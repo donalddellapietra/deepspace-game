@@ -1,6 +1,2 @@
-# Godot 4+ specific ignores
-.godot/
-exports/
-bin/
-
-.env
+node_modules
+dist
