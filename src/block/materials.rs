@@ -1,8 +1,7 @@
 use bevy::prelude::*;
-
 use super::BlockType;
 
-/// One StandardMaterial per block type, shared across everything.
+/// One StandardMaterial per block type, shared across all rendering.
 #[derive(Resource)]
 pub struct BlockMaterials {
     pub handles: [Handle<StandardMaterial>; 10],
