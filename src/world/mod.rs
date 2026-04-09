@@ -327,8 +327,48 @@ fn render_inside(
                 }
             }
         }
+    } else {
+        // Deeper layers: render sibling slots from the parent grid
+        let parent_nav = &active.nav_stack[..active.nav_stack.len() - 1];
+        if let Some(parent_grid) = world.get_grid(parent_nav) {
+            for dz in -1..=1i32 {
+                for dy in -1..=1i32 {
+                    for dx in -1..=1i32 {
+                        if dx == 0 && dy == 0 && dz == 0 { continue; }
+                        let sib = current_coord + IVec3::new(dx, dy, dz);
+                        if sib.x < 0 || sib.x >= s || sib.y < 0 || sib.y >= s
+                            || sib.z < 0 || sib.z >= s { continue; }
+
+                        let slot = &parent_grid.slots[sib.y as usize][sib.z as usize][sib.x as usize];
+                        let baked = match slot {
+                            CellSlot::Child(child) => &child.baked,
+                            CellSlot::Block(bt) => {
+                                // Render solid block as a cube
+                                let offset = Vec3::new((dx * s) as f32, (dy * s) as f32, (dz * s) as f32);
+                                let key = IVec3::new(2000 + dx, 2000 + dy, 2000 + dz);
+                                // Fill the neighbor area with a scaled cube of the block color
+                                let e = commands.spawn((
+                                    LayerEntity,
+                                    Mesh3d(cube.0.clone()),
+                                    MeshMaterial3d(materials.get(*bt)),
+                                    Transform::from_translation(offset + Vec3::splat(s as f32 / 2.0))
+                                        .with_scale(Vec3::splat(s as f32)),
+                                )).id();
+                                rs.entities.insert(key, e);
+                                continue;
+                            }
+                            CellSlot::Empty => continue,
+                        };
+
+                        let offset = Vec3::new((dx * s) as f32, (dy * s) as f32, (dz * s) as f32);
+                        let key = IVec3::new(2000 + dx, 2000 + dy, 2000 + dz);
+                        let e = spawn_baked_mesh(commands, materials, baked, offset, Vec3::ONE);
+                        rs.entities.insert(key, e);
+                    }
+                }
+            }
+        }
     }
-    // TODO: for nav_stack.len() > 1, render sibling slots from parent grid
 }
 
 /// Helper: spawn a baked mesh as a parent entity with sub-mesh children.
