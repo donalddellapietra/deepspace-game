@@ -1,7 +1,7 @@
 use std::f32::consts::FRAC_PI_2;
 
 use bevy::{
-    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
+    input::mouse::AccumulatedMouseMotion,
     prelude::*,
     window::{CursorGrabMode, CursorOptions},
 };
@@ -9,38 +9,50 @@ use bevy::{
 use crate::player::Player;
 
 const SENSITIVITY: f32 = 0.003;
-const ZOOM_SPEED: f32 = 1.5;
-const MIN_DISTANCE: f32 = 4.0;
-const MAX_DISTANCE: f32 = 40.0;
-const MIN_PITCH: f32 = 0.05;
-const MAX_PITCH: f32 = FRAC_PI_2 - 0.05;
-const TARGET_HEIGHT_OFFSET: f32 = 1.8;
+const EYE_HEIGHT: f32 = 1.7;
 
 pub struct CameraPlugin;
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera)
-            .add_systems(Update, (grab_cursor, orbit_camera).chain());
+        app.add_systems(Startup, (spawn_camera, spawn_crosshair))
+            .add_systems(Update, (grab_cursor, first_person_camera).chain());
     }
 }
 
 #[derive(Component)]
-pub struct OrbitCamera {
+pub struct FpsCam {
     pub yaw: f32,
     pub pitch: f32,
-    pub distance: f32,
 }
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
-        OrbitCamera {
+        FpsCam {
             yaw: 0.0,
-            pitch: 0.4,
-            distance: 15.0,
+            pitch: 0.0,
         },
-        Transform::from_xyz(0.0, 20.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(0.0, 10.0, 0.0),
+    ));
+}
+
+fn spawn_crosshair(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Percent(50.0),
+            top: Val::Percent(50.0),
+            width: Val::Px(4.0),
+            height: Val::Px(4.0),
+            margin: UiRect {
+                left: Val::Px(-2.0),
+                top: Val::Px(-2.0),
+                ..default()
+            },
+            ..default()
+        },
+        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
     ));
 }
 
@@ -59,36 +71,22 @@ fn grab_cursor(
     }
 }
 
-fn orbit_camera(
+fn first_person_camera(
     mouse_motion: Res<AccumulatedMouseMotion>,
-    mouse_scroll: Res<AccumulatedMouseScroll>,
-    player_query: Query<&Transform, (With<Player>, Without<OrbitCamera>)>,
-    mut camera_query: Query<(&mut Transform, &mut OrbitCamera), Without<Player>>,
+    player_query: Query<&Transform, (With<Player>, Without<FpsCam>)>,
+    mut camera_query: Query<(&mut Transform, &mut FpsCam), Without<Player>>,
 ) {
     let Ok(player_tf) = player_query.single() else {
         return;
     };
-    let Ok((mut cam_tf, mut orbit)) = camera_query.single_mut() else {
+    let Ok((mut cam_tf, mut cam)) = camera_query.single_mut() else {
         return;
     };
 
-    // Rotate orbit with mouse (don't multiply by delta_time -- already per-frame)
     let delta = mouse_motion.delta;
-    orbit.yaw -= delta.x * SENSITIVITY;
-    orbit.pitch = (orbit.pitch - delta.y * SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
+    cam.yaw -= delta.x * SENSITIVITY;
+    cam.pitch = (cam.pitch + delta.y * SENSITIVITY).clamp(-FRAC_PI_2 + 0.05, FRAC_PI_2 - 0.05);
 
-    // Zoom with scroll wheel
-    orbit.distance =
-        (orbit.distance - mouse_scroll.delta.y * ZOOM_SPEED).clamp(MIN_DISTANCE, MAX_DISTANCE);
-
-    // Place camera on a sphere around the player's head
-    let target = player_tf.translation + Vec3::Y * TARGET_HEIGHT_OFFSET;
-    let offset = Vec3::new(
-        orbit.distance * orbit.pitch.cos() * orbit.yaw.sin(),
-        orbit.distance * orbit.pitch.sin(),
-        orbit.distance * orbit.pitch.cos() * orbit.yaw.cos(),
-    );
-
-    cam_tf.translation = target + offset;
-    *cam_tf = cam_tf.looking_at(target, Vec3::Y);
+    cam_tf.translation = player_tf.translation + Vec3::Y * EYE_HEIGHT;
+    cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
 }
