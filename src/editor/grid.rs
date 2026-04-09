@@ -64,10 +64,11 @@ pub fn spawn_edit_grid(
         }
     }
 
-    // Move player inside the cell
+    // Position player above the cell center, looking down at the model.
+    // At yaw=0, forward = -Z, so put player at +Z side looking inward.
     if let Ok((mut tf, mut vel)) = player_q.single_mut() {
         vel.0 = Vec3::ZERO;
-        tf.translation = cell_origin + Vec3::new(2.5, 3.5, -1.0);
+        tf.translation = cell_origin + Vec3::new(2.5, 5.5, 7.0);
     }
 }
 

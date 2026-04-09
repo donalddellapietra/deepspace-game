@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::block::MODEL_SIZE;
 use crate::camera::FpsCam;
-use crate::layer::GameLayer;
+use crate::layer::{EditingContext, GameLayer};
 use crate::world::Layer1World;
 
 const WALK_SPEED: f32 = 8.0;
@@ -12,8 +12,8 @@ const GRAVITY: f32 = 20.0;
 const PLAYER_HEIGHT: f32 = 1.7;
 const CELL_SIZE: f32 = MODEL_SIZE as f32;
 
-// Editor fly mode
 const FLY_SPEED: f32 = 5.0;
+const EDIT_MARGIN: f32 = 2.0; // how far outside the cell you can go
 
 pub struct PlayerPlugin;
 
@@ -40,7 +40,6 @@ fn spawn_player(mut commands: Commands) {
     ));
 }
 
-/// World mode: walk on ground with gravity and jumping.
 fn move_world(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -52,8 +51,6 @@ fn move_world(
     let Ok(cam) = camera_query.single() else { return };
 
     let dt = time.delta_secs();
-    let ground = ground_height(&world, tf.translation);
-    let on_ground = tf.translation.y <= ground + PLAYER_HEIGHT + 0.05;
 
     let (forward, right) = cam_directions(cam);
     let input = gather_wasd(&keyboard);
@@ -65,6 +62,10 @@ fn move_world(
         tf.translation.x += move_dir.x * speed * dt;
         tf.translation.z += move_dir.z * speed * dt;
     }
+
+    // Ground collision — find highest solid cell top below player
+    let ground = ground_height(&world, tf.translation);
+    let on_ground = tf.translation.y <= ground + PLAYER_HEIGHT + 0.1;
 
     if keyboard.just_pressed(KeyCode::Space) && on_ground {
         vel.0.y = JUMP_IMPULSE;
@@ -80,15 +81,17 @@ fn move_world(
     }
 }
 
-/// Editor mode: free fly (no gravity).
+/// Editor mode: fly, clamped to the cell being edited.
 fn move_editor(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
+    context: Option<Res<EditingContext>>,
     mut player_query: Query<&mut Transform, With<Player>>,
     camera_query: Query<&FpsCam>,
 ) {
     let Ok(mut tf) = player_query.single_mut() else { return };
     let Ok(cam) = camera_query.single() else { return };
+    let Some(ctx) = context else { return };
 
     let dt = time.delta_secs();
     let (forward, right) = cam_directions(cam);
@@ -102,13 +105,26 @@ fn move_editor(
         tf.translation += move_dir * speed * dt;
     }
 
-    // Vertical
     if keyboard.pressed(KeyCode::Space) {
         tf.translation.y += speed * dt;
     }
     if keyboard.pressed(KeyCode::ControlLeft) {
         tf.translation.y -= speed * dt;
     }
+
+    // Clamp to cell bounds + margin
+    let cell_min = Vec3::new(
+        ctx.cell_coord.x as f32 * CELL_SIZE - EDIT_MARGIN,
+        ctx.cell_coord.y as f32 * CELL_SIZE - EDIT_MARGIN,
+        ctx.cell_coord.z as f32 * CELL_SIZE - EDIT_MARGIN,
+    );
+    let cell_max = Vec3::new(
+        (ctx.cell_coord.x as f32 + 1.0) * CELL_SIZE + EDIT_MARGIN,
+        (ctx.cell_coord.y as f32 + 1.0) * CELL_SIZE + EDIT_MARGIN + 3.0,
+        (ctx.cell_coord.z as f32 + 1.0) * CELL_SIZE + EDIT_MARGIN,
+    );
+
+    tf.translation = tf.translation.clamp(cell_min, cell_max);
 }
 
 fn cam_directions(cam: &FpsCam) -> (Vec3, Vec3) {
@@ -134,7 +150,8 @@ fn ground_height(world: &Layer1World, pos: Vec3) -> f32 {
     for y in -2..20 {
         let coord = IVec3::new(cx, y, cz);
         if world.cells.contains_key(&coord) {
-            let cell_top = (y as f32 + 1.0) * CELL_SIZE;
+            // Top of this cell's content (ground model fills y=0,1,2 so top is at 3 blocks)
+            let cell_top = y as f32 * CELL_SIZE + 3.0; // 3 blocks of ground model
             if cell_top <= pos.y + 0.5 && cell_top > best_y {
                 best_y = cell_top;
             }

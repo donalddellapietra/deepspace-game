@@ -8,8 +8,8 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_hotbar)
-            .add_systems(Update, update_hotbar);
+        app.add_systems(Startup, (spawn_hotbar, spawn_mode_indicator))
+            .add_systems(Update, (update_hotbar, update_mode_indicator));
     }
 }
 
@@ -19,8 +19,10 @@ struct HotbarSlot(u8);
 #[derive(Component)]
 struct HotbarLabel;
 
+#[derive(Component)]
+struct ModeIndicator;
+
 fn spawn_hotbar(mut commands: Commands) {
-    // Root container at bottom center
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
@@ -36,18 +38,13 @@ fn spawn_hotbar(mut commands: Commands) {
             ..default()
         })
         .with_children(|parent| {
-            // Block name label
             parent.spawn((
                 HotbarLabel,
                 Text::new("Stone"),
-                TextFont {
-                    font_size: 16.0,
-                    ..default()
-                },
+                TextFont { font_size: 16.0, ..default() },
                 TextColor(Color::WHITE),
             ));
 
-            // Slot row
             parent
                 .spawn(Node {
                     flex_direction: FlexDirection::Row,
@@ -70,16 +67,29 @@ fn spawn_hotbar(mut commands: Commands) {
                     }
                 });
 
-            // Key hint
             parent.spawn((
-                Text::new("1-0: select  |  E: edit cell  |  LMB: place  |  RMB: remove"),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
+                Text::new("E: edit cell | Q: exit edit | LClick: break | RClick: place | 1-0: select"),
+                TextFont { font_size: 12.0, ..default() },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.5)),
             ));
         });
+}
+
+fn spawn_mode_indicator(mut commands: Commands) {
+    commands.spawn((
+        ModeIndicator,
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(16.0),
+            left: Val::Px(16.0),
+            padding: UiRect::all(Val::Px(8.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+        Text::new("WORLD MODE"),
+        TextFont { font_size: 20.0, ..default() },
+        TextColor(Color::WHITE),
+    ));
 }
 
 fn update_hotbar(
@@ -99,5 +109,23 @@ fn update_hotbar(
 
     if let Ok(mut text) = label.single_mut() {
         *text = Text::new(format!("{:?}", editor.selected_block));
+    }
+}
+
+fn update_mode_indicator(
+    state: Res<State<GameLayer>>,
+    mut indicator: Query<(&mut Text, &mut TextColor), With<ModeIndicator>>,
+) {
+    let Ok((mut text, mut color)) = indicator.single_mut() else { return };
+
+    match state.get() {
+        GameLayer::World => {
+            *text = Text::new("WORLD MODE");
+            color.0 = Color::WHITE;
+        }
+        GameLayer::Editing => {
+            *text = Text::new("EDITING MODE");
+            color.0 = Color::srgb(0.3, 1.0, 0.3);
+        }
     }
 }

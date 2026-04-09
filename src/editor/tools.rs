@@ -2,11 +2,12 @@ use bevy::prelude::*;
 
 use crate::block::materials::BlockMaterials;
 use crate::block::{BlockType, MODEL_SIZE};
-use crate::interaction::{TargetedBlock, TargetedCell};
+use crate::camera::FpsCam;
+use crate::interaction::TargetedBlock;
 use crate::layer::{EditingContext, GameLayer};
 use crate::model::ModelRegistry;
 use crate::player::Player;
-use crate::world::{Layer1World, LoadedCells};
+use crate::world::Layer1World;
 
 use super::{EditorState, SharedCubeMesh};
 use super::grid::{EditBlock, EditEntity};
@@ -14,28 +15,23 @@ use super::grid::{EditBlock, EditEntity};
 /// In World mode, press E on a targeted cell to enter editing.
 pub fn enter_edit_mode(
     keyboard: Res<ButtonInput<KeyCode>>,
-    targeted: Res<TargetedCell>,
     world: Res<Layer1World>,
     player_q: Query<&Transform, With<Player>>,
+    mut cam_q: Query<&mut FpsCam>,
     mut commands: Commands,
     mut next_state: ResMut<NextState<GameLayer>>,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyE) { return }
 
-    // For now, enter the cell directly below the player if no targeting yet
     let Ok(player_tf) = player_q.single() else { return };
     let pos = player_tf.translation;
 
-    let coord = if let Some(c) = targeted.coord {
-        c
-    } else {
-        // Default: cell at player's feet
-        IVec3::new(
-            (pos.x / MODEL_SIZE as f32).floor() as i32,
-            0,
-            (pos.z / MODEL_SIZE as f32).floor() as i32,
-        )
-    };
+    // Cell at player's feet
+    let coord = IVec3::new(
+        (pos.x / MODEL_SIZE as f32).floor() as i32,
+        0,
+        (pos.z / MODEL_SIZE as f32).floor() as i32,
+    );
 
     let Some(cell_data) = world.cells.get(&coord) else { return };
 
@@ -45,20 +41,26 @@ pub fn enter_edit_mode(
         return_position: pos,
     });
 
+    // Reset camera to look toward -Z (into the cell)
+    if let Ok(mut cam) = cam_q.single_mut() {
+        cam.yaw = 0.0;
+        cam.pitch = 0.3; // slight downward angle
+    }
+
     next_state.set(GameLayer::Editing);
 }
 
-/// In Editing mode, press E or Escape to exit.
+/// In Editing mode, press Q to exit back to world.
 pub fn exit_edit_shortcut(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut next_state: ResMut<NextState<GameLayer>>,
 ) {
-    if keyboard.just_pressed(KeyCode::KeyE) || keyboard.just_pressed(KeyCode::Escape) {
+    if keyboard.just_pressed(KeyCode::KeyQ) {
         next_state.set(GameLayer::World);
     }
 }
 
-/// Left click: place a block adjacent to the targeted face.
+/// Right click: place a block adjacent to the targeted face (Minecraft convention).
 pub fn place_block(
     mouse: Res<ButtonInput<MouseButton>>,
     targeted: Res<TargetedBlock>,
@@ -69,7 +71,7 @@ pub fn place_block(
     materials: Res<BlockMaterials>,
     cube_mesh: Option<Res<SharedCubeMesh>>,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) { return }
+    if !mouse.just_pressed(MouseButton::Right) { return }
     let Some(hit) = targeted.hit else { return };
     let Some(normal) = targeted.normal else { return };
     let Some(cube) = cube_mesh else { return };
@@ -80,19 +82,18 @@ pub fn place_block(
         || place_pos.y < 0 || place_pos.y >= s
         || place_pos.z < 0 || place_pos.z >= s
     {
-        return; // Out of bounds
+        return;
     }
 
     let Some(model) = registry.get_mut(context.model_id) else { return };
     let p = place_pos;
 
     if model.blocks[p.y as usize][p.z as usize][p.x as usize].is_some() {
-        return; // Already occupied
+        return;
     }
 
     model.blocks[p.y as usize][p.z as usize][p.x as usize] = Some(editor.selected_block);
 
-    // Spawn the visual block entity
     let cell_origin = Vec3::new(
         context.cell_coord.x as f32 * MODEL_SIZE as f32,
         context.cell_coord.y as f32 * MODEL_SIZE as f32,
@@ -109,7 +110,7 @@ pub fn place_block(
     ));
 }
 
-/// Right click: remove the targeted block.
+/// Left click: remove the targeted block (Minecraft convention).
 pub fn remove_block(
     mouse: Res<ButtonInput<MouseButton>>,
     targeted: Res<TargetedBlock>,
@@ -118,13 +119,12 @@ pub fn remove_block(
     mut commands: Commands,
     blocks_q: Query<(Entity, &EditBlock), With<EditEntity>>,
 ) {
-    if !mouse.just_pressed(MouseButton::Right) { return }
+    if !mouse.just_pressed(MouseButton::Left) { return }
     let Some(hit) = targeted.hit else { return };
 
     let Some(model) = registry.get_mut(context.model_id) else { return };
     model.blocks[hit.y as usize][hit.z as usize][hit.x as usize] = None;
 
-    // Despawn the visual entity
     for (entity, edit_block) in &blocks_q {
         if edit_block.local_pos == hit {
             commands.entity(entity).despawn();
@@ -133,7 +133,7 @@ pub fn remove_block(
     }
 }
 
-/// Scroll wheel or number keys to change selected block type.
+/// Number keys to change selected block type.
 pub fn cycle_block_type(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut editor: ResMut<EditorState>,

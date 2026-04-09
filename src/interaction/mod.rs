@@ -136,13 +136,22 @@ fn draw_block_highlight(
     context: Option<Res<EditingContext>>,
 ) {
     let Some(ctx) = context else { return };
-    let Some(hit) = targeted.hit else { return };
 
     let cell_origin = Vec3::new(
         ctx.cell_coord.x as f32 * MODEL_SIZE as f32,
         ctx.cell_coord.y as f32 * MODEL_SIZE as f32,
         ctx.cell_coord.z as f32 * MODEL_SIZE as f32,
     );
+
+    // Always draw the cell boundary box
+    let cell_center = cell_origin + Vec3::splat(MODEL_SIZE as f32 / 2.0);
+    gizmos.cube(
+        Transform::from_translation(cell_center).with_scale(Vec3::splat(MODEL_SIZE as f32)),
+        Color::srgba(0.3, 1.0, 0.3, 0.4),
+    );
+
+    // Highlight targeted block
+    let Some(hit) = targeted.hit else { return };
     let center = cell_origin + hit.as_vec3() + Vec3::splat(0.5);
 
     gizmos.cube(

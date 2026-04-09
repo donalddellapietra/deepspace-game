@@ -67,34 +67,11 @@ fn setup_world(
         baked: bake_model(&ground, &mut meshes),
     });
 
-    // Tree model
-    let mut tree = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
-    tree[0][2][2] = Some(BlockType::Wood);
-    tree[1][2][2] = Some(BlockType::Wood);
-    tree[2][2][2] = Some(BlockType::Wood);
-    for dy in 3..5 {
-        for dz in 1..4 {
-            for dx in 1..4 {
-                tree[dy][dz][dx] = Some(BlockType::Leaf);
-            }
-        }
-    }
-    let tree_id = registry.register(VoxelModel {
-        name: "Tree".into(),
-        blocks: tree,
-        baked: bake_model(&tree, &mut meshes),
-    });
-
-    // Place ground grid with scattered trees
+    // Place ground grid
     let extent = 12;
     for z in -extent..extent {
         for x in -extent..extent {
             world.cells.insert(IVec3::new(x, 0, z), CellData { model_id: ground_id });
-
-            let hash = ((x.wrapping_mul(73856093)) ^ (z.wrapping_mul(19349663))).unsigned_abs();
-            if hash % 7 == 0 {
-                world.cells.insert(IVec3::new(x, 1, z), CellData { model_id: tree_id });
-            }
         }
     }
 }
