@@ -2,9 +2,8 @@ use bevy::prelude::*;
 
 use crate::block::MODEL_SIZE;
 use crate::camera::FpsCam;
-use crate::layer::GameLayer;
-use crate::model::ModelRegistry;
-use crate::layer::EditingContext;
+use crate::layer::{EditingContext, GameLayer};
+use crate::world::Layer1World;
 
 pub struct InteractionPlugin;
 
@@ -35,7 +34,7 @@ pub struct TargetedCell {
 fn update_targeted_block(
     camera_q: Query<&GlobalTransform, With<FpsCam>>,
     context: Option<Res<EditingContext>>,
-    registry: Res<ModelRegistry>,
+    world: Res<Layer1World>,
     mut targeted: ResMut<TargetedBlock>,
 ) {
     targeted.hit = None;
@@ -43,20 +42,15 @@ fn update_targeted_block(
 
     let Some(ctx) = context else { return };
     let Ok(cam_gtf) = camera_q.single() else { return };
-    let Some(model) = registry.get(ctx.model_id) else { return };
+    let Some(cell_data) = world.cells.get(&ctx.cell_coord) else { return };
 
     let origin = cam_gtf.translation();
     let dir = cam_gtf.forward().as_vec3();
 
-    // Transform ray into model-local space
-    let cell_origin = Vec3::new(
-        ctx.cell_coord.x as f32 * MODEL_SIZE as f32,
-        ctx.cell_coord.y as f32 * MODEL_SIZE as f32,
-        ctx.cell_coord.z as f32 * MODEL_SIZE as f32,
-    );
+    let cell_origin = ctx.cell_coord.as_vec3() * MODEL_SIZE as f32;
     let local_origin = origin - cell_origin;
 
-    if let Some((hit, normal)) = dda_raycast(local_origin, dir, &model.blocks, 20.0) {
+    if let Some((hit, normal)) = dda_raycast(local_origin, dir, &cell_data.blocks, 20.0) {
         targeted.hit = Some(hit);
         targeted.normal = Some(normal);
     }

@@ -3,6 +3,8 @@ use bevy::prelude::*;
 use crate::block::BlockType;
 use crate::editor::EditorState;
 use crate::layer::GameLayer;
+use crate::model::ModelRegistry;
+use crate::world::WorldHotbar;
 
 pub struct UiPlugin;
 
@@ -28,10 +30,7 @@ fn spawn_hotbar(mut commands: Commands) {
             position_type: PositionType::Absolute,
             bottom: Val::Px(20.0),
             left: Val::Percent(50.0),
-            margin: UiRect {
-                left: Val::Px(-220.0),
-                ..default()
-            },
+            margin: UiRect { left: Val::Px(-220.0), ..default() },
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Center,
             row_gap: Val::Px(6.0),
@@ -68,7 +67,7 @@ fn spawn_hotbar(mut commands: Commands) {
                 });
 
             parent.spawn((
-                Text::new("E: edit cell | Q: exit edit | LClick: break | RClick: place | 1-0: select"),
+                Text::new("E: edit | Q: exit | LClick: break | RClick: place | P: save model | 1-0: select"),
                 TextFont { font_size: 12.0, ..default() },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.5)),
             ));
@@ -93,22 +92,58 @@ fn spawn_mode_indicator(mut commands: Commands) {
 }
 
 fn update_hotbar(
+    state: Res<State<GameLayer>>,
     editor: Res<EditorState>,
-    mut slots: Query<(&HotbarSlot, &mut BorderColor)>,
+    world_hotbar: Res<WorldHotbar>,
+    registry: Res<ModelRegistry>,
+    mut slots: Query<(&HotbarSlot, &mut BorderColor, &mut BackgroundColor)>,
     mut label: Query<&mut Text, With<HotbarLabel>>,
 ) {
-    let selected = editor.selected_block as u8;
-
-    for (slot, mut border) in &mut slots {
-        if slot.0 == selected {
-            *border = BorderColor::all(Color::WHITE);
-        } else {
-            *border = BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.15));
+    match state.get() {
+        GameLayer::Editing => {
+            let selected = editor.selected_block as u8;
+            for (slot, mut border, mut bg) in &mut slots {
+                // Show block type colors
+                if (slot.0 as usize) < BlockType::ALL.len() {
+                    bg.0 = BlockType::ALL[slot.0 as usize].color();
+                }
+                *border = if slot.0 == selected {
+                    BorderColor::all(Color::WHITE)
+                } else {
+                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.15))
+                };
+            }
+            if let Ok(mut text) = label.single_mut() {
+                *text = Text::new(format!("{:?}", editor.selected_block));
+            }
         }
-    }
-
-    if let Ok(mut text) = label.single_mut() {
-        *text = Text::new(format!("{:?}", editor.selected_block));
+        GameLayer::World => {
+            let selected = world_hotbar.selected_slot as u8;
+            for (slot, mut border, mut bg) in &mut slots {
+                // Show model template colors (use a representative color)
+                if let Some(model) = registry.models.get(slot.0 as usize) {
+                    // Use the most common block color as representative
+                    let rep_color = model.blocks.iter().flatten().flatten()
+                        .find_map(|b| *b)
+                        .map(|b| b.color())
+                        .unwrap_or(Color::srgb(0.3, 0.3, 0.3));
+                    bg.0 = rep_color;
+                } else {
+                    bg.0 = Color::srgba(0.2, 0.2, 0.2, 0.3);
+                }
+                *border = if slot.0 == selected {
+                    BorderColor::all(Color::WHITE)
+                } else {
+                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.15))
+                };
+            }
+            if let Ok(mut text) = label.single_mut() {
+                let name = registry.models.get(world_hotbar.selected_slot)
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("Empty");
+                *text = Text::new(name.to_string());
+            }
+        }
     }
 }
 
@@ -117,14 +152,13 @@ fn update_mode_indicator(
     mut indicator: Query<(&mut Text, &mut TextColor), With<ModeIndicator>>,
 ) {
     let Ok((mut text, mut color)) = indicator.single_mut() else { return };
-
     match state.get() {
         GameLayer::World => {
             *text = Text::new("WORLD MODE");
             color.0 = Color::WHITE;
         }
         GameLayer::Editing => {
-            *text = Text::new("EDITING MODE");
+            *text = Text::new("EDITING MODE - Q to exit, P to save");
             color.0 = Color::srgb(0.3, 1.0, 0.3);
         }
     }

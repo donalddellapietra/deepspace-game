@@ -4,13 +4,15 @@ use bevy::prelude::*;
 
 use crate::block::materials::BlockMaterials;
 use crate::block::{BlockType, MODEL_SIZE};
-use crate::layer::{EditingContext, GameLayer};
+use crate::layer::EditingContext;
 use crate::model::mesher::bake_model;
-use crate::model::{ModelId, ModelRegistry, VoxelModel};
+use crate::model::{BakedSubMesh, ModelId, ModelRegistry, VoxelModel};
 use crate::player::Player;
 
 const RENDER_DISTANCE: i32 = 8;
 const CELL_WORLD_SIZE: f32 = MODEL_SIZE as f32;
+
+pub type BlockArray = [[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
 
 pub struct WorldPlugin;
 
@@ -18,33 +20,45 @@ impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Layer1World>()
             .init_resource::<LoadedCells>()
+            .init_resource::<WorldHotbar>()
             .add_systems(Startup, setup_world)
             .add_systems(Update, manage_visible_cells);
     }
 }
 
-/// Placement data for a cell in the world.
+/// Each cell owns its block data + baked mesh. Editing a cell only affects that cell.
 #[derive(Clone)]
 pub struct CellData {
-    pub model_id: ModelId,
+    pub template_id: ModelId,
+    pub blocks: BlockArray,
+    pub baked: Vec<BakedSubMesh>,
 }
 
-/// The layer 1 world grid (data only, no rendering state).
 #[derive(Resource, Default)]
 pub struct Layer1World {
     pub cells: HashMap<IVec3, CellData>,
 }
 
-/// Tracks spawned entities for visible cells (rendering state).
 #[derive(Resource, Default)]
 pub struct LoadedCells {
     pub entities: HashMap<IVec3, Entity>,
 }
 
-/// Marker on the root entity of a rendered layer 1 cell.
 #[derive(Component)]
 pub struct Layer1Cell {
     pub coord: IVec3,
+}
+
+/// Which model template is selected for placement in world mode.
+#[derive(Resource)]
+pub struct WorldHotbar {
+    pub selected_slot: usize,
+}
+
+impl Default for WorldHotbar {
+    fn default() -> Self {
+        Self { selected_slot: 0 }
+    }
 }
 
 fn setup_world(
@@ -52,8 +66,8 @@ fn setup_world(
     mut registry: ResMut<ModelRegistry>,
     mut world: ResMut<Layer1World>,
 ) {
-    // Ground model: 5x5 slab, 3 blocks tall (dirt + grass top)
-    let mut ground = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+    // Ground template
+    let mut ground: BlockArray = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
     for z in 0..MODEL_SIZE {
         for x in 0..MODEL_SIZE {
             ground[0][z][x] = Some(BlockType::Dirt);
@@ -61,24 +75,30 @@ fn setup_world(
             ground[2][z][x] = Some(BlockType::Grass);
         }
     }
-    let ground_id = registry.register(VoxelModel {
+    registry.register(VoxelModel {
         name: "Ground".into(),
         blocks: ground,
         baked: bake_model(&ground, &mut meshes),
     });
 
-    // Place ground grid
+    // Place ground — each cell gets its OWN copy of the block data
     let extent = 12;
     for z in -extent..extent {
         for x in -extent..extent {
-            world.cells.insert(IVec3::new(x, 0, z), CellData { model_id: ground_id });
+            world.cells.insert(
+                IVec3::new(x, 0, z),
+                CellData {
+                    template_id: ModelId(0),
+                    blocks: ground,
+                    baked: bake_model(&ground, &mut meshes),
+                },
+            );
         }
     }
 }
 
 fn manage_visible_cells(
     mut commands: Commands,
-    registry: Res<ModelRegistry>,
     materials: Res<BlockMaterials>,
     world: Res<Layer1World>,
     mut loaded: ResMut<LoadedCells>,
@@ -93,7 +113,6 @@ fn manage_visible_cells(
         (pos.z / CELL_WORLD_SIZE).floor() as i32,
     );
 
-    // Collect desired visible cells
     let mut desired = HashSet::new();
     let rd = RENDER_DISTANCE;
     for dz in -rd..=rd {
@@ -101,22 +120,18 @@ fn manage_visible_cells(
             if dx * dx + dz * dz > rd * rd { continue; }
             for y in -2..10 {
                 let coord = IVec3::new(player_cell.x + dx, y, player_cell.y + dz);
-                if world.cells.contains_key(&coord) {
-                    // Skip the cell being edited (it renders as individual blocks)
-                    if let Some(ref ctx) = editing {
-                        if coord == ctx.cell_coord { continue; }
-                    }
-                    desired.insert(coord);
+                if !world.cells.contains_key(&coord) { continue; }
+                if let Some(ref ctx) = editing {
+                    if coord == ctx.cell_coord { continue; }
                 }
+                desired.insert(coord);
             }
         }
     }
 
-    // Spawn missing
     for &coord in &desired {
         if loaded.entities.contains_key(&coord) { continue; }
         let Some(cell_data) = world.cells.get(&coord) else { continue };
-        let Some(model) = registry.get(cell_data.model_id) else { continue };
 
         let world_pos = Vec3::new(
             coord.x as f32 * CELL_WORLD_SIZE,
@@ -130,8 +145,7 @@ fn manage_visible_cells(
             Visibility::Inherited,
         )).id();
 
-        // One child per sub-mesh (per block type)
-        for sub in &model.baked {
+        for sub in &cell_data.baked {
             let child = commands.spawn((
                 Mesh3d(sub.mesh.clone()),
                 MeshMaterial3d(materials.get(sub.block_type)),
@@ -143,7 +157,6 @@ fn manage_visible_cells(
         loaded.entities.insert(coord, root);
     }
 
-    // Despawn far / unneeded
     let to_remove: Vec<IVec3> = loaded.entities.keys()
         .filter(|c| !desired.contains(c))
         .copied()

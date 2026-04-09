@@ -15,12 +15,13 @@ impl Plugin for EditorPlugin {
             .add_systems(OnExit(GameLayer::Editing), grid::exit_edit_mode)
             .add_systems(
                 Update,
-                (tools::place_block, tools::remove_block, tools::cycle_block_type)
+                (tools::place_block, tools::remove_block, tools::cycle_block_type, tools::save_as_template)
                     .run_if(in_state(GameLayer::Editing)),
             )
             .add_systems(
                 Update,
-                tools::enter_edit_mode.run_if(in_state(GameLayer::World)),
+                (tools::enter_edit_mode, tools::cycle_model_slot, tools::place_cell, tools::remove_cell)
+                    .run_if(in_state(GameLayer::World)),
             )
             .add_systems(
                 Update,
@@ -40,6 +41,5 @@ impl Default for EditorState {
     }
 }
 
-/// Shared unit cube mesh, reused by all edit-mode block entities.
 #[derive(Resource)]
 pub struct SharedCubeMesh(pub Handle<Mesh>);
