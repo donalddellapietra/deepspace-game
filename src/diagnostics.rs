@@ -26,6 +26,6 @@ fn log_diag(
     if !timer.0.just_finished() { return }
     let pos = player_q.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let tgt = targeted.hit.map(|h| format!("({},{},{})", h.x, h.y, h.z)).unwrap_or("none".into());
-    info!("pos=({:.1},{:.1},{:.1}) stack={} ents={} target={}",
+    info!("pos=({:.1},{:.1},{:.1}) depth={} ents={} target={}",
         pos.x, pos.y, pos.z, active.nav_stack.len(), rs.entities.len(), tgt);
 }
