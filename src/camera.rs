@@ -29,10 +29,7 @@ pub struct FpsCam {
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
-        FpsCam {
-            yaw: 0.0,
-            pitch: 0.0,
-        },
+        FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::from_xyz(0.0, 10.0, 0.0),
     ));
 }
@@ -76,12 +73,8 @@ fn first_person_camera(
     player_query: Query<&Transform, (With<Player>, Without<FpsCam>)>,
     mut camera_query: Query<(&mut Transform, &mut FpsCam), Without<Player>>,
 ) {
-    let Ok(player_tf) = player_query.single() else {
-        return;
-    };
-    let Ok((mut cam_tf, mut cam)) = camera_query.single_mut() else {
-        return;
-    };
+    let Ok(player_tf) = player_query.single() else { return };
+    let Ok((mut cam_tf, mut cam)) = camera_query.single_mut() else { return };
 
     let delta = mouse_motion.delta;
     cam.yaw -= delta.x * SENSITIVITY;

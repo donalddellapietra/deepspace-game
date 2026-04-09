@@ -3,9 +3,11 @@ name = "deepspace-game"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+dev = ["bevy/dynamic_linking"]
+
 [dependencies]
 bevy = "0.18"
-noise = "0.9"
 
 # Bevy is unusable in debug without this
 [profile.dev]
