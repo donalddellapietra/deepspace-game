@@ -97,12 +97,13 @@ pub fn remove_block(
 
     match state.depth {
         0 => {
-            // hit is a super-chunk key. Clear all 5×5×5 chunks beneath it.
+            // hit is a super-chunk key. Tombstone all 5×5×5 chunks beneath it
+            // so the streaming generator never refills them.
             for cz in 0..S {
                 for cy in 0..S {
                     for cx in 0..S {
                         let chunk_key = hit * S + IVec3::new(cx, cy, cz);
-                        state.world.chunks.remove(&chunk_key);
+                        state.world.chunks.insert(chunk_key, Chunk::tombstone());
                     }
                 }
             }
@@ -110,12 +111,22 @@ pub fn remove_block(
         }
         1 => {
             // hit is a chunk key.
-            state.world.chunks.remove(&hit);
+            state.world.chunks.insert(hit, Chunk::tombstone());
             state.dirty_super_for_chunk(hit);
         }
         _ => {
             // hit is an integer block coord.
             state.world.set(hit, None);
+            // Mark the containing chunk user_modified so the generator will
+            // never overwrite the user's hole.
+            let key = IVec3::new(
+                hit.x.div_euclid(S),
+                hit.y.div_euclid(S),
+                hit.z.div_euclid(S),
+            );
+            if let Some(chunk) = state.world.chunks.get_mut(&key) {
+                chunk.user_modified = true;
+            }
             state.dirty_super_for_block(hit);
         }
     }
@@ -151,7 +162,8 @@ pub fn place_block(
                 super::HotbarItem::Block(bt) => *bt,
                 super::HotbarItem::SavedModel(_) => BlockType::Stone, // models are too small at this granularity
             };
-            let filled = Chunk::new_filled(bt);
+            let mut filled = Chunk::new_filled(bt);
+            filled.user_modified = true;
             for cz in 0..S {
                 for cy in 0..S {
                     for cx in 0..S {
@@ -163,27 +175,28 @@ pub fn place_block(
             state.dirty_supers.insert(place);
         }
         1 => {
-            if state.world.chunks.contains_key(&place) {
+            if state.world.chunk_solid(place) {
                 return;
             }
-            match hotbar.active_item() {
+            let chunk = match hotbar.active_item() {
                 super::HotbarItem::Block(bt) => {
-                    state.world.chunks.insert(place, Chunk::new_filled(*bt));
+                    let mut c = Chunk::new_filled(*bt);
+                    c.user_modified = true;
+                    c
                 }
                 super::HotbarItem::SavedModel(idx) => {
                     let Some(model) = registry.models.get(*idx) else {
                         return;
                     };
-                    state.world.chunks.insert(
-                        place,
-                        Chunk {
-                            blocks: model.blocks,
-                            mesh_dirty: true,
-                            baked: vec![],
-                        },
-                    );
+                    Chunk {
+                        blocks: model.blocks,
+                        mesh_dirty: true,
+                        baked: vec![],
+                        user_modified: true,
+                    }
                 }
-            }
+            };
+            state.world.chunks.insert(place, chunk);
             state.dirty_super_for_chunk(place);
         }
         _ => {
@@ -193,7 +206,7 @@ pub fn place_block(
             match hotbar.active_item() {
                 super::HotbarItem::Block(bt) => {
                     state.world.set(place, Some(*bt));
-                    state.dirty_super_for_block(place);
+                    mark_block_user_modified(&mut state, place);
                 }
                 super::HotbarItem::SavedModel(idx) => {
                     let Some(model) = registry.models.get(*idx) else {
@@ -207,7 +220,7 @@ pub fn place_block(
                                     let coord =
                                         place + IVec3::new(x as i32, y as i32, z as i32);
                                     state.world.set(coord, Some(bt));
-                                    state.dirty_super_for_block(coord);
+                                    mark_block_user_modified(&mut state, coord);
                                 }
                             }
                         }
@@ -219,6 +232,18 @@ pub fn place_block(
 
     // Silence unused warning when SUPER isn't directly referenced.
     let _ = SUPER;
+}
+
+fn mark_block_user_modified(state: &mut WorldState, coord: IVec3) {
+    let key = IVec3::new(
+        coord.x.div_euclid(S),
+        coord.y.div_euclid(S),
+        coord.z.div_euclid(S),
+    );
+    if let Some(chunk) = state.world.chunks.get_mut(&key) {
+        chunk.user_modified = true;
+    }
+    state.dirty_super_for_block(coord);
 }
 
 // ============================================================

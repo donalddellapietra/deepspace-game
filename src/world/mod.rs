@@ -33,6 +33,10 @@ pub struct Chunk {
     pub blocks: [[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
     pub mesh_dirty: bool,
     pub baked: Vec<BakedSubMesh>,
+    /// True iff a player edit has touched this chunk. The streaming generator
+    /// must never overwrite a user_modified chunk. Removed cells are kept as
+    /// empty `user_modified=true` chunks so the generator skips them too.
+    pub user_modified: bool,
 }
 
 impl Chunk {
@@ -41,6 +45,7 @@ impl Chunk {
             blocks: [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
             mesh_dirty: true,
             baked: vec![],
+            user_modified: false,
         }
     }
 
@@ -49,7 +54,14 @@ impl Chunk {
             blocks: [[[Some(bt); MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
             mesh_dirty: true,
             baked: vec![],
+            user_modified: false,
         }
+    }
+
+    pub fn tombstone() -> Self {
+        let mut c = Self::new_empty();
+        c.user_modified = true;
+        c
     }
 }
 
@@ -192,6 +204,43 @@ impl WorldState {
 }
 
 // ============================================================
+// Procedural generation
+// ============================================================
+
+const WORLD_SEED: u64 = 0xDEAD_BEEF_F00D_CAFE;
+
+/// Deterministic per-chunk content. Returns None for chunk coords that should
+/// not be materialized (above the rock layer or below bedrock). Never touches
+/// world state — pure function of `coord`.
+pub fn generate_chunk(coord: IVec3) -> Option<Chunk> {
+    use BlockType::*;
+    match coord.y {
+        0 | 1 => Some(Chunk::new_filled(Stone)),
+        2 | 3 => Some(Chunk::new_filled(Dirt)),
+        4 => Some(Chunk::new_filled(Grass)),
+        5 => {
+            // Sparse layer above the grass: one rock at a deterministic
+            // (rx, rz) per (cx, cz) column. local y = 0 puts the rock on top
+            // of the grass below.
+            let mut chunk = Chunk::new_empty();
+            let (rx, rz) = rock_position(coord.x, coord.z);
+            chunk.blocks[0][rz][rx] = Some(Stone);
+            Some(chunk)
+        }
+        _ => None,
+    }
+}
+
+fn rock_position(cx: i32, cz: i32) -> (usize, usize) {
+    let h = WORLD_SEED
+        ^ (cx as i64 as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (cz as i64 as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+    let rx = (h % MODEL_SIZE as u64) as usize;
+    let rz = ((h / MODEL_SIZE as u64) % MODEL_SIZE as u64) as usize;
+    (rx, rz)
+}
+
+// ============================================================
 // Baking: super-chunks (depth 0) reuse the generic bake_volume
 // ============================================================
 
@@ -241,33 +290,86 @@ pub struct RenderState {
     pub needs_full_refresh: bool,
 }
 
+/// State for the streaming generator. We only re-stream when the player has
+/// crossed a chunk-column boundary, and we only generate the new edge.
+#[derive(Resource, Default)]
+pub struct StreamState {
+    pub last_column: Option<IVec2>,
+}
+
+/// How wide a window of chunk columns to keep generated around the player,
+/// measured in chunks per axis from the player's column. RENDER_DISTANCE is
+/// in super-chunks at depth 0, so multiply by S to get chunks, plus a margin.
+const STREAM_RADIUS_CHUNKS: i32 = RENDER_DISTANCE * S + S;
+
 pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorldState>()
             .init_resource::<RenderState>()
-            .add_systems(Startup, setup_world)
+            .init_resource::<StreamState>()
+            .add_systems(PreUpdate, generate_terrain)
             .add_systems(Update, render_world);
     }
 }
 
-fn setup_world(mut state: ResMut<WorldState>) {
-    // Build a ground that's a full super-chunk tall (5 chunks = 25 blocks).
-    // This way the bottom super-chunk row is fully populated and the player
-    // walking on top of super-chunk cubes lines up with the visible surface.
-    let stone = Chunk::new_filled(BlockType::Stone);
-    let dirt = Chunk::new_filled(BlockType::Dirt);
-    let grass = Chunk::new_filled(BlockType::Grass);
+/// Streaming terrain generator. Runs in PreUpdate so the world exists before
+/// player physics or render see it. Only ever inserts chunks that are absent;
+/// user_modified chunks (including tombstones) are never overwritten.
+fn generate_terrain(
+    mut stream: ResMut<StreamState>,
+    mut state: ResMut<WorldState>,
+    player_q: Query<&Transform, With<Player>>,
+) {
+    let Ok(tf) = player_q.single() else { return };
 
-    let extent: i32 = 16;
-    for cz in -extent..extent {
-        for cx in -extent..extent {
-            state.world.chunks.insert(IVec3::new(cx, 0, cz), stone.clone());
-            state.world.chunks.insert(IVec3::new(cx, 1, cz), stone.clone());
-            state.world.chunks.insert(IVec3::new(cx, 2, cz), dirt.clone());
-            state.world.chunks.insert(IVec3::new(cx, 3, cz), dirt.clone());
-            state.world.chunks.insert(IVec3::new(cx, 4, cz), grass.clone());
+    // Convert the player's bevy position to integer-block coords using the
+    // current depth's scale. At depth 0 one bevy unit = SUPER integer blocks,
+    // at depth 1 one bevy = S, at depth 2 one bevy = 1.
+    let scale = match state.depth {
+        0 => SUPER as f32,
+        1 => S as f32,
+        _ => 1.0,
+    };
+    let int_x = (tf.translation.x * scale).floor() as i32;
+    let int_z = (tf.translation.z * scale).floor() as i32;
+    let cx_player = int_x.div_euclid(S);
+    let cz_player = int_z.div_euclid(S);
+    let new_column = IVec2::new(cx_player, cz_player);
+
+    let prev = stream.last_column;
+    if prev == Some(new_column) {
+        return;
+    }
+    stream.last_column = Some(new_column);
+
+    let r = STREAM_RADIUS_CHUNKS;
+    let cy_min: i32 = 0;
+    let cy_max: i32 = 5;
+
+    for dz in -r..=r {
+        for dx in -r..=r {
+            let cx = new_column.x + dx;
+            let cz = new_column.y + dz;
+
+            // Delta optimization: skip cells that were already in the previous
+            // window — they're either generated or tombstoned.
+            if let Some(p) = prev {
+                if (cx - p.x).abs() <= r && (cz - p.y).abs() <= r {
+                    continue;
+                }
+            }
+
+            for cy in cy_min..=cy_max {
+                let key = IVec3::new(cx, cy, cz);
+                if state.world.chunks.contains_key(&key) {
+                    continue; // user_modified or already generated
+                }
+                let Some(chunk) = generate_chunk(key) else { continue };
+                state.world.chunks.insert(key, chunk);
+                state.dirty_super_for_chunk(key);
+            }
         }
     }
 }
