@@ -2,6 +2,7 @@ use bevy::prelude::*;
 
 use crate::block::MODEL_SIZE;
 use crate::camera::FpsCam;
+use crate::inventory::InventoryState;
 use crate::layer::ActiveLayer;
 use crate::world::collision::{self, PLAYER_H, PLAYER_HW};
 use crate::world::VoxelWorld;
@@ -36,9 +37,12 @@ fn move_player(
     keyboard: Res<ButtonInput<KeyCode>>,
     active: Res<ActiveLayer>,
     world: Res<VoxelWorld>,
+    inv: Res<InventoryState>,
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
     camera_q: Query<&FpsCam>,
 ) {
+    if inv.open { return } // freeze while inventory is open
+
     let Ok((mut tf, mut vel)) = player_q.single_mut() else { return };
     let Ok(cam) = camera_q.single() else { return };
     let dt = time.delta_secs();

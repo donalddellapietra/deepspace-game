@@ -340,9 +340,9 @@ fn depth2_fall_off_grandparent_edge() {
     // Walking to x=26 (outside the grandparent cell) enters neighboring
     // top-layer cells like (1,0,0) or (1,1,0).
 
-    // Test: walk to x=20 (inside the grandparent cell but outside the parent grid).
-    // The placed cell at (0,1,0) fills this region, so it should be solid.
-    assert!(block_solid(&world, &nav, IVec3::new(20, 4, 2)),
+    // Test: x=12 is inside the grandparent cell (0,1,0) which spans x=-10..15.
+    // It's outside the parent grid (0..5) but inside the top-layer cell.
+    assert!(block_solid(&world, &nav, IVec3::new(12, 4, 2)),
         "Blocks inside grandparent cell should be detected as solid");
 
     // Test: position at x=20, y=5. Fall from the top of the placed cell.
@@ -373,6 +373,85 @@ fn depth2_fall_off_grandparent_edge() {
 
     assert!(pos.y > -25.0, "Should land on ground, not fall to void. Got y={}", pos.y);
     assert!(pos.y < 5.0, "Should have fallen from y=5. Got y={}", pos.y);
+}
+
+// ============================================================
+// Model registry / save flow
+// ============================================================
+
+#[test]
+fn save_model_to_registry() {
+    use crate::model::{ModelRegistry, VoxelModel};
+    use crate::model::mesher::bake_model;
+
+    let mut registry = ModelRegistry::default();
+    assert_eq!(registry.models.len(), 0);
+
+    // Simulate saving: create a custom block pattern and register it
+    let mut blocks = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+    blocks[0][0][0] = Some(BlockType::Brick);
+    blocks[1][0][0] = Some(BlockType::Brick);
+
+    let mut meshes = Assets::<Mesh>::default();
+    let baked = bake_model(&blocks, &mut meshes);
+
+    let id = registry.register(VoxelModel {
+        name: "Test Tower".into(),
+        blocks,
+        baked,
+    });
+
+    assert_eq!(registry.models.len(), 1, "Registry should have 1 model after save");
+    assert_eq!(registry.models[id.0].name, "Test Tower");
+    assert_eq!(registry.models[id.0].blocks[0][0][0], Some(BlockType::Brick));
+    assert_eq!(registry.models[id.0].blocks[1][0][0], Some(BlockType::Brick));
+    assert_eq!(registry.models[id.0].blocks[2][0][0], None);
+}
+
+#[test]
+fn save_multiple_models() {
+    use crate::model::{ModelRegistry, VoxelModel};
+    use crate::model::mesher::bake_model;
+
+    let mut registry = ModelRegistry::default();
+    let mut meshes = Assets::<Mesh>::default();
+
+    for i in 0..3 {
+        let mut blocks = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+        blocks[0][0][0] = Some(BlockType::ALL[i]);
+        let baked = bake_model(&blocks, &mut meshes);
+        registry.register(VoxelModel {
+            name: format!("Model {}", i),
+            blocks,
+            baked,
+        });
+    }
+
+    assert_eq!(registry.models.len(), 3);
+    assert_eq!(registry.models[0].name, "Model 0");
+    assert_eq!(registry.models[1].name, "Model 1");
+    assert_eq!(registry.models[2].name, "Model 2");
+}
+
+#[test]
+fn saved_model_blocks_are_independent() {
+    use crate::model::{ModelRegistry, VoxelModel};
+    use crate::model::mesher::bake_model;
+
+    let mut registry = ModelRegistry::default();
+    let mut meshes = Assets::<Mesh>::default();
+
+    // Save a model
+    let mut blocks = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+    blocks[0][0][0] = Some(BlockType::Stone);
+    let baked = bake_model(&blocks, &mut meshes);
+    registry.register(VoxelModel { name: "Original".into(), blocks, baked });
+
+    // Modify the original blocks array — should NOT affect the saved model
+    blocks[0][0][0] = Some(BlockType::Grass);
+
+    assert_eq!(registry.models[0].blocks[0][0][0], Some(BlockType::Stone),
+        "Saved model should be independent copy, not reference");
 }
 
 // ============================================================

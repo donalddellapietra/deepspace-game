@@ -3,6 +3,7 @@ mod camera;
 mod diagnostics;
 mod editor;
 mod interaction;
+mod inventory;
 mod layer;
 mod model;
 mod player;
@@ -27,6 +28,7 @@ fn main() {
             world::WorldPlugin,
             editor::EditorPlugin,
             interaction::InteractionPlugin,
+            inventory::InventoryPlugin,
             player::PlayerPlugin,
             camera::CameraPlugin,
             ui::UiPlugin,

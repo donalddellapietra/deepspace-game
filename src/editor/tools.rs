@@ -4,6 +4,7 @@ use crate::block::materials::BlockMaterials;
 use crate::block::{BlockType, MODEL_SIZE};
 use crate::camera::{CursorLocked, FpsCam};
 use crate::interaction::TargetedBlock;
+use crate::inventory::InventoryState;
 use crate::layer::{ActiveLayer, NavEntry};
 use crate::model::mesher::bake_model;
 use crate::model::{ModelRegistry, VoxelModel};
@@ -14,9 +15,10 @@ use crate::world::{self, CellSlot, RenderState, SharedCubeMesh, VoxelGrid, Voxel
 // Drill down / up
 // ============================================================
 
-/// Press E: drill into the cell/block the crosshair is pointing at.
+/// Press F: drill into the cell/block the crosshair is pointing at.
 pub fn drill_down(
     keyboard: Res<ButtonInput<KeyCode>>,
+    inv: Res<InventoryState>,
     targeted: Res<TargetedBlock>,
     mut active: ResMut<ActiveLayer>,
     mut world: ResMut<VoxelWorld>,
@@ -25,7 +27,8 @@ pub fn drill_down(
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
     mut cam_q: Query<&mut FpsCam>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyE) { return }
+    if inv.open { return }
+    if !keyboard.just_pressed(KeyCode::KeyF) { return }
 
     // Must be targeting something
     let Some(hit) = targeted.hit else { return };
@@ -90,12 +93,14 @@ pub fn drill_down(
 /// Press Q: drill back up to parent layer.
 pub fn drill_up(
     keyboard: Res<ButtonInput<KeyCode>>,
+    inv: Res<InventoryState>,
     mut active: ResMut<ActiveLayer>,
     mut world: ResMut<VoxelWorld>,
     mut rs: ResMut<RenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
 ) {
+    if inv.open { return }
     if !keyboard.just_pressed(KeyCode::KeyQ) { return }
     if active.nav_stack.is_empty() { return }
 
@@ -122,12 +127,14 @@ pub fn drill_up(
 pub fn remove_block(
     mouse: Res<ButtonInput<MouseButton>>,
     locked: Res<CursorLocked>,
+    inv: Res<InventoryState>,
     targeted: Res<TargetedBlock>,
     active: Res<ActiveLayer>,
     mut world: ResMut<VoxelWorld>,
     mut commands: Commands,
     mut rs: ResMut<RenderState>,
 ) {
+    if inv.open { return }
     if !locked.0 { return } // cursor not grabbed yet
     if !mouse.just_pressed(MouseButton::Left) { return }
     let Some(hit) = targeted.hit else { return };
@@ -147,12 +154,17 @@ pub fn remove_block(
     }
 }
 
-/// Right click: place a block/cell adjacent to the targeted face.
+/// Right click: place using the active hotbar item.
+/// - If it's a Block: place a single block (inside grid) or solid cell (top layer).
+/// - If it's a SavedModel: place the model's blocks as a new cell (top layer) or
+///   as a Child grid (inside grid).
 pub fn place_block(
     mouse: Res<ButtonInput<MouseButton>>,
     locked: Res<CursorLocked>,
+    inv: Res<InventoryState>,
     targeted: Res<TargetedBlock>,
-    editor: Res<super::EditorState>,
+    hotbar: Res<super::Hotbar>,
+    registry: Res<ModelRegistry>,
     active: Res<ActiveLayer>,
     mut world: ResMut<VoxelWorld>,
     mut commands: Commands,
@@ -161,53 +173,75 @@ pub fn place_block(
     mut rs: ResMut<RenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    if inv.open { return }
     if !locked.0 { return }
     if !mouse.just_pressed(MouseButton::Right) { return }
     let Some(hit) = targeted.hit else { return };
     let Some(normal) = targeted.normal else { return };
 
     let place = hit + normal;
+    let item = hotbar.active_item();
+
+    // Build the block array to place
+    let place_blocks: [[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE] = match item {
+        super::HotbarItem::Block(bt) => {
+            let mut blocks = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+            // At top layer: solid cell. Inside grid: single block.
+            if active.is_top_layer() {
+                for y in 0..MODEL_SIZE { for z in 0..MODEL_SIZE { for x in 0..MODEL_SIZE {
+                    blocks[y][z][x] = Some(*bt);
+                }}}
+            } else {
+                // Just place one block
+                let s = MODEL_SIZE as i32;
+                if place.x < 0 || place.x >= s || place.y < 0 || place.y >= s
+                    || place.z < 0 || place.z >= s { return }
+                let Some(grid) = world.get_grid_mut(&active.nav_stack) else { return };
+                if grid.slots[place.y as usize][place.z as usize][place.x as usize].is_solid() { return }
+                grid.slots[place.y as usize][place.z as usize][place.x as usize] = CellSlot::Block(*bt);
+
+                if let Some(cube) = cube {
+                    let e = commands.spawn((
+                        world::LayerEntity, Mesh3d(cube.0.clone()),
+                        MeshMaterial3d(materials.get(*bt)),
+                        Transform::from_translation(place.as_vec3() + Vec3::splat(0.5)),
+                    )).id();
+                    rs.entities.insert(place, e);
+                }
+                return;
+            }
+            blocks
+        }
+        super::HotbarItem::SavedModel(idx) => {
+            let Some(model) = registry.models.get(*idx) else { return };
+            model.blocks
+        }
+    };
 
     if active.is_top_layer() {
-        // Place a new cell at the top layer
         if world.cells.contains_key(&place) { return }
-        // Create a solid cell of the selected block type
-        let mut blocks = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
-        for y in 0..MODEL_SIZE {
-            for z in 0..MODEL_SIZE {
-                for x in 0..MODEL_SIZE {
-                    blocks[y][z][x] = Some(editor.selected_block);
-                }
-            }
-        }
-        world.cells.insert(place, VoxelGrid::from_blocks(&blocks, &mut meshes));
+        world.cells.insert(place, VoxelGrid::from_blocks(&place_blocks, &mut meshes));
         rs.needs_refresh = true;
     } else {
-        // Place a block inside the current grid
-        let Some(cube) = cube else { return };
+        // Inside a grid: place as a Child grid
         let s = MODEL_SIZE as i32;
         if place.x < 0 || place.x >= s || place.y < 0 || place.y >= s
             || place.z < 0 || place.z >= s { return }
         let Some(grid) = world.get_grid_mut(&active.nav_stack) else { return };
         if grid.slots[place.y as usize][place.z as usize][place.x as usize].is_solid() { return }
-        grid.slots[place.y as usize][place.z as usize][place.x as usize] =
-            CellSlot::Block(editor.selected_block);
 
-        let e = commands.spawn((
-            world::LayerEntity,
-            Mesh3d(cube.0.clone()),
-            MeshMaterial3d(materials.get(editor.selected_block)),
-            Transform::from_translation(place.as_vec3() + Vec3::splat(0.5)),
-        )).id();
-        rs.entities.insert(place, e);
+        let child = VoxelGrid::from_blocks(&place_blocks, &mut meshes);
+        grid.slots[place.y as usize][place.z as usize][place.x as usize] =
+            CellSlot::Child(Box::new(child));
+        rs.needs_refresh = true;
     }
 }
 
 // ============================================================
-// Block type selection + save
+// Hotbar slot selection + save
 // ============================================================
 
-pub fn cycle_block_type(keyboard: Res<ButtonInput<KeyCode>>, mut editor: ResMut<super::EditorState>) {
+pub fn cycle_hotbar_slot(keyboard: Res<ButtonInput<KeyCode>>, mut hotbar: ResMut<super::Hotbar>) {
     for (key, idx) in [
         (KeyCode::Digit1, 0), (KeyCode::Digit2, 1), (KeyCode::Digit3, 2),
         (KeyCode::Digit4, 3), (KeyCode::Digit5, 4), (KeyCode::Digit6, 5),
@@ -215,7 +249,7 @@ pub fn cycle_block_type(keyboard: Res<ButtonInput<KeyCode>>, mut editor: ResMut<
         (KeyCode::Digit0, 9),
     ] {
         if keyboard.just_pressed(key) {
-            if let Some(bt) = BlockType::from_index(idx) { editor.selected_block = bt; }
+            hotbar.active = idx;
         }
     }
 }
@@ -223,11 +257,13 @@ pub fn cycle_block_type(keyboard: Res<ButtonInput<KeyCode>>, mut editor: ResMut<
 /// Press P: save the current grid as a reusable model template.
 pub fn save_as_template(
     keyboard: Res<ButtonInput<KeyCode>>,
+    inv: Res<InventoryState>,
     active: Res<ActiveLayer>,
     world: Res<VoxelWorld>,
     mut registry: ResMut<ModelRegistry>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    if inv.open { return }
     if !keyboard.just_pressed(KeyCode::KeyP) { return }
     let Some(grid) = world.get_grid(&active.nav_stack) else { return };
     let blocks = grid.to_block_array();

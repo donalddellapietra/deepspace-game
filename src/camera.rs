@@ -6,6 +6,7 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 
+use crate::inventory::InventoryState;
 use crate::player::{Player, PLAYER_HEIGHT};
 
 const SENSITIVITY: f32 = 0.003;
@@ -56,9 +57,12 @@ fn spawn_crosshair(mut commands: Commands) {
 fn manage_cursor(
     mouse: Res<ButtonInput<MouseButton>>,
     key: Res<ButtonInput<KeyCode>>,
+    inv: Res<InventoryState>,
     mut cursor_options: Single<&mut CursorOptions>,
     mut locked: ResMut<CursorLocked>,
 ) {
+    // Never grab cursor while inventory is open
+    if inv.open { return }
     if mouse.just_pressed(MouseButton::Left) && !locked.0 {
         cursor_options.visible = false;
         cursor_options.grab_mode = CursorGrabMode::Locked;
