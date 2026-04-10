@@ -108,19 +108,14 @@ fn render_chunks(
         (player_tf.translation.z / chunk_size_w).floor() as i32,
     );
 
-    // Build desired by walking the actual chunk set — one iteration over
-    // populated entities, not the cubic sphere. Cost is linear in chunk
-    // count instead of cubic in RENDER_DISTANCE.
-    let rd_sq = RENDER_DISTANCE * RENDER_DISTANCE;
+    // Range query via the spatial index — work is O(|visible chunks|), not
+    // O(|world.chunks|). Same linear-style "rebuild every frame" shape that
+    // keeps frametime consistent, just massively cheaper per frame.
     let desired: HashSet<IVec3> = state
         .world
-        .chunks
-        .keys()
-        .copied()
-        .filter(|&key| {
-            let d = key - player_key;
-            d.x * d.x + d.y * d.y + d.z * d.z <= rd_sq
-        })
+        .index
+        .chunks_in_sphere(player_key, RENDER_DISTANCE)
+        .into_iter()
         .collect();
 
     for &key in &desired {
@@ -192,12 +187,16 @@ fn render_super_chunks(
         player_tf.translation.z.floor() as i32,
     );
 
-    // Derive the desired super-chunk set from the actual chunk set. Each
-    // chunk is mapped to its containing super-chunk; dedupe via the HashSet.
-    // Linear in populated chunks, not cubic in RENDER_DISTANCE.
+    // Range query via the spatial index. The index lives in chunk coords,
+    // so we ask for chunks in a sphere large enough to cover every super-
+    // chunk within `RENDER_DISTANCE`, then map to super-chunks and filter
+    // at the super-chunk level. Layer-agnostic: the index doesn't know or
+    // care what a super-chunk is.
     let rd_sq = RENDER_DISTANCE * RENDER_DISTANCE;
+    let chunk_center = player_key * S + IVec3::splat(S / 2);
+    let chunk_radius = (RENDER_DISTANCE + 1) * S;
     let mut desired: HashSet<IVec3> = HashSet::new();
-    for chunk_key in state.world.chunks.keys() {
+    for chunk_key in state.world.index.chunks_in_sphere(chunk_center, chunk_radius) {
         let super_key = IVec3::new(
             chunk_key.x.div_euclid(S),
             chunk_key.y.div_euclid(S),

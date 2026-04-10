@@ -111,7 +111,7 @@ impl WorldState {
         chunk: Chunk,
         library: &mut MeshLibrary,
     ) {
-        if let Some(old) = self.world.chunks.insert(key, chunk) {
+        if let Some(old) = self.world.insert_chunk(key, chunk) {
             if let Some(id) = old.level1_id {
                 library.level1_decrement(id);
             }

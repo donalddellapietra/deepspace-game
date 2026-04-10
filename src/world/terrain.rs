@@ -110,7 +110,7 @@ pub fn generate_terrain(
                     continue; // user_modified / tombstoned / already generated
                 }
                 let Some(chunk) = generate_chunk(key) else { continue };
-                state.world.chunks.insert(key, chunk);
+                state.world.insert_chunk(key, chunk);
                 state.dirty_super_for_chunk(key);
             }
         }
