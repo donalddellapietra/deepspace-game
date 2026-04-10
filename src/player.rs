@@ -1,11 +1,9 @@
 use bevy::prelude::*;
 
-use crate::block::MODEL_SIZE;
 use crate::camera::FpsCam;
 use crate::inventory::InventoryState;
-use crate::layer::ActiveLayer;
-use crate::world::collision::{self, PLAYER_H, PLAYER_HW};
-use crate::world::VoxelWorld;
+use crate::world::collision::{self, PLAYER_H};
+use crate::world::WorldState;
 
 const WALK_SPEED: f32 = 8.0;
 const SPRINT_SPEED: f32 = 16.0;
@@ -29,25 +27,26 @@ pub struct Player;
 pub struct Velocity(pub Vec3);
 
 fn spawn_player(mut commands: Commands) {
-    commands.spawn((Player, Velocity(Vec3::ZERO), Transform::from_xyz(0.5, 1.0, 0.5), Visibility::Hidden));
+    // We start at depth 0, where 1 bevy unit = 1 super-chunk. The ground
+    // super-chunk row at super_y=0 is fully populated (5 chunk layers), so its
+    // top is at bevy y=1. Spawn just above and let gravity drop the player on.
+    commands.spawn((Player, Velocity(Vec3::ZERO), Transform::from_xyz(0.5, 2.0, 0.5), Visibility::Hidden));
 }
 
 fn move_player(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
-    active: Res<ActiveLayer>,
-    world: Res<VoxelWorld>,
+    state: Res<WorldState>,
     inv: Res<InventoryState>,
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
     camera_q: Query<&FpsCam>,
 ) {
-    if inv.open { return } // freeze while inventory is open
+    if inv.open { return }
 
     let Ok((mut tf, mut vel)) = player_q.single_mut() else { return };
     let Ok(cam) = camera_q.single() else { return };
     let dt = time.delta_secs();
 
-    // Camera-relative movement directions
     let forward = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
     let right = Vec3::new(-forward.z, 0.0, forward.x);
 
@@ -57,15 +56,12 @@ fn move_player(
     if keyboard.pressed(KeyCode::KeyD) { input.x += 1.0; }
     if keyboard.pressed(KeyCode::KeyA) { input.x -= 1.0; }
 
-    // Jump (must be on ground before applying gravity)
-    if keyboard.just_pressed(KeyCode::Space) && collision::on_ground(tf.translation, &world, &active.nav_stack) {
+    if keyboard.just_pressed(KeyCode::Space) && collision::on_ground(tf.translation, &*state) {
         vel.0.y = JUMP_IMPULSE;
     }
 
-    // Gravity
     vel.0.y -= GRAVITY * dt;
 
-    // Horizontal movement delta
     let speed = if keyboard.pressed(KeyCode::ShiftLeft) { SPRINT_SPEED } else { WALK_SPEED };
     let h_delta = if input.length_squared() > 0.0 {
         let dir = (forward * input.y + right * input.x).normalize();
@@ -74,22 +70,5 @@ fn move_player(
         Vec2::ZERO
     };
 
-    // Swept AABB collision resolves everything: floors, ceilings, walls.
-    // No tolerances, no hacks. Works at every depth.
-    collision::move_and_collide(
-        &mut tf.translation,
-        &mut vel.0,
-        h_delta,
-        dt,
-        &world,
-        &active.nav_stack,
-    );
-
-    // Clamp inside navigable area when drilled in
-    if !active.is_top_layer() {
-        let margin = 4.0 * MODEL_SIZE as f32;
-        let limit = MODEL_SIZE as f32 + margin;
-        tf.translation.x = tf.translation.x.clamp(-margin, limit);
-        tf.translation.z = tf.translation.z.clamp(-margin, limit);
-    }
+    collision::move_and_collide(&mut tf.translation, &mut vel.0, h_delta, dt, &*state);
 }

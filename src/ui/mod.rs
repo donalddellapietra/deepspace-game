@@ -2,7 +2,6 @@ use bevy::prelude::*;
 
 use crate::block::BlockType;
 use crate::editor::{Hotbar, HotbarItem};
-use crate::layer::ActiveLayer;
 use crate::model::ModelRegistry;
 
 pub struct UiPlugin;
@@ -111,13 +110,13 @@ fn update_hotbar(
 }
 
 fn update_mode_indicator(
-    active: Res<ActiveLayer>,
+    state: Res<crate::world::WorldState>,
     mut q: Query<&mut Text, With<ModeIndicator>>,
 ) {
     let Ok(mut t) = q.single_mut() else { return };
-    if active.is_top_layer() {
+    if state.is_top_layer() {
         *t = Text::new("Top Layer (F to drill in)");
     } else {
-        *t = Text::new(format!("Depth {} (Q to exit)", active.nav_stack.len()));
+        *t = Text::new(format!("Depth {} (Q to exit)", state.depth()));
     }
 }

@@ -6,502 +6,450 @@ use bevy::prelude::*;
 
 use crate::block::materials::BlockMaterials;
 use crate::block::{BlockType, MODEL_SIZE};
-use crate::layer::{ActiveLayer, NavEntry};
-use crate::model::mesher::bake_model;
+use crate::model::mesher::{bake_model, bake_volume};
 use crate::model::BakedSubMesh;
 use crate::player::Player;
 
-const CELL_SCALE: f32 = 1.0 / MODEL_SIZE as f32;
-const RENDER_DISTANCE: i32 = 16;
-const NEIGHBOR_RANGE: i32 = 4;
+const S: i32 = MODEL_SIZE as i32;
+/// Side length of a "super-chunk" in integer blocks: MODEL_SIZE chunks per
+/// axis × MODEL_SIZE blocks per chunk = 25.
+pub const SUPER: i32 = S * S;
+
+/// How many drill levels are supported. Depth 0 = most zoomed out
+/// (super-chunks visible), depth MAX_DEPTH = most zoomed in (single integer
+/// blocks visible). Each step is a 5× linear zoom.
+pub const MAX_DEPTH: usize = 2;
+
+/// How far the player can see, measured in *render entities* (super-chunks at
+/// depth 0, chunks at depth 1/2). Same entity budget at every depth.
+const RENDER_DISTANCE: i32 = 8;
 
 // ============================================================
-// Data model
+// Core data: Chunk + FlatWorld (one global integer-block grid)
 // ============================================================
 
 #[derive(Clone)]
-pub enum CellSlot {
-    Empty,
-    Block(BlockType),
-    Child(Box<VoxelGrid>),
-}
-
-impl Default for CellSlot {
-    fn default() -> Self { Self::Empty }
-}
-
-impl CellSlot {
-    pub fn is_solid(&self) -> bool { !matches!(self, Self::Empty) }
-
-    /// Representative block type for baking/display.
-    pub fn block_type(&self) -> Option<BlockType> {
-        match self {
-            Self::Block(bt) => Some(*bt),
-            Self::Child(child) => most_common_block(child),
-            Self::Empty => None,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct VoxelGrid {
-    pub slots: [[[CellSlot; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
+pub struct Chunk {
+    pub blocks: [[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
+    pub mesh_dirty: bool,
     pub baked: Vec<BakedSubMesh>,
 }
 
-impl VoxelGrid {
+impl Chunk {
     pub fn new_empty() -> Self {
         Self {
-            slots: std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| CellSlot::Empty))),
+            blocks: [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
+            mesh_dirty: true,
             baked: vec![],
         }
     }
 
-    pub fn from_blocks(blocks: &[[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE], meshes: &mut Assets<Mesh>) -> Self {
-        let mut grid = Self::new_empty();
-        for y in 0..MODEL_SIZE {
-            for z in 0..MODEL_SIZE {
-                for x in 0..MODEL_SIZE {
-                    if let Some(bt) = blocks[y][z][x] {
-                        grid.slots[y][z][x] = CellSlot::Block(bt);
+    pub fn new_filled(bt: BlockType) -> Self {
+        Self {
+            blocks: [[[Some(bt); MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
+            mesh_dirty: true,
+            baked: vec![],
+        }
+    }
+}
+
+/// All blocks in the game live here, indexed by integer-block coordinate
+/// through the chunk grid. There is exactly one of these — drilling never
+/// creates a new world, it just changes how we view this one.
+#[derive(Clone, Default)]
+pub struct FlatWorld {
+    pub chunks: HashMap<IVec3, Chunk>,
+}
+
+impl FlatWorld {
+    pub fn get(&self, coord: IVec3) -> Option<BlockType> {
+        let (key, local) = Self::decompose(coord);
+        self.chunks.get(&key)?.blocks[local.y as usize][local.z as usize][local.x as usize]
+    }
+
+    pub fn set(&mut self, coord: IVec3, block: Option<BlockType>) {
+        let (key, local) = Self::decompose(coord);
+        let chunk = self.chunks.entry(key).or_insert_with(Chunk::new_empty);
+        chunk.blocks[local.y as usize][local.z as usize][local.x as usize] = block;
+        chunk.mesh_dirty = true;
+    }
+
+    pub fn is_solid(&self, coord: IVec3) -> bool {
+        self.get(coord).is_some()
+    }
+
+    /// True iff the chunk at `key` exists and contains at least one block.
+    /// Used by depth-1 collision, where one chunk = one bevy unit cube.
+    pub fn chunk_solid(&self, key: IVec3) -> bool {
+        self.chunks
+            .get(&key)
+            .is_some_and(|c| c.blocks.iter().flatten().flatten().any(|b| b.is_some()))
+    }
+
+    /// True iff any of the 5×5×5 chunks beneath this super-chunk key has a
+    /// block. Used by depth-0 collision, where one super-chunk = one bevy unit.
+    pub fn super_chunk_solid(&self, super_key: IVec3) -> bool {
+        for cz in 0..S {
+            for cy in 0..S {
+                for cx in 0..S {
+                    let chunk_key = super_key * S + IVec3::new(cx, cy, cz);
+                    if self.chunk_solid(chunk_key) {
+                        return true;
                     }
                 }
             }
         }
-        grid.rebake(meshes);
-        grid
+        false
     }
 
-    pub fn to_block_array(&self) -> [[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE] {
-        let mut arr = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
-        for y in 0..MODEL_SIZE {
-            for z in 0..MODEL_SIZE {
-                for x in 0..MODEL_SIZE {
-                    arr[y][z][x] = self.slots[y][z][x].block_type();
-                }
-            }
-        }
-        arr
+    fn decompose(coord: IVec3) -> (IVec3, IVec3) {
+        let key = IVec3::new(
+            coord.x.div_euclid(S),
+            coord.y.div_euclid(S),
+            coord.z.div_euclid(S),
+        );
+        let local = IVec3::new(
+            coord.x.rem_euclid(S),
+            coord.y.rem_euclid(S),
+            coord.z.rem_euclid(S),
+        );
+        (key, local)
     }
-
-    pub fn rebake(&mut self, meshes: &mut Assets<Mesh>) {
-        self.baked = bake_model(&self.to_block_array(), meshes);
-    }
-
-    pub fn column_top(&self, x: usize, z: usize) -> f32 {
-        for y in (0..MODEL_SIZE).rev() {
-            if self.slots[y][z][x].is_solid() { return (y + 1) as f32; }
-        }
-        0.0
-    }
-
-    /// Count solid slots.
-    pub fn solid_count(&self) -> usize {
-        self.slots.iter().flatten().flatten().filter(|s| s.is_solid()).count()
-    }
-}
-
-fn most_common_block(grid: &VoxelGrid) -> Option<BlockType> {
-    let mut counts = [0u32; 10];
-    for slot in grid.slots.iter().flatten().flatten() {
-        if let CellSlot::Block(bt) = slot { counts[*bt as usize] += 1; }
-    }
-    counts.iter().enumerate().max_by_key(|(_, c)| **c)
-        .filter(|(_, c)| **c > 0).map(|(i, _)| BlockType::ALL[i])
 }
 
 // ============================================================
-// World resource
+// World state: one global world + a current zoom depth
 // ============================================================
 
 #[derive(Resource, Default)]
-pub struct VoxelWorld {
-    pub cells: HashMap<IVec3, VoxelGrid>,
+pub struct WorldState {
+    pub world: FlatWorld,
+    /// Current zoom level. 0 = most zoomed out (super-chunks), MAX_DEPTH = most
+    /// zoomed in (single integer blocks).
+    pub depth: usize,
+    /// Super-chunks whose cached bake is stale and must be rebuilt before the
+    /// next render at depth 0. Editor systems insert into this set after edits.
+    pub dirty_supers: HashSet<IVec3>,
 }
 
-impl VoxelWorld {
-    /// Get the grid the player is currently inside (follow the nav stack).
-    pub fn get_grid(&self, nav_stack: &[NavEntry]) -> Option<&VoxelGrid> {
-        if nav_stack.is_empty() { return None; }
-        let mut cur = self.cells.get(&nav_stack[0].cell_coord)?;
-        for entry in &nav_stack[1..] {
-            let c = entry.cell_coord;
-            cur = match &cur.slots[c.y as usize][c.z as usize][c.x as usize] {
-                CellSlot::Child(child) => child,
-                _ => { warn!("get_grid: expected Child at {:?}, got non-Child", c); return None; }
-            };
-        }
-        Some(cur)
-    }
-
-    pub fn get_grid_mut(&mut self, nav_stack: &[NavEntry]) -> Option<&mut VoxelGrid> {
-        if nav_stack.is_empty() { return None; }
-        let mut cur = self.cells.get_mut(&nav_stack[0].cell_coord)?;
-        for entry in &nav_stack[1..] {
-            let c = entry.cell_coord;
-            cur = match &mut cur.slots[c.y as usize][c.z as usize][c.x as usize] {
-                CellSlot::Child(child) => child,
-                _ => { warn!("get_grid_mut: expected Child at {:?}", c); return None; }
-            };
-        }
-        Some(cur)
-    }
-
-    /// Get a sibling grid in the parent layer. Works at any depth.
-    /// `nav_stack` is the current full stack, `sibling_coord` is an absolute coord in the parent.
-    /// At depth 1: parent is `self.cells` (unbounded HashMap).
-    /// At depth 2+: parent is the grid at `nav_stack[..len-1]` (bounded 0..MODEL_SIZE).
-    pub fn get_sibling(&self, nav_stack: &[NavEntry], sibling_coord: IVec3) -> Option<&VoxelGrid> {
-        if nav_stack.is_empty() { return None; }
-        let s = MODEL_SIZE as i32;
-
-        if nav_stack.len() == 1 {
-            // Parent is the top-layer HashMap (unbounded)
-            self.cells.get(&sibling_coord)
-        } else {
-            // Parent is a grid (bounded)
-            if sibling_coord.x < 0 || sibling_coord.x >= s
-                || sibling_coord.y < 0 || sibling_coord.y >= s
-                || sibling_coord.z < 0 || sibling_coord.z >= s { return None; }
-            let parent = self.get_grid(&nav_stack[..nav_stack.len() - 1])?;
-            match &parent.slots[sibling_coord.y as usize][sibling_coord.z as usize][sibling_coord.x as usize] {
-                CellSlot::Child(child) => Some(child),
-                _ => None,
-            }
+impl collision::SolidQuery for WorldState {
+    fn is_solid(&self, coord: IVec3) -> bool {
+        // `coord` is in the current depth's bevy-block grid, i.e. one integer
+        // unit equals one player-interactable cube at this depth.
+        match self.depth {
+            0 => self.world.super_chunk_solid(coord),
+            1 => self.world.chunk_solid(coord),
+            _ => self.world.is_solid(coord),
         }
     }
+}
 
-    /// Get the CellSlot of a sibling in the parent. Works at any depth.
-    pub fn get_sibling_slot(&self, nav_stack: &[NavEntry], sibling_coord: IVec3) -> Option<&CellSlot> {
-        if nav_stack.is_empty() { return None; }
-        let s = MODEL_SIZE as i32;
+impl WorldState {
+    pub fn is_top_layer(&self) -> bool {
+        self.depth == 0
+    }
 
-        if nav_stack.len() == 1 {
-            // Top-layer cells are always "solid" (they exist or don't)
-            self.cells.get(&sibling_coord).map(|_| &CellSlot::Block(BlockType::Grass) as &CellSlot)
-        } else {
-            if sibling_coord.x < 0 || sibling_coord.x >= s
-                || sibling_coord.y < 0 || sibling_coord.y >= s
-                || sibling_coord.z < 0 || sibling_coord.z >= s { return None; }
-            let parent = self.get_grid(&nav_stack[..nav_stack.len() - 1])?;
-            Some(&parent.slots[sibling_coord.y as usize][sibling_coord.z as usize][sibling_coord.x as usize])
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Drill in: zoom by 5×. The world is unchanged; only the player's bevy
+    /// position scales so they stay over the same integer-block location.
+    pub fn drill_in(&mut self, player_pos: Vec3) -> Option<Vec3> {
+        if self.depth >= MAX_DEPTH {
+            return None;
         }
+        self.depth += 1;
+        Some(player_pos * S as f32)
+    }
+
+    /// Drill out: zoom by 1/5×.
+    pub fn drill_out(&mut self, player_pos: Vec3) -> Option<Vec3> {
+        if self.depth == 0 {
+            return None;
+        }
+        self.depth -= 1;
+        Some(player_pos / S as f32)
+    }
+
+    /// Mark the super-chunk that owns this integer block as needing a rebake.
+    pub fn dirty_super_for_block(&mut self, block_coord: IVec3) {
+        self.dirty_supers.insert(IVec3::new(
+            block_coord.x.div_euclid(SUPER),
+            block_coord.y.div_euclid(SUPER),
+            block_coord.z.div_euclid(SUPER),
+        ));
+    }
+
+    /// Mark the super-chunk that owns this chunk key as needing a rebake.
+    pub fn dirty_super_for_chunk(&mut self, chunk_key: IVec3) {
+        self.dirty_supers.insert(IVec3::new(
+            chunk_key.x.div_euclid(S),
+            chunk_key.y.div_euclid(S),
+            chunk_key.z.div_euclid(S),
+        ));
     }
 }
 
 // ============================================================
-// Rendering
+// Baking: super-chunks (depth 0) reuse the generic bake_volume
+// ============================================================
+
+/// Bake one super-chunk's 25×25×25 integer-block contents into per-block-type
+/// sub-meshes. Mesh local coordinates are 0..SUPER on each axis.
+pub fn bake_super_chunk(
+    world: &FlatWorld,
+    super_key: IVec3,
+    meshes: &mut Assets<Mesh>,
+) -> Vec<BakedSubMesh> {
+    let origin = super_key * SUPER;
+    bake_volume(
+        SUPER,
+        |x, y, z| {
+            // Out-of-bounds means "no neighbor here", so border faces render.
+            // (We don't cull across super-chunk borders — keeps the render
+            // cache local to one super-chunk at a small visual cost.)
+            if x < 0 || y < 0 || z < 0 || x >= SUPER || y >= SUPER || z >= SUPER {
+                return None;
+            }
+            let ix = origin.x + x;
+            let iy = origin.y + y;
+            let iz = origin.z + z;
+            let chunk_key = IVec3::new(ix.div_euclid(S), iy.div_euclid(S), iz.div_euclid(S));
+            let lx = ix.rem_euclid(S) as usize;
+            let ly = iy.rem_euclid(S) as usize;
+            let lz = iz.rem_euclid(S) as usize;
+            world.chunks.get(&chunk_key).and_then(|c| c.blocks[ly][lz][lx])
+        },
+        meshes,
+    )
+}
+
+// ============================================================
+// Rendering: depth-aware (super-chunks at 0, chunks at 1/2)
 // ============================================================
 
 #[derive(Component)]
-pub struct LayerEntity;
+pub struct ChunkEntity;
 
 #[derive(Resource, Default)]
 pub struct RenderState {
+    /// Spawned root entities, keyed by their depth-specific render key
+    /// (super_key at depth 0, chunk_key at depth 1/2).
     pub entities: HashMap<IVec3, Entity>,
     pub rendered_depth: usize,
-    pub needs_refresh: bool,
+    pub needs_full_refresh: bool,
 }
-
-#[derive(Resource)]
-pub struct SharedCubeMesh(pub Handle<Mesh>);
 
 pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<VoxelWorld>()
+        app.init_resource::<WorldState>()
             .init_resource::<RenderState>()
             .add_systems(Startup, setup_world)
-            .add_systems(Update, render_layer);
+            .add_systems(Update, render_world);
     }
 }
 
-fn setup_world(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut world: ResMut<VoxelWorld>) {
-    commands.insert_resource(SharedCubeMesh(meshes.add(Cuboid::new(1.0, 1.0, 1.0))));
+fn setup_world(mut state: ResMut<WorldState>) {
+    // Build a ground that's a full super-chunk tall (5 chunks = 25 blocks).
+    // This way the bottom super-chunk row is fully populated and the player
+    // walking on top of super-chunk cubes lines up with the visible surface.
+    let stone = Chunk::new_filled(BlockType::Stone);
+    let dirt = Chunk::new_filled(BlockType::Dirt);
+    let grass = Chunk::new_filled(BlockType::Grass);
 
-    let mut ground = [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
-    for z in 0..MODEL_SIZE {
-        for x in 0..MODEL_SIZE {
-            ground[0][z][x] = Some(BlockType::Stone);
-            ground[1][z][x] = Some(BlockType::Stone);
-            ground[2][z][x] = Some(BlockType::Dirt);
-            ground[3][z][x] = Some(BlockType::Dirt);
-            ground[4][z][x] = Some(BlockType::Grass);
-        }
-    }
-
-    let extent = 16;
-    for z in -extent..extent {
-        for x in -extent..extent {
-            world.cells.insert(IVec3::new(x, 0, z), VoxelGrid::from_blocks(&ground, &mut meshes));
+    let extent: i32 = 16;
+    for cz in -extent..extent {
+        for cx in -extent..extent {
+            state.world.chunks.insert(IVec3::new(cx, 0, cz), stone.clone());
+            state.world.chunks.insert(IVec3::new(cx, 1, cz), stone.clone());
+            state.world.chunks.insert(IVec3::new(cx, 2, cz), dirt.clone());
+            state.world.chunks.insert(IVec3::new(cx, 3, cz), dirt.clone());
+            state.world.chunks.insert(IVec3::new(cx, 4, cz), grass.clone());
         }
     }
 }
 
-fn render_layer(
+fn render_world(
     mut commands: Commands,
     materials: Res<BlockMaterials>,
-    world: Res<VoxelWorld>,
-    active: Res<ActiveLayer>,
-    cube: Option<Res<SharedCubeMesh>>,
+    mut state: ResMut<WorldState>,
     mut rs: ResMut<RenderState>,
+    mut meshes: ResMut<Assets<Mesh>>,
     player_q: Query<&Transform, With<Player>>,
 ) {
     let Ok(player_tf) = player_q.single() else { return };
-    let Some(cube) = cube else { return };
 
-    let depth = active.nav_stack.len();
-    if rs.rendered_depth != depth || rs.needs_refresh {
+    if rs.rendered_depth != state.depth || rs.needs_full_refresh {
         for (_, entity) in rs.entities.drain() {
             commands.entity(entity).despawn();
         }
-        rs.rendered_depth = depth;
-        rs.needs_refresh = false;
+        rs.rendered_depth = state.depth;
+        rs.needs_full_refresh = false;
     }
 
-    if active.is_top_layer() {
-        render_top(&mut commands, &materials, &world, &mut rs, player_tf.translation);
-    } else {
-        if rs.entities.is_empty() {
-            render_inside(&mut commands, &materials, &world, &active, &cube, &mut rs);
-        }
+    match state.depth {
+        0 => render_super_chunks(&mut commands, &materials, &mut state, &mut rs, &mut meshes, player_tf),
+        1 => render_chunks(&mut commands, &materials, &mut state, &mut rs, &mut meshes, player_tf, 1.0 / S as f32, 1.0),
+        _ => render_chunks(&mut commands, &materials, &mut state, &mut rs, &mut meshes, player_tf, 1.0, S as f32),
     }
 }
 
-/// Top layer: each cell = 1 world unit.
-fn render_top(commands: &mut Commands, materials: &BlockMaterials, world: &VoxelWorld,
-    rs: &mut RenderState, pos: Vec3,
+fn render_super_chunks(
+    commands: &mut Commands,
+    materials: &BlockMaterials,
+    state: &mut WorldState,
+    rs: &mut RenderState,
+    meshes: &mut Assets<Mesh>,
+    player_tf: &Transform,
 ) {
-    let px = pos.x.floor() as i32;
-    let pz = pos.z.floor() as i32;
-    let mut desired = HashSet::new();
+    // 1 bevy unit = 1 super-chunk at depth 0. Player floor-divides into
+    // super-chunk space directly.
+    let player_key = IVec3::new(
+        player_tf.translation.x.floor() as i32,
+        player_tf.translation.y.floor() as i32,
+        player_tf.translation.z.floor() as i32,
+    );
+
     let rd = RENDER_DISTANCE;
-    for dz in -rd..=rd {
-        for dx in -rd..=rd {
-            if dx * dx + dz * dz > rd * rd { continue; }
-            for y in -2..10 {
-                let c = IVec3::new(px + dx, y, pz + dz);
-                if world.cells.contains_key(&c) { desired.insert(c); }
+    let mut desired: HashSet<IVec3> = HashSet::new();
+    for dy in -rd..=rd {
+        for dz in -rd..=rd {
+            for dx in -rd..=rd {
+                if dx * dx + dy * dy + dz * dz > rd * rd {
+                    continue;
+                }
+                let key = player_key + IVec3::new(dx, dy, dz);
+                if state.world.super_chunk_solid(key) {
+                    desired.insert(key);
+                }
             }
         }
     }
 
-    for &coord in &desired {
-        if rs.entities.contains_key(&coord) { continue; }
-        let Some(grid) = world.cells.get(&coord) else { continue };
-        let e = spawn_baked(commands, materials, &grid.baked, coord.as_vec3(), Vec3::splat(CELL_SCALE));
-        rs.entities.insert(coord, e);
+    // Mesh local size is SUPER, but each super-chunk should occupy 1 bevy
+    // unit, so the entity scale is 1/SUPER.
+    let view_scale = 1.0 / SUPER as f32;
+
+    for &key in &desired {
+        let dirty = state.dirty_supers.contains(&key);
+        if rs.entities.contains_key(&key) && !dirty {
+            continue;
+        }
+
+        if let Some(old) = rs.entities.remove(&key) {
+            commands.entity(old).despawn();
+        }
+
+        let baked = bake_super_chunk(&state.world, key, meshes);
+        state.dirty_supers.remove(&key);
+
+        let pos = key.as_vec3();
+        let root = commands
+            .spawn((
+                ChunkEntity,
+                Transform::from_translation(pos).with_scale(Vec3::splat(view_scale)),
+                Visibility::Inherited,
+            ))
+            .id();
+        for sub in &baked {
+            let child = commands
+                .spawn((
+                    Mesh3d(sub.mesh.clone()),
+                    MeshMaterial3d(materials.get(sub.block_type)),
+                    Transform::default(),
+                ))
+                .id();
+            commands.entity(root).add_child(child);
+        }
+        rs.entities.insert(key, root);
     }
 
-    let stale: Vec<_> = rs.entities.keys().filter(|c| !desired.contains(c)).copied().collect();
-    for c in stale {
-        if let Some(e) = rs.entities.remove(&c) { commands.entity(e).despawn(); }
-    }
+    despawn_stale(commands, rs, &desired);
 }
 
-/// Inside a grid at any depth. Renders:
-/// 1. Current cell's individual blocks/children
-/// 2. Neighboring parent-layer cells (GENERIC — works at any depth)
-fn render_inside(
-    commands: &mut Commands, materials: &BlockMaterials, world: &VoxelWorld,
-    active: &ActiveLayer, cube: &SharedCubeMesh, rs: &mut RenderState,
+fn render_chunks(
+    commands: &mut Commands,
+    materials: &BlockMaterials,
+    state: &mut WorldState,
+    rs: &mut RenderState,
+    meshes: &mut Assets<Mesh>,
+    player_tf: &Transform,
+    view_scale: f32,
+    chunk_size_w: f32,
 ) {
-    let Some(grid) = world.get_grid(&active.nav_stack) else {
-        warn!("render_inside: get_grid returned None at depth {}", active.nav_stack.len());
-        return;
-    };
+    let player_key = IVec3::new(
+        (player_tf.translation.x / chunk_size_w).floor() as i32,
+        (player_tf.translation.y / chunk_size_w).floor() as i32,
+        (player_tf.translation.z / chunk_size_w).floor() as i32,
+    );
 
-    info!("render_inside: depth={}, solid_blocks={}", active.nav_stack.len(), grid.solid_count());
-
-    let s = MODEL_SIZE as i32;
-
-    // 1. Current cell's contents
-    for y in 0..MODEL_SIZE {
-        for z in 0..MODEL_SIZE {
-            for x in 0..MODEL_SIZE {
-                let coord = IVec3::new(x as i32, y as i32, z as i32);
-                match &grid.slots[y][z][x] {
-                    CellSlot::Empty => {}
-                    CellSlot::Block(bt) => {
-                        let e = commands.spawn((
-                            LayerEntity, Mesh3d(cube.0.clone()), MeshMaterial3d(materials.get(*bt)),
-                            Transform::from_translation(coord.as_vec3() + Vec3::splat(0.5)),
-                        )).id();
-                        rs.entities.insert(coord, e);
-                    }
-                    CellSlot::Child(child) => {
-                        let e = spawn_baked(commands, materials, &child.baked,
-                            coord.as_vec3(), Vec3::splat(CELL_SCALE));
-                        rs.entities.insert(coord, e);
-                    }
+    let rd = RENDER_DISTANCE;
+    let mut desired: HashSet<IVec3> = HashSet::new();
+    for dy in -rd..=rd {
+        for dz in -rd..=rd {
+            for dx in -rd..=rd {
+                if dx * dx + dy * dy + dz * dz > rd * rd {
+                    continue;
+                }
+                let key = player_key + IVec3::new(dx, dy, dz);
+                if state.world.chunks.contains_key(&key) {
+                    desired.insert(key);
                 }
             }
         }
     }
 
-    // 2. Render the ENTIRE world at every ancestor layer.
-    //    Walk up the nav stack. At each level, render all cells/slots in that layer
-    //    EXCEPT the one we drilled into (that's already shown as expanded content).
-    //    Each ancestor level is offset and scaled relative to the current coordinate space.
-    //
-    //    offset accumulates: each ancestor's content is shifted by the cell_coord * MODEL_SIZE
-    //    at that level, and scaled by 1/MODEL_SIZE per level below.
-
-    render_ancestors(commands, materials, world, &active.nav_stack, cube, rs);
-}
-
-/// Render all ancestor layers' content around the current cell.
-/// This makes the full world visible at every depth.
-fn render_ancestors(
-    commands: &mut Commands, materials: &BlockMaterials, world: &VoxelWorld,
-    nav_stack: &[NavEntry], cube: &SharedCubeMesh, rs: &mut RenderState,
-) {
-    let s = MODEL_SIZE as i32;
-    let sf = MODEL_SIZE as f32;
-
-    // Walk the stack from deepest to shallowest.
-    // At each level, we compute the offset from the current coordinate space
-    // to that ancestor's coordinate space.
-    //
-    // cumulative_scale tracks how many current-blocks one ancestor slot spans.
-    // It is multiplied by MODEL_SIZE at the TOP of each iteration, so:
-    //   level 0 (immediate parent): cumulative_scale = MODEL_SIZE
-    //   level 1 (grandparent):      cumulative_scale = MODEL_SIZE^2
-    //   etc.
-    //
-    // cumulative_offset is updated by subtracting skip_coord * cumulative_scale
-    // at each level, so that the ancestor's coordinate origin aligns correctly
-    // with the current block-space.
-    //
-    // Baked meshes have vertices in 0..MODEL_SIZE, so mesh_scale = cumulative_scale / MODEL_SIZE
-    // to make them the right size in current block-space.
-    // Individual blocks (cubes) are placed with scale = cumulative_scale.
-
-    let depth = nav_stack.len();
-    let mut cumulative_offset = Vec3::ZERO;
-    let mut cumulative_scale = 1.0f32; // how many current-blocks one ancestor slot spans
-
-    for level in 0..depth {
-        let ancestor_idx = depth - 1 - level; // walk from immediate parent up
-        let entry = &nav_stack[ancestor_idx];
-        let skip_coord = entry.cell_coord;
-
-        // Scale up FIRST: each slot at this ancestor level spans MODEL_SIZE
-        // times as many current-blocks as the level below it.
-        // At level 0 (immediate parent): each slot = MODEL_SIZE current blocks.
-        // At level 1 (grandparent):      each slot = MODEL_SIZE^2 current blocks.
-        cumulative_scale *= sf;
-
-        // The cell we drilled into at this level is at skip_coord.
-        // Its origin in current block-space is at cumulative_offset.
-        // Each slot at this level spans cumulative_scale blocks.
-        // Update offset: shift so this ancestor's (0,0,0) aligns correctly.
-        cumulative_offset -= skip_coord.as_vec3() * cumulative_scale;
-
-        // Determine which cells/slots exist at this ancestor level
-        let key_base = (level as i32 + 1) * 10000;
-
-        if ancestor_idx == 0 {
-            // This ancestor is the top-layer HashMap
-            let range = RENDER_DISTANCE;
-            let anchor = skip_coord; // the top-layer cell we entered
-            for dz in -range..=range {
-                for dx in -range..=range {
-                    if dx * dx + dz * dz > range * range { continue; }
-                    for dy in -2..10 {
-                        let coord = IVec3::new(anchor.x + dx, anchor.y + dy, anchor.z + dz);
-                        if coord == skip_coord { continue; } // already expanded
-                        let Some(grid) = world.cells.get(&coord) else { continue };
-
-                        let pos = cumulative_offset + coord.as_vec3() * cumulative_scale;
-                        let mesh_scale = Vec3::splat(cumulative_scale / sf); // baked mesh is 0..sf, scale to fit
-                        let key = IVec3::new(key_base + dx, key_base + dy, key_base + dz);
-                        let e = spawn_baked(commands, materials, &grid.baked, pos, mesh_scale);
-                        rs.entities.insert(key, e);
-                    }
-                }
-            }
-        } else {
-            // This ancestor is a grid inside the stack
-            let parent_nav = &nav_stack[..ancestor_idx];
-            let Some(parent_grid) = world.get_grid(parent_nav) else { continue };
-
-            for y in 0..MODEL_SIZE {
-                for z in 0..MODEL_SIZE {
-                    for x in 0..MODEL_SIZE {
-                        let coord = IVec3::new(x as i32, y as i32, z as i32);
-                        if coord == skip_coord { continue; }
-
-                        let slot = &parent_grid.slots[y][z][x];
-                        if !slot.is_solid() { continue; }
-
-                        let pos = cumulative_offset + coord.as_vec3() * cumulative_scale;
-                        let key = IVec3::new(key_base + x as i32, key_base + y as i32, key_base + z as i32);
-
-                        match slot {
-                            CellSlot::Child(child) => {
-                                let mesh_scale = Vec3::splat(cumulative_scale / sf);
-                                let e = spawn_baked(commands, materials, &child.baked, pos, mesh_scale);
-                                rs.entities.insert(key, e);
-                            }
-                            CellSlot::Block(bt) => {
-                                let e = commands.spawn((
-                                    LayerEntity, Mesh3d(cube.0.clone()),
-                                    MeshMaterial3d(materials.get(*bt)),
-                                    Transform::from_translation(pos + Vec3::splat(cumulative_scale / 2.0))
-                                        .with_scale(Vec3::splat(cumulative_scale)),
-                                )).id();
-                                rs.entities.insert(key, e);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+    for &key in &desired {
+        let chunk = state.world.chunks.get_mut(&key).unwrap();
+        if chunk.mesh_dirty {
+            chunk.baked = bake_model(&chunk.blocks, meshes);
+            chunk.mesh_dirty = false;
+            if let Some(old) = rs.entities.remove(&key) {
+                commands.entity(old).despawn();
             }
         }
+        if rs.entities.contains_key(&key) {
+            continue;
+        }
 
-        // cumulative_scale was already multiplied at the top of this iteration
+        let chunk = state.world.chunks.get(&key).unwrap();
+        let pos = key.as_vec3() * chunk_size_w;
+        let root = commands
+            .spawn((
+                ChunkEntity,
+                Transform::from_translation(pos).with_scale(Vec3::splat(view_scale)),
+                Visibility::Inherited,
+            ))
+            .id();
+        for sub in &chunk.baked {
+            let child = commands
+                .spawn((
+                    Mesh3d(sub.mesh.clone()),
+                    MeshMaterial3d(materials.get(sub.block_type)),
+                    Transform::default(),
+                ))
+                .id();
+            commands.entity(root).add_child(child);
+        }
+        rs.entities.insert(key, root);
     }
+
+    despawn_stale(commands, rs, &desired);
 }
 
-/// Pure math for render_ancestors: given a nav_stack, compute the
-/// cumulative_offset and cumulative_scale at each ancestor level.
-///
-/// Returns a Vec of `(ancestor_idx, cumulative_offset, cumulative_scale)` tuples,
-/// ordered from the immediate parent (level 0) up to the root.
-pub fn render_ancestor_transforms(nav_stack: &[NavEntry]) -> Vec<(usize, Vec3, f32)> {
-    let sf = MODEL_SIZE as f32;
-    let depth = nav_stack.len();
-    let mut result = Vec::new();
-    let mut cumulative_offset = Vec3::ZERO;
-    let mut cumulative_scale = 1.0f32;
-
-    for level in 0..depth {
-        let ancestor_idx = depth - 1 - level;
-        let skip_coord = nav_stack[ancestor_idx].cell_coord;
-
-        cumulative_scale *= sf;
-        cumulative_offset -= skip_coord.as_vec3() * cumulative_scale;
-
-        result.push((ancestor_idx, cumulative_offset, cumulative_scale));
+fn despawn_stale(commands: &mut Commands, rs: &mut RenderState, desired: &HashSet<IVec3>) {
+    let stale: Vec<_> = rs
+        .entities
+        .keys()
+        .filter(|k| !desired.contains(k))
+        .copied()
+        .collect();
+    for key in stale {
+        if let Some(e) = rs.entities.remove(&key) {
+            commands.entity(e).despawn();
+        }
     }
-    result
 }
-
-fn spawn_baked(commands: &mut Commands, materials: &BlockMaterials, baked: &[BakedSubMesh],
-    position: Vec3, scale: Vec3) -> Entity
-{
-    let root = commands.spawn((
-        LayerEntity, Transform::from_translation(position).with_scale(scale), Visibility::Inherited,
-    )).id();
-    for sub in baked {
-        let child = commands.spawn((
-            Mesh3d(sub.mesh.clone()), MeshMaterial3d(materials.get(sub.block_type)), Transform::default(),
-        )).id();
-        commands.entity(root).add_child(child);
-    }
-    root
-}
-
-// Collision is in world/collision.rs

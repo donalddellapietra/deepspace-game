@@ -44,37 +44,28 @@ const FACES: [(IVec3, [Vec3; 4], Vec3); 6] = [
     ], Vec3::NEG_Z),
 ];
 
-/// Bake a 5x5x5 voxel grid into per-block-type sub-meshes with face culling.
-pub fn bake_model(
-    blocks: &[[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
+/// Bake any cubic voxel volume of `size^3` cells into per-block-type sub-meshes
+/// with face culling. The data source is given as a closure so the caller can
+/// stitch together a FlatWorld, a 5x5x5 model array, or anything else.
+pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<BlockType>>(
+    size: i32,
+    get: F,
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
-    // Collect faces grouped by block type
     let mut groups: std::collections::HashMap<BlockType, FaceCollector> =
         std::collections::HashMap::new();
 
-    let s = MODEL_SIZE as i32;
-
-    for y in 0..s {
-        for z in 0..s {
-            for x in 0..s {
-                let Some(block) = blocks[y as usize][z as usize][x as usize] else {
-                    continue;
-                };
-
+    for y in 0..size {
+        for z in 0..size {
+            for x in 0..size {
+                let Some(block) = get(x, y, z) else { continue };
                 let collector = groups.entry(block).or_default();
 
                 for &(dir, ref quad, normal) in &FACES {
                     let nx = x + dir.x;
                     let ny = y + dir.y;
                     let nz = z + dir.z;
-
-                    let neighbor_solid = nx >= 0 && nx < s && ny >= 0 && ny < s && nz >= 0 && nz < s
-                        && blocks[ny as usize][nz as usize][nx as usize].is_some();
-
-                    if neighbor_solid {
-                        continue;
-                    }
+                    if get(nx, ny, nz).is_some() { continue; }
 
                     let offset = Vec3::new(x as f32, y as f32, z as f32);
                     collector.add_quad(quad, normal, offset);
@@ -85,14 +76,27 @@ pub fn bake_model(
 
     groups
         .into_iter()
-        .map(|(block_type, collector)| {
-            let mesh = collector.build();
-            BakedSubMesh {
-                mesh: meshes.add(mesh),
-                block_type,
-            }
+        .map(|(block_type, collector)| BakedSubMesh {
+            mesh: meshes.add(collector.build()),
+            block_type,
         })
         .collect()
+}
+
+/// Bake a 5x5x5 voxel grid into per-block-type sub-meshes with face culling.
+pub fn bake_model(
+    blocks: &[[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
+    meshes: &mut Assets<Mesh>,
+) -> Vec<BakedSubMesh> {
+    let s = MODEL_SIZE as i32;
+    bake_volume(
+        s,
+        |x, y, z| {
+            if x < 0 || y < 0 || z < 0 || x >= s || y >= s || z >= s { return None; }
+            blocks[y as usize][z as usize][x as usize]
+        },
+        meshes,
+    )
 }
 
 #[derive(Default)]
