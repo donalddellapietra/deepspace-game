@@ -1,3 +1,5 @@
+pub mod collision;
+
 use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
@@ -463,6 +465,30 @@ fn render_ancestors(
     }
 }
 
+/// Pure math for render_ancestors: given a nav_stack, compute the
+/// cumulative_offset and cumulative_scale at each ancestor level.
+///
+/// Returns a Vec of `(ancestor_idx, cumulative_offset, cumulative_scale)` tuples,
+/// ordered from the immediate parent (level 0) up to the root.
+pub fn render_ancestor_transforms(nav_stack: &[NavEntry]) -> Vec<(usize, Vec3, f32)> {
+    let sf = MODEL_SIZE as f32;
+    let depth = nav_stack.len();
+    let mut result = Vec::new();
+    let mut cumulative_offset = Vec3::ZERO;
+    let mut cumulative_scale = 1.0f32;
+
+    for level in 0..depth {
+        let ancestor_idx = depth - 1 - level;
+        let skip_coord = nav_stack[ancestor_idx].cell_coord;
+
+        cumulative_scale *= sf;
+        cumulative_offset -= skip_coord.as_vec3() * cumulative_scale;
+
+        result.push((ancestor_idx, cumulative_offset, cumulative_scale));
+    }
+    result
+}
+
 fn spawn_baked(commands: &mut Commands, materials: &BlockMaterials, baked: &[BakedSubMesh],
     position: Vec3, scale: Vec3) -> Entity
 {
@@ -478,98 +504,4 @@ fn spawn_baked(commands: &mut Commands, materials: &BlockMaterials, baked: &[Bak
     root
 }
 
-// ============================================================
-// Collision — GENERIC for any depth, no special cases
-// ============================================================
-
-/// Floor at top layer. Each cell = 1 world unit.
-pub fn floor_top_layer(cells: &HashMap<IVec3, VoxelGrid>, pos: Vec3) -> f32 {
-    let gx = pos.x.floor() as i32;
-    let gz = pos.z.floor() as i32;
-    let top = pos.y.floor() as i32 + 1;
-    for cy in (-4..=top).rev() {
-        if cells.contains_key(&IVec3::new(gx, cy, gz)) {
-            return (cy + 1) as f32;
-        }
-    }
-    f32::NEG_INFINITY
-}
-
-/// Floor inside a grid at any depth. Uses get_sibling for neighbor lookups.
-pub fn floor_inner(world: &VoxelWorld, nav_stack: &[NavEntry], pos: Vec3) -> f32 {
-    if nav_stack.is_empty() { return f32::NEG_INFINITY; }
-
-    let current = nav_stack.last().unwrap().cell_coord;
-    let sf = MODEL_SIZE as f32;
-    let s = MODEL_SIZE as i32;
-
-    // Which parent-layer cell does the position map to?
-    let pdx = pos.x.div_euclid(sf) as i32;
-    let pdz = pos.z.div_euclid(sf) as i32;
-
-    let lx = (pos.x.rem_euclid(sf).floor() as i32).clamp(0, s - 1) as usize;
-    let lz = (pos.z.rem_euclid(sf).floor() as i32).clamp(0, s - 1) as usize;
-
-    let mut best = f32::NEG_INFINITY;
-
-    for pdy in -2..4 {
-        let sib_coord = current + IVec3::new(pdx, pdy, pdz);
-
-        // Get the grid — works at any depth via get_sibling
-        let grid = if pdx == 0 && pdy == 0 && pdz == 0 {
-            world.get_grid(nav_stack) // current cell
-        } else {
-            world.get_sibling(nav_stack, sib_coord) // neighbor (generic)
-        };
-
-        let Some(grid) = grid else { continue; };
-        let base_y = pdy as f32 * sf;
-
-        for y in (0..MODEL_SIZE).rev() {
-            if grid.slots[y][lz][lx].is_solid() {
-                let top = base_y + (y + 1) as f32;
-                // Return the highest solid surface. The physics system
-                // snaps the player up if they're below it.
-                if top > best {
-                    best = top;
-                    break; // highest in this cell, move to next pdy
-                }
-            }
-        }
-    }
-
-    best
-}
-
-/// Is there a solid block at this position? For horizontal collision. Generic for any depth.
-pub fn is_solid_at(world: &VoxelWorld, nav_stack: &[NavEntry], pos: Vec3) -> bool {
-    if nav_stack.is_empty() {
-        // Top layer
-        let coord = IVec3::new(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
-        return world.cells.contains_key(&coord);
-    }
-
-    let current = nav_stack.last().unwrap().cell_coord;
-    let sf = MODEL_SIZE as f32;
-    let s = MODEL_SIZE as i32;
-
-    let pdx = pos.x.div_euclid(sf) as i32;
-    let pdy = pos.y.div_euclid(sf) as i32;
-    let pdz = pos.z.div_euclid(sf) as i32;
-
-    let lx = (pos.x.rem_euclid(sf).floor() as i32).clamp(0, s - 1) as usize;
-    let ly = (pos.y.rem_euclid(sf).floor() as i32).clamp(0, s - 1) as usize;
-    let lz = (pos.z.rem_euclid(sf).floor() as i32).clamp(0, s - 1) as usize;
-
-    let sib_coord = current + IVec3::new(pdx, pdy, pdz);
-    let grid = if pdx == 0 && pdy == 0 && pdz == 0 {
-        world.get_grid(nav_stack)
-    } else {
-        world.get_sibling(nav_stack, sib_coord)
-    };
-
-    match grid {
-        Some(g) => g.slots[ly][lz][lx].is_solid(),
-        None => false,
-    }
-}
+// Collision is in world/collision.rs

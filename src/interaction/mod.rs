@@ -45,7 +45,7 @@ fn update_target(
 }
 
 /// DDA raycast against the top-layer sparse HashMap.
-fn dda_top_layer(world: &VoxelWorld, origin: Vec3, dir: Vec3, max_dist: f32) -> TargetedBlock {
+pub fn dda_top_layer(world: &VoxelWorld, origin: Vec3, dir: Vec3, max_dist: f32) -> TargetedBlock {
     let (step, inv, mut t_max, t_delta, mut pos) = dda_setup(origin, dir);
     let mut normal = IVec3::ZERO;
     let mut dist = 0.0f32;
@@ -64,7 +64,7 @@ fn dda_top_layer(world: &VoxelWorld, origin: Vec3, dir: Vec3, max_dist: f32) -> 
 }
 
 /// DDA raycast against a bounded VoxelGrid.
-fn dda_grid(grid: &crate::world::VoxelGrid, origin: Vec3, dir: Vec3, max_dist: f32) -> TargetedBlock {
+pub fn dda_grid(grid: &crate::world::VoxelGrid, origin: Vec3, dir: Vec3, max_dist: f32) -> TargetedBlock {
     let (step, inv, mut t_max, t_delta, mut pos) = dda_setup(origin, dir);
     let mut normal = IVec3::ZERO;
     let mut dist = 0.0f32;

@@ -48,10 +48,12 @@ pub fn drill_down(
                 // Auto-create a child grid from this block
                 let bt = *bt;
                 let mut inner = VoxelGrid::new_empty();
-                // Fill bottom layer with the block type so there's ground inside
-                for z in 0..MODEL_SIZE {
-                    for x in 0..MODEL_SIZE {
-                        inner.slots[0][z][x] = CellSlot::Block(bt);
+                // Fill bottom 3 layers — represents the solid interior of this block
+                for y in 0..3 {
+                    for z in 0..MODEL_SIZE {
+                        for x in 0..MODEL_SIZE {
+                            inner.slots[y][z][x] = CellSlot::Block(bt);
+                        }
                     }
                 }
                 inner.rebake(&mut meshes);

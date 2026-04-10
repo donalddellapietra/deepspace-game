@@ -6,6 +6,8 @@ mod interaction;
 mod layer;
 mod model;
 mod player;
+#[cfg(test)]
+mod tests;
 mod ui;
 mod world;
 
