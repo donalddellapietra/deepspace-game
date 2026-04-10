@@ -191,8 +191,8 @@ pub fn place_block(
                     Chunk {
                         blocks: model.blocks,
                         mesh_dirty: true,
-                        baked: vec![],
                         user_modified: true,
+                        level1_id: None,
                     }
                 }
             };

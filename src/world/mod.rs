@@ -11,50 +11,49 @@ use crate::model::BakedSubMesh;
 use crate::player::Player;
 
 const S: i32 = MODEL_SIZE as i32;
-/// Side length of a "super-chunk" in integer blocks: MODEL_SIZE chunks per
-/// axis × MODEL_SIZE blocks per chunk = 25.
+/// Side length of one super-chunk in integer blocks.
 pub const SUPER: i32 = S * S;
 
-/// How many drill levels are supported. Depth 0 = most zoomed out
-/// (super-chunks visible), depth MAX_DEPTH = most zoomed in (single integer
-/// blocks visible). Each step is a 5× linear zoom.
+/// Number of supported zoom levels. Depth 0 = most zoomed out (super-chunks),
+/// MAX_DEPTH = most zoomed in (per-block editing).
 pub const MAX_DEPTH: usize = 2;
 
-/// How far the player can see, measured in *render entities* (super-chunks at
-/// depth 0, chunks at depth 1/2). Same entity budget at every depth.
 const RENDER_DISTANCE: i32 = 8;
 
 // ============================================================
-// Core data: Chunk + FlatWorld (one global integer-block grid)
+// Chunk + FlatWorld
 // ============================================================
 
 #[derive(Clone)]
 pub struct Chunk {
     pub blocks: [[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
-    pub mesh_dirty: bool,
-    pub baked: Vec<BakedSubMesh>,
     /// True iff a player edit has touched this chunk. The streaming generator
     /// must never overwrite a user_modified chunk. Removed cells are kept as
     /// empty `user_modified=true` chunks so the generator skips them too.
     pub user_modified: bool,
+    /// Set to true whenever the content changes. Render will re-look-up the
+    /// mesh library on the next pass.
+    pub mesh_dirty: bool,
+    /// Cached library entry ID. `None` = needs lookup. `Some(0)` = empty.
+    pub level1_id: Option<u64>,
 }
 
 impl Chunk {
     pub fn new_empty() -> Self {
         Self {
             blocks: [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
-            mesh_dirty: true,
-            baked: vec![],
             user_modified: false,
+            mesh_dirty: true,
+            level1_id: None,
         }
     }
 
     pub fn new_filled(bt: BlockType) -> Self {
         Self {
             blocks: [[[Some(bt); MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
-            mesh_dirty: true,
-            baked: vec![],
             user_modified: false,
+            mesh_dirty: true,
+            level1_id: None,
         }
     }
 
@@ -65,9 +64,7 @@ impl Chunk {
     }
 }
 
-/// All blocks in the game live here, indexed by integer-block coordinate
-/// through the chunk grid. There is exactly one of these — drilling never
-/// creates a new world, it just changes how we view this one.
+/// The single integer-block grid. All blocks at every depth live here.
 #[derive(Clone, Default)]
 pub struct FlatWorld {
     pub chunks: HashMap<IVec3, Chunk>,
@@ -84,22 +81,19 @@ impl FlatWorld {
         let chunk = self.chunks.entry(key).or_insert_with(Chunk::new_empty);
         chunk.blocks[local.y as usize][local.z as usize][local.x as usize] = block;
         chunk.mesh_dirty = true;
+        chunk.level1_id = None;
     }
 
     pub fn is_solid(&self, coord: IVec3) -> bool {
         self.get(coord).is_some()
     }
 
-    /// True iff the chunk at `key` exists and contains at least one block.
-    /// Used by depth-1 collision, where one chunk = one bevy unit cube.
     pub fn chunk_solid(&self, key: IVec3) -> bool {
         self.chunks
             .get(&key)
             .is_some_and(|c| c.blocks.iter().flatten().flatten().any(|b| b.is_some()))
     }
 
-    /// True iff any of the 5×5×5 chunks beneath this super-chunk key has a
-    /// block. Used by depth-0 collision, where one super-chunk = one bevy unit.
     pub fn super_chunk_solid(&self, super_key: IVec3) -> bool {
         for cz in 0..S {
             for cy in 0..S {
@@ -130,88 +124,11 @@ impl FlatWorld {
 }
 
 // ============================================================
-// World state: one global world + a current zoom depth
-// ============================================================
-
-#[derive(Resource, Default)]
-pub struct WorldState {
-    pub world: FlatWorld,
-    /// Current zoom level. 0 = most zoomed out (super-chunks), MAX_DEPTH = most
-    /// zoomed in (single integer blocks).
-    pub depth: usize,
-    /// Super-chunks whose cached bake is stale and must be rebuilt before the
-    /// next render at depth 0. Editor systems insert into this set after edits.
-    pub dirty_supers: HashSet<IVec3>,
-}
-
-impl collision::SolidQuery for WorldState {
-    fn is_solid(&self, coord: IVec3) -> bool {
-        // `coord` is in the current depth's bevy-block grid, i.e. one integer
-        // unit equals one player-interactable cube at this depth.
-        match self.depth {
-            0 => self.world.super_chunk_solid(coord),
-            1 => self.world.chunk_solid(coord),
-            _ => self.world.is_solid(coord),
-        }
-    }
-}
-
-impl WorldState {
-    pub fn is_top_layer(&self) -> bool {
-        self.depth == 0
-    }
-
-    pub fn depth(&self) -> usize {
-        self.depth
-    }
-
-    /// Drill in: zoom by 5×. The world is unchanged; only the player's bevy
-    /// position scales so they stay over the same integer-block location.
-    pub fn drill_in(&mut self, player_pos: Vec3) -> Option<Vec3> {
-        if self.depth >= MAX_DEPTH {
-            return None;
-        }
-        self.depth += 1;
-        Some(player_pos * S as f32)
-    }
-
-    /// Drill out: zoom by 1/5×.
-    pub fn drill_out(&mut self, player_pos: Vec3) -> Option<Vec3> {
-        if self.depth == 0 {
-            return None;
-        }
-        self.depth -= 1;
-        Some(player_pos / S as f32)
-    }
-
-    /// Mark the super-chunk that owns this integer block as needing a rebake.
-    pub fn dirty_super_for_block(&mut self, block_coord: IVec3) {
-        self.dirty_supers.insert(IVec3::new(
-            block_coord.x.div_euclid(SUPER),
-            block_coord.y.div_euclid(SUPER),
-            block_coord.z.div_euclid(SUPER),
-        ));
-    }
-
-    /// Mark the super-chunk that owns this chunk key as needing a rebake.
-    pub fn dirty_super_for_chunk(&mut self, chunk_key: IVec3) {
-        self.dirty_supers.insert(IVec3::new(
-            chunk_key.x.div_euclid(S),
-            chunk_key.y.div_euclid(S),
-            chunk_key.z.div_euclid(S),
-        ));
-    }
-}
-
-// ============================================================
 // Procedural generation
 // ============================================================
 
 const WORLD_SEED: u64 = 0xDEAD_BEEF_F00D_CAFE;
 
-/// Deterministic per-chunk content. Returns None for chunk coords that should
-/// not be materialized (above the rock layer or below bedrock). Never touches
-/// world state — pure function of `coord`.
 pub fn generate_chunk(coord: IVec3) -> Option<Chunk> {
     use BlockType::*;
     match coord.y {
@@ -219,9 +136,6 @@ pub fn generate_chunk(coord: IVec3) -> Option<Chunk> {
         2 | 3 => Some(Chunk::new_filled(Dirt)),
         4 => Some(Chunk::new_filled(Grass)),
         5 => {
-            // Sparse layer above the grass: one rock at a deterministic
-            // (rx, rz) per (cx, cz) column. local y = 0 puts the rock on top
-            // of the grass below.
             let mut chunk = Chunk::new_empty();
             let (rx, rz) = rock_position(coord.x, coord.z);
             chunk.blocks[0][rz][rx] = Some(Stone);
@@ -241,41 +155,211 @@ fn rock_position(cx: i32, cz: i32) -> (usize, usize) {
 }
 
 // ============================================================
-// Baking: super-chunks (depth 0) reuse the generic bake_volume
+// MeshLibrary: content-addressed mesh cache, one level per hierarchy step
 // ============================================================
 
-/// Bake one super-chunk's 25×25×25 integer-block contents into per-block-type
-/// sub-meshes. Mesh local coordinates are 0..SUPER on each axis.
-pub fn bake_super_chunk(
+pub type Level1Key = [[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+pub type Level2Key = [[[u64; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+
+#[derive(Clone)]
+pub struct LibraryEntry {
+    pub id: u64,
+    pub baked: Vec<BakedSubMesh>,
+}
+
+/// Content-addressed mesh cache. Entries are never evicted — for procedural
+/// worlds the number of unique patterns is tiny, so this stays bounded even as
+/// the world grows without limit.
+///
+/// * `level1` is keyed by a chunk's 5×5×5 block pattern.
+/// * `level2` is keyed by the 5×5×5 layout of its children's level-1 IDs, so
+///    two super-chunks containing the same 125 chunks (in the same layout)
+///    share one baked mesh.
+#[derive(Resource)]
+pub struct MeshLibrary {
+    pub level1: HashMap<Level1Key, LibraryEntry>,
+    pub level2: HashMap<Level2Key, LibraryEntry>,
+    pub next_id: u64,
+}
+
+impl Default for MeshLibrary {
+    fn default() -> Self {
+        Self {
+            level1: HashMap::new(),
+            level2: HashMap::new(),
+            // 0 is reserved for "empty" (no mesh to render).
+            next_id: 1,
+        }
+    }
+}
+
+pub const EMPTY_ID: u64 = 0;
+
+/// Resolve a chunk's level-1 library ID, baking its mesh on a cache miss.
+/// Clears `mesh_dirty` and stores the id back on the chunk as a cache.
+fn ensure_level1_id(
+    chunk: &mut Chunk,
+    library: &mut MeshLibrary,
+    meshes: &mut Assets<Mesh>,
+) -> u64 {
+    if let Some(id) = chunk.level1_id {
+        if !chunk.mesh_dirty {
+            return id;
+        }
+    }
+
+    // Empty chunk short-circuit.
+    if chunk.blocks.iter().flatten().flatten().all(|b| b.is_none()) {
+        chunk.level1_id = Some(EMPTY_ID);
+        chunk.mesh_dirty = false;
+        return EMPTY_ID;
+    }
+
+    // Library hit?
+    if let Some(entry) = library.level1.get(&chunk.blocks) {
+        chunk.level1_id = Some(entry.id);
+        chunk.mesh_dirty = false;
+        return entry.id;
+    }
+
+    // Miss: bake + insert.
+    let id = library.next_id;
+    library.next_id += 1;
+    let baked = bake_model(&chunk.blocks, meshes);
+    library.level1.insert(chunk.blocks, LibraryEntry { id, baked });
+    chunk.level1_id = Some(id);
+    chunk.mesh_dirty = false;
+    id
+}
+
+/// Walk the 125 children of a super-chunk, ensuring each has a fresh level-1
+/// id, and return the resulting level-2 key.
+fn compute_level2_key(
+    world: &mut FlatWorld,
+    super_key: IVec3,
+    library: &mut MeshLibrary,
+    meshes: &mut Assets<Mesh>,
+) -> Level2Key {
+    let origin = super_key * S;
+    let mut child_ids: Level2Key = [[[EMPTY_ID; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+    for cz in 0..MODEL_SIZE {
+        for cy in 0..MODEL_SIZE {
+            for cx in 0..MODEL_SIZE {
+                let chunk_key = origin + IVec3::new(cx as i32, cy as i32, cz as i32);
+                if let Some(chunk) = world.chunks.get_mut(&chunk_key) {
+                    child_ids[cz][cy][cx] = ensure_level1_id(chunk, library, meshes);
+                }
+            }
+        }
+    }
+    child_ids
+}
+
+/// Bake a super-chunk's 25×25×25 integer grid into per-block-type sub-meshes.
+/// Pre-fetches the 125 chunks into a local array so the inner closure is
+/// array indexing instead of a HashMap lookup per cell.
+fn bake_super_chunk(
     world: &FlatWorld,
     super_key: IVec3,
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
-    let origin = super_key * SUPER;
+    let origin = super_key * S;
+    let mut chunks: [[[Option<&Chunk>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE] =
+        [[[None; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE];
+    for cz in 0..MODEL_SIZE {
+        for cy in 0..MODEL_SIZE {
+            for cx in 0..MODEL_SIZE {
+                let key = origin + IVec3::new(cx as i32, cy as i32, cz as i32);
+                chunks[cz][cy][cx] = world.chunks.get(&key);
+            }
+        }
+    }
+
     bake_volume(
         SUPER,
         |x, y, z| {
-            // Out-of-bounds means "no neighbor here", so border faces render.
-            // (We don't cull across super-chunk borders — keeps the render
-            // cache local to one super-chunk at a small visual cost.)
             if x < 0 || y < 0 || z < 0 || x >= SUPER || y >= SUPER || z >= SUPER {
                 return None;
             }
-            let ix = origin.x + x;
-            let iy = origin.y + y;
-            let iz = origin.z + z;
-            let chunk_key = IVec3::new(ix.div_euclid(S), iy.div_euclid(S), iz.div_euclid(S));
-            let lx = ix.rem_euclid(S) as usize;
-            let ly = iy.rem_euclid(S) as usize;
-            let lz = iz.rem_euclid(S) as usize;
-            world.chunks.get(&chunk_key).and_then(|c| c.blocks[ly][lz][lx])
+            let cx = (x / S) as usize;
+            let cy = (y / S) as usize;
+            let cz = (z / S) as usize;
+            let lx = (x % S) as usize;
+            let ly = (y % S) as usize;
+            let lz = (z % S) as usize;
+            chunks[cz][cy][cx].and_then(|c| c.blocks[ly][lz][lx])
         },
         meshes,
     )
 }
 
 // ============================================================
-// Rendering: depth-aware (super-chunks at 0, chunks at 1/2)
+// World state + drill (single global world, depth is only a view state)
+// ============================================================
+
+#[derive(Resource, Default)]
+pub struct WorldState {
+    pub world: FlatWorld,
+    pub depth: usize,
+    /// Super-chunks whose cached level-2 entry may be stale. Populated by
+    /// editor writes; consumed by `render_super_chunks`.
+    pub dirty_supers: HashSet<IVec3>,
+}
+
+impl collision::SolidQuery for WorldState {
+    fn is_solid(&self, coord: IVec3) -> bool {
+        match self.depth {
+            0 => self.world.super_chunk_solid(coord),
+            1 => self.world.chunk_solid(coord),
+            _ => self.world.is_solid(coord),
+        }
+    }
+}
+
+impl WorldState {
+    pub fn is_top_layer(&self) -> bool {
+        self.depth == 0
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn drill_in(&mut self, player_pos: Vec3) -> Option<Vec3> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        Some(player_pos * S as f32)
+    }
+
+    pub fn drill_out(&mut self, player_pos: Vec3) -> Option<Vec3> {
+        if self.depth == 0 {
+            return None;
+        }
+        self.depth -= 1;
+        Some(player_pos / S as f32)
+    }
+
+    pub fn dirty_super_for_block(&mut self, block_coord: IVec3) {
+        self.dirty_supers.insert(IVec3::new(
+            block_coord.x.div_euclid(SUPER),
+            block_coord.y.div_euclid(SUPER),
+            block_coord.z.div_euclid(SUPER),
+        ));
+    }
+
+    pub fn dirty_super_for_chunk(&mut self, chunk_key: IVec3) {
+        self.dirty_supers.insert(IVec3::new(
+            chunk_key.x.div_euclid(S),
+            chunk_key.y.div_euclid(S),
+            chunk_key.z.div_euclid(S),
+        ));
+    }
+}
+
+// ============================================================
+// Rendering
 // ============================================================
 
 #[derive(Component)]
@@ -283,23 +367,17 @@ pub struct ChunkEntity;
 
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Spawned root entities, keyed by their depth-specific render key
-    /// (super_key at depth 0, chunk_key at depth 1/2).
-    pub entities: HashMap<IVec3, Entity>,
+    /// (entity, library id currently shown) per render key.
+    pub entities: HashMap<IVec3, (Entity, u64)>,
     pub rendered_depth: usize,
     pub needs_full_refresh: bool,
 }
 
-/// State for the streaming generator. We only re-stream when the player has
-/// crossed a chunk-column boundary, and we only generate the new edge.
 #[derive(Resource, Default)]
 pub struct StreamState {
     pub last_column: Option<IVec2>,
 }
 
-/// How wide a window of chunk columns to keep generated around the player,
-/// measured in chunks per axis from the player's column. RENDER_DISTANCE is
-/// in super-chunks at depth 0, so multiply by S to get chunks, plus a margin.
 const STREAM_RADIUS_CHUNKS: i32 = RENDER_DISTANCE * S + S;
 
 pub struct WorldPlugin;
@@ -308,15 +386,13 @@ impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorldState>()
             .init_resource::<RenderState>()
+            .init_resource::<MeshLibrary>()
             .init_resource::<StreamState>()
             .add_systems(PreUpdate, generate_terrain)
             .add_systems(Update, render_world);
     }
 }
 
-/// Streaming terrain generator. Runs in PreUpdate so the world exists before
-/// player physics or render see it. Only ever inserts chunks that are absent;
-/// user_modified chunks (including tombstones) are never overwritten.
 fn generate_terrain(
     mut stream: ResMut<StreamState>,
     mut state: ResMut<WorldState>,
@@ -324,9 +400,6 @@ fn generate_terrain(
 ) {
     let Ok(tf) = player_q.single() else { return };
 
-    // Convert the player's bevy position to integer-block coords using the
-    // current depth's scale. At depth 0 one bevy unit = SUPER integer blocks,
-    // at depth 1 one bevy = S, at depth 2 one bevy = 1.
     let scale = match state.depth {
         0 => SUPER as f32,
         1 => S as f32,
@@ -345,26 +418,22 @@ fn generate_terrain(
     stream.last_column = Some(new_column);
 
     let r = STREAM_RADIUS_CHUNKS;
-    let cy_min: i32 = 0;
-    let cy_max: i32 = 5;
 
     for dz in -r..=r {
         for dx in -r..=r {
             let cx = new_column.x + dx;
             let cz = new_column.y + dz;
 
-            // Delta optimization: skip cells that were already in the previous
-            // window — they're either generated or tombstoned.
             if let Some(p) = prev {
                 if (cx - p.x).abs() <= r && (cz - p.y).abs() <= r {
                     continue;
                 }
             }
 
-            for cy in cy_min..=cy_max {
+            for cy in 0..=5 {
                 let key = IVec3::new(cx, cy, cz);
                 if state.world.chunks.contains_key(&key) {
-                    continue; // user_modified or already generated
+                    continue;
                 }
                 let Some(chunk) = generate_chunk(key) else { continue };
                 state.world.chunks.insert(key, chunk);
@@ -379,13 +448,14 @@ fn render_world(
     materials: Res<BlockMaterials>,
     mut state: ResMut<WorldState>,
     mut rs: ResMut<RenderState>,
+    mut library: ResMut<MeshLibrary>,
     mut meshes: ResMut<Assets<Mesh>>,
     player_q: Query<&Transform, With<Player>>,
 ) {
     let Ok(player_tf) = player_q.single() else { return };
 
     if rs.rendered_depth != state.depth || rs.needs_full_refresh {
-        for (_, entity) in rs.entities.drain() {
+        for (_, (entity, _)) in rs.entities.drain() {
             commands.entity(entity).despawn();
         }
         rs.rendered_depth = state.depth;
@@ -393,83 +463,38 @@ fn render_world(
     }
 
     match state.depth {
-        0 => render_super_chunks(&mut commands, &materials, &mut state, &mut rs, &mut meshes, player_tf),
-        1 => render_chunks(&mut commands, &materials, &mut state, &mut rs, &mut meshes, player_tf, 1.0 / S as f32, 1.0),
-        _ => render_chunks(&mut commands, &materials, &mut state, &mut rs, &mut meshes, player_tf, 1.0, S as f32),
+        0 => render_super_chunks(
+            &mut commands,
+            &materials,
+            &mut state,
+            &mut rs,
+            &mut library,
+            &mut meshes,
+            player_tf,
+        ),
+        1 => render_chunks(
+            &mut commands,
+            &materials,
+            &mut state,
+            &mut rs,
+            &mut library,
+            &mut meshes,
+            player_tf,
+            1.0 / S as f32,
+            1.0,
+        ),
+        _ => render_chunks(
+            &mut commands,
+            &materials,
+            &mut state,
+            &mut rs,
+            &mut library,
+            &mut meshes,
+            player_tf,
+            1.0,
+            S as f32,
+        ),
     }
-}
-
-fn render_super_chunks(
-    commands: &mut Commands,
-    materials: &BlockMaterials,
-    state: &mut WorldState,
-    rs: &mut RenderState,
-    meshes: &mut Assets<Mesh>,
-    player_tf: &Transform,
-) {
-    // 1 bevy unit = 1 super-chunk at depth 0. Player floor-divides into
-    // super-chunk space directly.
-    let player_key = IVec3::new(
-        player_tf.translation.x.floor() as i32,
-        player_tf.translation.y.floor() as i32,
-        player_tf.translation.z.floor() as i32,
-    );
-
-    let rd = RENDER_DISTANCE;
-    let mut desired: HashSet<IVec3> = HashSet::new();
-    for dy in -rd..=rd {
-        for dz in -rd..=rd {
-            for dx in -rd..=rd {
-                if dx * dx + dy * dy + dz * dz > rd * rd {
-                    continue;
-                }
-                let key = player_key + IVec3::new(dx, dy, dz);
-                if state.world.super_chunk_solid(key) {
-                    desired.insert(key);
-                }
-            }
-        }
-    }
-
-    // Mesh local size is SUPER, but each super-chunk should occupy 1 bevy
-    // unit, so the entity scale is 1/SUPER.
-    let view_scale = 1.0 / SUPER as f32;
-
-    for &key in &desired {
-        let dirty = state.dirty_supers.contains(&key);
-        if rs.entities.contains_key(&key) && !dirty {
-            continue;
-        }
-
-        if let Some(old) = rs.entities.remove(&key) {
-            commands.entity(old).despawn();
-        }
-
-        let baked = bake_super_chunk(&state.world, key, meshes);
-        state.dirty_supers.remove(&key);
-
-        let pos = key.as_vec3();
-        let root = commands
-            .spawn((
-                ChunkEntity,
-                Transform::from_translation(pos).with_scale(Vec3::splat(view_scale)),
-                Visibility::Inherited,
-            ))
-            .id();
-        for sub in &baked {
-            let child = commands
-                .spawn((
-                    Mesh3d(sub.mesh.clone()),
-                    MeshMaterial3d(materials.get(sub.block_type)),
-                    Transform::default(),
-                ))
-                .id();
-            commands.entity(root).add_child(child);
-        }
-        rs.entities.insert(key, root);
-    }
-
-    despawn_stale(commands, rs, &desired);
 }
 
 fn render_chunks(
@@ -477,6 +502,7 @@ fn render_chunks(
     materials: &BlockMaterials,
     state: &mut WorldState,
     rs: &mut RenderState,
+    library: &mut MeshLibrary,
     meshes: &mut Assets<Mesh>,
     player_tf: &Transform,
     view_scale: f32,
@@ -505,19 +531,29 @@ fn render_chunks(
     }
 
     for &key in &desired {
-        let chunk = state.world.chunks.get_mut(&key).unwrap();
-        if chunk.mesh_dirty {
-            chunk.baked = bake_model(&chunk.blocks, meshes);
-            chunk.mesh_dirty = false;
-            if let Some(old) = rs.entities.remove(&key) {
-                commands.entity(old).despawn();
+        // Resolve the current library id (may bake on miss).
+        let level1_id = match state.world.chunks.get_mut(&key) {
+            Some(chunk) => ensure_level1_id(chunk, library, meshes),
+            None => continue,
+        };
+
+        // Freshness check.
+        if let Some(&(entity, existing_id)) = rs.entities.get(&key) {
+            if existing_id == level1_id {
+                continue;
             }
+            commands.entity(entity).despawn();
+            rs.entities.remove(&key);
         }
-        if rs.entities.contains_key(&key) {
+
+        if level1_id == EMPTY_ID {
             continue;
         }
 
-        let chunk = state.world.chunks.get(&key).unwrap();
+        // Library lookup for spawning. Chunk content is Copy so this is cheap.
+        let content = state.world.chunks.get(&key).unwrap().blocks;
+        let entry = library.level1.get(&content).expect("ensured above");
+
         let pos = key.as_vec3() * chunk_size_w;
         let root = commands
             .spawn((
@@ -526,7 +562,7 @@ fn render_chunks(
                 Visibility::Inherited,
             ))
             .id();
-        for sub in &chunk.baked {
+        for sub in &entry.baked {
             let child = commands
                 .spawn((
                     Mesh3d(sub.mesh.clone()),
@@ -536,7 +572,109 @@ fn render_chunks(
                 .id();
             commands.entity(root).add_child(child);
         }
-        rs.entities.insert(key, root);
+        rs.entities.insert(key, (root, level1_id));
+    }
+
+    despawn_stale(commands, rs, &desired);
+}
+
+fn render_super_chunks(
+    commands: &mut Commands,
+    materials: &BlockMaterials,
+    state: &mut WorldState,
+    rs: &mut RenderState,
+    library: &mut MeshLibrary,
+    meshes: &mut Assets<Mesh>,
+    player_tf: &Transform,
+) {
+    let player_key = IVec3::new(
+        player_tf.translation.x.floor() as i32,
+        player_tf.translation.y.floor() as i32,
+        player_tf.translation.z.floor() as i32,
+    );
+
+    let rd = RENDER_DISTANCE;
+    let mut desired: HashSet<IVec3> = HashSet::new();
+    for dy in -rd..=rd {
+        for dz in -rd..=rd {
+            for dx in -rd..=rd {
+                if dx * dx + dy * dy + dz * dz > rd * rd {
+                    continue;
+                }
+                let key = player_key + IVec3::new(dx, dy, dz);
+                if state.world.super_chunk_solid(key) {
+                    desired.insert(key);
+                }
+            }
+        }
+    }
+
+    let view_scale = 1.0 / SUPER as f32;
+
+    for &super_key in &desired {
+        let is_dirty = state.dirty_supers.contains(&super_key);
+        let already_rendered = rs.entities.contains_key(&super_key);
+
+        // Optimization: already-rendered and not dirty → nothing to do.
+        if already_rendered && !is_dirty {
+            continue;
+        }
+
+        // Compute the key (also ensures each child has a level-1 id).
+        let level2_key = compute_level2_key(&mut state.world, super_key, library, meshes);
+        state.dirty_supers.remove(&super_key);
+
+        // Resolve level-2 id: cache hit, bake miss, or all-empty short-circuit.
+        let all_empty = level2_key
+            .iter()
+            .flatten()
+            .flatten()
+            .all(|&id| id == EMPTY_ID);
+        let level2_id = if all_empty {
+            EMPTY_ID
+        } else if let Some(entry) = library.level2.get(&level2_key) {
+            entry.id
+        } else {
+            let id = library.next_id;
+            library.next_id += 1;
+            let baked = bake_super_chunk(&state.world, super_key, meshes);
+            library.level2.insert(level2_key, LibraryEntry { id, baked });
+            id
+        };
+
+        // Freshness check.
+        if let Some(&(entity, existing_id)) = rs.entities.get(&super_key) {
+            if existing_id == level2_id {
+                continue;
+            }
+            commands.entity(entity).despawn();
+            rs.entities.remove(&super_key);
+        }
+
+        if level2_id == EMPTY_ID {
+            continue;
+        }
+
+        let entry = library.level2.get(&level2_key).expect("ensured above");
+        let pos = super_key.as_vec3();
+        let root = commands
+            .spawn((
+                ChunkEntity,
+                Transform::from_translation(pos).with_scale(Vec3::splat(view_scale)),
+                Visibility::Inherited,
+            ))
+            .id();
+        for sub in &entry.baked {
+            let child = commands
+                .spawn((
+                    Mesh3d(sub.mesh.clone()),
+                    MeshMaterial3d(materials.get(sub.block_type)),
+                    Transform::default(),
+                ))
+                .id();
+            commands.entity(root).add_child(child);
+        }
+        rs.entities.insert(super_key, (root, level2_id));
     }
 
     despawn_stale(commands, rs, &desired);
@@ -550,7 +688,7 @@ fn despawn_stale(commands: &mut Commands, rs: &mut RenderState, desired: &HashSe
         .copied()
         .collect();
     for key in stale {
-        if let Some(e) = rs.entities.remove(&key) {
+        if let Some((e, _)) = rs.entities.remove(&key) {
             commands.entity(e).despawn();
         }
     }
