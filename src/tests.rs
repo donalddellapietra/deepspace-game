@@ -195,16 +195,16 @@ fn jump_onto_block() {
     // Should be above the brick platform (y > 2.0)
     assert!(pos.y > 2.0, "Should rise above bricks. Got y={}", pos.y);
 
-    // Phase 2: drift right and fall onto the platform
+    // Phase 2: drift slightly right and fall onto the platform
     for _ in 0..60 {
         vel.y -= 20.0 * (1.0 / 60.0);
-        let h_delta = Vec2::new(6.0 * (1.0 / 60.0), 0.0);
+        let h_delta = Vec2::new(2.0 * (1.0 / 60.0), 0.0); // slow drift
         move_and_collide(&mut pos, &mut vel, h_delta, 1.0 / 60.0, &world, &nav);
     }
 
-    // Player should be on top of the brick platform at y=2.0
-    assert!((pos.y - 2.0).abs() < 0.1, "Should land on brick platform at y=2. Got y={}", pos.y);
-    assert!(pos.x >= 3.0, "Should have moved onto the platform. Got x={}", pos.x);
+    // Player should have landed on the brick platform (x=3..5) at y=2.0
+    assert!(pos.x >= 3.0 && pos.x <= 5.0, "Should be on platform. Got x={}", pos.x);
+    assert!((pos.y - 2.0).abs() < 0.1, "Should land on brick at y=2. Got y={}", pos.y);
 }
 
 #[test]

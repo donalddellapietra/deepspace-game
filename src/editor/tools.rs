@@ -48,8 +48,8 @@ pub fn drill_down(
                 // Auto-create a child grid from this block
                 let bt = *bt;
                 let mut inner = VoxelGrid::new_empty();
-                // Fill bottom 3 layers — represents the solid interior of this block
-                for y in 0..3 {
+                // A block is solid — fill ALL 5 layers
+                for y in 0..MODEL_SIZE {
                     for z in 0..MODEL_SIZE {
                         for x in 0..MODEL_SIZE {
                             inner.slots[y][z][x] = CellSlot::Block(bt);
