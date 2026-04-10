@@ -7,7 +7,7 @@ use crate::inventory::InventoryState;
 use crate::model::mesher::bake_model;
 use crate::model::{ModelRegistry, VoxelModel};
 use crate::player::{Player, Velocity};
-use crate::world::{Chunk, RenderState, WorldState, MAX_DEPTH, SUPER};
+use crate::world::{Chunk, MeshLibrary, RenderState, WorldState, MAX_DEPTH, SUPER};
 
 const S: i32 = MODEL_SIZE as i32;
 
@@ -86,6 +86,7 @@ pub fn remove_block(
     inv: Res<InventoryState>,
     targeted: Res<TargetedBlock>,
     mut state: ResMut<WorldState>,
+    mut library: ResMut<MeshLibrary>,
 ) {
     if inv.open || !locked.0 {
         return;
@@ -103,7 +104,7 @@ pub fn remove_block(
                 for cy in 0..S {
                     for cx in 0..S {
                         let chunk_key = hit * S + IVec3::new(cx, cy, cz);
-                        state.world.chunks.insert(chunk_key, Chunk::tombstone());
+                        state.replace_chunk(chunk_key, Chunk::tombstone(), &mut library);
                     }
                 }
             }
@@ -111,14 +112,12 @@ pub fn remove_block(
         }
         1 => {
             // hit is a chunk key.
-            state.world.chunks.insert(hit, Chunk::tombstone());
-            state.dirty_super_for_chunk(hit);
+            state.replace_chunk(hit, Chunk::tombstone(), &mut library);
         }
         _ => {
             // hit is an integer block coord.
-            state.world.set(hit, None);
-            // Mark the containing chunk user_modified so the generator will
-            // never overwrite the user's hole.
+            state.edit_block(hit, None, &mut library);
+            // Mark user_modified so the streaming generator never refills.
             let key = IVec3::new(
                 hit.x.div_euclid(S),
                 hit.y.div_euclid(S),
@@ -127,7 +126,6 @@ pub fn remove_block(
             if let Some(chunk) = state.world.chunks.get_mut(&key) {
                 chunk.user_modified = true;
             }
-            state.dirty_super_for_block(hit);
         }
     }
 }
@@ -140,6 +138,7 @@ pub fn place_block(
     hotbar: Res<super::Hotbar>,
     registry: Res<ModelRegistry>,
     mut state: ResMut<WorldState>,
+    mut library: ResMut<MeshLibrary>,
 ) {
     if inv.open || !locked.0 {
         return;
@@ -160,7 +159,7 @@ pub fn place_block(
             }
             let bt = match hotbar.active_item() {
                 super::HotbarItem::Block(bt) => *bt,
-                super::HotbarItem::SavedModel(_) => BlockType::Stone, // models are too small at this granularity
+                super::HotbarItem::SavedModel(_) => BlockType::Stone,
             };
             let mut filled = Chunk::new_filled(bt);
             filled.user_modified = true;
@@ -168,7 +167,7 @@ pub fn place_block(
                 for cy in 0..S {
                     for cx in 0..S {
                         let chunk_key = place * S + IVec3::new(cx, cy, cz);
-                        state.world.chunks.insert(chunk_key, filled.clone());
+                        state.replace_chunk(chunk_key, filled.clone(), &mut library);
                     }
                 }
             }
@@ -196,8 +195,7 @@ pub fn place_block(
                     }
                 }
             };
-            state.world.chunks.insert(place, chunk);
-            state.dirty_super_for_chunk(place);
+            state.replace_chunk(place, chunk, &mut library);
         }
         _ => {
             if state.world.is_solid(place) {
@@ -205,8 +203,8 @@ pub fn place_block(
             }
             match hotbar.active_item() {
                 super::HotbarItem::Block(bt) => {
-                    state.world.set(place, Some(*bt));
-                    mark_block_user_modified(&mut state, place);
+                    state.edit_block(place, Some(*bt), &mut library);
+                    mark_user_modified(&mut state, place);
                 }
                 super::HotbarItem::SavedModel(idx) => {
                     let Some(model) = registry.models.get(*idx) else {
@@ -219,8 +217,8 @@ pub fn place_block(
                                 if let Some(bt) = blocks[y][z][x] {
                                     let coord =
                                         place + IVec3::new(x as i32, y as i32, z as i32);
-                                    state.world.set(coord, Some(bt));
-                                    mark_block_user_modified(&mut state, coord);
+                                    state.edit_block(coord, Some(bt), &mut library);
+                                    mark_user_modified(&mut state, coord);
                                 }
                             }
                         }
@@ -234,7 +232,7 @@ pub fn place_block(
     let _ = SUPER;
 }
 
-fn mark_block_user_modified(state: &mut WorldState, coord: IVec3) {
+fn mark_user_modified(state: &mut WorldState, coord: IVec3) {
     let key = IVec3::new(
         coord.x.div_euclid(S),
         coord.y.div_euclid(S),
@@ -243,7 +241,6 @@ fn mark_block_user_modified(state: &mut WorldState, coord: IVec3) {
     if let Some(chunk) = state.world.chunks.get_mut(&key) {
         chunk.user_modified = true;
     }
-    state.dirty_super_for_block(coord);
 }
 
 // ============================================================
