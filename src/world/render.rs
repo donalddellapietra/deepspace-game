@@ -108,21 +108,20 @@ fn render_chunks(
         (player_tf.translation.z / chunk_size_w).floor() as i32,
     );
 
-    let rd = RENDER_DISTANCE;
-    let mut desired: HashSet<IVec3> = HashSet::new();
-    for dy in -rd..=rd {
-        for dz in -rd..=rd {
-            for dx in -rd..=rd {
-                if dx * dx + dy * dy + dz * dz > rd * rd {
-                    continue;
-                }
-                let key = player_key + IVec3::new(dx, dy, dz);
-                if state.world.chunks.contains_key(&key) {
-                    desired.insert(key);
-                }
-            }
-        }
-    }
+    // Build desired by walking the actual chunk set — one iteration over
+    // populated entities, not the cubic sphere. Cost is linear in chunk
+    // count instead of cubic in RENDER_DISTANCE.
+    let rd_sq = RENDER_DISTANCE * RENDER_DISTANCE;
+    let desired: HashSet<IVec3> = state
+        .world
+        .chunks
+        .keys()
+        .copied()
+        .filter(|&key| {
+            let d = key - player_key;
+            d.x * d.x + d.y * d.y + d.z * d.z <= rd_sq
+        })
+        .collect();
 
     for &key in &desired {
         let level1_id = match state.world.chunks.get_mut(&key) {
@@ -193,20 +192,25 @@ fn render_super_chunks(
         player_tf.translation.z.floor() as i32,
     );
 
-    let rd = RENDER_DISTANCE;
+    // Derive the desired super-chunk set from the actual chunk set. Each
+    // chunk is mapped to its containing super-chunk; dedupe via the HashSet.
+    // Linear in populated chunks, not cubic in RENDER_DISTANCE.
+    let rd_sq = RENDER_DISTANCE * RENDER_DISTANCE;
     let mut desired: HashSet<IVec3> = HashSet::new();
-    for dy in -rd..=rd {
-        for dz in -rd..=rd {
-            for dx in -rd..=rd {
-                if dx * dx + dy * dy + dz * dz > rd * rd {
-                    continue;
-                }
-                let key = player_key + IVec3::new(dx, dy, dz);
-                if state.world.super_chunk_solid(key) {
-                    desired.insert(key);
-                }
-            }
+    for chunk_key in state.world.chunks.keys() {
+        let super_key = IVec3::new(
+            chunk_key.x.div_euclid(S),
+            chunk_key.y.div_euclid(S),
+            chunk_key.z.div_euclid(S),
+        );
+        if desired.contains(&super_key) {
+            continue;
         }
+        let d = super_key - player_key;
+        if d.x * d.x + d.y * d.y + d.z * d.z > rd_sq {
+            continue;
+        }
+        desired.insert(super_key);
     }
 
     let view_scale = 1.0 / SUPER as f32;

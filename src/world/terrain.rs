@@ -33,8 +33,10 @@ pub fn generate_chunk(coord: IVec3) -> Option<Chunk> {
         2 | 3 => Some(Chunk::new_filled(Dirt)),
         4 => Some(Chunk::new_filled(Grass)),
         5 => {
-            // Sparse layer above the grass: one rock per 5×5 column, at a
-            // hash-derived (rx, rz).
+            // Sparse layer above the grass: one rock per 5×5 column, laid out
+            // by the chunk's LOCAL position within its super-chunk so every
+            // rock super-chunk worldwide collapses to one level-2 library
+            // entry.
             let mut chunk = Chunk::new_empty();
             let (rx, rz) = rock_position(coord.x, coord.z);
             chunk.blocks[0][rz][rx] = Some(Stone);
