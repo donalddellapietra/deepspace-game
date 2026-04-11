@@ -26,7 +26,7 @@ use super::position::{LayerPos, Position, NODE_PATH_LEN};
 use super::render::{cell_size_at_layer, ROOT_ORIGIN};
 use super::state::{world_extent_voxels, WorldState};
 use super::tree::{
-    slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL,
+    slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
     NODE_VOXELS_PER_AXIS,
 };
 
@@ -221,7 +221,21 @@ pub fn bevy_from_position(pos: &Position) -> Vec3 {
         )
 }
 
-// --------------------------------------------------------------- AABB
+// ----------------------------------------------------------- collision
+//
+// Player AABB scales with the view layer's cell size: at view L the
+// player is `PLAYER_HW` cells wide and `PLAYER_H` cells tall (= the
+// camera's eye height). Collision blocks are sampled at `target_layer
+// = (L + 2).min(MAX_LAYER)` — the same layer the renderer reads from
+// — so the visible mesh and the collision lattice always agree, at
+// every zoom level.
+//
+// At L = 10/11/12, target = MAX_LAYER (the leaves), block_size = 1
+// Bevy unit, and this code is functionally identical to the
+// previous leaf-voxel collision. At lower L the block grid grows
+// (`5^(MAX_LAYER - target)` Bevy units per side) and the player AABB
+// grows in lockstep, so the per-frame cell-iteration count stays
+// roughly constant (~`PLAYER_H * 25` cells in y, similar in x/z).
 
 #[derive(Clone, Copy)]
 struct Aabb {
@@ -229,55 +243,42 @@ struct Aabb {
     max: Vec3,
 }
 
-impl Aabb {
-    fn from_feet(pos: Vec3) -> Self {
-        Self {
-            min: Vec3::new(pos.x - PLAYER_HW, pos.y, pos.z - PLAYER_HW),
-            max: Vec3::new(
-                pos.x + PLAYER_HW,
-                pos.y + PLAYER_H,
-                pos.z + PLAYER_HW,
-            ),
-        }
-    }
-
-    fn expanded(&self, axis: usize, delta: f32) -> Self {
-        let mut r = *self;
-        if delta > 0.0 {
-            r.max[axis] += delta;
-        } else {
-            r.min[axis] += delta;
-        }
-        r
-    }
-
-    fn block_range(&self) -> (IVec3, IVec3) {
-        (
-            IVec3::new(
-                self.min.x.floor() as i32,
-                self.min.y.floor() as i32,
-                self.min.z.floor() as i32,
-            ),
-            IVec3::new(
-                (self.max.x - 1e-5).floor() as i32,
-                (self.max.y - 1e-5).floor() as i32,
-                (self.max.z - 1e-5).floor() as i32,
-            ),
-        )
+fn player_aabb(pos: Vec3, view_cell: f32) -> Aabb {
+    let hw = PLAYER_HW * view_cell;
+    let h = PLAYER_H * view_cell;
+    Aabb {
+        min: Vec3::new(pos.x - hw, pos.y, pos.z - hw),
+        max: Vec3::new(pos.x + hw, pos.y + h, pos.z + hw),
     }
 }
 
-/// Clip a one-axis movement `delta` against a single unit-block AABB.
-/// Returns a delta of equal sign but smaller (or zero) magnitude if
-/// the block stops the motion.
-fn clip_axis(player: &Aabb, delta: f32, axis: usize, bx: i32, by: i32, bz: i32) -> f32 {
+/// Clip a one-axis movement `delta` against a single block of side
+/// `block_size`, anchored to the cell lattice rooted at `cell_origin`.
+fn clip_axis(
+    player: &Aabb,
+    delta: f32,
+    axis: usize,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    block_size: f32,
+    cell_origin: Vec3,
+) -> f32 {
     let (a1, a2) = match axis {
         0 => (1, 2),
         1 => (0, 2),
         _ => (0, 1),
     };
-    let b_min = [bx as f32, by as f32, bz as f32];
-    let b_max = [(bx + 1) as f32, (by + 1) as f32, (bz + 1) as f32];
+    let b_min = [
+        cell_origin.x + bx as f32 * block_size,
+        cell_origin.y + by as f32 * block_size,
+        cell_origin.z + bz as f32 * block_size,
+    ];
+    let b_max = [
+        b_min[0] + block_size,
+        b_min[1] + block_size,
+        b_min[2] + block_size,
+    ];
 
     if player.max[a1] <= b_min[a1] || player.min[a1] >= b_max[a1] {
         return delta;
@@ -302,62 +303,108 @@ fn clip_axis(player: &Aabb, delta: f32, axis: usize, bx: i32, by: i32, bz: i32) 
     delta
 }
 
-/// Collect the solid blocks the player's swept AABB could touch.
-fn nearby_solid_blocks(
+/// Sample the layer-`target_layer` cell at integer coord `(bx, by, bz)`
+/// (relative to `cell_origin` in `block_size` strides).
+fn is_target_block_solid(
     world: &WorldState,
-    pos: Vec3,
-    dx: f32,
-    dy: f32,
-    dz: f32,
-) -> Vec<(i32, i32, i32)> {
-    let player = Aabb::from_feet(pos);
-    let expanded = Aabb {
-        min: Vec3::new(
-            player.min.x + dx.min(0.0) - 1.0,
-            player.min.y + dy.min(0.0) - 1.0,
-            player.min.z + dz.min(0.0) - 1.0,
-        ),
-        max: Vec3::new(
-            player.max.x + dx.max(0.0) + 1.0,
-            player.max.y + dy.max(0.0) + 1.0,
-            player.max.z + dz.max(0.0) + 1.0,
-        ),
-    };
-    let (bmin, bmax) = expanded.block_range();
-    let mut blocks = Vec::new();
-    for by in bmin.y..=bmax.y {
-        for bz in bmin.z..=bmax.z {
-            for bx in bmin.x..=bmax.x {
-                if solid_at_integer(world, IVec3::new(bx, by, bz)) {
-                    blocks.push((bx, by, bz));
-                }
-            }
-        }
+    target_layer: u8,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    block_size: f32,
+    cell_origin: Vec3,
+) -> bool {
+    let center = cell_origin
+        + Vec3::new(
+            (bx as f32 + 0.5) * block_size,
+            (by as f32 + 0.5) * block_size,
+            (bz as f32 + 0.5) * block_size,
+        );
+    match layer_pos_from_bevy(center, target_layer) {
+        Some(lp) => is_layer_pos_solid(world, &lp),
+        None => false,
     }
-    blocks
 }
 
-/// Resolve player movement with per-axis clipping. Modifies `pos` and
-/// `vel` in place. `horizontal_delta` is the desired XZ displacement
-/// (already scaled by dt). Y is resolved first, then X, then Z.
+/// Convert an AABB into the half-open cell range that overlaps it,
+/// expressed in cell-units relative to `cell_origin` and `block_size`.
+fn aabb_block_range(aabb: Aabb, block_size: f32, cell_origin: Vec3) -> (IVec3, IVec3) {
+    (
+        IVec3::new(
+            ((aabb.min.x - cell_origin.x) / block_size).floor() as i32,
+            ((aabb.min.y - cell_origin.y) / block_size).floor() as i32,
+            ((aabb.min.z - cell_origin.z) / block_size).floor() as i32,
+        ),
+        IVec3::new(
+            ((aabb.max.x - cell_origin.x - 1e-5) / block_size).floor() as i32,
+            ((aabb.max.y - cell_origin.y - 1e-5) / block_size).floor() as i32,
+            ((aabb.max.z - cell_origin.z - 1e-5) / block_size).floor() as i32,
+        ),
+    )
+}
+
+/// Resolve player movement with per-axis clipping. The player AABB
+/// scales with the view layer's cell size, and the collision blocks
+/// are sampled at the same layer the renderer reads from
+/// (`target = (view_layer + 2).min(MAX_LAYER)`).
 pub fn move_and_collide(
     pos: &mut Vec3,
     vel: &mut Vec3,
     horizontal_delta: Vec2,
     dt: f32,
     world: &WorldState,
+    view_layer: u8,
 ) {
+    let view_cell = cell_size_at_layer(view_layer);
+    let target_layer = view_layer.saturating_add(2).min(MAX_LAYER);
+    let block_size = cell_size_at_layer(target_layer);
+    let cell_origin = ROOT_ORIGIN;
+
     let mut dy = vel.y * dt;
     let dx = horizontal_delta.x;
     let dz = horizontal_delta.y;
 
-    let blocks = nearby_solid_blocks(world, *pos, dx, dy, dz);
+    // Expanded AABB covers the player's range plus the move delta
+    // plus one block's margin on each side.
+    let player = player_aabb(*pos, view_cell);
+    let expanded = Aabb {
+        min: Vec3::new(
+            player.min.x + dx.min(0.0) - block_size,
+            player.min.y + dy.min(0.0) - block_size,
+            player.min.z + dz.min(0.0) - block_size,
+        ),
+        max: Vec3::new(
+            player.max.x + dx.max(0.0) + block_size,
+            player.max.y + dy.max(0.0) + block_size,
+            player.max.z + dz.max(0.0) + block_size,
+        ),
+    };
+    let (bmin, bmax) = aabb_block_range(expanded, block_size, cell_origin);
+
+    let mut blocks: Vec<(i32, i32, i32)> = Vec::new();
+    for by in bmin.y..=bmax.y {
+        for bz in bmin.z..=bmax.z {
+            for bx in bmin.x..=bmax.x {
+                if is_target_block_solid(
+                    world,
+                    target_layer,
+                    bx,
+                    by,
+                    bz,
+                    block_size,
+                    cell_origin,
+                ) {
+                    blocks.push((bx, by, bz));
+                }
+            }
+        }
+    }
 
     // --- Y first ---
-    let player_aabb = Aabb::from_feet(*pos);
+    let pa = player_aabb(*pos, view_cell);
     let original_dy = dy;
     for &(bx, by, bz) in &blocks {
-        dy = clip_axis(&player_aabb, dy, 1, bx, by, bz);
+        dy = clip_axis(&pa, dy, 1, bx, by, bz, block_size, cell_origin);
     }
     pos.y += dy;
     if (dy - original_dy).abs() > 1e-6 {
@@ -365,39 +412,66 @@ pub fn move_and_collide(
     }
 
     // --- X ---
-    let player_aabb = Aabb::from_feet(*pos);
+    let pa = player_aabb(*pos, view_cell);
     let mut clipped_dx = dx;
     for &(bx, by, bz) in &blocks {
-        clipped_dx = clip_axis(&player_aabb, clipped_dx, 0, bx, by, bz);
+        clipped_dx = clip_axis(&pa, clipped_dx, 0, bx, by, bz, block_size, cell_origin);
     }
     pos.x += clipped_dx;
 
     // --- Z ---
-    let player_aabb = Aabb::from_feet(*pos);
+    let pa = player_aabb(*pos, view_cell);
     let mut clipped_dz = dz;
     for &(bx, by, bz) in &blocks {
-        clipped_dz = clip_axis(&player_aabb, clipped_dz, 2, bx, by, bz);
+        clipped_dz = clip_axis(&pa, clipped_dz, 2, bx, by, bz, block_size, cell_origin);
     }
     pos.z += clipped_dz;
 }
 
 /// Is the player standing on something? Tests a tiny downward nudge
-/// against all nearby blocks; if the nudge gets clipped ~to zero we
+/// (one tenth of a block at the current layer) against all nearby
+/// blocks at `target_layer`. If the nudge gets clipped ~to zero we
 /// were on the floor.
-pub fn on_ground(pos: Vec3, world: &WorldState) -> bool {
-    let player = Aabb::from_feet(pos);
-    let mut test_dy: f32 = -0.05;
-    let (bmin, bmax) = player.expanded(1, -0.1).block_range();
+pub fn on_ground(pos: Vec3, world: &WorldState, view_layer: u8) -> bool {
+    let view_cell = cell_size_at_layer(view_layer);
+    let target_layer = view_layer.saturating_add(2).min(MAX_LAYER);
+    let block_size = cell_size_at_layer(target_layer);
+    let cell_origin = ROOT_ORIGIN;
+
+    let player = player_aabb(pos, view_cell);
+    let probe = Aabb {
+        min: Vec3::new(player.min.x, player.min.y - 0.1 * block_size, player.min.z),
+        max: player.max,
+    };
+    let (bmin, bmax) = aabb_block_range(probe, block_size, cell_origin);
+    let mut test_dy = -0.05 * block_size;
     for by in bmin.y..=bmax.y {
         for bz in bmin.z..=bmax.z {
             for bx in bmin.x..=bmax.x {
-                if solid_at_integer(world, IVec3::new(bx, by, bz)) {
-                    test_dy = clip_axis(&player, test_dy, 1, bx, by, bz);
+                if is_target_block_solid(
+                    world,
+                    target_layer,
+                    bx,
+                    by,
+                    bz,
+                    block_size,
+                    cell_origin,
+                ) {
+                    test_dy = clip_axis(
+                        &player,
+                        test_dy,
+                        1,
+                        bx,
+                        by,
+                        bz,
+                        block_size,
+                        cell_origin,
+                    );
                 }
             }
         }
     }
-    test_dy.abs() < 0.04
+    test_dy.abs() < 0.04 * block_size
 }
 
 // ------------------------------------------------------------------ tests
@@ -524,13 +598,16 @@ mod tests {
     fn on_ground_just_above_surface() {
         let world = WorldState::new_grassland();
         // Feet at y = 0.001 are a hair above the grass top face.
-        assert!(on_ground(Vec3::new(0.0, 0.001, 0.0), &world));
+        // Use the leaf view layer so block_size = 1 (= the legacy
+        // collision behaviour).
+        assert!(on_ground(Vec3::new(0.0, 0.001, 0.0), &world, MAX_LAYER));
         // Feet a metre up — still walking, not on ground.
-        assert!(!on_ground(Vec3::new(0.0, 2.0, 0.0), &world));
+        assert!(!on_ground(Vec3::new(0.0, 2.0, 0.0), &world, MAX_LAYER));
         // Feet out in the void, way below ROOT_ORIGIN.
         assert!(!on_ground(
             Vec3::new(0.0, ROOT_ORIGIN.y - 50.0, 0.0),
-            &world
+            &world,
+            MAX_LAYER,
         ));
     }
 

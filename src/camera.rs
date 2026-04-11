@@ -36,13 +36,14 @@ pub struct CursorLocked(pub bool);
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
-        // pitch 0 = look forward at the horizon. The camera-follow
-        // system snaps this entity onto the player every frame, so
-        // the spawn translation is only the placeholder for frame 0.
-        // (The previous `pitch: -0.6` was a positive X rotation —
-        // looking *up* — which left the player staring at the sky.)
+        // Pitch 0 = look forward. The follow system in
+        // `first_person_camera` snaps this entity onto the player on
+        // frame 1, so the spawn translation is just a placeholder —
+        // we use `Vec3::ZERO` instead of any hardcoded global Bevy
+        // coordinate to make it obvious that this isn't a position
+        // we picked.
         FpsCam { yaw: 0.0, pitch: 0.0 },
-        Transform::from_xyz(500.0, 3.7, 500.0),
+        Transform::default(),
     ));
 }
 

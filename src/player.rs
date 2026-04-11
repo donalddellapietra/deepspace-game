@@ -6,8 +6,10 @@ use bevy::prelude::*;
 
 use crate::camera::FpsCam;
 use crate::inventory::InventoryState;
-use crate::world::collision::{self, PLAYER_H};
+use crate::world::collision::{self, bevy_from_position, PLAYER_H};
+use crate::world::position::{Position, NODE_PATH_LEN};
 use crate::world::render::cell_size_at_layer;
+use crate::world::tree::{slot_index, BRANCH_FACTOR, NODE_VOXELS_PER_AXIS};
 use crate::world::{CameraZoom, WorldState};
 
 pub const PLAYER_HEIGHT: f32 = PLAYER_H;
@@ -38,19 +40,44 @@ pub struct Player;
 #[derive(Component)]
 pub struct Velocity(pub Vec3);
 
+/// Path-based spawn position. Returns a `Position` that places the
+/// player a few cells inside the world's `-x, -z` corner, just above
+/// the ground surface, with no globally-growing integer coordinates
+/// or hardcoded Bevy-space numbers anywhere — every component is a
+/// `u8` slot index or in-leaf voxel coord.
+///
+/// Concretely:
+///
+/// - depth `MAX_LAYER - 2`: slot `(BRANCH_FACTOR - 1, 1, BRANCH_FACTOR - 1)`
+///   — the `+x, +z` corner of the all-zero layer-`(MAX_LAYER - 2)`
+///   grandparent, with `sy = 1` so the layer-`(MAX_LAYER - 1)` we
+///   land in sits one node above the world floor (= the ground row).
+/// - depth `MAX_LAYER - 1`: slot `(BRANCH_FACTOR - 1, 0, BRANCH_FACTOR - 1)`
+///   — the `+x, +z, -y` corner of that layer-`(MAX_LAYER - 1)`,
+///   so the leaf sits flush against the top of the grass.
+/// - voxel `(NODE_VOXELS_PER_AXIS / 2, 2, NODE_VOXELS_PER_AXIS / 2)`
+///   — centred in `xz` so the player isn't right against a leaf
+///   boundary, and two cells above the leaf's bottom face so gravity
+///   has something to do for a couple of frames.
+fn spawn_position() -> Position {
+    let mut path = [0u8; NODE_PATH_LEN];
+    let edge = (BRANCH_FACTOR - 1) as usize;
+    path[NODE_PATH_LEN - 2] = slot_index(edge, 1, edge) as u8;
+    path[NODE_PATH_LEN - 1] = slot_index(edge, 0, edge) as u8;
+    let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
+    Position {
+        path,
+        voxel: [mid, 2, mid],
+        offset: [0.5, 0.0, 0.5],
+    }
+}
+
 fn spawn_player(mut commands: Commands) {
-    // Spawn well clear of the world's `-x, -z` corner. The all-zero
-    // path leaf sits at the world's negative corner (`ROOT_ORIGIN`),
-    // so spawning at Bevy `(0, 2, 0)` puts the player ~13 units from
-    // the world edge in `-x` and `-z` — close enough that the
-    // 400-unit render radius clips against the edge and the player
-    // can fall off after a few steps. Pulling the spawn out to
-    // `(500, 2, 500)` puts the entire 400-unit visible sphere
-    // comfortably inside the world in every direction.
+    let translation = bevy_from_position(&spawn_position());
     commands.spawn((
         Player,
         Velocity(Vec3::ZERO),
-        Transform::from_xyz(500.0, 2.0, 500.0),
+        Transform::from_translation(translation),
         Visibility::Hidden,
     ));
 }
@@ -107,7 +134,7 @@ fn move_player(
 
     // Jump (must be on ground before applying gravity).
     if keyboard.just_pressed(KeyCode::Space)
-        && collision::on_ground(tf.translation, &world)
+        && collision::on_ground(tf.translation, &world, zoom.layer)
     {
         vel.0.y = jump_impulse;
     }
@@ -128,5 +155,12 @@ fn move_player(
         Vec2::ZERO
     };
 
-    collision::move_and_collide(&mut tf.translation, &mut vel.0, h_delta, dt, &world);
+    collision::move_and_collide(
+        &mut tf.translation,
+        &mut vel.0,
+        h_delta,
+        dt,
+        &world,
+        zoom.layer,
+    );
 }
