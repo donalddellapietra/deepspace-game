@@ -9,7 +9,8 @@ use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
 use crate::player::{Player, Velocity};
 use crate::world::collision::position_from_bevy;
-use crate::world::edit::edit_leaf;
+use crate::world::edit::edit_at_layer_pos;
+use crate::world::position::LayerPos;
 use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
 use crate::world::{CameraZoom, WorldState};
 
@@ -86,7 +87,15 @@ pub fn cycle_hotbar_slot(
     }
 }
 
-/// Left-click → delete the targeted voxel (set it to empty).
+/// Left-click → delete the view-layer cell under the crosshair.
+///
+/// The raycast returns a leaf `Position`; we project it down to the
+/// camera's current view layer and call [`edit_at_layer_pos`], which
+/// dispatches on the layer:
+///
+/// - at the leaf layer, it removes a single voxel,
+/// - one layer up, it removes a `5³` region inside a leaf,
+/// - any higher layer, it replaces a whole layer-`(L + 2)` subtree.
 ///
 /// Skips the frame when `CursorLocked` just transitioned from false
 /// to true — that click was consumed by the camera grab in
@@ -96,6 +105,7 @@ pub fn remove_block(
     locked: Res<CursorLocked>,
     inv: Res<InventoryState>,
     targeted: Res<TargetedBlock>,
+    zoom: Res<CameraZoom>,
     mut world: ResMut<WorldState>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() {
@@ -107,17 +117,21 @@ pub fn remove_block(
     let Some(pos) = targeted.hit_position else {
         return;
     };
-    edit_leaf(&mut world, &pos, EMPTY_VOXEL);
+    let lp = LayerPos::from_leaf(&pos, zoom.layer);
+    edit_at_layer_pos(&mut world, &lp, EMPTY_VOXEL);
 }
 
 /// Right-click → place the active hotbar block on the face of the
-/// targeted voxel pointed at by `normal`.
+/// targeted cell pointed at by `normal`. Like `remove_block`, the
+/// targeted cell and the placement cell are view-layer cells, so the
+/// edit dispatches on `CameraZoom.layer`.
 pub fn place_block(
     mouse: Res<ButtonInput<MouseButton>>,
     locked: Res<CursorLocked>,
     inv: Res<InventoryState>,
     targeted: Res<TargetedBlock>,
     hotbar: Res<super::Hotbar>,
+    zoom: Res<CameraZoom>,
     mut world: ResMut<WorldState>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() {
@@ -129,15 +143,20 @@ pub fn place_block(
     let (Some(hit), Some(normal)) = (targeted.hit, targeted.normal) else {
         return;
     };
-    let place_coord = hit + normal;
-    let center = Vec3::new(
-        place_coord.x as f32 + 0.5,
-        place_coord.y as f32 + 0.5,
-        place_coord.z as f32 + 0.5,
+
+    // Compute the placement cell by stepping one view-layer cell in
+    // the normal direction from the targeted cell. At view layer L,
+    // one cell is `5^(MAX_LAYER - L)` Bevy units.
+    let cell_size = crate::world::render::cell_size_at_layer(zoom.layer);
+    let place_center = Vec3::new(
+        hit.x as f32 + 0.5 + normal.x as f32 * cell_size,
+        hit.y as f32 + 0.5 + normal.y as f32 * cell_size,
+        hit.z as f32 + 0.5 + normal.z as f32 * cell_size,
     );
-    let Some(place_pos) = position_from_bevy(center) else {
+    let Some(place_leaf_pos) = position_from_bevy(place_center) else {
         return;
     };
+    let lp = LayerPos::from_leaf(&place_leaf_pos, zoom.layer);
     let voxel = voxel_from_block(Some(hotbar.active_block()));
-    edit_leaf(&mut world, &place_pos, voxel);
+    edit_at_layer_pos(&mut world, &lp, voxel);
 }

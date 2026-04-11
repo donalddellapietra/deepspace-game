@@ -30,6 +30,58 @@ pub struct Position {
     pub offset: [f32; 3],
 }
 
+/// A bounded position at an arbitrary view layer.
+///
+/// `path.len() == layer`, plus an in-node `cell` in `0..NODE_VOXELS_PER_AXIS`.
+/// This is the type the renderer and input layer hand back for clicks at
+/// a zoomed-out view — identifying exactly one cell within one layer-`layer`
+/// node without ever computing a global coordinate.
+///
+/// See `docs/architecture/editing.md` and the 2D prototype's `LayerPos`:
+/// a click on a cell at view layer `L` names the layer-`(L + 2)` subtree
+/// reached by decomposing `(cx, cy, cz)` into `slot_a = (c / 5)` and
+/// `slot_b = (c % 5)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerPos {
+    /// Slot indices from root down to the node this position sits in.
+    /// `path.len() == layer`. `layer == 0` means the position is in the
+    /// root itself and `path` is empty.
+    pub path: Vec<u8>,
+    /// Cell coordinates inside the node's `25³` grid. Each `0..25`.
+    pub cell: [u8; 3],
+    /// The layer the node lives at. `0..=MAX_LAYER`.
+    pub layer: u8,
+}
+
+impl LayerPos {
+    /// Project a leaf `Position` down to the layer-`layer` cell that
+    /// contains it. Walks up the leaf's path, applying the downsample's
+    /// inverse at each step: the leaf's contribution to the parent cell
+    /// at `(cx, cy, cz)` where `cx = 5 * slot_x + child_cx / 5`.
+    ///
+    /// Every intermediate cell stays in `0..NODE_VOXELS_PER_AXIS`.
+    pub fn from_leaf(leaf: &Position, layer: u8) -> Self {
+        assert!(layer <= MAX_LAYER);
+        let mut cx = leaf.voxel[0];
+        let mut cy = leaf.voxel[1];
+        let mut cz = leaf.voxel[2];
+        // Walk up from the leaf-parent slot (index MAX_LAYER - 1) down
+        // to `layer`, applying the parent-cell projection once per step.
+        for i in (layer as usize..NODE_PATH_LEN).rev() {
+            let (sx, sy, sz) = slot_coords(leaf.path[i] as usize);
+            cx = (BRANCH_FACTOR as u8) * (sx as u8) + cx / (BRANCH_FACTOR as u8);
+            cy = (BRANCH_FACTOR as u8) * (sy as u8) + cy / (BRANCH_FACTOR as u8);
+            cz = (BRANCH_FACTOR as u8) * (sz as u8) + cz / (BRANCH_FACTOR as u8);
+        }
+        let path: Vec<u8> = leaf.path.iter().take(layer as usize).copied().collect();
+        Self {
+            path,
+            cell: [cx, cy, cz],
+            layer,
+        }
+    }
+}
+
 impl Position {
     pub fn origin() -> Self {
         Self {
@@ -286,5 +338,52 @@ mod tests {
         assert!(p.add_offset_axis(0, 30.0));
         assert_eq!(p.voxel, [10, 5, 5]);
         assert_eq!(p.path[NODE_PATH_LEN - 1], slot_index(1, 0, 0) as u8);
+    }
+
+    // --------------------------------------------------------- LayerPos
+
+    #[test]
+    fn layer_pos_from_leaf_at_leaf_is_identity() {
+        let mut p = origin_at([7, 11, 3]);
+        p.path[NODE_PATH_LEN - 1] = slot_index(2, 1, 4) as u8;
+        let lp = LayerPos::from_leaf(&p, MAX_LAYER);
+        assert_eq!(lp.layer, MAX_LAYER);
+        assert_eq!(lp.path.len(), NODE_PATH_LEN);
+        assert_eq!(&lp.path[..], &p.path[..]);
+        assert_eq!(lp.cell, [7, 11, 3]);
+    }
+
+    #[test]
+    fn layer_pos_from_leaf_projects_one_level() {
+        // Leaf's last slot is (sx=3, sy=2, sz=4), voxel is (17, 6, 11).
+        // Going up one level: parent cell =
+        //   (5*3 + 17/5, 5*2 + 6/5, 5*4 + 11/5) = (18, 11, 22).
+        let mut p = Position::origin();
+        p.path[NODE_PATH_LEN - 1] = slot_index(3, 2, 4) as u8;
+        p.voxel = [17, 6, 11];
+        let lp = LayerPos::from_leaf(&p, MAX_LAYER - 1);
+        assert_eq!(lp.layer, MAX_LAYER - 1);
+        assert_eq!(lp.path.len(), NODE_PATH_LEN - 1);
+        assert_eq!(lp.cell, [18, 11, 22]);
+    }
+
+    #[test]
+    fn layer_pos_from_leaf_stays_bounded_at_every_layer() {
+        let mut p = Position::origin();
+        for i in 0..NODE_PATH_LEN {
+            p.path[i] = slot_index(
+                (i as usize) % 5,
+                (i as usize + 2) % 5,
+                (i as usize + 3) % 5,
+            ) as u8;
+        }
+        p.voxel = [23, 19, 7];
+        for layer in 0..=MAX_LAYER {
+            let lp = LayerPos::from_leaf(&p, layer);
+            assert!(lp.cell[0] < NODE_VOXELS_PER_AXIS as u8);
+            assert!(lp.cell[1] < NODE_VOXELS_PER_AXIS as u8);
+            assert!(lp.cell[2] < NODE_VOXELS_PER_AXIS as u8);
+            assert_eq!(lp.path.len(), layer as usize);
+        }
     }
 }

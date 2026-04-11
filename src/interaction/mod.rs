@@ -11,7 +11,8 @@ use bevy::prelude::*;
 use crate::camera::FpsCam;
 use crate::world::collision::{position_from_bevy, solid_at_integer};
 use crate::world::position::Position;
-use crate::world::WorldState;
+use crate::world::render::cell_size_at_layer;
+use crate::world::{CameraZoom, WorldState};
 
 const MAX_REACH: f32 = 20.0;
 
@@ -128,13 +129,29 @@ fn dda_world(
     (None, None)
 }
 
-fn draw_highlight(mut gizmos: Gizmos, targeted: Res<TargetedBlock>) {
+fn draw_highlight(
+    mut gizmos: Gizmos,
+    targeted: Res<TargetedBlock>,
+    zoom: Res<CameraZoom>,
+) {
     let Some(hit) = targeted.hit else {
         return;
     };
+    // `hit` is the leaf-voxel integer cell the raycast bottomed out
+    // on. Enlarge the outline to wrap the full view-layer cell: at
+    // view layer L, one cell is `5^(MAX_LAYER - L)` Bevy units. The
+    // hit cell's view-cell anchor is `hit - (hit % cell_size)`, i.e.
+    // the min corner of the view-cell that contains the hit.
+    let cell_size = cell_size_at_layer(zoom.layer);
+    let hit_f = hit.as_vec3();
+    let cell_min = Vec3::new(
+        (hit_f.x / cell_size).floor() * cell_size,
+        (hit_f.y / cell_size).floor() * cell_size,
+        (hit_f.z / cell_size).floor() * cell_size,
+    );
+    let center = cell_min + Vec3::splat(cell_size * 0.5);
     gizmos.cube(
-        Transform::from_translation(hit.as_vec3() + Vec3::splat(0.5))
-            .with_scale(Vec3::splat(1.02)),
+        Transform::from_translation(center).with_scale(Vec3::splat(cell_size * 1.02)),
         Color::WHITE,
     );
 }

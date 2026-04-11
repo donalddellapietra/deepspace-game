@@ -173,6 +173,18 @@ fn extent_for_layer(layer: u8) -> f32 {
     scale_for_layer(layer) * (NODE_VOXELS_PER_AXIS as f32)
 }
 
+/// Bevy-space edge length of ONE cell inside a layer-`layer` node's
+/// `25³` grid. At the leaf layer this is `1.0` (a leaf cell is a
+/// unit cube in Bevy space); at `layer = MAX_LAYER - 1` it's `5.0`;
+/// at the root it's `5^MAX_LAYER`.
+///
+/// The editor and the highlight gizmo use this to size the
+/// per-view-layer outline cube.
+#[inline]
+pub fn cell_size_at_layer(layer: u8) -> f32 {
+    scale_for_layer(layer)
+}
+
 // ----------------------------------------------------------- mesh caching
 
 fn get_or_bake_mesh<'a>(
