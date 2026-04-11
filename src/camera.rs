@@ -36,10 +36,13 @@ pub struct CursorLocked(pub bool);
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
-        // Pitch down a little so the initial view looks at the ground
-        // rather than the sky.
-        FpsCam { yaw: 0.0, pitch: -0.6 },
-        Transform::from_xyz(0.0, 3.0, 0.0),
+        // pitch 0 = look forward at the horizon. The camera-follow
+        // system snaps this entity onto the player every frame, so
+        // the spawn translation is only the placeholder for frame 0.
+        // (The previous `pitch: -0.6` was a positive X rotation —
+        // looking *up* — which left the player staring at the sky.)
+        FpsCam { yaw: 0.0, pitch: 0.0 },
+        Transform::from_xyz(500.0, 3.7, 500.0),
     ));
 }
 

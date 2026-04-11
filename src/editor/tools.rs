@@ -8,10 +8,11 @@ use crate::camera::CursorLocked;
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
 use crate::player::{Player, Velocity};
-use crate::world::collision::position_from_bevy;
+use crate::world::collision::{
+    bevy_center_of_layer_pos, layer_pos_from_bevy,
+};
 use crate::world::edit::edit_at_layer_pos;
-use crate::world::position::LayerPos;
-use crate::world::render::ROOT_ORIGIN;
+use crate::world::render::cell_size_at_layer;
 use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
 use crate::world::{CameraZoom, WorldState};
 
@@ -90,8 +91,8 @@ pub fn cycle_hotbar_slot(
 
 /// Left-click → delete the view-layer cell under the crosshair.
 ///
-/// The raycast returns a leaf `Position`; we project it down to the
-/// camera's current view layer and call [`edit_at_layer_pos`], which
+/// The raycast returns a [`LayerPos`] at the current view layer, so
+/// we just hand it straight to [`edit_at_layer_pos`], which
 /// dispatches on the layer:
 ///
 /// - at the leaf layer, it removes a single voxel,
@@ -106,7 +107,6 @@ pub fn remove_block(
     locked: Res<CursorLocked>,
     inv: Res<InventoryState>,
     targeted: Res<TargetedBlock>,
-    zoom: Res<CameraZoom>,
     mut world: ResMut<WorldState>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() {
@@ -115,17 +115,17 @@ pub fn remove_block(
     if !mouse.just_pressed(MouseButton::Left) {
         return;
     }
-    let Some(pos) = targeted.hit_position else {
+    let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
-    let lp = LayerPos::from_leaf(&pos, zoom.layer);
-    edit_at_layer_pos(&mut world, &lp, EMPTY_VOXEL);
+    edit_at_layer_pos(&mut world, lp, EMPTY_VOXEL);
 }
 
 /// Right-click → place the active hotbar block on the face of the
-/// targeted cell pointed at by `normal`. Like `remove_block`, the
-/// targeted cell and the placement cell are view-layer cells, so the
-/// edit dispatches on `CameraZoom.layer`.
+/// targeted cell pointed at by `normal`. The hit cell is a
+/// [`LayerPos`] at the current view layer; we step one cell in the
+/// normal direction by computing the placement cell's centre in
+/// Bevy space and routing it back through `layer_pos_from_bevy`.
 pub fn place_block(
     mouse: Res<ButtonInput<MouseButton>>,
     locked: Res<CursorLocked>,
@@ -141,30 +141,18 @@ pub fn place_block(
     if !mouse.just_pressed(MouseButton::Right) {
         return;
     }
-    let (Some(hit), Some(normal)) = (targeted.hit, targeted.normal) else {
+    let (Some(hit), Some(normal)) =
+        (targeted.hit_layer_pos.as_ref(), targeted.normal)
+    else {
         return;
     };
 
-    // Step one view-layer cell in the normal direction. The view-cell
-    // grid is rooted at `ROOT_ORIGIN`, NOT at integer Bevy zero — so
-    // the snap to the cell-center has to be relative to that origin
-    // (same fix as `interaction::draw_highlight`). Otherwise at any
-    // layer where `ROOT_ORIGIN.{x,z}` aren't multiples of `cell_size`
-    // the placement would land in the wrong cell.
-    let cell_size = crate::world::render::cell_size_at_layer(zoom.layer);
-    let hit_center = hit.as_vec3() + Vec3::splat(0.5);
-    let local = hit_center - ROOT_ORIGIN;
-    let cell_idx = Vec3::new(
-        (local.x / cell_size).floor(),
-        (local.y / cell_size).floor(),
-        (local.z / cell_size).floor(),
-    );
-    let hit_cell_center = ROOT_ORIGIN + cell_idx * cell_size + Vec3::splat(cell_size * 0.5);
-    let place_center = hit_cell_center + normal.as_vec3() * cell_size;
-    let Some(place_leaf_pos) = position_from_bevy(place_center) else {
+    let cell_size = cell_size_at_layer(zoom.layer);
+    let hit_center = bevy_center_of_layer_pos(hit);
+    let place_center = hit_center + normal.as_vec3() * cell_size;
+    let Some(place_lp) = layer_pos_from_bevy(place_center, zoom.layer) else {
         return;
     };
-    let lp = LayerPos::from_leaf(&place_leaf_pos, zoom.layer);
     let voxel = voxel_from_block(Some(hotbar.active_block()));
-    edit_at_layer_pos(&mut world, &lp, voxel);
+    edit_at_layer_pos(&mut world, &place_lp, voxel);
 }

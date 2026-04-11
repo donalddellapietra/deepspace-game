@@ -22,11 +22,12 @@
 use bevy::prelude::*;
 
 use super::edit::get_voxel;
-use super::position::{Position, NODE_PATH_LEN};
-use super::render::ROOT_ORIGIN;
+use super::position::{LayerPos, Position, NODE_PATH_LEN};
+use super::render::{cell_size_at_layer, ROOT_ORIGIN};
 use super::state::{world_extent_voxels, WorldState};
 use super::tree::{
-    slot_coords, slot_index, EMPTY_VOXEL, NODE_VOXELS_PER_AXIS,
+    slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL,
+    NODE_VOXELS_PER_AXIS,
 };
 
 // ------------------------------------------------------------ player AABB
@@ -124,6 +125,79 @@ pub fn position_from_bevy(pos: Vec3) -> Option<Position> {
         local.z - local.z.floor(),
     ];
     Some(Position { path, voxel, offset })
+}
+
+// ----------------------------------------------------- LayerPos helpers
+
+/// Project a Bevy `Vec3` straight to a [`LayerPos`] at view layer
+/// `layer`. Equivalent to
+/// `LayerPos::from_leaf(position_from_bevy(pos)?, layer)` but skips
+/// the intermediate leaf-level conversion when the caller doesn't
+/// need it.
+pub fn layer_pos_from_bevy(pos: Vec3, layer: u8) -> Option<LayerPos> {
+    let leaf = position_from_bevy(pos)?;
+    Some(LayerPos::from_leaf(&leaf, layer))
+}
+
+/// Bevy-space min corner of the cell at `lp`. Walks `lp.path` once,
+/// accumulating slot offsets in `i64` leaf-voxel units (overflow-free
+/// for any `MAX_LAYER`), then adds the in-node `cell` scaled by the
+/// view layer's cell size.
+pub fn bevy_origin_of_layer_pos(lp: &LayerPos) -> Vec3 {
+    let mut origin = ROOT_ORIGIN;
+    let mut extent: i64 = world_extent_voxels();
+    for depth in 0..lp.path.len() {
+        let child_extent = extent / 5;
+        let (sx, sy, sz) = slot_coords(lp.path[depth] as usize);
+        origin.x += (sx as i64 * child_extent) as f32;
+        origin.y += (sy as i64 * child_extent) as f32;
+        origin.z += (sz as i64 * child_extent) as f32;
+        extent = child_extent;
+    }
+    // After descending `lp.layer` slots, `extent` is the layer-`L`
+    // node's axis size in leaf voxels. The node has 25 cells per
+    // axis, so one cell = `extent / 25` Bevy units.
+    let cell_size = (extent / 25) as f32;
+    origin
+        + Vec3::new(
+            lp.cell[0] as f32 * cell_size,
+            lp.cell[1] as f32 * cell_size,
+            lp.cell[2] as f32 * cell_size,
+        )
+}
+
+/// Center of the cell at `lp` in Bevy space.
+pub fn bevy_center_of_layer_pos(lp: &LayerPos) -> Vec3 {
+    let cell = cell_size_at_layer(lp.layer);
+    bevy_origin_of_layer_pos(lp) + Vec3::splat(cell * 0.5)
+}
+
+/// Walk the tree from the root to the layer-`lp.layer` node and read
+/// the cell `lp.cell` from its `25³` voxel grid. Used by the
+/// cell-level raycast.
+pub fn is_layer_pos_solid(world: &WorldState, lp: &LayerPos) -> bool {
+    let mut id = world.root;
+    for &slot in &lp.path {
+        let Some(node) = world.library.get(id) else {
+            return false;
+        };
+        let Some(children) = node.children.as_ref() else {
+            return false;
+        };
+        id = children[slot as usize];
+        if id == EMPTY_NODE {
+            return false;
+        }
+    }
+    let Some(node) = world.library.get(id) else {
+        return false;
+    };
+    let v = node.voxels[voxel_idx(
+        lp.cell[0] as usize,
+        lp.cell[1] as usize,
+        lp.cell[2] as usize,
+    )];
+    v != EMPTY_VOXEL
 }
 
 /// Inverse of [`position_from_bevy`]. Accumulates the origin as we

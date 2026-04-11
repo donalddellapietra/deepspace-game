@@ -39,10 +39,18 @@ pub struct Player;
 pub struct Velocity(pub Vec3);
 
 fn spawn_player(mut commands: Commands) {
+    // Spawn well clear of the world's `-x, -z` corner. The all-zero
+    // path leaf sits at the world's negative corner (`ROOT_ORIGIN`),
+    // so spawning at Bevy `(0, 2, 0)` puts the player ~13 units from
+    // the world edge in `-x` and `-z` — close enough that the
+    // 400-unit render radius clips against the edge and the player
+    // can fall off after a few steps. Pulling the spawn out to
+    // `(500, 2, 500)` puts the entire 400-unit visible sphere
+    // comfortably inside the world in every direction.
     commands.spawn((
         Player,
         Velocity(Vec3::ZERO),
-        Transform::from_xyz(0.0, 2.0, 0.0),
+        Transform::from_xyz(500.0, 2.0, 500.0),
         Visibility::Hidden,
     ));
 }
