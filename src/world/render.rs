@@ -337,7 +337,18 @@ pub fn render_world(
     };
     let camera_pos = camera_tf.translation;
 
-    let target_layer = zoom.layer.clamp(0, MAX_LAYER);
+    // Sample TWO layers deeper than the camera's view layer, matching
+    // the 2D prototype's `subtexture_25` rule. At view layer L, one
+    // visible cell corresponds to a layer-(L+2) node, so emitting one
+    // entity per layer-(L+2) node gives one entity per cell — and the
+    // entity's mesh shows the finer L+2 voxel grid instead of the
+    // coarser L downsample. Clamps at MAX_LAYER (the leaves), which
+    // also degenerates the L = MAX_LAYER and L = MAX_LAYER - 1 cases
+    // to the prototype's "render the leaf below" fallback.
+    let target_layer = zoom
+        .layer
+        .saturating_add(2)
+        .min(MAX_LAYER);
 
     // If zoom changed, or we're on our first pass, drop everything.
     if !render_state.initialised || render_state.last_zoom_layer != target_layer

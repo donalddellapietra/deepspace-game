@@ -11,6 +11,7 @@ use crate::player::{Player, Velocity};
 use crate::world::collision::position_from_bevy;
 use crate::world::edit::edit_at_layer_pos;
 use crate::world::position::LayerPos;
+use crate::world::render::ROOT_ORIGIN;
 use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
 use crate::world::{CameraZoom, WorldState};
 
@@ -144,15 +145,22 @@ pub fn place_block(
         return;
     };
 
-    // Compute the placement cell by stepping one view-layer cell in
-    // the normal direction from the targeted cell. At view layer L,
-    // one cell is `5^(MAX_LAYER - L)` Bevy units.
+    // Step one view-layer cell in the normal direction. The view-cell
+    // grid is rooted at `ROOT_ORIGIN`, NOT at integer Bevy zero — so
+    // the snap to the cell-center has to be relative to that origin
+    // (same fix as `interaction::draw_highlight`). Otherwise at any
+    // layer where `ROOT_ORIGIN.{x,z}` aren't multiples of `cell_size`
+    // the placement would land in the wrong cell.
     let cell_size = crate::world::render::cell_size_at_layer(zoom.layer);
-    let place_center = Vec3::new(
-        hit.x as f32 + 0.5 + normal.x as f32 * cell_size,
-        hit.y as f32 + 0.5 + normal.y as f32 * cell_size,
-        hit.z as f32 + 0.5 + normal.z as f32 * cell_size,
+    let hit_center = hit.as_vec3() + Vec3::splat(0.5);
+    let local = hit_center - ROOT_ORIGIN;
+    let cell_idx = Vec3::new(
+        (local.x / cell_size).floor(),
+        (local.y / cell_size).floor(),
+        (local.z / cell_size).floor(),
     );
+    let hit_cell_center = ROOT_ORIGIN + cell_idx * cell_size + Vec3::splat(cell_size * 0.5);
+    let place_center = hit_cell_center + normal.as_vec3() * cell_size;
     let Some(place_leaf_pos) = position_from_bevy(place_center) else {
         return;
     };

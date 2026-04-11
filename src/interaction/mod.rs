@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use crate::camera::FpsCam;
 use crate::world::collision::{position_from_bevy, solid_at_integer};
 use crate::world::position::Position;
-use crate::world::render::cell_size_at_layer;
+use crate::world::render::{cell_size_at_layer, ROOT_ORIGIN};
 use crate::world::{CameraZoom, WorldState};
 
 const MAX_REACH: f32 = 20.0;
@@ -138,17 +138,25 @@ fn draw_highlight(
         return;
     };
     // `hit` is the leaf-voxel integer cell the raycast bottomed out
-    // on. Enlarge the outline to wrap the full view-layer cell: at
-    // view layer L, one cell is `5^(MAX_LAYER - L)` Bevy units. The
-    // hit cell's view-cell anchor is `hit - (hit % cell_size)`, i.e.
-    // the min corner of the view-cell that contains the hit.
+    // on. We need to draw an outline around the **view-layer cell**
+    // that contains `hit`, sized `cell_size` Bevy units per axis.
+    //
+    // Critically, the voxel grid is aligned to `ROOT_ORIGIN`, NOT to
+    // integer Bevy zero. With `ROOT_ORIGIN.{x,z} = -13` and
+    // `cell_size = 5` (view layer 11), the view cells lie at
+    // x = -13, -8, -3, 2, 7, ... — a different lattice from
+    // `..., -10, -5, 0, 5, ...`. So we have to snap to the
+    // root-aligned lattice by computing the cell index *relative to
+    // `ROOT_ORIGIN`*.
     let cell_size = cell_size_at_layer(zoom.layer);
-    let hit_f = hit.as_vec3();
-    let cell_min = Vec3::new(
-        (hit_f.x / cell_size).floor() * cell_size,
-        (hit_f.y / cell_size).floor() * cell_size,
-        (hit_f.z / cell_size).floor() * cell_size,
+    let hit_center = hit.as_vec3() + Vec3::splat(0.5);
+    let local = hit_center - ROOT_ORIGIN;
+    let cell_idx = Vec3::new(
+        (local.x / cell_size).floor(),
+        (local.y / cell_size).floor(),
+        (local.z / cell_size).floor(),
     );
+    let cell_min = ROOT_ORIGIN + cell_idx * cell_size;
     let center = cell_min + Vec3::splat(cell_size * 0.5);
     gizmos.cube(
         Transform::from_translation(center).with_scale(Vec3::splat(cell_size * 1.02)),
