@@ -316,6 +316,76 @@ pub fn on_ground(pos: Vec3, world: &WorldState, view_layer: u8) -> bool {
     test_dy.abs() < 0.04 * block_size
 }
 
+/// Snap the player onto the top of the apparent ground at the
+/// current view layer. Used after a zoom change, because the
+/// target-layer collision grid can *inflate* thin features when the
+/// block size grows past the feature's actual thickness:
+///
+/// The grassland ground is 125 leaves deep, and the presence-
+/// preserving downsample in `tree::downsample` propagates "any non-
+/// empty child → solid parent". So at view layer 6 (target 8, block
+/// size 625 leaves) the one-row ground becomes a full 625-leaf-tall
+/// solid block — the player, spawned a couple of leaves above actual
+/// grass, ends up *inside* the inflated block the moment they press
+/// Q. `move_and_collide`'s clip only stops motion that's heading
+/// *into* a block from outside, so gravity happily pulls them
+/// straight through.
+///
+/// This function walks the player's column at the new target layer:
+///
+/// * if the feet block is solid, walk upward until reaching empty
+///   space and place feet at the bottom of it (= top of the ground);
+/// * if the feet block is empty, walk downward until reaching solid
+///   and place feet at its top. This handles the mirror case (zoom
+///   *in*, ground shrinks), so pressing F while standing on the
+///   inflated ground doesn't leave the player hanging in the air.
+///
+/// Both walks are bounded at 64 steps — more than enough to exit any
+/// bottom-row stack, and bounded-latency regardless of view layer.
+pub fn snap_to_ground(pos: &mut Vec3, world: &WorldState, view_layer: u8) {
+    let target_layer = target_layer_for(view_layer);
+    let block_size = cell_size_at_layer(target_layer);
+    let cell_origin = ROOT_ORIGIN;
+
+    let bx = ((pos.x - cell_origin.x) / block_size).floor() as i32;
+    let bz = ((pos.z - cell_origin.z) / block_size).floor() as i32;
+    let mut by = ((pos.y - cell_origin.y) / block_size).floor() as i32;
+
+    let solid_at = |by: i32| {
+        is_target_block_solid(
+            world,
+            target_layer,
+            bx,
+            by,
+            bz,
+            block_size,
+            cell_origin,
+        )
+    };
+
+    if solid_at(by) {
+        // Inside a solid block — walk up until empty.
+        for _ in 0..64 {
+            by += 1;
+            if !solid_at(by) {
+                pos.y = cell_origin.y + by as f32 * block_size;
+                return;
+            }
+        }
+    } else {
+        // In empty space — walk down until solid and land on top.
+        for _ in 0..64 {
+            by -= 1;
+            if solid_at(by) {
+                pos.y = cell_origin.y + (by + 1) as f32 * block_size;
+                return;
+            }
+        }
+    }
+    // Didn't converge in 64 steps — leave the player where they are
+    // rather than teleport them somewhere surprising.
+}
+
 // ------------------------------------------------------------------ tests
 
 #[cfg(test)]
@@ -360,6 +430,61 @@ mod tests {
             &world,
             IVec3::new(ROOT_ORIGIN.x as i32 - 5, -1, 0)
         ));
+    }
+
+    /// At every view layer, a player placed at a Bevy Y that used
+    /// to be "just above the grass" must end up standing on top of
+    /// the apparent ground after a snap — feet in an empty block,
+    /// block directly below them solid. Regression against the bug
+    /// where pressing Q put the player inside an inflated ground
+    /// block and gravity then pulled them through.
+    #[test]
+    fn snap_to_ground_leaves_player_standing_at_every_view_layer() {
+        use super::super::render::{MAX_ZOOM, MIN_ZOOM};
+        let world = WorldState::new_grassland();
+        for view_layer in MIN_ZOOM..=MAX_ZOOM {
+            let target = target_layer_for(view_layer);
+            let block_size = cell_size_at_layer(target);
+            let mut pos = Vec3::new(0.0, 2.0, 0.0);
+            snap_to_ground(&mut pos, &world, view_layer);
+
+            // Feet block = the block containing `pos`. Must be empty.
+            let bx = ((pos.x - ROOT_ORIGIN.x) / block_size).floor() as i32;
+            let bz = ((pos.z - ROOT_ORIGIN.z) / block_size).floor() as i32;
+            // `pos.y` lands exactly on a block boundary, so nudge up
+            // by a fraction of a block when computing which block
+            // "contains" the feet for the is-empty check.
+            let by_feet = ((pos.y - ROOT_ORIGIN.y + 0.01 * block_size)
+                / block_size)
+                .floor() as i32;
+            assert!(
+                !is_target_block_solid(
+                    &world,
+                    target,
+                    bx,
+                    by_feet,
+                    bz,
+                    block_size,
+                    ROOT_ORIGIN,
+                ),
+                "view layer {view_layer}: feet block (by={by_feet}) is solid after snap"
+            );
+            // Block directly below feet must be solid (the player is
+            // standing on it, not floating).
+            assert!(
+                is_target_block_solid(
+                    &world,
+                    target,
+                    bx,
+                    by_feet - 1,
+                    bz,
+                    block_size,
+                    ROOT_ORIGIN,
+                ),
+                "view layer {view_layer}: block under feet (by={}) is not solid — player is floating",
+                by_feet - 1
+            );
+        }
     }
 
     #[test]

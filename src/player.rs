@@ -8,7 +8,7 @@ use crate::camera::FpsCam;
 use crate::inventory::InventoryState;
 use crate::world::collision::{self, PLAYER_H};
 use crate::world::position::{Position, NODE_PATH_LEN};
-use crate::world::tree::{slot_index, BRANCH_FACTOR, NODE_VOXELS_PER_AXIS};
+use crate::world::tree::{slot_index, NODE_VOXELS_PER_AXIS};
 use crate::world::view::{bevy_from_position, cell_size_at_layer};
 use crate::world::{CameraZoom, WorldState};
 
@@ -41,29 +41,38 @@ pub struct Player;
 pub struct Velocity(pub Vec3);
 
 /// Path-based spawn position. Returns a `Position` that places the
-/// player a few cells inside the world's `-x, -z` corner, just above
-/// the ground surface, with no globally-growing integer coordinates
-/// or hardcoded Bevy-space numbers anywhere — every component is a
-/// `u8` slot index or in-leaf voxel coord.
+/// player at the all-zero-`xz` corner of the ground, two leaves
+/// above the grass surface. The resulting Bevy translation sits
+/// essentially at the origin — `(-0.5, 2, -0.5)` — which keeps
+/// floating-point precision at its best for leaf-level physics and
+/// lines up the camera's initial view with the centre of the
+/// readable area of the world.
+///
+/// Why not the literal centre of the root node: at `MAX_LAYER = 12`
+/// the root is `25 * 5^12 ≈ 6.1e9` leaves wide, so a centred spawn
+/// would put the player at Bevy `x, z ≈ 3e9` where `f32` step size
+/// is hundreds of leaves — leaf-level collisions would stop working
+/// almost immediately. A floating-origin system (shift ROOT_ORIGIN
+/// when the player moves) is the proper fix for that and is out of
+/// scope here.
 ///
 /// Concretely:
 ///
-/// - depth `MAX_LAYER - 2`: slot `(BRANCH_FACTOR - 1, 1, BRANCH_FACTOR - 1)`
-///   — the `+x, +z` corner of the all-zero layer-`(MAX_LAYER - 2)`
-///   grandparent, with `sy = 1` so the layer-`(MAX_LAYER - 1)` we
-///   land in sits one node above the world floor (= the ground row).
-/// - depth `MAX_LAYER - 1`: slot `(BRANCH_FACTOR - 1, 0, BRANCH_FACTOR - 1)`
-///   — the `+x, +z, -y` corner of that layer-`(MAX_LAYER - 1)`,
-///   so the leaf sits flush against the top of the grass.
+/// - depth `MAX_LAYER - 2`: slot `(0, 1, 0)` — the `sy = 1` child
+///   of the all-zero layer-`(MAX_LAYER - 2)` grandparent, so the
+///   layer-`(MAX_LAYER - 1)` node we land in sits one step above
+///   the world floor (= the ground row ends directly below it).
+/// - depth `MAX_LAYER - 1`: slot `(0, 0, 0)` — the all-zero corner
+///   of that layer-`(MAX_LAYER - 1)`, so the leaf sits flush against
+///   the top face of the grass with its `xz` edge on the Bevy origin.
 /// - voxel `(NODE_VOXELS_PER_AXIS / 2, 2, NODE_VOXELS_PER_AXIS / 2)`
 ///   — centred in `xz` so the player isn't right against a leaf
 ///   boundary, and two cells above the leaf's bottom face so gravity
 ///   has something to do for a couple of frames.
 fn spawn_position() -> Position {
     let mut path = [0u8; NODE_PATH_LEN];
-    let edge = (BRANCH_FACTOR - 1) as usize;
-    path[NODE_PATH_LEN - 2] = slot_index(edge, 1, edge) as u8;
-    path[NODE_PATH_LEN - 1] = slot_index(edge, 0, edge) as u8;
+    path[NODE_PATH_LEN - 2] = slot_index(0, 1, 0) as u8;
+    path[NODE_PATH_LEN - 1] = slot_index(0, 0, 0) as u8;
     let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
     Position {
         path,
@@ -72,12 +81,19 @@ fn spawn_position() -> Position {
     }
 }
 
+/// Bevy translation of the player's spawn point — used by both
+/// [`spawn_player`] at startup and `editor::tools::reset_player` at
+/// runtime, so a fresh spawn and an R-key reset land in exactly the
+/// same spot.
+pub fn spawn_translation() -> Vec3 {
+    bevy_from_position(&spawn_position())
+}
+
 fn spawn_player(mut commands: Commands) {
-    let translation = bevy_from_position(&spawn_position());
     commands.spawn((
         Player,
         Velocity(Vec3::ZERO),
-        Transform::from_translation(translation),
+        Transform::from_translation(spawn_translation()),
         Visibility::Hidden,
     ));
 }
