@@ -11,6 +11,8 @@ impl Plugin for EditorPlugin {
         app.init_resource::<Hotbar>().add_systems(
             Update,
             (
+                tools::zoom_in,
+                tools::zoom_out,
                 tools::reset_player,
                 tools::cycle_hotbar_slot,
                 tools::remove_block,

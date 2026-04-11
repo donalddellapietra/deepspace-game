@@ -1,4 +1,4 @@
-//! Editor input handlers: player reset, hotbar cycling, and
+//! Editor input handlers: zoom, player reset, hotbar cycling, and
 //! place/remove block hooks driven by the raycast in
 //! `crate::interaction`.
 
@@ -11,9 +11,39 @@ use crate::player::{Player, Velocity};
 use crate::world::collision::position_from_bevy;
 use crate::world::edit::edit_leaf;
 use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
-use crate::world::WorldState;
+use crate::world::{CameraZoom, WorldState};
 
-/// Teleport the player back to the spawn point and zero their
+/// F → zoom in (show finer detail). Increments `CameraZoom.layer`
+/// toward the leaf layer. No-op at `MAX_ZOOM` (the leaves).
+pub fn zoom_in(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    inv: Res<InventoryState>,
+    mut zoom: ResMut<CameraZoom>,
+) {
+    if inv.open {
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::KeyF) {
+        zoom.zoom_in();
+    }
+}
+
+/// Q → zoom out (show larger area at coarser detail). Decrements
+/// `CameraZoom.layer` toward the root. No-op at `MIN_ZOOM`.
+pub fn zoom_out(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    inv: Res<InventoryState>,
+    mut zoom: ResMut<CameraZoom>,
+) {
+    if inv.open {
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::KeyQ) {
+        zoom.zoom_out();
+    }
+}
+
+/// R → teleport the player back to the spawn point and zero their
 /// velocity. Handy when you fall into the void off the edge of the
 /// ground layer, or to reset after a physics glitch.
 pub fn reset_player(
@@ -24,7 +54,7 @@ pub fn reset_player(
     if inv.open {
         return;
     }
-    if !keyboard.just_pressed(KeyCode::KeyF) {
+    if !keyboard.just_pressed(KeyCode::KeyR) {
         return;
     }
     let Ok((mut tf, mut vel)) = player_q.single_mut() else {
