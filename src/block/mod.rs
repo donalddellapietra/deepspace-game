@@ -2,9 +2,6 @@ pub mod materials;
 
 use bevy::prelude::*;
 
-/// Blocks per axis in each cell/model.
-pub const MODEL_SIZE: usize = 5;
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum BlockType {

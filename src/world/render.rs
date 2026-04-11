@@ -1,441 +1,463 @@
-//! Depth-aware rendering on top of the [`super::library::MeshLibrary`].
+//! Uniform-layer tree-walk renderer (Phase 5 v1).
 //!
-//! Depth 0 renders super-super-chunks (level 3). Depth 1 renders super-
-//! chunks (level 2). Depth 2 and 3 render chunks (level 1) at two different
-//! visual scales. Each rendered entity stores the library id it currently
-//! shows; on the next render pass we compare the "correct" id against the
-//! stored one and respawn only if it changed.
+//! Every frame, walk the content-addressed tree from the root down to
+//! `CameraZoom.layer` and emit one Bevy entity per surviving node at
+//! that layer. Entities are reused across frames via `RenderState`,
+//! and meshes are baked lazily into a `NodeId`-keyed cache. See
+//! `docs/architecture/rendering.md` for the full design.
+//!
+//! Key decisions for v1:
+//!
+//! * One Bevy unit equals one leaf voxel. A leaf entity has scale
+//!   `1.0` and its baked mesh is `bake_volume(NODE_VOXELS_PER_AXIS)`.
+//!   A layer-K node has scale `5 ^ (MAX_LAYER - K)`.
+//! * The tree is rooted in Bevy space at `ROOT_ORIGIN`, chosen so the
+//!   leaf at the all-zero path sits centred directly below the world
+//!   origin with its top face at `y = 0`. The camera spawns at
+//!   `y ≈ 3`, so it always starts above the grass.
+//! * v1 skips frustum culling. Instead it emits every node whose
+//!   centre is within `RADIUS_LEAF_UNITS` of the camera. Proper
+//!   frustum culling is deferred to Phase 5.1.
 
-use std::collections::{HashMap, HashSet};
-
+use bevy::ecs::hierarchy::ChildOf;
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 use crate::block::materials::BlockMaterials;
-use crate::player::Player;
+use crate::model::{mesher::bake_volume, BakedSubMesh};
 
-use super::chunk::{S, SUPER};
-use super::library::{
-    compute_level2_key, compute_level3_key, ensure_level1_id, MeshLibrary, EMPTY_ID,
-};
 use super::state::WorldState;
-use super::render_distance_for_depth;
+use super::tree::{
+    block_from_voxel, slot_coords, voxel_idx, NodeId, CHILDREN_PER_NODE,
+    EMPTY_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
+};
 
-#[derive(Component)]
-pub struct ChunkEntity;
+// --------------------------------------------------------------- camera zoom
 
+#[derive(Resource)]
+pub struct CameraZoom {
+    /// Which tree layer the camera renders. Clamped to
+    /// `MIN_ZOOM..=MAX_ZOOM`.
+    pub layer: u8,
+}
+
+pub const MIN_ZOOM: u8 = 2;
+pub const MAX_ZOOM: u8 = MAX_LAYER;
+
+impl Default for CameraZoom {
+    fn default() -> Self {
+        // Start at the leaf layer: that's where one Bevy unit equals one
+        // voxel and the world is readable without any up-level scaling.
+        Self { layer: MAX_LAYER }
+    }
+}
+
+impl CameraZoom {
+    pub fn zoom_in(&mut self) -> bool {
+        if self.layer < MAX_ZOOM {
+            self.layer += 1;
+            true
+        } else {
+            false
+        }
+    }
+    pub fn zoom_out(&mut self) -> bool {
+        if self.layer > MIN_ZOOM {
+            self.layer -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------- constants
+
+/// Origin of the root node in Bevy space.
+///
+/// The y component is chosen so that the top face of the
+/// `GROUND_Y_VOXELS`-deep grass surface lines up with Bevy `y = 0`.
+/// Concretely, the root-local y range `(0, GROUND_Y_VOXELS)` maps to
+/// Bevy y range `(-GROUND_Y_VOXELS, 0)`, and the "all-zero path" leaf
+/// sits at the very bottom of the grass region.
+///
+/// x and z are offset by `-12.5` so the all-zero leaf is centred
+/// horizontally around `(0, *, 0)`. The player spawns at `(0, 2, 0)`,
+/// a couple of voxels above the grass surface, and falls onto it.
+pub const ROOT_ORIGIN: Vec3 = Vec3::new(
+    -12.5,
+    -(super::state::GROUND_Y_VOXELS as f32),
+    -12.5,
+);
+
+/// How far a rendered node's centre may be from the camera (in leaf
+/// units, i.e. Bevy units since `1 unit = 1 leaf`) and still be
+/// emitted. Used as the v1 replacement for frustum culling.
+const RADIUS_LEAF_UNITS: f32 = 400.0;
+
+// ----------------------------------------------------------------- state
+
+/// A map from tree path (of length `depth`) to the Bevy entity
+/// currently rendering that path. `NodeId` tracks what the entity's
+/// mesh is a function of, so edits naturally invalidate it.
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// render key → (entity, library id it's currently showing).
-    /// Render key is super-chunk key at depth 0, chunk key at depth 1/2.
-    pub entities: HashMap<IVec3, (Entity, u64)>,
-    pub rendered_depth: usize,
-    pub needs_full_refresh: bool,
+    /// Cached per-`NodeId` baked sub-meshes. An entry survives across
+    /// frames and zoom layers — the mesh is a function of the node's
+    /// voxel grid, not of which layer it was emitted at. v1 never
+    /// evicts these.
+    meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
+    /// Live entities, keyed by "path prefix" (a `SmallPath`).
+    entities: HashMap<SmallPath, (Entity, NodeId)>,
+    /// Zoom layer the `entities` set was built for. If it changes,
+    /// everything gets despawned and rebuilt.
+    last_zoom_layer: u8,
+    /// Whether we have done at least one render pass.
+    initialised: bool,
 }
 
+/// A compact identifier for a node's position in the tree during a
+/// single-frame walk: `depth` significant slot indices from the root.
+/// Used as the `RenderState.entities` key, so reuse survives across
+/// frames as long as the camera keeps looking at the same spot.
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+struct SmallPath {
+    depth: u8,
+    slots: [u8; MAX_LAYER as usize],
+}
+
+impl SmallPath {
+    fn empty() -> Self {
+        Self {
+            depth: 0,
+            slots: [0; MAX_LAYER as usize],
+        }
+    }
+
+    fn push(&self, slot: u8) -> Self {
+        let mut out = *self;
+        out.slots[out.depth as usize] = slot;
+        out.depth += 1;
+        out
+    }
+}
+
+// ------------------------------------------------------------- math helpers
+
+/// Scale multiplier for a node at `layer`. A layer-`MAX_LAYER` (leaf)
+/// node has scale `1.0`; a layer-`MAX_LAYER - 1` node has scale `5.0`;
+/// the root (layer 0) has scale `5^MAX_LAYER`. Values get huge at the
+/// root but stay finite in f32 — only ~`6e8` at layer 0.
+#[inline]
+fn scale_for_layer(layer: u8) -> f32 {
+    let up = (MAX_LAYER - layer) as i32;
+    // 5^up. Up to 5^12 ≈ 2.4e8, well within f32.
+    let mut acc: f32 = 1.0;
+    for _ in 0..up {
+        acc *= 5.0;
+    }
+    acc
+}
+
+/// Bevy-space extent (per axis) of a node at `layer`.
+#[inline]
+fn extent_for_layer(layer: u8) -> f32 {
+    scale_for_layer(layer) * (NODE_VOXELS_PER_AXIS as f32)
+}
+
+// ----------------------------------------------------------- mesh caching
+
+fn get_or_bake_mesh<'a>(
+    render_state: &'a mut RenderState,
+    world: &WorldState,
+    node_id: NodeId,
+    meshes: &mut Assets<Mesh>,
+) -> &'a [BakedSubMesh] {
+    if !render_state.meshes.contains_key(&node_id) {
+        let node = world
+            .library
+            .get(node_id)
+            .expect("render: node missing from library");
+        let voxels = node.voxels.clone();
+        let baked = bake_volume(
+            NODE_VOXELS_PER_AXIS as i32,
+            move |x, y, z| {
+                if x < 0
+                    || y < 0
+                    || z < 0
+                    || x >= NODE_VOXELS_PER_AXIS as i32
+                    || y >= NODE_VOXELS_PER_AXIS as i32
+                    || z >= NODE_VOXELS_PER_AXIS as i32
+                {
+                    return None;
+                }
+                block_from_voxel(
+                    voxels[voxel_idx(x as usize, y as usize, z as usize)],
+                )
+            },
+            meshes,
+        );
+        render_state.meshes.insert(node_id, baked);
+    }
+    render_state
+        .meshes
+        .get(&node_id)
+        .expect("just inserted")
+        .as_slice()
+}
+
+// ------------------------------------------------------------- tree walk
+
+/// One "visit" the tree walk wants the reconciler to spawn/update.
+struct Visit {
+    path: SmallPath,
+    node_id: NodeId,
+    origin: Vec3,
+}
+
+fn walk(
+    world: &WorldState,
+    target_layer: u8,
+    camera_pos: Vec3,
+    out: &mut Vec<Visit>,
+) {
+    if world.root == EMPTY_NODE {
+        return;
+    }
+    let mut stack: Vec<(NodeId, SmallPath, Vec3, u8)> = Vec::with_capacity(256);
+    stack.push((world.root, SmallPath::empty(), ROOT_ORIGIN, 0));
+
+    let radius_sq = RADIUS_LEAF_UNITS * RADIUS_LEAF_UNITS;
+
+    while let Some((node_id, path, origin, depth)) = stack.pop() {
+        // Compute this node's AABB in Bevy space.
+        let extent = extent_for_layer(depth);
+        let aabb_min = origin;
+        let aabb_max = origin + Vec3::splat(extent);
+
+        // Per-axis "distance from camera to AABB": 0 if inside,
+        // otherwise the gap to the nearest face. L2 norm of the three
+        // gaps is the minimum distance from the camera point to the
+        // AABB. Much more accurate than a centre-based sphere test
+        // when the AABB is very large and contains the camera.
+        let dx = (aabb_min.x - camera_pos.x)
+            .max(0.0)
+            .max(camera_pos.x - aabb_max.x);
+        let dy = (aabb_min.y - camera_pos.y)
+            .max(0.0)
+            .max(camera_pos.y - aabb_max.y);
+        let dz = (aabb_min.z - camera_pos.z)
+            .max(0.0)
+            .max(camera_pos.z - aabb_max.z);
+        let min_dist_sq = dx * dx + dy * dy + dz * dz;
+        if min_dist_sq > radius_sq {
+            continue;
+        }
+
+        // Reached the target layer → emit.
+        if depth == target_layer {
+            out.push(Visit {
+                path,
+                node_id,
+                origin,
+            });
+            continue;
+        }
+
+        // Descend into children. If this node is already a leaf
+        // (no children) we can't go deeper — emit it at its actual
+        // layer instead. This shouldn't happen in a fully-materialised
+        // grassland world but is safe.
+        let Some(node) = world.library.get(node_id) else { continue };
+        let Some(children) = node.children.as_ref() else {
+            out.push(Visit {
+                path,
+                node_id,
+                origin,
+            });
+            continue;
+        };
+
+        let child_extent = extent_for_layer(depth + 1);
+        for slot in 0..CHILDREN_PER_NODE {
+            let child_id = children[slot];
+            if child_id == EMPTY_NODE {
+                continue;
+            }
+            let (sx, sy, sz) = slot_coords(slot);
+            let child_origin = origin
+                + Vec3::new(
+                    sx as f32 * child_extent,
+                    sy as f32 * child_extent,
+                    sz as f32 * child_extent,
+                );
+            let child_path = path.push(slot as u8);
+            stack.push((child_id, child_path, child_origin, depth + 1));
+        }
+    }
+}
+
+// ----------------------------------------------------------------- system
+
+/// Bevy system: walk the tree, reconcile `RenderState` entities.
 pub fn render_world(
     mut commands: Commands,
-    materials: Res<BlockMaterials>,
-    mut state: ResMut<WorldState>,
-    mut rs: ResMut<RenderState>,
-    mut library: ResMut<MeshLibrary>,
+    world: Res<WorldState>,
+    zoom: Res<CameraZoom>,
+    camera_q: Query<&Transform, With<Camera3d>>,
+    materials: Option<Res<BlockMaterials>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    player_q: Query<&Transform, With<Player>>,
+    mut render_state: ResMut<RenderState>,
 ) {
-    let Ok(player_tf) = player_q.single() else { return };
+    let Some(materials) = materials else {
+        return;
+    };
+    let Ok(camera_tf) = camera_q.single() else {
+        return;
+    };
+    let camera_pos = camera_tf.translation;
 
-    if rs.rendered_depth != state.depth || rs.needs_full_refresh {
-        // Decrement the correct level's refcount based on which layer we
-        // were rendering before the drain. Depth-1 entities hold level-2,
-        // depth-0 entities hold level-3. Chunk-level render modes don't
-        // refcount via entities.
-        let drained_depth = rs.rendered_depth;
-        for (_, (entity, id)) in rs.entities.drain() {
-            commands.entity(entity).despawn();
-            match drained_depth {
-                0 => library.level3_decrement(id),
-                1 => library.level2_decrement(id),
-                _ => {}
+    let target_layer = zoom.layer.clamp(0, MAX_LAYER);
+
+    // If zoom changed, or we're on our first pass, drop everything.
+    if !render_state.initialised || render_state.last_zoom_layer != target_layer
+    {
+        for (_, (entity, _)) in render_state.entities.drain() {
+            if let Ok(mut ec) = commands.get_entity(entity) {
+                ec.despawn();
             }
         }
-        rs.rendered_depth = state.depth;
-        rs.needs_full_refresh = false;
+        render_state.last_zoom_layer = target_layer;
+        render_state.initialised = true;
     }
 
-    match state.depth {
-        0 => render_super_super_chunks(
-            &mut commands,
-            &materials,
-            &mut state,
-            &mut rs,
-            &mut library,
-            &mut meshes,
-            player_tf,
-        ),
-        1 => render_super_chunks(
-            &mut commands,
-            &materials,
-            &mut state,
-            &mut rs,
-            &mut library,
-            &mut meshes,
-            player_tf,
-        ),
-        2 => render_chunks(
-            &mut commands,
-            &materials,
-            &mut state,
-            &mut rs,
-            &mut library,
-            &mut meshes,
-            player_tf,
-            1.0 / S as f32,
-            1.0,
-        ),
-        _ => render_chunks(
-            &mut commands,
-            &materials,
-            &mut state,
-            &mut rs,
-            &mut library,
-            &mut meshes,
-            player_tf,
-            1.0,
-            S as f32,
-        ),
-    }
+    // Walk the tree → collect visible positions.
+    let mut visits: Vec<Visit> = Vec::with_capacity(256);
+    walk(&world, target_layer, camera_pos, &mut visits);
 
-    // Consume this frame's dirty set now that every render path has had a
-    // chance to act on it. Anything inserted during the next frame's
-    // PreUpdate / Update passes will be picked up on the next render.
-    state.dirty_chunks.clear();
-}
+    let node_scale = scale_for_layer(target_layer);
 
-fn render_chunks(
-    commands: &mut Commands,
-    materials: &BlockMaterials,
-    state: &mut WorldState,
-    rs: &mut RenderState,
-    library: &mut MeshLibrary,
-    meshes: &mut Assets<Mesh>,
-    player_tf: &Transform,
-    view_scale: f32,
-    chunk_size_w: f32,
-) {
-    let player_key = IVec3::new(
-        (player_tf.translation.x / chunk_size_w).floor() as i32,
-        (player_tf.translation.y / chunk_size_w).floor() as i32,
-        (player_tf.translation.z / chunk_size_w).floor() as i32,
-    );
+    // Reconcile: what's alive now, what changed, what's gone.
+    let mut alive: HashMap<SmallPath, (Entity, NodeId)> =
+        HashMap::with_capacity(visits.len());
 
-    let rd = render_distance_for_depth(state.depth);
+    for visit in visits {
+        let new_node_id = visit.node_id;
+        let existing = render_state.entities.remove(&visit.path);
 
-    // Range query via the spatial index — work is O(|visible chunks|), not
-    // O(|world.chunks|). Same linear-style "rebuild every frame" shape that
-    // keeps frametime consistent, just massively cheaper per frame.
-    let desired: HashSet<IVec3> = state
-        .world
-        .index
-        .chunks_in_sphere(player_key, rd)
-        .into_iter()
-        .collect();
-
-    for &key in &desired {
-        let level1_id = match state.world.chunks.get_mut(&key) {
-            Some(chunk) => ensure_level1_id(chunk, library, meshes),
-            None => continue,
-        };
-
-        if let Some(&(entity, existing_id)) = rs.entities.get(&key) {
-            if existing_id == level1_id {
-                continue;
+        match existing {
+            Some((entity, existing_id)) if existing_id == new_node_id => {
+                // Reuse. Update translation (cheap; handles float
+                // drift if it ever creeps in).
+                if let Ok(mut ec) = commands.get_entity(entity) {
+                    ec.insert(
+                        Transform::from_translation(visit.origin)
+                            .with_scale(Vec3::splat(node_scale)),
+                    );
+                }
+                alive.insert(visit.path, (entity, existing_id));
             }
-            commands.entity(entity).despawn();
-            rs.entities.remove(&key);
-        }
+            other => {
+                if let Some((old_entity, _)) = other {
+                    if let Ok(mut ec) = commands.get_entity(old_entity) {
+                        ec.despawn();
+                    }
+                }
+                // Spawn a new root entity for this path, parent one
+                // child per sub-mesh.
+                let baked = get_or_bake_mesh(
+                    &mut render_state,
+                    &world,
+                    new_node_id,
+                    &mut meshes,
+                )
+                .to_vec();
 
-        if level1_id == EMPTY_ID {
-            continue;
-        }
+                let parent = commands
+                    .spawn((
+                        Transform::from_translation(visit.origin)
+                            .with_scale(Vec3::splat(node_scale)),
+                        Visibility::Visible,
+                    ))
+                    .id();
 
-        let entry = library.level1_get(level1_id).expect("ensured above");
-        let pos = key.as_vec3() * chunk_size_w;
-        let root = commands
-            .spawn((
-                ChunkEntity,
-                Transform::from_translation(pos).with_scale(Vec3::splat(view_scale)),
-                Visibility::Inherited,
-            ))
-            .id();
-        for sub in &entry.baked {
-            let child = commands
-                .spawn((
-                    Mesh3d(sub.mesh.clone()),
-                    MeshMaterial3d(materials.get(sub.block_type)),
-                    Transform::default(),
-                ))
-                .id();
-            commands.entity(root).add_child(child);
+                for sub in &baked {
+                    commands.spawn((
+                        Mesh3d(sub.mesh.clone()),
+                        MeshMaterial3d(materials.get(sub.block_type)),
+                        Transform::default(),
+                        Visibility::Inherited,
+                        ChildOf(parent),
+                    ));
+                }
+
+                alive.insert(visit.path, (parent, new_node_id));
+            }
         }
-        rs.entities.insert(key, (root, level1_id));
     }
 
-    // Stale despawn. Level-1 refs are from chunks, not entities.
-    let stale: Vec<_> = rs
-        .entities
-        .keys()
-        .filter(|k| !desired.contains(k))
-        .copied()
-        .collect();
-    for key in stale {
-        if let Some((e, _)) = rs.entities.remove(&key) {
-            commands.entity(e).despawn();
+    // Everything left in the old map was NOT visited this frame →
+    // despawn.
+    for (_, (entity, _)) in render_state.entities.drain() {
+        if let Ok(mut ec) = commands.get_entity(entity) {
+            ec.despawn();
         }
     }
+    render_state.entities = alive;
 }
 
-fn render_super_chunks(
-    commands: &mut Commands,
-    materials: &BlockMaterials,
-    state: &mut WorldState,
-    rs: &mut RenderState,
-    library: &mut MeshLibrary,
-    meshes: &mut Assets<Mesh>,
-    player_tf: &Transform,
-) {
-    let player_key = IVec3::new(
-        player_tf.translation.x.floor() as i32,
-        player_tf.translation.y.floor() as i32,
-        player_tf.translation.z.floor() as i32,
-    );
+// ------------------------------------------------------------------ tests
 
-    // Range query via the spatial index. The index lives in chunk coords,
-    // so we ask for chunks in a sphere large enough to cover every super-
-    // chunk within `rd`, then map to super-chunks and filter at the super-
-    // chunk level. Layer-agnostic: the index doesn't know what a super-
-    // chunk is.
-    let rd = render_distance_for_depth(state.depth);
-    let rd_sq = rd * rd;
-    let chunk_center = player_key * S + IVec3::splat(S / 2);
-    let chunk_radius = (rd + 1) * S;
-    let mut desired: HashSet<IVec3> = HashSet::new();
-    for chunk_key in state.world.index.chunks_in_sphere(chunk_center, chunk_radius) {
-        let super_key = IVec3::new(
-            chunk_key.x.div_euclid(S),
-            chunk_key.y.div_euclid(S),
-            chunk_key.z.div_euclid(S),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_at_leaf_is_one() {
+        assert_eq!(scale_for_layer(MAX_LAYER), 1.0);
+    }
+
+    #[test]
+    fn scale_at_layer_above_leaf_is_five() {
+        assert_eq!(scale_for_layer(MAX_LAYER - 1), 5.0);
+    }
+
+    #[test]
+    fn extent_at_leaf_is_node_voxels() {
+        assert_eq!(extent_for_layer(MAX_LAYER), NODE_VOXELS_PER_AXIS as f32);
+    }
+
+    #[test]
+    fn small_path_push() {
+        let p = SmallPath::empty().push(7).push(12);
+        assert_eq!(p.depth, 2);
+        assert_eq!(p.slots[0], 7);
+        assert_eq!(p.slots[1], 12);
+    }
+
+    #[test]
+    fn walk_grassland_at_leaves_emits_at_least_one_visit() {
+        let world = WorldState::new_grassland();
+        let mut visits = Vec::new();
+        walk(&world, MAX_LAYER, Vec3::ZERO, &mut visits);
+        assert!(
+            !visits.is_empty(),
+            "grassland walk at leaf layer should emit at least one visit"
         );
-        if desired.contains(&super_key) {
-            continue;
-        }
-        let d = super_key - player_key;
-        if d.x * d.x + d.y * d.y + d.z * d.z > rd_sq {
-            continue;
-        }
-        desired.insert(super_key);
     }
 
-    let view_scale = 1.0 / SUPER as f32;
-
-    // Derive per-level dirty set from the layer-agnostic dirty_chunks list.
-    let dirty_supers: HashSet<IVec3> = state
-        .dirty_chunks
-        .iter()
-        .map(|ck| IVec3::new(ck.x.div_euclid(S), ck.y.div_euclid(S), ck.z.div_euclid(S)))
-        .collect();
-
-    for &super_key in &desired {
-        let is_dirty = dirty_supers.contains(&super_key);
-        let already_rendered = rs.entities.contains_key(&super_key);
-        if already_rendered && !is_dirty {
-            continue;
-        }
-
-        let level2_key = compute_level2_key(&mut state.world, super_key, library, meshes);
-
-        let all_empty = level2_key
-            .iter()
-            .flatten()
-            .flatten()
-            .all(|&id| id == EMPTY_ID);
-        let level2_id = if all_empty {
-            EMPTY_ID
-        } else {
-            library.level2_lookup_or_bake(level2_key, &state.world, super_key, meshes)
-        };
-
-        if let Some(&(entity, existing_id)) = rs.entities.get(&super_key) {
-            if existing_id == level2_id {
-                continue;
-            }
-            commands.entity(entity).despawn();
-            rs.entities.remove(&super_key);
-            library.level2_decrement(existing_id);
-        }
-
-        if level2_id == EMPTY_ID {
-            continue;
-        }
-
-        library.level2_increment(level2_id);
-        let entry = library.level2_get(level2_id).expect("just ensured");
-        let pos = super_key.as_vec3();
-        let root = commands
-            .spawn((
-                ChunkEntity,
-                Transform::from_translation(pos).with_scale(Vec3::splat(view_scale)),
-                Visibility::Inherited,
-            ))
-            .id();
-        for sub in &entry.baked {
-            let child = commands
-                .spawn((
-                    Mesh3d(sub.mesh.clone()),
-                    MeshMaterial3d(materials.get(sub.block_type)),
-                    Transform::default(),
-                ))
-                .id();
-            commands.entity(root).add_child(child);
-        }
-        rs.entities.insert(super_key, (root, level2_id));
-    }
-
-    // Stale despawn — decrement each entity's level-2 refcount.
-    let stale: Vec<_> = rs
-        .entities
-        .keys()
-        .filter(|k| !desired.contains(k))
-        .copied()
-        .collect();
-    for key in stale {
-        if let Some((e, id)) = rs.entities.remove(&key) {
-            commands.entity(e).despawn();
-            library.level2_decrement(id);
-        }
-    }
-}
-
-fn render_super_super_chunks(
-    commands: &mut Commands,
-    materials: &BlockMaterials,
-    state: &mut WorldState,
-    rs: &mut RenderState,
-    library: &mut MeshLibrary,
-    meshes: &mut Assets<Mesh>,
-    player_tf: &Transform,
-) {
-    // Exact same shape as `render_super_chunks`, just one layer up:
-    // query the spatial index in chunk coords, derive the super-super-chunk
-    // key, dedupe, filter at the SSS level.
-    let player_key = IVec3::new(
-        player_tf.translation.x.floor() as i32,
-        player_tf.translation.y.floor() as i32,
-        player_tf.translation.z.floor() as i32,
-    );
-
-    let rd = render_distance_for_depth(state.depth);
-    let rd_sq = rd * rd;
-    // SSS spans SUPER chunks per axis. The index is in chunk coords; ask
-    // for chunks in a sphere wide enough to cover every SSS within `rd`.
-    let chunk_center = player_key * SUPER + IVec3::splat(SUPER / 2);
-    let chunk_radius = (rd + 1) * SUPER;
-    let mut desired: HashSet<IVec3> = HashSet::new();
-    for chunk_key in state.world.index.chunks_in_sphere(chunk_center, chunk_radius) {
-        let sss_key = IVec3::new(
-            chunk_key.x.div_euclid(SUPER),
-            chunk_key.y.div_euclid(SUPER),
-            chunk_key.z.div_euclid(SUPER),
+    #[test]
+    fn walk_radius_limits_emit_count() {
+        let world = WorldState::new_grassland();
+        let mut visits = Vec::new();
+        walk(&world, MAX_LAYER, Vec3::ZERO, &mut visits);
+        // Radius ~400 at scale 1.0 → bounded number of leaves. Hard
+        // ceiling chosen generously; this test is a guard rail against
+        // accidentally unbounded walks.
+        assert!(
+            visits.len() < 200_000,
+            "walk emitted {} visits; expected far fewer",
+            visits.len()
         );
-        if desired.contains(&sss_key) {
-            continue;
-        }
-        let d = sss_key - player_key;
-        if d.x * d.x + d.y * d.y + d.z * d.z > rd_sq {
-            continue;
-        }
-        desired.insert(sss_key);
-    }
-
-    let view_scale = 1.0 / (SUPER as f32 * S as f32);
-
-    // Derive per-level dirty set from the layer-agnostic dirty_chunks list.
-    let dirty_sss: HashSet<IVec3> = state
-        .dirty_chunks
-        .iter()
-        .map(|ck| {
-            IVec3::new(
-                ck.x.div_euclid(SUPER),
-                ck.y.div_euclid(SUPER),
-                ck.z.div_euclid(SUPER),
-            )
-        })
-        .collect();
-
-    for &sss_key in &desired {
-        let is_dirty = dirty_sss.contains(&sss_key);
-        let already_rendered = rs.entities.contains_key(&sss_key);
-        if already_rendered && !is_dirty {
-            continue;
-        }
-
-        let level3_key = compute_level3_key(&mut state.world, sss_key, library, meshes);
-
-        let all_empty = level3_key
-            .iter()
-            .flatten()
-            .flatten()
-            .all(|&id| id == EMPTY_ID);
-        let level3_id = if all_empty {
-            EMPTY_ID
-        } else {
-            library.level3_lookup_or_bake(level3_key, &state.world, sss_key, meshes)
-        };
-
-        if let Some(&(entity, existing_id)) = rs.entities.get(&sss_key) {
-            if existing_id == level3_id {
-                continue;
-            }
-            commands.entity(entity).despawn();
-            rs.entities.remove(&sss_key);
-            library.level3_decrement(existing_id);
-        }
-
-        if level3_id == EMPTY_ID {
-            continue;
-        }
-
-        library.level3_increment(level3_id);
-        let entry = library.level3_get(level3_id).expect("just ensured");
-        let pos = sss_key.as_vec3();
-        let root = commands
-            .spawn((
-                ChunkEntity,
-                Transform::from_translation(pos).with_scale(Vec3::splat(view_scale)),
-                Visibility::Inherited,
-            ))
-            .id();
-        for sub in &entry.baked {
-            let child = commands
-                .spawn((
-                    Mesh3d(sub.mesh.clone()),
-                    MeshMaterial3d(materials.get(sub.block_type)),
-                    Transform::default(),
-                ))
-                .id();
-            commands.entity(root).add_child(child);
-        }
-        rs.entities.insert(sss_key, (root, level3_id));
-    }
-
-    let stale: Vec<_> = rs
-        .entities
-        .keys()
-        .filter(|k| !desired.contains(k))
-        .copied()
-        .collect();
-    for key in stale {
-        if let Some((e, id)) = rs.entities.remove(&key) {
-            commands.entity(e).despawn();
-            library.level3_decrement(id);
-        }
     }
 }

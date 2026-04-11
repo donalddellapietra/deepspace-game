@@ -4,11 +4,8 @@ mod diagnostics;
 mod editor;
 mod interaction;
 mod inventory;
-mod layer;
 mod model;
 mod player;
-#[cfg(test)]
-mod tests;
 mod ui;
 mod world;
 
@@ -23,8 +20,6 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.5, 0.7, 0.9)))
         .add_plugins((
             block::BlockPlugin,
-            model::ModelPlugin,
-            layer::LayerPlugin,
             world::WorldPlugin,
             editor::EditorPlugin,
             interaction::InteractionPlugin,

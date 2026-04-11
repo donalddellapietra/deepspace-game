@@ -1,284 +1,46 @@
+//! Editor input handlers: zoom, hotbar cycling, and place/remove
+//! block hooks driven by the raycast in `crate::interaction`.
+
 use bevy::prelude::*;
 
-use crate::block::{BlockType, MODEL_SIZE};
-use crate::camera::{CursorLocked, FpsCam};
+use crate::camera::CursorLocked;
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
-use crate::model::mesher::bake_model;
-use crate::model::{ModelRegistry, VoxelModel};
-use crate::player::{Player, Velocity};
-use crate::world::{Chunk, MeshLibrary, RenderState, WorldState, MAX_DEPTH, SUPER};
+use crate::world::collision::position_from_bevy;
+use crate::world::edit::edit_leaf;
+use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
+use crate::world::{CameraZoom, WorldState};
 
-const S: i32 = MODEL_SIZE as i32;
-
-// ============================================================
-// Drill down / up — change zoom only, never modify world data
-// ============================================================
-
-pub fn drill_down(
+pub fn zoom_in(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
-    mut state: ResMut<WorldState>,
-    mut rs: ResMut<RenderState>,
-    mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
-    mut cam_q: Query<&mut FpsCam>,
+    mut zoom: ResMut<CameraZoom>,
 ) {
     if inv.open {
         return;
     }
-    if !keyboard.just_pressed(KeyCode::KeyF) {
-        return;
+    if keyboard.just_pressed(KeyCode::KeyF) {
+        zoom.zoom_in();
     }
-    if state.depth >= MAX_DEPTH {
-        return;
-    }
-    let Ok((mut tf, mut vel)) = player_q.single_mut() else {
-        return;
-    };
-
-    let Some(new_pos) = state.drill_in(tf.translation) else {
-        return;
-    };
-    tf.translation = new_pos;
-    vel.0 = Vec3::ZERO;
-    if let Ok(mut cam) = cam_q.single_mut() {
-        cam.yaw = 0.4;
-        cam.pitch = 0.8;
-    }
-    rs.needs_full_refresh = true;
 }
 
-pub fn drill_up(
+pub fn zoom_out(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
-    mut state: ResMut<WorldState>,
-    mut rs: ResMut<RenderState>,
-    mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
+    mut zoom: ResMut<CameraZoom>,
 ) {
     if inv.open {
         return;
     }
-    if !keyboard.just_pressed(KeyCode::KeyQ) {
-        return;
+    if keyboard.just_pressed(KeyCode::KeyQ) {
+        zoom.zoom_out();
     }
-    if state.depth == 0 {
-        return;
-    }
-    let Ok((mut tf, mut vel)) = player_q.single_mut() else {
-        return;
-    };
-
-    let Some(new_pos) = state.drill_out(tf.translation) else {
-        return;
-    };
-    tf.translation = new_pos;
-    vel.0 = Vec3::ZERO;
-    rs.needs_full_refresh = true;
 }
 
-// ============================================================
-// Block editing — granularity follows the current depth
-// ============================================================
-
-pub fn remove_block(
-    mouse: Res<ButtonInput<MouseButton>>,
-    locked: Res<CursorLocked>,
-    inv: Res<InventoryState>,
-    targeted: Res<TargetedBlock>,
-    mut state: ResMut<WorldState>,
-    mut library: ResMut<MeshLibrary>,
+pub fn cycle_hotbar_slot(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut hotbar: ResMut<super::Hotbar>,
 ) {
-    if inv.open || !locked.0 {
-        return;
-    }
-    if !mouse.just_pressed(MouseButton::Left) {
-        return;
-    }
-    let Some(hit) = targeted.hit else { return };
-
-    match state.depth {
-        0 => {
-            // hit is a super-super-chunk key. Tombstone all 25×25×25 chunks
-            // beneath it. (Proof-of-concept: coarse but correct.)
-            let chunk_origin = hit * SUPER;
-            for dz in 0..SUPER {
-                for dy in 0..SUPER {
-                    for dx in 0..SUPER {
-                        let chunk_key = chunk_origin + IVec3::new(dx, dy, dz);
-                        state.replace_chunk(chunk_key, Chunk::tombstone(), &mut library);
-                    }
-                }
-            }
-        }
-        1 => {
-            // hit is a super-chunk key. Tombstone its 5×5×5 chunks.
-            for cz in 0..S {
-                for cy in 0..S {
-                    for cx in 0..S {
-                        let chunk_key = hit * S + IVec3::new(cx, cy, cz);
-                        state.replace_chunk(chunk_key, Chunk::tombstone(), &mut library);
-                    }
-                }
-            }
-        }
-        2 => {
-            // hit is a chunk key.
-            state.replace_chunk(hit, Chunk::tombstone(), &mut library);
-        }
-        _ => {
-            // hit is an integer block coord.
-            state.edit_block(hit, None, &mut library);
-            let key = IVec3::new(
-                hit.x.div_euclid(S),
-                hit.y.div_euclid(S),
-                hit.z.div_euclid(S),
-            );
-            if let Some(chunk) = state.world.chunks.get_mut(&key) {
-                chunk.user_modified = true;
-            }
-        }
-    }
-}
-
-pub fn place_block(
-    mouse: Res<ButtonInput<MouseButton>>,
-    locked: Res<CursorLocked>,
-    inv: Res<InventoryState>,
-    targeted: Res<TargetedBlock>,
-    hotbar: Res<super::Hotbar>,
-    registry: Res<ModelRegistry>,
-    mut state: ResMut<WorldState>,
-    mut library: ResMut<MeshLibrary>,
-) {
-    if inv.open || !locked.0 {
-        return;
-    }
-    if !mouse.just_pressed(MouseButton::Right) {
-        return;
-    }
-    let Some(hit) = targeted.hit else { return };
-    let Some(normal) = targeted.normal else { return };
-
-    let place = hit + normal;
-
-    match state.depth {
-        0 => {
-            // place is a super-super-chunk key. Fill all 25×25×25 chunks
-            // beneath it with the selected block type.
-            if state.world.super_super_chunk_solid(place) {
-                return;
-            }
-            let bt = match hotbar.active_item() {
-                super::HotbarItem::Block(bt) => *bt,
-                super::HotbarItem::SavedModel(_) => BlockType::Stone,
-            };
-            let mut filled = Chunk::new_filled(bt);
-            filled.user_modified = true;
-            let chunk_origin = place * SUPER;
-            for dz in 0..SUPER {
-                for dy in 0..SUPER {
-                    for dx in 0..SUPER {
-                        let chunk_key = chunk_origin + IVec3::new(dx, dy, dz);
-                        state.replace_chunk(chunk_key, filled.clone(), &mut library);
-                    }
-                }
-            }
-        }
-        1 => {
-            // place is a super-chunk key.
-            if state.world.super_chunk_solid(place) {
-                return;
-            }
-            let bt = match hotbar.active_item() {
-                super::HotbarItem::Block(bt) => *bt,
-                super::HotbarItem::SavedModel(_) => BlockType::Stone,
-            };
-            let mut filled = Chunk::new_filled(bt);
-            filled.user_modified = true;
-            for cz in 0..S {
-                for cy in 0..S {
-                    for cx in 0..S {
-                        let chunk_key = place * S + IVec3::new(cx, cy, cz);
-                        state.replace_chunk(chunk_key, filled.clone(), &mut library);
-                    }
-                }
-            }
-        }
-        2 => {
-            if state.world.chunk_solid(place) {
-                return;
-            }
-            let chunk = match hotbar.active_item() {
-                super::HotbarItem::Block(bt) => {
-                    let mut c = Chunk::new_filled(*bt);
-                    c.user_modified = true;
-                    c
-                }
-                super::HotbarItem::SavedModel(idx) => {
-                    let Some(model) = registry.models.get(*idx) else {
-                        return;
-                    };
-                    Chunk {
-                        blocks: model.blocks,
-                        mesh_dirty: true,
-                        user_modified: true,
-                        level1_id: None,
-                    }
-                }
-            };
-            state.replace_chunk(place, chunk, &mut library);
-        }
-        _ => {
-            if state.world.is_solid(place) {
-                return;
-            }
-            match hotbar.active_item() {
-                super::HotbarItem::Block(bt) => {
-                    state.edit_block(place, Some(*bt), &mut library);
-                    mark_user_modified(&mut state, place);
-                }
-                super::HotbarItem::SavedModel(idx) => {
-                    let Some(model) = registry.models.get(*idx) else {
-                        return;
-                    };
-                    let blocks = model.blocks;
-                    for y in 0..MODEL_SIZE {
-                        for z in 0..MODEL_SIZE {
-                            for x in 0..MODEL_SIZE {
-                                if let Some(bt) = blocks[y][z][x] {
-                                    let coord =
-                                        place + IVec3::new(x as i32, y as i32, z as i32);
-                                    state.edit_block(coord, Some(bt), &mut library);
-                                    mark_user_modified(&mut state, coord);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Silence unused warning when SUPER isn't directly referenced.
-    let _ = SUPER;
-}
-
-fn mark_user_modified(state: &mut WorldState, coord: IVec3) {
-    let key = IVec3::new(
-        coord.x.div_euclid(S),
-        coord.y.div_euclid(S),
-        coord.z.div_euclid(S),
-    );
-    if let Some(chunk) = state.world.chunks.get_mut(&key) {
-        chunk.user_modified = true;
-    }
-}
-
-// ============================================================
-// Hotbar + save
-// ============================================================
-
-pub fn cycle_hotbar_slot(keyboard: Res<ButtonInput<KeyCode>>, mut hotbar: ResMut<super::Hotbar>) {
     for (key, idx) in [
         (KeyCode::Digit1, 0),
         (KeyCode::Digit2, 1),
@@ -297,47 +59,58 @@ pub fn cycle_hotbar_slot(keyboard: Res<ButtonInput<KeyCode>>, mut hotbar: ResMut
     }
 }
 
-pub fn save_as_template(
-    keyboard: Res<ButtonInput<KeyCode>>,
+/// Left-click → delete the targeted voxel (set it to empty).
+///
+/// Skips the frame when `CursorLocked` just transitioned from false
+/// to true — that click was consumed by the camera grab in
+/// `manage_cursor`, it should NOT also delete a block.
+pub fn remove_block(
+    mouse: Res<ButtonInput<MouseButton>>,
+    locked: Res<CursorLocked>,
     inv: Res<InventoryState>,
-    state: Res<WorldState>,
-    player_q: Query<&Transform, With<Player>>,
-    mut registry: ResMut<ModelRegistry>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    targeted: Res<TargetedBlock>,
+    mut world: ResMut<WorldState>,
 ) {
-    if inv.open {
+    if inv.open || !locked.0 || locked.is_changed() {
         return;
     }
-    if !keyboard.just_pressed(KeyCode::KeyP) {
+    if !mouse.just_pressed(MouseButton::Left) {
         return;
     }
-    let Ok(tf) = player_q.single() else { return };
+    let Some(pos) = targeted.hit_position else {
+        return;
+    };
+    edit_leaf(&mut world, &pos, EMPTY_VOXEL);
+}
 
-    // Save the chunk currently under the player. The player's bevy units
-    // scale with depth; convert to an integer block coord first, then to a
-    // chunk key.
-    let blocks_per_bevy: i32 = match state.depth {
-        0 => SUPER * S, // 125
-        1 => SUPER,     // 25
-        2 => S,         // 5
-        _ => 1,
-    };
-    let int_x = (tf.translation.x * blocks_per_bevy as f32).floor() as i32;
-    let int_y = (tf.translation.y * blocks_per_bevy as f32).floor() as i32;
-    let int_z = (tf.translation.z * blocks_per_bevy as f32).floor() as i32;
-    let chunk_key = IVec3::new(
-        int_x.div_euclid(S),
-        int_y.div_euclid(S),
-        int_z.div_euclid(S),
-    );
-    let Some(chunk) = state.world.chunks.get(&chunk_key) else {
+/// Right-click → place the active hotbar block on the face of the
+/// targeted voxel pointed at by `normal`.
+pub fn place_block(
+    mouse: Res<ButtonInput<MouseButton>>,
+    locked: Res<CursorLocked>,
+    inv: Res<InventoryState>,
+    targeted: Res<TargetedBlock>,
+    hotbar: Res<super::Hotbar>,
+    mut world: ResMut<WorldState>,
+) {
+    if inv.open || !locked.0 || locked.is_changed() {
+        return;
+    }
+    if !mouse.just_pressed(MouseButton::Right) {
+        return;
+    }
+    let (Some(hit), Some(normal)) = (targeted.hit, targeted.normal) else {
         return;
     };
-    let baked = bake_model(&chunk.blocks, &mut meshes);
-    let name = format!("Custom {}", registry.models.len());
-    registry.register(VoxelModel {
-        name,
-        blocks: chunk.blocks,
-        baked,
-    });
+    let place_coord = hit + normal;
+    let center = Vec3::new(
+        place_coord.x as f32 + 0.5,
+        place_coord.y as f32 + 0.5,
+        place_coord.z as f32 + 0.5,
+    );
+    let Some(place_pos) = position_from_bevy(center) else {
+        return;
+    };
+    let voxel = voxel_from_block(Some(hotbar.active_block()));
+    edit_leaf(&mut world, &place_pos, voxel);
 }

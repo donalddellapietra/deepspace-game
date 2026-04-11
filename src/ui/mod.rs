@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::block::BlockType;
 use crate::editor::{Hotbar, HotbarItem};
-use crate::model::ModelRegistry;
+use crate::world::CameraZoom;
 
 pub struct UiPlugin;
 
@@ -46,7 +46,7 @@ fn spawn_hotbar(mut commands: Commands) {
                     }
                 });
             p.spawn((
-                Text::new("E: inventory | F: drill in | Q: drill out | LClick: break | RClick: place | 1-0: hotbar"),
+                Text::new("E: inventory | F: zoom in | Q: zoom out | 1-0: hotbar"),
                 TextFont { font_size: 12.0, ..default() },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.5)),
             ));
@@ -59,13 +59,12 @@ fn spawn_mode_indicator(mut commands: Commands) {
         Node { position_type: PositionType::Absolute, top: Val::Px(16.0), left: Val::Px(16.0),
             padding: UiRect::all(Val::Px(8.0)), ..default() },
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
-        Text::new("Top Layer"), TextFont { font_size: 20.0, ..default() }, TextColor(Color::WHITE),
+        Text::new("Layer 0"), TextFont { font_size: 20.0, ..default() }, TextColor(Color::WHITE),
     ));
 }
 
 fn update_hotbar(
     hotbar: Res<Hotbar>,
-    registry: Res<ModelRegistry>,
     mut slots: Query<(&HotbarSlotUi, &mut BorderColor, &mut BackgroundColor)>,
     mut label: Query<&mut Text, With<HotbarLabel>>,
 ) {
@@ -73,18 +72,9 @@ fn update_hotbar(
         let i = slot.0 as usize;
         let is_active = i == hotbar.active;
 
-        // Update the slot's color based on what's in it
         match &hotbar.slots[i] {
             HotbarItem::Block(bt) => {
                 bg.0 = bt.color();
-            }
-            HotbarItem::SavedModel(idx) => {
-                // Use a representative color from the model
-                let color = registry.models.get(*idx)
-                    .and_then(|m| m.blocks.iter().flatten().flatten().find_map(|b| *b))
-                    .map(|bt| bt.color())
-                    .unwrap_or(Color::srgb(0.4, 0.4, 0.4));
-                bg.0 = color;
             }
         }
 
@@ -95,28 +85,18 @@ fn update_hotbar(
         };
     }
 
-    // Update label with active item name
     if let Ok(mut t) = label.single_mut() {
         let name = match hotbar.active_item() {
             HotbarItem::Block(bt) => format!("{:?}", bt),
-            HotbarItem::SavedModel(idx) => {
-                registry.models.get(*idx)
-                    .map(|m| m.name.clone())
-                    .unwrap_or("Unknown".into())
-            }
         };
         *t = Text::new(name);
     }
 }
 
 fn update_mode_indicator(
-    state: Res<crate::world::WorldState>,
+    zoom: Res<CameraZoom>,
     mut q: Query<&mut Text, With<ModeIndicator>>,
 ) {
     let Ok(mut t) = q.single_mut() else { return };
-    if state.is_top_layer() {
-        *t = Text::new("Top Layer (F to drill in)");
-    } else {
-        *t = Text::new(format!("Depth {} (Q to exit)", state.depth()));
-    }
+    *t = Text::new(format!("Layer {}", zoom.layer));
 }

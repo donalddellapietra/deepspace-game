@@ -5,7 +5,7 @@ use bevy::{
     render::render_resource::PrimitiveTopology,
 };
 
-use crate::block::{BlockType, MODEL_SIZE};
+use crate::block::BlockType;
 
 use super::BakedSubMesh;
 
@@ -46,7 +46,7 @@ const FACES: [(IVec3, [Vec3; 4], Vec3); 6] = [
 
 /// Bake any cubic voxel volume of `size^3` cells into per-block-type sub-meshes
 /// with face culling. The data source is given as a closure so the caller can
-/// stitch together a FlatWorld, a 5x5x5 model array, or anything else.
+/// feed it any voxel grid.
 pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<BlockType>>(
     size: i32,
     get: F,
@@ -81,22 +81,6 @@ pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<BlockType>>(
             block_type,
         })
         .collect()
-}
-
-/// Bake a 5x5x5 voxel grid into per-block-type sub-meshes with face culling.
-pub fn bake_model(
-    blocks: &[[[Option<BlockType>; MODEL_SIZE]; MODEL_SIZE]; MODEL_SIZE],
-    meshes: &mut Assets<Mesh>,
-) -> Vec<BakedSubMesh> {
-    let s = MODEL_SIZE as i32;
-    bake_volume(
-        s,
-        |x, y, z| {
-            if x < 0 || y < 0 || z < 0 || x >= s || y >= s || z >= s { return None; }
-            blocks[y as usize][z as usize][x as usize]
-        },
-        meshes,
-    )
 }
 
 #[derive(Default)]

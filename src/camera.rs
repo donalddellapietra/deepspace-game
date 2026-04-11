@@ -34,8 +34,8 @@ pub struct CursorLocked(pub bool);
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
-        // Pitch down a little so the initial depth-0 view looks at the
-        // ground rather than the sky.
+        // Pitch down a little so the initial view looks at the ground
+        // rather than the sky.
         FpsCam { yaw: 0.0, pitch: -0.6 },
         Transform::from_xyz(0.0, 3.0, 0.0),
     ));

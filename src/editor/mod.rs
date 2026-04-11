@@ -8,27 +8,26 @@ pub struct EditorPlugin;
 
 impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Hotbar>()
-            .add_systems(Update, (
-                tools::drill_down,
-                tools::drill_up,
-                tools::place_block,
-                tools::remove_block,
+        app.init_resource::<Hotbar>().add_systems(
+            Update,
+            (
+                tools::zoom_in,
+                tools::zoom_out,
                 tools::cycle_hotbar_slot,
-                tools::save_as_template,
-            ));
+                tools::remove_block,
+                tools::place_block,
+            ),
+        );
     }
 }
 
-/// What a hotbar slot contains.
+/// What a hotbar slot contains. v1 only supports block types;
+/// saved models are deferred.
 #[derive(Clone, Debug)]
 pub enum HotbarItem {
     Block(BlockType),
-    /// Index into ModelRegistry.models
-    SavedModel(usize),
 }
 
-/// The 10 hotbar slots + which one is active.
 #[derive(Resource)]
 pub struct Hotbar {
     pub slots: [HotbarItem; 10],
@@ -49,10 +48,9 @@ impl Hotbar {
         &self.slots[self.active]
     }
 
-    pub fn active_block(&self) -> Option<BlockType> {
+    pub fn active_block(&self) -> BlockType {
         match self.active_item() {
-            HotbarItem::Block(bt) => Some(*bt),
-            _ => None,
+            HotbarItem::Block(bt) => *bt,
         }
     }
 }
