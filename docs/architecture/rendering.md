@@ -23,11 +23,33 @@ pub struct CameraZoom {
 The player's `Position` does not change when the camera zooms. The
 camera is a pure view state.
 
+## Target layer: sample two layers below the view layer
+
+A naive renderer at view layer `L` would emit one entity per node at
+layer `L`, textured from that node's majority-vote 25³ downsample. That
+discards most of the tree — at view layer 5, every on-screen cell is
+averaging `5^(MAX_LAYER - 5) × 5³` leaf voxels into one value.
+
+Instead, the renderer emits one entity per **layer-`(L + 2)` node**
+(clamped to `MAX_LAYER`). The reason is the same `(c / 5, c % 5)`
+decomposition the editor uses: inside a layer-`L` node's 25³ grid, one
+cell `(cx, cy, cz)` decomposes into exactly two more slot steps, so one
+view cell corresponds to exactly *one* layer-`(L + 2)` subtree. The
+renderer can hand that subtree's raw voxel grid straight to the greedy
+mesher without involving the downsample at all — detail never gets
+smoothed away by zooming out, because we're always reading from two
+layers below whatever the camera is showing.
+
+At `L = MAX_LAYER` and `L = MAX_LAYER - 1` the clamp degenerates into
+"just emit at the leaf layer," which is the right behaviour: there's no
+deeper layer to sample. This rule was ported from the 2D prototype's
+`subtexture_25` / `subtexture_5` helpers.
+
 ## Per-frame tree walk
 
 Rendering walks the tree from the root to the target layer, emitting
-one entity per visited node at `zoom.layer`. The walk is a recursive
-descent with frustum culling:
+one entity per visited node at `target_layer = (zoom.layer + 2).min(MAX_LAYER)`.
+The walk is a recursive descent with culling:
 
 ```
 render_walk(node_id, path, layer, camera_frustum, out):
@@ -54,11 +76,16 @@ node's world-space origin.
 A naive walk to layer K visits up to `125^K` nodes — astronomically
 too many. Two things cut the cost to something reasonable:
 
-1. **Frustum culling.** At any layer, only the nodes inside the
-   camera's view frustum survive the walk. A typical frustum contains
-   a bounded number of layer-K nodes roughly proportional to
-   `frustum_volume / node_size_at_K`. For a standard camera, that's
-   ~hundreds to low thousands of nodes per frame.
+1. **Cell-radius culling (v1).** Proper frustum culling is deferred;
+   the current walker drops any node whose AABB is more than
+   `RADIUS_VIEW_CELLS` cells from the camera, measured at the current
+   view layer. That is, the radius is
+   `RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer)` Bevy units,
+   which grows by 5× per layer as you zoom out. The visible world
+   covers a roughly constant number of cells regardless of zoom —
+   ported from the 2D prototype's "viewport counts cells, not pixels"
+   behaviour. A real frustum test will replace this once it shows up
+   in a profile.
 2. **Content dedup.** Multiple entities at different world positions
    reference the same `NodeId` and share the same mesh handle. GPU
    upload is paid once per unique pattern, not once per entity. An
@@ -66,7 +93,23 @@ too many. Two things cut the cost to something reasonable:
    they all point at one mesh.
 
 The frame cost is dominated by entity spawn/despawn bookkeeping and
-the per-node frustum check, not by mesh data.
+the per-node AABB check, not by mesh data.
+
+## Mesh cache keyed on NodeId
+
+`RenderState.meshes: HashMap<NodeId, Vec<BakedSubMesh>>` caches the
+baked mesh for every `NodeId` that has ever been rendered. An entry
+survives across frames *and* across zoom layer changes — the mesh is
+a function of the node's voxel grid, nothing layer-specific.
+
+Because the cache is keyed on `NodeId`, it inherits the library's
+dedup guarantee for free: every grass leaf in the world shares the
+same `NodeId`, so grassland bakes exactly one mesh regardless of how
+many entities are on screen. The same "sub-texture cache" trick the
+2D prototype uses.
+
+v1 never evicts from this cache. Long edit sessions will grow it by
+roughly one entry per unique node ever seen; not a concern yet.
 
 ## Entity management across frames
 
@@ -127,13 +170,19 @@ current tree from the root on every frame.
 
 ## Deferred
 
+- **Proper frustum culling.** v1 uses a "within N view cells of the
+  camera" radius test instead of a real frustum intersection. Replace
+  once it shows up in a profile.
 - **Smooth zoom transitions.** Changing `zoom.layer` is currently a
-  hard swap. A cross-fade or a short interpolation frame would feel
-  nicer; skip until the base renderer works.
+  hard swap (the entity set is rebuilt from scratch when
+  `target_layer` changes). A cross-fade or a short interpolation frame
+  would feel nicer.
 - **Background mesh baking.** Bakes currently happen on the main
   thread. For procedurally-rich worlds, move them to worker threads.
   Not needed for grassland v1.
-- **Partial frustum walks.** The walk currently re-descends the tree
-  from the root every frame. A cached "last frame's frustum" +
-  delta-walk can limit work to only the nodes entering or leaving
-  view. Skip until the base walk shows up in a profile.
+- **Mesh cache eviction.** `RenderState.meshes` grows monotonically.
+  Fine for grassland; revisit when edit-heavy workloads start pushing
+  its size.
+- **Partial tree walks.** The walk currently re-descends from the root
+  every frame. A cached "last frame's visits" + delta-walk can limit
+  work to only the nodes entering or leaving view.

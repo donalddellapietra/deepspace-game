@@ -1,6 +1,14 @@
 # Refactor plan: flat chunks → content-addressed voxel tree
 
-This is the execution plan for replacing `src/world/`'s current
+> **Status: landed.** This document is the original execution plan
+> that got us from the drill-in/out `CellSlot::Child` world to the
+> content-addressed tree now in `src/world/`. Kept for historical
+> reference; `docs/progress.md` describes what actually shipped,
+> including the post-refactor port of prototype concepts (`LayerPos`,
+> three-branch `edit_at_layer_pos`, sample-two-layers-below,
+> cell-rate movement) that isn't covered here.
+
+This is the execution plan for replacing `src/world/`'s previous
 `FlatWorld` + three-level mesh library with the tree architecture
 described in `voxels.md`, `coordinates.md`, `editing.md`, and
 `rendering.md`.

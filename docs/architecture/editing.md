@@ -141,7 +141,43 @@ node at every layer to a single library entry — the simplest possible
 world to reason about while we build out the tree and the editor.
 Noise, biomes, structures, caves etc. come later.
 
-## Editing at higher layers
+## Player-facing edit API: `edit_at_layer_pos`
+
+All player edits go through `edit_at_layer_pos(world, &LayerPos,
+voxel)`, which dispatches on `lp.layer` into three branches — the
+same split the 2D prototype's `World::edit_at` uses:
+
+- **`lp.layer == MAX_LAYER`** (leaf view): synthesise a `Position`
+  pointing at `(cx, cy, cz)` inside the targeted leaf and call
+  `edit_leaf` directly. Single-voxel write.
+- **`lp.layer == MAX_LAYER - 1`** (one above leaves): the clicked
+  cell summarises a `5³` region of exactly one child leaf at slot
+  `(cx/5, cy/5, cz/5)`. Clone that leaf, fill the `5³` region at
+  `((cx%5)*5, (cy%5)*5, (cz%5)*5)`, intern, then call `install_subtree`
+  with `lp.path + [child_slot]`.
+- **`lp.layer <= MAX_LAYER - 2`** (two or more above leaves): the
+  `(cx, cy, cz)` triple decomposes into **two more slot steps**:
+  `slot_a = slot_index(cx/5, cy/5, cz/5)` and
+  `slot_b = slot_index(cx%5, cy%5, cz%5)`. Together these name a
+  specific layer-`(lp.layer + 2)` subtree. Build (or recycle via
+  dedup) a "solid X chain" rooted at that layer and splice it in via
+  `install_subtree(lp.path + [slot_a, slot_b], chain_id)`.
+
+All three branches end in `install_subtree(ancestor_slots, new_id)`,
+which does the leaf-to-root walk above: re-downsample one slot per
+ancestor, intern each new node, update `World.root`, rotate the root
+refcount. The length of `ancestor_slots` is the layer of the replaced
+node.
+
+Semantically, editing a layer-`K` cell still means **"fill the
+entire leaf region under that cell with block X"** — dispatch just
+picks the cheapest shape of edit walk that achieves it. The third
+branch is where dedup carries its weight: replacing a trillion leaf
+voxels with "solid stone" costs the same as replacing one million,
+because the solid-stone subtree at every layer is already a single
+library entry.
+
+## Editing at higher layers (conceptual)
 
 When the camera is zoomed out to layer K (K < MAX_LAYER), a click
 targets a layer-K voxel, not a leaf voxel. Placing block X at a

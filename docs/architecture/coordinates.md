@@ -205,9 +205,47 @@ the nodes it finds there.
 - No coordinate spans more than one tree layer. No integer ever grows
   past `125`. No float ever leaves `0..1`.
 
+## `LayerPos`: a cell at an arbitrary view layer
+
+`Position` is always leaf-layer. The renderer, editor, input layer,
+and picking code all want the opposite: a cell at the *current camera
+view layer*, without projecting through a leaf position.
+
+```rust
+pub struct LayerPos {
+    pub path:  Vec<u8>,       // length == layer, 0 for root
+    pub cell:  [u8; 3],       // each component 0..25
+    pub layer: u8,            // 0..=MAX_LAYER
+}
+```
+
+Same bounded-ness: `path` slots `< 125`, `cell` components `< 25`.
+`LayerPos.path.len() == LayerPos.layer`.
+
+`LayerPos::from_leaf(&Position, layer)` walks up the leaf's path
+applying the downsample's inverse one step at a time:
+
+```
+cx, cy, cz = leaf.voxel
+for i in (layer..NODE_PATH_LEN).rev():
+    (sx, sy, sz) = slot_coords(leaf.path[i])
+    cx = 5 * sx + cx / 5
+    cy = 5 * sy + cy / 5
+    cz = 5 * sz + cz / 5
+```
+
+Every intermediate `(cx, cy, cz)` stays in `0..25`, because
+`5 * sx < 25`, `cx / 5 < 5`, and their sum is `< 25`. That's the
+bounded-ness invariant proving itself at runtime.
+
+`LayerPos` was originally added in the 2D prototype — the 3D design
+only had `Position`, and every non-physics caller ended up re-writing
+the same projection logic. Making the view-layer cell a first-class
+type removed a lot of duplication.
+
 ## Not covered here
 
 - **Editing and propagation.** How edits flow up the tree and keep
   voxels + meshes consistent at every layer. See `editing.md`.
 - **Rendering LOD.** How the renderer picks which layer to emit
-  entities at. Separate document.
+  entities at. See `rendering.md`.
