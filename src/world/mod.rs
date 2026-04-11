@@ -26,9 +26,16 @@ pub use render::RenderState;
 pub use state::{WorldState, MAX_DEPTH};
 pub use terrain::StreamState;
 
-/// How far the player can see, in *render entities* per axis. Same entity
-/// budget at every depth (super-chunks at 0, chunks at 1/2).
-pub const RENDER_DISTANCE: i32 = 24;
+/// How far the player can see, in render-entities per axis, at a given zoom
+/// depth. Coarse depths (fewer bake-worthy patterns thanks to content
+/// dedup) can afford larger render radii.
+pub fn render_distance_for_depth(depth: usize) -> i32 {
+    match depth {
+        0 => 12, // super-super-chunks — 1,500-block view radius
+        1 => 16, // super-chunks       — 400-block view radius
+        _ => 24, // chunks / blocks    — 120-block view radius
+    }
+}
 
 pub struct WorldPlugin;
 

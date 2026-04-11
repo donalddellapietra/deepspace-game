@@ -15,23 +15,30 @@ use super::chunk::{Chunk, FlatWorld, S, SUPER};
 use super::collision;
 use super::library::MeshLibrary;
 
-/// Maximum drill depth. 0 = most zoomed out, `MAX_DEPTH` = most zoomed in.
-pub const MAX_DEPTH: usize = 2;
+/// Maximum drill depth. 0 = most zoomed out (super-super-chunks visible),
+/// `MAX_DEPTH` = most zoomed in (individual blocks). Each step between
+/// depths is a factor of `S` in linear scale.
+pub const MAX_DEPTH: usize = 3;
 
 #[derive(Resource, Default)]
 pub struct WorldState {
     pub world: FlatWorld,
     pub depth: usize,
-    /// Super-chunk keys whose cached level-2 mesh may be stale and need a
-    /// re-lookup on the next render pass.
-    pub dirty_supers: HashSet<IVec3>,
+    /// Chunk keys whose content may have changed since the last render.
+    /// Each render pass derives its own per-level dirty set from this
+    /// (e.g. `render_super_chunks` divides by `S`, `render_super_super_chunks`
+    /// divides by `SUPER`) and uses it to skip re-computing keys for
+    /// entities that are already rendered and haven't been touched. Cleared
+    /// at the end of `render_world`.
+    pub dirty_chunks: HashSet<IVec3>,
 }
 
 impl collision::SolidQuery for WorldState {
     fn is_solid(&self, coord: IVec3) -> bool {
         match self.depth {
-            0 => self.world.super_chunk_solid(coord),
-            1 => self.world.chunk_solid(coord),
+            0 => self.world.super_super_chunk_solid(coord),
+            1 => self.world.super_chunk_solid(coord),
+            2 => self.world.chunk_solid(coord),
             _ => self.world.is_solid(coord),
         }
     }
@@ -57,27 +64,47 @@ impl WorldState {
     }
 
     /// Zoom out by one level.
+    ///
+    /// After the scale change, the player's new `y` may land inside a
+    /// solid bevy-block (e.g. depth-1 `y=2` divided by `S=5` becomes `y=0.4`
+    /// which is inside the depth-0 ground cube spanning `0..1`). The swept-
+    /// AABB collision can't resolve "already overlapping," so we push the
+    /// player up to sit on top of whatever cell their feet landed in.
     pub fn drill_out(&mut self, player_pos: Vec3) -> Option<Vec3> {
         if self.depth == 0 {
             return None;
         }
         self.depth -= 1;
-        Some(player_pos / S as f32)
+        use collision::SolidQuery;
+        let mut new_pos = player_pos / S as f32;
+        // Bound the push-up to a few cells so a pathological world can't
+        // loop forever.
+        for _ in 0..8 {
+            let cell = IVec3::new(
+                new_pos.x.floor() as i32,
+                new_pos.y.floor() as i32,
+                new_pos.z.floor() as i32,
+            );
+            if !SolidQuery::is_solid(self, cell) {
+                break;
+            }
+            new_pos.y = (cell.y + 1) as f32 + 0.001;
+        }
+        Some(new_pos)
     }
 
-    pub fn dirty_super_for_block(&mut self, block_coord: IVec3) {
-        self.dirty_supers.insert(IVec3::new(
-            block_coord.x.div_euclid(SUPER),
-            block_coord.y.div_euclid(SUPER),
-            block_coord.z.div_euclid(SUPER),
-        ));
+    /// Mark a chunk as dirty so the next render re-derives whatever level
+    /// entity contains it.
+    pub fn dirty_chunk(&mut self, chunk_key: IVec3) {
+        self.dirty_chunks.insert(chunk_key);
     }
 
-    pub fn dirty_super_for_chunk(&mut self, chunk_key: IVec3) {
-        self.dirty_supers.insert(IVec3::new(
-            chunk_key.x.div_euclid(S),
-            chunk_key.y.div_euclid(S),
-            chunk_key.z.div_euclid(S),
+    /// Convenience: mark the chunk that owns `block_coord` as dirty.
+    pub fn dirty_chunk_for_block(&mut self, block_coord: IVec3) {
+        self.dirty_chunks.insert(IVec3::new(
+            block_coord.x.div_euclid(S),
+            block_coord.y.div_euclid(S),
+            block_coord.z.div_euclid(S),
         ));
     }
 
@@ -100,7 +127,7 @@ impl WorldState {
             }
         }
         self.world.set(coord, block);
-        self.dirty_super_for_block(coord);
+        self.dirty_chunk_for_block(coord);
     }
 
     /// Insert (or replace) a whole chunk. If a chunk already lived at `key`
@@ -116,6 +143,6 @@ impl WorldState {
                 library.level1_decrement(id);
             }
         }
-        self.dirty_super_for_chunk(key);
+        self.dirty_chunk(key);
     }
 }

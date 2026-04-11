@@ -7,16 +7,14 @@ use bevy::prelude::*;
 use crate::block::{BlockType, MODEL_SIZE};
 use crate::player::Player;
 
-use super::chunk::{Chunk, S};
+use super::chunk::{Chunk, S, SUPER};
 use super::state::WorldState;
-use super::RENDER_DISTANCE;
 
 const WORLD_SEED: u64 = 0xDEAD_BEEF_F00D_CAFE;
 
-/// How wide a window of chunk columns to keep generated around the player,
-/// in chunks per axis. Slightly larger than render range so the world is
-/// already there before it becomes visible.
-const STREAM_RADIUS_CHUNKS: i32 = RENDER_DISTANCE * S + S;
+/// Stream radius in chunks. Must cover the largest per-depth view radius.
+/// Depth 0 at rd=12 wants 12 SSS × 25 chunks/SSS = 300 chunks, plus margin.
+const STREAM_RADIUS_CHUNKS: i32 = 12 * SUPER + S;
 
 #[derive(Resource, Default)]
 pub struct StreamState {
@@ -73,10 +71,12 @@ pub fn generate_terrain(
     let Ok(tf) = player_q.single() else { return };
 
     // Convert bevy-space position to integer-block coords, depth-aware.
+    // At depth N, 1 bevy unit = S^(MAX_DEPTH - N) integer blocks.
     let scale = match state.depth {
-        0 => (S * S) as f32, // 1 bevy = 1 super-chunk = 25 blocks
-        1 => S as f32,       // 1 bevy = 1 chunk = 5 blocks
-        _ => 1.0,            // 1 bevy = 1 block
+        0 => (S * S * S) as f32, // super-super-chunk: 125 blocks
+        1 => (S * S) as f32,     // super-chunk:       25 blocks
+        2 => S as f32,           // chunk:              5 blocks
+        _ => 1.0,                // block:              1 block
     };
     let int_x = (tf.translation.x * scale).floor() as i32;
     let int_z = (tf.translation.z * scale).floor() as i32;
@@ -111,7 +111,7 @@ pub fn generate_terrain(
                 }
                 let Some(chunk) = generate_chunk(key) else { continue };
                 state.world.insert_chunk(key, chunk);
-                state.dirty_super_for_chunk(key);
+                state.dirty_chunk(key);
             }
         }
     }

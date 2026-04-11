@@ -89,31 +89,94 @@ impl ChunkIndex {
 
     /// Return every chunk key within squared euclidean `radius` chunks of
     /// `center`. Iterates populated buckets only, with a loose-radius bucket
-    /// cull before descending into each bucket's chunk list.
+    /// cull before descending into each bucket's chunk list. Squared-distance
+    /// math is done in `i64` so wildly out-of-range queries (e.g. a player
+    /// that fell a long way) can't overflow.
     pub fn chunks_in_sphere(&self, center: IVec3, radius: i32) -> Vec<IVec3> {
-        let radius_sq = radius * radius;
-        // A bucket can contribute only if its center is within
-        // `radius + bucket diagonal` of the query center.
+        let radius_sq: i64 = (radius as i64) * (radius as i64);
         let bucket_diag = ((CHUNK_INDEX_BUCKET as f32) * 1.7321) as i32 + 1;
-        let loose = radius + bucket_diag;
-        let loose_sq = loose * loose;
+        let loose = (radius as i64) + (bucket_diag as i64);
+        let loose_sq: i64 = loose * loose;
         let bucket_half = CHUNK_INDEX_BUCKET / 2;
 
         let mut result = Vec::new();
         for (&bk, chunk_keys) in &self.buckets {
             let bucket_center = bk * CHUNK_INDEX_BUCKET + IVec3::splat(bucket_half);
-            let db = bucket_center - center;
-            if db.x * db.x + db.y * db.y + db.z * db.z > loose_sq {
+            let dbx = (bucket_center.x - center.x) as i64;
+            let dby = (bucket_center.y - center.y) as i64;
+            let dbz = (bucket_center.z - center.z) as i64;
+            if dbx * dbx + dby * dby + dbz * dbz > loose_sq {
                 continue;
             }
             for &chunk_key in chunk_keys {
-                let d = chunk_key - center;
-                if d.x * d.x + d.y * d.y + d.z * d.z <= radius_sq {
+                let dx = (chunk_key.x - center.x) as i64;
+                let dy = (chunk_key.y - center.y) as i64;
+                let dz = (chunk_key.z - center.z) as i64;
+                if dx * dx + dy * dy + dz * dz <= radius_sq {
                     result.push(chunk_key);
                 }
             }
         }
         result
+    }
+
+    /// Return every chunk key that falls inside the inclusive cube
+    /// `[min, max_incl]`. Walks the bucket range overlapping the cube and
+    /// filters each bucket's chunk list by exact containment. Faster than
+    /// `chunks_in_sphere` for axis-aligned queries and a good fit for the
+    /// `compute_levelN_key` path, which needs all existing chunks in one
+    /// super-chunk or super-super-chunk-sized region.
+    pub fn chunks_in_cube(&self, min: IVec3, max_incl: IVec3) -> Vec<IVec3> {
+        let bsize = CHUNK_INDEX_BUCKET;
+        let b_min = IVec3::new(
+            min.x.div_euclid(bsize),
+            min.y.div_euclid(bsize),
+            min.z.div_euclid(bsize),
+        );
+        let b_max = IVec3::new(
+            max_incl.x.div_euclid(bsize),
+            max_incl.y.div_euclid(bsize),
+            max_incl.z.div_euclid(bsize),
+        );
+
+        let mut result = Vec::new();
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let bk = IVec3::new(bx, by, bz);
+                    if let Some(bucket) = self.buckets.get(&bk) {
+                        for &ck in bucket {
+                            if ck.x >= min.x
+                                && ck.x <= max_incl.x
+                                && ck.y >= min.y
+                                && ck.y <= max_incl.y
+                                && ck.z >= min.z
+                                && ck.z <= max_incl.z
+                            {
+                                result.push(ck);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Look up a single bucket's contents (used by FlatWorld for cube-range
+    /// queries like super_chunk_solid / super_super_chunk_solid).
+    pub fn bucket_at(&self, bucket_key: IVec3) -> Option<&HashSet<IVec3>> {
+        self.buckets.get(&bucket_key)
+    }
+
+    /// Convert a chunk key to the bucket coord it lives in.
+    pub fn bucket_of(chunk_key: IVec3) -> IVec3 {
+        Self::bucket(chunk_key)
+    }
+
+    /// The bucket side length. Exposed so FlatWorld can walk a bucket range.
+    pub const fn bucket_size() -> i32 {
+        CHUNK_INDEX_BUCKET
     }
 
     fn bucket(chunk_key: IVec3) -> IVec3 {
@@ -197,6 +260,48 @@ impl FlatWorld {
                     let chunk_key = super_key * S + IVec3::new(cx, cy, cz);
                     if self.chunk_solid(chunk_key) {
                         return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `true` iff any chunk inside super-super-chunk `sss_key` (25×25×25
+    /// chunks) has at least one block. Goes through the spatial index so
+    /// empty SSSes are a handful of bucket misses instead of 15k HashMap
+    /// lookups.
+    pub fn super_super_chunk_solid(&self, sss_key: IVec3) -> bool {
+        let min = sss_key * SUPER;
+        let max = min + IVec3::splat(SUPER - 1);
+        let b_size = ChunkIndex::bucket_size();
+        let b_min = IVec3::new(
+            min.x.div_euclid(b_size),
+            min.y.div_euclid(b_size),
+            min.z.div_euclid(b_size),
+        );
+        let b_max = IVec3::new(
+            max.x.div_euclid(b_size),
+            max.y.div_euclid(b_size),
+            max.z.div_euclid(b_size),
+        );
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let bk = IVec3::new(bx, by, bz);
+                    if let Some(bucket) = self.index.bucket_at(bk) {
+                        for &ck in bucket {
+                            if ck.x >= min.x
+                                && ck.x <= max.x
+                                && ck.y >= min.y
+                                && ck.y <= max.y
+                                && ck.z >= min.z
+                                && ck.z <= max.z
+                                && self.chunk_solid(ck)
+                            {
+                                return true;
+                            }
+                        }
                     }
                 }
             }

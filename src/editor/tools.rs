@@ -98,8 +98,20 @@ pub fn remove_block(
 
     match state.depth {
         0 => {
-            // hit is a super-chunk key. Tombstone all 5×5×5 chunks beneath it
-            // so the streaming generator never refills them.
+            // hit is a super-super-chunk key. Tombstone all 25×25×25 chunks
+            // beneath it. (Proof-of-concept: coarse but correct.)
+            let chunk_origin = hit * SUPER;
+            for dz in 0..SUPER {
+                for dy in 0..SUPER {
+                    for dx in 0..SUPER {
+                        let chunk_key = chunk_origin + IVec3::new(dx, dy, dz);
+                        state.replace_chunk(chunk_key, Chunk::tombstone(), &mut library);
+                    }
+                }
+            }
+        }
+        1 => {
+            // hit is a super-chunk key. Tombstone its 5×5×5 chunks.
             for cz in 0..S {
                 for cy in 0..S {
                     for cx in 0..S {
@@ -108,16 +120,14 @@ pub fn remove_block(
                     }
                 }
             }
-            state.dirty_supers.insert(hit);
         }
-        1 => {
+        2 => {
             // hit is a chunk key.
             state.replace_chunk(hit, Chunk::tombstone(), &mut library);
         }
         _ => {
             // hit is an integer block coord.
             state.edit_block(hit, None, &mut library);
-            // Mark user_modified so the streaming generator never refills.
             let key = IVec3::new(
                 hit.x.div_euclid(S),
                 hit.y.div_euclid(S),
@@ -153,7 +163,29 @@ pub fn place_block(
 
     match state.depth {
         0 => {
-            // place is a super-chunk key. Refuse if already populated.
+            // place is a super-super-chunk key. Fill all 25×25×25 chunks
+            // beneath it with the selected block type.
+            if state.world.super_super_chunk_solid(place) {
+                return;
+            }
+            let bt = match hotbar.active_item() {
+                super::HotbarItem::Block(bt) => *bt,
+                super::HotbarItem::SavedModel(_) => BlockType::Stone,
+            };
+            let mut filled = Chunk::new_filled(bt);
+            filled.user_modified = true;
+            let chunk_origin = place * SUPER;
+            for dz in 0..SUPER {
+                for dy in 0..SUPER {
+                    for dx in 0..SUPER {
+                        let chunk_key = chunk_origin + IVec3::new(dx, dy, dz);
+                        state.replace_chunk(chunk_key, filled.clone(), &mut library);
+                    }
+                }
+            }
+        }
+        1 => {
+            // place is a super-chunk key.
             if state.world.super_chunk_solid(place) {
                 return;
             }
@@ -171,9 +203,8 @@ pub fn place_block(
                     }
                 }
             }
-            state.dirty_supers.insert(place);
         }
-        1 => {
+        2 => {
             if state.world.chunk_solid(place) {
                 return;
             }
@@ -283,25 +314,22 @@ pub fn save_as_template(
     let Ok(tf) = player_q.single() else { return };
 
     // Save the chunk currently under the player. The player's bevy units
-    // depend on depth, so convert via the per-depth granularity to find the
-    // integer chunk key.
-    let chunk_key = match state.depth {
-        0 => IVec3::new(
-            (tf.translation.x * S as f32) as i32,
-            (tf.translation.y * S as f32) as i32,
-            (tf.translation.z * S as f32) as i32,
-        ),
-        1 => IVec3::new(
-            tf.translation.x as i32,
-            tf.translation.y as i32,
-            tf.translation.z as i32,
-        ),
-        _ => IVec3::new(
-            (tf.translation.x as i32).div_euclid(S),
-            (tf.translation.y as i32).div_euclid(S),
-            (tf.translation.z as i32).div_euclid(S),
-        ),
+    // scale with depth; convert to an integer block coord first, then to a
+    // chunk key.
+    let blocks_per_bevy: i32 = match state.depth {
+        0 => SUPER * S, // 125
+        1 => SUPER,     // 25
+        2 => S,         // 5
+        _ => 1,
     };
+    let int_x = (tf.translation.x * blocks_per_bevy as f32).floor() as i32;
+    let int_y = (tf.translation.y * blocks_per_bevy as f32).floor() as i32;
+    let int_z = (tf.translation.z * blocks_per_bevy as f32).floor() as i32;
+    let chunk_key = IVec3::new(
+        int_x.div_euclid(S),
+        int_y.div_euclid(S),
+        int_z.div_euclid(S),
+    );
     let Some(chunk) = state.world.chunks.get(&chunk_key) else {
         return;
     };

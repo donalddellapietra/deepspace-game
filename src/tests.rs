@@ -169,8 +169,9 @@ fn drill_in_blocked_at_max_depth() {
     let mut state = WorldState::default();
     state.world = ground_world(2);
 
-    state.drill_in(Vec3::ZERO).unwrap();
-    state.drill_in(Vec3::ZERO).unwrap();
+    for _ in 0..crate::world::MAX_DEPTH {
+        state.drill_in(Vec3::ZERO).unwrap();
+    }
     assert_eq!(state.depth(), crate::world::MAX_DEPTH);
     // One past MAX_DEPTH must be refused.
     assert!(state.drill_in(Vec3::ZERO).is_none());
