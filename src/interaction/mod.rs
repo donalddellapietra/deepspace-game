@@ -1,11 +1,19 @@
-//! Block targeting via a view-layer-aware voxel raycast.
+//! Block targeting via a view-layer voxel raycast.
 //!
-//! At view layer L the world is rendered as cells of
-//! `cell_size_at_layer(L)` Bevy units; the player picks and edits at
-//! that same granularity. We DDA-walk one view-cell per iteration
-//! (16 steps regardless of L) and store the hit as a [`LayerPos`] —
-//! a path-based representation with no globally-growing integers, so
-//! the same code works at `MAX_LAYER = 12` today and at 15+ later.
+//! At view layer `L` the crosshair names one **view cell** —
+//! precisely one voxel of the layer-`L` node's `25³` grid, with
+//! Bevy-space extent `cell_size_at_layer(L)`. Clicks place or remove
+//! a full layer-`L` block, so zooming out (pressing Q) lets the player
+//! place bigger blocks without any editor mode switch; that is the
+//! whole point of the layer hierarchy.
+//!
+//! The DDA walks view cells, sampling solidity via
+//! [`is_layer_pos_solid`] at the view layer. The tree's downsample
+//! rule (see `world::tree::downsample`) is presence-preserving — any
+//! non-empty child voxel surfaces its value at the parent — so a
+//! layer-`L` voxel correctly reports "solid" whenever the subtree
+//! below it contains anything visible. That invariant is what makes
+//! this single solidity query work at every view layer.
 
 use bevy::prelude::*;
 
@@ -17,10 +25,10 @@ use crate::world::position::LayerPos;
 use crate::world::render::{cell_size_at_layer, ROOT_ORIGIN};
 use crate::world::{CameraZoom, WorldState};
 
-/// Maximum reach in **cells** at the current view layer. The cell
-/// DDA takes at most this many steps, so picking and placement work
-/// the same way at every zoom level: 16 cells in front, regardless
-/// of whether one cell is 1 leaf voxel (L=12) or 625 leaf voxels (L=8).
+/// Maximum reach in cells at the current view layer. The cell DDA
+/// takes at most this many steps, so picking works the same at every
+/// zoom level: 16 cells in front, regardless of whether one cell is
+/// 1 leaf voxel (L=12) or 625 leaf voxels (L=8).
 const MAX_REACH_CELLS: i32 = 16;
 
 pub struct InteractionPlugin;
@@ -32,15 +40,17 @@ impl Plugin for InteractionPlugin {
     }
 }
 
-/// The view-layer cell the crosshair is pointing at.
+/// The view cell the crosshair is pointing at.
+///
+/// `hit_layer_pos.layer == zoom.layer` — one voxel in the layer-`L`
+/// node's `25³` grid. Editing consumers drive `cell_size` and
+/// re-projection off `zoom.layer` (equivalently `hit_layer_pos.layer`).
 #[derive(Resource, Default)]
 pub struct TargetedBlock {
-    /// The hit cell, as a [`LayerPos`] at the current view layer.
-    /// `path.len() == lp.layer`, `cell` in `0..25`.
     pub hit_layer_pos: Option<LayerPos>,
-    /// Face normal at the hit, in CELL units. Add `normal *
-    /// cell_size_at_layer(lp.layer)` to the cell's centre to get
-    /// the placement cell's centre.
+    /// Face normal at the hit, in view-cell units. Add
+    /// `normal * cell_size_at_layer(hit_layer_pos.layer)` to the
+    /// cell's centre to get the placement cell's centre.
     pub normal: Option<IVec3>,
 }
 
@@ -71,11 +81,9 @@ fn update_target(
     }
 }
 
-/// Cell-level DDA. Walks **view cells** at `view_layer` cell size,
-/// not leaf voxels — so the cost is independent of zoom (16 steps
-/// max, with each step doing one path walk in the tree).
-///
-/// Returns the hit `LayerPos` and the face normal in cell units.
+/// View-cell DDA. Walks one view cell per iteration, sampling
+/// solidity at the view layer. Returns the hit `LayerPos` at
+/// `view_layer` and the face normal in view-cell units.
 fn dda_view_cells(
     world: &WorldState,
     view_layer: u8,
@@ -85,10 +93,6 @@ fn dda_view_cells(
     let cell_size = cell_size_at_layer(view_layer);
     let cell_origin = ROOT_ORIGIN;
 
-    // Compute the starting cell index relative to ROOT_ORIGIN.
-    // These IVec3 values are local to the camera (max ~MAX_REACH_CELLS
-    // away from the camera's own cell), so they never overflow `i32`
-    // even at large `MAX_LAYER` values.
     let local = origin - cell_origin;
     let mut pos = IVec3::new(
         (local.x / cell_size).floor() as i32,
@@ -107,7 +111,6 @@ fn dda_view_cells(
         if dir.z.abs() > 1e-10 { 1.0 / dir.z } else { f32::MAX },
     );
 
-    // First boundary on each axis in the direction of the ray.
     let next_x = if step.x > 0 {
         cell_origin.x + (pos.x + 1) as f32 * cell_size
     } else {
@@ -170,7 +173,7 @@ fn dda_view_cells(
 /// canonical sample point.
 fn cell_index_to_layer_pos(
     cell: IVec3,
-    view_layer: u8,
+    layer: u8,
     cell_size: f32,
     cell_origin: Vec3,
 ) -> Option<LayerPos> {
@@ -180,7 +183,7 @@ fn cell_index_to_layer_pos(
             (cell.y as f32 + 0.5) * cell_size,
             (cell.z as f32 + 0.5) * cell_size,
         );
-    layer_pos_from_bevy(center, view_layer)
+    layer_pos_from_bevy(center, layer)
 }
 
 fn draw_highlight(

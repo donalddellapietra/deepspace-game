@@ -23,11 +23,10 @@ use bevy::prelude::*;
 
 use super::edit::get_voxel;
 use super::position::{LayerPos, Position, NODE_PATH_LEN};
-use super::render::{cell_size_at_layer, ROOT_ORIGIN};
+use super::render::{cell_size_at_layer, target_layer_for, ROOT_ORIGIN};
 use super::state::{world_extent_voxels, WorldState};
 use super::tree::{
-    slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
-    NODE_VOXELS_PER_AXIS,
+    slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL, NODE_VOXELS_PER_AXIS,
 };
 
 // ------------------------------------------------------------ player AABB
@@ -356,7 +355,7 @@ pub fn move_and_collide(
     view_layer: u8,
 ) {
     let view_cell = cell_size_at_layer(view_layer);
-    let target_layer = view_layer.saturating_add(2).min(MAX_LAYER);
+    let target_layer = target_layer_for(view_layer);
     let block_size = cell_size_at_layer(target_layer);
     let cell_origin = ROOT_ORIGIN;
 
@@ -434,7 +433,7 @@ pub fn move_and_collide(
 /// were on the floor.
 pub fn on_ground(pos: Vec3, world: &WorldState, view_layer: u8) -> bool {
     let view_cell = cell_size_at_layer(view_layer);
-    let target_layer = view_layer.saturating_add(2).min(MAX_LAYER);
+    let target_layer = target_layer_for(view_layer);
     let block_size = cell_size_at_layer(target_layer);
     let cell_origin = ROOT_ORIGIN;
 
@@ -594,8 +593,44 @@ mod tests {
         ));
     }
 
+    /// The grassland's ground surface must be reachable as a solid
+    /// [`LayerPos`] at every view layer. Regression against a
+    /// majority-vote downsample that washed out thin features — at
+    /// view L ≤ 8 the 125-leaf-deep ground used to collapse to air
+    /// in the cascaded downsample, so the crosshair clicked through
+    /// ground it could see. The presence-preserving downsample in
+    /// `tree::downsample` is what makes this hold.
+    #[test]
+    fn ground_is_solid_at_every_view_layer() {
+        use super::super::position::LayerPos;
+        use super::super::render::{target_layer_for, MIN_ZOOM, MAX_ZOOM};
+        let world = WorldState::new_grassland();
+        // A point guaranteed to sit inside the grass region: one
+        // voxel below the surface at the world's all-zero-path.
+        let probe = Vec3::new(0.0, -1.0, 0.0);
+        for view_layer in MIN_ZOOM..=MAX_ZOOM {
+            let target = target_layer_for(view_layer);
+            let lp_view = layer_pos_from_bevy(probe, view_layer)
+                .expect("probe inside world at view layer");
+            let lp_target = layer_pos_from_bevy(probe, target)
+                .expect("probe inside world at target layer");
+            assert!(
+                is_layer_pos_solid(&world, &lp_view),
+                "view layer {view_layer}: ground reads as air (downsample loss)"
+            );
+            assert!(
+                is_layer_pos_solid(&world, &lp_target),
+                "target layer {target} (from view {view_layer}): ground reads as air"
+            );
+            // Silence an unused-import warning on some configurations.
+            let _: LayerPos = lp_view;
+            let _: LayerPos = lp_target;
+        }
+    }
+
     #[test]
     fn on_ground_just_above_surface() {
+        use super::super::tree::MAX_LAYER;
         let world = WorldState::new_grassland();
         // Feet at y = 0.001 are a hair above the grass top face.
         // Use the leaf view layer so block_size = 1 (= the legacy

@@ -330,8 +330,22 @@ pub fn downsample_from_library(
 }
 
 /// Compress 125 children (each a 25³ voxel grid) into a parent 25³
-/// grid. Each parent voxel majority-votes the 5³ child-voxel block it
-/// represents. See `docs/architecture/voxels.md` for the math.
+/// grid. For each parent voxel, scan the 5³ child-voxel block it
+/// summarises and pick the most common **non-empty** value, falling
+/// back to [`EMPTY_VOXEL`] only when every child voxel in the block
+/// is empty.
+///
+/// This is a **presence-preserving** downsample: any non-empty voxel,
+/// no matter how rare, surfaces a non-empty parent voxel. It's the
+/// key invariant that lets thin features (like a 125-leaf-deep ground
+/// surface embedded in a billions-of-leaves world) survive cascaded
+/// downsampling all the way to the root. A plain majority vote would
+/// collapse the surface to air within a few layers and leave the
+/// crosshair clicking through ground it can clearly see.
+///
+/// If two non-empty values tie within a block, the one with the
+/// lower voxel id wins — stable and dedup-friendly, and the visual
+/// difference at that kind of zoom is imperceptible anyway.
 pub fn downsample(children: [&VoxelGrid; CHILDREN_PER_NODE]) -> VoxelGrid {
     let mut out = empty_voxel_grid();
     for pz in 0..NODE_VOXELS_PER_AXIS {
@@ -356,8 +370,11 @@ pub fn downsample(children: [&VoxelGrid; CHILDREN_PER_NODE]) -> VoxelGrid {
                     }
                 }
 
-                let mut best_v = 0u8;
-                let mut best_count = counts[0];
+                // Skip index 0 (EMPTY_VOXEL). Pick the most common
+                // non-empty value; only fall through to empty if
+                // nothing non-empty was seen.
+                let mut best_v: u8 = EMPTY_VOXEL;
+                let mut best_count: u16 = 0;
                 for v in 1..256usize {
                     if counts[v] > best_count {
                         best_v = v as u8;
@@ -453,6 +470,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Presence-preserving invariant: a single non-empty child voxel
+    /// in an otherwise-empty block must surface a non-empty parent
+    /// voxel. This is the property the grassland-world ground
+    /// surface relies on to survive cascaded downsampling from leaf
+    /// layer all the way to the root.
+    #[test]
+    fn downsample_preserves_sparse_non_empty_voxel() {
+        let grass = grass_voxel();
+        let empty_child = empty_voxel_grid();
+        let mut sparse_child = empty_voxel_grid();
+        // One non-empty voxel in the (0, 0, 0) corner of slot (0,0,0).
+        sparse_child[voxel_idx(0, 0, 0)] = grass;
+
+        let mut refs: [&VoxelGrid; CHILDREN_PER_NODE] =
+            std::array::from_fn(|_| &empty_child);
+        refs[slot_index(0, 0, 0)] = &sparse_child;
+
+        let out = downsample(refs);
+        // Parent voxel (0, 0, 0) samples child[0] voxels (0..5)³ —
+        // 124 empty + 1 grass. Majority vote would pick empty; the
+        // presence-preserving rule picks grass.
+        assert_eq!(
+            out[voxel_idx(0, 0, 0)],
+            grass,
+            "one non-empty child voxel must surface a non-empty parent voxel"
+        );
+        // Parent voxel (1, 0, 0) still samples child[0] but a
+        // disjoint 5³ block, entirely empty → empty.
+        assert_eq!(out[voxel_idx(1, 0, 0)], EMPTY_VOXEL);
     }
 
     #[test]

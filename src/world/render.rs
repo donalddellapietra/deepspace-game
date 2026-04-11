@@ -98,10 +98,18 @@ pub const ROOT_ORIGIN: Vec3 = Vec3::new(
     -13.0,
 );
 
-/// How far a rendered node's centre may be from the camera (in leaf
-/// units, i.e. Bevy units since `1 unit = 1 leaf`) and still be
-/// emitted. Used as the v1 replacement for frustum culling.
-const RADIUS_LEAF_UNITS: f32 = 400.0;
+/// How far a rendered node's centre may be from the camera, measured
+/// in **cells at the current view layer**. Used as the v1 replacement
+/// for frustum culling. At walk time this is multiplied by
+/// `cell_size_at_layer(view_layer)` so that the render distance scales
+/// with zoom: you see the same number of cells out to the horizon
+/// whether you're at the leaves or zoomed all the way out, matching
+/// the 2D prototype's "viewport counts cells, not pixels" behaviour.
+///
+/// At view layer `L`, one visible cell is one target-layer node
+/// (target = `(L + 2).min(MAX_LAYER)`), so N cells of radius emit at
+/// most roughly `(2N)^3` target-layer nodes — keep modest.
+const RADIUS_VIEW_CELLS: f32 = 32.0;
 
 // ----------------------------------------------------------------- state
 
@@ -185,6 +193,23 @@ pub fn cell_size_at_layer(layer: u8) -> f32 {
     scale_for_layer(layer)
 }
 
+/// The layer the renderer emits entities at for a given view layer,
+/// and the layer collision samples blocks at. Ported from the 2D
+/// prototype's `subtexture_25` rule: at view layer `L`, one visible
+/// cell corresponds to one layer-`(L + 2)` node, so each emitted
+/// entity's mesh shows the fine `(L + 2)` voxel grid instead of the
+/// single layer-`L` voxel. Clamped to [`MAX_LAYER`] because you can't
+/// descend past the leaves.
+///
+/// **Every consumer that needs this rule calls this function.** Do
+/// not hardcode `(view + 2).min(MAX_LAYER)` at call sites — past
+/// bugs came from having the rule in two places and only updating
+/// one.
+#[inline]
+pub fn target_layer_for(view_layer: u8) -> u8 {
+    view_layer.saturating_add(2).min(MAX_LAYER)
+}
+
 // ----------------------------------------------------------- mesh caching
 
 fn get_or_bake_mesh<'a>(
@@ -239,6 +264,7 @@ fn walk(
     world: &WorldState,
     target_layer: u8,
     camera_pos: Vec3,
+    radius_bevy: f32,
     out: &mut Vec<Visit>,
 ) {
     if world.root == EMPTY_NODE {
@@ -247,7 +273,7 @@ fn walk(
     let mut stack: Vec<(NodeId, SmallPath, Vec3, u8)> = Vec::with_capacity(256);
     stack.push((world.root, SmallPath::empty(), ROOT_ORIGIN, 0));
 
-    let radius_sq = RADIUS_LEAF_UNITS * RADIUS_LEAF_UNITS;
+    let radius_sq = radius_bevy * radius_bevy;
 
     while let Some((node_id, path, origin, depth)) = stack.pop() {
         // Compute this node's AABB in Bevy space.
@@ -337,18 +363,14 @@ pub fn render_world(
     };
     let camera_pos = camera_tf.translation;
 
-    // Sample TWO layers deeper than the camera's view layer, matching
-    // the 2D prototype's `subtexture_25` rule. At view layer L, one
-    // visible cell corresponds to a layer-(L+2) node, so emitting one
-    // entity per layer-(L+2) node gives one entity per cell — and the
-    // entity's mesh shows the finer L+2 voxel grid instead of the
-    // coarser L downsample. Clamps at MAX_LAYER (the leaves), which
-    // also degenerates the L = MAX_LAYER and L = MAX_LAYER - 1 cases
-    // to the prototype's "render the leaf below" fallback.
-    let target_layer = zoom
-        .layer
-        .saturating_add(2)
-        .min(MAX_LAYER);
+    let target_layer = target_layer_for(zoom.layer);
+
+    // Render radius in Bevy units = N cells × Bevy-units-per-cell at
+    // the current view layer. This is what the 2D prototype does
+    // implicitly (its viewport is measured in cells); without it,
+    // zooming out collapses the visible world to a dot because the
+    // per-cell Bevy size grows by 5× per layer.
+    let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
 
     // If zoom changed, or we're on our first pass, drop everything.
     if !render_state.initialised || render_state.last_zoom_layer != target_layer
@@ -364,7 +386,7 @@ pub fn render_world(
 
     // Walk the tree → collect visible positions.
     let mut visits: Vec<Visit> = Vec::with_capacity(256);
-    walk(&world, target_layer, camera_pos, &mut visits);
+    walk(&world, target_layer, camera_pos, radius_bevy, &mut visits);
 
     let node_scale = scale_for_layer(target_layer);
 
@@ -470,7 +492,15 @@ mod tests {
     fn walk_grassland_at_leaves_emits_at_least_one_visit() {
         let world = WorldState::new_grassland();
         let mut visits = Vec::new();
-        walk(&world, MAX_LAYER, Vec3::ZERO, &mut visits);
+        // At view L = MAX_LAYER the view cell is 1 Bevy unit, so the
+        // Bevy-space radius equals RADIUS_VIEW_CELLS directly.
+        walk(
+            &world,
+            MAX_LAYER,
+            Vec3::ZERO,
+            RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
+            &mut visits,
+        );
         assert!(
             !visits.is_empty(),
             "grassland walk at leaf layer should emit at least one visit"
@@ -481,14 +511,45 @@ mod tests {
     fn walk_radius_limits_emit_count() {
         let world = WorldState::new_grassland();
         let mut visits = Vec::new();
-        walk(&world, MAX_LAYER, Vec3::ZERO, &mut visits);
-        // Radius ~400 at scale 1.0 → bounded number of leaves. Hard
-        // ceiling chosen generously; this test is a guard rail against
+        walk(
+            &world,
+            MAX_LAYER,
+            Vec3::ZERO,
+            RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
+            &mut visits,
+        );
+        // Bounded number of target-layer nodes — guard rail against
         // accidentally unbounded walks.
         assert!(
             visits.len() < 200_000,
             "walk emitted {} visits; expected far fewer",
             visits.len()
         );
+    }
+
+    #[test]
+    fn walk_radius_scales_with_view_layer() {
+        // At every view layer the walk should emit a comparable count
+        // of target-layer nodes (within a small constant factor),
+        // because the radius is "N cells at view layer" and one
+        // target-layer node = one view cell.
+        let world = WorldState::new_grassland();
+        let mut counts = Vec::new();
+        for view_layer in (MIN_ZOOM..=MAX_ZOOM).rev() {
+            let target = view_layer.saturating_add(2).min(MAX_LAYER);
+            let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
+            let mut visits = Vec::new();
+            walk(&world, target, Vec3::ZERO, radius, &mut visits);
+            counts.push((view_layer, visits.len()));
+        }
+        // No view layer should be empty (the bug this test guards
+        // against: at low view layers the old fixed-Bevy-unit radius
+        // culled everything).
+        for &(view_layer, n) in &counts {
+            assert!(
+                n > 0,
+                "view layer {view_layer}: walk emitted 0 visits — radius too small at this zoom?"
+            );
+        }
     }
 }
