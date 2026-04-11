@@ -8,6 +8,8 @@ use bevy::{
 
 use crate::inventory::InventoryState;
 use crate::player::{Player, PLAYER_HEIGHT};
+use crate::world::render::cell_size_at_layer;
+use crate::world::CameraZoom;
 
 const SENSITIVITY: f32 = 0.003;
 
@@ -81,6 +83,7 @@ fn manage_cursor(
 fn first_person_camera(
     motion: Res<AccumulatedMouseMotion>,
     locked: Res<CursorLocked>,
+    zoom: Res<CameraZoom>,
     player_q: Query<&Transform, (With<Player>, Without<FpsCam>)>,
     mut cam_q: Query<(&mut Transform, &mut FpsCam), Without<Player>>,
 ) {
@@ -94,7 +97,14 @@ fn first_person_camera(
             .clamp(-FRAC_PI_2 + 0.05, FRAC_PI_2 - 0.05);
     }
 
-    // Player.y = feet. Camera at eye height.
-    cam_tf.translation = player_tf.translation + Vec3::Y * PLAYER_HEIGHT;
+    // Player.y = feet. Camera sits at the eye, but the eye height
+    // scales with the view layer's cell size: at view L the player
+    // operates "at one cell" of body width / height, and one cell is
+    // `cell_size_at_layer(L)` Bevy units. The fixed-FOV camera at a
+    // higher eye then sees the same number of cells regardless of L
+    // — pressing Q to zoom out lifts the camera so the world looks
+    // proportionally smaller.
+    let cell = cell_size_at_layer(zoom.layer);
+    cam_tf.translation = player_tf.translation + Vec3::Y * (PLAYER_HEIGHT * cell);
     cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
 }
