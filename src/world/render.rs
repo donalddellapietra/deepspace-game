@@ -75,19 +75,27 @@ impl CameraZoom {
 
 /// Origin of the root node in Bevy space.
 ///
-/// The y component is chosen so that the top face of the
-/// `GROUND_Y_VOXELS`-deep grass surface lines up with Bevy `y = 0`.
-/// Concretely, the root-local y range `(0, GROUND_Y_VOXELS)` maps to
-/// Bevy y range `(-GROUND_Y_VOXELS, 0)`, and the "all-zero path" leaf
-/// sits at the very bottom of the grass region.
+/// `y` is chosen so that the top face of the `GROUND_Y_VOXELS`-deep
+/// grass surface lines up with Bevy `y = 0`. The root-local y range
+/// `(0, GROUND_Y_VOXELS)` maps to Bevy `(-GROUND_Y_VOXELS, 0)`, and
+/// the all-zero-path leaf sits at the very bottom of the grass
+/// region.
 ///
-/// x and z are offset by `-12.5` so the all-zero leaf is centred
-/// horizontally around `(0, *, 0)`. The player spawns at `(0, 2, 0)`,
-/// a couple of voxels above the grass surface, and falls onto it.
+/// `x` and `z` are **integer offsets**. It is important that they
+/// are integer: the raycast in `src/interaction/mod.rs` steps through
+/// Bevy integer cells `[c, c+1]`, and the highlight gizmo centres a
+/// unit cube at `c + 0.5`. If `ROOT_ORIGIN.{x,z}` had a fractional
+/// part, voxels would sit on a non-integer lattice and the outline
+/// would drift half a voxel away from the block it names.
+///
+/// `-13` puts the all-zero-path leaf at Bevy `(-13..12)` on each of
+/// x and z, so Bevy `(0, ·, 0)` is near the leaf's centre (voxel 13
+/// out of 25). The player spawns at `(0, 2, 0)`, a couple of voxels
+/// above the grass surface, and falls onto it.
 pub const ROOT_ORIGIN: Vec3 = Vec3::new(
-    -12.5,
+    -13.0,
     -(super::state::GROUND_Y_VOXELS as f32),
-    -12.5,
+    -13.0,
 );
 
 /// How far a rendered node's centre may be from the camera (in leaf

@@ -351,16 +351,14 @@ mod tests {
     fn concrete_leaf_voxel_example() {
         // Position in the all-zero-path leaf with voxel (5, 10, 0)
         // and offset (0.5, 0, 0) should map to
-        //   ROOT_ORIGIN + (5.5, 10, 0)
-        //   = (-12.5 + 5.5, ROOT_ORIGIN.y + 10, -12.5 + 0)
-        //   = (-7, ROOT_ORIGIN.y + 10, -12.5).
+        //   ROOT_ORIGIN + (5.5, 10, 0).
         let mut p = Position::origin();
         p.voxel = [5, 10, 0];
         p.offset = [0.5, 0.0, 0.0];
         let v = bevy_from_position(&p);
-        assert!(approx_eq(v.x, -7.0), "x={}", v.x);
+        assert!(approx_eq(v.x, ROOT_ORIGIN.x + 5.5), "x={}", v.x);
         assert!(approx_eq(v.y, ROOT_ORIGIN.y + 10.0), "y={}", v.y);
-        assert!(approx_eq(v.z, -12.5), "z={}", v.z);
+        assert!(approx_eq(v.z, ROOT_ORIGIN.z), "z={}", v.z);
     }
 
     #[test]
@@ -372,7 +370,7 @@ mod tests {
             Vec3::new(0.0, 0.0, 0.0),
             Vec3::new(0.1, -0.2, 0.3),
             Vec3::new(-5.0, -10.5, -11.25),
-            Vec3::new(12.499, -0.001, 12.499),
+            Vec3::new(11.999, -0.001, 11.999),
             Vec3::new(0.0, 20.0, 0.0),
             Vec3::new(-7.5, -100.0, 4.25),
         ];
@@ -441,8 +439,11 @@ mod tests {
             &world,
             IVec3::new(0, ROOT_ORIGIN.y as i32 - 5, 0)
         ));
-        // Left of ROOT_ORIGIN.x = -12.5.
-        assert!(!solid_at_integer(&world, IVec3::new(-20, -1, 0)));
+        // Left of ROOT_ORIGIN.x.
+        assert!(!solid_at_integer(
+            &world,
+            IVec3::new(ROOT_ORIGIN.x as i32 - 5, -1, 0)
+        ));
     }
 
     #[test]

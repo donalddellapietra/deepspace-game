@@ -46,7 +46,7 @@ fn spawn_hotbar(mut commands: Commands) {
                     }
                 });
             p.spawn((
-                Text::new("E: inventory | F: zoom in | Q: zoom out | 1-0: hotbar"),
+                Text::new("E: inventory | F: reset | LClick: break | RClick: place | 1-0: hotbar"),
                 TextFont { font_size: 12.0, ..default() },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.5)),
             ));

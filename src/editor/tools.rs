@@ -1,40 +1,37 @@
-//! Editor input handlers: zoom, hotbar cycling, and place/remove
-//! block hooks driven by the raycast in `crate::interaction`.
+//! Editor input handlers: player reset, hotbar cycling, and
+//! place/remove block hooks driven by the raycast in
+//! `crate::interaction`.
 
 use bevy::prelude::*;
 
 use crate::camera::CursorLocked;
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
+use crate::player::{Player, Velocity};
 use crate::world::collision::position_from_bevy;
 use crate::world::edit::edit_leaf;
 use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
-use crate::world::{CameraZoom, WorldState};
+use crate::world::WorldState;
 
-pub fn zoom_in(
+/// Teleport the player back to the spawn point and zero their
+/// velocity. Handy when you fall into the void off the edge of the
+/// ground layer, or to reset after a physics glitch.
+pub fn reset_player(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
-    mut zoom: ResMut<CameraZoom>,
+    mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
 ) {
     if inv.open {
         return;
     }
-    if keyboard.just_pressed(KeyCode::KeyF) {
-        zoom.zoom_in();
-    }
-}
-
-pub fn zoom_out(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    inv: Res<InventoryState>,
-    mut zoom: ResMut<CameraZoom>,
-) {
-    if inv.open {
+    if !keyboard.just_pressed(KeyCode::KeyF) {
         return;
     }
-    if keyboard.just_pressed(KeyCode::KeyQ) {
-        zoom.zoom_out();
-    }
+    let Ok((mut tf, mut vel)) = player_q.single_mut() else {
+        return;
+    };
+    tf.translation = Vec3::new(0.0, 5.0, 0.0);
+    vel.0 = Vec3::ZERO;
 }
 
 pub fn cycle_hotbar_slot(

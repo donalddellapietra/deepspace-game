@@ -173,7 +173,7 @@ fn spawn_panel(commands: &mut Commands) -> Entity {
 
             // Hints
             panel.spawn((
-                Text::new("E: close | F: zoom in | Q: zoom out"),
+                Text::new("E: close | F: reset player"),
                 TextFont { font_size: 12.0, ..default() },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.4)),
             ));
