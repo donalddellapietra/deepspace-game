@@ -8,7 +8,7 @@ use bevy::{
 
 use crate::inventory::InventoryState;
 use crate::player::{Player, PLAYER_HEIGHT};
-use crate::world::render::cell_size_at_layer;
+use crate::world::view::cell_size_at_layer;
 use crate::world::CameraZoom;
 
 const SENSITIVITY: f32 = 0.003;

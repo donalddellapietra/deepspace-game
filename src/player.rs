@@ -6,10 +6,10 @@ use bevy::prelude::*;
 
 use crate::camera::FpsCam;
 use crate::inventory::InventoryState;
-use crate::world::collision::{self, bevy_from_position, PLAYER_H};
+use crate::world::collision::{self, PLAYER_H};
 use crate::world::position::{Position, NODE_PATH_LEN};
-use crate::world::render::cell_size_at_layer;
 use crate::world::tree::{slot_index, BRANCH_FACTOR, NODE_VOXELS_PER_AXIS};
+use crate::world::view::{bevy_from_position, cell_size_at_layer};
 use crate::world::{CameraZoom, WorldState};
 
 pub const PLAYER_HEIGHT: f32 = PLAYER_H;

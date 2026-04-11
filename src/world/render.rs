@@ -31,6 +31,10 @@ use super::tree::{
     block_from_voxel, slot_coords, voxel_idx, NodeId, CHILDREN_PER_NODE,
     EMPTY_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
 };
+use super::view::{
+    cell_size_at_layer, extent_for_layer, scale_for_layer, target_layer_for,
+    ROOT_ORIGIN,
+};
 
 // --------------------------------------------------------------- camera zoom
 
@@ -72,31 +76,6 @@ impl CameraZoom {
 }
 
 // ---------------------------------------------------------------- constants
-
-/// Origin of the root node in Bevy space.
-///
-/// `y` is chosen so that the top face of the `GROUND_Y_VOXELS`-deep
-/// grass surface lines up with Bevy `y = 0`. The root-local y range
-/// `(0, GROUND_Y_VOXELS)` maps to Bevy `(-GROUND_Y_VOXELS, 0)`, and
-/// the all-zero-path leaf sits at the very bottom of the grass
-/// region.
-///
-/// `x` and `z` are **integer offsets**. It is important that they
-/// are integer: the raycast in `src/interaction/mod.rs` steps through
-/// Bevy integer cells `[c, c+1]`, and the highlight gizmo centres a
-/// unit cube at `c + 0.5`. If `ROOT_ORIGIN.{x,z}` had a fractional
-/// part, voxels would sit on a non-integer lattice and the outline
-/// would drift half a voxel away from the block it names.
-///
-/// `-13` puts the all-zero-path leaf at Bevy `(-13..12)` on each of
-/// x and z, so Bevy `(0, ·, 0)` is near the leaf's centre (voxel 13
-/// out of 25). The player spawns at `(0, 2, 0)`, a couple of voxels
-/// above the grass surface, and falls onto it.
-pub const ROOT_ORIGIN: Vec3 = Vec3::new(
-    -13.0,
-    -(super::state::GROUND_Y_VOXELS as f32),
-    -13.0,
-);
 
 /// How far a rendered node's centre may be from the camera, measured
 /// in **cells at the current view layer**. Used as the v1 replacement
@@ -156,58 +135,6 @@ impl SmallPath {
         out.depth += 1;
         out
     }
-}
-
-// ------------------------------------------------------------- math helpers
-
-/// Scale multiplier for a node at `layer`. A layer-`MAX_LAYER` (leaf)
-/// node has scale `1.0`; a layer-`MAX_LAYER - 1` node has scale `5.0`;
-/// the root (layer 0) has scale `5^MAX_LAYER`. Values get huge at the
-/// root but stay finite in f32 — only ~`6e8` at layer 0.
-#[inline]
-fn scale_for_layer(layer: u8) -> f32 {
-    let up = (MAX_LAYER - layer) as i32;
-    // 5^up. Up to 5^12 ≈ 2.4e8, well within f32.
-    let mut acc: f32 = 1.0;
-    for _ in 0..up {
-        acc *= 5.0;
-    }
-    acc
-}
-
-/// Bevy-space extent (per axis) of a node at `layer`.
-#[inline]
-fn extent_for_layer(layer: u8) -> f32 {
-    scale_for_layer(layer) * (NODE_VOXELS_PER_AXIS as f32)
-}
-
-/// Bevy-space edge length of ONE cell inside a layer-`layer` node's
-/// `25³` grid. At the leaf layer this is `1.0` (a leaf cell is a
-/// unit cube in Bevy space); at `layer = MAX_LAYER - 1` it's `5.0`;
-/// at the root it's `5^MAX_LAYER`.
-///
-/// The editor and the highlight gizmo use this to size the
-/// per-view-layer outline cube.
-#[inline]
-pub fn cell_size_at_layer(layer: u8) -> f32 {
-    scale_for_layer(layer)
-}
-
-/// The layer the renderer emits entities at for a given view layer,
-/// and the layer collision samples blocks at. Ported from the 2D
-/// prototype's `subtexture_25` rule: at view layer `L`, one visible
-/// cell corresponds to one layer-`(L + 2)` node, so each emitted
-/// entity's mesh shows the fine `(L + 2)` voxel grid instead of the
-/// single layer-`L` voxel. Clamped to [`MAX_LAYER`] because you can't
-/// descend past the leaves.
-///
-/// **Every consumer that needs this rule calls this function.** Do
-/// not hardcode `(view + 2).min(MAX_LAYER)` at call sites — past
-/// bugs came from having the rule in two places and only updating
-/// one.
-#[inline]
-pub fn target_layer_for(view_layer: u8) -> u8 {
-    view_layer.saturating_add(2).min(MAX_LAYER)
 }
 
 // ----------------------------------------------------------- mesh caching
@@ -466,21 +393,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scale_at_leaf_is_one() {
-        assert_eq!(scale_for_layer(MAX_LAYER), 1.0);
-    }
-
-    #[test]
-    fn scale_at_layer_above_leaf_is_five() {
-        assert_eq!(scale_for_layer(MAX_LAYER - 1), 5.0);
-    }
-
-    #[test]
-    fn extent_at_leaf_is_node_voxels() {
-        assert_eq!(extent_for_layer(MAX_LAYER), NODE_VOXELS_PER_AXIS as f32);
-    }
-
-    #[test]
     fn small_path_push() {
         let p = SmallPath::empty().push(7).push(12);
         assert_eq!(p.depth, 2);
@@ -536,7 +448,7 @@ mod tests {
         let world = WorldState::new_grassland();
         let mut counts = Vec::new();
         for view_layer in (MIN_ZOOM..=MAX_ZOOM).rev() {
-            let target = view_layer.saturating_add(2).min(MAX_LAYER);
+            let target = target_layer_for(view_layer);
             let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
             let mut visits = Vec::new();
             walk(&world, target, Vec3::ZERO, radius, &mut visits);

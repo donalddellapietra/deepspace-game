@@ -8,12 +8,9 @@ use crate::camera::CursorLocked;
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
 use crate::player::{Player, Velocity};
-use crate::world::collision::{
-    bevy_center_of_layer_pos, layer_pos_from_bevy,
-};
 use crate::world::edit::edit_at_layer_pos;
-use crate::world::render::cell_size_at_layer;
 use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
+use crate::world::view::{bevy_center_of_layer_pos, cell_size_at_layer, layer_pos_from_bevy};
 use crate::world::{CameraZoom, WorldState};
 
 /// F → zoom in (show finer detail). Increments `CameraZoom.layer`

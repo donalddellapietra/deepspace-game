@@ -7,7 +7,7 @@
 //!
 //! The v1 world is an infinite grassland with a solid ground layer
 //! that is [`GROUND_Y_VOXELS`] leaf voxels deep and air above it.
-//! [`ROOT_ORIGIN`](super::render::ROOT_ORIGIN) is set so the top face
+//! [`ROOT_ORIGIN`](super::view::ROOT_ORIGIN) is set so the top face
 //! of the grass lines up with Bevy `y = 0`.
 
 use bevy::prelude::*;

@@ -18,11 +18,11 @@
 use bevy::prelude::*;
 
 use crate::camera::FpsCam;
-use crate::world::collision::{
-    bevy_origin_of_layer_pos, is_layer_pos_solid, layer_pos_from_bevy,
-};
 use crate::world::position::LayerPos;
-use crate::world::render::{cell_size_at_layer, ROOT_ORIGIN};
+use crate::world::view::{
+    bevy_origin_of_layer_pos, cell_size_at_layer, is_layer_pos_solid,
+    layer_pos_from_bevy, ROOT_ORIGIN,
+};
 use crate::world::{CameraZoom, WorldState};
 
 /// Maximum reach in cells at the current view layer. The cell DDA
