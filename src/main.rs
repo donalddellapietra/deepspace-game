@@ -6,12 +6,12 @@ mod import;
 mod interaction;
 mod inventory;
 mod model;
+mod overlay;
 mod player;
 mod ui;
 mod world;
 
 use bevy::prelude::*;
-use bevy_egui::EguiPlugin;
 
 fn main() {
     let mut app = App::new();
@@ -25,7 +25,6 @@ fn main() {
             ..default()
         }))
         .insert_resource(ClearColor(Color::srgb(0.5, 0.7, 0.9)))
-        .add_plugins(EguiPlugin { ..default() })
         .add_plugins((
             block::BlockPlugin,
             world::WorldPlugin,
@@ -35,6 +34,7 @@ fn main() {
             player::PlayerPlugin,
             camera::CameraPlugin,
             ui::UiPlugin,
+            overlay::OverlayPlugin,
             diagnostics::DiagnosticsPlugin,
         ))
         .add_systems(Startup, setup_environment);

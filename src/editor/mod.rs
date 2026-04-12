@@ -44,7 +44,6 @@ impl Plugin for EditorPlugin {
                     save_mode::update_save_tint
                         .after(crate::interaction::update_target)
                         .after(crate::world::render::render_world),
-                    toast::tick_toasts,
                 ),
             );
     }

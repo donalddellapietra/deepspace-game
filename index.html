@@ -21,8 +21,18 @@
             height: 100%;
         }
     </style>
+    <!-- React UI overlay assets (copied to dist/) -->
+    <link data-trunk rel="copy-file" href="ui/dist/ui.css" />
+    <link data-trunk rel="copy-file" href="ui/dist/ui.js" />
+    <link rel="stylesheet" href="ui.css" />
 </head>
 <body>
+    <!-- Bevy WASM game -->
     <link data-trunk rel="rust" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int" />
+
+    <!-- React UI mounts here, on top of the canvas -->
+    <div id="root"></div>
+
+    <script type="module" src="ui.js"></script>
 </body>
 </html>
