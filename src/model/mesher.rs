@@ -352,6 +352,51 @@ where
         .collect()
 }
 
+/// Check whether a uniform child at `slot` can be skipped entirely
+/// (all 6 neighbors are the same uniform value).
+///
+/// `neighbor_same` indicates whether the neighboring emit-layer
+/// parent in each direction (-x, +x, -y, +y, -z, +z) has the same
+/// NodeId as the current parent. If true, boundary children in that
+/// direction are treated as having the same content (instead of
+/// assuming empty). This lets underground chunks skip all boundary
+/// children when surrounded by identical neighbors.
+pub fn uniform_child_skippable(
+    slot: usize,
+    v: u8,
+    child_class: &[ChildClass],
+    branch_factor: usize,
+    empty_voxel: u8,
+    neighbor_same: [bool; 6],
+) -> bool {
+    let sx = slot % branch_factor;
+    let sy = (slot / branch_factor) % branch_factor;
+    let sz = slot / (branch_factor * branch_factor);
+    // (delta, direction_index) for each of 6 neighbors.
+    // Direction indices: 0=-x, 1=+x, 2=-y, 3=+y, 4=-z, 5=+z.
+    let neighbors = [
+        (sx.wrapping_sub(1), sy, sz, 0usize), // -x
+        (sx + 1, sy, sz, 1),                  // +x
+        (sx, sy.wrapping_sub(1), sz, 2),       // -y
+        (sx, sy + 1, sz, 3),                   // +y
+        (sx, sy, sz.wrapping_sub(1), 4),       // -z
+        (sx, sy, sz + 1, 5),                   // +z
+    ];
+    neighbors.iter().all(|&(nx, ny, nz, dir)| {
+        if nx >= branch_factor || ny >= branch_factor || nz >= branch_factor {
+            // Outside the parent. If the neighbor parent has the same
+            // NodeId, its content is identical → treat as same type.
+            if neighbor_same[dir] {
+                return true;
+            }
+            // Otherwise conservatively assume empty.
+            return v == empty_voxel;
+        }
+        let nslot = nz * branch_factor * branch_factor + ny * branch_factor + nx;
+        child_class[nslot] == ChildClass::Uniform(v)
+    })
+}
+
 /// Flatten children's voxel grids into a contiguous `size³` array,
 /// using child classification to skip empty children and memset
 /// uniform ones.
