@@ -90,7 +90,7 @@ const SHADER_ASSET_PATH: &str = "shaders/instanced_block.wgsl";
 
 // -------------------------------------------------- instance data
 
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct InstanceData {
     pub position: Vec3,
@@ -455,6 +455,12 @@ pub struct RenderTimings {
 /// Entity entry for one `(NodeId, voxel)` group.
 struct GroupEntry {
     entity: Entity,
+    /// Cached instance data from last frame. Compared against the new
+    /// data to avoid re-inserting `InstanceMaterialData` when nothing
+    /// changed — re-insertion triggers Bevy's `SyncComponent` cleanup
+    /// which destroys the render-world `InstanceBuffer`, forcing a
+    /// GPU buffer reallocation every frame.
+    last_instances: Vec<InstanceData>,
 }
 
 /// Render state: caches baked meshes and maps live instanced entities.
@@ -832,12 +838,26 @@ pub fn render_world(
             .collect();
 
         match render_state.entities.remove(&(node_id, voxel)) {
-            Some(entry) => {
-                // Update instance data on existing entity.
-                if let Ok(mut ec) = commands.get_entity(entry.entity) {
-                    ec.insert(InstanceMaterialData(instance_data));
-                    alive.insert((node_id, voxel), entry);
+            Some(mut entry) => {
+                // Only re-insert InstanceMaterialData when the data
+                // actually changed. Re-inserting every frame triggers
+                // SyncComponent cleanup which destroys the render-world
+                // InstanceBuffer, forcing a GPU buffer reallocation.
+                let changed = entry.last_instances.len() != instance_data.len()
+                    || entry.last_instances.iter().zip(instance_data.iter()).any(
+                        |(a, b)| {
+                            a.position != b.position
+                                || a.scale != b.scale
+                                || a.color != b.color
+                        },
+                    );
+                if changed {
+                    if let Ok(mut ec) = commands.get_entity(entry.entity) {
+                        ec.insert(InstanceMaterialData(instance_data.clone()));
+                    }
+                    entry.last_instances = instance_data;
                 }
+                alive.insert((node_id, voxel), entry);
             }
             None => {
                 // Look up the baked mesh handle.
@@ -855,7 +875,7 @@ pub fn render_world(
                 let entity = commands
                     .spawn((
                         Mesh3d(mesh_handle),
-                        InstanceMaterialData(instance_data),
+                        InstanceMaterialData(instance_data.clone()),
                         WorldRenderedNode(node_id),
                         SubMeshBlock(voxel),
                         NoFrustumCulling,
@@ -865,7 +885,7 @@ pub fn render_world(
                     .id();
                 alive.insert(
                     (node_id, voxel),
-                    GroupEntry { entity },
+                    GroupEntry { entity, last_instances: instance_data },
                 );
             }
         }

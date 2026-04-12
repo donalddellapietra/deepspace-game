@@ -64,24 +64,43 @@ window.__onGameState = (data) => {
 };
 
 // Mouse passthrough: track whether cursor is over an interactive element.
-document.addEventListener('mousemove', (e) => {
-    const el = document.elementFromPoint(e.clientX, e.clientY);
-    let interactive = false;
-    if (el) {
-        let node = el;
-        while (node && node !== document.documentElement) {
-            const pe = getComputedStyle(node).pointerEvents;
-            if (pe === 'auto') { interactive = true; break; }
-            if (pe === 'none') { break; }
-            node = node.parentElement;
-        }
-    }
-    window.ipc.postMessage(JSON.stringify({ __passthrough: !interactive }));
-}, { passive: true });
+// Throttled to avoid flooding IPC with messages on every mouse move.
+(function() {
+    let lastPassthrough = true;
+    let scheduled = false;
 
-document.addEventListener('mouseleave', () => {
-    window.ipc.postMessage(JSON.stringify({ __passthrough: true }));
-}, { passive: true });
+    function checkPassthrough(e) {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(() => {
+            scheduled = false;
+            const el = document.elementFromPoint(e.clientX, e.clientY);
+            let interactive = false;
+            if (el) {
+                let node = el;
+                while (node && node !== document.documentElement) {
+                    const pe = getComputedStyle(node).pointerEvents;
+                    if (pe === 'auto') { interactive = true; break; }
+                    if (pe === 'none') { break; }
+                    node = node.parentElement;
+                }
+            }
+            const passthrough = !interactive;
+            if (passthrough !== lastPassthrough) {
+                lastPassthrough = passthrough;
+                window.ipc.postMessage(JSON.stringify({ __passthrough: passthrough }));
+            }
+        });
+    }
+
+    document.addEventListener('mousemove', checkPassthrough, { passive: true });
+    document.addEventListener('mouseleave', () => {
+        if (!lastPassthrough) {
+            lastPassthrough = true;
+            window.ipc.postMessage(JSON.stringify({ __passthrough: true }));
+        }
+    }, { passive: true });
+})();
 "#;
 
 // ── hitTest: swizzle ──────────────────────────────────────────────
