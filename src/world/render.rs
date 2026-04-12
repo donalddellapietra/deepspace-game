@@ -1,23 +1,26 @@
-//! Uniform-layer tree-walk renderer (Phase 5 v1).
+//! Uniform-layer tree-walk renderer.
 //!
 //! Every frame, walk the content-addressed tree from the root down to
-//! `CameraZoom.layer` and emit one Bevy entity per surviving node at
-//! that layer. Entities are reused across frames via `RenderState`,
-//! and meshes are baked lazily into a `NodeId`-keyed cache. See
-//! `docs/architecture/rendering.md` for the full design.
+//! `CameraZoom.layer + 2` (the target layer — see
+//! `view::target_layer_for`) and emit one Bevy entity per surviving
+//! node at that layer. Entities are reused across frames via
+//! `RenderState`, and meshes are baked lazily into a `NodeId`-keyed
+//! cache. See `docs/architecture/rendering.md` for the full design.
 //!
-//! Key decisions for v1:
+//! Key invariants:
 //!
-//! * One Bevy unit equals one leaf voxel. A leaf entity has scale
-//!   `1.0` and its baked mesh is `bake_volume(NODE_VOXELS_PER_AXIS)`.
-//!   A layer-K node has scale `5 ^ (MAX_LAYER - K)`.
-//! * The tree is rooted in Bevy space at `ROOT_ORIGIN`, chosen so the
-//!   leaf at the all-zero path sits centred directly below the world
-//!   origin with its top face at `y = 0`. The camera spawns at
-//!   `y ≈ 3`, so it always starts above the grass.
-//! * v1 skips frustum culling. Instead it emits every node whose
-//!   centre is within `RADIUS_LEAF_UNITS` of the camera. Proper
-//!   frustum culling is deferred to Phase 5.1.
+//! * One Bevy unit equals one leaf voxel *in the current
+//!   [`WorldAnchor`] frame*. A leaf entity has scale `1.0` and its
+//!   baked mesh is `bake_volume(NODE_VOXELS_PER_AXIS)`. A layer-K
+//!   node has scale `5 ^ (MAX_LAYER - K)`.
+//! * Node origins are computed as `leaf-coord - anchor.leaf_coord`,
+//!   so rendered entities live in a small Bevy coordinate range
+//!   around the player regardless of absolute world position. This
+//!   is the "no big numbers in Bevy space" guarantee from
+//!   `docs/architecture/coordinates.md`.
+//! * The renderer skips frustum culling. It emits every node whose
+//!   AABB intersects a sphere of `RADIUS_VIEW_CELLS` view-cells
+//!   around the camera.
 
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::platform::collections::HashMap;
@@ -33,7 +36,7 @@ use super::tree::{
 };
 use super::view::{
     cell_size_at_layer, extent_for_layer, scale_for_layer, target_layer_for,
-    ROOT_ORIGIN,
+    WorldAnchor,
 };
 
 // --------------------------------------------------------------- camera zoom
@@ -181,32 +184,65 @@ fn get_or_bake_mesh<'a>(
 // ------------------------------------------------------------- tree walk
 
 /// One "visit" the tree walk wants the reconciler to spawn/update.
+/// `origin` is anchor-relative — already the final Bevy `Transform`
+/// translation the renderer will give the entity.
 struct Visit {
     path: SmallPath,
     node_id: NodeId,
     origin: Vec3,
 }
 
+/// Accumulate each node's absolute leaf-space origin as the walker
+/// descends, then convert to a Bevy `Vec3` relative to the camera
+/// anchor only when the node passes the cull / emit test. Tracking
+/// the origin in `i64` is what keeps `f32` precision small even
+/// when the player is billions of leaves deep inside the root — the
+/// subtraction `(node_coord - anchor_coord)` stays exact in integer
+/// space, and the cast to `f32` only ever happens on the small
+/// difference.
 fn walk(
     world: &WorldState,
     target_layer: u8,
     camera_pos: Vec3,
     radius_bevy: f32,
+    anchor: &WorldAnchor,
     out: &mut Vec<Visit>,
 ) {
     if world.root == EMPTY_NODE {
         return;
     }
-    let mut stack: Vec<(NodeId, SmallPath, Vec3, u8)> = Vec::with_capacity(256);
-    stack.push((world.root, SmallPath::empty(), ROOT_ORIGIN, 0));
+    // Precomputed child extents in leaves, indexed by the child's
+    // layer number (layer 1 = root's direct children, layer MAX = leaves).
+    // Root leaf-extent is `25 * 5^MAX_LAYER`; each descent divides by 5.
+    let mut child_extent_leaves: [i64; MAX_LAYER as usize + 1] =
+        [0; MAX_LAYER as usize + 1];
+    {
+        let mut ext: i64 = super::state::world_extent_voxels();
+        child_extent_leaves[0] = ext;
+        for layer in 1..=(MAX_LAYER as usize) {
+            ext /= 5;
+            child_extent_leaves[layer] = ext;
+        }
+    }
+
+    let mut stack: Vec<(NodeId, SmallPath, [i64; 3], u8)> =
+        Vec::with_capacity(256);
+    stack.push((world.root, SmallPath::empty(), [0; 3], 0));
 
     let radius_sq = radius_bevy * radius_bevy;
 
-    while let Some((node_id, path, origin, depth)) = stack.pop() {
-        // Compute this node's AABB in Bevy space.
+    while let Some((node_id, path, origin_leaves, depth)) = stack.pop() {
+        // Bevy-space origin of this node: delta from the anchor, in
+        // leaves, cast to `f32`. For nodes near the player the delta
+        // is small and `f32` is essentially exact.
+        let origin_bevy = Vec3::new(
+            (origin_leaves[0] - anchor.leaf_coord[0]) as f32,
+            (origin_leaves[1] - anchor.leaf_coord[1]) as f32,
+            (origin_leaves[2] - anchor.leaf_coord[2]) as f32,
+        );
         let extent = extent_for_layer(depth);
-        let aabb_min = origin;
-        let aabb_max = origin + Vec3::splat(extent);
+        let aabb_min = origin_bevy;
+        let aabb_max = origin_bevy + Vec3::splat(extent);
 
         // Per-axis "distance from camera to AABB": 0 if inside,
         // otherwise the gap to the nearest face. L2 norm of the three
@@ -232,7 +268,7 @@ fn walk(
             out.push(Visit {
                 path,
                 node_id,
-                origin,
+                origin: origin_bevy,
             });
             continue;
         }
@@ -246,26 +282,25 @@ fn walk(
             out.push(Visit {
                 path,
                 node_id,
-                origin,
+                origin: origin_bevy,
             });
             continue;
         };
 
-        let child_extent = extent_for_layer(depth + 1);
+        let child_extent_i64 = child_extent_leaves[(depth + 1) as usize];
         for slot in 0..CHILDREN_PER_NODE {
             let child_id = children[slot];
             if child_id == EMPTY_NODE {
                 continue;
             }
             let (sx, sy, sz) = slot_coords(slot);
-            let child_origin = origin
-                + Vec3::new(
-                    sx as f32 * child_extent,
-                    sy as f32 * child_extent,
-                    sz as f32 * child_extent,
-                );
+            let child_origin_leaves = [
+                origin_leaves[0] + (sx as i64) * child_extent_i64,
+                origin_leaves[1] + (sy as i64) * child_extent_i64,
+                origin_leaves[2] + (sz as i64) * child_extent_i64,
+            ];
             let child_path = path.push(slot as u8);
-            stack.push((child_id, child_path, child_origin, depth + 1));
+            stack.push((child_id, child_path, child_origin_leaves, depth + 1));
         }
     }
 }
@@ -277,6 +312,7 @@ pub fn render_world(
     mut commands: Commands,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     camera_q: Query<&Transform, With<Camera3d>>,
     materials: Option<Res<BlockMaterials>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -313,7 +349,14 @@ pub fn render_world(
 
     // Walk the tree → collect visible positions.
     let mut visits: Vec<Visit> = Vec::with_capacity(256);
-    walk(&world, target_layer, camera_pos, radius_bevy, &mut visits);
+    walk(
+        &world,
+        target_layer,
+        camera_pos,
+        radius_bevy,
+        &anchor,
+        &mut visits,
+    );
 
     let node_scale = scale_for_layer(target_layer);
 
@@ -400,6 +443,10 @@ mod tests {
         assert_eq!(p.slots[1], 12);
     }
 
+    fn anchor_origin() -> WorldAnchor {
+        WorldAnchor { leaf_coord: [0, 0, 0] }
+    }
+
     #[test]
     fn walk_grassland_at_leaves_emits_at_least_one_visit() {
         let world = WorldState::new_grassland();
@@ -411,6 +458,7 @@ mod tests {
             MAX_LAYER,
             Vec3::ZERO,
             RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
+            &anchor_origin(),
             &mut visits,
         );
         assert!(
@@ -428,6 +476,7 @@ mod tests {
             MAX_LAYER,
             Vec3::ZERO,
             RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
+            &anchor_origin(),
             &mut visits,
         );
         // Bounded number of target-layer nodes — guard rail against
@@ -446,12 +495,13 @@ mod tests {
         // because the radius is "N cells at view layer" and one
         // target-layer node = one view cell.
         let world = WorldState::new_grassland();
+        let anchor = anchor_origin();
         let mut counts = Vec::new();
         for view_layer in (MIN_ZOOM..=MAX_ZOOM).rev() {
             let target = target_layer_for(view_layer);
             let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
             let mut visits = Vec::new();
-            walk(&world, target, Vec3::ZERO, radius, &mut visits);
+            walk(&world, target, Vec3::ZERO, radius, &anchor, &mut visits);
             counts.push((view_layer, visits.len()));
         }
         // No view layer should be empty (the bug this test guards

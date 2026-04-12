@@ -9,23 +9,39 @@
 //! collision algorithms; `interaction/`, `editor/`, `player.rs`,
 //! and `camera.rs` all route layer-space math through this module.
 //!
-//! ## Why this module exists
+//! ## Floating anchor (a.k.a. "no absolute Bevy coords")
 //!
-//! These helpers used to live in two places: `render.rs` owned
-//! [`ROOT_ORIGIN`], [`cell_size_at_layer`], and [`target_layer_for`];
-//! `collision.rs` owned [`position_from_bevy`],
-//! [`layer_pos_from_bevy`], and [`is_layer_pos_solid`]. Every other
-//! module imported from both. Two classes of bug came out of that:
+//! The design doc ([`docs/architecture/coordinates.md`]) is explicit:
 //!
-//! 1. **The `+2` rule drifted.** Collision and render both computed
-//!    `(view_layer + 2).min(MAX_LAYER)` inline; it was easy to update
-//!    one and forget the other. Centralising it in
-//!    [`target_layer_for`] makes that impossible.
-//! 2. **`is_layer_pos_solid` lived next to the collision algorithms**,
-//!    which made it look collision-specific — so the raycast in
-//!    `interaction/` happily re-implemented its own solidity notion
-//!    and diverged. Moving it here makes it obvious that it's the
-//!    *one* solidity query.
+//! > Nothing is ever a "big number." Every component is bounded.
+//!
+//! The authoritative representation of any location in the world is
+//! a [`Position`] — a path of 12 slot indices, a `25³` in-leaf voxel
+//! coord, and a `[0, 1)` sub-voxel offset. None of those components
+//! ever exceed 125. There is no big number anywhere in that
+//! representation, and it works equally well at the corner or the
+//! centre of the 6-billion-leaf root.
+//!
+//! The earlier code pinned the root's `(-x, -y, -z)` corner to a
+//! constant Bevy `Vec3` called `ROOT_ORIGIN`. Every `bevy_from_*`
+//! helper computed "origin + path-walk-offset-in-leaves", which is
+//! fine when the path-walk offset is small, but loses `f32`
+//! precision catastrophically for paths deep inside the root — at
+//! Bevy `x ≈ 3e9` the step size of `f32` is ~180 leaves, so leaf-
+//! granularity anything (collision, raycasting, picking) fails.
+//! That's why the old spawn was stuck at a corner of the root.
+//!
+//! Fix: the *anchor* between path-space and Bevy-space is now a
+//! [`WorldAnchor`] resource, not a constant, and it holds an
+//! **integer leaf coordinate**. Every `bevy_from_*` helper computes
+//! its output as `(target_leaf_coord - anchor.leaf_coord)`, an
+//! **`i64` subtraction** (exact), and only casts the small delta to
+//! `f32`. The anchor is updated each frame to track the player's
+//! current integer leaf coord, so the player's Bevy `Transform`
+//! always stays within `[-1, 1]`-ish regardless of where they are
+//! in the world. The player can spawn anywhere — including the
+//! exact centre of the root — with perfect `f32` precision at the
+//! leaf level.
 //!
 //! ## Contract with [`super::tree::downsample`]
 //!
@@ -42,6 +58,8 @@ use bevy::prelude::*;
 
 use super::position::{LayerPos, Position, NODE_PATH_LEN};
 use super::state::{world_extent_voxels, WorldState};
+#[cfg(test)]
+use super::state::GROUND_Y_VOXELS;
 use super::tree::{
     slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
     NODE_VOXELS_PER_AXIS,
@@ -49,30 +67,36 @@ use super::tree::{
 
 // ---------------------------------------------------------------- anchor
 
-/// Origin of the root node in Bevy space.
+/// The floating anchor between tree-space and Bevy-space.
 ///
-/// `y` is chosen so that the top face of the `GROUND_Y_VOXELS`-deep
-/// grass surface lines up with Bevy `y = 0`. The root-local y range
-/// `(0, GROUND_Y_VOXELS)` maps to Bevy `(-GROUND_Y_VOXELS, 0)`, and
-/// the all-zero-path leaf sits at the very bottom of the grass
-/// region.
+/// `leaf_coord` is the integer leaf-voxel coordinate in the root's
+/// frame that Bevy `(0, 0, 0)` currently represents. The player's
+/// Bevy `Transform.translation` is always small because the anchor
+/// is kept aligned with the player's integer leaf coord — the whole
+/// world shifts around the player rather than the player drifting
+/// across a fixed Bevy grid.
 ///
-/// `x` and `z` are **integer offsets**. It is important that they
-/// are integer: the raycast in `src/interaction/mod.rs` steps through
-/// Bevy integer cells `[c, c+1]`, and the highlight gizmo centres a
-/// unit cube at `c + 0.5`. If `ROOT_ORIGIN.{x,z}` had a fractional
-/// part, voxels would sit on a non-integer lattice and the outline
-/// would drift half a voxel away from the block it names.
-///
-/// `-13` puts the all-zero-path leaf at Bevy `(-13..12)` on each of
-/// x and z, so Bevy `(0, ·, 0)` is near the leaf's centre (voxel 13
-/// out of 25). The player spawns at `(0, 2, 0)`, a couple of voxels
-/// above the grass surface, and falls onto it.
-pub const ROOT_ORIGIN: Vec3 = Vec3::new(
-    -13.0,
-    -(super::state::GROUND_Y_VOXELS as f32),
-    -13.0,
-);
+/// Updating the anchor is a straight assignment; callers never need
+/// to compute deltas themselves. See `player::recenter_anchor` for
+/// the per-frame update loop.
+#[derive(Resource, Copy, Clone, Debug)]
+pub struct WorldAnchor {
+    pub leaf_coord: [i64; 3],
+}
+
+impl Default for WorldAnchor {
+    fn default() -> Self {
+        // The default anchor places Bevy `(0, 0, 0)` at leaf
+        // `(0, 0, 0)` of the root — the `-x, -y, -z` corner. The
+        // player plugin overrides this in its startup system to
+        // match the spawn position, so this default mainly exists
+        // so the resource can be inserted before the player exists
+        // (e.g. in tests and in `WorldPlugin::build`).
+        Self {
+            leaf_coord: [0, 0, 0],
+        }
+    }
+}
 
 // ----------------------------------------------------- per-layer sizes
 
@@ -127,50 +151,51 @@ pub fn target_layer_for(view_layer: u8) -> u8 {
     view_layer.saturating_add(2).min(MAX_LAYER)
 }
 
-// ------------------------------------------------------ conversions
+// ------------------------------------------------------ leaf coord math
 
-/// Convert a Bevy `Vec3` into a tree `Position`. Returns `None` when
-/// the point is outside the world.
+/// Integer leaf coordinate of a [`Position`] in the root's frame.
 ///
-/// The all-zero `Position` has its min corner at [`ROOT_ORIGIN`], so
-/// `local = pos - ROOT_ORIGIN` is a point inside the world in
-/// leaf-voxel units (1 Bevy unit = 1 leaf voxel).
+/// Walks the path top-down, accumulating each slot's contribution
+/// in `i64` leaf units, then adds the in-leaf voxel. The offset is
+/// ignored — this is the integer part. Total output is in
+/// `0..world_extent_voxels()`.
 ///
-/// At descent step `K` (0-indexed), the current extent starts at
-/// `25 * 5^(MAX_LAYER - K)` leaf voxels (the axis size of the node
-/// we're inside). The child's extent is one fifth of that — we
-/// divide the running remainder by the child extent to find which
-/// of the 5 child slots on each axis we're in, then take the
-/// remainder for the next step. After `MAX_LAYER` steps the extent
-/// is exactly `25` and the remainder is the leaf-local voxel coord
-/// in `0..25`. The floored fractional part of `local` is the
-/// sub-voxel offset.
-pub fn position_from_bevy(pos: Vec3) -> Option<Position> {
-    let local = pos - ROOT_ORIGIN;
-    if !local.x.is_finite() || !local.y.is_finite() || !local.z.is_finite() {
-        return None;
-    }
-    if local.x < 0.0 || local.y < 0.0 || local.z < 0.0 {
-        return None;
-    }
-
-    let max = world_extent_voxels() as f32;
-    if local.x >= max || local.y >= max || local.z >= max {
-        return None;
-    }
-
-    let vx = local.x.floor() as i64;
-    let vy = local.y.floor() as i64;
-    let vz = local.z.floor() as i64;
-
-    let mut rem: [i64; 3] = [vx, vy, vz];
-    let mut path = [0u8; NODE_PATH_LEN];
-    // `extent` is the current node's axis size in leaf voxels.
-    // Starts at `25 * 5^MAX_LAYER` (root).
+/// Used as the common ground between Bevy space and path space:
+/// two positions in the world can be subtracted in this
+/// representation and the delta is exact, regardless of how far
+/// apart they are.
+pub fn position_to_leaf_coord(pos: &Position) -> [i64; 3] {
+    let mut coord: [i64; 3] = [0; 3];
     let mut extent: i64 = world_extent_voxels();
     for depth in 0..NODE_PATH_LEN {
         let child_extent = extent / 5;
-        // `rem` is `0 <= rem < extent`, so slot is `0..5`.
+        let (sx, sy, sz) = slot_coords(pos.path[depth] as usize);
+        coord[0] += (sx as i64) * child_extent;
+        coord[1] += (sy as i64) * child_extent;
+        coord[2] += (sz as i64) * child_extent;
+        extent = child_extent;
+    }
+    coord[0] += pos.voxel[0] as i64;
+    coord[1] += pos.voxel[1] as i64;
+    coord[2] += pos.voxel[2] as i64;
+    coord
+}
+
+/// Inverse of [`position_to_leaf_coord`]. Walks the tree from the
+/// root, picking slot indices from the magnitude of `coord` at each
+/// descent step. Returns `None` if `coord` is outside the world
+/// bounds. Offset is initialised to zero; callers holding a
+/// sub-leaf fractional part set it themselves.
+pub fn position_from_leaf_coord(coord: [i64; 3]) -> Option<Position> {
+    let world_max = world_extent_voxels();
+    if coord.iter().any(|&c| c < 0 || c >= world_max) {
+        return None;
+    }
+    let mut rem = coord;
+    let mut path = [0u8; NODE_PATH_LEN];
+    let mut extent: i64 = world_max;
+    for depth in 0..NODE_PATH_LEN {
+        let child_extent = extent / 5;
         let sx = (rem[0] / child_extent) as usize;
         let sy = (rem[1] / child_extent) as usize;
         let sz = (rem[2] / child_extent) as usize;
@@ -181,77 +206,123 @@ pub fn position_from_bevy(pos: Vec3) -> Option<Position> {
         rem[2] -= (sz as i64) * child_extent;
         extent = child_extent;
     }
-    // `extent == 25` now, and each `rem[i]` is `0..25`.
     debug_assert_eq!(extent, NODE_VOXELS_PER_AXIS as i64);
     let voxel = [rem[0] as u8, rem[1] as u8, rem[2] as u8];
-    let offset = [
-        local.x - local.x.floor(),
-        local.y - local.y.floor(),
-        local.z - local.z.floor(),
-    ];
-    Some(Position { path, voxel, offset })
+    Some(Position { path, voxel, offset: [0.0; 3] })
 }
 
-/// Inverse of [`position_from_bevy`]. Accumulates the origin as we
-/// descend, then adds the leaf voxel and sub-voxel offset at the end.
-pub fn bevy_from_position(pos: &Position) -> Vec3 {
-    let mut origin = ROOT_ORIGIN;
-    let mut extent: i64 = world_extent_voxels();
-    for depth in 0..NODE_PATH_LEN {
-        let child_extent = extent / 5;
-        let (sx, sy, sz) = slot_coords(pos.path[depth] as usize);
-        origin.x += (sx as i64 * child_extent) as f32;
-        origin.y += (sy as i64 * child_extent) as f32;
-        origin.z += (sz as i64 * child_extent) as f32;
-        extent = child_extent;
+/// `i64` leaf-coord delta, cast to `f32`. This is the one place
+/// we cross from the exact-integer world frame into the
+/// approximate-`f32` Bevy frame — everything else stays in `i64`
+/// for as long as possible. The cast is only inexact when the
+/// delta exceeds `2^24 ≈ 16M` leaves, which only happens for
+/// entities far outside the render radius at view layers where
+/// `f32` resolution per visual voxel is already thousands of
+/// leaves.
+#[inline]
+fn delta_as_vec3(target: [i64; 3], anchor: [i64; 3]) -> Vec3 {
+    Vec3::new(
+        (target[0] - anchor[0]) as f32,
+        (target[1] - anchor[1]) as f32,
+        (target[2] - anchor[2]) as f32,
+    )
+}
+
+// ------------------------------------------------------ conversions
+
+/// Convert a [`Position`] into its Bevy coordinate in the frame of
+/// `anchor`. `anchor.leaf_coord` is the integer leaf coord that the
+/// Bevy origin currently represents, so the output is
+/// `(pos - anchor)` in f32 leaves, plus the sub-voxel fractional
+/// offset from `pos.offset`.
+pub fn bevy_from_position(pos: &Position, anchor: &WorldAnchor) -> Vec3 {
+    let coord = position_to_leaf_coord(pos);
+    delta_as_vec3(coord, anchor.leaf_coord)
+        + Vec3::new(pos.offset[0], pos.offset[1], pos.offset[2])
+}
+
+/// Convert a Bevy `Vec3` in the `anchor` frame back to a
+/// [`Position`]. Returns `None` when the resulting leaf coord is
+/// outside the world.
+///
+/// Interprets `bevy` as `(pos.leaf - anchor.leaf_coord) + offset`,
+/// where `offset ∈ [0, 1)` is the sub-voxel fractional part. The
+/// integer leaf coord recovery is exact (`i64` addition); only the
+/// sub-voxel offset lives in `f32`.
+pub fn position_from_bevy(bevy: Vec3, anchor: &WorldAnchor) -> Option<Position> {
+    if !bevy.x.is_finite() || !bevy.y.is_finite() || !bevy.z.is_finite() {
+        return None;
     }
-    origin
-        + Vec3::new(
-            pos.voxel[0] as f32 + pos.offset[0],
-            pos.voxel[1] as f32 + pos.offset[1],
-            pos.voxel[2] as f32 + pos.offset[2],
-        )
+    // Split `bevy` into an integer leaf delta and a sub-voxel
+    // fractional part, then add the integer delta to the anchor's
+    // leaf coord in `i64` space.
+    let int_delta: [i64; 3] = [
+        bevy.x.floor() as i64,
+        bevy.y.floor() as i64,
+        bevy.z.floor() as i64,
+    ];
+    let coord: [i64; 3] = [
+        anchor.leaf_coord[0] + int_delta[0],
+        anchor.leaf_coord[1] + int_delta[1],
+        anchor.leaf_coord[2] + int_delta[2],
+    ];
+    let mut pos = position_from_leaf_coord(coord)?;
+    pos.offset = [
+        bevy.x - bevy.x.floor(),
+        bevy.y - bevy.y.floor(),
+        bevy.z - bevy.z.floor(),
+    ];
+    Some(pos)
 }
 
 /// Project a Bevy `Vec3` straight to a [`LayerPos`] at view layer
-/// `layer`. Equivalent to
-/// `LayerPos::from_leaf(&position_from_bevy(pos)?, layer)`.
-pub fn layer_pos_from_bevy(pos: Vec3, layer: u8) -> Option<LayerPos> {
-    let leaf = position_from_bevy(pos)?;
+/// `layer`, in the `anchor` frame. Equivalent to
+/// `LayerPos::from_leaf(&position_from_bevy(bevy, anchor)?, layer)`.
+pub fn layer_pos_from_bevy(
+    bevy: Vec3,
+    layer: u8,
+    anchor: &WorldAnchor,
+) -> Option<LayerPos> {
+    let leaf = position_from_bevy(bevy, anchor)?;
     Some(LayerPos::from_leaf(&leaf, layer))
 }
 
-/// Bevy-space min corner of the cell at `lp`. Walks `lp.path` once,
-/// accumulating slot offsets in `i64` leaf-voxel units (overflow-free
-/// for any `MAX_LAYER`), then adds the in-node `cell` scaled by the
-/// view layer's cell size.
-pub fn bevy_origin_of_layer_pos(lp: &LayerPos) -> Vec3 {
-    let mut origin = ROOT_ORIGIN;
+/// Integer leaf coord of the min corner of the cell at `lp` —
+/// i.e. the `(leaf x, leaf y, leaf z)` of the cell's `-x, -y, -z`
+/// face in the root's frame.
+pub fn layer_pos_min_leaf_coord(lp: &LayerPos) -> [i64; 3] {
+    let mut coord: [i64; 3] = [0; 3];
     let mut extent: i64 = world_extent_voxels();
     for depth in 0..lp.path.len() {
         let child_extent = extent / 5;
         let (sx, sy, sz) = slot_coords(lp.path[depth] as usize);
-        origin.x += (sx as i64 * child_extent) as f32;
-        origin.y += (sy as i64 * child_extent) as f32;
-        origin.z += (sz as i64 * child_extent) as f32;
+        coord[0] += (sx as i64) * child_extent;
+        coord[1] += (sy as i64) * child_extent;
+        coord[2] += (sz as i64) * child_extent;
         extent = child_extent;
     }
     // After descending `lp.layer` slots, `extent` is the layer-`L`
-    // node's axis size in leaf voxels. The node has 25 cells per
-    // axis, so one cell = `extent / 25` Bevy units.
-    let cell_size = (extent / 25) as f32;
-    origin
-        + Vec3::new(
-            lp.cell[0] as f32 * cell_size,
-            lp.cell[1] as f32 * cell_size,
-            lp.cell[2] as f32 * cell_size,
-        )
+    // node's axis size in leaf voxels. A cell is `extent / 25`
+    // leaves wide, and `lp.cell` picks one of the 25 cells on each
+    // axis inside that node.
+    let cell_size_leaves = extent / (NODE_VOXELS_PER_AXIS as i64);
+    coord[0] += (lp.cell[0] as i64) * cell_size_leaves;
+    coord[1] += (lp.cell[1] as i64) * cell_size_leaves;
+    coord[2] += (lp.cell[2] as i64) * cell_size_leaves;
+    coord
 }
 
-/// Center of the cell at `lp` in Bevy space.
-pub fn bevy_center_of_layer_pos(lp: &LayerPos) -> Vec3 {
+/// Bevy-space min corner of the cell at `lp`, in the `anchor`
+/// frame. Works at any view layer — `lp.layer = 0` returns the
+/// root's corner offset from the anchor.
+pub fn bevy_origin_of_layer_pos(lp: &LayerPos, anchor: &WorldAnchor) -> Vec3 {
+    delta_as_vec3(layer_pos_min_leaf_coord(lp), anchor.leaf_coord)
+}
+
+/// Bevy-space centre of the cell at `lp`, in the `anchor` frame.
+pub fn bevy_center_of_layer_pos(lp: &LayerPos, anchor: &WorldAnchor) -> Vec3 {
     let cell = cell_size_at_layer(lp.layer);
-    bevy_origin_of_layer_pos(lp) + Vec3::splat(cell * 0.5)
+    bevy_origin_of_layer_pos(lp, anchor) + Vec3::splat(cell * 0.5)
 }
 
 // -------------------------------------------------------- solidity
@@ -301,6 +372,13 @@ mod tests {
         (a - b).abs() < 1e-4
     }
 
+    fn anchor_origin() -> WorldAnchor {
+        // "Origin anchor" — Bevy (0, 0, 0) represents the root's
+        // all-zero leaf corner. Matches the historical constant
+        // `ROOT_ORIGIN + (13, 125, 13)` after the coordinate shift.
+        WorldAnchor { leaf_coord: [0, 0, 0] }
+    }
+
     #[test]
     fn scale_at_leaf_is_one() {
         assert_eq!(scale_for_layer(MAX_LAYER), 1.0);
@@ -326,70 +404,120 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_origin() {
+    fn leaf_coord_round_trip_origin() {
         let p = Position::origin();
-        let v = bevy_from_position(&p);
-        assert!(approx_eq(v.x, ROOT_ORIGIN.x));
-        assert!(approx_eq(v.y, ROOT_ORIGIN.y));
-        assert!(approx_eq(v.z, ROOT_ORIGIN.z));
-        let back = position_from_bevy(v).unwrap();
-        assert_eq!(back, p);
+        assert_eq!(position_to_leaf_coord(&p), [0, 0, 0]);
+        let back = position_from_leaf_coord([0, 0, 0]).unwrap();
+        assert_eq!(back.path, p.path);
+        assert_eq!(back.voxel, p.voxel);
     }
 
     #[test]
-    fn concrete_leaf_voxel_example() {
-        // Position in the all-zero-path leaf with voxel (5, 10, 0)
-        // and offset (0.5, 0, 0) should map to
-        //   ROOT_ORIGIN + (5.5, 10, 0).
+    fn leaf_coord_round_trip_arbitrary() {
+        // Pick a point well inside the world and round-trip via
+        // `position_to_leaf_coord` and `position_from_leaf_coord`.
+        // This proves the two inversions are consistent.
+        let mut p = Position::origin();
+        // Layer-11 slot (3, 2, 4), voxel (7, 12, 19).
+        p.path[NODE_PATH_LEN - 1] = slot_index(3, 2, 4) as u8;
+        p.voxel = [7, 12, 19];
+
+        let coord = position_to_leaf_coord(&p);
+        let back = position_from_leaf_coord(coord).unwrap();
+        assert_eq!(back.path, p.path);
+        assert_eq!(back.voxel, p.voxel);
+    }
+
+    #[test]
+    fn bevy_round_trip_at_origin_anchor() {
+        // At the origin anchor, positions round-trip through Bevy
+        // space for points whose leaf coords fit in `f32` without
+        // loss. We stay well below the `2^24`-leaf precision limit.
+        let anchor = anchor_origin();
         let mut p = Position::origin();
         p.voxel = [5, 10, 0];
         p.offset = [0.5, 0.0, 0.0];
-        let v = bevy_from_position(&p);
-        assert!(approx_eq(v.x, ROOT_ORIGIN.x + 5.5), "x={}", v.x);
-        assert!(approx_eq(v.y, ROOT_ORIGIN.y + 10.0), "y={}", v.y);
-        assert!(approx_eq(v.z, ROOT_ORIGIN.z), "z={}", v.z);
+        let v = bevy_from_position(&p, &anchor);
+        assert!(approx_eq(v.x, 5.5), "x={}", v.x);
+        assert!(approx_eq(v.y, 10.0), "y={}", v.y);
+        assert!(approx_eq(v.z, 0.0), "z={}", v.z);
+        let back = position_from_bevy(v, &anchor).unwrap();
+        assert_eq!(back.voxel, p.voxel);
+        assert!(approx_eq(back.offset[0], 0.5));
     }
 
     #[test]
-    fn round_trip_various_points() {
-        let points = [
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(0.1, -0.2, 0.3),
-            Vec3::new(-5.0, -10.5, -11.25),
-            Vec3::new(11.999, -0.001, 11.999),
-            Vec3::new(0.0, 20.0, 0.0),
-            Vec3::new(-7.5, -100.0, 4.25),
-        ];
-        for &pt in &points {
-            let p = position_from_bevy(pt).expect("in-range");
-            let back = bevy_from_position(&p);
-            assert!(approx_eq(back.x, pt.x), "x: {} vs {}", back.x, pt.x);
-            assert!(approx_eq(back.y, pt.y), "y: {} vs {}", back.y, pt.y);
-            assert!(approx_eq(back.z, pt.z), "z: {} vs {}", back.z, pt.z);
+    fn bevy_from_position_is_zero_when_anchor_is_player() {
+        // Crucial invariant for the floating-anchor scheme: if the
+        // anchor's leaf coord matches a position's leaf coord, the
+        // Bevy projection is `(0, 0, 0)` modulo sub-voxel offset.
+        // This is what keeps the player's `Transform.translation`
+        // tiny no matter where in the 6-billion-leaf world they
+        // are.
+        let mut p = Position::origin();
+        // Push the path deep into the +x, +y, +z quadrant of the
+        // root — the position whose absolute Bevy coord would be
+        // catastrophically imprecise under the old constant anchor.
+        for depth in 0..NODE_PATH_LEN {
+            p.path[depth] = slot_index(2, 2, 2) as u8;
         }
+        p.voxel = [12, 12, 12];
+        p.offset = [0.3, 0.7, 0.1];
+
+        let anchor = WorldAnchor {
+            leaf_coord: position_to_leaf_coord(&p),
+        };
+        let v = bevy_from_position(&p, &anchor);
+        // Integer delta is exactly zero; only the sub-voxel offset
+        // survives.
+        assert!(approx_eq(v.x, 0.3));
+        assert!(approx_eq(v.y, 0.7));
+        assert!(approx_eq(v.z, 0.1));
     }
 
     #[test]
-    fn position_from_bevy_rejects_below_root() {
-        // ROOT_ORIGIN.y = -GROUND_Y_VOXELS (= -125). Anything strictly
-        // below that is outside the world.
-        assert!(
-            position_from_bevy(Vec3::new(0.0, ROOT_ORIGIN.y - 0.5, 0.0)).is_none()
-        );
+    fn bevy_round_trip_from_root_centre() {
+        // The reason the refactor exists: a position at the
+        // arithmetic centre of the root must round-trip with
+        // perfect precision, provided the anchor tracks it. This is
+        // the spawn-at-centre case the old absolute-`ROOT_ORIGIN`
+        // scheme physically couldn't support.
+        let mut p = Position::origin();
+        for depth in 0..NODE_PATH_LEN {
+            p.path[depth] = slot_index(2, 2, 2) as u8;
+        }
+        p.voxel = [12, 12, 12];
+        let anchor = WorldAnchor {
+            leaf_coord: position_to_leaf_coord(&p),
+        };
+        let v = bevy_from_position(&p, &anchor);
+        let back = position_from_bevy(v, &anchor).unwrap();
+        assert_eq!(back.path, p.path);
+        assert_eq!(back.voxel, p.voxel);
     }
 
     #[test]
-    fn position_from_bevy_boundary_at_ground_surface() {
-        // Exactly at y = 0 (the top face of the grass surface):
-        // local.y = GROUND_Y_VOXELS, which is the boundary between
-        // the top grass leaf and the first air leaf above it. The
-        // converter should land in the air leaf with voxel.y = 0
-        // and offset.y = 0.
-        let p = position_from_bevy(Vec3::new(0.0, 0.0, 0.0)).unwrap();
-        assert_eq!(p.voxel[1], 0);
-        assert!(p.offset[1].abs() < 1e-6);
-        let v = bevy_from_position(&p);
-        assert!(approx_eq(v.y, 0.0));
+    fn position_from_bevy_rejects_outside_world() {
+        let anchor = anchor_origin();
+        // One leaf west of the root's `-x` edge.
+        assert!(position_from_bevy(Vec3::new(-0.5, 0.0, 0.0), &anchor).is_none());
+        // One leaf below the root's `-y` edge.
+        assert!(position_from_bevy(Vec3::new(0.0, -0.5, 0.0), &anchor).is_none());
+    }
+
+    #[test]
+    fn bevy_origin_of_layer_pos_matches_leaf_coord() {
+        let anchor = anchor_origin();
+        let lp = LayerPos {
+            path: vec![slot_index(0, 0, 0) as u8; (MAX_LAYER - 2) as usize],
+            cell: [3, 0, 3],
+            layer: MAX_LAYER - 2,
+        };
+        let bevy = bevy_origin_of_layer_pos(&lp, &anchor);
+        let leaf = layer_pos_min_leaf_coord(&lp);
+        assert!(approx_eq(bevy.x, leaf[0] as f32));
+        assert!(approx_eq(bevy.y, leaf[1] as f32));
+        assert!(approx_eq(bevy.z, leaf[2] as f32));
     }
 
     /// The grassland's ground surface must be reachable as a solid
@@ -402,14 +530,18 @@ mod tests {
     #[test]
     fn ground_is_solid_at_every_view_layer() {
         let world = WorldState::new_grassland();
-        // A point guaranteed to sit inside the grass region: one
-        // voxel below the surface at the world's all-zero-path.
-        let probe = Vec3::new(0.0, -1.0, 0.0);
+        let anchor = anchor_origin();
+        // A point guaranteed to sit inside the grass region: the
+        // first leaf below the surface at the world's all-zero path.
+        // In the origin-anchor frame, the grass top face is at
+        // Bevy y = `GROUND_Y_VOXELS`, so `y - 1` sits one leaf
+        // inside the grass.
+        let probe = Vec3::new(0.0, (GROUND_Y_VOXELS - 1) as f32, 0.0);
         for view_layer in 2..=MAX_LAYER {
             let target = target_layer_for(view_layer);
-            let lp_view = layer_pos_from_bevy(probe, view_layer)
+            let lp_view = layer_pos_from_bevy(probe, view_layer, &anchor)
                 .expect("probe inside world at view layer");
-            let lp_target = layer_pos_from_bevy(probe, target)
+            let lp_target = layer_pos_from_bevy(probe, target, &anchor)
                 .expect("probe inside world at target layer");
             assert!(
                 is_layer_pos_solid(&world, &lp_view),

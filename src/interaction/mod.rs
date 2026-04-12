@@ -21,7 +21,7 @@ use crate::camera::FpsCam;
 use crate::world::position::LayerPos;
 use crate::world::view::{
     bevy_origin_of_layer_pos, cell_size_at_layer, is_layer_pos_solid,
-    layer_pos_from_bevy, ROOT_ORIGIN,
+    layer_pos_from_bevy, WorldAnchor,
 };
 use crate::world::{CameraZoom, WorldState};
 
@@ -65,6 +65,7 @@ fn update_target(
     cam_q: Query<&GlobalTransform, With<FpsCam>>,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut targeted: ResMut<TargetedBlock>,
 ) {
     targeted.clear();
@@ -75,7 +76,9 @@ fn update_target(
     let origin = cam.translation();
     let dir = cam.forward().as_vec3();
 
-    if let Some((hit, normal)) = dda_view_cells(&world, zoom.layer, origin, dir) {
+    if let Some((hit, normal)) =
+        dda_view_cells(&world, zoom.layer, origin, dir, &anchor)
+    {
         targeted.hit_layer_pos = Some(hit);
         targeted.normal = Some(normal);
     }
@@ -84,14 +87,25 @@ fn update_target(
 /// View-cell DDA. Walks one view cell per iteration, sampling
 /// solidity at the view layer. Returns the hit `LayerPos` at
 /// `view_layer` and the face normal in view-cell units.
+///
+/// The cell grid is anchored to the current [`WorldAnchor`]: block
+/// index 0 is the view cell that contains the anchor's leaf coord,
+/// and `cell_origin` is the small `(-cell_size, 0]` offset from the
+/// anchor to that cell's min corner.
 fn dda_view_cells(
     world: &WorldState,
     view_layer: u8,
     origin: Vec3,
     dir: Vec3,
+    anchor: &WorldAnchor,
 ) -> Option<(LayerPos, IVec3)> {
     let cell_size = cell_size_at_layer(view_layer);
-    let cell_origin = ROOT_ORIGIN;
+    let cell_size_i64 = cell_size as i64;
+    let cell_origin = Vec3::new(
+        -(anchor.leaf_coord[0].rem_euclid(cell_size_i64) as f32),
+        -(anchor.leaf_coord[1].rem_euclid(cell_size_i64) as f32),
+        -(anchor.leaf_coord[2].rem_euclid(cell_size_i64) as f32),
+    );
 
     let local = origin - cell_origin;
     let mut pos = IVec3::new(
@@ -143,7 +157,13 @@ fn dda_view_cells(
 
     for _ in 0..MAX_REACH_CELLS {
         if !first {
-            let lp = cell_index_to_layer_pos(pos, view_layer, cell_size, cell_origin)?;
+            let lp = cell_index_to_layer_pos(
+                pos,
+                view_layer,
+                cell_size,
+                cell_origin,
+                anchor,
+            )?;
             if is_layer_pos_solid(world, &lp) {
                 return Some((lp, normal));
             }
@@ -167,15 +187,16 @@ fn dda_view_cells(
     None
 }
 
-/// Convert a cell IVec3 (relative to `ROOT_ORIGIN`, in cell-size
-/// units) to a path-based [`LayerPos`] by routing through the
-/// existing `Vec3 → LayerPos` converter. The cell's centre is the
-/// canonical sample point.
+/// Convert an anchor-local cell `IVec3` (in `cell_size` strides from
+/// `cell_origin`) to a path-based [`LayerPos`] by going through
+/// [`layer_pos_from_bevy`], which handles the `i64` leaf-coord
+/// math against the anchor internally.
 fn cell_index_to_layer_pos(
     cell: IVec3,
     layer: u8,
     cell_size: f32,
     cell_origin: Vec3,
+    anchor: &WorldAnchor,
 ) -> Option<LayerPos> {
     let center = cell_origin
         + Vec3::new(
@@ -183,19 +204,20 @@ fn cell_index_to_layer_pos(
             (cell.y as f32 + 0.5) * cell_size,
             (cell.z as f32 + 0.5) * cell_size,
         );
-    layer_pos_from_bevy(center, layer)
+    layer_pos_from_bevy(center, layer, anchor)
 }
 
 fn draw_highlight(
     mut gizmos: Gizmos,
     targeted: Res<TargetedBlock>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
 ) {
     let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
     let cell_size = cell_size_at_layer(zoom.layer);
-    let cell_min = bevy_origin_of_layer_pos(lp);
+    let cell_min = bevy_origin_of_layer_pos(lp, &anchor);
     let center = cell_min + Vec3::splat(cell_size * 0.5);
     gizmos.cube(
         Transform::from_translation(center).with_scale(Vec3::splat(cell_size * 1.02)),

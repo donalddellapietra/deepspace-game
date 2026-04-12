@@ -11,7 +11,9 @@ use crate::player::{spawn_translation, Player, Velocity};
 use crate::world::collision;
 use crate::world::edit::edit_at_layer_pos;
 use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
-use crate::world::view::{bevy_center_of_layer_pos, cell_size_at_layer, layer_pos_from_bevy};
+use crate::world::view::{
+    bevy_center_of_layer_pos, cell_size_at_layer, layer_pos_from_bevy, WorldAnchor,
+};
 use crate::world::{CameraZoom, WorldState};
 
 /// F → zoom in (show finer detail). Increments `CameraZoom.layer`
@@ -29,6 +31,7 @@ pub fn zoom_in(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
     world: Res<WorldState>,
+    anchor: Res<WorldAnchor>,
     mut zoom: ResMut<CameraZoom>,
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
 ) {
@@ -37,7 +40,12 @@ pub fn zoom_in(
     }
     if keyboard.just_pressed(KeyCode::KeyF) && zoom.zoom_in() {
         if let Ok((mut tf, mut vel)) = player_q.single_mut() {
-            collision::snap_to_ground(&mut tf.translation, &world, zoom.layer);
+            collision::snap_to_ground(
+                &mut tf.translation,
+                &world,
+                zoom.layer,
+                &anchor,
+            );
             // Zero vertical velocity so the frame after the snap
             // doesn't inherit whatever fall/jump we were in the
             // middle of.
@@ -53,6 +61,7 @@ pub fn zoom_out(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
     world: Res<WorldState>,
+    anchor: Res<WorldAnchor>,
     mut zoom: ResMut<CameraZoom>,
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
 ) {
@@ -61,7 +70,12 @@ pub fn zoom_out(
     }
     if keyboard.just_pressed(KeyCode::KeyQ) && zoom.zoom_out() {
         if let Ok((mut tf, mut vel)) = player_q.single_mut() {
-            collision::snap_to_ground(&mut tf.translation, &world, zoom.layer);
+            collision::snap_to_ground(
+                &mut tf.translation,
+                &world,
+                zoom.layer,
+                &anchor,
+            );
             vel.0.y = 0.0;
         }
     }
@@ -79,6 +93,7 @@ pub fn reset_player(
     inv: Res<InventoryState>,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
 ) {
     if inv.open {
@@ -90,9 +105,9 @@ pub fn reset_player(
     let Ok((mut tf, mut vel)) = player_q.single_mut() else {
         return;
     };
-    tf.translation = spawn_translation();
+    tf.translation = spawn_translation(&anchor);
     vel.0 = Vec3::ZERO;
-    collision::snap_to_ground(&mut tf.translation, &world, zoom.layer);
+    collision::snap_to_ground(&mut tf.translation, &world, zoom.layer, &anchor);
 }
 
 pub fn cycle_hotbar_slot(
@@ -161,6 +176,7 @@ pub fn place_block(
     targeted: Res<TargetedBlock>,
     hotbar: Res<super::Hotbar>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut world: ResMut<WorldState>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() {
@@ -176,9 +192,10 @@ pub fn place_block(
     };
 
     let cell_size = cell_size_at_layer(zoom.layer);
-    let hit_center = bevy_center_of_layer_pos(hit);
+    let hit_center = bevy_center_of_layer_pos(hit, &anchor);
     let place_center = hit_center + normal.as_vec3() * cell_size;
-    let Some(place_lp) = layer_pos_from_bevy(place_center, zoom.layer) else {
+    let Some(place_lp) = layer_pos_from_bevy(place_center, zoom.layer, &anchor)
+    else {
         return;
     };
     let voxel = voxel_from_block(Some(hotbar.active_block()));

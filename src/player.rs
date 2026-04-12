@@ -1,6 +1,14 @@
 //! Player entity. Gravity + WASD + jump driven by
-//! [`crate::world::collision::move_and_collide`]. The player's
-//! `Transform` lives in Bevy leaf-voxel space (1 unit = 1 voxel).
+//! [`crate::world::collision::move_and_collide`].
+//!
+//! The player's `Transform.translation` is deliberately kept near
+//! Bevy `(0, 0, 0)` by the floating [`WorldAnchor`] — every frame,
+//! after physics, [`recenter_anchor`] moves the anchor's integer
+//! leaf coord to track the player's current leaf position and
+//! subtracts the integer part back out of the `Transform`. Only
+//! the sub-leaf fractional drift is left in the `Transform`, so the
+//! `f32` ever resolves a step size smaller than a leaf, no matter
+//! how deep the player wanders into the 6-billion-leaf root.
 
 use bevy::prelude::*;
 
@@ -9,7 +17,9 @@ use crate::inventory::InventoryState;
 use crate::world::collision::{self, PLAYER_H};
 use crate::world::position::{Position, NODE_PATH_LEN};
 use crate::world::tree::{slot_index, NODE_VOXELS_PER_AXIS};
-use crate::world::view::{bevy_from_position, cell_size_at_layer};
+use crate::world::view::{
+    bevy_from_position, cell_size_at_layer, position_to_leaf_coord, WorldAnchor,
+};
 use crate::world::{CameraZoom, WorldState};
 
 pub const PLAYER_HEIGHT: f32 = PLAYER_H;
@@ -30,7 +40,7 @@ pub struct PlayerPlugin;
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_player)
-            .add_systems(Update, move_player);
+            .add_systems(Update, (move_player, recenter_anchor).chain());
     }
 }
 
@@ -40,39 +50,36 @@ pub struct Player;
 #[derive(Component)]
 pub struct Velocity(pub Vec3);
 
-/// Path-based spawn position. Returns a `Position` that places the
-/// player at the all-zero-`xz` corner of the ground, two leaves
-/// above the grass surface. The resulting Bevy translation sits
-/// essentially at the origin — `(-0.5, 2, -0.5)` — which keeps
-/// floating-point precision at its best for leaf-level physics and
-/// lines up the camera's initial view with the centre of the
-/// readable area of the world.
+/// Path-based spawn position. Returns a [`Position`] pointing at the
+/// arithmetic centre of the `25³ × 5^MAX_LAYER`-leaf root node, one
+/// row above the grass surface. Every path slot is `(2, _, 2)` (the
+/// middle of the `5³` child array on `x`/`z`), and the in-leaf voxel
+/// is centred too — so the spawn is as close to the root's
+/// geometric centre as the tree structure permits.
 ///
-/// Why not the literal centre of the root node: at `MAX_LAYER = 12`
-/// the root is `25 * 5^12 ≈ 6.1e9` leaves wide, so a centred spawn
-/// would put the player at Bevy `x, z ≈ 3e9` where `f32` step size
-/// is hundreds of leaves — leaf-level collisions would stop working
-/// almost immediately. A floating-origin system (shift ROOT_ORIGIN
-/// when the player moves) is the proper fix for that and is out of
-/// scope here.
+/// Why this is only possible with the floating anchor: under the
+/// old constant `ROOT_ORIGIN` the centre of the root was at Bevy
+/// `x ≈ 3e9` where `f32` step size is hundreds of leaves — leaf-
+/// level collision and picking would silently collapse. With
+/// `WorldAnchor` tracking the player's integer leaf coord, the
+/// player's `Transform` is tiny regardless of where they are, so
+/// leaf precision is preserved all the way to the centre.
 ///
-/// Concretely:
-///
-/// - depth `MAX_LAYER - 2`: slot `(0, 1, 0)` — the `sy = 1` child
-///   of the all-zero layer-`(MAX_LAYER - 2)` grandparent, so the
-///   layer-`(MAX_LAYER - 1)` node we land in sits one step above
-///   the world floor (= the ground row ends directly below it).
-/// - depth `MAX_LAYER - 1`: slot `(0, 0, 0)` — the all-zero corner
-///   of that layer-`(MAX_LAYER - 1)`, so the leaf sits flush against
-///   the top face of the grass with its `xz` edge on the Bevy origin.
-/// - voxel `(NODE_VOXELS_PER_AXIS / 2, 2, NODE_VOXELS_PER_AXIS / 2)`
-///   — centred in `xz` so the player isn't right against a leaf
-///   boundary, and two cells above the leaf's bottom face so gravity
-///   has something to do for a couple of frames.
+/// Bottom-row slot `(2, 0, 2)` at depth `MAX_LAYER - 1` puts the
+/// leaf flush against the grass's top face; depth `MAX_LAYER - 2`
+/// uses `sy = 1` so the layer-`(MAX_LAYER - 1)` node containing
+/// that leaf sits just above the world floor.
 fn spawn_position() -> Position {
     let mut path = [0u8; NODE_PATH_LEN];
-    path[NODE_PATH_LEN - 2] = slot_index(0, 1, 0) as u8;
-    path[NODE_PATH_LEN - 1] = slot_index(0, 0, 0) as u8;
+    // Every level above (MAX_LAYER - 2): centre slot on x/z, floor on y.
+    for depth in 0..(NODE_PATH_LEN - 2) {
+        path[depth] = slot_index(2, 0, 2) as u8;
+    }
+    // Grandparent of the leaf: centre on x/z, one row above the floor
+    // (so the leaf's y face lines up with the top of the grass).
+    path[NODE_PATH_LEN - 2] = slot_index(2, 1, 2) as u8;
+    // Leaf parent: centre on x/z, bottom of its parent on y.
+    path[NODE_PATH_LEN - 1] = slot_index(2, 0, 2) as u8;
     let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
     Position {
         path,
@@ -81,19 +88,43 @@ fn spawn_position() -> Position {
     }
 }
 
-/// Bevy translation of the player's spawn point — used by both
-/// [`spawn_player`] at startup and `editor::tools::reset_player` at
-/// runtime, so a fresh spawn and an R-key reset land in exactly the
-/// same spot.
-pub fn spawn_translation() -> Vec3 {
-    bevy_from_position(&spawn_position())
+/// The [`WorldAnchor`] that places the spawn `Position` at Bevy
+/// `(0, 0, 0)`. Used by [`spawn_player`] to initialise the
+/// resource, and by [`spawn_translation`] so the reset-to-spawn
+/// translation is consistently zero.
+pub fn spawn_anchor() -> WorldAnchor {
+    WorldAnchor {
+        leaf_coord: position_to_leaf_coord(&spawn_position()),
+    }
 }
 
+/// Bevy translation of the spawn point in the player's current
+/// `anchor` frame. Used by `editor::tools::reset_player` to teleport
+/// the player — passing the current anchor keeps the teleport
+/// small-f32 regardless of how far the player has wandered since
+/// startup.
+pub fn spawn_translation(anchor: &WorldAnchor) -> Vec3 {
+    bevy_from_position(&spawn_position(), anchor)
+}
+
+/// Startup system: insert the [`WorldAnchor`] resource so that the
+/// player's spawn position sits at Bevy `(0, 0, 0)`, then spawn the
+/// player entity with a zero translation. Anything Bevy-shaped that
+/// runs after this reads a tiny `Transform` regardless of where the
+/// spawn is in the world.
 fn spawn_player(mut commands: Commands) {
+    let anchor = spawn_anchor();
+    // `bevy_from_position(spawn_position(), spawn_anchor())` evaluates
+    // to `(0, 0, 0) + spawn_position().offset`, which lives in the
+    // same leaf — we just store the offset as the initial
+    // translation so the first frame's render/collision already
+    // sees the correct sub-voxel drift.
+    let translation = bevy_from_position(&spawn_position(), &anchor);
+    commands.insert_resource(anchor);
     commands.spawn((
         Player,
         Velocity(Vec3::ZERO),
-        Transform::from_translation(spawn_translation()),
+        Transform::from_translation(translation),
         Visibility::Hidden,
     ));
 }
@@ -104,6 +135,7 @@ fn move_player(
     world: Res<WorldState>,
     inv: Res<InventoryState>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
     camera_q: Query<&FpsCam>,
 ) {
@@ -150,7 +182,7 @@ fn move_player(
 
     // Jump (must be on ground before applying gravity).
     if keyboard.just_pressed(KeyCode::Space)
-        && collision::on_ground(tf.translation, &world, zoom.layer)
+        && collision::on_ground(tf.translation, &world, zoom.layer, &anchor)
     {
         vel.0.y = jump_impulse;
     }
@@ -178,5 +210,39 @@ fn move_player(
         dt,
         &world,
         zoom.layer,
+        &anchor,
     );
+}
+
+/// Run after [`move_player`]: take the integer leaf part of the
+/// player's drift in this frame and roll it into the anchor, leaving
+/// only the sub-leaf fractional part in `Transform.translation`.
+///
+/// This is the mechanism that keeps f32 precision perfect even
+/// though the player is conceptually traversing a 6-billion-leaf
+/// world: the Bevy `Transform` never accumulates large magnitudes,
+/// because every whole-leaf chunk of drift is paid out to the
+/// anchor as an exact `i64` delta.
+fn recenter_anchor(
+    mut anchor: ResMut<WorldAnchor>,
+    mut player_q: Query<&mut Transform, With<Player>>,
+) {
+    let Ok(mut tf) = player_q.single_mut() else {
+        return;
+    };
+    // Integer leaf drift since the last recenter.
+    let shift: [i64; 3] = [
+        tf.translation.x.floor() as i64,
+        tf.translation.y.floor() as i64,
+        tf.translation.z.floor() as i64,
+    ];
+    if shift == [0, 0, 0] {
+        return;
+    }
+    anchor.leaf_coord[0] += shift[0];
+    anchor.leaf_coord[1] += shift[1];
+    anchor.leaf_coord[2] += shift[2];
+    tf.translation.x -= shift[0] as f32;
+    tf.translation.y -= shift[1] as f32;
+    tf.translation.z -= shift[2] as f32;
 }

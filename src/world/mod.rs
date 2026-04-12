@@ -28,6 +28,7 @@ use bevy::prelude::*;
 pub use render::CameraZoom;
 pub use render::RenderState;
 pub use state::WorldState;
+pub use view::WorldAnchor;
 
 pub struct WorldPlugin;
 
@@ -36,6 +37,14 @@ impl Plugin for WorldPlugin {
         app.init_resource::<WorldState>()
             .init_resource::<CameraZoom>()
             .init_resource::<RenderState>()
+            // The `WorldAnchor` starts at its default (origin leaf)
+            // so the renderer and any pre-spawn systems see a valid
+            // resource, but the player plugin overwrites it in its
+            // Startup system to match the spawn position. The two
+            // inserts race-free because Startup systems run strictly
+            // after all `init_resource` / `insert_resource` calls
+            // made in plugin `build`.
+            .init_resource::<WorldAnchor>()
             .add_systems(Update, render::render_world);
     }
 }
