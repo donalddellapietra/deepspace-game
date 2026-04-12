@@ -12,6 +12,52 @@ use crate::player::{Player, PLAYER_HEIGHT};
 use crate::world::view::cell_size_at_layer;
 use crate::world::CameraZoom;
 
+// ------------------------------------------------- zoom transition
+
+/// Duration of the camera height animation when switching layers.
+const ZOOM_TRANSITION_SECS: f32 = 0.3;
+
+/// Smooth camera animation state for layer transitions. When a zoom
+/// happens, the layer switch and entity rebuild are instant, but the
+/// camera height interpolates from the old cell size to the new one
+/// over `ZOOM_TRANSITION_SECS` so the jump feels like a glide.
+#[derive(Resource, Default)]
+pub struct ZoomTransition {
+    active: Option<AnimatingZoom>,
+}
+
+struct AnimatingZoom {
+    from_cell_size: f32,
+    to_cell_size: f32,
+    t: f32,
+}
+
+impl ZoomTransition {
+    /// Start a new transition. `from_layer` is the layer *before* the
+    /// zoom; `to_layer` is the layer *after*.
+    pub fn start(&mut self, from_layer: u8, to_layer: u8) {
+        self.active = Some(AnimatingZoom {
+            from_cell_size: cell_size_at_layer(from_layer),
+            to_cell_size: cell_size_at_layer(to_layer),
+            t: 0.0,
+        });
+    }
+
+    /// The interpolated cell size, or the steady-state value when no
+    /// transition is active.
+    pub fn effective_cell_size(&self, current_layer: u8) -> f32 {
+        match &self.active {
+            Some(anim) => {
+                // Smooth-step easing: 3t² - 2t³
+                let t = anim.t.clamp(0.0, 1.0);
+                let ease = t * t * (3.0 - 2.0 * t);
+                anim.from_cell_size + (anim.to_cell_size - anim.from_cell_size) * ease
+            }
+            None => cell_size_at_layer(current_layer),
+        }
+    }
+}
+
 const SENSITIVITY: f32 = 0.003;
 
 pub struct CameraPlugin;
@@ -19,11 +65,14 @@ pub struct CameraPlugin;
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(CursorLocked(false))
+            .init_resource::<ZoomTransition>()
             .add_systems(Startup, (spawn_camera, spawn_crosshair))
             .add_systems(
                 Update,
                 (
+                    tick_zoom_transition,
                     first_person_camera
+                        .after(tick_zoom_transition)
                         .after(crate::player::derive_transforms)
                         .after(crate::ui::sync_cursor),
                     sync_atmosphere_scale,
@@ -83,10 +132,21 @@ fn spawn_crosshair(mut commands: Commands) {
     ));
 }
 
+/// Advance the zoom transition each frame.
+fn tick_zoom_transition(time: Res<Time>, mut transition: ResMut<ZoomTransition>) {
+    if let Some(anim) = &mut transition.active {
+        anim.t += time.delta_secs() / ZOOM_TRANSITION_SECS;
+        if anim.t >= 1.0 {
+            transition.active = None;
+        }
+    }
+}
+
 fn first_person_camera(
     motion: Res<AccumulatedMouseMotion>,
     locked: Res<CursorLocked>,
     zoom: Res<CameraZoom>,
+    transition: Res<ZoomTransition>,
     player_q: Query<&Transform, (With<Player>, Without<FpsCam>)>,
     mut cam_q: Query<(&mut Transform, &mut FpsCam), Without<Player>>,
 ) {
@@ -101,13 +161,10 @@ fn first_person_camera(
     }
 
     // Player.y = feet. Camera sits at the eye, but the eye height
-    // scales with the view layer's cell size: at view L the player
-    // operates "at one cell" of body width / height, and one cell is
-    // `cell_size_at_layer(L)` Bevy units. The fixed-FOV camera at a
-    // higher eye then sees the same number of cells regardless of L
-    // — pressing Q to zoom out lifts the camera so the world looks
-    // proportionally smaller.
-    let cell = cell_size_at_layer(zoom.layer);
+    // scales with the view layer's cell size. During a zoom transition
+    // the cell size is interpolated so the camera glides smoothly
+    // between layers instead of snapping.
+    let cell = transition.effective_cell_size(zoom.layer);
     cam_tf.translation = player_tf.translation + Vec3::Y * (PLAYER_HEIGHT * cell);
     cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
 }
