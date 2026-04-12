@@ -19,7 +19,7 @@ use std::f32::consts::{PI, TAU};
 
 use bevy::prelude::*;
 
-use crate::block::{Palette, PaletteEntry};
+use crate::block::{Palette, PaletteEntry, PaletteMaterial};
 use crate::camera::FpsCam;
 use crate::model::mesher::bake_volume;
 use crate::model::BakedSubMesh;
@@ -120,7 +120,7 @@ mod blueprint_json {
         name: &str,
         json_bytes: &[u8],
         palette: &mut Palette,
-        mat_assets: &mut Assets<StandardMaterial>,
+        mat_assets: &mut Assets<PaletteMaterial>,
     ) -> Result<NpcBlueprint, String> {
         let file: BlueprintFile =
             serde_json::from_slice(json_bytes).map_err(|e| format!("JSON parse error: {e}"))?;
@@ -384,7 +384,7 @@ fn load_blueprints(
     mut commands: Commands,
     mut blueprints: ResMut<NpcBlueprints>,
     mut palette: ResMut<Palette>,
-    mut mat_assets: ResMut<Assets<StandardMaterial>>,
+    mut mat_assets: ResMut<Assets<PaletteMaterial>>,
 ) {
     let dir = "assets/npcs";
     let entries = match std::fs::read_dir(dir) {

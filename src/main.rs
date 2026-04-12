@@ -16,7 +16,7 @@ use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
 
-use block::BslMaterial;
+use block::{BslMaterial, PaletteMaterial};
 
 fn main() {
     let mut app = App::new();
@@ -63,7 +63,7 @@ fn main() {
 fn debug_stamp_monument(
     mut world_state: ResMut<world::WorldState>,
     mut palette: ResMut<block::Palette>,
-    mut mat_assets: ResMut<Assets<BslMaterial>>,
+    mut mat_assets: ResMut<Assets<PaletteMaterial>>,
 ) {
     const VOX_BYTES: &[u8] = include_bytes!("../assets/vox/monu1.vox");
     let model = import::vox::load_first_model_bytes(

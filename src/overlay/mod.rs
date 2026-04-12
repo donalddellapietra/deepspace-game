@@ -16,7 +16,7 @@ use serde_json;
 
 use bridge::*;
 
-use crate::block::{BlockType, BslMaterial, Palette, PaletteEntry};
+use crate::block::{BlockType, PaletteMaterial, Palette, PaletteEntry};
 use crate::editor::save_mode::{save_mode_eligible, SaveMode, SavedMeshes};
 use crate::editor::{Hotbar, HotbarItem};
 use crate::inventory::InventoryState;
@@ -328,7 +328,7 @@ fn poll_ui_commands(
     mut inv: ResMut<InventoryState>,
     mut picker: ResMut<ColorPickerState>,
     mut palette: ResMut<Palette>,
-    mut materials: ResMut<Assets<BslMaterial>>,
+    mut materials: ResMut<Assets<PaletteMaterial>>,
     mut ui_focused: ResMut<UiFocused>,
     mut lock_lost: ResMut<PointerLockLost>,
 ) {

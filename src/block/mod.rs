@@ -68,17 +68,22 @@ pub struct PaletteEntry {
     pub alpha_mode: AlphaMode,
 }
 
+/// The concrete material type the palette creates handles for.
+/// Every caller that needs `&mut Assets<PaletteMaterial>` imports
+/// this alias instead of reaching into `bsl_material` directly.
+pub type PaletteMaterial = BslMaterial;
+
 /// Runtime palette. Index 0 is reserved (EMPTY_VOXEL). Indices 1..=len are
 /// valid block types. The first 10 are the built-in gameplay blocks.
 #[derive(Resource)]
 pub struct Palette {
     entries: Vec<PaletteEntry>,
-    materials: Vec<Handle<BslMaterial>>,
+    materials: Vec<Handle<PaletteMaterial>>,
 }
 
 impl Palette {
     /// Create a new palette pre-populated with the 10 built-in blocks.
-    pub fn new(mat_assets: &mut Assets<BslMaterial>) -> Self {
+    pub fn new(mat_assets: &mut Assets<PaletteMaterial>) -> Self {
         let mut palette = Self {
             entries: Vec::new(),
             materials: Vec::new(),
@@ -108,7 +113,7 @@ impl Palette {
     }
 
     /// Get the material handle for a voxel value.
-    pub fn material(&self, voxel: u8) -> Option<Handle<BslMaterial>> {
+    pub fn material(&self, voxel: u8) -> Option<Handle<PaletteMaterial>> {
         if voxel == 0 {
             return None;
         }
@@ -120,7 +125,7 @@ impl Palette {
     pub fn register(
         &mut self,
         entry: PaletteEntry,
-        mat_assets: &mut Assets<BslMaterial>,
+        mat_assets: &mut Assets<PaletteMaterial>,
     ) -> u8 {
         assert!(
             self.entries.len() < 255,

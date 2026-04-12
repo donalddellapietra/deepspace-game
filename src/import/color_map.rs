@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use crate::block::{BslMaterial, Palette, PaletteEntry};
+use crate::block::{PaletteMaterial, Palette, PaletteEntry};
 use crate::world::tree::{Voxel, EMPTY_VOXEL};
 
 /// Register .vox palette colors as new Palette entries (exact colors).
@@ -15,7 +15,7 @@ use crate::world::tree::{Voxel, EMPTY_VOXEL};
 pub fn build_palette_lut(
     vox_palette: &[(u8, u8, u8, u8); 256],
     palette: &mut Palette,
-    mat_assets: &mut Assets<BslMaterial>,
+    mat_assets: &mut Assets<PaletteMaterial>,
 ) -> [Voxel; 256] {
     let mut lut = [EMPTY_VOXEL; 256];
     let mut seen: std::collections::HashMap<(u8, u8, u8, u8), u8> =
