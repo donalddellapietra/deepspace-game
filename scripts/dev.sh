@@ -15,4 +15,7 @@ until curl -s http://localhost:5173 > /dev/null 2>&1; do sleep 0.2; done
 echo "Vite ready"
 
 # Start native game (wry WebView overlay loads from Vite)
-cargo run --features dev
+# Note: --features dev (dynamic linking) is incompatible with wry on macOS
+# due to objc-sys symbol conflicts. Plain cargo run is fast enough with
+# incremental builds (~3-5s).
+cargo run
