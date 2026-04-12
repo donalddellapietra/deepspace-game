@@ -9,7 +9,7 @@
 use super::position::{LayerPos, Position, NODE_PATH_LEN};
 use super::state::WorldState;
 use super::tree::{
-    downsample, downsample_from_library, filled_voxel_grid, slot_index,
+    downsample, downsample_updated_slot, filled_voxel_grid, slot_index,
     uniform_children, voxel_idx, NodeId, Voxel, VoxelGrid, BRANCH_FACTOR,
     CHILDREN_PER_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
 };
@@ -52,8 +52,11 @@ pub fn edit_leaf(world: &mut WorldState, position: &Position, voxel: Voxel) {
     let mut new_child_id = world.library.insert_leaf(new_leaf_voxels);
 
     // Walk back up, rebuilding each ancestor with the new child id.
+    // Only one slot changed per layer, so we incrementally patch that
+    // slot's 5³ parent region instead of re-downsampling all 125
+    // children from scratch.
     for &(parent_id, slot) in descent.iter().rev() {
-        let new_children = {
+        let (new_voxels, new_children) = {
             let parent = world
                 .library
                 .get(parent_id)
@@ -62,12 +65,20 @@ pub fn edit_leaf(world: &mut WorldState, position: &Position, voxel: Voxel) {
                 .children
                 .as_ref()
                 .expect("edit_leaf: non-leaf expected on walk up");
-            let mut c = old_children.clone();
-            c[slot] = new_child_id;
-            c
+            let mut new_children = old_children.clone();
+            new_children[slot] = new_child_id;
+            let new_child_voxels = &world
+                .library
+                .get(new_child_id)
+                .expect("edit_leaf: new child missing")
+                .voxels;
+            let new_voxels = downsample_updated_slot(
+                &parent.voxels,
+                new_child_voxels,
+                slot,
+            );
+            (new_voxels, new_children)
         };
-        let new_voxels =
-            downsample_from_library(&world.library, new_children.as_ref());
         new_child_id = world.library.insert_non_leaf(new_voxels, new_children);
     }
 
@@ -132,9 +143,10 @@ pub fn edit_at_layer(world: &mut WorldState, path_prefix: &[u8], voxel: Voxel) {
     }
 
     // Walk back up, splicing chain_id at the target_layer position.
+    // Incremental downsample: one slot changes per layer.
     let mut new_child_id = chain_id;
     for &(parent_id, slot) in descent.iter().rev() {
-        let new_children = {
+        let (new_voxels, new_children) = {
             let parent = world
                 .library
                 .get(parent_id)
@@ -143,12 +155,20 @@ pub fn edit_at_layer(world: &mut WorldState, path_prefix: &[u8], voxel: Voxel) {
                 .children
                 .as_ref()
                 .expect("edit_at_layer: non-leaf expected on walk up");
-            let mut c = old_children.clone();
-            c[slot] = new_child_id;
-            c
+            let mut new_children = old_children.clone();
+            new_children[slot] = new_child_id;
+            let new_child_voxels = &world
+                .library
+                .get(new_child_id)
+                .expect("edit_at_layer: new child missing")
+                .voxels;
+            let new_voxels = downsample_updated_slot(
+                &parent.voxels,
+                new_child_voxels,
+                slot,
+            );
+            (new_voxels, new_children)
         };
-        let new_voxels =
-            downsample_from_library(&world.library, new_children.as_ref());
         new_child_id = world.library.insert_non_leaf(new_voxels, new_children);
     }
 
@@ -310,9 +330,10 @@ fn install_subtree(world: &mut WorldState, ancestor_slots: &[u8], new_node_id: N
         current_id = children[slot as usize];
     }
 
+    // Incremental downsample: one slot changes per layer.
     let mut child_id = new_node_id;
     for &(parent_id, slot) in descent.iter().rev() {
-        let new_children = {
+        let (new_voxels, new_children) = {
             let parent = world
                 .library
                 .get(parent_id)
@@ -321,12 +342,20 @@ fn install_subtree(world: &mut WorldState, ancestor_slots: &[u8], new_node_id: N
                 .children
                 .as_ref()
                 .expect("install_subtree: non-leaf expected on walk up");
-            let mut c = old_children.clone();
-            c[slot] = child_id;
-            c
+            let mut new_children = old_children.clone();
+            new_children[slot] = child_id;
+            let new_child_voxels = &world
+                .library
+                .get(child_id)
+                .expect("install_subtree: new child missing")
+                .voxels;
+            let new_voxels = downsample_updated_slot(
+                &parent.voxels,
+                new_child_voxels,
+                slot,
+            );
+            (new_voxels, new_children)
         };
-        let new_voxels =
-            downsample_from_library(&world.library, new_children.as_ref());
         child_id = world.library.insert_non_leaf(new_voxels, new_children);
     }
 

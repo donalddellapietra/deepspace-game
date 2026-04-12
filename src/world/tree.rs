@@ -335,6 +335,9 @@ pub fn downsample_from_library(
 /// If two non-empty values tie within a block, the one with the
 /// lower voxel id wins — stable and dedup-friendly, and the visual
 /// difference at that kind of zoom is imperceptible anyway.
+///
+/// See also [`downsample_updated_slot`] for the incremental version
+/// used by edit walks, where exactly one child slot has changed.
 pub fn downsample(children: [&VoxelGrid; CHILDREN_PER_NODE]) -> VoxelGrid {
     let mut out = empty_voxel_grid();
     for pz in 0..NODE_VOXELS_PER_AXIS {
@@ -371,6 +374,68 @@ pub fn downsample(children: [&VoxelGrid; CHILDREN_PER_NODE]) -> VoxelGrid {
                     }
                 }
                 out[voxel_idx(px, py, pz)] = best_v;
+            }
+        }
+    }
+    out
+}
+
+/// Incremental downsample for the edit walk: given the **old parent's**
+/// voxel grid and the **new child** at exactly one slot, produce the
+/// parent's new voxel grid.
+///
+/// The geometry: each of the parent's 125 children owns a disjoint
+/// 5×5×5 region of the 25³ parent grid (125 parent voxels each). The
+/// downsample function is pure and local — every parent voxel is a
+/// deterministic majority-vote over a 5³ block inside exactly one
+/// child. So if only one child slot has changed, only the 125 parent
+/// voxels in that child's region can differ; the other 15,500 parent
+/// voxels are bit-identical to the old parent.
+///
+/// This function clones the old parent grid and recomputes only that
+/// one 5³ region using the **same majority-vote rule** as
+/// [`downsample`]. The output is byte-for-byte identical to running
+/// [`downsample`] over the full 125-child array — see the
+/// `downsample_updated_slot_matches_full` test.
+pub fn downsample_updated_slot(
+    old_parent_voxels: &VoxelGrid,
+    new_child_voxels: &VoxelGrid,
+    changed_slot: usize,
+) -> VoxelGrid {
+    let mut out = old_parent_voxels.clone();
+    let (sx, sy, sz) = slot_coords(changed_slot);
+    let base_px = sx * BRANCH_FACTOR;
+    let base_py = sy * BRANCH_FACTOR;
+    let base_pz = sz * BRANCH_FACTOR;
+
+    for dz in 0..BRANCH_FACTOR {
+        for dy in 0..BRANCH_FACTOR {
+            for dx in 0..BRANCH_FACTOR {
+                let bx = dx * BRANCH_FACTOR;
+                let by = dy * BRANCH_FACTOR;
+                let bz = dz * BRANCH_FACTOR;
+
+                let mut counts = [0u16; 256];
+                for ddz in 0..BRANCH_FACTOR {
+                    for ddy in 0..BRANCH_FACTOR {
+                        for ddx in 0..BRANCH_FACTOR {
+                            let v = new_child_voxels
+                                [voxel_idx(bx + ddx, by + ddy, bz + ddz)];
+                            counts[v as usize] += 1;
+                        }
+                    }
+                }
+
+                let mut best_v: u8 = EMPTY_VOXEL;
+                let mut best_count: u16 = 0;
+                for v in 1..256usize {
+                    if counts[v] > best_count {
+                        best_v = v as u8;
+                        best_count = counts[v];
+                    }
+                }
+                out[voxel_idx(base_px + dx, base_py + dy, base_pz + dz)] =
+                    best_v;
             }
         }
     }
@@ -490,6 +555,66 @@ mod tests {
         // Parent voxel (1, 0, 0) still samples child[0] but a
         // disjoint 5³ block, entirely empty → empty.
         assert_eq!(out[voxel_idx(1, 0, 0)], EMPTY_VOXEL);
+    }
+
+    /// The core correctness property of `downsample_updated_slot`:
+    /// given old parent voxels + a new child at one slot, it must
+    /// produce byte-identical output to running a full `downsample`
+    /// over the updated 125-child array. Covers several slot
+    /// positions to catch any off-by-one in the `slot_coords` math.
+    #[test]
+    fn downsample_updated_slot_matches_full() {
+        // Build 125 distinct children by filling each with a different
+        // voxel value (cycled mod 4, offset so none are EMPTY_VOXEL).
+        let children_grids: Vec<VoxelGrid> = (0..CHILDREN_PER_NODE)
+            .map(|i| filled_voxel_grid(((i % 4) as u8) + 1))
+            .collect();
+        let refs: [&VoxelGrid; CHILDREN_PER_NODE] =
+            std::array::from_fn(|i| &children_grids[i]);
+        let old_parent = downsample(refs);
+
+        // A non-trivial replacement grid with a scattered pattern so
+        // the majority vote actually exercises the histogram path
+        // rather than falling into the all-uniform fast path.
+        let mut scattered = empty_voxel_grid();
+        for i in 0..NODE_VOXELS {
+            scattered[i] = ((i * 13) % 7) as u8;
+        }
+
+        for &changed_slot in &[0usize, 1, 42, 62, 100, CHILDREN_PER_NODE - 1] {
+            let mut new_children_grids: Vec<VoxelGrid> = children_grids
+                .iter()
+                .map(|g| {
+                    let v: Vec<Voxel> = g.iter().copied().collect();
+                    v.into_boxed_slice()
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!("size constant"))
+                })
+                .collect();
+            let scattered_clone: VoxelGrid = {
+                let v: Vec<Voxel> = scattered.iter().copied().collect();
+                v.into_boxed_slice()
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("size constant"))
+            };
+            new_children_grids[changed_slot] = scattered_clone;
+
+            let new_refs: [&VoxelGrid; CHILDREN_PER_NODE] =
+                std::array::from_fn(|i| &new_children_grids[i]);
+            let expected = downsample(new_refs);
+
+            let actual = downsample_updated_slot(
+                &old_parent,
+                &new_children_grids[changed_slot],
+                changed_slot,
+            );
+
+            assert_eq!(
+                actual.as_ref(),
+                expected.as_ref(),
+                "mismatch at changed_slot = {changed_slot}",
+            );
+        }
     }
 
     #[test]
