@@ -390,6 +390,46 @@ pub fn is_layer_pos_solid(world: &WorldState, lp: &LayerPos) -> bool {
     v != EMPTY_VOXEL
 }
 
+// -------------------------------------------- direct leaf-coord → LayerPos
+
+/// Convert an absolute leaf coordinate directly to a [`LayerPos`] at
+/// `layer`, without round-tripping through float or a full leaf
+/// `Position`. Decomposes the coordinate into slot indices via
+/// integer division, stopping after `layer` steps instead of
+/// descending all the way to `MAX_LAYER`.
+///
+/// Returns `None` if the coordinate is outside the world.
+pub fn layer_pos_from_leaf_coord_direct(
+    coord: [i64; 3],
+    layer: u8,
+) -> Option<LayerPos> {
+    let world_max = world_extent_voxels();
+    if coord.iter().any(|&c| c < 0 || c >= world_max) {
+        return None;
+    }
+    let mut rem = coord;
+    let mut path = [0u8; NODE_PATH_LEN];
+    let mut extent: i64 = world_max;
+    for depth in 0..(layer as usize) {
+        let child_extent = extent / 5;
+        let sx = (rem[0] / child_extent) as usize;
+        let sy = (rem[1] / child_extent) as usize;
+        let sz = (rem[2] / child_extent) as usize;
+        path[depth] = slot_index(sx, sy, sz) as u8;
+        rem[0] -= (sx as i64) * child_extent;
+        rem[1] -= (sy as i64) * child_extent;
+        rem[2] -= (sz as i64) * child_extent;
+        extent = child_extent;
+    }
+    // `extent` is now the node extent in leaf voxels at `layer`.
+    // Each cell is `extent / 25` leaves wide.
+    let cell_leaves = extent / (NODE_VOXELS_PER_AXIS as i64);
+    let cx = (rem[0] / cell_leaves) as u8;
+    let cy = (rem[1] / cell_leaves) as u8;
+    let cz = (rem[2] / cell_leaves) as u8;
+    Some(LayerPos::from_path_and_cell(path, [cx, cy, cz], layer))
+}
+
 // ----------------------------------------------------------- tests
 
 #[cfg(test)]

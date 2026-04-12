@@ -361,9 +361,19 @@ fn poll_ui_commands(
             }
             UiCommand::ToggleInventory => {
                 inv.open = !inv.open;
+                if inv.open {
+                    picker.open = false;
+                }
             }
             UiCommand::ToggleColorPicker => {
                 picker.open = !picker.open;
+                if picker.open {
+                    inv.open = false;
+                }
+            }
+            UiCommand::CloseAllPanels => {
+                inv.open = false;
+                picker.open = false;
             }
             UiCommand::UiFocused { focused } => {
                 ui_focused.0 = focused;

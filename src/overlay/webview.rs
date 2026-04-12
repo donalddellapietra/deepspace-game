@@ -63,6 +63,48 @@ window.__onGameState = (data) => {
     window.__stateBuffer.push(parsed);
 };
 
+// ── Keyboard focus fix ──────────────────────────────────────────
+// Clicking on the webview makes it first responder on macOS, which
+// steals keyboard events from Bevy/winit.  Two mitigations:
+//
+// 1. preventDefault on mousedown for non-input elements — this
+//    prevents the *web-layer* focus change and, in WKWebView,
+//    usually prevents the NSView-level first-responder change too.
+//
+// 2. Forward game-relevant key presses to Bevy via IPC so that
+//    panel toggles and Escape still work even if the webview has
+//    keyboard focus.  Bevy and the webview never *both* see the
+//    same keypress (only one is first responder at a time), so
+//    there is no double-toggle.
+
+document.addEventListener('mousedown', (e) => {
+    const tag = e.target.tagName;
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA') {
+        e.preventDefault();
+    }
+}, true);
+
+document.addEventListener('keydown', (e) => {
+    // Let text inputs handle their own keys.
+    const tag = document.activeElement?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+    switch (e.code) {
+        case 'KeyE':
+            window.ipc.postMessage(JSON.stringify([{ cmd: 'toggleInventory' }]));
+            e.preventDefault();
+            break;
+        case 'KeyC':
+            window.ipc.postMessage(JSON.stringify([{ cmd: 'toggleColorPicker' }]));
+            e.preventDefault();
+            break;
+        case 'Escape':
+            window.ipc.postMessage(JSON.stringify([{ cmd: 'closeAllPanels' }]));
+            e.preventDefault();
+            break;
+    }
+}, true);
+
 // Mouse passthrough: track whether cursor is over an interactive element.
 // Throttled to avoid flooding IPC with messages on every mouse move.
 (function() {
@@ -149,6 +191,41 @@ unsafe fn swizzle_hit_test(webview: &wry::WebView) {
     ORIGINAL_HIT_TEST = Some(std::mem::transmute(original_imp));
 
     info!("overlay: hitTest: swizzled for mouse passthrough");
+}
+
+// ── Keyboard refocus ─────────────────────────────────────────────
+//
+// After a panel closes we need to hand keyboard focus back to the
+// Bevy/winit content view.  Without this, keys released while the
+// webview was first responder are never seen by winit, leaving
+// ButtonInput in a stale "pressed" state (the stuck-movement bug).
+
+use objc2_app_kit::{NSView, NSWindow};
+
+/// Make the NSWindow's contentView the first responder, returning
+/// keyboard events to Bevy/winit.
+pub fn refocus_content_view(entity: Entity) {
+    WINIT_WINDOWS.with_borrow(|winit_windows| {
+        let Some(wrapper) = winit_windows.get_window(entity) else {
+            return;
+        };
+        let Ok(handle) = wrapper.window_handle() else {
+            return;
+        };
+        let raw = handle.as_raw();
+        let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw else {
+            return;
+        };
+        // SAFETY: The pointers come from winit's live window and are
+        // valid for the duration of the borrow.
+        unsafe {
+            let ns_view = appkit.ns_view.as_ptr() as *mut NSView;
+            let Some(ns_window) = (*ns_view).window() else {
+                return;
+            };
+            ns_window.makeFirstResponder(Some(&*ns_view));
+        }
+    });
 }
 
 // ── Systems ───────────────────────────────────────────────────────

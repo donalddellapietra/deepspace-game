@@ -5,7 +5,7 @@
   transform: translate(-50%, -50%);
   width: 460px;
   max-height: 520px;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 20px 24px;
   display: flex;
   flex-direction: column;
@@ -15,6 +15,34 @@
   border-radius: 12px;
   background: var(--panel-bg);
   pointer-events: auto;
+}
+
+.inv-scroll {
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.inv-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+
+.inv-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.inv-scroll::-webkit-scrollbar-thumb {
+  background: var(--hud-border);
+  border-radius: 2px;
+}
+
+.inv-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
 }
 
 .inv-title {

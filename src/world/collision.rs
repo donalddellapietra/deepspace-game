@@ -25,11 +25,11 @@ use bevy::prelude::*;
 
 use super::position::Position;
 use super::state::WorldState;
-use super::tree::MAX_LAYER;
+use super::tree::{voxel_idx, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER, NodeId};
 use super::view::{
     bevy_from_position, cell_origin_for_anchor, cell_size_at_layer,
-    is_layer_pos_solid, layer_pos_from_bevy, position_from_leaf_coord,
-    position_to_leaf_coord, target_layer_for, WorldAnchor,
+    is_layer_pos_solid, layer_pos_from_bevy, layer_pos_from_leaf_coord_direct,
+    position_from_leaf_coord, position_to_leaf_coord, WorldAnchor,
 };
 
 // ------------------------------------------------------------ player AABB
@@ -166,6 +166,10 @@ fn clip_axis(
 /// Sample the layer-`target_layer` cell at the anchor-local block
 /// index `(bx, by, bz)`. Goes through [`layer_pos_from_bevy`] which
 /// handles the `i64` absolute recovery internally.
+///
+/// This is the **legacy per-block path** — kept for `on_ground` and
+/// `snap_to_ground` where the block count is tiny. The hot
+/// `move_and_collide` sweep uses [`collect_solid_blocks`] instead.
 fn is_target_block_solid(
     world: &WorldState,
     target_layer: u8,
@@ -185,6 +189,121 @@ fn is_target_block_solid(
     match layer_pos_from_bevy(center, target_layer, anchor) {
         Some(lp) => is_layer_pos_solid(world, &lp),
         None => false,
+    }
+}
+
+// ---------------------------------------------- batched solidity sweep
+
+/// The i64 leaf coordinate of the grid's origin block `(0, 0, 0)`.
+/// Block `(bx, by, bz)` starts at `grid_base[i] + b * block_size_i64`.
+#[inline]
+fn grid_base(anchor: &WorldAnchor, block_size_i64: i64) -> [i64; 3] {
+    [
+        anchor.leaf_coord[0] - anchor.leaf_coord[0].rem_euclid(block_size_i64),
+        anchor.leaf_coord[1] - anchor.leaf_coord[1].rem_euclid(block_size_i64),
+        anchor.leaf_coord[2] - anchor.leaf_coord[2].rem_euclid(block_size_i64),
+    ]
+}
+
+/// Walk the tree from the root to the node at `layer`, following the
+/// path in `lp`. Returns the [`NodeId`] of the target node, or
+/// `EMPTY_NODE` if any ancestor is missing or empty.
+#[inline]
+fn walk_to_node(world: &WorldState, path: &[u8]) -> NodeId {
+    let mut id = world.root;
+    for &slot in path {
+        let Some(node) = world.library.get(id) else {
+            return EMPTY_NODE;
+        };
+        let Some(children) = node.children.as_ref() else {
+            return EMPTY_NODE;
+        };
+        id = children[slot as usize];
+        if id == EMPTY_NODE {
+            return EMPTY_NODE;
+        }
+    }
+    id
+}
+
+/// Collect solid block indices from the sweep range `bmin..=bmax`,
+/// using direct integer leaf-coord → LayerPos conversion and caching
+/// the tree walk for blocks that share the same containing node.
+///
+/// This replaces the per-block `is_target_block_solid` call in the
+/// hot `move_and_collide` path, avoiding:
+/// - float → i64 → Position → LayerPos round-trips (proposal 3)
+/// - redundant root-to-node tree walks for adjacent blocks (proposal 1)
+fn collect_solid_blocks(
+    world: &WorldState,
+    collision_layer: u8,
+    bmin: IVec3,
+    bmax: IVec3,
+    base: [i64; 3],
+    block_size_i64: i64,
+    out: &mut Vec<(i32, i32, i32)>,
+) {
+    // Half a block offset to land in the block's centre (avoids
+    // boundary ambiguity). Integer division truncates, so any point
+    // strictly inside works.
+    let half = block_size_i64 / 2;
+
+    // Cache: the last walked node id and its path prefix. When the
+    // next block falls in the same node we skip the tree walk entirely
+    // and just read the voxel grid.
+    let mut cached_node_id: NodeId = EMPTY_NODE;
+    // Path of the cached node (first `collision_layer` slots valid).
+    let mut cached_path = [0u8; 12];
+    // Whether the cache has been populated at least once.
+    let mut cache_valid = false;
+
+    for by in bmin.y..=bmax.y {
+        for bz in bmin.z..=bmax.z {
+            for bx in bmin.x..=bmax.x {
+                let coord = [
+                    base[0] + (bx as i64) * block_size_i64 + half,
+                    base[1] + (by as i64) * block_size_i64 + half,
+                    base[2] + (bz as i64) * block_size_i64 + half,
+                ];
+                let Some(lp) =
+                    layer_pos_from_leaf_coord_direct(coord, collision_layer)
+                else {
+                    continue;
+                };
+
+                let path = lp.path();
+
+                // Check if we can reuse the cached node.
+                let node_id = if cache_valid
+                    && cached_path[..collision_layer as usize]
+                        == path[..collision_layer as usize]
+                {
+                    cached_node_id
+                } else {
+                    let id = walk_to_node(world, path);
+                    cached_path[..collision_layer as usize]
+                        .copy_from_slice(&path[..collision_layer as usize]);
+                    cached_node_id = id;
+                    cache_valid = true;
+                    id
+                };
+
+                if node_id == EMPTY_NODE {
+                    continue;
+                }
+                let Some(node) = world.library.get(node_id) else {
+                    continue;
+                };
+                let v = node.voxels[voxel_idx(
+                    lp.cell[0] as usize,
+                    lp.cell[1] as usize,
+                    lp.cell[2] as usize,
+                )];
+                if v != EMPTY_VOXEL {
+                    out.push((bx, by, bz));
+                }
+            }
+        }
     }
 }
 
@@ -248,25 +367,17 @@ pub fn move_and_collide(
     };
     let (bmin, bmax) = aabb_block_range(expanded, block_size, cell_origin);
 
+    let base = grid_base(&anchor, block_size_i64);
     let mut blocks: Vec<(i32, i32, i32)> = Vec::new();
-    for by in bmin.y..=bmax.y {
-        for bz in bmin.z..=bmax.z {
-            for bx in bmin.x..=bmax.x {
-                if is_target_block_solid(
-                    world,
-                    collision_layer,
-                    bx,
-                    by,
-                    bz,
-                    block_size,
-                    cell_origin,
-                    &anchor,
-                ) {
-                    blocks.push((bx, by, bz));
-                }
-            }
-        }
-    }
+    collect_solid_blocks(
+        world,
+        collision_layer,
+        bmin,
+        bmax,
+        base,
+        block_size_i64,
+        &mut blocks,
+    );
 
     // --- Y first ---
     let pa = player_aabb(local_pos, view_cell);
@@ -436,6 +547,7 @@ mod tests {
     use super::*;
     use super::super::tree::{slot_index, MAX_LAYER, NODE_VOXELS_PER_AXIS};
     use super::super::position::NODE_PATH_LEN;
+    use super::super::view::target_layer_for;
 
     /// Position resting directly on the grass surface: leaf-coord
     /// y = `GROUND_Y_VOXELS` (the first air voxel), voxel y = 0,
