@@ -6,6 +6,7 @@ mod import;
 mod interaction;
 mod inventory;
 mod model;
+mod npc;
 mod overlay;
 mod player;
 mod ui;
@@ -39,6 +40,7 @@ fn main() {
             ui::UiPlugin,
             overlay::OverlayPlugin,
             diagnostics::DiagnosticsPlugin,
+            npc::NpcPlugin,
         ))
         .add_systems(Startup, setup_environment);
 
