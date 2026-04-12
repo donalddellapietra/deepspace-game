@@ -124,7 +124,9 @@ pub struct RenderState {
     /// evicts these.
     meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
-    entities: HashMap<SmallPath, (Entity, NodeId)>,
+    /// The `Vec3` is the last-written Bevy translation so we can skip
+    /// redundant `Transform` inserts when the anchor hasn't moved.
+    entities: HashMap<SmallPath, (Entity, NodeId, Vec3)>,
     /// Zoom layer the `entities` set was built for. If it changes,
     /// everything gets despawned and rebuilt.
     last_zoom_layer: u8,
@@ -457,7 +459,7 @@ pub fn render_world(
     // If emit layer changed, or we're on our first pass, drop everything.
     if !render_state.initialised || render_state.last_zoom_layer != emit_layer
     {
-        for (_, (entity, _)) in render_state.entities.drain() {
+        for (_, (entity, _, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
@@ -486,7 +488,7 @@ pub fn render_world(
     );
 
     // Reconcile: what's alive now, what changed, what's gone.
-    let mut alive: HashMap<SmallPath, (Entity, NodeId)> =
+    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
         HashMap::with_capacity(visits.len());
 
     for visit in visits.drain(..) {
@@ -494,19 +496,25 @@ pub fn render_world(
         let existing = render_state.entities.remove(&visit.path);
 
         match existing {
-            Some((entity, existing_id)) if existing_id == new_node_id => {
-                // Reuse. Update translation (cheap; handles float
-                // drift if it ever creeps in).
-                if let Ok(mut ec) = commands.get_entity(entity) {
-                    ec.insert(
-                        Transform::from_translation(visit.origin)
-                            .with_scale(Vec3::splat(visit.scale)),
-                    );
+            Some((entity, existing_id, last_origin))
+                if existing_id == new_node_id =>
+            {
+                // Reuse. Only touch the Transform when the origin
+                // actually changed (anchor shifted). Skipping this
+                // avoids ~2k Bevy command dispatches per frame in
+                // the common stationary-camera case.
+                if last_origin != visit.origin {
+                    if let Ok(mut ec) = commands.get_entity(entity) {
+                        ec.insert(
+                            Transform::from_translation(visit.origin)
+                                .with_scale(Vec3::splat(visit.scale)),
+                        );
+                    }
                 }
-                alive.insert(visit.path, (entity, existing_id));
+                alive.insert(visit.path, (entity, existing_id, visit.origin));
             }
             other => {
-                if let Some((old_entity, _)) = other {
+                if let Some((old_entity, _, _)) = other {
                     if let Ok(mut ec) = commands.get_entity(old_entity) {
                         ec.despawn();
                     }
@@ -541,14 +549,14 @@ pub fn render_world(
                     ));
                 }
 
-                alive.insert(visit.path, (parent, new_node_id));
+                alive.insert(visit.path, (parent, new_node_id, visit.origin));
             }
         }
     }
 
     // Everything left in the old map was NOT visited this frame →
     // despawn.
-    for (_, (entity, _)) in render_state.entities.drain() {
+    for (_, (entity, _, _)) in render_state.entities.drain() {
         if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
         }
