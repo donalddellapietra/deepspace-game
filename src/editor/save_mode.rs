@@ -1,40 +1,29 @@
 //! Save mode: hover a cell at a non-leaf view layer and stash the
 //! underlying subtree as a reusable mesh.
 //!
-//! When `SaveMode.active == true`, the usual white outline gizmo is
-//! suppressed and the hovered view cell is overlaid with a neon
-//! translucent mesh of the node beneath it. The overlay re-uses the
-//! same `NodeId`-keyed baked sub-mesh cache that `world::render`
-//! fills in for the renderer — no mesh is baked twice.
+//! While `SaveMode.active`, the world block under the crosshair is
+//! recoloured blue in place (by swapping its children's
+//! `MeshMaterial3d` to [`SaveTintMaterial`]) and the normal outline
+//! gizmo is drawn blue instead of white. There is no overlay mesh —
+//! the existing rendered entity is what gets tinted, so the blue
+//! exactly covers what the edit-mode outline would have covered.
 //!
-//! Pressing the save key (`G`) records the hovered `NodeId` into
-//! `SavedMeshes`, which `inventory` displays alongside the block
-//! grid. Only view layers `L <= MAX_LAYER - 2` are eligible: any
-//! higher and one view cell is smaller than a tree leaf, so there's
-//! no clean node to save.
+//! Left-clicking records the hovered `NodeId` into `SavedMeshes`,
+//! fires a toast, and drops out of save mode. Only view layers
+//! `L <= MAX_LAYER - 2` are eligible: any higher and one view cell
+//! is smaller than a tree leaf, so there's no clean node to save.
 
-use bevy::ecs::hierarchy::ChildOf;
 use bevy::prelude::*;
 
+use crate::block::materials::BlockMaterials;
 use crate::camera::CursorLocked;
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
+use crate::world::edit::subtree_path_for_layer_pos;
 use crate::world::position::LayerPos;
-use crate::world::render::RenderState;
-use crate::world::tree::{
-    slot_index, NodeId, BRANCH_FACTOR, EMPTY_NODE, MAX_LAYER,
-    NODE_VOXELS_PER_AXIS,
-};
-use crate::world::view::{
-    bevy_origin_of_layer_pos, cell_size_at_layer, scale_for_layer, WorldAnchor,
-};
+use crate::world::render::{SubMeshBlock, WorldRenderedNode};
+use crate::world::tree::{NodeId, EMPTY_NODE, MAX_LAYER};
 use crate::world::{CameraZoom, WorldState};
-
-/// Extra size factor on the highlight parent so the overlay sits a
-/// sliver outside the world block. Without this the translucent
-/// neon material fights the opaque block's depth buffer and drops
-/// out across most of the surface.
-const OVERLAY_SCALE_BIAS: f32 = 1.02;
 
 // -------------------------------------------------------------- resources
 
@@ -45,17 +34,18 @@ pub struct SaveMode {
 
 /// A saved subtree, referenced by its content-addressed `NodeId`.
 ///
-/// Capturing a mesh bumps the library refcount on `node_id`
-/// (see `save_on_click`), so the subtree survives in the library
-/// even after the live world edits its original location away.
-/// Without that pin, placing a captured mesh after even small
-/// unrelated edits would panic in `install_subtree` — the captured
-/// id would dangle.
+/// Capturing a mesh bumps the library refcount on `node_id` (see
+/// `save_on_click`), so the subtree survives in the library even
+/// after the live world edits its original location away. Without
+/// that pin, placing a captured mesh after even small unrelated
+/// edits would panic in `install_subtree` — the captured id would
+/// dangle.
 #[derive(Clone, Debug)]
 pub struct SavedMesh {
     pub node_id: NodeId,
-    /// Tree layer of the saved node. Used later if we want to place
-    /// the saved mesh back into the world at a matching zoom.
+    /// Tree layer of the saved node. Used by the inventory filter
+    /// and by `place_block` to match saved meshes against the
+    /// current placement target layer.
     pub layer: u8,
 }
 
@@ -64,38 +54,35 @@ pub struct SavedMeshes {
     pub items: Vec<SavedMesh>,
 }
 
+/// A single bright-blue material reused for every tinted entity.
 #[derive(Resource)]
-pub struct SaveHighlightMaterial {
+pub struct SaveTintMaterial {
     pub handle: Handle<StandardMaterial>,
 }
 
-/// Tracks the currently-spawned highlight entity so we only rebuild
-/// it when the hovered NodeId changes.
+/// Tracks the currently tinted rendered entity so we can restore
+/// its children's original materials when the hover moves or save
+/// mode exits.
 #[derive(Resource, Default)]
-pub struct SaveHighlightState {
-    current: Option<(NodeId, Entity)>,
+pub struct SaveTintState {
+    current_node: Option<NodeId>,
+    current_entity: Option<Entity>,
 }
-
-#[derive(Component)]
-pub struct SaveHighlight;
 
 // ------------------------------------------------------ material init
 
-pub fn init_save_highlight_material(
+pub fn init_save_tint_material(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let handle = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.25, 1.0, 0.85, 0.45),
-        emissive: LinearRgba::new(0.6, 2.8, 2.4, 1.0),
-        alpha_mode: AlphaMode::Blend,
-        metallic: 0.7,
-        perceptual_roughness: 0.15,
-        double_sided: true,
-        cull_mode: None,
+        base_color: Color::srgb(0.25, 0.5, 1.0),
+        emissive: LinearRgba::new(0.15, 0.4, 1.1, 1.0),
+        perceptual_roughness: 0.35,
+        metallic: 0.1,
         ..default()
     });
-    commands.insert_resource(SaveHighlightMaterial { handle });
+    commands.insert_resource(SaveTintMaterial { handle });
 }
 
 // --------------------------------------------------------------- toggle
@@ -176,101 +163,88 @@ pub fn save_on_click(
     save_mode.active = false;
 }
 
-// ----------------------------------------------------- highlight system
+// ----------------------------------------------------- tint system
 
-pub fn update_save_highlight(
-    mut commands: Commands,
+/// Recolour the hovered world block by swapping each of its child
+/// sub-meshes' `MeshMaterial3d` to the shared [`SaveTintMaterial`].
+/// When the hover moves, restore the previously tinted entity's
+/// children to their canonical block materials (looked up via the
+/// `SubMeshBlock` marker the renderer attaches to each child).
+///
+/// This runs after `render::render_world` so we see the
+/// freshly-spawned `WorldRenderedNode` entities on frames where the
+/// hovered node was just brought into view.
+pub fn update_save_tint(
     save_mode: Res<SaveMode>,
     targeted: Res<TargetedBlock>,
     zoom: Res<CameraZoom>,
-    anchor: Res<WorldAnchor>,
     world: Res<WorldState>,
-    material: Option<Res<SaveHighlightMaterial>>,
-    mut state: ResMut<SaveHighlightState>,
-    mut render_state: ResMut<RenderState>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    block_materials: Option<Res<BlockMaterials>>,
+    tint: Option<Res<SaveTintMaterial>>,
+    mut state: ResMut<SaveTintState>,
+    mut commands: Commands,
+    rendered_q: Query<(Entity, &WorldRenderedNode)>,
+    children_q: Query<&Children>,
+    sub_q: Query<&SubMeshBlock>,
 ) {
-    let Some(material) = material else { return };
+    let (Some(block_materials), Some(tint)) = (block_materials, tint) else {
+        return;
+    };
 
-    let want: Option<(NodeId, u8, Vec3)> =
+    // What node (if any) should be tinted this frame?
+    let target_node: Option<NodeId> =
         if save_mode.active && save_mode_eligible(zoom.layer) {
-            targeted.hit_layer_pos.as_ref().and_then(|lp| {
-                let (node_id, layer) = resolve_node_at_lp(&world, lp)?;
-                let origin = bevy_origin_of_layer_pos(lp, &anchor);
-                Some((node_id, layer, origin))
-            })
+            targeted
+                .hit_layer_pos
+                .as_ref()
+                .and_then(|lp| resolve_node_at_lp(&world, lp).map(|(id, _)| id))
         } else {
             None
         };
 
-    let Some((node_id, node_layer, origin)) = want else {
-        despawn_current(&mut commands, &mut state);
+    // No change → no work. This is the common case: the hover
+    // sits on the same node across many frames.
+    if state.current_node == target_node {
         return;
-    };
+    }
 
-    // The baked mesh has vertices in `[0, 25]` on each axis, so the
-    // node at `node_layer` lives at a Transform scale of
-    // `scale_for_layer(node_layer)` (= `cell_size_at_layer(L) / 25`).
-    // We want the overlay slightly bigger than the world block and
-    // centred on it, so the translucent surface doesn't z-fight
-    // against the opaque world render. Bias the scale up, then shift
-    // the min corner back by half the extra width.
-    let base_scale = scale_for_layer(node_layer);
-    let scale = base_scale * OVERLAY_SCALE_BIAS;
-    let cell = cell_size_at_layer(zoom.layer);
-    let overlay_origin =
-        origin - Vec3::splat((OVERLAY_SCALE_BIAS - 1.0) * cell * 0.5);
-    let overlay_transform = Transform::from_translation(overlay_origin)
-        .with_scale(Vec3::splat(scale));
-    // `NODE_VOXELS_PER_AXIS` is the mesh's raw vertex extent; kept
-    // here as a referenced constant so the relationship between
-    // `base_scale` and `cell` is obvious to the reader.
-    let _ = NODE_VOXELS_PER_AXIS;
-
-    // Reuse the existing entity if the hovered node hasn't changed.
-    if let Some((cur_id, entity)) = state.current {
-        if cur_id == node_id {
-            commands.entity(entity).insert(overlay_transform);
-            return;
+    // Restore whatever we tinted last frame. If the entity was
+    // despawned by the renderer in the meantime, `get_entity`
+    // returns Err and we silently drop it — the entity is gone, so
+    // there's nothing to restore.
+    if let Some(prev_entity) = state.current_entity.take() {
+        if let Ok(children) = children_q.get(prev_entity) {
+            for child in children.iter() {
+                if let Ok(sub) = sub_q.get(child) {
+                    if let Ok(mut ec) = commands.get_entity(child) {
+                        ec.insert(MeshMaterial3d(block_materials.get(sub.0)));
+                    }
+                }
+            }
         }
-        commands.entity(entity).despawn();
-        state.current = None;
     }
 
-    // Spawn a fresh overlay. Uses the cached bake from `RenderState`,
-    // so the second and later hovers of the same node cost nothing.
-    let baked = render_state
-        .get_or_bake(&world, node_id, &mut meshes)
-        .to_vec();
+    state.current_node = target_node;
 
-    let parent = commands
-        .spawn((
-            SaveHighlight,
-            overlay_transform,
-            Visibility::Visible,
-        ))
-        .id();
+    let Some(target_node) = target_node else { return };
 
-    for sub in &baked {
-        commands.spawn((
-            Mesh3d(sub.mesh.clone()),
-            MeshMaterial3d(material.handle.clone()),
-            Transform::default(),
-            Visibility::Inherited,
-            ChildOf(parent),
-        ));
-    }
-
-    state.current = Some((node_id, parent));
-}
-
-fn despawn_current(
-    commands: &mut Commands,
-    state: &mut SaveHighlightState,
-) {
-    if let Some((_, entity)) = state.current.take() {
-        if let Ok(mut ec) = commands.get_entity(entity) {
-            ec.despawn();
+    // Find the rendered parent that matches our target. The number
+    // of `WorldRenderedNode` entities is bounded by the render
+    // radius (hundreds to low thousands), and this only runs on
+    // hover-change, so a linear scan is fine.
+    for (entity, rendered) in &rendered_q {
+        if rendered.0 == target_node {
+            if let Ok(children) = children_q.get(entity) {
+                for child in children.iter() {
+                    if sub_q.contains(child) {
+                        if let Ok(mut ec) = commands.get_entity(child) {
+                            ec.insert(MeshMaterial3d(tint.handle.clone()));
+                        }
+                    }
+                }
+            }
+            state.current_entity = Some(entity);
+            break;
         }
     }
 }
@@ -286,12 +260,9 @@ pub fn save_mode_eligible(view_layer: u8) -> bool {
 }
 
 /// Resolve a hovered `LayerPos` to the `NodeId` of the subtree that
-/// one view cell covers. The cell `(cx, cy, cz)` at view layer `L`
-/// decomposes into `slot_a = (c / 5)` (child of the layer-`L` node)
-/// and `slot_b = (c % 5)` (child of the layer-`(L + 1)` node),
-/// landing on a layer-`(L + 2)` subtree. Mirrors the rule in
-/// `world::edit::edit_at_layer_pos` that makes bulk edits work at
-/// the same view cell.
+/// one view cell covers, plus the tree layer that subtree lives at.
+/// Shares the path construction with `place_block` via the helper
+/// in `world::edit` so there's one canonical slot-decomposition.
 fn resolve_node_at_lp(
     world: &WorldState,
     lp: &LayerPos,
@@ -299,9 +270,9 @@ fn resolve_node_at_lp(
     if !save_mode_eligible(lp.layer) {
         return None;
     }
-
+    let path = subtree_path_for_layer_pos(lp);
     let mut id = world.root;
-    for &slot in &lp.path {
+    for &slot in &path {
         let node = world.library.get(id)?;
         let children = node.children.as_ref()?;
         id = children[slot as usize];
@@ -309,31 +280,6 @@ fn resolve_node_at_lp(
             return None;
         }
     }
-
-    let b = BRANCH_FACTOR as u8;
-    let slot_a = slot_index(
-        (lp.cell[0] / b) as usize,
-        (lp.cell[1] / b) as usize,
-        (lp.cell[2] / b) as usize,
-    );
-    let node = world.library.get(id)?;
-    let children = node.children.as_ref()?;
-    id = children[slot_a];
-    if id == EMPTY_NODE {
-        return None;
-    }
-
-    let slot_b = slot_index(
-        (lp.cell[0] % b) as usize,
-        (lp.cell[1] % b) as usize,
-        (lp.cell[2] % b) as usize,
-    );
-    let node = world.library.get(id)?;
-    let children = node.children.as_ref()?;
-    id = children[slot_b];
-    if id == EMPTY_NODE {
-        return None;
-    }
-
-    Some((id, lp.layer + 2))
+    // `save_mode_eligible` guarantees `path.len() == lp.layer + 2`.
+    Some((id, path.len() as u8))
 }

@@ -9,10 +9,10 @@ use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
 use crate::player::{spawn_position, Player, Velocity};
 use crate::world::collision;
-use crate::world::edit::{edit_at_layer_pos, install_subtree};
-use crate::world::tree::{
-    slot_index, voxel_from_block, BRANCH_FACTOR, EMPTY_VOXEL,
+use crate::world::edit::{
+    edit_at_layer_pos, install_subtree, subtree_path_for_layer_pos,
 };
+use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
 use crate::world::view::{
     bevy_center_of_layer_pos, cell_size_at_layer, layer_pos_from_bevy,
     target_layer_for, WorldAnchor,
@@ -204,31 +204,18 @@ pub fn place_block(
             let Some(saved) = saved.items.get(*idx) else {
                 return;
             };
-            // A saved subtree only slots back in at the zoom it was
-            // captured at — its baked mesh is a function of its
-            // actual tree layer, and splicing it elsewhere would
-            // either scale it or require a re-bake. Require a match
-            // for v1.
-            let target_layer = target_layer_for(place_lp.layer);
-            if saved.layer != target_layer {
-                return;
-            }
-            let b = BRANCH_FACTOR as u8;
-            let mut path: Vec<u8> = place_lp.path.clone();
-            let slot_a = slot_index(
-                (place_lp.cell[0] / b) as usize,
-                (place_lp.cell[1] / b) as usize,
-                (place_lp.cell[2] / b) as usize,
+            // Per-layer hotbars + the inventory's layer-filtered
+            // saved-mesh list mean the only way a `Model` slot is
+            // active is if it was assigned from the same zoom.
+            // Assert the invariant so a future change to the
+            // filter rules trips the test suite instead of silently
+            // no-op'ing placement.
+            debug_assert_eq!(
+                saved.layer,
+                target_layer_for(place_lp.layer),
+                "Model in hotbar must match current placement target layer",
             );
-            path.push(slot_a as u8);
-            if target_layer > place_lp.layer + 1 {
-                let slot_b = slot_index(
-                    (place_lp.cell[0] % b) as usize,
-                    (place_lp.cell[1] % b) as usize,
-                    (place_lp.cell[2] % b) as usize,
-                );
-                path.push(slot_b as u8);
-            }
+            let path = subtree_path_for_layer_pos(&place_lp);
             install_subtree(&mut world, &path, saved.node_id);
         }
     }

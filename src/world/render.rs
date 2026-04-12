@@ -27,6 +27,7 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 use crate::block::materials::BlockMaterials;
+use crate::block::BlockType;
 use crate::model::{mesher::bake_volume, BakedSubMesh};
 
 use super::state::WorldState;
@@ -38,6 +39,22 @@ use super::view::{
     cell_size_at_layer, extent_for_layer, scale_for_layer, target_layer_for,
     WorldAnchor,
 };
+
+// ------------------------------------------------------- markers
+
+/// Marker attached to the *parent* of each rendered node, carrying
+/// the `NodeId` the entity is representing. Save-mode tinting looks
+/// up entities by this component rather than keying into the
+/// private `RenderState.entities` map.
+#[derive(Component)]
+pub struct WorldRenderedNode(pub NodeId);
+
+/// Marker attached to each *child* sub-mesh entity, remembering its
+/// canonical block type so callers that temporarily swap the
+/// `MeshMaterial3d` (save-mode tinting) can restore the original
+/// material without re-querying the library.
+#[derive(Component)]
+pub struct SubMeshBlock(pub BlockType);
 
 // --------------------------------------------------------------- camera zoom
 
@@ -160,9 +177,8 @@ fn get_or_bake_mesh<'a>(
 
 impl RenderState {
     /// Fetch the baked sub-meshes for `node_id`, baking and caching
-    /// on a miss. Public so the save-mode highlight overlay can share
-    /// the same `NodeId`-keyed mesh cache as the world renderer.
-    pub fn get_or_bake<'a>(
+    /// on a miss. Internal helper for the renderer's reconciler.
+    fn get_or_bake<'a>(
         &'a mut self,
         world: &WorldState,
         node_id: NodeId,
@@ -446,6 +462,7 @@ pub fn render_world(
 
                 let parent = commands
                     .spawn((
+                        WorldRenderedNode(new_node_id),
                         Transform::from_translation(visit.origin)
                             .with_scale(Vec3::splat(node_scale)),
                         Visibility::Visible,
@@ -456,6 +473,7 @@ pub fn render_world(
                     commands.spawn((
                         Mesh3d(sub.mesh.clone()),
                         MeshMaterial3d(materials.get(sub.block_type)),
+                        SubMeshBlock(sub.block_type),
                         Transform::default(),
                         Visibility::Inherited,
                         ChildOf(parent),

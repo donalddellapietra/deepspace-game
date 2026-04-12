@@ -14,6 +14,50 @@ use super::tree::{
     CHILDREN_PER_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
 };
 
+/// Construct the tree path that reaches the subtree "under" a view
+/// cell named by `lp`. Mirrors the `slot_a = c/5, slot_b = c%5`
+/// decomposition that `edit_at_layer_pos` uses internally: starting
+/// from `lp.path` (length `lp.layer`), push one or two extra slots
+/// until we reach the layer that one view cell actually corresponds
+/// to.
+///
+/// The returned path length equals `min(lp.layer + 2, MAX_LAYER)`,
+/// so:
+///
+/// - `lp.layer <= MAX_LAYER - 2` → `path.len() == lp.layer + 2`
+///   (one clean layer-`(L+2)` subtree per view cell).
+/// - `lp.layer == MAX_LAYER - 1` → `path.len() == MAX_LAYER`
+///   (one leaf; the second descent is clamped).
+/// - `lp.layer == MAX_LAYER` → `path.len() == MAX_LAYER` (the
+///   leaf containing `lp.cell` as one voxel).
+///
+/// Call this from any site that needs to address the subtree beneath
+/// a hovered / clicked cell — `resolve_node_at_lp` in save mode,
+/// `place_block` when placing a saved mesh, etc. — rather than
+/// re-deriving the decomposition inline.
+pub fn subtree_path_for_layer_pos(lp: &LayerPos) -> Vec<u8> {
+    let mut path = lp.path.clone();
+    if lp.layer >= MAX_LAYER {
+        return path;
+    }
+    let b = BRANCH_FACTOR as u8;
+    let slot_a = slot_index(
+        (lp.cell[0] / b) as usize,
+        (lp.cell[1] / b) as usize,
+        (lp.cell[2] / b) as usize,
+    );
+    path.push(slot_a as u8);
+    if lp.layer + 1 < MAX_LAYER {
+        let slot_b = slot_index(
+            (lp.cell[0] % b) as usize,
+            (lp.cell[1] % b) as usize,
+            (lp.cell[2] % b) as usize,
+        );
+        path.push(slot_b as u8);
+    }
+    path
+}
+
 /// Edit a single leaf voxel to `voxel`. Propagates up the tree and
 /// atomically replaces `world.root`.
 pub fn edit_leaf(world: &mut WorldState, position: &Position, voxel: Voxel) {

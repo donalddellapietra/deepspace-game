@@ -219,16 +219,20 @@ fn draw_highlight(
     let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
-    // Save mode paints the target with a neon mesh overlay instead,
-    // so skip the white outline at layers where save mode is active.
-    if save_mode.active && save_mode_eligible(zoom.layer) {
-        return;
-    }
+    // In save mode the hovered block is recoloured blue in place
+    // (see `editor::save_mode::update_save_tint`); paint the outline
+    // blue to match so the "save target" is visually cohesive.
+    let save_tinted = save_mode.active && save_mode_eligible(zoom.layer);
+    let color = if save_tinted {
+        Color::srgb(0.3, 0.65, 1.0)
+    } else {
+        Color::WHITE
+    };
     let cell_size = cell_size_at_layer(zoom.layer);
     let cell_min = bevy_origin_of_layer_pos(lp, &anchor);
     let center = cell_min + Vec3::splat(cell_size * 0.5);
     gizmos.cube(
         Transform::from_translation(center).with_scale(Vec3::splat(cell_size * 1.02)),
-        Color::WHITE,
+        color,
     );
 }

@@ -16,8 +16,8 @@ impl Plugin for EditorPlugin {
         app.init_resource::<Hotbar>()
             .init_resource::<save_mode::SaveMode>()
             .init_resource::<save_mode::SavedMeshes>()
-            .init_resource::<save_mode::SaveHighlightState>()
-            .add_systems(Startup, save_mode::init_save_highlight_material)
+            .init_resource::<save_mode::SaveTintState>()
+            .add_systems(Startup, save_mode::init_save_tint_material)
             .add_systems(
                 Update,
                 (
@@ -28,18 +28,15 @@ impl Plugin for EditorPlugin {
                     tools::remove_block.after(crate::player::sync_anchor_to_player),
                     tools::place_block.after(crate::player::sync_anchor_to_player),
                     save_mode::toggle_save_mode,
-                    // Save-on-click reads `TargetedBlock` (raycast
-                    // output from `interaction::update_target`) and
-                    // `WorldAnchor` (via `install_subtree` / layer
-                    // math), so it needs both the up-to-date target
-                    // and the current anchor.
                     save_mode::save_on_click
                         .after(crate::player::sync_anchor_to_player)
                         .after(crate::interaction::update_target),
-                    // Same reads, same ordering.
-                    save_mode::update_save_highlight
-                        .after(crate::player::sync_anchor_to_player)
-                        .after(crate::interaction::update_target),
+                    // Tinting reads the raycast target and has to
+                    // observe the entities the renderer spawned
+                    // this frame, so it runs strictly after both.
+                    save_mode::update_save_tint
+                        .after(crate::interaction::update_target)
+                        .after(crate::world::render::render_world),
                     toast::tick_toasts,
                 ),
             );
