@@ -109,7 +109,7 @@ impl CameraZoom {
 /// At view layer `L`, one visible cell is one target-layer node
 /// (target = `(L + 2).min(MAX_LAYER)`), so N cells of radius emit at
 /// most roughly `(2N)^3` target-layer nodes — keep modest.
-const RADIUS_VIEW_CELLS: f32 = 32.0;
+pub const RADIUS_VIEW_CELLS: f32 = 32.0;
 
 // ----------------------------------------------------------------- state
 
