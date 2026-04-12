@@ -298,9 +298,7 @@ pub fn position_from_bevy(bevy: Vec3, anchor: &WorldAnchor) -> Option<Position> 
     ];
     let mut pos = position_from_leaf_coord(coord)?;
     pos.offset = [bevy.x - fx, bevy.y - fy, bevy.z - fz];
-    debug_assert!(pos.offset[0] >= 0.0 && pos.offset[0] < 1.0);
-    debug_assert!(pos.offset[1] >= 0.0 && pos.offset[1] < 1.0);
-    debug_assert!(pos.offset[2] >= 0.0 && pos.offset[2] < 1.0);
+    pos.debug_check_offset();
     Some(pos)
 }
 
@@ -322,9 +320,10 @@ pub fn layer_pos_from_bevy(
 pub fn layer_pos_min_leaf_coord(lp: &LayerPos) -> [i64; 3] {
     let mut coord: [i64; 3] = [0; 3];
     let mut extent: i64 = world_extent_voxels();
-    for depth in 0..lp.path.len() {
+    let path = lp.path();
+    for depth in 0..path.len() {
         let child_extent = extent / 5;
-        let (sx, sy, sz) = slot_coords(lp.path[depth] as usize);
+        let (sx, sy, sz) = slot_coords(path[depth] as usize);
         coord[0] += (sx as i64) * child_extent;
         coord[1] += (sy as i64) * child_extent;
         coord[2] += (sz as i64) * child_extent;
@@ -368,7 +367,7 @@ pub fn bevy_center_of_layer_pos(lp: &LayerPos, anchor: &WorldAnchor) -> Vec3 {
 /// sampler (`collision::is_target_block_solid`).
 pub fn is_layer_pos_solid(world: &WorldState, lp: &LayerPos) -> bool {
     let mut id = world.root;
-    for &slot in &lp.path {
+    for &slot in lp.path() {
         let Some(node) = world.library.get(id) else {
             return false;
         };
@@ -537,11 +536,11 @@ mod tests {
     #[test]
     fn bevy_origin_of_layer_pos_matches_leaf_coord() {
         let anchor = anchor_origin();
-        let lp = LayerPos {
-            path: vec![slot_index(0, 0, 0) as u8; (MAX_LAYER - 2) as usize],
-            cell: [3, 0, 3],
-            layer: MAX_LAYER - 2,
-        };
+        let lp = LayerPos::from_parts(
+            &vec![slot_index(0, 0, 0) as u8; (MAX_LAYER - 2) as usize],
+            [3, 0, 3],
+            MAX_LAYER - 2,
+        );
         let bevy = bevy_origin_of_layer_pos(&lp, &anchor);
         let leaf = layer_pos_min_leaf_coord(&lp);
         assert!(approx_eq(bevy.x, leaf[0] as f32));

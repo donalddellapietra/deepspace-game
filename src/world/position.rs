@@ -32,21 +32,29 @@ pub struct Position {
 
 /// A bounded position at an arbitrary view layer.
 ///
-/// `path.len() == layer`, plus an in-node `cell` in `0..NODE_VOXELS_PER_AXIS`.
-/// This is the type the renderer and input layer hand back for clicks at
-/// a zoomed-out view — identifying exactly one cell within one layer-`layer`
-/// node without ever computing a global coordinate.
+/// The valid path prefix has `path().len() == layer`, plus an in-node
+/// `cell` in `0..NODE_VOXELS_PER_AXIS`. This is the type the renderer
+/// and input layer hand back for clicks at a zoomed-out view —
+/// identifying exactly one cell within one layer-`layer` node without
+/// ever computing a global coordinate.
+///
+/// This type is fully stack-allocated and `Copy` — every component is
+/// bounded in size (see `docs/architecture/coordinates.md`: "nothing
+/// is ever a big number"). The `path_slots` buffer is `NODE_PATH_LEN`
+/// bytes long, and only the first `layer` slots are semantically
+/// valid; the remainder is zero padding. Access the valid prefix via
+/// [`LayerPos::path`].
 ///
 /// See `docs/architecture/editing.md` and the 2D prototype's `LayerPos`:
 /// a click on a cell at view layer `L` names the layer-`(L + 2)` subtree
 /// reached by decomposing `(cx, cy, cz)` into `slot_a = (c / 5)` and
 /// `slot_b = (c % 5)`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LayerPos {
-    /// Slot indices from root down to the node this position sits in.
-    /// `path.len() == layer`. `layer == 0` means the position is in the
-    /// root itself and `path` is empty.
-    pub path: Vec<u8>,
+    /// First `layer` slots are valid; slots `[layer..]` are zero
+    /// padding. Private so the "valid prefix" invariant is enforced
+    /// — the only readers go through [`LayerPos::path`].
+    path_slots: NodePath,
     /// Cell coordinates inside the node's `25³` grid. Each `0..25`.
     pub cell: [u8; 3],
     /// The layer the node lives at. `0..=MAX_LAYER`.
@@ -73,16 +81,65 @@ impl LayerPos {
             cy = (BRANCH_FACTOR as u8) * (sy as u8) + cy / (BRANCH_FACTOR as u8);
             cz = (BRANCH_FACTOR as u8) * (sz as u8) + cz / (BRANCH_FACTOR as u8);
         }
-        let path: Vec<u8> = leaf.path.iter().take(layer as usize).copied().collect();
+        let mut path_slots: NodePath = zero_path();
+        path_slots[..layer as usize]
+            .copy_from_slice(&leaf.path[..layer as usize]);
         Self {
-            path,
+            path_slots,
             cell: [cx, cy, cz],
             layer,
         }
     }
+
+    /// Build a `LayerPos` from an explicit slot slice, a cell, and a
+    /// layer. Panics if `path.len() != layer as usize` or the layer
+    /// exceeds `MAX_LAYER`. Used by tests and callers that need to
+    /// synthesise a `LayerPos` directly rather than project one from a
+    /// leaf.
+    #[cfg(test)]
+    pub fn from_parts(path: &[u8], cell: [u8; 3], layer: u8) -> Self {
+        assert!(layer <= MAX_LAYER);
+        assert_eq!(
+            path.len(),
+            layer as usize,
+            "LayerPos::from_parts: path.len() must equal layer"
+        );
+        let mut path_slots: NodePath = zero_path();
+        path_slots[..layer as usize].copy_from_slice(path);
+        Self {
+            path_slots,
+            cell,
+            layer,
+        }
+    }
+
+    /// Read the valid path prefix — the `lp.layer`-long list of slot
+    /// indices from the root to the node this position sits in.
+    /// `layer == 0` returns an empty slice (the position is in the
+    /// root itself).
+    #[inline]
+    pub fn path(&self) -> &[u8] {
+        &self.path_slots[..self.layer as usize]
+    }
 }
 
 impl Position {
+    /// Debug-assert the [`Position::offset`] invariant: every
+    /// component is in `[0.0, 1.0)`. Called at every non-trivial
+    /// construction site in the codebase so a floor/fract mismatch
+    /// on a boundary trips a clear assertion instead of silently
+    /// desyncing the integer and fractional parts.
+    #[inline]
+    pub fn debug_check_offset(&self) {
+        debug_assert!(
+            (0.0..1.0).contains(&self.offset[0])
+                && (0.0..1.0).contains(&self.offset[1])
+                && (0.0..1.0).contains(&self.offset[2]),
+            "Position::offset out of range: {:?}",
+            self.offset
+        );
+    }
+
     pub fn origin() -> Self {
         Self {
             path: zero_path(),
@@ -350,8 +407,8 @@ mod tests {
         p.path[NODE_PATH_LEN - 1] = slot_index(2, 1, 4) as u8;
         let lp = LayerPos::from_leaf(&p, MAX_LAYER);
         assert_eq!(lp.layer, MAX_LAYER);
-        assert_eq!(lp.path.len(), NODE_PATH_LEN);
-        assert_eq!(&lp.path[..], &p.path[..]);
+        assert_eq!(lp.path().len(), NODE_PATH_LEN);
+        assert_eq!(lp.path(), &p.path[..]);
         assert_eq!(lp.cell, [7, 11, 3]);
     }
 
@@ -365,7 +422,7 @@ mod tests {
         p.voxel = [17, 6, 11];
         let lp = LayerPos::from_leaf(&p, MAX_LAYER - 1);
         assert_eq!(lp.layer, MAX_LAYER - 1);
-        assert_eq!(lp.path.len(), NODE_PATH_LEN - 1);
+        assert_eq!(lp.path().len(), NODE_PATH_LEN - 1);
         assert_eq!(lp.cell, [18, 11, 22]);
     }
 
@@ -385,7 +442,7 @@ mod tests {
             assert!(lp.cell[0] < NODE_VOXELS_PER_AXIS as u8);
             assert!(lp.cell[1] < NODE_VOXELS_PER_AXIS as u8);
             assert!(lp.cell[2] < NODE_VOXELS_PER_AXIS as u8);
-            assert_eq!(lp.path.len(), layer as usize);
+            assert_eq!(lp.path().len(), layer as usize);
         }
     }
 }

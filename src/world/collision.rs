@@ -65,22 +65,23 @@ fn local_bevy(pos: &Position, anchor: &WorldAnchor) -> Vec3 {
 /// `[0, 1)` sub-voxel offset. Returns `None` if the result leaves
 /// the world.
 fn position_from_local(local: Vec3, anchor: &WorldAnchor) -> Option<Position> {
-    let int_delta: [i64; 3] = [
-        local.x.floor() as i64,
-        local.y.floor() as i64,
-        local.z.floor() as i64,
-    ];
+    // Evaluate `.floor()` once per axis so the integer and
+    // fractional parts can't disagree on an integer boundary —
+    // mirrors the fix in `view::position_from_bevy`. A double-eval
+    // would let the fractional part reach exactly `1.0` on negative
+    // inputs right at a boundary, violating `Position::offset ∈ [0, 1)`.
+    let fx = local.x.floor();
+    let fy = local.y.floor();
+    let fz = local.z.floor();
+    let int_delta: [i64; 3] = [fx as i64, fy as i64, fz as i64];
     let new_leaf = [
         anchor.leaf_coord[0] + int_delta[0],
         anchor.leaf_coord[1] + int_delta[1],
         anchor.leaf_coord[2] + int_delta[2],
     ];
     let mut new_pos = position_from_leaf_coord(new_leaf)?;
-    new_pos.offset = [
-        local.x - int_delta[0] as f32,
-        local.y - int_delta[1] as f32,
-        local.z - int_delta[2] as f32,
-    ];
+    new_pos.offset = [local.x - fx, local.y - fy, local.z - fz];
+    new_pos.debug_check_offset();
     Some(new_pos)
 }
 

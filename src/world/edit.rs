@@ -17,7 +17,7 @@ use super::tree::{
 /// Construct the tree path that reaches the subtree "under" a view
 /// cell named by `lp`. Mirrors the `slot_a = c/5, slot_b = c%5`
 /// decomposition that `edit_at_layer_pos` uses internally: starting
-/// from `lp.path` (length `lp.layer`), push one or two extra slots
+/// from `lp.path()` (length `lp.layer`), push one or two extra slots
 /// until we reach the layer that one view cell actually corresponds
 /// to.
 ///
@@ -36,7 +36,7 @@ use super::tree::{
 /// `place_block` when placing a saved mesh, etc. — rather than
 /// re-deriving the decomposition inline.
 pub fn subtree_path_for_layer_pos(lp: &LayerPos) -> Vec<u8> {
-    let mut path = lp.path.clone();
+    let mut path: Vec<u8> = lp.path().to_vec();
     if lp.layer >= MAX_LAYER {
         return path;
     }
@@ -237,7 +237,7 @@ pub fn edit_at_layer(world: &mut WorldState, path_prefix: &[u8], voxel: Voxel) {
 /// See `docs/architecture/editing.md` and the 2D prototype's
 /// `World::edit_at` for the derivation of the three cases.
 pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
-    assert!(lp.layer as usize == lp.path.len());
+    assert!(lp.layer as usize == lp.path().len());
     assert!(lp.layer <= MAX_LAYER);
     assert!(lp.cell[0] < NODE_VOXELS_PER_AXIS as u8);
     assert!(lp.cell[1] < NODE_VOXELS_PER_AXIS as u8);
@@ -251,11 +251,10 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
     if lp.layer == MAX_LAYER {
         // Leaf-view: single-voxel edit. Synthesise a `Position`
         // pointing at the target cell and fall through.
-        assert!(lp.path.len() == NODE_PATH_LEN);
+        let lp_path = lp.path();
+        assert!(lp_path.len() == NODE_PATH_LEN);
         let mut path = [0u8; NODE_PATH_LEN];
-        for (i, &s) in lp.path.iter().enumerate() {
-            path[i] = s;
-        }
+        path.copy_from_slice(lp_path);
         let position = Position {
             path,
             voxel: [cx, cy, cz],
@@ -275,7 +274,7 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
             (cy / b) as usize,
             (cz / b) as usize,
         );
-        let mut leaf_path_vec: Vec<u8> = lp.path.clone();
+        let mut leaf_path_vec: Vec<u8> = lp.path().to_vec();
         leaf_path_vec.push(child_slot as u8);
         debug_assert_eq!(leaf_path_vec.len(), NODE_PATH_LEN);
 
@@ -326,7 +325,7 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
         (cy % b) as usize,
         (cz % b) as usize,
     );
-    let mut sub_path: Vec<u8> = lp.path.clone();
+    let mut sub_path: Vec<u8> = lp.path().to_vec();
     sub_path.push(slot_a as u8);
     sub_path.push(slot_b as u8);
     let target_layer = (lp.layer + 2) as usize;
@@ -606,11 +605,11 @@ mod tests {
         // path. Cell (2, 3, 4) maps to:
         //   child_slot = (2/5, 3/5, 4/5) = (0, 0, 0)
         //   region base = ((2%5)*5, (3%5)*5, (4%5)*5) = (10, 15, 20)
-        let lp = LayerPos {
-            path: vec![0; (MAX_LAYER - 1) as usize],
-            cell: [2, 3, 4],
-            layer: MAX_LAYER - 1,
-        };
+        let lp = LayerPos::from_parts(
+            &vec![0; (MAX_LAYER - 1) as usize],
+            [2, 3, 4],
+            MAX_LAYER - 1,
+        );
         edit_at_layer_pos(&mut world, &lp, stone());
 
         // Every voxel in the 5³ region [10..15, 15..20, 20..25] of
@@ -639,11 +638,11 @@ mod tests {
         // slot_a = (0, 0, 0), slot_b = (0, 0, 0). Replaces the
         // layer-12 (leaf) subtree at path [0; 10, 0, 0] with a
         // solid-stone leaf.
-        let lp = LayerPos {
-            path: vec![0; (MAX_LAYER - 2) as usize],
-            cell: [0, 0, 0],
-            layer: MAX_LAYER - 2,
-        };
+        let lp = LayerPos::from_parts(
+            &vec![0; (MAX_LAYER - 2) as usize],
+            [0, 0, 0],
+            MAX_LAYER - 2,
+        );
         edit_at_layer_pos(&mut world, &lp, stone());
 
         // The all-zero-path leaf is now solid stone.
@@ -665,11 +664,7 @@ mod tests {
         //   slot_a = (6/5, 2/5, 0/5) = (1, 0, 0)
         //   slot_b = (6%5, 2%5, 0%5) = (1, 2, 0)
         // So the target leaf is at path [0; 10, slot(1,0,0), slot(1,2,0)].
-        let lp = LayerPos {
-            path: vec![0; 10],
-            cell: [6, 2, 0],
-            layer: 10,
-        };
+        let lp = LayerPos::from_parts(&vec![0; 10], [6, 2, 0], 10);
         edit_at_layer_pos(&mut world, &lp, stone());
 
         // Construct the matching leaf Position and confirm it reads
