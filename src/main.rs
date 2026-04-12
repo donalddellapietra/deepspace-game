@@ -11,6 +11,7 @@ mod player;
 mod ui;
 mod world;
 
+use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::prelude::*;
 
 fn main() {
@@ -27,7 +28,10 @@ fn main() {
             }),
             ..default()
         }))
-        .insert_resource(ClearColor(Color::srgb(0.5, 0.7, 0.9)))
+        // Atmosphere renders the sky; ClearColor only peeks through
+        // sub-pixel gaps between mesh faces, so match it to the
+        // dominant terrain color (grass) to hide seams.
+        .insert_resource(ClearColor(Color::srgb(0.3, 0.6, 0.2)))
         .add_plugins((
             block::BlockPlugin,
             world::WorldPlugin,
@@ -40,7 +44,8 @@ fn main() {
             overlay::OverlayPlugin,
             diagnostics::DiagnosticsPlugin,
         ))
-        .add_systems(Startup, setup_environment);
+        .add_systems(Startup, setup_environment)
+        .add_systems(Update, update_shadow_cascades);
 
     #[cfg(feature = "debug_import")]
     app.add_systems(Startup, debug_stamp_monument);
@@ -72,8 +77,33 @@ fn setup_environment(mut commands: Commands) {
         brightness: 800.0,
         ..default()
     });
+
     commands.spawn((
-        DirectionalLight { illuminance: 20_000.0, shadows_enabled: false, ..default() },
+        DirectionalLight { illuminance: 20_000.0, shadows_enabled: true, ..default() },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, 0.4, 0.0)),
     ));
+}
+
+/// Keep shadow cascade bounds in sync with the zoom layer so shadows
+/// cover the full view distance at every scale.
+fn update_shadow_cascades(
+    zoom: Res<world::render::CameraZoom>,
+    mut lights: Query<&mut CascadeShadowConfig, With<DirectionalLight>>,
+) {
+    if !zoom.is_changed() {
+        return;
+    }
+    let cell = world::view::cell_size_at_layer(zoom.layer);
+    let radius = world::render::RADIUS_VIEW_CELLS * cell;
+    for mut config in &mut lights {
+        // Scale cascade bounds with zoom so the shadow map texel
+        // density stays consistent at every layer.
+        *config = CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 10.0 * cell,
+            maximum_distance: radius,
+            overlap_proportion: 0.4,
+            ..default()
+        }
+        .build();
+    }
 }

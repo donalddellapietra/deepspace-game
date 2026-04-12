@@ -1,7 +1,9 @@
 use std::f32::consts::FRAC_PI_2;
 
 use bevy::{
+    core_pipeline::tonemapping::Tonemapping,
     input::mouse::AccumulatedMouseMotion,
+    pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
     prelude::*,
 };
 
@@ -19,9 +21,12 @@ impl Plugin for CameraPlugin {
             .add_systems(Startup, (spawn_camera, spawn_crosshair))
             .add_systems(
                 Update,
-                first_person_camera
-                    .after(crate::player::derive_transforms)
-                    .after(crate::ui::sync_cursor),
+                (
+                    first_person_camera
+                        .after(crate::player::derive_transforms)
+                        .after(crate::ui::sync_cursor),
+                    sync_atmosphere_scale,
+                ),
             );
     }
 }
@@ -36,7 +41,12 @@ pub struct FpsCam {
 #[derive(Resource)]
 pub struct CursorLocked(pub bool);
 
-fn spawn_camera(mut commands: Commands) {
+fn spawn_camera(
+    mut commands: Commands,
+    mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
+) {
+    let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
+
     commands.spawn((
         Camera3d::default(),
         // Pitch 0 = look forward. The follow system in
@@ -47,6 +57,14 @@ fn spawn_camera(mut commands: Commands) {
         // we picked.
         FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::default(),
+        // Procedural atmosphere (Rayleigh + Mie scattering).
+        // Ground albedo matches grass color so the horizon blends
+        // with the terrain edge instead of showing a grey seam.
+        Atmosphere {
+            ground_albedo: Vec3::new(0.3, 0.6, 0.2),
+            ..Atmosphere::earthlike(medium)
+        },
+        Tonemapping::Reinhard,
     ));
 }
 
@@ -90,4 +108,26 @@ fn first_person_camera(
     let cell = cell_size_at_layer(zoom.layer);
     cam_tf.translation = player_tf.translation + Vec3::Y * (PLAYER_HEIGHT * cell);
     cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
+}
+
+/// Keep the aerial-view LUT range in sync with the actual view
+/// distance so atmospheric fog distributes evenly across all visible
+/// chunks (avoiding banding at chunk boundaries).
+fn sync_atmosphere_scale(
+    zoom: Res<CameraZoom>,
+    mut cam_q: Query<&mut AtmosphereSettings, With<FpsCam>>,
+) {
+    if !zoom.is_changed() {
+        return;
+    }
+    let cell = cell_size_at_layer(zoom.layer);
+    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    for mut settings in &mut cam_q {
+        // At lower layers the camera is at PLAYER_HEIGHT * cell Bevy
+        // units. Dividing by cell keeps the atmosphere seeing a
+        // consistent ~2m altitude regardless of zoom, preventing
+        // heavy blue scattering at zoomed-out layers.
+        settings.scene_units_to_m = 1.0 / cell;
+        settings.aerial_view_lut_max_distance = view_radius / cell;
+    }
 }

@@ -9,44 +9,37 @@ use bevy::{
 
 use super::BakedSubMesh;
 
-/// Tiny overlap so diagonal-neighbor blocks don't leave a visible seam.
-/// Axis-aligned shared faces are already culled, so the overlap only
-/// affects exposed faces — exactly the ones that border a diagonal gap.
-const E: f32 = 0.001;
-
 /// Face definitions: (neighbor offset, quad vertices in CCW winding, normal).
-/// Each face is pushed E outward along its normal AND extended E on
-/// both tangent axes to seal diagonal and three-way corner gaps.
 const FACES: [(IVec3, [Vec3; 4], Vec3); 6] = [
-    // +X: normal axis pushed from 1.0 to 1.0+E
+    // +X
     (IVec3::X, [
-        Vec3::new(1.0 + E, 0.0 - E, 0.0 - E), Vec3::new(1.0 + E, 1.0 + E, 0.0 - E),
-        Vec3::new(1.0 + E, 1.0 + E, 1.0 + E), Vec3::new(1.0 + E, 0.0 - E, 1.0 + E),
+        Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.0, 0.0, 1.0),
     ], Vec3::X),
-    // -X: normal axis pushed from 0.0 to 0.0-E
+    // -X
     (IVec3::NEG_X, [
-        Vec3::new(0.0 - E, 0.0 - E, 1.0 + E), Vec3::new(0.0 - E, 1.0 + E, 1.0 + E),
-        Vec3::new(0.0 - E, 1.0 + E, 0.0 - E), Vec3::new(0.0 - E, 0.0 - E, 0.0 - E),
+        Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 1.0),
+        Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 0.0),
     ], Vec3::NEG_X),
-    // +Y: normal axis pushed from 1.0 to 1.0+E
+    // +Y
     (IVec3::Y, [
-        Vec3::new(0.0 - E, 1.0 + E, 1.0 + E), Vec3::new(1.0 + E, 1.0 + E, 1.0 + E),
-        Vec3::new(1.0 + E, 1.0 + E, 0.0 - E), Vec3::new(0.0 - E, 1.0 + E, 0.0 - E),
+        Vec3::new(0.0, 1.0, 1.0), Vec3::new(1.0, 1.0, 1.0),
+        Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0),
     ], Vec3::Y),
-    // -Y: normal axis pushed from 0.0 to 0.0-E
+    // -Y
     (IVec3::NEG_Y, [
-        Vec3::new(0.0 - E, 0.0 - E, 0.0 - E), Vec3::new(1.0 + E, 0.0 - E, 0.0 - E),
-        Vec3::new(1.0 + E, 0.0 - E, 1.0 + E), Vec3::new(0.0 - E, 0.0 - E, 1.0 + E),
+        Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 1.0), Vec3::new(0.0, 0.0, 1.0),
     ], Vec3::NEG_Y),
-    // +Z: normal axis pushed from 1.0 to 1.0+E
+    // +Z
     (IVec3::Z, [
-        Vec3::new(0.0 - E, 0.0 - E, 1.0 + E), Vec3::new(1.0 + E, 0.0 - E, 1.0 + E),
-        Vec3::new(1.0 + E, 1.0 + E, 1.0 + E), Vec3::new(0.0 - E, 1.0 + E, 1.0 + E),
+        Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(1.0, 1.0, 1.0), Vec3::new(0.0, 1.0, 1.0),
     ], Vec3::Z),
-    // -Z: normal axis pushed from 0.0 to 0.0-E
+    // -Z
     (IVec3::NEG_Z, [
-        Vec3::new(1.0 + E, 0.0 - E, 0.0 - E), Vec3::new(0.0 - E, 0.0 - E, 0.0 - E),
-        Vec3::new(0.0 - E, 1.0 + E, 0.0 - E), Vec3::new(1.0 + E, 1.0 + E, 0.0 - E),
+        Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 0.0),
     ], Vec3::NEG_Z),
 ];
 
