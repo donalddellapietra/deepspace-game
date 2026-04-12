@@ -120,13 +120,35 @@ impl Palette {
         self.materials.get((voxel - 1) as usize).cloned()
     }
 
+    /// Find an existing entry with the same color (within tolerance).
+    /// Returns the 1-based voxel index if found.
+    pub fn find_by_color(&self, color: Color) -> Option<u8> {
+        let target = color.to_srgba();
+        for (i, entry) in self.entries.iter().enumerate() {
+            let c = entry.color.to_srgba();
+            let dr = (c.red - target.red).abs();
+            let dg = (c.green - target.green).abs();
+            let db = (c.blue - target.blue).abs();
+            let da = (c.alpha - target.alpha).abs();
+            if dr < 0.004 && dg < 0.004 && db < 0.004 && da < 0.004 {
+                return Some((i + 1) as u8);
+            }
+        }
+        None
+    }
+
     /// Add a new entry, create its material, return the voxel index.
-    /// Panics if the palette is full (255 entries).
+    /// Deduplicates by color — if an entry with the same color already
+    /// exists, returns its index without creating a new material.
+    /// Panics if the palette is full (255 entries) and the color is new.
     pub fn register(
         &mut self,
         entry: PaletteEntry,
         mat_assets: &mut Assets<PaletteMaterial>,
     ) -> u8 {
+        if let Some(existing) = self.find_by_color(entry.color) {
+            return existing;
+        }
         assert!(
             self.entries.len() < 255,
             "Palette full: cannot register more than 255 entries"
