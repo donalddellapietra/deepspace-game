@@ -363,7 +363,7 @@ impl Plugin for NpcPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NpcMeshCache>()
             .init_resource::<NpcBlueprints>()
-            .add_systems(Startup, load_blueprints)
+            .add_systems(Startup, load_blueprints.after(crate::block::materials::init_palette))
             .add_systems(
                 Update,
                 (
@@ -381,7 +381,6 @@ impl Plugin for NpcPlugin {
 
 /// Load all blueprint JSON files from assets/npcs/ at startup.
 fn load_blueprints(
-    mut commands: Commands,
     mut blueprints: ResMut<NpcBlueprints>,
     mut palette: ResMut<Palette>,
     mut mat_assets: ResMut<Assets<PaletteMaterial>>,
