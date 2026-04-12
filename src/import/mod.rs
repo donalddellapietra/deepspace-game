@@ -7,8 +7,8 @@
 //! The pipeline has three stages:
 //!
 //! 1. **Parse** — read the file format into a [`VoxelModel`].
-//! 2. **Color map** — palette colours are mapped to [`BlockType`] during
-//!    parsing (see [`color_map`]).
+//! 2. **Color map** — palette colours are registered as exact `Palette`
+//!    entries preserving full RGBA fidelity (see [`color_map`]).
 //! 3. **Stamp** — chunk the model into 25³ leaves and install them into
 //!    [`WorldState`] at a caller-supplied position (see [`stamp`]).
 

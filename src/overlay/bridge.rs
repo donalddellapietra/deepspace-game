@@ -86,11 +86,13 @@ pub enum GameStateUpdate {
 pub enum UiCommand {
     SelectHotbarSlot { slot: usize },
     AssignBlockToSlot { voxel: u8 },
+    #[serde(rename_all = "camelCase")]
     AssignMeshToSlot { mesh_index: usize },
     SetColorPickerRgb { r: f32, g: f32, b: f32 },
     CreateBlock,
     ToggleInventory,
     ToggleColorPicker,
+    CloseAllPanels,
     UiFocused { focused: bool },
     PointerLockLost,
 }

@@ -6,12 +6,17 @@ mod import;
 mod interaction;
 mod inventory;
 mod model;
+mod npc;
 mod overlay;
 mod player;
 mod ui;
 mod world;
 
+use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
+use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
+
+use block::BslMaterial;
 
 fn main() {
     let mut app = App::new();
@@ -27,7 +32,11 @@ fn main() {
             }),
             ..default()
         }))
-        .insert_resource(ClearColor(Color::srgb(0.5, 0.7, 0.9)))
+        // Atmosphere renders the sky; ClearColor only peeks through
+        // sub-pixel gaps between mesh faces, so match it to the
+        // dominant terrain color (grass) to hide seams.
+        .insert_resource(ClearColor(Color::srgb(0.3, 0.6, 0.2)))
+        .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
             world::WorldPlugin,
@@ -38,26 +47,38 @@ fn main() {
             camera::CameraPlugin,
             ui::UiPlugin,
             overlay::OverlayPlugin,
+            npc::NpcPlugin,
             diagnostics::DiagnosticsPlugin,
         ))
-        .add_systems(Startup, setup_environment);
+        .add_systems(Startup, setup_environment)
+        .add_systems(Update, update_shadow_cascades);
 
     #[cfg(feature = "debug_import")]
-    app.add_systems(Startup, debug_stamp_monument);
+    app.add_systems(PostStartup, debug_stamp_monument);
 
     app.run();
 }
 
 #[cfg(feature = "debug_import")]
-fn debug_stamp_monument(mut world_state: ResMut<world::WorldState>) {
+fn debug_stamp_monument(
+    mut world_state: ResMut<world::WorldState>,
+    mut palette: ResMut<block::Palette>,
+    mut mat_assets: ResMut<Assets<BslMaterial>>,
+) {
     const VOX_BYTES: &[u8] = include_bytes!("../assets/vox/monu1.vox");
-    let model = import::vox::load_first_model_bytes(VOX_BYTES).expect("failed to parse .vox");
+    let model = import::vox::load_first_model_bytes(
+        VOX_BYTES,
+        &mut palette,
+        &mut mat_assets,
+    )
+    .expect("failed to parse .vox");
     info!(
-        "Loaded monument: {}×{}×{} ({} non-empty voxels)",
+        "Loaded monument: {}×{}×{} ({} non-empty voxels, palette now {} entries)",
         model.size_x,
         model.size_y,
         model.size_z,
         model.data.iter().filter(|&&v| v != 0).count(),
+        palette.len(),
     );
 
     let mut anchor = player::spawn_position();
@@ -72,8 +93,39 @@ fn setup_environment(mut commands: Commands) {
         brightness: 800.0,
         ..default()
     });
+
     commands.spawn((
-        DirectionalLight { illuminance: 20_000.0, shadows_enabled: false, ..default() },
+        DirectionalLight {
+            illuminance: 20_000.0,
+            shadows_enabled: true,
+            shadow_depth_bias: 0.3,
+            shadow_normal_bias: 2.0,
+            ..default()
+        },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, 0.4, 0.0)),
     ));
+}
+
+/// Keep shadow cascade bounds in sync with the zoom layer so shadows
+/// cover the full view distance at every scale.
+fn update_shadow_cascades(
+    zoom: Res<world::render::CameraZoom>,
+    mut lights: Query<&mut CascadeShadowConfig, With<DirectionalLight>>,
+) {
+    if !zoom.is_changed() {
+        return;
+    }
+    let cell = world::view::cell_size_at_layer(zoom.layer);
+    let radius = world::render::RADIUS_VIEW_CELLS * cell;
+    for mut config in &mut lights {
+        // Scale cascade bounds with zoom so the shadow map texel
+        // density stays consistent at every layer.
+        *config = CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 10.0 * cell,
+            maximum_distance: radius,
+            overlap_proportion: 0.4,
+            ..default()
+        }
+        .build();
+    }
 }

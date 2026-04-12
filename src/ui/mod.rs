@@ -1,5 +1,25 @@
 //! UI module — cursor management and state resources.
 //! The actual HUD rendering is handled by the React overlay (see `overlay` module).
+//!
+//! ## Cursor state machine
+//!
+//! There are exactly three states:
+//!
+//! ```text
+//!   ┌──────────┐  E / C   ┌──────────┐  Esc    ┌──────────┐
+//!   │ Gameplay  │────────►│  Panel   │───────►│Unfocused │
+//!   │  locked   │◄────────│ unlocked │        │ unlocked │
+//!   └──────────┘ E / C    └──────────┘        └──────────┘
+//!        ▲                                         │
+//!        │              click anywhere             │
+//!        └─────────────────────────────────────────┘
+//! ```
+//!
+//! - **Gameplay**: cursor locked, game has input.
+//! - **Panel**: a panel is open, cursor free.
+//! - **Unfocused**: no panel, cursor free, waiting for click-to-grab.
+//!
+//! `sync_cursor` is the single owner of transitions.
 
 pub mod color_picker;
 
@@ -17,99 +37,130 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(color_picker::ColorPickerPlugin)
-            .insert_resource(WasPanel(false))
             .add_systems(Update, sync_cursor);
     }
 }
 
-/// Tracks whether a panel was open last frame so we can auto-relock
-/// on the frame the panel closes.
-#[derive(Resource)]
-pub struct WasPanel(bool);
-
 // ── Cursor sync ──────────────────────────────────────────────────
 
-/// Single owner of cursor lock state. Panels set their `open` bool;
-/// click-to-grab and Escape-to-release are handled here too.
-///
-/// `UiFocused` is set by the React overlay when the mouse enters/leaves
-/// an interactive UI element, replacing the old `egui_wants_pointer` flag.
 pub fn sync_cursor(
     mut inv: ResMut<InventoryState>,
     mut picker: ResMut<color_picker::ColorPickerState>,
-    ui_focused: Res<UiFocused>,
+    mut ui_focused: ResMut<UiFocused>,
     mouse: Res<ButtonInput<MouseButton>>,
-    key: Res<ButtonInput<KeyCode>>,
+    mut keyboard: ResMut<ButtonInput<KeyCode>>,
     mut cursor_options: Single<&mut CursorOptions>,
     mut cursor_locked: ResMut<CursorLocked>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
-    mut was_panel: ResMut<WasPanel>,
     mut lock_lost: ResMut<PointerLockLost>,
+    #[cfg(not(target_arch = "wasm32"))]
+    primary: Query<Entity, With<PrimaryWindow>>,
 ) {
-    // ── Escape (native) ──
-    if key.just_pressed(KeyCode::Escape) {
-        cursor_options.visible = true;
-        cursor_options.grab_mode = CursorGrabMode::None;
-        cursor_locked.0 = false;
-        was_panel.0 = false;
+    // ── 1. Escape — close everything, go to Unfocused ──
+    if keyboard.just_pressed(KeyCode::Escape) {
         inv.open = false;
         picker.open = false;
-        lock_lost.0 = false;
+        go_unlocked(&mut cursor_options, &mut cursor_locked, &mut ui_focused, &mut lock_lost);
         return;
     }
 
-    // ── Browser pointer lock loss (WASM) ──
-    // The browser exits Pointer Lock on Escape and consumes the keypress.
-    // JS detects `pointerlockchange` and sets this flag.
-    // Only act on it if we thought we were locked — ignore if Bevy
-    // intentionally unlocked for a panel (cursor_locked is already false).
-    if lock_lost.0 {
-        lock_lost.0 = false;
-        if cursor_locked.0 {
-            cursor_options.visible = true;
-            cursor_options.grab_mode = CursorGrabMode::None;
-            cursor_locked.0 = false;
-            was_panel.0 = false;
-            inv.open = false;
-            picker.open = false;
-            return;
-        }
+    // ── 2. Browser pointer-lock loss (WASM) ──
+    if lock_lost.0 && cursor_locked.0 {
+        inv.open = false;
+        picker.open = false;
+        go_unlocked(&mut cursor_options, &mut cursor_locked, &mut ui_focused, &mut lock_lost);
+        return;
     }
+    lock_lost.0 = false;
 
-    let any_panel_open = inv.open || picker.open;
+    let any_panel = inv.open || picker.open;
 
-    if any_panel_open {
-        let was_locked = cursor_locked.0;
-        cursor_options.visible = true;
-        cursor_options.grab_mode = CursorGrabMode::None;
-        cursor_locked.0 = false;
-        was_panel.0 = true;
-
-        if was_locked {
+    // ── 3. A panel is open → stay unlocked ──
+    if any_panel {
+        if cursor_locked.0 {
+            unlock_cursor(&mut cursor_options, &mut cursor_locked);
             let center = Vec2::new(window.width() / 2.0, window.height() / 2.0);
             window.set_cursor_position(Some(center));
         }
         return;
     }
 
-    // ── Auto-relock when panel just closed ──
-    if was_panel.0 {
-        was_panel.0 = false;
-        cursor_options.visible = false;
-        cursor_options.grab_mode = CursorGrabMode::Locked;
-        cursor_locked.0 = true;
+    // ── 4. No panel open. If one JUST closed this frame → re-lock ──
+    // inv/picker are change-detected; if either flipped to false this
+    // frame the panel was open last frame and closed now.
+    if (inv.is_changed() || picker.is_changed()) && !cursor_locked.0 {
+        go_locked(
+            &mut cursor_options, &mut cursor_locked,
+            &mut ui_focused, &mut keyboard,
+            #[cfg(not(target_arch = "wasm32"))]
+            &primary,
+        );
         return;
     }
 
-    // Don't grab if the React UI has pointer focus
-    if ui_focused.0 {
+    // ── 5. Already locked → nothing to do ──
+    if cursor_locked.0 {
         return;
     }
 
-    // Click to grab
-    if mouse.just_pressed(MouseButton::Left) && !cursor_locked.0 {
-        cursor_options.visible = false;
-        cursor_options.grab_mode = CursorGrabMode::Locked;
-        cursor_locked.0 = true;
+    // ── 6. Unlocked, no panel — click ANYWHERE to re-grab ──
+    if mouse.just_pressed(MouseButton::Left) {
+        go_locked(
+            &mut cursor_options, &mut cursor_locked,
+            &mut ui_focused, &mut keyboard,
+            #[cfg(not(target_arch = "wasm32"))]
+            &primary,
+        );
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+fn unlock_cursor(opts: &mut CursorOptions, locked: &mut CursorLocked) {
+    opts.visible = true;
+    opts.grab_mode = CursorGrabMode::None;
+    locked.0 = false;
+}
+
+/// Transition to the Unfocused state (no panel, cursor free).
+fn go_unlocked(
+    opts: &mut CursorOptions,
+    locked: &mut CursorLocked,
+    ui_focused: &mut UiFocused,
+    lock_lost: &mut PointerLockLost,
+) {
+    unlock_cursor(opts, locked);
+    ui_focused.0 = false;
+    lock_lost.0 = false;
+}
+
+/// Transition to the Gameplay state (cursor locked, game has input).
+fn go_locked(
+    opts: &mut CursorOptions,
+    locked: &mut CursorLocked,
+    ui_focused: &mut UiFocused,
+    keyboard: &mut ButtonInput<KeyCode>,
+    #[cfg(not(target_arch = "wasm32"))]
+    primary: &Query<Entity, With<PrimaryWindow>>,
+) {
+    opts.visible = false;
+    opts.grab_mode = CursorGrabMode::Locked;
+    locked.0 = true;
+    // Clear stale flags: the panel's React element may have unmounted
+    // before onMouseLeave could fire, leaving UiFocused stuck true.
+    ui_focused.0 = false;
+    // The webview may have consumed key-up events while it was first
+    // responder.  Release everything so Bevy doesn't think keys are
+    // still held ("stuck WASD" bug).
+    keyboard.release_all();
+    // Force the webview hitTest: to pass all events through to Bevy.
+    // Without this, CURSOR_OVER_UI stays true from when the panel was
+    // open (no mousemove events fire while cursor is locked to update it).
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::overlay::webview::clear_passthrough();
+    // Hand keyboard first-responder back to the Bevy content view.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(entity) = primary.single() {
+        crate::overlay::webview::refocus_content_view(entity);
     }
 }

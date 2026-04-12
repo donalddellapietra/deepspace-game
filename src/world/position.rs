@@ -91,6 +91,25 @@ impl LayerPos {
         }
     }
 
+    /// Build a `LayerPos` from a full `NodePath` array, a cell, and a
+    /// layer. Only the first `layer` slots of `path_slots` are
+    /// semantically valid; the rest must be zero. This is the fast
+    /// path used by `layer_pos_from_leaf_coord_direct` which already
+    /// builds a zero-initialised array.
+    #[inline]
+    pub fn from_path_and_cell(
+        path_slots: NodePath,
+        cell: [u8; 3],
+        layer: u8,
+    ) -> Self {
+        debug_assert!(layer <= MAX_LAYER);
+        Self {
+            path_slots,
+            cell,
+            layer,
+        }
+    }
+
     /// Build a `LayerPos` from an explicit slot slice, a cell, and a
     /// layer. Panics if `path.len() != layer as usize` or the layer
     /// exceeds `MAX_LAYER`. Used by tests and callers that need to

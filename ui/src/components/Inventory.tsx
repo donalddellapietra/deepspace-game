@@ -50,36 +50,38 @@ export function Inventory() {
         Click a block to assign to active hotbar slot
       </p>
 
-      {/* Built-in Blocks */}
-      <div className="inv-section-header">BUILT-IN BLOCKS</div>
-      <div className="inv-grid">
-        {builtinBlocks.map((b) => (
-          <BlockTile key={b.voxel} block={b} />
-        ))}
-      </div>
+      <div className="inv-scroll">
+        {/* Built-in Blocks */}
+        <div className="inv-section-header">BUILT-IN BLOCKS</div>
+        <div className="inv-grid">
+          {builtinBlocks.map((b) => (
+            <BlockTile key={b.voxel} block={b} />
+          ))}
+        </div>
 
-      <div className="inv-divider" />
+        <div className="inv-divider" />
 
-      {/* Custom Blocks */}
-      <div className="inv-section-header">CUSTOM BLOCKS (C TO CREATE)</div>
-      <div className="inv-grid">
-        {customBlocks.length === 0 ? (
-          <span className="inv-hint">Press C to create custom blocks</span>
-        ) : (
-          customBlocks.map((b) => <BlockTile key={b.voxel} block={b} />)
-        )}
-      </div>
+        {/* Custom Blocks */}
+        <div className="inv-section-header">CUSTOM BLOCKS (C TO CREATE)</div>
+        <div className="inv-grid">
+          {customBlocks.length === 0 ? (
+            <span className="inv-hint">Press C to create custom blocks</span>
+          ) : (
+            customBlocks.map((b) => <BlockTile key={b.voxel} block={b} />)
+          )}
+        </div>
 
-      <div className="inv-divider" />
+        <div className="inv-divider" />
 
-      {/* Saved Meshes */}
-      <div className="inv-section-header inv-mesh-header">
-        Saved Meshes &mdash; Layer {layer} ({savedMeshes.length})
-      </div>
-      <div className="inv-grid">
-        {savedMeshes.map((m) => (
-          <MeshTile key={m.index} mesh={m} />
-        ))}
+        {/* Saved Meshes */}
+        <div className="inv-section-header inv-mesh-header">
+          Saved Meshes &mdash; Layer {layer} ({savedMeshes.length})
+        </div>
+        <div className="inv-grid">
+          {savedMeshes.map((m) => (
+            <MeshTile key={m.index} mesh={m} />
+          ))}
+        </div>
       </div>
 
       <div className="inv-divider" />

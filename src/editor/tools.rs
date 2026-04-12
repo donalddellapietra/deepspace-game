@@ -4,7 +4,7 @@
 
 use bevy::prelude::*;
 
-use crate::camera::CursorLocked;
+use crate::camera::{CursorLocked, ZoomTransition};
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
 use crate::player::{spawn_position, Player, Velocity};
@@ -38,18 +38,20 @@ pub fn zoom_in(
     inv: Res<InventoryState>,
     world: Res<WorldState>,
     mut zoom: ResMut<CameraZoom>,
+    mut transition: ResMut<ZoomTransition>,
     mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
 ) {
     if inv.open {
         return;
     }
-    if keyboard.just_pressed(KeyCode::KeyF) && zoom.zoom_in() {
-        if let Ok((mut pos, mut vel)) = player_q.single_mut() {
-            collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
-            // Zero vertical velocity so the frame after the snap
-            // doesn't inherit whatever fall/jump we were in the
-            // middle of.
-            vel.0.y = 0.0;
+    if keyboard.just_pressed(KeyCode::KeyF) {
+        let old_layer = zoom.layer;
+        if zoom.zoom_in() {
+            transition.start(old_layer, zoom.layer);
+            if let Ok((mut pos, mut vel)) = player_q.single_mut() {
+                collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
+                vel.0.y = 0.0;
+            }
         }
     }
 }
@@ -62,15 +64,20 @@ pub fn zoom_out(
     inv: Res<InventoryState>,
     world: Res<WorldState>,
     mut zoom: ResMut<CameraZoom>,
+    mut transition: ResMut<ZoomTransition>,
     mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
 ) {
     if inv.open {
         return;
     }
-    if keyboard.just_pressed(KeyCode::KeyQ) && zoom.zoom_out() {
-        if let Ok((mut pos, mut vel)) = player_q.single_mut() {
-            collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
-            vel.0.y = 0.0;
+    if keyboard.just_pressed(KeyCode::KeyQ) {
+        let old_layer = zoom.layer;
+        if zoom.zoom_out() {
+            transition.start(old_layer, zoom.layer);
+            if let Ok((mut pos, mut vel)) = player_q.single_mut() {
+                collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
+                vel.0.y = 0.0;
+            }
         }
     }
 }

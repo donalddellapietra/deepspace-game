@@ -8,3 +8,4 @@
 
 # Downloaded test assets (large .vox files, etc.)
 /assets/vox/*.vox
+.claude/

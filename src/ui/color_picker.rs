@@ -47,10 +47,13 @@ impl ColorPickerState {
 
 fn toggle_color_picker(
     keyboard: Res<ButtonInput<KeyCode>>,
-    inv: Res<InventoryState>,
+    mut inv: ResMut<InventoryState>,
     mut state: ResMut<ColorPickerState>,
 ) {
-    if keyboard.just_pressed(KeyCode::KeyC) && !inv.open {
+    if keyboard.just_pressed(KeyCode::KeyC) {
         state.open = !state.open;
+        if state.open {
+            inv.open = false;
+        }
     }
 }

@@ -35,7 +35,7 @@ use crate::model::BakedSubMesh;
 
 use super::state::WorldState;
 use super::tree::{
-    slot_coords, slot_index, voxel_idx, NodeId, VoxelGrid,
+    slot_coords, slot_index, voxel_idx, NodeId,
     BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
     NODE_VOXELS_PER_AXIS,
 };

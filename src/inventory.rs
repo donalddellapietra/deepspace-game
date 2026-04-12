@@ -3,6 +3,8 @@
 
 use bevy::prelude::*;
 
+use crate::ui::color_picker::ColorPickerState;
+
 // ── Plugin ─────────────────────────────────────────────────────────
 
 pub struct InventoryPlugin;
@@ -26,8 +28,12 @@ pub struct InventoryState {
 fn toggle_inventory(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<InventoryState>,
+    mut picker: ResMut<ColorPickerState>,
 ) {
     if keyboard.just_pressed(KeyCode::KeyE) {
         state.open = !state.open;
+        if state.open {
+            picker.open = false;
+        }
     }
 }
