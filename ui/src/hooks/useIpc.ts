@@ -48,3 +48,12 @@ export function toggleColorPicker() {
 export function setUiFocused(focused: boolean) {
   sendCommand({ cmd: "uiFocused", focused });
 }
+
+// Listen for browser exiting Pointer Lock (e.g., user presses Escape).
+// The browser consumes the Escape keypress so Bevy never sees it —
+// we detect the change here and tell Rust to disengage.
+document.addEventListener("pointerlockchange", () => {
+  if (!document.pointerLockElement) {
+    sendCommand({ cmd: "pointerLockLost" });
+  }
+});

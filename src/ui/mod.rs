@@ -8,7 +8,7 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::camera::CursorLocked;
 use crate::inventory::InventoryState;
-use crate::overlay::UiFocused;
+use crate::overlay::{PointerLockLost, UiFocused};
 
 // ── Plugin ─────────────────────────────────────────────────────────
 
@@ -35,8 +35,8 @@ pub struct WasPanel(bool);
 /// `UiFocused` is set by the React overlay when the mouse enters/leaves
 /// an interactive UI element, replacing the old `egui_wants_pointer` flag.
 pub fn sync_cursor(
-    inv: Res<InventoryState>,
-    picker: Res<color_picker::ColorPickerState>,
+    mut inv: ResMut<InventoryState>,
+    mut picker: ResMut<color_picker::ColorPickerState>,
     ui_focused: Res<UiFocused>,
     mouse: Res<ButtonInput<MouseButton>>,
     key: Res<ButtonInput<KeyCode>>,
@@ -44,18 +44,39 @@ pub fn sync_cursor(
     mut cursor_locked: ResMut<CursorLocked>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     mut was_panel: ResMut<WasPanel>,
+    mut lock_lost: ResMut<PointerLockLost>,
 ) {
-    let any_panel_open = inv.open || picker.open;
-
-    // ── Detect browser-side pointer lock loss ──
-    // In WASM, the browser can exit Pointer Lock without telling Bevy
-    // (e.g., user presses Escape handled by the browser, or tab-switches).
-    // Detect this by checking the actual grab mode vs our resource.
-    if cursor_locked.0 && cursor_options.grab_mode == CursorGrabMode::None {
-        // Browser exited pointer lock under us — sync our state
-        cursor_locked.0 = false;
+    // ── Escape (native) ──
+    if key.just_pressed(KeyCode::Escape) {
         cursor_options.visible = true;
+        cursor_options.grab_mode = CursorGrabMode::None;
+        cursor_locked.0 = false;
+        was_panel.0 = false;
+        inv.open = false;
+        picker.open = false;
+        lock_lost.0 = false;
+        return;
     }
+
+    // ── Browser pointer lock loss (WASM) ──
+    // The browser exits Pointer Lock on Escape and consumes the keypress.
+    // JS detects `pointerlockchange` and sets this flag.
+    // Only act on it if we thought we were locked — ignore if Bevy
+    // intentionally unlocked for a panel (cursor_locked is already false).
+    if lock_lost.0 {
+        lock_lost.0 = false;
+        if cursor_locked.0 {
+            cursor_options.visible = true;
+            cursor_options.grab_mode = CursorGrabMode::None;
+            cursor_locked.0 = false;
+            was_panel.0 = false;
+            inv.open = false;
+            picker.open = false;
+            return;
+        }
+    }
+
+    let any_panel_open = inv.open || picker.open;
 
     if any_panel_open {
         let was_locked = cursor_locked.0;
@@ -64,8 +85,6 @@ pub fn sync_cursor(
         cursor_locked.0 = false;
         was_panel.0 = true;
 
-        // When transitioning from locked → unlocked, warp the cursor
-        // to screen center so the browser/OS has a valid position.
         if was_locked {
             let center = Vec2::new(window.width() / 2.0, window.height() / 2.0);
             window.set_cursor_position(Some(center));
@@ -74,8 +93,6 @@ pub fn sync_cursor(
     }
 
     // ── Auto-relock when panel just closed ──
-    // The frame a panel closes, immediately re-lock so the user doesn't
-    // have to click again to resume FPS controls.
     if was_panel.0 {
         was_panel.0 = false;
         cursor_options.visible = false;
@@ -94,13 +111,5 @@ pub fn sync_cursor(
         cursor_options.visible = false;
         cursor_options.grab_mode = CursorGrabMode::Locked;
         cursor_locked.0 = true;
-        return;
-    }
-
-    // Escape to release
-    if key.just_pressed(KeyCode::Escape) && cursor_locked.0 {
-        cursor_options.visible = true;
-        cursor_options.grab_mode = CursorGrabMode::None;
-        cursor_locked.0 = false;
     }
 }

@@ -68,4 +68,5 @@ export type UiCommand =
   | { cmd: "createBlock" }
   | { cmd: "toggleInventory" }
   | { cmd: "toggleColorPicker" }
-  | { cmd: "uiFocused"; focused: boolean };
+  | { cmd: "uiFocused"; focused: boolean }
+  | { cmd: "pointerLockLost" };

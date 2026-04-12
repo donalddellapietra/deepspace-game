@@ -53,28 +53,81 @@ this cheap even when the affected volume is billions of leaf voxels.
 
 ## Running
 
+### Native (desktop)
+
 ```bash
 # First time (compiles all dependencies, takes a few minutes)
 cargo run
 
 # Fast incremental builds with dynamic linking
 cargo run --features dev
+
+# With debug structures (stamps a test monument at spawn)
+cargo run --features debug_import
 ```
 
-Requires Rust 1.85+ (edition 2024).
+### Web (WASM)
+
+```bash
+# Build the React UI first
+cd ui && npm install && npm run build && cd ..
+
+# Dev server with auto-reload (rebuilds on .rs changes, ~9s incremental)
+trunk serve
+
+# With debug structures baked in
+trunk serve --features debug_import
+
+# Production build + deploy to Vercel
+./deploy.sh
+```
+
+Requires Rust 1.85+ (edition 2024) and [Trunk](https://trunkrs.dev/) for WASM builds.
+
+## UI architecture
+
+The game UI (hotbar, inventory, color picker, mode indicator, toasts) is a **React/TypeScript app** rendered as an HTML/CSS overlay on top of the Bevy canvas. Communication between Bevy and React uses wasm-bindgen: Rust pushes state to JS, React sends commands back via a polled queue.
+
+```
+index.html
+  ├── <canvas>       Bevy WASM renders here
+  └── <div id="root"> React app (pointer-events: none, click-through)
+       ├── Hotbar, ModeIndicator (always visible)
+       ├── Inventory (E to toggle)
+       ├── ColorPicker (C to toggle)
+       └── Toasts (auto-dismiss)
+```
+
+React source lives in `ui/src/`. After editing React files, rebuild with `cd ui && npm run build` and refresh the browser — no Rust recompilation needed.
 
 ## Testing
 
 ```bash
+# Rust tests
 cargo test
+
+# Playwright UI tests (requires trunk server running)
+trunk serve --no-autoreload   # terminal 1
+cd ui && npx playwright test  # terminal 2
+
+# Single test
+cd ui && npx playwright test -g "Hotbar renders"
 ```
+
+See `tests/CONTEXT.md` for details on writing and running Playwright tests.
 
 ## Architecture
 
 ```
 src/
   main.rs              App setup, plugins, lighting
-  block/               BlockType enum (10 types), per-type PBR materials
+  overlay/
+    mod.rs             OverlayPlugin — pushes Bevy state to React, polls commands
+    bridge.rs          Serializable IPC types (serde) for Rust ↔ JS
+  ui/
+    mod.rs             Cursor lock/unlock sync (coordinates with React overlay)
+    color_picker.rs    ColorPickerState resource + toggle
+  block/               BlockType enum (10 types), Palette, per-type PBR materials
   model/
     mod.rs             BakedSubMesh (mesh + block type)
     mesher.rs          Generic bake_volume(size, sampler) greedy mesher
@@ -97,12 +150,18 @@ src/
   editor/
     mod.rs             Hotbar, HotbarItem::Block
     tools.rs           zoom_in/out, place/remove, reset_player
-  inventory.rs         Inventory panel UI, click-to-swap-into-hotbar
+    toast.rs           Toast bridge to React overlay
+  inventory.rs         InventoryState resource + toggle
   camera.rs            First-person camera with view-layer-scaled eye
   player.rs            Path-based spawn, cell-rate movement (speed,
                          jump, gravity all scale with cell_size_at_layer)
-  ui/mod.rs            Hotbar, "Layer N" indicator
   diagnostics.rs       Debug logging
+ui/
+  src/
+    components/        Hotbar, Inventory, ColorPicker, ModeIndicator, Toast
+    hooks/             useGameState (Rust → React), useIpc (React → Rust)
+    types.ts           TypeScript interfaces mirroring Rust bridge types
+  tests/               Playwright integration tests
 ```
 
 ### Data model

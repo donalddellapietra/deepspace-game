@@ -27,6 +27,7 @@ pub struct OverlayPlugin;
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(UiFocused(false))
+            .insert_resource(PointerLockLost(false))
             .insert_resource(ToastIdCounter(0))
             .add_message::<ToastEvent>()
             .add_systems(
@@ -48,6 +49,11 @@ impl Plugin for OverlayPlugin {
 /// Whether the React UI has pointer focus (mouse is over an interactive element).
 #[derive(Resource)]
 pub struct UiFocused(pub bool);
+
+/// Set by JS when the browser exits Pointer Lock (e.g., Escape key).
+/// `sync_cursor` reads and clears this each frame.
+#[derive(Resource)]
+pub struct PointerLockLost(pub bool);
 
 /// Monotonic toast ID counter.
 #[derive(Resource)]
@@ -245,6 +251,7 @@ fn poll_ui_commands(
     mut palette: ResMut<Palette>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut ui_focused: ResMut<UiFocused>,
+    mut lock_lost: ResMut<PointerLockLost>,
 ) {
     for cmd in poll_commands() {
         match cmd {
@@ -290,6 +297,9 @@ fn poll_ui_commands(
             }
             UiCommand::UiFocused { focused } => {
                 ui_focused.0 = focused;
+            }
+            UiCommand::PointerLockLost => {
+                lock_lost.0 = true;
             }
         }
     }

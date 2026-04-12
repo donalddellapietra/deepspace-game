@@ -92,4 +92,5 @@ pub enum UiCommand {
     ToggleInventory,
     ToggleColorPicker,
     UiFocused { focused: bool },
+    PointerLockLost,
 }

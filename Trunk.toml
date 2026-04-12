@@ -1,0 +1,16 @@
+[watch]
+ignore = [
+    ".claude",
+    "external",
+    "ui/node_modules",
+    "ui/dist",
+    "tests",
+    "docs",
+    "dist",
+    ".git",
+    "target",
+]
+
+[build]
+# To bake in the debug_import feature (stamps test monuments):
+#   trunk serve --features debug_import

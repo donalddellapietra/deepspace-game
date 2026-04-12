@@ -47,12 +47,8 @@ fn main() {
 
 #[cfg(feature = "debug_import")]
 fn debug_stamp_monument(mut world_state: ResMut<world::WorldState>) {
-    let path = std::path::Path::new("assets/vox/monu1.vox");
-    if !path.exists() {
-        warn!("No test monument at {path:?} — skipping stamp");
-        return;
-    }
-    let model = import::vox::load_first_model(path).expect("failed to parse .vox");
+    const VOX_BYTES: &[u8] = include_bytes!("../assets/vox/monu1.vox");
+    let model = import::vox::load_first_model_bytes(VOX_BYTES).expect("failed to parse .vox");
     info!(
         "Loaded monument: {}×{}×{} ({} non-empty voxels)",
         model.size_x,
