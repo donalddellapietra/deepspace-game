@@ -27,7 +27,8 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 use crate::block::Palette;
-use crate::model::{mesher::bake_volume, BakedSubMesh};
+use crate::model::mesher::{bake_volume, bake_child_faces, merge_child_faces};
+use crate::model::BakedSubMesh;
 
 use super::state::WorldState;
 use super::tree::{
@@ -115,24 +116,29 @@ pub const RADIUS_VIEW_CELLS: f32 = 32.0;
 /// Per-frame timing data exposed to the diagnostics HUD.
 #[derive(Resource, Default)]
 pub struct RenderTimings {
+    pub render_total_us: u64,
     pub walk_us: u64,
+    pub bake_us: u64,
     pub reconcile_us: u64,
     pub visit_count: usize,
     pub group_count: usize,
     pub collision_us: u64,
-    pub triangles: usize,
 }
 
-/// A map from tree path (of length `depth`) to the Bevy entity
-/// currently rendering that path. `NodeId` tracks what the entity's
-/// mesh is a function of, so edits naturally invalidate it.
+/// Cached per-child face data for a parent node at a given path.
+/// Stores the children NodeId array so we can diff against the new
+/// parent's children and only re-bake changed slots.
+struct ParentBakeCache {
+    children: Box<[NodeId; CHILDREN_PER_NODE]>,
+    child_faces: Vec<crate::model::mesher::ChildFaces>,
+}
+
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached per-`NodeId` baked sub-meshes. An entry survives across
-    /// frames and zoom layers — the mesh is a function of the node's
-    /// voxel grid, not of which layer it was emitted at. v1 never
-    /// evicts these.
+    /// Cached per-`NodeId` baked sub-meshes.
     meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
+    /// Per-path bake cache for incremental re-baking.
+    parent_cache: HashMap<SmallPath, ParentBakeCache>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
     /// The `Vec3` is the last-written Bevy translation so we can skip
     /// redundant `Transform` inserts when the anchor hasn't moved.
@@ -183,18 +189,18 @@ fn get_or_bake_mesh<'a>(
     render_state: &'a mut RenderState,
     world: &WorldState,
     node_id: NodeId,
+    path: SmallPath,
     meshes: &mut Assets<Mesh>,
 ) -> &'a [BakedSubMesh] {
-    render_state.get_or_bake(world, node_id, meshes)
+    render_state.get_or_bake(world, node_id, path, meshes)
 }
 
 impl RenderState {
-    /// Fetch the baked sub-meshes for `node_id`, baking and caching
-    /// on a miss. Internal helper for the renderer's reconciler.
     fn get_or_bake<'a>(
         &'a mut self,
         world: &WorldState,
         node_id: NodeId,
+        path: SmallPath,
         meshes: &mut Assets<Mesh>,
     ) -> &'a [BakedSubMesh] {
         if !self.meshes.contains_key(&node_id) {
@@ -203,7 +209,11 @@ impl RenderState {
                 .get(node_id)
                 .expect("render: node missing from library");
             let baked = if let Some(children) = &node.children {
-                // Non-leaf: bake 125³ mesh from children's voxel grids.
+                // Non-leaf: bake per-child, then merge.
+                // Check if we have a cached bake for this path whose
+                // children mostly overlap — reuse unchanged slots.
+                let old_cache = self.parent_cache.remove(&path);
+
                 let child_voxels: Vec<Option<VoxelGrid>> = children
                     .iter()
                     .map(|&id| {
@@ -222,38 +232,60 @@ impl RenderState {
                     })
                     .collect();
                 let size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
-                bake_volume(
-                    size,
-                    move |x, y, z| {
-                        if x < 0
-                            || y < 0
-                            || z < 0
-                            || x >= size
-                            || y >= size
-                            || z >= size
-                        {
-                            return None;
+                let get = |x: i32, y: i32, z: i32| -> Option<u8> {
+                    if x < 0 || y < 0 || z < 0
+                        || x >= size || y >= size || z >= size
+                    {
+                        return None;
+                    }
+                    let xu = x as usize;
+                    let yu = y as usize;
+                    let zu = z as usize;
+                    let slot = slot_index(
+                        xu / NODE_VOXELS_PER_AXIS,
+                        yu / NODE_VOXELS_PER_AXIS,
+                        zu / NODE_VOXELS_PER_AXIS,
+                    );
+                    let voxels = child_voxels[slot].as_ref()?;
+                    let v = voxels[voxel_idx(
+                        xu % NODE_VOXELS_PER_AXIS,
+                        yu % NODE_VOXELS_PER_AXIS,
+                        zu % NODE_VOXELS_PER_AXIS,
+                    )];
+                    if v == EMPTY_VOXEL { None } else { Some(v) }
+                };
+
+                let per_child: Vec<_> = (0..CHILDREN_PER_NODE)
+                    .map(|slot| {
+                        let child_id = children[slot];
+                        if child_id == EMPTY_NODE {
+                            return Default::default();
                         }
-                        let xu = x as usize;
-                        let yu = y as usize;
-                        let zu = z as usize;
-                        let slot = slot_index(
-                            xu / NODE_VOXELS_PER_AXIS,
-                            yu / NODE_VOXELS_PER_AXIS,
-                            zu / NODE_VOXELS_PER_AXIS,
-                        );
-                        let voxels = child_voxels[slot].as_ref()?;
-                        let v = voxels[voxel_idx(
-                            xu % NODE_VOXELS_PER_AXIS,
-                            yu % NODE_VOXELS_PER_AXIS,
-                            zu % NODE_VOXELS_PER_AXIS,
-                        )];
-                        if v == EMPTY_VOXEL { None } else { Some(v) }
-                    },
-                    meshes,
-                )
+                        // Reuse cached faces if this child's NodeId
+                        // hasn't changed since the last bake at this path.
+                        if let Some(ref old) = old_cache {
+                            if old.children[slot] == child_id {
+                                return old.child_faces[slot].clone();
+                            }
+                        }
+                        bake_child_faces(
+                            &get,
+                            slot,
+                            NODE_VOXELS_PER_AXIS as i32,
+                            BRANCH_FACTOR,
+                        )
+                    })
+                    .collect();
+
+                let result = merge_child_faces(&per_child, meshes);
+
+                self.parent_cache.insert(path, ParentBakeCache {
+                    children: children.clone(),
+                    child_faces: per_child,
+                });
+
+                result
             } else {
-                // Leaf: bake 25³ from own voxels.
                 let voxels = node.voxels.clone();
                 bake_volume(
                     NODE_VOXELS_PER_AXIS as i32,
@@ -456,6 +488,7 @@ pub fn render_world(
         return;
     };
     let camera_pos = camera_tf.translation;
+    let render_total_start = std::time::Instant::now();
 
     let target_layer = target_layer_for(zoom.layer);
     let emit_layer = target_layer.saturating_sub(1);
@@ -485,6 +518,7 @@ pub fn render_world(
     // `get_or_bake_mesh`). We put them back at the end; the buffers
     // are cleared internally by `walk()` and drained during
     // reconciliation, so they retain their allocated capacity.
+    timings.bake_us = 0;
     let walk_start = std::time::Instant::now();
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
@@ -501,21 +535,15 @@ pub fn render_world(
     timings.walk_us = walk_start.elapsed().as_micros() as u64;
     timings.visit_count = visits.len();
 
-    // Count triangles: for each visit, sum the index counts of its
-    // baked sub-meshes. This is approximate (counts all visits, not
-    // just those surviving frustum culling) but cheap.
+    // Pre-bake any new NodeIds before the reconcile loop.
     {
-        let mut tri_count = 0usize;
+        let bake_start = std::time::Instant::now();
         for v in visits.iter() {
-            if let Some(baked) = render_state.meshes.get(&v.node_id) {
-                for sub in baked {
-                    if let Some(mesh) = meshes.get(&sub.mesh) {
-                        tri_count += mesh.count_vertices() / 3;
-                    }
-                }
+            if !render_state.meshes.contains_key(&v.node_id) {
+                get_or_bake_mesh(&mut render_state, &world, v.node_id, v.path, &mut meshes);
             }
         }
-        timings.triangles = tri_count;
+        timings.bake_us = bake_start.elapsed().as_micros() as u64;
     }
 
     // Reconcile: what's alive now, what changed, what's gone.
@@ -531,10 +559,6 @@ pub fn render_world(
             Some((entity, existing_id, last_origin))
                 if existing_id == new_node_id =>
             {
-                // Reuse. Only touch the Transform when the origin
-                // actually changed (anchor shifted). Skipping this
-                // avoids ~2k Bevy command dispatches per frame in
-                // the common stationary-camera case.
                 if last_origin != visit.origin {
                     if let Ok(mut ec) = commands.get_entity(entity) {
                         ec.insert(
@@ -551,15 +575,11 @@ pub fn render_world(
                         ec.despawn();
                     }
                 }
-                // Spawn a new root entity for this path, parent one
-                // child per sub-mesh.
-                let baked = get_or_bake_mesh(
-                    &mut render_state,
-                    &world,
-                    new_node_id,
-                    &mut meshes,
-                )
-                .to_vec();
+
+                let baked = render_state.meshes
+                    .get(&new_node_id)
+                    .cloned()
+                    .unwrap_or_default();
 
                 let parent = commands
                     .spawn((
@@ -589,8 +609,6 @@ pub fn render_world(
         }
     }
 
-    // Everything left in the old map was NOT visited this frame →
-    // despawn.
     for (_, (entity, _, _)) in render_state.entities.drain() {
         if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
@@ -599,6 +617,8 @@ pub fn render_world(
     render_state.entities = alive;
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
+
+    timings.render_total_us = render_total_start.elapsed().as_micros() as u64;
 
     render_state.walk_stack = walk_stack;
     render_state.visits = visits;
