@@ -119,11 +119,45 @@ fn make_pos(d: i32, u: i32, v: i32, axes: (usize, usize, usize)) -> [i32; 3] {
 }
 
 /// Bake any cubic voxel volume of `size^3` cells into per-voxel-type
-/// sub-meshes with greedy face merging. Adjacent coplanar faces of
-/// the same material are merged into larger quads when their AO is
-/// uniform (all 4 vertices equal), preserving pixel-identical output.
-/// Faces with non-uniform AO (near placed blocks) stay as individual
-/// quads with the original AO diagonal flip logic.
+/// sub-meshes with greedy face merging.
+///
+/// ## Greedy meshing
+///
+/// The naive approach emits one quad per exposed voxel face. For a
+/// flat 125×125 grass surface, that's 15,625 quads — most of which
+/// are coplanar, same-material, and visually identical. At low zoom
+/// layers with ~1,100 chunks in the cull sphere, this produces ~88M
+/// triangles for a scene that looks the same as layer 12's ~80k.
+///
+/// Greedy meshing fixes this by merging adjacent coplanar faces into
+/// larger rectangles. The algorithm sweeps each 2D slice of the
+/// volume (one per face direction per depth), finds maximal
+/// rectangles of mergeable faces, and emits one quad per rectangle.
+/// A flat grass surface collapses to ~1 quad. Total triangles drop
+/// from 88M to ~40k.
+///
+/// ## Merge safety
+///
+/// Two faces merge only when the result is **pixel-identical** to
+/// separate quads. The merge condition:
+///
+/// - Same voxel type (material)
+/// - **Uniform AO**: all 4 vertex AO values are the same number
+///   (e.g., `[3,3,3,3]`)
+///
+/// The uniform-AO rule prevents interpolation artifacts. When a
+/// merged quad's interior vertices are removed, the GPU interpolates
+/// AO linearly between the corners. This is only correct when AO is
+/// constant across the merged region. Faces near placed blocks
+/// typically have non-uniform AO (e.g., `[3,3,2,3]`) and stay as
+/// individual quads with the original AO diagonal flip logic.
+///
+/// ## Future considerations
+///
+/// If per-voxel visual variation is added (textures, tints), the
+/// merge eligibility check should be extended to exclude faces with
+/// varying attributes. Non-eligible faces fall through to the
+/// individual quad path automatically.
 pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
     size: i32,
     get: F,
