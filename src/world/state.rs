@@ -14,16 +14,12 @@
 
 use bevy::prelude::*;
 
-use super::generator::{
-    generate_air_leaf, generate_grass_leaf,
-    generate_sphere_leaf, aabb_inside_sphere, aabb_outside_sphere, SphereParams,
-};
+use super::generator::{generate_air_leaf, generate_grass_leaf};
 use super::tree::{
-    downsample_from_library, filled_voxel_grid, slot_coords, uniform_children,
-    voxel_from_block, Children, NodeId, NodeLibrary, BRANCH_FACTOR,
-    CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
+    downsample_from_library, slot_coords, uniform_children, Children, NodeId,
+    NodeLibrary, BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER,
+    NODE_VOXELS_PER_AXIS,
 };
-use crate::block::BlockType;
 
 /// Root-local y-offset of the ground surface, in leaf voxels. Every
 /// leaf whose y-range in root-local coords is ≤ this value is solid
@@ -77,22 +73,6 @@ pub const GROUND_TRANSITION_DEPTH: usize = {
         d += 1;
     }
 };
-
-// ---------------------------------------------------------- sphere parameters
-
-/// Radius of the test sphere in leaf voxels.
-pub const SPHERE_RADIUS: i64 = 500;
-
-/// Depth from the sphere surface at which all voxels are Stone.
-/// Used by the sphere builder to shortcut deep-interior subtrees
-/// to a uniform "all Stone" tower.
-const STONE_DEPTH: i64 = 10;
-
-/// Leaf-coordinate centre of the sphere (world centre on all axes).
-pub fn sphere_center() -> [i64; 3] {
-    let half = world_extent_voxels() / 2;
-    [half, half, half]
-}
 
 /// Full world extent along one axis, in leaf voxels.
 /// `25 × 5^MAX_LAYER ≈ 6.1 billion` — overflows `i32`, lives in `i64`.
@@ -159,105 +139,6 @@ impl WorldState {
         let old_root = self.root;
         self.root = new_root_id;
         self.library.ref_dec(old_root);
-    }
-
-    /// Build a sphere world from the default sphere parameters.
-    pub fn new_sphere() -> Self {
-        let mut state = Self {
-            root: EMPTY_NODE,
-            library: NodeLibrary::default(),
-        };
-        let params = SphereParams {
-            center: sphere_center(),
-            radius: SPHERE_RADIUS,
-        };
-        state.build_sphere_root(&params);
-        state
-    }
-
-    /// Build the sphere tree. Pre-builds uniform "all air" and "all
-    /// stone" subtree towers so the recursive builder can skip
-    /// entirely empty (exterior) or deep-interior regions without
-    /// recursing to leaves.
-    pub fn build_sphere_root(&mut self, params: &SphereParams) -> NodeId {
-        let air_leaf = self.library.insert_leaf(generate_air_leaf());
-        let stone_leaf = self.library.insert_leaf(
-            filled_voxel_grid(voxel_from_block(Some(BlockType::Stone))),
-        );
-
-        let layer_count = MAX_LAYER as usize + 1;
-        let mut air_tower = vec![EMPTY_NODE; layer_count];
-        let mut solid_tower = vec![EMPTY_NODE; layer_count];
-        air_tower[MAX_LAYER as usize] = air_leaf;
-        solid_tower[MAX_LAYER as usize] = stone_leaf;
-
-        for k in (0..MAX_LAYER as usize).rev() {
-            let air_ch = uniform_children(air_tower[k + 1]);
-            let air_vox = downsample_from_library(&self.library, air_ch.as_ref());
-            air_tower[k] = self.library.insert_non_leaf(air_vox, air_ch);
-
-            let solid_ch = uniform_children(solid_tower[k + 1]);
-            let solid_vox = downsample_from_library(&self.library, solid_ch.as_ref());
-            solid_tower[k] = self.library.insert_non_leaf(solid_vox, solid_ch);
-        }
-
-        let extent = world_extent_voxels();
-        let root_id = self.build_sphere_node(
-            [0, 0, 0], extent, 0, params, &air_tower, &solid_tower,
-        );
-        self.swap_root(root_id);
-        root_id
-    }
-
-    /// Recursive sphere builder. At each node, checks whether the
-    /// AABB is entirely outside (→ air tower), entirely deep inside
-    /// (→ solid tower), or intersects the surface (→ recurse / eval).
-    fn build_sphere_node(
-        &mut self,
-        origin: [i64; 3],
-        extent: i64,
-        layer: u8,
-        params: &SphereParams,
-        air_tower: &[NodeId],
-        solid_tower: &[NodeId],
-    ) -> NodeId {
-        // Entirely outside the sphere → uniform air subtree.
-        if aabb_outside_sphere(origin, extent, params) {
-            return air_tower[layer as usize];
-        }
-        // Deep inside the sphere (all points > STONE_DEPTH from
-        // surface) → uniform stone subtree.
-        if aabb_inside_sphere(
-            origin, extent, params.center, params.radius - STONE_DEPTH,
-        ) {
-            return solid_tower[layer as usize];
-        }
-        // Leaf layer: evaluate density per voxel.
-        if layer == MAX_LAYER {
-            let grid = generate_sphere_leaf(origin, params);
-            return self.library.insert_leaf(grid);
-        }
-        // Non-leaf: recurse into 125 children.
-        let child_extent = extent / BRANCH_FACTOR as i64;
-        let mut child_ids = Vec::with_capacity(CHILDREN_PER_NODE);
-        for slot in 0..CHILDREN_PER_NODE {
-            let (sx, sy, sz) = slot_coords(slot);
-            let child_origin = [
-                origin[0] + sx as i64 * child_extent,
-                origin[1] + sy as i64 * child_extent,
-                origin[2] + sz as i64 * child_extent,
-            ];
-            child_ids.push(self.build_sphere_node(
-                child_origin, child_extent, layer + 1, params,
-                air_tower, solid_tower,
-            ));
-        }
-        let children_arr: Children = child_ids
-            .into_boxed_slice()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("size constant"));
-        let voxels = downsample_from_library(&self.library, children_arr.as_ref());
-        self.library.insert_non_leaf(voxels, children_arr)
     }
 
     /// (Re)build the root. Safe to call on an already-built world —
@@ -449,61 +330,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    // --------------------------------------------------------- sphere tests
-
-    #[test]
-    fn sphere_builds_root() {
-        let world = WorldState::new_sphere();
-        assert_ne!(world.root, EMPTY_NODE);
-        assert!(world.library.get(world.root).is_some());
-    }
-
-    #[test]
-    fn sphere_center_is_solid() {
-        let world = WorldState::new_sphere();
-        let center = sphere_center();
-        let pos = crate::world::view::position_from_leaf_coord(center)
-            .expect("center inside world");
-        assert_ne!(
-            crate::world::edit::get_voxel(&world, &pos),
-            EMPTY_VOXEL,
-            "sphere center should be solid"
-        );
-    }
-
-    #[test]
-    fn sphere_exterior_is_empty() {
-        let world = WorldState::new_sphere();
-        let center = sphere_center();
-        let coord = [center[0], center[1] + SPHERE_RADIUS + 100, center[2]];
-        let pos = crate::world::view::position_from_leaf_coord(coord)
-            .expect("outside point inside world");
-        assert_eq!(
-            crate::world::edit::get_voxel(&world, &pos),
-            EMPTY_VOXEL,
-            "point outside sphere should be empty"
-        );
-    }
-
-    #[test]
-    fn sphere_library_is_compact() {
-        let world = WorldState::new_sphere();
-        assert!(
-            world.library.len() < 20_000,
-            "library has {} entries — dedup not working?",
-            world.library.len()
-        );
-    }
-
-    #[test]
-    fn sphere_surface_visible_at_root() {
-        let world = WorldState::new_sphere();
-        let root = world.library.get(world.root).expect("root");
-        // The root's downsampled 25³ grid should contain at least
-        // one non-empty voxel (the sphere's presence).
-        let has_solid = root.voxels.iter().any(|&v| v != EMPTY_VOXEL);
-        assert!(has_solid, "root voxel grid is all-empty — sphere not visible");
     }
 }
