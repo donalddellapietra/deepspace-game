@@ -68,6 +68,34 @@ impl WorldState {
         state
     }
 
+    /// Replace the world root with `new_root_id`, transferring the
+    /// external ref in the order that keeps the library consistent
+    /// even when the new root and the old root share descendants.
+    ///
+    /// The order matters: if the new root transiently held no external
+    /// refs and we dec'd the old root first, a cascading eviction
+    /// could free a node the new root was about to reference. Always
+    /// `ref_inc` the new root first, then `ref_dec` the old root,
+    /// then commit the pointer swap. Captures `self.root` before
+    /// `ref_dec` so the pointer swap can actually occur before the
+    /// decrement fires — this is functionally equivalent to the order
+    /// described above (the value decremented is the old root either
+    /// way) but keeps `self.root` pointing at a live node at every
+    /// observable moment.
+    ///
+    /// No-op when `new_root_id == self.root` so callers can be lazy
+    /// about checking. This also keeps round-trip edits (edit then
+    /// undo) from uselessly ref-cycling the same id.
+    pub fn swap_root(&mut self, new_root_id: NodeId) {
+        if new_root_id == self.root {
+            return;
+        }
+        self.library.ref_inc(new_root_id);
+        let old_root = self.root;
+        self.root = new_root_id;
+        self.library.ref_dec(old_root);
+    }
+
     /// (Re)build the root. Safe to call on an already-built world —
     /// dedup makes every insertion a library hit, so the world id
     /// is preserved.
@@ -122,15 +150,14 @@ impl WorldState {
             cur_air = new_air;
         }
 
-        // `cur_bottom` is now the root. Transfer the external ref
-        // from the previous root. Order matters: ref_inc new first,
-        // then ref_dec old, so that a round-trip rebuild with the
-        // same content doesn't evict-and-remint the root.
-        self.library.ref_inc(cur_bottom);
-        if self.root != EMPTY_NODE {
-            self.library.ref_dec(self.root);
-        }
-        self.root = cur_bottom;
+        // `cur_bottom` is now the root. Hand off the external ref via
+        // `swap_root`, which does the ref_inc-then-ref_dec dance in
+        // the order that keeps the library consistent. On an idempotent
+        // rebuild (dedup makes `cur_bottom` equal to the existing
+        // root), `swap_root`'s no-op guard short-circuits and avoids
+        // a pointless ref-cycle. On the very first build, `self.root`
+        // is `EMPTY_NODE`, which `ref_dec` treats as a no-op.
+        self.swap_root(cur_bottom);
         self.root
     }
 }

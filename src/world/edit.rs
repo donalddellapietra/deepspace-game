@@ -58,98 +58,40 @@ pub fn subtree_path_for_layer_pos(lp: &LayerPos) -> Vec<u8> {
     path
 }
 
-/// Edit a single leaf voxel to `voxel`. Propagates up the tree and
-/// atomically replaces `world.root`.
-pub fn edit_leaf(world: &mut WorldState, position: &Position, voxel: Voxel) {
-    // Walk down from the root, collecting one (ancestor_id, child_slot)
-    // pair per layer. After the loop, `current_id` points at the leaf.
-    let mut descent: Vec<(NodeId, usize)> = Vec::with_capacity(NODE_PATH_LEN);
+/// Descend `path` (length `0..=NODE_PATH_LEN`) from `world.root` and
+/// return the id of the node living at that path. A zero-length path
+/// returns the root. Panics if the descent hits a missing node or a
+/// premature leaf.
+fn descend_to(world: &WorldState, path: &[u8]) -> NodeId {
     let mut current_id = world.root;
-    for layer_idx in 0..NODE_PATH_LEN {
-        let slot = position.path[layer_idx] as usize;
-        descent.push((current_id, slot));
+    for &slot in path {
         let node = world
             .library
             .get(current_id)
-            .expect("edit_leaf: descent hit a missing node");
+            .expect("descend_to: descent hit a missing node");
         let children = node
             .children
             .as_ref()
-            .expect("edit_leaf: descent hit a leaf above MAX_LAYER");
-        current_id = children[slot];
+            .expect("descend_to: non-leaf expected on descent");
+        current_id = children[slot as usize];
     }
-
-    // Build the new leaf's voxel grid.
-    let new_leaf_voxels: VoxelGrid = {
-        let leaf = world
-            .library
-            .get(current_id)
-            .expect("edit_leaf: missing leaf");
-        let mut v = leaf.voxels.clone();
-        v[voxel_idx(
-            position.voxel[0] as usize,
-            position.voxel[1] as usize,
-            position.voxel[2] as usize,
-        )] = voxel;
-        v
-    };
-    let mut new_child_id = world.library.insert_leaf(new_leaf_voxels);
-
-    // Walk back up, rebuilding each ancestor with the new child id.
-    // Only one slot changed per layer, so we incrementally patch that
-    // slot's 5³ parent region instead of re-downsampling all 125
-    // children from scratch.
-    for &(parent_id, slot) in descent.iter().rev() {
-        let (new_voxels, new_children) = {
-            let parent = world
-                .library
-                .get(parent_id)
-                .expect("edit_leaf: parent missing");
-            let old_children = parent
-                .children
-                .as_ref()
-                .expect("edit_leaf: non-leaf expected on walk up");
-            let mut new_children = old_children.clone();
-            new_children[slot] = new_child_id;
-            let new_child_voxels = &world
-                .library
-                .get(new_child_id)
-                .expect("edit_leaf: new child missing")
-                .voxels;
-            let new_voxels = downsample_updated_slot(
-                &parent.voxels,
-                new_child_voxels,
-                slot,
-            );
-            (new_voxels, new_children)
-        };
-        new_child_id = world.library.insert_non_leaf(new_voxels, new_children);
-    }
-
-    // Transfer the external ref from old root to new root. Order
-    // matters: ref_inc first so that if old == new (round-trip edit)
-    // the refcount never hits zero.
-    world.library.ref_inc(new_child_id);
-    let old_root = world.root;
-    world.root = new_child_id;
-    world.library.ref_dec(old_root);
+    current_id
 }
 
-/// Bulk edit: replace the node at `path_prefix` (of length
-/// `target_layer`, 0..=MAX_LAYER) with a solid chain of `voxel`.
+/// Build (or recycle via dedup) a "solid `voxel`" subtree rooted at
+/// `target_layer` and return its `NodeId`. `target_layer == MAX_LAYER`
+/// returns just the solid leaf; each layer above adds one non-leaf
+/// whose 125 children are all the layer-below id.
 ///
-/// - `path_prefix.len() == MAX_LAYER` → replace the leaf with a
-///   filled leaf.
-/// - `path_prefix.len() < MAX_LAYER` → build a solid-voxel subtree
-///   from the leaf up to `target_layer` and splice it in.
-/// - `path_prefix.len() == 0` → replace the entire world root.
-pub fn edit_at_layer(world: &mut WorldState, path_prefix: &[u8], voxel: Voxel) {
-    let target_layer = path_prefix.len();
+/// Thanks to content dedup, repeated calls with the same `voxel` and
+/// `target_layer` return the same id without allocating new library
+/// entries — this is how layer-K edits stay cheap.
+fn build_solid_chain(
+    world: &mut WorldState,
+    voxel: Voxel,
+    target_layer: usize,
+) -> NodeId {
     assert!(target_layer <= MAX_LAYER as usize);
-
-    // Build solid-voxel chain. chain_id starts as a leaf and is
-    // wrapped in a non-leaf once per layer up until it reaches
-    // target_layer.
     let leaf_voxels = filled_voxel_grid(voxel);
     let mut chain_id = world.library.insert_leaf(leaf_voxels);
     let mut chain_layer = MAX_LAYER as usize;
@@ -158,7 +100,7 @@ pub fn edit_at_layer(world: &mut WorldState, path_prefix: &[u8], voxel: Voxel) {
             let node = world
                 .library
                 .get(chain_id)
-                .expect("edit_at_layer: chain node missing");
+                .expect("build_solid_chain: chain node missing");
             let refs: [&VoxelGrid; CHILDREN_PER_NODE] =
                 std::array::from_fn(|_| &node.voxels);
             downsample(refs)
@@ -167,68 +109,20 @@ pub fn edit_at_layer(world: &mut WorldState, path_prefix: &[u8], voxel: Voxel) {
         chain_id = world.library.insert_non_leaf(voxels, children);
         chain_layer -= 1;
     }
-    // chain_id is now at exactly `target_layer`.
-
-    // Walk down path_prefix collecting ancestors at depths 0..target_layer.
-    let mut descent: Vec<(NodeId, usize)> = Vec::with_capacity(target_layer);
-    let mut current_id = world.root;
-    for layer_idx in 0..target_layer {
-        let slot = path_prefix[layer_idx] as usize;
-        descent.push((current_id, slot));
-        let node = world
-            .library
-            .get(current_id)
-            .expect("edit_at_layer: missing ancestor");
-        let children = node
-            .children
-            .as_ref()
-            .expect("edit_at_layer: non-leaf expected on descent");
-        current_id = children[slot];
-    }
-
-    // Walk back up, splicing chain_id at the target_layer position.
-    // Incremental downsample: one slot changes per layer.
-    let mut new_child_id = chain_id;
-    for &(parent_id, slot) in descent.iter().rev() {
-        let (new_voxels, new_children) = {
-            let parent = world
-                .library
-                .get(parent_id)
-                .expect("edit_at_layer: parent missing");
-            let old_children = parent
-                .children
-                .as_ref()
-                .expect("edit_at_layer: non-leaf expected on walk up");
-            let mut new_children = old_children.clone();
-            new_children[slot] = new_child_id;
-            let new_child_voxels = &world
-                .library
-                .get(new_child_id)
-                .expect("edit_at_layer: new child missing")
-                .voxels;
-            let new_voxels = downsample_updated_slot(
-                &parent.voxels,
-                new_child_voxels,
-                slot,
-            );
-            (new_voxels, new_children)
-        };
-        new_child_id = world.library.insert_non_leaf(new_voxels, new_children);
-    }
-
-    world.library.ref_inc(new_child_id);
-    let old_root = world.root;
-    world.root = new_child_id;
-    world.library.ref_dec(old_root);
+    chain_id
 }
 
 /// Apply an edit named by a [`LayerPos`]. Dispatches on the view
-/// layer to one of three shapes:
+/// layer to one of three shapes, each of which computes a
+/// `(path, new_node_id)` pair and then routes through
+/// [`install_subtree`]:
 ///
-/// - **`lp.layer == MAX_LAYER`** (leaf view): single-cell edit on the
-///   clicked leaf voxel. Equivalent to calling [`edit_leaf`] directly.
+/// - **`lp.layer == MAX_LAYER`** (leaf view): single-cell edit. Walk
+///   down to the target leaf, clone its voxel grid, patch the one
+///   cell, intern the new leaf, and install it at the full leaf path.
 /// - **`lp.layer == MAX_LAYER - 1`**: fills the `5³` region inside the
 ///   leaf one level below the view node that this cell summarises.
+///   Walk down to that leaf, clone, fill, intern, install.
 /// - **`lp.layer <= MAX_LAYER - 2`**: replaces the whole layer-`(L + 2)`
 ///   subtree beneath the clicked cell with a canonical "solid X"
 ///   chain. The click's `(cx, cy, cz)` decomposes into two slot
@@ -249,26 +143,27 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
     let b = BRANCH_FACTOR as u8;
 
     if lp.layer == MAX_LAYER {
-        // Leaf-view: single-voxel edit. Synthesise a `Position`
-        // pointing at the target cell and fall through.
-        let lp_path = lp.path();
-        assert!(lp_path.len() == NODE_PATH_LEN);
-        let mut path = [0u8; NODE_PATH_LEN];
-        path.copy_from_slice(lp_path);
-        let position = Position {
-            path,
-            voxel: [cx, cy, cz],
-            offset: [0.5, 0.5, 0.5],
-        };
-        edit_leaf(world, &position, voxel);
+        // Leaf-view: single-voxel edit. Read the target leaf, clone
+        // its voxel grid, patch one cell, intern, install.
+        let leaf_path = lp.path();
+        debug_assert_eq!(leaf_path.len(), NODE_PATH_LEN);
+        let leaf_id = descend_to(world, leaf_path);
+        let mut new_voxels: VoxelGrid = world
+            .library
+            .get(leaf_id)
+            .expect("edit_at_layer_pos: leaf missing")
+            .voxels
+            .clone();
+        new_voxels[voxel_idx(cx as usize, cy as usize, cz as usize)] = voxel;
+        let new_leaf_id = world.library.insert_leaf(new_voxels);
+        install_subtree(world, leaf_path, new_leaf_id);
         return;
     }
 
     if lp.layer == MAX_LAYER - 1 {
         // One layer above leaves: the clicked cell summarises a 5³
         // region of one specific leaf below us. Walk down into that
-        // leaf, clone its voxels, fill the 5³ region, and call
-        // `install_subtree` via `edit_leaf`'s walk.
+        // leaf, clone its voxels, fill the 5³ region, intern, install.
         let child_slot = slot_index(
             (cx / b) as usize,
             (cy / b) as usize,
@@ -278,19 +173,7 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
         leaf_path_vec.push(child_slot as u8);
         debug_assert_eq!(leaf_path_vec.len(), NODE_PATH_LEN);
 
-        // Locate the leaf so we can read its current voxel grid.
-        let mut leaf_id = world.root;
-        for &slot in &leaf_path_vec {
-            let node = world
-                .library
-                .get(leaf_id)
-                .expect("edit_at_layer_pos: descent hit missing node");
-            let children = node
-                .children
-                .as_ref()
-                .expect("edit_at_layer_pos: non-leaf expected on descent");
-            leaf_id = children[slot as usize];
-        }
+        let leaf_id = descend_to(world, &leaf_path_vec);
         let mut new_voxels: VoxelGrid = world
             .library
             .get(leaf_id)
@@ -330,26 +213,7 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
     sub_path.push(slot_b as u8);
     let target_layer = (lp.layer + 2) as usize;
 
-    // Build (or recycle via dedup) a solid-voxel chain rooted at
-    // `target_layer`. Same construction as `edit_at_layer` below.
-    let leaf_voxels = filled_voxel_grid(voxel);
-    let mut chain_id = world.library.insert_leaf(leaf_voxels);
-    let mut chain_layer = MAX_LAYER as usize;
-    while chain_layer > target_layer {
-        let voxels = {
-            let node = world
-                .library
-                .get(chain_id)
-                .expect("edit_at_layer_pos: chain node missing");
-            let refs: [&VoxelGrid; CHILDREN_PER_NODE] =
-                std::array::from_fn(|_| &node.voxels);
-            downsample(refs)
-        };
-        let children = uniform_children(chain_id);
-        chain_id = world.library.insert_non_leaf(voxels, children);
-        chain_layer -= 1;
-    }
-
+    let chain_id = build_solid_chain(world, voxel, target_layer);
     install_subtree(world, &sub_path, chain_id);
 }
 
@@ -405,10 +269,7 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[u8], new_node_i
         child_id = world.library.insert_non_leaf(new_voxels, new_children);
     }
 
-    world.library.ref_inc(child_id);
-    let old_root = world.root;
-    world.root = child_id;
-    world.library.ref_dec(old_root);
+    world.swap_root(child_id);
 }
 
 /// Read a leaf voxel by walking down the tree. Used by tests and
@@ -452,13 +313,21 @@ mod tests {
         voxel_from_block(Some(BlockType::Stone))
     }
 
+    /// Helper: project a leaf `Position` into a `LayerPos` at
+    /// `MAX_LAYER` for the leaf-case tests that used to call
+    /// `edit_leaf` directly.
+    fn edit_single_leaf_voxel(world: &mut WorldState, pos: &Position, voxel: Voxel) {
+        let lp = LayerPos::from_leaf(pos, MAX_LAYER);
+        edit_at_layer_pos(world, &lp, voxel);
+    }
+
     #[test]
     fn edit_leaf_changes_root_id() {
         let mut world = WorldState::new_grassland();
         let initial_root = world.root;
         let mut pos = Position::origin();
         pos.voxel = [12, 5, 3];
-        edit_leaf(&mut world, &pos, stone());
+        edit_single_leaf_voxel(&mut world, &pos, stone());
         assert_ne!(world.root, initial_root);
     }
 
@@ -468,7 +337,7 @@ mod tests {
         let mut pos = Position::origin();
         pos.voxel = [12, 5, 3];
         assert_eq!(get_voxel(&world, &pos), grass());
-        edit_leaf(&mut world, &pos, stone());
+        edit_single_leaf_voxel(&mut world, &pos, stone());
         assert_eq!(get_voxel(&world, &pos), stone());
     }
 
@@ -477,7 +346,7 @@ mod tests {
         let mut world = WorldState::new_grassland();
         let mut pos = Position::origin();
         pos.voxel = [12, 5, 3];
-        edit_leaf(&mut world, &pos, stone());
+        edit_single_leaf_voxel(&mut world, &pos, stone());
 
         // Some other voxel in the same leaf should still be grass.
         let mut other = Position::origin();
@@ -492,8 +361,8 @@ mod tests {
 
         let mut pos = Position::origin();
         pos.voxel = [12, 5, 3];
-        edit_leaf(&mut world, &pos, stone());
-        edit_leaf(&mut world, &pos, grass());
+        edit_single_leaf_voxel(&mut world, &pos, stone());
+        edit_single_leaf_voxel(&mut world, &pos, grass());
 
         // After a round trip, every sampled voxel is grass again.
         let mut p = Position::origin();
@@ -509,12 +378,16 @@ mod tests {
     }
 
     #[test]
-    fn edit_at_layer_fills_whole_leaf() {
+    fn install_subtree_full_path_replaces_one_leaf() {
+        // `install_subtree` with a full-length path splices a new leaf
+        // into exactly one leaf slot without disturbing its siblings.
+        // Covers the same scenario as the old `edit_at_layer` test for
+        // a path prefix of length `MAX_LAYER` — the whole leaf gets
+        // replaced with solid stone.
         let mut world = WorldState::new_grassland();
-        // path_prefix = the full path (MAX_LAYER entries) replaces
-        // one leaf entirely with stone.
-        let path_prefix = [0u8; MAX_LAYER as usize];
-        edit_at_layer(&mut world, &path_prefix, stone());
+        let full_path = [0u8; MAX_LAYER as usize];
+        let solid_stone_leaf = build_solid_chain(&mut world, stone(), MAX_LAYER as usize);
+        install_subtree(&mut world, &full_path, solid_stone_leaf);
 
         // Every voxel inside the target leaf is stone.
         let mut pos = Position::origin();
@@ -531,9 +404,11 @@ mod tests {
     #[test]
     fn edit_at_layer_higher_builds_shallow_chain() {
         let mut world = WorldState::new_grassland();
-        // Target layer 6 (path_prefix length 6) — a small subtree.
-        let path_prefix = [0u8; 6];
-        edit_at_layer(&mut world, &path_prefix, stone());
+        // Layer-4 view cell (0, 0, 0) decomposes to slot_a = slot_b = 0,
+        // so the target subtree is at path [0; 6] — layer 6, matching
+        // the old `edit_at_layer(&[0; 6], ...)` test.
+        let lp = LayerPos::from_parts(&vec![0u8; 4], [0, 0, 0], 4);
+        edit_at_layer_pos(&mut world, &lp, stone());
 
         // Any leaf inside that subtree should now be stone.
         let mut pos = Position::origin();
@@ -542,9 +417,16 @@ mod tests {
     }
 
     #[test]
-    fn edit_at_layer_zero_replaces_entire_world() {
+    fn install_subtree_at_root_replaces_entire_world() {
+        // `install_subtree` is public (save-mode uses it) and callable
+        // with an empty ancestor path, which replaces the whole world
+        // root. `edit_at_layer_pos` can't reach target layer 0 itself
+        // — its minimum is `lp.layer + 2 == 2` — so this exercises
+        // `install_subtree`'s empty-descent path directly.
         let mut world = WorldState::new_grassland();
-        edit_at_layer(&mut world, &[], stone());
+        let root_chain = build_solid_chain(&mut world, stone(), 0);
+        install_subtree(&mut world, &[], root_chain);
+
         // Every leaf everywhere is now stone.
         let mut pos = Position::origin();
         pos.voxel = [0, 0, 0];
@@ -559,7 +441,7 @@ mod tests {
         let mut world = WorldState::new_grassland();
         let mut pos = Position::origin();
         pos.voxel = [3, 4, 5];
-        edit_leaf(&mut world, &pos, EMPTY_VOXEL);
+        edit_single_leaf_voxel(&mut world, &pos, EMPTY_VOXEL);
         assert_eq!(get_voxel(&world, &pos), EMPTY_VOXEL);
     }
 
@@ -568,11 +450,11 @@ mod tests {
         let mut world = WorldState::new_grassland();
         let mut pos = Position::origin();
         pos.voxel = [10, 10, 10];
-        edit_leaf(&mut world, &pos, stone());
+        edit_single_leaf_voxel(&mut world, &pos, stone());
         let mid_root = world.root;
         let mid_len = world.library.len();
 
-        edit_leaf(&mut world, &pos, stone());
+        edit_single_leaf_voxel(&mut world, &pos, stone());
         assert_eq!(world.root, mid_root);
         assert_eq!(world.library.len(), mid_len);
     }
