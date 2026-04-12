@@ -582,11 +582,15 @@ def main():
 
         pivot = compute_pivot(pvox, grid_data, shape, part_name)
 
-        # Rest offset relative to model origin (feet-center)
+        # Rest offset: the pivot's position in NPC space.
+        # The Rust renderer places the part entity at rest_offset,
+        # then offsets the mesh by -pivot. So the mesh corner ends
+        # up at (rest_offset - pivot) = (min_corner - origin), which
+        # is correct only when rest_offset = min_corner - origin + pivot.
         rest_offset = [
-            grid_data["min"][0] - origin_x,
-            grid_data["min"][1] - origin_y,
-            grid_data["min"][2] - origin_z,
+            grid_data["min"][0] - origin_x + pivot[0],
+            grid_data["min"][1] - origin_y + pivot[1],
+            grid_data["min"][2] - origin_z + pivot[2],
         ]
 
         voxel_bytes = bytes(grid_data["voxels"])
