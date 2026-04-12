@@ -46,11 +46,6 @@ const FACES: [(IVec3, [Vec3; 4], Vec3); 6] = [
 const AO_CURVE: [f32; 4] = [0.6, 0.75, 0.9, 1.0];
 
 /// Compute per-vertex ambient occlusion for a quad face.
-///
-/// For each of the 4 vertices on the face, we check the 3 neighboring voxels
-/// diagonal to that corner (on the outside of the face). The AO level is:
-///   - If both side neighbors are solid: ao = 0 (darkest)
-///   - Otherwise: ao = 3 - (side1 + side2 + corner)
 fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
     bx: i32,
     by: i32,
@@ -63,16 +58,13 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
     let mut ao = [3u8; 4];
 
     for (i, vert) in quad.iter().enumerate() {
-        // For each vertex, determine the two tangent-axis directions.
-        // On the face plane (excluding the normal axis), each vertex coordinate
-        // is either 0 or 1. We map 0 -> -1, 1 -> +1 to get the side direction.
         let mut sides = [IVec3::ZERO; 2];
         let mut idx = 0;
         for axis in 0..3 {
             if normal[axis] != 0 {
                 continue;
             }
-            let v = vert[axis] as i32; // 0 or 1
+            let v = vert[axis] as i32;
             let dir = if v == 0 { -1 } else { 1 };
             sides[idx][axis] = dir;
             idx += 1;
@@ -89,7 +81,7 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
             (sample_base + sides[1]).z,
         ) as u8;
         let c = if s1 == 1 && s2 == 1 {
-            1 // Both sides solid → corner is fully occluded regardless
+            1
         } else {
             is_solid(
                 (sample_base + sides[0] + sides[1]).x,
@@ -104,10 +96,34 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
     ao
 }
 
-/// Bake any cubic voxel volume of `size^3` cells into per-voxel-type sub-meshes
-/// with face culling. The data source is given as a closure so the caller can
-/// feed it any voxel grid. Returns `Option<u8>` where `None` = empty, `Some(v)`
-/// = a non-zero voxel index into the palette.
+/// For each face direction, the axes used by greedy meshing:
+/// (normal_axis, u_axis, v_axis). The grid sweeps slices along the
+/// normal axis and merges rectangles on the (u, v) plane.
+const FACE_AXES: [(usize, usize, usize); 6] = [
+    (0, 2, 1), // +X: sweep x, grid (z, y)
+    (0, 2, 1), // -X: sweep x, grid (z, y)
+    (1, 0, 2), // +Y: sweep y, grid (x, z)
+    (1, 0, 2), // -Y: sweep y, grid (x, z)
+    (2, 0, 1), // +Z: sweep z, grid (x, y)
+    (2, 0, 1), // -Z: sweep z, grid (x, y)
+];
+
+/// Build a world-space position from (d, u, v) given axis mappings.
+#[inline]
+fn make_pos(d: i32, u: i32, v: i32, axes: (usize, usize, usize)) -> [i32; 3] {
+    let mut pos = [0i32; 3];
+    pos[axes.0] = d;
+    pos[axes.1] = u;
+    pos[axes.2] = v;
+    pos
+}
+
+/// Bake any cubic voxel volume of `size^3` cells into per-voxel-type
+/// sub-meshes with greedy face merging. Adjacent coplanar faces of
+/// the same material are merged into larger quads when their AO is
+/// uniform (all 4 vertices equal), preserving pixel-identical output.
+/// Faces with non-uniform AO (near placed blocks) stay as individual
+/// quads with the original AO diagonal flip logic.
 pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
     size: i32,
     get: F,
@@ -116,23 +132,99 @@ pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
     let mut groups: std::collections::HashMap<u8, FaceCollector> =
         std::collections::HashMap::new();
 
-    for y in 0..size {
-        for z in 0..size {
-            for x in 0..size {
-                let Some(voxel) = get(x, y, z) else { continue };
-                let collector = groups.entry(voxel).or_default();
+    let sz = size as usize;
 
-                for &(dir, ref quad, normal) in &FACES {
-                    let nx = x + dir.x;
-                    let ny = y + dir.y;
-                    let nz = z + dir.z;
-                    if get(nx, ny, nz).is_some() { continue; }
+    for (face_idx, &(dir, ref quad, normal)) in FACES.iter().enumerate() {
+        let axes = FACE_AXES[face_idx];
 
-                    let ao = compute_face_ao(x, y, z, dir, quad, &|ax, ay, az| {
-                        get(ax, ay, az).is_some()
-                    });
-                    let offset = Vec3::new(x as f32, y as f32, z as f32);
-                    collector.add_quad(quad, normal, offset, ao);
+        for d in 0..size {
+            // Build 2D grid of exposed faces in this slice.
+            // Each cell is either:
+            //   Some((voxel, ao_level)) — uniform AO, eligible for merging
+            //   None — no face, or non-uniform AO (emitted immediately)
+            let mut grid: Vec<Option<(u8, u8)>> = vec![None; sz * sz];
+
+            for v in 0..size {
+                for u in 0..size {
+                    let pos = make_pos(d, u, v, axes);
+                    let Some(voxel) = get(pos[0], pos[1], pos[2]) else {
+                        continue;
+                    };
+
+                    let npos = [pos[0] + dir.x, pos[1] + dir.y, pos[2] + dir.z];
+                    if get(npos[0], npos[1], npos[2]).is_some() {
+                        continue;
+                    }
+
+                    let ao = compute_face_ao(
+                        pos[0], pos[1], pos[2], dir, quad,
+                        &|ax, ay, az| get(ax, ay, az).is_some(),
+                    );
+
+                    if ao[0] == ao[1] && ao[1] == ao[2] && ao[2] == ao[3] {
+                        // Uniform AO → eligible for greedy merge.
+                        grid[(v as usize) * sz + (u as usize)] =
+                            Some((voxel, ao[0]));
+                    } else {
+                        // Non-uniform AO → emit as individual quad now.
+                        let offset = Vec3::new(pos[0] as f32, pos[1] as f32, pos[2] as f32);
+                        groups.entry(voxel).or_default().add_quad(
+                            quad, normal, offset, ao,
+                        );
+                    }
+                }
+            }
+
+            // Greedy merge the grid.
+            let mut visited = vec![false; sz * sz];
+
+            for v in 0..size {
+                for u in 0..size {
+                    let idx = (v as usize) * sz + (u as usize);
+                    if visited[idx] {
+                        continue;
+                    }
+                    let Some((voxel, ao_level)) = grid[idx] else {
+                        continue;
+                    };
+
+                    // Extend width (u direction).
+                    let mut w = 1i32;
+                    while u + w < size {
+                        let ni = (v as usize) * sz + ((u + w) as usize);
+                        if visited[ni] || grid[ni] != Some((voxel, ao_level)) {
+                            break;
+                        }
+                        w += 1;
+                    }
+
+                    // Extend height (v direction).
+                    let mut h = 1i32;
+                    'outer: while v + h < size {
+                        for du in 0..w {
+                            let ni = ((v + h) as usize) * sz + ((u + du) as usize);
+                            if visited[ni]
+                                || grid[ni] != Some((voxel, ao_level))
+                            {
+                                break 'outer;
+                            }
+                        }
+                        h += 1;
+                    }
+
+                    // Mark visited.
+                    for dv in 0..h {
+                        for du in 0..w {
+                            visited[((v + dv) as usize) * sz
+                                + ((u + du) as usize)] = true;
+                        }
+                    }
+
+                    // Emit the merged quad.
+                    let collector = groups.entry(voxel).or_default();
+                    emit_merged_quad(
+                        collector, face_idx, d, u, v, w, h, ao_level, axes,
+                    );
                 }
             }
         }
@@ -145,6 +237,52 @@ pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
             voxel,
         })
         .collect()
+}
+
+/// Emit a merged quad covering a (w × h) rectangle on the (u, v) plane
+/// at depth `d` along the normal axis. The AO is uniform across the
+/// quad (all 4 corners have `ao_level`).
+fn emit_merged_quad(
+    collector: &mut FaceCollector,
+    face_idx: usize,
+    d: i32,
+    u: i32,
+    v: i32,
+    w: i32,
+    h: i32,
+    ao_level: u8,
+    axes: (usize, usize, usize),
+) {
+    let (_, ref quad, normal) = FACES[face_idx];
+
+    // The original 1×1 quad vertices are at positions 0 or 1 on each
+    // tangent axis. For the merged quad, scale 0→0 and 1→w (or h)
+    // on the appropriate axis.
+    let base = collector.positions.len() as u32;
+    let brightness = AO_CURVE[ao_level as usize];
+    let normal_arr = normal.to_array();
+
+    for &vert in quad {
+        // Map vertex (0 or 1) on each tangent axis to the merged range.
+        let mut pos = [0.0f32; 3];
+        pos[axes.0] = d as f32 + vert[axes.0]; // normal axis: d or d+1
+        pos[axes.1] = u as f32 + vert[axes.1] * (w as f32); // u axis: u..u+w
+        pos[axes.2] = v as f32 + vert[axes.2] * (h as f32); // v axis: v..v+h
+
+        collector.positions.push(pos);
+        collector.normals.push(normal_arr);
+        collector.colors.push([brightness, brightness, brightness, 1.0]);
+    }
+
+    // Uniform AO → no diagonal flip needed. Standard winding.
+    collector.indices.extend_from_slice(&[
+        base,
+        base + 1,
+        base + 2,
+        base,
+        base + 2,
+        base + 3,
+    ]);
 }
 
 #[derive(Default)]
@@ -167,13 +305,10 @@ impl FaceCollector {
         }
 
         // Flip the quad diagonal when needed to avoid AO interpolation artifacts.
-        // Split across the brighter diagonal so the dark corner doesn't bleed.
         if ao[0] + ao[2] > ao[1] + ao[3] {
-            // Standard winding: triangles (0,1,2) and (0,2,3)
             self.indices
                 .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         } else {
-            // Flipped winding: triangles (1,2,3) and (1,3,0)
             self.indices.extend_from_slice(&[
                 base + 1,
                 base + 2,
