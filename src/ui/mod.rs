@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 use crate::block::BlockType;
+use crate::editor::save_mode::{save_mode_eligible, SaveMode};
 use crate::editor::{Hotbar, HotbarItem};
 use crate::world::CameraZoom;
 
@@ -46,7 +47,7 @@ fn spawn_hotbar(mut commands: Commands) {
                     }
                 });
             p.spawn((
-                Text::new("E: inventory | Q: zoom out | F: zoom in | R: reset | LClick: break | RClick: place | 1-0: hotbar"),
+                Text::new("E: inventory | Q/F: zoom | R: reset | V: save mode | LClick: break/save | RClick: place"),
                 TextFont { font_size: 12.0, ..default() },
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.5)),
             ));
@@ -65,16 +66,21 @@ fn spawn_mode_indicator(mut commands: Commands) {
 
 fn update_hotbar(
     hotbar: Res<Hotbar>,
+    zoom: Res<CameraZoom>,
     mut slots: Query<(&HotbarSlotUi, &mut BorderColor, &mut BackgroundColor)>,
     mut label: Query<&mut Text, With<HotbarLabel>>,
 ) {
+    let layer_slots = hotbar.slots(zoom.layer);
     for (slot, mut border, mut bg) in &mut slots {
         let i = slot.0 as usize;
         let is_active = i == hotbar.active;
 
-        match &hotbar.slots[i] {
+        match &layer_slots[i] {
             HotbarItem::Block(bt) => {
                 bg.0 = bt.color();
+            }
+            HotbarItem::Model(_) => {
+                bg.0 = Color::srgba(0.25, 1.0, 0.85, 0.7);
             }
         }
 
@@ -86,8 +92,9 @@ fn update_hotbar(
     }
 
     if let Ok(mut t) = label.single_mut() {
-        let name = match hotbar.active_item() {
+        let name = match hotbar.active_item(zoom.layer) {
             HotbarItem::Block(bt) => format!("{:?}", bt),
+            HotbarItem::Model(idx) => format!("Mesh #{}", idx),
         };
         *t = Text::new(name);
     }
@@ -95,8 +102,18 @@ fn update_hotbar(
 
 fn update_mode_indicator(
     zoom: Res<CameraZoom>,
+    save_mode: Res<SaveMode>,
     mut q: Query<&mut Text, With<ModeIndicator>>,
 ) {
     let Ok(mut t) = q.single_mut() else { return };
-    *t = Text::new(format!("Layer {}", zoom.layer));
+    let suffix = if save_mode.active {
+        if save_mode_eligible(zoom.layer) {
+            "  [SAVE]"
+        } else {
+            "  [SAVE – press Q to zoom out]"
+        }
+    } else {
+        ""
+    };
+    *t = Text::new(format!("Layer {}{}", zoom.layer, suffix));
 }

@@ -92,19 +92,27 @@ impl Position {
     }
 
     /// Step by a signed integer number of leaf voxels on one axis.
-    /// Returns `false` if the step walked past the root (in which case
-    /// the position is left at a valid state near the boundary).
+    /// Returns `false` if the step walked past the root. On failure
+    /// the position is restored to its pre-call state — an earlier
+    /// version left a partially-walked `path` when a multi-leaf
+    /// crossing failed mid-loop.
     pub fn step_voxels(&mut self, axis: usize, delta: i32) -> bool {
         debug_assert!(axis < 3);
+        let saved_path = self.path;
+        let saved_voxel = self.voxel[axis];
         let mut new_v = self.voxel[axis] as i32 + delta;
         while new_v >= NODE_VOXELS_PER_AXIS as i32 {
             if !self.step_neighbor_leaf(axis, true) {
+                self.path = saved_path;
+                self.voxel[axis] = saved_voxel;
                 return false;
             }
             new_v -= NODE_VOXELS_PER_AXIS as i32;
         }
         while new_v < 0 {
             if !self.step_neighbor_leaf(axis, false) {
+                self.path = saved_path;
+                self.voxel[axis] = saved_voxel;
                 return false;
             }
             new_v += NODE_VOXELS_PER_AXIS as i32;
@@ -115,16 +123,20 @@ impl Position {
 
     /// Add a sub-voxel offset on one axis, carrying whole voxels into
     /// `voxel` and `path`. Returns `false` on walking off the root.
+    ///
+    /// On failure, `self` is left untouched: the voxel step is tried
+    /// first and the new fractional offset is only committed if the
+    /// step succeeded. An earlier version mutated `self.offset`
+    /// before calling `step_voxels`, which left a silent 1-leaf
+    /// desync (post-delta offset, rolled-back voxel) on failure.
     pub fn add_offset_axis(&mut self, axis: usize, delta: f32) -> bool {
         debug_assert!(axis < 3);
         let new_offset = self.offset[axis] + delta;
         let whole = new_offset.floor();
-        self.offset[axis] = new_offset - whole;
-        if whole != 0.0 {
-            if !self.step_voxels(axis, whole as i32) {
-                return false;
-            }
+        if whole != 0.0 && !self.step_voxels(axis, whole as i32) {
+            return false;
         }
+        self.offset[axis] = new_offset - whole;
         true
     }
 

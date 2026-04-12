@@ -77,8 +77,8 @@ use super::tree::{
 /// across a fixed Bevy grid.
 ///
 /// Updating the anchor is a straight assignment; callers never need
-/// to compute deltas themselves. See `player::recenter_anchor` for
-/// the per-frame update loop.
+/// to compute deltas themselves. See `player::sync_anchor_to_player`
+/// for the per-frame update loop.
 #[derive(Resource, Copy, Clone, Debug)]
 pub struct WorldAnchor {
     pub leaf_coord: [i64; 3],
@@ -282,23 +282,25 @@ pub fn position_from_bevy(bevy: Vec3, anchor: &WorldAnchor) -> Option<Position> 
     }
     // Split `bevy` into an integer leaf delta and a sub-voxel
     // fractional part, then add the integer delta to the anchor's
-    // leaf coord in `i64` space.
-    let int_delta: [i64; 3] = [
-        bevy.x.floor() as i64,
-        bevy.y.floor() as i64,
-        bevy.z.floor() as i64,
-    ];
+    // leaf coord in `i64` space. Evaluate `.floor()` once per axis
+    // so the integer and fractional parts can't disagree on an
+    // integer boundary (a double-eval would let the fractional
+    // part reach exactly 1.0 for negative inputs near a boundary,
+    // violating `Position::offset ∈ [0, 1)`).
+    let fx = bevy.x.floor();
+    let fy = bevy.y.floor();
+    let fz = bevy.z.floor();
+    let int_delta: [i64; 3] = [fx as i64, fy as i64, fz as i64];
     let coord: [i64; 3] = [
         anchor.leaf_coord[0] + int_delta[0],
         anchor.leaf_coord[1] + int_delta[1],
         anchor.leaf_coord[2] + int_delta[2],
     ];
     let mut pos = position_from_leaf_coord(coord)?;
-    pos.offset = [
-        bevy.x - bevy.x.floor(),
-        bevy.y - bevy.y.floor(),
-        bevy.z - bevy.z.floor(),
-    ];
+    pos.offset = [bevy.x - fx, bevy.y - fy, bevy.z - fz];
+    debug_assert!(pos.offset[0] >= 0.0 && pos.offset[0] < 1.0);
+    debug_assert!(pos.offset[1] >= 0.0 && pos.offset[1] < 1.0);
+    debug_assert!(pos.offset[2] >= 0.0 && pos.offset[2] < 1.0);
     Some(pos)
 }
 

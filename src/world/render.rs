@@ -112,6 +112,13 @@ pub struct RenderState {
     last_zoom_layer: u8,
     /// Whether we have done at least one render pass.
     initialised: bool,
+    /// Reusable DFS stack for `walk()`. Stashed here so we don't
+    /// reallocate a `Vec` every frame. Cleared at the start of each
+    /// `walk()` call.
+    walk_stack: Vec<WalkFrame>,
+    /// Reusable buffer for the target-layer visits collected by
+    /// `walk()`. Same motivation as `walk_stack`.
+    visits: Vec<Visit>,
 }
 
 /// A compact identifier for a node's position in the tree during a
@@ -148,37 +155,50 @@ fn get_or_bake_mesh<'a>(
     node_id: NodeId,
     meshes: &mut Assets<Mesh>,
 ) -> &'a [BakedSubMesh] {
-    if !render_state.meshes.contains_key(&node_id) {
-        let node = world
-            .library
-            .get(node_id)
-            .expect("render: node missing from library");
-        let voxels = node.voxels.clone();
-        let baked = bake_volume(
-            NODE_VOXELS_PER_AXIS as i32,
-            move |x, y, z| {
-                if x < 0
-                    || y < 0
-                    || z < 0
-                    || x >= NODE_VOXELS_PER_AXIS as i32
-                    || y >= NODE_VOXELS_PER_AXIS as i32
-                    || z >= NODE_VOXELS_PER_AXIS as i32
-                {
-                    return None;
-                }
-                block_from_voxel(
-                    voxels[voxel_idx(x as usize, y as usize, z as usize)],
-                )
-            },
-            meshes,
-        );
-        render_state.meshes.insert(node_id, baked);
+    render_state.get_or_bake(world, node_id, meshes)
+}
+
+impl RenderState {
+    /// Fetch the baked sub-meshes for `node_id`, baking and caching
+    /// on a miss. Public so the save-mode highlight overlay can share
+    /// the same `NodeId`-keyed mesh cache as the world renderer.
+    pub fn get_or_bake<'a>(
+        &'a mut self,
+        world: &WorldState,
+        node_id: NodeId,
+        meshes: &mut Assets<Mesh>,
+    ) -> &'a [BakedSubMesh] {
+        if !self.meshes.contains_key(&node_id) {
+            let node = world
+                .library
+                .get(node_id)
+                .expect("render: node missing from library");
+            let voxels = node.voxels.clone();
+            let baked = bake_volume(
+                NODE_VOXELS_PER_AXIS as i32,
+                move |x, y, z| {
+                    if x < 0
+                        || y < 0
+                        || z < 0
+                        || x >= NODE_VOXELS_PER_AXIS as i32
+                        || y >= NODE_VOXELS_PER_AXIS as i32
+                        || z >= NODE_VOXELS_PER_AXIS as i32
+                    {
+                        return None;
+                    }
+                    block_from_voxel(
+                        voxels[voxel_idx(x as usize, y as usize, z as usize)],
+                    )
+                },
+                meshes,
+            );
+            self.meshes.insert(node_id, baked);
+        }
+        self.meshes
+            .get(&node_id)
+            .expect("just inserted")
+            .as_slice()
     }
-    render_state
-        .meshes
-        .get(&node_id)
-        .expect("just inserted")
-        .as_slice()
 }
 
 // ------------------------------------------------------------- tree walk
@@ -190,6 +210,15 @@ struct Visit {
     path: SmallPath,
     node_id: NodeId,
     origin: Vec3,
+}
+
+/// One frame on the `walk()` DFS stack. Extracted into a named
+/// struct so `Vec<WalkFrame>` is a nameable type on `RenderState`.
+struct WalkFrame {
+    node_id: NodeId,
+    path: SmallPath,
+    origin_leaves: [i64; 3],
+    depth: u8,
 }
 
 /// Accumulate each node's absolute leaf-space origin as the walker
@@ -206,8 +235,11 @@ fn walk(
     camera_pos: Vec3,
     radius_bevy: f32,
     anchor: &WorldAnchor,
+    stack: &mut Vec<WalkFrame>,
     out: &mut Vec<Visit>,
 ) {
+    stack.clear();
+    out.clear();
     if world.root == EMPTY_NODE {
         return;
     }
@@ -225,13 +257,17 @@ fn walk(
         }
     }
 
-    let mut stack: Vec<(NodeId, SmallPath, [i64; 3], u8)> =
-        Vec::with_capacity(256);
-    stack.push((world.root, SmallPath::empty(), [0; 3], 0));
+    stack.push(WalkFrame {
+        node_id: world.root,
+        path: SmallPath::empty(),
+        origin_leaves: [0; 3],
+        depth: 0,
+    });
 
     let radius_sq = radius_bevy * radius_bevy;
 
-    while let Some((node_id, path, origin_leaves, depth)) = stack.pop() {
+    while let Some(frame) = stack.pop() {
+        let WalkFrame { node_id, path, origin_leaves, depth } = frame;
         // Bevy-space origin of this node: delta from the anchor, in
         // leaves, cast to `f32`. For nodes near the player the delta
         // is small and `f32` is essentially exact.
@@ -300,7 +336,12 @@ fn walk(
                 origin_leaves[2] + (sz as i64) * child_extent_i64,
             ];
             let child_path = path.push(slot as u8);
-            stack.push((child_id, child_path, child_origin_leaves, depth + 1));
+            stack.push(WalkFrame {
+                node_id: child_id,
+                path: child_path,
+                origin_leaves: child_origin_leaves,
+                depth: depth + 1,
+            });
         }
     }
 }
@@ -347,14 +388,21 @@ pub fn render_world(
         render_state.initialised = true;
     }
 
-    // Walk the tree → collect visible positions.
-    let mut visits: Vec<Visit> = Vec::with_capacity(256);
+    // Walk the tree → collect visible positions. `mem::take` the
+    // reusable buffers off `render_state` so the walk and reconcile
+    // loop can hold `&mut render_state` freely (notably
+    // `get_or_bake_mesh`). We put them back at the end; the buffers
+    // are cleared internally by `walk()` and drained during
+    // reconciliation, so they retain their allocated capacity.
+    let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
+    let mut visits = std::mem::take(&mut render_state.visits);
     walk(
         &world,
         target_layer,
         camera_pos,
         radius_bevy,
         &anchor,
+        &mut walk_stack,
         &mut visits,
     );
 
@@ -364,7 +412,7 @@ pub fn render_world(
     let mut alive: HashMap<SmallPath, (Entity, NodeId)> =
         HashMap::with_capacity(visits.len());
 
-    for visit in visits {
+    for visit in visits.drain(..) {
         let new_node_id = visit.node_id;
         let existing = render_state.entities.remove(&visit.path);
 
@@ -427,6 +475,11 @@ pub fn render_world(
         }
     }
     render_state.entities = alive;
+
+    // Put the reusable walk buffers back on `render_state` so next
+    // frame reuses their allocated capacity.
+    render_state.walk_stack = walk_stack;
+    render_state.visits = visits;
 }
 
 // ------------------------------------------------------------------ tests
@@ -450,6 +503,7 @@ mod tests {
     #[test]
     fn walk_grassland_at_leaves_emits_at_least_one_visit() {
         let world = WorldState::new_grassland();
+        let mut stack = Vec::new();
         let mut visits = Vec::new();
         // At view L = MAX_LAYER the view cell is 1 Bevy unit, so the
         // Bevy-space radius equals RADIUS_VIEW_CELLS directly.
@@ -459,6 +513,7 @@ mod tests {
             Vec3::ZERO,
             RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
             &anchor_origin(),
+            &mut stack,
             &mut visits,
         );
         assert!(
@@ -470,6 +525,7 @@ mod tests {
     #[test]
     fn walk_radius_limits_emit_count() {
         let world = WorldState::new_grassland();
+        let mut stack = Vec::new();
         let mut visits = Vec::new();
         walk(
             &world,
@@ -477,6 +533,7 @@ mod tests {
             Vec3::ZERO,
             RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
             &anchor_origin(),
+            &mut stack,
             &mut visits,
         );
         // Bounded number of target-layer nodes — guard rail against
@@ -497,11 +554,20 @@ mod tests {
         let world = WorldState::new_grassland();
         let anchor = anchor_origin();
         let mut counts = Vec::new();
+        let mut stack = Vec::new();
         for view_layer in (MIN_ZOOM..=MAX_ZOOM).rev() {
             let target = target_layer_for(view_layer);
             let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
             let mut visits = Vec::new();
-            walk(&world, target, Vec3::ZERO, radius, &anchor, &mut visits);
+            walk(
+                &world,
+                target,
+                Vec3::ZERO,
+                radius,
+                &anchor,
+                &mut stack,
+                &mut visits,
+            );
             counts.push((view_layer, visits.len()));
         }
         // No view layer should be empty (the bug this test guards

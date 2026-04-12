@@ -19,7 +19,14 @@ impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(CursorLocked(false))
             .add_systems(Startup, (spawn_camera, spawn_crosshair))
-            .add_systems(Update, (manage_cursor, first_person_camera).chain());
+            .add_systems(
+                Update,
+                (
+                    manage_cursor,
+                    first_person_camera.after(crate::player::derive_transforms),
+                )
+                    .chain(),
+            );
     }
 }
 

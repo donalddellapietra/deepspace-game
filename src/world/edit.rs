@@ -207,7 +207,7 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
     if lp.layer == MAX_LAYER {
         // Leaf-view: single-voxel edit. Synthesise a `Position`
         // pointing at the target cell and fall through.
-        debug_assert!(lp.path.len() == NODE_PATH_LEN);
+        assert!(lp.path.len() == NODE_PATH_LEN);
         let mut path = [0u8; NODE_PATH_LEN];
         for (i, &s) in lp.path.iter().enumerate() {
             path[i] = s;
@@ -314,7 +314,10 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
 /// back up to the root re-downsampling the one affected slot per
 /// ancestor and interning each new ancestor. The length of
 /// `ancestor_slots` equals the layer of the replaced node.
-fn install_subtree(world: &mut WorldState, ancestor_slots: &[u8], new_node_id: NodeId) {
+///
+/// Public so the save-mode placement flow can splice a previously
+/// captured subtree back into the world at a matching layer.
+pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[u8], new_node_id: NodeId) {
     let mut descent: Vec<(NodeId, usize)> = Vec::with_capacity(ancestor_slots.len());
     let mut current_id = world.root;
     for &slot in ancestor_slots {

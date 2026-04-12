@@ -122,7 +122,7 @@ fn spawn_player(mut commands: Commands) {
     ));
 }
 
-fn move_player(
+pub fn move_player(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     world: Res<WorldState>,
@@ -210,7 +210,7 @@ fn move_player(
 /// (camera, highlight gizmo, rendering, raycasting) then share
 /// one consistent frame whose Bevy `(0, 0, 0)` is the player's
 /// current leaf.
-fn sync_anchor_to_player(
+pub fn sync_anchor_to_player(
     mut anchor: ResMut<WorldAnchor>,
     player_q: Query<&WorldPosition, With<Player>>,
 ) {
@@ -224,7 +224,7 @@ fn sync_anchor_to_player(
 /// `Transform` always lands at its sub-voxel offset (tiny), and
 /// any future entity with a `WorldPosition` gets anchor-relative
 /// placement for free.
-fn derive_transforms(
+pub fn derive_transforms(
     anchor: Res<WorldAnchor>,
     mut q: Query<(&WorldPosition, &mut Transform)>,
 ) {

@@ -425,7 +425,7 @@ pub fn snap_to_ground(pos: &mut Position, world: &WorldState, view_layer: u8) {
             *pos = updated;
         }
     }
-    // If we didn't converge in 64 steps, leave `pos` as-is rather
+    // If we didn't converge in 256 steps, leave `pos` as-is rather
     // than teleport somewhere surprising.
 }
 

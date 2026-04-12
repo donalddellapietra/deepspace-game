@@ -18,6 +18,7 @@
 use bevy::prelude::*;
 
 use crate::camera::FpsCam;
+use crate::editor::save_mode::{save_mode_eligible, SaveMode};
 use crate::world::position::LayerPos;
 use crate::world::view::{
     bevy_origin_of_layer_pos, cell_origin_for_anchor, cell_size_at_layer,
@@ -35,8 +36,13 @@ pub struct InteractionPlugin;
 
 impl Plugin for InteractionPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TargetedBlock>()
-            .add_systems(Update, (update_target, draw_highlight));
+        app.init_resource::<TargetedBlock>().add_systems(
+            Update,
+            (
+                update_target.after(crate::player::sync_anchor_to_player),
+                draw_highlight.after(crate::player::sync_anchor_to_player),
+            ),
+        );
     }
 }
 
@@ -61,7 +67,7 @@ impl TargetedBlock {
     }
 }
 
-fn update_target(
+pub fn update_target(
     cam_q: Query<&GlobalTransform, With<FpsCam>>,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
@@ -208,10 +214,16 @@ fn draw_highlight(
     targeted: Res<TargetedBlock>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
+    save_mode: Res<SaveMode>,
 ) {
     let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
+    // Save mode paints the target with a neon mesh overlay instead,
+    // so skip the white outline at layers where save mode is active.
+    if save_mode.active && save_mode_eligible(zoom.layer) {
+        return;
+    }
     let cell_size = cell_size_at_layer(zoom.layer);
     let cell_min = bevy_origin_of_layer_pos(lp, &anchor);
     let center = cell_min + Vec3::splat(cell_size * 0.5);
