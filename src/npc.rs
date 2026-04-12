@@ -362,6 +362,14 @@ struct NpcAnimState {
     time: f32,
 }
 
+/// Per-instance part overrides for edited NPCs. When a voxel on an
+/// NPC is edited, the affected part gets a new NodeId stored here
+/// (clone-on-write). Unedited parts fall back to the blueprint's NodeId.
+#[derive(Component, Default)]
+pub struct NpcPartOverrides {
+    pub overrides: HashMap<usize, NodeId>,
+}
+
 /// Per-frame computed part transforms, written by `npc_animate`,
 /// read by `collect_overlays`. Each entry is `(offset, rotation)`
 /// indexed by part index.
@@ -389,6 +397,7 @@ impl Plugin for NpcPlugin {
                 npc_ai,
                 npc_animate,
                 npc_physics,
+                npc_despawn_on_zoom,
                 collect_overlays
                     .after(npc_animate)
                     .after(crate::player::derive_transforms),
@@ -653,6 +662,7 @@ fn spawn_npc_on_keypress(
         NpcPartTransforms {
             transforms: rest_transforms,
         },
+        NpcPartOverrides::default(),
         Transform::from_translation(spawn_bevy)
             .with_rotation(Quat::from_rotation_y(heading + PI)),
         Visibility::Visible,
@@ -766,6 +776,25 @@ fn npc_physics(
     }
 }
 
+// ====================================================== zoom despawn
+
+/// Despawn NPC entities entirely when 2+ layers out from leaf layer.
+fn npc_despawn_on_zoom(
+    mut commands: Commands,
+    zoom: Res<CameraZoom>,
+    q: Query<Entity, With<Npc>>,
+) {
+    if !zoom.is_changed() {
+        return;
+    }
+    let layers_out = crate::world::tree::MAX_LAYER.saturating_sub(zoom.layer);
+    if layers_out >= 2 {
+        for entity in &q {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 // ============================================== overlay collection
 
 /// Populate `OverlayList` each frame from visible NPCs. Scale is
@@ -774,19 +803,29 @@ fn npc_physics(
 /// it, so the NPC naturally appears smaller. That's real zoom.
 pub fn collect_overlays(
     tree_bp: Option<Res<TreeBlueprint>>,
+    zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
-    npc_q: Query<(Entity, &WorldPosition, &Transform, &NpcPartTransforms), With<Npc>>,
+    npc_q: Query<
+        (Entity, &WorldPosition, &Transform, &NpcPartTransforms, Option<&NpcPartOverrides>),
+        With<Npc>,
+    >,
     mut overlay_list: ResMut<OverlayList>,
 ) {
     overlay_list.entries.clear();
 
     let Some(tree_bp) = tree_bp else { return };
 
+    // NPCs live at the leaf layer. Skip rendering when 2+ layers out.
+    let layers_out = crate::world::tree::MAX_LAYER.saturating_sub(zoom.layer);
+    if layers_out >= 2 {
+        return;
+    }
+
     // Leaf-layer scale: NPC is ~1.5 leaf voxels tall. This never
     // changes with zoom — the NPC has a fixed real-world size.
     let scale = tree_npc_scale(crate::world::tree::MAX_LAYER, &tree_bp);
 
-    for (entity, world_pos, tf, part_tf) in &npc_q {
+    for (entity, world_pos, tf, part_tf, overrides) in &npc_q {
         let bevy_pos = bevy_from_position(&world_pos.0, &anchor);
 
         let parts: Vec<OverlayPart> = tree_bp
@@ -795,8 +834,11 @@ pub fn collect_overlays(
             .enumerate()
             .filter_map(|(i, tp)| {
                 let (offset, rotation) = part_tf.transforms.get(i)?;
+                let node_id = overrides
+                    .and_then(|o| o.overrides.get(&i).copied())
+                    .unwrap_or(tp.node_id);
                 Some(OverlayPart {
-                    node_id: tp.node_id,
+                    node_id,
                     offset: *offset,
                     rotation: *rotation,
                     pivot: tp.pivot,
@@ -812,6 +854,40 @@ pub fn collect_overlays(
             scale,
         });
     }
+}
+
+// ============================================== NPC voxel editing
+
+/// Edit a single voxel on an NPC part. Clone-on-write: clones the
+/// leaf voxel grid, patches one cell, inserts the new leaf, and
+/// stores the new NodeId in the per-instance overrides.
+pub fn edit_npc_voxel(
+    world: &mut WorldState,
+    overrides: &mut NpcPartOverrides,
+    tree_bp: &TreeBlueprint,
+    part_index: usize,
+    local_voxel: [u8; 3],
+    new_voxel: Voxel,
+) {
+    let base_id = overrides
+        .overrides
+        .get(&part_index)
+        .copied()
+        .unwrap_or(tree_bp.parts[part_index].node_id);
+
+    let mut new_voxels = world
+        .library
+        .get(base_id)
+        .expect("edit_npc_voxel: part node missing")
+        .voxels
+        .clone();
+    new_voxels[voxel_idx(
+        local_voxel[0] as usize,
+        local_voxel[1] as usize,
+        local_voxel[2] as usize,
+    )] = new_voxel;
+    let new_id = world.library.insert_leaf(new_voxels);
+    overrides.overrides.insert(part_index, new_id);
 }
 
 // ============================================================= helpers

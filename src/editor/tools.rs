@@ -7,6 +7,7 @@ use bevy::prelude::*;
 use crate::camera::{CursorLocked, ZoomTransition};
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
+use crate::npc::{edit_npc_voxel, Npc, NpcPartOverrides, TreeBlueprint};
 use crate::player::{spawn_position, Player, Velocity};
 use crate::world::collision;
 use crate::world::edit::{
@@ -151,7 +152,9 @@ pub fn remove_block(
     inv: Res<InventoryState>,
     save_mode: Res<super::save_mode::SaveMode>,
     targeted: Res<TargetedBlock>,
+    tree_bp: Option<Res<TreeBlueprint>>,
     mut world: ResMut<WorldState>,
+    mut npc_q: Query<&mut NpcPartOverrides, With<Npc>>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() || save_mode.active {
         return;
@@ -159,6 +162,24 @@ pub fn remove_block(
     if !mouse.just_pressed(MouseButton::Left) {
         return;
     }
+
+    // NPC hit takes priority over world hit.
+    if let Some(overlay_hit) = &targeted.hit_overlay {
+        let Some(tree_bp) = tree_bp else { return };
+        let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
+            return;
+        };
+        edit_npc_voxel(
+            &mut world,
+            &mut overrides,
+            &tree_bp,
+            overlay_hit.part_index,
+            overlay_hit.local_voxel,
+            EMPTY_VOXEL,
+        );
+        return;
+    }
+
     let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
@@ -178,9 +199,11 @@ pub fn place_block(
     targeted: Res<TargetedBlock>,
     hotbar: Res<super::Hotbar>,
     saved: Res<SavedMeshes>,
+    tree_bp: Option<Res<TreeBlueprint>>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
     mut world: ResMut<WorldState>,
+    mut npc_q: Query<&mut NpcPartOverrides, With<Npc>>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() || save_mode.active {
         return;
@@ -188,6 +211,26 @@ pub fn place_block(
     if !mouse.just_pressed(MouseButton::Right) {
         return;
     }
+
+    // NPC hit: place the active block voxel onto the NPC part.
+    if let Some(overlay_hit) = &targeted.hit_overlay {
+        if let HotbarItem::Block(voxel) = hotbar.active_item(zoom.layer) {
+            let Some(tree_bp) = tree_bp else { return };
+            let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
+                return;
+            };
+            edit_npc_voxel(
+                &mut world,
+                &mut overrides,
+                &tree_bp,
+                overlay_hit.part_index,
+                overlay_hit.local_voxel,
+                *voxel,
+            );
+        }
+        return;
+    }
+
     let (Some(hit), Some(normal)) =
         (targeted.hit_layer_pos.as_ref(), targeted.normal)
     else {
