@@ -3,7 +3,6 @@ use std::f32::consts::FRAC_PI_2;
 use bevy::{
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
-    render::view::NoIndirectDrawing,
 };
 
 use crate::player::{Player, PLAYER_HEIGHT};
@@ -48,9 +47,6 @@ fn spawn_camera(mut commands: Commands) {
         // we picked.
         FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::default(),
-        // Required for custom `draw_indexed` calls in the instanced
-        // block renderer.
-        NoIndirectDrawing,
     ));
 }
 

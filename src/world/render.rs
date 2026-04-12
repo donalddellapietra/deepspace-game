@@ -1,60 +1,30 @@
-//! GPU-instanced uniform-layer tree-walk renderer.
+//! Uniform-layer tree-walk renderer.
 //!
 //! Every frame, walk the content-addressed tree from the root down to
-//! the emit layer (`target_layer - 1`) and group visible nodes by
-//! `(NodeId, voxel)`.  Each unique group is ONE Bevy entity with a
-//! custom instance buffer; the GPU draws the baked mesh N times from a
-//! single draw call.  Typical worlds have ~3-4 unique NodeIds and ~2
-//! sub-meshes each, so the live entity count drops from ~2 200 to ~6-10.
+//! `CameraZoom.layer + 2` (the target layer — see
+//! `view::target_layer_for`) and emit one Bevy entity per surviving
+//! node at that layer. Entities are reused across frames via
+//! `RenderState`, and meshes are baked lazily into a `NodeId`-keyed
+//! cache. See `docs/architecture/rendering.md` for the full design.
 //!
-//! The custom render pipeline follows the Bevy 0.18
-//! `custom_shader_instancing` example pattern:
-//!   - `ExtractComponent` copies `InstanceMaterialData` into the render world
-//!   - `prepare_instance_buffers` uploads instance data to the GPU
-//!   - `queue_custom` inserts draw items into the `Transparent3d` phase
-//!   - `DrawMeshInstanced` issues `draw_indexed` with the instance count
-//!
-//! Key invariants (unchanged from the scalar renderer):
+//! Key invariants:
 //!
 //! * One Bevy unit equals one leaf voxel *in the current
-//!   [`WorldAnchor`] frame*.
-//! * Node origins are `leaf-coord − anchor.leaf_coord`, keeping
-//!   rendered positions small regardless of absolute world location.
-//! * Frustum culling is disabled (`NoFrustumCulling`) — the walk
-//!   already culls by a sphere of `RADIUS_VIEW_CELLS` view-cells.
+//!   [`WorldAnchor`] frame*. A leaf entity has scale `1.0` and its
+//!   baked mesh is `bake_volume(NODE_VOXELS_PER_AXIS)`. A layer-K
+//!   node has scale `5 ^ (MAX_LAYER - K)`.
+//! * Node origins are computed as `leaf-coord - anchor.leaf_coord`,
+//!   so rendered entities live in a small Bevy coordinate range
+//!   around the player regardless of absolute world position. This
+//!   is the "no big numbers in Bevy space" guarantee from
+//!   `docs/architecture/coordinates.md`.
+//! * The renderer skips frustum culling. It emits every node whose
+//!   AABB intersects a sphere of `RADIUS_VIEW_CELLS` view-cells
+//!   around the camera.
 
-use bevy::camera::visibility::NoFrustumCulling;
-use bevy::pbr::SetMeshViewBindingArrayBindGroup;
-use bevy::{
-    core_pipeline::core_3d::Transparent3d,
-    ecs::{
-        query::QueryItem,
-        system::{lifetimeless::*, SystemParamItem},
-    },
-    mesh::{MeshVertexBufferLayoutRef, VertexBufferLayout},
-    pbr::{
-        MeshPipeline, MeshPipelineKey, RenderMeshInstances, SetMeshBindGroup,
-        SetMeshViewBindGroup,
-    },
-    platform::collections::HashMap,
-    prelude::*,
-    render::{
-        extract_component::{ExtractComponent, ExtractComponentPlugin},
-        mesh::{allocator::MeshAllocator, RenderMesh, RenderMeshBufferInfo},
-        render_asset::RenderAssets,
-        render_phase::{
-            AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
-            RenderCommand, RenderCommandResult, SetItemPipeline,
-            TrackedRenderPass, ViewSortedRenderPhases,
-        },
-        render_resource::*,
-        renderer::{RenderDevice, RenderQueue},
-        sync_world::MainEntity,
-        view::ExtractedView,
-        Render, RenderApp, RenderStartup, RenderSystems,
-    },
-};
-use bytemuck::{Pod, Zeroable};
+use bevy::ecs::hierarchy::ChildOf;
+use bevy::platform::collections::HashMap;
+use bevy::prelude::*;
 
 use crate::block::Palette;
 use crate::model::{mesher::bake_volume, BakedSubMesh};
@@ -72,328 +42,19 @@ use super::view::{
 
 // ------------------------------------------------------- markers
 
-/// Marker attached to each instanced entity, carrying the `NodeId`
-/// the entity is representing. Save-mode tinting looks up entities
-/// by this component.
+/// Marker attached to the *parent* of each rendered node, carrying
+/// the `NodeId` the entity is representing. Save-mode tinting looks
+/// up entities by this component rather than keying into the
+/// private `RenderState.entities` map.
 #[derive(Component)]
 pub struct WorldRenderedNode(pub NodeId);
 
-/// Marker attached to each instanced entity, remembering its
-/// canonical voxel index so callers can restore the original material
-/// after tinting.
+/// Marker attached to each *child* sub-mesh entity, remembering its
+/// canonical voxel index so callers that temporarily swap the
+/// `MeshMaterial3d` (save-mode tinting) can restore the original
+/// material without re-querying the library.
 #[derive(Component)]
 pub struct SubMeshBlock(pub u8);
-
-// ------------------------------------------------------- shader path
-
-const SHADER_ASSET_PATH: &str = "shaders/instanced_block.wgsl";
-
-// -------------------------------------------------- instance data
-
-#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
-#[repr(C)]
-pub struct InstanceData {
-    pub position: Vec3,
-    pub scale: f32,
-    pub color: [f32; 4],
-}
-
-#[derive(Component, Deref)]
-pub struct InstanceMaterialData(pub Vec<InstanceData>);
-
-impl ExtractComponent for InstanceMaterialData {
-    type QueryData = &'static InstanceMaterialData;
-    type QueryFilter = ();
-    type Out = Self;
-
-    fn extract_component(
-        item: QueryItem<'_, '_, Self::QueryData>,
-    ) -> Option<Self> {
-        Some(InstanceMaterialData(item.0.clone()))
-    }
-}
-
-// ---------------------------------------------- custom pipeline plugin
-
-pub struct InstancedBlockPlugin;
-
-impl Plugin for InstancedBlockPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_plugins(
-            ExtractComponentPlugin::<InstanceMaterialData>::default(),
-        );
-        app.sub_app_mut(RenderApp)
-            .add_render_command::<Transparent3d, DrawCustom>()
-            .init_resource::<SpecializedMeshPipelines<CustomPipeline>>()
-            .add_systems(RenderStartup, init_custom_pipeline)
-            .add_systems(
-                Render,
-                (
-                    queue_custom.in_set(RenderSystems::QueueMeshes),
-                    prepare_instance_buffers
-                        .in_set(RenderSystems::PrepareResources),
-                ),
-            );
-    }
-}
-
-#[derive(Resource)]
-struct CustomPipeline {
-    shader: Handle<Shader>,
-    mesh_pipeline: MeshPipeline,
-}
-
-fn init_custom_pipeline(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mesh_pipeline: Res<MeshPipeline>,
-) {
-    commands.insert_resource(CustomPipeline {
-        shader: asset_server.load(SHADER_ASSET_PATH),
-        mesh_pipeline: mesh_pipeline.clone(),
-    });
-}
-
-impl SpecializedMeshPipeline for CustomPipeline {
-    type Key = MeshPipelineKey;
-
-    fn specialize(
-        &self,
-        key: Self::Key,
-        layout: &MeshVertexBufferLayoutRef,
-    ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
-        let mut descriptor = self.mesh_pipeline.specialize(key, layout)?;
-
-        descriptor.vertex.shader = self.shader.clone();
-        descriptor.vertex.buffers.push(VertexBufferLayout {
-            array_stride: size_of::<InstanceData>() as u64,
-            step_mode: VertexStepMode::Instance,
-            attributes: vec![
-                // i_pos_scale: vec4<f32> at location 3
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 0,
-                    shader_location: 3,
-                },
-                // i_color: vec4<f32> at location 4
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: VertexFormat::Float32x4.size(),
-                    shader_location: 4,
-                },
-            ],
-        });
-        descriptor.fragment.as_mut().unwrap().shader =
-            self.shader.clone();
-        Ok(descriptor)
-    }
-}
-
-// --------------------------------------------- queue / prepare
-
-fn queue_custom(
-    transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
-    custom_pipeline: Res<CustomPipeline>,
-    mut pipelines: ResMut<SpecializedMeshPipelines<CustomPipeline>>,
-    pipeline_cache: Res<PipelineCache>,
-    meshes: Res<RenderAssets<RenderMesh>>,
-    render_mesh_instances: Res<RenderMeshInstances>,
-    material_meshes: Query<
-        (Entity, &MainEntity),
-        With<InstanceMaterialData>,
-    >,
-    mut transparent_render_phases: ResMut<
-        ViewSortedRenderPhases<Transparent3d>,
-    >,
-    views: Query<(&ExtractedView, &Msaa)>,
-) {
-    let draw_custom =
-        transparent_3d_draw_functions.read().id::<DrawCustom>();
-
-    for (view, msaa) in &views {
-        let Some(transparent_phase) =
-            transparent_render_phases.get_mut(&view.retained_view_entity)
-        else {
-            continue;
-        };
-
-        let msaa_key = MeshPipelineKey::from_msaa_samples(msaa.samples());
-        let view_key = msaa_key | MeshPipelineKey::from_hdr(view.hdr);
-        let rangefinder = view.rangefinder3d();
-
-        for (entity, main_entity) in &material_meshes {
-            let Some(mesh_instance) =
-                render_mesh_instances.render_mesh_queue_data(*main_entity)
-            else {
-                continue;
-            };
-            let Some(mesh) =
-                meshes.get(mesh_instance.mesh_asset_id)
-            else {
-                continue;
-            };
-            let key = view_key
-                | MeshPipelineKey::from_primitive_topology(
-                    mesh.primitive_topology(),
-                );
-            let pipeline = pipelines
-                .specialize(
-                    &pipeline_cache,
-                    &custom_pipeline,
-                    key,
-                    &mesh.layout,
-                )
-                .unwrap();
-            transparent_phase.add(Transparent3d {
-                entity: (entity, *main_entity),
-                pipeline,
-                draw_function: draw_custom,
-                distance: rangefinder
-                    .distance(&mesh_instance.center),
-                batch_range: 0..1,
-                extra_index: PhaseItemExtraIndex::None,
-                indexed: true,
-            });
-        }
-    }
-}
-
-#[derive(Component)]
-struct InstanceBuffer {
-    buffer: Buffer,
-    length: usize,
-    /// Number of instances the buffer can hold without reallocation.
-    capacity: usize,
-}
-
-fn prepare_instance_buffers(
-    mut commands: Commands,
-    query: Query<(Entity, &InstanceMaterialData, Option<&InstanceBuffer>)>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-) {
-    for (entity, instance_data, existing_buf) in &query {
-        let new_len = instance_data.len();
-        let contents = bytemuck::cast_slice(instance_data.as_slice());
-
-        if let Some(existing) = existing_buf {
-            if existing.capacity >= new_len {
-                // Reuse existing buffer — just upload new data in place.
-                render_queue.write_buffer(&existing.buffer, 0, contents);
-                // Update length only (buffer & capacity stay the same).
-                commands.entity(entity).insert(InstanceBuffer {
-                    buffer: existing.buffer.clone(),
-                    length: new_len,
-                    capacity: existing.capacity,
-                });
-                continue;
-            }
-        }
-
-        // Need a new (larger) buffer.
-        let buffer =
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("instance data buffer"),
-                contents,
-                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-            });
-        commands.entity(entity).insert(InstanceBuffer {
-            buffer,
-            length: new_len,
-            capacity: new_len,
-        });
-    }
-}
-
-// -------------------------------------------- draw command
-
-type DrawCustom = (
-    SetItemPipeline,
-    SetMeshViewBindGroup<0>,
-    SetMeshViewBindingArrayBindGroup<1>,
-    SetMeshBindGroup<2>,
-    DrawMeshInstanced,
-);
-
-struct DrawMeshInstanced;
-
-impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
-    type Param = (
-        SRes<RenderAssets<RenderMesh>>,
-        SRes<RenderMeshInstances>,
-        SRes<MeshAllocator>,
-    );
-    type ViewQuery = ();
-    type ItemQuery = Read<InstanceBuffer>;
-
-    #[inline]
-    fn render<'w>(
-        item: &P,
-        _view: (),
-        instance_buffer: Option<&'w InstanceBuffer>,
-        (meshes, render_mesh_instances, mesh_allocator): SystemParamItem<
-            'w,
-            '_,
-            Self::Param,
-        >,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let mesh_allocator = mesh_allocator.into_inner();
-
-        let Some(mesh_instance) =
-            render_mesh_instances.render_mesh_queue_data(item.main_entity())
-        else {
-            return RenderCommandResult::Skip;
-        };
-        let Some(gpu_mesh) =
-            meshes.into_inner().get(mesh_instance.mesh_asset_id)
-        else {
-            return RenderCommandResult::Skip;
-        };
-        let Some(instance_buffer) = instance_buffer else {
-            return RenderCommandResult::Skip;
-        };
-        let Some(vertex_buffer_slice) =
-            mesh_allocator.mesh_vertex_slice(&mesh_instance.mesh_asset_id)
-        else {
-            return RenderCommandResult::Skip;
-        };
-
-        pass.set_vertex_buffer(0, vertex_buffer_slice.buffer.slice(..));
-        pass.set_vertex_buffer(1, instance_buffer.buffer.slice(..));
-
-        match &gpu_mesh.buffer_info {
-            RenderMeshBufferInfo::Indexed {
-                index_format,
-                count,
-            } => {
-                let Some(index_buffer_slice) = mesh_allocator
-                    .mesh_index_slice(&mesh_instance.mesh_asset_id)
-                else {
-                    return RenderCommandResult::Skip;
-                };
-
-                pass.set_index_buffer(
-                    index_buffer_slice.buffer.slice(..),
-                    *index_format,
-                );
-                pass.draw_indexed(
-                    index_buffer_slice.range.start
-                        ..(index_buffer_slice.range.start + count),
-                    vertex_buffer_slice.range.start as i32,
-                    0..instance_buffer.length as u32,
-                );
-            }
-            RenderMeshBufferInfo::NonIndexed => {
-                pass.draw(
-                    vertex_buffer_slice.range,
-                    0..instance_buffer.length as u32,
-                );
-            }
-        }
-        RenderCommandResult::Success
-    }
-}
 
 // --------------------------------------------------------------- camera zoom
 
@@ -409,6 +70,8 @@ pub const MAX_ZOOM: u8 = MAX_LAYER;
 
 impl Default for CameraZoom {
     fn default() -> Self {
+        // Start at the leaf layer: that's where one Bevy unit equals one
+        // voxel and the world is readable without any up-level scaling.
         Self { layer: MAX_LAYER }
     }
 }
@@ -435,7 +98,16 @@ impl CameraZoom {
 // ---------------------------------------------------------------- constants
 
 /// How far a rendered node's centre may be from the camera, measured
-/// in **cells at the current view layer**.
+/// in **cells at the current view layer**. Used as the v1 replacement
+/// for frustum culling. At walk time this is multiplied by
+/// `cell_size_at_layer(view_layer)` so that the render distance scales
+/// with zoom: you see the same number of cells out to the horizon
+/// whether you're at the leaves or zoomed all the way out, matching
+/// the 2D prototype's "viewport counts cells, not pixels" behaviour.
+///
+/// At view layer `L`, one visible cell is one target-layer node
+/// (target = `(L + 2).min(MAX_LAYER)`), so N cells of radius emit at
+/// most roughly `(2N)^3` target-layer nodes — keep modest.
 pub const RADIUS_VIEW_CELLS: f32 = 32.0;
 
 // ----------------------------------------------------------------- state
@@ -447,41 +119,42 @@ pub struct RenderTimings {
     pub reconcile_us: u64,
     pub visit_count: usize,
     pub group_count: usize,
-    /// Set by the player movement system.
     pub collision_us: u64,
-    pub collision_blocks: usize,
+    pub triangles: usize,
 }
 
-/// Entity entry for one `(NodeId, voxel)` group.
-struct GroupEntry {
-    entity: Entity,
-    /// Cached instance data from last frame. Compared against the new
-    /// data to avoid re-inserting `InstanceMaterialData` when nothing
-    /// changed — re-insertion triggers Bevy's `SyncComponent` cleanup
-    /// which destroys the render-world `InstanceBuffer`, forcing a
-    /// GPU buffer reallocation every frame.
-    last_instances: Vec<InstanceData>,
-}
-
-/// Render state: caches baked meshes and maps live instanced entities.
+/// A map from tree path (of length `depth`) to the Bevy entity
+/// currently rendering that path. `NodeId` tracks what the entity's
+/// mesh is a function of, so edits naturally invalidate it.
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached per-`NodeId` baked sub-meshes.
+    /// Cached per-`NodeId` baked sub-meshes. An entry survives across
+    /// frames and zoom layers — the mesh is a function of the node's
+    /// voxel grid, not of which layer it was emitted at. v1 never
+    /// evicts these.
     meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
-    /// Live entities, keyed by `(NodeId, voxel)`.
-    entities: HashMap<(NodeId, u8), GroupEntry>,
-    /// Emit layer the `entities` set was built for.
+    /// Live entities, keyed by "path prefix" (a `SmallPath`).
+    /// The `Vec3` is the last-written Bevy translation so we can skip
+    /// redundant `Transform` inserts when the anchor hasn't moved.
+    entities: HashMap<SmallPath, (Entity, NodeId, Vec3)>,
+    /// Zoom layer the `entities` set was built for. If it changes,
+    /// everything gets despawned and rebuilt.
     last_zoom_layer: u8,
     /// Whether we have done at least one render pass.
     initialised: bool,
-    /// Reusable DFS stack for `walk()`.
+    /// Reusable DFS stack for `walk()`. Stashed here so we don't
+    /// reallocate a `Vec` every frame. Cleared at the start of each
+    /// `walk()` call.
     walk_stack: Vec<WalkFrame>,
-    /// Reusable buffer for the target-layer visits.
+    /// Reusable buffer for the target-layer visits collected by
+    /// `walk()`. Same motivation as `walk_stack`.
     visits: Vec<Visit>,
 }
 
 /// A compact identifier for a node's position in the tree during a
-/// single-frame walk.
+/// single-frame walk: `depth` significant slot indices from the root.
+/// Used as the `RenderState.entities` key, so reuse survives across
+/// frames as long as the camera keeps looking at the same spot.
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 struct SmallPath {
     depth: u8,
@@ -516,6 +189,8 @@ fn get_or_bake_mesh<'a>(
 }
 
 impl RenderState {
+    /// Fetch the baked sub-meshes for `node_id`, baking and caching
+    /// on a miss. Internal helper for the renderer's reconciler.
     fn get_or_bake<'a>(
         &'a mut self,
         world: &WorldState,
@@ -528,6 +203,7 @@ impl RenderState {
                 .get(node_id)
                 .expect("render: node missing from library");
             let baked = if let Some(children) = &node.children {
+                // Non-leaf: bake 125³ mesh from children's voxel grids.
                 let child_voxels: Vec<Option<VoxelGrid>> = children
                     .iter()
                     .map(|&id| {
@@ -577,6 +253,7 @@ impl RenderState {
                     meshes,
                 )
             } else {
+                // Leaf: bake 25³ from own voxels.
                 let voxels = node.voxels.clone();
                 bake_volume(
                     NODE_VOXELS_PER_AXIS as i32,
@@ -611,14 +288,18 @@ impl RenderState {
 
 // ------------------------------------------------------------- tree walk
 
+/// One "visit" the tree walk wants the reconciler to spawn/update.
+/// `origin` is anchor-relative — already the final Bevy `Transform`
+/// translation the renderer will give the entity.
 struct Visit {
-    #[allow(dead_code)]
     path: SmallPath,
     node_id: NodeId,
     origin: Vec3,
     scale: f32,
 }
 
+/// One frame on the `walk()` DFS stack. Extracted into a named
+/// struct so `Vec<WalkFrame>` is a nameable type on `RenderState`.
 struct WalkFrame {
     node_id: NodeId,
     path: SmallPath,
@@ -626,6 +307,14 @@ struct WalkFrame {
     depth: u8,
 }
 
+/// Accumulate each node's absolute leaf-space origin as the walker
+/// descends, then convert to a Bevy `Vec3` relative to the camera
+/// anchor only when the node passes the cull / emit test. Tracking
+/// the origin in `i64` is what keeps `f32` precision small even
+/// when the player is billions of leaves deep inside the root — the
+/// subtraction `(node_coord - anchor_coord)` stays exact in integer
+/// space, and the cast to `f32` only ever happens on the small
+/// difference.
 fn walk(
     world: &WorldState,
     emit_layer: u8,
@@ -641,6 +330,9 @@ fn walk(
     if world.root == EMPTY_NODE {
         return;
     }
+    // Precomputed child extents in leaves, indexed by the child's
+    // layer number (layer 1 = root's direct children, layer MAX = leaves).
+    // Root leaf-extent is `25 * 5^MAX_LAYER`; each descent divides by 5.
     let mut child_extent_leaves: [i64; MAX_LAYER as usize + 1] =
         [0; MAX_LAYER as usize + 1];
     {
@@ -663,6 +355,9 @@ fn walk(
 
     while let Some(frame) = stack.pop() {
         let WalkFrame { node_id, path, origin_leaves, depth } = frame;
+        // Bevy-space origin of this node: delta from the anchor, in
+        // leaves, cast to `f32`. For nodes near the player the delta
+        // is small and `f32` is essentially exact.
         let origin_bevy = Vec3::new(
             (origin_leaves[0] - anchor.leaf_coord[0]) as f32,
             (origin_leaves[1] - anchor.leaf_coord[1]) as f32,
@@ -672,6 +367,11 @@ fn walk(
         let aabb_min = origin_bevy;
         let aabb_max = origin_bevy + Vec3::splat(extent);
 
+        // Per-axis "distance from camera to AABB": 0 if inside,
+        // otherwise the gap to the nearest face. L2 norm of the three
+        // gaps is the minimum distance from the camera point to the
+        // AABB. Much more accurate than a centre-based sphere test
+        // when the AABB is very large and contains the camera.
         let dx = (aabb_min.x - camera_pos.x)
             .max(0.0)
             .max(camera_pos.x - aabb_max.x);
@@ -686,6 +386,7 @@ fn walk(
             continue;
         }
 
+        // Reached the emit layer → emit.
         if depth == emit_layer {
             out.push(Visit {
                 path,
@@ -696,6 +397,10 @@ fn walk(
             continue;
         }
 
+        // Descend into children. If this node is already a leaf
+        // (no children) we can't go deeper — emit it at its actual
+        // layer instead. This shouldn't happen in a fully-materialised
+        // grassland world but is safe.
         let Some(node) = world.library.get(node_id) else { continue };
         let Some(children) = node.children.as_ref() else {
             out.push(Visit {
@@ -730,22 +435,9 @@ fn walk(
     }
 }
 
-// ------------------------------------------------------ colour helper
-
-fn voxel_color_linear(palette: &Palette, voxel: u8) -> [f32; 4] {
-    let entry = palette.get(voxel);
-    match entry {
-        Some(e) => {
-            let lin = e.color.to_linear();
-            [lin.red, lin.green, lin.blue, lin.alpha]
-        }
-        None => [1.0, 0.0, 1.0, 1.0], // magenta fallback
-    }
-}
-
 // ----------------------------------------------------------------- system
 
-/// Bevy system: walk the tree, reconcile instanced entities.
+/// Bevy system: walk the tree, reconcile `RenderState` entities.
 pub fn render_world(
     mut commands: Commands,
     world: Res<WorldState>,
@@ -768,13 +460,18 @@ pub fn render_world(
     let target_layer = target_layer_for(zoom.layer);
     let emit_layer = target_layer.saturating_sub(1);
 
+    // Render radius in Bevy units = N cells × Bevy-units-per-cell at
+    // the current view layer. This is what the 2D prototype does
+    // implicitly (its viewport is measured in cells); without it,
+    // zooming out collapses the visible world to a dot because the
+    // per-cell Bevy size grows by 5× per layer.
     let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
 
-    // If emit layer changed, or first pass, drop everything.
+    // If emit layer changed, or we're on our first pass, drop everything.
     if !render_state.initialised || render_state.last_zoom_layer != emit_layer
     {
-        for (_, entry) in render_state.entities.drain() {
-            if let Ok(mut ec) = commands.get_entity(entry.entity) {
+        for (_, (entity, _, _)) in render_state.entities.drain() {
+            if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
         }
@@ -782,7 +479,12 @@ pub fn render_world(
         render_state.initialised = true;
     }
 
-    // Walk
+    // Walk the tree → collect visible positions. `mem::take` the
+    // reusable buffers off `render_state` so the walk and reconcile
+    // loop can hold `&mut render_state` freely (notably
+    // `get_or_bake_mesh`). We put them back at the end; the buffers
+    // are cleared internally by `walk()` and drained during
+    // reconciliation, so they retain their allocated capacity.
     let walk_start = std::time::Instant::now();
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
@@ -799,101 +501,98 @@ pub fn render_world(
     timings.walk_us = walk_start.elapsed().as_micros() as u64;
     timings.visit_count = visits.len();
 
-    // Ensure all visited NodeIds are baked before grouping.
-    for v in visits.iter() {
-        if !render_state.meshes.contains_key(&v.node_id) {
-            get_or_bake_mesh(&mut render_state, &world, v.node_id, &mut meshes);
-        }
-    }
-
-    // Group visits by (NodeId, voxel) → Vec<(origin, scale)>.
-    let mut groups: HashMap<(NodeId, u8), Vec<(Vec3, f32)>> =
-        HashMap::new();
-    for visit in visits.drain(..) {
-        if let Some(baked) = render_state.meshes.get(&visit.node_id) {
-            for sub in baked {
-                groups
-                    .entry((visit.node_id, sub.voxel))
-                    .or_default()
-                    .push((visit.origin, visit.scale));
-            }
-        }
-    }
-
-    // Reconcile: update or spawn one entity per group.
-    let reconcile_start = std::time::Instant::now();
-    timings.group_count = groups.len();
-    let mut alive: HashMap<(NodeId, u8), GroupEntry> =
-        HashMap::with_capacity(groups.len());
-
-    for ((node_id, voxel), origins) in groups {
-        let color = voxel_color_linear(&palette, voxel);
-        let instance_data: Vec<InstanceData> = origins
-            .iter()
-            .map(|&(origin, scale)| InstanceData {
-                position: origin,
-                scale,
-                color,
-            })
-            .collect();
-
-        match render_state.entities.remove(&(node_id, voxel)) {
-            Some(mut entry) => {
-                // Only re-insert InstanceMaterialData when the data
-                // actually changed. Re-inserting every frame triggers
-                // SyncComponent cleanup which destroys the render-world
-                // InstanceBuffer, forcing a GPU buffer reallocation.
-                let changed = entry.last_instances.len() != instance_data.len()
-                    || entry.last_instances.iter().zip(instance_data.iter()).any(
-                        |(a, b)| {
-                            a.position != b.position
-                                || a.scale != b.scale
-                                || a.color != b.color
-                        },
-                    );
-                if changed {
-                    if let Ok(mut ec) = commands.get_entity(entry.entity) {
-                        ec.insert(InstanceMaterialData(instance_data.clone()));
+    // Count triangles: for each visit, sum the index counts of its
+    // baked sub-meshes. This is approximate (counts all visits, not
+    // just those surviving frustum culling) but cheap.
+    {
+        let mut tri_count = 0usize;
+        for v in visits.iter() {
+            if let Some(baked) = render_state.meshes.get(&v.node_id) {
+                for sub in baked {
+                    if let Some(mesh) = meshes.get(&sub.mesh) {
+                        tri_count += mesh.count_vertices() / 3;
                     }
-                    entry.last_instances = instance_data;
                 }
-                alive.insert((node_id, voxel), entry);
             }
-            None => {
-                // Look up the baked mesh handle.
-                let baked = render_state
-                    .meshes
-                    .get(&node_id)
-                    .expect("just baked");
-                let mesh_handle = baked
-                    .iter()
-                    .find(|s| s.voxel == voxel)
-                    .expect("group key came from baked submeshes")
-                    .mesh
-                    .clone();
+        }
+        timings.triangles = tri_count;
+    }
 
-                let entity = commands
+    // Reconcile: what's alive now, what changed, what's gone.
+    let reconcile_start = std::time::Instant::now();
+    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
+        HashMap::with_capacity(visits.len());
+
+    for visit in visits.drain(..) {
+        let new_node_id = visit.node_id;
+        let existing = render_state.entities.remove(&visit.path);
+
+        match existing {
+            Some((entity, existing_id, last_origin))
+                if existing_id == new_node_id =>
+            {
+                // Reuse. Only touch the Transform when the origin
+                // actually changed (anchor shifted). Skipping this
+                // avoids ~2k Bevy command dispatches per frame in
+                // the common stationary-camera case.
+                if last_origin != visit.origin {
+                    if let Ok(mut ec) = commands.get_entity(entity) {
+                        ec.insert(
+                            Transform::from_translation(visit.origin)
+                                .with_scale(Vec3::splat(visit.scale)),
+                        );
+                    }
+                }
+                alive.insert(visit.path, (entity, existing_id, visit.origin));
+            }
+            other => {
+                if let Some((old_entity, _, _)) = other {
+                    if let Ok(mut ec) = commands.get_entity(old_entity) {
+                        ec.despawn();
+                    }
+                }
+                // Spawn a new root entity for this path, parent one
+                // child per sub-mesh.
+                let baked = get_or_bake_mesh(
+                    &mut render_state,
+                    &world,
+                    new_node_id,
+                    &mut meshes,
+                )
+                .to_vec();
+
+                let parent = commands
                     .spawn((
-                        Mesh3d(mesh_handle),
-                        InstanceMaterialData(instance_data.clone()),
-                        WorldRenderedNode(node_id),
-                        SubMeshBlock(voxel),
-                        NoFrustumCulling,
-                        Transform::default(),
+                        WorldRenderedNode(new_node_id),
+                        Transform::from_translation(visit.origin)
+                            .with_scale(Vec3::splat(visit.scale)),
                         Visibility::Visible,
                     ))
                     .id();
-                alive.insert(
-                    (node_id, voxel),
-                    GroupEntry { entity, last_instances: instance_data },
-                );
+
+                for sub in &baked {
+                    let Some(mat) = palette.material(sub.voxel) else {
+                        continue;
+                    };
+                    commands.spawn((
+                        Mesh3d(sub.mesh.clone()),
+                        MeshMaterial3d(mat),
+                        SubMeshBlock(sub.voxel),
+                        Transform::default(),
+                        Visibility::Inherited,
+                        ChildOf(parent),
+                    ));
+                }
+
+                alive.insert(visit.path, (parent, new_node_id, visit.origin));
             }
         }
     }
 
-    // Despawn stale groups.
-    for (_, entry) in render_state.entities.drain() {
-        if let Ok(mut ec) = commands.get_entity(entry.entity) {
+    // Everything left in the old map was NOT visited this frame →
+    // despawn.
+    for (_, (entity, _, _)) in render_state.entities.drain() {
+        if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
         }
     }
@@ -972,6 +671,8 @@ mod tests {
 
     #[test]
     fn walk_radius_scales_with_view_layer() {
+        // At every view layer the walk should emit a non-zero count
+        // of emit-layer nodes.
         let world = WorldState::new_grassland();
         let anchor = anchor_origin();
         let mut counts = Vec::new();

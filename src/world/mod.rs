@@ -72,7 +72,6 @@ impl Plugin for WorldPlugin {
             // after all `init_resource` / `insert_resource` calls
             // made in plugin `build`.
             .init_resource::<WorldAnchor>()
-            .add_plugins(render::InstancedBlockPlugin)
             .add_systems(
                 Update,
                 render::render_world.after(crate::player::derive_transforms),

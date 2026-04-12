@@ -128,7 +128,8 @@ fn update_debug_overlay(
          groups        {:>11}\n\
          walk          {:>8} us\n\
          reconcile     {:>8} us\n\
-         collision     {:>8} us",
+         collision     {:>8} us\n\
+         triangles     {:>11}",
         fps,
         frame_time_ms,
         entity_count as u64,
@@ -144,6 +145,7 @@ fn update_debug_overlay(
         timings.walk_us,
         timings.reconcile_us,
         timings.collision_us,
+        timings.triangles,
     ));
 }
 
