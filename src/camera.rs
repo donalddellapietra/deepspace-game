@@ -3,6 +3,7 @@ use std::f32::consts::FRAC_PI_2;
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::AccumulatedMouseMotion,
+    light::ShadowFilteringMethod,
     pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
     prelude::*,
 };
@@ -65,6 +66,7 @@ fn spawn_camera(
             ..Atmosphere::earthlike(medium)
         },
         Tonemapping::Reinhard,
+        ShadowFilteringMethod::Gaussian,
     ));
 }
 

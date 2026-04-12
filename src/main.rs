@@ -13,7 +13,10 @@ mod ui;
 mod world;
 
 use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
+use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
+
+use block::BslMaterial;
 
 fn main() {
     let mut app = App::new();
@@ -33,6 +36,7 @@ fn main() {
         // sub-pixel gaps between mesh faces, so match it to the
         // dominant terrain color (grass) to hide seams.
         .insert_resource(ClearColor(Color::srgb(0.3, 0.6, 0.2)))
+        .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
             world::WorldPlugin,
@@ -59,7 +63,7 @@ fn main() {
 fn debug_stamp_monument(
     mut world_state: ResMut<world::WorldState>,
     mut palette: ResMut<block::Palette>,
-    mut mat_assets: ResMut<Assets<StandardMaterial>>,
+    mut mat_assets: ResMut<Assets<BslMaterial>>,
 ) {
     const VOX_BYTES: &[u8] = include_bytes!("../assets/vox/monu1.vox");
     let model = import::vox::load_first_model_bytes(
@@ -91,7 +95,13 @@ fn setup_environment(mut commands: Commands) {
     });
 
     commands.spawn((
-        DirectionalLight { illuminance: 20_000.0, shadows_enabled: false, ..default() },
+        DirectionalLight {
+            illuminance: 20_000.0,
+            shadows_enabled: true,
+            shadow_depth_bias: 0.3,
+            shadow_normal_bias: 2.0,
+            ..default()
+        },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, 0.4, 0.0)),
     ));
 }
