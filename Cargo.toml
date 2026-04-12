@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 dev = ["bevy/dynamic_linking"]
+debug_import = []
 
 [dependencies]
 bevy = "0.18"
