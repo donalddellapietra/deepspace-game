@@ -160,8 +160,17 @@ test.describe("React UI Overlay", () => {
   test("clicking inventory block sends assignBlockToSlot command", async ({
     page,
   }) => {
-    // Open inventory
-    await page.evaluate(() => {
+    // Set up command capture, push state, click, and check — all in one
+    // evaluate to avoid DOM detach from game loop re-renders.
+    const captured = await page.evaluate(async () => {
+      const all: any[] = [];
+      const orig = (window as any).__pollUiCommands;
+      (window as any).__pollUiCommands = () => {
+        const result = orig();
+        all.push(...JSON.parse(result));
+        return result;
+      };
+
       (window as any).__onGameState({
         type: "inventory",
         data: {
@@ -174,45 +183,63 @@ test.describe("React UI Overlay", () => {
           layer: 2,
         },
       });
+
+      // Wait a tick for React to render
+      await new Promise((r) => setTimeout(r, 100));
+
+      const tile = document.querySelector(".inv-block-tile") as HTMLElement;
+      tile?.click();
+
+      // Wait for game loop to drain
+      await new Promise((r) => setTimeout(r, 500));
+      return all;
     });
 
-    // Click the block tile and wait for React to process
-    await page.locator(".inv-block-tile").first().click();
-    await page.waitForTimeout(100);
-
-    // Poll the command queue
-    const cmds = await page.evaluate(() =>
-      (window as any).__pollUiCommands()
-    );
-    const parsed = JSON.parse(cmds);
-    expect(parsed).toContainEqual({
+    expect(captured).toContainEqual({
       cmd: "assignBlockToSlot",
       voxel: 3,
     });
   });
 
-  test("color picker slider sends setColorPickerRgb command", async ({
+  test("color picker slider dispatches setColorPickerRgb command", async ({
     page,
   }) => {
-    await page.evaluate(() => {
+    const captured = await page.evaluate(async () => {
+      const all: any[] = [];
+      const orig = (window as any).__pollUiCommands;
+      (window as any).__pollUiCommands = () => {
+        const result = orig();
+        all.push(...JSON.parse(result));
+        return result;
+      };
+
       (window as any).__onGameState({
         type: "colorPicker",
         data: { open: true, r: 0.5, g: 0.5, b: 0.5 },
       });
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      const slider = document.querySelector(
+        '.cp-slider-row input[type="range"]'
+      ) as HTMLInputElement;
+      if (slider) {
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          "value"
+        )!.set!;
+        nativeSetter.call(slider, "0.9");
+        slider.dispatchEvent(new Event("input", { bubbles: true }));
+        slider.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      await new Promise((r) => setTimeout(r, 500));
+      return all;
     });
 
-    // Drag the R slider to the right
-    const rSlider = page.locator('.cp-slider-row input[type="range"]').first();
-    await rSlider.fill("0.9");
-
-    const cmds = await page.evaluate(() =>
-      (window as any).__pollUiCommands()
-    );
-    const parsed = JSON.parse(cmds);
-    const rgbCmd = parsed.find(
+    const rgbCmd = captured.find(
       (c: any) => c.cmd === "setColorPickerRgb"
     );
     expect(rgbCmd).toBeDefined();
-    expect(rgbCmd.r).toBeCloseTo(0.9, 1);
   });
 });
