@@ -44,6 +44,38 @@ use super::view::{
     WorldAnchor,
 };
 
+// ------------------------------------------------------ overlays
+
+/// One body part (or composite) to render as an overlay.
+pub struct OverlayPart {
+    pub node_id: NodeId,
+    /// Offset from NPC root in NPC-local voxel space (rest + anim).
+    pub offset: Vec3,
+    /// Part rotation (animation).
+    pub rotation: Quat,
+    /// Pivot point in voxel-local coords for rotation centre.
+    pub pivot: Vec3,
+}
+
+/// One NPC (or future overlay entity) to composite during rendering.
+pub struct OverlayInstance {
+    /// Stable Bevy entity ID of the NPC root.
+    pub id: Entity,
+    pub parts: Vec<OverlayPart>,
+    /// Anchor-relative Bevy position of the NPC root.
+    pub bevy_pos: Vec3,
+    /// NPC facing rotation.
+    pub rotation: Quat,
+    /// Uniform scale (maps voxel space to view-cell space).
+    pub scale: f32,
+}
+
+/// Populated each frame by `collect_overlays`, consumed by `render_world`.
+#[derive(Resource, Default)]
+pub struct OverlayList {
+    pub entries: Vec<OverlayInstance>,
+}
+
 // ------------------------------------------------------- markers
 
 /// Marker attached to the *parent* of each rendered node, carrying
@@ -143,6 +175,9 @@ pub struct RenderState {
     last_zoom_layer: u8,
     /// Whether we have done at least one render pass.
     initialised: bool,
+    /// Live overlay entities keyed by `(NPC Entity, part_index)`.
+    /// Each value is `(spawned Entity, NodeId, last Bevy translation)`.
+    overlay_entities: HashMap<(Entity, usize), (Entity, NodeId, Vec3)>,
     /// Reusable DFS stack for `walk()`. Stashed here so we don't
     /// reallocate a `Vec` every frame. Cleared at the start of each
     /// `walk()` call.
@@ -400,6 +435,43 @@ impl RenderState {
             .expect("just inserted")
             .as_slice()
     }
+
+    /// Bake an overlay leaf node into the mesh cache. Overlay nodes
+    /// skip `compute_neighbor_same` (all faces emit) and only support
+    /// leaf nodes (no children).
+    pub fn bake_overlay(
+        &mut self,
+        world: &WorldState,
+        node_id: NodeId,
+        meshes: &mut Assets<Mesh>,
+    ) {
+        if self.meshes.contains_key(&node_id) {
+            return;
+        }
+        let node = world
+            .library
+            .get(node_id)
+            .expect("overlay: node missing from library");
+        let voxels = node.voxels.clone();
+        let baked = bake_volume(
+            NODE_VOXELS_PER_AXIS as i32,
+            move |x, y, z| {
+                if x < 0
+                    || y < 0
+                    || z < 0
+                    || x >= NODE_VOXELS_PER_AXIS as i32
+                    || y >= NODE_VOXELS_PER_AXIS as i32
+                    || z >= NODE_VOXELS_PER_AXIS as i32
+                {
+                    return None;
+                }
+                let v = voxels[voxel_idx(x as usize, y as usize, z as usize)];
+                if v == EMPTY_VOXEL { None } else { Some(v) }
+            },
+            meshes,
+        );
+        self.meshes.insert(node_id, baked);
+    }
 }
 
 // ------------------------------------------------------------- tree walk
@@ -564,6 +636,7 @@ pub fn render_world(
     mut meshes: ResMut<Assets<Mesh>>,
     mut render_state: ResMut<RenderState>,
     mut timings: ResMut<RenderTimings>,
+    overlay_list: Res<OverlayList>,
 ) {
     let Some(palette) = palette else {
         return;
@@ -588,6 +661,11 @@ pub fn render_world(
     if !render_state.initialised || render_state.last_zoom_layer != emit_layer
     {
         for (_, (entity, _, _)) in render_state.entities.drain() {
+            if let Ok(mut ec) = commands.get_entity(entity) {
+                ec.despawn();
+            }
+        }
+        for (_, (entity, _, _)) in render_state.overlay_entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
@@ -700,6 +778,99 @@ pub fn render_world(
     }
     render_state.entities = alive;
 
+    // ---- overlay reconcile (NPCs and other overlay subtrees) ----
+    {
+        // Pre-bake overlay node meshes.
+        for entry in overlay_list.entries.iter() {
+            for part in &entry.parts {
+                render_state.bake_overlay(&world, part.node_id, &mut meshes);
+            }
+        }
+
+        let mut overlay_alive: HashMap<(Entity, usize), (Entity, NodeId, Vec3)> =
+            HashMap::with_capacity(
+                overlay_list.entries.iter().map(|e| e.parts.len()).sum(),
+            );
+
+        for entry in overlay_list.entries.iter() {
+            for (part_idx, part) in entry.parts.iter().enumerate() {
+                // Compute the part's Bevy-space transform:
+                // Parent: T = npc_pos + npc_rot * scale * (offset + anim_pos)
+                //         R = npc_rot * anim_rot
+                //         S = scale
+                // Mesh child: T = -pivot (in parent-scaled space)
+                let part_origin = entry.bevy_pos
+                    + entry.rotation * (entry.scale * part.offset);
+                let part_rotation = entry.rotation * part.rotation;
+
+                let key = (entry.id, part_idx);
+                let existing = render_state.overlay_entities.remove(&key);
+
+                match existing {
+                    Some((ent, prev_id, prev_origin))
+                        if prev_id == part.node_id
+                            && (prev_origin - part_origin).length_squared() < 1e-6 =>
+                    {
+                        // Same node, same position — reuse. Still update
+                        // rotation in case animation changed.
+                        if let Ok(mut ec) = commands.get_entity(ent) {
+                            ec.insert(
+                                Transform::from_translation(part_origin)
+                                    .with_scale(Vec3::splat(entry.scale))
+                                    .with_rotation(part_rotation),
+                            );
+                        }
+                        overlay_alive.insert(key, (ent, part.node_id, part_origin));
+                    }
+                    other => {
+                        if let Some((old_ent, _, _)) = other {
+                            if let Ok(mut ec) = commands.get_entity(old_ent) {
+                                ec.despawn();
+                            }
+                        }
+
+                        let baked = render_state
+                            .meshes
+                            .get(&part.node_id)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let parent = commands
+                            .spawn((
+                                Transform::from_translation(part_origin)
+                                    .with_scale(Vec3::splat(entry.scale))
+                                    .with_rotation(part_rotation),
+                                Visibility::Visible,
+                            ))
+                            .id();
+
+                        for sub in &baked {
+                            let Some(mat) = palette.material(sub.voxel) else {
+                                continue;
+                            };
+                            commands.spawn((
+                                Mesh3d(sub.mesh.clone()),
+                                MeshMaterial3d(mat),
+                                Transform::from_translation(-part.pivot * entry.scale),
+                                Visibility::Inherited,
+                                ChildOf(parent),
+                            ));
+                        }
+
+                        overlay_alive.insert(key, (parent, part.node_id, part_origin));
+                    }
+                }
+            }
+        }
+
+        // Despawn overlay entities not visited this frame.
+        for (_, (entity, _, _)) in render_state.overlay_entities.drain() {
+            if let Ok(mut ec) = commands.get_entity(entity) {
+                ec.despawn();
+            }
+        }
+        render_state.overlay_entities = overlay_alive;
+    }
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
 

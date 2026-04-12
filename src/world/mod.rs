@@ -72,9 +72,12 @@ impl Plugin for WorldPlugin {
             // after all `init_resource` / `insert_resource` calls
             // made in plugin `build`.
             .init_resource::<WorldAnchor>()
+            .init_resource::<render::OverlayList>()
             .add_systems(
                 Update,
-                render::render_world.after(crate::player::derive_transforms),
+                render::render_world
+                    .after(crate::player::derive_transforms)
+                    .after(crate::npc::collect_overlays),
             );
     }
 }
