@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use crate::player::Player;
 use crate::world::state::GROUND_Y_VOXELS;
 use crate::world::view::{position_to_leaf_coord, target_layer_for};
+use crate::world::render::RenderTimings;
 use crate::world::{CameraZoom, WorldPosition, WorldState};
 
 pub struct DiagnosticsPlugin;
@@ -73,6 +74,7 @@ fn update_debug_overlay(
     diagnostics: Res<DiagnosticsStore>,
     zoom: Res<CameraZoom>,
     state: Res<WorldState>,
+    timings: Res<RenderTimings>,
     player_q: Query<&WorldPosition, With<Player>>,
     overlay_q: Query<&Node, With<DebugOverlay>>,
     mut text_q: Query<&mut Text, With<DebugOverlayText>>,
@@ -121,7 +123,12 @@ fn update_debug_overlay(
          height        {:>11}\n\
          view layer    {:>11}\n\
          target layer  {:>11}\n\
-         library       {:>11}",
+         library       {:>11}\n\
+         visits        {:>11}\n\
+         groups        {:>11}\n\
+         walk          {:>8} us\n\
+         reconcile     {:>8} us\n\
+         collision     {:>8} us",
         fps,
         frame_time_ms,
         entity_count as u64,
@@ -132,6 +139,11 @@ fn update_debug_overlay(
         zoom.layer,
         target,
         state.library.len(),
+        timings.visit_count,
+        timings.group_count,
+        timings.walk_us,
+        timings.reconcile_us,
+        timings.collision_us,
     ));
 }
 

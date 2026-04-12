@@ -134,6 +134,7 @@ pub fn move_player(
     zoom: Res<CameraZoom>,
     mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
     camera_q: Query<&FpsCam>,
+    mut timings: ResMut<crate::world::render::RenderTimings>,
 ) {
     if inv.open {
         return;
@@ -199,6 +200,7 @@ pub fn move_player(
         Vec2::ZERO
     };
 
+    let col_start = std::time::Instant::now();
     collision::move_and_collide(
         &mut world_pos.0,
         &mut vel.0,
@@ -207,6 +209,7 @@ pub fn move_player(
         &world,
         zoom.layer,
     );
+    timings.collision_us = col_start.elapsed().as_micros() as u64;
 }
 
 /// After physics, copy the player's new integer leaf coord into the

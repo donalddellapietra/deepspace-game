@@ -63,6 +63,7 @@ impl Plugin for WorldPlugin {
         app.init_resource::<WorldState>()
             .init_resource::<CameraZoom>()
             .init_resource::<RenderState>()
+            .init_resource::<render::RenderTimings>()
             // The `WorldAnchor` starts at its default (origin leaf)
             // so the renderer and any pre-spawn systems see a valid
             // resource, but the player plugin overwrites it in its

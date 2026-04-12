@@ -48,7 +48,7 @@ use bevy::{
             TrackedRenderPass, ViewSortedRenderPhases,
         },
         render_resource::*,
-        renderer::RenderDevice,
+        renderer::{RenderDevice, RenderQueue},
         sync_world::MainEntity,
         view::ExtractedView,
         Render, RenderApp, RenderStartup, RenderSystems,
@@ -262,23 +262,45 @@ fn queue_custom(
 struct InstanceBuffer {
     buffer: Buffer,
     length: usize,
+    /// Number of instances the buffer can hold without reallocation.
+    capacity: usize,
 }
 
 fn prepare_instance_buffers(
     mut commands: Commands,
-    query: Query<(Entity, &InstanceMaterialData)>,
+    query: Query<(Entity, &InstanceMaterialData, Option<&InstanceBuffer>)>,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
 ) {
-    for (entity, instance_data) in &query {
+    for (entity, instance_data, existing_buf) in &query {
+        let new_len = instance_data.len();
+        let contents = bytemuck::cast_slice(instance_data.as_slice());
+
+        if let Some(existing) = existing_buf {
+            if existing.capacity >= new_len {
+                // Reuse existing buffer — just upload new data in place.
+                render_queue.write_buffer(&existing.buffer, 0, contents);
+                // Update length only (buffer & capacity stay the same).
+                commands.entity(entity).insert(InstanceBuffer {
+                    buffer: existing.buffer.clone(),
+                    length: new_len,
+                    capacity: existing.capacity,
+                });
+                continue;
+            }
+        }
+
+        // Need a new (larger) buffer.
         let buffer =
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("instance data buffer"),
-                contents: bytemuck::cast_slice(instance_data.as_slice()),
+                contents,
                 usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             });
         commands.entity(entity).insert(InstanceBuffer {
             buffer,
-            length: instance_data.len(),
+            length: new_len,
+            capacity: new_len,
         });
     }
 }
@@ -417,6 +439,18 @@ impl CameraZoom {
 pub const RADIUS_VIEW_CELLS: f32 = 32.0;
 
 // ----------------------------------------------------------------- state
+
+/// Per-frame timing data exposed to the diagnostics HUD.
+#[derive(Resource, Default)]
+pub struct RenderTimings {
+    pub walk_us: u64,
+    pub reconcile_us: u64,
+    pub visit_count: usize,
+    pub group_count: usize,
+    /// Set by the player movement system.
+    pub collision_us: u64,
+    pub collision_blocks: usize,
+}
 
 /// Entity entry for one `(NodeId, voxel)` group.
 struct GroupEntry {
@@ -715,6 +749,7 @@ pub fn render_world(
     palette: Option<Res<Palette>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut render_state: ResMut<RenderState>,
+    mut timings: ResMut<RenderTimings>,
 ) {
     let Some(palette) = palette else {
         return;
@@ -742,6 +777,7 @@ pub fn render_world(
     }
 
     // Walk
+    let walk_start = std::time::Instant::now();
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
@@ -754,17 +790,13 @@ pub fn render_world(
         &mut walk_stack,
         &mut visits,
     );
+    timings.walk_us = walk_start.elapsed().as_micros() as u64;
+    timings.visit_count = visits.len();
 
     // Ensure all visited NodeIds are baked before grouping.
-    {
-        let mut seen: Vec<NodeId> = Vec::new();
-        for v in visits.iter() {
-            if !seen.contains(&v.node_id) {
-                seen.push(v.node_id);
-            }
-        }
-        for nid in seen {
-            get_or_bake_mesh(&mut render_state, &world, nid, &mut meshes);
+    for v in visits.iter() {
+        if !render_state.meshes.contains_key(&v.node_id) {
+            get_or_bake_mesh(&mut render_state, &world, v.node_id, &mut meshes);
         }
     }
 
@@ -783,6 +815,8 @@ pub fn render_world(
     }
 
     // Reconcile: update or spawn one entity per group.
+    let reconcile_start = std::time::Instant::now();
+    timings.group_count = groups.len();
     let mut alive: HashMap<(NodeId, u8), GroupEntry> =
         HashMap::with_capacity(groups.len());
 
@@ -844,6 +878,8 @@ pub fn render_world(
         }
     }
     render_state.entities = alive;
+
+    timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
 
     render_state.walk_stack = walk_stack;
     render_state.visits = visits;

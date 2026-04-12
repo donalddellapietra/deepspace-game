@@ -25,6 +25,7 @@ use bevy::prelude::*;
 
 use super::position::Position;
 use super::state::WorldState;
+use super::tree::MAX_LAYER;
 use super::view::{
     bevy_from_position, cell_origin_for_anchor, cell_size_at_layer,
     is_layer_pos_solid, layer_pos_from_bevy, position_from_leaf_coord,
@@ -217,17 +218,15 @@ pub fn move_and_collide(
     view_layer: u8,
 ) {
     let view_cell = cell_size_at_layer(view_layer);
-    let target_layer = target_layer_for(view_layer);
-    let block_size = cell_size_at_layer(target_layer);
+    // Collision samples one level below the view — fine enough to
+    // catch small placed blocks (5-leaf precision at view 10) while
+    // keeping the block count manageable (~343 vs ~20k at leaf).
+    let collision_layer = (view_layer + 1).min(MAX_LAYER);
+    let block_size = cell_size_at_layer(collision_layer);
     let block_size_i64 = block_size as i64;
     let anchor = local_anchor(pos);
     let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
 
-    // `local_pos` is the entity's Bevy position in its own local
-    // anchor frame — always equal to the sub-voxel offset, so
-    // always in `[0, 1)³`. The AABB algorithm runs entirely on
-    // this small scratch `Vec3`; nothing here ever touches a
-    // long-range coordinate.
     let mut local_pos = local_bevy(pos, &anchor);
 
     let mut dy = vel.y * dt;
@@ -255,7 +254,7 @@ pub fn move_and_collide(
             for bx in bmin.x..=bmax.x {
                 if is_target_block_solid(
                     world,
-                    target_layer,
+                    collision_layer,
                     bx,
                     by,
                     bz,
@@ -310,8 +309,8 @@ pub fn move_and_collide(
 /// grid. Purely a read — does not mutate `pos`.
 pub fn on_ground(pos: &Position, world: &WorldState, view_layer: u8) -> bool {
     let view_cell = cell_size_at_layer(view_layer);
-    let target_layer = target_layer_for(view_layer);
-    let block_size = cell_size_at_layer(target_layer);
+    let collision_layer = (view_layer + 1).min(MAX_LAYER);
+    let block_size = cell_size_at_layer(collision_layer);
     let block_size_i64 = block_size as i64;
     let anchor = local_anchor(pos);
     let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
@@ -329,7 +328,7 @@ pub fn on_ground(pos: &Position, world: &WorldState, view_layer: u8) -> bool {
             for bx in bmin.x..=bmax.x {
                 if is_target_block_solid(
                     world,
-                    target_layer,
+                    collision_layer,
                     bx,
                     by,
                     bz,
@@ -377,8 +376,8 @@ pub fn on_ground(pos: &Position, world: &WorldState, view_layer: u8) -> bool {
 /// `target_layer = MAX_LAYER` (`block_size = 1`), so the walk
 /// converges at every view layer without hand-tuning per target.
 pub fn snap_to_ground(pos: &mut Position, world: &WorldState, view_layer: u8) {
-    let target_layer = target_layer_for(view_layer);
-    let block_size = cell_size_at_layer(target_layer);
+    let collision_layer = (view_layer + 1).min(MAX_LAYER);
+    let block_size = cell_size_at_layer(collision_layer);
     let block_size_i64 = block_size as i64;
     let anchor = local_anchor(pos);
     let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
@@ -391,7 +390,7 @@ pub fn snap_to_ground(pos: &mut Position, world: &WorldState, view_layer: u8) {
     let solid_at = |by: i32| {
         is_target_block_solid(
             world,
-            target_layer,
+            collision_layer,
             bx,
             by,
             bz,
