@@ -4,6 +4,7 @@
 /.vercel
 /ui/node_modules
 /ui/dist
+/ui/test-results
 
 # Downloaded test assets (large .vox files, etc.)
 /assets/vox/*.vox
