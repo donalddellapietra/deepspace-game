@@ -29,7 +29,7 @@ use bevy::prelude::*;
 use crate::block::Palette;
 use crate::model::mesher::{
     bake_volume, bake_child_faces, merge_child_faces,
-    flatten_children, uniform_child_skippable, ChildClass,
+    flatten_children, ChildClass,
 };
 use crate::model::BakedSubMesh;
 
@@ -130,18 +130,10 @@ pub struct RenderTimings {
 
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached baked sub-meshes keyed by `(NodeId, neighbor_same)`.
-    /// The `neighbor_same` array is included because the
-    /// `uniform_child_skippable` optimisation can skip entire children
-    /// when all six neighbours are identical — producing a different
-    /// (often empty) mesh for the same `NodeId` at different tree
-    /// positions. Without this, a fully-surrounded underground node
-    /// would cache an empty mesh and reuse it at the cave surface.
-    meshes: HashMap<(NodeId, [bool; 6]), Vec<BakedSubMesh>>,
+    /// Cached baked sub-meshes keyed by `NodeId`.
+    meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
-    /// Stores `(Entity, NodeId, neighbor_same, last_origin)` so we can
-    /// detect when the mesh cache key changes and re-spawn.
-    entities: HashMap<SmallPath, (Entity, NodeId, [bool; 6], Vec3)>,
+    entities: HashMap<SmallPath, (Entity, NodeId, Vec3)>,
     /// Zoom layer the `entities` set was built for. If it changes,
     /// everything gets despawned and rebuilt.
     last_zoom_layer: u8,
@@ -184,86 +176,25 @@ impl SmallPath {
 
 // ----------------------------------------------------------- mesh caching
 
-/// For each of 6 directions, check whether the neighboring
-/// emit-layer sibling's border children all match ours along the
-/// shared face. If they do, our boundary children in that direction
-/// can be skipped (same content on both sides → no exposed faces).
-fn compute_neighbor_same(
-    world: &WorldState,
-    path: &SmallPath,
-    node_id: NodeId,
-    emit_depth: u8,
-) -> [bool; 6] {
-    if emit_depth == 0 {
-        return [false; 6];
-    }
-    // Walk to the grandparent (one level above emit).
-    let mut gp_id = world.root;
-    for i in 0..(emit_depth as usize - 1) {
-        let Some(node) = world.library.get(gp_id) else { return [false; 6] };
-        let Some(ch) = node.children.as_ref() else { return [false; 6] };
-        gp_id = ch[path.slots[i] as usize];
-        if gp_id == EMPTY_NODE { return [false; 6] }
-    }
-    let Some(gp) = world.library.get(gp_id) else { return [false; 6] };
-    let Some(gp_ch) = gp.children.as_ref() else { return [false; 6] };
-
-    let Some(our) = world.library.get(node_id) else { return [false; 6] };
-    let Some(oc) = our.children.as_ref() else { return [false; 6] };
-
-    let slot = path.slots[emit_depth as usize - 1] as usize;
-    let (sx, sy, sz) = slot_coords(slot);
+/// Skip a uniform child only if all 6 neighbors within the 5³ grid
+/// are the same uniform value. Boundary children always bake.
+fn is_interior_uniform(slot: usize, v: u8, child_class: &[ChildClass]) -> bool {
     let bf = BRANCH_FACTOR;
-
-    /// Compare 5×5 border children along one face. `our_idx` and
-    /// `their_idx` map (a, b) in 0..5 to a child slot index.
-    fn faces_match(
-        world: &WorldState,
-        gp_ch: &[NodeId; CHILDREN_PER_NODE],
-        oc: &[NodeId; CHILDREN_PER_NODE],
-        node_id: NodeId,
-        neighbor_slot: usize,
-        our_idx: impl Fn(usize, usize) -> usize,
-        their_idx: impl Fn(usize, usize) -> usize,
-    ) -> bool {
-        let nid = gp_ch[neighbor_slot];
-        if nid == EMPTY_NODE { return false }
-        if nid == node_id { return true }
-        let Some(n) = world.library.get(nid) else { return false };
-        let Some(nc) = n.children.as_ref() else { return false };
-        (0..BRANCH_FACTOR).all(|a| (0..BRANCH_FACTOR).all(|b|
-            oc[our_idx(a, b)] == nc[their_idx(a, b)]
-        ))
-    }
-
-    // Each direction: compare our face at the boundary vs the
-    // neighbor's opposite face. The axis that varies is fixed at
-    // 0 (our near edge) or bf-1 (our far edge / their far edge).
-    let result = |delta: (isize, isize, isize),
-                  our_idx: &dyn Fn(usize, usize) -> usize,
-                  their_idx: &dyn Fn(usize, usize) -> usize| -> bool {
-        let (nx, ny, nz) = (
-            sx as isize + delta.0,
-            sy as isize + delta.1,
-            sz as isize + delta.2,
-        );
-        if nx < 0 || ny < 0 || nz < 0
-            || nx >= bf as isize || ny >= bf as isize || nz >= bf as isize
-        {
+    let (sx, sy, sz) = slot_coords(slot);
+    let neighbors: [(usize, usize, usize); 6] = [
+        (sx.wrapping_sub(1), sy, sz),
+        (sx + 1, sy, sz),
+        (sx, sy.wrapping_sub(1), sz),
+        (sx, sy + 1, sz),
+        (sx, sy, sz.wrapping_sub(1)),
+        (sx, sy, sz + 1),
+    ];
+    neighbors.iter().all(|&(nx, ny, nz)| {
+        if nx >= bf || ny >= bf || nz >= bf {
             return false;
         }
-        let ns = slot_index(nx as usize, ny as usize, nz as usize);
-        faces_match(world, gp_ch, oc, node_id, ns, our_idx, their_idx)
-    };
-
-    [
-        result((-1,0,0), &|a,b| slot_index(0,a,b),    &|a,b| slot_index(bf-1,a,b)), // -x
-        result((1,0,0),  &|a,b| slot_index(bf-1,a,b), &|a,b| slot_index(0,a,b)),    // +x
-        result((0,-1,0), &|a,b| slot_index(a,0,b),    &|a,b| slot_index(a,bf-1,b)), // -y
-        result((0,1,0),  &|a,b| slot_index(a,bf-1,b), &|a,b| slot_index(a,0,b)),    // +y
-        result((0,0,-1), &|a,b| slot_index(a,b,0),    &|a,b| slot_index(a,b,bf-1)), // -z
-        result((0,0,1),  &|a,b| slot_index(a,b,bf-1), &|a,b| slot_index(a,b,0)),    // +z
-    ]
+        child_class[slot_index(nx, ny, nz)] == ChildClass::Uniform(v)
+    })
 }
 
 fn get_or_bake_mesh<'a>(
@@ -286,11 +217,7 @@ impl RenderState {
         emit_depth: u8,
         meshes: &mut Assets<Mesh>,
     ) -> &'a [BakedSubMesh] {
-        let neighbor_same = compute_neighbor_same(
-            world, &path, node_id, emit_depth,
-        );
-        let cache_key = (node_id, neighbor_same);
-        if !self.meshes.contains_key(&cache_key) {
+        if !self.meshes.contains_key(&node_id) {
             let node = world
                 .library
                 .get(node_id)
@@ -356,11 +283,7 @@ impl RenderState {
                             return Default::default();
                         }
                         if let ChildClass::Uniform(v) = child_class[slot] {
-                            if uniform_child_skippable(
-                                slot, v, &child_class,
-                                BRANCH_FACTOR, EMPTY_VOXEL,
-                                neighbor_same,
-                            ) {
+                            if v == EMPTY_VOXEL || is_interior_uniform(slot, v, &child_class) {
                                 return Default::default();
                             }
                         }
@@ -397,10 +320,10 @@ impl RenderState {
                     meshes,
                 )
             };
-            self.meshes.insert(cache_key, baked);
+            self.meshes.insert(node_id, baked);
         }
         self.meshes
-            .get(&cache_key)
+            .get(&node_id)
             .expect("just inserted")
             .as_slice()
     }
@@ -416,7 +339,6 @@ struct Visit {
     node_id: NodeId,
     origin: Vec3,
     scale: f32,
-    neighbor_same: [bool; 6],
 }
 
 /// One frame on the `walk()` DFS stack. Extracted into a named
@@ -514,7 +436,6 @@ fn walk(
                 node_id,
                 origin: origin_bevy,
                 scale: scale_for_layer(target_layer),
-                neighbor_same: [false; 6],
             });
             continue;
         }
@@ -530,7 +451,6 @@ fn walk(
                 node_id,
                 origin: origin_bevy,
                 scale: scale_for_layer(depth),
-                neighbor_same: [false; 6],
             });
             continue;
         };
@@ -594,7 +514,7 @@ pub fn render_world(
     // If emit layer changed, or we're on our first pass, drop everything.
     if !render_state.initialised || render_state.last_zoom_layer != emit_layer
     {
-        for (_, (entity, _, _, _)) in render_state.entities.drain() {
+        for (_, (entity, _, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
@@ -626,17 +546,11 @@ pub fn render_world(
     timings.walk_us = walk_start.elapsed().as_micros() as u64;
     timings.visit_count = visits.len();
 
-    // Pre-bake any new (NodeId, neighbor_same) pairs before the reconcile loop.
-    // Also populate each Visit's neighbor_same field so the reconcile
-    // loop can look up the correct cache entry.
+    // Pre-bake any new NodeIds before the reconcile loop.
     {
         let bake_start = std::time::Instant::now();
-        for v in visits.iter_mut() {
-            v.neighbor_same = compute_neighbor_same(
-                &world, &v.path, v.node_id, emit_layer,
-            );
-            let cache_key = (v.node_id, v.neighbor_same);
-            if !render_state.meshes.contains_key(&cache_key) {
+        for v in visits.iter() {
+            if !render_state.meshes.contains_key(&v.node_id) {
                 get_or_bake_mesh(&mut render_state, &world, v.node_id, v.path, emit_layer, &mut meshes);
             }
         }
@@ -645,18 +559,16 @@ pub fn render_world(
 
     // Reconcile: what's alive now, what changed, what's gone.
     let reconcile_start = std::time::Instant::now();
-    let mut alive: HashMap<SmallPath, (Entity, NodeId, [bool; 6], Vec3)> =
+    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
         HashMap::with_capacity(visits.len());
 
     for visit in visits.drain(..) {
         let new_node_id = visit.node_id;
-        let ns = visit.neighbor_same;
-        let cache_key = (new_node_id, ns);
         let existing = render_state.entities.remove(&visit.path);
 
         match existing {
-            Some((entity, existing_id, existing_ns, last_origin))
-                if existing_id == new_node_id && existing_ns == ns =>
+            Some((entity, existing_id, last_origin))
+                if existing_id == new_node_id =>
             {
                 if last_origin != visit.origin {
                     if let Ok(mut ec) = commands.get_entity(entity) {
@@ -666,17 +578,17 @@ pub fn render_world(
                         );
                     }
                 }
-                alive.insert(visit.path, (entity, existing_id, ns, visit.origin));
+                alive.insert(visit.path, (entity, existing_id, visit.origin));
             }
             other => {
-                if let Some((old_entity, _, _, _)) = other {
+                if let Some((old_entity, _, _)) = other {
                     if let Ok(mut ec) = commands.get_entity(old_entity) {
                         ec.despawn();
                     }
                 }
 
                 let baked = render_state.meshes
-                    .get(&cache_key)
+                    .get(&new_node_id)
                     .cloned()
                     .unwrap_or_default();
 
@@ -703,12 +615,12 @@ pub fn render_world(
                     ));
                 }
 
-                alive.insert(visit.path, (parent, new_node_id, ns, visit.origin));
+                alive.insert(visit.path, (parent, new_node_id, visit.origin));
             }
         }
     }
 
-    for (_, (entity, _, _, _)) in render_state.entities.drain() {
+    for (_, (entity, _, _)) in render_state.entities.drain() {
         if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
         }
