@@ -1,36 +1,34 @@
-//! Swept-AABB collision for the player, in the current
-//! [`WorldAnchor`] frame.
+//! Swept-AABB collision that operates on [`Position`] directly.
 //!
-//! The player's `Transform` is always near Bevy `(0, 0, 0)` because
-//! the world anchor shifts each frame to track the player's integer
-//! leaf coord (see `docs/architecture/coordinates.md` and the
-//! `view` module). Every function in this module takes a
-//! `&WorldAnchor` so it can turn absolute block positions into
-//! small Bevy deltas without ever computing a huge `f32`.
+//! The public API takes `&(mut) Position` and never exposes a
+//! long-range `Vec3` — no caller has to worry about `f32` precision
+//! regardless of where in the 6-billion-leaf world the entity sits.
+//! Internally, each function builds a **local** [`WorldAnchor`]
+//! equal to the entity's own integer leaf coord, runs the existing
+//! AABB algorithm on a small `Vec3` scratch (the entity's sub-voxel
+//! offset is the starting point; deltas of at most a view cell are
+//! added each frame), and then folds the updated `Vec3` back into
+//! the `Position` via an exact `i64` leaf addition. The `Vec3`
+//! never accumulates a large value and the `Position` is the
+//! single source of truth.
 //!
-//! * [`solid_at_integer`] probes the leaf voxel at an `IVec3` Bevy
-//!   coord in the anchor frame. Used by the remaining leaf-level
-//!   tests.
-//! * [`move_and_collide`] does per-axis swept-AABB clipping for the
-//!   player, sampling blocks at
-//!   [`target_layer_for`](super::view::target_layer_for) so the
-//!   collision lattice matches what the renderer draws.
-//! * [`on_ground`] tests whether the player is resting on something
-//!   directly beneath their feet.
-//! * [`snap_to_ground`] re-places the player on top of the apparent
-//!   ground after a zoom change (presence-preserving downsample
-//!   can inflate thin features, so the block grid grows vertically
-//!   when zooming out).
+//! * [`move_and_collide`] runs per-axis swept clipping against the
+//!   target-layer block grid and updates `pos` in place.
+//! * [`on_ground`] tests whether the entity is resting on something
+//!   at the current view layer.
+//! * [`snap_to_ground`] re-places the entity on top of the apparent
+//!   ground after a zoom change (presence-preserving downsample can
+//!   inflate thin features vertically, so the collision grid grows
+//!   upward when zooming out).
 
 use bevy::prelude::*;
 
-use super::edit::get_voxel;
 use super::position::Position;
 use super::state::WorldState;
-use super::tree::EMPTY_VOXEL;
 use super::view::{
-    cell_size_at_layer, is_layer_pos_solid, layer_pos_from_bevy,
-    position_from_bevy, target_layer_for, WorldAnchor,
+    bevy_from_position, cell_size_at_layer, is_layer_pos_solid,
+    layer_pos_from_bevy, position_from_leaf_coord, position_to_leaf_coord,
+    target_layer_for, WorldAnchor,
 };
 
 // ------------------------------------------------------------ player AABB
@@ -40,50 +38,62 @@ pub const PLAYER_HW: f32 = 0.3;
 /// Total height of the player's AABB, in view-layer cells.
 pub const PLAYER_H: f32 = 1.7;
 
-// --------------------------------------------------------------- solidity
+// ----------------------------------------------------- local-frame helpers
 
-/// Is the leaf voxel at `position` non-empty?
-pub fn is_voxel_solid(world: &WorldState, position: &Position) -> bool {
-    get_voxel(world, position) != EMPTY_VOXEL
-}
-
-/// Is the leaf voxel at the Bevy integer coordinate `coord` solid,
-/// interpreted in the frame of `anchor`?
-///
-/// `coord` names the unit-cube `[coord, coord+1]` in Bevy space.
-/// Anything outside the materialised root (`Position` conversion
-/// fails) is treated as empty space — the player can fall into the
-/// void, but physics doesn't panic. Kept as a leaf-only probe for
-/// the existing tests.
-pub fn solid_at_integer(world: &WorldState, coord: IVec3, anchor: &WorldAnchor) -> bool {
-    let center = Vec3::new(
-        coord.x as f32 + 0.5,
-        coord.y as f32 + 0.5,
-        coord.z as f32 + 0.5,
-    );
-    match position_from_bevy(center, anchor) {
-        Some(p) => is_voxel_solid(world, &p),
-        None => false,
+/// Build the local anchor that places `pos` at (approximately)
+/// Bevy `(0, 0, 0)` — specifically, at `Vec3::from(pos.offset)`.
+/// This lets every collision function run the existing AABB
+/// algorithm on a tiny scratch `Vec3` without any `f32` precision
+/// concerns, no matter how deep `pos` is in the tree.
+#[inline]
+fn local_anchor(pos: &Position) -> WorldAnchor {
+    WorldAnchor {
+        leaf_coord: position_to_leaf_coord(pos),
     }
 }
 
-// ----------------------------------------------------------- collision
+/// The entity's Bevy position in its own local anchor frame. Always
+/// equal to the sub-voxel offset `(pos.offset[0], pos.offset[1],
+/// pos.offset[2])`, which lives in `[0, 1)³`.
+#[inline]
+fn local_bevy(pos: &Position, anchor: &WorldAnchor) -> Vec3 {
+    bevy_from_position(pos, anchor)
+}
+
+/// Fold a local Bevy `Vec3` (in the frame of `anchor`) back into a
+/// [`Position`], splitting it into an exact `i64` leaf delta and a
+/// `[0, 1)` sub-voxel offset. Returns `None` if the result leaves
+/// the world.
+fn position_from_local(local: Vec3, anchor: &WorldAnchor) -> Option<Position> {
+    let int_delta: [i64; 3] = [
+        local.x.floor() as i64,
+        local.y.floor() as i64,
+        local.z.floor() as i64,
+    ];
+    let new_leaf = [
+        anchor.leaf_coord[0] + int_delta[0],
+        anchor.leaf_coord[1] + int_delta[1],
+        anchor.leaf_coord[2] + int_delta[2],
+    ];
+    let mut new_pos = position_from_leaf_coord(new_leaf)?;
+    new_pos.offset = [
+        local.x - int_delta[0] as f32,
+        local.y - int_delta[1] as f32,
+        local.z - int_delta[2] as f32,
+    ];
+    Some(new_pos)
+}
+
+// ----------------------------------------------------------- block grid
 //
-// The player AABB scales with the view layer's cell size: at view L
-// the player is `PLAYER_HW` cells wide and `PLAYER_H` cells tall
-// (= the camera's eye height). Collision blocks are sampled at
-// `target_layer = (L + 2).min(MAX_LAYER)` — the same layer the
-// renderer reads from — so the visible mesh and the collision
-// lattice always agree, at every zoom level.
-//
-// Block indices are expressed in an **anchor-local block grid**:
-// `rbx = 0` is the block the anchor sits inside, `rbx = 1` is its
-// +x neighbour, and so on. `cell_origin` is the Bevy offset from
-// the anchor to the `-x,-y,-z` corner of block `rbx=0`, which is
-// always `-(anchor.leaf_coord % block_size)` — a small, signed
-// value in `(-block_size, 0]`. That's how the whole collision
-// pipeline stays in a small Bevy range regardless of how deep into
-// the 6-billion-leaf root the player currently is.
+// The block grid at `target_layer` is anchored at the root's
+// `-x,-y,-z` corner in the world's integer leaf frame. Viewed from
+// the local anchor (= the entity's own leaf coord), block index
+// `rbx = 0` is the block that contains the entity, `rbx = 1` is
+// its +x neighbour, and so on. `cell_origin` is the Bevy offset
+// from the local anchor to that `rbx = 0` block's corner, which
+// is always `-(anchor.leaf_coord % block_size)` — a small value
+// in `(-block_size, 0]`.
 
 #[derive(Clone, Copy)]
 struct Aabb {
@@ -100,10 +110,6 @@ fn player_aabb(pos: Vec3, view_cell: f32) -> Aabb {
     }
 }
 
-/// Bevy-space offset from the anchor to the `-x,-y,-z` corner of the
-/// anchor-aligned block grid's "block 0" (i.e. the block that
-/// contains the anchor). Always in `(-block_size, 0]` so all the
-/// collision arithmetic stays in a small `f32` range.
 fn cell_origin_for_anchor(anchor: &WorldAnchor, block_size_i64: i64) -> Vec3 {
     Vec3::new(
         -(anchor.leaf_coord[0].rem_euclid(block_size_i64) as f32),
@@ -164,9 +170,8 @@ fn clip_axis(
 }
 
 /// Sample the layer-`target_layer` cell at the anchor-local block
-/// index `(bx, by, bz)`. The block's Bevy centre is computed
-/// relative to the anchor, then [`layer_pos_from_bevy`] handles the
-/// i64 addition back to an absolute `LayerPos` internally.
+/// index `(bx, by, bz)`. Goes through [`layer_pos_from_bevy`] which
+/// handles the `i64` absolute recovery internally.
 fn is_target_block_solid(
     world: &WorldState,
     target_layer: u8,
@@ -189,8 +194,6 @@ fn is_target_block_solid(
     }
 }
 
-/// Convert an AABB into the half-open cell range that overlaps it,
-/// expressed in cell-units relative to `cell_origin` and `block_size`.
 fn aabb_block_range(aabb: Aabb, block_size: f32, cell_origin: Vec3) -> (IVec3, IVec3) {
     (
         IVec3::new(
@@ -206,32 +209,39 @@ fn aabb_block_range(aabb: Aabb, block_size: f32, cell_origin: Vec3) -> (IVec3, I
     )
 }
 
-/// Resolve player movement with per-axis clipping. The player AABB
-/// scales with the view layer's cell size, and the collision blocks
-/// are sampled at the same layer the renderer reads from
-/// (`target = (view_layer + 2).min(MAX_LAYER)`).
+// --------------------------------------------------------- public API
+
+/// Resolve movement for an entity at `pos` with velocity `vel` and a
+/// horizontal input delta, against the target-layer block grid. On
+/// return `pos` has been updated in place via exact `i64` path math;
+/// `vel.y` is zeroed if a vertical clip occurred.
 pub fn move_and_collide(
-    pos: &mut Vec3,
+    pos: &mut Position,
     vel: &mut Vec3,
     horizontal_delta: Vec2,
     dt: f32,
     world: &WorldState,
     view_layer: u8,
-    anchor: &WorldAnchor,
 ) {
     let view_cell = cell_size_at_layer(view_layer);
     let target_layer = target_layer_for(view_layer);
     let block_size = cell_size_at_layer(target_layer);
     let block_size_i64 = block_size as i64;
-    let cell_origin = cell_origin_for_anchor(anchor, block_size_i64);
+    let anchor = local_anchor(pos);
+    let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
+
+    // `local_pos` is the entity's Bevy position in its own local
+    // anchor frame — always equal to the sub-voxel offset, so
+    // always in `[0, 1)³`. The AABB algorithm runs entirely on
+    // this small scratch `Vec3`; nothing here ever touches a
+    // long-range coordinate.
+    let mut local_pos = local_bevy(pos, &anchor);
 
     let mut dy = vel.y * dt;
     let dx = horizontal_delta.x;
     let dz = horizontal_delta.y;
 
-    // Expanded AABB covers the player's range plus the move delta
-    // plus one block's margin on each side.
-    let player = player_aabb(*pos, view_cell);
+    let player = player_aabb(local_pos, view_cell);
     let expanded = Aabb {
         min: Vec3::new(
             player.min.x + dx.min(0.0) - block_size,
@@ -258,7 +268,7 @@ pub fn move_and_collide(
                     bz,
                     block_size,
                     cell_origin,
-                    anchor,
+                    &anchor,
                 ) {
                     blocks.push((bx, by, bz));
                 }
@@ -267,50 +277,54 @@ pub fn move_and_collide(
     }
 
     // --- Y first ---
-    let pa = player_aabb(*pos, view_cell);
+    let pa = player_aabb(local_pos, view_cell);
     let original_dy = dy;
     for &(bx, by, bz) in &blocks {
         dy = clip_axis(&pa, dy, 1, bx, by, bz, block_size, cell_origin);
     }
-    pos.y += dy;
+    local_pos.y += dy;
     if (dy - original_dy).abs() > 1e-6 {
         vel.y = 0.0;
     }
 
     // --- X ---
-    let pa = player_aabb(*pos, view_cell);
+    let pa = player_aabb(local_pos, view_cell);
     let mut clipped_dx = dx;
     for &(bx, by, bz) in &blocks {
         clipped_dx = clip_axis(&pa, clipped_dx, 0, bx, by, bz, block_size, cell_origin);
     }
-    pos.x += clipped_dx;
+    local_pos.x += clipped_dx;
 
     // --- Z ---
-    let pa = player_aabb(*pos, view_cell);
+    let pa = player_aabb(local_pos, view_cell);
     let mut clipped_dz = dz;
     for &(bx, by, bz) in &blocks {
         clipped_dz = clip_axis(&pa, clipped_dz, 2, bx, by, bz, block_size, cell_origin);
     }
-    pos.z += clipped_dz;
+    local_pos.z += clipped_dz;
+
+    // Fold the new local Vec3 back into the `Position`. The delta
+    // from the anchor (an `i64` leaf coord) is small — at most a
+    // fraction of a view cell — so the `f32`-to-`i64` cast is
+    // exact.
+    if let Some(updated) = position_from_local(local_pos, &anchor) {
+        *pos = updated;
+    }
 }
 
-/// Is the player standing on something? Tests a tiny downward nudge
-/// (one tenth of a block at the current layer) against all nearby
-/// blocks at `target_layer`. If the nudge gets clipped ~to zero we
-/// were on the floor.
-pub fn on_ground(
-    pos: Vec3,
-    world: &WorldState,
-    view_layer: u8,
-    anchor: &WorldAnchor,
-) -> bool {
+/// Is the entity at `pos` standing on something at `view_layer`?
+/// Probes a small downward nudge against the target-layer block
+/// grid. Purely a read — does not mutate `pos`.
+pub fn on_ground(pos: &Position, world: &WorldState, view_layer: u8) -> bool {
     let view_cell = cell_size_at_layer(view_layer);
     let target_layer = target_layer_for(view_layer);
     let block_size = cell_size_at_layer(target_layer);
     let block_size_i64 = block_size as i64;
-    let cell_origin = cell_origin_for_anchor(anchor, block_size_i64);
+    let anchor = local_anchor(pos);
+    let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
+    let local_pos = local_bevy(pos, &anchor);
 
-    let player = player_aabb(pos, view_cell);
+    let player = player_aabb(local_pos, view_cell);
     let probe = Aabb {
         min: Vec3::new(player.min.x, player.min.y - 0.1 * block_size, player.min.z),
         max: player.max,
@@ -328,7 +342,7 @@ pub fn on_ground(
                     bz,
                     block_size,
                     cell_origin,
-                    anchor,
+                    &anchor,
                 ) {
                     test_dy = clip_axis(
                         &player,
@@ -347,46 +361,39 @@ pub fn on_ground(
     test_dy.abs() < 0.04 * block_size
 }
 
-/// Snap the player onto the top of the apparent ground at the
-/// current view layer. Used after a zoom change, because the
-/// target-layer collision grid can *inflate* thin features when the
-/// block size grows past the feature's actual thickness:
+/// Snap `pos` onto the top of the apparent ground at the current
+/// view layer. Used after a zoom change, because the target-layer
+/// collision grid can inflate thin features when the block size
+/// grows past the feature's actual thickness.
 ///
-/// The grassland ground is 125 leaves deep, and the presence-
-/// preserving downsample in `tree::downsample` propagates "any non-
-/// empty child → solid parent". So at view layer 6 (target 8, block
-/// size 625 leaves) the one-row ground becomes a full 625-leaf-tall
-/// solid block — the player, spawned a couple of leaves above actual
-/// grass, ends up *inside* the inflated block the moment they press
-/// Q. `move_and_collide`'s clip only stops motion that's heading
-/// *into* a block from outside, so gravity happily pulls them
-/// straight through.
+/// The grassland ground is 125 leaves deep; the presence-preserving
+/// downsample in `tree::downsample` propagates "any non-empty child
+/// → solid parent". So at view layer 6 (block size 625 leaves) the
+/// one-row ground becomes a full 625-leaf-tall solid block. An
+/// entity at `pos.y = 2` after spawning would be inside that
+/// inflated block, and `move_and_collide`'s clip only stops motion
+/// heading into a block from outside — gravity would otherwise
+/// pull the entity straight through.
 ///
-/// This function walks the player's column at the new target layer:
-///
-/// * if the feet block is solid, walk upward until reaching empty
-///   space and place feet at the bottom of it (= top of the ground);
-/// * if the feet block is empty, walk downward until reaching solid
-///   and place feet at its top. This handles the mirror case (zoom
-///   *in*, ground shrinks), so pressing F while standing on the
-///   inflated ground doesn't leave the player hanging in the air.
-///
-/// Both walks are bounded at 64 steps — more than enough to exit any
-/// bottom-row stack, and bounded-latency regardless of view layer.
-pub fn snap_to_ground(
-    pos: &mut Vec3,
-    world: &WorldState,
-    view_layer: u8,
-    anchor: &WorldAnchor,
-) {
+/// Walks `pos`'s column at the new target layer. If the feet block
+/// is solid, walk upward until reaching empty space. Otherwise walk
+/// downward until reaching solid (the mirror case — zoom in shrinks
+/// the apparent ground, entity has to drop). Both walks are capped
+/// at 256 steps — more than enough to cross the 125-leaf grassland
+/// ground even at `target_layer = MAX_LAYER` (`block_size = 1`), so
+/// the walk converges at every view layer without hand-tuning per
+/// target.
+pub fn snap_to_ground(pos: &mut Position, world: &WorldState, view_layer: u8) {
     let target_layer = target_layer_for(view_layer);
     let block_size = cell_size_at_layer(target_layer);
     let block_size_i64 = block_size as i64;
-    let cell_origin = cell_origin_for_anchor(anchor, block_size_i64);
+    let anchor = local_anchor(pos);
+    let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
+    let mut local_pos = local_bevy(pos, &anchor);
 
-    let bx = ((pos.x - cell_origin.x) / block_size).floor() as i32;
-    let bz = ((pos.z - cell_origin.z) / block_size).floor() as i32;
-    let mut by = ((pos.y - cell_origin.y) / block_size).floor() as i32;
+    let bx = ((local_pos.x - cell_origin.x) / block_size).floor() as i32;
+    let bz = ((local_pos.z - cell_origin.z) / block_size).floor() as i32;
+    let mut by = ((local_pos.y - cell_origin.y) / block_size).floor() as i32;
 
     let solid_at = |by: i32| {
         is_target_block_solid(
@@ -397,31 +404,37 @@ pub fn snap_to_ground(
             bz,
             block_size,
             cell_origin,
-            anchor,
+            &anchor,
         )
     };
 
+    let mut new_y: Option<f32> = None;
     if solid_at(by) {
-        // Inside a solid block — walk up until empty.
-        for _ in 0..64 {
+        for _ in 0..256 {
             by += 1;
             if !solid_at(by) {
-                pos.y = cell_origin.y + by as f32 * block_size;
-                return;
+                new_y = Some(cell_origin.y + by as f32 * block_size);
+                break;
             }
         }
     } else {
-        // In empty space — walk down until solid and land on top.
-        for _ in 0..64 {
+        for _ in 0..256 {
             by -= 1;
             if solid_at(by) {
-                pos.y = cell_origin.y + (by + 1) as f32 * block_size;
-                return;
+                new_y = Some(cell_origin.y + (by + 1) as f32 * block_size);
+                break;
             }
         }
     }
-    // Didn't converge in 64 steps — leave the player where they are
-    // rather than teleport them somewhere surprising.
+
+    if let Some(y) = new_y {
+        local_pos.y = y;
+        if let Some(updated) = position_from_local(local_pos, &anchor) {
+            *pos = updated;
+        }
+    }
+    // If we didn't converge in 64 steps, leave `pos` as-is rather
+    // than teleport somewhere surprising.
 }
 
 // ------------------------------------------------------------------ tests
@@ -429,83 +442,82 @@ pub fn snap_to_ground(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::state::GROUND_Y_VOXELS;
+    use super::super::tree::{slot_index, MAX_LAYER, NODE_VOXELS_PER_AXIS};
+    use super::super::position::NODE_PATH_LEN;
 
-    /// An anchor whose leaf coord matches the *historical* fixed
-    /// `ROOT_ORIGIN` — Bevy `(0, 0, 0)` corresponds to the leaf one
-    /// row above the grass surface at the world's all-zero path.
-    /// Used by the existing leaf-level tests so their integer Bevy
-    /// coords still mean what they used to.
-    fn legacy_anchor() -> WorldAnchor {
-        WorldAnchor {
-            leaf_coord: [13, super::super::state::GROUND_Y_VOXELS, 13],
+    /// Leaf-level position in the all-zero path at voxel `(12, vy, 12)`
+    /// — the all-zero leaf is at Bevy (~0, ~-125..-100, ~0) under the
+    /// legacy constant anchor. With the floating anchor we express
+    /// tests against the Position directly.
+    fn position_at_voxel(vy: u8) -> Position {
+        let mut p = Position::origin();
+        p.voxel = [12, vy, 12];
+        p.offset = [0.5, 0.0, 0.5];
+        p
+    }
+
+    /// Position resting directly on the grass surface: leaf-coord
+    /// y = `GROUND_Y_VOXELS` (the first air voxel), voxel y = 0,
+    /// fractional offset y = 0. In the position's own local anchor
+    /// frame that's Bevy `(offset.x, 0.0, offset.z)` with the top
+    /// face of the grass at Bevy `y = 0`.
+    fn position_on_ground() -> Position {
+        let mut path = [0u8; NODE_PATH_LEN];
+        // At depth `MAX_LAYER - 2` the layer-10 node at slot
+        // `(0, 1, 0)` starts at root-local leaf y = 125 =
+        // `GROUND_Y_VOXELS` — the first air voxel above the grass.
+        path[NODE_PATH_LEN - 2] = slot_index(0, 1, 0) as u8;
+        let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
+        Position {
+            path,
+            voxel: [mid, 0, mid],
+            offset: [0.5, 0.0, 0.5],
         }
     }
 
-    #[test]
-    fn solid_at_integer_grassland_below_surface_is_solid() {
-        let world = WorldState::new_grassland();
-        let a = legacy_anchor();
-        // Below ground (Bevy y < 0) — the grass region.
-        assert!(solid_at_integer(&world, IVec3::new(0, -1, 0), &a));
-        assert!(solid_at_integer(&world, IVec3::new(5, -10, -3), &a));
-        assert!(solid_at_integer(&world, IVec3::new(0, -50, 0), &a));
-        // The deepest solid voxel sits at Bevy y = -GROUND_Y_VOXELS.
-        let deepest_y = -(super::super::state::GROUND_Y_VOXELS as i32);
-        assert!(solid_at_integer(&world, IVec3::new(0, deepest_y, 0), &a));
+    /// Position 2 leaves above the grass top face. Drops under
+    /// gravity for a couple of frames before landing.
+    fn position_airborne() -> Position {
+        let mut path = [0u8; NODE_PATH_LEN];
+        path[NODE_PATH_LEN - 2] = slot_index(0, 1, 0) as u8;
+        let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
+        Position {
+            path,
+            voxel: [mid, 2, mid],
+            offset: [0.5, 0.0, 0.5],
+        }
     }
 
+    /// At every view layer, a position placed "just above the grass"
+    /// must end up standing on top of the apparent ground after a
+    /// [`snap_to_ground`] call — feet in an empty block, block
+    /// directly below them solid. Regression against the bug where
+    /// pressing Q put the player inside an inflated ground block
+    /// and gravity then pulled them through.
     #[test]
-    fn solid_at_integer_grassland_above_surface_is_empty() {
-        let world = WorldState::new_grassland();
-        let a = legacy_anchor();
-        // Above ground (Bevy y >= 0) — all air.
-        assert!(!solid_at_integer(&world, IVec3::new(0, 0, 0), &a));
-        assert!(!solid_at_integer(&world, IVec3::new(0, 5, 0), &a));
-        assert!(!solid_at_integer(&world, IVec3::new(100, 100, 100), &a));
-    }
-
-    #[test]
-    fn solid_at_integer_outside_root_is_empty() {
-        let world = WorldState::new_grassland();
-        let a = legacy_anchor();
-        // Strictly below the grass floor is outside the materialised
-        // world and should be air, not solid.
-        let deepest_y = -(super::super::state::GROUND_Y_VOXELS as i32);
-        assert!(!solid_at_integer(
-            &world,
-            IVec3::new(0, deepest_y - 5, 0),
-            &a,
-        ));
-        // Well outside the root on `-x`.
-        assert!(!solid_at_integer(&world, IVec3::new(-50, -1, 0), &a));
-    }
-
-    /// At every view layer, a player placed at a Bevy Y that used
-    /// to be "just above the grass" must end up standing on top of
-    /// the apparent ground after a snap — feet in an empty block,
-    /// block directly below them solid. Regression against the bug
-    /// where pressing Q put the player inside an inflated ground
-    /// block and gravity then pulled them through.
-    #[test]
-    fn snap_to_ground_leaves_player_standing_at_every_view_layer() {
+    fn snap_to_ground_leaves_position_standing_at_every_view_layer() {
         use super::super::render::{MAX_ZOOM, MIN_ZOOM};
         let world = WorldState::new_grassland();
-        let anchor = legacy_anchor();
         for view_layer in MIN_ZOOM..=MAX_ZOOM {
             let target = target_layer_for(view_layer);
             let block_size = cell_size_at_layer(target);
             let block_size_i64 = block_size as i64;
-            let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
-            let mut pos = Vec3::new(0.0, 2.0, 0.0);
-            snap_to_ground(&mut pos, &world, view_layer, &anchor);
+            let mut pos = position_airborne();
+            snap_to_ground(&mut pos, &world, view_layer);
 
-            // Feet block = the block containing `pos`. Must be empty.
-            let bx = ((pos.x - cell_origin.x) / block_size).floor() as i32;
-            let bz = ((pos.z - cell_origin.z) / block_size).floor() as i32;
-            // `pos.y` lands exactly on a block boundary, so nudge up
-            // by a fraction of a block when computing which block
-            // "contains" the feet for the is-empty check.
-            let by_feet = ((pos.y - cell_origin.y + 0.01 * block_size)
+            // Reconstruct the same local-anchor frame the public
+            // API uses internally and verify the contract.
+            let anchor = local_anchor(&pos);
+            let cell_origin = cell_origin_for_anchor(&anchor, block_size_i64);
+            let local_pos = local_bevy(&pos, &anchor);
+            let bx = ((local_pos.x - cell_origin.x) / block_size).floor() as i32;
+            let bz = ((local_pos.z - cell_origin.z) / block_size).floor() as i32;
+            // `local_pos.y` lands exactly on a block boundary after
+            // the snap, so nudge up by a fraction of a block when
+            // computing which block "contains" the feet for the
+            // is-empty check.
+            let by_feet = ((local_pos.y - cell_origin.y + 0.01 * block_size)
                 / block_size)
                 .floor() as i32;
             assert!(
@@ -532,25 +544,46 @@ mod tests {
                     cell_origin,
                     &anchor,
                 ),
-                "view layer {view_layer}: block under feet (by={}) is not solid — player is floating",
-                by_feet - 1
+                "view layer {view_layer}: block under feet is not solid — position is floating"
             );
         }
     }
 
     #[test]
     fn on_ground_just_above_surface() {
-        use super::super::tree::MAX_LAYER;
         let world = WorldState::new_grassland();
-        let a = legacy_anchor();
-        // Feet at y = 0.001 are a hair above the grass top face.
-        // Use the leaf view layer so block_size = 1 (= the legacy
-        // collision behaviour).
-        assert!(on_ground(Vec3::new(0.0, 0.001, 0.0), &world, MAX_LAYER, &a));
-        // Feet a metre up — still walking, not on ground.
-        assert!(!on_ground(Vec3::new(0.0, 2.0, 0.0), &world, MAX_LAYER, &a));
-        // Feet out in the void, way below the grass floor.
-        let deep = -(super::super::state::GROUND_Y_VOXELS as f32) - 50.0;
-        assert!(!on_ground(Vec3::new(0.0, deep, 0.0), &world, MAX_LAYER, &a));
+        // Feet resting on the top face of the grass.
+        let standing = position_on_ground();
+        assert!(on_ground(&standing, &world, MAX_LAYER));
+
+        // Feet 2 leaves up — airborne, not on the floor.
+        let airborne = position_airborne();
+        assert!(!on_ground(&airborne, &world, MAX_LAYER));
+    }
+
+    /// Ground solidity at every layer — mirrors the test in `view.rs`
+    /// but exercises it through the collision pipeline.
+    #[test]
+    fn ground_is_reachable_via_collision_at_every_view_layer() {
+        use super::super::render::{MAX_ZOOM, MIN_ZOOM};
+        let world = WorldState::new_grassland();
+        // A position inside the grass region — voxel y=0 inside the
+        // all-zero leaf puts root-local y = 0 (the top grass voxel).
+        let grass_pos = position_at_voxel(0);
+        for view_layer in MIN_ZOOM..=MAX_ZOOM {
+            // Starting inside solid, `on_ground` won't necessarily
+            // be true (we're inside, not resting on), but
+            // `snap_to_ground` should move us out and standing.
+            let mut p = grass_pos.clone();
+            snap_to_ground(&mut p, &world, view_layer);
+            assert!(
+                on_ground(&p, &world, view_layer),
+                "view layer {view_layer}: snapped position is not on_ground",
+            );
+        }
+        // Silence the `GROUND_Y_VOXELS` import warning by referencing
+        // it — this file's tests used to exercise the legacy leaf
+        // Bevy-integer probes against that constant.
+        let _ = GROUND_Y_VOXELS;
     }
 }

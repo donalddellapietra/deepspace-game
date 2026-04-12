@@ -1,14 +1,25 @@
-//! Player entity. Gravity + WASD + jump driven by
-//! [`crate::world::collision::move_and_collide`].
+//! Player entity. Gravity + WASD + jump, with [`WorldPosition`] as
+//! the authoritative location and `Transform` purely derived.
 //!
-//! The player's `Transform.translation` is deliberately kept near
-//! Bevy `(0, 0, 0)` by the floating [`WorldAnchor`] — every frame,
-//! after physics, [`recenter_anchor`] moves the anchor's integer
-//! leaf coord to track the player's current leaf position and
-//! subtracts the integer part back out of the `Transform`. Only
-//! the sub-leaf fractional drift is left in the `Transform`, so the
-//! `f32` ever resolves a step size smaller than a leaf, no matter
-//! how deep the player wanders into the 6-billion-leaf root.
+//! ## Data flow each frame
+//!
+//! 1. [`move_player`] reads input, `WorldPosition`, `Velocity`, and
+//!    calls `collision::move_and_collide`, which mutates the
+//!    `WorldPosition` in place via exact `i64` path math.
+//! 2. [`sync_anchor_to_player`] copies the player's new integer
+//!    leaf coord into the global [`WorldAnchor`] resource, so
+//!    every subsequent system (rendering, raycasting, highlight
+//!    gizmos, other entities' `Transform` derivations) sees a
+//!    consistent "Bevy `(0, 0, 0)` is here" anchor.
+//! 3. [`derive_transforms`] iterates every entity with both
+//!    [`WorldPosition`] and `Transform` and writes the `Transform`
+//!    from `bevy_from_position(pos, anchor)`. The player's
+//!    `Transform` ends up at its sub-voxel offset — always tiny.
+//!
+//! The player's `Vec3` `Transform` is never a source of truth and
+//! never accumulates a long-range coordinate. Every future entity
+//! that adds a `WorldPosition` gets the same large-world behaviour
+//! for free.
 
 use bevy::prelude::*;
 
@@ -20,16 +31,17 @@ use crate::world::tree::{slot_index, NODE_VOXELS_PER_AXIS};
 use crate::world::view::{
     bevy_from_position, cell_size_at_layer, position_to_leaf_coord, WorldAnchor,
 };
-use crate::world::{CameraZoom, WorldState};
+use crate::world::{CameraZoom, WorldPosition, WorldState};
 
 pub const PLAYER_HEIGHT: f32 = PLAYER_H;
 
 // Movement constants are expressed in CELLS per second / cells per
 // second². At runtime they're multiplied by `cell_size_at_layer(zoom.layer)`
-// to convert to Bevy units. This way the player crosses one cell in
-// the same wall-clock time at every view layer — pressing Q to zoom
-// out makes the player effectively bigger and faster, matching the
-// 2D prototype's "cells subtend a constant visual angle" behaviour.
+// to convert to leaves per second at the current zoom. The player
+// crosses one cell in the same wall-clock time at every view layer —
+// pressing Q to zoom out makes the player effectively bigger and
+// faster, matching the 2D prototype's "cells subtend a constant
+// visual angle" behaviour.
 const WALK_SPEED_CELLS: f32 = 8.0;
 const SPRINT_SPEED_CELLS: f32 = 16.0;
 const JUMP_IMPULSE_CELLS: f32 = 8.0;
@@ -39,8 +51,10 @@ pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_player)
-            .add_systems(Update, (move_player, recenter_anchor).chain());
+        app.add_systems(Startup, spawn_player).add_systems(
+            Update,
+            (move_player, sync_anchor_to_player, derive_transforms).chain(),
+        );
     }
 }
 
@@ -50,35 +64,27 @@ pub struct Player;
 #[derive(Component)]
 pub struct Velocity(pub Vec3);
 
-/// Path-based spawn position. Returns a [`Position`] pointing at the
-/// arithmetic centre of the `25³ × 5^MAX_LAYER`-leaf root node, one
-/// row above the grass surface. Every path slot is `(2, _, 2)` (the
-/// middle of the `5³` child array on `x`/`z`), and the in-leaf voxel
-/// is centred too — so the spawn is as close to the root's
-/// geometric centre as the tree structure permits.
+/// Path-based spawn position at the **arithmetic centre of the
+/// root**. Every path slot is `(2, _, 2)` on `x`/`z`, which picks
+/// the middle of each `5³` child array, and the in-leaf voxel is
+/// also centred. The depth-`(MAX_LAYER - 2)` slot uses `sy = 1`
+/// so the layer-`(MAX_LAYER - 1)` node containing the spawn leaf
+/// sits one step above the world floor — that puts the leaf flush
+/// against the grass's top face.
 ///
-/// Why this is only possible with the floating anchor: under the
-/// old constant `ROOT_ORIGIN` the centre of the root was at Bevy
-/// `x ≈ 3e9` where `f32` step size is hundreds of leaves — leaf-
-/// level collision and picking would silently collapse. With
-/// `WorldAnchor` tracking the player's integer leaf coord, the
-/// player's `Transform` is tiny regardless of where they are, so
-/// leaf precision is preserved all the way to the centre.
-///
-/// Bottom-row slot `(2, 0, 2)` at depth `MAX_LAYER - 1` puts the
-/// leaf flush against the grass's top face; depth `MAX_LAYER - 2`
-/// uses `sy = 1` so the layer-`(MAX_LAYER - 1)` node containing
-/// that leaf sits just above the world floor.
-fn spawn_position() -> Position {
+/// This spawn is only possible thanks to the floating
+/// [`WorldAnchor`]: under a constant `ROOT_ORIGIN` the centre of
+/// the `25 × 5^12`-leaf root would be at Bevy `(≈3e9, ≈3e9)` and
+/// `f32` step size there is hundreds of leaves, breaking leaf-
+/// level collision and picking. With the anchor tracking the
+/// player's integer leaf coord, the player's `Transform` stays
+/// sub-voxel regardless of where in the tree they are.
+pub fn spawn_position() -> Position {
     let mut path = [0u8; NODE_PATH_LEN];
-    // Every level above (MAX_LAYER - 2): centre slot on x/z, floor on y.
     for depth in 0..(NODE_PATH_LEN - 2) {
         path[depth] = slot_index(2, 0, 2) as u8;
     }
-    // Grandparent of the leaf: centre on x/z, one row above the floor
-    // (so the leaf's y face lines up with the top of the grass).
     path[NODE_PATH_LEN - 2] = slot_index(2, 1, 2) as u8;
-    // Leaf parent: centre on x/z, bottom of its parent on y.
     path[NODE_PATH_LEN - 1] = slot_index(2, 0, 2) as u8;
     let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
     Position {
@@ -88,41 +94,28 @@ fn spawn_position() -> Position {
     }
 }
 
-/// The [`WorldAnchor`] that places the spawn `Position` at Bevy
-/// `(0, 0, 0)`. Used by [`spawn_player`] to initialise the
-/// resource, and by [`spawn_translation`] so the reset-to-spawn
-/// translation is consistently zero.
+/// The [`WorldAnchor`] that would place the spawn `Position` at
+/// Bevy `(0, 0, 0)`. Used by [`spawn_player`] to initialise the
+/// resource at startup.
 pub fn spawn_anchor() -> WorldAnchor {
     WorldAnchor {
         leaf_coord: position_to_leaf_coord(&spawn_position()),
     }
 }
 
-/// Bevy translation of the spawn point in the player's current
-/// `anchor` frame. Used by `editor::tools::reset_player` to teleport
-/// the player — passing the current anchor keeps the teleport
-/// small-f32 regardless of how far the player has wandered since
-/// startup.
-pub fn spawn_translation(anchor: &WorldAnchor) -> Vec3 {
-    bevy_from_position(&spawn_position(), anchor)
-}
-
-/// Startup system: insert the [`WorldAnchor`] resource so that the
-/// player's spawn position sits at Bevy `(0, 0, 0)`, then spawn the
-/// player entity with a zero translation. Anything Bevy-shaped that
-/// runs after this reads a tiny `Transform` regardless of where the
-/// spawn is in the world.
+/// Startup system: insert the `WorldAnchor` matching the spawn, and
+/// spawn the player entity with a `WorldPosition` pointing at the
+/// centre of the root. The `Transform` starts at the sub-voxel
+/// offset; the `Update`-phase `derive_transforms` recomputes it on
+/// the first frame.
 fn spawn_player(mut commands: Commands) {
+    let pos = spawn_position();
     let anchor = spawn_anchor();
-    // `bevy_from_position(spawn_position(), spawn_anchor())` evaluates
-    // to `(0, 0, 0) + spawn_position().offset`, which lives in the
-    // same leaf — we just store the offset as the initial
-    // translation so the first frame's render/collision already
-    // sees the correct sub-voxel drift.
-    let translation = bevy_from_position(&spawn_position(), &anchor);
+    let translation = bevy_from_position(&pos, &anchor);
     commands.insert_resource(anchor);
     commands.spawn((
         Player,
+        WorldPosition(pos),
         Velocity(Vec3::ZERO),
         Transform::from_translation(translation),
         Visibility::Hidden,
@@ -135,15 +128,14 @@ fn move_player(
     world: Res<WorldState>,
     inv: Res<InventoryState>,
     zoom: Res<CameraZoom>,
-    anchor: Res<WorldAnchor>,
-    mut player_q: Query<(&mut Transform, &mut Velocity), With<Player>>,
+    mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
     camera_q: Query<&FpsCam>,
 ) {
     if inv.open {
         return;
     }
 
-    let Ok((mut tf, mut vel)) = player_q.single_mut() else {
+    let Ok((mut world_pos, mut vel)) = player_q.single_mut() else {
         return;
     };
     let Ok(cam) = camera_q.single() else {
@@ -151,11 +143,11 @@ fn move_player(
     };
     let dt = time.delta_secs();
 
-    // Convert cell-rate constants into Bevy-unit/second values for
-    // the current zoom level. At view L=12 (leaves) cell_size = 1, so
-    // these match the original numbers; as you zoom out, every speed
-    // and gravity scales linearly so the player still crosses one
-    // cell per ~0.125s and jumps ~1.6 cells high.
+    // Convert cell-rate constants into leaves-per-second values for
+    // the current zoom level. At view L=12 (leaves) cell_size = 1,
+    // so these match the original numbers; as you zoom out, every
+    // speed and gravity scales linearly so the player still crosses
+    // one cell per ~0.125s and jumps ~1.6 cells high.
     let cell = cell_size_at_layer(zoom.layer);
     let walk_speed = WALK_SPEED_CELLS * cell;
     let sprint_speed = SPRINT_SPEED_CELLS * cell;
@@ -182,7 +174,7 @@ fn move_player(
 
     // Jump (must be on ground before applying gravity).
     if keyboard.just_pressed(KeyCode::Space)
-        && collision::on_ground(tf.translation, &world, zoom.layer, &anchor)
+        && collision::on_ground(&world_pos.0, &world, zoom.layer)
     {
         vel.0.y = jump_impulse;
     }
@@ -190,7 +182,7 @@ fn move_player(
     // Gravity.
     vel.0.y -= gravity * dt;
 
-    // Horizontal movement delta.
+    // Horizontal movement delta in leaves.
     let speed = if keyboard.pressed(KeyCode::ShiftLeft) {
         sprint_speed
     } else {
@@ -204,45 +196,39 @@ fn move_player(
     };
 
     collision::move_and_collide(
-        &mut tf.translation,
+        &mut world_pos.0,
         &mut vel.0,
         h_delta,
         dt,
         &world,
         zoom.layer,
-        &anchor,
     );
 }
 
-/// Run after [`move_player`]: take the integer leaf part of the
-/// player's drift in this frame and roll it into the anchor, leaving
-/// only the sub-leaf fractional part in `Transform.translation`.
-///
-/// This is the mechanism that keeps f32 precision perfect even
-/// though the player is conceptually traversing a 6-billion-leaf
-/// world: the Bevy `Transform` never accumulates large magnitudes,
-/// because every whole-leaf chunk of drift is paid out to the
-/// anchor as an exact `i64` delta.
-fn recenter_anchor(
+/// After physics, copy the player's new integer leaf coord into the
+/// global [`WorldAnchor`] resource. Subsequent systems this frame
+/// (camera, highlight gizmo, rendering, raycasting) then share
+/// one consistent frame whose Bevy `(0, 0, 0)` is the player's
+/// current leaf.
+fn sync_anchor_to_player(
     mut anchor: ResMut<WorldAnchor>,
-    mut player_q: Query<&mut Transform, With<Player>>,
+    player_q: Query<&WorldPosition, With<Player>>,
 ) {
-    let Ok(mut tf) = player_q.single_mut() else {
-        return;
-    };
-    // Integer leaf drift since the last recenter.
-    let shift: [i64; 3] = [
-        tf.translation.x.floor() as i64,
-        tf.translation.y.floor() as i64,
-        tf.translation.z.floor() as i64,
-    ];
-    if shift == [0, 0, 0] {
-        return;
+    if let Ok(pos) = player_q.single() {
+        anchor.leaf_coord = position_to_leaf_coord(&pos.0);
     }
-    anchor.leaf_coord[0] += shift[0];
-    anchor.leaf_coord[1] += shift[1];
-    anchor.leaf_coord[2] += shift[2];
-    tf.translation.x -= shift[0] as f32;
-    tf.translation.y -= shift[1] as f32;
-    tf.translation.z -= shift[2] as f32;
+}
+
+/// Derive every entity's `Transform.translation` from its
+/// [`WorldPosition`] and the current [`WorldAnchor`]. The player's
+/// `Transform` always lands at its sub-voxel offset (tiny), and
+/// any future entity with a `WorldPosition` gets anchor-relative
+/// placement for free.
+fn derive_transforms(
+    anchor: Res<WorldAnchor>,
+    mut q: Query<(&WorldPosition, &mut Transform)>,
+) {
+    for (world_pos, mut tf) in &mut q {
+        tf.translation = bevy_from_position(&world_pos.0, &anchor);
+    }
 }
