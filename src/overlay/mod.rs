@@ -52,7 +52,6 @@ impl Plugin for OverlayPlugin {
                 .add_systems(Update, (
                     webview::create_overlay_webview,
                     webview::resize_overlay_webview,
-                    webview::sync_mouse_passthrough,
                     flush_state_to_webview,
                 ));
         }

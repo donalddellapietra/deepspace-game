@@ -2315,6 +2315,7 @@ dependencies = [
  "getrandom 0.3.4",
  "objc2 0.5.2",
  "objc2-app-kit",
+ "objc2-foundation",
  "raw-window-handle",
  "serde",
  "serde_json",

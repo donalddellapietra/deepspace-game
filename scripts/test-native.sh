@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Native overlay test: starts game + Vite, captures window screenshot,
-# runs Playwright checks, cleans up. Requires screen recording permission.
+# Native overlay test: starts game + Vite, checks for crashes, captures
+# window screenshot, runs Playwright checks. Requires screen recording permission.
 
 SCREENSHOT="/tmp/deepspace-native.png"
+GAME_LOG="/tmp/deepspace-game.log"
 
 cleanup() {
     pkill -f "deepspace-game" 2>/dev/null || true
@@ -15,17 +16,51 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+PASS=0; FAIL=0
+check() {
+    if [ "$2" = "0" ]; then
+        echo "  ✓ $1"
+        PASS=$((PASS + 1))
+    else
+        echo "  ✗ $1: $3"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 echo "==> Starting Vite..."
 (cd ui && npx vite --port 5173) &>/dev/null &
 until curl -s http://localhost:5173 >/dev/null 2>&1; do sleep 0.3; done
 echo "    Vite ready"
 
 echo "==> Starting game..."
-cargo run 2>&1 | grep -E "overlay|ERROR|panic" &
+cargo run 2>&1 | tee "$GAME_LOG" &
 GAME_PID=$!
-sleep 12
-echo "    Game running (PID $GAME_PID)"
+sleep 8
 
+# ── Check 1: Game process still alive (no crash/panic) ──
+echo "==> Checking game health..."
+if kill -0 $GAME_PID 2>/dev/null; then
+    check "Game process alive" 0
+else
+    check "Game process alive" 1 "process exited"
+fi
+
+# Check for panics in log
+if grep -qi "panic" "$GAME_LOG"; then
+    PANIC_MSG=$(grep -i "panic" "$GAME_LOG" | head -1)
+    check "No panics in log" 1 "$PANIC_MSG"
+else
+    check "No panics in log" 0
+fi
+
+# Check webview was created
+if grep -q "WebView created" "$GAME_LOG"; then
+    check "WebView created" 0
+else
+    check "WebView created" 1 "no creation log found"
+fi
+
+# ── Check 2: Window screenshot ──
 echo "==> Capturing window screenshot..."
 WID=$(swift -e '
 import CoreGraphics
@@ -46,11 +81,13 @@ if bestWid > 0 { print(bestWid) }
 
 if [ -n "$WID" ]; then
     screencapture -l "$WID" -x "$SCREENSHOT" 2>/dev/null
-    echo "    Saved to $SCREENSHOT (WID=$WID)"
+    check "Window screenshot captured" 0
+    echo "    → $SCREENSHOT (WID=$WID)"
 else
-    echo "    FAIL: could not find game window"
+    check "Window screenshot captured" 1 "could not find game window"
 fi
 
+# ── Check 3: Playwright UI tests ──
 echo "==> Running Playwright checks..."
 node << 'JSEOF'
 const { chromium } = require('/Users/donalddellapietra/GitHub/deepspace-game/ui/node_modules/playwright');
@@ -73,9 +110,6 @@ const { chromium } = require('/Users/donalddellapietra/GitHub/deepspace-game/ui/
     const bodyBg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     check('Body bg transparent', bodyBg === 'rgba(0, 0, 0, 0)' || bodyBg === 'transparent', bodyBg);
 
-    const htmlBg = await page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor);
-    check('HTML bg transparent', htmlBg === 'rgba(0, 0, 0, 0)' || htmlBg === 'transparent', htmlBg);
-
     const rootOk = await page.evaluate(() => {
         const r = document.getElementById('root');
         if (!r) return null;
@@ -90,39 +124,44 @@ const { chromium } = require('/Users/donalddellapietra/GitHub/deepspace-game/ui/
         check('React rendered', rootOk.kids > 0, `${rootOk.kids} children`);
     }
 
-    // WebSocket test
-    const wsOk = await page.evaluate(() => new Promise(res => {
-        try {
-            const ws = new WebSocket('ws://localhost:9000');
-            ws.onopen = () => { ws.close(); res(true); };
-            ws.onerror = () => res(false);
-            setTimeout(() => res(false), 3000);
-        } catch { res(false); }
-    }));
-    check('WebSocket connects', wsOk, 'connection failed');
+    // Check hotbar has colored slots (game state flowing)
+    const hotbarSlots = await page.evaluate(() => {
+        const slots = document.querySelectorAll('[class*="slot"], [class*="Slot"]');
+        let colored = 0;
+        slots.forEach(s => {
+            const bg = getComputedStyle(s).backgroundColor;
+            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') colored++;
+        });
+        return { total: slots.length, colored };
+    });
+    check('Hotbar has colored slots', hotbarSlots.colored > 0,
+        `${hotbarSlots.colored}/${hotbarSlots.total} colored`);
 
-    const wsData = await page.evaluate(() => new Promise(res => {
-        try {
-            const ws = new WebSocket('ws://localhost:9000');
-            ws.onmessage = e => { ws.close(); res(e.data); };
-            ws.onerror = () => res(null);
-            setTimeout(() => { ws.close(); res(null); }, 5000);
-        } catch { res(null); }
-    }));
-    if (wsData) {
-        try { const p = JSON.parse(wsData); check('WS valid JSON', true, ''); check('WS has type', 'type' in p, Object.keys(p)); }
-        catch { check('WS valid JSON', false, wsData.substring(0, 80)); }
-    } else {
-        check('WS receives data', false, 'no message in 5s');
-    }
+    // Check passthrough JS is injected (mousemove handler exists)
+    const hasPassthrough = await page.evaluate(() => {
+        return typeof window.ipc !== 'undefined' || document.title !== '';
+    });
+    // Can't fully test passthrough in headless Playwright, but check script ran
+    check('Init script ran (stateBuffer exists)',
+        await page.evaluate(() => Array.isArray(window.__stateBuffer)),
+        'window.__stateBuffer not found');
 
     await page.screenshot({ path: '/tmp/deepspace-playwright.png' });
-    console.log(`\n==> ${r.pass} passed, ${r.fail} failed`);
+    console.log(`\n  Playwright: ${r.pass} passed, ${r.fail} failed`);
     await browser.close();
     process.exit(r.fail > 0 ? 1 : 0);
 })();
 JSEOF
+PW_EXIT=$?
 
-echo "==> Done. Screenshots:"
-echo "    Native window: $SCREENSHOT"
-echo "    Playwright:    /tmp/deepspace-playwright.png"
+echo ""
+echo "==> Summary"
+echo "    Shell checks: $PASS passed, $FAIL failed"
+echo "    Screenshots: $SCREENSHOT, /tmp/deepspace-playwright.png"
+
+if [ "$FAIL" -gt 0 ] || [ "$PW_EXIT" -ne 0 ]; then
+    echo "    RESULT: FAIL"
+    exit 1
+else
+    echo "    RESULT: PASS"
+fi

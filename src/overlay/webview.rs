@@ -4,9 +4,9 @@
 //! - Rust → JS: `evaluate_script("window.__onGameState(json)")`
 //! - JS → Rust: `window.ipc.postMessage(json)` → ipc_handler → channel
 //!
-//! Mouse passthrough: the WKWebView defaults to ignoring mouse events.
-//! Each frame, JS checks if the cursor is over an interactive element
-//! and toggles `setIgnoresMouseEvents:` accordingly via IPC.
+//! Mouse passthrough: hitTest: is swizzled on the WKWebView so that
+//! clicks on transparent areas fall through to the Metal/Bevy layer.
+//! JS mousemove sets an atomic flag; the swizzled hitTest checks it.
 //!
 //! Only compiled on non-wasm32 targets.
 
@@ -16,10 +16,9 @@ use std::sync::Mutex;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy::winit::WINIT_WINDOWS;
-use objc2::rc::Retained;
-use objc2::runtime::Bool;
-use objc2::{msg_send, sel};
-use objc2_app_kit::NSView;
+use objc2::runtime::{AnyObject, Imp, Sel};
+use objc2::sel;
+use objc2_foundation::CGPoint;
 use raw_window_handle::HasWindowHandle;
 use wry::WebViewExtMacOS;
 use wry::{dpi::*, Rect, WebViewBuilder};
@@ -29,7 +28,6 @@ use wry::{dpi::*, Rect, WebViewBuilder};
 static IPC_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Whether the cursor is currently over an interactive UI element.
-/// Set by JS via IPC, read by the passthrough system.
 static CURSOR_OVER_UI: AtomicBool = AtomicBool::new(false);
 
 pub fn drain_ipc_commands() -> Vec<String> {
@@ -66,12 +64,10 @@ window.__onGameState = (data) => {
 };
 
 // Mouse passthrough: track whether cursor is over an interactive element.
-// This runs on mousemove and sends the result to Rust via IPC.
 document.addEventListener('mousemove', (e) => {
     const el = document.elementFromPoint(e.clientX, e.clientY);
     let interactive = false;
     if (el) {
-        // Walk up the DOM tree to check pointer-events
         let node = el;
         while (node && node !== document.documentElement) {
             const pe = getComputedStyle(node).pointerEvents;
@@ -80,16 +76,61 @@ document.addEventListener('mousemove', (e) => {
             node = node.parentElement;
         }
     }
-    window.ipc.postMessage(JSON.stringify({
-        __passthrough: !interactive
-    }));
+    window.ipc.postMessage(JSON.stringify({ __passthrough: !interactive }));
 }, { passive: true });
 
-// Also handle mouseleave on the document (cursor left the webview)
 document.addEventListener('mouseleave', () => {
     window.ipc.postMessage(JSON.stringify({ __passthrough: true }));
 }, { passive: true });
 "#;
+
+// ── hitTest: swizzle ──────────────────────────────────────────────
+//
+// We replace the WKWebView's hitTest: method so it returns nil when
+// the cursor is over a transparent area (CURSOR_OVER_UI is false).
+// This causes macOS to pass the event to the view behind (Metal layer).
+
+/// The original hitTest: IMP, saved during swizzle.
+static mut ORIGINAL_HIT_TEST: Option<
+    unsafe extern "C" fn(*mut AnyObject, Sel, CGPoint) -> *mut AnyObject,
+> = None;
+
+/// Our replacement hitTest: — returns nil to pass through, or calls
+/// the original to let the webview handle the event.
+unsafe extern "C" fn swizzled_hit_test(
+    this: *mut AnyObject,
+    cmd: Sel,
+    point: CGPoint,
+) -> *mut AnyObject {
+    if CURSOR_OVER_UI.load(Ordering::Relaxed) {
+        if let Some(original) = ORIGINAL_HIT_TEST {
+            original(this, cmd, point)
+        } else {
+            std::ptr::null_mut()
+        }
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// Swizzle hitTest: on the WKWebView's runtime class.
+unsafe fn swizzle_hit_test(webview: &wry::WebView) {
+    let wry_view = webview.webview();
+    // Get the runtime class of this specific instance (may be a KVO subclass)
+    let class = (*wry_view).class();
+
+    let sel = sel!(hitTest:);
+    let Some(method) = class.instance_method(sel) else {
+        eprintln!("overlay: hitTest: method not found on WryWebView class");
+        return;
+    };
+
+    let new_imp: Imp = std::mem::transmute(swizzled_hit_test as *const ());
+    let original_imp: Imp = unsafe { method.set_implementation(new_imp) };
+    ORIGINAL_HIT_TEST = Some(std::mem::transmute(original_imp));
+
+    info!("overlay: hitTest: swizzled for mouse passthrough");
+}
 
 // ── Systems ───────────────────────────────────────────────────────
 
@@ -131,7 +172,6 @@ pub fn create_overlay_webview(
             .with_accept_first_mouse(true)
             .with_ipc_handler(|request| {
                 let body = request.body();
-                // Check for passthrough messages vs UI commands
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
                     if let Some(pt) = val.get("__passthrough") {
                         CURSOR_OVER_UI.store(!pt.as_bool().unwrap_or(true), Ordering::Relaxed);
@@ -153,8 +193,7 @@ pub fn create_overlay_webview(
                     "overlay: WebView created ({}x{} @{:.1}x) → {url}",
                     phys.width, phys.height, scale
                 );
-                // Start with mouse events ignored so game receives input
-                set_ignores_mouse_events(&webview, true);
+                unsafe { swizzle_hit_test(&webview) };
                 holder.webview = Some(webview);
             }
             Err(e) => {
@@ -162,31 +201,6 @@ pub fn create_overlay_webview(
             }
         }
     });
-}
-
-/// Toggle `setIgnoresMouseEvents:` based on whether the cursor is
-/// over an interactive UI element.
-pub fn sync_mouse_passthrough(holder: NonSend<WebViewHolder>) {
-    let Some(ref webview) = holder.webview else {
-        return;
-    };
-
-    let over_ui = CURSOR_OVER_UI.load(Ordering::Relaxed);
-    // When cursor is over UI, the webview should NOT ignore mouse events.
-    // When cursor is over transparent area, it SHOULD ignore them.
-    set_ignores_mouse_events(webview, !over_ui);
-}
-
-/// Call `[NSView setIgnoresMouseEvents:]` on the WKWebView.
-fn set_ignores_mouse_events(webview: &wry::WebView, ignores: bool) {
-    let wk: Retained<NSView> = {
-        let wry_view = webview.webview();
-        // WryWebView inherits from WKWebView which inherits from NSView.
-        // We can safely cast via Retained::cast since the inheritance is linear.
-        unsafe { Retained::cast(wry_view) }
-    };
-    let val = Bool::new(ignores);
-    let _: () = unsafe { msg_send![&*wk, setIgnoresMouseEvents: val] };
 }
 
 pub fn resize_overlay_webview(
