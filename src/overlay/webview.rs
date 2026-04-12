@@ -8,6 +8,15 @@
 //! clicks on transparent areas fall through to the Metal/Bevy layer.
 //! JS mousemove sets an atomic flag; the swizzled hitTest checks it.
 //!
+//! ## Centralised input
+//!
+//! Clicking on the webview makes it macOS first-responder, stealing
+//! keyboard (and sometimes mouse) events from Bevy/winit.  Rather
+//! than trying to prevent this, the webview forwards **every** key
+//! and mouse-button event to Bevy via IPC.  A system in `PreUpdate`
+//! injects them into `ButtonInput`, so all game systems see a single,
+//! always-correct input state.
+//!
 //! Only compiled on non-wasm32 targets.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,12 +32,22 @@ use raw_window_handle::HasWindowHandle;
 use wry::WebViewExtMacOS;
 use wry::{dpi::*, Rect, WebViewBuilder};
 
-// ── Global command channel (JS → Rust) ────────────────────────────
+// ── Global state (JS → Rust) ────────────────────────────────────
 
 static IPC_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Whether the cursor is currently over an interactive UI element.
+/// Controls the hitTest: swizzle — true routes clicks to the webview,
+/// false lets them fall through to Bevy.
 static CURSOR_OVER_UI: AtomicBool = AtomicBool::new(false);
+
+/// Forwarded key events: (js_code, pressed).
+static FORWARDED_KEYS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
+/// Forwarded mouse-button events: (js_button, pressed).
+static FORWARDED_MOUSE: Mutex<Vec<(u8, bool)>> = Mutex::new(Vec::new());
+
+// ── Drain helpers ────────────────────────────────────────────────
 
 pub fn drain_ipc_commands() -> Vec<String> {
     let Ok(mut cmds) = IPC_COMMANDS.lock() else {
@@ -37,7 +56,30 @@ pub fn drain_ipc_commands() -> Vec<String> {
     cmds.drain(..).collect()
 }
 
-// ── WebView holder ────────────────────────────────────────────────
+pub fn drain_forwarded_keys() -> Vec<(String, bool)> {
+    let Ok(mut q) = FORWARDED_KEYS.lock() else {
+        return Vec::new();
+    };
+    q.drain(..).collect()
+}
+
+pub fn drain_forwarded_mouse() -> Vec<(u8, bool)> {
+    let Ok(mut q) = FORWARDED_MOUSE.lock() else {
+        return Vec::new();
+    };
+    q.drain(..).collect()
+}
+
+// ── Passthrough control ─────────────────────────────────────────
+
+/// Force the hitTest: swizzle to pass all events through to Bevy.
+/// Called when locking the cursor — there are no mousemove events
+/// while the cursor is locked, so the JS tracker would never update.
+pub fn clear_passthrough() {
+    CURSOR_OVER_UI.store(false, Ordering::Relaxed);
+}
+
+// ── WebView holder ───────────────────────────────────────────────
 
 #[derive(Default)]
 pub struct WebViewHolder {
@@ -47,7 +89,7 @@ pub struct WebViewHolder {
 
 const WAIT_FRAMES: u32 = 10;
 
-// ── Initialization script ─────────────────────────────────────────
+// ── Initialization script ────────────────────────────────────────
 
 const INIT_SCRIPT: &str = r#"
 // Force transparent backgrounds
@@ -63,47 +105,49 @@ window.__onGameState = (data) => {
     window.__stateBuffer.push(parsed);
 };
 
-// ── Keyboard focus fix ──────────────────────────────────────────
-// Clicking on the webview makes it first responder on macOS, which
-// steals keyboard events from Bevy/winit.  Two mitigations:
-//
-// 1. preventDefault on mousedown for non-input elements — this
-//    prevents the *web-layer* focus change and, in WKWebView,
-//    usually prevents the NSView-level first-responder change too.
-//
-// 2. Forward game-relevant key presses to Bevy via IPC so that
-//    panel toggles and Escape still work even if the webview has
-//    keyboard focus.  Bevy and the webview never *both* see the
-//    same keypress (only one is first responder at a time), so
-//    there is no double-toggle.
+// ── Centralised input ───────────────────────────────────────────
+// The webview steals macOS first-responder on click.  Instead of
+// fighting it, forward EVERY key and mouse event to Bevy via IPC.
+// A Rust system in PreUpdate injects them into ButtonInput, making
+// it the single source of truth regardless of which view has focus.
 
+// Keys — skip forwarding keydown when a text input is focused so
+// typing in the hex field works, but ALWAYS forward keyup so Bevy
+// can release the key.
+document.addEventListener('keydown', (e) => {
+    const tag = document.activeElement?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    window.ipc.postMessage(JSON.stringify({
+        __key: { code: e.code, pressed: true }
+    }));
+}, true);
+
+document.addEventListener('keyup', (e) => {
+    window.ipc.postMessage(JSON.stringify({
+        __key: { code: e.code, pressed: false }
+    }));
+}, true);
+
+// Mouse buttons
 document.addEventListener('mousedown', (e) => {
+    window.ipc.postMessage(JSON.stringify({
+        __mouse: { button: e.button, pressed: true }
+    }));
+    // Prevent focus theft on non-input elements
     const tag = e.target.tagName;
     if (tag !== 'INPUT' && tag !== 'TEXTAREA') {
         e.preventDefault();
     }
 }, true);
 
-document.addEventListener('keydown', (e) => {
-    // Let text inputs handle their own keys.
-    const tag = document.activeElement?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-
-    switch (e.code) {
-        case 'KeyE':
-            window.ipc.postMessage(JSON.stringify([{ cmd: 'toggleInventory' }]));
-            e.preventDefault();
-            break;
-        case 'KeyC':
-            window.ipc.postMessage(JSON.stringify([{ cmd: 'toggleColorPicker' }]));
-            e.preventDefault();
-            break;
-        case 'Escape':
-            window.ipc.postMessage(JSON.stringify([{ cmd: 'closeAllPanels' }]));
-            e.preventDefault();
-            break;
-    }
+document.addEventListener('mouseup', (e) => {
+    window.ipc.postMessage(JSON.stringify({
+        __mouse: { button: e.button, pressed: false }
+    }));
 }, true);
+
+// Never show the browser context menu — right-click belongs to Bevy.
+document.addEventListener('contextmenu', (e) => e.preventDefault(), true);
 
 // Mouse passthrough: track whether cursor is over an interactive element.
 // Throttled to avoid flooding IPC with messages on every mouse move.
@@ -145,7 +189,7 @@ document.addEventListener('keydown', (e) => {
 })();
 "#;
 
-// ── hitTest: swizzle ──────────────────────────────────────────────
+// ── hitTest: swizzle ─────────────────────────────────────────────
 //
 // We replace the WKWebView's hitTest: method so it returns nil when
 // the cursor is over a transparent area (CURSOR_OVER_UI is false).
@@ -194,16 +238,13 @@ unsafe fn swizzle_hit_test(webview: &wry::WebView) {
 }
 
 // ── Keyboard refocus ─────────────────────────────────────────────
-//
-// After a panel closes we need to hand keyboard focus back to the
-// Bevy/winit content view.  Without this, keys released while the
-// webview was first responder are never seen by winit, leaving
-// ButtonInput in a stale "pressed" state (the stuck-movement bug).
 
 use objc2_app_kit::{NSView, NSWindow};
 
 /// Make the NSWindow's contentView the first responder, returning
-/// keyboard events to Bevy/winit.
+/// keyboard events to Bevy/winit.  This is a best-effort
+/// optimisation — even if it fails, the IPC forwarding ensures
+/// ButtonInput stays correct.
 pub fn refocus_content_view(entity: Entity) {
     WINIT_WINDOWS.with_borrow(|winit_windows| {
         let Some(wrapper) = winit_windows.get_window(entity) else {
@@ -228,7 +269,42 @@ pub fn refocus_content_view(entity: Entity) {
     });
 }
 
-// ── Systems ───────────────────────────────────────────────────────
+// ── IPC routing ──────────────────────────────────────────────────
+
+/// Route an IPC message from the webview to the appropriate queue.
+fn route_ipc_message(body: &str) {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        // Passthrough flag (mouse hit-test)
+        if let Some(pt) = val.get("__passthrough") {
+            CURSOR_OVER_UI.store(!pt.as_bool().unwrap_or(true), Ordering::Relaxed);
+            return;
+        }
+        // Forwarded key event
+        if let Some(key) = val.get("__key") {
+            let code = key.get("code").and_then(|c| c.as_str()).unwrap_or("");
+            let pressed = key.get("pressed").and_then(|p| p.as_bool()).unwrap_or(false);
+            if let Ok(mut q) = FORWARDED_KEYS.lock() {
+                q.push((code.to_string(), pressed));
+            }
+            return;
+        }
+        // Forwarded mouse-button event
+        if let Some(m) = val.get("__mouse") {
+            let button = m.get("button").and_then(|b| b.as_u64()).unwrap_or(99) as u8;
+            let pressed = m.get("pressed").and_then(|p| p.as_bool()).unwrap_or(false);
+            if let Ok(mut q) = FORWARDED_MOUSE.lock() {
+                q.push((button, pressed));
+            }
+            return;
+        }
+    }
+    // Everything else is a UI command (React → Rust).
+    if let Ok(mut cmds) = IPC_COMMANDS.lock() {
+        cmds.push(body.to_string());
+    }
+}
+
+// ── Systems ──────────────────────────────────────────────────────
 
 pub fn create_overlay_webview(
     mut holder: NonSendMut<WebViewHolder>,
@@ -267,16 +343,7 @@ pub fn create_overlay_webview(
             .with_url(url)
             .with_accept_first_mouse(true)
             .with_ipc_handler(|request| {
-                let body = request.body();
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
-                    if let Some(pt) = val.get("__passthrough") {
-                        CURSOR_OVER_UI.store(!pt.as_bool().unwrap_or(true), Ordering::Relaxed);
-                        return;
-                    }
-                }
-                if let Ok(mut cmds) = IPC_COMMANDS.lock() {
-                    cmds.push(body.to_string());
-                }
+                route_ipc_message(request.body());
             })
             .with_bounds(Rect {
                 position: PhysicalPosition::new(0, 0).into(),

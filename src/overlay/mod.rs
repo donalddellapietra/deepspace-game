@@ -53,7 +53,16 @@ impl Plugin for OverlayPlugin {
                     webview::create_overlay_webview,
                     webview::resize_overlay_webview,
                     flush_state_to_webview,
-                ));
+                ))
+                // Inject webview-forwarded key/mouse events into
+                // ButtonInput in PreUpdate, right after Bevy's own
+                // input processing.  This makes ButtonInput the
+                // single source of truth for all game systems.
+                .add_systems(
+                    PreUpdate,
+                    inject_webview_input
+                        .after(bevy::input::InputSystems),
+                );
         }
     }
 }
@@ -390,4 +399,77 @@ fn poll_ui_commands(
 fn color_to_rgba(color: Color) -> [f32; 4] {
     let c = color.to_srgba();
     [c.red, c.green, c.blue, c.alpha]
+}
+
+// ── Centralised input injection (native only) ────────────────────
+//
+// The webview forwards every key and mouse-button event via IPC.
+// This system drains those queues and injects them into Bevy's
+// `ButtonInput`, making it the single source of truth.  It runs in
+// `PreUpdate` after `InputSystems` so that all `Update` systems
+// see a complete picture.
+
+#[cfg(not(target_arch = "wasm32"))]
+fn inject_webview_input(
+    mut keyboard: ResMut<ButtonInput<KeyCode>>,
+    mut mouse: ResMut<ButtonInput<MouseButton>>,
+) {
+    for (code, pressed) in webview::drain_forwarded_keys() {
+        if let Some(key) = js_code_to_keycode(&code) {
+            if pressed {
+                keyboard.press(key);
+            } else {
+                keyboard.release(key);
+            }
+        }
+    }
+    for (button, pressed) in webview::drain_forwarded_mouse() {
+        if let Some(btn) = js_button_to_mouse(button) {
+            if pressed {
+                mouse.press(btn);
+            } else {
+                mouse.release(btn);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_code_to_keycode(code: &str) -> Option<KeyCode> {
+    Some(match code {
+        "KeyW" => KeyCode::KeyW,
+        "KeyA" => KeyCode::KeyA,
+        "KeyS" => KeyCode::KeyS,
+        "KeyD" => KeyCode::KeyD,
+        "KeyE" => KeyCode::KeyE,
+        "KeyC" => KeyCode::KeyC,
+        "KeyV" => KeyCode::KeyV,
+        "KeyQ" => KeyCode::KeyQ,
+        "KeyF" => KeyCode::KeyF,
+        "Space" => KeyCode::Space,
+        "ShiftLeft" => KeyCode::ShiftLeft,
+        "ShiftRight" => KeyCode::ShiftRight,
+        "Escape" => KeyCode::Escape,
+        "Digit1" => KeyCode::Digit1,
+        "Digit2" => KeyCode::Digit2,
+        "Digit3" => KeyCode::Digit3,
+        "Digit4" => KeyCode::Digit4,
+        "Digit5" => KeyCode::Digit5,
+        "Digit6" => KeyCode::Digit6,
+        "Digit7" => KeyCode::Digit7,
+        "Digit8" => KeyCode::Digit8,
+        "Digit9" => KeyCode::Digit9,
+        "Digit0" => KeyCode::Digit0,
+        _ => return None,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_button_to_mouse(button: u8) -> Option<MouseButton> {
+    match button {
+        0 => Some(MouseButton::Left),
+        1 => Some(MouseButton::Middle),
+        2 => Some(MouseButton::Right),
+        _ => None,
+    }
 }

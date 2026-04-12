@@ -153,6 +153,11 @@ fn go_locked(
     // responder.  Release everything so Bevy doesn't think keys are
     // still held ("stuck WASD" bug).
     keyboard.release_all();
+    // Force the webview hitTest: to pass all events through to Bevy.
+    // Without this, CURSOR_OVER_UI stays true from when the panel was
+    // open (no mousemove events fire while cursor is locked to update it).
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::overlay::webview::clear_passthrough();
     // Hand keyboard first-responder back to the Bevy content view.
     #[cfg(not(target_arch = "wasm32"))]
     if let Ok(entity) = primary.single() {
