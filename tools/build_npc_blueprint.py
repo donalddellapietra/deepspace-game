@@ -560,6 +560,16 @@ def main():
     for name, pvox in sorted(part_voxels.items()):
         print(f"    {name}: {len(pvox)} voxels", file=sys.stderr)
 
+    # Compute the model's origin: center X/Z, bottom Y.
+    # All rest_offsets will be relative to this point so the NPC's
+    # WorldPosition corresponds to its feet-center.
+    (all_min_x, all_min_y, all_min_z), (all_max_x, all_max_y, all_max_z) = compute_bounds(voxels)
+    origin_x = (all_min_x + all_max_x + 1) / 2  # center X
+    origin_y = all_min_y                          # feet at Y=0
+    origin_z = (all_min_z + all_max_z + 1) / 2  # center Z
+    print(f"  Model origin (feet-center): ({origin_x:.1f}, {origin_y:.1f}, {origin_z:.1f})",
+          file=sys.stderr)
+
     # Build part grids
     parts_out = {}
     all_used_colors = set()
@@ -571,7 +581,13 @@ def main():
         all_used_colors.update(c for c in grid_data["voxels"] if c != 0)
 
         pivot = compute_pivot(pvox, grid_data, shape, part_name)
-        rest_offset = [float(v) for v in grid_data["min"]]
+
+        # Rest offset relative to model origin (feet-center)
+        rest_offset = [
+            grid_data["min"][0] - origin_x,
+            grid_data["min"][1] - origin_y,
+            grid_data["min"][2] - origin_z,
+        ]
 
         voxel_bytes = bytes(grid_data["voxels"])
         voxels_b64 = base64.b64encode(voxel_bytes).decode('ascii')
@@ -579,7 +595,7 @@ def main():
         parts_out[part_name] = {
             "size": grid_data["size"],
             "pivot": [round(v, 2) for v in pivot],
-            "rest_offset": rest_offset,
+            "rest_offset": [round(v, 2) for v in rest_offset],
             "voxels_b64": voxels_b64,
             "voxel_count": sum(1 for v in grid_data["voxels"] if v != 0),
         }
