@@ -128,16 +128,6 @@ impl Position {
         true
     }
 
-    /// Apply an offset delta on all three axes. Axes are processed
-    /// independently; a failure on one axis doesn't revert earlier
-    /// axes, matching how a physics step would "slide along a wall".
-    pub fn add_offset(&mut self, delta: [f32; 3]) -> bool {
-        let a = self.add_offset_axis(0, delta[0]);
-        let b = self.add_offset_axis(1, delta[1]);
-        let c = self.add_offset_axis(2, delta[2]);
-        a && b && c
-    }
-
     /// Cross one leaf boundary on the given axis. Walks up the path
     /// until it finds an ancestor whose slot can step on that axis,
     /// then walks back down resetting lower slots and `voxel[axis]`

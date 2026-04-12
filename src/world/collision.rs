@@ -442,7 +442,6 @@ pub fn snap_to_ground(pos: &mut Position, world: &WorldState, view_layer: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::state::GROUND_Y_VOXELS;
     use super::super::tree::{slot_index, MAX_LAYER, NODE_VOXELS_PER_AXIS};
     use super::super::position::NODE_PATH_LEN;
 
@@ -581,9 +580,5 @@ mod tests {
                 "view layer {view_layer}: snapped position is not on_ground",
             );
         }
-        // Silence the `GROUND_Y_VOXELS` import warning by referencing
-        // it — this file's tests used to exercise the legacy leaf
-        // Bevy-integer probes against that constant.
-        let _ = GROUND_Y_VOXELS;
     }
 }

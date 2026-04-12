@@ -7,8 +7,9 @@
 //!
 //! The v1 world is an infinite grassland with a solid ground layer
 //! that is [`GROUND_Y_VOXELS`] leaf voxels deep and air above it.
-//! [`ROOT_ORIGIN`](super::view::ROOT_ORIGIN) is set so the top face
-//! of the grass lines up with Bevy `y = 0`.
+//! The top face of the grass sits at root-local leaf y =
+//! [`GROUND_Y_VOXELS`], and the floating [`WorldAnchor`](super::view::WorldAnchor)
+//! maps that to Bevy `y = 0` whenever the player is resting on it.
 
 use bevy::prelude::*;
 
@@ -215,7 +216,6 @@ mod tests {
     /// — entirely below ground — so it should be all-grass.
     #[test]
     fn all_zero_leaf_is_all_grass() {
-        use crate::world::position::Position;
         let world = WorldState::new_grassland();
         let grass = grass();
         // Walk down the zero path and inspect the leaf.
@@ -233,7 +233,6 @@ mod tests {
                 }
             }
         }
-        let _ = Position::origin();
     }
 
     /// A path whose layer-10 y-slot is 1 lands in the "air above

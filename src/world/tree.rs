@@ -92,11 +92,6 @@ pub const EMPTY_NODE: NodeId = 0;
 /// 125 child ids, one per slot in the 5³ layout.
 pub type Children = Box<[NodeId; CHILDREN_PER_NODE]>;
 
-pub fn empty_children() -> Children {
-    let v = vec![EMPTY_NODE; CHILDREN_PER_NODE].into_boxed_slice();
-    v.try_into().unwrap_or_else(|_| unreachable!("size constant"))
-}
-
 pub fn uniform_children(id: NodeId) -> Children {
     let v = vec![id; CHILDREN_PER_NODE].into_boxed_slice();
     v.try_into().unwrap_or_else(|_| unreachable!("size constant"))
@@ -112,12 +107,6 @@ pub struct Node {
     pub children: Option<Children>,
     /// Refcount for library eviction.
     pub ref_count: u32,
-}
-
-impl Node {
-    pub fn is_leaf(&self) -> bool {
-        self.children.is_none()
-    }
 }
 
 // ------------------------------------------------------------- library
