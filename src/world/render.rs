@@ -180,13 +180,97 @@ impl SmallPath {
 
 // ----------------------------------------------------------- mesh caching
 
+/// For each of 6 directions, check whether the neighboring
+/// emit-layer sibling's border children all match ours along the
+/// shared face. If they do, our boundary children in that direction
+/// can be skipped (same content on both sides → no exposed faces).
+fn compute_neighbor_same(
+    world: &WorldState,
+    path: &SmallPath,
+    node_id: NodeId,
+    emit_depth: u8,
+) -> [bool; 6] {
+    if emit_depth == 0 {
+        return [false; 6];
+    }
+    // Walk to the grandparent (one level above emit).
+    let mut gp_id = world.root;
+    for i in 0..(emit_depth as usize - 1) {
+        let Some(node) = world.library.get(gp_id) else { return [false; 6] };
+        let Some(ch) = node.children.as_ref() else { return [false; 6] };
+        gp_id = ch[path.slots[i] as usize];
+        if gp_id == EMPTY_NODE { return [false; 6] }
+    }
+    let Some(gp) = world.library.get(gp_id) else { return [false; 6] };
+    let Some(gp_ch) = gp.children.as_ref() else { return [false; 6] };
+
+    let Some(our) = world.library.get(node_id) else { return [false; 6] };
+    let Some(oc) = our.children.as_ref() else { return [false; 6] };
+
+    let slot = path.slots[emit_depth as usize - 1] as usize;
+    let (sx, sy, sz) = slot_coords(slot);
+    let bf = BRANCH_FACTOR;
+
+    /// Compare 5×5 border children along one face. `our_idx` and
+    /// `their_idx` map (a, b) in 0..5 to a child slot index.
+    fn faces_match(
+        world: &WorldState,
+        gp_ch: &[NodeId; CHILDREN_PER_NODE],
+        oc: &[NodeId; CHILDREN_PER_NODE],
+        node_id: NodeId,
+        neighbor_slot: usize,
+        our_idx: impl Fn(usize, usize) -> usize,
+        their_idx: impl Fn(usize, usize) -> usize,
+    ) -> bool {
+        let nid = gp_ch[neighbor_slot];
+        if nid == EMPTY_NODE { return false }
+        if nid == node_id { return true }
+        let Some(n) = world.library.get(nid) else { return false };
+        let Some(nc) = n.children.as_ref() else { return false };
+        (0..BRANCH_FACTOR).all(|a| (0..BRANCH_FACTOR).all(|b|
+            oc[our_idx(a, b)] == nc[their_idx(a, b)]
+        ))
+    }
+
+    // Each direction: compare our face at the boundary vs the
+    // neighbor's opposite face. The axis that varies is fixed at
+    // 0 (our near edge) or bf-1 (our far edge / their far edge).
+    let result = |delta: (isize, isize, isize),
+                  our_idx: &dyn Fn(usize, usize) -> usize,
+                  their_idx: &dyn Fn(usize, usize) -> usize| -> bool {
+        let (nx, ny, nz) = (
+            sx as isize + delta.0,
+            sy as isize + delta.1,
+            sz as isize + delta.2,
+        );
+        if nx < 0 || ny < 0 || nz < 0
+            || nx >= bf as isize || ny >= bf as isize || nz >= bf as isize
+        {
+            return false;
+        }
+        let ns = slot_index(nx as usize, ny as usize, nz as usize);
+        faces_match(world, gp_ch, oc, node_id, ns, our_idx, their_idx)
+    };
+
+    [
+        result((-1,0,0), &|a,b| slot_index(0,a,b),    &|a,b| slot_index(bf-1,a,b)), // -x
+        result((1,0,0),  &|a,b| slot_index(bf-1,a,b), &|a,b| slot_index(0,a,b)),    // +x
+        result((0,-1,0), &|a,b| slot_index(a,0,b),    &|a,b| slot_index(a,bf-1,b)), // -y
+        result((0,1,0),  &|a,b| slot_index(a,bf-1,b), &|a,b| slot_index(a,0,b)),    // +y
+        result((0,0,-1), &|a,b| slot_index(a,b,0),    &|a,b| slot_index(a,b,bf-1)), // -z
+        result((0,0,1),  &|a,b| slot_index(a,b,bf-1), &|a,b| slot_index(a,b,0)),    // +z
+    ]
+}
+
 fn get_or_bake_mesh<'a>(
     render_state: &'a mut RenderState,
     world: &WorldState,
     node_id: NodeId,
+    path: SmallPath,
+    emit_depth: u8,
     meshes: &mut Assets<Mesh>,
 ) -> &'a [BakedSubMesh] {
-    render_state.get_or_bake(world, node_id, meshes)
+    render_state.get_or_bake(world, node_id, path, emit_depth, meshes)
 }
 
 impl RenderState {
@@ -194,6 +278,8 @@ impl RenderState {
         &'a mut self,
         world: &WorldState,
         node_id: NodeId,
+        path: SmallPath,
+        emit_depth: u8,
         meshes: &mut Assets<Mesh>,
     ) -> &'a [BakedSubMesh] {
         if !self.meshes.contains_key(&node_id) {
@@ -219,6 +305,11 @@ impl RenderState {
                         }
                     })
                     .collect();
+
+                let neighbor_same = compute_neighbor_same(
+                    world, &path, node_id, emit_depth,
+                );
+
 
                 let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
                     .map(|slot| {
@@ -264,6 +355,7 @@ impl RenderState {
                             if uniform_child_skippable(
                                 slot, v, &child_class,
                                 BRANCH_FACTOR, EMPTY_VOXEL,
+                                neighbor_same,
                             ) {
                                 return Default::default();
                             }
@@ -532,7 +624,7 @@ pub fn render_world(
         let bake_start = std::time::Instant::now();
         for v in visits.iter() {
             if !render_state.meshes.contains_key(&v.node_id) {
-                get_or_bake_mesh(&mut render_state, &world, v.node_id, &mut meshes);
+                get_or_bake_mesh(&mut render_state, &world, v.node_id, v.path, emit_layer, &mut meshes);
             }
         }
         timings.bake_us = bake_start.elapsed().as_micros() as u64;

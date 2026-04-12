@@ -9,37 +9,44 @@ use bevy::{
 
 use super::BakedSubMesh;
 
+/// Tiny overlap so diagonal-neighbor blocks don't leave a visible seam.
+/// Axis-aligned shared faces are already culled, so the overlap only
+/// affects exposed faces — exactly the ones that border a diagonal gap.
+const E: f32 = 0.001;
+
 /// Face definitions: (neighbor offset, quad vertices in CCW winding, normal).
+/// Each face is pushed E outward along its normal AND extended E on
+/// both tangent axes to seal diagonal and three-way corner gaps.
 const FACES: [(IVec3, [Vec3; 4], Vec3); 6] = [
-    // +X
+    // +X: normal axis pushed from 1.0 to 1.0+E
     (IVec3::X, [
-        Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(1.0 + E, 0.0 - E, 0.0 - E), Vec3::new(1.0 + E, 1.0 + E, 0.0 - E),
+        Vec3::new(1.0 + E, 1.0 + E, 1.0 + E), Vec3::new(1.0 + E, 0.0 - E, 1.0 + E),
     ], Vec3::X),
-    // -X
+    // -X: normal axis pushed from 0.0 to 0.0-E
     (IVec3::NEG_X, [
-        Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 1.0),
-        Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0 - E, 0.0 - E, 1.0 + E), Vec3::new(0.0 - E, 1.0 + E, 1.0 + E),
+        Vec3::new(0.0 - E, 1.0 + E, 0.0 - E), Vec3::new(0.0 - E, 0.0 - E, 0.0 - E),
     ], Vec3::NEG_X),
-    // +Y
+    // +Y: normal axis pushed from 1.0 to 1.0+E
     (IVec3::Y, [
-        Vec3::new(0.0, 1.0, 1.0), Vec3::new(1.0, 1.0, 1.0),
-        Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0 - E, 1.0 + E, 1.0 + E), Vec3::new(1.0 + E, 1.0 + E, 1.0 + E),
+        Vec3::new(1.0 + E, 1.0 + E, 0.0 - E), Vec3::new(0.0 - E, 1.0 + E, 0.0 - E),
     ], Vec3::Y),
-    // -Y
+    // -Y: normal axis pushed from 0.0 to 0.0-E
     (IVec3::NEG_Y, [
-        Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 1.0), Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(0.0 - E, 0.0 - E, 0.0 - E), Vec3::new(1.0 + E, 0.0 - E, 0.0 - E),
+        Vec3::new(1.0 + E, 0.0 - E, 1.0 + E), Vec3::new(0.0 - E, 0.0 - E, 1.0 + E),
     ], Vec3::NEG_Y),
-    // +Z
+    // +Z: normal axis pushed from 1.0 to 1.0+E
     (IVec3::Z, [
-        Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 1.0),
-        Vec3::new(1.0, 1.0, 1.0), Vec3::new(0.0, 1.0, 1.0),
+        Vec3::new(0.0 - E, 0.0 - E, 1.0 + E), Vec3::new(1.0 + E, 0.0 - E, 1.0 + E),
+        Vec3::new(1.0 + E, 1.0 + E, 1.0 + E), Vec3::new(0.0 - E, 1.0 + E, 1.0 + E),
     ], Vec3::Z),
-    // -Z
+    // -Z: normal axis pushed from 0.0 to 0.0-E
     (IVec3::NEG_Z, [
-        Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(1.0 + E, 0.0 - E, 0.0 - E), Vec3::new(0.0 - E, 0.0 - E, 0.0 - E),
+        Vec3::new(0.0 - E, 1.0 + E, 0.0 - E), Vec3::new(1.0 + E, 1.0 + E, 0.0 - E),
     ], Vec3::NEG_Z),
 ];
 
@@ -354,28 +361,42 @@ where
 
 /// Check whether a uniform child at `slot` can be skipped entirely
 /// (all 6 neighbors are the same uniform value).
+///
+/// `neighbor_same` indicates whether the neighboring emit-layer
+/// parent in each direction (-x, +x, -y, +y, -z, +z) has the same
+/// NodeId as the current parent. If true, boundary children in that
+/// direction are treated as having the same content (instead of
+/// assuming empty). This lets underground chunks skip all boundary
+/// children when surrounded by identical neighbors.
 pub fn uniform_child_skippable(
     slot: usize,
     v: u8,
     child_class: &[ChildClass],
     branch_factor: usize,
     empty_voxel: u8,
+    neighbor_same: [bool; 6],
 ) -> bool {
     let sx = slot % branch_factor;
     let sy = (slot / branch_factor) % branch_factor;
     let sz = slot / (branch_factor * branch_factor);
+    // (delta, direction_index) for each of 6 neighbors.
+    // Direction indices: 0=-x, 1=+x, 2=-y, 3=+y, 4=-z, 5=+z.
     let neighbors = [
-        (sx.wrapping_sub(1), sy, sz),
-        (sx + 1, sy, sz),
-        (sx, sy.wrapping_sub(1), sz),
-        (sx, sy + 1, sz),
-        (sx, sy, sz.wrapping_sub(1)),
-        (sx, sy, sz + 1),
+        (sx.wrapping_sub(1), sy, sz, 0usize), // -x
+        (sx + 1, sy, sz, 1),                  // +x
+        (sx, sy.wrapping_sub(1), sz, 2),       // -y
+        (sx, sy + 1, sz, 3),                   // +y
+        (sx, sy, sz.wrapping_sub(1), 4),       // -z
+        (sx, sy, sz + 1, 5),                   // +z
     ];
-    neighbors.iter().all(|&(nx, ny, nz)| {
+    neighbors.iter().all(|&(nx, ny, nz, dir)| {
         if nx >= branch_factor || ny >= branch_factor || nz >= branch_factor {
-            // Outside parent boundary — treated as empty.
-            // Only skip if this child is also empty (air).
+            // Outside the parent. If the neighbor parent has the same
+            // NodeId, its content is identical → treat as same type.
+            if neighbor_same[dir] {
+                return true;
+            }
+            // Otherwise conservatively assume empty.
             return v == empty_voxel;
         }
         let nslot = nz * branch_factor * branch_factor + ny * branch_factor + nx;
