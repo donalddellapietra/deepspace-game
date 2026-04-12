@@ -130,14 +130,18 @@ pub struct RenderTimings {
 
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached per-`NodeId` baked sub-meshes. Content-addressed dedup
-    /// means identical subtrees share a NodeId, so cache hits are
-    /// common.
-    meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
+    /// Cached baked sub-meshes keyed by `(NodeId, neighbor_same)`.
+    /// The `neighbor_same` array is included because the
+    /// `uniform_child_skippable` optimisation can skip entire children
+    /// when all six neighbours are identical — producing a different
+    /// (often empty) mesh for the same `NodeId` at different tree
+    /// positions. Without this, a fully-surrounded underground node
+    /// would cache an empty mesh and reuse it at the cave surface.
+    meshes: HashMap<(NodeId, [bool; 6]), Vec<BakedSubMesh>>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
-    /// The `Vec3` is the last-written Bevy translation so we can skip
-    /// redundant `Transform` inserts when the anchor hasn't moved.
-    entities: HashMap<SmallPath, (Entity, NodeId, Vec3)>,
+    /// Stores `(Entity, NodeId, neighbor_same, last_origin)` so we can
+    /// detect when the mesh cache key changes and re-spawn.
+    entities: HashMap<SmallPath, (Entity, NodeId, [bool; 6], Vec3)>,
     /// Zoom layer the `entities` set was built for. If it changes,
     /// everything gets despawned and rebuilt.
     last_zoom_layer: u8,
@@ -282,7 +286,11 @@ impl RenderState {
         emit_depth: u8,
         meshes: &mut Assets<Mesh>,
     ) -> &'a [BakedSubMesh] {
-        if !self.meshes.contains_key(&node_id) {
+        let neighbor_same = compute_neighbor_same(
+            world, &path, node_id, emit_depth,
+        );
+        let cache_key = (node_id, neighbor_same);
+        if !self.meshes.contains_key(&cache_key) {
             let node = world
                 .library
                 .get(node_id)
@@ -305,10 +313,6 @@ impl RenderState {
                         }
                     })
                     .collect();
-
-                let neighbor_same = compute_neighbor_same(
-                    world, &path, node_id, emit_depth,
-                );
 
 
                 let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
@@ -393,10 +397,10 @@ impl RenderState {
                     meshes,
                 )
             };
-            self.meshes.insert(node_id, baked);
+            self.meshes.insert(cache_key, baked);
         }
         self.meshes
-            .get(&node_id)
+            .get(&cache_key)
             .expect("just inserted")
             .as_slice()
     }
@@ -412,6 +416,7 @@ struct Visit {
     node_id: NodeId,
     origin: Vec3,
     scale: f32,
+    neighbor_same: [bool; 6],
 }
 
 /// One frame on the `walk()` DFS stack. Extracted into a named
@@ -509,6 +514,7 @@ fn walk(
                 node_id,
                 origin: origin_bevy,
                 scale: scale_for_layer(target_layer),
+                neighbor_same: [false; 6],
             });
             continue;
         }
@@ -524,6 +530,7 @@ fn walk(
                 node_id,
                 origin: origin_bevy,
                 scale: scale_for_layer(depth),
+                neighbor_same: [false; 6],
             });
             continue;
         };
@@ -587,7 +594,7 @@ pub fn render_world(
     // If emit layer changed, or we're on our first pass, drop everything.
     if !render_state.initialised || render_state.last_zoom_layer != emit_layer
     {
-        for (_, (entity, _, _)) in render_state.entities.drain() {
+        for (_, (entity, _, _, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
@@ -619,11 +626,17 @@ pub fn render_world(
     timings.walk_us = walk_start.elapsed().as_micros() as u64;
     timings.visit_count = visits.len();
 
-    // Pre-bake any new NodeIds before the reconcile loop.
+    // Pre-bake any new (NodeId, neighbor_same) pairs before the reconcile loop.
+    // Also populate each Visit's neighbor_same field so the reconcile
+    // loop can look up the correct cache entry.
     {
         let bake_start = std::time::Instant::now();
-        for v in visits.iter() {
-            if !render_state.meshes.contains_key(&v.node_id) {
+        for v in visits.iter_mut() {
+            v.neighbor_same = compute_neighbor_same(
+                &world, &v.path, v.node_id, emit_layer,
+            );
+            let cache_key = (v.node_id, v.neighbor_same);
+            if !render_state.meshes.contains_key(&cache_key) {
                 get_or_bake_mesh(&mut render_state, &world, v.node_id, v.path, emit_layer, &mut meshes);
             }
         }
@@ -632,16 +645,18 @@ pub fn render_world(
 
     // Reconcile: what's alive now, what changed, what's gone.
     let reconcile_start = std::time::Instant::now();
-    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
+    let mut alive: HashMap<SmallPath, (Entity, NodeId, [bool; 6], Vec3)> =
         HashMap::with_capacity(visits.len());
 
     for visit in visits.drain(..) {
         let new_node_id = visit.node_id;
+        let ns = visit.neighbor_same;
+        let cache_key = (new_node_id, ns);
         let existing = render_state.entities.remove(&visit.path);
 
         match existing {
-            Some((entity, existing_id, last_origin))
-                if existing_id == new_node_id =>
+            Some((entity, existing_id, existing_ns, last_origin))
+                if existing_id == new_node_id && existing_ns == ns =>
             {
                 if last_origin != visit.origin {
                     if let Ok(mut ec) = commands.get_entity(entity) {
@@ -651,17 +666,17 @@ pub fn render_world(
                         );
                     }
                 }
-                alive.insert(visit.path, (entity, existing_id, visit.origin));
+                alive.insert(visit.path, (entity, existing_id, ns, visit.origin));
             }
             other => {
-                if let Some((old_entity, _, _)) = other {
+                if let Some((old_entity, _, _, _)) = other {
                     if let Ok(mut ec) = commands.get_entity(old_entity) {
                         ec.despawn();
                     }
                 }
 
                 let baked = render_state.meshes
-                    .get(&new_node_id)
+                    .get(&cache_key)
                     .cloned()
                     .unwrap_or_default();
 
@@ -688,12 +703,12 @@ pub fn render_world(
                     ));
                 }
 
-                alive.insert(visit.path, (parent, new_node_id, visit.origin));
+                alive.insert(visit.path, (parent, new_node_id, ns, visit.origin));
             }
         }
     }
 
-    for (_, (entity, _, _)) in render_state.entities.drain() {
+    for (_, (entity, _, _, _)) in render_state.entities.drain() {
         if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
         }

@@ -791,10 +791,8 @@ fn npc_ai(
         vel.0.x = dir_x * speed;
         vel.0.z = dir_z * speed;
 
-        // Face the movement direction. Voxel models (like the old fox
-        // glTF) face +Z in local space, so rotate by PI + heading to
-        // align with the (-sin, -cos) movement vector.
-        tf.rotation = Quat::from_rotation_y(ai.heading + PI);
+        // Face the movement direction.
+        tf.rotation = Quat::from_rotation_y(ai.heading);
 
         anim.current_anim = "walk".into();
     }
