@@ -1,10 +1,15 @@
-//! Map RGBA palette colours to [`BlockType`].
+//! Map RGBA palette colours to voxel indices.
 //!
-//! Each `.vox` palette entry is matched to the nearest `BlockType` by
-//! Euclidean distance in sRGB space. Fully transparent entries
-//! (`a == 0`) map to [`EMPTY_VOXEL`].
+//! Two modes:
+//! 1. **Legacy nearest-match** — each `.vox` palette entry is matched to
+//!    the nearest built-in `BlockType` by Euclidean distance in sRGB space.
+//! 2. **Palette registration** — each `.vox` palette entry is registered as
+//!    a new `Palette` entry with its exact color, returning a fresh voxel
+//!    index. Transparent entries (`a == 0`) map to [`EMPTY_VOXEL`].
 
-use crate::block::BlockType;
+use bevy::prelude::*;
+
+use crate::block::{BlockType, PaletteEntry, Palette};
 use crate::world::tree::{voxel_from_block, Voxel, EMPTY_VOXEL};
 
 /// Reference sRGB colours for each `BlockType`, extracted from
@@ -23,7 +28,7 @@ const BLOCK_COLORS: [(u8, u8, u8); 10] = [
 ];
 
 /// Map an RGBA colour to the closest `BlockType`, or `EMPTY_VOXEL`
-/// when the alpha channel is zero.
+/// when the alpha channel is zero. (Legacy nearest-match mode.)
 pub fn rgba_to_voxel(r: u8, g: u8, b: u8, a: u8) -> Voxel {
     if a == 0 {
         return EMPTY_VOXEL;
@@ -43,12 +48,65 @@ pub fn rgba_to_voxel(r: u8, g: u8, b: u8, a: u8) -> Voxel {
     voxel_from_block(Some(BlockType::ALL[best_idx]))
 }
 
-/// Pre-compute a full 256-entry palette lookup table so each voxel
-/// only needs an array index during model construction.
+/// Pre-compute a full 256-entry palette lookup table using legacy
+/// nearest-match to the 10 built-in block types.
 pub fn build_palette_lut(palette: &[(u8, u8, u8, u8); 256]) -> [Voxel; 256] {
     let mut lut = [EMPTY_VOXEL; 256];
     for (i, &(r, g, b, a)) in palette.iter().enumerate() {
         lut[i] = rgba_to_voxel(r, g, b, a);
+    }
+    lut
+}
+
+/// Register .vox palette colors as new Palette entries (exact colors).
+/// Returns a `[u8; 256]` mapping .vox palette indices to voxel indices.
+/// Transparent entries (`a == 0`) map to `EMPTY_VOXEL`.
+pub fn build_palette_lut_registered(
+    vox_palette: &[(u8, u8, u8, u8); 256],
+    palette: &mut Palette,
+    mat_assets: &mut Assets<StandardMaterial>,
+) -> [Voxel; 256] {
+    let mut lut = [EMPTY_VOXEL; 256];
+    // Cache to avoid registering duplicate colors multiple times.
+    let mut seen: std::collections::HashMap<(u8, u8, u8, u8), u8> =
+        std::collections::HashMap::new();
+    for (i, &(r, g, b, a)) in vox_palette.iter().enumerate() {
+        if a == 0 {
+            lut[i] = EMPTY_VOXEL;
+            continue;
+        }
+        let key = (r, g, b, a);
+        if let Some(&cached) = seen.get(&key) {
+            lut[i] = cached;
+            continue;
+        }
+        let color = if a == 255 {
+            Color::srgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+        } else {
+            Color::srgba(
+                r as f32 / 255.0,
+                g as f32 / 255.0,
+                b as f32 / 255.0,
+                a as f32 / 255.0,
+            )
+        };
+        let alpha_mode = if a < 255 {
+            AlphaMode::Blend
+        } else {
+            AlphaMode::Opaque
+        };
+        let voxel = palette.register(
+            PaletteEntry {
+                name: format!("vox_{}", i),
+                color,
+                roughness: 0.9,
+                metallic: 0.0,
+                alpha_mode,
+            },
+            mat_assets,
+        );
+        seen.insert(key, voxel);
+        lut[i] = voxel;
     }
     lut
 }

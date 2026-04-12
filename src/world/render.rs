@@ -26,14 +26,13 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
-use crate::block::materials::BlockMaterials;
-use crate::block::BlockType;
+use crate::block::Palette;
 use crate::model::{mesher::bake_volume, BakedSubMesh};
 
 use super::state::WorldState;
 use super::tree::{
-    block_from_voxel, slot_coords, slot_index, voxel_idx, NodeId, VoxelGrid,
-    BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER,
+    slot_coords, slot_index, voxel_idx, NodeId, VoxelGrid,
+    BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
     NODE_VOXELS_PER_AXIS,
 };
 use super::view::{
@@ -51,11 +50,11 @@ use super::view::{
 pub struct WorldRenderedNode(pub NodeId);
 
 /// Marker attached to each *child* sub-mesh entity, remembering its
-/// canonical block type so callers that temporarily swap the
+/// canonical voxel index so callers that temporarily swap the
 /// `MeshMaterial3d` (save-mode tinting) can restore the original
 /// material without re-querying the library.
 #[derive(Component)]
-pub struct SubMeshBlock(pub BlockType);
+pub struct SubMeshBlock(pub u8);
 
 // --------------------------------------------------------------- camera zoom
 
@@ -233,11 +232,12 @@ impl RenderState {
                             zu / NODE_VOXELS_PER_AXIS,
                         );
                         let voxels = child_voxels[slot].as_ref()?;
-                        block_from_voxel(voxels[voxel_idx(
+                        let v = voxels[voxel_idx(
                             xu % NODE_VOXELS_PER_AXIS,
                             yu % NODE_VOXELS_PER_AXIS,
                             zu % NODE_VOXELS_PER_AXIS,
-                        )])
+                        )];
+                        if v == EMPTY_VOXEL { None } else { Some(v) }
                     },
                     meshes,
                 )
@@ -256,13 +256,12 @@ impl RenderState {
                         {
                             return None;
                         }
-                        block_from_voxel(
-                            voxels[voxel_idx(
-                                x as usize,
-                                y as usize,
-                                z as usize,
-                            )],
-                        )
+                        let v = voxels[voxel_idx(
+                            x as usize,
+                            y as usize,
+                            z as usize,
+                        )];
+                        if v == EMPTY_VOXEL { None } else { Some(v) }
                     },
                     meshes,
                 )
@@ -434,11 +433,11 @@ pub fn render_world(
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
     camera_q: Query<&Transform, With<Camera3d>>,
-    materials: Option<Res<BlockMaterials>>,
+    palette: Option<Res<Palette>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut render_state: ResMut<RenderState>,
 ) {
-    let Some(materials) = materials else {
+    let Some(palette) = palette else {
         return;
     };
     let Ok(camera_tf) = camera_q.single() else {
@@ -539,10 +538,13 @@ pub fn render_world(
                     .id();
 
                 for sub in &baked {
+                    let Some(mat) = palette.material(sub.voxel) else {
+                        continue;
+                    };
                     commands.spawn((
                         Mesh3d(sub.mesh.clone()),
-                        MeshMaterial3d(materials.get(sub.block_type)),
-                        SubMeshBlock(sub.block_type),
+                        MeshMaterial3d(mat),
+                        SubMeshBlock(sub.voxel),
                         Transform::default(),
                         Visibility::Inherited,
                         ChildOf(parent),

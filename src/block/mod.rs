@@ -45,11 +45,114 @@ impl BlockType {
     pub fn from_index(i: u8) -> Option<Self> {
         Self::ALL.get(i as usize).copied()
     }
+
+    /// Return the 1-based voxel index for this built-in block type.
+    pub fn voxel(&self) -> u8 {
+        (*self as u8) + 1
+    }
 }
+
+// ---------------------------------------------------------------- Palette
+
+/// A single palette entry.
+#[derive(Clone, Debug)]
+pub struct PaletteEntry {
+    pub name: String,
+    pub color: Color,
+    pub roughness: f32,
+    pub metallic: f32,
+    pub alpha_mode: AlphaMode,
+}
+
+/// Runtime palette. Index 0 is reserved (EMPTY_VOXEL). Indices 1..=len are
+/// valid block types. The first 10 are the built-in gameplay blocks.
+#[derive(Resource)]
+pub struct Palette {
+    entries: Vec<PaletteEntry>,
+    materials: Vec<Handle<StandardMaterial>>,
+}
+
+impl Palette {
+    /// Create a new palette pre-populated with the 10 built-in blocks.
+    pub fn new(mat_assets: &mut Assets<StandardMaterial>) -> Self {
+        let mut palette = Self {
+            entries: Vec::new(),
+            materials: Vec::new(),
+        };
+        for bt in BlockType::ALL {
+            palette.register(
+                PaletteEntry {
+                    name: format!("{:?}", bt),
+                    color: bt.color(),
+                    roughness: bt.roughness(),
+                    metallic: bt.metallic(),
+                    alpha_mode: bt.alpha_mode(),
+                },
+                mat_assets,
+            );
+        }
+        palette
+    }
+
+    /// Look up by voxel value (1-indexed). Returns `None` for 0 (empty)
+    /// or out-of-range indices.
+    pub fn get(&self, voxel: u8) -> Option<&PaletteEntry> {
+        if voxel == 0 {
+            return None;
+        }
+        self.entries.get((voxel - 1) as usize)
+    }
+
+    /// Get the material handle for a voxel value.
+    pub fn material(&self, voxel: u8) -> Option<Handle<StandardMaterial>> {
+        if voxel == 0 {
+            return None;
+        }
+        self.materials.get((voxel - 1) as usize).cloned()
+    }
+
+    /// Add a new entry, create its material, return the voxel index.
+    /// Panics if the palette is full (255 entries).
+    pub fn register(
+        &mut self,
+        entry: PaletteEntry,
+        mat_assets: &mut Assets<StandardMaterial>,
+    ) -> u8 {
+        assert!(
+            self.entries.len() < 255,
+            "Palette full: cannot register more than 255 entries"
+        );
+        let handle = mat_assets.add(StandardMaterial {
+            base_color: entry.color,
+            perceptual_roughness: entry.roughness,
+            metallic: entry.metallic,
+            alpha_mode: entry.alpha_mode,
+            ..default()
+        });
+        self.entries.push(entry);
+        self.materials.push(handle);
+        self.entries.len() as u8 // 1-based voxel index
+    }
+
+    /// Number of palette entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterate with 1-based voxel indices.
+    pub fn iter(&self) -> impl Iterator<Item = (u8, &PaletteEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| ((i + 1) as u8, e))
+    }
+}
+
+// ---------------------------------------------------------------- Plugin
 
 pub struct BlockPlugin;
 impl Plugin for BlockPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, materials::init_block_materials);
+        app.add_systems(Startup, materials::init_palette);
     }
 }

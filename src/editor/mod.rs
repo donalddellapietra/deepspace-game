@@ -9,6 +9,8 @@ use bevy::prelude::*;
 use crate::block::BlockType;
 use crate::world::render::{MAX_ZOOM, MIN_ZOOM};
 
+use crate::world::tree::voxel_from_block;
+
 pub struct EditorPlugin;
 
 impl Plugin for EditorPlugin {
@@ -25,12 +27,17 @@ impl Plugin for EditorPlugin {
                     tools::zoom_out.before(crate::player::move_player),
                     tools::reset_player.before(crate::player::move_player),
                     tools::cycle_hotbar_slot,
-                    tools::remove_block.after(crate::player::sync_anchor_to_player),
-                    tools::place_block.after(crate::player::sync_anchor_to_player),
-                    save_mode::toggle_save_mode,
+                    tools::remove_block
+                        .after(crate::player::sync_anchor_to_player)
+                        .after(crate::ui::sync_cursor),
+                    tools::place_block
+                        .after(crate::player::sync_anchor_to_player)
+                        .after(crate::ui::sync_cursor),
+                    save_mode::toggle_save_mode.after(crate::ui::sync_cursor),
                     save_mode::save_on_click
                         .after(crate::player::sync_anchor_to_player)
-                        .after(crate::interaction::update_target),
+                        .after(crate::interaction::update_target)
+                        .after(crate::ui::sync_cursor),
                     // Tinting reads the raycast target and has to
                     // observe the entities the renderer spawned
                     // this frame, so it runs strictly after both.
@@ -46,9 +53,10 @@ impl Plugin for EditorPlugin {
 /// What a hotbar slot contains. A `Model` entry points into
 /// `SavedMeshes` by index — we only store the index (not the
 /// `NodeId`) so the hotbar stays stable when the saved list grows.
+/// `Block(u8)` holds a voxel index (1-based palette index).
 #[derive(Clone, Debug)]
 pub enum HotbarItem {
-    Block(BlockType),
+    Block(u8),
     Model(usize),
 }
 
@@ -64,7 +72,7 @@ pub struct Hotbar {
 }
 
 fn default_slots() -> [HotbarItem; 10] {
-    BlockType::ALL.map(HotbarItem::Block)
+    BlockType::ALL.map(|bt| HotbarItem::Block(voxel_from_block(Some(bt))))
 }
 
 impl Default for Hotbar {

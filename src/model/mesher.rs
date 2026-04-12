@@ -5,8 +5,6 @@ use bevy::{
     render::render_resource::PrimitiveTopology,
 };
 
-use crate::block::BlockType;
-
 use super::BakedSubMesh;
 
 /// Face definitions: (neighbor offset, quad vertices in CCW winding, normal).
@@ -106,22 +104,23 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
     ao
 }
 
-/// Bake any cubic voxel volume of `size^3` cells into per-block-type sub-meshes
+/// Bake any cubic voxel volume of `size^3` cells into per-voxel-type sub-meshes
 /// with face culling. The data source is given as a closure so the caller can
-/// feed it any voxel grid.
-pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<BlockType>>(
+/// feed it any voxel grid. Returns `Option<u8>` where `None` = empty, `Some(v)`
+/// = a non-zero voxel index into the palette.
+pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
     size: i32,
     get: F,
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
-    let mut groups: std::collections::HashMap<BlockType, FaceCollector> =
+    let mut groups: std::collections::HashMap<u8, FaceCollector> =
         std::collections::HashMap::new();
 
     for y in 0..size {
         for z in 0..size {
             for x in 0..size {
-                let Some(block) = get(x, y, z) else { continue };
-                let collector = groups.entry(block).or_default();
+                let Some(voxel) = get(x, y, z) else { continue };
+                let collector = groups.entry(voxel).or_default();
 
                 for &(dir, ref quad, normal) in &FACES {
                     let nx = x + dir.x;
@@ -141,9 +140,9 @@ pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<BlockType>>(
 
     groups
         .into_iter()
-        .map(|(block_type, collector)| BakedSubMesh {
+        .map(|(voxel, collector)| BakedSubMesh {
             mesh: meshes.add(collector.build()),
-            block_type,
+            voxel,
         })
         .collect()
 }

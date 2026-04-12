@@ -3,10 +3,8 @@ use std::f32::consts::FRAC_PI_2;
 use bevy::{
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
-    window::{CursorGrabMode, CursorOptions},
 };
 
-use crate::inventory::InventoryState;
 use crate::player::{Player, PLAYER_HEIGHT};
 use crate::world::view::cell_size_at_layer;
 use crate::world::CameraZoom;
@@ -21,11 +19,9 @@ impl Plugin for CameraPlugin {
             .add_systems(Startup, (spawn_camera, spawn_crosshair))
             .add_systems(
                 Update,
-                (
-                    manage_cursor,
-                    first_person_camera.after(crate::player::derive_transforms),
-                )
-                    .chain(),
+                first_person_camera
+                    .after(crate::player::derive_transforms)
+                    .after(crate::ui::sync_cursor),
             );
     }
 }
@@ -65,30 +61,6 @@ fn spawn_crosshair(mut commands: Commands) {
         },
         BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
     ));
-}
-
-/// Grab cursor on left click (only if not already grabbed). Release on Escape.
-/// The grab-click does NOT count as a block interaction.
-fn manage_cursor(
-    mouse: Res<ButtonInput<MouseButton>>,
-    key: Res<ButtonInput<KeyCode>>,
-    inv: Res<InventoryState>,
-    mut cursor_options: Single<&mut CursorOptions>,
-    mut locked: ResMut<CursorLocked>,
-) {
-    // Never grab cursor while inventory is open
-    if inv.open { return }
-    if mouse.just_pressed(MouseButton::Left) && !locked.0 {
-        cursor_options.visible = false;
-        cursor_options.grab_mode = CursorGrabMode::Locked;
-        locked.0 = true;
-        return; // consume this click — don't also break a block
-    }
-    if key.just_pressed(KeyCode::Escape) {
-        cursor_options.visible = true;
-        cursor_options.grab_mode = CursorGrabMode::None;
-        locked.0 = false;
-    }
 }
 
 fn first_person_camera(

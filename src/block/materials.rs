@@ -1,30 +1,11 @@
 use bevy::prelude::*;
-use super::BlockType;
+use super::Palette;
 
-/// One StandardMaterial per block type, shared across all rendering.
-#[derive(Resource)]
-pub struct BlockMaterials {
-    pub handles: [Handle<StandardMaterial>; 10],
-}
-
-impl BlockMaterials {
-    pub fn get(&self, bt: BlockType) -> Handle<StandardMaterial> {
-        self.handles[bt as usize].clone()
-    }
-}
-
-pub fn init_block_materials(
+/// Initialize the Palette resource at startup.
+pub fn init_palette(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let handles = BlockType::ALL.map(|bt| {
-        materials.add(StandardMaterial {
-            base_color: bt.color(),
-            perceptual_roughness: bt.roughness(),
-            metallic: bt.metallic(),
-            alpha_mode: bt.alpha_mode(),
-            ..default()
-        })
-    });
-    commands.insert_resource(BlockMaterials { handles });
+    let palette = Palette::new(&mut materials);
+    commands.insert_resource(palette);
 }

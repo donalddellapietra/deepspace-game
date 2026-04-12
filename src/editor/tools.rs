@@ -12,7 +12,7 @@ use crate::world::collision;
 use crate::world::edit::{
     edit_at_layer_pos, install_subtree, subtree_path_for_layer_pos,
 };
-use crate::world::tree::{voxel_from_block, EMPTY_VOXEL};
+use crate::world::tree::EMPTY_VOXEL;
 use crate::world::view::{
     bevy_center_of_layer_pos, cell_size_at_layer, layer_pos_from_bevy,
     target_layer_for, WorldAnchor,
@@ -196,9 +196,8 @@ pub fn place_block(
     };
 
     match hotbar.active_item(zoom.layer) {
-        HotbarItem::Block(bt) => {
-            let voxel = voxel_from_block(Some(*bt));
-            edit_at_layer_pos(&mut world, &place_lp, voxel);
+        HotbarItem::Block(voxel) => {
+            edit_at_layer_pos(&mut world, &place_lp, *voxel);
         }
         HotbarItem::Model(idx) => {
             let Some(saved) = saved.items.get(*idx) else {

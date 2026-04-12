@@ -15,7 +15,7 @@
 
 use bevy::prelude::*;
 
-use crate::block::materials::BlockMaterials;
+use crate::block::Palette;
 use crate::camera::CursorLocked;
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
@@ -179,7 +179,7 @@ pub fn update_save_tint(
     targeted: Res<TargetedBlock>,
     zoom: Res<CameraZoom>,
     world: Res<WorldState>,
-    block_materials: Option<Res<BlockMaterials>>,
+    palette: Option<Res<Palette>>,
     tint: Option<Res<SaveTintMaterial>>,
     mut state: ResMut<SaveTintState>,
     mut commands: Commands,
@@ -187,7 +187,7 @@ pub fn update_save_tint(
     children_q: Query<&Children>,
     sub_q: Query<&SubMeshBlock>,
 ) {
-    let (Some(block_materials), Some(tint)) = (block_materials, tint) else {
+    let (Some(palette), Some(tint)) = (palette, tint) else {
         return;
     };
 
@@ -218,8 +218,10 @@ pub fn update_save_tint(
         if let Ok(children) = children_q.get(prev_entity) {
             for child in children.iter() {
                 if let Ok(sub) = sub_q.get(child) {
-                    if let Ok(mut ec) = commands.get_entity(child) {
-                        ec.insert(MeshMaterial3d(block_materials.get(sub.0)));
+                    if let Some(mat) = palette.material(sub.0) {
+                        if let Ok(mut ec) = commands.get_entity(child) {
+                            ec.insert(MeshMaterial3d(mat));
+                        }
                     }
                 }
             }
