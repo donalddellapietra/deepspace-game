@@ -121,6 +121,23 @@ def auto_split_humanoid(voxels, vox_size):
         core_left = mid_x - width * 0.15
         core_right = mid_x + width * 0.15
 
+    # Also compute head core width — the actual head is narrower than
+    # the shoulders/arms that may be at the same height (T-pose).
+    # Scan the very top of the model to find the head's X extent.
+    top_10 = min_y + height * 0.90
+    top_xs = [x for (x, y, z), _ in voxels.items() if y >= top_10]
+    if top_xs:
+        head_min_x = min(top_xs)
+        head_max_x = max(top_xs)
+        # Head core: the top-10% width plus some margin
+        head_w = head_max_x - head_min_x + 1
+        head_margin = head_w * 0.3
+        head_left = head_min_x - head_margin
+        head_right = head_max_x + head_margin
+    else:
+        head_left = core_left
+        head_right = core_right
+
     parts = {
         "head": {},
         "torso": {},
@@ -132,7 +149,16 @@ def auto_split_humanoid(voxels, vox_size):
 
     for (x, y, z), c in voxels.items():
         if y >= head_bot:
-            parts["head"][(x, y, z)] = c
+            # Head band: only voxels within the head's X width are "head".
+            # Voxels outside that are arms (T-pose) or shoulders (torso).
+            if head_left <= x <= head_right:
+                parts["head"][(x, y, z)] = c
+            elif x < core_left:
+                parts["arm_l"][(x, y, z)] = c
+            elif x > core_right:
+                parts["arm_r"][(x, y, z)] = c
+            else:
+                parts["torso"][(x, y, z)] = c
         elif y >= leg_top:
             # Torso band: split arms from core torso
             if x < core_left:
