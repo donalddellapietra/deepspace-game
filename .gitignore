@@ -2,6 +2,8 @@
 /external
 /dist
 /.vercel
+/ui/node_modules
+/ui/dist
 
 # Downloaded test assets (large .vox files, etc.)
 /assets/vox/*.vox

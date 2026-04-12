@@ -119,7 +119,7 @@ pub fn save_on_click(
     zoom: Res<CameraZoom>,
     mut world: ResMut<WorldState>,
     mut saved: ResMut<SavedMeshes>,
-    mut commands: Commands,
+    mut toast_writer: MessageWriter<crate::overlay::ToastEvent>,
 ) {
     if inv.open || !save_mode.active || !locked.0 || locked.is_changed() {
         return;
@@ -158,7 +158,7 @@ pub fn save_on_click(
     } else {
         format!("Saved mesh #{} (L{})", idx, layer)
     };
-    super::toast::show_toast(&mut commands, message);
+    super::toast::show_toast(&mut toast_writer, message);
 
     save_mode.active = false;
 }

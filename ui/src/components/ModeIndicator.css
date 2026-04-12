@@ -1,0 +1,28 @@
+.mode-indicator {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border: 1px solid var(--hud-border);
+  border-radius: 8px;
+  background: var(--hud-bg);
+  pointer-events: none;
+}
+
+.mode-layer {
+  font-size: 18px;
+  color: var(--text-primary);
+}
+
+.mode-save {
+  font-size: 12px;
+}
+.mode-save.eligible {
+  color: var(--save-mode-color);
+}
+.mode-save.warning {
+  color: var(--save-warning-color);
+}

@@ -1,0 +1,130 @@
+.inventory-panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 460px;
+  max-height: 520px;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--hud-border);
+  border-radius: 12px;
+  background: var(--panel-bg);
+  pointer-events: auto;
+}
+
+.inv-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 400;
+  color: var(--accent);
+}
+
+.inv-subtitle {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-hint);
+}
+
+.inv-section-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  align-self: center;
+}
+
+.inv-mesh-header {
+  color: var(--mesh-accent);
+  font-size: 14px;
+  text-transform: none;
+}
+
+.inv-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 412px;
+  justify-content: center;
+}
+
+.inv-block-tile {
+  width: 72px;
+  height: 72px;
+  border: 2px solid var(--slot-border);
+  border-radius: 8px;
+  background: transparent;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  cursor: pointer;
+  transition: border-color 0.1s, background-color 0.1s;
+}
+.inv-block-tile:hover {
+  border-color: var(--slot-border-hover);
+  background: var(--slot-bg-hover);
+}
+
+.inv-block-swatch {
+  width: 44px;
+  height: 32px;
+  margin-bottom: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+}
+
+.inv-block-name {
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.inv-mesh-tile {
+  width: 54px;
+  height: 54px;
+  border: 2px solid var(--mesh-border);
+  border-radius: 6px;
+  background: var(--mesh-bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  cursor: pointer;
+  transition: border-color 0.1s, background-color 0.1s;
+}
+.inv-mesh-tile:hover {
+  border-color: rgba(102, 255, 230, 1);
+  background: rgba(38, 102, 89, 0.55);
+}
+
+.inv-mesh-id {
+  font-size: 11px;
+  color: var(--mesh-accent);
+}
+
+.inv-mesh-layer {
+  font-size: 9px;
+  color: var(--text-hint);
+}
+
+.inv-divider {
+  width: 90%;
+  height: 1px;
+  margin: 4px 0;
+  background: var(--section-line);
+}
+
+.inv-hint {
+  font-size: 11px;
+  color: var(--text-hint);
+}
+
+.inv-footer {
+  font-size: 10px;
+  color: var(--text-hint);
+}
