@@ -87,6 +87,8 @@ pub fn update_target(
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
     overlay_list: Res<OverlayList>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
     mut targeted: ResMut<TargetedBlock>,
 ) {
     targeted.clear();
@@ -96,6 +98,32 @@ pub fn update_target(
     };
     let origin = cam.translation();
     let dir = cam.forward().as_vec3();
+
+    // Debug: log raycast state on left/right click when NPCs exist.
+    let debug = (mouse.just_pressed(MouseButton::Left)
+        || mouse.just_pressed(MouseButton::Right))
+        && !overlay_list.entries.is_empty();
+
+    if debug {
+        info!(
+            "RAYCAST DEBUG: origin={origin:?} dir={dir:?} overlays={}",
+            overlay_list.entries.len()
+        );
+        for (i, entry) in overlay_list.entries.iter().enumerate() {
+            info!(
+                "  NPC[{i}]: pos={:?} rot={:?} scale={} parts={}",
+                entry.bevy_pos, entry.rotation, entry.scale, entry.parts.len()
+            );
+            for (j, part) in entry.parts.iter().enumerate() {
+                let part_pos = entry.bevy_pos
+                    + entry.rotation * (entry.scale * part.offset);
+                info!(
+                    "    part[{j}]: node={} offset={:?} pivot={:?} bevy_pos={:?}",
+                    part.node_id, part.offset, part.pivot, part_pos
+                );
+            }
+        }
+    }
 
     let mut world_dist = f32::MAX;
     if let Some((hit, normal)) =
@@ -108,9 +136,13 @@ pub fn update_target(
         targeted.normal = Some(normal);
     }
 
+    if debug {
+        info!("  world_dist={world_dist}");
+    }
+
     // Check NPC overlay parts — if closer than the world hit, override.
     if let Some(overlay_hit) =
-        raycast_overlays(&world, &overlay_list, origin, dir, world_dist)
+        raycast_overlays(&world, &overlay_list, origin, dir, world_dist, debug)
     {
         targeted.hit_overlay = Some(overlay_hit);
     }
@@ -225,6 +257,7 @@ fn raycast_overlays(
     ray_origin: Vec3,
     ray_dir: Vec3,
     max_dist: f32,
+    debug: bool,
 ) -> Option<OverlayHit> {
     let mut best: Option<(OverlayHit, f32)> = None;
 
@@ -247,7 +280,16 @@ fn raycast_overlays(
             // Ray-AABB intersection with [0, N)^3 where N = 25.
             let n = NODE_VOXELS_PER_AXIS as f32;
             let (t_enter, t_exit) = ray_aabb(local_origin, local_dir, Vec3::ZERO, Vec3::splat(n));
+
+            if debug {
+                info!(
+                    "  raycast part[{part_idx}]: part_pos={part_pos:?} scale={} local_origin={local_origin:?} local_dir={local_dir:?} t_enter={t_enter:.3} t_exit={t_exit:.3}",
+                    entry.scale
+                );
+            }
+
             if t_enter >= t_exit || t_exit < 0.0 {
+                if debug { info!("    AABB miss"); }
                 continue;
             }
 
@@ -255,14 +297,16 @@ fn raycast_overlays(
             let node = world.library.get(part.node_id);
             let Some(node) = node else { continue };
 
+            if debug { info!("    AABB hit, marching voxels..."); }
+
             let t_start = t_enter.max(0.0) + 0.001;
             let start = local_origin + local_dir * t_start;
 
             // Simple stepping: walk along the ray in small increments.
-            // For NPC parts (small grids), this is fast enough.
-            let step_size = 0.4; // sub-voxel steps
+            let step_size = 0.4;
             let max_steps = (n * 3.0 / step_size) as i32;
             let dir_norm = local_dir.normalize();
+            let mut march_hit = false;
 
             for i in 0..max_steps {
                 let p = start + dir_norm * (i as f32 * step_size);
@@ -272,13 +316,17 @@ fn raycast_overlays(
                 if vx < 0 || vy < 0 || vz < 0
                     || vx >= n as i32 || vy >= n as i32 || vz >= n as i32
                 {
-                    if i > 0 { break; } // exited the box
+                    if i > 0 { break; }
                     continue;
                 }
                 let idx = (vz as usize * NODE_VOXELS_PER_AXIS + vy as usize)
                     * NODE_VOXELS_PER_AXIS
                     + vx as usize;
                 if node.voxels[idx] != EMPTY_VOXEL {
+                    if debug {
+                        info!("    HIT voxel ({vx},{vy},{vz}) val={} at step {i}", node.voxels[idx]);
+                    }
+                    march_hit = true;
                     // Compute Bevy-space distance for this hit.
                     let hit_bevy = part_pos
                         + part_rot
@@ -300,9 +348,15 @@ fn raycast_overlays(
                     break;
                 }
             }
+            if debug && !march_hit {
+                info!("    march: no voxel hit after {max_steps} steps, start={start:?}");
+            }
         }
     }
 
+    if debug {
+        info!("  raycast result: {}", if best.is_some() { "HIT" } else { "MISS" });
+    }
     best.map(|(hit, _)| hit)
 }
 
