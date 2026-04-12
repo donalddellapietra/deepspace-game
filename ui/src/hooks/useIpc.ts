@@ -1,18 +1,13 @@
 import type { UiCommand } from "../types";
+import { getTransport } from "./useTransport";
 
-// Command queue that Rust polls via wasm-bindgen
-const queue: UiCommand[] = [];
+// In WASM mode, Rust polls commands via __pollUiCommands.
+// The transport handles this: in WASM mode it maintains the queue and
+// sets up the global; in WS mode it sends over the WebSocket.
 
-/** Called by Rust to drain pending commands. Returns JSON array. */
-(window as any).__pollUiCommands = (): string => {
-  const cmds = JSON.stringify(queue);
-  queue.length = 0;
-  return cmds;
-};
-
-/** Send a command to the Rust game. */
+/** Send a command to the Rust game (works in both WASM and WS modes). */
 export function sendCommand(cmd: UiCommand) {
-  queue.push(cmd);
+  getTransport().sendCommand(cmd);
 }
 
 // Convenience wrappers
@@ -48,12 +43,3 @@ export function toggleColorPicker() {
 export function setUiFocused(focused: boolean) {
   sendCommand({ cmd: "uiFocused", focused });
 }
-
-// Listen for browser exiting Pointer Lock (e.g., user presses Escape).
-// The browser consumes the Escape keypress so Bevy never sees it —
-// we detect the change here and tell Rust to disengage.
-document.addEventListener("pointerlockchange", () => {
-  if (!document.pointerLockElement) {
-    sendCommand({ cmd: "pointerLockLost" });
-  }
-});

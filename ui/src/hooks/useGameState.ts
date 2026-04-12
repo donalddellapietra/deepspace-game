@@ -7,6 +7,7 @@ import type {
   ModeIndicatorState,
   ToastMessage,
 } from "../types";
+import { getTransport } from "./useTransport";
 
 // ── In-memory stores ─���────────────────────────────────────────────
 
@@ -80,11 +81,16 @@ function handleGameState(update: GameStateUpdate) {
   }
 }
 
-// Register global handler for Rust to call
+// Register global handler for WASM mode (Rust calls window.__onGameState).
+// In WebSocket mode, the transport calls handleGameState directly.
 (window as any).__onGameState = (data: GameStateUpdate | string) => {
   const parsed = typeof data === "string" ? JSON.parse(data) : data;
   handleGameState(parsed);
 };
+
+// Wire up the transport — in WS mode this starts the WebSocket connection
+// and routes incoming messages through handleGameState.
+getTransport().onState(handleGameState);
 
 // ── React hooks ────────���─────────────────────────────���────────────
 

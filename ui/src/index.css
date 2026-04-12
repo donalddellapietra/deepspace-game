@@ -20,6 +20,10 @@
   --section-line: rgba(255, 255, 255, 0.08);
 }
 
+html, body {
+  background: transparent !important;
+}
+
 * {
   margin: 0;
   padding: 0;

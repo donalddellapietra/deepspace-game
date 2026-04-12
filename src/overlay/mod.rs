@@ -6,6 +6,10 @@
 //! * Polls a JS command queue each frame and applies mutations to Bevy resources
 
 pub mod bridge;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod webview;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ws_server;
 
 use bevy::prelude::*;
 use serde_json;
@@ -21,6 +25,10 @@ use crate::world::view::target_layer_for;
 use crate::world::CameraZoom;
 
 // ── Plugin ────────────────────────────────────────────────────────
+
+/// WebSocket port for the native overlay server.
+#[cfg(not(target_arch = "wasm32"))]
+const WS_PORT: u16 = 9000;
 
 pub struct OverlayPlugin;
 
@@ -41,6 +49,18 @@ impl Plugin for OverlayPlugin {
                     poll_ui_commands,
                 ),
             );
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle = ws_server::start(WS_PORT, false);
+            native_bridge::set_handle(handle);
+
+            app.init_non_send_resource::<webview::WebViewHolder>()
+                .add_systems(Update, (
+                    webview::create_overlay_webview,
+                    webview::resize_overlay_webview,
+                ));
+        }
     }
 }
 
@@ -81,15 +101,9 @@ mod js {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-mod js {
-    /// Stub for native builds — no-ops until WebSocket/wry is wired up.
-    pub fn push_to_js(_json: &str) {}
-    pub fn poll_from_js() -> String {
-        "[]".to_string()
-    }
-}
+// ── Transport: unified push/poll across WASM and native ─────────
 
+#[cfg(target_arch = "wasm32")]
 fn push_state(update: &GameStateUpdate) {
     match serde_json::to_string(update) {
         Ok(json) => js::push_to_js(&json),
@@ -97,9 +111,67 @@ fn push_state(update: &GameStateUpdate) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn poll_commands() -> Vec<UiCommand> {
     let raw = js::poll_from_js();
     serde_json::from_str(&raw).unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod native_bridge {
+    use super::ws_server::{ToServer, WsServerHandle};
+    use std::sync::Mutex;
+
+    static HANDLE: Mutex<Option<WsServerHandle>> = Mutex::new(None);
+
+    pub fn set_handle(handle: WsServerHandle) {
+        *HANDLE.lock().unwrap() = Some(handle);
+    }
+
+    pub fn push(json: &str) {
+        let guard = HANDLE.lock().unwrap();
+        if let Some(ref h) = *guard {
+            let _ = h.tx.send(ToServer::Broadcast(json.to_owned()));
+        }
+    }
+
+    pub fn poll_raw() -> Vec<String> {
+        let guard = HANDLE.lock().unwrap();
+        let Some(ref h) = *guard else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(raw) = h.rx.try_recv() {
+            out.push(raw);
+        }
+        out
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn push_state(update: &GameStateUpdate) {
+    match serde_json::to_string(update) {
+        Ok(json) => native_bridge::push(&json),
+        Err(e) => eprintln!("overlay: failed to serialize state update: {e}"),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_commands() -> Vec<UiCommand> {
+    let mut cmds = Vec::new();
+    for raw in native_bridge::poll_raw() {
+        match serde_json::from_str::<Vec<UiCommand>>(&raw) {
+            Ok(batch) => cmds.extend(batch),
+            Err(_) => {
+                if let Ok(cmd) = serde_json::from_str::<UiCommand>(&raw) {
+                    cmds.push(cmd);
+                } else {
+                    eprintln!("overlay: failed to parse command: {raw}");
+                }
+            }
+        }
+    }
+    cmds
 }
 
 // ── State push systems ────────────────────────────────────────────
