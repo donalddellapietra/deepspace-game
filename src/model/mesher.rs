@@ -320,6 +320,122 @@ pub fn bake_child_faces<F: Fn(i32, i32, i32) -> Option<u8>>(
     bake_faces(child_size, get, offset)
 }
 
+/// Voxel classification for a child slot: empty, uniform, or mixed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChildClass {
+    /// EMPTY_NODE — no voxels at all.
+    Empty,
+    /// Every voxel in the 25³ grid is the same value.
+    Uniform(u8),
+    /// The grid contains multiple voxel types.
+    Mixed,
+}
+
+/// Classify each of `n_children` children as empty, uniform, or mixed.
+/// `get_voxels` returns the 25³ grid for a slot, or `None` for EMPTY_NODE.
+pub fn classify_children<F>(n_children: usize, get_voxels: F) -> Vec<ChildClass>
+where
+    F: Fn(usize) -> Option<&'static [u8]>,
+{
+    (0..n_children)
+        .map(|slot| {
+            let Some(voxels) = get_voxels(slot) else {
+                return ChildClass::Empty;
+            };
+            let first = voxels[0];
+            if voxels.iter().all(|&v| v == first) {
+                ChildClass::Uniform(first)
+            } else {
+                ChildClass::Mixed
+            }
+        })
+        .collect()
+}
+
+/// Check whether a uniform child at `slot` can be skipped entirely
+/// (all 6 neighbors are the same uniform value).
+pub fn uniform_child_skippable(
+    slot: usize,
+    v: u8,
+    child_class: &[ChildClass],
+    branch_factor: usize,
+    empty_voxel: u8,
+) -> bool {
+    let sx = slot % branch_factor;
+    let sy = (slot / branch_factor) % branch_factor;
+    let sz = slot / (branch_factor * branch_factor);
+    let neighbors = [
+        (sx.wrapping_sub(1), sy, sz),
+        (sx + 1, sy, sz),
+        (sx, sy.wrapping_sub(1), sz),
+        (sx, sy + 1, sz),
+        (sx, sy, sz.wrapping_sub(1)),
+        (sx, sy, sz + 1),
+    ];
+    neighbors.iter().all(|&(nx, ny, nz)| {
+        if nx >= branch_factor || ny >= branch_factor || nz >= branch_factor {
+            // Outside parent boundary — treated as empty.
+            // Only skip if this child is also empty (air).
+            return v == empty_voxel;
+        }
+        let nslot = nz * branch_factor * branch_factor + ny * branch_factor + nx;
+        child_class[nslot] == ChildClass::Uniform(v)
+    })
+}
+
+/// Flatten children's voxel grids into a contiguous `size³` array,
+/// using child classification to skip empty children and memset
+/// uniform ones.
+pub fn flatten_children(
+    children_voxels: &[Option<&[u8]>],
+    child_class: &[ChildClass],
+    branch_factor: usize,
+    child_size: usize,
+    empty_voxel: u8,
+) -> Vec<u8> {
+    let size = branch_factor * child_size;
+    let mut flat = vec![empty_voxel; size * size * size];
+
+    for slot in 0..children_voxels.len() {
+        let sx = slot % branch_factor;
+        let sy = (slot / branch_factor) % branch_factor;
+        let sz = slot / (branch_factor * branch_factor);
+        let bx = sx * child_size;
+        let by = sy * child_size;
+        let bz = sz * child_size;
+
+        match child_class[slot] {
+            ChildClass::Empty => {}
+            ChildClass::Uniform(v) if v == empty_voxel => {}
+            ChildClass::Uniform(v) => {
+                for z in 0..child_size {
+                    for y in 0..child_size {
+                        for x in 0..child_size {
+                            flat[((bz + z) * size + (by + y)) * size + (bx + x)] = v;
+                        }
+                    }
+                }
+            }
+            ChildClass::Mixed => {
+                if let Some(voxels) = children_voxels[slot] {
+                    for z in 0..child_size {
+                        for y in 0..child_size {
+                            for x in 0..child_size {
+                                let v = voxels[z * child_size * child_size + y * child_size + x];
+                                if v != empty_voxel {
+                                    flat[((bz + z) * size + (by + y)) * size + (bx + x)] = v;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    flat
+}
+
 /// Merge 125 children's `ChildFaces` into final `BakedSubMesh`es.
 /// Each child's face data is concatenated (with index offsets) into
 /// one mesh per voxel type.

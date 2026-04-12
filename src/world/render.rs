@@ -27,7 +27,10 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 use crate::block::Palette;
-use crate::model::mesher::{bake_volume, bake_child_faces, merge_child_faces};
+use crate::model::mesher::{
+    bake_volume, bake_child_faces, merge_child_faces,
+    flatten_children, uniform_child_skippable, ChildClass,
+};
 use crate::model::BakedSubMesh;
 
 use super::state::WorldState;
@@ -125,49 +128,12 @@ pub struct RenderTimings {
     pub collision_us: u64,
 }
 
-/// Cached per-child face data for a parent node at a given tree path.
-///
-/// When a block is edited, the content-addressed tree mints new
-/// NodeIds from the leaf up to the root. At the emit layer, the
-/// parent node gets a new NodeId, but only one of its 125 children
-/// actually changed. This cache stores the old children's NodeId
-/// array alongside the per-child greedy-meshed face data. On
-/// re-bake, we diff old vs new children — matching slots reuse their
-/// cached faces (~0μs each), and only the changed slot re-bakes its
-/// 25³ region (~2ms). The merge pass concatenates all 125 children's
-/// face data into the final mesh (~0.5ms).
-///
-/// Total edit cost: ~3ms instead of ~200ms for a full 125-child bake.
-struct ParentBakeCache {
-    children: Box<[NodeId; CHILDREN_PER_NODE]>,
-    child_faces: Vec<crate::model::mesher::ChildFaces>,
-}
-
-/// Render state: caches baked meshes and per-child face data, tracks
-/// live entities, and holds reusable walk buffers.
-///
-/// ## Cache lifecycle
-///
-/// - `meshes`: keyed by NodeId. Populated on first bake, evicted
-///   when the NodeId leaves the active entity set (no live entity
-///   references it). Content-addressed dedup means identical subtrees
-///   share a NodeId, so cache hits are common.
-///
-/// - `parent_cache`: keyed by SmallPath (tree position). Stores the
-///   per-child face data for incremental re-baking. Evicted when the
-///   path leaves the active entity set (entity despawned due to cull
-///   sphere movement or zoom change).
-///
-/// Both caches are evicted after each reconcile pass to prevent
-/// unbounded growth during camera movement or zoom changes.
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached per-`NodeId` baked sub-meshes. Evicted when the NodeId
-    /// is no longer referenced by any live entity.
+    /// Cached per-`NodeId` baked sub-meshes. Content-addressed dedup
+    /// means identical subtrees share a NodeId, so cache hits are
+    /// common.
     meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
-    /// Per-path incremental bake cache. Evicted when the path is no
-    /// longer in the active entity set.
-    parent_cache: HashMap<SmallPath, ParentBakeCache>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
     /// The `Vec3` is the last-written Bevy translation so we can skip
     /// redundant `Transform` inserts when the anchor hasn't moved.
@@ -218,10 +184,9 @@ fn get_or_bake_mesh<'a>(
     render_state: &'a mut RenderState,
     world: &WorldState,
     node_id: NodeId,
-    path: SmallPath,
     meshes: &mut Assets<Mesh>,
 ) -> &'a [BakedSubMesh] {
-    render_state.get_or_bake(world, node_id, path, meshes)
+    render_state.get_or_bake(world, node_id, meshes)
 }
 
 impl RenderState {
@@ -229,7 +194,6 @@ impl RenderState {
         &'a mut self,
         world: &WorldState,
         node_id: NodeId,
-        path: SmallPath,
         meshes: &mut Assets<Mesh>,
     ) -> &'a [BakedSubMesh] {
         if !self.meshes.contains_key(&node_id) {
@@ -238,82 +202,81 @@ impl RenderState {
                 .get(node_id)
                 .expect("render: node missing from library");
             let baked = if let Some(children) = &node.children {
-                // Non-leaf: bake per-child, then merge.
-                // Check if we have a cached bake for this path whose
-                // children mostly overlap — reuse unchanged slots.
-                let old_cache = self.parent_cache.remove(&path);
 
-                let child_voxels: Vec<Option<VoxelGrid>> = children
-                    .iter()
-                    .map(|&id| {
-                        if id == EMPTY_NODE {
-                            None
+                // Classify children and build flat voxel array.
+                let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
+                    .map(|slot| {
+                        if children[slot] == EMPTY_NODE {
+                            return ChildClass::Empty;
+                        }
+                        let child = world.library.get(children[slot])
+                            .expect("render: child missing from library");
+                        let first = child.voxels[0];
+                        if child.voxels.iter().all(|&v| v == first) {
+                            ChildClass::Uniform(first)
                         } else {
-                            Some(
-                                world
-                                    .library
-                                    .get(id)
-                                    .expect("render: child missing from library")
-                                    .voxels
-                                    .clone(),
-                            )
+                            ChildClass::Mixed
                         }
                     })
                     .collect();
+
+                let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
+                    .map(|slot| {
+                        if children[slot] == EMPTY_NODE {
+                            None
+                        } else {
+                            Some(world.library.get(children[slot])
+                                .expect("render: child missing")
+                                .voxels
+                                .as_ref()
+                                .as_slice())
+                        }
+                    })
+                    .collect();
+
+                let flat = flatten_children(
+                    &children_voxels,
+                    &child_class,
+                    BRANCH_FACTOR,
+                    NODE_VOXELS_PER_AXIS,
+                    EMPTY_VOXEL,
+                );
+
                 let size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
-                let get = |x: i32, y: i32, z: i32| -> Option<u8> {
+                let sz = size as usize;
+                let get = move |x: i32, y: i32, z: i32| -> Option<u8> {
                     if x < 0 || y < 0 || z < 0
                         || x >= size || y >= size || z >= size
                     {
                         return None;
                     }
-                    let xu = x as usize;
-                    let yu = y as usize;
-                    let zu = z as usize;
-                    let slot = slot_index(
-                        xu / NODE_VOXELS_PER_AXIS,
-                        yu / NODE_VOXELS_PER_AXIS,
-                        zu / NODE_VOXELS_PER_AXIS,
-                    );
-                    let voxels = child_voxels[slot].as_ref()?;
-                    let v = voxels[voxel_idx(
-                        xu % NODE_VOXELS_PER_AXIS,
-                        yu % NODE_VOXELS_PER_AXIS,
-                        zu % NODE_VOXELS_PER_AXIS,
-                    )];
+                    let v = flat[(z as usize * sz + y as usize) * sz + x as usize];
                     if v == EMPTY_VOXEL { None } else { Some(v) }
                 };
 
+                // Bake per-child with caching and skip optimizations.
                 let per_child: Vec<_> = (0..CHILDREN_PER_NODE)
                     .map(|slot| {
-                        let child_id = children[slot];
-                        if child_id == EMPTY_NODE {
+                        if children[slot] == EMPTY_NODE {
                             return Default::default();
                         }
-                        // Reuse cached faces if this child's NodeId
-                        // hasn't changed since the last bake at this path.
-                        if let Some(ref old) = old_cache {
-                            if old.children[slot] == child_id {
-                                return old.child_faces[slot].clone();
+                        if let ChildClass::Uniform(v) = child_class[slot] {
+                            if uniform_child_skippable(
+                                slot, v, &child_class,
+                                BRANCH_FACTOR, EMPTY_VOXEL,
+                            ) {
+                                return Default::default();
                             }
                         }
                         bake_child_faces(
-                            &get,
-                            slot,
+                            &get, slot,
                             NODE_VOXELS_PER_AXIS as i32,
                             BRANCH_FACTOR,
                         )
                     })
                     .collect();
 
-                let result = merge_child_faces(&per_child, meshes);
-
-                self.parent_cache.insert(path, ParentBakeCache {
-                    children: children.clone(),
-                    child_faces: per_child,
-                });
-
-                result
+                merge_child_faces(&per_child, meshes)
             } else {
                 let voxels = node.voxels.clone();
                 bake_volume(
@@ -569,7 +532,7 @@ pub fn render_world(
         let bake_start = std::time::Instant::now();
         for v in visits.iter() {
             if !render_state.meshes.contains_key(&v.node_id) {
-                get_or_bake_mesh(&mut render_state, &world, v.node_id, v.path, &mut meshes);
+                get_or_bake_mesh(&mut render_state, &world, v.node_id, &mut meshes);
             }
         }
         timings.bake_us = bake_start.elapsed().as_micros() as u64;
@@ -645,16 +608,6 @@ pub fn render_world(
     }
     render_state.entities = alive;
 
-    // Evict stale caches: remove parent_cache and mesh entries for
-    // paths/NodeIds that are no longer in the active entity set.
-    // Without this, caches grow unboundedly as the player moves or
-    // zooms.
-    let live_paths: std::collections::HashSet<SmallPath> =
-        render_state.entities.keys().copied().collect();
-    let live_node_ids: std::collections::HashSet<NodeId> =
-        render_state.entities.values().map(|&(_, nid, _)| nid).collect();
-    render_state.parent_cache.retain(|path, _| live_paths.contains(path));
-    render_state.meshes.retain(|nid, _| live_node_ids.contains(nid));
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
 
