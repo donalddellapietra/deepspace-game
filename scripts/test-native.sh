@@ -60,6 +60,13 @@ else
     check "WebView created" 1 "no creation log found"
 fi
 
+# Check hitTest swizzle succeeded
+if grep -q "hitTest.*swizzled" "$GAME_LOG"; then
+    check "hitTest: swizzled" 0
+else
+    check "hitTest: swizzled" 1 "swizzle log not found"
+fi
+
 # ── Check 2: Window screenshot ──
 echo "==> Capturing window screenshot..."
 WID=$(swift -e '
@@ -124,27 +131,28 @@ const { chromium } = require('/Users/donalddellapietra/GitHub/deepspace-game/ui/
         check('React rendered', rootOk.kids > 0, `${rootOk.kids} children`);
     }
 
-    // Check hotbar has colored slots (game state flowing)
-    const hotbarSlots = await page.evaluate(() => {
-        const slots = document.querySelectorAll('[class*="slot"], [class*="Slot"]');
-        let colored = 0;
-        slots.forEach(s => {
-            const bg = getComputedStyle(s).backgroundColor;
-            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') colored++;
-        });
-        return { total: slots.length, colored };
-    });
-    check('Hotbar has colored slots', hotbarSlots.colored > 0,
-        `${hotbarSlots.colored}/${hotbarSlots.total} colored`);
+    // Note: Playwright loads the page in a regular browser, NOT inside the
+    // wry webview. So wry-specific features (IPC, __stateBuffer, game state)
+    // can't be tested here. Only CSS/layout/React rendering is testable.
 
-    // Check passthrough JS is injected (mousemove handler exists)
-    const hasPassthrough = await page.evaluate(() => {
-        return typeof window.ipc !== 'undefined' || document.title !== '';
+    // Check hotbar element exists and is positioned correctly
+    const hotbar = await page.evaluate(() => {
+        const el = document.querySelector('[class*="hotbar"], [class*="Hotbar"]');
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return {
+            exists: true,
+            bottom: rect.bottom,
+            viewportHeight: window.innerHeight,
+            hasPointerEvents: getComputedStyle(el).pointerEvents === 'auto',
+        };
     });
-    // Can't fully test passthrough in headless Playwright, but check script ran
-    check('Init script ran (stateBuffer exists)',
-        await page.evaluate(() => Array.isArray(window.__stateBuffer)),
-        'window.__stateBuffer not found');
+    check('Hotbar element exists', !!hotbar, 'not found');
+    if (hotbar) {
+        check('Hotbar near bottom', hotbar.bottom > hotbar.viewportHeight * 0.7,
+            `bottom=${hotbar.bottom} viewport=${hotbar.viewportHeight}`);
+        check('Hotbar has pointer-events:auto', hotbar.hasPointerEvents, 'not auto');
+    }
 
     await page.screenshot({ path: '/tmp/deepspace-playwright.png' });
     console.log(`\n  Playwright: ${r.pass} passed, ${r.fail} failed`);
