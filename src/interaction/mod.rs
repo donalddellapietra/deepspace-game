@@ -20,8 +20,8 @@ use bevy::prelude::*;
 use crate::camera::FpsCam;
 use crate::world::position::LayerPos;
 use crate::world::view::{
-    bevy_origin_of_layer_pos, cell_size_at_layer, is_layer_pos_solid,
-    layer_pos_from_bevy, WorldAnchor,
+    bevy_origin_of_layer_pos, cell_origin_for_anchor, cell_size_at_layer,
+    is_layer_pos_solid, layer_pos_from_bevy, WorldAnchor,
 };
 use crate::world::{CameraZoom, WorldState};
 
@@ -101,11 +101,7 @@ fn dda_view_cells(
 ) -> Option<(LayerPos, IVec3)> {
     let cell_size = cell_size_at_layer(view_layer);
     let cell_size_i64 = cell_size as i64;
-    let cell_origin = Vec3::new(
-        -(anchor.leaf_coord[0].rem_euclid(cell_size_i64) as f32),
-        -(anchor.leaf_coord[1].rem_euclid(cell_size_i64) as f32),
-        -(anchor.leaf_coord[2].rem_euclid(cell_size_i64) as f32),
-    );
+    let cell_origin = cell_origin_for_anchor(anchor, cell_size_i64);
 
     let local = origin - cell_origin;
     let mut pos = IVec3::new(

@@ -4,7 +4,9 @@ use bevy::diagnostic::{
 use bevy::prelude::*;
 
 use crate::player::Player;
-use crate::world::{CameraZoom, WorldState};
+use crate::world::state::GROUND_Y_VOXELS;
+use crate::world::view::{position_to_leaf_coord, target_layer_for};
+use crate::world::{CameraZoom, WorldPosition, WorldState};
 
 pub struct DiagnosticsPlugin;
 
@@ -71,7 +73,7 @@ fn update_debug_overlay(
     diagnostics: Res<DiagnosticsStore>,
     zoom: Res<CameraZoom>,
     state: Res<WorldState>,
-    player_q: Query<&Transform, With<Player>>,
+    player_q: Query<&WorldPosition, With<Player>>,
     overlay_q: Query<&Node, With<DebugOverlay>>,
     mut text_q: Query<&mut Text, With<DebugOverlayText>>,
 ) {
@@ -93,26 +95,42 @@ fn update_debug_overlay(
         .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
         .and_then(|d| d.value())
         .unwrap_or(0.0);
-    let pos = player_q
+
+    // Player position in the world's absolute leaf-coord frame.
+    // `WorldPosition` is the source of truth; the Bevy `Transform`
+    // is just its projection through the floating anchor and would
+    // always show sub-voxel drift (`[0, 1)`), which isn't useful.
+    let leaf = player_q
         .single()
-        .map(|t| t.translation)
-        .unwrap_or(Vec3::ZERO);
+        .map(|wp| position_to_leaf_coord(&wp.0))
+        .unwrap_or([0, 0, 0]);
+    // `height` is signed leaf y relative to the grass top face:
+    // `0` = feet on the ground, `+n` = n leaves above, `-n` = n
+    // leaves underground.
+    let height = leaf[1] - GROUND_Y_VOXELS;
+    let target = target_layer_for(zoom.layer);
 
     *text = Text::new(format!(
         "DEBUG [F3]\n\
-         fps           {:>7.1}\n\
-         frame time    {:>6.2} ms\n\
-         entities      {:>7}\n\
-         pos           {:>6.1} {:>6.1} {:>6.1}\n\
-         zoom layer    {:>7}\n\
-         library       {:>7}",
+         fps           {:>11.1}\n\
+         frame time    {:>8.2} ms\n\
+         entities      {:>11}\n\
+         world x       {:>11}\n\
+         world y       {:>11}\n\
+         world z       {:>11}\n\
+         height        {:>11}\n\
+         view layer    {:>11}\n\
+         target layer  {:>11}\n\
+         library       {:>11}",
         fps,
         frame_time_ms,
         entity_count as u64,
-        pos.x,
-        pos.y,
-        pos.z,
+        leaf[0],
+        leaf[1],
+        leaf[2],
+        height,
         zoom.layer,
+        target,
         state.library.len(),
     ));
 }
@@ -122,21 +140,23 @@ fn log_diag(
     mut timer: ResMut<DiagTimer>,
     state: Res<WorldState>,
     zoom: Res<CameraZoom>,
-    player_q: Query<&Transform, With<Player>>,
+    player_q: Query<&WorldPosition, With<Player>>,
 ) {
     timer.0.tick(time.delta());
     if !timer.0.just_finished() {
         return;
     }
-    let pos = player_q
+    let leaf = player_q
         .single()
-        .map(|t| t.translation)
-        .unwrap_or(Vec3::ZERO);
+        .map(|wp| position_to_leaf_coord(&wp.0))
+        .unwrap_or([0, 0, 0]);
+    let height = leaf[1] - GROUND_Y_VOXELS;
     info!(
-        "pos=({:.1},{:.1},{:.1}) zoom_layer={} library_entries={}",
-        pos.x,
-        pos.y,
-        pos.z,
+        "leaf=({},{},{}) height={} zoom_layer={} library_entries={}",
+        leaf[0],
+        leaf[1],
+        leaf[2],
+        height,
         zoom.layer,
         state.library.len(),
     );

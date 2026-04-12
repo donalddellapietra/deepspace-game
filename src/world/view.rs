@@ -151,6 +151,33 @@ pub fn target_layer_for(view_layer: u8) -> u8 {
     view_layer.saturating_add(2).min(MAX_LAYER)
 }
 
+/// Bevy offset from the given `anchor` to the `-x, -y, -z` corner
+/// of the `cell_size_leaves`-aligned cell that contains the anchor.
+///
+/// Used by every module that iterates an **anchor-local cell grid**
+/// (collision block-sweep, interaction DDA, highlight placement…).
+/// The returned `Vec3` is always in `(-cell_size_leaves, 0]` on
+/// each axis — tiny, `f32`-safe — because it's just the negated
+/// `leaf_coord.rem_euclid(cell_size_leaves)`. Call sites that
+/// iterate relative block indices `(rbx, rby, rbz)` then compute
+/// each block's Bevy corner as
+/// `cell_origin + (rbx, rby, rbz) as f32 * cell_size_leaves as f32`,
+/// which stays small-f32 too so long as the iteration range is
+/// bounded.
+///
+/// `cell_size_leaves` is the cell edge length in leaves, not in
+/// Bevy units — for a target-layer collision grid at layer `L`
+/// that's `cell_size_at_layer(L) as i64`, and for a view-cell
+/// grid at view layer `L` it's the same.
+#[inline]
+pub fn cell_origin_for_anchor(anchor: &WorldAnchor, cell_size_leaves: i64) -> Vec3 {
+    Vec3::new(
+        -(anchor.leaf_coord[0].rem_euclid(cell_size_leaves) as f32),
+        -(anchor.leaf_coord[1].rem_euclid(cell_size_leaves) as f32),
+        -(anchor.leaf_coord[2].rem_euclid(cell_size_leaves) as f32),
+    )
+}
+
 // ------------------------------------------------------ leaf coord math
 
 /// Integer leaf coordinate of a [`Position`] in the root's frame.

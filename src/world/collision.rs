@@ -26,9 +26,9 @@ use bevy::prelude::*;
 use super::position::Position;
 use super::state::WorldState;
 use super::view::{
-    bevy_from_position, cell_size_at_layer, is_layer_pos_solid,
-    layer_pos_from_bevy, position_from_leaf_coord, position_to_leaf_coord,
-    target_layer_for, WorldAnchor,
+    bevy_from_position, cell_origin_for_anchor, cell_size_at_layer,
+    is_layer_pos_solid, layer_pos_from_bevy, position_from_leaf_coord,
+    position_to_leaf_coord, target_layer_for, WorldAnchor,
 };
 
 // ------------------------------------------------------------ player AABB
@@ -108,14 +108,6 @@ fn player_aabb(pos: Vec3, view_cell: f32) -> Aabb {
         min: Vec3::new(pos.x - hw, pos.y, pos.z - hw),
         max: Vec3::new(pos.x + hw, pos.y + h, pos.z + hw),
     }
-}
-
-fn cell_origin_for_anchor(anchor: &WorldAnchor, block_size_i64: i64) -> Vec3 {
-    Vec3::new(
-        -(anchor.leaf_coord[0].rem_euclid(block_size_i64) as f32),
-        -(anchor.leaf_coord[1].rem_euclid(block_size_i64) as f32),
-        -(anchor.leaf_coord[2].rem_euclid(block_size_i64) as f32),
-    )
 }
 
 /// Clip a one-axis movement `delta` against a single block of side
