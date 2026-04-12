@@ -550,11 +550,11 @@ mod tests {
 
     /// The grassland's ground surface must be reachable as a solid
     /// [`LayerPos`] at every view layer. Regression against a
-    /// majority-vote downsample that washed out thin features — at
-    /// view L ≤ 8 the 125-leaf-deep ground used to collapse to air
-    /// in the cascaded downsample, so the crosshair clicked through
-    /// ground it could see. The presence-preserving downsample in
-    /// [`super::tree::downsample`] is what makes this hold.
+    /// majority-vote downsample that washed out thin features — the
+    /// ground used to collapse to air in the cascaded downsample, so
+    /// the crosshair clicked through ground it could see. The
+    /// presence-preserving downsample in [`super::tree::downsample`]
+    /// is what makes this hold.
     #[test]
     fn ground_is_solid_at_every_view_layer() {
         let world = WorldState::new_grassland();

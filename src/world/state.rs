@@ -6,10 +6,11 @@
 //! which keep voxels and meshes consistent.
 //!
 //! The v1 world is an infinite grassland with a solid ground layer
-//! that is [`GROUND_Y_VOXELS`] leaf voxels deep and air above it.
-//! The top face of the grass sits at root-local leaf y =
-//! [`GROUND_Y_VOXELS`], and the floating [`WorldAnchor`](super::view::WorldAnchor)
-//! maps that to Bevy `y = 0` whenever the player is resting on it.
+//! that is [`GROUND_Y_VOXELS`] leaf voxels deep (`5^(MAX_LAYER - 1)`,
+//! one layer-1 child extent) and air above it. The top face of the
+//! grass sits at root-local leaf y = [`GROUND_Y_VOXELS`], and the
+//! floating [`WorldAnchor`](super::view::WorldAnchor) maps that to
+//! Bevy `y = 0` whenever the player is resting on it.
 
 use bevy::prelude::*;
 
@@ -24,10 +25,54 @@ use super::tree::{
 /// leaf whose y-range in root-local coords is ≤ this value is solid
 /// grass; every leaf whose y-range is ≥ this is empty air.
 ///
-/// At `125` = one layer-11 extent, the ground is `125` leaf voxels
-/// (5 leaves) deep — enough for the player to dig down noticeably
-/// before hitting the void at the bottom of the root.
-pub const GROUND_Y_VOXELS: i64 = 125;
+/// Set to `5^(MAX_LAYER - 1)` — one layer-1 child extent — so the
+/// ground spans at least 5 view cells at every zoom level, including
+/// [`MIN_ZOOM`](super::render::MIN_ZOOM). This guarantees the
+/// layer-uniform UX principle: the outline, placement, and collision
+/// feel identical at every view layer.
+///
+/// Thanks to content dedup, the deeper ground adds zero extra library
+/// entries — the grassland bootstrap produces exactly 25 nodes
+/// regardless of this value.
+pub const GROUND_Y_VOXELS: i64 = {
+    // 5^(MAX_LAYER - 1). Computed as a const because f64::powi isn't
+    // available in const context.
+    let mut n: i64 = 1;
+    let mut i = 0;
+    while i < MAX_LAYER - 1 {
+        n *= BRANCH_FACTOR as i64;
+        i += 1;
+    }
+    n
+};
+
+/// The depth in a [`Position`]'s path at which the grass/air
+/// transition first appears. At this depth, the child extent equals
+/// [`GROUND_Y_VOXELS`], so `sy = 1` is the first air slot.
+///
+/// For `GROUND_Y_VOXELS = 5^(MAX_LAYER - 1)` the transition depth
+/// is 2 — depths 0 and 1 are still inside the "bottom" mixed
+/// pattern, and depth 2 is where `sy = 0` is all-grass and
+/// `sy >= 1` is all-air.
+pub const GROUND_TRANSITION_DEPTH: usize = {
+    // Find the shallowest depth d where
+    // child_extent(d) = world_extent / 5^(d+1) <= GROUND_Y_VOXELS.
+    // child_extent(d) = NODE_VOXELS_PER_AXIS * 5^(MAX_LAYER - d - 1).
+    let mut d: usize = 0;
+    loop {
+        let mut extent: i64 = NODE_VOXELS_PER_AXIS as i64;
+        let exp = MAX_LAYER as usize - d - 1;
+        let mut j = 0;
+        while j < exp {
+            extent *= BRANCH_FACTOR as i64;
+            j += 1;
+        }
+        if extent <= GROUND_Y_VOXELS {
+            break d;
+        }
+        d += 1;
+    }
+};
 
 /// Full world extent along one axis, in leaf voxels.
 /// `25 × 5^MAX_LAYER ≈ 6.1 billion` — overflows `i32`, lives in `i64`.
@@ -198,7 +243,7 @@ fn mixed_bottom_children(bottom: NodeId, air: NodeId) -> Children {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::tree::{voxel_from_block, voxel_idx, EMPTY_VOXEL, NODE_VOXELS_PER_AXIS};
+    use crate::world::tree::{slot_index, voxel_from_block, voxel_idx, EMPTY_VOXEL, NODE_VOXELS_PER_AXIS};
     use crate::block::BlockType;
 
     fn grass() -> u8 {
@@ -262,16 +307,16 @@ mod tests {
         }
     }
 
-    /// A path whose layer-10 y-slot is 1 lands in the "air above
+    /// A path whose root y-slot is 1 lands in the "air above
     /// ground" region — the leaf should be all-empty.
     #[test]
     fn air_region_leaf_is_all_empty() {
         let world = WorldState::new_grassland();
         let mut id = world.root;
         let mut path = [0u8; MAX_LAYER as usize];
-        // slot_index(0, 1, 0) = 1*5 = 5 at depth 10 pushes us into
-        // the air layer above ground.
-        path[10] = 5;
+        // slot_index(0, 1, 0) = 5 at depth 0 (the root) pushes us
+        // into the air region above the ground.
+        path[0] = slot_index(0, 1, 0) as u8;
         for depth in 0..MAX_LAYER as usize {
             let node = world.library.get(id).expect("node");
             let children = node.children.as_ref().expect("non-leaf");

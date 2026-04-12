@@ -5,6 +5,13 @@ camera chooses which layer of the tree to play on.
 
 Built with [Bevy 0.18](https://bevyengine.org/) in Rust.
 
+## Design principle
+
+**Layer-uniform UX.** The experience at every view layer must be
+identical — same code paths, same visual proportions, same interaction
+feel. Zooming is purely a scale change, never a mode switch. If
+something works at layers 9–12 but degrades at layer 8, that is a bug.
+
 ## Concept
 
 The world is a fixed tree of `MAX_LAYER = 12` layers. Every node —
@@ -112,9 +119,10 @@ children; decrementing a refcount to zero evicts and cascades.
 
 `WorldState` holds one `NodeId` (the root) and owns the library. The
 root is rebuilt via an `insert_leaf`+`insert_non_leaf` chain that
-bootstraps an infinite grassland with a `GROUND_Y_VOXELS = 125`-deep
-solid surface and air above it — thanks to dedup that collapses to 25
-library entries total (2 leaves + 2 patterns per layer + 1 root).
+bootstraps an infinite grassland with a `GROUND_Y_VOXELS = 5^(MAX_LAYER-1)`-deep
+solid surface and air above it — deep enough that the ground spans at
+least 5 view cells at every zoom level. Thanks to dedup that collapses
+to 25 library entries total (2 leaves + 2 patterns per layer + 1 root).
 
 ### Coordinates
 

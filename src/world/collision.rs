@@ -359,23 +359,23 @@ pub fn on_ground(pos: &Position, world: &WorldState, view_layer: u8) -> bool {
 /// collision grid can inflate thin features when the block size
 /// grows past the feature's actual thickness.
 ///
-/// The grassland ground is 125 leaves deep; the presence-preserving
-/// downsample in `tree::downsample` propagates "any non-empty child
-/// → solid parent". So at view layer 6 (block size 625 leaves) the
-/// one-row ground becomes a full 625-leaf-tall solid block. An
-/// entity at `pos.y = 2` after spawning would be inside that
-/// inflated block, and `move_and_collide`'s clip only stops motion
-/// heading into a block from outside — gravity would otherwise
-/// pull the entity straight through.
+/// The grassland ground is `GROUND_Y_VOXELS` leaves deep (one
+/// layer-1 child extent). The presence-preserving downsample in
+/// `tree::downsample` propagates "any non-empty child → solid
+/// parent", so at coarse view layers the ground may appear inflated
+/// by up to one view cell. An entity at a stale `pos.y` after a
+/// zoom change could end up inside an inflated block, and
+/// `move_and_collide`'s clip only stops motion heading into a block
+/// from outside — gravity would otherwise pull the entity straight
+/// through.
 ///
 /// Walks `pos`'s column at the new target layer. If the feet block
 /// is solid, walk upward until reaching empty space. Otherwise walk
 /// downward until reaching solid (the mirror case — zoom in shrinks
 /// the apparent ground, entity has to drop). Both walks are capped
-/// at 256 steps — more than enough to cross the 125-leaf grassland
-/// ground even at `target_layer = MAX_LAYER` (`block_size = 1`), so
-/// the walk converges at every view layer without hand-tuning per
-/// target.
+/// at 256 steps — more than enough to cross the ground even at
+/// `target_layer = MAX_LAYER` (`block_size = 1`), so the walk
+/// converges at every view layer without hand-tuning per target.
 pub fn snap_to_ground(pos: &mut Position, world: &WorldState, view_layer: u8) {
     let target_layer = target_layer_for(view_layer);
     let block_size = cell_size_at_layer(target_layer);
@@ -438,28 +438,17 @@ mod tests {
     use super::super::tree::{slot_index, MAX_LAYER, NODE_VOXELS_PER_AXIS};
     use super::super::position::NODE_PATH_LEN;
 
-    /// Leaf-level position in the all-zero path at voxel `(12, vy, 12)`
-    /// — the all-zero leaf is at Bevy (~0, ~-125..-100, ~0) under the
-    /// legacy constant anchor. With the floating anchor we express
-    /// tests against the Position directly.
-    fn position_at_voxel(vy: u8) -> Position {
-        let mut p = Position::origin();
-        p.voxel = [12, vy, 12];
-        p.offset = [0.5, 0.0, 0.5];
-        p
-    }
-
     /// Position resting directly on the grass surface: leaf-coord
     /// y = `GROUND_Y_VOXELS` (the first air voxel), voxel y = 0,
     /// fractional offset y = 0. In the position's own local anchor
     /// frame that's Bevy `(offset.x, 0.0, offset.z)` with the top
     /// face of the grass at Bevy `y = 0`.
     fn position_on_ground() -> Position {
+        use super::super::state::GROUND_TRANSITION_DEPTH;
         let mut path = [0u8; NODE_PATH_LEN];
-        // At depth `MAX_LAYER - 2` the layer-10 node at slot
-        // `(0, 1, 0)` starts at root-local leaf y = 125 =
-        // `GROUND_Y_VOXELS` — the first air voxel above the grass.
-        path[NODE_PATH_LEN - 2] = slot_index(0, 1, 0) as u8;
+        // At GROUND_TRANSITION_DEPTH, slot `(0, 1, 0)` is the first
+        // air region above the grass.
+        path[GROUND_TRANSITION_DEPTH] = slot_index(0, 1, 0) as u8;
         let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
         Position {
             path,
@@ -471,8 +460,9 @@ mod tests {
     /// Position 2 leaves above the grass top face. Drops under
     /// gravity for a couple of frames before landing.
     fn position_airborne() -> Position {
+        use super::super::state::GROUND_TRANSITION_DEPTH;
         let mut path = [0u8; NODE_PATH_LEN];
-        path[NODE_PATH_LEN - 2] = slot_index(0, 1, 0) as u8;
+        path[GROUND_TRANSITION_DEPTH] = slot_index(0, 1, 0) as u8;
         let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
         Position {
             path,
@@ -558,10 +548,20 @@ mod tests {
     #[test]
     fn ground_is_reachable_via_collision_at_every_view_layer() {
         use super::super::render::{MAX_ZOOM, MIN_ZOOM};
+        use super::super::state::GROUND_TRANSITION_DEPTH;
         let world = WorldState::new_grassland();
-        // A position inside the grass region — voxel y=0 inside the
-        // all-zero leaf puts root-local y = 0 (the top grass voxel).
-        let grass_pos = position_at_voxel(0);
+        // Start one voxel below the ground surface — close enough
+        // that `snap_to_ground`'s f32 `local_pos.y` stays small
+        // (matching real gameplay where the anchor tracks the
+        // player). Navigate to the top of the grass by using
+        // `sy = 4` at every depth below the transition to reach
+        // the last grass leaf before the surface.
+        let mut grass_pos = Position::origin();
+        for depth in (GROUND_TRANSITION_DEPTH + 1)..NODE_PATH_LEN {
+            grass_pos.path[depth] = slot_index(0, 4, 0) as u8;
+        }
+        grass_pos.voxel = [12, 24, 12];
+        grass_pos.offset = [0.5, 0.0, 0.5];
         for view_layer in MIN_ZOOM..=MAX_ZOOM {
             // Starting inside solid, `on_ground` won't necessarily
             // be true (we're inside, not resting on), but

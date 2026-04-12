@@ -326,8 +326,7 @@ pub fn downsample_from_library(
 ///
 /// This is a **presence-preserving** downsample: any non-empty voxel,
 /// no matter how rare, surfaces a non-empty parent voxel. It's the
-/// key invariant that lets thin features (like a 125-leaf-deep ground
-/// surface embedded in a billions-of-leaves world) survive cascaded
+/// key invariant that lets thin features survive cascaded
 /// downsampling all the way to the root. A plain majority vote would
 /// collapse the surface to air within a few layers and leave the
 /// crosshair clicking through ground it can clearly see.

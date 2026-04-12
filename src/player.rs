@@ -27,6 +27,7 @@ use crate::camera::FpsCam;
 use crate::inventory::InventoryState;
 use crate::world::collision::{self, PLAYER_H};
 use crate::world::position::{Position, NODE_PATH_LEN};
+use crate::world::state::GROUND_TRANSITION_DEPTH;
 use crate::world::tree::{slot_index, NODE_VOXELS_PER_AXIS};
 use crate::world::view::{
     bevy_from_position, cell_size_at_layer, position_to_leaf_coord, WorldAnchor,
@@ -67,10 +68,14 @@ pub struct Velocity(pub Vec3);
 /// Path-based spawn position at the **arithmetic centre of the
 /// root**. Every path slot is `(2, _, 2)` on `x`/`z`, which picks
 /// the middle of each `5³` child array, and the in-leaf voxel is
-/// also centred. The depth-`(MAX_LAYER - 2)` slot uses `sy = 1`
-/// so the layer-`(MAX_LAYER - 1)` node containing the spawn leaf
-/// sits one step above the world floor — that puts the leaf flush
-/// against the grass's top face.
+/// also centred.
+///
+/// The grass/air transition in the tree happens at depth
+/// [`GROUND_TRANSITION_DEPTH`] (= 2): at that depth, the child
+/// extent first equals `GROUND_Y_VOXELS`, so `sy = 1` is the first
+/// air slot. All slots above that depth stay `sy = 0` to remain in
+/// the grass "bottom" subtree, and all below stay `sy = 0` to sit
+/// flush with the ground surface.
 ///
 /// This spawn is only possible thanks to the floating
 /// [`WorldAnchor`]: under a constant `ROOT_ORIGIN` the centre of
@@ -80,12 +85,11 @@ pub struct Velocity(pub Vec3);
 /// player's integer leaf coord, the player's `Transform` stays
 /// sub-voxel regardless of where in the tree they are.
 pub fn spawn_position() -> Position {
-    let mut path = [0u8; NODE_PATH_LEN];
-    for depth in 0..(NODE_PATH_LEN - 2) {
-        path[depth] = slot_index(2, 0, 2) as u8;
-    }
-    path[NODE_PATH_LEN - 2] = slot_index(2, 1, 2) as u8;
-    path[NODE_PATH_LEN - 1] = slot_index(2, 0, 2) as u8;
+    let mut path = [slot_index(2, 0, 2) as u8; NODE_PATH_LEN];
+    // Depth GROUND_TRANSITION_DEPTH: sy = 1 → first air region above
+    // the ground. At this depth the child extent equals
+    // GROUND_Y_VOXELS, so sy = 1 places us at y = GROUND_Y_VOXELS.
+    path[GROUND_TRANSITION_DEPTH] = slot_index(2, 1, 2) as u8;
     let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
     Position {
         path,
