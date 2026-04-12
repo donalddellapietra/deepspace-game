@@ -15,7 +15,7 @@
 
 use bevy::prelude::*;
 
-use crate::block::Palette;
+use crate::block::{BslMaterial, Palette};
 use crate::camera::CursorLocked;
 use crate::interaction::TargetedBlock;
 use crate::inventory::InventoryState;
@@ -57,7 +57,7 @@ pub struct SavedMeshes {
 /// A single bright-blue material reused for every tinted entity.
 #[derive(Resource)]
 pub struct SaveTintMaterial {
-    pub handle: Handle<StandardMaterial>,
+    pub handle: Handle<BslMaterial>,
 }
 
 /// Tracks the currently tinted rendered entity so we can restore
@@ -73,14 +73,17 @@ pub struct SaveTintState {
 
 pub fn init_save_tint_material(
     mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<BslMaterial>>,
 ) {
-    let handle = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.25, 0.5, 1.0),
-        emissive: LinearRgba::new(0.15, 0.4, 1.1, 1.0),
-        perceptual_roughness: 0.35,
-        metallic: 0.1,
-        ..default()
+    let handle = materials.add(BslMaterial {
+        base: StandardMaterial {
+            base_color: Color::srgb(0.25, 0.5, 1.0),
+            emissive: LinearRgba::new(0.15, 0.4, 1.1, 1.0),
+            perceptual_roughness: 0.35,
+            metallic: 0.1,
+            ..default()
+        },
+        extension: Default::default(),
     });
     commands.insert_resource(SaveTintMaterial { handle });
 }

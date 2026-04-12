@@ -2,6 +2,7 @@ use std::f32::consts::FRAC_PI_2;
 
 use bevy::{
     input::mouse::AccumulatedMouseMotion,
+    light::ShadowFilteringMethod,
     prelude::*,
 };
 
@@ -47,6 +48,7 @@ fn spawn_camera(mut commands: Commands) {
         // we picked.
         FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::default(),
+        ShadowFilteringMethod::Gaussian,
     ));
 }
 

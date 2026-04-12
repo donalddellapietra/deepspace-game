@@ -1,6 +1,10 @@
+pub mod bsl_material;
 pub mod materials;
 
+pub use bsl_material::BslMaterial;
+
 use bevy::prelude::*;
+use bsl_material::{BslExtension, BslParams};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
@@ -69,12 +73,12 @@ pub struct PaletteEntry {
 #[derive(Resource)]
 pub struct Palette {
     entries: Vec<PaletteEntry>,
-    materials: Vec<Handle<StandardMaterial>>,
+    materials: Vec<Handle<BslMaterial>>,
 }
 
 impl Palette {
     /// Create a new palette pre-populated with the 10 built-in blocks.
-    pub fn new(mat_assets: &mut Assets<StandardMaterial>) -> Self {
+    pub fn new(mat_assets: &mut Assets<BslMaterial>) -> Self {
         let mut palette = Self {
             entries: Vec::new(),
             materials: Vec::new(),
@@ -104,7 +108,7 @@ impl Palette {
     }
 
     /// Get the material handle for a voxel value.
-    pub fn material(&self, voxel: u8) -> Option<Handle<StandardMaterial>> {
+    pub fn material(&self, voxel: u8) -> Option<Handle<BslMaterial>> {
         if voxel == 0 {
             return None;
         }
@@ -116,18 +120,30 @@ impl Palette {
     pub fn register(
         &mut self,
         entry: PaletteEntry,
-        mat_assets: &mut Assets<StandardMaterial>,
+        mat_assets: &mut Assets<BslMaterial>,
     ) -> u8 {
         assert!(
             self.entries.len() < 255,
             "Palette full: cannot register more than 255 entries"
         );
-        let handle = mat_assets.add(StandardMaterial {
-            base_color: entry.color,
-            perceptual_roughness: entry.roughness,
-            metallic: entry.metallic,
-            alpha_mode: entry.alpha_mode,
-            ..default()
+        let subsurface = match entry.name.as_str() {
+            "Leaf" | "Water" | "Glass" => 0.5,
+            _ => 0.0,
+        };
+        let handle = mat_assets.add(BslMaterial {
+            base: StandardMaterial {
+                base_color: entry.color,
+                perceptual_roughness: entry.roughness,
+                metallic: entry.metallic,
+                alpha_mode: entry.alpha_mode,
+                ..default()
+            },
+            extension: BslExtension {
+                params: BslParams {
+                    subsurface_strength: subsurface,
+                    ..default()
+                },
+            },
         });
         self.entries.push(entry);
         self.materials.push(handle);

@@ -9,7 +9,7 @@
 
 use bevy::prelude::*;
 
-use crate::block::{BlockType, PaletteEntry, Palette};
+use crate::block::{BlockType, BslMaterial, PaletteEntry, Palette};
 use crate::world::tree::{voxel_from_block, Voxel, EMPTY_VOXEL};
 
 /// Reference sRGB colours for each `BlockType`, extracted from
@@ -64,7 +64,7 @@ pub fn build_palette_lut(palette: &[(u8, u8, u8, u8); 256]) -> [Voxel; 256] {
 pub fn build_palette_lut_registered(
     vox_palette: &[(u8, u8, u8, u8); 256],
     palette: &mut Palette,
-    mat_assets: &mut Assets<StandardMaterial>,
+    mat_assets: &mut Assets<BslMaterial>,
 ) -> [Voxel; 256] {
     let mut lut = [EMPTY_VOXEL; 256];
     // Cache to avoid registering duplicate colors multiple times.

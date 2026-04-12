@@ -11,7 +11,10 @@ mod player;
 mod ui;
 mod world;
 
+use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
+
+use block::BslMaterial;
 
 fn main() {
     let mut app = App::new();
@@ -28,6 +31,7 @@ fn main() {
             ..default()
         }))
         .insert_resource(ClearColor(Color::srgb(0.5, 0.7, 0.9)))
+        .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
             world::WorldPlugin,
@@ -73,7 +77,13 @@ fn setup_environment(mut commands: Commands) {
         ..default()
     });
     commands.spawn((
-        DirectionalLight { illuminance: 20_000.0, shadows_enabled: false, ..default() },
+        DirectionalLight {
+            illuminance: 20_000.0,
+            shadows_enabled: true,
+            shadow_depth_bias: 0.3,
+            shadow_normal_bias: 2.0,
+            ..default()
+        },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, 0.4, 0.0)),
     ));
 }
