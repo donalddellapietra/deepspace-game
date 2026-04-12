@@ -32,8 +32,9 @@ use crate::model::{mesher::bake_volume, BakedSubMesh};
 
 use super::state::WorldState;
 use super::tree::{
-    block_from_voxel, slot_coords, voxel_idx, NodeId, CHILDREN_PER_NODE,
-    EMPTY_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
+    block_from_voxel, slot_coords, slot_index, voxel_idx, NodeId, VoxelGrid,
+    BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER,
+    NODE_VOXELS_PER_AXIS,
 };
 use super::view::{
     cell_size_at_layer, extent_for_layer, scale_for_layer, target_layer_for,
@@ -189,25 +190,81 @@ impl RenderState {
                 .library
                 .get(node_id)
                 .expect("render: node missing from library");
-            let voxels = node.voxels.clone();
-            let baked = bake_volume(
-                NODE_VOXELS_PER_AXIS as i32,
-                move |x, y, z| {
-                    if x < 0
-                        || y < 0
-                        || z < 0
-                        || x >= NODE_VOXELS_PER_AXIS as i32
-                        || y >= NODE_VOXELS_PER_AXIS as i32
-                        || z >= NODE_VOXELS_PER_AXIS as i32
-                    {
-                        return None;
-                    }
-                    block_from_voxel(
-                        voxels[voxel_idx(x as usize, y as usize, z as usize)],
-                    )
-                },
-                meshes,
-            );
+            let baked = if let Some(children) = &node.children {
+                // Non-leaf: bake 125³ mesh from children's voxel grids.
+                let child_voxels: Vec<Option<VoxelGrid>> = children
+                    .iter()
+                    .map(|&id| {
+                        if id == EMPTY_NODE {
+                            None
+                        } else {
+                            Some(
+                                world
+                                    .library
+                                    .get(id)
+                                    .expect("render: child missing from library")
+                                    .voxels
+                                    .clone(),
+                            )
+                        }
+                    })
+                    .collect();
+                let size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
+                bake_volume(
+                    size,
+                    move |x, y, z| {
+                        if x < 0
+                            || y < 0
+                            || z < 0
+                            || x >= size
+                            || y >= size
+                            || z >= size
+                        {
+                            return None;
+                        }
+                        let xu = x as usize;
+                        let yu = y as usize;
+                        let zu = z as usize;
+                        let slot = slot_index(
+                            xu / NODE_VOXELS_PER_AXIS,
+                            yu / NODE_VOXELS_PER_AXIS,
+                            zu / NODE_VOXELS_PER_AXIS,
+                        );
+                        let voxels = child_voxels[slot].as_ref()?;
+                        block_from_voxel(voxels[voxel_idx(
+                            xu % NODE_VOXELS_PER_AXIS,
+                            yu % NODE_VOXELS_PER_AXIS,
+                            zu % NODE_VOXELS_PER_AXIS,
+                        )])
+                    },
+                    meshes,
+                )
+            } else {
+                // Leaf: bake 25³ from own voxels.
+                let voxels = node.voxels.clone();
+                bake_volume(
+                    NODE_VOXELS_PER_AXIS as i32,
+                    move |x, y, z| {
+                        if x < 0
+                            || y < 0
+                            || z < 0
+                            || x >= NODE_VOXELS_PER_AXIS as i32
+                            || y >= NODE_VOXELS_PER_AXIS as i32
+                            || z >= NODE_VOXELS_PER_AXIS as i32
+                        {
+                            return None;
+                        }
+                        block_from_voxel(
+                            voxels[voxel_idx(
+                                x as usize,
+                                y as usize,
+                                z as usize,
+                            )],
+                        )
+                    },
+                    meshes,
+                )
+            };
             self.meshes.insert(node_id, baked);
         }
         self.meshes
@@ -226,6 +283,7 @@ struct Visit {
     path: SmallPath,
     node_id: NodeId,
     origin: Vec3,
+    scale: f32,
 }
 
 /// One frame on the `walk()` DFS stack. Extracted into a named
@@ -247,6 +305,7 @@ struct WalkFrame {
 /// difference.
 fn walk(
     world: &WorldState,
+    emit_layer: u8,
     target_layer: u8,
     camera_pos: Vec3,
     radius_bevy: f32,
@@ -315,12 +374,13 @@ fn walk(
             continue;
         }
 
-        // Reached the target layer → emit.
-        if depth == target_layer {
+        // Reached the emit layer → emit.
+        if depth == emit_layer {
             out.push(Visit {
                 path,
                 node_id,
                 origin: origin_bevy,
+                scale: scale_for_layer(target_layer),
             });
             continue;
         }
@@ -335,6 +395,7 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
+                scale: scale_for_layer(depth),
             });
             continue;
         };
@@ -384,6 +445,7 @@ pub fn render_world(
     let camera_pos = camera_tf.translation;
 
     let target_layer = target_layer_for(zoom.layer);
+    let emit_layer = target_layer.saturating_sub(1);
 
     // Render radius in Bevy units = N cells × Bevy-units-per-cell at
     // the current view layer. This is what the 2D prototype does
@@ -392,15 +454,15 @@ pub fn render_world(
     // per-cell Bevy size grows by 5× per layer.
     let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
 
-    // If zoom changed, or we're on our first pass, drop everything.
-    if !render_state.initialised || render_state.last_zoom_layer != target_layer
+    // If emit layer changed, or we're on our first pass, drop everything.
+    if !render_state.initialised || render_state.last_zoom_layer != emit_layer
     {
         for (_, (entity, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
         }
-        render_state.last_zoom_layer = target_layer;
+        render_state.last_zoom_layer = emit_layer;
         render_state.initialised = true;
     }
 
@@ -414,6 +476,7 @@ pub fn render_world(
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
         &world,
+        emit_layer,
         target_layer,
         camera_pos,
         radius_bevy,
@@ -421,8 +484,6 @@ pub fn render_world(
         &mut walk_stack,
         &mut visits,
     );
-
-    let node_scale = scale_for_layer(target_layer);
 
     // Reconcile: what's alive now, what changed, what's gone.
     let mut alive: HashMap<SmallPath, (Entity, NodeId)> =
@@ -439,7 +500,7 @@ pub fn render_world(
                 if let Ok(mut ec) = commands.get_entity(entity) {
                     ec.insert(
                         Transform::from_translation(visit.origin)
-                            .with_scale(Vec3::splat(node_scale)),
+                            .with_scale(Vec3::splat(visit.scale)),
                     );
                 }
                 alive.insert(visit.path, (entity, existing_id));
@@ -464,7 +525,7 @@ pub fn render_world(
                     .spawn((
                         WorldRenderedNode(new_node_id),
                         Transform::from_translation(visit.origin)
-                            .with_scale(Vec3::splat(node_scale)),
+                            .with_scale(Vec3::splat(visit.scale)),
                         Visibility::Visible,
                     ))
                     .id();
@@ -523,11 +584,12 @@ mod tests {
         let world = WorldState::new_grassland();
         let mut stack = Vec::new();
         let mut visits = Vec::new();
-        // At view L = MAX_LAYER the view cell is 1 Bevy unit, so the
-        // Bevy-space radius equals RADIUS_VIEW_CELLS directly.
+        let target = target_layer_for(MAX_LAYER);
+        let emit = target.saturating_sub(1);
         walk(
             &world,
-            MAX_LAYER,
+            emit,
+            target,
             Vec3::ZERO,
             RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
             &anchor_origin(),
@@ -545,17 +607,18 @@ mod tests {
         let world = WorldState::new_grassland();
         let mut stack = Vec::new();
         let mut visits = Vec::new();
+        let target = target_layer_for(MAX_LAYER);
+        let emit = target.saturating_sub(1);
         walk(
             &world,
-            MAX_LAYER,
+            emit,
+            target,
             Vec3::ZERO,
             RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
             &anchor_origin(),
             &mut stack,
             &mut visits,
         );
-        // Bounded number of target-layer nodes — guard rail against
-        // accidentally unbounded walks.
         assert!(
             visits.len() < 200_000,
             "walk emitted {} visits; expected far fewer",
@@ -565,20 +628,20 @@ mod tests {
 
     #[test]
     fn walk_radius_scales_with_view_layer() {
-        // At every view layer the walk should emit a comparable count
-        // of target-layer nodes (within a small constant factor),
-        // because the radius is "N cells at view layer" and one
-        // target-layer node = one view cell.
+        // At every view layer the walk should emit a non-zero count
+        // of emit-layer nodes.
         let world = WorldState::new_grassland();
         let anchor = anchor_origin();
         let mut counts = Vec::new();
         let mut stack = Vec::new();
         for view_layer in (MIN_ZOOM..=MAX_ZOOM).rev() {
             let target = target_layer_for(view_layer);
+            let emit = target.saturating_sub(1);
             let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
             let mut visits = Vec::new();
             walk(
                 &world,
+                emit,
                 target,
                 Vec3::ZERO,
                 radius,
@@ -588,9 +651,6 @@ mod tests {
             );
             counts.push((view_layer, visits.len()));
         }
-        // No view layer should be empty (the bug this test guards
-        // against: at low view layers the old fixed-Bevy-unit radius
-        // culled everything).
         for &(view_layer, n) in &counts {
             assert!(
                 n > 0,

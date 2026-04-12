@@ -191,13 +191,15 @@ pub fn update_save_tint(
         return;
     };
 
-    // What node (if any) should be tinted this frame?
+    // What node (if any) should be tinted this frame? Rendered
+    // entities live at emit_layer (target - 1), so resolve one
+    // level above target to find the matching WorldRenderedNode.
     let target_node: Option<NodeId> =
         if save_mode.active && save_mode_eligible(zoom.layer) {
             targeted
                 .hit_layer_pos
                 .as_ref()
-                .and_then(|lp| resolve_node_at_lp(&world, lp).map(|(id, _)| id))
+                .and_then(|lp| resolve_emit_node_at_lp(&world, lp))
         } else {
             None
         };
@@ -257,6 +259,34 @@ pub fn update_save_tint(
 /// the highest layer" rule.
 pub fn save_mode_eligible(view_layer: u8) -> bool {
     view_layer + 2 <= MAX_LAYER
+}
+
+/// Like [`resolve_node_at_lp`] but walks one fewer level, returning
+/// the emit-layer node that *contains* the target-layer subtree.
+/// Used for tinting: rendered entities live at emit_layer, so the
+/// tint must match the parent of the target node.
+fn resolve_emit_node_at_lp(
+    world: &WorldState,
+    lp: &LayerPos,
+) -> Option<NodeId> {
+    if !save_mode_eligible(lp.layer) {
+        return None;
+    }
+    let path = subtree_path_for_layer_pos(lp);
+    if path.len() < 2 {
+        return None;
+    }
+    let emit_path = &path[..path.len() - 1];
+    let mut id = world.root;
+    for &slot in emit_path {
+        let node = world.library.get(id)?;
+        let children = node.children.as_ref()?;
+        id = children[slot as usize];
+        if id == EMPTY_NODE {
+            return None;
+        }
+    }
+    Some(id)
 }
 
 /// Resolve a hovered `LayerPos` to the `NodeId` of the subtree that
