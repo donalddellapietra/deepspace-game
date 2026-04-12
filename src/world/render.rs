@@ -125,19 +125,48 @@ pub struct RenderTimings {
     pub collision_us: u64,
 }
 
-/// Cached per-child face data for a parent node at a given path.
-/// Stores the children NodeId array so we can diff against the new
-/// parent's children and only re-bake changed slots.
+/// Cached per-child face data for a parent node at a given tree path.
+///
+/// When a block is edited, the content-addressed tree mints new
+/// NodeIds from the leaf up to the root. At the emit layer, the
+/// parent node gets a new NodeId, but only one of its 125 children
+/// actually changed. This cache stores the old children's NodeId
+/// array alongside the per-child greedy-meshed face data. On
+/// re-bake, we diff old vs new children — matching slots reuse their
+/// cached faces (~0μs each), and only the changed slot re-bakes its
+/// 25³ region (~2ms). The merge pass concatenates all 125 children's
+/// face data into the final mesh (~0.5ms).
+///
+/// Total edit cost: ~3ms instead of ~200ms for a full 125-child bake.
 struct ParentBakeCache {
     children: Box<[NodeId; CHILDREN_PER_NODE]>,
     child_faces: Vec<crate::model::mesher::ChildFaces>,
 }
 
+/// Render state: caches baked meshes and per-child face data, tracks
+/// live entities, and holds reusable walk buffers.
+///
+/// ## Cache lifecycle
+///
+/// - `meshes`: keyed by NodeId. Populated on first bake, evicted
+///   when the NodeId leaves the active entity set (no live entity
+///   references it). Content-addressed dedup means identical subtrees
+///   share a NodeId, so cache hits are common.
+///
+/// - `parent_cache`: keyed by SmallPath (tree position). Stores the
+///   per-child face data for incremental re-baking. Evicted when the
+///   path leaves the active entity set (entity despawned due to cull
+///   sphere movement or zoom change).
+///
+/// Both caches are evicted after each reconcile pass to prevent
+/// unbounded growth during camera movement or zoom changes.
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached per-`NodeId` baked sub-meshes.
+    /// Cached per-`NodeId` baked sub-meshes. Evicted when the NodeId
+    /// is no longer referenced by any live entity.
     meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
-    /// Per-path bake cache for incremental re-baking.
+    /// Per-path incremental bake cache. Evicted when the path is no
+    /// longer in the active entity set.
     parent_cache: HashMap<SmallPath, ParentBakeCache>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
     /// The `Vec3` is the last-written Bevy translation so we can skip
@@ -615,6 +644,17 @@ pub fn render_world(
         }
     }
     render_state.entities = alive;
+
+    // Evict stale caches: remove parent_cache and mesh entries for
+    // paths/NodeIds that are no longer in the active entity set.
+    // Without this, caches grow unboundedly as the player moves or
+    // zooms.
+    let live_paths: std::collections::HashSet<SmallPath> =
+        render_state.entities.keys().copied().collect();
+    let live_node_ids: std::collections::HashSet<NodeId> =
+        render_state.entities.values().map(|&(_, nid, _)| nid).collect();
+    render_state.parent_cache.retain(|path, _| live_paths.contains(path));
+    render_state.meshes.retain(|nid, _| live_node_ids.contains(nid));
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
 

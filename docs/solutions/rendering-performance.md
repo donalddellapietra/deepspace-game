@@ -101,8 +101,49 @@ faces stay separate. The output is pixel-identical.
 | Triangles at layer 12 | ~80,000 | ~40,000 |
 | Render distance 64 cells, layer 10 | Unplayable | 60 FPS |
 | Collision blocks per frame (layer 10) | 19,683 | 343 |
+| Edit bake time (layer 10) | ~200ms | ~3ms |
 
-### Future considerations
+## Incremental re-baking
+
+### The problem
+
+Greedy meshing solved the triangle count, but introduced a new
+issue: baking a 125³ emit-layer mesh (125 children × greedy meshing)
+took ~200ms. Every block edit triggered a full re-bake because the
+parent's NodeId changed (content-addressed), causing a mesh cache
+miss.
+
+### The fix
+
+Cache per-child face data at each tree path (`parent_cache`). When
+a parent's NodeId changes after an edit, diff the old vs new
+children arrays. Only the changed child (1 of 125) gets re-baked
+(25³ greedy mesh, ~2ms). The other 124 children's faces are reused
+from cache. The merge pass concatenates all 125 into the final mesh
+(~0.5ms).
+
+### Cache eviction
+
+Both `meshes` and `parent_cache` are evicted after each reconcile
+pass. Any entry whose key (NodeId or SmallPath) is not referenced by
+a live entity is removed. This prevents unbounded growth during
+camera movement or zoom changes.
+
+### Why per-child NodeId caching failed
+
+First attempt: cache faces by child NodeId. Failed because faces
+depend on **neighbors**, not just the child's own voxels. In
+grassland, most children share the same NodeId (content-addressed
+dedup). A surface child and an underground child have the same
+NodeId but different faces (different neighbors → different face
+culling and AO). Caching by NodeId reused underground faces at the
+surface, corrupting the mesh.
+
+Fix: cache by **path** (tree position). The path uniquely identifies
+the spatial context. When re-baking, compare old vs new children at
+the same path to find which slot changed.
+
+## Future considerations
 
 - **Textures/tints**: if per-voxel visual variation is added, extend
   the merge eligibility check. Non-eligible faces automatically fall
@@ -119,7 +160,9 @@ faces stay separate. The output is pixel-identical.
 
 ## Files changed
 
-- `src/model/mesher.rs` — greedy meshing algorithm
+- `src/model/mesher.rs` — greedy meshing with per-child baking API
 - `src/world/collision.rs` — `view_layer + 1` collision sampling
-- `src/world/render.rs` — emit-layer batching, diagnostics timings
-- `src/diagnostics.rs` — HUD shows walk/reconcile/collision/triangles
+- `src/world/render.rs` — emit-layer batching, incremental re-bake,
+  per-child face cache with eviction, diagnostics timings
+- `src/diagnostics.rs` — HUD shows render_total/walk/bake/reconcile/
+  collision timings
