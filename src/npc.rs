@@ -19,13 +19,13 @@ use std::f32::consts::{PI, TAU};
 
 use bevy::prelude::*;
 
-use crate::block::{BslMaterial, Palette, PaletteEntry};
+use crate::block::{Palette, PaletteEntry};
 use crate::camera::FpsCam;
 use crate::model::mesher::bake_volume;
 use crate::model::BakedSubMesh;
 use crate::player::Player;
 use crate::world::collision;
-use crate::world::tree::{Voxel, EMPTY_VOXEL};
+use crate::world::tree::{Voxel, EMPTY_VOXEL, MAX_LAYER};
 use crate::world::view::{bevy_from_position, cell_size_at_layer, position_from_bevy, WorldAnchor};
 use crate::world::{CameraZoom, WorldPosition, WorldState};
 
@@ -59,11 +59,19 @@ pub struct NpcAnimation {
 }
 
 /// Shared blueprint for an NPC type. All instances reference this.
-#[derive(Clone, Resource)]
+#[derive(Clone)]
 pub struct NpcBlueprint {
     pub name: String,
     pub parts: Vec<VoxelPart>,
     pub animations: HashMap<String, NpcAnimation>,
+}
+
+/// Collection of all loaded blueprints, keyed by name.
+#[derive(Resource, Default)]
+pub struct NpcBlueprints {
+    pub blueprints: Vec<NpcBlueprint>,
+    /// Index of the next blueprint to spawn (cycles through).
+    pub next: usize,
 }
 
 // ============================================== blueprint JSON loading
@@ -112,7 +120,7 @@ mod blueprint_json {
         name: &str,
         json_bytes: &[u8],
         palette: &mut Palette,
-        mat_assets: &mut Assets<BslMaterial>,
+        mat_assets: &mut Assets<StandardMaterial>,
     ) -> Result<NpcBlueprint, String> {
         let file: BlueprintFile =
             serde_json::from_slice(json_bytes).map_err(|e| format!("JSON parse error: {e}"))?;
@@ -148,8 +156,7 @@ mod blueprint_json {
             color_remap.insert(vox_idx, game_voxel);
         }
 
-        // Parse parts
-        // Sort by key for deterministic ordering
+        // Parse parts — sort keys for deterministic ordering
         let mut part_names: Vec<&String> = file.parts.keys().collect();
         part_names.sort();
 
@@ -158,7 +165,6 @@ mod blueprint_json {
             let def = &file.parts[part_name];
             let raw_voxels = base64_decode(&def.voxels_b64)?;
 
-            // Remap color indices
             let voxels: Vec<Voxel> = raw_voxels
                 .into_iter()
                 .map(|v| {
@@ -195,7 +201,6 @@ mod blueprint_json {
                 continue;
             }
 
-            // Compute frame duration from keyframe timestamps
             let frame_duration = if anim_def.keyframes.len() > 1 {
                 anim_def.duration / (anim_def.keyframes.len() - 1) as f32
             } else {
@@ -242,7 +247,6 @@ mod blueprint_json {
     }
 
     fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-        // Minimal base64 decoder (no extra dependency needed)
         let table: [u8; 128] = {
             let mut t = [255u8; 128];
             for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -338,7 +342,15 @@ struct NpcAnimState {
 #[derive(Component)]
 struct NpcPartIndex(usize);
 
+/// Which blueprint this NPC was spawned from.
+#[derive(Component)]
+struct NpcBlueprintName(String);
+
 // ========================================================= constants
+
+/// NPCs are visible at this layer and below (finer). At coarser
+/// layers they despawn (fold into statistical representation).
+const NPC_MAX_VISIBLE_LAYER: u8 = MAX_LAYER;
 
 const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
@@ -349,66 +361,78 @@ pub struct NpcPlugin;
 
 impl Plugin for NpcPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<NpcMeshCache>().add_systems(
-            Update,
-            (
-                try_load_blueprint,
-                spawn_npc_on_keypress,
-                npc_ai,
-                npc_animate,
-                npc_physics,
-                npc_zoom_visibility,
-            ),
-        );
+        app.init_resource::<NpcMeshCache>()
+            .init_resource::<NpcBlueprints>()
+            .add_systems(Startup, load_blueprints)
+            .add_systems(
+                Update,
+                (
+                    spawn_npc_on_keypress,
+                    npc_ai,
+                    npc_animate,
+                    npc_physics,
+                    npc_zoom_visibility,
+                ),
+            );
     }
 }
 
 // ======================================= blueprint loading
 
-/// Marker that we've attempted to load blueprints.
-#[derive(Resource, Default)]
-struct BlueprintLoaded(bool);
-
-fn try_load_blueprint(
+/// Load all blueprint JSON files from assets/npcs/ at startup.
+fn load_blueprints(
     mut commands: Commands,
-    loaded: Option<Res<BlueprintLoaded>>,
-    existing: Option<Res<NpcBlueprint>>,
-    mut palette: Option<ResMut<Palette>>,
-    mut mat_assets: ResMut<Assets<BslMaterial>>,
+    mut blueprints: ResMut<NpcBlueprints>,
+    mut palette: ResMut<Palette>,
+    mut mat_assets: ResMut<Assets<StandardMaterial>>,
 ) {
-    if existing.is_some() {
-        return;
-    }
-    if loaded.is_some_and(|l| l.0) {
-        return;
-    }
-    commands.insert_resource(BlueprintLoaded(true));
+    let dir = "assets/npcs";
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => {
+            info!("No {dir}/ directory — using fallback procedural blueprint");
+            blueprints.blueprints.push(build_humanoid_blueprint());
+            return;
+        }
+    };
 
-    // Try loading from file
-    let blueprint_path = "assets/npcs/fox.blueprint.json";
-    if let Ok(bytes) = std::fs::read(blueprint_path) {
-        if let Some(palette) = palette.as_mut() {
-            match blueprint_json::load_blueprint("fox", &bytes, palette, &mut mat_assets) {
-                Ok(bp) => {
-                    info!(
-                        "Loaded NPC blueprint '{}': {} parts, {} animations",
-                        bp.name,
-                        bp.parts.len(),
-                        bp.animations.len()
-                    );
-                    commands.insert_resource(bp);
-                    return;
-                }
-                Err(e) => {
-                    warn!("Failed to load NPC blueprint: {e}");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .replace(".blueprint", "");
+
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                match blueprint_json::load_blueprint(&name, &bytes, &mut palette, &mut mat_assets)
+                {
+                    Ok(bp) => {
+                        info!(
+                            "Loaded NPC blueprint '{}': {} parts, {} animations",
+                            bp.name,
+                            bp.parts.len(),
+                            bp.animations.len()
+                        );
+                        blueprints.blueprints.push(bp);
+                    }
+                    Err(e) => warn!("Failed to load {}: {e}", path.display()),
                 }
             }
+            Err(e) => warn!("Failed to read {}: {e}", path.display()),
         }
     }
 
-    // Fallback: procedural humanoid
-    info!("Using fallback procedural humanoid blueprint");
-    commands.insert_resource(build_humanoid_blueprint());
+    if blueprints.blueprints.is_empty() {
+        info!("No blueprints loaded — using fallback procedural blueprint");
+        blueprints.blueprints.push(build_humanoid_blueprint());
+    } else {
+        info!("Loaded {} NPC blueprints total", blueprints.blueprints.len());
+    }
 }
 
 // ======================================== default humanoid blueprint
@@ -467,31 +491,44 @@ fn build_humanoid_blueprint() -> NpcBlueprint {
         }
     };
 
-    let make_limb = |name: &str, top_voxel: Voxel, bot_voxel: Voxel, pivot: Vec3, offset: Vec3| {
-        let (sx, sy, sz) = (2u8, 5, 2);
-        let mut v = vec![EMPTY_VOXEL; (sx as usize) * (sy as usize) * (sz as usize)];
-        let idx =
-            |x: usize, y: usize, z: usize| (z * sy as usize + y) * sx as usize + x;
-        for z in 0..sz as usize {
-            for y in 0..sy as usize {
-                for x in 0..sx as usize {
-                    v[idx(x, y, z)] = if y >= 3 { top_voxel } else { bot_voxel };
+    let make_limb =
+        |name: &str, top_voxel: Voxel, bot_voxel: Voxel, pivot: Vec3, offset: Vec3| {
+            let (sx, sy, sz) = (2u8, 5, 2);
+            let mut v = vec![EMPTY_VOXEL; (sx as usize) * (sy as usize) * (sz as usize)];
+            let idx =
+                |x: usize, y: usize, z: usize| (z * sy as usize + y) * sx as usize + x;
+            for z in 0..sz as usize {
+                for y in 0..sy as usize {
+                    for x in 0..sx as usize {
+                        v[idx(x, y, z)] = if y >= 3 { top_voxel } else { bot_voxel };
+                    }
                 }
             }
-        }
-        VoxelPart {
-            name: name.into(),
-            size: [sx, sy, sz],
-            voxels: v,
-            pivot,
-            rest_offset: offset,
-        }
-    };
+            VoxelPart {
+                name: name.into(),
+                size: [sx, sy, sz],
+                voxels: v,
+                pivot,
+                rest_offset: offset,
+            }
+        };
 
-    let arm_l = make_limb("arm_l", skin, shirt, Vec3::new(1.0, 5.0, 1.0), Vec3::new(-4.0, 5.0, -1.0));
-    let arm_r = make_limb("arm_r", skin, shirt, Vec3::new(1.0, 5.0, 1.0), Vec3::new(2.0, 5.0, -1.0));
-    let leg_l = make_limb("leg_l", pants, shoe, Vec3::new(1.0, 5.0, 1.0), Vec3::new(-2.0, 0.0, -1.0));
-    let leg_r = make_limb("leg_r", pants, shoe, Vec3::new(1.0, 5.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+    let arm_l = make_limb(
+        "arm_l", skin, shirt,
+        Vec3::new(1.0, 5.0, 1.0), Vec3::new(-4.0, 5.0, -1.0),
+    );
+    let arm_r = make_limb(
+        "arm_r", skin, shirt,
+        Vec3::new(1.0, 5.0, 1.0), Vec3::new(2.0, 5.0, -1.0),
+    );
+    let leg_l = make_limb(
+        "leg_l", pants, shoe,
+        Vec3::new(1.0, 5.0, 1.0), Vec3::new(-2.0, 0.0, -1.0),
+    );
+    let leg_r = make_limb(
+        "leg_r", pants, shoe,
+        Vec3::new(1.0, 5.0, 1.0), Vec3::new(0.0, 0.0, -1.0),
+    );
 
     let mut animations = HashMap::new();
 
@@ -553,7 +590,7 @@ fn build_humanoid_blueprint() -> NpcBlueprint {
 fn spawn_npc_on_keypress(
     mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
-    blueprint: Option<Res<NpcBlueprint>>,
+    mut blueprints: ResMut<NpcBlueprints>,
     palette: Option<Res<Palette>>,
     mut mesh_cache: ResMut<NpcMeshCache>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -566,11 +603,18 @@ fn spawn_npc_on_keypress(
         return;
     }
 
-    let Some(blueprint) = blueprint else { return };
+    if blueprints.blueprints.is_empty() {
+        return;
+    }
     let Some(palette) = palette else { return };
     let Ok(player_pos) = player_q.single() else {
         return;
     };
+
+    // Cycle through available blueprints
+    let bp_idx = blueprints.next % blueprints.blueprints.len();
+    blueprints.next += 1;
+    let blueprint = &blueprints.blueprints[bp_idx];
 
     let cell = cell_size_at_layer(zoom.layer);
     let forward = if let Ok(cam) = cam_q.single() {
@@ -579,6 +623,7 @@ fn spawn_npc_on_keypress(
         Vec3::NEG_Z
     };
 
+    // Place the NPC a few cells in front of the player.
     let player_bevy = bevy_from_position(&player_pos.0, &anchor);
     let npc_bevy = player_bevy + forward * 5.0 * cell + Vec3::Y * 1.0;
     let Some(npc_pos) = position_from_bevy(npc_bevy, &anchor) else {
@@ -587,9 +632,12 @@ fn spawn_npc_on_keypress(
     };
 
     let spawn_bevy = bevy_from_position(&npc_pos, &anchor);
-    let scale = npc_scale(zoom.layer, &blueprint);
+    let scale = npc_scale(zoom.layer, blueprint);
+
+    // Random initial heading (same as old code — no PI offset at spawn).
     let heading = rand_heading();
 
+    // Ensure meshes are baked
     if !mesh_cache.meshes.contains_key(&blueprint.name) {
         let part_meshes: Vec<Vec<BakedSubMesh>> = blueprint
             .parts
@@ -598,12 +646,12 @@ fn spawn_npc_on_keypress(
             .collect();
         mesh_cache.meshes.insert(blueprint.name.clone(), part_meshes);
     }
-
     let cached = mesh_cache.meshes.get(&blueprint.name).unwrap();
 
     let root = commands
         .spawn((
             Npc,
+            NpcBlueprintName(blueprint.name.clone()),
             WorldPosition(npc_pos),
             NpcVelocity(Vec3::ZERO),
             NpcAi {
@@ -614,9 +662,10 @@ fn spawn_npc_on_keypress(
                 current_anim: "walk".into(),
                 time: 0.0,
             },
+            // Match old code: spawn rotation is just heading, not heading+PI.
             Transform::from_translation(spawn_bevy)
                 .with_scale(Vec3::splat(scale))
-                .with_rotation(Quat::from_rotation_y(heading + PI)),
+                .with_rotation(Quat::from_rotation_y(heading)),
             Visibility::Visible,
         ))
         .id();
@@ -646,21 +695,27 @@ fn spawn_npc_on_keypress(
         }
     }
 
-    info!("Spawned voxel NPC '{}' at {spawn_bevy:?} (layer {})", blueprint.name, zoom.layer);
+    info!(
+        "Spawned voxel NPC '{}' at {spawn_bevy:?} (layer {})",
+        blueprint.name, zoom.layer
+    );
 }
 
 // =========================================================== animation
 
 fn npc_animate(
     time: Res<Time>,
-    blueprint: Option<Res<NpcBlueprint>>,
-    mut npc_q: Query<(&mut NpcAnimState, &Children), With<Npc>>,
+    blueprints: Res<NpcBlueprints>,
+    mut npc_q: Query<(&NpcBlueprintName, &mut NpcAnimState, &Children), With<Npc>>,
     mut part_q: Query<(&NpcPartIndex, &mut Transform)>,
 ) {
-    let Some(blueprint) = blueprint else { return };
     let dt = time.delta_secs();
 
-    for (mut anim_state, children) in &mut npc_q {
+    for (bp_name, mut anim_state, children) in &mut npc_q {
+        let Some(blueprint) = blueprints.blueprints.iter().find(|b| b.name == bp_name.0) else {
+            continue;
+        };
+
         anim_state.time += dt;
 
         let Some(anim) = blueprint.animations.get(&anim_state.current_anim) else {
@@ -713,6 +768,8 @@ fn npc_animate(
 
 // ================================================================= AI
 
+/// Simple random-walk: pick a heading, walk that direction for a few
+/// seconds, pick a new one. Same convention as old glTF NPC code.
 fn npc_ai(
     time: Res<Time>,
     mut q: Query<
@@ -729,15 +786,25 @@ fn npc_ai(
         }
 
         let speed = NPC_WALK_SPEED_CELLS;
-        vel.0.x = -ai.heading.sin() * speed;
-        vel.0.z = -ai.heading.cos() * speed;
+        // Movement direction from heading (same convention as camera).
+        let dir_x = -ai.heading.sin();
+        let dir_z = -ai.heading.cos();
+        vel.0.x = dir_x * speed;
+        vel.0.z = dir_z * speed;
+
+        // Face the movement direction. Voxel models (like the old fox
+        // glTF) face +Z in local space, so rotate by PI + heading to
+        // align with the (-sin, -cos) movement vector.
         tf.rotation = Quat::from_rotation_y(ai.heading + PI);
+
         anim.current_anim = "walk".into();
     }
 }
 
 // ============================================================= physics
 
+/// Apply gravity and collision to NPCs, then let `derive_transforms`
+/// handle the Bevy Transform.
 fn npc_physics(
     time: Res<Time>,
     world: Res<WorldState>,
@@ -748,32 +815,41 @@ fn npc_physics(
     let cell = cell_size_at_layer(zoom.layer);
 
     for (mut wpos, mut vel) in &mut q {
+        // Gravity (in cells/s², scaled to leaves).
         vel.0.y -= NPC_GRAVITY_CELLS * cell * dt;
+
         let h_delta = bevy::math::Vec2::new(vel.0.x * cell * dt, vel.0.z * cell * dt);
+
         collision::move_and_collide(&mut wpos.0, &mut vel.0, h_delta, dt, &world, zoom.layer);
     }
 }
 
 // ====================================================== zoom visibility
 
+/// Rescale NPCs with zoom. They stay visible (just smaller) when 1
+/// layer out. Despawn when 2+ layers out from their native layer.
 fn npc_zoom_visibility(
     mut commands: Commands,
     zoom: Res<CameraZoom>,
-    blueprint: Option<Res<NpcBlueprint>>,
-    mut q: Query<(Entity, &mut Transform), With<Npc>>,
+    blueprints: Res<NpcBlueprints>,
+    mut q: Query<(Entity, &NpcBlueprintName, &mut Visibility, &mut Transform), With<Npc>>,
 ) {
     if !zoom.is_changed() {
         return;
     }
 
-    let Some(blueprint) = blueprint else { return };
-    let scale = npc_scale(zoom.layer, &blueprint);
-
-    for (entity, mut tf) in &mut q {
-        let layers_out = crate::world::tree::MAX_LAYER.saturating_sub(zoom.layer);
+    for (entity, bp_name, mut vis, mut tf) in &mut q {
+        let layers_out = NPC_MAX_VISIBLE_LAYER.saturating_sub(zoom.layer);
         if layers_out >= 2 {
             commands.entity(entity).despawn();
         } else {
+            *vis = Visibility::Inherited;
+            let scale = blueprints
+                .blueprints
+                .iter()
+                .find(|b| b.name == bp_name.0)
+                .map(|bp| npc_scale(zoom.layer, bp))
+                .unwrap_or(1.0);
             tf.scale = Vec3::splat(scale);
         }
     }
