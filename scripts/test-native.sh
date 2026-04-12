@@ -7,11 +7,13 @@ set -euo pipefail
 SCREENSHOT="/tmp/deepspace-native.png"
 
 cleanup() {
-    kill $GAME_PID 2>/dev/null || true
+    pkill -f "deepspace-game" 2>/dev/null || true
+    pkill -f "cargo run" 2>/dev/null || true
     pkill -f "vite.*5173" 2>/dev/null || true
-    wait $GAME_PID 2>/dev/null || true
+    pkill -f "node.*vite" 2>/dev/null || true
+    wait 2>/dev/null || true
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 echo "==> Starting Vite..."
 (cd ui && npx vite --port 5173) &>/dev/null &
