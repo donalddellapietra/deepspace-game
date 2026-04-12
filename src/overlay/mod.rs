@@ -26,10 +26,6 @@ use crate::world::CameraZoom;
 
 // ── Plugin ────────────────────────────────────────────────────────
 
-/// WebSocket port for the native overlay server.
-#[cfg(not(target_arch = "wasm32"))]
-const WS_PORT: u16 = 9000;
-
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
@@ -52,13 +48,11 @@ impl Plugin for OverlayPlugin {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let handle = ws_server::start(WS_PORT, false);
-            native_bridge::set_handle(handle);
-
             app.init_non_send_resource::<webview::WebViewHolder>()
                 .add_systems(Update, (
                     webview::create_overlay_webview,
                     webview::resize_overlay_webview,
+                    flush_state_to_webview,
                 ));
         }
     }
@@ -117,34 +111,25 @@ fn poll_commands() -> Vec<UiCommand> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+/// On native, push_state writes JSON to a buffer. A separate system
+/// flushes the buffer to the webview via evaluate_script each frame.
 #[cfg(not(target_arch = "wasm32"))]
 mod native_bridge {
-    use super::ws_server::{ToServer, WsServerHandle};
     use std::sync::Mutex;
 
-    static HANDLE: Mutex<Option<WsServerHandle>> = Mutex::new(None);
-
-    pub fn set_handle(handle: WsServerHandle) {
-        *HANDLE.lock().unwrap() = Some(handle);
-    }
+    static OUTBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     pub fn push(json: &str) {
-        let guard = HANDLE.lock().unwrap();
-        if let Some(ref h) = *guard {
-            let _ = h.tx.send(ToServer::Broadcast(json.to_owned()));
+        if let Ok(mut outbox) = OUTBOX.lock() {
+            outbox.push(json.to_owned());
         }
     }
 
-    pub fn poll_raw() -> Vec<String> {
-        let guard = HANDLE.lock().unwrap();
-        let Some(ref h) = *guard else {
+    pub fn drain_outbox() -> Vec<String> {
+        let Ok(mut outbox) = OUTBOX.lock() else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        while let Ok(raw) = h.rx.try_recv() {
-            out.push(raw);
-        }
-        out
+        outbox.drain(..).collect()
     }
 }
 
@@ -159,7 +144,7 @@ fn push_state(update: &GameStateUpdate) {
 #[cfg(not(target_arch = "wasm32"))]
 fn poll_commands() -> Vec<UiCommand> {
     let mut cmds = Vec::new();
-    for raw in native_bridge::poll_raw() {
+    for raw in webview::drain_ipc_commands() {
         match serde_json::from_str::<Vec<UiCommand>>(&raw) {
             Ok(batch) => cmds.extend(batch),
             Err(_) => {
@@ -172,6 +157,19 @@ fn poll_commands() -> Vec<UiCommand> {
         }
     }
     cmds
+}
+
+/// Flush buffered state updates to the webview via evaluate_script.
+#[cfg(not(target_arch = "wasm32"))]
+fn flush_state_to_webview(holder: NonSend<webview::WebViewHolder>) {
+    let Some(ref wv) = holder.webview else {
+        return;
+    };
+    for json in native_bridge::drain_outbox() {
+        // Calls the same window.__onGameState that the React app listens to
+        let js = format!("window.__onGameState && window.__onGameState({})", json);
+        let _ = wv.evaluate_script(&js);
+    }
 }
 
 // ── State push systems ────────────────────────────────────────────

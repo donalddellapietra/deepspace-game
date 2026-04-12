@@ -1,12 +1,12 @@
 /**
  * Transport abstraction for the Rust <-> React bridge.
  *
- * Two modes:
- * - **WASM mode**: `window.__onGameState` exists (set by useGameState.ts).
- *   State arrives via that global callback; commands are queued in-memory
- *   and polled by Rust via `window.__pollUiCommands`.
- * - **WebSocket mode**: No globals exist, so we connect to `ws://localhost:9000`.
- *   State arrives as WebSocket messages; commands are sent as WebSocket messages.
+ * Three modes (auto-detected):
+ * - **WASM mode**: Rust calls `window.__onGameState` via wasm-bindgen.
+ *   Commands queued in-memory, polled by Rust via `window.__pollUiCommands`.
+ * - **wry IPC mode**: Rust calls `window.__onGameState` via evaluate_script.
+ *   Commands sent via `window.ipc.postMessage`.
+ * - **WebSocket mode**: Fallback if neither wasm nor wry detected.
  *
  * The transport is a singleton — initialized once and shared across hooks.
  */
@@ -26,6 +26,10 @@ export interface Transport {
 
 // ── Detection ────────────────────────────────────────────────────
 
+function hasWryIpc(): boolean {
+  return typeof (window as any).ipc?.postMessage === "function";
+}
+
 function isWasmMode(): boolean {
   return typeof (window as any).__onGameState === "function";
 }
@@ -33,11 +37,8 @@ function isWasmMode(): boolean {
 // ── WASM transport ───────────────────────────────────────────────
 
 function createWasmTransport(): Transport {
-  // In WASM mode the globals are already set up by useGameState.ts and
-  // useIpc.ts. We just wire into them.
   const queue: UiCommand[] = [];
 
-  // Override the poll function to drain our queue.
   (window as any).__pollUiCommands = (): string => {
     const cmds = JSON.stringify(queue);
     queue.length = 0;
@@ -57,7 +58,33 @@ function createWasmTransport(): Transport {
   };
 }
 
-// ── WebSocket transport ──────────────────────────────────────────
+// ── wry IPC transport ───────────────────────────────────────────
+
+function createWryTransport(): Transport {
+  return {
+    onState(handler: StateHandler) {
+      // Replace the buffer handler with the real one
+      (window as any).__onGameState = (data: GameStateUpdate | string) => {
+        const parsed = typeof data === "string" ? JSON.parse(data) : data;
+        handler(parsed);
+      };
+      // Replay any state updates that arrived before React mounted
+      const buf = (window as any).__stateBuffer as GameStateUpdate[] | undefined;
+      if (buf && buf.length > 0) {
+        console.log(`[transport] Replaying ${buf.length} buffered state updates`);
+        for (const update of buf) {
+          handler(update);
+        }
+        buf.length = 0;
+      }
+    },
+    sendCommand(cmd: UiCommand) {
+      (window as any).ipc.postMessage(JSON.stringify([cmd]));
+    },
+  };
+}
+
+// ── WebSocket transport (fallback) ──────────────────────────────
 
 const WS_URL = "ws://localhost:9000";
 const RECONNECT_INTERVAL_MS = 2000;
@@ -77,7 +104,6 @@ function createWsTransport(): Transport {
 
     ws.onopen = () => {
       console.log("[transport] WebSocket connected to", WS_URL);
-      // Flush any commands queued while disconnected.
       if (pendingQueue.length > 0) {
         for (const cmd of pendingQueue) {
           ws!.send(JSON.stringify([cmd]));
@@ -104,7 +130,6 @@ function createWsTransport(): Transport {
     };
 
     ws.onerror = () => {
-      // onclose will fire after this — it handles reconnect.
       ws?.close();
     };
   }
@@ -113,7 +138,6 @@ function createWsTransport(): Transport {
     setTimeout(connect, RECONNECT_INTERVAL_MS);
   }
 
-  // Start connecting immediately.
   connect();
 
   return {
@@ -122,7 +146,6 @@ function createWsTransport(): Transport {
     },
     sendCommand(cmd: UiCommand) {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        // Send as a JSON array (same format Rust expects from __pollUiCommands).
         ws.send(JSON.stringify([cmd]));
       } else {
         pendingQueue.push(cmd);
@@ -137,7 +160,16 @@ let _transport: Transport | null = null;
 
 export function getTransport(): Transport {
   if (!_transport) {
-    _transport = isWasmMode() ? createWasmTransport() : createWsTransport();
+    if (hasWryIpc()) {
+      console.log("[transport] Using wry IPC");
+      _transport = createWryTransport();
+    } else if (isWasmMode()) {
+      console.log("[transport] Using WASM bridge");
+      _transport = createWasmTransport();
+    } else {
+      console.log("[transport] Using WebSocket fallback");
+      _transport = createWsTransport();
+    }
   }
   return _transport;
 }

@@ -20,6 +20,9 @@ fn main() {
                 title: "Deep Space".into(),
                 fit_canvas_to_parent: true,
                 prevent_default_event_handling: true,
+                // Transparent window allows the wry WebView overlay to
+                // composite over the Metal rendering on native builds.
+                transparent: true,
                 ..default()
             }),
             ..default()
