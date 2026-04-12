@@ -60,13 +60,14 @@ pub struct SaveTintMaterial {
     pub handle: Handle<StandardMaterial>,
 }
 
-/// Tracks the currently tinted rendered entity so we can restore
-/// its children's original materials when the hover moves or save
-/// mode exits.
+/// Tracks the currently tinted rendered entities so we can restore
+/// their original materials when the hover moves or save mode exits.
+/// With instancing, one NodeId maps to multiple entities (one per
+/// voxel type), so we track all of them.
 #[derive(Resource, Default)]
 pub struct SaveTintState {
     current_node: Option<NodeId>,
-    current_entity: Option<Entity>,
+    tinted_entities: Vec<(Entity, Handle<StandardMaterial>)>,
 }
 
 // ------------------------------------------------------ material init
@@ -165,11 +166,12 @@ pub fn save_on_click(
 
 // ----------------------------------------------------- tint system
 
-/// Recolour the hovered world block by swapping each of its child
-/// sub-meshes' `MeshMaterial3d` to the shared [`SaveTintMaterial`].
-/// When the hover moves, restore the previously tinted entity's
-/// children to their canonical block materials (looked up via the
-/// `SubMeshBlock` marker the renderer attaches to each child).
+/// Recolour the hovered world block by swapping each matching
+/// entity's `MeshMaterial3d` to the shared [`SaveTintMaterial`].
+///
+/// With instancing, each entity represents all instances of a
+/// `(NodeId, voxel)` pair. Tinting all entities with a given NodeId
+/// highlights every visible instance of that pattern.
 ///
 /// This runs after `render::render_world` so we see the
 /// freshly-spawned `WorldRenderedNode` entities on frames where the
@@ -183,17 +185,13 @@ pub fn update_save_tint(
     tint: Option<Res<SaveTintMaterial>>,
     mut state: ResMut<SaveTintState>,
     mut commands: Commands,
-    rendered_q: Query<(Entity, &WorldRenderedNode)>,
-    children_q: Query<&Children>,
-    sub_q: Query<&SubMeshBlock>,
+    rendered_q: Query<(Entity, &WorldRenderedNode, &SubMeshBlock)>,
 ) {
     let (Some(palette), Some(tint)) = (palette, tint) else {
         return;
     };
 
-    // What node (if any) should be tinted this frame? Rendered
-    // entities live at emit_layer (target - 1), so resolve one
-    // level above target to find the matching WorldRenderedNode.
+    // What node (if any) should be tinted this frame?
     let target_node: Option<NodeId> =
         if save_mode.active && save_mode_eligible(zoom.layer) {
             targeted
@@ -204,27 +202,14 @@ pub fn update_save_tint(
             None
         };
 
-    // No change → no work. This is the common case: the hover
-    // sits on the same node across many frames.
     if state.current_node == target_node {
         return;
     }
 
-    // Restore whatever we tinted last frame. If the entity was
-    // despawned by the renderer in the meantime, `get_entity`
-    // returns Err and we silently drop it — the entity is gone, so
-    // there's nothing to restore.
-    if let Some(prev_entity) = state.current_entity.take() {
-        if let Ok(children) = children_q.get(prev_entity) {
-            for child in children.iter() {
-                if let Ok(sub) = sub_q.get(child) {
-                    if let Some(mat) = palette.material(sub.0) {
-                        if let Ok(mut ec) = commands.get_entity(child) {
-                            ec.insert(MeshMaterial3d(mat));
-                        }
-                    }
-                }
-            }
+    // Restore previously tinted entities.
+    for (entity, original_mat) in state.tinted_entities.drain(..) {
+        if let Ok(mut ec) = commands.get_entity(entity) {
+            ec.insert(MeshMaterial3d(original_mat));
         }
     }
 
@@ -232,23 +217,16 @@ pub fn update_save_tint(
 
     let Some(target_node) = target_node else { return };
 
-    // Find the rendered parent that matches our target. The number
-    // of `WorldRenderedNode` entities is bounded by the render
-    // radius (hundreds to low thousands), and this only runs on
-    // hover-change, so a linear scan is fine.
-    for (entity, rendered) in &rendered_q {
+    // Find all rendered entities matching the target NodeId
+    // (typically 1-3, one per voxel type).
+    for (entity, rendered, sub) in &rendered_q {
         if rendered.0 == target_node {
-            if let Ok(children) = children_q.get(entity) {
-                for child in children.iter() {
-                    if sub_q.contains(child) {
-                        if let Ok(mut ec) = commands.get_entity(child) {
-                            ec.insert(MeshMaterial3d(tint.handle.clone()));
-                        }
-                    }
+            if let Some(original) = palette.material(sub.0) {
+                state.tinted_entities.push((entity, original));
+                if let Ok(mut ec) = commands.get_entity(entity) {
+                    ec.insert(MeshMaterial3d(tint.handle.clone()));
                 }
             }
-            state.current_entity = Some(entity);
-            break;
         }
     }
 }
