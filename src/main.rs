@@ -2,6 +2,7 @@ mod block;
 mod camera;
 mod diagnostics;
 mod editor;
+mod import;
 mod interaction;
 mod inventory;
 mod model;

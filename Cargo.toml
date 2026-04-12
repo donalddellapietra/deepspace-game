@@ -8,6 +8,7 @@ dev = ["bevy/dynamic_linking"]
 
 [dependencies]
 bevy = "0.18"
+dot_vox = "5"
 
 # Bevy is unusable in debug without this
 [profile.dev]
