@@ -49,7 +49,6 @@ fn main() {
             overlay::OverlayPlugin,
             npc::NpcPlugin,
             diagnostics::DiagnosticsPlugin,
-            npc::NpcPlugin,
         ))
         .add_systems(Startup, setup_environment)
         .add_systems(Update, update_shadow_cascades);
