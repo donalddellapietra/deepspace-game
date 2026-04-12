@@ -6,6 +6,7 @@ mod import;
 mod interaction;
 mod inventory;
 mod model;
+mod npc;
 mod overlay;
 mod player;
 mod ui;
@@ -42,27 +43,38 @@ fn main() {
             camera::CameraPlugin,
             ui::UiPlugin,
             overlay::OverlayPlugin,
+            npc::NpcPlugin,
             diagnostics::DiagnosticsPlugin,
         ))
         .add_systems(Startup, setup_environment)
         .add_systems(Update, update_shadow_cascades);
 
     #[cfg(feature = "debug_import")]
-    app.add_systems(Startup, debug_stamp_monument);
+    app.add_systems(PostStartup, debug_stamp_monument);
 
     app.run();
 }
 
 #[cfg(feature = "debug_import")]
-fn debug_stamp_monument(mut world_state: ResMut<world::WorldState>) {
+fn debug_stamp_monument(
+    mut world_state: ResMut<world::WorldState>,
+    mut palette: ResMut<block::Palette>,
+    mut mat_assets: ResMut<Assets<StandardMaterial>>,
+) {
     const VOX_BYTES: &[u8] = include_bytes!("../assets/vox/monu1.vox");
-    let model = import::vox::load_first_model_bytes(VOX_BYTES).expect("failed to parse .vox");
+    let model = import::vox::load_first_model_bytes(
+        VOX_BYTES,
+        &mut palette,
+        &mut mat_assets,
+    )
+    .expect("failed to parse .vox");
     info!(
-        "Loaded monument: {}×{}×{} ({} non-empty voxels)",
+        "Loaded monument: {}×{}×{} ({} non-empty voxels, palette now {} entries)",
         model.size_x,
         model.size_y,
         model.size_z,
         model.data.iter().filter(|&&v| v != 0).count(),
+        palette.len(),
     );
 
     let mut anchor = player::spawn_position();
@@ -79,7 +91,7 @@ fn setup_environment(mut commands: Commands) {
     });
 
     commands.spawn((
-        DirectionalLight { illuminance: 20_000.0, shadows_enabled: true, ..default() },
+        DirectionalLight { illuminance: 20_000.0, shadows_enabled: false, ..default() },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, 0.4, 0.0)),
     ));
 }

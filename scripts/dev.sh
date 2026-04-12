@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage: ./scripts/dev.sh [--import]
+#   --import   Load and stamp a .vox model on startup (debug_import feature)
+
+FEATURES=""
+for arg in "$@"; do
+    case "$arg" in
+        --import) FEATURES="debug_import" ;;
+        *) echo "Unknown flag: $arg"; exit 1 ;;
+    esac
+done
+
 cleanup() {
     pkill -f "deepspace-game" 2>/dev/null || true
     pkill -f "node.*vite" 2>/dev/null || true
@@ -18,4 +29,8 @@ echo "Vite ready"
 # Note: --features dev (dynamic linking) is incompatible with wry on macOS
 # due to objc-sys symbol conflicts. Plain cargo run is fast enough with
 # incremental builds (~3-5s).
-cargo run
+if [ -n "$FEATURES" ]; then
+    cargo run --features "$FEATURES"
+else
+    cargo run
+fi
