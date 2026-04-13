@@ -24,8 +24,11 @@ test("NPC mass spawn performance", async ({ page }) => {
   const baseline = await page.evaluate<PerfData>(() => (window as any).__perfData);
   console.log(`Baseline: ${baseline.fps.toFixed(1)} FPS, ${baseline.entityCount} entities`);
 
-  // Click canvas to give focus
-  await page.locator("canvas").click();
+  // Focus the canvas directly via JS (React overlay intercepts click events)
+  await page.evaluate(() => {
+    const canvas = document.querySelector("canvas");
+    if (canvas) canvas.focus();
+  });
   await page.waitForTimeout(500);
 
   // Press M to mass-spawn NPCs (1000 at a time)

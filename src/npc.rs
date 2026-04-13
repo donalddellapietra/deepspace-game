@@ -387,13 +387,20 @@ const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
 const MASS_SPAWN_COUNT: usize = 1000;
 
+/// Frame counter for staggering NPC updates across frames.
+#[derive(Resource, Default)]
+struct NpcFrameCounter(u32);
+
+const NPC_UPDATE_STAGGER: u32 = 4;
+
 // ============================================================ plugin
 
 pub struct NpcPlugin;
 
 impl Plugin for NpcPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.init_resource::<NpcFrameCounter>()
+        .add_systems(
             Update,
             (
                 try_load_blueprint,
@@ -707,14 +714,22 @@ fn spawn_npc_on_keypress(
 
 fn npc_animate(
     time: Res<Time>,
+    frame: Res<NpcFrameCounter>,
     tree_bp: Option<Res<TreeBlueprint>>,
-    mut npc_q: Query<(&mut NpcAnimState, &mut NpcPartTransforms), With<Npc>>,
+    mut npc_q: Query<(Entity, &mut NpcAnimState, &mut NpcPartTransforms), With<Npc>>,
 ) {
     let Some(tree_bp) = tree_bp else { return };
     let dt = time.delta_secs();
+    let fc = frame.0;
 
-    for (mut anim_state, mut part_tf) in &mut npc_q {
+    for (entity, mut anim_state, mut part_tf) in &mut npc_q {
+        // Always advance time for smooth playback.
         anim_state.time += dt;
+
+        // Stagger the expensive interpolation.
+        if entity.index().index() % NPC_UPDATE_STAGGER != fc % NPC_UPDATE_STAGGER {
+            continue;
+        }
 
         let Some(anim) = tree_bp.animations.get(&anim_state.current_anim) else {
             continue;
@@ -766,19 +781,28 @@ fn npc_animate(
 
 fn npc_ai(
     time: Res<Time>,
+    mut frame: ResMut<NpcFrameCounter>,
     mut q: Query<
-        (&mut NpcAi, &mut NpcVelocity, &mut Transform, &mut NpcAnimState),
+        (Entity, &mut NpcAi, &mut NpcVelocity, &mut Transform, &mut NpcAnimState),
         With<Npc>,
     >,
 ) {
-    for (mut ai, mut vel, mut tf, mut anim) in &mut q {
-        ai.change_timer.tick(time.delta());
+    let fc = frame.0;
+    frame.0 = fc.wrapping_add(1);
 
-        if ai.change_timer.just_finished() {
-            ai.heading = rand_heading();
-            ai.change_timer = Timer::from_seconds(2.0 + rand_f32() * 3.0, TimerMode::Once);
+    for (entity, mut ai, mut vel, mut tf, mut anim) in &mut q {
+        // Stagger timer tick: only 1/N of NPCs per frame.
+        if entity.index().index() % NPC_UPDATE_STAGGER == fc % NPC_UPDATE_STAGGER {
+            ai.change_timer.tick(time.delta() * NPC_UPDATE_STAGGER);
+
+            if ai.change_timer.just_finished() {
+                ai.heading = rand_heading();
+                ai.change_timer =
+                    Timer::from_seconds(2.0 + rand_f32() * 3.0, TimerMode::Once);
+            }
         }
 
+        // Velocity and rotation are cheap — always update.
         let speed = NPC_WALK_SPEED_CELLS;
         vel.0.x = -ai.heading.sin() * speed;
         vel.0.z = -ai.heading.cos() * speed;
@@ -791,16 +815,25 @@ fn npc_ai(
 
 fn npc_physics(
     time: Res<Time>,
+    frame: Res<NpcFrameCounter>,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
-    mut q: Query<(&mut WorldPosition, &mut NpcVelocity), With<Npc>>,
+    mut q: Query<(Entity, &mut WorldPosition, &mut NpcVelocity), With<Npc>>,
 ) {
     let dt = time.delta_secs();
     let cell = cell_size_at_layer(zoom.layer);
+    let fc = frame.0;
 
-    for (mut wpos, mut vel) in &mut q {
-        vel.0.y -= NPC_GRAVITY_CELLS * cell * dt;
-        let h_delta = bevy::math::Vec2::new(vel.0.x * cell * dt, vel.0.z * cell * dt);
+    for (entity, mut wpos, mut vel) in &mut q {
+        // Stagger collision: only 1/N per frame.
+        if entity.index().index() % NPC_UPDATE_STAGGER != fc % NPC_UPDATE_STAGGER {
+            continue;
+        }
+        vel.0.y -= NPC_GRAVITY_CELLS * cell * dt * NPC_UPDATE_STAGGER as f32;
+        let h_delta = bevy::math::Vec2::new(
+            vel.0.x * cell * dt * NPC_UPDATE_STAGGER as f32,
+            vel.0.z * cell * dt * NPC_UPDATE_STAGGER as f32,
+        );
         collision::move_and_collide(&mut wpos.0, &mut vel.0, h_delta, dt, &world, zoom.layer);
     }
 }
@@ -834,13 +867,14 @@ pub fn collect_overlays(
     tree_bp: Option<Res<TreeBlueprint>>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
+    camera_q: Query<(&Transform, &FpsCam), With<Camera3d>>,
     npc_q: Query<
         (Entity, &WorldPosition, &Transform, &NpcPartTransforms, Option<&NpcPartOverrides>),
         With<Npc>,
     >,
     mut overlay_list: ResMut<OverlayList>,
 ) {
-    overlay_list.entries.clear();
+    overlay_list.clear_and_recycle();
 
     let Some(tree_bp) = tree_bp else { return };
 
@@ -850,30 +884,50 @@ pub fn collect_overlays(
         return;
     }
 
-    // Leaf-layer scale: NPC is ~1.5 leaf voxels tall. This never
-    // changes with zoom — the NPC has a fixed real-world size.
+    // Frustum culling: camera position and forward direction.
+    let (cam_pos, cam_forward) = if let Ok((cam_tf, cam)) = camera_q.single() {
+        let fwd = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+        (cam_tf.translation, fwd)
+    } else {
+        (Vec3::ZERO, Vec3::NEG_Z)
+    };
+    let cell = cell_size_at_layer(zoom.layer);
+    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    let view_radius_sq = view_radius * view_radius;
+
+    // Leaf-layer scale: NPC is ~1.5 leaf voxels tall.
     let scale = tree_npc_scale(crate::world::tree::MAX_LAYER, &tree_bp);
 
     for (entity, world_pos, tf, part_tf, overrides) in &npc_q {
         let bevy_pos = bevy_from_position(&world_pos.0, &anchor);
 
-        let parts: Vec<OverlayPart> = tree_bp
-            .parts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tp)| {
-                let (offset, rotation) = part_tf.transforms.get(i)?;
-                let node_id = overrides
-                    .and_then(|o| o.overrides.get(&i).copied())
-                    .unwrap_or(tp.node_id);
-                Some(OverlayPart {
-                    node_id,
-                    offset: *offset,
-                    rotation: *rotation,
-                    pivot: tp.pivot,
-                })
-            })
-            .collect();
+        // Distance cull.
+        let to_npc = bevy_pos - cam_pos;
+        if to_npc.length_squared() > view_radius_sq {
+            continue;
+        }
+        // Hemisphere cull.
+        let forward_dot = to_npc.x * cam_forward.x + to_npc.z * cam_forward.z;
+        if forward_dot < -view_radius * 0.3 {
+            continue;
+        }
+
+        let mut parts = overlay_list.pop_spare_parts();
+        parts.clear();
+        for (i, tp) in tree_bp.parts.iter().enumerate() {
+            let Some((offset, rotation)) = part_tf.transforms.get(i) else {
+                continue;
+            };
+            let node_id = overrides
+                .and_then(|o| o.overrides.get(&i).copied())
+                .unwrap_or(tp.node_id);
+            parts.push(OverlayPart {
+                node_id,
+                offset: *offset,
+                rotation: *rotation,
+                pivot: tp.pivot,
+            });
+        }
 
         overlay_list.entries.push(OverlayInstance {
             id: entity,

@@ -1,13 +1,13 @@
 import { test } from "@playwright/test";
 
-test("NPC visual check after spawn", async ({ page }) => {
+test("NPC lifecycle tracking", async ({ page }) => {
   test.setTimeout(90_000);
 
-  const errors: string[] = [];
-  page.on("pageerror", (err) => errors.push(err.message));
+  const logs: string[] = [];
   page.on("console", (msg) => {
-    if (msg.text().includes("ERROR") || msg.text().includes("panicked")) {
-      errors.push(msg.text().slice(0, 400));
+    const text = msg.text();
+    if (text.includes("NPC") || text.includes("npc") || text.includes("Spawned") || text.includes("despawn")) {
+      logs.push(text.slice(0, 300));
     }
   });
 
@@ -16,18 +16,26 @@ test("NPC visual check after spawn", async ({ page }) => {
     () => (window as any).__perfData?.fps > 0,
     { timeout: 45_000 },
   );
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(2000);
 
-  // Click and spawn
-  await page.locator("canvas").click();
-  await page.waitForTimeout(500);
+  await page.locator("canvas").click({ position: { x: 640, y: 360 } });
+  await page.waitForTimeout(300);
+  await page.locator("canvas").click({ position: { x: 640, y: 360 } });
+  await page.waitForTimeout(300);
+
+  // Spawn
   await page.keyboard.press("n");
-  await page.waitForTimeout(3000);
 
-  await page.screenshot({ path: "test-results/npc-instanced.png" });
+  // Track NPC count over time
+  for (let i = 0; i < 10; i++) {
+    await page.waitForTimeout(200);
+    const perf = await page.evaluate(() => (window as any).__perfData);
+    console.log(`t=${(i+1)*200}ms: ${perf.npcCount} NPCs, ${perf.entityCount} entities, ${perf.fps.toFixed(1)} FPS`);
+    if (i === 0) {
+      await page.screenshot({ path: "test-results/npc-instanced.png" });
+    }
+  }
 
-  const perf = await page.evaluate(() => (window as any).__perfData);
-  console.log(`Perf: ${perf.fps.toFixed(1)} FPS, ${perf.entityCount} entities, ${perf.npcCount} NPCs`);
-  console.log(`Errors: ${errors.length}`);
-  for (const e of errors.slice(0, 5)) console.log(`  ${e}`);
+  console.log(`\nNPC-related logs:`);
+  for (const l of logs) console.log(`  ${l}`);
 });
