@@ -76,6 +76,9 @@ test("Movement FPS with 10K NPCs", async ({ page }) => {
   const movingWithNpcs = await page.evaluate(() => (window as any).__perfData);
   console.log(`10K NPCs (moving): ${movingWithNpcs.fps.toFixed(1)} FPS`);
 
+  if (panics.length > 0) {
+    console.log(`Panics: ${panics.join(", ")}`);
+  }
   expect(panics.length).toBe(0);
   console.log(`FPS ratio: ${(movingWithNpcs.fps / withNpcs.fps * 100).toFixed(0)}%`);
 });

@@ -1046,6 +1046,13 @@ fn npc_buf_animate(
 }
 
 /// Ground collision via spatial cache: O(1) lookups, lazy population.
+///
+/// Uses the **player's** anchor for the ground cache queries (the
+/// cache stores absolute leaf Y internally, so the anchor only
+/// affects the bevy-space conversion), but builds a **local anchor**
+/// for each NPC's own position when folding the result back into
+/// `Position` -- keeping f32 values tiny for NPCs far from the
+/// player.
 fn npc_buf_physics(
     time: Res<Time>,
     world: Res<WorldState>,
@@ -1060,20 +1067,41 @@ fn npc_buf_physics(
     for npc in &mut npc_buffer.npcs {
         if !npc.alive { continue; }
 
-        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        // Use a local anchor at the NPC's own position so all f32
+        // arithmetic stays small, regardless of distance from player.
+        let npc_anchor = WorldAnchor {
+            leaf_coord: crate::world::view::position_to_leaf_coord(&npc.position),
+        };
+        let bevy_pos = bevy_from_position(&npc.position, &npc_anchor);
+
         let new_x = bevy_pos.x + npc.velocity.x * cell * dt;
         let new_z = bevy_pos.z + npc.velocity.z * cell * dt;
 
         // Cached ground lookup: O(1) after first query per cell.
-        let ground_y = ground_cache.ground_y(
-            &world, &anchor, zoom.layer, new_x, new_z, cell,
+        // The cache stores absolute leaf Y internally, so the anchor
+        // only affects the bevy-space XZ used for the cache key. We
+        // pass player-anchor coords for key stability across frames.
+        let player_bevy = bevy_from_position(&npc.position, &anchor);
+        let ground_y_player_frame = ground_cache.ground_y(
+            &world, &anchor, zoom.layer,
+            player_bevy.x + npc.velocity.x * cell * dt,
+            player_bevy.z + npc.velocity.z * cell * dt,
+            cell,
         );
 
-        // If cache returned 0 (budget exhausted), keep current height.
-        let ground_y = if ground_y == 0.0 && bevy_pos.y > 0.5 {
+        // Convert from player-anchor frame to NPC-local frame.
+        let ground_y = if ground_y_player_frame.is_nan() {
+            // Cache budget exhausted -- keep current height.
             bevy_pos.y
         } else {
-            ground_y
+            // ground_y in player frame = (absolute_leaf_y - player_anchor_y).
+            // We need it in NPC frame  = (absolute_leaf_y - npc_anchor_y).
+            // Difference: (npc_anchor_y - player_anchor_y) added to the
+            // player-frame value... but since both are just
+            // (absolute - anchor), we can compute directly:
+            // ground_y_npc = ground_y_player + (player_anchor_y - npc_anchor_y)
+            let anchor_dy = (anchor.leaf_coord[1] - npc_anchor.leaf_coord[1]) as f32;
+            ground_y_player_frame + anchor_dy
         };
 
         // Apply gravity only when above ground.
@@ -1088,7 +1116,7 @@ fn npc_buf_physics(
         let final_y = new_y.max(ground_y);
 
         let new_bevy = Vec3::new(new_x, final_y, new_z);
-        if let Some(new_pos) = position_from_bevy(new_bevy, &anchor) {
+        if let Some(new_pos) = position_from_bevy(new_bevy, &npc_anchor) {
             npc.position = new_pos;
         }
     }
