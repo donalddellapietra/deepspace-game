@@ -429,7 +429,7 @@ pub struct NpcPartTransforms {
 
 const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
-const MASS_SPAWN_COUNT: usize = 1000;
+const MASS_SPAWN_COUNT: usize = 10_000;
 
 /// Frame counter for staggering animation updates.
 #[derive(Resource, Default)]
