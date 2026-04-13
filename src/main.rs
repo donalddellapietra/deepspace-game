@@ -32,10 +32,11 @@ fn main() {
             }),
             ..default()
         }))
-        // Atmosphere renders the sky; ClearColor only peeks through
-        // sub-pixel gaps between mesh faces, so match it to the
-        // dominant terrain color (grass) to hide seams.
-        .insert_resource(ClearColor(Color::srgb(0.3, 0.6, 0.2)))
+        // ClearColor shows at the horizon where terrain ends and at
+        // sub-pixel gaps between mesh faces. Match it to the
+        // atmosphere's haze color so the terrain-to-sky transition
+        // is seamless instead of showing a hard green line.
+        .insert_resource(ClearColor(Color::srgb(0.7, 0.78, 0.65)))
         .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
@@ -93,8 +94,8 @@ fn setup_environment(mut commands: Commands) {
     // core of BSL's "warm sun / cool shadow" look. Brightness lowered
     // from 800 to fit the HDR pipeline (AcesFitted tone-maps it).
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.7, 0.8, 1.0),
-        brightness: 400.0,
+        color: Color::srgb(0.8, 0.85, 1.0),
+        brightness: 600.0,
         ..default()
     });
 
@@ -104,8 +105,8 @@ fn setup_environment(mut commands: Commands) {
     // with AcesFitted at the old intensity.
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(1.0, 0.95, 0.85),
-            illuminance: 8_000.0,
+            color: Color::srgb(1.0, 0.98, 0.93),
+            illuminance: 10_000.0,
             shadows_enabled: true,
             shadow_depth_bias: 0.3,
             shadow_normal_bias: 2.0,

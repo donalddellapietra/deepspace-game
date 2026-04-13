@@ -29,9 +29,9 @@ impl Default for BslParams {
         Self {
             // Cool blue ambient — shadows tint toward this, contrasting
             // with the warm golden directional light (BSL signature).
-            ambient_color: Vec4::new(0.6, 0.75, 1.0, 0.35),
+            ambient_color: Vec4::new(0.8, 0.85, 1.0, 0.3),
             subsurface_strength: 0.0,
-            ao_strength: 1.0,
+            ao_strength: 0.6,
             _padding: Vec2::ZERO,
         }
     }

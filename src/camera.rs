@@ -114,8 +114,10 @@ fn spawn_camera(
         Tonemapping::AcesFitted,
         ShadowFilteringMethod::Gaussian,
         ScreenSpaceAmbientOcclusion {
-            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::Medium,
-            constant_object_thickness: 1.0,
+            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
+            // Higher thickness = samples stay closer to the surface,
+            // reducing noise on thin voxel geometry.
+            constant_object_thickness: 4.0,
         },
         // Bloom only on bright highlights (threshold 0.8) — sky, sun
         // reflections, emissive blocks. Energy-conserving mode adds
@@ -140,28 +142,28 @@ fn spawn_camera(
         ColorGrading {
             global: ColorGradingGlobal {
                 exposure: 0.0,
-                temperature: 0.1,
+                temperature: 0.0,
                 tint: 0.0,
                 hue: 0.0,
-                post_saturation: 1.1,
+                post_saturation: 1.0,
                 midtones_range: 0.2..0.7,
             },
             shadows: ColorGradingSection {
-                saturation: 1.15,
+                saturation: 1.1,
                 contrast: 1.05,
                 gamma: 1.0,
                 gain: 1.0,
-                lift: 0.015,
+                lift: 0.01,
             },
             midtones: ColorGradingSection {
-                saturation: 1.05,
-                contrast: 1.02,
+                saturation: 1.0,
+                contrast: 1.0,
                 gamma: 1.0,
                 gain: 1.0,
                 lift: 0.0,
             },
             highlights: ColorGradingSection {
-                saturation: 0.95,
+                saturation: 1.0,
                 contrast: 1.0,
                 gamma: 1.0,
                 gain: 1.0,
