@@ -17,7 +17,7 @@ use crate::model::BakedSubMesh;
 use super::mesh_cache::MeshStore;
 use super::state::WorldState;
 use super::tree::{NodeId, EMPTY_NODE, MAX_LAYER};
-use super::view::{cell_size_at_layer, target_layer_for, WorldAnchor};
+use super::view::{target_layer_for, WorldAnchor};
 use super::walk::{walk, SmallPath, Visit, WalkFrame};
 
 // ------------------------------------------------------- markers
@@ -124,11 +124,11 @@ pub fn render_world(
 
     let target_layer = target_layer_for(zoom.layer);
     let emit_layer = target_layer.saturating_sub(1);
-    let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
+    let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
 
     // On zoom change or first pass, drop entities but keep mesh cache.
     if !render_state.initialised
-        || render_state.last_zoom_layer != zoom.layer
+        || render_state.last_zoom_layer != emit_layer
         || render_state.force_rebuild
     {
         render_state.force_rebuild = false;
@@ -139,7 +139,7 @@ pub fn render_world(
         }
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
         render_state.mesh_store.clear_paths();
-        render_state.last_zoom_layer = zoom.layer;
+        render_state.last_zoom_layer = emit_layer;
         render_state.initialised = true;
     }
 
@@ -272,7 +272,7 @@ pub fn render_world(
         for pf_layer in prefetch_layers.into_iter().flatten() {
             let pf_target = target_layer_for(pf_layer);
             let pf_emit = pf_target.saturating_sub(1);
-            let pf_radius = RADIUS_VIEW_CELLS * cell_size_at_layer(pf_layer);
+            let pf_radius = RADIUS_VIEW_CELLS * anchor.cell_bevy(pf_layer);
             walk(
                 &world, pf_emit, pf_target,
                 camera_pos, pf_radius, &anchor,
