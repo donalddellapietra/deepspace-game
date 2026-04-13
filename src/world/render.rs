@@ -146,6 +146,10 @@ pub struct RenderState {
     last_zoom_layer: u8,
     /// Whether we have done at least one render pass.
     initialised: bool,
+    /// Set to true to force a full entity rebuild on the next frame.
+    pub force_rebuild: bool,
+    /// Overlay (NPC) entity tracking and mesh cache.
+    pub overlay: super::overlay::OverlayState,
     /// Reusable DFS stack for `walk()`. Stashed here so we don't
     /// reallocate a `Vec` every frame. Cleared at the start of each
     /// `walk()` call.
@@ -562,6 +566,7 @@ pub fn render_world(
     mut meshes: ResMut<Assets<Mesh>>,
     mut render_state: ResMut<RenderState>,
     mut timings: ResMut<RenderTimings>,
+    overlay_list: Res<super::overlay::OverlayList>,
 ) {
     let Some(palette) = palette else {
         return;
@@ -582,14 +587,18 @@ pub fn render_world(
     // per-cell Bevy size grows by 5× per layer.
     let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
 
-    // If emit layer changed, or we're on our first pass, drop everything.
-    if !render_state.initialised || render_state.last_zoom_layer != emit_layer
+    // If emit layer changed, first pass, or forced rebuild, drop everything.
+    if !render_state.initialised
+        || render_state.last_zoom_layer != emit_layer
+        || render_state.force_rebuild
     {
+        render_state.force_rebuild = false;
         for (_, (entity, _, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
         }
+        super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
         render_state.baked.clear();
         render_state.path_node.clear();
         render_state.last_zoom_layer = emit_layer;
@@ -718,6 +727,16 @@ pub fn render_world(
         }
     }
     render_state.entities = alive;
+
+    // Overlay reconcile (NPCs and other overlay subtrees).
+    super::overlay::reconcile_overlays(
+        &mut commands,
+        &world,
+        &palette,
+        &mut meshes,
+        &overlay_list,
+        &mut render_state.overlay,
+    );
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
     timings.render_total_us = render_total_start.elapsed().as_micros() as u64;

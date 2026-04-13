@@ -16,7 +16,7 @@ use serde_json;
 
 use bridge::*;
 
-use crate::block::{BlockType, PaletteMaterial, Palette, PaletteEntry};
+use crate::block::{BlockType, BslMaterial, Palette, PaletteEntry};
 use crate::editor::save_mode::{save_mode_eligible, SaveMode, SavedMeshes};
 use crate::editor::{Hotbar, HotbarItem};
 use crate::inventory::InventoryState;
@@ -228,8 +228,12 @@ fn push_hotbar(
     }));
 }
 
-fn push_mode_indicator(zoom: Res<CameraZoom>, save_mode: Res<SaveMode>) {
-    if !zoom.is_changed() && !save_mode.is_changed() {
+fn push_mode_indicator(
+    zoom: Res<CameraZoom>,
+    save_mode: Res<SaveMode>,
+    entity_edit: Res<crate::interaction::EntityEditMode>,
+) {
+    if !zoom.is_changed() && !save_mode.is_changed() && !entity_edit.is_changed() {
         return;
     }
 
@@ -237,6 +241,7 @@ fn push_mode_indicator(zoom: Res<CameraZoom>, save_mode: Res<SaveMode>) {
         layer: zoom.layer,
         save_mode: save_mode.active,
         save_eligible: save_mode_eligible(zoom.layer),
+        entity_edit_mode: entity_edit.active,
     }));
 }
 
@@ -328,7 +333,7 @@ fn poll_ui_commands(
     mut inv: ResMut<InventoryState>,
     mut picker: ResMut<ColorPickerState>,
     mut palette: ResMut<Palette>,
-    mut materials: ResMut<Assets<PaletteMaterial>>,
+    mut materials: ResMut<Assets<BslMaterial>>,
     mut ui_focused: ResMut<UiFocused>,
     mut lock_lost: ResMut<PointerLockLost>,
 ) {
