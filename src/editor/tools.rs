@@ -38,6 +38,7 @@ pub fn zoom_in(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
     world: Res<WorldState>,
+    anchor: Res<WorldAnchor>,
     mut zoom: ResMut<CameraZoom>,
     mut transition: ResMut<ZoomTransition>,
     mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
@@ -48,7 +49,7 @@ pub fn zoom_in(
     if keyboard.just_pressed(KeyCode::KeyF) {
         let old_layer = zoom.layer;
         if zoom.zoom_in() {
-            transition.start(old_layer, zoom.layer);
+            transition.start(old_layer, zoom.layer, &anchor);
             if let Ok((mut pos, mut vel)) = player_q.single_mut() {
                 collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
                 vel.0.y = 0.0;
@@ -64,6 +65,7 @@ pub fn zoom_out(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
     world: Res<WorldState>,
+    anchor: Res<WorldAnchor>,
     mut zoom: ResMut<CameraZoom>,
     mut transition: ResMut<ZoomTransition>,
     mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
@@ -74,7 +76,7 @@ pub fn zoom_out(
     if keyboard.just_pressed(KeyCode::KeyQ) {
         let old_layer = zoom.layer;
         if zoom.zoom_out() {
-            transition.start(old_layer, zoom.layer);
+            transition.start(old_layer, zoom.layer, &anchor);
             if let Ok((mut pos, mut vel)) = player_q.single_mut() {
                 collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
                 vel.0.y = 0.0;
@@ -244,7 +246,7 @@ pub fn place_block(
         return;
     };
 
-    let cell_size = cell_size_at_layer(zoom.layer);
+    let cell_size = anchor.cell_bevy(zoom.layer);
     let hit_center = bevy_center_of_layer_pos(hit, &anchor);
     let place_center = hit_center + normal.as_vec3() * cell_size;
     let Some(place_lp) = layer_pos_from_bevy(place_center, zoom.layer, &anchor)

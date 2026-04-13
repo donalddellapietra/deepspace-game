@@ -619,7 +619,7 @@ fn spawn_npc_on_keypress(
     let Ok(player_pos) = player_q.single() else { return;
     };
 
-    let cell = cell_size_at_layer(zoom.layer);
+    let cell = anchor.cell_bevy(zoom.layer);
     let forward = if let Ok(cam) = cam_q.single() {
         Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos())
     } else {
@@ -823,7 +823,7 @@ pub fn collect_overlays(
 
     // Leaf-layer scale: NPC is ~1.5 leaf voxels tall. This never
     // changes with zoom — the NPC has a fixed real-world size.
-    let scale = tree_npc_scale(crate::world::tree::MAX_LAYER, &tree_bp);
+    let scale = tree_npc_scale(crate::world::tree::MAX_LAYER, &tree_bp, &anchor);
 
     for (entity, world_pos, tf, part_tf, overrides) in &npc_q {
         let bevy_pos = bevy_from_position(&world_pos.0, &anchor);
@@ -892,14 +892,14 @@ pub fn edit_npc_voxel(
 
 // ============================================================= helpers
 
-fn tree_npc_scale(view_layer: u8, tree_bp: &TreeBlueprint) -> f32 {
+fn tree_npc_scale(view_layer: u8, tree_bp: &TreeBlueprint, anchor: &WorldAnchor) -> f32 {
     let max_y: f32 = tree_bp
         .parts
         .iter()
         .map(|p| p.rest_offset.y + p.size[1] as f32)
         .fold(0.0f32, f32::max);
     let height = max_y.max(1.0);
-    let cell = cell_size_at_layer(view_layer);
+    let cell = anchor.cell_bevy(view_layer);
     (1.5 * cell) / height
 }
 

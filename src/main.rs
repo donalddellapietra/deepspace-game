@@ -120,22 +120,18 @@ fn setup_environment(mut commands: Commands) {
 /// cover the full view distance at every scale.
 fn update_shadow_cascades(
     zoom: Res<world::render::CameraZoom>,
+    anchor: Res<world::view::WorldAnchor>,
     mut lights: Query<&mut CascadeShadowConfig, With<DirectionalLight>>,
 ) {
     if !zoom.is_changed() {
         return;
     }
-    let cell = world::view::cell_size_at_layer(zoom.layer);
+    let cell = anchor.cell_bevy(zoom.layer);
     let radius = world::render::RADIUS_VIEW_CELLS * cell;
-    // Cap shadow distance: at zoomed-out layers the shadow pass would
-    // render the entire view volume (radius can be 20k+ Bevy units at
-    // layer 8), destroying GPU perf. Shadows beyond ~2000 units are
-    // invisible anyway — the atmosphere haze hides them.
-    let shadow_max = radius.min(2000.0 * cell.min(5.0));
     for mut config in &mut lights {
         *config = CascadeShadowConfigBuilder {
             first_cascade_far_bound: 10.0 * cell,
-            maximum_distance: shadow_max,
+            maximum_distance: radius,
             overlap_proportion: 0.4,
             ..default()
         }

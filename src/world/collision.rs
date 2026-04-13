@@ -50,6 +50,7 @@ pub const PLAYER_H: f32 = 1.7;
 fn local_anchor(pos: &Position) -> WorldAnchor {
     WorldAnchor {
         leaf_coord: position_to_leaf_coord(pos),
+        norm: 1.0,
     }
 }
 

@@ -12,7 +12,7 @@ use bevy::{
 
 use crate::block::BslMaterial;
 use crate::player::{Player, PLAYER_HEIGHT};
-use crate::world::view::cell_size_at_layer;
+use crate::world::view::{cell_size_at_layer, WorldAnchor};
 use crate::world::CameraZoom;
 
 // ------------------------------------------------- zoom transition
@@ -37,26 +37,25 @@ struct AnimatingZoom {
 
 impl ZoomTransition {
     /// Start a new transition. `from_layer` is the layer *before* the
-    /// zoom; `to_layer` is the layer *after*.
-    pub fn start(&mut self, from_layer: u8, to_layer: u8) {
+    /// zoom; `to_layer` is the layer *after*. Cell sizes are stored in
+    /// normalized Bevy units using the anchor's norm factor.
+    pub fn start(&mut self, from_layer: u8, to_layer: u8, anchor: &WorldAnchor) {
         self.active = Some(AnimatingZoom {
-            from_cell_size: cell_size_at_layer(from_layer),
-            to_cell_size: cell_size_at_layer(to_layer),
+            from_cell_size: anchor.cell_bevy(from_layer),
+            to_cell_size: anchor.cell_bevy(to_layer),
             t: 0.0,
         });
     }
 
-    /// The interpolated cell size, or the steady-state value when no
-    /// transition is active.
-    pub fn effective_cell_size(&self, current_layer: u8) -> f32 {
+    /// The interpolated cell size in normalized Bevy units.
+    pub fn effective_cell_size(&self, current_layer: u8, anchor: &WorldAnchor) -> f32 {
         match &self.active {
             Some(anim) => {
-                // Smooth-step easing: 3t² - 2t³
                 let t = anim.t.clamp(0.0, 1.0);
                 let ease = t * t * (3.0 - 2.0 * t);
                 anim.from_cell_size + (anim.to_cell_size - anim.from_cell_size) * ease
             }
-            None => cell_size_at_layer(current_layer),
+            None => anchor.cell_bevy(current_layer),
         }
     }
 }
@@ -203,6 +202,7 @@ fn first_person_camera(
     motion: Res<AccumulatedMouseMotion>,
     locked: Res<CursorLocked>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     transition: Res<ZoomTransition>,
     player_q: Query<&Transform, (With<Player>, Without<FpsCam>)>,
     mut cam_q: Query<(&mut Transform, &mut FpsCam), Without<Player>>,
@@ -210,18 +210,13 @@ fn first_person_camera(
     let Ok(player_tf) = player_q.single() else { return };
     let Ok((mut cam_tf, mut cam)) = cam_q.single_mut() else { return };
 
-    // Only rotate when cursor is locked
     if locked.0 {
         cam.yaw -= motion.delta.x * SENSITIVITY;
         cam.pitch = (cam.pitch + motion.delta.y * SENSITIVITY)
             .clamp(-FRAC_PI_2 + 0.05, FRAC_PI_2 - 0.05);
     }
 
-    // Player.y = feet. Camera sits at the eye, but the eye height
-    // scales with the view layer's cell size. During a zoom transition
-    // the cell size is interpolated so the camera glides smoothly
-    // between layers instead of snapping.
-    let cell = transition.effective_cell_size(zoom.layer);
+    let cell = transition.effective_cell_size(zoom.layer, &anchor);
     cam_tf.translation = player_tf.translation + Vec3::Y * (PLAYER_HEIGHT * cell);
     cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
 }
@@ -231,24 +226,22 @@ fn first_person_camera(
 /// chunks (avoiding banding at chunk boundaries).
 fn sync_atmosphere_scale(
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut cam_q: Query<&mut AtmosphereSettings, With<FpsCam>>,
 ) {
     if !zoom.is_changed() {
         return;
     }
-    let cell = cell_size_at_layer(zoom.layer);
-    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    let cell_bevy = anchor.cell_bevy(zoom.layer);
+    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell_bevy;
     for mut settings in &mut cam_q {
-        // At lower layers the camera is at PLAYER_HEIGHT * cell Bevy
-        // units. Dividing by cell keeps the atmosphere seeing a
-        // consistent ~2m altitude regardless of zoom, preventing
-        // heavy blue scattering at zoomed-out layers.
-        settings.scene_units_to_m = 1.0 / cell;
-        // Set the aerial-view LUT distance to ~60% of render radius.
-        // This concentrates the atmosphere fog samples so haze reaches
-        // near-opacity right where terrain ends, hiding the render
-        // distance cutoff instead of showing two distinct horizons.
-        settings.aerial_view_lut_max_distance = view_radius * 0.6 / cell;
+        // With coordinate normalization, Bevy-space distances are
+        // bounded (~800 units) at all zoom levels. 1 Bevy unit ≈
+        // 1 target-layer voxel. scene_units_to_m converts to meters
+        // for the atmosphere — divide by cell_bevy so the atmosphere
+        // sees a consistent ~2m camera altitude regardless of zoom.
+        settings.scene_units_to_m = 1.0 / cell_bevy;
+        settings.aerial_view_lut_max_distance = view_radius / cell_bevy;
     }
 }
 
@@ -256,13 +249,13 @@ fn sync_atmosphere_scale(
 /// terrain fades smoothly into the atmosphere at the render edge.
 fn sync_fog_distances(
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut materials: ResMut<Assets<BslMaterial>>,
 ) {
     if !zoom.is_changed() {
         return;
     }
-    let cell = cell_size_at_layer(zoom.layer);
-    let radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    let radius = crate::world::render::RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
     // Fog starts at 70% of render radius, fully opaque at 95%.
     let fog_start = radius * 0.7;
     let fog_end = radius * 0.95;

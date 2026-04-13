@@ -476,12 +476,13 @@ fn walk(
         // Bevy-space origin of this node: delta from the anchor, in
         // leaves, cast to `f32`. For nodes near the player the delta
         // is small and `f32` is essentially exact.
+        let n = anchor.norm;
         let origin_bevy = Vec3::new(
-            (origin_leaves[0] - anchor.leaf_coord[0]) as f32,
-            (origin_leaves[1] - anchor.leaf_coord[1]) as f32,
-            (origin_leaves[2] - anchor.leaf_coord[2]) as f32,
+            (origin_leaves[0] - anchor.leaf_coord[0]) as f32 / n,
+            (origin_leaves[1] - anchor.leaf_coord[1]) as f32 / n,
+            (origin_leaves[2] - anchor.leaf_coord[2]) as f32 / n,
         );
-        let extent = extent_for_layer(depth);
+        let extent = extent_for_layer(depth) / n;
         let aabb_min = origin_bevy;
         let aabb_max = origin_bevy + Vec3::splat(extent);
 
@@ -510,7 +511,7 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: scale_for_layer(target_layer),
+                scale: 1.0,
             });
             continue;
         }
@@ -525,7 +526,7 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: scale_for_layer(depth),
+                scale: 1.0,
             });
             continue;
         };
@@ -585,7 +586,7 @@ pub fn render_world(
     // implicitly (its viewport is measured in cells); without it,
     // zooming out collapses the visible world to a dot because the
     // per-cell Bevy size grows by 5× per layer.
-    let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
+    let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
 
     // If emit layer changed, first pass, or forced rebuild, drop everything.
     if !render_state.initialised
@@ -760,7 +761,7 @@ mod tests {
     }
 
     fn anchor_origin() -> WorldAnchor {
-        WorldAnchor { leaf_coord: [0, 0, 0] }
+        WorldAnchor { leaf_coord: [0, 0, 0], norm: 1.0 }
     }
 
     #[test]
