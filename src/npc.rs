@@ -387,13 +387,20 @@ const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
 const MASS_SPAWN_COUNT: usize = 1000;
 
+/// Frame counter for staggering NPC updates across frames.
+#[derive(Resource, Default)]
+struct NpcFrameCounter(u32);
+
+const NPC_UPDATE_STAGGER: u32 = 4; // update 1/4 of NPCs per frame
+
 // ============================================================ plugin
 
 pub struct NpcPlugin;
 
 impl Plugin for NpcPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.init_resource::<NpcFrameCounter>()
+        .add_systems(
             Update,
             (
                 try_load_blueprint,
@@ -707,14 +714,22 @@ fn spawn_npc_on_keypress(
 
 fn npc_animate(
     time: Res<Time>,
+    frame: Res<NpcFrameCounter>,
     tree_bp: Option<Res<TreeBlueprint>>,
-    mut npc_q: Query<(&mut NpcAnimState, &mut NpcPartTransforms), With<Npc>>,
+    mut npc_q: Query<(Entity, &mut NpcAnimState, &mut NpcPartTransforms), With<Npc>>,
 ) {
     let Some(tree_bp) = tree_bp else { return };
     let dt = time.delta_secs();
+    let fc = frame.0;
 
-    for (mut anim_state, mut part_tf) in &mut npc_q {
+    for (entity, mut anim_state, mut part_tf) in &mut npc_q {
+        // Always advance time so animations stay in sync.
         anim_state.time += dt;
+
+        // Stagger the expensive interpolation work.
+        if entity.index().index() % NPC_UPDATE_STAGGER != fc % NPC_UPDATE_STAGGER {
+            continue;
+        }
 
         let Some(anim) = tree_bp.animations.get(&anim_state.current_anim) else {
             continue;
@@ -766,19 +781,29 @@ fn npc_animate(
 
 fn npc_ai(
     time: Res<Time>,
+    mut frame: ResMut<NpcFrameCounter>,
     mut q: Query<
-        (&mut NpcAi, &mut NpcVelocity, &mut Transform, &mut NpcAnimState),
+        (Entity, &mut NpcAi, &mut NpcVelocity, &mut Transform, &mut NpcAnimState),
         With<Npc>,
     >,
 ) {
-    for (mut ai, mut vel, mut tf, mut anim) in &mut q {
-        ai.change_timer.tick(time.delta());
+    let fc = frame.0;
+    frame.0 = fc.wrapping_add(1);
 
-        if ai.change_timer.just_finished() {
-            ai.heading = rand_heading();
-            ai.change_timer = Timer::from_seconds(2.0 + rand_f32() * 3.0, TimerMode::Once);
+    for (entity, mut ai, mut vel, mut tf, mut anim) in &mut q {
+        // Stagger: only update 1/N of NPCs per frame for timer tick.
+        if entity.index().index() % NPC_UPDATE_STAGGER == fc % NPC_UPDATE_STAGGER {
+            ai.change_timer.tick(time.delta() * NPC_UPDATE_STAGGER);
+
+            if ai.change_timer.just_finished() {
+                ai.heading = rand_heading();
+                ai.change_timer =
+                    Timer::from_seconds(2.0 + rand_f32() * 3.0, TimerMode::Once);
+            }
         }
 
+        // Velocity and rotation are cheap — always update so movement
+        // stays smooth even when AI tick is staggered.
         let speed = NPC_WALK_SPEED_CELLS;
         vel.0.x = -ai.heading.sin() * speed;
         vel.0.z = -ai.heading.cos() * speed;
@@ -791,16 +816,26 @@ fn npc_ai(
 
 fn npc_physics(
     time: Res<Time>,
+    frame: Res<NpcFrameCounter>,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
-    mut q: Query<(&mut WorldPosition, &mut NpcVelocity), With<Npc>>,
+    mut q: Query<(Entity, &mut WorldPosition, &mut NpcVelocity), With<Npc>>,
 ) {
     let dt = time.delta_secs();
     let cell = cell_size_at_layer(zoom.layer);
+    let fc = frame.0;
 
-    for (mut wpos, mut vel) in &mut q {
-        vel.0.y -= NPC_GRAVITY_CELLS * cell * dt;
-        let h_delta = bevy::math::Vec2::new(vel.0.x * cell * dt, vel.0.z * cell * dt);
+    for (entity, mut wpos, mut vel) in &mut q {
+        // Stagger collision queries — only 1/N per frame.
+        if entity.index().index() % NPC_UPDATE_STAGGER != fc % NPC_UPDATE_STAGGER {
+            continue;
+        }
+
+        vel.0.y -= NPC_GRAVITY_CELLS * cell * dt * NPC_UPDATE_STAGGER as f32;
+        let h_delta = bevy::math::Vec2::new(
+            vel.0.x * cell * dt * NPC_UPDATE_STAGGER as f32,
+            vel.0.z * cell * dt * NPC_UPDATE_STAGGER as f32,
+        );
         collision::move_and_collide(&mut wpos.0, &mut vel.0, h_delta, dt, &world, zoom.layer);
     }
 }
