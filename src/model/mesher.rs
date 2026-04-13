@@ -296,13 +296,16 @@ pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
     let faces = bake_faces(size, &get, [0, 0, 0]);
-    faces
-        .into_iter()
-        .map(|(voxel, data)| BakedSubMesh {
-            mesh: meshes.add(data.build()),
-            voxel,
-        })
-        .collect()
+    build_sub_meshes(faces, meshes)
+}
+
+/// Bake a `size³` volume into raw `FaceData` per voxel type, without
+/// GPU upload. Used for pre-baking leaf nodes during composition.
+pub fn bake_faces_raw<F: Fn(i32, i32, i32) -> Option<u8>>(
+    size: i32,
+    get: &F,
+) -> HashMap<u8, FaceData> {
+    bake_faces(size, get, [0, 0, 0])
 }
 
 /// Bake one child's 25³ region within a parent's 125³ grid.
@@ -468,36 +471,157 @@ pub fn merge_child_faces(
     children: &[ChildFaces],
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
+    let raw = merge_child_faces_raw(children);
+    build_sub_meshes(raw, meshes)
+}
+
+/// Merge 125 children's `ChildFaces` into raw `FaceData` per voxel
+/// type, without uploading to GPU. Used as a building block for
+/// hierarchical mesh composition.
+pub fn merge_child_faces_raw(children: &[ChildFaces]) -> HashMap<u8, FaceData> {
+    let mut result: HashMap<u8, FaceData> = HashMap::new();
+    for child in children {
+        for (&voxel, data) in child {
+            let merged = result.entry(voxel).or_default();
+            let base = merged.positions.len() as u32;
+            merged.positions.extend_from_slice(&data.positions);
+            merged.normals.extend_from_slice(&data.normals);
+            merged.colors.extend_from_slice(&data.colors);
+            merged.uvs.extend_from_slice(&data.uvs);
+            for &idx in &data.indices {
+                merged.indices.push(base + idx);
+            }
+        }
+    }
+    result
+}
+
+/// Convert raw `FaceData` per voxel type into GPU-uploaded
+/// `BakedSubMesh`es.
+pub fn build_sub_meshes(
+    face_data: HashMap<u8, FaceData>,
+    meshes: &mut Assets<Mesh>,
+) -> Vec<BakedSubMesh> {
+    face_data
+        .into_iter()
+        .filter_map(|(voxel, data)| {
+            if data.is_empty() {
+                return None;
+            }
+            Some(BakedSubMesh {
+                mesh: meshes.add(data.build()),
+                voxel,
+            })
+        })
+        .collect()
+}
+
+/// Map a quad's normal vector to a face index (0=+X, 1=-X, 2=+Y,
+/// 3=-Y, 4=+Z, 5=-Z).
+#[inline]
+fn normal_to_face_idx(normal: &[f32; 3]) -> usize {
+    if normal[0] > 0.5 { 0 }
+    else if normal[0] < -0.5 { 1 }
+    else if normal[1] > 0.5 { 2 }
+    else if normal[1] < -0.5 { 3 }
+    else if normal[2] > 0.5 { 4 }
+    else { 5 }
+}
+
+/// Compose pre-baked children's `FaceData` into final
+/// `BakedSubMesh`es, offsetting each child's vertex positions by its
+/// slot within the parent's grid. Each child's mesh covers [0, 125)
+/// in its own local space; the composed result covers [0, 625).
+///
+/// `children_faces` has one entry per slot (0..n_children). `None`
+/// means the child is empty or uniform-empty and contributes no faces.
+///
+/// `cull_masks` has one `[bool; 6]` per slot. If `cull_masks[slot][face]`
+/// is true, all quads from that child with that face normal are
+/// skipped (boundary face suppression between adjacent solid children).
+pub fn compose_children_meshes(
+    children_faces: &[Option<&HashMap<u8, FaceData>>],
+    cull_masks: &[[bool; 6]],
+    n_children: usize,
+    branch_factor: usize,
+    child_mesh_size: usize,
+    meshes: &mut Assets<Mesh>,
+) -> Vec<BakedSubMesh> {
     // Collect all voxel types across all children.
     let mut all_voxels: Vec<u8> = Vec::new();
-    for child in children {
-        for &v in child.keys() {
-            if !all_voxels.contains(&v) {
-                all_voxels.push(v);
+    for child_opt in children_faces {
+        if let Some(faces) = child_opt {
+            for &v in faces.keys() {
+                if !all_voxels.contains(&v) {
+                    all_voxels.push(v);
+                }
             }
         }
     }
 
+    let csf = child_mesh_size as f32;
     all_voxels
         .into_iter()
         .filter_map(|voxel| {
             let mut merged = FaceData::default();
-            for child in children {
-                if let Some(data) = child.get(&voxel) {
+            for slot in 0..n_children {
+                let Some(faces) = children_faces[slot] else { continue };
+                let Some(data) = faces.get(&voxel) else { continue };
+                let sx = slot % branch_factor;
+                let sy = (slot / branch_factor) % branch_factor;
+                let sz = slot / (branch_factor * branch_factor);
+                let offset = [sx as f32 * csf, sy as f32 * csf, sz as f32 * csf];
+                let mask = &cull_masks[slot];
+                let any_culled = mask.iter().any(|&b| b);
+
+                if !any_culled {
+                    // Fast path: no culling, bulk copy.
                     let base = merged.positions.len() as u32;
-                    merged.positions.extend_from_slice(&data.positions);
+                    for pos in &data.positions {
+                        merged.positions.push([
+                            pos[0] + offset[0],
+                            pos[1] + offset[1],
+                            pos[2] + offset[2],
+                        ]);
+                    }
                     merged.normals.extend_from_slice(&data.normals);
                     merged.colors.extend_from_slice(&data.colors);
                     merged.uvs.extend_from_slice(&data.uvs);
                     for &idx in &data.indices {
                         merged.indices.push(base + idx);
                     }
+                } else {
+                    // Slow path: per-quad filtering.
+                    let n_quads = data.positions.len() / 4;
+                    for q in 0..n_quads {
+                        let vi = q * 4;
+                        let ii = q * 6;
+                        let face = normal_to_face_idx(&data.normals[vi]);
+                        if mask[face] { continue; }
+                        let new_base = merged.positions.len() as u32;
+                        let old_base = vi as u32;
+                        for k in 0..4 {
+                            let pos = &data.positions[vi + k];
+                            merged.positions.push([
+                                pos[0] + offset[0],
+                                pos[1] + offset[1],
+                                pos[2] + offset[2],
+                            ]);
+                            merged.normals.push(data.normals[vi + k]);
+                            merged.colors.push(data.colors[vi + k]);
+                            merged.uvs.push(data.uvs[vi + k]);
+                        }
+                        for k in 0..6 {
+                            merged.indices.push(
+                                data.indices[ii + k] - old_base + new_base,
+                            );
+                        }
+                    }
                 }
             }
             if merged.is_empty() {
                 return None;
             }
-
             Some(BakedSubMesh {
                 mesh: meshes.add(merged.build()),
                 voxel,

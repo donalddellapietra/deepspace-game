@@ -30,7 +30,7 @@ use crate::world::position::{Position, NODE_PATH_LEN};
 use crate::world::state::GROUND_TRANSITION_DEPTH;
 use crate::world::tree::{slot_index, NODE_VOXELS_PER_AXIS};
 use crate::world::view::{
-    bevy_from_position, cell_size_at_layer, position_to_leaf_coord,
+    bevy_from_position, cell_size_at_layer, norm_for_layer, position_to_leaf_coord,
     scale_for_layer, target_layer_for, WorldAnchor,
 };
 use crate::world::{CameraZoom, WorldPosition, WorldState};
@@ -105,8 +105,8 @@ pub fn spawn_position() -> Position {
 pub fn spawn_anchor() -> WorldAnchor {
     WorldAnchor {
         leaf_coord: position_to_leaf_coord(&spawn_position()),
-        // Start at leaf layer (MAX_LAYER), target = MAX_LAYER, norm = 1.0
-        norm: scale_for_layer(target_layer_for(crate::world::tree::MAX_LAYER)),
+        // Start at leaf layer (MAX_LAYER), norm = scale_for_layer(MAX_LAYER) = 1.0
+        norm: norm_for_layer(crate::world::tree::MAX_LAYER),
     }
 }
 
@@ -228,10 +228,10 @@ pub fn sync_anchor_to_player(
     if let Ok(pos) = player_q.single() {
         anchor.leaf_coord = position_to_leaf_coord(&pos.0);
     }
-    // Keep the normalization divisor in sync with the target layer
-    // so Bevy-space coordinates stay bounded.
-    let target = target_layer_for(zoom.layer);
-    anchor.norm = scale_for_layer(target);
+    // Normalize by (view + 1), not the target layer, so Bevy-space
+    // coordinates stay bounded (~800 units) regardless of DETAIL_DEPTH.
+    // Entity scale compensates: scale = scale_for_layer(target) / norm.
+    anchor.norm = norm_for_layer(zoom.layer);
 }
 
 /// Derive every entity's `Transform.translation` from its

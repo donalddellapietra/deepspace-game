@@ -1,7 +1,7 @@
 //! Uniform-layer tree-walk renderer.
 //!
 //! Every frame, walk the content-addressed tree from the root down to
-//! `CameraZoom.layer + 2` (the target layer — see
+//! `CameraZoom.layer + DETAIL_DEPTH` (the target layer — see
 //! `view::target_layer_for`) and emit one Bevy entity per surviving
 //! node at that layer. Entities are reused across frames via
 //! `RenderState`, and meshes are baked lazily into a `NodeId`-keyed
@@ -27,17 +27,19 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 use crate::block::Palette;
+use std::collections::HashMap as StdHashMap;
 use crate::model::mesher::{
-    bake_volume, bake_child_faces, merge_child_faces,
-    flatten_children, ChildClass, ChildFaces,
+    bake_volume, bake_child_faces, merge_child_faces, merge_child_faces_raw,
+    flatten_children, compose_children_meshes, build_sub_meshes,
+    ChildClass, ChildFaces, FaceData,
 };
 use crate::model::BakedSubMesh;
 
 use super::state::WorldState;
 use super::tree::{
     slot_coords, slot_index, voxel_idx, NodeId,
-    BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
-    NODE_VOXELS_PER_AXIS,
+    BRANCH_FACTOR, CHILDREN_PER_NODE, DETAIL_DEPTH, EMPTY_NODE, EMPTY_VOXEL,
+    MAX_LAYER, NODE_VOXELS_PER_AXIS,
 };
 use super::view::{
     cell_size_at_layer, extent_for_layer, scale_for_layer, target_layer_for,
@@ -108,10 +110,6 @@ impl CameraZoom {
 /// with zoom: you see the same number of cells out to the horizon
 /// whether you're at the leaves or zoomed all the way out, matching
 /// the 2D prototype's "viewport counts cells, not pixels" behaviour.
-///
-/// At view layer `L`, one visible cell is one target-layer node
-/// (target = `(L + 2).min(MAX_LAYER)`), so N cells of radius emit at
-/// most roughly `(2N)^3` target-layer nodes — keep modest.
 pub const RADIUS_VIEW_CELLS: f32 = 32.0;
 
 // ----------------------------------------------------------------- state
@@ -135,6 +133,11 @@ pub struct RenderState {
     /// GPU meshes so edits can incrementally re-bake only the dirty
     /// children instead of the full 125³ grid.
     baked: HashMap<NodeId, BakedNode>,
+    /// Pre-baked mesh data for composition children, keyed by `NodeId`.
+    /// Each entry holds per-voxel-type `FaceData` (pre-GPU vertex
+    /// buffers). These are shared across parent entities via
+    /// content-addressed dedup.
+    pre_baked: StdHashMap<NodeId, StdHashMap<u8, FaceData>>,
     /// Per-path tracking: remembers which `NodeId` each path last
     /// displayed. Used to find the old `BakedNode` for incremental
     /// diff when an edit changes the NodeId at a path.
@@ -404,6 +407,138 @@ fn bake_leaf(world: &WorldState, node_id: NodeId, meshes: &mut Assets<Mesh>) -> 
     )
 }
 
+// ---------------------------------------------------------- composition
+
+/// Pre-bake a child node into raw `FaceData` per voxel type. Same
+/// pipeline as `BakedNode::new_cold` but stops before GPU upload:
+/// flatten children into 125³, greedy mesh, merge to `FaceData`.
+fn pre_bake_child(world: &WorldState, node_id: NodeId) -> StdHashMap<u8, FaceData> {
+    let node = world.library.get(node_id).expect("pre_bake: node missing");
+    let Some(children) = node.children.as_ref() else {
+        // Leaf node: bake its 25³ grid to FaceData directly.
+        let voxels = node.voxels.clone();
+        let faces = crate::model::mesher::bake_faces_raw(
+            NODE_VOXELS_PER_AXIS as i32,
+            &move |x, y, z| {
+                if x < 0 || y < 0 || z < 0
+                    || x >= NODE_VOXELS_PER_AXIS as i32
+                    || y >= NODE_VOXELS_PER_AXIS as i32
+                    || z >= NODE_VOXELS_PER_AXIS as i32
+                { return None; }
+                let v = voxels[voxel_idx(x as usize, y as usize, z as usize)];
+                if v == EMPTY_VOXEL { None } else { Some(v) }
+            },
+        );
+        return faces;
+    };
+    let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
+    let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
+        .map(|slot| classify_child(world, child_ids[slot]))
+        .collect();
+    let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
+        .map(|slot| {
+            if child_ids[slot] == EMPTY_NODE { None }
+            else { Some(world.library.get(child_ids[slot])
+                .expect("pre_bake: child missing").voxels.as_ref().as_slice()) }
+        })
+        .collect();
+    let flat_grid = flatten_children(
+        &children_voxels, &child_class,
+        BRANCH_FACTOR, NODE_VOXELS_PER_AXIS, EMPTY_VOXEL,
+    );
+    let child_faces = bake_all_children(&flat_grid, &child_ids, &child_class);
+    merge_child_faces_raw(&child_faces)
+}
+
+/// Compose a node's mesh by concatenating its 125 pre-baked
+/// children's meshes with position offsets. Each child's mesh
+/// covers [0, 125); the composed result covers [0, 625).
+fn compose_node(
+    world: &WorldState,
+    node_id: NodeId,
+    pre_baked: &mut StdHashMap<NodeId, StdHashMap<u8, FaceData>>,
+    meshes: &mut Assets<Mesh>,
+) -> Vec<BakedSubMesh> {
+    let node = world.library.get(node_id).expect("compose: node missing");
+    let children = node.children.as_ref().expect("compose: expected non-leaf");
+    let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
+
+    // Classify children at the parent's level (using their 25³
+    // downsampled grids). Interior-uniform children — those completely
+    // surrounded by same-material siblings — are skipped because
+    // their outer faces are fully occluded.
+    let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
+        .map(|slot| classify_child(world, child_ids[slot]))
+        .collect();
+
+    // Pre-bake only children that will contribute visible faces.
+    for slot in 0..CHILDREN_PER_NODE {
+        let child_id = child_ids[slot];
+        if child_id == EMPTY_NODE { continue; }
+        match child_class[slot] {
+            ChildClass::Empty => continue,
+            ChildClass::Uniform(v) if v == EMPTY_VOXEL => continue,
+            ChildClass::Uniform(v) if is_interior_uniform(slot, v, &child_class) => continue,
+            _ => {}
+        }
+        if pre_baked.contains_key(&child_id) { continue; }
+        let faces = pre_bake_child(world, child_id);
+        pre_baked.insert(child_id, faces);
+    }
+
+    // Collect references for composition, skipping interior children.
+    let children_faces: Vec<Option<&StdHashMap<u8, FaceData>>> = (0..CHILDREN_PER_NODE)
+        .map(|slot| {
+            let child_id = child_ids[slot];
+            if child_id == EMPTY_NODE { return None; }
+            match child_class[slot] {
+                ChildClass::Empty => None,
+                ChildClass::Uniform(v) if v == EMPTY_VOXEL => None,
+                ChildClass::Uniform(v) if is_interior_uniform(slot, v, &child_class) => None,
+                _ => pre_baked.get(&child_id),
+            }
+        })
+        .collect();
+
+    // Build cull mask: for each pair of adjacent uniform-solid children
+    // with the same material, mark their shared face for culling.
+    // This eliminates ~95% of underground boundary face waste.
+    // Face indices: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
+    let mut cull_masks = [[false; 6]; CHILDREN_PER_NODE];
+    for slot in 0..CHILDREN_PER_NODE {
+        let (sx, sy, sz) = slot_coords(slot);
+        // Check +X, +Y, +Z neighbors (avoids double-processing).
+        for &(axis_pos, axis_neg, nx, ny, nz) in &[
+            (0usize, 1usize, sx + 1, sy, sz),
+            (2, 3, sx, sy + 1, sz),
+            (4, 5, sx, sy, sz + 1),
+        ] {
+            if nx >= BRANCH_FACTOR || ny >= BRANCH_FACTOR || nz >= BRANCH_FACTOR {
+                continue;
+            }
+            let neighbor = slot_index(nx, ny, nz);
+            if let ChildClass::Uniform(va) = child_class[slot] {
+                if let ChildClass::Uniform(vb) = child_class[neighbor] {
+                    if va == vb && va != EMPTY_VOXEL {
+                        cull_masks[slot][axis_pos] = true;
+                        cull_masks[neighbor][axis_neg] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let child_mesh_size = BRANCH_FACTOR * NODE_VOXELS_PER_AXIS;
+    compose_children_meshes(
+        &children_faces,
+        &cull_masks,
+        CHILDREN_PER_NODE,
+        BRANCH_FACTOR,
+        child_mesh_size,
+        meshes,
+    )
+}
+
 // ------------------------------------------------------------- tree walk
 
 /// One "visit" the tree walk wants the reconciler to spawn/update.
@@ -436,7 +571,7 @@ struct WalkFrame {
 fn walk(
     world: &WorldState,
     emit_layer: u8,
-    target_layer: u8,
+    entity_scale: f32,
     camera_pos: Vec3,
     radius_bevy: f32,
     anchor: &WorldAnchor,
@@ -448,9 +583,6 @@ fn walk(
     if world.root == EMPTY_NODE {
         return;
     }
-    // Precomputed child extents in leaves, indexed by the child's
-    // layer number (layer 1 = root's direct children, layer MAX = leaves).
-    // Root leaf-extent is `25 * 5^MAX_LAYER`; each descent divides by 5.
     let mut child_extent_leaves: [i64; MAX_LAYER as usize + 1] =
         [0; MAX_LAYER as usize + 1];
     {
@@ -473,9 +605,6 @@ fn walk(
 
     while let Some(frame) = stack.pop() {
         let WalkFrame { node_id, path, origin_leaves, depth } = frame;
-        // Bevy-space origin of this node: delta from the anchor, in
-        // leaves, cast to `f32`. For nodes near the player the delta
-        // is small and `f32` is essentially exact.
         let n = anchor.norm;
         let origin_bevy = Vec3::new(
             (origin_leaves[0] - anchor.leaf_coord[0]) as f32 / n,
@@ -486,11 +615,6 @@ fn walk(
         let aabb_min = origin_bevy;
         let aabb_max = origin_bevy + Vec3::splat(extent);
 
-        // Per-axis "distance from camera to AABB": 0 if inside,
-        // otherwise the gap to the nearest face. L2 norm of the three
-        // gaps is the minimum distance from the camera point to the
-        // AABB. Much more accurate than a centre-based sphere test
-        // when the AABB is very large and contains the camera.
         let dx = (aabb_min.x - camera_pos.x)
             .max(0.0)
             .max(camera_pos.x - aabb_max.x);
@@ -505,28 +629,27 @@ fn walk(
             continue;
         }
 
-        // Reached the emit layer → emit.
+        // Reached emit layer → emit.
         if depth == emit_layer {
             out.push(Visit {
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: 1.0,
+                scale: entity_scale,
             });
             continue;
         }
 
         // Descend into children. If this node is already a leaf
         // (no children) we can't go deeper — emit it at its actual
-        // layer instead. This shouldn't happen in a fully-materialised
-        // grassland world but is safe.
+        // layer instead.
         let Some(node) = world.library.get(node_id) else { continue };
         let Some(children) = node.children.as_ref() else {
             out.push(Visit {
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: 1.0,
+                scale: entity_scale,
             });
             continue;
         };
@@ -579,18 +702,25 @@ pub fn render_world(
     let render_total_start = bevy::platform::time::Instant::now();
 
     let target_layer = target_layer_for(zoom.layer);
-    let emit_layer = target_layer.saturating_sub(1);
+    // Composition: emit at target-2 (entity composes pre-baked child
+    // meshes for full DETAIL_DEPTH detail). Falls back to target-1
+    // when the tree isn't deep enough for composition.
+    let use_composition = zoom.layer + DETAIL_DEPTH <= MAX_LAYER;
+    let emit_layer = if use_composition {
+        target_layer.saturating_sub(2)
+    } else {
+        target_layer.saturating_sub(1)
+    };
 
-    // Render radius in Bevy units = N cells × Bevy-units-per-cell at
-    // the current view layer. This is what the 2D prototype does
-    // implicitly (its viewport is measured in cells); without it,
-    // zooming out collapses the visible world to a dot because the
-    // per-cell Bevy size grows by 5× per layer.
     let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
 
-    // If emit layer changed, first pass, or forced rebuild, drop everything.
+    // Entity scale: mesh coordinates are in target-layer voxels, but
+    // norm is based on (zoom+1). Scale converts mesh units to Bevy units.
+    let entity_scale = scale_for_layer(target_layer) / anchor.norm;
+
+    // If zoom changed, first pass, or forced rebuild, drop everything.
     if !render_state.initialised
-        || render_state.last_zoom_layer != emit_layer
+        || render_state.last_zoom_layer != zoom.layer
         || render_state.force_rebuild
     {
         render_state.force_rebuild = false;
@@ -602,7 +732,7 @@ pub fn render_world(
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
         render_state.baked.clear();
         render_state.path_node.clear();
-        render_state.last_zoom_layer = emit_layer;
+        render_state.last_zoom_layer = zoom.layer;
         render_state.initialised = true;
     }
 
@@ -614,7 +744,7 @@ pub fn render_world(
     walk(
         &world,
         emit_layer,
-        target_layer,
+        entity_scale,
         camera_pos,
         radius_bevy,
         &anchor,
@@ -625,28 +755,19 @@ pub fn render_world(
     timings.visit_count = visits.len();
 
     // Pre-bake: ensure every visited NodeId has a BakedNode.
-    // On edit, use the old BakedNode for incremental diff.
     {
         let bake_start = bevy::platform::time::Instant::now();
         for v in visits.iter() {
+            if render_state.baked.contains_key(&v.node_id) {
+                render_state.path_node.insert(v.path, v.node_id);
+                continue;
+            }
+
             let node = world.library.get(v.node_id)
                 .expect("render: node missing from library");
 
-            if node.children.is_some() {
-                if !render_state.baked.contains_key(&v.node_id) {
-                    let baked = if let Some(&old_nid) = render_state.path_node.get(&v.path) {
-                        if let Some(old_bake) = render_state.baked.get(&old_nid) {
-                            BakedNode::new_incremental(old_bake, &world, v.node_id, &mut meshes)
-                        } else {
-                            BakedNode::new_cold(&world, v.node_id, &mut meshes)
-                        }
-                    } else {
-                        BakedNode::new_cold(&world, v.node_id, &mut meshes)
-                    };
-                    render_state.baked.insert(v.node_id, baked);
-                }
-                render_state.path_node.insert(v.path, v.node_id);
-            } else if !render_state.baked.contains_key(&v.node_id) {
+            if node.children.is_none() {
+                // Leaf node.
                 let merged = bake_leaf(&world, v.node_id, &mut meshes);
                 render_state.baked.insert(v.node_id, BakedNode {
                     child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
@@ -655,7 +776,33 @@ pub fn render_world(
                     child_faces: Vec::new(),
                     merged,
                 });
+            } else if use_composition {
+                // Composition: compose from pre-baked children.
+                let merged = compose_node(
+                    &world, v.node_id,
+                    &mut render_state.pre_baked, &mut meshes,
+                );
+                render_state.baked.insert(v.node_id, BakedNode {
+                    child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
+                    child_class: Vec::new(),
+                    flat_grid: Vec::new(),
+                    child_faces: Vec::new(),
+                    merged,
+                });
+            } else {
+                // Fallback: single-level flatten.
+                let baked = if let Some(&old_nid) = render_state.path_node.get(&v.path) {
+                    if let Some(old_bake) = render_state.baked.get(&old_nid) {
+                        BakedNode::new_incremental(old_bake, &world, v.node_id, &mut meshes)
+                    } else {
+                        BakedNode::new_cold(&world, v.node_id, &mut meshes)
+                    }
+                } else {
+                    BakedNode::new_cold(&world, v.node_id, &mut meshes)
+                };
+                render_state.baked.insert(v.node_id, baked);
             }
+            render_state.path_node.insert(v.path, v.node_id);
         }
         timings.bake_us = bake_start.elapsed().as_micros() as u64;
     }
