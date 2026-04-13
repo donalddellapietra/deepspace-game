@@ -9,11 +9,12 @@ debug_import = []
 textures = []
 
 [dependencies]
-bevy = { version = "0.18", features = ["experimental_bevy_ui_widgets"] }
+bevy = { version = "0.18", features = ["experimental_bevy_ui_widgets", "webgpu"] }
 dot_vox = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fastnoise-lite = "1"
+bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tungstenite = "0.26"
@@ -26,6 +27,7 @@ objc2-app-kit = { version = "0.2", features = ["NSView", "NSResponder", "NSWindo
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 # Bevy is unusable in debug without this

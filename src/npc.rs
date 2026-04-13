@@ -22,10 +22,12 @@ use crate::block::{BslMaterial, Palette, PaletteEntry};
 use crate::camera::FpsCam;
 use crate::player::Player;
 use crate::world::collision;
+// NpcGpuData kept as resource for future compute pipeline use.
 use crate::world::overlay::{OverlayInstance, OverlayList, OverlayPart};
 use crate::world::tree::{
     voxel_idx, NodeId, Voxel, EMPTY_VOXEL, NODE_VOXELS, NODE_VOXELS_PER_AXIS,
 };
+use crate::world::position::Position;
 use crate::world::view::{bevy_from_position, cell_size_at_layer, position_from_bevy, WorldAnchor};
 use crate::world::{CameraZoom, WorldPosition, WorldState};
 
@@ -84,6 +86,12 @@ pub struct TreeBlueprint {
     pub name: String,
     pub parts: Vec<TreePart>,
     pub animations: HashMap<String, NpcAnimation>,
+}
+
+/// Multiple NPC blueprints for variety.
+#[derive(Resource, Default)]
+pub struct TreeBlueprints {
+    pub blueprints: Vec<TreeBlueprint>,
 }
 
 /// Convert a VoxelPart into a 25x25x25 leaf node in the library.
@@ -346,47 +354,91 @@ mod blueprint_json {
     }
 }
 
-// ====================================================== components
+// ====================================================== flat buffer
 
+/// Maximum number of body parts per NPC.
+const MAX_PARTS: usize = 8;
+
+/// Per-NPC state, stored in a flat buffer for cache-friendly iteration.
+/// No ECS overhead — just a struct in a Vec.
+pub struct NpcState {
+    pub position: Position,
+    pub velocity: Vec3,
+    pub heading: f32,
+    /// Raw countdown timer (no Timer overhead).
+    pub ai_timer: f32,
+    pub anim_time: f32,
+    /// Computed part transforms (rest_offset + animation).
+    pub part_transforms: [(Vec3, Quat); MAX_PARTS],
+    pub num_parts: u8,
+    /// Facing rotation (derived from heading).
+    pub rotation: Quat,
+    /// If Some, this NPC has an ECS entity for editor overrides.
+    pub handle_entity: Option<Entity>,
+    /// Index into TreeBlueprints for this NPC's type.
+    pub blueprint_idx: u8,
+    /// Whether this slot is alive.
+    pub alive: bool,
+}
+
+impl NpcState {
+    fn new(position: Position, heading: f32, num_parts: usize) -> Self {
+        Self {
+            position,
+            velocity: Vec3::ZERO,
+            heading,
+            blueprint_idx: 0,
+            ai_timer: 3.0, // Set by caller with seeded random
+            anim_time: 0.0,
+            part_transforms: [(Vec3::ZERO, Quat::IDENTITY); MAX_PARTS],
+            num_parts: num_parts.min(MAX_PARTS) as u8,
+            rotation: Quat::from_rotation_y(heading + PI),
+            handle_entity: None,
+            alive: true,
+        }
+    }
+}
+
+/// The flat buffer holding all NPC state. Systems iterate this directly.
+#[derive(Resource, Default)]
+pub struct NpcBuffer {
+    pub npcs: Vec<NpcState>,
+}
+
+impl NpcBuffer {
+    pub fn len(&self) -> usize {
+        self.npcs.len()
+    }
+}
+
+// ====================================================== components (minimal)
+
+/// Marker component on lightweight ECS entities that index into NpcBuffer.
+/// Only needed for NPCs that have been edited (NpcPartOverrides).
 #[derive(Component)]
 pub struct Npc;
 
+/// Index into NpcBuffer, stored on the ECS entity for editor access.
 #[derive(Component)]
-struct NpcVelocity(Vec3);
+pub struct NpcHandle(pub usize);
 
-#[derive(Component)]
-struct NpcAi {
-    heading: f32,
-    change_timer: Timer,
-}
-
-#[derive(Component)]
-struct NpcAnimState {
-    current_anim: String,
-    time: f32,
-}
-
-/// Per-instance part overrides for edited NPCs. When a voxel on an
-/// NPC is edited, the affected part gets a new NodeId stored here
-/// (clone-on-write). Unedited parts fall back to the blueprint's NodeId.
+/// Per-instance part overrides for edited NPCs.
 #[derive(Component, Default)]
 pub struct NpcPartOverrides {
     pub overrides: HashMap<usize, NodeId>,
-}
-
-/// Per-frame computed part transforms, written by `npc_animate`,
-/// read by `collect_overlays`. Each entry is `(offset, rotation)`
-/// indexed by part index.
-#[derive(Component)]
-pub struct NpcPartTransforms {
-    pub transforms: Vec<(Vec3, Quat)>,
 }
 
 // ========================================================= constants
 
 const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
-const MASS_SPAWN_COUNT: usize = 1000;
+const MASS_SPAWN_COUNT: usize = 10_000;
+
+/// Frame counter for staggering animation updates.
+#[derive(Resource, Default)]
+struct NpcFrameCounter(u32);
+
+const NPC_UPDATE_STAGGER: u32 = 4;
 
 // ============================================================ plugin
 
@@ -394,20 +446,25 @@ pub struct NpcPlugin;
 
 impl Plugin for NpcPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            (
-                try_load_blueprint,
-                spawn_npc_on_keypress,
-                npc_ai,
-                npc_animate,
-                npc_physics,
-                npc_despawn_on_zoom,
-                collect_overlays
-                    .after(npc_animate)
-                    .after(crate::player::derive_transforms),
-            ),
-        );
+        app.init_resource::<NpcFrameCounter>()
+            .init_resource::<NpcBuffer>()
+            .add_systems(
+                Update,
+                (
+                    try_load_blueprint,
+                    spawn_npc_on_keypress,
+                    js_spawn_bridge,
+                    npc_buf_ai,
+                    npc_buf_animate,
+                    npc_buf_physics,
+                    manage_npc_handles,
+                    npc_despawn_on_zoom,
+                    // sync_gpu_uniforms removed — compute pipeline not active
+                    collect_overlays_from_buffer
+                        .after(npc_buf_animate)
+                        .after(crate::player::derive_transforms),
+                ),
+            );
     }
 }
 
@@ -464,11 +521,24 @@ fn try_load_blueprint(
         }
     }
 
-    // Fallback: procedural humanoid
-    info!("Using fallback procedural humanoid blueprint");
-    let bp = build_humanoid_blueprint();
-    let tree_bp = blueprint_to_tree(&bp, &mut world);
-    commands.insert_resource(tree_bp);
+    // Build all procedural blueprints.
+    let blueprints = vec![
+        build_humanoid_blueprint(),
+        build_critter_blueprint(),
+        build_golem_blueprint(),
+    ];
+
+    let mut tree_blueprints = TreeBlueprints::default();
+    for bp in &blueprints {
+        info!("Built NPC blueprint '{}': {} parts", bp.name, bp.parts.len());
+        tree_blueprints.blueprints.push(blueprint_to_tree(bp, &mut world));
+    }
+
+    // First blueprint is the default (for backward compat).
+    if let Some(first) = tree_blueprints.blueprints.first() {
+        commands.insert_resource(first.clone());
+    }
+    commands.insert_resource(tree_blueprints);
 }
 
 // ======================================== default humanoid blueprint
@@ -608,14 +678,188 @@ fn build_humanoid_blueprint() -> NpcBlueprint {
     }
 }
 
+fn build_critter_blueprint() -> NpcBlueprint {
+    let body: Voxel = 3; // wood brown
+    let eye: Voxel = 1;  // stone grey
+
+    let body_part = {
+        let (sx, sy, sz) = (3u8, 2, 4);
+        let mut v = vec![EMPTY_VOXEL; (sx as usize) * (sy as usize) * (sz as usize)];
+        let idx = |x: usize, y: usize, z: usize| (z * sy as usize + y) * sx as usize + x;
+        for z in 0..sz as usize {
+            for y in 0..sy as usize {
+                for x in 0..sx as usize {
+                    v[idx(x, y, z)] = body;
+                }
+            }
+        }
+        // Eyes on front face
+        v[idx(0, 1, 0)] = eye;
+        v[idx(2, 1, 0)] = eye;
+        VoxelPart {
+            name: "body".into(),
+            size: [sx, sy, sz],
+            voxels: v,
+            pivot: Vec3::new(1.5, 1.0, 2.0),
+            rest_offset: Vec3::new(-1.5, 2.0, -2.0),
+        }
+    };
+
+    let make_leg = |name: &str, offset: Vec3| {
+        let (sx, sy, sz) = (1u8, 2, 1);
+        let mut v = vec![body; (sx as usize) * (sy as usize) * (sz as usize)];
+        VoxelPart {
+            name: name.into(),
+            size: [sx, sy, sz],
+            voxels: v,
+            pivot: Vec3::new(0.5, 2.0, 0.5),
+            rest_offset: offset,
+        }
+    };
+
+    let leg_fl = make_leg("leg_fl", Vec3::new(-1.5, 0.0, -2.0));
+    let leg_fr = make_leg("leg_fr", Vec3::new(0.5, 0.0, -2.0));
+    let leg_bl = make_leg("leg_bl", Vec3::new(-1.5, 0.0, 1.0));
+    let leg_br = make_leg("leg_br", Vec3::new(0.5, 0.0, 1.0));
+
+    let mut animations = HashMap::new();
+    let swing = 0.35;
+    animations.insert(
+        "walk".into(),
+        NpcAnimation {
+            keyframes: vec![
+                NpcPose {
+                    parts: HashMap::from([
+                        ("leg_fl".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                        ("leg_br".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                        ("leg_fr".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                        ("leg_bl".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                    ]),
+                },
+                NpcPose { parts: HashMap::new() },
+                NpcPose {
+                    parts: HashMap::from([
+                        ("leg_fl".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                        ("leg_br".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                        ("leg_fr".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                        ("leg_bl".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                    ]),
+                },
+                NpcPose { parts: HashMap::new() },
+            ],
+            frame_duration: 0.15,
+            looping: true,
+        },
+    );
+
+    NpcBlueprint {
+        name: "critter".into(),
+        parts: vec![body_part, leg_fl, leg_fr, leg_bl, leg_br],
+        animations,
+    }
+}
+
+fn build_golem_blueprint() -> NpcBlueprint {
+    let stone: Voxel = 1;  // stone grey
+    let moss: Voxel = 5;   // leaf green
+    let glow: Voxel = 7;   // blue
+
+    let head = {
+        let (sx, sy, sz) = (3u8, 3, 3);
+        let mut v = vec![stone; (sx as usize) * (sy as usize) * (sz as usize)];
+        let idx = |x: usize, y: usize, z: usize| (z * sy as usize + y) * sx as usize + x;
+        v[idx(0, 2, 0)] = glow;
+        v[idx(2, 2, 0)] = glow;
+        VoxelPart {
+            name: "head".into(),
+            size: [sx, sy, sz],
+            voxels: v,
+            pivot: Vec3::new(1.5, 0.0, 1.5),
+            rest_offset: Vec3::new(-1.5, 15.0, -1.5),
+        }
+    };
+
+    let torso = {
+        let (sx, sy, sz) = (5u8, 7, 4);
+        let mut v = vec![stone; (sx as usize) * (sy as usize) * (sz as usize)];
+        let idx = |x: usize, y: usize, z: usize| (z * sy as usize + y) * sx as usize + x;
+        // Moss on top
+        for z in 0..sz as usize {
+            for x in 0..sx as usize {
+                v[idx(x, 6, z)] = moss;
+            }
+        }
+        VoxelPart {
+            name: "torso".into(),
+            size: [sx, sy, sz],
+            voxels: v,
+            pivot: Vec3::new(2.5, 3.5, 2.0),
+            rest_offset: Vec3::new(-2.5, 8.0, -2.0),
+        }
+    };
+
+    let make_limb = |name: &str, pivot: Vec3, offset: Vec3| {
+        let (sx, sy, sz) = (2u8, 6, 2);
+        let v = vec![stone; (sx as usize) * (sy as usize) * (sz as usize)];
+        VoxelPart {
+            name: name.into(),
+            size: [sx, sy, sz],
+            voxels: v,
+            pivot,
+            rest_offset: offset,
+        }
+    };
+
+    let arm_l = make_limb("arm_l", Vec3::new(1.0, 6.0, 1.0), Vec3::new(-4.5, 9.0, -1.0));
+    let arm_r = make_limb("arm_r", Vec3::new(1.0, 6.0, 1.0), Vec3::new(2.5, 9.0, -1.0));
+    let leg_l = make_limb("leg_l", Vec3::new(1.0, 6.0, 1.0), Vec3::new(-2.5, 2.0, -1.0));
+    let leg_r = make_limb("leg_r", Vec3::new(1.0, 6.0, 1.0), Vec3::new(0.5, 2.0, -1.0));
+
+    let mut animations = HashMap::new();
+    let swing = 0.25;
+    animations.insert(
+        "walk".into(),
+        NpcAnimation {
+            keyframes: vec![
+                NpcPose {
+                    parts: HashMap::from([
+                        ("leg_l".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                        ("leg_r".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                        ("arm_l".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                        ("arm_r".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                    ]),
+                },
+                NpcPose { parts: HashMap::new() },
+                NpcPose {
+                    parts: HashMap::from([
+                        ("leg_l".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                        ("leg_r".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                        ("arm_l".into(), (Vec3::ZERO, Quat::from_rotation_x(swing))),
+                        ("arm_r".into(), (Vec3::ZERO, Quat::from_rotation_x(-swing))),
+                    ]),
+                },
+                NpcPose { parts: HashMap::new() },
+            ],
+            frame_duration: 0.3,
+            looping: true,
+        },
+    );
+
+    NpcBlueprint {
+        name: "golem".into(),
+        parts: vec![head, torso, arm_l, arm_r, leg_l, leg_r],
+        animations,
+    }
+}
+
 // =========================================================== spawning
 
 fn spawn_npc_on_keypress(
-    mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
     tree_bp: Option<Res<TreeBlueprint>>,
+    blueprints: Option<Res<TreeBlueprints>>,
     player_q: Query<&WorldPosition, With<Player>>,
-    npc_count: Query<(), With<Npc>>,
+    mut npc_buffer: ResMut<NpcBuffer>,
     anchor: Res<WorldAnchor>,
     zoom: Res<CameraZoom>,
     cam_q: Query<&FpsCam>,
@@ -640,18 +884,18 @@ fn spawn_npc_on_keypress(
     };
 
     let player_bevy = bevy_from_position(&player_pos.0, &anchor);
+    let num_parts = tree_bp.parts.len();
+    let existing = npc_buffer.len();
 
-    // Initialize part transforms at rest pose (shared across all spawns).
-    let rest_transforms: Vec<(Vec3, Quat)> = tree_bp
-        .parts
-        .iter()
-        .map(|p| (p.rest_offset, Quat::IDENTITY))
-        .collect();
+    // Pre-compute rest pose transforms.
+    let mut rest_parts = [(Vec3::ZERO, Quat::IDENTITY); MAX_PARTS];
+    for (i, p) in tree_bp.parts.iter().enumerate().take(MAX_PARTS) {
+        rest_parts[i] = (p.rest_offset, Quat::IDENTITY);
+    }
 
-    let existing = npc_count.iter().count();
+    npc_buffer.npcs.reserve(count);
 
     for i in 0..count {
-        // Spread NPCs in a grid pattern around the player
         let (offset_x, offset_z) = if count > 1 {
             let grid_side = (count as f32).sqrt().ceil() as usize;
             let row = i / grid_side;
@@ -670,32 +914,37 @@ fn spawn_npc_on_keypress(
             continue;
         };
 
-        let spawn_bevy = bevy_from_position(&npc_pos, &anchor);
-        let heading = rand_heading_seeded(i as u32);
+        // Pick a random blueprint type for variety.
+        let num_types = blueprints.as_ref().map(|b| b.blueprints.len()).unwrap_or(1);
+        let bp_idx = if num_types > 1 {
+            (rand_f32_seeded(i as u32 + 3333) * num_types as f32) as u8 % num_types as u8
+        } else {
+            0
+        };
+        let bp_parts = blueprints
+            .as_ref()
+            .and_then(|b| b.blueprints.get(bp_idx as usize))
+            .map(|b| b.parts.len())
+            .unwrap_or(num_parts);
 
-        commands.spawn((
-            Npc,
-            WorldPosition(npc_pos),
-            NpcVelocity(Vec3::ZERO),
-            NpcAi {
-                heading,
-                change_timer: Timer::from_seconds(
-                    2.0 + rand_f32_seeded(i as u32 + 9999) * 3.0,
-                    TimerMode::Once,
-                ),
-            },
-            NpcAnimState {
-                current_anim: "walk".into(),
-                time: rand_f32_seeded(i as u32 + 5555) * 2.0,
-            },
-            NpcPartTransforms {
-                transforms: rest_transforms.clone(),
-            },
-            NpcPartOverrides::default(),
-            Transform::from_translation(spawn_bevy)
-                .with_rotation(Quat::from_rotation_y(heading + PI)),
-            Visibility::Visible,
-        ));
+        let heading = rand_heading_seeded(i as u32);
+        let mut npc = NpcState::new(npc_pos, heading, bp_parts);
+        npc.blueprint_idx = bp_idx;
+        npc.anim_time = rand_f32_seeded(i as u32 + 5555) * 2.0;
+        npc.ai_timer = 2.0 + rand_f32_seeded(i as u32 + 9999) * 3.0;
+
+        // Set rest pose from the selected blueprint.
+        if let Some(bps) = blueprints.as_ref() {
+            if let Some(bp) = bps.blueprints.get(bp_idx as usize) {
+                for (j, p) in bp.parts.iter().enumerate().take(MAX_PARTS) {
+                    npc.part_transforms[j] = (p.rest_offset, Quat::IDENTITY);
+                }
+            }
+        } else {
+            npc.part_transforms = rest_parts;
+        }
+
+        npc_buffer.npcs.push(npc);
     }
 
     info!(
@@ -704,31 +953,67 @@ fn spawn_npc_on_keypress(
     );
 }
 
-// =========================================================== animation
+// =========================================================== buffer systems
 
-fn npc_animate(
+fn npc_buf_ai(
     time: Res<Time>,
-    tree_bp: Option<Res<TreeBlueprint>>,
-    mut npc_q: Query<(&mut NpcAnimState, &mut NpcPartTransforms), With<Npc>>,
+    mut frame: ResMut<NpcFrameCounter>,
+    mut npc_buffer: ResMut<NpcBuffer>,
 ) {
-    let Some(tree_bp) = tree_bp else { return };
     let dt = time.delta_secs();
+    let fc = frame.0;
+    frame.0 = fc.wrapping_add(1);
 
-    for (mut anim_state, mut part_tf) in &mut npc_q {
-        anim_state.time += dt;
+    for (i, npc) in npc_buffer.npcs.iter_mut().enumerate() {
+        if !npc.alive { continue; }
 
-        let Some(anim) = tree_bp.animations.get(&anim_state.current_anim) else {
-            continue;
-        };
-        if anim.keyframes.is_empty() {
+        // Stagger timer: only 1/N per frame.
+        if (i as u32) % NPC_UPDATE_STAGGER == fc % NPC_UPDATE_STAGGER {
+            npc.ai_timer -= dt * NPC_UPDATE_STAGGER as f32;
+            if npc.ai_timer <= 0.0 {
+                npc.heading = rand_f32_seeded(fc.wrapping_mul(1000).wrapping_add(i as u32)) * TAU;
+                npc.ai_timer = 2.0 + rand_f32_seeded(fc.wrapping_add(i as u32 + 7777)) * 3.0;
+            }
+        }
+
+        // Velocity and rotation: always update (cheap).
+        let speed = NPC_WALK_SPEED_CELLS;
+        npc.velocity.x = -npc.heading.sin() * speed;
+        npc.velocity.z = -npc.heading.cos() * speed;
+        npc.rotation = Quat::from_rotation_y(npc.heading + PI);
+    }
+}
+
+fn npc_buf_animate(
+    time: Res<Time>,
+    frame: Res<NpcFrameCounter>,
+    blueprints: Option<Res<TreeBlueprints>>,
+    mut npc_buffer: ResMut<NpcBuffer>,
+) {
+    let Some(blueprints) = blueprints else { return };
+    if blueprints.blueprints.is_empty() { return; }
+    let dt = time.delta_secs();
+    let fc = frame.0;
+
+    for (i, npc) in npc_buffer.npcs.iter_mut().enumerate() {
+        if !npc.alive { continue; }
+
+        npc.anim_time += dt;
+
+        if (i as u32) % NPC_UPDATE_STAGGER != fc % NPC_UPDATE_STAGGER {
             continue;
         }
 
+        let bp = &blueprints.blueprints[npc.blueprint_idx as usize % blueprints.blueprints.len()];
+        let Some(anim) = bp.animations.get("walk") else { continue };
+        if anim.keyframes.is_empty() || anim.frame_duration <= 0.0 { continue; }
         let total_duration = anim.keyframes.len() as f32 * anim.frame_duration;
+        if total_duration <= 0.0 { continue; }
+
         let t = if anim.looping {
-            anim_state.time % total_duration
+            npc.anim_time % total_duration
         } else {
-            anim_state.time.min(total_duration - 0.001)
+            npc.anim_time.min(total_duration - 0.001)
         };
 
         let frame_f = t / anim.frame_duration;
@@ -739,11 +1024,7 @@ fn npc_animate(
         let pose_a = &anim.keyframes[frame_a];
         let pose_b = &anim.keyframes[frame_b];
 
-        for (i, part) in tree_bp.parts.iter().enumerate() {
-            if i >= part_tf.transforms.len() {
-                break;
-            }
-
+        for (j, part) in bp.parts.iter().enumerate().take(npc.num_parts as usize) {
             let (pos_a, rot_a) = pose_a
                 .parts
                 .get(&part.name)
@@ -755,136 +1036,345 @@ fn npc_animate(
                 .cloned()
                 .unwrap_or((Vec3::ZERO, Quat::IDENTITY));
 
-            let pos = pos_a.lerp(pos_b, blend);
-            let rot = rot_a.slerp(rot_b, blend);
-
-            part_tf.transforms[i] = (part.rest_offset + pos, rot);
+            npc.part_transforms[j] = (
+                part.rest_offset + pos_a.lerp(pos_b, blend),
+                rot_a.slerp(rot_b, blend),
+            );
         }
     }
 }
 
-// ================================================================= AI
-
-fn npc_ai(
-    time: Res<Time>,
-    mut q: Query<
-        (&mut NpcAi, &mut NpcVelocity, &mut Transform, &mut NpcAnimState),
-        With<Npc>,
-    >,
-) {
-    for (mut ai, mut vel, mut tf, mut anim) in &mut q {
-        ai.change_timer.tick(time.delta());
-
-        if ai.change_timer.just_finished() {
-            ai.heading = rand_heading();
-            ai.change_timer = Timer::from_seconds(2.0 + rand_f32() * 3.0, TimerMode::Once);
-        }
-
-        let speed = NPC_WALK_SPEED_CELLS;
-        vel.0.x = -ai.heading.sin() * speed;
-        vel.0.z = -ai.heading.cos() * speed;
-        tf.rotation = Quat::from_rotation_y(ai.heading + PI);
-        anim.current_anim = "walk".into();
-    }
-}
-
-// ============================================================= physics
-
-fn npc_physics(
+/// Hybrid collision: heightmap for ground Y + block checks for walls.
+/// - Ground Y: O(1) from pre-computed heightmap
+/// - Walls: check if destination block at feet/chest height is solid
+/// - Step-up: if destination block is <= 1 cell above feet, step up
+/// - Holes: NPCs fall and stay (heightmap gives correct low Y)
+fn npc_buf_physics(
     time: Res<Time>,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
-    mut q: Query<(&mut WorldPosition, &mut NpcVelocity), With<Npc>>,
+    anchor: Res<WorldAnchor>,
+    heightmap: Res<crate::world::heightmap::GroundHeightmap>,
+    mut npc_buffer: ResMut<NpcBuffer>,
 ) {
     let dt = time.delta_secs();
-    let cell = cell_size_at_layer(zoom.layer);
+    let cell = anchor.cell_bevy(zoom.layer);
+    let max_step = cell * 0.6; // Can step up ~half a cell (like Minecraft)
+    let target_layer = crate::world::view::target_layer_for(zoom.layer);
 
-    for (mut wpos, mut vel) in &mut q {
-        vel.0.y -= NPC_GRAVITY_CELLS * cell * dt;
-        let h_delta = bevy::math::Vec2::new(vel.0.x * cell * dt, vel.0.z * cell * dt);
-        collision::move_and_collide(&mut wpos.0, &mut vel.0, h_delta, dt, &world, zoom.layer);
+    for npc in &mut npc_buffer.npcs {
+        if !npc.alive { continue; }
+
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        let feet_y = bevy_pos.y;
+
+        // --- Horizontal movement with wall check ---
+        let want_x = bevy_pos.x + npc.velocity.x * cell * dt;
+        let want_z = bevy_pos.z + npc.velocity.z * cell * dt;
+
+        // Check if the destination has a solid block at feet or chest height.
+        // Only check when crossing a cell boundary (saves tree walks).
+        let cur_cx = (bevy_pos.x * anchor.norm / cell_size_at_layer(zoom.layer)).floor() as i32;
+        let cur_cz = (bevy_pos.z * anchor.norm / cell_size_at_layer(zoom.layer)).floor() as i32;
+        let new_cx = (want_x * anchor.norm / cell_size_at_layer(zoom.layer)).floor() as i32;
+        let new_cz = (want_z * anchor.norm / cell_size_at_layer(zoom.layer)).floor() as i32;
+
+        let (final_x, final_z) = if cur_cx != new_cx || cur_cz != new_cz {
+            // Crossing a cell boundary — check for walls.
+            // Probe at feet level and one cell above feet.
+            let probe_feet = Vec3::new(want_x, feet_y + cell * 0.1, want_z);
+            let probe_chest = Vec3::new(want_x, feet_y + cell * 0.9, want_z);
+
+            let feet_solid = crate::world::view::layer_pos_from_bevy(
+                probe_feet, target_layer, &anchor,
+            ).is_some_and(|lp| crate::world::view::is_layer_pos_solid(&world, &lp));
+
+            let chest_solid = crate::world::view::layer_pos_from_bevy(
+                probe_chest, target_layer, &anchor,
+            ).is_some_and(|lp| crate::world::view::is_layer_pos_solid(&world, &lp));
+
+            if chest_solid {
+                // Wall at chest height — completely blocked.
+                npc.velocity.x = 0.0;
+                npc.velocity.z = 0.0;
+                npc.ai_timer = 0.0;
+                (bevy_pos.x, bevy_pos.z)
+            } else if feet_solid {
+                // Block at feet — check if we can step up.
+                let dest_ground = heightmap.ground_y(&anchor, want_x, want_z);
+                if dest_ground - feet_y > max_step {
+                    // Too high to step up.
+                    npc.velocity.x = 0.0;
+                    npc.velocity.z = 0.0;
+                    npc.ai_timer = 0.0;
+                    (bevy_pos.x, bevy_pos.z)
+                } else {
+                    // Can step up.
+                    (want_x, want_z)
+                }
+            } else {
+                // Path is clear.
+                (want_x, want_z)
+            }
+        } else {
+            // Same cell — no wall check needed.
+            (want_x, want_z)
+        };
+
+        // --- Vertical: gravity + heightmap ground clamp ---
+        let ground_y = heightmap.ground_y(&anchor, final_x, final_z);
+
+        npc.velocity.y -= NPC_GRAVITY_CELLS * cell * dt;
+        let new_y = bevy_pos.y + npc.velocity.y * dt;
+        let final_y = if new_y <= ground_y {
+            npc.velocity.y = 0.0;
+            ground_y
+        } else {
+            new_y
+        };
+
+        let new_bevy = Vec3::new(final_x, final_y, final_z);
+        if let Some(new_pos) = position_from_bevy(new_bevy, &anchor) {
+            npc.position = new_pos;
+        }
     }
 }
 
 // ====================================================== zoom despawn
 
-/// Despawn NPC entities entirely when 2+ layers out from leaf layer.
+/// Clear NPC buffer when zoomed 2+ layers out from leaf layer.
 fn npc_despawn_on_zoom(
-    mut commands: Commands,
     zoom: Res<CameraZoom>,
-    q: Query<Entity, With<Npc>>,
+    mut npc_buffer: ResMut<NpcBuffer>,
 ) {
     if !zoom.is_changed() {
         return;
     }
     let layers_out = crate::world::tree::MAX_LAYER.saturating_sub(zoom.layer);
     if layers_out >= 2 {
-        for entity in &q {
-            commands.entity(entity).despawn();
-        }
+        npc_buffer.npcs.clear();
     }
 }
 
-// ============================================== overlay collection
+// ============================================== overlay collection (buffer-based)
 
-/// Populate `OverlayList` each frame from visible NPCs. Scale is
-/// constant (leaf-layer based) — the NPC keeps its real-world size
-/// in Bevy space. When you zoom out, the visible world grows around
-/// it, so the NPC naturally appears smaller. That's real zoom.
-pub fn collect_overlays(
-    tree_bp: Option<Res<TreeBlueprint>>,
+/// Populate `OverlayList` from the flat NPC buffer.
+pub fn collect_overlays_from_buffer(
+    blueprints: Option<Res<TreeBlueprints>>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
-    npc_q: Query<
-        (Entity, &WorldPosition, &Transform, &NpcPartTransforms, Option<&NpcPartOverrides>),
-        With<Npc>,
-    >,
+    camera_q: Query<(&Transform, &FpsCam), With<Camera3d>>,
+    npc_buffer: Res<NpcBuffer>,
+    npc_overrides: Query<(&NpcHandle, &NpcPartOverrides)>,
     mut overlay_list: ResMut<OverlayList>,
 ) {
-    overlay_list.entries.clear();
+    overlay_list.clear_and_recycle();
 
-    let Some(tree_bp) = tree_bp else { return };
+    let Some(blueprints) = blueprints else { return };
+    if blueprints.blueprints.is_empty() { return; }
 
-    // NPCs live at the leaf layer. Skip rendering when 2+ layers out.
     let layers_out = crate::world::tree::MAX_LAYER.saturating_sub(zoom.layer);
     if layers_out >= 2 {
         return;
     }
 
-    // Leaf-layer scale: NPC is ~1.5 leaf voxels tall. This never
-    // changes with zoom — the NPC has a fixed real-world size.
-    let scale = tree_npc_scale(crate::world::tree::MAX_LAYER, &tree_bp, &anchor);
+    let (cam_pos, cam_forward) = if let Ok((cam_tf, cam)) = camera_q.single() {
+        let fwd = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+        (cam_tf.translation, fwd)
+    } else {
+        (Vec3::ZERO, Vec3::NEG_Z)
+    };
+    let cell = cell_size_at_layer(zoom.layer);
+    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    let view_radius_sq = view_radius * view_radius;
 
-    for (entity, world_pos, tf, part_tf, overrides) in &npc_q {
-        let bevy_pos = bevy_from_position(&world_pos.0, &anchor);
+    // Pre-compute scale per blueprint type.
+    let scales: Vec<f32> = blueprints.blueprints.iter()
+        .map(|bp| tree_npc_scale(crate::world::tree::MAX_LAYER, bp, &anchor))
+        .collect();
 
-        let parts: Vec<OverlayPart> = tree_bp
-            .parts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tp)| {
-                let (offset, rotation) = part_tf.transforms.get(i)?;
-                let node_id = overrides
-                    .and_then(|o| o.overrides.get(&i).copied())
-                    .unwrap_or(tp.node_id);
-                Some(OverlayPart {
-                    node_id,
-                    offset: *offset,
-                    rotation: *rotation,
-                    pivot: tp.pivot,
-                })
-            })
-            .collect();
+    let mut override_map: HashMap<usize, &NpcPartOverrides> = HashMap::new();
+    for (handle, overrides) in &npc_overrides {
+        if !overrides.overrides.is_empty() {
+            override_map.insert(handle.0, overrides);
+        }
+    }
+
+    for (idx, npc) in npc_buffer.npcs.iter().enumerate() {
+        if !npc.alive { continue; }
+
+        let bp_idx = npc.blueprint_idx as usize % blueprints.blueprints.len();
+        let bp = &blueprints.blueprints[bp_idx];
+        let scale = scales[bp_idx];
+
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+
+        let to_npc = bevy_pos - cam_pos;
+        if to_npc.length_squared() > view_radius_sq {
+            continue;
+        }
+        let forward_dot = to_npc.x * cam_forward.x + to_npc.z * cam_forward.z;
+        if forward_dot < -view_radius * 0.3 {
+            continue;
+        }
+
+        let overrides = override_map.get(&idx);
+
+        let mut parts = overlay_list.pop_spare_parts();
+        parts.clear();
+        for (i, tp) in bp.parts.iter().enumerate().take(npc.num_parts as usize) {
+            let (offset, rotation) = npc.part_transforms[i];
+            let node_id = overrides
+                .and_then(|o| o.overrides.get(&i).copied())
+                .unwrap_or(tp.node_id);
+            parts.push(OverlayPart {
+                node_id,
+                offset,
+                rotation,
+                pivot: tp.pivot,
+            });
+        }
+
+        // Use the handle entity if available (for editing), otherwise placeholder.
+        let overlay_entity = npc.handle_entity.unwrap_or(Entity::PLACEHOLDER);
 
         overlay_list.entries.push(OverlayInstance {
-            id: entity,
+            id: overlay_entity,
             parts,
             bevy_pos,
-            rotation: tf.rotation,
+            rotation: npc.rotation,
             scale,
         });
     }
 }
+
+// ============================================== GPU sync
+
+/// Sync NPC buffer state to GPU data each frame.
+// ============================================== NPC handle entities for editing
+
+/// Maximum distance from player for NPC editing (bevy units).
+const EDIT_RANGE: f32 = 20.0;
+
+/// System that creates/destroys lightweight ECS handle entities
+/// for NPCs near the player, enabling per-NPC voxel editing.
+fn manage_npc_handles(
+    mut commands: Commands,
+    mut npc_buffer: ResMut<NpcBuffer>,
+    anchor: Res<WorldAnchor>,
+    player_q: Query<&Transform, With<Player>>,
+    existing_handles: Query<(Entity, &NpcHandle)>,
+) {
+    let Ok(player_tf) = player_q.single() else { return };
+    let player_pos = player_tf.translation;
+
+    // Despawn handles for NPCs that moved out of range or died.
+    for (entity, handle) in &existing_handles {
+        let idx = handle.0;
+        let in_range = npc_buffer.npcs.get(idx).is_some_and(|npc| {
+            if !npc.alive { return false; }
+            let bp = bevy_from_position(&npc.position, &anchor);
+            bp.distance_squared(player_pos) <= EDIT_RANGE * EDIT_RANGE * 4.0
+        });
+        if !in_range {
+            commands.entity(entity).despawn();
+            if let Some(npc) = npc_buffer.npcs.get_mut(idx) {
+                npc.handle_entity = None;
+            }
+        }
+    }
+
+    // Create handles for nearby NPCs that don't have one.
+    for (idx, npc) in npc_buffer.npcs.iter_mut().enumerate() {
+        if !npc.alive || npc.handle_entity.is_some() { continue; }
+
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        if bevy_pos.distance_squared(player_pos) > EDIT_RANGE * EDIT_RANGE {
+            continue;
+        }
+
+        let entity = commands.spawn((
+            Npc,
+            NpcHandle(idx),
+            NpcPartOverrides::default(),
+        )).id();
+        npc.handle_entity = Some(entity);
+    }
+}
+
+// ============================================== JS spawn bridge (WASM only)
+
+/// Check `window.__spawnNpcs` from JS each frame.
+#[cfg(target_arch = "wasm32")]
+fn js_spawn_bridge(
+    tree_bp: Option<Res<TreeBlueprint>>,
+    player_q: Query<&WorldPosition, With<Player>>,
+    mut npc_buffer: ResMut<NpcBuffer>,
+    anchor: Res<WorldAnchor>,
+    zoom: Res<CameraZoom>,
+    cam_q: Query<&FpsCam>,
+) {
+    // Call the __getAndResetSpawnCount function defined in index.html <head>.
+    let result = js_sys::eval("window.__getAndResetSpawnCount()");
+    let count = result
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as usize;
+    if count == 0 { return; }
+
+    let Some(tree_bp) = tree_bp else { return };
+    let Ok(player_pos) = player_q.single() else { return };
+
+    let cell = cell_size_at_layer(zoom.layer);
+    let forward = if let Ok(cam) = cam_q.single() {
+        Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos())
+    } else {
+        Vec3::NEG_Z
+    };
+    let player_bevy = bevy_from_position(&player_pos.0, &anchor);
+    let num_parts = tree_bp.parts.len();
+    let existing = npc_buffer.len();
+
+    let mut rest_parts = [(Vec3::ZERO, Quat::IDENTITY); MAX_PARTS];
+    for (i, p) in tree_bp.parts.iter().enumerate().take(MAX_PARTS) {
+        rest_parts[i] = (p.rest_offset, Quat::IDENTITY);
+    }
+
+    npc_buffer.npcs.reserve(count);
+
+    for i in 0..count {
+        let (offset_x, offset_z) = if count > 1 {
+            let grid_side = (count as f32).sqrt().ceil() as usize;
+            let row = i / grid_side;
+            let col = i % grid_side;
+            let spacing = 3.0 * cell;
+            let half = (grid_side as f32) * spacing / 2.0;
+            (col as f32 * spacing - half, row as f32 * spacing - half)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let npc_bevy = player_bevy
+            + forward * 5.0 * cell
+            + Vec3::new(offset_x, 1.0, offset_z);
+        let Some(npc_pos) = position_from_bevy(npc_bevy, &anchor) else {
+            continue;
+        };
+
+        let heading = rand_heading_seeded(i as u32);
+        let mut npc = NpcState::new(npc_pos, heading, num_parts);
+        npc.anim_time = rand_f32_seeded(i as u32 + 5555) * 2.0;
+        npc.ai_timer = 2.0 + rand_f32_seeded(i as u32 + 9999) * 3.0;
+        npc.part_transforms = rest_parts;
+
+        npc_buffer.npcs.push(npc);
+    }
+
+    info!("JS bridge: spawned {} NPCs (buffer len now {})", count, npc_buffer.npcs.len());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_spawn_bridge() {}
 
 // ============================================== NPC voxel editing
 
@@ -947,10 +1437,6 @@ fn rand_f32() -> f32 {
         let t = (js_sys::Date::now() * 1000.0) as u64;
         ((t % 10000) as f32) / 10000.0
     }
-}
-
-fn rand_heading() -> f32 {
-    rand_f32() * TAU
 }
 
 /// Deterministic pseudo-random f32 in [0, 1) from a seed.

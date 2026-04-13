@@ -148,8 +148,10 @@ pub struct RenderState {
     initialised: bool,
     /// Set to true to force a full entity rebuild on the next frame.
     pub force_rebuild: bool,
-    /// Overlay (NPC) entity tracking and mesh cache.
+    /// Overlay (NPC) entity tracking and mesh cache (legacy).
     pub overlay: super::overlay::OverlayState,
+    /// GPU-instanced NPC overlay state.
+    pub instanced_overlay: super::instanced_overlay::InstancedOverlayState,
     /// Reusable DFS stack for `walk()`. Stashed here so we don't
     /// reallocate a `Vec` every frame. Cleared at the start of each
     /// `walk()` call.
@@ -729,14 +731,14 @@ pub fn render_world(
     }
     render_state.entities = alive;
 
-    // Overlay reconcile (NPCs and other overlay subtrees).
-    super::overlay::reconcile_overlays(
+    // GPU-instanced overlay reconcile (NPCs).
+    super::instanced_overlay::reconcile_instanced(
         &mut commands,
         &world,
         &palette,
         &mut meshes,
         &overlay_list,
-        &mut render_state.overlay,
+        &mut render_state.instanced_overlay,
     );
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;

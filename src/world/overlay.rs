@@ -48,6 +48,19 @@ pub struct OverlayInstance {
 #[derive(Resource, Default)]
 pub struct OverlayList {
     pub entries: Vec<OverlayInstance>,
+    spare_parts: Vec<Vec<OverlayPart>>,
+}
+
+impl OverlayList {
+    pub fn clear_and_recycle(&mut self) {
+        for entry in self.entries.drain(..) {
+            self.spare_parts.push(entry.parts);
+        }
+    }
+
+    pub fn pop_spare_parts(&mut self) -> Vec<OverlayPart> {
+        self.spare_parts.pop().unwrap_or_default()
+    }
 }
 
 // ------------------------------------------------------ state

@@ -17,6 +17,9 @@
 pub mod collision;
 pub mod edit;
 pub mod generator;
+pub mod heightmap;
+pub mod instanced_overlay;
+pub mod npc_compute;
 pub mod overlay;
 pub mod position;
 pub mod render;
@@ -74,11 +77,15 @@ impl Plugin for WorldPlugin {
             // made in plugin `build`.
             .init_resource::<WorldAnchor>()
             .init_resource::<overlay::OverlayList>()
+            .init_resource::<heightmap::GroundHeightmap>()
             .add_systems(
                 Update,
-                render::render_world
-                    .after(crate::player::derive_transforms)
-                    .after(crate::npc::collect_overlays),
+                (
+                    heightmap::update_ground_heightmap,
+                    render::render_world
+                        .after(crate::player::derive_transforms)
+                        .after(crate::npc::collect_overlays_from_buffer),
+                ),
             );
     }
 }

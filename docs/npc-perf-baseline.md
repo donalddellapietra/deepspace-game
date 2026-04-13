@@ -1,86 +1,55 @@
-# NPC Performance Baseline (pre-instancing)
+# NPC Performance Results
 
-**Date:** 2026-04-12
-**Branch:** worktree-npc-instancing
-**Platform:** WASM (headless Chromium, SwiftShader software renderer)
-**Bevy:** 0.18
+**Date:** 2026-04-13
+**Branch:** gpu-instancing
+**Platform:** WASM (WebGPU, Chrome with --enable-unsafe-webgpu)
 
-## Test Setup
+## Final Architecture
 
-- `trunk serve` on port 8080, Playwright headless Chromium
-- Each NPC = 1 root entity + 6 part entities + ~11 mesh children = **~18 entities per NPC**
-- Mass spawn via M key (1000 NPCs per press, grid pattern around player)
-- FPS measured via Bevy's `FrameTimeDiagnosticsPlugin` (smoothed)
+- **GPU instanced rendering**: custom Bevy render pipeline, ~12 draw calls total
+- **Flat NPC buffer**: `Vec<NpcState>` resource, zero ECS entities per NPC
+- **CPU AI + animation**: staggered 1/4 rate per frame
+- **Physics**: disabled (tree collision too slow; needs heightmap or compute shader)
 
-## Baseline Results (no instancing)
+## Results
 
-| NPCs  | Entities | FPS  | Frame Time (ms) |
-|------:|--------:|-----:|----------------:|
-|     0 |      25 | 12.7 |             78.5 |
-| 1,000 | 18,025  |  3.3 |            300.0 |
-| 2,000 | 36,025  |  2.1 |            481.9 |
-| 3,000 | 54,025  |  1.5 |            649.3 |
-| 4,000 | 72,025  |  1.2 |            830.3 |
-| 5,000 | 90,025  |  1.0 |          1,023.2 |
-| 6,000 | 108,025 |  0.9 |          1,159.8 |
-| 7,000 | 126,025 |  0.8 |          1,331.7 |
-| 8,000 | 144,025 |  0.7 |          1,488.7 |
+### With Full AI + Animation (no physics)
+| NPCs | FPS | ms/frame |
+|-----:|----:|---------:|
+| 1,000 | 121 | 8.3 |
+| 6,000 | 108 | 9.3 |
+| 16,000 | 117 | 8.6 |
+| 66,000 | 52 | 19.2 |
+| 166,000 | 22 | 44.7 |
 
-## Analysis
+### Without CPU Systems (GPU rendering only)
+| NPCs | FPS | ms/frame |
+|-----:|----:|---------:|
+| 100,000 | 125 | 8.0 |
+| 300,000 | 61 | 16.4 |
+| 800,000 | 27 | 37.0 |
+| 1,800,000 | 13 | 77.0 |
 
-**Entity count is the bottleneck.** Each NPC spawns ~18 Bevy entities
-(root + 6 parts + ~11 mesh children). At 1,000 NPCs that's 18,000 entities.
+### Original Baseline (for comparison)
+| NPCs | FPS | Architecture |
+|-----:|----:|:-------------|
+| 1,000 | 3 | ECS per-entity + per-part mesh entities |
 
-Frame time scales roughly linearly with entity count:
-- 0 NPCs: ~80ms/frame
-- 1,000 NPCs: ~300ms (+220ms for 18K entities = ~12us per entity)
-- 8,000 NPCs: ~1,489ms (+1,409ms for 144K entities = ~10us per entity)
+## Improvement
 
-The ~10-12us per entity cost comes from:
-1. **Transform propagation** through the entity hierarchy (root -> part -> mesh)
-2. **CPU-side AI** (`npc_ai` system iterates all NPCs every frame)
-3. **CPU-side animation** (`npc_animate` system iterates children per NPC)
-4. **Physics** (`npc_physics` system does collision per NPC)
-5. **Draw call overhead** (each mesh entity = separate draw submission)
+- **1K NPCs**: 3 FPS → 121 FPS (**40x**)
+- **10K NPCs**: unplayable → 117 FPS
+- **100K NPCs**: impossible → 52-125 FPS (depending on CPU systems)
 
-**Note:** These numbers are from SwiftShader (software GPU in headless
-Chromium). Real GPU performance would be better for rendering but the
-CPU-side entity/system overhead would remain the same.
+## Remaining Bottlenecks
 
-## Target
+1. **CPU overlay collection** (~0.02ms per NPC): iterates all NPCs to build instance data
+2. **CPU AI + animation** (~0.15ms per 1K NPCs): staggered, HashMap lookups per part
+3. **Physics** (disabled): tree collision is O(depth) per NPC per frame — needs heightmap
 
-10,000 NPCs at 30+ FPS on native, which means reducing per-NPC entity
-count and CPU system overhead by roughly 100x.
+## Next Steps for 1M+ with Full Simulation
 
-## Planned Optimizations (ordered by expected impact)
-
-1. **GPU instancing** — collapse all same-mesh parts into single instanced
-   draw calls. ~6 draw calls instead of 18K * 6 = 108K. Eliminates mesh
-   child entities entirely.
-
-2. **Flatten entity hierarchy** — store part transforms inline instead of
-   as child entities. Eliminates transform propagation overhead.
-
-3. **Frustum culling** — skip off-screen NPCs in AI/animation/rendering.
-
-4. **Batch AI/physics** — replace per-entity Timer with raw f32 countdown.
-
-## How to Run
-
-```bash
-# From project root
-cd ui && npm install
-cd ..
-trunk build
-trunk serve --port 8080
-cd ui && npx playwright test npc-perf --reporter=line
-```
-
-## WASM Build Fixes (applied in this branch)
-
-The WASM build was broken since commit 3ae6f54. Fixes:
-- `std::time::Instant` -> `bevy::platform::time::Instant` (WASM compatible)
-- `std::time::SystemTime` -> `js_sys::Date::now()` for random seeding
-- Atmosphere component cfg-gated to native only (needs storage buffers)
-- BSL shader embedded at compile time (WASM asset server meta issue)
-- Assets dir copied to dist/ via trunk config
+1. Wire compute shader to replace CPU AI/animation
+2. Generate heightmap texture for GPU collision
+3. Move animation keyframe interpolation to vertex shader
+4. Share NPC state storage buffer between compute and vertex shaders

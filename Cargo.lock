@@ -2311,6 +2311,7 @@ name = "deepspace-game"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
  "dot_vox",
  "fastnoise-lite",
  "getrandom 0.3.4",
@@ -2323,6 +2324,7 @@ dependencies = [
  "serde_json",
  "tungstenite",
  "wasm-bindgen",
+ "web-sys",
  "wry",
 ]
 
@@ -6725,6 +6727,7 @@ dependencies = [
  "smallvec",
  "static_assertions",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "wgpu-core",
  "wgpu-hal",
