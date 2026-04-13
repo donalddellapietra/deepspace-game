@@ -975,21 +975,16 @@ pub fn render_world(
 
     let grass_voxel: u8 = 3;
     if let Some(grass_mat) = palette.material(grass_voxel) {
-        let cell = anchor.cell_bevy(zoom.layer);
         let ground_y = (super::state::GROUND_Y_VOXELS - anchor.leaf_coord[1]) as f32 / anchor.norm;
-
-        // Cylinder wall at the render boundary. From ground level, the
-        // wall looks like ground extending to the horizon. Through holes,
-        // the cylinder is at the render boundary distance — too far to
-        // see in a local hole. The wall extends from well below ground
-        // to slightly above, covering the terrain edge from any angle.
-        let wall_radius = radius_bevy * 0.95;
-        let wall_bottom = ground_y - cell * 50.0;
-        let wall_top = ground_y + cell * 2.0;
+        let outer_radius = radius_bevy * 3.0;
+        // Inner radius at 85% of render distance — the annulus only
+        // fills the outer 15% and beyond. Digging near the player
+        // (inside the inner edge) won't reveal the annulus.
+        let inner_radius = radius_bevy * 0.85;
 
         let needs_rebuild = render_state.imposter_mesh.is_none();
-        let cylinder = if needs_rebuild {
-            let mesh = make_cylinder_wall(&mut meshes, wall_radius, wall_bottom, wall_top, 64);
+        let annulus = if needs_rebuild {
+            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, 0.0, 64);
             render_state.imposter_mesh = Some(mesh.clone());
             mesh
         } else {
@@ -997,16 +992,16 @@ pub fn render_world(
         };
 
         let entity = commands.spawn((
-            Mesh3d(cylinder),
+            Mesh3d(annulus),
             MeshMaterial3d(grass_mat.clone()),
-            Transform::from_translation(Vec3::new(camera_pos.x, 0.0, camera_pos.z)),
+            Transform::from_translation(Vec3::new(camera_pos.x, ground_y, camera_pos.z)),
             Visibility::Visible,
             bevy::light::NotShadowCaster,
             bevy::light::NotShadowReceiver,
         )).id();
         render_state.imposter_entities.push(entity);
 
-        info!("Imposter cylinder: r={:.0}, y={:.0}..{:.0}", wall_radius, wall_bottom, wall_top);
+        info!("Imposter annulus: inner={:.0}, outer={:.0}, y={:.1}", inner_radius, outer_radius, ground_y);
     }
 
     // Overlay reconcile (NPCs and other overlay subtrees).
