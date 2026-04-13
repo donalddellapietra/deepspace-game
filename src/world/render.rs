@@ -506,10 +506,8 @@ fn walk(
         // Fine emit layer → emit at scale 1 (skip uniform-empty
         // nodes — they produce zero faces).
         if depth == fine_emit {
-            if let Some(node) = world.library.get(node_id) {
-                if node.voxels.iter().all(|&v| v == EMPTY_VOXEL) {
-                    continue;
-                }
+            if world.library.get(node_id).map_or(false, |n| n.uniform_empty) {
+                continue;
             }
             out.push(Visit {
                 path,
@@ -525,10 +523,8 @@ fn walk(
         // Skip uniform-empty nodes (zero visible faces).
         if depth == coarse_emit && coarse_emit < fine_emit {
             if min_dist_sq > fine_radius_sq {
-                if let Some(node) = world.library.get(node_id) {
-                    if node.voxels.iter().all(|&v| v == EMPTY_VOXEL) {
-                        continue;
-                    }
+                if world.library.get(node_id).map_or(false, |n| n.uniform_empty) {
+                    continue;
                 }
                 out.push(Visit {
                     path,
@@ -561,14 +557,9 @@ fn walk(
             if child_id == EMPTY_NODE {
                 continue;
             }
-            // Skip uniform-empty subtrees: they produce zero faces at
-            // every depth, so there's no point descending into them.
-            // Content-addressing means only a handful of unique air
-            // NodeIds exist, so the library lookup hits cache.
-            if let Some(child_node) = world.library.get(child_id) {
-                if child_node.voxels.iter().all(|&v| v == EMPTY_VOXEL) {
-                    continue;
-                }
+            // Skip uniform-empty subtrees — zero faces at any depth.
+            if world.library.get(child_id).map_or(false, |n| n.uniform_empty) {
+                continue;
             }
             let (sx, sy, sz) = slot_coords(slot);
             let child_origin_leaves = [

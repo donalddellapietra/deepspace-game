@@ -111,6 +111,10 @@ pub struct Node {
     pub children: Option<Children>,
     /// Refcount for library eviction.
     pub ref_count: u32,
+    /// True when every voxel in the grid is `EMPTY_VOXEL`. Cached at
+    /// insert time so the walk can skip uniform-empty subtrees with a
+    /// single field read instead of scanning 15,625 bytes.
+    pub uniform_empty: bool,
 }
 
 // ------------------------------------------------------------- library
@@ -164,12 +168,14 @@ impl NodeLibrary {
         }
         let id = self.next_id;
         self.next_id += 1;
+        let uniform_empty = voxels.iter().all(|&v| v == EMPTY_VOXEL);
         self.nodes.insert(
             id,
             Node {
                 voxels,
                 children: None,
                 ref_count: 0,
+                uniform_empty,
             },
         );
         self.leaf_by_hash.entry(h).or_default().push(id);
@@ -200,12 +206,14 @@ impl NodeLibrary {
         // Copy child ids so we can ref_inc after the insert without a
         // borrow conflict on `self.nodes`.
         let child_ids: [NodeId; CHILDREN_PER_NODE] = *children;
+        let uniform_empty = voxels.iter().all(|&v| v == EMPTY_VOXEL);
         self.nodes.insert(
             id,
             Node {
                 voxels,
                 children: Some(children),
                 ref_count: 0,
+                uniform_empty,
             },
         );
         self.non_leaf_by_hash.entry(h).or_default().push(id);
