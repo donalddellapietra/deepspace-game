@@ -11,6 +11,7 @@
 
 # Generated world data (run `cargo run --bin gen_world` to regenerate)
 /assets/world.bin
+/assets/meshes.bin
 
 # Save files
 /saves/

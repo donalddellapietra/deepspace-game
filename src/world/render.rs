@@ -28,8 +28,9 @@ use bevy::prelude::*;
 
 use crate::block::Palette;
 use crate::model::mesher::{
-    bake_volume, bake_child_faces, merge_child_faces,
-    flatten_children, ChildClass, ChildFaces,
+    bake_volume, bake_volume_raw, bake_child_faces, merge_child_faces,
+    merge_child_faces_raw, flatten_children, ChildClass, ChildFaces,
+    FaceData,
 };
 use crate::model::BakedSubMesh;
 
@@ -126,6 +127,8 @@ pub struct RenderTimings {
     pub visit_count: usize,
     pub group_count: usize,
     pub collision_us: u64,
+    pub cold_bakes: usize,
+    pub unbaked: usize,
 }
 
 #[derive(Resource, Default)]
@@ -135,6 +138,11 @@ pub struct RenderState {
     /// GPU meshes so edits can incrementally re-bake only the dirty
     /// children instead of the full 125³ grid.
     baked: HashMap<NodeId, BakedNode>,
+    /// Prebaked mesh data loaded from `assets/meshes.bin`. Consumed
+    /// on first use: the raw `FaceData` is converted to a Bevy
+    /// `Handle<Mesh>` and moved into `baked`.
+    prebaked: Option<super::serial::PrebakedMeshes>,
+    prebaked_loaded: bool,
     /// Per-path tracking: remembers which `NodeId` each path last
     /// displayed. Used to find the old `BakedNode` for incremental
     /// diff when an edit changes the NodeId at a path.
@@ -404,6 +412,48 @@ fn bake_leaf(world: &WorldState, node_id: NodeId, meshes: &mut Assets<Mesh>) -> 
     )
 }
 
+// -------------------------------------------------------- offline prebake
+
+/// Bake a non-leaf node into raw mesh data, without Bevy. Used by the
+/// offline gen_world tool to prebake meshes for all library nodes.
+pub fn prebake_node_raw(world: &WorldState, node_id: NodeId) -> Vec<(u8, FaceData)> {
+    let node = world.library.get(node_id).expect("prebake: node missing");
+    if let Some(children) = node.children.as_ref() {
+        let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
+        let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
+            .map(|slot| classify_child(world, child_ids[slot]))
+            .collect();
+        let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
+            .map(|slot| {
+                if child_ids[slot] == EMPTY_NODE { None }
+                else { Some(world.library.get(child_ids[slot])
+                    .expect("prebake: child missing").voxels.as_ref().as_slice()) }
+            })
+            .collect();
+        let flat_grid = flatten_children(
+            &children_voxels, &child_class,
+            BRANCH_FACTOR, NODE_VOXELS_PER_AXIS, EMPTY_VOXEL,
+        );
+        let child_faces = bake_all_children(&flat_grid, &child_ids, &child_class);
+        merge_child_faces_raw(&child_faces)
+    } else {
+        // Leaf node.
+        let voxels = &node.voxels;
+        bake_volume_raw(
+            NODE_VOXELS_PER_AXIS as i32,
+            |x, y, z| {
+                if x < 0 || y < 0 || z < 0
+                    || x >= NODE_VOXELS_PER_AXIS as i32
+                    || y >= NODE_VOXELS_PER_AXIS as i32
+                    || z >= NODE_VOXELS_PER_AXIS as i32
+                { return None; }
+                let v = voxels[voxel_idx(x as usize, y as usize, z as usize)];
+                if v == EMPTY_VOXEL { None } else { Some(v) }
+            },
+        )
+    }
+}
+
 // ------------------------------------------------------------- tree walk
 
 /// One "visit" the tree walk wants the reconciler to spawn/update.
@@ -577,6 +627,21 @@ pub fn render_world(
     let camera_pos = camera_tf.translation;
     let render_total_start = std::time::Instant::now();
 
+    // Load prebaked meshes from disk on first frame.
+    if !render_state.prebaked_loaded {
+        render_state.prebaked_loaded = true;
+        let path = std::path::Path::new("assets/meshes.bin");
+        match super::serial::read_prebaked_file(path) {
+            Ok(prebaked) => {
+                eprintln!("loaded prebaked meshes: {} entries", prebaked.len());
+                render_state.prebaked = Some(prebaked);
+            }
+            Err(e) => {
+                eprintln!("no prebaked meshes ({}), will cold bake", e);
+            }
+        }
+    }
+
     let target_layer = target_layer_for(zoom.layer);
     let emit_layer = target_layer.saturating_sub(1);
 
@@ -599,7 +664,10 @@ pub fn render_world(
             }
         }
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
-        render_state.baked.clear();
+        // Keep baked mesh data — NodeId-keyed meshes are valid across
+        // zoom layers. Only clear the path→NodeId map (paths change
+        // when the emit layer changes) and the entity set (transforms
+        // and scales change with zoom).
         render_state.path_node.clear();
         render_state.last_zoom_layer = zoom.layer;
         render_state.initialised = true;
@@ -635,12 +703,38 @@ pub fn render_world(
             let node = world.library.get(v.node_id)
                 .expect("render: node missing from library");
 
-            if node.children.is_some() {
-                if !render_state.baked.contains_key(&v.node_id) {
+            if !render_state.baked.contains_key(&v.node_id) {
+                // Try prebaked cache first (fast: just GPU upload).
+                if let Some(entry) = render_state.prebaked
+                    .as_mut()
+                    .and_then(|p| p.remove(&v.node_id))
+                {
+                    let merged: Vec<BakedSubMesh> = entry
+                        .into_iter()
+                        .map(|(voxel, data)| BakedSubMesh {
+                            mesh: meshes.add(data.build()),
+                            voxel,
+                        })
+                        .collect();
+                    render_state.baked.insert(v.node_id, BakedNode {
+                        child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
+                        child_class: Vec::new(),
+                        flat_grid: Vec::new(),
+                        child_faces: Vec::new(),
+                        merged,
+                    });
+                } else if node.children.is_some() {
                     if cold_bakes >= MAX_COLD_BAKES { continue; }
                     let baked = if let Some(&old_nid) = render_state.path_node.get(&v.path) {
                         if let Some(old_bake) = render_state.baked.get(&old_nid) {
-                            BakedNode::new_incremental(old_bake, &world, v.node_id, &mut meshes)
+                            // Can only do incremental if the old bake has
+                            // intermediate data (not a prebaked-only entry).
+                            if !old_bake.child_class.is_empty() {
+                                BakedNode::new_incremental(old_bake, &world, v.node_id, &mut meshes)
+                            } else {
+                                cold_bakes += 1;
+                                BakedNode::new_cold(&world, v.node_id, &mut meshes)
+                            }
                         } else {
                             cold_bakes += 1;
                             BakedNode::new_cold(&world, v.node_id, &mut meshes)
@@ -650,22 +744,29 @@ pub fn render_world(
                         BakedNode::new_cold(&world, v.node_id, &mut meshes)
                     };
                     render_state.baked.insert(v.node_id, baked);
+                } else {
+                    if cold_bakes >= MAX_COLD_BAKES { continue; }
+                    cold_bakes += 1;
+                    let merged = bake_leaf(&world, v.node_id, &mut meshes);
+                    render_state.baked.insert(v.node_id, BakedNode {
+                        child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
+                        child_class: Vec::new(),
+                        flat_grid: Vec::new(),
+                        child_faces: Vec::new(),
+                        merged,
+                    });
                 }
+            }
+            if node.children.is_some() {
                 render_state.path_node.insert(v.path, v.node_id);
-            } else if !render_state.baked.contains_key(&v.node_id) {
-                if cold_bakes >= MAX_COLD_BAKES { continue; }
-                cold_bakes += 1;
-                let merged = bake_leaf(&world, v.node_id, &mut meshes);
-                render_state.baked.insert(v.node_id, BakedNode {
-                    child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
-                    child_class: Vec::new(),
-                    flat_grid: Vec::new(),
-                    child_faces: Vec::new(),
-                    merged,
-                });
             }
         }
         timings.bake_us = bake_start.elapsed().as_micros() as u64;
+        timings.cold_bakes = cold_bakes;
+        let unbaked = visits.iter()
+            .filter(|v| !render_state.baked.contains_key(&v.node_id))
+            .count();
+        timings.unbaked = unbaked;
     }
 
     // Reconcile: what's alive now, what changed, what's gone.

@@ -289,6 +289,63 @@ pub fn read_save_file(
     load_save(&data, library, expected_base_hash)
 }
 
+// -------------------------------------------------------- prebaked meshes
+
+use crate::model::mesher::FaceData;
+
+/// Prebaked mesh data for one node: list of (voxel_type, mesh_geometry).
+pub type PrebakedEntry = Vec<(u8, FaceData)>;
+
+/// All prebaked meshes, keyed by NodeId.
+pub type PrebakedMeshes = std::collections::HashMap<NodeId, PrebakedEntry>;
+
+#[derive(Serialize, Deserialize)]
+struct PrebakedFile {
+    version: u32,
+    entries: Vec<(u64, PrebakedEntry)>,
+}
+
+const PREBAKED_VERSION: u32 = 1;
+
+pub fn serialize_prebaked(meshes: &PrebakedMeshes) -> io::Result<Vec<u8>> {
+    let entries: Vec<(u64, PrebakedEntry)> = meshes
+        .iter()
+        .map(|(&id, entry)| (id, entry.clone()))
+        .collect();
+    let file = PrebakedFile {
+        version: PREBAKED_VERSION,
+        entries,
+    };
+    let raw = bincode::serialize(&file)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    Ok(compress(&raw))
+}
+
+pub fn write_prebaked_file(path: &Path, meshes: &PrebakedMeshes) -> io::Result<()> {
+    let data = serialize_prebaked(meshes)?;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(&data)?;
+    Ok(())
+}
+
+pub fn deserialize_prebaked(data: &[u8]) -> io::Result<PrebakedMeshes> {
+    let raw = decompress(data)?;
+    let file: PrebakedFile = bincode::deserialize(&raw)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if file.version != PREBAKED_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported prebaked version: {}", file.version),
+        ));
+    }
+    Ok(file.entries.into_iter().collect())
+}
+
+pub fn read_prebaked_file(path: &Path) -> io::Result<PrebakedMeshes> {
+    let data = std::fs::read(path)?;
+    deserialize_prebaked(&data)
+}
+
 // ----------------------------------------------------------------- tests
 
 #[cfg(test)]

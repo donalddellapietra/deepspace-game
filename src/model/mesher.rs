@@ -105,6 +105,7 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
 /// Raw face data for one voxel type, before conversion to a Mesh.
 /// Stored per-child so edits only re-bake the affected child.
 #[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FaceData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
@@ -156,7 +157,7 @@ impl FaceData {
         self.positions.is_empty()
     }
 
-    fn build(self) -> Mesh {
+    pub fn build(self) -> Mesh {
         if self.positions.is_empty() {
             return Mesh::new(
                 PrimitiveTopology::TriangleList,
@@ -279,13 +280,22 @@ fn bake_faces<F: Fn(i32, i32, i32) -> Option<u8>>(
 /// Bake a `size³` volume into per-voxel-type sub-meshes with greedy
 /// meshing. Used for leaf nodes and any case where incremental
 /// baking isn't needed.
+/// Bake a volume into raw `(voxel, FaceData)` pairs without Bevy.
+pub fn bake_volume_raw<F: Fn(i32, i32, i32) -> Option<u8>>(
+    size: i32,
+    get: F,
+) -> Vec<(u8, FaceData)> {
+    bake_faces(size, &get, [0, 0, 0])
+        .into_iter()
+        .collect()
+}
+
 pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
     size: i32,
     get: F,
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
-    let faces = bake_faces(size, &get, [0, 0, 0]);
-    faces
+    bake_volume_raw(size, &get)
         .into_iter()
         .map(|(voxel, data)| BakedSubMesh {
             mesh: meshes.add(data.build()),
@@ -450,14 +460,11 @@ pub fn flatten_children(
     flat
 }
 
-/// Merge 125 children's `ChildFaces` into final `BakedSubMesh`es.
-/// Each child's face data is concatenated (with index offsets) into
-/// one mesh per voxel type.
-pub fn merge_child_faces(
-    children: &[ChildFaces],
-    meshes: &mut Assets<Mesh>,
-) -> Vec<BakedSubMesh> {
-    // Collect all voxel types across all children.
+/// Merge 125 children's `ChildFaces` into raw `(voxel, FaceData)` pairs.
+/// This does all the CPU-side work (concatenation, index offset) without
+/// requiring Bevy `Assets<Mesh>`. Used by both the runtime renderer and
+/// the offline prebake tool.
+pub fn merge_child_faces_raw(children: &[ChildFaces]) -> Vec<(u8, FaceData)> {
     let mut all_voxels: Vec<u8> = Vec::new();
     for child in children {
         for &v in child.keys() {
@@ -485,11 +492,23 @@ pub fn merge_child_faces(
             if merged.is_empty() {
                 return None;
             }
+            Some((voxel, merged))
+        })
+        .collect()
+}
 
-            Some(BakedSubMesh {
-                mesh: meshes.add(merged.build()),
-                voxel,
-            })
+/// Merge 125 children's `ChildFaces` into final `BakedSubMesh`es.
+/// Each child's face data is concatenated (with index offsets) into
+/// one mesh per voxel type.
+pub fn merge_child_faces(
+    children: &[ChildFaces],
+    meshes: &mut Assets<Mesh>,
+) -> Vec<BakedSubMesh> {
+    merge_child_faces_raw(children)
+        .into_iter()
+        .map(|(voxel, data)| BakedSubMesh {
+            mesh: meshes.add(data.build()),
+            voxel,
         })
         .collect()
 }

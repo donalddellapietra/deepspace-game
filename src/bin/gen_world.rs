@@ -1,50 +1,95 @@
-//! Offline world generator. Builds a world tree and serializes it to
-//! `assets/world.bin`. Run when terrain parameters change:
+//! Offline world generator. Builds a world tree, prebakes all meshes,
+//! and serializes both to `assets/`. Run when terrain parameters change:
 //!
 //! ```sh
 //! cargo run --bin gen_world
 //! ```
 //!
-//! The main game binary loads this file at startup instead of
-//! generating the world in-process.
+//! The main game binary loads these files at startup instead of
+//! generating the world or cold-baking meshes in-process.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-// The gen_world binary lives inside the deepspace-game crate, so it
-// can access all internal modules directly.
-use deepspace_game::world::serial::write_world_file;
+use deepspace_game::world::render::prebake_node_raw;
+use deepspace_game::world::serial::{
+    write_prebaked_file, write_world_file, PrebakedMeshes,
+};
 use deepspace_game::world::state::WorldState;
+use deepspace_game::world::tree::EMPTY_NODE;
 
 fn main() {
     let start = Instant::now();
 
-    // Generate the world. Currently uses the sphere builder; swap to
-    // any other builder (grassland, terrain, etc.) as needed.
+    // Generate the world.
     eprintln!("generating world...");
     let world = WorldState::new_sphere();
+    let lib_len = world.library.len();
     eprintln!(
         "  generated in {:.1}s, {} library entries",
         start.elapsed().as_secs_f64(),
-        world.library.len(),
+        lib_len,
     );
 
-    // Write to assets/world.bin.
-    let out_path = PathBuf::from("assets/world.bin");
-    if let Some(parent) = out_path.parent() {
+    // Write world.bin.
+    let world_path = PathBuf::from("assets/world.bin");
+    if let Some(parent) = world_path.parent() {
         std::fs::create_dir_all(parent).expect("failed to create assets dir");
     }
-    eprintln!("writing {}...", out_path.display());
-    write_world_file(&out_path, world.root, &world.library)
+    eprintln!("writing {}...", world_path.display());
+    write_world_file(&world_path, world.root, &world.library)
         .expect("failed to write world file");
-
-    let file_size = std::fs::metadata(&out_path)
+    let world_size = std::fs::metadata(&world_path)
         .map(|m| m.len())
         .unwrap_or(0);
     eprintln!(
-        "  wrote {} ({:.1} KB) in {:.1}s total",
-        out_path.display(),
-        file_size as f64 / 1024.0,
+        "  wrote {} ({:.1} KB)",
+        world_path.display(),
+        world_size as f64 / 1024.0,
+    );
+
+    // Prebake meshes for every node in the library.
+    eprintln!("prebaking meshes...");
+    let bake_start = Instant::now();
+    let mut prebaked = PrebakedMeshes::new();
+    let mut baked_count = 0usize;
+    let mut skipped = 0usize;
+
+    for (&node_id, _node) in world.library.iter_nodes() {
+        if node_id == EMPTY_NODE {
+            continue;
+        }
+        let raw = prebake_node_raw(&world, node_id);
+        if raw.is_empty() {
+            skipped += 1;
+        } else {
+            prebaked.insert(node_id, raw);
+            baked_count += 1;
+        }
+    }
+    eprintln!(
+        "  prebaked {} nodes, skipped {} empty, in {:.1}s",
+        baked_count,
+        skipped,
+        bake_start.elapsed().as_secs_f64(),
+    );
+
+    // Write meshes.bin.
+    let meshes_path = PathBuf::from("assets/meshes.bin");
+    eprintln!("writing {}...", meshes_path.display());
+    write_prebaked_file(&meshes_path, &prebaked)
+        .expect("failed to write prebaked meshes");
+    let meshes_size = std::fs::metadata(&meshes_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!(
+        "  wrote {} ({:.1} KB)",
+        meshes_path.display(),
+        meshes_size as f64 / 1024.0,
+    );
+
+    eprintln!(
+        "done in {:.1}s total",
         start.elapsed().as_secs_f64(),
     );
 }
