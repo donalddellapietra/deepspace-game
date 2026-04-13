@@ -138,7 +138,6 @@ impl FaceData {
     ) {
         let (_, ref quad, normal) = FACES[face_idx];
         let base = self.positions.len() as u32;
-        let brightness = AO_CURVE[ao_level as usize];
         let normal_arr = normal.to_array();
         for &vert in quad {
             let mut pos = [0.0f32; 3];
@@ -147,6 +146,7 @@ impl FaceData {
             pos[axes.2] = v as f32 + vert[axes.2] * (h as f32);
             self.positions.push(pos);
             self.normals.push(normal_arr);
+            let brightness = AO_CURVE[ao_level as usize];
             self.colors.push([brightness, brightness, brightness, 1.0]);
         }
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -484,28 +484,6 @@ pub fn merge_child_faces(
             }
             if merged.is_empty() {
                 return None;
-            }
-
-            // Smooth AO at child boundaries: the per-child greedy merge
-            // can't merge across 25-voxel child edges, so adjacent
-            // children's quads can have different AO levels at their
-            // shared edge, creating visible dark lines. Setting
-            // boundary vertices to full brightness removes the
-            // discontinuity without affecting interior AO or the
-            // incremental baking cache.
-            let child_size: f32 = 25.0;
-            let eps = 0.01;
-            for (i, pos) in merged.positions.iter().enumerate() {
-                let on_child_edge =
-                    (pos[0] % child_size).abs() < eps
-                    || (child_size - pos[0] % child_size).abs() < eps
-                    || (pos[1] % child_size).abs() < eps
-                    || (child_size - pos[1] % child_size).abs() < eps
-                    || (pos[2] % child_size).abs() < eps
-                    || (child_size - pos[2] % child_size).abs() < eps;
-                if on_child_edge {
-                    merged.colors[i] = [1.0, 1.0, 1.0, 1.0];
-                }
             }
 
             Some(BakedSubMesh {

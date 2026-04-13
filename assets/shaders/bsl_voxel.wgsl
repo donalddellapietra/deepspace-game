@@ -50,34 +50,23 @@ fn fragment(
 
     // --- BSL-style post-processing ---
 
-    // Vertex AO from the greedy mesher (greyscale in vertex color, range ~0.6..1.0).
-    // StandardMaterial already multiplied base_color by vertex color, so the AO
-    // is baked into lit_color. We read the raw AO value to apply BSL's squared
-    // skylight curve on top.
+    // Vertex AO from the greedy mesher (greyscale in vertex color).
+    // Recomputed from the full 125³ grid in merge_child_faces so it's
+    // continuous across child boundaries.
 #ifdef VERTEX_COLORS
     let ao_raw = in.color.r;
 #else
     let ao_raw = 1.0;
 #endif
-
-    // BSL squares the skylight (AO) for a softer falloff in occluded areas —
-    // corners darken more than edges, matching how real ambient light
-    // attenuates in concavities.
     let ao = mix(1.0, ao_raw * ao_raw, bsl.ao_strength);
+    lit_color = vec4(lit_color.rgb * ao, lit_color.a);
 
-    // Modulate the lit result: in fully occluded areas (ao~0.36) the color
-    // darkens significantly; in open areas (ao=1.0) it passes through.
-    // BSL's formula: sceneLighting = mix(ambientCol * skylight², lightCol, shadow * NoL)
-    // Since PBR already computed the shadow*NoL term, we approximate by
-    // tinting shadowed (dark) regions toward the ambient color.
+    // BSL ambient tinting: push shadowed regions toward ambient color.
     let luminance = dot(lit_color.rgb, vec3(0.299, 0.587, 0.114));
     let ambient_tint = bsl.ambient_color.rgb * bsl.ambient_color.a;
-
-    // Blend ambient tint into dark regions (where luminance is low = in shadow).
-    // In well-lit areas, ao modulation alone is enough.
     let shadow_blend = saturate(1.0 - luminance * 2.0);
     lit_color = vec4(
-        lit_color.rgb * ao + ambient_tint * shadow_blend * ao * 0.5,
+        lit_color.rgb + ambient_tint * shadow_blend * 0.5,
         lit_color.a,
     );
 
