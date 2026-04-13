@@ -4,11 +4,14 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::AccumulatedMouseMotion,
     light::ShadowFilteringMethod,
-    pbr::{Atmosphere, AtmosphereSettings, ScreenSpaceAmbientOcclusion, ScatteringMedium},
+    pbr::ScreenSpaceAmbientOcclusion,
     post_process::bloom::Bloom,
     prelude::*,
     render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 
 use crate::player::{Player, PLAYER_HEIGHT};
 use crate::world::view::{cell_size_at_layer, scale_for_layer, target_layer_for, WorldAnchor};
@@ -78,6 +81,7 @@ impl Plugin for CameraPlugin {
                         .after(tick_zoom_transition)
                         .after(crate::player::derive_transforms)
                         .after(crate::ui::sync_cursor),
+                    #[cfg(not(target_arch = "wasm32"))]
                     sync_atmosphere_scale,
                 ),
             );
@@ -96,22 +100,13 @@ pub struct CursorLocked(pub bool);
 
 fn spawn_camera(
     mut commands: Commands,
+    #[cfg(not(target_arch = "wasm32"))]
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
-    let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
-
-    commands.spawn((
+    let mut cam = commands.spawn((
         Camera3d::default(),
         FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::default(),
-        Atmosphere {
-            ground_albedo: Vec3::new(0.3, 0.6, 0.2),
-            ..Atmosphere::earthlike(medium)
-        },
-        // AcesFitted: filmic S-curve that rolls off highlights and
-        // lifts shadows, matching BSL's cinematic look. Previously
-        // caused shadow acne with high lighting values — fixed by
-        // rebalancing to HDR-appropriate intensities in setup_environment.
         Tonemapping::AcesFitted,
         ShadowFilteringMethod::Gaussian,
         ScreenSpaceAmbientOcclusion {
@@ -173,6 +168,16 @@ fn spawn_camera(
         },
         Msaa::Off,
     ));
+
+    // Procedural atmosphere requires storage buffers (not available on WebGL2).
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
+        cam.insert(Atmosphere {
+            ground_albedo: Vec3::new(0.3, 0.6, 0.2),
+            ..Atmosphere::earthlike(medium)
+        });
+    }
 }
 
 fn spawn_crosshair(mut commands: Commands) {
@@ -224,6 +229,7 @@ fn first_person_camera(
 /// Keep the aerial-view LUT range in sync with the actual view
 /// distance so atmospheric fog distributes evenly across all visible
 /// chunks (avoiding banding at chunk boundaries).
+#[cfg(not(target_arch = "wasm32"))]
 fn sync_atmosphere_scale(
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,

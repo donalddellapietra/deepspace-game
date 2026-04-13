@@ -196,6 +196,7 @@ impl Palette {
 pub struct BlockPlugin;
 impl Plugin for BlockPlugin {
     fn build(&self, app: &mut App) {
+        bsl_material::load_bsl_shader(app);
         app.add_systems(Startup, materials::init_palette);
     }
 }

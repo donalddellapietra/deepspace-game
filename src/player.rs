@@ -203,7 +203,7 @@ pub fn move_player(
         Vec2::ZERO
     };
 
-    let col_start = std::time::Instant::now();
+    let col_start = bevy::platform::time::Instant::now();
     collision::move_and_collide(
         &mut world_pos.0,
         &mut vel.0,

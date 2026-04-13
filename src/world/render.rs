@@ -576,7 +576,7 @@ pub fn render_world(
         return;
     };
     let camera_pos = camera_tf.translation;
-    let render_total_start = std::time::Instant::now();
+    let render_total_start = bevy::platform::time::Instant::now();
 
     let target_layer = target_layer_for(zoom.layer);
     let emit_layer = target_layer.saturating_sub(1);
@@ -608,7 +608,7 @@ pub fn render_world(
 
     // Walk the tree → collect visible positions.
     timings.bake_us = 0;
-    let walk_start = std::time::Instant::now();
+    let walk_start = bevy::platform::time::Instant::now();
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
@@ -627,7 +627,7 @@ pub fn render_world(
     // Pre-bake: ensure every visited NodeId has a BakedNode.
     // On edit, use the old BakedNode for incremental diff.
     {
-        let bake_start = std::time::Instant::now();
+        let bake_start = bevy::platform::time::Instant::now();
         for v in visits.iter() {
             let node = world.library.get(v.node_id)
                 .expect("render: node missing from library");
@@ -661,7 +661,7 @@ pub fn render_world(
     }
 
     // Reconcile: what's alive now, what changed, what's gone.
-    let reconcile_start = std::time::Instant::now();
+    let reconcile_start = bevy::platform::time::Instant::now();
     let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
         HashMap::with_capacity(visits.len());
 

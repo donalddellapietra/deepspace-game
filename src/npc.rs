@@ -15,6 +15,9 @@ use std::f32::consts::{PI, TAU};
 
 use bevy::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
+use js_sys;
+
 use crate::block::{BslMaterial, Palette, PaletteEntry};
 use crate::camera::FpsCam;
 use crate::player::Player;
@@ -382,6 +385,7 @@ pub struct NpcPartTransforms {
 
 const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
+const MASS_SPAWN_COUNT: usize = 1000;
 
 // ============================================================ plugin
 
@@ -428,29 +432,32 @@ fn try_load_blueprint(
     }
     commands.insert_resource(BlueprintLoaded(true));
 
-    // Try loading from file
-    let blueprint_path = "assets/npcs/fox.blueprint.json";
-    if let Ok(bytes) = std::fs::read(blueprint_path) {
-        if let Some(palette) = palette.as_mut() {
-            match blueprint_json::load_blueprint("fox", &bytes, palette, &mut mat_assets) {
-                Ok(bp) => {
-                    info!(
-                        "Loaded NPC blueprint '{}': {} parts, {} animations",
-                        bp.name,
-                        bp.parts.len(),
-                        bp.animations.len()
-                    );
-                    let tree_bp = blueprint_to_tree(&bp, &mut world);
-                    info!(
-                        "Built tree blueprint '{}': {} tree parts",
-                        tree_bp.name,
-                        tree_bp.parts.len()
-                    );
-                    commands.insert_resource(tree_bp);
-                    return;
-                }
-                Err(e) => {
-                    warn!("Failed to load NPC blueprint: {e}");
+    // Try loading from file (filesystem not available on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let blueprint_path = "assets/npcs/fox.blueprint.json";
+        if let Ok(bytes) = std::fs::read(blueprint_path) {
+            if let Some(palette) = palette.as_mut() {
+                match blueprint_json::load_blueprint("fox", &bytes, palette, &mut mat_assets) {
+                    Ok(bp) => {
+                        info!(
+                            "Loaded NPC blueprint '{}': {} parts, {} animations",
+                            bp.name,
+                            bp.parts.len(),
+                            bp.animations.len()
+                        );
+                        let tree_bp = blueprint_to_tree(&bp, &mut world);
+                        info!(
+                            "Built tree blueprint '{}': {} tree parts",
+                            tree_bp.name,
+                            tree_bp.parts.len()
+                        );
+                        commands.insert_resource(tree_bp);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("Failed to load NPC blueprint: {e}");
+                    }
                 }
             }
         }
@@ -607,17 +614,22 @@ fn spawn_npc_on_keypress(
     keyboard: Res<ButtonInput<KeyCode>>,
     tree_bp: Option<Res<TreeBlueprint>>,
     player_q: Query<&WorldPosition, With<Player>>,
+    npc_count: Query<(), With<Npc>>,
     anchor: Res<WorldAnchor>,
     zoom: Res<CameraZoom>,
     cam_q: Query<&FpsCam>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyN) {
+    // N = spawn 1 NPC, M = mass spawn batch
+    let count = if keyboard.just_pressed(KeyCode::KeyN) {
+        1usize
+    } else if keyboard.just_pressed(KeyCode::KeyM) {
+        MASS_SPAWN_COUNT
+    } else {
         return;
-    }
+    };
 
     let Some(tree_bp) = tree_bp else { return };
-    let Ok(player_pos) = player_q.single() else { return;
-    };
+    let Ok(player_pos) = player_q.single() else { return };
 
     let cell = anchor.cell_bevy(zoom.layer);
     let forward = if let Ok(cam) = cam_q.single() {
@@ -627,50 +639,67 @@ fn spawn_npc_on_keypress(
     };
 
     let player_bevy = bevy_from_position(&player_pos.0, &anchor);
-    let npc_bevy = player_bevy + forward * 5.0 * cell + Vec3::Y * 1.0;
-    let Some(npc_pos) = position_from_bevy(npc_bevy, &anchor) else {
-        warn!("NPC spawn position outside world");
-        return;
-    };
 
-    let spawn_bevy = bevy_from_position(&npc_pos, &anchor);
-    let heading = rand_heading();
-
-    // Initialize part transforms at rest pose.
+    // Initialize part transforms at rest pose (shared across all spawns).
     let rest_transforms: Vec<(Vec3, Quat)> = tree_bp
         .parts
         .iter()
         .map(|p| (p.rest_offset, Quat::IDENTITY))
         .collect();
 
-    // The root entity carries position (via derive_transforms) and
-    // rotation (via npc_ai). Scale is NOT stored here — it's a
-    // rendering concern computed per-frame in collect_overlays from
-    // the current zoom layer.
-    commands.spawn((
-        Npc,
-        WorldPosition(npc_pos),
-        NpcVelocity(Vec3::ZERO),
-        NpcAi {
-            heading,
-            change_timer: Timer::from_seconds(2.0 + rand_f32() * 3.0, TimerMode::Once),
-        },
-        NpcAnimState {
-            current_anim: "walk".into(),
-            time: 0.0,
-        },
-        NpcPartTransforms {
-            transforms: rest_transforms,
-        },
-        NpcPartOverrides::default(),
-        Transform::from_translation(spawn_bevy)
-            .with_rotation(Quat::from_rotation_y(heading + PI)),
-        Visibility::Visible,
-    ));
+    let existing = npc_count.iter().count();
+
+    for i in 0..count {
+        // Spread NPCs in a grid pattern around the player
+        let (offset_x, offset_z) = if count > 1 {
+            let grid_side = (count as f32).sqrt().ceil() as usize;
+            let row = i / grid_side;
+            let col = i % grid_side;
+            let spacing = 3.0 * cell;
+            let half = (grid_side as f32) * spacing / 2.0;
+            (col as f32 * spacing - half, row as f32 * spacing - half)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let npc_bevy = player_bevy
+            + forward * 5.0 * cell
+            + Vec3::new(offset_x, 1.0, offset_z);
+        let Some(npc_pos) = position_from_bevy(npc_bevy, &anchor) else {
+            continue;
+        };
+
+        let spawn_bevy = bevy_from_position(&npc_pos, &anchor);
+        let heading = rand_heading_seeded(i as u32);
+
+        commands.spawn((
+            Npc,
+            WorldPosition(npc_pos),
+            NpcVelocity(Vec3::ZERO),
+            NpcAi {
+                heading,
+                change_timer: Timer::from_seconds(
+                    2.0 + rand_f32_seeded(i as u32 + 9999) * 3.0,
+                    TimerMode::Once,
+                ),
+            },
+            NpcAnimState {
+                current_anim: "walk".into(),
+                time: rand_f32_seeded(i as u32 + 5555) * 2.0,
+            },
+            NpcPartTransforms {
+                transforms: rest_transforms.clone(),
+            },
+            NpcPartOverrides::default(),
+            Transform::from_translation(spawn_bevy)
+                .with_rotation(Quat::from_rotation_y(heading + PI)),
+            Visibility::Visible,
+        ));
+    }
 
     info!(
-        "Spawned voxel NPC '{}' at {spawn_bevy:?} (layer {})",
-        tree_bp.name, zoom.layer
+        "Spawned {} NPC(s) '{}' (total now ~{}, layer {})",
+        count, tree_bp.name, existing + count, zoom.layer,
     );
 }
 
@@ -904,13 +933,34 @@ fn tree_npc_scale(view_layer: u8, tree_bp: &TreeBlueprint, anchor: &WorldAnchor)
 }
 
 fn rand_f32() -> f32 {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    (t % 10000) as f32 / 10000.0
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        (t % 10000) as f32 / 10000.0
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let t = (js_sys::Date::now() * 1000.0) as u64;
+        ((t % 10000) as f32) / 10000.0
+    }
 }
 
 fn rand_heading() -> f32 {
     rand_f32() * TAU
+}
+
+/// Deterministic pseudo-random f32 in [0, 1) from a seed.
+fn rand_f32_seeded(seed: u32) -> f32 {
+    let mut s = seed.wrapping_mul(747796405).wrapping_add(2891336453);
+    s = ((s >> 16) ^ s).wrapping_mul(0x45d9f3b);
+    s = ((s >> 16) ^ s).wrapping_mul(0x45d9f3b);
+    s = (s >> 16) ^ s;
+    (s % 10000) as f32 / 10000.0
+}
+
+fn rand_heading_seeded(seed: u32) -> f32 {
+    rand_f32_seeded(seed) * TAU
 }

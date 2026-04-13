@@ -2,6 +2,7 @@
 //
 // Extends StandardMaterial's PBR output with:
 // - SSAO integration with BSL's squared skylight curve
+// - Vertex AO fallback when SSAO is unavailable
 // - Warm sun / cool shadow ambient blending (BSL signature look)
 // - Subsurface scattering for translucent blocks (leaves, water, glass)
 
@@ -47,12 +48,20 @@ fn fragment(
 
     var lit_color = apply_pbr_lighting(pbr_input);
 
-    // SSAO occlusion with BSL's squared skylight curve.
+    // --- Ambient occlusion ---
+    // Use SSAO (diffuse_occlusion) as the primary AO source. Falls
+    // back to vertex-color AO from the greedy mesher when SSAO is
+    // unavailable (e.g. WASM). Both use BSL's squared skylight curve.
     let ssao = pbr_input.diffuse_occlusion.r;
-    let ao = mix(1.0, ssao * ssao, bsl.ao_strength);
+#ifdef VERTEX_COLORS
+    let ao_raw = min(ssao, in.color.r);
+#else
+    let ao_raw = ssao;
+#endif
+    let ao = mix(1.0, ao_raw * ao_raw, bsl.ao_strength);
     lit_color = vec4(lit_color.rgb * ao, lit_color.a);
 
-    // Warm sun / cool shadow blending.
+    // --- Warm sun / cool shadow blending ---
     let luminance = dot(lit_color.rgb, vec3(0.299, 0.587, 0.114));
     let ambient_tint = bsl.ambient_color.rgb * bsl.ambient_color.a;
     let shadow_blend = 1.0 - smoothstep(0.05, 0.5, luminance);
@@ -62,7 +71,7 @@ fn fragment(
         lit_color.a,
     );
 
-    // Subsurface scattering for translucent blocks.
+    // --- Subsurface scattering for translucent blocks ---
     if (bsl.subsurface_strength > 0.0) {
         let world_normal = normalize(in.world_normal);
         let transmission = saturate(-world_normal.y * 0.5 + 0.5);

@@ -32,11 +32,15 @@ fn main() {
             }),
             ..default()
         }))
-        // ClearColor shows at the horizon where terrain ends and at
-        // sub-pixel gaps between mesh faces. Match it to the
-        // atmosphere's haze color so the terrain-to-sky transition
-        // is seamless instead of showing a hard green line.
-        .insert_resource(ClearColor(Color::srgb(0.7, 0.78, 0.65)))
+        // On WASM without atmosphere, ClearColor is the sky.
+        // On native, atmosphere renders the sky and ClearColor peeks
+        // through sub-pixel gaps and the terrain-to-sky boundary.
+        .insert_resource(ClearColor({
+            #[cfg(target_arch = "wasm32")]
+            { Color::srgb(0.5, 0.7, 0.9) }
+            #[cfg(not(target_arch = "wasm32"))]
+            { Color::srgb(0.7, 0.78, 0.65) }
+        }))
         .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
