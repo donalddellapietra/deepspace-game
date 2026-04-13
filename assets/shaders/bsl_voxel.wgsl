@@ -87,7 +87,7 @@ fn fragment(
     // artifacts (dark block outlines at the terrain edge) disappear.
     var ao_fade = 1.0;
     if (bsl.clip_radius > 0.0) {
-        let fade_start_sq = bsl.clip_radius * bsl.clip_radius * 0.64; // 80% radius
+        let fade_start_sq = bsl.clip_radius * bsl.clip_radius * 0.16; // 40% radius
         let fade_end_sq = bsl.clip_radius * bsl.clip_radius;
         ao_fade = 1.0 - smoothstep(fade_start_sq, fade_end_sq, clip_dist_sq);
     }
