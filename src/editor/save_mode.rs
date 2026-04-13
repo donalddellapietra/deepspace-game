@@ -22,7 +22,7 @@ use crate::inventory::InventoryState;
 use crate::world::edit::subtree_path_for_layer_pos;
 use crate::world::position::LayerPos;
 use crate::world::render::{SubMeshBlock, WorldRenderedNode};
-use crate::world::tree::{NodeId, EMPTY_NODE, MAX_LAYER};
+use crate::world::tree::{NodeId, DETAIL_DEPTH, EMPTY_NODE, MAX_LAYER};
 use crate::world::{CameraZoom, WorldState};
 
 // -------------------------------------------------------------- resources
@@ -267,10 +267,13 @@ pub fn save_mode_eligible(view_layer: u8) -> bool {
     view_layer + 2 <= MAX_LAYER
 }
 
-/// Like [`resolve_node_at_lp`] but walks one fewer level, returning
+/// Like [`resolve_node_at_lp`] but walks fewer levels, returning
 /// the emit-layer node that *contains* the target-layer subtree.
 /// Used for tinting: rendered entities live at emit_layer, so the
-/// tint must match the parent of the target node.
+/// tint must match the ancestor of the target node.
+///
+/// When composition is active (`view + DETAIL_DEPTH <= MAX_LAYER`),
+/// entities are emitted 2 levels above target; otherwise 1.
 fn resolve_emit_node_at_lp(
     world: &WorldState,
     lp: &LayerPos,
@@ -279,10 +282,12 @@ fn resolve_emit_node_at_lp(
         return None;
     }
     let path = subtree_path_for_layer_pos(lp);
-    if path.len() < 2 {
+    let composition = lp.layer + DETAIL_DEPTH <= MAX_LAYER;
+    let trim = if composition { 2 } else { 1 };
+    if path.len() < trim + 1 {
         return None;
     }
-    let emit_path = &path[..path.len() - 1];
+    let emit_path = &path[..path.len() - trim];
     let mut id = world.root;
     for &slot in emit_path {
         let node = world.library.get(id)?;
