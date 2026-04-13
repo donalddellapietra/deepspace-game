@@ -128,10 +128,7 @@ fn update_shadow_cascades(
     for mut config in &mut lights {
         *config = CascadeShadowConfigBuilder {
             first_cascade_far_bound: 10.0 * cell,
-            // Extend shadow cascades past the terrain render distance
-            // so the cascade boundary falls on the imposter ring (which
-            // has NotShadowReceiver) rather than on the terrain itself.
-            maximum_distance: radius * 1.5,
+            maximum_distance: radius,
             overlap_proportion: 0.4,
             ..default()
         }
