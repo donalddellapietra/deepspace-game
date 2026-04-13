@@ -1,14 +1,12 @@
-import { test } from "@playwright/test";
+import { test, expect } from "@playwright/test";
 
-test("NPC lifecycle tracking", async ({ page }) => {
-  test.setTimeout(90_000);
+test("100K NPCs visual verification", async ({ page }) => {
+  test.setTimeout(120_000);
 
-  const logs: string[] = [];
-  page.on("console", (msg) => {
-    const text = msg.text();
-    if (text.includes("NPC") || text.includes("npc") || text.includes("Spawned") || text.includes("despawn")) {
-      logs.push(text.slice(0, 300));
-    }
+  const panics: string[] = [];
+  page.on("pageerror", (err) => {
+    if (err.message.includes("pointer lock")) return;
+    panics.push(err.message.slice(0, 200));
   });
 
   await page.goto("/");
@@ -18,24 +16,18 @@ test("NPC lifecycle tracking", async ({ page }) => {
   );
   await page.waitForTimeout(2000);
 
-  await page.locator("canvas").click({ position: { x: 640, y: 360 } });
-  await page.waitForTimeout(300);
-  await page.locator("canvas").click({ position: { x: 640, y: 360 } });
-  await page.waitForTimeout(300);
+  // Spawn 100K NPCs
+  await page.evaluate(() => { (window as any).__spawnNpcs = 100000; });
+  await page.waitForTimeout(5000);
 
-  // Spawn
-  await page.keyboard.press("n");
+  const perf = await page.evaluate(() => (window as any).__perfData);
+  console.log(`${perf.npcCount} NPCs, ${perf.fps.toFixed(1)} FPS, ${perf.frameTimeMs.toFixed(1)} ms`);
 
-  // Track NPC count over time
-  for (let i = 0; i < 10; i++) {
-    await page.waitForTimeout(200);
-    const perf = await page.evaluate(() => (window as any).__perfData);
-    console.log(`t=${(i+1)*200}ms: ${perf.npcCount} NPCs, ${perf.entityCount} entities, ${perf.fps.toFixed(1)} FPS`);
-    if (i === 0) {
-      await page.screenshot({ path: "test-results/npc-instanced.png" });
-    }
-  }
+  // Take screenshot
+  await page.screenshot({ path: "test-results/100k-npcs.png" });
 
-  console.log(`\nNPC-related logs:`);
-  for (const l of logs) console.log(`  ${l}`);
+  // Verify
+  expect(panics.length).toBe(0);
+  expect(perf.npcCount).toBeGreaterThanOrEqual(50000);
+  expect(perf.fps).toBeGreaterThan(10);
 });
