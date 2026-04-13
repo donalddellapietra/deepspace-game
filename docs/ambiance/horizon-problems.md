@@ -60,11 +60,15 @@ The fundamental issue is architectural: **there is a void between the last rende
 
 ## Possible Solutions (Untried)
 
-### A: Ground Plane Mesh
-Spawn a large flat mesh at ground height extending to the atmosphere horizon. This gives the atmosphere aerial perspective and distance fog something to render on. The ground plane would be a single giant quad at `y = ground_level`, colored to match grass, extending well past the render radius. Distance fog would fade it into the atmosphere naturally.
+### A: Ground Plane Mesh (TRIED — partially works but not future-proof)
+Spawn a large flat quad at ground level. Bridges the gap and atmosphere fogs it naturally.
 
-**Pros:** Simple, works with all existing fog/atmosphere systems.
-**Cons:** Only works for flat terrain; at ground level the camera might see the edge; needs per-layer scaling.
+**Result:** The horizons merge when jumping (gap fills). But the quad is clearly visible, wrong color for non-grass terrain, not viable for varied biomes.
+
+### G: Two-tier LOD Shell (TRIED — visually broken)
+Emit coarser tree nodes in a ring beyond the main render radius. Each coarser node covers 5x the space.
+
+**Result:** The coarser nodes render as full 3D blocks sticking up above the terrain — they need to be flat/simplified at that distance. The approach is sound but needs a simplified mesh (flat billboard or top-face-only) for the outer tier, not a full voxel bake.
 
 ### B: Skybox/Skydome with Terrain Color
 Render a skydome or cylinder at the render distance that's colored to match the terrain at the bottom and transitions to sky color at the top. This fills the void with a gradient that bridges terrain and sky.
