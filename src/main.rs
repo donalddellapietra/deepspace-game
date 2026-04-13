@@ -88,15 +88,24 @@ fn debug_stamp_monument(
 }
 
 fn setup_environment(mut commands: Commands) {
+    // Cool blue-tinted ambient pushes unlit/shadowed surfaces toward
+    // blue, contrasting with the warm directional light — this is the
+    // core of BSL's "warm sun / cool shadow" look. Brightness lowered
+    // from 800 to fit the HDR pipeline (AcesFitted tone-maps it).
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.9, 0.95, 1.0),
-        brightness: 800.0,
+        color: Color::srgb(0.7, 0.8, 1.0),
+        brightness: 400.0,
         ..default()
     });
 
+    // Warm golden sun — BSL tints its directional light toward amber.
+    // Illuminance lowered from 20k to avoid blowing out highlights in
+    // the HDR pipeline and to eliminate the shadow acne that occurred
+    // with AcesFitted at the old intensity.
     commands.spawn((
         DirectionalLight {
-            illuminance: 20_000.0,
+            color: Color::srgb(1.0, 0.95, 0.85),
+            illuminance: 8_000.0,
             shadows_enabled: true,
             shadow_depth_bias: 0.3,
             shadow_normal_bias: 2.0,

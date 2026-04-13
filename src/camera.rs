@@ -4,8 +4,10 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::AccumulatedMouseMotion,
     light::ShadowFilteringMethod,
-    pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
+    pbr::{Atmosphere, AtmosphereSettings, ScreenSpaceAmbientOcclusion, ScatteringMedium},
+    post_process::bloom::Bloom,
     prelude::*,
+    render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
 };
 
 use crate::player::{Player, PLAYER_HEIGHT};
@@ -99,23 +101,65 @@ fn spawn_camera(
 
     commands.spawn((
         Camera3d::default(),
-        // Pitch 0 = look forward. The follow system in
-        // `first_person_camera` snaps this entity onto the player on
-        // frame 1, so the spawn translation is just a placeholder —
-        // we use `Vec3::ZERO` instead of any hardcoded global Bevy
-        // coordinate to make it obvious that this isn't a position
-        // we picked.
         FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::default(),
-        // Procedural atmosphere (Rayleigh + Mie scattering).
-        // Ground albedo matches grass color so the horizon blends
-        // with the terrain edge instead of showing a grey seam.
         Atmosphere {
             ground_albedo: Vec3::new(0.3, 0.6, 0.2),
             ..Atmosphere::earthlike(medium)
         },
-        Tonemapping::Reinhard,
+        // AcesFitted: filmic S-curve that rolls off highlights and
+        // lifts shadows, matching BSL's cinematic look. Previously
+        // caused shadow acne with high lighting values — fixed by
+        // rebalancing to HDR-appropriate intensities in setup_environment.
+        Tonemapping::AcesFitted,
         ShadowFilteringMethod::Gaussian,
+        ScreenSpaceAmbientOcclusion {
+            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::Ultra,
+            constant_object_thickness: 1.0,
+        },
+        // Subtle bloom for emissive surfaces and bright sky/sun
+        // highlights. NATURAL preset uses energy-conserving mode
+        // so it adds glow without washing out. Low intensity avoids
+        // the artifacts seen with the old LDR-tuned lighting.
+        Bloom {
+            intensity: 0.15,
+            ..Bloom::NATURAL
+        },
+        // BSL-style color grading: cool shadows, warm highlights.
+        // Pushes shadowed regions toward blue and lit regions toward
+        // golden amber — the signature BSL look.
+        ColorGrading {
+            global: ColorGradingGlobal {
+                exposure: 0.0,
+                temperature: 0.1,
+                tint: 0.0,
+                hue: 0.0,
+                post_saturation: 1.1,
+                midtones_range: 0.2..0.7,
+            },
+            shadows: ColorGradingSection {
+                saturation: 1.15,
+                contrast: 1.05,
+                gamma: 1.0,
+                gain: 1.0,
+                lift: 0.015,
+            },
+            midtones: ColorGradingSection {
+                saturation: 1.05,
+                contrast: 1.02,
+                gamma: 1.0,
+                gain: 1.0,
+                lift: 0.0,
+            },
+            highlights: ColorGradingSection {
+                saturation: 0.95,
+                contrast: 1.0,
+                gamma: 1.0,
+                gain: 1.0,
+                lift: 0.0,
+            },
+        },
+        Msaa::Off,
     ));
 }
 
