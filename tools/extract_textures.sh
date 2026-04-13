@@ -63,7 +63,7 @@ mkdir -p "$OUTPUT_DIR"
 ok=0
 fail=0
 
-echo "$BLOCKS" | while IFS='|' read -r block relpath animated; do
+while IFS='|' read -r block relpath animated; do
     # Skip empty lines
     [ -z "$block" ] && continue
 
@@ -87,8 +87,7 @@ echo "$BLOCKS" | while IFS='|' read -r block relpath animated; do
 
     echo "  OK    $block  ($relpath)"
     ok=$((ok + 1))
-done
+done <<< "$BLOCKS"
 
 echo ""
-echo "Done → $OUTPUT_DIR/"
-ls -1 "$OUTPUT_DIR"/*.png 2>/dev/null | wc -l | xargs -I{} echo "{} textures extracted"
+echo "Done: $ok extracted, $fail missing → $OUTPUT_DIR/"

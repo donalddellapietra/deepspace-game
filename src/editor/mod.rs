@@ -1,3 +1,4 @@
+pub mod debug;
 pub mod save_mode;
 pub mod toast;
 pub mod tools;
@@ -44,7 +45,7 @@ impl Plugin for EditorPlugin {
                     save_mode::update_save_tint
                         .after(crate::interaction::update_target)
                         .after(crate::world::render::render_world),
-                    tools::debug_texture_test,
+                    debug::debug_texture_test,
                 ),
             );
     }

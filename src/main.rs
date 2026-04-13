@@ -21,17 +21,7 @@ use block::{BslMaterial, PaletteMaterial};
 fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins
-        .set(ImagePlugin {
-            default_sampler: bevy::image::ImageSamplerDescriptor {
-                address_mode_u: bevy::image::ImageAddressMode::Repeat,
-                address_mode_v: bevy::image::ImageAddressMode::Repeat,
-                address_mode_w: bevy::image::ImageAddressMode::Repeat,
-                mag_filter: bevy::image::ImageFilterMode::Nearest,
-                min_filter: bevy::image::ImageFilterMode::Nearest,
-                mipmap_filter: bevy::image::ImageFilterMode::Nearest,
-                ..default()
-            },
-        })
+        .set(ImagePlugin::default())
         .set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Deep Space".into(),
