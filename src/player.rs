@@ -27,6 +27,7 @@ use crate::camera::FpsCam;
 use crate::inventory::InventoryState;
 use crate::world::collision::{self, PLAYER_H};
 use crate::world::position::Position;
+use crate::world::generator::MAX_TERRAIN_AMPLITUDE;
 use crate::world::state::{sphere_center, SPHERE_RADIUS};
 use crate::world::view::{
     bevy_from_position, cell_size_at_layer, position_from_leaf_coord,
@@ -71,7 +72,8 @@ pub struct Velocity(pub Vec3);
 /// of where in the 6-billion-leaf root this lands.
 pub fn spawn_position() -> Position {
     let center = sphere_center();
-    let coord = [center[0], center[1] + SPHERE_RADIUS + 2, center[2]];
+    let max_h = SPHERE_RADIUS + MAX_TERRAIN_AMPLITUDE as i64;
+    let coord = [center[0], center[1] + max_h + 2, center[2]];
     let mut pos = position_from_leaf_coord(coord)
         .expect("sphere spawn position inside world bounds");
     pos.offset = [0.5, 0.0, 0.5];

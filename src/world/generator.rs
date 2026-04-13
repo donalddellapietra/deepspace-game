@@ -14,6 +14,8 @@
 //! [`WorldState::build_grassland_root`](super::state::WorldState::build_grassland_root)
 //! for how the tree is assembled from these two primitives.
 
+use fastnoise_lite::*;
+
 use super::tree::{
     empty_voxel_grid, filled_voxel_grid, voxel_from_block, voxel_idx,
     VoxelGrid, NODE_VOXELS_PER_AXIS,
@@ -30,17 +32,73 @@ pub fn generate_air_leaf() -> VoxelGrid {
     empty_voxel_grid()
 }
 
+// ---------------------------------------------------------- terrain noise
+
+// Noise octaves. Amplitude in leaf voxels, wavelength in leaf voxels.
+// Features at each scale become visible at the layer whose cell size
+// is comparable to the wavelength. All amplitudes stay below layer-9
+// cell size (3125 voxels) so terrain is invisible at layer 8 and below.
+const MOUNTAIN_AMP: f64 = 80.0;
+const MOUNTAIN_FREQ: f32 = 1.0 / 800.0;
+
+const HILL_AMP: f64 = 20.0;
+const HILL_FREQ: f32 = 1.0 / 200.0;
+
+const DETAIL_AMP: f64 = 5.0;
+const DETAIL_FREQ: f32 = 1.0 / 50.0;
+
+/// Maximum possible terrain offset from the base radius. The AABB
+/// culling checks use this as a margin so nodes near the surface
+/// aren't incorrectly classified as all-air or all-solid.
+pub const MAX_TERRAIN_AMPLITUDE: f64 = MOUNTAIN_AMP + HILL_AMP + DETAIL_AMP;
+
+/// 3D noise generators for terrain. Sampled at world-space voxel
+/// positions, so features wrap the sphere naturally with no seams.
+pub struct TerrainNoise {
+    mountain: FastNoiseLite,
+    hill: FastNoiseLite,
+    detail: FastNoiseLite,
+}
+
+impl TerrainNoise {
+    pub fn new(seed: i32) -> Self {
+        let make = |s: i32, freq: f32| {
+            let mut n = FastNoiseLite::with_seed(s);
+            n.set_noise_type(Some(NoiseType::OpenSimplex2));
+            n.set_frequency(Some(freq));
+            n
+        };
+        Self {
+            mountain: make(seed, MOUNTAIN_FREQ),
+            hill: make(seed.wrapping_add(1), HILL_FREQ),
+            detail: make(seed.wrapping_add(2), DETAIL_FREQ),
+        }
+    }
+
+    /// Terrain offset at a world-space position. Positive = surface
+    /// pushed outward (mountain), negative = pushed inward (valley/ocean).
+    pub fn offset(&self, x: f32, y: f32, z: f32) -> f64 {
+        self.mountain.get_noise_3d(x, y, z) as f64 * MOUNTAIN_AMP
+            + self.hill.get_noise_3d(x, y, z) as f64 * HILL_AMP
+            + self.detail.get_noise_3d(x, y, z) as f64 * DETAIL_AMP
+    }
+}
+
 // ---------------------------------------------------------- sphere generation
 
 /// Parameters for a spherical planet.
 pub struct SphereParams {
     pub center: [i64; 3],
     pub radius: i64,
+    pub terrain: Option<TerrainNoise>,
 }
 
-/// Generate a leaf voxel grid by evaluating the sphere density field
-/// at each voxel position. Voxels inside the sphere are coloured by
-/// depth from the surface: Grass (< 3), Dirt (3–10), Stone (> 10).
+/// Generate a leaf voxel grid by evaluating the sphere density field.
+///
+/// The surface radius at each voxel is `radius + terrain_offset(p)`.
+/// Sea level equals the base `radius`. Where terrain dips below sea
+/// level, water fills the gap. Block type depends on depth from the
+/// terrain surface: Grass (< 3), Dirt (3–10), Stone (> 10).
 pub fn generate_sphere_leaf(leaf_origin: [i64; 3], params: &SphereParams) -> VoxelGrid {
     let mut grid = empty_voxel_grid();
     let r = params.radius as f64;
@@ -51,8 +109,21 @@ pub fn generate_sphere_leaf(leaf_origin: [i64; 3], params: &SphereParams) -> Vox
                 let dy = (leaf_origin[1] + y as i64 - params.center[1]) as f64;
                 let dz = (leaf_origin[2] + z as i64 - params.center[2]) as f64;
                 let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-                if dist < r {
-                    let depth = r - dist;
+
+                // Terrain offset pushes surface in/out from base radius.
+                let terrain_r = match &params.terrain {
+                    Some(t) => {
+                        let wx = (leaf_origin[0] + x as i64) as f32;
+                        let wy = (leaf_origin[1] + y as i64) as f32;
+                        let wz = (leaf_origin[2] + z as i64) as f32;
+                        r + t.offset(wx, wy, wz)
+                    }
+                    None => r,
+                };
+
+                if dist < terrain_r {
+                    // Inside terrain surface.
+                    let depth = terrain_r - dist;
                     let block = if depth < 3.0 {
                         BlockType::Grass
                     } else if depth < 10.0 {
@@ -61,21 +132,27 @@ pub fn generate_sphere_leaf(leaf_origin: [i64; 3], params: &SphereParams) -> Vox
                         BlockType::Stone
                     };
                     grid[voxel_idx(x, y, z)] = voxel_from_block(Some(block));
+                } else if dist < r {
+                    // Above terrain but below sea level → water.
+                    grid[voxel_idx(x, y, z)] = voxel_from_block(Some(BlockType::Water));
                 }
+                // else: air (above sea level)
             }
         }
     }
     grid
 }
 
-/// True when the axis-aligned box is entirely outside the sphere
-/// (no voxel in the box can be inside). Uses the standard
+/// True when the AABB is entirely outside the maximum possible
+/// surface (radius + max terrain amplitude). Uses the standard
 /// closest-point-on-AABB distance test.
 pub fn aabb_outside_sphere(
     origin: [i64; 3],
     extent: i64,
     params: &SphereParams,
 ) -> bool {
+    let max_r = params.radius as f64
+        + if params.terrain.is_some() { MAX_TERRAIN_AMPLITUDE } else { 0.0 };
     let closest = [
         params.center[0].clamp(origin[0], origin[0] + extent),
         params.center[1].clamp(origin[1], origin[1] + extent),
@@ -84,12 +161,12 @@ pub fn aabb_outside_sphere(
     let dx = (closest[0] - params.center[0]) as f64;
     let dy = (closest[1] - params.center[1]) as f64;
     let dz = (closest[2] - params.center[2]) as f64;
-    dx * dx + dy * dy + dz * dz >= (params.radius as f64) * (params.radius as f64)
+    dx * dx + dy * dy + dz * dz >= max_r * max_r
 }
 
 /// True when the axis-aligned box is entirely inside a sphere of the
 /// given `radius` centred at `center` (all 8 corners are within
-/// `radius`). The caller may pass a reduced radius to guarantee a
+/// `radius`). The caller passes a reduced radius to guarantee a
 /// minimum depth from the surface.
 pub fn aabb_inside_sphere(
     origin: [i64; 3],

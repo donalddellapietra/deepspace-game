@@ -16,7 +16,8 @@ use bevy::prelude::*;
 
 use super::generator::{
     generate_air_leaf, generate_grass_leaf,
-    generate_sphere_leaf, aabb_inside_sphere, aabb_outside_sphere, SphereParams,
+    generate_sphere_leaf, aabb_inside_sphere, aabb_outside_sphere,
+    SphereParams, TerrainNoise, MAX_TERRAIN_AMPLITUDE,
 };
 use super::tree::{
     downsample_from_library, filled_voxel_grid, slot_coords, uniform_children,
@@ -117,7 +118,7 @@ impl Default for WorldState {
 }
 
 impl WorldState {
-    /// Build a sphere world from the default sphere parameters.
+    /// Build a sphere world with terrain noise.
     pub fn new_sphere() -> Self {
         let mut state = Self {
             root: EMPTY_NODE,
@@ -126,6 +127,7 @@ impl WorldState {
         let params = SphereParams {
             center: sphere_center(),
             radius: SPHERE_RADIUS,
+            terrain: Some(TerrainNoise::new(42)),
         };
         state.build_sphere_root(&params);
         state
@@ -180,8 +182,14 @@ impl WorldState {
         if aabb_outside_sphere(origin, extent, params) {
             return air_tower[layer as usize];
         }
+        let amp = if params.terrain.is_some() {
+            MAX_TERRAIN_AMPLITUDE as i64
+        } else {
+            0
+        };
         if aabb_inside_sphere(
-            origin, extent, params.center, params.radius - STONE_DEPTH,
+            origin, extent, params.center,
+            params.radius - amp - STONE_DEPTH,
         ) {
             return solid_tower[layer as usize];
         }
