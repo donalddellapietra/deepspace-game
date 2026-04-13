@@ -12,7 +12,7 @@ use bevy::{
 
 use crate::block::BslMaterial;
 use crate::player::{Player, PLAYER_HEIGHT};
-use crate::world::view::{cell_size_at_layer, WorldAnchor};
+use crate::world::view::{cell_size_at_layer, scale_for_layer, target_layer_for, WorldAnchor};
 use crate::world::CameraZoom;
 
 // ------------------------------------------------- zoom transition
@@ -36,13 +36,15 @@ struct AnimatingZoom {
 }
 
 impl ZoomTransition {
-    /// Start a new transition. `from_layer` is the layer *before* the
-    /// zoom; `to_layer` is the layer *after*. Cell sizes are stored in
-    /// normalized Bevy units using the anchor's norm factor.
-    pub fn start(&mut self, from_layer: u8, to_layer: u8, anchor: &WorldAnchor) {
+    /// Start a new transition. Each layer's cell size is computed with
+    /// its OWN target norm, not the current anchor.norm, so the
+    /// animation endpoint matches the post-transition steady state.
+    pub fn start(&mut self, from_layer: u8, to_layer: u8) {
+        let from_norm = scale_for_layer(target_layer_for(from_layer));
+        let to_norm = scale_for_layer(target_layer_for(to_layer));
         self.active = Some(AnimatingZoom {
-            from_cell_size: anchor.cell_bevy(from_layer),
-            to_cell_size: anchor.cell_bevy(to_layer),
+            from_cell_size: scale_for_layer(from_layer) / from_norm,
+            to_cell_size: scale_for_layer(to_layer) / to_norm,
             t: 0.0,
         });
     }

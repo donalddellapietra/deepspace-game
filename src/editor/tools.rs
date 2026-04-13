@@ -38,7 +38,6 @@ pub fn zoom_in(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
     world: Res<WorldState>,
-    anchor: Res<WorldAnchor>,
     mut zoom: ResMut<CameraZoom>,
     mut transition: ResMut<ZoomTransition>,
     mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
@@ -49,7 +48,7 @@ pub fn zoom_in(
     if keyboard.just_pressed(KeyCode::KeyF) {
         let old_layer = zoom.layer;
         if zoom.zoom_in() {
-            transition.start(old_layer, zoom.layer, &anchor);
+            transition.start(old_layer, zoom.layer);
             if let Ok((mut pos, mut vel)) = player_q.single_mut() {
                 collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
                 vel.0.y = 0.0;
@@ -65,7 +64,6 @@ pub fn zoom_out(
     keyboard: Res<ButtonInput<KeyCode>>,
     inv: Res<InventoryState>,
     world: Res<WorldState>,
-    anchor: Res<WorldAnchor>,
     mut zoom: ResMut<CameraZoom>,
     mut transition: ResMut<ZoomTransition>,
     mut player_q: Query<(&mut WorldPosition, &mut Velocity), With<Player>>,
@@ -76,7 +74,7 @@ pub fn zoom_out(
     if keyboard.just_pressed(KeyCode::KeyQ) {
         let old_layer = zoom.layer;
         if zoom.zoom_out() {
-            transition.start(old_layer, zoom.layer, &anchor);
+            transition.start(old_layer, zoom.layer);
             if let Ok((mut pos, mut vel)) = player_q.single_mut() {
                 collision::snap_to_ground(&mut pos.0, &world, zoom.layer);
                 vel.0.y = 0.0;
