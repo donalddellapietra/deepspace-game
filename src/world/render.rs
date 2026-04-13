@@ -1,9 +1,9 @@
-//! Uniform-layer tree-walk renderer.
+//! Uniform-layer tree-walk renderer with LOD cascade.
 //!
 //! Every frame, walk the content-addressed tree from the root down to
-//! `CameraZoom.layer + 2` (the target layer) and emit one Bevy entity
-//! per surviving node. Meshes are resolved via `MeshStore` which
-//! checks prebaked data first, then falls back to cold baking.
+//! the emit layer and emit one Bevy entity per surviving node. Near
+//! entities get composed meshes (DETAIL_DEPTH layers of detail); far
+//! entities get flattened meshes (one fewer layer, cheaper).
 //!
 //! See `docs/architecture/rendering.md` for the full design.
 
@@ -16,17 +16,15 @@ use crate::model::BakedSubMesh;
 
 use super::mesh_cache::MeshStore;
 use super::state::WorldState;
-use super::tree::{NodeId, EMPTY_NODE, MAX_LAYER};
-use super::view::{target_layer_for, WorldAnchor};
+use super::tree::{NodeId, DETAIL_DEPTH, MAX_LAYER};
+use super::view::{scale_for_layer, target_layer_for, WorldAnchor};
 use super::walk::{walk, SmallPath, Visit, WalkFrame};
 
 // ------------------------------------------------------- markers
 
-/// Marker on the parent entity of a rendered node.
 #[derive(Component)]
 pub struct WorldRenderedNode(pub NodeId);
 
-/// Marker on each child sub-mesh entity, remembering its voxel index.
 #[derive(Component)]
 pub struct SubMeshBlock(pub u8);
 
@@ -48,26 +46,21 @@ impl Default for CameraZoom {
 
 impl CameraZoom {
     pub fn zoom_in(&mut self) -> bool {
-        if self.layer < MAX_ZOOM {
-            self.layer += 1;
-            true
-        } else {
-            false
-        }
+        if self.layer < MAX_ZOOM { self.layer += 1; true } else { false }
     }
     pub fn zoom_out(&mut self) -> bool {
-        if self.layer > MIN_ZOOM {
-            self.layer -= 1;
-            true
-        } else {
-            false
-        }
+        if self.layer > MIN_ZOOM { self.layer -= 1; true } else { false }
     }
 }
 
 // ---------------------------------------------------------------- constants
 
 pub const RADIUS_VIEW_CELLS: f32 = 32.0;
+
+/// Within this radius (in view cells) entities get composed meshes
+/// (full DETAIL_DEPTH detail). Beyond this out to RADIUS_VIEW_CELLS,
+/// entities get flattened meshes (one fewer layer, cheaper).
+pub const FINE_RADIUS_VIEW_CELLS: f32 = 8.0;
 
 // ----------------------------------------------------------------- state
 
@@ -86,11 +79,9 @@ pub struct RenderTimings {
 
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Mesh store: handles prebaked loading, cold baking, and caching.
     pub mesh_store: MeshStore,
-    /// Live entities, keyed by tree path.
-    entities: HashMap<SmallPath, (Entity, NodeId, Vec3)>,
-    /// Zoom layer the entities were built for.
+    /// Tuple: (entity, node_id, origin, compose_flag).
+    entities: HashMap<SmallPath, (Entity, NodeId, Vec3, bool)>,
     last_zoom_layer: u8,
     initialised: bool,
     pub force_rebuild: bool,
@@ -101,7 +92,6 @@ pub struct RenderState {
 
 // ----------------------------------------------------------------- system
 
-/// Bevy system: walk the tree, reconcile `RenderState` entities.
 pub fn render_world(
     mut commands: Commands,
     world: Res<WorldState>,
@@ -119,49 +109,61 @@ pub fn render_world(
     let camera_pos = camera_tf.translation;
     let render_total_start = bevy::platform::time::Instant::now();
 
-    // Load prebaked meshes on first frame.
     render_state.mesh_store.ensure_loaded(world.canned_world_hash);
 
     let target_layer = target_layer_for(zoom.layer);
-    let emit_layer = target_layer.saturating_sub(1);
-    let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
+    let use_composition = zoom.layer + DETAIL_DEPTH <= MAX_LAYER;
 
-    // On zoom change or first pass, drop entities but keep mesh cache.
+    // Single emit layer: target-2 when composition possible, else target-1.
+    let emit_layer = if use_composition {
+        target_layer.saturating_sub(2)
+    } else {
+        target_layer.saturating_sub(1)
+    };
+
+    let cell = anchor.cell_bevy(zoom.layer);
+    let radius_bevy = RADIUS_VIEW_CELLS * cell;
+    let fine_radius_sq = (FINE_RADIUS_VIEW_CELLS * cell).powi(2);
+
+    // Composed meshes are in target-layer voxels [0, 625).
+    // Flattened meshes are in (emit+1)-layer voxels [0, 125).
+    let compose_scale = scale_for_layer(target_layer) / anchor.norm;
+    let flatten_scale = scale_for_layer((emit_layer + 1).min(MAX_LAYER)) / anchor.norm;
+
+    // On zoom change, drop entities and clear caches.
     if !render_state.initialised
-        || render_state.last_zoom_layer != emit_layer
+        || render_state.last_zoom_layer != zoom.layer
         || render_state.force_rebuild
     {
         render_state.force_rebuild = false;
-        for (_, (entity, _, _)) in render_state.entities.drain() {
+        for (_, (entity, _, _, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
         }
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
         render_state.mesh_store.clear_paths();
-        render_state.last_zoom_layer = emit_layer;
+        render_state.last_zoom_layer = zoom.layer;
         render_state.initialised = true;
     }
 
-    // Receive completed async mesh loads from the I/O thread.
     render_state.mesh_store.receive_async_meshes(&mut meshes);
 
-    // Walk the tree → collect visible nodes.
+    // Walk the tree.
     timings.bake_us = 0;
     let walk_start = bevy::platform::time::Instant::now();
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
-        &world, emit_layer, target_layer,
+        &world, emit_layer,
+        compose_scale, flatten_scale, use_composition, fine_radius_sq,
         camera_pos, radius_bevy, &anchor,
         &mut walk_stack, &mut visits,
     );
     timings.walk_us = walk_start.elapsed().as_micros() as u64;
     timings.visit_count = visits.len();
 
-    // Bake pass: ensure every visited node has a mesh, or request it
-    // async. Nodes pending async load return false — the reconcile
-    // step will use parent-fallback for them.
+    // Bake pass.
     const MAX_COLD_BAKES: usize = 16;
     {
         let bake_start = bevy::platform::time::Instant::now();
@@ -171,7 +173,6 @@ pub fn render_world(
                 &world, v.node_id, &v.path, &mut meshes,
                 &mut cold_bakes, MAX_COLD_BAKES,
             );
-
             if let Some(node) = world.library.get(v.node_id) {
                 if node.children.is_some() {
                     render_state.mesh_store.set_path_node(v.path, v.node_id);
@@ -187,7 +188,7 @@ pub fn render_world(
 
     // Reconcile: spawn/update/despawn entities.
     let reconcile_start = bevy::platform::time::Instant::now();
-    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
+    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3, bool)> =
         HashMap::with_capacity(visits.len());
 
     for visit in visits.drain(..) {
@@ -195,8 +196,8 @@ pub fn render_world(
         let existing = render_state.entities.remove(&visit.path);
 
         match existing {
-            Some((entity, existing_id, last_origin))
-                if existing_id == new_node_id =>
+            Some((entity, existing_id, last_origin, last_compose))
+                if existing_id == new_node_id && last_compose == visit.compose =>
             {
                 if last_origin != visit.origin {
                     if let Ok(mut ec) = commands.get_entity(entity) {
@@ -206,10 +207,10 @@ pub fn render_world(
                         );
                     }
                 }
-                alive.insert(visit.path, (entity, existing_id, visit.origin));
+                alive.insert(visit.path, (entity, existing_id, visit.origin, visit.compose));
             }
             other => {
-                if let Some((old_entity, _, _)) = other {
+                if let Some((old_entity, _, _, _)) = other {
                     if let Ok(mut ec) = commands.get_entity(old_entity) {
                         ec.despawn();
                     }
@@ -241,19 +242,18 @@ pub fn render_world(
                     ));
                 }
 
-                alive.insert(visit.path, (parent, new_node_id, visit.origin));
+                alive.insert(visit.path, (parent, new_node_id, visit.origin, visit.compose));
             }
         }
     }
 
-    for (_, (entity, _, _)) in render_state.entities.drain() {
+    for (_, (entity, _, _, _)) in render_state.entities.drain() {
         if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
         }
     }
     render_state.entities = alive;
 
-    // Overlay reconcile (NPCs).
     super::overlay::reconcile_overlays(
         &mut commands, &world, &palette, &mut meshes,
         &overlay_list, &mut render_state.overlay,
@@ -261,9 +261,7 @@ pub fn render_world(
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
 
-    // Prefetch: async-request meshes for adjacent zoom layers so the
-    // next zoom transition has data ready. Non-blocking, no frame cost
-    // beyond the walk itself.
+    // Prefetch adjacent zoom layers.
     {
         let prefetch_layers: [Option<u8>; 2] = [
             if zoom.layer > MIN_ZOOM { Some(zoom.layer - 1) } else { None },
@@ -271,16 +269,26 @@ pub fn render_world(
         ];
         for pf_layer in prefetch_layers.into_iter().flatten() {
             let pf_target = target_layer_for(pf_layer);
-            let pf_emit = pf_target.saturating_sub(1);
-            let pf_radius = RADIUS_VIEW_CELLS * anchor.cell_bevy(pf_layer);
+            let pf_use_comp = pf_layer + DETAIL_DEPTH <= MAX_LAYER;
+            let pf_emit = if pf_use_comp {
+                pf_target.saturating_sub(2)
+            } else {
+                pf_target.saturating_sub(1)
+            };
+            let pf_cell = anchor.cell_bevy(pf_layer);
+            let pf_radius = RADIUS_VIEW_CELLS * pf_cell;
+            let pf_fine_sq = (FINE_RADIUS_VIEW_CELLS * pf_cell).powi(2);
+            let pf_compose_scale = scale_for_layer(pf_target) / anchor.norm;
+            let pf_flatten_scale = scale_for_layer((pf_emit + 1).min(MAX_LAYER)) / anchor.norm;
             walk(
-                &world, pf_emit, pf_target,
+                &world, pf_emit,
+                pf_compose_scale, pf_flatten_scale, pf_use_comp, pf_fine_sq,
                 camera_pos, pf_radius, &anchor,
                 &mut walk_stack, &mut visits,
             );
             for pv in visits.iter() {
                 let dist = pv.origin.distance(camera_pos);
-                render_state.mesh_store.prefetch(pv.node_id, (dist * 10.0) as u32);
+                render_state.mesh_store.prefetch(pv.node_id, dist.min(u32::MAX as f32) as u32);
             }
         }
     }

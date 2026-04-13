@@ -53,6 +53,9 @@ pub struct Visit {
     pub node_id: NodeId,
     pub origin: Vec3,
     pub scale: f32,
+    /// True for near entities (composed, 3-layer detail).
+    /// False for far entities (flattened, 2-layer, cheaper mesh).
+    pub compose: bool,
 }
 
 /// One frame on the `walk()` DFS stack.
@@ -75,7 +78,10 @@ pub struct WalkFrame {
 pub fn walk(
     world: &super::state::WorldState,
     emit_layer: u8,
-    target_layer: u8,
+    compose_scale: f32,
+    flatten_scale: f32,
+    use_composition: bool,
+    fine_radius_sq: f32,
     camera_pos: Vec3,
     radius_bevy: f32,
     anchor: &WorldAnchor,
@@ -136,11 +142,13 @@ pub fn walk(
         }
 
         if depth == emit_layer {
+            let compose = use_composition && min_dist_sq <= fine_radius_sq;
             out.push(Visit {
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: 1.0,
+                scale: if compose { compose_scale } else { flatten_scale },
+                compose,
             });
             continue;
         }
@@ -151,7 +159,8 @@ pub fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: 1.0,
+                scale: flatten_scale,
+                compose: false,
             });
             continue;
         };
@@ -184,59 +193,50 @@ pub fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::render::{CameraZoom, RADIUS_VIEW_CELLS, MIN_ZOOM, MAX_ZOOM};
+    use crate::world::render::{RADIUS_VIEW_CELLS, MIN_ZOOM, MAX_ZOOM};
     use crate::world::state::WorldState;
     use crate::world::tree::MAX_LAYER;
-    use crate::world::view::{cell_size_at_layer, target_layer_for};
+    use crate::world::view::{cell_size_at_layer, target_layer_for, scale_for_layer};
 
     fn anchor_origin() -> WorldAnchor {
         WorldAnchor { leaf_coord: [0, 0, 0], norm: 1.0 }
     }
 
+    fn test_walk(world: &WorldState, view_layer: u8) -> Vec<Visit> {
+        let target = target_layer_for(view_layer);
+        let emit = target.saturating_sub(1);
+        let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
+        let compose_scale = scale_for_layer(target);
+        let flatten_scale = scale_for_layer((emit + 1).min(MAX_LAYER));
+        let mut stack = Vec::new();
+        let mut visits = Vec::new();
+        walk(
+            world, emit, compose_scale, flatten_scale, false, 0.0,
+            Vec3::ZERO, radius, &anchor_origin(),
+            &mut stack, &mut visits,
+        );
+        visits
+    }
+
     #[test]
     fn walk_grassland_at_leaves_emits_at_least_one_visit() {
         let world = WorldState::new_grassland();
-        let mut stack = Vec::new();
-        let mut visits = Vec::new();
-        let target = target_layer_for(MAX_LAYER);
-        let emit = target.saturating_sub(1);
-        walk(
-            &world, emit, target, Vec3::ZERO,
-            RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
-            &anchor_origin(), &mut stack, &mut visits,
-        );
+        let visits = test_walk(&world, MAX_LAYER);
         assert!(!visits.is_empty());
     }
 
     #[test]
     fn walk_radius_limits_emit_count() {
         let world = WorldState::new_grassland();
-        let mut stack = Vec::new();
-        let mut visits = Vec::new();
-        let target = target_layer_for(MAX_LAYER);
-        let emit = target.saturating_sub(1);
-        walk(
-            &world, emit, target, Vec3::ZERO,
-            RADIUS_VIEW_CELLS * cell_size_at_layer(MAX_LAYER),
-            &anchor_origin(), &mut stack, &mut visits,
-        );
+        let visits = test_walk(&world, MAX_LAYER);
         assert!(visits.len() < 200_000, "walk emitted {} visits", visits.len());
     }
 
     #[test]
     fn walk_radius_scales_with_view_layer() {
         let world = WorldState::new_grassland();
-        let anchor = anchor_origin();
-        let mut stack = Vec::new();
         for view_layer in (MIN_ZOOM..=MAX_ZOOM).rev() {
-            let target = target_layer_for(view_layer);
-            let emit = target.saturating_sub(1);
-            let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
-            let mut visits = Vec::new();
-            walk(
-                &world, emit, target, Vec3::ZERO, radius,
-                &anchor, &mut stack, &mut visits,
-            );
+            let visits = test_walk(&world, view_layer);
             assert!(visits.len() > 0, "view layer {view_layer}: 0 visits");
         }
     }
