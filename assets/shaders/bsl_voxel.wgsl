@@ -56,6 +56,16 @@ fn fragment(
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 
+    // Near the clip boundary, disable SSAO in PBR lighting too
+    // (not just the BSL AO layer). Without this, apply_pbr_lighting
+    // still applies the dark SSAO halo via diffuse_occlusion.
+    if (bsl.clip_radius > 0.0) {
+        let fade_start_sq = bsl.clip_radius * bsl.clip_radius * 0.64;
+        let fade_end_sq = bsl.clip_radius * bsl.clip_radius;
+        let pbr_ao_fade = 1.0 - smoothstep(fade_start_sq, fade_end_sq, clip_dist_sq);
+        pbr_input.diffuse_occlusion = mix(vec3(1.0), pbr_input.diffuse_occlusion, vec3(pbr_ao_fade));
+    }
+
 #ifdef PREPASS_PIPELINE
     let out = deferred_output(in, pbr_input);
 #else
