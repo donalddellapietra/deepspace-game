@@ -108,9 +108,14 @@ fn spawn_camera(
         Transform::default(),
         Tonemapping::AcesFitted,
         ShadowFilteringMethod::Gaussian,
-        // SSAO disabled — creates color mismatch between terrain (darkened)
-        // and annulus (bright), making the terrain edge visible as a
-        // second horizon. Will re-enable with edge masking later.
+        // SSAO re-enabled. Creates a subtle dark halo at the terrain
+        // clip boundary (depth discontinuity artifact). This is the
+        // tradeoff: SSAO quality on terrain vs clean horizon edge.
+        // The halo is smooth (thanks to shader clip) but visible.
+        ScreenSpaceAmbientOcclusion {
+            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
+            constant_object_thickness: 4.0,
+        },
         // Bloom only on bright highlights (threshold 0.8) — sky, sun
         // reflections, emissive blocks. Energy-conserving mode adds
         // glow without washing out. Reduced max_mip_dimension cuts
