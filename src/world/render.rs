@@ -543,6 +543,7 @@ struct WalkFrame {
 fn walk(
     world: &WorldState,
     emit_layer: u8,
+    entity_scale: f32,
     camera_pos: Vec3,
     radius_bevy: f32,
     anchor: &WorldAnchor,
@@ -609,7 +610,7 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: 1.0,
+                scale: entity_scale,
             });
             continue;
         }
@@ -623,7 +624,7 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: 1.0,
+                scale: entity_scale,
             });
             continue;
         };
@@ -688,6 +689,10 @@ pub fn render_world(
 
     let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
 
+    // Entity scale: mesh coordinates are in target-layer voxels, but
+    // norm is based on (zoom+1). Scale converts mesh units to Bevy units.
+    let entity_scale = scale_for_layer(target_layer) / anchor.norm;
+
     // If zoom changed, first pass, or forced rebuild, drop everything.
     if !render_state.initialised
         || render_state.last_zoom_layer != zoom.layer
@@ -714,6 +719,7 @@ pub fn render_world(
     walk(
         &world,
         emit_layer,
+        entity_scale,
         camera_pos,
         radius_bevy,
         &anchor,

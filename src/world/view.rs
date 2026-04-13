@@ -83,18 +83,16 @@ use super::tree::{
 pub struct WorldAnchor {
     pub leaf_coord: [i64; 3],
     /// Normalization divisor: how many leaf voxels equal one Bevy unit.
-    /// Set to `scale_for_layer(target_layer_for(zoom.layer))` so that
-    /// Bevy-space coordinates stay in a bounded range (~800 units)
-    /// regardless of zoom level. This prevents atmosphere LUT banding
-    /// and post-processing artifacts caused by huge coordinate ranges
-    /// at zoomed-out layers.
+    /// Set to `norm_for_layer(zoom.layer)` = `scale_for_layer(view+1)`
+    /// so that Bevy-space coordinates stay bounded (~800 units)
+    /// regardless of zoom level or DETAIL_DEPTH.
     pub norm: f32,
 }
 
 impl WorldAnchor {
     /// Size of one cell at `layer` in normalized Bevy units.
-    /// At the target layer this is 1.0; at the view layer it's
-    /// typically 25.0 (= 5^(target - view) = 5^2).
+    /// At the emit layer (view+1) this is 1.0; at the view layer
+    /// it's 5.0.
     #[inline]
     pub fn cell_bevy(&self, layer: u8) -> f32 {
         scale_for_layer(layer) / self.norm
@@ -157,6 +155,14 @@ pub fn cell_size_at_layer(layer: u8) -> f32 {
 #[inline]
 pub fn target_layer_for(view_layer: u8) -> u8 {
     view_layer.saturating_add(DETAIL_DEPTH).min(MAX_LAYER)
+}
+
+/// The normalization divisor for a given view layer. Based on
+/// `view + 1` (one layer below the view) so that Bevy-space
+/// coordinates stay bounded (~800 units) regardless of DETAIL_DEPTH.
+#[inline]
+pub fn norm_for_layer(view_layer: u8) -> f32 {
+    scale_for_layer((view_layer + 1).min(MAX_LAYER))
 }
 
 /// Bevy offset from the given `anchor` to the `-x, -y, -z` corner

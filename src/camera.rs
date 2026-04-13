@@ -14,7 +14,7 @@ use bevy::{
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 
 use crate::player::{Player, PLAYER_HEIGHT};
-use crate::world::view::{cell_size_at_layer, scale_for_layer, target_layer_for, WorldAnchor};
+use crate::world::view::{cell_size_at_layer, norm_for_layer, scale_for_layer, target_layer_for, WorldAnchor};
 use crate::world::CameraZoom;
 
 // ------------------------------------------------- zoom transition
@@ -42,8 +42,8 @@ impl ZoomTransition {
     /// its OWN target norm, not the current anchor.norm, so the
     /// animation endpoint matches the post-transition steady state.
     pub fn start(&mut self, from_layer: u8, to_layer: u8) {
-        let from_norm = scale_for_layer(target_layer_for(from_layer));
-        let to_norm = scale_for_layer(target_layer_for(to_layer));
+        let from_norm = norm_for_layer(from_layer);
+        let to_norm = norm_for_layer(to_layer);
         self.active = Some(AnimatingZoom {
             from_cell_size: scale_for_layer(from_layer) / from_norm,
             to_cell_size: scale_for_layer(to_layer) / to_norm,
