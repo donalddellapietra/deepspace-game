@@ -53,6 +53,7 @@ fn main() {
             ui::UiPlugin,
             overlay::OverlayPlugin,
             npc::NpcPlugin,
+            world::instanced_overlay::NpcInstancePlugin,
             diagnostics::DiagnosticsPlugin,
         ))
         .add_systems(Startup, setup_environment)

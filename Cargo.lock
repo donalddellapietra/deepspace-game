@@ -2311,6 +2311,7 @@ name = "deepspace-game"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
  "dot_vox",
  "fastnoise-lite",
  "getrandom 0.3.4",

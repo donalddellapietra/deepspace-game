@@ -17,6 +17,7 @@
 pub mod collision;
 pub mod edit;
 pub mod generator;
+pub mod instanced_overlay;
 pub mod overlay;
 pub mod position;
 pub mod render;
