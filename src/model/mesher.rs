@@ -104,7 +104,7 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
 
 /// Raw face data for one voxel type, before conversion to a Mesh.
 /// Stored per-child so edits only re-bake the affected child.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default)]
 pub struct FaceData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
@@ -147,8 +147,9 @@ struct CompactFaceData {
     normals: Vec<u8>,
     /// 1 byte per vertex: AO level (0..4).
     ao_levels: Vec<u8>,
-    /// u16 triangle indices.
-    indices: Vec<u16>,
+    /// Full u32 indices — NOT u16, because merged nodes can have
+    /// 75,000+ vertices (125 children × ~600 vertices each).
+    indices: Vec<u32>,
 }
 
 impl From<&FaceData> for CompactFaceData {
@@ -165,7 +166,7 @@ impl From<&FaceData> for CompactFaceData {
             normals.push(encode_normal(&f.normals[i]));
             ao_levels.push(ao_level_from_brightness(f.colors[i][0]));
         }
-        let indices: Vec<u16> = f.indices.iter().map(|&i| i as u16).collect();
+        let indices = f.indices.clone();
         CompactFaceData { positions, normals, ao_levels, indices }
     }
 }
@@ -186,15 +187,22 @@ impl From<CompactFaceData> for FaceData {
             let brightness = AO_CURVE[c.ao_levels[i] as usize];
             colors.push([brightness, brightness, brightness, 1.0]);
         }
-        let indices: Vec<u32> = c.indices.iter().map(|&i| i as u32).collect();
+        let indices = c.indices;
         FaceData { positions, normals, colors, indices }
     }
 }
 
-// Compact serialization disabled — using raw f32 derive.
-// Re-enable once the sphere holes bug is fixed.
-// impl serde::Serialize for FaceData { ... }
-// impl<'de> serde::Deserialize<'de> for FaceData { ... }
+impl serde::Serialize for FaceData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        CompactFaceData::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FaceData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        CompactFaceData::deserialize(deserializer).map(FaceData::from)
+    }
+}
 
 impl FaceData {
     fn add_quad(&mut self, quad: &[Vec3; 4], normal: Vec3, offset: Vec3, ao: [u8; 4]) {
