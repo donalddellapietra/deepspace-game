@@ -22,6 +22,7 @@ use crate::block::{BslMaterial, Palette, PaletteEntry};
 use crate::camera::FpsCam;
 use crate::player::Player;
 use crate::world::collision;
+use crate::world::npc_compute::{GpuNpcState, NpcGpuData};
 use crate::world::overlay::{OverlayInstance, OverlayList, OverlayPart};
 use crate::world::tree::{
     voxel_idx, NodeId, Voxel, EMPTY_VOXEL, NODE_VOXELS, NODE_VOXELS_PER_AXIS,
@@ -453,6 +454,7 @@ impl Plugin for NpcPlugin {
                     npc_buf_animate,
                     npc_buf_physics,
                     npc_despawn_on_zoom,
+                    sync_gpu_uniforms,
                     collect_overlays_from_buffer
                         .after(npc_buf_animate)
                         .after(crate::player::derive_transforms),
@@ -665,6 +667,7 @@ fn spawn_npc_on_keypress(
     tree_bp: Option<Res<TreeBlueprint>>,
     player_q: Query<&WorldPosition, With<Player>>,
     mut npc_buffer: ResMut<NpcBuffer>,
+    mut gpu_data: ResMut<NpcGpuData>,
     anchor: Res<WorldAnchor>,
     zoom: Res<CameraZoom>,
     cam_q: Query<&FpsCam>,
@@ -724,8 +727,24 @@ fn spawn_npc_on_keypress(
         npc.anim_time = rand_f32_seeded(i as u32 + 5555) * 2.0;
         npc.ai_timer = 2.0 + rand_f32_seeded(i as u32 + 9999) * 3.0;
         npc.part_transforms = rest_parts;
+
+        // Also populate GPU data for the compute shader.
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        gpu_data.states.push(GpuNpcState {
+            position: bevy_pos.to_array(),
+            heading: npc.heading,
+            velocity: [0.0; 3],
+            ai_timer: npc.ai_timer,
+            anim_time: npc.anim_time,
+            speed: NPC_WALK_SPEED_CELLS * cell,
+            seed: i as u32 + 42,
+            flags: 1, // alive
+        });
+
         npc_buffer.npcs.push(npc);
     }
+
+    gpu_data.dirty = true;
 
     info!(
         "Spawned {} NPC(s) '{}' (total now ~{}, layer {})",
@@ -944,6 +963,19 @@ pub fn collect_overlays_from_buffer(
             scale,
         });
     }
+}
+
+// ============================================== GPU sync
+
+/// Update NpcGpuData uniforms each frame so the compute shader
+/// has current delta_time, frame count, and NPC count.
+fn sync_gpu_uniforms(
+    time: Res<Time>,
+    mut gpu_data: ResMut<NpcGpuData>,
+) {
+    gpu_data.uniforms.delta_time = time.delta_secs();
+    gpu_data.uniforms.frame = gpu_data.uniforms.frame.wrapping_add(1);
+    gpu_data.uniforms.npc_count = gpu_data.states.len() as u32;
 }
 
 // ============================================== NPC voxel editing
