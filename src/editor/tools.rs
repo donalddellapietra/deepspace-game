@@ -13,7 +13,8 @@ use crate::world::collision;
 use crate::world::edit::{
     edit_at_layer_pos, install_subtree, subtree_path_for_layer_pos,
 };
-use crate::world::tree::EMPTY_VOXEL;
+use crate::block::BlockType;
+use crate::world::tree::{voxel_from_block, EMPTY_VOXEL, MAX_LAYER};
 use crate::world::view::{
     bevy_center_of_layer_pos, cell_size_at_layer, layer_pos_from_bevy,
     target_layer_for, WorldAnchor,
@@ -275,4 +276,66 @@ pub fn place_block(
             install_subtree(&mut world, &path, saved.node_id);
         }
     }
+}
+
+/// F9 (or auto on first frame) → carve a pit near spawn and place one
+/// of each block type so textures can be visually inspected.
+pub fn debug_texture_test(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut world: ResMut<WorldState>,
+    mut frame: Local<u32>,
+) {
+    *frame += 1;
+    // Auto-fire on frame 2 (world is initialized by then), or on F9.
+    if *frame != 2 && !keyboard.just_pressed(KeyCode::F9) {
+        return;
+    }
+    if *frame > 2 && !keyboard.just_pressed(KeyCode::F9) {
+        return;
+    }
+
+    let spawn = spawn_position();
+    let base_path = spawn.path;
+
+    // Helper: edit a voxel at (dx, dy, dz) relative to the spawn voxel.
+    let mut edit = |dx: i8, dy: i8, dz: i8, voxel: u8| {
+        let cx = (spawn.voxel[0] as i8 + dx) as u8;
+        let cy = (spawn.voxel[1] as i8 + dy) as u8;
+        let cz = (spawn.voxel[2] as i8 + dz) as u8;
+        if cx < 25 && cy < 25 && cz < 25 {
+            let lp = crate::world::position::LayerPos::from_path_and_cell(
+                base_path,
+                [cx, cy, cz],
+                MAX_LAYER,
+            );
+            edit_at_layer_pos(&mut world, &lp, voxel);
+        }
+    };
+
+    // Carve a 5x3x5 pit in front of the player (negative Z)
+    for dx in -2..=2i8 {
+        for dz in -5..=-1i8 {
+            for dy in -3..=-1i8 {
+                edit(dx, dy, dz, EMPTY_VOXEL);
+            }
+        }
+    }
+
+    // Place a row of different block types along the pit floor
+    let blocks = BlockType::ALL;
+    for (i, bt) in blocks.iter().enumerate() {
+        let dx = (i as i8) - 2;
+        if (-2..=2).contains(&dx) {
+            edit(dx, -3, -3, voxel_from_block(Some(*bt)));
+        }
+    }
+    // Place remaining blocks in second row
+    for (i, bt) in blocks.iter().enumerate().skip(5) {
+        let dx = (i as i8) - 7;
+        if (-2..=2).contains(&dx) {
+            edit(dx, -3, -4, voxel_from_block(Some(*bt)));
+        }
+    }
+
+    info!("Debug texture test: carved pit and placed block samples near spawn. Look down!");
 }

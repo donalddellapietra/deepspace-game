@@ -210,6 +210,7 @@ mod blueprint_json {
                     } else {
                         AlphaMode::Opaque
                     },
+                    texture: None,
                 },
                 mat_assets,
             );

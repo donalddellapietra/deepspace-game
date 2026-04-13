@@ -367,6 +367,7 @@ fn poll_ui_commands(
                         roughness: 0.9,
                         metallic: 0.0,
                         alpha_mode: AlphaMode::Opaque,
+                        texture: None,
                     },
                     &mut materials,
                 );
