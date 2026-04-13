@@ -158,6 +158,7 @@ pub fn remove_block(
     blueprints: Option<Res<TreeBlueprints>>,
     npc_buffer: Res<NpcBuffer>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut ground_cache: ResMut<GroundCache>,
     mut world: ResMut<WorldState>,
     mut npc_q: Query<(&NpcHandle, &mut NpcPartOverrides), With<Npc>>,
@@ -200,16 +201,10 @@ pub fn remove_block(
     };
     edit_at_layer_pos(&mut world, lp, EMPTY_VOXEL);
 
-    // Invalidate ground cache near the edit so NPCs respond to terrain changes.
+    // Invalidate ground cache near the edit.
     let cell = crate::world::view::cell_size_at_layer(zoom.layer);
-    if let Some(lp) = &targeted.hit_layer_pos {
-        let min = crate::world::view::layer_pos_min_leaf_coord(lp);
-        let anchor = crate::world::view::WorldAnchor::default();
-        // Approximate: use cell coords directly for invalidation.
-        let cx = (min[0] as f32 / cell).floor() as f32;
-        let cz = (min[2] as f32 / cell).floor() as f32;
-        ground_cache.invalidate_near(cx * cell, cz * cell, cell, 3);
-    }
+    let hit_center = crate::world::view::bevy_center_of_layer_pos(lp, &anchor);
+    ground_cache.invalidate_near(hit_center.x, hit_center.z, cell, 3);
 }
 
 /// Right-click → place the active hotbar block on the face of the
