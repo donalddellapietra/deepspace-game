@@ -1,8 +1,9 @@
 // BSL-inspired voxel lighting shader.
 //
 // Extends StandardMaterial's PBR output with:
-// - Vertex-baked AO integration (squared skylight curve from BSL)
-// - BSL-style ambient/lit blending
+// - SSAO integration with BSL's squared skylight curve
+// - Vertex AO fallback when SSAO is unavailable
+// - Warm sun / cool shadow ambient blending (BSL signature look)
 // - Subsurface scattering for translucent blocks (leaves, water, glass)
 
 #import bevy_pbr::{
@@ -45,52 +46,38 @@ fn fragment(
 #else
     var out: FragmentOutput;
 
-    // Standard PBR lighting (includes shadow sampling, cascade blending, etc.)
     var lit_color = apply_pbr_lighting(pbr_input);
 
-    // --- BSL-style post-processing ---
-
-    // Vertex AO from the greedy mesher (greyscale in vertex color, range ~0.6..1.0).
-    // StandardMaterial already multiplied base_color by vertex color, so the AO
-    // is baked into lit_color. We read the raw AO value to apply BSL's squared
-    // skylight curve on top.
+    // --- Ambient occlusion ---
+    // Use SSAO (diffuse_occlusion) as the primary AO source. Falls
+    // back to vertex-color AO from the greedy mesher when SSAO is
+    // unavailable (e.g. WASM). Both use BSL's squared skylight curve.
+    let ssao = pbr_input.diffuse_occlusion.r;
 #ifdef VERTEX_COLORS
-    let ao_raw = in.color.r;
+    let ao_raw = min(ssao, in.color.r);
 #else
-    let ao_raw = 1.0;
+    let ao_raw = ssao;
 #endif
-
-    // BSL squares the skylight (AO) for a softer falloff in occluded areas —
-    // corners darken more than edges, matching how real ambient light
-    // attenuates in concavities.
     let ao = mix(1.0, ao_raw * ao_raw, bsl.ao_strength);
+    lit_color = vec4(lit_color.rgb * ao, lit_color.a);
 
-    // Modulate the lit result: in fully occluded areas (ao~0.36) the color
-    // darkens significantly; in open areas (ao=1.0) it passes through.
-    // BSL's formula: sceneLighting = mix(ambientCol * skylight², lightCol, shadow * NoL)
-    // Since PBR already computed the shadow*NoL term, we approximate by
-    // tinting shadowed (dark) regions toward the ambient color.
+    // --- Warm sun / cool shadow blending ---
     let luminance = dot(lit_color.rgb, vec3(0.299, 0.587, 0.114));
     let ambient_tint = bsl.ambient_color.rgb * bsl.ambient_color.a;
-
-    // Blend ambient tint into dark regions (where luminance is low = in shadow).
-    // In well-lit areas, ao modulation alone is enough.
-    let shadow_blend = saturate(1.0 - luminance * 2.0);
+    let shadow_blend = 1.0 - smoothstep(0.05, 0.5, luminance);
+    let base_lum = max(dot(pbr_input.material.base_color.rgb, vec3(0.299, 0.587, 0.114)), 0.05);
     lit_color = vec4(
-        lit_color.rgb * ao + ambient_tint * shadow_blend * ao * 0.5,
+        lit_color.rgb + ambient_tint * shadow_blend * base_lum * 0.4,
         lit_color.a,
     );
 
-    // Subsurface scattering for translucent blocks.
-    // BSL: VoL = dot(viewDir, lightDir) * 0.5 + 0.5, scattering = pow(VoL, 16)
+    // --- Subsurface scattering for translucent blocks ---
     if (bsl.subsurface_strength > 0.0) {
         let world_normal = normalize(in.world_normal);
-        // Approximate: back-facing surfaces relative to the main light
-        // get a soft glow. We use the normal as a proxy for the
-        // light-to-view transmission direction.
         let transmission = saturate(-world_normal.y * 0.5 + 0.5);
-        let sss = pow(transmission, 4.0) * bsl.subsurface_strength * 0.3;
-        lit_color = vec4(lit_color.rgb + pbr_input.material.base_color.rgb * sss, lit_color.a);
+        let sss = pow(transmission, 6.0) * bsl.subsurface_strength * 0.35;
+        let sss_color = pbr_input.material.base_color.rgb * vec3(1.1, 1.0, 0.9);
+        lit_color = vec4(lit_color.rgb + sss_color * sss, lit_color.a);
     }
 
     out.color = main_pass_post_lighting_processing(pbr_input, lit_color);

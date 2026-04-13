@@ -20,6 +20,8 @@ use bevy::prelude::*;
 use crate::camera::FpsCam;
 use crate::editor::save_mode::{save_mode_eligible, SaveMode};
 use crate::world::position::LayerPos;
+use crate::world::overlay::OverlayList;
+use crate::world::tree::{EMPTY_VOXEL, NODE_VOXELS_PER_AXIS};
 use crate::world::view::{
     bevy_origin_of_layer_pos, cell_origin_for_anchor, cell_size_at_layer,
     is_layer_pos_solid, layer_pos_from_bevy, WorldAnchor,
@@ -32,18 +34,55 @@ use crate::world::{CameraZoom, WorldState};
 /// 1 leaf voxel (L=12) or 625 leaf voxels (L=8).
 const MAX_REACH_CELLS: i32 = 16;
 
+/// When true, clicks target NPC overlay voxels instead of terrain.
+/// The world raycast is skipped and only overlay parts are checked.
+/// Toggle with G key.
+#[derive(Resource, Default)]
+pub struct EntityEditMode {
+    pub active: bool,
+}
+
 pub struct InteractionPlugin;
 
 impl Plugin for InteractionPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TargetedBlock>().add_systems(
-            Update,
-            (
-                update_target.after(crate::player::sync_anchor_to_player),
-                draw_highlight.after(crate::player::sync_anchor_to_player),
-            ),
-        );
+        app.init_resource::<TargetedBlock>()
+            .init_resource::<EntityEditMode>()
+            .add_systems(
+                Update,
+                (
+                    toggle_entity_edit_mode,
+                    update_target
+                        .after(crate::player::sync_anchor_to_player)
+                        .after(crate::npc::collect_overlays),
+                    draw_highlight
+                        .after(update_target)
+                        .after(crate::npc::collect_overlays),
+                ),
+            );
     }
+}
+
+fn toggle_entity_edit_mode(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<EntityEditMode>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyG) {
+        mode.active = !mode.active;
+        if mode.active {
+            info!("Entity edit mode ON — clicks target NPC voxels");
+        } else {
+            info!("Entity edit mode OFF — normal terrain editing");
+        }
+    }
+}
+
+/// Identifies which NPC part and local voxel the crosshair hit.
+#[derive(Clone)]
+pub struct OverlayHit {
+    pub npc_entity: Entity,
+    pub part_index: usize,
+    pub local_voxel: [u8; 3],
 }
 
 /// The view cell the crosshair is pointing at.
@@ -58,12 +97,16 @@ pub struct TargetedBlock {
     /// `normal * cell_size_at_layer(hit_layer_pos.layer)` to the
     /// cell's centre to get the placement cell's centre.
     pub normal: Option<IVec3>,
+    /// If the crosshair hit an NPC overlay part (and it was closer
+    /// than the world hit), this identifies the NPC and voxel.
+    pub hit_overlay: Option<OverlayHit>,
 }
 
 impl TargetedBlock {
     fn clear(&mut self) {
         self.hit_layer_pos = None;
         self.normal = None;
+        self.hit_overlay = None;
     }
 }
 
@@ -72,6 +115,9 @@ pub fn update_target(
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
+    overlay_list: Res<OverlayList>,
+    entity_edit: Res<EntityEditMode>,
+    mouse: Res<ButtonInput<MouseButton>>,
     mut targeted: ResMut<TargetedBlock>,
 ) {
     targeted.clear();
@@ -82,11 +128,29 @@ pub fn update_target(
     let origin = cam.translation();
     let dir = cam.forward().as_vec3();
 
-    if let Some((hit, normal)) =
-        dda_view_cells(&world, zoom.layer, origin, dir, &anchor)
+    let debug = (mouse.just_pressed(MouseButton::Left)
+        || mouse.just_pressed(MouseButton::Right))
+        && !overlay_list.entries.is_empty();
+
+    // In entity edit mode, skip the world raycast entirely.
+    let mut world_dist = f32::MAX;
+    if !entity_edit.active {
+        if let Some((hit, normal)) =
+            dda_view_cells(&world, zoom.layer, origin, dir, &anchor)
+        {
+            let hit_center = bevy_origin_of_layer_pos(&hit, &anchor)
+                + Vec3::splat(anchor.cell_bevy(zoom.layer) * 0.5);
+            world_dist = (hit_center - origin).length();
+            targeted.hit_layer_pos = Some(hit);
+            targeted.normal = Some(normal);
+        }
+    }
+
+    // Check NPC overlay parts.
+    if let Some(overlay_hit) =
+        raycast_overlays(&world, &overlay_list, origin, dir, world_dist, debug)
     {
-        targeted.hit_layer_pos = Some(hit);
-        targeted.normal = Some(normal);
+        targeted.hit_overlay = Some(overlay_hit);
     }
 }
 
@@ -105,8 +169,8 @@ fn dda_view_cells(
     dir: Vec3,
     anchor: &WorldAnchor,
 ) -> Option<(LayerPos, IVec3)> {
-    let cell_size = cell_size_at_layer(view_layer);
-    let cell_size_i64 = cell_size as i64;
+    let cell_size = anchor.cell_bevy(view_layer);
+    let cell_size_i64 = cell_size_at_layer(view_layer) as i64;
     let cell_origin = cell_origin_for_anchor(anchor, cell_size_i64);
 
     let local = origin - cell_origin;
@@ -189,6 +253,143 @@ fn dda_view_cells(
     None
 }
 
+/// Raycast against all visible NPC overlay parts. For each part,
+/// transform the ray into part-local voxel space and march through
+/// the 25x25x25 voxel grid. Returns the closest hit (if any) that
+/// is nearer than `max_dist`.
+fn raycast_overlays(
+    world: &WorldState,
+    overlay_list: &OverlayList,
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    max_dist: f32,
+    debug: bool,
+) -> Option<OverlayHit> {
+    let mut best: Option<(OverlayHit, f32)> = None;
+
+    for entry in &overlay_list.entries {
+        for (part_idx, part) in entry.parts.iter().enumerate() {
+            // Compute part transform in Bevy space.
+            let part_pos = entry.bevy_pos
+                + entry.rotation * (entry.scale * part.offset);
+            let part_rot = entry.rotation * part.rotation;
+            let inv_rot = part_rot.inverse();
+
+            // Transform ray into part-local voxel space.
+            // A voxel at local (x,y,z) maps to Bevy:
+            //   part_pos + part_rot * scale * (Vec3(x,y,z) - pivot)
+            // Inverse: local = inv_rot * (bevy - part_pos) / scale + pivot
+            let local_origin =
+                inv_rot * (ray_origin - part_pos) / entry.scale + part.pivot;
+            let local_dir = inv_rot * ray_dir / entry.scale;
+
+            // Ray-AABB intersection with [0, N)^3 where N = 25.
+            let n = NODE_VOXELS_PER_AXIS as f32;
+            let (t_enter, t_exit) = ray_aabb(local_origin, local_dir, Vec3::ZERO, Vec3::splat(n));
+
+            if debug {
+                info!(
+                    "  raycast part[{part_idx}]: part_pos={part_pos:?} scale={} local_origin={local_origin:?} local_dir={local_dir:?} t_enter={t_enter:.3} t_exit={t_exit:.3}",
+                    entry.scale
+                );
+            }
+
+            if t_enter >= t_exit || t_exit < 0.0 {
+                if debug { info!("    AABB miss"); }
+                continue;
+            }
+
+            // March through voxels using DDA in local space.
+            let node = world.library.get(part.node_id);
+            let Some(node) = node else { continue };
+
+            if debug { info!("    AABB hit, marching voxels..."); }
+
+            let t_start = t_enter.max(0.0) + 0.001;
+            let start = local_origin + local_dir * t_start;
+
+            // Simple stepping: walk along the ray in small increments.
+            let step_size = 0.4;
+            let max_steps = (n * 3.0 / step_size) as i32;
+            let dir_norm = local_dir.normalize();
+            let mut march_hit = false;
+
+            for i in 0..max_steps {
+                let p = start + dir_norm * (i as f32 * step_size);
+                let vx = p.x.floor() as i32;
+                let vy = p.y.floor() as i32;
+                let vz = p.z.floor() as i32;
+                if vx < 0 || vy < 0 || vz < 0
+                    || vx >= n as i32 || vy >= n as i32 || vz >= n as i32
+                {
+                    if i > 0 { break; }
+                    continue;
+                }
+                let idx = (vz as usize * NODE_VOXELS_PER_AXIS + vy as usize)
+                    * NODE_VOXELS_PER_AXIS
+                    + vx as usize;
+                if node.voxels[idx] != EMPTY_VOXEL {
+                    if debug {
+                        info!("    HIT voxel ({vx},{vy},{vz}) val={} at step {i}", node.voxels[idx]);
+                    }
+                    march_hit = true;
+                    // Compute Bevy-space distance for this hit.
+                    let hit_bevy = part_pos
+                        + part_rot
+                            * (entry.scale
+                                * (Vec3::new(vx as f32 + 0.5, vy as f32 + 0.5, vz as f32 + 0.5)
+                                    - part.pivot));
+                    let dist = (hit_bevy - ray_origin).length();
+                    let limit = best.as_ref().map(|(_, d)| *d).unwrap_or(max_dist);
+                    if dist < limit {
+                        best = Some((
+                            OverlayHit {
+                                npc_entity: entry.id,
+                                part_index: part_idx,
+                                local_voxel: [vx as u8, vy as u8, vz as u8],
+                            },
+                            dist,
+                        ));
+                    }
+                    break;
+                }
+            }
+            if debug && !march_hit {
+                info!("    march: no voxel hit after {max_steps} steps, start={start:?}");
+            }
+        }
+    }
+
+    if debug {
+        info!("  raycast result: {}", if best.is_some() { "HIT" } else { "MISS" });
+    }
+    best.map(|(hit, _)| hit)
+}
+
+/// Ray-AABB slab intersection. Returns (t_enter, t_exit).
+fn ray_aabb(origin: Vec3, dir: Vec3, aabb_min: Vec3, aabb_max: Vec3) -> (f32, f32) {
+    let mut t_min = f32::NEG_INFINITY;
+    let mut t_max = f32::INFINITY;
+    for i in 0..3 {
+        let o = [origin.x, origin.y, origin.z][i];
+        let d = [dir.x, dir.y, dir.z][i];
+        let lo = [aabb_min.x, aabb_min.y, aabb_min.z][i];
+        let hi = [aabb_max.x, aabb_max.y, aabb_max.z][i];
+        if d.abs() < 1e-12 {
+            if o < lo || o > hi {
+                return (1.0, -1.0); // miss
+            }
+        } else {
+            let t1 = (lo - o) / d;
+            let t2 = (hi - o) / d;
+            let (t_near, t_far) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+            t_min = t_min.max(t_near);
+            t_max = t_max.min(t_far);
+        }
+    }
+    (t_min, t_max)
+}
+
 /// Convert an anchor-local cell `IVec3` (in `cell_size` strides from
 /// `cell_origin`) to a path-based [`LayerPos`] by going through
 /// [`layer_pos_from_bevy`], which handles the `i64` leaf-coord
@@ -215,20 +416,50 @@ fn draw_highlight(
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
     save_mode: Res<SaveMode>,
+    entity_edit: Res<EntityEditMode>,
+    overlay_list: Res<OverlayList>,
 ) {
+    // Entity edit mode: highlight targeted NPC voxel.
+    if entity_edit.active {
+        let green = Color::srgb(0.2, 1.0, 0.3);
+        if let Some(overlay_hit) = &targeted.hit_overlay {
+            for entry in &overlay_list.entries {
+                if entry.id != overlay_hit.npc_entity { continue; }
+                if let Some(part) = entry.parts.get(overlay_hit.part_index) {
+                    let part_pos = entry.bevy_pos
+                        + entry.rotation * (entry.scale * part.offset);
+                    let part_rot = entry.rotation * part.rotation;
+                    let v = overlay_hit.local_voxel;
+                    let voxel_center = Vec3::new(
+                        v[0] as f32 + 0.5,
+                        v[1] as f32 + 0.5,
+                        v[2] as f32 + 0.5,
+                    );
+                    let bevy_pos = part_pos
+                        + part_rot * (entry.scale * (voxel_center - part.pivot));
+                    gizmos.cube(
+                        Transform::from_translation(bevy_pos)
+                            .with_scale(Vec3::splat(entry.scale * 1.05))
+                            .with_rotation(part_rot),
+                        green,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    // Normal mode: terrain highlight.
     let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
-    // In save mode the hovered block is recoloured blue in place
-    // (see `editor::save_mode::update_save_tint`); paint the outline
-    // blue to match so the "save target" is visually cohesive.
     let save_tinted = save_mode.active && save_mode_eligible(zoom.layer);
     let color = if save_tinted {
         Color::srgb(0.3, 0.65, 1.0)
     } else {
         Color::WHITE
     };
-    let cell_size = cell_size_at_layer(zoom.layer);
+    let cell_size = anchor.cell_bevy(zoom.layer);
     let cell_min = bevy_origin_of_layer_pos(lp, &anchor);
     let center = cell_min + Vec3::splat(cell_size * 0.5);
     gizmos.cube(

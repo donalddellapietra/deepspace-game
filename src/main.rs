@@ -16,7 +16,7 @@ use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
 
-use block::BslMaterial;
+use block::{BslMaterial, PaletteMaterial};
 
 fn main() {
     let mut app = App::new();
@@ -32,10 +32,15 @@ fn main() {
             }),
             ..default()
         }))
-        // Atmosphere renders the sky; ClearColor only peeks through
-        // sub-pixel gaps between mesh faces, so match it to the
-        // dominant terrain color (grass) to hide seams.
-        .insert_resource(ClearColor(Color::srgb(0.3, 0.6, 0.2)))
+        // On WASM without atmosphere, ClearColor is the sky.
+        // On native, atmosphere renders the sky and ClearColor peeks
+        // through sub-pixel gaps and the terrain-to-sky boundary.
+        .insert_resource(ClearColor({
+            #[cfg(target_arch = "wasm32")]
+            { Color::srgb(0.5, 0.7, 0.9) }
+            #[cfg(not(target_arch = "wasm32"))]
+            { Color::srgb(0.7, 0.78, 0.65) }
+        }))
         .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
@@ -63,7 +68,7 @@ fn main() {
 fn debug_stamp_monument(
     mut world_state: ResMut<world::WorldState>,
     mut palette: ResMut<block::Palette>,
-    mut mat_assets: ResMut<Assets<BslMaterial>>,
+    mut mat_assets: ResMut<Assets<PaletteMaterial>>,
 ) {
     const VOX_BYTES: &[u8] = include_bytes!("../assets/vox/monu1.vox");
     let model = import::vox::load_first_model_bytes(
@@ -88,15 +93,24 @@ fn debug_stamp_monument(
 }
 
 fn setup_environment(mut commands: Commands) {
+    // Cool blue-tinted ambient pushes unlit/shadowed surfaces toward
+    // blue, contrasting with the warm directional light — this is the
+    // core of BSL's "warm sun / cool shadow" look. Brightness lowered
+    // from 800 to fit the HDR pipeline (AcesFitted tone-maps it).
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.9, 0.95, 1.0),
-        brightness: 800.0,
+        color: Color::srgb(0.8, 0.85, 1.0),
+        brightness: 600.0,
         ..default()
     });
 
+    // Warm golden sun — BSL tints its directional light toward amber.
+    // Illuminance lowered from 20k to avoid blowing out highlights in
+    // the HDR pipeline and to eliminate the shadow acne that occurred
+    // with AcesFitted at the old intensity.
     commands.spawn((
         DirectionalLight {
-            illuminance: 20_000.0,
+            color: Color::srgb(1.0, 0.98, 0.93),
+            illuminance: 10_000.0,
             shadows_enabled: true,
             shadow_depth_bias: 0.3,
             shadow_normal_bias: 2.0,
@@ -110,16 +124,15 @@ fn setup_environment(mut commands: Commands) {
 /// cover the full view distance at every scale.
 fn update_shadow_cascades(
     zoom: Res<world::render::CameraZoom>,
+    anchor: Res<world::view::WorldAnchor>,
     mut lights: Query<&mut CascadeShadowConfig, With<DirectionalLight>>,
 ) {
     if !zoom.is_changed() {
         return;
     }
-    let cell = world::view::cell_size_at_layer(zoom.layer);
+    let cell = anchor.cell_bevy(zoom.layer);
     let radius = world::render::RADIUS_VIEW_CELLS * cell;
     for mut config in &mut lights {
-        // Scale cascade bounds with zoom so the shadow map texel
-        // density stays consistent at every layer.
         *config = CascadeShadowConfigBuilder {
             first_cascade_far_bound: 10.0 * cell,
             maximum_distance: radius,

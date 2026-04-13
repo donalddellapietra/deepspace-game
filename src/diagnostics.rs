@@ -3,6 +3,7 @@ use bevy::diagnostic::{
 };
 use bevy::prelude::*;
 
+use crate::npc::Npc;
 use crate::player::Player;
 use crate::world::state::GROUND_Y_VOXELS;
 use crate::world::view::{position_to_leaf_coord, target_layer_for};
@@ -19,7 +20,7 @@ impl Plugin for DiagnosticsPlugin {
         ))
         .insert_resource(DiagTimer(Timer::from_seconds(2.0, TimerMode::Repeating)))
         .add_systems(Startup, spawn_debug_overlay)
-        .add_systems(Update, (log_diag, toggle_debug_overlay, update_debug_overlay));
+        .add_systems(Update, (log_diag, toggle_debug_overlay, update_debug_overlay, expose_perf_to_js));
     }
 }
 
@@ -177,3 +178,37 @@ fn log_diag(
         state.library.len(),
     );
 }
+
+/// Expose perf data to JS so Playwright tests can read it.
+#[cfg(target_arch = "wasm32")]
+fn expose_perf_to_js(
+    diagnostics: Res<DiagnosticsStore>,
+    npc_q: Query<(), With<Npc>>,
+) {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = window, js_name = "__setPerfData")]
+        fn set_perf_data(fps: f64, frame_time_ms: f64, entity_count: f64, npc_count: f64);
+    }
+
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed())
+        .unwrap_or(0.0);
+    let frame_time_ms = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.smoothed())
+        .unwrap_or(0.0);
+    let entity_count = diagnostics
+        .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
+        .and_then(|d| d.value())
+        .unwrap_or(0.0);
+    let npc_count = npc_q.iter().count() as f64;
+
+    set_perf_data(fps, frame_time_ms, entity_count, npc_count);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn expose_perf_to_js() {}

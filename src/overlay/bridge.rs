@@ -60,6 +60,7 @@ pub struct ModeIndicatorStateJs {
     pub layer: u8,
     pub save_mode: bool,
     pub save_eligible: bool,
+    pub entity_edit_mode: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]

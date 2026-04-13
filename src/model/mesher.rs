@@ -138,7 +138,6 @@ impl FaceData {
     ) {
         let (_, ref quad, normal) = FACES[face_idx];
         let base = self.positions.len() as u32;
-        let brightness = AO_CURVE[ao_level as usize];
         let normal_arr = normal.to_array();
         for &vert in quad {
             let mut pos = [0.0f32; 3];
@@ -147,6 +146,7 @@ impl FaceData {
             pos[axes.2] = v as f32 + vert[axes.2] * (h as f32);
             self.positions.push(pos);
             self.normals.push(normal_arr);
+            let brightness = AO_CURVE[ao_level as usize];
             self.colors.push([brightness, brightness, brightness, 1.0]);
         }
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -473,7 +473,6 @@ pub fn merge_child_faces(
             let mut merged = FaceData::default();
             for child in children {
                 if let Some(data) = child.get(&voxel) {
-                    // Append with index offset.
                     let base = merged.positions.len() as u32;
                     merged.positions.extend_from_slice(&data.positions);
                     merged.normals.extend_from_slice(&data.normals);
@@ -484,13 +483,13 @@ pub fn merge_child_faces(
                 }
             }
             if merged.is_empty() {
-                None
-            } else {
-                Some(BakedSubMesh {
-                    mesh: meshes.add(merged.build()),
-                    voxel,
-                })
+                return None;
             }
+
+            Some(BakedSubMesh {
+                mesh: meshes.add(merged.build()),
+                voxel,
+            })
         })
         .collect()
 }

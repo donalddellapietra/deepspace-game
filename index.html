@@ -24,6 +24,8 @@
     <!-- React UI overlay assets (copied to dist/) -->
     <link data-trunk rel="copy-file" href="ui/dist/ui.css" />
     <link data-trunk rel="copy-file" href="ui/dist/ui.js" />
+    <!-- Bevy assets (shaders, NPC blueprints, etc.) -->
+    <link data-trunk rel="copy-dir" href="assets" />
     <link rel="stylesheet" href="ui.css" />
 </head>
 <body>
@@ -33,6 +35,13 @@
     <!-- React UI mounts here, on top of the canvas -->
     <div id="root"></div>
 
+    <script>
+        // Perf data bridge: Bevy WASM writes here, Playwright reads it.
+        window.__perfData = { fps: 0, frameTimeMs: 0, entityCount: 0, npcCount: 0 };
+        window.__setPerfData = function(fps, frameTimeMs, entityCount, npcCount) {
+            window.__perfData = { fps, frameTimeMs, entityCount, npcCount };
+        };
+    </script>
     <script type="module" src="ui.js"></script>
 </body>
 </html>

@@ -29,7 +29,7 @@ use bevy::prelude::*;
 use crate::block::Palette;
 use crate::model::mesher::{
     bake_volume, bake_child_faces, merge_child_faces,
-    flatten_children, uniform_child_skippable, ChildClass,
+    flatten_children, ChildClass, ChildFaces,
 };
 use crate::model::BakedSubMesh;
 
@@ -130,19 +130,26 @@ pub struct RenderTimings {
 
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached per-`NodeId` baked sub-meshes. Content-addressed dedup
-    /// means identical subtrees share a NodeId, so cache hits are
-    /// common.
-    meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
+    /// Cached baked data keyed by `NodeId`. Stores intermediate
+    /// products (flat grid, per-child faces) alongside the merged
+    /// GPU meshes so edits can incrementally re-bake only the dirty
+    /// children instead of the full 125³ grid.
+    baked: HashMap<NodeId, BakedNode>,
+    /// Per-path tracking: remembers which `NodeId` each path last
+    /// displayed. Used to find the old `BakedNode` for incremental
+    /// diff when an edit changes the NodeId at a path.
+    path_node: HashMap<SmallPath, NodeId>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
-    /// The `Vec3` is the last-written Bevy translation so we can skip
-    /// redundant `Transform` inserts when the anchor hasn't moved.
     entities: HashMap<SmallPath, (Entity, NodeId, Vec3)>,
     /// Zoom layer the `entities` set was built for. If it changes,
     /// everything gets despawned and rebuilt.
     last_zoom_layer: u8,
     /// Whether we have done at least one render pass.
     initialised: bool,
+    /// Set to true to force a full entity rebuild on the next frame.
+    pub force_rebuild: bool,
+    /// Overlay (NPC) entity tracking and mesh cache.
+    pub overlay: super::overlay::OverlayState,
     /// Reusable DFS stack for `walk()`. Stashed here so we don't
     /// reallocate a `Vec` every frame. Cleared at the start of each
     /// `walk()` call.
@@ -180,226 +187,221 @@ impl SmallPath {
 
 // ----------------------------------------------------------- mesh caching
 
-/// For each of 6 directions, check whether the neighboring
-/// emit-layer sibling's border children all match ours along the
-/// shared face. If they do, our boundary children in that direction
-/// can be skipped (same content on both sides → no exposed faces).
-fn compute_neighbor_same(
-    world: &WorldState,
-    path: &SmallPath,
-    node_id: NodeId,
-    emit_depth: u8,
-) -> [bool; 6] {
-    if emit_depth == 0 {
-        return [false; 6];
-    }
-    // Walk to the grandparent (one level above emit).
-    let mut gp_id = world.root;
-    for i in 0..(emit_depth as usize - 1) {
-        let Some(node) = world.library.get(gp_id) else { return [false; 6] };
-        let Some(ch) = node.children.as_ref() else { return [false; 6] };
-        gp_id = ch[path.slots[i] as usize];
-        if gp_id == EMPTY_NODE { return [false; 6] }
-    }
-    let Some(gp) = world.library.get(gp_id) else { return [false; 6] };
-    let Some(gp_ch) = gp.children.as_ref() else { return [false; 6] };
+/// Cached bake data for one emit-level node.
+struct BakedNode {
+    child_ids: [NodeId; CHILDREN_PER_NODE],
+    child_class: Vec<ChildClass>,
+    flat_grid: Vec<u8>,
+    child_faces: Vec<ChildFaces>,
+    merged: Vec<BakedSubMesh>,
+}
 
-    let Some(our) = world.library.get(node_id) else { return [false; 6] };
-    let Some(oc) = our.children.as_ref() else { return [false; 6] };
+fn classify_child(world: &WorldState, child_id: NodeId) -> ChildClass {
+    if child_id == EMPTY_NODE { return ChildClass::Empty; }
+    let child = world.library.get(child_id).expect("render: child missing");
+    let first = child.voxels[0];
+    if child.voxels.iter().all(|&v| v == first) {
+        ChildClass::Uniform(first)
+    } else {
+        ChildClass::Mixed
+    }
+}
 
-    let slot = path.slots[emit_depth as usize - 1] as usize;
-    let (sx, sy, sz) = slot_coords(slot);
+fn is_interior_uniform(slot: usize, v: u8, child_class: &[ChildClass]) -> bool {
     let bf = BRANCH_FACTOR;
+    let (sx, sy, sz) = slot_coords(slot);
+    let neighbors: [(usize, usize, usize); 6] = [
+        (sx.wrapping_sub(1), sy, sz), (sx + 1, sy, sz),
+        (sx, sy.wrapping_sub(1), sz), (sx, sy + 1, sz),
+        (sx, sy, sz.wrapping_sub(1)), (sx, sy, sz + 1),
+    ];
+    neighbors.iter().all(|&(nx, ny, nz)| {
+        if nx >= bf || ny >= bf || nz >= bf { return false; }
+        child_class[slot_index(nx, ny, nz)] == ChildClass::Uniform(v)
+    })
+}
 
-    /// Compare 5×5 border children along one face. `our_idx` and
-    /// `their_idx` map (a, b) in 0..5 to a child slot index.
-    fn faces_match(
-        world: &WorldState,
-        gp_ch: &[NodeId; CHILDREN_PER_NODE],
-        oc: &[NodeId; CHILDREN_PER_NODE],
-        node_id: NodeId,
-        neighbor_slot: usize,
-        our_idx: impl Fn(usize, usize) -> usize,
-        their_idx: impl Fn(usize, usize) -> usize,
-    ) -> bool {
-        let nid = gp_ch[neighbor_slot];
-        if nid == EMPTY_NODE { return false }
-        if nid == node_id { return true }
-        let Some(n) = world.library.get(nid) else { return false };
-        let Some(nc) = n.children.as_ref() else { return false };
-        (0..BRANCH_FACTOR).all(|a| (0..BRANCH_FACTOR).all(|b|
-            oc[our_idx(a, b)] == nc[their_idx(a, b)]
-        ))
+fn make_get(flat: &[u8]) -> impl Fn(i32, i32, i32) -> Option<u8> + '_ {
+    let size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
+    let sz = size as usize;
+    move |x: i32, y: i32, z: i32| -> Option<u8> {
+        if x < 0 || y < 0 || z < 0 || x >= size || y >= size || z >= size {
+            return None;
+        }
+        let v = flat[(z as usize * sz + y as usize) * sz + x as usize];
+        if v == EMPTY_VOXEL { None } else { Some(v) }
     }
+}
 
-    // Each direction: compare our face at the boundary vs the
-    // neighbor's opposite face. The axis that varies is fixed at
-    // 0 (our near edge) or bf-1 (our far edge / their far edge).
-    let result = |delta: (isize, isize, isize),
-                  our_idx: &dyn Fn(usize, usize) -> usize,
-                  their_idx: &dyn Fn(usize, usize) -> usize| -> bool {
-        let (nx, ny, nz) = (
-            sx as isize + delta.0,
-            sy as isize + delta.1,
-            sz as isize + delta.2,
-        );
-        if nx < 0 || ny < 0 || nz < 0
-            || nx >= bf as isize || ny >= bf as isize || nz >= bf as isize
+fn bake_all_children(
+    flat: &[u8],
+    child_ids: &[NodeId; CHILDREN_PER_NODE],
+    child_class: &[ChildClass],
+) -> Vec<ChildFaces> {
+    let get = make_get(flat);
+    (0..CHILDREN_PER_NODE).map(|slot| {
+        if child_ids[slot] == EMPTY_NODE { return Default::default(); }
+        if let ChildClass::Uniform(v) = child_class[slot] {
+            if v == EMPTY_VOXEL || is_interior_uniform(slot, v, child_class) {
+                return Default::default();
+            }
+        }
+        bake_child_faces(&get, slot, NODE_VOXELS_PER_AXIS as i32, BRANCH_FACTOR)
+    }).collect()
+}
+
+fn mark_dirty(dirty: &mut [bool; CHILDREN_PER_NODE], slot: usize) {
+    dirty[slot] = true;
+    let bf = BRANCH_FACTOR;
+    let (sx, sy, sz) = slot_coords(slot);
+    for (dx, dy, dz) in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)] {
+        let (nx, ny, nz) = (sx as isize+dx, sy as isize+dy, sz as isize+dz);
+        if nx >= 0 && nx < bf as isize
+            && ny >= 0 && ny < bf as isize
+            && nz >= 0 && nz < bf as isize
         {
-            return false;
+            dirty[slot_index(nx as usize, ny as usize, nz as usize)] = true;
         }
-        let ns = slot_index(nx as usize, ny as usize, nz as usize);
-        faces_match(world, gp_ch, oc, node_id, ns, our_idx, their_idx)
-    };
-
-    [
-        result((-1,0,0), &|a,b| slot_index(0,a,b),    &|a,b| slot_index(bf-1,a,b)), // -x
-        result((1,0,0),  &|a,b| slot_index(bf-1,a,b), &|a,b| slot_index(0,a,b)),    // +x
-        result((0,-1,0), &|a,b| slot_index(a,0,b),    &|a,b| slot_index(a,bf-1,b)), // -y
-        result((0,1,0),  &|a,b| slot_index(a,bf-1,b), &|a,b| slot_index(a,0,b)),    // +y
-        result((0,0,-1), &|a,b| slot_index(a,b,0),    &|a,b| slot_index(a,b,bf-1)), // -z
-        result((0,0,1),  &|a,b| slot_index(a,b,bf-1), &|a,b| slot_index(a,b,0)),    // +z
-    ]
-}
-
-fn get_or_bake_mesh<'a>(
-    render_state: &'a mut RenderState,
-    world: &WorldState,
-    node_id: NodeId,
-    path: SmallPath,
-    emit_depth: u8,
-    meshes: &mut Assets<Mesh>,
-) -> &'a [BakedSubMesh] {
-    render_state.get_or_bake(world, node_id, path, emit_depth, meshes)
-}
-
-impl RenderState {
-    fn get_or_bake<'a>(
-        &'a mut self,
-        world: &WorldState,
-        node_id: NodeId,
-        path: SmallPath,
-        emit_depth: u8,
-        meshes: &mut Assets<Mesh>,
-    ) -> &'a [BakedSubMesh] {
-        if !self.meshes.contains_key(&node_id) {
-            let node = world
-                .library
-                .get(node_id)
-                .expect("render: node missing from library");
-            let baked = if let Some(children) = &node.children {
-
-                // Classify children and build flat voxel array.
-                let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
-                    .map(|slot| {
-                        if children[slot] == EMPTY_NODE {
-                            return ChildClass::Empty;
-                        }
-                        let child = world.library.get(children[slot])
-                            .expect("render: child missing from library");
-                        let first = child.voxels[0];
-                        if child.voxels.iter().all(|&v| v == first) {
-                            ChildClass::Uniform(first)
-                        } else {
-                            ChildClass::Mixed
-                        }
-                    })
-                    .collect();
-
-                let neighbor_same = compute_neighbor_same(
-                    world, &path, node_id, emit_depth,
-                );
-
-
-                let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
-                    .map(|slot| {
-                        if children[slot] == EMPTY_NODE {
-                            None
-                        } else {
-                            Some(world.library.get(children[slot])
-                                .expect("render: child missing")
-                                .voxels
-                                .as_ref()
-                                .as_slice())
-                        }
-                    })
-                    .collect();
-
-                let flat = flatten_children(
-                    &children_voxels,
-                    &child_class,
-                    BRANCH_FACTOR,
-                    NODE_VOXELS_PER_AXIS,
-                    EMPTY_VOXEL,
-                );
-
-                let size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
-                let sz = size as usize;
-                let get = move |x: i32, y: i32, z: i32| -> Option<u8> {
-                    if x < 0 || y < 0 || z < 0
-                        || x >= size || y >= size || z >= size
-                    {
-                        return None;
-                    }
-                    let v = flat[(z as usize * sz + y as usize) * sz + x as usize];
-                    if v == EMPTY_VOXEL { None } else { Some(v) }
-                };
-
-                // Bake per-child with caching and skip optimizations.
-                let per_child: Vec<_> = (0..CHILDREN_PER_NODE)
-                    .map(|slot| {
-                        if children[slot] == EMPTY_NODE {
-                            return Default::default();
-                        }
-                        if let ChildClass::Uniform(v) = child_class[slot] {
-                            if uniform_child_skippable(
-                                slot, v, &child_class,
-                                BRANCH_FACTOR, EMPTY_VOXEL,
-                                neighbor_same,
-                            ) {
-                                return Default::default();
-                            }
-                        }
-                        bake_child_faces(
-                            &get, slot,
-                            NODE_VOXELS_PER_AXIS as i32,
-                            BRANCH_FACTOR,
-                        )
-                    })
-                    .collect();
-
-                merge_child_faces(&per_child, meshes)
-            } else {
-                let voxels = node.voxels.clone();
-                bake_volume(
-                    NODE_VOXELS_PER_AXIS as i32,
-                    move |x, y, z| {
-                        if x < 0
-                            || y < 0
-                            || z < 0
-                            || x >= NODE_VOXELS_PER_AXIS as i32
-                            || y >= NODE_VOXELS_PER_AXIS as i32
-                            || z >= NODE_VOXELS_PER_AXIS as i32
-                        {
-                            return None;
-                        }
-                        let v = voxels[voxel_idx(
-                            x as usize,
-                            y as usize,
-                            z as usize,
-                        )];
-                        if v == EMPTY_VOXEL { None } else { Some(v) }
-                    },
-                    meshes,
-                )
-            };
-            self.meshes.insert(node_id, baked);
-        }
-        self.meshes
-            .get(&node_id)
-            .expect("just inserted")
-            .as_slice()
     }
+}
+
+fn patch_flat_region(flat: &mut [u8], voxels: Option<&[u8]>, class: ChildClass, slot: usize) {
+    let cs = NODE_VOXELS_PER_AXIS;
+    let size = BRANCH_FACTOR * cs;
+    let (sx, sy, sz) = slot_coords(slot);
+    let (bx, by, bz) = (sx * cs, sy * cs, sz * cs);
+    match class {
+        ChildClass::Empty => {
+            for z in 0..cs { for y in 0..cs {
+                let s = (bz+z)*size*size + (by+y)*size + bx;
+                flat[s..s+cs].fill(EMPTY_VOXEL);
+            }}
+        }
+        ChildClass::Uniform(v) => {
+            for z in 0..cs { for y in 0..cs {
+                let s = (bz+z)*size*size + (by+y)*size + bx;
+                flat[s..s+cs].fill(v);
+            }}
+        }
+        ChildClass::Mixed => {
+            if let Some(vox) = voxels {
+                for z in 0..cs { for y in 0..cs {
+                    let d = (bz+z)*size*size + (by+y)*size + bx;
+                    let s = z*cs*cs + y*cs;
+                    flat[d..d+cs].copy_from_slice(&vox[s..s+cs]);
+                }}
+            }
+        }
+    }
+}
+
+impl BakedNode {
+    /// Full build from scratch.
+    fn new_cold(world: &WorldState, node_id: NodeId, meshes: &mut Assets<Mesh>) -> Self {
+        let node = world.library.get(node_id).expect("render: node missing");
+        let children = node.children.as_ref().expect("render: expected non-leaf");
+        let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
+
+        let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
+            .map(|slot| classify_child(world, child_ids[slot]))
+            .collect();
+
+        let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
+            .map(|slot| {
+                if child_ids[slot] == EMPTY_NODE { None }
+                else { Some(world.library.get(child_ids[slot])
+                    .expect("render: child missing").voxels.as_ref().as_slice()) }
+            })
+            .collect();
+
+        let flat_grid = flatten_children(
+            &children_voxels, &child_class,
+            BRANCH_FACTOR, NODE_VOXELS_PER_AXIS, EMPTY_VOXEL,
+        );
+        let child_faces = bake_all_children(&flat_grid, &child_ids, &child_class);
+        let merged = merge_child_faces(&child_faces, meshes);
+
+        BakedNode { child_ids, child_class, flat_grid, child_faces, merged }
+    }
+
+    /// Incremental build: clone old data, diff children, patch only dirty slots.
+    fn new_incremental(
+        old: &BakedNode, world: &WorldState, node_id: NodeId, meshes: &mut Assets<Mesh>,
+    ) -> Self {
+        let node = world.library.get(node_id).expect("render: node missing");
+        let children = node.children.as_ref().expect("render: expected non-leaf");
+        let new_child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
+
+        let mut dirty = [false; CHILDREN_PER_NODE];
+        let mut any_changed = false;
+        for slot in 0..CHILDREN_PER_NODE {
+            if new_child_ids[slot] != old.child_ids[slot] {
+                mark_dirty(&mut dirty, slot);
+                any_changed = true;
+            }
+        }
+
+        if !any_changed {
+            let merged = merge_child_faces(&old.child_faces, meshes);
+            return BakedNode {
+                child_ids: old.child_ids, child_class: old.child_class.clone(),
+                flat_grid: old.flat_grid.clone(), child_faces: old.child_faces.clone(),
+                merged,
+            };
+        }
+
+        let mut child_class = old.child_class.clone();
+        let mut flat_grid = old.flat_grid.clone();
+        let mut child_faces = old.child_faces.clone();
+
+        for slot in 0..CHILDREN_PER_NODE {
+            if new_child_ids[slot] != old.child_ids[slot] {
+                child_class[slot] = classify_child(world, new_child_ids[slot]);
+                let voxels = if new_child_ids[slot] == EMPTY_NODE { None }
+                    else { Some(world.library.get(new_child_ids[slot])
+                        .expect("render: child missing").voxels.as_ref().as_slice()) };
+                patch_flat_region(&mut flat_grid, voxels, child_class[slot], slot);
+            }
+        }
+
+        {
+            let get = make_get(&flat_grid);
+            for slot in 0..CHILDREN_PER_NODE {
+                if !dirty[slot] { continue; }
+                child_faces[slot] = if new_child_ids[slot] == EMPTY_NODE {
+                    Default::default()
+                } else if let ChildClass::Uniform(v) = child_class[slot] {
+                    if v == EMPTY_VOXEL || is_interior_uniform(slot, v, &child_class) {
+                        Default::default()
+                    } else {
+                        bake_child_faces(&get, slot, NODE_VOXELS_PER_AXIS as i32, BRANCH_FACTOR)
+                    }
+                } else {
+                    bake_child_faces(&get, slot, NODE_VOXELS_PER_AXIS as i32, BRANCH_FACTOR)
+                };
+            }
+        }
+
+        let merged = merge_child_faces(&child_faces, meshes);
+        BakedNode { child_ids: new_child_ids, child_class, flat_grid, child_faces, merged }
+    }
+}
+
+fn bake_leaf(world: &WorldState, node_id: NodeId, meshes: &mut Assets<Mesh>) -> Vec<BakedSubMesh> {
+    let voxels = world.library.get(node_id).expect("render: leaf missing").voxels.clone();
+    bake_volume(
+        NODE_VOXELS_PER_AXIS as i32,
+        move |x, y, z| {
+            if x < 0 || y < 0 || z < 0
+                || x >= NODE_VOXELS_PER_AXIS as i32
+                || y >= NODE_VOXELS_PER_AXIS as i32
+                || z >= NODE_VOXELS_PER_AXIS as i32
+            { return None; }
+            let v = voxels[voxel_idx(x as usize, y as usize, z as usize)];
+            if v == EMPTY_VOXEL { None } else { Some(v) }
+        },
+        meshes,
+    )
 }
 
 // ------------------------------------------------------------- tree walk
@@ -474,12 +476,13 @@ fn walk(
         // Bevy-space origin of this node: delta from the anchor, in
         // leaves, cast to `f32`. For nodes near the player the delta
         // is small and `f32` is essentially exact.
+        let n = anchor.norm;
         let origin_bevy = Vec3::new(
-            (origin_leaves[0] - anchor.leaf_coord[0]) as f32,
-            (origin_leaves[1] - anchor.leaf_coord[1]) as f32,
-            (origin_leaves[2] - anchor.leaf_coord[2]) as f32,
+            (origin_leaves[0] - anchor.leaf_coord[0]) as f32 / n,
+            (origin_leaves[1] - anchor.leaf_coord[1]) as f32 / n,
+            (origin_leaves[2] - anchor.leaf_coord[2]) as f32 / n,
         );
-        let extent = extent_for_layer(depth);
+        let extent = extent_for_layer(depth) / n;
         let aabb_min = origin_bevy;
         let aabb_max = origin_bevy + Vec3::splat(extent);
 
@@ -508,7 +511,7 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: scale_for_layer(target_layer),
+                scale: 1.0,
             });
             continue;
         }
@@ -523,7 +526,7 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: scale_for_layer(depth),
+                scale: 1.0,
             });
             continue;
         };
@@ -564,6 +567,7 @@ pub fn render_world(
     mut meshes: ResMut<Assets<Mesh>>,
     mut render_state: ResMut<RenderState>,
     mut timings: ResMut<RenderTimings>,
+    overlay_list: Res<super::overlay::OverlayList>,
 ) {
     let Some(palette) = palette else {
         return;
@@ -572,7 +576,7 @@ pub fn render_world(
         return;
     };
     let camera_pos = camera_tf.translation;
-    let render_total_start = std::time::Instant::now();
+    let render_total_start = bevy::platform::time::Instant::now();
 
     let target_layer = target_layer_for(zoom.layer);
     let emit_layer = target_layer.saturating_sub(1);
@@ -582,28 +586,29 @@ pub fn render_world(
     // implicitly (its viewport is measured in cells); without it,
     // zooming out collapses the visible world to a dot because the
     // per-cell Bevy size grows by 5× per layer.
-    let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
+    let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
 
-    // If emit layer changed, or we're on our first pass, drop everything.
-    if !render_state.initialised || render_state.last_zoom_layer != emit_layer
+    // If emit layer changed, first pass, or forced rebuild, drop everything.
+    if !render_state.initialised
+        || render_state.last_zoom_layer != emit_layer
+        || render_state.force_rebuild
     {
+        render_state.force_rebuild = false;
         for (_, (entity, _, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
         }
+        super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
+        render_state.baked.clear();
+        render_state.path_node.clear();
         render_state.last_zoom_layer = emit_layer;
         render_state.initialised = true;
     }
 
-    // Walk the tree → collect visible positions. `mem::take` the
-    // reusable buffers off `render_state` so the walk and reconcile
-    // loop can hold `&mut render_state` freely (notably
-    // `get_or_bake_mesh`). We put them back at the end; the buffers
-    // are cleared internally by `walk()` and drained during
-    // reconciliation, so they retain their allocated capacity.
+    // Walk the tree → collect visible positions.
     timings.bake_us = 0;
-    let walk_start = std::time::Instant::now();
+    let walk_start = bevy::platform::time::Instant::now();
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
@@ -619,19 +624,44 @@ pub fn render_world(
     timings.walk_us = walk_start.elapsed().as_micros() as u64;
     timings.visit_count = visits.len();
 
-    // Pre-bake any new NodeIds before the reconcile loop.
+    // Pre-bake: ensure every visited NodeId has a BakedNode.
+    // On edit, use the old BakedNode for incremental diff.
     {
-        let bake_start = std::time::Instant::now();
+        let bake_start = bevy::platform::time::Instant::now();
         for v in visits.iter() {
-            if !render_state.meshes.contains_key(&v.node_id) {
-                get_or_bake_mesh(&mut render_state, &world, v.node_id, v.path, emit_layer, &mut meshes);
+            let node = world.library.get(v.node_id)
+                .expect("render: node missing from library");
+
+            if node.children.is_some() {
+                if !render_state.baked.contains_key(&v.node_id) {
+                    let baked = if let Some(&old_nid) = render_state.path_node.get(&v.path) {
+                        if let Some(old_bake) = render_state.baked.get(&old_nid) {
+                            BakedNode::new_incremental(old_bake, &world, v.node_id, &mut meshes)
+                        } else {
+                            BakedNode::new_cold(&world, v.node_id, &mut meshes)
+                        }
+                    } else {
+                        BakedNode::new_cold(&world, v.node_id, &mut meshes)
+                    };
+                    render_state.baked.insert(v.node_id, baked);
+                }
+                render_state.path_node.insert(v.path, v.node_id);
+            } else if !render_state.baked.contains_key(&v.node_id) {
+                let merged = bake_leaf(&world, v.node_id, &mut meshes);
+                render_state.baked.insert(v.node_id, BakedNode {
+                    child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
+                    child_class: Vec::new(),
+                    flat_grid: Vec::new(),
+                    child_faces: Vec::new(),
+                    merged,
+                });
             }
         }
         timings.bake_us = bake_start.elapsed().as_micros() as u64;
     }
 
     // Reconcile: what's alive now, what changed, what's gone.
-    let reconcile_start = std::time::Instant::now();
+    let reconcile_start = bevy::platform::time::Instant::now();
     let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
         HashMap::with_capacity(visits.len());
 
@@ -660,10 +690,9 @@ pub fn render_world(
                     }
                 }
 
-                let baked = render_state.meshes
-                    .get(&new_node_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let baked = render_state.baked.get(&new_node_id)
+                    .map(|b| &b.merged[..])
+                    .unwrap_or(&[]);
 
                 let parent = commands
                     .spawn((
@@ -674,7 +703,7 @@ pub fn render_world(
                     ))
                     .id();
 
-                for sub in &baked {
+                for sub in baked {
                     let Some(mat) = palette.material(sub.voxel) else {
                         continue;
                     };
@@ -700,9 +729,17 @@ pub fn render_world(
     }
     render_state.entities = alive;
 
+    // Overlay reconcile (NPCs and other overlay subtrees).
+    super::overlay::reconcile_overlays(
+        &mut commands,
+        &world,
+        &palette,
+        &mut meshes,
+        &overlay_list,
+        &mut render_state.overlay,
+    );
 
     timings.reconcile_us = reconcile_start.elapsed().as_micros() as u64;
-
     timings.render_total_us = render_total_start.elapsed().as_micros() as u64;
 
     render_state.walk_stack = walk_stack;
@@ -724,7 +761,7 @@ mod tests {
     }
 
     fn anchor_origin() -> WorldAnchor {
-        WorldAnchor { leaf_coord: [0, 0, 0] }
+        WorldAnchor { leaf_coord: [0, 0, 0], norm: 1.0 }
     }
 
     #[test]

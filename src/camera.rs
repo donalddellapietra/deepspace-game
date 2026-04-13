@@ -4,12 +4,17 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::AccumulatedMouseMotion,
     light::ShadowFilteringMethod,
-    pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
+    pbr::ScreenSpaceAmbientOcclusion,
+    post_process::bloom::Bloom,
     prelude::*,
+    render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
+
 use crate::player::{Player, PLAYER_HEIGHT};
-use crate::world::view::cell_size_at_layer;
+use crate::world::view::{cell_size_at_layer, scale_for_layer, target_layer_for, WorldAnchor};
 use crate::world::CameraZoom;
 
 // ------------------------------------------------- zoom transition
@@ -33,27 +38,28 @@ struct AnimatingZoom {
 }
 
 impl ZoomTransition {
-    /// Start a new transition. `from_layer` is the layer *before* the
-    /// zoom; `to_layer` is the layer *after*.
+    /// Start a new transition. Each layer's cell size is computed with
+    /// its OWN target norm, not the current anchor.norm, so the
+    /// animation endpoint matches the post-transition steady state.
     pub fn start(&mut self, from_layer: u8, to_layer: u8) {
+        let from_norm = scale_for_layer(target_layer_for(from_layer));
+        let to_norm = scale_for_layer(target_layer_for(to_layer));
         self.active = Some(AnimatingZoom {
-            from_cell_size: cell_size_at_layer(from_layer),
-            to_cell_size: cell_size_at_layer(to_layer),
+            from_cell_size: scale_for_layer(from_layer) / from_norm,
+            to_cell_size: scale_for_layer(to_layer) / to_norm,
             t: 0.0,
         });
     }
 
-    /// The interpolated cell size, or the steady-state value when no
-    /// transition is active.
-    pub fn effective_cell_size(&self, current_layer: u8) -> f32 {
+    /// The interpolated cell size in normalized Bevy units.
+    pub fn effective_cell_size(&self, current_layer: u8, anchor: &WorldAnchor) -> f32 {
         match &self.active {
             Some(anim) => {
-                // Smooth-step easing: 3t² - 2t³
                 let t = anim.t.clamp(0.0, 1.0);
                 let ease = t * t * (3.0 - 2.0 * t);
                 anim.from_cell_size + (anim.to_cell_size - anim.from_cell_size) * ease
             }
-            None => cell_size_at_layer(current_layer),
+            None => anchor.cell_bevy(current_layer),
         }
     }
 }
@@ -75,6 +81,7 @@ impl Plugin for CameraPlugin {
                         .after(tick_zoom_transition)
                         .after(crate::player::derive_transforms)
                         .after(crate::ui::sync_cursor),
+                    #[cfg(not(target_arch = "wasm32"))]
                     sync_atmosphere_scale,
                 ),
             );
@@ -93,30 +100,84 @@ pub struct CursorLocked(pub bool);
 
 fn spawn_camera(
     mut commands: Commands,
+    #[cfg(not(target_arch = "wasm32"))]
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
-    let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
-
-    commands.spawn((
+    let mut cam = commands.spawn((
         Camera3d::default(),
-        // Pitch 0 = look forward. The follow system in
-        // `first_person_camera` snaps this entity onto the player on
-        // frame 1, so the spawn translation is just a placeholder —
-        // we use `Vec3::ZERO` instead of any hardcoded global Bevy
-        // coordinate to make it obvious that this isn't a position
-        // we picked.
         FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::default(),
-        // Procedural atmosphere (Rayleigh + Mie scattering).
-        // Ground albedo matches grass color so the horizon blends
-        // with the terrain edge instead of showing a grey seam.
-        Atmosphere {
+        Tonemapping::AcesFitted,
+        ShadowFilteringMethod::Gaussian,
+        ScreenSpaceAmbientOcclusion {
+            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
+            // Higher thickness = samples stay closer to the surface,
+            // reducing noise on thin voxel geometry.
+            constant_object_thickness: 4.0,
+        },
+        // Bloom only on bright highlights (threshold 0.8) — sky, sun
+        // reflections, emissive blocks. Energy-conserving mode adds
+        // glow without washing out. Reduced max_mip_dimension cuts
+        // GPU passes for zoomed-out layers.
+        Bloom {
+            intensity: 0.2,
+            low_frequency_boost: 0.5,
+            low_frequency_boost_curvature: 0.95,
+            high_pass_frequency: 1.0,
+            prefilter: bevy::post_process::bloom::BloomPrefilter {
+                threshold: 0.8,
+                threshold_softness: 0.3,
+            },
+            composite_mode: bevy::post_process::bloom::BloomCompositeMode::EnergyConserving,
+            max_mip_dimension: 256,
+            ..default()
+        },
+        // BSL-style color grading: cool shadows, warm highlights.
+        // Pushes shadowed regions toward blue and lit regions toward
+        // golden amber — the signature BSL look.
+        ColorGrading {
+            global: ColorGradingGlobal {
+                exposure: 0.0,
+                temperature: 0.0,
+                tint: 0.0,
+                hue: 0.0,
+                post_saturation: 1.0,
+                midtones_range: 0.2..0.7,
+            },
+            shadows: ColorGradingSection {
+                saturation: 1.1,
+                contrast: 1.05,
+                gamma: 1.0,
+                gain: 1.0,
+                lift: 0.01,
+            },
+            midtones: ColorGradingSection {
+                saturation: 1.0,
+                contrast: 1.0,
+                gamma: 1.0,
+                gain: 1.0,
+                lift: 0.0,
+            },
+            highlights: ColorGradingSection {
+                saturation: 1.0,
+                contrast: 1.0,
+                gamma: 1.0,
+                gain: 1.0,
+                lift: 0.0,
+            },
+        },
+        Msaa::Off,
+    ));
+
+    // Procedural atmosphere requires storage buffers (not available on WebGL2).
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
+        cam.insert(Atmosphere {
             ground_albedo: Vec3::new(0.3, 0.6, 0.2),
             ..Atmosphere::earthlike(medium)
-        },
-        Tonemapping::Reinhard,
-        ShadowFilteringMethod::Gaussian,
-    ));
+        });
+    }
 }
 
 fn spawn_crosshair(mut commands: Commands) {
@@ -146,6 +207,7 @@ fn first_person_camera(
     motion: Res<AccumulatedMouseMotion>,
     locked: Res<CursorLocked>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     transition: Res<ZoomTransition>,
     player_q: Query<&Transform, (With<Player>, Without<FpsCam>)>,
     mut cam_q: Query<(&mut Transform, &mut FpsCam), Without<Player>>,
@@ -153,18 +215,13 @@ fn first_person_camera(
     let Ok(player_tf) = player_q.single() else { return };
     let Ok((mut cam_tf, mut cam)) = cam_q.single_mut() else { return };
 
-    // Only rotate when cursor is locked
     if locked.0 {
         cam.yaw -= motion.delta.x * SENSITIVITY;
         cam.pitch = (cam.pitch + motion.delta.y * SENSITIVITY)
             .clamp(-FRAC_PI_2 + 0.05, FRAC_PI_2 - 0.05);
     }
 
-    // Player.y = feet. Camera sits at the eye, but the eye height
-    // scales with the view layer's cell size. During a zoom transition
-    // the cell size is interpolated so the camera glides smoothly
-    // between layers instead of snapping.
-    let cell = transition.effective_cell_size(zoom.layer);
+    let cell = transition.effective_cell_size(zoom.layer, &anchor);
     cam_tf.translation = player_tf.translation + Vec3::Y * (PLAYER_HEIGHT * cell);
     cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, -cam.pitch, 0.0);
 }
@@ -172,21 +229,24 @@ fn first_person_camera(
 /// Keep the aerial-view LUT range in sync with the actual view
 /// distance so atmospheric fog distributes evenly across all visible
 /// chunks (avoiding banding at chunk boundaries).
+#[cfg(not(target_arch = "wasm32"))]
 fn sync_atmosphere_scale(
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
     mut cam_q: Query<&mut AtmosphereSettings, With<FpsCam>>,
 ) {
     if !zoom.is_changed() {
         return;
     }
-    let cell = cell_size_at_layer(zoom.layer);
-    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    let cell_bevy = anchor.cell_bevy(zoom.layer);
+    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell_bevy;
     for mut settings in &mut cam_q {
-        // At lower layers the camera is at PLAYER_HEIGHT * cell Bevy
-        // units. Dividing by cell keeps the atmosphere seeing a
-        // consistent ~2m altitude regardless of zoom, preventing
-        // heavy blue scattering at zoomed-out layers.
-        settings.scene_units_to_m = 1.0 / cell;
-        settings.aerial_view_lut_max_distance = view_radius / cell;
+        // With coordinate normalization, Bevy-space distances are
+        // bounded (~800 units) at all zoom levels. 1 Bevy unit ≈
+        // 1 target-layer voxel. scene_units_to_m converts to meters
+        // for the atmosphere — divide by cell_bevy so the atmosphere
+        // sees a consistent ~2m camera altitude regardless of zoom.
+        settings.scene_units_to_m = 1.0 / cell_bevy;
+        settings.aerial_view_lut_max_distance = view_radius / cell_bevy;
     }
 }

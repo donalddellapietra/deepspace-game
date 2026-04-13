@@ -7,7 +7,7 @@ use std::path::Path;
 
 use bevy::prelude::*;
 
-use crate::block::{BslMaterial, Palette};
+use crate::block::{PaletteMaterial, Palette};
 use crate::world::tree::EMPTY_VOXEL;
 
 use super::color_map;
@@ -17,7 +17,7 @@ use super::VoxelModel;
 pub fn load_first_model(
     path: &Path,
     palette: &mut Palette,
-    mat_assets: &mut Assets<BslMaterial>,
+    mat_assets: &mut Assets<PaletteMaterial>,
 ) -> Result<VoxelModel, String> {
     let data = dot_vox::load(
         path.to_str()
@@ -33,7 +33,7 @@ pub fn load_first_model(
 pub fn load_first_model_bytes(
     bytes: &[u8],
     palette: &mut Palette,
-    mat_assets: &mut Assets<BslMaterial>,
+    mat_assets: &mut Assets<PaletteMaterial>,
 ) -> Result<VoxelModel, String> {
     let data = dot_vox::load_bytes(bytes).map_err(|e| e.to_string())?;
     let model = data.models.first().ok_or("no models in .vox file")?;
@@ -44,7 +44,7 @@ pub fn load_first_model_bytes(
 pub fn load_all_models(
     path: &Path,
     palette: &mut Palette,
-    mat_assets: &mut Assets<BslMaterial>,
+    mat_assets: &mut Assets<PaletteMaterial>,
 ) -> Result<Vec<VoxelModel>, String> {
     let data = dot_vox::load(
         path.to_str()
@@ -63,7 +63,7 @@ fn convert_model(
     model: &dot_vox::Model,
     vox_palette: &[dot_vox::Color],
     palette: &mut Palette,
-    mat_assets: &mut Assets<BslMaterial>,
+    mat_assets: &mut Assets<PaletteMaterial>,
 ) -> VoxelModel {
     let sx = model.size.x as usize;
     let sy = model.size.y as usize;

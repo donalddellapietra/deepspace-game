@@ -68,17 +68,22 @@ pub struct PaletteEntry {
     pub alpha_mode: AlphaMode,
 }
 
+/// The concrete material type the palette creates handles for.
+/// Every caller that needs `&mut Assets<PaletteMaterial>` imports
+/// this alias instead of reaching into `bsl_material` directly.
+pub type PaletteMaterial = BslMaterial;
+
 /// Runtime palette. Index 0 is reserved (EMPTY_VOXEL). Indices 1..=len are
 /// valid block types. The first 10 are the built-in gameplay blocks.
 #[derive(Resource)]
 pub struct Palette {
     entries: Vec<PaletteEntry>,
-    materials: Vec<Handle<BslMaterial>>,
+    materials: Vec<Handle<PaletteMaterial>>,
 }
 
 impl Palette {
     /// Create a new palette pre-populated with the 10 built-in blocks.
-    pub fn new(mat_assets: &mut Assets<BslMaterial>) -> Self {
+    pub fn new(mat_assets: &mut Assets<PaletteMaterial>) -> Self {
         let mut palette = Self {
             entries: Vec::new(),
             materials: Vec::new(),
@@ -108,20 +113,42 @@ impl Palette {
     }
 
     /// Get the material handle for a voxel value.
-    pub fn material(&self, voxel: u8) -> Option<Handle<BslMaterial>> {
+    pub fn material(&self, voxel: u8) -> Option<Handle<PaletteMaterial>> {
         if voxel == 0 {
             return None;
         }
         self.materials.get((voxel - 1) as usize).cloned()
     }
 
+    /// Find an existing entry with the same color (within tolerance).
+    /// Returns the 1-based voxel index if found.
+    pub fn find_by_color(&self, color: Color) -> Option<u8> {
+        let target = color.to_srgba();
+        for (i, entry) in self.entries.iter().enumerate() {
+            let c = entry.color.to_srgba();
+            let dr = (c.red - target.red).abs();
+            let dg = (c.green - target.green).abs();
+            let db = (c.blue - target.blue).abs();
+            let da = (c.alpha - target.alpha).abs();
+            if dr < 0.004 && dg < 0.004 && db < 0.004 && da < 0.004 {
+                return Some((i + 1) as u8);
+            }
+        }
+        None
+    }
+
     /// Add a new entry, create its material, return the voxel index.
-    /// Panics if the palette is full (255 entries).
+    /// Deduplicates by color — if an entry with the same color already
+    /// exists, returns its index without creating a new material.
+    /// Panics if the palette is full (255 entries) and the color is new.
     pub fn register(
         &mut self,
         entry: PaletteEntry,
-        mat_assets: &mut Assets<BslMaterial>,
+        mat_assets: &mut Assets<PaletteMaterial>,
     ) -> u8 {
+        if let Some(existing) = self.find_by_color(entry.color) {
+            return existing;
+        }
         assert!(
             self.entries.len() < 255,
             "Palette full: cannot register more than 255 entries"
@@ -169,6 +196,7 @@ impl Palette {
 pub struct BlockPlugin;
 impl Plugin for BlockPlugin {
     fn build(&self, app: &mut App) {
+        bsl_material::load_bsl_shader(app);
         app.add_systems(Startup, materials::init_palette);
     }
 }
