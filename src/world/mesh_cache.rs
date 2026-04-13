@@ -249,19 +249,28 @@ impl MeshStore {
     /// Load prebaked meshes on first call.
     /// Native: starts the async I/O thread with indexed format.
     /// WASM: loads the monolithic meshes.bin into memory.
-    pub fn ensure_loaded(&mut self, world_hash: u64) {
+    pub fn ensure_loaded(&mut self, _world_hash: u64) {
         if self.loaded { return; }
         self.loaded = true;
 
-        let path = std::path::Path::new("assets/meshes_mono.bin");
-        match super::serial::read_prebaked_file(path, world_hash) {
-            Ok(prebaked) => {
-                eprintln!("loaded prebaked meshes: {} entries", prebaked.len());
-                self.prebaked = Some(prebaked);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let idx_path = std::path::Path::new("assets/meshes.idx");
+            let bin_path = std::path::Path::new("assets/meshes.bin");
+            match MeshStreamer::start(idx_path, bin_path) {
+                Ok(streamer) => {
+                    self.streamer = Some(streamer);
+                }
+                Err(e) => {
+                    eprintln!("no mesh streamer ({}), will cold bake", e);
+                }
             }
-            Err(e) => {
-                eprintln!("no prebaked meshes ({}), will cold bake", e);
-            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // WASM: no filesystem — meshes are cold baked at runtime.
+            // Prebaked loading via Bevy async assets is a future optimization.
         }
     }
 
@@ -325,9 +334,18 @@ impl MeshStore {
             eprintln!("ENSURE_BAKED[{}]: node {} not in cache, attempting load", self.diag_frame, node_id);
         }
 
-        // Monolithic prebaked loader — no budget cap, loads instantly.
-        let prebaked_entry = self.prebaked.as_mut()
-            .and_then(|p| p.remove(&node_id));
+        // Try prebaked: native uses streamer sync load, WASM cold bakes.
+        let prebaked_entry = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.streamer.as_ref()
+                    .and_then(|s| s.load_sync(node_id))
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                None::<super::serial::PrebakedEntry>
+            }
+        };
         if let Some(entry) = prebaked_entry {
             let n = entry.len();
             let merged: Vec<BakedSubMesh> = entry

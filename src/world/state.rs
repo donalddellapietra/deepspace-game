@@ -147,11 +147,11 @@ impl Default for WorldState {
             return Self::new_sphere();
         }
 
-        // WASM: use grassland for now. Canned world loading via HTTP
-        // will be implemented as async Bevy asset loading.
+        // WASM: generate sphere in-process (no filesystem access).
+        // TODO: load world.bin via Bevy async asset system for instant startup.
         #[cfg(target_arch = "wasm32")]
         {
-            Self::new_grassland()
+            Self::new_sphere()
         }
     }
 }
