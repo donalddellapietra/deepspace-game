@@ -1,4 +1,3 @@
-pub mod debug;
 pub mod save_mode;
 pub mod toast;
 pub mod tools;

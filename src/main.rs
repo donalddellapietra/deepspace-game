@@ -63,9 +63,6 @@ fn main() {
     #[cfg(feature = "debug_import")]
     app.add_systems(PostStartup, debug_stamp_monument);
 
-    #[cfg(feature = "debug_textures")]
-    app.add_systems(Update, editor::debug::debug_texture_test);
-
     app.run();
 }
 

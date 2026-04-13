@@ -109,9 +109,10 @@ impl Palette {
             materials: Vec::new(),
         };
         for bt in BlockType::ALL {
-            let path = format!("textures/blocks/{}.png", bt.texture_name());
-            let texture: Handle<Image> = asset_server
-                .load_with_settings(path, |s: &mut ImageLoaderSettings| {
+            #[cfg(feature = "textures")]
+            let texture = {
+                let path = format!("textures/blocks/{}.png", bt.texture_name());
+                Some(asset_server.load_with_settings(path, |s: &mut ImageLoaderSettings| {
                     s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
                         address_mode_u: ImageAddressMode::Repeat,
                         address_mode_v: ImageAddressMode::Repeat,
@@ -121,7 +122,10 @@ impl Palette {
                         mipmap_filter: ImageFilterMode::Nearest,
                         ..default()
                     });
-                });
+                }))
+            };
+            #[cfg(not(feature = "textures"))]
+            let texture: Option<Handle<Image>> = None;
             palette.register(
                 PaletteEntry {
                     name: format!("{:?}", bt),
@@ -129,7 +133,7 @@ impl Palette {
                     roughness: bt.roughness(),
                     metallic: bt.metallic(),
                     alpha_mode: bt.alpha_mode(),
-                    texture: Some(texture),
+                    texture,
                 },
                 mat_assets,
             );
