@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use deepspace_game::world::render::prebake_node_raw;
+use deepspace_game::world::mesh_cache::prebake_node_raw;
 use deepspace_game::world::serial::{
     write_prebaked_indexed, write_world_file, PrebakedMeshes,
 };
@@ -62,10 +62,9 @@ fn main() {
         let raw = prebake_node_raw(&world, node_id);
         if raw.is_empty() {
             skipped += 1;
-        } else {
-            prebaked.insert(node_id, raw);
-            baked_count += 1;
         }
+        prebaked.insert(node_id, raw);
+        baked_count += 1;
     }
     eprintln!(
         "  prebaked {} nodes, skipped {} empty, in {:.1}s",
@@ -74,7 +73,7 @@ fn main() {
         bake_start.elapsed().as_secs_f64(),
     );
 
-    // Write meshes.idx + meshes.bin (indexed format for on-demand loading).
+    // Write indexed meshes.idx + meshes.bin.
     let idx_path = PathBuf::from("assets/meshes.idx");
     let meshes_path = PathBuf::from("assets/meshes.bin");
     eprintln!("writing {} + {}...", idx_path.display(), meshes_path.display());

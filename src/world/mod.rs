@@ -17,6 +17,8 @@
 pub mod collision;
 pub mod edit;
 pub mod generator;
+pub mod mesh_cache;
+pub mod mesh_stream;
 pub mod overlay;
 pub mod position;
 pub mod render;
@@ -24,6 +26,7 @@ pub mod serial;
 pub mod state;
 pub mod tree;
 pub mod view;
+pub mod walk;
 
 use bevy::prelude::*;
 

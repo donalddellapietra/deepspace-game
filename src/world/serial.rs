@@ -299,8 +299,6 @@ pub fn read_save_file(
 
 // -------------------------------------------------------- prebaked meshes
 
-use std::io::{Read as _, Seek as _, SeekFrom};
-
 use crate::model::mesher::FaceData;
 
 /// Prebaked mesh data for one node: list of (voxel_type, mesh_geometry).
@@ -309,27 +307,71 @@ pub type PrebakedEntry = Vec<(u8, FaceData)>;
 /// All prebaked meshes, keyed by NodeId.
 pub type PrebakedMeshes = std::collections::HashMap<NodeId, PrebakedEntry>;
 
-// ---- Indexed format: meshes.idx + meshes.bin ----
+#[derive(Serialize, Deserialize)]
+struct PrebakedFile {
+    version: u32,
+    entries: Vec<(u64, PrebakedEntry)>,
+}
+
+const PREBAKED_VERSION: u32 = 1;
+
+pub fn serialize_prebaked(meshes: &PrebakedMeshes) -> io::Result<Vec<u8>> {
+    let entries: Vec<(u64, PrebakedEntry)> = meshes
+        .iter()
+        .map(|(&id, entry)| (id, entry.clone()))
+        .collect();
+    let file = PrebakedFile {
+        version: PREBAKED_VERSION,
+        entries,
+    };
+    let raw = bincode::serialize(&file)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    compress_zstd(&raw)
+}
+
+pub fn write_prebaked_file(path: &Path, meshes: &PrebakedMeshes) -> io::Result<()> {
+    let data = serialize_prebaked(meshes)?;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(&data)?;
+    Ok(())
+}
+
+pub fn deserialize_prebaked(data: &[u8]) -> io::Result<PrebakedMeshes> {
+    let raw = decompress_zstd(data)?;
+    let file: PrebakedFile = bincode::deserialize(&raw)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if file.version != PREBAKED_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported prebaked version: {}", file.version),
+        ));
+    }
+    Ok(file.entries.into_iter().collect())
+}
+
+pub fn read_prebaked_file(path: &Path) -> io::Result<PrebakedMeshes> {
+    let data = std::fs::read(path)?;
+    deserialize_prebaked(&data)
+}
+
+// --------------------------------------------------- indexed format
 //
-// meshes.idx: bincode-serialized MeshIndex (small, loaded at startup)
+// meshes.idx: small index mapping NodeId → (offset, compressed_len)
 // meshes.bin: concatenated individually-zstd-compressed entries
 //
-// Each entry in meshes.bin is independently decompressible, so we can
-// seek to any node and decompress just that one. This enables:
-// - Local: mmap or seek+read, zero upfront cost
-// - Remote: HTTP byte-range requests per node, or per-node endpoint
+// Each entry is independently decompressible for random access.
+
+use std::io::{Read as IoRead, Seek as _, SeekFrom};
 
 const MESH_INDEX_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct MeshIndex {
     version: u32,
-    /// (NodeId, byte offset in meshes.bin, compressed byte length)
-    entries: Vec<(u64, u64, u32)>,
+    entries: Vec<(u64, u64, u32)>, // (node_id, offset, compressed_len)
 }
 
-/// Write prebaked meshes as an indexed pair: meshes.idx + meshes.bin.
-/// Each entry is individually zstd-compressed for independent access.
+/// Write prebaked meshes as indexed meshes.idx + meshes.bin.
 pub fn write_prebaked_indexed(
     idx_path: &Path,
     bin_path: &Path,
@@ -357,11 +399,10 @@ pub fn write_prebaked_indexed(
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let mut idx_file = std::fs::File::create(idx_path)?;
     idx_file.write_all(&idx_data)?;
-
     Ok(())
 }
 
-/// Loaded mesh index: maps NodeId → (offset, length) in meshes.bin.
+/// Loaded index: NodeId → (offset, length) in meshes.bin.
 pub struct MeshIndexMap {
     map: std::collections::HashMap<NodeId, (u64, u32)>,
 }
@@ -377,48 +418,31 @@ impl MeshIndexMap {
                 format!("unsupported mesh index version: {}", index.version),
             ));
         }
-        let map = index
-            .entries
-            .into_iter()
+        let map = index.entries.into_iter()
             .map(|(id, offset, len)| (id, (offset, len)))
             .collect();
         Ok(Self { map })
     }
 
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn contains(&self, node_id: NodeId) -> bool {
-        self.map.contains_key(&node_id)
-    }
+    pub fn len(&self) -> usize { self.map.len() }
 
     pub fn get(&self, node_id: NodeId) -> Option<(u64, u32)> {
         self.map.get(&node_id).copied()
     }
 }
 
-/// On-demand mesh loader: holds a file handle to meshes.bin and reads
-/// individual entries by seeking to their offset.
-pub struct MeshReader {
-    file: std::fs::File,
-}
-
-impl MeshReader {
-    pub fn open(bin_path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(bin_path)?;
-        Ok(Self { file })
-    }
-
-    /// Read and decompress a single prebaked entry by offset + length.
-    pub fn read_entry(&mut self, offset: u64, len: u32) -> io::Result<PrebakedEntry> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; len as usize];
-        self.file.read_exact(&mut buf)?;
-        let raw = decompress_zstd(&buf)?;
-        bincode::deserialize(&raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
+/// Read a single entry from meshes.bin by offset + length.
+pub fn read_mesh_entry(
+    file: &mut std::fs::File,
+    offset: u64,
+    len: u32,
+) -> io::Result<PrebakedEntry> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf)?;
+    let raw = decompress_zstd(&buf)?;
+    bincode::deserialize(&raw)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 // ----------------------------------------------------------------- tests
