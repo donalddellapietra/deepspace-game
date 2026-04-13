@@ -22,6 +22,8 @@ use crate::block::{BslMaterial, Palette, PaletteEntry};
 use crate::camera::FpsCam;
 use crate::player::Player;
 use crate::world::collision;
+use crate::world::npc_compute::anim_data::bake_anim_data;
+use crate::world::npc_compute::instance_builder::{BuildUniforms, InstanceBuilderData};
 use crate::world::npc_compute::{GpuNpcState, NpcGpuData};
 use crate::world::overlay::{OverlayInstance, OverlayList, OverlayPart};
 use crate::world::tree::{
@@ -961,15 +963,74 @@ pub fn collect_overlays_from_buffer(
 
 // ============================================== GPU sync
 
-/// Update NpcGpuData uniforms each frame so the compute shader
-/// has current delta_time, frame count, and NPC count.
+/// Sync NPC buffer state to GPU data each frame.
 fn sync_gpu_uniforms(
     time: Res<Time>,
+    npc_buffer: Res<NpcBuffer>,
+    tree_bp: Option<Res<TreeBlueprint>>,
+    anchor: Res<WorldAnchor>,
+    zoom: Res<CameraZoom>,
+    palette: Option<Res<crate::block::Palette>>,
     mut gpu_data: ResMut<NpcGpuData>,
+    mut builder_data: ResMut<InstanceBuilderData>,
 ) {
     gpu_data.uniforms.delta_time = time.delta_secs();
     gpu_data.uniforms.frame = gpu_data.uniforms.frame.wrapping_add(1);
-    gpu_data.uniforms.npc_count = gpu_data.states.len() as u32;
+    gpu_data.uniforms.npc_count = npc_buffer.npcs.len() as u32;
+
+    let Some(tree_bp) = tree_bp else { return };
+
+    // Sync NPC states to builder data for GPU instance generation.
+    builder_data.npc_states.clear();
+    for npc in &npc_buffer.npcs {
+        if !npc.alive { continue; }
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        builder_data.npc_states.push(GpuNpcState {
+            position: bevy_pos.to_array(),
+            heading: npc.heading,
+            velocity: npc.velocity.to_array(),
+            ai_timer: npc.ai_timer,
+            anim_time: npc.anim_time,
+            speed: NPC_WALK_SPEED_CELLS * cell_size_at_layer(zoom.layer),
+            seed: 0,
+            flags: 1,
+        });
+    }
+
+    // Bake animation data (only changes when blueprint changes).
+    let anim = bake_anim_data(&tree_bp);
+    builder_data.parts = anim.parts;
+    builder_data.keyframes.clear();
+    for kf in &anim.keyframes[..anim.num_keyframes as usize] {
+        for part in &kf[..anim.num_parts as usize] {
+            builder_data.keyframes.push(*part);
+        }
+    }
+
+    // Per-part colors from palette.
+    if let Some(palette) = palette {
+        for (i, tp) in tree_bp.parts.iter().enumerate().take(8) {
+            // Use the first voxel color of the part's node as the part color.
+            // This is approximate — parts with multiple materials use the first.
+            if let Some(entry) = palette.get(tp.size[0]) {
+                let c = entry.color.to_linear();
+                builder_data.colors[i] = [c.red, c.green, c.blue, 1.0];
+            }
+        }
+    }
+
+    let scale = tree_npc_scale(crate::world::tree::MAX_LAYER, &tree_bp);
+    builder_data.uniforms = BuildUniforms {
+        npc_count: builder_data.npc_states.len() as u32,
+        num_parts: anim.num_parts,
+        num_keyframes: anim.num_keyframes,
+        _pad: 0,
+        frame_duration: anim.frame_duration,
+        total_duration: anim.total_duration,
+        scale,
+        _pad2: 0.0,
+    };
+    builder_data.dirty = true;
 }
 
 // ============================================== JS spawn bridge (WASM only)

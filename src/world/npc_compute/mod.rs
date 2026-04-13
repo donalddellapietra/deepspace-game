@@ -10,7 +10,9 @@
 //! - `NpcComputeUniforms` (GPU): per-frame globals (dt, frame, gravity)
 //! - Render graph node dispatches compute before camera rendering
 
+pub mod anim_data;
 mod data;
+pub mod instance_builder;
 mod pipeline;
 mod node;
 

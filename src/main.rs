@@ -55,6 +55,7 @@ fn main() {
             npc::NpcPlugin,
             world::instanced_overlay::NpcInstancePlugin,
             world::npc_compute::NpcComputePlugin,
+            world::npc_compute::instance_builder::InstanceBuilderPlugin,
             diagnostics::DiagnosticsPlugin,
         ))
         .add_systems(Startup, setup_environment)
