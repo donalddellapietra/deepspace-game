@@ -12,18 +12,14 @@
 //! floating [`WorldAnchor`](super::view::WorldAnchor) maps that to
 //! Bevy `y = 0` whenever the player is resting on it.
 
-use std::collections::HashMap;
-
 use bevy::prelude::*;
 
 use super::generator::{generate_air_leaf, generate_grass_leaf};
-use super::terrain::TerrainConfig;
 use super::tree::{
-    downsample_from_library, filled_voxel_grid, slot_coords, uniform_children,
-    voxel_from_block, Children, NodeId, NodeLibrary, BRANCH_FACTOR,
-    CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
+    downsample_from_library, slot_coords, uniform_children, Children, NodeId,
+    NodeLibrary, BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER,
+    NODE_VOXELS_PER_AXIS,
 };
-use crate::block::BlockType;
 
 /// Root-local y-offset of the ground surface, in leaf voxels. Every
 /// leaf whose y-range in root-local coords is ≤ this value is solid
@@ -94,81 +90,26 @@ pub const fn world_extent_voxels() -> i64 {
 pub struct WorldState {
     pub root: NodeId,
     pub library: NodeLibrary,
-    pub terrain: Option<TerrainConfig>,
-    pub grass_leaf_id: Option<NodeId>,
-    pub air_leaf_id: Option<NodeId>,
-    /// Cached uniform air subtree at each layer.
-    pub air_tower: [NodeId; MAX_LAYER as usize + 1],
-    /// Cached uniform solid subtrees, keyed by block type.
-    solid_towers: HashMap<BlockType, [NodeId; MAX_LAYER as usize + 1]>,
-}
-
-impl WorldState {
-    /// Look up (or build) the uniform solid tower for a block type.
-    pub fn solid_tower(&mut self, bt: &BlockType, layer: u8) -> NodeId {
-        if let Some(tower) = self.solid_towers.get(bt) {
-            return tower[layer as usize];
-        }
-        // Build the tower bottom-up.
-        let voxel = voxel_from_block(Some(*bt));
-        let leaf = self.library.insert_leaf(filled_voxel_grid(voxel));
-        let mut layers = [EMPTY_NODE; MAX_LAYER as usize + 1];
-        layers[MAX_LAYER as usize] = leaf;
-        let mut cur = leaf;
-        for k in (0..MAX_LAYER).rev() {
-            let children = uniform_children(cur);
-            let voxels = downsample_from_library(&self.library, children.as_ref());
-            cur = self.library.insert_non_leaf(voxels, children);
-            layers[k as usize] = cur;
-        }
-        self.solid_towers.insert(*bt, layers);
-        layers[layer as usize]
-    }
 }
 
 impl Default for WorldState {
     fn default() -> Self {
-        // Toggle: new_terrain(42) for terrain, new_grassland() for flat.
         Self::new_grassland()
     }
 }
 
 impl WorldState {
-    /// Build a flat grassland world (no terrain generation).
+    /// Build a fresh grassland world with a ground layer. Content
+    /// collapses to a small number of library entries thanks to
+    /// dedup: two leaf patterns (grass and air), plus two non-leaf
+    /// patterns per layer (a "bottom-row" pattern and an "all air"
+    /// pattern) until the loop reaches the root.
     pub fn new_grassland() -> Self {
         let mut state = Self {
             root: EMPTY_NODE,
             library: NodeLibrary::default(),
-            terrain: None,
-            grass_leaf_id: None,
-            air_leaf_id: None,
-            air_tower: [EMPTY_NODE; MAX_LAYER as usize + 1],
-            solid_towers: HashMap::new(),
         };
         state.build_grassland_root();
-        state
-    }
-
-    /// Build a terrain world. Starts as grassland; the terrain system
-    /// lazily replaces pristine subtrees with noise content each frame.
-    pub fn new_terrain(seed: i32) -> Self {
-        let mut state = Self {
-            root: EMPTY_NODE,
-            library: NodeLibrary::default(),
-            terrain: None,
-            grass_leaf_id: None,
-            air_leaf_id: None,
-            air_tower: [EMPTY_NODE; MAX_LAYER as usize + 1],
-            solid_towers: HashMap::new(),
-        };
-        state.build_grassland_root();
-        // Build air_tower[0] — the grassland loop skips layer 0.
-        if state.air_tower[0] == EMPTY_NODE && state.air_tower[1] != EMPTY_NODE {
-            let children = uniform_children(state.air_tower[1]);
-            let voxels = downsample_from_library(&state.library, children.as_ref());
-            state.air_tower[0] = state.library.insert_non_leaf(voxels, children);
-        }
-        state.terrain = Some(TerrainConfig::new(seed, GROUND_Y_VOXELS));
         state
     }
 
@@ -204,13 +145,9 @@ impl WorldState {
     /// dedup makes every insertion a library hit, so the world id
     /// is preserved.
     pub fn build_grassland_root(&mut self) -> NodeId {
-        // Insert the two leaf patterns and record them for terrain
-        // generation detection.
+        // Insert the two leaf patterns.
         let grass_leaf = self.library.insert_leaf(generate_grass_leaf());
         let air_leaf = self.library.insert_leaf(generate_air_leaf());
-        self.grass_leaf_id = Some(grass_leaf);
-        self.air_leaf_id = Some(air_leaf);
-        self.air_tower[MAX_LAYER as usize] = air_leaf;
 
         // `cur_bottom` is the NodeId of the "pattern at root-local
         // y_min = 0" for the layer BELOW the one we're currently
@@ -253,11 +190,6 @@ impl WorldState {
             } else {
                 cur_air
             };
-
-            // Record the air tower ID at this layer.
-            if k > 0 {
-                self.air_tower[k as usize] = new_air;
-            }
 
             cur_bottom = new_bottom;
             cur_air = new_air;
