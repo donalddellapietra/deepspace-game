@@ -23,6 +23,10 @@ test("WASM terrain renders", async ({ page }) => {
   const perf = await page.evaluate(() => (window as any).__perfData);
   console.log(`Perf: ${perf.fps.toFixed(1)} FPS, ${perf.entityCount} entities`);
 
-  // Game is running and rendering
-  expect(perf.entityCount).toBeGreaterThan(0);
+  // Game is running and rendering terrain
+  expect(perf.entityCount).toBeGreaterThan(10);
+
+  // Visual regression check: screenshot saved to test-results/
+  // for manual review. Playwright's toHaveScreenshot() can be
+  // used for automated comparison once a baseline is established.
 });

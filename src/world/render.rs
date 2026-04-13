@@ -112,6 +112,13 @@ impl CameraZoom {
 /// the 2D prototype's "viewport counts cells, not pixels" behaviour.
 pub const RADIUS_VIEW_CELLS: f32 = 32.0;
 
+/// Within this radius (in view cells) the renderer emits composed
+/// entities (target − 2, full DETAIL_DEPTH detail). Beyond this
+/// radius out to `RADIUS_VIEW_CELLS`, it emits single-level
+/// flattened entities (target − 1, one less layer of detail but
+/// cheaper meshes). Only applies when composition is possible.
+pub const FINE_RADIUS_VIEW_CELLS: f32 = 8.0;
+
 // ----------------------------------------------------------------- state
 
 /// Per-frame timing data exposed to the diagnostics HUD.
@@ -128,11 +135,12 @@ pub struct RenderTimings {
 
 #[derive(Resource, Default)]
 pub struct RenderState {
-    /// Cached baked data keyed by `NodeId`. Stores intermediate
-    /// products (flat grid, per-child faces) alongside the merged
-    /// GPU meshes so edits can incrementally re-bake only the dirty
-    /// children instead of the full 125³ grid.
+    /// Cached flattened bake data keyed by `NodeId`.
     baked: HashMap<NodeId, BakedNode>,
+    /// Cached composed bake data keyed by `NodeId`. Separate from
+    /// `baked` because the same NodeId produces different meshes
+    /// when composed vs flattened.
+    baked_composed: HashMap<NodeId, BakedNode>,
     /// Pre-baked mesh data for composition children, keyed by `NodeId`.
     /// Each entry holds per-voxel-type `FaceData` (pre-GPU vertex
     /// buffers). These are shared across parent entities via
@@ -143,7 +151,8 @@ pub struct RenderState {
     /// diff when an edit changes the NodeId at a path.
     path_node: HashMap<SmallPath, NodeId>,
     /// Live entities, keyed by "path prefix" (a `SmallPath`).
-    entities: HashMap<SmallPath, (Entity, NodeId, Vec3)>,
+    /// Tuple: (entity, node_id, origin, compose_flag).
+    entities: HashMap<SmallPath, (Entity, NodeId, Vec3, bool)>,
     /// Zoom layer the `entities` set was built for. If it changes,
     /// everything gets despawned and rebuilt.
     last_zoom_layer: u8,
@@ -549,6 +558,9 @@ struct Visit {
     node_id: NodeId,
     origin: Vec3,
     scale: f32,
+    /// True if this visit should use composition baking (fine emit).
+    /// False for single-level flatten (coarse emit).
+    compose: bool,
 }
 
 /// One frame on the `walk()` DFS stack. Extracted into a named
@@ -571,7 +583,10 @@ struct WalkFrame {
 fn walk(
     world: &WorldState,
     emit_layer: u8,
-    entity_scale: f32,
+    compose_scale: f32,
+    flatten_scale: f32,
+    use_composition: bool,
+    fine_radius_sq: f32,
     camera_pos: Vec3,
     radius_bevy: f32,
     anchor: &WorldAnchor,
@@ -629,13 +644,17 @@ fn walk(
             continue;
         }
 
-        // Reached emit layer → emit.
+        // Reached emit layer → emit. Near entities get composed
+        // (3-layer detail); far entities get flattened (2-layer,
+        // cheaper mesh). Same entity count either way.
         if depth == emit_layer {
+            let compose = use_composition && min_dist_sq <= fine_radius_sq;
             out.push(Visit {
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: entity_scale,
+                scale: if compose { compose_scale } else { flatten_scale },
+                compose,
             });
             continue;
         }
@@ -649,7 +668,8 @@ fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: entity_scale,
+                scale: flatten_scale,
+                compose: false,
             });
             continue;
         };
@@ -702,21 +722,26 @@ pub fn render_world(
     let render_total_start = bevy::platform::time::Instant::now();
 
     let target_layer = target_layer_for(zoom.layer);
-    // Composition: emit at target-2 (entity composes pre-baked child
-    // meshes for full DETAIL_DEPTH detail). Falls back to target-1
-    // when the tree isn't deep enough for composition.
     let use_composition = zoom.layer + DETAIL_DEPTH <= MAX_LAYER;
+
+    // Single emit layer: target-2 when composition possible, else
+    // target-1. The compose flag on each Visit controls whether the
+    // entity gets composed (3-layer detail) or flattened (2-layer).
     let emit_layer = if use_composition {
         target_layer.saturating_sub(2)
     } else {
         target_layer.saturating_sub(1)
     };
 
-    let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
+    let cell = anchor.cell_bevy(zoom.layer);
+    let radius_bevy = RADIUS_VIEW_CELLS * cell;
+    let fine_radius_sq = (FINE_RADIUS_VIEW_CELLS * cell).powi(2);
 
-    // Entity scale: mesh coordinates are in target-layer voxels, but
-    // norm is based on (zoom+1). Scale converts mesh units to Bevy units.
-    let entity_scale = scale_for_layer(target_layer) / anchor.norm;
+    // Composed meshes are in target-layer voxels [0, 625).
+    // Flattened meshes are in (emit+1)-layer voxels [0, 125).
+    // They need different scales to map to the same Bevy extent.
+    let compose_scale = scale_for_layer(target_layer) / anchor.norm;
+    let flatten_scale = scale_for_layer((emit_layer + 1).min(MAX_LAYER)) / anchor.norm;
 
     // If zoom changed, first pass, or forced rebuild, drop everything.
     if !render_state.initialised
@@ -724,13 +749,14 @@ pub fn render_world(
         || render_state.force_rebuild
     {
         render_state.force_rebuild = false;
-        for (_, (entity, _, _)) in render_state.entities.drain() {
+        for (_, (entity, _, _, _)) in render_state.entities.drain() {
             if let Ok(mut ec) = commands.get_entity(entity) {
                 ec.despawn();
             }
         }
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
         render_state.baked.clear();
+        render_state.baked_composed.clear();
         render_state.path_node.clear();
         render_state.last_zoom_layer = zoom.layer;
         render_state.initialised = true;
@@ -744,7 +770,10 @@ pub fn render_world(
     walk(
         &world,
         emit_layer,
-        entity_scale,
+        compose_scale,
+        flatten_scale,
+        use_composition,
+        fine_radius_sq,
         camera_pos,
         radius_bevy,
         &anchor,
@@ -758,7 +787,13 @@ pub fn render_world(
     {
         let bake_start = bevy::platform::time::Instant::now();
         for v in visits.iter() {
-            if render_state.baked.contains_key(&v.node_id) {
+            let already_cached = if v.compose {
+                render_state.baked_composed.contains_key(&v.node_id)
+            } else {
+                render_state.baked.contains_key(&v.node_id)
+            };
+
+            if already_cached {
                 render_state.path_node.insert(v.path, v.node_id);
                 continue;
             }
@@ -776,13 +811,13 @@ pub fn render_world(
                     child_faces: Vec::new(),
                     merged,
                 });
-            } else if use_composition {
+            } else if v.compose {
                 // Composition: compose from pre-baked children.
                 let merged = compose_node(
                     &world, v.node_id,
                     &mut render_state.pre_baked, &mut meshes,
                 );
-                render_state.baked.insert(v.node_id, BakedNode {
+                render_state.baked_composed.insert(v.node_id, BakedNode {
                     child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
                     child_class: Vec::new(),
                     flat_grid: Vec::new(),
@@ -790,7 +825,7 @@ pub fn render_world(
                     merged,
                 });
             } else {
-                // Fallback: single-level flatten.
+                // Single-level flatten.
                 let baked = if let Some(&old_nid) = render_state.path_node.get(&v.path) {
                     if let Some(old_bake) = render_state.baked.get(&old_nid) {
                         BakedNode::new_incremental(old_bake, &world, v.node_id, &mut meshes)
@@ -809,7 +844,7 @@ pub fn render_world(
 
     // Reconcile: what's alive now, what changed, what's gone.
     let reconcile_start = bevy::platform::time::Instant::now();
-    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
+    let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3, bool)> =
         HashMap::with_capacity(visits.len());
 
     for visit in visits.drain(..) {
@@ -817,8 +852,8 @@ pub fn render_world(
         let existing = render_state.entities.remove(&visit.path);
 
         match existing {
-            Some((entity, existing_id, last_origin))
-                if existing_id == new_node_id =>
+            Some((entity, existing_id, last_origin, last_compose))
+                if existing_id == new_node_id && last_compose == visit.compose =>
             {
                 if last_origin != visit.origin {
                     if let Ok(mut ec) = commands.get_entity(entity) {
@@ -828,18 +863,20 @@ pub fn render_world(
                         );
                     }
                 }
-                alive.insert(visit.path, (entity, existing_id, visit.origin));
+                alive.insert(visit.path, (entity, existing_id, visit.origin, visit.compose));
             }
             other => {
-                if let Some((old_entity, _, _)) = other {
+                if let Some((old_entity, _, _, _)) = other {
                     if let Ok(mut ec) = commands.get_entity(old_entity) {
                         ec.despawn();
                     }
                 }
 
-                let baked = render_state.baked.get(&new_node_id)
-                    .map(|b| &b.merged[..])
-                    .unwrap_or(&[]);
+                let baked = if visit.compose {
+                    render_state.baked_composed.get(&new_node_id)
+                } else {
+                    render_state.baked.get(&new_node_id)
+                }.map(|b| &b.merged[..]).unwrap_or(&[]);
 
                 let parent = commands
                     .spawn((
@@ -864,12 +901,12 @@ pub fn render_world(
                     ));
                 }
 
-                alive.insert(visit.path, (parent, new_node_id, visit.origin));
+                alive.insert(visit.path, (parent, new_node_id, visit.origin, visit.compose));
             }
         }
     }
 
-    for (_, (entity, _, _)) in render_state.entities.drain() {
+    for (_, (entity, _, _, _)) in render_state.entities.drain() {
         if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
         }
