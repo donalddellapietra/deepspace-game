@@ -463,11 +463,41 @@ fn compose_node(
     let children = node.children.as_ref().expect("compose: expected non-leaf");
     let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
 
+    // Fast path: if ALL children share the same NodeId, the entity is
+    // a uniform "tower" (e.g., all-solid underground). Instead of
+    // composing 98 boundary children with 588 quads, emit a simple
+    // box mesh: 6 quads for the 6 outer faces of the whole entity.
+    // This reduces underground geometry by ~100× while keeping the
+    // surface faces visible.
+    let first_non_empty = child_ids.iter().find(|&&id| id != EMPTY_NODE);
+    if let Some(&first_id) = first_non_empty {
+        if child_ids.iter().all(|&id| id == first_id || id == EMPTY_NODE)
+            && child_ids.iter().all(|&id| id == first_id)
+        {
+            // All 125 children are identical → uniform tower.
+            // Bake as a simple volume from the node's own 25³ downsample.
+            let voxels = node.voxels.clone();
+            let grid_size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
+            let first_v = voxels[0];
+            // If truly uniform (all same voxel), emit a single box.
+            if voxels.iter().all(|&v| v == first_v) && first_v != EMPTY_VOXEL {
+                return bake_volume(
+                    grid_size,
+                    |x, y, z| {
+                        if x < 0 || y < 0 || z < 0
+                            || x >= grid_size || y >= grid_size || z >= grid_size
+                        { None } else { Some(first_v) }
+                    },
+                    meshes,
+                );
+            }
+        }
+    }
+
     // Classify children at the parent's level (using their 25³
     // downsampled grids). Interior-uniform children — those completely
     // surrounded by same-material siblings — are skipped because
-    // their outer faces are fully occluded. This eliminates the
-    // massive face waste from underground solid children.
+    // their outer faces are fully occluded.
     let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
         .map(|slot| classify_child(world, child_ids[slot]))
         .collect();
@@ -603,7 +633,7 @@ fn walk(
 
         // Reached emit layer → emit (skip uniform-empty nodes).
         if depth == emit_layer {
-            if world.library.get(node_id).map_or(false, |n| n.uniform) {
+            if world.library.get(node_id).map_or(false, |n| n.uniform_empty) {
                 continue;
             }
             out.push(Visit {
