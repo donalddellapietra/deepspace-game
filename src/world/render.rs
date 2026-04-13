@@ -463,19 +463,41 @@ fn compose_node(
     let children = node.children.as_ref().expect("compose: expected non-leaf");
     let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
 
-    // Ensure all children are pre-baked.
-    for &child_id in &child_ids {
+    // Classify children at the parent's level (using their 25³
+    // downsampled grids). Interior-uniform children — those completely
+    // surrounded by same-material siblings — are skipped because
+    // their outer faces are fully occluded. This eliminates the
+    // massive face waste from underground solid children.
+    let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
+        .map(|slot| classify_child(world, child_ids[slot]))
+        .collect();
+
+    // Pre-bake only children that will contribute visible faces.
+    for slot in 0..CHILDREN_PER_NODE {
+        let child_id = child_ids[slot];
         if child_id == EMPTY_NODE { continue; }
+        match child_class[slot] {
+            ChildClass::Empty => continue,
+            ChildClass::Uniform(v) if v == EMPTY_VOXEL => continue,
+            ChildClass::Uniform(v) if is_interior_uniform(slot, v, &child_class) => continue,
+            _ => {}
+        }
         if pre_baked.contains_key(&child_id) { continue; }
         let faces = pre_bake_child(world, child_id);
         pre_baked.insert(child_id, faces);
     }
 
-    // Collect references for composition.
-    let children_faces: Vec<Option<&StdHashMap<u8, FaceData>>> = child_ids.iter()
-        .map(|&id| {
-            if id == EMPTY_NODE { None }
-            else { pre_baked.get(&id) }
+    // Collect references for composition, skipping interior children.
+    let children_faces: Vec<Option<&StdHashMap<u8, FaceData>>> = (0..CHILDREN_PER_NODE)
+        .map(|slot| {
+            let child_id = child_ids[slot];
+            if child_id == EMPTY_NODE { return None; }
+            match child_class[slot] {
+                ChildClass::Empty => None,
+                ChildClass::Uniform(v) if v == EMPTY_VOXEL => None,
+                ChildClass::Uniform(v) if is_interior_uniform(slot, v, &child_class) => None,
+                _ => pre_baked.get(&child_id),
+            }
         })
         .collect();
 
