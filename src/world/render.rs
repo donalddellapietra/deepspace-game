@@ -570,7 +570,10 @@ fn walk(
 /// Build a flat annulus (ring) mesh in the XZ plane, centered at origin.
 /// `inner_r` and `outer_r` are the radii. The ring has `segments`
 /// angular divisions for a smooth circular edge.
-fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, segments: u32) -> Handle<Mesh> {
+/// Build a flat annulus (ring) mesh in the XZ plane, centered at origin.
+/// `inner_y` raises the inner edge above the outer edge, creating a
+/// gentle slope that covers terrain side faces at the boundary.
+fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, inner_y: f32, segments: u32) -> Handle<Mesh> {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::Indices;
     use bevy::render::render_resource::PrimitiveTopology;
@@ -586,12 +589,12 @@ fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, segm
         let angle = (i as f32 / segments as f32) * TAU;
         let (sin_a, cos_a) = angle.sin_cos();
 
-        // Inner vertex
-        positions.push([cos_a * inner_r, 0.0, sin_a * inner_r]);
+        // Inner vertex — raised to inner_y to cover terrain edge side faces.
+        positions.push([cos_a * inner_r, inner_y, sin_a * inner_r]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([i as f32 / segments as f32, 0.0]);
 
-        // Outer vertex
+        // Outer vertex — at Y=0 (ground level at horizon).
         positions.push([cos_a * outer_r, 0.0, sin_a * outer_r]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([i as f32 / segments as f32, 1.0]);
@@ -927,9 +930,15 @@ pub fn render_world(
 
         // Rebuild the annulus mesh when the zoom layer changes (radii change).
         // Otherwise reuse the cached mesh.
+        // Inner edge raised by 2 cells to cover terrain side faces.
+        // The slope from inner_y down to Y=0 at the outer edge is gentle
+        // enough to not be visible as a floating layer.
+        let cell = anchor.cell_bevy(zoom.layer);
+        let inner_y = cell * 2.0;
+
         let needs_rebuild = render_state.imposter_mesh.is_none();
         let annulus = if needs_rebuild {
-            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, 64);
+            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, inner_y, 64);
             render_state.imposter_mesh = Some(mesh.clone());
             mesh
         } else {
