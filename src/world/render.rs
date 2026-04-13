@@ -29,8 +29,8 @@ use bevy::prelude::*;
 use crate::block::Palette;
 use std::collections::HashMap as StdHashMap;
 use crate::model::mesher::{
-    bake_volume, bake_child_faces, merge_child_faces, merge_child_faces_raw,
-    flatten_children, compose_children_meshes, build_sub_meshes,
+    bake_volume, bake_child_faces, merge_child_faces,
+    flatten_children, compose_children_meshes,
     ChildClass, ChildFaces, FaceData,
 };
 use crate::model::BakedSubMesh;
@@ -133,11 +133,11 @@ pub struct RenderState {
     /// GPU meshes so edits can incrementally re-bake only the dirty
     /// children instead of the full 125³ grid.
     baked: HashMap<NodeId, BakedNode>,
-    /// Pre-baked mesh data for composition children, keyed by `NodeId`.
-    /// Each entry holds per-voxel-type `FaceData` (pre-GPU vertex
-    /// buffers). These are shared across parent entities via
-    /// content-addressed dedup.
-    pre_baked: StdHashMap<NodeId, StdHashMap<u8, FaceData>>,
+    /// Cached 125³ flat grids for composition children, keyed by
+    /// `NodeId`. Each grid is the child's grandchildren flattened into
+    /// a contiguous volume. Shared across entities via content-addressed
+    /// dedup. Used for fine-detail baking in compose_node.
+    child_grids: StdHashMap<NodeId, Vec<u8>>,
     /// Per-path tracking: remembers which `NodeId` each path last
     /// displayed. Used to find the old `BakedNode` for incremental
     /// diff when an edit changes the NodeId at a path.
@@ -409,28 +409,17 @@ fn bake_leaf(world: &WorldState, node_id: NodeId, meshes: &mut Assets<Mesh>) -> 
 
 // ---------------------------------------------------------- composition
 
-/// Pre-bake a child node into raw `FaceData` per voxel type. Same
-/// pipeline as `BakedNode::new_cold` but stops before GPU upload:
-/// flatten children into 125³, greedy mesh, merge to `FaceData`.
-fn pre_bake_child(world: &WorldState, node_id: NodeId) -> StdHashMap<u8, FaceData> {
-    let node = world.library.get(node_id).expect("pre_bake: node missing");
-    let Some(children) = node.children.as_ref() else {
-        // Leaf node: bake its 25³ grid to FaceData directly.
-        let voxels = node.voxels.clone();
-        let faces = crate::model::mesher::bake_faces_raw(
-            NODE_VOXELS_PER_AXIS as i32,
-            &move |x, y, z| {
-                if x < 0 || y < 0 || z < 0
-                    || x >= NODE_VOXELS_PER_AXIS as i32
-                    || y >= NODE_VOXELS_PER_AXIS as i32
-                    || z >= NODE_VOXELS_PER_AXIS as i32
-                { return None; }
-                let v = voxels[voxel_idx(x as usize, y as usize, z as usize)];
-                if v == EMPTY_VOXEL { None } else { Some(v) }
-            },
-        );
-        return faces;
-    };
+/// Build or retrieve the 125³ flat grid for a node (flattened from
+/// its children's 25³ grids). Cached by NodeId since the grid
+/// depends only on the node's content.
+fn ensure_child_grid(
+    world: &WorldState,
+    node_id: NodeId,
+    cache: &mut StdHashMap<NodeId, Vec<u8>>,
+) -> bool {
+    if cache.contains_key(&node_id) { return true; }
+    let node = world.library.get(node_id).expect("ensure_grid: missing");
+    let Some(children) = node.children.as_ref() else { return false; };
     let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
     let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
         .map(|slot| classify_child(world, child_ids[slot]))
@@ -439,70 +428,53 @@ fn pre_bake_child(world: &WorldState, node_id: NodeId) -> StdHashMap<u8, FaceDat
         .map(|slot| {
             if child_ids[slot] == EMPTY_NODE { None }
             else { Some(world.library.get(child_ids[slot])
-                .expect("pre_bake: child missing").voxels.as_ref().as_slice()) }
+                .expect("ensure_grid: child missing").voxels.as_ref().as_slice()) }
         })
         .collect();
-    let flat_grid = flatten_children(
+    let grid = flatten_children(
         &children_voxels, &child_class,
         BRANCH_FACTOR, NODE_VOXELS_PER_AXIS, EMPTY_VOXEL,
     );
-    let child_faces = bake_all_children(&flat_grid, &child_ids, &child_class);
-    merge_child_faces_raw(&child_faces)
+    cache.insert(node_id, grid);
+    true
 }
 
-/// Compose a node's mesh by concatenating its 125 pre-baked
-/// children's meshes with position offsets. Each child's mesh
-/// covers [0, 125); the composed result covers [0, 625).
+/// Compose a node's mesh from its children's fine detail, using the
+/// parent's flat grid for boundary face suppression.
+///
+/// Each child is baked from its own 125³ grid (full resolution), but
+/// boundary queries fall back to the parent's 125³ flat grid
+/// (downsample resolution). This suppresses interior faces between
+/// adjacent solid children while preserving surface detail.
 fn compose_node(
     world: &WorldState,
     node_id: NodeId,
-    pre_baked: &mut StdHashMap<NodeId, StdHashMap<u8, FaceData>>,
+    child_grids: &mut StdHashMap<NodeId, Vec<u8>>,
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
     let node = world.library.get(node_id).expect("compose: node missing");
     let children = node.children.as_ref().expect("compose: expected non-leaf");
     let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
 
-    // Fast path: if ALL children share the same NodeId, the entity is
-    // a uniform "tower" (e.g., all-solid underground). Instead of
-    // composing 98 boundary children with 588 quads, emit a simple
-    // box mesh: 6 quads for the 6 outer faces of the whole entity.
-    // This reduces underground geometry by ~100× while keeping the
-    // surface faces visible.
-    let first_non_empty = child_ids.iter().find(|&&id| id != EMPTY_NODE);
-    if let Some(&first_id) = first_non_empty {
-        if child_ids.iter().all(|&id| id == first_id || id == EMPTY_NODE)
-            && child_ids.iter().all(|&id| id == first_id)
-        {
-            // All 125 children are identical → uniform tower.
-            // Bake as a simple volume from the node's own 25³ downsample.
-            let voxels = node.voxels.clone();
-            let grid_size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
-            let first_v = voxels[0];
-            // If truly uniform (all same voxel), emit a single box.
-            if voxels.iter().all(|&v| v == first_v) && first_v != EMPTY_VOXEL {
-                return bake_volume(
-                    grid_size,
-                    |x, y, z| {
-                        if x < 0 || y < 0 || z < 0
-                            || x >= grid_size || y >= grid_size || z >= grid_size
-                        { None } else { Some(first_v) }
-                    },
-                    meshes,
-                );
-            }
-        }
-    }
-
-    // Classify children at the parent's level (using their 25³
-    // downsampled grids). Interior-uniform children — those completely
-    // surrounded by same-material siblings — are skipped because
-    // their outer faces are fully occluded.
+    // Step 1: build parent-level flat grid (125³) from children's 25³
+    // downsamples. Used for boundary face suppression.
     let child_class: Vec<ChildClass> = (0..CHILDREN_PER_NODE)
         .map(|slot| classify_child(world, child_ids[slot]))
         .collect();
+    let children_voxels: Vec<Option<&[u8]>> = (0..CHILDREN_PER_NODE)
+        .map(|slot| {
+            if child_ids[slot] == EMPTY_NODE { None }
+            else { Some(world.library.get(child_ids[slot])
+                .expect("compose: child missing").voxels.as_ref().as_slice()) }
+        })
+        .collect();
+    let parent_grid = flatten_children(
+        &children_voxels, &child_class,
+        BRANCH_FACTOR, NODE_VOXELS_PER_AXIS, EMPTY_VOXEL,
+    );
+    let parent_size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
 
-    // Pre-bake only children that will contribute visible faces.
+    // Step 2: ensure each non-interior child's 125³ grid is cached.
     for slot in 0..CHILDREN_PER_NODE {
         let child_id = child_ids[slot];
         if child_id == EMPTY_NODE { continue; }
@@ -512,31 +484,111 @@ fn compose_node(
             ChildClass::Uniform(v) if is_interior_uniform(slot, v, &child_class) => continue,
             _ => {}
         }
-        if pre_baked.contains_key(&child_id) { continue; }
-        let faces = pre_bake_child(world, child_id);
-        pre_baked.insert(child_id, faces);
+        ensure_child_grid(world, child_id, child_grids);
     }
 
-    // Collect references for composition, skipping interior children.
-    let children_faces: Vec<Option<&StdHashMap<u8, FaceData>>> = (0..CHILDREN_PER_NODE)
-        .map(|slot| {
-            let child_id = child_ids[slot];
-            if child_id == EMPTY_NODE { return None; }
-            match child_class[slot] {
-                ChildClass::Empty => None,
-                ChildClass::Uniform(v) if v == EMPTY_VOXEL => None,
-                ChildClass::Uniform(v) if is_interior_uniform(slot, v, &child_class) => None,
-                _ => pre_baked.get(&child_id),
+    // Step 3: bake each non-interior child using extended_get.
+    let child_size = parent_size; // 125
+    let cs = child_size as usize;
+    let ps = parent_size as usize;
+    let mut all_faces: Vec<ChildFaces> = Vec::with_capacity(CHILDREN_PER_NODE);
+
+    for slot in 0..CHILDREN_PER_NODE {
+        let child_id = child_ids[slot];
+        if child_id == EMPTY_NODE {
+            all_faces.push(Default::default());
+            continue;
+        }
+        match child_class[slot] {
+            ChildClass::Empty => { all_faces.push(Default::default()); continue; }
+            ChildClass::Uniform(v) if v == EMPTY_VOXEL => { all_faces.push(Default::default()); continue; }
+            ChildClass::Uniform(v) if is_interior_uniform(slot, v, &child_class) => { all_faces.push(Default::default()); continue; }
+            _ => {}
+        }
+
+        let child_grid = match child_grids.get(&child_id) {
+            Some(g) => g,
+            None => {
+                // Leaf child (no grandchildren): bake from 25³ voxels.
+                let voxels = world.library.get(child_id).unwrap().voxels.clone();
+                let (sx, sy, sz) = slot_coords(slot);
+                let offset = [
+                    (sx as i32) * child_size,
+                    (sy as i32) * child_size,
+                    (sz as i32) * child_size,
+                ];
+                // For leaves, bake at 25³ resolution with parent boundary.
+                let leaf_size = NODE_VOXELS_PER_AXIS as i32;
+                let get = |x: i32, y: i32, z: i32| -> Option<u8> {
+                    if x >= 0 && y >= 0 && z >= 0
+                        && x < leaf_size && y < leaf_size && z < leaf_size
+                    {
+                        let v = voxels[voxel_idx(x as usize, y as usize, z as usize)];
+                        if v == EMPTY_VOXEL { None } else { Some(v) }
+                    } else {
+                        // Boundary: map to parent flat grid.
+                        let px = offset[0] + x;
+                        let py = offset[1] + y;
+                        let pz = offset[2] + z;
+                        if px < 0 || py < 0 || pz < 0
+                            || px >= parent_size || py >= parent_size || pz >= parent_size
+                        { return None; }
+                        let v = parent_grid[(pz as usize * ps + py as usize) * ps + px as usize];
+                        if v == EMPTY_VOXEL { None } else { Some(v) }
+                    }
+                };
+                let faces = crate::model::mesher::bake_faces_raw(leaf_size, &get);
+                all_faces.push(faces);
+                continue;
             }
-        })
+        };
+
+        let (sx, sy, sz) = slot_coords(slot);
+        let child_offset = [
+            (sx as i32) * NODE_VOXELS_PER_AXIS as i32,
+            (sy as i32) * NODE_VOXELS_PER_AXIS as i32,
+            (sz as i32) * NODE_VOXELS_PER_AXIS as i32,
+        ];
+
+        // Extended get: child grid for interior, parent grid for boundary.
+        // Child's 125³ maps to 25 parent voxels, so 5 child voxels = 1 parent voxel.
+        let get = |x: i32, y: i32, z: i32| -> Option<u8> {
+            if x >= 0 && y >= 0 && z >= 0
+                && x < child_size && y < child_size && z < child_size
+            {
+                let v = child_grid[(z as usize * cs + y as usize) * cs + x as usize];
+                if v == EMPTY_VOXEL { None } else { Some(v) }
+            } else {
+                // Map child position to parent flat grid position.
+                // floor_div for correct negative handling.
+                let fdiv = |a: i32, b: i32| -> i32 {
+                    if a >= 0 { a / b } else { (a - b + 1) / b }
+                };
+                let px = child_offset[0] + fdiv(x, BRANCH_FACTOR as i32);
+                let py = child_offset[1] + fdiv(y, BRANCH_FACTOR as i32);
+                let pz = child_offset[2] + fdiv(z, BRANCH_FACTOR as i32);
+                if px < 0 || py < 0 || pz < 0
+                    || px >= parent_size || py >= parent_size || pz >= parent_size
+                { return None; }
+                let v = parent_grid[(pz as usize * ps + py as usize) * ps + px as usize];
+                if v == EMPTY_VOXEL { None } else { Some(v) }
+            }
+        };
+
+        let faces = crate::model::mesher::bake_faces_raw(child_size, &get);
+        all_faces.push(faces);
+    }
+
+    // Step 4: compose children's faces with position offsets.
+    let children_refs: Vec<Option<&StdHashMap<u8, FaceData>>> = all_faces.iter()
+        .map(|f| if f.is_empty() { None } else { Some(f) })
         .collect();
 
-    let child_mesh_size = BRANCH_FACTOR * NODE_VOXELS_PER_AXIS;
     compose_children_meshes(
-        &children_faces,
+        &children_refs,
         CHILDREN_PER_NODE,
         BRANCH_FACTOR,
-        child_mesh_size,
+        child_size as usize,
         meshes,
     )
 }
@@ -785,7 +837,7 @@ pub fn render_world(
                 // Composition: compose from pre-baked children.
                 let merged = compose_node(
                     &world, v.node_id,
-                    &mut render_state.pre_baked, &mut meshes,
+                    &mut render_state.child_grids, &mut meshes,
                 );
                 render_state.baked.insert(v.node_id, BakedNode {
                     child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
