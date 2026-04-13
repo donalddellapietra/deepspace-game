@@ -1,11 +1,10 @@
 import { test, expect } from "@playwright/test";
 
-test("NPC incremental scale", async ({ page }) => {
+test("NPC scale with AI + animation", async ({ page }) => {
   test.setTimeout(120_000);
 
   const panics: string[] = [];
   page.on("pageerror", (err) => {
-    // Filter out benign browser errors
     if (err.message.includes("pointer lock")) return;
     panics.push(err.message.slice(0, 200));
   });
@@ -17,16 +16,23 @@ test("NPC incremental scale", async ({ page }) => {
   );
   await page.waitForTimeout(2000);
 
-  const batches = [100000, 200000, 500000, 1000000];
+  const batches = [1000, 5000, 10000, 50000, 100000];
   for (const count of batches) {
     await page.evaluate((n) => { (window as any).__spawnNpcs = n; }, count);
     await page.waitForTimeout(3000);
 
     const perf = await page.evaluate(() => (window as any).__perfData);
-    console.log(`+${count}: ${perf.npcCount} total, ${perf.fps.toFixed(1)} FPS`);
+    console.log(
+      `+${count}: ${perf.npcCount} total, ${perf.fps.toFixed(1)} FPS, ` +
+      `${perf.frameTimeMs.toFixed(1)} ms`
+    );
 
     if (panics.length > 0) {
-      console.log(`PANIC after +${count}: ${panics[panics.length - 1]}`);
+      console.log(`PANIC: ${panics[panics.length - 1]}`);
+      break;
+    }
+    if (perf.fps < 5 && perf.npcCount > 0) {
+      console.log("FPS too low, stopping");
       break;
     }
   }

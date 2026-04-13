@@ -444,7 +444,11 @@ impl Plugin for NpcPlugin {
                     try_load_blueprint,
                     spawn_npc_on_keypress,
                     js_spawn_bridge,
+                    npc_buf_ai,
+                    npc_buf_animate,
+                    // npc_buf_physics disabled — tree collision too slow for scale.
                     npc_despawn_on_zoom,
+                    sync_gpu_uniforms,
                     collect_overlays_from_buffer
                         .after(npc_buf_animate)
                         .after(crate::player::derive_transforms),
