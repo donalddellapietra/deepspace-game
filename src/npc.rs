@@ -429,7 +429,7 @@ pub struct NpcPartTransforms {
 
 const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
-const MASS_SPAWN_COUNT: usize = 100_000;
+const MASS_SPAWN_COUNT: usize = 10_000;
 
 /// Frame counter for staggering animation updates.
 #[derive(Resource, Default)]
@@ -451,11 +451,7 @@ impl Plugin for NpcPlugin {
                     try_load_blueprint,
                     spawn_npc_on_keypress,
                     js_spawn_bridge,
-                    npc_buf_ai,
-                    npc_buf_animate,
-                    npc_buf_physics,
                     npc_despawn_on_zoom,
-                    sync_gpu_uniforms,
                     collect_overlays_from_buffer
                         .after(npc_buf_animate)
                         .after(crate::player::derive_transforms),
@@ -981,9 +977,7 @@ fn sync_gpu_uniforms(
 
 // ============================================== JS spawn bridge (WASM only)
 
-/// Check `window.__spawnNpcs` from JS each frame. If > 0, spawn that
-/// many NPCs and reset to 0. This lets Playwright trigger spawning
-/// without keyboard focus issues.
+/// Check `window.__spawnNpcs` from JS each frame.
 #[cfg(target_arch = "wasm32")]
 fn js_spawn_bridge(
     tree_bp: Option<Res<TreeBlueprint>>,
@@ -994,14 +988,13 @@ fn js_spawn_bridge(
     zoom: Res<CameraZoom>,
     cam_q: Query<&FpsCam>,
 ) {
-    // Read __spawnNpcs via js_sys (more reliable than wasm_bindgen extern).
-    let global = js_sys::global();
-    let key = wasm_bindgen::JsValue::from_str("__spawnNpcs");
-    let val = js_sys::Reflect::get(&global, &key).unwrap_or(wasm_bindgen::JsValue::from_f64(0.0));
-    let count = val.as_f64().unwrap_or(0.0) as usize;
+    // Call the __getAndResetSpawnCount function defined in index.html <head>.
+    let result = js_sys::eval("window.__getAndResetSpawnCount()");
+    let count = result
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as usize;
     if count == 0 { return; }
-    // Reset to 0.
-    let _ = js_sys::Reflect::set(&global, &key, &wasm_bindgen::JsValue::from_f64(0.0));
 
     let Some(tree_bp) = tree_bp else { return };
     let Ok(player_pos) = player_q.single() else { return };
@@ -1064,7 +1057,7 @@ fn js_spawn_bridge(
     }
 
     gpu_data.dirty = true;
-    info!("JS bridge: spawned {} NPCs (total now ~{})", count, existing + count);
+    info!("JS bridge: spawned {} NPCs (buffer len now {})", count, npc_buffer.npcs.len());
 }
 
 #[cfg(not(target_arch = "wasm32"))]

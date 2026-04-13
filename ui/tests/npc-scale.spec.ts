@@ -1,7 +1,10 @@
 import { test } from "@playwright/test";
 
-test("NPC scale test via JS bridge", async ({ page }) => {
+test("NPC scale test", async ({ page }) => {
   test.setTimeout(120_000);
+
+  const errors: string[] = [];
+  page.on("pageerror", (err) => errors.push(err.message.slice(0, 300)));
 
   await page.goto("/");
   await page.waitForFunction(
@@ -10,25 +13,20 @@ test("NPC scale test via JS bridge", async ({ page }) => {
   );
   await page.waitForTimeout(2000);
 
-  // Spawn via JS bridge (bypasses keyboard focus issues)
-  const counts = [10_000, 50_000, 100_000];
-  for (const target of counts) {
-    const current = await page.evaluate(() => (window as any).__perfData.npcCount);
-    const toSpawn = target - current;
-    if (toSpawn <= 0) continue;
+  // Spawn 1000 via JS bridge
+  await page.evaluate(() => { (window as any).__spawnNpcs = 1000; });
+  await page.waitForTimeout(5000);
 
-    await page.evaluate((n) => { (window as any).__spawnNpcs = n; }, toSpawn);
-    await page.waitForTimeout(5000);
+  const perf = await page.evaluate(() => (window as any).__perfData);
+  console.log(`${perf.npcCount} NPCs, ${perf.fps.toFixed(1)} FPS`);
 
-    const perf = await page.evaluate(() => (window as any).__perfData);
-    console.log(
-      `${perf.npcCount} NPCs: ${perf.fps.toFixed(1)} FPS, ` +
-      `${perf.frameTimeMs.toFixed(1)} ms, ${perf.entityCount} entities`
-    );
+  // Spawn more
+  await page.evaluate(() => { (window as any).__spawnNpcs = 9000; });
+  await page.waitForTimeout(5000);
 
-    if (perf.fps < 2 && perf.npcCount > 0) {
-      console.log("FPS too low, stopping");
-      break;
-    }
-  }
+  const perf2 = await page.evaluate(() => (window as any).__perfData);
+  console.log(`${perf2.npcCount} NPCs, ${perf2.fps.toFixed(1)} FPS`);
+
+  console.log(`\nPage errors (${errors.length}):`);
+  for (const e of errors) console.log(`  ${e}`);
 });

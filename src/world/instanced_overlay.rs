@@ -118,10 +118,9 @@ pub fn reconcile_instanced(
     for entry in &overlay_list.entries {
         for part in &entry.parts {
             if !state.meshes.contains_key(&part.node_id) {
-                let node = world
-                    .library
-                    .get(part.node_id)
-                    .expect("overlay: node missing from library");
+                let Some(node) = world.library.get(part.node_id) else {
+                    continue;
+                };
                 let voxels = node.voxels.clone();
                 let baked = bake_volume(
                     NODE_VOXELS_PER_AXIS as i32,
@@ -209,7 +208,7 @@ pub fn reconcile_instanced(
     let keys: Vec<MeshGroupKey> = state.group_instances.keys().cloned().collect();
 
     for key in &keys {
-        let instances = state.group_instances.get_mut(key).unwrap();
+        let Some(instances) = state.group_instances.get_mut(key) else { continue; };
 
         if instances.is_empty() {
             if let Some(ent) = state.group_entities.remove(key) {

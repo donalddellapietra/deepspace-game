@@ -84,6 +84,14 @@ pub fn prepare_npc_bind_group(
         return;
     }
 
+    // Don't create bind group until the compute pipeline has compiled.
+    if !matches!(
+        pipeline_cache.get_compute_pipeline_state(pipeline.pipeline_id),
+        bevy::render::render_resource::CachedPipelineState::Ok(_)
+    ) {
+        return;
+    }
+
     // Create/update the NPC state storage buffer.
     let npc_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("npc_state_buffer"),

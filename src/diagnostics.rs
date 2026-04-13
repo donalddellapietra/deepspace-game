@@ -181,17 +181,20 @@ fn log_diag(
 
 /// Expose perf data to JS so Playwright tests can read it.
 #[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
+    export function updatePerfData(fps, frameTimeMs, entityCount, npcCount) {
+        window.__perfData = { fps, frameTimeMs, entityCount, npcCount };
+    }
+")]
+extern "C" {
+    fn updatePerfData(fps: f64, frame_time_ms: f64, entity_count: f64, npc_count: f64);
+}
+
+#[cfg(target_arch = "wasm32")]
 fn expose_perf_to_js(
     diagnostics: Res<DiagnosticsStore>,
     npc_buffer: Res<NpcBuffer>,
 ) {
-    use wasm_bindgen::prelude::*;
-
-    #[wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(js_namespace = window, js_name = "__setPerfData")]
-        fn set_perf_data(fps: f64, frame_time_ms: f64, entity_count: f64, npc_count: f64);
-    }
 
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
@@ -207,7 +210,12 @@ fn expose_perf_to_js(
         .unwrap_or(0.0);
     let npc_count = npc_buffer.len() as f64;
 
-    set_perf_data(fps, frame_time_ms, entity_count, npc_count);
+    // Use js_sys::eval to update perfData without any extern issues.
+    let js = format!(
+        "window.__perfData = {{ fps: {}, frameTimeMs: {}, entityCount: {}, npcCount: {} }};",
+        fps, frame_time_ms, entity_count, npc_count
+    );
+    let _ = js_sys::eval(&js);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
