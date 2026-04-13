@@ -228,8 +228,12 @@ fn push_hotbar(
     }));
 }
 
-fn push_mode_indicator(zoom: Res<CameraZoom>, save_mode: Res<SaveMode>) {
-    if !zoom.is_changed() && !save_mode.is_changed() {
+fn push_mode_indicator(
+    zoom: Res<CameraZoom>,
+    save_mode: Res<SaveMode>,
+    entity_edit: Res<crate::interaction::EntityEditMode>,
+) {
+    if !zoom.is_changed() && !save_mode.is_changed() && !entity_edit.is_changed() {
         return;
     }
 
@@ -237,6 +241,7 @@ fn push_mode_indicator(zoom: Res<CameraZoom>, save_mode: Res<SaveMode>) {
         layer: zoom.layer,
         save_mode: save_mode.active,
         save_eligible: save_mode_eligible(zoom.layer),
+        entity_edit_mode: entity_edit.active,
     }));
 }
 

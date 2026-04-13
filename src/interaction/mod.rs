@@ -52,8 +52,12 @@ impl Plugin for InteractionPlugin {
                 Update,
                 (
                     toggle_entity_edit_mode,
-                    update_target.after(crate::player::sync_anchor_to_player),
-                    draw_highlight.after(crate::player::sync_anchor_to_player),
+                    update_target
+                        .after(crate::player::sync_anchor_to_player)
+                        .after(crate::npc::collect_overlays),
+                    draw_highlight
+                        .after(update_target)
+                        .after(crate::npc::collect_overlays),
                 ),
             );
     }
@@ -414,23 +418,10 @@ fn draw_highlight(
     save_mode: Res<SaveMode>,
     entity_edit: Res<EntityEditMode>,
     overlay_list: Res<OverlayList>,
-    cam_q: Query<&GlobalTransform, With<FpsCam>>,
 ) {
-    // Entity edit mode indicator: green wireframe around each NPC.
+    // Entity edit mode: highlight targeted NPC voxel.
     if entity_edit.active {
         let green = Color::srgb(0.2, 1.0, 0.3);
-        // Draw a small green diamond near the camera as mode indicator.
-        if let Ok(cam) = cam_q.single() {
-            let fwd = cam.forward().as_vec3();
-            let indicator = cam.translation() + fwd * 2.0 + Vec3::Y * -0.5;
-            gizmos.sphere(
-                Isometry3d::from_translation(indicator),
-                0.03,
-                green,
-            );
-        }
-
-        // Highlight targeted NPC voxel if any.
         if let Some(overlay_hit) = &targeted.hit_overlay {
             for entry in &overlay_list.entries {
                 if entry.id != overlay_hit.npc_entity { continue; }
