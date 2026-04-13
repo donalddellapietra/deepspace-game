@@ -91,8 +91,10 @@ fn build_instances(@builtin(global_invocation_id) gid: vec3<u32>) {
     let total = u.npc_count * u.num_parts;
     if (idx >= total) { return; }
 
-    let npc_idx = idx / u.num_parts;
-    let part_idx = idx % u.num_parts;
+    // Layout: grouped by part. Part 0's instances are [0..npc_count),
+    // part 1's are [npc_count..2*npc_count), etc.
+    let part_idx = idx / u.npc_count;
+    let npc_idx = idx % u.npc_count;
 
     let npc = npcs[npc_idx];
     if ((npc.flags & 1u) == 0u) { return; }
