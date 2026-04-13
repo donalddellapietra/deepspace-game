@@ -84,8 +84,17 @@ Use the atmosphere's raymarched mode instead of LUT mode, which might handle the
 **Pros:** Cleanest solution.
 **Cons:** Raymarched mode is more expensive; modifying the atmosphere compositor is deep engine work.
 
-### E: Fix scene_units_to_m Scaling
-The `scene_units_to_m = 1.0 / cell` scaling means at layer 9 the atmosphere thinks the entire scene is 19 meters across. This may be causing the black spots and waves — the atmosphere's scattering calculations break down at such tiny scales. Instead of shrinking the scale, keep `scene_units_to_m` constant or bounded, and adjust the atmosphere's radii instead.
+### E: Fix Aerial-View LUT Banding (CONFIRMED ROOT CAUSE of artifacts)
 
-**Pros:** Might fix the artifacts without any new geometry.
-**Cons:** May break the atmosphere's visual consistency across zoom layers.
+**Layer 6 screenshot proves this.** Concentric circles centered on camera = depth-slice banding in the aerial-view LUT.
+
+The math:
+- `aerial_view_lut_max_distance = RADIUS_VIEW_CELLS * 0.6 = 19.2 meters` (constant after simplification)
+- Default LUT has 32 depth slices → each slice = 0.6 meters
+- `scene_units_to_m = 1/cell`. At layer 6, cell = 15625
+- 0.6 meters = 0.6 * 15625 = 9375 Bevy units per depth slice
+- View radius = 500,000 Bevy units → ~32 visible bands (matches screenshot exactly)
+
+At layer 12: 0.6m = 0.6 Bevy units per slice → invisible. Only appears when zoomed out.
+
+**Fix:** Increase `aerial_view_lut_max_distance` proportionally so depth slices stay small in Bevy-space, AND/OR increase `aerial_view_lut_size.z` (depth resolution) at lower layers.
