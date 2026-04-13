@@ -117,7 +117,7 @@ pub fn render_world(
     let Some(palette) = palette else { return };
     let Ok(camera_tf) = camera_q.single() else { return };
     let camera_pos = camera_tf.translation;
-    let render_total_start = std::time::Instant::now();
+    let render_total_start = bevy::platform::time::Instant::now();
 
     // Load prebaked meshes on first frame.
     render_state.mesh_store.ensure_loaded();
@@ -148,7 +148,7 @@ pub fn render_world(
 
     // Walk the tree → collect visible nodes.
     timings.bake_us = 0;
-    let walk_start = std::time::Instant::now();
+    let walk_start = bevy::platform::time::Instant::now();
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
@@ -164,7 +164,7 @@ pub fn render_world(
     // step will use parent-fallback for them.
     const MAX_COLD_BAKES: usize = 16;
     {
-        let bake_start = std::time::Instant::now();
+        let bake_start = bevy::platform::time::Instant::now();
         let mut cold_bakes = 0usize;
         for v in visits.iter() {
             let node = world.library.get(v.node_id)
@@ -190,11 +190,8 @@ pub fn render_world(
             .count();
     }
 
-    // Reconcile: spawn/update/despawn entities. If a node's mesh isn't
-    // ready (pending async load), look up its parent in the tree and
-    // use the parent's mesh at the child's position/scale (parent-
-    // fallback). This guarantees no holes in the terrain.
-    let reconcile_start = std::time::Instant::now();
+    // Reconcile: spawn/update/despawn entities.
+    let reconcile_start = bevy::platform::time::Instant::now();
     let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
         HashMap::with_capacity(visits.len());
 
@@ -202,34 +199,9 @@ pub fn render_world(
         let new_node_id = visit.node_id;
         let existing = render_state.entities.remove(&visit.path);
 
-        // Determine which mesh to render: the node's own, or a
-        // parent fallback if the node's mesh is pending.
-        let render_node_id = if render_state.mesh_store.is_baked(new_node_id) {
-            new_node_id
-        } else {
-            // Walk up the tree path to find a baked ancestor.
-            let mut fallback = EMPTY_NODE;
-            let mut cur = world.root;
-            for d in 0..visit.path.depth {
-                if render_state.mesh_store.is_baked(cur) {
-                    fallback = cur;
-                }
-                if let Some(node) = world.library.get(cur) {
-                    if let Some(children) = node.children.as_ref() {
-                        cur = children[visit.path.slots[d as usize] as usize];
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if fallback != EMPTY_NODE { fallback } else { new_node_id }
-        };
-
         match existing {
             Some((entity, existing_id, last_origin))
-                if existing_id == render_node_id =>
+                if existing_id == new_node_id =>
             {
                 if last_origin != visit.origin {
                     if let Ok(mut ec) = commands.get_entity(entity) {
@@ -248,12 +220,12 @@ pub fn render_world(
                     }
                 }
 
-                let baked = render_state.mesh_store.get_merged(render_node_id)
+                let baked = render_state.mesh_store.get_merged(new_node_id)
                     .unwrap_or(&[]);
 
                 let parent = commands
                     .spawn((
-                        WorldRenderedNode(render_node_id),
+                        WorldRenderedNode(new_node_id),
                         Transform::from_translation(visit.origin)
                             .with_scale(Vec3::splat(visit.scale)),
                         Visibility::Visible,
@@ -274,7 +246,7 @@ pub fn render_world(
                     ));
                 }
 
-                alive.insert(visit.path, (parent, render_node_id, visit.origin));
+                alive.insert(visit.path, (parent, new_node_id, visit.origin));
             }
         }
     }

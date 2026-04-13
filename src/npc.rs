@@ -428,29 +428,32 @@ fn try_load_blueprint(
     }
     commands.insert_resource(BlueprintLoaded(true));
 
-    // Try loading from file
-    let blueprint_path = "assets/npcs/fox.blueprint.json";
-    if let Ok(bytes) = std::fs::read(blueprint_path) {
-        if let Some(palette) = palette.as_mut() {
-            match blueprint_json::load_blueprint("fox", &bytes, palette, &mut mat_assets) {
-                Ok(bp) => {
-                    info!(
-                        "Loaded NPC blueprint '{}': {} parts, {} animations",
-                        bp.name,
-                        bp.parts.len(),
-                        bp.animations.len()
-                    );
-                    let tree_bp = blueprint_to_tree(&bp, &mut world);
-                    info!(
-                        "Built tree blueprint '{}': {} tree parts",
-                        tree_bp.name,
-                        tree_bp.parts.len()
-                    );
-                    commands.insert_resource(tree_bp);
-                    return;
-                }
-                Err(e) => {
-                    warn!("Failed to load NPC blueprint: {e}");
+    // Try loading from file (filesystem not available on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let blueprint_path = "assets/npcs/fox.blueprint.json";
+        if let Ok(bytes) = std::fs::read(blueprint_path) {
+            if let Some(palette) = palette.as_mut() {
+                match blueprint_json::load_blueprint("fox", &bytes, palette, &mut mat_assets) {
+                    Ok(bp) => {
+                        info!(
+                            "Loaded NPC blueprint '{}': {} parts, {} animations",
+                            bp.name,
+                            bp.parts.len(),
+                            bp.animations.len()
+                        );
+                        let tree_bp = blueprint_to_tree(&bp, &mut world);
+                        info!(
+                            "Built tree blueprint '{}': {} tree parts",
+                            tree_bp.name,
+                            tree_bp.parts.len()
+                        );
+                        commands.insert_resource(tree_bp);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("Failed to load NPC blueprint: {e}");
+                    }
                 }
             }
         }

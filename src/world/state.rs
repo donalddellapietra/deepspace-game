@@ -122,27 +122,37 @@ const WORLD_BIN_PATH: &str = "assets/world.bin";
 
 impl Default for WorldState {
     fn default() -> Self {
-        // Try to load a pre-generated canned world from disk.
-        if let Ok((root, library, next_id)) =
-            super::serial::read_world_file(std::path::Path::new(WORLD_BIN_PATH))
+        // Native: try to load a pre-generated canned world from disk.
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            let hash = super::serial::canned_world_hash(root, next_id, library.len());
-            eprintln!(
-                "loaded canned world: {} library entries, {:.1} KB",
-                library.len(),
-                std::fs::metadata(WORLD_BIN_PATH)
-                    .map(|m| m.len() as f64 / 1024.0)
-                    .unwrap_or(0.0),
-            );
-            return Self {
-                root,
-                library,
-                canned_node_count: next_id,
-                canned_world_hash: hash,
-            };
+            if let Ok((root, library, next_id)) =
+                super::serial::read_world_file(std::path::Path::new(WORLD_BIN_PATH))
+            {
+                let hash = super::serial::canned_world_hash(root, next_id, library.len());
+                eprintln!(
+                    "loaded canned world: {} library entries, {:.1} KB",
+                    library.len(),
+                    std::fs::metadata(WORLD_BIN_PATH)
+                        .map(|m| m.len() as f64 / 1024.0)
+                        .unwrap_or(0.0),
+                );
+                return Self {
+                    root,
+                    library,
+                    canned_node_count: next_id,
+                    canned_world_hash: hash,
+                };
+            }
+            // Fall back to in-process generation.
+            return Self::new_sphere();
         }
-        // Fall back to in-process generation.
-        Self::new_sphere()
+
+        // WASM: use grassland for now. Canned world loading via HTTP
+        // will be implemented as async Bevy asset loading.
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self::new_grassland()
+        }
     }
 }
 
@@ -191,7 +201,7 @@ impl WorldState {
         }
 
         let extent = world_extent_voxels();
-        let gen_start = std::time::Instant::now();
+        let gen_start = bevy::platform::time::Instant::now();
         let root_id = self.build_sphere_node(
             [0, 0, 0], extent, 0, params, &air_tower, &solid_tower,
         );

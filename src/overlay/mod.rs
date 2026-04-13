@@ -410,39 +410,53 @@ fn poll_ui_commands(
                 lock_lost.0 = true;
             }
             UiCommand::SaveGame => {
-                let path = std::path::Path::new("saves/save.bin");
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let path = std::path::Path::new("saves/save.bin");
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match world.save_to_file(path) {
+                        Ok(()) => {
+                            let size = std::fs::metadata(path)
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            let msg = format!("Saved ({:.1} KB)", size as f64 / 1024.0);
+                            info!("{msg}");
+                            pause_menu.save_status = Some(msg);
+                        }
+                        Err(e) => {
+                            let msg = format!("Save failed: {e}");
+                            error!("{msg}");
+                            pause_menu.save_status = Some(msg);
+                        }
+                    }
                 }
-                match world.save_to_file(path) {
-                    Ok(()) => {
-                        let size = std::fs::metadata(path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        let msg = format!("Saved ({:.1} KB)", size as f64 / 1024.0);
-                        info!("{msg}");
-                        pause_menu.save_status = Some(msg);
-                    }
-                    Err(e) => {
-                        let msg = format!("Save failed: {e}");
-                        error!("{msg}");
-                        pause_menu.save_status = Some(msg);
-                    }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    warn!("Save not supported on WASM");
                 }
             }
             UiCommand::LoadGame => {
-                let path = std::path::Path::new("saves/save.bin");
-                match world.load_save_file(path) {
-                    Ok(()) => {
-                        let msg = "Loaded".to_string();
-                        info!("{msg}");
-                        pause_menu.save_status = Some(msg);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let path = std::path::Path::new("saves/save.bin");
+                    match world.load_save_file(path) {
+                        Ok(()) => {
+                            let msg = "Loaded".to_string();
+                            info!("{msg}");
+                            pause_menu.save_status = Some(msg);
+                        }
+                        Err(e) => {
+                            let msg = format!("Load failed: {e}");
+                            error!("{msg}");
+                            pause_menu.save_status = Some(msg);
+                        }
                     }
-                    Err(e) => {
-                        let msg = format!("Load failed: {e}");
-                        error!("{msg}");
-                        pause_menu.save_status = Some(msg);
-                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    warn!("Load not supported on WASM");
                 }
             }
             UiCommand::ClosePauseMenu => {

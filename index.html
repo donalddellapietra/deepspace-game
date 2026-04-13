@@ -24,11 +24,19 @@
     <!-- React UI overlay assets (copied to dist/) -->
     <link data-trunk rel="copy-file" href="ui/dist/ui.css" />
     <link data-trunk rel="copy-file" href="ui/dist/ui.js" />
+    <!-- Bevy assets (shaders, NPC blueprints, etc.) -->
+    <link data-trunk rel="copy-dir" href="assets" />
     <link rel="stylesheet" href="ui.css" />
+    <script>
+        window.__perfData = { fps: 0, frameTimeMs: 0, entityCount: 0, unbaked: 0, coldBakes: 0 };
+        window.__setPerfData = function(fps, frameTimeMs, entityCount, unbaked, coldBakes) {
+            window.__perfData = { fps, frameTimeMs, entityCount, unbaked, coldBakes };
+        };
+    </script>
 </head>
 <body>
     <!-- Bevy WASM game -->
-    <link data-trunk rel="rust" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int" />
+    <link data-trunk rel="rust" data-bin="deepspace-game" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int" />
 
     <!-- React UI mounts here, on top of the canvas -->
     <div id="root"></div>
