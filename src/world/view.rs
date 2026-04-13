@@ -297,7 +297,14 @@ pub fn position_from_bevy(bevy: Vec3, anchor: &WorldAnchor) -> Option<Position> 
         anchor.leaf_coord[2] + int_delta[2],
     ];
     let mut pos = position_from_leaf_coord(coord)?;
-    pos.offset = [bevy.x - fx, bevy.y - fy, bevy.z - fz];
+    // Clamp offsets to [0, 1) to handle f32 precision at boundaries.
+    // Without this, bevy.z - fz can produce exactly 1.0 when many
+    // f32 additions accumulate rounding errors (e.g. NPC physics).
+    pos.offset = [
+        (bevy.x - fx).clamp(0.0, 1.0 - f32::EPSILON),
+        (bevy.y - fy).clamp(0.0, 1.0 - f32::EPSILON),
+        (bevy.z - fz).clamp(0.0, 1.0 - f32::EPSILON),
+    ];
     pos.debug_check_offset();
     Some(pos)
 }

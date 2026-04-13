@@ -62,6 +62,11 @@ impl GroundCache {
             self.cached_collision_layer = collision_layer;
         }
 
+        // Guard against non-finite inputs.
+        if !bevy_x.is_finite() || !bevy_z.is_finite() {
+            return f32::NAN;
+        }
+
         // Convert bevy-space XZ to absolute leaf coordinates for the key.
         let leaf_x = anchor.leaf_coord[0] + bevy_x.floor() as i64;
         let leaf_z = anchor.leaf_coord[2] + bevy_z.floor() as i64;

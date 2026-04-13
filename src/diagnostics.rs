@@ -211,6 +211,9 @@ fn expose_perf_to_js(
     let npc_count = npc_buffer.len() as f64;
 
     // Use js_sys::eval to update perfData without any extern issues.
+    // Guard against NaN/Inf which would produce invalid JS.
+    let fps = if fps.is_finite() { fps } else { 0.0 };
+    let frame_time_ms = if frame_time_ms.is_finite() { frame_time_ms } else { 0.0 };
     let js = format!(
         "window.__perfData = {{ fps: {}, frameTimeMs: {}, entityCount: {}, npcCount: {} }};",
         fps, frame_time_ms, entity_count, npc_count

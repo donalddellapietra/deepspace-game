@@ -370,7 +370,9 @@ impl SpecializedMeshPipeline for NpcPipeline {
             ],
         });
 
-        descriptor.fragment.as_mut().unwrap().shader = self.shader.clone();
+        if let Some(frag) = descriptor.fragment.as_mut() {
+            frag.shader = self.shader.clone();
+        }
         Ok(descriptor)
     }
 }
@@ -412,9 +414,11 @@ fn queue_npc_instances(
             };
             let key = view_key
                 | MeshPipelineKey::from_primitive_topology(mesh.primitive_topology());
-            let pipeline = pipelines
+            let Ok(pipeline) = pipelines
                 .specialize(&pipeline_cache, &custom_pipeline, key, &mesh.layout)
-                .unwrap();
+            else {
+                continue;
+            };
             transparent_phase.add(Transparent3d {
                 entity: (entity, *main_entity),
                 pipeline,

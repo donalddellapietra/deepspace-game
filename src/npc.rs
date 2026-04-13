@@ -1008,8 +1008,9 @@ fn npc_buf_animate(
 
         let bp = &blueprints.blueprints[npc.blueprint_idx as usize % blueprints.blueprints.len()];
         let Some(anim) = bp.animations.get("walk") else { continue };
-        if anim.keyframes.is_empty() { continue; }
+        if anim.keyframes.is_empty() || anim.frame_duration <= 0.0 { continue; }
         let total_duration = anim.keyframes.len() as f32 * anim.frame_duration;
+        if total_duration <= 0.0 { continue; }
 
         let t = if anim.looping {
             npc.anim_time % total_duration
