@@ -105,12 +105,102 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
 /// Raw face data for one voxel type, before conversion to a Mesh.
 /// Stored per-child so edits only re-bake the affected child.
 #[derive(Clone, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FaceData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
+}
+
+// ------------------------------------------------ compact serialization
+//
+// On disk, each vertex is 5 bytes (3×u8 position + 1 byte normal +
+// 1 byte AO level) instead of 44 bytes (3×f32 pos + 3×f32 normal +
+// 4×f32 color). Indices are u16 instead of u32.
+
+const NORMAL_DIRS: [[f32; 3]; 6] = [
+    [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0], [0.0, -1.0, 0.0],
+    [0.0, 0.0, 1.0], [0.0, 0.0, -1.0],
+];
+
+fn encode_normal(n: &[f32; 3]) -> u8 {
+    for (i, dir) in NORMAL_DIRS.iter().enumerate() {
+        if n == dir { return i as u8; }
+    }
+    0
+}
+
+fn ao_level_from_brightness(b: f32) -> u8 {
+    // AO_CURVE = [0.6, 0.75, 0.9, 1.0]
+    if b < 0.67 { 0 }
+    else if b < 0.82 { 1 }
+    else if b < 0.95 { 2 }
+    else { 3 }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompactFaceData {
+    /// 3 bytes per vertex: [x, y, z] as u8.
+    positions: Vec<u8>,
+    /// 1 byte per vertex: normal direction index (0..6).
+    normals: Vec<u8>,
+    /// 1 byte per vertex: AO level (0..4).
+    ao_levels: Vec<u8>,
+    /// u16 triangle indices.
+    indices: Vec<u16>,
+}
+
+impl From<&FaceData> for CompactFaceData {
+    fn from(f: &FaceData) -> Self {
+        let n = f.positions.len();
+        let mut positions = Vec::with_capacity(n * 3);
+        let mut normals = Vec::with_capacity(n);
+        let mut ao_levels = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = &f.positions[i];
+            positions.push(p[0] as u8);
+            positions.push(p[1] as u8);
+            positions.push(p[2] as u8);
+            normals.push(encode_normal(&f.normals[i]));
+            ao_levels.push(ao_level_from_brightness(f.colors[i][0]));
+        }
+        let indices: Vec<u16> = f.indices.iter().map(|&i| i as u16).collect();
+        CompactFaceData { positions, normals, ao_levels, indices }
+    }
+}
+
+impl From<CompactFaceData> for FaceData {
+    fn from(c: CompactFaceData) -> Self {
+        let n = c.normals.len();
+        let mut positions = Vec::with_capacity(n);
+        let mut normals = Vec::with_capacity(n);
+        let mut colors = Vec::with_capacity(n);
+        for i in 0..n {
+            positions.push([
+                c.positions[i * 3] as f32,
+                c.positions[i * 3 + 1] as f32,
+                c.positions[i * 3 + 2] as f32,
+            ]);
+            normals.push(NORMAL_DIRS[c.normals[i] as usize]);
+            let brightness = AO_CURVE[c.ao_levels[i] as usize];
+            colors.push([brightness, brightness, brightness, 1.0]);
+        }
+        let indices: Vec<u32> = c.indices.iter().map(|&i| i as u32).collect();
+        FaceData { positions, normals, colors, indices }
+    }
+}
+
+impl serde::Serialize for FaceData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        CompactFaceData::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FaceData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        CompactFaceData::deserialize(deserializer).map(FaceData::from)
+    }
 }
 
 impl FaceData {
