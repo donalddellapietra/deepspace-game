@@ -17,7 +17,9 @@
 pub mod collision;
 pub mod edit;
 pub mod generator;
+pub mod heightmap;
 pub mod instanced_overlay;
+pub mod npc_compute;
 pub mod overlay;
 pub mod position;
 pub mod render;
