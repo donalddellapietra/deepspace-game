@@ -108,10 +108,9 @@ fn spawn_camera(
         Transform::default(),
         Tonemapping::AcesFitted,
         ShadowFilteringMethod::Gaussian,
-        ScreenSpaceAmbientOcclusion {
-            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
-            constant_object_thickness: 4.0,
-        },
+        // SSAO disabled — creates color mismatch between terrain (darkened)
+        // and annulus (bright), making the terrain edge visible as a
+        // second horizon. Will re-enable with edge masking later.
         // Bloom only on bright highlights (threshold 0.8) — sky, sun
         // reflections, emissive blocks. Energy-conserving mode adds
         // glow without washing out. Reduced max_mip_dimension cuts

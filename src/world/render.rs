@@ -980,7 +980,7 @@ pub fn render_world(
         // Inner radius at 85% of render distance — the annulus only
         // fills the outer 15% and beyond. Digging near the player
         // (inside the inner edge) won't reveal the annulus.
-        let inner_radius = radius_bevy * 0.85;
+        let inner_radius = radius_bevy * 0.5;
 
         let needs_rebuild = render_state.imposter_mesh.is_none();
         let annulus = if needs_rebuild {
