@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use crate::camera::{CursorLocked, ZoomTransition};
 use crate::interaction::{EntityEditMode, TargetedBlock};
 use crate::inventory::InventoryState;
-use crate::npc::{edit_npc_voxel, Npc, NpcPartOverrides, TreeBlueprint};
+use crate::npc::{edit_npc_voxel, Npc, NpcBuffer, NpcHandle, NpcPartOverrides, TreeBlueprint, TreeBlueprints};
 use crate::player::{spawn_position, Player, Velocity};
 use crate::world::collision;
 use crate::world::edit::{
@@ -154,8 +154,10 @@ pub fn remove_block(
     entity_edit: Res<EntityEditMode>,
     targeted: Res<TargetedBlock>,
     tree_bp: Option<Res<TreeBlueprint>>,
+    blueprints: Option<Res<TreeBlueprints>>,
+    npc_buffer: Res<NpcBuffer>,
     mut world: ResMut<WorldState>,
-    mut npc_q: Query<&mut NpcPartOverrides, With<Npc>>,
+    mut npc_q: Query<(&NpcHandle, &mut NpcPartOverrides), With<Npc>>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() || save_mode.active {
         return;
@@ -167,14 +169,21 @@ pub fn remove_block(
     if entity_edit.active {
         // Entity edit mode: only NPC voxels can be edited.
         if let Some(overlay_hit) = &targeted.hit_overlay {
-            let Some(tree_bp) = tree_bp else { return };
-            let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
+            let Ok((handle, mut overrides)) = npc_q.get_mut(overlay_hit.npc_entity) else {
                 return;
             };
+            // Look up the correct blueprint for this NPC's type.
+            let bp = blueprints.as_ref()
+                .and_then(|bps| {
+                    let npc = npc_buffer.npcs.get(handle.0)?;
+                    bps.blueprints.get(npc.blueprint_idx as usize % bps.blueprints.len())
+                })
+                .or(tree_bp.as_deref());
+            let Some(bp) = bp else { return };
             edit_npc_voxel(
                 &mut world,
                 &mut overrides,
-                &tree_bp,
+                bp,
                 overlay_hit.part_index,
                 overlay_hit.local_voxel,
                 EMPTY_VOXEL,
@@ -204,10 +213,12 @@ pub fn place_block(
     hotbar: Res<super::Hotbar>,
     saved: Res<SavedMeshes>,
     tree_bp: Option<Res<TreeBlueprint>>,
+    blueprints: Option<Res<TreeBlueprints>>,
+    npc_buffer: Res<NpcBuffer>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
     mut world: ResMut<WorldState>,
-    mut npc_q: Query<&mut NpcPartOverrides, With<Npc>>,
+    mut npc_q: Query<(&NpcHandle, &mut NpcPartOverrides), With<Npc>>,
 ) {
     if inv.open || !locked.0 || locked.is_changed() || save_mode.active {
         return;
@@ -216,19 +227,23 @@ pub fn place_block(
         return;
     }
 
-    // NPC hit: place the active block voxel onto the NPC part.
     if entity_edit.active {
-        // Entity edit mode: only NPC voxels can be edited.
         if let Some(overlay_hit) = &targeted.hit_overlay {
             if let HotbarItem::Block(voxel) = hotbar.active_item(zoom.layer) {
-                let Some(tree_bp) = tree_bp else { return };
-                let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
+                let Ok((handle, mut overrides)) = npc_q.get_mut(overlay_hit.npc_entity) else {
                     return;
                 };
+                let bp = blueprints.as_ref()
+                    .and_then(|bps| {
+                        let npc = npc_buffer.npcs.get(handle.0)?;
+                        bps.blueprints.get(npc.blueprint_idx as usize % bps.blueprints.len())
+                    })
+                    .or(tree_bp.as_deref());
+                let Some(bp) = bp else { return };
                 edit_npc_voxel(
                     &mut world,
                     &mut overrides,
-                    &tree_bp,
+                    bp,
                     overlay_hit.part_index,
                     overlay_hit.local_voxel,
                     *voxel,

@@ -456,6 +456,7 @@ impl Plugin for NpcPlugin {
                     npc_buf_ai,
                     npc_buf_animate,
                     npc_buf_physics,
+                    manage_npc_handles,
                     npc_despawn_on_zoom,
                     sync_gpu_uniforms,
                     collect_overlays_from_buffer
@@ -1146,8 +1147,6 @@ pub fn collect_overlays_from_buffer(
         }
     }
 
-    let dummy_entity = Entity::PLACEHOLDER;
-
     for (idx, npc) in npc_buffer.npcs.iter().enumerate() {
         if !npc.alive { continue; }
 
@@ -1183,8 +1182,11 @@ pub fn collect_overlays_from_buffer(
             });
         }
 
+        // Use the handle entity if available (for editing), otherwise placeholder.
+        let overlay_entity = npc.handle_entity.unwrap_or(Entity::PLACEHOLDER);
+
         overlay_list.entries.push(OverlayInstance {
-            id: dummy_entity,
+            id: overlay_entity,
             parts,
             bevy_pos,
             rotation: npc.rotation,
@@ -1204,6 +1206,57 @@ fn sync_gpu_uniforms(
     gpu_data.uniforms.delta_time = time.delta_secs();
     gpu_data.uniforms.frame = gpu_data.uniforms.frame.wrapping_add(1);
     gpu_data.uniforms.npc_count = npc_buffer.npcs.len() as u32;
+}
+
+// ============================================== NPC handle entities for editing
+
+/// Maximum distance from player for NPC editing (bevy units).
+const EDIT_RANGE: f32 = 20.0;
+
+/// System that creates/destroys lightweight ECS handle entities
+/// for NPCs near the player, enabling per-NPC voxel editing.
+fn manage_npc_handles(
+    mut commands: Commands,
+    mut npc_buffer: ResMut<NpcBuffer>,
+    anchor: Res<WorldAnchor>,
+    player_q: Query<&Transform, With<Player>>,
+    existing_handles: Query<(Entity, &NpcHandle)>,
+) {
+    let Ok(player_tf) = player_q.single() else { return };
+    let player_pos = player_tf.translation;
+
+    // Despawn handles for NPCs that moved out of range or died.
+    for (entity, handle) in &existing_handles {
+        let idx = handle.0;
+        let in_range = npc_buffer.npcs.get(idx).is_some_and(|npc| {
+            if !npc.alive { return false; }
+            let bp = bevy_from_position(&npc.position, &anchor);
+            bp.distance_squared(player_pos) <= EDIT_RANGE * EDIT_RANGE * 4.0
+        });
+        if !in_range {
+            commands.entity(entity).despawn();
+            if let Some(npc) = npc_buffer.npcs.get_mut(idx) {
+                npc.handle_entity = None;
+            }
+        }
+    }
+
+    // Create handles for nearby NPCs that don't have one.
+    for (idx, npc) in npc_buffer.npcs.iter_mut().enumerate() {
+        if !npc.alive || npc.handle_entity.is_some() { continue; }
+
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        if bevy_pos.distance_squared(player_pos) > EDIT_RANGE * EDIT_RANGE {
+            continue;
+        }
+
+        let entity = commands.spawn((
+            Npc,
+            NpcHandle(idx),
+            NpcPartOverrides::default(),
+        )).id();
+        npc.handle_entity = Some(entity);
+    }
 }
 
 // ============================================== JS spawn bridge (WASM only)
