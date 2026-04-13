@@ -834,6 +834,7 @@ pub fn collect_overlays(
     tree_bp: Option<Res<TreeBlueprint>>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
+    camera_q: Query<(&Transform, &FpsCam), With<Camera3d>>,
     npc_q: Query<
         (Entity, &WorldPosition, &Transform, &NpcPartTransforms, Option<&NpcPartOverrides>),
         With<Npc>,
@@ -850,12 +851,34 @@ pub fn collect_overlays(
         return;
     }
 
+    // Frustum culling: get camera position and forward direction.
+    let (cam_pos, cam_forward) = if let Ok((cam_tf, cam)) = camera_q.single() {
+        let fwd = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+        (cam_tf.translation, fwd)
+    } else {
+        (Vec3::ZERO, Vec3::NEG_Z)
+    };
+    let cell = cell_size_at_layer(zoom.layer);
+    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    let view_radius_sq = view_radius * view_radius;
+
     // Leaf-layer scale: NPC is ~1.5 leaf voxels tall. This never
     // changes with zoom — the NPC has a fixed real-world size.
     let scale = tree_npc_scale(crate::world::tree::MAX_LAYER, &tree_bp);
 
     for (entity, world_pos, tf, part_tf, overrides) in &npc_q {
         let bevy_pos = bevy_from_position(&world_pos.0, &anchor);
+
+        // Frustum cull: skip NPCs outside the view radius.
+        let to_npc = bevy_pos - cam_pos;
+        if to_npc.length_squared() > view_radius_sq {
+            continue;
+        }
+        // Hemisphere cull: skip NPCs behind the camera (with margin).
+        let forward_dot = to_npc.x * cam_forward.x + to_npc.z * cam_forward.z;
+        if forward_dot < -view_radius * 0.3 {
+            continue;
+        }
 
         let parts: Vec<OverlayPart> = tree_bp
             .parts
