@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 dev = ["bevy/dynamic_linking"]
 debug_import = []
+debug_textures = []
 
 [dependencies]
 bevy = { version = "0.18", features = ["experimental_bevy_ui_widgets"] }
