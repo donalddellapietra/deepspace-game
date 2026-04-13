@@ -453,6 +453,259 @@ pub fn flatten_children(
 /// Merge 125 children's `ChildFaces` into final `BakedSubMesh`es.
 /// Each child's face data is concatenated (with index offsets) into
 /// one mesh per voxel type.
+// ------------------------------------------------- sphere clipping
+
+/// Clip a Bevy Mesh to a sphere, producing a new Mesh. Triangles fully
+/// inside the sphere are kept. Triangles fully outside are discarded.
+/// Triangles that straddle the boundary are clipped: vertices outside
+/// the sphere are moved to the sphere surface along their edge,
+/// and the triangle is split as needed to follow the sphere contour.
+///
+/// `center` and `radius` are in the mesh's local coordinate space.
+pub fn clip_mesh_to_sphere(
+    mesh: &Mesh,
+    center: Vec3,
+    radius: f32,
+    meshes: &mut Assets<Mesh>,
+) -> Option<Handle<Mesh>> {
+    let Some(pos_attr) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else {
+        return None;
+    };
+    let Some(positions) = pos_attr.as_float3() else {
+        return None;
+    };
+    let Some(norm_attr) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) else {
+        return None;
+    };
+    let Some(normals) = norm_attr.as_float3() else {
+        return None;
+    };
+    // Extract Float32x4 color data via raw bytes.
+    let colors: Vec<[f32; 4]> = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+        Some(attr) => {
+            let raw = attr.get_bytes();
+            let count = positions.len();
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let off = i * 16;
+                if off + 16 > raw.len() { break; }
+                out.push([
+                    f32::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3]]),
+                    f32::from_le_bytes([raw[off+4], raw[off+5], raw[off+6], raw[off+7]]),
+                    f32::from_le_bytes([raw[off+8], raw[off+9], raw[off+10], raw[off+11]]),
+                    f32::from_le_bytes([raw[off+12], raw[off+13], raw[off+14], raw[off+15]]),
+                ]);
+            }
+            out
+        }
+        None => vec![[1.0, 1.0, 1.0, 1.0]; positions.len()],
+    };
+    let indices = match mesh.indices() {
+        Some(Indices::U32(v)) => v,
+        _ => return None,
+    };
+
+    let r_sq = radius * radius;
+    let mut out = FaceData::default();
+
+    // Process each triangle.
+    let mut i = 0;
+    while i + 2 < indices.len() {
+        let i0 = indices[i] as usize;
+        let i1 = indices[i + 1] as usize;
+        let i2 = indices[i + 2] as usize;
+        i += 3;
+
+        let p0 = Vec3::from(positions[i0]);
+        let p1 = Vec3::from(positions[i1]);
+        let p2 = Vec3::from(positions[i2]);
+
+        // Use XZ distance only (cylindrical clip) so the sphere
+        // doesn't exclude ground terrain when camera is elevated.
+        let xz0 = Vec2::new(p0.x - center.x, p0.z - center.z);
+        let xz1 = Vec2::new(p1.x - center.x, p1.z - center.z);
+        let xz2 = Vec2::new(p2.x - center.x, p2.z - center.z);
+        let d0 = xz0.length_squared();
+        let d1 = xz1.length_squared();
+        let d2 = xz2.length_squared();
+
+        let in0 = d0 <= r_sq;
+        let in1 = d1 <= r_sq;
+        let in2 = d2 <= r_sq;
+
+        let inside_count = in0 as u8 + in1 as u8 + in2 as u8;
+
+        if inside_count == 3 {
+            // Fully inside — keep as-is.
+            let base = out.positions.len() as u32;
+            out.positions.push(positions[i0]);
+            out.positions.push(positions[i1]);
+            out.positions.push(positions[i2]);
+            out.normals.push(normals[i0]);
+            out.normals.push(normals[i1]);
+            out.normals.push(normals[i2]);
+            out.colors.push(colors[i0]);
+            out.colors.push(colors[i1]);
+            out.colors.push(colors[i2]);
+            out.indices.extend_from_slice(&[base, base + 1, base + 2]);
+        } else if inside_count == 0 {
+            // Fully outside — discard.
+        } else {
+            // Straddle — clip to sphere.
+            // Reorder so inside vertices come first.
+            let (verts, norms, cols, n_inside) = reorder_by_inside(
+                [i0, i1, i2], [in0, in1, in2],
+                positions, normals, &colors,
+            );
+            clip_straddling_triangle(
+                &verts, &norms, &cols, n_inside,
+                center, radius, r_sq, &mut out,
+            );
+        }
+    }
+
+    if out.is_empty() {
+        return None;
+    }
+    Some(meshes.add(out.build()))
+}
+
+/// Reorder triangle vertices so inside vertices come first.
+fn reorder_by_inside(
+    idx: [usize; 3],
+    inside: [bool; 3],
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    colors: &[[f32; 4]],
+) -> ([Vec3; 3], [[f32; 3]; 3], [[f32; 4]; 3], u8) {
+    let mut order = [0usize, 1, 2];
+    // Sort: inside vertices first.
+    order.sort_by_key(|&i| !inside[i] as u8);
+    let n_inside = inside.iter().filter(|&&b| b).count() as u8;
+    let verts = [
+        Vec3::from(positions[idx[order[0]]]),
+        Vec3::from(positions[idx[order[1]]]),
+        Vec3::from(positions[idx[order[2]]]),
+    ];
+    let norms = [
+        normals[idx[order[0]]],
+        normals[idx[order[1]]],
+        normals[idx[order[2]]],
+    ];
+    let cols = [
+        colors[idx[order[0]]],
+        colors[idx[order[1]]],
+        colors[idx[order[2]]],
+    ];
+    (verts, norms, cols, n_inside)
+}
+
+/// Find the parameter t where a line segment from `a` (inside) to `b`
+/// (outside) intersects a sphere centered at `center` with `radius`.
+/// Find t where edge from a (inside) to b (outside) crosses the
+/// clip cylinder (XZ distance only).
+fn edge_sphere_t(a: Vec3, b: Vec3, center: Vec3, r_sq: f32) -> f32 {
+    // Project to XZ plane for cylindrical clip.
+    let d = Vec2::new(b.x - a.x, b.z - a.z);
+    let f = Vec2::new(a.x - center.x, a.z - center.z);
+    let a_coeff = d.dot(d);
+    let b_coeff = 2.0 * f.dot(d);
+    let c_coeff = f.dot(f) - r_sq;
+    let discriminant = b_coeff * b_coeff - 4.0 * a_coeff * c_coeff;
+    if discriminant < 0.0 {
+        return 0.5; // Fallback — shouldn't happen for straddling edges.
+    }
+    let sqrt_disc = discriminant.sqrt();
+    // We want the intersection between a (inside) and b (outside),
+    // so t should be in (0, 1). Take the smaller positive root.
+    let t1 = (-b_coeff - sqrt_disc) / (2.0 * a_coeff);
+    let t2 = (-b_coeff + sqrt_disc) / (2.0 * a_coeff);
+    if t1 > 0.0 && t1 < 1.0 { t1 } else { t2.clamp(0.0, 1.0) }
+}
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
+fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
+/// Clip a straddling triangle. `verts[0..n_inside]` are inside the
+/// sphere, the rest are outside.
+fn clip_straddling_triangle(
+    verts: &[Vec3; 3],
+    norms: &[[f32; 3]; 3],
+    cols: &[[f32; 4]; 3],
+    n_inside: u8,
+    center: Vec3,
+    _radius: f32,
+    r_sq: f32,
+    out: &mut FaceData,
+) {
+    if n_inside == 2 {
+        // A, B inside; C outside.
+        // Clip edges AC and BC to sphere → P and Q.
+        let t_ac = edge_sphere_t(verts[0], verts[2], center, r_sq);
+        let t_bc = edge_sphere_t(verts[1], verts[2], center, r_sq);
+        let p_pos = verts[0].lerp(verts[2], t_ac).to_array();
+        let q_pos = verts[1].lerp(verts[2], t_bc).to_array();
+        let p_norm = lerp3(norms[0], norms[2], t_ac);
+        let q_norm = lerp3(norms[1], norms[2], t_bc);
+        let p_col = lerp4(cols[0], cols[2], t_ac);
+        let q_col = lerp4(cols[1], cols[2], t_bc);
+
+        // Emit quad ABQP as two triangles: ABQ + AQP.
+        let base = out.positions.len() as u32;
+        out.positions.push(verts[0].to_array()); // A
+        out.positions.push(verts[1].to_array()); // B
+        out.positions.push(q_pos);               // Q
+        out.positions.push(p_pos);               // P
+        out.normals.push(norms[0]);
+        out.normals.push(norms[1]);
+        out.normals.push(q_norm);
+        out.normals.push(p_norm);
+        out.colors.push(cols[0]);
+        out.colors.push(cols[1]);
+        out.colors.push(q_col);
+        out.colors.push(p_col);
+        out.indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+    } else if n_inside == 1 {
+        // A inside; B, C outside.
+        // Clip edges AB and AC to sphere → P and Q.
+        let t_ab = edge_sphere_t(verts[0], verts[1], center, r_sq);
+        let t_ac = edge_sphere_t(verts[0], verts[2], center, r_sq);
+        let p_pos = verts[0].lerp(verts[1], t_ab).to_array();
+        let q_pos = verts[0].lerp(verts[2], t_ac).to_array();
+        let p_norm = lerp3(norms[0], norms[1], t_ab);
+        let q_norm = lerp3(norms[0], norms[2], t_ac);
+        let p_col = lerp4(cols[0], cols[1], t_ab);
+        let q_col = lerp4(cols[0], cols[2], t_ac);
+
+        // Emit triangle APQ.
+        let base = out.positions.len() as u32;
+        out.positions.push(verts[0].to_array()); // A
+        out.positions.push(p_pos);               // P
+        out.positions.push(q_pos);               // Q
+        out.normals.push(norms[0]);
+        out.normals.push(p_norm);
+        out.normals.push(q_norm);
+        out.colors.push(cols[0]);
+        out.colors.push(p_col);
+        out.colors.push(q_col);
+        out.indices.extend_from_slice(&[base, base+1, base+2]);
+    }
+}
+
 pub fn merge_child_faces(
     children: &[ChildFaces],
     meshes: &mut Assets<Mesh>,

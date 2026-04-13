@@ -10,3 +10,6 @@
 /assets/vox/*.vox
 .claude/
 ui/comparison/
+target-horizon/
+target-horizon/
+target-local/

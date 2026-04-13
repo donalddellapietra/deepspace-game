@@ -29,7 +29,7 @@ use bevy::prelude::*;
 use crate::block::Palette;
 use crate::model::mesher::{
     bake_volume, bake_child_faces, merge_child_faces,
-    flatten_children, ChildClass, ChildFaces,
+    flatten_children, clip_mesh_to_sphere, ChildClass, ChildFaces,
 };
 use crate::model::BakedSubMesh;
 
@@ -946,12 +946,36 @@ pub fn render_world(
                     ))
                     .id();
 
+                // Check if this node straddles the clip sphere by
+                // testing the farthest corner distance.
+                let node_extent = 125.0_f32;
+                let r_sq = radius_bevy * radius_bevy;
+                let sphere_center_local = camera_pos - visit.origin;
+                // Farthest corner from sphere center in local space.
+                let far_x = if sphere_center_local.x < node_extent * 0.5 { node_extent } else { 0.0 };
+                let far_y = if sphere_center_local.y < node_extent * 0.5 { node_extent } else { 0.0 };
+                let far_z = if sphere_center_local.z < node_extent * 0.5 { node_extent } else { 0.0 };
+                let far_corner = Vec3::new(far_x, far_y, far_z);
+                let far_dist_sq = (far_corner - sphere_center_local).length_squared();
+                let is_boundary = far_dist_sq > r_sq;
+
                 for sub in baked {
                     let Some(mat) = palette.material(sub.voxel) else {
                         continue;
                     };
+                    let mesh_handle = if is_boundary {
+                        let clipped = meshes.get(&sub.mesh)
+                            .cloned()
+                            .and_then(|m| {
+                                let result = clip_mesh_to_sphere(&m, sphere_center_local, radius_bevy, &mut meshes);
+                                result
+                            });
+                        clipped.unwrap_or_else(|| sub.mesh.clone())
+                    } else {
+                        sub.mesh.clone()
+                    };
                     commands.spawn((
-                        Mesh3d(sub.mesh.clone()),
+                        Mesh3d(mesh_handle),
                         MeshMaterial3d(mat),
                         SubMeshBlock(sub.voxel),
                         Transform::default(),
@@ -973,7 +997,7 @@ pub fn render_world(
     render_state.entities = alive;
 
     // Update clip_radius on all BSL materials so the terrain is clipped
-    // to a smooth circle matching the annulus inner edge.
+    // to a smooth circle matching the view distance.
     for (_id, mat) in mat_assets.iter_mut() {
         mat.extension.params.clip_radius = radius_bevy;
     }

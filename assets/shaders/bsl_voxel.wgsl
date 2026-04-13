@@ -42,7 +42,8 @@ fn fragment(
     in: VertexOutput,
     @builtin(front_facing) is_front: bool,
 ) -> FragmentOutput {
-    // Clip terrain to a smooth circle and compute distance for AO fade.
+    // Clip terrain to a smooth circle. The fog blend (below, after
+    // lighting) fades terrain toward the sky color near this boundary.
     var clip_dist_sq = 0.0;
     if (bsl.clip_radius > 0.0) {
         let dx = in.world_position.x - view.world_position.x;
