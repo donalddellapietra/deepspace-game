@@ -37,7 +37,9 @@ pub struct BslParams {
     pub subsurface_strength: f32,
     /// Vertex-baked AO influence (1.0 = full effect).
     pub ao_strength: f32,
-    pub _padding: Vec2,
+    /// XZ clip radius for smooth circular terrain boundary. 0 = no clip.
+    pub clip_radius: f32,
+    pub _padding: f32,
 }
 
 impl Default for BslParams {
@@ -48,7 +50,8 @@ impl Default for BslParams {
             ambient_color: Vec4::new(0.8, 0.85, 1.0, 0.3),
             subsurface_strength: 0.0,
             ao_strength: 0.6,
-            _padding: Vec2::ZERO,
+            clip_radius: 0.0,
+            _padding: 0.0,
         }
     }
 }

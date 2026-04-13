@@ -9,6 +9,7 @@
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::alpha_discard,
+    mesh_view_bindings::view,
 }
 
 #ifdef PREPASS_PIPELINE
@@ -27,7 +28,10 @@ struct BslParams {
     ambient_color: vec4<f32>,
     subsurface_strength: f32,
     ao_strength: f32,
-    _padding: vec2<f32>,
+    /// XZ distance from camera beyond which fragments are discarded,
+    /// creating a smooth circular terrain boundary. 0 = no clipping.
+    clip_radius: f32,
+    _padding: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100)
@@ -38,6 +42,17 @@ fn fragment(
     in: VertexOutput,
     @builtin(front_facing) is_front: bool,
 ) -> FragmentOutput {
+    // Clip terrain to a smooth circle so the boundary matches the
+    // annulus imposter ring. Without this, sphere-culled cube blocks
+    // create a patchy edge that doesn't align with the smooth annulus.
+    if (bsl.clip_radius > 0.0) {
+        let dx = in.world_position.x - view.world_position.x;
+        let dz = in.world_position.z - view.world_position.z;
+        if (dx * dx + dz * dz > bsl.clip_radius * bsl.clip_radius) {
+            discard;
+        }
+    }
+
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 

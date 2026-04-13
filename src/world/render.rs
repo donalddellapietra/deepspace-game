@@ -166,6 +166,8 @@ pub struct RenderState {
     imposter_entities: Vec<Entity>,
     /// Cached annulus mesh for imposters.
     imposter_mesh: Option<Handle<Mesh>>,
+    /// Custom cooler material for the annulus (matches terrain's shaded look).
+    imposter_material: Option<Handle<crate::block::BslMaterial>>,
 }
 
 /// A compact identifier for a node's position in the tree during a
@@ -581,21 +583,25 @@ fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, inne
     let mut positions = Vec::with_capacity(vert_count);
     let mut normals = Vec::with_capacity(vert_count);
     let mut uvs = Vec::with_capacity(vert_count);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(vert_count);
     let mut indices = Vec::with_capacity(segments as usize * 6);
 
     for i in 0..=segments {
         let angle = (i as f32 / segments as f32) * TAU;
         let (sin_a, cos_a) = angle.sin_cos();
 
-        // Inner vertex — raised to inner_y to cover terrain edge side faces.
+        // Inner vertex — dark vertex color to match terrain's shaded look.
+        // BSL shader reads vertex_color.r as AO (squared, * ao_strength).
         positions.push([cos_a * inner_r, inner_y, sin_a * inner_r]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([i as f32 / segments as f32, 0.0]);
+        colors.push([0.15, 0.15, 0.15, 1.0]);
 
-        // Outer vertex — at Y=0 (ground level at horizon).
+        // Outer vertex — slightly brighter (atmosphere fogs it anyway).
         positions.push([cos_a * outer_r, 0.0, sin_a * outer_r]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([i as f32 / segments as f32, 1.0]);
+        colors.push([0.3, 0.3, 0.3, 1.0]);
     }
 
     for i in 0..segments {
@@ -617,6 +623,7 @@ fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, inne
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
     meshes.add(mesh)
 }
@@ -794,6 +801,7 @@ pub fn render_world(
     camera_q: Query<&Transform, With<Camera3d>>,
     palette: Option<Res<Palette>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut mat_assets: ResMut<Assets<crate::block::BslMaterial>>,
     mut render_state: ResMut<RenderState>,
     mut timings: ResMut<RenderTimings>,
     overlay_list: Res<super::overlay::OverlayList>,
@@ -964,6 +972,12 @@ pub fn render_world(
     }
     render_state.entities = alive;
 
+    // Update clip_radius on all BSL materials so the terrain is clipped
+    // to a smooth circle matching the annulus inner edge.
+    for (_id, mat) in mat_assets.iter_mut() {
+        mat.extension.params.clip_radius = radius_bevy;
+    }
+
     // ------ Imposter ring: single annulus filling the gap to the horizon ------
 
     // Despawn old imposter (single entity now).
@@ -973,36 +987,9 @@ pub fn render_world(
         }
     }
 
-    let grass_voxel: u8 = 3;
-    if let Some(grass_mat) = palette.material(grass_voxel) {
-        let ground_y = (super::state::GROUND_Y_VOXELS - anchor.leaf_coord[1]) as f32 / anchor.norm;
-        let outer_radius = radius_bevy * 3.0;
-        // Inner radius at 85% of render distance — the annulus only
-        // fills the outer 15% and beyond. Digging near the player
-        // (inside the inner edge) won't reveal the annulus.
-        let inner_radius = radius_bevy * 0.5;
-
-        let needs_rebuild = render_state.imposter_mesh.is_none();
-        let annulus = if needs_rebuild {
-            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, 0.0, 64);
-            render_state.imposter_mesh = Some(mesh.clone());
-            mesh
-        } else {
-            render_state.imposter_mesh.clone().unwrap()
-        };
-
-        let entity = commands.spawn((
-            Mesh3d(annulus),
-            MeshMaterial3d(grass_mat.clone()),
-            Transform::from_translation(Vec3::new(camera_pos.x, ground_y, camera_pos.z)),
-            Visibility::Visible,
-            bevy::light::NotShadowCaster,
-            bevy::light::NotShadowReceiver,
-        )).id();
-        render_state.imposter_entities.push(entity);
-
-        info!("Imposter annulus: inner={:.0}, outer={:.0}, y={:.1}", inner_radius, outer_radius, ground_y);
-    }
+    // No annulus — just the shader clip for a smooth circular terrain
+    // edge. The annulus color can't match terrain under PBR lighting
+    // (flat surface gets different hue than 3D blocks).
 
     // Overlay reconcile (NPCs and other overlay subtrees).
     super::overlay::reconcile_overlays(
