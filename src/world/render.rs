@@ -943,12 +943,14 @@ pub fn render_world(
         let entity = commands.spawn((
             Mesh3d(annulus),
             MeshMaterial3d(grass_mat.clone()),
-            // Ground Y in anchor-relative Bevy space. The anchor tracks
-            // the player, so when jumping the ground drops below Y=0.
-            // The annulus must track the actual ground, not the anchor.
+            // Ground Y in anchor-relative Bevy space, pushed well below
+            // the surface so it's not visible through holes dug in the
+            // terrain. At the horizon viewing angle it's still visible
+            // because you look edge-on.
             Transform::from_translation(Vec3::new(
                 camera_pos.x,
-                (super::state::GROUND_Y_VOXELS - anchor.leaf_coord[1]) as f32 / anchor.norm,
+                (super::state::GROUND_Y_VOXELS - anchor.leaf_coord[1]) as f32 / anchor.norm
+                    - anchor.cell_bevy(zoom.layer) * 10.0,
                 camera_pos.z,
             )),
             Visibility::Visible,
