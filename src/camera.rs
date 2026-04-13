@@ -4,9 +4,11 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::AccumulatedMouseMotion,
     light::ShadowFilteringMethod,
-    pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium},
     prelude::*,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
 
 use crate::player::{Player, PLAYER_HEIGHT};
 use crate::world::view::cell_size_at_layer;
@@ -75,6 +77,7 @@ impl Plugin for CameraPlugin {
                         .after(tick_zoom_transition)
                         .after(crate::player::derive_transforms)
                         .after(crate::ui::sync_cursor),
+                    #[cfg(not(target_arch = "wasm32"))]
                     sync_atmosphere_scale,
                 ),
             );
@@ -93,30 +96,26 @@ pub struct CursorLocked(pub bool);
 
 fn spawn_camera(
     mut commands: Commands,
+    #[cfg(not(target_arch = "wasm32"))]
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
-    let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
-
-    commands.spawn((
+    let mut cam = commands.spawn((
         Camera3d::default(),
-        // Pitch 0 = look forward. The follow system in
-        // `first_person_camera` snaps this entity onto the player on
-        // frame 1, so the spawn translation is just a placeholder —
-        // we use `Vec3::ZERO` instead of any hardcoded global Bevy
-        // coordinate to make it obvious that this isn't a position
-        // we picked.
         FpsCam { yaw: 0.0, pitch: 0.0 },
         Transform::default(),
-        // Procedural atmosphere (Rayleigh + Mie scattering).
-        // Ground albedo matches grass color so the horizon blends
-        // with the terrain edge instead of showing a grey seam.
-        Atmosphere {
-            ground_albedo: Vec3::new(0.3, 0.6, 0.2),
-            ..Atmosphere::earthlike(medium)
-        },
         Tonemapping::Reinhard,
         ShadowFilteringMethod::Gaussian,
     ));
+
+    // Procedural atmosphere requires storage buffers (not available on WebGL2).
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
+        cam.insert(Atmosphere {
+            ground_albedo: Vec3::new(0.3, 0.6, 0.2),
+            ..Atmosphere::earthlike(medium)
+        });
+    }
 }
 
 fn spawn_crosshair(mut commands: Commands) {
@@ -172,6 +171,7 @@ fn first_person_camera(
 /// Keep the aerial-view LUT range in sync with the actual view
 /// distance so atmospheric fog distributes evenly across all visible
 /// chunks (avoiding banding at chunk boundaries).
+#[cfg(not(target_arch = "wasm32"))]
 fn sync_atmosphere_scale(
     zoom: Res<CameraZoom>,
     mut cam_q: Query<&mut AtmosphereSettings, With<FpsCam>>,
