@@ -112,23 +112,16 @@ pub fn render_world(
     render_state.mesh_store.ensure_loaded(world.canned_world_hash);
 
     let target_layer = target_layer_for(zoom.layer);
-    let use_composition = zoom.layer + DETAIL_DEPTH <= MAX_LAYER;
-
-    // Single emit layer: target-2 when composition possible, else target-1.
-    let emit_layer = if use_composition {
-        target_layer.saturating_sub(2)
-    } else {
-        target_layer.saturating_sub(1)
-    };
+    // No LOD cascade for now — all entities use flattened meshes.
+    let use_composition = false;
+    let emit_layer = target_layer.saturating_sub(1);
 
     let cell = anchor.cell_bevy(zoom.layer);
     let radius_bevy = RADIUS_VIEW_CELLS * cell;
-    let fine_radius_sq = (FINE_RADIUS_VIEW_CELLS * cell).powi(2);
+    let fine_radius_sq = 0.0f32; // composition disabled
 
-    // Composed meshes are in target-layer voxels [0, 625).
-    // Flattened meshes are in (emit+1)-layer voxels [0, 125).
-    let compose_scale = scale_for_layer(target_layer) / anchor.norm;
     let flatten_scale = scale_for_layer((emit_layer + 1).min(MAX_LAYER)) / anchor.norm;
+    let compose_scale = flatten_scale; // unused, same value to avoid issues
 
     // On zoom change, drop entities and clear caches.
     if !render_state.initialised
