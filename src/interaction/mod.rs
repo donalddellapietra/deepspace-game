@@ -412,13 +412,56 @@ fn draw_highlight(
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
     save_mode: Res<SaveMode>,
+    entity_edit: Res<EntityEditMode>,
+    overlay_list: Res<OverlayList>,
+    cam_q: Query<&GlobalTransform, With<FpsCam>>,
 ) {
+    // Entity edit mode indicator: green wireframe around each NPC.
+    if entity_edit.active {
+        let green = Color::srgb(0.2, 1.0, 0.3);
+        // Draw a small green diamond near the camera as mode indicator.
+        if let Ok(cam) = cam_q.single() {
+            let fwd = cam.forward().as_vec3();
+            let indicator = cam.translation() + fwd * 2.0 + Vec3::Y * -0.5;
+            gizmos.sphere(
+                Isometry3d::from_translation(indicator),
+                0.03,
+                green,
+            );
+        }
+
+        // Highlight targeted NPC voxel if any.
+        if let Some(overlay_hit) = &targeted.hit_overlay {
+            for entry in &overlay_list.entries {
+                if entry.id != overlay_hit.npc_entity { continue; }
+                if let Some(part) = entry.parts.get(overlay_hit.part_index) {
+                    let part_pos = entry.bevy_pos
+                        + entry.rotation * (entry.scale * part.offset);
+                    let part_rot = entry.rotation * part.rotation;
+                    let v = overlay_hit.local_voxel;
+                    let voxel_center = Vec3::new(
+                        v[0] as f32 + 0.5,
+                        v[1] as f32 + 0.5,
+                        v[2] as f32 + 0.5,
+                    );
+                    let bevy_pos = part_pos
+                        + part_rot * (entry.scale * (voxel_center - part.pivot));
+                    gizmos.cube(
+                        Transform::from_translation(bevy_pos)
+                            .with_scale(Vec3::splat(entry.scale * 1.05))
+                            .with_rotation(part_rot),
+                        green,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    // Normal mode: terrain highlight.
     let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
-    // In save mode the hovered block is recoloured blue in place
-    // (see `editor::save_mode::update_save_tint`); paint the outline
-    // blue to match so the "save target" is visually cohesive.
     let save_tinted = save_mode.active && save_mode_eligible(zoom.layer);
     let color = if save_tinted {
         Color::srgb(0.3, 0.65, 1.0)

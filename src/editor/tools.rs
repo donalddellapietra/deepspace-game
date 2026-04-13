@@ -164,25 +164,22 @@ pub fn remove_block(
         return;
     }
 
-    // NPC hit takes priority over world hit.
-    if let Some(overlay_hit) = &targeted.hit_overlay {
-        let Some(tree_bp) = tree_bp else { return };
-        let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
-            return;
-        };
-        edit_npc_voxel(
-            &mut world,
-            &mut overrides,
-            &tree_bp,
-            overlay_hit.part_index,
-            overlay_hit.local_voxel,
-            EMPTY_VOXEL,
-        );
-        return;
-    }
-
-    // In entity edit mode, don't fall through to terrain editing.
     if entity_edit.active {
+        // Entity edit mode: only NPC voxels can be edited.
+        if let Some(overlay_hit) = &targeted.hit_overlay {
+            let Some(tree_bp) = tree_bp else { return };
+            let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
+                return;
+            };
+            edit_npc_voxel(
+                &mut world,
+                &mut overrides,
+                &tree_bp,
+                overlay_hit.part_index,
+                overlay_hit.local_voxel,
+                EMPTY_VOXEL,
+            );
+        }
         return;
     }
 
@@ -220,25 +217,24 @@ pub fn place_block(
     }
 
     // NPC hit: place the active block voxel onto the NPC part.
-    if let Some(overlay_hit) = &targeted.hit_overlay {
-        if let HotbarItem::Block(voxel) = hotbar.active_item(zoom.layer) {
-            let Some(tree_bp) = tree_bp else { return };
-            let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
-                return;
-            };
-            edit_npc_voxel(
-                &mut world,
-                &mut overrides,
-                &tree_bp,
-                overlay_hit.part_index,
-                overlay_hit.local_voxel,
-                *voxel,
-            );
-        }
-        return;
-    }
-
     if entity_edit.active {
+        // Entity edit mode: only NPC voxels can be edited.
+        if let Some(overlay_hit) = &targeted.hit_overlay {
+            if let HotbarItem::Block(voxel) = hotbar.active_item(zoom.layer) {
+                let Some(tree_bp) = tree_bp else { return };
+                let Ok(mut overrides) = npc_q.get_mut(overlay_hit.npc_entity) else {
+                    return;
+                };
+                edit_npc_voxel(
+                    &mut world,
+                    &mut overrides,
+                    &tree_bp,
+                    overlay_hit.part_index,
+                    overlay_hit.local_voxel,
+                    *voxel,
+                );
+            }
+        }
         return;
     }
 
