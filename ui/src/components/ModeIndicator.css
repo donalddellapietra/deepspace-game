@@ -5,7 +5,7 @@
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 6px 16px;
   border: 1px solid var(--hud-border);
   border-radius: 8px;
@@ -18,23 +18,28 @@
   color: var(--text-primary);
 }
 
-.mode-badge {
-  font-size: 12px;
+.mode-divider {
+  font-size: 14px;
+  color: var(--hud-border);
+}
+
+.mode-current {
+  font-size: 14px;
   font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 4px;
 }
 
-.mode-badge.save {
+.mode-current.terrain {
+  color: var(--text-primary);
+}
+
+.mode-current.save {
   color: var(--save-mode-color);
-  background: rgba(100, 200, 255, 0.1);
 }
 
-.mode-badge.save-warning {
+.mode-current.save-warning {
   color: var(--save-warning-color);
 }
 
-.mode-badge.entity-edit {
+.mode-current.entity-edit {
   color: #4ade80;
-  background: rgba(74, 222, 128, 0.15);
 }
