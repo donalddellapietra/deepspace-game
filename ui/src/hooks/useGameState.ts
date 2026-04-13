@@ -55,6 +55,7 @@ const modeIndicatorStore = createStore<ModeIndicatorState>({
   layer: 2,
   saveMode: false,
   saveEligible: false,
+  entityEditMode: false,
 });
 
 const toastStore = createStore<ToastMessage | null>(null);
