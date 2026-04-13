@@ -93,12 +93,12 @@ pub struct InstancedOverlayState {
     meshes: HashMap<NodeId, Vec<BakedSubMesh>>,
     /// Pivot per NodeId.
     pivots: HashMap<NodeId, Vec3>,
+    /// Palette color cache: voxel -> linear RGBA. Avoids per-instance lookup.
+    color_cache: HashMap<u8, [f32; 4]>,
     /// One Bevy entity per mesh group (reused across frames).
     group_entities: HashMap<MeshGroupKey, Entity>,
     /// Instance data per group, rebuilt each frame.
     group_instances: HashMap<MeshGroupKey, Vec<NpcInstanceData>>,
-    /// Keys used this frame (for cleanup).
-    active_keys: Vec<MeshGroupKey>,
 }
 
 // --------------------------------------------------------------- reconcile
@@ -150,7 +150,16 @@ pub fn reconcile_instanced(
     for instances in state.group_instances.values_mut() {
         instances.clear();
     }
-    state.active_keys.clear();
+
+    // Cache palette colors (only ~10 entries, done once).
+    if state.color_cache.is_empty() {
+        for voxel in 1..=255u8 {
+            if let Some(entry) = palette.get(voxel) {
+                let c = entry.color.to_linear();
+                state.color_cache.insert(voxel, [c.red, c.green, c.blue, 1.0]);
+            }
+        }
+    }
 
     // Collect instances grouped by (mesh, material).
     for entry in &overlay_list.entries {
@@ -179,37 +188,37 @@ pub fn reconcile_instanced(
                     sub_idx,
                 };
 
-                // Look up the color from the palette.
-                let color = palette
-                    .get(sub.voxel)
-                    .map(|e| {
-                        let c = e.color.to_linear();
-                        [c.red, c.green, c.blue, 1.0]
-                    })
+                let color = state.color_cache
+                    .get(&sub.voxel)
+                    .copied()
                     .unwrap_or([1.0, 0.0, 1.0, 1.0]);
 
-                let instances = state
+                state
                     .group_instances
-                    .entry(key.clone())
-                    .or_insert_with(Vec::new);
-                instances.push(NpcInstanceData {
-                    transform: combined.to_cols_array(),
-                    color,
-                });
-
-                if !state.active_keys.contains(&key) {
-                    state.active_keys.push(key);
-                }
+                    .entry(key)
+                    .or_default()
+                    .push(NpcInstanceData {
+                        transform: combined.to_cols_array(),
+                        color,
+                    });
             }
         }
     }
 
-    // Reconcile entities: update existing, spawn new, despawn empty.
-    for key in &state.active_keys {
-        let instances = match state.group_instances.get(key) {
-            Some(v) if !v.is_empty() => v,
-            _ => continue,
-        };
+    // Collect keys to process (can't mutate group_entities while iterating group_instances).
+    let keys: Vec<MeshGroupKey> = state.group_instances.keys().cloned().collect();
+
+    for key in &keys {
+        let instances = state.group_instances.get_mut(key).unwrap();
+
+        if instances.is_empty() {
+            if let Some(ent) = state.group_entities.remove(key) {
+                if let Ok(mut ec) = commands.get_entity(ent) {
+                    ec.despawn();
+                }
+            }
+            continue;
+        }
 
         let baked = match state.meshes.get(&key.node_id) {
             Some(b) => b,
@@ -220,19 +229,19 @@ pub fn reconcile_instanced(
             None => continue,
         };
 
+        let data = std::mem::take(instances);
+
         match state.group_entities.get(key) {
             Some(&ent) => {
-                // Update instance data on existing entity.
                 if let Ok(mut ec) = commands.get_entity(ent) {
-                    ec.insert(NpcInstanceList(instances.clone()));
+                    ec.insert(NpcInstanceList(data));
                 }
             }
             None => {
-                // Spawn new entity for this mesh group.
                 let ent = commands
                     .spawn((
                         Mesh3d(sub.mesh.clone()),
-                        NpcInstanceList(instances.clone()),
+                        NpcInstanceList(data),
                         Transform::IDENTITY,
                         Visibility::Visible,
                         NoFrustumCulling,
@@ -244,13 +253,9 @@ pub fn reconcile_instanced(
         }
     }
 
-    // Despawn groups that had no instances this frame.
+    // Despawn groups not seen this frame (key not in group_instances).
     state.group_entities.retain(|key, ent| {
-        let has_instances = state
-            .group_instances
-            .get(key)
-            .is_some_and(|v| !v.is_empty());
-        if !has_instances {
+        if !state.group_instances.contains_key(key) {
             if let Ok(mut ec) = commands.get_entity(*ent) {
                 ec.despawn();
             }

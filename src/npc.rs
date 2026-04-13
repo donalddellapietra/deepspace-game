@@ -815,25 +815,16 @@ fn npc_ai(
 
 fn npc_physics(
     time: Res<Time>,
-    frame: Res<NpcFrameCounter>,
     world: Res<WorldState>,
     zoom: Res<CameraZoom>,
-    mut q: Query<(Entity, &mut WorldPosition, &mut NpcVelocity), With<Npc>>,
+    mut q: Query<(&mut WorldPosition, &mut NpcVelocity), With<Npc>>,
 ) {
     let dt = time.delta_secs();
     let cell = cell_size_at_layer(zoom.layer);
-    let fc = frame.0;
 
-    for (entity, mut wpos, mut vel) in &mut q {
-        // Stagger collision: only 1/N per frame.
-        if entity.index().index() % NPC_UPDATE_STAGGER != fc % NPC_UPDATE_STAGGER {
-            continue;
-        }
-        vel.0.y -= NPC_GRAVITY_CELLS * cell * dt * NPC_UPDATE_STAGGER as f32;
-        let h_delta = bevy::math::Vec2::new(
-            vel.0.x * cell * dt * NPC_UPDATE_STAGGER as f32,
-            vel.0.z * cell * dt * NPC_UPDATE_STAGGER as f32,
-        );
+    for (mut wpos, mut vel) in &mut q {
+        vel.0.y -= NPC_GRAVITY_CELLS * cell * dt;
+        let h_delta = bevy::math::Vec2::new(vel.0.x * cell * dt, vel.0.z * cell * dt);
         collision::move_and_collide(&mut wpos.0, &mut vel.0, h_delta, dt, &world, zoom.layer);
     }
 }
