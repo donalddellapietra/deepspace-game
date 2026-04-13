@@ -557,10 +557,6 @@ fn walk(
             if child_id == EMPTY_NODE {
                 continue;
             }
-            // Skip uniform-empty subtrees — zero faces at any depth.
-            if world.library.get(child_id).map_or(false, |n| n.uniform_empty) {
-                continue;
-            }
             let (sx, sy, sz) = slot_coords(slot);
             let child_origin_leaves = [
                 origin_leaves[0] + (sx as i64) * child_extent_i64,
