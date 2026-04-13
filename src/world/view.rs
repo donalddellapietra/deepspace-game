@@ -61,7 +61,7 @@ use super::state::{world_extent_voxels, WorldState};
 #[cfg(test)]
 use super::state::GROUND_Y_VOXELS;
 use super::tree::{
-    slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
+    slot_coords, slot_index, voxel_idx, DETAIL_DEPTH, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
     NODE_VOXELS_PER_AXIS,
 };
 
@@ -83,18 +83,16 @@ use super::tree::{
 pub struct WorldAnchor {
     pub leaf_coord: [i64; 3],
     /// Normalization divisor: how many leaf voxels equal one Bevy unit.
-    /// Set to `scale_for_layer(target_layer_for(zoom.layer))` so that
-    /// Bevy-space coordinates stay in a bounded range (~800 units)
-    /// regardless of zoom level. This prevents atmosphere LUT banding
-    /// and post-processing artifacts caused by huge coordinate ranges
-    /// at zoomed-out layers.
+    /// Set to `norm_for_layer(zoom.layer)` = `scale_for_layer(view+1)`
+    /// so that Bevy-space coordinates stay bounded (~800 units)
+    /// regardless of zoom level or DETAIL_DEPTH.
     pub norm: f32,
 }
 
 impl WorldAnchor {
     /// Size of one cell at `layer` in normalized Bevy units.
-    /// At the target layer this is 1.0; at the view layer it's
-    /// typically 25.0 (= 5^(target - view) = 5^2).
+    /// At the emit layer (view+1) this is 1.0; at the view layer
+    /// it's 5.0.
     #[inline]
     pub fn cell_bevy(&self, layer: u8) -> f32 {
         scale_for_layer(layer) / self.norm
@@ -147,20 +145,24 @@ pub fn cell_size_at_layer(layer: u8) -> f32 {
 }
 
 /// The layer the renderer emits entities at for a given view layer,
-/// and the layer collision samples blocks at. Ported from the 2D
-/// prototype's `subtexture_25` rule: at view layer `L`, one visible
-/// cell corresponds to one layer-`(L + 2)` node, so each emitted
-/// entity's mesh shows the fine `(L + 2)` voxel grid instead of the
-/// single layer-`L` voxel. Clamped to [`MAX_LAYER`] because you can't
-/// descend past the leaves.
+/// and the layer collision samples blocks at. At view layer `L`, one
+/// visible cell corresponds to one layer-`(L + DETAIL_DEPTH)` node.
+/// Clamped to [`MAX_LAYER`] because you can't descend past the leaves.
 ///
 /// **Every consumer that needs this rule calls this function.** Do
-/// not hardcode `(view + 2).min(MAX_LAYER)` at call sites — past
-/// bugs came from having the rule in two places and only updating
-/// one.
+/// not hardcode the depth offset at call sites — past bugs came from
+/// having the rule in two places and only updating one.
 #[inline]
 pub fn target_layer_for(view_layer: u8) -> u8 {
-    view_layer.saturating_add(2).min(MAX_LAYER)
+    view_layer.saturating_add(DETAIL_DEPTH).min(MAX_LAYER)
+}
+
+/// The normalization divisor for a given view layer. Based on
+/// `view + 1` (one layer below the view) so that Bevy-space
+/// coordinates stay bounded (~800 units) regardless of DETAIL_DEPTH.
+#[inline]
+pub fn norm_for_layer(view_layer: u8) -> f32 {
+    scale_for_layer((view_layer + 1).min(MAX_LAYER))
 }
 
 /// Bevy offset from the given `anchor` to the `-x, -y, -z` corner
