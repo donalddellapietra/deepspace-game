@@ -603,7 +603,7 @@ fn walk(
 
         // Reached emit layer → emit (skip uniform-empty nodes).
         if depth == emit_layer {
-            if world.library.get(node_id).map_or(false, |n| n.uniform_empty) {
+            if world.library.get(node_id).map_or(false, |n| n.uniform) {
                 continue;
             }
             out.push(Visit {
