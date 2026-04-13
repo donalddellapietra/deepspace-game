@@ -21,7 +21,10 @@ pub struct BslParams {
     pub subsurface_strength: f32,
     /// Vertex-baked AO influence (1.0 = full effect).
     pub ao_strength: f32,
-    pub _padding: Vec2,
+    /// Distance fog: fragments beyond `fog_start` fade toward the
+    /// atmosphere color, fully faded at `fog_end`. Set to 0.0 to disable.
+    pub fog_start: f32,
+    pub fog_end: f32,
 }
 
 impl Default for BslParams {
@@ -32,7 +35,8 @@ impl Default for BslParams {
             ambient_color: Vec4::new(0.8, 0.85, 1.0, 0.3),
             subsurface_strength: 0.0,
             ao_strength: 0.6,
-            _padding: Vec2::ZERO,
+            fog_start: 0.0,
+            fog_end: 0.0,
         }
     }
 }

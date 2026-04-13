@@ -10,6 +10,7 @@ use bevy::{
     render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
 };
 
+use crate::block::BslMaterial;
 use crate::player::{Player, PLAYER_HEIGHT};
 use crate::world::view::cell_size_at_layer;
 use crate::world::CameraZoom;
@@ -78,6 +79,7 @@ impl Plugin for CameraPlugin {
                         .after(crate::player::derive_transforms)
                         .after(crate::ui::sync_cursor),
                     sync_atmosphere_scale,
+                    sync_fog_distances,
                 ),
             );
     }
@@ -242,6 +244,30 @@ fn sync_atmosphere_scale(
         // consistent ~2m altitude regardless of zoom, preventing
         // heavy blue scattering at zoomed-out layers.
         settings.scene_units_to_m = 1.0 / cell;
-        settings.aerial_view_lut_max_distance = view_radius / cell;
+        // Set the aerial-view LUT distance to ~60% of render radius.
+        // This concentrates the atmosphere fog samples so haze reaches
+        // near-opacity right where terrain ends, hiding the render
+        // distance cutoff instead of showing two distinct horizons.
+        settings.aerial_view_lut_max_distance = view_radius * 0.6 / cell;
+    }
+}
+
+/// Update fog start/end on all BSL materials when the zoom changes, so
+/// terrain fades smoothly into the atmosphere at the render edge.
+fn sync_fog_distances(
+    zoom: Res<CameraZoom>,
+    mut materials: ResMut<Assets<BslMaterial>>,
+) {
+    if !zoom.is_changed() {
+        return;
+    }
+    let cell = cell_size_at_layer(zoom.layer);
+    let radius = crate::world::render::RADIUS_VIEW_CELLS * cell;
+    // Fog starts at 70% of render radius, fully opaque at 95%.
+    let fog_start = radius * 0.7;
+    let fog_end = radius * 0.95;
+    for (_, mat) in materials.iter_mut() {
+        mat.extension.params.fog_start = fog_start;
+        mat.extension.params.fog_end = fog_end;
     }
 }
