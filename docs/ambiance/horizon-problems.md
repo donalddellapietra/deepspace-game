@@ -4,7 +4,7 @@
 
 **SOLVED: LUT banding (Problem 2)** — Coordinate normalization (commit e6965fd) fixed concentric rings by keeping Bevy-space bounded at ~800 units.
 
-**UNSOLVED: Double horizon (Problem 1)** — Terrain edge vs atmosphere horizon. 11 approaches tried, none fully work.
+**UNSOLVED: Double horizon (Problem 1)** — Terrain edge vs atmosphere horizon. 16 approaches tried, none fully work. Next step: LOD imposters (approach E).
 
 ## The Double Horizon
 
@@ -14,13 +14,23 @@ Two visible horizons at any zoom layer:
 
 The gap between them shows sky where terrain should be. The terrain is dark green; the atmosphere at ground level is lighter desaturated green. The mismatch creates a visible seam.
 
+## The Fundamental Problem
+
+**There is no geometry between the terrain edge and the atmosphere horizon.** Every approach that operates on mesh fragments (fog, blur, shader effects) can only affect the terrain itself — it cannot fill the void beyond the terrain edge. The only solution is to put geometry there.
+
+This was confirmed by testing 16 approaches across two sessions:
+- Approaches 1-11: Fog, color matching, shader tricks — all fail because they can't fill the void
+- Approaches 12-16: Transmittance fix, DOF blur, DistanceFog + DOF combo — confirmed the fundamental issue: mesh-only effects produce a visible band ON the terrain but leave the gap untouched
+
 ## Why This Is Hard
 
-**There is no geometry between the terrain edge and the atmosphere horizon.** The atmosphere's `render_sky.wgsl` composites as `inscattering + transmittance * background`. Where there's no mesh, it draws sky. No shader trick can create pixels where no mesh exists.
+**Bevy's atmosphere is not like Minecraft's sky.** Minecraft uses a simple colored plane + fog color matching. Bevy uses physically-based Rayleigh/Mie scattering with LUTs. The atmosphere's horizon color is dynamic (changes with sun angle, altitude, view direction) and cannot be easily approximated with a static color.
 
-**Bevy's atmosphere is not like Minecraft's sky.** Minecraft uses a simple colored plane + fog color matching. Bevy uses physically-based Rayleigh/Mie scattering with LUTs. The atmosphere's horizon color is dynamic (changes with sun angle, altitude, view direction) and cannot be easily approximated with a static color. This is why the Minecraft-style "fog color = sky color" approach fails — the static fog color never matches the dynamic atmosphere.
+**The core constraint: we can't increase render distance** (RADIUS_VIEW_CELLS) because of CPU cost in the tree walk/bake.
 
-## All 11 Approaches Tried
+## All 16 Approaches Tried
+
+### Session 1 (ambiance-shaders branch)
 
 | # | Approach | Why It Failed |
 |---|----------|---------------|
@@ -30,48 +40,64 @@ The gap between them shows sky where terrain should be. The terrain is dark gree
 | 4 | Bevy DistanceFog component | Only affects mesh fragments, can't fill void |
 | 5 | ClearColor matching (grey-green) | Static color can't match dynamic atmosphere |
 | 6 | ClearColor black | Eliminated bleed-through band but terrain/sky gap remains |
-| 7 | Ground plane mesh | Horizons merge! But quad is visible, wrong color for varied terrain |
+| 7 | Ground plane mesh | Horizons conceptually merge, but quad is visible and wrong color for varied terrain |
 | 8 | Two-tier LOD shell (coarser nodes) | Coarser nodes render as full 3D blocks sticking up |
 | 9 | DistanceFog + black ClearColor | Fog darkens terrain edge but color mismatch with atmosphere |
 | 10 | Far plane clipping to render radius | Sphere cull means terrain doesn't fill full frustum — gap remains |
-| 11 | Minecraft-style fog=sky=clear color matching | Bevy's dynamic atmosphere color can't be matched with a static fog color — the fog darkens terrain but doesn't match the atmosphere's actual horizon rendering |
+| 11 | Minecraft-style fog=sky=clear color matching | Bevy's dynamic atmosphere color can't be matched with a static fog color |
 
-## Key Insights
+### Session 2 (horizon-fix branch)
 
-1. **The ground plane (approach 7) is the only approach that actually merged the horizons.** When geometry extends to the horizon, the atmosphere naturally fogs it. Every other approach tries to hide the gap; only geometry fills it.
+| # | Approach | Why It Failed |
+|---|----------|---------------|
+| 12 | Atmosphere transmittance fix (render_sky.wgsl: `transmittance = vec3(0.0)` for sky pixels) | A/B comparison showed zero visual difference — ClearColor bleed is not the visible problem |
+| 13 | Increased atmosphere density (`scene_units_to_m * 3`) | Zero visual difference in automated comparison |
+| 14 | DistanceFog (gray tint) | Creates a visible 2D gray band on the terrain. Doesn't fill the gap. Flat, not 3D. |
+| 15 | BSL shader distance fog (blend toward horizon color) | Same problem as #14 — only affects mesh fragments. Also broke block interaction. |
+| 16 | Bevy DOF (Depth of Field) + DistanceFog | DOF blur works (after fixing sensor_height for our coordinate scale). But fog+blur only affect mesh fragments — the gap between terrain and atmosphere remains. Creates a blurred gray band ON the terrain, gap untouched. |
 
-2. **Bevy's atmosphere is the obstacle.** If we used a simple colored skybox (like Minecraft), fog color matching would work trivially. The physically-based atmosphere produces a dynamically varying horizon color that can't be matched with a static fog color.
+### Key Debugging Notes from Session 2
 
-3. **The core constraint: we can't increase render distance** (RADIUS_VIEW_CELLS) because of CPU cost in the tree walk/bake.
+- **DOF requires correct sensor_height**: Default 18.66mm produces 0.19px CoC at 800 units (invisible). Need `sensor_height: 10.0` for ~21px CoC at terrain edge. DOF math is designed for real-world meter distances, not ~800-unit game coordinates.
+- **`DEPTH_TEXTURE_SAMPLING_SUPPORTED`**: On WASM, DOF requires the `webgpu` Bevy feature (WebGL2 doesn't support depth texture sampling). The constant is in `bevy_core_pipeline/src/core_3d/mod.rs`.
+- **Atmosphere compositing**: `render_sky.wgsl` runs between `main_opaque_pass_3d` and `main_transparent_pass_3d`. Post-process effects (DOF, bloom) run after. DistanceFog runs during PBR lighting (before atmosphere).
+- **Transmittance fix**: Setting `transmittance = vec3(0.0)` for `depth == 0` in `render_sky.wgsl` prevents ClearColor bleed at the horizon. Technically correct but produces no visible improvement because the ClearColor bleed wasn't the primary visual issue.
 
-## Approaches NOT Yet Tried
+## WASM/WebGPU Testing Infrastructure
 
-### A: Disable Bevy Atmosphere, Use Minecraft-Style Sky
-Replace Bevy's `Atmosphere` with a simple colored sky (skybox or procedural gradient). Then fog color = sky color at horizon, matching Minecraft's proven technique. Lose the fancy scattering but get a seamless horizon.
+Established during session 2 for iterative visual testing:
 
-**Pros:** Proven to work (every voxel game does this). Simple. Fast.
-**Cons:** Lose the beautiful atmospheric scattering. Might look "gamey."
+- **WebGPU on WASM**: Add `"webgpu"` to Bevy features in Cargo.toml. Overrides default `webgl2`. Enables atmosphere, DOF, SSR on WASM.
+- **Playwright with real Chrome**: Bundled headless Chromium can't capture WebGPU canvas. Use `channel: "chrome"` + `--enable-gpu` + `--enable-unsafe-webgpu` + `--use-angle=metal` for real GPU rendering in headless mode.
+- **Canvas pixel readback**: `toDataURL`/`drawImage` returns `[0,0,0,0]` on WebGPU. Only `page.screenshot()` works.
+- **Pointer Lock**: Doesn't work in headless — camera can't be rotated via mouse in tests.
+- **Custom port**: `trunk serve --port 8082` + `TRUNK_PORT=8082 npx playwright test`.
+- **Worktree setup**: Symlink `external/` and `target/`, create `.claude/`, `ui/dist/`, `tests/`, `docs/`, `dist/` dirs, `npm install && npm run build` in ui/.
 
-### B: Read Atmosphere Color from Sky-View LUT at Runtime
-Sample the atmosphere's sky-view LUT at the horizon direction each frame to get the actual dynamic horizon color. Use that as the fog color and ClearColor. This is the "match the atmosphere dynamically" approach.
+See `docs/testing.md` for full details.
 
-**Pros:** Works with the existing atmosphere. Fog always matches sky.
-**Cons:** Requires reading GPU texture back to CPU, or passing it through a compute shader. Non-trivial Bevy render pipeline work.
+## The Solution: LOD Imposters (Approach E)
 
-### C: Custom Post-Process that Reads Depth + Sky-View LUT
-A full-screen post-process that, for pixels with no geometry (depth == far plane), samples the atmosphere's sky-view LUT directly and composites it. This would replace ClearColor entirely with the actual atmosphere color, even in the gap.
+The only approach that can solve the double horizon is **putting geometry in the gap**. Every shipped open-world game does this — Minecraft, Skyrim, GTA, No Man's Sky all render low-detail terrain to the horizon.
 
-**Pros:** Perfect visual result. Works with any terrain.
-**Cons:** Requires implementing a custom ViewNode in Bevy's render graph. The sky pass already does this (`render_sky.wgsl`), but the compositing math (transmittance blending) leaks ClearColor through. Fixing the compositing is the real fix.
+### Design
 
-### D: Fix the Atmosphere Compositing
-The root issue: `render_sky.wgsl` outputs `vec4(inscattering, mean_transmittance)` which blends with the framebuffer. At the horizon, transmittance is non-zero, so ClearColor bleeds through. If the sky pass wrote opaque pixels (transmittance → 0) for the sky case (`depth == 0`), there would be no bleed. This might be a one-line fix in the sky shader if Bevy exposes it, or it could require forking the atmosphere plugin.
+Beyond the normal render radius (`RADIUS_VIEW_CELLS`), emit cheap geometry for an additional ring of coarser tree nodes:
 
-**Pros:** Fixes the actual bug. Everything else stays the same.
-**Cons:** Modifying Bevy's built-in atmosphere shader. May need a Bevy fork or a shader override.
+1. **Inner ring** (0 to RADIUS_VIEW_CELLS): Full voxel meshes at emit layer (current behavior)
+2. **Outer ring** (RADIUS_VIEW_CELLS to 2× or 3×): Flat quads or low-res heightmaps per coarser node, colored by dominant surface voxel
 
-### E: Flat LOD Imposters (revisit approach 8, done right)
-The LOD shell is the right concept but needs flat meshes, not full voxel bakes. For each coarser node in the outer ring, emit a single flat quad at the node's surface Y-level, colored by the node's dominant surface voxel. With future mountains/valleys, extract a heightmap from the coarser node's voxel grid instead of a flat quad.
+The atmosphere's aerial-view LUT naturally fogs the outer ring, blending it into the sky. DistanceFog can further soften the transition.
 
-**Pros:** Real geometry that the atmosphere fogs naturally. Adapts to terrain. Proven concept (ground plane worked).
-**Cons:** Needs new mesh generation path for the outer tier. Heightmap extraction adds complexity with non-flat terrain.
+### Requirements
+
+- Extract surface Y-level and dominant color from coarser tree nodes
+- Generate simple quad or heightmap mesh per outer-ring node
+- Must work with both flat grassland AND sphere/terrain (the sphere-planet worktree uses the same render walk and has the same horizon problem)
+- Must be cheap enough to not blow the CPU budget (the whole point is these are simpler than full voxel bakes)
+
+### Open Questions
+
+- How many extra rings? 1 ring at 2× radius, or multiple tiers?
+- Flat quads or heightmap extraction? Flat is simpler, heightmap is more correct for terrain.
+- How to handle the transition between full-detail inner ring and imposter outer ring?

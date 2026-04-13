@@ -114,6 +114,11 @@ impl CameraZoom {
 /// most roughly `(2N)^3` target-layer nodes — keep modest.
 pub const RADIUS_VIEW_CELLS: f32 = 32.0;
 
+/// How many times further the imposter ring extends beyond the
+/// normal render radius. Imposters are flat quads at ground level
+/// that fill the gap between the terrain edge and the horizon.
+const IMPOSTER_RADIUS_MULT: f32 = 3.0;
+
 // ----------------------------------------------------------------- state
 
 /// Per-frame timing data exposed to the diagnostics HUD.
@@ -157,6 +162,10 @@ pub struct RenderState {
     /// Reusable buffer for the target-layer visits collected by
     /// `walk()`. Same motivation as `walk_stack`.
     visits: Vec<Visit>,
+    /// Imposter entities for the outer ring (horizon fill).
+    imposter_entities: Vec<Entity>,
+    /// Cached flat quad mesh for imposters.
+    imposter_mesh: Option<Handle<Mesh>>,
 }
 
 /// A compact identifier for a node's position in the tree during a
@@ -554,6 +563,139 @@ fn walk(
     }
 }
 
+// --------------------------------------------------------- imposters
+
+/// Create a flat quad mesh of size `extent` in the XZ plane at Y=0.
+/// Used for the imposter ring that fills the gap to the horizon.
+fn make_imposter_quad(meshes: &mut Assets<Mesh>, extent: f32) -> Handle<Mesh> {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::Indices;
+    use bevy::render::render_resource::PrimitiveTopology;
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    let positions: Vec<[f32; 3]> = vec![
+        [0.0, 0.0, 0.0],
+        [extent, 0.0, 0.0],
+        [extent, 0.0, extent],
+        [0.0, 0.0, extent],
+    ];
+    let normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; 4];
+    let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let indices = vec![0u32, 2, 1, 0, 3, 2];
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    meshes.add(mesh)
+}
+
+/// Collect imposter positions: walk the tree at a coarser layer,
+/// collecting nodes that are OUTSIDE the normal render radius but
+/// INSIDE the extended imposter radius.  Returns (origin_bevy, extent)
+/// pairs for each imposter quad.
+fn collect_imposters(
+    world: &WorldState,
+    anchor: &WorldAnchor,
+    camera_pos: Vec3,
+    inner_radius: f32,
+    outer_radius: f32,
+    emit_layer: u8,
+) -> Vec<(Vec3, f32)> {
+    if world.root == EMPTY_NODE { return Vec::new(); }
+
+    // Walk at 2 layers coarser than the current emit layer.
+    // Each level up covers 5× more space, so 2 levels = 25× bigger nodes.
+    let imposter_depth = emit_layer.saturating_sub(2).max(1);
+
+    let mut results = Vec::new();
+    let mut stack: Vec<WalkFrame> = Vec::new();
+
+    let mut child_extent_leaves: [i64; MAX_LAYER as usize + 1] =
+        [0; MAX_LAYER as usize + 1];
+    {
+        let mut ext: i64 = super::state::world_extent_voxels();
+        child_extent_leaves[0] = ext;
+        for layer in 1..=(MAX_LAYER as usize) {
+            ext /= 5;
+            child_extent_leaves[layer] = ext;
+        }
+    }
+
+    stack.push(WalkFrame {
+        node_id: world.root,
+        path: SmallPath::empty(),
+        origin_leaves: [0; 3],
+        depth: 0,
+    });
+
+    let inner_sq = inner_radius * inner_radius;
+    let outer_sq = outer_radius * outer_radius;
+    let n = anchor.norm;
+
+    while let Some(frame) = stack.pop() {
+        let WalkFrame { node_id, path, origin_leaves, depth } = frame;
+
+        let origin_bevy = Vec3::new(
+            (origin_leaves[0] - anchor.leaf_coord[0]) as f32 / n,
+            (origin_leaves[1] - anchor.leaf_coord[1]) as f32 / n,
+            (origin_leaves[2] - anchor.leaf_coord[2]) as f32 / n,
+        );
+        let extent = extent_for_layer(depth) / n;
+        let aabb_min = origin_bevy;
+        let aabb_max = origin_bevy + Vec3::splat(extent);
+
+        // Distance to AABB
+        let dx = (aabb_min.x - camera_pos.x).max(0.0).max(camera_pos.x - aabb_max.x);
+        let dy = (aabb_min.y - camera_pos.y).max(0.0).max(camera_pos.y - aabb_max.y);
+        let dz = (aabb_min.z - camera_pos.z).max(0.0).max(camera_pos.z - aabb_max.z);
+        let min_dist_sq = dx * dx + dy * dy + dz * dz;
+
+        // Skip if completely outside the outer imposter radius
+        if min_dist_sq > outer_sq { continue; }
+
+        // At imposter depth: emit if outside inner radius
+        if depth == imposter_depth {
+            // Only emit if the node's nearest point is beyond the inner radius
+            // (so we don't double-render what the main pass already covers)
+            if min_dist_sq > inner_sq * 0.8 {
+                // Place the quad at the ground Y-level.
+                // In the grassland, ground is at the bottom of the root's
+                // y=0 slot, which in anchor-relative coords is near Y=0.
+                let ground_y = -camera_pos.y + 0.0; // ground is at the anchor's Y=0
+                let ground_origin = Vec3::new(origin_bevy.x, 0.0, origin_bevy.z);
+                results.push((ground_origin, extent));
+            }
+            continue;
+        }
+
+        // Descend
+        let Some(node) = world.library.get(node_id) else { continue };
+        let Some(children) = node.children.as_ref() else { continue };
+
+        let child_extent_i64 = child_extent_leaves[(depth + 1) as usize];
+        for slot in 0..CHILDREN_PER_NODE {
+            let child_id = children[slot];
+            if child_id == EMPTY_NODE { continue; }
+            let (sx, sy, sz) = slot_coords(slot);
+            let child_origin_leaves = [
+                origin_leaves[0] + (sx as i64) * child_extent_i64,
+                origin_leaves[1] + (sy as i64) * child_extent_i64,
+                origin_leaves[2] + (sz as i64) * child_extent_i64,
+            ];
+            stack.push(WalkFrame {
+                node_id: child_id,
+                path: path.push(slot as u8),
+                origin_leaves: child_origin_leaves,
+                depth: depth + 1,
+            });
+        }
+    }
+    results
+}
+
 // ----------------------------------------------------------------- system
 
 /// Bevy system: walk the tree, reconcile `RenderState` entities.
@@ -600,6 +742,12 @@ pub fn render_world(
             }
         }
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
+        for entity in render_state.imposter_entities.drain(..) {
+            if let Ok(mut ec) = commands.get_entity(entity) {
+                ec.despawn();
+            }
+        }
+        render_state.imposter_mesh = None;
         render_state.baked.clear();
         render_state.path_node.clear();
         render_state.last_zoom_layer = emit_layer;
@@ -728,6 +876,46 @@ pub fn render_world(
         }
     }
     render_state.entities = alive;
+
+    // ------ Imposter ring: flat quads filling the gap to the horizon ------
+
+    // Despawn old imposters.
+    for entity in render_state.imposter_entities.drain(..) {
+        if let Ok(mut ec) = commands.get_entity(entity) {
+            ec.despawn();
+        }
+    }
+
+    // Collect imposter positions.
+    let imposter_radius = radius_bevy * IMPOSTER_RADIUS_MULT;
+    let imposters = collect_imposters(
+        &world, &anchor, camera_pos,
+        radius_bevy, imposter_radius,
+        emit_layer,
+    );
+
+    if !imposters.is_empty() {
+        // Grass voxel = BlockType::Grass (index 2) + 1 = 3
+        let grass_voxel: u8 = 3;
+        if let Some(grass_mat) = palette.material(grass_voxel) {
+            // Create or reuse the imposter quad mesh.
+            // All imposters use the same unit quad scaled by Transform.
+            let quad_mesh = render_state.imposter_mesh
+                .get_or_insert_with(|| make_imposter_quad(&mut meshes, 1.0))
+                .clone();
+
+            for (origin, extent) in &imposters {
+                let entity = commands.spawn((
+                    Mesh3d(quad_mesh.clone()),
+                    MeshMaterial3d(grass_mat.clone()),
+                    Transform::from_translation(*origin)
+                        .with_scale(Vec3::new(*extent, 1.0, *extent)),
+                    Visibility::Visible,
+                )).id();
+                render_state.imposter_entities.push(entity);
+            }
+        }
+    }
 
     // Overlay reconcile (NPCs and other overlay subtrees).
     super::overlay::reconcile_overlays(
