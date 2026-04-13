@@ -116,12 +116,17 @@ fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn compress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
     zstd::encode_all(data, 3)
 }
 
 fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::decode_all(data)
+    let mut decoder = ruzstd::StreamingDecoder::new(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut out)?;
+    Ok(out)
 }
 
 // --------------------------------------------------- canned world I/O
@@ -310,18 +315,23 @@ pub type PrebakedMeshes = std::collections::HashMap<NodeId, PrebakedEntry>;
 #[derive(Serialize, Deserialize)]
 struct PrebakedFile {
     version: u32,
+    /// Hash of the world.bin this was generated from. Used to reject
+    /// stale mesh files that don't match the loaded world.
+    world_hash: u64,
     entries: Vec<(u64, PrebakedEntry)>,
 }
 
-const PREBAKED_VERSION: u32 = 1;
+const PREBAKED_VERSION: u32 = 2;
 
-pub fn serialize_prebaked(meshes: &PrebakedMeshes) -> io::Result<Vec<u8>> {
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serialize_prebaked(meshes: &PrebakedMeshes, world_hash: u64) -> io::Result<Vec<u8>> {
     let entries: Vec<(u64, PrebakedEntry)> = meshes
         .iter()
         .map(|(&id, entry)| (id, entry.clone()))
         .collect();
     let file = PrebakedFile {
         version: PREBAKED_VERSION,
+        world_hash,
         entries,
     };
     let raw = bincode::serialize(&file)
@@ -329,14 +339,15 @@ pub fn serialize_prebaked(meshes: &PrebakedMeshes) -> io::Result<Vec<u8>> {
     compress_zstd(&raw)
 }
 
-pub fn write_prebaked_file(path: &Path, meshes: &PrebakedMeshes) -> io::Result<()> {
-    let data = serialize_prebaked(meshes)?;
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_prebaked_file(path: &Path, meshes: &PrebakedMeshes, world_hash: u64) -> io::Result<()> {
+    let data = serialize_prebaked(meshes, world_hash)?;
     let mut f = std::fs::File::create(path)?;
     f.write_all(&data)?;
     Ok(())
 }
 
-pub fn deserialize_prebaked(data: &[u8]) -> io::Result<PrebakedMeshes> {
+pub fn deserialize_prebaked(data: &[u8], expected_world_hash: u64) -> io::Result<PrebakedMeshes> {
     let raw = decompress_zstd(data)?;
     let file: PrebakedFile = bincode::deserialize(&raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -346,12 +357,21 @@ pub fn deserialize_prebaked(data: &[u8]) -> io::Result<PrebakedMeshes> {
             format!("unsupported prebaked version: {}", file.version),
         ));
     }
+    if file.world_hash != expected_world_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stale prebaked meshes: world_hash={:#x} expected={:#x}. Regenerate with `cargo run --bin gen_world`",
+                file.world_hash, expected_world_hash,
+            ),
+        ));
+    }
     Ok(file.entries.into_iter().collect())
 }
 
-pub fn read_prebaked_file(path: &Path) -> io::Result<PrebakedMeshes> {
+pub fn read_prebaked_file(path: &Path, expected_world_hash: u64) -> io::Result<PrebakedMeshes> {
     let data = std::fs::read(path)?;
-    deserialize_prebaked(&data)
+    deserialize_prebaked(&data, expected_world_hash)
 }
 
 // --------------------------------------------------- indexed format
@@ -372,6 +392,7 @@ struct MeshIndex {
 }
 
 /// Write prebaked meshes as indexed meshes.idx + meshes.bin.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write_prebaked_indexed(
     idx_path: &Path,
     bin_path: &Path,
@@ -403,10 +424,12 @@ pub fn write_prebaked_indexed(
 }
 
 /// Loaded index: NodeId → (offset, length) in meshes.bin.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct MeshIndexMap {
     map: std::collections::HashMap<NodeId, (u64, u32)>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl MeshIndexMap {
     pub fn load(idx_path: &Path) -> io::Result<Self> {
         let data = std::fs::read(idx_path)?;
@@ -432,6 +455,7 @@ impl MeshIndexMap {
 }
 
 /// Read a single entry from meshes.bin by offset + length.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn read_mesh_entry(
     file: &mut std::fs::File,
     offset: u64,

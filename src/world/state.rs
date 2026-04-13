@@ -231,29 +231,12 @@ impl WorldState {
         air_tower: &[NodeId],
         solid_tower: &[NodeId],
     ) -> NodeId {
-        // At layers 0–8 use smooth sphere checks (no noise margin).
-        // Terrain features are smaller than a layer-8 cell (3125
-        // voxels) so they don't affect coarse-layer classification.
-        // The downsample from layer-9 children propagates terrain
-        // into layer-8 voxels automatically.
-        let use_terrain = layer >= 9 && params.terrain.is_some();
-        let amp = if use_terrain { MAX_TERRAIN_AMPLITUDE as i64 } else { 0 };
+        // Always use terrain-aware radius for the outside check so
+        // nodes where terrain noise pushes the surface outward aren't
+        // incorrectly classified as all-air.
+        let amp = if params.terrain.is_some() { MAX_TERRAIN_AMPLITUDE as i64 } else { 0 };
 
-        // Build a smooth-sphere SphereParams for coarse-layer AABB
-        // checks (no terrain margin inflates the outer radius).
-        let check_params = if use_terrain {
-            params
-        } else {
-            // For layers 0–8 we need a no-terrain version for the
-            // outside check. Build one on the stack — cheap, no alloc.
-            &SphereParams {
-                center: params.center,
-                radius: params.radius,
-                terrain: None,
-            }
-        };
-
-        if aabb_outside_sphere(origin, extent, check_params) {
+        if aabb_outside_sphere(origin, extent, params) {
             return air_tower[layer as usize];
         }
         if aabb_inside_sphere(

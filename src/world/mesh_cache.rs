@@ -204,7 +204,8 @@ pub fn prebake_node_raw(world: &WorldState, node_id: NodeId) -> Vec<(u8, FaceDat
 
 // -------------------------------------------------------- mesh store
 
-use super::mesh_stream::MeshStreamer;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::world::mesh_stream::MeshStreamer;
 
 /// Manages the mesh bake cache, async streaming, and parent-fallback.
 ///
@@ -221,9 +222,13 @@ pub struct MeshStore {
     baked: HashMap<NodeId, BakedNode>,
     /// Path→NodeId tracking for incremental baking.
     path_node: HashMap<super::walk::SmallPath, NodeId>,
-    /// Async mesh streamer (I/O thread + index).
+    /// Monolithic prebaked mesh map loaded at startup.
+    prebaked: Option<super::serial::PrebakedMeshes>,
+    /// Native: async mesh streamer (I/O thread + index).
+    #[cfg(not(target_arch = "wasm32"))]
     streamer: Option<MeshStreamer>,
     loaded: bool,
+    diag_frame: u32,
 }
 
 impl Default for MeshStore {
@@ -231,25 +236,31 @@ impl Default for MeshStore {
         Self {
             baked: HashMap::new(),
             path_node: HashMap::new(),
+            prebaked: None,
+            #[cfg(not(target_arch = "wasm32"))]
             streamer: None,
             loaded: false,
+            diag_frame: 0,
         }
     }
 }
 
 impl MeshStore {
-    /// Start the async mesh streamer on first call.
-    pub fn ensure_loaded(&mut self) {
+    /// Load prebaked meshes on first call.
+    /// Native: starts the async I/O thread with indexed format.
+    /// WASM: loads the monolithic meshes.bin into memory.
+    pub fn ensure_loaded(&mut self, world_hash: u64) {
         if self.loaded { return; }
         self.loaded = true;
-        let idx_path = std::path::Path::new("assets/meshes.idx");
-        let bin_path = std::path::Path::new("assets/meshes.bin");
-        match MeshStreamer::start(idx_path, bin_path) {
-            Ok(streamer) => {
-                self.streamer = Some(streamer);
+
+        let path = std::path::Path::new("assets/meshes_mono.bin");
+        match super::serial::read_prebaked_file(path, world_hash) {
+            Ok(prebaked) => {
+                eprintln!("loaded prebaked meshes: {} entries", prebaked.len());
+                self.prebaked = Some(prebaked);
             }
             Err(e) => {
-                eprintln!("no mesh streamer ({}), will cold bake", e);
+                eprintln!("no prebaked meshes ({}), will cold bake", e);
             }
         }
     }
@@ -257,17 +268,20 @@ impl MeshStore {
     /// Drain completed async mesh loads into the bake cache.
     /// Call once per frame, before the bake pass.
     pub fn receive_async_meshes(&mut self, meshes: &mut Assets<Mesh>) {
-        let Some(streamer) = self.streamer.as_mut() else { return };
-        for resp in streamer.drain_responses() {
-            if self.baked.contains_key(&resp.node_id) { continue; }
-            let merged: Vec<BakedSubMesh> = resp.entry
-                .into_iter()
-                .map(|(voxel, data)| BakedSubMesh {
-                    mesh: meshes.add(data.build()),
-                    voxel,
-                })
-                .collect();
-            self.baked.insert(resp.node_id, BakedNode::from_prebaked(merged));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(streamer) = self.streamer.as_mut() else { return };
+            for resp in streamer.drain_responses() {
+                if self.baked.contains_key(&resp.node_id) { continue; }
+                let merged: Vec<BakedSubMesh> = resp.entry
+                    .into_iter()
+                    .map(|(voxel, data)| BakedSubMesh {
+                        mesh: meshes.add(data.build()),
+                        voxel,
+                    })
+                    .collect();
+                self.baked.insert(resp.node_id, BakedNode::from_prebaked(merged));
+            }
         }
     }
 
@@ -306,26 +320,43 @@ impl MeshStore {
             return true;
         }
 
-        // Try loading from the prebaked index. For visible nodes we
-        // load synchronously (must render this frame).
-        if let Some(streamer) = self.streamer.as_ref() {
-            if let Some(entry) = streamer.load_sync(node_id) {
-                let merged: Vec<BakedSubMesh> = entry
-                    .into_iter()
-                    .map(|(voxel, data)| BakedSubMesh {
-                        mesh: meshes.add(data.build()),
-                        voxel,
-                    })
-                    .collect();
-                self.baked.insert(node_id, BakedNode::from_prebaked(merged));
-                return true;
+        self.diag_frame += 1;
+        if self.diag_frame <= 500 {
+            eprintln!("ENSURE_BAKED[{}]: node {} not in cache, attempting load", self.diag_frame, node_id);
+        }
+
+        // Monolithic prebaked loader — no budget cap, loads instantly.
+        let prebaked_entry = self.prebaked.as_mut()
+            .and_then(|p| p.remove(&node_id));
+        if let Some(entry) = prebaked_entry {
+            let n = entry.len();
+            let merged: Vec<BakedSubMesh> = entry
+                .into_iter()
+                .map(|(voxel, data)| BakedSubMesh {
+                    mesh: meshes.add(data.build()),
+                    voxel,
+                })
+                .collect();
+            if self.diag_frame <= 500 {
+                eprintln!("ENSURE_BAKED[{}]: node {} loaded OK ({} submeshes)", self.diag_frame, node_id, n);
             }
+            self.baked.insert(node_id, BakedNode::from_prebaked(merged));
+            return true;
+        }
+
+        if self.diag_frame <= 500 {
+            eprintln!("ENSURE_BAKED[{}]: node {} prebaked=None, falling to cold bake", self.diag_frame, node_id);
         }
 
         // No prebaked entry — cold/incremental bake (budget-limited).
         let node = world.library.get(node_id).expect("mesh_cache: node missing");
         if node.children.is_some() {
-            if *cold_bakes >= max_cold_bakes { return false; }
+            if *cold_bakes >= max_cold_bakes {
+                if self.diag_frame <= 500 {
+                    eprintln!("ENSURE_BAKED[{}]: node {} BUDGET EXCEEDED ({}/{})", self.diag_frame, node_id, cold_bakes, max_cold_bakes);
+                }
+                return false;
+            }
             let baked = if let Some(old_nid) = self.get_path_node(path) {
                 if let Some(old_bake) = self.baked.get(&old_nid) {
                     if old_bake.has_intermediate_data() {
@@ -342,11 +373,17 @@ impl MeshStore {
                 *cold_bakes += 1;
                 BakedNode::new_cold(world, node_id, meshes)
             };
+            if self.diag_frame <= 500 {
+                eprintln!("ENSURE_BAKED[{}]: node {} cold-baked non-leaf ({} submeshes)", self.diag_frame, node_id, baked.merged.len());
+            }
             self.baked.insert(node_id, baked);
         } else {
             if *cold_bakes >= max_cold_bakes { return false; }
             *cold_bakes += 1;
             let merged = bake_leaf(world, node_id, meshes);
+            if self.diag_frame <= 500 {
+                eprintln!("ENSURE_BAKED[{}]: node {} cold-baked leaf ({} submeshes)", self.diag_frame, node_id, merged.len());
+            }
             self.baked.insert(node_id, BakedNode::from_prebaked(merged));
         }
         true
@@ -354,15 +391,25 @@ impl MeshStore {
 
     /// Request async prefetch for a node (non-blocking). Used for
     /// nodes not yet visible but likely to be needed soon.
-    pub fn prefetch(&mut self, node_id: NodeId, priority: u32) {
-        if self.baked.contains_key(&node_id) { return; }
-        if let Some(streamer) = self.streamer.as_mut() {
-            streamer.request(node_id, priority);
+    /// No-op on WASM (all meshes are in memory already).
+    pub fn prefetch(&mut self, _node_id: NodeId, _priority: u32) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.baked.contains_key(&_node_id) { return; }
+            if let Some(streamer) = self.streamer.as_mut() {
+                streamer.request(_node_id, _priority);
+            }
         }
     }
 
     /// Clear entity tracking (on zoom change). Keeps baked mesh data.
     pub fn clear_paths(&mut self) {
+        self.path_node.clear();
+    }
+
+    /// Clear everything (on zoom change). Forces fresh bake of all nodes.
+    pub fn clear_all(&mut self) {
+        self.baked.clear();
         self.path_node.clear();
     }
 }

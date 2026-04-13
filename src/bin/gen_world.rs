@@ -13,7 +13,8 @@ use std::time::Instant;
 
 use deepspace_game::world::mesh_cache::prebake_node_raw;
 use deepspace_game::world::serial::{
-    write_prebaked_indexed, write_world_file, PrebakedMeshes,
+    canned_world_hash, write_prebaked_file, write_prebaked_indexed,
+    write_world_file, PrebakedMeshes,
 };
 use deepspace_game::world::state::WorldState;
 use deepspace_game::world::tree::EMPTY_NODE;
@@ -42,10 +43,12 @@ fn main() {
     let world_size = std::fs::metadata(&world_path)
         .map(|m| m.len())
         .unwrap_or(0);
+    let whash = canned_world_hash(world.root, world.library.next_id(), world.library.len());
     eprintln!(
-        "  wrote {} ({:.1} KB)",
+        "  wrote {} ({:.1} KB), world_hash={:#x}",
         world_path.display(),
         world_size as f64 / 1024.0,
+        whash,
     );
 
     // Prebake meshes for every node in the library.
@@ -86,6 +89,14 @@ fn main() {
         idx_path.display(), idx_size as f64 / 1024.0,
         meshes_path.display(), meshes_size as f64 / 1024.0,
     );
+
+    // Write monolithic format (loaded at startup).
+    let mono_path = PathBuf::from("assets/meshes_mono.bin");
+    eprintln!("writing {}...", mono_path.display());
+    write_prebaked_file(&mono_path, &prebaked, whash)
+        .expect("failed to write monolithic meshes");
+    let mono_size = std::fs::metadata(&mono_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!("  wrote {} ({:.1} KB)", mono_path.display(), mono_size as f64 / 1024.0);
 
     eprintln!(
         "done in {:.1}s total",

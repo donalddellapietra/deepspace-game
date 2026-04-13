@@ -13,6 +13,7 @@
 /assets/world.bin
 /assets/meshes.bin
 /assets/meshes.idx
+/assets/meshes_mono.bin
 
 # Save files
 /saves/

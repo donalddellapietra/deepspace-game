@@ -120,7 +120,7 @@ pub fn render_world(
     let render_total_start = bevy::platform::time::Instant::now();
 
     // Load prebaked meshes on first frame.
-    render_state.mesh_store.ensure_loaded();
+    render_state.mesh_store.ensure_loaded(world.canned_world_hash);
 
     let target_layer = target_layer_for(zoom.layer);
     let emit_layer = target_layer.saturating_sub(1);
@@ -190,6 +190,26 @@ pub fn render_world(
             .count();
     }
 
+    // One-time dump: every visit origin at layer 11.
+    {
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if zoom.layer <= 11 && visits.len() > 20
+            && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut origins: Vec<(i32,i32,i32,u64,usize)> = visits.iter().map(|v| {
+                let submeshes = render_state.mesh_store.get_merged(v.node_id)
+                    .map(|m| m.len()).unwrap_or(0);
+                (v.origin.x as i32, v.origin.y as i32, v.origin.z as i32, v.node_id, submeshes)
+            }).collect();
+            origins.sort();
+            eprintln!("=== VISIT GRID (zoom={}, {} visits) ===", zoom.layer, origins.len());
+            for (x,y,z,nid,sm) in &origins {
+                eprintln!("  ({:>6},{:>6},{:>6}) node={} submeshes={}", x, y, z, nid, sm);
+            }
+            eprintln!("=== END VISIT GRID ===");
+        }
+    }
+
     // Reconcile: spawn/update/despawn entities.
     let reconcile_start = bevy::platform::time::Instant::now();
     let mut alive: HashMap<SmallPath, (Entity, NodeId, Vec3)> =
@@ -220,8 +240,21 @@ pub fn render_world(
                     }
                 }
 
-                let baked = render_state.mesh_store.get_merged(new_node_id)
-                    .unwrap_or(&[]);
+                let baked_opt = render_state.mesh_store.get_merged(new_node_id);
+                if baked_opt.is_none() {
+                    eprintln!("HOLE_BUG: node {} at ({:.0},{:.0},{:.0}) scale={:.1} has NO baked mesh",
+                        new_node_id, visit.origin.x, visit.origin.y, visit.origin.z, visit.scale);
+                } else if baked_opt.map(|b| b.is_empty()).unwrap_or(false) {
+                    // Check if node voxels have solid content
+                    let has_solid = world.library.get(new_node_id)
+                        .map(|n| n.voxels.iter().any(|&v| v != 0))
+                        .unwrap_or(false);
+                    if has_solid {
+                        eprintln!("HOLE_BUG: node {} at ({:.0},{:.0},{:.0}) has SOLID voxels but 0 submeshes!",
+                            new_node_id, visit.origin.x, visit.origin.y, visit.origin.z);
+                    }
+                }
+                let baked = baked_opt.unwrap_or(&[]);
 
                 let parent = commands
                     .spawn((
@@ -234,6 +267,7 @@ pub fn render_world(
 
                 for sub in baked {
                     let Some(mat) = palette.material(sub.voxel) else {
+                        eprintln!("PALETTE_MISS: node {} voxel {} has no material!", new_node_id, sub.voxel);
                         continue;
                     };
                     commands.spawn((

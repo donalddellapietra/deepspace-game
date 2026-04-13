@@ -104,7 +104,7 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> bool>(
 
 /// Raw face data for one voxel type, before conversion to a Mesh.
 /// Stored per-child so edits only re-bake the affected child.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FaceData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
@@ -191,17 +191,10 @@ impl From<CompactFaceData> for FaceData {
     }
 }
 
-impl serde::Serialize for FaceData {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        CompactFaceData::from(self).serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for FaceData {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        CompactFaceData::deserialize(deserializer).map(FaceData::from)
-    }
-}
+// Compact serialization disabled — using raw f32 derive.
+// Re-enable once the sphere holes bug is fixed.
+// impl serde::Serialize for FaceData { ... }
+// impl<'de> serde::Deserialize<'de> for FaceData { ... }
 
 impl FaceData {
     fn add_quad(&mut self, quad: &[Vec3; 4], normal: Vec3, offset: Vec3, ao: [u8; 4]) {

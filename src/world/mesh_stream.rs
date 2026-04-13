@@ -99,10 +99,21 @@ impl MeshStreamer {
     /// file handle so it doesn't conflict with the I/O thread.
     pub fn load_sync(&self, node_id: NodeId) -> Option<PrebakedEntry> {
         let (offset, len) = self.index.get(node_id)?;
-        // Open a fresh handle — the I/O thread owns the main one.
         let bin_path = std::path::Path::new("assets/meshes.bin");
-        let mut file = std::fs::File::open(bin_path).ok()?;
-        super::serial::read_mesh_entry(&mut file, offset, len).ok()
+        let mut file = match std::fs::File::open(bin_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("SYNC_LOAD: failed to open meshes.bin: {}", e);
+                return None;
+            }
+        };
+        match super::serial::read_mesh_entry(&mut file, offset, len) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                eprintln!("SYNC_LOAD: failed to read node {} (offset={}, len={}): {}", node_id, offset, len, e);
+                None
+            }
+        }
     }
 
     /// Drain all completed responses from the I/O thread.
