@@ -97,4 +97,16 @@ The math:
 
 At layer 12: 0.6m = 0.6 Bevy units per slice → invisible. Only appears when zoomed out.
 
-**Fix:** Increase `aerial_view_lut_max_distance` proportionally so depth slices stay small in Bevy-space, AND/OR increase `aerial_view_lut_size.z` (depth resolution) at lower layers.
+**Attempted fixes (all failed):**
+
+1. **Increase `aerial_view_lut_size.z` dynamically** — The needed slices scale with `cell`, which is 15625 at layer 6. Even capped at 256 slices, each still covers thousands of Bevy units. Impossible to fix within the LUT architecture when the Bevy-space view distance is 500k units.
+
+2. **Floor `scene_units_to_m` at 0.01** — Doesn't help: the ratio view_radius/slices in Bevy-space is the fundamental problem, not the meter conversion.
+
+3. **Set `scene_units_to_m = 1.0` always** — Same problem: view_radius at layer 6 is 500k Bevy units, 32 slices → 15625 BU/slice regardless of meter scaling.
+
+4. **Cap `aerial_view_lut_max_distance` to 100m** — Restricts aerial perspective to near-camera, but same banding visible within that range since cell multiplier still applies.
+
+**Root cause is architectural:** The renderer scales Bevy-space coordinates by `5^(MAX_LAYER - layer)` per zoom level. At layer 6, meshes span 500k Bevy units. Bevy's atmosphere (and all post-processing that uses screen depth) sees these as real coordinates, and any depth-sliced LUT will band because the ratio of scene extent to LUT resolution is unbounded.
+
+**The real fix (Option F):** Normalize all rendered geometry to a fixed Bevy-space range regardless of zoom layer. Instead of scaling `Transform` by `5^(MAX_LAYER-layer)`, keep all node meshes at scale 1.0 and adjust the camera/viewport. From Bevy's perspective, every layer should look geometrically identical — same coordinate range, same distances, same atmosphere parameters. The zoom effect comes from what voxel data is shown, not from coordinate scaling.
