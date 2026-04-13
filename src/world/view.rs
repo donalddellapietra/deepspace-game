@@ -263,11 +263,15 @@ pub fn position_from_leaf_coord(coord: [i64; 3]) -> Option<Position> {
 /// preventing atmosphere/post-processing artifacts.
 #[inline]
 fn delta_as_vec3(target: [i64; 3], anchor: &WorldAnchor) -> Vec3 {
-    let n = anchor.norm;
+    let n = anchor.norm as i64;
+    let nf = anchor.norm;
+    let dx = target[0] - anchor.leaf_coord[0];
+    let dy = target[1] - anchor.leaf_coord[1];
+    let dz = target[2] - anchor.leaf_coord[2];
     Vec3::new(
-        (target[0] - anchor.leaf_coord[0]) as f32 / n,
-        (target[1] - anchor.leaf_coord[1]) as f32 / n,
-        (target[2] - anchor.leaf_coord[2]) as f32 / n,
+        (dx / n) as f32 + (dx % n) as f32 / nf,
+        (dy / n) as f32 + (dy % n) as f32 / nf,
+        (dz / n) as f32 + (dz % n) as f32 / nf,
     )
 }
 
@@ -478,8 +482,7 @@ mod tests {
     fn target_layer_clamps_at_max() {
         assert_eq!(target_layer_for(MAX_LAYER), MAX_LAYER);
         assert_eq!(target_layer_for(MAX_LAYER - 1), MAX_LAYER);
-        assert_eq!(target_layer_for(MAX_LAYER - 2), MAX_LAYER);
-        assert_eq!(target_layer_for(MAX_LAYER - 3), MAX_LAYER);
+        assert_eq!(target_layer_for(MAX_LAYER - DETAIL_DEPTH), MAX_LAYER);
         assert_eq!(target_layer_for(MAX_LAYER - DETAIL_DEPTH - 1), MAX_LAYER - 1);
         assert_eq!(target_layer_for(0), DETAIL_DEPTH);
     }

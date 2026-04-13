@@ -12,7 +12,7 @@ use super::tree::{
     slot_coords, NodeId, BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE,
     MAX_LAYER,
 };
-use super::view::{extent_for_layer, WorldAnchor};
+use super::view::{extent_for_layer, scale_for_layer, WorldAnchor};
 
 // ----------------------------------------------------------- SmallPath
 
@@ -78,10 +78,7 @@ pub struct WalkFrame {
 pub fn walk(
     world: &super::state::WorldState,
     emit_layer: u8,
-    compose_scale: f32,
-    flatten_scale: f32,
-    use_composition: bool,
-    fine_radius_sq: f32,
+    target_layer: u8,
     camera_pos: Vec3,
     radius_bevy: f32,
     anchor: &WorldAnchor,
@@ -117,13 +114,12 @@ pub fn walk(
     while let Some(frame) = stack.pop() {
         let WalkFrame { node_id, path, origin_leaves, depth } = frame;
 
-        let n = anchor.norm;
         let origin_bevy = Vec3::new(
-            (origin_leaves[0] - anchor.leaf_coord[0]) as f32 / n,
-            (origin_leaves[1] - anchor.leaf_coord[1]) as f32 / n,
-            (origin_leaves[2] - anchor.leaf_coord[2]) as f32 / n,
+            (origin_leaves[0] - anchor.leaf_coord[0]) as f32,
+            (origin_leaves[1] - anchor.leaf_coord[1]) as f32,
+            (origin_leaves[2] - anchor.leaf_coord[2]) as f32,
         );
-        let extent = extent_for_layer(depth) / n;
+        let extent = extent_for_layer(depth);
         let aabb_min = origin_bevy;
         let aabb_max = origin_bevy + Vec3::splat(extent);
 
@@ -142,13 +138,12 @@ pub fn walk(
         }
 
         if depth == emit_layer {
-            let compose = use_composition && min_dist_sq <= fine_radius_sq;
             out.push(Visit {
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: if compose { compose_scale } else { flatten_scale },
-                compose,
+                scale: scale_for_layer(target_layer),
+                compose: false,
             });
             continue;
         }
@@ -159,7 +154,7 @@ pub fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: flatten_scale,
+                scale: scale_for_layer(depth),
                 compose: false,
             });
             continue;
@@ -206,12 +201,10 @@ mod tests {
         let target = target_layer_for(view_layer);
         let emit = target.saturating_sub(1);
         let radius = RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer);
-        let compose_scale = scale_for_layer(target);
-        let flatten_scale = scale_for_layer((emit + 1).min(MAX_LAYER));
         let mut stack = Vec::new();
         let mut visits = Vec::new();
         walk(
-            world, emit, compose_scale, flatten_scale, false, 0.0,
+            world, emit, target,
             Vec3::ZERO, radius, &anchor_origin(),
             &mut stack, &mut visits,
         );

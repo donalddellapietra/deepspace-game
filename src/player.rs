@@ -213,9 +213,9 @@ pub fn sync_anchor_to_player(
     if let Ok(pos) = player_q.single() {
         anchor.leaf_coord = position_to_leaf_coord(&pos.0);
     }
-    // Normalize by (view + 1), not the target layer, so Bevy-space
-    // coordinates stay bounded (~800 units) regardless of DETAIL_DEPTH.
-    anchor.norm = norm_for_layer(zoom.layer);
+    // Normalization disabled — raw leaf-voxel coordinates avoid tile
+    // boundary seams. Re-enable when LOD composition is implemented.
+    anchor.norm = 1.0;
 }
 
 /// Derive every entity's `Transform.translation` from its

@@ -16,8 +16,8 @@ use crate::model::BakedSubMesh;
 
 use super::mesh_cache::MeshStore;
 use super::state::WorldState;
-use super::tree::{NodeId, DETAIL_DEPTH, MAX_LAYER};
-use super::view::{scale_for_layer, target_layer_for, WorldAnchor};
+use super::tree::{NodeId, MAX_LAYER};
+use super::view::{cell_size_at_layer, target_layer_for, WorldAnchor};
 use super::walk::{walk, SmallPath, Visit, WalkFrame};
 
 // ------------------------------------------------------- markers
@@ -112,16 +112,8 @@ pub fn render_world(
     render_state.mesh_store.ensure_loaded(world.canned_world_hash);
 
     let target_layer = target_layer_for(zoom.layer);
-    // No LOD cascade for now — all entities use flattened meshes.
-    let use_composition = false;
     let emit_layer = target_layer.saturating_sub(1);
-
-    let cell = anchor.cell_bevy(zoom.layer);
-    let radius_bevy = RADIUS_VIEW_CELLS * cell;
-    let fine_radius_sq = 0.0f32; // composition disabled
-
-    let flatten_scale = scale_for_layer((emit_layer + 1).min(MAX_LAYER)) / anchor.norm;
-    let compose_scale = flatten_scale; // unused, same value to avoid issues
+    let radius_bevy = RADIUS_VIEW_CELLS * cell_size_at_layer(zoom.layer);
 
     // On zoom change, drop entities and clear caches.
     if !render_state.initialised
@@ -148,8 +140,7 @@ pub fn render_world(
     let mut walk_stack = std::mem::take(&mut render_state.walk_stack);
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
-        &world, emit_layer,
-        compose_scale, flatten_scale, use_composition, fine_radius_sq,
+        &world, emit_layer, target_layer,
         camera_pos, radius_bevy, &anchor,
         &mut walk_stack, &mut visits,
     );
@@ -262,20 +253,10 @@ pub fn render_world(
         ];
         for pf_layer in prefetch_layers.into_iter().flatten() {
             let pf_target = target_layer_for(pf_layer);
-            let pf_use_comp = pf_layer + DETAIL_DEPTH <= MAX_LAYER;
-            let pf_emit = if pf_use_comp {
-                pf_target.saturating_sub(2)
-            } else {
-                pf_target.saturating_sub(1)
-            };
-            let pf_cell = anchor.cell_bevy(pf_layer);
-            let pf_radius = RADIUS_VIEW_CELLS * pf_cell;
-            let pf_fine_sq = (FINE_RADIUS_VIEW_CELLS * pf_cell).powi(2);
-            let pf_compose_scale = scale_for_layer(pf_target) / anchor.norm;
-            let pf_flatten_scale = scale_for_layer((pf_emit + 1).min(MAX_LAYER)) / anchor.norm;
+            let pf_emit = pf_target.saturating_sub(1);
+            let pf_radius = RADIUS_VIEW_CELLS * cell_size_at_layer(pf_layer);
             walk(
-                &world, pf_emit,
-                pf_compose_scale, pf_flatten_scale, pf_use_comp, pf_fine_sq,
+                &world, pf_emit, pf_target,
                 camera_pos, pf_radius, &anchor,
                 &mut walk_stack, &mut visits,
             );
