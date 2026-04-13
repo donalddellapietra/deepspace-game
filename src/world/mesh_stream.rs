@@ -8,8 +8,8 @@
 //! The renderer never blocks on I/O. If a mesh isn't ready yet, the
 //! parent's coarser mesh stays visible (parent-fallback rendering).
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::thread;
 
@@ -40,8 +40,10 @@ pub struct MeshStreamer {
     response_rx: Mutex<mpsc::Receiver<MeshResponse>>,
     /// The index: NodeId → (offset, len) in meshes.bin.
     index: MeshIndexMap,
+    /// Path to meshes.bin for sync loads.
+    bin_path: PathBuf,
     /// Track which nodes have been requested (avoid duplicate requests).
-    in_flight: HashMap<NodeId, ()>,
+    in_flight: HashSet<NodeId>,
 }
 
 impl MeshStreamer {
@@ -54,31 +56,33 @@ impl MeshStreamer {
         let (request_tx, request_rx) = mpsc::channel::<MeshRequest>();
         let (response_tx, response_rx) = mpsc::channel::<MeshResponse>();
 
-        let bin_path = bin_path.to_path_buf();
+        let bin_path_owned = bin_path.to_path_buf();
+        let bin_path_sync = bin_path.to_path_buf();
         thread::Builder::new()
             .name("mesh-io".into())
             .spawn(move || {
-                io_thread(bin_path, request_rx, response_tx);
+                io_thread(bin_path_owned, request_rx, response_tx);
             })?;
 
         Ok(Self {
             request_tx,
             response_rx: Mutex::new(response_rx),
             index,
-            in_flight: HashMap::new(),
+            bin_path: bin_path_sync,
+            in_flight: HashSet::new(),
         })
     }
 
     /// Request a mesh for a node. No-op if already in-flight or if the
     /// node isn't in the index. `priority`: lower = closer to camera.
     pub fn request(&mut self, node_id: NodeId, priority: u32) {
-        if self.in_flight.contains_key(&node_id) {
+        if self.in_flight.contains(&node_id) {
             return;
         }
         let Some((offset, len)) = self.index.get(node_id) else {
             return;
         };
-        self.in_flight.insert(node_id, ());
+        self.in_flight.insert(node_id);
         // If the channel is full (thread busy), the request is dropped.
         // The renderer will re-request next frame.
         let _ = self.request_tx.send(MeshRequest {
@@ -99,8 +103,7 @@ impl MeshStreamer {
     /// file handle so it doesn't conflict with the I/O thread.
     pub fn load_sync(&self, node_id: NodeId) -> Option<PrebakedEntry> {
         let (offset, len) = self.index.get(node_id)?;
-        let bin_path = std::path::Path::new("assets/meshes.bin");
-        let mut file = match std::fs::File::open(bin_path) {
+        let mut file = match std::fs::File::open(&self.bin_path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("SYNC_LOAD: failed to open meshes.bin: {}", e);

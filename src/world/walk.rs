@@ -35,6 +35,7 @@ impl SmallPath {
     }
 
     pub fn push(&self, slot: u8) -> Self {
+        debug_assert!((self.depth as usize) < MAX_LAYER as usize, "SmallPath overflow");
         let mut out = *self;
         out.slots[out.depth as usize] = slot;
         out.depth += 1;

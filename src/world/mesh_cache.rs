@@ -222,13 +222,10 @@ pub struct MeshStore {
     baked: HashMap<NodeId, BakedNode>,
     /// Path→NodeId tracking for incremental baking.
     path_node: HashMap<super::walk::SmallPath, NodeId>,
-    /// Monolithic prebaked mesh map loaded at startup.
-    prebaked: Option<super::serial::PrebakedMeshes>,
     /// Native: async mesh streamer (I/O thread + index).
     #[cfg(not(target_arch = "wasm32"))]
     streamer: Option<MeshStreamer>,
     loaded: bool,
-    diag_frame: u32,
 }
 
 impl Default for MeshStore {
@@ -236,11 +233,9 @@ impl Default for MeshStore {
         Self {
             baked: HashMap::new(),
             path_node: HashMap::new(),
-            prebaked: None,
             #[cfg(not(target_arch = "wasm32"))]
             streamer: None,
             loaded: false,
-            diag_frame: 0,
         }
     }
 }
@@ -323,15 +318,9 @@ impl MeshStore {
         meshes: &mut Assets<Mesh>,
         cold_bakes: &mut usize,
         max_cold_bakes: usize,
-        distance_priority: u32,
     ) -> bool {
         if self.baked.contains_key(&node_id) {
             return true;
-        }
-
-        self.diag_frame += 1;
-        if self.diag_frame <= 500 {
-            eprintln!("ENSURE_BAKED[{}]: node {} not in cache, attempting load", self.diag_frame, node_id);
         }
 
         // Try prebaked: native uses streamer sync load, WASM cold bakes.
@@ -347,7 +336,6 @@ impl MeshStore {
             }
         };
         if let Some(entry) = prebaked_entry {
-            let n = entry.len();
             let merged: Vec<BakedSubMesh> = entry
                 .into_iter()
                 .map(|(voxel, data)| BakedSubMesh {
@@ -355,26 +343,14 @@ impl MeshStore {
                     voxel,
                 })
                 .collect();
-            if self.diag_frame <= 500 {
-                eprintln!("ENSURE_BAKED[{}]: node {} loaded OK ({} submeshes)", self.diag_frame, node_id, n);
-            }
             self.baked.insert(node_id, BakedNode::from_prebaked(merged));
             return true;
-        }
-
-        if self.diag_frame <= 500 {
-            eprintln!("ENSURE_BAKED[{}]: node {} prebaked=None, falling to cold bake", self.diag_frame, node_id);
         }
 
         // No prebaked entry — cold/incremental bake (budget-limited).
         let node = world.library.get(node_id).expect("mesh_cache: node missing");
         if node.children.is_some() {
-            if *cold_bakes >= max_cold_bakes {
-                if self.diag_frame <= 500 {
-                    eprintln!("ENSURE_BAKED[{}]: node {} BUDGET EXCEEDED ({}/{})", self.diag_frame, node_id, cold_bakes, max_cold_bakes);
-                }
-                return false;
-            }
+            if *cold_bakes >= max_cold_bakes { return false; }
             let baked = if let Some(old_nid) = self.get_path_node(path) {
                 if let Some(old_bake) = self.baked.get(&old_nid) {
                     if old_bake.has_intermediate_data() {
@@ -391,17 +367,11 @@ impl MeshStore {
                 *cold_bakes += 1;
                 BakedNode::new_cold(world, node_id, meshes)
             };
-            if self.diag_frame <= 500 {
-                eprintln!("ENSURE_BAKED[{}]: node {} cold-baked non-leaf ({} submeshes)", self.diag_frame, node_id, baked.merged.len());
-            }
             self.baked.insert(node_id, baked);
         } else {
             if *cold_bakes >= max_cold_bakes { return false; }
             *cold_bakes += 1;
             let merged = bake_leaf(world, node_id, meshes);
-            if self.diag_frame <= 500 {
-                eprintln!("ENSURE_BAKED[{}]: node {} cold-baked leaf ({} submeshes)", self.diag_frame, node_id, merged.len());
-            }
             self.baked.insert(node_id, BakedNode::from_prebaked(merged));
         }
         true

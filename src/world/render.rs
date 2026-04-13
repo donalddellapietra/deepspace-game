@@ -167,20 +167,15 @@ pub fn render_world(
         let bake_start = bevy::platform::time::Instant::now();
         let mut cold_bakes = 0usize;
         for v in visits.iter() {
-            let node = world.library.get(v.node_id)
-                .expect("render: node missing from library");
-
-            // Distance-based priority: closer nodes load first.
-            let dist = v.origin.distance(camera_pos);
-            let priority = (dist * 10.0) as u32;
-
             render_state.mesh_store.ensure_baked(
                 &world, v.node_id, &v.path, &mut meshes,
-                &mut cold_bakes, MAX_COLD_BAKES, priority,
+                &mut cold_bakes, MAX_COLD_BAKES,
             );
 
-            if node.children.is_some() {
-                render_state.mesh_store.set_path_node(v.path, v.node_id);
+            if let Some(node) = world.library.get(v.node_id) {
+                if node.children.is_some() {
+                    render_state.mesh_store.set_path_node(v.path, v.node_id);
+                }
             }
         }
         timings.bake_us = bake_start.elapsed().as_micros() as u64;
@@ -188,26 +183,6 @@ pub fn render_world(
         timings.unbaked = visits.iter()
             .filter(|v| !render_state.mesh_store.is_baked(v.node_id))
             .count();
-    }
-
-    // One-time dump: every visit origin at layer 11.
-    {
-        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if zoom.layer <= 11 && visits.len() > 20
-            && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            let mut origins: Vec<(i32,i32,i32,u64,usize)> = visits.iter().map(|v| {
-                let submeshes = render_state.mesh_store.get_merged(v.node_id)
-                    .map(|m| m.len()).unwrap_or(0);
-                (v.origin.x as i32, v.origin.y as i32, v.origin.z as i32, v.node_id, submeshes)
-            }).collect();
-            origins.sort();
-            eprintln!("=== VISIT GRID (zoom={}, {} visits) ===", zoom.layer, origins.len());
-            for (x,y,z,nid,sm) in &origins {
-                eprintln!("  ({:>6},{:>6},{:>6}) node={} submeshes={}", x, y, z, nid, sm);
-            }
-            eprintln!("=== END VISIT GRID ===");
-        }
     }
 
     // Reconcile: spawn/update/despawn entities.
@@ -240,21 +215,8 @@ pub fn render_world(
                     }
                 }
 
-                let baked_opt = render_state.mesh_store.get_merged(new_node_id);
-                if baked_opt.is_none() {
-                    eprintln!("HOLE_BUG: node {} at ({:.0},{:.0},{:.0}) scale={:.1} has NO baked mesh",
-                        new_node_id, visit.origin.x, visit.origin.y, visit.origin.z, visit.scale);
-                } else if baked_opt.map(|b| b.is_empty()).unwrap_or(false) {
-                    // Check if node voxels have solid content
-                    let has_solid = world.library.get(new_node_id)
-                        .map(|n| n.voxels.iter().any(|&v| v != 0))
-                        .unwrap_or(false);
-                    if has_solid {
-                        eprintln!("HOLE_BUG: node {} at ({:.0},{:.0},{:.0}) has SOLID voxels but 0 submeshes!",
-                            new_node_id, visit.origin.x, visit.origin.y, visit.origin.z);
-                    }
-                }
-                let baked = baked_opt.unwrap_or(&[]);
+                let baked = render_state.mesh_store.get_merged(new_node_id)
+                    .unwrap_or(&[]);
 
                 let parent = commands
                     .spawn((
@@ -267,7 +229,6 @@ pub fn render_world(
 
                 for sub in baked {
                     let Some(mat) = palette.material(sub.voxel) else {
-                        eprintln!("PALETTE_MISS: node {} voxel {} has no material!", new_node_id, sub.voxel);
                         continue;
                     };
                     commands.spawn((
