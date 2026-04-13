@@ -5,7 +5,7 @@
 use bevy::prelude::*;
 
 use crate::camera::{CursorLocked, ZoomTransition};
-use crate::interaction::TargetedBlock;
+use crate::interaction::{EntityEditMode, TargetedBlock};
 use crate::inventory::InventoryState;
 use crate::npc::{edit_npc_voxel, Npc, NpcPartOverrides, TreeBlueprint};
 use crate::player::{spawn_position, Player, Velocity};
@@ -151,6 +151,7 @@ pub fn remove_block(
     locked: Res<CursorLocked>,
     inv: Res<InventoryState>,
     save_mode: Res<super::save_mode::SaveMode>,
+    entity_edit: Res<EntityEditMode>,
     targeted: Res<TargetedBlock>,
     tree_bp: Option<Res<TreeBlueprint>>,
     mut world: ResMut<WorldState>,
@@ -180,6 +181,11 @@ pub fn remove_block(
         return;
     }
 
+    // In entity edit mode, don't fall through to terrain editing.
+    if entity_edit.active {
+        return;
+    }
+
     let Some(lp) = targeted.hit_layer_pos.as_ref() else {
         return;
     };
@@ -196,6 +202,7 @@ pub fn place_block(
     locked: Res<CursorLocked>,
     inv: Res<InventoryState>,
     save_mode: Res<super::save_mode::SaveMode>,
+    entity_edit: Res<EntityEditMode>,
     targeted: Res<TargetedBlock>,
     hotbar: Res<super::Hotbar>,
     saved: Res<SavedMeshes>,
@@ -228,6 +235,10 @@ pub fn place_block(
                 *voxel,
             );
         }
+        return;
+    }
+
+    if entity_edit.active {
         return;
     }
 

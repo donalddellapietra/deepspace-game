@@ -34,17 +34,42 @@ use crate::world::{CameraZoom, WorldState};
 /// 1 leaf voxel (L=12) or 625 leaf voxels (L=8).
 const MAX_REACH_CELLS: i32 = 16;
 
+/// When true, clicks target NPC overlay voxels instead of terrain.
+/// The world raycast is skipped and only overlay parts are checked.
+/// Toggle with G key.
+#[derive(Resource, Default)]
+pub struct EntityEditMode {
+    pub active: bool,
+}
+
 pub struct InteractionPlugin;
 
 impl Plugin for InteractionPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TargetedBlock>().add_systems(
-            Update,
-            (
-                update_target.after(crate::player::sync_anchor_to_player),
-                draw_highlight.after(crate::player::sync_anchor_to_player),
-            ),
-        );
+        app.init_resource::<TargetedBlock>()
+            .init_resource::<EntityEditMode>()
+            .add_systems(
+                Update,
+                (
+                    toggle_entity_edit_mode,
+                    update_target.after(crate::player::sync_anchor_to_player),
+                    draw_highlight.after(crate::player::sync_anchor_to_player),
+                ),
+            );
+    }
+}
+
+fn toggle_entity_edit_mode(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<EntityEditMode>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyG) {
+        mode.active = !mode.active;
+        if mode.active {
+            info!("Entity edit mode ON — clicks target NPC voxels");
+        } else {
+            info!("Entity edit mode OFF — normal terrain editing");
+        }
     }
 }
 
@@ -87,7 +112,7 @@ pub fn update_target(
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
     overlay_list: Res<OverlayList>,
-    keyboard: Res<ButtonInput<KeyCode>>,
+    entity_edit: Res<EntityEditMode>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut targeted: ResMut<TargetedBlock>,
 ) {
@@ -99,48 +124,25 @@ pub fn update_target(
     let origin = cam.translation();
     let dir = cam.forward().as_vec3();
 
-    // Debug: log raycast state on left/right click when NPCs exist.
     let debug = (mouse.just_pressed(MouseButton::Left)
         || mouse.just_pressed(MouseButton::Right))
         && !overlay_list.entries.is_empty();
 
-    if debug {
-        info!(
-            "RAYCAST DEBUG: origin={origin:?} dir={dir:?} overlays={}",
-            overlay_list.entries.len()
-        );
-        for (i, entry) in overlay_list.entries.iter().enumerate() {
-            info!(
-                "  NPC[{i}]: pos={:?} rot={:?} scale={} parts={}",
-                entry.bevy_pos, entry.rotation, entry.scale, entry.parts.len()
-            );
-            for (j, part) in entry.parts.iter().enumerate() {
-                let part_pos = entry.bevy_pos
-                    + entry.rotation * (entry.scale * part.offset);
-                info!(
-                    "    part[{j}]: node={} offset={:?} pivot={:?} bevy_pos={:?}",
-                    part.node_id, part.offset, part.pivot, part_pos
-                );
-            }
+    // In entity edit mode, skip the world raycast entirely.
+    let mut world_dist = f32::MAX;
+    if !entity_edit.active {
+        if let Some((hit, normal)) =
+            dda_view_cells(&world, zoom.layer, origin, dir, &anchor)
+        {
+            let hit_center = bevy_origin_of_layer_pos(&hit, &anchor)
+                + Vec3::splat(cell_size_at_layer(zoom.layer) * 0.5);
+            world_dist = (hit_center - origin).length();
+            targeted.hit_layer_pos = Some(hit);
+            targeted.normal = Some(normal);
         }
     }
 
-    let mut world_dist = f32::MAX;
-    if let Some((hit, normal)) =
-        dda_view_cells(&world, zoom.layer, origin, dir, &anchor)
-    {
-        let hit_center = bevy_origin_of_layer_pos(&hit, &anchor)
-            + Vec3::splat(cell_size_at_layer(zoom.layer) * 0.5);
-        world_dist = (hit_center - origin).length();
-        targeted.hit_layer_pos = Some(hit);
-        targeted.normal = Some(normal);
-    }
-
-    if debug {
-        info!("  world_dist={world_dist}");
-    }
-
-    // Check NPC overlay parts — if closer than the world hit, override.
+    // Check NPC overlay parts.
     if let Some(overlay_hit) =
         raycast_overlays(&world, &overlay_list, origin, dir, world_dist, debug)
     {
