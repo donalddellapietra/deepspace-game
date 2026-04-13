@@ -82,18 +82,30 @@ use super::tree::{
 #[derive(Resource, Copy, Clone, Debug)]
 pub struct WorldAnchor {
     pub leaf_coord: [i64; 3],
+    /// Normalization divisor: how many leaf voxels equal one Bevy unit.
+    /// Set to `scale_for_layer(target_layer_for(zoom.layer))` so that
+    /// Bevy-space coordinates stay in a bounded range (~800 units)
+    /// regardless of zoom level. This prevents atmosphere LUT banding
+    /// and post-processing artifacts caused by huge coordinate ranges
+    /// at zoomed-out layers.
+    pub norm: f32,
+}
+
+impl WorldAnchor {
+    /// Size of one cell at `layer` in normalized Bevy units.
+    /// At the target layer this is 1.0; at the view layer it's
+    /// typically 25.0 (= 5^(target - view) = 5^2).
+    #[inline]
+    pub fn cell_bevy(&self, layer: u8) -> f32 {
+        scale_for_layer(layer) / self.norm
+    }
 }
 
 impl Default for WorldAnchor {
     fn default() -> Self {
-        // The default anchor places Bevy `(0, 0, 0)` at leaf
-        // `(0, 0, 0)` of the root — the `-x, -y, -z` corner. The
-        // player plugin overrides this in its startup system to
-        // match the spawn position, so this default mainly exists
-        // so the resource can be inserted before the player exists
-        // (e.g. in tests and in `WorldPlugin::build`).
         Self {
             leaf_coord: [0, 0, 0],
+            norm: 1.0,
         }
     }
 }
@@ -171,10 +183,11 @@ pub fn target_layer_for(view_layer: u8) -> u8 {
 /// grid at view layer `L` it's the same.
 #[inline]
 pub fn cell_origin_for_anchor(anchor: &WorldAnchor, cell_size_leaves: i64) -> Vec3 {
+    let n = anchor.norm;
     Vec3::new(
-        -(anchor.leaf_coord[0].rem_euclid(cell_size_leaves) as f32),
-        -(anchor.leaf_coord[1].rem_euclid(cell_size_leaves) as f32),
-        -(anchor.leaf_coord[2].rem_euclid(cell_size_leaves) as f32),
+        -(anchor.leaf_coord[0].rem_euclid(cell_size_leaves) as f32) / n,
+        -(anchor.leaf_coord[1].rem_euclid(cell_size_leaves) as f32) / n,
+        -(anchor.leaf_coord[2].rem_euclid(cell_size_leaves) as f32) / n,
     )
 }
 
@@ -238,20 +251,19 @@ pub fn position_from_leaf_coord(coord: [i64; 3]) -> Option<Position> {
     Some(Position { path, voxel, offset: [0.0; 3] })
 }
 
-/// `i64` leaf-coord delta, cast to `f32`. This is the one place
-/// we cross from the exact-integer world frame into the
-/// approximate-`f32` Bevy frame — everything else stays in `i64`
-/// for as long as possible. The cast is only inexact when the
-/// delta exceeds `2^24 ≈ 16M` leaves, which only happens for
-/// entities far outside the render radius at view layers where
-/// `f32` resolution per visual voxel is already thousands of
-/// leaves.
+/// `i64` leaf-coord delta, normalized to Bevy units by dividing by
+/// `anchor.norm`. This is the one place we cross from the exact-
+/// integer world frame into the approximate-`f32` Bevy frame.
+/// With normalization, the output stays in a bounded range (~800)
+/// regardless of zoom level, preserving `f32` precision and
+/// preventing atmosphere/post-processing artifacts.
 #[inline]
-fn delta_as_vec3(target: [i64; 3], anchor: [i64; 3]) -> Vec3 {
+fn delta_as_vec3(target: [i64; 3], anchor: &WorldAnchor) -> Vec3 {
+    let n = anchor.norm;
     Vec3::new(
-        (target[0] - anchor[0]) as f32,
-        (target[1] - anchor[1]) as f32,
-        (target[2] - anchor[2]) as f32,
+        (target[0] - anchor.leaf_coord[0]) as f32 / n,
+        (target[1] - anchor.leaf_coord[1]) as f32 / n,
+        (target[2] - anchor.leaf_coord[2]) as f32 / n,
     )
 }
 
@@ -264,8 +276,8 @@ fn delta_as_vec3(target: [i64; 3], anchor: [i64; 3]) -> Vec3 {
 /// offset from `pos.offset`.
 pub fn bevy_from_position(pos: &Position, anchor: &WorldAnchor) -> Vec3 {
     let coord = position_to_leaf_coord(pos);
-    delta_as_vec3(coord, anchor.leaf_coord)
-        + Vec3::new(pos.offset[0], pos.offset[1], pos.offset[2])
+    delta_as_vec3(coord, anchor)
+        + Vec3::new(pos.offset[0], pos.offset[1], pos.offset[2]) / anchor.norm
 }
 
 /// Convert a Bevy `Vec3` in the `anchor` frame back to a
@@ -280,16 +292,12 @@ pub fn position_from_bevy(bevy: Vec3, anchor: &WorldAnchor) -> Option<Position> 
     if !bevy.x.is_finite() || !bevy.y.is_finite() || !bevy.z.is_finite() {
         return None;
     }
-    // Split `bevy` into an integer leaf delta and a sub-voxel
-    // fractional part, then add the integer delta to the anchor's
-    // leaf coord in `i64` space. Evaluate `.floor()` once per axis
-    // so the integer and fractional parts can't disagree on an
-    // integer boundary (a double-eval would let the fractional
-    // part reach exactly 1.0 for negative inputs near a boundary,
-    // violating `Position::offset ∈ [0, 1)`).
-    let fx = bevy.x.floor();
-    let fy = bevy.y.floor();
-    let fz = bevy.z.floor();
+    // Scale back from normalized Bevy units to leaf units.
+    let leaf = bevy * anchor.norm;
+    // Split into integer leaf delta and sub-voxel fractional part.
+    let fx = leaf.x.floor();
+    let fy = leaf.y.floor();
+    let fz = leaf.z.floor();
     let int_delta: [i64; 3] = [fx as i64, fy as i64, fz as i64];
     let coord: [i64; 3] = [
         anchor.leaf_coord[0] + int_delta[0],
@@ -297,7 +305,7 @@ pub fn position_from_bevy(bevy: Vec3, anchor: &WorldAnchor) -> Option<Position> 
         anchor.leaf_coord[2] + int_delta[2],
     ];
     let mut pos = position_from_leaf_coord(coord)?;
-    pos.offset = [bevy.x - fx, bevy.y - fy, bevy.z - fz];
+    pos.offset = [leaf.x - fx, leaf.y - fy, leaf.z - fz];
     pos.debug_check_offset();
     Some(pos)
 }
@@ -344,12 +352,12 @@ pub fn layer_pos_min_leaf_coord(lp: &LayerPos) -> [i64; 3] {
 /// frame. Works at any view layer — `lp.layer = 0` returns the
 /// root's corner offset from the anchor.
 pub fn bevy_origin_of_layer_pos(lp: &LayerPos, anchor: &WorldAnchor) -> Vec3 {
-    delta_as_vec3(layer_pos_min_leaf_coord(lp), anchor.leaf_coord)
+    delta_as_vec3(layer_pos_min_leaf_coord(lp), anchor)
 }
 
 /// Bevy-space centre of the cell at `lp`, in the `anchor` frame.
 pub fn bevy_center_of_layer_pos(lp: &LayerPos, anchor: &WorldAnchor) -> Vec3 {
-    let cell = cell_size_at_layer(lp.layer);
+    let cell = anchor.cell_bevy(lp.layer);
     bevy_origin_of_layer_pos(lp, anchor) + Vec3::splat(cell * 0.5)
 }
 
@@ -444,7 +452,7 @@ mod tests {
         // "Origin anchor" — Bevy (0, 0, 0) represents the root's
         // all-zero leaf corner. Matches the historical constant
         // `ROOT_ORIGIN + (13, 125, 13)` after the coordinate shift.
-        WorldAnchor { leaf_coord: [0, 0, 0] }
+        WorldAnchor { leaf_coord: [0, 0, 0], norm: 1.0 }
     }
 
     #[test]
@@ -534,6 +542,7 @@ mod tests {
 
         let anchor = WorldAnchor {
             leaf_coord: position_to_leaf_coord(&p),
+            norm: 1.0,
         };
         let v = bevy_from_position(&p, &anchor);
         // Integer delta is exactly zero; only the sub-voxel offset
@@ -557,6 +566,7 @@ mod tests {
         p.voxel = [12, 12, 12];
         let anchor = WorldAnchor {
             leaf_coord: position_to_leaf_coord(&p),
+            norm: 1.0,
         };
         let v = bevy_from_position(&p, &anchor);
         let back = position_from_bevy(v, &anchor).unwrap();

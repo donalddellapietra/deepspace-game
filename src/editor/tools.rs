@@ -244,7 +244,7 @@ pub fn place_block(
         return;
     };
 
-    let cell_size = cell_size_at_layer(zoom.layer);
+    let cell_size = anchor.cell_bevy(zoom.layer);
     let hit_center = bevy_center_of_layer_pos(hit, &anchor);
     let place_center = hit_center + normal.as_vec3() * cell_size;
     let Some(place_lp) = layer_pos_from_bevy(place_center, zoom.layer, &anchor)

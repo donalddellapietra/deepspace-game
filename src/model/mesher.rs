@@ -109,6 +109,7 @@ pub struct FaceData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 4]>,
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
 }
 
@@ -147,6 +148,8 @@ struct CompactFaceData {
     normals: Vec<u8>,
     /// 1 byte per vertex: AO level (0..4).
     ao_levels: Vec<u8>,
+    /// UVs stored as raw f32 (can have fractional values from greedy merge).
+    uvs: Vec<[f32; 2]>,
     /// Full u32 indices — NOT u16, because merged nodes can have
     /// 75,000+ vertices (125 children × ~600 vertices each).
     indices: Vec<u32>,
@@ -166,8 +169,9 @@ impl From<&FaceData> for CompactFaceData {
             normals.push(encode_normal(&f.normals[i]));
             ao_levels.push(ao_level_from_brightness(f.colors[i][0]));
         }
+        let uvs = f.uvs.clone();
         let indices = f.indices.clone();
-        CompactFaceData { positions, normals, ao_levels, indices }
+        CompactFaceData { positions, normals, ao_levels, uvs, indices }
     }
 }
 
@@ -187,8 +191,9 @@ impl From<CompactFaceData> for FaceData {
             let brightness = AO_CURVE[c.ao_levels[i] as usize];
             colors.push([brightness, brightness, brightness, 1.0]);
         }
+        let uvs = c.uvs;
         let indices = c.indices;
-        FaceData { positions, normals, colors, indices }
+        FaceData { positions, normals, colors, uvs, indices }
     }
 }
 
@@ -207,11 +212,19 @@ impl<'de> serde::Deserialize<'de> for FaceData {
 impl FaceData {
     fn add_quad(&mut self, quad: &[Vec3; 4], normal: Vec3, offset: Vec3, ao: [u8; 4]) {
         let base = self.positions.len() as u32;
+        let (u_axis, v_axis) = if normal.x.abs() > 0.5 {
+            (2, 1)
+        } else if normal.y.abs() > 0.5 {
+            (0, 2)
+        } else {
+            (0, 1)
+        };
         for (i, &vert) in quad.iter().enumerate() {
             self.positions.push((vert + offset).to_array());
             self.normals.push(normal.to_array());
             let brightness = AO_CURVE[ao[i] as usize];
             self.colors.push([brightness, brightness, brightness, 1.0]);
+            self.uvs.push([vert[u_axis], vert[v_axis]]);
         }
         if ao[0] + ao[2] > ao[1] + ao[3] {
             self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -240,6 +253,7 @@ impl FaceData {
             self.normals.push(normal_arr);
             let brightness = AO_CURVE[ao_level as usize];
             self.colors.push([brightness, brightness, brightness, 1.0]);
+            self.uvs.push([vert[axes.1] * (w as f32), vert[axes.2] * (h as f32)]);
         }
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -262,6 +276,7 @@ impl FaceData {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
         .with_inserted_indices(Indices::U32(self.indices))
     }
 }
@@ -575,6 +590,7 @@ pub fn merge_child_faces_raw(children: &[ChildFaces]) -> Vec<(u8, FaceData)> {
                     merged.positions.extend_from_slice(&data.positions);
                     merged.normals.extend_from_slice(&data.normals);
                     merged.colors.extend_from_slice(&data.colors);
+                    merged.uvs.extend_from_slice(&data.uvs);
                     for &idx in &data.indices {
                         merged.indices.push(base + idx);
                     }

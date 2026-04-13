@@ -139,7 +139,7 @@ pub fn update_target(
             dda_view_cells(&world, zoom.layer, origin, dir, &anchor)
         {
             let hit_center = bevy_origin_of_layer_pos(&hit, &anchor)
-                + Vec3::splat(cell_size_at_layer(zoom.layer) * 0.5);
+                + Vec3::splat(anchor.cell_bevy(zoom.layer) * 0.5);
             world_dist = (hit_center - origin).length();
             targeted.hit_layer_pos = Some(hit);
             targeted.normal = Some(normal);
@@ -169,8 +169,8 @@ fn dda_view_cells(
     dir: Vec3,
     anchor: &WorldAnchor,
 ) -> Option<(LayerPos, IVec3)> {
-    let cell_size = cell_size_at_layer(view_layer);
-    let cell_size_i64 = cell_size as i64;
+    let cell_size = anchor.cell_bevy(view_layer);
+    let cell_size_i64 = cell_size_at_layer(view_layer) as i64;
     let cell_origin = cell_origin_for_anchor(anchor, cell_size_i64);
 
     let local = origin - cell_origin;
@@ -459,7 +459,7 @@ fn draw_highlight(
     } else {
         Color::WHITE
     };
-    let cell_size = cell_size_at_layer(zoom.layer);
+    let cell_size = anchor.cell_bevy(zoom.layer);
     let cell_min = bevy_origin_of_layer_pos(lp, &anchor);
     let center = cell_min + Vec3::splat(cell_size * 0.5);
     gizmos.cube(

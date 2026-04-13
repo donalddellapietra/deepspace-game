@@ -12,7 +12,7 @@ use super::tree::{
     slot_coords, NodeId, BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE,
     MAX_LAYER,
 };
-use super::view::{extent_for_layer, scale_for_layer, WorldAnchor};
+use super::view::{extent_for_layer, WorldAnchor};
 
 // ----------------------------------------------------------- SmallPath
 
@@ -110,12 +110,13 @@ pub fn walk(
     while let Some(frame) = stack.pop() {
         let WalkFrame { node_id, path, origin_leaves, depth } = frame;
 
+        let n = anchor.norm;
         let origin_bevy = Vec3::new(
-            (origin_leaves[0] - anchor.leaf_coord[0]) as f32,
-            (origin_leaves[1] - anchor.leaf_coord[1]) as f32,
-            (origin_leaves[2] - anchor.leaf_coord[2]) as f32,
+            (origin_leaves[0] - anchor.leaf_coord[0]) as f32 / n,
+            (origin_leaves[1] - anchor.leaf_coord[1]) as f32 / n,
+            (origin_leaves[2] - anchor.leaf_coord[2]) as f32 / n,
         );
-        let extent = extent_for_layer(depth);
+        let extent = extent_for_layer(depth) / n;
         let aabb_min = origin_bevy;
         let aabb_max = origin_bevy + Vec3::splat(extent);
 
@@ -138,7 +139,7 @@ pub fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: scale_for_layer(target_layer),
+                scale: 1.0,
             });
             continue;
         }
@@ -149,7 +150,7 @@ pub fn walk(
                 path,
                 node_id,
                 origin: origin_bevy,
-                scale: scale_for_layer(depth),
+                scale: 1.0,
             });
             continue;
         };
@@ -188,7 +189,7 @@ mod tests {
     use crate::world::view::{cell_size_at_layer, target_layer_for};
 
     fn anchor_origin() -> WorldAnchor {
-        WorldAnchor { leaf_coord: [0, 0, 0] }
+        WorldAnchor { leaf_coord: [0, 0, 0], norm: 1.0 }
     }
 
     #[test]

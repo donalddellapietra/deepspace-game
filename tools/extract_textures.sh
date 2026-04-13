@@ -17,15 +17,15 @@ TILE_SIZE=32
 # Edit these paths when switching to a different texture pack.
 # Format: name|relative_path|animated(0/1)
 BLOCKS="
-stone|stone/stone_side_1.png|0
-dirt|nature/dirt/dirt.png|0
+stone|stone.png|0
+dirt|dirt.png|0
 grass|grass_block_top.png|0
 wood|oak_log.png|0
-leaf|nature/leaves/oak_leaves.png|0
-sand|soils/sand/sand.png|0
+leaf|oak_leaves.png|0
+sand|sand.png|0
 water|water_still.png|1
-brick|stone/bricks/bricks.png|0
-metal|materials/iron/side_atlas.png|0
+brick|bricks.png|0
+metal|iron_block.png|0
 glass|glass.png|0
 "
 
@@ -63,7 +63,7 @@ mkdir -p "$OUTPUT_DIR"
 ok=0
 fail=0
 
-echo "$BLOCKS" | while IFS='|' read -r block relpath animated; do
+while IFS='|' read -r block relpath animated; do
     # Skip empty lines
     [ -z "$block" ] && continue
 
@@ -87,8 +87,7 @@ echo "$BLOCKS" | while IFS='|' read -r block relpath animated; do
 
     echo "  OK    $block  ($relpath)"
     ok=$((ok + 1))
-done
+done <<< "$BLOCKS"
 
 echo ""
-echo "Done → $OUTPUT_DIR/"
-ls -1 "$OUTPUT_DIR"/*.png 2>/dev/null | wc -l | xargs -I{} echo "{} textures extracted"
+echo "Done: $ok extracted, $fail missing → $OUTPUT_DIR/"

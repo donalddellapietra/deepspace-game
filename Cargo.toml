@@ -7,6 +7,7 @@ default-run = "deepspace-game"
 [features]
 dev = ["bevy/dynamic_linking"]
 debug_import = []
+textures = []
 
 [dependencies]
 bevy = { version = "0.18", features = ["experimental_bevy_ui_widgets", "webgpu"] }

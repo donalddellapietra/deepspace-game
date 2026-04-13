@@ -52,6 +52,7 @@ pub fn build_palette_lut(
                 roughness: 0.9,
                 metallic: 0.0,
                 alpha_mode,
+                texture: None,
             },
             mat_assets,
         );
