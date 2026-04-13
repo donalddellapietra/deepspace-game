@@ -27,6 +27,21 @@
     <!-- Bevy assets (shaders, NPC blueprints, etc.) -->
     <link data-trunk rel="copy-dir" href="assets" />
     <link rel="stylesheet" href="ui.css" />
+    <script>
+        // These must be defined BEFORE WASM loads (Trunk injects WASM init in <body>).
+        // Perf data bridge: Bevy WASM writes here, Playwright reads it.
+        window.__perfData = { fps: 0, frameTimeMs: 0, entityCount: 0, npcCount: 0 };
+        window.__setPerfData = function(fps, frameTimeMs, entityCount, npcCount) {
+            window.__perfData = { fps, frameTimeMs, entityCount, npcCount };
+        };
+        // Spawn bridge: Playwright sets __spawnNpcs, Bevy calls __getAndResetSpawnCount.
+        window.__spawnNpcs = 0;
+        window.__getAndResetSpawnCount = function() {
+            var n = window.__spawnNpcs || 0;
+            window.__spawnNpcs = 0;
+            return n;
+        };
+    </script>
 </head>
 <body>
     <!-- Bevy WASM game -->
@@ -35,13 +50,6 @@
     <!-- React UI mounts here, on top of the canvas -->
     <div id="root"></div>
 
-    <script>
-        // Perf data bridge: Bevy WASM writes here, Playwright reads it.
-        window.__perfData = { fps: 0, frameTimeMs: 0, entityCount: 0, npcCount: 0 };
-        window.__setPerfData = function(fps, frameTimeMs, entityCount, npcCount) {
-            window.__perfData = { fps, frameTimeMs, entityCount, npcCount };
-        };
-    </script>
     <script type="module" src="ui.js"></script>
 </body>
 </html>

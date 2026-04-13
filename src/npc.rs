@@ -397,7 +397,7 @@ pub struct NpcBuffer {
 
 impl NpcBuffer {
     pub fn len(&self) -> usize {
-        self.npcs.iter().filter(|n| n.alive).count()
+        self.npcs.len()
     }
 }
 
@@ -429,7 +429,7 @@ pub struct NpcPartTransforms {
 
 const NPC_WALK_SPEED_CELLS: f32 = 3.0;
 const NPC_GRAVITY_CELLS: f32 = 20.0;
-const MASS_SPAWN_COUNT: usize = 10_000;
+const MASS_SPAWN_COUNT: usize = 100_000;
 
 /// Frame counter for staggering animation updates.
 #[derive(Resource, Default)]
@@ -450,6 +450,7 @@ impl Plugin for NpcPlugin {
                 (
                     try_load_blueprint,
                     spawn_npc_on_keypress,
+                    js_spawn_bridge,
                     npc_buf_ai,
                     npc_buf_animate,
                     npc_buf_physics,
@@ -977,6 +978,97 @@ fn sync_gpu_uniforms(
     gpu_data.uniforms.frame = gpu_data.uniforms.frame.wrapping_add(1);
     gpu_data.uniforms.npc_count = gpu_data.states.len() as u32;
 }
+
+// ============================================== JS spawn bridge (WASM only)
+
+/// Check `window.__spawnNpcs` from JS each frame. If > 0, spawn that
+/// many NPCs and reset to 0. This lets Playwright trigger spawning
+/// without keyboard focus issues.
+#[cfg(target_arch = "wasm32")]
+fn js_spawn_bridge(
+    tree_bp: Option<Res<TreeBlueprint>>,
+    player_q: Query<&WorldPosition, With<Player>>,
+    mut npc_buffer: ResMut<NpcBuffer>,
+    mut gpu_data: ResMut<NpcGpuData>,
+    anchor: Res<WorldAnchor>,
+    zoom: Res<CameraZoom>,
+    cam_q: Query<&FpsCam>,
+) {
+    // Read __spawnNpcs via js_sys (more reliable than wasm_bindgen extern).
+    let global = js_sys::global();
+    let key = wasm_bindgen::JsValue::from_str("__spawnNpcs");
+    let val = js_sys::Reflect::get(&global, &key).unwrap_or(wasm_bindgen::JsValue::from_f64(0.0));
+    let count = val.as_f64().unwrap_or(0.0) as usize;
+    if count == 0 { return; }
+    // Reset to 0.
+    let _ = js_sys::Reflect::set(&global, &key, &wasm_bindgen::JsValue::from_f64(0.0));
+
+    let Some(tree_bp) = tree_bp else { return };
+    let Ok(player_pos) = player_q.single() else { return };
+
+    let cell = cell_size_at_layer(zoom.layer);
+    let forward = if let Ok(cam) = cam_q.single() {
+        Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos())
+    } else {
+        Vec3::NEG_Z
+    };
+    let player_bevy = bevy_from_position(&player_pos.0, &anchor);
+    let num_parts = tree_bp.parts.len();
+    let existing = npc_buffer.len();
+
+    let mut rest_parts = [(Vec3::ZERO, Quat::IDENTITY); MAX_PARTS];
+    for (i, p) in tree_bp.parts.iter().enumerate().take(MAX_PARTS) {
+        rest_parts[i] = (p.rest_offset, Quat::IDENTITY);
+    }
+
+    npc_buffer.npcs.reserve(count);
+
+    for i in 0..count {
+        let (offset_x, offset_z) = if count > 1 {
+            let grid_side = (count as f32).sqrt().ceil() as usize;
+            let row = i / grid_side;
+            let col = i % grid_side;
+            let spacing = 3.0 * cell;
+            let half = (grid_side as f32) * spacing / 2.0;
+            (col as f32 * spacing - half, row as f32 * spacing - half)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let npc_bevy = player_bevy
+            + forward * 5.0 * cell
+            + Vec3::new(offset_x, 1.0, offset_z);
+        let Some(npc_pos) = position_from_bevy(npc_bevy, &anchor) else {
+            continue;
+        };
+
+        let heading = rand_heading_seeded(i as u32);
+        let mut npc = NpcState::new(npc_pos, heading, num_parts);
+        npc.anim_time = rand_f32_seeded(i as u32 + 5555) * 2.0;
+        npc.ai_timer = 2.0 + rand_f32_seeded(i as u32 + 9999) * 3.0;
+        npc.part_transforms = rest_parts;
+
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        gpu_data.states.push(GpuNpcState {
+            position: bevy_pos.to_array(),
+            heading: npc.heading,
+            velocity: [0.0; 3],
+            ai_timer: npc.ai_timer,
+            anim_time: npc.anim_time,
+            speed: NPC_WALK_SPEED_CELLS * cell,
+            seed: i as u32 + 42,
+            flags: 1,
+        });
+
+        npc_buffer.npcs.push(npc);
+    }
+
+    gpu_data.dirty = true;
+    info!("JS bridge: spawned {} NPCs (total now ~{})", count, existing + count);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_spawn_bridge() {}
 
 // ============================================== NPC voxel editing
 
