@@ -8,18 +8,31 @@
 //! The main game binary loads these files at startup instead of
 //! generating the world or cold-baking meshes in-process.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
-
+#[cfg(not(target_arch = "wasm32"))]
 use deepspace_game::world::mesh_cache::prebake_node_raw;
+#[cfg(not(target_arch = "wasm32"))]
 use deepspace_game::world::serial::{
     canned_world_hash, write_prebaked_file, write_prebaked_indexed,
     write_world_file, PrebakedMeshes,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use deepspace_game::world::state::WorldState;
+#[cfg(not(target_arch = "wasm32"))]
 use deepspace_game::world::tree::EMPTY_NODE;
 
 fn main() {
+    #[cfg(target_arch = "wasm32")]
+    { eprintln!("gen_world is native-only"); return; }
+    #[cfg(not(target_arch = "wasm32"))]
+    native_main();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_main() {
     let start = Instant::now();
 
     // Generate the world.

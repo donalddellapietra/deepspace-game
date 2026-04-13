@@ -18,6 +18,7 @@ pub mod collision;
 pub mod edit;
 pub mod generator;
 pub mod mesh_cache;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod mesh_stream;
 pub mod overlay;
 pub mod position;
