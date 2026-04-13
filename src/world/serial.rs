@@ -107,13 +107,21 @@ fn serial_to_node(s: SerialNode) -> Node {
 
 // ------------------------------------------------ compress / decompress
 
-fn compress(data: &[u8]) -> Vec<u8> {
+fn compress_lz4(data: &[u8]) -> Vec<u8> {
     lz4_flex::compress_prepend_size(data)
 }
 
-fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
+fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
     lz4_flex::decompress_size_prepended(data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn compress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::encode_all(data, 3)
+}
+
+fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::decode_all(data)
 }
 
 // --------------------------------------------------- canned world I/O
@@ -135,7 +143,7 @@ pub fn serialize_world(
     };
     let raw = bincode::serialize(&canned)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(compress(&raw))
+    Ok(compress_lz4(&raw))
 }
 
 /// Write a canned world file to disk.
@@ -154,7 +162,7 @@ pub fn write_world_file(
 /// The `next_id` is stored so the caller can track which NodeIds are
 /// canned vs player-created.
 pub fn deserialize_world(data: &[u8]) -> io::Result<(NodeId, NodeLibrary, u64)> {
-    let raw = decompress(data)?;
+    let raw = decompress_lz4(data)?;
     let canned: CannedWorld = bincode::deserialize(&raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if canned.version != CANNED_VERSION {
@@ -222,7 +230,7 @@ pub fn serialize_save(
     };
     let raw = bincode::serialize(&save)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(compress(&raw))
+    Ok(compress_lz4(&raw))
 }
 
 /// Write a save file to disk.
@@ -247,7 +255,7 @@ pub fn load_save(
     library: &mut NodeLibrary,
     expected_base_hash: u64,
 ) -> io::Result<NodeId> {
-    let raw = decompress(data)?;
+    let raw = decompress_lz4(data)?;
     let save: SaveFile = bincode::deserialize(&raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if save.version != SAVE_VERSION {
@@ -318,7 +326,7 @@ pub fn serialize_prebaked(meshes: &PrebakedMeshes) -> io::Result<Vec<u8>> {
     };
     let raw = bincode::serialize(&file)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(compress(&raw))
+    compress_zstd(&raw)
 }
 
 pub fn write_prebaked_file(path: &Path, meshes: &PrebakedMeshes) -> io::Result<()> {
@@ -329,7 +337,7 @@ pub fn write_prebaked_file(path: &Path, meshes: &PrebakedMeshes) -> io::Result<(
 }
 
 pub fn deserialize_prebaked(data: &[u8]) -> io::Result<PrebakedMeshes> {
-    let raw = decompress(data)?;
+    let raw = decompress_zstd(data)?;
     let file: PrebakedFile = bincode::deserialize(&raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if file.version != PREBAKED_VERSION {
