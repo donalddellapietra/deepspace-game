@@ -164,7 +164,7 @@ pub struct RenderState {
     visits: Vec<Visit>,
     /// Imposter entities for the outer ring (horizon fill).
     imposter_entities: Vec<Entity>,
-    /// Cached flat quad mesh for imposters.
+    /// Cached annulus mesh for imposters.
     imposter_mesh: Option<Handle<Mesh>>,
 }
 
@@ -567,24 +567,52 @@ fn walk(
 
 /// Create a flat quad mesh of size `extent` in the XZ plane at Y=0.
 /// Used for the imposter ring that fills the gap to the horizon.
-fn make_imposter_quad(meshes: &mut Assets<Mesh>, extent: f32) -> Handle<Mesh> {
+/// Build a flat annulus (ring) mesh in the XZ plane, centered at origin.
+/// `inner_r` and `outer_r` are the radii. The ring has `segments`
+/// angular divisions for a smooth circular edge.
+fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, segments: u32) -> Handle<Mesh> {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::Indices;
     use bevy::render::render_resource::PrimitiveTopology;
+    use std::f32::consts::TAU;
+
+    let vert_count = (segments as usize + 1) * 2;
+    let mut positions = Vec::with_capacity(vert_count);
+    let mut normals = Vec::with_capacity(vert_count);
+    let mut uvs = Vec::with_capacity(vert_count);
+    let mut indices = Vec::with_capacity(segments as usize * 6);
+
+    for i in 0..=segments {
+        let angle = (i as f32 / segments as f32) * TAU;
+        let (sin_a, cos_a) = angle.sin_cos();
+
+        // Inner vertex
+        positions.push([cos_a * inner_r, 0.0, sin_a * inner_r]);
+        normals.push([0.0, 1.0, 0.0]);
+        uvs.push([i as f32 / segments as f32, 0.0]);
+
+        // Outer vertex
+        positions.push([cos_a * outer_r, 0.0, sin_a * outer_r]);
+        normals.push([0.0, 1.0, 0.0]);
+        uvs.push([i as f32 / segments as f32, 1.0]);
+    }
+
+    for i in 0..segments {
+        let base = i * 2;
+        // Two triangles per segment
+        indices.push(base);
+        indices.push(base + 2);
+        indices.push(base + 1);
+
+        indices.push(base + 1);
+        indices.push(base + 2);
+        indices.push(base + 3);
+    }
 
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
     );
-    let positions: Vec<[f32; 3]> = vec![
-        [0.0, 0.0, 0.0],
-        [extent, 0.0, 0.0],
-        [extent, 0.0, extent],
-        [0.0, 0.0, extent],
-    ];
-    let normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; 4];
-    let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-    let indices = vec![0u32, 2, 1, 0, 3, 2];
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
@@ -883,74 +911,45 @@ pub fn render_world(
     }
     render_state.entities = alive;
 
-    // ------ Imposter ring: flat quads filling the gap to the horizon ------
+    // ------ Imposter ring: single annulus filling the gap to the horizon ------
 
-    // Despawn old imposters.
+    // Despawn old imposter (single entity now).
     for entity in render_state.imposter_entities.drain(..) {
         if let Ok(mut ec) = commands.get_entity(entity) {
             ec.despawn();
         }
     }
 
-    // Generate a grid of flat quads on the ground plane, covering the
-    // area beyond the normal render radius out to 3× the radius.
-    // The grassland is uniform so we don't need tree data — just a
-    // grid of grass-colored quads at Y=0.
     let grass_voxel: u8 = 3;
     if let Some(grass_mat) = palette.material(grass_voxel) {
-        let quad_mesh = render_state.imposter_mesh
-            .get_or_insert_with(|| make_imposter_quad(&mut meshes, 1.0))
-            .clone();
-
         let outer_radius = radius_bevy * IMPOSTER_RADIUS_MULT;
-        let inner_radius = radius_bevy * 0.9; // slight overlap with terrain
-        // Quad size: use the cell size at the current view layer.
-        let cell = anchor.cell_bevy(zoom.layer);
-        let quad_size = cell * 5.0; // 5 cells per imposter quad
+        let inner_radius = radius_bevy * 0.5; // generous overlap — annulus hides under terrain
 
-        // Grid from -outer_radius to +outer_radius around camera XZ.
-        let cam_x = camera_pos.x;
-        let cam_z = camera_pos.z;
-        // Snap to grid.
-        let grid_x0 = ((cam_x - outer_radius) / quad_size).floor() as i32;
-        let grid_x1 = ((cam_x + outer_radius) / quad_size).ceil() as i32;
-        let grid_z0 = ((cam_z - outer_radius) / quad_size).floor() as i32;
-        let grid_z1 = ((cam_z + outer_radius) / quad_size).ceil() as i32;
+        // Rebuild the annulus mesh when the zoom layer changes (radii change).
+        // Otherwise reuse the cached mesh.
+        let needs_rebuild = render_state.imposter_mesh.is_none();
+        let annulus = if needs_rebuild {
+            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, 64);
+            render_state.imposter_mesh = Some(mesh.clone());
+            mesh
+        } else {
+            render_state.imposter_mesh.clone().unwrap()
+        };
 
-        let inner_sq = inner_radius * inner_radius;
-        let outer_sq = outer_radius * outer_radius;
-        let mut count = 0;
+        // Position centered on camera XZ at ground level (Y=0 in anchor
+        // space). The generous inner overlap means the seam is always
+        // hidden under the 3D terrain blocks.
+        let entity = commands.spawn((
+            Mesh3d(annulus),
+            MeshMaterial3d(grass_mat.clone()),
+            Transform::from_translation(Vec3::new(camera_pos.x, 0.0, camera_pos.z)),
+            Visibility::Visible,
+            bevy::light::NotShadowCaster,
+            bevy::light::NotShadowReceiver,
+        )).id();
+        render_state.imposter_entities.push(entity);
 
-        for gx in grid_x0..grid_x1 {
-            for gz in grid_z0..grid_z1 {
-                let x = gx as f32 * quad_size;
-                let z = gz as f32 * quad_size;
-                // Center of this quad relative to camera.
-                let cx = x + quad_size * 0.5 - cam_x;
-                let cz = z + quad_size * 0.5 - cam_z;
-                let dist_sq = cx * cx + cz * cz;
-
-                // Only emit in the ring between inner and outer radius.
-                if dist_sq < inner_sq || dist_sq > outer_sq {
-                    continue;
-                }
-
-                let entity = commands.spawn((
-                    Mesh3d(quad_mesh.clone()),
-                    MeshMaterial3d(grass_mat.clone()),
-                    Transform::from_translation(Vec3::new(x, 0.0, z))
-                        .with_scale(Vec3::new(quad_size, 1.0, quad_size)),
-                    Visibility::Visible,
-                )).id();
-                render_state.imposter_entities.push(entity);
-                count += 1;
-            }
-        }
-
-        if count > 0 {
-            info!("Imposters: {} quads, radius {:.0}..{:.0}, quad_size={:.1}",
-                count, inner_radius, outer_radius, quad_size);
-        }
+        info!("Imposter annulus: inner={:.0}, outer={:.0}", inner_radius, outer_radius);
     }
 
     // Overlay reconcile (NPCs and other overlay subtrees).
