@@ -21,6 +21,7 @@ pub mod overlay;
 pub mod position;
 pub mod render;
 pub mod state;
+pub mod terrain;
 pub mod tree;
 pub mod view;
 
@@ -76,9 +77,14 @@ impl Plugin for WorldPlugin {
             .init_resource::<overlay::OverlayList>()
             .add_systems(
                 Update,
-                render::render_world
-                    .after(crate::player::derive_transforms)
-                    .after(crate::npc::collect_overlays),
+                (
+                    terrain::terrain_generation_system
+                        .after(crate::player::derive_transforms),
+                    render::render_world
+                        .after(crate::player::derive_transforms)
+                        .after(crate::npc::collect_overlays)
+                        .after(terrain::terrain_generation_system),
+                ),
             );
     }
 }
