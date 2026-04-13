@@ -144,10 +144,10 @@ fn update_debug_overlay(
         state.library.len(),
         timings.visit_count,
         timings.group_count,
-        timings.walk_us,
-        timings.reconcile_us,
         timings.render_total_us,
+        timings.walk_us,
         timings.bake_us,
+        timings.reconcile_us,
         timings.collision_us,
     ));
 }

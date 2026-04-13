@@ -32,7 +32,7 @@ use bevy::{
             RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
         },
         render_resource::*,
-        renderer::RenderDevice,
+        renderer::{RenderDevice, RenderQueue},
         sync_world::MainEntity,
         view::{ExtractedView, NoIndirectDrawing},
         Render, RenderApp, RenderStartup, RenderSystems,
@@ -264,15 +264,6 @@ pub fn reconcile_instanced(
     });
 }
 
-/// Clear all instanced overlay entities.
-pub fn clear_instanced(commands: &mut Commands, state: &mut InstancedOverlayState) {
-    for (_, ent) in state.group_entities.drain() {
-        if let Ok(mut ec) = commands.get_entity(ent) {
-            ec.despawn();
-        }
-    }
-}
-
 // --------------------------------------------------------------- render plugin
 
 /// Global handle for the embedded NPC instancing shader.
@@ -447,13 +438,29 @@ struct NpcInstanceBuffer {
 
 fn prepare_npc_instance_buffers(
     mut commands: Commands,
-    query: Query<(Entity, &NpcInstanceList)>,
+    query: Query<(Entity, &NpcInstanceList, Option<&NpcInstanceBuffer>)>,
     render_device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
 ) {
-    for (entity, instance_data) in &query {
+    for (entity, instance_data, existing_buf) in &query {
+        let data_bytes = bytemuck::cast_slice::<NpcInstanceData, u8>(instance_data.as_slice());
+
+        // Reuse existing buffer if it's large enough.
+        if let Some(existing) = existing_buf {
+            if existing.buffer.size() >= data_bytes.len() as u64 {
+                queue.write_buffer(&existing.buffer, 0, data_bytes);
+                commands.entity(entity).insert(NpcInstanceBuffer {
+                    buffer: existing.buffer.clone(),
+                    length: instance_data.len(),
+                });
+                continue;
+            }
+        }
+
+        // Create new buffer (only when size increases).
         let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("npc instance buffer"),
-            contents: bytemuck::cast_slice(instance_data.as_slice()),
+            contents: data_bytes,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
         });
         commands.entity(entity).insert(NpcInstanceBuffer {

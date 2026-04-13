@@ -418,13 +418,6 @@ pub struct NpcPartOverrides {
     pub overrides: HashMap<usize, NodeId>,
 }
 
-/// Legacy component kept for editor compatibility. The flat buffer
-/// systems don't use this — it's only for the editor query.
-#[derive(Component)]
-pub struct NpcPartTransforms {
-    pub transforms: Vec<(Vec3, Quat)>,
-}
-
 // ========================================================= constants
 
 const NPC_WALK_SPEED_CELLS: f32 = 3.0;
@@ -1124,10 +1117,6 @@ fn rand_f32() -> f32 {
         let t = (js_sys::Date::now() * 1000.0) as u64;
         ((t % 10000) as f32) / 10000.0
     }
-}
-
-fn rand_heading() -> f32 {
-    rand_f32() * TAU
 }
 
 /// Deterministic pseudo-random f32 in [0, 1) from a seed.
