@@ -42,13 +42,13 @@ fn fragment(
     in: VertexOutput,
     @builtin(front_facing) is_front: bool,
 ) -> FragmentOutput {
-    // Clip terrain to a smooth circle so the boundary matches the
-    // annulus imposter ring. Without this, sphere-culled cube blocks
-    // create a patchy edge that doesn't align with the smooth annulus.
+    // Clip terrain to a smooth circle and compute distance for AO fade.
+    var clip_dist_sq = 0.0;
     if (bsl.clip_radius > 0.0) {
         let dx = in.world_position.x - view.world_position.x;
         let dz = in.world_position.z - view.world_position.z;
-        if (dx * dx + dz * dz > bsl.clip_radius * bsl.clip_radius) {
+        clip_dist_sq = dx * dx + dz * dz;
+        if (clip_dist_sq > bsl.clip_radius * bsl.clip_radius) {
             discard;
         }
     }
@@ -73,7 +73,15 @@ fn fragment(
 #else
     let ao_raw = ssao;
 #endif
-    let ao = mix(1.0, ao_raw * ao_raw, bsl.ao_strength);
+    // Fade AO to zero near the clip boundary so SSAO depth-discontinuity
+    // artifacts (dark block outlines at the terrain edge) disappear.
+    var ao_fade = 1.0;
+    if (bsl.clip_radius > 0.0) {
+        let fade_start_sq = bsl.clip_radius * bsl.clip_radius * 0.64; // 80% radius
+        let fade_end_sq = bsl.clip_radius * bsl.clip_radius;
+        ao_fade = 1.0 - smoothstep(fade_start_sq, fade_end_sq, clip_dist_sq);
+    }
+    let ao = mix(1.0, ao_raw * ao_raw, bsl.ao_strength * ao_fade);
     lit_color = vec4(lit_color.rgb * ao, lit_color.a);
 
     // --- Warm sun / cool shadow blending ---
