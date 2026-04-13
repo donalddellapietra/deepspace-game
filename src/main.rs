@@ -32,10 +32,15 @@ fn main() {
             }),
             ..default()
         }))
-        // Atmosphere renders the sky; ClearColor only peeks through
-        // sub-pixel gaps between mesh faces, so match it to the
-        // dominant terrain color (grass) to hide seams.
-        .insert_resource(ClearColor(Color::srgb(0.3, 0.6, 0.2)))
+        // On WASM without atmosphere, ClearColor is the sky.
+        // On native, atmosphere renders the sky and ClearColor only
+        // peeks through sub-pixel gaps.
+        .insert_resource(ClearColor({
+            #[cfg(target_arch = "wasm32")]
+            { Color::srgb(0.5, 0.7, 0.9) }
+            #[cfg(not(target_arch = "wasm32"))]
+            { Color::srgb(0.3, 0.6, 0.2) }
+        }))
         .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
