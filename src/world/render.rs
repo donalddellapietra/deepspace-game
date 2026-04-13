@@ -851,7 +851,7 @@ pub fn render_world(
                             commands.spawn((
                                 Mesh3d(sub.mesh.clone()),
                                 MeshMaterial3d(mat),
-                                Transform::from_translation(-part.pivot * entry.scale),
+                                Transform::from_translation(-part.pivot),
                                 Visibility::Inherited,
                                 ChildOf(parent),
                             ));
