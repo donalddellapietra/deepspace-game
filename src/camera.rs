@@ -114,16 +114,25 @@ fn spawn_camera(
         Tonemapping::AcesFitted,
         ShadowFilteringMethod::Gaussian,
         ScreenSpaceAmbientOcclusion {
-            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::Ultra,
+            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::Medium,
             constant_object_thickness: 1.0,
         },
-        // Subtle bloom for emissive surfaces and bright sky/sun
-        // highlights. NATURAL preset uses energy-conserving mode
-        // so it adds glow without washing out. Low intensity avoids
-        // the artifacts seen with the old LDR-tuned lighting.
+        // Bloom only on bright highlights (threshold 0.8) — sky, sun
+        // reflections, emissive blocks. Energy-conserving mode adds
+        // glow without washing out. Reduced max_mip_dimension cuts
+        // GPU passes for zoomed-out layers.
         Bloom {
-            intensity: 0.15,
-            ..Bloom::NATURAL
+            intensity: 0.2,
+            low_frequency_boost: 0.5,
+            low_frequency_boost_curvature: 0.95,
+            high_pass_frequency: 1.0,
+            prefilter: bevy::post_process::bloom::BloomPrefilter {
+                threshold: 0.8,
+                threshold_softness: 0.3,
+            },
+            composite_mode: bevy::post_process::bloom::BloomCompositeMode::EnergyConserving,
+            max_mip_dimension: 256,
+            ..default()
         },
         // BSL-style color grading: cool shadows, warm highlights.
         // Pushes shadowed regions toward blue and lit regions toward

@@ -126,12 +126,15 @@ fn update_shadow_cascades(
     }
     let cell = world::view::cell_size_at_layer(zoom.layer);
     let radius = world::render::RADIUS_VIEW_CELLS * cell;
+    // Cap shadow distance: at zoomed-out layers the shadow pass would
+    // render the entire view volume (radius can be 20k+ Bevy units at
+    // layer 8), destroying GPU perf. Shadows beyond ~2000 units are
+    // invisible anyway — the atmosphere haze hides them.
+    let shadow_max = radius.min(2000.0 * cell.min(5.0));
     for mut config in &mut lights {
-        // Scale cascade bounds with zoom so the shadow map texel
-        // density stays consistent at every layer.
         *config = CascadeShadowConfigBuilder {
             first_cascade_far_bound: 10.0 * cell,
-            maximum_distance: radius,
+            maximum_distance: shadow_max,
             overlap_proportion: 0.4,
             ..default()
         }
