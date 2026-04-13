@@ -571,8 +571,6 @@ fn walk(
 /// `inner_r` and `outer_r` are the radii. The ring has `segments`
 /// angular divisions for a smooth circular edge.
 /// Build a flat annulus (ring) mesh in the XZ plane, centered at origin.
-/// `inner_y` raises the inner edge above the outer edge, creating a
-/// gentle slope that covers terrain side faces at the boundary.
 fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, inner_y: f32, segments: u32) -> Handle<Mesh> {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::Indices;
@@ -610,6 +608,58 @@ fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, inne
         indices.push(base + 1);
         indices.push(base + 2);
         indices.push(base + 3);
+    }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    meshes.add(mesh)
+}
+
+/// Build a cylinder wall mesh: a ring of vertical quads at `radius`,
+/// extending from `y_bottom` to `y_top`. Normals point inward (toward
+/// the camera). The cylinder has no top/bottom caps — just the wall.
+fn make_cylinder_wall(meshes: &mut Assets<Mesh>, radius: f32, y_bottom: f32, y_top: f32, segments: u32) -> Handle<Mesh> {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::Indices;
+    use bevy::render::render_resource::PrimitiveTopology;
+    use std::f32::consts::TAU;
+
+    let vert_count = (segments as usize + 1) * 2;
+    let mut positions = Vec::with_capacity(vert_count);
+    let mut normals = Vec::with_capacity(vert_count);
+    let mut uvs = Vec::with_capacity(vert_count);
+    let mut indices = Vec::with_capacity(segments as usize * 6);
+
+    for i in 0..=segments {
+        let angle = (i as f32 / segments as f32) * TAU;
+        let (sin_a, cos_a) = angle.sin_cos();
+
+        // Bottom vertex
+        positions.push([cos_a * radius, y_bottom, sin_a * radius]);
+        normals.push([-cos_a, 0.0, -sin_a]); // inward-facing
+        uvs.push([i as f32 / segments as f32, 0.0]);
+
+        // Top vertex
+        positions.push([cos_a * radius, y_top, sin_a * radius]);
+        normals.push([-cos_a, 0.0, -sin_a]);
+        uvs.push([i as f32 / segments as f32, 1.0]);
+    }
+
+    for i in 0..segments {
+        let base = i * 2;
+        indices.push(base);
+        indices.push(base + 1);
+        indices.push(base + 2);
+
+        indices.push(base + 1);
+        indices.push(base + 3);
+        indices.push(base + 2);
     }
 
     let mut mesh = Mesh::new(
@@ -925,40 +975,38 @@ pub fn render_world(
 
     let grass_voxel: u8 = 3;
     if let Some(grass_mat) = palette.material(grass_voxel) {
-        let outer_radius = radius_bevy * IMPOSTER_RADIUS_MULT;
-        let inner_radius = radius_bevy * 0.5; // generous overlap — annulus hides under terrain
+        let cell = anchor.cell_bevy(zoom.layer);
+        let ground_y = (super::state::GROUND_Y_VOXELS - anchor.leaf_coord[1]) as f32 / anchor.norm;
+
+        // Cylinder wall at the render boundary. From ground level, the
+        // wall looks like ground extending to the horizon. Through holes,
+        // the cylinder is at the render boundary distance — too far to
+        // see in a local hole. The wall extends from well below ground
+        // to slightly above, covering the terrain edge from any angle.
+        let wall_radius = radius_bevy * 0.95;
+        let wall_bottom = ground_y - cell * 50.0;
+        let wall_top = ground_y + cell * 2.0;
 
         let needs_rebuild = render_state.imposter_mesh.is_none();
-        let annulus = if needs_rebuild {
-            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, 0.0, 64);
+        let cylinder = if needs_rebuild {
+            let mesh = make_cylinder_wall(&mut meshes, wall_radius, wall_bottom, wall_top, 64);
             render_state.imposter_mesh = Some(mesh.clone());
             mesh
         } else {
             render_state.imposter_mesh.clone().unwrap()
         };
 
-        // Position centered on camera XZ at ground level (Y=0 in anchor
-        // space). The generous inner overlap means the seam is always
-        // hidden under the 3D terrain blocks.
         let entity = commands.spawn((
-            Mesh3d(annulus),
+            Mesh3d(cylinder),
             MeshMaterial3d(grass_mat.clone()),
-            // Ground Y in anchor-relative Bevy space, pushed well below
-            // the surface so it's not visible through holes dug in the
-            // terrain. At the horizon viewing angle it's still visible
-            // because you look edge-on.
-            Transform::from_translation(Vec3::new(
-                camera_pos.x,
-                (super::state::GROUND_Y_VOXELS - anchor.leaf_coord[1]) as f32 / anchor.norm
-                    - anchor.cell_bevy(zoom.layer) * 10.0,
-                camera_pos.z,
-            )),
+            Transform::from_translation(Vec3::new(camera_pos.x, 0.0, camera_pos.z)),
             Visibility::Visible,
             bevy::light::NotShadowCaster,
+            bevy::light::NotShadowReceiver,
         )).id();
         render_state.imposter_entities.push(entity);
 
-        info!("Imposter annulus: inner={:.0}, outer={:.0}", inner_radius, outer_radius);
+        info!("Imposter cylinder: r={:.0}, y={:.0}..{:.0}", wall_radius, wall_bottom, wall_top);
     }
 
     // Overlay reconcile (NPCs and other overlay subtrees).
