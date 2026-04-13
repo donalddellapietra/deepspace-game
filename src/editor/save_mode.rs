@@ -260,8 +260,9 @@ pub fn update_save_tint(
 
 /// True when the current view layer cleanly maps one view cell to one
 /// tree node. At `L > MAX_LAYER - 2` a view cell is smaller than a
-/// leaf, so there is no subtree to save — the user's "anything but
-/// the highest layer" rule.
+/// leaf, so there is no subtree to save. The `+2` here is tied to the
+/// cell decomposition (25 = 5² cells → 2 base-5 digits), not to
+/// `DETAIL_DEPTH`.
 pub fn save_mode_eligible(view_layer: u8) -> bool {
     view_layer + 2 <= MAX_LAYER
 }

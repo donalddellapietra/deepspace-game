@@ -14,12 +14,24 @@ use super::tree::{
     CHILDREN_PER_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
 };
 
+// Note on the hardcoded +2 throughout this module: it comes from the fact that
+// NODE_VOXELS_PER_AXIS = 25 = 5², so a cell coordinate decomposes into exactly
+// 2 base-5 digits. This is separate from DETAIL_DEPTH (defined in tree.rs), which
+// governs rendering detail. The edit system operates at the cell-decomposition
+// granularity regardless of render detail.
+
 /// Construct the tree path that reaches the subtree "under" a view
 /// cell named by `lp`. Mirrors the `slot_a = c/5, slot_b = c%5`
 /// decomposition that `edit_at_layer_pos` uses internally: starting
 /// from `lp.path()` (length `lp.layer`), push one or two extra slots
 /// until we reach the layer that one view cell actually corresponds
 /// to.
+///
+/// NOTE: The `+2` here is NOT related to DETAIL_DEPTH (which controls
+/// render detail). Instead, it comes from the mathematical fact that
+/// NODE_VOXELS_PER_AXIS = 25 = 5², so a cell coordinate (0..24) decomposes
+/// into exactly 2 base-5 digits: c/5 and c%5. The edit system operates
+/// at this granularity regardless of rendering detail.
 ///
 /// The returned path length equals `min(lp.layer + 2, MAX_LAYER)`,
 /// so:
@@ -125,8 +137,10 @@ fn build_solid_chain(
 ///   Walk down to that leaf, clone, fill, intern, install.
 /// - **`lp.layer <= MAX_LAYER - 2`**: replaces the whole layer-`(L + 2)`
 ///   subtree beneath the clicked cell with a canonical "solid X"
-///   chain. The click's `(cx, cy, cz)` decomposes into two slot
-///   steps: `slot_a = (c / 5)` and `slot_b = (c % 5)`.
+///   chain. The click's `(cx, cy, cz)` decomposes into exactly two
+///   base-5 slot steps via `slot_a = (c / 5)` and `slot_b = (c % 5)`.
+///   (The `+2` is fixed by the math that NODE_VOXELS_PER_AXIS = 5²,
+///   not by DETAIL_DEPTH which controls render detail.)
 ///
 /// See `docs/architecture/editing.md` and the 2D prototype's
 /// `World::edit_at` for the derivation of the three cases.
@@ -197,7 +211,8 @@ pub fn edit_at_layer_pos(world: &mut WorldState, lp: &LayerPos, voxel: Voxel) {
 
     // Two or more layers above leaves: replace the whole layer-(L+2)
     // subtree with a solid-voxel chain. (cx, cy, cz) decomposes into
-    // two more slot steps to reach that subtree.
+    // exactly two more slot steps (via 5² = 25 cell decomposition) to
+    // reach that subtree.
     let slot_a = slot_index(
         (cx / b) as usize,
         (cy / b) as usize,
@@ -420,8 +435,9 @@ mod tests {
     fn install_subtree_at_root_replaces_entire_world() {
         // `install_subtree` is public (save-mode uses it) and callable
         // with an empty ancestor path, which replaces the whole world
-        // root. `edit_at_layer_pos` can't reach target layer 0 itself
-        // — its minimum is `lp.layer + 2 == 2` — so this exercises
+        // root. `edit_at_layer_pos` can't reach layer 0 itself — due to
+        // the cell coordinate decomposition, its minimum target is
+        // `lp.layer + 2 == 2` (when lp.layer == 0). This test exercises
         // `install_subtree`'s empty-descent path directly.
         let mut world = WorldState::new_grassland();
         let root_chain = build_solid_chain(&mut world, stone(), 0);

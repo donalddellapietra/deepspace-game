@@ -1,7 +1,7 @@
 //! Uniform-layer tree-walk renderer.
 //!
 //! Every frame, walk the content-addressed tree from the root down to
-//! `CameraZoom.layer + 2` (the target layer — see
+//! `CameraZoom.layer + DETAIL_DEPTH` (the target layer — see
 //! `view::target_layer_for`) and emit one Bevy entity per surviving
 //! node at that layer. Entities are reused across frames via
 //! `RenderState`, and meshes are baked lazily into a `NodeId`-keyed
@@ -108,11 +108,15 @@ impl CameraZoom {
 /// with zoom: you see the same number of cells out to the horizon
 /// whether you're at the leaves or zoomed all the way out, matching
 /// the 2D prototype's "viewport counts cells, not pixels" behaviour.
-///
-/// At view layer `L`, one visible cell is one target-layer node
-/// (target = `(L + 2).min(MAX_LAYER)`), so N cells of radius emit at
-/// most roughly `(2N)^3` target-layer nodes — keep modest.
 pub const RADIUS_VIEW_CELLS: f32 = 32.0;
+
+/// Within this radius (in view cells) the renderer emits entities at
+/// the fine emit layer (target − 1, giving full DETAIL_DEPTH detail).
+/// Beyond this radius out to `RADIUS_VIEW_CELLS`, it emits at the
+/// coarse layer (target − 2, one level less detail but 125× fewer
+/// entities). This LOD cascade keeps entity counts manageable while
+/// preserving fine detail close to the camera.
+pub const FINE_RADIUS_VIEW_CELLS: f32 = 8.0;
 
 // ----------------------------------------------------------------- state
 
@@ -435,10 +439,11 @@ struct WalkFrame {
 /// difference.
 fn walk(
     world: &WorldState,
-    emit_layer: u8,
-    target_layer: u8,
+    fine_emit: u8,
+    coarse_emit: u8,
     camera_pos: Vec3,
     radius_bevy: f32,
+    fine_radius_bevy: f32,
     anchor: &WorldAnchor,
     stack: &mut Vec<WalkFrame>,
     out: &mut Vec<Visit>,
@@ -470,12 +475,10 @@ fn walk(
     });
 
     let radius_sq = radius_bevy * radius_bevy;
+    let fine_radius_sq = fine_radius_bevy * fine_radius_bevy;
 
     while let Some(frame) = stack.pop() {
         let WalkFrame { node_id, path, origin_leaves, depth } = frame;
-        // Bevy-space origin of this node: delta from the anchor, in
-        // leaves, cast to `f32`. For nodes near the player the delta
-        // is small and `f32` is essentially exact.
         let n = anchor.norm;
         let origin_bevy = Vec3::new(
             (origin_leaves[0] - anchor.leaf_coord[0]) as f32 / n,
@@ -486,11 +489,6 @@ fn walk(
         let aabb_min = origin_bevy;
         let aabb_max = origin_bevy + Vec3::splat(extent);
 
-        // Per-axis "distance from camera to AABB": 0 if inside,
-        // otherwise the gap to the nearest face. L2 norm of the three
-        // gaps is the minimum distance from the camera point to the
-        // AABB. Much more accurate than a centre-based sphere test
-        // when the AABB is very large and contains the camera.
         let dx = (aabb_min.x - camera_pos.x)
             .max(0.0)
             .max(camera_pos.x - aabb_max.x);
@@ -505,8 +503,8 @@ fn walk(
             continue;
         }
 
-        // Reached the emit layer → emit.
-        if depth == emit_layer {
+        // Fine emit layer → always emit at scale 1.
+        if depth == fine_emit {
             out.push(Visit {
                 path,
                 node_id,
@@ -516,10 +514,24 @@ fn walk(
             continue;
         }
 
+        // Coarse emit layer — emit here only if outside the fine
+        // radius; otherwise keep descending to the fine layer.
+        if depth == coarse_emit && coarse_emit < fine_emit {
+            if min_dist_sq > fine_radius_sq {
+                out.push(Visit {
+                    path,
+                    node_id,
+                    origin: origin_bevy,
+                    scale: 5.0,
+                });
+                continue;
+            }
+            // Inside fine radius → fall through to descend.
+        }
+
         // Descend into children. If this node is already a leaf
         // (no children) we can't go deeper — emit it at its actual
-        // layer instead. This shouldn't happen in a fully-materialised
-        // grassland world but is safe.
+        // layer instead.
         let Some(node) = world.library.get(node_id) else { continue };
         let Some(children) = node.children.as_ref() else {
             out.push(Visit {
@@ -579,18 +591,21 @@ pub fn render_world(
     let render_total_start = bevy::platform::time::Instant::now();
 
     let target_layer = target_layer_for(zoom.layer);
-    let emit_layer = target_layer.saturating_sub(1);
+    let fine_emit = target_layer.saturating_sub(1);
+    let coarse_emit = target_layer.saturating_sub(2).max(fine_emit.saturating_sub(1));
 
     // Render radius in Bevy units = N cells × Bevy-units-per-cell at
     // the current view layer. This is what the 2D prototype does
     // implicitly (its viewport is measured in cells); without it,
     // zooming out collapses the visible world to a dot because the
     // per-cell Bevy size grows by 5× per layer.
-    let radius_bevy = RADIUS_VIEW_CELLS * anchor.cell_bevy(zoom.layer);
+    let cell = anchor.cell_bevy(zoom.layer);
+    let radius_bevy = RADIUS_VIEW_CELLS * cell;
+    let fine_radius_bevy = FINE_RADIUS_VIEW_CELLS * cell;
 
-    // If emit layer changed, first pass, or forced rebuild, drop everything.
+    // If zoom changed, first pass, or forced rebuild, drop everything.
     if !render_state.initialised
-        || render_state.last_zoom_layer != emit_layer
+        || render_state.last_zoom_layer != zoom.layer
         || render_state.force_rebuild
     {
         render_state.force_rebuild = false;
@@ -602,7 +617,7 @@ pub fn render_world(
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
         render_state.baked.clear();
         render_state.path_node.clear();
-        render_state.last_zoom_layer = emit_layer;
+        render_state.last_zoom_layer = zoom.layer;
         render_state.initialised = true;
     }
 
@@ -613,10 +628,11 @@ pub fn render_world(
     let mut visits = std::mem::take(&mut render_state.visits);
     walk(
         &world,
-        emit_layer,
-        target_layer,
+        fine_emit,
+        coarse_emit,
         camera_pos,
         radius_bevy,
+        fine_radius_bevy,
         &anchor,
         &mut walk_stack,
         &mut visits,

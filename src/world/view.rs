@@ -61,7 +61,7 @@ use super::state::{world_extent_voxels, WorldState};
 #[cfg(test)]
 use super::state::GROUND_Y_VOXELS;
 use super::tree::{
-    slot_coords, slot_index, voxel_idx, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
+    slot_coords, slot_index, voxel_idx, DETAIL_DEPTH, EMPTY_NODE, EMPTY_VOXEL, MAX_LAYER,
     NODE_VOXELS_PER_AXIS,
 };
 
@@ -147,20 +147,16 @@ pub fn cell_size_at_layer(layer: u8) -> f32 {
 }
 
 /// The layer the renderer emits entities at for a given view layer,
-/// and the layer collision samples blocks at. Ported from the 2D
-/// prototype's `subtexture_25` rule: at view layer `L`, one visible
-/// cell corresponds to one layer-`(L + 2)` node, so each emitted
-/// entity's mesh shows the fine `(L + 2)` voxel grid instead of the
-/// single layer-`L` voxel. Clamped to [`MAX_LAYER`] because you can't
-/// descend past the leaves.
+/// and the layer collision samples blocks at. At view layer `L`, one
+/// visible cell corresponds to one layer-`(L + DETAIL_DEPTH)` node.
+/// Clamped to [`MAX_LAYER`] because you can't descend past the leaves.
 ///
 /// **Every consumer that needs this rule calls this function.** Do
-/// not hardcode `(view + 2).min(MAX_LAYER)` at call sites — past
-/// bugs came from having the rule in two places and only updating
-/// one.
+/// not hardcode the depth offset at call sites — past bugs came from
+/// having the rule in two places and only updating one.
 #[inline]
 pub fn target_layer_for(view_layer: u8) -> u8 {
-    view_layer.saturating_add(2).min(MAX_LAYER)
+    view_layer.saturating_add(DETAIL_DEPTH).min(MAX_LAYER)
 }
 
 /// Bevy offset from the given `anchor` to the `-x, -y, -z` corner

@@ -18,6 +18,10 @@ pub const CHILDREN_PER_NODE: usize = 125; // 5³
 pub const NODE_VOXELS_PER_AXIS: usize = 25;
 pub const NODE_VOXELS: usize = 15_625; // 25³
 pub const MAX_LAYER: u8 = 12;
+/// How many layers of sub-cell detail the renderer shows below the
+/// current view layer. At view layer `L`, one visible cell maps to a
+/// layer-`(L + DETAIL_DEPTH)` node (clamped to `MAX_LAYER`).
+pub const DETAIL_DEPTH: u8 = 3;
 
 // ---------------------------------------------------------------- voxel
 
