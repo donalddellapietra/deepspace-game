@@ -494,7 +494,7 @@ fn build_humanoid_blueprint() -> NpcBlueprint {
             size: [sx, sy, sz],
             voxels: v,
             pivot: Vec3::new(2.0, 0.0, 2.0),
-            rest_offset: Vec3::new(-2.0, 10.0, -2.0),
+            rest_offset: Vec3::new(0.0, 10.0, 0.0),
         }
     };
 
@@ -515,7 +515,7 @@ fn build_humanoid_blueprint() -> NpcBlueprint {
             size: [sx, sy, sz],
             voxels: v,
             pivot: Vec3::new(2.0, 2.5, 1.5),
-            rest_offset: Vec3::new(-2.0, 7.5, -1.5),
+            rest_offset: Vec3::new(0.0, 7.5, 0.0),
         }
     };
 
@@ -540,10 +540,10 @@ fn build_humanoid_blueprint() -> NpcBlueprint {
         }
     };
 
-    let arm_l = make_limb("arm_l", skin, shirt, Vec3::new(1.0, 5.0, 1.0), Vec3::new(-4.0, 10.0, -1.0));
-    let arm_r = make_limb("arm_r", skin, shirt, Vec3::new(1.0, 5.0, 1.0), Vec3::new(2.0, 10.0, -1.0));
-    let leg_l = make_limb("leg_l", pants, shoe, Vec3::new(1.0, 5.0, 1.0), Vec3::new(-2.0, 5.0, -1.0));
-    let leg_r = make_limb("leg_r", pants, shoe, Vec3::new(1.0, 5.0, 1.0), Vec3::new(0.0, 5.0, -1.0));
+    let arm_l = make_limb("arm_l", skin, shirt, Vec3::new(1.0, 5.0, 1.0), Vec3::new(-3.0, 10.0, 0.0));
+    let arm_r = make_limb("arm_r", skin, shirt, Vec3::new(1.0, 5.0, 1.0), Vec3::new(3.0, 10.0, 0.0));
+    let leg_l = make_limb("leg_l", pants, shoe, Vec3::new(1.0, 5.0, 1.0), Vec3::new(-1.0, 5.0, 0.0));
+    let leg_r = make_limb("leg_r", pants, shoe, Vec3::new(1.0, 5.0, 1.0), Vec3::new(1.0, 5.0, 0.0));
 
     let mut animations = HashMap::new();
 
