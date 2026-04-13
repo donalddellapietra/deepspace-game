@@ -5,12 +5,22 @@ camera chooses which layer of the tree to play on.
 
 Built with [Bevy 0.18](https://bevyengine.org/) in Rust.
 
-## Design principle
+## Design principles
 
 **Layer-uniform UX.** The experience at every view layer must be
 identical — same code paths, same visual proportions, same interaction
 feel. Zooming is purely a scale change, never a mode switch. If
 something works at layers 9–12 but degrades at layer 8, that is a bug.
+
+**Canned structures, not procedural generation.** World content is
+precomputed offline and loaded at runtime. A fixed library of unique
+patterns at each layer provides combinatorial variety (10,000 patterns
+per layer × 7 layers = effectively infinite worlds) while keeping
+startup instant and dedup perfect. No noise evaluation at runtime, no
+generation budgets, no pop-in. Terrain, biomes, cities, and simulations
+are all canned structures — snapshots of offline computations stored in
+the same content-addressed library. See
+[docs/architecture/canned-structures.md](docs/architecture/canned-structures.md).
 
 ## Concept
 
@@ -177,11 +187,18 @@ the ~rare 64-bit collision. Inserting a non-leaf refs all 125 of its
 children; decrementing a refcount to zero evicts and cascades.
 
 `WorldState` holds one `NodeId` (the root) and owns the library. The
-root is rebuilt via an `insert_leaf`+`insert_non_leaf` chain that
-bootstraps an infinite grassland with a `GROUND_Y_VOXELS = 5^(MAX_LAYER-1)`-deep
-solid surface and air above it — deep enough that the ground spans at
-least 5 view cells at every zoom level. Thanks to dedup that collapses
-to 25 library entries total (2 leaves + 2 patterns per layer + 1 root).
+library is populated from **canned structures** — precomputed patterns
+generated offline by a build tool and serialized to disk. At runtime,
+the game deserializes the library and root, paying zero generation cost.
+Dedup is the design, not an optimization: a planet is composed of
+patterns selected from a bounded library, giving combinatorial variety
+from bounded storage. Player edits create new unique entries via
+`install_subtree`; everything else is a library hit.
+
+For development, a grassland bootstrap generates a minimal tree
+in-process (~25 library entries). For production, the build tool
+generates the full world (terrain, biomes, structures) and the game
+loads the result.
 
 ### Coordinates
 

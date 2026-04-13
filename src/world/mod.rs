@@ -20,6 +20,7 @@ pub mod generator;
 pub mod overlay;
 pub mod position;
 pub mod render;
+pub mod serial;
 pub mod state;
 pub mod tree;
 pub mod view;

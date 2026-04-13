@@ -109,10 +109,39 @@ pub const fn world_extent_voxels() -> i64 {
 pub struct WorldState {
     pub root: NodeId,
     pub library: NodeLibrary,
+    /// The library's `next_id` at the time the canned world was loaded.
+    /// Nodes with `id >= canned_node_count` were created at runtime
+    /// (player edits) and should be included in save files.
+    /// Zero if no canned world was loaded (in-process generation).
+    pub canned_node_count: u64,
+    /// Hash of the canned world, for save file validation.
+    pub canned_world_hash: u64,
 }
+
+const WORLD_BIN_PATH: &str = "assets/world.bin";
 
 impl Default for WorldState {
     fn default() -> Self {
+        // Try to load a pre-generated canned world from disk.
+        if let Ok((root, library, next_id)) =
+            super::serial::read_world_file(std::path::Path::new(WORLD_BIN_PATH))
+        {
+            let hash = super::serial::canned_world_hash(root, next_id, library.len());
+            eprintln!(
+                "loaded canned world: {} library entries, {:.1} KB",
+                library.len(),
+                std::fs::metadata(WORLD_BIN_PATH)
+                    .map(|m| m.len() as f64 / 1024.0)
+                    .unwrap_or(0.0),
+            );
+            return Self {
+                root,
+                library,
+                canned_node_count: next_id,
+                canned_world_hash: hash,
+            };
+        }
+        // Fall back to in-process generation.
         Self::new_sphere()
     }
 }
@@ -123,6 +152,8 @@ impl WorldState {
         let mut state = Self {
             root: EMPTY_NODE,
             library: NodeLibrary::default(),
+            canned_node_count: 0,
+            canned_world_hash: 0,
         };
         let params = SphereParams {
             center: sphere_center(),
@@ -256,6 +287,8 @@ impl WorldState {
         let mut state = Self {
             root: EMPTY_NODE,
             library: NodeLibrary::default(),
+            canned_node_count: 0,
+            canned_world_hash: 0,
         };
         state.build_grassland_root();
         state
@@ -279,6 +312,34 @@ impl WorldState {
     /// No-op when `new_root_id == self.root` so callers can be lazy
     /// about checking. This also keeps round-trip edits (edit then
     /// undo) from uselessly ref-cycling the same id.
+    /// Save the current game state (player edits) to a file.
+    /// Only nodes created at runtime (id >= canned_node_count) are saved.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        super::serial::write_save_file(
+            path,
+            self.root,
+            &self.library,
+            self.canned_node_count,
+            self.canned_world_hash,
+        )
+    }
+
+    /// Load a save file on top of the current canned world.
+    /// Replaces the root and inserts override nodes into the library.
+    pub fn load_save_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let new_root = super::serial::read_save_file(
+            path,
+            &mut self.library,
+            self.canned_world_hash,
+        )?;
+        // Don't use swap_root here — load_save already ref_inc'd the
+        // new root and rebuilt all refcounts. We just need to update
+        // the root pointer. The old root's ref was already decremented
+        // by the rebuild.
+        self.root = new_root;
+        Ok(())
+    }
+
     pub fn swap_root(&mut self, new_root_id: NodeId) {
         if new_root_id == self.root {
             return;
