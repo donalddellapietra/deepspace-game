@@ -455,7 +455,7 @@ impl Plugin for NpcPlugin {
                     js_spawn_bridge,
                     npc_buf_ai,
                     npc_buf_animate,
-                    // npc_buf_physics disabled — tree collision too slow for scale.
+                    npc_buf_physics,
                     npc_despawn_on_zoom,
                     sync_gpu_uniforms,
                     collect_overlays_from_buffer
@@ -1044,10 +1044,12 @@ fn npc_buf_animate(
     }
 }
 
+/// Heightmap-based physics: O(1) ground sampling instead of tree walks.
 fn npc_buf_physics(
     time: Res<Time>,
-    world: Res<WorldState>,
     zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
+    heightmap: Res<crate::world::heightmap::NpcHeightmap>,
     mut npc_buffer: ResMut<NpcBuffer>,
 ) {
     let dt = time.delta_secs();
@@ -1055,9 +1057,32 @@ fn npc_buf_physics(
 
     for npc in &mut npc_buffer.npcs {
         if !npc.alive { continue; }
+
+        // Apply gravity.
         npc.velocity.y -= NPC_GRAVITY_CELLS * cell * dt;
-        let h_delta = bevy::math::Vec2::new(npc.velocity.x * cell * dt, npc.velocity.z * cell * dt);
-        collision::move_and_collide(&mut npc.position, &mut npc.velocity, h_delta, dt, &world, zoom.layer);
+
+        // Update position in bevy space via the heightmap.
+        let bevy_pos = bevy_from_position(&npc.position, &anchor);
+        let new_x = bevy_pos.x + npc.velocity.x * cell * dt;
+        let new_z = bevy_pos.z + npc.velocity.z * cell * dt;
+        let new_y = bevy_pos.y + npc.velocity.y * dt;
+
+        // Sample heightmap for ground level.
+        let ground_y = heightmap.sample(new_x, new_z);
+
+        // Clamp to ground.
+        let final_y = if new_y <= ground_y {
+            npc.velocity.y = 0.0;
+            ground_y
+        } else {
+            new_y
+        };
+
+        // Convert back to Position.
+        let new_bevy = Vec3::new(new_x, final_y, new_z);
+        if let Some(new_pos) = position_from_bevy(new_bevy, &anchor) {
+            npc.position = new_pos;
+        }
     }
 }
 
