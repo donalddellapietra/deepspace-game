@@ -580,21 +580,26 @@ fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, segm
     let mut positions = Vec::with_capacity(vert_count);
     let mut normals = Vec::with_capacity(vert_count);
     let mut uvs = Vec::with_capacity(vert_count);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(vert_count);
     let mut indices = Vec::with_capacity(segments as usize * 6);
 
     for i in 0..=segments {
         let angle = (i as f32 / segments as f32) * TAU;
         let (sin_a, cos_a) = angle.sin_cos();
 
-        // Inner vertex
+        // Inner vertex — darkened via vertex color AO to match the
+        // SSAO-darkened terrain at the render boundary.  The BSL shader
+        // reads vertex_color.r as AO (squared, mixed with ao_strength).
         positions.push([cos_a * inner_r, 0.0, sin_a * inner_r]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([i as f32 / segments as f32, 0.0]);
+        colors.push([0.35, 0.35, 0.35, 1.0]);
 
-        // Outer vertex
+        // Outer vertex — full brightness (atmosphere fogs it anyway).
         positions.push([cos_a * outer_r, 0.0, sin_a * outer_r]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([i as f32 / segments as f32, 1.0]);
+        colors.push([1.0, 1.0, 1.0, 1.0]);
     }
 
     for i in 0..segments {
@@ -616,6 +621,7 @@ fn make_annulus_mesh(meshes: &mut Assets<Mesh>, inner_r: f32, outer_r: f32, segm
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
     meshes.add(mesh)
 }
@@ -936,13 +942,17 @@ pub fn render_world(
             render_state.imposter_mesh.clone().unwrap()
         };
 
-        // Position centered on camera XZ at ground level (Y=0 in anchor
-        // space). The generous inner overlap means the seam is always
-        // hidden under the 3D terrain blocks.
+        // Position centered on camera XZ. Y is at the top of the terrain
+        // surface (one cell above Y=0) so the annulus meets the terrain
+        // top face, hiding the dark side faces of edge blocks.
+        let cell = anchor.cell_bevy(zoom.layer);
         let entity = commands.spawn((
             Mesh3d(annulus),
             MeshMaterial3d(grass_mat.clone()),
-            Transform::from_translation(Vec3::new(camera_pos.x, 0.0, camera_pos.z)),
+            // Y at 1.5 cells above ground — covers the dark side faces
+            // of the outermost terrain blocks. Confirmed via A/B testing:
+            // cell*1.0 shows a dark ring, cell*1.5 eliminates it.
+            Transform::from_translation(Vec3::new(camera_pos.x, cell * 1.5, camera_pos.z)),
             Visibility::Visible,
             bevy::light::NotShadowCaster,
             bevy::light::NotShadowReceiver,
