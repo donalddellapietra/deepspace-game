@@ -128,7 +128,10 @@ fn update_shadow_cascades(
     for mut config in &mut lights {
         *config = CascadeShadowConfigBuilder {
             first_cascade_far_bound: 10.0 * cell,
-            maximum_distance: radius,
+            // Extend past clip_radius so the low-resolution cascade
+            // boundary (with visible block-shaped shadow artifacts)
+            // falls on clipped/invisible terrain, not the visible edge.
+            maximum_distance: radius * 2.0,
             overlap_proportion: 0.4,
             ..default()
         }
