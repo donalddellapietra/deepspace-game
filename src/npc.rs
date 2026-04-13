@@ -378,7 +378,7 @@ impl NpcState {
             position,
             velocity: Vec3::ZERO,
             heading,
-            ai_timer: 2.0 + rand_f32() * 3.0,
+            ai_timer: 3.0, // Set by caller with seeded random
             anim_time: 0.0,
             part_transforms: [(Vec3::ZERO, Quat::IDENTITY); MAX_PARTS],
             num_parts: num_parts.min(MAX_PARTS) as u8,

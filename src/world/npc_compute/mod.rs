@@ -55,24 +55,7 @@ impl Plugin for NpcComputePlugin {
         NPC_COMPUTE_SHADER.set(handle).ok();
 
         app.init_resource::<NpcGpuData>();
-        app.add_plugins((
-            ExtractResourcePlugin::<NpcGpuData>::default(),
-        ));
-
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app
-            .add_systems(RenderStartup, init_npc_compute_pipeline)
-            .add_systems(
-                Render,
-                pipeline::prepare_npc_bind_group
-                    .in_set(RenderSystems::PrepareBindGroups),
-            );
-
-        let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
-        render_graph.add_node(NpcComputeLabel, NpcComputeNode::default());
-        render_graph.add_node_edge(
-            NpcComputeLabel,
-            bevy::render::graph::CameraDriverLabel,
-        );
+        // TODO: Enable compute render systems when shader is wired.
+        // For now, just register the resource for the main world spawn bridge.
     }
 }
