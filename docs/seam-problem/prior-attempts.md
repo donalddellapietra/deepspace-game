@@ -121,3 +121,23 @@ Note: attempts 1–6 were based on the incorrect assumption that seams were betw
 **Result**: Ineffective — the AO discontinuities are too dark (brightness as low as 0.6, AO level 0). Clamping to 0.9 still leaves visible jumps from 0.9 to 1.0.
 
 **Status**: Reverted.
+
+### 12. Bevy SSAO (replace vertex AO entirely)
+
+**Theory**: Remove vertex-color AO and use Bevy's built-in `ScreenSpaceAmbientOcclusion` which computes AO per-pixel from the depth buffer. No mesh topology dependence → no child boundary seams.
+
+**Change**: Set all vertex colors to `[1.0, 1.0, 1.0, 1.0]` in mesher, added `ScreenSpaceAmbientOcclusion` to camera, `Msaa::Off`.
+
+**Result**: Seams disappeared, but SSAO was invisible in sunlit areas because Bevy's SSAO only affects indirect/ambient lighting, not direct lighting (by design — physically correct but wrong for the Minecraft aesthetic). When we hacked the BSL shader to read `diffuse_occlusion` and multiply the full lighting result, it created rings of darkness at different zoom levels because SSAO's screen-space radius doesn't adapt to the voxel engine's layer/zoom system.
+
+**Status**: Reverted. SSAO is fundamentally incompatible with a multi-scale voxel engine.
+
+### 13. Full-grid AO recomputation in `merge_child_faces`
+
+**Theory**: Keep per-child greedy merge for geometry (preserving incremental baking), but recompute AO per-vertex from the full 125³ grid post-merge. Each vertex gets AO from its own corner voxel using the full grid, so both sides of a child boundary agree.
+
+**Change**: `merge_child_faces` takes the flat grid, and for each vertex in the merged mesh, recovers the owning voxel from the vertex position/normal, then computes AO by sampling the full grid.
+
+**Result**: Extremely slow — the per-vertex AO recomputation for every vertex in every merged mesh on every bake made the game unplayable. Also the initial implementation was buggy (used min corner of quad for all 4 vertices instead of per-vertex recovery).
+
+**Status**: Reverted. The approach is correct in principle but too expensive to run in `merge_child_faces` which is called on every edit.
