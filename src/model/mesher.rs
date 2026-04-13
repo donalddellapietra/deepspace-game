@@ -473,7 +473,6 @@ pub fn merge_child_faces(
             let mut merged = FaceData::default();
             for child in children {
                 if let Some(data) = child.get(&voxel) {
-                    // Append with index offset.
                     let base = merged.positions.len() as u32;
                     merged.positions.extend_from_slice(&data.positions);
                     merged.normals.extend_from_slice(&data.normals);
@@ -484,13 +483,35 @@ pub fn merge_child_faces(
                 }
             }
             if merged.is_empty() {
-                None
-            } else {
-                Some(BakedSubMesh {
-                    mesh: meshes.add(merged.build()),
-                    voxel,
-                })
+                return None;
             }
+
+            // Smooth AO at child boundaries: the per-child greedy merge
+            // can't merge across 25-voxel child edges, so adjacent
+            // children's quads can have different AO levels at their
+            // shared edge, creating visible dark lines. Setting
+            // boundary vertices to full brightness removes the
+            // discontinuity without affecting interior AO or the
+            // incremental baking cache.
+            let child_size: f32 = 25.0;
+            let eps = 0.01;
+            for (i, pos) in merged.positions.iter().enumerate() {
+                let on_child_edge =
+                    (pos[0] % child_size).abs() < eps
+                    || (child_size - pos[0] % child_size).abs() < eps
+                    || (pos[1] % child_size).abs() < eps
+                    || (child_size - pos[1] % child_size).abs() < eps
+                    || (pos[2] % child_size).abs() < eps
+                    || (child_size - pos[2] % child_size).abs() < eps;
+                if on_child_edge {
+                    merged.colors[i] = [1.0, 1.0, 1.0, 1.0];
+                }
+            }
+
+            Some(BakedSubMesh {
+                mesh: meshes.add(merged.build()),
+                voxel,
+            })
         })
         .collect()
 }
