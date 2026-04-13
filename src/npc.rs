@@ -841,7 +841,7 @@ pub fn collect_overlays(
     >,
     mut overlay_list: ResMut<OverlayList>,
 ) {
-    overlay_list.entries.clear();
+    overlay_list.clear_and_recycle();
 
     let Some(tree_bp) = tree_bp else { return };
 
@@ -880,23 +880,24 @@ pub fn collect_overlays(
             continue;
         }
 
-        let parts: Vec<OverlayPart> = tree_bp
-            .parts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tp)| {
-                let (offset, rotation) = part_tf.transforms.get(i)?;
-                let node_id = overrides
-                    .and_then(|o| o.overrides.get(&i).copied())
-                    .unwrap_or(tp.node_id);
-                Some(OverlayPart {
-                    node_id,
-                    offset: *offset,
-                    rotation: *rotation,
-                    pivot: tp.pivot,
-                })
-            })
-            .collect();
+        // Reuse a Vec from a previous frame's entry if available,
+        // otherwise allocate. Avoids per-NPC heap alloc every frame.
+        let mut parts = overlay_list.pop_spare_parts();
+        parts.clear();
+        for (i, tp) in tree_bp.parts.iter().enumerate() {
+            let Some((offset, rotation)) = part_tf.transforms.get(i) else {
+                continue;
+            };
+            let node_id = overrides
+                .and_then(|o| o.overrides.get(&i).copied())
+                .unwrap_or(tp.node_id);
+            parts.push(OverlayPart {
+                node_id,
+                offset: *offset,
+                rotation: *rotation,
+                pivot: tp.pivot,
+            });
+        }
 
         overlay_list.entries.push(OverlayInstance {
             id: entity,
