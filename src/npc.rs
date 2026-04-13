@@ -1060,24 +1060,32 @@ fn npc_buf_physics(
     for npc in &mut npc_buffer.npcs {
         if !npc.alive { continue; }
 
-        npc.velocity.y -= NPC_GRAVITY_CELLS * cell * dt;
-
         let bevy_pos = bevy_from_position(&npc.position, &anchor);
         let new_x = bevy_pos.x + npc.velocity.x * cell * dt;
         let new_z = bevy_pos.z + npc.velocity.z * cell * dt;
-        let new_y = bevy_pos.y + npc.velocity.y * dt;
 
         // Cached ground lookup: O(1) after first query per cell.
         let ground_y = ground_cache.ground_y(
             &world, &anchor, zoom.layer, new_x, new_z, cell,
         );
 
-        let final_y = if new_y <= ground_y {
+        // If cache returned 0 (budget exhausted), keep current height.
+        let ground_y = if ground_y == 0.0 && bevy_pos.y > 0.5 {
+            bevy_pos.y
+        } else {
+            ground_y
+        };
+
+        // Apply gravity only when above ground.
+        let new_y = if bevy_pos.y > ground_y + 0.01 {
+            npc.velocity.y -= NPC_GRAVITY_CELLS * cell * dt;
+            bevy_pos.y + npc.velocity.y * dt
+        } else {
             npc.velocity.y = 0.0;
             ground_y
-        } else {
-            new_y
         };
+
+        let final_y = new_y.max(ground_y);
 
         let new_bevy = Vec3::new(new_x, final_y, new_z);
         if let Some(new_pos) = position_from_bevy(new_bevy, &anchor) {

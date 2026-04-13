@@ -204,7 +204,7 @@ pub fn remove_block(
     // Invalidate ground cache near the edit.
     let cell = crate::world::view::cell_size_at_layer(zoom.layer);
     let hit_center = crate::world::view::bevy_center_of_layer_pos(lp, &anchor);
-    ground_cache.invalidate_near(hit_center.x, hit_center.z, cell, 3);
+    ground_cache.invalidate_near(hit_center.x, hit_center.z, &anchor, cell, 3);
 }
 
 /// Right-click → place the active hotbar block on the face of the
@@ -296,5 +296,5 @@ pub fn place_block(
     }
 
     // Invalidate ground cache near placement.
-    ground_cache.invalidate_near(place_center.x, place_center.z, cell_size, 3);
+    ground_cache.invalidate_near(place_center.x, place_center.z, &anchor, cell_size, 3);
 }
