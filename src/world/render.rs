@@ -138,10 +138,10 @@ pub struct RenderState {
     /// GPU meshes so edits can incrementally re-bake only the dirty
     /// children instead of the full 125³ grid.
     baked: HashMap<NodeId, BakedNode>,
-    /// Prebaked mesh data loaded from `assets/meshes.bin`. Consumed
-    /// on first use: the raw `FaceData` is converted to a Bevy
-    /// `Handle<Mesh>` and moved into `baked`.
-    prebaked: Option<super::serial::PrebakedMeshes>,
+    /// On-demand mesh loader: index (small, loaded at startup) +
+    /// file reader (seeks into meshes.bin per node).
+    mesh_index: Option<super::serial::MeshIndexMap>,
+    mesh_reader: Option<super::serial::MeshReader>,
     prebaked_loaded: bool,
     /// Per-path tracking: remembers which `NodeId` each path last
     /// displayed. Used to find the old `BakedNode` for incremental
@@ -627,17 +627,24 @@ pub fn render_world(
     let camera_pos = camera_tf.translation;
     let render_total_start = std::time::Instant::now();
 
-    // Load prebaked meshes from disk on first frame.
+    // Load mesh index on first frame (small — just NodeId→offset map).
     if !render_state.prebaked_loaded {
         render_state.prebaked_loaded = true;
-        let path = std::path::Path::new("assets/meshes.bin");
-        match super::serial::read_prebaked_file(path) {
-            Ok(prebaked) => {
-                eprintln!("loaded prebaked meshes: {} entries", prebaked.len());
-                render_state.prebaked = Some(prebaked);
+        let idx_path = std::path::Path::new("assets/meshes.idx");
+        let bin_path = std::path::Path::new("assets/meshes.bin");
+        match super::serial::MeshIndexMap::load(idx_path) {
+            Ok(index) => {
+                eprintln!("loaded mesh index: {} entries", index.len());
+                render_state.mesh_index = Some(index);
+                match super::serial::MeshReader::open(bin_path) {
+                    Ok(reader) => {
+                        render_state.mesh_reader = Some(reader);
+                    }
+                    Err(e) => eprintln!("failed to open meshes.bin: {}", e),
+                }
             }
             Err(e) => {
-                eprintln!("no prebaked meshes ({}), will cold bake", e);
+                eprintln!("no mesh index ({}), will cold bake", e);
             }
         }
     }
@@ -704,11 +711,15 @@ pub fn render_world(
                 .expect("render: node missing from library");
 
             if !render_state.baked.contains_key(&v.node_id) {
-                // Try prebaked cache first (fast: just GPU upload).
-                if let Some(entry) = render_state.prebaked
-                    .as_mut()
-                    .and_then(|p| p.remove(&v.node_id))
-                {
+                // Try on-demand prebaked load (seek + decompress + GPU upload).
+                let prebaked_entry = render_state.mesh_index
+                    .as_ref()
+                    .and_then(|idx| idx.get(v.node_id))
+                    .and_then(|(offset, len)| {
+                        render_state.mesh_reader.as_mut()
+                            .and_then(|r| r.read_entry(offset, len).ok())
+                    });
+                if let Some(entry) = prebaked_entry {
                     let merged: Vec<BakedSubMesh> = entry
                         .into_iter()
                         .map(|(voxel, data)| BakedSubMesh {
@@ -767,6 +778,71 @@ pub fn render_world(
             .filter(|v| !render_state.baked.contains_key(&v.node_id))
             .count();
         timings.unbaked = unbaked;
+    }
+
+    // Prefetch: load meshes for nodes the player is approaching (wider
+    // radius) and for adjacent zoom layers. Budget-limited per frame.
+    {
+        const PREFETCH_BUDGET: usize = 32;
+        let mut prefetched = 0usize;
+
+        // Prefetch layers: current zoom ± 1 (anticipate zoom in/out).
+        let prefetch_layers: Vec<u8> = {
+            let mut layers = vec![zoom.layer];
+            if zoom.layer > MIN_ZOOM { layers.push(zoom.layer - 1); }
+            if zoom.layer < MAX_ZOOM { layers.push(zoom.layer + 1); }
+            layers
+        };
+
+        let mut prefetch_stack = std::mem::take(&mut render_state.walk_stack);
+        let mut prefetch_visits = std::mem::take(&mut render_state.visits);
+
+        for &pf_layer in &prefetch_layers {
+            if prefetched >= PREFETCH_BUDGET { break; }
+            let pf_target = target_layer_for(pf_layer);
+            let pf_emit = pf_target.saturating_sub(1);
+            // 2× render radius for spatial prefetch.
+            let pf_radius = 2.0 * RADIUS_VIEW_CELLS * cell_size_at_layer(pf_layer);
+
+            walk(
+                &world, pf_emit, pf_target,
+                camera_pos, pf_radius, &anchor,
+                &mut prefetch_stack, &mut prefetch_visits,
+            );
+
+            for pv in prefetch_visits.iter() {
+                if prefetched >= PREFETCH_BUDGET { break; }
+                if render_state.baked.contains_key(&pv.node_id) { continue; }
+
+                let entry = render_state.mesh_index
+                    .as_ref()
+                    .and_then(|idx| idx.get(pv.node_id))
+                    .and_then(|(offset, len)| {
+                        render_state.mesh_reader.as_mut()
+                            .and_then(|r| r.read_entry(offset, len).ok())
+                    });
+                if let Some(entry) = entry {
+                    let merged: Vec<BakedSubMesh> = entry
+                        .into_iter()
+                        .map(|(voxel, data)| BakedSubMesh {
+                            mesh: meshes.add(data.build()),
+                            voxel,
+                        })
+                        .collect();
+                    render_state.baked.insert(pv.node_id, BakedNode {
+                        child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],
+                        child_class: Vec::new(),
+                        flat_grid: Vec::new(),
+                        child_faces: Vec::new(),
+                        merged,
+                    });
+                    prefetched += 1;
+                }
+            }
+        }
+
+        render_state.walk_stack = prefetch_stack;
+        render_state.visits = prefetch_visits;
     }
 
     // Reconcile: what's alive now, what changed, what's gone.

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use deepspace_game::world::render::prebake_node_raw;
 use deepspace_game::world::serial::{
-    write_prebaked_file, write_world_file, PrebakedMeshes,
+    write_prebaked_indexed, write_world_file, PrebakedMeshes,
 };
 use deepspace_game::world::state::WorldState;
 use deepspace_game::world::tree::EMPTY_NODE;
@@ -74,18 +74,18 @@ fn main() {
         bake_start.elapsed().as_secs_f64(),
     );
 
-    // Write meshes.bin.
+    // Write meshes.idx + meshes.bin (indexed format for on-demand loading).
+    let idx_path = PathBuf::from("assets/meshes.idx");
     let meshes_path = PathBuf::from("assets/meshes.bin");
-    eprintln!("writing {}...", meshes_path.display());
-    write_prebaked_file(&meshes_path, &prebaked)
+    eprintln!("writing {} + {}...", idx_path.display(), meshes_path.display());
+    write_prebaked_indexed(&idx_path, &meshes_path, &prebaked)
         .expect("failed to write prebaked meshes");
-    let meshes_size = std::fs::metadata(&meshes_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let idx_size = std::fs::metadata(&idx_path).map(|m| m.len()).unwrap_or(0);
+    let meshes_size = std::fs::metadata(&meshes_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
-        "  wrote {} ({:.1} KB)",
-        meshes_path.display(),
-        meshes_size as f64 / 1024.0,
+        "  wrote {} ({:.1} KB) + {} ({:.1} KB)",
+        idx_path.display(), idx_size as f64 / 1024.0,
+        meshes_path.display(), meshes_size as f64 / 1024.0,
     );
 
     eprintln!(
