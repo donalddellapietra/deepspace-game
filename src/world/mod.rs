@@ -79,7 +79,7 @@ impl Plugin for WorldPlugin {
                 Update,
                 render::render_world
                     .after(crate::player::derive_transforms)
-                    .after(crate::npc::collect_overlays),
+                    .after(crate::npc::collect_overlays_from_buffer),
             );
     }
 }

@@ -3,7 +3,7 @@ use bevy::diagnostic::{
 };
 use bevy::prelude::*;
 
-use crate::npc::Npc;
+use crate::npc::NpcBuffer;
 use crate::player::Player;
 use crate::world::state::GROUND_Y_VOXELS;
 use crate::world::view::{position_to_leaf_coord, target_layer_for};
@@ -183,7 +183,7 @@ fn log_diag(
 #[cfg(target_arch = "wasm32")]
 fn expose_perf_to_js(
     diagnostics: Res<DiagnosticsStore>,
-    npc_q: Query<(), With<Npc>>,
+    npc_buffer: Res<NpcBuffer>,
 ) {
     use wasm_bindgen::prelude::*;
 
@@ -205,7 +205,7 @@ fn expose_perf_to_js(
         .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
         .and_then(|d| d.value())
         .unwrap_or(0.0);
-    let npc_count = npc_q.iter().count() as f64;
+    let npc_count = npc_buffer.len() as f64;
 
     set_perf_data(fps, frame_time_ms, entity_count, npc_count);
 }

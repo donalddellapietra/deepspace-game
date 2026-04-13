@@ -54,10 +54,10 @@ impl Plugin for InteractionPlugin {
                     toggle_entity_edit_mode,
                     update_target
                         .after(crate::player::sync_anchor_to_player)
-                        .after(crate::npc::collect_overlays),
+                        .after(crate::npc::collect_overlays_from_buffer),
                     draw_highlight
                         .after(update_target)
-                        .after(crate::npc::collect_overlays),
+                        .after(crate::npc::collect_overlays_from_buffer),
                 ),
             );
     }
