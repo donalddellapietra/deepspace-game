@@ -928,17 +928,9 @@ pub fn render_world(
         let outer_radius = radius_bevy * IMPOSTER_RADIUS_MULT;
         let inner_radius = radius_bevy * 0.5; // generous overlap — annulus hides under terrain
 
-        // Rebuild the annulus mesh when the zoom layer changes (radii change).
-        // Otherwise reuse the cached mesh.
-        // Inner edge raised by 2 cells to cover terrain side faces.
-        // The slope from inner_y down to Y=0 at the outer edge is gentle
-        // enough to not be visible as a floating layer.
-        let cell = anchor.cell_bevy(zoom.layer);
-        let inner_y = cell * 2.0;
-
         let needs_rebuild = render_state.imposter_mesh.is_none();
         let annulus = if needs_rebuild {
-            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, inner_y, 64);
+            let mesh = make_annulus_mesh(&mut meshes, inner_radius, outer_radius, 0.0, 64);
             render_state.imposter_mesh = Some(mesh.clone());
             mesh
         } else {
@@ -954,7 +946,6 @@ pub fn render_world(
             Transform::from_translation(Vec3::new(camera_pos.x, 0.0, camera_pos.z)),
             Visibility::Visible,
             bevy::light::NotShadowCaster,
-            bevy::light::NotShadowReceiver,
         )).id();
         render_state.imposter_entities.push(entity);
 

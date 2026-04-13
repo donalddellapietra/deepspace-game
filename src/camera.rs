@@ -108,12 +108,12 @@ fn spawn_camera(
         Transform::default(),
         Tonemapping::AcesFitted,
         ShadowFilteringMethod::Gaussian,
-        ScreenSpaceAmbientOcclusion {
-            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
-            // Higher thickness = samples stay closer to the surface,
-            // reducing noise on thin voxel geometry.
-            constant_object_thickness: 4.0,
-        },
+        // SSAO disabled: it creates a dark halo ring at the terrain edge
+        // due to the depth discontinuity (terrain → disk/sky). Confirmed
+        // via A/B test — disabling SSAO eliminates the dark ring entirely.
+        // constant_object_thickness values up to 100 don't help.
+        // TODO: re-enable with edge-aware masking near the horizon.
+        // ScreenSpaceAmbientOcclusion { ... },
         // Bloom only on bright highlights (threshold 0.8) — sky, sun
         // reflections, emissive blocks. Energy-conserving mode adds
         // glow without washing out. Reduced max_mip_dimension cuts
