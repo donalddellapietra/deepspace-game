@@ -8,7 +8,7 @@ dev = ["bevy/dynamic_linking"]
 debug_import = []
 
 [dependencies]
-bevy = { version = "0.18", features = ["experimental_bevy_ui_widgets"] }
+bevy = { version = "0.18", features = ["experimental_bevy_ui_widgets", "webgpu"] }
 dot_vox = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

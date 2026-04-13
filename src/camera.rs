@@ -10,8 +10,8 @@ use bevy::{
     render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
 };
 
-#[cfg(not(target_arch = "wasm32"))]
 use bevy::pbr::{Atmosphere, AtmosphereSettings, ScatteringMedium};
+use bevy::post_process::dof::{DepthOfField, DepthOfFieldMode};
 
 use crate::player::{Player, PLAYER_HEIGHT};
 use crate::world::view::{cell_size_at_layer, scale_for_layer, target_layer_for, WorldAnchor};
@@ -81,8 +81,8 @@ impl Plugin for CameraPlugin {
                         .after(tick_zoom_transition)
                         .after(crate::player::derive_transforms)
                         .after(crate::ui::sync_cursor),
-                    #[cfg(not(target_arch = "wasm32"))]
                     sync_atmosphere_scale,
+                    sync_horizon_dof,
                 ),
             );
     }
@@ -100,7 +100,6 @@ pub struct CursorLocked(pub bool);
 
 fn spawn_camera(
     mut commands: Commands,
-    #[cfg(not(target_arch = "wasm32"))]
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
     let mut cam = commands.spawn((
@@ -169,15 +168,22 @@ fn spawn_camera(
         Msaa::Off,
     ));
 
-    // Procedural atmosphere requires storage buffers (not available on WebGL2).
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
-        cam.insert(Atmosphere {
+    let medium = scattering_mediums.add(ScatteringMedium::earthlike(256, 256));
+    cam.insert((
+        Atmosphere {
             ground_albedo: Vec3::new(0.3, 0.6, 0.2),
             ..Atmosphere::earthlike(medium)
-        });
-    }
+        },
+        // DOF blurs the horizon where imposters meet sky.
+        DepthOfField {
+            mode: DepthOfFieldMode::Gaussian,
+            focal_distance: 200.0,
+            sensor_height: 10.0,
+            aperture_f_stops: 1.0,
+            max_circle_of_confusion_diameter: 16.0,
+            max_depth: 1000.0,
+        },
+    ));
 }
 
 fn spawn_crosshair(mut commands: Commands) {
@@ -229,7 +235,6 @@ fn first_person_camera(
 /// Keep the aerial-view LUT range in sync with the actual view
 /// distance so atmospheric fog distributes evenly across all visible
 /// chunks (avoiding banding at chunk boundaries).
-#[cfg(not(target_arch = "wasm32"))]
 fn sync_atmosphere_scale(
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
@@ -248,5 +253,23 @@ fn sync_atmosphere_scale(
         // sees a consistent ~2m camera altitude regardless of zoom.
         settings.scene_units_to_m = 1.0 / cell_bevy;
         settings.aerial_view_lut_max_distance = view_radius / cell_bevy;
+    }
+}
+
+/// Sync DOF so the far edge of the imposter ring blurs into the sky.
+fn sync_horizon_dof(
+    zoom: Res<CameraZoom>,
+    anchor: Res<WorldAnchor>,
+    mut cam_q: Query<&mut DepthOfField, With<FpsCam>>,
+) {
+    if !zoom.is_changed() {
+        return;
+    }
+    let cell_bevy = anchor.cell_bevy(zoom.layer);
+    let view_radius = crate::world::render::RADIUS_VIEW_CELLS * cell_bevy;
+    // Focus at the inner terrain edge; imposters beyond blur into sky.
+    for mut dof in &mut cam_q {
+        dof.focal_distance = view_radius * 0.5;
+        dof.max_depth = view_radius * 3.5;
     }
 }

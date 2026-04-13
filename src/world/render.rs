@@ -606,9 +606,11 @@ fn collect_imposters(
 ) -> Vec<(Vec3, f32)> {
     if world.root == EMPTY_NODE { return Vec::new(); }
 
-    // Walk at 2 layers coarser than the current emit layer.
-    // Each level up covers 5× more space, so 2 levels = 25× bigger nodes.
-    let imposter_depth = emit_layer.saturating_sub(2).max(1);
+    // Walk at the same emit layer as the main render pass.
+    // Imposters are just flat quads at the same granularity but
+    // extending further. Using a coarser depth doesn't work because
+    // each node is too large relative to the render radius.
+    let imposter_depth = emit_layer;
 
     let mut results = Vec::new();
     let mut stack: Vec<WalkFrame> = Vec::new();
@@ -658,13 +660,17 @@ fn collect_imposters(
 
         // At imposter depth: emit if outside inner radius
         if depth == imposter_depth {
-            // Only emit if the node's nearest point is beyond the inner radius
-            // (so we don't double-render what the main pass already covers)
             if min_dist_sq > inner_sq * 0.8 {
-                // Place the quad at the ground Y-level.
-                // In the grassland, ground is at the bottom of the root's
-                // y=0 slot, which in anchor-relative coords is near Y=0.
-                let ground_y = -camera_pos.y + 0.0; // ground is at the anchor's Y=0
+                // Spherical clip: check XZ distance from camera to quad
+                // center. Skip quads whose center is beyond the outer radius
+                // so the imposter ring has a circular edge, not square.
+                let center = origin_bevy + Vec3::splat(extent * 0.5);
+                let dx_c = center.x - camera_pos.x;
+                let dz_c = center.z - camera_pos.z;
+                let xz_dist_sq = dx_c * dx_c + dz_c * dz_c;
+                if xz_dist_sq > outer_sq {
+                    continue;
+                }
                 let ground_origin = Vec3::new(origin_bevy.x, 0.0, origin_bevy.z);
                 results.push((ground_origin, extent));
             }
@@ -886,34 +892,64 @@ pub fn render_world(
         }
     }
 
-    // Collect imposter positions.
-    let imposter_radius = radius_bevy * IMPOSTER_RADIUS_MULT;
-    let imposters = collect_imposters(
-        &world, &anchor, camera_pos,
-        radius_bevy, imposter_radius,
-        emit_layer,
-    );
+    // Generate a grid of flat quads on the ground plane, covering the
+    // area beyond the normal render radius out to 3× the radius.
+    // The grassland is uniform so we don't need tree data — just a
+    // grid of grass-colored quads at Y=0.
+    let grass_voxel: u8 = 3;
+    if let Some(grass_mat) = palette.material(grass_voxel) {
+        let quad_mesh = render_state.imposter_mesh
+            .get_or_insert_with(|| make_imposter_quad(&mut meshes, 1.0))
+            .clone();
 
-    if !imposters.is_empty() {
-        // Grass voxel = BlockType::Grass (index 2) + 1 = 3
-        let grass_voxel: u8 = 3;
-        if let Some(grass_mat) = palette.material(grass_voxel) {
-            // Create or reuse the imposter quad mesh.
-            // All imposters use the same unit quad scaled by Transform.
-            let quad_mesh = render_state.imposter_mesh
-                .get_or_insert_with(|| make_imposter_quad(&mut meshes, 1.0))
-                .clone();
+        let outer_radius = radius_bevy * IMPOSTER_RADIUS_MULT;
+        let inner_radius = radius_bevy * 0.9; // slight overlap with terrain
+        // Quad size: use the cell size at the current view layer.
+        let cell = anchor.cell_bevy(zoom.layer);
+        let quad_size = cell * 5.0; // 5 cells per imposter quad
 
-            for (origin, extent) in &imposters {
+        // Grid from -outer_radius to +outer_radius around camera XZ.
+        let cam_x = camera_pos.x;
+        let cam_z = camera_pos.z;
+        // Snap to grid.
+        let grid_x0 = ((cam_x - outer_radius) / quad_size).floor() as i32;
+        let grid_x1 = ((cam_x + outer_radius) / quad_size).ceil() as i32;
+        let grid_z0 = ((cam_z - outer_radius) / quad_size).floor() as i32;
+        let grid_z1 = ((cam_z + outer_radius) / quad_size).ceil() as i32;
+
+        let inner_sq = inner_radius * inner_radius;
+        let outer_sq = outer_radius * outer_radius;
+        let mut count = 0;
+
+        for gx in grid_x0..grid_x1 {
+            for gz in grid_z0..grid_z1 {
+                let x = gx as f32 * quad_size;
+                let z = gz as f32 * quad_size;
+                // Center of this quad relative to camera.
+                let cx = x + quad_size * 0.5 - cam_x;
+                let cz = z + quad_size * 0.5 - cam_z;
+                let dist_sq = cx * cx + cz * cz;
+
+                // Only emit in the ring between inner and outer radius.
+                if dist_sq < inner_sq || dist_sq > outer_sq {
+                    continue;
+                }
+
                 let entity = commands.spawn((
                     Mesh3d(quad_mesh.clone()),
                     MeshMaterial3d(grass_mat.clone()),
-                    Transform::from_translation(*origin)
-                        .with_scale(Vec3::new(*extent, 1.0, *extent)),
+                    Transform::from_translation(Vec3::new(x, 0.0, z))
+                        .with_scale(Vec3::new(quad_size, 1.0, quad_size)),
                     Visibility::Visible,
                 )).id();
                 render_state.imposter_entities.push(entity);
+                count += 1;
             }
+        }
+
+        if count > 0 {
+            info!("Imposters: {} quads, radius {:.0}..{:.0}, quad_size={:.1}",
+                count, inner_radius, outer_radius, quad_size);
         }
     }
 

@@ -32,15 +32,8 @@ fn main() {
             }),
             ..default()
         }))
-        // On WASM without atmosphere, ClearColor is the sky.
-        // On native, atmosphere renders the sky and ClearColor peeks
-        // through sub-pixel gaps and the terrain-to-sky boundary.
-        .insert_resource(ClearColor({
-            #[cfg(target_arch = "wasm32")]
-            { Color::srgb(0.5, 0.7, 0.9) }
-            #[cfg(not(target_arch = "wasm32"))]
-            { Color::srgb(0.7, 0.78, 0.65) }
-        }))
+        // Atmosphere renders sky on all platforms (WebGPU on WASM).
+        .insert_resource(ClearColor(Color::srgb(0.7, 0.78, 0.65)))
         .add_plugins(MaterialPlugin::<BslMaterial>::default())
         .add_plugins((
             block::BlockPlugin,
