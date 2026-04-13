@@ -55,8 +55,18 @@ impl NpcHeightmap {
     }
 
     /// Whether this heightmap needs regeneration.
+    /// Only regenerate when the anchor has moved significantly
+    /// (more than 1/4 of the heightmap extent) to avoid per-frame
+    /// 16K raycasts while the player walks.
     pub fn needs_regen(&self, anchor: &WorldAnchor) -> bool {
-        self.heights.is_empty() || self.anchor_coord != anchor.leaf_coord
+        if self.heights.is_empty() {
+            return true;
+        }
+        let dx = (anchor.leaf_coord[0] - self.anchor_coord[0]).abs();
+        let dz = (anchor.leaf_coord[2] - self.anchor_coord[2]).abs();
+        // Regenerate when moved more than 1/4 of the heightmap extent.
+        let threshold = (self.world_size.x / self.cell_size / 4.0).max(8.0) as i64;
+        dx > threshold || dz > threshold
     }
 }
 
