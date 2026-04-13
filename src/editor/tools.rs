@@ -10,6 +10,7 @@ use crate::inventory::InventoryState;
 use crate::npc::{edit_npc_voxel, Npc, NpcBuffer, NpcHandle, NpcPartOverrides, TreeBlueprint, TreeBlueprints};
 use crate::player::{spawn_position, Player, Velocity};
 use crate::world::collision;
+use crate::world::heightmap::GroundCache;
 use crate::world::edit::{
     edit_at_layer_pos, install_subtree, subtree_path_for_layer_pos,
 };
@@ -156,6 +157,8 @@ pub fn remove_block(
     tree_bp: Option<Res<TreeBlueprint>>,
     blueprints: Option<Res<TreeBlueprints>>,
     npc_buffer: Res<NpcBuffer>,
+    zoom: Res<CameraZoom>,
+    mut ground_cache: ResMut<GroundCache>,
     mut world: ResMut<WorldState>,
     mut npc_q: Query<(&NpcHandle, &mut NpcPartOverrides), With<Npc>>,
 ) {
@@ -196,6 +199,17 @@ pub fn remove_block(
         return;
     };
     edit_at_layer_pos(&mut world, lp, EMPTY_VOXEL);
+
+    // Invalidate ground cache near the edit so NPCs respond to terrain changes.
+    let cell = crate::world::view::cell_size_at_layer(zoom.layer);
+    if let Some(lp) = &targeted.hit_layer_pos {
+        let min = crate::world::view::layer_pos_min_leaf_coord(lp);
+        let anchor = crate::world::view::WorldAnchor::default();
+        // Approximate: use cell coords directly for invalidation.
+        let cx = (min[0] as f32 / cell).floor() as f32;
+        let cz = (min[2] as f32 / cell).floor() as f32;
+        ground_cache.invalidate_near(cx * cell, cz * cell, cell, 3);
+    }
 }
 
 /// Right-click → place the active hotbar block on the face of the
@@ -217,6 +231,7 @@ pub fn place_block(
     npc_buffer: Res<NpcBuffer>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
+    mut ground_cache: ResMut<GroundCache>,
     mut world: ResMut<WorldState>,
     mut npc_q: Query<(&NpcHandle, &mut NpcPartOverrides), With<Npc>>,
 ) {
@@ -275,12 +290,6 @@ pub fn place_block(
             let Some(saved) = saved.items.get(*idx) else {
                 return;
             };
-            // Per-layer hotbars + the inventory's layer-filtered
-            // saved-mesh list mean the only way a `Model` slot is
-            // active is if it was assigned from the same zoom.
-            // Assert the invariant so a future change to the
-            // filter rules trips the test suite instead of silently
-            // no-op'ing placement.
             debug_assert_eq!(
                 saved.layer,
                 target_layer_for(place_lp.layer),
@@ -290,4 +299,7 @@ pub fn place_block(
             install_subtree(&mut world, &path, saved.node_id);
         }
     }
+
+    // Invalidate ground cache near placement.
+    ground_cache.invalidate_near(place_center.x, place_center.z, cell_size, 3);
 }

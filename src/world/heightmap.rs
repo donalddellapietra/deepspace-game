@@ -1,118 +1,81 @@
-//! Heightmap for NPC ground collision.
+//! Spatial ground height cache for NPC collision.
 //!
-//! Pre-computes a 2D grid of ground heights from the voxel tree so
-//! NPC physics can sample O(1) instead of walking the tree per NPC.
-//! Regenerated when the view layer or anchor changes.
+//! Lazily caches ground heights per XZ cell. O(1) lookups after first
+//! query. Invalidated surgically when terrain is edited.
+//! No bulk regeneration — zero frame-time hitches.
 
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 use super::state::WorldState;
 use super::view::{cell_size_at_layer, is_layer_pos_solid, layer_pos_from_bevy, target_layer_for, WorldAnchor};
-use super::render::RADIUS_VIEW_CELLS;
 
-/// Resolution of the heightmap grid per axis.
-const HEIGHTMAP_RES: usize = 128;
+/// Maximum tree-walk queries per frame to avoid spikes.
+const MAX_QUERIES_PER_FRAME: usize = 128;
 
-/// Cached heightmap for NPC ground collision.
-#[derive(Resource)]
-pub struct NpcHeightmap {
-    /// Ground Y in bevy space, indexed [z * HEIGHTMAP_RES + x].
-    heights: Vec<f32>,
-    /// World-space min corner (bevy coords, anchor-relative).
-    world_min: Vec2,
-    /// World-space size covered.
-    world_size: Vec2,
-    /// Cell size used to generate this heightmap.
-    cell_size: f32,
-    /// Anchor leaf coord when this was generated.
-    anchor_coord: [i64; 3],
+/// Spatial ground height cache.
+#[derive(Resource, Default)]
+pub struct GroundCache {
+    /// Cached ground heights keyed by XZ cell coordinate.
+    cache: HashMap<(i32, i32), f32>,
+    /// Number of tree walks done this frame (reset each frame).
+    queries_this_frame: usize,
 }
 
-impl Default for NpcHeightmap {
-    fn default() -> Self {
-        Self {
-            heights: Vec::new(),
-            world_min: Vec2::ZERO,
-            world_size: Vec2::ONE,
-            cell_size: 1.0,
-            anchor_coord: [0; 3],
+impl GroundCache {
+    /// Look up the ground height at a bevy-space XZ position.
+    /// Returns cached value or queries the tree (up to frame budget).
+    /// Falls back to 0.0 if budget exhausted and no cache entry exists.
+    pub fn ground_y(
+        &mut self,
+        world: &WorldState,
+        anchor: &WorldAnchor,
+        view_layer: u8,
+        x: f32,
+        z: f32,
+        cell: f32,
+    ) -> f32 {
+        let cx = (x / cell).floor() as i32;
+        let cz = (z / cell).floor() as i32;
+        let key = (cx, cz);
+
+        if let Some(&y) = self.cache.get(&key) {
+            return y;
         }
-    }
-}
 
-impl NpcHeightmap {
-    /// Sample the ground height at a bevy-space XZ position.
-    /// Returns the Y coordinate of the top of the ground.
-    pub fn sample(&self, x: f32, z: f32) -> f32 {
-        if self.heights.is_empty() {
+        // Budget check: don't do too many tree walks per frame.
+        if self.queries_this_frame >= MAX_QUERIES_PER_FRAME {
             return 0.0;
         }
-        let u = (x - self.world_min.x) / self.world_size.x;
-        let v = (z - self.world_min.y) / self.world_size.y;
-        let tx = ((u * HEIGHTMAP_RES as f32) as usize).min(HEIGHTMAP_RES - 1);
-        let tz = ((v * HEIGHTMAP_RES as f32) as usize).min(HEIGHTMAP_RES - 1);
-        self.heights[tz * HEIGHTMAP_RES + tx]
+
+        let target = target_layer_for(view_layer);
+        let y = raycast_ground(world, target, anchor, x, z, cell);
+        self.cache.insert(key, y);
+        self.queries_this_frame += 1;
+        y
     }
 
-    /// Whether this heightmap needs regeneration.
-    /// Only regenerate when the anchor has moved significantly
-    /// (more than 1/4 of the heightmap extent) to avoid per-frame
-    /// 16K raycasts while the player walks.
-    pub fn needs_regen(&self, anchor: &WorldAnchor) -> bool {
-        if self.heights.is_empty() {
-            return true;
+    /// Invalidate cache entries near an edited position.
+    /// Call this when terrain is edited at a given bevy-space position.
+    pub fn invalidate_near(&mut self, x: f32, z: f32, cell: f32, radius: i32) {
+        let cx = (x / cell).floor() as i32;
+        let cz = (z / cell).floor() as i32;
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                self.cache.remove(&(cx + dx, cz + dz));
+            }
         }
-        let dx = (anchor.leaf_coord[0] - self.anchor_coord[0]).abs();
-        let dz = (anchor.leaf_coord[2] - self.anchor_coord[2]).abs();
-        // Regenerate when moved more than 1/4 of the heightmap extent.
-        let threshold = (self.world_size.x / self.cell_size / 4.0).max(8.0) as i64;
-        dx > threshold || dz > threshold
+    }
+
+    /// Reset the per-frame query counter. Call once at frame start.
+    pub fn reset_frame(&mut self) {
+        self.queries_this_frame = 0;
     }
 }
 
-/// System that regenerates the heightmap when the anchor moves.
-pub fn update_heightmap(
-    world: Res<WorldState>,
-    anchor: Res<WorldAnchor>,
-    zoom: Res<super::CameraZoom>,
-    mut heightmap: ResMut<NpcHeightmap>,
-) {
-    if !heightmap.needs_regen(&anchor) {
-        return;
-    }
-
-    let cell = cell_size_at_layer(zoom.layer);
-    let radius = RADIUS_VIEW_CELLS * cell;
-    let target = target_layer_for(zoom.layer);
-
-    let world_min = Vec2::new(-radius, -radius);
-    let world_size = Vec2::new(radius * 2.0, radius * 2.0);
-
-    heightmap.heights.resize(HEIGHTMAP_RES * HEIGHTMAP_RES, 0.0);
-
-    for tz in 0..HEIGHTMAP_RES {
-        for tx in 0..HEIGHTMAP_RES {
-            let u = (tx as f32 + 0.5) / HEIGHTMAP_RES as f32;
-            let v = (tz as f32 + 0.5) / HEIGHTMAP_RES as f32;
-            let world_x = world_min.x + u * world_size.x;
-            let world_z = world_min.y + v * world_size.y;
-
-            let ground_y = raycast_ground(
-                &world, target, &anchor, world_x, world_z, cell,
-            );
-            heightmap.heights[tz * HEIGHTMAP_RES + tx] = ground_y;
-        }
-    }
-
-    heightmap.world_min = world_min;
-    heightmap.world_size = world_size;
-    heightmap.cell_size = cell;
-    heightmap.anchor_coord = anchor.leaf_coord;
-
-    info!(
-        "Heightmap generated: {}x{} at cell_size={:.1}, radius={:.1}",
-        HEIGHTMAP_RES, HEIGHTMAP_RES, cell, radius,
-    );
+/// System that resets the per-frame query counter.
+pub fn reset_ground_cache(mut cache: ResMut<GroundCache>) {
+    cache.reset_frame();
 }
 
 /// Raycast downward to find ground height at an XZ position.
@@ -124,7 +87,6 @@ fn raycast_ground(
     world_z: f32,
     cell: f32,
 ) -> f32 {
-    // Probe downward from a reasonable height.
     let max_cells: i32 = 32;
     for y_cell in (-max_cells..max_cells).rev() {
         let probe = Vec3::new(world_x, y_cell as f32 * cell + cell * 0.5, world_z);

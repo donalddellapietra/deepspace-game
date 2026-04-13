@@ -1045,12 +1045,13 @@ fn npc_buf_animate(
     }
 }
 
-/// Heightmap-based physics: O(1) ground sampling instead of tree walks.
+/// Ground collision via spatial cache: O(1) lookups, lazy population.
 fn npc_buf_physics(
     time: Res<Time>,
+    world: Res<WorldState>,
     zoom: Res<CameraZoom>,
     anchor: Res<WorldAnchor>,
-    heightmap: Res<crate::world::heightmap::NpcHeightmap>,
+    mut ground_cache: ResMut<crate::world::heightmap::GroundCache>,
     mut npc_buffer: ResMut<NpcBuffer>,
 ) {
     let dt = time.delta_secs();
@@ -1059,19 +1060,18 @@ fn npc_buf_physics(
     for npc in &mut npc_buffer.npcs {
         if !npc.alive { continue; }
 
-        // Apply gravity.
         npc.velocity.y -= NPC_GRAVITY_CELLS * cell * dt;
 
-        // Update position in bevy space via the heightmap.
         let bevy_pos = bevy_from_position(&npc.position, &anchor);
         let new_x = bevy_pos.x + npc.velocity.x * cell * dt;
         let new_z = bevy_pos.z + npc.velocity.z * cell * dt;
         let new_y = bevy_pos.y + npc.velocity.y * dt;
 
-        // Sample heightmap for ground level.
-        let ground_y = heightmap.sample(new_x, new_z);
+        // Cached ground lookup: O(1) after first query per cell.
+        let ground_y = ground_cache.ground_y(
+            &world, &anchor, zoom.layer, new_x, new_z, cell,
+        );
 
-        // Clamp to ground.
         let final_y = if new_y <= ground_y {
             npc.velocity.y = 0.0;
             ground_y
@@ -1079,7 +1079,6 @@ fn npc_buf_physics(
             new_y
         };
 
-        // Convert back to Position.
         let new_bevy = Vec3::new(new_x, final_y, new_z);
         if let Some(new_pos) = position_from_bevy(new_bevy, &anchor) {
             npc.position = new_pos;
