@@ -8,4 +8,11 @@
 
 # Downloaded test assets (large .vox files, etc.)
 /assets/vox/*.vox
+
+# Generated world data (run `cargo run --bin gen_world` to regenerate)
+/assets/world.bin
+
+# Save files
+/saves/
+
 .claude/

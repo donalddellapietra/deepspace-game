@@ -21,8 +21,9 @@ use crate::editor::save_mode::{save_mode_eligible, SaveMode, SavedMeshes};
 use crate::editor::{Hotbar, HotbarItem};
 use crate::inventory::InventoryState;
 use crate::ui::color_picker::ColorPickerState;
+use crate::ui::PauseMenuState;
 use crate::world::view::target_layer_for;
-use crate::world::CameraZoom;
+use crate::world::{CameraZoom, WorldState};
 
 // ── Plugin ────────────────────────────────────────────────────────
 
@@ -41,6 +42,7 @@ impl Plugin for OverlayPlugin {
                     push_mode_indicator,
                     push_inventory,
                     push_color_picker,
+                    push_pause_menu,
                     push_toasts,
                     poll_ui_commands,
                 ),
@@ -312,6 +314,16 @@ fn push_color_picker(picker: Res<ColorPickerState>) {
     }));
 }
 
+fn push_pause_menu(menu: Res<PauseMenuState>) {
+    if !menu.is_changed() {
+        return;
+    }
+    push_state(&GameStateUpdate::PauseMenu(PauseMenuStateJs {
+        open: menu.open,
+        save_status: menu.save_status.clone(),
+    }));
+}
+
 fn push_toasts(
     mut events: MessageReader<ToastEvent>,
     mut counter: ResMut<ToastIdCounter>,
@@ -336,6 +348,8 @@ fn poll_ui_commands(
     mut materials: ResMut<Assets<BslMaterial>>,
     mut ui_focused: ResMut<UiFocused>,
     mut lock_lost: ResMut<PointerLockLost>,
+    mut world: ResMut<WorldState>,
+    mut pause_menu: ResMut<PauseMenuState>,
 ) {
     for cmd in poll_commands() {
         match cmd {
@@ -394,6 +408,46 @@ fn poll_ui_commands(
             }
             UiCommand::PointerLockLost => {
                 lock_lost.0 = true;
+            }
+            UiCommand::SaveGame => {
+                let path = std::path::Path::new("saves/save.bin");
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match world.save_to_file(path) {
+                    Ok(()) => {
+                        let size = std::fs::metadata(path)
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        let msg = format!("Saved ({:.1} KB)", size as f64 / 1024.0);
+                        info!("{msg}");
+                        pause_menu.save_status = Some(msg);
+                    }
+                    Err(e) => {
+                        let msg = format!("Save failed: {e}");
+                        error!("{msg}");
+                        pause_menu.save_status = Some(msg);
+                    }
+                }
+            }
+            UiCommand::LoadGame => {
+                let path = std::path::Path::new("saves/save.bin");
+                match world.load_save_file(path) {
+                    Ok(()) => {
+                        let msg = "Loaded".to_string();
+                        info!("{msg}");
+                        pause_menu.save_status = Some(msg);
+                    }
+                    Err(e) => {
+                        let msg = format!("Load failed: {e}");
+                        error!("{msg}");
+                        pause_menu.save_status = Some(msg);
+                    }
+                }
+            }
+            UiCommand::ClosePauseMenu => {
+                pause_menu.open = false;
+                pause_menu.save_status = None;
             }
         }
     }
