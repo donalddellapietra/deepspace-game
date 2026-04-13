@@ -34,53 +34,33 @@ pub fn generate_air_leaf() -> VoxelGrid {
 
 // ---------------------------------------------------------- terrain noise
 
-// Noise octaves. Amplitude in leaf voxels, wavelength in leaf voxels.
-// Features at each scale become visible at the layer whose cell size
-// is comparable to the wavelength. All amplitudes stay below layer-9
-// cell size (3125 voxels) so terrain is invisible at layer 8 and below.
-const MOUNTAIN_AMP: f64 = 80.0;
-const MOUNTAIN_FREQ: f32 = 1.0 / 800.0;
+// Single noise octave for terrain. Amplitude in leaf voxels.
+// Kept modest so the surface band is thin and generation is fast
+// in debug builds (~78M voxels × 1 noise call vs 3).
+const TERRAIN_AMP: f64 = 40.0;
+const TERRAIN_FREQ: f32 = 1.0 / 400.0;
 
-const HILL_AMP: f64 = 20.0;
-const HILL_FREQ: f32 = 1.0 / 200.0;
+/// Maximum possible terrain offset from the base radius.
+pub const MAX_TERRAIN_AMPLITUDE: f64 = TERRAIN_AMP;
 
-const DETAIL_AMP: f64 = 5.0;
-const DETAIL_FREQ: f32 = 1.0 / 50.0;
-
-/// Maximum possible terrain offset from the base radius. The AABB
-/// culling checks use this as a margin so nodes near the surface
-/// aren't incorrectly classified as all-air or all-solid.
-pub const MAX_TERRAIN_AMPLITUDE: f64 = MOUNTAIN_AMP + HILL_AMP + DETAIL_AMP;
-
-/// 3D noise generators for terrain. Sampled at world-space voxel
-/// positions, so features wrap the sphere naturally with no seams.
+/// 3D noise generator for terrain. Sampled at center-relative voxel
+/// positions, so features wrap the sphere naturally with no seams
+/// and f32 precision is perfect (coords in ±600 range).
 pub struct TerrainNoise {
-    mountain: FastNoiseLite,
-    hill: FastNoiseLite,
-    detail: FastNoiseLite,
+    noise: FastNoiseLite,
 }
 
 impl TerrainNoise {
     pub fn new(seed: i32) -> Self {
-        let make = |s: i32, freq: f32| {
-            let mut n = FastNoiseLite::with_seed(s);
-            n.set_noise_type(Some(NoiseType::OpenSimplex2));
-            n.set_frequency(Some(freq));
-            n
-        };
-        Self {
-            mountain: make(seed, MOUNTAIN_FREQ),
-            hill: make(seed.wrapping_add(1), HILL_FREQ),
-            detail: make(seed.wrapping_add(2), DETAIL_FREQ),
-        }
+        let mut noise = FastNoiseLite::with_seed(seed);
+        noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+        noise.set_frequency(Some(TERRAIN_FREQ));
+        Self { noise }
     }
 
-    /// Terrain offset at a world-space position. Positive = surface
-    /// pushed outward (mountain), negative = pushed inward (valley/ocean).
+    #[inline]
     pub fn offset(&self, x: f32, y: f32, z: f32) -> f64 {
-        self.mountain.get_noise_3d(x, y, z) as f64 * MOUNTAIN_AMP
-            + self.hill.get_noise_3d(x, y, z) as f64 * HILL_AMP
-            + self.detail.get_noise_3d(x, y, z) as f64 * DETAIL_AMP
+        self.noise.get_noise_3d(x, y, z) as f64 * TERRAIN_AMP
     }
 }
 
@@ -102,27 +82,41 @@ pub struct SphereParams {
 pub fn generate_sphere_leaf(leaf_origin: [i64; 3], params: &SphereParams) -> VoxelGrid {
     let mut grid = empty_voxel_grid();
     let r = params.radius as f64;
+    let amp = MAX_TERRAIN_AMPLITUDE;
+    let stone_v = voxel_from_block(Some(BlockType::Stone));
+    let water_v = voxel_from_block(Some(BlockType::Water));
+    let has_terrain = params.terrain.is_some();
+
     for z in 0..NODE_VOXELS_PER_AXIS {
         for y in 0..NODE_VOXELS_PER_AXIS {
             for x in 0..NODE_VOXELS_PER_AXIS {
                 let dx = (leaf_origin[0] + x as i64 - params.center[0]) as f64;
                 let dy = (leaf_origin[1] + y as i64 - params.center[1]) as f64;
                 let dz = (leaf_origin[2] + z as i64 - params.center[2]) as f64;
-                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                let dist_sq = dx * dx + dy * dy + dz * dz;
 
-                // Terrain offset pushes surface in/out from base radius.
-                let terrain_r = match &params.terrain {
-                    Some(t) => {
-                        let wx = (leaf_origin[0] + x as i64) as f32;
-                        let wy = (leaf_origin[1] + y as i64) as f32;
-                        let wz = (leaf_origin[2] + z as i64) as f32;
-                        r + t.offset(wx, wy, wz)
+                // Early exit: skip noise for voxels clearly outside
+                // or clearly deep inside the surface band.
+                if has_terrain {
+                    let outer = r + amp;
+                    if dist_sq >= outer * outer {
+                        continue; // definitely air
                     }
+                    let inner = r - amp - 10.0;
+                    if inner > 0.0 && dist_sq < inner * inner {
+                        grid[voxel_idx(x, y, z)] = stone_v;
+                        continue; // definitely deep stone
+                    }
+                }
+
+                let dist = dist_sq.sqrt();
+
+                let terrain_r = match &params.terrain {
+                    Some(t) => r + t.offset(dx as f32, dy as f32, dz as f32),
                     None => r,
                 };
 
                 if dist < terrain_r {
-                    // Inside terrain surface.
                     let depth = terrain_r - dist;
                     let block = if depth < 3.0 {
                         BlockType::Grass
@@ -133,10 +127,8 @@ pub fn generate_sphere_leaf(leaf_origin: [i64; 3], params: &SphereParams) -> Vox
                     };
                     grid[voxel_idx(x, y, z)] = voxel_from_block(Some(block));
                 } else if dist < r {
-                    // Above terrain but below sea level → water.
-                    grid[voxel_idx(x, y, z)] = voxel_from_block(Some(BlockType::Water));
+                    grid[voxel_idx(x, y, z)] = water_v;
                 }
-                // else: air (above sea level)
             }
         }
     }

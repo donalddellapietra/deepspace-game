@@ -160,8 +160,14 @@ impl WorldState {
         }
 
         let extent = world_extent_voxels();
+        let gen_start = std::time::Instant::now();
         let root_id = self.build_sphere_node(
             [0, 0, 0], extent, 0, params, &air_tower, &solid_tower,
+        );
+        eprintln!(
+            "sphere gen: {:.1}s, {} library entries",
+            gen_start.elapsed().as_secs_f64(),
+            self.library.len(),
         );
         self.swap_root(root_id);
         root_id
@@ -170,6 +176,11 @@ impl WorldState {
     /// Recursive sphere builder. At each node, checks whether the
     /// AABB is entirely outside (air tower), entirely deep inside
     /// (solid tower), or intersects the surface (recurse / eval).
+    ///
+    /// Layers 0–8 use the smooth sphere (no noise margin) so the
+    /// surface band is thin and generation is fast. Layers 9–12
+    /// widen the band by MAX_TERRAIN_AMPLITUDE so noise-displaced
+    /// surface nodes aren't incorrectly culled.
     fn build_sphere_node(
         &mut self,
         origin: [i64; 3],
@@ -179,14 +190,31 @@ impl WorldState {
         air_tower: &[NodeId],
         solid_tower: &[NodeId],
     ) -> NodeId {
-        if aabb_outside_sphere(origin, extent, params) {
+        // At layers 0–8 use smooth sphere checks (no noise margin).
+        // Terrain features are smaller than a layer-8 cell (3125
+        // voxels) so they don't affect coarse-layer classification.
+        // The downsample from layer-9 children propagates terrain
+        // into layer-8 voxels automatically.
+        let use_terrain = layer >= 9 && params.terrain.is_some();
+        let amp = if use_terrain { MAX_TERRAIN_AMPLITUDE as i64 } else { 0 };
+
+        // Build a smooth-sphere SphereParams for coarse-layer AABB
+        // checks (no terrain margin inflates the outer radius).
+        let check_params = if use_terrain {
+            params
+        } else {
+            // For layers 0–8 we need a no-terrain version for the
+            // outside check. Build one on the stack — cheap, no alloc.
+            &SphereParams {
+                center: params.center,
+                radius: params.radius,
+                terrain: None,
+            }
+        };
+
+        if aabb_outside_sphere(origin, extent, check_params) {
             return air_tower[layer as usize];
         }
-        let amp = if params.terrain.is_some() {
-            MAX_TERRAIN_AMPLITUDE as i64
-        } else {
-            0
-        };
         if aabb_inside_sphere(
             origin, extent, params.center,
             params.radius - amp - STONE_DEPTH,

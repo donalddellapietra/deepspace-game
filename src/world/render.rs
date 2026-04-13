@@ -589,7 +589,7 @@ pub fn render_world(
 
     // If emit layer changed, first pass, or forced rebuild, drop everything.
     if !render_state.initialised
-        || render_state.last_zoom_layer != emit_layer
+        || render_state.last_zoom_layer != zoom.layer
         || render_state.force_rebuild
     {
         render_state.force_rebuild = false;
@@ -601,7 +601,7 @@ pub fn render_world(
         super::overlay::clear_overlay_entities(&mut commands, &mut render_state.overlay);
         render_state.baked.clear();
         render_state.path_node.clear();
-        render_state.last_zoom_layer = emit_layer;
+        render_state.last_zoom_layer = zoom.layer;
         render_state.initialised = true;
     }
 
@@ -625,27 +625,36 @@ pub fn render_world(
 
     // Pre-bake: ensure every visited NodeId has a BakedNode.
     // On edit, use the old BakedNode for incremental diff.
+    // Budget: limit cold bakes per frame to avoid multi-second
+    // stalls when zooming out reveals many new unique nodes.
+    const MAX_COLD_BAKES: usize = 16;
     {
         let bake_start = std::time::Instant::now();
+        let mut cold_bakes = 0usize;
         for v in visits.iter() {
             let node = world.library.get(v.node_id)
                 .expect("render: node missing from library");
 
             if node.children.is_some() {
                 if !render_state.baked.contains_key(&v.node_id) {
+                    if cold_bakes >= MAX_COLD_BAKES { continue; }
                     let baked = if let Some(&old_nid) = render_state.path_node.get(&v.path) {
                         if let Some(old_bake) = render_state.baked.get(&old_nid) {
                             BakedNode::new_incremental(old_bake, &world, v.node_id, &mut meshes)
                         } else {
+                            cold_bakes += 1;
                             BakedNode::new_cold(&world, v.node_id, &mut meshes)
                         }
                     } else {
+                        cold_bakes += 1;
                         BakedNode::new_cold(&world, v.node_id, &mut meshes)
                     };
                     render_state.baked.insert(v.node_id, baked);
                 }
                 render_state.path_node.insert(v.path, v.node_id);
             } else if !render_state.baked.contains_key(&v.node_id) {
+                if cold_bakes >= MAX_COLD_BAKES { continue; }
+                cold_bakes += 1;
                 let merged = bake_leaf(&world, v.node_id, &mut meshes);
                 render_state.baked.insert(v.node_id, BakedNode {
                     child_ids: [EMPTY_NODE; CHILDREN_PER_NODE],

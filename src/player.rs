@@ -128,7 +128,11 @@ pub fn move_player(
     let Ok(cam) = camera_q.single() else {
         return;
     };
-    let dt = time.delta_secs();
+    // Clamp dt to prevent runaway physics on slow frames (e.g.
+    // mesh baking burst after a zoom change). Without this, a
+    // 2-second bake frame causes enormous gravity velocity →
+    // huge collision sweep → even slower frame → feedback loop.
+    let dt = time.delta_secs().min(0.1);
 
     // Convert cell-rate constants into leaves-per-second values for
     // the current zoom level. At view L=12 (leaves) cell_size = 1,
