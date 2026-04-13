@@ -463,37 +463,6 @@ fn compose_node(
     let children = node.children.as_ref().expect("compose: expected non-leaf");
     let child_ids: [NodeId; CHILDREN_PER_NODE] = **children;
 
-    // Fast path: if ALL children share the same NodeId, the entity is
-    // a uniform "tower" (e.g., all-solid underground). Instead of
-    // composing 98 boundary children with 588 quads, emit a simple
-    // box mesh: 6 quads for the 6 outer faces of the whole entity.
-    // This reduces underground geometry by ~100× while keeping the
-    // surface faces visible.
-    let first_non_empty = child_ids.iter().find(|&&id| id != EMPTY_NODE);
-    if let Some(&first_id) = first_non_empty {
-        if child_ids.iter().all(|&id| id == first_id || id == EMPTY_NODE)
-            && child_ids.iter().all(|&id| id == first_id)
-        {
-            // All 125 children are identical → uniform tower.
-            // Bake as a simple volume from the node's own 25³ downsample.
-            let voxels = node.voxels.clone();
-            let grid_size = (BRANCH_FACTOR * NODE_VOXELS_PER_AXIS) as i32;
-            let first_v = voxels[0];
-            // If truly uniform (all same voxel), emit a single box.
-            if voxels.iter().all(|&v| v == first_v) && first_v != EMPTY_VOXEL {
-                return bake_volume(
-                    grid_size,
-                    |x, y, z| {
-                        if x < 0 || y < 0 || z < 0
-                            || x >= grid_size || y >= grid_size || z >= grid_size
-                        { None } else { Some(first_v) }
-                    },
-                    meshes,
-                );
-            }
-        }
-    }
-
     // Classify children at the parent's level (using their 25³
     // downsampled grids). Interior-uniform children — those completely
     // surrounded by same-material siblings — are skipped because
@@ -531,9 +500,38 @@ fn compose_node(
         })
         .collect();
 
+    // Build cull mask: for each pair of adjacent uniform-solid children
+    // with the same material, mark their shared face for culling.
+    // This eliminates ~95% of underground boundary face waste.
+    // Face indices: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
+    let mut cull_masks = [[false; 6]; CHILDREN_PER_NODE];
+    for slot in 0..CHILDREN_PER_NODE {
+        let (sx, sy, sz) = slot_coords(slot);
+        // Check +X, +Y, +Z neighbors (avoids double-processing).
+        for &(axis_pos, axis_neg, nx, ny, nz) in &[
+            (0usize, 1usize, sx + 1, sy, sz),
+            (2, 3, sx, sy + 1, sz),
+            (4, 5, sx, sy, sz + 1),
+        ] {
+            if nx >= BRANCH_FACTOR || ny >= BRANCH_FACTOR || nz >= BRANCH_FACTOR {
+                continue;
+            }
+            let neighbor = slot_index(nx, ny, nz);
+            if let ChildClass::Uniform(va) = child_class[slot] {
+                if let ChildClass::Uniform(vb) = child_class[neighbor] {
+                    if va == vb && va != EMPTY_VOXEL {
+                        cull_masks[slot][axis_pos] = true;
+                        cull_masks[neighbor][axis_neg] = true;
+                    }
+                }
+            }
+        }
+    }
+
     let child_mesh_size = BRANCH_FACTOR * NODE_VOXELS_PER_AXIS;
     compose_children_meshes(
         &children_faces,
+        &cull_masks,
         CHILDREN_PER_NODE,
         BRANCH_FACTOR,
         child_mesh_size,
@@ -631,11 +629,8 @@ fn walk(
             continue;
         }
 
-        // Reached emit layer → emit (skip uniform-empty nodes).
+        // Reached emit layer → emit.
         if depth == emit_layer {
-            if world.library.get(node_id).map_or(false, |n| n.uniform_empty) {
-                continue;
-            }
             out.push(Visit {
                 path,
                 node_id,
