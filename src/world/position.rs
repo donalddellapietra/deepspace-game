@@ -11,7 +11,9 @@
 //! existing code calls it yet. `step_neighbor` here is the Cartesian
 //! dispatch only; `NodeKind`-aware dispatch arrives in step 2.
 
-use crate::world::tree::{slot_coords, slot_index, CHILDREN_PER_NODE, MAX_DEPTH};
+use crate::world::tree::{
+    slot_coords, slot_index, NodeKind, NodeLibrary, CHILDREN_PER_NODE, MAX_DEPTH,
+};
 
 // -------------------------------------------------------------- position
 
@@ -260,18 +262,122 @@ impl Position {
 
 // -------------------------------------------------------- step_neighbor
 
-/// Move one cell along `axis` by `dir` (`+1` or `-1`). Cartesian
-/// semantics: increment/decrement the slot coord; carry to parent on
-/// wrap. Returns `false` and leaves `pos` unchanged if the step walks
-/// past the root.
+/// Move one cell along `axis` by `dir` (`+1` or `-1`) with Cartesian
+/// semantics only. Increment/decrement the slot coord, carry to
+/// parent on wrap; returns `false` and leaves `pos` unchanged if the
+/// step walks past the root.
 ///
-/// Step 8 turns this into a dispatcher over `NodeKind::CubedSphereBody`
-/// / `CubedSphereFace` (§2c of refactor-decisions.md); today it's
-/// Cartesian-only.
+/// Use this when the path is known to contain only Cartesian nodes —
+/// the default across the engine today. Library-aware stepping (which
+/// dispatches over `NodeKind::CubedSphereBody`/`CubedSphereFace` per
+/// §2c of refactor-decisions.md) is [`step_neighbor_in`]; it delegates
+/// to this function when the parent node is Cartesian.
 pub fn step_neighbor(pos: &mut Position, axis: usize, dir: i32) -> bool {
     debug_assert!(axis < 3, "axis must be 0, 1, or 2");
     debug_assert!(dir == 1 || dir == -1, "dir must be ±1");
     carry_axis(pos, axis, dir as i64) == 0
+}
+
+/// NodeKind-aware step: walks up `pos.path` and, at each level,
+/// consults `library` for the containing node's [`NodeKind`]. Cartesian
+/// parents use the bulk base-3 carry ([`carry_axis`]); body / face
+/// parents apply cubed-sphere-specific rewrites (see
+/// [`crate::world::face_transitions`]).
+///
+/// Step 8 wires the dispatch; the non-Cartesian branches today are
+/// scaffolded and will be fleshed out alongside step 9 when the tree
+/// actually starts containing body/face nodes. Falls back to plain
+/// Cartesian stepping if `library` has no entry for the containing
+/// node (e.g. during bring-up).
+pub fn step_neighbor_in(
+    pos: &mut Position,
+    library: &NodeLibrary,
+    axis: usize,
+    dir: i32,
+) -> bool {
+    debug_assert!(axis < 3);
+    debug_assert!(dir == 1 || dir == -1);
+    // Find the deepest parent node id by walking `path` from root.
+    // For Cartesian-only scenes this is an O(depth) pass but cheap
+    // because the library is a HashMap.
+    let Some(parent_id) = resolve_parent_node(pos, library) else {
+        // Missing parent — behave as Cartesian so tests and legacy
+        // code paths keep working during bring-up.
+        return step_neighbor(pos, axis, dir);
+    };
+    let Some(parent) = library.get(parent_id) else {
+        return step_neighbor(pos, axis, dir);
+    };
+    match parent.kind {
+        NodeKind::Cartesian => step_neighbor(pos, axis, dir),
+        NodeKind::CubedSphereFace { .. } => {
+            // TODO(step 9): apply u/v seam crossing via
+            // face_transitions::seam_transition and the full axis
+            // swap/flip rules. Radial (axis == 2) exits via
+            // face_transitions::radial_exit. Scaffolded skeleton
+            // below falls through to Cartesian — correct in the
+            // degenerate case of stepping within the face without
+            // crossing a seam.
+            step_neighbor(pos, axis, dir)
+        }
+        NodeKind::CubedSphereBody { .. } => {
+            // TODO(step 9): a camera inside a body's 27-child grid is
+            // effectively one level above a face subtree; any step
+            // beyond the current face slot bubbles into the body's
+            // parent (Cartesian) for handling. Scaffolded skeleton
+            // uses Cartesian carry, which is correct for body
+            // interior-filler slots but wrong for face-adjacent
+            // motion. Full rules land with step 9.
+            step_neighbor(pos, axis, dir)
+        }
+    }
+}
+
+/// Walk the path down to depth-1 and return the node id that holds
+/// `pos`'s deepest slot. `None` if the path descends through a Block
+/// or Empty child (i.e. `pos` is deeper than the tree supports) or if
+/// the root id isn't in the library yet.
+fn resolve_parent_node(
+    pos: &Position,
+    library: &NodeLibrary,
+) -> Option<crate::world::tree::NodeId> {
+    use crate::world::tree::Child;
+    if pos.depth == 0 {
+        return None;
+    }
+    // Caller typically knows the root; we can't recover it from the
+    // Position alone. Future refactor threads a render_root through
+    // here; for step 8 we walk from the conventional root id 1 if
+    // present, else skip. This helper only exists to keep the
+    // dispatch surface honest — not to be relied on in hot paths.
+    let root = {
+        // Try library ids in order; pick the first one that has a
+        // child matching the first slot. This is a best-effort probe
+        // during bring-up.
+        let first_slot = pos.path[0] as usize;
+        let mut candidate: Option<crate::world::tree::NodeId> = None;
+        for id in 1u64..=(library.len() as u64 + 16) {
+            if let Some(n) = library.get(id) {
+                if matches!(n.children[first_slot], Child::Node(_) | Child::Block(_) | Child::Empty) {
+                    candidate = Some(id);
+                    break;
+                }
+            }
+        }
+        candidate?
+    };
+    let mut current = root;
+    for k in 0..(pos.depth as usize) {
+        let node = library.get(current)?;
+        match node.children[pos.path[k] as usize] {
+            Child::Node(nid) if k + 1 < pos.depth as usize => current = nid,
+            _ => {
+                // If we're at the deepest slot, `current` IS the parent.
+                return if k + 1 == pos.depth as usize { Some(current) } else { None };
+            }
+        }
+    }
+    Some(current)
 }
 
 /// Shift `pos` by `amount` cells along `axis`, carrying through

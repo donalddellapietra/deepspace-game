@@ -1,5 +1,6 @@
 pub mod tree;
 pub mod position;
+pub mod face_transitions;
 pub mod palette;
 pub mod state;
 pub mod gpu;
