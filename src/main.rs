@@ -202,16 +202,13 @@ impl App {
         let td = self.tree_depth as i32;
         let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
 
-        // Orient the camera to the local gravity frame. Near a planet
-        // the camera's "up" tracks the planet's radial so the horizon
-        // feels right; far from any planet the up vector smoothly
-        // relaxes back to world +Y. This is purely visual — no
-        // physics or collision is applied.
-        let target_up = if let Some(p) = self.world.dominant_planet(self.camera.pos) {
-            p.up_at(self.camera.pos)
-        } else {
-            [0.0, 1.0, 0.0]
-        };
+        // Orient the camera to the local gravity frame. `blended_up`
+        // gives a distance-weighted mix of each nearby planet's
+        // radial and world +Y — weight is full at the surface and
+        // tapers smoothly to zero at the influence boundary, so
+        // flying toward / away from a planet rotates the horizon
+        // gradually instead of snapping at a hard sphere.
+        let target_up = self.world.blended_up(self.camera.pos);
         self.camera.update_up(target_up, dt);
 
         // Creative/flycam movement: WASD along camera forward/right,
