@@ -238,6 +238,37 @@ impl CubeSpherePlanet {
         let v = -1.0 + 2.0 * (j as f32 + 0.5) / n;
         (u, v)
     }
+
+    /// Intersect a ray with the planet's outer shell. Returns the
+    /// entry-t if the ray hits in front of the camera.
+    pub fn ray_t(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
+        let oc = sdf::sub(origin, self.center);
+        let b = sdf::dot(oc, dir);
+        let c = sdf::dot(oc, oc) - self.radius * self.radius;
+        let disc = b * b - c;
+        if disc <= 0.0 { return None; }
+        let sq = disc.sqrt();
+        let t0 = -b - sq;
+        let t1 = -b + sq;
+        if t0 > 0.0 { Some(t0) } else if t1 > 0.0 { Some(t1) } else { None }
+    }
+
+    /// Which (face, i, j) cell does this ray hit first on the shell?
+    /// Returns the entry-t and the cell it lands in, clamped to the
+    /// grid. Does NOT skip empty cells — that's the caller's call
+    /// (the highlight wants the shell position, a block raycast
+    /// would want a loop).
+    pub fn hit_cell(&self, origin: Vec3, dir: Vec3) -> Option<(f32, Face, u32, u32)> {
+        let t = self.ray_t(origin, dir)?;
+        let hit = sdf::add(origin, sdf::scale(dir, t));
+        let coord = world_to_coord(self.center, hit)?;
+        let n = self.cells_per_face_edge as f32;
+        let ug = ((coord.u + 1.0) * 0.5 * n).floor();
+        let vg = ((coord.v + 1.0) * 0.5 * n).floor();
+        let i = (ug as i32).clamp(0, self.cells_per_face_edge as i32 - 1) as u32;
+        let j = (vg as i32).clamp(0, self.cells_per_face_edge as i32 - 1) as u32;
+        Some((t, coord.face, i, j))
+    }
 }
 
 /// Fill a `CubeSpherePlanet`'s cells by sampling an SDF `Planet`

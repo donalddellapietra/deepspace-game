@@ -118,47 +118,6 @@ impl Keys {
     }
 }
 
-// ------------------------------------------------------------ Cubed-sphere demo
-
-#[derive(Copy, Clone)]
-struct CsDemo {
-    center: [f32; 3],
-    radius: f32,
-    cells: u32,
-}
-
-impl CsDemo {
-    /// Intersect a ray against the planet's outer shell. Returns the
-    /// entry t if the ray hits in front of the camera.
-    fn ray_t(&self, origin: [f32; 3], dir: [f32; 3]) -> Option<f32> {
-        let oc = sdf::sub(origin, self.center);
-        let b = sdf::dot(oc, dir);
-        let c = sdf::dot(oc, oc) - self.radius * self.radius;
-        let disc = b * b - c;
-        if disc <= 0.0 { return None; }
-        let sq = disc.sqrt();
-        let t0 = -b - sq;
-        let t1 = -b + sq;
-        if t0 > 0.0 { Some(t0) } else if t1 > 0.0 { Some(t1) } else { None }
-    }
-
-    /// Which (face, i, j) cell does this ray hit first on the shell?
-    fn hit_cell(&self, origin: [f32; 3], dir: [f32; 3])
-        -> Option<(f32, deepspace_game::world::cubesphere::Face, u32, u32)>
-    {
-        use deepspace_game::world::cubesphere::world_to_coord;
-        let t = self.ray_t(origin, dir)?;
-        let hit = sdf::add(origin, sdf::scale(dir, t));
-        let coord = world_to_coord(self.center, hit)?;
-        let n = self.cells as f32;
-        let ug = ((coord.u + 1.0) * 0.5 * n).floor();
-        let vg = ((coord.v + 1.0) * 0.5 * n).floor();
-        let i = (ug as i32).clamp(0, self.cells as i32 - 1) as u32;
-        let j = (vg as i32).clamp(0, self.cells as i32 - 1) as u32;
-        Some((t, coord.face, i, j))
-    }
-}
-
 // ------------------------------------------------------------ App
 
 struct App {
@@ -179,10 +138,9 @@ struct App {
     debug_overlay_visible: bool,
     /// Exponentially smoothed FPS for the debug overlay.
     fps_smooth: f64,
-    /// Cubed-sphere demo planet (center, outer radius, cells/face).
-    /// Used by the cursor raycast so the highlight can target
-    /// individual bulged cells on the sphere.
-    cs_demo: Option<CsDemo>,
+    /// Cubed-sphere demo planet — owns per-cell block storage and
+    /// the shell geometry used for cursor raycasts and editing.
+    cs_planet: Option<deepspace_game::world::cubesphere::CubeSpherePlanet>,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -225,7 +183,7 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
-            cs_demo: None,
+            cs_planet: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -292,8 +250,45 @@ impl App {
         );
     }
 
+    /// If the cubed-sphere planet is hit closer than any tree block,
+    /// write `new_block` (0 = erase) to the targeted cell and
+    /// re-upload the per-cell buffer. Returns `true` if the edit
+    /// happened so the caller can skip its tree-edit fallback.
+    fn edit_cs_if_closer(&mut self, ray_dir: [f32; 3], new_block: u8) -> bool {
+        // First: read-only probe of the cubed-sphere planet.
+        let Some((cs_t, face, i, j)) = self.cs_planet.as_ref()
+            .and_then(|p| p.hit_cell(self.camera.pos, ray_dir)) else {
+            return false;
+        };
+        // Compare against the nearest tree block along this ray.
+        let ed = self.edit_depth();
+        let tree_hit = edit::cpu_raycast(
+            &self.world.library, self.world.root,
+            self.camera.pos, ray_dir, ed,
+        );
+        let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
+        if cs_t >= tree_t { return false; }
+
+        // Safe to take a mutable borrow now: we're no longer reading
+        // anything else on `self` that conflicts.
+        let Some(planet) = self.cs_planet.as_mut() else { return false };
+        planet.set(face, i, j, new_block);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_cubed_sphere_blocks(&planet.blocks);
+        }
+        true
+    }
+
     fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
+
+        // If the cubed-sphere planet's shell is closer than any
+        // tree block, clear the targeted cell there. Break never
+        // cares whether the cell was empty — we always write 0.
+        if self.edit_cs_if_closer(ray_dir, 0) {
+            return;
+        }
+
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
             self.camera.pos, ray_dir, self.edit_depth(),
@@ -339,6 +334,16 @@ impl App {
 
     fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
+
+        // Cubed-sphere first: place the active hotbar block into the
+        // targeted cell if the sphere is closer. Mesh slots fall
+        // through to the tree path.
+        if let Some(block_type) = self.ui.active_block_type() {
+            if self.edit_cs_if_closer(ray_dir, block_type) {
+                return;
+            }
+        }
+
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
             self.camera.pos, ray_dir, self.edit_depth(),
@@ -403,7 +408,8 @@ impl App {
 
         // Cubed-sphere cursor: hit the demo planet's outer shell and
         // report (face, i, j) for whichever cell the ray enters.
-        let cs_hit = self.cs_demo.and_then(|d| d.hit_cell(self.camera.pos, ray_dir));
+        let cs_hit = self.cs_planet.as_ref()
+            .and_then(|p| p.hit_cell(self.camera.pos, ray_dir));
         let cs_t = cs_hit.map(|(t, ..)| t).unwrap_or(f32::INFINITY);
 
         if let Some(renderer) = &mut self.renderer {
@@ -594,11 +600,7 @@ impl ApplicationHandler for App {
             let planet = generate_from_sdf(cs_center, cs_radius, cells_per_face, &sdf);
             renderer.set_cubed_sphere_planet(cs_center, cs_radius, cells_per_face);
             renderer.set_cubed_sphere_blocks(&planet.blocks);
-            self.cs_demo = Some(CsDemo {
-                center: cs_center,
-                radius: cs_radius,
-                cells: cells_per_face,
-            });
+            self.cs_planet = Some(planet);
         }
         self.renderer = Some(renderer);
         self.apply_zoom(); // sync renderer max_depth with initial zoom_level
