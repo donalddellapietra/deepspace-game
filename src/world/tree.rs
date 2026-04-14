@@ -86,6 +86,10 @@ pub fn uniform_children(child: Child) -> Children {
 pub struct Node {
     pub children: Children,
     pub ref_count: u32,
+    /// The most common block type among all children (recursive).
+    /// Used by the renderer when it can't descend further (LOD/zoom).
+    /// 255 = no dominant block (all empty).
+    pub dominant_block: u8,
 }
 
 // ---------------------------------------------------------- slot encoding
@@ -145,7 +149,21 @@ impl NodeLibrary {
                 _ => None,
             })
             .collect();
-        self.nodes.insert(id, Node { children, ref_count: 0 });
+        // Compute dominant block: most common BlockType among children.
+        let mut counts = [0u32; 256];
+        for c in &children {
+            if let Child::Block(bt) = c {
+                counts[*bt as u8 as usize] += 1;
+            }
+        }
+        let dominant_block = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, count)| *count)
+            .filter(|&(_, count)| *count > 0)
+            .map(|(i, _)| i as u8)
+            .unwrap_or(255);
+        self.nodes.insert(id, Node { children, ref_count: 0, dominant_block });
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
             self.ref_inc(nid);

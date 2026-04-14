@@ -3,9 +3,6 @@ name = "deepspace-game"
 version = "0.2.0"
 edition = "2024"
 
-[features]
-dev = []
-
 [dependencies]
 winit = "0.30"
 wgpu = "25"
@@ -13,6 +10,15 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 log = "0.4"
 env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wry = { version = "0.47", features = ["transparent"] }
+raw-window-handle = "0.6"
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSResponder", "NSWindow"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

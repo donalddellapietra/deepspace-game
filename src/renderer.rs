@@ -15,6 +15,8 @@ pub struct GpuUniforms {
     pub node_count: u32,
     pub screen_width: f32,
     pub screen_height: f32,
+    pub max_depth: u32,
+    pub _pad: [u32; 3],
 }
 
 pub struct Renderer {
@@ -29,9 +31,10 @@ pub struct Renderer {
     palette_buffer: wgpu::Buffer,
     uniforms_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    // Tracked state for resize.
+    // Tracked state.
     root_index: u32,
     node_count: u32,
+    max_depth: u32,
 }
 
 impl Renderer {
@@ -128,6 +131,8 @@ impl Renderer {
             node_count,
             screen_width: config.width as f32,
             screen_height: config.height as f32,
+            max_depth: 8,
+            _pad: [0; 3],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -252,7 +257,13 @@ impl Renderer {
             bind_group,
             root_index,
             node_count,
+            max_depth: 8,
         }
+    }
+
+    pub fn set_max_depth(&mut self, depth: u32) {
+        self.max_depth = depth;
+        self.write_uniforms();
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -341,6 +352,8 @@ impl Renderer {
             node_count: self.node_count,
             screen_width: self.config.width as f32,
             screen_height: self.config.height as f32,
+            max_depth: self.max_depth,
+            _pad: [0; 3],
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
