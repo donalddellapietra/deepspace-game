@@ -284,20 +284,29 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var s_node_idx: array<u32, 16>;
     var s_cell: array<vec3<i32>, 16>;
     var s_side_dist: array<vec3<f32>, 16>;
-    // The world-space origin of the node at each level (its min corner).
-    var s_node_origin: array<vec3<f32>, 16>;
+    // Ray origin expressed in each level's LOCAL frame: the frame
+    // where the current node's min corner is at (0, 0, 0) and its
+    // max is at (3 * s_cell_size[depth]). Storing per-level local
+    // origins instead of a single world origin keeps every
+    // `(cell_min - origin) * inv_dir` subtraction in small-number
+    // territory — at depth D, both operands are bounded by
+    // 3 * cell_size[D], so f32 precision is preserved regardless of
+    // where the camera actually is in world space.
+    var s_local_origin: array<vec3<f32>, 16>;
     // The scale of one cell at each level.
     var s_cell_size: array<f32, 16>;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
-    // Initialize root level.
+    // Initialize root level. Root spans [0, 3) in world, so the root's
+    // local frame IS world space — ray_origin passes through unchanged.
     s_node_idx[0] = uniforms.root_index;
-    s_node_origin[0] = vec3<f32>(0.0);
+    s_local_origin[0] = ray_origin;
     s_cell_size[0] = 1.0; // root node: each cell is 1.0 wide, node spans [0, 3)
 
-    // Intersect ray with root node [0, 3)
+    // Intersect ray with root node [0, 3). Local frame == world frame
+    // at root, so this test is the same.
     let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
@@ -306,29 +315,32 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
 
-    // Initial cell in root
+    // Initial cell in root (root's local frame == world frame).
     s_cell[0] = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
         clamp(i32(floor(entry_pos.y)), 0, 2),
         clamp(i32(floor(entry_pos.z)), 0, 2),
     );
 
-    // Initial side_dist for root level
+    // Initial side_dist for root level. side_dist is frame-invariant
+    // (both cell-boundary and ray-origin shift by the same offset),
+    // so computing it in local coords yields the same t-values the
+    // world-frame version would — with better precision at depth.
     let cell_f = vec3<f32>(s_cell[0]);
     s_side_dist[0] = vec3<f32>(
         select(
-            (cell_f.x - entry_pos.x) * inv_dir.x,
-            (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x,
+            (cell_f.x - s_local_origin[0].x) * inv_dir.x,
+            (cell_f.x + 1.0 - s_local_origin[0].x) * inv_dir.x,
             ray_dir.x >= 0.0
         ),
         select(
-            (cell_f.y - entry_pos.y) * inv_dir.y,
-            (cell_f.y + 1.0 - entry_pos.y) * inv_dir.y,
+            (cell_f.y - s_local_origin[0].y) * inv_dir.y,
+            (cell_f.y + 1.0 - s_local_origin[0].y) * inv_dir.y,
             ray_dir.y >= 0.0
         ),
         select(
-            (cell_f.z - entry_pos.z) * inv_dir.z,
-            (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z,
+            (cell_f.z - s_local_origin[0].z) * inv_dir.z,
+            (cell_f.z + 1.0 - s_local_origin[0].z) * inv_dir.z,
             ray_dir.z >= 0.0
         ),
     );
@@ -395,12 +407,13 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                 normal = vec3<f32>(0.0, 0.0, f32(-step.z));
             }
         } else if tag == 1u {
-            // Block hit!
-            let cell_min_h = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-            let cell_max_h = cell_min_h + vec3<f32>(s_cell_size[depth]);
-            let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+            // Block hit! Cell bounds expressed in the current level's
+            // local frame — precise at any tree depth.
+            let cell_min_l = vec3<f32>(cell) * s_cell_size[depth];
+            let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
+            let cell_box = ray_box(s_local_origin[depth], inv_dir, cell_min_l, cell_max_l);
             result.hit = true;
-            result.t = max(cell_box_h.t_enter, 0.0);
+            result.t = max(cell_box.t_enter, 0.0);
             result.color = palette.colors[child_block_type(packed)].rgb;
             result.normal = normal;
             return result;
@@ -439,10 +452,11 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                         normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                     }
                 } else {
-                    // Solid representative — render as block.
-                    let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
+                    // Solid representative — render as block, in
+                    // the current level's local frame.
+                    let cell_min_l = vec3<f32>(cell) * s_cell_size[depth];
                     let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
-                    let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
+                    let cell_box_l = ray_box(s_local_origin[depth], inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
                     result.color = palette.colors[bt].rgb;
@@ -453,48 +467,64 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
 
             let child_idx = child_node_index(s_node_idx[depth], slot);
 
-            // Compute the world-space min corner of this child cell.
-            let parent_origin = s_node_origin[depth];
+            // All arithmetic here stays in the PARENT's local frame
+            // (small numbers), then shifts into the child's local
+            // frame for the push. Worst-case magnitude after the shift
+            // is `3 * child_cell_size`, so precision is preserved at
+            // any depth.
             let parent_cell_size = s_cell_size[depth];
-            let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
             let child_cell_size = parent_cell_size / 3.0;
+            // Child's min corner in parent-local frame.
+            let child_origin_local = vec3<f32>(cell) * parent_cell_size;
+            let child_max_local = child_origin_local + vec3<f32>(parent_cell_size);
 
-            // Intersect ray with this child's AABB.
-            let child_max = child_origin + vec3<f32>(parent_cell_size);
-            let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);
+            // Intersect ray (parent-local origin) with the child AABB
+            // (also parent-local). Small operands both sides.
+            let child_hit = ray_box(
+                s_local_origin[depth], inv_dir,
+                child_origin_local, child_max_local
+            );
             let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
-            let child_entry = ray_origin + ray_dir * ct_start;
-
-            // Convert entry point to child-local cell coordinates.
-            let local_entry = (child_entry - child_origin) / child_cell_size;
+            // Ray position at t = ct_start, still in parent-local frame.
+            let child_entry_in_parent = s_local_origin[depth] + ray_dir * ct_start;
+            // Shift into child's local frame: subtract the child's
+            // origin (parent-local) so the child's min is now (0,0,0).
+            let child_entry_in_child = child_entry_in_parent - child_origin_local;
+            // child_entry_in_child ∈ [0, 3 * child_cell_size], so
+            // dividing by child_cell_size lands in [0, 3) — the
+            // per-level local-frame convention.
+            let local_entry_cells = child_entry_in_child / child_cell_size;
 
             // Push onto stack.
             depth += 1u;
             s_node_idx[depth] = child_idx;
-            s_node_origin[depth] = child_origin;
             s_cell_size[depth] = child_cell_size;
+            // Ray origin in the CHILD's local frame: shift parent-local
+            // origin by the child's min corner. This is the heart of
+            // the precision fix.
+            s_local_origin[depth] = s_local_origin[depth - 1u] - child_origin_local;
             s_cell[depth] = vec3<i32>(
-                clamp(i32(floor(local_entry.x)), 0, 2),
-                clamp(i32(floor(local_entry.y)), 0, 2),
-                clamp(i32(floor(local_entry.z)), 0, 2),
+                clamp(i32(floor(local_entry_cells.x)), 0, 2),
+                clamp(i32(floor(local_entry_cells.y)), 0, 2),
+                clamp(i32(floor(local_entry_cells.z)), 0, 2),
             );
 
-            // Initialize side_dist for this level.
+            // Initialize side_dist for this level in child-local frame.
             let lc = vec3<f32>(s_cell[depth]);
             s_side_dist[depth] = vec3<f32>(
                 select(
-                    (child_origin.x + lc.x * child_cell_size - ray_origin.x) * inv_dir.x,
-                    (child_origin.x + (lc.x + 1.0) * child_cell_size - ray_origin.x) * inv_dir.x,
+                    (lc.x * child_cell_size - s_local_origin[depth].x) * inv_dir.x,
+                    ((lc.x + 1.0) * child_cell_size - s_local_origin[depth].x) * inv_dir.x,
                     ray_dir.x >= 0.0
                 ),
                 select(
-                    (child_origin.y + lc.y * child_cell_size - ray_origin.y) * inv_dir.y,
-                    (child_origin.y + (lc.y + 1.0) * child_cell_size - ray_origin.y) * inv_dir.y,
+                    (lc.y * child_cell_size - s_local_origin[depth].y) * inv_dir.y,
+                    ((lc.y + 1.0) * child_cell_size - s_local_origin[depth].y) * inv_dir.y,
                     ray_dir.y >= 0.0
                 ),
                 select(
-                    (child_origin.z + lc.z * child_cell_size - ray_origin.z) * inv_dir.z,
-                    (child_origin.z + (lc.z + 1.0) * child_cell_size - ray_origin.z) * inv_dir.z,
+                    (lc.z * child_cell_size - s_local_origin[depth].z) * inv_dir.z,
+                    ((lc.z + 1.0) * child_cell_size - s_local_origin[depth].z) * inv_dir.z,
                     ray_dir.z >= 0.0
                 ),
             );

@@ -47,7 +47,17 @@ pub fn demo_planet() -> PlanetSetup {
         center,
         inner_r,
         outer_r,
-        depth: 20,
+        // Face-subtree depth. The shader's sphere DDA computes cell
+        // boundaries via `iu / cells_d` where `cells_d = 3^depth`.
+        // Past depth 14, `3^depth` exceeds f32's 24-bit integer
+        // precision, so `iu` and `iu + 1` round to the same float
+        // and adjacent cells get the same boundary plane → corners
+        // don't separate cleanly → visible "spike" artifacts.
+        // Depth 13 is the sweet spot: finest cells are still fine
+        // enough to be imperceptibly small at normal viewing
+        // distances, but `3^13 = 1594323` is well within f32
+        // integer precision.
+        depth: 13,
         sdf: Planet {
             center,
             radius: 0.32,
@@ -92,9 +102,9 @@ mod tests {
         assert!(s.sdf.radius < s.outer_r);
         // SDF is anchored to the same center as the shell.
         assert_eq!(s.sdf.center, s.center);
-        // Depth matches the original main.rs setup (extraction, not
-        // redesign — bump deliberately if tuning the demo).
-        assert_eq!(s.depth, 20);
+        // Depth capped for f32 precision — see demo_planet() for
+        // the reasoning. Adjust this and the assert together.
+        assert_eq!(s.depth, 13);
         // Influence radius extends beyond the shell for gravity in space.
         assert!(s.sdf.influence_radius >= s.outer_r);
         // Blocks are sane.
