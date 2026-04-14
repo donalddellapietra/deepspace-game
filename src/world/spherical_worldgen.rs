@@ -185,7 +185,8 @@ mod tests {
         // Face roots are reachable through the body node's children.
         use super::super::cubesphere::{face_root_of, Face};
         for &face in &Face::ALL {
-            let id = face_root_of(&scene.world.library, scene.planet.body_node, face);
+            let id = face_root_of(&scene.world.library, scene.planet.body_node, face)
+                .expect("face root must resolve on a freshly built scene");
             assert!(scene.world.library.get(id).is_some());
         }
     }

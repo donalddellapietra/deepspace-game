@@ -243,16 +243,14 @@ pub struct SphericalPlanet {
 
 /// Return the face subtree root for `face` under `body_node` —
 /// `body_node`'s child at the face-center slot for that face.
-/// Panics if `body_node` is missing or its face-center slot isn't a
-/// `Child::Node`; both are invariants of a correctly built body.
-pub fn face_root_of(lib: &NodeLibrary, body_node: NodeId, face: Face) -> NodeId {
-    let node = lib.get(body_node).expect("body node must exist");
+/// Returns `None` if `body_node` isn't in the library (e.g., it was
+/// evicted after an edit) or its face-center slot isn't a
+/// `Child::Node` (e.g., a broken body with a solid filler).
+pub fn face_root_of(lib: &NodeLibrary, body_node: NodeId, face: Face) -> Option<NodeId> {
+    let node = lib.get(body_node)?;
     match node.children[body_face_center_slot(face)] {
-        Child::Node(id) => id,
-        other => panic!(
-            "body_node {} face-center slot for {:?} must be Child::Node, got {:?}",
-            body_node, face, other
-        ),
+        Child::Node(id) => Some(id),
+        _ => None,
     }
 }
 
@@ -613,7 +611,9 @@ impl SphericalPlanet {
         r_n: f32,
         max_depth: u32,
     ) -> (u8, u32) {
-        let mut node_id = face_root_of(lib, self.body_node, face);
+        let Some(mut node_id) = face_root_of(lib, self.body_node, face) else {
+            return (0, 0);
+        };
         let mut un = u_n.clamp(0.0, 0.9999999);
         let mut vn = v_n.clamp(0.0, 0.9999999);
         let mut rn = r_n.clamp(0.0, 0.9999999);
@@ -682,7 +682,10 @@ impl SphericalPlanet {
         }
 
         let face_slot = body_face_center_slot(face);
-        let root = face_root_of(&world.library, self.body_node, face);
+        let root = match face_root_of(&world.library, self.body_node, face) {
+            Some(id) => id,
+            None => return false,
+        };
         let new_face_root =
             rebuild_with_edit(&mut world.library, root, &slots[..levels], 0, new_child);
         if new_face_root == root { return false; }
@@ -1085,7 +1088,7 @@ mod tests {
         }
         // `face_root_of` agrees with the raw slot lookup.
         for &face in &Face::ALL {
-            let id = face_root_of(&lib, planet.body_node, face);
+            let id = face_root_of(&lib, planet.body_node, face).unwrap();
             assert!(lib.get(id).is_some());
         }
     }
@@ -1096,7 +1099,8 @@ mod tests {
         let sdf = test_sdf(1.0, 0.05);
         let planet = generate_spherical_planet(&mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf);
         for &face in &Face::ALL {
-            let id = face_root_of(&lib, planet.body_node, face);
+            let id = face_root_of(&lib, planet.body_node, face)
+                .expect("face root must resolve");
             assert!(lib.get(id).is_some(), "every face root must exist in library");
         }
     }
@@ -1109,7 +1113,7 @@ mod tests {
         // Bottom (rs=0) layer is deep inside solid; top (rs=2) is deep air.
         let planet = generate_spherical_planet(&mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 2, &sdf);
         // Walk one level into the +X face, middle u/v, bottom rs: solid.
-        let inner = walk_subtree(&lib, face_root_of(&lib, planet.body_node, Face::PosX), &[(1, 1, 0)]);
+        let inner = walk_subtree(&lib, face_root_of(&lib, planet.body_node, Face::PosX).unwrap(), &[(1, 1, 0)]);
         match inner {
             Child::Block(_) => {}
             Child::Node(id) => {
@@ -1121,7 +1125,7 @@ mod tests {
             Child::Empty => panic!("inner slot at r_lo should be solid"),
         }
         // Top slot: empty.
-        let outer = walk_subtree(&lib, face_root_of(&lib, planet.body_node, Face::PosX), &[(1, 1, 2)]);
+        let outer = walk_subtree(&lib, face_root_of(&lib, planet.body_node, Face::PosX).unwrap(), &[(1, 1, 2)]);
         assert!(matches!(outer, Child::Empty | Child::Node(_)),
             "outer slot should resolve to empty or an empty subtree");
     }
