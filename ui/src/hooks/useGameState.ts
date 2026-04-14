@@ -6,6 +6,7 @@ import type {
   ColorPickerState,
   ModeIndicatorState,
   ToastMessage,
+  PauseMenuState,
 } from "../types";
 import { getTransport } from "./useTransport";
 
@@ -60,6 +61,11 @@ const modeIndicatorStore = createStore<ModeIndicatorState>({
 
 const toastStore = createStore<ToastMessage | null>(null);
 
+const pauseMenuStore = createStore<PauseMenuState>({
+  open: false,
+  saveStatus: null,
+});
+
 // ── Dispatch from Rust ────────────────────────────────────────────
 
 function handleGameState(update: GameStateUpdate) {
@@ -78,6 +84,9 @@ function handleGameState(update: GameStateUpdate) {
       break;
     case "toast":
       toastStore.set(update.data);
+      break;
+    case "pauseMenu":
+      pauseMenuStore.set(update.data);
       break;
   }
 }
@@ -119,6 +128,10 @@ export function useModeIndicator(): ModeIndicatorState {
 
 export function useToast(): ToastMessage | null {
   return useSyncExternalStore(toastStore.subscribe, toastStore.get);
+}
+
+export function usePauseMenu(): PauseMenuState {
+  return useSyncExternalStore(pauseMenuStore.subscribe, pauseMenuStore.get);
 }
 
 // For clearing toast after display

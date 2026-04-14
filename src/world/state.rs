@@ -14,12 +14,17 @@
 
 use bevy::prelude::*;
 
-use super::generator::{generate_air_leaf, generate_grass_leaf};
-use super::tree::{
-    downsample_from_library, slot_coords, uniform_children, Children, NodeId,
-    NodeLibrary, BRANCH_FACTOR, CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER,
-    NODE_VOXELS_PER_AXIS,
+use super::generator::{
+    generate_air_leaf, generate_grass_leaf,
+    generate_sphere_leaf, aabb_inside_sphere, aabb_outside_sphere,
+    SphereParams, TerrainNoise, MAX_TERRAIN_AMPLITUDE,
 };
+use super::tree::{
+    downsample_from_library, filled_voxel_grid, slot_coords, uniform_children,
+    voxel_from_block, Children, NodeId, NodeLibrary, BRANCH_FACTOR,
+    CHILDREN_PER_NODE, EMPTY_NODE, MAX_LAYER, NODE_VOXELS_PER_AXIS,
+};
+use crate::block::BlockType;
 
 /// Root-local y-offset of the ground surface, in leaf voxels. Every
 /// leaf whose y-range in root-local coords is ≤ this value is solid
@@ -74,6 +79,20 @@ pub const GROUND_TRANSITION_DEPTH: usize = {
     }
 };
 
+// ---------------------------------------------------------- sphere parameters
+
+/// Radius of the test sphere in leaf voxels.
+pub const SPHERE_RADIUS: i64 = 500;
+
+/// Depth from the sphere surface at which all voxels are Stone.
+const STONE_DEPTH: i64 = 10;
+
+/// Leaf-coordinate centre of the sphere (world centre on all axes).
+pub fn sphere_center() -> [i64; 3] {
+    let half = world_extent_voxels() / 2;
+    [half, half, half]
+}
+
 /// Full world extent along one axis, in leaf voxels.
 /// `25 × 5^MAX_LAYER ≈ 6.1 billion` — overflows `i32`, lives in `i64`.
 pub const fn world_extent_voxels() -> i64 {
@@ -90,15 +109,168 @@ pub const fn world_extent_voxels() -> i64 {
 pub struct WorldState {
     pub root: NodeId,
     pub library: NodeLibrary,
+    /// The library's `next_id` at the time the canned world was loaded.
+    /// Nodes with `id >= canned_node_count` were created at runtime
+    /// (player edits) and should be included in save files.
+    /// Zero if no canned world was loaded (in-process generation).
+    pub canned_node_count: u64,
+    /// Hash of the canned world, for save file validation.
+    pub canned_world_hash: u64,
 }
+
+const WORLD_BIN_PATH: &str = "assets/world.bin";
 
 impl Default for WorldState {
     fn default() -> Self {
-        Self::new_grassland()
+        // Native: try to load a pre-generated canned world from disk.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Ok((root, library, next_id)) =
+                super::serial::read_world_file(std::path::Path::new(WORLD_BIN_PATH))
+            {
+                let hash = super::serial::canned_world_hash(root, next_id, library.len());
+                eprintln!(
+                    "loaded canned world: {} library entries, {:.1} KB",
+                    library.len(),
+                    std::fs::metadata(WORLD_BIN_PATH)
+                        .map(|m| m.len() as f64 / 1024.0)
+                        .unwrap_or(0.0),
+                );
+                return Self {
+                    root,
+                    library,
+                    canned_node_count: next_id,
+                    canned_world_hash: hash,
+                };
+            }
+            // Fall back to in-process generation.
+            return Self::new_sphere();
+        }
+
+        // WASM: generate sphere in-process (no filesystem access).
+        // TODO: load world.bin via Bevy async asset system for instant startup.
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self::new_sphere()
+        }
     }
 }
 
 impl WorldState {
+    /// Build a sphere world with terrain noise.
+    pub fn new_sphere() -> Self {
+        let mut state = Self {
+            root: EMPTY_NODE,
+            library: NodeLibrary::default(),
+            canned_node_count: 0,
+            canned_world_hash: 0,
+        };
+        let params = SphereParams {
+            center: sphere_center(),
+            radius: SPHERE_RADIUS,
+            terrain: Some(TerrainNoise::new(42)),
+        };
+        state.build_sphere_root(&params);
+        state
+    }
+
+    /// Build the sphere tree. Pre-builds uniform "all air" and "all
+    /// stone" subtree towers so the recursive builder can skip
+    /// entirely empty (exterior) or deep-interior regions without
+    /// recursing to leaves.
+    pub fn build_sphere_root(&mut self, params: &SphereParams) -> NodeId {
+        let air_leaf = self.library.insert_leaf(generate_air_leaf());
+        let stone_leaf = self.library.insert_leaf(
+            filled_voxel_grid(voxel_from_block(Some(BlockType::Stone))),
+        );
+
+        let layer_count = MAX_LAYER as usize + 1;
+        let mut air_tower = vec![EMPTY_NODE; layer_count];
+        let mut solid_tower = vec![EMPTY_NODE; layer_count];
+        air_tower[MAX_LAYER as usize] = air_leaf;
+        solid_tower[MAX_LAYER as usize] = stone_leaf;
+
+        for k in (0..MAX_LAYER as usize).rev() {
+            let air_ch = uniform_children(air_tower[k + 1]);
+            let air_vox = downsample_from_library(&self.library, air_ch.as_ref());
+            air_tower[k] = self.library.insert_non_leaf(air_vox, air_ch);
+
+            let solid_ch = uniform_children(solid_tower[k + 1]);
+            let solid_vox = downsample_from_library(&self.library, solid_ch.as_ref());
+            solid_tower[k] = self.library.insert_non_leaf(solid_vox, solid_ch);
+        }
+
+        let extent = world_extent_voxels();
+        let gen_start = bevy::platform::time::Instant::now();
+        let root_id = self.build_sphere_node(
+            [0, 0, 0], extent, 0, params, &air_tower, &solid_tower,
+        );
+        eprintln!(
+            "sphere gen: {:.1}s, {} library entries",
+            gen_start.elapsed().as_secs_f64(),
+            self.library.len(),
+        );
+        self.swap_root(root_id);
+        root_id
+    }
+
+    /// Recursive sphere builder. At each node, checks whether the
+    /// AABB is entirely outside (air tower), entirely deep inside
+    /// (solid tower), or intersects the surface (recurse / eval).
+    ///
+    /// Layers 0–8 use the smooth sphere (no noise margin) so the
+    /// surface band is thin and generation is fast. Layers 9–12
+    /// widen the band by MAX_TERRAIN_AMPLITUDE so noise-displaced
+    /// surface nodes aren't incorrectly culled.
+    fn build_sphere_node(
+        &mut self,
+        origin: [i64; 3],
+        extent: i64,
+        layer: u8,
+        params: &SphereParams,
+        air_tower: &[NodeId],
+        solid_tower: &[NodeId],
+    ) -> NodeId {
+        // Always use terrain-aware radius for the outside check so
+        // nodes where terrain noise pushes the surface outward aren't
+        // incorrectly classified as all-air.
+        let amp = if params.terrain.is_some() { MAX_TERRAIN_AMPLITUDE as i64 } else { 0 };
+
+        if aabb_outside_sphere(origin, extent, params) {
+            return air_tower[layer as usize];
+        }
+        if aabb_inside_sphere(
+            origin, extent, params.center,
+            params.radius - amp - STONE_DEPTH,
+        ) {
+            return solid_tower[layer as usize];
+        }
+        if layer == MAX_LAYER {
+            let grid = generate_sphere_leaf(origin, params);
+            return self.library.insert_leaf(grid);
+        }
+        let child_extent = extent / BRANCH_FACTOR as i64;
+        let mut child_ids = Vec::with_capacity(CHILDREN_PER_NODE);
+        for slot in 0..CHILDREN_PER_NODE {
+            let (sx, sy, sz) = slot_coords(slot);
+            let child_origin = [
+                origin[0] + sx as i64 * child_extent,
+                origin[1] + sy as i64 * child_extent,
+                origin[2] + sz as i64 * child_extent,
+            ];
+            child_ids.push(self.build_sphere_node(
+                child_origin, child_extent, layer + 1, params,
+                air_tower, solid_tower,
+            ));
+        }
+        let children_arr: Children = child_ids
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("size constant"));
+        let voxels = downsample_from_library(&self.library, children_arr.as_ref());
+        self.library.insert_non_leaf(voxels, children_arr)
+    }
+
     /// Build a fresh grassland world with a ground layer. Content
     /// collapses to a small number of library entries thanks to
     /// dedup: two leaf patterns (grass and air), plus two non-leaf
@@ -108,6 +280,8 @@ impl WorldState {
         let mut state = Self {
             root: EMPTY_NODE,
             library: NodeLibrary::default(),
+            canned_node_count: 0,
+            canned_world_hash: 0,
         };
         state.build_grassland_root();
         state
@@ -131,6 +305,34 @@ impl WorldState {
     /// No-op when `new_root_id == self.root` so callers can be lazy
     /// about checking. This also keeps round-trip edits (edit then
     /// undo) from uselessly ref-cycling the same id.
+    /// Save the current game state (player edits) to a file.
+    /// Only nodes created at runtime (id >= canned_node_count) are saved.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        super::serial::write_save_file(
+            path,
+            self.root,
+            &self.library,
+            self.canned_node_count,
+            self.canned_world_hash,
+        )
+    }
+
+    /// Load a save file on top of the current canned world.
+    /// Replaces the root and inserts override nodes into the library.
+    pub fn load_save_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let new_root = super::serial::read_save_file(
+            path,
+            &mut self.library,
+            self.canned_world_hash,
+        )?;
+        // Don't use swap_root here — load_save already ref_inc'd the
+        // new root and rebuilt all refcounts. We just need to update
+        // the root pointer. The old root's ref was already decremented
+        // by the rebuild.
+        self.root = new_root;
+        Ok(())
+    }
+
     pub fn swap_root(&mut self, new_root_id: NodeId) {
         if new_root_id == self.root {
             return;
@@ -330,5 +532,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --------------------------------------------------------- sphere tests
+
+    #[test]
+    fn sphere_builds_root() {
+        let world = WorldState::new_sphere();
+        assert_ne!(world.root, EMPTY_NODE);
+        assert!(world.library.get(world.root).is_some());
+    }
+
+    #[test]
+    fn sphere_center_is_solid() {
+        let world = WorldState::new_sphere();
+        let center = sphere_center();
+        let pos = crate::world::view::position_from_leaf_coord(center)
+            .expect("center inside world");
+        assert_ne!(
+            crate::world::edit::get_voxel(&world, &pos),
+            EMPTY_VOXEL,
+            "sphere center should be solid"
+        );
+    }
+
+    #[test]
+    fn sphere_exterior_is_empty() {
+        let world = WorldState::new_sphere();
+        let center = sphere_center();
+        let coord = [center[0], center[1] + SPHERE_RADIUS + 100, center[2]];
+        let pos = crate::world::view::position_from_leaf_coord(coord)
+            .expect("outside point inside world");
+        assert_eq!(
+            crate::world::edit::get_voxel(&world, &pos),
+            EMPTY_VOXEL,
+            "point outside sphere should be empty"
+        );
+    }
+
+    #[test]
+    fn sphere_library_is_compact() {
+        let world = WorldState::new_sphere();
+        assert!(
+            world.library.len() < 20_000,
+            "library has {} entries — dedup not working?",
+            world.library.len()
+        );
+    }
+
+    #[test]
+    fn sphere_surface_visible_at_root() {
+        let world = WorldState::new_sphere();
+        let root = world.library.get(world.root).expect("root");
+        let has_solid = root.voxels.iter().any(|&v| v != EMPTY_VOXEL);
+        assert!(has_solid, "root voxel grid is all-empty — sphere not visible");
     }
 }

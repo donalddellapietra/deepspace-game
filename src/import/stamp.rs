@@ -192,7 +192,7 @@ mod tests {
     /// land in the right place.
     #[test]
     fn stamp_small_model_at_origin() {
-        let mut world = WorldState::default();
+        let mut world = WorldState::new_grassland();
         let anchor = Position::origin();
 
         let size = 3;
@@ -231,7 +231,7 @@ mod tests {
     /// An all-empty model should modify zero leaves.
     #[test]
     fn stamp_empty_model_is_noop() {
-        let mut world = WorldState::default();
+        let mut world = WorldState::new_grassland();
         let anchor = Position::origin();
         let model = VoxelModel {
             size_x: 10,
@@ -246,7 +246,7 @@ mod tests {
     /// A model larger than 25 spans multiple leaves.
     #[test]
     fn stamp_multi_leaf_model() {
-        let mut world = WorldState::default();
+        let mut world = WorldState::new_grassland();
         let anchor = Position::origin();
 
         let size = 30; // spans 2 leaves on each axis
@@ -272,7 +272,7 @@ mod tests {
     /// world content.
     #[test]
     fn stamp_preserves_existing_on_transparent() {
-        let mut world = WorldState::default();
+        let mut world = WorldState::new_grassland();
         let anchor = Position::origin();
 
         let mut data = vec![EMPTY_VOXEL; 25 * 25 * 25];

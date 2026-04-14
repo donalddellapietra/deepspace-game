@@ -8,4 +8,15 @@
 
 # Downloaded test assets (large .vox files, etc.)
 /assets/vox/*.vox
+
+# Generated world data (run `cargo run --bin gen_world` to regenerate)
+/assets/world.bin
+/assets/meshes.bin
+/assets/meshes.idx
+/assets/meshes_mono.bin
+
+# Save files
+/saves/
+
 .claude/
+ui/assets/
