@@ -116,20 +116,38 @@ impl App {
             .clamp(1, (self.tree_depth as i32).max(1));
         if new_anchor_depth == self.anchor_depth() as i32 { return; }
 
+        // Dolly anchor: world-space point under the crosshair. Try
+        // the Cartesian tree first, then the cubed-sphere planet.
+        // Without the sphere fallback, an empty tree produces no
+        // hit and the dolly uses a phantom "10 cell-widths ahead"
+        // point; at shallow anchors (big cells) that pushes the
+        // camera well outside the root cell, where `from_world_xyz`
+        // clamps to the root boundary and the resulting view no
+        // longer intersects the planet → blue screen.
         let cam_world = self.camera.world_pos_f32();
         let ray_dir = self.camera.forward();
-        let hit = edit::cpu_raycast(
+        let tree_t = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
             cam_world,
             ray_dir,
             self.edit_depth(),
-        );
-        let anchor_world = if let Some(h) = hit {
+        ).map(|h| h.t);
+        let cs_t = self.cs_planet.as_ref().and_then(|p| {
+            p.raycast(&self.world.library, cam_world, ray_dir, p.depth.min(4))
+                .map(|h| h.t)
+        });
+        let hit_t = match (tree_t, cs_t) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let anchor_world = if let Some(t) = hit_t {
             [
-                cam_world[0] + ray_dir[0] * h.t,
-                cam_world[1] + ray_dir[1] * h.t,
-                cam_world[2] + ray_dir[2] * h.t,
+                cam_world[0] + ray_dir[0] * t,
+                cam_world[1] + ray_dir[1] * t,
+                cam_world[2] + ray_dir[2] * t,
             ]
         } else {
             let d = self.camera.cell_size() * 10.0;
