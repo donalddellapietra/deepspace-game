@@ -60,10 +60,17 @@ pub fn uniform_children(child: Child) -> Children {
 pub struct Node {
     pub children: Children,
     pub ref_count: u32,
-    /// The most common block type among all children (recursive).
-    /// Used by the renderer when it can't descend further (LOD/zoom).
-    /// 255 = no dominant block (all empty).
-    pub dominant_block: u8,
+    /// Presence-preserving representative block type for this subtree.
+    /// The most common NON-EMPTY block type among all terminals in the
+    /// subtree. Used by the renderer at LOD cutoff — when a cell is too
+    /// small to descend into, it renders as this color.
+    /// 255 = all empty (no solid content in this subtree).
+    ///
+    /// Presence-preserving means: if ANY child is non-empty, the
+    /// representative is non-empty. A tree trunk (1 voxel of wood in
+    /// 26 air voxels) gets representative = Wood, not Air. Thin
+    /// features survive cascaded LOD across arbitrary depth.
+    pub representative_block: u8,
     /// If the entire subtree is one type: 0-253 = that BlockType,
     /// 254 = all empty, 255 = mixed (not uniform).
     /// Uniform nodes can be flattened to a single Block during GPU packing.
@@ -130,24 +137,26 @@ impl NodeLibrary {
                 _ => None,
             })
             .collect();
-        // Compute dominant block: most common BlockType among children.
-        // For Block children, count directly. For Node children, inherit
-        // their dominant_block (recursive aggregation).
+        // Compute representative block (presence-preserving):
+        // Most common NON-EMPTY block type among children. Empty children
+        // are ignored so that thin features (a single wood voxel in air)
+        // survive cascaded LOD. For Node children, inherit their
+        // representative_block recursively.
         let mut counts = [0u32; 256];
         for c in &children {
             match c {
                 Child::Block(bt) => counts[*bt as usize] += 1,
                 Child::Node(nid) => {
                     if let Some(child_node) = self.nodes.get(nid) {
-                        if child_node.dominant_block < 255 {
-                            counts[child_node.dominant_block as usize] += 1;
+                        if child_node.representative_block < 255 {
+                            counts[child_node.representative_block as usize] += 1;
                         }
                     }
                 }
                 Child::Empty => {}
             }
         }
-        let dominant_block = counts
+        let representative_block = counts
             .iter()
             .enumerate()
             .max_by_key(|&(_, count)| *count)
@@ -175,7 +184,7 @@ impl NodeLibrary {
             }
             if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
         };
-        self.nodes.insert(id, Node { children, ref_count: 0, dominant_block, uniform_type });
+        self.nodes.insert(id, Node { children, ref_count: 0, representative_block, uniform_type });
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
             self.ref_inc(nid);

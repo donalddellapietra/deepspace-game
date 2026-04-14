@@ -83,17 +83,18 @@ fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: v
 
 // -------------- Stack-based iterative ray march --------------
 
-// Maximum tree depth we'll traverse.
-const MAX_STACK_DEPTH: u32 = 8u;
+// Maximum tree depth we'll traverse. 16 supports trees up to ~14 levels
+// deep with room for DDA stepping across siblings at ancestor levels.
+const MAX_STACK_DEPTH: u32 = 16u;
 
 // Stack frame: tracks where we are in the DDA at each tree level.
 // WGSL has no structs-in-arrays of variable size, so we use
 // parallel arrays for each field.
 struct MarchState {
     // Per-level DDA state (fixed-size arrays)
-    node_idx: array<u32, 8>,
-    cell: array<vec3<i32>, 8>,
-    side_dist: array<vec3<f32>, 8>,
+    node_idx: array<u32, 16>,
+    cell: array<vec3<i32>, 16>,
+    side_dist: array<vec3<f32>, 16>,
     // Shared across all levels
     origin: vec3<f32>,       // original ray origin (world space)
     inv_dir: vec3<f32>,
@@ -129,13 +130,13 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     let delta_dist = abs(inv_dir);
 
     // State arrays for each depth level.
-    var s_node_idx: array<u32, 8>;
-    var s_cell: array<vec3<i32>, 8>;
-    var s_side_dist: array<vec3<f32>, 8>;
+    var s_node_idx: array<u32, 16>;
+    var s_cell: array<vec3<i32>, 16>;
+    var s_side_dist: array<vec3<f32>, 16>;
     // The world-space origin of the node at each level (its min corner).
-    var s_node_origin: array<vec3<f32>, 8>;
+    var s_node_origin: array<vec3<f32>, 16>;
     // The scale of one cell at each level.
-    var s_cell_size: array<f32, 8>;
+    var s_cell_size: array<f32, 16>;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
@@ -268,16 +269,35 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             let at_lod = lod_pixels < 1.0;
 
             if at_max || at_lod {
-                // Treat as solid using the node's dominant color.
-                let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-                let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
-                let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
-                result.hit = true;
-                result.t = max(cell_box_l.t_enter, 0.0);
+                // LOD cutoff: use the per-child representative block type.
+                // bt=255 means all-empty subtree — treat as air, advance DDA.
                 let bt = child_block_type(packed);
-                result.color = palette.colors[bt].rgb;
-                result.normal = normal;
-                return result;
+                if bt == 255u {
+                    // All-empty subtree — skip like Empty.
+                    if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                        s_cell[depth].x += step.x;
+                        s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                        normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                    } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                        s_cell[depth].y += step.y;
+                        s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                        normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                    } else {
+                        s_cell[depth].z += step.z;
+                        s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                        normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                    }
+                } else {
+                    // Solid representative — render as block.
+                    let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
+                    let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
+                    let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
+                    result.hit = true;
+                    result.t = max(cell_box_l.t_enter, 0.0);
+                    result.color = palette.colors[bt].rgb;
+                    result.normal = normal;
+                    return result;
+                }
             }
 
             let child_idx = child_node_index(s_node_idx[depth], slot);

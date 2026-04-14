@@ -176,7 +176,10 @@ impl App {
         };
 
         // Swept-AABB collision against the tree.
-        let edit_depth = self.edit_depth();
+        // Collision probes 3 layers deeper than the edit layer so we
+        // see actual ground/air inside coarse nodes, but don't waste
+        // time descending to the finest leaf level.
+        let collision_depth = (self.edit_depth() + 3).min(self.tree_depth);
         let root = self.world.root;
         collision::move_and_collide(
             &mut self.camera.pos,
@@ -186,7 +189,7 @@ impl App {
             cell_size,
             &self.world.library,
             root,
-            edit_depth,
+            collision_depth,
         );
 
         // Camera is at eye height above feet.
@@ -210,7 +213,7 @@ impl App {
 
     /// GPU visual depth: edit_depth + 3 (see 27×27×27 detail).
     fn visual_depth(&self) -> u32 {
-        (self.edit_depth() + 3).min(8)
+        (self.edit_depth() + 3).min(16)
     }
 
     /// Clamp zoom and sync GPU depth.

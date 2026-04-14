@@ -104,14 +104,14 @@ pub fn pack_tree(
                     node_index: 0,
                 },
                 Child::Node(child_id) => {
-                    // Store the child node's dominant block type so the
-                    // shader can use a meaningful color at LOD cutoff.
-                    let dominant = library.get(*child_id)
-                        .map(|n| n.dominant_block)
+                    // Store the child node's representative block type so
+                    // the shader can use a meaningful color at LOD cutoff.
+                    let repr = library.get(*child_id)
+                        .map(|n| n.representative_block)
                         .unwrap_or(0);
                     GpuChild {
                         tag: 2,
-                        block_type: dominant,
+                        block_type: repr,
                         _pad: 0,
                         node_index: *visited.get(child_id).expect("child must be visited"),
                     }
@@ -126,12 +126,14 @@ pub fn pack_tree(
 
 /// LOD-aware tree packing: only uploads nodes large enough to see.
 ///
-/// - **Uniform flattening (B):** Nodes where the entire subtree is one
+/// - **Uniform flattening:** Nodes where the entire subtree is one
 ///   block type (or all empty) are packed as Block/Empty — the shader
 ///   never descends into solid mountains or air volumes.
-/// - **Distance culling (C):** Nodes whose screen-space size is below
-///   a threshold are packed as Block(dominant_color). Nearby terrain
+/// - **Distance culling:** Nodes whose screen-space size is below a
+///   threshold are packed as Block(representative_block). Nearby terrain
 ///   gets full depth, distant terrain gets 1-2 levels.
+/// - **Presence-preserving:** Nodes with representative_block=255 (all
+///   empty subtree) are flattened to Empty, not solid grey.
 pub fn pack_tree_lod(
     library: &NodeLibrary,
     root: NodeId,
@@ -211,9 +213,12 @@ pub fn pack_tree_lod(
                 let screen_pixels = cell_size / dist * half_fov_recip;
 
                 if screen_pixels < LOD_THRESHOLD {
-                    // Too small to see detail — flatten to dominant color.
-                    let gpu = if child_node.dominant_block < 255 {
-                        GpuChild { tag: 1, block_type: child_node.dominant_block, _pad: 0, node_index: 0 }
+                    // Too small to see detail — flatten to representative color.
+                    // Presence-preserving: if representative_block is 255
+                    // (all-empty subtree), flatten to Empty so the ray
+                    // passes through instead of hitting a grey wall.
+                    let gpu = if child_node.representative_block < 255 {
+                        GpuChild { tag: 1, block_type: child_node.representative_block, _pad: 0, node_index: 0 }
                     } else {
                         GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
                     };
@@ -254,9 +259,9 @@ pub fn pack_tree_lod(
                     Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
                     Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
                     Child::Node(child_id) => {
-                        let dominant = library.get(*child_id).map(|n| n.dominant_block).unwrap_or(0);
+                        let repr = library.get(*child_id).map(|n| n.representative_block).unwrap_or(0);
                         let idx = visited.get(child_id).copied().unwrap_or(0);
-                        GpuChild { tag: 2, block_type: dominant, _pad: 0, node_index: idx }
+                        GpuChild { tag: 2, block_type: repr, _pad: 0, node_index: idx }
                     },
                 });
             }
