@@ -200,6 +200,23 @@ impl NodeLibrary {
         self.nodes.len()
     }
 
+    /// Build a uniform subtree of `depth` levels filled with `block_type`.
+    /// depth=0 returns `Child::Block(block_type)`.
+    /// depth=1 returns a node whose 27 children are all `Block(block_type)`.
+    /// depth=N returns a node of uniform nodes, N levels deep.
+    /// Content-addressed dedup means this creates at most N unique nodes.
+    pub fn build_uniform_subtree(&mut self, block_type: u8, depth: u32) -> Child {
+        if depth == 0 {
+            return Child::Block(block_type);
+        }
+        let mut child = Child::Block(block_type);
+        for _ in 0..depth {
+            let id = self.insert(uniform_children(child));
+            child = Child::Node(id);
+        }
+        child
+    }
+
     pub fn ref_inc(&mut self, id: NodeId) {
         if id == EMPTY_NODE { return; }
         if let Some(node) = self.nodes.get_mut(&id) {

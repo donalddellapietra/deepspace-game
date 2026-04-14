@@ -264,9 +264,44 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
     place_child_at_point(world, target, hit.path.len(), new_child)
 }
 
-/// Convenience wrapper: place a single block adjacent to hit face.
+/// Place a block adjacent to the hit face. Builds a uniform subtree
+/// that matches the depth of siblings at the placement site, so the
+/// placed block has full recursive structure like the terrain around it.
 pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
-    place_child(world, hit, Child::Block(block_type))
+    // Figure out how deep siblings are at the placement site.
+    // The hit path has `path.len()` levels from root. The sibling
+    // nodes at that depth have some subtree depth. We match it.
+    let sibling_depth = if let Some(&(parent_id, _)) = hit.path.last() {
+        if let Some(parent) = world.library.get(parent_id) {
+            // Find the max depth among non-empty siblings.
+            let mut max_d = 0u32;
+            for child in &parent.children {
+                if let Child::Node(nid) = child {
+                    let d = depth_of_node(&world.library, *nid);
+                    if d > max_d { max_d = d; }
+                }
+            }
+            max_d
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let child = world.library.build_uniform_subtree(block_type, sibling_depth);
+    place_child(world, hit, child)
+}
+
+/// Compute depth of a single node (non-memoized, but uniform nodes are O(1)).
+fn depth_of_node(library: &super::tree::NodeLibrary, id: super::tree::NodeId) -> u32 {
+    let Some(node) = library.get(id) else { return 0 };
+    // For uniform nodes (all children identical), just check one child.
+    let first_child = node.children[0];
+    match first_child {
+        Child::Node(child_id) => 1 + depth_of_node(library, child_id),
+        _ => 1,
+    }
 }
 
 /// Place a block at the given world-space point, descending `depth`
