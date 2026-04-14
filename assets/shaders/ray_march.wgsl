@@ -328,7 +328,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let ndc = vec2<f32>(
         (in.uv.x - 0.5) * 2.0 * aspect * half_fov_tan,
-        (in.uv.y - 0.5) * 2.0 * half_fov_tan,
+        (0.5 - in.uv.y) * 2.0 * half_fov_tan,
     );
 
     let ray_dir = normalize(

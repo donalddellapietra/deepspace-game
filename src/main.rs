@@ -244,8 +244,7 @@ impl ApplicationHandler for App {
                 // Mouse right (positive delta.0) → yaw decreases → look right.
                 self.camera.yaw -= (delta.0 * SENS) as f32;
                 // Mouse up (negative delta.1) → pitch increases → look up.
-                // macOS: delta.1 positive = mouse moves up physically.
-                self.camera.pitch = (self.camera.pitch + (delta.1 * SENS) as f32)
+                self.camera.pitch = (self.camera.pitch - (delta.1 * SENS) as f32)
                     .clamp(-1.5, 1.5);
             }
         }
