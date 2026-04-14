@@ -230,22 +230,30 @@ pub struct SphericalPlanet {
     /// cells above, solid cells below.
     pub inner_r: f32,
     pub outer_r: f32,
-    /// One subtree root per cube face. Indexed by `Face as usize`.
-    /// Subtrees live in the shared `NodeLibrary` alongside the
-    /// Cartesian space tree — dedup is natural because they use the
-    /// same `Child`/`Node` representation.
-    pub face_roots: [NodeId; 6],
     /// Levels of recursion under each face root. Zoom-in reveals up
     /// to `depth` cascades of 27 sub-cells before bottoming out.
     pub depth: u32,
-    /// `NodeKind::CubedSphereBody` node containing the 6 face roots
-    /// at face-center slots. This is the canonical in-tree identity
-    /// of the planet. The fields above are eager caches of the
-    /// body's world-space footprint (computable at any time via
-    /// [`resolve_body_from_anchor`]); they live on the struct so the
-    /// hot-path CPU raycast and editing don't have to walk the tree
-    /// on every call.
+    /// `NodeKind::CubedSphereBody` node whose 27 children include
+    /// the 6 face subtrees at face-center slots. This is the one
+    /// place the engine stores the planet's identity — face roots
+    /// are read from its children via [`face_root_of`], and the
+    /// shell radii come from its `NodeKind` payload.
     pub body_node: NodeId,
+}
+
+/// Return the face subtree root for `face` under `body_node` —
+/// `body_node`'s child at the face-center slot for that face.
+/// Panics if `body_node` is missing or its face-center slot isn't a
+/// `Child::Node`; both are invariants of a correctly built body.
+pub fn face_root_of(lib: &NodeLibrary, body_node: NodeId, face: Face) -> NodeId {
+    let node = lib.get(body_node).expect("body node must exist");
+    match node.children[body_face_center_slot(face)] {
+        Child::Node(id) => id,
+        other => panic!(
+            "body_node {} face-center slot for {:?} must be Child::Node, got {:?}",
+            body_node, face, other
+        ),
+    }
 }
 
 /// Max levels the SDF recursion is allowed to descend into a face
@@ -386,7 +394,8 @@ pub fn generate_spherical_planet(
     );
     lib.ref_inc(body_node);
 
-    SphericalPlanet { center, inner_r, outer_r, face_roots, depth, body_node }
+    let _ = face_roots; // face_roots are now reachable via `body_node.children`.
+    SphericalPlanet { center, inner_r, outer_r, depth, body_node }
 }
 
 /// Slot index in a `CubedSphereBody` node's 3×3×3 children that holds
@@ -604,7 +613,7 @@ impl SphericalPlanet {
         r_n: f32,
         max_depth: u32,
     ) -> (u8, u32) {
-        let mut node_id = self.face_roots[face as usize];
+        let mut node_id = face_root_of(lib, self.body_node, face);
         let mut un = u_n.clamp(0.0, 0.9999999);
         let mut vn = v_n.clamp(0.0, 0.9999999);
         let mut rn = r_n.clamp(0.0, 0.9999999);
@@ -647,7 +656,8 @@ impl SphericalPlanet {
     /// changed.
     pub fn set_cell_at_depth(
         &mut self,
-        lib: &mut NodeLibrary,
+        world: &mut super::state::WorldState,
+        body_anchor: &super::coords::Path,
         face: Face,
         iu: u32, iv: u32, ir: u32,
         depth: u32,
@@ -657,7 +667,7 @@ impl SphericalPlanet {
         let cells = 3u32.pow(d);
         if iu >= cells || iv >= cells || ir >= cells { return false; }
 
-        // Per-level slot indices from root toward the target.
+        // Per-level slot indices from face root toward the target.
         // Sized for `MAX_DEPTH` from `tree.rs` (63) with headroom;
         // depth=20 planets were hitting a 16-slot cap here.
         let mut slots: [usize; 64] = [0; 64];
@@ -671,13 +681,53 @@ impl SphericalPlanet {
             slots[level] = slot_index(us, vs, rs);
         }
 
-        let root = self.face_roots[face as usize];
-        let new_root = rebuild_with_edit(lib, root, &slots[..levels], 0, new_child);
-        if new_root == root { return false; }
-        lib.ref_inc(new_root);
-        let old = root;
-        self.face_roots[face as usize] = new_root;
-        lib.ref_dec(old);
+        let face_slot = body_face_center_slot(face);
+        let root = face_root_of(&world.library, self.body_node, face);
+        let new_face_root =
+            rebuild_with_edit(&mut world.library, root, &slots[..levels], 0, new_child);
+        if new_face_root == root { return false; }
+
+        // Compose the chain of slot rewrites from face root up through
+        // the body to the world root, then swap in the new root.
+        // Rust's `insert_with_kind` dedups along the way — identical
+        // post-edit states collapse to existing nodes.
+        let body_kind = world.library.get(self.body_node)
+            .map(|b| b.kind)
+            .expect("body node must exist");
+        let mut body_children = world.library.get(self.body_node)
+            .expect("body node must exist")
+            .children;
+        body_children[face_slot] = Child::Node(new_face_root);
+        let new_body = world.library.insert_with_kind(body_children, body_kind);
+
+        // Walk back up from the body's parent to the world root,
+        // rebuilding each Cartesian ancestor with the new child.
+        let mut current_new = new_body;
+        let mut current_anchor_level = body_anchor.depth() as usize;
+        while current_anchor_level > 0 {
+            let anchor_slot = body_anchor.slots()[current_anchor_level - 1] as usize;
+            // Resolve the parent's NodeId by walking from the world
+            // root down the path.
+            let mut parent_id = world.root;
+            for i in 0..(current_anchor_level - 1) {
+                let slot = body_anchor.slots()[i] as usize;
+                match world.library.get(parent_id).unwrap().children[slot] {
+                    Child::Node(child) => parent_id = child,
+                    _ => return false,
+                }
+            }
+            let parent = world.library.get(parent_id).expect("parent must exist");
+            let mut new_children = parent.children;
+            new_children[anchor_slot] = Child::Node(current_new);
+            current_new = world.library.insert_with_kind(new_children, parent.kind);
+            current_anchor_level -= 1;
+        }
+
+        // Swap in the new world root; old subtrees drop via ref counting.
+        if current_new != world.root {
+            world.swap_root(current_new);
+            self.body_node = new_body;
+        }
         true
     }
 
@@ -963,6 +1013,21 @@ mod tests {
         }
     }
 
+    /// Wrap a freshly generated planet in a minimal `WorldState` whose
+    /// root IS the body node. With `body_anchor = Path::root()`,
+    /// `set_cell_at_depth`'s ancestor walk is a no-op and the test
+    /// exercises the face-root + body-node rebuild path cleanly.
+    fn world_with_body_as_root(
+        mut lib: NodeLibrary,
+        body_node: NodeId,
+    ) -> (super::super::state::WorldState, super::super::coords::Path) {
+        lib.ref_inc(body_node);
+        (
+            super::super::state::WorldState { root: body_node, library: lib },
+            super::super::coords::Path::root(),
+        )
+    }
+
     /// Walk into a face's subtree at the given slot path and return
     /// the resolved child (Empty / Block / Node).
     fn walk_subtree(
@@ -1010,16 +1075,18 @@ mod tests {
             }
             _ => panic!("body node must have CubedSphereBody kind, got {:?}", body.kind),
         }
-        // Face-center slots must reference the face roots.
+        // Face-center slots must each resolve to a Node in the library.
         for &face in &Face::ALL {
             let slot = body_face_center_slot(face);
             match body.children[slot] {
-                Child::Node(id) => assert_eq!(
-                    id, planet.face_roots[face as usize],
-                    "body face-center slot for {:?} must point at face root", face
-                ),
+                Child::Node(id) => assert!(lib.get(id).is_some()),
                 other => panic!("expected Node at face-center slot, got {:?}", other),
             }
+        }
+        // `face_root_of` agrees with the raw slot lookup.
+        for &face in &Face::ALL {
+            let id = face_root_of(&lib, planet.body_node, face);
+            assert!(lib.get(id).is_some());
         }
     }
 
@@ -1028,7 +1095,8 @@ mod tests {
         let mut lib = NodeLibrary::default();
         let sdf = test_sdf(1.0, 0.05);
         let planet = generate_spherical_planet(&mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf);
-        for id in planet.face_roots {
+        for &face in &Face::ALL {
+            let id = face_root_of(&lib, planet.body_node, face);
             assert!(lib.get(id).is_some(), "every face root must exist in library");
         }
     }
@@ -1041,7 +1109,7 @@ mod tests {
         // Bottom (rs=0) layer is deep inside solid; top (rs=2) is deep air.
         let planet = generate_spherical_planet(&mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 2, &sdf);
         // Walk one level into the +X face, middle u/v, bottom rs: solid.
-        let inner = walk_subtree(&lib, planet.face_roots[Face::PosX as usize], &[(1, 1, 0)]);
+        let inner = walk_subtree(&lib, face_root_of(&lib, planet.body_node, Face::PosX), &[(1, 1, 0)]);
         match inner {
             Child::Block(_) => {}
             Child::Node(id) => {
@@ -1053,7 +1121,7 @@ mod tests {
             Child::Empty => panic!("inner slot at r_lo should be solid"),
         }
         // Top slot: empty.
-        let outer = walk_subtree(&lib, planet.face_roots[Face::PosX as usize], &[(1, 1, 2)]);
+        let outer = walk_subtree(&lib, face_root_of(&lib, planet.body_node, Face::PosX), &[(1, 1, 2)]);
         assert!(matches!(outer, Child::Empty | Child::Node(_)),
             "outer slot should resolve to empty or an empty subtree");
     }
@@ -1065,17 +1133,14 @@ mod tests {
         let mut planet = generate_spherical_planet(
             &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf,
         );
-        // At depth 1 pick the middle cell of +X face. Sample it
-        // before — expect at least some solid content (the SDF
-        // surface sits right in the middle of the shell).
-        let (before, _) = planet.sample_subtree(&lib, Face::PosX, 0.5, 0.5, 0.5, 1);
+        let (mut world, body_anchor) = world_with_body_as_root(lib, planet.body_node);
+        let (before, _) = planet.sample_subtree(&world.library, Face::PosX, 0.5, 0.5, 0.5, 1);
         assert!(before != 0, "middle chunk should be solid before break");
-        // Break at depth 1 (one of 27 coarse chunks of +X).
         let changed = planet.set_cell_at_depth(
-            &mut lib, Face::PosX, 1, 1, 1, 1, Child::Empty,
+            &mut world, &body_anchor, Face::PosX, 1, 1, 1, 1, Child::Empty,
         );
         assert!(changed, "edit should change the face root");
-        let (after, _) = planet.sample_subtree(&lib, Face::PosX, 0.5, 0.5, 0.5, 1);
+        let (after, _) = planet.sample_subtree(&world.library, Face::PosX, 0.5, 0.5, 0.5, 1);
         assert_eq!(after, 0, "broken chunk must read as empty");
     }
 
@@ -1110,8 +1175,9 @@ mod tests {
         );
         let hit = planet.raycast(&lib, [2.0, 0.0, 0.0], [-1.0, 0.0, 0.0], 2).unwrap();
         let (face, iu, iv, ir) = hit.prev.unwrap();
+        let (mut world, body_anchor) = world_with_body_as_root(lib, planet.body_node);
         let changed = planet.set_cell_at_depth(
-            &mut lib, face, iu, iv, ir, hit.depth,
+            &mut world, &body_anchor, face, iu, iv, ir, hit.depth,
             Child::Block(block::BRICK),
         );
         assert!(changed);
@@ -1120,7 +1186,7 @@ mod tests {
         let un = (iu as f32 + 0.5) / cells;
         let vn = (iv as f32 + 0.5) / cells;
         let rn = (ir as f32 + 0.5) / cells;
-        let (b, _) = planet.sample_subtree(&lib, face, un, vn, rn, hit.depth);
+        let (b, _) = planet.sample_subtree(&world.library, face, un, vn, rn, hit.depth);
         assert_eq!(b, block::BRICK);
     }
 
@@ -1134,12 +1200,10 @@ mod tests {
         let mut planet = generate_spherical_planet(
             &mut lib, [0.0, 0.0, 0.0], 0.12, 0.52, 20, &sdf,
         );
-        // Break the innermost finest cell on +X. This exercises the
-        // full 20-level path without relying on coordinates being
-        // solid — even a no-op runs the full path walk.
+        let (mut world, body_anchor) = world_with_body_as_root(lib, planet.body_node);
         let iu_last = 3u32.pow(20) - 1;
         planet.set_cell_at_depth(
-            &mut lib, Face::PosX, iu_last, iu_last, iu_last, 20,
+            &mut world, &body_anchor, Face::PosX, iu_last, iu_last, iu_last, 20,
             Child::Empty,
         );
     }
@@ -1151,9 +1215,9 @@ mod tests {
         let mut planet = generate_spherical_planet(
             &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf,
         );
-        // Above the SDF surface at r close to outer_r: empty.
+        let (mut world, body_anchor) = world_with_body_as_root(lib, planet.body_node);
         let changed = planet.set_cell_at_depth(
-            &mut lib, Face::PosX, 1, 1, 2, 1, Child::Empty,
+            &mut world, &body_anchor, Face::PosX, 1, 1, 2, 1, Child::Empty,
         );
         assert!(!changed, "breaking an already-empty cell should no-op");
     }

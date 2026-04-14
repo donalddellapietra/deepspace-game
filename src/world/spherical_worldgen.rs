@@ -182,7 +182,10 @@ mod tests {
             other => panic!("expected body at anchor, got {:?}", other),
         }
         // Face roots are still reachable.
-        for &id in &scene.planet.face_roots {
+        // Face roots are reachable through the body node's children.
+        use super::super::cubesphere::{face_root_of, Face};
+        for &face in &Face::ALL {
+            let id = face_root_of(&scene.world.library, scene.planet.body_node, face);
             assert!(scene.world.library.get(id).is_some());
         }
     }

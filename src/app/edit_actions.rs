@@ -82,6 +82,7 @@ impl App {
         if editing::try_cs_break(
             &mut self.world,
             self.cs_planet.as_mut(),
+            &self.body_anchor,
             camera_pos,
             ray_dir,
             edit_depth,
@@ -147,6 +148,7 @@ impl App {
             if editing::try_cs_place(
                 &mut self.world,
                 self.cs_planet.as_mut(),
+                &self.body_anchor,
                 camera_pos,
                 ray_dir,
                 edit_depth,
@@ -248,10 +250,10 @@ impl App {
         // buffer in a single pass.
         let (rf_origin, rf_cell, rf_node) = self.render_frame();
 
-        let mut roots: Vec<u64> = vec![rf_node];
-        if let Some(p) = self.cs_planet.as_ref() {
-            roots.extend_from_slice(&p.face_roots);
-        }
+        // The shader walks from `rf_node` and handles body/face
+        // dispatch via the per-node kind buffer — face subtrees are
+        // reached automatically through the body node's children.
+        let roots: Vec<u64> = vec![rf_node];
         let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
             &roots,

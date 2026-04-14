@@ -50,6 +50,7 @@ pub fn cs_cursor_hit(
 pub fn try_cs_break(
     world: &mut WorldState,
     cs_planet: Option<&mut SphericalPlanet>,
+    body_anchor: &crate::world::coords::Path,
     camera_pos: [f32; 3],
     ray_dir: [f32; 3],
     edit_depth: u32,
@@ -63,7 +64,7 @@ pub fn try_cs_break(
     };
     let Some(planet) = cs_planet else { return false; };
     planet.set_cell_at_depth(
-        &mut world.library,
+        world, body_anchor,
         hit.face, hit.iu, hit.iv, hit.ir, hit.depth,
         Child::Empty,
     )
@@ -76,6 +77,7 @@ pub fn try_cs_break(
 pub fn try_cs_place(
     world: &mut WorldState,
     cs_planet: Option<&mut SphericalPlanet>,
+    body_anchor: &crate::world::coords::Path,
     camera_pos: [f32; 3],
     ray_dir: [f32; 3],
     edit_depth: u32,
@@ -91,7 +93,7 @@ pub fn try_cs_place(
     let Some((face, iu, iv, ir)) = hit.prev else { return false; };
     let Some(planet) = cs_planet else { return false; };
     planet.set_cell_at_depth(
-        &mut world.library,
+        world, body_anchor,
         face, iu, iv, ir, hit.depth,
         Child::Block(new_block),
     )
