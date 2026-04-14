@@ -380,12 +380,42 @@ impl App {
             &self.world.library, self.world.root,
             self.camera.pos, ray_dir, self.edit_depth(),
         );
-        // Phase A: the spherical planet's cells live in a subtree we
-        // haven't wired to CPU-raycast yet. Highlight the Cartesian
-        // tree hit only — cs highlighting returns in Phase C.
+        let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
+
+        // Cubed-sphere cursor. Highlight depth scales with zoom:
+        // at the finest playable zoom we highlight individual
+        // finest-level voxels; as the player zooms out we highlight
+        // progressively larger 3^n chunks, matching the engine's
+        // "same UX at every layer" principle — the same selection
+        // that previously worked on the hollow-sphere prototype at
+        // its coarser cell scale.
+        let cs_depth = {
+            let planet_depth = self.cs_planet.as_ref().map(|p| p.depth).unwrap_or(0);
+            // `zoom_level = 15` is the default. Each level zoomed out
+            // drops one subdivision on the planet (to a floor of 1).
+            const BASELINE: i32 = 15;
+            let dz = (self.zoom_level - BASELINE).max(0) as u32;
+            planet_depth.saturating_sub(dz).max(1).min(planet_depth)
+        };
+        let cs_hit = self.cs_planet.as_ref().and_then(|p| {
+            p.raycast_highlight(
+                &self.world.library, self.camera.pos, ray_dir, cs_depth,
+            )
+        });
+        let cs_t = cs_hit.map(|(t, ..)| t).unwrap_or(f32::INFINITY);
+
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
-            renderer.set_cubed_sphere_highlight(None);
+            if cs_t < tree_t {
+                renderer.set_highlight(None);
+                if let Some((_, face, iu, iv, ir, depth)) = cs_hit {
+                    renderer.set_cubed_sphere_highlight(Some((
+                        face as u32, iu, iv, ir, depth,
+                    )));
+                }
+            } else {
+                renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
+                renderer.set_cubed_sphere_highlight(None);
+            }
         }
     }
 

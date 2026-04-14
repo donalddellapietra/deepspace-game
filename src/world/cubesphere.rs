@@ -362,6 +362,126 @@ fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
     id
 }
 
+impl SphericalPlanet {
+    /// Project `world` into the planet's (face, u_n, v_n, r_n)
+    /// normalized cubed-sphere frame. `u_n` / `v_n` / `r_n` all live
+    /// in `[0, 1)` — same coordinates the shader uses to descend a
+    /// face subtree. Returns `None` if `world` is outside the shell
+    /// or degenerate at the center.
+    pub fn world_to_normalized(
+        &self,
+        world: Vec3,
+    ) -> Option<(Face, f32, f32, f32)> {
+        let local = sdf::sub(world, self.center);
+        let r = sdf::length(local);
+        if r < self.inner_r || r >= self.outer_r { return None; }
+        let coord = world_to_coord(self.center, world)?;
+        let u_n = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
+        let v_n = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
+        let r_n = ((r - self.inner_r) / (self.outer_r - self.inner_r))
+            .clamp(0.0, 0.9999999);
+        Some((coord.face, u_n, v_n, r_n))
+    }
+
+    /// Walk the face subtree for `(face, u_n, v_n, r_n)` down to
+    /// `max_depth` levels, stopping early at the first non-Node
+    /// terminal. Returns the palette index (0 = empty) and the
+    /// depth at which the walk stopped. Useful for collision /
+    /// highlight queries that want to limit resolution.
+    pub fn sample_subtree(
+        &self,
+        lib: &NodeLibrary,
+        face: Face,
+        u_n: f32,
+        v_n: f32,
+        r_n: f32,
+        max_depth: u32,
+    ) -> (u8, u32) {
+        let mut node_id = self.face_roots[face as usize];
+        let mut un = u_n.clamp(0.0, 0.9999999);
+        let mut vn = v_n.clamp(0.0, 0.9999999);
+        let mut rn = r_n.clamp(0.0, 0.9999999);
+        let limit = max_depth.min(self.depth);
+        for d in 0..limit {
+            let Some(node) = lib.get(node_id) else { return (0, d); };
+            let us = ((un * 3.0) as usize).min(2);
+            let vs = ((vn * 3.0) as usize).min(2);
+            let rs = ((rn * 3.0) as usize).min(2);
+            let slot = slot_index(us, vs, rs);
+            match node.children[slot] {
+                Child::Empty => return (0, d + 1),
+                Child::Block(b) => return (b, d + 1),
+                Child::Node(nid) => {
+                    node_id = nid;
+                    un = un * 3.0 - us as f32;
+                    vn = vn * 3.0 - vs as f32;
+                    rn = rn * 3.0 - rs as f32;
+                }
+            }
+        }
+        // Bottomed out at limit without a terminal. Use the subtree's
+        // representative block so "any solid content inside this
+        // chunk" counts as a hit at the requested depth.
+        let repr = lib.get(node_id).map(|n| n.representative_block).unwrap_or(255);
+        if repr < 255 { (repr, limit) } else { (0, limit) }
+    }
+
+    /// Cursor raycast. Walks the ray through the shell, sampling the
+    /// subtree at every step, and returns the first position whose
+    /// `(face, u_n, v_n, r_n)` cell contains solid content at
+    /// `highlight_depth`. Integer cell indices are floor'd into
+    /// `3^highlight_depth` per axis — so `highlight_depth = 1` gives
+    /// a 3×3×3 grid per face (one of 54 global "chunks" per planet),
+    /// and `highlight_depth = subtree.depth` gives the finest cell.
+    pub fn raycast_highlight(
+        &self,
+        lib: &NodeLibrary,
+        origin: Vec3,
+        dir: Vec3,
+        highlight_depth: u32,
+    ) -> Option<(f32, Face, u32, u32, u32, u32)> {
+        let oc = sdf::sub(origin, self.center);
+        let b = sdf::dot(oc, dir);
+        let c = sdf::dot(oc, oc) - self.outer_r * self.outer_r;
+        let disc = b * b - c;
+        if disc <= 0.0 { return None; }
+        let sq = disc.sqrt();
+        let t_enter = (-b - sq).max(0.0);
+        let t_exit = -b + sq;
+        if t_exit <= 0.0 { return None; }
+
+        // Brute-step march at CPU (one ray per frame — cheap). Step
+        // is a fraction of the finest-cell radial size so we don't
+        // skip leaf cells.
+        let shell = self.outer_r - self.inner_r;
+        let finest_cells = 3u32.pow(self.depth) as f32;
+        let step = (shell / finest_cells) * 0.5;
+        if step <= 0.0 { return None; }
+        let d_eff = highlight_depth.clamp(1, self.depth);
+        let cells_at_depth = 3u32.pow(d_eff) as f32;
+        let mut t = t_enter + step * 0.25;
+        let max_steps = 4000usize;
+        for _ in 0..max_steps {
+            if t >= t_exit { break; }
+            let p = sdf::add(origin, sdf::scale(dir, t));
+            if let Some((face, un, vn, rn)) = self.world_to_normalized(p) {
+                let (block, _) = self.sample_subtree(lib, face, un, vn, rn, d_eff);
+                if block != 0 {
+                    let iu = ((un * cells_at_depth).floor() as u32)
+                        .min(cells_at_depth as u32 - 1);
+                    let iv = ((vn * cells_at_depth).floor() as u32)
+                        .min(cells_at_depth as u32 - 1);
+                    let ir = ((rn * cells_at_depth).floor() as u32)
+                        .min(cells_at_depth as u32 - 1);
+                    return Some((t, face, iu, iv, ir, d_eff));
+                }
+            }
+            t += step;
+        }
+        None
+    }
+}
+
 /// The twelve edges of a cubed-sphere block as pairs of corner
 /// indices into `block_corners`'s output. Useful for drawing the
 /// bulged wireframe outline that Minecraft's flat-cube outline

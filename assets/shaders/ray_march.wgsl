@@ -610,7 +610,44 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
                     let diffuse = max(dot(n, sun_dir), 0.0);
                     let ambient = 0.25;
-                    cs_color = cell_color * (ambient + diffuse * 0.75);
+                    var surface = cell_color * (ambient + diffuse * 0.75);
+
+                    // Cursor highlight: the selected cell can live at
+                    // any subtree depth, not just the finest. At
+                    // `highlight_depth = 1` the wireframe encloses a
+                    // 3³-cell chunk; at `highlight_depth = subtree_depth`
+                    // it encloses one finest cell.
+                    if uniforms.cs_params.w > 0.5 {
+                        let hl_depth = max(uniforms.cs_params.z, 1.0);
+                        let hl_cells = pow(3.0, hl_depth);
+                        let hl_face = u32(uniforms.cs_highlight.x);
+                        let iu_h = floor(un * hl_cells);
+                        let iv_h = floor(vn * hl_cells);
+                        let ir_h = floor(rn * hl_cells);
+                        if face == hl_face
+                            && iu_h == uniforms.cs_highlight.y
+                            && iv_h == uniforms.cs_highlight.z
+                            && ir_h == uniforms.cs_highlight.w
+                        {
+                            // Edge-distance in the highlight cell's
+                            // local (0,1) space. Lines near any of
+                            // the six bulged faces of the cell.
+                            let cell_u = un * hl_cells - iu_h;
+                            let cell_v = vn * hl_cells - iv_h;
+                            let cell_r = rn * hl_cells - ir_h;
+                            let edge = min(
+                                min(min(cell_u, 1.0 - cell_u),
+                                    min(cell_v, 1.0 - cell_v)),
+                                min(cell_r, 1.0 - cell_r));
+                            // Line width: ~3% of cell, roughly one
+                            // visible "rim" at any zoom.
+                            if edge < 0.05 {
+                                surface = vec3<f32>(1.0, 0.9, 0.2);
+                            }
+                        }
+                    }
+
+                    cs_color = surface;
                     break;
                 }
 

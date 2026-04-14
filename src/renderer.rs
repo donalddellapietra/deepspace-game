@@ -305,16 +305,25 @@ impl Renderer {
         self.write_uniforms();
     }
 
-    /// Set or clear the cubed-sphere cursor highlight. Cell is
-    /// `(face, i, j, k)`.
-    pub fn set_cubed_sphere_highlight(&mut self, cell: Option<(u32, u32, u32, u32)>) {
+    /// Set or clear the cubed-sphere cursor highlight.
+    /// `cell = (face, iu, iv, ir, depth)`. Indices live in the grid
+    /// `3^depth` per axis, so `depth = 1` highlights 1 of 27 coarse
+    /// "chunks" per face, and `depth = subtree_depth` highlights a
+    /// single finest cell. The shader compares cell indices at the
+    /// same depth so the wireframe shrinks/grows with depth.
+    pub fn set_cubed_sphere_highlight(
+        &mut self,
+        cell: Option<(u32, u32, u32, u32, u32)>,
+    ) {
         match cell {
-            Some((face, i, j, k)) => {
+            Some((face, i, j, k, depth)) => {
                 self.cs_highlight = [face as f32, i as f32, j as f32, k as f32];
+                self.cs_params[2] = depth as f32;
                 self.cs_params[3] = 1.0;
             }
             None => {
                 self.cs_highlight = [0.0; 4];
+                self.cs_params[2] = 0.0;
                 self.cs_params[3] = 0.0;
             }
         }
