@@ -135,7 +135,7 @@ impl App {
         let steps = self.zoom_level - old_zoom;
         if steps != 0 {
             let ray_dir = self.camera.forward();
-            let cam_pos = self.camera.world_pos();
+            let cam_pos = self.camera_pos_in_render_frame();
             let hit = edit::cpu_raycast(
                 &self.world.library,
                 self.world.root,
@@ -166,7 +166,12 @@ impl App {
                 anchor[1] + (cam_pos[1] - anchor[1]) * scale,
                 anchor[2] + (cam_pos[2] - anchor[2]) * scale,
             ];
-            self.camera.set_world_pos(new_pos);
+            // Reanchor the camera at the new XYZ in the render frame.
+            // Step 7 rewrites this whole anchor computation in path
+            // terms; step 6 keeps it XYZ-local to the render root.
+            let depth = self.camera.position.depth;
+            self.camera.position =
+                crate::world::position::Position::from_world_pos(new_pos, depth);
         }
     }
 
@@ -192,7 +197,7 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_pos: self.camera.world_pos(),
+                    camera_pos: self.camera.position.pos_in_ancestor_frame(0),
                     fov: 1.2,
                     node_count: self.world.library.len(),
                 },

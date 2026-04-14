@@ -1,10 +1,10 @@
 //! Yaw/pitch camera with locally-oriented frame.
 //!
-//! Step 3 of the path-based refactor: the camera's location is now a
-//! [`Position`] (path + sub-slot offset). [`Camera::world_pos`] and
-//! [`Camera::set_world_pos`] are **temporary shims** that let callers
-//! still expressed in absolute XYZ keep working. Steps 4–6 migrate
-//! those callers; step 6 deletes the shims.
+//! The camera's location is a [`Position`] (path + sub-slot offset).
+//! Call sites that want XYZ coordinates in a specific ancestor's
+//! frame go through
+//! [`Position::pos_in_ancestor_frame`]; the camera itself exposes no
+//! absolute-XYZ accessors — that's the whole point of the refactor.
 
 use crate::world::gpu::GpuCamera;
 use crate::world::position::Position;
@@ -25,36 +25,23 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// Construct at an absolute XYZ location, anchored at `depth` in
-    /// the tree. Temporary — step 4 callers build `Position` directly.
-    pub fn at_world_pos(
-        pos: [f32; 3],
+    /// Construct at an XYZ spawn point in the tree root's `[0, 3)³`
+    /// frame, anchored at `depth`. The spawn-point XYZ is a one-time
+    /// convenience for worldgen; after construction nothing reads
+    /// absolute coordinates from the camera.
+    pub fn at_spawn(
+        spawn_xyz: [f32; 3],
         depth: u8,
         smoothed_up: [f32; 3],
         yaw: f32,
         pitch: f32,
     ) -> Self {
         Self {
-            position: Position::from_world_pos(pos, depth),
+            position: Position::from_world_pos(spawn_xyz, depth),
             smoothed_up,
             yaw,
             pitch,
         }
-    }
-
-    /// Absolute XYZ coordinates in the root cell's `[0, 3)³` frame.
-    /// Shim for XYZ-only call sites; step 6 removes callers.
-    #[inline]
-    pub fn world_pos(&self) -> [f32; 3] {
-        self.position.world_pos()
-    }
-
-    /// Overwrite the camera's location from absolute XYZ, preserving
-    /// the current anchoring depth. Shim; step 4 replaces all call
-    /// sites with path-based updates.
-    pub fn set_world_pos(&mut self, pos: [f32; 3]) {
-        let depth = self.position.depth;
-        self.position = Position::from_world_pos(pos, depth);
     }
 
     /// Lerp `smoothed_up` toward `target_up` at rate `k` per dt.
@@ -96,10 +83,14 @@ impl Camera {
 
     pub fn forward(&self) -> [f32; 3] { self.basis().0 }
 
-    pub fn gpu_camera(&self, fov: f32) -> GpuCamera {
+    /// Build the GPU camera block. `frame_depth` names the ancestor
+    /// whose local `[0, 3)³` frame the shader will treat as world space
+    /// — normally the render root. Caller supplies it (the camera
+    /// doesn't know what the renderer's frame is).
+    pub fn gpu_camera(&self, fov: f32, frame_depth: u8) -> GpuCamera {
         let (fwd, r, up) = self.basis();
         GpuCamera {
-            pos: self.world_pos(),
+            pos: self.position.pos_in_ancestor_frame(frame_depth),
             _pad0: 0.0,
             forward: fwd,
             _pad1: 0.0,

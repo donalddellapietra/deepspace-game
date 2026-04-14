@@ -92,7 +92,7 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            camera: Camera::at_world_pos(
+            camera: Camera::at_spawn(
                 spawn_pos,
                 tree_depth as u8,
                 [0.0, 1.0, 0.0],
@@ -141,7 +141,7 @@ impl App {
         );
 
         if let Some(renderer) = &self.renderer {
-            renderer.update_camera(&self.camera.gpu_camera(1.2));
+            renderer.update_camera(&self.camera.gpu_camera(1.2, self.render_root_depth()));
         }
     }
 }
