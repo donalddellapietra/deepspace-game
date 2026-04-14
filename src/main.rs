@@ -250,12 +250,59 @@ impl App {
         );
     }
 
-    /// Break: clear the first solid cubed-sphere cell along the
+    /// Depth at which cubed-sphere edits and highlighting operate.
+    /// Scales with zoom: default zoom picks the finest subtree depth;
+    /// each scroll-out drops one level of subdivision. Matches the
+    /// formula in `update_highlight` so the cell you see as selected
+    /// is the cell you break.
+    fn cs_edit_depth(&self) -> u32 {
+        let planet_depth = self.cs_planet.as_ref().map(|p| p.depth).unwrap_or(0);
+        if planet_depth == 0 { return 0; }
+        const BASELINE: i32 = 15;
+        let dz = (self.zoom_level - BASELINE).max(0) as u32;
+        planet_depth.saturating_sub(dz).max(1).min(planet_depth)
+    }
+
+    /// Cubed-sphere break: raycast the planet at the current edit
+    /// depth; if it beats the Cartesian tree to a hit, clear that
+    /// subtree. Returns true on success so the caller can skip its
+    /// Cartesian fallback.
+    fn try_cs_break(&mut self, ray_dir: [f32; 3]) -> bool {
+        let depth = self.cs_edit_depth();
+        if depth == 0 { return false; }
+
+        // Raycast and check depth against the tree hit.
+        let (face, iu, iv, ir, d, cs_t) = {
+            let Some(planet) = self.cs_planet.as_ref() else { return false; };
+            let Some(hit) = planet.raycast_highlight(
+                &self.world.library, self.camera.pos, ray_dir, depth,
+            ) else { return false; };
+            let (t, face, iu, iv, ir, d) = hit;
+            (face, iu, iv, ir, d, t)
+        };
+        let tree_t = edit::cpu_raycast(
+            &self.world.library, self.world.root,
+            self.camera.pos, ray_dir, self.edit_depth(),
+        ).map(|h| h.t).unwrap_or(f32::INFINITY);
+        if cs_t >= tree_t { return false; }
+
+        let Some(planet) = self.cs_planet.as_mut() else { return false; };
+        planet.set_cell_at_depth(
+            &mut self.world.library,
+            face, iu, iv, ir, d,
+            deepspace_game::world::tree::Child::Empty,
+        )
+    }
+
     fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
 
-        // TODO Phase C: spherical-tree break/place. For now, fall
-        // straight through to the Cartesian tree editor.
+        // Spherical-tree break: if the planet is hit closer than any
+        // Cartesian tree block, clear the subtree at the targeted
+        // (face, iu, iv, ir, depth) cell. Empty cells along the ray
+        // are ignored by `raycast_highlight`, so we always hit a
+        // solid one first.
+        if self.try_cs_break(ray_dir) { return; }
 
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
@@ -382,21 +429,10 @@ impl App {
         );
         let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
 
-        // Cubed-sphere cursor. Highlight depth scales with zoom:
-        // at the finest playable zoom we highlight individual
-        // finest-level voxels; as the player zooms out we highlight
-        // progressively larger 3^n chunks, matching the engine's
-        // "same UX at every layer" principle — the same selection
-        // that previously worked on the hollow-sphere prototype at
-        // its coarser cell scale.
-        let cs_depth = {
-            let planet_depth = self.cs_planet.as_ref().map(|p| p.depth).unwrap_or(0);
-            // `zoom_level = 15` is the default. Each level zoomed out
-            // drops one subdivision on the planet (to a floor of 1).
-            const BASELINE: i32 = 15;
-            let dz = (self.zoom_level - BASELINE).max(0) as u32;
-            planet_depth.saturating_sub(dz).max(1).min(planet_depth)
-        };
+        // Cubed-sphere cursor. Highlight depth comes from the same
+        // `cs_edit_depth` the break path uses, so what you see is
+        // exactly what you break.
+        let cs_depth = self.cs_edit_depth();
         let cs_hit = self.cs_planet.as_ref().and_then(|p| {
             p.raycast_highlight(
                 &self.world.library, self.camera.pos, ray_dir, cs_depth,

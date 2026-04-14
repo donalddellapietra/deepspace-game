@@ -28,6 +28,7 @@
 use super::sdf::{self, Planet, Vec3};
 use super::tree::{
     empty_children, slot_index, uniform_children, Child, NodeId, NodeLibrary,
+    UNIFORM_EMPTY,
 };
 
 /// One of the six cube faces.
@@ -362,6 +363,74 @@ fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
     id
 }
 
+/// True iff the tree rooted at `c` is semantically equivalent to a
+/// single `target` terminal — `c` is literally `target`, OR `c` is a
+/// Node whose entire subtree is uniform `target`. Used so edits that
+/// would replace a uniform subtree with an equivalent terminal are
+/// detected as no-ops and don't churn the NodeLibrary.
+fn child_equivalent_to(lib: &NodeLibrary, c: Child, target: Child) -> bool {
+    if c == target { return true; }
+    let Child::Node(nid) = c else { return false; };
+    let Some(node) = lib.get(nid) else { return false; };
+    match target {
+        Child::Empty => node.uniform_type == UNIFORM_EMPTY,
+        Child::Block(b) => node.uniform_type == b,
+        Child::Node(_) => false,
+    }
+}
+
+/// Rebuild a face subtree with the cell at the end of `slots` replaced
+/// by `new_child`. Descends through Node children, expanding uniform
+/// terminals on the path so the edit lands at the requested depth.
+/// Content-addressed inserts mean no-op edits collapse back to the
+/// original NodeId at the top.
+fn rebuild_with_edit(
+    lib: &mut NodeLibrary,
+    current_id: NodeId,
+    slots: &[usize],
+    level: usize,
+    new_child: Child,
+) -> NodeId {
+    let Some(node) = lib.get(current_id) else { return current_id; };
+    let target_slot = slots[level];
+    let mut new_children = node.children;
+
+    if level + 1 == slots.len() {
+        // Treat a pointer-to-uniform-subtree identical to its
+        // scalar equivalent so setting an effectively-empty slot
+        // to Empty is a no-op, not a churn of the library.
+        if child_equivalent_to(lib, node.children[target_slot], new_child) {
+            return current_id;
+        }
+        new_children[target_slot] = new_child;
+    } else {
+        let child_next_id = match node.children[target_slot] {
+            Child::Node(nid) => {
+                // If the whole subtree is already uniform-`new_child`,
+                // no descent is needed — the leaf deep inside is
+                // already what we want.
+                if child_equivalent_to(lib, Child::Node(nid), new_child) {
+                    return current_id;
+                }
+                rebuild_with_edit(lib, nid, slots, level + 1, new_child)
+            }
+            other => {
+                if other == new_child {
+                    return current_id;
+                }
+                // Expand the terminal into a Node of 27 identical
+                // children and recurse into it. Dedup keeps repeated
+                // expansions cheap.
+                let expanded = lib.insert(uniform_children(other));
+                rebuild_with_edit(lib, expanded, slots, level + 1, new_child)
+            }
+        };
+        new_children[target_slot] = Child::Node(child_next_id);
+    }
+
+    lib.insert(new_children)
+}
+
 impl SphericalPlanet {
     /// Project `world` into the planet's (face, u_n, v_n, r_n)
     /// normalized cubed-sphere frame. `u_n` / `v_n` / `r_n` all live
@@ -424,6 +493,52 @@ impl SphericalPlanet {
         // chunk" counts as a hit at the requested depth.
         let repr = lib.get(node_id).map(|n| n.representative_block).unwrap_or(255);
         if repr < 255 { (repr, limit) } else { (0, limit) }
+    }
+
+    /// Replace the `(iu, iv, ir)` cell at `depth` on `face` with
+    /// `new_child` (typically `Empty` for break, `Block(b)` for
+    /// place). The target is identified by integer coordinates in a
+    /// `3^depth` grid — the same coordinates `raycast_highlight`
+    /// returns — so a highlight at depth 2 becomes a depth-2 edit.
+    ///
+    /// If the path to the target passes through a uniform terminal
+    /// shallower than `depth` (a pack-time flattened chunk), the
+    /// terminal is re-expanded into a Node of 27 identical children
+    /// and the edit proceeds into the slot. Content-addressed dedup
+    /// keeps that expansion cheap. Returns `true` if the face root
+    /// changed.
+    pub fn set_cell_at_depth(
+        &mut self,
+        lib: &mut NodeLibrary,
+        face: Face,
+        iu: u32, iv: u32, ir: u32,
+        depth: u32,
+        new_child: Child,
+    ) -> bool {
+        let d = depth.clamp(1, self.depth);
+        let cells = 3u32.pow(d);
+        if iu >= cells || iv >= cells || ir >= cells { return false; }
+
+        // Per-level slot indices from root toward the target.
+        let mut slots: [usize; 16] = [0; 16];
+        let levels = d as usize;
+        for level in 0..levels {
+            let shift = (d - 1 - level as u32) as u32;
+            let div = 3u32.pow(shift);
+            let us = ((iu / div) % 3) as usize;
+            let vs = ((iv / div) % 3) as usize;
+            let rs = ((ir / div) % 3) as usize;
+            slots[level] = slot_index(us, vs, rs);
+        }
+
+        let root = self.face_roots[face as usize];
+        let new_root = rebuild_with_edit(lib, root, &slots[..levels], 0, new_child);
+        if new_root == root { return false; }
+        lib.ref_inc(new_root);
+        let old = root;
+        self.face_roots[face as usize] = new_root;
+        lib.ref_dec(old);
+        true
     }
 
     /// Cursor raycast. Walks the ray through the shell, sampling the
@@ -724,6 +839,41 @@ mod tests {
         let outer = walk_subtree(&lib, planet.face_roots[Face::PosX as usize], &[(1, 1, 2)]);
         assert!(matches!(outer, Child::Empty | Child::Node(_)),
             "outer slot should resolve to empty or an empty subtree");
+    }
+
+    #[test]
+    fn set_cell_at_depth_clears_solid_region() {
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.0);
+        let mut planet = generate_spherical_planet(
+            &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf,
+        );
+        // At depth 1 pick the middle cell of +X face. Sample it
+        // before — expect at least some solid content (the SDF
+        // surface sits right in the middle of the shell).
+        let (before, _) = planet.sample_subtree(&lib, Face::PosX, 0.5, 0.5, 0.5, 1);
+        assert!(before != 0, "middle chunk should be solid before break");
+        // Break at depth 1 (one of 27 coarse chunks of +X).
+        let changed = planet.set_cell_at_depth(
+            &mut lib, Face::PosX, 1, 1, 1, 1, Child::Empty,
+        );
+        assert!(changed, "edit should change the face root");
+        let (after, _) = planet.sample_subtree(&lib, Face::PosX, 0.5, 0.5, 0.5, 1);
+        assert_eq!(after, 0, "broken chunk must read as empty");
+    }
+
+    #[test]
+    fn set_cell_at_depth_noop_for_already_empty_cell() {
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.0);
+        let mut planet = generate_spherical_planet(
+            &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf,
+        );
+        // Above the SDF surface at r close to outer_r: empty.
+        let changed = planet.set_cell_at_depth(
+            &mut lib, Face::PosX, 1, 1, 2, 1, Child::Empty,
+        );
+        assert!(!changed, "breaking an already-empty cell should no-op");
     }
 
     #[test]

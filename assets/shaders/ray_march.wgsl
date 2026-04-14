@@ -176,35 +176,38 @@ fn min_after(best: f32, cand: f32, cur: f32) -> f32 {
 }
 
 /// Walk a face subtree iteratively. Inputs are normalized
-/// `(un, vn, rn) ∈ [0, 1]³` — a uniform cell grid in the face's
-/// (u_ea, v_ea, r) space. Returns the palette index of the first
-/// non-Node terminal encountered (0 = empty). Slot mapping:
-/// `slot = r_slot * 9 + v_slot * 3 + u_slot`, matching how
-/// `build_face_subtree` stored its children via `slot_index(us, vs, rs)`.
-fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> u32 {
+/// `(un, vn, rn) ∈ [0, 1]³`. Returns `(block_id, depth)`:
+///   - `block_id`: 0 = empty, >0 = palette index of first terminal.
+///   - `depth`: number of descents taken before the terminal was
+///     found. A uniform empty region flattened at pack-time by
+///     `pack_tree_lod_multi` returns `depth = 1`; a finest-level
+///     hit returns `depth = subtree_depth`.
+///
+/// The DDA caller uses `depth` to compute exit-cell bounds at the
+/// appropriate coarseness, so a ray through a huge empty chunk
+/// crosses it in ONE step instead of `3^(subtree_depth-depth)`
+/// steps — recovering the Cartesian octree's skip-empty speedup.
+fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u32> {
     var node = root_idx;
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
-    // The subtree depth passed to the builder is 4 in the demo; we
-    // cap here with a safety margin so bad data can't infinite-loop
-    // a GPU thread.
-    for (var d: u32 = 0u; d < 12u; d = d + 1u) {
+    for (var d: u32 = 1u; d <= 12u; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
         let packed = child_packed(node, slot);
         let tag = child_tag(packed);
-        if tag == 0u { return 0u; }
-        if tag == 1u { return child_block_type(packed); }
+        if tag == 0u { return vec2<u32>(0u, d); }
+        if tag == 1u { return vec2<u32>(child_block_type(packed), d); }
         // tag == 2u: descend.
         node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
     }
-    return 0u;
+    return vec2<u32>(0u, 12u);
 }
 
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
@@ -552,12 +555,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if cs_outer > 0.0 {
         let cs_center = uniforms.cs_planet.xyz;
         let cs_inner = uniforms.cs_params.x;
-        let subtree_depth = u32(uniforms.cs_params.y + 0.5);
-        // Cells per axis at the finest subtree level. For depth=4
-        // that's 81; depth=5 → 243. Used only for exit-plane math —
-        // the subtree walker itself descends until it hits a
-        // terminal, so dedup still shortcuts uniform regions.
-        let cells_f = pow(3.0, f32(max(subtree_depth, 1u)));
         let shell = cs_outer - cs_inner;
 
         let oc = camera.pos - cs_center;
@@ -601,7 +598,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
                 let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
 
-                let block_id = sample_face_tree(face_root(face), un, vn, rn);
+                let walk = sample_face_tree(face_root(face), un, vn, rn);
+                let block_id = walk.x;
+                let term_depth = walk.y;
                 if block_id != 0u {
                     cs_hit = true;
                     cs_t = t;
@@ -651,33 +650,35 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     break;
                 }
 
-                // Empty cell — step to its exit. Cell bounds at the
-                // finest subtree level.
-                let iu = floor(un * cells_f);
-                let iv = floor(vn * cells_f);
-                let ir = floor(rn * cells_f);
+                // Empty cell — step to its exit. Cell bounds are at
+                // the SUBTREE WALKER'S termination depth, not at a
+                // fixed finest depth. This is the octree skip-empty
+                // speedup: if the walker bottomed out at depth 1
+                // because the whole 1/27 chunk is empty, we jump
+                // 1/3 of the face per step instead of 1/3^depth.
+                let cells_d = pow(3.0, f32(term_depth));
+                let iu = floor(un * cells_d);
+                let iv = floor(vn * cells_d);
+                let ir = floor(rn * cells_d);
 
-                // u-boundaries as world planes through center. A
-                // plane at `u_ea = U_ea` lives where
-                // `(p - center) · (u_axis - K · n_axis) = 0`
-                // with K = tan(U_ea · π/4).
-                let u_lo_ea = (iu       / cells_f) * 2.0 - 1.0;
-                let u_hi_ea = ((iu+1.0) / cells_f) * 2.0 - 1.0;
+                // u-boundaries as world planes through center.
+                let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
+                let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
                 let k_u_lo = ea_to_cube(u_lo_ea);
                 let k_u_hi = ea_to_cube(u_hi_ea);
                 let n_u_lo = u_axis - k_u_lo * n_axis;
                 let n_u_hi = u_axis - k_u_hi * n_axis;
 
-                let v_lo_ea = (iv       / cells_f) * 2.0 - 1.0;
-                let v_hi_ea = ((iv+1.0) / cells_f) * 2.0 - 1.0;
+                let v_lo_ea = (iv       / cells_d) * 2.0 - 1.0;
+                let v_hi_ea = ((iv+1.0) / cells_d) * 2.0 - 1.0;
                 let k_v_lo = ea_to_cube(v_lo_ea);
                 let k_v_hi = ea_to_cube(v_hi_ea);
                 let n_v_lo = v_axis - k_v_lo * n_axis;
                 let n_v_hi = v_axis - k_v_hi * n_axis;
 
                 // r-boundaries as spheres around center.
-                let r_lo = cs_inner + (ir       / cells_f) * shell;
-                let r_hi = cs_inner + ((ir+1.0) / cells_f) * shell;
+                let r_lo = cs_inner + (ir       / cells_d) * shell;
+                let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
 
                 var t_next = t_exit + 1.0;
                 t_next = min_after(t_next,
