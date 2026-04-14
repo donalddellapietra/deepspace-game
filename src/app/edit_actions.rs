@@ -187,32 +187,20 @@ impl App {
             ];
             renderer.set_face_roots(face_roots);
 
-            // Express the planet in the render frame. We deepen the
-            // planet's anchor to the frame's depth via exact path
-            // arithmetic, then require the frame path to be a prefix
-            // of the deepened anchor. When it isn't (camera and
-            // planet live in different branches of the tree) the
-            // planet is outside the render frame — hide it.
+            // Transform the planet into the render frame. `in_frame`
+            // handles the in-branch case precisely and the
+            // cross-branch case via common-ancestor composition —
+            // either way we get shader-appropriate frame-local
+            // coordinates. Deepen first so tail-path walk spans
+            // the finer scale.
             let deepened = planet.center_worldpos.deepened_to(frame.depth());
-            let planet_in_frame = frame.depth() == 0
-                || deepened.anchor.as_slice()[..frame.depth() as usize]
-                    == *frame.as_slice();
-            if planet_in_frame {
-                let local_center = deepened.in_frame(&frame);
-                renderer.set_cubed_sphere_planet(
-                    local_center,
-                    planet.inner_r * frame_scale,
-                    planet.outer_r * frame_scale,
-                    planet.depth,
-                );
-            } else {
-                renderer.set_cubed_sphere_planet(
-                    [0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    planet.depth,
-                );
-            }
+            let local_center = deepened.in_frame(&frame);
+            renderer.set_cubed_sphere_planet(
+                local_center,
+                planet.inner_r * frame_scale,
+                planet.outer_r * frame_scale,
+                planet.depth,
+            );
         }
 
         renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));

@@ -326,38 +326,64 @@ impl WorldPos {
         self
     }
 
-    /// Position expressed in a render frame's local `[0, WORLD_SIZE)³`
-    /// coordinate system. Requires `frame` to be a prefix of this
-    /// position's anchor — the caller guarantees the render frame is
-    /// an ancestor of the camera's anchor.
+    /// Position expressed in `frame`'s local coordinate system,
+    /// where the frame's cell spans `[0, WORLD_SIZE)³`.
     ///
-    /// **Precision-safe.** The computation composes path slots from
-    /// `frame.depth` down to `self.anchor.depth`, plus the offset —
-    /// exact integer math on the slots, no float accumulation at
-    /// absolute world scale. This is the whole point of the anchor
-    /// refactor: rendering inputs stay at f32-safe magnitudes no
-    /// matter how deep the anchor sits.
+    /// Handles any relationship between `self.anchor` and `frame`:
+    /// - If `frame` is a prefix of `self.anchor` (the usual render
+    ///   case for the camera): the result is precise sub-cell
+    ///   precision via pure path-slot composition in the tail —
+    ///   f32 magnitudes stay bounded by `WORLD_SIZE` regardless of
+    ///   how deep the anchor sits.
+    /// - If the two diverge: both positions are computed in their
+    ///   common ancestor's frame (each in `[0, WORLD_SIZE)`) and
+    ///   the difference is scaled into the frame's local system.
+    ///   The result lands outside `[0, WORLD_SIZE)` when `self` is
+    ///   outside the frame's cell — correct behavior for shader
+    ///   inputs like a distant planet center.
     pub fn in_frame(&self, frame: &Path) -> [f32; 3] {
-        debug_assert!(frame.depth() <= self.anchor.depth(),
-            "frame must be an ancestor of the camera's anchor");
-        debug_assert!(
-            self.anchor.as_slice()[..frame.depth() as usize] == *frame.as_slice(),
-            "frame must be a path prefix of the camera's anchor",
-        );
-        let mut origin = [0.0f32; 3];
+        let c = self.anchor.common_prefix_len(frame) as usize;
+
+        // Walk [c..self.anchor.depth) + offset → position in the
+        // common ancestor's frame (spans [0, WORLD_SIZE)).
+        let mut pos_common = [0.0f32; 3];
         let mut size = WORLD_SIZE;
-        for k in (frame.depth() as usize)..(self.anchor.depth() as usize) {
+        for k in c..(self.anchor.depth() as usize) {
             let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
             let child = size / 3.0;
-            origin[0] += sx as f32 * child;
-            origin[1] += sy as f32 * child;
-            origin[2] += sz as f32 * child;
+            pos_common[0] += sx as f32 * child;
+            pos_common[1] += sy as f32 * child;
+            pos_common[2] += sz as f32 * child;
             size = child;
         }
+        pos_common[0] += self.offset[0] * size;
+        pos_common[1] += self.offset[1] * size;
+        pos_common[2] += self.offset[2] * size;
+
+        // Walk [c..frame.depth) → frame's min corner in the common
+        // ancestor's frame, plus the frame's cell size there.
+        let mut frame_origin = [0.0f32; 3];
+        let mut frame_size = WORLD_SIZE;
+        for k in c..(frame.depth() as usize) {
+            let (sx, sy, sz) = slot_coords(frame.slot(k) as usize);
+            let child = frame_size / 3.0;
+            frame_origin[0] += sx as f32 * child;
+            frame_origin[1] += sy as f32 * child;
+            frame_origin[2] += sz as f32 * child;
+            frame_size = child;
+        }
+
+        // Transform common-ancestor coords → frame-local: the
+        // frame's cell is `[frame_origin, frame_origin + frame_size)`
+        // in the common ancestor, and `[0, WORLD_SIZE)` in frame
+        // local. When `c == frame.depth()` (frame is prefix of
+        // anchor) this reduces to the identity, i.e.
+        // `pos_common - 0 * 1 = pos_common` — the precise tail walk.
+        let scale = WORLD_SIZE / frame_size;
         [
-            origin[0] + self.offset[0] * size,
-            origin[1] + self.offset[1] * size,
-            origin[2] + self.offset[2] * size,
+            (pos_common[0] - frame_origin[0]) * scale,
+            (pos_common[1] - frame_origin[1]) * scale,
+            (pos_common[2] - frame_origin[2]) * scale,
         ]
     }
 
@@ -650,6 +676,45 @@ mod tests {
         let world_orig = p.to_world_xyz();
         for i in 0..3 {
             assert!((world_back[i] - world_orig[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn in_frame_cross_branch_matches_world_diff() {
+        // Point and frame living in different depth-1 branches: the
+        // returned local coords fall outside [0, WORLD_SIZE) and must
+        // match (world_pos - frame_world_origin) * (WORLD_SIZE /
+        // frame_size) to within f32 precision.
+        let point = WorldPos::from_world_xyz([2.5, 0.25, 1.5], 4);
+        let mut frame = Path::root();
+        frame.push(slot_index(0, 2, 0) as u8); // depth-1 cell (0, 2, 0) = y-top-left
+        frame.push(slot_index(1, 1, 1) as u8); // depth-2 center within it
+        let frame_size = super::WORLD_SIZE / 3.0f32.powi(frame.depth() as i32);
+        let mut frame_origin = [0.0f32; 3];
+        let mut size = super::WORLD_SIZE;
+        for k in 0..frame.depth() as usize {
+            let (sx, sy, sz) = slot_coords(frame.slot(k) as usize);
+            let child = size / 3.0;
+            frame_origin[0] += sx as f32 * child;
+            frame_origin[1] += sy as f32 * child;
+            frame_origin[2] += sz as f32 * child;
+            size = child;
+        }
+        let expected = {
+            let w = point.to_world_xyz();
+            let s = super::WORLD_SIZE / frame_size;
+            [
+                (w[0] - frame_origin[0]) * s,
+                (w[1] - frame_origin[1]) * s,
+                (w[2] - frame_origin[2]) * s,
+            ]
+        };
+        let actual = point.in_frame(&frame);
+        for i in 0..3 {
+            assert!(
+                (actual[i] - expected[i]).abs() < 1e-3,
+                "axis {i}: got {} expected {}", actual[i], expected[i],
+            );
         }
     }
 
