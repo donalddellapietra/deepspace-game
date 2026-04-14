@@ -240,12 +240,11 @@ pub struct SphericalPlanet {
     pub depth: u32,
     /// `NodeKind::CubedSphereBody` node containing the 6 face roots
     /// at face-center slots. This is the canonical in-tree identity
-    /// of the planet — `body_node` + the `NodeKind` payload
-    /// (inner_r, outer_r) are enough to rebuild `SphericalPlanet`
-    /// without any external `cs_*` state. The rest of the engine
-    /// still reads from the explicit fields above; those fields
-    /// become derivable once the shader learns to dispatch on
-    /// `NodeKind` (deferred).
+    /// of the planet. The fields above are eager caches of the
+    /// body's world-space footprint (computable at any time via
+    /// [`resolve_body_from_anchor`]); they live on the struct so the
+    /// hot-path CPU raycast and editing don't have to walk the tree
+    /// on every call.
     pub body_node: NodeId,
 }
 
@@ -257,6 +256,76 @@ pub struct SphericalPlanet {
 /// face; the filler chain below is O(depth) unique nodes shared
 /// across the whole planet.
 const SDF_DETAIL_LEVELS: u32 = 4;
+
+/// Resolution of a body node's world-space footprint: center, radii,
+/// and the face-subtree recursion depth, derived from its anchor
+/// path and `NodeKind::CubedSphereBody` payload. The anchor is the
+/// source of truth; this is a projection for downstream consumers
+/// (gravity math, shader uniform population) that need world units.
+pub struct ResolvedBody {
+    pub center: [f32; 3],
+    pub inner_r_world: f32,
+    pub outer_r_world: f32,
+    /// Levels of recursion under each face root.
+    pub face_subtree_depth: u32,
+}
+
+/// Walk `world_root` down `anchor` to the body node and compute its
+/// world-space footprint. Returns `None` if the walk hits a non-Node
+/// child or the resolved node doesn't have `CubedSphereBody` kind.
+pub fn resolve_body_from_anchor(
+    lib: &NodeLibrary,
+    world_root: NodeId,
+    anchor: &super::coords::Path,
+) -> Option<ResolvedBody> {
+    let mut id = world_root;
+    for &slot in anchor.slots() {
+        let node = lib.get(id)?;
+        match node.children[slot as usize] {
+            Child::Node(child) => id = child,
+            _ => return None,
+        }
+    }
+    let body = lib.get(id)?;
+    let (inner_r, outer_r) = match body.kind {
+        NodeKind::CubedSphereBody { inner_r, outer_r } => (inner_r, outer_r),
+        _ => return None,
+    };
+    // Cell size at `anchor.depth()` in world units.
+    let cell_size = super::coords::ROOT_EXTENT / 3f32.powi(anchor.depth() as i32);
+    let center = super::coords::world_pos_to_f32(&super::coords::WorldPos {
+        anchor: *anchor,
+        offset: [0.5, 0.5, 0.5],
+    });
+    // Face-subtree depth: count Node descents from any face root
+    // (they're all the same depth by construction).
+    let face_root_id = match body.children[body_face_center_slot(Face::PosX)] {
+        Child::Node(id) => id,
+        _ => return None,
+    };
+    let face_subtree_depth = measure_node_depth(lib, face_root_id);
+    Some(ResolvedBody {
+        center,
+        inner_r_world: inner_r * cell_size,
+        outer_r_world: outer_r * cell_size,
+        face_subtree_depth,
+    })
+}
+
+fn measure_node_depth(lib: &NodeLibrary, start: NodeId) -> u32 {
+    // Walk the leftmost Node child chain to count depth.
+    let mut d = 0u32;
+    let mut id = start;
+    loop {
+        let Some(n) = lib.get(id) else { break; };
+        d += 1;
+        match n.children[0] {
+            Child::Node(child) => id = child,
+            _ => break,
+        }
+    }
+    d
+}
 
 /// Build a 6-face `SphericalPlanet` in `lib` by recursively sampling
 /// `sdf` along each face's `(u, v, r)` subtree. SDF-driven recursion

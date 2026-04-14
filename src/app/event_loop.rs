@@ -42,15 +42,17 @@ impl ApplicationHandler for App {
 
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
         let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
-        // The planet was generated in App::new(), BEFORE the event
-        // loop, so `resumed()` is cheap. Here we just upload the
-        // pre-built handles to the GPU.
-        if let Some(planet) = self.cs_planet.as_ref() {
+        // Derive the body's world-space footprint from its anchor
+        // path and NodeKind payload — the body node IS the source of
+        // truth; the shader's uniforms are a projection of it.
+        if let Some(body_desc) = crate::world::cubesphere::resolve_body_from_anchor(
+            &self.world.library, self.world.root, &self.body_anchor,
+        ) {
             renderer.set_cubed_sphere_planet(
-                planet.center,
-                planet.inner_r,
-                planet.outer_r,
-                planet.depth,
+                body_desc.center,
+                body_desc.inner_r_world,
+                body_desc.outer_r_world,
+                body_desc.face_subtree_depth,
             );
         }
         self.renderer = Some(renderer);
