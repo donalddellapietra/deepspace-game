@@ -20,18 +20,17 @@ pub struct GpuUniforms {
     pub _pad: [u32; 2],
     pub highlight_min: [f32; 4], // xyz, w unused
     pub highlight_max: [f32; 4], // xyz, w unused
-    /// Demo cubed-sphere planet: xyz = center, w = radius.
-    /// Rendered directly in the shader to visualize the 6-face
-    /// voxel layout on a sphere. `w == 0` disables it.
+    /// Spherical planet: xyz = center, w = outer radius (0 disables).
     pub cs_planet: [f32; 4],
-    /// x = cells per cube-face edge (so each face has x² cells,
-    /// planet has 6·x² surface cells at the chosen depth).
-    /// y, z, w unused.
+    /// x = inner radius. y/z/w reserved for later phases (cells
+    /// visualization parameters or highlight-active flag).
     pub cs_params: [f32; 4],
-    /// Cursor highlight on the cubed-sphere planet.
-    /// x = face index (0..6) as f32,
-    /// y = cell i, z = cell j, w = active flag (0/1).
+    /// Reserved for Phase C cursor highlight.
     pub cs_highlight: [f32; 4],
+    /// GPU buffer indices of the 6 face subtree roots.
+    /// Layout: [PosX, NegX, PosY, NegY, PosZ, NegZ, unused, unused].
+    /// Face `f` is looked up at `cs_face_roots[f]`.
+    pub cs_face_roots: [u32; 8],
 }
 
 pub struct Renderer {
@@ -45,7 +44,6 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     uniforms_buffer: wgpu::Buffer,
-    cs_blocks_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     // Tracked state.
     root_index: u32,
@@ -57,6 +55,7 @@ pub struct Renderer {
     cs_planet: [f32; 4],
     cs_params: [f32; 4],
     cs_highlight: [f32; 4],
+    cs_face_roots: [u32; 8],
 }
 
 impl Renderer {
@@ -161,6 +160,7 @@ impl Renderer {
             cs_planet: [0.0; 4],
             cs_params: [0.0; 4],
             cs_highlight: [0.0; 4],
+            cs_face_roots: [0; 8],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -213,27 +213,7 @@ impl Renderer {
                     },
                     count: None,
                 },
-                // Cubed-sphere planet blocks: flat u32 per cell,
-                // indexed by (face * N*N + j * N + i).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
             ],
-        });
-
-        // Placeholder cubed-sphere blocks buffer; replaced by
-        // `set_cubed_sphere_blocks` once the planet is built.
-        let cs_blocks_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cs_blocks"),
-            contents: bytemuck::cast_slice(&[0u32]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -244,7 +224,6 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: uniforms_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cs_blocks_buffer.as_entire_binding() },
             ],
         });
 
@@ -303,7 +282,6 @@ impl Renderer {
             camera_buffer,
             palette_buffer,
             uniforms_buffer,
-            cs_blocks_buffer,
             bind_group,
             root_index,
             node_count,
@@ -314,54 +292,50 @@ impl Renderer {
             cs_planet: [0.0; 4],
             cs_params: [0.0; 4],
             cs_highlight: [0.0; 4],
+            cs_face_roots: [0; 8],
         }
     }
 
-    /// Set or clear the cubed-sphere cursor highlight.
-    pub fn set_cubed_sphere_highlight(&mut self, cell: Option<(u32, u32, u32)>) {
-        self.cs_highlight = match cell {
-            Some((face, i, j)) => [face as f32, i as f32, j as f32, 1.0],
-            None => [0.0; 4],
-        };
+    /// Provide the 6 face-subtree buffer indices for the spherical
+    /// planet. Order: PosX, NegX, PosY, NegY, PosZ, NegZ.
+    pub fn set_face_roots(&mut self, roots: [u32; 6]) {
+        for (i, &r) in roots.iter().enumerate() {
+            self.cs_face_roots[i] = r;
+        }
         self.write_uniforms();
     }
 
-    /// Configure the demo cubed-sphere planet. `radius == 0` hides it.
+    /// Set or clear the cubed-sphere cursor highlight. Cell is
+    /// `(face, i, j, k)`.
+    pub fn set_cubed_sphere_highlight(&mut self, cell: Option<(u32, u32, u32, u32)>) {
+        match cell {
+            Some((face, i, j, k)) => {
+                self.cs_highlight = [face as f32, i as f32, j as f32, k as f32];
+                self.cs_params[3] = 1.0;
+            }
+            None => {
+                self.cs_highlight = [0.0; 4];
+                self.cs_params[3] = 0.0;
+            }
+        }
+        self.write_uniforms();
+    }
+
+    /// Configure the spherical planet's rendering footprint.
+    /// - `outer_radius == 0` hides the planet.
+    /// - `depth` = levels of recursion in each face subtree (3^depth
+    ///   cells per face per axis). Needed by the shader so its DDA
+    ///   knows the finest cell size to step to.
     pub fn set_cubed_sphere_planet(
         &mut self,
         center: [f32; 3],
-        radius: f32,
-        cells_per_face: u32,
+        inner_radius: f32,
+        outer_radius: f32,
+        depth: u32,
     ) {
-        self.cs_planet = [center[0], center[1], center[2], radius];
-        self.cs_params = [cells_per_face as f32, 0.0, 0.0, 0.0];
+        self.cs_planet = [center[0], center[1], center[2], outer_radius];
+        self.cs_params = [inner_radius, depth as f32, 0.0, self.cs_params[3]];
         self.write_uniforms();
-    }
-
-    /// Upload the cubed-sphere planet's per-cell block types. The
-    /// slice's layout must be `face * N*N + j * N + i`, same as
-    /// `CubeSpherePlanet::blocks`. Each block is stored as a u32
-    /// for simple GPU indexing.
-    pub fn set_cubed_sphere_blocks(&mut self, blocks: &[u8]) {
-        let as_u32: Vec<u32> = blocks.iter().map(|&b| b as u32).collect();
-        self.cs_blocks_buffer = self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("cs_blocks"),
-                contents: bytemuck::cast_slice(&as_u32),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            },
-        );
-        self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ray_march"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.tree_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.camera_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.palette_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.uniforms_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.cs_blocks_buffer.as_entire_binding() },
-            ],
-        });
     }
 
     pub fn update_palette(&self, palette: &GpuPalette) {
@@ -459,7 +433,6 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 1, resource: self.camera_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: self.palette_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: self.uniforms_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: self.cs_blocks_buffer.as_entire_binding() },
                 ],
             });
         } else {
@@ -483,6 +456,7 @@ impl Renderer {
             cs_planet: self.cs_planet,
             cs_params: self.cs_params,
             cs_highlight: self.cs_highlight,
+            cs_face_roots: self.cs_face_roots,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

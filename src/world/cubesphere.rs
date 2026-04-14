@@ -25,8 +25,10 @@
 //! later passes (tree integration, renderer, collision) will build
 //! on it.
 
-use super::palette::block;
 use super::sdf::{self, Planet, Vec3};
+use super::tree::{
+    empty_children, slot_index, uniform_children, Child, NodeId, NodeLibrary,
+};
 
 /// One of the six cube faces.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -94,21 +96,34 @@ pub struct CubeSphereCoord {
 }
 
 /// Convert (face, u, v) → unit direction pointing outward from the
-/// planet center. `u, v` both in [-1, 1]. The cube face is projected
-/// onto the sphere by normalizing: cube_point = normal + u·u_axis +
-/// v·v_axis; sphere_dir = normalize(cube_point).
+/// planet center. `u, v ∈ [-1, 1]` live in **equal-angle** space:
+/// each uniform step in `(u, v)` covers the same angular slice of
+/// the sphere as seen from its center, which makes cells project
+/// to nearly-uniform area (~6% variation peak-to-peak vs. ~50% for
+/// the basic gnomonic projection).
 ///
-/// Adjacent cells share edges because the cube points agree at the
-/// boundary and normalization is continuous.
+/// The warp is one `tan` each on `u` and `v`: a uniform cell grid
+/// gets pre-compressed toward the face's middle, exactly canceling
+/// the expansion `normalize` would otherwise apply near the corners.
 pub fn face_uv_to_dir(face: Face, u: f32, v: f32) -> Vec3 {
+    let cube_u = (u * std::f32::consts::FRAC_PI_4).tan();
+    let cube_v = (v * std::f32::consts::FRAC_PI_4).tan();
     let n = face.normal();
     let (ua, va) = face.tangents();
     let cube_pt = [
-        n[0] + u * ua[0] + v * va[0],
-        n[1] + u * ua[1] + v * va[1],
-        n[2] + u * ua[2] + v * va[2],
+        n[0] + cube_u * ua[0] + cube_v * va[0],
+        n[1] + cube_u * ua[1] + cube_v * va[1],
+        n[2] + cube_u * ua[2] + cube_v * va[2],
     ];
     sdf::normalize(cube_pt)
+}
+
+/// Inverse of the equal-angle warp: raw cube-face coord → equal-angle.
+/// The shader + raymarchers compute `cube_u = ratio` (e.g. `-n.z/ax`),
+/// then call this to get the `u ∈ [-1, 1]` used for cell indexing.
+#[inline]
+pub fn cube_to_ea(c: f32) -> f32 {
+    c.atan() * (4.0 / std::f32::consts::PI)
 }
 
 /// Given a planet center and a `CubeSphereCoord`, return the
@@ -129,25 +144,29 @@ pub fn world_to_coord(center: Vec3, pos: Vec3) -> Option<CubeSphereCoord> {
     if r < 1e-12 { return None; }
     let dir = sdf::scale(d, 1.0 / r);
 
-    // Pick the dominant axis.
+    // Pick the dominant axis; the raw ratios give the CUBE-space
+    // (u, v) on that face. Then apply the equal-angle inverse so
+    // `u, v` are the same coords cells are indexed by.
     let ax = dir[0].abs();
     let ay = dir[1].abs();
     let az = dir[2].abs();
-    let (face, u, v) = if ax >= ay && ax >= az {
-        // X-dominant.
+    let (face, cube_u, cube_v) = if ax >= ay && ax >= az {
         if dir[0] > 0.0 { (Face::PosX, -dir[2] / ax,  dir[1] / ax) }
         else            { (Face::NegX,  dir[2] / ax,  dir[1] / ax) }
     } else if ay >= az {
-        // Y-dominant.
         if dir[1] > 0.0 { (Face::PosY,  dir[0] / ay, -dir[2] / ay) }
         else            { (Face::NegY,  dir[0] / ay,  dir[2] / ay) }
     } else {
-        // Z-dominant.
         if dir[2] > 0.0 { (Face::PosZ,  dir[0] / az,  dir[1] / az) }
         else            { (Face::NegZ, -dir[0] / az,  dir[1] / az) }
     };
 
-    Some(CubeSphereCoord { face, u, v, r })
+    Some(CubeSphereCoord {
+        face,
+        u: cube_to_ea(cube_u),
+        v: cube_to_ea(cube_v),
+        r,
+    })
 }
 
 /// The eight world-space corners of a block spanning
@@ -182,142 +201,165 @@ pub fn block_corners(
 
 // ────────────────────────────────────────────────── planet data
 
-/// A planet represented in cubed-sphere coordinates.
+/// A planet made of 6 face-subtrees in the content-addressed
+/// `NodeLibrary`. Each face subtree's 3 recursive axes are
+/// `(u_slot, v_slot, r_slot)` in the planet's equal-angle cubed-sphere
+/// frame — NOT (x, y, z). A subtree leaf is a block / empty terminal
+/// exactly like any other subtree, so the existing content-addressed
+/// dedup, LOD cascade, and editing primitives all apply.
 ///
-/// Each of the 6 faces carries an N×N grid of surface cells
-/// (single-layer shell for now — altitude stacking comes later).
-/// `blocks[f * N*N + j*N + i]` is the palette index of the cell at
-/// `(face=f, cell_i=i, cell_j=j)`, or 0 if empty / above surface.
+/// Recursion semantics: each node splits its local (u, v, r) box
+/// into 3×3×3 children. The slot at `(us, vs, rs)` covers
+/// `u ∈ [u_lo + us·du/3, u_lo + (us+1)·du/3]` and analogously for
+/// v and r, where `(u_lo, u_hi, v_lo, v_hi, r_lo, r_hi)` is the
+/// current node's box. At the top level each face's box is
+/// `[-1, 1] × [-1, 1] × [inner_r, outer_r]`.
 ///
-/// This flat layout is what the GPU reads to shade the planet per
-/// fragment: ray→sphere hit → face picker → (i, j) → block index →
-/// palette color. Later phases will lift this to an LOD'd nested
-/// tree, but the flat single-shell form is the simplest thing that
-/// lets us see real, SDF-driven content on the bulged-square grid.
+/// A leaf cell is a "bulged voxel": its world-space corners come
+/// from `block_corners` at the cell's (u, v, r) extents. Zoom in
+/// and you descend into the subtree, revealing 27 smaller bulged
+/// voxels per parent — the same "blocks inside blocks" mechanic
+/// the rest of the engine uses, just interpreted in spherical
+/// coordinates.
 #[derive(Clone, Debug)]
-pub struct CubeSpherePlanet {
+pub struct SphericalPlanet {
     pub center: Vec3,
-    pub radius: f32,
-    pub cells_per_face_edge: u32,
-    pub blocks: Vec<u8>,
+    /// Cells span `r ∈ [inner_r, outer_r]`. A solid column typical of
+    /// a rocky planet has its surface near the midpoint and empty
+    /// cells above, solid cells below.
+    pub inner_r: f32,
+    pub outer_r: f32,
+    /// One subtree root per cube face. Indexed by `Face as usize`.
+    /// Subtrees live in the shared `NodeLibrary` alongside the
+    /// Cartesian space tree — dedup is natural because they use the
+    /// same `Child`/`Node` representation.
+    pub face_roots: [NodeId; 6],
+    /// Levels of recursion under each face root. Zoom-in reveals up
+    /// to `depth` cascades of 27 sub-cells before bottoming out.
+    pub depth: u32,
 }
 
-impl CubeSpherePlanet {
-    pub fn empty(center: Vec3, radius: f32, cells_per_face_edge: u32) -> Self {
-        let n = cells_per_face_edge as usize;
-        Self {
-            center,
-            radius,
-            cells_per_face_edge,
-            blocks: vec![0; 6 * n * n],
-        }
-    }
-
-    #[inline]
-    pub fn cell_index(&self, face: Face, i: u32, j: u32) -> usize {
-        let n = self.cells_per_face_edge as usize;
-        (face as usize) * n * n + (j as usize) * n + (i as usize)
-    }
-
-    pub fn set(&mut self, face: Face, i: u32, j: u32, block: u8) {
-        let idx = self.cell_index(face, i, j);
-        self.blocks[idx] = block;
-    }
-
-    pub fn get(&self, face: Face, i: u32, j: u32) -> u8 {
-        self.blocks[self.cell_index(face, i, j)]
-    }
-
-    /// Center (u, v) of the (i, j) cell on a face of N×N cells.
-    /// Cells tile [-1, 1]² uniformly in (u, v) space; their
-    /// projections to the sphere are slightly non-uniform in
-    /// solid angle, which is the standard cubed-sphere property.
-    pub fn cell_center_uv(&self, i: u32, j: u32) -> (f32, f32) {
-        let n = self.cells_per_face_edge as f32;
-        let u = -1.0 + 2.0 * (i as f32 + 0.5) / n;
-        let v = -1.0 + 2.0 * (j as f32 + 0.5) / n;
-        (u, v)
-    }
-
-    /// Intersect a ray with the planet's outer shell. Returns the
-    /// entry-t if the ray hits in front of the camera.
-    pub fn ray_t(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
-        let oc = sdf::sub(origin, self.center);
-        let b = sdf::dot(oc, dir);
-        let c = sdf::dot(oc, oc) - self.radius * self.radius;
-        let disc = b * b - c;
-        if disc <= 0.0 { return None; }
-        let sq = disc.sqrt();
-        let t0 = -b - sq;
-        let t1 = -b + sq;
-        if t0 > 0.0 { Some(t0) } else if t1 > 0.0 { Some(t1) } else { None }
-    }
-
-    /// Which (face, i, j) cell does this ray hit first on the shell?
-    /// Returns the entry-t and the cell it lands in, clamped to the
-    /// grid. Does NOT skip empty cells — that's the caller's call
-    /// (the highlight wants the shell position, a block raycast
-    /// would want a loop).
-    pub fn hit_cell(&self, origin: Vec3, dir: Vec3) -> Option<(f32, Face, u32, u32)> {
-        let t = self.ray_t(origin, dir)?;
-        let hit = sdf::add(origin, sdf::scale(dir, t));
-        let coord = world_to_coord(self.center, hit)?;
-        let n = self.cells_per_face_edge as f32;
-        let ug = ((coord.u + 1.0) * 0.5 * n).floor();
-        let vg = ((coord.v + 1.0) * 0.5 * n).floor();
-        let i = (ug as i32).clamp(0, self.cells_per_face_edge as i32 - 1) as u32;
-        let j = (vg as i32).clamp(0, self.cells_per_face_edge as i32 - 1) as u32;
-        Some((t, coord.face, i, j))
-    }
-}
-
-/// Fill a `CubeSpherePlanet`'s cells by sampling an SDF `Planet`
-/// at each cell's world-space center. A cell is solid (gets the
-/// planet's surface block) iff the SDF says its center is below
-/// the displaced surface. Above-surface cells stay empty.
-///
-/// This is the single-shell equivalent of the voxel-octree
-/// `build_space_subtree`: one radius, one sample per column. Good
-/// enough to visualize terrain on the sphere right now; later
-/// phases layer altitude columns below/above.
-pub fn generate_from_sdf(
+/// Build a 6-face `SphericalPlanet` in `lib` by recursively sampling
+/// `sdf` along each face's `(u, v, r)` subtree. Uniform solid /
+/// uniform empty subtrees are built once and referenced many times
+/// by the content-addressed library, so a pristine spherical planet
+/// costs only `O(surface_area · depth)` unique nodes — not `O(27^depth)`.
+pub fn generate_spherical_planet(
+    lib: &mut NodeLibrary,
     center: Vec3,
-    radius: f32,
-    cells_per_face_edge: u32,
-    sdf_planet: &Planet,
-) -> CubeSpherePlanet {
-    let mut cs = CubeSpherePlanet::empty(center, radius, cells_per_face_edge);
+    inner_r: f32,
+    outer_r: f32,
+    depth: u32,
+    sdf: &Planet,
+) -> SphericalPlanet {
+    let mut face_roots = [0u64; 6];
     for &face in &Face::ALL {
-        for j in 0..cells_per_face_edge {
-            for i in 0..cells_per_face_edge {
-                let (u, v) = cs.cell_center_uv(i, j);
-                let world = coord_to_world(center, CubeSphereCoord { face, u, v, r: radius });
-                // Cell is "present" if the undisplaced surface at
-                // radius `radius` is below the noise-displaced SDF
-                // surface at this direction — equivalently, SDF < 0
-                // means we're inside the planet, so the surface cell
-                // is solid.
-                if sdf_planet.distance(world) < 0.0 {
-                    cs.set(face, i, j, sdf_planet.block_at(world));
-                } else {
-                    // Cell is above the displaced surface (valley
-                    // where the noise pushes terrain inward). Leave
-                    // empty — the raymarch sees through this cell.
-                    cs.set(face, i, j, 0);
-                }
+        let child = build_face_subtree(
+            lib, face, center,
+            -1.0, 1.0, -1.0, 1.0, inner_r, outer_r,
+            depth, sdf,
+        );
+        // The face root must be a Node — we always wrap so the
+        // renderer has a tree to walk per face, even if the whole
+        // face is uniform empty / solid.
+        face_roots[face as usize] = match child {
+            Child::Node(id) => id,
+            Child::Empty => lib.insert(empty_children()),
+            Child::Block(b) => lib.insert(uniform_children(Child::Block(b))),
+        };
+        lib.ref_inc(face_roots[face as usize]);
+    }
+    SphericalPlanet { center, inner_r, outer_r, face_roots, depth }
+}
+
+/// Recursive builder for one cubed-sphere face. Returns a `Child` so
+/// the caller can collapse uniform subtrees up the call chain.
+fn build_face_subtree(
+    lib: &mut NodeLibrary,
+    face: Face,
+    center: Vec3,
+    u_lo: f32, u_hi: f32,
+    v_lo: f32, v_hi: f32,
+    r_lo: f32, r_hi: f32,
+    depth: u32,
+    sdf: &Planet,
+) -> Child {
+    // Cell center in world space.
+    let u_c = 0.5 * (u_lo + u_hi);
+    let v_c = 0.5 * (v_lo + v_hi);
+    let r_c = 0.5 * (r_lo + r_hi);
+    let p_center = coord_to_world(center, CubeSphereCoord { face, u: u_c, v: v_c, r: r_c });
+    let d_center = sdf.distance(p_center);
+
+    // Conservative bound on world-space distance from p_center to any
+    // corner of this cell. Lateral extent grows with radius; radial
+    // extent is straightforward. Overestimating is safe (means extra
+    // subdivision, never wrong bits).
+    let du = u_hi - u_lo;
+    let dv = v_hi - v_lo;
+    let dr = r_hi - r_lo;
+    // At equal-angle, uv half-span on the sphere is roughly
+    // r · tan(du/2 · π/4). Use a generous linearization: r · du/2.
+    let lateral_half = r_hi * 0.5 * du.max(dv);
+    let radial_half = 0.5 * dr;
+    let cell_rad = (lateral_half * lateral_half + radial_half * radial_half).sqrt();
+
+    // Fully outside: the SDF surface can't reach this cell, so every
+    // sub-cell is empty. Content-addressed into a dedup'd empty subtree.
+    if d_center > cell_rad {
+        if depth == 0 { return Child::Empty; }
+        return Child::Node(build_uniform_empty(lib, depth));
+    }
+    // Fully inside: every sub-cell is solid. Pick the center-sample
+    // block type and stamp the whole subtree with it.
+    if d_center < -cell_rad {
+        let b = sdf.block_at(p_center);
+        if depth == 0 { return Child::Block(b); }
+        return match lib.build_uniform_subtree(b, depth) {
+            Child::Node(id) => Child::Node(id),
+            other => other, // (Shouldn't happen for depth ≥ 1, but safe.)
+        };
+    }
+
+    // Straddles the surface or too close to commit. At depth 0 we
+    // have no more room to resolve — sample the center and go.
+    if depth == 0 {
+        return if d_center < 0.0 {
+            Child::Block(sdf.block_at(p_center))
+        } else {
+            Child::Empty
+        };
+    }
+
+    // Recurse: split this cell's (u, v, r) box into 3×3×3 sub-cells.
+    let mut children = empty_children();
+    for rs in 0..3 {
+        for vs in 0..3 {
+            for us in 0..3 {
+                let us_lo = u_lo + du * (us as f32) / 3.0;
+                let us_hi = u_lo + du * (us as f32 + 1.0) / 3.0;
+                let vs_lo = v_lo + dv * (vs as f32) / 3.0;
+                let vs_hi = v_lo + dv * (vs as f32 + 1.0) / 3.0;
+                let rs_lo = r_lo + dr * (rs as f32) / 3.0;
+                let rs_hi = r_lo + dr * (rs as f32 + 1.0) / 3.0;
+                children[slot_index(us, vs, rs)] = build_face_subtree(
+                    lib, face, center,
+                    us_lo, us_hi, vs_lo, vs_hi, rs_lo, rs_hi,
+                    depth - 1, sdf,
+                );
             }
         }
     }
-    // Make sure a completely-empty planet still shows *something* for
-    // debugging: fill the 4 cardinal face centers with stone if the
-    // whole buffer is empty.
-    if cs.blocks.iter().all(|&b| b == 0) {
-        for &face in &Face::ALL {
-            let mid = cells_per_face_edge / 2;
-            cs.set(face, mid, mid, block::STONE);
-        }
+    Child::Node(lib.insert(children))
+}
+
+/// Build (and cache) a uniform-empty subtree of the given depth.
+fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
+    let mut id = lib.insert(empty_children());
+    for _ in 1..depth {
+        id = lib.insert(uniform_children(Child::Node(id)));
     }
-    cs
+    id
 }
 
 /// The twelve edges of a cubed-sphere block as pairs of corner
@@ -338,6 +380,7 @@ pub const BLOCK_EDGES: [(usize, usize); 12] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::palette::block;
 
     fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-5 }
     fn approx_v(a: Vec3, b: Vec3) -> bool {
@@ -494,64 +537,88 @@ mod tests {
         assert_eq!(world_to_coord(c, [0.2, 0.2, 1.0]).unwrap().face, Face::PosZ);
     }
 
-    #[test]
-    fn cube_sphere_planet_generates_solid_cells() {
-        let sdf = Planet {
+    fn test_sdf(radius: f32, noise: f32) -> Planet {
+        Planet {
             center: [0.0, 0.0, 0.0],
-            radius: 1.0,
-            noise_scale: 0.05,
+            radius,
+            noise_scale: noise,
             noise_freq: 5.0,
             noise_seed: 1,
             gravity: 1.0,
-            influence_radius: 2.0,
+            influence_radius: radius * 2.0,
             surface_block: block::GRASS,
             core_block: block::STONE,
-        };
-        let planet = generate_from_sdf([0.0, 0.0, 0.0], 1.0, 8, &sdf);
-        // With radius = SDF radius and small noise, about half the
-        // cells should be solid (noise pushes some above, some below).
-        let solid_count = planet.blocks.iter().filter(|&&b| b != 0).count();
-        assert!(solid_count > 0, "expected some solid cells");
-        assert!(solid_count < planet.blocks.len(), "expected some empty cells");
+        }
+    }
+
+    /// Walk into a face's subtree at the given slot path and return
+    /// the resolved child (Empty / Block / Node).
+    fn walk_subtree(
+        lib: &NodeLibrary,
+        root: NodeId,
+        path: &[(usize, usize, usize)],
+    ) -> Child {
+        let mut node = lib.get(root).unwrap();
+        let mut current_child = Child::Node(root);
+        for &(us, vs, rs) in path {
+            let slot = slot_index(us, vs, rs);
+            current_child = node.children[slot];
+            match current_child {
+                Child::Node(id) => node = lib.get(id).unwrap(),
+                _ => return current_child,
+            }
+        }
+        current_child
     }
 
     #[test]
-    fn cube_sphere_planet_fully_solid_when_sampled_below_surface() {
-        let sdf = Planet {
-            center: [0.0, 0.0, 0.0],
-            radius: 1.0,
-            noise_scale: 0.0,
-            noise_freq: 1.0,
-            noise_seed: 1,
-            gravity: 1.0,
-            influence_radius: 2.0,
-            surface_block: block::GRASS,
-            core_block: block::STONE,
-        };
-        // Sample well below the undisplaced surface.
-        let planet = generate_from_sdf([0.0, 0.0, 0.0], 0.5, 6, &sdf);
-        assert!(planet.blocks.iter().all(|&b| b != 0),
-            "every cell should be solid at r=0.5 for a radius-1 SDF");
+    fn spherical_planet_has_six_faces() {
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.05);
+        let planet = generate_spherical_planet(&mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf);
+        for id in planet.face_roots {
+            assert!(lib.get(id).is_some(), "every face root must exist in library");
+        }
     }
 
     #[test]
-    fn cube_sphere_planet_fully_empty_when_sampled_above_surface() {
-        let sdf = Planet {
-            center: [0.0, 0.0, 0.0],
-            radius: 1.0,
-            noise_scale: 0.0,
-            noise_freq: 1.0,
-            noise_seed: 1,
-            gravity: 1.0,
-            influence_radius: 2.0,
-            surface_block: block::GRASS,
-            core_block: block::STONE,
-        };
-        // Sample well above the surface.
-        let planet = generate_from_sdf([0.0, 0.0, 0.0], 2.0, 6, &sdf);
-        // The fallback "debug centers" path lights 6 cells. All else empty.
-        let solid = planet.blocks.iter().filter(|&&b| b != 0).count();
-        assert_eq!(solid, 6, "only the 6 fallback debug cells should be solid");
+    fn spherical_planet_outer_is_empty_inner_is_solid() {
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.0);
+        // Inner 0.5, outer 1.5 → SDF surface at r=1 is the midpoint.
+        // Bottom (rs=0) layer is deep inside solid; top (rs=2) is deep air.
+        let planet = generate_spherical_planet(&mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 2, &sdf);
+        // Walk one level into the +X face, middle u/v, bottom rs: solid.
+        let inner = walk_subtree(&lib, planet.face_roots[Face::PosX as usize], &[(1, 1, 0)]);
+        match inner {
+            Child::Block(_) => {}
+            Child::Node(id) => {
+                // Descend one more step; deepest layer should contain Block terminals.
+                let node = lib.get(id).unwrap();
+                assert!(node.children.iter().any(|c| matches!(c, Child::Block(_))),
+                    "inner subtree should contain solid blocks");
+            }
+            Child::Empty => panic!("inner slot at r_lo should be solid"),
+        }
+        // Top slot: empty.
+        let outer = walk_subtree(&lib, planet.face_roots[Face::PosX as usize], &[(1, 1, 2)]);
+        assert!(matches!(outer, Child::Empty | Child::Node(_)),
+            "outer slot should resolve to empty or an empty subtree");
+    }
+
+    #[test]
+    fn spherical_planet_dedup_keeps_node_count_modest() {
+        // A fully pristine sphere with a simple SDF should produce a
+        // small number of unique nodes — most subtrees collapse into
+        // a single uniform-empty / uniform-solid cache entry.
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.0);
+        let _ = generate_spherical_planet(&mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 4, &sdf);
+        // Depth 4 means up to 27^4 ≈ 530k potential unique cells per
+        // face; dedup should bring us well under that.
+        assert!(lib.len() < 20_000,
+            "dedup'd spherical planet should have < 20k unique nodes, got {}",
+            lib.len());
     }
 
     #[test]

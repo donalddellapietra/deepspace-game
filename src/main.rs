@@ -140,7 +140,7 @@ struct App {
     fps_smooth: f64,
     /// Cubed-sphere demo planet — owns per-cell block storage and
     /// the shell geometry used for cursor raycasts and editing.
-    cs_planet: Option<deepspace_game::world::cubesphere::CubeSpherePlanet>,
+    cs_planet: Option<deepspace_game::world::cubesphere::SphericalPlanet>,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -250,44 +250,12 @@ impl App {
         );
     }
 
-    /// If the cubed-sphere planet is hit closer than any tree block,
-    /// write `new_block` (0 = erase) to the targeted cell and
-    /// re-upload the per-cell buffer. Returns `true` if the edit
-    /// happened so the caller can skip its tree-edit fallback.
-    fn edit_cs_if_closer(&mut self, ray_dir: [f32; 3], new_block: u8) -> bool {
-        // First: read-only probe of the cubed-sphere planet.
-        let Some((cs_t, face, i, j)) = self.cs_planet.as_ref()
-            .and_then(|p| p.hit_cell(self.camera.pos, ray_dir)) else {
-            return false;
-        };
-        // Compare against the nearest tree block along this ray.
-        let ed = self.edit_depth();
-        let tree_hit = edit::cpu_raycast(
-            &self.world.library, self.world.root,
-            self.camera.pos, ray_dir, ed,
-        );
-        let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
-        if cs_t >= tree_t { return false; }
-
-        // Safe to take a mutable borrow now: we're no longer reading
-        // anything else on `self` that conflicts.
-        let Some(planet) = self.cs_planet.as_mut() else { return false };
-        planet.set(face, i, j, new_block);
-        if let Some(renderer) = &mut self.renderer {
-            renderer.set_cubed_sphere_blocks(&planet.blocks);
-        }
-        true
-    }
-
+    /// Break: clear the first solid cubed-sphere cell along the
     fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
 
-        // If the cubed-sphere planet's shell is closer than any
-        // tree block, clear the targeted cell there. Break never
-        // cares whether the cell was empty — we always write 0.
-        if self.edit_cs_if_closer(ray_dir, 0) {
-            return;
-        }
+        // TODO Phase C: spherical-tree break/place. For now, fall
+        // straight through to the Cartesian tree editor.
 
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
@@ -335,14 +303,7 @@ impl App {
     fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
 
-        // Cubed-sphere first: place the active hotbar block into the
-        // targeted cell if the sphere is closer. Mesh slots fall
-        // through to the tree path.
-        if let Some(block_type) = self.ui.active_block_type() {
-            if self.edit_cs_if_closer(ray_dir, block_type) {
-                return;
-            }
-        }
+        // TODO Phase C: spherical-tree break/place.
 
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
@@ -379,15 +340,30 @@ impl App {
     /// Re-pack and upload the tree with LOD culling based on camera position.
     /// Called every frame so distant terrain stays flattened as the camera moves.
     fn upload_tree_lod(&mut self) {
-        let (tree_data, root_index) = gpu::pack_tree_lod(
+        // Pack the Cartesian space tree and (if present) the 6 face
+        // subtrees of the spherical demo planet into one GPU buffer
+        // in a single pass, so the shader can look up any of them by
+        // buffer index.
+        let mut roots: Vec<u64> = vec![self.world.root];
+        if let Some(p) = self.cs_planet.as_ref() {
+            roots.extend_from_slice(&p.face_roots);
+        }
+        let (tree_data, root_indices) = gpu::pack_tree_lod_multi(
             &self.world.library,
-            self.world.root,
+            &roots,
             self.camera.pos,
-            1440.0, // approximate screen height
-            1.2,    // fov
+            1440.0,
+            1.2,
         );
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, root_index);
+            renderer.update_tree(&tree_data, root_indices[0]);
+            if self.cs_planet.is_some() {
+                let face_roots: [u32; 6] = [
+                    root_indices[1], root_indices[2], root_indices[3],
+                    root_indices[4], root_indices[5], root_indices[6],
+                ];
+                renderer.set_face_roots(face_roots);
+            }
         }
     }
 
@@ -404,27 +380,12 @@ impl App {
             &self.world.library, self.world.root,
             self.camera.pos, ray_dir, self.edit_depth(),
         );
-        let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
-
-        // Cubed-sphere cursor: hit the demo planet's outer shell and
-        // report (face, i, j) for whichever cell the ray enters.
-        let cs_hit = self.cs_planet.as_ref()
-            .and_then(|p| p.hit_cell(self.camera.pos, ray_dir));
-        let cs_t = cs_hit.map(|(t, ..)| t).unwrap_or(f32::INFINITY);
-
+        // Phase A: the spherical planet's cells live in a subtree we
+        // haven't wired to CPU-raycast yet. Highlight the Cartesian
+        // tree hit only — cs highlighting returns in Phase C.
         if let Some(renderer) = &mut self.renderer {
-            if cs_t < tree_t {
-                // Cubed-sphere cell is in front — draw its bulged
-                // outline, hide the tree AABB highlight.
-                renderer.set_highlight(None);
-                if let Some((_, face, i, j)) = cs_hit {
-                    renderer.set_cubed_sphere_highlight(Some((face as u32, i, j)));
-                }
-            } else {
-                // Tree block (or nothing) is in front — normal AABB.
-                renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
-                renderer.set_cubed_sphere_highlight(None);
-            }
+            renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
+            renderer.set_cubed_sphere_highlight(None);
         }
     }
 
@@ -570,36 +531,40 @@ impl ApplicationHandler for App {
 
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
         let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
-        // Demo cubed-sphere planet: 16 cells per face edge (96²
-        // surface cells total), SDF-driven terrain. The SDF's own
-        // radius is a touch smaller than the shell radius so noise
-        // produces both inland terrain and empty "seas" where the
-        // noise-displaced surface dips below the shell radius.
+        // Cubed-sphere demo planet. Backed by 6 face-subtrees in the
+        // shared NodeLibrary — recursive, 27-per-level dedup'd — not
+        // a flat buffer. Shader in this phase shows the planet as a
+        // placeholder sphere; Phase B walks the subtrees for real
+        // voxel content.
         {
-            use deepspace_game::world::cubesphere::generate_from_sdf;
+            use deepspace_game::world::cubesphere::generate_spherical_planet;
             use deepspace_game::world::palette::block;
             use deepspace_game::world::sdf::Planet as SdfPlanet;
             let cs_center = [1.5, 2.3, 1.5];
-            let cs_radius = 0.35;
-            let cells_per_face = 16u32;
-            // SDF radius is slightly LARGER than the shell radius so
-            // most cells read as "below surface" (= solid). Noise
-            // then carves the occasional valley / sea where the
-            // displaced surface dips below the shell.
+            let outer_r = 0.52;
+            let inner_r = 0.12;
             let sdf = SdfPlanet {
                 center: cs_center,
-                radius: cs_radius + 0.03,
-                noise_scale: 0.05,
-                noise_freq: 14.0,
+                radius: 0.32,
+                noise_scale: 0.015,
+                noise_freq: 8.0,
                 noise_seed: 2024,
                 gravity: 9.8,
-                influence_radius: cs_radius * 2.5,
+                influence_radius: outer_r * 2.0,
                 surface_block: block::GRASS,
                 core_block: block::STONE,
             };
-            let planet = generate_from_sdf(cs_center, cs_radius, cells_per_face, &sdf);
-            renderer.set_cubed_sphere_planet(cs_center, cs_radius, cells_per_face);
-            renderer.set_cubed_sphere_blocks(&planet.blocks);
+            // Depth 4 → 27^4 ≈ 530k potential cells per face at
+            // finest level, aggressively dedup'd by the library.
+            let planet = generate_spherical_planet(
+                &mut self.world.library,
+                cs_center, inner_r, outer_r, 4, &sdf,
+            );
+            eprintln!(
+                "Spherical planet generated: 6 face subtrees, library now {} nodes",
+                self.world.library.len(),
+            );
+            renderer.set_cubed_sphere_planet(cs_center, inner_r, outer_r, planet.depth);
             self.cs_planet = Some(planet);
         }
         self.renderer = Some(renderer);
