@@ -5,6 +5,12 @@ use crate::input::Keys;
 use crate::world::cubesphere::SphericalPlanet;
 use crate::world::sdf;
 
+/// Gravity is currently disabled — the sphere's frame-transition
+/// handlers and collision aren't in place yet, so gravity pulled the
+/// player through the surface in well under a frame at deep zoom.
+/// Re-enable once those are wired up.
+const GRAVITY_ENABLED: bool = false;
+
 /// Step the camera forward one frame.
 ///
 /// Radial gravity toward the cubed-sphere planet's center with
@@ -62,11 +68,17 @@ pub fn update(
     };
     camera.update_up(target_up, dt);
 
-    // Integrate gravity into persistent velocity, then damp so we
-    // have a terminal fall speed rather than unbounded divergence.
-    *velocity = sdf::add(*velocity, sdf::scale(gravity_acc, dt));
-    let damp = (-2.5_f32 * dt).exp();
-    *velocity = sdf::scale(*velocity, damp);
+    if GRAVITY_ENABLED {
+        // Integrate gravity into persistent velocity, damped to a
+        // terminal fall speed.
+        *velocity = sdf::add(*velocity, sdf::scale(gravity_acc, dt));
+        let damp = (-2.5_f32 * dt).exp();
+        *velocity = sdf::scale(*velocity, damp);
+    } else {
+        // No gravity, no persistent momentum — releasing WASD stops.
+        *velocity = [0.0; 3];
+    }
+    let _ = gravity_acc;
 
     // Flight thrust: WASD in the camera's horizontal plane,
     // Space/Shift along the camera's local up. Applied as direct
