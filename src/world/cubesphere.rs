@@ -27,8 +27,8 @@
 
 use super::sdf::{self, Planet, Vec3};
 use super::tree::{
-    empty_children, slot_index, uniform_children, Child, NodeId, NodeLibrary,
-    UNIFORM_EMPTY,
+    empty_children, slot_index, uniform_children, Child, NodeId, NodeKind,
+    NodeLibrary, UNIFORM_EMPTY,
 };
 
 /// One of the six cube faces.
@@ -270,18 +270,28 @@ pub fn generate_spherical_planet(
             -1.0, 1.0, -1.0, 1.0, inner_r, outer_r,
             depth, sdf_budget, sdf,
         );
-        face_roots[face as usize] = match child {
+        let plain_id: NodeId = match child {
             Child::Node(id) => id,
             Child::Empty => build_uniform_empty(lib, depth.max(1)),
             Child::Block(b) => {
-                // build_uniform_subtree returns Child::Block at depth 0.
                 match lib.build_uniform_subtree(b, depth.max(1)) {
                     Child::Node(id) => id,
                     _ => lib.insert(uniform_children(Child::Block(b))),
                 }
             }
         };
-        lib.ref_inc(face_roots[face as usize]);
+        // Retag the face root with `NodeKind::CubedSphereFace` so
+        // callers that dispatch on `NodeKind` know they're entering
+        // `(u, v, r)` axis semantics. The underlying children are
+        // identical — dedup still shares deeper subtrees across
+        // faces, the top-level node is unique per face.
+        let kids = lib.get(plain_id).map(|n| n.children).expect("face root must exist");
+        let face_root = lib.insert_with_kind(
+            kids,
+            NodeKind::CubedSphereFace { face: face as u8 },
+        );
+        face_roots[face as usize] = face_root;
+        lib.ref_inc(face_root);
     }
     SphericalPlanet { center, inner_r, outer_r, face_roots, depth }
 }

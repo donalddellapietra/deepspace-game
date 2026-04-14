@@ -5,7 +5,7 @@ use crate::input::Keys;
 use crate::world::coords::ROOT_EXTENT;
 use crate::world::cubesphere::SphericalPlanet;
 use crate::world::sdf;
-use crate::world::tree::NodeLibrary;
+use crate::world::tree::{NodeId, NodeLibrary};
 
 /// Step the camera forward one frame.
 ///
@@ -31,6 +31,7 @@ pub fn update(
     cell_size: f32,
     cs_planet: Option<&SphericalPlanet>,
     library: &NodeLibrary,
+    world_root: NodeId,
     dt: f32,
 ) {
     let world_up = [0.0f32, 1.0, 0.0];
@@ -116,7 +117,7 @@ pub fn update(
         step_world[1] / cell_world,
         step_world[2] / cell_world,
     ];
-    let _transition = camera.position.add_local(delta_local, library);
+    let _transition = camera.position.add_local(delta_local, library, world_root);
     // Sphere entry/exit/seam transitions will be dispatched here once
     // the cubed-sphere body is represented as a tree node (step 8).
 }

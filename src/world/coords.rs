@@ -14,7 +14,7 @@
 //! `docs/experimental-architecture/anchor-refactor-decisions.md`.
 
 use super::cubesphere::Face;
-use super::tree::{slot_coords, slot_index, MAX_DEPTH, NodeLibrary};
+use super::tree::{slot_coords, slot_index, Child, MAX_DEPTH, NodeKind, NodeLibrary, NodeId};
 
 // ---------------------------------------------------------------- Path
 
@@ -228,6 +228,46 @@ fn rescale_up_remainder(v: f32, slot: usize) -> f32 {
     r.clamp(0.0, below_one())
 }
 
+// ----------------------------------------- NodeKind resolution for Path
+
+/// Walk a path from `root` and return the `NodeKind` of each node
+/// visited (including the root), up to (but not past) the path's
+/// depth. The returned vec has `path.depth() + 1` entries when the
+/// walk succeeds; fewer if the path overshoots the instantiated
+/// portion of the tree.
+pub fn resolve_kinds_along(
+    lib: &NodeLibrary,
+    root: NodeId,
+    path: &Path,
+) -> Vec<NodeKind> {
+    let mut out = Vec::with_capacity(path.depth() as usize + 1);
+    let Some(root_node) = lib.get(root) else { return out; };
+    out.push(root_node.kind);
+    let mut id = root;
+    for &slot in path.slots() {
+        let Some(node) = lib.get(id) else { break; };
+        match node.children[slot as usize] {
+            Child::Node(child_id) => {
+                let Some(child) = lib.get(child_id) else { break; };
+                out.push(child.kind);
+                id = child_id;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// The kind of the deepest instantiated node reachable from `root`
+/// along `path`. Returns `Cartesian` as a default when the walk
+/// terminates at a `Block` or `Empty` child (those have no kind).
+pub fn deepest_kind(lib: &NodeLibrary, root: NodeId, path: &Path) -> NodeKind {
+    resolve_kinds_along(lib, root, path)
+        .last()
+        .copied()
+        .unwrap_or(NodeKind::Cartesian)
+}
+
 // ------------------------------------------------------------ Transition
 
 /// Semantic event emitted when the anchor crosses a coordinate-meaning
@@ -276,29 +316,70 @@ impl WorldPos {
         }
     }
 
-    /// Add `delta` to `offset`. If any axis overflows `[0, 1)`, steps
-    /// to the neighboring cell at the current depth (bubbling up the
-    /// path if needed). Returns a `Transition` describing any
-    /// coordinate-meaning boundary that was crossed.
+    /// Add `delta` to `offset` and cross cell boundaries as needed.
+    /// Dispatches on the anchor's deepest `NodeKind` (looked up from
+    /// `root` via `lib`). Returns a `Transition` describing any
+    /// coordinate-meaning boundary that was crossed during the step.
     ///
-    /// In the current (Cartesian-only) implementation, this always
-    /// returns `Transition::None`. Sphere-aware dispatch lands in a
-    /// later step once `NodeKind` is wired through the tree.
-    pub fn add_local(&mut self, delta: [f32; 3], _lib: &NodeLibrary) -> Transition {
+    /// Cartesian and CubedSphereBody dispatch to the pure Cartesian
+    /// neighbor step. CubedSphereFace also does a Cartesian step in
+    /// the `(u, v, r)` local frame — the face subtree IS a 27-ary
+    /// base-3 tree, just with axes relabelled — but emits a
+    /// `FaceExit` transition when the step bubbles out of the face
+    /// root, and `CubeSeam` stubs for future u/v seam handling.
+    pub fn add_local(
+        &mut self,
+        delta: [f32; 3],
+        lib: &NodeLibrary,
+        root: NodeId,
+    ) -> Transition {
+        let kind_before = deepest_kind(lib, root, &self.anchor);
+        let depth_before = self.anchor.depth();
         for i in 0..3 {
             self.offset[i] += delta[i];
         }
         for axis in 0..3usize {
-            // Forward overflow.
             while self.offset[axis] >= 1.0 {
                 if !self.anchor.step_neighbor_cartesian(axis as u8, 1) {
-                    // Root clamp.
                     self.offset[axis] = below_one();
                     break;
                 }
                 self.offset[axis] -= 1.0;
             }
-            // Backward overflow.
+            while self.offset[axis] < 0.0 {
+                if !self.anchor.step_neighbor_cartesian(axis as u8, -1) {
+                    self.offset[axis] = 0.0;
+                    break;
+                }
+                self.offset[axis] += 1.0;
+            }
+        }
+        if self.anchor.depth() == depth_before && matches!(kind_before, NodeKind::Cartesian | NodeKind::CubedSphereBody { .. }) {
+            return Transition::None;
+        }
+        classify_transition(lib, root, kind_before, &self.anchor)
+    }
+
+    /// Backwards-compatible shim: equivalent to calling `add_local`
+    /// with `root = 0`, which skips kind dispatch. Only use this from
+    /// tests where the library root isn't meaningful.
+    #[cfg(test)]
+    pub fn add_local_cartesian(
+        &mut self,
+        delta: [f32; 3],
+        _lib: &NodeLibrary,
+    ) -> Transition {
+        for i in 0..3 {
+            self.offset[i] += delta[i];
+        }
+        for axis in 0..3usize {
+            while self.offset[axis] >= 1.0 {
+                if !self.anchor.step_neighbor_cartesian(axis as u8, 1) {
+                    self.offset[axis] = below_one();
+                    break;
+                }
+                self.offset[axis] -= 1.0;
+            }
             while self.offset[axis] < 0.0 {
                 if !self.anchor.step_neighbor_cartesian(axis as u8, -1) {
                     self.offset[axis] = 0.0;
@@ -308,6 +389,35 @@ impl WorldPos {
             }
         }
         Transition::None
+    }
+
+    /// Zoom in one level, resolving the kind of the child we're
+    /// descending into so transitions can fire. When kind info isn't
+    /// available (no library root handy — e.g., tests), use the pure
+    /// `zoom_in` below.
+    pub fn zoom_in_in(
+        &mut self,
+        lib: &NodeLibrary,
+        root: NodeId,
+    ) -> Transition {
+        let kind_before = deepest_kind(lib, root, &self.anchor);
+        let t = self.zoom_in();
+        if !matches!(t, Transition::None) { return t; }
+        let kind_after = deepest_kind(lib, root, &self.anchor);
+        classify_zoom_transition(kind_before, kind_after)
+    }
+
+    /// Zoom out one level, resolving kinds for transition dispatch.
+    pub fn zoom_out_in(
+        &mut self,
+        lib: &NodeLibrary,
+        root: NodeId,
+    ) -> Transition {
+        let kind_before = deepest_kind(lib, root, &self.anchor);
+        let t = self.zoom_out();
+        if !matches!(t, Transition::None) { return t; }
+        let kind_after = deepest_kind(lib, root, &self.anchor);
+        classify_zoom_transition(kind_before, kind_after)
     }
 
     /// Descend the anchor into the child slot currently containing the
@@ -345,6 +455,74 @@ impl WorldPos {
         while self.anchor.depth() > target_depth {
             self.zoom_out();
         }
+    }
+}
+
+// ----------------------------------------------- transition classifiers
+
+/// Classify a `zoom_in`/`zoom_out` that crossed a kind boundary.
+/// Same kind before and after = no transition. Sphere body ↔ face
+/// transitions fire when the body's face-center slot is entered or
+/// left. Face ↔ face transitions (cube seams) do not arise from
+/// zoom alone — they need a lateral step.
+fn classify_zoom_transition(
+    before: NodeKind,
+    after: NodeKind,
+) -> Transition {
+    match (before, after) {
+        (a, b) if a == b => Transition::None,
+        (NodeKind::Cartesian, NodeKind::CubedSphereBody { .. })
+            => Transition::SphereEntry { body_path: Path::root() },
+        (NodeKind::CubedSphereBody { .. }, NodeKind::Cartesian)
+            => Transition::SphereExit { body_path: Path::root() },
+        (NodeKind::CubedSphereBody { .. }, NodeKind::CubedSphereFace { face })
+            => Transition::FaceEntry { face: face_from_index(face) },
+        (NodeKind::CubedSphereFace { face }, NodeKind::CubedSphereBody { .. })
+            => Transition::FaceExit { face: face_from_index(face) },
+        _ => Transition::None,
+    }
+}
+
+/// Classify a post-`add_local` state where the anchor either changed
+/// depth or crossed a kind boundary. The pre-move kind is known; the
+/// post-move kind is re-resolved. Currently emits sphere-entry/exit
+/// and stubs a `CubeSeam` placeholder when moving laterally across
+/// the face roots; the 24-case face adjacency table is scaffolded
+/// (see `face_transitions::seam_neighbor`) but not wired into
+/// `step_neighbor` until the body-as-tree-node work in step 9.
+fn classify_transition(
+    lib: &NodeLibrary,
+    root: NodeId,
+    kind_before: NodeKind,
+    anchor_after: &Path,
+) -> Transition {
+    let kind_after = deepest_kind(lib, root, anchor_after);
+    match (kind_before, kind_after) {
+        (a, b) if a == b => Transition::None,
+        (NodeKind::Cartesian, NodeKind::CubedSphereBody { .. })
+            => Transition::SphereEntry { body_path: *anchor_after },
+        (NodeKind::CubedSphereBody { .. }, NodeKind::Cartesian)
+            => Transition::SphereExit { body_path: *anchor_after },
+        (NodeKind::CubedSphereBody { .. }, NodeKind::CubedSphereFace { face })
+            => Transition::FaceEntry { face: face_from_index(face) },
+        (NodeKind::CubedSphereFace { face }, NodeKind::CubedSphereBody { .. })
+            => Transition::FaceExit { face: face_from_index(face) },
+        (NodeKind::CubedSphereFace { face: from }, NodeKind::CubedSphereFace { face: to })
+            => Transition::CubeSeam {
+                from_face: face_from_index(from),
+                to_face: face_from_index(to),
+            },
+        _ => Transition::None,
+    }
+}
+
+#[inline]
+fn face_from_index(i: u8) -> Face {
+    match i {
+        0 => Face::PosX, 1 => Face::NegX,
+        2 => Face::PosY, 3 => Face::NegY,
+        4 => Face::PosZ, 5 => Face::NegZ,
+        _ => Face::PosX,
     }
 }
 
@@ -487,7 +665,7 @@ mod tests {
         let lib = NodeLibrary::default();
         let mut p = WorldPos::root();
         p.anchor.push(slot_index(1, 1, 1) as u8);
-        let t = p.add_local([0.1, 0.2, 0.3], &lib);
+        let t = p.add_local_cartesian([0.1, 0.2, 0.3], &lib);
         assert_eq!(t, Transition::None);
         assert_eq!(p.anchor.depth(), 1);
         assert!((p.offset[0] - 0.1).abs() < 1e-6);
@@ -502,7 +680,7 @@ mod tests {
         // Anchor at slot (1,1,1); offset near +x edge.
         p.anchor.push(slot_index(1, 1, 1) as u8);
         p.offset = [0.9, 0.5, 0.5];
-        p.add_local([0.2, 0.0, 0.0], &lib);
+        p.add_local_cartesian([0.2, 0.0, 0.0], &lib);
         // Stepped +x one cell: slot now (2,1,1), offset.x wraps to 0.1.
         assert_eq!(p.anchor.last_slot(), Some(slot_index(2, 1, 1) as u8));
         assert!((p.offset[0] - 0.1).abs() < 1e-5);
@@ -516,7 +694,7 @@ mod tests {
         p.anchor.push(slot_index(0, 0, 0) as u8);
         p.anchor.push(slot_index(2, 1, 1) as u8);
         p.offset = [0.9, 0.5, 0.5];
-        p.add_local([0.2, 0.0, 0.0], &lib);
+        p.add_local_cartesian([0.2, 0.0, 0.0], &lib);
         assert_eq!(p.anchor.depth(), 2);
         assert_eq!(p.anchor.slots()[0], slot_index(1, 0, 0) as u8);
         assert_eq!(p.anchor.slots()[1], slot_index(0, 1, 1) as u8);
@@ -528,9 +706,49 @@ mod tests {
         let mut p = WorldPos::root();
         p.anchor.push(slot_index(1, 1, 1) as u8);
         p.offset = [0.05, 0.5, 0.5];
-        p.add_local([-0.1, 0.0, 0.0], &lib);
+        p.add_local_cartesian([-0.1, 0.0, 0.0], &lib);
         assert_eq!(p.anchor.last_slot(), Some(slot_index(0, 1, 1) as u8));
         assert!((p.offset[0] - 0.95).abs() < 1e-4);
+    }
+
+    #[test]
+    fn classify_zoom_transition_body_to_face() {
+        let before = NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 };
+        let after = NodeKind::CubedSphereFace { face: Face::PosZ as u8 };
+        match classify_zoom_transition(before, after) {
+            Transition::FaceEntry { face } => assert_eq!(face, Face::PosZ),
+            other => panic!("expected FaceEntry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_zoom_transition_face_to_body() {
+        let before = NodeKind::CubedSphereFace { face: Face::NegY as u8 };
+        let after = NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 };
+        match classify_zoom_transition(before, after) {
+            Transition::FaceExit { face } => assert_eq!(face, Face::NegY),
+            other => panic!("expected FaceExit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_local_kind_aware_stays_cartesian() {
+        // When root is Cartesian and the path stays Cartesian,
+        // add_local must still behave identically to the pure
+        // Cartesian variant.
+        use super::super::tree::{empty_children, Child};
+        let mut lib = NodeLibrary::default();
+        let child = lib.insert(empty_children());
+        let mut root_children = empty_children();
+        root_children[slot_index(1, 1, 1)] = Child::Node(child);
+        let root = lib.insert(root_children);
+
+        let mut p = WorldPos::root();
+        p.anchor.push(slot_index(1, 1, 1) as u8);
+        p.offset = [0.9, 0.5, 0.5];
+        let t = p.add_local([0.2, 0.0, 0.0], &lib, root);
+        assert_eq!(t, Transition::None);
+        assert_eq!(p.anchor.last_slot(), Some(slot_index(2, 1, 1) as u8));
     }
 
     #[test]
