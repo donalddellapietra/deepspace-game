@@ -10,7 +10,6 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use deepspace_game::game_state::{GameUiState, HotbarItem, SavedMeshes};
 use deepspace_game::renderer::Renderer;
-use deepspace_game::world::collision::{self, PlayerPhysics};
 use deepspace_game::world::edit;
 use deepspace_game::world::sdf;
 use deepspace_game::world::gpu::{self, GpuCamera};
@@ -50,14 +49,18 @@ impl Camera {
 
     /// (forward, right, up) in world space, built from smoothed_up +
     /// yaw + pitch. Returned basis is orthonormal — `up` is
-    /// perpendicular to `forward`, not `smoothed_up` itself (which
-    /// would produce fisheye distortion when pitched).
+    /// perpendicular to `forward`.
+    ///
+    /// Yaw convention: positive yaw = turn LEFT (counterclockwise
+    /// around up). This matches the original world-Y camera so
+    /// mouse-look feels consistent on a planet.
     fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
         let ref_up = self.smoothed_up;
         let (t_right, t_fwd) = deepspace_game::world::collision::tangent_basis(ref_up);
         let (sy, cy) = self.yaw.sin_cos();
-        let horiz_fwd = sdf::add(sdf::scale(t_fwd, cy), sdf::scale(t_right, sy));
-        let horiz_right = sdf::sub(sdf::scale(t_right, cy), sdf::scale(t_fwd, sy));
+        // Positive yaw rotates counterclockwise around `ref_up`.
+        let horiz_fwd = sdf::sub(sdf::scale(t_fwd, cy), sdf::scale(t_right, sy));
+        let horiz_right = sdf::add(sdf::scale(t_right, cy), sdf::scale(t_fwd, sy));
         let (sp, cp) = self.pitch.sin_cos();
         let fwd = sdf::normalize(sdf::add(
             sdf::scale(horiz_fwd, cp),
@@ -135,7 +138,6 @@ struct App {
     debug_overlay_visible: bool,
     /// Exponentially smoothed FPS for the debug overlay.
     fps_smooth: f64,
-    physics: PlayerPhysics,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -189,7 +191,6 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
-            physics: PlayerPhysics::default(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -201,11 +202,11 @@ impl App {
         let td = self.tree_depth as i32;
         let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
 
-        // Resolve the local gravity frame for this frame. When the
-        // player is inside a planet's influence, gravity + collision
-        // are active and up tracks the planet's radial. Otherwise we
-        // are in space: free flight, no gravity, no tree collision.
-        let on_planet = self.world.dominant_planet(self.camera.pos).is_some();
+        // Orient the camera to the local gravity frame. Near a planet
+        // the camera's "up" tracks the planet's radial so the horizon
+        // feels right; far from any planet the up vector smoothly
+        // relaxes back to world +Y. This is purely visual — no
+        // physics or collision is applied.
         let target_up = if let Some(p) = self.world.dominant_planet(self.camera.pos) {
             p.up_at(self.camera.pos)
         } else {
@@ -213,72 +214,21 @@ impl App {
         };
         self.camera.update_up(target_up, dt);
 
-        // Handle jump edge.
-        if self.keys.space && on_planet && self.physics.on_ground {
-            let g_mag = self.world.dominant_planet(self.camera.pos)
-                .map(|p| sdf::length(p.gravity_at(self.camera.pos)))
-                .unwrap_or(9.8);
-            self.physics.jump(self.camera.smoothed_up, g_mag);
-        }
-
-        if on_planet {
-            // On-planet: WASD in tangent plane, gravity + collision.
-            let mut mv = [0.0f32, 0.0f32];
-            if self.keys.w { mv[1] += 1.0; }
-            if self.keys.s { mv[1] -= 1.0; }
-            if self.keys.d { mv[0] += 1.0; }
-            if self.keys.a { mv[0] -= 1.0; }
-            // Rotate input by yaw so W maps to camera's horizontal
-            // forward. This must match the rotation in Camera::basis().
-            let (sy, cy) = self.camera.yaw.sin_cos();
-            let tangent_x = mv[0] * cy + mv[1] * sy;
-            let tangent_f = mv[1] * cy - mv[0] * sy;
-            let len = (tangent_x * tangent_x + tangent_f * tangent_f).sqrt();
-            let tangent_in = if len > 1e-4 {
-                [tangent_x / len, tangent_f / len]
-            } else {
-                [0.0, 0.0]
-            };
-            // Collision walks the FULL tree depth so near-surface
-            // mixed subtrees resolve to their actual air/solid
-            // terminal — otherwise a shallow max_depth treats any
-            // Node child as solid and blocks all movement.
-            let coll_depth = self.tree_depth;
-            // Walk speed scales with planet radius so traversal feels
-            // the same on big and small planets.
-            let walk = self.world.dominant_planet(self.camera.pos)
-                .map(|p| p.radius * 0.35)
-                .unwrap_or(0.1);
-            // Collision cell size is at the finest level of the tree,
-            // matching `coll_depth` — not the renderer's zoom.
-            let coll_cs = 1.0 / 3.0f32.powi(coll_depth as i32);
-            collision::move_and_collide(
-                &mut self.camera.pos,
-                &mut self.physics,
-                &self.world,
-                tangent_in,
-                walk,
-                dt,
-                coll_cs,
-                coll_depth,
-            );
-        } else {
-            // Free-flight in space: no gravity, no collision.
-            let speed = 5.0 * cell_size;
-            let (fwd, right, up) = self.camera.basis();
-            let mut d = [0.0f32; 3];
-            if self.keys.w { d = sdf::add(d, fwd); }
-            if self.keys.s { d = sdf::sub(d, fwd); }
-            if self.keys.d { d = sdf::add(d, right); }
-            if self.keys.a { d = sdf::sub(d, right); }
-            if self.keys.space { d = sdf::add(d, up); }
-            if self.keys.shift { d = sdf::sub(d, up); }
-            let l = sdf::length(d);
-            if l > 1e-4 {
-                let s = speed * dt / l;
-                self.camera.pos = sdf::add(self.camera.pos, sdf::scale(d, s));
-            }
-            self.physics.velocity = [0.0, 0.0, 0.0];
+        // Creative/flycam movement: WASD along camera forward/right,
+        // Space/Shift along camera up. No collision, no gravity force.
+        let speed = 5.0 * cell_size;
+        let (fwd, right, up) = self.camera.basis();
+        let mut d = [0.0f32; 3];
+        if self.keys.w { d = sdf::add(d, fwd); }
+        if self.keys.s { d = sdf::sub(d, fwd); }
+        if self.keys.d { d = sdf::add(d, right); }
+        if self.keys.a { d = sdf::sub(d, right); }
+        if self.keys.space { d = sdf::add(d, up); }
+        if self.keys.shift { d = sdf::sub(d, up); }
+        let l = sdf::length(d);
+        if l > 1e-4 {
+            let s = speed * dt / l;
+            self.camera.pos = sdf::add(self.camera.pos, sdf::scale(d, s));
         }
 
         if let Some(renderer) = &self.renderer {
