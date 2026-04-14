@@ -134,7 +134,16 @@ pub fn pack_tree(
     // Pack into flat buffer.
     let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
     for &nid in &ordered {
-        let node = library.get(nid).expect("node in ordered list must exist");
+        let Some(node) = library.get(nid) else {
+            // Shouldn't happen on a consistent library — a node was
+            // enqueued via `library.get(...)` succeeding but is now
+            // missing. Emit empty children so packing stays in lock-
+            // step with `ordered` (one node slot per entry).
+            for _ in 0..CHILDREN_PER_NODE {
+                data.push(GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 });
+            }
+            continue;
+        };
         for child in &node.children {
             data.push(match child {
                 Child::Empty => GpuChild {
@@ -301,7 +310,16 @@ pub fn pack_tree_lod(
     // Pack into flat buffer, applying overrides.
     let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
     for (oi, &nid) in ordered.iter().enumerate() {
-        let node = library.get(nid).expect("node in ordered list must exist");
+        let Some(node) = library.get(nid) else {
+            // Shouldn't happen on a consistent library — a node was
+            // enqueued via `library.get(...)` succeeding but is now
+            // missing. Emit empty children so packing stays in lock-
+            // step with `ordered` (one node slot per entry).
+            for _ in 0..CHILDREN_PER_NODE {
+                data.push(GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 });
+            }
+            continue;
+        };
         for (slot, child) in node.children.iter().enumerate() {
             if let Some(gpu) = overrides[oi][slot] {
                 data.push(gpu);
@@ -472,7 +490,16 @@ pub fn pack_tree_lod_multi_with_frame(
 
     let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
     for (oi, &nid) in ordered.iter().enumerate() {
-        let node = library.get(nid).expect("node in ordered list must exist");
+        let Some(node) = library.get(nid) else {
+            // Shouldn't happen on a consistent library — a node was
+            // enqueued via `library.get(...)` succeeding but is now
+            // missing. Emit empty children so packing stays in lock-
+            // step with `ordered` (one node slot per entry).
+            for _ in 0..CHILDREN_PER_NODE {
+                data.push(GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 });
+            }
+            continue;
+        };
         for (slot, child) in node.children.iter().enumerate() {
             if let Some(gpu) = overrides[oi][slot] {
                 data.push(gpu);

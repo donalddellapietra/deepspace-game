@@ -242,17 +242,41 @@ impl App {
         (origin, cell_size, node_id)
     }
 
+    /// Walk `body_anchor` from `world.root` and confirm a
+    /// `CubedSphereBody` still lives at the end. Updates
+    /// `cs_planet.body_node` to match. Returns the body's current
+    /// `NodeId`, or `None` if the anchor no longer leads to a body
+    /// (e.g., a Cartesian edit overwrote it).
+    fn refresh_body_node(&mut self) -> Option<crate::world::tree::NodeId> {
+        use crate::world::tree::{Child, NodeKind};
+        let Some(planet) = self.cs_planet.as_mut() else { return None; };
+        let mut id = self.world.root;
+        for &slot in self.body_anchor.slots() {
+            let node = self.world.library.get(id)?;
+            match node.children[slot as usize] {
+                Child::Node(child) => id = child,
+                _ => return None,
+            }
+        }
+        let node = self.world.library.get(id)?;
+        if !matches!(node.kind, NodeKind::CubedSphereBody { .. }) {
+            return None;
+        }
+        planet.body_node = id;
+        Some(id)
+    }
+
     /// Re-pack and upload the tree with LOD culling based on camera position.
     /// Called every frame so distant terrain stays flattened as the camera moves.
     pub(super) fn upload_tree_lod(&mut self) {
         let (rf_origin, rf_cell, rf_node) = self.render_frame();
 
-        // Pin the body as a secondary pack root so it's always in
-        // the packed buffer — even when the camera has descended
-        // into a face subtree and the render frame no longer
-        // contains it. The shader reads the body's buffer index
-        // from a uniform, not from a tree walk.
-        let body_node = self.cs_planet.as_ref().map(|p| p.body_node);
+        // Re-resolve the body from `body_anchor` each frame. The
+        // walk catches cases where a Cartesian edit has replaced the
+        // body cell — stale ids can't outlive an edit and sneak into
+        // the packer. `self.cs_planet.body_node` is refreshed to
+        // match the current tree state.
+        let body_node = self.refresh_body_node();
         let mut roots: Vec<u64> = vec![rf_node];
         if let Some(b) = body_node { roots.push(b); }
 

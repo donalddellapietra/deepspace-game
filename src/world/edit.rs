@@ -226,8 +226,24 @@ pub fn cpu_raycast(
     None
 }
 
+/// True iff the hit path passes through any non-Cartesian node
+/// (a `CubedSphereBody` or `CubedSphereFace`). Cartesian edits must
+/// refuse such hits — rewriting a body/face node would strip its
+/// `NodeKind` and orphan the planet handle.
+fn hit_passes_through_non_cartesian(world: &WorldState, hit: &HitInfo) -> bool {
+    for &(nid, _) in &hit.path {
+        if let Some(node) = world.library.get(nid) {
+            if !node.kind.is_cartesian() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Break (remove) the block at the hit location.
 pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
+    if hit_passes_through_non_cartesian(world, hit) { return false; }
     propagate_edit(world, hit, Child::Empty)
 }
 
@@ -235,6 +251,7 @@ pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
 /// For blocks, use `Child::Block(idx)`. For saved meshes, use
 /// `Child::Node(saved_node_id)`.
 pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bool {
+    if hit_passes_through_non_cartesian(world, hit) { return false; }
     let (_parent_id, slot) = *hit.path.last().unwrap();
     let (x, y, z) = slot_coords(slot);
     let (dx, dy, dz): (i32, i32, i32) = match hit.face {
@@ -286,6 +303,7 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
 /// that matches the depth of siblings at the placement site, so the
 /// placed block has full recursive structure like the terrain around it.
 pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
+    if hit_passes_through_non_cartesian(world, hit) { return false; }
     // Figure out how deep siblings are at the placement site.
     // The hit path has `path.len()` levels from root. The sibling
     // nodes at that depth have some subtree depth. We match it.
