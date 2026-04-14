@@ -133,6 +133,44 @@ impl Position {
         true
     }
 
+    /// Reconstruct XYZ coordinates in the frame of an ancestor node.
+    ///
+    /// `ancestor_depth` is how many of the leading slots in `path` to
+    /// treat as "above the render root" (i.e. skipped). The ancestor
+    /// cell is mapped to the `[0, 3)³` box; the returned coordinates
+    /// are the point's position inside that box.
+    ///
+    /// This is the path-native replacement for [`Self::world_pos`]:
+    /// callers that previously read absolute XYZ in the tree root's
+    /// frame now pass `ancestor_depth = 0` and get identical numbers,
+    /// but the call site is explicit about which frame the XYZ lives
+    /// in. Step 5 introduces it as the render-root accessor; step 6
+    /// migrates raycast/edit call sites to use it.
+    ///
+    /// Panics if `ancestor_depth > self.depth`.
+    pub fn pos_in_ancestor_frame(&self, ancestor_depth: u8) -> [f32; 3] {
+        let d = self.depth as usize;
+        let a = ancestor_depth as usize;
+        assert!(a <= d, "ancestor_depth {} > depth {}", a, d);
+        let mut out = [0.0f32; 3];
+        for k in (a + 1)..=d {
+            let slot = self.path[k - 1] as usize;
+            let (sx, sy, sz) = slot_coords(slot);
+            // Level k sits at depth k, ancestor at depth a; its offset
+            // within the ancestor's [0, 3)³ frame is scaled by
+            // 3^(1 - (k - a)).
+            let scale = 3.0f32.powi(1 - (k as i32 - a as i32));
+            out[0] += sx as f32 * scale;
+            out[1] += sy as f32 * scale;
+            out[2] += sz as f32 * scale;
+        }
+        let leaf_scale = 3.0f32.powi(1 - (d as i32 - a as i32));
+        for axis in 0..3 {
+            out[axis] += self.offset[axis] * leaf_scale;
+        }
+        out
+    }
+
     /// Reconstruct absolute XYZ coordinates in the root cell's frame.
     ///
     /// The root cell has extent `[0, 3)` on each axis (its 27 children
@@ -140,21 +178,7 @@ impl Position {
     /// XYZ-expecting code paths can keep working during the migration;
     /// step 6 deletes all callers.
     pub fn world_pos(&self) -> [f32; 3] {
-        let d = self.depth as usize;
-        let mut out = [0.0f32; 3];
-        for k in 1..=d {
-            let slot = self.path[k - 1] as usize;
-            let (sx, sy, sz) = slot_coords(slot);
-            let scale = 3.0f32.powi(1 - k as i32);
-            out[0] += sx as f32 * scale;
-            out[1] += sy as f32 * scale;
-            out[2] += sz as f32 * scale;
-        }
-        let leaf_scale = 3.0f32.powi(1 - d as i32);
-        for axis in 0..3 {
-            out[axis] += self.offset[axis] * leaf_scale;
-        }
-        out
+        self.pos_in_ancestor_frame(0)
     }
 
     /// Inverse shim: construct a Position at the given tree depth
@@ -532,6 +556,40 @@ mod tests {
         // Expected: 1 + 2/3 + 0.5 * 1/3 = 1.8333
         let w = p.world_pos();
         assert!((w[0] - (1.0 + 2.0 / 3.0 + 0.5 / 3.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pos_in_ancestor_frame_matches_world_pos_at_depth_zero() {
+        let p = pos_at(&[5, 10, 15], [0.3, 0.4, 0.5]);
+        assert_eq!(p.pos_in_ancestor_frame(0), p.world_pos());
+    }
+
+    #[test]
+    fn pos_in_ancestor_frame_rescales_for_deeper_ancestor() {
+        // If the ancestor is the camera's parent (depth d - 1),
+        // the point's position in the ancestor's [0, 3)³ frame is
+        // slot_coord(last) + offset (each axis).
+        let slot = slot_index(2, 0, 1) as u8;
+        let p = pos_at(&[slot], [0.25, 0.5, 0.75]);
+        let frame_pos = p.pos_in_ancestor_frame(0);
+        // Ancestor at depth 1 (i.e. the node itself): offset in its
+        // own [0, 3)³ frame is offset * 3 (since the node's children
+        // each cover 1.0 — the node as a whole covers 3.0).
+        let self_frame = p.pos_in_ancestor_frame(1);
+        // offset * 3 = [0.75, 1.5, 2.25]
+        for axis in 0..3 {
+            assert!((self_frame[axis] - p.offset[axis] * 3.0).abs() < 1e-5);
+        }
+        // And the root-frame position is at slot_origin + child_frame/3.
+        let (sx, sy, sz) = slot_coords(slot as usize);
+        let expected = [
+            sx as f32 + self_frame[0] / 3.0,
+            sy as f32 + self_frame[1] / 3.0,
+            sz as f32 + self_frame[2] / 3.0,
+        ];
+        for axis in 0..3 {
+            assert!((frame_pos[axis] - expected[axis]).abs() < 1e-5);
+        }
     }
 
     #[test]

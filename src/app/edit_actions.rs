@@ -21,6 +21,33 @@ impl App {
         (td - self.zoom_level).max(1) as u32
     }
 
+    /// Node id of the "render root" — the ancestor whose subtree the
+    /// GPU walks each frame. Today this is always the tree root. Step
+    /// 5 introduces the concept so the plumbing can later pick a
+    /// smaller ancestor for precision (see §3a of
+    /// refactor-decisions.md).
+    pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
+        self.world.root
+    }
+
+    /// Depth (number of leading slots in the camera's path) that sits
+    /// above the render root. `0` means the render root is the tree
+    /// root itself. Paired with
+    /// [`Position::pos_in_ancestor_frame`](crate::world::position::Position::pos_in_ancestor_frame).
+    pub(super) fn render_root_depth(&self) -> u8 {
+        0
+    }
+
+    /// Camera position expressed in the render root's local `[0, 3)³`
+    /// frame. This is the path-native replacement for
+    /// `camera.world_pos()` at upload sites; they produce the same
+    /// numbers today because `render_root_depth() == 0`.
+    pub(super) fn camera_pos_in_render_frame(&self) -> [f32; 3] {
+        self.camera
+            .position
+            .pos_in_ancestor_frame(self.render_root_depth())
+    }
+
     /// GPU visual depth: edit_depth + 3 (see 27×27×27 detail).
     pub(super) fn visual_depth(&self) -> u32 {
         (self.edit_depth() + 3).min(16)
@@ -175,14 +202,14 @@ impl App {
         // subtrees of the spherical demo planet into one GPU buffer
         // in a single pass, so the shader can look up any of them by
         // buffer index.
-        let mut roots: Vec<u64> = vec![self.world.root];
+        let mut roots: Vec<u64> = vec![self.render_root_id()];
         if let Some(p) = self.cs_planet.as_ref() {
             roots.extend_from_slice(&p.face_roots);
         }
         let (tree_data, root_indices) = gpu::pack_tree_lod_multi(
             &self.world.library,
             &roots,
-            self.camera.world_pos(),
+            self.camera_pos_in_render_frame(),
             1440.0,
             1.2,
         );
