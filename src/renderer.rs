@@ -31,6 +31,12 @@ pub struct GpuUniforms {
     /// Layout: [PosX, NegX, PosY, NegY, PosZ, NegZ, unused, unused].
     /// Face `f` is looked up at `cs_face_roots[f]`.
     pub cs_face_roots: [u32; 8],
+    /// Render frame: the packed tree's root node represents this
+    /// sub-cube of world space. `xyz` = world-space min corner; `w` =
+    /// world-space width of ONE root-cell (so the root node spans
+    /// `[xyz, xyz + 3·w)`). When the render frame is the world root,
+    /// this is `(0, 0, 0, 1)`.
+    pub render_frame: [f32; 4],
 }
 
 pub struct Renderer {
@@ -56,6 +62,7 @@ pub struct Renderer {
     cs_params: [f32; 4],
     cs_highlight: [f32; 4],
     cs_face_roots: [u32; 8],
+    render_frame: [f32; 4],
 }
 
 impl Renderer {
@@ -161,6 +168,7 @@ impl Renderer {
             cs_params: [0.0; 4],
             cs_highlight: [0.0; 4],
             cs_face_roots: [0; 8],
+            render_frame: [0.0, 0.0, 0.0, 1.0],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -293,7 +301,18 @@ impl Renderer {
             cs_params: [0.0; 4],
             cs_highlight: [0.0; 4],
             cs_face_roots: [0; 8],
+            render_frame: [0.0, 0.0, 0.0, 1.0],
         }
+    }
+
+    /// Declare the world-space footprint of the packed tree's root.
+    /// `origin` is the min corner in world units; `cell_size` is the
+    /// width of one root-cell (the root node spans `[origin, origin +
+    /// 3·cell_size)`). Call this whenever the render frame moves or
+    /// rescales (e.g., camera crosses into a new depth-K ancestor).
+    pub fn set_render_frame(&mut self, origin: [f32; 3], cell_size: f32) {
+        self.render_frame = [origin[0], origin[1], origin[2], cell_size];
+        self.write_uniforms();
     }
 
     /// Provide the 6 face-subtree buffer indices for the spherical
@@ -466,6 +485,7 @@ impl Renderer {
             cs_params: self.cs_params,
             cs_highlight: self.cs_highlight,
             cs_face_roots: self.cs_face_roots,
+            render_frame: self.render_frame,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

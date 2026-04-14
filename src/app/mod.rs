@@ -93,7 +93,7 @@ impl App {
             window: None,
             renderer: None,
             camera: Camera {
-                position: crate::world::coords::world_pos_from_f32(spawn_pos, 0),
+                position: crate::world::coords::world_pos_from_f32(spawn_pos, 4),
                 smoothed_up: [0.0, 1.0, 0.0],
                 yaw: 0.0,
                 pitch: -0.3,

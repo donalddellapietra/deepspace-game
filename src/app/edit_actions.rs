@@ -8,10 +8,19 @@
 
 use crate::editing;
 use crate::game_state::HotbarItem;
+use crate::world::coords::ROOT_EXTENT;
 use crate::world::edit;
 use crate::world::gpu;
+use crate::world::tree::{slot_coords, Child, NodeId};
 
 use super::App;
+
+/// Render-frame ancestor offset: the packed tree's root is the
+/// camera's ancestor at `camera.position.anchor.depth() - K`.
+/// K = 3 → "your cell plus three layers up" as the rendered volume.
+/// At small depths this clamps to the world root, which is unchanged
+/// from the pre-refactor behavior.
+pub(super) const RENDER_FRAME_K: u8 = 3;
 
 impl App {
     /// CPU raycast depth: tree_depth - zoom_level.
@@ -168,26 +177,79 @@ impl App {
         self.upload_tree_lod();
     }
 
+    /// Compute the render frame for the current camera: the
+    /// ancestor Path at `depth - K`, its root `NodeId`, its world-
+    /// space min corner, and the world width of one root-cell.
+    ///
+    /// If the render-frame path resolves to a non-Node child (an
+    /// uninstantiated uniform region the content-addressed tree
+    /// hasn't spelled out at that depth), falls back to the world
+    /// root. The world-generated empty tree is fully instantiated so
+    /// this fallback only fires on partially-built worlds.
+    pub(super) fn render_frame(&self) -> ([f32; 3], f32, NodeId) {
+        let cam = &self.camera.position;
+        let cam_depth = cam.anchor.depth();
+        let rf_depth = cam_depth.saturating_sub(RENDER_FRAME_K);
+        // Walk from world.root down rf_depth slots, tracking world
+        // origin. Root cells are 1.0 wide (span [0, ROOT_EXTENT)).
+        let mut node_id = self.world.root;
+        let mut origin = [0.0f32; 3];
+        let mut cell_size = 1.0f32;
+        for i in 0..rf_depth as usize {
+            let slot = cam.anchor.slots()[i];
+            let Some(node) = self.world.library.get(node_id) else {
+                return (origin, cell_size, self.world.root);
+            };
+            match node.children[slot as usize] {
+                Child::Node(child_id) => {
+                    let (sx, sy, sz) = slot_coords(slot as usize);
+                    origin[0] += sx as f32 * cell_size;
+                    origin[1] += sy as f32 * cell_size;
+                    origin[2] += sz as f32 * cell_size;
+                    cell_size /= 3.0;
+                    node_id = child_id;
+                }
+                _ => {
+                    // Ancestor isn't instantiated; render from world
+                    // root. Shouldn't happen for the generated empty
+                    // tree, which is uniformly subdivided.
+                    return ([0.0; 3], 1.0, self.world.root);
+                }
+            }
+        }
+        // After walking `rf_depth` levels, `cell_size` is the width
+        // of one cell AT that depth = the width of one root-cell of
+        // the render-frame node. `origin` is its world-space min
+        // corner. The render-frame node itself spans
+        // `[origin, origin + 3 * cell_size) = ROOT_EXTENT / 3^rf_depth`.
+        let _ = ROOT_EXTENT; // ROOT_EXTENT is baked into the numbers above.
+        (origin, cell_size, node_id)
+    }
+
     /// Re-pack and upload the tree with LOD culling based on camera position.
     /// Called every frame so distant terrain stays flattened as the camera moves.
     pub(super) fn upload_tree_lod(&mut self) {
-        // Pack the Cartesian space tree and (if present) the 6 face
-        // subtrees of the spherical demo planet into one GPU buffer
-        // in a single pass, so the shader can look up any of them by
-        // buffer index.
-        let mut roots: Vec<u64> = vec![self.world.root];
+        // Pack the render-frame ancestor plus (if present) the 6
+        // face subtrees of the spherical demo planet into one GPU
+        // buffer in a single pass.
+        let (rf_origin, rf_cell, rf_node) = self.render_frame();
+
+        let mut roots: Vec<u64> = vec![rf_node];
         if let Some(p) = self.cs_planet.as_ref() {
             roots.extend_from_slice(&p.face_roots);
         }
-        let (tree_data, root_indices) = gpu::pack_tree_lod_multi(
+        let (tree_data, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
             &roots,
             self.camera.world_pos_f32(),
             1440.0,
             1.2,
+            rf_origin,
+            rf_cell,
         );
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, root_indices[0]);
+            renderer.set_render_frame(rf_origin, rf_cell);
             if self.cs_planet.is_some() {
                 let face_roots: [u32; 6] = [
                     root_indices[1], root_indices[2], root_indices[3],

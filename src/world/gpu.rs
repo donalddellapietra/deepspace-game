@@ -287,6 +287,32 @@ pub fn pack_tree_lod_multi(
     screen_height: f32,
     fov: f32,
 ) -> (Vec<GpuChild>, Vec<u32>) {
+    pack_tree_lod_multi_with_frame(
+        library, roots, camera_pos, screen_height, fov,
+        [0.0, 0.0, 0.0], 1.0,
+    )
+}
+
+/// Variant of `pack_tree_lod_multi` that declares where the first
+/// root sits in world space. `root_origin` is the world-space min
+/// corner; `root_cell_size` is the world width of one root-cell (so
+/// the root node spans `[root_origin, root_origin + 3·root_cell_size)`).
+///
+/// LOD culling uses the actual world-space cell size at each level,
+/// so rendering a sub-root frame correctly treats its cells as larger
+/// (or smaller) than the world root. Secondary roots (i.e., the six
+/// cubed-sphere face subtrees) still use the legacy `[0, 1)` cell
+/// size because their axes don't live in world space — LOD is
+/// disabled for them, as before.
+pub fn pack_tree_lod_multi_with_frame(
+    library: &NodeLibrary,
+    roots: &[NodeId],
+    camera_pos: [f32; 3],
+    screen_height: f32,
+    fov: f32,
+    root_origin: [f32; 3],
+    root_cell_size: f32,
+) -> (Vec<GpuChild>, Vec<u32>) {
     use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
 
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
@@ -310,10 +336,15 @@ pub fn pack_tree_lod_multi(
         visited.insert(root, idx);
         ordered.push(root);
         overrides.push([None; CHILDREN_PER_NODE]);
+        let (origin, cell_size) = if ri == 0 {
+            (root_origin, root_cell_size)
+        } else {
+            ([0.0; 3], 1.0)
+        };
         queue.push(QueueEntry {
             node_id: root,
-            origin: [0.0; 3],
-            cell_size: 1.0,
+            origin,
+            cell_size,
             use_lod: ri == 0,
         });
     }

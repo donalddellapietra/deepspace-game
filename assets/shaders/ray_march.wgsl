@@ -43,6 +43,11 @@ struct Uniforms {
     // two vec4<u32>. Order: PosX, NegX, PosY, NegY, PosZ, NegZ.
     cs_face_roots_a: vec4<u32>,
     cs_face_roots_b: vec4<u32>,
+    // Render frame: the packed tree's root represents this sub-cube
+    // of world space. xyz = world-space min corner, w = width of one
+    // root-cell (root node spans [xyz, xyz + 3*w)). When the render
+    // frame is the world root, this is (0, 0, 0, 1).
+    render_frame: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
@@ -292,43 +297,54 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
-    // Initialize root level.
+    // Initialize root level. The render frame declares where the
+    // packed tree's root lives in world space: `rf_origin` is its
+    // world-space min corner, `rf_cell` is the world width of one
+    // root-cell (root node spans [rf_origin, rf_origin + 3*rf_cell)).
+    let rf_origin = uniforms.render_frame.xyz;
+    let rf_cell = uniforms.render_frame.w;
     s_node_idx[0] = uniforms.root_index;
-    s_node_origin[0] = vec3<f32>(0.0);
-    s_cell_size[0] = 1.0; // root node: each cell is 1.0 wide, node spans [0, 3)
+    s_node_origin[0] = rf_origin;
+    s_cell_size[0] = rf_cell;
 
-    // Intersect ray with root node [0, 3)
-    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    // Intersect ray with the render frame's root box.
+    let root_min = rf_origin;
+    let root_max = rf_origin + vec3<f32>(3.0 * rf_cell);
+    let root_hit = ray_box(ray_origin, inv_dir, root_min, root_max);
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
     }
 
-    let t_start = max(root_hit.t_enter, 0.0) + 0.001;
+    let t_start = max(root_hit.t_enter, 0.0) + 0.001 * rf_cell;
     let entry_pos = ray_origin + ray_dir * t_start;
 
-    // Initial cell in root
+    // Initial cell in root, in root-cell units relative to rf_origin.
+    let rel = (entry_pos - rf_origin) / rf_cell;
     s_cell[0] = vec3<i32>(
-        clamp(i32(floor(entry_pos.x)), 0, 2),
-        clamp(i32(floor(entry_pos.y)), 0, 2),
-        clamp(i32(floor(entry_pos.z)), 0, 2),
+        clamp(i32(floor(rel.x)), 0, 2),
+        clamp(i32(floor(rel.y)), 0, 2),
+        clamp(i32(floor(rel.z)), 0, 2),
     );
 
-    // Initial side_dist for root level
+    // Initial side_dist for root level.
     let cell_f = vec3<f32>(s_cell[0]);
+    let cell_min_x = rf_origin.x + cell_f.x * rf_cell;
+    let cell_min_y = rf_origin.y + cell_f.y * rf_cell;
+    let cell_min_z = rf_origin.z + cell_f.z * rf_cell;
     s_side_dist[0] = vec3<f32>(
         select(
-            (cell_f.x - entry_pos.x) * inv_dir.x,
-            (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x,
+            (cell_min_x - entry_pos.x) * inv_dir.x,
+            (cell_min_x + rf_cell - entry_pos.x) * inv_dir.x,
             ray_dir.x >= 0.0
         ),
         select(
-            (cell_f.y - entry_pos.y) * inv_dir.y,
-            (cell_f.y + 1.0 - entry_pos.y) * inv_dir.y,
+            (cell_min_y - entry_pos.y) * inv_dir.y,
+            (cell_min_y + rf_cell - entry_pos.y) * inv_dir.y,
             ray_dir.y >= 0.0
         ),
         select(
-            (cell_f.z - entry_pos.z) * inv_dir.z,
-            (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z,
+            (cell_min_z - entry_pos.z) * inv_dir.z,
+            (cell_min_z + rf_cell - entry_pos.z) * inv_dir.z,
             ray_dir.z >= 0.0
         ),
     );
