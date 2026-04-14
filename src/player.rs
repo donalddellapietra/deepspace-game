@@ -24,7 +24,7 @@ pub fn update(
 ) {
     let world_up = [0.0f32, 1.0, 0.0];
     let (target_up, gravity_acc) = if let Some(p) = cs_planet {
-        let to_player = sdf::sub(camera.pos, p.center);
+        let to_player = sdf::sub(camera.world_pos_f32(), p.center);
         let r = sdf::length(to_player);
         let surface_r = p.outer_r;
         let influence_r = surface_r * 2.0;
@@ -93,5 +93,6 @@ pub fn update(
         sdf::scale(*velocity, dt),
         sdf::scale(thrust, dt),
     );
-    camera.pos = sdf::add(camera.pos, step);
+    let new_pos = sdf::add(camera.world_pos_f32(), step);
+    camera.set_world_pos_f32(new_pos);
 }

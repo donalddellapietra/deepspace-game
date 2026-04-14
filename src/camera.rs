@@ -1,9 +1,16 @@
 //! Yaw/pitch camera with locally-oriented frame.
 
+use crate::world::coords::{self, WorldPos};
 use crate::world::gpu::GpuCamera;
 use crate::world::sdf;
 
 /// Yaw/pitch camera in a locally-oriented frame.
+///
+/// `position` is an anchor-based `WorldPos` — a `(Path, offset)` pair
+/// that never accumulates f32 error across cells at any zoom depth.
+/// Callers that still need legacy world-space `[f32; 3]` go through
+/// [`Camera::world_pos_f32`] / [`Camera::set_world_pos_f32`] until
+/// their own migration lands.
 ///
 /// `smoothed_up` tracks the local "up" direction (away from the
 /// dominant planet's center, or world +Y in empty space), smoothed
@@ -11,10 +18,29 @@ use crate::world::sdf;
 /// `yaw` rotates around `smoothed_up`; `pitch` tilts the look vector
 /// out of the tangent plane toward `smoothed_up`.
 pub struct Camera {
-    pub pos: [f32; 3],
+    pub position: WorldPos,
     pub smoothed_up: [f32; 3],
     pub yaw: f32,
     pub pitch: f32,
+}
+
+impl Camera {
+    /// Legacy world-space position in the root frame. Equivalent to
+    /// the old `Camera.pos` field; kept as a shim while downstream
+    /// call sites migrate to operate on `position` directly.
+    #[inline]
+    pub fn world_pos_f32(&self) -> [f32; 3] {
+        coords::world_pos_to_f32(&self.position)
+    }
+
+    /// Overwrite `position` so `world_pos_f32()` returns `world`.
+    /// Preserves the current anchor depth; large moves bubble up and
+    /// back down via `world_pos_from_f32`. Out-of-range coordinates
+    /// are clamped.
+    pub fn set_world_pos_f32(&mut self, world: [f32; 3]) {
+        let depth = self.position.anchor.depth();
+        self.position = coords::world_pos_from_f32(world, depth);
+    }
 }
 
 impl Camera {
@@ -62,7 +88,7 @@ impl Camera {
     pub fn gpu_camera(&self, fov: f32) -> GpuCamera {
         let (fwd, r, up) = self.basis();
         GpuCamera {
-            pos: self.pos,
+            pos: self.world_pos_f32(),
             _pad0: 0.0,
             forward: fwd,
             _pad1: 0.0,
