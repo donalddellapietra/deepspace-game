@@ -6,6 +6,7 @@
 //! raycast descends, so the same code breaks a single block at fine
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
+use super::coords::Path;
 use super::state::WorldState;
 use super::tree::*;
 
@@ -15,11 +16,26 @@ pub struct HitInfo {
     /// Path from root to the hit: each entry is (node_id, child_slot).
     /// The last entry's child_slot is the slot that was hit.
     pub path: Vec<(NodeId, usize)>,
+    /// The same descent expressed as an anchor-based `Path`. This is
+    /// the identity the world uses to address the hit cell — callers
+    /// that previously compared XYZ coordinates should compare anchor
+    /// paths instead.
+    pub anchor: Path,
     /// Which face was crossed when the block was hit.
     /// 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
     pub face: u32,
     /// Distance along the ray to the hit point.
     pub t: f32,
+}
+
+/// Build a [`Path`] from a slice of `(NodeId, slot)` pairs produced
+/// by [`cpu_raycast`]. Each slot is in `0..27`.
+fn anchor_from_path(path: &[(NodeId, usize)]) -> Path {
+    let mut p = Path::root();
+    for &(_, slot) in path {
+        p.push(slot as u8);
+    }
+    p
 }
 
 /// Stack frame for iterative DDA traversal.
@@ -133,6 +149,7 @@ pub fn cpu_raycast(
             }
             Child::Block(_) => {
                 return Some(HitInfo {
+                    anchor: anchor_from_path(&path),
                     path: path.clone(),
                     face: normal_face,
                     t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
@@ -148,6 +165,7 @@ pub fn cpu_raycast(
                         continue;
                     }
                     return Some(HitInfo {
+                        anchor: anchor_from_path(&path),
                         path: path.clone(),
                         face: normal_face,
                         t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
@@ -354,7 +372,8 @@ fn place_child_at_point(
             }
             child if is_last && is_placeable(&world.library, child) => {
                 // Target cell is empty (or all-empty subtree) — place directly.
-                let place_hit = HitInfo { path, face: 0, t: 0.0 };
+                let anchor = anchor_from_path(&path);
+                let place_hit = HitInfo { anchor, path, face: 0, t: 0.0 };
                 return propagate_edit(world, &place_hit, new_child);
             }
             child if !is_last && is_placeable(&world.library, child) => {
@@ -374,7 +393,8 @@ fn place_child_at_point(
                     remaining,
                     new_child,
                 );
-                let place_hit = HitInfo { path, face: 0, t: 0.0 };
+                let anchor = anchor_from_path(&path);
+                let place_hit = HitInfo { anchor, path, face: 0, t: 0.0 };
                 return propagate_edit(world, &place_hit, Child::Node(chain_id));
             }
             _ => {
@@ -864,8 +884,10 @@ mod tests {
         let mut world = WorldState::test_world();
         // Create a fake hit at the world boundary (cell y=2 at depth 1).
         // Placing above would go outside [0, 3).
+        let path = vec![(world.root, slot_index(1, 2, 1))];
         let hit = HitInfo {
-            path: vec![(world.root, slot_index(1, 2, 1))],
+            anchor: anchor_from_path(&path),
+            path,
             face: 2, // +Y
             t: 1.0,
         };
