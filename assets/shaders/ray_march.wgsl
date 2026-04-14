@@ -34,10 +34,22 @@ struct Uniforms {
     highlight_max: vec4<f32>,
 }
 
+struct Environment {
+    sun_dir: vec3<f32>,
+    time: f32,
+    sun_color: vec3<f32>,
+    sun_intensity: f32,
+    fog_density: f32,
+    fog_start: f32,
+    water_block_type: u32,
+    _pad: u32,
+}
+
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
 @group(0) @binding(1) var<uniform> camera: Camera;
 @group(0) @binding(2) var<uniform> palette: Palette;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
+@group(0) @binding(4) var<uniform> env: Environment;
 
 // -------------- Tree access helpers --------------
 
@@ -108,12 +120,14 @@ struct HitResult {
     color: vec3<f32>,
     normal: vec3<f32>,
     t: f32,
+    block_type: u32,
 }
 
 fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+    result.block_type = 0u;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -250,7 +264,8 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
             result.hit = true;
             result.t = max(cell_box_h.t_enter, 0.0);
-            result.color = palette.colors[child_block_type(packed)].rgb;
+            result.block_type = child_block_type(packed);
+            result.color = palette.colors[result.block_type].rgb;
             result.normal = normal;
             return result;
         } else if tag == 2u {
@@ -294,6 +309,7 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
+                    result.block_type = bt;
                     result.color = palette.colors[bt].rgb;
                     result.normal = normal;
                     return result;
@@ -370,6 +386,218 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
+// ─── Atmospheric scattering ─────────────────────────────────────────
+//
+// Simplified Rayleigh + Mie scattering adapted from Kappa/RRe36.
+// Models light scattering through an atmosphere sphere around a planet.
+
+const PI: f32 = 3.14159265;
+const PLANET_RADIUS: f32 = 6371e3;
+const ATMOS_RADIUS: f32 = 6471e3;
+const RAYLEIGH_SCALE_HEIGHT: f32 = 8500.0;
+const MIE_SCALE_HEIGHT: f32 = 1200.0;
+const RAYLEIGH_COEFF: vec3<f32> = vec3<f32>(5.8e-6, 13.5e-6, 33.1e-6);
+const MIE_COEFF: f32 = 21e-6;
+const MIE_G: f32 = 0.76;
+
+// Ray-sphere intersection: returns (near, far) distances.
+fn ray_sphere(origin: vec3<f32>, dir: vec3<f32>, radius: f32) -> vec2<f32> {
+    let b = dot(origin, dir);
+    let c = dot(origin, origin) - radius * radius;
+    let det = b * b - c;
+    if det < 0.0 { return vec2<f32>(-1.0); }
+    let d = sqrt(det);
+    return vec2<f32>(-b - d, -b + d);
+}
+
+fn rayleigh_phase(cos_theta: f32) -> f32 {
+    return 3.0 / (16.0 * PI) * (1.0 + cos_theta * cos_theta);
+}
+
+fn mie_phase(cos_theta: f32, g: f32) -> f32 {
+    let gg = g * g;
+    let num = (1.0 - gg);
+    let denom = 4.0 * PI * pow(1.0 + gg - 2.0 * g * cos_theta, 1.5);
+    return num / max(denom, 1e-8);
+}
+
+fn atmosphere(ray_dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
+    let cam_pos = vec3<f32>(0.0, PLANET_RADIUS + 100.0, 0.0);
+
+    let atmos_dist = ray_sphere(cam_pos, ray_dir, ATMOS_RADIUS);
+    if atmos_dist.y < 0.0 { return vec3<f32>(0.0); }
+
+    let planet_dist = ray_sphere(cam_pos, ray_dir, PLANET_RADIUS);
+    let ray_end = select(atmos_dist.y, max(planet_dist.x, 0.0), planet_dist.x > 0.0);
+    let ray_start = max(atmos_dist.x, 0.0);
+
+    let steps = 8u;
+    let step_size = (ray_end - ray_start) / f32(steps);
+
+    var rayleigh_sum = vec3<f32>(0.0);
+    var mie_sum = vec3<f32>(0.0);
+    var optical_depth_r = 0.0;
+    var optical_depth_m = 0.0;
+
+    let cos_theta = dot(ray_dir, sun_dir);
+    let phase_r = rayleigh_phase(cos_theta);
+    let phase_m = mie_phase(cos_theta, MIE_G);
+
+    for (var i = 0u; i < steps; i++) {
+        let t = ray_start + (f32(i) + 0.5) * step_size;
+        let pos = cam_pos + ray_dir * t;
+        let altitude = length(pos) - PLANET_RADIUS;
+
+        let density_r = exp(-altitude / RAYLEIGH_SCALE_HEIGHT) * step_size;
+        let density_m = exp(-altitude / MIE_SCALE_HEIGHT) * step_size;
+
+        optical_depth_r += density_r;
+        optical_depth_m += density_m;
+
+        // Light optical depth to sun (simplified: 4 steps)
+        let sun_dist = ray_sphere(pos, sun_dir, ATMOS_RADIUS);
+        let sun_step = sun_dist.y / 4.0;
+        var sun_od_r = 0.0;
+        var sun_od_m = 0.0;
+        for (var j = 0u; j < 4u; j++) {
+            let sp = pos + sun_dir * (f32(j) + 0.5) * sun_step;
+            let sa = length(sp) - PLANET_RADIUS;
+            sun_od_r += exp(-sa / RAYLEIGH_SCALE_HEIGHT) * sun_step;
+            sun_od_m += exp(-sa / MIE_SCALE_HEIGHT) * sun_step;
+        }
+
+        let attenuation = exp(
+            -(RAYLEIGH_COEFF * (optical_depth_r + sun_od_r)
+              + MIE_COEFF * (optical_depth_m + sun_od_m))
+        );
+
+        rayleigh_sum += density_r * attenuation;
+        mie_sum += density_m * attenuation;
+    }
+
+    let sun_intensity = env.sun_intensity * 22.0;
+    return sun_intensity * (rayleigh_sum * RAYLEIGH_COEFF * phase_r
+                          + mie_sum * MIE_COEFF * phase_m);
+}
+
+// ─── PBR lighting ───────────────────────────────────────────────────
+
+// Schlick Fresnel approximation.
+fn fresnel_schlick(cos_theta: f32, f0: f32) -> f32 {
+    return f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+}
+
+// GGX/Trowbridge-Reitz normal distribution.
+fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d + 1e-8);
+}
+
+// Smith's geometry function (Schlick-GGX).
+fn geometry_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
+    let r = (roughness + 1.0);
+    let k = (r * r) / 8.0;
+    let g1 = n_dot_v / (n_dot_v * (1.0 - k) + k);
+    let g2 = n_dot_l / (n_dot_l * (1.0 - k) + k);
+    return g1 * g2;
+}
+
+fn pbr_lighting(
+    albedo: vec3<f32>,
+    normal: vec3<f32>,
+    view_dir: vec3<f32>,
+    sun_dir: vec3<f32>,
+    roughness: f32,
+    metallic: f32,
+    f0_base: f32,
+) -> vec3<f32> {
+    let half_dir = normalize(view_dir + sun_dir);
+    let n_dot_l = max(dot(normal, sun_dir), 0.0);
+    let n_dot_v = max(dot(normal, view_dir), 0.001);
+    let n_dot_h = max(dot(normal, half_dir), 0.0);
+    let v_dot_h = max(dot(view_dir, half_dir), 0.0);
+
+    // Fresnel: metallic surfaces use albedo as F0
+    let f0 = mix(vec3<f32>(f0_base), albedo, metallic);
+    let fresnel = f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
+
+    // Specular BRDF
+    let d = distribution_ggx(n_dot_h, roughness);
+    let g = geometry_smith(n_dot_v, n_dot_l, roughness);
+    let specular = (d * g * fresnel) / max(4.0 * n_dot_v * n_dot_l, 0.001);
+
+    // Diffuse (energy-conserving Lambert)
+    let k_d = (1.0 - fresnel) * (1.0 - metallic);
+    let diffuse = k_d * albedo / PI;
+
+    let sun_color = env.sun_color * env.sun_intensity;
+    let direct = (diffuse + specular) * sun_color * n_dot_l;
+
+    // Ambient: sky-colored fill light from above, ground bounce from below
+    let sky_ambient = vec3<f32>(0.4, 0.5, 0.7) * 0.15;
+    let ground_ambient = vec3<f32>(0.3, 0.25, 0.2) * 0.05;
+    let up_factor = normal.y * 0.5 + 0.5;
+    let ambient = albedo * mix(ground_ambient, sky_ambient, up_factor);
+
+    return direct + ambient;
+}
+
+// ─── Water ──────────────────────────────────────────────────────────
+
+// Gerstner wave: physically-based ocean wave.
+fn gerstner(pos: vec2<f32>, t: f32, amp: f32, wlen: f32, dir: vec2<f32>, steep: f32) -> f32 {
+    let k = 6.283185 / wlen;
+    let w = sqrt(9.81 * k);
+    let phase = w * t - k * dot(dir, pos);
+    return pow(sin(phase) * 0.5 + 0.5, steep) * amp;
+}
+
+fn water_height(pos: vec3<f32>) -> f32 {
+    let p = pos.xz + pos.y / PI;
+    let t = env.time * 0.76;
+
+    var wave = 0.0;
+    var amp = 0.06;
+    var steep = 0.51;
+    var wlen = 2.8;
+    var dir = normalize(vec2<f32>(0.4, 0.8));
+
+    // Rotation per octave
+    let ca = cos(2.6);
+    let sa = sin(2.6);
+
+    for (var i = 0u; i < 4u; i++) {
+        wave -= gerstner(p, t, amp, wlen, dir, steep);
+        amp *= 0.55;
+        wlen *= 0.63;
+        steep = mix(steep, sqrt(steep), sqrt(clamp(abs(wave), 0.0, 1.0)));
+        dir = vec2<f32>(dir.x * ca - dir.y * sa, dir.x * sa + dir.y * ca);
+    }
+    return wave;
+}
+
+fn water_normal(pos: vec3<f32>) -> vec3<f32> {
+    let e = 0.02;
+    let h0 = water_height(pos);
+    let hx = water_height(pos + vec3<f32>(e, 0.0, 0.0));
+    let hz = water_height(pos + vec3<f32>(0.0, 0.0, e));
+    return normalize(vec3<f32>(-(hx - h0) / e, 1.0, -(hz - h0) / e));
+}
+
+// ─── Fog ────────────────────────────────────────────────────────────
+
+fn apply_fog(color: vec3<f32>, dist: f32, ray_dir: vec3<f32>, sky_color: vec3<f32>) -> vec3<f32> {
+    let fog_amount = 1.0 - exp(-max(dist - env.fog_start, 0.0) * env.fog_density);
+    // Sun-tinted fog: brighter when looking toward the sun
+    let sun_factor = max(dot(ray_dir, env.sun_dir), 0.0);
+    let fog_color = mix(sky_color, env.sun_color * 1.2, pow(sun_factor, 8.0) * 0.3);
+    return mix(color, fog_color, clamp(fog_amount, 0.0, 1.0));
+}
+
+// ─── Fragment shader ────────────────────────────────────────────────
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let aspect = uniforms.screen_width / uniforms.screen_height;
@@ -383,24 +611,78 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ray_dir = normalize(
         camera.forward + camera.right * ndc.x + camera.up * ndc.y
     );
+    let view_dir = -ray_dir;
 
     let result = march(camera.pos, ray_dir);
+    let sun_dir = normalize(env.sun_dir);
+
+    // Atmospheric sky for miss rays and fog blending
+    let sky_color = atmosphere(ray_dir, sun_dir);
+    // Add sun disc
+    let sun_dot = dot(ray_dir, sun_dir);
+    let sun_disc = smoothstep(0.9997, 0.9999, sun_dot) * env.sun_intensity * 50.0;
+    let sky_with_sun = sky_color + env.sun_color * sun_disc;
 
     var color: vec3<f32>;
+
     if result.hit {
-        let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-        let diffuse = max(dot(result.normal, sun_dir), 0.0);
-        let ambient = 0.3;
-        let lit = result.color * (ambient + diffuse * 0.7);
-        color = pow(lit, vec3<f32>(1.0 / 2.2));
+        let hit_pos = camera.pos + ray_dir * result.t;
+
+        // Check if this is a water block
+        let is_water = result.block_type == env.water_block_type && env.water_block_type > 0u;
+
+        if is_water {
+            // Animated water normal
+            let w_normal = water_normal(hit_pos);
+            let blended_n = normalize(mix(result.normal, w_normal, 0.7));
+
+            // Fresnel reflection
+            let n_dot_v = max(dot(blended_n, view_dir), 0.0);
+            let fresnel = fresnel_schlick(n_dot_v, 0.02);
+
+            // Reflected sky color
+            let reflect_dir = reflect(ray_dir, blended_n);
+            let reflected = atmosphere(reflect_dir, sun_dir);
+
+            // Water absorption: deeper = bluer/darker
+            let water_color = vec3<f32>(0.05, 0.15, 0.3);
+            let depth_factor = 1.0 / max(n_dot_v, 0.1);
+            let absorbed = water_color * exp(-vec3<f32>(0.4, 0.1, 0.05) * depth_factor);
+
+            // Specular highlight on water surface
+            let spec = pbr_lighting(
+                vec3<f32>(0.0), blended_n, view_dir, sun_dir,
+                0.05, 0.0, 0.02,
+            );
+
+            // Blend reflection and refraction
+            color = mix(absorbed, reflected, fresnel) + spec;
+
+            // Subsurface scattering through wave crests
+            let sss = pow(clamp(-blended_n.y * 0.5 + 0.5, 0.0, 1.0), 6.0) * 0.15;
+            color += vec3<f32>(0.1, 0.2, 0.15) * sss;
+        } else {
+            // Standard PBR for solid blocks
+            let roughness = 0.85;  // voxels are rough
+            let metallic = 0.0;
+            color = pbr_lighting(
+                result.color, result.normal, view_dir, sun_dir,
+                roughness, metallic, 0.04,
+            );
+
+            // Simple ambient occlusion from face normals:
+            // corners and edges between faces are darker.
+            let ao = 0.7 + 0.3 * abs(dot(result.normal, normalize(vec3<f32>(1.0))));
+            color *= ao;
+        }
+
+        // Distance fog
+        color = apply_fog(color, result.t, ray_dir, sky_color);
     } else {
-        let sky_t = ray_dir.y * 0.5 + 0.5;
-        color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
+        color = sky_with_sun;
     }
 
-    // Block highlight outline: Minecraft-style wireframe cube.
-    // Draws all 12 edges with screen-space constant-pixel width.
-    // Occluded by geometry via result.t comparison.
+    // Block highlight outline (same as before).
     if uniforms.highlight_active != 0u {
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;
@@ -416,23 +698,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
             let t = max(hb.t_enter, 0.0);
-
-            // Only draw if the outline is in front of (or at) geometry.
             if t <= result.t + h_size.x * 0.01 {
                 let hit_pos = camera.pos + ray_dir * t;
                 let from_min = hit_pos - h_min;
                 let from_max = h_max - hit_pos;
-
-                // Screen-space edge width: ~1.5 pixels regardless of distance.
                 let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
                 let ew = max(pixel_world * 1.5, h_size.x * 0.003);
-
-                // An edge exists where at least 2 of the 3 axes are near a face boundary.
                 let near_x = from_min.x < ew || from_max.x < ew;
                 let near_y = from_min.y < ew || from_max.y < ew;
                 let near_z = from_min.z < ew || from_max.z < ew;
                 let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
-
                 if edge_count >= 2u {
                     color = mix(color, vec3<f32>(0.1, 0.1, 0.1), 0.7);
                 }
@@ -440,7 +715,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Crosshair: thin cross at screen center.
+    // Crosshair
     let pixel = vec2<f32>(in.uv.x * uniforms.screen_width, in.uv.y * uniforms.screen_height);
     let center = vec2<f32>(uniforms.screen_width * 0.5, uniforms.screen_height * 0.5);
     let d = abs(pixel - center);
@@ -450,9 +725,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_crosshair = (d.x < cross_thickness && d.y >= gap && d.y < cross_size)
                     || (d.y < cross_thickness && d.x >= gap && d.x < cross_size);
     if is_crosshair {
-        // Invert color for visibility against any background.
-        color = vec3<f32>(1.0) - color;
+        color = vec3<f32>(1.0) - clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
-    return vec4<f32>(color, 1.0);
+    // Output HDR linear color (tonemapping happens in postprocess pass)
+    return vec4<f32>(max(color, vec3<f32>(0.0)), 1.0);
 }

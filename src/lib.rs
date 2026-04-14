@@ -1,6 +1,7 @@
 pub mod world;
 pub mod import;
 pub mod renderer;
+pub mod postprocess;
 pub mod bridge;
 pub mod game_state;
 #[cfg(not(target_arch = "wasm32"))]

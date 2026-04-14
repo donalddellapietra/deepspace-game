@@ -9,7 +9,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use deepspace_game::game_state::{GameUiState, HotbarItem, SavedMeshes};
-use deepspace_game::renderer::Renderer;
+use deepspace_game::renderer::{GpuEnvironment, Renderer};
 // Collision module exists but is disabled pending proper layer-aware probing.
 // use deepspace_game::world::collision::{self, PlayerPhysics};
 use deepspace_game::world::edit;
@@ -110,6 +110,8 @@ struct App {
     ui: GameUiState,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
+    start_time: std::time::Instant,
+    elapsed: f32,
     #[cfg(not(target_arch = "wasm32"))]
     frames_waited: u32,
 }
@@ -143,6 +145,8 @@ impl App {
             saved_meshes: SavedMeshes::default(),
             save_mode: false,
             ui: GameUiState::new(),
+            start_time: std::time::Instant::now(),
+            elapsed: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -508,9 +512,28 @@ impl ApplicationHandler for App {
                 let now = std::time::Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
+                self.elapsed = (now - self.start_time).as_secs_f32();
                 self.update(dt);
                 self.upload_tree_lod(); // LOD repack every frame
                 self.update_highlight();
+
+                // Update environment (sun rotation, time for water animation)
+                if let Some(renderer) = &self.renderer {
+                    // Slow day/night cycle: sun orbits once per 10 minutes
+                    let sun_angle = self.elapsed * 0.0105;
+                    let sun_y = sun_angle.cos();
+                    let sun_xz = sun_angle.sin();
+                    renderer.update_environment(&GpuEnvironment {
+                        sun_dir: [sun_xz * 0.7, sun_y.abs().max(0.1), sun_xz * 0.3],
+                        time: self.elapsed,
+                        sun_color: [1.0, 0.95, 0.85],
+                        sun_intensity: sun_y.max(0.05) * 1.5,
+                        fog_density: 0.015,
+                        fog_start: 15.0,
+                        water_block_type: 0, // TODO: set when water blocks exist
+                        _pad: 0,
+                    });
+                }
 
                 if let Some(renderer) = &self.renderer {
                     match renderer.render() {

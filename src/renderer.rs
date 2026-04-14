@@ -1,11 +1,12 @@
-//! wgpu renderer: full-screen ray march shader.
+//! wgpu renderer: full-screen ray march shader + post-processing.
 //!
-//! One render pipeline, one storage buffer (tree nodes), three uniform
-//! buffers (camera, palette, uniforms). The fragment shader ray-marches
-//! the base-3 tree with an iterative stack-based DDA.
+//! The ray march pass renders to an HDR intermediate texture. The
+//! post-process pass reads that texture and composites bloom, ACES
+//! tonemapping, and color grading to the swapchain.
 
 use wgpu::util::DeviceExt;
 
+use crate::postprocess::PostProcessor;
 use crate::world::gpu::{GpuCamera, GpuChild, GpuPalette};
 
 #[repr(C)]
@@ -22,6 +23,35 @@ pub struct GpuUniforms {
     pub highlight_max: [f32; 4], // xyz, w unused
 }
 
+/// Environment data for atmospheric sky, lighting, water, and fog.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuEnvironment {
+    pub sun_dir: [f32; 3],
+    pub time: f32,
+    pub sun_color: [f32; 3],
+    pub sun_intensity: f32,
+    pub fog_density: f32,
+    pub fog_start: f32,
+    pub water_block_type: u32,
+    pub _pad: u32,
+}
+
+impl Default for GpuEnvironment {
+    fn default() -> Self {
+        Self {
+            sun_dir: [0.4, 0.7, 0.3],
+            time: 0.0,
+            sun_color: [1.0, 0.95, 0.85],
+            sun_intensity: 1.5,
+            fog_density: 0.02,
+            fog_start: 20.0,
+            water_block_type: 0,
+            _pad: 0,
+        }
+    }
+}
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -33,7 +63,9 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     uniforms_buffer: wgpu::Buffer,
+    env_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    postprocess: PostProcessor,
     // Tracked state.
     root_index: u32,
     node_count: u32,
@@ -100,6 +132,10 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
+        // --- Post-processor (creates HDR texture) ---
+
+        let postprocess = PostProcessor::new(&device, format, config.width, config.height);
+
         // --- Buffers ---
 
         let tree_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -149,6 +185,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let env = GpuEnvironment::default();
+        let env_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("environment"),
+            contents: bytemuck::bytes_of(&env),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // --- Bind group ---
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -194,21 +237,31 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ray_march"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: tree_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: camera_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: uniforms_buffer.as_entire_binding() },
-            ],
-        });
+        let bind_group = Self::create_bind_group(
+            &device,
+            &bind_group_layout,
+            &tree_buffer,
+            &camera_buffer,
+            &palette_buffer,
+            &uniforms_buffer,
+            &env_buffer,
+        );
 
         // --- Shader & Pipeline ---
+        // Ray march now renders to Rgba16Float HDR texture.
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ray_march"),
@@ -236,7 +289,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -263,7 +316,9 @@ impl Renderer {
             camera_buffer,
             palette_buffer,
             uniforms_buffer,
+            env_buffer,
             bind_group,
+            postprocess,
             root_index,
             node_count,
             max_depth: 16,
@@ -273,8 +328,35 @@ impl Renderer {
         }
     }
 
+    fn create_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        tree_buffer: &wgpu::Buffer,
+        camera_buffer: &wgpu::Buffer,
+        palette_buffer: &wgpu::Buffer,
+        uniforms_buffer: &wgpu::Buffer,
+        env_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ray_march"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: tree_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: camera_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: uniforms_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: env_buffer.as_entire_binding() },
+            ],
+        })
+    }
+
     pub fn update_palette(&self, palette: &GpuPalette) {
         self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
+    }
+
+    /// Update environment parameters (sun, time, fog, water).
+    pub fn update_environment(&self, env: &GpuEnvironment) {
+        self.queue.write_buffer(&self.env_buffer, 0, bytemuck::bytes_of(env));
     }
 
     /// Set the highlighted block AABB (or clear it with None).
@@ -302,6 +384,7 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.postprocess.resize(&self.device, &self.queue, width, height);
         self.write_uniforms();
     }
 
@@ -311,21 +394,22 @@ impl Renderer {
 
     pub fn render(&self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let output_view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
 
+        // Pass 1: Ray march → HDR texture
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ray_march"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: self.postprocess.hdr_target(),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                            r: 0.0, g: 0.0, b: 0.0, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -338,6 +422,9 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+
+        // Pass 2: Post-process (bloom + tonemap) → swapchain
+        self.postprocess.render(&mut encoder, &output_view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -360,16 +447,15 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             });
             // Recreate bind group with new buffer.
-            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("ray_march"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.tree_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.camera_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.palette_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: self.uniforms_buffer.as_entire_binding() },
-                ],
-            });
+            self.bind_group = Self::create_bind_group(
+                &self.device,
+                &self.bind_group_layout,
+                &self.tree_buffer,
+                &self.camera_buffer,
+                &self.palette_buffer,
+                &self.uniforms_buffer,
+                &self.env_buffer,
+            );
         } else {
             self.queue.write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
         }
