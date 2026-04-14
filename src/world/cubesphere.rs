@@ -32,7 +32,7 @@ use super::tree::{
 };
 
 /// One of the six cube faces.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
     PosX = 0,
     NegX = 1,
