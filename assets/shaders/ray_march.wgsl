@@ -187,27 +187,48 @@ fn min_after(best: f32, cand: f32, cur: f32) -> f32 {
 /// appropriate coarseness, so a ray through a huge empty chunk
 /// crosses it in ONE step instead of `3^(subtree_depth-depth)`
 /// steps — recovering the Cartesian octree's skip-empty speedup.
+// Depth all face-subtree walkers terminate at. Returning a CONSTANT
+// depth (not the subtree's natural termination) means every ray in
+// the same region computes its cell boundaries at the same `cells_d`,
+// so adjacent cells share exact boundary planes and don't overlap /
+// punch through each other visually. Must match the build depth
+// (`PlanetSetup.depth`) or the walker will miss its terminals.
+const FACE_WALK_DEPTH: u32 = 13u;
+
 fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u32> {
     var node = root_idx;
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
-    for (var d: u32 = 1u; d <= 22u; d = d + 1u) {
+    var block_id: u32 = 0u;
+    // Walk to a fixed depth regardless of early termination. When we
+    // hit a terminal early, remember its block type but keep
+    // descending in the (uniform) subtree so the exit-cell bounds
+    // are always computed at FACE_WALK_DEPTH.
+    for (var d: u32 = 1u; d <= FACE_WALK_DEPTH; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
         let packed = child_packed(node, slot);
         let tag = child_tag(packed);
-        if tag == 0u { return vec2<u32>(0u, d); }
-        if tag == 1u { return vec2<u32>(child_block_type(packed), d); }
+        if tag == 0u {
+            // Empty terminal. Keep un/vn/rn advancing so the caller's
+            // iu/iv/ir at FACE_WALK_DEPTH matches a real grid cell.
+            return vec2<u32>(0u, FACE_WALK_DEPTH);
+        }
+        if tag == 1u {
+            // Block terminal. Same story — fix block_id, always
+            // report FACE_WALK_DEPTH so boundary grids align.
+            return vec2<u32>(child_block_type(packed), FACE_WALK_DEPTH);
+        }
         // tag == 2u: descend.
         node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
     }
-    return vec2<u32>(0u, 12u);
+    return vec2<u32>(block_id, FACE_WALK_DEPTH);
 }
 
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
