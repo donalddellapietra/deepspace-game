@@ -1,11 +1,35 @@
 //! Runtime world state: the content-addressed tree.
 
 use super::palette::block;
+use super::sdf::{self, Planet, Vec3};
 use super::tree::*;
 
 pub struct WorldState {
     pub root: NodeId,
     pub library: NodeLibrary,
+    /// Gravity sources placed in world-space [0, 3). Collision and
+    /// camera orientation query `dominant_planet(pos)` to decide
+    /// which (if any) planet's gravity applies at a given position.
+    pub planets: Vec<Planet>,
+}
+
+impl WorldState {
+    /// The planet whose influence sphere contains `pos` and whose
+    /// center is closest; `None` if `pos` is in empty space.
+    pub fn dominant_planet(&self, pos: Vec3) -> Option<&Planet> {
+        let mut best: Option<(&Planet, f32)> = None;
+        for p in &self.planets {
+            let d = sdf::length(sdf::sub(pos, p.center));
+            if d <= p.influence_radius {
+                match best {
+                    None => best = Some((p, d)),
+                    Some((_, bd)) if d < bd => best = Some((p, d)),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|(p, _)| p)
+    }
 }
 
 impl WorldState {
@@ -143,7 +167,7 @@ impl WorldState {
             library.len(),
         );
 
-        Self { root, library }
+        Self { root, library, planets: Vec::new() }
     }
 
     /// Compute the maximum depth of the tree from the root.

@@ -10,9 +10,9 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use deepspace_game::game_state::{GameUiState, HotbarItem, SavedMeshes};
 use deepspace_game::renderer::Renderer;
-// Collision module exists but is disabled pending proper layer-aware probing.
-// use deepspace_game::world::collision::{self, PlayerPhysics};
+use deepspace_game::world::collision::{self, PlayerPhysics};
 use deepspace_game::world::edit;
+use deepspace_game::world::sdf;
 use deepspace_game::world::gpu::{self, GpuCamera};
 use deepspace_game::world::palette::ColorRegistry;
 use deepspace_game::world::state::WorldState;
@@ -22,36 +22,60 @@ use deepspace_game::overlay;
 
 // ------------------------------------------------------------ Camera
 
+/// Yaw/pitch camera in a locally-oriented frame.
+///
+/// `smoothed_up` tracks the local "up" direction (away from the
+/// dominant planet's center, or world +Y in empty space), smoothed
+/// over time so the horizon doesn't jerk when gravity switches.
+/// `yaw` rotates around `smoothed_up`; `pitch` tilts the look vector
+/// out of the tangent plane toward `smoothed_up`.
 struct Camera {
     pos: [f32; 3],
+    smoothed_up: [f32; 3],
     yaw: f32,
     pitch: f32,
 }
 
 impl Camera {
-    fn forward(&self) -> [f32; 3] {
+    /// Lerp `smoothed_up` toward `target_up` at rate `k` per dt.
+    fn update_up(&mut self, target_up: [f32; 3], dt: f32) {
+        let k = (dt * 4.0).min(1.0);
+        let blended = [
+            self.smoothed_up[0] + (target_up[0] - self.smoothed_up[0]) * k,
+            self.smoothed_up[1] + (target_up[1] - self.smoothed_up[1]) * k,
+            self.smoothed_up[2] + (target_up[2] - self.smoothed_up[2]) * k,
+        ];
+        self.smoothed_up = sdf::normalize(blended);
+    }
+
+    /// (forward, right, up) in world space, built from smoothed_up +
+    /// yaw + pitch. Returned basis is orthonormal — `up` is
+    /// perpendicular to `forward`, not `smoothed_up` itself (which
+    /// would produce fisheye distortion when pitched).
+    fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        let ref_up = self.smoothed_up;
+        let (t_right, t_fwd) = deepspace_game::world::collision::tangent_basis(ref_up);
         let (sy, cy) = self.yaw.sin_cos();
+        let horiz_fwd = sdf::add(sdf::scale(t_fwd, cy), sdf::scale(t_right, sy));
+        let horiz_right = sdf::sub(sdf::scale(t_right, cy), sdf::scale(t_fwd, sy));
         let (sp, cp) = self.pitch.sin_cos();
-        [-sy * cp, sp, -cy * cp]
+        let fwd = sdf::normalize(sdf::add(
+            sdf::scale(horiz_fwd, cp),
+            sdf::scale(ref_up, sp),
+        ));
+        // Orthonormal `up` = right × forward (right-handed).
+        let up = [
+            horiz_right[1] * fwd[2] - horiz_right[2] * fwd[1],
+            horiz_right[2] * fwd[0] - horiz_right[0] * fwd[2],
+            horiz_right[0] * fwd[1] - horiz_right[1] * fwd[0],
+        ];
+        (fwd, horiz_right, sdf::normalize(up))
     }
 
-    fn right(&self) -> [f32; 3] {
-        let (sy, cy) = self.yaw.sin_cos();
-        [cy, 0.0, -sy]
-    }
-
-    fn forward_xz(&self) -> [f32; 3] {
-        [-self.yaw.sin(), 0.0, -self.yaw.cos()]
-    }
+    fn forward(&self) -> [f32; 3] { self.basis().0 }
 
     fn gpu_camera(&self, fov: f32) -> GpuCamera {
-        let fwd = self.forward();
-        let r = self.right();
-        let up = [
-            r[1] * fwd[2] - r[2] * fwd[1],
-            r[2] * fwd[0] - r[0] * fwd[2],
-            r[0] * fwd[1] - r[1] * fwd[0],
-        ];
+        let (fwd, r, up) = self.basis();
         GpuCamera {
             pos: self.pos,
             _pad0: 0.0,
@@ -111,6 +135,7 @@ struct App {
     debug_overlay_visible: bool,
     /// Exponentially smoothed FPS for the debug overlay.
     fps_smooth: f64,
+    physics: PlayerPhysics,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -125,11 +150,27 @@ impl App {
         let world = deepspace_game::world::worldgen::generate_world();
         let tree_depth = world.tree_depth();
 
+        // Spawn well above the first planet's surface on +Y. The
+        // noise displacement can push the actual surface above the
+        // undisplaced radius, so we add a generous clearance so the
+        // player isn't accidentally embedded in terrain at spawn.
+        let spawn_pos = if let Some(p) = world.planets.first() {
+            [p.center[0], p.center[1] + p.radius + p.noise_scale * 3.0, p.center[2]]
+        } else {
+            [1.5, 1.75, 1.5]
+        };
+        let spawn_up = if let Some(p) = world.planets.first() {
+            p.up_at(spawn_pos)
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+
         Self {
             window: None,
             renderer: None,
             camera: Camera {
-                pos: [1.5, 1.75, 1.5],
+                pos: spawn_pos,
+                smoothed_up: spawn_up,
                 yaw: 0.0,
                 pitch: 0.0,
             },
@@ -148,6 +189,7 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
+            physics: PlayerPhysics::default(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -156,31 +198,87 @@ impl App {
     }
 
     fn update(&mut self, dt: f32) {
-        // Speed: ~5 interaction-layer cells/second regardless of zoom.
         let td = self.tree_depth as i32;
         let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
-        let speed = 5.0 * cell_size;
 
-        let fwd = self.camera.forward_xz();
-        let right = self.camera.right();
+        // Resolve the local gravity frame for this frame. When the
+        // player is inside a planet's influence, gravity + collision
+        // are active and up tracks the planet's radial. Otherwise we
+        // are in space: free flight, no gravity, no tree collision.
+        let on_planet = self.world.dominant_planet(self.camera.pos).is_some();
+        let target_up = if let Some(p) = self.world.dominant_planet(self.camera.pos) {
+            p.up_at(self.camera.pos)
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        self.camera.update_up(target_up, dt);
 
-        let mut dx = 0.0f32;
-        let mut dy = 0.0f32;
-        let mut dz = 0.0f32;
+        // Handle jump edge.
+        if self.keys.space && on_planet && self.physics.on_ground {
+            let g_mag = self.world.dominant_planet(self.camera.pos)
+                .map(|p| sdf::length(p.gravity_at(self.camera.pos)))
+                .unwrap_or(9.8);
+            self.physics.jump(self.camera.smoothed_up, g_mag);
+        }
 
-        if self.keys.w { dx += fwd[0]; dz += fwd[2]; }
-        if self.keys.s { dx -= fwd[0]; dz -= fwd[2]; }
-        if self.keys.d { dx += right[0]; dz += right[2]; }
-        if self.keys.a { dx -= right[0]; dz -= right[2]; }
-        if self.keys.space { dy += 1.0; }
-        if self.keys.shift { dy -= 1.0; }
-
-        let len = (dx * dx + dy * dy + dz * dz).sqrt();
-        if len > 0.001 {
-            let s = speed * dt / len;
-            self.camera.pos[0] += dx * s;
-            self.camera.pos[1] += dy * s;
-            self.camera.pos[2] += dz * s;
+        if on_planet {
+            // On-planet: WASD in tangent plane, gravity + collision.
+            let mut mv = [0.0f32, 0.0f32];
+            if self.keys.w { mv[1] += 1.0; }
+            if self.keys.s { mv[1] -= 1.0; }
+            if self.keys.d { mv[0] += 1.0; }
+            if self.keys.a { mv[0] -= 1.0; }
+            // Rotate input by yaw so W maps to camera's horizontal
+            // forward. This must match the rotation in Camera::basis().
+            let (sy, cy) = self.camera.yaw.sin_cos();
+            let tangent_x = mv[0] * cy + mv[1] * sy;
+            let tangent_f = mv[1] * cy - mv[0] * sy;
+            let len = (tangent_x * tangent_x + tangent_f * tangent_f).sqrt();
+            let tangent_in = if len > 1e-4 {
+                [tangent_x / len, tangent_f / len]
+            } else {
+                [0.0, 0.0]
+            };
+            // Collision walks the FULL tree depth so near-surface
+            // mixed subtrees resolve to their actual air/solid
+            // terminal — otherwise a shallow max_depth treats any
+            // Node child as solid and blocks all movement.
+            let coll_depth = self.tree_depth;
+            // Walk speed scales with planet radius so traversal feels
+            // the same on big and small planets.
+            let walk = self.world.dominant_planet(self.camera.pos)
+                .map(|p| p.radius * 0.35)
+                .unwrap_or(0.1);
+            // Collision cell size is at the finest level of the tree,
+            // matching `coll_depth` — not the renderer's zoom.
+            let coll_cs = 1.0 / 3.0f32.powi(coll_depth as i32);
+            collision::move_and_collide(
+                &mut self.camera.pos,
+                &mut self.physics,
+                &self.world,
+                tangent_in,
+                walk,
+                dt,
+                coll_cs,
+                coll_depth,
+            );
+        } else {
+            // Free-flight in space: no gravity, no collision.
+            let speed = 5.0 * cell_size;
+            let (fwd, right, up) = self.camera.basis();
+            let mut d = [0.0f32; 3];
+            if self.keys.w { d = sdf::add(d, fwd); }
+            if self.keys.s { d = sdf::sub(d, fwd); }
+            if self.keys.d { d = sdf::add(d, right); }
+            if self.keys.a { d = sdf::sub(d, right); }
+            if self.keys.space { d = sdf::add(d, up); }
+            if self.keys.shift { d = sdf::sub(d, up); }
+            let l = sdf::length(d);
+            if l > 1e-4 {
+                let s = speed * dt / l;
+                self.camera.pos = sdf::add(self.camera.pos, sdf::scale(d, s));
+            }
+            self.physics.velocity = [0.0, 0.0, 0.0];
         }
 
         if let Some(renderer) = &self.renderer {
