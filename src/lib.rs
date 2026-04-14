@@ -1,13 +1,2 @@
-pub mod block;
-pub mod camera;
-pub mod diagnostics;
-pub mod editor;
-pub mod import;
-pub mod interaction;
-pub mod inventory;
-pub mod model;
-pub mod npc;
-pub mod overlay;
-pub mod player;
-pub mod ui;
 pub mod world;
+pub mod renderer;
