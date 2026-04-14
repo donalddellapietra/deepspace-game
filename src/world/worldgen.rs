@@ -1,15 +1,11 @@
-//! World generator: builds a 6-level deep world with varied terrain.
+//! World generator: builds a 20-level deep world with varied terrain.
 //!
-//! The world has structure at every scale:
-//!   Level 1: individual block materials (stone, dirt, grass, etc.)
-//!   Level 2: 3×3×3 block clusters (uniform fills, checkerboards, surfaces)
-//!   Level 3: 9×9×9 terrain chunks (ground layers, trees, buildings)
-//!   Level 4: 27×27×27 terrain sections (terrain with features)
-//!   Level 5: 81×81×81 biome-scale regions
-//!   Level 6: 243×243×243 world root
+//! Bottom 6 levels have hand-crafted terrain detail (blocks, surfaces,
+//! trees, buildings, biomes). Levels 7-20 are composed algorithmically
+//! by mixing lower-level variants with positional hashing.
 //!
-//! Content-addressing means shared structure costs no extra memory.
-//! A uniform stone layer reused 100 times is still one node.
+//! Content-addressing means the node count stays small (~100 unique
+//! nodes) even at 20 levels deep (3^20 ≈ 3.5 billion blocks per axis).
 
 use super::state::WorldState;
 use super::tree::*;
@@ -26,12 +22,12 @@ fn pos_hash(x: usize, y: usize, z: usize, seed: u32) -> u32 {
     h
 }
 
-/// Build a 6-level deep world.
+/// Build a 20-level deep world.
 pub fn generate_world() -> WorldState {
     let mut lib = NodeLibrary::default();
 
     // ═══════════════════════════════════════════════════════════════
-    // Level 1: 3×3×3 uniform block clusters (building materials)
+    // Level 1: 3×3×3 uniform block clusters
     // ═══════════════════════════════════════════════════════════════
 
     let stone_l1 = lib.insert(uniform_children(Child::Block(BlockType::Stone)));
@@ -41,25 +37,7 @@ pub fn generate_world() -> WorldState {
     let leaf_l1 = lib.insert(uniform_children(Child::Block(BlockType::Leaf)));
     let sand_l1 = lib.insert(uniform_children(Child::Block(BlockType::Sand)));
     let brick_l1 = lib.insert(uniform_children(Child::Block(BlockType::Brick)));
-    let _metal_l1 = lib.insert(uniform_children(Child::Block(BlockType::Metal)));
     let air_l1 = lib.insert(empty_children());
-
-    // Mixed materials for visual variety.
-    let _stone_dirt_l1 = {
-        let mut c = empty_children();
-        for z in 0..BRANCH {
-            for y in 0..BRANCH {
-                for x in 0..BRANCH {
-                    c[slot_index(x, y, z)] = if (x + y + z) % 2 == 0 {
-                        Child::Block(BlockType::Stone)
-                    } else {
-                        Child::Block(BlockType::Dirt)
-                    };
-                }
-            }
-        }
-        lib.insert(c)
-    };
 
     let gravel_l1 = {
         let mut c = empty_children();
@@ -79,15 +57,13 @@ pub fn generate_world() -> WorldState {
     };
 
     // ═══════════════════════════════════════════════════════════════
-    // Level 2: 3×3×3 of L1 nodes (terrain building blocks)
+    // Level 2: terrain building blocks (surfaces, trunks, walls)
     // ═══════════════════════════════════════════════════════════════
 
     let stone_l2 = lib.insert(uniform_children(Child::Node(stone_l1)));
-    let _dirt_l2 = lib.insert(uniform_children(Child::Node(dirt_l1)));
     let sand_l2 = lib.insert(uniform_children(Child::Node(sand_l1)));
     let air_l2 = lib.insert(uniform_children(Child::Node(air_l1)));
 
-    // Ground surface: dirt below, grass on top, air above.
     let grass_surface_l2 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -100,7 +76,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Sandy surface.
     let sand_surface_l2 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -113,7 +88,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Rocky surface with gravel.
     let rocky_surface_l2 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -126,7 +100,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Tree trunk column.
     let trunk_l2 = {
         let mut c = uniform_children(Child::Node(air_l1));
         c[slot_index(1, 0, 1)] = Child::Node(wood_l1);
@@ -135,7 +108,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Tree canopy (leaves with some air gaps).
     let canopy_l2 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -143,7 +115,7 @@ pub fn generate_world() -> WorldState {
                 for x in 0..BRANCH {
                     let h = pos_hash(x, y, z, 77);
                     c[slot_index(x, y, z)] = if h % 4 == 0 {
-                        Child::Node(air_l1) // gaps
+                        Child::Node(air_l1)
                     } else {
                         Child::Node(leaf_l1)
                     };
@@ -153,14 +125,12 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Building wall.
     let wall_l2 = lib.insert(uniform_children(Child::Node(brick_l1)));
 
     // ═══════════════════════════════════════════════════════════════
-    // Level 3: 3×3×3 of L2 nodes (terrain chunks = 9×9×9 blocks)
+    // Level 3: terrain chunks (9×9×9 blocks)
     // ═══════════════════════════════════════════════════════════════
 
-    // Flat grassland chunk: stone base, grass surface, air.
     let grassland_l3 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -173,7 +143,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Desert chunk.
     let desert_l3 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -186,7 +155,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Rocky chunk.
     let rocky_l3 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -199,7 +167,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Forest chunk: grassland + tree at center.
     let forest_l3 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -209,12 +176,10 @@ pub fn generate_world() -> WorldState {
                 c[slot_index(x, 2, z)] = Child::Node(air_l2);
             }
         }
-        // Tree at center.
         c[slot_index(1, 2, 1)] = Child::Node(trunk_l2);
         lib.insert(c)
     };
 
-    // Dense forest: trees in multiple spots.
     let dense_forest_l3 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -234,16 +199,13 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Mountain chunk: stone all the way up.
     let mountain_l3 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
             for x in 0..BRANCH {
                 c[slot_index(x, 0, z)] = Child::Node(stone_l2);
                 c[slot_index(x, 1, z)] = Child::Node(stone_l2);
-                // Peaks only at center.
-                let is_center = x == 1 && z == 1;
-                c[slot_index(x, 2, z)] = if is_center {
+                c[slot_index(x, 2, z)] = if x == 1 && z == 1 {
                     Child::Node(rocky_surface_l2)
                 } else {
                     Child::Node(air_l2)
@@ -253,7 +215,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Village chunk: grassland with a building.
     let village_l3 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -263,24 +224,20 @@ pub fn generate_world() -> WorldState {
                 c[slot_index(x, 2, z)] = Child::Node(air_l2);
             }
         }
-        // Small building.
         c[slot_index(1, 2, 1)] = Child::Node(wall_l2);
         c[slot_index(0, 2, 1)] = Child::Node(wall_l2);
         c[slot_index(1, 2, 0)] = Child::Node(wall_l2);
         lib.insert(c)
     };
 
-    // Air chunk.
     let air_l3 = lib.insert(uniform_children(Child::Node(air_l2)));
 
     // ═══════════════════════════════════════════════════════════════
-    // Level 4: 3×3×3 of L3 nodes (terrain sections = 27×27×27)
+    // Level 4: terrain sections (27×27×27)
     // ═══════════════════════════════════════════════════════════════
 
-    // Plains section.
     let plains_l4 = lib.insert(uniform_children(Child::Node(grassland_l3)));
 
-    // Forest section.
     let forest_l4 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -290,11 +247,8 @@ pub fn generate_world() -> WorldState {
                     c[slot_index(x, y, z)] = if y >= 2 {
                         Child::Node(air_l3)
                     } else if y == 1 {
-                        if h % 2 == 0 {
-                            Child::Node(forest_l3)
-                        } else {
-                            Child::Node(dense_forest_l3)
-                        }
+                        if h % 2 == 0 { Child::Node(forest_l3) }
+                        else { Child::Node(dense_forest_l3) }
                     } else {
                         Child::Node(grassland_l3)
                     };
@@ -304,7 +258,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Mountain section.
     let mountain_l4 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -325,16 +278,13 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Desert section.
     let desert_l4 = lib.insert(uniform_children(Child::Node(desert_l3)));
 
-    // Village section: mostly plains with a village chunk.
     let village_l4 = {
         let mut c = uniform_children(Child::Node(grassland_l3));
         c[slot_index(1, 1, 1)] = Child::Node(village_l3);
         c[slot_index(0, 1, 0)] = Child::Node(forest_l3);
         c[slot_index(2, 1, 2)] = Child::Node(forest_l3);
-        // Top layer is air.
         for z in 0..BRANCH {
             for x in 0..BRANCH {
                 c[slot_index(x, 2, z)] = Child::Node(air_l3);
@@ -344,10 +294,9 @@ pub fn generate_world() -> WorldState {
     };
 
     // ═══════════════════════════════════════════════════════════════
-    // Level 5: 3×3×3 of L4 nodes (biome regions = 81×81×81)
+    // Level 5: biome regions (81×81×81)
     // ═══════════════════════════════════════════════════════════════
 
-    // Temperate biome: forests + plains + villages.
     let temperate_l5 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -355,14 +304,10 @@ pub fn generate_world() -> WorldState {
                 for x in 0..BRANCH {
                     let h = pos_hash(x, y, z, 400);
                     c[slot_index(x, y, z)] = match (y, h % 5) {
-                        (2, _) => Child::Node(plains_l4), // top = air-heavy
-                        (1, 0) => Child::Node(forest_l4),
+                        (2, _) => Child::Node(plains_l4),
+                        (1, 0) | (1, 3) => Child::Node(forest_l4),
                         (1, 1) => Child::Node(village_l4),
-                        (1, 2) => Child::Node(plains_l4),
-                        (1, 3) => Child::Node(forest_l4),
-                        (1, _) => Child::Node(plains_l4),
-                        (0, _) => Child::Node(plains_l4), // underground
-                        _ => Child::Node(plains_l4),
+                        (_, _) => Child::Node(plains_l4),
                     };
                 }
             }
@@ -370,7 +315,6 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Highland biome: mountains + rocky terrain.
     let highland_l5 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
@@ -378,10 +322,7 @@ pub fn generate_world() -> WorldState {
                 for x in 0..BRANCH {
                     let h = pos_hash(x, y, z, 500);
                     c[slot_index(x, y, z)] = match (y, h % 3) {
-                        (2, _) => Child::Node(mountain_l4),
-                        (1, 0) => Child::Node(mountain_l4),
-                        (1, _) => Child::Node(forest_l4),
-                        (0, _) => Child::Node(mountain_l4),
+                        (1, 1) => Child::Node(forest_l4),
                         _ => Child::Node(mountain_l4),
                     };
                 }
@@ -390,20 +331,16 @@ pub fn generate_world() -> WorldState {
         lib.insert(c)
     };
 
-    // Arid biome: desert + some rocky.
     let arid_l5 = {
         let mut c = empty_children();
         for z in 0..BRANCH {
             for y in 0..BRANCH {
                 for x in 0..BRANCH {
                     let h = pos_hash(x, y, z, 600);
-                    c[slot_index(x, y, z)] = match (y, h % 4) {
-                        (2, _) => Child::Node(desert_l4),
-                        (1, 0) => Child::Node(desert_l4),
-                        (1, _) => Child::Node(desert_l4),
-                        (0, 0) => Child::Node(mountain_l4),
-                        (0, _) => Child::Node(desert_l4),
-                        _ => Child::Node(desert_l4),
+                    c[slot_index(x, y, z)] = if y == 0 && h % 4 == 0 {
+                        Child::Node(mountain_l4)
+                    } else {
+                        Child::Node(desert_l4)
                     };
                 }
             }
@@ -412,40 +349,112 @@ pub fn generate_world() -> WorldState {
     };
 
     // ═══════════════════════════════════════════════════════════════
-    // Level 6 (root): 3×3×3 of L5 nodes (the world = 243×243×243)
+    // Level 6: continents (243×243×243)
     // ═══════════════════════════════════════════════════════════════
 
+    let continent_a = {
+        let mut c = empty_children();
+        for z in 0..BRANCH {
+            for x in 0..BRANCH {
+                c[slot_index(x, 0, z)] = Child::Node(highland_l5);
+                c[slot_index(x, 2, z)] = Child::Node(temperate_l5);
+                let h = pos_hash(x, 1, z, 700);
+                c[slot_index(x, 1, z)] = match h % 3 {
+                    0 => Child::Node(temperate_l5),
+                    1 => Child::Node(highland_l5),
+                    _ => Child::Node(arid_l5),
+                };
+            }
+        }
+        lib.insert(c)
+    };
+
+    let continent_b = {
+        let mut c = empty_children();
+        for z in 0..BRANCH {
+            for y in 0..BRANCH {
+                for x in 0..BRANCH {
+                    let h = pos_hash(x, y, z, 710);
+                    c[slot_index(x, y, z)] = match h % 4 {
+                        0 => Child::Node(arid_l5),
+                        1 => Child::Node(highland_l5),
+                        _ => Child::Node(temperate_l5),
+                    };
+                }
+            }
+        }
+        lib.insert(c)
+    };
+
+    let continent_c = {
+        let mut c = empty_children();
+        for z in 0..BRANCH {
+            for y in 0..BRANCH {
+                for x in 0..BRANCH {
+                    let h = pos_hash(x, y, z, 720);
+                    c[slot_index(x, y, z)] = match h % 3 {
+                        0 => Child::Node(highland_l5),
+                        _ => Child::Node(arid_l5),
+                    };
+                }
+            }
+        }
+        lib.insert(c)
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    // Levels 7-20: composed algorithmically.
+    //
+    // At each level, create 3 variants by mixing the previous level's
+    // variants with positional hashing. This gives visual variety at
+    // every zoom scale while keeping node count small (~3 per level).
+    // ═══════════════════════════════════════════════════════════════
+
+    let mut prev_variants: Vec<NodeId> = vec![continent_a, continent_b, continent_c];
+
+    for level in 7..=20 {
+        let seed_base = level as u32 * 1000;
+        let num_variants = prev_variants.len();
+        let mut new_variants = Vec::new();
+
+        for variant in 0..3u32 {
+            let mut c = empty_children();
+            for z in 0..BRANCH {
+                for y in 0..BRANCH {
+                    for x in 0..BRANCH {
+                        let h = pos_hash(x, y, z, seed_base + variant * 100);
+                        let pick = (h as usize) % num_variants;
+                        c[slot_index(x, y, z)] = Child::Node(prev_variants[pick]);
+                    }
+                }
+            }
+            new_variants.push(lib.insert(c));
+        }
+
+        prev_variants = new_variants;
+    }
+
+    // Final root: mix the level-20 variants.
     let mut root_children = empty_children();
     for z in 0..BRANCH {
-        for x in 0..BRANCH {
-            // Bottom third: underground (stone-heavy).
-            root_children[slot_index(x, 0, z)] = Child::Node(highland_l5);
-            // Top third: more air-heavy.
-            root_children[slot_index(x, 2, z)] = Child::Node(temperate_l5);
-            // Middle: varied biomes.
-            let h = pos_hash(x, 1, z, 700);
-            root_children[slot_index(x, 1, z)] = match h % 3 {
-                0 => Child::Node(temperate_l5),
-                1 => Child::Node(highland_l5),
-                _ => Child::Node(arid_l5),
-            };
+        for y in 0..BRANCH {
+            for x in 0..BRANCH {
+                let h = pos_hash(x, y, z, 99999);
+                let pick = (h as usize) % prev_variants.len();
+                root_children[slot_index(x, y, z)] = Child::Node(prev_variants[pick]);
+            }
         }
     }
 
     let root = lib.insert(root_children);
     lib.ref_inc(root);
 
-    let depth = {
-        let world = WorldState { root, library: lib };
-        let d = world.tree_depth();
-        eprintln!(
-            "Generated world: {} unique nodes, depth {}, 3^{} = {} blocks per axis",
-            world.library.len(), d, d, 3u64.pow(d),
-        );
-        let WorldState { root: r, library: l } = world;
-        let _ = r;
-        WorldState { root, library: l }
-    };
+    let world = WorldState { root, library: lib };
+    let d = world.tree_depth();
+    eprintln!(
+        "Generated world: {} unique nodes, depth {}, 3^{} ≈ {:.2e} blocks per axis",
+        world.library.len(), d, d, 3.0f64.powi(d as i32),
+    );
 
-    depth
+    world
 }
