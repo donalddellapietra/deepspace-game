@@ -88,7 +88,10 @@ impl App {
         // Spawn above the cubed-sphere planet's north pole. The
         // initial edit depth is 6 (base-terrain level), which means
         // the camera anchors at depth 6 — zoom-in descends from there.
-        let spawn_pos = [setup.center[0], setup.center[1] + setup.outer_r + 0.3, setup.center[2]];
+        // Clamp Y inside the root cell [0, 3) — Position requires
+        // XYZ inputs to fit the tree, unlike the old XYZ camera.
+        let spawn_y = (setup.center[1] + setup.outer_r + 0.3).min(2.99);
+        let spawn_pos = [setup.center[0], spawn_y, setup.center[2]];
         let spawn_depth = 6u8.min(tree_depth as u8).max(1);
 
         Self {
@@ -126,9 +129,13 @@ impl App {
     /// live in [`edit_actions`]; the `ApplicationHandler` in
     /// [`event_loop`] calls them in order.
     pub(super) fn update(&mut self, dt: f32) {
-        // Cell size at the camera's current anchoring depth in world
-        // units. depth=d → cell_size = 3^(1 - d).
-        let cell_size = 3.0f32.powi(1 - self.camera.position.depth as i32);
+        // "cell_size" here matches the old engine's convention
+        // (`1/3^edit_depth` — the extent of one 27-grandchild of the
+        // camera's cell, not the cell itself). Thrust and gravity
+        // scale off this so player speed feels identical to the
+        // pre-refactor game at every zoom level. Geometrically the
+        // camera's own cell is 3× this (3^(1 - depth)).
+        let cell_size = 3.0f32.powi(-(self.camera.position.depth as i32));
 
         player::update(
             &mut self.camera,
