@@ -107,6 +107,7 @@ struct HitResult {
     hit: bool,
     color: vec3<f32>,
     normal: vec3<f32>,
+    t: f32,
 }
 
 fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
@@ -246,11 +247,29 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.hit = true;
             result.color = palette.colors[child_block_type(packed)].rgb;
             result.normal = normal;
+            // Approximate hit t from the cell's AABB entry.
+            let cell_min_t = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
+            let cell_max_t = cell_min_t + vec3<f32>(s_cell_size[depth]);
+            let hbox = ray_box(ray_origin, inv_dir, cell_min_t, cell_max_t);
+            result.t = max(hbox.t_enter, 0.0);
             return result;
         } else if tag == 2u {
-            // Node — descend if we haven't hit max depth.
-            if depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH {
-                // At max depth, treat as solid using the node's dominant color.
+            // Node — check if we should descend or treat as solid.
+
+            // Hard depth limits.
+            let at_max = depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH;
+
+            // Screen-space LOD: compute how many pixels this cell covers.
+            // If sub-pixel, no point descending — shade as dominant color.
+            let cell_world_size = s_cell_size[depth];
+            // Approximate ray distance to this cell from side_dist.
+            let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
+            let ray_dist = max(min_side, 0.001);
+            let lod_pixels = cell_world_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+            let at_lod = lod_pixels < 1.0;
+
+            if at_max || at_lod {
+                // Treat as solid using the node's dominant color.
                 result.hit = true;
                 let bt = child_block_type(packed);
                 if bt < 10u {
@@ -259,6 +278,10 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                     result.color = vec3<f32>(0.5);
                 }
                 result.normal = normal;
+                let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
+                let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
+                let hbox_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
+                result.t = max(hbox_l.t_enter, 0.0);
                 return result;
             }
 
@@ -360,39 +383,72 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    // Block highlight outline: intersect ray with the highlight AABB
-    // and draw white edges where the ray grazes the box faces.
+    // Block highlight: wireframe cube outline matching Bevy gizmos.cube() style.
+    // Expanded 2% like the original, white color.
     if uniforms.highlight_active != 0u {
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;
-        let inv_dir = vec3<f32>(
-            select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
-            select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
-            select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
-        );
-        let hb = ray_box(camera.pos, inv_dir, h_min, h_max);
-        if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
-            let t = max(hb.t_enter, 0.0);
+        let box_size = h_max - h_min;
+        let expand = box_size * 0.01; // 1% each side = 2% total, matching Bevy's 1.02x
+        let e_min = h_min - expand;
+        let e_max = h_max + expand;
+
+        // Per-slab intersection to find the exact entry face.
+        let t1 = (e_min - camera.pos) / ray_dir;
+        let t2 = (e_max - camera.pos) / ray_dir;
+        let t_lo = min(t1, t2);
+        let t_hi = max(t1, t2);
+        let t_enter = max(max(t_lo.x, t_lo.y), t_lo.z);
+        let t_exit  = min(min(t_hi.x, t_hi.y), t_hi.z);
+
+        // Occlusion: only draw outline if it's in front of (or on) the hit surface.
+        let max_t = select(result.t, 1e10, !result.hit);
+        if t_enter < t_exit && t_exit > 0.0 && t_enter <= max_t + 0.01 {
+            // Use t_enter if in front of camera, else we're inside the box.
+            let t = select(t_enter, 0.001, t_enter < 0.0);
             let hit_pos = camera.pos + ray_dir * t;
-            // Distance from each face of the box in local coords.
-            let from_min = hit_pos - h_min;
-            let from_max = h_max - hit_pos;
-            let box_size = h_max - h_min;
-            let edge_width = box_size.x * 0.04; // 4% of block size
-            // Check if near any edge (where two faces meet).
-            let near_min_x = from_min.x < edge_width;
-            let near_max_x = from_max.x < edge_width;
-            let near_min_y = from_min.y < edge_width;
-            let near_max_y = from_max.y < edge_width;
-            let near_min_z = from_min.z < edge_width;
-            let near_max_z = from_max.z < edge_width;
-            let near_x = near_min_x || near_max_x;
-            let near_y = near_min_y || near_max_y;
-            let near_z = near_min_z || near_max_z;
-            // An edge is where at least 2 of the 3 axes are near a face.
-            let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
-            if edge_count >= 2u {
-                color = mix(color, vec3<f32>(1.0), 0.8);
+
+            // Normalize to [0,1] within expanded box.
+            let local = (hit_pos - e_min) / (e_max - e_min);
+            let d_lo = local;
+            let d_hi = vec3<f32>(1.0) - local;
+            let d_face = min(d_lo, d_hi);
+
+            // Which axis entered the box? The one with the largest t_lo.
+            // This correctly identifies the face even from any angle.
+            var face_axis = 0u;
+            if t_lo.y > t_lo.x && t_lo.y > t_lo.z {
+                face_axis = 1u;
+            } else if t_lo.z > t_lo.x {
+                face_axis = 2u;
+            }
+
+            // If camera is inside box, use the closest face instead.
+            if t_enter < 0.0 {
+                let min_d = min(d_face.x, min(d_face.y, d_face.z));
+                if d_face.x <= min_d + 0.001 {
+                    face_axis = 0u;
+                } else if d_face.y <= min_d + 0.001 {
+                    face_axis = 1u;
+                } else {
+                    face_axis = 2u;
+                }
+            }
+
+            // Edge width in normalized [0,1] coords. ~2% = thin wireframe.
+            let ew = 0.02;
+
+            // On the entry face, check if the other two axes are near an edge.
+            var on_edge = false;
+            if face_axis == 0u {
+                on_edge = d_lo.y < ew || d_hi.y < ew || d_lo.z < ew || d_hi.z < ew;
+            } else if face_axis == 1u {
+                on_edge = d_lo.x < ew || d_hi.x < ew || d_lo.z < ew || d_hi.z < ew;
+            } else {
+                on_edge = d_lo.x < ew || d_hi.x < ew || d_lo.y < ew || d_hi.y < ew;
+            }
+            if on_edge {
+                color = mix(color, vec3<f32>(1.0), 0.85);
             }
         }
     }

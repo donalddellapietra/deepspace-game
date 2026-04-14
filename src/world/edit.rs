@@ -208,9 +208,10 @@ pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
 }
 
 /// Place a block adjacent to the hit face.
+///
+/// When the adjacent cell is outside the current 3x3x3 node, walks up
+/// the path to find the correct parent where the neighbor lives.
 pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: BlockType) -> bool {
-    let (_parent_id, slot) = *hit.path.last().unwrap();
-    let (x, y, z) = slot_coords(slot);
     let (dx, dy, dz): (i32, i32, i32) = match hit.face {
         0 => (1, 0, 0),
         1 => (-1, 0, 0),
@@ -221,29 +222,54 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: BlockType)
         _ => return false,
     };
 
-    let nx = x as i32 + dx;
-    let ny = y as i32 + dy;
-    let nz = z as i32 + dz;
+    // Walk up from the deepest level, carrying the offset until we
+    // find a level where the neighbor cell is in-bounds.
+    let mut carry = [dx, dy, dz];
+    let mut target_depth = hit.path.len(); // will be decremented
 
-    if nx < 0 || nx > 2 || ny < 0 || ny > 2 || nz < 0 || nz > 2 {
-        return false;
+    loop {
+        if target_depth == 0 {
+            // Walked past root — placement is outside the world.
+            return false;
+        }
+        target_depth -= 1;
+
+        let (_node_id, slot) = hit.path[target_depth];
+        let (cx, cy, cz) = slot_coords(slot);
+        let nx = cx as i32 + carry[0];
+        let ny = cy as i32 + carry[1];
+        let nz = cz as i32 + carry[2];
+
+        if nx >= 0 && nx <= 2 && ny >= 0 && ny <= 2 && nz >= 0 && nz <= 2 {
+            // Found the level where the neighbor is in-bounds.
+            let adj_slot = slot_index(nx as usize, ny as usize, nz as usize);
+            let parent_id = hit.path[target_depth].0;
+            let node = match world.library.get(parent_id) {
+                Some(n) => n,
+                None => return false,
+            };
+
+            // The neighbor must be empty (or an empty node) to place into.
+            if !node.children[adj_slot].is_empty() {
+                return false;
+            }
+
+            // Build a truncated path up to and including this level.
+            let mut place_hit = hit.clone();
+            place_hit.path.truncate(target_depth + 1);
+            place_hit.path[target_depth].1 = adj_slot;
+            return propagate_edit(world, &place_hit, Child::Block(block_type));
+        }
+
+        // Still out of bounds — propagate carry to the parent level.
+        // Each cell at this level is 1 cell at the parent, so the
+        // overflow becomes ±1 in the parent's coordinate space.
+        carry = [
+            if nx < 0 { -1 } else if nx > 2 { 1 } else { 0 },
+            if ny < 0 { -1 } else if ny > 2 { 1 } else { 0 },
+            if nz < 0 { -1 } else if nz > 2 { 1 } else { 0 },
+        ];
     }
-
-    let adj_slot = slot_index(nx as usize, ny as usize, nz as usize);
-    let parent_id = hit.path.last().unwrap().0;
-
-    let node = match world.library.get(parent_id) {
-        Some(n) => n,
-        None => return false,
-    };
-
-    if !node.children[adj_slot].is_empty() {
-        return false;
-    }
-
-    let mut place_hit = hit.clone();
-    place_hit.path.last_mut().unwrap().1 = adj_slot;
-    propagate_edit(world, &place_hit, Child::Block(block_type))
 }
 
 /// Apply an edit and propagate clone-on-write up to root.

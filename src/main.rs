@@ -99,6 +99,8 @@ struct App {
     keys: Keys,
     last_frame: std::time::Instant,
     zoom_level: i32,
+    /// Cached tree depth (recomputed only after edits).
+    tree_depth: u32,
     ui: GameUiState,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
@@ -111,7 +113,8 @@ const WAIT_FRAMES: u32 = 10;
 
 impl App {
     fn new() -> Self {
-        let world = WorldState::test_world();
+        let world = deepspace_game::world::worldgen::generate_world();
+        let tree_depth = world.tree_depth();
 
         Self {
             window: None,
@@ -126,6 +129,7 @@ impl App {
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
             zoom_level: 0,
+            tree_depth,
             ui: GameUiState::new(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
@@ -135,7 +139,10 @@ impl App {
     }
 
     fn update(&mut self, dt: f32) {
-        let speed = 5.0 * 3.0f32.powi(self.zoom_level);
+        // Speed: ~5 interaction-layer cells/second regardless of zoom.
+        let td = self.tree_depth as i32;
+        let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
+        let speed = 5.0 * cell_size;
 
         let fwd = self.camera.forward_xz();
         let right = self.camera.right();
@@ -164,9 +171,31 @@ impl App {
         }
     }
 
+    /// CPU raycast depth: tree_depth - zoom_level.
+    /// zoom_level 0 = finest blocks, higher = coarser.
     fn edit_depth(&self) -> u32 {
-        let base_depth: u32 = 8;
-        base_depth.saturating_sub(self.zoom_level.max(0) as u32).max(1)
+        let td = self.tree_depth as i32;
+        (td - self.zoom_level).max(1) as u32
+    }
+
+    /// GPU visual depth: edit_depth + 3 (see 27×27×27 detail).
+    fn visual_depth(&self) -> u32 {
+        (self.edit_depth() + 3).min(8)
+    }
+
+    /// Clamp zoom and sync GPU depth.
+    fn apply_zoom(&mut self) {
+        let td = self.tree_depth as i32;
+        self.zoom_level = self.zoom_level.clamp(0, (td - 1).max(0));
+        self.ui.zoom_level = self.zoom_level;
+        let vd = self.visual_depth();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_max_depth(vd);
+        }
+        log::info!(
+            "Zoom: {}/{}, edit_depth: {}, visual: {}",
+            self.zoom_level, td, self.edit_depth(), vd
+        );
     }
 
     fn do_break(&mut self) {
@@ -197,6 +226,7 @@ impl App {
     }
 
     fn upload_tree(&mut self) {
+        self.tree_depth = self.world.tree_depth();
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, root_index);
@@ -377,17 +407,10 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
+                // Scroll up = zoom in (finer), scroll down = zoom out (coarser).
                 if y > 0.0 { self.zoom_level -= 1; }
                 else if y < 0.0 { self.zoom_level += 1; }
-                self.zoom_level = self.zoom_level.clamp(-2, 5);
-                self.ui.zoom_level = self.zoom_level;
-
-                let max_depth = (3 - self.zoom_level).clamp(1, 8) as u32;
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.set_max_depth(max_depth);
-                }
-                log::info!("Zoom level: {}, max_depth: {}, edit_depth: {}",
-                    self.zoom_level, max_depth, self.edit_depth());
+                self.apply_zoom();
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {

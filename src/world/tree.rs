@@ -90,7 +90,14 @@ pub struct Node {
     /// Used by the renderer when it can't descend further (LOD/zoom).
     /// 255 = no dominant block (all empty).
     pub dominant_block: u8,
+    /// If the entire subtree is one type: 0-253 = that BlockType,
+    /// 254 = all empty, 255 = mixed (not uniform).
+    /// Uniform nodes can be flattened to a single Block during GPU packing.
+    pub uniform_type: u8,
 }
+
+pub const UNIFORM_EMPTY: u8 = 254;
+pub const UNIFORM_MIXED: u8 = 255;
 
 // ---------------------------------------------------------- slot encoding
 
@@ -173,7 +180,28 @@ impl NodeLibrary {
             .filter(|&(_, count)| *count > 0)
             .map(|(i, _)| i as u8)
             .unwrap_or(255);
-        self.nodes.insert(id, Node { children, ref_count: 0, dominant_block });
+        // Compute uniform_type: is the entire subtree one block type?
+        let uniform_type = {
+            let mut first: Option<u8> = None;
+            let mut uniform = true;
+            for c in &children {
+                let ct = match c {
+                    Child::Empty => UNIFORM_EMPTY,
+                    Child::Block(bt) => *bt as u8,
+                    Child::Node(nid) => {
+                        self.nodes.get(nid).map(|n| n.uniform_type).unwrap_or(UNIFORM_MIXED)
+                    }
+                };
+                if ct == UNIFORM_MIXED { uniform = false; break; }
+                match first {
+                    None => first = Some(ct),
+                    Some(f) if f == ct => {}
+                    _ => { uniform = false; break; }
+                }
+            }
+            if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
+        };
+        self.nodes.insert(id, Node { children, ref_count: 0, dominant_block, uniform_type });
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
             self.ref_inc(nid);
