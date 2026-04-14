@@ -154,37 +154,45 @@ impl Position {
         let d = self.depth as usize;
         let a = ancestor_depth as usize;
         assert!(a <= d, "ancestor_depth {} > depth {}", a, d);
-        let n = (d - a) as i32;
-        // Horner in f32: each slot is 0/1/2 and the running
-        // accumulator is the integer `Σ slot_k * 3^(d-k)`. That
-        // integer stays exact in f32 as long as 3^n ≤ 2^24
-        // (i.e. n ≤ 15), so for ancestor depths within 15 levels of
-        // the camera the final XYZ lands within one native f32 ulp
-        // without any f64 pass. Summing the per-slot terms directly
-        // in f32 instead loses ~1 ulp per level and was the cause of
-        // the "faces stick out" artifact at moderate zoom depths.
+        if d == a {
+            // Identity frame: offset IS the position in the [0, 1)³
+            // sub-cell; scale up to the ancestor's [0, 3)³ extent.
+            return [self.offset[0] * 3.0, self.offset[1] * 3.0, self.offset[2] * 3.0];
+        }
+        // Reverse Horner in f64:
         //
-        // Worlds that anchor the camera more than 15 levels below
-        // the render root still risk precision blow-up: the real fix
-        // is the dynamic render-root selection in §3a of
-        // refactor-decisions.md, which keeps `n` small by construction
-        // but requires the shader-side work from step 9 to follow
-        // the frame shift. Until that lands, callers should keep
-        // `render_root_depth` close enough to `camera.depth` to
-        // honor the n ≤ 15 bound.
-        let mut acc = [0.0f32; 3];
-        for k in (a + 1)..=d {
+        //   acc_d = slot_d + offset                  // in [0, 3)
+        //   acc_k = slot_k + acc_{k+1} / 3           // in [0, 3)
+        //   result = acc_{a+1}
+        //
+        // Every intermediate value is bounded in `[0, 3)`, so no
+        // accumulator grows with depth — unlike forward Horner,
+        // which blows through f32's mantissa at depth > 15 and f64's
+        // at depth > 33. That's the only way to keep `pos_in_ancestor_frame`
+        // precision-stable across the full `MAX_DEPTH = 63` range,
+        // and it's what makes 40+ rendering layers possible at all
+        // within the tree-root render frame.
+        //
+        // f64 throughout because each `/ 3.0` step loses ~1 ulp and
+        // the accumulated rounding at MAX_DEPTH in f32 would still
+        // be visible at shader scale. This is a local numerical
+        // method at the path→XYZ boundary — nothing upstream ever
+        // stores or accumulates these f64 values.
+        let innermost = self.path[d - 1] as usize;
+        let (sx, sy, sz) = slot_coords(innermost);
+        let mut acc = [
+            sx as f64 + self.offset[0] as f64,
+            sy as f64 + self.offset[1] as f64,
+            sz as f64 + self.offset[2] as f64,
+        ];
+        for k in (a + 1..d).rev() {
             let slot = self.path[k - 1] as usize;
-            let (sx, sy, sz) = slot_coords(slot);
-            acc[0] = acc[0] * 3.0 + sx as f32;
-            acc[1] = acc[1] * 3.0 + sy as f32;
-            acc[2] = acc[2] * 3.0 + sz as f32;
+            let (qx, qy, qz) = slot_coords(slot);
+            acc[0] = qx as f64 + acc[0] / 3.0;
+            acc[1] = qy as f64 + acc[1] / 3.0;
+            acc[2] = qz as f64 + acc[2] / 3.0;
         }
-        for axis in 0..3 {
-            acc[axis] += self.offset[axis];
-        }
-        let scale = 3.0f32.powi(1 - n);
-        [acc[0] * scale, acc[1] * scale, acc[2] * scale]
+        [acc[0] as f32, acc[1] as f32, acc[2] as f32]
     }
 
     /// Reconstruct absolute XYZ coordinates in the root cell's frame.
@@ -714,18 +722,25 @@ mod tests {
 
     #[test]
     fn world_pos_round_trip_at_various_depths() {
-        for depth in [1u8, 5, 10, 15] {
+        for depth in [1u8, 5, 10, 15, 20, 30, 40, 50, 60] {
             let original = [1.234, 0.567, 2.891];
             let p = Position::from_world_pos(original, depth);
             let back = p.world_pos();
+            // Tolerance ≈ cell extent at the anchoring depth — any
+            // round-trip through `from_world_pos` loses up to one
+            // cell's precision when discretizing XYZ into slot
+            // choices, but the reverse Horner in pos_in_ancestor_frame
+            // shouldn't add any further drift.
+            let tol = (3.0f32.powi(1 - depth as i32)).max(1e-6);
             for axis in 0..3 {
                 assert!(
-                    (back[axis] - original[axis]).abs() < 1e-3,
-                    "depth {} axis {} drifted: {} vs {}",
+                    (back[axis] - original[axis]).abs() <= tol,
+                    "depth {} axis {} drifted: {} vs {} (tol {})",
                     depth,
                     axis,
                     back[axis],
-                    original[axis]
+                    original[axis],
+                    tol
                 );
             }
         }
