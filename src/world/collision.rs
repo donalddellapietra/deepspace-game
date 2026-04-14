@@ -132,7 +132,12 @@ pub fn move_and_collide(
                     }
                 }
                 pos[1] = hi;
-                physics.velocity[1] = 0.0;
+                // Ground contact zeros accumulated velocity. Without
+                // this, off-axis gravity (e.g. radial gravity when the
+                // player walks away from a planet's pole) keeps
+                // building X/Z velocity forever, pulling the player
+                // "downhill" across frames even on flat walking.
+                physics.velocity = [0.0, 0.0, 0.0];
             } else {
                 pos[1] = new_y;
             }
