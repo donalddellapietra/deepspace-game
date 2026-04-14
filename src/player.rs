@@ -2,8 +2,10 @@
 
 use crate::camera::Camera;
 use crate::input::Keys;
+use crate::world::coords::ROOT_EXTENT;
 use crate::world::cubesphere::SphericalPlanet;
 use crate::world::sdf;
+use crate::world::tree::NodeLibrary;
 
 /// Step the camera forward one frame.
 ///
@@ -14,12 +16,21 @@ use crate::world::sdf;
 /// enough lets you escape. `target_up` blends between the
 /// planet's radial and world +Y with the same weight, so the
 /// horizon rotates gradually instead of snapping.
+///
+/// Movement mutates `camera.position` via `WorldPos::add_local`, so
+/// the player crosses cell boundaries exactly (anchor re-anchors
+/// on overflow, offset stays in `[0, 1)³`). Gravity/thrust math still
+/// reads the legacy `[f32; 3]` via the `world_pos_f32` shim — the
+/// gravity center of the demo planet is a world-space point, so
+/// there's no benefit yet from expressing it anchor-relative. That
+/// migration comes when the cubed-sphere body becomes a tree node.
 pub fn update(
     camera: &mut Camera,
     velocity: &mut [f32; 3],
     keys: &Keys,
     cell_size: f32,
     cs_planet: Option<&SphericalPlanet>,
+    library: &NodeLibrary,
     dt: f32,
 ) {
     let world_up = [0.0f32, 1.0, 0.0];
@@ -89,10 +100,23 @@ pub fn update(
         [0.0, 0.0, 0.0]
     };
 
-    let step = sdf::add(
+    let step_world = sdf::add(
         sdf::scale(*velocity, dt),
         sdf::scale(thrust, dt),
     );
-    let new_pos = sdf::add(camera.world_pos_f32(), step);
-    camera.set_world_pos_f32(new_pos);
+
+    // Convert the world-space step into offset-units at the camera's
+    // current anchor depth, then let `add_local` handle cell crossings
+    // and bubble-up. One offset unit = one cell width at anchor depth,
+    // which in world units is `ROOT_EXTENT / 3^depth`.
+    let depth = camera.position.anchor.depth();
+    let cell_world = ROOT_EXTENT / 3f32.powi(depth as i32);
+    let delta_local = [
+        step_world[0] / cell_world,
+        step_world[1] / cell_world,
+        step_world[2] / cell_world,
+    ];
+    let _transition = camera.position.add_local(delta_local, library);
+    // Sphere entry/exit/seam transitions will be dispatched here once
+    // the cubed-sphere body is represented as a tree node (step 8).
 }

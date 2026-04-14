@@ -136,6 +136,7 @@ impl App {
             &self.keys,
             cell_size,
             self.cs_planet.as_ref(),
+            &self.world.library,
             dt,
         );
 
