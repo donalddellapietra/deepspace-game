@@ -207,10 +207,10 @@ pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
     propagate_edit(world, hit, Child::Empty)
 }
 
-/// Place a block adjacent to the hit face. Handles both in-node
-/// placement (neighbor within same 3x3x3) and cross-node placement
-/// (neighbor in a different node, resolved via world-space point lookup).
-pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
+/// Place any child (block or subtree) adjacent to the hit face.
+/// For blocks, use `Child::Block(idx)`. For saved meshes, use
+/// `Child::Node(saved_node_id)`.
+pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bool {
     let (_parent_id, slot) = *hit.path.last().unwrap();
     let (x, y, z) = slot_coords(slot);
     let (dx, dy, dz): (i32, i32, i32) = match hit.face {
@@ -243,7 +243,7 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> boo
 
         let mut place_hit = hit.clone();
         place_hit.path.last_mut().unwrap().1 = adj_slot;
-        return propagate_edit(world, &place_hit, Child::Block(block_type));
+        return propagate_edit(world, &place_hit, new_child);
     }
 
     // Cross-node: compute world-space target center and look up from root.
@@ -255,17 +255,22 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> boo
         (aabb_min[2] + aabb_max[2]) * 0.5 + dz as f32 * cell_size,
     ];
 
-    place_at_point(world, target, hit.path.len(), block_type)
+    place_child_at_point(world, target, hit.path.len(), new_child)
+}
+
+/// Convenience wrapper: place a single block adjacent to hit face.
+pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
+    place_child(world, hit, Child::Block(block_type))
 }
 
 /// Place a block at the given world-space point, descending `depth`
 /// levels from root. If the path crosses empty subtrees, intermediate
 /// nodes are materialized automatically.
-fn place_at_point(
+fn place_child_at_point(
     world: &mut WorldState,
     target: [f32; 3],
     depth: usize,
-    block_type: u8,
+    new_child: Child,
 ) -> bool {
     // Bounds check: must be inside root [0, 3).
     if target[0] < 0.0 || target[0] >= 3.0
@@ -309,11 +314,11 @@ fn place_at_point(
             Child::Empty if is_last => {
                 // Target cell is empty at the right depth — place directly.
                 let place_hit = HitInfo { path, face: 0, t: 0.0 };
-                return propagate_edit(world, &place_hit, Child::Block(block_type));
+                return propagate_edit(world, &place_hit, new_child);
             }
             Child::Empty => {
                 // Empty subtree but we need to go deeper. Build a chain
-                // of empty nodes with the block at the target position.
+                // of empty nodes with the child at the target position.
                 let child_origin = [
                     origin[0] + cell[0] as f32 * cell_size,
                     origin[1] + cell[1] as f32 * cell_size,
@@ -326,7 +331,7 @@ fn place_at_point(
                     child_origin,
                     cell_size / 3.0,
                     remaining,
-                    block_type,
+                    new_child,
                 );
                 let place_hit = HitInfo { path, face: 0, t: 0.0 };
                 return propagate_edit(world, &place_hit, Child::Node(chain_id));
@@ -350,7 +355,7 @@ fn build_placement_chain(
     mut origin: [f32; 3],
     mut cell_size: f32,
     remaining: usize,
-    block_type: u8,
+    leaf_child: Child,
 ) -> NodeId {
     let mut slots = Vec::with_capacity(remaining);
     for _ in 0..remaining {
@@ -369,8 +374,8 @@ fn build_placement_chain(
         cell_size /= 3.0;
     }
 
-    // Build bottom-up: block at the deepest level, wrapped in empty nodes.
-    let mut child = Child::Block(block_type);
+    // Build bottom-up: leaf child at the deepest level, wrapped in empty nodes.
+    let mut child = leaf_child;
     for &slot in slots.iter().rev() {
         let mut children = empty_children();
         children[slot] = child;

@@ -10,7 +10,8 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use deepspace_game::game_state::{GameUiState, HotbarItem, SavedMeshes};
 use deepspace_game::renderer::Renderer;
-use deepspace_game::world::collision::{self, PlayerPhysics};
+// Collision module exists but is disabled pending proper layer-aware probing.
+// use deepspace_game::world::collision::{self, PlayerPhysics};
 use deepspace_game::world::edit;
 use deepspace_game::world::gpu::{self, GpuCamera};
 use deepspace_game::world::palette::ColorRegistry;
@@ -103,7 +104,6 @@ struct App {
     zoom_level: i32,
     /// Cached tree depth (recomputed only after edits).
     tree_depth: u32,
-    physics: PlayerPhysics,
     palette: ColorRegistry,
     saved_meshes: SavedMeshes,
     save_mode: bool,
@@ -136,7 +136,6 @@ impl App {
             last_frame: std::time::Instant::now(),
             zoom_level: 0,
             tree_depth,
-            physics: PlayerPhysics::default(),
             palette: ColorRegistry::new(),
             saved_meshes: SavedMeshes::default(),
             save_mode: false,
@@ -158,53 +157,26 @@ impl App {
         let right = self.camera.right();
 
         let mut dx = 0.0f32;
+        let mut dy = 0.0f32;
         let mut dz = 0.0f32;
 
         if self.keys.w { dx += fwd[0]; dz += fwd[2]; }
         if self.keys.s { dx -= fwd[0]; dz -= fwd[2]; }
         if self.keys.d { dx += right[0]; dz += right[2]; }
         if self.keys.a { dx -= right[0]; dz -= right[2]; }
+        if self.keys.space { dy += 1.0; }
+        if self.keys.shift { dy -= 1.0; }
 
-        // Jump.
-        if self.keys.space {
-            self.physics.jump();
+        let len = (dx * dx + dy * dy + dz * dz).sqrt();
+        if len > 0.001 {
+            let s = speed * dt / len;
+            self.camera.pos[0] += dx * s;
+            self.camera.pos[1] += dy * s;
+            self.camera.pos[2] += dz * s;
         }
 
-        // Normalize horizontal movement.
-        let len = (dx * dx + dz * dz).sqrt();
-        let move_xz = if len > 0.001 {
-            let s = speed * dt / len;
-            [dx * s, dz * s]
-        } else {
-            [0.0, 0.0]
-        };
-
-        // Swept-AABB collision against the tree.
-        // Collision probes 3 layers deeper than the edit layer so we
-        // see actual ground/air inside coarse nodes, but don't waste
-        // time descending to the finest leaf level.
-        let collision_depth = (self.edit_depth() + 3).min(self.tree_depth);
-        let root = self.world.root;
-        collision::move_and_collide(
-            &mut self.camera.pos,
-            &mut self.physics,
-            move_xz,
-            dt,
-            cell_size,
-            &self.world.library,
-            root,
-            collision_depth,
-        );
-
-        // Camera is at eye height above feet.
-        let eye_height = collision::PLAYER_H * cell_size * 0.9;
-        let mut gpu_pos = self.camera.pos;
-        gpu_pos[1] += eye_height;
-
         if let Some(renderer) = &self.renderer {
-            let mut cam = self.camera.gpu_camera(1.2);
-            cam.pos = gpu_pos;
-            renderer.update_camera(&cam);
+            renderer.update_camera(&self.camera.gpu_camera(1.2));
         }
     }
 
@@ -235,34 +207,41 @@ impl App {
         );
     }
 
-    fn eye_pos(&self) -> [f32; 3] {
-        let td = self.tree_depth as i32;
-        let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
-        let eye_height = collision::PLAYER_H * cell_size * 0.9;
-        [self.camera.pos[0], self.camera.pos[1] + eye_height, self.camera.pos[2]]
-    }
-
     fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
-            self.eye_pos(), ray_dir, self.edit_depth(),
+            self.camera.pos, ray_dir, self.edit_depth(),
         );
         let Some(hit) = hit else { return };
 
         if self.save_mode {
             // Save mode: capture the subtree under the crosshair.
-            // The last path entry's parent contains the hit child.
-            // Walk to the Node child at the hit slot to get its NodeId.
+            // The hit path gives us (parent_id, slot) pairs from root.
+            // We want to save the deepest Node in the path — that's
+            // the natural "block" at the current zoom level.
+            //
+            // If the hit child is a Node, save it directly.
+            // If it's a Block terminal, go one level up and save the
+            // parent node (which contains this block as a child).
+            use deepspace_game::world::tree::Child;
+            let mut saved_id = None;
             if let Some(&(parent_id, slot)) = hit.path.last() {
                 if let Some(node) = self.world.library.get(parent_id) {
-                    if let deepspace_game::world::tree::Child::Node(child_id) = node.children[slot] {
-                        self.world.library.ref_inc(child_id);
-                        let idx = self.saved_meshes.save(child_id);
-                        self.ui.slots[self.ui.active_slot] = HotbarItem::Mesh(idx);
-                        log::info!("Saved mesh #{idx} (node {child_id})");
+                    match node.children[slot] {
+                        Child::Node(child_id) => saved_id = Some(child_id),
+                        Child::Block(_) | Child::Empty => {
+                            // Hit a terminal — save the parent node instead.
+                            saved_id = Some(parent_id);
+                        }
                     }
                 }
+            }
+            if let Some(node_id) = saved_id {
+                self.world.library.ref_inc(node_id);
+                let idx = self.saved_meshes.save(node_id);
+                self.ui.slots[self.ui.active_slot] = HotbarItem::Mesh(idx);
+                log::info!("Saved mesh #{idx} (node {node_id})");
             }
             self.save_mode = false;
             return;
@@ -277,7 +256,7 @@ impl App {
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
-            self.eye_pos(), ray_dir, self.edit_depth(),
+            self.camera.pos, ray_dir, self.edit_depth(),
         );
         let Some(hit) = hit else { return };
 
@@ -290,11 +269,14 @@ impl App {
             HotbarItem::Mesh(idx) => {
                 let Some(saved) = self.saved_meshes.items.get(*idx) else { return };
                 let node_id = saved.node_id;
-                // Place the subtree adjacent to the hit face.
-                // Compute the path to the adjacent cell.
-                let path: Vec<usize> = hit.path.iter().map(|&(_, slot)| slot).collect();
-                edit::install_subtree(&mut self.world, &path, node_id);
-                self.upload_tree();
+                // Place the subtree adjacent to the hit face, same as blocks.
+                if edit::place_child(
+                    &mut self.world,
+                    &hit,
+                    deepspace_game::world::tree::Child::Node(node_id),
+                ) {
+                    self.upload_tree();
+                }
             }
         }
     }
@@ -329,7 +311,7 @@ impl App {
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
-            self.eye_pos(), ray_dir, self.edit_depth(),
+            self.camera.pos, ray_dir, self.edit_depth(),
         );
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(hit.as_ref().map(edit::hit_aabb));
