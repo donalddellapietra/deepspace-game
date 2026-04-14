@@ -10,6 +10,7 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use deepspace_game::game_state::GameUiState;
 use deepspace_game::renderer::Renderer;
+use deepspace_game::world::collision::{self, PlayerPhysics};
 use deepspace_game::world::edit;
 use deepspace_game::world::gpu::{self, GpuCamera};
 use deepspace_game::world::state::WorldState;
@@ -101,6 +102,7 @@ struct App {
     zoom_level: i32,
     /// Cached tree depth (recomputed only after edits).
     tree_depth: u32,
+    physics: PlayerPhysics,
     ui: GameUiState,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
@@ -130,6 +132,7 @@ impl App {
             last_frame: std::time::Instant::now(),
             zoom_level: 0,
             tree_depth,
+            physics: PlayerPhysics::default(),
             ui: GameUiState::new(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
@@ -148,26 +151,50 @@ impl App {
         let right = self.camera.right();
 
         let mut dx = 0.0f32;
-        let mut dy = 0.0f32;
         let mut dz = 0.0f32;
 
         if self.keys.w { dx += fwd[0]; dz += fwd[2]; }
         if self.keys.s { dx -= fwd[0]; dz -= fwd[2]; }
         if self.keys.d { dx += right[0]; dz += right[2]; }
         if self.keys.a { dx -= right[0]; dz -= right[2]; }
-        if self.keys.space { dy += 1.0; }
-        if self.keys.shift { dy -= 1.0; }
 
-        let len = (dx * dx + dy * dy + dz * dz).sqrt();
-        if len > 0.001 {
-            let s = speed * dt / len;
-            self.camera.pos[0] += dx * s;
-            self.camera.pos[1] += dy * s;
-            self.camera.pos[2] += dz * s;
+        // Jump.
+        if self.keys.space {
+            self.physics.jump();
         }
 
+        // Normalize horizontal movement.
+        let len = (dx * dx + dz * dz).sqrt();
+        let move_xz = if len > 0.001 {
+            let s = speed * dt / len;
+            [dx * s, dz * s]
+        } else {
+            [0.0, 0.0]
+        };
+
+        // Swept-AABB collision against the tree.
+        let edit_depth = self.edit_depth();
+        let root = self.world.root;
+        collision::move_and_collide(
+            &mut self.camera.pos,
+            &mut self.physics,
+            move_xz,
+            dt,
+            cell_size,
+            &self.world.library,
+            root,
+            edit_depth,
+        );
+
+        // Camera is at eye height above feet.
+        let eye_height = collision::PLAYER_H * cell_size * 0.9;
+        let mut gpu_pos = self.camera.pos;
+        gpu_pos[1] += eye_height;
+
         if let Some(renderer) = &self.renderer {
-            renderer.update_camera(&self.camera.gpu_camera(1.2));
+            let mut cam = self.camera.gpu_camera(1.2);
+            cam.pos = gpu_pos;
+            renderer.update_camera(&cam);
         }
     }
 
@@ -198,11 +225,18 @@ impl App {
         );
     }
 
+    fn eye_pos(&self) -> [f32; 3] {
+        let td = self.tree_depth as i32;
+        let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
+        let eye_height = collision::PLAYER_H * cell_size * 0.9;
+        [self.camera.pos[0], self.camera.pos[1] + eye_height, self.camera.pos[2]]
+    }
+
     fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
-            self.camera.pos, ray_dir, self.edit_depth(),
+            self.eye_pos(), ray_dir, self.edit_depth(),
         );
         if let Some(hit) = hit {
             if edit::break_block(&mut self.world, &hit) {
@@ -216,7 +250,7 @@ impl App {
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
-            self.camera.pos, ray_dir, self.edit_depth(),
+            self.eye_pos(), ray_dir, self.edit_depth(),
         );
         if let Some(hit) = hit {
             if edit::place_block(&mut self.world, &hit, block_type) {
@@ -255,7 +289,7 @@ impl App {
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
-            self.camera.pos, ray_dir, self.edit_depth(),
+            self.eye_pos(), ray_dir, self.edit_depth(),
         );
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(hit.as_ref().map(edit::hit_aabb));

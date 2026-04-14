@@ -208,11 +208,9 @@ pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
 }
 
 /// Place a block adjacent to the hit face.
-///
-/// When the adjacent cell is outside the current 3x3x3 node, walks up
-/// the path to find the correct parent where the neighbor lives, then
-/// descends back down into the neighbor subtree to find the right cell.
 pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: BlockType) -> bool {
+    let (_parent_id, slot) = *hit.path.last().unwrap();
+    let (x, y, z) = slot_coords(slot);
     let (dx, dy, dz): (i32, i32, i32) = match hit.face {
         0 => (1, 0, 0),
         1 => (-1, 0, 0),
@@ -223,118 +221,29 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: BlockType)
         _ => return false,
     };
 
-    // First try same-node placement (common case).
-    let (_parent_id, slot) = *hit.path.last().unwrap();
-    let (x, y, z) = slot_coords(slot);
     let nx = x as i32 + dx;
     let ny = y as i32 + dy;
     let nz = z as i32 + dz;
 
-    if nx >= 0 && nx <= 2 && ny >= 0 && ny <= 2 && nz >= 0 && nz <= 2 {
-        // Same-node: simple adjacent placement.
-        let adj_slot = slot_index(nx as usize, ny as usize, nz as usize);
-        let parent_id = hit.path.last().unwrap().0;
-        let node = match world.library.get(parent_id) {
-            Some(n) => n,
-            None => return false,
-        };
-        if !node.children[adj_slot].is_empty() {
-            return false;
-        }
-        let mut place_hit = hit.clone();
-        place_hit.path.last_mut().unwrap().1 = adj_slot;
-        return propagate_edit(world, &place_hit, Child::Block(block_type));
+    if nx < 0 || nx > 2 || ny < 0 || ny > 2 || nz < 0 || nz > 2 {
+        return false;
     }
 
-    // Cross-node: walk up the path carrying the overflow, then descend
-    // back into the neighbor subtree.
-    let original_depth = hit.path.len();
-    let mut carry = [dx, dy, dz];
-    let mut walk_depth = hit.path.len();
+    let adj_slot = slot_index(nx as usize, ny as usize, nz as usize);
+    let parent_id = hit.path.last().unwrap().0;
 
-    loop {
-        if walk_depth == 0 {
-            return false; // outside world
-        }
-        walk_depth -= 1;
+    let node = match world.library.get(parent_id) {
+        Some(n) => n,
+        None => return false,
+    };
 
-        let (_node_id, slot) = hit.path[walk_depth];
-        let (cx, cy, cz) = slot_coords(slot);
-        let adj_x = cx as i32 + carry[0];
-        let adj_y = cy as i32 + carry[1];
-        let adj_z = cz as i32 + carry[2];
-
-        if adj_x >= 0 && adj_x <= 2 && adj_y >= 0 && adj_y <= 2 && adj_z >= 0 && adj_z <= 2 {
-            // Found the parent level where the neighbor is in-bounds.
-            let adj_slot = slot_index(adj_x as usize, adj_y as usize, adj_z as usize);
-            let parent_id = hit.path[walk_depth].0;
-
-            // Now descend from this level back to the original depth.
-            // At each level, pick the child cell closest to the face we're
-            // placing against (e.g., placing above = enter at y=0).
-            let levels_to_descend = original_depth - walk_depth - 1;
-            let mut path = hit.path[..=walk_depth].to_vec();
-            path[walk_depth].1 = adj_slot;
-
-            let mut current_node_id = parent_id;
-            let mut current_slot = adj_slot;
-
-            for _level in 0..levels_to_descend {
-                let node = match world.library.get(current_node_id) {
-                    Some(n) => n,
-                    None => return false,
-                };
-                match node.children[current_slot] {
-                    Child::Empty => {
-                        // Empty at a coarser level — place here.
-                        let place_hit = HitInfo {
-                            path,
-                            face: hit.face,
-                            t: hit.t,
-                        };
-                        return propagate_edit(world, &place_hit, Child::Block(block_type));
-                    }
-                    Child::Block(_) => {
-                        return false; // occupied
-                    }
-                    Child::Node(child_id) => {
-                        // Descend into this node. Pick the face-adjacent cell:
-                        // e.g., dx=+1 means we entered from -X, so child x=0.
-                        let child_x = if dx > 0 { 0 } else if dx < 0 { 2 } else { 1 };
-                        let child_y = if dy > 0 { 0 } else if dy < 0 { 2 } else { 1 };
-                        let child_z = if dz > 0 { 0 } else if dz < 0 { 2 } else { 1 };
-                        current_slot = slot_index(child_x, child_y, child_z);
-                        current_node_id = child_id;
-                        path.push((child_id, current_slot));
-                    }
-                }
-            }
-
-            // At the target depth — check if the cell is empty.
-            let node = match world.library.get(current_node_id) {
-                Some(n) => n,
-                None => return false,
-            };
-            return match node.children[current_slot] {
-                Child::Empty => {
-                    let place_hit = HitInfo {
-                        path,
-                        face: hit.face,
-                        t: hit.t,
-                    };
-                    propagate_edit(world, &place_hit, Child::Block(block_type))
-                }
-                _ => false, // occupied
-            };
-        } else {
-            // Still out of bounds — propagate carry to the parent.
-            carry = [
-                if adj_x < 0 { -1 } else if adj_x > 2 { 1 } else { 0 },
-                if adj_y < 0 { -1 } else if adj_y > 2 { 1 } else { 0 },
-                if adj_z < 0 { -1 } else if adj_z > 2 { 1 } else { 0 },
-            ];
-        }
+    if !node.children[adj_slot].is_empty() {
+        return false;
     }
+
+    let mut place_hit = hit.clone();
+    place_hit.path.last_mut().unwrap().1 = adj_slot;
+    propagate_edit(world, &place_hit, Child::Block(block_type))
 }
 
 /// Apply an edit and propagate clone-on-write up to root.
@@ -444,6 +353,68 @@ fn cell_entry_t(frame: &Frame, ray_origin: &[f32; 3], inv_dir: &[f32; 3]) -> f32
     ];
     let (t_enter, _) = ray_aabb(*ray_origin, *inv_dir, cell_min, cell_max);
     t_enter
+}
+
+/// Check whether the cell at world-space position `pos` is solid at
+/// the given tree depth. Walks the tree from root, mapping the
+/// position to slot indices at each level. Returns true if the cell
+/// is Block or Node (has content); false if Empty or out of bounds.
+pub fn is_solid_at(
+    library: &NodeLibrary,
+    root: NodeId,
+    pos: [f32; 3],
+    max_depth: u32,
+) -> bool {
+    // The root spans [0, 3) on each axis.
+    if pos[0] < 0.0 || pos[0] >= 3.0
+        || pos[1] < 0.0 || pos[1] >= 3.0
+        || pos[2] < 0.0 || pos[2] >= 3.0
+    {
+        return false;
+    }
+
+    let mut node_id = root;
+    let mut node_origin = [0.0f32; 3];
+    let mut cell_size = 1.0f32; // each cell at this level
+
+    for depth in 0..max_depth {
+        let node = match library.get(node_id) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        // Which cell does pos fall into at this level?
+        let cx = ((pos[0] - node_origin[0]) / cell_size).floor() as i32;
+        let cy = ((pos[1] - node_origin[1]) / cell_size).floor() as i32;
+        let cz = ((pos[2] - node_origin[2]) / cell_size).floor() as i32;
+
+        if cx < 0 || cx > 2 || cy < 0 || cy > 2 || cz < 0 || cz > 2 {
+            return false;
+        }
+
+        let slot = slot_index(cx as usize, cy as usize, cz as usize);
+        match node.children[slot] {
+            Child::Empty => return false,
+            Child::Block(_) => return true,
+            Child::Node(child_id) => {
+                if depth + 1 >= max_depth {
+                    return true; // at max depth, treat node as solid
+                }
+                // Descend.
+                node_origin = [
+                    node_origin[0] + cx as f32 * cell_size,
+                    node_origin[1] + cy as f32 * cell_size,
+                    node_origin[2] + cz as f32 * cell_size,
+                ];
+                cell_size /= 3.0;
+                node_id = child_id;
+            }
+        }
+    }
+
+    // Reached max_depth without resolving — treat as solid if we're
+    // still inside a node.
+    true
 }
 
 /// Compute the world-space AABB of the block at the hit location.
