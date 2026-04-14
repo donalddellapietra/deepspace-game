@@ -79,11 +79,29 @@ impl App {
         let tree_depth = world.tree_depth();
 
         let setup = crate::world::spherical_worldgen::demo_planet();
-        let cs_planet = crate::world::spherical_worldgen::build(&mut world.library, &setup);
+        let built = crate::world::spherical_worldgen::build(&mut world.library, &setup);
+        let cs_planet = built.planet.clone();
+        let body_node = built.body_node;
+
+        // Install the body as root's center-slot child. Reinsert the
+        // root (content-addressed so a new NodeId), rotate ref counts.
+        let body_slot = crate::world::tree::slot_index(1, 1, 1);
+        let mut root_children = world.library
+            .get(world.root)
+            .expect("root node missing")
+            .children;
+        root_children[body_slot] = crate::world::tree::Child::Node(body_node);
+        let new_root = world.library.insert(root_children);
+        world.library.ref_inc(new_root);
+        world.library.ref_dec(world.root);
+        world.root = new_root;
+
         eprintln!(
-            "Spherical planet generated: 6 face subtrees, library now {} nodes",
+            "Spherical planet generated: 6 face subtrees, library now {} nodes, body at path {:?}",
             world.library.len(),
+            built.body_path,
         );
+        let _ = body_node;
 
         // Spawn exactly on the outer shell of the planet at layer 10.
         // At depth = tree_depth - 10 the cell_size-scaled gravity is

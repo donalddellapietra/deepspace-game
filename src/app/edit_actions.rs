@@ -230,7 +230,7 @@ impl App {
         if let Some(p) = self.cs_planet.as_ref() {
             roots.extend_from_slice(&p.face_roots);
         }
-        let (tree_data, root_indices) = gpu::pack_tree_lod_multi(
+        let (tree_data, kinds_data, root_indices) = gpu::pack_tree_lod_multi(
             &self.world.library,
             &roots,
             self.camera_pos_in_render_frame(),
@@ -238,7 +238,7 @@ impl App {
             1.2,
         );
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, root_indices[0]);
+            renderer.update_tree(&tree_data, &kinds_data, root_indices[0]);
             if self.cs_planet.is_some() {
                 let face_roots: [u32; 6] = [
                     root_indices[1], root_indices[2], root_indices[3],

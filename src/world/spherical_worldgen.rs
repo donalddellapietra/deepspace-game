@@ -24,7 +24,9 @@
 use super::cubesphere::{generate_spherical_planet, SphericalPlanet};
 use super::palette::block;
 use super::sdf::{Planet, Vec3};
-use super::tree::NodeLibrary;
+use super::tree::{
+    empty_children, slot_index, Child, NodeId, NodeKind, NodeLibrary,
+};
 
 /// Declarative description of a planet to build. All units are in
 /// world space. `depth` is the face-subtree recursion depth.
@@ -37,12 +39,18 @@ pub struct PlanetSetup {
     pub sdf: Planet,
 }
 
-/// The demo/starter planet used by the default world. Edit this
-/// function to tune the starting scene.
+/// The demo/starter planet. Center sits at the middle of the root
+/// cell `[0, 3)³` so the planet's body-cell is the root-center slot
+/// (path `[13]`), a 1×1×1 world cube at `[1, 2)³`. That keeps the
+/// sphere strictly inside one parent cell, a hard requirement of the
+/// `CubedSphereBody` node kind (doc §3).
 pub fn demo_planet() -> PlanetSetup {
-    let center: Vec3 = [1.5, 2.3, 1.5];
+    let center: Vec3 = [1.5, 1.5, 1.5];
     let inner_r = 0.12_f32;
-    let outer_r = 0.52_f32;
+    // Body cell extent is 1.0 (root's child at slot 13), so world
+    // outer_r == body-local outer_r. The hard cap is 0.5 (§3) so the
+    // sphere doesn't poke past the body cell; pick 0.5 exactly.
+    let outer_r = 0.5_f32;
     PlanetSetup {
         center,
         inner_r,
@@ -62,17 +70,63 @@ pub fn demo_planet() -> PlanetSetup {
     }
 }
 
-/// Generate the planet's 6 face subtrees into `lib` and return a
-/// [`SphericalPlanet`] handle.
-pub fn build(lib: &mut NodeLibrary, setup: &PlanetSetup) -> SphericalPlanet {
-    generate_spherical_planet(
+/// Result of building a planet: the `SphericalPlanet` handle (center,
+/// radii, face-root ids — kept for the legacy uniform upload path)
+/// plus the body node that owns the face subtrees in the tree. Step
+/// C deletes the handle once the shader dispatches on `NodeKind`.
+pub struct BuiltPlanet {
+    pub planet: SphericalPlanet,
+    pub body_node: NodeId,
+    pub body_path: Vec<u8>,
+}
+
+/// Generate the planet's 6 face subtrees into `lib`, wrap them in a
+/// `CubedSphereBody` node with the face subtrees attached at the
+/// six face-center child slots, and return the body. The caller is
+/// expected to install the body at `root_children[slot_index(1,1,1)]`
+/// and reinsert the tree root.
+pub fn build(lib: &mut NodeLibrary, setup: &PlanetSetup) -> BuiltPlanet {
+    let planet = generate_spherical_planet(
         lib,
         setup.center,
         setup.inner_r,
         setup.outer_r,
         setup.depth,
         &setup.sdf,
-    )
+    );
+
+    // Interior filler: a uniform subtree of core blocks of depth
+    // matching the face subtrees, so the body's inner cavity looks
+    // right when the player tunnels through.
+    let filler_child = lib.build_uniform_subtree(setup.sdf.core_block, setup.depth);
+
+    // Assemble the body's 27 children. Six face-center slots hold the
+    // face subtrees (order: +X, −X, +Y, −Y, +Z, −Z). Center slot is
+    // the interior filler; the other 20 slots are Empty.
+    let mut body_children = empty_children();
+    body_children[slot_index(2, 1, 1)] = Child::Node(planet.face_roots[0]); // +X
+    body_children[slot_index(0, 1, 1)] = Child::Node(planet.face_roots[1]); // −X
+    body_children[slot_index(1, 2, 1)] = Child::Node(planet.face_roots[2]); // +Y
+    body_children[slot_index(1, 0, 1)] = Child::Node(planet.face_roots[3]); // −Y
+    body_children[slot_index(1, 1, 2)] = Child::Node(planet.face_roots[4]); // +Z
+    body_children[slot_index(1, 1, 0)] = Child::Node(planet.face_roots[5]); // −Z
+    body_children[slot_index(1, 1, 1)] = filler_child;
+
+    // Body radii in body-cell local frame `[0, 1)³`. Cell extent is
+    // 1.0 (root's slot 13) so local == world for this demo.
+    let body_node = lib.insert_with_kind(
+        body_children,
+        NodeKind::CubedSphereBody {
+            inner_r: setup.inner_r,
+            outer_r: setup.outer_r,
+        },
+    );
+
+    BuiltPlanet {
+        planet,
+        body_node,
+        body_path: vec![slot_index(1, 1, 1) as u8],
+    }
 }
 
 // ───────────────────────────────────────────────────────── tests
@@ -106,7 +160,8 @@ mod tests {
     fn build_produces_six_face_roots_in_library() {
         let mut lib = NodeLibrary::default();
         let setup = demo_planet();
-        let planet = build(&mut lib, &setup);
+        let built = build(&mut lib, &setup);
+        let planet = &built.planet;
         assert_eq!(planet.face_roots.len(), 6);
         for &id in &planet.face_roots {
             assert!(
@@ -118,5 +173,37 @@ mod tests {
         assert_eq!(planet.inner_r, setup.inner_r);
         assert_eq!(planet.outer_r, setup.outer_r);
         assert_eq!(planet.depth, setup.depth);
+    }
+
+    #[test]
+    fn build_produces_body_node_with_cubed_sphere_body_kind() {
+        let mut lib = NodeLibrary::default();
+        let setup = demo_planet();
+        let built = build(&mut lib, &setup);
+        let body = lib.get(built.body_node).expect("body node present");
+        match body.kind {
+            NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                assert!((inner_r - setup.inner_r).abs() < 1e-6);
+                assert!((outer_r - setup.outer_r).abs() < 1e-6);
+            }
+            _ => panic!("body node has non-body kind: {:?}", body.kind),
+        }
+        // 6 face-center slots should hold the face subtrees.
+        let face_slots = [
+            (slot_index(2, 1, 1), 0), // +X
+            (slot_index(0, 1, 1), 1), // −X
+            (slot_index(1, 2, 1), 2), // +Y
+            (slot_index(1, 0, 1), 3), // −Y
+            (slot_index(1, 1, 2), 4), // +Z
+            (slot_index(1, 1, 0), 5), // −Z
+        ];
+        for (slot, face_idx) in face_slots {
+            match body.children[slot] {
+                Child::Node(id) => assert_eq!(id, built.planet.face_roots[face_idx]),
+                other => panic!("slot {} not a Node: {:?}", slot, other),
+            }
+        }
+        // Path is just the root-center slot.
+        assert_eq!(built.body_path, vec![slot_index(1, 1, 1) as u8]);
     }
 }

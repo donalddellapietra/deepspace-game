@@ -6,7 +6,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuChild, GpuPalette};
+use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -41,6 +41,7 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     tree_buffer: wgpu::Buffer,
+    kinds_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     uniforms_buffer: wgpu::Buffer,
@@ -62,6 +63,7 @@ impl Renderer {
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
         tree_data: &[GpuChild],
+        kinds_data: &[GpuNodeKind],
         root_index: u32,
     ) -> Self {
         let size = window.inner_size();
@@ -120,6 +122,12 @@ impl Renderer {
         let tree_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree"),
             contents: bytemuck::cast_slice(tree_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let kinds_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("kinds"),
+            contents: bytemuck::cast_slice(kinds_data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -213,6 +221,16 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -224,6 +242,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: uniforms_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: kinds_buffer.as_entire_binding() },
             ],
         });
 
@@ -279,6 +298,7 @@ impl Renderer {
             pipeline,
             bind_group_layout,
             tree_buffer,
+            kinds_buffer,
             camera_buffer,
             palette_buffer,
             uniforms_buffer,
@@ -420,20 +440,41 @@ impl Renderer {
 
     /// Re-upload the tree buffer after an edit. Recreates the buffer
     /// and bind group if the size changed.
-    pub fn update_tree(&mut self, tree_data: &[GpuChild], root_index: u32) {
+    pub fn update_tree(
+        &mut self,
+        tree_data: &[GpuChild],
+        kinds_data: &[GpuNodeKind],
+        root_index: u32,
+    ) {
         self.root_index = root_index;
         self.node_count = (tree_data.len() / 27) as u32;
 
-        let new_size = (tree_data.len() * std::mem::size_of::<GpuChild>()) as u64;
+        let new_tree_size = (tree_data.len() * std::mem::size_of::<GpuChild>()) as u64;
+        let new_kinds_size = (kinds_data.len() * std::mem::size_of::<GpuNodeKind>()) as u64;
+        let tree_grew = new_tree_size > self.tree_buffer.size();
+        let kinds_grew = new_kinds_size > self.kinds_buffer.size();
 
-        if new_size > self.tree_buffer.size() {
-            // Buffer too small — recreate.
+        if tree_grew {
             self.tree_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tree"),
                 contents: bytemuck::cast_slice(tree_data),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             });
-            // Recreate bind group with new buffer.
+        } else {
+            self.queue.write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
+        }
+
+        if kinds_grew {
+            self.kinds_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("kinds"),
+                contents: bytemuck::cast_slice(kinds_data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+        } else {
+            self.queue.write_buffer(&self.kinds_buffer, 0, bytemuck::cast_slice(kinds_data));
+        }
+
+        if tree_grew || kinds_grew {
             self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ray_march"),
                 layout: &self.bind_group_layout,
@@ -442,10 +483,9 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 1, resource: self.camera_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: self.palette_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: self.uniforms_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: self.kinds_buffer.as_entire_binding() },
                 ],
             });
-        } else {
-            self.queue.write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
         }
 
         self.write_uniforms();

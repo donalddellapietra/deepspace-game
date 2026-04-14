@@ -23,6 +23,49 @@ pub struct GpuChild {
 /// One node in the GPU buffer = 27 GpuChild = 216 bytes.
 pub const GPU_NODE_SIZE: usize = 27;
 
+/// Per-node kind descriptor, uploaded as a storage buffer parallel to
+/// the tree. Indexed by the node's buffer index. The shader reads it
+/// to dispatch between Cartesian DDA, cubed-sphere body, and cubed-
+/// sphere face semantics.
+///
+/// Encoding matches [`crate::world::tree::NodeKind`]:
+/// - `tag = 0` → Cartesian (fields zero).
+/// - `tag = 1` → CubedSphereBody (`inner_r`, `outer_r` in body-cell
+///   local frame; `face` unused).
+/// - `tag = 2` → CubedSphereFace (`face` ∈ 0..=5; radii unused).
+///
+/// 16 bytes, std430-safe.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct GpuNodeKind {
+    pub tag: u32,
+    pub inner_r: f32,
+    pub outer_r: f32,
+    pub face: u32,
+}
+
+impl GpuNodeKind {
+    pub const CARTESIAN: Self = Self { tag: 0, inner_r: 0.0, outer_r: 0.0, face: 0 };
+
+    pub fn from_node_kind(kind: &NodeKind) -> Self {
+        match *kind {
+            NodeKind::Cartesian => Self::CARTESIAN,
+            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
+                tag: 1,
+                inner_r,
+                outer_r,
+                face: 0,
+            },
+            NodeKind::CubedSphereFace { face } => Self {
+                tag: 2,
+                inner_r: 0.0,
+                outer_r: 0.0,
+                face: face as u32,
+            },
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuCamera {
@@ -56,11 +99,12 @@ impl Default for GpuPalette {
 }
 
 /// Pack the visible portion of the tree into a flat GPU buffer.
-/// Returns (node_data, root_buffer_index).
+/// Returns `(node_data, kinds, root_buffer_index)`. `kinds[i]` is the
+/// kind of the i-th packed node.
 pub fn pack_tree(
     library: &NodeLibrary,
     root: NodeId,
-) -> (Vec<GpuChild>, u32) {
+) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     // BFS to collect all reachable nodes. `ordered` doubles as the
     // queue (head advances through it) and the result (insertion order
     // = buffer order).
@@ -121,7 +165,16 @@ pub fn pack_tree(
     }
 
     let root_idx = *visited.get(&root).unwrap();
-    (data, root_idx)
+    let kinds: Vec<GpuNodeKind> = ordered
+        .iter()
+        .map(|&nid| {
+            library
+                .get(nid)
+                .map(|n| GpuNodeKind::from_node_kind(&n.kind))
+                .unwrap_or(GpuNodeKind::CARTESIAN)
+        })
+        .collect();
+    (data, kinds, root_idx)
 }
 
 /// LOD-aware tree packing: only uploads nodes large enough to see.
@@ -140,7 +193,7 @@ pub fn pack_tree_lod(
     camera_pos: [f32; 3],
     screen_height: f32,
     fov: f32,
-) -> (Vec<GpuChild>, u32) {
+) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
 
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
@@ -269,7 +322,16 @@ pub fn pack_tree_lod(
     }
 
     let root_idx = *visited.get(&root).unwrap();
-    (data, root_idx)
+    let kinds: Vec<GpuNodeKind> = ordered
+        .iter()
+        .map(|&nid| {
+            library
+                .get(nid)
+                .map(|n| GpuNodeKind::from_node_kind(&n.kind))
+                .unwrap_or(GpuNodeKind::CARTESIAN)
+        })
+        .collect();
+    (data, kinds, root_idx)
 }
 
 /// Like `pack_tree_lod`, but packs multiple root subtrees into the
@@ -286,7 +348,7 @@ pub fn pack_tree_lod_multi(
     camera_pos: [f32; 3],
     screen_height: f32,
     fov: f32,
-) -> (Vec<GpuChild>, Vec<u32>) {
+) -> (Vec<GpuChild>, Vec<GpuNodeKind>, Vec<u32>) {
     use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
 
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
@@ -412,7 +474,20 @@ pub fn pack_tree_lod_multi(
         .iter()
         .map(|r| *visited.get(r).expect("every root must be visited"))
         .collect();
-    (data, root_indices)
+
+    // Emit per-node kinds in the same BFS order as `ordered`. Length
+    // equals node count (= data.len() / GPU_NODE_SIZE).
+    let kinds: Vec<GpuNodeKind> = ordered
+        .iter()
+        .map(|&nid| {
+            library
+                .get(nid)
+                .map(|n| GpuNodeKind::from_node_kind(&n.kind))
+                .unwrap_or(GpuNodeKind::CARTESIAN)
+        })
+        .collect();
+
+    (data, kinds, root_indices)
 }
 
 #[cfg(test)]
@@ -422,7 +497,7 @@ mod tests {
     #[test]
     fn pack_test_world() {
         let world = super::super::state::WorldState::test_world();
-        let (data, root_idx) = pack_tree(&world.library, world.root);
+        let (data, _kinds, root_idx) = pack_tree(&world.library, world.root);
         // Verify data is a multiple of 27 (each node is 27 children).
         assert_eq!(data.len() % 27, 0);
         // Root is always first in BFS order.

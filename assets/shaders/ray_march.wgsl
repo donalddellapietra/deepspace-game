@@ -45,10 +45,21 @@ struct Uniforms {
     cs_face_roots_b: vec4<u32>,
 }
 
+/// Per-node kind descriptor, parallel to the tree buffer. Indexed by
+/// the node's buffer index. Tag: 0=Cartesian, 1=CubedSphereBody,
+/// 2=CubedSphereFace.
+struct GpuNodeKind {
+    tag: u32,
+    inner_r: f32,
+    outer_r: f32,
+    face: u32,
+}
+
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
 @group(0) @binding(1) var<uniform> camera: Camera;
 @group(0) @binding(2) var<uniform> palette: Palette;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
+@group(0) @binding(4) var<storage, read> kinds: array<GpuNodeKind>;
 
 // -------------- Tree access helpers --------------
 
@@ -405,7 +416,31 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.normal = normal;
             return result;
         } else if tag == 2u {
-            // Node — check if we should descend or treat as solid.
+            // Node — inspect its kind. A CubedSphereBody child is
+            // rendered by the sphere DDA below (driven by the
+            // cs_planet uniform until shader-side NodeKind dispatch
+            // lands in a later commit); here we just step past its
+            // cell as if it were Empty, so the Cartesian march
+            // doesn't try to interpret face-subtree children as
+            // axis-aligned voxels.
+            let ci = child_node_index(s_node_idx[depth], slot);
+            let kind_tag = kinds[ci].tag;
+            if kind_tag == 1u {
+                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                    s_cell[depth].x += step.x;
+                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                    s_cell[depth].y += step.y;
+                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                } else {
+                    s_cell[depth].z += step.z;
+                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                }
+                continue;
+            }
 
             // Hard depth limits.
             let at_max = depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH;
