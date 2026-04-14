@@ -245,15 +245,17 @@ impl App {
     /// Re-pack and upload the tree with LOD culling based on camera position.
     /// Called every frame so distant terrain stays flattened as the camera moves.
     pub(super) fn upload_tree_lod(&mut self) {
-        // Pack the render-frame ancestor plus (if present) the 6
-        // face subtrees of the spherical demo planet into one GPU
-        // buffer in a single pass.
         let (rf_origin, rf_cell, rf_node) = self.render_frame();
 
-        // The shader walks from `rf_node` and handles body/face
-        // dispatch via the per-node kind buffer — face subtrees are
-        // reached automatically through the body node's children.
-        let roots: Vec<u64> = vec![rf_node];
+        // Pin the body as a secondary pack root so it's always in
+        // the packed buffer — even when the camera has descended
+        // into a face subtree and the render frame no longer
+        // contains it. The shader reads the body's buffer index
+        // from a uniform, not from a tree walk.
+        let body_node = self.cs_planet.as_ref().map(|p| p.body_node);
+        let mut roots: Vec<u64> = vec![rf_node];
+        if let Some(b) = body_node { roots.push(b); }
+
         let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
             &roots,
@@ -263,9 +265,26 @@ impl App {
             rf_origin,
             rf_cell,
         );
+
+        // Derive the body's world frame from its anchor path, so the
+        // shader doesn't have to re-walk the tree. Body occupies one
+        // cell at `body_anchor.depth()` in world units.
+        let (body_world, body_idx) = if body_node.is_some() {
+            use crate::world::coords::{world_pos_to_f32, WorldPos, ROOT_EXTENT};
+            let cube_w = ROOT_EXTENT / 3f32.powi(self.body_anchor.depth() as i32);
+            let origin = world_pos_to_f32(&WorldPos {
+                anchor: self.body_anchor,
+                offset: [0.0, 0.0, 0.0],
+            });
+            ([origin[0], origin[1], origin[2], cube_w], root_indices[1])
+        } else {
+            ([0.0; 4], u32::MAX)
+        };
+
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &tree_metas, root_indices[0]);
             renderer.set_render_frame(rf_origin, rf_cell);
+            renderer.set_body(body_world, body_idx);
         }
     }
 

@@ -44,9 +44,18 @@ pub struct PlanetSetup {
 /// The demo/starter planet used by the default world. Edit this
 /// function to tune the starting scene.
 pub fn demo_planet() -> PlanetSetup {
-    let center: Vec3 = [1.5, 2.3, 1.5];
+    // Anchor slot (1, 2, 1) in the `[0, 3)` root frame spans
+    // [1, 2) × [2, 3) × [1, 2) — its cell center is (1.5, 2.5, 1.5).
+    // The body's local (0.5, 0.5, 0.5) maps to that world point, so
+    // both the SDF sampling (during worldgen) and the shader render
+    // must agree on this center. `inner_r` / `outer_r` are in the
+    // body cell's local `[0, 1)` frame; per decisions §3 they must
+    // satisfy `0 < inner_r < outer_r ≤ 0.5` so the shell fits
+    // strictly inside one parent cell.
+    let center: Vec3 = [1.5, 2.5, 1.5];
     let inner_r = 0.12_f32;
-    let outer_r = 0.52_f32;
+    let outer_r = 0.48_f32;
+    let surface_r = 0.5 * (inner_r + outer_r);
     PlanetSetup {
         center,
         inner_r,
@@ -54,7 +63,7 @@ pub fn demo_planet() -> PlanetSetup {
         depth: 20,
         sdf: Planet {
             center,
-            radius: 0.32,
+            radius: surface_r,
             noise_scale: 0.015,
             noise_freq: 8.0,
             noise_seed: 2024,

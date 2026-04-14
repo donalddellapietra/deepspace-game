@@ -43,6 +43,16 @@ struct Uniforms {
     // root-cell (root node spans [xyz, xyz + 3*w)). When the render
     // frame is the world root, this is (0, 0, 0, 1).
     render_frame: vec4<f32>,
+    // Sphere body's world frame: xyz = body cube's min corner,
+    // w = body cube side length. The body's center in world is
+    // `xyz + 0.5·w`, and shell radii are `inner_r·w` / `outer_r·w`
+    // using the radii on `node_metas[body_idx]`.
+    body_world: vec4<f32>,
+    // Packed-buffer index of the body node. 0xFFFFFFFF = no body.
+    body_idx: u32,
+    _body_pad0: u32,
+    _body_pad1: u32,
+    _body_pad2: u32,
 }
 
 /// Per-node metadata — the NodeKind exposed to the shader. Layout
@@ -285,53 +295,23 @@ fn body_frame_from(
     );
 }
 
-/// Locate a cubed-sphere body reachable from the render root.
-/// Covers the two cases the engine actually produces:
-///   1. Render root IS the body (camera inside the body subtree).
-///   2. Render root is Cartesian and has ONE body child (camera at
-///      a sibling of the body at the same anchor depth).
-/// A deeper search isn't wired in — the render frame policy
-/// (ancestor at depth − K) is tuned so this condition holds for
-/// normal gameplay.
+/// Read the body's world frame straight from the uniforms. The CPU
+/// side pins the body into the packed buffer as a secondary root
+/// and publishes its buffer index + world footprint, so the shader
+/// can march it regardless of where the camera is in the tree. No
+/// tree walk needed.
 fn find_visible_body() -> BodyFrame {
-    let rf_origin = uniforms.render_frame.xyz;
-    let rf_cell = uniforms.render_frame.w;
-    let root_idx = uniforms.root_index;
-    let root_meta = node_metas[root_idx];
-
-    // Case 1: render root is the body itself. Body's own cube spans
-    // `3 · rf_cell` — all three of the render frame's root cells.
-    if root_meta.kind_tag == 1u {
-        return body_frame_from(
-            root_idx,
-            rf_origin,
-            3.0 * rf_cell,
-            root_meta.inner_r,
-            root_meta.outer_r,
-        );
-    }
-
-    // Case 2: scan render root's 27 children for a body kind.
-    for (var s: u32 = 0u; s < 27u; s = s + 1u) {
-        let packed = child_packed(root_idx, s);
-        if child_tag(packed) != 2u { continue; }
-        let child_idx = child_node_index(root_idx, s);
-        let child_meta = node_metas[child_idx];
-        if child_meta.kind_tag != 1u { continue; }
-        let sx = f32(s % 3u);
-        let sy = f32((s / 3u) % 3u);
-        let sz = f32(s / 9u);
-        let child_origin = rf_origin + vec3<f32>(sx, sy, sz) * rf_cell;
-        return body_frame_from(
-            child_idx,
-            child_origin,
-            rf_cell,
-            child_meta.inner_r,
-            child_meta.outer_r,
-        );
-    }
-
-    return body_frame_none();
+    let buf_idx = uniforms.body_idx;
+    if buf_idx == 0xFFFFFFFFu { return body_frame_none(); }
+    let body_meta = node_metas[buf_idx];
+    if body_meta.kind_tag != 1u { return body_frame_none(); }
+    return body_frame_from(
+        buf_idx,
+        uniforms.body_world.xyz,
+        uniforms.body_world.w,
+        body_meta.inner_r,
+        body_meta.outer_r,
+    );
 }
 
 /// Yellow-rim highlight factor for a body-cell cursor. Compares the
