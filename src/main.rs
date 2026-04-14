@@ -8,11 +8,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
+use deepspace_game::game_state::GameUiState;
 use deepspace_game::renderer::Renderer;
 use deepspace_game::world::edit;
 use deepspace_game::world::gpu::{self, GpuCamera};
 use deepspace_game::world::state::WorldState;
-use deepspace_game::world::tree::BlockType;
 
 #[cfg(not(target_arch = "wasm32"))]
 use deepspace_game::overlay;
@@ -71,7 +71,6 @@ struct Keys {
 }
 
 impl Keys {
-    /// Apply a key press/release from a winit KeyCode.
     fn apply(&mut self, code: KeyCode, pressed: bool) {
         match code {
             KeyCode::KeyW => self.w = pressed,
@@ -84,7 +83,6 @@ impl Keys {
         }
     }
 
-    /// Clear all held keys (prevents "stuck keys" on focus transitions).
     fn clear(&mut self) {
         *self = Keys::default();
     }
@@ -100,21 +98,14 @@ struct App {
     cursor_locked: bool,
     keys: Keys,
     last_frame: std::time::Instant,
-    /// View layer: 0 = finest (individual blocks), positive = zoomed out (coarser).
-    /// Each step up multiplies interaction block size by 3× per axis.
-    view_layer: i32,
-    selected_block: BlockType,
+    zoom_level: i32,
+    ui: GameUiState,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
     frames_waited: u32,
-    /// Whether the React UI currently has pointer focus.
-    #[cfg(not(target_arch = "wasm32"))]
-    ui_focused: bool,
 }
 
-/// Wait this many frames before creating the WebView, giving the
-/// window and Metal surface time to initialise fully.
 #[cfg(not(target_arch = "wasm32"))]
 const WAIT_FRAMES: u32 = 10;
 
@@ -134,23 +125,17 @@ impl App {
             cursor_locked: false,
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
-            view_layer: 0,
-            selected_block: BlockType::Stone,
+            zoom_level: 0,
+            ui: GameUiState::new(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
             frames_waited: 0,
-            #[cfg(not(target_arch = "wasm32"))]
-            ui_focused: false,
         }
     }
 
     fn update(&mut self, dt: f32) {
-        // Speed: 5 interaction-cells per second at every view layer.
-        // Cell size at interaction layer = 1 / 3^(tree_depth - view_layer).
-        let td = self.world.tree_depth() as i32;
-        let cell_size = 1.0 / 3.0f32.powi(td - self.view_layer);
-        let speed = 5.0 * cell_size;
+        let speed = 5.0 * 3.0f32.powi(self.zoom_level);
 
         let fwd = self.camera.forward_xz();
         let right = self.camera.right();
@@ -179,43 +164,16 @@ impl App {
         }
     }
 
-    /// How deep the CPU raycast descends for editing.
-    /// view_layer 0 = finest (tree_depth), higher = coarser.
     fn edit_depth(&self) -> u32 {
-        let td = self.world.tree_depth() as i32;
-        (td - self.view_layer).max(1) as u32
-    }
-
-    /// How deep the GPU descends for rendering.
-    /// Always 3 levels deeper than edit layer (see 27×27×27 detail
-    /// within each interaction block).
-    fn visual_depth(&self) -> u32 {
-        (self.edit_depth() + 3).min(8)
-    }
-
-    /// Clamp view_layer and sync GPU + edit depths after a zoom change.
-    fn apply_zoom(&mut self) {
-        let td = self.world.tree_depth() as i32;
-        self.view_layer = self.view_layer.clamp(0, (td - 1).max(0));
-
-        let vd = self.visual_depth();
-        if let Some(renderer) = &mut self.renderer {
-            renderer.set_max_depth(vd);
-        }
-        log::info!(
-            "View layer: {}/{}, edit_depth: {}, visual_depth: {}",
-            self.view_layer, td, self.edit_depth(), vd
-        );
+        let base_depth: u32 = 8;
+        base_depth.saturating_sub(self.zoom_level.max(0) as u32).max(1)
     }
 
     fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
-            &self.world.library,
-            self.world.root,
-            self.camera.pos,
-            ray_dir,
-            self.edit_depth(),
+            &self.world.library, self.world.root,
+            self.camera.pos, ray_dir, self.edit_depth(),
         );
         if let Some(hit) = hit {
             if edit::break_block(&mut self.world, &hit) {
@@ -225,16 +183,14 @@ impl App {
     }
 
     fn do_place(&mut self) {
+        let Some(block_type) = self.ui.active_block_type() else { return };
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
-            &self.world.library,
-            self.world.root,
-            self.camera.pos,
-            ray_dir,
-            self.edit_depth(),
+            &self.world.library, self.world.root,
+            self.camera.pos, ray_dir, self.edit_depth(),
         );
         if let Some(hit) = hit {
-            if edit::place_block(&mut self.world, &hit, self.selected_block) {
+            if edit::place_block(&mut self.world, &hit, block_type) {
                 self.upload_tree();
             }
         }
@@ -244,6 +200,23 @@ impl App {
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, root_index);
+        }
+    }
+
+    fn update_highlight(&mut self) {
+        if !self.cursor_locked {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_highlight(None);
+            }
+            return;
+        }
+        let ray_dir = self.camera.forward();
+        let hit = edit::cpu_raycast(
+            &self.world.library, self.world.root,
+            self.camera.pos, ray_dir, self.edit_depth(),
+        );
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_highlight(hit.as_ref().map(edit::hit_aabb));
         }
     }
 
@@ -268,31 +241,27 @@ impl App {
         window.set_cursor_visible(true);
     }
 
-    fn toggle_cursor_lock(&mut self) {
-        if self.cursor_locked {
+    fn sync_cursor_to_panels(&mut self) {
+        if self.ui.any_panel_open() && self.cursor_locked {
             self.unlock_cursor();
-        } else {
+        } else if !self.ui.any_panel_open() && !self.cursor_locked {
             self.lock_cursor();
         }
     }
 
     // ── Overlay integration (native only) ────────────────────────
 
-    /// Try to create the WebView overlay after enough frames have passed.
     #[cfg(not(target_arch = "wasm32"))]
     fn try_create_webview(&mut self) {
         if self.webview.is_some() { return; }
         self.frames_waited += 1;
         if self.frames_waited < WAIT_FRAMES { return; }
-
         let Some(window) = &self.window else { return };
         if let Some(wv) = overlay::create_webview(window) {
             self.webview = Some(wv);
         }
     }
 
-    /// Drain forwarded key/mouse events from the WebView IPC and
-    /// apply them to our input state.
     #[cfg(not(target_arch = "wasm32"))]
     fn inject_webview_input(&mut self) {
         for (code, pressed) in overlay::drain_forwarded_keys() {
@@ -309,31 +278,14 @@ impl App {
         }
     }
 
-    /// Process UI commands from React.
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_ui_commands(&mut self) {
-        use deepspace_game::bridge::UiCommand;
         for cmd in overlay::poll_commands() {
-            match cmd {
-                UiCommand::SelectHotbarSlot { slot } => {
-                    if slot < 10 {
-                        if let Some(bt) = slot_to_block(slot) {
-                            self.selected_block = bt;
-                        }
-                    }
-                }
-                UiCommand::UiFocused { focused } => {
-                    self.ui_focused = focused;
-                }
-                UiCommand::CloseAllPanels => {}
-                UiCommand::ToggleInventory => {}
-                UiCommand::ToggleColorPicker => {}
-                _ => {}
-            }
+            let panel_changed = self.ui.handle_command(cmd);
+            if panel_changed { self.sync_cursor_to_panels(); }
         }
     }
 
-    /// Flush buffered state to the WebView.
     #[cfg(not(target_arch = "wasm32"))]
     fn flush_overlay(&self) {
         if let Some(ref wv) = self.webview {
@@ -341,7 +293,6 @@ impl App {
         }
     }
 
-    /// Resize the WebView to match the window.
     #[cfg(not(target_arch = "wasm32"))]
     fn resize_overlay(&self) {
         if let Some(ref wv) = self.webview {
@@ -351,60 +302,32 @@ impl App {
         }
     }
 
-    /// Push current game state to the React overlay.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn push_state_to_overlay(&self) {
-        use deepspace_game::bridge::*;
-
-        let slots: Vec<SlotInfo> = (0..10).map(|i| {
-            let bt = slot_to_block(i).unwrap_or(BlockType::Stone);
-            let color = block_color(bt);
-            SlotInfo {
-                kind: "block",
-                index: bt as u32,
-                name: format!("{:?}", bt),
-                color,
-            }
-        }).collect();
-
-        overlay::push_state(&GameStateUpdate::Hotbar(HotbarState {
-            active: block_to_slot(self.selected_block),
-            slots,
-            layer: self.view_layer.max(0) as u8,
-        }));
-
-        overlay::push_state(&GameStateUpdate::ModeIndicator(ModeIndicatorStateJs {
-            layer: self.view_layer.max(0) as u8,
-            save_mode: false,
-            save_eligible: false,
-            entity_edit_mode: false,
-        }));
-    }
-
     // ── Unified input handlers ───────────────────────────────────
 
     fn apply_key(&mut self, code: KeyCode, pressed: bool) {
         self.keys.apply(code, pressed);
-        if pressed {
-            match code {
-                KeyCode::Escape => self.toggle_cursor_lock(),
-                KeyCode::Digit1 => self.selected_block = BlockType::Stone,
-                KeyCode::Digit2 => self.selected_block = BlockType::Dirt,
-                KeyCode::Digit3 => self.selected_block = BlockType::Grass,
-                KeyCode::Digit4 => self.selected_block = BlockType::Wood,
-                KeyCode::Digit5 => self.selected_block = BlockType::Leaf,
-                KeyCode::Digit6 => self.selected_block = BlockType::Sand,
-                KeyCode::Digit7 => self.selected_block = BlockType::Brick,
-                KeyCode::Digit8 => self.selected_block = BlockType::Metal,
-                KeyCode::Digit9 => self.selected_block = BlockType::Glass,
-                _ => {}
+
+        if pressed && code == KeyCode::Escape {
+            if self.ui.any_panel_open() {
+                self.ui.handle_command(deepspace_game::bridge::UiCommand::CloseAllPanels);
+                self.sync_cursor_to_panels();
+            } else if self.cursor_locked {
+                self.unlock_cursor();
+            } else {
+                self.lock_cursor();
             }
+            return;
         }
+
+        let panel_changed = self.ui.handle_key(code, pressed);
+        if panel_changed { self.sync_cursor_to_panels(); }
     }
 
     fn apply_mouse(&mut self, button: MouseButton) {
         if !self.cursor_locked {
-            self.lock_cursor();
+            if !self.ui.any_panel_open() {
+                self.lock_cursor();
+            }
         } else {
             match button {
                 MouseButton::Left => self.do_break(),
@@ -454,11 +377,17 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                // Scroll up = zoom in (finer, decrease view_layer).
-                // Scroll down = zoom out (coarser, increase view_layer).
-                if y > 0.0 { self.view_layer -= 1; }
-                else if y < 0.0 { self.view_layer += 1; }
-                self.apply_zoom();
+                if y > 0.0 { self.zoom_level -= 1; }
+                else if y < 0.0 { self.zoom_level += 1; }
+                self.zoom_level = self.zoom_level.clamp(-2, 5);
+                self.ui.zoom_level = self.zoom_level;
+
+                let max_depth = (3 - self.zoom_level).clamp(1, 8) as u32;
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_max_depth(max_depth);
+                }
+                log::info!("Zoom level: {}, max_depth: {}, edit_depth: {}",
+                    self.zoom_level, max_depth, self.edit_depth());
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
@@ -466,13 +395,12 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // ── Overlay lifecycle ──
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     self.try_create_webview();
                     self.inject_webview_input();
                     self.poll_ui_commands();
-                    self.push_state_to_overlay();
+                    self.ui.push_to_overlay();
                     self.flush_overlay();
                 }
 
@@ -480,6 +408,7 @@ impl ApplicationHandler for App {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
                 self.update(dt);
+                self.update_highlight();
 
                 if let Some(renderer) = &self.renderer {
                     match renderer.render() {
@@ -506,53 +435,6 @@ impl ApplicationHandler for App {
                     .clamp(-1.5, 1.5);
             }
         }
-    }
-}
-
-// ── Block ↔ slot helpers ─────────────────────────────────────────
-
-fn slot_to_block(slot: usize) -> Option<BlockType> {
-    match slot {
-        0 => Some(BlockType::Stone),
-        1 => Some(BlockType::Dirt),
-        2 => Some(BlockType::Grass),
-        3 => Some(BlockType::Wood),
-        4 => Some(BlockType::Leaf),
-        5 => Some(BlockType::Sand),
-        6 => Some(BlockType::Brick),
-        7 => Some(BlockType::Metal),
-        8 => Some(BlockType::Glass),
-        _ => None,
-    }
-}
-
-fn block_to_slot(bt: BlockType) -> usize {
-    match bt {
-        BlockType::Stone => 0,
-        BlockType::Dirt => 1,
-        BlockType::Grass => 2,
-        BlockType::Wood => 3,
-        BlockType::Leaf => 4,
-        BlockType::Sand => 5,
-        BlockType::Brick => 6,
-        BlockType::Metal => 7,
-        BlockType::Glass => 8,
-        _ => 0,
-    }
-}
-
-fn block_color(bt: BlockType) -> [f32; 4] {
-    match bt {
-        BlockType::Stone => [0.5, 0.5, 0.5, 1.0],
-        BlockType::Dirt  => [0.6, 0.4, 0.2, 1.0],
-        BlockType::Grass => [0.3, 0.7, 0.2, 1.0],
-        BlockType::Wood  => [0.6, 0.4, 0.15, 1.0],
-        BlockType::Leaf  => [0.2, 0.6, 0.1, 1.0],
-        BlockType::Sand  => [0.9, 0.85, 0.6, 1.0],
-        BlockType::Water => [0.2, 0.4, 0.9, 0.7],
-        BlockType::Brick => [0.7, 0.3, 0.2, 1.0],
-        BlockType::Metal => [0.8, 0.8, 0.85, 1.0],
-        BlockType::Glass => [0.7, 0.85, 0.9, 0.4],
     }
 }
 
