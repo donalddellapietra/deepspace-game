@@ -372,15 +372,15 @@ pub fn generate_world() -> WorldState {
     let continent_b = {
         let mut c = empty_children();
         for z in 0..BRANCH {
-            for y in 0..BRANCH {
-                for x in 0..BRANCH {
-                    let h = pos_hash(x, y, z, 710);
-                    c[slot_index(x, y, z)] = match h % 4 {
-                        0 => Child::Node(arid_l5),
-                        1 => Child::Node(highland_l5),
-                        _ => Child::Node(temperate_l5),
-                    };
-                }
+            for x in 0..BRANCH {
+                c[slot_index(x, 0, z)] = Child::Node(highland_l5);
+                c[slot_index(x, 2, z)] = Child::Node(arid_l5);
+                let h = pos_hash(x, 1, z, 710);
+                c[slot_index(x, 1, z)] = match h % 3 {
+                    0 => Child::Node(arid_l5),
+                    1 => Child::Node(highland_l5),
+                    _ => Child::Node(temperate_l5),
+                };
             }
         }
         lib.insert(c)
@@ -389,14 +389,14 @@ pub fn generate_world() -> WorldState {
     let continent_c = {
         let mut c = empty_children();
         for z in 0..BRANCH {
-            for y in 0..BRANCH {
-                for x in 0..BRANCH {
-                    let h = pos_hash(x, y, z, 720);
-                    c[slot_index(x, y, z)] = match h % 3 {
-                        0 => Child::Node(highland_l5),
-                        _ => Child::Node(arid_l5),
-                    };
-                }
+            for x in 0..BRANCH {
+                c[slot_index(x, 0, z)] = Child::Node(highland_l5);
+                c[slot_index(x, 2, z)] = Child::Node(temperate_l5);
+                let h = pos_hash(x, 1, z, 720);
+                c[slot_index(x, 1, z)] = match h % 3 {
+                    0 => Child::Node(highland_l5),
+                    _ => Child::Node(arid_l5),
+                };
             }
         }
         lib.insert(c)
@@ -405,44 +405,97 @@ pub fn generate_world() -> WorldState {
     // ═══════════════════════════════════════════════════════════════
     // Levels 7-20: composed algorithmically.
     //
-    // At each level, create 3 variants by mixing the previous level's
-    // variants with positional hashing. This gives visual variety at
-    // every zoom scale while keeping node count small (~3 per level).
+    // Every level preserves the y-structure from the terrain:
+    //   y=0: underground (denser, more stone/mountain)
+    //   y=1: surface (mixed terrain — the interesting layer)
+    //   y=2: sky (air-heavy, sparser)
+    //
+    // This ensures the camera always has navigable space above
+    // ground at every zoom scale. Each level creates 3 surface
+    // variants and 2 underground variants for xz variety.
     // ═══════════════════════════════════════════════════════════════
 
-    let mut prev_variants: Vec<NodeId> = vec![continent_a, continent_b, continent_c];
+    // We need an air node at the continent scale for sky layers.
+    // Build one by uniform-wrapping air upward from air_l3.
+    let mut air_at_level = air_l3;
+    for _ in 4..=6 {
+        air_at_level = lib.insert(uniform_children(Child::Node(air_at_level)));
+    }
+    // air_at_level is now an all-air node at level 6 (continent scale).
+
+    // Track surface variants (terrain with air above) and underground
+    // variants (solid terrain) separately.
+    let mut surface_variants: Vec<NodeId> = vec![continent_a, continent_b, continent_c];
+    let mut underground_variants: Vec<NodeId> = vec![continent_a, continent_c];
 
     for level in 7..=20 {
         let seed_base = level as u32 * 1000;
-        let num_variants = prev_variants.len();
-        let mut new_variants = Vec::new();
+        let n_surf = surface_variants.len();
+        let n_under = underground_variants.len();
 
+        let mut new_surface = Vec::new();
+        let mut new_underground = Vec::new();
+
+        // 3 surface variants: y=0 underground, y=1 mixed surface, y=2 air.
         for variant in 0..3u32 {
+            let mut c = empty_children();
+            for z in 0..BRANCH {
+                for x in 0..BRANCH {
+                    // y=0: underground
+                    let h0 = pos_hash(x, 0, z, seed_base + variant * 100);
+                    c[slot_index(x, 0, z)] = Child::Node(
+                        underground_variants[h0 as usize % n_under]
+                    );
+                    // y=1: surface (the interesting terrain)
+                    let h1 = pos_hash(x, 1, z, seed_base + variant * 100 + 37);
+                    c[slot_index(x, 1, z)] = Child::Node(
+                        surface_variants[h1 as usize % n_surf]
+                    );
+                    // y=2: sky (all air)
+                    c[slot_index(x, 2, z)] = Child::Node(air_at_level);
+                }
+            }
+            new_surface.push(lib.insert(c));
+        }
+
+        // 2 underground variants: solid terrain at all y levels.
+        for variant in 0..2u32 {
             let mut c = empty_children();
             for z in 0..BRANCH {
                 for y in 0..BRANCH {
                     for x in 0..BRANCH {
-                        let h = pos_hash(x, y, z, seed_base + variant * 100);
-                        let pick = (h as usize) % num_variants;
-                        c[slot_index(x, y, z)] = Child::Node(prev_variants[pick]);
+                        let h = pos_hash(x, y, z, seed_base + 500 + variant * 100);
+                        c[slot_index(x, y, z)] = Child::Node(
+                            underground_variants[h as usize % n_under]
+                        );
                     }
                 }
             }
-            new_variants.push(lib.insert(c));
+            new_underground.push(lib.insert(c));
         }
 
-        prev_variants = new_variants;
+        // Wrap air up one more level for the next iteration.
+        air_at_level = lib.insert(uniform_children(Child::Node(air_at_level)));
+
+        surface_variants = new_surface;
+        underground_variants = new_underground;
     }
 
-    // Final root: mix the level-20 variants.
+    // Final root: y-structured.
     let mut root_children = empty_children();
+    let n_surf = surface_variants.len();
+    let n_under = underground_variants.len();
     for z in 0..BRANCH {
-        for y in 0..BRANCH {
-            for x in 0..BRANCH {
-                let h = pos_hash(x, y, z, 99999);
-                let pick = (h as usize) % prev_variants.len();
-                root_children[slot_index(x, y, z)] = Child::Node(prev_variants[pick]);
-            }
+        for x in 0..BRANCH {
+            let h = pos_hash(x, 0, z, 99999);
+            root_children[slot_index(x, 0, z)] = Child::Node(
+                underground_variants[h as usize % n_under]
+            );
+            let h = pos_hash(x, 1, z, 99998);
+            root_children[slot_index(x, 1, z)] = Child::Node(
+                surface_variants[h as usize % n_surf]
+            );
+            root_children[slot_index(x, 2, z)] = Child::Node(air_at_level);
         }
     }
 
