@@ -32,21 +32,38 @@ impl App {
         self.tree_depth as i32 - self.edit_depth() as i32
     }
 
-    /// Node id of the "render root" — the ancestor whose subtree the
-    /// GPU walks each frame. Today this is always the tree root. Step
-    /// 5 introduces the concept so the plumbing can later pick a
-    /// smaller ancestor for precision (see §3a of
-    /// refactor-decisions.md).
-    pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
-        self.world.root
+    /// How many leading slots of the camera's path sit *above* the
+    /// render root. The render root is pinned `RENDER_FRAME_K` levels
+    /// above the camera so the shader's `[0, 3)³` traversal volume
+    /// fits a small f32 magnitude regardless of how deep the camera
+    /// path goes — this is what eliminates the per-layer "absolute
+    /// coords" quantization that made layer 10+ jittery.
+    ///
+    /// Clamped to camera depth so it never points past the root.
+    pub(super) fn render_root_depth(&self) -> u8 {
+        const RENDER_FRAME_K: u8 = 3;
+        self.camera.position.depth.saturating_sub(RENDER_FRAME_K)
     }
 
-    /// Depth (number of leading slots in the camera's path) that sits
-    /// above the render root. `0` means the render root is the tree
-    /// root itself. Paired with
-    /// [`Position::pos_in_ancestor_frame`](crate::world::position::Position::pos_in_ancestor_frame).
-    pub(super) fn render_root_depth(&self) -> u8 {
-        0
+    /// NodeId of the render root — resolved by walking
+    /// `camera.position.path[0..render_root_depth]` from the tree
+    /// root. Falls back to `world.root` if the walk hits a non-Node
+    /// slot (can happen in degenerate edits or edge-of-tree paths).
+    pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
+        use crate::world::tree::Child;
+        let target_depth = self.render_root_depth() as usize;
+        let mut id = self.world.root;
+        for k in 0..target_depth {
+            let Some(node) = self.world.library.get(id) else {
+                return self.world.root;
+            };
+            let slot = self.camera.position.path[k] as usize;
+            match node.children[slot] {
+                Child::Node(child) => id = child,
+                _ => return self.world.root,
+            }
+        }
+        id
     }
 
     /// Camera position expressed in the render root's local `[0, 3)³`
