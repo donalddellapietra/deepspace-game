@@ -302,6 +302,39 @@ impl Renderer {
         Ok(())
     }
 
+    /// Re-upload the tree buffer after an edit. Recreates the buffer
+    /// and bind group if the size changed.
+    pub fn update_tree(&mut self, tree_data: &[GpuChild], root_index: u32) {
+        self.root_index = root_index;
+        self.node_count = (tree_data.len() / 27) as u32;
+
+        let new_size = (tree_data.len() * std::mem::size_of::<GpuChild>()) as u64;
+
+        if new_size > self.tree_buffer.size() {
+            // Buffer too small — recreate.
+            self.tree_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tree"),
+                contents: bytemuck::cast_slice(tree_data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            // Recreate bind group with new buffer.
+            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ray_march"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.tree_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.camera_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.palette_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: self.uniforms_buffer.as_entire_binding() },
+                ],
+            });
+        } else {
+            self.queue.write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
+        }
+
+        self.write_uniforms();
+    }
+
     fn write_uniforms(&self) {
         let uniforms = GpuUniforms {
             root_index: self.root_index,

@@ -130,9 +130,12 @@ mod tests {
     fn pack_test_world() {
         let world = super::super::state::WorldState::test_world();
         let (data, root_idx) = pack_tree(&world.library, world.root);
-        // Root + 3 unique child nodes (stone, grass, air) = 4 nodes
-        assert_eq!(data.len(), 4 * 27);
+        // Verify data is a multiple of 27 (each node is 27 children).
+        assert_eq!(data.len() % 27, 0);
+        // Root is always first in BFS order.
         assert_eq!(root_idx, 0);
+        // Should have all reachable nodes packed.
+        assert_eq!(data.len() / 27, world.library.len());
     }
 
     #[test]

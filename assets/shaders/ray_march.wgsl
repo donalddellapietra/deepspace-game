@@ -337,18 +337,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let result = march(camera.pos, ray_dir);
 
+    var color: vec3<f32>;
     if result.hit {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
         let lit = result.color * (ambient + diffuse * 0.7);
-        // Simple gamma correction.
-        let corrected = pow(lit, vec3<f32>(1.0 / 2.2));
-        return vec4<f32>(corrected, 1.0);
+        color = pow(lit, vec3<f32>(1.0 / 2.2));
+    } else {
+        let sky_t = ray_dir.y * 0.5 + 0.5;
+        color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    // Sky gradient.
-    let sky_t = ray_dir.y * 0.5 + 0.5;
-    let sky = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
-    return vec4<f32>(sky, 1.0);
+    // Crosshair: thin cross at screen center.
+    let pixel = vec2<f32>(in.uv.x * uniforms.screen_width, in.uv.y * uniforms.screen_height);
+    let center = vec2<f32>(uniforms.screen_width * 0.5, uniforms.screen_height * 0.5);
+    let d = abs(pixel - center);
+    let cross_size = 12.0;
+    let cross_thickness = 1.5;
+    let gap = 3.0;
+    let is_crosshair = (d.x < cross_thickness && d.y >= gap && d.y < cross_size)
+                    || (d.y < cross_thickness && d.x >= gap && d.x < cross_size);
+    if is_crosshair {
+        // Invert color for visibility against any background.
+        color = vec3<f32>(1.0) - color;
+    }
+
+    return vec4<f32>(color, 1.0);
 }
