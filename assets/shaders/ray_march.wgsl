@@ -32,6 +32,7 @@ struct Uniforms {
     _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    sun_pos: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
@@ -108,12 +109,21 @@ struct HitResult {
     color: vec3<f32>,
     normal: vec3<f32>,
     t: f32,
+    // Emission intensity of the surface (stored in the palette's
+    // alpha channel). 0 = diffuse-only; >0 = the block glows with
+    // its own light on top of any reflected sunlight. Averages
+    // naturally through LOD because `representative_block` is the
+    // dominant non-empty block in a subtree, and emission is looked
+    // up per palette index — a coarse-LOD cell that representatively
+    // holds STAR_SURFACE inherits the star's emission.
+    emission: f32,
 }
 
 fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+    result.emission = 0.0;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -250,7 +260,9 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
             result.hit = true;
             result.t = max(cell_box_h.t_enter, 0.0);
-            result.color = palette.colors[child_block_type(packed)].rgb;
+            let bt_h = child_block_type(packed);
+            result.color = palette.colors[bt_h].rgb;
+            result.emission = palette.colors[bt_h].a;
             result.normal = normal;
             return result;
         } else if tag == 2u {
@@ -288,13 +300,19 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                         normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                     }
                 } else {
-                    // Solid representative — render as block.
+                    // Solid representative — render as block. The
+                    // representative block's emission is inherited
+                    // through LOD: if a subtree's dominant block is
+                    // emissive (e.g. STAR_SURFACE), the coarse cell
+                    // glows too, preserving the star's appearance
+                    // at any zoom level.
                     let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
                     let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
                     result.color = palette.colors[bt].rgb;
+                    result.emission = palette.colors[bt].a;
                     result.normal = normal;
                     return result;
                 }
@@ -388,14 +406,61 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var color: vec3<f32>;
     if result.hit {
-        let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-        let diffuse = max(dot(result.normal, sun_dir), 0.0);
-        let ambient = 0.3;
-        let lit = result.color * (ambient + diffuse * 0.7);
-        color = pow(lit, vec3<f32>(1.0 / 2.2));
+        let hit_pos = camera.pos + ray_dir * result.t;
+
+        if result.emission > 0.0 {
+            // Emissive surface: render it as its own light source,
+            // unaffected by shadows or the sun's direction. Emission
+            // multiplies the base color so a star reads hot and
+            // bright even through LOD averaging (which gets here via
+            // `representative_block` and this same emission alpha).
+            let emit = result.color * result.emission;
+            color = pow(emit, vec3<f32>(1.0 / 2.2));
+        } else {
+            // Per-point sun direction: aim at the star's position
+            // uploaded in `sun_pos`. Each planet gets a correct
+            // terminator from its own position relative to the star.
+            let to_sun = uniforms.sun_pos.xyz - hit_pos;
+            let sun_dist = length(to_sun);
+            let sun_dir = to_sun / max(sun_dist, 1e-6);
+            let n_dot_l = dot(result.normal, sun_dir);
+            let diffuse = max(n_dot_l, 0.0);
+
+            // Shadow ray: march from just above the surface toward
+            // the star. A hit that is NOT itself emissive before the
+            // star means the point is in cast shadow (terrain or
+            // another planet occluding). We allow emissive hits
+            // (the star surface itself) to count as reaching the
+            // light source.
+            var shadow_factor: f32 = 1.0;
+            if diffuse > 0.0 {
+                let shadow_origin = hit_pos + result.normal * 0.0005;
+                let shadow_hit = march(shadow_origin, sun_dir);
+                let blocked = shadow_hit.hit
+                    && shadow_hit.t < sun_dist
+                    && shadow_hit.emission <= 0.0;
+                if blocked { shadow_factor = 0.0; }
+            }
+
+            // Constant ambient fill so shadowed faces remain legible.
+            // A proper renderer would sample a sky-radiance LUT; a
+            // small constant is fine for a diffuse-only look.
+            let ambient = 0.10;
+            let lit = result.color * (ambient + diffuse * 1.1 * shadow_factor);
+            color = pow(lit, vec3<f32>(1.0 / 2.2));
+        }
     } else {
-        let sky_t = ray_dir.y * 0.5 + 0.5;
-        color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
+        // Deep-space sky: dark background + a bright sun disk & halo
+        // around the star's apparent position. Lets the player orient
+        // toward the light source at any zoom.
+        let sun_vec = normalize(uniforms.sun_pos.xyz - camera.pos);
+        let alignment = dot(ray_dir, sun_vec);
+        let disk = smoothstep(0.9995, 0.9999, alignment);
+        let halo = smoothstep(0.985, 0.9995, alignment) * 0.35;
+        let sky_bg = vec3<f32>(0.015, 0.02, 0.035);
+        color = sky_bg
+            + vec3<f32>(1.35, 1.22, 0.95) * disk
+            + vec3<f32>(1.0, 0.8, 0.55) * halo;
     }
 
     // Block highlight outline: Minecraft-style wireframe cube.

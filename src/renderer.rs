@@ -20,6 +20,13 @@ pub struct GpuUniforms {
     pub _pad: [u32; 2],
     pub highlight_min: [f32; 4], // xyz, w unused
     pub highlight_max: [f32; 4], // xyz, w unused
+    /// Sun position in world space. Every hit point computes
+    /// `sun_dir = normalize(sun_pos - hit_pos)` so each planet
+    /// has its own correct day/night terminator, and a shadow
+    /// ray from the hit point toward the sun determines whether
+    /// the point is in direct light or in cast shadow (e.g.
+    /// behind a mountain, or inside an eclipse).
+    pub sun_pos: [f32; 4], // xyz = position, w unused
 }
 
 pub struct Renderer {
@@ -41,6 +48,7 @@ pub struct Renderer {
     highlight_active: u32,
     highlight_min: [f32; 4],
     highlight_max: [f32; 4],
+    sun_pos: [f32; 4],
 }
 
 impl Renderer {
@@ -142,6 +150,7 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
+            sun_pos: [4.0, 3.5, -2.5, 0.0],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -270,7 +279,15 @@ impl Renderer {
             highlight_active: 0,
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
+            sun_pos: [4.0, 3.5, -2.5, 0.0],
         }
+    }
+
+    /// Update the sun position. Per-point shading uses this to
+    /// compute correct day/night terminators for every planet.
+    pub fn set_sun_pos(&mut self, pos: [f32; 3]) {
+        self.sun_pos = [pos[0], pos[1], pos[2], 0.0];
+        self.write_uniforms();
     }
 
     pub fn update_palette(&self, palette: &GpuPalette) {
@@ -388,6 +405,7 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
+            sun_pos: self.sun_pos,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

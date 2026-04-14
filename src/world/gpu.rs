@@ -48,8 +48,8 @@ impl Default for GpuPalette {
     fn default() -> Self {
         // Populate from the builtin palette entries.
         let mut colors = [[0.0f32; 4]; 256];
-        for &(idx, _, color) in super::palette::BUILTINS {
-            colors[idx as usize] = color;
+        for &(idx, _, color, emission) in super::palette::BUILTINS {
+            colors[idx as usize] = [color[0], color[1], color[2], emission];
         }
         Self { colors }
     }
