@@ -1,5 +1,6 @@
 //! Break / place / highlight / zoom / GPU upload on the `App`.
 
+use crate::editing;
 use crate::game_state::HotbarItem;
 use crate::world::edit;
 use crate::world::gpu;
@@ -17,8 +18,6 @@ impl App {
         (self.edit_depth() + 3).min(16)
     }
 
-    /// Sync renderer max_depth and camera uniforms after a zoom or
-    /// worldgen change.
     pub(super) fn apply_zoom(&mut self) {
         self.ui.zoom_level = self.zoom_level();
         let vd = self.visual_depth();
@@ -38,7 +37,20 @@ impl App {
 
     pub(super) fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
+        let edit_depth = self.edit_depth();
+        let zoom_level = self.zoom_level();
         let camera_pos = self.camera.world_pos_f32();
+
+        if editing::try_cs_break(
+            &mut self.world,
+            self.cs_planet.as_mut(),
+            camera_pos,
+            ray_dir,
+            zoom_level,
+            edit_depth,
+        ) {
+            return;
+        }
 
         let hit = edit::cpu_raycast(
             &self.world.library,
@@ -79,7 +91,23 @@ impl App {
 
     pub(super) fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
+        let edit_depth = self.edit_depth();
+        let zoom_level = self.zoom_level();
         let camera_pos = self.camera.world_pos_f32();
+
+        if let Some(block_type) = self.ui.active_block_type() {
+            if editing::try_cs_place(
+                &mut self.world,
+                self.cs_planet.as_mut(),
+                camera_pos,
+                ray_dir,
+                zoom_level,
+                edit_depth,
+                block_type,
+            ) {
+                return;
+            }
+        }
 
         let hit = edit::cpu_raycast(
             &self.world.library,
@@ -116,19 +144,30 @@ impl App {
     }
 
     /// Re-pack and upload the tree with LOD culling based on camera
-    /// position. Called every frame so distant terrain stays flattened
-    /// as the camera moves.
+    /// position. Packs both the Cartesian space tree and the
+    /// spherical planet's 6 face subtrees in one pass.
     pub(super) fn upload_tree_lod(&mut self) {
         let cam_world = self.camera.world_pos_f32();
-        let (tree_data, root_index) = gpu::pack_tree_lod(
+        let mut roots: Vec<u64> = vec![self.world.root];
+        if let Some(p) = self.cs_planet.as_ref() {
+            roots.extend_from_slice(&p.face_roots);
+        }
+        let (tree_data, root_indices) = gpu::pack_tree_lod_multi(
             &self.world.library,
-            self.world.root,
+            &roots,
             cam_world,
             1440.0,
             1.2,
         );
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, root_index);
+            renderer.update_tree(&tree_data, root_indices[0]);
+            if self.cs_planet.is_some() {
+                let face_roots: [u32; 6] = [
+                    root_indices[1], root_indices[2], root_indices[3],
+                    root_indices[4], root_indices[5], root_indices[6],
+                ];
+                renderer.set_face_roots(face_roots);
+            }
         }
     }
 
@@ -136,6 +175,7 @@ impl App {
         if !self.cursor_locked {
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);
+                renderer.set_cubed_sphere_highlight(None);
             }
             return;
         }
@@ -148,8 +188,26 @@ impl App {
             ray_dir,
             self.edit_depth(),
         );
+        let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
+
+        let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.zoom_level());
+        let cs_hit = self.cs_planet.as_ref().and_then(|p| {
+            p.raycast(&self.world.library, camera_pos, ray_dir, cs_depth)
+        });
+        let cs_t = cs_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
+
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
+            if cs_t < tree_t {
+                renderer.set_highlight(None);
+                if let Some(h) = cs_hit {
+                    renderer.set_cubed_sphere_highlight(Some((
+                        h.face as u32, h.iu, h.iv, h.ir, h.depth,
+                    )));
+                }
+            } else {
+                renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
+                renderer.set_cubed_sphere_highlight(None);
+            }
         }
     }
 }

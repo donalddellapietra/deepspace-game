@@ -36,6 +36,7 @@ pub struct App {
     pub(super) ui: GameUiState,
     pub(super) debug_overlay_visible: bool,
     pub(super) fps_smooth: f64,
+    pub(super) cs_planet: Option<crate::world::cubesphere::SphericalPlanet>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -44,12 +45,36 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let world = crate::world::worldgen::generate_world();
+        // Build the ENTIRE world — space tree AND spherical planet —
+        // here, BEFORE the event loop starts.
+        let mut world = crate::world::worldgen::generate_world();
         let tree_depth = world.tree_depth();
 
-        // Spawn above the middle of the world, looking slightly down.
-        let spawn_xyz = [WORLD_SIZE * 0.5, WORLD_SIZE * 0.75, WORLD_SIZE * 0.5];
-        let anchor_depth = ((tree_depth as i32).saturating_sub(2).max(1) as u8).min(60);
+        let setup = crate::world::spherical_worldgen::demo_planet();
+        let cs_planet = crate::world::spherical_worldgen::build(&mut world.library, &setup);
+        eprintln!(
+            "Spherical planet generated: 6 face subtrees, library now {} nodes",
+            world.library.len(),
+        );
+
+        // Spawn just above the planet's north pole. `demo_planet`
+        // centers the planet at the world origin so this naturally
+        // lands inside `[0, WORLD_SIZE)^3`; assert to catch drift
+        // if those tuning knobs change.
+        let spawn_xyz = [
+            setup.center[0],
+            setup.center[1] + setup.outer_r + 0.3,
+            setup.center[2],
+        ];
+        debug_assert!(
+            spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)),
+            "spawn {:?} must be inside root [0, {})",
+            spawn_xyz, WORLD_SIZE,
+        );
+        // Default anchor depth: `td - 6 + 1` reproduces the legacy
+        // zoom feel (one level above the face subtree's per-block
+        // cells at the planet's surface).
+        let anchor_depth = ((tree_depth as i32 - 6 + 1).max(1) as u8).min(60);
         let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
 
         Self {
@@ -73,6 +98,7 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
+            cs_planet: Some(cs_planet),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -80,13 +106,11 @@ impl App {
         }
     }
 
-    /// Camera anchor depth. Every zoom-dependent quantity flows from this.
     #[inline]
     pub(super) fn anchor_depth(&self) -> u32 {
         self.camera.position.anchor.depth() as u32
     }
 
-    /// Display zoom level. Low = zoomed-in (fine), high = zoomed-out.
     #[inline]
     pub(super) fn zoom_level(&self) -> i32 {
         (self.tree_depth as i32) - (self.anchor_depth() as i32) + 1
@@ -97,6 +121,7 @@ impl App {
             &mut self.camera,
             &mut self.velocity,
             &self.keys,
+            self.cs_planet.as_ref(),
             &self.world.library,
             dt,
         );

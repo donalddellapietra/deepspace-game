@@ -144,7 +144,7 @@ pub fn pack_tree_lod(
     use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
 
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
-    const LOD_THRESHOLD: f32 = 1.5; // pixels — stop descending below this
+    const LOD_THRESHOLD: f32 = 0.5; // pixels — lower = more detail kept at distance
 
     // BFS with position tracking.
     struct QueueEntry {
@@ -270,6 +270,149 @@ pub fn pack_tree_lod(
 
     let root_idx = *visited.get(&root).unwrap();
     (data, root_idx)
+}
+
+/// Like `pack_tree_lod`, but packs multiple root subtrees into the
+/// same flat buffer. Used when the engine needs several independent
+/// trees on the GPU — the Cartesian space tree *and* each of a
+/// spherical planet's 6 face subtrees, for instance. Returns the
+/// buffer index of each root in the same order given. Distance-LOD
+/// is applied to the first root only (the Cartesian tree has a
+/// meaningful world-space origin); face subtrees always pack full
+/// depth because their axes don't live in world space.
+pub fn pack_tree_lod_multi(
+    library: &NodeLibrary,
+    roots: &[NodeId],
+    camera_pos: [f32; 3],
+    screen_height: f32,
+    fov: f32,
+) -> (Vec<GpuChild>, Vec<u32>) {
+    use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
+
+    let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
+    const LOD_THRESHOLD: f32 = 0.5;
+
+    struct QueueEntry {
+        node_id: NodeId,
+        origin: [f32; 3],
+        cell_size: f32,
+        use_lod: bool,
+    }
+
+    let mut visited: HashMap<NodeId, u32> = HashMap::new();
+    let mut queue: Vec<QueueEntry> = Vec::new();
+    let mut ordered: Vec<NodeId> = Vec::new();
+    let mut overrides: Vec<[Option<GpuChild>; CHILDREN_PER_NODE]> = Vec::new();
+
+    for (ri, &root) in roots.iter().enumerate() {
+        if visited.contains_key(&root) { continue; }
+        let idx = ordered.len() as u32;
+        visited.insert(root, idx);
+        ordered.push(root);
+        overrides.push([None; CHILDREN_PER_NODE]);
+        queue.push(QueueEntry {
+            node_id: root,
+            origin: [0.0; 3],
+            cell_size: 1.0,
+            use_lod: ri == 0,
+        });
+    }
+    let mut head = 0;
+    while head < queue.len() {
+        let entry = &queue[head];
+        let node_id = entry.node_id;
+        let node_origin = entry.origin;
+        let cell_size = entry.cell_size;
+        let use_lod = entry.use_lod;
+        let ordered_idx = head;
+        head += 1;
+
+        let Some(node) = library.get(node_id) else { continue };
+
+        for (slot, child) in node.children.iter().enumerate() {
+            if let Child::Node(child_id) = child {
+                let child_node = match library.get(*child_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if child_node.uniform_type != UNIFORM_MIXED {
+                    let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
+                        GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
+                    } else {
+                        GpuChild { tag: 1, block_type: child_node.uniform_type, _pad: 0, node_index: 0 }
+                    };
+                    overrides[ordered_idx][slot] = Some(gpu);
+                    continue;
+                }
+                if use_lod {
+                    let (cx, cy, cz) = slot_coords(slot);
+                    let child_center = [
+                        node_origin[0] + (cx as f32 + 0.5) * cell_size,
+                        node_origin[1] + (cy as f32 + 0.5) * cell_size,
+                        node_origin[2] + (cz as f32 + 0.5) * cell_size,
+                    ];
+                    let dx = child_center[0] - camera_pos[0];
+                    let dy = child_center[1] - camera_pos[1];
+                    let dz = child_center[2] - camera_pos[2];
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
+                    let screen_pixels = cell_size / dist * half_fov_recip;
+                    if screen_pixels < LOD_THRESHOLD {
+                        let gpu = if child_node.representative_block < 255 {
+                            GpuChild { tag: 1, block_type: child_node.representative_block, _pad: 0, node_index: 0 }
+                        } else {
+                            GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
+                        };
+                        overrides[ordered_idx][slot] = Some(gpu);
+                        continue;
+                    }
+                }
+                if !visited.contains_key(child_id) {
+                    let idx = ordered.len() as u32;
+                    visited.insert(*child_id, idx);
+                    ordered.push(*child_id);
+                    overrides.push([None; CHILDREN_PER_NODE]);
+                    let (cx, cy, cz) = slot_coords(slot);
+                    let child_origin = [
+                        node_origin[0] + cx as f32 * cell_size,
+                        node_origin[1] + cy as f32 * cell_size,
+                        node_origin[2] + cz as f32 * cell_size,
+                    ];
+                    queue.push(QueueEntry {
+                        node_id: *child_id,
+                        origin: child_origin,
+                        cell_size: cell_size / 3.0,
+                        use_lod,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
+    for (oi, &nid) in ordered.iter().enumerate() {
+        let node = library.get(nid).expect("node in ordered list must exist");
+        for (slot, child) in node.children.iter().enumerate() {
+            if let Some(gpu) = overrides[oi][slot] {
+                data.push(gpu);
+            } else {
+                data.push(match child {
+                    Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
+                    Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
+                    Child::Node(child_id) => {
+                        let repr = library.get(*child_id).map(|n| n.representative_block).unwrap_or(0);
+                        let idx = visited.get(child_id).copied().unwrap_or(0);
+                        GpuChild { tag: 2, block_type: repr, _pad: 0, node_index: idx }
+                    },
+                });
+            }
+        }
+    }
+
+    let root_indices: Vec<u32> = roots
+        .iter()
+        .map(|r| *visited.get(r).expect("every root must be visited"))
+        .collect();
+    (data, root_indices)
 }
 
 #[cfg(test)]

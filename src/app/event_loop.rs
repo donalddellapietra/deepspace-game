@@ -32,7 +32,15 @@ impl ApplicationHandler for App {
         crate::platform::prepare_window(&window);
 
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
-        let renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
+        let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
+        if let Some(planet) = self.cs_planet.as_ref() {
+            renderer.set_cubed_sphere_planet(
+                planet.center,
+                planet.inner_r,
+                planet.outer_r,
+                planet.depth,
+            );
+        }
         self.renderer = Some(renderer);
         self.apply_zoom();
         self.last_frame = std::time::Instant::now();

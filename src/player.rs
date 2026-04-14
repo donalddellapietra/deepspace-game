@@ -1,31 +1,64 @@
-//! Per-frame player physics: world-space flight with constant-Y gravity.
+//! Per-frame player physics: gravity, velocity, and flight thrust.
 
 use crate::camera::Camera;
 use crate::input::Keys;
+use crate::world::cubesphere::SphericalPlanet;
 use crate::world::sdf;
 use crate::world::tree::NodeLibrary;
 
 /// Step the camera forward one frame.
 ///
-/// Velocity is stored in world-units-per-second. `add_local` expects
-/// the delta in cell-local units, so each per-frame world-step is
-/// divided by `cell_size()` before being applied. Gravity and flight
-/// thrust scale with `cell_size` so holding W at any zoom feels the
-/// same on screen.
+/// Radial gravity toward the cubed-sphere planet's center with
+/// smoothstep falloff from the outer shell out to 2x the outer
+/// radius. Motion integrates through `WorldPos::add_local` so the
+/// camera's anchor advances as the player crosses cell boundaries.
 pub fn update(
     camera: &mut Camera,
     velocity: &mut [f32; 3],
     keys: &Keys,
+    cs_planet: Option<&SphericalPlanet>,
     lib: &NodeLibrary,
     dt: f32,
 ) {
     let cell_size = camera.cell_size();
     let world_up = [0.0f32, 1.0, 0.0];
+    let cam_world = camera.world_pos_f32();
 
-    // Simple world-aligned up — no sphere gravity until sphere
-    // rendering is revived via NodeKind dispatch.
-    camera.update_up(world_up, dt);
-    let gravity_acc = [0.0f32, -8.0 * cell_size, 0.0];
+    let (target_up, gravity_acc) = if let Some(p) = cs_planet {
+        let to_player = sdf::sub(cam_world, p.center);
+        let r = sdf::length(to_player);
+        let surface_r = p.outer_r;
+        let influence_r = surface_r * 2.0;
+        let weight = if r <= surface_r {
+            1.0
+        } else if r >= influence_r {
+            0.0
+        } else {
+            let t = (r - surface_r) / (influence_r - surface_r);
+            let s = 1.0 - t;
+            s * s * (3.0 - 2.0 * s)
+        };
+        let radial_up = if r > 1e-6 {
+            sdf::scale(to_player, 1.0 / r)
+        } else {
+            world_up
+        };
+        let up_blend = sdf::normalize(sdf::add(
+            sdf::scale(radial_up, weight),
+            sdf::scale(world_up, 1.0 - weight),
+        ));
+        let g_mag = 8.0 * cell_size * weight;
+        let grav = if r > 1e-6 {
+            sdf::scale(radial_up, -g_mag)
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+        (up_blend, grav)
+    } else {
+        (world_up, [0.0, 0.0, 0.0])
+    };
+    camera.update_up(target_up, dt);
+
     *velocity = sdf::add(*velocity, sdf::scale(gravity_acc, dt));
     let damp = (-2.5_f32 * dt).exp();
     *velocity = sdf::scale(*velocity, damp);

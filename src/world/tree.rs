@@ -9,18 +9,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// One of the six cube faces. Lives on `NodeKind::CubedSphereFace`;
-/// interpretation of the face's subtree is deferred until the
-/// NodeKind-dispatched renderer path is revived.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Face {
-    PosX = 0,
-    NegX = 1,
-    PosY = 2,
-    NegY = 3,
-    PosZ = 4,
-    NegZ = 5,
-}
+use super::cubesphere::Face;
 
 // ------------------------------------------------------------- constants
 
