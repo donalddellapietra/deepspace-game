@@ -227,7 +227,19 @@ impl App {
 
     fn upload_tree(&mut self) {
         self.tree_depth = self.world.tree_depth();
-        let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
+        self.upload_tree_lod();
+    }
+
+    /// Re-pack and upload the tree with LOD culling based on camera position.
+    /// Called every frame so distant terrain stays flattened as the camera moves.
+    fn upload_tree_lod(&mut self) {
+        let (tree_data, root_index) = gpu::pack_tree_lod(
+            &self.world.library,
+            self.world.root,
+            self.camera.pos,
+            1440.0, // approximate screen height
+            1.2,    // fov
+        );
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, root_index);
         }
@@ -431,6 +443,7 @@ impl ApplicationHandler for App {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
                 self.update(dt);
+                self.upload_tree_lod(); // LOD repack every frame
                 self.update_highlight();
 
                 if let Some(renderer) = &self.renderer {

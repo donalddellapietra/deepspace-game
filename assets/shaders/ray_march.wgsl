@@ -401,9 +401,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let t_enter = max(max(t_lo.x, t_lo.y), t_lo.z);
         let t_exit  = min(min(t_hi.x, t_hi.y), t_hi.z);
 
-        // Occlusion: only draw outline if it's in front of (or on) the hit surface.
-        let max_t = select(result.t, 1e10, !result.hit);
-        if t_enter < t_exit && t_exit > 0.0 && t_enter <= max_t + 0.01 {
+        // Occlusion: only draw outline if it's not fully behind other geometry.
+        // Use the highlight box size as epsilon since the shader may march
+        // deeper than the CPU raycast (visual_depth > edit_depth).
+        let occ_eps = length(box_size);
+        let max_t = select(result.t + occ_eps, 1e10, !result.hit);
+        if t_enter < t_exit && t_exit > 0.0 && t_enter <= max_t {
             // Use t_enter if in front of camera, else we're inside the box.
             let t = select(t_enter, 0.001, t_enter < 0.0);
             let hit_pos = camera.pos + ray_dir * t;
