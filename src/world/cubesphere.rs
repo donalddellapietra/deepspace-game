@@ -544,17 +544,24 @@ impl SphericalPlanet {
     /// Cursor raycast. Walks the ray through the shell, sampling the
     /// subtree at every step, and returns the first position whose
     /// `(face, u_n, v_n, r_n)` cell contains solid content at
-    /// `highlight_depth`. Integer cell indices are floor'd into
-    /// `3^highlight_depth` per axis — so `highlight_depth = 1` gives
-    /// a 3×3×3 grid per face (one of 54 global "chunks" per planet),
-    /// and `highlight_depth = subtree.depth` gives the finest cell.
-    pub fn raycast_highlight(
+    /// `highlight_depth`. Integer cell indices live in a
+    /// `3^highlight_depth` grid per axis — so `highlight_depth = 1`
+    /// gives a 3×3×3 grid per face (one of 54 global "chunks" per
+    /// planet), and `highlight_depth = subtree.depth` gives the
+    /// finest cell.
+    ///
+    /// The returned `prev` is the last empty cell the ray was in
+    /// immediately before the solid hit, at the same depth. This is
+    /// the Minecraft-style "place against the face you're looking
+    /// at" target. `prev = None` means the ray spawned already
+    /// inside solid, in which case placement isn't meaningful.
+    pub fn raycast(
         &self,
         lib: &NodeLibrary,
         origin: Vec3,
         dir: Vec3,
         highlight_depth: u32,
-    ) -> Option<(f32, Face, u32, u32, u32, u32)> {
+    ) -> Option<CsRayHit> {
         let oc = sdf::sub(origin, self.center);
         let b = sdf::dot(oc, dir);
         let c = sdf::dot(oc, oc) - self.outer_r * self.outer_r;
@@ -565,36 +572,58 @@ impl SphericalPlanet {
         let t_exit = -b + sq;
         if t_exit <= 0.0 { return None; }
 
-        // Brute-step march at CPU (one ray per frame — cheap). Step
-        // is a fraction of the finest-cell radial size so we don't
-        // skip leaf cells.
         let shell = self.outer_r - self.inner_r;
         let finest_cells = 3u32.pow(self.depth) as f32;
         let step = (shell / finest_cells) * 0.5;
         if step <= 0.0 { return None; }
         let d_eff = highlight_depth.clamp(1, self.depth);
         let cells_at_depth = 3u32.pow(d_eff) as f32;
+        let cells_max = cells_at_depth as u32 - 1;
         let mut t = t_enter + step * 0.25;
-        let max_steps = 4000usize;
-        for _ in 0..max_steps {
+        let mut prev: Option<(Face, u32, u32, u32)> = None;
+        for _ in 0..4000usize {
             if t >= t_exit { break; }
             let p = sdf::add(origin, sdf::scale(dir, t));
             if let Some((face, un, vn, rn)) = self.world_to_normalized(p) {
                 let (block, _) = self.sample_subtree(lib, face, un, vn, rn, d_eff);
+                let iu = ((un * cells_at_depth).floor() as u32).min(cells_max);
+                let iv = ((vn * cells_at_depth).floor() as u32).min(cells_max);
+                let ir = ((rn * cells_at_depth).floor() as u32).min(cells_max);
                 if block != 0 {
-                    let iu = ((un * cells_at_depth).floor() as u32)
-                        .min(cells_at_depth as u32 - 1);
-                    let iv = ((vn * cells_at_depth).floor() as u32)
-                        .min(cells_at_depth as u32 - 1);
-                    let ir = ((rn * cells_at_depth).floor() as u32)
-                        .min(cells_at_depth as u32 - 1);
-                    return Some((t, face, iu, iv, ir, d_eff));
+                    return Some(CsRayHit {
+                        t, face, iu, iv, ir, depth: d_eff, prev,
+                    });
+                }
+                // Update prev only when we actually move to a
+                // different cell — otherwise a sub-step oversample
+                // would keep overwriting prev with the same coords.
+                let new_prev = Some((face, iu, iv, ir));
+                if new_prev != prev {
+                    prev = new_prev;
                 }
             }
             t += step;
         }
         None
     }
+}
+
+/// Output of a cursor raycast against the planet.
+#[derive(Copy, Clone, Debug)]
+pub struct CsRayHit {
+    /// Ray t at the first solid-cell sample.
+    pub t: f32,
+    pub face: Face,
+    pub iu: u32,
+    pub iv: u32,
+    pub ir: u32,
+    /// The depth the raycast was performed at. `iu/iv/ir` live in a
+    /// `3^depth` grid.
+    pub depth: u32,
+    /// The cell adjacent to the hit on the ray-entry side, or `None`
+    /// if the ray began already inside solid. Used as the placement
+    /// target for right-click.
+    pub prev: Option<(Face, u32, u32, u32)>,
 }
 
 /// The twelve edges of a cubed-sphere block as pairs of corner
@@ -860,6 +889,51 @@ mod tests {
         assert!(changed, "edit should change the face root");
         let (after, _) = planet.sample_subtree(&lib, Face::PosX, 0.5, 0.5, 0.5, 1);
         assert_eq!(after, 0, "broken chunk must read as empty");
+    }
+
+    #[test]
+    fn raycast_reports_prev_empty_cell_for_placement() {
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.0);
+        let planet = generate_spherical_planet(
+            &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf,
+        );
+        // Fire a ray from far +X back toward origin. It enters the
+        // shell above the SDF surface (empty), then drops into the
+        // solid interior. The last empty cell before the hit is the
+        // placement target.
+        let hit = planet.raycast(&lib, [2.0, 0.0, 0.0], [-1.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(hit.face, Face::PosX);
+        assert!(hit.prev.is_some(), "should have an adjacent empty cell");
+        let (prev_face, prev_iu, prev_iv, prev_ir) = hit.prev.unwrap();
+        assert_eq!(prev_face, Face::PosX);
+        // The prev cell sits one radial step outward from the hit.
+        assert!(prev_ir > hit.ir, "placement cell should be radially outside the hit");
+        assert_eq!((prev_iu, prev_iv), (hit.iu, hit.iv),
+            "placement cell shares u/v columns with the hit");
+    }
+
+    #[test]
+    fn set_cell_at_depth_places_block_on_adjacent_empty() {
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.0);
+        let mut planet = generate_spherical_planet(
+            &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 3, &sdf,
+        );
+        let hit = planet.raycast(&lib, [2.0, 0.0, 0.0], [-1.0, 0.0, 0.0], 2).unwrap();
+        let (face, iu, iv, ir) = hit.prev.unwrap();
+        let changed = planet.set_cell_at_depth(
+            &mut lib, face, iu, iv, ir, hit.depth,
+            Child::Block(block::BRICK),
+        );
+        assert!(changed);
+        // Confirm the new block stuck.
+        let cells = 3.0f32.powi(hit.depth as i32);
+        let un = (iu as f32 + 0.5) / cells;
+        let vn = (iv as f32 + 0.5) / cells;
+        let rn = (ir as f32 + 0.5) / cells;
+        let (b, _) = planet.sample_subtree(&lib, face, un, vn, rn, hit.depth);
+        assert_eq!(b, block::BRICK);
     }
 
     #[test]

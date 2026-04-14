@@ -263,45 +263,57 @@ impl App {
         planet_depth.saturating_sub(dz).max(1).min(planet_depth)
     }
 
-    /// Cubed-sphere break: raycast the planet at the current edit
-    /// depth; if it beats the Cartesian tree to a hit, clear that
-    /// subtree. Returns true on success so the caller can skip its
-    /// Cartesian fallback.
-    fn try_cs_break(&mut self, ray_dir: [f32; 3]) -> bool {
+    /// Raycast the planet at the current edit depth AND ensure the
+    /// hit is closer than any Cartesian tree block along the same
+    /// ray. Returns the hit or None, so both break and place can
+    /// share the same targeting logic.
+    fn cs_cursor_hit(&self, ray_dir: [f32; 3])
+        -> Option<deepspace_game::world::cubesphere::CsRayHit>
+    {
         let depth = self.cs_edit_depth();
-        if depth == 0 { return false; }
-
-        // Raycast and check depth against the tree hit.
-        let (face, iu, iv, ir, d, cs_t) = {
-            let Some(planet) = self.cs_planet.as_ref() else { return false; };
-            let Some(hit) = planet.raycast_highlight(
-                &self.world.library, self.camera.pos, ray_dir, depth,
-            ) else { return false; };
-            let (t, face, iu, iv, ir, d) = hit;
-            (face, iu, iv, ir, d, t)
-        };
+        if depth == 0 { return None; }
+        let hit = self.cs_planet.as_ref()?.raycast(
+            &self.world.library, self.camera.pos, ray_dir, depth,
+        )?;
         let tree_t = edit::cpu_raycast(
             &self.world.library, self.world.root,
             self.camera.pos, ray_dir, self.edit_depth(),
         ).map(|h| h.t).unwrap_or(f32::INFINITY);
-        if cs_t >= tree_t { return false; }
+        if hit.t >= tree_t { return None; }
+        Some(hit)
+    }
 
+    /// Cubed-sphere break: clear the subtree at the targeted cell.
+    fn try_cs_break(&mut self, ray_dir: [f32; 3]) -> bool {
+        let Some(hit) = self.cs_cursor_hit(ray_dir) else { return false; };
         let Some(planet) = self.cs_planet.as_mut() else { return false; };
         planet.set_cell_at_depth(
             &mut self.world.library,
-            face, iu, iv, ir, d,
+            hit.face, hit.iu, hit.iv, hit.ir, hit.depth,
             deepspace_game::world::tree::Child::Empty,
+        )
+    }
+
+    /// Cubed-sphere place: fill `hit.prev` (the empty cell adjacent
+    /// to the solid hit on the ray-entry side) with `new_block`.
+    /// Skips if no prev exists (ray spawned inside solid) or if the
+    /// adjacent cell already contains the requested block.
+    fn try_cs_place(&mut self, ray_dir: [f32; 3], new_block: u8) -> bool {
+        let Some(hit) = self.cs_cursor_hit(ray_dir) else { return false; };
+        let Some((face, iu, iv, ir)) = hit.prev else { return false; };
+        let Some(planet) = self.cs_planet.as_mut() else { return false; };
+        planet.set_cell_at_depth(
+            &mut self.world.library,
+            face, iu, iv, ir, hit.depth,
+            deepspace_game::world::tree::Child::Block(new_block),
         )
     }
 
     fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
 
-        // Spherical-tree break: if the planet is hit closer than any
-        // Cartesian tree block, clear the subtree at the targeted
-        // (face, iu, iv, ir, depth) cell. Empty cells along the ray
-        // are ignored by `raycast_highlight`, so we always hit a
-        // solid one first.
+        // Spherical-tree break: clear the targeted subtree if the
+        // planet is hit closer than any Cartesian tree block.
         if self.try_cs_break(ray_dir) { return; }
 
         let hit = edit::cpu_raycast(
@@ -350,7 +362,12 @@ impl App {
     fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
 
-        // TODO Phase C: spherical-tree break/place.
+        // Spherical place: fill the cell adjacent to the first solid
+        // cell with the active hotbar block. Meshes fall through to
+        // the Cartesian tree placer below.
+        if let Some(block_type) = self.ui.active_block_type() {
+            if self.try_cs_place(ray_dir, block_type) { return; }
+        }
 
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
@@ -434,18 +451,16 @@ impl App {
         // exactly what you break.
         let cs_depth = self.cs_edit_depth();
         let cs_hit = self.cs_planet.as_ref().and_then(|p| {
-            p.raycast_highlight(
-                &self.world.library, self.camera.pos, ray_dir, cs_depth,
-            )
+            p.raycast(&self.world.library, self.camera.pos, ray_dir, cs_depth)
         });
-        let cs_t = cs_hit.map(|(t, ..)| t).unwrap_or(f32::INFINITY);
+        let cs_t = cs_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
 
         if let Some(renderer) = &mut self.renderer {
             if cs_t < tree_t {
                 renderer.set_highlight(None);
-                if let Some((_, face, iu, iv, ir, depth)) = cs_hit {
+                if let Some(h) = cs_hit {
                     renderer.set_cubed_sphere_highlight(Some((
-                        face as u32, iu, iv, ir, depth,
+                        h.face as u32, h.iu, h.iv, h.ir, h.depth,
                     )));
                 }
             } else {
