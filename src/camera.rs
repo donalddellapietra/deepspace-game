@@ -25,23 +25,18 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// Construct at an XYZ spawn point in the tree root's `[0, 3)³`
-    /// frame, anchored at `depth`. The spawn-point XYZ is a one-time
-    /// convenience for worldgen; after construction nothing reads
-    /// absolute coordinates from the camera.
-    pub fn at_spawn(
-        spawn_xyz: [f32; 3],
-        depth: u8,
+    /// Construct at an explicit `Position`. Use
+    /// `Position::from_world_pos_in_tree` to build the position from
+    /// an XYZ spawn point — that walks the real tree, dispatching
+    /// on `NodeKind` so the path is semantically valid even where it
+    /// crosses body / face subtrees.
+    pub fn at_position(
+        position: Position,
         smoothed_up: [f32; 3],
         yaw: f32,
         pitch: f32,
     ) -> Self {
-        Self {
-            position: Position::from_world_pos(spawn_xyz, depth),
-            smoothed_up,
-            yaw,
-            pitch,
-        }
+        Self { position, smoothed_up, yaw, pitch }
     }
 
     /// Lerp `smoothed_up` toward `target_up` at rate `k` per dt.
@@ -83,14 +78,15 @@ impl Camera {
 
     pub fn forward(&self) -> [f32; 3] { self.basis().0 }
 
-    /// Build the GPU camera block. `frame_depth` names the ancestor
-    /// whose local `[0, 3)³` frame the shader will treat as world space
-    /// — normally the render root. Caller supplies it (the camera
-    /// doesn't know what the renderer's frame is).
-    pub fn gpu_camera(&self, fov: f32, frame_depth: u8) -> GpuCamera {
+    /// Build the GPU camera block. `pos_in_frame` is the camera's
+    /// XYZ in whatever frame the shader is rendering in (usually the
+    /// render-root's `[0, 3)³` cell). Caller computes it with
+    /// `Position::pos_in_ancestor_frame_in_tree` so crossings
+    /// through body/face subtrees reconstruct correct XYZ.
+    pub fn gpu_camera(&self, fov: f32, pos_in_frame: [f32; 3]) -> GpuCamera {
         let (fwd, r, up) = self.basis();
         GpuCamera {
-            pos: self.position.pos_in_ancestor_frame(frame_depth),
+            pos: pos_in_frame,
             _pad0: 0.0,
             forward: fwd,
             _pad1: 0.0,
