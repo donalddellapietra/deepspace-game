@@ -384,6 +384,48 @@ fn build_placement_chain(
     }
 }
 
+/// Install a subtree (NodeId) at a given path from root.
+///
+/// `ancestor_slots` is a list of child slot indices from root to the
+/// target position. The subtree at `new_node_id` replaces whatever
+/// was at the final slot. Clone-on-write propagation creates new
+/// ancestors all the way to a new root.
+///
+/// Used for placing saved meshes / imported models.
+pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_node_id: NodeId) {
+    if ancestor_slots.is_empty() { return; }
+
+    // Phase 1: Descent — record (parent_id, slot) pairs.
+    let mut descent: Vec<(NodeId, usize)> = Vec::with_capacity(ancestor_slots.len());
+    let mut current_id = world.root;
+
+    for &slot in ancestor_slots {
+        descent.push((current_id, slot));
+        let Some(node) = world.library.get(current_id) else { return };
+        match node.children[slot] {
+            Child::Node(child_id) => current_id = child_id,
+            _ => {
+                // Terminal or empty at this slot — we'll replace it.
+                // No further descent needed.
+                break;
+            }
+        }
+    }
+
+    // Phase 2: Ascent — walk back up, cloning children arrays.
+    let mut child = Child::Node(new_node_id);
+    for &(parent_id, slot) in descent.iter().rev() {
+        let Some(node) = world.library.get(parent_id) else { return };
+        let mut new_children = node.children;
+        new_children[slot] = child;
+        child = Child::Node(world.library.insert(new_children));
+    }
+
+    if let Child::Node(new_root) = child {
+        world.swap_root(new_root);
+    }
+}
+
 /// Apply an edit and propagate clone-on-write up to root.
 fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bool {
     if hit.path.is_empty() {

@@ -6,6 +6,7 @@
 
 use crate::bridge::*;
 use crate::world::palette::{self, block, ColorRegistry};
+use crate::world::tree::NodeId;
 
 // ── Hotbar slot ──────────────────────────────────────────────────
 
@@ -13,6 +14,31 @@ use crate::world::palette::{self, block, ColorRegistry};
 pub enum HotbarItem {
     Block(u8),
     Mesh(usize),
+}
+
+// ── Saved meshes (subtrees captured with V key) ─────────────────
+
+#[derive(Clone, Debug)]
+pub struct SavedMesh {
+    pub node_id: NodeId,
+}
+
+#[derive(Default)]
+pub struct SavedMeshes {
+    pub items: Vec<SavedMesh>,
+}
+
+impl SavedMeshes {
+    /// Save a subtree. Caller must `ref_inc` the node_id first to pin it.
+    /// Returns the index, or the existing index if already saved.
+    pub fn save(&mut self, node_id: NodeId) -> usize {
+        if let Some(idx) = self.items.iter().position(|s| s.node_id == node_id) {
+            return idx;
+        }
+        let idx = self.items.len();
+        self.items.push(SavedMesh { node_id });
+        idx
+    }
 }
 
 // ── Custom block palette entry ───────────────────────────────────

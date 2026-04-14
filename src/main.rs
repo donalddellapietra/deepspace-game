@@ -8,7 +8,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
-use deepspace_game::game_state::GameUiState;
+use deepspace_game::game_state::{GameUiState, HotbarItem, SavedMeshes};
 use deepspace_game::renderer::Renderer;
 use deepspace_game::world::collision::{self, PlayerPhysics};
 use deepspace_game::world::edit;
@@ -105,6 +105,8 @@ struct App {
     tree_depth: u32,
     physics: PlayerPhysics,
     palette: ColorRegistry,
+    saved_meshes: SavedMeshes,
+    save_mode: bool,
     ui: GameUiState,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
@@ -136,6 +138,8 @@ impl App {
             tree_depth,
             physics: PlayerPhysics::default(),
             palette: ColorRegistry::new(),
+            saved_meshes: SavedMeshes::default(),
+            save_mode: false,
             ui: GameUiState::new(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
@@ -244,22 +248,52 @@ impl App {
             &self.world.library, self.world.root,
             self.eye_pos(), ray_dir, self.edit_depth(),
         );
-        if let Some(hit) = hit {
-            if edit::break_block(&mut self.world, &hit) {
-                self.upload_tree();
+        let Some(hit) = hit else { return };
+
+        if self.save_mode {
+            // Save mode: capture the subtree under the crosshair.
+            // The last path entry's parent contains the hit child.
+            // Walk to the Node child at the hit slot to get its NodeId.
+            if let Some(&(parent_id, slot)) = hit.path.last() {
+                if let Some(node) = self.world.library.get(parent_id) {
+                    if let deepspace_game::world::tree::Child::Node(child_id) = node.children[slot] {
+                        self.world.library.ref_inc(child_id);
+                        let idx = self.saved_meshes.save(child_id);
+                        self.ui.slots[self.ui.active_slot] = HotbarItem::Mesh(idx);
+                        log::info!("Saved mesh #{idx} (node {child_id})");
+                    }
+                }
             }
+            self.save_mode = false;
+            return;
+        }
+
+        if edit::break_block(&mut self.world, &hit) {
+            self.upload_tree();
         }
     }
 
     fn do_place(&mut self) {
-        let Some(block_type) = self.ui.active_block_type() else { return };
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
             self.eye_pos(), ray_dir, self.edit_depth(),
         );
-        if let Some(hit) = hit {
-            if edit::place_block(&mut self.world, &hit, block_type) {
+        let Some(hit) = hit else { return };
+
+        match &self.ui.slots[self.ui.active_slot] {
+            HotbarItem::Block(block_type) => {
+                if edit::place_block(&mut self.world, &hit, *block_type) {
+                    self.upload_tree();
+                }
+            }
+            HotbarItem::Mesh(idx) => {
+                let Some(saved) = self.saved_meshes.items.get(*idx) else { return };
+                let node_id = saved.node_id;
+                // Place the subtree adjacent to the hit face.
+                // Compute the path to the adjacent cell.
+                let path: Vec<usize> = hit.path.iter().map(|&(_, slot)| slot).collect();
+                edit::install_subtree(&mut self.world, &path, node_id);
                 self.upload_tree();
             }
         }
@@ -398,6 +432,12 @@ impl App {
             } else {
                 self.lock_cursor();
             }
+            return;
+        }
+
+        if pressed && code == KeyCode::KeyV && self.cursor_locked {
+            self.save_mode = !self.save_mode;
+            log::info!("Save mode: {}", self.save_mode);
             return;
         }
 
