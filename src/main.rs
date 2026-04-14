@@ -134,7 +134,10 @@ impl App {
             cursor_locked: false,
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
-            zoom_level: 0,
+            // Start at the base terrain's block level. The base terrain
+            // occupies the bottom 6 layers, so edit_depth = 6 means
+            // zoom_level = tree_depth - 6.
+            zoom_level: (tree_depth as i32 - 6).max(0),
             tree_depth,
             palette: ColorRegistry::new(),
             saved_meshes: SavedMeshes::default(),
@@ -456,6 +459,7 @@ impl ApplicationHandler for App {
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
         let renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
         self.renderer = Some(renderer);
+        self.apply_zoom(); // sync renderer max_depth with initial zoom_level
         self.last_frame = std::time::Instant::now();
     }
 
