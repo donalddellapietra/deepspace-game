@@ -3,5 +3,12 @@ pub mod import;
 pub mod renderer;
 pub mod bridge;
 pub mod game_state;
+pub mod camera;
+pub mod input;
+pub mod player;
+pub mod editing;
+pub mod app;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod overlay;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod platform;
