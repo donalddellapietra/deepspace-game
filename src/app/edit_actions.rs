@@ -14,11 +14,22 @@ use crate::world::gpu;
 use super::App;
 
 impl App {
-    /// CPU raycast depth: tree_depth - zoom_level.
-    /// zoom_level 0 = finest blocks, higher = coarser.
+    /// CPU raycast depth: how far below the render root to descend
+    /// when testing the cursor ray. Derived from the camera's path
+    /// depth (the "zoom anchor") minus the render-root depth. Under
+    /// the path-based model introduced in step 7, zoom IS
+    /// `camera.position.depth`.
     pub(super) fn edit_depth(&self) -> u32 {
-        let td = self.tree_depth as i32;
-        (td - self.zoom_level).max(1) as u32
+        let cd = self.camera.position.depth as i32;
+        let rrd = self.render_root_depth() as i32;
+        (cd - rrd).max(1) as u32
+    }
+
+    /// Legacy "zoom_level" = `tree_depth - edit_depth`. Kept as a
+    /// getter for UI/overlay code that still reports the old number
+    /// (0 = finest, higher = coarser). Step 10 retires the UI field.
+    pub(super) fn zoom_level(&self) -> i32 {
+        self.tree_depth as i32 - self.edit_depth() as i32
     }
 
     /// Node id of the "render root" — the ancestor whose subtree the
@@ -53,12 +64,22 @@ impl App {
         (self.edit_depth() + 3).min(16)
     }
 
-    /// Clamp zoom and sync GPU depth.
+    /// Sync GPU max depth + camera uniform with the current camera
+    /// depth. Called after any zoom change.
     pub(super) fn apply_zoom(&mut self) {
-        let td = self.tree_depth as i32;
-        self.zoom_level = self.zoom_level.clamp(0, (td - 1).max(0));
-        self.ui.zoom_level = self.zoom_level;
+        let td = self.tree_depth as u8;
+        // Clamp camera depth into [1, tree_depth] via zoom_in/out.
+        // Step 7 puts zoom behind Position — the camera can't end up
+        // at an invalid depth through normal input, but defensive
+        // clamping covers edge cases (e.g. tree shrank after edits).
+        while self.camera.position.depth < 1 {
+            self.camera.position.zoom_in();
+        }
+        while self.camera.position.depth > td && td > 0 {
+            self.camera.position.zoom_out();
+        }
         let vd = self.visual_depth();
+        self.ui.zoom_level = self.zoom_level();
         let frame_depth = self.render_root_depth();
         let gpu_cam = self.camera.gpu_camera(1.2, frame_depth);
         if let Some(renderer) = &mut self.renderer {
@@ -66,18 +87,19 @@ impl App {
             renderer.update_camera(&gpu_cam);
         }
         log::info!(
-            "Zoom: {}/{}, edit_depth: {}, visual: {}",
-            self.zoom_level,
+            "Camera depth: {}/{} (zoom_level {}), edit: {}, visual: {}",
+            self.camera.position.depth,
             td,
+            self.zoom_level(),
             self.edit_depth(),
-            vd
+            vd,
         );
     }
 
     pub(super) fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
-        let zoom_level = self.zoom_level;
+        let zoom_level = self.zoom_level();
         let camera_pos = self.camera_pos_in_render_frame();
 
         // Spherical-tree break: clear the targeted subtree if the
@@ -142,7 +164,7 @@ impl App {
     pub(super) fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
-        let zoom_level = self.zoom_level;
+        let zoom_level = self.zoom_level();
         let camera_pos = self.camera_pos_in_render_frame();
 
         // Spherical place: fill the cell adjacent to the first solid
@@ -248,7 +270,7 @@ impl App {
         // Cubed-sphere cursor. Highlight depth comes from the same
         // `cs_edit_depth` the break path uses, so what you see is
         // exactly what you break.
-        let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.zoom_level);
+        let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.zoom_level());
         let cs_hit = self.cs_planet.as_ref().and_then(|p| {
             p.raycast(&self.world.library, self.camera_pos_in_render_frame(), ray_dir, cs_depth)
         });

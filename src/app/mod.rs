@@ -47,7 +47,6 @@ pub struct App {
     pub(super) cursor_locked: bool,
     pub(super) keys: Keys,
     pub(super) last_frame: std::time::Instant,
-    pub(super) zoom_level: i32,
     /// Cached tree depth (recomputed only after edits).
     pub(super) tree_depth: u32,
     pub(super) palette: ColorRegistry,
@@ -86,15 +85,18 @@ impl App {
             world.library.len(),
         );
 
-        // Spawn above the cubed-sphere planet's north pole.
+        // Spawn above the cubed-sphere planet's north pole. The
+        // initial edit depth is 6 (base-terrain level), which means
+        // the camera anchors at depth 6 — zoom-in descends from there.
         let spawn_pos = [setup.center[0], setup.center[1] + setup.outer_r + 0.3, setup.center[2]];
+        let spawn_depth = 6u8.min(tree_depth as u8).max(1);
 
         Self {
             window: None,
             renderer: None,
             camera: Camera::at_spawn(
                 spawn_pos,
-                tree_depth as u8,
+                spawn_depth,
                 [0.0, 1.0, 0.0],
                 0.0,
                 -0.3,
@@ -104,10 +106,6 @@ impl App {
             cursor_locked: false,
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
-            // Start at the base terrain's block level. The base terrain
-            // occupies the bottom 6 layers, so edit_depth = 6 means
-            // zoom_level = tree_depth - 6.
-            zoom_level: (tree_depth as i32 - 6).max(0),
             tree_depth,
             palette: ColorRegistry::new(),
             saved_meshes: SavedMeshes::default(),
@@ -128,8 +126,9 @@ impl App {
     /// live in [`edit_actions`]; the `ApplicationHandler` in
     /// [`event_loop`] calls them in order.
     pub(super) fn update(&mut self, dt: f32) {
-        let td = self.tree_depth as i32;
-        let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
+        // Cell size at the camera's current anchoring depth in world
+        // units. depth=d → cell_size = 3^(1 - d).
+        let cell_size = 3.0f32.powi(1 - self.camera.position.depth as i32);
 
         player::update(
             &mut self.camera,
