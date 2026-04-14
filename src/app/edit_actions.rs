@@ -1,7 +1,17 @@
 //! Break / place / highlight / zoom / GPU upload on the `App`.
+//!
+//! The rendering path is driven in the **render frame** — an
+//! ancestor of the camera's anchor a few levels up. Every value
+//! that reaches the shader (camera position, planet center, block
+//! highlight AABB) is expressed in that frame's local
+//! `[0, WORLD_SIZE)³` system so f32 precision is preserved at any
+//! anchor depth. Absolute world XYZ is reserved for CPU-side
+//! operations (cursor raycast, gravity, editing) where cell-scale
+//! noise at deep anchors is invisible.
 
 use crate::editing;
 use crate::game_state::HotbarItem;
+use crate::world::anchor::WORLD_SIZE;
 use crate::world::edit;
 use crate::world::gpu;
 
@@ -21,17 +31,20 @@ impl App {
     pub(super) fn apply_zoom(&mut self) {
         self.ui.zoom_level = self.zoom_level();
         let vd = self.visual_depth();
+        let (frame, _) = self.render_frame();
+        let cam_local = self.camera.position.in_frame(&frame);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
-            renderer.update_camera(&self.camera.gpu_camera(1.2));
+            renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
         }
         log::info!(
-            "Zoom: {}/{}, edit_depth: {}, visual: {}, anchor_depth: {}",
+            "Zoom: {}/{}, edit_depth: {}, visual: {}, anchor_depth: {}, frame_depth: {}",
             self.zoom_level(),
             self.tree_depth as i32,
             self.edit_depth(),
             vd,
             self.anchor_depth(),
+            frame.depth(),
         );
     }
 
@@ -143,32 +156,66 @@ impl App {
         self.upload_tree_lod();
     }
 
-    /// Re-pack and upload the tree with LOD culling based on camera
-    /// position. Packs both the Cartesian space tree and the
-    /// spherical planet's 6 face subtrees in one pass.
+    /// Pack and upload the tree subtree rooted at the current render
+    /// frame. The shader sees the frame as its `[0, WORLD_SIZE)` root;
+    /// camera position, planet center, and planet radii are all
+    /// transformed into the same local frame so f32 stays sub-cell
+    /// accurate at any anchor depth.
     pub(super) fn upload_tree_lod(&mut self) {
-        let cam_world = self.camera.world_pos_f32();
-        let mut roots: Vec<u64> = vec![self.world.root];
+        let (frame, frame_root) = self.render_frame();
+        let frame_scale = 3.0f32.powi(frame.depth() as i32);
+        let cam_local = self.camera.position.in_frame(&frame);
+
+        let mut roots: Vec<u64> = vec![frame_root];
         if let Some(p) = self.cs_planet.as_ref() {
             roots.extend_from_slice(&p.face_roots);
         }
         let (tree_data, root_indices) = gpu::pack_tree_lod_multi(
             &self.world.library,
             &roots,
-            cam_world,
+            cam_local,
             1440.0,
             1.2,
         );
-        if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, root_indices[0]);
-            if self.cs_planet.is_some() {
-                let face_roots: [u32; 6] = [
-                    root_indices[1], root_indices[2], root_indices[3],
-                    root_indices[4], root_indices[5], root_indices[6],
-                ];
-                renderer.set_face_roots(face_roots);
+
+        let Some(renderer) = &mut self.renderer else { return; };
+        renderer.update_tree(&tree_data, root_indices[0]);
+        if let Some(planet) = self.cs_planet.as_ref() {
+            let face_roots: [u32; 6] = [
+                root_indices[1], root_indices[2], root_indices[3],
+                root_indices[4], root_indices[5], root_indices[6],
+            ];
+            renderer.set_face_roots(face_roots);
+
+            // Express the planet in the render frame. We deepen the
+            // planet's anchor to the frame's depth via exact path
+            // arithmetic, then require the frame path to be a prefix
+            // of the deepened anchor. When it isn't (camera and
+            // planet live in different branches of the tree) the
+            // planet is outside the render frame — hide it.
+            let deepened = planet.center_worldpos.deepened_to(frame.depth());
+            let planet_in_frame = frame.depth() == 0
+                || deepened.anchor.as_slice()[..frame.depth() as usize]
+                    == *frame.as_slice();
+            if planet_in_frame {
+                let local_center = deepened.in_frame(&frame);
+                renderer.set_cubed_sphere_planet(
+                    local_center,
+                    planet.inner_r * frame_scale,
+                    planet.outer_r * frame_scale,
+                    planet.depth,
+                );
+            } else {
+                renderer.set_cubed_sphere_planet(
+                    [0.0, 0.0, 0.0],
+                    0.0,
+                    0.0,
+                    planet.depth,
+                );
             }
         }
+
+        renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
     }
 
     pub(super) fn update_highlight(&mut self) {
@@ -196,18 +243,45 @@ impl App {
         });
         let cs_t = cs_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
 
-        if let Some(renderer) = &mut self.renderer {
-            if cs_t < tree_t {
-                renderer.set_highlight(None);
-                if let Some(h) = cs_hit {
-                    renderer.set_cubed_sphere_highlight(Some((
-                        h.face as u32, h.iu, h.iv, h.ir, h.depth,
-                    )));
-                }
-            } else {
-                renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
-                renderer.set_cubed_sphere_highlight(None);
+        // Resolve the block AABB into frame-local coords before we
+        // take the mutable renderer borrow — read-only `self`
+        // access can't overlap the `&mut renderer`.
+        let highlight_local = if cs_t < tree_t {
+            None
+        } else if let Some(aabb) = tree_hit.as_ref().map(edit::hit_aabb) {
+            let (frame, _) = self.render_frame();
+            let frame_scale = 3.0f32.powi(frame.depth() as i32);
+            let mut frame_origin = [0.0f32; 3];
+            let mut size = WORLD_SIZE;
+            for k in 0..frame.depth() as usize {
+                let (sx, sy, sz) = crate::world::tree::slot_coords(frame.slot(k) as usize);
+                let child = size / 3.0;
+                frame_origin[0] += sx as f32 * child;
+                frame_origin[1] += sy as f32 * child;
+                frame_origin[2] += sz as f32 * child;
+                size = child;
             }
+            let to_local = |w: [f32; 3]| [
+                (w[0] - frame_origin[0]) * frame_scale,
+                (w[1] - frame_origin[1]) * frame_scale,
+                (w[2] - frame_origin[2]) * frame_scale,
+            ];
+            Some((to_local(aabb.0), to_local(aabb.1)))
+        } else {
+            None
+        };
+
+        let Some(renderer) = &mut self.renderer else { return };
+        if cs_t < tree_t {
+            renderer.set_highlight(None);
+            if let Some(h) = cs_hit {
+                renderer.set_cubed_sphere_highlight(Some((
+                    h.face as u32, h.iu, h.iv, h.ir, h.depth,
+                )));
+            }
+        } else {
+            renderer.set_highlight(highlight_local);
+            renderer.set_cubed_sphere_highlight(None);
         }
     }
 }

@@ -25,6 +25,7 @@
 //! later passes (tree integration, renderer, collision) will build
 //! on it.
 
+use super::anchor::WorldPos;
 use super::sdf::{self, Planet, Vec3};
 use super::tree::{
     empty_children, slot_index, uniform_children, Child, NodeId, NodeLibrary,
@@ -224,7 +225,16 @@ pub fn block_corners(
 /// coordinates.
 #[derive(Clone, Debug)]
 pub struct SphericalPlanet {
+    /// Planet center in world XYZ. Kept for absolute-space use
+    /// (gravity, cursor targeting) that doesn't need f32 cell-scale
+    /// precision.
     pub center: Vec3,
+    /// Planet center as a path-anchored `WorldPos`. The canonical
+    /// identifier for rendering — transformed to the current render
+    /// frame's local coords via `anchor.in_frame(frame)` so the
+    /// center-to-camera vector preserves sub-cell precision at any
+    /// anchor depth.
+    pub center_worldpos: WorldPos,
     /// Cells span `r ∈ [inner_r, outer_r]`. A solid column typical of
     /// a rocky planet has its surface near the midpoint and empty
     /// cells above, solid cells below.
@@ -283,7 +293,10 @@ pub fn generate_spherical_planet(
         };
         lib.ref_inc(face_roots[face as usize]);
     }
-    SphericalPlanet { center, inner_r, outer_r, face_roots, depth }
+    // Anchor the planet center at a depth where the cell fully
+    // contains the shell — f32 precision is plenty at that scale.
+    let center_worldpos = WorldPos::from_world_xyz(center, 4);
+    SphericalPlanet { center, center_worldpos, inner_r, outer_r, face_roots, depth }
 }
 
 /// Recursive builder for one cubed-sphere face. Returns a `Child` so

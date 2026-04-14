@@ -316,6 +316,84 @@ impl WorldPos {
         WORLD_SIZE / 3.0f32.powi(self.anchor.depth() as i32)
     }
 
+    /// Zoom this position in repeatedly until its anchor reaches
+    /// `target_depth`. Precision-safe: each step is pure path-slot
+    /// arithmetic, no absolute-XYZ accumulation.
+    pub fn deepened_to(mut self, target_depth: u8) -> Self {
+        while self.anchor.depth() < target_depth {
+            self.zoom_in();
+        }
+        self
+    }
+
+    /// Position expressed in a render frame's local `[0, WORLD_SIZE)³`
+    /// coordinate system. Requires `frame` to be a prefix of this
+    /// position's anchor — the caller guarantees the render frame is
+    /// an ancestor of the camera's anchor.
+    ///
+    /// **Precision-safe.** The computation composes path slots from
+    /// `frame.depth` down to `self.anchor.depth`, plus the offset —
+    /// exact integer math on the slots, no float accumulation at
+    /// absolute world scale. This is the whole point of the anchor
+    /// refactor: rendering inputs stay at f32-safe magnitudes no
+    /// matter how deep the anchor sits.
+    pub fn in_frame(&self, frame: &Path) -> [f32; 3] {
+        debug_assert!(frame.depth() <= self.anchor.depth(),
+            "frame must be an ancestor of the camera's anchor");
+        debug_assert!(
+            self.anchor.as_slice()[..frame.depth() as usize] == *frame.as_slice(),
+            "frame must be a path prefix of the camera's anchor",
+        );
+        let mut origin = [0.0f32; 3];
+        let mut size = WORLD_SIZE;
+        for k in (frame.depth() as usize)..(self.anchor.depth() as usize) {
+            let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
+            let child = size / 3.0;
+            origin[0] += sx as f32 * child;
+            origin[1] += sy as f32 * child;
+            origin[2] += sz as f32 * child;
+            size = child;
+        }
+        [
+            origin[0] + self.offset[0] * size,
+            origin[1] + self.offset[1] * size,
+            origin[2] + self.offset[2] * size,
+        ]
+    }
+
+    /// Build a `WorldPos` at `anchor_depth` whose frame-local
+    /// coordinate under `frame` equals `xyz`. Inverse of
+    /// `in_frame`. Used when scroll-zoom reconstructs the camera
+    /// after a frame-local dolly.
+    pub fn from_frame_local(frame: &Path, xyz: [f32; 3], anchor_depth: u8) -> Self {
+        debug_assert!(anchor_depth >= frame.depth());
+        let clamped = [
+            xyz[0].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[1].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[2].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+        ];
+        let mut anchor = *frame;
+        let mut origin = [0.0f32; 3];
+        let mut size = WORLD_SIZE;
+        for _ in frame.depth()..anchor_depth {
+            let child = size / 3.0;
+            let mut s = [0usize; 3];
+            for i in 0..3 {
+                let v = ((clamped[i] - origin[i]) / child).floor().clamp(0.0, 2.0) as usize;
+                s[i] = v;
+                origin[i] += v as f32 * child;
+            }
+            anchor.push(slot_index(s[0], s[1], s[2]) as u8);
+            size = child;
+        }
+        let offset = [
+            ((clamped[0] - origin[0]) / size).clamp(0.0, 1.0 - f32::EPSILON),
+            ((clamped[1] - origin[1]) / size).clamp(0.0, 1.0 - f32::EPSILON),
+            ((clamped[2] - origin[2]) / size).clamp(0.0, 1.0 - f32::EPSILON),
+        ];
+        Self { anchor, offset }
+    }
+
     /// Pop the deepest slot. Offset rescaled so the world position
     /// is unchanged. Clamps at root.
     pub fn zoom_out(&mut self) -> Transition {
@@ -548,6 +626,44 @@ mod tests {
         let after_out = p.to_world_xyz();
         for i in 0..3 {
             assert!((before[i] - after_out[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn in_frame_is_identity_at_root_frame() {
+        let p = WorldPos::from_world_xyz([1.5, 2.25, 0.75], 7);
+        let local = p.in_frame(&Path::root());
+        let world = p.to_world_xyz();
+        for i in 0..3 {
+            assert!((local[i] - world[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn in_frame_round_trip_via_from_frame_local() {
+        let p = WorldPos::from_world_xyz([1.5, 2.1, 0.9], 12);
+        let mut frame = p.anchor;
+        frame.truncate(frame.depth() - 3);
+        let local = p.in_frame(&frame);
+        let q = WorldPos::from_frame_local(&frame, local, p.anchor.depth());
+        let world_back = q.to_world_xyz();
+        let world_orig = p.to_world_xyz();
+        for i in 0..3 {
+            assert!((world_back[i] - world_orig[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn in_frame_precision_at_deep_anchor() {
+        // At anchor depth 18, absolute world XYZ near 1.5 loses
+        // sub-cell precision in f32. The frame-local coord should
+        // hit f32-safe magnitudes inside the frame's [0, WORLD_SIZE).
+        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 18);
+        let mut frame = p.anchor;
+        frame.truncate(frame.depth() - 3);
+        let local = p.in_frame(&frame);
+        for &v in &local {
+            assert!((0.0..super::WORLD_SIZE).contains(&v), "local {v} out of frame");
         }
     }
 

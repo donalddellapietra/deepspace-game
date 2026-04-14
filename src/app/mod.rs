@@ -9,9 +9,16 @@ use crate::game_state::{GameUiState, SavedMeshes};
 use crate::input::Keys;
 use crate::player;
 use crate::renderer::Renderer;
-use crate::world::anchor::{WorldPos, WORLD_SIZE};
+use crate::world::anchor::{Path, WorldPos, WORLD_SIZE};
 use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
+use crate::world::tree::{Child, NodeId};
+
+/// Levels shallower than the camera's anchor at which the render
+/// frame sits. Larger K = bigger packed subtree (more to render) but
+/// more headroom before cell-scale drops below the local scale we
+/// ship to the shader. 3 matches the spec's default.
+pub const RENDER_FRAME_K: u8 = 3;
 
 pub mod cursor;
 pub mod edit_actions;
@@ -111,6 +118,37 @@ impl App {
         self.camera.position.anchor.depth() as u32
     }
 
+    /// Render frame = camera's anchor truncated by `RENDER_FRAME_K`
+    /// levels, further clamped so the walk from `world.root` lands
+    /// on an actual `Node`. Returns `(path, node_id)` where
+    /// `node_id` is the root of the subtree the shader will render
+    /// and `path` is the path from `world.root` to that subtree.
+    ///
+    /// If the walk encounters a terminal (`Empty` or `Block`) before
+    /// reaching the desired depth, the frame is truncated to the
+    /// parent `Node` so the rendered subtree stays concrete — the
+    /// shader can walk it without hitting a dangling path.
+    pub(super) fn render_frame(&self) -> (Path, NodeId) {
+        let desired_depth = self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8;
+        let mut frame = self.camera.position.anchor;
+        frame.truncate(desired_depth);
+        let mut node_id = self.world.root;
+        let mut reached = 0u8;
+        for k in 0..frame.depth() as usize {
+            let Some(node) = self.world.library.get(node_id) else { break };
+            let slot = frame.slot(k) as usize;
+            match node.children[slot] {
+                Child::Node(child_id) => {
+                    node_id = child_id;
+                    reached = (k as u8) + 1;
+                }
+                Child::Block(_) | Child::Empty => break,
+            }
+        }
+        frame.truncate(reached);
+        (frame, node_id)
+    }
+
     #[inline]
     pub(super) fn zoom_level(&self) -> i32 {
         (self.tree_depth as i32) - (self.anchor_depth() as i32) + 1
@@ -126,8 +164,12 @@ impl App {
             dt,
         );
 
+        // Camera moved — push its new frame-local position to the
+        // GPU so the next render consumes f32-safe coordinates.
+        let (frame, _) = self.render_frame();
+        let cam_local = self.camera.position.in_frame(&frame);
         if let Some(renderer) = &self.renderer {
-            renderer.update_camera(&self.camera.gpu_camera(1.2));
+            renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
         }
     }
 }

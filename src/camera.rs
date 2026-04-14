@@ -80,9 +80,16 @@ impl Camera {
     pub fn forward(&self) -> [f32; 3] { self.basis().0 }
 
     pub fn gpu_camera(&self, fov: f32) -> GpuCamera {
+        self.gpu_camera_at(self.world_pos_f32(), fov)
+    }
+
+    /// Build a `GpuCamera` with an explicit position. Used by the
+    /// render-frame pipeline: position is the camera's frame-local
+    /// coordinate (f32-safe at any anchor depth), not world XYZ.
+    pub fn gpu_camera_at(&self, pos: [f32; 3], fov: f32) -> GpuCamera {
         let (fwd, r, up) = self.basis();
         GpuCamera {
-            pos: self.world_pos_f32(),
+            pos,
             _pad0: 0.0,
             forward: fwd,
             _pad1: 0.0,
