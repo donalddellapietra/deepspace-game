@@ -20,6 +20,21 @@ use crate::world::tree::{Child, NodeId};
 /// ship to the shader. 3 matches the spec's default.
 pub const RENDER_FRAME_K: u8 = 3;
 
+/// Maximum depth the render frame is allowed to sit at. The
+/// cubed-sphere planet currently renders via separate `cs_planet`
+/// uniforms at world scale; running the tree march in a deeper
+/// frame would force the shader to mix world-scale sphere math
+/// with `3^frame_depth`-scaled tree math, and the ray-sphere
+/// `dot(oc, oc)` at those magnitudes blows past f32 precision.
+///
+/// Cap = 0 (root frame) keeps both pipelines at world scale. The
+/// frame machinery stays in place — `in_frame` / `deepened_to` /
+/// the packing-from-frame path are all exercised by tests — so
+/// once `NodeKind::CubedSphereBody` dispatch lands in the shader
+/// and the sphere renders inside the tree walk, this cap can
+/// rise and the precision win returns for tree voxels.
+pub const RENDER_FRAME_MAX_DEPTH: u8 = 0;
+
 pub mod cursor;
 pub mod edit_actions;
 pub mod event_loop;
@@ -129,7 +144,8 @@ impl App {
     /// parent `Node` so the rendered subtree stays concrete — the
     /// shader can walk it without hitting a dangling path.
     pub(super) fn render_frame(&self) -> (Path, NodeId) {
-        let desired_depth = self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8;
+        let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
+            .min(RENDER_FRAME_MAX_DEPTH);
         let mut frame = self.camera.position.anchor;
         frame.truncate(desired_depth);
         let mut node_id = self.world.root;
