@@ -93,5 +93,15 @@ pub fn update(
         sdf::scale(*velocity, dt),
         sdf::scale(thrust, dt),
     );
-    camera.set_world_pos(sdf::add(camera.world_pos(), step));
+    // Integrate motion path-based. `step` is a world-space delta;
+    // at the camera's anchoring depth each cell is 3^(1 - depth)
+    // wide in world units, so offset delta = world delta / cell_size
+    // = world delta * 3^(depth - 1). add_offset handles carry.
+    let depth = camera.position.depth as i32;
+    let inv_cell = 3.0f32.powi(depth - 1);
+    camera.position.add_offset([
+        step[0] * inv_cell,
+        step[1] * inv_cell,
+        step[2] * inv_cell,
+    ]);
 }

@@ -197,28 +197,37 @@ impl Position {
     }
 
     /// Integrate a velocity step: `offset += delta`, then carry across
-    /// cell boundaries via [`step_neighbor`]. Clamps at the tree root
-    /// if the carry bubbles past it.
+    /// cell boundaries via [`carry_axis`]. Clamps at the tree root if
+    /// the carry bubbles past it.
+    ///
+    /// Large deltas (e.g. world-space step converted to offset at a
+    /// deep anchoring depth — step 4's player physics can produce
+    /// offsets well above 1.0) are handled in O(depth) by extracting
+    /// the integer cell count once, not one cell at a time.
     pub fn add_offset(&mut self, delta: [f32; 3]) {
         for axis in 0..3 {
             self.offset[axis] += delta[axis];
-            loop {
-                if self.offset[axis] >= 1.0 {
-                    if !carry_axis(self, axis, 1) {
-                        // Past root in +axis; clamp just below 1.
+            let whole = self.offset[axis].floor();
+            self.offset[axis] -= whole;
+            // After floor-subtract, offset ∈ [0, 1) in exact math.
+            // A tiny positive remainder is still possible from float
+            // roundoff; snap back inside the range.
+            if self.offset[axis] >= 1.0 {
+                self.offset[axis] = 1.0 - f32::EPSILON;
+            } else if self.offset[axis] < 0.0 {
+                self.offset[axis] = 0.0;
+            }
+            let cells = whole as i64;
+            if cells != 0 {
+                let leftover = carry_axis(self, axis, cells);
+                if leftover != 0 {
+                    // Carry walked off the root. Pin the offset to
+                    // the boundary so world_pos stays inside [0, 3).
+                    if leftover > 0 {
                         self.offset[axis] = 1.0 - f32::EPSILON;
-                        break;
-                    }
-                    self.offset[axis] -= 1.0;
-                } else if self.offset[axis] < 0.0 {
-                    if !carry_axis(self, axis, -1) {
-                        // Past root in -axis; clamp at 0.
+                    } else {
                         self.offset[axis] = 0.0;
-                        break;
                     }
-                    self.offset[axis] += 1.0;
-                } else {
-                    break;
                 }
             }
         }
@@ -229,45 +238,52 @@ impl Position {
 
 /// Move one cell along `axis` by `dir` (`+1` or `-1`). Cartesian
 /// semantics: increment/decrement the slot coord; carry to parent on
-/// wrap.
+/// wrap. Returns `false` and leaves `pos` unchanged if the step walks
+/// past the root.
 ///
-/// Returns `false` and leaves `pos` unchanged if the carry reaches
-/// past the root — the step is absorbed by the caller (typically by
-/// clamping offset, as in [`Position::add_offset`]).
-///
-/// Step 2 introduces `NodeKind` and turns this into a dispatcher over
-/// body/face kinds (§2c); step 1 is Cartesian-only.
+/// Step 8 turns this into a dispatcher over `NodeKind::CubedSphereBody`
+/// / `CubedSphereFace` (§2c of refactor-decisions.md); today it's
+/// Cartesian-only.
 pub fn step_neighbor(pos: &mut Position, axis: usize, dir: i32) -> bool {
     debug_assert!(axis < 3, "axis must be 0, 1, or 2");
     debug_assert!(dir == 1 || dir == -1, "dir must be ±1");
-    carry_axis(pos, axis, dir)
+    carry_axis(pos, axis, dir as i64) == 0
 }
 
-/// Walk up `pos.path`, adjusting the axis coord by `dir` at each
-/// level, carrying through 3-wraps. Returns `false` if we walk past
-/// the root without resolving; on failure the path is restored.
-fn carry_axis(pos: &mut Position, axis: usize, dir: i32) -> bool {
+/// Shift `pos` by `amount` cells along `axis`, carrying through
+/// base-3 wraps up the path. O(depth).
+///
+/// Returns any leftover cells that couldn't be resolved before the
+/// carry ran past the root; callers clamp the offset when this
+/// happens. On leftover != 0 the path is restored to its original
+/// state so the caller sees an atomic "either-or" outcome.
+fn carry_axis(pos: &mut Position, axis: usize, amount: i64) -> i64 {
+    if amount == 0 {
+        return 0;
+    }
     let saved = pos.path;
+    let mut carry = amount;
     let mut d = pos.depth as usize;
-    while d > 0 {
+    while d > 0 && carry != 0 {
         let slot = pos.path[d - 1] as usize;
         let (sx, sy, sz) = slot_coords(slot);
-        let mut coords = [sx as i32, sy as i32, sz as i32];
-        let v = coords[axis] + dir;
-        if (0..=2).contains(&v) {
-            coords[axis] = v;
-            pos.path[d - 1] =
-                slot_index(coords[0] as usize, coords[1] as usize, coords[2] as usize) as u8;
-            return true;
-        }
-        // Wrap and continue carrying into the parent.
-        coords[axis] = if v < 0 { 2 } else { 0 };
-        pos.path[d - 1] =
-            slot_index(coords[0] as usize, coords[1] as usize, coords[2] as usize) as u8;
+        let mut coords = [sx as i64, sy as i64, sz as i64];
+        let shifted = coords[axis] + carry;
+        let new_coord = shifted.rem_euclid(3);
+        let parent_carry = shifted.div_euclid(3);
+        coords[axis] = new_coord;
+        pos.path[d - 1] = slot_index(
+            coords[0] as usize,
+            coords[1] as usize,
+            coords[2] as usize,
+        ) as u8;
+        carry = parent_carry;
         d -= 1;
     }
-    pos.path = saved;
-    false
+    if carry != 0 {
+        pos.path = saved;
+    }
+    carry
 }
 
 // ---------------------------------------------------------------- tests
@@ -445,6 +461,39 @@ mod tests {
         p.add_offset([2.5, 0.0, 0.0]);
         assert_eq!(p.slots(), &[slot_index(2, 1, 1) as u8]);
         assert!((p.offset[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn add_offset_large_delta_preserves_world_pos() {
+        // Huge offset delta — simulates step 4's world-to-offset
+        // conversion at a deep anchoring depth. Round-tripping
+        // through world_pos must still land at the same XYZ point
+        // (within float precision).
+        let start = Position::from_world_pos([1.5, 1.5, 1.5], 15);
+        let mut p = start;
+        let delta_world = [0.1, -0.05, 0.02];
+        let depth = p.depth as i32;
+        let inv_cell = 3.0f32.powi(depth - 1);
+        p.add_offset([
+            delta_world[0] * inv_cell,
+            delta_world[1] * inv_cell,
+            delta_world[2] * inv_cell,
+        ]);
+        let expected = [
+            1.5 + delta_world[0],
+            1.5 + delta_world[1],
+            1.5 + delta_world[2],
+        ];
+        let got = p.world_pos();
+        for axis in 0..3 {
+            assert!(
+                (got[axis] - expected[axis]).abs() < 1e-3,
+                "axis {}: got {} expected {}",
+                axis,
+                got[axis],
+                expected[axis]
+            );
+        }
     }
 
     #[test]
