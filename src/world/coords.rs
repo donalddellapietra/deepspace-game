@@ -162,6 +162,72 @@ impl std::fmt::Debug for Path {
     }
 }
 
+// -------------------------------------------- legacy-world-coord bridge
+//
+// The legacy engine represents world positions as `[f32; 3]` in a
+// fixed root frame spanning `[0, ROOT_EXTENT)³`. These helpers convert
+// between that representation and the new `WorldPos`, so we can
+// migrate the engine incrementally: the camera and player carry a
+// `WorldPos` internally, but external call sites (shaders, editing,
+// collision) keep reading legacy XYZ through `world_pos_f32`.
+
+/// World extent spanned by the root cell in legacy coordinates.
+/// Matches the shader and `gpu.rs` where "root node cells are 1.0
+/// wide, node spans [0, 3)".
+pub const ROOT_EXTENT: f32 = 3.0;
+
+/// Reconstruct a legacy world `[f32; 3]` from a `WorldPos`.
+///
+/// Exact if `anchor.depth() == 0` (trivial), lossy only by the usual
+/// f32 rounding at deeper anchors. The mapping is
+/// `world_i = ROOT_EXTENT · (Σ slot_coord_at_k · 3^-(k+1) + offset · 3^-depth)`.
+pub fn world_pos_to_f32(pos: &WorldPos) -> [f32; 3] {
+    let slots = pos.anchor.slots();
+    let mut out = [0.0f32; 3];
+    for axis in 0..3usize {
+        let mut frac = 0.0f32;
+        let mut scale = 1.0f32 / 3.0;
+        for &slot in slots {
+            let (sx, sy, sz) = slot_coords(slot as usize);
+            let s = [sx, sy, sz][axis] as f32;
+            frac += s * scale;
+            scale /= 3.0;
+        }
+        frac += pos.offset[axis] * scale * 3.0; // last `scale` was for the next (unused) level
+        out[axis] = frac * ROOT_EXTENT;
+    }
+    out
+}
+
+/// Build a `WorldPos` at the given depth from a legacy world `[f32; 3]`.
+///
+/// Values outside `[0, ROOT_EXTENT)` are clamped. At `depth == 0` the
+/// result is `(root, world/ROOT_EXTENT)`, exact within f32.
+pub fn world_pos_from_f32(world: [f32; 3], depth: u8) -> WorldPos {
+    let mut frac = [
+        (world[0] / ROOT_EXTENT).clamp(0.0, below_one()),
+        (world[1] / ROOT_EXTENT).clamp(0.0, below_one()),
+        (world[2] / ROOT_EXTENT).clamp(0.0, below_one()),
+    ];
+    let mut anchor = Path::root();
+    for _ in 0..depth {
+        let sx = pick_slot(frac[0]);
+        let sy = pick_slot(frac[1]);
+        let sz = pick_slot(frac[2]);
+        anchor.push(slot_index(sx, sy, sz) as u8);
+        frac[0] = rescale_up_remainder(frac[0], sx);
+        frac[1] = rescale_up_remainder(frac[1], sy);
+        frac[2] = rescale_up_remainder(frac[2], sz);
+    }
+    WorldPos { anchor, offset: frac }
+}
+
+#[inline]
+fn rescale_up_remainder(v: f32, slot: usize) -> f32 {
+    let r = v * 3.0 - slot as f32;
+    r.clamp(0.0, below_one())
+}
+
 // ------------------------------------------------------------ Transition
 
 /// Semantic event emitted when the anchor crosses a coordinate-meaning
@@ -494,6 +560,54 @@ mod tests {
         assert!((p.offset[0] - 0.4).abs() < 1e-5);
         assert!((p.offset[1] - 0.3).abs() < 1e-5);
         assert!((p.offset[2] - 0.5).abs() < 1e-5);
+    }
+
+    // ---- legacy-world-coord bridge ----
+
+    #[test]
+    fn world_pos_to_f32_root_is_scaled_offset() {
+        let p = WorldPos { anchor: Path::root(), offset: [0.5, 0.5, 0.5] };
+        let xyz = world_pos_to_f32(&p);
+        assert!((xyz[0] - 1.5).abs() < 1e-5);
+        assert!((xyz[1] - 1.5).abs() < 1e-5);
+        assert!((xyz[2] - 1.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn world_pos_from_f32_round_trips_at_depth_zero() {
+        for &xyz in &[[1.5, 2.3, 1.5], [0.1, 0.2, 0.3], [2.9, 0.0, 1.0]] {
+            let p = world_pos_from_f32(xyz, 0);
+            let back = world_pos_to_f32(&p);
+            for i in 0..3 {
+                assert!((back[i] - xyz[i]).abs() < 1e-5, "axis {i}: {} vs {}", back[i], xyz[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn world_pos_from_f32_round_trips_at_deeper_anchors() {
+        let xyz = [1.5, 2.3, 1.5];
+        for depth in 0u8..=6 {
+            let p = world_pos_from_f32(xyz, depth);
+            assert_eq!(p.anchor.depth(), depth);
+            let back = world_pos_to_f32(&p);
+            for i in 0..3 {
+                assert!(
+                    (back[i] - xyz[i]).abs() < 1e-4,
+                    "depth {depth} axis {i}: {} vs {}", back[i], xyz[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn world_pos_from_f32_clamps_out_of_range() {
+        let p = world_pos_from_f32([-1.0, 5.0, 1.5], 2);
+        let back = world_pos_to_f32(&p);
+        // Negative clamped to 0, past-extent clamped to < ROOT_EXTENT.
+        assert!(back[0] >= 0.0 && back[0] < ROOT_EXTENT);
+        assert!(back[1] >= 0.0 && back[1] < ROOT_EXTENT);
+        assert!((back[2] - 1.5).abs() < 1e-4);
     }
 
     #[test]
