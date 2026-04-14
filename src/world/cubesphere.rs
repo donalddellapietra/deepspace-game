@@ -240,11 +240,20 @@ pub struct SphericalPlanet {
     pub depth: u32,
 }
 
+/// Max levels the SDF recursion is allowed to descend into a face
+/// subtree. Beyond this, each cell commits to solid-or-empty based
+/// on the center sample and wraps the remaining tree depth in a
+/// dedup'd uniform filler. This is what makes `depth = 20` feasible:
+/// we never do more than `27^SDF_DETAIL_LEVELS` SDF sample chains per
+/// face; the filler chain below is O(depth) unique nodes shared
+/// across the whole planet.
+const SDF_DETAIL_LEVELS: u32 = 4;
+
 /// Build a 6-face `SphericalPlanet` in `lib` by recursively sampling
-/// `sdf` along each face's `(u, v, r)` subtree. Uniform solid /
-/// uniform empty subtrees are built once and referenced many times
-/// by the content-addressed library, so a pristine spherical planet
-/// costs only `O(surface_area · depth)` unique nodes — not `O(27^depth)`.
+/// `sdf` along each face's `(u, v, r)` subtree. SDF-driven recursion
+/// is bounded by `SDF_DETAIL_LEVELS`; below it, each straddling cell
+/// becomes a uniform filler of the remaining depth. Total unique
+/// nodes: `O(surface_cells_at_SDF_DETAIL_LEVELS · 27 + depth)`.
 pub fn generate_spherical_planet(
     lib: &mut NodeLibrary,
     center: Vec3,
@@ -254,19 +263,23 @@ pub fn generate_spherical_planet(
     sdf: &Planet,
 ) -> SphericalPlanet {
     let mut face_roots = [0u64; 6];
+    let sdf_budget = depth.min(SDF_DETAIL_LEVELS);
     for &face in &Face::ALL {
         let child = build_face_subtree(
             lib, face, center,
             -1.0, 1.0, -1.0, 1.0, inner_r, outer_r,
-            depth, sdf,
+            depth, sdf_budget, sdf,
         );
-        // The face root must be a Node — we always wrap so the
-        // renderer has a tree to walk per face, even if the whole
-        // face is uniform empty / solid.
         face_roots[face as usize] = match child {
             Child::Node(id) => id,
-            Child::Empty => lib.insert(empty_children()),
-            Child::Block(b) => lib.insert(uniform_children(Child::Block(b))),
+            Child::Empty => build_uniform_empty(lib, depth.max(1)),
+            Child::Block(b) => {
+                // build_uniform_subtree returns Child::Block at depth 0.
+                match lib.build_uniform_subtree(b, depth.max(1)) {
+                    Child::Node(id) => id,
+                    _ => lib.insert(uniform_children(Child::Block(b))),
+                }
+            }
         };
         lib.ref_inc(face_roots[face as usize]);
     }
@@ -275,6 +288,14 @@ pub fn generate_spherical_planet(
 
 /// Recursive builder for one cubed-sphere face. Returns a `Child` so
 /// the caller can collapse uniform subtrees up the call chain.
+///
+/// `depth` = remaining tree depth (total levels still to build below
+/// this cell). `sdf_budget` = how many more SDF-driven recursions
+/// are allowed. When the budget hits zero but more depth remains,
+/// the cell commits to solid-or-empty by the center sample and
+/// wraps the remaining depth in a dedup'd uniform filler. This
+/// keeps recursive work bounded by `27^SDF_DETAIL_LEVELS` regardless
+/// of how deep the tree goes.
 fn build_face_subtree(
     lib: &mut NodeLibrary,
     face: Face,
@@ -283,47 +304,39 @@ fn build_face_subtree(
     v_lo: f32, v_hi: f32,
     r_lo: f32, r_hi: f32,
     depth: u32,
+    sdf_budget: u32,
     sdf: &Planet,
 ) -> Child {
-    // Cell center in world space.
     let u_c = 0.5 * (u_lo + u_hi);
     let v_c = 0.5 * (v_lo + v_hi);
     let r_c = 0.5 * (r_lo + r_hi);
     let p_center = coord_to_world(center, CubeSphereCoord { face, u: u_c, v: v_c, r: r_c });
     let d_center = sdf.distance(p_center);
 
-    // Conservative bound on world-space distance from p_center to any
-    // corner of this cell. Lateral extent grows with radius; radial
-    // extent is straightforward. Overestimating is safe (means extra
-    // subdivision, never wrong bits).
     let du = u_hi - u_lo;
     let dv = v_hi - v_lo;
     let dr = r_hi - r_lo;
-    // At equal-angle, uv half-span on the sphere is roughly
-    // r · tan(du/2 · π/4). Use a generous linearization: r · du/2.
     let lateral_half = r_hi * 0.5 * du.max(dv);
     let radial_half = 0.5 * dr;
     let cell_rad = (lateral_half * lateral_half + radial_half * radial_half).sqrt();
 
-    // Fully outside: the SDF surface can't reach this cell, so every
-    // sub-cell is empty. Content-addressed into a dedup'd empty subtree.
+    // Fully outside the SDF surface → uniform empty subtree.
     if d_center > cell_rad {
         if depth == 0 { return Child::Empty; }
         return Child::Node(build_uniform_empty(lib, depth));
     }
-    // Fully inside: every sub-cell is solid. Pick the center-sample
-    // block type and stamp the whole subtree with it.
+    // Fully inside → uniform block subtree with the center's block type.
     if d_center < -cell_rad {
         let b = sdf.block_at(p_center);
         if depth == 0 { return Child::Block(b); }
-        return match lib.build_uniform_subtree(b, depth) {
-            Child::Node(id) => Child::Node(id),
-            other => other, // (Shouldn't happen for depth ≥ 1, but safe.)
-        };
+        return lib.build_uniform_subtree(b, depth);
     }
 
-    // Straddles the surface or too close to commit. At depth 0 we
-    // have no more room to resolve — sample the center and go.
+    // Straddling the surface. If we still have tree depth but no
+    // more SDF budget, commit to the center sample and fill the
+    // rest of the subtree with a uniform filler. This is the
+    // critical cap: without it, `depth = 20` would recurse into
+    // ~3^40 surface-band calls before bottoming out.
     if depth == 0 {
         return if d_center < 0.0 {
             Child::Block(sdf.block_at(p_center))
@@ -331,8 +344,15 @@ fn build_face_subtree(
             Child::Empty
         };
     }
+    if sdf_budget == 0 {
+        return if d_center < 0.0 {
+            lib.build_uniform_subtree(sdf.block_at(p_center), depth)
+        } else {
+            Child::Node(build_uniform_empty(lib, depth))
+        };
+    }
 
-    // Recurse: split this cell's (u, v, r) box into 3×3×3 sub-cells.
+    // Subdivide into 3×3×3, with both depth and sdf_budget decremented.
     let mut children = empty_children();
     for rs in 0..3 {
         for vs in 0..3 {
@@ -346,7 +366,7 @@ fn build_face_subtree(
                 children[slot_index(us, vs, rs)] = build_face_subtree(
                     lib, face, center,
                     us_lo, us_hi, vs_lo, vs_hi, rs_lo, rs_hi,
-                    depth - 1, sdf,
+                    depth - 1, sdf_budget - 1, sdf,
                 );
             }
         }
@@ -520,7 +540,9 @@ impl SphericalPlanet {
         if iu >= cells || iv >= cells || ir >= cells { return false; }
 
         // Per-level slot indices from root toward the target.
-        let mut slots: [usize; 16] = [0; 16];
+        // Sized for `MAX_DEPTH` from `tree.rs` (63) with headroom;
+        // depth=20 planets were hitting a 16-slot cap here.
+        let mut slots: [usize; 64] = [0; 64];
         let levels = d as usize;
         for level in 0..levels {
             let shift = (d - 1 - level as u32) as u32;
@@ -573,15 +595,23 @@ impl SphericalPlanet {
         if t_exit <= 0.0 { return None; }
 
         let shell = self.outer_r - self.inner_r;
-        let finest_cells = 3u32.pow(self.depth) as f32;
-        let step = (shell / finest_cells) * 0.5;
-        if step <= 0.0 { return None; }
         let d_eff = highlight_depth.clamp(1, self.depth);
+        // Cap step-size resolution at 3^8 = 6561 per axis. Deeper
+        // subtrees (depth 20) don't need a 3^20-granularity CPU
+        // raycast; the cursor can't visibly distinguish individual
+        // sub-picometer cells. The subtree walker still samples at
+        // the requested `d_eff` — only the ray's stride is capped,
+        // and a feature smaller than the step that the walker does
+        // see will still register when its cell is sampled.
+        let step_cells = 3u32.pow(d_eff.min(8)) as f32;
+        let step = (shell / step_cells) * 0.5;
+        if step <= 0.0 { return None; }
         let cells_at_depth = 3u32.pow(d_eff) as f32;
         let cells_max = cells_at_depth as u32 - 1;
         let mut t = t_enter + step * 0.25;
         let mut prev: Option<(Face, u32, u32, u32)> = None;
-        for _ in 0..4000usize {
+        let max_steps = 20_000usize;
+        for _ in 0..max_steps {
             if t >= t_exit { break; }
             let p = sdf::add(origin, sdf::scale(dir, t));
             if let Some((face, un, vn, rn)) = self.world_to_normalized(p) {
@@ -937,6 +967,26 @@ mod tests {
     }
 
     #[test]
+    fn set_cell_at_depth_handles_max_planet_depth() {
+        // Regression: the slots-path array inside `set_cell_at_depth`
+        // must hold as many entries as the deepest planet's depth.
+        // At depth 20 the array needs ≥20 slots — 16 overflows.
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(0.34, 0.04);
+        let mut planet = generate_spherical_planet(
+            &mut lib, [0.0, 0.0, 0.0], 0.12, 0.52, 20, &sdf,
+        );
+        // Break the innermost finest cell on +X. This exercises the
+        // full 20-level path without relying on coordinates being
+        // solid — even a no-op runs the full path walk.
+        let iu_last = 3u32.pow(20) - 1;
+        planet.set_cell_at_depth(
+            &mut lib, Face::PosX, iu_last, iu_last, iu_last, 20,
+            Child::Empty,
+        );
+    }
+
+    #[test]
     fn set_cell_at_depth_noop_for_already_empty_cell() {
         let mut lib = NodeLibrary::default();
         let sdf = test_sdf(1.0, 0.0);
@@ -948,6 +998,27 @@ mod tests {
             &mut lib, Face::PosX, 1, 1, 2, 1, Child::Empty,
         );
         assert!(!changed, "breaking an already-empty cell should no-op");
+    }
+
+    #[test]
+    fn depth_20_planet_generates_bounded_node_count() {
+        // Regression: without the SDF_DETAIL_LEVELS budget cap, a
+        // depth-20 planet's surface band would recurse ~3^40 times.
+        // With the cap in place, SDF-driven recursion stops at
+        // ~27^SDF_DETAIL_LEVELS cells per face + O(depth) filler
+        // nodes total. Should finish in well under a second and use
+        // a few thousand unique nodes.
+        let start = std::time::Instant::now();
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(0.34, 0.04);
+        let _ = generate_spherical_planet(
+            &mut lib, [0.0, 0.0, 0.0], 0.12, 0.52, 20, &sdf,
+        );
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs_f64() < 5.0,
+            "depth-20 planet generation took {:?} (regression?)", elapsed);
+        assert!(lib.len() < 200_000,
+            "depth-20 planet produced {} unique nodes (regression?)", lib.len());
     }
 
     #[test]

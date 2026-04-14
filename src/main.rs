@@ -124,6 +124,12 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     camera: Camera,
+    /// Persistent velocity, integrated from gravity and damped each
+    /// frame. Flight thrust is applied as direct per-frame
+    /// displacement rather than accumulating here, so releasing WASD
+    /// stops horizontal motion immediately while gravity keeps
+    /// pulling.
+    velocity: [f32; 3],
     world: WorldState,
     cursor_locked: bool,
     keys: Keys,
@@ -152,12 +158,48 @@ const WAIT_FRAMES: u32 = 10;
 
 impl App {
     fn new() -> Self {
-        let world = deepspace_game::world::worldgen::generate_world();
+        // Build the ENTIRE world — space tree AND spherical planet —
+        // here, BEFORE the event loop starts. `resumed()` is called
+        // synchronously by AppKit during its window-activation
+        // handshake on macOS; if worldgen runs inside it, AppKit
+        // never finishes activation and the NSWindow comes up non-
+        // key (title bar grayed out, clicks ignored). Doing all
+        // heavy work before `run_app` keeps `resumed()` a fast
+        // "create window + hand pre-built data to GPU" path.
+        let mut world = deepspace_game::world::worldgen::generate_world();
         let tree_depth = world.tree_depth();
 
-        // Spawn in empty space, facing toward the cubed-sphere demo
-        // planet (which is placed at [1.5, 2.3, 1.5]).
-        let spawn_pos = [1.5, 1.75, 1.5];
+        let cs_center = [1.5, 2.3, 1.5];
+        let cs_inner_r = 0.12;
+        let cs_outer_r = 0.52;
+        let cs_planet = {
+            use deepspace_game::world::cubesphere::generate_spherical_planet;
+            use deepspace_game::world::palette::block;
+            use deepspace_game::world::sdf::Planet as SdfPlanet;
+            let sdf = SdfPlanet {
+                center: cs_center,
+                radius: 0.32,
+                noise_scale: 0.015,
+                noise_freq: 8.0,
+                noise_seed: 2024,
+                gravity: 9.8,
+                influence_radius: cs_outer_r * 2.0,
+                surface_block: block::GRASS,
+                core_block: block::STONE,
+            };
+            let planet = generate_spherical_planet(
+                &mut world.library,
+                cs_center, cs_inner_r, cs_outer_r, 20, &sdf,
+            );
+            eprintln!(
+                "Spherical planet generated: 6 face subtrees, library now {} nodes",
+                world.library.len(),
+            );
+            planet
+        };
+
+        // Spawn above the cubed-sphere planet's north pole.
+        let spawn_pos = [1.5, 3.1, 1.5];
 
         Self {
             window: None,
@@ -166,8 +208,9 @@ impl App {
                 pos: spawn_pos,
                 smoothed_up: [0.0, 1.0, 0.0],
                 yaw: 0.0,
-                pitch: 0.0,
+                pitch: -0.3,
             },
+            velocity: [0.0, 0.0, 0.0],
             world,
             cursor_locked: false,
             keys: Keys::default(),
@@ -183,7 +226,7 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
-            cs_planet: None,
+            cs_planet: Some(cs_planet),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -195,13 +238,64 @@ impl App {
         let td = self.tree_depth as i32;
         let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
 
-        // Camera's "up" relaxes toward world +Y. Later, when the
-        // cubed-sphere planet gets gravity, we'll blend in the
-        // planet's radial up here — for now this is pure flycam.
-        self.camera.update_up([0.0, 1.0, 0.0], dt);
+        // Radial gravity toward the cubed-sphere planet's center with
+        // smoothstep falloff from the outer shell out to 2x the outer
+        // radius. Inside the outer shell gravity is at full strength;
+        // past the influence boundary it's zero, so flying up far
+        // enough lets you escape. `target_up` blends between the
+        // planet's radial and world +Y with the same weight, so the
+        // horizon rotates gradually instead of snapping.
+        let world_up = [0.0f32, 1.0, 0.0];
+        let (target_up, gravity_acc) = if let Some(p) = self.cs_planet.as_ref() {
+            let to_player = sdf::sub(self.camera.pos, p.center);
+            let r = sdf::length(to_player);
+            let surface_r = p.outer_r;
+            let influence_r = surface_r * 2.0;
+            let weight = if r <= surface_r {
+                1.0
+            } else if r >= influence_r {
+                0.0
+            } else {
+                let t = (r - surface_r) / (influence_r - surface_r);
+                let s = 1.0 - t;
+                s * s * (3.0 - 2.0 * s)
+            };
+            let radial_up = if r > 1e-6 {
+                sdf::scale(to_player, 1.0 / r)
+            } else {
+                world_up
+            };
+            let up_blend = sdf::normalize(sdf::add(
+                sdf::scale(radial_up, weight),
+                sdf::scale(world_up, 1.0 - weight),
+            ));
+            // Gravity magnitude scales with cell_size so fall speed
+            // is visible at every zoom. Tuned so holding Space
+            // (thrust = 5 * cell_size) noticeably overpowers gravity
+            // and you can fly off the planet.
+            let g_mag = 8.0 * cell_size * weight;
+            let grav = if r > 1e-6 {
+                sdf::scale(radial_up, -g_mag)
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            (up_blend, grav)
+        } else {
+            (world_up, [0.0, 0.0, 0.0])
+        };
+        self.camera.update_up(target_up, dt);
 
-        // Creative/flycam movement: WASD along camera forward/right,
-        // Space/Shift along camera up. No collision, no gravity force.
+        // Integrate gravity into persistent velocity, then damp so we
+        // have a terminal fall speed rather than unbounded divergence.
+        self.velocity = sdf::add(self.velocity, sdf::scale(gravity_acc, dt));
+        let damp = (-2.5_f32 * dt).exp();
+        self.velocity = sdf::scale(self.velocity, damp);
+
+        // Flight thrust: WASD in the camera's horizontal plane,
+        // Space/Shift along the camera's local up. Applied as direct
+        // per-frame displacement, not velocity, so controls feel
+        // responsive and momentum only comes from gravity. No
+        // collisions — you fly through everything.
         let speed = 5.0 * cell_size;
         let (fwd, right, up) = self.camera.basis();
         let mut d = [0.0f32; 3];
@@ -212,10 +306,17 @@ impl App {
         if self.keys.space { d = sdf::add(d, up); }
         if self.keys.shift { d = sdf::sub(d, up); }
         let l = sdf::length(d);
-        if l > 1e-4 {
-            let s = speed * dt / l;
-            self.camera.pos = sdf::add(self.camera.pos, sdf::scale(d, s));
-        }
+        let thrust = if l > 1e-4 {
+            sdf::scale(d, speed / l)
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+
+        let step = sdf::add(
+            sdf::scale(self.velocity, dt),
+            sdf::scale(thrust, dt),
+        );
+        self.camera.pos = sdf::add(self.camera.pos, step);
 
         if let Some(renderer) = &self.renderer {
             renderer.update_camera(&self.camera.gpu_camera(1.2));
@@ -509,6 +610,11 @@ impl App {
         let Some(window) = &self.window else { return };
         if let Some(wv) = overlay::create_webview(window) {
             self.webview = Some(wv);
+            // The webview is a WKWebView added as a subview. It
+            // often grabs first responder during creation. Re-claim
+            // key + first-responder on the content view so the
+            // title bar lights up and clicks land on the game.
+            overlay::make_key_window(window);
         }
     }
 
@@ -610,43 +716,23 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.window = Some(window.clone());
 
+        // Claim key-window status up front. Without this on macOS
+        // the NSWindow can come up with its title bar grayed out
+        // and *remain* unfocusable — clicks on the content view
+        // don't promote it to key because the later-added wry
+        // WKWebView subview took first responder.
+        #[cfg(not(target_arch = "wasm32"))]
+        overlay::make_key_window(&window);
+
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
         let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
-        // Cubed-sphere demo planet. Backed by 6 face-subtrees in the
-        // shared NodeLibrary — recursive, 27-per-level dedup'd — not
-        // a flat buffer. Shader in this phase shows the planet as a
-        // placeholder sphere; Phase B walks the subtrees for real
-        // voxel content.
-        {
-            use deepspace_game::world::cubesphere::generate_spherical_planet;
-            use deepspace_game::world::palette::block;
-            use deepspace_game::world::sdf::Planet as SdfPlanet;
-            let cs_center = [1.5, 2.3, 1.5];
-            let outer_r = 0.52;
-            let inner_r = 0.12;
-            let sdf = SdfPlanet {
-                center: cs_center,
-                radius: 0.32,
-                noise_scale: 0.015,
-                noise_freq: 8.0,
-                noise_seed: 2024,
-                gravity: 9.8,
-                influence_radius: outer_r * 2.0,
-                surface_block: block::GRASS,
-                core_block: block::STONE,
-            };
-            // Depth 4 → 27^4 ≈ 530k potential cells per face at
-            // finest level, aggressively dedup'd by the library.
-            let planet = generate_spherical_planet(
-                &mut self.world.library,
-                cs_center, inner_r, outer_r, 4, &sdf,
+        // The planet was generated in App::new(), BEFORE the event
+        // loop, so `resumed()` is cheap. Here we just upload the
+        // pre-built handles to the GPU.
+        if let Some(planet) = self.cs_planet.as_ref() {
+            renderer.set_cubed_sphere_planet(
+                planet.center, planet.inner_r, planet.outer_r, planet.depth,
             );
-            eprintln!(
-                "Spherical planet generated: 6 face subtrees, library now {} nodes",
-                self.world.library.len(),
-            );
-            renderer.set_cubed_sphere_planet(cs_center, inner_r, outer_r, planet.depth);
-            self.cs_planet = Some(planet);
         }
         self.renderer = Some(renderer);
         self.apply_zoom(); // sync renderer max_depth with initial zoom_level

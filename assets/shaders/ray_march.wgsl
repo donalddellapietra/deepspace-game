@@ -192,7 +192,7 @@ fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
-    for (var d: u32 = 1u; d <= 12u; d = d + 1u) {
+    for (var d: u32 = 1u; d <= 22u; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);

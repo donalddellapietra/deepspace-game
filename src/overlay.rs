@@ -303,6 +303,23 @@ pub fn refocus_content_view(window: &Window) {
     }
 }
 
+/// Ensure the NSWindow is the key window. Without this, macOS can
+/// keep the window non-key after a wry WKWebView is added as a
+/// subview — the title bar stays grayed out and clicks on the
+/// window content don't bring it into focus the way they would on
+/// a plain NSWindow. Call after window creation, and again after
+/// the webview is created, to claim key status explicitly.
+pub fn make_key_window(window: &Window) {
+    let Ok(handle) = window.window_handle() else { return; };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return; };
+    unsafe {
+        let ns_view = appkit.ns_view.as_ptr() as *mut NSView;
+        let Some(ns_window) = (*ns_view).window() else { return; };
+        ns_window.makeKeyAndOrderFront(None);
+        ns_window.makeFirstResponder(Some(&*ns_view));
+    }
+}
+
 // ── IPC routing ──────────────────────────────────────────────────
 
 /// Route an IPC message from the webview to the appropriate queue.
