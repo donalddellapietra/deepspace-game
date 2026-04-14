@@ -238,6 +238,15 @@ pub struct SphericalPlanet {
     /// Levels of recursion under each face root. Zoom-in reveals up
     /// to `depth` cascades of 27 sub-cells before bottoming out.
     pub depth: u32,
+    /// `NodeKind::CubedSphereBody` node containing the 6 face roots
+    /// at face-center slots. This is the canonical in-tree identity
+    /// of the planet — `body_node` + the `NodeKind` payload
+    /// (inner_r, outer_r) are enough to rebuild `SphericalPlanet`
+    /// without any external `cs_*` state. The rest of the engine
+    /// still reads from the explicit fields above; those fields
+    /// become derivable once the shader learns to dispatch on
+    /// `NodeKind` (deferred).
+    pub body_node: NodeId,
 }
 
 /// Max levels the SDF recursion is allowed to descend into a face
@@ -293,7 +302,37 @@ pub fn generate_spherical_planet(
         face_roots[face as usize] = face_root;
         lib.ref_inc(face_root);
     }
-    SphericalPlanet { center, inner_r, outer_r, face_roots, depth }
+    // Assemble the body node: 6 face-center slots hold the face
+    // subtrees, 20 corner/edge slots are Empty, the center slot is
+    // the interior filler (uniform `core_block` of depth `depth`).
+    let mut body_children = empty_children();
+    for &face in &Face::ALL {
+        let slot = body_face_center_slot(face);
+        body_children[slot] = Child::Node(face_roots[face as usize]);
+    }
+    body_children[slot_index(1, 1, 1)] = lib.build_uniform_subtree(sdf.core_block, depth.max(1));
+    let body_node = lib.insert_with_kind(
+        body_children,
+        NodeKind::CubedSphereBody { inner_r, outer_r },
+    );
+    lib.ref_inc(body_node);
+
+    SphericalPlanet { center, inner_r, outer_r, face_roots, depth, body_node }
+}
+
+/// Slot index in a `CubedSphereBody` node's 3×3×3 children that holds
+/// the subtree for `face`. Face-center slots: `+X→(2,1,1)`,
+/// `-X→(0,1,1)`, `+Y→(1,2,1)`, `-Y→(1,0,1)`, `+Z→(1,1,2)`,
+/// `-Z→(1,1,0)`.
+pub fn body_face_center_slot(face: Face) -> usize {
+    match face {
+        Face::PosX => slot_index(2, 1, 1),
+        Face::NegX => slot_index(0, 1, 1),
+        Face::PosY => slot_index(1, 2, 1),
+        Face::NegY => slot_index(1, 0, 1),
+        Face::PosZ => slot_index(1, 1, 2),
+        Face::NegZ => slot_index(1, 1, 0),
+    }
 }
 
 /// Recursive builder for one cubed-sphere face. Returns a `Child` so
@@ -873,6 +912,46 @@ mod tests {
             }
         }
         current_child
+    }
+
+    #[test]
+    fn body_node_carries_cubed_sphere_body_kind() {
+        let mut lib = NodeLibrary::default();
+        let planet = generate_spherical_planet(
+            &mut lib,
+            [1.5, 2.3, 1.5],
+            0.12, 0.52, 6,
+            &Planet {
+                center: [1.5, 2.3, 1.5],
+                radius: 0.32,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                gravity: 0.0,
+                influence_radius: 1.0,
+                surface_block: crate::world::palette::block::GRASS,
+                core_block: crate::world::palette::block::STONE,
+            },
+        );
+        let body = lib.get(planet.body_node).expect("body node must exist");
+        match body.kind {
+            NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                assert_eq!(inner_r, 0.12);
+                assert_eq!(outer_r, 0.52);
+            }
+            _ => panic!("body node must have CubedSphereBody kind, got {:?}", body.kind),
+        }
+        // Face-center slots must reference the face roots.
+        for &face in &Face::ALL {
+            let slot = body_face_center_slot(face);
+            match body.children[slot] {
+                Child::Node(id) => assert_eq!(
+                    id, planet.face_roots[face as usize],
+                    "body face-center slot for {:?} must point at face root", face
+                ),
+                other => panic!("expected Node at face-center slot, got {:?}", other),
+            }
+        }
     }
 
     #[test]
