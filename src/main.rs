@@ -513,14 +513,7 @@ impl ApplicationHandler for App {
         self.window = Some(window.clone());
 
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
-        let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
-        // Point the renderer's sun at the star planet's center. The
-        // star is whichever planet has an emissive core block —
-        // shading and shadow rays all aim at this position.
-        use deepspace_game::world::palette::block as pal;
-        if let Some(star) = self.world.planets.iter().find(|p| p.core_block == pal::STAR_CORE) {
-            renderer.set_sun_pos(star.center);
-        }
+        let renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
         self.renderer = Some(renderer);
         self.apply_zoom(); // sync renderer max_depth with initial zoom_level
         self.last_frame = std::time::Instant::now();

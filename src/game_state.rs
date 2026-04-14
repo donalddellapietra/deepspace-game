@@ -213,7 +213,7 @@ impl GameUiState {
         }));
 
         // Inventory: builtin blocks from the palette
-        let builtin_blocks: Vec<BlockInfo> = palette::BUILTINS.iter().map(|&(idx, name, color, _emission)| {
+        let builtin_blocks: Vec<BlockInfo> = palette::BUILTINS.iter().map(|&(idx, name, color)| {
             BlockInfo { voxel: idx, name: name.to_string(), color }
         }).collect();
 

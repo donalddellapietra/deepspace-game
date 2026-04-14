@@ -14,39 +14,26 @@ use super::gpu::GpuPalette;
 /// Maximum number of palette entries (u8 range, minus 255 reserved).
 pub const MAX_ENTRIES: usize = 255;
 
-/// A single palette entry: name + RGBA color + emission.
-///
-/// `emission` is a scalar intensity (0 = non-emissive, >0 = the
-/// block glows with its own light). Emissive blocks are rendered
-/// unlit and cast light via a shadow/contribution pass in the ray
-/// march shader. Emission averages through LOD the same way colors
-/// do: a subtree's representative block carries its emission into
-/// coarser cascades, so a star viewed from far away still glows.
+/// A single palette entry: name + RGBA color.
 #[derive(Clone, Debug)]
 pub struct PaletteEntry {
     pub name: String,
     pub color: [f32; 4],
-    pub emission: f32,
 }
 
 /// The builtin block types. Index 0 is reserved (empty sentinel in
-/// `VoxelModel`), so builtins start at 1. Last column is emission.
-pub const BUILTINS: &[(u8, &str, [f32; 4], f32)] = &[
-    (1,  "Stone",  [0.50, 0.50, 0.50, 1.0], 0.0),
-    (2,  "Dirt",   [0.45, 0.30, 0.15, 1.0], 0.0),
-    (3,  "Grass",  [0.30, 0.60, 0.20, 1.0], 0.0),
-    (4,  "Wood",   [0.55, 0.35, 0.15, 1.0], 0.0),
-    (5,  "Leaf",   [0.20, 0.50, 0.10, 1.0], 0.0),
-    (6,  "Sand",   [0.85, 0.80, 0.55, 1.0], 0.0),
-    (7,  "Water",  [0.20, 0.40, 0.80, 1.0], 0.0),
-    (8,  "Brick",  [0.70, 0.30, 0.20, 1.0], 0.0),
-    (9,  "Metal",  [0.75, 0.75, 0.80, 1.0], 0.0),
-    (10, "Glass",  [0.85, 0.90, 1.00, 1.0], 0.0),
-    // Emissive block types for stars and other light sources.
-    // Emission is radiance multiplier; 8.0 = hot star.
-    (11, "StarSurface", [1.00, 0.95, 0.70, 1.0], 8.0),
-    (12, "StarCore",    [1.00, 0.70, 0.30, 1.0], 12.0),
-    (13, "Lamp",        [1.00, 0.90, 0.60, 1.0], 3.0),
+/// `VoxelModel`), so builtins start at 1.
+pub const BUILTINS: &[(u8, &str, [f32; 4])] = &[
+    (1,  "Stone",  [0.50, 0.50, 0.50, 1.0]),
+    (2,  "Dirt",   [0.45, 0.30, 0.15, 1.0]),
+    (3,  "Grass",  [0.30, 0.60, 0.20, 1.0]),
+    (4,  "Wood",   [0.55, 0.35, 0.15, 1.0]),
+    (5,  "Leaf",   [0.20, 0.50, 0.10, 1.0]),
+    (6,  "Sand",   [0.85, 0.80, 0.55, 1.0]),
+    (7,  "Water",  [0.20, 0.40, 0.80, 1.0]),
+    (8,  "Brick",  [0.70, 0.30, 0.20, 1.0]),
+    (9,  "Metal",  [0.75, 0.75, 0.80, 1.0]),
+    (10, "Glass",  [0.85, 0.90, 1.00, 1.0]),
 ];
 
 /// Named constants for the builtin indices — use these instead of
@@ -62,10 +49,7 @@ pub mod block {
     pub const BRICK: u8 = 8;
     pub const METAL: u8 = 9;
     pub const GLASS: u8 = 10;
-    pub const STAR_SURFACE: u8 = 11;
-    pub const STAR_CORE: u8 = 12;
-    pub const LAMP: u8 = 13;
-    pub const BUILTIN_COUNT: u8 = 14;
+    pub const BUILTIN_COUNT: u8 = 11;
 }
 
 pub struct ColorRegistry {
@@ -84,15 +68,14 @@ impl ColorRegistry {
         reg.entries.push(PaletteEntry {
             name: "Empty".to_string(),
             color: [0.0, 0.0, 0.0, 0.0],
-            emission: 0.0,
         });
-        for &(_, name, color, emission) in BUILTINS {
+        for &(_, name, color) in BUILTINS {
             let r = (color[0] * 255.0) as u8;
             let g = (color[1] * 255.0) as u8;
             let b = (color[2] * 255.0) as u8;
             let a = (color[3] * 255.0) as u8;
             let idx = reg.entries.len() as u8;
-            reg.entries.push(PaletteEntry { name: name.to_string(), color, emission });
+            reg.entries.push(PaletteEntry { name: name.to_string(), color });
             reg.seen.insert((r, g, b, a), idx);
         }
         reg
@@ -120,15 +103,9 @@ impl ColorRegistry {
                 b as f32 / 255.0,
                 a as f32 / 255.0,
             ],
-            emission: 0.0,
         });
         self.seen.insert(key, idx);
         Some(idx)
-    }
-
-    /// Emission intensity for a palette index. 0 = non-emissive.
-    pub fn emission(&self, index: u8) -> f32 {
-        self.entries.get(index as usize).map(|e| e.emission).unwrap_or(0.0)
     }
 
     pub fn get(&self, index: u8) -> Option<&PaletteEntry> {
@@ -151,20 +128,11 @@ impl ColorRegistry {
             .unwrap_or([0.3, 0.3, 0.3, 1.0])
     }
 
-    /// Convert to GPU format for the shader. Emission is packed into
-    /// the alpha channel — the shader reads `color.rgb` for diffuse
-    /// albedo and `color.a` for emission intensity. Opacity isn't
-    /// needed GPU-side since the tree's `Empty` terminal already
-    /// encodes transparency.
+    /// Convert to GPU format for the shader.
     pub fn to_gpu_palette(&self) -> GpuPalette {
         let mut colors = [[0.0f32; 4]; 256];
         for (i, entry) in self.entries.iter().enumerate() {
-            colors[i] = [
-                entry.color[0],
-                entry.color[1],
-                entry.color[2],
-                entry.emission,
-            ];
+            colors[i] = entry.color;
         }
         GpuPalette { colors }
     }
@@ -183,12 +151,11 @@ mod tests {
     #[test]
     fn builtins_registered() {
         let reg = ColorRegistry::new();
-        // 1 reserved (empty) + BUILTIN_COUNT-1 entries
-        assert_eq!(reg.len(), block::BUILTIN_COUNT as usize);
+        // 1 reserved (empty) + 10 builtins = 11
+        assert_eq!(reg.len(), 11);
         assert_eq!(reg.name(0), "Empty");
         assert_eq!(reg.name(block::STONE), "Stone");
         assert_eq!(reg.name(block::GLASS), "Glass");
-        assert_eq!(reg.name(block::STAR_SURFACE), "StarSurface");
     }
 
     #[test]
@@ -197,7 +164,7 @@ mod tests {
         let a = reg.register(255, 0, 0, 255).unwrap();
         let b = reg.register(255, 0, 0, 255).unwrap();
         assert_eq!(a, b);
-        assert_eq!(reg.len(), block::BUILTIN_COUNT as usize + 1);
+        assert_eq!(reg.len(), 12);
     }
 
     #[test]
@@ -206,18 +173,14 @@ mod tests {
         let a = reg.register(255, 0, 0, 255).unwrap();
         let b = reg.register(0, 255, 0, 255).unwrap();
         assert_ne!(a, b);
-        assert_eq!(reg.len(), block::BUILTIN_COUNT as usize + 2);
+        assert_eq!(reg.len(), 13);
     }
 
     #[test]
     fn gpu_palette_roundtrip() {
         let reg = ColorRegistry::new();
         let gp = reg.to_gpu_palette();
-        // GPU packs emission into alpha; first 3 channels match.
-        let c = reg.color(block::STONE);
-        let g = gp.colors[block::STONE as usize];
-        assert_eq!([g[0], g[1], g[2]], [c[0], c[1], c[2]]);
-        assert_eq!(g[3], reg.emission(block::STONE));
-        assert!(reg.emission(block::STAR_SURFACE) > 1.0, "star should be emissive");
+        assert_eq!(gp.colors[block::STONE as usize], reg.color(block::STONE));
+        assert_eq!(gp.colors[block::GLASS as usize], reg.color(block::GLASS));
     }
 }
