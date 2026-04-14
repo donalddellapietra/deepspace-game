@@ -252,7 +252,7 @@ impl App {
         if let Some(p) = self.cs_planet.as_ref() {
             roots.extend_from_slice(&p.face_roots);
         }
-        let (tree_data, root_indices) = gpu::pack_tree_lod_multi_with_frame(
+        let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
             &roots,
             crate::world::coords::world_pos_to_f32(&self.camera.position),
@@ -262,15 +262,8 @@ impl App {
             rf_cell,
         );
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, root_indices[0]);
+            renderer.update_tree(&tree_data, &tree_metas, root_indices[0]);
             renderer.set_render_frame(rf_origin, rf_cell);
-            if self.cs_planet.is_some() {
-                let face_roots: [u32; 6] = [
-                    root_indices[1], root_indices[2], root_indices[3],
-                    root_indices[4], root_indices[5], root_indices[6],
-                ];
-                renderer.set_face_roots(face_roots);
-            }
         }
     }
 
@@ -278,7 +271,7 @@ impl App {
         if !self.cursor_locked {
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);
-                renderer.set_cubed_sphere_highlight(None);
+                renderer.set_body_highlight(None);
             }
             return;
         }
@@ -305,13 +298,13 @@ impl App {
             if cs_t < tree_t {
                 renderer.set_highlight(None);
                 if let Some(h) = cs_hit {
-                    renderer.set_cubed_sphere_highlight(Some((
+                    renderer.set_body_highlight(Some((
                         h.face as u32, h.iu, h.iv, h.ir, h.depth,
                     )));
                 }
             } else {
                 renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
-                renderer.set_cubed_sphere_highlight(None);
+                renderer.set_body_highlight(None);
             }
         }
     }

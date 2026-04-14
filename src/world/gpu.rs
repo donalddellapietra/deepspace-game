@@ -23,6 +23,52 @@ pub struct GpuChild {
 /// One node in the GPU buffer = 27 GpuChild = 216 bytes.
 pub const GPU_NODE_SIZE: usize = 27;
 
+/// Per-node metadata: the `NodeKind` exposed to the shader so its
+/// tree walk can dispatch on body / face branches without any
+/// separate uniform state. One entry per node in the packed tree
+/// buffer, indexed by `node_idx`.
+///
+/// Layout (16 bytes):
+/// - `kind_tag`: 0 = Cartesian, 1 = CubedSphereBody, 2 = CubedSphereFace.
+/// - `face_index`: 0..6 for `CubedSphereFace`, 0 otherwise.
+/// - `inner_r`, `outer_r`: body-local radii `[0, 0.5]`, only valid for
+///   `CubedSphereBody`. Zero for other kinds.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GpuNodeMeta {
+    pub kind_tag: u32,
+    pub face_index: u32,
+    pub inner_r: f32,
+    pub outer_r: f32,
+}
+
+impl Default for GpuNodeMeta {
+    fn default() -> Self {
+        Self { kind_tag: 0, face_index: 0, inner_r: 0.0, outer_r: 0.0 }
+    }
+}
+
+impl GpuNodeMeta {
+    pub fn from_kind(kind: &super::tree::NodeKind) -> Self {
+        use super::tree::NodeKind;
+        match kind {
+            NodeKind::Cartesian => Self::default(),
+            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
+                kind_tag: 1,
+                face_index: 0,
+                inner_r: *inner_r,
+                outer_r: *outer_r,
+            },
+            NodeKind::CubedSphereFace { face } => Self {
+                kind_tag: 2,
+                face_index: *face as u32,
+                inner_r: 0.0,
+                outer_r: 0.0,
+            },
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuCamera {
@@ -56,11 +102,11 @@ impl Default for GpuPalette {
 }
 
 /// Pack the visible portion of the tree into a flat GPU buffer.
-/// Returns (node_data, root_buffer_index).
+/// Returns `(node_data, node_metas, root_buffer_index)`.
 pub fn pack_tree(
     library: &NodeLibrary,
     root: NodeId,
-) -> (Vec<GpuChild>, u32) {
+) -> (Vec<GpuChild>, Vec<GpuNodeMeta>, u32) {
     // BFS to collect all reachable nodes. `ordered` doubles as the
     // queue (head advances through it) and the result (insertion order
     // = buffer order).
@@ -120,8 +166,13 @@ pub fn pack_tree(
         }
     }
 
+    let metas: Vec<GpuNodeMeta> = ordered
+        .iter()
+        .map(|&nid| library.get(nid).map(|n| GpuNodeMeta::from_kind(&n.kind)).unwrap_or_default())
+        .collect();
+
     let root_idx = *visited.get(&root).unwrap();
-    (data, root_idx)
+    (data, metas, root_idx)
 }
 
 /// LOD-aware tree packing: only uploads nodes large enough to see.
@@ -286,7 +337,7 @@ pub fn pack_tree_lod_multi(
     camera_pos: [f32; 3],
     screen_height: f32,
     fov: f32,
-) -> (Vec<GpuChild>, Vec<u32>) {
+) -> (Vec<GpuChild>, Vec<GpuNodeMeta>, Vec<u32>) {
     pack_tree_lod_multi_with_frame(
         library, roots, camera_pos, screen_height, fov,
         [0.0, 0.0, 0.0], 1.0,
@@ -312,7 +363,7 @@ pub fn pack_tree_lod_multi_with_frame(
     fov: f32,
     root_origin: [f32; 3],
     root_cell_size: f32,
-) -> (Vec<GpuChild>, Vec<u32>) {
+) -> (Vec<GpuChild>, Vec<GpuNodeMeta>, Vec<u32>) {
     use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
 
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
@@ -439,11 +490,22 @@ pub fn pack_tree_lod_multi_with_frame(
         }
     }
 
+    // Parallel per-node metadata buffer. One entry per packed node
+    // in the same BFS order the tree buffer uses.
+    let metas: Vec<GpuNodeMeta> = ordered
+        .iter()
+        .map(|&nid| {
+            library.get(nid)
+                .map(|n| GpuNodeMeta::from_kind(&n.kind))
+                .unwrap_or_default()
+        })
+        .collect();
+
     let root_indices: Vec<u32> = roots
         .iter()
         .map(|r| *visited.get(r).expect("every root must be visited"))
         .collect();
-    (data, root_indices)
+    (data, metas, root_indices)
 }
 
 #[cfg(test)]
@@ -453,7 +515,7 @@ mod tests {
     #[test]
     fn pack_test_world() {
         let world = super::super::state::WorldState::test_world();
-        let (data, root_idx) = pack_tree(&world.library, world.root);
+        let (data, _metas, root_idx) = pack_tree(&world.library, world.root);
         // Verify data is a multiple of 27 (each node is 27 children).
         assert_eq!(data.len() % 27, 0);
         // Root is always first in BFS order.

@@ -6,7 +6,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuChild, GpuPalette};
+use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeMeta, GpuPalette};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -20,17 +20,12 @@ pub struct GpuUniforms {
     pub _pad: [u32; 2],
     pub highlight_min: [f32; 4], // xyz, w unused
     pub highlight_max: [f32; 4], // xyz, w unused
-    /// Spherical planet: xyz = center, w = outer radius (0 disables).
-    pub cs_planet: [f32; 4],
-    /// x = inner radius. y/z/w reserved for later phases (cells
-    /// visualization parameters or highlight-active flag).
-    pub cs_params: [f32; 4],
-    /// Reserved for Phase C cursor highlight.
-    pub cs_highlight: [f32; 4],
-    /// GPU buffer indices of the 6 face subtree roots.
-    /// Layout: [PosX, NegX, PosY, NegY, PosZ, NegZ, unused, unused].
-    /// Face `f` is looked up at `cs_face_roots[f]`.
-    pub cs_face_roots: [u32; 8],
+    /// Cubed-sphere cursor highlight state — UI, not body geometry.
+    /// x: `1.0` when active, `0.0` otherwise. y: highlight cell depth
+    /// (`3^y` subdivisions per face axis). z, w: reserved.
+    pub body_highlight_active: [f32; 4],
+    /// Highlight cell `(face, iu, iv, ir)` at the depth above.
+    pub body_highlight_cell: [f32; 4],
     /// Render frame: the packed tree's root node represents this
     /// sub-cube of world space. `xyz` = world-space min corner; `w` =
     /// world-space width of ONE root-cell (so the root node spans
@@ -47,6 +42,7 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     tree_buffer: wgpu::Buffer,
+    metas_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     uniforms_buffer: wgpu::Buffer,
@@ -58,10 +54,8 @@ pub struct Renderer {
     highlight_active: u32,
     highlight_min: [f32; 4],
     highlight_max: [f32; 4],
-    cs_planet: [f32; 4],
-    cs_params: [f32; 4],
-    cs_highlight: [f32; 4],
-    cs_face_roots: [u32; 8],
+    body_highlight_active: [f32; 4],
+    body_highlight_cell: [f32; 4],
     render_frame: [f32; 4],
 }
 
@@ -69,6 +63,7 @@ impl Renderer {
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
         tree_data: &[GpuChild],
+        tree_metas: &[GpuNodeMeta],
         root_index: u32,
     ) -> Self {
         let size = window.inner_size();
@@ -130,6 +125,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        let metas_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("node_metas"),
+            contents: bytemuck::cast_slice(tree_metas),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let camera = GpuCamera {
             pos: [1.5, 1.75, 1.5],
             _pad0: 0.0,
@@ -164,10 +165,8 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
-            cs_planet: [0.0; 4],
-            cs_params: [0.0; 4],
-            cs_highlight: [0.0; 4],
-            cs_face_roots: [0; 8],
+            body_highlight_active: [0.0; 4],
+            body_highlight_cell: [0.0; 4],
             render_frame: [0.0, 0.0, 0.0, 1.0],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -221,6 +220,16 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -232,6 +241,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: uniforms_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: metas_buffer.as_entire_binding() },
             ],
         });
 
@@ -287,6 +297,7 @@ impl Renderer {
             pipeline,
             bind_group_layout,
             tree_buffer,
+            metas_buffer,
             camera_buffer,
             palette_buffer,
             uniforms_buffer,
@@ -297,10 +308,8 @@ impl Renderer {
             highlight_active: 0,
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
-            cs_planet: [0.0; 4],
-            cs_params: [0.0; 4],
-            cs_highlight: [0.0; 4],
-            cs_face_roots: [0; 8],
+            body_highlight_active: [0.0; 4],
+            body_highlight_cell: [0.0; 4],
             render_frame: [0.0, 0.0, 0.0, 1.0],
         }
     }
@@ -315,54 +324,26 @@ impl Renderer {
         self.write_uniforms();
     }
 
-    /// Provide the 6 face-subtree buffer indices for the spherical
-    /// planet. Order: PosX, NegX, PosY, NegY, PosZ, NegZ.
-    pub fn set_face_roots(&mut self, roots: [u32; 6]) {
-        for (i, &r) in roots.iter().enumerate() {
-            self.cs_face_roots[i] = r;
-        }
-        self.write_uniforms();
-    }
-
     /// Set or clear the cubed-sphere cursor highlight.
     /// `cell = (face, iu, iv, ir, depth)`. Indices live in the grid
     /// `3^depth` per axis, so `depth = 1` highlights 1 of 27 coarse
     /// "chunks" per face, and `depth = subtree_depth` highlights a
     /// single finest cell. The shader compares cell indices at the
     /// same depth so the wireframe shrinks/grows with depth.
-    pub fn set_cubed_sphere_highlight(
+    pub fn set_body_highlight(
         &mut self,
         cell: Option<(u32, u32, u32, u32, u32)>,
     ) {
         match cell {
             Some((face, i, j, k, depth)) => {
-                self.cs_highlight = [face as f32, i as f32, j as f32, k as f32];
-                self.cs_params[2] = depth as f32;
-                self.cs_params[3] = 1.0;
+                self.body_highlight_active = [1.0, depth as f32, 0.0, 0.0];
+                self.body_highlight_cell = [face as f32, i as f32, j as f32, k as f32];
             }
             None => {
-                self.cs_highlight = [0.0; 4];
-                self.cs_params[2] = 0.0;
-                self.cs_params[3] = 0.0;
+                self.body_highlight_active = [0.0; 4];
+                self.body_highlight_cell = [0.0; 4];
             }
         }
-        self.write_uniforms();
-    }
-
-    /// Configure the spherical planet's rendering footprint.
-    /// - `outer_radius == 0` hides the planet.
-    /// - `depth` = levels of recursion in each face subtree (3^depth
-    ///   cells per face per axis). Needed by the shader so its DDA
-    ///   knows the finest cell size to step to.
-    pub fn set_cubed_sphere_planet(
-        &mut self,
-        center: [f32; 3],
-        inner_radius: f32,
-        outer_radius: f32,
-        depth: u32,
-    ) {
-        self.cs_planet = [center[0], center[1], center[2], outer_radius];
-        self.cs_params = [inner_radius, depth as f32, 0.0, self.cs_params[3]];
         self.write_uniforms();
     }
 
@@ -439,20 +420,43 @@ impl Renderer {
 
     /// Re-upload the tree buffer after an edit. Recreates the buffer
     /// and bind group if the size changed.
-    pub fn update_tree(&mut self, tree_data: &[GpuChild], root_index: u32) {
+    pub fn update_tree(
+        &mut self,
+        tree_data: &[GpuChild],
+        tree_metas: &[GpuNodeMeta],
+        root_index: u32,
+    ) {
         self.root_index = root_index;
         self.node_count = (tree_data.len() / 27) as u32;
 
-        let new_size = (tree_data.len() * std::mem::size_of::<GpuChild>()) as u64;
+        let new_tree_size = (tree_data.len() * std::mem::size_of::<GpuChild>()) as u64;
+        let new_metas_size = (tree_metas.len() * std::mem::size_of::<GpuNodeMeta>()) as u64;
 
-        if new_size > self.tree_buffer.size() {
-            // Buffer too small — recreate.
+        let mut recreate_bind_group = false;
+
+        if new_tree_size > self.tree_buffer.size() {
             self.tree_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tree"),
                 contents: bytemuck::cast_slice(tree_data),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             });
-            // Recreate bind group with new buffer.
+            recreate_bind_group = true;
+        } else {
+            self.queue.write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
+        }
+
+        if new_metas_size > self.metas_buffer.size() {
+            self.metas_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("node_metas"),
+                contents: bytemuck::cast_slice(tree_metas),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            recreate_bind_group = true;
+        } else {
+            self.queue.write_buffer(&self.metas_buffer, 0, bytemuck::cast_slice(tree_metas));
+        }
+
+        if recreate_bind_group {
             self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ray_march"),
                 layout: &self.bind_group_layout,
@@ -461,10 +465,9 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 1, resource: self.camera_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: self.palette_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: self.uniforms_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: self.metas_buffer.as_entire_binding() },
                 ],
             });
-        } else {
-            self.queue.write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
         }
 
         self.write_uniforms();
@@ -481,10 +484,8 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
-            cs_planet: self.cs_planet,
-            cs_params: self.cs_params,
-            cs_highlight: self.cs_highlight,
-            cs_face_roots: self.cs_face_roots,
+            body_highlight_active: self.body_highlight_active,
+            body_highlight_cell: self.body_highlight_cell,
             render_frame: self.render_frame,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));

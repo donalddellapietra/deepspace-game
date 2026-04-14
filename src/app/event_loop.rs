@@ -40,21 +40,11 @@ impl ApplicationHandler for App {
         #[cfg(not(target_arch = "wasm32"))]
         crate::platform::prepare_window(&window);
 
-        let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
-        let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
-        // Derive the body's world-space footprint from its anchor
-        // path and NodeKind payload — the body node IS the source of
-        // truth; the shader's uniforms are a projection of it.
-        if let Some(body_desc) = crate::world::cubesphere::resolve_body_from_anchor(
-            &self.world.library, self.world.root, &self.body_anchor,
-        ) {
-            renderer.set_cubed_sphere_planet(
-                body_desc.center,
-                body_desc.inner_r_world,
-                body_desc.outer_r_world,
-                body_desc.face_subtree_depth,
-            );
-        }
+        let (tree_data, tree_metas, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
+        let renderer = pollster::block_on(Renderer::new(window, &tree_data, &tree_metas, root_index));
+        // The body node's world-space footprint is discovered by the
+        // shader from the per-node kind buffer + tree structure —
+        // nothing to push at startup.
         self.renderer = Some(renderer);
         self.apply_zoom(); // sync renderer max_depth with initial zoom_level
         self.last_frame = std::time::Instant::now();
