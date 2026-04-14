@@ -36,26 +36,21 @@ pub struct GpuCamera {
     pub fov: f32,
 }
 
-/// Block color palette — 10 RGBA colors, one per BlockType.
+/// Block color palette — up to 256 RGBA colors indexed by block type.
+/// Built from a `ColorRegistry` via `to_gpu_palette()`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuPalette {
-    pub colors: [[f32; 4]; 16], // 10 used + 6 padding for alignment
+    pub colors: [[f32; 4]; 256],
 }
 
 impl Default for GpuPalette {
     fn default() -> Self {
-        let mut colors = [[0.0; 4]; 16];
-        colors[0]  = [0.5, 0.5, 0.5, 1.0];    // Stone
-        colors[1]  = [0.45, 0.3, 0.15, 1.0];   // Dirt
-        colors[2]  = [0.3, 0.6, 0.2, 1.0];     // Grass
-        colors[3]  = [0.55, 0.35, 0.15, 1.0];  // Wood
-        colors[4]  = [0.2, 0.5, 0.1, 1.0];     // Leaf
-        colors[5]  = [0.85, 0.8, 0.55, 1.0];   // Sand
-        colors[6]  = [0.2, 0.4, 0.8, 1.0];     // Water
-        colors[7]  = [0.7, 0.3, 0.2, 1.0];     // Brick
-        colors[8]  = [0.75, 0.75, 0.8, 1.0];   // Metal
-        colors[9]  = [0.85, 0.9, 1.0, 1.0];    // Glass
+        // Populate from the builtin palette entries.
+        let mut colors = [[0.0f32; 4]; 256];
+        for &(idx, _, color) in super::palette::BUILTINS {
+            colors[idx as usize] = color;
+        }
         Self { colors }
     }
 }
@@ -104,7 +99,7 @@ pub fn pack_tree(
                 },
                 Child::Block(bt) => GpuChild {
                     tag: 1,
-                    block_type: *bt as u8,
+                    block_type: *bt,
                     _pad: 0,
                     node_index: 0,
                 },
@@ -257,7 +252,7 @@ pub fn pack_tree_lod(
             } else {
                 data.push(match child {
                     Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
-                    Child::Block(bt) => GpuChild { tag: 1, block_type: *bt as u8, _pad: 0, node_index: 0 },
+                    Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
                     Child::Node(child_id) => {
                         let dominant = library.get(*child_id).map(|n| n.dominant_block).unwrap_or(0);
                         let idx = visited.get(child_id).copied().unwrap_or(0);

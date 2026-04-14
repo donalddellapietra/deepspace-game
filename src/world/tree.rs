@@ -15,42 +15,16 @@ pub const BRANCH: usize = 3;
 pub const CHILDREN_PER_NODE: usize = 27; // 3³
 pub const MAX_DEPTH: usize = 63;
 
-// --------------------------------------------------------------- block
-
-/// Block types. Simple enum — colors are defined in the renderer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum BlockType {
-    Stone = 0,
-    Dirt = 1,
-    Grass = 2,
-    Wood = 3,
-    Leaf = 4,
-    Sand = 5,
-    Water = 6,
-    Brick = 7,
-    Metal = 8,
-    Glass = 9,
-}
-
-impl BlockType {
-    pub const ALL: [Self; 10] = [
-        Self::Stone, Self::Dirt, Self::Grass, Self::Wood, Self::Leaf,
-        Self::Sand, Self::Water, Self::Brick, Self::Metal, Self::Glass,
-    ];
-
-    pub fn from_index(i: u8) -> Option<Self> {
-        Self::ALL.get(i as usize).copied()
-    }
-}
-
 // --------------------------------------------------------------- child
 
 /// One child slot in a node's 3x3x3 grid.
+///
+/// `Block(u8)` holds a palette index. Builtin block indices live in
+/// `palette::block`; imported model colors use indices 10-254.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Child {
     Empty,
-    Block(BlockType),
+    Block(u8),
     Node(NodeId),
 }
 
@@ -162,7 +136,7 @@ impl NodeLibrary {
         let mut counts = [0u32; 256];
         for c in &children {
             match c {
-                Child::Block(bt) => counts[*bt as u8 as usize] += 1,
+                Child::Block(bt) => counts[*bt as usize] += 1,
                 Child::Node(nid) => {
                     if let Some(child_node) = self.nodes.get(nid) {
                         if child_node.dominant_block < 255 {
@@ -187,7 +161,7 @@ impl NodeLibrary {
             for c in &children {
                 let ct = match c {
                     Child::Empty => UNIFORM_EMPTY,
-                    Child::Block(bt) => *bt as u8,
+                    Child::Block(bt) => *bt,
                     Child::Node(nid) => {
                         self.nodes.get(nid).map(|n| n.uniform_type).unwrap_or(UNIFORM_MIXED)
                     }
@@ -264,6 +238,7 @@ fn hash_children(children: &Children) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::palette::block;
 
     #[test]
     fn slot_round_trip() {
@@ -281,7 +256,7 @@ mod tests {
     #[test]
     fn dedup() {
         let mut lib = NodeLibrary::default();
-        let c = uniform_children(Child::Block(BlockType::Stone));
+        let c = uniform_children(Child::Block(block::STONE));
         let id1 = lib.insert(c);
         let id2 = lib.insert(c);
         assert_eq!(id1, id2);
@@ -291,8 +266,8 @@ mod tests {
     #[test]
     fn distinct() {
         let mut lib = NodeLibrary::default();
-        let id1 = lib.insert(uniform_children(Child::Block(BlockType::Stone)));
-        let id2 = lib.insert(uniform_children(Child::Block(BlockType::Grass)));
+        let id1 = lib.insert(uniform_children(Child::Block(block::STONE)));
+        let id2 = lib.insert(uniform_children(Child::Block(block::GRASS)));
         assert_ne!(id1, id2);
         assert_eq!(lib.len(), 2);
     }
@@ -310,7 +285,7 @@ mod tests {
     #[test]
     fn cascade_eviction() {
         let mut lib = NodeLibrary::default();
-        let leaf = lib.insert(uniform_children(Child::Block(BlockType::Grass)));
+        let leaf = lib.insert(uniform_children(Child::Block(block::GRASS)));
         let mut parent_children = empty_children();
         parent_children[0] = Child::Node(leaf);
         let parent = lib.insert(parent_children);

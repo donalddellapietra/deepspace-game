@@ -1,5 +1,6 @@
 //! Runtime world state: the content-addressed tree.
 
+use super::palette::block;
 use super::tree::*;
 
 pub struct WorldState {
@@ -22,13 +23,13 @@ impl WorldState {
         let mut library = NodeLibrary::default();
 
         // --- Level 1 nodes: 3x3x3 uniform block clusters ---
-        let stone_l1 = library.insert(uniform_children(Child::Block(BlockType::Stone)));
-        let dirt_l1 = library.insert(uniform_children(Child::Block(BlockType::Dirt)));
-        let grass_l1 = library.insert(uniform_children(Child::Block(BlockType::Grass)));
-        let wood_l1 = library.insert(uniform_children(Child::Block(BlockType::Wood)));
-        let leaf_l1 = library.insert(uniform_children(Child::Block(BlockType::Leaf)));
-        let sand_l1 = library.insert(uniform_children(Child::Block(BlockType::Sand)));
-        let brick_l1 = library.insert(uniform_children(Child::Block(BlockType::Brick)));
+        let stone_l1 = library.insert(uniform_children(Child::Block(block::STONE)));
+        let dirt_l1 = library.insert(uniform_children(Child::Block(block::DIRT)));
+        let grass_l1 = library.insert(uniform_children(Child::Block(block::GRASS)));
+        let wood_l1 = library.insert(uniform_children(Child::Block(block::WOOD)));
+        let leaf_l1 = library.insert(uniform_children(Child::Block(block::LEAF)));
+        let sand_l1 = library.insert(uniform_children(Child::Block(block::SAND)));
+        let brick_l1 = library.insert(uniform_children(Child::Block(block::BRICK)));
         let air_l1 = library.insert(empty_children());
 
         // A mixed level-1 node: checkerboard of stone and dirt.
@@ -38,9 +39,9 @@ impl WorldState {
                 for x in 0..BRANCH {
                     let slot = slot_index(x, y, z);
                     if (x + y + z) % 2 == 0 {
-                        checker_children[slot] = Child::Block(BlockType::Stone);
+                        checker_children[slot] = Child::Block(block::STONE);
                     } else {
-                        checker_children[slot] = Child::Block(BlockType::Dirt);
+                        checker_children[slot] = Child::Block(block::DIRT);
                     }
                 }
             }

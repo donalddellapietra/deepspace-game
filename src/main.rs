@@ -13,6 +13,7 @@ use deepspace_game::renderer::Renderer;
 use deepspace_game::world::collision::{self, PlayerPhysics};
 use deepspace_game::world::edit;
 use deepspace_game::world::gpu::{self, GpuCamera};
+use deepspace_game::world::palette::ColorRegistry;
 use deepspace_game::world::state::WorldState;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,6 +104,7 @@ struct App {
     /// Cached tree depth (recomputed only after edits).
     tree_depth: u32,
     physics: PlayerPhysics,
+    palette: ColorRegistry,
     ui: GameUiState,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
@@ -133,6 +135,7 @@ impl App {
             zoom_level: 0,
             tree_depth,
             physics: PlayerPhysics::default(),
+            palette: ColorRegistry::new(),
             ui: GameUiState::new(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
@@ -469,7 +472,7 @@ impl ApplicationHandler for App {
                     self.try_create_webview();
                     self.inject_webview_input();
                     self.poll_ui_commands();
-                    self.ui.push_to_overlay();
+                    self.ui.push_to_overlay(&self.palette);
                     self.flush_overlay();
                 }
 

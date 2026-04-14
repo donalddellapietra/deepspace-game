@@ -207,8 +207,10 @@ pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
     propagate_edit(world, hit, Child::Empty)
 }
 
-/// Place a block adjacent to the hit face.
-pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: BlockType) -> bool {
+/// Place a block adjacent to the hit face. Handles both in-node
+/// placement (neighbor within same 3x3x3) and cross-node placement
+/// (neighbor in a different node, resolved via world-space point lookup).
+pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
     let (_parent_id, slot) = *hit.path.last().unwrap();
     let (x, y, z) = slot_coords(slot);
     let (dx, dy, dz): (i32, i32, i32) = match hit.face {
@@ -225,25 +227,161 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: BlockType)
     let ny = y as i32 + dy;
     let nz = z as i32 + dz;
 
-    if nx < 0 || nx > 2 || ny < 0 || ny > 2 || nz < 0 || nz > 2 {
+    // In-node: neighbor is within the same 3x3x3 node.
+    if (0..=2).contains(&nx) && (0..=2).contains(&ny) && (0..=2).contains(&nz) {
+        let adj_slot = slot_index(nx as usize, ny as usize, nz as usize);
+        let parent_id = hit.path.last().unwrap().0;
+
+        let node = match world.library.get(parent_id) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        if !node.children[adj_slot].is_empty() {
+            return false;
+        }
+
+        let mut place_hit = hit.clone();
+        place_hit.path.last_mut().unwrap().1 = adj_slot;
+        return propagate_edit(world, &place_hit, Child::Block(block_type));
+    }
+
+    // Cross-node: compute world-space target center and look up from root.
+    let (aabb_min, aabb_max) = hit_aabb(hit);
+    let cell_size = aabb_max[0] - aabb_min[0];
+    let target = [
+        (aabb_min[0] + aabb_max[0]) * 0.5 + dx as f32 * cell_size,
+        (aabb_min[1] + aabb_max[1]) * 0.5 + dy as f32 * cell_size,
+        (aabb_min[2] + aabb_max[2]) * 0.5 + dz as f32 * cell_size,
+    ];
+
+    place_at_point(world, target, hit.path.len(), block_type)
+}
+
+/// Place a block at the given world-space point, descending `depth`
+/// levels from root. If the path crosses empty subtrees, intermediate
+/// nodes are materialized automatically.
+fn place_at_point(
+    world: &mut WorldState,
+    target: [f32; 3],
+    depth: usize,
+    block_type: u8,
+) -> bool {
+    // Bounds check: must be inside root [0, 3).
+    if target[0] < 0.0 || target[0] >= 3.0
+        || target[1] < 0.0 || target[1] >= 3.0
+        || target[2] < 0.0 || target[2] >= 3.0
+    {
         return false;
     }
 
-    let adj_slot = slot_index(nx as usize, ny as usize, nz as usize);
-    let parent_id = hit.path.last().unwrap().0;
+    let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(depth);
+    let mut current_id = world.root;
+    let mut origin = [0.0f32; 3];
+    let mut cell_size = 1.0f32;
 
-    let node = match world.library.get(parent_id) {
-        Some(n) => n,
-        None => return false,
-    };
+    for level in 0..depth {
+        let cell = [
+            ((target[0] - origin[0]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+            ((target[1] - origin[1]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+            ((target[2] - origin[2]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+        ];
+        let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
+        path.push((current_id, slot));
 
-    if !node.children[adj_slot].is_empty() {
-        return false;
+        let node = match world.library.get(current_id) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        let is_last = level == depth - 1;
+
+        match node.children[slot] {
+            Child::Node(child_id) if !is_last => {
+                origin = [
+                    origin[0] + cell[0] as f32 * cell_size,
+                    origin[1] + cell[1] as f32 * cell_size,
+                    origin[2] + cell[2] as f32 * cell_size,
+                ];
+                cell_size /= 3.0;
+                current_id = child_id;
+            }
+            Child::Empty if is_last => {
+                // Target cell is empty at the right depth — place directly.
+                let place_hit = HitInfo { path, face: 0, t: 0.0 };
+                return propagate_edit(world, &place_hit, Child::Block(block_type));
+            }
+            Child::Empty => {
+                // Empty subtree but we need to go deeper. Build a chain
+                // of empty nodes with the block at the target position.
+                let child_origin = [
+                    origin[0] + cell[0] as f32 * cell_size,
+                    origin[1] + cell[1] as f32 * cell_size,
+                    origin[2] + cell[2] as f32 * cell_size,
+                ];
+                let remaining = depth - level - 1;
+                let chain_id = build_placement_chain(
+                    world,
+                    target,
+                    child_origin,
+                    cell_size / 3.0,
+                    remaining,
+                    block_type,
+                );
+                let place_hit = HitInfo { path, face: 0, t: 0.0 };
+                return propagate_edit(world, &place_hit, Child::Node(chain_id));
+            }
+            _ => {
+                // Block or occupied Node at target — can't place here.
+                return false;
+            }
+        }
     }
 
-    let mut place_hit = hit.clone();
-    place_hit.path.last_mut().unwrap().1 = adj_slot;
-    propagate_edit(world, &place_hit, Child::Block(block_type))
+    false
+}
+
+/// Build a chain of `remaining` empty-children nodes with one block
+/// placed at the position determined by `target` coordinates.
+/// Returns the NodeId of the top of the chain.
+fn build_placement_chain(
+    world: &mut WorldState,
+    target: [f32; 3],
+    mut origin: [f32; 3],
+    mut cell_size: f32,
+    remaining: usize,
+    block_type: u8,
+) -> NodeId {
+    let mut slots = Vec::with_capacity(remaining);
+    for _ in 0..remaining {
+        let cell = [
+            ((target[0] - origin[0]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+            ((target[1] - origin[1]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+            ((target[2] - origin[2]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+        ];
+        let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
+        slots.push(slot);
+        origin = [
+            origin[0] + cell[0] as f32 * cell_size,
+            origin[1] + cell[1] as f32 * cell_size,
+            origin[2] + cell[2] as f32 * cell_size,
+        ];
+        cell_size /= 3.0;
+    }
+
+    // Build bottom-up: block at the deepest level, wrapped in empty nodes.
+    let mut child = Child::Block(block_type);
+    for &slot in slots.iter().rev() {
+        let mut children = empty_children();
+        children[slot] = child;
+        let id = world.library.insert(children);
+        child = Child::Node(id);
+    }
+
+    match child {
+        Child::Node(id) => id,
+        _ => unreachable!("remaining > 0 guarantees at least one wrapping node"),
+    }
 }
 
 /// Apply an edit and propagate clone-on-write up to root.
@@ -445,6 +583,7 @@ pub fn hit_aabb(hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::palette::block;
 
     #[test]
     fn raycast_hits_ground() {
@@ -515,7 +654,7 @@ mod tests {
         ).unwrap();
         let old_root = world.root;
         // Place on top of the newly exposed surface.
-        assert!(place_block(&mut world, &hit2, BlockType::Brick));
+        assert!(place_block(&mut world, &hit2, block::BRICK));
         assert_ne!(world.root, old_root, "Root should change after placement");
     }
 
@@ -542,5 +681,96 @@ mod tests {
         assert!(hit_fine.is_some());
         // Coarse hit should have shorter path (fewer levels descended).
         assert!(hit_coarse.unwrap().path.len() < hit_fine.unwrap().path.len());
+    }
+
+    #[test]
+    fn cross_node_placement_upward() {
+        let mut world = WorldState::test_world();
+        // Hit the ground surface from above. The test world has grass
+        // surface around y≈1 (level-2 node). At depth 2, cells are
+        // 1.0 wide, so cell (x, 2, z) at depth 1 is the top of a
+        // coarse node.
+        //
+        // We need a hit at a cell boundary where placing above would
+        // cross into a different node (ny > 2).
+        let hit = cpu_raycast(
+            &world.library,
+            world.root,
+            [1.5, 2.5, 1.5],
+            [0.0, -1.0, 0.0],
+            2, // coarse depth — each cell is a 3x3x3 group
+        );
+        assert!(hit.is_some(), "Should hit ground at depth 2");
+        let hit = hit.unwrap();
+
+        let (_, slot) = *hit.path.last().unwrap();
+        let (_x, y, _z) = slot_coords(slot);
+
+        // If the hit cell is at y=2 (top of node), placing above (face=2, +Y)
+        // requires cross-node placement.
+        if y == 2 {
+            let old_root = world.root;
+            assert!(
+                place_block(&mut world, &hit, block::BRICK),
+                "Cross-node placement above y=2 cell should succeed"
+            );
+            assert_ne!(world.root, old_root);
+        }
+    }
+
+    #[test]
+    fn cross_node_placement_into_empty_subtree() {
+        let mut world = WorldState::test_world();
+        // The test world has air_l2 at (0, 2, 0). Hit the ground
+        // surface below it and place upward into the empty air region.
+        let hit = cpu_raycast(
+            &world.library,
+            world.root,
+            [0.5, 2.5, 0.5],
+            [0.0, -1.0, 0.0],
+            3, // depth 3 = individual blocks
+        );
+        assert!(hit.is_some(), "Should hit ground");
+        let hit = hit.unwrap();
+        let (aabb_min, aabb_max) = hit_aabb(&hit);
+        let cell_size = aabb_max[0] - aabb_min[0];
+
+        // Check that the block above the hit is in a different node
+        // (i.e., the target center is in the air region).
+        let target_center_y = (aabb_min[1] + aabb_max[1]) * 0.5 + cell_size;
+        if target_center_y < 3.0 {
+            let old_root = world.root;
+            let placed = place_block(&mut world, &hit, block::BRICK);
+            // Should succeed even when crossing into an empty subtree.
+            assert!(placed, "Should place into empty subtree");
+            assert_ne!(world.root, old_root);
+
+            // Verify the block is now solid at the target position.
+            let target = [
+                (aabb_min[0] + aabb_max[0]) * 0.5,
+                target_center_y,
+                (aabb_min[2] + aabb_max[2]) * 0.5,
+            ];
+            assert!(
+                is_solid_at(&world.library, world.root, target, 8),
+                "Placed block should be solid at target"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_outside_world_returns_false() {
+        let mut world = WorldState::test_world();
+        // Create a fake hit at the world boundary (cell y=2 at depth 1).
+        // Placing above would go outside [0, 3).
+        let hit = HitInfo {
+            path: vec![(world.root, slot_index(1, 2, 1))],
+            face: 2, // +Y
+            t: 1.0,
+        };
+        assert!(
+            !place_block(&mut world, &hit, block::BRICK),
+            "Should reject placement outside world bounds"
+        );
     }
 }

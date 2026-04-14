@@ -11,6 +11,7 @@
 //! Content-addressing means shared structure costs no extra memory.
 //! A uniform stone layer reused 100 times is still one node.
 
+use super::palette::block;
 use super::state::WorldState;
 use super::tree::*;
 
@@ -34,13 +35,13 @@ pub fn generate_world() -> WorldState {
     // Level 1: 3×3×3 uniform block clusters (building materials)
     // ═══════════════════════════════════════════════════════════════
 
-    let stone_l1 = lib.insert(uniform_children(Child::Block(BlockType::Stone)));
-    let dirt_l1 = lib.insert(uniform_children(Child::Block(BlockType::Dirt)));
-    let grass_l1 = lib.insert(uniform_children(Child::Block(BlockType::Grass)));
-    let wood_l1 = lib.insert(uniform_children(Child::Block(BlockType::Wood)));
-    let leaf_l1 = lib.insert(uniform_children(Child::Block(BlockType::Leaf)));
-    let sand_l1 = lib.insert(uniform_children(Child::Block(BlockType::Sand)));
-    let brick_l1 = lib.insert(uniform_children(Child::Block(BlockType::Brick)));
+    let stone_l1 = lib.insert(uniform_children(Child::Block(block::STONE)));
+    let dirt_l1 = lib.insert(uniform_children(Child::Block(block::DIRT)));
+    let grass_l1 = lib.insert(uniform_children(Child::Block(block::GRASS)));
+    let wood_l1 = lib.insert(uniform_children(Child::Block(block::WOOD)));
+    let leaf_l1 = lib.insert(uniform_children(Child::Block(block::LEAF)));
+    let sand_l1 = lib.insert(uniform_children(Child::Block(block::SAND)));
+    let brick_l1 = lib.insert(uniform_children(Child::Block(block::BRICK)));
     let air_l1 = lib.insert(empty_children());
 
     let gravel_l1 = {
@@ -50,9 +51,9 @@ pub fn generate_world() -> WorldState {
                 for x in 0..BRANCH {
                     let h = pos_hash(x, y, z, 42);
                     c[slot_index(x, y, z)] = if h % 3 == 0 {
-                        Child::Block(BlockType::Dirt)
+                        Child::Block(block::DIRT)
                     } else {
-                        Child::Block(BlockType::Stone)
+                        Child::Block(block::STONE)
                     };
                 }
             }

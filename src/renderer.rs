@@ -128,7 +128,7 @@ impl Renderer {
         let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("palette"),
             contents: bytemuck::bytes_of(&palette),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let node_count = (tree_data.len() / 27) as u32;
@@ -271,6 +271,10 @@ impl Renderer {
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
         }
+    }
+
+    pub fn update_palette(&self, palette: &GpuPalette) {
+        self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
     }
 
     /// Set the highlighted block AABB (or clear it with None).

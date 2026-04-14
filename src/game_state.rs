@@ -5,7 +5,7 @@
 //! world tree or camera — those stay in `App`.
 
 use crate::bridge::*;
-use crate::world::tree::BlockType;
+use crate::world::palette::{self, block, ColorRegistry};
 
 // ── Hotbar slot ──────────────────────────────────────────────────
 
@@ -40,18 +40,12 @@ pub struct GameUiState {
 
 impl GameUiState {
     pub fn new() -> Self {
+        // Default hotbar: first 9 builtin blocks + stone in slot 10
         let slots = std::array::from_fn(|i| {
-            let voxel = match i {
-                0 => BlockType::Stone as u8,
-                1 => BlockType::Dirt as u8,
-                2 => BlockType::Grass as u8,
-                3 => BlockType::Wood as u8,
-                4 => BlockType::Leaf as u8,
-                5 => BlockType::Sand as u8,
-                6 => BlockType::Brick as u8,
-                7 => BlockType::Metal as u8,
-                8 => BlockType::Glass as u8,
-                _ => BlockType::Stone as u8,
+            let voxel = if i < palette::BUILTINS.len() {
+                palette::BUILTINS[i].0
+            } else {
+                block::STONE
             };
             HotbarItem::Block(voxel)
         });
@@ -74,9 +68,10 @@ impl GameUiState {
         self.inventory_open || self.color_picker_open
     }
 
-    pub fn active_block_type(&self) -> Option<BlockType> {
+    /// The palette index of the active hotbar slot, or None for mesh slots.
+    pub fn active_block_type(&self) -> Option<u8> {
         match &self.slots[self.active_slot] {
-            HotbarItem::Block(voxel) => BlockType::from_index(*voxel),
+            HotbarItem::Block(idx) => Some(*idx),
             HotbarItem::Mesh(_) => None,
         }
     }
@@ -101,7 +96,7 @@ impl GameUiState {
                 self.picker_b = b;
             }
             UiCommand::CreateBlock => {
-                let idx = BlockType::ALL.len() as u8 + self.custom_blocks.len() as u8;
+                let idx = block::BUILTIN_COUNT + self.custom_blocks.len() as u8;
                 let name = format!("Custom #{}", self.custom_blocks.len() + 1);
                 let color = [self.picker_r, self.picker_g, self.picker_b, 1.0];
                 self.custom_blocks.push(CustomBlock { name, color });
@@ -163,7 +158,7 @@ impl GameUiState {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn push_to_overlay(&mut self) {
+    pub fn push_to_overlay(&mut self, registry: &ColorRegistry) {
         use crate::overlay;
 
         let layer = self.zoom_level.max(0) as u8;
@@ -172,8 +167,12 @@ impl GameUiState {
         let slots: Vec<SlotInfo> = self.slots.iter().map(|item| {
             match item {
                 HotbarItem::Block(voxel) => {
-                    let (name, color) = self.block_info(*voxel);
-                    SlotInfo { kind: "block", index: *voxel as u32, name, color }
+                    SlotInfo {
+                        kind: "block",
+                        index: *voxel as u32,
+                        name: registry.name(*voxel).to_string(),
+                        color: registry.color(*voxel),
+                    }
                 }
                 HotbarItem::Mesh(idx) => SlotInfo {
                     kind: "model", index: *idx as u32,
@@ -187,13 +186,13 @@ impl GameUiState {
             active: self.active_slot, slots, layer,
         }));
 
-        // Inventory
-        let builtin_blocks: Vec<BlockInfo> = BlockType::ALL.iter().map(|bt| {
-            BlockInfo { voxel: *bt as u8, name: format!("{:?}", bt), color: builtin_block_color(*bt) }
+        // Inventory: builtin blocks from the palette
+        let builtin_blocks: Vec<BlockInfo> = palette::BUILTINS.iter().map(|&(idx, name, color)| {
+            BlockInfo { voxel: idx, name: name.to_string(), color }
         }).collect();
 
         let custom_blocks: Vec<BlockInfo> = self.custom_blocks.iter().enumerate().map(|(i, cb)| {
-            BlockInfo { voxel: BlockType::ALL.len() as u8 + i as u8, name: cb.name.clone(), color: cb.color }
+            BlockInfo { voxel: block::BUILTIN_COUNT + i as u8, name: cb.name.clone(), color: cb.color }
         }).collect();
 
         overlay::push_state(&GameStateUpdate::Inventory(InventoryStateJs {
@@ -210,38 +209,5 @@ impl GameUiState {
         overlay::push_state(&GameStateUpdate::ModeIndicator(ModeIndicatorStateJs {
             layer, save_mode: false, save_eligible: false, entity_edit_mode: false,
         }));
-    }
-
-    fn block_info(&self, voxel: u8) -> (String, [f32; 4]) {
-        let builtin_count = BlockType::ALL.len() as u8;
-        if voxel < builtin_count {
-            if let Some(bt) = BlockType::from_index(voxel) {
-                (format!("{:?}", bt), builtin_block_color(bt))
-            } else {
-                (format!("Block {}", voxel), [0.3, 0.3, 0.3, 1.0])
-            }
-        } else {
-            let custom_idx = (voxel - builtin_count) as usize;
-            if let Some(cb) = self.custom_blocks.get(custom_idx) {
-                (cb.name.clone(), cb.color)
-            } else {
-                (format!("Custom {}", voxel), [0.3, 0.3, 0.3, 1.0])
-            }
-        }
-    }
-}
-
-fn builtin_block_color(bt: BlockType) -> [f32; 4] {
-    match bt {
-        BlockType::Stone => [0.5, 0.5, 0.5, 1.0],
-        BlockType::Dirt  => [0.6, 0.4, 0.2, 1.0],
-        BlockType::Grass => [0.3, 0.7, 0.2, 1.0],
-        BlockType::Wood  => [0.6, 0.4, 0.15, 1.0],
-        BlockType::Leaf  => [0.2, 0.6, 0.1, 1.0],
-        BlockType::Sand  => [0.9, 0.85, 0.6, 1.0],
-        BlockType::Water => [0.2, 0.4, 0.9, 0.7],
-        BlockType::Brick => [0.7, 0.3, 0.2, 1.0],
-        BlockType::Metal => [0.8, 0.8, 0.85, 1.0],
-        BlockType::Glass => [0.7, 0.85, 0.9, 0.4],
     }
 }
