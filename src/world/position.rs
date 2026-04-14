@@ -154,23 +154,33 @@ impl Position {
         let d = self.depth as usize;
         let a = ancestor_depth as usize;
         assert!(a <= d, "ancestor_depth {} > depth {}", a, d);
-        let mut out = [0.0f32; 3];
+        let n = (d - a) as i32;
+        // Accumulate slot contributions in f64 via Horner's scheme,
+        // then rescale once to the ancestor's [0, 3)³ frame and cast
+        // back to f32. Summing the per-slot terms directly in f32
+        // loses about 1 ulp per level — at depth ≥ 10 the cumulative
+        // error exceeds one voxel at visual_depth (= depth + 3),
+        // which shows up as the shader rendering cells a voxel off
+        // from where they're packed ("faces sticking out"). Staying
+        // in f64 through the summation keeps the final f32 within
+        // one native ulp regardless of path length.
+        let mut acc = [0.0f64; 3];
         for k in (a + 1)..=d {
             let slot = self.path[k - 1] as usize;
             let (sx, sy, sz) = slot_coords(slot);
-            // Level k sits at depth k, ancestor at depth a; its offset
-            // within the ancestor's [0, 3)³ frame is scaled by
-            // 3^(1 - (k - a)).
-            let scale = 3.0f32.powi(1 - (k as i32 - a as i32));
-            out[0] += sx as f32 * scale;
-            out[1] += sy as f32 * scale;
-            out[2] += sz as f32 * scale;
+            acc[0] = acc[0] * 3.0 + sx as f64;
+            acc[1] = acc[1] * 3.0 + sy as f64;
+            acc[2] = acc[2] * 3.0 + sz as f64;
         }
-        let leaf_scale = 3.0f32.powi(1 - (d as i32 - a as i32));
         for axis in 0..3 {
-            out[axis] += self.offset[axis] * leaf_scale;
+            acc[axis] += self.offset[axis] as f64;
         }
-        out
+        let scale = 3.0f64.powi(1 - n);
+        [
+            (acc[0] * scale) as f32,
+            (acc[1] * scale) as f32,
+            (acc[2] * scale) as f32,
+        ]
     }
 
     /// Reconstruct absolute XYZ coordinates in the root cell's frame.
