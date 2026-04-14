@@ -702,10 +702,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         camera.forward + camera.right * ndc.x + camera.up * ndc.y
     );
 
-    let result = march(camera.pos, ray_dir);
-
-    // Sphere rendering lives inside `march()` now — the old
-    // uniform-driven cs_planet path in fs_main is gone.
+    // Render root can be any NodeKind. If it's the body itself
+    // (camera anchored exactly at body depth), dispatch the sphere
+    // DDA directly on the whole render cell. Otherwise the Cartesian
+    // march handles it — including the case where the render root is
+    // a face-subtree node, which gets walked as if Cartesian (cubes
+    // in local (u,v,r)); at such zoom the sphere bulge is sub-pixel.
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    let root_kind = kinds[uniforms.root_index];
+    if root_kind.tag == 1u {
+        result = march_sphere_body(
+            uniforms.root_index,
+            vec3<f32>(0.0),
+            3.0,
+            root_kind.inner_r,
+            root_kind.outer_r,
+            camera.pos,
+            ray_dir,
+        );
+    } else {
+        result = march(camera.pos, ray_dir);
+    }
 
     var color: vec3<f32>;
     if result.hit {

@@ -108,16 +108,26 @@ impl App {
         // too weak to close even a small spawn-above gap in a
         // reasonable time, so place the camera on the surface Y
         // directly rather than above it + wait-for-gravity.
-        let spawn_y = (setup.center[1] + setup.outer_r).min(2.99);
+        // Spawn just above the outer shell (r = outer_r + tiny) so
+        // the camera sits inside the body cell's shell region rather
+        // than on the exact boundary. `from_world_pos_in_tree` walks
+        // the real tree, dispatching on NodeKind so the path is
+        // valid through body and face subtrees.
+        let spawn_y = (setup.center[1] + setup.outer_r - 0.002).min(2.99);
         let spawn_pos = [setup.center[0], spawn_y, setup.center[2]];
         let spawn_depth = (tree_depth as i32 - 10).clamp(1, tree_depth as i32) as u8;
+        let spawn_position = crate::world::position::Position::from_world_pos_in_tree(
+            spawn_pos,
+            spawn_depth,
+            &world.library,
+            world.root,
+        );
 
         Self {
             window: None,
             renderer: None,
-            camera: Camera::at_spawn(
-                spawn_pos,
-                spawn_depth,
+            camera: Camera::at_position(
+                spawn_position,
                 [0.0, 1.0, 0.0],
                 0.0,
                 -0.3,
@@ -165,7 +175,8 @@ impl App {
         );
 
         if let Some(renderer) = &self.renderer {
-            renderer.update_camera(&self.camera.gpu_camera(1.2, self.render_root_depth()));
+            let pos = self.camera_pos_in_render_frame();
+            renderer.update_camera(&self.camera.gpu_camera(1.2, pos));
         }
     }
 }
