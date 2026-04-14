@@ -133,6 +133,69 @@ impl Position {
         true
     }
 
+    /// Reconstruct absolute XYZ coordinates in the root cell's frame.
+    ///
+    /// The root cell has extent `[0, 3)` on each axis (its 27 children
+    /// cover `[0, 1), [1, 2), [2, 3)`). This shim exists so old
+    /// XYZ-expecting code paths can keep working during the migration;
+    /// step 6 deletes all callers.
+    pub fn world_pos(&self) -> [f32; 3] {
+        let d = self.depth as usize;
+        let mut out = [0.0f32; 3];
+        for k in 1..=d {
+            let slot = self.path[k - 1] as usize;
+            let (sx, sy, sz) = slot_coords(slot);
+            let scale = 3.0f32.powi(1 - k as i32);
+            out[0] += sx as f32 * scale;
+            out[1] += sy as f32 * scale;
+            out[2] += sz as f32 * scale;
+        }
+        let leaf_scale = 3.0f32.powi(1 - d as i32);
+        for axis in 0..3 {
+            out[axis] += self.offset[axis] * leaf_scale;
+        }
+        out
+    }
+
+    /// Inverse shim: construct a Position at the given tree depth
+    /// from absolute XYZ in the root cell's `[0, 3)³` frame. Clamps
+    /// out-of-range inputs. Used by XYZ-accepting setters during the
+    /// migration; step 6 deletes it.
+    pub fn from_world_pos(pos: [f32; 3], depth: u8) -> Self {
+        let d = depth as usize;
+        assert!(d <= MAX_DEPTH, "depth exceeds MAX_DEPTH");
+        let mut path = [0u8; MAX_DEPTH];
+        let clamp_hi = 3.0 - f32::EPSILON * 4.0;
+        let mut offset = [
+            (pos[0] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+            (pos[1] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+            (pos[2] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+        ];
+        // Re-clamp in case of NaN or tiny out-of-range drift.
+        for axis in 0..3 {
+            if pos[axis] >= clamp_hi {
+                offset[axis] = 1.0 - f32::EPSILON;
+            }
+        }
+        for k in 0..d {
+            let mut coords = [0usize; 3];
+            for axis in 0..3 {
+                let v = offset[axis] * 3.0;
+                let i = (v.floor() as i32).clamp(0, 2) as usize;
+                coords[axis] = i;
+                offset[axis] = v - i as f32;
+                if offset[axis] >= 1.0 {
+                    offset[axis] = 0.0;
+                    coords[axis] = (coords[axis] + 1).min(2);
+                } else if offset[axis] < 0.0 {
+                    offset[axis] = 0.0;
+                }
+            }
+            path[k] = slot_index(coords[0], coords[1], coords[2]) as u8;
+        }
+        Self { path, depth, offset }
+    }
+
     /// Integrate a velocity step: `offset += delta`, then carry across
     /// cell boundaries via [`step_neighbor`]. Clamps at the tree root
     /// if the carry bubbles past it.
@@ -393,6 +456,52 @@ mod tests {
         assert_eq!(p.slots(), &[slot_index(2, 1, 1) as u8]);
         assert!(p.offset[0] < 1.0);
         assert!(p.offset[0] > 0.99);
+    }
+
+    #[test]
+    fn world_pos_depth_0_is_offset_times_three() {
+        let p = Position { path: [0; MAX_DEPTH], depth: 0, offset: [0.25, 0.5, 0.75] };
+        assert_eq!(p.world_pos(), [0.75, 1.5, 2.25]);
+    }
+
+    #[test]
+    fn world_pos_depth_1_matches_cell_origin_plus_offset() {
+        // Cell (2, 1, 0) at root has LL = (2, 1, 0); cell size 1.
+        let p = pos_at(&[slot_index(2, 1, 0) as u8], [0.5; 3]);
+        let w = p.world_pos();
+        assert!((w[0] - 2.5).abs() < 1e-5);
+        assert!((w[1] - 1.5).abs() < 1e-5);
+        assert!((w[2] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn world_pos_depth_2_matches_nested_cell() {
+        let p = pos_at(
+            &[slot_index(1, 0, 0) as u8, slot_index(2, 0, 0) as u8],
+            [0.5, 0.0, 0.0],
+        );
+        // Expected: 1 + 2/3 + 0.5 * 1/3 = 1.8333
+        let w = p.world_pos();
+        assert!((w[0] - (1.0 + 2.0 / 3.0 + 0.5 / 3.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn world_pos_round_trip_at_various_depths() {
+        for depth in [1u8, 5, 10, 15] {
+            let original = [1.234, 0.567, 2.891];
+            let p = Position::from_world_pos(original, depth);
+            let back = p.world_pos();
+            for axis in 0..3 {
+                assert!(
+                    (back[axis] - original[axis]).abs() < 1e-3,
+                    "depth {} axis {} drifted: {} vs {}",
+                    depth,
+                    axis,
+                    back[axis],
+                    original[axis]
+                );
+            }
+        }
     }
 
     #[test]

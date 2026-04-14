@@ -92,12 +92,13 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            camera: Camera {
-                pos: spawn_pos,
-                smoothed_up: [0.0, 1.0, 0.0],
-                yaw: 0.0,
-                pitch: -0.3,
-            },
+            camera: Camera::at_world_pos(
+                spawn_pos,
+                tree_depth as u8,
+                [0.0, 1.0, 0.0],
+                0.0,
+                -0.3,
+            ),
             velocity: [0.0, 0.0, 0.0],
             world,
             cursor_locked: false,

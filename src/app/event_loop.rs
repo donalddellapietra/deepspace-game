@@ -135,18 +135,19 @@ impl App {
         let steps = self.zoom_level - old_zoom;
         if steps != 0 {
             let ray_dir = self.camera.forward();
+            let cam_pos = self.camera.world_pos();
             let hit = edit::cpu_raycast(
                 &self.world.library,
                 self.world.root,
-                self.camera.pos,
+                cam_pos,
                 ray_dir,
                 self.edit_depth(),
             );
             let anchor = if let Some(h) = hit {
                 [
-                    self.camera.pos[0] + ray_dir[0] * h.t,
-                    self.camera.pos[1] + ray_dir[1] * h.t,
-                    self.camera.pos[2] + ray_dir[2] * h.t,
+                    cam_pos[0] + ray_dir[0] * h.t,
+                    cam_pos[1] + ray_dir[1] * h.t,
+                    cam_pos[2] + ray_dir[2] * h.t,
                 ]
             } else {
                 // No hit — anchor at a reasonable distance ahead.
@@ -154,15 +155,18 @@ impl App {
                 let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
                 let d = cell_size * 10.0;
                 [
-                    self.camera.pos[0] + ray_dir[0] * d,
-                    self.camera.pos[1] + ray_dir[1] * d,
-                    self.camera.pos[2] + ray_dir[2] * d,
+                    cam_pos[0] + ray_dir[0] * d,
+                    cam_pos[1] + ray_dir[1] * d,
+                    cam_pos[2] + ray_dir[2] * d,
                 ]
             };
             let scale = 3.0f32.powi(-steps);
-            for i in 0..3 {
-                self.camera.pos[i] = anchor[i] + (self.camera.pos[i] - anchor[i]) * scale;
-            }
+            let new_pos = [
+                anchor[0] + (cam_pos[0] - anchor[0]) * scale,
+                anchor[1] + (cam_pos[1] - anchor[1]) * scale,
+                anchor[2] + (cam_pos[2] - anchor[2]) * scale,
+            ];
+            self.camera.set_world_pos(new_pos);
         }
     }
 
@@ -188,7 +192,7 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_pos: self.camera.pos,
+                    camera_pos: self.camera.world_pos(),
                     fov: 1.2,
                     node_count: self.world.library.len(),
                 },
