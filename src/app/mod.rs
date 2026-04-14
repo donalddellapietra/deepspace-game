@@ -85,13 +85,12 @@ impl App {
             world.library.len(),
         );
 
-        // Spawn on the planet's north-pole surface at layer 10
-        // (edit_depth = tree_depth - 10). The camera anchors at
-        // depth = tree_depth - 10 so scroll-zoom descends from there.
-        // Y just clears the outer shell so gravity catches the player
-        // immediately instead of dropping them through it.
-        let surface_clearance = 0.001_f32;
-        let spawn_y = (setup.center[1] + setup.outer_r + surface_clearance).min(2.99);
+        // Spawn exactly on the outer shell of the planet at layer 10.
+        // At depth = tree_depth - 10 the cell_size-scaled gravity is
+        // too weak to close even a small spawn-above gap in a
+        // reasonable time, so place the camera on the surface Y
+        // directly rather than above it + wait-for-gravity.
+        let spawn_y = (setup.center[1] + setup.outer_r).min(2.99);
         let spawn_pos = [setup.center[0], spawn_y, setup.center[2]];
         let spawn_depth = (tree_depth as i32 - 10).clamp(1, tree_depth as i32) as u8;
 

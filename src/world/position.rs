@@ -155,32 +155,36 @@ impl Position {
         let a = ancestor_depth as usize;
         assert!(a <= d, "ancestor_depth {} > depth {}", a, d);
         let n = (d - a) as i32;
-        // Accumulate slot contributions in f64 via Horner's scheme,
-        // then rescale once to the ancestor's [0, 3)³ frame and cast
-        // back to f32. Summing the per-slot terms directly in f32
-        // loses about 1 ulp per level — at depth ≥ 10 the cumulative
-        // error exceeds one voxel at visual_depth (= depth + 3),
-        // which shows up as the shader rendering cells a voxel off
-        // from where they're packed ("faces sticking out"). Staying
-        // in f64 through the summation keeps the final f32 within
-        // one native ulp regardless of path length.
-        let mut acc = [0.0f64; 3];
+        // Horner in f32: each slot is 0/1/2 and the running
+        // accumulator is the integer `Σ slot_k * 3^(d-k)`. That
+        // integer stays exact in f32 as long as 3^n ≤ 2^24
+        // (i.e. n ≤ 15), so for ancestor depths within 15 levels of
+        // the camera the final XYZ lands within one native f32 ulp
+        // without any f64 pass. Summing the per-slot terms directly
+        // in f32 instead loses ~1 ulp per level and was the cause of
+        // the "faces stick out" artifact at moderate zoom depths.
+        //
+        // Worlds that anchor the camera more than 15 levels below
+        // the render root still risk precision blow-up: the real fix
+        // is the dynamic render-root selection in §3a of
+        // refactor-decisions.md, which keeps `n` small by construction
+        // but requires the shader-side work from step 9 to follow
+        // the frame shift. Until that lands, callers should keep
+        // `render_root_depth` close enough to `camera.depth` to
+        // honor the n ≤ 15 bound.
+        let mut acc = [0.0f32; 3];
         for k in (a + 1)..=d {
             let slot = self.path[k - 1] as usize;
             let (sx, sy, sz) = slot_coords(slot);
-            acc[0] = acc[0] * 3.0 + sx as f64;
-            acc[1] = acc[1] * 3.0 + sy as f64;
-            acc[2] = acc[2] * 3.0 + sz as f64;
+            acc[0] = acc[0] * 3.0 + sx as f32;
+            acc[1] = acc[1] * 3.0 + sy as f32;
+            acc[2] = acc[2] * 3.0 + sz as f32;
         }
         for axis in 0..3 {
-            acc[axis] += self.offset[axis] as f64;
+            acc[axis] += self.offset[axis];
         }
-        let scale = 3.0f64.powi(1 - n);
-        [
-            (acc[0] * scale) as f32,
-            (acc[1] * scale) as f32,
-            (acc[2] * scale) as f32,
-        ]
+        let scale = 3.0f32.powi(1 - n);
+        [acc[0] * scale, acc[1] * scale, acc[2] * scale]
     }
 
     /// Reconstruct absolute XYZ coordinates in the root cell's frame.
