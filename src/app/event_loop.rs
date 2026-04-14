@@ -41,18 +41,7 @@ impl ApplicationHandler for App {
         crate::platform::prepare_window(&window);
 
         let (tree_data, kinds_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
-        let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, &kinds_data, root_index));
-        // The planet was generated in App::new(), BEFORE the event
-        // loop, so `resumed()` is cheap. Here we just upload the
-        // pre-built handles to the GPU.
-        if let Some(planet) = self.cs_planet.as_ref() {
-            renderer.set_cubed_sphere_planet(
-                planet.center,
-                planet.inner_r,
-                planet.outer_r,
-                planet.depth,
-            );
-        }
+        let renderer = pollster::block_on(Renderer::new(window, &tree_data, &kinds_data, root_index));
         self.renderer = Some(renderer);
         self.apply_zoom(); // sync renderer max_depth with initial zoom_level
         self.last_frame = std::time::Instant::now();
