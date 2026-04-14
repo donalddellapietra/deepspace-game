@@ -15,7 +15,6 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::renderer::Renderer;
-use crate::world::edit;
 use crate::world::gpu;
 
 use super::App;
@@ -116,58 +115,21 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// Mouse-wheel zoom: change `zoom_level`, then translate the
-    /// camera along its forward ray so the block under the crosshair
-    /// stays the same visible size. Each zoom step is 3× finer/coarser.
+    /// Mouse-wheel zoom: descend or ascend the camera's anchor one
+    /// level. The coordinate primitive handles re-expressing the
+    /// world point in the finer/coarser frame; no manual XYZ rescale.
     fn handle_scroll_zoom(&mut self, delta: winit::event::MouseScrollDelta) {
         let y = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => y,
             winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
         };
-        let old_zoom = self.zoom_level;
-        // Scroll up = zoom in (finer), scroll down = zoom out (coarser).
+        // Scroll up = zoom in (anchor descends), scroll down = zoom out.
         if y > 0.0 {
-            self.zoom_level -= 1;
+            self.camera.position.zoom_in();
         } else if y < 0.0 {
-            self.zoom_level += 1;
+            self.camera.position.zoom_out();
         }
         self.apply_zoom();
-        let steps = self.zoom_level - old_zoom;
-        if steps != 0 {
-            let ray_dir = self.camera.forward();
-            let cam_pos = self.camera.world_pos_f32();
-            let hit = edit::cpu_raycast(
-                &self.world.library,
-                self.world.root,
-                cam_pos,
-                ray_dir,
-                self.edit_depth(),
-            );
-            let anchor = if let Some(h) = hit {
-                [
-                    cam_pos[0] + ray_dir[0] * h.t,
-                    cam_pos[1] + ray_dir[1] * h.t,
-                    cam_pos[2] + ray_dir[2] * h.t,
-                ]
-            } else {
-                // No hit — anchor at a reasonable distance ahead.
-                let td = self.tree_depth as i32;
-                let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
-                let d = cell_size * 10.0;
-                [
-                    cam_pos[0] + ray_dir[0] * d,
-                    cam_pos[1] + ray_dir[1] * d,
-                    cam_pos[2] + ray_dir[2] * d,
-                ]
-            };
-            let scale = 3.0f32.powi(-steps);
-            let new_pos = [
-                anchor[0] + (cam_pos[0] - anchor[0]) * scale,
-                anchor[1] + (cam_pos[1] - anchor[1]) * scale,
-                anchor[2] + (cam_pos[2] - anchor[2]) * scale,
-            ];
-            self.camera.set_world_pos_f32(new_pos);
-        }
     }
 
     /// One full frame: webview sync, per-frame state push, physics,
@@ -188,7 +150,7 @@ impl App {
                     } else {
                         0.0
                     },
-                    zoom_level: self.zoom_level,
+                    zoom_level: self.legacy_zoom_level(),
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),

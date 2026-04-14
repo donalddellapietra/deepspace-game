@@ -23,32 +23,50 @@ use super::App;
 pub(super) const RENDER_FRAME_K: u8 = 3;
 
 impl App {
-    /// CPU raycast depth: tree_depth - zoom_level.
-    /// zoom_level 0 = finest blocks, higher = coarser.
+    /// CPU raycast depth: the camera's anchor depth. Zoom is no
+    /// longer a separate "edit depth" knob — the raycast resolves at
+    /// whatever layer the camera is anchored in.
     pub(super) fn edit_depth(&self) -> u32 {
-        let td = self.tree_depth as i32;
-        (td - self.zoom_level).max(1) as u32
+        let d = self.camera.position.anchor.depth() as u32;
+        d.max(1)
     }
 
-    /// GPU visual depth: edit_depth + 3 (see 27×27×27 detail).
+    /// GPU visual depth: `edit_depth + 3` (the ~27×27×27 surround
+    /// you can see from your cell).
     pub(super) fn visual_depth(&self) -> u32 {
         (self.edit_depth() + 3).min(16)
     }
 
-    /// Clamp zoom and sync GPU depth.
+    /// Legacy zoom_level value exposed to the overlay / debug UI.
+    /// Preserved so external consumers (the React overlay) keep
+    /// rendering the old numeric scale: `tree_depth - anchor_depth`.
+    pub(super) fn legacy_zoom_level(&self) -> i32 {
+        (self.tree_depth as i32 - self.camera.position.anchor.depth() as i32).max(0)
+    }
+
+    /// Sync the renderer and overlay with the current anchor depth.
+    /// Called after every zoom_in/zoom_out and after worldgen, so a
+    /// single entry point owns the "depth changed — redraw" plumbing.
     pub(super) fn apply_zoom(&mut self) {
-        let td = self.tree_depth as i32;
-        self.zoom_level = self.zoom_level.clamp(0, (td - 1).max(0));
-        self.ui.zoom_level = self.zoom_level;
+        // Clamp the camera's anchor depth into the instantiated
+        // portion of the tree. If the player has zoomed past the
+        // finest layer the tree has spelled out, pop back up.
+        let max_depth = (self.tree_depth.saturating_sub(1)).max(1) as u8;
+        while self.camera.position.anchor.depth() > max_depth {
+            self.camera.position.zoom_out();
+        }
+        let zl = self.legacy_zoom_level();
+        self.ui.zoom_level = zl;
         let vd = self.visual_depth();
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
             renderer.update_camera(&self.camera.gpu_camera(1.2));
         }
         log::info!(
-            "Zoom: {}/{}, edit_depth: {}, visual: {}",
-            self.zoom_level,
-            td,
+            "Anchor depth: {}/{} (legacy zoom: {}), edit_depth: {}, visual: {}",
+            self.camera.position.anchor.depth(),
+            self.tree_depth,
+            zl,
             self.edit_depth(),
             vd
         );
@@ -57,7 +75,6 @@ impl App {
     pub(super) fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
-        let zoom_level = self.zoom_level;
         let camera_pos = self.camera.world_pos_f32();
 
         // Spherical-tree break: clear the targeted subtree if the
@@ -67,7 +84,6 @@ impl App {
             self.cs_planet.as_mut(),
             camera_pos,
             ray_dir,
-            zoom_level,
             edit_depth,
         ) {
             return;
@@ -122,7 +138,6 @@ impl App {
     pub(super) fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
-        let zoom_level = self.zoom_level;
         let camera_pos = self.camera.world_pos_f32();
 
         // Spherical place: fill the cell adjacent to the first solid
@@ -134,7 +149,6 @@ impl App {
                 self.cs_planet.as_mut(),
                 camera_pos,
                 ray_dir,
-                zoom_level,
                 edit_depth,
                 block_type,
             ) {
@@ -281,7 +295,7 @@ impl App {
         // Cubed-sphere cursor. Highlight depth comes from the same
         // `cs_edit_depth` the break path uses, so what you see is
         // exactly what you break.
-        let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.zoom_level);
+        let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.edit_depth());
         let cs_hit = self.cs_planet.as_ref().and_then(|p| {
             p.raycast(&self.world.library, self.camera.world_pos_f32(), ray_dir, cs_depth)
         });
