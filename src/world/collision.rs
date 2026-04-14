@@ -19,8 +19,6 @@ pub const PLAYER_H: f32 = 1.7;
 
 /// Gravity in collision-grid cells per second squared.
 const GRAVITY: f32 = 20.0;
-/// Jump impulse in collision-grid cells per second.
-const JUMP_IMPULSE: f32 = 8.0;
 /// Maximum downward velocity (terminal velocity).
 const MAX_FALL_SPEED: f32 = 40.0;
 
@@ -35,15 +33,6 @@ impl Default for PlayerPhysics {
         Self {
             velocity_y: 0.0,
             on_ground: false,
-        }
-    }
-}
-
-impl PlayerPhysics {
-    pub fn jump(&mut self) {
-        if self.on_ground {
-            self.velocity_y = JUMP_IMPULSE;
-            self.on_ground = false;
         }
     }
 }

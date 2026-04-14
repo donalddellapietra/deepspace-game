@@ -9,9 +9,9 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use deepspace_game::game_state::{GameUiState, HotbarItem, SavedMeshes};
+use deepspace_game::interaction::{self, MoveInput};
 use deepspace_game::renderer::Renderer;
-// Collision module exists but is disabled pending proper layer-aware probing.
-// use deepspace_game::world::collision::{self, PlayerPhysics};
+use deepspace_game::world::collision::PlayerPhysics;
 use deepspace_game::world::edit;
 use deepspace_game::world::gpu::{self, GpuCamera};
 use deepspace_game::world::palette::ColorRegistry;
@@ -71,6 +71,8 @@ impl Camera {
 struct Keys {
     w: bool, a: bool, s: bool, d: bool,
     space: bool, shift: bool,
+    /// One-shot flag: set on press, consumed by [`take_input`].
+    space_just_pressed: bool,
 }
 
 impl Keys {
@@ -80,10 +82,26 @@ impl Keys {
             KeyCode::KeyA => self.a = pressed,
             KeyCode::KeyS => self.s = pressed,
             KeyCode::KeyD => self.d = pressed,
-            KeyCode::Space => self.space = pressed,
+            KeyCode::Space => {
+                if pressed && !self.space {
+                    self.space_just_pressed = true;
+                }
+                self.space = pressed;
+            }
             KeyCode::ShiftLeft => self.shift = pressed,
             _ => {}
         }
+    }
+
+    /// Build a [`MoveInput`] and consume the one-shot jump flag.
+    fn take_input(&mut self) -> MoveInput {
+        let forward = if self.w { 1.0 } else { 0.0 }
+                    + if self.s { -1.0 } else { 0.0 };
+        let strafe  = if self.d { 1.0 } else { 0.0 }
+                    + if self.a { -1.0 } else { 0.0 };
+        let jump = self.space_just_pressed;
+        self.space_just_pressed = false;
+        MoveInput { forward, strafe, jump, sprint: self.shift }
     }
 
     fn clear(&mut self) {
@@ -104,6 +122,7 @@ struct App {
     zoom_level: i32,
     /// Cached tree depth (recomputed only after edits).
     tree_depth: u32,
+    physics: PlayerPhysics,
     palette: ColorRegistry,
     saved_meshes: SavedMeshes,
     save_mode: bool,
@@ -139,6 +158,7 @@ impl App {
             // zoom_level = tree_depth - 6.
             zoom_level: (tree_depth as i32 - 6).max(0),
             tree_depth,
+            physics: PlayerPhysics::default(),
             palette: ColorRegistry::new(),
             saved_meshes: SavedMeshes::default(),
             save_mode: false,
@@ -151,32 +171,22 @@ impl App {
     }
 
     fn update(&mut self, dt: f32) {
-        // Speed: ~5 interaction-layer cells/second regardless of zoom.
         let td = self.tree_depth as i32;
         let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
-        let speed = 5.0 * cell_size;
+        let input = self.keys.take_input();
+        let depth = self.edit_depth();
 
-        let fwd = self.camera.forward_xz();
-        let right = self.camera.right();
-
-        let mut dx = 0.0f32;
-        let mut dy = 0.0f32;
-        let mut dz = 0.0f32;
-
-        if self.keys.w { dx += fwd[0]; dz += fwd[2]; }
-        if self.keys.s { dx -= fwd[0]; dz -= fwd[2]; }
-        if self.keys.d { dx += right[0]; dz += right[2]; }
-        if self.keys.a { dx -= right[0]; dz -= right[2]; }
-        if self.keys.space { dy += 1.0; }
-        if self.keys.shift { dy -= 1.0; }
-
-        let len = (dx * dx + dy * dy + dz * dz).sqrt();
-        if len > 0.001 {
-            let s = speed * dt / len;
-            self.camera.pos[0] += dx * s;
-            self.camera.pos[1] += dy * s;
-            self.camera.pos[2] += dz * s;
-        }
+        interaction::tick(
+            &mut self.camera.pos,
+            &mut self.physics,
+            &input,
+            self.camera.yaw,
+            dt,
+            cell_size,
+            &self.world.library,
+            self.world.root,
+            depth,
+        );
 
         if let Some(renderer) = &self.renderer {
             renderer.update_camera(&self.camera.gpu_camera(1.2));

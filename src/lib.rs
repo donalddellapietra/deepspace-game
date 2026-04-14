@@ -1,5 +1,6 @@
 pub mod world;
 pub mod import;
+pub mod interaction;
 pub mod renderer;
 pub mod bridge;
 pub mod game_state;
