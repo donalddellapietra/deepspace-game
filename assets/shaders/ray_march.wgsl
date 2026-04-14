@@ -32,12 +32,23 @@ struct Uniforms {
     _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    // Cubed-sphere demo planet: xyz = world-space center,
+    //                           w   = outer radius (0 disables).
+    cs_planet: vec4<f32>,
+    // x = cells per cube-face edge (integer-valued f32).
+    cs_params: vec4<f32>,
+    // Cursor cell highlight. x = face (as f32), y = cell i, z = cell j,
+    // w = active (0 or 1).
+    cs_highlight: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
 @group(0) @binding(1) var<uniform> camera: Camera;
 @group(0) @binding(2) var<uniform> palette: Palette;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
+// Cubed-sphere planet's per-cell block palette indices, flat layout
+// `[face * N*N + j * N + i]`. One u32 per cell for simple indexing.
+@group(0) @binding(4) var<storage, read> cs_blocks: array<u32>;
 
 // -------------- Tree access helpers --------------
 
@@ -386,13 +397,161 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let result = march(camera.pos, ray_dir);
 
+    // Overlay pass: the demo cubed-sphere planet. Rendered as a
+    // ray-sphere intersection; per-fragment we compute (face, u, v)
+    // in cubed-sphere space, discretize to a cell, and shade with:
+    //   - a per-(face, cell) hash color so the grid is visible,
+    //   - dark lines at cell boundaries = the bulged-square edges,
+    //   - bolder lines at cube-face seams (|u| or |v| == 1).
+    //
+    // Composited by depth: if the sphere hits closer than the tree
+    // march, it wins. Whenever you look at the planet, the voxel-like
+    // cells will feel flat at the surface and visibly curved/bulged
+    // when zoomed out — which is the whole point of the cubed-sphere
+    // representation.
+    var cs_hit = false;
+    var cs_t = 1e20;
+    var cs_color = vec3<f32>(0.0);
+    var cs_normal = vec3<f32>(0.0);
+    let cs_radius = uniforms.cs_planet.w;
+    if cs_radius > 0.0 {
+        let cs_center = uniforms.cs_planet.xyz;
+        let oc = camera.pos - cs_center;
+        let b = dot(oc, ray_dir);
+        let c = dot(oc, oc) - cs_radius * cs_radius;
+        let disc = b * b - c;
+        if disc > 0.0 {
+            let sq = sqrt(disc);
+            let t0 = -b - sq;
+            let t1 = -b + sq;
+            // Use the nearest positive root (camera outside) or the
+            // far root (camera inside the sphere).
+            let t_enter = select(t1, t0, t0 > 0.0);
+            if t_enter > 0.0 {
+                cs_hit = true;
+                cs_t = t_enter;
+                let hit_pos = camera.pos + ray_dir * t_enter;
+                let local = hit_pos - cs_center;
+                cs_normal = local / cs_radius;
+
+                // Pick the dominant face by |axis|; compute (u, v)
+                // in the face's tangent frame. Matches the Rust
+                // `world_to_coord` tangent choice 1:1.
+                let ax = abs(cs_normal.x);
+                let ay = abs(cs_normal.y);
+                let az = abs(cs_normal.z);
+                var face: u32 = 0u;
+                var u: f32 = 0.0;
+                var v: f32 = 0.0;
+                if ax >= ay && ax >= az {
+                    if cs_normal.x > 0.0 {
+                        face = 0u; u = -cs_normal.z / ax; v =  cs_normal.y / ax;
+                    } else {
+                        face = 1u; u =  cs_normal.z / ax; v =  cs_normal.y / ax;
+                    }
+                } else if ay >= az {
+                    if cs_normal.y > 0.0 {
+                        face = 2u; u =  cs_normal.x / ay; v = -cs_normal.z / ay;
+                    } else {
+                        face = 3u; u =  cs_normal.x / ay; v =  cs_normal.z / ay;
+                    }
+                } else {
+                    if cs_normal.z > 0.0 {
+                        face = 4u; u =  cs_normal.x / az; v =  cs_normal.y / az;
+                    } else {
+                        face = 5u; u = -cs_normal.x / az; v =  cs_normal.y / az;
+                    }
+                }
+
+                // Discretize to cells. cells_per_face is an f32 for
+                // alignment convenience; treat as integer.
+                let cells = max(uniforms.cs_params.x, 1.0);
+                // Map (u, v) from [-1, 1] to [0, cells].
+                let ug = (u + 1.0) * 0.5 * cells;
+                let vg = (v + 1.0) * 0.5 * cells;
+                let iu = floor(ug);
+                let iv = floor(vg);
+                let cell_u = ug - iu;
+                let cell_v = vg - iv;
+
+                // Look up the cell's block type in the cubed-sphere
+                // storage buffer. Flat index: face * N*N + j * N + i.
+                let cells_i = u32(cells);
+                let ci = u32(clamp(iu, 0.0, cells - 1.0));
+                let cj = u32(clamp(iv, 0.0, cells - 1.0));
+                let cell_idx = face * cells_i * cells_i + cj * cells_i + ci;
+                let block_id = cs_blocks[cell_idx];
+                // 0 means empty — let the ray continue past the
+                // sphere as if it weren't there, so valleys / voids
+                // show through to whatever's behind.
+                if block_id == 0u {
+                    cs_hit = false;
+                }
+                var cell_color = palette.colors[block_id].rgb;
+
+                // Cell-boundary line. Width scales with screen-space
+                // pixel size so lines stay ~1-2 px thick at any zoom.
+                let pixel_world = max(cs_t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
+                // Arc length per cell ≈ (2 * cs_radius / cells) near a face center.
+                let cell_arc = 2.0 * cs_radius / cells;
+                let line_frac = clamp(pixel_world * 1.2 / cell_arc, 0.005, 0.05);
+                let edge = min(min(cell_u, 1.0 - cell_u), min(cell_v, 1.0 - cell_v));
+                let in_line = 1.0 - smoothstep(line_frac * 0.5, line_frac, edge);
+
+                // Stronger, darker line at cube-face seams: draw
+                // when (iu == 0 & cell_u small) or (iu == cells-1 &
+                // cell_u near 1), same for v. These mark the 12
+                // cube edges as prominent lines on the sphere.
+                let at_u_seam =
+                    (iu <= 0.5 && cell_u < line_frac) ||
+                    (iu >= cells - 0.5 && cell_u > 1.0 - line_frac);
+                let at_v_seam =
+                    (iv <= 0.5 && cell_v < line_frac) ||
+                    (iv >= cells - 0.5 && cell_v > 1.0 - line_frac);
+                let is_seam = at_u_seam || at_v_seam;
+
+                // Simple Lambert lighting from a fixed sun.
+                let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
+                let diffuse = max(dot(cs_normal, sun_dir), 0.0);
+                let ambient = 0.25;
+                let lit = cell_color * (ambient + diffuse * 0.75);
+
+                // Composite: cell body, cell edge (mid grey), seam (black).
+                var surface = lit;
+                surface = mix(surface, vec3<f32>(0.05, 0.05, 0.05), in_line);
+                if is_seam { surface = vec3<f32>(0.0); }
+
+                // Cursor highlight: when this fragment's cell is the
+                // selected one, overwrite the cell boundary in a
+                // bright yellow. The outline is the cell's own
+                // (u, v) edges, so on the sphere it reads as the
+                // bulged-square wireframe the player expects.
+                if uniforms.cs_highlight.w > 0.5 {
+                    let hl_face = u32(uniforms.cs_highlight.x);
+                    let hl_i = uniforms.cs_highlight.y;
+                    let hl_j = uniforms.cs_highlight.z;
+                    if face == hl_face && iu == hl_i && iv == hl_j {
+                        let hl_width = max(line_frac * 2.5, 0.05);
+                        if edge < hl_width {
+                            surface = vec3<f32>(1.0, 0.9, 0.2);
+                        }
+                    }
+                }
+                cs_color = surface;
+            }
+        }
+    }
+
     var color: vec3<f32>;
-    if result.hit {
+    let tree_closer = result.hit && result.t <= cs_t;
+    if tree_closer {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
         let lit = result.color * (ambient + diffuse * 0.7);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
+    } else if cs_hit {
+        color = pow(cs_color, vec3<f32>(1.0 / 2.2));
     } else {
         let sky_t = ray_dir.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);

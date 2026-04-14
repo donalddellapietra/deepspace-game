@@ -1,66 +1,11 @@
 //! Runtime world state: the content-addressed tree.
 
 use super::palette::block;
-use super::sdf::{self, Planet, Vec3};
 use super::tree::*;
 
 pub struct WorldState {
     pub root: NodeId,
     pub library: NodeLibrary,
-    /// Gravity sources placed in world-space [0, 3). Collision and
-    /// camera orientation query `dominant_planet(pos)` to decide
-    /// which (if any) planet's gravity applies at a given position.
-    pub planets: Vec<Planet>,
-}
-
-impl WorldState {
-    /// The planet whose influence sphere contains `pos` and whose
-    /// center is closest; `None` if `pos` is in empty space.
-    pub fn dominant_planet(&self, pos: Vec3) -> Option<&Planet> {
-        let mut best: Option<(&Planet, f32)> = None;
-        for p in &self.planets {
-            let d = sdf::length(sdf::sub(pos, p.center));
-            if d <= p.influence_radius {
-                match best {
-                    None => best = Some((p, d)),
-                    Some((_, bd)) if d < bd => best = Some((p, d)),
-                    _ => {}
-                }
-            }
-        }
-        best.map(|(p, _)| p)
-    }
-
-    /// Blended "up" direction at `pos`: contributions from each
-    /// planet whose influence reaches `pos`, plus a residual toward
-    /// world +Y. Weights taper smoothly from 1 at the planet surface
-    /// to 0 at the influence boundary, so flying into / out of
-    /// gravity rotates the horizon gradually instead of snapping.
-    pub fn blended_up(&self, pos: Vec3) -> Vec3 {
-        let mut accum = [0.0f32, 0.0, 0.0];
-        let mut total_weight = 0.0f32;
-        for p in &self.planets {
-            let to = sdf::sub(pos, p.center);
-            let r = sdf::length(to);
-            if r >= p.influence_radius || r < 1e-8 { continue; }
-            // t = 0 at surface, 1 at influence boundary.
-            let t = if r <= p.radius {
-                0.0
-            } else {
-                ((r - p.radius) / (p.influence_radius - p.radius).max(1e-6))
-                    .clamp(0.0, 1.0)
-            };
-            // Smoothstep falloff: full pull inside, zero at boundary.
-            let s = 1.0 - t;
-            let w = s * s * (3.0 - 2.0 * s);
-            accum = sdf::add(accum, sdf::scale(p.up_at(pos), w));
-            total_weight += w;
-        }
-        let world_up = [0.0f32, 1.0, 0.0];
-        let residual = (1.0 - total_weight).max(0.0);
-        accum = sdf::add(accum, sdf::scale(world_up, residual));
-        sdf::normalize(accum)
-    }
 }
 
 impl WorldState {
@@ -198,7 +143,7 @@ impl WorldState {
             library.len(),
         );
 
-        Self { root, library, planets: Vec::new() }
+        Self { root, library }
     }
 
     /// Compute the maximum depth of the tree from the root.

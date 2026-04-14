@@ -56,7 +56,7 @@ impl Camera {
     /// mouse-look feels consistent on a planet.
     fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
         let ref_up = self.smoothed_up;
-        let (t_right, t_fwd) = deepspace_game::world::collision::tangent_basis(ref_up);
+        let (t_right, t_fwd) = sdf::tangent_basis(ref_up);
         let (sy, cy) = self.yaw.sin_cos();
         // Positive yaw rotates counterclockwise around `ref_up`.
         let horiz_fwd = sdf::sub(sdf::scale(t_fwd, cy), sdf::scale(t_right, sy));
@@ -118,6 +118,47 @@ impl Keys {
     }
 }
 
+// ------------------------------------------------------------ Cubed-sphere demo
+
+#[derive(Copy, Clone)]
+struct CsDemo {
+    center: [f32; 3],
+    radius: f32,
+    cells: u32,
+}
+
+impl CsDemo {
+    /// Intersect a ray against the planet's outer shell. Returns the
+    /// entry t if the ray hits in front of the camera.
+    fn ray_t(&self, origin: [f32; 3], dir: [f32; 3]) -> Option<f32> {
+        let oc = sdf::sub(origin, self.center);
+        let b = sdf::dot(oc, dir);
+        let c = sdf::dot(oc, oc) - self.radius * self.radius;
+        let disc = b * b - c;
+        if disc <= 0.0 { return None; }
+        let sq = disc.sqrt();
+        let t0 = -b - sq;
+        let t1 = -b + sq;
+        if t0 > 0.0 { Some(t0) } else if t1 > 0.0 { Some(t1) } else { None }
+    }
+
+    /// Which (face, i, j) cell does this ray hit first on the shell?
+    fn hit_cell(&self, origin: [f32; 3], dir: [f32; 3])
+        -> Option<(f32, deepspace_game::world::cubesphere::Face, u32, u32)>
+    {
+        use deepspace_game::world::cubesphere::world_to_coord;
+        let t = self.ray_t(origin, dir)?;
+        let hit = sdf::add(origin, sdf::scale(dir, t));
+        let coord = world_to_coord(self.center, hit)?;
+        let n = self.cells as f32;
+        let ug = ((coord.u + 1.0) * 0.5 * n).floor();
+        let vg = ((coord.v + 1.0) * 0.5 * n).floor();
+        let i = (ug as i32).clamp(0, self.cells as i32 - 1) as u32;
+        let j = (vg as i32).clamp(0, self.cells as i32 - 1) as u32;
+        Some((t, coord.face, i, j))
+    }
+}
+
 // ------------------------------------------------------------ App
 
 struct App {
@@ -138,6 +179,10 @@ struct App {
     debug_overlay_visible: bool,
     /// Exponentially smoothed FPS for the debug overlay.
     fps_smooth: f64,
+    /// Cubed-sphere demo planet (center, outer radius, cells/face).
+    /// Used by the cursor raycast so the highlight can target
+    /// individual bulged cells on the sphere.
+    cs_demo: Option<CsDemo>,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -152,27 +197,16 @@ impl App {
         let world = deepspace_game::world::worldgen::generate_world();
         let tree_depth = world.tree_depth();
 
-        // Spawn well above the first planet's surface on +Y. The
-        // noise displacement can push the actual surface above the
-        // undisplaced radius, so we add a generous clearance so the
-        // player isn't accidentally embedded in terrain at spawn.
-        let spawn_pos = if let Some(p) = world.planets.first() {
-            [p.center[0], p.center[1] + p.radius + p.noise_scale * 3.0, p.center[2]]
-        } else {
-            [1.5, 1.75, 1.5]
-        };
-        let spawn_up = if let Some(p) = world.planets.first() {
-            p.up_at(spawn_pos)
-        } else {
-            [0.0, 1.0, 0.0]
-        };
+        // Spawn in empty space, facing toward the cubed-sphere demo
+        // planet (which is placed at [1.5, 2.3, 1.5]).
+        let spawn_pos = [1.5, 1.75, 1.5];
 
         Self {
             window: None,
             renderer: None,
             camera: Camera {
                 pos: spawn_pos,
-                smoothed_up: spawn_up,
+                smoothed_up: [0.0, 1.0, 0.0],
                 yaw: 0.0,
                 pitch: 0.0,
             },
@@ -191,6 +225,7 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
+            cs_demo: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -202,14 +237,10 @@ impl App {
         let td = self.tree_depth as i32;
         let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
 
-        // Orient the camera to the local gravity frame. `blended_up`
-        // gives a distance-weighted mix of each nearby planet's
-        // radial and world +Y — weight is full at the surface and
-        // tapers smoothly to zero at the influence boundary, so
-        // flying toward / away from a planet rotates the horizon
-        // gradually instead of snapping at a hard sphere.
-        let target_up = self.world.blended_up(self.camera.pos);
-        self.camera.update_up(target_up, dt);
+        // Camera's "up" relaxes toward world +Y. Later, when the
+        // cubed-sphere planet gets gravity, we'll blend in the
+        // planet's radial up here — for now this is pure flycam.
+        self.camera.update_up([0.0, 1.0, 0.0], dt);
 
         // Creative/flycam movement: WASD along camera forward/right,
         // Space/Shift along camera up. No collision, no gravity force.
@@ -359,16 +390,35 @@ impl App {
         if !self.cursor_locked {
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);
+                renderer.set_cubed_sphere_highlight(None);
             }
             return;
         }
         let ray_dir = self.camera.forward();
-        let hit = edit::cpu_raycast(
+        let tree_hit = edit::cpu_raycast(
             &self.world.library, self.world.root,
             self.camera.pos, ray_dir, self.edit_depth(),
         );
+        let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
+
+        // Cubed-sphere cursor: hit the demo planet's outer shell and
+        // report (face, i, j) for whichever cell the ray enters.
+        let cs_hit = self.cs_demo.and_then(|d| d.hit_cell(self.camera.pos, ray_dir));
+        let cs_t = cs_hit.map(|(t, ..)| t).unwrap_or(f32::INFINITY);
+
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_highlight(hit.as_ref().map(edit::hit_aabb));
+            if cs_t < tree_t {
+                // Cubed-sphere cell is in front — draw its bulged
+                // outline, hide the tree AABB highlight.
+                renderer.set_highlight(None);
+                if let Some((_, face, i, j)) = cs_hit {
+                    renderer.set_cubed_sphere_highlight(Some((face as u32, i, j)));
+                }
+            } else {
+                // Tree block (or nothing) is in front — normal AABB.
+                renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
+                renderer.set_cubed_sphere_highlight(None);
+            }
         }
     }
 
@@ -513,7 +563,43 @@ impl ApplicationHandler for App {
         self.window = Some(window.clone());
 
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
-        let renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
+        let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
+        // Demo cubed-sphere planet: 16 cells per face edge (96²
+        // surface cells total), SDF-driven terrain. The SDF's own
+        // radius is a touch smaller than the shell radius so noise
+        // produces both inland terrain and empty "seas" where the
+        // noise-displaced surface dips below the shell radius.
+        {
+            use deepspace_game::world::cubesphere::generate_from_sdf;
+            use deepspace_game::world::palette::block;
+            use deepspace_game::world::sdf::Planet as SdfPlanet;
+            let cs_center = [1.5, 2.3, 1.5];
+            let cs_radius = 0.35;
+            let cells_per_face = 16u32;
+            // SDF radius is slightly LARGER than the shell radius so
+            // most cells read as "below surface" (= solid). Noise
+            // then carves the occasional valley / sea where the
+            // displaced surface dips below the shell.
+            let sdf = SdfPlanet {
+                center: cs_center,
+                radius: cs_radius + 0.03,
+                noise_scale: 0.05,
+                noise_freq: 14.0,
+                noise_seed: 2024,
+                gravity: 9.8,
+                influence_radius: cs_radius * 2.5,
+                surface_block: block::GRASS,
+                core_block: block::STONE,
+            };
+            let planet = generate_from_sdf(cs_center, cs_radius, cells_per_face, &sdf);
+            renderer.set_cubed_sphere_planet(cs_center, cs_radius, cells_per_face);
+            renderer.set_cubed_sphere_blocks(&planet.blocks);
+            self.cs_demo = Some(CsDemo {
+                center: cs_center,
+                radius: cs_radius,
+                cells: cells_per_face,
+            });
+        }
         self.renderer = Some(renderer);
         self.apply_zoom(); // sync renderer max_depth with initial zoom_level
         self.last_frame = std::time::Instant::now();

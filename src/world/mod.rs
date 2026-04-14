@@ -3,6 +3,6 @@ pub mod palette;
 pub mod state;
 pub mod gpu;
 pub mod edit;
-pub mod collision;
 pub mod sdf;
+pub mod cubesphere;
 pub mod worldgen;
