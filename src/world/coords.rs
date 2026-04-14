@@ -162,14 +162,14 @@ impl std::fmt::Debug for Path {
     }
 }
 
-// -------------------------------------------- legacy-world-coord bridge
+// -------------------------------------------- world-frame conversions
 //
-// The legacy engine represents world positions as `[f32; 3]` in a
-// fixed root frame spanning `[0, ROOT_EXTENT)³`. These helpers convert
-// between that representation and the new `WorldPos`, so we can
-// migrate the engine incrementally: the camera and player carry a
-// `WorldPos` internally, but external call sites (shaders, editing,
-// collision) keep reading legacy XYZ through `world_pos_f32`.
+// The shader, GPU packer, and editing code operate in an absolute
+// world frame spanning `[0, ROOT_EXTENT)³`. These helpers project
+// `WorldPos` into that frame and back so those systems can continue
+// to consume plain `[f32; 3]`s. The `WorldPos` remains the
+// authoritative identity of a point; the f32 form is a derived
+// view used at system boundaries.
 
 /// World extent spanned by the root cell in legacy coordinates.
 /// Matches the shader and `gpu.rs` where "root node cells are 1.0

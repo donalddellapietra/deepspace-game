@@ -61,6 +61,10 @@ pub struct App {
     /// Cubed-sphere demo planet — owns per-cell block storage and
     /// the shell geometry used for cursor raycasts and editing.
     pub(super) cs_planet: Option<crate::world::cubesphere::SphericalPlanet>,
+    /// Anchor path from `world.root` to the sphere body node. Used
+    /// by gravity and render math to derive the body's world-space
+    /// center without a separate `center: [f32; 3]` field.
+    pub(super) body_anchor: crate::world::coords::Path,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -77,18 +81,30 @@ impl App {
         // key (title bar grayed out, clicks ignored). Doing all
         // heavy work before `run_app` keeps `resumed()` a fast
         // "create window + hand pre-built data to GPU" path.
-        let mut world = crate::world::worldgen::generate_world();
-        let tree_depth = world.tree_depth();
-
         let setup = crate::world::spherical_worldgen::demo_planet();
-        let cs_planet = crate::world::spherical_worldgen::build(&mut world.library, &setup);
+        let scene = crate::world::spherical_worldgen::build(&setup);
+        let tree_depth = scene.world.tree_depth();
         eprintln!(
-            "Spherical planet generated: 6 face subtrees, library now {} nodes",
-            world.library.len(),
+            "Generated scene: body anchored at {:?}, tree_depth {}, library {} nodes",
+            scene.body_anchor, tree_depth, scene.world.library.len(),
         );
 
-        // Spawn above the cubed-sphere planet's north pole.
-        let spawn_pos = [setup.center[0], setup.center[1] + setup.outer_r + 0.3, setup.center[2]];
+        // Body's world-space center: the anchor cell's center (local
+        // offset = 0.5 on every axis), which equals the slot-coords
+        // times the cell size plus half a cell. Spawn one 30%-outer-r
+        // hop above the north pole.
+        let body_center = crate::world::coords::world_pos_to_f32(
+            &crate::world::coords::WorldPos { anchor: scene.body_anchor, offset: [0.5, 0.5, 0.5] },
+        );
+        let spawn_pos = [
+            body_center[0],
+            body_center[1] + setup.outer_r + 0.3,
+            body_center[2],
+        ];
+
+        let world = scene.world;
+        let cs_planet = scene.planet;
+        let body_anchor = scene.body_anchor;
 
         Self {
             window: None,
@@ -112,6 +128,7 @@ impl App {
             debug_overlay_visible: false,
             fps_smooth: 0.0,
             cs_planet: Some(cs_planet),
+            body_anchor,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -136,7 +153,7 @@ impl App {
             &mut self.velocity,
             &self.keys,
             cell_size,
-            self.cs_planet.as_ref(),
+            &self.body_anchor,
             &self.world.library,
             self.world.root,
             dt,

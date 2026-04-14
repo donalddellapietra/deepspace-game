@@ -2,10 +2,9 @@
 
 use crate::camera::Camera;
 use crate::input::Keys;
-use crate::world::coords::ROOT_EXTENT;
-use crate::world::cubesphere::SphericalPlanet;
+use crate::world::coords::{self, Path, ROOT_EXTENT, WorldPos};
 use crate::world::sdf;
-use crate::world::tree::{NodeId, NodeLibrary};
+use crate::world::tree::{NodeId, NodeKind, NodeLibrary};
 
 /// Step the camera forward one frame.
 ///
@@ -19,26 +18,25 @@ use crate::world::tree::{NodeId, NodeLibrary};
 ///
 /// Movement mutates `camera.position` via `WorldPos::add_local`, so
 /// the player crosses cell boundaries exactly (anchor re-anchors
-/// on overflow, offset stays in `[0, 1)³`). Gravity/thrust math still
-/// reads the legacy `[f32; 3]` via the `world_pos_f32` shim — the
-/// gravity center of the demo planet is a world-space point, so
-/// there's no benefit yet from expressing it anchor-relative. That
-/// migration comes when the cubed-sphere body becomes a tree node.
+/// on overflow, offset stays in `[0, 1)³`). Gravity reads the body
+/// node's world-space center through `coords::world_pos_to_f32` +
+/// the body's anchor path; the same conversion the GPU uses.
 pub fn update(
     camera: &mut Camera,
     velocity: &mut [f32; 3],
     keys: &Keys,
     cell_size: f32,
-    cs_planet: Option<&SphericalPlanet>,
+    body_anchor: &Path,
     library: &NodeLibrary,
     world_root: NodeId,
     dt: f32,
 ) {
     let world_up = [0.0f32, 1.0, 0.0];
-    let (target_up, gravity_acc) = if let Some(p) = cs_planet {
-        let to_player = sdf::sub(camera.world_pos_f32(), p.center);
+    let body = resolve_body(library, world_root, body_anchor);
+    let (target_up, gravity_acc) = if let Some(body) = body {
+        let to_player = sdf::sub(coords::world_pos_to_f32(&camera.position), body.center);
         let r = sdf::length(to_player);
-        let surface_r = p.outer_r;
+        let surface_r = body.outer_r_world;
         let influence_r = surface_r * 2.0;
         let weight = if r <= surface_r {
             1.0
@@ -118,6 +116,44 @@ pub fn update(
         step_world[2] / cell_world,
     ];
     let _transition = camera.position.add_local(delta_local, library, world_root);
-    // Sphere entry/exit/seam transitions will be dispatched here once
-    // the cubed-sphere body is represented as a tree node (step 8).
+}
+
+/// World-space resolution of the sphere body at `body_anchor`: its
+/// center (anchor-cell's local 0.5 offset, mapped through
+/// `world_pos_to_f32`) plus the outer radius in world units (the
+/// body cell's world side length times `outer_r` from the kind
+/// payload).
+struct ResolvedBody {
+    center: [f32; 3],
+    outer_r_world: f32,
+}
+
+fn resolve_body(
+    lib: &NodeLibrary,
+    world_root: NodeId,
+    body_anchor: &Path,
+) -> Option<ResolvedBody> {
+    // Walk from world_root down body_anchor to the body node.
+    let mut id = world_root;
+    for &slot in body_anchor.slots() {
+        let node = lib.get(id)?;
+        match node.children[slot as usize] {
+            crate::world::tree::Child::Node(child_id) => { id = child_id; }
+            _ => return None,
+        }
+    }
+    let body_node = lib.get(id)?;
+    let (inner_r, outer_r) = match body_node.kind {
+        NodeKind::CubedSphereBody { inner_r, outer_r } => (inner_r, outer_r),
+        _ => return None,
+    };
+    let _ = inner_r;
+    // Body cell spans [origin, origin + cell_size) in world units,
+    // where cell_size = ROOT_EXTENT / 3^depth. Center = origin + 0.5·cell_size.
+    let center = coords::world_pos_to_f32(
+        &WorldPos { anchor: *body_anchor, offset: [0.5, 0.5, 0.5] },
+    );
+    let cell_size = ROOT_EXTENT / 3f32.powi(body_anchor.depth() as i32);
+    let outer_r_world = outer_r * cell_size;
+    Some(ResolvedBody { center, outer_r_world })
 }

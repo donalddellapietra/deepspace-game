@@ -21,10 +21,14 @@
 //! let planet = spherical_worldgen::build(&mut lib, &setup);
 //! ```
 
+use super::coords::Path;
 use super::cubesphere::{generate_spherical_planet, SphericalPlanet};
 use super::palette::block;
 use super::sdf::{Planet, Vec3};
-use super::tree::NodeLibrary;
+use super::state::WorldState;
+use super::tree::{
+    empty_children, slot_index, Child, NodeLibrary,
+};
 
 /// Declarative description of a planet to build. All units are in
 /// world space. `depth` is the face-subtree recursion depth.
@@ -62,17 +66,76 @@ pub fn demo_planet() -> PlanetSetup {
     }
 }
 
-/// Generate the planet's 6 face subtrees into `lib` and return a
-/// [`SphericalPlanet`] handle.
-pub fn build(lib: &mut NodeLibrary, setup: &PlanetSetup) -> SphericalPlanet {
-    generate_spherical_planet(
-        lib,
+/// One-shot scene bootstrap: build the planet's body node (with its
+/// 6 face subtrees) and anchor it at slot (1, 2, 1) of a fresh
+/// world root. Returns a [`Scene`] carrying the world, the body's
+/// anchor [`Path`], and the [`SphericalPlanet`] handle with its
+/// cached shell geometry.
+///
+/// The anchor slot is chosen so the body cell spans `[1, 2) × [2, 3)
+/// × [1, 2)` in the root's `[0, 3)³` frame — the body's local center
+/// at world `(1.5, 2.5, 1.5)`, with the full `outer_r ≤ 0.5` shell
+/// fitting inside that single depth-1 cell.
+///
+/// The other 26 root-child slots hold uniform-empty subtrees of the
+/// same depth as the body, so the tree is uniformly `1 +
+/// face_subtree_depth` levels deep.
+pub fn build(setup: &PlanetSetup) -> Scene {
+    let mut lib = NodeLibrary::default();
+
+    // 1. Build the body (body_node + 6 face subtrees) in `lib`.
+    let planet = generate_spherical_planet(
+        &mut lib,
         setup.center,
         setup.inner_r,
         setup.outer_r,
         setup.depth,
         &setup.sdf,
-    )
+    );
+
+    // 2. Build a uniform-empty subtree at the same depth as the
+    //    body node, so all root children are equi-depth.
+    let empty_sub = build_uniform_empty(&mut lib, setup.depth);
+
+    // 3. Assemble the root: 27 children, the body at slot (1, 2, 1),
+    //    the rest uniform empty. Slot ordering is
+    //    `slot_index(x, y, z) = z*9 + y*3 + x`, so (1, 2, 1) = 16.
+    let body_slot = slot_index(1, 2, 1);
+    let mut root_children = empty_children();
+    for i in 0..27 {
+        root_children[i] = if i == body_slot {
+            Child::Node(planet.body_node)
+        } else {
+            Child::Node(empty_sub)
+        };
+    }
+    let root = lib.insert(root_children);
+    lib.ref_inc(root);
+
+    let mut body_anchor = Path::root();
+    body_anchor.push(body_slot as u8);
+
+    Scene {
+        world: WorldState { root, library: lib },
+        body_anchor,
+        planet,
+    }
+}
+
+/// Returned by [`build`]: the constructed world tree, the body's
+/// anchor [`Path`] within it, and the [`SphericalPlanet`] cache.
+pub struct Scene {
+    pub world: WorldState,
+    pub body_anchor: Path,
+    pub planet: SphericalPlanet,
+}
+
+fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> super::tree::NodeId {
+    let mut id = lib.insert(empty_children());
+    for _ in 1..depth {
+        id = lib.insert(super::tree::uniform_children(Child::Node(id)));
+    }
+    id
 }
 
 // ───────────────────────────────────────────────────────── tests
@@ -103,20 +166,24 @@ mod tests {
     }
 
     #[test]
-    fn build_produces_six_face_roots_in_library() {
-        let mut lib = NodeLibrary::default();
+    fn build_scene_embeds_body_at_anchor_slot() {
         let setup = demo_planet();
-        let planet = build(&mut lib, &setup);
-        assert_eq!(planet.face_roots.len(), 6);
-        for &id in &planet.face_roots {
-            assert!(
-                lib.get(id).is_some(),
-                "face root {id} missing from NodeLibrary",
-            );
+        let scene = build(&setup);
+        // Body anchor is at depth 1, slot_index(1, 2, 1).
+        assert_eq!(scene.body_anchor.depth(), 1);
+        assert_eq!(
+            scene.body_anchor.slots()[0],
+            super::super::tree::slot_index(1, 2, 1) as u8,
+        );
+        // Body node is reachable from world root via the anchor.
+        let root = scene.world.library.get(scene.world.root).unwrap();
+        match root.children[scene.body_anchor.slots()[0] as usize] {
+            Child::Node(id) => assert_eq!(id, scene.planet.body_node),
+            other => panic!("expected body at anchor, got {:?}", other),
         }
-        assert_eq!(planet.center, setup.center);
-        assert_eq!(planet.inner_r, setup.inner_r);
-        assert_eq!(planet.outer_r, setup.outer_r);
-        assert_eq!(planet.depth, setup.depth);
+        // Face roots are still reachable.
+        for &id in &scene.planet.face_roots {
+            assert!(scene.world.library.get(id).is_some());
+        }
     }
 }

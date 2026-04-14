@@ -154,7 +154,7 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_pos: self.camera.world_pos_f32(),
+                    camera_pos: crate::world::coords::world_pos_to_f32(&self.camera.position),
                     fov: 1.2,
                     node_count: self.world.library.len(),
                 },

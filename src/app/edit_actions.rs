@@ -75,7 +75,7 @@ impl App {
     pub(super) fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
-        let camera_pos = self.camera.world_pos_f32();
+        let camera_pos = crate::world::coords::world_pos_to_f32(&self.camera.position);
 
         // Spherical-tree break: clear the targeted subtree if the
         // planet is hit closer than any Cartesian tree block.
@@ -92,7 +92,7 @@ impl App {
         let hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera.world_pos_f32(),
+            crate::world::coords::world_pos_to_f32(&self.camera.position),
             ray_dir,
             self.edit_depth(),
         );
@@ -138,7 +138,7 @@ impl App {
     pub(super) fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
-        let camera_pos = self.camera.world_pos_f32();
+        let camera_pos = crate::world::coords::world_pos_to_f32(&self.camera.position);
 
         // Spherical place: fill the cell adjacent to the first solid
         // cell with the active hotbar block. Meshes fall through to
@@ -159,7 +159,7 @@ impl App {
         let hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera.world_pos_f32(),
+            crate::world::coords::world_pos_to_f32(&self.camera.position),
             ray_dir,
             self.edit_depth(),
         );
@@ -255,7 +255,7 @@ impl App {
         let (tree_data, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
             &roots,
-            self.camera.world_pos_f32(),
+            crate::world::coords::world_pos_to_f32(&self.camera.position),
             1440.0,
             1.2,
             rf_origin,
@@ -286,7 +286,7 @@ impl App {
         let tree_hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera.world_pos_f32(),
+            crate::world::coords::world_pos_to_f32(&self.camera.position),
             ray_dir,
             self.edit_depth(),
         );
@@ -297,7 +297,7 @@ impl App {
         // exactly what you break.
         let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.edit_depth());
         let cs_hit = self.cs_planet.as_ref().and_then(|p| {
-            p.raycast(&self.world.library, self.camera.world_pos_f32(), ray_dir, cs_depth)
+            p.raycast(&self.world.library, crate::world::coords::world_pos_to_f32(&self.camera.position), ray_dir, cs_depth)
         });
         let cs_t = cs_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
 
