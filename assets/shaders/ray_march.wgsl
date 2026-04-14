@@ -398,17 +398,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    // Block highlight outline: intersect ray with a slightly expanded
-    // highlight AABB, determine entry face, and draw screen-space-width
-    // edges on that face. Occluded by geometry via result.t comparison.
+    // Block highlight outline: Minecraft-style wireframe cube.
+    // Draws all 12 edges with screen-space constant-pixel width.
+    // Occluded by geometry via result.t comparison.
     if uniforms.highlight_active != 0u {
-        let h_min_raw = uniforms.highlight_min.xyz;
-        let h_max_raw = uniforms.highlight_max.xyz;
-        let h_size = h_max_raw - h_min_raw;
-        // Expand AABB slightly to prevent z-fighting with block faces.
-        let expand = h_size * 0.005;
-        let h_min = h_min_raw - expand;
-        let h_max = h_max_raw + expand;
+        let h_min = uniforms.highlight_min.xyz;
+        let h_max = uniforms.highlight_max.xyz;
+        let h_size = h_max - h_min;
 
         let h_inv_dir = vec3<f32>(
             select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -416,41 +412,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
         );
 
-        let ht1 = (h_min - camera.pos) * h_inv_dir;
-        let ht2 = (h_max - camera.pos) * h_inv_dir;
-        let h_t_lo = min(ht1, ht2);
-        let h_t_hi = max(ht1, ht2);
-        let h_t_enter = max(max(h_t_lo.x, h_t_lo.y), h_t_lo.z);
-        let h_t_exit = min(min(h_t_hi.x, h_t_hi.y), h_t_hi.z);
+        let hb = ray_box(camera.pos, h_inv_dir, h_min, h_max);
 
-        // Valid hit, camera outside box, and not occluded by geometry.
-        if h_t_enter < h_t_exit && h_t_enter > 0.0 && h_t_enter <= result.t + h_size.x * 0.01 {
-            let h_hit_pos = camera.pos + ray_dir * h_t_enter;
-            let from_min = h_hit_pos - h_min;
-            let from_max = h_max - h_hit_pos;
+        if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
+            let t = max(hb.t_enter, 0.0);
 
-            // Screen-space edge width: constant ~1.5 pixels regardless of distance.
-            let pixel_world = h_t_enter * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
-            let ew = max(pixel_world * 1.5, h_size.x * 0.005);
+            // Only draw if the outline is in front of (or at) geometry.
+            if t <= result.t + h_size.x * 0.01 {
+                let hit_pos = camera.pos + ray_dir * t;
+                let from_min = hit_pos - h_min;
+                let from_max = h_max - hit_pos;
 
-            // Determine entry face from which slab entered last.
-            var on_edge = false;
-            if h_t_lo.x >= h_t_lo.y && h_t_lo.x >= h_t_lo.z {
-                // Entered through an X face — draw Y and Z edges.
-                on_edge = from_min.y < ew || from_max.y < ew
-                       || from_min.z < ew || from_max.z < ew;
-            } else if h_t_lo.y >= h_t_lo.z {
-                // Entered through a Y face — draw X and Z edges.
-                on_edge = from_min.x < ew || from_max.x < ew
-                       || from_min.z < ew || from_max.z < ew;
-            } else {
-                // Entered through a Z face — draw X and Y edges.
-                on_edge = from_min.x < ew || from_max.x < ew
-                       || from_min.y < ew || from_max.y < ew;
-            }
+                // Screen-space edge width: ~1.5 pixels regardless of distance.
+                let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
+                let ew = max(pixel_world * 1.5, h_size.x * 0.003);
 
-            if on_edge {
-                color = mix(color, vec3<f32>(1.0), 0.8);
+                // An edge exists where at least 2 of the 3 axes are near a face boundary.
+                let near_x = from_min.x < ew || from_max.x < ew;
+                let near_y = from_min.y < ew || from_max.y < ew;
+                let near_z = from_min.z < ew || from_max.z < ew;
+                let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
+
+                if edge_count >= 2u {
+                    color = mix(color, vec3<f32>(0.1, 0.1, 0.1), 0.7);
+                }
             }
         }
     }

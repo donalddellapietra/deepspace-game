@@ -140,7 +140,13 @@ pub fn cpu_raycast(
             }
             Child::Node(child_id) => {
                 if (depth as u32 + 1) >= max_depth {
-                    // At max depth, treat node as solid.
+                    // At max depth, treat node as solid — unless its
+                    // subtree is all-empty (dominant_block == 255).
+                    let child_node = library.get(child_id)?;
+                    if child_node.representative_block == 255 {
+                        advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                        continue;
+                    }
                     return Some(HitInfo {
                         path: path.clone(),
                         face: normal_face,
@@ -237,7 +243,7 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
             None => return false,
         };
 
-        if !node.children[adj_slot].is_empty() {
+        if !is_placeable(&world.library, node.children[adj_slot]) {
             return false;
         }
 
@@ -311,12 +317,12 @@ fn place_child_at_point(
                 cell_size /= 3.0;
                 current_id = child_id;
             }
-            Child::Empty if is_last => {
-                // Target cell is empty at the right depth — place directly.
+            child if is_last && is_placeable(&world.library, child) => {
+                // Target cell is empty (or all-empty subtree) — place directly.
                 let place_hit = HitInfo { path, face: 0, t: 0.0 };
                 return propagate_edit(world, &place_hit, new_child);
             }
-            Child::Empty => {
+            child if !is_last && is_placeable(&world.library, child) => {
                 // Empty subtree but we need to go deeper. Build a chain
                 // of empty nodes with the child at the target position.
                 let child_origin = [
@@ -465,6 +471,19 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// A cell is placeable if it's Empty or an all-empty Node subtree
+/// (representative_block == 255). At coarser zoom levels, air regions
+/// are represented as Node subtrees rather than Child::Empty.
+fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
+    match child {
+        Child::Empty => true,
+        Child::Node(id) => library
+            .get(id)
+            .map_or(false, |n| n.representative_block == 255),
+        Child::Block(_) => false,
+    }
+}
 
 fn advance_dda(frame: &mut Frame, step: &[i32; 3], delta_dist: &[f32; 3], normal_face: &mut u32) {
     if frame.side_dist[0] < frame.side_dist[1] && frame.side_dist[0] < frame.side_dist[2] {
