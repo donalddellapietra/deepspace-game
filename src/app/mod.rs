@@ -85,14 +85,15 @@ impl App {
             world.library.len(),
         );
 
-        // Spawn above the cubed-sphere planet's north pole. The
-        // initial edit depth is 6 (base-terrain level), which means
-        // the camera anchors at depth 6 — zoom-in descends from there.
-        // Clamp Y inside the root cell [0, 3) — Position requires
-        // XYZ inputs to fit the tree, unlike the old XYZ camera.
-        let spawn_y = (setup.center[1] + setup.outer_r + 0.3).min(2.99);
+        // Spawn on the planet's north-pole surface at layer 10
+        // (edit_depth = tree_depth - 10). The camera anchors at
+        // depth = tree_depth - 10 so scroll-zoom descends from there.
+        // Y just clears the outer shell so gravity catches the player
+        // immediately instead of dropping them through it.
+        let surface_clearance = 0.001_f32;
+        let spawn_y = (setup.center[1] + setup.outer_r + surface_clearance).min(2.99);
         let spawn_pos = [setup.center[0], spawn_y, setup.center[2]];
-        let spawn_depth = 6u8.min(tree_depth as u8).max(1);
+        let spawn_depth = (tree_depth as i32 - 10).clamp(1, tree_depth as i32) as u8;
 
         Self {
             window: None,
