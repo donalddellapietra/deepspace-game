@@ -222,30 +222,18 @@ impl App {
     /// Re-pack and upload the tree with LOD culling based on camera position.
     /// Called every frame so distant terrain stays flattened as the camera moves.
     pub(super) fn upload_tree_lod(&mut self) {
-        // Pack the Cartesian space tree and (if present) the 6 face
-        // subtrees of the spherical demo planet into one GPU buffer
-        // in a single pass, so the shader can look up any of them by
-        // buffer index.
-        let mut roots: Vec<u64> = vec![self.render_root_id()];
-        if let Some(p) = self.cs_planet.as_ref() {
-            roots.extend_from_slice(&p.face_roots);
-        }
-        let (tree_data, kinds_data, root_indices) = gpu::pack_tree_lod_multi(
+        // Single unified tree — the sphere's face subtrees live as
+        // children of the body node in the tree, so one BFS packs
+        // them all. No separate face-root uploads any more.
+        let (tree_data, kinds_data, root_idx) = gpu::pack_tree_lod(
             &self.world.library,
-            &roots,
+            self.render_root_id(),
             self.camera_pos_in_render_frame(),
             1440.0,
             1.2,
         );
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, &kinds_data, root_indices[0]);
-            if self.cs_planet.is_some() {
-                let face_roots: [u32; 6] = [
-                    root_indices[1], root_indices[2], root_indices[3],
-                    root_indices[4], root_indices[5], root_indices[6],
-                ];
-                renderer.set_face_roots(face_roots);
-            }
+            renderer.update_tree(&tree_data, &kinds_data, root_idx);
         }
     }
 
@@ -253,7 +241,6 @@ impl App {
         if !self.cursor_locked {
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);
-                renderer.set_cubed_sphere_highlight(None);
             }
             return;
         }
@@ -265,29 +252,9 @@ impl App {
             ray_dir,
             self.edit_depth(),
         );
-        let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
-
-        // Cubed-sphere cursor. Highlight depth comes from the same
-        // `cs_edit_depth` the break path uses, so what you see is
-        // exactly what you break.
-        let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.zoom_level());
-        let cs_hit = self.cs_planet.as_ref().and_then(|p| {
-            p.raycast(&self.world.library, self.camera_pos_in_render_frame(), ray_dir, cs_depth)
-        });
-        let cs_t = cs_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
 
         if let Some(renderer) = &mut self.renderer {
-            if cs_t < tree_t {
-                renderer.set_highlight(None);
-                if let Some(h) = cs_hit {
-                    renderer.set_cubed_sphere_highlight(Some((
-                        h.face as u32, h.iu, h.iv, h.ir, h.depth,
-                    )));
-                }
-            } else {
-                renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
-                renderer.set_cubed_sphere_highlight(None);
-            }
+            renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
         }
     }
 }
