@@ -14,32 +14,43 @@ use crate::world::gpu;
 use super::App;
 
 impl App {
-    /// CPU raycast depth: how far below the render root to descend
-    /// when testing the cursor ray. Derived from the camera's path
-    /// depth (the "zoom anchor") minus the render-root depth. Under
-    /// the path-based model introduced in step 7, zoom IS
-    /// `camera.position.depth`.
+    /// CPU raycast depth: how far below the render root the cursor
+    /// ray descends. Equals `camera.depth - render_root_depth` so
+    /// editing resolution tracks the camera regardless of where the
+    /// render frame is pinned.
     pub(super) fn edit_depth(&self) -> u32 {
         let cd = self.camera.position.depth as i32;
         let rrd = self.render_root_depth() as i32;
         (cd - rrd).max(1) as u32
     }
 
-    /// Legacy "zoom_level" = `tree_depth - edit_depth`. Kept as a
-    /// getter for UI/overlay code that still reports the old number
-    /// (0 = finest, higher = coarser). Step 10 retires the UI field.
+    /// UI layer number: `tree_depth - camera.depth`. 0 = finest
+    /// possible anchor, `tree_depth - 1` = coarsest. Reflects
+    /// where the camera is, not the render-frame choice — the
+    /// overlay should move when you scroll.
     pub(super) fn zoom_level(&self) -> i32 {
-        self.tree_depth as i32 - self.edit_depth() as i32
+        self.tree_depth as i32 - self.camera.position.depth as i32
     }
 
     /// How many leading slots of the camera's path sit above the
-    /// render root. Pinned `RENDER_FRAME_K` levels above the camera
-    /// so the shader's `[0, 3)³` traversal volume stays a small f32
-    /// magnitude regardless of camera depth — which is what
-    /// eliminates the per-layer absolute-coords jitter.
+    /// render root.
+    ///
+    /// Pinned `K` levels above the camera so shader coordinates stay
+    /// in a small f32 range — but ALSO capped at the body's tree
+    /// depth (`PLANET_BODY_DEPTH`) so the render root never descends
+    /// into a face subtree. If it did, `march()` would walk face
+    /// data as if Cartesian and, at any position inside the shell,
+    /// only cells within a tiny neighborhood are visible — the rest
+    /// of the planet's surface lives outside the render subtree and
+    /// the shader renders plain sky. Capping at body depth keeps
+    /// the whole planet in the packed subtree and makes the render
+    /// root either the tree root or the body itself, whichever is
+    /// deeper without crossing a face boundary.
     pub(super) fn render_root_depth(&self) -> u8 {
         const RENDER_FRAME_K: u8 = 3;
-        self.camera.position.depth.saturating_sub(RENDER_FRAME_K)
+        const PLANET_BODY_DEPTH: u8 = 1;
+        let desired = self.camera.position.depth.saturating_sub(RENDER_FRAME_K);
+        desired.min(PLANET_BODY_DEPTH)
     }
 
     /// NodeId of the render root — walks `camera.position.path[..]`
