@@ -420,6 +420,7 @@ pub fn js_code_to_keycode(code: &str) -> Option<winit::keyboard::KeyCode> {
         "Digit8" => KeyCode::Digit8,
         "Digit9" => KeyCode::Digit9,
         "Digit0" => KeyCode::Digit0,
+        "BracketRight" => KeyCode::BracketRight,
         _ => return None,
     })
 }

@@ -4,6 +4,7 @@ import { Inventory } from "./components/Inventory";
 import { ColorPicker } from "./components/ColorPicker";
 import { ToastContainer } from "./components/Toast";
 import { PauseMenu } from "./components/PauseMenu";
+import { DebugOverlay } from "./components/DebugOverlay";
 
 export default function App() {
   return (
@@ -13,6 +14,7 @@ export default function App() {
       <Inventory />
       <ColorPicker />
       <PauseMenu />
+      <DebugOverlay />
       <ToastContainer />
     </>
   );

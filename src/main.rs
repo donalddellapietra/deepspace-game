@@ -108,6 +108,9 @@ struct App {
     saved_meshes: SavedMeshes,
     save_mode: bool,
     ui: GameUiState,
+    debug_overlay_visible: bool,
+    /// Exponentially smoothed FPS for the debug overlay.
+    fps_smooth: f64,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -143,6 +146,8 @@ impl App {
             saved_meshes: SavedMeshes::default(),
             save_mode: false,
             ui: GameUiState::new(),
+            debug_overlay_visible: false,
+            fps_smooth: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -203,6 +208,7 @@ impl App {
         let vd = self.visual_depth();
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
+            renderer.update_camera(&self.camera.gpu_camera(1.2));
         }
         log::info!(
             "Zoom: {}/{}, edit_depth: {}, visual: {}",
@@ -420,6 +426,11 @@ impl App {
             return;
         }
 
+        if pressed && code == KeyCode::BracketRight {
+            self.debug_overlay_visible = !self.debug_overlay_visible;
+            return;
+        }
+
         if pressed && code == KeyCode::KeyV && self.cursor_locked {
             self.save_mode = !self.save_mode;
             log::info!("Save mode: {}", self.save_mode);
@@ -485,10 +496,44 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
+                let old_zoom = self.zoom_level;
                 // Scroll up = zoom in (finer), scroll down = zoom out (coarser).
                 if y > 0.0 { self.zoom_level -= 1; }
                 else if y < 0.0 { self.zoom_level += 1; }
                 self.apply_zoom();
+                let steps = self.zoom_level - old_zoom; // negative = zoomed in
+                if steps != 0 {
+                    // Move camera toward/away from the crosshair target so
+                    // blocks at the new layer appear the same size on screen.
+                    // Each layer is 3× finer, so scale distance by 3^steps.
+                    let ray_dir = self.camera.forward();
+                    let hit = edit::cpu_raycast(
+                        &self.world.library, self.world.root,
+                        self.camera.pos, ray_dir, self.edit_depth(),
+                    );
+                    let anchor = if let Some(h) = hit {
+                        // Anchor at the hit point.
+                        [
+                            self.camera.pos[0] + ray_dir[0] * h.t,
+                            self.camera.pos[1] + ray_dir[1] * h.t,
+                            self.camera.pos[2] + ray_dir[2] * h.t,
+                        ]
+                    } else {
+                        // No hit — anchor at a reasonable distance ahead.
+                        let td = self.tree_depth as i32;
+                        let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
+                        let d = cell_size * 10.0;
+                        [
+                            self.camera.pos[0] + ray_dir[0] * d,
+                            self.camera.pos[1] + ray_dir[1] * d,
+                            self.camera.pos[2] + ray_dir[2] * d,
+                        ]
+                    };
+                    let scale = 3.0f32.powi(-steps); // zoom in → 1/3, zoom out → 3
+                    for i in 0..3 {
+                        self.camera.pos[i] = anchor[i] + (self.camera.pos[i] - anchor[i]) * scale;
+                    }
+                }
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
@@ -502,12 +547,33 @@ impl ApplicationHandler for App {
                     self.inject_webview_input();
                     self.poll_ui_commands();
                     self.ui.push_to_overlay(&self.palette);
+                    overlay::push_state(&deepspace_game::bridge::GameStateUpdate::DebugOverlay(
+                        deepspace_game::bridge::DebugOverlayStateJs {
+                            visible: self.debug_overlay_visible,
+                            fps: self.fps_smooth,
+                            frame_time_ms: if self.fps_smooth > 0.0 { 1000.0 / self.fps_smooth } else { 0.0 },
+                            zoom_level: self.zoom_level,
+                            tree_depth: self.tree_depth,
+                            edit_depth: self.edit_depth(),
+                            visual_depth: self.visual_depth(),
+                            camera_pos: self.camera.pos,
+                            fov: 1.2,
+                            node_count: self.world.library.len(),
+                        },
+                    ));
                     self.flush_overlay();
                 }
 
                 let now = std::time::Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
+
+                // Update smoothed FPS (EMA, ~0.5s window).
+                if dt > 0.0 {
+                    let instant_fps = 1.0 / dt as f64;
+                    let alpha = (dt as f64 * 5.0).min(1.0); // smoothing factor
+                    self.fps_smooth = self.fps_smooth * (1.0 - alpha) + instant_fps * alpha;
+                }
                 self.update(dt);
                 self.upload_tree_lod(); // LOD repack every frame
                 self.update_highlight();

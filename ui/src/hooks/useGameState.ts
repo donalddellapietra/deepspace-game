@@ -7,6 +7,7 @@ import type {
   ModeIndicatorState,
   ToastMessage,
   PauseMenuState,
+  DebugOverlayState,
 } from "../types";
 import { getTransport } from "./useTransport";
 
@@ -66,6 +67,19 @@ const pauseMenuStore = createStore<PauseMenuState>({
   saveStatus: null,
 });
 
+const debugOverlayStore = createStore<DebugOverlayState>({
+  visible: false,
+  fps: 0,
+  frameTimeMs: 0,
+  zoomLevel: 0,
+  treeDepth: 0,
+  editDepth: 0,
+  visualDepth: 0,
+  cameraPos: [0, 0, 0],
+  fov: 0,
+  nodeCount: 0,
+});
+
 // ── Dispatch from Rust ────────────────────────────────────────────
 
 function handleGameState(update: GameStateUpdate) {
@@ -87,6 +101,9 @@ function handleGameState(update: GameStateUpdate) {
       break;
     case "pauseMenu":
       pauseMenuStore.set(update.data);
+      break;
+    case "debugOverlay":
+      debugOverlayStore.set(update.data);
       break;
   }
 }
@@ -132,6 +149,10 @@ export function useToast(): ToastMessage | null {
 
 export function usePauseMenu(): PauseMenuState {
   return useSyncExternalStore(pauseMenuStore.subscribe, pauseMenuStore.get);
+}
+
+export function useDebugOverlay(): DebugOverlayState {
+  return useSyncExternalStore(debugOverlayStore.subscribe, debugOverlayStore.get);
 }
 
 // For clearing toast after display

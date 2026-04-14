@@ -77,6 +77,21 @@ pub struct PauseMenuStateJs {
 }
 
 #[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugOverlayStateJs {
+    pub visible: bool,
+    pub fps: f64,
+    pub frame_time_ms: f64,
+    pub zoom_level: i32,
+    pub tree_depth: u32,
+    pub edit_depth: u32,
+    pub visual_depth: u32,
+    pub camera_pos: [f32; 3],
+    pub fov: f32,
+    pub node_count: usize,
+}
+
+#[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "camelCase")]
 pub enum GameStateUpdate {
@@ -86,6 +101,7 @@ pub enum GameStateUpdate {
     ModeIndicator(ModeIndicatorStateJs),
     Toast(ToastMessageJs),
     PauseMenu(PauseMenuStateJs),
+    DebugOverlay(DebugOverlayStateJs),
 }
 
 // ── JS → Rust commands ────────────────────────────────────────────

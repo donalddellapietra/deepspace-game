@@ -57,6 +57,19 @@ export interface PauseMenuState {
   saveStatus: string | null;
 }
 
+export interface DebugOverlayState {
+  visible: boolean;
+  fps: number;
+  frameTimeMs: number;
+  zoomLevel: number;
+  treeDepth: number;
+  editDepth: number;
+  visualDepth: number;
+  cameraPos: [number, number, number];
+  fov: number;
+  nodeCount: number;
+}
+
 // Union of all state updates pushed from Rust
 export type GameStateUpdate =
   | { type: "hotbar"; data: HotbarState }
@@ -64,7 +77,8 @@ export type GameStateUpdate =
   | { type: "colorPicker"; data: ColorPickerState }
   | { type: "modeIndicator"; data: ModeIndicatorState }
   | { type: "toast"; data: ToastMessage }
-  | { type: "pauseMenu"; data: PauseMenuState };
+  | { type: "pauseMenu"; data: PauseMenuState }
+  | { type: "debugOverlay"; data: DebugOverlayState };
 
 // Commands sent from React to Rust
 export type UiCommand =
