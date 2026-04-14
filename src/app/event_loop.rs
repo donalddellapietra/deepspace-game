@@ -1,10 +1,4 @@
 //! winit `ApplicationHandler` for the `App`.
-//!
-//! `resumed` creates the window + renderer + (previously-generated)
-//! GPU state. `window_event` routes per-event behavior to the
-//! submodule-provided methods on `App`. `device_event` handles
-//! mouse-motion for camera look. All heavy lifting lives elsewhere
-//! — this file is deliberately a thin dispatcher.
 
 use std::sync::Arc;
 
@@ -38,15 +32,7 @@ impl ApplicationHandler for App {
         crate::platform::prepare_window(&window);
 
         let (tree_data, root_index) = gpu::pack_tree(&self.world.library, self.world.root);
-        let mut renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
-        if let Some(planet) = self.cs_planet.as_ref() {
-            renderer.set_cubed_sphere_planet(
-                planet.center,
-                planet.inner_r,
-                planet.outer_r,
-                planet.depth,
-            );
-        }
+        let renderer = pollster::block_on(Renderer::new(window, &tree_data, root_index));
         self.renderer = Some(renderer);
         self.apply_zoom();
         self.last_frame = std::time::Instant::now();
@@ -111,27 +97,17 @@ impl ApplicationHandler for App {
 impl App {
     /// Mouse-wheel zoom: change the camera's anchor depth by one,
     /// then translate the camera along its forward ray so the block
-    /// under the crosshair stays at the same apparent size. Each
-    /// zoom step is 3× finer/coarser.
-    ///
-    /// The anchor depth is shifted via `WorldPos::zoom_in` /
-    /// `zoom_out`, which preserve world-space position — only the
-    /// representation changes. The 3× world-space dolly is a
-    /// separate cosmetic move so the user sees "zoom" as zoom.
+    /// under the crosshair stays at the same apparent size.
     fn handle_scroll_zoom(&mut self, delta: winit::event::MouseScrollDelta) {
         let y = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => y,
             winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
         };
-        // Positive y = scroll up = zoom in (finer = deeper anchor).
         let step: i32 = if y > 0.0 { 1 } else if y < 0.0 { -1 } else { return };
-        // Clamp: zooming past root or past max depth is rejected.
         let new_anchor_depth = (self.anchor_depth() as i32 + step)
             .clamp(1, (self.tree_depth as i32).max(1));
         if new_anchor_depth == self.anchor_depth() as i32 { return; }
 
-        // Compute dolly anchor: the world-space point under the
-        // crosshair, or a fallback point ahead of the camera.
         let cam_world = self.camera.world_pos_f32();
         let ray_dir = self.camera.forward();
         let hit = edit::cpu_raycast(
@@ -156,7 +132,6 @@ impl App {
             ]
         };
 
-        // Dolly the camera along the ray by 3×^(−step).
         let scale = 3.0f32.powi(-step);
         let new_cam_world = [
             anchor_world[0] + (cam_world[0] - anchor_world[0]) * scale,
@@ -168,8 +143,6 @@ impl App {
         self.apply_zoom();
     }
 
-    /// One full frame: webview sync, per-frame state push, physics,
-    /// editing queries, GPU repack, render.
     fn handle_redraw(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
