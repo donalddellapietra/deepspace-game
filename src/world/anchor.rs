@@ -16,6 +16,13 @@ use std::hash::{Hash, Hasher};
 
 use crate::world::tree::{slot_coords, slot_index, NodeLibrary, MAX_DEPTH};
 
+/// Root cell spans `[0, WORLD_SIZE)³` in world units.
+///
+/// Every cell at anchor depth `d` is `WORLD_SIZE / 3^d` wide. The
+/// whole engine uses this as the single convention for converting
+/// between `WorldPos` and f32 world-space XYZ.
+pub const WORLD_SIZE: f32 = 3.0;
+
 // --------------------------------------------------------------- Path
 
 /// Symbolic path through the 27-ary tree. Exact at any depth; no
@@ -251,6 +258,64 @@ impl WorldPos {
         Transition::None
     }
 
+    /// World-space XYZ this position represents. Root cell spans
+    /// `[0, WORLD_SIZE)³`; each anchor slot narrows that cell by 1/3.
+    pub fn to_world_xyz(&self) -> [f32; 3] {
+        let mut origin = [0.0f32; 3];
+        let mut size = WORLD_SIZE;
+        for k in 0..self.anchor.depth() as usize {
+            let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
+            let child = size / 3.0;
+            origin[0] += sx as f32 * child;
+            origin[1] += sy as f32 * child;
+            origin[2] += sz as f32 * child;
+            size = child;
+        }
+        [
+            origin[0] + self.offset[0] * size,
+            origin[1] + self.offset[1] * size,
+            origin[2] + self.offset[2] * size,
+        ]
+    }
+
+    /// Build a `WorldPos` anchored at `anchor_depth` for a world-space
+    /// XYZ point. The XYZ is clamped into `[0, WORLD_SIZE)` — positions
+    /// outside the root cell are not representable and collapse to the
+    /// boundary.
+    pub fn from_world_xyz(xyz: [f32; 3], anchor_depth: u8) -> Self {
+        let clamped = [
+            xyz[0].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[1].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[2].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+        ];
+        let mut anchor = Path::root();
+        let mut origin = [0.0f32; 3];
+        let mut size = WORLD_SIZE;
+        let depth = (anchor_depth as usize).min(MAX_DEPTH);
+        for _ in 0..depth {
+            let child = size / 3.0;
+            let mut s = [0usize; 3];
+            for i in 0..3 {
+                let v = ((clamped[i] - origin[i]) / child).floor().clamp(0.0, 2.0) as usize;
+                s[i] = v;
+                origin[i] += v as f32 * child;
+            }
+            anchor.push(slot_index(s[0], s[1], s[2]) as u8);
+            size = child;
+        }
+        let offset = [
+            ((clamped[0] - origin[0]) / size).clamp(0.0, 1.0 - f32::EPSILON),
+            ((clamped[1] - origin[1]) / size).clamp(0.0, 1.0 - f32::EPSILON),
+            ((clamped[2] - origin[2]) / size).clamp(0.0, 1.0 - f32::EPSILON),
+        ];
+        Self { anchor, offset }
+    }
+
+    /// World-space size of the anchor's cell.
+    pub fn cell_size(&self) -> f32 {
+        WORLD_SIZE / 3.0f32.powi(self.anchor.depth() as i32)
+    }
+
     /// Pop the deepest slot. Offset rescaled so the world position
     /// is unchanged. Clamps at root.
     pub fn zoom_out(&mut self) -> Transition {
@@ -435,6 +500,55 @@ mod tests {
         // becomes 0.1 - 1.2 + 2 = 0.9.
         assert_eq!(pos.anchor.slot(0), slot_index(0, 1, 1) as u8);
         assert!((pos.offset[0] - 0.9).abs() < 1e-4);
+    }
+
+    #[test]
+    fn world_xyz_round_trip() {
+        for depth in [0u8, 1, 3, 7, 12] {
+            for xyz in [
+                [0.0, 0.0, 0.0],
+                [1.5, 2.3, 1.5],
+                [2.999, 0.001, 1.0],
+                [0.5, 0.5, 0.5],
+            ] {
+                let p = WorldPos::from_world_xyz(xyz, depth);
+                assert_eq!(p.anchor.depth(), depth);
+                let back = p.to_world_xyz();
+                for i in 0..3 {
+                    assert!(
+                        (back[i] - xyz[i]).abs() < WORLD_SIZE * 1e-5,
+                        "depth {}: xyz {:?} round-tripped to {:?}",
+                        depth, xyz, back
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cell_size_matches_depth() {
+        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 0);
+        assert!((p.cell_size() - WORLD_SIZE).abs() < 1e-5);
+        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 1);
+        assert!((p.cell_size() - 1.0).abs() < 1e-5);
+        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 7);
+        assert!((p.cell_size() - (WORLD_SIZE / 3.0f32.powi(7))).abs() < 1e-7);
+    }
+
+    #[test]
+    fn zoom_preserves_world_xyz() {
+        let mut p = WorldPos::from_world_xyz([1.23, 2.34, 0.56], 5);
+        let before = p.to_world_xyz();
+        p.zoom_in();
+        let after_in = p.to_world_xyz();
+        for i in 0..3 {
+            assert!((before[i] - after_in[i]).abs() < 1e-4);
+        }
+        p.zoom_out();
+        let after_out = p.to_world_xyz();
+        for i in 0..3 {
+            assert!((before[i] - after_out[i]).abs() < 1e-4);
+        }
     }
 
     #[test]
