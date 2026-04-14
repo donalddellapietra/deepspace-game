@@ -1,99 +1,131 @@
-# Scaling the Ray Marcher to Deep Trees (>8 levels)
+# Scaling the Ray Marcher to Deep Trees
 
-## Status: BLOCKED — grey screen at >8 levels
+## The Architecture
 
-The ray marcher works correctly at 6 levels (depth 6, 38 nodes). When we scale to 20+ levels (depth 21, ~80-125 nodes), the screen renders as a solid grey cube. The underlying tree structure is correct (tests pass, content-addressing works, node counts are right), but the rendering pipeline breaks.
+The world is a recursive base-3 tree. Every node has 27 children (3×3×3). The GPU ray marcher casts one ray per pixel, stepping through the tree via DDA at each level. Per-pixel LOD stops descent when a cell is sub-pixel. See `docs/experimental-architecture/rendering.md` for the full design.
 
-## The Problem
+## What "Deep" Means
 
-The shader has `MAX_STACK_DEPTH = 8` (fixed WGSL arrays). A 21-level tree needs the ray to descend 21 levels near the camera to reach actual blocks. At depth 8, the ray hits a Node child, can't descend further, and renders `vec3(0.5)` (grey) because `dominant_block = 255` at that intermediate depth.
+A 63-layer tree spans quarks to galaxies. But the ray marcher doesn't care about absolute depth. It only cares about **visual depth** — the number of levels a ray actually descends before hitting a terminal or reaching LOD cutoff. Visual depth is bounded by screen resolution, not tree depth:
 
-"Just increase MAX_STACK_DEPTH to 24" was tried — **it didn't fix it.** The screen remained solid grey even with stack depth 24, max_iterations 512, and visual_depth capped at 24.
+- A sub-pixel cell stops at depth 0 (relative to where the ray enters it)
+- A cell filling the screen stops at ~log₃(screen_width) ≈ 7 levels
+- The worst case (a ray from camera through nearby terrain to the horizon) crosses maybe 10-15 visually-significant levels
 
-## What We Tried
+The challenge is not "how do we traverse 63 levels" — it's "how do we start the ray near the camera instead of at the absolute root."
 
-### 1. Increase shader stack depth (8 → 24)
-**Result: Still grey.** The arrays were enlarged, max_iterations increased to 512, renderer and visual_depth caps raised to 24. No change. The ray either still can't reach blocks, or the LOD/packing pipeline prevents it.
+## The Real Problem: Absolute Root Traversal
 
-### 2. Screen-space LOD cutoff in shader
-Added per-pixel check: `cell_world_size / ray_distance * screen_height / (2 * tan(fov/2))`. If sub-pixel, stop descending and use dominant color. This helps performance for distant terrain in the 6-level tree but didn't fix the deep-tree grey screen.
+The old implementation started every ray at the tree's absolute root (layer 63) and descended toward the camera. Even with LOD cutoff, the ray must descend through every intermediate layer between root and camera to reach the local neighborhood. At depth 21, that's 21 levels of descent just to arrive at the terrain the player is standing on — before any actual rendering work begins.
 
-### 3. Distance-aware GPU packing (`pack_tree_lod`)
-CPU walks the tree with camera position, only uploads nodes large enough on screen. Distant nodes flattened to Block(dominant_color). Near nodes get full children. This runs every frame.
+This is why increasing `MAX_STACK_DEPTH` from 8 to 24 didn't help. The ray could descend further, but it was still doing useless work traversing empty intermediate nodes. And the GPU buffer still packed the tree root-down, wasting slots on nodes between root and camera that every ray must pass through identically.
 
-**Potential issue:** Content-addressed nodes appear at multiple world positions. The BFS visits each NodeId once, using the FIRST occurrence's position for LOD decisions. A node first seen nearby gets full detail, but the same node far away also gets full detail (because it's already visited). Conversely, a node first seen far away gets flattened, even if it also appears nearby.
+### Why the Grey Screen
 
-### 4. Uniform node flattening
-Nodes where the entire subtree is one block type (`uniform_type`) get packed as Block/Empty. All-air volumes skip instantly. All-stone mountains render as one block. Works correctly at 6 levels.
+The grey screen at >8 levels was a symptom, not the disease. `dominant_block = 255` (unset) at intermediate nodes caused the shader to render `vec3(0.5)` when it couldn't descend further. But even with correct dominant block values, the approach is fundamentally wrong — the ray shouldn't be traversing those intermediate nodes at all.
 
-### 5. Dominant color propagation
-Nodes track `dominant_block` recursively through children. GPU packs this into the `block_type` field for Node entries. Shader uses `palette.colors[bt]` at LOD cutoff instead of grey. Works at 6 levels.
+## The Solution: Camera-Relative Packing (Virtual Root)
 
-### 6. Memoized tree_depth()
-Prevented exponential recursive walks through content-addressed tree. Reduced from potentially millions of calls to ~N (one per unique node).
+The old Bevy mesh-based implementation solved this with `WorldAnchor` — a floating origin that keeps all Bevy coordinates near zero. The ray marcher needs the equivalent: **the GPU buffer should be rooted at the deepest node containing the camera, not the absolute root.**
 
-## Why It's Hard
+### How It Works
 
-### Content-addressing vs. spatial LOD
-The fundamental tension: content-addressed nodes are **position-independent** (same NodeId appears at many world positions), but LOD decisions are **position-dependent** (a node near the camera needs more detail than the same node far away).
+1. **CPU: Walk from root to camera.** Follow the camera's path through the tree to find the deepest node that contains the camera and is large enough to be the rendering root. This node becomes the **virtual root**. The walk is O(depth) — 63 node lookups, microseconds.
 
-The GPU buffer can only store ONE version of each node. If the same NodeId appears both near and far from the camera, it must be packed the same way in both locations. This means:
-- If we pack it with full children (for nearby): distant occurrences waste shader time descending
-- If we flatten it (for distant): nearby occurrences lose detail
+2. **CPU: Pack the virtual root's subtree.** Upload the virtual root and its visible descendants into the GPU buffer. Nodes near the camera get full children. Nodes far from the camera get flattened (children replaced with their representative block type). This is spatial packing — the same NodeId at two different distances becomes two different entries with different LOD levels.
 
-The 6-level tree doesn't hit this hard because content sharing is mostly between nodes at the same depth (same-sized things). At 20+ levels, nodes are reused across many depths and positions.
+3. **CPU: Pack the ancestor path.** For rays that exit the virtual root (looking up at the sky, or toward the horizon), upload one node per ancestor level from the virtual root back to the absolute root, plus siblings at each level. This is ~63 extra nodes — trivial.
 
-### Camera position vs. tree depth
-At zoom_level 0 with depth 21, the finest blocks are ~10^-10 units wide. The camera is at [1.5, 1.75, 1.5] — a macro position. The ray must descend 21 levels of 3×3×3 DDA to reach a block. Even with LOD, nearby rays need full depth.
+4. **GPU: Ray starts at the virtual root.** The camera position is in virtual-root-local coordinates (always in [0, 3)³, perfect f32 precision). Rays descend from the virtual root, not the absolute root. Visual depth is 5-15 levels regardless of absolute tree depth.
 
-The `y-structure` (y=0 underground, y=1 surface, y=2 air) must be maintained at EVERY level or the camera ends up inside solid terrain. This was fixed for 6 levels but the 20-level version had the camera alternating between air/terrain at different depths due to the base-3 expansion of y=1.75.
+5. **GPU: Rays that exit the virtual root pop upward.** The ancestor path provides the context. The ray enters the virtual root's parent, steps through siblings via DDA, and may descend into a sibling's subtree. This is rare (only for rays pointing away from the camera's local neighborhood) and adds at most one level per ancestor.
 
-### Shader register pressure
-WGSL arrays of size 24 × 5 arrays = 120 registers per pixel. GPU occupancy drops, reducing parallelism. This may explain why increasing stack depth alone didn't help — the shader may have hit register limits and produced incorrect results silently.
+### Why This Fixes Everything
 
-## What Might Actually Work
+- **Stack depth**: Visual depth is bounded by screen resolution (~7-15 levels), not tree depth. `MAX_STACK_DEPTH = 16` is generous.
+- **Register pressure**: 16 × 5 arrays = 80 registers. Well within GPU limits.
+- **Performance**: No wasted traversal through empty intermediate nodes. Every DDA step is visually meaningful.
+- **Precision**: Camera coordinates are always near zero in virtual-root space. No f32 precision issues.
+- **Correctness**: No grey screen — every ray reaches a terminal or LOD cutoff within the visual depth budget.
 
-### A. Virtual root / camera-relative packing
-Instead of always starting the ray from the absolute root, find the deepest node containing the camera and make THAT the GPU root. Upload only its subtree. The ray starts at depth 0 in a local coordinate system.
+## LOD at the Ray Level: Per-Child Representative Type
 
-**Challenge:** Rays that exit this node need to pop up to siblings/parents. This requires uploading the path from absolute root to the virtual root (one node per level = 21 nodes), plus siblings at each level.
+When the ray hits a `Node(id)` child and the LOD cutoff says "don't descend," the ray needs a color for that child. This is NOT a per-node "dominant block" — it's a **per-child representative block type**.
 
-### B. Two-pass rendering
-1. **Coarse pass:** Render from root with low max_depth (3-4 levels). This shows the large-scale terrain structure — mountains, biomes, etc. Each pixel gets a coarse block color.
-2. **Detail pass:** For pixels near the camera, re-render starting from a deeper node that's been pre-identified as containing the camera. This pass uses full depth but only covers a portion of the screen.
+### Presence-Preserving, Not Majority Vote
 
-### C. Hybrid approach: pre-resolved GPU buffer
-Instead of uploading the raw tree and letting the shader traverse it, resolve the tree on CPU for the camera's viewport. Walk the tree from root, and for each node the camera can see:
-- If it's small enough on screen (< N pixels): store its dominant color as a Block entry
-- If it's large: store its 27 children
+The old Bevy implementation used presence-preserving downsample: if ANY child voxel in a 3×3×3 block is non-empty, the parent voxel is non-empty. The representative block type among the non-empty children is chosen by frequency.
 
-This produces a FLAT buffer where every entry is either Block or a reference to a pre-resolved child. The shader's traversal depth equals the number of nodes that are "large enough to see" in a straight line from the camera — typically 5-8 regardless of tree depth.
+This matters because majority vote destroys thin features:
 
-**This is essentially what `pack_tree_lod` tries to do, but it needs to handle the content-addressing problem:** the same NodeId at different positions needs different resolutions. The fix is to pack by POSITION (world-space path), not by NodeId. Two occurrences of the same NodeId at different distances become separate entries in the GPU buffer.
+- A tree trunk (1 voxel wide, surrounded by 26 air voxels) has majority type = Air. The trunk vanishes after one level of cascaded downsample.
+- Presence-preserving: the trunk survives because any non-empty child keeps the parent non-empty. The representative type is Wood (the most common non-empty type), not Air.
 
-### D. Completely different shader architecture
-Replace the iterative stack-based DDA with a different traversal:
-- **Beam marching:** Instead of per-pixel rays, march beams (groups of pixels). Coarse beams for distant terrain, fine beams near camera.
-- **Cone tracing:** March a cone that widens with distance. The cone's width determines LOD.
-- **Precomputed distance fields:** For each node, store max empty-space skip distance. Rays jump through empty regions.
+For the ray marcher, each `Node(id)` in the library should cache its **representative block type** — the most common non-empty block type among all terminals in its subtree, computed bottom-up. This is O(1) per node during tree construction and gives the correct LOD color at any depth.
 
-## Current State (Working)
+### Why Per-Child, Not Per-Node
 
-- 6-level tree with 38 unique nodes renders correctly
-- Zoom (scroll wheel) changes edit scale and movement speed
-- Left-click break, right-click place with clone-on-write propagation
-- Dominant colors, uniform flattening, distance-aware packing, screen-space LOD
-- All 13 tests pass
+The ray marcher steps through a node's 3×3×3 children via DDA. When it hits a child that's sub-pixel, it needs THAT CHILD's representative type. Different children of the same node have different types — one is stone, another is air, another is a tree. The spatial structure at the 3×3×3 level is always preserved; the LOD cutoff only collapses the structure WITHIN each child.
+
+This means the 3×3×3 DDA always runs (trivial — at most 9 steps), and LOD only affects whether the ray descends INTO a child. The visual result is that distant terrain has blocky 3×3×3 structure at each visible level, not flat single-color nodes.
+
+## Content-Addressing and Spatial Packing
+
+The `scaling-deep-trees` doc previously described a "fundamental tension" between content-addressed nodes (position-independent) and LOD (position-dependent). This is real but solvable:
+
+### The Library Is Content-Addressed; the GPU Buffer Is Spatial
+
+The `NodeLibrary` stores nodes by content (same children = same NodeId). This is correct and essential for memory efficiency and dedup.
+
+The GPU buffer is packed **spatially** — by camera-relative position, not by NodeId. The same NodeId appearing near and far from the camera becomes **two separate entries** in the GPU buffer:
+- The near entry has full children (Node tags with buffer indices)
+- The far entry is flattened to `Block(representative_type)`
+
+This means the GPU buffer has no content-addressing conflicts. Each entry is a unique spatial position with the correct LOD for its distance. The CPU packer walks the tree spatially (BFS/DFS from virtual root with distance-based LOD cutoff) and emits one entry per visible spatial position.
+
+Content-addressed dedup still works in the library — 50 forests sharing one oak tree NodeId store it once. But the GPU buffer may contain 50 entries for that NodeId at different LOD levels depending on distance. The buffer is O(visible nodes), not O(unique nodes).
+
+## What Was Tried and Why It Failed
+
+### Increasing stack depth (8 → 24)
+**Why it failed:** The ray was still starting at the absolute root. More stack depth just meant more useless traversal through empty intermediate nodes. The ray reached deeper but was still doing the wrong thing.
+
+### Distance-aware GPU packing (`pack_tree_lod`)
+**Why it partially worked, partially failed:** The right idea (flatten distant nodes) but wrong execution. It packed by NodeId, not by spatial position. A NodeId first encountered near the camera got full detail everywhere; a NodeId first encountered far away got flattened everywhere. The fix: pack by position (the virtual root approach).
+
+### Screen-space LOD cutoff in shader
+**Why it worked but didn't fix the real problem:** Correctly stopped descent for distant terrain. But the ray still started at the absolute root, so nearby terrain (which CAN'T be LOD-cutoff because it fills the screen) still needed to descend through all intermediate levels.
+
+### Uniform flattening / dominant color propagation
+**Why they worked at 6 levels:** At 6 levels, the ray's total descent (6 levels) fits in the stack. The optimizations reduced wasted work within those 6 levels. At 21 levels, the optimizations don't help because the ray can't even reach the interesting nodes within the stack budget.
+
+## Implementation Plan
+
+### Phase 1: Virtual Root Packing
+1. CPU: Walk from root to camera → find virtual root node
+2. CPU: Pack virtual root's subtree with distance-based LOD flattening, by spatial position
+3. CPU: Pack ancestor path (virtual root → absolute root) with siblings
+4. GPU: Start ray at virtual root. Camera position in virtual-root-local coords.
+
+### Phase 2: Ancestor Traversal
+1. GPU: When ray exits the virtual root, pop to parent using the ancestor path
+2. GPU: Step through parent's siblings, potentially descending into them
+3. This enables sky, horizon, and distant terrain rendering
+
+### Phase 3: Representative Block Types
+1. Compute per-node representative block type (most common non-empty terminal, presence-preserving)
+2. Cache on each node during tree construction / edit propagation
+3. GPU uses representative type at LOD cutoff instead of grey
 
 ## Files
 
 | File | Role |
 |------|------|
-| `assets/shaders/ray_march.wgsl` | GPU ray marcher (DDA through base-3 tree) |
-| `src/world/worldgen.rs` | World generator (currently 6 levels) |
-| `src/world/gpu.rs` | `pack_tree` and `pack_tree_lod` (tree → GPU buffer) |
-| `src/world/tree.rs` | Node, NodeLibrary, content-addressing, dominant_block, uniform_type |
+| `assets/shaders/ray_march.wgsl` | GPU ray marcher — virtual root traversal, per-child LOD |
+| `src/world/gpu.rs` | Camera-relative spatial packing, virtual root selection |
+| `src/world/tree.rs` | Node, NodeLibrary, representative block type computation |
+| `src/world/worldgen.rs` | World generator |
 | `src/world/edit.rs` | CPU raycast, break/place, clone-on-write propagation |
-| `src/world/state.rs` | WorldState, tree_depth() |
-| `src/renderer.rs` | wgpu renderer, uniforms (max_depth), buffer upload |
-| `src/main.rs` | App loop, zoom, input, LOD packing per frame |
+| `src/world/state.rs` | WorldState |
+| `src/renderer.rs` | wgpu renderer, uniforms, buffer upload |
+| `src/main.rs` | App loop, zoom, input |
