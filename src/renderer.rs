@@ -16,7 +16,10 @@ pub struct GpuUniforms {
     pub screen_width: f32,
     pub screen_height: f32,
     pub max_depth: u32,
-    pub _pad: [u32; 3],
+    pub highlight_active: u32,
+    pub _pad: [u32; 2],
+    pub highlight_min: [f32; 4], // xyz, w unused
+    pub highlight_max: [f32; 4], // xyz, w unused
 }
 
 pub struct Renderer {
@@ -35,6 +38,9 @@ pub struct Renderer {
     root_index: u32,
     node_count: u32,
     max_depth: u32,
+    highlight_active: u32,
+    highlight_min: [f32; 4],
+    highlight_max: [f32; 4],
 }
 
 impl Renderer {
@@ -132,7 +138,10 @@ impl Renderer {
             screen_width: config.width as f32,
             screen_height: config.height as f32,
             max_depth: 8,
-            _pad: [0; 3],
+            highlight_active: 0,
+            _pad: [0; 2],
+            highlight_min: [0.0; 4],
+            highlight_max: [0.0; 4],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -258,7 +267,25 @@ impl Renderer {
             root_index,
             node_count,
             max_depth: 8,
+            highlight_active: 0,
+            highlight_min: [0.0; 4],
+            highlight_max: [0.0; 4],
         }
+    }
+
+    /// Set the highlighted block AABB (or clear it with None).
+    pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {
+        match aabb {
+            Some((min, max)) => {
+                self.highlight_active = 1;
+                self.highlight_min = [min[0], min[1], min[2], 0.0];
+                self.highlight_max = [max[0], max[1], max[2], 0.0];
+            }
+            None => {
+                self.highlight_active = 0;
+            }
+        }
+        self.write_uniforms();
     }
 
     pub fn set_max_depth(&mut self, depth: u32) {
@@ -353,7 +380,10 @@ impl Renderer {
             screen_width: self.config.width as f32,
             screen_height: self.config.height as f32,
             max_depth: self.max_depth,
-            _pad: [0; 3],
+            highlight_active: self.highlight_active,
+            _pad: [0; 2],
+            highlight_min: self.highlight_min,
+            highlight_max: self.highlight_max,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

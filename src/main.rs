@@ -100,7 +100,9 @@ struct App {
     cursor_locked: bool,
     keys: Keys,
     last_frame: std::time::Instant,
-    zoom_level: i32,
+    /// View layer: 0 = finest (individual blocks), positive = zoomed out (coarser).
+    /// Each step up multiplies interaction block size by 3× per axis.
+    view_layer: i32,
     selected_block: BlockType,
     #[cfg(not(target_arch = "wasm32"))]
     webview: Option<wry::WebView>,
@@ -132,7 +134,7 @@ impl App {
             cursor_locked: false,
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
-            zoom_level: 0,
+            view_layer: 0,
             selected_block: BlockType::Stone,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
@@ -144,7 +146,11 @@ impl App {
     }
 
     fn update(&mut self, dt: f32) {
-        let speed = 5.0 * 3.0f32.powi(self.zoom_level);
+        // Speed: 5 interaction-cells per second at every view layer.
+        // Cell size at interaction layer = 1 / 3^(tree_depth - view_layer).
+        let td = self.world.tree_depth() as i32;
+        let cell_size = 1.0 / 3.0f32.powi(td - self.view_layer);
+        let speed = 5.0 * cell_size;
 
         let fwd = self.camera.forward_xz();
         let right = self.camera.right();
@@ -173,14 +179,33 @@ impl App {
         }
     }
 
-    /// Compute the max ray depth for the current zoom level.
-    /// zoom_level 0 → deepest (individual blocks), higher → coarser.
+    /// How deep the CPU raycast descends for editing.
+    /// view_layer 0 = finest (tree_depth), higher = coarser.
     fn edit_depth(&self) -> u32 {
-        // The test world is 3 levels deep. Each zoom step removes one
-        // level of descent, so the player edits coarser structures.
-        // Clamp to at least 1 (can always target root children).
-        let base_depth: u32 = 8; // max traversal depth
-        base_depth.saturating_sub(self.zoom_level.max(0) as u32).max(1)
+        let td = self.world.tree_depth() as i32;
+        (td - self.view_layer).max(1) as u32
+    }
+
+    /// How deep the GPU descends for rendering.
+    /// Always 3 levels deeper than edit layer (see 27×27×27 detail
+    /// within each interaction block).
+    fn visual_depth(&self) -> u32 {
+        (self.edit_depth() + 3).min(8)
+    }
+
+    /// Clamp view_layer and sync GPU + edit depths after a zoom change.
+    fn apply_zoom(&mut self) {
+        let td = self.world.tree_depth() as i32;
+        self.view_layer = self.view_layer.clamp(0, (td - 1).max(0));
+
+        let vd = self.visual_depth();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_max_depth(vd);
+        }
+        log::info!(
+            "View layer: {}/{}, edit_depth: {}, visual_depth: {}",
+            self.view_layer, td, self.edit_depth(), vd
+        );
     }
 
     fn do_break(&mut self) {
@@ -345,11 +370,11 @@ impl App {
         overlay::push_state(&GameStateUpdate::Hotbar(HotbarState {
             active: block_to_slot(self.selected_block),
             slots,
-            layer: self.zoom_level.max(0) as u8,
+            layer: self.view_layer.max(0) as u8,
         }));
 
         overlay::push_state(&GameStateUpdate::ModeIndicator(ModeIndicatorStateJs {
-            layer: self.zoom_level.max(0) as u8,
+            layer: self.view_layer.max(0) as u8,
             save_mode: false,
             save_eligible: false,
             entity_edit_mode: false,
@@ -429,16 +454,11 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                if y > 0.0 { self.zoom_level -= 1; }
-                else if y < 0.0 { self.zoom_level += 1; }
-                self.zoom_level = self.zoom_level.clamp(-2, 5);
-
-                let max_depth = (3 - self.zoom_level).clamp(1, 8) as u32;
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.set_max_depth(max_depth);
-                }
-                log::info!("Zoom level: {}, max_depth: {}, edit_depth: {}",
-                    self.zoom_level, max_depth, self.edit_depth());
+                // Scroll up = zoom in (finer, decrease view_layer).
+                // Scroll down = zoom out (coarser, increase view_layer).
+                if y > 0.0 { self.view_layer -= 1; }
+                else if y < 0.0 { self.view_layer += 1; }
+                self.apply_zoom();
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {

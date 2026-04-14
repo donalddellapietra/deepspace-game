@@ -355,6 +355,31 @@ fn cell_entry_t(frame: &Frame, ray_origin: &[f32; 3], inv_dir: &[f32; 3]) -> f32
     t_enter
 }
 
+/// Compute the world-space AABB of the block at the hit location.
+pub fn hit_aabb(hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+    let mut origin = [0.0f32; 3];
+    let mut cell_size = 1.0f32;
+
+    for &(_node_id, slot) in &hit.path {
+        let (x, y, z) = slot_coords(slot);
+        origin = [
+            origin[0] + x as f32 * cell_size,
+            origin[1] + y as f32 * cell_size,
+            origin[2] + z as f32 * cell_size,
+        ];
+        cell_size /= 3.0;
+    }
+    // Undo the last division — the final path entry IS the hit cell.
+    cell_size *= 3.0;
+
+    let aabb_max = [
+        origin[0] + cell_size,
+        origin[1] + cell_size,
+        origin[2] + cell_size,
+    ];
+    (origin, aabb_max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

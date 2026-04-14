@@ -150,10 +150,20 @@ impl NodeLibrary {
             })
             .collect();
         // Compute dominant block: most common BlockType among children.
+        // For Block children, count directly. For Node children, inherit
+        // their dominant_block (recursive aggregation).
         let mut counts = [0u32; 256];
         for c in &children {
-            if let Child::Block(bt) = c {
-                counts[*bt as u8 as usize] += 1;
+            match c {
+                Child::Block(bt) => counts[*bt as u8 as usize] += 1,
+                Child::Node(nid) => {
+                    if let Some(child_node) = self.nodes.get(nid) {
+                        if child_node.dominant_block < 255 {
+                            counts[child_node.dominant_block as usize] += 1;
+                        }
+                    }
+                }
+                Child::Empty => {}
             }
         }
         let dominant_block = counts

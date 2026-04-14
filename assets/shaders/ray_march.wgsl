@@ -27,9 +27,11 @@ struct Uniforms {
     screen_width: f32,
     screen_height: f32,
     max_depth: u32,
+    highlight_active: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
+    highlight_min: vec4<f32>,
+    highlight_max: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
@@ -247,10 +249,15 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             return result;
         } else if tag == 2u {
             // Node — descend if we haven't hit max depth.
-            if depth + 1u >= MAX_STACK_DEPTH {
-                // At max depth, treat as solid with a default color.
+            if depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH {
+                // At max depth, treat as solid using the node's dominant color.
                 result.hit = true;
-                result.color = vec3<f32>(0.5);
+                let bt = child_block_type(packed);
+                if bt < 10u {
+                    result.color = palette.colors[bt].rgb;
+                } else {
+                    result.color = vec3<f32>(0.5);
+                }
                 result.normal = normal;
                 return result;
             }
@@ -351,6 +358,43 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     } else {
         let sky_t = ray_dir.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
+    }
+
+    // Block highlight outline: intersect ray with the highlight AABB
+    // and draw white edges where the ray grazes the box faces.
+    if uniforms.highlight_active != 0u {
+        let h_min = uniforms.highlight_min.xyz;
+        let h_max = uniforms.highlight_max.xyz;
+        let inv_dir = vec3<f32>(
+            select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+            select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+            select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+        );
+        let hb = ray_box(camera.pos, inv_dir, h_min, h_max);
+        if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
+            let t = max(hb.t_enter, 0.0);
+            let hit_pos = camera.pos + ray_dir * t;
+            // Distance from each face of the box in local coords.
+            let from_min = hit_pos - h_min;
+            let from_max = h_max - hit_pos;
+            let box_size = h_max - h_min;
+            let edge_width = box_size.x * 0.04; // 4% of block size
+            // Check if near any edge (where two faces meet).
+            let near_min_x = from_min.x < edge_width;
+            let near_max_x = from_max.x < edge_width;
+            let near_min_y = from_min.y < edge_width;
+            let near_max_y = from_max.y < edge_width;
+            let near_min_z = from_min.z < edge_width;
+            let near_max_z = from_max.z < edge_width;
+            let near_x = near_min_x || near_max_x;
+            let near_y = near_min_y || near_max_y;
+            let near_z = near_min_z || near_max_z;
+            // An edge is where at least 2 of the 3 axes are near a face.
+            let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
+            if edge_count >= 2u {
+                color = mix(color, vec3<f32>(1.0), 0.8);
+            }
+        }
     }
 
     // Crosshair: thin cross at screen center.

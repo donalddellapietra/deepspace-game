@@ -108,11 +108,18 @@ pub fn pack_tree(
                     _pad: 0,
                     node_index: 0,
                 },
-                Child::Node(child_id) => GpuChild {
-                    tag: 2,
-                    block_type: 0,
-                    _pad: 0,
-                    node_index: *visited.get(child_id).expect("child must be visited"),
+                Child::Node(child_id) => {
+                    // Store the child node's dominant block type so the
+                    // shader can use a meaningful color at LOD cutoff.
+                    let dominant = library.get(*child_id)
+                        .map(|n| n.dominant_block)
+                        .unwrap_or(0);
+                    GpuChild {
+                        tag: 2,
+                        block_type: dominant,
+                        _pad: 0,
+                        node_index: *visited.get(child_id).expect("child must be visited"),
+                    }
                 },
             });
         }

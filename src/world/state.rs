@@ -145,6 +145,24 @@ impl WorldState {
         Self { root, library }
     }
 
+    /// Compute the maximum depth of the tree from the root.
+    /// Depth = number of Node→Node edges from root to the deepest
+    /// terminal (Block/Empty) children.
+    pub fn tree_depth(&self) -> u32 {
+        self.depth_of(self.root)
+    }
+
+    fn depth_of(&self, id: NodeId) -> u32 {
+        let Some(node) = self.library.get(id) else { return 0 };
+        let mut max_child_depth = 0u32;
+        for child in &node.children {
+            if let Child::Node(child_id) = child {
+                max_child_depth = max_child_depth.max(self.depth_of(*child_id));
+            }
+        }
+        1 + max_child_depth
+    }
+
     pub fn swap_root(&mut self, new_root: NodeId) {
         if new_root == self.root { return; }
         self.library.ref_inc(new_root);
