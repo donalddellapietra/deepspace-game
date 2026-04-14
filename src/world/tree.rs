@@ -45,6 +45,80 @@ impl Child {
 pub type NodeId = u64;
 pub const EMPTY_NODE: NodeId = 0;
 
+// ------------------------------------------------------------ node kind
+
+/// What kind of axes a node's 27 children branch on.
+///
+/// All existing Cartesian-tree content uses [`NodeKind::Cartesian`].
+/// Step 2 introduces the enum itself; the body/face variants are
+/// constructed by worldgen in step 5+ when planets move into the
+/// tree. Dispatching on `kind` during `step_neighbor` (§2c of
+/// refactor-decisions.md) arrives in step 8.
+///
+/// `CubedSphereBody` has no `center` field: a body always occupies
+/// its parent cell, with the sphere centered at `(0.5, 0.5, 0.5)` in
+/// that cell's local frame. Only `inner_r` and `outer_r` (also in
+/// the parent's local `[0, 1)` frame) are per-node.
+#[derive(Copy, Clone, Debug)]
+pub enum NodeKind {
+    /// Standard Cartesian branching. Children indexed by
+    /// `(x_slot, y_slot, z_slot)` via [`slot_index`].
+    Cartesian,
+    /// A cubed-sphere body occupying its parent's cell. Six specific
+    /// child slots (the face-center slots of the 27-grid) hold the
+    /// per-face subtrees; other slots are the sphere's interior
+    /// filler or empty.
+    CubedSphereBody { inner_r: f32, outer_r: f32 },
+    /// One face of a cubed-sphere body. Children indexed by
+    /// `(u_slot, v_slot, r_slot)`. `face` is `0..=5` matching the
+    /// indexing used by `cubesphere::Face`.
+    CubedSphereFace { face: u8 },
+}
+
+impl Default for NodeKind {
+    fn default() -> Self {
+        NodeKind::Cartesian
+    }
+}
+
+// f32 fields mean we can't derive PartialEq/Eq/Hash cleanly — we
+// compare/hash bit patterns so two bodies with identical radii dedup
+// correctly in the library.
+impl PartialEq for NodeKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (NodeKind::Cartesian, NodeKind::Cartesian) => true,
+            (
+                NodeKind::CubedSphereBody { inner_r: a, outer_r: b },
+                NodeKind::CubedSphereBody { inner_r: c, outer_r: d },
+            ) => a.to_bits() == c.to_bits() && b.to_bits() == d.to_bits(),
+            (
+                NodeKind::CubedSphereFace { face: a },
+                NodeKind::CubedSphereFace { face: b },
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for NodeKind {}
+
+impl Hash for NodeKind {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            NodeKind::Cartesian => 0u8.hash(state),
+            NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                1u8.hash(state);
+                inner_r.to_bits().hash(state);
+                outer_r.to_bits().hash(state);
+            }
+            NodeKind::CubedSphereFace { face } => {
+                2u8.hash(state);
+                face.hash(state);
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ node
 
 pub type Children = [Child; CHILDREN_PER_NODE];
@@ -59,6 +133,10 @@ pub fn uniform_children(child: Child) -> Children {
 
 pub struct Node {
     pub children: Children,
+    /// Axis semantics of this node's 27-slot branching. Defaults to
+    /// `Cartesian`; `CubedSphereBody` / `CubedSphereFace` are used
+    /// when a planet lives in the tree (step 5+).
+    pub kind: NodeKind,
     pub ref_count: u32,
     /// Presence-preserving representative block type for this subtree.
     /// The most common NON-EMPTY block type among all terminals in the
@@ -115,14 +193,23 @@ impl Default for NodeLibrary {
 }
 
 impl NodeLibrary {
-    /// Insert a node. If an existing node has identical children,
-    /// return its id (content-addressed dedup).
+    /// Insert a Cartesian node. If an existing node has identical
+    /// children and kind, return its id (content-addressed dedup).
     pub fn insert(&mut self, children: Children) -> NodeId {
-        let h = hash_children(&children);
+        self.insert_with_kind(children, NodeKind::Cartesian)
+    }
+
+    /// Insert a node with an explicit [`NodeKind`]. Dedup matches on
+    /// `(children, kind)` together — two nodes with identical children
+    /// but different kinds are distinct (e.g. a Cartesian subtree and
+    /// a CubedSphereFace subtree with the same child array would be
+    /// interpreted differently by `step_neighbor` and the shader).
+    pub fn insert_with_kind(&mut self, children: Children, kind: NodeKind) -> NodeId {
+        let h = hash_node_identity(&children, &kind);
         if let Some(candidates) = self.by_hash.get(&h) {
             for &id in candidates {
                 if let Some(node) = self.nodes.get(&id) {
-                    if node.children == children {
+                    if node.children == children && node.kind == kind {
                         return id;
                     }
                 }
@@ -184,7 +271,10 @@ impl NodeLibrary {
             }
             if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
         };
-        self.nodes.insert(id, Node { children, ref_count: 0, representative_block, uniform_type });
+        self.nodes.insert(
+            id,
+            Node { children, kind, ref_count: 0, representative_block, uniform_type },
+        );
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
             self.ref_inc(nid);
@@ -238,7 +328,7 @@ impl NodeLibrary {
 
     fn evict(&mut self, id: NodeId) {
         let Some(node) = self.nodes.remove(&id) else { return };
-        let h = hash_children(&node.children);
+        let h = hash_node_identity(&node.children, &node.kind);
         if let Some(v) = self.by_hash.get_mut(&h) {
             v.retain(|&i| i != id);
             if v.is_empty() { self.by_hash.remove(&h); }
@@ -253,9 +343,14 @@ impl NodeLibrary {
 
 // ------------------------------------------------------------- hashing
 
-fn hash_children(children: &Children) -> u64 {
+/// Hash identifying a unique node in the library. Includes kind
+/// because two nodes with identical children but different kinds are
+/// distinct (e.g. face subtree vs. Cartesian subtree with same child
+/// arrangement).
+fn hash_node_identity(children: &Children, kind: &NodeKind) -> u64 {
     let mut h = DefaultHasher::new();
     children.hash(&mut h);
+    kind.hash(&mut h);
     h.finish()
 }
 
@@ -306,6 +401,61 @@ mod tests {
         assert!(lib.get(id).is_some());
         lib.ref_dec(id);
         assert!(lib.get(id).is_none());
+    }
+
+    #[test]
+    fn default_kind_is_cartesian() {
+        let mut lib = NodeLibrary::default();
+        let id = lib.insert(empty_children());
+        matches!(lib.get(id).unwrap().kind, NodeKind::Cartesian);
+    }
+
+    #[test]
+    fn dedup_distinguishes_kind() {
+        // Same children, different kinds → different library entries.
+        let mut lib = NodeLibrary::default();
+        let c = uniform_children(Child::Block(block::STONE));
+        let cart = lib.insert_with_kind(c, NodeKind::Cartesian);
+        let body = lib.insert_with_kind(
+            c,
+            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+        );
+        let face = lib.insert_with_kind(c, NodeKind::CubedSphereFace { face: 0 });
+        assert_ne!(cart, body);
+        assert_ne!(body, face);
+        assert_ne!(cart, face);
+        assert_eq!(lib.len(), 3);
+    }
+
+    #[test]
+    fn dedup_same_kind_merges() {
+        let mut lib = NodeLibrary::default();
+        let c = uniform_children(Child::Block(block::STONE));
+        let a = lib.insert_with_kind(
+            c,
+            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+        );
+        let b = lib.insert_with_kind(
+            c,
+            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dedup_respects_radii() {
+        // Different radii → different nodes.
+        let mut lib = NodeLibrary::default();
+        let c = uniform_children(Child::Block(block::STONE));
+        let a = lib.insert_with_kind(
+            c,
+            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+        );
+        let b = lib.insert_with_kind(
+            c,
+            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.5 },
+        );
+        assert_ne!(a, b);
     }
 
     #[test]
