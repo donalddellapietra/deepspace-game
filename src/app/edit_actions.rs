@@ -6,11 +6,12 @@
 //! the actual logic lives in `editing`; this file is the glue layer
 //! that owns the `&mut self` access pattern.
 
-use crate::editing;
 use crate::game_state::HotbarItem;
 use crate::world::coords::ROOT_EXTENT;
+use crate::world::cubesphere::SphericalPlanet;
 use crate::world::edit;
 use crate::world::gpu;
+use crate::world::state::WorldState;
 use crate::world::tree::{slot_coords, Child, NodeId};
 
 use super::App;
@@ -20,6 +21,37 @@ use super::App;
 /// anchor depth — zooming changes the layer the player operates at
 /// without shifting the rendered view.
 pub(super) const RENDER_FRAME_K: u8 = 255;
+
+/// Cubed-sphere edit depth derived from the player's anchor depth.
+/// Capped below `f32` integer-precision so the shader's `floor(un ·
+/// 3^depth) == hl_i` comparison stays exact.
+fn cs_edit_depth(planet: Option<&SphericalPlanet>, anchor_depth: u32) -> u32 {
+    let planet_depth = planet.map(|p| p.depth).unwrap_or(0);
+    if planet_depth == 0 { return 0; }
+    const SHADER_SAFE_MAX: u32 = 14;
+    let max_d = planet_depth.min(SHADER_SAFE_MAX);
+    anchor_depth.clamp(1, max_d)
+}
+
+/// Cursor raycast against the sphere body, gated by the Cartesian
+/// raycast: returns a sphere hit only when it's closer than any
+/// Cartesian-tree block along the same ray.
+fn cs_cursor_hit(
+    world: &WorldState,
+    planet: Option<&SphericalPlanet>,
+    camera_pos: [f32; 3],
+    ray_dir: [f32; 3],
+    edit_depth: u32,
+) -> Option<crate::world::cubesphere::CsRayHit> {
+    let depth = cs_edit_depth(planet, edit_depth);
+    if depth == 0 { return None; }
+    let hit = planet?.raycast(&world.library, camera_pos, ray_dir, depth)?;
+    let tree_t = edit::cpu_raycast(&world.library, world.root, camera_pos, ray_dir, edit_depth)
+        .map(|h| h.t)
+        .unwrap_or(f32::INFINITY);
+    if hit.t >= tree_t { return None; }
+    Some(hit)
+}
 
 impl App {
     /// CPU raycast depth: the camera's anchor depth. Zoom is no
@@ -76,16 +108,20 @@ impl App {
         let edit_depth = self.edit_depth();
         let camera_pos = crate::world::coords::world_pos_to_f32(&self.camera.position);
 
-        // Spherical-tree break: clear the targeted subtree if the
-        // planet is hit closer than any Cartesian tree block.
-        if editing::try_cs_break(
-            &mut self.world,
-            self.cs_planet.as_mut(),
-            &self.body_anchor,
-            camera_pos,
-            ray_dir,
-            edit_depth,
+        // Spherical-tree break: clear the targeted cell if the body
+        // is hit closer than any Cartesian-tree block along the ray.
+        if let Some(hit) = cs_cursor_hit(
+            &self.world, self.cs_planet.as_ref(),
+            camera_pos, ray_dir, edit_depth,
         ) {
+            if let Some(planet) = self.cs_planet.as_mut() {
+                planet.set_cell_at_depth(
+                    &mut self.world, &self.body_anchor,
+                    hit.face, hit.iu, hit.iv, hit.ir, hit.depth,
+                    Child::Empty,
+                );
+                self.upload_tree();
+            }
             return;
         }
 
@@ -144,16 +180,21 @@ impl App {
         // cell with the active hotbar block. Meshes fall through to
         // the Cartesian tree placer below.
         if let Some(block_type) = self.ui.active_block_type() {
-            if editing::try_cs_place(
-                &mut self.world,
-                self.cs_planet.as_mut(),
-                &self.body_anchor,
-                camera_pos,
-                ray_dir,
-                edit_depth,
-                block_type,
+            if let Some(hit) = cs_cursor_hit(
+                &self.world, self.cs_planet.as_ref(),
+                camera_pos, ray_dir, edit_depth,
             ) {
-                return;
+                if let Some((face, iu, iv, ir)) = hit.prev {
+                    if let Some(planet) = self.cs_planet.as_mut() {
+                        planet.set_cell_at_depth(
+                            &mut self.world, &self.body_anchor,
+                            face, iu, iv, ir, hit.depth,
+                            Child::Block(block_type),
+                        );
+                        self.upload_tree();
+                    }
+                    return;
+                }
             }
         }
 
@@ -332,7 +373,7 @@ impl App {
         // Cubed-sphere cursor. Highlight depth comes from the same
         // `cs_edit_depth` the break path uses, so what you see is
         // exactly what you break.
-        let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.edit_depth());
+        let cs_depth = cs_edit_depth(self.cs_planet.as_ref(), self.edit_depth());
         let cs_hit = self.cs_planet.as_ref().and_then(|p| {
             p.raycast(&self.world.library, crate::world::coords::world_pos_to_f32(&self.camera.position), ray_dir, cs_depth)
         });

@@ -549,13 +549,11 @@ fn rebuild_with_edit(
     new_child: Child,
 ) -> NodeId {
     let Some(node) = lib.get(current_id) else { return current_id; };
+    let kind = node.kind;
     let target_slot = slots[level];
     let mut new_children = node.children;
 
     if level + 1 == slots.len() {
-        // Treat a pointer-to-uniform-subtree identical to its
-        // scalar equivalent so setting an effectively-empty slot
-        // to Empty is a no-op, not a churn of the library.
         if child_equivalent_to(lib, node.children[target_slot], new_child) {
             return current_id;
         }
@@ -563,9 +561,6 @@ fn rebuild_with_edit(
     } else {
         let child_next_id = match node.children[target_slot] {
             Child::Node(nid) => {
-                // If the whole subtree is already uniform-`new_child`,
-                // no descent is needed — the leaf deep inside is
-                // already what we want.
                 if child_equivalent_to(lib, Child::Node(nid), new_child) {
                     return current_id;
                 }
@@ -575,9 +570,6 @@ fn rebuild_with_edit(
                 if other == new_child {
                     return current_id;
                 }
-                // Expand the terminal into a Node of 27 identical
-                // children and recurse into it. Dedup keeps repeated
-                // expansions cheap.
                 let expanded = lib.insert(uniform_children(other));
                 rebuild_with_edit(lib, expanded, slots, level + 1, new_child)
             }
@@ -585,7 +577,9 @@ fn rebuild_with_edit(
         new_children[target_slot] = Child::Node(child_next_id);
     }
 
-    lib.insert(new_children)
+    // Preserve the rebuilt node's kind so a body / face that's edited
+    // doesn't get demoted to Cartesian on the way back up.
+    lib.insert_with_kind(new_children, kind)
 }
 
 impl SphericalPlanet {

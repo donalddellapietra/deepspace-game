@@ -520,8 +520,11 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_nod
     }
 }
 
-/// Apply an edit and propagate clone-on-write up to root.
-fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bool {
+/// Apply an edit and propagate clone-on-write up to root, preserving
+/// each rebuilt node's `NodeKind`. This matters when the path passes
+/// through `CubedSphereBody` or `CubedSphereFace` — re-inserting them
+/// as `Cartesian` would orphan the planet handle.
+pub(crate) fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bool {
     if hit.path.is_empty() {
         return false;
     }
@@ -530,19 +533,19 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
 
     for i in (0..hit.path.len()).rev() {
         let (node_id, slot) = hit.path[i];
-        let node = match world.library.get(node_id) {
-            Some(n) => n,
+        let (children, kind) = match world.library.get(node_id) {
+            Some(n) => (n.children, n.kind),
             None => return false,
         };
 
-        let mut new_children = node.children;
+        let mut new_children = children;
         if let Some(nid) = replacement {
             new_children[slot] = Child::Node(nid);
         } else {
             new_children[slot] = new_child;
         }
 
-        replacement = Some(world.library.insert(new_children));
+        replacement = Some(world.library.insert_with_kind(new_children, kind));
     }
 
     if let Some(new_root) = replacement {
