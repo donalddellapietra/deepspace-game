@@ -32,14 +32,6 @@ pub struct GpuUniforms {
     /// `[xyz, xyz + 3·w)`). When the render frame is the world root,
     /// this is `(0, 0, 0, 1)`.
     pub render_frame: [f32; 4],
-    /// Sphere body's world frame. xyz = min corner of the body's
-    /// cube in world units; w = cube side length. Combined with
-    /// the body's NodeKind payload (looked up via `body_idx`), this
-    /// is all the shader needs to march the cubed-sphere shell.
-    pub body_world: [f32; 4],
-    /// Packed-buffer index of the body node. `u32::MAX` = no body.
-    pub body_idx: u32,
-    pub _body_pad: [u32; 3],
 }
 
 pub struct Renderer {
@@ -65,8 +57,6 @@ pub struct Renderer {
     body_highlight_active: [f32; 4],
     body_highlight_cell: [f32; 4],
     render_frame: [f32; 4],
-    body_world: [f32; 4],
-    body_idx: u32,
 }
 
 impl Renderer {
@@ -178,9 +168,6 @@ impl Renderer {
             body_highlight_active: [0.0; 4],
             body_highlight_cell: [0.0; 4],
             render_frame: [0.0, 0.0, 0.0, 1.0],
-            body_world: [0.0, 0.0, 0.0, 0.0],
-            body_idx: u32::MAX,
-            _body_pad: [0; 3],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -324,18 +311,7 @@ impl Renderer {
             body_highlight_active: [0.0; 4],
             body_highlight_cell: [0.0; 4],
             render_frame: [0.0, 0.0, 0.0, 1.0],
-            body_world: [0.0, 0.0, 0.0, 0.0],
-            body_idx: u32::MAX,
         }
-    }
-
-    /// Set the body's world frame (min corner + cube side length)
-    /// and its packed-buffer index. `body_idx == u32::MAX` hides the
-    /// body entirely (the shader treats it as absent).
-    pub fn set_body(&mut self, world: [f32; 4], buf_idx: u32) {
-        self.body_world = world;
-        self.body_idx = buf_idx;
-        self.write_uniforms();
     }
 
     /// Declare the world-space footprint of the packed tree's root.
@@ -511,9 +487,6 @@ impl Renderer {
             body_highlight_active: self.body_highlight_active,
             body_highlight_cell: self.body_highlight_cell,
             render_frame: self.render_frame,
-            body_world: self.body_world,
-            body_idx: self.body_idx,
-            _body_pad: [0; 3],
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

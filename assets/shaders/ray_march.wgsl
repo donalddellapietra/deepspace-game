@@ -43,16 +43,6 @@ struct Uniforms {
     // root-cell (root node spans [xyz, xyz + 3*w)). When the render
     // frame is the world root, this is (0, 0, 0, 1).
     render_frame: vec4<f32>,
-    // Sphere body's world frame: xyz = body cube's min corner,
-    // w = body cube side length. The body's center in world is
-    // `xyz + 0.5·w`, and shell radii are `inner_r·w` / `outer_r·w`
-    // using the radii on `node_metas[body_idx]`.
-    body_world: vec4<f32>,
-    // Packed-buffer index of the body node. 0xFFFFFFFF = no body.
-    body_idx: u32,
-    _body_pad0: u32,
-    _body_pad1: u32,
-    _body_pad2: u32,
 }
 
 /// Per-node metadata — the NodeKind exposed to the shader. Layout
@@ -292,25 +282,6 @@ fn body_frame_from(
         origin + vec3<f32>(0.5 * cube_w),
         inner_r_local * cube_w,
         outer_r_local * cube_w,
-    );
-}
-
-/// Read the body's world frame straight from the uniforms. The CPU
-/// side pins the body into the packed buffer as a secondary root
-/// and publishes its buffer index + world footprint, so the shader
-/// can march it regardless of where the camera is in the tree. No
-/// tree walk needed.
-fn find_visible_body() -> BodyFrame {
-    let buf_idx = uniforms.body_idx;
-    if buf_idx == 0xFFFFFFFFu { return body_frame_none(); }
-    let body_meta = node_metas[buf_idx];
-    if body_meta.kind_tag != 1u { return body_frame_none(); }
-    return body_frame_from(
-        buf_idx,
-        uniforms.body_world.xyz,
-        uniforms.body_world.w,
-        body_meta.inner_r,
-        body_meta.outer_r,
     );
 }
 
@@ -669,13 +640,52 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.normal = normal;
             return result;
         } else if tag == 2u {
-            // Node — check NodeKind first. Body / face cells are
-            // owned by the cubed-sphere DDA (`march_body`); the
-            // Cartesian walk MUST treat them as empty so it doesn't
-            // render the body as a flat box, occluding the sphere.
+            // Node — dispatch on NodeKind. The body is rendered
+            // INLINE here, in the cell's local frame derived from
+            // the descent context — no separate uniform pipeline.
             let candidate_idx = child_node_index(s_node_idx[depth], slot);
-            let candidate_kind = node_metas[candidate_idx].kind_tag;
-            if candidate_kind != 0u {
+            let candidate_meta = node_metas[candidate_idx];
+            if candidate_meta.kind_tag == 1u {
+                // CubedSphereBody: run cubed-sphere DDA for this
+                // cell, using its world-space (origin, cube_w) from
+                // the descent context and (inner_r, outer_r) from
+                // the kind metadata. On hit, return; on miss, treat
+                // the cell as empty for the parent walk.
+                let parent_origin = s_node_origin[depth];
+                let parent_cell_size = s_cell_size[depth];
+                let body_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
+                let body_frame = body_frame_from(
+                    candidate_idx, body_origin, parent_cell_size,
+                    candidate_meta.inner_r, candidate_meta.outer_r,
+                );
+                let bh = march_body(ray_origin, ray_dir, body_frame);
+                if bh.hit {
+                    result.hit = true;
+                    result.t = bh.t;
+                    result.color = bh.color;
+                    result.normal = bh.normal;
+                    return result;
+                }
+                // Body missed — advance DDA past this cell.
+                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                    s_cell[depth].x += step.x;
+                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                    s_cell[depth].y += step.y;
+                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                } else {
+                    s_cell[depth].z += step.z;
+                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                }
+                continue;
+            }
+            if candidate_meta.kind_tag == 2u {
+                // CubedSphereFace shouldn't appear as a Cartesian
+                // child (faces always sit under bodies). Treat as
+                // empty if encountered.
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -820,23 +830,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         camera.forward + camera.right * ndc.x + camera.up * ndc.y
     );
 
-    // Two marches, independent: the Cartesian tree DDA and the
-    // cubed-sphere body DDA. Whichever hit is closer wins. The body
-    // is discovered from `node_metas` — no dedicated uniforms.
+    // Single unified march. The Cartesian tree walk dispatches on
+    // NodeKind when it hits a body cell — the cubed-sphere DDA runs
+    // INLINE inside `march()`, in the cell's local frame derived
+    // from descent context. No separate uniform-driven body pass.
     let tree_hit = march(camera.pos, ray_dir);
-    let body = find_visible_body();
-    let body_hit = march_body(camera.pos, ray_dir, body);
 
     var color: vec3<f32>;
-    let tree_closer = tree_hit.hit && tree_hit.t <= body_hit.t;
-    if tree_closer {
+    if tree_hit.hit {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(tree_hit.normal, sun_dir), 0.0);
         let ambient = 0.3;
         let lit = tree_hit.color * (ambient + diffuse * 0.7);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
-    } else if body_hit.hit {
-        color = pow(body_hit.color, vec3<f32>(1.0 / 2.2));
     } else {
         let sky_t = ray_dir.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
@@ -844,13 +850,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Block highlight outline: Minecraft-style wireframe cube.
     // Draws all 12 edges with screen-space constant-pixel width.
-    // Occluded by the nearer of the Cartesian tree hit and the body
-    // hit — whichever a ray encounters first should cover the edge.
-    let occluder_t = select(
-        select(1e20, body_hit.t, body_hit.hit),
-        tree_hit.t,
-        tree_hit.hit && (!body_hit.hit || tree_hit.t <= body_hit.t),
-    );
+    // Occluded against the unified march — body and Cartesian hits
+    // both come back through `tree_hit`.
+    let occluder_t = select(1e20, tree_hit.t, tree_hit.hit);
     if uniforms.highlight_active != 0u {
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;

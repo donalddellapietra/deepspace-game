@@ -312,17 +312,17 @@ impl App {
         let (rf_origin, rf_cell, rf_node) = self.render_frame();
 
         // Re-resolve the body from `body_anchor` each frame. The
-        // walk catches cases where a Cartesian edit has replaced the
-        // body cell — stale ids can't outlive an edit and sneak into
-        // the packer. `self.cs_planet.body_node` is refreshed to
-        // match the current tree state.
-        let body_node = self.refresh_body_node();
-        let mut roots: Vec<u64> = vec![rf_node];
-        if let Some(b) = body_node { roots.push(b); }
+        // walk catches cases where a Cartesian edit has replaced
+        // the body cell — stale ids can't sneak into the packer.
+        let _ = self.refresh_body_node();
 
+        // Single-root pack. The body and its face subtrees are
+        // reachable as Cartesian descendants of the world root, so
+        // BFS picks them up automatically. The shader's tree walk
+        // dispatches on NodeKind when it descends into the body.
         let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
-            &roots,
+            &[rf_node],
             crate::world::coords::world_pos_to_f32(&self.camera.position),
             1440.0,
             1.2,
@@ -330,25 +330,9 @@ impl App {
             rf_cell,
         );
 
-        // Derive the body's world frame from its anchor path, so the
-        // shader doesn't have to re-walk the tree. Body occupies one
-        // cell at `body_anchor.depth()` in world units.
-        let (body_world, body_idx) = if body_node.is_some() {
-            use crate::world::coords::{world_pos_to_f32, WorldPos, ROOT_EXTENT};
-            let cube_w = ROOT_EXTENT / 3f32.powi(self.body_anchor.depth() as i32);
-            let origin = world_pos_to_f32(&WorldPos {
-                anchor: self.body_anchor,
-                offset: [0.0, 0.0, 0.0],
-            });
-            ([origin[0], origin[1], origin[2], cube_w], root_indices[1])
-        } else {
-            ([0.0; 4], u32::MAX)
-        };
-
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &tree_metas, root_indices[0]);
             renderer.set_render_frame(rf_origin, rf_cell);
-            renderer.set_body(body_world, body_idx);
         }
     }
 
