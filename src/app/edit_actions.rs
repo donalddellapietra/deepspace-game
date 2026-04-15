@@ -19,15 +19,17 @@ impl App {
         self.anchor_depth().saturating_sub(1).max(1)
     }
 
-    /// Face-subtree depth at which sphere edits land — picks a
-    /// user-visible cell granularity instead of the planet's
-    /// deepest sub-pixel resolution. Without this cap the walker
-    /// descends all 20 face-subtree levels and breaks/places
-    /// modify cells smaller than a pixel — they succeed but are
-    /// invisible. Mirrors the old `cs_edit_depth = 4 + (15 -
-    /// zoom_level)` formula, clamped to `[1, 14]`.
+    /// Face-subtree depth at which sphere edits land. Picks a
+    /// user-visible cell granularity matching the UI's layer
+    /// readout: placing at "Layer N" produces a block whose cell
+    /// size is exactly 3^N cells per face axis. The previous
+    /// `anchor - 4` formula was off by one — placements at Layer
+    /// N landed at face-subtree depth N-1 ("Layer N+1 block").
+    /// Cap remains at 15 for f32-integer precision in the shader's
+    /// `floor(un * 3^depth)` highlight comparison (2^24 ≈ 1.6e7;
+    /// 3^15 ≈ 1.4e7 — last depth safely below the mantissa).
     pub(super) fn cs_edit_depth(&self) -> u32 {
-        ((self.anchor_depth() as i32) - 4).clamp(1, 14) as u32
+        ((self.anchor_depth() as i32) - 3).clamp(1, 15) as u32
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
