@@ -856,39 +856,33 @@ fn walk_face_subtree_with_path(
             Child::Empty => return Some((0, d, path)),
             Child::Block(b) => return Some((b, d, path)),
             Child::Node(nid) => {
-                // Mirror `pack_tree_lod`'s exact flattening rule
-                // (gpu.rs:202, 214): uniform-content collapse only
-                // fires when BOTH the parent being walked AND the
-                // child are Cartesian. At the face root (kind =
-                // CubedSphereFace) the packer preserves children
-                // as tag=2 even when the subtree is uniform. If we
-                // applied the stop unconditionally the CPU walker
-                // would return one level shallower than the shader
-                // — targeting a coarser cell than the user sees,
-                // which is what "below layer 15 is broken" felt
-                // like: cursor drift on every zoomed interaction.
-                if let Some(child_node) = library.get(nid) {
-                    let parent_is_cartesian = matches!(node.kind, NodeKind::Cartesian);
-                    let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
-                    if parent_is_cartesian
-                        && child_is_cartesian
-                        && child_node.uniform_type != UNIFORM_MIXED
-                    {
-                        let block = if child_node.uniform_type == UNIFORM_EMPTY {
-                            0
-                        } else {
-                            child_node.uniform_type
-                        };
-                        return Some((block, d, path));
-                    }
-                }
+                // Descend all the way to `limit` (= cs_edit_depth).
+                // Do NOT stop at uniform-content subtrees: below
+                // SDF_DETAIL_LEVELS the face subtree is a uniform
+                // chain (stone or empty), and stopping there caps
+                // the editable cell size at the SDF detail level
+                // regardless of zoom — "interaction stops at layer
+                // 15." The shader packer still flattens those
+                // uniform chains for rendering efficiency, but that
+                // doesn't prevent edits at finer paths: editing a
+                // sub-cell of a uniform chain simply forces the
+                // packer to re-materialize that subtree on the next
+                // upload, so the finer geometry becomes visible
+                // exactly where the edit landed.
                 if d == limit {
-                    // Hit the depth cap mid-descent on a mixed
-                    // child. Report the subtree's representative
-                    // block so the cursor lands on this cell.
-                    let rep = library.get(nid)
-                        .map(|n| n.representative_block).unwrap_or(255);
-                    let block = if rep < 255 { rep } else { 0 };
+                    // Cap: report the cell at this depth via the
+                    // child subtree's uniform/representative block.
+                    let Some(child_node) = library.get(nid) else {
+                        return Some((0, d, path));
+                    };
+                    let block = match child_node.uniform_type {
+                        UNIFORM_MIXED => {
+                            let rep = child_node.representative_block;
+                            if rep < 255 { rep } else { 0 }
+                        }
+                        UNIFORM_EMPTY => 0,
+                        b => b,
+                    };
                     return Some((block, d, path));
                 }
                 node_id = nid;
