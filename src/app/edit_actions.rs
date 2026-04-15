@@ -101,10 +101,12 @@ impl App {
     /// shader's `kinds[root]==1 → march_sphere_body` dispatch handle
     /// the entire planet from one render call.
     pub(super) fn render_root_depth(&self) -> u8 {
-        const RENDER_FRAME_K: u8 = 3;
-        const PLANET_BODY_DEPTH: u8 = 1;
-        let desired = self.camera.position.depth.saturating_sub(RENDER_FRAME_K);
-        desired.min(PLANET_BODY_DEPTH)
+        // Temporarily disabled dynamic render frame to isolate
+        // whether the "flat wall in space" is caused by it. With
+        // render_root_depth = 0 the shader renders in the original
+        // tree-root frame, so behavior should match the pre-dynamic
+        // baseline (e9dc645 and earlier).
+        0
     }
 
     /// NodeId of the render root — walks `camera.position.path[..]`
@@ -379,6 +381,18 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_cubed_sphere_planet(center_render, inner_render, outer_render, planet_depth);
         }
+        // One-shot per-frame debug. Intentionally chatty during the
+        // dynamic-render-frame bring-up; remove once we're done.
+        let cam_render = self.camera_pos_in_render_frame();
+        let cam_world = self.camera_pos_world();
+        eprintln!(
+            "[frame] rrd={} root_id={} root_kind={:?} cs_center_render={:?} cs_outer_render={:.3} cs_inner_render={:.3} cam_render={:?} cam_world={:?}",
+            rrd,
+            self.render_root_id(),
+            self.world.library.get(self.render_root_id()).map(|n| n.kind),
+            center_render, outer_render, inner_render,
+            cam_render, cam_world,
+        );
     }
 
     pub(super) fn update_highlight(&mut self) {
