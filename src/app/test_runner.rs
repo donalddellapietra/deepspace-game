@@ -197,8 +197,19 @@ impl TestConfig {
             || self.require_webview
     }
 
+    pub fn prefers_live_loop(&self) -> bool {
+        self.screenshot.is_none()
+            && (
+                self.min_fps.is_some()
+                    || self.min_cadence_fps.is_some()
+                    || self.run_for_secs.is_some()
+                    || self.max_frame_gap_ms.is_some()
+                    || self.require_webview
+            )
+    }
+
     pub fn use_render_harness(&self) -> bool {
-        self.render_harness || self.screenshot.is_some()
+        (self.render_harness && !self.prefers_live_loop()) || self.screenshot.is_some()
     }
 }
 

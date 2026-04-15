@@ -13,7 +13,7 @@
 use crate::world::anchor::{Path, WORLD_SIZE};
 use crate::world::cubesphere::{coord_to_world, world_to_coord, CubeSphereCoord, Face};
 use crate::world::sdf;
-use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SphereFrame {
@@ -155,6 +155,33 @@ pub fn point_world_to_body_frame(sphere: &SphereFrame, point: [f32; 3]) -> [f32;
     ]
 }
 
+pub fn aabb_world_to_body_frame(
+    sphere: &SphereFrame,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let corners = [
+        [aabb_min[0], aabb_min[1], aabb_min[2]],
+        [aabb_min[0], aabb_min[1], aabb_max[2]],
+        [aabb_min[0], aabb_max[1], aabb_min[2]],
+        [aabb_min[0], aabb_max[1], aabb_max[2]],
+        [aabb_max[0], aabb_min[1], aabb_min[2]],
+        [aabb_max[0], aabb_min[1], aabb_max[2]],
+        [aabb_max[0], aabb_max[1], aabb_min[2]],
+        [aabb_max[0], aabb_max[1], aabb_max[2]],
+    ];
+    let mut out_min = [f32::INFINITY; 3];
+    let mut out_max = [f32::NEG_INFINITY; 3];
+    for corner in corners {
+        let p = point_world_to_body_frame(sphere, corner);
+        for axis in 0..3 {
+            out_min[axis] = out_min[axis].min(p[axis]);
+            out_max[axis] = out_max[axis].max(p[axis]);
+        }
+    }
+    (out_min, out_max)
+}
+
 pub fn frame_point_to_body(point: [f32; 3], sphere: &SphereFrame) -> [f32; 3] {
     let (body_origin, body_size) = frame_origin_size_world(&sphere.body_path);
     let body_center = [
@@ -209,6 +236,77 @@ pub fn world_dir_to_frame(
         shifted[1] - base[1],
         shifted[2] - base[2],
     ])
+}
+
+pub fn camera_surface_path_for_sphere(
+    sphere: &SphereFrame,
+    camera_world: [f32; 3],
+    forward_world: [f32; 3],
+    desired_depth: u8,
+) -> Option<Path> {
+    let (body_origin, body_size) = frame_origin_size_world(&sphere.body_path);
+    let body_center = [
+        body_origin[0] + body_size * 0.5,
+        body_origin[1] + body_size * 0.5,
+        body_origin[2] + body_size * 0.5,
+    ];
+    let outer_r_world = sphere.outer_r * body_size;
+    let ray_dir = sdf::normalize(forward_world);
+    let oc = [
+        camera_world[0] - body_center[0],
+        camera_world[1] - body_center[1],
+        camera_world[2] - body_center[2],
+    ];
+    let b = oc[0] * ray_dir[0] + oc[1] * ray_dir[1] + oc[2] * ray_dir[2];
+    let c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - outer_r_world * outer_r_world;
+    let disc = b * b - c;
+    if disc <= 0.0 {
+        return None;
+    }
+    let sq = disc.sqrt();
+    let t_enter = (-b - sq).max(0.0);
+    let t_exit = -b + sq;
+    let t = if t_enter > 0.0 { t_enter } else { t_exit };
+    if t <= 0.0 {
+        return None;
+    }
+    let hit_world = [
+        camera_world[0] + ray_dir[0] * t,
+        camera_world[1] + ray_dir[1] * t,
+        camera_world[2] + ray_dir[2] * t,
+    ];
+    let coord = world_to_coord(body_center, hit_world)?;
+    let shell_world = (sphere.outer_r - sphere.inner_r) * body_size;
+    if shell_world <= 0.0 {
+        return None;
+    }
+    let eps = 1e-5;
+    let mut un = ((coord.u + 1.0) * 0.5).clamp(eps, 1.0 - eps);
+    let mut vn = ((coord.v + 1.0) * 0.5).clamp(eps, 1.0 - eps);
+    let mut rn = ((coord.r - sphere.inner_r * body_size) / shell_world).clamp(eps, 1.0 - eps);
+
+    let mut path = sphere.body_path;
+    path.push(crate::world::cubesphere::FACE_SLOTS[coord.face as usize] as u8);
+
+    let mut u_min = 0.0f32;
+    let mut v_min = 0.0f32;
+    let mut r_min = 0.0f32;
+    let mut size = 1.0f32;
+    while usize::from(path.depth()) < desired_depth as usize {
+        let child_size = size / 3.0;
+        let su = (((un - u_min) / child_size).floor() as i32).clamp(0, 2) as usize;
+        let sv = (((vn - v_min) / child_size).floor() as i32).clamp(0, 2) as usize;
+        let sr = (((rn - r_min) / child_size).floor() as i32).clamp(0, 2) as usize;
+        path.push(slot_index(su, sv, sr) as u8);
+        u_min += su as f32 * child_size;
+        v_min += sv as f32 * child_size;
+        r_min += sr as f32 * child_size;
+        size = child_size;
+        un = un.clamp(u_min + eps.min(size * 0.25), u_min + size - eps.min(size * 0.25));
+        vn = vn.clamp(v_min + eps.min(size * 0.25), v_min + size - eps.min(size * 0.25));
+        rn = rn.clamp(r_min + eps.min(size * 0.25), r_min + size - eps.min(size * 0.25));
+    }
+    Some(path)
 }
 
 /// Build a `Path` from the slot prefix the GPU ribbon walker

@@ -109,7 +109,7 @@ pub fn pack_tree_lod_preserving(
     camera_pos: [f32; 3],
     screen_height: f32,
     fov: f32,
-    preserve_path: &[u8],
+    preserve_paths: &[&[u8]],
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     use std::collections::HashSet;
 
@@ -119,13 +119,15 @@ pub fn pack_tree_lod_preserving(
     // slot) pair at each step.
     let mut preserve_pairs: HashSet<(NodeId, u8)> = HashSet::new();
     {
-        let mut current = root;
-        for &slot in preserve_path {
-            preserve_pairs.insert((current, slot));
-            let Some(node) = library.get(current) else { break };
-            match node.children[slot as usize] {
-                Child::Node(child_id) => { current = child_id; }
-                _ => break,
+        for preserve_path in preserve_paths {
+            let mut current = root;
+            for &slot in *preserve_path {
+                preserve_pairs.insert((current, slot));
+                let Some(node) = library.get(current) else { break };
+                match node.children[slot as usize] {
+                    Child::Node(child_id) => { current = child_id; }
+                    _ => break,
+                }
             }
         }
     }

@@ -29,7 +29,6 @@ use crate::world::tree::{NodeKind, MAX_DEPTH};
 pub const RENDER_FRAME_K: u8 = 3;
 pub const RENDER_FRAME_MAX_DEPTH: u8 = MAX_DEPTH as u8;
 pub const RENDER_FRAME_CONTEXT: u8 = 4;
-
 pub mod cursor;
 pub mod edit_actions;
 pub mod event_loop;
@@ -301,13 +300,50 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_world = self.camera.world_pos_f32();
-        let cam_local = self.camera.position.in_frame(&frame.render_path);
+        let cam_local = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => frame::point_world_to_body_frame(&sphere, cam_world),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                self.camera.position.in_frame(&frame.render_path)
+            }
+        };
+        if self.startup_profile_frames < 4 {
+            let projected = frame::point_world_to_frame(frame, cam_world);
+            eprintln!(
+                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?} projected={:?}",
+                frame.kind,
+                frame.render_path.as_slice(),
+                frame.logical_path.as_slice(),
+                cam_local,
+                projected,
+            );
+        }
         let (fwd_world, right_world, up_world) = self.camera.basis();
+        let (fwd_local, right_local, up_local) = match frame.kind {
+            ActiveFrameKind::Sphere(_) => (
+                crate::world::sdf::normalize(fwd_world),
+                crate::world::sdf::normalize(right_world),
+                crate::world::sdf::normalize(up_world),
+            ),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
+                frame::world_dir_to_frame(frame, cam_world, fwd_world),
+                frame::world_dir_to_frame(frame, cam_world, right_world),
+                frame::world_dir_to_frame(frame, cam_world, up_world),
+            ),
+        };
+        if self.startup_profile_frames < 4 {
+            eprintln!(
+                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
+                fwd_world,
+                fwd_local,
+                right_local,
+                up_local,
+            );
+        }
         self.camera.gpu_camera_with_basis(
             cam_local,
-            frame::world_dir_to_frame(frame, cam_world, fwd_world),
-            frame::world_dir_to_frame(frame, cam_world, right_world),
-            frame::world_dir_to_frame(frame, cam_world, up_world),
+            fwd_local,
+            right_local,
+            up_local,
             1.2,
         )
     }

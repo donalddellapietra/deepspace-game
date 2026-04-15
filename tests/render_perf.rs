@@ -2,7 +2,6 @@
 #[test]
 fn startup_render_stays_above_50_fps() {
     let output = run_game(&[
-        "--render-harness",
         "--disable-overlay",
         "--spawn-depth", "17",
         "--run-for-secs", "2",
@@ -21,7 +20,6 @@ fn startup_render_stays_above_50_fps() {
 #[test]
 fn zoom_transition_to_layer_18_does_not_freeze() {
     let output = run_game(&[
-        "--render-harness",
         "--disable-overlay",
         "--spawn-depth", "17",
         "--script", "wait:8,zoom_out:12,wait:1000",
