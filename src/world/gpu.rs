@@ -435,7 +435,12 @@ pub fn pack_tree_lod_multi_with_frame(
                     Some(n) => n,
                     None => continue,
                 };
-                if child_node.uniform_type != UNIFORM_MIXED {
+                // Sphere body / face nodes must reach the GPU as
+                // full Node children — the cubed-sphere DDA reads
+                // them via `child_node_index`. Skip uniform / LOD
+                // flattening that would convert them to a Block.
+                let preserve_node = !child_node.kind.is_cartesian();
+                if !preserve_node && child_node.uniform_type != UNIFORM_MIXED {
                     let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
                         GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
                     } else {
@@ -444,7 +449,7 @@ pub fn pack_tree_lod_multi_with_frame(
                     overrides[ordered_idx][slot] = Some(gpu);
                     continue;
                 }
-                if use_lod {
+                if use_lod && !preserve_node {
                     let (cx, cy, cz) = slot_coords(slot);
                     let child_center = [
                         node_origin[0] + (cx as f32 + 0.5) * cell_size,

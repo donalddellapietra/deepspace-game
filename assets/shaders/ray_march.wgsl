@@ -669,7 +669,28 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.normal = normal;
             return result;
         } else if tag == 2u {
-            // Node — check if we should descend or treat as solid.
+            // Node — check NodeKind first. Body / face cells are
+            // owned by the cubed-sphere DDA (`march_body`); the
+            // Cartesian walk MUST treat them as empty so it doesn't
+            // render the body as a flat box, occluding the sphere.
+            let candidate_idx = child_node_index(s_node_idx[depth], slot);
+            let candidate_kind = node_metas[candidate_idx].kind_tag;
+            if candidate_kind != 0u {
+                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                    s_cell[depth].x += step.x;
+                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                    s_cell[depth].y += step.y;
+                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                } else {
+                    s_cell[depth].z += step.z;
+                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                }
+                continue;
+            }
 
             // Hard depth limits.
             let at_max = depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH;
