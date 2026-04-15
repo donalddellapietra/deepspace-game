@@ -75,6 +75,15 @@ impl App {
         // key (title bar grayed out, clicks ignored). Doing all
         // heavy work before `run_app` keeps `resumed()` a fast
         // "create window + hand pre-built data to GPU" path.
+        eprintln!(
+            "================================================================\n\
+             DEEPSPACE-GAME refactor-position 2284342+ DEBUG BUILD\n\
+             - Physics OFF. WASD/Space/Shift = teleport one cell.\n\
+             - R = reset to (1.5, 2.0, 1.5) looking down.\n\
+             - Each teleport prints a `[teleport] dir=...` line.\n\
+             If you don't see this banner, you're running a different binary.\n\
+             ================================================================",
+        );
         let mut world = crate::world::worldgen::generate_world();
         let tree_depth = world.tree_depth();
 
