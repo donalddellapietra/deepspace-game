@@ -896,68 +896,93 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
             Some(n) => n,
             None => break,
         };
-        // If THIS node is the body, the next path entry uses
-        // a face slot — switch to bulged-voxel AABB math.
-        if let NodeKind::CubedSphereBody { inner_r, outer_r } = node.kind {
-            // Body cell occupies [origin, origin + cell_size)^3.
-            let body_origin = origin;
-            let body_size = cell_size;
-            let body_center = [
-                body_origin[0] + body_size * 0.5,
-                body_origin[1] + body_size * 0.5,
-                body_origin[2] + body_size * 0.5,
-            ];
-            // Determine which face from this path entry's slot.
-            let face = match (0..6).find(|&f| FACE_SLOTS[f] == slot) {
-                Some(f) => Face::from_index(f as u8),
-                None => {
-                    // Hit is in the body's interior or non-face slot
-                    // — fall back to the body's AABB.
-                    return (body_origin, [
-                        body_origin[0] + body_size,
-                        body_origin[1] + body_size,
-                        body_origin[2] + body_size,
-                    ]);
+        // Detect the body by inspecting the CHILD at this slot, not
+        // the current node's kind. At this point `origin`/`cell_size`
+        // describe the current node's children: the child at `slot`
+        // occupies `[origin + (x,y,z)*cell_size, +cell_size)^3` with
+        // width `cell_size`. If we advanced state first and then
+        // checked the body at path[i+1], `cell_size` would already be
+        // the body's *children's* width (1/3 of its cell) — wrong
+        // scale for body_center and r_world. Matches `cpu_raycast`'s
+        // sphere dispatch, which uses `parent_cell_size` as body_size.
+        let child = node.children[slot];
+        if let Child::Node(child_id) = child {
+            if let Some(child_node) = library.get(child_id) {
+                if let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind {
+                    let (x, y, z) = slot_coords(slot);
+                    let body_origin = [
+                        origin[0] + x as f32 * cell_size,
+                        origin[1] + y as f32 * cell_size,
+                        origin[2] + z as f32 * cell_size,
+                    ];
+                    let body_size = cell_size;
+                    let body_center = [
+                        body_origin[0] + body_size * 0.5,
+                        body_origin[1] + body_size * 0.5,
+                        body_origin[2] + body_size * 0.5,
+                    ];
+                    // The NEXT path entry is (body_id, face_slot) —
+                    // determines which face subtree holds the hit.
+                    let face_slot = match hit.path.get(i + 1) {
+                        Some(&(_, fs)) => fs,
+                        None => {
+                            return (body_origin, [
+                                body_origin[0] + body_size,
+                                body_origin[1] + body_size,
+                                body_origin[2] + body_size,
+                            ]);
+                        }
+                    };
+                    let face = match (0..6).find(|&f| FACE_SLOTS[f] == face_slot) {
+                        Some(f) => Face::from_index(f as u8),
+                        None => {
+                            return (body_origin, [
+                                body_origin[0] + body_size,
+                                body_origin[1] + body_size,
+                                body_origin[2] + body_size,
+                            ]);
+                        }
+                    };
+                    // Remaining entries AFTER (body, face_slot) walk
+                    // the face subtree — each slot's (u, v, r)
+                    // accumulates cell indices.
+                    let mut iu: u32 = 0;
+                    let mut iv: u32 = 0;
+                    let mut ir: u32 = 0;
+                    let mut depth: u32 = 0;
+                    for &(_face_node_id, face_slot_idx) in &hit.path[i + 2..] {
+                        let (us, vs, rs) = slot_coords(face_slot_idx);
+                        iu = iu * 3 + us as u32;
+                        iv = iv * 3 + vs as u32;
+                        ir = ir * 3 + rs as u32;
+                        depth += 1;
+                    }
+                    // Cell extent in the face's normalized (u, v, r) frame.
+                    let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
+                    let u_lo = (iu as f32 / cells) * 2.0 - 1.0;
+                    let v_lo = (iv as f32 / cells) * 2.0 - 1.0;
+                    let r_lo_n = ir as f32 / cells;
+                    let du = 2.0 / cells;
+                    let dv = 2.0 / cells;
+                    let drn = 1.0 / cells;
+                    let r_world_lo = inner_r * body_size + r_lo_n * (outer_r - inner_r) * body_size;
+                    let dr_world = drn * (outer_r - inner_r) * body_size;
+                    let corners = block_corners(
+                        body_center, face,
+                        u_lo, v_lo, r_world_lo,
+                        du, dv, dr_world,
+                    );
+                    let mut aabb_min = corners[0];
+                    let mut aabb_max = corners[0];
+                    for c in &corners[1..] {
+                        for k in 0..3 {
+                            if c[k] < aabb_min[k] { aabb_min[k] = c[k]; }
+                            if c[k] > aabb_max[k] { aabb_max[k] = c[k]; }
+                        }
+                    }
+                    return (aabb_min, aabb_max);
                 }
-            };
-            // Walk remaining path slots inside the face subtree to
-            // accumulate cell indices and depth.
-            let mut iu: u32 = 0;
-            let mut iv: u32 = 0;
-            let mut ir: u32 = 0;
-            let mut depth: u32 = 0;
-            for &(_face_node_id, face_slot_idx) in &hit.path[i + 1..] {
-                let (us, vs, rs) = slot_coords(face_slot_idx);
-                iu = iu * 3 + us as u32;
-                iv = iv * 3 + vs as u32;
-                ir = ir * 3 + rs as u32;
-                depth += 1;
             }
-            // Cell extent in the face's normalized (u, v, r) frame.
-            let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
-            let u_lo = (iu as f32 / cells) * 2.0 - 1.0;
-            let v_lo = (iv as f32 / cells) * 2.0 - 1.0;
-            let r_lo_n = ir as f32 / cells;
-            let du = 2.0 / cells;
-            let dv = 2.0 / cells;
-            let drn = 1.0 / cells;
-            let r_world_lo = inner_r * body_size + r_lo_n * (outer_r - inner_r) * body_size;
-            let dr_world = drn * (outer_r - inner_r) * body_size;
-            // World corners of the bulged voxel.
-            let corners = block_corners(
-                body_center, face,
-                u_lo, v_lo, r_world_lo,
-                du, dv, dr_world,
-            );
-            let mut aabb_min = corners[0];
-            let mut aabb_max = corners[0];
-            for c in &corners[1..] {
-                for k in 0..3 {
-                    if c[k] < aabb_min[k] { aabb_min[k] = c[k]; }
-                    if c[k] > aabb_max[k] { aabb_max[k] = c[k]; }
-                }
-            }
-            return (aabb_min, aabb_max);
         }
         // Cartesian step.
         let (x, y, z) = slot_coords(slot);
