@@ -313,11 +313,18 @@ struct HitResult {
     t: f32,
     /// Which ancestor-pop level the hit happened in. 0 = original
     /// camera frame; >0 = popped that many times into ancestors.
-    /// `t` is in this frame's units, not the camera's. Used by the
-    /// highlight overlay to decide whether to draw (today the
-    /// CPU only sends the camera-frame AABB, so popped hits skip
-    /// the outline — see unified-driver-refactor.md "Not yet done").
+    /// `t` is in this frame's units, not the camera's.
     frame_level: u32,
+    /// The highlight AABB transformed into the frame where the
+    /// hit happened. Follows the same pop transform as the ray
+    /// (`min = slot + min/3` on each pop). Lets fs_main test the
+    /// highlight box in the same coord system as `t`.
+    highlight_min: vec3<f32>,
+    highlight_max: vec3<f32>,
+    /// World-to-frame scale at the hit's level. frame_scale = 3^N
+    /// where N = frame_level. Used by fs_main to size the
+    /// highlight edge width consistently across pops.
+    frame_scale: f32,
 }
 
 // Sphere DDA running inside one CubedSphereBody cell. The body cell
@@ -337,6 +344,9 @@ fn sphere_in_cell(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
+    result.highlight_min = vec3<f32>(0.0);
+    result.highlight_max = vec3<f32>(0.0);
+    result.frame_scale = 1.0;
 
     let cs_center = body_cell_origin + vec3<f32>(body_cell_size * 0.5);
     let cs_outer = outer_r_local * body_cell_size;
@@ -466,6 +476,9 @@ fn march_cartesian(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
+    result.highlight_min = vec3<f32>(0.0);
+    result.highlight_max = vec3<f32>(0.0);
+    result.frame_scale = 1.0;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -727,6 +740,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var inner_r = uniforms.root_radii.x;
     var outer_r = uniforms.root_radii.y;
     var ribbon_level: u32 = 0u;
+    // Highlight AABB transforms alongside the ray on each pop so
+    // fs_main can test it in the same frame as `result.t`.
+    var cur_hmin = uniforms.highlight_min.xyz;
+    var cur_hmax = uniforms.highlight_max.xyz;
+    var cur_scale: f32 = 1.0;
 
     var hops: u32 = 0u;
     loop {
@@ -746,6 +764,9 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         }
         if r.hit {
             r.frame_level = ribbon_level;
+            r.highlight_min = cur_hmin;
+            r.highlight_max = cur_hmax;
+            r.frame_scale = cur_scale;
             return r;
         }
 
@@ -764,7 +785,13 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         // 1e-8 parallel-axis check after ~17 pops. Now `t` is no
         // longer continuous across frames — each frame's DDA runs
         // its own t starting from where the ray entered.
-        ray_origin = vec3<f32>(f32(sx), f32(sy), f32(sz)) + ray_origin / 3.0;
+        let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+        ray_origin = slot_off + ray_origin / 3.0;
+        // Same transform on the highlight AABB so it stays in
+        // the ray's current frame coords.
+        cur_hmin = slot_off + cur_hmin / 3.0;
+        cur_hmax = slot_off + cur_hmax / 3.0;
+        cur_scale = cur_scale * (1.0 / 3.0);
         // ray_dir unchanged.
         current_idx = entry.node_idx;
         let k = node_kinds[current_idx].kind;
@@ -782,6 +809,9 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
+    result.highlight_min = cur_hmin;
+    result.highlight_max = cur_hmax;
+    result.frame_scale = cur_scale;
     return result;
 }
 
@@ -825,14 +855,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    // Highlight overlay only renders for hits in the camera's
-    // own frame (frame_level == 0). Hits via ancestor pop have
-    // their `t` and ray coords in a popped frame, where the
-    // CPU-supplied AABB doesn't apply. Per-level AABBs is
-    // future work — see unified-driver-refactor.md.
-    if uniforms.highlight_active != 0u && (!result.hit || result.frame_level == 0u) {
-        let h_min = uniforms.highlight_min.xyz;
-        let h_max = uniforms.highlight_max.xyz;
+    // Highlight overlay — uses the frame-transformed AABB from
+    // the hit's frame (march() transforms cur_hmin/cur_hmax on
+    // each pop alongside the ray). For no-hit, still use the
+    // camera-frame AABB so sky rays can show the outline.
+    if uniforms.highlight_active != 0u {
+        let h_min = select(uniforms.highlight_min.xyz, result.highlight_min,
+                           result.hit);
+        let h_max = select(uniforms.highlight_max.xyz, result.highlight_max,
+                           result.hit);
         let h_size = h_max - h_min;
         let h_inv_dir = vec3<f32>(
             select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),

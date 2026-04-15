@@ -459,6 +459,11 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
         (aabb_min[2] + aabb_max[2]) * 0.5 + dz as f32 * cell_size,
     ];
 
+    eprintln!(
+        "place_child: hit_path_len={} face={} slot={} aabb_min={:?} aabb_max={:?} cell_size={} target={:?}",
+        hit.path.len(), hit.face, slot, aabb_min, aabb_max, cell_size, target,
+    );
+
     place_child_at_point(world, target, hit.path.len(), new_child)
 }
 

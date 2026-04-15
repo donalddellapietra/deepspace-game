@@ -9,6 +9,7 @@
 //! aren't yet supported. Rendering of the planet works.)
 
 use crate::game_state::HotbarItem;
+use crate::world::anchor::WORLD_SIZE;
 use crate::world::edit;
 use crate::world::gpu;
 
@@ -19,24 +20,20 @@ impl App {
         self.anchor_depth().saturating_sub(1).max(1)
     }
 
-    /// Face-subtree depth at which sphere edits land — picks a
-    /// user-visible cell granularity. Formula: anchor_depth - 4
-    /// (4 layers of headroom between visible scale and edit
-    /// scale). Lower bound 1 (can't edit at the body root).
+    /// Sphere face-subtree edit depth.
     ///
-    /// Upper bound is now `MAX_DEPTH` rather than the historical
-    /// 14, because:
+    /// The old port kept sphere edits 3 levels coarser than
+    /// Cartesian edits (`anchor_depth - 4` vs `anchor_depth - 1`).
+    /// That created the exact cross-layer asymmetry the refactor is
+    /// supposed to eliminate: at the same zoom, sphere placement
+    /// targeted much larger cells, so placed blocks ballooned as the
+    /// player went deeper.
     ///
-    /// - The face DDA boundaries are Kahan-compensated (precision
-    ///   ~1 ULP regardless of depth).
-    /// - The CPU raycast runs in frame-local coords with ribbon
-    ///   ascent (cell precision bounded by frame depth, not
-    ///   absolute path).
-    /// - The shader's ribbon pop keeps `ray_dir` unit so the
-    ///   1e-8 parallel-axis check no longer underflows.
+    /// Use the same edit depth for both paths. The body/face wrappers
+    /// are structural node kinds, not a reason to coarsen the user's
+    /// interaction scale.
     pub(super) fn cs_edit_depth(&self) -> u32 {
-        ((self.anchor_depth() as i32) - 4)
-            .clamp(1, crate::world::tree::MAX_DEPTH as i32) as u32
+        self.edit_depth()
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
@@ -47,7 +44,8 @@ impl App {
         self.ui.zoom_level = self.zoom_level();
         let vd = self.visual_depth();
         let (frame, _) = self.render_frame();
-        let cam_local = self.camera.position.in_frame(&frame);
+        self.active_frame = frame;
+        let cam_local = self.camera.position.in_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
             renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
@@ -68,11 +66,10 @@ impl App {
     /// pinned to the f32-precision wall of world XYZ.
     pub(super) fn frame_aware_raycast(&self) -> Option<edit::HitInfo> {
         let ray_dir = self.camera.forward();
-        let (frame, _) = self.render_frame();
-        let cam_local = self.camera.position.in_frame(&frame);
+        let cam_local = self.camera.position.in_frame(&self.active_frame);
         edit::cpu_raycast_in_frame(
             &self.world.library, self.world.root,
-            frame.as_slice(), cam_local, ray_dir,
+            self.active_frame.as_slice(), cam_local, ray_dir,
             self.edit_depth(), self.cs_edit_depth(),
         )
     }
@@ -171,10 +168,8 @@ impl App {
         // actually reached, so we recompute cam_local against the
         // truncated path.
         let r = gpu::build_ribbon(&tree_data, intended_frame.as_slice());
-        let mut effective_frame = crate::world::anchor::Path::root();
-        for &slot in &r.reached_slots {
-            effective_frame.push(slot);
-        }
+        let effective_frame = super::frame::frame_from_slots(&r.reached_slots);
+        self.active_frame = effective_frame;
         let cam_local = self.camera.position.in_frame(&effective_frame);
         // Frame kind depends on the EFFECTIVE frame, not the
         // intended one.
@@ -223,18 +218,57 @@ impl App {
         }
         let tree_hit = self.frame_aware_raycast();
         if let Some(h) = &tree_hit {
+            let cam_world = self.camera.world_pos_f32();
+            let cam_local = self.camera.position.in_frame(&self.active_frame);
+            let (frame_origin, frame_size_world) = super::frame_origin_size_world(&self.active_frame);
+            let frame_scale = WORLD_SIZE / frame_size_world;
+            let (hit_world_min, hit_world_max) = edit::hit_aabb(&self.world.library, h);
+            let hit_world_center = [
+                (hit_world_min[0] + hit_world_max[0]) * 0.5,
+                (hit_world_min[1] + hit_world_max[1]) * 0.5,
+                (hit_world_min[2] + hit_world_max[2]) * 0.5,
+            ];
+            let hit_frame_center = super::aabb_world_to_frame(
+                &self.active_frame, hit_world_center, hit_world_center,
+            ).0;
+            let cam_to_hit_world = [
+                hit_world_center[0] - cam_world[0],
+                hit_world_center[1] - cam_world[1],
+                hit_world_center[2] - cam_world[2],
+            ];
+            let cam_to_hit_frame = [
+                hit_frame_center[0] - cam_local[0],
+                hit_frame_center[1] - cam_local[1],
+                hit_frame_center[2] - cam_local[2],
+            ];
+            let world_dist = (cam_to_hit_world[0] * cam_to_hit_world[0]
+                + cam_to_hit_world[1] * cam_to_hit_world[1]
+                + cam_to_hit_world[2] * cam_to_hit_world[2]).sqrt();
+            let frame_dist = (cam_to_hit_frame[0] * cam_to_hit_frame[0]
+                + cam_to_hit_frame[1] * cam_to_hit_frame[1]
+                + cam_to_hit_frame[2] * cam_to_hit_frame[2]).sqrt();
+            let hit_world_size = [
+                hit_world_max[0] - hit_world_min[0],
+                hit_world_max[1] - hit_world_min[1],
+                hit_world_max[2] - hit_world_min[2],
+            ];
             eprintln!(
-                "highlight tree_hit: path.len={} face={} t={} place_path.len={:?} edit_depth={} cs_edit_depth={}",
+                "highlight tree_hit: path.len={} face={} t={} place_path.len={:?} edit_depth={} cs_edit_depth={} active_frame_depth={} active_frame={:?} frame_origin={:?} frame_size_world={} frame_scale={} cam_world={:?} cam_local={:?} hit_world_center={:?} hit_world_size={:?} cam_to_hit_world={:?} world_dist={} cam_to_hit_frame={:?} frame_dist={}",
                 h.path.len(), h.face, h.t,
                 h.place_path.as_ref().map(|p| p.len()),
                 self.edit_depth(), self.cs_edit_depth(),
+                self.active_frame.depth(), self.active_frame.as_slice(),
+                frame_origin, frame_size_world, frame_scale,
+                cam_world, cam_local,
+                hit_world_center, hit_world_size,
+                cam_to_hit_world, world_dist,
+                cam_to_hit_frame, frame_dist,
             );
         }
         let aabb_world = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
         // Transform AABB from world coords to frame-local coords.
         // Shader expects highlight in the same frame as `camera.pos`.
-        let (frame, _) = self.render_frame();
-        let aabb = aabb_world.map(|(mn, mx)| super::aabb_world_to_frame(&frame, mn, mx));
+        let aabb = aabb_world.map(|(mn, mx)| super::aabb_world_to_frame(&self.active_frame, mn, mx));
         if let Some((mn, mx)) = &aabb {
             eprintln!("highlight (frame-local): min={:?} max={:?} size={:?}",
                 mn, mx, [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]]);
@@ -244,4 +278,3 @@ impl App {
         }
     }
 }
-

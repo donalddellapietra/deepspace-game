@@ -59,10 +59,20 @@ pub fn aabb_world_to_frame(
     )
 }
 
+/// Build a `Path` from the slot prefix the GPU ribbon walker
+/// actually reached. This is the renderer's effective frame.
+pub fn frame_from_slots(slots: &[u8]) -> Path {
+    let mut frame = Path::root();
+    for &slot in slots {
+        frame.push(slot);
+    }
+    frame
+}
+
 /// Render-frame walker: descends the camera's path from
 /// `world_root`, accepting Cartesian or CubedSphereBody nodes and
-/// stopping at face cells (the shader doesn't yet handle a face-
-/// cell frame root). Truncates at `desired_depth`.
+/// stopping at face cells (the shader's face-cell-as-frame
+/// dispatch is still being wired up). Truncates at `desired_depth`.
 ///
 /// Returns `(frame_path, frame_node_id)`.
 pub fn compute_render_frame(
@@ -317,5 +327,13 @@ mod tests {
             assert!(mn[i].abs() < 1e-5);
             assert!((mx[i] - (0.01 * 27.0)).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn frame_from_slots_builds_exact_prefix() {
+        let slots = [13u8, 16u8, 4u8];
+        let p = frame_from_slots(&slots);
+        assert_eq!(p.depth(), slots.len() as u8);
+        assert_eq!(p.as_slice(), &slots);
     }
 }

@@ -63,6 +63,11 @@ pub struct App {
     /// normal tree walk + `NodeKind` dispatch.
     #[allow(dead_code)]
     pub(super) planet_path: Path,
+    /// The actual frame the renderer is using right now. This may
+    /// be shallower than `render_frame()` when GPU packing flattened
+    /// a slot on the intended path and `build_ribbon` had to stop
+    /// early.
+    pub(super) active_frame: Path,
     /// Headless test driver. Populated when CLI flags ask for
     /// scripted actions or screenshots. See `test_runner`.
     pub(super) test: Option<test_runner::TestRunner>,
@@ -108,6 +113,11 @@ impl App {
         let default_depth = ((tree_depth as i32 - 6 + 1).max(1) as u8).min(60);
         let anchor_depth = test_cfg.spawn_depth.unwrap_or(default_depth);
         let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
+        let desired_depth = (position.anchor.depth().saturating_sub(RENDER_FRAME_K))
+            .min(RENDER_FRAME_MAX_DEPTH);
+        let (active_frame, _) = frame::compute_render_frame(
+            &world.library, world.root, &position.anchor, desired_depth,
+        );
         let spawn_yaw = test_cfg.spawn_yaw.unwrap_or(0.0);
         let spawn_pitch = test_cfg.spawn_pitch.unwrap_or(-1.2);
         eprintln!(
@@ -140,6 +150,7 @@ impl App {
             debug_overlay_visible: false,
             fps_smooth: 0.0,
             planet_path,
+            active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
@@ -196,8 +207,7 @@ impl App {
     pub(super) fn update(&mut self, dt: f32) {
         player::update(&mut self.camera, dt);
 
-        let (frame, _) = self.render_frame();
-        let cam_local = self.camera.position.in_frame(&frame);
+        let cam_local = self.camera.position.in_frame(&self.active_frame);
         if let Some(renderer) = &self.renderer {
             renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
         }
@@ -229,4 +239,3 @@ impl App {
         );
     }
 }
-
