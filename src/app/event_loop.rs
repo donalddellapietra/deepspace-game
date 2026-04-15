@@ -51,6 +51,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let el_for_redraw = event_loop;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -83,7 +84,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                self.handle_redraw();
+                self.handle_redraw(el_for_redraw);
             }
             _ => {}
         }
@@ -125,8 +126,10 @@ impl App {
     }
 
     /// One full frame: webview sync, per-frame state push, physics,
-    /// editing queries, GPU repack, render.
-    fn handle_redraw(&mut self) {
+    /// editing queries, GPU repack, render. `event_loop` is taken so
+    /// the test runner can ask the loop to exit after the scenario
+    /// completes.
+    fn handle_redraw(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.try_create_webview();
@@ -180,8 +183,51 @@ impl App {
                 Err(e) => log::error!("Render error: {e:?}"),
             }
         }
+
+        // Test driver: scripted actions, screenshot, and exit. Runs
+        // AFTER the frame so the captured image reflects what the
+        // user just saw (state + edits + render all integrated).
+        self.tick_test_runner(event_loop);
+
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+}
+
+impl App {
+    fn tick_test_runner(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(test) = self.test.as_mut() else { return };
+        test.frame += 1;
+        let frame = test.frame;
+        let due = test.drain_due();
+        for cmd in due {
+            match cmd {
+                super::test_runner::ScriptCmd::Break => self.do_break(),
+                super::test_runner::ScriptCmd::Place => self.do_place(),
+                super::test_runner::ScriptCmd::Wait(_) => {}
+            }
+        }
+
+        let test = self.test.as_mut().unwrap();
+        // One frame before exit, capture the screenshot. Re-fetch
+        // the renderer after running script commands so any tree
+        // re-uploads have settled.
+        if let Some(path) = test.screenshot_path.clone() {
+            if !test.screenshot_done && frame + 1 >= test.exit_after_frames {
+                if let Some(r) = &mut self.renderer {
+                    match r.capture_to_png(&path) {
+                        Ok(()) => eprintln!("test_runner: screenshot saved to {path}"),
+                        Err(e) => eprintln!("test_runner: screenshot failed: {e}"),
+                    }
+                }
+                self.test.as_mut().unwrap().screenshot_done = true;
+            }
+        }
+
+        if frame >= self.test.as_ref().unwrap().exit_after_frames {
+            eprintln!("test_runner: exit_after_frames={frame} reached, quitting");
+            event_loop.exit();
         }
     }
 }

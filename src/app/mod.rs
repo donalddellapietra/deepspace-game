@@ -32,6 +32,9 @@ pub mod event_loop;
 pub mod input_handlers;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod overlay_integration;
+pub mod test_runner;
+
+pub use test_runner::TestConfig;
 
 pub struct App {
     pub(super) window: Option<Arc<Window>>,
@@ -69,6 +72,10 @@ pub struct App {
     /// by gravity and render math to derive the body's world-space
     /// center without a separate `center: [f32; 3]` field.
     pub(super) body_anchor: crate::world::coords::Path,
+    /// Optional non-interactive test driver. When `Some`, the app
+    /// runs a scripted scenario (zoom, click, screenshot, exit) and
+    /// produces deterministic artifacts on disk. See `test_runner`.
+    pub(super) test: Option<test_runner::TestRunner>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -77,6 +84,10 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_test_config(TestConfig::default())
+    }
+
+    pub fn with_test_config(test_cfg: TestConfig) -> Self {
         // Build the ENTIRE world — space tree AND spherical planet —
         // here, BEFORE the event loop starts. `resumed()` is called
         // synchronously by AppKit during its window-activation
@@ -128,7 +139,9 @@ impl App {
             window: None,
             renderer: None,
             camera: Camera {
-                position: crate::world::coords::world_pos_from_f32(spawn_pos, 4),
+                position: crate::world::coords::world_pos_from_f32(
+                    spawn_pos, test_cfg.spawn_depth.unwrap_or(4),
+                ),
                 smoothed_up: [0.0, 1.0, 0.0],
                 yaw: 0.0,
                 // Look mostly straight down — body is directly below
@@ -151,6 +164,7 @@ impl App {
             fps_smooth: 0.0,
             cs_planet: Some(cs_planet),
             body_anchor,
+            test: test_runner::TestRunner::from_config(test_cfg),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
