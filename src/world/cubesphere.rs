@@ -125,6 +125,20 @@ pub fn cube_to_ea(c: f32) -> f32 {
     c.atan() * (4.0 / std::f32::consts::PI)
 }
 
+/// Pick the dominant cube face for a unit direction.
+pub fn pick_face(n: Vec3) -> Face {
+    let ax = n[0].abs();
+    let ay = n[1].abs();
+    let az = n[2].abs();
+    if ax >= ay && ax >= az {
+        if n[0] > 0.0 { Face::PosX } else { Face::NegX }
+    } else if ay >= az {
+        if n[1] > 0.0 { Face::PosY } else { Face::NegY }
+    } else {
+        if n[2] > 0.0 { Face::PosZ } else { Face::NegZ }
+    }
+}
+
 /// Given a planet center and a `CubeSphereCoord`, return the
 /// world-space position of that point.
 pub fn coord_to_world(center: Vec3, c: CubeSphereCoord) -> Vec3 {

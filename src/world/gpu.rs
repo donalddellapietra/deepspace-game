@@ -290,28 +290,6 @@ pub fn pack_tree_lod(
     }
 
     let root_idx = *visited.get(&root).unwrap();
-
-    // Diagnostic: report pack shape so we can see what reaches the GPU.
-    static PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("pack_tree_lod first call: ordered={}, kinds={}, data={}, root_idx={}",
-            ordered.len(), kinds.len(), data.len(), root_idx);
-        for (i, k) in kinds.iter().enumerate().take(10) {
-            eprintln!(
-                "  kinds[{i}] = kind={} face={} inner_r={} outer_r={}",
-                k.kind, k.face, k.inner_r, k.outer_r,
-            );
-        }
-        // Print root's slot 13 entry.
-        let slot13_packed = data[(root_idx as usize * 27 + 13) * 1];
-        eprintln!(
-            "  root[slot 13] (data[{}]): tag={}, block_type={}, _pad={}, node_index={}",
-            (root_idx as usize * 27 + 13),
-            slot13_packed.tag, slot13_packed.block_type, slot13_packed._pad,
-            slot13_packed.node_index,
-        );
-    }
-
     (data, kinds, root_idx)
 }
 

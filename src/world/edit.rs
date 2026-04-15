@@ -6,6 +6,8 @@
 //! raycast descends, so the same code breaks a single block at fine
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
+use super::cubesphere::{pick_face, world_to_coord, FACE_SLOTS};
+use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
 
@@ -139,10 +141,35 @@ pub fn cpu_raycast(
                 });
             }
             Child::Node(child_id) => {
+                let child_node = library.get(child_id)?;
+
+                // NodeKind dispatch — sphere body cells switch to
+                // sphere DDA in the body cell's local frame.
+                if let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind {
+                    let parent_origin = stack[depth].node_origin;
+                    let parent_cell_size = stack[depth].cell_size;
+                    let body_origin = [
+                        parent_origin[0] + cell[0] as f32 * parent_cell_size,
+                        parent_origin[1] + cell[1] as f32 * parent_cell_size,
+                        parent_origin[2] + cell[2] as f32 * parent_cell_size,
+                    ];
+                    let body_size = parent_cell_size;
+                    if let Some(sphere_hit) = cs_raycast_in_body(
+                        library, child_id, body_origin, body_size,
+                        inner_r, outer_r,
+                        ray_origin, ray_dir,
+                        &path,
+                    ) {
+                        return Some(sphere_hit);
+                    }
+                    // Sphere missed — advance Cartesian DDA past this cell.
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
+
                 if (depth as u32 + 1) >= max_depth {
                     // At max depth, treat node as solid — unless its
                     // subtree is all-empty (dominant_block == 255).
-                    let child_node = library.get(child_id)?;
                     if child_node.representative_block == 255 {
                         advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
                         continue;
@@ -654,6 +681,158 @@ pub fn is_solid_at(
     // Reached max_depth without resolving — treat as solid if we're
     // still inside a node.
     true
+}
+
+// ─────────────────────────────────────── cubed-sphere body raycast
+
+/// CPU mirror of the shader's `sphere_in_cell`. When `cpu_raycast`
+/// descends into a `NodeKind::CubedSphereBody` child, it dispatches
+/// here to find which sub-cell of the planet the ray hits and
+/// returns a `HitInfo` whose path extends through `(body_id,
+/// face_slot)` + the face subtree descent — letting the standard
+/// `propagate_edit` machinery break/place that cell generically.
+///
+/// Step-based march (not the fully analytic version the shader
+/// uses): cell-bounded by the deepest term_depth seen, advances
+/// by a fraction of that cell. Sufficient accuracy for cursor
+/// targeting; not meant for visual rendering.
+fn cs_raycast_in_body(
+    library: &NodeLibrary,
+    body_id: NodeId,
+    body_origin: [f32; 3],
+    body_size: f32,
+    inner_r_local: f32,
+    outer_r_local: f32,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    ancestor_path: &[(NodeId, usize)],
+) -> Option<HitInfo> {
+    let cs_center = [
+        body_origin[0] + body_size * 0.5,
+        body_origin[1] + body_size * 0.5,
+        body_origin[2] + body_size * 0.5,
+    ];
+    let cs_outer = outer_r_local * body_size;
+    let cs_inner = inner_r_local * body_size;
+    let shell = cs_outer - cs_inner;
+    if shell <= 0.0 { return None; }
+
+    // Ray-sphere with outer radius. Standard form (cursor accuracy
+    // is fine; we don't need the Numerical-Recipes fallback).
+    let oc = sdf::sub(ray_origin, cs_center);
+    let b = sdf::dot(oc, ray_dir);
+    let c = sdf::dot(oc, oc) - cs_outer * cs_outer;
+    let disc = b * b - c;
+    if disc <= 0.0 { return None; }
+    let sq = disc.sqrt();
+    let t_enter = (-b - sq).max(0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return None; }
+
+    // Step size scales with the deepest face-subtree depth observed.
+    // Start coarse (1/3 of shell) and refine as we sample finer cells.
+    let mut step_world = shell * 0.33;
+    let eps = (shell * 1e-5).max(1e-7);
+    let mut t = t_enter + eps;
+    let mut last_face_id: u32 = 6; // 0..5 = u_lo..r_hi crossing, 6 = shell entry
+    let max_steps = 8_000usize;
+    for _ in 0..max_steps {
+        if t >= t_exit { break; }
+        let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
+        let local = sdf::sub(p, cs_center);
+        let r = sdf::length(local);
+        if r >= cs_outer || r < cs_inner { break; }
+
+        let n = sdf::scale(local, 1.0 / r);
+        let face = pick_face(n);
+        let face_slot = FACE_SLOTS[face as usize];
+        let body_node = library.get(body_id)?;
+        let face_root_id = match body_node.children[face_slot] {
+            Child::Node(id) => id,
+            _ => {
+                // No face subtree at this slot — shouldn't happen
+                // for a properly built body. Advance and try again.
+                t += step_world;
+                continue;
+            }
+        };
+
+        // Convert (face, n, r) to (un, vn, rn) in [0, 1).
+        let coord = world_to_coord(cs_center, p)?;
+        let un = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
+        let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
+        let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
+        debug_assert_eq!(coord.face, face);
+
+        // Walk face subtree, tracking path.
+        let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn);
+        if let Some((block_id, term_depth, mut face_path)) = walk {
+            if block_id != 0 {
+                // Build full path: ancestor chain + (body's parent
+                // entry already in ancestor) + (body_id, face_slot)
+                // + face subtree descent path.
+                let mut full_path = ancestor_path.to_vec();
+                full_path.push((body_id, face_slot));
+                full_path.append(&mut face_path);
+                let face_for_placement = match last_face_id {
+                    0 => 1, // u_lo crossed → adjacent in -u → -X face slot delta
+                    1 => 0,
+                    2 => 3,
+                    3 => 2,
+                    4 => 5,
+                    5 => 4,
+                    _ => 4, // shell entry: place outward (+r ≈ +Z slot delta)
+                };
+                return Some(HitInfo {
+                    path: full_path,
+                    face: face_for_placement,
+                    t,
+                });
+            }
+            // Empty cell — refine step to one third of cell width.
+            let cells_d = 3.0_f32.powi(term_depth as i32);
+            step_world = (shell / cells_d * 0.33).max(eps * 4.0);
+            // Determine which boundary advancement crosses next (rough).
+            // For simplicity, just advance by step_world.
+            last_face_id = 6; // reset — step-based march doesn't track per-axis crossings
+        }
+        t += step_world;
+    }
+
+    None
+}
+
+/// CPU walker mirror of the shader's `walk_face_subtree`.
+/// Returns `(block_id, term_depth, path)` on success.
+fn walk_face_subtree_with_path(
+    library: &NodeLibrary,
+    face_root_id: NodeId,
+    un_in: f32, vn_in: f32, rn_in: f32,
+) -> Option<(u8, u32, Vec<(NodeId, usize)>)> {
+    let mut node_id = face_root_id;
+    let mut un = un_in.clamp(0.0, 0.9999999);
+    let mut vn = vn_in.clamp(0.0, 0.9999999);
+    let mut rn = rn_in.clamp(0.0, 0.9999999);
+    let mut path: Vec<(NodeId, usize)> = Vec::new();
+    for d in 1u32..=22 {
+        let node = library.get(node_id)?;
+        let us = ((un * 3.0) as usize).min(2);
+        let vs = ((vn * 3.0) as usize).min(2);
+        let rs = ((rn * 3.0) as usize).min(2);
+        let slot = slot_index(us, vs, rs);
+        path.push((node_id, slot));
+        match node.children[slot] {
+            Child::Empty => return Some((0, d, path)),
+            Child::Block(b) => return Some((b, d, path)),
+            Child::Node(nid) => {
+                node_id = nid;
+                un = un * 3.0 - us as f32;
+                vn = vn * 3.0 - vs as f32;
+                rn = rn * 3.0 - rs as f32;
+            }
+        }
+    }
+    Some((0, 22, path))
 }
 
 /// Compute the world-space AABB of the block at the hit location.

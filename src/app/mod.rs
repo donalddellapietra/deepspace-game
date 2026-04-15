@@ -95,7 +95,9 @@ impl App {
                 position,
                 smoothed_up: [0.0, 1.0, 0.0],
                 yaw: 0.0,
-                pitch: -0.3,
+                // Steep pitch so the planet (below camera) fills
+                // the lower half of the view at spawn.
+                pitch: -1.2,
             },
             world,
             frozen: false,
