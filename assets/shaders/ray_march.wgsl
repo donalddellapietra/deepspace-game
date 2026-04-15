@@ -425,7 +425,12 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             // axis-aligned voxels.
             let ci = child_node_index(s_node_idx[depth], slot);
             let kind_tag = kinds[ci].tag;
-            if kind_tag == 1u {
+            // Body (1) and Face (2) children are rendered by the
+            // cs_planet sphere DDA, not the Cartesian march. Walking
+            // a face subtree as if it were Cartesian produces "walls
+            // floating in the sky" because face-subtree slots index
+            // (u, v, r) cells, not axis-aligned voxels.
+            if kind_tag == 1u || kind_tag == 2u {
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -570,7 +575,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         camera.forward + camera.right * ndc.x + camera.up * ndc.y
     );
 
-    let result = march(camera.pos, ray_dir);
+    // Render root may be the tree root (Cartesian — normal march),
+    // a body cell (camera ≥ K below body — no Cartesian content,
+    // sphere DDA handles everything), or inside a face subtree
+    // (deep zoom — same: sphere DDA only). Skip the Cartesian march
+    // for body/face render roots so it doesn't try to interpret
+    // face data as voxels.
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    let root_kind_tag = kinds[uniforms.root_index].tag;
+    if root_kind_tag == 0u {
+        result = march(camera.pos, ray_dir);
+    }
 
     // Spherical planet: true 3D DDA through the face subtrees.
     //
