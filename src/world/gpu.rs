@@ -392,6 +392,14 @@ pub fn pack_tree_lod_multi_with_frame(
         origin: [f32; 3],
         cell_size: f32,
         use_lod: bool,
+        /// `true` once the BFS has descended into a non-Cartesian
+        /// subtree (a `CubedSphereBody` or any `CubedSphereFace`'s
+        /// internals). Inside such subtrees the BFS's Cartesian
+        /// `cell_size` no longer maps to world geometry — the cells
+        /// live in `(u, v, r)` not `(x, y, z)` — so LOD / uniform
+        /// flattening can't be applied without corrupting the
+        /// cubed-sphere DDA's reads. Propagated to all descendants.
+        in_sphere_subtree: bool,
     }
 
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
@@ -410,11 +418,15 @@ pub fn pack_tree_lod_multi_with_frame(
         } else {
             ([0.0; 3], 1.0)
         };
+        let root_kind_non_cartesian = library.get(root)
+            .map(|n| !n.kind.is_cartesian())
+            .unwrap_or(false);
         queue.push(QueueEntry {
             node_id: root,
             origin,
             cell_size,
             use_lod: ri == 0,
+            in_sphere_subtree: root_kind_non_cartesian,
         });
     }
     let mut head = 0;
@@ -424,6 +436,7 @@ pub fn pack_tree_lod_multi_with_frame(
         let node_origin = entry.origin;
         let cell_size = entry.cell_size;
         let use_lod = entry.use_lod;
+        let in_sphere_subtree = entry.in_sphere_subtree;
         let ordered_idx = head;
         head += 1;
 
@@ -435,12 +448,16 @@ pub fn pack_tree_lod_multi_with_frame(
                     Some(n) => n,
                     None => continue,
                 };
-                // Sphere body / face nodes must reach the GPU as
-                // full Node children — the cubed-sphere DDA reads
-                // them via `child_node_index`. Skip uniform / LOD
-                // flattening that would convert them to a Block.
-                let preserve_node = !child_node.kind.is_cartesian();
-                if !preserve_node && child_node.uniform_type != UNIFORM_MIXED {
+                // Once we're inside a body or face subtree, ALL
+                // descendants stay as full Node children. The BFS's
+                // Cartesian `cell_size` is geometric nonsense for
+                // (u, v, r) cells, so any LOD / uniform flattening
+                // would corrupt what the cubed-sphere DDA reads
+                // back via `child_node_index`. Sphere subtree
+                // membership propagates through the whole BFS.
+                let child_in_sphere = in_sphere_subtree
+                    || !child_node.kind.is_cartesian();
+                if !child_in_sphere && child_node.uniform_type != UNIFORM_MIXED {
                     let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
                         GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
                     } else {
@@ -449,7 +466,7 @@ pub fn pack_tree_lod_multi_with_frame(
                     overrides[ordered_idx][slot] = Some(gpu);
                     continue;
                 }
-                if use_lod && !preserve_node {
+                if use_lod && !child_in_sphere {
                     let (cx, cy, cz) = slot_coords(slot);
                     let child_center = [
                         node_origin[0] + (cx as f32 + 0.5) * cell_size,
@@ -487,6 +504,7 @@ pub fn pack_tree_lod_multi_with_frame(
                         origin: child_origin,
                         cell_size: cell_size / 3.0,
                         use_lod,
+                        in_sphere_subtree: child_in_sphere,
                     });
                 }
             }
