@@ -15,24 +15,11 @@ use crate::world::state::WorldState;
 use crate::world::tree::{Child, NodeId};
 
 /// Levels shallower than the camera's anchor at which the render
-/// frame sits. Larger K = bigger packed subtree (more to render) but
-/// more headroom before cell-scale drops below the local scale we
-/// ship to the shader. 3 matches the spec's default.
+/// frame sits. Currently capped at root by `RENDER_FRAME_MAX_DEPTH`
+/// while the path-anchored shader pipeline is being validated end-
+/// to-end; once the sphere DDA fully runs in body-cell-local
+/// coordinates (which it now does), this can rise.
 pub const RENDER_FRAME_K: u8 = 3;
-
-/// Maximum depth the render frame is allowed to sit at. The
-/// cubed-sphere planet currently renders via separate `cs_planet`
-/// uniforms at world scale; running the tree march in a deeper
-/// frame would force the shader to mix world-scale sphere math
-/// with `3^frame_depth`-scaled tree math, and the ray-sphere
-/// `dot(oc, oc)` at those magnitudes blows past f32 precision.
-///
-/// Cap = 0 (root frame) keeps both pipelines at world scale. The
-/// frame machinery stays in place — `in_frame` / `deepened_to` /
-/// the packing-from-frame path are all exercised by tests — so
-/// once `NodeKind::CubedSphereBody` dispatch lands in the shader
-/// and the sphere renders inside the tree walk, this cap can
-/// rise and the precision win returns for tree voxels.
 pub const RENDER_FRAME_MAX_DEPTH: u8 = 0;
 
 pub mod cursor;
@@ -47,9 +34,6 @@ pub struct App {
     pub(super) renderer: Option<Renderer>,
     pub(super) camera: Camera,
     pub(super) world: WorldState,
-    /// Debug freeze. When true, WASD / Space / Shift / scroll zoom
-    /// are all ignored; the camera only turns with the mouse. Toggled
-    /// with `F` in-game.
     pub(super) frozen: bool,
     pub(super) cursor_locked: bool,
     pub(super) keys: Keys,
@@ -61,7 +45,12 @@ pub struct App {
     pub(super) ui: GameUiState,
     pub(super) debug_overlay_visible: bool,
     pub(super) fps_smooth: f64,
-    pub(super) cs_planet: Option<crate::world::cubesphere::SphericalPlanet>,
+    /// Path from `world.root` to the planet's body node. Used for
+    /// spawn-position derivation and as a hint for future debug
+    /// teleport / cursor logic; rendering reads the body via the
+    /// normal tree walk + `NodeKind` dispatch.
+    #[allow(dead_code)]
+    pub(super) planet_path: Path,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -70,35 +59,32 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        // Build the ENTIRE world — space tree AND spherical planet —
-        // here, BEFORE the event loop starts.
+        // Build a Cartesian world tree, then insert the planet body
+        // into its central depth-1 cell. After install, the planet
+        // is a `NodeKind::CubedSphereBody` node living inside the
+        // tree — there's no parallel `cs_planet` handle.
         let mut world = crate::world::worldgen::generate_world();
-        let tree_depth = world.tree_depth();
-
         let setup = crate::world::spherical_worldgen::demo_planet();
-        let cs_planet = crate::world::spherical_worldgen::build(&mut world.library, &setup);
+        let (new_root, planet_path) =
+            crate::world::spherical_worldgen::install_at_root_center(
+                &mut world.library, world.root, &setup,
+            );
+        world.swap_root(new_root);
+        let tree_depth = world.tree_depth();
         eprintln!(
-            "Spherical planet generated: 6 face subtrees, library now {} nodes",
-            world.library.len(),
+            "Planet inserted at path {:?}; library has {} nodes, depth {}",
+            planet_path.as_slice(), world.library.len(), tree_depth,
         );
 
-        // Spawn just above the planet's north pole. `demo_planet`
-        // centers the planet at the world origin so this naturally
-        // lands inside `[0, WORLD_SIZE)^3`; assert to catch drift
-        // if those tuning knobs change.
-        let spawn_xyz = [
-            setup.center[0],
-            setup.center[1] + setup.outer_r + 0.3,
-            setup.center[2],
-        ];
-        debug_assert!(
-            spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)),
-            "spawn {:?} must be inside root [0, {})",
-            spawn_xyz, WORLD_SIZE,
-        );
-        // Default anchor depth: `td - 6 + 1` reproduces the legacy
-        // zoom feel (one level above the face subtree's per-block
-        // cells at the planet's surface).
+        // Spawn just above the planet's body cell. Body cell at
+        // depth 1 slot 13 spans world `[1, 2)³`. Sphere outer_r
+        // local = `setup.outer_r`, world = `outer_r * 1.0` (cell
+        // size is 1 world unit at depth 1). Top of sphere at world
+        // y = 1.5 + outer_r. Spawn slightly above.
+        let body_top_y = 1.5 + setup.outer_r;
+        let spawn_xyz = [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5];
+        debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
+
         let anchor_depth = ((tree_depth as i32 - 6 + 1).max(1) as u8).min(60);
         let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
 
@@ -123,7 +109,7 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
-            cs_planet: Some(cs_planet),
+            planet_path,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -136,16 +122,15 @@ impl App {
         self.camera.position.anchor.depth() as u32
     }
 
-    /// Render frame = camera's anchor truncated by `RENDER_FRAME_K`
-    /// levels, further clamped so the walk from `world.root` lands
-    /// on an actual `Node`. Returns `(path, node_id)` where
-    /// `node_id` is the root of the subtree the shader will render
-    /// and `path` is the path from `world.root` to that subtree.
-    ///
-    /// If the walk encounters a terminal (`Empty` or `Block`) before
-    /// reaching the desired depth, the frame is truncated to the
-    /// parent `Node` so the rendered subtree stays concrete — the
-    /// shader can walk it without hitting a dangling path.
+    #[inline]
+    pub(super) fn zoom_level(&self) -> i32 {
+        (self.tree_depth as i32) - (self.anchor_depth() as i32) + 1
+    }
+
+    /// Walk the world tree to find the render-frame's NodeId.
+    /// Currently `RENDER_FRAME_MAX_DEPTH = 0` so this just returns
+    /// `world.root` — kept as a method so the frame-aware shader
+    /// path stays connected and the cap can lift later.
     pub(super) fn render_frame(&self) -> (Path, NodeId) {
         let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
@@ -168,11 +153,6 @@ impl App {
         (frame, node_id)
     }
 
-    #[inline]
-    pub(super) fn zoom_level(&self) -> i32 {
-        (self.tree_depth as i32) - (self.anchor_depth() as i32) + 1
-    }
-
     pub(super) fn update(&mut self, dt: f32) {
         player::update(&mut self.camera, dt);
 
@@ -183,23 +163,12 @@ impl App {
         }
     }
 
-    /// Debug chunk teleport. Step the camera's anchor one cell
-    /// along `axis` (0 = X, 1 = Y, 2 = Z) in `direction` (±1). The
-    /// anchor's depth is preserved; offset snaps to the cell center
-    /// so successive steps land deterministically regardless of
-    /// where the camera used to be inside the old cell. Bubble-up
-    /// across parent cells is handled by
-    /// `Path::step_neighbor_cartesian`.
     pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {
         if self.frozen { return; }
         self.camera.position.anchor.step_neighbor_cartesian(axis, direction);
         self.camera.position.offset = [0.5, 0.5, 0.5];
     }
 
-    /// Jump the camera to a specific path + cell-local offset.
-    /// Offset must be in `[0, 1)³`; anchor slots are `[0, 27)`.
-    /// Clears `frozen` so the teleport takes effect even from a
-    /// frozen state.
     pub fn debug_teleport(&mut self, slots: &[u8], offset: [f32; 3]) {
         let mut anchor = Path::root();
         for &s in slots.iter().take(crate::world::tree::MAX_DEPTH) {
@@ -209,8 +178,6 @@ impl App {
         self.apply_zoom();
     }
 
-    /// Log the camera's current anchor path and offset to the
-    /// console — handy for picking debug-teleport destinations.
     pub(super) fn log_location(&self) {
         let p = &self.camera.position;
         log::info!(

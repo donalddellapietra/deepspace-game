@@ -1,10 +1,10 @@
 // Ray march shader for base-3 recursive voxel tree.
 //
-// Iterative stack-based traversal (WGSL forbids recursion).
-// Each node has 27 children (3x3x3). Each child is:
-//   tag=0: Empty (air)
-//   tag=1: Block (solid, block_type indexes into palette)
-//   tag=2: Node (descend into child node at node_index)
+// One unified tree walker. When it descends into a Node child whose
+// NodeKind is CubedSphereBody, it switches to the cubed-sphere DDA
+// running in that body cell's local frame — no parallel uniforms,
+// no separate face_root buffers, no absolute world coords. The body's
+// `inner_r` / `outer_r` come from the per-node `node_kinds` buffer.
 
 struct Camera {
     pos: vec3<f32>,
@@ -32,94 +32,76 @@ struct Uniforms {
     _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    // Camera offset from the sphere center, computed via path
-    // arithmetic on the CPU. Used directly instead of subtracting
-    // two world-scale floats — keeps sub-cell precision at any
-    // anchor depth. w unused.
-    cs_oc: vec4<f32>,
-    // Cubed-sphere planet: xyz = world-space center (kept for
-    //   highlight cell math; sphere ray-march never reads it),
-    // w   = outer radius (0 disables).
-    cs_planet: vec4<f32>,
-    // x = inner radius. y, z reserved. w = highlight-active flag.
-    cs_params: vec4<f32>,
-    // Highlighted cell: (face, i, j, k) as f32.
-    cs_highlight: vec4<f32>,
-    // GPU buffer indices of the 6 face subtree roots, packed into
-    // two vec4<u32>. Order: PosX, NegX, PosY, NegY, PosZ, NegZ.
-    cs_face_roots_a: vec4<u32>,
-    cs_face_roots_b: vec4<u32>,
+}
+
+struct NodeKindGpu {
+    kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
+    face: u32,
+    inner_r: f32,
+    outer_r: f32,
 }
 
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
 @group(0) @binding(1) var<uniform> camera: Camera;
 @group(0) @binding(2) var<uniform> palette: Palette;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
+@group(0) @binding(4) var<storage, read> node_kinds: array<NodeKindGpu>;
 
 // -------------- Tree access helpers --------------
 
-// Each GpuChild is 2 u32s (8 bytes). A node at buffer index
-// `node_idx` occupies tree[(node_idx*27 + slot) * 2 .. +2].
 fn child_packed(node_idx: u32, slot: u32) -> u32 {
     return tree[(node_idx * 27u + slot) * 2u];
 }
-
 fn child_node_index(node_idx: u32, slot: u32) -> u32 {
     return tree[(node_idx * 27u + slot) * 2u + 1u];
 }
+fn child_tag(packed: u32) -> u32 { return packed & 0xFFu; }
+fn child_block_type(packed: u32) -> u32 { return (packed >> 8u) & 0xFFu; }
 
-fn child_tag(packed: u32) -> u32 {
-    return packed & 0xFFu;
+fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
+    return u32(z * 9 + y * 3 + x);
 }
 
-fn child_block_type(packed: u32) -> u32 {
-    return (packed >> 8u) & 0xFFu;
-}
-
-// ────────────── Cubed-sphere helpers ──────────────
+// -------------- Cubed-sphere geometry helpers --------------
 
 const PI_F: f32 = 3.1415926535;
 const FRAC_PI_4: f32 = 0.785398163;
 
-/// Cube-face coordinate → equal-angle coordinate. Inverse of the
-/// `tan(u · π/4)` warp applied in Rust's `face_uv_to_dir`.
-fn cube_to_ea(c: f32) -> f32 {
-    return atan(c) * (4.0 / PI_F);
-}
+fn cube_to_ea(c: f32) -> f32 { return atan(c) * (4.0 / PI_F); }
+fn ea_to_cube(e: f32) -> f32 { return tan(e * FRAC_PI_4); }
 
-/// Equal-angle coordinate → cube-face coordinate (for boundary
-/// plane math, which needs the raw ratio `k` for `u·x = 1` etc.).
-fn ea_to_cube(e: f32) -> f32 {
-    return tan(e * FRAC_PI_4);
-}
-
-/// Look up the `cs_face_roots` packed uniform by face index 0..6.
-fn face_root(face: u32) -> u32 {
-    if face < 4u { return uniforms.cs_face_roots_a[face]; }
-    return uniforms.cs_face_roots_b[face - 4u];
-}
-
-/// Outward-pointing normal of the given cube face.
-fn face_normal(face: u32) -> vec3<f32> {
+// Slot in a CubedSphereBody node's 27-grid that holds each face's
+// subtree. Matches Rust `FACE_SLOTS`.
+fn face_slot(face: u32) -> u32 {
     switch face {
-        case 0u: { return vec3<f32>( 1.0,  0.0,  0.0); } // PosX
-        case 1u: { return vec3<f32>(-1.0,  0.0,  0.0); } // NegX
-        case 2u: { return vec3<f32>( 0.0,  1.0,  0.0); } // PosY
-        case 3u: { return vec3<f32>( 0.0, -1.0,  0.0); } // NegY
-        case 4u: { return vec3<f32>( 0.0,  0.0,  1.0); } // PosZ
-        default: { return vec3<f32>( 0.0,  0.0, -1.0); } // NegZ
+        case 0u: { return 14u; } // PosX = (2, 1, 1)
+        case 1u: { return 12u; } // NegX = (0, 1, 1)
+        case 2u: { return 16u; } // PosY = (1, 2, 1)
+        case 3u: { return 10u; } // NegY = (1, 0, 1)
+        case 4u: { return 22u; } // PosZ = (1, 1, 2)
+        default: { return 4u;  } // NegZ = (1, 1, 0)
     }
 }
 
-/// The face's u-tangent in world space. Matches Rust Face::tangents().
+fn face_normal(face: u32) -> vec3<f32> {
+    switch face {
+        case 0u: { return vec3<f32>( 1.0,  0.0,  0.0); }
+        case 1u: { return vec3<f32>(-1.0,  0.0,  0.0); }
+        case 2u: { return vec3<f32>( 0.0,  1.0,  0.0); }
+        case 3u: { return vec3<f32>( 0.0, -1.0,  0.0); }
+        case 4u: { return vec3<f32>( 0.0,  0.0,  1.0); }
+        default: { return vec3<f32>( 0.0,  0.0, -1.0); }
+    }
+}
+
 fn face_u_axis(face: u32) -> vec3<f32> {
     switch face {
-        case 0u: { return vec3<f32>( 0.0,  0.0, -1.0); } // PosX
-        case 1u: { return vec3<f32>( 0.0,  0.0,  1.0); } // NegX
-        case 2u: { return vec3<f32>( 1.0,  0.0,  0.0); } // PosY
-        case 3u: { return vec3<f32>( 1.0,  0.0,  0.0); } // NegY
-        case 4u: { return vec3<f32>( 1.0,  0.0,  0.0); } // PosZ
-        default: { return vec3<f32>(-1.0,  0.0,  0.0); } // NegZ
+        case 0u: { return vec3<f32>( 0.0,  0.0, -1.0); }
+        case 1u: { return vec3<f32>( 0.0,  0.0,  1.0); }
+        case 2u: { return vec3<f32>( 1.0,  0.0,  0.0); }
+        case 3u: { return vec3<f32>( 1.0,  0.0,  0.0); }
+        case 4u: { return vec3<f32>( 1.0,  0.0,  0.0); }
+        default: { return vec3<f32>(-1.0,  0.0,  0.0); }
     }
 }
 
@@ -134,7 +116,6 @@ fn face_v_axis(face: u32) -> vec3<f32> {
     }
 }
 
-/// Pick the dominant cube face for a unit direction.
 fn pick_face(n: vec3<f32>) -> u32 {
     let ax = abs(n.x); let ay = abs(n.y); let az = abs(n.z);
     if ax >= ay && ax >= az {
@@ -146,26 +127,14 @@ fn pick_face(n: vec3<f32>) -> u32 {
     }
 }
 
-/// Forward ray-plane intersection. Returns t ≥ 0 or -1 if no hit.
-/// Plane passes through `through` with normal `plane_n`.
 fn ray_plane_t(origin: vec3<f32>, dir: vec3<f32>,
                through: vec3<f32>, plane_n: vec3<f32>) -> f32 {
     let denom = dot(dir, plane_n);
     if abs(denom) < 1e-12 { return -1.0; }
-    let t = -dot(origin - through, plane_n) / denom;
-    return t;
+    return -dot(origin - through, plane_n) / denom;
 }
 
-/// First t strictly greater than `after` at which the ray hits the
-/// sphere of given radius around `center`. -1 if no such hit.
-///
-/// Numerical-Recipes stable form: when `oc` is near the shell
-/// surface, `c = |oc|² − r²` is small and the conventional
-/// `-b ± √disc` roots suffer catastrophic cancellation in one of
-/// the two combinations (whichever has the same sign as b). Compute
-/// `q = -b − sign(b)·√disc` first (the well-conditioned root),
-/// then derive the other via Vieta's `t·t' = c → t' = c/q`. Both
-/// roots end up at full f32 precision regardless of cancellation.
+// Numerical-Recipes stable ray-sphere intersection.
 fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
                     center: vec3<f32>, radius: f32, after: f32) -> f32 {
     let oc = origin - center;
@@ -176,9 +145,6 @@ fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
     let sq = sqrt(disc);
     let s = select(-1.0, 1.0, b >= 0.0);
     let q = -b - s * sq;
-    // `q` is non-zero unless the ray is exactly tangent (disc=0
-    // AND b=0 simultaneously) — return -1 in that edge case
-    // rather than dividing by zero.
     if abs(q) < 1e-30 { return -1.0; }
     let t0 = q;
     let t1 = c / q;
@@ -189,32 +155,21 @@ fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
     return -1.0;
 }
 
-/// Consider candidate `c` as a potential next-t: if `c > cur` and
-/// `c < best`, return `c`; otherwise return `best`. Helper for the
-/// "minimum positive exit t" reduction.
-fn min_after(best: f32, cand: f32, cur: f32) -> f32 {
-    if cand > cur && cand < best { return cand; }
-    return best;
-}
-
-/// Walk a face subtree iteratively. Inputs are normalized
-/// `(un, vn, rn) ∈ [0, 1]³`. Returns `(block_id, depth)`:
-///   - `block_id`: 0 = empty, >0 = palette index of first terminal.
-///   - `depth`: number of descents taken before the terminal was
-///     found. A uniform empty region flattened at pack-time by
-///     `pack_tree_lod_multi` returns `depth = 1`; a finest-level
-///     hit returns `depth = subtree_depth`.
-///
-/// The DDA caller uses `depth` to compute exit-cell bounds at the
-/// appropriate coarseness, so a ray through a huge empty chunk
-/// crosses it in ONE step instead of `3^(subtree_depth-depth)`
-/// steps — recovering the Cartesian octree's skip-empty speedup.
-fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u32> {
-    var node = root_idx;
+// Walk a face subtree from the body node's face-center child slot,
+// using normalized `(un, vn, rn) ∈ [0, 1]³` coords. Returns
+// `(block_id, term_depth)`.
+fn walk_face_subtree(body_node_idx: u32, face: u32,
+                     un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u32> {
+    let fs = face_slot(face);
+    let face_packed = child_packed(body_node_idx, fs);
+    let face_tag = child_tag(face_packed);
+    if face_tag == 0u { return vec2<u32>(0u, 1u); }
+    if face_tag == 1u { return vec2<u32>(child_block_type(face_packed), 1u); }
+    var node = child_node_index(body_node_idx, fs);
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
-    for (var d: u32 = 1u; d <= 22u; d = d + 1u) {
+    for (var d: u32 = 2u; d <= 22u; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -223,25 +178,17 @@ fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u
         let tag = child_tag(packed);
         if tag == 0u { return vec2<u32>(0u, d); }
         if tag == 1u { return vec2<u32>(child_block_type(packed), d); }
-        // tag == 2u: descend.
         node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
     }
-    return vec2<u32>(0u, 12u);
+    return vec2<u32>(0u, 22u);
 }
 
-fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
-    return u32(z * 9 + y * 3 + x);
-}
+// -------------- Ray-AABB --------------
 
-// -------------- Ray-AABB intersection --------------
-
-struct BoxHit {
-    t_enter: f32,
-    t_exit: f32,
-}
+struct BoxHit { t_enter: f32, t_exit: f32, }
 
 fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> BoxHit {
     let t1 = (box_min - origin) * inv_dir;
@@ -254,27 +201,7 @@ fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: v
     );
 }
 
-// -------------- Stack-based iterative ray march --------------
-
-// Maximum tree depth we'll traverse. 16 supports trees up to ~14 levels
-// deep with room for DDA stepping across siblings at ancestor levels.
 const MAX_STACK_DEPTH: u32 = 16u;
-
-// Stack frame: tracks where we are in the DDA at each tree level.
-// WGSL has no structs-in-arrays of variable size, so we use
-// parallel arrays for each field.
-struct MarchState {
-    // Per-level DDA state (fixed-size arrays)
-    node_idx: array<u32, 16>,
-    cell: array<vec3<i32>, 16>,
-    side_dist: array<vec3<f32>, 16>,
-    // Shared across all levels
-    origin: vec3<f32>,       // original ray origin (world space)
-    inv_dir: vec3<f32>,
-    step: vec3<i32>,
-    delta_dist: vec3<f32>,
-    depth: u32,
-}
 
 struct HitResult {
     hit: bool,
@@ -282,6 +209,138 @@ struct HitResult {
     normal: vec3<f32>,
     t: f32,
 }
+
+// Sphere DDA running inside one CubedSphereBody cell. The body cell
+// is given in the render-frame's coords (origin + size); radii are
+// scaled into the same frame. Returns hit/miss; on miss the caller
+// continues the Cartesian DDA past the body cell.
+fn sphere_in_cell(
+    body_node_idx: u32,
+    body_cell_origin: vec3<f32>,
+    body_cell_size: f32,
+    inner_r_local: f32,
+    outer_r_local: f32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+
+    let cs_center = body_cell_origin + vec3<f32>(body_cell_size * 0.5);
+    let cs_outer = outer_r_local * body_cell_size;
+    let cs_inner = inner_r_local * body_cell_size;
+    let shell = cs_outer - cs_inner;
+
+    let oc = ray_origin - cs_center;
+    let b = dot(oc, ray_dir);
+    let c_outer = dot(oc, oc) - cs_outer * cs_outer;
+    let disc = b * b - c_outer;
+    if disc <= 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_enter = max(-b - sq, 0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return result; }
+
+    let eps_init = max(shell * 1e-5, 1e-7);
+    var t = t_enter + eps_init;
+    var steps = 0u;
+    var last_face_id: u32 = 6u;
+    var deepest_term_depth: u32 = 1u;
+    loop {
+        if t >= t_exit || steps > 4096u { break; }
+        steps = steps + 1u;
+
+        let local = oc + ray_dir * t;
+        let r = length(local);
+        if r >= cs_outer || r < cs_inner { break; }
+
+        let n = local / r;
+        let face = pick_face(n);
+        let n_axis = face_normal(face);
+        let u_axis = face_u_axis(face);
+        let v_axis = face_v_axis(face);
+        let axis_dot = dot(n, n_axis);
+        let cube_u = dot(n, u_axis) / axis_dot;
+        let cube_v = dot(n, v_axis) / axis_dot;
+        let u_ea = cube_to_ea(cube_u);
+        let v_ea = cube_to_ea(cube_v);
+
+        let un = clamp((u_ea + 1.0) * 0.5, 0.0, 0.9999999);
+        let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
+        let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
+
+        let walk = walk_face_subtree(body_node_idx, face, un, vn, rn);
+        let block_id = walk.x;
+        let term_depth = walk.y;
+
+        if block_id != 0u {
+            var hit_normal: vec3<f32>;
+            switch last_face_id {
+                case 0u: { hit_normal = -u_axis; }
+                case 1u: { hit_normal =  u_axis; }
+                case 2u: { hit_normal = -v_axis; }
+                case 3u: { hit_normal =  v_axis; }
+                case 4u: { hit_normal = -n; }
+                case 5u: { hit_normal =  n; }
+                default: { hit_normal =  n; }
+            }
+            let cell_color = palette.colors[block_id].rgb;
+            let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
+            let diffuse = max(dot(hit_normal, sun_dir), 0.0);
+            let ambient = 0.25;
+            result.hit = true;
+            result.t = t;
+            result.normal = hit_normal;
+            result.color = cell_color * (ambient + diffuse * 0.75);
+            return result;
+        }
+
+        deepest_term_depth = max(deepest_term_depth, term_depth);
+        let cells_d = pow(3.0, f32(deepest_term_depth));
+        let iu = floor(un * cells_d);
+        let iv = floor(vn * cells_d);
+        let ir = floor(rn * cells_d);
+
+        let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
+        let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
+        let n_u_lo = u_axis - ea_to_cube(u_lo_ea) * n_axis;
+        let n_u_hi = u_axis - ea_to_cube(u_hi_ea) * n_axis;
+
+        let v_lo_ea = (iv       / cells_d) * 2.0 - 1.0;
+        let v_hi_ea = ((iv+1.0) / cells_d) * 2.0 - 1.0;
+        let n_v_lo = v_axis - ea_to_cube(v_lo_ea) * n_axis;
+        let n_v_hi = v_axis - ea_to_cube(v_hi_ea) * n_axis;
+
+        let r_lo = cs_inner + (ir       / cells_d) * shell;
+        let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
+
+        var t_next = t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        let zero3 = vec3<f32>(0.0);
+        let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+        let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+        let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
+        if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+        let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
+        if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+
+        if t_next >= t_exit { break; }
+        last_face_id = winning_face;
+        let cell_eps = max(shell / cells_d * 1e-3, 1e-7);
+        t = t_next + cell_eps;
+    }
+
+    return result;
+}
+
+// -------------- Stack-based Cartesian tree DDA --------------
 
 fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
@@ -293,33 +352,26 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
         select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
     );
-
     let step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
         select(-1, 1, ray_dir.y >= 0.0),
         select(-1, 1, ray_dir.z >= 0.0),
     );
-
     let delta_dist = abs(inv_dir);
 
-    // State arrays for each depth level.
     var s_node_idx: array<u32, 16>;
     var s_cell: array<vec3<i32>, 16>;
     var s_side_dist: array<vec3<f32>, 16>;
-    // The world-space origin of the node at each level (its min corner).
     var s_node_origin: array<vec3<f32>, 16>;
-    // The scale of one cell at each level.
     var s_cell_size: array<f32, 16>;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
-    // Initialize root level.
     s_node_idx[0] = uniforms.root_index;
     s_node_origin[0] = vec3<f32>(0.0);
-    s_cell_size[0] = 1.0; // root node: each cell is 1.0 wide, node spans [0, 3)
+    s_cell_size[0] = 1.0;
 
-    // Intersect ray with root node [0, 3)
     let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
@@ -328,59 +380,34 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
 
-    // Initial cell in root
     s_cell[0] = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
         clamp(i32(floor(entry_pos.y)), 0, 2),
         clamp(i32(floor(entry_pos.z)), 0, 2),
     );
-
-    // Initial side_dist for root level
     let cell_f = vec3<f32>(s_cell[0]);
     s_side_dist[0] = vec3<f32>(
-        select(
-            (cell_f.x - entry_pos.x) * inv_dir.x,
-            (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x,
-            ray_dir.x >= 0.0
-        ),
-        select(
-            (cell_f.y - entry_pos.y) * inv_dir.y,
-            (cell_f.y + 1.0 - entry_pos.y) * inv_dir.y,
-            ray_dir.y >= 0.0
-        ),
-        select(
-            (cell_f.z - entry_pos.z) * inv_dir.z,
-            (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z,
-            ray_dir.z >= 0.0
-        ),
+        select((cell_f.x - entry_pos.x) * inv_dir.x,
+               (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+        select((cell_f.y - entry_pos.y) * inv_dir.y,
+               (cell_f.y + 1.0 - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+        select((cell_f.z - entry_pos.z) * inv_dir.z,
+               (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
     );
 
-    // Main traversal loop.
-    // Each iteration either:
-    //   - Hits a block → return
-    //   - Descends into a child node (push)
-    //   - Steps DDA to next cell
-    //   - Exits current node (pop)
     var iterations = 0u;
-    let max_iterations = 256u;
+    let max_iterations = 2048u;
 
     loop {
-        if iterations >= max_iterations {
-            break;
-        }
+        if iterations >= max_iterations { break; }
         iterations += 1u;
 
         let cell = s_cell[depth];
 
-        // Out of bounds check — this cell has left the 3x3x3 grid.
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
-            // Pop up one level.
-            if depth == 0u {
-                break; // Exited root, done.
-            }
+            if depth == 0u { break; }
             depth -= 1u;
 
-            // Advance the DDA at the parent level (we finished this child).
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
                 s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -402,7 +429,7 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
         let tag = child_tag(packed);
 
         if tag == 0u {
-            // Empty — advance DDA.
+            // Empty — DDA advance.
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
                 s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -417,7 +444,6 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                 normal = vec3<f32>(0.0, 0.0, f32(-step.z));
             }
         } else if tag == 1u {
-            // Block hit!
             let cell_min_h = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
             let cell_max_h = cell_min_h + vec3<f32>(s_cell_size[depth]);
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
@@ -426,27 +452,52 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.color = palette.colors[child_block_type(packed)].rgb;
             result.normal = normal;
             return result;
-        } else if tag == 2u {
-            // Node — check if we should descend or treat as solid.
+        } else {
+            // tag == 2u: Node child. Look up its kind.
+            let child_idx = child_node_index(s_node_idx[depth], slot);
+            let kind = node_kinds[child_idx].kind;
 
-            // Hard depth limits.
+            if kind == 1u {
+                // CubedSphereBody: dispatch sphere DDA in this body's cell.
+                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
+                let body_size = s_cell_size[depth];
+                let inner_r = node_kinds[child_idx].inner_r;
+                let outer_r = node_kinds[child_idx].outer_r;
+                let sph = sphere_in_cell(
+                    child_idx, body_origin, body_size,
+                    inner_r, outer_r, ray_origin, ray_dir,
+                );
+                if sph.hit {
+                    return sph;
+                }
+                // Sphere missed — advance Cartesian DDA past this cell.
+                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                    s_cell[depth].x += step.x;
+                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                    s_cell[depth].y += step.y;
+                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                } else {
+                    s_cell[depth].z += step.z;
+                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                }
+                continue;
+            }
+
+            // Cartesian Node: depth/LOD check, then descend.
             let at_max = depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH;
-
-            // Screen-space LOD: compute how many pixels this cell covers.
-            // If sub-pixel, no point descending — shade as dominant color.
             let cell_world_size = s_cell_size[depth];
-            // Approximate ray distance to this cell from side_dist.
             let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
             let ray_dist = max(min_side, 0.001);
             let lod_pixels = cell_world_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
             let at_lod = lod_pixels < 1.0;
 
             if at_max || at_lod {
-                // LOD cutoff: use the per-child representative block type.
-                // bt=255 means all-empty subtree — treat as air, advance DDA.
                 let bt = child_block_type(packed);
                 if bt == 255u {
-                    // All-empty subtree — skip like Empty.
                     if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                         s_cell[depth].x += step.x;
                         s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -461,7 +512,6 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                         normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                     }
                 } else {
-                    // Solid representative — render as block.
                     let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
                     let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
@@ -471,55 +521,37 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                     result.normal = normal;
                     return result;
                 }
+            } else {
+                let parent_origin = s_node_origin[depth];
+                let parent_cell_size = s_cell_size[depth];
+                let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
+                let child_cell_size = parent_cell_size / 3.0;
+
+                let child_max = child_origin + vec3<f32>(parent_cell_size);
+                let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);
+                let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
+                let child_entry = ray_origin + ray_dir * ct_start;
+                let local_entry = (child_entry - child_origin) / child_cell_size;
+
+                depth += 1u;
+                s_node_idx[depth] = child_idx;
+                s_node_origin[depth] = child_origin;
+                s_cell_size[depth] = child_cell_size;
+                s_cell[depth] = vec3<i32>(
+                    clamp(i32(floor(local_entry.x)), 0, 2),
+                    clamp(i32(floor(local_entry.y)), 0, 2),
+                    clamp(i32(floor(local_entry.z)), 0, 2),
+                );
+                let lc = vec3<f32>(s_cell[depth]);
+                s_side_dist[depth] = vec3<f32>(
+                    select((child_origin.x + lc.x * child_cell_size - ray_origin.x) * inv_dir.x,
+                           (child_origin.x + (lc.x + 1.0) * child_cell_size - ray_origin.x) * inv_dir.x, ray_dir.x >= 0.0),
+                    select((child_origin.y + lc.y * child_cell_size - ray_origin.y) * inv_dir.y,
+                           (child_origin.y + (lc.y + 1.0) * child_cell_size - ray_origin.y) * inv_dir.y, ray_dir.y >= 0.0),
+                    select((child_origin.z + lc.z * child_cell_size - ray_origin.z) * inv_dir.z,
+                           (child_origin.z + (lc.z + 1.0) * child_cell_size - ray_origin.z) * inv_dir.z, ray_dir.z >= 0.0),
+                );
             }
-
-            let child_idx = child_node_index(s_node_idx[depth], slot);
-
-            // Compute the world-space min corner of this child cell.
-            let parent_origin = s_node_origin[depth];
-            let parent_cell_size = s_cell_size[depth];
-            let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
-            let child_cell_size = parent_cell_size / 3.0;
-
-            // Intersect ray with this child's AABB.
-            let child_max = child_origin + vec3<f32>(parent_cell_size);
-            let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);
-            let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
-            let child_entry = ray_origin + ray_dir * ct_start;
-
-            // Convert entry point to child-local cell coordinates.
-            let local_entry = (child_entry - child_origin) / child_cell_size;
-
-            // Push onto stack.
-            depth += 1u;
-            s_node_idx[depth] = child_idx;
-            s_node_origin[depth] = child_origin;
-            s_cell_size[depth] = child_cell_size;
-            s_cell[depth] = vec3<i32>(
-                clamp(i32(floor(local_entry.x)), 0, 2),
-                clamp(i32(floor(local_entry.y)), 0, 2),
-                clamp(i32(floor(local_entry.z)), 0, 2),
-            );
-
-            // Initialize side_dist for this level.
-            let lc = vec3<f32>(s_cell[depth]);
-            s_side_dist[depth] = vec3<f32>(
-                select(
-                    (child_origin.x + lc.x * child_cell_size - ray_origin.x) * inv_dir.x,
-                    (child_origin.x + (lc.x + 1.0) * child_cell_size - ray_origin.x) * inv_dir.x,
-                    ray_dir.x >= 0.0
-                ),
-                select(
-                    (child_origin.y + lc.y * child_cell_size - ray_origin.y) * inv_dir.y,
-                    (child_origin.y + (lc.y + 1.0) * child_cell_size - ray_origin.y) * inv_dir.y,
-                    ray_dir.y >= 0.0
-                ),
-                select(
-                    (child_origin.z + lc.z * child_cell_size - ray_origin.z) * inv_dir.z,
-                    (child_origin.z + (lc.z + 1.0) * child_cell_size - ray_origin.z) * inv_dir.z,
-                    ray_dir.z >= 0.0
-                ),
-            );
         }
     }
 
@@ -535,7 +567,6 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
-    // Full-screen triangle from 3 vertices.
     let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
     var out: VertexOutput;
     out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
@@ -547,311 +578,48 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let aspect = uniforms.screen_width / uniforms.screen_height;
     let half_fov_tan = tan(camera.fov * 0.5);
-
     let ndc = vec2<f32>(
         (in.uv.x - 0.5) * 2.0 * aspect * half_fov_tan,
         (0.5 - in.uv.y) * 2.0 * half_fov_tan,
     );
-
-    let ray_dir = normalize(
-        camera.forward + camera.right * ndc.x + camera.up * ndc.y
-    );
+    let ray_dir = normalize(camera.forward + camera.right * ndc.x + camera.up * ndc.y);
 
     let result = march(camera.pos, ray_dir);
 
-    // Spherical planet: true 3D DDA through the face subtrees.
-    //
-    // Each iteration finds the (face, iu, iv, ir) cell the ray is
-    // currently in at the finest subtree depth, samples that cell's
-    // block via the subtree walker, and either hits or steps to the
-    // exit boundary of that cell via analytic ray-plane (u/v) or
-    // ray-sphere (r) intersection. No fixed step, no aliasing —
-    // every pixel settles on the same cell regardless of depth or
-    // camera distance.
-    var cs_hit = false;
-    var cs_t = 1e20;
-    var cs_color = vec3<f32>(0.0);
-    var cs_normal = vec3<f32>(0.0, 1.0, 0.0);
-
-    let cs_outer = uniforms.cs_planet.w;
-    if cs_outer > 0.0 {
-        let cs_inner = uniforms.cs_params.x;
-        let shell = cs_outer - cs_inner;
-
-        // Path-anchored camera-from-sphere-center vector. Computed
-        // on the CPU via `WorldPos::offset_from`; precision bounded
-        // by the camera/planet common-ancestor cell size, so cell-
-        // scale rendering stays sub-pixel-accurate at any anchor.
-        let oc = uniforms.cs_oc.xyz;
-        let b = dot(oc, ray_dir);
-        let c_outer = dot(oc, oc) - cs_outer * cs_outer;
-        let disc = b * b - c_outer;
-        if disc > 0.0 {
-            let sq = sqrt(disc);
-            let t_enter = max(-b - sq, 0.0);
-            let t_exit = -b + sq;
-            // Small epsilon in world units, anchored to shell
-            // thickness. Advances t past a boundary so the next
-            // iteration samples the neighboring cell instead of
-            // looping on the same boundary plane.
-            // `eps` is the advance past a cell boundary. It must
-            // be (a) large enough to push the ray off the boundary
-            // plane in float arithmetic, and (b) small enough not
-            // to skip an entire neighbor cell. The previous fixed
-            // `shell * 1e-5` violated (b) at deep cs_edit depths
-            // (cell radial width = shell / cells_d drops below the
-            // fixed eps once cells_d > 1e5), so the DDA stepped
-            // past the cell that the next sample should have
-            // landed in — invisible cells at deep depths and
-            // misaligned advances at moderate depths (the seams).
-            // `eps_for(cells_d)` scales eps to the current
-            // boundary granularity.
-            var t = t_enter + max(shell * 1e-5, 1e-7);
-            var steps = 0u;
-            // Last cell boundary the DDA crossed. 0=u_lo, 1=u_hi,
-            // 2=v_lo, 3=v_hi, 4=r_lo, 5=r_hi, 6=outer-shell entry
-            // (no in-shell crossing yet). Used to compute a
-            // per-face shading normal so adjacent cells have
-            // different brightness instead of all sharing the
-            // smooth radial direction (which made cells look 2D).
-            var last_face_id: u32 = 6u;
-            // Deepest face-subtree term_depth the walker has
-            // returned on this ray. Cell boundaries are computed
-            // at this depth — not the current sample's term_depth
-            // — so adjacent regions with different walker depths
-            // share aligned boundary planes. Without this, an
-            // edit at `cs_edit_depth > SDF_DETAIL_LEVELS + 1`
-            // expands a previously-uniform depth-5 cell into a
-            // mixed depth-5 node, the walker returns `d=6` inside
-            // it but `d=5` for its uniform-stone siblings, and
-            // the DDA computes boundaries at cells_d=729 vs 243
-            // on either side — leaving a sky-strip seam at the
-            // transition. Hierarchical: depth-5 boundaries are a
-            // subset of depth-6 boundaries (`(iu+1)/243 ==
-            // 3*(iu+1)/729`), so promoting the scale upward
-            // never misses a true boundary.
-            var deepest_term_depth: u32 = 1u;
-            loop {
-                // 4096 step budget supports deep-depth empty
-                // traversals at small per-step advances (eps and
-                // cell-width scale with cells_d).
-                if t >= t_exit || steps > 4096u { break; }
-                steps = steps + 1u;
-
-                // `local` is the sample point relative to the sphere
-                // center, derived from `oc` so we never reconstruct
-                // `camera.pos - cs_center` at world scale.
-                let local = oc + ray_dir * t;
-                let r = length(local);
-                // The outer sphere intersect keeps us inside the
-                // shell in practice, but guard both boundaries.
-                if r >= cs_outer || r < cs_inner { break; }
-
-                let n = local / r;
-                let face = pick_face(n);
-                let n_axis = face_normal(face);
-                let u_axis = face_u_axis(face);
-                let v_axis = face_v_axis(face);
-                let axis_dot = dot(n, n_axis);
-                let cube_u = dot(n, u_axis) / axis_dot;
-                let cube_v = dot(n, v_axis) / axis_dot;
-                let u_ea = cube_to_ea(cube_u);
-                let v_ea = cube_to_ea(cube_v);
-
-                let un = clamp((u_ea + 1.0) * 0.5, 0.0, 0.9999999);
-                let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
-                let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
-
-                let walk = sample_face_tree(face_root(face), un, vn, rn);
-                let block_id = walk.x;
-                let term_depth = walk.y;
-                if block_id != 0u {
-                    cs_hit = true;
-                    cs_t = t;
-
-                    // Per-face shading normal from the boundary the
-                    // DDA last advanced through. u/v boundaries use
-                    // the face's tangent axes; r boundaries use the
-                    // radial direction. The sign flips with which
-                    // side of the boundary the ray came from.
-                    var hit_normal: vec3<f32>;
-                    switch last_face_id {
-                        case 0u: { hit_normal = -u_axis; }    // crossed u_lo, came from -u
-                        case 1u: { hit_normal =  u_axis; }    // crossed u_hi, came from +u
-                        case 2u: { hit_normal = -v_axis; }
-                        case 3u: { hit_normal =  v_axis; }
-                        case 4u: { hit_normal = -n; }         // crossed r_lo, came from above
-                        case 5u: { hit_normal =  n; }         // crossed r_hi, came from below
-                        default: { hit_normal =  n; }         // first hit on shell entry
-                    }
-                    cs_normal = hit_normal;
-
-                    let cell_color = palette.colors[block_id].rgb;
-                    let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-                    let diffuse = max(dot(hit_normal, sun_dir), 0.0);
-                    let ambient = 0.25;
-                    var surface = cell_color * (ambient + diffuse * 0.75);
-
-                    // Cursor highlight: the selected cell can live at
-                    // any subtree depth, not just the finest. At
-                    // `highlight_depth = 1` the wireframe encloses a
-                    // 3³-cell chunk; at `highlight_depth = subtree_depth`
-                    // it encloses one finest cell.
-                    if uniforms.cs_params.w > 0.5 {
-                        let hl_depth = max(uniforms.cs_params.z, 1.0);
-                        let hl_cells = pow(3.0, hl_depth);
-                        let hl_face = u32(uniforms.cs_highlight.x);
-                        let iu_h = floor(un * hl_cells);
-                        let iv_h = floor(vn * hl_cells);
-                        let ir_h = floor(rn * hl_cells);
-                        if face == hl_face
-                            && iu_h == uniforms.cs_highlight.y
-                            && iv_h == uniforms.cs_highlight.z
-                            && ir_h == uniforms.cs_highlight.w
-                        {
-                            // Edge-distance in the highlight cell's
-                            // local (0,1) space. Lines near any of
-                            // the six bulged faces of the cell.
-                            let cell_u = un * hl_cells - iu_h;
-                            let cell_v = vn * hl_cells - iv_h;
-                            let cell_r = rn * hl_cells - ir_h;
-                            let edge = min(
-                                min(min(cell_u, 1.0 - cell_u),
-                                    min(cell_v, 1.0 - cell_v)),
-                                min(cell_r, 1.0 - cell_r));
-                            // Line width: ~3% of cell, roughly one
-                            // visible "rim" at any zoom.
-                            if edge < 0.05 {
-                                surface = vec3<f32>(1.0, 0.9, 0.2);
-                            }
-                        }
-                    }
-
-                    cs_color = surface;
-                    break;
-                }
-
-                // Empty cell — step to its exit. Boundary scale uses
-                // the DEEPEST term_depth seen on this ray, not the
-                // current sample's, so adjacent regions with
-                // mismatched walker depths still share aligned
-                // boundary planes (see `deepest_term_depth`
-                // declaration above). Skip-empty is preserved for
-                // rays that never enter a finely-edited region —
-                // they keep `deepest_term_depth = 1` and traverse
-                // the whole face in O(3) steps.
-                deepest_term_depth = max(deepest_term_depth, term_depth);
-                let cells_d = pow(3.0, f32(deepest_term_depth));
-                let iu = floor(un * cells_d);
-                let iv = floor(vn * cells_d);
-                let ir = floor(rn * cells_d);
-
-                // u-boundaries as world planes through center.
-                let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
-                let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
-                let k_u_lo = ea_to_cube(u_lo_ea);
-                let k_u_hi = ea_to_cube(u_hi_ea);
-                let n_u_lo = u_axis - k_u_lo * n_axis;
-                let n_u_hi = u_axis - k_u_hi * n_axis;
-
-                let v_lo_ea = (iv       / cells_d) * 2.0 - 1.0;
-                let v_hi_ea = ((iv+1.0) / cells_d) * 2.0 - 1.0;
-                let k_v_lo = ea_to_cube(v_lo_ea);
-                let k_v_hi = ea_to_cube(v_hi_ea);
-                let n_v_lo = v_axis - k_v_lo * n_axis;
-                let n_v_hi = v_axis - k_v_hi * n_axis;
-
-                // r-boundaries as spheres around center.
-                let r_lo = cs_inner + (ir       / cells_d) * shell;
-                let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
-
-                var t_next = t_exit + 1.0;
-                var winning_face: u32 = 6u;
-                // Boundary intersections are also computed in
-                // sphere-relative coords: passing `oc` as origin
-                // and `vec3<f32>(0.0)` as the through-point keeps
-                // every subtraction at sub-cell precision.
-                let zero3 = vec3<f32>(0.0);
-                let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
-                if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
-                let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
-                if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
-                let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
-                if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
-                let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
-                if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
-                let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
-                if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
-                let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
-                if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
-
-                if t_next >= t_exit { break; }
-                // Record which boundary we crossed so the next
-                // sample knows which face it just entered through.
-                last_face_id = winning_face;
-                // Advance past the boundary by a fraction of the
-                // current cell's radial width — keeps the new
-                // sample firmly inside the neighbor cell while
-                // never skipping past it. f32-precision floor
-                // protects against degenerate eps when cells_d is
-                // huge enough to make `shell / cells_d` below the
-                // representable scale at world magnitudes.
-                let cell_eps = max(shell / cells_d * 1e-3, 1e-7);
-                t = t_next + cell_eps;
-            }
-        }
-    }
-
     var color: vec3<f32>;
-    let tree_closer = result.hit && result.t <= cs_t;
-    if tree_closer {
+    if result.hit {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
         let lit = result.color * (ambient + diffuse * 0.7);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
-    } else if cs_hit {
-        color = pow(cs_color, vec3<f32>(1.0 / 2.2));
     } else {
         let sky_t = ray_dir.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    // Block highlight outline: Minecraft-style wireframe cube.
-    // Draws all 12 edges with screen-space constant-pixel width.
-    // Occluded by geometry via result.t comparison.
     if uniforms.highlight_active != 0u {
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;
         let h_size = h_max - h_min;
-
         let h_inv_dir = vec3<f32>(
             select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
             select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
             select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
         );
-
         let hb = ray_box(camera.pos, h_inv_dir, h_min, h_max);
-
         if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
             let t = max(hb.t_enter, 0.0);
-
-            // Only draw if the outline is in front of (or at) geometry.
             if t <= result.t + h_size.x * 0.01 {
                 let hit_pos = camera.pos + ray_dir * t;
                 let from_min = hit_pos - h_min;
                 let from_max = h_max - hit_pos;
-
-                // Screen-space edge width: ~1.5 pixels regardless of distance.
                 let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
                 let ew = max(pixel_world * 1.5, h_size.x * 0.003);
-
-                // An edge exists where at least 2 of the 3 axes are near a face boundary.
                 let near_x = from_min.x < ew || from_max.x < ew;
                 let near_y = from_min.y < ew || from_max.y < ew;
                 let near_z = from_min.z < ew || from_max.z < ew;
                 let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
-
                 if edge_count >= 2u {
                     color = mix(color, vec3<f32>(0.1, 0.1, 0.1), 0.7);
                 }
@@ -859,7 +627,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Crosshair: thin cross at screen center.
     let pixel = vec2<f32>(in.uv.x * uniforms.screen_width, in.uv.y * uniforms.screen_height);
     let center = vec2<f32>(uniforms.screen_width * 0.5, uniforms.screen_height * 0.5);
     let d = abs(pixel - center);
@@ -869,7 +636,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_crosshair = (d.x < cross_thickness && d.y >= gap && d.y < cross_size)
                     || (d.y < cross_thickness && d.x >= gap && d.x < cross_size);
     if is_crosshair {
-        // Invert color for visibility against any background.
         color = vec3<f32>(1.0) - color;
     }
 

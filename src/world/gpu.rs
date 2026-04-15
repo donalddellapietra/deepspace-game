@@ -1,5 +1,16 @@
-//! GPU data packing: convert tree nodes into a flat buffer for the
+//! GPU data packing: convert tree nodes into flat buffers for the
 //! ray march shader.
+//!
+//! Two parallel buffers are produced per pack:
+//!
+//! - `tree: Vec<GpuChild>` — 27 children per node, BFS-ordered. Each
+//!   child has a tag (Empty / Block / Node) and either a block_type
+//!   or a buffer-local node index.
+//! - `node_kinds: Vec<GpuNodeKind>` — one entry per packed node,
+//!   carrying its `NodeKind` discriminant + per-kind data (sphere
+//!   body radii, cube face index). The shader looks this up when
+//!   it walks into a Node child to decide whether to descend with
+//!   the standard Cartesian DDA or switch to the cubed-sphere DDA.
 
 use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
@@ -23,6 +34,36 @@ pub struct GpuChild {
 /// One node in the GPU buffer = 27 GpuChild = 216 bytes.
 pub const GPU_NODE_SIZE: usize = 27;
 
+/// Per-packed-node metadata: which `NodeKind` this node is, plus the
+/// per-kind data the shader needs to render its content. Indexed by
+/// the same buffer index used in `GpuChild::node_index`.
+///
+/// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns
+/// cleanly. `kind` discriminant: 0 = Cartesian, 1 = CubedSphereBody,
+/// 2 = CubedSphereFace.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+pub struct GpuNodeKind {
+    pub kind: u32,
+    pub face: u32,
+    pub inner_r: f32,
+    pub outer_r: f32,
+}
+
+impl GpuNodeKind {
+    pub fn from_node_kind(k: NodeKind) -> Self {
+        match k {
+            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
+            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
+                kind: 1, face: 0, inner_r, outer_r,
+            },
+            NodeKind::CubedSphereFace { face } => Self {
+                kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
+            },
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuCamera {
@@ -37,7 +78,6 @@ pub struct GpuCamera {
 }
 
 /// Block color palette — up to 256 RGBA colors indexed by block type.
-/// Built from a `ColorRegistry` via `to_gpu_palette()`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuPalette {
@@ -46,7 +86,6 @@ pub struct GpuPalette {
 
 impl Default for GpuPalette {
     fn default() -> Self {
-        // Populate from the builtin palette entries.
         let mut colors = [[0.0f32; 4]; 256];
         for &(idx, _, color) in super::palette::BUILTINS {
             colors[idx as usize] = color;
@@ -55,15 +94,12 @@ impl Default for GpuPalette {
     }
 }
 
-/// Pack the visible portion of the tree into a flat GPU buffer.
-/// Returns (node_data, root_buffer_index).
+/// Pack the visible portion of the tree into flat GPU buffers.
+/// Returns `(tree_data, node_kinds, root_buffer_index)`.
 pub fn pack_tree(
     library: &NodeLibrary,
     root: NodeId,
-) -> (Vec<GpuChild>, u32) {
-    // BFS to collect all reachable nodes. `ordered` doubles as the
-    // queue (head advances through it) and the result (insertion order
-    // = buffer order).
+) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
     let mut ordered: Vec<NodeId> = Vec::new();
     let mut head = 0;
@@ -85,34 +121,20 @@ pub fn pack_tree(
         }
     }
 
-    // Pack into flat buffer.
     let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
+    let mut kinds: Vec<GpuNodeKind> = Vec::with_capacity(ordered.len());
     for &nid in &ordered {
         let node = library.get(nid).expect("node in ordered list must exist");
+        kinds.push(GpuNodeKind::from_node_kind(node.kind));
         for child in &node.children {
             data.push(match child {
-                Child::Empty => GpuChild {
-                    tag: 0,
-                    block_type: 0,
-                    _pad: 0,
-                    node_index: 0,
-                },
-                Child::Block(bt) => GpuChild {
-                    tag: 1,
-                    block_type: *bt,
-                    _pad: 0,
-                    node_index: 0,
-                },
+                Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
+                Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
                 Child::Node(child_id) => {
-                    // Store the child node's representative block type so
-                    // the shader can use a meaningful color at LOD cutoff.
                     let repr = library.get(*child_id)
-                        .map(|n| n.representative_block)
-                        .unwrap_or(0);
+                        .map(|n| n.representative_block).unwrap_or(0);
                     GpuChild {
-                        tag: 2,
-                        block_type: repr,
-                        _pad: 0,
+                        tag: 2, block_type: repr, _pad: 0,
                         node_index: *visited.get(child_id).expect("child must be visited"),
                     }
                 },
@@ -121,172 +143,22 @@ pub fn pack_tree(
     }
 
     let root_idx = *visited.get(&root).unwrap();
-    (data, root_idx)
+    (data, kinds, root_idx)
 }
 
 /// LOD-aware tree packing: only uploads nodes large enough to see.
 ///
-/// - **Uniform flattening:** Nodes where the entire subtree is one
-///   block type (or all empty) are packed as Block/Empty — the shader
-///   never descends into solid mountains or air volumes.
-/// - **Distance culling:** Nodes whose screen-space size is below a
-///   threshold are packed as Block(representative_block). Nearby terrain
-///   gets full depth, distant terrain gets 1-2 levels.
-/// - **Presence-preserving:** Nodes with representative_block=255 (all
-///   empty subtree) are flattened to Empty, not solid grey.
+/// Same dual-buffer output as `pack_tree`, plus distance-aware
+/// flattening of subtrees that cover less than `LOD_THRESHOLD`
+/// pixels on screen. The shader walks whatever ends up in the
+/// buffer; flattened cells appear as Block/Empty leaves.
 pub fn pack_tree_lod(
     library: &NodeLibrary,
     root: NodeId,
     camera_pos: [f32; 3],
     screen_height: f32,
     fov: f32,
-) -> (Vec<GpuChild>, u32) {
-    use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
-
-    let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
-    const LOD_THRESHOLD: f32 = 0.5; // pixels — lower = more detail kept at distance
-
-    // BFS with position tracking.
-    struct QueueEntry {
-        node_id: NodeId,
-        origin: [f32; 3],  // world-space min corner of this node
-        cell_size: f32,     // size of one child cell within this node
-    }
-
-    let mut visited: HashMap<NodeId, u32> = HashMap::new();
-    let mut queue: Vec<QueueEntry> = Vec::new();
-    let mut ordered: Vec<NodeId> = Vec::new();
-    // Track which children should be flattened (by ordered index + slot).
-    // For each ordered node, store 27 overrides: None = use real child,
-    // Some(GpuChild) = use this flattened value.
-    let mut overrides: Vec<[Option<GpuChild>; CHILDREN_PER_NODE]> = Vec::new();
-
-    visited.insert(root, 0);
-    ordered.push(root);
-    overrides.push([None; CHILDREN_PER_NODE]);
-    queue.push(QueueEntry {
-        node_id: root,
-        origin: [0.0; 3],
-        cell_size: 1.0, // root cells are 1.0 wide, node spans [0,3)
-    });
-    let mut head = 0;
-
-    while head < queue.len() {
-        let entry = &queue[head];
-        let node_id = entry.node_id;
-        let node_origin = entry.origin;
-        let cell_size = entry.cell_size;
-        let ordered_idx = head; // queue and ordered are aligned
-        head += 1;
-
-        let Some(node) = library.get(node_id) else { continue };
-
-        for (slot, child) in node.children.iter().enumerate() {
-            if let Child::Node(child_id) = child {
-                let child_node = match library.get(*child_id) {
-                    Some(n) => n,
-                    None => continue,
-                };
-
-                // (B) Uniform flattening: entire subtree is one type.
-                if child_node.uniform_type != UNIFORM_MIXED {
-                    let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
-                        GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
-                    } else {
-                        GpuChild { tag: 1, block_type: child_node.uniform_type, _pad: 0, node_index: 0 }
-                    };
-                    overrides[ordered_idx][slot] = Some(gpu);
-                    continue;
-                }
-
-                // (C) Distance-aware culling: is this cell large enough on screen?
-                let (cx, cy, cz) = slot_coords(slot);
-                let child_center = [
-                    node_origin[0] + (cx as f32 + 0.5) * cell_size,
-                    node_origin[1] + (cy as f32 + 0.5) * cell_size,
-                    node_origin[2] + (cz as f32 + 0.5) * cell_size,
-                ];
-                let dx = child_center[0] - camera_pos[0];
-                let dy = child_center[1] - camera_pos[1];
-                let dz = child_center[2] - camera_pos[2];
-                let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
-                let screen_pixels = cell_size / dist * half_fov_recip;
-
-                if screen_pixels < LOD_THRESHOLD {
-                    // Too small to see detail — flatten to representative color.
-                    // Presence-preserving: if representative_block is 255
-                    // (all-empty subtree), flatten to Empty so the ray
-                    // passes through instead of hitting a grey wall.
-                    let gpu = if child_node.representative_block < 255 {
-                        GpuChild { tag: 1, block_type: child_node.representative_block, _pad: 0, node_index: 0 }
-                    } else {
-                        GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
-                    };
-                    overrides[ordered_idx][slot] = Some(gpu);
-                    continue;
-                }
-
-                // This node is visible — add to BFS if not already visited.
-                if !visited.contains_key(child_id) {
-                    let idx = ordered.len() as u32;
-                    visited.insert(*child_id, idx);
-                    ordered.push(*child_id);
-                    overrides.push([None; CHILDREN_PER_NODE]);
-                    let child_origin = [
-                        node_origin[0] + cx as f32 * cell_size,
-                        node_origin[1] + cy as f32 * cell_size,
-                        node_origin[2] + cz as f32 * cell_size,
-                    ];
-                    queue.push(QueueEntry {
-                        node_id: *child_id,
-                        origin: child_origin,
-                        cell_size: cell_size / 3.0,
-                    });
-                }
-            }
-        }
-    }
-
-    // Pack into flat buffer, applying overrides.
-    let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
-    for (oi, &nid) in ordered.iter().enumerate() {
-        let node = library.get(nid).expect("node in ordered list must exist");
-        for (slot, child) in node.children.iter().enumerate() {
-            if let Some(gpu) = overrides[oi][slot] {
-                data.push(gpu);
-            } else {
-                data.push(match child {
-                    Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
-                    Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
-                    Child::Node(child_id) => {
-                        let repr = library.get(*child_id).map(|n| n.representative_block).unwrap_or(0);
-                        let idx = visited.get(child_id).copied().unwrap_or(0);
-                        GpuChild { tag: 2, block_type: repr, _pad: 0, node_index: idx }
-                    },
-                });
-            }
-        }
-    }
-
-    let root_idx = *visited.get(&root).unwrap();
-    (data, root_idx)
-}
-
-/// Like `pack_tree_lod`, but packs multiple root subtrees into the
-/// same flat buffer. Used when the engine needs several independent
-/// trees on the GPU — the Cartesian space tree *and* each of a
-/// spherical planet's 6 face subtrees, for instance. Returns the
-/// buffer index of each root in the same order given. Distance-LOD
-/// is applied to the first root only (the Cartesian tree has a
-/// meaningful world-space origin); face subtrees always pack full
-/// depth because their axes don't live in world space.
-pub fn pack_tree_lod_multi(
-    library: &NodeLibrary,
-    roots: &[NodeId],
-    camera_pos: [f32; 3],
-    screen_height: f32,
-    fov: f32,
-) -> (Vec<GpuChild>, Vec<u32>) {
+) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
 
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
@@ -296,7 +168,6 @@ pub fn pack_tree_lod_multi(
         node_id: NodeId,
         origin: [f32; 3],
         cell_size: f32,
-        use_lod: bool,
     }
 
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
@@ -304,30 +175,31 @@ pub fn pack_tree_lod_multi(
     let mut ordered: Vec<NodeId> = Vec::new();
     let mut overrides: Vec<[Option<GpuChild>; CHILDREN_PER_NODE]> = Vec::new();
 
-    for (ri, &root) in roots.iter().enumerate() {
-        if visited.contains_key(&root) { continue; }
-        let idx = ordered.len() as u32;
-        visited.insert(root, idx);
-        ordered.push(root);
-        overrides.push([None; CHILDREN_PER_NODE]);
-        queue.push(QueueEntry {
-            node_id: root,
-            origin: [0.0; 3],
-            cell_size: 1.0,
-            use_lod: ri == 0,
-        });
-    }
+    visited.insert(root, 0);
+    ordered.push(root);
+    overrides.push([None; CHILDREN_PER_NODE]);
+    queue.push(QueueEntry {
+        node_id: root,
+        origin: [0.0; 3],
+        cell_size: 1.0,
+    });
     let mut head = 0;
+
     while head < queue.len() {
         let entry = &queue[head];
         let node_id = entry.node_id;
         let node_origin = entry.origin;
         let cell_size = entry.cell_size;
-        let use_lod = entry.use_lod;
         let ordered_idx = head;
         head += 1;
 
         let Some(node) = library.get(node_id) else { continue };
+
+        // Sphere-body and face nodes do NOT participate in
+        // distance-LOD flattening — their children are interpreted
+        // by the shader's NodeKind dispatch. Flattening would lose
+        // the geometric semantics. Only Cartesian nodes apply LOD.
+        let lod_active = matches!(node.kind, NodeKind::Cartesian);
 
         for (slot, child) in node.children.iter().enumerate() {
             if let Child::Node(child_id) = child {
@@ -335,7 +207,13 @@ pub fn pack_tree_lod_multi(
                     Some(n) => n,
                     None => continue,
                 };
-                if child_node.uniform_type != UNIFORM_MIXED {
+
+                // Uniform-content collapse — only safe for Cartesian
+                // nodes (face/body subtrees have geometry that the
+                // shader needs to walk).
+                let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
+                if lod_active && child_is_cartesian
+                    && child_node.uniform_type != UNIFORM_MIXED {
                     let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
                         GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
                     } else {
@@ -344,7 +222,8 @@ pub fn pack_tree_lod_multi(
                     overrides[ordered_idx][slot] = Some(gpu);
                     continue;
                 }
-                if use_lod {
+
+                if lod_active && child_is_cartesian {
                     let (cx, cy, cz) = slot_coords(slot);
                     let child_center = [
                         node_origin[0] + (cx as f32 + 0.5) * cell_size,
@@ -366,6 +245,7 @@ pub fn pack_tree_lod_multi(
                         continue;
                     }
                 }
+
                 if !visited.contains_key(child_id) {
                     let idx = ordered.len() as u32;
                     visited.insert(*child_id, idx);
@@ -381,7 +261,6 @@ pub fn pack_tree_lod_multi(
                         node_id: *child_id,
                         origin: child_origin,
                         cell_size: cell_size / 3.0,
-                        use_lod,
                     });
                 }
             }
@@ -389,8 +268,10 @@ pub fn pack_tree_lod_multi(
     }
 
     let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
+    let mut kinds: Vec<GpuNodeKind> = Vec::with_capacity(ordered.len());
     for (oi, &nid) in ordered.iter().enumerate() {
         let node = library.get(nid).expect("node in ordered list must exist");
+        kinds.push(GpuNodeKind::from_node_kind(node.kind));
         for (slot, child) in node.children.iter().enumerate() {
             if let Some(gpu) = overrides[oi][slot] {
                 data.push(gpu);
@@ -408,11 +289,8 @@ pub fn pack_tree_lod_multi(
         }
     }
 
-    let root_indices: Vec<u32> = roots
-        .iter()
-        .map(|r| *visited.get(r).expect("every root must be visited"))
-        .collect();
-    (data, root_indices)
+    let root_idx = *visited.get(&root).unwrap();
+    (data, kinds, root_idx)
 }
 
 #[cfg(test)]
@@ -422,17 +300,24 @@ mod tests {
     #[test]
     fn pack_test_world() {
         let world = super::super::state::WorldState::test_world();
-        let (data, root_idx) = pack_tree(&world.library, world.root);
-        // Verify data is a multiple of 27 (each node is 27 children).
+        let (data, kinds, root_idx) = pack_tree(&world.library, world.root);
         assert_eq!(data.len() % 27, 0);
-        // Root is always first in BFS order.
         assert_eq!(root_idx, 0);
-        // Should have all reachable nodes packed.
         assert_eq!(data.len() / 27, world.library.len());
+        assert_eq!(kinds.len(), world.library.len());
+        // All test_world nodes are Cartesian.
+        for k in &kinds {
+            assert_eq!(k.kind, 0);
+        }
     }
 
     #[test]
     fn gpu_child_size() {
         assert_eq!(std::mem::size_of::<GpuChild>(), 8);
+    }
+
+    #[test]
+    fn gpu_node_kind_size() {
+        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 16);
     }
 }

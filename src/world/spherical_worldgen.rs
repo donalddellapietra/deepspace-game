@@ -1,62 +1,44 @@
-//! Declarative setup for spherical-planet worldgen.
+//! Insert a spherical body into the world tree.
 //!
-//! This module is a thin, data-first wrapper around
-//! [`super::cubesphere::generate_spherical_planet`]. Callers construct
-//! (or start from [`demo_planet`]) a [`PlanetSetup`] value and hand it
-//! to [`build`], which materializes the 6 face subtrees into the
-//! provided [`NodeLibrary`] and returns a [`SphericalPlanet`] handle.
-//!
-//! The split exists so `main.rs` (and tests, and future editors) can
-//! describe planets as plain data instead of open-coding the setup
-//! every time one is needed.
-//!
-//! Tuning the starter scene is done by editing [`demo_planet`] — all
-//! fields are `pub` so callers can also clone-and-modify.
-//!
-//! # Example
-//! ```ignore
-//! use deepspace_game::world::{spherical_worldgen, tree::NodeLibrary};
-//! let mut lib = NodeLibrary::default();
-//! let setup = spherical_worldgen::demo_planet();
-//! let planet = spherical_worldgen::build(&mut lib, &setup);
-//! ```
+//! The planet IS a `NodeKind::CubedSphereBody` node, placed at a
+//! chosen path inside the world's Cartesian tree. There's no
+//! external `SphericalPlanet` handle — the tree is the single
+//! source of truth, and the path returned here is just a hint for
+//! spawn-position computation.
 
-use super::cubesphere::{generate_spherical_planet, SphericalPlanet};
+use super::anchor::Path;
+use super::cubesphere::insert_spherical_body;
 use super::palette::block;
 use super::sdf::{Planet, Vec3};
-use super::tree::NodeLibrary;
+use super::tree::{slot_index, Child, NodeId, NodeLibrary};
 
-/// Declarative description of a planet to build. All units are in
-/// world space. `depth` is the face-subtree recursion depth.
+/// Declarative planet description. Radii are in **the body cell's
+/// local `[0, 1)` frame** (per spec §1d). The body cell's actual
+/// world-space size is determined by where in the tree it lives.
 #[derive(Clone, Debug)]
 pub struct PlanetSetup {
-    pub center: Vec3,
+    /// Radii in body cell local `[0, 1)`.
     pub inner_r: f32,
     pub outer_r: f32,
+    /// Face subtree depth.
     pub depth: u32,
+    /// SDF in body cell local frame (center = `(0.5, 0.5, 0.5)`).
     pub sdf: Planet,
 }
 
-/// The demo/starter planet used by the default world. Edit this
-/// function to tune the starting scene.
+/// The demo / starter planet. Body cell-local: `outer_r ≤ 0.5` so
+/// the sphere fits cleanly in one cell of its parent.
 pub fn demo_planet() -> PlanetSetup {
-    // Centered at the world origin (root cell midpoint) so the
-    // shell + gravity influence (2 × outer_r) fits inside the root
-    // cell `[0, WORLD_SIZE)^3` and spawn / fly-space don't need
-    // clamping. With WORLD_SIZE = 3.0, center = 1.5 and
-    // influence_radius = 1.04 gives a hard floor/ceiling at
-    // y ∈ [0.46, 2.54] for gravity — well inside root.
-    let center: Vec3 = [1.5, 1.5, 1.5];
+    let center: Vec3 = [0.5, 0.5, 0.5];
     let inner_r = 0.12_f32;
-    let outer_r = 0.52_f32;
+    let outer_r = 0.45_f32;
     PlanetSetup {
-        center,
         inner_r,
         outer_r,
         depth: 20,
         sdf: Planet {
             center,
-            radius: 0.32,
+            radius: 0.30,
             noise_scale: 0.015,
             noise_freq: 8.0,
             noise_seed: 2024,
@@ -68,61 +50,116 @@ pub fn demo_planet() -> PlanetSetup {
     }
 }
 
-/// Generate the planet's 6 face subtrees into `lib` and return a
-/// [`SphericalPlanet`] handle.
-pub fn build(lib: &mut NodeLibrary, setup: &PlanetSetup) -> SphericalPlanet {
-    generate_spherical_planet(
-        lib,
-        setup.center,
-        setup.inner_r,
-        setup.outer_r,
-        setup.depth,
-        &setup.sdf,
-    )
+/// Build a body node and place it at the given world-tree path,
+/// returning the body's `NodeId` and the full path to it from
+/// `world_root`.
+///
+/// `host_path` is the slots from `world_root` to the cell that
+/// will become the body. The cell at the end of `host_path`
+/// becomes a `CubedSphereBody` child of its parent.
+///
+/// For the simplest case (planet at root center), pass a single
+/// `slot_index(1, 1, 1) = 13` to put the body in the central
+/// depth-1 cell.
+pub fn insert_into_tree(
+    lib: &mut NodeLibrary,
+    world_root: NodeId,
+    host_slots: &[u8],
+    setup: &PlanetSetup,
+) -> (NodeId, Path, Path) {
+    assert!(!host_slots.is_empty(), "host_slots must point at a child");
+
+    let body_id = insert_spherical_body(
+        lib, setup.inner_r, setup.outer_r, setup.depth, &setup.sdf,
+    );
+
+    // Rebuild the path from world_root downward, replacing the
+    // target slot with the body. Only the path levels are
+    // touched; all other siblings are preserved.
+    let new_root = install_body(lib, world_root, host_slots, body_id);
+
+    let mut body_path = Path::root();
+    for &s in host_slots { body_path.push(s); }
+    (new_root, body_path, body_path)
 }
 
-// ───────────────────────────────────────────────────────── tests
+/// Walk down `slots`, expanding any uniform terminals on the path
+/// into Node children, then install `new_node` at the leaf and
+/// rebuild parents on the way up. Returns the new world root id.
+fn install_body(
+    lib: &mut NodeLibrary,
+    root: NodeId,
+    slots: &[u8],
+    new_node: NodeId,
+) -> NodeId {
+    fn rebuild(
+        lib: &mut NodeLibrary,
+        current: NodeId,
+        slots: &[u8],
+        level: usize,
+        new_node: NodeId,
+    ) -> NodeId {
+        let target = slots[level] as usize;
+        let node = lib.get(current).expect("install path must exist in library");
+        let mut new_children = node.children;
+        if level + 1 == slots.len() {
+            new_children[target] = Child::Node(new_node);
+        } else {
+            let next_id = match node.children[target] {
+                Child::Node(nid) => rebuild(lib, nid, slots, level + 1, new_node),
+                Child::Empty | Child::Block(_) => {
+                    use super::tree::empty_children;
+                    let expanded = lib.insert(empty_children());
+                    rebuild(lib, expanded, slots, level + 1, new_node)
+                }
+            };
+            new_children[target] = Child::Node(next_id);
+        }
+        lib.insert(new_children)
+    }
+    rebuild(lib, root, slots, 0, new_node)
+}
+
+/// Convenience — install at slot 13 (depth-1 center cell of the root).
+pub fn install_at_root_center(
+    lib: &mut NodeLibrary,
+    world_root: NodeId,
+    setup: &PlanetSetup,
+) -> (NodeId, Path) {
+    let (new_root, body_path, _) = insert_into_tree(
+        lib, world_root, &[slot_index(1, 1, 1) as u8], setup,
+    );
+    (new_root, body_path)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::tree::NodeKind;
 
     #[test]
-    fn demo_planet_has_valid_parameters() {
+    fn demo_planet_setup_valid() {
         let s = demo_planet();
-        // Radii form a valid shell.
-        assert!(s.inner_r > 0.0);
-        assert!(s.outer_r > s.inner_r);
-        // Planet surface radius lies inside the shell.
-        assert!(s.sdf.radius > s.inner_r);
-        assert!(s.sdf.radius < s.outer_r);
-        // SDF is anchored to the same center as the shell.
-        assert_eq!(s.sdf.center, s.center);
-        // Depth matches the original main.rs setup (extraction, not
-        // redesign — bump deliberately if tuning the demo).
-        assert_eq!(s.depth, 20);
-        // Influence radius extends beyond the shell for gravity in space.
-        assert!(s.sdf.influence_radius >= s.outer_r);
-        // Blocks are sane.
-        assert_eq!(s.sdf.surface_block, block::GRASS);
-        assert_eq!(s.sdf.core_block, block::STONE);
+        assert!(0.0 < s.inner_r && s.inner_r < s.outer_r);
+        assert!(s.outer_r <= 0.5);
     }
 
     #[test]
-    fn build_produces_six_face_roots_in_library() {
+    fn install_at_root_center_creates_body_at_slot_13() {
         let mut lib = NodeLibrary::default();
+        // Empty world root.
+        let root = lib.insert(super::super::tree::empty_children());
         let setup = demo_planet();
-        let planet = build(&mut lib, &setup);
-        assert_eq!(planet.face_roots.len(), 6);
-        for &id in &planet.face_roots {
-            assert!(
-                lib.get(id).is_some(),
-                "face root {id} missing from NodeLibrary",
-            );
-        }
-        assert_eq!(planet.center, setup.center);
-        assert_eq!(planet.inner_r, setup.inner_r);
-        assert_eq!(planet.outer_r, setup.outer_r);
-        assert_eq!(planet.depth, setup.depth);
+        let (new_root, body_path) = install_at_root_center(&mut lib, root, &setup);
+        assert_eq!(body_path.depth(), 1);
+        assert_eq!(body_path.slot(0), slot_index(1, 1, 1) as u8);
+
+        let new_root_node = lib.get(new_root).unwrap();
+        let body_child = match new_root_node.children[slot_index(1, 1, 1)] {
+            Child::Node(id) => id,
+            _ => panic!("slot 13 not a Node"),
+        };
+        let body = lib.get(body_child).unwrap();
+        assert!(matches!(body.kind, NodeKind::CubedSphereBody { .. }));
     }
 }
