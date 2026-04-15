@@ -72,11 +72,11 @@ impl App {
 
     pub(super) fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f32();
-        let hit = edit::cpu_raycast_with_face_depth(
+        let anchor = self.camera.position.anchor;
+        let hit = edit::cpu_raycast_from_anchor(
             &self.world.library, self.world.root,
-            camera_pos, ray_dir, self.edit_depth(),
-            self.cs_edit_depth(),
+            &anchor, &self.camera.position, ray_dir,
+            self.edit_depth(), self.cs_edit_depth(),
         );
         eprintln!(
             "do_break: anchor_depth={}, edit_depth={}, cs_edit_depth={}, hit={:?}",
@@ -120,11 +120,11 @@ impl App {
 
     pub(super) fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f32();
-        let hit = edit::cpu_raycast_with_face_depth(
+        let anchor = self.camera.position.anchor;
+        let hit = edit::cpu_raycast_from_anchor(
             &self.world.library, self.world.root,
-            camera_pos, ray_dir, self.edit_depth(),
-            self.cs_edit_depth(),
+            &anchor, &self.camera.position, ray_dir,
+            self.edit_depth(), self.cs_edit_depth(),
         );
         eprintln!(
             "do_place: anchor_depth={}, edit_depth={}, cs_edit_depth={}, hit={:?}",
@@ -521,11 +521,11 @@ impl App {
             return;
         }
         let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f32();
-        let tree_hit = edit::cpu_raycast_with_face_depth(
+        let anchor = self.camera.position.anchor;
+        let tree_hit = edit::cpu_raycast_from_anchor(
             &self.world.library, self.world.root,
-            camera_pos, ray_dir, self.edit_depth(),
-            self.cs_edit_depth(),
+            &anchor, &self.camera.position, ray_dir,
+            self.edit_depth(), self.cs_edit_depth(),
         );
         let aabb = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
         if let Some((mn, mx)) = &aabb {

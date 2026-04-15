@@ -6,6 +6,7 @@
 //! raycast descends, so the same code breaks a single block at fine
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
+use super::anchor::{Path, WorldPos};
 use super::cubesphere::{world_to_coord, FACE_SLOTS};
 use super::sdf;
 use super::state::WorldState;
@@ -54,6 +55,88 @@ pub fn cpu_raycast(
     max_depth: u32,
 ) -> Option<HitInfo> {
     cpu_raycast_with_face_depth(library, root, ray_origin, ray_dir, max_depth, 6)
+}
+
+/// Raycast in the camera's local layer frame — no world-root coords.
+///
+/// Every layer uses the same f32 `[0, WORLD_SIZE)` coord system in
+/// its own frame. Precision is identical at layer 1 and layer 40
+/// because NO absolute world coordinates ever appear in the math:
+/// the DDA runs in the `start_path` frame, which is a prefix of the
+/// camera's anchor.
+///
+/// `start_path` is picked so that the DDA has just enough levels to
+/// reach `max_depth` cells: `start_depth = max_depth - 1`, giving one
+/// level of DDA across `[0, WORLD_SIZE)` cells of size 1.0 — same
+/// precision profile regardless of how deep the user is zoomed in.
+///
+/// The camera's anchor must be at or below `start_depth` (true in
+/// all normal play: `edit_depth < anchor_depth`).
+///
+/// 1. `start_path = first start_depth slots of anchor`.
+/// 2. `ray_origin = camera.in_frame(&start_path)` — pure path-slot
+///    composition in the tail, f32 precision bounded by WORLD_SIZE.
+/// 3. Delegate to `cpu_raycast_with_face_depth`, which is layer-
+///    independent (marches `[0, 3)` with `cell_size=1.0`).
+/// 4. Prepend the ancestor prefix to the returned path so
+///    `propagate_edit` walks the full root→leaf path.
+pub fn cpu_raycast_from_anchor(
+    library: &NodeLibrary,
+    root: NodeId,
+    anchor_path: &Path,
+    camera_pos: &WorldPos,
+    ray_dir: [f32; 3],
+    max_depth: u32,
+    max_face_depth: u32,
+) -> Option<HitInfo> {
+    // Edit layer's parent frame: one level shallower than the edit
+    // cells, so one level of DDA reaches them. Clamped to anchor's
+    // depth (the camera must be inside the start cell).
+    let start_depth = max_depth
+        .saturating_sub(1)
+        .min(anchor_path.depth() as u32) as usize;
+
+    // Build the start path (prefix of anchor) and walk the tree to
+    // find the start node's NodeId + ancestor prefix.
+    let mut start_path = Path::root();
+    let mut prefix: Vec<(NodeId, usize)> = Vec::with_capacity(start_depth);
+    let mut node_id = root;
+    for k in 0..start_depth {
+        let slot = anchor_path.slot(k);
+        start_path.push(slot);
+        prefix.push((node_id, slot as usize));
+        let node = library.get(node_id)?;
+        match node.children[slot as usize] {
+            Child::Node(next) => node_id = next,
+            _ => return None,
+        }
+    }
+
+    // Ray origin in the start cell's local frame — pure f32,
+    // bounded by WORLD_SIZE no matter how deep the anchor sits.
+    let ray_origin = camera_pos.in_frame(&start_path);
+
+    // Remaining depth to reach edit cells from start.
+    let max_from_start = max_depth.saturating_sub(start_depth as u32).max(1);
+
+    let mut hit = cpu_raycast_with_face_depth(
+        library, node_id, ray_origin, ray_dir,
+        max_from_start, max_face_depth,
+    )?;
+
+    // Prepend the ancestor prefix so propagate_edit walks the full
+    // path from world root.
+    let mut full_path = prefix.clone();
+    full_path.append(&mut hit.path);
+    hit.path = full_path;
+
+    if let Some(ref mut pp) = hit.place_path {
+        let mut full_pp = prefix;
+        full_pp.append(pp);
+        *pp = full_pp;
+    }
+
+    Some(hit)
 }
 
 /// Same as `cpu_raycast` but with an explicit cap on how deep the
