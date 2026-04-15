@@ -902,7 +902,7 @@ fn walk_face_subtree_with_path(
 /// voxel's world AABB is computed from `cubesphere::block_corners`
 /// at the cell's `(face, u, v, r)` extents.
 pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
-    use super::cubesphere::{block_corners, Face, FACE_SLOTS};
+    use super::cubesphere::{block_corners, coord_to_world, CubeSphereCoord, Face, FACE_SLOTS};
 
     let mut origin = [0.0f32; 3];
     let mut cell_size = 1.0f32;
@@ -959,19 +959,45 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
             let drn = 1.0 / cells;
             let r_world_lo = inner_r * body_size + r_lo_n * (outer_r - inner_r) * body_size;
             let dr_world = drn * (outer_r - inner_r) * body_size;
-            // World corners of the bulged voxel.
+            // World corners of the bulged voxel — the 8 corners
+            // alone underestimate the cell on cells near a face
+            // center, where the spherical patch BULGES outward
+            // beyond the corner envelope (up to ~50% of cell size
+            // for shallow cells). Also sample the 6 cell-face
+            // midpoints so the AABB encloses the bulge.
             let corners = block_corners(
                 body_center, face,
                 u_lo, v_lo, r_world_lo,
                 du, dv, dr_world,
             );
+            let u_hi = u_lo + du;
+            let v_hi = v_lo + dv;
+            let r_world_hi = r_world_lo + dr_world;
+            let u_mid = u_lo + du * 0.5;
+            let v_mid = v_lo + dv * 0.5;
+            let r_world_mid = r_world_lo + dr_world * 0.5;
+            let mids = [
+                (u_lo,  v_mid, r_world_mid),
+                (u_hi,  v_mid, r_world_mid),
+                (u_mid, v_lo,  r_world_mid),
+                (u_mid, v_hi,  r_world_mid),
+                (u_mid, v_mid, r_world_lo),
+                (u_mid, v_mid, r_world_hi),
+            ];
             let mut aabb_min = corners[0];
             let mut aabb_max = corners[0];
-            for c in &corners[1..] {
+            let update = |p: [f32; 3], mn: &mut [f32; 3], mx: &mut [f32; 3]| {
                 for k in 0..3 {
-                    if c[k] < aabb_min[k] { aabb_min[k] = c[k]; }
-                    if c[k] > aabb_max[k] { aabb_max[k] = c[k]; }
+                    if p[k] < mn[k] { mn[k] = p[k]; }
+                    if p[k] > mx[k] { mx[k] = p[k]; }
                 }
+            };
+            for c in &corners[1..] {
+                update(*c, &mut aabb_min, &mut aabb_max);
+            }
+            for &(u, v, r) in &mids {
+                let p = coord_to_world(body_center, CubeSphereCoord { face, u, v, r });
+                update(p, &mut aabb_min, &mut aabb_max);
             }
             return (aabb_min, aabb_max);
         }
