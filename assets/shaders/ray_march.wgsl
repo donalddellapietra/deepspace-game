@@ -459,6 +459,26 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
 
             if kind == 1u {
                 // CubedSphereBody: dispatch sphere DDA in this body's cell.
+                //
+                // DIAGNOSTIC (remove once dispatch is verified): paint the
+                // entry face of the body cell BRIGHT MAGENTA. If you see
+                // magenta where the planet should be, NodeKind dispatch
+                // is firing correctly; if you still see stone, the
+                // dispatch is broken (the walker is descending into the
+                // body's children Cartesian-style).
+                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
+                let body_size = s_cell_size[depth];
+                let cell_box_h = ray_box(ray_origin, inv_dir,
+                                         body_origin,
+                                         body_origin + vec3<f32>(body_size));
+                result.hit = true;
+                result.t = max(cell_box_h.t_enter, 0.0);
+                result.color = vec3<f32>(1.0, 0.0, 1.0);
+                result.normal = normal;
+                return result;
+            }
+            if false {
+                // Real path (re-enable after diagnostic confirms dispatch):
                 let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
                 let body_size = s_cell_size[depth];
                 let inner_r = node_kinds[child_idx].inner_r;
