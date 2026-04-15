@@ -316,6 +316,46 @@ impl WorldPos {
         WORLD_SIZE / 3.0f32.powi(self.anchor.depth() as i32)
     }
 
+    /// Vector from `other` to `self`, in world units, computed
+    /// without ever materializing either position at world scale.
+    ///
+    /// **Precision-safe.** Both positions are walked in their
+    /// common ancestor cell's frame (size = `WORLD_SIZE / 3^C`),
+    /// and the subtraction happens at that local scale — so the
+    /// difference's f32 precision is bounded by `cell_size_at_C *
+    /// 1e-7` rather than by `WORLD_SIZE * 1e-7`. When `self` and
+    /// `other` share a deep prefix (camera near a tracked entity),
+    /// precision improves geometrically with that depth.
+    ///
+    /// Returns `self - other` as a world-units `[f32; 3]`.
+    pub fn offset_from(&self, other: &Self) -> [f32; 3] {
+        let c = self.anchor.common_prefix_len(&other.anchor) as usize;
+        // Cell size of the common ancestor in world units.
+        let mut common_size = WORLD_SIZE;
+        for _ in 0..c {
+            common_size /= 3.0;
+        }
+        let walk = |p: &Self| -> [f32; 3] {
+            let mut pos = [0.0f32; 3];
+            let mut size = common_size;
+            for k in c..(p.anchor.depth() as usize) {
+                let (sx, sy, sz) = slot_coords(p.anchor.slot(k) as usize);
+                let child = size / 3.0;
+                pos[0] += sx as f32 * child;
+                pos[1] += sy as f32 * child;
+                pos[2] += sz as f32 * child;
+                size = child;
+            }
+            pos[0] += p.offset[0] * size;
+            pos[1] += p.offset[1] * size;
+            pos[2] += p.offset[2] * size;
+            pos
+        };
+        let a = walk(self);
+        let b = walk(other);
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
     /// Zoom this position in repeatedly until its anchor reaches
     /// `target_depth`. Precision-safe: each step is pure path-slot
     /// arithmetic, no absolute-XYZ accumulation.
@@ -677,6 +717,39 @@ mod tests {
         for i in 0..3 {
             assert!((world_back[i] - world_orig[i]).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn offset_from_matches_world_diff_at_shallow_anchors() {
+        let a = WorldPos::from_world_xyz([2.5, 0.25, 1.5], 4);
+        let b = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
+        let o = a.offset_from(&b);
+        let aw = a.to_world_xyz();
+        let bw = b.to_world_xyz();
+        for i in 0..3 {
+            assert!((o[i] - (aw[i] - bw[i])).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn offset_from_precision_at_deep_common_prefix() {
+        // Two positions inside the same depth-12 cell — common
+        // prefix is 12, so the offset should resolve at sub-cell
+        // precision even though to_world_xyz of either is bounded
+        // by f32 precision at magnitude ~1.5.
+        let mut anchor = Path::root();
+        for _ in 0..12 { anchor.push(slot_index(1, 1, 1) as u8); }
+        let a = WorldPos::new(anchor, [0.30, 0.50, 0.70]);
+        let b = WorldPos::new(anchor, [0.20, 0.50, 0.70]);
+        let o = a.offset_from(&b);
+        let cell = WORLD_SIZE / 3.0f32.powi(12);
+        let expected_x = 0.10 * cell;
+        // f32 precision at magnitude `cell` is ~cell * 1e-7,
+        // way below the 1e-5 *cell tolerance below.
+        assert!((o[0] - expected_x).abs() < cell * 1e-5,
+            "diff {} expected {}", o[0], expected_x);
+        assert!(o[1].abs() < cell * 1e-5);
+        assert!(o[2].abs() < cell * 1e-5);
     }
 
     #[test]

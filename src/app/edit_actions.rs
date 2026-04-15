@@ -201,6 +201,15 @@ impl App {
                 planet.outer_r * frame_scale,
                 planet.depth,
             );
+
+            // Path-anchored camera-from-sphere-center vector. The
+            // shader uses this as `oc` directly — it never
+            // recomputes `camera.pos - cs_center`, so the shell
+            // ray-march keeps sub-cell precision at any anchor
+            // depth. The diff is bounded in f32 by the camera /
+            // planet common-ancestor cell size, not by WORLD_SIZE.
+            let oc = self.camera.position.offset_from(&planet.center_worldpos);
+            renderer.set_cs_oc(oc);
         }
 
         renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));

@@ -32,8 +32,14 @@ struct Uniforms {
     _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    // Cubed-sphere planet: xyz = world-space center,
-    //                      w   = outer radius (0 disables).
+    // Camera offset from the sphere center, computed via path
+    // arithmetic on the CPU. Used directly instead of subtracting
+    // two world-scale floats — keeps sub-cell precision at any
+    // anchor depth. w unused.
+    cs_oc: vec4<f32>,
+    // Cubed-sphere planet: xyz = world-space center (kept for
+    //   highlight cell math; sphere ray-march never reads it),
+    // w   = outer radius (0 disables).
     cs_planet: vec4<f32>,
     // x = inner radius. y, z reserved. w = highlight-active flag.
     cs_params: vec4<f32>,
@@ -553,11 +559,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let cs_outer = uniforms.cs_planet.w;
     if cs_outer > 0.0 {
-        let cs_center = uniforms.cs_planet.xyz;
         let cs_inner = uniforms.cs_params.x;
         let shell = cs_outer - cs_inner;
 
-        let oc = camera.pos - cs_center;
+        // Path-anchored camera-from-sphere-center vector. Computed
+        // on the CPU via `WorldPos::offset_from`; precision bounded
+        // by the camera/planet common-ancestor cell size, so cell-
+        // scale rendering stays sub-pixel-accurate at any anchor.
+        let oc = uniforms.cs_oc.xyz;
         let b = dot(oc, ray_dir);
         let c_outer = dot(oc, oc) - cs_outer * cs_outer;
         let disc = b * b - c_outer;
@@ -583,8 +592,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 if t >= t_exit || steps > 512u { break; }
                 steps = steps + 1u;
 
-                let p = camera.pos + ray_dir * t;
-                let local = p - cs_center;
+                // `local` is the sample point relative to the sphere
+                // center, derived from `oc` so we never reconstruct
+                // `camera.pos - cs_center` at world scale.
+                let local = oc + ray_dir * t;
                 let r = length(local);
                 // The outer sphere intersect keeps us inside the
                 // shell in practice, but guard both boundaries.
@@ -706,17 +717,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
                 var t_next = t_exit + 1.0;
                 var winning_face: u32 = 6u;
-                let cand_u_lo = ray_plane_t(camera.pos, ray_dir, cs_center, n_u_lo);
+                // Boundary intersections are also computed in
+                // sphere-relative coords: passing `oc` as origin
+                // and `vec3<f32>(0.0)` as the through-point keeps
+                // every subtraction at sub-cell precision.
+                let zero3 = vec3<f32>(0.0);
+                let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
                 if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
-                let cand_u_hi = ray_plane_t(camera.pos, ray_dir, cs_center, n_u_hi);
+                let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
                 if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
-                let cand_v_lo = ray_plane_t(camera.pos, ray_dir, cs_center, n_v_lo);
+                let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
                 if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
-                let cand_v_hi = ray_plane_t(camera.pos, ray_dir, cs_center, n_v_hi);
+                let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
                 if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
-                let cand_r_lo = ray_sphere_after(camera.pos, ray_dir, cs_center, r_lo, t);
+                let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
                 if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
-                let cand_r_hi = ray_sphere_after(camera.pos, ray_dir, cs_center, r_hi, t);
+                let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
                 if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
 
                 if t_next >= t_exit { break; }

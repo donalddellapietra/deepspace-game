@@ -20,6 +20,12 @@ pub struct GpuUniforms {
     pub _pad: [u32; 2],
     pub highlight_min: [f32; 4], // xyz, w unused
     pub highlight_max: [f32; 4], // xyz, w unused
+    /// `xyz` = camera offset from the sphere center, computed via
+    /// path-anchored arithmetic on the CPU so its f32 precision is
+    /// bounded by the camera–planet common-ancestor cell size, not
+    /// by `WORLD_SIZE`. The shader uses this directly instead of
+    /// computing `camera.pos - cs_center`. `w` unused.
+    pub cs_oc: [f32; 4],
     /// Spherical planet: xyz = center, w = outer radius (0 disables).
     pub cs_planet: [f32; 4],
     /// x = inner radius. y/z/w reserved for later phases (cells
@@ -52,6 +58,7 @@ pub struct Renderer {
     highlight_active: u32,
     highlight_min: [f32; 4],
     highlight_max: [f32; 4],
+    cs_oc: [f32; 4],
     cs_planet: [f32; 4],
     cs_params: [f32; 4],
     cs_highlight: [f32; 4],
@@ -157,6 +164,7 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
+            cs_oc: [0.0; 4],
             cs_planet: [0.0; 4],
             cs_params: [0.0; 4],
             cs_highlight: [0.0; 4],
@@ -289,11 +297,20 @@ impl Renderer {
             highlight_active: 0,
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
+            cs_oc: [0.0; 4],
             cs_planet: [0.0; 4],
             cs_params: [0.0; 4],
             cs_highlight: [0.0; 4],
             cs_face_roots: [0; 8],
         }
+    }
+
+    /// Path-anchored camera offset from the sphere center. Set
+    /// every frame from `WorldPos::offset_from` so f32 precision
+    /// stays sub-cell at any anchor depth.
+    pub fn set_cs_oc(&mut self, oc: [f32; 3]) {
+        self.cs_oc = [oc[0], oc[1], oc[2], 0.0];
+        self.write_uniforms();
     }
 
     /// Provide the 6 face-subtree buffer indices for the spherical
@@ -462,6 +479,7 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
+            cs_oc: self.cs_oc,
             cs_planet: self.cs_planet,
             cs_params: self.cs_params,
             cs_highlight: self.cs_highlight,
