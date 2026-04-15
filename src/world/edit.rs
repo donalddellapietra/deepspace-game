@@ -10,7 +10,6 @@ use super::cubesphere::{world_to_coord, FACE_SLOTS};
 use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
-use crate::world::anchor::WORLD_SIZE;
 
 #[derive(Clone, Copy)]
 struct FrameFaceInfo {
@@ -19,7 +18,6 @@ struct FrameFaceInfo {
     outer_r: f32,
     face: super::cubesphere::Face,
     body_depth: usize,
-    body_center_world: [f32; 3],
     u_lo: f32,
     v_lo: f32,
     r_lo: f32,
@@ -46,13 +44,6 @@ fn frame_face_info(
     if frame_path[0] as usize != body_slot {
         return None;
     }
-    let body_size_world = WORLD_SIZE / 3.0;
-    let (sx, sy, sz) = slot_coords(body_slot);
-    let body_center_world = [
-        sx as f32 * body_size_world + body_size_world * 0.5,
-        sy as f32 * body_size_world + body_size_world * 0.5,
-        sz as f32 * body_size_world + body_size_world * 0.5,
-    ];
     let face_slot = frame_path[1] as usize;
     let face_idx = FACE_SLOTS.iter().position(|&s| s == face_slot)?;
     let mut u_lo = 0.0f32;
@@ -73,7 +64,6 @@ fn frame_face_info(
         outer_r,
         face: super::cubesphere::Face::from_index(face_idx as u8),
         body_depth: 1,
-        body_center_world,
         u_lo,
         v_lo,
         r_lo,
@@ -85,8 +75,8 @@ fn face_frame_point_to_body(point: [f32; 3], info: FrameFaceInfo) -> [f32; 3] {
     let un = (info.u_lo + (point[0] / 3.0) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
     let vn = (info.v_lo + (point[1] / 3.0) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
     let rn = (info.r_lo + (point[2] / 3.0) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
-    let world = super::cubesphere::coord_to_world(
-        info.body_center_world,
+    let point_local = super::cubesphere::coord_to_world(
+        [0.5, 0.5, 0.5],
         super::cubesphere::CubeSphereCoord {
             face: info.face,
             u: un * 2.0 - 1.0,
@@ -94,11 +84,11 @@ fn face_frame_point_to_body(point: [f32; 3], info: FrameFaceInfo) -> [f32; 3] {
             r: info.inner_r + rn * (info.outer_r - info.inner_r),
         },
     );
-    [world[0], world[1], world[2]]
+    [point_local[0] * 3.0, point_local[1] * 3.0, point_local[2] * 3.0]
 }
 
 fn face_frame_dir_to_body(origin: [f32; 3], dir: [f32; 3], info: FrameFaceInfo) -> [f32; 3] {
-    let eps = (info.size * 1e-3).max(1e-5);
+    let eps = (info.size * 3.0 * 1e-3).max(1e-5);
     let p0 = face_frame_point_to_body(origin, info);
     let p1 = face_frame_point_to_body(
         [origin[0] + dir[0] * eps, origin[1] + dir[1] * eps, origin[2] + dir[2] * eps],

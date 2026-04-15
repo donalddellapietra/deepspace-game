@@ -11,10 +11,17 @@
 //! All functions here are **pure** — no `App` state — for direct
 //! unit testing.
 
-use crate::world::anchor::{Path, WORLD_SIZE};
+use crate::world::anchor::{Path, WorldPos, WORLD_SIZE};
 use crate::world::cubesphere::{self as cs, Face, FACE_SLOTS};
 use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
 use crate::world::sdf;
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug)]
+struct BodyWorldBounds {
+    center: [f32; 3],
+    outer_r: f32,
+}
 
 /// Per-frame kind info: at each frame level, what NodeKind did we
 /// pass through? Used by `cam_local_in_frame` to dispatch position
@@ -35,8 +42,6 @@ pub struct FaceFrameInfo {
     pub subtree_depth: usize,
     pub inner_r: f32,
     pub outer_r: f32,
-    pub body_center_world: [f32; 3],
-    pub body_size_world: f32,
     pub u_lo: f32,
     pub v_lo: f32,
     pub r_lo: f32,
@@ -138,52 +143,9 @@ pub fn face_cell_bounds_from_path(face_subtree_slots: &[u8]) -> (f32, f32, f32, 
     (u_sum + u_comp, v_sum + v_comp, r_sum + r_comp, size)
 }
 
-/// Project a camera's world-XYZ position into a face-cell frame's
-/// local `[0, 3)³` coordinates. The frame's cell is the sub-region
-/// of the face's (u_norm, v_norm, r_norm) ∈ [0, 1]³ box mapped to
-/// [0, 3)³ shader coords. Returns Some(cam_local) when camera is
-/// on/near the same face as the frame; None if camera is on a
-/// different face (different quadrant of the sphere).
-pub fn cam_local_in_face_frame(
-    camera_world: [f32; 3],
-    body_center_world: [f32; 3],
-    body_size_world: f32,
-    inner_r_local: f32,
-    outer_r_local: f32,
-    face: Face,
-    u_lo: f32, v_lo: f32, r_lo: f32, size: f32,
-) -> [f32; 3] {
-    // Camera vector from body center.
-    let p = sdf::sub(camera_world, body_center_world);
-    let r_world = sdf::length(p);
-    let cs_outer = outer_r_local * body_size_world;
-    let cs_inner = inner_r_local * body_size_world;
-    let shell = cs_outer - cs_inner;
-    // Face EA projection:
-    let n_axis = face.normal();
-    let (u_axis, v_axis) = face.tangents();
-    let axis_dot = sdf::dot(sdf::scale(p, 1.0 / r_world.max(1e-30)), n_axis);
-    let p_norm = sdf::scale(p, 1.0 / r_world.max(1e-30));
-    let cube_u = sdf::dot(p_norm, u_axis) / axis_dot.max(1e-30);
-    let cube_v = sdf::dot(p_norm, v_axis) / axis_dot.max(1e-30);
-    let u_ea = cs::cube_to_ea(cube_u);
-    let v_ea = cs::cube_to_ea(cube_v);
-    let un = (u_ea + 1.0) * 0.5;
-    let vn = (v_ea + 1.0) * 0.5;
-    let rn = (r_world - cs_inner) / shell.max(1e-30);
-    // Map (un, vn, rn) from cell's [u_lo, u_lo+size] → [0, 3).
-    let scale = WORLD_SIZE / size.max(1e-30);
-    [
-        (un - u_lo) * scale,
-        (vn - v_lo) * scale,
-        (rn - r_lo) * scale,
-    ]
-}
-
 pub fn face_frame_info(frame: &Path, chain: &FrameKindChain) -> Option<FaceFrameInfo> {
     let (body_depth, face) = chain.body_and_face(frame)?;
     let (inner_r, outer_r) = chain.body_radii()?;
-    let (body_center_world, body_size_world) = body_center_world(frame, body_depth);
     let face_subtree_slots = &frame.as_slice()[(body_depth + 1)..];
     let (u_lo, v_lo, r_lo, size) = face_cell_bounds_from_path(face_subtree_slots);
     Some(FaceFrameInfo {
@@ -192,8 +154,6 @@ pub fn face_frame_info(frame: &Path, chain: &FrameKindChain) -> Option<FaceFrame
         subtree_depth: frame.depth() as usize - (body_depth + 1),
         inner_r,
         outer_r,
-        body_center_world,
-        body_size_world,
         u_lo,
         v_lo,
         r_lo,
@@ -201,92 +161,61 @@ pub fn face_frame_info(frame: &Path, chain: &FrameKindChain) -> Option<FaceFrame
     })
 }
 
-/// World-space body center for the given body depth in the frame
-/// path. Body's cell origin in world via Cartesian walk (body is
-/// a child of a Cartesian ancestor), center = origin + size/2.
-pub fn body_center_world(frame_path: &Path, body_depth: usize) -> ([f32; 3], f32) {
-    let mut origin = [0.0f32; 3];
-    let mut size = WORLD_SIZE;
-    // Walk to body_depth (inclusive of the body cell itself).
-    for k in 0..=body_depth.min(frame_path.depth() as usize) {
-        if k > 0 {
-            let (sx, sy, sz) = slot_coords(frame_path.slot(k - 1) as usize);
-            let child = size / 3.0;
-            origin[0] += sx as f32 * child;
-            origin[1] += sy as f32 * child;
-            origin[2] += sz as f32 * child;
-            size = child;
-        }
-    }
-    let center = [
-        origin[0] + size * 0.5,
-        origin[1] + size * 0.5,
-        origin[2] + size * 0.5,
+pub fn position_in_frame(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame: &Path,
+    position: &WorldPos,
+) -> [f32; 3] {
+    position.in_frame_in(library, world_root, frame)
+}
+
+fn body_local_point_to_face_frame(point_body: [f32; 3], info: &FaceFrameInfo) -> [f32; 3] {
+    let point_local = [
+        point_body[0] / WORLD_SIZE,
+        point_body[1] / WORLD_SIZE,
+        point_body[2] / WORLD_SIZE,
     ];
-    (center, size)
-}
-
-/// Compute cam_local for the frame, kind-aware: dispatches on the
-/// frame chain's kinds. Use this anywhere camera position is needed
-/// in shader/frame coords when the frame may descend into faces.
-pub fn cam_local_in_frame(
-    camera_world: [f32; 3],
-    frame: &Path,
-    chain: &FrameKindChain,
-) -> [f32; 3] {
-    if let Some(info) = face_frame_info(frame, chain) {
-        return cam_local_in_face_frame(
-            camera_world,
-            info.body_center_world,
-            info.body_size_world,
-            info.inner_r,
-            info.outer_r,
-            info.face,
-            info.u_lo,
-            info.v_lo,
-            info.r_lo,
-            info.size,
-        );
-    }
-    let (frame_origin, frame_size) = frame_origin_size_world(frame);
-    let scale = WORLD_SIZE / frame_size;
+    let coord = cs::world_to_coord([0.5, 0.5, 0.5], point_local)
+        .unwrap_or(cs::CubeSphereCoord {
+            face: info.face,
+            u: 0.0,
+            v: 0.0,
+            r: info.inner_r,
+        });
+    let un = (coord.u + 1.0) * 0.5;
+    let vn = (coord.v + 1.0) * 0.5;
+    let rn = (coord.r - info.inner_r) / (info.outer_r - info.inner_r).max(1e-30);
+    let scale = WORLD_SIZE / info.size.max(1e-30);
     [
-        (camera_world[0] - frame_origin[0]) * scale,
-        (camera_world[1] - frame_origin[1]) * scale,
-        (camera_world[2] - frame_origin[2]) * scale,
+        (un - info.u_lo) * scale,
+        (vn - info.v_lo) * scale,
+        (rn - info.r_lo) * scale,
     ]
-}
-
-pub fn world_point_to_frame(
-    frame: &Path,
-    chain: &FrameKindChain,
-    world: [f32; 3],
-) -> [f32; 3] {
-    cam_local_in_frame(world, frame, chain)
 }
 
 pub fn frame_point_to_body(point: [f32; 3], info: &FaceFrameInfo) -> [f32; 3] {
     let un = (info.u_lo + (point[0] / WORLD_SIZE) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
     let vn = (info.v_lo + (point[1] / WORLD_SIZE) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
     let rn = (info.r_lo + (point[2] / WORLD_SIZE) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
-    let world = cs::coord_to_world(
-        info.body_center_world,
+    let point_local = cs::coord_to_world(
+        [0.5, 0.5, 0.5],
         cs::CubeSphereCoord {
             face: info.face,
             u: un * 2.0 - 1.0,
             v: vn * 2.0 - 1.0,
-            r: (info.inner_r + rn * (info.outer_r - info.inner_r)) * info.body_size_world,
+            r: info.inner_r + rn * (info.outer_r - info.inner_r),
         },
     );
     [
-        (world[0] - (info.body_center_world[0] - info.body_size_world * 0.5)) * WORLD_SIZE,
-        (world[1] - (info.body_center_world[1] - info.body_size_world * 0.5)) * WORLD_SIZE,
-        (world[2] - (info.body_center_world[2] - info.body_size_world * 0.5)) * WORLD_SIZE,
+        point_local[0] * WORLD_SIZE,
+        point_local[1] * WORLD_SIZE,
+        point_local[2] * WORLD_SIZE,
     ]
 }
 
 pub fn face_frame_dir_to_body(point: [f32; 3], dir: [f32; 3], info: &FaceFrameInfo) -> [f32; 3] {
-    let eps = (info.size * info.body_size_world * 1e-3).max(1e-5);
+    let eps = (info.size * WORLD_SIZE * 1e-3).max(1e-5);
     let p0 = frame_point_to_body(point, info);
     let p1 = frame_point_to_body([
         point[0] + dir[0] * eps,
@@ -300,6 +229,292 @@ pub fn face_frame_dir_to_body(point: [f32; 3], dir: [f32; 3], info: &FaceFrameIn
     ])
 }
 
+pub fn body_dir_to_frame(point_body: [f32; 3], body_dir: [f32; 3], info: &FaceFrameInfo) -> [f32; 3] {
+    let eps = (info.size * WORLD_SIZE * 1e-3).max(1e-5);
+    let p0 = body_local_point_to_face_frame(point_body, info);
+    let p1 = body_local_point_to_face_frame([
+        point_body[0] + body_dir[0] * eps,
+        point_body[1] + body_dir[1] * eps,
+        point_body[2] + body_dir[2] * eps,
+    ], info);
+    sdf::normalize([
+        p1[0] - p0[0],
+        p1[1] - p0[1],
+        p1[2] - p0[2],
+    ])
+}
+
+fn body_center_world(frame_path: &Path, body_depth: usize) -> ([f32; 3], f32) {
+    let mut origin = [0.0f32; 3];
+    let mut size = WORLD_SIZE;
+    for k in 0..=body_depth.min(frame_path.depth() as usize) {
+        if k > 0 {
+            let (sx, sy, sz) = slot_coords(frame_path.slot(k - 1) as usize);
+            let child = size / 3.0;
+            origin[0] += sx as f32 * child;
+            origin[1] += sy as f32 * child;
+            origin[2] += sz as f32 * child;
+            size = child;
+        }
+    }
+    ([
+        origin[0] + size * 0.5,
+        origin[1] + size * 0.5,
+        origin[2] + size * 0.5,
+    ], size)
+}
+
+fn collect_body_bounds(
+    library: &NodeLibrary,
+    node_id: NodeId,
+    origin: [f32; 3],
+    size: f32,
+    contains_body: &mut HashMap<NodeId, bool>,
+    out: &mut Vec<BodyWorldBounds>,
+) {
+    let Some(node) = library.get(node_id) else { return };
+    if let NodeKind::CubedSphereBody { outer_r, .. } = node.kind {
+        out.push(BodyWorldBounds {
+            center: [
+                origin[0] + size * 0.5,
+                origin[1] + size * 0.5,
+                origin[2] + size * 0.5,
+            ],
+            outer_r: outer_r * size,
+        });
+    }
+    let child_size = size / 3.0;
+    for (slot, child) in node.children.iter().enumerate() {
+        let Child::Node(child_id) = child else { continue };
+        if !subtree_contains_body(library, *child_id, contains_body) {
+            continue;
+        }
+        let (sx, sy, sz) = slot_coords(slot);
+        let child_origin = [
+            origin[0] + sx as f32 * child_size,
+            origin[1] + sy as f32 * child_size,
+            origin[2] + sz as f32 * child_size,
+        ];
+        collect_body_bounds(
+            library,
+            *child_id,
+            child_origin,
+            child_size,
+            contains_body,
+            out,
+        );
+    }
+}
+
+fn subtree_contains_body(
+    library: &NodeLibrary,
+    node_id: NodeId,
+    memo: &mut HashMap<NodeId, bool>,
+) -> bool {
+    if let Some(found) = memo.get(&node_id) {
+        return *found;
+    }
+    let Some(node) = library.get(node_id) else {
+        memo.insert(node_id, false);
+        return false;
+    };
+    let found = matches!(node.kind, NodeKind::CubedSphereBody { .. }) || node.children.iter().any(|child| {
+        match child {
+            Child::Node(child_id) => subtree_contains_body(library, *child_id, memo),
+            _ => false,
+        }
+    });
+    memo.insert(node_id, found);
+    found
+}
+
+fn visible_hit_on_body(
+    bodies: &[BodyWorldBounds],
+    camera_world: [f32; 3],
+    dir: [f32; 3],
+) -> Option<[f32; 3]> {
+    let mut best_t = f32::INFINITY;
+    let mut best_hit = None;
+    for body in bodies {
+        let oc = sdf::sub(camera_world, body.center);
+        let b = sdf::dot(oc, dir);
+        let c = sdf::dot(oc, oc) - body.outer_r * body.outer_r;
+        let disc = b * b - c;
+        if disc <= 0.0 {
+            continue;
+        }
+        let sq = disc.sqrt();
+        let mut t = -b - sq;
+        if t <= 0.0 {
+            t = -b + sq;
+        }
+        if t <= 0.0 || t >= best_t {
+            continue;
+        }
+        best_t = t;
+        best_hit = Some([
+            camera_world[0] + dir[0] * t,
+            camera_world[1] + dir[1] * t,
+            camera_world[2] + dir[2] * t,
+        ]);
+    }
+    best_hit
+}
+
+fn cartesian_frame_contains_view(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame: &Path,
+    chain: &FrameKindChain,
+    camera_world: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    fov: f32,
+    aspect: f32,
+) -> bool {
+    let mut bodies = Vec::new();
+    let mut contains_body = HashMap::new();
+    collect_body_bounds(
+        library,
+        world_root,
+        [0.0, 0.0, 0.0],
+        WORLD_SIZE,
+        &mut contains_body,
+        &mut bodies,
+    );
+    if bodies.is_empty() {
+        return true;
+    }
+    let half_fov_tan = (fov * 0.5).tan();
+    let samples = [
+        (0.0f32, 0.0f32),
+        (-0.9, -0.9),
+        (0.9, -0.9),
+        (-0.9, 0.9),
+        (0.9, 0.9),
+    ];
+    let margin = 0.1f32;
+    for (sx, sy) in samples {
+        let dir = sdf::normalize([
+            forward[0] + right[0] * sx * aspect * half_fov_tan + up[0] * sy * half_fov_tan,
+            forward[1] + right[1] * sx * aspect * half_fov_tan + up[1] * sy * half_fov_tan,
+            forward[2] + right[2] * sx * aspect * half_fov_tan + up[2] * sy * half_fov_tan,
+        ]);
+        let Some(hit) = visible_hit_on_body(&bodies, camera_world, dir) else {
+            continue;
+        };
+        let local = world_point_to_frame(frame, chain, hit);
+        if local[0] < -margin || local[0] > WORLD_SIZE + margin
+            || local[1] < -margin || local[1] > WORLD_SIZE + margin
+            || local[2] < -margin || local[2] > WORLD_SIZE + margin
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn frame_contains_view(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame: &Path,
+    chain: &FrameKindChain,
+    camera_world: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    fov: f32,
+    aspect: f32,
+) -> bool {
+    let Some(info) = face_frame_info(frame, chain) else {
+        return cartesian_frame_contains_view(
+            library, world_root, frame, chain,
+            camera_world, forward, right, up, fov, aspect,
+        );
+    };
+    let (body_center, body_size) = body_center_world(frame, info.body_depth);
+    let outer_r = info.outer_r * body_size;
+    let half_fov_tan = (fov * 0.5).tan();
+    let samples = [
+        (0.0f32, 0.0f32),
+        (-0.9, -0.9),
+        ( 0.9, -0.9),
+        (-0.9,  0.9),
+        ( 0.9,  0.9),
+    ];
+    let margin = info.size * 0.05;
+    for (sx, sy) in samples {
+        let dir = sdf::normalize([
+            forward[0] + right[0] * sx * aspect * half_fov_tan + up[0] * sy * half_fov_tan,
+            forward[1] + right[1] * sx * aspect * half_fov_tan + up[1] * sy * half_fov_tan,
+            forward[2] + right[2] * sx * aspect * half_fov_tan + up[2] * sy * half_fov_tan,
+        ]);
+        let oc = sdf::sub(camera_world, body_center);
+        let b = sdf::dot(oc, dir);
+        let c = sdf::dot(oc, oc) - outer_r * outer_r;
+        let disc = b * b - c;
+        if disc <= 0.0 {
+            continue;
+        }
+        let sq = disc.sqrt();
+        let mut t = -b - sq;
+        if t <= 0.0 {
+            t = -b + sq;
+        }
+        if t <= 0.0 {
+            continue;
+        }
+        let hit = [
+            camera_world[0] + dir[0] * t,
+            camera_world[1] + dir[1] * t,
+            camera_world[2] + dir[2] * t,
+        ];
+        let coord = cs::world_to_coord(body_center, hit).unwrap_or(cs::CubeSphereCoord {
+            face: info.face,
+            u: 0.0,
+            v: 0.0,
+            r: outer_r,
+        });
+        if coord.face != info.face {
+            return false;
+        }
+        let un = (coord.u + 1.0) * 0.5;
+        let vn = (coord.v + 1.0) * 0.5;
+        if un < info.u_lo - margin
+            || un > info.u_lo + info.size + margin
+            || vn < info.v_lo - margin
+            || vn > info.v_lo + info.size + margin
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn world_point_to_frame(
+    frame: &Path,
+    chain: &FrameKindChain,
+    world: [f32; 3],
+) -> [f32; 3] {
+    if let Some(info) = face_frame_info(frame, chain) {
+        let (body_center, body_size) = body_center_world(frame, info.body_depth);
+        let point_body = [
+            (world[0] - (body_center[0] - body_size * 0.5)) * WORLD_SIZE,
+            (world[1] - (body_center[1] - body_size * 0.5)) * WORLD_SIZE,
+            (world[2] - (body_center[2] - body_size * 0.5)) * WORLD_SIZE,
+        ];
+        return body_local_point_to_face_frame(point_body, &info);
+    }
+    let (frame_origin, frame_size) = frame_origin_size_world(frame);
+    let scale = WORLD_SIZE / frame_size;
+    [
+        (world[0] - frame_origin[0]) * scale,
+        (world[1] - frame_origin[1]) * scale,
+        (world[2] - frame_origin[2]) * scale,
+    ]
+}
+
 pub fn world_dir_to_frame(
     frame: &Path,
     chain: &FrameKindChain,
@@ -307,7 +522,7 @@ pub fn world_dir_to_frame(
     world_dir: [f32; 3],
 ) -> [f32; 3] {
     let eps = if let Some(info) = face_frame_info(frame, chain) {
-        (info.size * info.body_size_world * 1e-3).max(1e-5)
+        (info.size * WORLD_SIZE * 1e-3).max(1e-5)
     } else {
         frame_origin_size_world(frame).1 * 1e-3
     };
@@ -527,6 +742,69 @@ mod tests {
         anchor.push(0);
         let (frame, _) = compute_render_frame(&lib, root, &anchor, 2);
         assert_eq!(frame.depth(), 0, "Block child terminates descent");
+    }
+
+    #[test]
+    fn cartesian_frame_must_contain_visible_planet() {
+        let mut lib = NodeLibrary::default();
+        let face = lib.insert_with_kind(
+            empty_children(),
+            NodeKind::CubedSphereFace {
+                face: crate::world::cubesphere::Face::PosX,
+            },
+        );
+        let mut body_children = empty_children();
+        body_children[14] = Child::Node(face);
+        let body = lib.insert_with_kind(
+            body_children,
+            NodeKind::CubedSphereBody { inner_r: 0.3, outer_r: 0.49 },
+        );
+        let mut root_children = empty_children();
+        root_children[slot_index(1, 1, 1)] = Child::Node(body);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        let camera_world = [1.5, 2.0, 1.5];
+        let forward = [0.0, -1.0, 0.0];
+        let right = [1.0, 0.0, 0.0];
+        let up = [0.0, 0.0, 1.0];
+
+        let mut off_planet = Path::root();
+        off_planet.push(slot_index(0, 0, 0) as u8);
+        let off_chain = FrameKindChain::build(&lib, root, &off_planet);
+        assert!(
+            !frame_contains_view(
+                &lib,
+                root,
+                &off_planet,
+                &off_chain,
+                camera_world,
+                forward,
+                right,
+                up,
+                1.2,
+                16.0 / 9.0,
+            ),
+            "deep empty cartesian frame should be rejected when the planet is visible elsewhere",
+        );
+
+        let root_frame = Path::root();
+        let root_chain = FrameKindChain::build(&lib, root, &root_frame);
+        assert!(
+            frame_contains_view(
+                &lib,
+                root,
+                &root_frame,
+                &root_chain,
+                camera_world,
+                forward,
+                right,
+                up,
+                1.2,
+                16.0 / 9.0,
+            ),
+            "root frame should contain the visible planet footprint",
+        );
     }
 
     // --------- frame_origin_size_world ---------

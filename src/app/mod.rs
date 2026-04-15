@@ -196,10 +196,36 @@ impl App {
     pub(super) fn render_frame(&self) -> (Path, NodeId) {
         let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
-        frame::compute_render_frame(
+        let (mut frame_path, mut node_id) = frame::compute_render_frame(
             &self.world.library, self.world.root,
             &self.camera.position.anchor, desired_depth,
-        )
+        );
+        let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
+        let (forward, right, up) = self.camera.basis();
+        loop {
+            let chain = frame::FrameKindChain::build(
+                &self.world.library,
+                self.world.root,
+                &frame_path,
+            );
+            if frame::frame_contains_view(
+                &self.world.library,
+                self.world.root,
+                &frame_path,
+                &chain,
+                cam_world,
+                forward,
+                right,
+                up,
+                1.2,
+                16.0 / 9.0,
+            ) || frame_path.depth() == 0 {
+                break;
+            }
+            frame_path.truncate(frame_path.depth() - 1);
+            node_id = self.frame_root_id_for(&frame_path);
+        }
+        (frame_path, node_id)
     }
 
     /// `NodeKind` of the *intended* render-frame root from a tree
@@ -220,13 +246,33 @@ impl App {
             &self.world.library, self.world.root, &self.active_frame,
         );
         let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
-        let cam_local = frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
+        let cam_local = frame::position_in_frame(
+            &self.world.library,
+            self.world.root,
+            &self.active_frame,
+            &self.camera.position,
+        );
         let (fwd_world, right_world, up_world) = self.camera.basis();
+        let face_info = frame::face_frame_info(&self.active_frame, &chain);
+        let (fwd_local, right_local, up_local) = if let Some(info) = face_info {
+            let cam_body = frame::frame_point_to_body(cam_local, &info);
+            (
+                frame::body_dir_to_frame(cam_body, fwd_world, &info),
+                frame::body_dir_to_frame(cam_body, right_world, &info),
+                frame::body_dir_to_frame(cam_body, up_world, &info),
+            )
+        } else {
+            (
+                frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, fwd_world),
+                frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, right_world),
+                frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, up_world),
+            )
+        };
         let cam_gpu = self.camera.gpu_camera_with_basis(
             cam_local,
-            frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, fwd_world),
-            frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, right_world),
-            frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, up_world),
+            fwd_local,
+            right_local,
+            up_local,
             1.2,
         );
         if let Some(renderer) = &self.renderer {

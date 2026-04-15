@@ -9,11 +9,12 @@
 //! aren't yet supported. Rendering of the planet works.)
 
 use crate::game_state::HotbarItem;
-use crate::world::anchor::WORLD_SIZE;
 use crate::world::edit;
 use crate::world::gpu;
 
 use super::App;
+
+const MAX_LOCAL_VISUAL_DEPTH: u32 = 4;
 
 impl App {
     pub(super) fn edit_depth(&self) -> u32 {
@@ -37,7 +38,12 @@ impl App {
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
-        (self.edit_depth() + 3).min(16)
+        let local_target = self.edit_depth()
+            .saturating_sub(self.active_frame.depth() as u32)
+            .max(1);
+        local_target
+            .min(MAX_LOCAL_VISUAL_DEPTH)
+            .min(crate::world::tree::MAX_DEPTH as u32)
     }
 
     pub fn apply_zoom(&mut self) {
@@ -49,13 +55,33 @@ impl App {
             &self.world.library, self.world.root, &self.active_frame,
         );
         let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
-        let cam_local = super::frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
+        let cam_local = super::frame::position_in_frame(
+            &self.world.library,
+            self.world.root,
+            &self.active_frame,
+            &self.camera.position,
+        );
         let (fwd_world, right_world, up_world) = self.camera.basis();
+        let face_info = super::frame::face_frame_info(&self.active_frame, &chain);
+        let (fwd_local, right_local, up_local) = if let Some(info) = face_info {
+            let cam_body = super::frame::frame_point_to_body(cam_local, &info);
+            (
+                super::frame::body_dir_to_frame(cam_body, fwd_world, &info),
+                super::frame::body_dir_to_frame(cam_body, right_world, &info),
+                super::frame::body_dir_to_frame(cam_body, up_world, &info),
+            )
+        } else {
+            (
+                super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, fwd_world),
+                super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, right_world),
+                super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, up_world),
+            )
+        };
         let cam_gpu = self.camera.gpu_camera_with_basis(
             cam_local,
-            super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, fwd_world),
-            super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, right_world),
-            super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, up_world),
+            fwd_local,
+            right_local,
+            up_local,
             1.2,
         );
         if let Some(renderer) = &mut self.renderer {
@@ -81,10 +107,20 @@ impl App {
             &self.world.library, self.world.root, &self.active_frame,
         );
         let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
-        let cam_local = super::frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
-        let ray_dir = super::frame::world_dir_to_frame(
-            &self.active_frame, &chain, cam_world, self.camera.forward(),
+        let cam_local = super::frame::position_in_frame(
+            &self.world.library,
+            self.world.root,
+            &self.active_frame,
+            &self.camera.position,
         );
+        let ray_dir = if let Some(info) = super::frame::face_frame_info(&self.active_frame, &chain) {
+            let cam_body = super::frame::frame_point_to_body(cam_local, &info);
+            super::frame::body_dir_to_frame(cam_body, self.camera.forward(), &info)
+        } else {
+            super::frame::world_dir_to_frame(
+                &self.active_frame, &chain, cam_world, self.camera.forward(),
+            )
+        };
         edit::cpu_raycast_in_frame(
             &self.world.library, self.world.root,
             self.active_frame.as_slice(), cam_local, ray_dir,
@@ -94,8 +130,6 @@ impl App {
 
     pub(super) fn do_break(&mut self) {
         let hit = self.frame_aware_raycast();
-        eprintln!("do_break: hit={:?}",
-            hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
         let Some(hit) = hit else { return };
 
         if self.save_mode {
@@ -120,7 +154,6 @@ impl App {
         }
 
         let changed = edit::break_block(&mut self.world, &hit);
-        eprintln!("do_break: break_block returned {}", changed);
         if changed {
             self.upload_tree();
         }
@@ -128,8 +161,6 @@ impl App {
 
     pub(super) fn do_place(&mut self) {
         let hit = self.frame_aware_raycast();
-        eprintln!("do_place: hit={:?}",
-            hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
         let Some(hit) = hit else { return };
 
         match &self.ui.slots[self.ui.active_slot] {
@@ -191,14 +222,28 @@ impl App {
         let chain = super::frame::FrameKindChain::build(
             &self.world.library, self.world.root, &effective_frame,
         );
-        let cam_local = super::frame::world_point_to_frame(&effective_frame, &chain, cam_world);
+        let cam_local = super::frame::position_in_frame(
+            &self.world.library,
+            self.world.root,
+            &effective_frame,
+            &self.camera.position,
+        );
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local =
-            super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, fwd_world);
-        let right_local =
-            super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, right_world);
-        let up_local =
-            super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, up_world);
+        let face_info = super::frame::face_frame_info(&effective_frame, &chain);
+        let (fwd_local, right_local, up_local) = if let Some(info) = face_info {
+            let cam_body = super::frame::frame_point_to_body(cam_local, &info);
+            (
+                super::frame::body_dir_to_frame(cam_body, fwd_world, &info),
+                super::frame::body_dir_to_frame(cam_body, right_world, &info),
+                super::frame::body_dir_to_frame(cam_body, up_world, &info),
+            )
+        } else {
+            (
+                super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, fwd_world),
+                super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, right_world),
+                super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, up_world),
+            )
+        };
         let cam_gpu = self.camera.gpu_camera_with_basis(
             cam_local,
             fwd_local,
@@ -212,7 +257,6 @@ impl App {
             .get(self.frame_root_id_for(&effective_frame))
             .map(|n| n.kind)
             .unwrap_or(crate::world::tree::NodeKind::Cartesian);
-        let face_info = super::frame::face_frame_info(&effective_frame, &chain);
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &node_kinds, r.frame_root_idx);
             renderer.update_ribbon(&r.ribbon);
@@ -244,7 +288,7 @@ impl App {
     /// returning the NodeId reached. Used by upload_tree_lod to
     /// look up the *effective* frame's NodeKind after build_ribbon
     /// truncated.
-    fn frame_root_id_for(&self, path: &crate::world::anchor::Path) -> crate::world::tree::NodeId {
+    pub(super) fn frame_root_id_for(&self, path: &crate::world::anchor::Path) -> crate::world::tree::NodeId {
         let mut node = self.world.root;
         for k in 0..path.depth() as usize {
             let Some(n) = self.world.library.get(node) else { break };
@@ -268,64 +312,12 @@ impl App {
         let chain = super::frame::FrameKindChain::build(
             &self.world.library, self.world.root, &self.active_frame,
         );
-        if let Some(h) = &tree_hit {
-            let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
-            let cam_local = super::frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
-            let (frame_origin, frame_size_world) = super::frame_origin_size_world(&self.active_frame);
-            let frame_scale = WORLD_SIZE / frame_size_world;
-            let (hit_world_min, hit_world_max) = edit::hit_aabb(&self.world.library, h);
-            let hit_world_center = [
-                (hit_world_min[0] + hit_world_max[0]) * 0.5,
-                (hit_world_min[1] + hit_world_max[1]) * 0.5,
-                (hit_world_min[2] + hit_world_max[2]) * 0.5,
-            ];
-            let hit_frame_center = super::aabb_world_to_frame(
-                &self.active_frame, &chain, hit_world_center, hit_world_center,
-            ).0;
-            let cam_to_hit_world = [
-                hit_world_center[0] - cam_world[0],
-                hit_world_center[1] - cam_world[1],
-                hit_world_center[2] - cam_world[2],
-            ];
-            let cam_to_hit_frame = [
-                hit_frame_center[0] - cam_local[0],
-                hit_frame_center[1] - cam_local[1],
-                hit_frame_center[2] - cam_local[2],
-            ];
-            let world_dist = (cam_to_hit_world[0] * cam_to_hit_world[0]
-                + cam_to_hit_world[1] * cam_to_hit_world[1]
-                + cam_to_hit_world[2] * cam_to_hit_world[2]).sqrt();
-            let frame_dist = (cam_to_hit_frame[0] * cam_to_hit_frame[0]
-                + cam_to_hit_frame[1] * cam_to_hit_frame[1]
-                + cam_to_hit_frame[2] * cam_to_hit_frame[2]).sqrt();
-            let hit_world_size = [
-                hit_world_max[0] - hit_world_min[0],
-                hit_world_max[1] - hit_world_min[1],
-                hit_world_max[2] - hit_world_min[2],
-            ];
-            eprintln!(
-                "highlight tree_hit: path.len={} face={} t={} place_path.len={:?} edit_depth={} cs_edit_depth={} active_frame_depth={} active_frame={:?} frame_origin={:?} frame_size_world={} frame_scale={} cam_world={:?} cam_local={:?} hit_world_center={:?} hit_world_size={:?} cam_to_hit_world={:?} world_dist={} cam_to_hit_frame={:?} frame_dist={}",
-                h.path.len(), h.face, h.t,
-                h.place_path.as_ref().map(|p| p.len()),
-                self.edit_depth(), self.cs_edit_depth(),
-                self.active_frame.depth(), self.active_frame.as_slice(),
-                frame_origin, frame_size_world, frame_scale,
-                cam_world, cam_local,
-                hit_world_center, hit_world_size,
-                cam_to_hit_world, world_dist,
-                cam_to_hit_frame, frame_dist,
-            );
-        }
         let aabb_world = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
         // Transform AABB from world coords to frame-local coords.
         // Shader expects highlight in the same frame as `camera.pos`.
         let aabb = aabb_world.map(|(mn, mx)| {
             super::aabb_world_to_frame(&self.active_frame, &chain, mn, mx)
         });
-        if let Some((mn, mx)) = &aabb {
-            eprintln!("highlight (frame-local): min={:?} max={:?} size={:?}",
-                mn, mx, [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]]);
-        }
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(aabb);
         }
