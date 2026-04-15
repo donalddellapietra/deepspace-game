@@ -913,6 +913,110 @@ mod tests {
             "outer slot should resolve to empty or an empty subtree");
     }
 
+    /// Mirror of the WGSL `sample_face_tree` walker — operates on
+    /// the flattened `pack_tree_lod_multi` GPU buffer. Used by the
+    /// term-depth-discontinuity regression test below.
+    fn walk_packed(
+        buf: &[crate::world::gpu::GpuChild],
+        root_idx: u32,
+        u_n: f32, v_n: f32, r_n: f32,
+    ) -> (u8, u32) {
+        let mut node = root_idx;
+        let mut un = u_n.clamp(0.0, 0.9999999);
+        let mut vn = v_n.clamp(0.0, 0.9999999);
+        let mut rn = r_n.clamp(0.0, 0.9999999);
+        for d in 1u32..=22 {
+            let us = ((un * 3.0) as usize).min(2);
+            let vs = ((vn * 3.0) as usize).min(2);
+            let rs = ((rn * 3.0) as usize).min(2);
+            let slot = rs * 9 + vs * 3 + us;
+            let child = buf[(node * 27 + slot as u32) as usize];
+            match child.tag {
+                0 => return (0, d),
+                1 => return (child.block_type, d),
+                _ => {
+                    node = child.node_index;
+                    un = un * 3.0 - us as f32;
+                    vn = vn * 3.0 - vs as f32;
+                    rn = rn * 3.0 - rs as f32;
+                }
+            }
+        }
+        (0, 22)
+    }
+
+    #[test]
+    fn placing_below_sdf_detail_creates_term_depth_discontinuity() {
+        // The seam-at-edits bug: when an edit lands deeper than
+        // SDF_DETAIL_LEVELS+1, the placement expands a previously
+        // uniform depth-(SDF_DETAIL_LEVELS+1) cell into a mixed
+        // node. The shader walker (which sees pack-time-flattened
+        // uniform subtrees as Block leaves) then returns DIFFERENT
+        // term_depths for the edited cell vs its uniform siblings,
+        // and the DDA picks mismatched cell-boundary scales —
+        // visible as sky-strip seams.
+        //
+        // This test reconstructs the exact shape the SHADER sees
+        // and pins the discontinuity. The shader-side fix
+        // (`deepest_term_depth` boundary scaling) compensates.
+        use crate::world::gpu::pack_tree_lod_multi;
+
+        let mut lib = NodeLibrary::default();
+        let sdf = test_sdf(1.0, 0.0);
+        let edit_depth = super::SDF_DETAIL_LEVELS + 2; // 6 by default
+        let total_depth = edit_depth + 2;
+        let mut planet = generate_spherical_planet(
+            &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, total_depth, &sdf,
+        );
+
+        // Place a foreign block at edit_depth in the planet's
+        // solid interior. iu/iv/ir picked so the cell lands well
+        // inside the inner stone layer.
+        let cells = 3u32.pow(edit_depth);
+        let iu = cells / 2;
+        let iv = cells / 2;
+        let ir = cells / 9;
+        assert!(planet.set_cell_at_depth(
+            &mut lib, Face::PosX, iu, iv, ir, edit_depth,
+            Child::Block(block::WOOD),
+        ));
+
+        // Pack as the shader would see it. Skip the world-tree
+        // root: this test only cares about the face-subtree shape.
+        let roots: Vec<u64> = planet.face_roots.to_vec();
+        let (buf, root_indices) = pack_tree_lod_multi(
+            &lib, &roots, [0.0, 0.0, 5.0], 1440.0, 1.2,
+        );
+        let face_root_idx = root_indices[Face::PosX as usize];
+
+        // Walker at the placed cell should bottom out at edit_depth.
+        let cells_f = cells as f32;
+        let un_p = (iu as f32 + 0.5) / cells_f;
+        let vn_p = (iv as f32 + 0.5) / cells_f;
+        let rn_p = (ir as f32 + 0.5) / cells_f;
+        let (b_placed, d_placed) = walk_packed(&buf, face_root_idx, un_p, vn_p, rn_p);
+        assert_eq!(b_placed, block::WOOD,
+            "shader walker at placed cell should read the placed block");
+        assert_eq!(d_placed, edit_depth,
+            "shader walker descends to edit_depth at placed cell, got {d_placed}");
+
+        // Walker at an ADJACENT depth-(edit-1) sibling reads the
+        // uniform stone — flattened by pack_tree_lod_multi so the
+        // walker bottoms out at a SHALLOWER depth.
+        let parent_cells = 3u32.pow(edit_depth - 1);
+        let adj_parent = (iu / 3) + 1;
+        assert!(adj_parent < parent_cells);
+        let un_adj = (adj_parent as f32 + 0.5) / parent_cells as f32;
+        let (b_adj, d_adj) = walk_packed(&buf, face_root_idx, un_adj, vn_p, rn_p);
+        assert!(b_adj != 0, "adjacent sibling is still solid");
+        assert!(
+            d_adj < d_placed,
+            "discontinuity: shader walker bottoms at d={d_adj} for adjacent \
+             uniform sibling vs d={d_placed} at placed cell — this is the \
+             data shape the shader's `deepest_term_depth` scaling compensates for"
+        );
+    }
+
     #[test]
     fn set_cell_at_depth_clears_solid_region() {
         let mut lib = NodeLibrary::default();

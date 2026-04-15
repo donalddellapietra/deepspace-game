@@ -588,6 +588,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // different brightness instead of all sharing the
             // smooth radial direction (which made cells look 2D).
             var last_face_id: u32 = 6u;
+            // Deepest face-subtree term_depth the walker has
+            // returned on this ray. Cell boundaries are computed
+            // at this depth — not the current sample's term_depth
+            // — so adjacent regions with different walker depths
+            // share aligned boundary planes. Without this, an
+            // edit at `cs_edit_depth > SDF_DETAIL_LEVELS + 1`
+            // expands a previously-uniform depth-5 cell into a
+            // mixed depth-5 node, the walker returns `d=6` inside
+            // it but `d=5` for its uniform-stone siblings, and
+            // the DDA computes boundaries at cells_d=729 vs 243
+            // on either side — leaving a sky-strip seam at the
+            // transition. Hierarchical: depth-5 boundaries are a
+            // subset of depth-6 boundaries (`(iu+1)/243 ==
+            // 3*(iu+1)/729`), so promoting the scale upward
+            // never misses a true boundary.
+            var deepest_term_depth: u32 = 1u;
             loop {
                 if t >= t_exit || steps > 512u { break; }
                 steps = steps + 1u;
@@ -685,13 +701,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     break;
                 }
 
-                // Empty cell — step to its exit. Cell bounds are at
-                // the SUBTREE WALKER'S termination depth, not at a
-                // fixed finest depth. This is the octree skip-empty
-                // speedup: if the walker bottomed out at depth 1
-                // because the whole 1/27 chunk is empty, we jump
-                // 1/3 of the face per step instead of 1/3^depth.
-                let cells_d = pow(3.0, f32(term_depth));
+                // Empty cell — step to its exit. Boundary scale uses
+                // the DEEPEST term_depth seen on this ray, not the
+                // current sample's, so adjacent regions with
+                // mismatched walker depths still share aligned
+                // boundary planes (see `deepest_term_depth`
+                // declaration above). Skip-empty is preserved for
+                // rays that never enter a finely-edited region —
+                // they keep `deepest_term_depth = 1` and traverse
+                // the whole face in O(3) steps.
+                deepest_term_depth = max(deepest_term_depth, term_depth);
+                let cells_d = pow(3.0, f32(deepest_term_depth));
                 let iu = floor(un * cells_d);
                 let iv = floor(vn * cells_d);
                 let ir = floor(rn * cells_d);
