@@ -154,10 +154,13 @@ impl App {
             camera_pos, ray_dir, self.edit_depth(),
             self.cs_edit_depth(),
         );
+        let aabb = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
+        if let Some((mn, mx)) = &aabb {
+            eprintln!("highlight: min={:?} max={:?} size={:?}",
+                mn, mx, [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]]);
+        }
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_highlight(
-                tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h)),
-            );
+            renderer.set_highlight(aabb);
         }
     }
 }

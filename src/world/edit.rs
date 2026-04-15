@@ -856,12 +856,28 @@ fn walk_face_subtree_with_path(
             Child::Empty => return Some((0, d, path)),
             Child::Block(b) => return Some((b, d, path)),
             Child::Node(nid) => {
+                // Mirror the GPU shader's behavior: pack-time
+                // flattens uniform-content subtrees so the GPU
+                // walker sees them as a single tag=1/0 cell at
+                // this depth. The CPU walker stops here too —
+                // descending further would target an
+                // indistinguishable sub-cell, breaking the
+                // assumption that "what the user clicks is what
+                // gets broken."
+                if let Some(child_node) = library.get(nid) {
+                    if child_node.uniform_type != UNIFORM_MIXED {
+                        let block = if child_node.uniform_type == UNIFORM_EMPTY {
+                            0
+                        } else {
+                            child_node.uniform_type
+                        };
+                        return Some((block, d, path));
+                    }
+                }
                 if d == limit {
-                    // Hit the depth cap mid-descent. Treat the
-                    // cell at this path entry as the target and
-                    // report what's there: the subtree's
-                    // representative block (so the cursor lands
-                    // on a chunk-sized cell, not pixel-deep).
+                    // Hit the depth cap mid-descent on a mixed
+                    // child. Report the subtree's representative
+                    // block so the cursor lands on this cell.
                     let rep = library.get(nid)
                         .map(|n| n.representative_block).unwrap_or(255);
                     let block = if rep < 255 { rep } else { 0 };
