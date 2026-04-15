@@ -411,6 +411,18 @@ pub fn body_face_center_slot(face: Face) -> usize {
     }
 }
 
+/// Inverse of `body_face_center_slot`: decode a body slot index
+/// back to its `Face`. Returns `None` for the center slot (interior
+/// filler) and the 20 corner / edge slots.
+pub fn face_from_body_center_slot(slot: usize) -> Option<Face> {
+    for &face in &Face::ALL {
+        if body_face_center_slot(face) == slot {
+            return Some(face);
+        }
+    }
+    None
+}
+
 /// Recursive builder for one cubed-sphere face. Returns a `Child` so
 /// the caller can collapse uniform subtrees up the call chain.
 ///

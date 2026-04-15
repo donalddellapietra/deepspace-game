@@ -13,7 +13,8 @@
 //! For the full design see
 //! `docs/experimental-architecture/anchor-refactor-decisions.md`.
 
-use super::cubesphere::Face;
+use super::cubesphere::{body_face_center_slot, Face};
+use super::face_transitions;
 use super::tree::{slot_coords, slot_index, Child, MAX_DEPTH, NodeKind, NodeLibrary, NodeId};
 
 // ---------------------------------------------------------------- Path
@@ -69,6 +70,13 @@ impl Path {
     #[inline]
     pub fn last_slot(&self) -> Option<u8> {
         if self.depth == 0 { None } else { Some(self.slots[(self.depth - 1) as usize]) }
+    }
+
+    /// Overwrite the slot at `index` (must be `< depth()`).
+    pub fn set_slot(&mut self, index: usize, slot: u8) {
+        debug_assert!(index < self.depth as usize, "set_slot index out of range");
+        debug_assert!((slot as usize) < 27, "slot {} out of range", slot);
+        self.slots[index] = slot;
     }
 
     /// Truncate to at most `new_depth` levels (no-op if shorter).
@@ -317,16 +325,14 @@ impl WorldPos {
     }
 
     /// Add `delta` to `offset` and cross cell boundaries as needed.
-    /// Dispatches on the anchor's deepest `NodeKind` (looked up from
-    /// `root` via `lib`). Returns a `Transition` describing any
-    /// coordinate-meaning boundary that was crossed during the step.
+    /// Dispatches on the anchor's deepest `NodeKind` via `lib`/`root`
+    /// and consults the cube-seam table when a step would exit a
+    /// face subtree's lateral bounds. Returns a `Transition`.
     ///
-    /// Cartesian and CubedSphereBody dispatch to the pure Cartesian
-    /// neighbor step. CubedSphereFace also does a Cartesian step in
-    /// the `(u, v, r)` local frame — the face subtree IS a 27-ary
-    /// base-3 tree, just with axes relabelled — but emits a
-    /// `FaceExit` transition when the step bubbles out of the face
-    /// root, and `CubeSeam` stubs for future u/v seam handling.
+    /// Cartesian and CubedSphereBody overflow → vanilla Cartesian
+    /// neighbor step. CubedSphereFace overflow on the `u`/`v` axes
+    /// → `face_transitions::seam_neighbor` rewrites the path to
+    /// land on the adjacent face with the right axis remap.
     pub fn add_local(
         &mut self,
         delta: [f32; 3],
@@ -340,14 +346,14 @@ impl WorldPos {
         }
         for axis in 0..3usize {
             while self.offset[axis] >= 1.0 {
-                if !self.anchor.step_neighbor_cartesian(axis as u8, 1) {
+                if !self.step_seam_aware(axis as u8, 1, lib, root) {
                     self.offset[axis] = below_one();
                     break;
                 }
                 self.offset[axis] -= 1.0;
             }
             while self.offset[axis] < 0.0 {
-                if !self.anchor.step_neighbor_cartesian(axis as u8, -1) {
+                if !self.step_seam_aware(axis as u8, -1, lib, root) {
                     self.offset[axis] = 0.0;
                     break;
                 }
@@ -358,6 +364,95 @@ impl WorldPos {
             return Transition::None;
         }
         classify_transition(lib, root, kind_before, &self.anchor)
+    }
+
+    /// One-cell step that respects sphere-face seams. If the current
+    /// anchor sits inside a `CubedSphereFace` subtree and the step
+    /// would push the face's `(u, v)` index outside `[0, 3^N)`,
+    /// applies `face_transitions::seam_neighbor` instead of letting
+    /// the path bubble up into the body's empty corner cells.
+    /// Otherwise falls through to the pure Cartesian step.
+    fn step_seam_aware(
+        &mut self,
+        axis: u8,
+        dir: i8,
+        lib: &NodeLibrary,
+        root: NodeId,
+    ) -> bool {
+        if axis < 2 {
+            if let Some(fr) = find_face_root_in_path(lib, root, &self.anchor) {
+                if let Some(stepped) = self.try_face_step(axis, dir, &fr) {
+                    return stepped;
+                }
+            }
+        }
+        self.anchor.step_neighbor_cartesian(axis, dir)
+    }
+
+    /// Step within the face subtree rooted at `fr.face_root_depth`.
+    /// Aggregates `(cu, cv, cr)` from the slots beneath the face
+    /// root, applies `delta` along `axis`, and either rewrites the
+    /// slots in place (within face) or rewrites them with a seam
+    /// crossing (to the neighbor face's subtree). Returns `Some(true)`
+    /// when the step succeeded, `Some(false)` when no seam exists in
+    /// the requested direction (clamp), or `None` when the current
+    /// path doesn't actually cross a face boundary (caller falls
+    /// back to Cartesian step).
+    fn try_face_step(&mut self, axis: u8, dir: i8, fr: &FaceRoot) -> Option<bool> {
+        let n = (self.anchor.depth() as usize).saturating_sub(fr.face_root_depth as usize);
+        if n == 0 { return None; } // anchor IS the face root; one cell IS the entire face
+        let cells = 3u32.pow(n as u32);
+        let (cu, cv, cr) = aggregate_face_coords(&self.anchor, fr.face_root_depth, n);
+        let (mut nu, mut nv, nr) = (cu as i64, cv as i64, cr);
+        match axis {
+            0 => nu += dir as i64,
+            1 => nv += dir as i64,
+            _ => return None,
+        }
+        if nu >= 0 && nu < cells as i64 && nv >= 0 && nv < cells as i64 {
+            // Stays inside the same face — let the normal Cartesian
+            // step handle it (cheaper, no seam math needed).
+            return None;
+        }
+        // Out of face bounds → seam crossing.
+        let crossing = match face_transitions::seam_neighbor(fr.face, axis, dir) {
+            Some(c) => c,
+            None => return Some(false),
+        };
+        // Apply the AxisRemap at the COARSEST face cell — the cube
+        // edge — and let the finer cells fall through linearly. For
+        // the simplest correct behaviour with one-cell steps, take
+        // the source `(cu, cv)` mod 3 for the coarsest digit, apply
+        // remap to that, and place the new cell at the corresponding
+        // edge of the destination face.
+        let entry_u: u32;
+        let entry_v: u32;
+        match (axis, dir) {
+            (0,  1) => { entry_u = 0;          entry_v = cv; } // crossed +u: enter at u'=0
+            (0, -1) => { entry_u = cells - 1;  entry_v = cv; } // crossed -u: enter at u'=last
+            (1,  1) => { entry_u = cu;         entry_v = 0;  }
+            (1, -1) => { entry_u = cu;         entry_v = cells - 1; }
+            _ => return Some(false),
+        }
+        // Map the source cell (cu, cv) at the COARSEST level (digit n-1)
+        // to find which edge cell on the new face we enter at.
+        // The seam table is per-edge; the perpendicular coordinate
+        // (entry_u or entry_v above) is then remapped via the table's
+        // axis-swap/flip rules.
+        let perp = if axis == 0 { entry_v } else { entry_u };
+        let remapped_perp = remap_face_coord(perp, cells, &crossing, axis, dir);
+        let (new_cu, new_cv) = match axis {
+            0 => (entry_u, remapped_perp),
+            1 => (remapped_perp, entry_v),
+            _ => unreachable!(),
+        };
+        // Rewrite slots: body face-center slot to the new face, then
+        // base-3 decompose (new_cu, new_cv, nr) into the face-internal
+        // slots.
+        let body_slot_pos = (fr.face_root_depth - 1) as usize;
+        self.anchor.set_slot(body_slot_pos, body_face_center_slot(crossing.to_face) as u8);
+        write_face_coords(&mut self.anchor, fr.face_root_depth, n, new_cu, new_cv, nr);
+        Some(true)
     }
 
     /// Backwards-compatible shim: equivalent to calling `add_local`
@@ -455,6 +550,78 @@ impl WorldPos {
         while self.anchor.depth() > target_depth {
             self.zoom_out();
         }
+    }
+}
+
+// ----------------------------------------- face-aware step helpers
+
+/// Captures where in the path the deepest `CubedSphereFace` root sits,
+/// plus the face it represents.
+struct FaceRoot {
+    face: Face,
+    /// Depth at which the face root node sits. The slot at
+    /// `face_root_depth - 1` in the path is the body's face-center
+    /// slot for `face`.
+    face_root_depth: u8,
+}
+
+fn find_face_root_in_path(lib: &NodeLibrary, root: NodeId, path: &Path) -> Option<FaceRoot> {
+    let kinds = resolve_kinds_along(lib, root, path);
+    for (i, k) in kinds.iter().enumerate().rev() {
+        if let NodeKind::CubedSphereFace { face } = k {
+            return Some(FaceRoot {
+                face: face_from_index(*face),
+                face_root_depth: i as u8,
+            });
+        }
+    }
+    None
+}
+
+fn aggregate_face_coords(path: &Path, face_root_depth: u8, n: usize) -> (u32, u32, u32) {
+    let mut cu = 0u32;
+    let mut cv = 0u32;
+    let mut cr = 0u32;
+    let slots = path.slots();
+    for i in 0..n {
+        let s = slots[face_root_depth as usize + i] as usize;
+        let (u, v, r) = slot_coords(s);
+        cu = cu * 3 + u as u32;
+        cv = cv * 3 + v as u32;
+        cr = cr * 3 + r as u32;
+    }
+    (cu, cv, cr)
+}
+
+fn write_face_coords(path: &mut Path, face_root_depth: u8, n: usize, cu: u32, cv: u32, cr: u32) {
+    for i in 0..n {
+        let level = n - 1 - i;
+        let div = 3u32.pow(level as u32);
+        let u = ((cu / div) % 3) as usize;
+        let v = ((cv / div) % 3) as usize;
+        let r = ((cr / div) % 3) as usize;
+        path.set_slot(face_root_depth as usize + i, slot_index(u, v, r) as u8);
+    }
+}
+
+/// Apply a seam's `AxisRemap` to the perpendicular face coordinate
+/// at `cells = 3^n` resolution. The seam table operates on slot
+/// indices `0..3`; finer-grained coordinates use the same forward /
+/// reverse semantics extended to `[0, cells)`.
+fn remap_face_coord(
+    coord: u32,
+    cells: u32,
+    crossing: &face_transitions::SeamCrossing,
+    axis: u8,
+    _dir: i8,
+) -> u32 {
+    use face_transitions::AxisRemap;
+    let dst_axis_remap = if axis == 0 { crossing.new_v } else { crossing.new_u };
+    match dst_axis_remap {
+        AxisRemap::UForward | AxisRemap::VForward => coord,
+        AxisRemap::UReverse | AxisRemap::VReverse => cells - 1 - coord,
+        AxisRemap::Edge0 => 0,
+        AxisRemap::Edge2 => cells - 1,
     }
 }
 
@@ -728,6 +895,59 @@ mod tests {
         match classify_zoom_transition(before, after) {
             Transition::FaceExit { face } => assert_eq!(face, Face::NegY),
             other => panic!("expected FaceExit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_local_seam_crosses_to_neighbor_face() {
+        // Build a minimal tree: world root → body (CubedSphereBody)
+        // → 6 face roots at face-center slots. Anchor inside +X face,
+        // step +u → should land inside -Z face.
+        use super::super::tree::{empty_children, Child};
+        let mut lib = NodeLibrary::default();
+        let mut face_roots = [0u64; 6];
+        for &face in &Face::ALL {
+            face_roots[face as usize] = lib.insert_with_kind(
+                empty_children(),
+                NodeKind::CubedSphereFace { face: face as u8 },
+            );
+        }
+        let mut body_children = empty_children();
+        for &face in &Face::ALL {
+            body_children[body_face_center_slot(face)] =
+                Child::Node(face_roots[face as usize]);
+        }
+        let body = lib.insert_with_kind(
+            body_children,
+            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+        );
+        let mut world_root_children = empty_children();
+        world_root_children[slot_index(1, 2, 1)] = Child::Node(body);
+        let world_root = lib.insert(world_root_children);
+
+        // Anchor: world_root [16] → body [14 = +X face] → face_root [some cell at u=2 edge]
+        let mut p = WorldPos::root();
+        p.anchor.push(slot_index(1, 2, 1) as u8); // body
+        p.anchor.push(body_face_center_slot(Face::PosX) as u8); // +X face_root
+        p.anchor.push(slot_index(2, 1, 1) as u8); // u=2, v=1, r=1 inside face
+        p.offset = [0.9, 0.5, 0.5];
+
+        let t = p.add_local([0.2, 0.0, 0.0], &lib, world_root);
+
+        // Stepping +u past u=2 on +X face should cross the seam to -Z.
+        // The new face-center slot at body level should be -Z's slot.
+        assert_eq!(p.anchor.depth(), 3);
+        assert_eq!(
+            p.anchor.slots()[1],
+            body_face_center_slot(Face::NegZ) as u8,
+            "seam should land on NegZ face after +u from PosX",
+        );
+        match t {
+            Transition::CubeSeam { from_face, to_face } => {
+                assert_eq!(from_face, Face::PosX);
+                assert_eq!(to_face, Face::NegZ);
+            }
+            other => panic!("expected CubeSeam transition, got {:?}", other),
         }
     }
 
