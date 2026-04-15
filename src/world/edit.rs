@@ -486,12 +486,14 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_nod
     }
 
     // Phase 2: Ascent — walk back up, cloning children arrays.
+    // Preserve each ancestor's NodeKind (see `propagate_edit`).
     let mut child = Child::Node(new_node_id);
     for &(parent_id, slot) in descent.iter().rev() {
         let Some(node) = world.library.get(parent_id) else { return };
+        let original_kind = node.kind;
         let mut new_children = node.children;
         new_children[slot] = child;
-        child = Child::Node(world.library.insert(new_children));
+        child = Child::Node(world.library.insert_with_kind(new_children, original_kind));
     }
 
     if let Child::Node(new_root) = child {
@@ -513,6 +515,14 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
             Some(n) => n,
             None => return false,
         };
+        // CRITICAL: preserve the original NodeKind when rebuilding.
+        // Without this, an edit through a `CubedSphereBody` or
+        // `CubedSphereFace` ancestor reinserts it as Cartesian,
+        // the shader's NodeKind dispatch stops firing, and the
+        // walker descends into the body's children Cartesian-style
+        // — painting the planet's interior-stone fillers as cube
+        // blocks. (Spec §1b: NodeKind is part of node identity.)
+        let original_kind = node.kind;
 
         let mut new_children = node.children;
         if let Some(nid) = replacement {
@@ -521,7 +531,7 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
             new_children[slot] = new_child;
         }
 
-        replacement = Some(world.library.insert(new_children));
+        replacement = Some(world.library.insert_with_kind(new_children, original_kind));
     }
 
     if let Some(new_root) = replacement {
@@ -864,6 +874,82 @@ pub fn hit_aabb(hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
 mod tests {
     use super::*;
     use crate::world::palette::block;
+    use crate::world::cubesphere::insert_spherical_body;
+    use crate::world::sdf::Planet;
+
+    #[test]
+    fn propagate_edit_preserves_node_kinds_through_sphere_path() {
+        // Regression for "world collapses into floating cubes when
+        // I break a block": propagate_edit was reinserting ancestors
+        // via lib.insert (default Cartesian), destroying the body's
+        // CubedSphereBody NodeKind. The shader's NodeKind dispatch
+        // then stopped firing, walker descended into the body
+        // Cartesian-style and rendered the interior-stone fillers
+        // as cube blocks.
+        let mut lib = NodeLibrary::default();
+        let sdf = Planet {
+            center: [0.5, 0.5, 0.5],
+            radius: 0.30, noise_scale: 0.0, noise_freq: 1.0, noise_seed: 0,
+            gravity: 0.0, influence_radius: 1.0,
+            surface_block: block::GRASS, core_block: block::STONE,
+        };
+        let body_id = insert_spherical_body(&mut lib, 0.12, 0.45, 6, &sdf);
+        let body_kind_before = lib.get(body_id).unwrap().kind;
+        assert!(matches!(body_kind_before, NodeKind::CubedSphereBody { .. }));
+
+        // Find any Block leaf in the body and edit it.
+        // For this test, simulate a hit at slot 0 (some arbitrary
+        // sub-cell) of the first face subtree.
+        let body_node = lib.get(body_id).unwrap();
+        let face_root_id = match body_node.children[crate::world::cubesphere::FACE_SLOTS[0]] {
+            Child::Node(id) => id,
+            _ => panic!("face slot must be a Node"),
+        };
+        let face_kind_before = lib.get(face_root_id).unwrap().kind;
+        assert!(matches!(face_kind_before, NodeKind::CubedSphereFace { .. }));
+
+        // Build a simulated edit path: world-tree-style root → body
+        // → face_root → face's slot 0. Use a 1-level world (body is
+        // at slot 0 of "world root").
+        let mut world_children = empty_children();
+        world_children[0] = Child::Node(body_id);
+        let world_root = lib.insert(world_children);
+        let mut world = WorldState { root: world_root, library: lib };
+        world.library.ref_inc(world_root);
+
+        // Build a HitInfo at body → face_root → slot 0.
+        let hit = HitInfo {
+            path: vec![
+                (world_root, 0),
+                (body_id, crate::world::cubesphere::FACE_SLOTS[0]),
+                (face_root_id, 0),
+            ],
+            face: 0, t: 1.0,
+        };
+        assert!(propagate_edit(&mut world, &hit, Child::Empty));
+
+        // Walk the new world root and verify NodeKinds along the
+        // edit path are preserved (NOT collapsed to Cartesian).
+        let new_world_root = world.root;
+        let new_root_kind = world.library.get(new_world_root).unwrap().kind;
+        assert!(matches!(new_root_kind, NodeKind::Cartesian),
+            "world root must stay Cartesian");
+        let new_body = match world.library.get(new_world_root).unwrap().children[0] {
+            Child::Node(id) => id,
+            _ => panic!("slot 0 must still be the body"),
+        };
+        let new_body_kind = world.library.get(new_body).unwrap().kind;
+        assert!(matches!(new_body_kind, NodeKind::CubedSphereBody { .. }),
+            "body NodeKind must survive the edit (was: {:?})", new_body_kind);
+        let new_face = match world.library.get(new_body).unwrap()
+            .children[crate::world::cubesphere::FACE_SLOTS[0]] {
+            Child::Node(id) => id,
+            _ => panic!("face slot must still be a Node"),
+        };
+        let new_face_kind = world.library.get(new_face).unwrap().kind;
+        assert!(matches!(new_face_kind, NodeKind::CubedSphereFace { .. }),
+            "face NodeKind must survive the edit (was: {:?})", new_face_kind);
+    }
 
     #[test]
     fn raycast_hits_ground() {
