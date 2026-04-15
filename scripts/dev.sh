@@ -15,4 +15,4 @@ until curl -s http://localhost:5173 > /dev/null 2>&1; do sleep 0.2; done
 echo "Vite ready"
 
 # Start native game (wry WebView overlay loads from Vite)
-cargo run
+cargo run --bin deepspace-game

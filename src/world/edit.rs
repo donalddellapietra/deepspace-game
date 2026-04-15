@@ -11,6 +11,8 @@ use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
 
+const MAX_FACE_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
+
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
 pub struct HitInfo {
@@ -183,6 +185,140 @@ pub fn cpu_raycast_in_frame(
             sz as f32 + ray_origin[2] / 3.0,
         ];
         // ray_dir unchanged (stays unit).
+        current_frame_depth -= 1;
+    }
+}
+
+/// Frame-aware raycast for a sphere sub-frame. The linear render
+/// frame stays rooted at the containing body cell, but the actual
+/// editable/renderable layer is the bounded face-cell window
+/// described by `(face, *_min, face_size, face_depth)`.
+pub fn cpu_raycast_in_sphere_frame(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame_path: &[u8],
+    cam_local: [f32; 3],
+    ray_origin_world: [f32; 3],
+    ray_dir: [f32; 3],
+    max_face_depth: u32,
+    face: u32,
+    face_u_min: f32,
+    face_v_min: f32,
+    face_r_min: f32,
+    face_size: f32,
+    inner_r_local: f32,
+    outer_r_local: f32,
+    face_depth: u32,
+) -> Option<HitInfo> {
+    let mut chain: Vec<NodeId> = Vec::with_capacity(frame_path.len() + 1);
+    chain.push(world_root);
+    let mut frame_entries: Vec<(NodeId, usize)> = Vec::with_capacity(frame_path.len());
+    {
+        let mut current = world_root;
+        for &slot in frame_path {
+            let Some(node) = library.get(current) else { break };
+            frame_entries.push((current, slot as usize));
+            match node.children[slot as usize] {
+                Child::Node(child_id) => {
+                    current = child_id;
+                    chain.push(current);
+                }
+                _ => break,
+            }
+        }
+    }
+    let effective_depth = chain.len() - 1;
+    let frame_entries = &frame_entries[..effective_depth];
+    let mut current_frame_depth = effective_depth;
+    let mut ray_origin_local = cam_local;
+
+    loop {
+        let frame_root_id = chain[current_frame_depth];
+        if current_frame_depth == effective_depth {
+            if let Some(mut hit) = cs_raycast_in_body_bounded(
+                library,
+                frame_root_id,
+                [0.0; 3],
+                3.0,
+                inner_r_local,
+                outer_r_local,
+                ray_origin_world,
+                ray_dir,
+                &[],
+                face,
+                face_u_min,
+                face_v_min,
+                face_r_min,
+                face_size,
+                max_face_depth.saturating_sub(face_depth),
+            ) {
+                let mut new_path: Vec<(NodeId, usize)> =
+                    Vec::with_capacity(current_frame_depth + hit.path.len());
+                new_path.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                new_path.append(&mut hit.path);
+                hit.path = new_path;
+                if let Some(mut pp) = hit.place_path.take() {
+                    let mut new_pp: Vec<(NodeId, usize)> =
+                        Vec::with_capacity(current_frame_depth + pp.len());
+                    new_pp.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                    new_pp.append(&mut pp);
+                    hit.place_path = Some(new_pp);
+                }
+                return Some(hit);
+            }
+        } else {
+            let inner_max = max_face_depth.saturating_sub(current_frame_depth as u32);
+            let frame_node = library.get(frame_root_id);
+            let frame_kind = frame_node.map(|n| n.kind);
+            let hit = if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
+                cs_raycast_in_body(
+                    library,
+                    frame_root_id,
+                    [0.0; 3],
+                    3.0,
+                    inner_r,
+                    outer_r,
+                    ray_origin_local,
+                    ray_dir,
+                    &[],
+                    max_face_depth,
+                )
+            } else {
+                cpu_raycast_with_face_depth(
+                    library,
+                    frame_root_id,
+                    ray_origin_local,
+                    ray_dir,
+                    inner_max,
+                    max_face_depth,
+                )
+            };
+            if let Some(mut hit) = hit {
+                let mut new_path: Vec<(NodeId, usize)> =
+                    Vec::with_capacity(current_frame_depth + hit.path.len());
+                new_path.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                new_path.append(&mut hit.path);
+                hit.path = new_path;
+                if let Some(mut pp) = hit.place_path.take() {
+                    let mut new_pp: Vec<(NodeId, usize)> =
+                        Vec::with_capacity(current_frame_depth + pp.len());
+                    new_pp.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                    new_pp.append(&mut pp);
+                    hit.place_path = Some(new_pp);
+                }
+                return Some(hit);
+            }
+        }
+        if current_frame_depth == 0 {
+            return None;
+        }
+        let last_slot = frame_entries[current_frame_depth - 1].1;
+        let (sx, sy, sz) = slot_coords(last_slot);
+        ray_origin_local = [
+            sx as f32 + ray_origin_local[0] / 3.0,
+            sy as f32 + ray_origin_local[1] / 3.0,
+            sz as f32 + ray_origin_local[2] / 3.0,
+        ];
         current_frame_depth -= 1;
     }
 }
@@ -466,11 +602,6 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
 /// that matches the depth of siblings at the placement site, so the
 /// placed block has full recursive structure like the terrain around it.
 pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
-    eprintln!(
-        "place_block: hit.path.len={} face={} place_path.len={:?} block_type={}",
-        hit.path.len(), hit.face,
-        hit.place_path.as_ref().map(|p| p.len()), block_type,
-    );
     // Figure out how deep siblings are at the placement site.
     // The hit path has `path.len()` levels from root. The sibling
     // nodes at that depth have some subtree depth. We match it.
@@ -492,11 +623,8 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> boo
         0
     };
 
-    eprintln!("place_block: sibling_depth={}", sibling_depth);
     let child = world.library.build_uniform_subtree(block_type, sibling_depth);
-    let result = place_child(world, hit, child);
-    eprintln!("place_block: result={}", result);
-    result
+    place_child(world, hit, child)
 }
 
 /// Compute depth of a single node (non-memoized, but uniform nodes are O(1)).
@@ -1006,6 +1134,104 @@ fn cs_raycast_in_body(
     None
 }
 
+fn cs_raycast_in_body_bounded(
+    library: &NodeLibrary,
+    body_id: NodeId,
+    body_origin: [f32; 3],
+    body_size: f32,
+    inner_r_local: f32,
+    outer_r_local: f32,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    ancestor_path: &[(NodeId, usize)],
+    frame_face: u32,
+    frame_u_min: f32,
+    frame_v_min: f32,
+    frame_r_min: f32,
+    frame_size: f32,
+    remaining_depth: u32,
+) -> Option<HitInfo> {
+    let cs_center = [
+        body_origin[0] + body_size * 0.5,
+        body_origin[1] + body_size * 0.5,
+        body_origin[2] + body_size * 0.5,
+    ];
+    let cs_outer = outer_r_local * body_size;
+    let cs_inner = inner_r_local * body_size;
+    let shell = cs_outer - cs_inner;
+    if shell <= 0.0 { return None; }
+
+    let oc = sdf::sub(ray_origin, cs_center);
+    let b = sdf::dot(oc, ray_dir);
+    let c = sdf::dot(oc, oc) - cs_outer * cs_outer;
+    let disc = b * b - c;
+    if disc <= 0.0 { return None; }
+    let sq = disc.sqrt();
+    let t_enter = (-b - sq).max(0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return None; }
+
+    let mut step_world = shell * frame_size * 0.33;
+    let eps = (shell * 1e-5).max(1e-7);
+    let mut t = t_enter + eps;
+    let mut prev_place_path: Option<Vec<(NodeId, usize)>> = None;
+    for _ in 0..8_000usize {
+        if t >= t_exit { break; }
+        let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
+        let local = sdf::sub(p, cs_center);
+        let r = sdf::length(local);
+        if r >= cs_outer || r < cs_inner { break; }
+
+        let coord = world_to_coord(cs_center, p)?;
+        if coord.face as u32 != frame_face {
+            break;
+        }
+        let un_abs = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
+        let vn_abs = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
+        let rn_abs = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
+        if un_abs < frame_u_min || un_abs >= frame_u_min + frame_size ||
+           vn_abs < frame_v_min || vn_abs >= frame_v_min + frame_size ||
+           rn_abs < frame_r_min || rn_abs >= frame_r_min + frame_size {
+            break;
+        }
+
+        let body_node = library.get(body_id)?;
+        let face_slot = FACE_SLOTS[frame_face as usize];
+        let face_root_id = match body_node.children[face_slot] {
+            Child::Node(id) => id,
+            _ => return None,
+        };
+        let un = ((un_abs - frame_u_min) / frame_size).clamp(0.0, 0.9999999);
+        let vn = ((vn_abs - frame_v_min) / frame_size).clamp(0.0, 0.9999999);
+        let rn = ((rn_abs - frame_r_min) / frame_size).clamp(0.0, 0.9999999);
+
+        let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn, remaining_depth);
+        if let Some((block_id, term_depth, mut face_path)) = walk {
+            if block_id != 0 {
+                let mut full_path = ancestor_path.to_vec();
+                full_path.push((body_id, face_slot));
+                full_path.append(&mut face_path);
+                return Some(HitInfo {
+                    path: full_path,
+                    face: 4,
+                    t,
+                    place_path: prev_place_path,
+                });
+            }
+            let mut empty_full = ancestor_path.to_vec();
+            empty_full.push((body_id, face_slot));
+            empty_full.append(&mut face_path);
+            prev_place_path = Some(empty_full);
+            let cells_d = 3.0_f32.powi(term_depth as i32);
+            let nominal = shell * frame_size / cells_d * 0.33;
+            let coarse_floor = shell * frame_size * 0.01;
+            step_world = nominal.max(coarse_floor).max(eps * 4.0);
+        }
+        t += step_world;
+    }
+    None
+}
+
 /// CPU walker mirror of the shader's `walk_face_subtree`.
 /// Returns `(block_id, term_depth, path)` on success.
 fn walk_face_subtree_with_path(
@@ -1019,7 +1245,7 @@ fn walk_face_subtree_with_path(
     let mut vn = vn_in.clamp(0.0, 0.9999999);
     let mut rn = rn_in.clamp(0.0, 0.9999999);
     let mut path: Vec<(NodeId, usize)> = Vec::new();
-    let limit = max_depth.min(22);
+    let limit = max_depth.min(MAX_FACE_DEPTH);
     // After an empty terminal at d < limit, the tree gives us no
     // further structure to walk — but placement at the user's chosen
     // cs_edit_depth requires a path of uniform depth so the placed

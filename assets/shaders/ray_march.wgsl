@@ -9,6 +9,8 @@
 struct Camera {
     pos: vec3<f32>,
     _pad0: f32,
+    world_pos: vec3<f32>,
+    _pad_world: f32,
     forward: vec3<f32>,
     _pad1: f32,
     right: vec3<f32>,
@@ -28,9 +30,7 @@ struct Uniforms {
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
-    /// 0 = Cartesian (run main DDA from frame root), 1 = sphere
-    /// body (body fills [0, 3) frame; dispatch directly to
-    /// sphere_in_cell at start-of-march).
+    /// 0 = Cartesian, 1 = body root, 2 = face-space root.
     root_kind: u32,
     /// Number of ancestor ribbon entries available. When the ray
     /// exits the frame's [0, 3)³ bubble at depth 0, the shader
@@ -40,12 +40,20 @@ struct Uniforms {
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
-    /// Used when root_kind == 1.
+    /// Used when root_kind == 1 or 2.
     root_radii: vec4<f32>,
+    /// x = face id, y = how many generic UVR pops remain before the
+    /// next pop crosses from face root to body.
+    root_face_meta: vec4<u32>,
+    /// Current face-frame cell bounds inside the full face:
+    /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
+    root_face_bounds: vec4<f32>,
+    root_face_pop_pos: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
+const ROOT_KIND_FACE: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node; `slot` is the slot in that
@@ -138,6 +146,15 @@ fn face_v_axis(face: u32) -> vec3<f32> {
     }
 }
 
+fn face_uv_to_dir(face: u32, u: f32, v: f32) -> vec3<f32> {
+    let cube_u = ea_to_cube(u);
+    let cube_v = ea_to_cube(v);
+    let n = face_normal(face);
+    let u_axis = face_u_axis(face);
+    let v_axis = face_v_axis(face);
+    return normalize(n + cube_u * u_axis + cube_v * v_axis);
+}
+
 fn pick_face(n: vec3<f32>) -> u32 {
     let ax = abs(n.x); let ay = abs(n.y); let az = abs(n.z);
     if ax >= ay && ax >= az {
@@ -200,8 +217,12 @@ struct FaceWalkResult {
 // Loop bound stays at 22 to match the demo planet's face subtree
 // depth (20 + 2 levels of overhead for body + face root). The bound
 // disappears entirely with the unified-driver refactor.
+const MAX_FACE_DEPTH: u32 = 63u;
+const MAX_STACK_DEPTH: u32 = 64u;
+
 fn walk_face_subtree(body_node_idx: u32, face: u32,
-                     un_in: f32, vn_in: f32, rn_in: f32) -> FaceWalkResult {
+                     un_in: f32, vn_in: f32, rn_in: f32,
+                     depth_limit: u32) -> FaceWalkResult {
     var result: FaceWalkResult;
     result.u_lo = 0.0;
     result.v_lo = 0.0;
@@ -231,7 +252,8 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     var r_sum: f32 = 0.0; var r_comp: f32 = 0.0;
     var size: f32 = 1.0;
 
-    for (var d: u32 = 2u; d <= 22u; d = d + 1u) {
+    let limit = min(depth_limit, MAX_FACE_DEPTH);
+    for (var d: u32 = 2u; d <= limit; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -281,12 +303,169 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
     // Hit max depth without terminal: report deepest LOD bounds.
     result.block = 0u;
-    result.depth = 22u;
+    result.depth = limit;
     result.u_lo = u_sum + u_comp;
     result.v_lo = v_sum + v_comp;
     result.r_lo = r_sum + r_comp;
     result.size = size;
     return result;
+}
+
+const FACE_ROOT_LOD_THRESHOLD_PIXELS: f32 = 2.0;
+
+fn walk_face_node(node_idx: u32,
+                  un_in: f32, vn_in: f32, rn_in: f32,
+                  ray_t: f32) -> FaceWalkResult {
+    var result: FaceWalkResult;
+    result.block = 0u;
+    result.depth = 0u;
+    result.u_lo = 0.0;
+    result.v_lo = 0.0;
+    result.r_lo = 0.0;
+    result.size = 1.0;
+
+    var node = node_idx;
+    var un = clamp(un_in, 0.0, 0.9999999);
+    var vn = clamp(vn_in, 0.0, 0.9999999);
+    var rn = clamp(rn_in, 0.0, 0.9999999);
+
+    var u_sum: f32 = 0.0; var u_comp: f32 = 0.0;
+    var v_sum: f32 = 0.0; var v_comp: f32 = 0.0;
+    var r_sum: f32 = 0.0; var r_comp: f32 = 0.0;
+    var size: f32 = 1.0;
+
+    for (var d: u32 = 1u; d <= MAX_FACE_DEPTH; d = d + 1u) {
+        let us = min(u32(un * 3.0), 2u);
+        let vs = min(u32(vn * 3.0), 2u);
+        let rs = min(u32(rn * 3.0), 2u);
+        let slot = rs * 9u + vs * 3u + us;
+        let packed = child_packed(node, slot);
+        let tag = child_tag(packed);
+
+        let step_size = size * (1.0 / 3.0);
+        let u_add = step_size * f32(us);
+        let v_add = step_size * f32(vs);
+        let r_add = step_size * f32(rs);
+
+        let yu = u_add - u_comp;
+        let tu = u_sum + yu;
+        u_comp = (tu - u_sum) - yu;
+        u_sum = tu;
+
+        let yv = v_add - v_comp;
+        let tv = v_sum + yv;
+        v_comp = (tv - v_sum) - yv;
+        v_sum = tv;
+
+        let yr = r_add - r_comp;
+        let tr = r_sum + yr;
+        r_comp = (tr - r_sum) - yr;
+        r_sum = tr;
+
+        size = step_size;
+
+        if tag == 0u || tag == 1u {
+            result.block = select(0u, child_block_type(packed), tag == 1u);
+            result.depth = d;
+            result.u_lo = u_sum + u_comp;
+            result.v_lo = v_sum + v_comp;
+            result.r_lo = r_sum + r_comp;
+            result.size = size;
+            return result;
+        }
+
+        let cell_size_local = 3.0 * size;
+        let ray_dist = max(ray_t, 0.001);
+        let lod_pixels = cell_size_local / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+        let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
+        let at_max = d >= uniforms.max_depth;
+        if at_lod || at_max {
+            let bt = child_block_type(packed);
+            result.block = select(0u, bt, bt != 255u);
+            result.depth = d;
+            result.u_lo = u_sum + u_comp;
+            result.v_lo = v_sum + v_comp;
+            result.r_lo = r_sum + r_comp;
+            result.size = size;
+            return result;
+        }
+
+        node = child_node_index(node, slot);
+        un = un * 3.0 - f32(us);
+        vn = vn * 3.0 - f32(vs);
+        rn = rn * 3.0 - f32(rs);
+    }
+
+    result.depth = MAX_FACE_DEPTH;
+    result.u_lo = u_sum + u_comp;
+    result.v_lo = v_sum + v_comp;
+    result.r_lo = r_sum + r_comp;
+    result.size = size;
+    return result;
+}
+
+fn face_point_to_body_with_bounds(point: vec3<f32>, bounds: vec4<f32>) -> vec3<f32> {
+    let face = uniforms.root_face_meta.x;
+    let un = clamp(bounds.x + (point.x / 3.0) * bounds.w, 0.0, 0.9999999);
+    let vn = clamp(bounds.y + (point.y / 3.0) * bounds.w, 0.0, 0.9999999);
+    let rn = clamp(bounds.z + (point.z / 3.0) * bounds.w, 0.0, 0.9999999);
+    let dir = face_uv_to_dir(face, un * 2.0 - 1.0, vn * 2.0 - 1.0);
+    let radius_local = uniforms.root_radii.x + rn * (uniforms.root_radii.y - uniforms.root_radii.x);
+    let body_local = vec3<f32>(0.5) + dir * radius_local;
+    return body_local * 3.0;
+}
+
+fn root_face_point_to_body(point: vec3<f32>) -> vec3<f32> {
+    return face_point_to_body_with_bounds(point, uniforms.root_face_bounds);
+}
+
+fn face_root_point_to_body(point: vec3<f32>) -> vec3<f32> {
+    return face_point_to_body_with_bounds(point, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+}
+
+fn face_dir_to_body(origin: vec3<f32>, dir: vec3<f32>, bounds: vec4<f32>) -> vec3<f32> {
+    let eps = max(bounds.w * 1e-3, 1e-5);
+    let p0 = face_point_to_body_with_bounds(origin, bounds);
+    let p1 = face_point_to_body_with_bounds(origin + dir * eps, bounds);
+    let d = p1 - p0;
+    if dot(d, d) < 1e-12 {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    return normalize(d);
+}
+
+fn face_local_normal_to_body(point: vec3<f32>, normal: vec3<f32>, bounds: vec4<f32>) -> vec3<f32> {
+    let p = face_point_to_body_with_bounds(point, bounds);
+    let dir = normalize(p - vec3<f32>(1.5));
+    let face = uniforms.root_face_meta.x;
+    let n_axis = face_normal(face);
+    let u_axis = face_u_axis(face);
+    let v_axis = face_v_axis(face);
+    if abs(normal.z) > 0.5 {
+        return normalize(dir * sign(normal.z));
+    }
+    if abs(normal.y) > 0.5 {
+        return normalize(v_axis * sign(normal.y));
+    }
+    let axis_dot = max(dot(dir, n_axis), 1e-5);
+    let u_world = normalize(u_axis - n_axis * (dot(dir, u_axis) / axis_dot));
+    return normalize(u_world * sign(normal.x));
+}
+
+fn face_box_to_body_bounds(hmin: vec3<f32>, hmax: vec3<f32>, bounds: vec4<f32>) -> mat2x3<f32> {
+    var mn = vec3<f32>(1e20);
+    var mx = vec3<f32>(-1e20);
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+        let corner = vec3<f32>(
+            select(hmin.x, hmax.x, (i & 1u) != 0u),
+            select(hmin.y, hmax.y, (i & 2u) != 0u),
+            select(hmin.z, hmax.z, (i & 4u) != 0u),
+        );
+        let p = face_point_to_body_with_bounds(corner, bounds);
+        mn = min(mn, p);
+        mx = max(mx, p);
+    }
+    return mat2x3<f32>(mn, mx);
 }
 
 // -------------- Ray-AABB --------------
@@ -304,7 +483,13 @@ fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: v
     );
 }
 
-const MAX_STACK_DEPTH: u32 = 16u;
+fn pow3_u(exp: u32) -> f32 {
+    var scale = 1.0;
+    for (var i: u32 = 0u; i < exp; i = i + 1u) {
+        scale = scale * 3.0;
+    }
+    return scale;
+}
 
 struct HitResult {
     hit: bool,
@@ -313,11 +498,112 @@ struct HitResult {
     t: f32,
     /// Which ancestor-pop level the hit happened in. 0 = original
     /// camera frame; >0 = popped that many times into ancestors.
-    /// `t` is in this frame's units, not the camera's. Used by the
-    /// highlight overlay to decide whether to draw (today the
-    /// CPU only sends the camera-frame AABB, so popped hits skip
-    /// the outline — see unified-driver-refactor.md "Not yet done").
+    /// `t` is in this frame's units, not the camera's.
     frame_level: u32,
+    highlight_min: vec3<f32>,
+    highlight_max: vec3<f32>,
+    frame_scale: f32,
+}
+
+fn march_face_root(
+    root_node_idx: u32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.highlight_min = vec3<f32>(0.0);
+    result.highlight_max = vec3<f32>(0.0);
+    result.frame_scale = 1.0;
+
+    let inv_dir = vec3<f32>(
+        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+    );
+    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
+        return result;
+    }
+
+    let t_start = max(root_hit.t_enter, 0.0) + 0.001;
+    var t = t_start;
+    var steps = 0u;
+    var last_face_id: u32 = 6u;
+    loop {
+        if t >= root_hit.t_exit || steps > 4096u { break; }
+        steps = steps + 1u;
+
+        let local = ray_origin + ray_dir * t;
+        if local.x < 0.0 || local.x >= 3.0 || local.y < 0.0 || local.y >= 3.0 || local.z < 0.0 || local.z >= 3.0 {
+            break;
+        }
+
+        let walk = walk_face_node(
+            root_node_idx,
+            local.x / 3.0,
+            local.y / 3.0,
+            local.z / 3.0,
+            t,
+        );
+
+        if walk.block != 0u {
+            var hit_normal: vec3<f32>;
+            switch last_face_id {
+                case 0u: { hit_normal = vec3<f32>(-1.0, 0.0, 0.0); }
+                case 1u: { hit_normal = vec3<f32>( 1.0, 0.0, 0.0); }
+                case 2u: { hit_normal = vec3<f32>(0.0, -1.0, 0.0); }
+                case 3u: { hit_normal = vec3<f32>(0.0,  1.0, 0.0); }
+                case 4u: { hit_normal = vec3<f32>(0.0, 0.0, -1.0); }
+                case 5u: { hit_normal = vec3<f32>(0.0, 0.0,  1.0); }
+                default: { hit_normal = vec3<f32>(0.0, 0.0, 1.0); }
+            }
+            result.hit = true;
+            result.t = t;
+            result.color = palette.colors[walk.block].rgb;
+            result.normal = hit_normal;
+            return result;
+        }
+
+        let u_lo = walk.u_lo * 3.0;
+        let u_hi = (walk.u_lo + walk.size) * 3.0;
+        let v_lo = walk.v_lo * 3.0;
+        let v_hi = (walk.v_lo + walk.size) * 3.0;
+        let r_lo = walk.r_lo * 3.0;
+        let r_hi = (walk.r_lo + walk.size) * 3.0;
+
+        var t_next = root_hit.t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        if abs(ray_dir.x) > 1e-8 {
+            let cand_u_lo = (u_lo - ray_origin.x) / ray_dir.x;
+            if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+            let cand_u_hi = (u_hi - ray_origin.x) / ray_dir.x;
+            if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        }
+        if abs(ray_dir.y) > 1e-8 {
+            let cand_v_lo = (v_lo - ray_origin.y) / ray_dir.y;
+            if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+            let cand_v_hi = (v_hi - ray_origin.y) / ray_dir.y;
+            if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        }
+        if abs(ray_dir.z) > 1e-8 {
+            let cand_r_lo = (r_lo - ray_origin.z) / ray_dir.z;
+            if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+            let cand_r_hi = (r_hi - ray_origin.z) / ray_dir.z;
+            if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+        }
+
+        if t_next >= root_hit.t_exit { break; }
+        last_face_id = winning_face;
+        let cell_size_local = 3.0 * walk.size;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(cell_size_local * 1e-3, t_ulp);
+        t = t_next + cell_eps;
+    }
+
+    return result;
 }
 
 // Sphere DDA running inside one CubedSphereBody cell. The body cell
@@ -337,6 +623,9 @@ fn sphere_in_cell(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
+    result.highlight_min = vec3<f32>(0.0);
+    result.highlight_max = vec3<f32>(0.0);
+    result.frame_scale = 1.0;
 
     let cs_center = body_cell_origin + vec3<f32>(body_cell_size * 0.5);
     let cs_outer = outer_r_local * body_cell_size;
@@ -381,7 +670,7 @@ fn sphere_in_cell(
         let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
         let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
 
-        let walk = walk_face_subtree(body_node_idx, face, un, vn, rn);
+        let walk = walk_face_subtree(body_node_idx, face, un, vn, rn, uniforms.max_depth);
         let block_id = walk.block;
         let term_depth = walk.depth;
 
@@ -453,6 +742,138 @@ fn sphere_in_cell(
     return result;
 }
 
+fn sphere_in_face_window(
+    body_node_idx: u32,
+    face: u32,
+    face_u_min: f32,
+    face_v_min: f32,
+    face_r_min: f32,
+    face_size: f32,
+    face_depth: u32,
+    inner_r_local: f32,
+    outer_r_local: f32,
+    ray_origin_world: vec3<f32>,
+    ray_dir: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.highlight_min = vec3<f32>(0.0);
+    result.highlight_max = vec3<f32>(0.0);
+    result.frame_scale = 1.0;
+
+    let body_origin = vec3<f32>(0.0);
+    let body_size = 3.0;
+    let cs_center = body_origin + vec3<f32>(body_size * 0.5);
+    let cs_outer = outer_r_local * body_size;
+    let cs_inner = inner_r_local * body_size;
+    let shell = cs_outer - cs_inner;
+
+    let oc = ray_origin_world - cs_center;
+    let b = dot(oc, ray_dir);
+    let c_outer = dot(oc, oc) - cs_outer * cs_outer;
+    let disc = b * b - c_outer;
+    if disc <= 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_enter = max(-b - sq, 0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return result; }
+
+    let eps_init = max(shell * 1e-5, 1e-7);
+    var t = t_enter + eps_init;
+    var steps = 0u;
+    var last_face_id: u32 = 6u;
+    let depth_limit = min(MAX_FACE_DEPTH, face_depth + uniforms.max_depth);
+    loop {
+        if t >= t_exit || steps > 4096u { break; }
+        steps = steps + 1u;
+
+        let local = oc + ray_dir * t;
+        let r = length(local);
+        if r >= cs_outer || r < cs_inner { break; }
+
+        let n = local / r;
+        let hit_face = pick_face(n);
+        if hit_face != face { break; }
+        let n_axis = face_normal(face);
+        let u_axis = face_u_axis(face);
+        let v_axis = face_v_axis(face);
+        let axis_dot = dot(n, n_axis);
+        let cube_u = dot(n, u_axis) / axis_dot;
+        let cube_v = dot(n, v_axis) / axis_dot;
+        let u_ea = cube_to_ea(cube_u);
+        let v_ea = cube_to_ea(cube_v);
+
+        let un_abs = clamp((u_ea + 1.0) * 0.5, 0.0, 0.9999999);
+        let vn_abs = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
+        let rn_abs = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
+        if un_abs < face_u_min || un_abs >= face_u_min + face_size ||
+           vn_abs < face_v_min || vn_abs >= face_v_min + face_size ||
+           rn_abs < face_r_min || rn_abs >= face_r_min + face_size {
+            break;
+        }
+
+        let walk = walk_face_subtree(body_node_idx, face, un_abs, vn_abs, rn_abs, depth_limit);
+        let block_id = walk.block;
+        if block_id != 0u {
+            var hit_normal: vec3<f32>;
+            switch last_face_id {
+                case 0u: { hit_normal = -u_axis; }
+                case 1u: { hit_normal =  u_axis; }
+                case 2u: { hit_normal = -v_axis; }
+                case 3u: { hit_normal =  v_axis; }
+                case 4u: { hit_normal = -n; }
+                case 5u: { hit_normal =  n; }
+                default: { hit_normal =  n; }
+            }
+            result.hit = true;
+            result.t = t;
+            result.normal = hit_normal;
+            result.color = palette.colors[block_id].rgb * 0.8;
+            return result;
+        }
+
+        let u_lo_ea = walk.u_lo * 2.0 - 1.0;
+        let u_hi_ea = (walk.u_lo + walk.size) * 2.0 - 1.0;
+        let n_u_lo = u_axis - ea_to_cube(u_lo_ea) * n_axis;
+        let n_u_hi = u_axis - ea_to_cube(u_hi_ea) * n_axis;
+
+        let v_lo_ea = walk.v_lo * 2.0 - 1.0;
+        let v_hi_ea = (walk.v_lo + walk.size) * 2.0 - 1.0;
+        let n_v_lo = v_axis - ea_to_cube(v_lo_ea) * n_axis;
+        let n_v_hi = v_axis - ea_to_cube(v_hi_ea) * n_axis;
+
+        let r_lo = cs_inner + walk.r_lo * shell;
+        let r_hi = cs_inner + (walk.r_lo + walk.size) * shell;
+
+        var t_next = t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        let zero3 = vec3<f32>(0.0);
+        let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+        let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+        let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
+        if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+        let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
+        if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+
+        if t_next >= t_exit { break; }
+        last_face_id = winning_face;
+        let cell_world = shell * walk.size;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(cell_world * 1e-3, t_ulp);
+        t = t_next + cell_eps;
+    }
+
+    return result;
+}
+
 // -------------- Stack-based Cartesian tree DDA --------------
 
 /// Cartesian DDA in a single frame rooted at `root_node_idx`. The
@@ -466,6 +887,9 @@ fn march_cartesian(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
+    result.highlight_min = vec3<f32>(0.0);
+    result.highlight_max = vec3<f32>(0.0);
+    result.frame_scale = 1.0;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -479,11 +903,11 @@ fn march_cartesian(
     );
     let delta_dist = abs(inv_dir);
 
-    var s_node_idx: array<u32, 16>;
-    var s_cell: array<vec3<i32>, 16>;
-    var s_side_dist: array<vec3<f32>, 16>;
-    var s_node_origin: array<vec3<f32>, 16>;
-    var s_cell_size: array<f32, 16>;
+    var s_node_idx: array<u32, MAX_STACK_DEPTH>;
+    var s_cell: array<vec3<i32>, MAX_STACK_DEPTH>;
+    var s_side_dist: array<vec3<f32>, MAX_STACK_DEPTH>;
+    var s_node_origin: array<vec3<f32>, MAX_STACK_DEPTH>;
+    var s_cell_size: array<f32, MAX_STACK_DEPTH>;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
@@ -726,7 +1150,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var current_kind = uniforms.root_kind;
     var inner_r = uniforms.root_radii.x;
     var outer_r = uniforms.root_radii.y;
+    var cur_face_bounds = uniforms.root_face_bounds;
     var ribbon_level: u32 = 0u;
+    var cur_hmin = uniforms.highlight_min.xyz;
+    var cur_hmax = uniforms.highlight_max.xyz;
+    var cur_scale: f32 = 1.0;
 
     var hops: u32 = 0u;
     loop {
@@ -741,11 +1169,20 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 current_idx, body_origin, body_size,
                 inner_r, outer_r, ray_origin, ray_dir,
             );
+        } else if current_kind == ROOT_KIND_FACE {
+            r = march_face_root(current_idx, ray_origin, ray_dir);
         } else {
             r = march_cartesian(current_idx, ray_origin, ray_dir);
         }
         if r.hit {
+            if current_kind == ROOT_KIND_FACE {
+                let hit_pos = ray_origin + ray_dir * r.t;
+                r.normal = face_local_normal_to_body(hit_pos, r.normal, cur_face_bounds);
+            }
             r.frame_level = ribbon_level;
+            r.highlight_min = cur_hmin;
+            r.highlight_max = cur_hmax;
+            r.frame_scale = cur_scale;
             return r;
         }
 
@@ -753,35 +1190,82 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if ribbon_level >= uniforms.ribbon_count {
             break;
         }
-        let entry = ribbon[ribbon_level];
-        let s = entry.slot;
-        let sx = i32(s % 3u);
-        let sy = i32((s / 3u) % 3u);
-        let sz = i32(s / 9u);
-        // Pop transform: scale ORIGIN by 1/3 + integer offset, but
-        // KEEP `ray_dir` at unit magnitude. Earlier versions divided
-        // dir by 3 to preserve t-units; that underflowed the
-        // 1e-8 parallel-axis check after ~17 pops. Now `t` is no
-        // longer continuous across frames — each frame's DDA runs
-        // its own t starting from where the ray entered.
-        ray_origin = vec3<f32>(f32(sx), f32(sy), f32(sz)) + ray_origin / 3.0;
-        // ray_dir unchanged.
-        current_idx = entry.node_idx;
-        let k = node_kinds[current_idx].kind;
-        if k == 1u {
+        if current_kind == ROOT_KIND_FACE {
+            let body_pop_level = uniforms.root_face_meta.y;
+            if ribbon_level < body_pop_level {
+                let entry = ribbon[ribbon_level];
+                let s = entry.slot;
+                let sx = i32(s % 3u);
+                let sy = i32((s / 3u) % 3u);
+                let sz = i32(s / 9u);
+                let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+                let old_size = cur_face_bounds.w;
+                ray_origin = slot_off + ray_origin / 3.0;
+                if uniforms.highlight_active != 0u {
+                    cur_hmin = slot_off + cur_hmin / 3.0;
+                    cur_hmax = slot_off + cur_hmax / 3.0;
+                }
+                cur_face_bounds = vec4<f32>(
+                    cur_face_bounds.x - slot_off.x * old_size,
+                    cur_face_bounds.y - slot_off.y * old_size,
+                    cur_face_bounds.z - slot_off.z * old_size,
+                    old_size * 3.0,
+                );
+                cur_scale = cur_scale * (1.0 / 3.0);
+                current_idx = entry.node_idx;
+                ribbon_level = ribbon_level + 1u;
+                continue;
+            }
+            if body_pop_level >= uniforms.ribbon_count {
+                break;
+            }
+            let body_entry = ribbon[body_pop_level];
+            let face_origin = ray_origin;
+            ray_origin = face_point_to_body_with_bounds(face_origin, cur_face_bounds);
+            ray_dir = face_dir_to_body(face_origin, ray_dir, cur_face_bounds);
+            if uniforms.highlight_active != 0u {
+                let bounds = face_box_to_body_bounds(cur_hmin, cur_hmax, cur_face_bounds);
+                cur_hmin = bounds[0];
+                cur_hmax = bounds[1];
+            }
+            current_idx = body_entry.node_idx;
             current_kind = ROOT_KIND_BODY;
             inner_r = node_kinds[current_idx].inner_r;
             outer_r = node_kinds[current_idx].outer_r;
+            ribbon_level = body_pop_level + 1u;
         } else {
-            current_kind = ROOT_KIND_CARTESIAN;
+            let entry = ribbon[ribbon_level];
+            let s = entry.slot;
+            let sx = i32(s % 3u);
+            let sy = i32((s / 3u) % 3u);
+            let sz = i32(s / 9u);
+            let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+            ray_origin = slot_off + ray_origin / 3.0;
+            if uniforms.highlight_active != 0u {
+                cur_hmin = slot_off + cur_hmin / 3.0;
+                cur_hmax = slot_off + cur_hmax / 3.0;
+            }
+            cur_scale = cur_scale * (1.0 / 3.0);
+            current_idx = entry.node_idx;
+            let k = node_kinds[current_idx].kind;
+            if k == 1u {
+                current_kind = ROOT_KIND_BODY;
+                inner_r = node_kinds[current_idx].inner_r;
+                outer_r = node_kinds[current_idx].outer_r;
+            } else {
+                current_kind = ROOT_KIND_CARTESIAN;
+            }
+            ribbon_level = ribbon_level + 1u;
         }
-        ribbon_level = ribbon_level + 1u;
     }
 
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
+    result.highlight_min = cur_hmin;
+    result.highlight_max = cur_hmax;
+    result.frame_scale = cur_scale;
     return result;
 }
 
@@ -825,14 +1309,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    // Highlight overlay only renders for hits in the camera's
-    // own frame (frame_level == 0). Hits via ancestor pop have
-    // their `t` and ray coords in a popped frame, where the
-    // CPU-supplied AABB doesn't apply. Per-level AABBs is
-    // future work — see unified-driver-refactor.md.
-    if uniforms.highlight_active != 0u && (!result.hit || result.frame_level == 0u) {
-        let h_min = uniforms.highlight_min.xyz;
-        let h_max = uniforms.highlight_max.xyz;
+    if uniforms.highlight_active != 0u {
+        let h_min = select(uniforms.highlight_min.xyz, result.highlight_min, result.hit);
+        let h_max = select(uniforms.highlight_max.xyz, result.highlight_max, result.hit);
         let h_size = h_max - h_min;
         let h_inv_dir = vec3<f32>(
             select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),

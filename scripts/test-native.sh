@@ -33,7 +33,7 @@ until curl -s http://localhost:5173 >/dev/null 2>&1; do sleep 0.3; done
 echo "    Vite ready"
 
 echo "==> Starting game..."
-cargo run 2>&1 | tee "$GAME_LOG" &
+cargo run --bin deepspace-game 2>&1 | tee "$GAME_LOG" &
 GAME_PID=$!
 sleep 8
 

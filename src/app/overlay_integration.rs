@@ -23,6 +23,10 @@ impl App {
         let Some(window) = &self.window else { return };
         if let Some(wv) = overlay::create_webview(window) {
             self.webview = Some(wv);
+            if let Some(test) = self.test.as_ref() {
+                use std::sync::atomic::Ordering;
+                test.monitor.webview_created.store(true, Ordering::Relaxed);
+            }
             // The webview is a WKWebView added as a subview. It
             // often grabs first responder during creation. Reclaim
             // key + first-responder on the content view so the

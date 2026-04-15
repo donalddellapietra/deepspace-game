@@ -103,8 +103,12 @@ pub fn flush_to_webview(webview: &wry::WebView) {
         let Ok(mut outbox) = OUTBOX.lock() else { return };
         outbox.drain(..).collect()
     };
-    for json in jsons {
-        let js = format!("window.__onGameState && window.__onGameState({})", json);
+    if !jsons.is_empty() {
+        let batch = format!("[{}]", jsons.join(","));
+        let js = format!(
+            "window.__onGameStateBatch && window.__onGameStateBatch({})",
+            batch
+        );
         let _ = webview.evaluate_script(&js);
     }
 }
@@ -143,6 +147,13 @@ window.__stateBuffer = [];
 window.__onGameState = (data) => {
     const parsed = typeof data === 'string' ? JSON.parse(data) : data;
     window.__stateBuffer.push(parsed);
+};
+window.__onGameStateBatch = (batch) => {
+    const updates = typeof batch === 'string' ? JSON.parse(batch) : batch;
+    if (!Array.isArray(updates)) return;
+    for (const update of updates) {
+        window.__onGameState(update);
+    }
 };
 
 // ── Centralised input ───────────────────────────────────────────
@@ -344,7 +355,7 @@ pub fn create_webview(window: &Window) -> Option<wry::WebView> {
         .build_as_child(&handle)
     {
         Ok(webview) => {
-            log::info!(
+            eprintln!(
                 "overlay: WebView created ({}x{} @{:.1}x) → {url}",
                 phys.width, phys.height, scale
             );

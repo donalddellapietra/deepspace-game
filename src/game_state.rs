@@ -62,6 +62,10 @@ pub struct GameUiState {
     pub custom_blocks: Vec<CustomBlock>,
     pub ui_focused: bool,
     pub zoom_level: i32,
+    pub last_hotbar_sent: Option<HotbarState>,
+    pub last_inventory_sent: Option<InventoryStateJs>,
+    pub last_color_picker_sent: Option<ColorPickerStateJs>,
+    pub last_mode_indicator_sent: Option<ModeIndicatorStateJs>,
 }
 
 impl GameUiState {
@@ -87,6 +91,10 @@ impl GameUiState {
             custom_blocks: Vec::new(),
             ui_focused: false,
             zoom_level: 0,
+            last_hotbar_sent: None,
+            last_inventory_sent: None,
+            last_color_picker_sent: None,
+            last_mode_indicator_sent: None,
         }
     }
 
@@ -208,9 +216,13 @@ impl GameUiState {
             }
         }).collect();
 
-        overlay::push_state(&GameStateUpdate::Hotbar(HotbarState {
+        let hotbar = HotbarState {
             active: self.active_slot, slots, layer,
-        }));
+        };
+        if self.last_hotbar_sent.as_ref() != Some(&hotbar) {
+            overlay::push_state(&GameStateUpdate::Hotbar(hotbar.clone()));
+            self.last_hotbar_sent = Some(hotbar);
+        }
 
         // Inventory: builtin blocks from the palette
         let builtin_blocks: Vec<BlockInfo> = palette::BUILTINS.iter().map(|&(idx, name, color)| {
@@ -221,19 +233,31 @@ impl GameUiState {
             BlockInfo { voxel: block::BUILTIN_COUNT + i as u8, name: cb.name.clone(), color: cb.color }
         }).collect();
 
-        overlay::push_state(&GameStateUpdate::Inventory(InventoryStateJs {
+        let inventory = InventoryStateJs {
             open: self.inventory_open, builtin_blocks, custom_blocks,
             saved_meshes: Vec::new(), layer,
-        }));
+        };
+        if self.last_inventory_sent.as_ref() != Some(&inventory) {
+            overlay::push_state(&GameStateUpdate::Inventory(inventory.clone()));
+            self.last_inventory_sent = Some(inventory);
+        }
 
         // Color picker
-        overlay::push_state(&GameStateUpdate::ColorPicker(ColorPickerStateJs {
+        let color_picker = ColorPickerStateJs {
             open: self.color_picker_open, r: self.picker_r, g: self.picker_g, b: self.picker_b,
-        }));
+        };
+        if self.last_color_picker_sent.as_ref() != Some(&color_picker) {
+            overlay::push_state(&GameStateUpdate::ColorPicker(color_picker.clone()));
+            self.last_color_picker_sent = Some(color_picker);
+        }
 
         // Mode indicator
-        overlay::push_state(&GameStateUpdate::ModeIndicator(ModeIndicatorStateJs {
+        let mode_indicator = ModeIndicatorStateJs {
             layer, save_mode: false, save_eligible: false, entity_edit_mode: false,
-        }));
+        };
+        if self.last_mode_indicator_sent.as_ref() != Some(&mode_indicator) {
+            overlay::push_state(&GameStateUpdate::ModeIndicator(mode_indicator.clone()));
+            self.last_mode_indicator_sent = Some(mode_indicator);
+        }
     }
 }

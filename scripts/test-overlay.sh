@@ -25,7 +25,7 @@ echo "    Vite ready on :$VITE_PORT"
 
 echo "==> Building + starting game..."
 cargo build 2>&1 | grep -E "Compiling deepspace|Finished|error" || true
-cargo run &
+cargo run --bin deepspace-game &
 GAME_PID=$!
 
 # Wait for WebSocket server

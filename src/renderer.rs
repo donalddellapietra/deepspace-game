@@ -9,6 +9,7 @@
 use wgpu::util::DeviceExt;
 
 use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::tree::MAX_DEPTH;
 
 /// Maximum ancestor-ribbon depth supported by the shader. Larger
 /// ribbons get truncated at upload (anything beyond can't pop).
@@ -19,6 +20,7 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// constants in `ray_march.wgsl`.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
+pub const ROOT_KIND_FACE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -43,6 +45,9 @@ pub struct GpuUniforms {
     /// cell's local `[0, 1)` frame; the shader scales by 3.0
     /// (= WORLD_SIZE) to get shader-frame units.
     pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
+    pub root_face_meta: [u32; 4],
+    pub root_face_bounds: [f32; 4],
+    pub root_face_pop_pos: [f32; 4],
 }
 
 pub struct Renderer {
@@ -67,6 +72,9 @@ pub struct Renderer {
     highlight_max: [f32; 4],
     root_kind: u32,
     root_radii: [f32; 4],
+    root_face_meta: [u32; 4],
+    root_face_bounds: [f32; 4],
+    root_face_pop_pos: [f32; 4],
     ribbon_count: u32,
 }
 
@@ -142,6 +150,8 @@ impl Renderer {
         let camera = GpuCamera {
             pos: [1.5, 1.75, 1.5],
             _pad0: 0.0,
+            world_pos: [1.5, 1.75, 1.5],
+            _pad_world: 0.0,
             forward: [0.0, 0.0, -1.0],
             _pad1: 0.0,
             right: [1.0, 0.0, 0.0],
@@ -168,13 +178,16 @@ impl Renderer {
             node_count,
             screen_width: config.width as f32,
             screen_height: config.height as f32,
-            max_depth: 16,
+            max_depth: MAX_DEPTH as u32,
             highlight_active: 0,
             root_kind: ROOT_KIND_CARTESIAN,
             ribbon_count: 0,
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             root_radii: [0.0; 4],
+            root_face_meta: [0; 4],
+            root_face_bounds: [0.0; 4],
+            root_face_pop_pos: [0.0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -295,10 +308,13 @@ impl Renderer {
             ribbon_buffer,
             bind_group,
             root_index, node_count,
-            max_depth: 16, highlight_active: 0,
+            max_depth: MAX_DEPTH as u32, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
             root_radii: [0.0; 4],
+            root_face_meta: [0; 4],
+            root_face_bounds: [0.0; 4],
+            root_face_pop_pos: [0.0; 4],
             ribbon_count: 0,
         }
     }
@@ -351,12 +367,35 @@ impl Renderer {
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
+        self.root_face_meta = [0; 4];
+        self.root_face_bounds = [0.0; 4];
+        self.root_face_pop_pos = [0.0; 4];
         self.write_uniforms();
     }
 
     pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
         self.root_kind = ROOT_KIND_BODY;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_meta = [0; 4];
+        self.root_face_bounds = [0.0; 4];
+        self.root_face_pop_pos = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    pub fn set_root_kind_face(
+        &mut self,
+        inner_r: f32,
+        outer_r: f32,
+        face_id: u32,
+        subtree_depth: u32,
+        bounds: [f32; 4],
+        pop_pos: [f32; 3],
+    ) {
+        self.root_kind = ROOT_KIND_FACE;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_meta = [face_id, subtree_depth, 0, 0];
+        self.root_face_bounds = bounds;
+        self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
     }
 
@@ -391,6 +430,49 @@ impl Renderer {
 
     pub fn update_camera(&self, camera: &GpuCamera) {
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+    }
+
+    pub fn render_offscreen(&self) {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-frame"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("offscreen-frame"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen-ray-march"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::Wait);
     }
 
     /// Render an off-screen frame and write a PNG to `path`. Used
@@ -503,8 +585,12 @@ impl Renderer {
     }
 
     pub fn render(&self) -> Result<(), wgpu::SurfaceError> {
+        let frame_start = std::time::Instant::now();
+        let acquire_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
+        let acquire_elapsed = acquire_start.elapsed();
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let encode_start = std::time::Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
@@ -528,8 +614,24 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        let encode_elapsed = encode_start.elapsed();
+        let submit_start = std::time::Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
+        let submit_elapsed = submit_start.elapsed();
+        let present_start = std::time::Instant::now();
         output.present();
+        let present_elapsed = present_start.elapsed();
+        let frame_elapsed = frame_start.elapsed();
+        if frame_elapsed.as_secs_f64() * 1000.0 >= 30.0 {
+            eprintln!(
+                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2}",
+                acquire_elapsed.as_secs_f64() * 1000.0,
+                encode_elapsed.as_secs_f64() * 1000.0,
+                submit_elapsed.as_secs_f64() * 1000.0,
+                present_elapsed.as_secs_f64() * 1000.0,
+                frame_elapsed.as_secs_f64() * 1000.0,
+            );
+        }
         Ok(())
     }
 
@@ -596,6 +698,9 @@ impl Renderer {
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             root_radii: self.root_radii,
+            root_face_meta: self.root_face_meta,
+            root_face_bounds: self.root_face_bounds,
+            root_face_pop_pos: self.root_face_pop_pos,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

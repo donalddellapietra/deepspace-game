@@ -88,12 +88,25 @@ impl Camera {
     /// coordinate (f32-safe at any anchor depth), not world XYZ.
     pub fn gpu_camera_at(&self, pos: [f32; 3], fov: f32) -> GpuCamera {
         let (fwd, r, up) = self.basis();
+        self.gpu_camera_with_basis(pos, fwd, r, up, fov)
+    }
+
+    pub fn gpu_camera_with_basis(
+        &self,
+        pos: [f32; 3],
+        forward: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        fov: f32,
+    ) -> GpuCamera {
         GpuCamera {
             pos,
             _pad0: 0.0,
-            forward: fwd,
+            world_pos: self.world_pos_f32(),
+            _pad_world: 0.0,
+            forward,
             _pad1: 0.0,
-            right: r,
+            right,
             _pad2: 0.0,
             up,
             fov,

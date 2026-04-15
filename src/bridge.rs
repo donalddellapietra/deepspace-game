@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Rust → JS state pushes ────────────────────────────────────────
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct SlotInfo {
     pub kind: &'static str, // "block" or "model"
     pub index: u32,
@@ -15,7 +15,7 @@ pub struct SlotInfo {
     pub color: [f32; 4],
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HotbarState {
     pub active: usize,
@@ -23,20 +23,20 @@ pub struct HotbarState {
     pub layer: u8,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct BlockInfo {
     pub voxel: u8,
     pub name: String,
     pub color: [f32; 4],
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct MeshInfo {
     pub index: usize,
     pub layer: u8,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InventoryStateJs {
     pub open: bool,
@@ -46,7 +46,7 @@ pub struct InventoryStateJs {
     pub layer: u8,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct ColorPickerStateJs {
     pub open: bool,
     pub r: f32,
@@ -54,7 +54,7 @@ pub struct ColorPickerStateJs {
     pub b: f32,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModeIndicatorStateJs {
     pub layer: u8,
@@ -63,20 +63,20 @@ pub struct ModeIndicatorStateJs {
     pub entity_edit_mode: bool,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct ToastMessageJs {
     pub text: String,
     pub id: u64,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PauseMenuStateJs {
     pub open: bool,
     pub save_status: Option<String>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugOverlayStateJs {
     pub visible: bool,
@@ -91,7 +91,7 @@ pub struct DebugOverlayStateJs {
     pub node_count: usize,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "camelCase")]
 pub enum GameStateUpdate {

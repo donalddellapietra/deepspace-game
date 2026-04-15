@@ -1,18 +1,55 @@
 //! Render-frame helpers: walking the camera path to find the
-//! frame root, transforming AABBs between world and frame coords.
+//! active frame, transforming positions/AABBs into that frame.
 //!
 //! The "render frame" is the GPU's view of the world. The shader
-//! starts ray marching at the frame root, with the camera in
-//! frame-local `[0, 3)³` coordinates. The `WorldPos.in_frame`
-//! method gives the camera those coords; this module gives the
-//! tree walker that picks the frame and the AABB transforms used
-//! by the highlight overlay.
+//! starts ray marching at a frame root, with the camera expressed
+//! in that frame's coordinates. Cartesian frames are linear
+//! `[0, 3)³`; sphere frames stay rooted at the containing body
+//! cell but carry an explicit cubed-sphere face-cell window.
 //!
 //! All functions here are **pure** — no `App` state — for direct
 //! unit testing.
 
 use crate::world::anchor::{Path, WORLD_SIZE};
+use crate::world::cubesphere::{coord_to_world, world_to_coord, CubeSphereCoord, Face};
+use crate::world::sdf;
 use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SphereFrame {
+    pub body_path: Path,
+    pub body_node_id: NodeId,
+    pub face_root_id: NodeId,
+    pub face: Face,
+    pub inner_r: f32,
+    pub outer_r: f32,
+    pub face_u_min: f32,
+    pub face_v_min: f32,
+    pub face_r_min: f32,
+    pub face_size: f32,
+    pub frame_path: Path,
+    pub face_depth: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ActiveFrameKind {
+    Cartesian,
+    Body { inner_r: f32, outer_r: f32 },
+    Sphere(SphereFrame),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActiveFrame {
+    /// Path used by the linear ribbon / camera-local transforms.
+    pub render_path: Path,
+    /// Logical interaction/render layer path. For Cartesian this is
+    /// identical to `render_path`; for sphere frames it continues
+    /// through the face subtree while the linear render root stays
+    /// at the containing body.
+    pub logical_path: Path,
+    pub node_id: NodeId,
+    pub kind: ActiveFrameKind,
+}
 
 /// World-space origin and side length of the cell at `path`.
 /// Origin is the world XYZ of the cell's `(0, 0, 0)` corner; size
@@ -39,67 +76,286 @@ pub fn frame_origin_size_world(path: &Path) -> ([f32; 3], f32) {
 /// maps to the shader's `[0, 3)³`, so the scale factor is
 /// `WORLD_SIZE / frame_cell_size_world`.
 pub fn aabb_world_to_frame(
-    frame_path: &Path,
+    frame: &ActiveFrame,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
 ) -> ([f32; 3], [f32; 3]) {
-    let (frame_origin, frame_size) = frame_origin_size_world(frame_path);
-    let scale = WORLD_SIZE / frame_size;
-    (
-        [
-            (aabb_min[0] - frame_origin[0]) * scale,
-            (aabb_min[1] - frame_origin[1]) * scale,
-            (aabb_min[2] - frame_origin[2]) * scale,
-        ],
-        [
-            (aabb_max[0] - frame_origin[0]) * scale,
-            (aabb_max[1] - frame_origin[1]) * scale,
-            (aabb_max[2] - frame_origin[2]) * scale,
-        ],
-    )
+    let corners = [
+        [aabb_min[0], aabb_min[1], aabb_min[2]],
+        [aabb_min[0], aabb_min[1], aabb_max[2]],
+        [aabb_min[0], aabb_max[1], aabb_min[2]],
+        [aabb_min[0], aabb_max[1], aabb_max[2]],
+        [aabb_max[0], aabb_min[1], aabb_min[2]],
+        [aabb_max[0], aabb_min[1], aabb_max[2]],
+        [aabb_max[0], aabb_max[1], aabb_min[2]],
+        [aabb_max[0], aabb_max[1], aabb_max[2]],
+    ];
+    let mut out_min = [f32::INFINITY; 3];
+    let mut out_max = [f32::NEG_INFINITY; 3];
+    for corner in corners {
+        let p = point_world_to_frame(frame, corner);
+        for axis in 0..3 {
+            out_min[axis] = out_min[axis].min(p[axis]);
+            out_max[axis] = out_max[axis].max(p[axis]);
+        }
+    }
+    (out_min, out_max)
 }
 
-/// Render-frame walker: descends the camera's path from
-/// `world_root`, accepting Cartesian or CubedSphereBody nodes and
-/// stopping at face cells (the shader doesn't yet handle a face-
-/// cell frame root). Truncates at `desired_depth`.
-///
-/// Returns `(frame_path, frame_node_id)`.
+pub fn point_world_to_frame(frame: &ActiveFrame, point: [f32; 3]) -> [f32; 3] {
+    match frame.kind {
+        ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+            let (frame_origin, frame_size) = frame_origin_size_world(&frame.render_path);
+            let scale = WORLD_SIZE / frame_size;
+            [
+                (point[0] - frame_origin[0]) * scale,
+                (point[1] - frame_origin[1]) * scale,
+                (point[2] - frame_origin[2]) * scale,
+            ]
+        }
+        ActiveFrameKind::Sphere(sphere) => {
+            let (body_origin, body_size) = frame_origin_size_world(&sphere.body_path);
+            let body_center = [
+                body_origin[0] + body_size * 0.5,
+                body_origin[1] + body_size * 0.5,
+                body_origin[2] + body_size * 0.5,
+            ];
+            let coord = world_to_coord(body_center, point)
+                .unwrap_or(crate::world::cubesphere::CubeSphereCoord {
+                    face: sphere.face,
+                    u: 0.0,
+                    v: 0.0,
+                    r: sphere.inner_r * body_size,
+                });
+            let un_abs = (coord.u + 1.0) * 0.5;
+            let vn_abs = (coord.v + 1.0) * 0.5;
+            let shell_world = (sphere.outer_r - sphere.inner_r) * body_size;
+            let rn_abs = if shell_world > 0.0 {
+                ((coord.r - sphere.inner_r * body_size) / shell_world).clamp(-1.0, 2.0)
+            } else {
+                0.0
+            };
+            let scale = WORLD_SIZE / sphere.face_size;
+            [
+                (un_abs - sphere.face_u_min) * scale,
+                (vn_abs - sphere.face_v_min) * scale,
+                (rn_abs - sphere.face_r_min) * scale,
+            ]
+        }
+    }
+}
+
+pub fn point_world_to_body_frame(sphere: &SphereFrame, point: [f32; 3]) -> [f32; 3] {
+    let (body_origin, body_size) = frame_origin_size_world(&sphere.body_path);
+    let scale = WORLD_SIZE / body_size;
+    [
+        (point[0] - body_origin[0]) * scale,
+        (point[1] - body_origin[1]) * scale,
+        (point[2] - body_origin[2]) * scale,
+    ]
+}
+
+pub fn frame_point_to_body(point: [f32; 3], sphere: &SphereFrame) -> [f32; 3] {
+    let (body_origin, body_size) = frame_origin_size_world(&sphere.body_path);
+    let body_center = [
+        body_origin[0] + body_size * 0.5,
+        body_origin[1] + body_size * 0.5,
+        body_origin[2] + body_size * 0.5,
+    ];
+    let un = (sphere.face_u_min + (point[0] / WORLD_SIZE) * sphere.face_size)
+        .clamp(0.0, 1.0 - f32::EPSILON);
+    let vn = (sphere.face_v_min + (point[1] / WORLD_SIZE) * sphere.face_size)
+        .clamp(0.0, 1.0 - f32::EPSILON);
+    let rn = (sphere.face_r_min + (point[2] / WORLD_SIZE) * sphere.face_size)
+        .clamp(0.0, 1.0 - f32::EPSILON);
+    let world = coord_to_world(
+        body_center,
+        CubeSphereCoord {
+            face: sphere.face,
+            u: un * 2.0 - 1.0,
+            v: vn * 2.0 - 1.0,
+            r: (sphere.inner_r + rn * (sphere.outer_r - sphere.inner_r)) * body_size,
+        },
+    );
+    point_world_to_body_frame(sphere, world)
+}
+
+pub fn world_dir_to_frame(
+    frame: &ActiveFrame,
+    camera_world: [f32; 3],
+    world_dir: [f32; 3],
+) -> [f32; 3] {
+    if !matches!(frame.kind, ActiveFrameKind::Sphere(_)) {
+        return sdf::normalize(world_dir);
+    }
+    let eps = match frame.kind {
+        ActiveFrameKind::Sphere(sphere) => {
+            let (_, body_size) = frame_origin_size_world(&sphere.body_path);
+            (sphere.face_size * body_size * 1e-3).max(1e-5)
+        }
+        _ => frame_origin_size_world(&frame.render_path).1 * 1e-3,
+    };
+    let base = point_world_to_frame(frame, camera_world);
+    let shifted = point_world_to_frame(
+        frame,
+        [
+            camera_world[0] + world_dir[0] * eps,
+            camera_world[1] + world_dir[1] * eps,
+            camera_world[2] + world_dir[2] * eps,
+        ],
+    );
+    sdf::normalize([
+        shifted[0] - base[0],
+        shifted[1] - base[1],
+        shifted[2] - base[2],
+    ])
+}
+
+/// Build a `Path` from the slot prefix the GPU ribbon walker
+/// actually reached. This is the renderer's effective frame.
+pub fn frame_from_slots(slots: &[u8]) -> Path {
+    let mut frame = Path::root();
+    for &slot in slots {
+        frame.push(slot);
+    }
+    frame
+}
+
+/// Resolve the active frame. Cartesian zones use a normal linear
+/// frame root. Sphere zones keep the linear root at the containing
+/// body cell but continue the logical frame through the face
+/// subtree, carrying explicit face-cell bounds so render/edit can
+/// operate at the same layer depth without absolute-depth caps.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
     camera_anchor: &Path,
     desired_depth: u8,
-) -> (Path, NodeId) {
-    let mut frame = *camera_anchor;
-    frame.truncate(desired_depth);
+) -> ActiveFrame {
+    let mut target = *camera_anchor;
+    target.truncate(desired_depth);
     let mut node_id = world_root;
-    let mut reached = 0u8;
-    for k in 0..frame.depth() as usize {
+    let mut reached = Path::root();
+    let mut body_info: Option<(Path, NodeId, f32, f32)> = None;
+    let mut sphere_info: Option<(Face, NodeId, f32, f32, f32, f32)> = None;
+    for k in 0..target.depth() as usize {
         let Some(node) = library.get(node_id) else { break };
-        let slot = frame.slot(k) as usize;
+        let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 let Some(child) = library.get(child_id) else { break };
+                reached.push(slot as u8);
                 match child.kind {
-                    NodeKind::Cartesian | NodeKind::CubedSphereBody { .. } => {
+                    NodeKind::Cartesian => {
                         node_id = child_id;
-                        reached = (k as u8) + 1;
+                        if let Some((_, _, ref mut u_min, ref mut v_min, ref mut r_min, ref mut size)) = sphere_info {
+                            let (us, vs, rs) = slot_coords(slot);
+                            let child_size = *size / 3.0;
+                            *u_min += us as f32 * child_size;
+                            *v_min += vs as f32 * child_size;
+                            *r_min += rs as f32 * child_size;
+                            *size = child_size;
+                        }
                     }
-                    NodeKind::CubedSphereFace { .. } => break,
+                    NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                        node_id = child_id;
+                        body_info = Some((reached, child_id, inner_r, outer_r));
+                    }
+                    NodeKind::CubedSphereFace { face } => {
+                        node_id = child_id;
+                        if let Some((body_path, body_node_id, inner_r, outer_r)) = body_info {
+                            sphere_info = Some((face, child_id, 0.0, 0.0, 0.0, 1.0));
+                            body_info = Some((body_path, body_node_id, inner_r, outer_r));
+                        }
+                    }
                 }
             }
             Child::Block(_) | Child::Empty => break,
         }
     }
-    frame.truncate(reached);
-    (frame, node_id)
+    if let Some((face, face_root_id, face_u_min, face_v_min, face_r_min, face_size)) = sphere_info {
+        let (body_path, body_node_id, inner_r, outer_r) =
+            body_info.expect("sphere frame requires containing body");
+        ActiveFrame {
+            render_path: reached,
+            logical_path: reached,
+            node_id,
+            kind: ActiveFrameKind::Sphere(SphereFrame {
+                body_path,
+                body_node_id,
+                face_root_id,
+                face,
+                inner_r,
+                outer_r,
+                face_u_min,
+                face_v_min,
+                face_r_min,
+                face_size,
+                frame_path: reached,
+                face_depth: reached.depth().saturating_sub(body_path.depth() + 1) as u32,
+            }),
+        }
+    } else {
+        let kind = library.get(node_id).map(|n| n.kind).unwrap_or(NodeKind::Cartesian);
+        ActiveFrame {
+            render_path: reached,
+            logical_path: reached,
+            node_id,
+            kind: match kind {
+                NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                    ActiveFrameKind::Body { inner_r, outer_r }
+                }
+                _ => ActiveFrameKind::Cartesian,
+            },
+        }
+    }
+}
+
+pub fn with_render_margin(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    logical_path: &Path,
+    render_margin: u8,
+) -> ActiveFrame {
+    let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
+    let min_render_depth = match logical.kind {
+        ActiveFrameKind::Sphere(sphere) => (sphere.body_path.depth() + 1).min(logical.logical_path.depth()),
+        ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
+        ActiveFrameKind::Cartesian => 0,
+    };
+    let render_depth = logical
+        .logical_path
+        .depth()
+        .saturating_sub(render_margin)
+        .max(min_render_depth);
+    if render_depth == logical.logical_path.depth() {
+        return logical;
+    }
+
+    let mut render_path = logical.logical_path;
+    render_path.truncate(render_depth);
+    let render = compute_render_frame(library, world_root, &render_path, render_depth);
+    ActiveFrame {
+        render_path: render.render_path,
+        logical_path: logical.logical_path,
+        node_id: render.node_id,
+        kind: render.kind,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::world::tree::{empty_children, slot_index, uniform_children};
+
+    fn cartesian_frame(path: Path, node_id: NodeId) -> ActiveFrame {
+        ActiveFrame {
+            render_path: path,
+            logical_path: path,
+            node_id,
+            kind: ActiveFrameKind::Cartesian,
+        }
+    }
 
     fn cartesian_chain(depth: u8) -> (NodeLibrary, NodeId) {
         let mut lib = NodeLibrary::default();
@@ -118,9 +374,9 @@ mod tests {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
         for _ in 0..3 { anchor.push(13); }
-        let (frame, node_id) = compute_render_frame(&lib, root, &anchor, 0);
-        assert_eq!(frame.depth(), 0);
-        assert_eq!(node_id, root);
+        let frame = compute_render_frame(&lib, root, &anchor, 0);
+        assert_eq!(frame.render_path.depth(), 0);
+        assert_eq!(frame.node_id, root);
     }
 
     #[test]
@@ -128,12 +384,12 @@ mod tests {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
         for _ in 0..4 { anchor.push(13); }
-        let (frame, _node_id) = compute_render_frame(&lib, root, &anchor, 3);
-        assert_eq!(frame.depth(), 3);
+        let frame = compute_render_frame(&lib, root, &anchor, 3);
+        assert_eq!(frame.render_path.depth(), 3);
     }
 
     #[test]
-    fn render_frame_stops_at_face_cell() {
+    fn render_frame_enters_sphere_face_logically() {
         let mut lib = NodeLibrary::default();
         let face = lib.insert_with_kind(
             empty_children(),
@@ -155,9 +411,11 @@ mod tests {
         let mut anchor = Path::root();
         anchor.push(13);
         anchor.push(14);
-        let (frame, node_id) = compute_render_frame(&lib, root, &anchor, 2);
-        assert_eq!(frame.depth(), 1, "stopped before face cell");
-        assert_eq!(node_id, body);
+        let frame = compute_render_frame(&lib, root, &anchor, 2);
+        assert_eq!(frame.render_path.depth(), 2);
+        assert_eq!(frame.logical_path.depth(), 2);
+        assert_eq!(frame.node_id, face);
+        assert!(matches!(frame.kind, ActiveFrameKind::Sphere(_)));
     }
 
     #[test]
@@ -174,9 +432,9 @@ mod tests {
 
         let mut anchor = Path::root();
         anchor.push(13);
-        let (frame, node_id) = compute_render_frame(&lib, root, &anchor, 1);
-        assert_eq!(frame.depth(), 1);
-        assert_eq!(node_id, body);
+        let frame = compute_render_frame(&lib, root, &anchor, 1);
+        assert_eq!(frame.render_path.depth(), 1);
+        assert_eq!(frame.node_id, body);
     }
 
     #[test]
@@ -184,8 +442,8 @@ mod tests {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
         anchor.push(13);
-        let (frame, _node_id) = compute_render_frame(&lib, root, &anchor, 5);
-        assert!(frame.depth() <= 1);
+        let frame = compute_render_frame(&lib, root, &anchor, 5);
+        assert!(frame.render_path.depth() <= 1);
     }
 
     #[test]
@@ -199,8 +457,8 @@ mod tests {
         let mut anchor = Path::root();
         anchor.push(5);
         anchor.push(0);
-        let (frame, _) = compute_render_frame(&lib, root, &anchor, 2);
-        assert_eq!(frame.depth(), 0, "Block child terminates descent");
+        let frame = compute_render_frame(&lib, root, &anchor, 2);
+        assert_eq!(frame.render_path.depth(), 0, "Block child terminates descent");
     }
 
     // --------- frame_origin_size_world ---------
@@ -259,7 +517,8 @@ mod tests {
     #[test]
     fn aabb_root_frame_is_identity() {
         let p = Path::root();
-        let (mn, mx) = aabb_world_to_frame(&p, [0.5, 0.5, 0.5], [1.5, 1.5, 1.5]);
+        let frame = cartesian_frame(p, 0);
+        let (mn, mx) = aabb_world_to_frame(&frame, [0.5, 0.5, 0.5], [1.5, 1.5, 1.5]);
         assert!((mn[0] - 0.5).abs() < 1e-6);
         assert!((mx[0] - 1.5).abs() < 1e-6);
     }
@@ -268,7 +527,8 @@ mod tests {
     fn aabb_body_frame_scales_3x() {
         let mut p = Path::root();
         p.push(slot_index(1, 1, 1) as u8);
-        let (mn, mx) = aabb_world_to_frame(&p, [1.4, 1.4, 1.4], [1.6, 1.6, 1.6]);
+        let frame = cartesian_frame(p, 0);
+        let (mn, mx) = aabb_world_to_frame(&frame, [1.4, 1.4, 1.4], [1.6, 1.6, 1.6]);
         assert!((mn[0] - 1.2).abs() < 1e-5);
         assert!((mx[0] - 1.8).abs() < 1e-5);
     }
@@ -279,7 +539,8 @@ mod tests {
         p.push(slot_index(2, 2, 2) as u8);
         let world_min = [2.5, 2.5, 2.5];
         let world_max = [2.7, 2.7, 2.7];
-        let (mn, mx) = aabb_world_to_frame(&p, world_min, world_max);
+        let frame = cartesian_frame(p, 0);
+        let (mn, mx) = aabb_world_to_frame(&frame, world_min, world_max);
         let (frame_origin, frame_size) = frame_origin_size_world(&p);
         let back_min = [
             mn[0] * frame_size / WORLD_SIZE + frame_origin[0],
@@ -305,6 +566,7 @@ mod tests {
         p.push(slot_index(1, 1, 1) as u8);
         p.push(slot_index(1, 1, 1) as u8);
         p.push(slot_index(1, 1, 1) as u8);
+        let frame = cartesian_frame(p, 0);
         let (frame_origin, _) = frame_origin_size_world(&p);
         let world_min = frame_origin;
         let world_max = [
@@ -312,10 +574,18 @@ mod tests {
             frame_origin[1] + 0.01,
             frame_origin[2] + 0.01,
         ];
-        let (mn, mx) = aabb_world_to_frame(&p, world_min, world_max);
+        let (mn, mx) = aabb_world_to_frame(&frame, world_min, world_max);
         for i in 0..3 {
             assert!(mn[i].abs() < 1e-5);
             assert!((mx[i] - (0.01 * 27.0)).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn frame_from_slots_builds_exact_prefix() {
+        let slots = [13u8, 16u8, 4u8];
+        let p = frame_from_slots(&slots);
+        assert_eq!(p.depth(), slots.len() as u8);
+        assert_eq!(p.as_slice(), &slots);
     }
 }
