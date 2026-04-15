@@ -32,6 +32,13 @@ impl Camera {
         self.position.to_world_xyz()
     }
 
+    /// F64 world position — precise at deep anchor where f32 loses
+    /// sub-cell resolution. Used by CPU raycast / edit actions.
+    #[inline]
+    pub fn world_pos_f64(&self) -> [f64; 3] {
+        self.position.to_world_xyz_f64()
+    }
+
     /// World-space size of the anchor's cell. Flight speed,
     /// crosshair reach, and physics integration all scale with this
     /// so movement "feels" the same at every zoom level.

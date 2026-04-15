@@ -7,7 +7,6 @@
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
 use super::cubesphere::{world_to_coord, FACE_SLOTS};
-use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
 
@@ -33,12 +32,17 @@ pub struct HitInfo {
 }
 
 /// Stack frame for iterative DDA traversal.
+///
+/// Arithmetic is in f64: at deep anchor (depth >= 15) `cell_size`
+/// drops below `WORLD_SIZE * f32::EPSILON`, so f32 DDA cannot
+/// distinguish sub-cells. f64 keeps ~1e-16 relative precision so
+/// the same traversal works at any depth.
 struct Frame {
     node_id: NodeId,
     cell: [i32; 3],
-    side_dist: [f32; 3],
-    node_origin: [f32; 3],
-    cell_size: f32,
+    side_dist: [f64; 3],
+    node_origin: [f64; 3],
+    cell_size: f64,
 }
 
 /// Cast a ray through the tree, stopping at `max_depth` levels from root.
@@ -53,7 +57,8 @@ pub fn cpu_raycast(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
-    cpu_raycast_with_face_depth(library, root, ray_origin, ray_dir, max_depth, 6)
+    let ro64 = [ray_origin[0] as f64, ray_origin[1] as f64, ray_origin[2] as f64];
+    cpu_raycast_with_face_depth(library, root, ro64, ray_dir, max_depth, 6)
 }
 
 /// Same as `cpu_raycast` but with an explicit cap on how deep the
@@ -64,21 +69,22 @@ pub fn cpu_raycast(
 pub fn cpu_raycast_with_face_depth(
     library: &NodeLibrary,
     root: NodeId,
-    ray_origin: [f32; 3],
+    ray_origin: [f64; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
     max_face_depth: u32,
 ) -> Option<HitInfo> {
+    let rd64 = [ray_dir[0] as f64, ray_dir[1] as f64, ray_dir[2] as f64];
     let inv_dir = [
-        if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
-        if ray_dir[1].abs() > 1e-8 { 1.0 / ray_dir[1] } else { 1e10 },
-        if ray_dir[2].abs() > 1e-8 { 1.0 / ray_dir[2] } else { 1e10 },
+        if rd64[0].abs() > 1e-12 { 1.0 / rd64[0] } else { 1e20 },
+        if rd64[1].abs() > 1e-12 { 1.0 / rd64[1] } else { 1e20 },
+        if rd64[2].abs() > 1e-12 { 1.0 / rd64[2] } else { 1e20 },
     ];
 
     let step = [
-        if ray_dir[0] >= 0.0 { 1i32 } else { -1 },
-        if ray_dir[1] >= 0.0 { 1i32 } else { -1 },
-        if ray_dir[2] >= 0.0 { 1i32 } else { -1 },
+        if rd64[0] >= 0.0 { 1i32 } else { -1 },
+        if rd64[1] >= 0.0 { 1i32 } else { -1 },
+        if rd64[2] >= 0.0 { 1i32 } else { -1 },
     ];
 
     let delta_dist = [inv_dir[0].abs(), inv_dir[1].abs(), inv_dir[2].abs()];
@@ -91,9 +97,9 @@ pub fn cpu_raycast_with_face_depth(
 
     let t_start = t_enter.max(0.0) + 0.001;
     let entry_pos = [
-        ray_origin[0] + ray_dir[0] * t_start,
-        ray_origin[1] + ray_dir[1] * t_start,
-        ray_origin[2] + ray_dir[2] * t_start,
+        ray_origin[0] + rd64[0] * t_start,
+        ray_origin[1] + rd64[1] * t_start,
+        ray_origin[2] + rd64[2] * t_start,
     ];
 
     let initial_cell = [
@@ -102,7 +108,7 @@ pub fn cpu_raycast_with_face_depth(
         (entry_pos[2].floor() as i32).clamp(0, 2),
     ];
 
-    let cell_f = [initial_cell[0] as f32, initial_cell[1] as f32, initial_cell[2] as f32];
+    let cell_f = [initial_cell[0] as f64, initial_cell[1] as f64, initial_cell[2] as f64];
 
     let mut stack: Vec<Frame> = Vec::with_capacity(max_depth as usize + 1);
     let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(max_depth as usize + 1);
@@ -110,7 +116,7 @@ pub fn cpu_raycast_with_face_depth(
     stack.push(Frame {
         node_id: root,
         cell: initial_cell,
-        side_dist: compute_initial_side_dist(&entry_pos, &cell_f, &inv_dir, &ray_dir, 1.0, &[0.0; 3]),
+        side_dist: compute_initial_side_dist(&ray_origin, &cell_f, &inv_dir, &rd64, 1.0, &[0.0; 3]),
         node_origin: [0.0; 3],
         cell_size: 1.0,
     });
@@ -161,7 +167,7 @@ pub fn cpu_raycast_with_face_depth(
                 return Some(HitInfo {
                     path: path.clone(),
                     face: normal_face,
-                    t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                    t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir) as f32,
                     place_path: None,
                 });
             }
@@ -174,15 +180,30 @@ pub fn cpu_raycast_with_face_depth(
                     let parent_origin = stack[depth].node_origin;
                     let parent_cell_size = stack[depth].cell_size;
                     let body_origin = [
-                        parent_origin[0] + cell[0] as f32 * parent_cell_size,
-                        parent_origin[1] + cell[1] as f32 * parent_cell_size,
-                        parent_origin[2] + cell[2] as f32 * parent_cell_size,
+                        parent_origin[0] + cell[0] as f64 * parent_cell_size,
+                        parent_origin[1] + cell[1] as f64 * parent_cell_size,
+                        parent_origin[2] + cell[2] as f64 * parent_cell_size,
                     ];
                     let body_size = parent_cell_size;
+                    // Precompute ray origin in body-local coords (f64).
+                    // At deep anchor, `ray_origin - body_center` at
+                    // world scale loses precision via catastrophic
+                    // cancellation — passing the difference lets the
+                    // sphere DDA operate at bounded (body-size) scale.
+                    let cs_center = [
+                        body_origin[0] + body_size * 0.5,
+                        body_origin[1] + body_size * 0.5,
+                        body_origin[2] + body_size * 0.5,
+                    ];
+                    let oc_body = [
+                        ray_origin[0] - cs_center[0],
+                        ray_origin[1] - cs_center[1],
+                        ray_origin[2] - cs_center[2],
+                    ];
                     if let Some(sphere_hit) = cs_raycast_in_body(
-                        library, child_id, body_origin, body_size,
+                        library, child_id, body_size,
                         inner_r, outer_r,
-                        ray_origin, ray_dir,
+                        oc_body, rd64,
                         &path,
                         max_face_depth,
                     ) {
@@ -203,7 +224,7 @@ pub fn cpu_raycast_with_face_depth(
                     return Some(HitInfo {
                         path: path.clone(),
                         face: normal_face,
-                        t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                        t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir) as f32,
                         place_path: None,
                     });
                 }
@@ -212,9 +233,9 @@ pub fn cpu_raycast_with_face_depth(
                 let parent_origin = stack[depth].node_origin;
                 let parent_cell_size = stack[depth].cell_size;
                 let child_origin = [
-                    parent_origin[0] + cell[0] as f32 * parent_cell_size,
-                    parent_origin[1] + cell[1] as f32 * parent_cell_size,
-                    parent_origin[2] + cell[2] as f32 * parent_cell_size,
+                    parent_origin[0] + cell[0] as f64 * parent_cell_size,
+                    parent_origin[1] + cell[1] as f64 * parent_cell_size,
+                    parent_origin[2] + cell[2] as f64 * parent_cell_size,
                 ];
                 let child_cell_size = parent_cell_size / 3.0;
 
@@ -226,9 +247,9 @@ pub fn cpu_raycast_with_face_depth(
                 let (ct_enter, _) = ray_aabb(ray_origin, inv_dir, child_origin, child_max);
                 let ct_start = ct_enter.max(0.0) + 0.0001 * child_cell_size;
                 let child_entry = [
-                    ray_origin[0] + ray_dir[0] * ct_start,
-                    ray_origin[1] + ray_dir[1] * ct_start,
-                    ray_origin[2] + ray_dir[2] * ct_start,
+                    ray_origin[0] + rd64[0] * ct_start,
+                    ray_origin[1] + rd64[1] * ct_start,
+                    ray_origin[2] + rd64[2] * ct_start,
                 ];
 
                 let local_entry = [
@@ -243,13 +264,13 @@ pub fn cpu_raycast_with_face_depth(
                     (local_entry[2].floor() as i32).clamp(0, 2),
                 ];
 
-                let lc = [child_cell[0] as f32, child_cell[1] as f32, child_cell[2] as f32];
+                let lc = [child_cell[0] as f64, child_cell[1] as f64, child_cell[2] as f64];
 
                 stack.push(Frame {
                     node_id: child_id,
                     cell: child_cell,
                     side_dist: compute_initial_side_dist(
-                        &ray_origin, &lc, &inv_dir, &ray_dir,
+                        &ray_origin, &lc, &inv_dir, &rd64,
                         child_cell_size, &child_origin,
                     ),
                     node_origin: child_origin,
@@ -607,7 +628,7 @@ fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
     }
 }
 
-fn advance_dda(frame: &mut Frame, step: &[i32; 3], delta_dist: &[f32; 3], normal_face: &mut u32) {
+fn advance_dda(frame: &mut Frame, step: &[i32; 3], delta_dist: &[f64; 3], normal_face: &mut u32) {
     if frame.side_dist[0] < frame.side_dist[1] && frame.side_dist[0] < frame.side_dist[2] {
         frame.cell[0] += step[0];
         frame.side_dist[0] += delta_dist[0] * frame.cell_size;
@@ -623,7 +644,7 @@ fn advance_dda(frame: &mut Frame, step: &[i32; 3], delta_dist: &[f32; 3], normal
     }
 }
 
-fn ray_aabb(origin: [f32; 3], inv_dir: [f32; 3], bmin: [f32; 3], bmax: [f32; 3]) -> (f32, f32) {
+fn ray_aabb(origin: [f64; 3], inv_dir: [f64; 3], bmin: [f64; 3], bmax: [f64; 3]) -> (f64, f64) {
     let t1 = [
         (bmin[0] - origin[0]) * inv_dir[0],
         (bmin[1] - origin[1]) * inv_dir[1],
@@ -640,13 +661,13 @@ fn ray_aabb(origin: [f32; 3], inv_dir: [f32; 3], bmin: [f32; 3], bmax: [f32; 3])
 }
 
 fn compute_initial_side_dist(
-    ray_origin: &[f32; 3],
-    cell: &[f32; 3],
-    inv_dir: &[f32; 3],
-    ray_dir: &[f32; 3],
-    cell_size: f32,
-    node_origin: &[f32; 3],
-) -> [f32; 3] {
+    ray_origin: &[f64; 3],
+    cell: &[f64; 3],
+    inv_dir: &[f64; 3],
+    ray_dir: &[f64; 3],
+    cell_size: f64,
+    node_origin: &[f64; 3],
+) -> [f64; 3] {
     [
         if ray_dir[0] >= 0.0 {
             (node_origin[0] + (cell[0] + 1.0) * cell_size - ray_origin[0]) * inv_dir[0]
@@ -666,11 +687,11 @@ fn compute_initial_side_dist(
     ]
 }
 
-fn cell_entry_t(frame: &Frame, ray_origin: &[f32; 3], inv_dir: &[f32; 3]) -> f32 {
+fn cell_entry_t(frame: &Frame, ray_origin: &[f64; 3], inv_dir: &[f64; 3]) -> f64 {
     let cell_min = [
-        frame.node_origin[0] + frame.cell[0] as f32 * frame.cell_size,
-        frame.node_origin[1] + frame.cell[1] as f32 * frame.cell_size,
-        frame.node_origin[2] + frame.cell[2] as f32 * frame.cell_size,
+        frame.node_origin[0] + frame.cell[0] as f64 * frame.cell_size,
+        frame.node_origin[1] + frame.cell[1] as f64 * frame.cell_size,
+        frame.node_origin[2] + frame.cell[2] as f64 * frame.cell_size,
     ];
     let cell_max = [
         cell_min[0] + frame.cell_size,
@@ -759,30 +780,25 @@ pub fn is_solid_at(
 fn cs_raycast_in_body(
     library: &NodeLibrary,
     body_id: NodeId,
-    body_origin: [f32; 3],
-    body_size: f32,
+    body_size: f64,
     inner_r_local: f32,
     outer_r_local: f32,
-    ray_origin: [f32; 3],
-    ray_dir: [f32; 3],
+    oc: [f64; 3],
+    ray_dir: [f64; 3],
     ancestor_path: &[(NodeId, usize)],
     max_face_depth: u32,
 ) -> Option<HitInfo> {
-    let cs_center = [
-        body_origin[0] + body_size * 0.5,
-        body_origin[1] + body_size * 0.5,
-        body_origin[2] + body_size * 0.5,
-    ];
-    let cs_outer = outer_r_local * body_size;
-    let cs_inner = inner_r_local * body_size;
+    // All math is in body-local coords — `oc` is the ray origin
+    // relative to the body center (precomputed by the caller in f64
+    // without catastrophic cancellation at deep anchor).
+    let cs_outer = outer_r_local as f64 * body_size;
+    let cs_inner = inner_r_local as f64 * body_size;
     let shell = cs_outer - cs_inner;
     if shell <= 0.0 { return None; }
 
-    // Ray-sphere with outer radius. Standard form (cursor accuracy
-    // is fine; we don't need the Numerical-Recipes fallback).
-    let oc = sdf::sub(ray_origin, cs_center);
-    let b = sdf::dot(oc, ray_dir);
-    let c = sdf::dot(oc, oc) - cs_outer * cs_outer;
+    // Ray-sphere with outer radius.
+    let b = oc[0] * ray_dir[0] + oc[1] * ray_dir[1] + oc[2] * ray_dir[2];
+    let c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - cs_outer * cs_outer;
     let disc = b * b - c;
     if disc <= 0.0 { return None; }
     let sq = disc.sqrt();
@@ -791,9 +807,8 @@ fn cs_raycast_in_body(
     if t_exit <= 0.0 { return None; }
 
     // Step size scales with the deepest face-subtree depth observed.
-    // Start coarse (1/3 of shell) and refine as we sample finer cells.
     let mut step_world = shell * 0.33;
-    let eps = (shell * 1e-5).max(1e-7);
+    let eps = (shell * 1e-8).max(1e-14);
     let mut t = t_enter + eps;
     // Tracks the last empty cell's face-subtree path. On block hit,
     // THIS is the placement target: it's the cell the ray was in one
@@ -808,12 +823,20 @@ fn cs_raycast_in_body(
     let max_steps = 8_000usize;
     for _ in 0..max_steps {
         if t >= t_exit { break; }
-        let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
-        let local = sdf::sub(p, cs_center);
-        let r = sdf::length(local);
+        // Sample point in body-local coords (no subtraction — oc is
+        // already the ray origin relative to the body center).
+        let sample = [
+            oc[0] + ray_dir[0] * t,
+            oc[1] + ray_dir[1] * t,
+            oc[2] + ray_dir[2] * t,
+        ];
+        let r = (sample[0] * sample[0] + sample[1] * sample[1] + sample[2] * sample[2]).sqrt();
         if r >= cs_outer || r < cs_inner { break; }
 
-        let coord = world_to_coord(cs_center, p)?;
+        // world_to_coord takes f32, but at this point `sample` is
+        // body-local (bounded by cs_outer, well within f32 range).
+        let sample_f32 = [sample[0] as f32, sample[1] as f32, sample[2] as f32];
+        let coord = world_to_coord([0.0; 3], sample_f32)?;
         let face = coord.face;
         let face_slot = FACE_SLOTS[face as usize];
         let body_node = library.get(body_id)?;
@@ -826,7 +849,7 @@ fn cs_raycast_in_body(
         };
         let un = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
-        let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
+        let rn = (((r - cs_inner) / shell) as f32).clamp(0.0, 0.9999999);
 
         let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn, max_face_depth);
         if let Some((block_id, term_depth, mut face_path)) = walk {
@@ -836,18 +859,16 @@ fn cs_raycast_in_body(
                 full_path.append(&mut face_path);
                 return Some(HitInfo {
                     path: full_path,
-                    face: 4, // unused for sphere hits; place_path drives placement
-                    t,
+                    face: 4,
+                    t: t as f32,
                     place_path: prev_place_path,
                 });
             }
-            // Empty cell — record its full path as the candidate
-            // placement target; refine step to one third of its width.
             let mut empty_full = ancestor_path.to_vec();
             empty_full.push((body_id, face_slot));
             empty_full.append(&mut face_path);
             prev_place_path = Some(empty_full);
-            let cells_d = 3.0_f32.powi(term_depth as i32);
+            let cells_d = 3.0_f64.powi(term_depth as i32);
             step_world = (shell / cells_d * 0.33).max(eps * 4.0);
         }
         t += step_world;

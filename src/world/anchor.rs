@@ -261,20 +261,30 @@ impl WorldPos {
     /// World-space XYZ this position represents. Root cell spans
     /// `[0, WORLD_SIZE)³`; each anchor slot narrows that cell by 1/3.
     pub fn to_world_xyz(&self) -> [f32; 3] {
-        let mut origin = [0.0f32; 3];
-        let mut size = WORLD_SIZE;
+        let [x, y, z] = self.to_world_xyz_f64();
+        [x as f32, y as f32, z as f32]
+    }
+
+    /// Same as `to_world_xyz` but accumulates in f64. At deep anchor
+    /// (depth ~15+), f32 accumulation loses sub-cell precision because
+    /// cell_size becomes smaller than `WORLD_SIZE * f32::EPSILON`.
+    /// CPU raycast and sphere edits use this variant so their DDA /
+    /// analytic math can resolve sub-cells at arbitrary depth.
+    pub fn to_world_xyz_f64(&self) -> [f64; 3] {
+        let mut origin = [0.0f64; 3];
+        let mut size = WORLD_SIZE as f64;
         for k in 0..self.anchor.depth() as usize {
             let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
             let child = size / 3.0;
-            origin[0] += sx as f32 * child;
-            origin[1] += sy as f32 * child;
-            origin[2] += sz as f32 * child;
+            origin[0] += sx as f64 * child;
+            origin[1] += sy as f64 * child;
+            origin[2] += sz as f64 * child;
             size = child;
         }
         [
-            origin[0] + self.offset[0] * size,
-            origin[1] + self.offset[1] * size,
-            origin[2] + self.offset[2] * size,
+            origin[0] + self.offset[0] as f64 * size,
+            origin[1] + self.offset[1] as f64 * size,
+            origin[2] + self.offset[2] as f64 * size,
         ]
     }
 
