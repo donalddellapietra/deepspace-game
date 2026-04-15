@@ -311,6 +311,13 @@ struct HitResult {
     color: vec3<f32>,
     normal: vec3<f32>,
     t: f32,
+    /// Which ancestor-pop level the hit happened in. 0 = original
+    /// camera frame; >0 = popped that many times into ancestors.
+    /// `t` is in this frame's units, not the camera's. Used by the
+    /// highlight overlay to decide whether to draw (today the
+    /// CPU only sends the camera-frame AABB, so popped hits skip
+    /// the outline — see unified-driver-refactor.md "Not yet done").
+    frame_level: u32,
 }
 
 // Sphere DDA running inside one CubedSphereBody cell. The body cell
@@ -329,6 +336,7 @@ fn sphere_in_cell(
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+    result.frame_level = 0u;
 
     let cs_center = body_cell_origin + vec3<f32>(body_cell_size * 0.5);
     let cs_outer = outer_r_local * body_cell_size;
@@ -457,6 +465,7 @@ fn march_cartesian(
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+    result.frame_level = 0u;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -736,6 +745,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             r = march_cartesian(current_idx, ray_origin, ray_dir);
         }
         if r.hit {
+            r.frame_level = ribbon_level;
             return r;
         }
 
@@ -765,6 +775,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+    result.frame_level = 0u;
     return result;
 }
 
@@ -808,7 +819,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    if uniforms.highlight_active != 0u {
+    // Highlight overlay only renders for hits in the camera's
+    // own frame (frame_level == 0). Hits via ancestor pop have
+    // their `t` and ray coords in a popped frame, where the
+    // CPU-supplied AABB doesn't apply. Per-level AABBs is
+    // future work — see unified-driver-refactor.md.
+    if uniforms.highlight_active != 0u && (!result.hit || result.frame_level == 0u) {
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;
         let h_size = h_max - h_min;

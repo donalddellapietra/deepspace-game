@@ -1,152 +1,24 @@
-//! GPU data packing: convert tree nodes into flat buffers for the
-//! ray march shader.
+//! BFS packing of the world tree into the GPU buffer layout.
 //!
-//! Two parallel buffers are produced per pack:
+//! Two pack functions:
 //!
-//! - `tree: Vec<GpuChild>` — 27 children per node, BFS-ordered. Each
-//!   child has a tag (Empty / Block / Node) and either a block_type
-//!   or a buffer-local node index.
-//! - `node_kinds: Vec<GpuNodeKind>` — one entry per packed node,
-//!   carrying its `NodeKind` discriminant + per-kind data (sphere
-//!   body radii, cube face index). The shader looks this up when
-//!   it walks into a Node child to decide whether to descend with
-//!   the standard Cartesian DDA or switch to the cubed-sphere DDA.
+//! - `pack_tree`: full BFS, no LOD. Used by tests and for sanity
+//!   debugging. Every reachable node ends up in the buffer at full
+//!   detail.
+//! - `pack_tree_lod`: distance-aware. Cartesian subtrees that
+//!   subtend less than `LOD_THRESHOLD` pixels at the camera get
+//!   flattened into a single Block leaf (their representative
+//!   block type). Sphere bodies and face cells are exempt from
+//!   flattening — their geometry semantics need the full subtree.
 
 use std::collections::HashMap;
-use bytemuck::{Pod, Zeroable};
 
-use super::tree::*;
+use crate::world::tree::{
+    slot_coords, Child, NodeId, NodeKind, NodeLibrary,
+    CHILDREN_PER_NODE, UNIFORM_EMPTY, UNIFORM_MIXED,
+};
 
-// Each child in the GPU buffer is 8 bytes:
-//   tag (u8): 0=Empty, 1=Block, 2=Node
-//   block_type (u8): valid when tag==1
-//   _pad (u16)
-//   node_index (u32): buffer-local index, valid when tag==2
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct GpuChild {
-    pub tag: u8,
-    pub block_type: u8,
-    pub _pad: u16,
-    pub node_index: u32,
-}
-
-/// One node in the GPU buffer = 27 GpuChild = 216 bytes.
-pub const GPU_NODE_SIZE: usize = 27;
-
-/// Per-packed-node metadata: which `NodeKind` this node is, plus the
-/// per-kind data the shader needs to render its content. Indexed by
-/// the same buffer index used in `GpuChild::node_index`.
-///
-/// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns
-/// cleanly. `kind` discriminant: 0 = Cartesian, 1 = CubedSphereBody,
-/// 2 = CubedSphereFace.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Default)]
-pub struct GpuNodeKind {
-    pub kind: u32,
-    pub face: u32,
-    pub inner_r: f32,
-    pub outer_r: f32,
-}
-
-impl GpuNodeKind {
-    pub fn from_node_kind(k: NodeKind) -> Self {
-        match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
-            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
-                kind: 1, face: 0, inner_r, outer_r,
-            },
-            NodeKind::CubedSphereFace { face } => Self {
-                kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
-            },
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct GpuCamera {
-    pub pos: [f32; 3],
-    pub _pad0: f32,
-    pub forward: [f32; 3],
-    pub _pad1: f32,
-    pub right: [f32; 3],
-    pub _pad2: f32,
-    pub up: [f32; 3],
-    pub fov: f32,
-}
-
-/// Block color palette — up to 256 RGBA colors indexed by block type.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct GpuPalette {
-    pub colors: [[f32; 4]; 256],
-}
-
-/// One entry in the ancestor ribbon. The shader pops from the
-/// frame upward; `ribbon[0]` is the frame's direct parent, then
-/// `ribbon[1]` the grandparent, etc., up to the absolute root.
-///
-/// `node_idx` is the buffer index of the ancestor's node. `slot`
-/// is the slot in the ancestor that contained the level the ray
-/// is popping FROM — the shader uses `slot_coords(slot)` to add
-/// the integer offset when remapping the ray into the ancestor's
-/// frame.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq, Eq)]
-pub struct GpuRibbonEntry {
-    pub node_idx: u32,
-    pub slot: u32,
-}
-
-/// Walk the GPU buffer from index 0 (world root) along `frame_slots`,
-/// following Node-tagged children, returning:
-///
-/// - `frame_root_idx` — the buffer index of the deepest reached node
-/// - `ribbon` — pop-ordered ancestors from frame's direct parent up
-///   to (and including) the world root. Empty when `frame_slots`
-///   is empty (frame == world root).
-///
-/// Stops early if a slot points at a non-Node child (e.g. uniform
-/// LOD-flattened); the frame_root then sits at that depth.
-pub fn build_ribbon(tree: &[GpuChild], frame_slots: &[u8]) -> (u32, Vec<GpuRibbonEntry>) {
-    let mut walk: Vec<u32> = Vec::with_capacity(frame_slots.len() + 1);
-    walk.push(0);
-    let mut reached_slots: Vec<u8> = Vec::with_capacity(frame_slots.len());
-    let mut current = 0u32;
-    for &slot in frame_slots {
-        let idx = (current as usize) * GPU_NODE_SIZE + slot as usize;
-        if idx >= tree.len() { break; }
-        let child = tree[idx];
-        if child.tag != 2 { break; }
-        current = child.node_index;
-        walk.push(current);
-        reached_slots.push(slot);
-    }
-    let frame_root_idx = *walk.last().unwrap();
-    let depth = reached_slots.len();
-    let mut ribbon = Vec::with_capacity(depth);
-    for pop in 0..depth {
-        let ancestor_idx = walk[depth - 1 - pop];
-        let slot = reached_slots[depth - 1 - pop];
-        ribbon.push(GpuRibbonEntry {
-            node_idx: ancestor_idx,
-            slot: slot as u32,
-        });
-    }
-    (frame_root_idx, ribbon)
-}
-
-impl Default for GpuPalette {
-    fn default() -> Self {
-        let mut colors = [[0.0f32; 4]; 256];
-        for &(idx, _, color) in super::palette::BUILTINS {
-            colors[idx as usize] = color;
-        }
-        Self { colors }
-    }
-}
+use super::types::{GpuChild, GpuNodeKind, GPU_NODE_SIZE};
 
 /// Pack the visible portion of the tree into flat GPU buffers.
 /// Returns `(tree_data, node_kinds, root_buffer_index)`.
@@ -206,6 +78,10 @@ pub fn pack_tree(
 /// flattening of subtrees that cover less than `LOD_THRESHOLD`
 /// pixels on screen. The shader walks whatever ends up in the
 /// buffer; flattened cells appear as Block/Empty leaves.
+///
+/// `camera_pos` is in the same coord system as the BFS uses
+/// internally — for `root = world.root` that's world XYZ; the
+/// caller is responsible for matching units.
 pub fn pack_tree_lod(
     library: &NodeLibrary,
     root: NodeId,
@@ -213,8 +89,6 @@ pub fn pack_tree_lod(
     screen_height: f32,
     fov: f32,
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
-    use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
-
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
     const LOD_THRESHOLD: f32 = 0.5;
 
@@ -350,103 +224,25 @@ pub fn pack_tree_lod(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::palette::block;
+    use crate::world::tree::{empty_children, uniform_children, CENTER_SLOT};
 
     #[test]
     fn pack_test_world() {
-        let world = super::super::state::WorldState::test_world();
+        let world = crate::world::state::WorldState::test_world();
         let (data, kinds, root_idx) = pack_tree(&world.library, world.root);
         assert_eq!(data.len() % 27, 0);
         assert_eq!(root_idx, 0);
         assert_eq!(data.len() / 27, world.library.len());
         assert_eq!(kinds.len(), world.library.len());
-        // All test_world nodes are Cartesian.
         for k in &kinds {
             assert_eq!(k.kind, 0);
         }
     }
 
-    #[test]
-    fn gpu_child_size() {
-        assert_eq!(std::mem::size_of::<GpuChild>(), 8);
-    }
-
-    #[test]
-    fn gpu_node_kind_size() {
-        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 16);
-    }
-
-    #[test]
-    fn gpu_ribbon_entry_size() {
-        // Must match WGSL `RibbonEntry { node_idx: u32, slot: u32 }`.
-        assert_eq!(std::mem::size_of::<GpuRibbonEntry>(), 8);
-    }
-
-    // --------- build_ribbon ---------
-
-    fn one_node_tree() -> Vec<GpuChild> {
-        // 27 children, all Empty
-        vec![GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }; 27]
-    }
-
-    fn two_node_tree(parent_slot: u8) -> Vec<GpuChild> {
-        // Two nodes in buffer: index 0 (parent) has Node child at
-        // `parent_slot` pointing to index 1.
-        let mut data = vec![GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }; 54];
-        data[parent_slot as usize] = GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 1 };
-        data
-    }
-
-    #[test]
-    fn build_ribbon_empty_path_gives_empty_ribbon() {
-        let tree = one_node_tree();
-        let (frame_idx, ribbon) = build_ribbon(&tree, &[]);
-        assert_eq!(frame_idx, 0);
-        assert!(ribbon.is_empty());
-    }
-
-    #[test]
-    fn build_ribbon_single_step() {
-        let tree = two_node_tree(13);
-        let (frame_idx, ribbon) = build_ribbon(&tree, &[13]);
-        assert_eq!(frame_idx, 1, "frame should be at child node");
-        assert_eq!(ribbon.len(), 1);
-        assert_eq!(ribbon[0], GpuRibbonEntry { node_idx: 0, slot: 13 });
-    }
-
-    #[test]
-    fn build_ribbon_stops_at_non_node_child() {
-        // Path requests slot 13 → Node, then slot 5 → ... but child
-        // at idx 1 has only Empty children. Walker stops at frame=1.
-        let tree = two_node_tree(13);
-        let (frame_idx, ribbon) = build_ribbon(&tree, &[13, 5]);
-        assert_eq!(frame_idx, 1, "ran out of Node children at depth 1");
-        assert_eq!(ribbon.len(), 1);
-    }
-
-    #[test]
-    fn build_ribbon_multi_step_pop_order() {
-        // Three nodes: 0 → slot 16 → 1 → slot 8 → 2.
-        let mut data = vec![GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }; 81];
-        data[16] = GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 1 };
-        data[27 + 8] = GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 2 };
-
-        let (frame_idx, ribbon) = build_ribbon(&data, &[16, 8]);
-        assert_eq!(frame_idx, 2);
-        assert_eq!(ribbon.len(), 2);
-        // Pop order: ribbon[0] = direct parent (idx 1, came from
-        // slot 8); ribbon[1] = grandparent (idx 0, came from slot 16).
-        assert_eq!(ribbon[0], GpuRibbonEntry { node_idx: 1, slot: 8 });
-        assert_eq!(ribbon[1], GpuRibbonEntry { node_idx: 0, slot: 16 });
-    }
-
-    // --------- pack_tree_lod from world root with body sibling ---------
-
-    fn planet_world() -> super::super::state::WorldState {
+    fn planet_world() -> crate::world::state::WorldState {
         let mut lib = NodeLibrary::default();
         let leaf_air = lib.insert(empty_children());
         let mut root_children = uniform_children(Child::Node(leaf_air));
-        // Body at slot 13 — kind = CubedSphereBody.
         let body_id = lib.insert_with_kind(
             empty_children(),
             NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
@@ -454,7 +250,7 @@ mod tests {
         root_children[CENTER_SLOT] = Child::Node(body_id);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
-        super::super::state::WorldState { root, library: lib }
+        crate::world::state::WorldState { root, library: lib }
     }
 
     #[test]
@@ -464,7 +260,6 @@ mod tests {
         let (_data, kinds, _root_idx) = pack_tree_lod(
             &world.library, world.root, camera_pos, 1080.0, 1.2,
         );
-        // Find the body kind entry (kind == 1).
         let body = kinds.iter().find(|k| k.kind == 1).expect("body kind in buffer");
         assert!((body.inner_r - 0.12).abs() < 1e-6);
         assert!((body.outer_r - 0.45).abs() < 1e-6);
@@ -472,48 +267,49 @@ mod tests {
 
     #[test]
     fn pack_lod_flattens_far_uniform_cartesian() {
-        // Camera far from world; uniform empty Cartesian siblings
-        // should be tag=0 (empty) overrides, not full descents.
         let world = planet_world();
         let camera_pos = [1.5, 2.0, 1.5];
         let (data, _kinds, _root_idx) = pack_tree_lod(
             &world.library, world.root, camera_pos, 1080.0, 1.2,
         );
-        // Root's slot 0 (corner, far from camera, uniform empty)
-        // should be tag=0 (empty leaf).
+        // Slot 0 (corner, far from camera, uniform empty) → tag=0.
         assert_eq!(data[0].tag, 0);
-        // Slot 13 = body, must be a Node tag with non-zero index.
+        // Slot 13 = body, must be a Node tag.
         assert_eq!(data[13].tag, 2);
         assert!(data[13].node_index > 0);
     }
 
     #[test]
-    fn pack_planet_face_subtrees_present() {
+    fn pack_planet_body_present() {
         let world = planet_world();
         let camera_pos = [1.5, 2.0, 1.5];
         let (_data, kinds, _root_idx) = pack_tree_lod(
             &world.library, world.root, camera_pos, 1080.0, 1.2,
         );
-        // No face nodes in our minimal planet_world (body has empty
-        // children). Sanity check: only the body kind exists.
-        let has_body = kinds.iter().any(|k| k.kind == 1);
-        assert!(has_body);
+        assert!(kinds.iter().any(|k| k.kind == 1), "body kind present");
     }
 
-    // --------- build_ribbon on a real packed planet world ---------
-
     #[test]
-    fn ribbon_for_path_into_body() {
-        let world = planet_world();
-        let camera_pos = [1.5, 2.0, 1.5];
+    fn pack_lod_keeps_near_subtrees_full() {
+        // A subtree with mixed content close to the camera should
+        // descend (not flatten). Build a root with a non-uniform
+        // child near camera; verify the child is still a Node tag.
+        let mut lib = NodeLibrary::default();
+        let air = lib.insert(empty_children());
+        let mut mixed = empty_children();
+        mixed[0] = Child::Block(crate::world::palette::block::STONE);
+        let mixed_node = lib.insert(mixed);
+        let mut root_children = uniform_children(Child::Node(air));
+        root_children[CENTER_SLOT] = Child::Node(mixed_node);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        // Camera VERY close so the center cell subtends many pixels.
+        let camera_pos = [1.5, 1.5, 1.6];
         let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, camera_pos, 1080.0, 1.2,
+            &lib, root, camera_pos, 1080.0, 1.2,
         );
-        // Frame path = [13] (down to body).
-        let (frame_idx, ribbon) = build_ribbon(&data, &[13]);
-        assert!(frame_idx > 0, "body was packed at non-zero index");
-        assert_eq!(ribbon.len(), 1);
-        assert_eq!(ribbon[0].node_idx, 0, "world root is at index 0");
-        assert_eq!(ribbon[0].slot, 13);
+        // Center slot 13 should be a Node tag (not flattened).
+        assert_eq!(data[CENTER_SLOT].tag, 2);
     }
 }

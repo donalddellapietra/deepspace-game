@@ -142,17 +142,32 @@ impl App {
     /// coordinates, and pops via the ribbon when rays exit the
     /// frame's `[0, 3)³` bubble.
     pub(super) fn upload_tree_lod(&mut self) {
-        let (frame, _frame_root_id) = self.render_frame();
-        let cam_local = self.camera.position.in_frame(&frame);
+        let (intended_frame, _frame_root_id) = self.render_frame();
         let cam_world = self.camera.world_pos_f32();
         let (tree_data, node_kinds, _world_root_idx) = gpu::pack_tree_lod(
             &self.world.library, self.world.root, cam_world, 1440.0, 1.2,
         );
-        let (frame_root_idx, ribbon) = gpu::build_ribbon(&tree_data, frame.as_slice());
-        let frame_kind = self.render_frame_kind();
+        // build_ribbon may stop short of the intended frame when
+        // pack LOD-flattened a sibling on the way down (uniform-
+        // empty Cartesian children become tag=0 leaves). The
+        // shader can only operate at the depth the buffer
+        // actually reached, so we recompute cam_local against the
+        // truncated path.
+        let r = gpu::build_ribbon(&tree_data, intended_frame.as_slice());
+        let mut effective_frame = crate::world::anchor::Path::root();
+        for &slot in &r.reached_slots {
+            effective_frame.push(slot);
+        }
+        let cam_local = self.camera.position.in_frame(&effective_frame);
+        // Frame kind depends on the EFFECTIVE frame, not the
+        // intended one.
+        let frame_kind = self.world.library
+            .get(self.frame_root_id_for(&effective_frame))
+            .map(|n| n.kind)
+            .unwrap_or(crate::world::tree::NodeKind::Cartesian);
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, &node_kinds, frame_root_idx);
-            renderer.update_ribbon(&ribbon);
+            renderer.update_tree(&tree_data, &node_kinds, r.frame_root_idx);
+            renderer.update_ribbon(&r.ribbon);
             renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
             match frame_kind {
                 crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } => {
@@ -163,6 +178,23 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Walk the world tree from world.root following `path`
+    /// returning the NodeId reached. Used by upload_tree_lod to
+    /// look up the *effective* frame's NodeKind after build_ribbon
+    /// truncated.
+    fn frame_root_id_for(&self, path: &crate::world::anchor::Path) -> crate::world::tree::NodeId {
+        let mut node = self.world.root;
+        for k in 0..path.depth() as usize {
+            let Some(n) = self.world.library.get(node) else { break };
+            let slot = path.slot(k) as usize;
+            match n.children[slot] {
+                crate::world::tree::Child::Node(child) => { node = child; }
+                _ => break,
+            }
+        }
+        node
     }
 
     pub(super) fn update_highlight(&mut self) {

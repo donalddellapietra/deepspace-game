@@ -173,8 +173,58 @@ impl App {
                 Err(e) => log::error!("Render error: {e:?}"),
             }
         }
+
+        // Test driver runs AFTER the frame so the captured image
+        // reflects what just rendered.
+        self.tick_test_runner_after_frame();
+
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+}
+
+impl App {
+    fn tick_test_runner_after_frame(&mut self) {
+        // Borrow checker: collect commands into a local first.
+        let (due, frame, frame_budget_done, timed_out, exit_after, screenshot) = {
+            let Some(test) = self.test.as_mut() else { return };
+            test.frame += 1;
+            let frame = test.frame;
+            let due = test.drain_due();
+            let frame_budget_done = frame + 1 >= test.exit_after_frames;
+            let timed_out = test.timed_out();
+            let exit_after = test.exit_after_frames;
+            let screenshot = test.screenshot_path.clone();
+            (due, frame, frame_budget_done, timed_out, exit_after, screenshot)
+        };
+        for cmd in due {
+            match cmd {
+                super::test_runner::ScriptCmd::Break => self.do_break(),
+                super::test_runner::ScriptCmd::Place => self.do_place(),
+                super::test_runner::ScriptCmd::Wait(_) => {}
+            }
+        }
+        if let Some(path) = screenshot {
+            let already_done = self.test.as_ref().is_some_and(|t| t.screenshot_done);
+            if !already_done && (frame_budget_done || timed_out) {
+                if let Some(r) = &mut self.renderer {
+                    match r.capture_to_png(&path) {
+                        Ok(()) => eprintln!("test_runner: screenshot saved to {path}"),
+                        Err(e) => eprintln!("test_runner: screenshot failed: {e}"),
+                    }
+                }
+                if let Some(t) = self.test.as_mut() {
+                    t.screenshot_done = true;
+                }
+            }
+        }
+        if timed_out {
+            eprintln!("test_runner: timeout reached at frame {frame}, quitting");
+            std::process::exit(0);
+        } else if frame >= exit_after {
+            eprintln!("test_runner: exit_after_frames={frame} reached, quitting");
+            std::process::exit(0);
         }
     }
 }
