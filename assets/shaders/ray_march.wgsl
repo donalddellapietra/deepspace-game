@@ -235,7 +235,15 @@ fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
-    for (var d: u32 = 1u; d <= 22u; d = d + 1u) {
+    // Cap descent at the player's edit depth (`uniforms.max_depth`)
+    // so the body DDA's stride is `1 / 3^cap` — small enough to
+    // cross the shell within `max_body_steps` while still showing
+    // visible voxel granularity. Hard wall at 12 keeps every per-
+    // pixel loop bounded for f32 precision and perf safety; deeper
+    // detail at higher zoom needs the per-pixel LOD work the spec
+    // describes (deferred).
+    let max_d = min(min(uniforms.max_depth, 22u), 12u);
+    for (var d: u32 = 1u; d <= max_d; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -244,13 +252,20 @@ fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u
         let tag = child_tag(packed);
         if tag == 0u { return vec2<u32>(0u, d); }
         if tag == 1u { return vec2<u32>(child_block_type(packed), d); }
-        // tag == 2u: descend.
+        // tag == 2u: at the depth cap, use the child's representative
+        // block as the LOD leaf (`bt == 255` means all-empty, which
+        // surfaces as Empty). Otherwise descend.
+        if d == max_d {
+            let bt = child_block_type(packed);
+            if bt < 255u { return vec2<u32>(bt, d); }
+            return vec2<u32>(0u, d);
+        }
         node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
     }
-    return vec2<u32>(0u, 22u);
+    return vec2<u32>(0u, max_d);
 }
 
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
