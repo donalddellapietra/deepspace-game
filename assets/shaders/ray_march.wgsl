@@ -702,10 +702,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         camera.forward + camera.right * ndc.x + camera.up * ndc.y
     );
 
-    let result = march(camera.pos, ray_dir);
-
-    // Sphere rendering lives inside `march()` now — the old
-    // uniform-driven cs_planet path in fs_main is gone.
+    // Dynamic render root: the GPU tree may be packed starting at any
+    // ancestor of the camera. If that ancestor IS a `CubedSphereBody`
+    // (happens when the camera's depth puts the render frame exactly
+    // at the body level), the body fills the entire render cell and
+    // we dispatch the sphere DDA directly here — there's no parent
+    // Cartesian march to descend into it from.
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    let root_kind = kinds[uniforms.root_index];
+    if root_kind.tag == 1u {
+        let body_hit = march_sphere_body(
+            uniforms.root_index,
+            vec3<f32>(0.0),
+            3.0,
+            root_kind.inner_r,
+            root_kind.outer_r,
+            camera.pos,
+            ray_dir,
+        );
+        result = body_hit;
+    } else {
+        result = march(camera.pos, ray_dir);
+    }
 
     var color: vec3<f32>;
     if result.hit {
