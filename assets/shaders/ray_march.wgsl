@@ -453,29 +453,55 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.normal = normal;
             return result;
         } else {
-            // tag == 2u: Node child. Look up its kind.
+            // tag == 2u: Node child. DIAGNOSTIC — paint EVERY Node
+            // child cell magenta to verify the walker reaches this
+            // branch at all. If yellow background remains and no
+            // magenta appears anywhere, the walker is never seeing
+            // tag=2 in the body cell — likely a bigger pack /
+            // BFS / buffer bug.
+            let child_idx = child_node_index(s_node_idx[depth], slot);
+            let kind = node_kinds[child_idx].kind;
+            let body_origin_dbg = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
+            let body_size_dbg = s_cell_size[depth];
+            let cell_box_dbg = ray_box(ray_origin, inv_dir,
+                                       body_origin_dbg,
+                                       body_origin_dbg + vec3<f32>(body_size_dbg));
+            result.hit = true;
+            result.t = max(cell_box_dbg.t_enter, 0.0);
+            // Color encodes which kind we read (so we can tell):
+            //   kind=0 (Cartesian)         → cyan
+            //   kind=1 (CubedSphereBody)   → magenta
+            //   kind=2 (CubedSphereFace)   → orange
+            //   else                       → white
+            if kind == 0u {
+                result.color = vec3<f32>(0.0, 1.0, 1.0);
+            } else if kind == 1u {
+                result.color = vec3<f32>(1.0, 0.0, 1.0);
+            } else if kind == 2u {
+                result.color = vec3<f32>(1.0, 0.5, 0.0);
+            } else {
+                result.color = vec3<f32>(1.0, 1.0, 1.0);
+            }
+            result.normal = normal;
+            return result;
+        }
+        if false {
+            // ORIGINAL Node branch (re-enable after diagnostic):
             let child_idx = child_node_index(s_node_idx[depth], slot);
             let kind = node_kinds[child_idx].kind;
 
             if kind == 1u {
-                // CubedSphereBody: dispatch sphere DDA in this body's cell.
-                //
-                // DIAGNOSTIC (remove once dispatch is verified): paint the
-                // entry face of the body cell BRIGHT MAGENTA. If you see
-                // magenta where the planet should be, NodeKind dispatch
-                // is firing correctly; if you still see stone, the
-                // dispatch is broken (the walker is descending into the
-                // body's children Cartesian-style).
                 let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
                 let body_size = s_cell_size[depth];
-                let cell_box_h = ray_box(ray_origin, inv_dir,
-                                         body_origin,
-                                         body_origin + vec3<f32>(body_size));
-                result.hit = true;
-                result.t = max(cell_box_h.t_enter, 0.0);
-                result.color = vec3<f32>(1.0, 0.0, 1.0);
-                result.normal = normal;
-                return result;
+                let inner_r = node_kinds[child_idx].inner_r;
+                let outer_r = node_kinds[child_idx].outer_r;
+                let sph = sphere_in_cell(
+                    child_idx, body_origin, body_size,
+                    inner_r, outer_r, ray_origin, ray_dir,
+                );
+                if sph.hit { return sph; }
+                // ... advance DDA ...
+                continue;
             }
             if false {
                 // Real path (re-enable after diagnostic confirms dispatch):
@@ -596,6 +622,34 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // DIAGNOSTIC: bypass ray-march entirely and paint the screen
+    // based on what `node_kinds[1].kind` reads as. CPU verified
+    // `kinds[1].kind == 1` (CubedSphereBody). If the GPU sees:
+    //   - RED: kind == 1 → buffer plumbing is fine, the bug is
+    //     in the dispatch logic of the tree DDA.
+    //   - BLUE: kind == 0 → buffer reads as Cartesian; either
+    //     wrong index, wrong layout, or the body's kind isn't
+    //     making it to the GPU.
+    //   - GREEN: kind == 2 → reading a face's kind at index 1.
+    //   - WHITE: kind value out of range.
+    //   - BLACK: node_count uniform shows zero — uniforms broken.
+    if uniforms.node_count > 1u {
+        let k1 = node_kinds[1].kind;
+        if k1 == 1u {
+            return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+        } else if k1 == 0u {
+            return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+        } else if k1 == 2u {
+            return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+        } else {
+            return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        }
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main_disabled(in: VertexOutput) -> @location(0) vec4<f32> {
     let aspect = uniforms.screen_width / uniforms.screen_height;
     let half_fov_tan = tan(camera.fov * 0.5);
     let ndc = vec2<f32>(
