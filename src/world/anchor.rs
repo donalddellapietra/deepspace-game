@@ -720,6 +720,160 @@ mod tests {
     }
 
     #[test]
+    fn offset_from_camera_at_spawn_matches_pre_refactor() {
+        // The exact scenario the shader sees on boot. Camera spawned
+        // 0.82 world above the planet's north pole; cs_oc must be
+        // `(0, 0.82, 0)` to single-precision regardless of which
+        // anchor depth the camera sits at.
+        let planet = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
+        for cam_depth in [4u8, 8, 12, 13, 16, 18] {
+            let cam = WorldPos::from_world_xyz([1.5, 2.32, 1.5], cam_depth);
+            let oc = cam.offset_from(&planet);
+            assert!(oc[0].abs() < 1e-4, "depth {cam_depth}: oc.x = {}", oc[0]);
+            assert!((oc[1] - 0.82).abs() < 1e-4,
+                "depth {cam_depth}: oc.y = {}", oc[1]);
+            assert!(oc[2].abs() < 1e-4, "depth {cam_depth}: oc.z = {}", oc[2]);
+        }
+    }
+
+    #[test]
+    fn offset_from_after_zoom_chain_matches_baseline() {
+        // The user's flow: spawn at depth 16, scroll out 7 times to
+        // layer 9 (anchor depth 13). cs_oc must be identical to a
+        // freshly constructed depth-13 camera at the same world XYZ.
+        let planet = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
+        let mut cam = WorldPos::from_world_xyz([1.5, 2.32, 1.5], 16);
+        for _ in 0..7 { cam.zoom_out(); }
+        assert_eq!(cam.anchor.depth(), 9);
+        let baseline = WorldPos::from_world_xyz([1.5, 2.32, 1.5], 9);
+        let oc_chained = cam.offset_from(&planet);
+        let oc_baseline = baseline.offset_from(&planet);
+        for i in 0..3 {
+            assert!(
+                (oc_chained[i] - oc_baseline[i]).abs() < 1e-4,
+                "axis {}: chained {} vs baseline {}",
+                i, oc_chained[i], oc_baseline[i],
+            );
+        }
+        assert!(oc_chained[1].abs() > 0.5,
+            "oc.y collapsed to 0 after zoom chain — sphere would be invisible");
+    }
+
+    #[test]
+    fn offset_from_self_is_zero() {
+        for d in [1u8, 4, 8, 12, 16] {
+            let p = WorldPos::from_world_xyz([1.5, 2.0, 0.7], d);
+            let o = p.offset_from(&p);
+            for v in o {
+                assert!(v.abs() < 1e-6, "depth {}: o = {:?}", d, o);
+            }
+        }
+    }
+
+    #[test]
+    fn offset_from_is_antisymmetric() {
+        let a = WorldPos::from_world_xyz([1.5, 2.0, 0.7], 8);
+        let b = WorldPos::from_world_xyz([0.5, 1.5, 1.5], 8);
+        let ab = a.offset_from(&b);
+        let ba = b.offset_from(&a);
+        for i in 0..3 {
+            assert!((ab[i] + ba[i]).abs() < 1e-5,
+                "axis {}: ab={} ba={}", i, ab[i], ba[i]);
+        }
+    }
+
+    #[test]
+    fn offset_from_satisfies_triangle_equality() {
+        let a = WorldPos::from_world_xyz([0.5, 1.5, 1.5], 6);
+        let b = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 6);
+        let c = WorldPos::from_world_xyz([2.0, 1.5, 1.5], 6);
+        let ac = a.offset_from(&c);
+        let ab = a.offset_from(&b);
+        let bc = b.offset_from(&c);
+        for i in 0..3 {
+            let sum = ab[i] + bc[i];
+            assert!((ac[i] - sum).abs() < 1e-5,
+                "axis {}: ac={} ab+bc={}", i, ac[i], sum);
+        }
+    }
+
+    #[test]
+    fn offset_from_invariant_under_anchor_depth() {
+        let world = [1.5, 2.0, 0.7];
+        let target = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
+        let baseline = WorldPos::from_world_xyz(world, 4).offset_from(&target);
+        for depth in [4u8, 6, 8, 12, 16, 20] {
+            let p = WorldPos::from_world_xyz(world, depth);
+            let o = p.offset_from(&target);
+            for i in 0..3 {
+                assert!(
+                    (o[i] - baseline[i]).abs() < 1e-5,
+                    "depth {}: axis {}: {} vs baseline {}",
+                    depth, i, o[i], baseline[i],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_in_then_zoom_out_preserves_world_xyz() {
+        let mut p = WorldPos::from_world_xyz([1.234, 2.345, 0.567], 4);
+        let before = p.to_world_xyz();
+        for _ in 0..16 { p.zoom_in(); }
+        for _ in 0..16 { p.zoom_out(); }
+        let after = p.to_world_xyz();
+        for i in 0..3 {
+            assert!((after[i] - before[i]).abs() < 1e-4,
+                "axis {}: {} -> {}", i, before[i], after[i]);
+        }
+    }
+
+    #[test]
+    fn many_zoom_ins_preserve_world_xyz() {
+        let mut p = WorldPos::from_world_xyz([1.234, 2.345, 0.567], 4);
+        let before = p.to_world_xyz();
+        for k in 0..15 {
+            p.zoom_in();
+            let after = p.to_world_xyz();
+            for i in 0..3 {
+                assert!((after[i] - before[i]).abs() < 1e-4,
+                    "after {} zoom_ins, axis {}: {} -> {}",
+                    k + 1, i, before[i], after[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn deepened_to_preserves_world_xyz() {
+        for d in [4u8, 6, 8, 12, 16, 20] {
+            let p = WorldPos::from_world_xyz([1.234, 2.345, 0.567], 4);
+            let q = p.deepened_to(d);
+            let a = p.to_world_xyz();
+            let b = q.to_world_xyz();
+            for i in 0..3 {
+                assert!((a[i] - b[i]).abs() < 1e-4,
+                    "depth {}: axis {}: {} vs {}", d, i, a[i], b[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn deepened_offset_from_matches_base() {
+        let target = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
+        let base = WorldPos::from_world_xyz([1.5, 2.0, 0.7], 4);
+        let base_o = base.offset_from(&target);
+        for d in [4u8, 6, 8, 12, 16, 20] {
+            let deeper = base.deepened_to(d);
+            let o = deeper.offset_from(&target);
+            for i in 0..3 {
+                assert!((o[i] - base_o[i]).abs() < 1e-5,
+                    "depth {}: axis {}: {} vs base {}",
+                    d, i, o[i], base_o[i]);
+            }
+        }
+    }
+
+    #[test]
     fn offset_from_matches_world_diff_at_shallow_anchors() {
         let a = WorldPos::from_world_xyz([2.5, 0.25, 1.5], 4);
         let b = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
