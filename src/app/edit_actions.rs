@@ -20,18 +20,23 @@ impl App {
     }
 
     /// Face-subtree depth at which sphere edits land — picks a
-    /// user-visible cell granularity instead of the planet's
-    /// deepest sub-pixel resolution. Without this cap the walker
-    /// descends all 20 face-subtree levels and breaks/places
-    /// modify cells smaller than a pixel — they succeed but are
-    /// invisible. Mirrors the old `cs_edit_depth = 4 + (15 -
-    /// zoom_level)` formula, clamped to `[1, 14]`.
+    /// user-visible cell granularity. Formula: anchor_depth - 4
+    /// (4 layers of headroom between visible scale and edit
+    /// scale). Lower bound 1 (can't edit at the body root).
     ///
-    /// The 14 cap is tactical and disappears with the unified
-    /// driver refactor (camera-precision via virtual-root + face
-    /// DDA in cell-local frames).
+    /// Upper bound is now `MAX_DEPTH` rather than the historical
+    /// 14, because:
+    ///
+    /// - The face DDA boundaries are Kahan-compensated (precision
+    ///   ~1 ULP regardless of depth).
+    /// - The CPU raycast runs in frame-local coords with ribbon
+    ///   ascent (cell precision bounded by frame depth, not
+    ///   absolute path).
+    /// - The shader's ribbon pop keeps `ray_dir` unit so the
+    ///   1e-8 parallel-axis check no longer underflows.
     pub(super) fn cs_edit_depth(&self) -> u32 {
-        ((self.anchor_depth() as i32) - 4).clamp(1, 14) as u32
+        ((self.anchor_depth() as i32) - 4)
+            .clamp(1, crate::world::tree::MAX_DEPTH as i32) as u32
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
@@ -54,14 +59,26 @@ impl App {
         );
     }
 
-    pub(super) fn do_break(&mut self) {
+    /// Cast a ray from the camera into the world using the same
+    /// frame-aware machinery as the renderer: the cpu raycast
+    /// runs in frame-local coordinates and pops upward via the
+    /// camera's anchor when it exits the frame's bubble. This is
+    /// what makes deep-zoom block placement land in the cell
+    /// that's actually under the crosshair, instead of being
+    /// pinned to the f32-precision wall of world XYZ.
+    pub(super) fn frame_aware_raycast(&self) -> Option<edit::HitInfo> {
         let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f32();
-        let hit = edit::cpu_raycast_with_face_depth(
+        let (frame, _) = self.render_frame();
+        let cam_local = self.camera.position.in_frame(&frame);
+        edit::cpu_raycast_in_frame(
             &self.world.library, self.world.root,
-            camera_pos, ray_dir, self.edit_depth(),
-            self.cs_edit_depth(),
-        );
+            frame.as_slice(), cam_local, ray_dir,
+            self.edit_depth(), self.cs_edit_depth(),
+        )
+    }
+
+    pub(super) fn do_break(&mut self) {
+        let hit = self.frame_aware_raycast();
         eprintln!("do_break: hit={:?}",
             hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
         let Some(hit) = hit else { return };
@@ -95,13 +112,7 @@ impl App {
     }
 
     pub(super) fn do_place(&mut self) {
-        let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f32();
-        let hit = edit::cpu_raycast_with_face_depth(
-            &self.world.library, self.world.root,
-            camera_pos, ray_dir, self.edit_depth(),
-            self.cs_edit_depth(),
-        );
+        let hit = self.frame_aware_raycast();
         eprintln!("do_place: hit={:?}",
             hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
         let Some(hit) = hit else { return };
@@ -210,13 +221,7 @@ impl App {
             }
             return;
         }
-        let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f32();
-        let tree_hit = edit::cpu_raycast_with_face_depth(
-            &self.world.library, self.world.root,
-            camera_pos, ray_dir, self.edit_depth(),
-            self.cs_edit_depth(),
-        );
+        let tree_hit = self.frame_aware_raycast();
         let aabb_world = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
         // Transform AABB from world coords to frame-local coords.
         // Shader expects highlight in the same frame as `camera.pos`.

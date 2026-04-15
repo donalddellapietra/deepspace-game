@@ -758,8 +758,14 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         let sx = i32(s % 3u);
         let sy = i32((s / 3u) % 3u);
         let sz = i32(s / 9u);
+        // Pop transform: scale ORIGIN by 1/3 + integer offset, but
+        // KEEP `ray_dir` at unit magnitude. Earlier versions divided
+        // dir by 3 to preserve t-units; that underflowed the
+        // 1e-8 parallel-axis check after ~17 pops. Now `t` is no
+        // longer continuous across frames — each frame's DDA runs
+        // its own t starting from where the ray entered.
         ray_origin = vec3<f32>(f32(sx), f32(sy), f32(sz)) + ray_origin / 3.0;
-        ray_dir = ray_dir / 3.0;
+        // ray_dir unchanged.
         current_idx = entry.node_idx;
         let k = node_kinds[current_idx].kind;
         if k == 1u {
