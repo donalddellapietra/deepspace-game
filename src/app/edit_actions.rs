@@ -32,31 +32,58 @@ impl App {
         self.tree_depth as i32 - self.edit_depth() as i32
     }
 
-    /// Node id of the "render root" — the ancestor whose subtree the
-    /// GPU walks each frame. Today this is always the tree root. Step
-    /// 5 introduces the concept so the plumbing can later pick a
-    /// smaller ancestor for precision (see §3a of
-    /// refactor-decisions.md).
-    pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
-        self.world.root
-    }
-
-    /// Depth (number of leading slots in the camera's path) that sits
-    /// above the render root. `0` means the render root is the tree
-    /// root itself. Paired with
-    /// [`Position::pos_in_ancestor_frame`](crate::world::position::Position::pos_in_ancestor_frame).
+    /// How many leading slots of the camera's path sit above the
+    /// render root.
+    ///
+    /// Pinned `K` levels above the camera so the shader's `[0, 3)³`
+    /// traversal volume stays in a small f32 magnitude regardless of
+    /// camera depth — that's what removes the per-layer "absolute
+    /// coords" jitter & precision wall.
+    ///
+    /// Capped at the body node's tree depth (`PLANET_BODY_DEPTH`)
+    /// so the render root never descends INSIDE a face subtree.
+    /// Inside a face subtree the shader can only see the immediate
+    /// neighborhood of the camera (mostly empty above the SDF surface),
+    /// so the planet would render as plain sky. Capping at body depth
+    /// keeps the whole sphere in the packed subtree and lets the
+    /// shader's `kinds[root]==1 → march_sphere_body` dispatch handle
+    /// the entire planet from one render call.
     pub(super) fn render_root_depth(&self) -> u8 {
-        0
+        const RENDER_FRAME_K: u8 = 3;
+        const PLANET_BODY_DEPTH: u8 = 1;
+        let desired = self.camera.position.depth.saturating_sub(RENDER_FRAME_K);
+        desired.min(PLANET_BODY_DEPTH)
     }
 
-    /// Camera position expressed in the render root's local `[0, 3)³`
-    /// frame. This is the path-native replacement for
-    /// `camera.world_pos()` at upload sites; they produce the same
-    /// numbers today because `render_root_depth() == 0`.
+    /// NodeId of the render root — walks `camera.position.path[..]`
+    /// from the tree root via NodeKind-aware indexing (the camera's
+    /// path was built by `from_world_pos_in_tree` so each slot
+    /// resolves to the correct node at every level). Falls back to
+    /// `world.root` if the walk hits a non-Node slot.
+    pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
+        use crate::world::tree::Child;
+        let target = self.render_root_depth() as usize;
+        let mut id = self.world.root;
+        for k in 0..target {
+            let Some(node) = self.world.library.get(id) else { return self.world.root };
+            let slot = self.camera.position.path[k] as usize;
+            match node.children[slot] {
+                Child::Node(child) => id = child,
+                _ => return self.world.root,
+            }
+        }
+        id
+    }
+
+    /// Camera XYZ in the render root's local `[0, 3)³` frame.
+    /// NodeKind-aware: passing through a body ancestor reconstructs
+    /// the cartesian XYZ inside the body cell via sphere geometry.
     pub(super) fn camera_pos_in_render_frame(&self) -> [f32; 3] {
-        self.camera
-            .position
-            .pos_in_ancestor_frame(self.render_root_depth())
+        self.camera.position.pos_in_ancestor_frame_in_tree(
+            self.render_root_depth(),
+            &self.world.library,
+            self.world.root,
+        )
     }
 
     /// GPU visual depth: edit_depth + 3 (see 27×27×27 detail).
@@ -80,8 +107,8 @@ impl App {
         }
         let vd = self.visual_depth();
         self.ui.zoom_level = self.zoom_level();
-        let frame_depth = self.render_root_depth();
-        let gpu_cam = self.camera.gpu_camera(1.2, frame_depth);
+        let pos = self.camera_pos_in_render_frame();
+        let gpu_cam = self.camera.gpu_camera(1.2, pos);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
             renderer.update_camera(&gpu_cam);
@@ -222,10 +249,6 @@ impl App {
     /// Re-pack and upload the tree with LOD culling based on camera position.
     /// Called every frame so distant terrain stays flattened as the camera moves.
     pub(super) fn upload_tree_lod(&mut self) {
-        // Pack the Cartesian space tree and (if present) the 6 face
-        // subtrees of the spherical demo planet into one GPU buffer
-        // in a single pass, so the shader can look up any of them by
-        // buffer index.
         let mut roots: Vec<u64> = vec![self.render_root_id()];
         if let Some(p) = self.cs_planet.as_ref() {
             roots.extend_from_slice(&p.face_roots);
@@ -246,6 +269,47 @@ impl App {
                 ];
                 renderer.set_face_roots(face_roots);
             }
+        }
+        // The `cs_planet` uniform is in WHATEVER frame the shader is
+        // rendering in. With dynamic render frame the shader's
+        // `[0, 3)³` traversal volume is the render-root cell, not
+        // tree root, so the planet center / radii must be shifted
+        // and scaled into that frame each frame.
+        self.upload_cs_planet_in_render_frame();
+    }
+
+    /// Recompute `cs_planet` and `cs_params` uniforms in the render
+    /// root's `[0, 3)³` frame and upload them. The shader's sphere
+    /// DDA uses these values; if they don't match the camera's frame
+    /// the ray and the sphere live in different worlds.
+    fn upload_cs_planet_in_render_frame(&mut self) {
+        let rrd = self.render_root_depth() as usize;
+        let path = self.camera.position.path;
+        let (planet_center, planet_inner, planet_outer, planet_depth) =
+            match self.cs_planet.as_ref() {
+                Some(p) => (p.center, p.inner_r, p.outer_r, p.depth),
+                None => return,
+            };
+        let mut origin = [0.0f64; 3];
+        let mut cell_size_world = 1.0f64;
+        for k in 0..rrd {
+            let (sx, sy, sz) = crate::world::tree::slot_coords(path[k] as usize);
+            origin[0] += sx as f64 * cell_size_world;
+            origin[1] += sy as f64 * cell_size_world;
+            origin[2] += sz as f64 * cell_size_world;
+            cell_size_world /= 3.0;
+        }
+        let render_extent_world = if rrd == 0 { 3.0 } else { cell_size_world * 3.0 };
+        let scale = 3.0 / render_extent_world;
+        let center_render = [
+            ((planet_center[0] as f64 - origin[0]) * scale) as f32,
+            ((planet_center[1] as f64 - origin[1]) * scale) as f32,
+            ((planet_center[2] as f64 - origin[2]) * scale) as f32,
+        ];
+        let outer_render = (planet_outer as f64 * scale) as f32;
+        let inner_render = (planet_inner as f64 * scale) as f32;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_cubed_sphere_planet(center_render, inner_render, outer_render, planet_depth);
         }
     }
 

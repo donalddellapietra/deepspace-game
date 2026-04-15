@@ -12,8 +12,17 @@
 //! dispatch only; `NodeKind`-aware dispatch arrives in step 2.
 
 use crate::world::tree::{
-    slot_coords, slot_index, NodeKind, NodeLibrary, CHILDREN_PER_NODE, MAX_DEPTH,
+    slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary,
+    CHILDREN_PER_NODE, MAX_DEPTH,
 };
+
+/// Body-face-center slot indices, indexed by `cubesphere::Face as u8`.
+/// Order: +X, −X, +Y, −Y, +Z, −Z. Same table the shader uses.
+const FACE_CENTER_SLOTS: [u8; 6] = [14, 12, 16, 10, 22, 4];
+
+fn slot_to_face(slot: u8) -> Option<u8> {
+    FACE_CENTER_SLOTS.iter().position(|&s| s == slot).map(|i| i as u8)
+}
 
 // -------------------------------------------------------------- position
 
@@ -244,6 +253,110 @@ impl Position {
         Self { path, depth, offset }
     }
 
+    /// NodeKind-aware path construction. Walks the actual tree from
+    /// `tree_root`, dispatching subdivision on each node's `NodeKind`:
+    /// at a `CubedSphereBody` the Cartesian offset is converted to
+    /// `(face, un, vn, rn)` via sphere geometry and the path
+    /// descends into the corresponding face-center child; everywhere
+    /// else does standard base-3 subdivision (the arithmetic is
+    /// identical for `Cartesian` and `CubedSphereFace` — only the
+    /// axis interpretation differs).
+    ///
+    /// Returns a Position whose path correctly indexes the node the
+    /// camera is inside at every level — usable as a render-frame
+    /// anchor without the "walking through a face subtree as if it
+    /// were Cartesian" garbage that vanilla `from_world_pos`
+    /// produces.
+    pub fn from_world_pos_in_tree(
+        pos: [f32; 3],
+        target_depth: u8,
+        library: &NodeLibrary,
+        tree_root: NodeId,
+    ) -> Self {
+        let d = target_depth as usize;
+        assert!(d <= MAX_DEPTH);
+        let mut path = [0u8; MAX_DEPTH];
+        let clamp_hi = 1.0 - f32::EPSILON;
+        let mut offset = [
+            (pos[0] / 3.0).clamp(0.0, clamp_hi),
+            (pos[1] / 3.0).clamp(0.0, clamp_hi),
+            (pos[2] / 3.0).clamp(0.0, clamp_hi),
+        ];
+        let mut current_id = tree_root;
+        for k in 0..d {
+            let Some(node) = library.get(current_id) else { break };
+            let slot = match node.kind {
+                NodeKind::Cartesian | NodeKind::CubedSphereFace { .. } => {
+                    subdivide_in_place(&mut offset)
+                }
+                NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                    subdivide_body(&mut offset, inner_r, outer_r)
+                }
+            };
+            path[k] = slot;
+            match node.children[slot as usize] {
+                Child::Node(child) => current_id = child,
+                _ => break,
+            }
+        }
+        Self { path, depth: target_depth, offset }
+    }
+
+    /// NodeKind-aware reverse: reconstruct camera XYZ in the frame
+    /// of an ancestor node, dispatching on each node's kind on the
+    /// way down. At a body ancestor, the path's face-center slot
+    /// plus accumulated `(un, vn, rn)` decode to body-local XYZ via
+    /// sphere geometry. Returned XYZ is in the ancestor's `[0, 3)³`.
+    pub fn pos_in_ancestor_frame_in_tree(
+        &self,
+        ancestor_depth: u8,
+        library: &NodeLibrary,
+        tree_root: NodeId,
+    ) -> [f32; 3] {
+        let d = self.depth as usize;
+        let a = ancestor_depth as usize;
+        assert!(a <= d);
+        if d == a {
+            return [
+                self.offset[0] * 3.0,
+                self.offset[1] * 3.0,
+                self.offset[2] * 3.0,
+            ];
+        }
+        // Walk down `path[0..d]` collecting kinds at every level.
+        let mut kinds = [NodeKind::Cartesian; MAX_DEPTH];
+        let mut current_id = tree_root;
+        for k in 0..d {
+            let Some(node) = library.get(current_id) else { break };
+            kinds[k] = node.kind;
+            match node.children[self.path[k] as usize] {
+                Child::Node(child) => current_id = child,
+                _ => break,
+            }
+        }
+        // Reverse fold: at each level, decode (slot, child_offset)
+        // back to a parent-cell offset. Body ancestors use sphere
+        // math; everything else is base-3 inverse.
+        let mut child_offset = self.offset;
+        for k in (a..d).rev() {
+            let slot = self.path[k];
+            child_offset = match kinds[k] {
+                NodeKind::Cartesian | NodeKind::CubedSphereFace { .. } => {
+                    let (sx, sy, sz) = slot_coords(slot as usize);
+                    [
+                        (sx as f32 + child_offset[0]) / 3.0,
+                        (sy as f32 + child_offset[1]) / 3.0,
+                        (sz as f32 + child_offset[2]) / 3.0,
+                    ]
+                }
+                NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                    unbody(slot, child_offset, inner_r, outer_r)
+                }
+            };
+        }
+        [child_offset[0] * 3.0, child_offset[1] * 3.0, child_offset[2] * 3.0]
+    }
+
     /// Integrate a velocity step: `offset += delta`, then carry across
     /// cell boundaries via [`carry_axis`]. Clamps at the tree root if
     /// the carry bubbles past it.
@@ -400,6 +513,117 @@ fn resolve_parent_node(
         }
     }
     Some(current)
+}
+
+/// Standard base-3 subdivision (`offset ∈ [0, 1)³` → slot + child
+/// offset). Used by `from_world_pos_in_tree` for Cartesian and
+/// CubedSphereFace nodes (subdivision math identical; axis meaning
+/// is the kind's concern).
+fn subdivide_in_place(offset: &mut [f32; 3]) -> u8 {
+    let mut coords = [0usize; 3];
+    for axis in 0..3 {
+        let v = offset[axis] * 3.0;
+        let i = (v.floor() as i32).clamp(0, 2) as usize;
+        coords[axis] = i;
+        offset[axis] = v - i as f32;
+        if offset[axis] >= 1.0 {
+            offset[axis] = 0.0;
+            coords[axis] = (coords[axis] + 1).min(2);
+        } else if offset[axis] < 0.0 {
+            offset[axis] = 0.0;
+        }
+    }
+    slot_index(coords[0], coords[1], coords[2]) as u8
+}
+
+/// CubedSphereBody subdivision: convert Cartesian offset in
+/// `[0, 1)³` to `(face, un, vn, rn)` via sphere geometry, set
+/// `offset = (un, vn, rn)`, return the body-level slot holding that
+/// face subtree. Out-of-shell points fall back to the center slot
+/// (interior filler) with Cartesian subdivision.
+fn subdivide_body(offset: &mut [f32; 3], inner_r: f32, outer_r: f32) -> u8 {
+    let local = [offset[0] - 0.5, offset[1] - 0.5, offset[2] - 0.5];
+    let r2 = local[0].powi(2) + local[1].powi(2) + local[2].powi(2);
+    let r = r2.sqrt();
+    if r < inner_r || r >= outer_r {
+        for axis in 0..3 {
+            offset[axis] = (offset[axis] * 3.0 - 1.0).clamp(0.0, 1.0 - f32::EPSILON);
+        }
+        return slot_index(1, 1, 1) as u8;
+    }
+    let inv_r = 1.0 / r;
+    let dir = [local[0] * inv_r, local[1] * inv_r, local[2] * inv_r];
+    let ax = dir[0].abs(); let ay = dir[1].abs(); let az = dir[2].abs();
+    let (face, cube_u, cube_v) = if ax >= ay && ax >= az {
+        if dir[0] > 0.0 { (0u8, -dir[2] / ax, dir[1] / ax) }
+        else            { (1u8,  dir[2] / ax, dir[1] / ax) }
+    } else if ay >= az {
+        if dir[1] > 0.0 { (2u8, dir[0] / ay, -dir[2] / ay) }
+        else            { (3u8, dir[0] / ay,  dir[2] / ay) }
+    } else if dir[2] > 0.0 { (4u8,  dir[0] / az, dir[1] / az) }
+        else               { (5u8, -dir[0] / az, dir[1] / az) };
+    let u_ea = cube_to_ea(cube_u);
+    let v_ea = cube_to_ea(cube_v);
+    let un = ((u_ea + 1.0) * 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+    let vn = ((v_ea + 1.0) * 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+    let rn = ((r - inner_r) / (outer_r - inner_r)).clamp(0.0, 1.0 - f32::EPSILON);
+    offset[0] = un;
+    offset[1] = vn;
+    offset[2] = rn;
+    FACE_CENTER_SLOTS[face as usize]
+}
+
+/// Reverse of [`subdivide_body`]: given a body slot + child's
+/// `(un, vn, rn)` in `[0, 1)³`, return body-cell-local Cartesian XYZ
+/// in `[0, 1)³`.
+fn unbody(body_slot: u8, child: [f32; 3], inner_r: f32, outer_r: f32) -> [f32; 3] {
+    match slot_to_face(body_slot) {
+        Some(face) => {
+            let u_ea = child[0] * 2.0 - 1.0;
+            let v_ea = child[1] * 2.0 - 1.0;
+            let cube_u = ea_to_cube(u_ea);
+            let cube_v = ea_to_cube(v_ea);
+            let (n_ax, u_ax, v_ax) = face_basis(face);
+            let cube_pt = [
+                n_ax[0] + cube_u * u_ax[0] + cube_v * v_ax[0],
+                n_ax[1] + cube_u * u_ax[1] + cube_v * v_ax[1],
+                n_ax[2] + cube_u * u_ax[2] + cube_v * v_ax[2],
+            ];
+            let mag = (cube_pt[0].powi(2) + cube_pt[1].powi(2) + cube_pt[2].powi(2)).sqrt();
+            let dir = if mag > 1e-12 {
+                [cube_pt[0] / mag, cube_pt[1] / mag, cube_pt[2] / mag]
+            } else { n_ax };
+            let r = inner_r + child[2] * (outer_r - inner_r);
+            [
+                (0.5 + dir[0] * r).clamp(0.0, 1.0 - f32::EPSILON),
+                (0.5 + dir[1] * r).clamp(0.0, 1.0 - f32::EPSILON),
+                (0.5 + dir[2] * r).clamp(0.0, 1.0 - f32::EPSILON),
+            ]
+        }
+        None => {
+            let (sx, sy, sz) = slot_coords(body_slot as usize);
+            [
+                (sx as f32 + child[0]) / 3.0,
+                (sy as f32 + child[1]) / 3.0,
+                (sz as f32 + child[2]) / 3.0,
+            ]
+        }
+    }
+}
+
+#[inline] fn cube_to_ea(c: f32) -> f32 { c.atan() * (4.0 / std::f32::consts::PI) }
+#[inline] fn ea_to_cube(e: f32) -> f32 { (e * std::f32::consts::FRAC_PI_4).tan() }
+
+fn face_basis(face: u8) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    // (normal, u_axis, v_axis) — matches `cubesphere::Face::tangents`.
+    match face {
+        0 => ([ 1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+        1 => ([-1.0, 0.0, 0.0], [0.0, 0.0,  1.0], [0.0, 1.0, 0.0]),
+        2 => ([0.0,  1.0, 0.0], [1.0, 0.0,  0.0], [0.0, 0.0, -1.0]),
+        3 => ([0.0, -1.0, 0.0], [1.0, 0.0,  0.0], [0.0, 0.0,  1.0]),
+        4 => ([0.0, 0.0,  1.0], [1.0, 0.0,  0.0], [0.0, 1.0, 0.0]),
+        _ => ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    }
 }
 
 /// Shift `pos` by `amount` cells along `axis`, carrying through

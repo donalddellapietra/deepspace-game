@@ -83,14 +83,15 @@ impl Camera {
 
     pub fn forward(&self) -> [f32; 3] { self.basis().0 }
 
-    /// Build the GPU camera block. `frame_depth` names the ancestor
-    /// whose local `[0, 3)³` frame the shader will treat as world space
-    /// — normally the render root. Caller supplies it (the camera
-    /// doesn't know what the renderer's frame is).
-    pub fn gpu_camera(&self, fov: f32, frame_depth: u8) -> GpuCamera {
+    /// Build the GPU camera block. `pos_in_frame` is the camera's
+    /// XYZ in whatever frame the shader is rendering in — normally
+    /// the render root's `[0, 3)³` cell. Caller computes it
+    /// (typically via `Position::pos_in_ancestor_frame_in_tree` so
+    /// crossings through body / face subtrees decode correctly).
+    pub fn gpu_camera(&self, fov: f32, pos_in_frame: [f32; 3]) -> GpuCamera {
         let (fwd, r, up) = self.basis();
         GpuCamera {
-            pos: self.position.pos_in_ancestor_frame(frame_depth),
+            pos: pos_in_frame,
             _pad0: 0.0,
             forward: fwd,
             _pad1: 0.0,
