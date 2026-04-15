@@ -151,20 +151,8 @@ impl App {
     /// live in [`edit_actions`]; the `ApplicationHandler` in
     /// [`event_loop`] calls them in order.
     pub(super) fn update(&mut self, dt: f32) {
-        if !self.debug_frozen {
-            player::update(
-                &mut self.camera,
-                &mut self.velocity,
-                &self.keys,
-                &self.body_anchor,
-                &self.world.library,
-                self.world.root,
-                dt,
-            );
-        } else {
-            // Frozen — still re-blend up so look smoothing stays smooth.
-            self.camera.update_up([0.0, 1.0, 0.0], dt);
-        }
+        // Debug mode: no physics. Up-vector smoothing only.
+        player::update(&mut self.camera, &mut self.velocity, dt);
 
         if let Some(renderer) = &self.renderer {
             renderer.update_camera(&self.camera.gpu_camera(1.2));

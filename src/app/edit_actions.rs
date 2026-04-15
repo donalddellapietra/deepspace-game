@@ -15,12 +15,11 @@ use crate::world::tree::{slot_coords, Child, NodeId};
 
 use super::App;
 
-/// Render-frame ancestor offset: the packed tree's root is the
-/// camera's ancestor at `camera.position.anchor.depth() - K`.
-/// K = 3 → "your cell plus three layers up" as the rendered volume.
-/// At small depths this clamps to the world root, which is unchanged
-/// from the pre-refactor behavior.
-pub(super) const RENDER_FRAME_K: u8 = 3;
+/// Render-frame ancestor offset. Set to a saturating-large value so
+/// the render root is ALWAYS the world root, regardless of camera
+/// anchor depth — zooming changes the layer the player operates at
+/// without shifting the rendered view.
+pub(super) const RENDER_FRAME_K: u8 = 255;
 
 impl App {
     /// CPU raycast depth: the camera's anchor depth. Zoom is no

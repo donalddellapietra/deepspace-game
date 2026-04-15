@@ -10,6 +10,8 @@
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
 
+use crate::player::{self, CameraDir};
+
 use super::App;
 
 impl App {
@@ -50,19 +52,70 @@ impl App {
         }
     }
 
-    /// Debug-only one-shot keys. WASD / Space / Shift go through the
-    /// continuous physics integrator in `player::update`, NOT here.
+    /// Debug-only motion: every keystroke teleports the camera
+    /// exactly one cell at its current anchor depth. Continuous
+    /// physics is OFF — there is NO motion outside these keys.
     ///
-    ///   `F` — toggle debug freeze (gravity + thrust off).
-    ///   `T` — teleport to the body's anchor cell at the camera's
-    ///         current depth (offset reset to (0.5, 0.5, 0.5)).
+    /// Bindings:
+    ///   `W` / `S` — camera-forward / -backward, snapped to nearest world axis.
+    ///   `A` / `D` — camera-left / -right, snapped likewise.
+    ///   `Space` / `Shift` — world `+Y` / `-Y`.
+    ///   `F` — toggle debug freeze (ignore movement keys).
+    ///   `T` — teleport to the body's anchor cell at the camera's depth.
+    ///   `1` / `2` / `3` — teleport to body north / south pole / center.
     fn handle_debug_motion(&mut self, code: KeyCode) {
         if code == KeyCode::KeyF {
             self.debug_frozen = !self.debug_frozen;
             log::info!("Debug freeze: {}", self.debug_frozen);
-        } else if code == KeyCode::KeyT {
-            self.teleport_to_body();
+            return;
         }
+        if self.debug_frozen { return; }
+        if code == KeyCode::KeyT { self.teleport_to_body();        return; }
+        if code == KeyCode::Digit1 { self.teleport_to_pole( 1);    return; }
+        if code == KeyCode::Digit2 { self.teleport_to_pole(-1);    return; }
+        if code == KeyCode::Digit3 { self.teleport_to_body_center(); return; }
+        let lib = &self.world.library;
+        let root = self.world.root;
+        match code {
+            KeyCode::KeyW       => player::teleport_along_camera(&mut self.camera, CameraDir::Forward,  lib, root),
+            KeyCode::KeyS       => player::teleport_along_camera(&mut self.camera, CameraDir::Backward, lib, root),
+            KeyCode::KeyA       => player::teleport_along_camera(&mut self.camera, CameraDir::Left,     lib, root),
+            KeyCode::KeyD       => player::teleport_along_camera(&mut self.camera, CameraDir::Right,    lib, root),
+            KeyCode::Space      => player::teleport_one_cell(&mut self.camera, 1,  1, lib, root),
+            KeyCode::ShiftLeft  => player::teleport_one_cell(&mut self.camera, 1, -1, lib, root),
+            _ => {}
+        }
+    }
+
+    /// Teleport directly above (`pole=+1`) or below (`-1`) the body
+    /// at the camera's current anchor depth. Lands one cell away
+    /// from the body cell along the Y axis.
+    fn teleport_to_pole(&mut self, pole: i8) {
+        use crate::world::coords::WorldPos;
+        use crate::world::tree::CENTER_SLOT;
+        let mut anchor = self.body_anchor;
+        let target_depth = self.camera.position.anchor.depth().max(self.body_anchor.depth());
+        while anchor.depth() < target_depth {
+            if !anchor.push(CENTER_SLOT as u8) { break; }
+        }
+        self.camera.position = WorldPos { anchor, offset: [0.5, 0.5, 0.5] };
+        let lib = &self.world.library;
+        let root = self.world.root;
+        let _ = self.camera.position.add_local([0.0, pole as f32 * 1.5, 0.0], lib, root);
+        log::info!("Teleport to pole {} at depth {}", pole, self.camera.position.anchor.depth());
+    }
+
+    /// Teleport to the body's anchor cell center at the camera's depth.
+    fn teleport_to_body_center(&mut self) {
+        use crate::world::coords::WorldPos;
+        use crate::world::tree::CENTER_SLOT;
+        let mut anchor = self.body_anchor;
+        let target_depth = self.camera.position.anchor.depth().max(self.body_anchor.depth());
+        while anchor.depth() < target_depth {
+            if !anchor.push(CENTER_SLOT as u8) { break; }
+        }
+        self.camera.position = WorldPos { anchor, offset: [0.5, 0.5, 0.5] };
+        log::info!("Teleport to body center at depth {}", self.camera.position.anchor.depth());
     }
 
     /// Hard-set the camera's anchor to the body's anchor cell at the
