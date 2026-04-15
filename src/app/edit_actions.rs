@@ -73,8 +73,16 @@ impl App {
             camera_pos, ray_dir, self.edit_depth(),
             self.cs_edit_depth(),
         );
-        eprintln!("do_break: hit={:?}",
-            hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
+        eprintln!(
+            "do_break: anchor_depth={}, edit_depth={}, cs_edit_depth={}, hit={:?}",
+            self.anchor_depth(), self.edit_depth(), self.cs_edit_depth(),
+            hit.as_ref().map(|h| (
+                h.path.len(),
+                h.face,
+                h.t,
+                h.place_path.as_ref().map(|p| p.len()),
+            )),
+        );
         let Some(hit) = hit else { return };
 
         if self.save_mode {
@@ -113,8 +121,16 @@ impl App {
             camera_pos, ray_dir, self.edit_depth(),
             self.cs_edit_depth(),
         );
-        eprintln!("do_place: hit={:?}",
-            hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
+        eprintln!(
+            "do_place: anchor_depth={}, edit_depth={}, cs_edit_depth={}, hit={:?}",
+            self.anchor_depth(), self.edit_depth(), self.cs_edit_depth(),
+            hit.as_ref().map(|h| (
+                h.path.len(),
+                h.face,
+                h.t,
+                h.place_path.as_ref().map(|p| p.len()),
+            )),
+        );
         let Some(hit) = hit else { return };
 
         match &self.ui.slots[self.ui.active_slot] {

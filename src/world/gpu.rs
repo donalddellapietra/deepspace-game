@@ -396,28 +396,25 @@ pub fn pack_tree_lod(
                     continue;
                 }
 
-                if !child_on_preserve && lod_active && child_is_cartesian {
-                    let (cx, cy, cz) = slot_coords(slot);
-                    let child_center = [
-                        node_origin[0] + (cx as f32 + 0.5) * cell_size,
-                        node_origin[1] + (cy as f32 + 0.5) * cell_size,
-                        node_origin[2] + (cz as f32 + 0.5) * cell_size,
-                    ];
-                    let dx = child_center[0] - camera_pos[0];
-                    let dy = child_center[1] - camera_pos[1];
-                    let dz = child_center[2] - camera_pos[2];
-                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
-                    let screen_pixels = cell_size / dist * half_fov_recip;
-                    if screen_pixels < LOD_THRESHOLD {
-                        let gpu = if child_node.representative_block < 255 {
-                            GpuChild { tag: 1, block_type: child_node.representative_block, _pad: 0, node_index: 0 }
-                        } else {
-                            GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
-                        };
-                        overrides[ordered_idx][slot] = Some(gpu);
-                        continue;
-                    }
-                }
+                // Distance LOD: REMOVED. The previous behavior
+                // flattened any cell smaller than ~0.5 pixels to its
+                // `representative_block`, which silently swallowed
+                // user-placed blocks whose ancestors became MIXED
+                // (one wood + 26 stone cells → ancestor's
+                // representative is still STONE → user's wood
+                // disappears at moderate zoom). Uniform-flattening
+                // above already handles the actual perf win
+                // (uniform stone/empty regions collapse to one
+                // tag=1 entry); MIXED cells are kept walkable at
+                // any depth so user edits remain visible.
+                //
+                // Performance: mixed-subtree count is bounded by
+                // the SDF's complexity (~SDF_DETAIL_LEVELS deep)
+                // plus user-edit volume — typically thousands of
+                // nodes, not millions, so packing all MIXED depths
+                // is cheap.
+                let _ = LOD_THRESHOLD; // keep constant referenced
+                let _ = (child_on_preserve, lod_active, child_is_cartesian, half_fov_recip, camera_pos);
 
                 if !visited.contains_key(child_id) {
                     let idx = ordered.len() as u32;
