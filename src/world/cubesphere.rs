@@ -493,6 +493,17 @@ impl SphericalPlanet {
         let limit = max_depth.min(self.depth);
         for d in 0..limit {
             let Some(node) = lib.get(node_id) else { return (0, d); };
+            // Short-circuit: if this node's whole subtree is uniform
+            // (Empty or single block type), descending further finds
+            // the same answer at every level. Returning the current
+            // depth as `term_depth` lets the DDA caller jump-step
+            // through the uniform region instead of stepping cell-by-
+            // cell at `max_depth` granularity.
+            match node.uniform_type {
+                UNIFORM_EMPTY => return (0, d),
+                UNIFORM_MIXED => {} // mixed — keep descending
+                bt => return (bt, d),
+            }
             let us = ((un * 3.0) as usize).min(2);
             let vs = ((vn * 3.0) as usize).min(2);
             let rs = ((rn * 3.0) as usize).min(2);
@@ -618,9 +629,10 @@ impl SphericalPlanet {
         let mut t = t_enter + eps;
         let mut prev: Option<(Face, u32, u32, u32)> = None;
         // Cell-DDA: each iteration samples one cell, then steps to
-        // the next analytic boundary. Max iterations bounded by the
-        // sphere-traverse chord at the finest meaningful resolution;
-        // 100k is well above what any visible ray needs.
+        // the next analytic boundary. With sample_subtree's
+        // uniform-type short-circuit, the step granularity is the
+        // walker's TERMINAL depth (not d_eff), so even at d_eff = 20
+        // a clear chord traverses only a few hundred cells.
         for _ in 0..100_000usize {
             if t >= t_exit { break; }
 
@@ -651,10 +663,14 @@ impl SphericalPlanet {
             let iv = ((vn * cells_at_depth) as u32).min(cells_max);
             let ir = ((rn * cells_at_depth) as u32).min(cells_max);
 
-            // Sample the face subtree at this cell. `sample_subtree`
-            // accepts f32; convert. Precision is fine here — we're
-            // sampling a single cell, not accumulating across cells.
-            let (block, _) = self.sample_subtree(
+            // Sample the face subtree. The walker returns the terminal
+            // it bottomed out on AND its actual depth — we use that
+            // depth to size the next DDA step. This is the same
+            // skip-empty optimization the shader's `march_sphere_body`
+            // uses: a uniform-empty depth-4 chunk advances the ray by
+            // 1/3⁴ of the shell, not 1/3^d_eff. Without it, depth ≥ ~12
+            // would need millions of cell steps to traverse the shell.
+            let (block, term_depth) = self.sample_subtree(
                 lib,
                 face,
                 un as f32, vn as f32, rn as f32,
@@ -670,17 +686,20 @@ impl SphericalPlanet {
                 prev = Some(here);
             }
 
-            // Compute the t at which the ray exits this cell. Six
-            // candidate boundaries: u_lo, u_hi, v_lo, v_hi (planes
-            // through center), r_lo, r_hi (spheres around center).
-            // Pick the smallest t > current.
-            let cells_d = cells_at_depth;
-            let u_lo_ea = ((iu       as f64) / cells_d) * 2.0 - 1.0;
-            let u_hi_ea = ((iu as f64 + 1.0) / cells_d) * 2.0 - 1.0;
-            let v_lo_ea = ((iv       as f64) / cells_d) * 2.0 - 1.0;
-            let v_hi_ea = ((iv as f64 + 1.0) / cells_d) * 2.0 - 1.0;
-            let r_lo = inner_r + (ir       as f64 / cells_d) * shell;
-            let r_hi = inner_r + ((ir + 1) as f64 / cells_d) * shell;
+            // Compute the t at which the ray exits the sample-cell at
+            // the WALKER's termination depth (not d_eff). Boundaries:
+            // u_lo, u_hi, v_lo, v_hi (planes through center), r_lo,
+            // r_hi (spheres around center). Pick the smallest t > now.
+            let cells_d = 3.0f64.powi(term_depth as i32);
+            let term_iu = (un * cells_d).floor();
+            let term_iv = (vn * cells_d).floor();
+            let term_ir = (rn * cells_d).floor();
+            let u_lo_ea = (term_iu       / cells_d) * 2.0 - 1.0;
+            let u_hi_ea = ((term_iu + 1.0) / cells_d) * 2.0 - 1.0;
+            let v_lo_ea = (term_iv       / cells_d) * 2.0 - 1.0;
+            let v_hi_ea = ((term_iv + 1.0) / cells_d) * 2.0 - 1.0;
+            let r_lo = inner_r + (term_ir       / cells_d) * shell;
+            let r_hi = inner_r + ((term_ir + 1.0) / cells_d) * shell;
 
             let k_u_lo = ea_to_cube_f64(u_lo_ea);
             let k_u_hi = ea_to_cube_f64(u_hi_ea);
@@ -1121,6 +1140,57 @@ mod tests {
             &mut lib, Face::PosX, iu_last, iu_last, iu_last, 20,
             Child::Empty,
         );
+    }
+
+    #[test]
+    fn raycast_places_round_trip_at_deep_depth() {
+        // Verify the user's complaint: place at deep zoom IS happening
+        // in the data even when the shader can't render it. Round-trip
+        // raycast → place → sample at depths 14, 16, 18.
+        for depth in [14u32, 16, 18] {
+            let mut lib = NodeLibrary::default();
+            let sdf = test_sdf(1.0, 0.0);
+            let mut planet = generate_spherical_planet(
+                &mut lib, [0.0, 0.0, 0.0], 0.5, 1.5, 20, &sdf,
+            );
+            let hit = planet
+                .raycast(&lib, [2.0, 0.0, 0.0], [-1.0, 0.0, 0.0], depth)
+                .unwrap_or_else(|| panic!("raycast None at depth {}", depth));
+            assert_eq!(hit.depth, depth, "raycast clamped depth at {}", depth);
+            let (face, iu, iv, ir) = hit
+                .prev
+                .unwrap_or_else(|| panic!("no prev at depth {}", depth));
+            let changed = planet.set_cell_at_depth(
+                &mut lib, face, iu, iv, ir, depth, Child::Block(block::BRICK),
+            );
+            assert!(changed, "set_cell_at_depth no-op at depth {}", depth);
+            // Path-based sample: walk face subtree by the SAME integer
+            // divisions `set_cell_at_depth` used. f32 sample_subtree
+            // accumulates ulp drift over `depth` steps and can land
+            // in the wrong slot at depth ≥ 14 — that's a sampler
+            // precision bug, not a placement bug.
+            let mut node_id = planet.face_roots[face as usize];
+            let mut found = 0u8;
+            for level in 0..depth {
+                let shift = depth - 1 - level;
+                let div = 3u32.pow(shift);
+                let us = ((iu / div) % 3) as usize;
+                let vs = ((iv / div) % 3) as usize;
+                let rs = ((ir / div) % 3) as usize;
+                let slot = slot_index(us, vs, rs);
+                let node = lib.get(node_id).expect("node");
+                match node.children[slot] {
+                    Child::Block(b) => { found = b; break; }
+                    Child::Empty => { found = 0; break; }
+                    Child::Node(nid) => { node_id = nid; }
+                }
+            }
+            assert_eq!(
+                found, block::BRICK,
+                "round-trip failed at depth {} (iu={}, iv={}, ir={})",
+                depth, iu, iv, ir,
+            );
+        }
     }
 
     #[test]
