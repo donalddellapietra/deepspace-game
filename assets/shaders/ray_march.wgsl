@@ -368,6 +368,7 @@ fn march_body(ray_origin: vec3<f32>, ray_dir: vec3<f32>, body: BodyFrame) -> Bod
     // neighboring cell instead of looping on the same plane.
     let eps = max(shell * 1e-5, 1e-7);
     var t = t_enter + eps;
+    let max_body_steps: u32 = 4096u;
 
     // If the ray begins inside the inner core (`r < cs_inner`),
     // the sample loop's `if r < cs_inner { break }` would bail
@@ -383,7 +384,7 @@ fn march_body(ray_origin: vec3<f32>, ray_dir: vec3<f32>, body: BodyFrame) -> Bod
     }
     var steps = 0u;
     loop {
-        if t >= t_exit || steps > 512u { break; }
+        if t >= t_exit || steps > max_body_steps { break; }
         steps = steps + 1u;
 
         let p = ray_origin + ray_dir * t;
