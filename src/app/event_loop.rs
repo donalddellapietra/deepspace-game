@@ -21,13 +21,16 @@ impl ApplicationHandler for App {
 
         let attrs = WindowAttributes::default()
             .with_title("Deep Space")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
+            .with_visible(!self.render_harness || self.show_harness_window);
 
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.window = Some(window.clone());
 
         #[cfg(not(target_arch = "wasm32"))]
-        crate::platform::prepare_window(&window);
+        if self.overlay_enabled() {
+            crate::platform::prepare_window(&window);
+        }
 
         let (tree_data, node_kinds, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
@@ -37,6 +40,9 @@ impl ApplicationHandler for App {
         self.renderer = Some(renderer);
         self.apply_zoom();
         self.last_frame = std::time::Instant::now();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -93,6 +99,14 @@ impl ApplicationHandler for App {
             }
         }
     }
+
+    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+        if self.render_harness {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
 }
 
 impl App {
@@ -112,17 +126,15 @@ impl App {
         let max_depth = (self.tree_depth as i32).max(1);
         let new_depth = (cur + step).clamp(1, max_depth);
         if new_depth == cur { return; }
-        if step > 0 {
-            self.camera.position.zoom_in();
-        } else {
-            self.camera.position.zoom_out();
-        }
+        self.camera.position = self.camera.position.reanchored_to_depth_in(
+            &self.world.library, self.world.root, new_depth as u8,
+        );
         self.apply_zoom();
     }
 
     fn handle_redraw(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        if self.overlay_enabled() {
             self.try_create_webview();
             self.inject_webview_input();
             self.poll_ui_commands();
@@ -140,7 +152,9 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_pos: self.camera.world_pos_f32(),
+                    camera_pos: self.camera.position.to_world_xyz_in(
+                        &self.world.library, self.world.root,
+                    ),
                     fov: 1.2,
                     node_count: self.world.library.len(),
                 },
@@ -157,10 +171,17 @@ impl App {
             let alpha = (dt as f64 * 5.0).min(1.0);
             self.fps_smooth = self.fps_smooth * (1.0 - alpha) + instant_fps * alpha;
         }
+        let t_update0 = std::time::Instant::now();
         self.update(dt);
+        let t_update = t_update0.elapsed();
+        let t_upload0 = std::time::Instant::now();
         self.upload_tree_lod();
+        let t_upload = t_upload0.elapsed();
+        let t_highlight0 = std::time::Instant::now();
         self.update_highlight();
+        let t_highlight = t_highlight0.elapsed();
 
+        let t_render0 = std::time::Instant::now();
         if let Some(renderer) = &self.renderer {
             match renderer.render() {
                 Ok(()) => {}
@@ -172,6 +193,18 @@ impl App {
                 }
                 Err(e) => log::error!("Render error: {e:?}"),
             }
+        }
+        let t_render = t_render0.elapsed();
+        let total = t_update + t_upload + t_highlight + t_render;
+        if total.as_millis() >= 30 {
+            eprintln!(
+                "frame_timing_ms total={:.1} update={:.1} upload={:.1} highlight={:.1} render={:.1}",
+                total.as_secs_f64() * 1000.0,
+                t_update.as_secs_f64() * 1000.0,
+                t_upload.as_secs_f64() * 1000.0,
+                t_highlight.as_secs_f64() * 1000.0,
+                t_render.as_secs_f64() * 1000.0,
+            );
         }
 
         // Test driver runs AFTER the frame so the captured image

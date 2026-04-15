@@ -44,8 +44,9 @@ in parallel pipelines.
    wall in the inner sphere DDA.
 4. **Frame-root dispatch.** `Renderer.set_root_kind_*` +
    `uniforms.root_kind`. Shader at start of `march()` either
-   enters `march_cartesian` (Cartesian frame) or
-   `sphere_in_cell` (body frame).
+   enters `march_cartesian` (Cartesian or face frame) or
+   `sphere_in_cell` (body frame), with explicit face metadata for
+   face-root starts and body pops.
 5. **Pack from world root with camera in WORLD coords.** Single
    pack call produces a buffer that any frame depth can ray-march
    from. Distance-LOD decisions are at world scale and shared
@@ -56,42 +57,41 @@ in parallel pipelines.
    current frame; on miss, pop next ribbon entry, transform the
    ray (`origin/3 + slot_offset`, `dir/3`), continue at the
    ancestor's buffer index. Hop budget 80.
-8. **Render-frame walker is sphere-aware.** `app::frame::compute_render_frame`
-   accepts Cartesian or CubedSphereBody as a frame root and
-   stops at face cells.
+8. **Render-frame walker is face-aware.** `app::frame::compute_render_frame`
+   accepts Cartesian, CubedSphereBody, or CubedSphereFace as a
+   frame root and can descend into face cells on the camera path.
 9. **Highlight transform.** `aabb_world_to_frame` projects the
    cursor's AABB into the frame the shader sees.
 10. **Module split.** `world::gpu` is `gpu/{mod, types, pack, ribbon}.rs`;
     frame helpers live in `app/frame.rs`. Shader is one file but
     organized into clearly-marked sections.
+11. **CPU / anchor face-frame helpers.** `world::edit` and
+    `world::anchor` now have canonical single-body helpers for
+    face-frame projection and inverse projection without hardcoded
+    absolute body centers.
 
 ### Not yet done
 
-1. **Face-cell-as-frame.** When the camera is deep in face content,
-   `render_frame` stops at the body. The frame can't descend into
-   a face cell because the shader doesn't yet know how to start a
-   DDA from inside a face cell with explicit (u, v, r) bounds.
-   This is the camera-precision win for the planet's interior.
-2. **Highlight across ancestor pops.** `aabb_world_to_frame` uses
+1. **Highlight across ancestor pops.** `aabb_world_to_frame` uses
    the *original* frame. If a hit happens after one or more pops,
    the AABB is in the wrong frame and the highlight outline drifts.
    Needs the shader to report the pop level at hit and the CPU
    to pre-compute AABBs for each ribbon level.
-3. **Cap removal.** `cs_edit_depth` clamp `[1, 14]`, hardcoded
+2. **Cap removal.** `cs_edit_depth` clamp `[1, 14]`, hardcoded
    `walk_face_subtree d <= 22u`, `MAX_STACK_DEPTH = 16` are still
-   in place. They become removable once face-cell-as-frame lands
-   (depth in shader stops being a precision wall).
-4. **Face seam transitions inside a single sphere_in_cell.** The
+   in place. Face-cell-as-frame removed the main precision wall;
+   these are now just explicit implementation caps to retire.
+3. **Face seam transitions inside a single sphere_in_cell.** The
    current code re-projects the ray to a face on every step,
    which works but is wasteful. With face-cell-as-frame in place,
    crossing a u/v boundary becomes a stack pop + push to a
    neighbor face's frame.
-5. **Sphere outer-shell exit.** When a ray exits a body upward,
+4. **Sphere outer-shell exit.** When a ray exits a body upward,
    today we `return` miss and the caller advances Cartesian DDA
    past the body cell. With ribbon in place, this should pop to
    the body's parent and continue from the *exit* point, not from
    the body's bounding-cube boundary.
-6. **Performance.** `pack_tree_lod` from world root runs every
+5. **Performance.** `pack_tree_lod` from world root runs every
    frame and is O(visible nodes). Acceptable today; needs caching
    when content density grows. Not a correctness item.
 
@@ -141,7 +141,7 @@ There are exactly three coordinate systems in flight:
    - Highlight AABB after `aabb_world_to_frame`.
    - All shader DDA state.
 
-Conversions live in `app::frame` and `WorldPos::in_frame`. Never
+Conversions live in `app::frame` and `WorldPos::in_frame_in`. Never
 do f32 arithmetic on world XYZ at deep zoom — magnitudes grow
 unbounded. Always project into frame-local first.
 
@@ -159,8 +159,8 @@ Every "depth limit" in the engine is actually one of:
   resolution (~10–15 levels), so 16 is generous; the absolute
   tree depth doesn't matter because the frame can lift.
 - **Face walker loop budget.** Hardcoded 22 today (matches demo
-  planet's face depth + 2). Will lift when face-cell-as-frame
-  lands so face cells can themselves be the frame root.
+  planet's face depth + 2). Face-cell-as-frame means this is no
+  longer a correctness wall, but it is still an explicit cap.
 
 So "support 40+ layers" reduces to: the camera must always be in
 a frame whose cells are not sub-ULP, and the inner DDA at that
@@ -186,31 +186,23 @@ Total target: 100+ tests post-refactor.
 
 ## Next-step recipe (for the session that picks this up)
 
-1. **Face-cell-as-frame.**
-   - `render_frame` learns to descend into face cells.
-   - New uniform: `face_id`, `face_cell_bounds: [u_lo, u_hi, v_lo, v_hi, r_lo, r_hi]`.
-   - New shader entry `sphere_in_face_cell` that picks up the
-     ray inside the cell scoped to those bounds.
-   - Camera position via `WorldPos::in_frame` for face frames
-     (may need `step_neighbor` for face-axes — see
-     `refactor-decisions.md` §1g).
-2. **Highlight cross-pop.**
+1. **Highlight cross-pop.**
    - Shader return value gains a `frame_level` field (which pop
      level the hit happened at).
    - CPU pre-computes per-ribbon-level AABBs and the shader picks
      the right one for outline drawing.
-3. **Cap removal.**
+2. **Cap removal.**
    - Drop `cs_edit_depth` clamp, `MAX_STACK_DEPTH = 16`,
      `walk_face_subtree d <= 22u`. Replace with `MAX_VISUAL_DEPTH`
      (still 16, but justified by screen resolution).
-4. **Sphere outer-shell exit handoff.**
+3. **Sphere outer-shell exit handoff.**
    - `sphere_in_cell` returns the exit point + new ray direction.
    - Caller (whoever popped into the body) continues from that
      point in the parent frame.
-5. **Multi-body smoke test.**
+4. **Multi-body smoke test.**
    - `spherical_worldgen` install a second body at a different
      slot. Verify ribbon pop renders both bodies from any frame.
 
-When all five land, the engine genuinely supports 40+ layers
+When all four land, the engine genuinely supports 40+ layers
 without any hardcoded caps, with planet-deep editing working at
 arbitrary face depth.

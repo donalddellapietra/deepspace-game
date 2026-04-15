@@ -38,19 +38,7 @@ shutdown.
 
 ## Architectural pieces deferred
 
-### 4. Face-cell-as-frame
-
-`compute_render_frame` stops at face-cell boundaries. Camera
-deep inside a planet's face subtree only gets body-level frame
-precision (cells of size 1, body-local). The unified driver
-calls for face-cell frames where each face cell can itself be a
-frame root with `(face_id, u/v/r bounds)` metadata, dispatching
-into a `sphere_in_face_cell` shader entry. Same for cpu_raycast.
-Without this, deep face-content edits still hit the precision
-floor of body-frame coords once you zoom past where body-frame
-cells become sub-pixel.
-
-### 5. Sphere outer-shell exit handoff
+### 4. Sphere outer-shell exit handoff
 
 When a ray exits a body outward (`r >= cs_outer`), `sphere_in_cell`
 returns miss and the caller advances Cartesian DDA past the body
@@ -60,7 +48,7 @@ boundary. Today this means: anything embedded right next to a
 planet (a moon, debris) gets occluded by an invisible bounding
 cube around the planet rather than the planet itself.
 
-### 6. Face-seam transitions still implicit
+### 5. Face-seam transitions still implicit
 
 `sphere_in_cell` re-runs `pick_face` every step rather than
 walking through a 24-case face-transition table. Works but
@@ -68,7 +56,7 @@ doesn't unify with the ribbon-pop protocol — face-to-face
 neighbor traversal isn't expressed in the same vocabulary as
 cell-to-cell DDA stepping.
 
-### 7. Hardcoded shader caps
+### 6. Hardcoded shader caps
 
 - `MAX_STACK_DEPTH = 16` in `march_cartesian`
 - `walk_face_subtree d <= 22u`
@@ -78,7 +66,7 @@ them as "should disappear once face-cell-as-frame lands."
 
 ## Test gaps
 
-### 8. cpu_raycast_in_frame ribbon ascent: only structural unit tests
+### 7. cpu_raycast_in_frame ribbon ascent: only structural unit tests
 
 `cpu_raycast_in_frame_pop_finds_hit_in_ancestor` just verifies no
 panic. There's no test that asserts the *correct cell* is hit
@@ -86,7 +74,7 @@ when the ray exits the deep frame and pops to find content in
 an ancestor. End-to-end correctness here only validates via
 visual / interactive testing.
 
-### 9. preserve_path doesn't extend through face subtrees
+### 8. preserve_path doesn't extend through face subtrees
 
 `pack_tree_lod_preserving` only protects slots whose parent
 NodeKind makes them LOD-eligible (Cartesian + Cartesian child).
@@ -96,7 +84,7 @@ flattened anyway, so it's not a bug *yet*. Becomes a bug if
 Cartesian content embedded inside a face subtree starts being
 flattened.
 
-### 10. Highlight AABB transform uses *intended* frame, not effective
+### 9. Highlight AABB transform uses *intended* frame, not effective
 
 `update_highlight` pulls `frame` from `render_frame()` (the
 intended deep frame). `upload_tree_lod` uses `effective_frame`
@@ -113,7 +101,7 @@ frame's transform inflates a tiny world AABB to the wrong scale.
 
 ## What should land next session
 
-1. **Fix bug #10**: pass the *effective* frame (the one the
+1. **Fix bug #9**: pass the *effective* frame (the one the
    shader actually uses) to `aabb_world_to_frame` in
    `update_highlight`. Cheap one-line fix, blocks visible
    placement-target outline at deep zoom.
@@ -123,9 +111,8 @@ frame's transform inflates a tiny world AABB to the wrong scale.
 3. **Verify cpu_raycast_in_frame end-to-end**: add a planet-world
    test that asserts the cell hit at deep zoom is the cell
    actually under the crosshair.
-4. **Face-cell-as-frame** (#4): the big remaining piece.
-5. **Sphere-exit handoff** (#5) when multi-body content is added.
-6. **Cap removal** (#7) once #4 lands.
+4. **Sphere-exit handoff** (#4) when multi-body content is added.
+5. **Cap removal** (#6).
 
-Items 1–3 are this-session-grade. Items 4–6 are next architectural
+Items 1–3 are this-session-grade. Items 4–5 are next architectural
 session.

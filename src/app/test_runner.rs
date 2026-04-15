@@ -9,6 +9,10 @@
 //! Recognized flags:
 //!
 //! ```text
+//! --render-harness        Run in deterministic render-harness mode:
+//!                         no overlay/webview, forced redraws, auto-exit.
+//! --show-window           In render-harness mode, keep the native window
+//!                         visible instead of hidden.
 //! --spawn-depth N         Camera anchor starts at depth N (default 4).
 //! --screenshot PATH       Capture the rendered frame to PATH (PNG)
 //!                         after the warm-up + script settle, then exit.
@@ -28,12 +32,21 @@
 //! Example:
 //!
 //! ```bash
-//! cargo run -- --spawn-depth 12 --screenshot /tmp/layer10.png \
+//! cargo run -- --render-harness --spawn-depth 12 --screenshot /tmp/layer10.png \
 //!     --script "wait:30,break,wait:30" --exit-after-frames 90
 //! ```
 
+use std::sync::Arc;
+
+use crate::app::App;
+use crate::renderer::Renderer;
+use winit::event_loop::EventLoop;
+use winit::window::WindowAttributes;
+
 #[derive(Default, Debug, Clone)]
 pub struct TestConfig {
+    pub render_harness: bool,
+    pub show_window: bool,
     pub spawn_depth: Option<u8>,
     /// Explicit camera world-XYZ at spawn. Positions the camera
     /// at a specific point regardless of zoom level — since the
@@ -68,6 +81,12 @@ impl TestConfig {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--render-harness" => {
+                    cfg.render_harness = true;
+                }
+                "--show-window" => {
+                    cfg.show_window = true;
+                }
                 "--spawn-depth" => {
                     cfg.spawn_depth = args.next().and_then(|v| v.parse().ok());
                 }
@@ -107,12 +126,20 @@ impl TestConfig {
 
     /// True if any flag asks the test runner to take action.
     pub fn is_active(&self) -> bool {
-        self.screenshot.is_some()
+        self.render_harness
+            || self.screenshot.is_some()
             || self.exit_after_frames.is_some()
             || !self.script.is_empty()
             || self.spawn_xyz.is_some()
             || self.spawn_yaw.is_some()
             || self.spawn_pitch.is_some()
+    }
+
+    pub fn use_render_harness(&self) -> bool {
+        self.render_harness
+            || self.screenshot.is_some()
+            || self.exit_after_frames.is_some()
+            || !self.script.is_empty()
     }
 }
 
@@ -187,4 +214,106 @@ impl TestRunner {
         });
         due
     }
+}
+
+#[allow(deprecated)]
+pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = App::with_test_config(cfg.clone());
+    let event_loop = EventLoop::new()?;
+    let window = Arc::new(event_loop.create_window(
+        WindowAttributes::default()
+            .with_title("Deep Space Render Harness")
+            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
+            .with_visible(cfg.show_window),
+    )?);
+    let (tree_data, node_kinds, root_index) =
+        crate::world::gpu::pack_tree(&app.world.library, app.world.root);
+    let renderer = pollster::block_on(Renderer::new(
+        window.clone(), &tree_data, &node_kinds, root_index,
+    ));
+    app.window = Some(window);
+    app.renderer = Some(renderer);
+    app.apply_zoom();
+    app.last_frame = std::time::Instant::now();
+    let mut total_update = 0.0f64;
+    let mut total_upload = 0.0f64;
+    let mut total_highlight = 0.0f64;
+    let mut total_render = 0.0f64;
+    let mut frame_count = 0u32;
+
+    loop {
+        let t0 = std::time::Instant::now();
+        app.update(1.0 / 60.0);
+        let t_update = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        app.upload_tree_lod();
+        let t_upload = t1.elapsed().as_secs_f64() * 1000.0;
+        let t2 = std::time::Instant::now();
+        app.update_highlight();
+        let t_highlight = t2.elapsed().as_secs_f64() * 1000.0;
+        let t3 = std::time::Instant::now();
+        if let Some(renderer) = &app.renderer {
+            renderer.render_offscreen();
+        }
+        let t_render = t3.elapsed().as_secs_f64() * 1000.0;
+        total_update += t_update;
+        total_upload += t_upload;
+        total_highlight += t_highlight;
+        total_render += t_render;
+        frame_count += 1;
+
+        let (due, frame, frame_budget_done, timed_out, exit_after, screenshot) = {
+            let Some(test) = app.test.as_mut() else { break };
+            test.frame += 1;
+            let frame = test.frame;
+            let due = test.drain_due();
+            let frame_budget_done = frame + 1 >= test.exit_after_frames;
+            let timed_out = test.timed_out();
+            let exit_after = test.exit_after_frames;
+            let screenshot = test.screenshot_path.clone();
+            (due, frame, frame_budget_done, timed_out, exit_after, screenshot)
+        };
+
+        for cmd in due {
+            match cmd {
+                ScriptCmd::Break => app.do_break(),
+                ScriptCmd::Place => app.do_place(),
+                ScriptCmd::Wait(_) => {}
+            }
+        }
+
+        if let Some(path) = screenshot {
+            let already_done = app.test.as_ref().is_some_and(|t| t.screenshot_done);
+            if !already_done && (frame_budget_done || timed_out) {
+                if let Some(renderer) = &mut app.renderer {
+                    renderer.capture_to_png(&path)?;
+                }
+                if let Some(t) = app.test.as_mut() {
+                    t.screenshot_done = true;
+                }
+            }
+        }
+
+        if timed_out {
+            eprintln!("render_harness: timeout reached at frame {frame}, quitting");
+            break;
+        }
+        if frame >= exit_after {
+            eprintln!("render_harness: exit_after_frames={frame} reached, quitting");
+            break;
+        }
+    }
+
+    if frame_count > 0 {
+        eprintln!(
+            "render_harness_timing avg_ms update={:.3} upload={:.3} highlight={:.3} render={:.3} total={:.3}",
+            total_update / frame_count as f64,
+            total_upload / frame_count as f64,
+            total_highlight / frame_count as f64,
+            total_render / frame_count as f64,
+            (total_update + total_upload + total_highlight + total_render) / frame_count as f64,
+        );
+    }
+
+    Ok(())
 }

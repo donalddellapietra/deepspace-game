@@ -13,6 +13,9 @@ pub(super) const WAIT_FRAMES: u32 = 10;
 
 impl App {
     pub(super) fn try_create_webview(&mut self) {
+        if !self.overlay_enabled() {
+            return;
+        }
         if self.webview.is_some() {
             return;
         }
@@ -32,6 +35,9 @@ impl App {
     }
 
     pub(super) fn inject_webview_input(&mut self) {
+        if !self.overlay_enabled() {
+            return;
+        }
         for (code, pressed) in overlay::drain_forwarded_keys() {
             if let Some(key) = overlay::js_code_to_keycode(&code) {
                 self.apply_key(key, pressed);
@@ -47,6 +53,9 @@ impl App {
     }
 
     pub(super) fn poll_ui_commands(&mut self) {
+        if !self.overlay_enabled() {
+            return;
+        }
         for cmd in overlay::poll_commands() {
             let panel_changed = self.ui.handle_command(cmd);
             if panel_changed {
@@ -56,12 +65,18 @@ impl App {
     }
 
     pub(super) fn flush_overlay(&self) {
+        if !self.overlay_enabled() {
+            return;
+        }
         if let Some(ref wv) = self.webview {
             overlay::flush_to_webview(wv);
         }
     }
 
     pub(super) fn resize_overlay(&self) {
+        if !self.overlay_enabled() {
+            return;
+        }
         if let Some(ref wv) = self.webview {
             if let Some(window) = &self.window {
                 overlay::resize_webview(wv, window);

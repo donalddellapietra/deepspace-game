@@ -14,7 +14,10 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::world::tree::{slot_coords, slot_index, NodeLibrary, MAX_DEPTH};
+use crate::world::cubesphere::{self, FACE_SLOTS};
+use crate::world::tree::{
+    slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, CENTER_SLOT, MAX_DEPTH,
+};
 
 /// Root cell spans `[0, WORLD_SIZE)³` in world units.
 ///
@@ -22,6 +25,120 @@ use crate::world::tree::{slot_coords, slot_index, NodeLibrary, MAX_DEPTH};
 /// whole engine uses this as the single convention for converting
 /// between `WorldPos` and f32 world-space XYZ.
 pub const WORLD_SIZE: f32 = 3.0;
+
+#[derive(Clone, Copy, Debug)]
+struct CanonicalBodyInfo {
+    body_slot: usize,
+    face_slots: [usize; 6],
+    inner_r: f32,
+    outer_r: f32,
+    body_origin_world: [f32; 3],
+    body_size_world: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CanonicalFaceFrameInfo {
+    body_center_world: [f32; 3],
+    body_size_world: f32,
+    inner_r: f32,
+    outer_r: f32,
+    face_idx: usize,
+    u_lo: f32,
+    v_lo: f32,
+    r_lo: f32,
+    size: f32,
+}
+
+fn canonical_body_info(library: &NodeLibrary, world_root: NodeId) -> Option<CanonicalBodyInfo> {
+    let root = library.get(world_root)?;
+    let body_slot = CENTER_SLOT;
+    let Child::Node(body_id) = root.children[body_slot] else {
+        return None;
+    };
+    let body = library.get(body_id)?;
+    let NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
+        return None;
+    };
+    let (sx, sy, sz) = slot_coords(body_slot);
+    let body_size_world = WORLD_SIZE / 3.0;
+    let body_origin_world = [
+        sx as f32 * body_size_world,
+        sy as f32 * body_size_world,
+        sz as f32 * body_size_world,
+    ];
+    Some(CanonicalBodyInfo {
+        body_slot,
+        face_slots: FACE_SLOTS,
+        inner_r,
+        outer_r,
+        body_origin_world,
+        body_size_world,
+    })
+}
+
+fn face_index_for_slot(face_slots: &[usize; 6], slot: usize) -> Option<usize> {
+    face_slots.iter().position(|&s| s == slot)
+}
+
+fn canonical_face_frame_info(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame: &Path,
+) -> Option<CanonicalFaceFrameInfo> {
+    let body = canonical_body_info(library, world_root)?;
+    if frame.depth() < 2
+        || frame.slot(0) as usize != body.body_slot
+    {
+        return None;
+    }
+    let face_idx = face_index_for_slot(&body.face_slots, frame.slot(1) as usize)?;
+    let mut u_lo = 0.0f32;
+    let mut v_lo = 0.0f32;
+    let mut r_lo = 0.0f32;
+    let mut size = 1.0f32;
+    for k in 2..frame.depth() as usize {
+        let (us, vs, rs) = slot_coords(frame.slot(k) as usize);
+        let child = size / 3.0;
+        u_lo += us as f32 * child;
+        v_lo += vs as f32 * child;
+        r_lo += rs as f32 * child;
+        size = child;
+    }
+    Some(CanonicalFaceFrameInfo {
+        body_center_world: [
+            body.body_origin_world[0] + body.body_size_world * 0.5,
+            body.body_origin_world[1] + body.body_size_world * 0.5,
+            body.body_origin_world[2] + body.body_size_world * 0.5,
+        ],
+        body_size_world: body.body_size_world,
+        inner_r: body.inner_r,
+        outer_r: body.outer_r,
+        face_idx,
+        u_lo,
+        v_lo,
+        r_lo,
+        size,
+    })
+}
+
+fn is_shell_point(body: CanonicalBodyInfo, xyz: [f32; 3]) -> Option<(usize, f32, f32, f32)> {
+    let body_center = [
+        body.body_origin_world[0] + body.body_size_world * 0.5,
+        body.body_origin_world[1] + body.body_size_world * 0.5,
+        body.body_origin_world[2] + body.body_size_world * 0.5,
+    ];
+    let coord = cubesphere::world_to_coord(body_center, xyz)?;
+    let r_local = coord.r / body.body_size_world.max(1e-30);
+    if r_local < body.inner_r || r_local >= body.outer_r {
+        return None;
+    }
+    Some((
+        coord.face as usize,
+        (coord.u + 1.0) * 0.5,
+        (coord.v + 1.0) * 0.5,
+        (r_local - body.inner_r) / (body.outer_r - body.inner_r).max(1e-30),
+    ))
+}
 
 // --------------------------------------------------------------- Path
 
@@ -278,6 +395,53 @@ impl WorldPos {
         ]
     }
 
+    /// World-space XYZ for the canonical single-body world. When the
+    /// anchor path descends into a face subtree, the tail of the path
+    /// is interpreted as `(u, v, r)` slots instead of Cartesian XYZ.
+    pub fn to_world_xyz_in(&self, library: &NodeLibrary, world_root: NodeId) -> [f32; 3] {
+        let Some(body) = canonical_body_info(library, world_root) else {
+            return self.to_world_xyz();
+        };
+        if self.anchor.depth() >= 2
+            && self.anchor.slot(0) as usize == body.body_slot
+            && face_index_for_slot(&body.face_slots, self.anchor.slot(1) as usize).is_some()
+        {
+            let face_idx = face_index_for_slot(&body.face_slots, self.anchor.slot(1) as usize)
+                .expect("checked above");
+            let mut u_lo = 0.0f32;
+            let mut v_lo = 0.0f32;
+            let mut r_lo = 0.0f32;
+            let mut size = 1.0f32;
+            for k in 2..self.anchor.depth() as usize {
+                let (us, vs, rs) = slot_coords(self.anchor.slot(k) as usize);
+                let child = size / 3.0;
+                u_lo += us as f32 * child;
+                v_lo += vs as f32 * child;
+                r_lo += rs as f32 * child;
+                size = child;
+            }
+            let un = (u_lo + self.offset[0] * size).clamp(0.0, 1.0 - f32::EPSILON);
+            let vn = (v_lo + self.offset[1] * size).clamp(0.0, 1.0 - f32::EPSILON);
+            let rn = (r_lo + self.offset[2] * size).clamp(0.0, 1.0 - f32::EPSILON);
+            let body_center = [
+                body.body_origin_world[0] + body.body_size_world * 0.5,
+                body.body_origin_world[1] + body.body_size_world * 0.5,
+                body.body_origin_world[2] + body.body_size_world * 0.5,
+            ];
+            let radius_local = body.inner_r + rn * (body.outer_r - body.inner_r);
+            return cubesphere::coord_to_world(
+                body_center,
+                cubesphere::CubeSphereCoord {
+                    face: cubesphere::Face::from_index(face_idx as u8),
+                    u: un * 2.0 - 1.0,
+                    v: vn * 2.0 - 1.0,
+                    r: radius_local * body.body_size_world,
+                },
+            );
+        }
+        self.to_world_xyz()
+    }
+
     /// Build a `WorldPos` anchored at `anchor_depth` for a world-space
     /// XYZ point. The XYZ is clamped into `[0, WORLD_SIZE)` — positions
     /// outside the root cell are not representable and collapse to the
@@ -309,6 +473,71 @@ impl WorldPos {
             ((clamped[2] - origin[2]) / size).clamp(0.0, 1.0 - f32::EPSILON),
         ];
         Self { anchor, offset }
+    }
+
+    /// Canonical single-body inverse of `to_world_xyz_in`.
+    pub fn from_world_xyz_in(
+        library: &NodeLibrary,
+        world_root: NodeId,
+        xyz: [f32; 3],
+        anchor_depth: u8,
+    ) -> Self {
+        let clamped = [
+            xyz[0].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[1].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[2].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+        ];
+        let Some(body) = canonical_body_info(library, world_root) else {
+            return Self::from_world_xyz(clamped, anchor_depth);
+        };
+
+        if anchor_depth >= 2 {
+            if let Some((face_idx, un, vn, rn)) = is_shell_point(body, clamped) {
+                let mut anchor = Path::root();
+                anchor.push(body.body_slot as u8);
+                anchor.push(body.face_slots[face_idx] as u8);
+                let mut coords = [un, vn, rn];
+                for _ in 2..anchor_depth {
+                    let mut slot_coords_uvw = [0usize; 3];
+                    for i in 0..3 {
+                        let s = (coords[i] * 3.0).floor();
+                        slot_coords_uvw[i] = s.clamp(0.0, 2.0) as usize;
+                        coords[i] = (coords[i] * 3.0 - s).clamp(0.0, 1.0 - f32::EPSILON);
+                    }
+                    anchor.push(slot_index(
+                        slot_coords_uvw[0],
+                        slot_coords_uvw[1],
+                        slot_coords_uvw[2],
+                    ) as u8);
+                }
+                return Self { anchor, offset: coords };
+            }
+        }
+
+        if anchor_depth >= 1
+            && clamped[0] >= body.body_origin_world[0]
+            && clamped[0] < body.body_origin_world[0] + body.body_size_world
+            && clamped[1] >= body.body_origin_world[1]
+            && clamped[1] < body.body_origin_world[1] + body.body_size_world
+            && clamped[2] >= body.body_origin_world[2]
+            && clamped[2] < body.body_origin_world[2] + body.body_size_world
+        {
+            let mut anchor = Path::root();
+            anchor.push(body.body_slot as u8);
+            let local = [
+                ((clamped[0] - body.body_origin_world[0]) / body.body_size_world)
+                    .clamp(0.0, 1.0 - f32::EPSILON),
+                ((clamped[1] - body.body_origin_world[1]) / body.body_size_world)
+                    .clamp(0.0, 1.0 - f32::EPSILON),
+                ((clamped[2] - body.body_origin_world[2]) / body.body_size_world)
+                    .clamp(0.0, 1.0 - f32::EPSILON),
+            ];
+            if anchor_depth == 1 {
+                return Self { anchor, offset: local };
+            }
+        }
+
+        Self::from_world_xyz(clamped, anchor_depth)
     }
 
     /// World-space size of the anchor's cell.
@@ -366,22 +595,7 @@ impl WorldPos {
         self
     }
 
-    /// Position expressed in `frame`'s local coordinate system,
-    /// where the frame's cell spans `[0, WORLD_SIZE)³`.
-    ///
-    /// Handles any relationship between `self.anchor` and `frame`:
-    /// - If `frame` is a prefix of `self.anchor` (the usual render
-    ///   case for the camera): the result is precise sub-cell
-    ///   precision via pure path-slot composition in the tail —
-    ///   f32 magnitudes stay bounded by `WORLD_SIZE` regardless of
-    ///   how deep the anchor sits.
-    /// - If the two diverge: both positions are computed in their
-    ///   common ancestor's frame (each in `[0, WORLD_SIZE)`) and
-    ///   the difference is scaled into the frame's local system.
-    ///   The result lands outside `[0, WORLD_SIZE)` when `self` is
-    ///   outside the frame's cell — correct behavior for shader
-    ///   inputs like a distant planet center.
-    pub fn in_frame(&self, frame: &Path) -> [f32; 3] {
+    fn in_frame_cartesian(&self, frame: &Path) -> [f32; 3] {
         let c = self.anchor.common_prefix_len(frame) as usize;
 
         // Walk [c..self.anchor.depth) + offset → position in the
@@ -427,11 +641,43 @@ impl WorldPos {
         ]
     }
 
-    /// Build a `WorldPos` at `anchor_depth` whose frame-local
-    /// coordinate under `frame` equals `xyz`. Inverse of
-    /// `in_frame`. Used when scroll-zoom reconstructs the camera
-    /// after a frame-local dolly.
-    pub fn from_frame_local(frame: &Path, xyz: [f32; 3], anchor_depth: u8) -> Self {
+    /// Position expressed in `frame`'s local coordinate system,
+    /// where the frame's cell spans `[0, WORLD_SIZE)³`.
+    ///
+    /// This is the canonical single-body, NodeKind-aware version of
+    /// the frame projection. Face frames interpret their local axes
+    /// as `(u, v, r)` inside the frame's bounded shell cell; all
+    /// other frames use Cartesian slot geometry.
+    pub fn in_frame_in(
+        &self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        frame: &Path,
+    ) -> [f32; 3] {
+        let Some(info) = canonical_face_frame_info(library, world_root, frame) else {
+            return self.in_frame_cartesian(frame);
+        };
+        let world = self.to_world_xyz_in(library, world_root);
+        let coord = cubesphere::world_to_coord(info.body_center_world, world)
+            .unwrap_or(cubesphere::CubeSphereCoord {
+                face: cubesphere::Face::from_index(info.face_idx as u8),
+                u: 0.0,
+                v: 0.0,
+                r: info.inner_r * info.body_size_world,
+            });
+        let un = (coord.u + 1.0) * 0.5;
+        let vn = (coord.v + 1.0) * 0.5;
+        let radius_local = coord.r / info.body_size_world.max(1e-30);
+        let rn = (radius_local - info.inner_r) / (info.outer_r - info.inner_r).max(1e-30);
+        let scale = WORLD_SIZE / info.size.max(1e-30);
+        [
+            (un - info.u_lo) * scale,
+            (vn - info.v_lo) * scale,
+            (rn - info.r_lo) * scale,
+        ]
+    }
+
+    fn from_frame_local_cartesian(frame: &Path, xyz: [f32; 3], anchor_depth: u8) -> Self {
         debug_assert!(anchor_depth >= frame.depth());
         let clamped = [
             xyz[0].clamp(0.0, WORLD_SIZE - f32::EPSILON),
@@ -460,6 +706,45 @@ impl WorldPos {
         Self { anchor, offset }
     }
 
+    /// Build a `WorldPos` at `anchor_depth` whose frame-local
+    /// coordinate under `frame` equals `xyz`. Inverse of
+    /// `in_frame_in`.
+    pub fn from_frame_local_in(
+        library: &NodeLibrary,
+        world_root: NodeId,
+        frame: &Path,
+        xyz: [f32; 3],
+        anchor_depth: u8,
+    ) -> Self {
+        let Some(info) = canonical_face_frame_info(library, world_root, frame) else {
+            return Self::from_frame_local_cartesian(frame, xyz, anchor_depth);
+        };
+        let un = (info.u_lo + (xyz[0] / WORLD_SIZE) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
+        let vn = (info.v_lo + (xyz[1] / WORLD_SIZE) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
+        let rn = (info.r_lo + (xyz[2] / WORLD_SIZE) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
+        let radius_local = info.inner_r + rn * (info.outer_r - info.inner_r);
+        let world = cubesphere::coord_to_world(
+            info.body_center_world,
+            cubesphere::CubeSphereCoord {
+                face: cubesphere::Face::from_index(info.face_idx as u8),
+                u: un * 2.0 - 1.0,
+                v: vn * 2.0 - 1.0,
+                r: radius_local * info.body_size_world,
+            },
+        );
+        Self::from_world_xyz_in(library, world_root, world, anchor_depth)
+    }
+
+    pub fn reanchored_to_depth_in(
+        &self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        target_depth: u8,
+    ) -> Self {
+        let world = self.to_world_xyz_in(library, world_root);
+        Self::from_world_xyz_in(library, world_root, world, target_depth)
+    }
+
     /// Pop the deepest slot. Offset rescaled so the world position
     /// is unchanged. Clamps at root.
     pub fn zoom_out(&mut self) -> Transition {
@@ -481,9 +766,19 @@ impl WorldPos {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::spherical_worldgen::{demo_planet, install_at_root_center};
 
     fn lib() -> NodeLibrary {
         NodeLibrary::default()
+    }
+
+    fn canonical_world() -> (NodeLibrary, NodeId) {
+        let mut lib = NodeLibrary::default();
+        let root = lib.insert(crate::world::tree::empty_children());
+        lib.ref_inc(root);
+        let setup = demo_planet();
+        let (world_root, _) = install_at_root_center(&mut lib, root, &setup);
+        (lib, world_root)
     }
 
     #[test]
@@ -698,7 +993,7 @@ mod tests {
     #[test]
     fn in_frame_is_identity_at_root_frame() {
         let p = WorldPos::from_world_xyz([1.5, 2.25, 0.75], 7);
-        let local = p.in_frame(&Path::root());
+        let local = p.in_frame_cartesian(&Path::root());
         let world = p.to_world_xyz();
         for i in 0..3 {
             assert!((local[i] - world[i]).abs() < 1e-5);
@@ -707,13 +1002,14 @@ mod tests {
 
     #[test]
     fn in_frame_round_trip_via_from_frame_local() {
+        let (lib, world_root) = canonical_world();
         let p = WorldPos::from_world_xyz([1.5, 2.1, 0.9], 12);
         let mut frame = p.anchor;
         frame.truncate(frame.depth() - 3);
-        let local = p.in_frame(&frame);
-        let q = WorldPos::from_frame_local(&frame, local, p.anchor.depth());
-        let world_back = q.to_world_xyz();
-        let world_orig = p.to_world_xyz();
+        let local = p.in_frame_in(&lib, world_root, &frame);
+        let q = WorldPos::from_frame_local_in(&lib, world_root, &frame, local, p.anchor.depth());
+        let world_back = q.to_world_xyz_in(&lib, world_root);
+        let world_orig = p.to_world_xyz_in(&lib, world_root);
         for i in 0..3 {
             assert!((world_back[i] - world_orig[i]).abs() < 1e-4);
         }
@@ -908,6 +1204,7 @@ mod tests {
 
     #[test]
     fn in_frame_cross_branch_matches_world_diff() {
+        let (lib, world_root) = canonical_world();
         // Point and frame living in different depth-1 branches: the
         // returned local coords fall outside [0, WORLD_SIZE) and must
         // match (world_pos - frame_world_origin) * (WORLD_SIZE /
@@ -936,7 +1233,7 @@ mod tests {
                 (w[2] - frame_origin[2]) * s,
             ]
         };
-        let actual = point.in_frame(&frame);
+        let actual = point.in_frame_in(&lib, world_root, &frame);
         for i in 0..3 {
             assert!(
                 (actual[i] - expected[i]).abs() < 1e-3,
@@ -947,15 +1244,37 @@ mod tests {
 
     #[test]
     fn in_frame_precision_at_deep_anchor() {
+        let (lib, world_root) = canonical_world();
         // At anchor depth 18, absolute world XYZ near 1.5 loses
         // sub-cell precision in f32. The frame-local coord should
         // hit f32-safe magnitudes inside the frame's [0, WORLD_SIZE).
         let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 18);
         let mut frame = p.anchor;
         frame.truncate(frame.depth() - 3);
-        let local = p.in_frame(&frame);
+        let local = p.in_frame_in(&lib, world_root, &frame);
         for &v in &local {
             assert!((0.0..super::WORLD_SIZE).contains(&v), "local {v} out of frame");
+        }
+    }
+
+    #[test]
+    fn face_frame_round_trip_via_frame_local_in() {
+        let (lib, world_root) = canonical_world();
+        let p = WorldPos::from_world_xyz_in(&lib, world_root, [1.5, 1.93, 1.5], 12);
+        assert!(p.anchor.depth() >= 2);
+        let mut frame = p.anchor;
+        frame.truncate(frame.depth() - 3);
+        let local = p.in_frame_in(&lib, world_root, &frame);
+        let q = WorldPos::from_frame_local_in(&lib, world_root, &frame, local, p.anchor.depth());
+        let world_back = q.to_world_xyz_in(&lib, world_root);
+        let world_orig = p.to_world_xyz_in(&lib, world_root);
+        for i in 0..3 {
+            assert!(
+                (world_back[i] - world_orig[i]).abs() < 1e-4,
+                "axis {i}: {} vs {}",
+                world_back[i],
+                world_orig[i],
+            );
         }
     }
 

@@ -28,9 +28,7 @@ struct Uniforms {
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
-    /// 0 = Cartesian (run main DDA from frame root), 1 = sphere
-    /// body (body fills [0, 3) frame; dispatch directly to
-    /// sphere_in_cell at start-of-march).
+    /// 0 = Cartesian, 1 = body root, 2 = face-space root.
     root_kind: u32,
     /// Number of ancestor ribbon entries available. When the ray
     /// exits the frame's [0, 3)³ bubble at depth 0, the shader
@@ -40,12 +38,20 @@ struct Uniforms {
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
-    /// Used when root_kind == 1.
+    /// Used when root_kind == 1 or 2.
     root_radii: vec4<f32>,
+    /// x = face id, y = how many generic UVR pops remain before the
+    /// next pop crosses from face root to body.
+    root_face_meta: vec4<u32>,
+    /// Current face-frame cell bounds inside the full face:
+    /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
+    root_face_bounds: vec4<f32>,
+    root_face_pop_pos: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
+const ROOT_KIND_FACE: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node; `slot` is the slot in that
@@ -138,6 +144,15 @@ fn face_v_axis(face: u32) -> vec3<f32> {
     }
 }
 
+fn face_uv_to_dir(face: u32, u: f32, v: f32) -> vec3<f32> {
+    let cube_u = ea_to_cube(u);
+    let cube_v = ea_to_cube(v);
+    let n = face_normal(face);
+    let u_axis = face_u_axis(face);
+    let v_axis = face_v_axis(face);
+    return normalize(n + cube_u * u_axis + cube_v * v_axis);
+}
+
 fn pick_face(n: vec3<f32>) -> u32 {
     let ax = abs(n.x); let ay = abs(n.y); let az = abs(n.z);
     if ax >= ay && ax >= az {
@@ -201,6 +216,7 @@ struct FaceWalkResult {
 // limit, NOT a per-planet cap). The walker exits on Empty/Block
 // terminals, so this is effectively unbounded for real content.
 const MAX_FACE_DEPTH: u32 = 63u;
+const FACE_ROOT_LOD_THRESHOLD_PIXELS: f32 = 3.0;
 fn walk_face_subtree(body_node_idx: u32, face: u32,
                      un_in: f32, vn_in: f32, rn_in: f32) -> FaceWalkResult {
     var result: FaceWalkResult;
@@ -287,6 +303,275 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     result.v_lo = v_sum + v_comp;
     result.r_lo = r_sum + r_comp;
     result.size = size;
+    return result;
+}
+
+// Like walk_face_subtree, but starts from a face node that is
+// already the render-frame root. Bounds are returned in the root
+// face-node's local normalized [0,1]^3 frame, so callers can jump
+// directly to the next terminal cell boundary without marching the
+// intermediate 3x3x3 stacks one level at a time.
+fn walk_face_node(node_idx: u32,
+                  un_in: f32, vn_in: f32, rn_in: f32,
+                  ray_t: f32) -> FaceWalkResult {
+    var result: FaceWalkResult;
+    result.block = 0u;
+    result.depth = 0u;
+    result.u_lo = 0.0;
+    result.v_lo = 0.0;
+    result.r_lo = 0.0;
+    result.size = 1.0;
+
+    var node = node_idx;
+    var un = clamp(un_in, 0.0, 0.9999999);
+    var vn = clamp(vn_in, 0.0, 0.9999999);
+    var rn = clamp(rn_in, 0.0, 0.9999999);
+
+    var u_sum: f32 = 0.0; var u_comp: f32 = 0.0;
+    var v_sum: f32 = 0.0; var v_comp: f32 = 0.0;
+    var r_sum: f32 = 0.0; var r_comp: f32 = 0.0;
+    var size: f32 = 1.0;
+
+    for (var d: u32 = 1u; d <= MAX_FACE_DEPTH; d = d + 1u) {
+        let us = min(u32(un * 3.0), 2u);
+        let vs = min(u32(vn * 3.0), 2u);
+        let rs = min(u32(rn * 3.0), 2u);
+        let slot = rs * 9u + vs * 3u + us;
+        let packed = child_packed(node, slot);
+        let tag = child_tag(packed);
+
+        let step_size = size * (1.0 / 3.0);
+        let u_add = step_size * f32(us);
+        let v_add = step_size * f32(vs);
+        let r_add = step_size * f32(rs);
+
+        let yu = u_add - u_comp;
+        let tu = u_sum + yu;
+        u_comp = (tu - u_sum) - yu;
+        u_sum = tu;
+
+        let yv = v_add - v_comp;
+        let tv = v_sum + yv;
+        v_comp = (tv - v_sum) - yv;
+        v_sum = tv;
+
+        let yr = r_add - r_comp;
+        let tr = r_sum + yr;
+        r_comp = (tr - r_sum) - yr;
+        r_sum = tr;
+
+        size = step_size;
+
+        if tag == 0u || tag == 1u {
+            result.block = select(0u, child_block_type(packed), tag == 1u);
+            result.depth = d;
+            result.u_lo = u_sum + u_comp;
+            result.v_lo = v_sum + v_comp;
+            result.r_lo = r_sum + r_comp;
+            result.size = size;
+            return result;
+        }
+
+        let cell_size_local = 3.0 * size;
+        let ray_dist = max(ray_t, 0.001);
+        let lod_pixels = cell_size_local / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+        let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
+        let at_max = d >= uniforms.max_depth;
+        if at_lod || at_max {
+            let bt = child_block_type(packed);
+            result.block = select(0u, bt, bt != 255u);
+            result.depth = d;
+            result.u_lo = u_sum + u_comp;
+            result.v_lo = v_sum + v_comp;
+            result.r_lo = r_sum + r_comp;
+            result.size = size;
+            return result;
+        }
+
+        node = child_node_index(node, slot);
+        un = un * 3.0 - f32(us);
+        vn = vn * 3.0 - f32(vs);
+        rn = rn * 3.0 - f32(rs);
+    }
+
+    result.depth = MAX_FACE_DEPTH;
+    result.u_lo = u_sum + u_comp;
+    result.v_lo = v_sum + v_comp;
+    result.r_lo = r_sum + r_comp;
+    result.size = size;
+    return result;
+}
+
+fn root_face_point_to_body(point: vec3<f32>) -> vec3<f32> {
+    let face = uniforms.root_face_meta.x;
+    let bounds = uniforms.root_face_bounds;
+    let un = clamp(bounds.x + (point.x / 3.0) * bounds.w, 0.0, 0.9999999);
+    let vn = clamp(bounds.y + (point.y / 3.0) * bounds.w, 0.0, 0.9999999);
+    let rn = clamp(bounds.z + (point.z / 3.0) * bounds.w, 0.0, 0.9999999);
+    let dir = face_uv_to_dir(face, un * 2.0 - 1.0, vn * 2.0 - 1.0);
+    let radius_local = uniforms.root_radii.x + rn * (uniforms.root_radii.y - uniforms.root_radii.x);
+    let body_local = vec3<f32>(0.5) + dir * radius_local;
+    return body_local * 3.0;
+}
+
+fn face_root_point_to_body(point: vec3<f32>) -> vec3<f32> {
+    let face = uniforms.root_face_meta.x;
+    let un = clamp(point.x / 3.0, 0.0, 0.9999999);
+    let vn = clamp(point.y / 3.0, 0.0, 0.9999999);
+    let rn = clamp(point.z / 3.0, 0.0, 0.9999999);
+    let dir = face_uv_to_dir(face, un * 2.0 - 1.0, vn * 2.0 - 1.0);
+    let radius_local = uniforms.root_radii.x + rn * (uniforms.root_radii.y - uniforms.root_radii.x);
+    let body_local = vec3<f32>(0.5) + dir * radius_local;
+    return body_local * 3.0;
+}
+
+fn face_dir_to_body(origin: vec3<f32>, dir: vec3<f32>, use_root_bounds: bool) -> vec3<f32> {
+    let eps = max(uniforms.root_face_bounds.w * 1e-3, 1e-5);
+    let p0 = select(face_root_point_to_body(origin), root_face_point_to_body(origin), use_root_bounds);
+    let p1 = select(
+        face_root_point_to_body(origin + dir * eps),
+        root_face_point_to_body(origin + dir * eps),
+        use_root_bounds,
+    );
+    let d = p1 - p0;
+    if dot(d, d) < 1e-12 {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    return normalize(d);
+}
+
+fn face_local_normal_to_body(point: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    let p = root_face_point_to_body(point);
+    let dir = normalize(p - vec3<f32>(1.5));
+    let face = uniforms.root_face_meta.x;
+    let n_axis = face_normal(face);
+    let u_axis = face_u_axis(face);
+    let v_axis = face_v_axis(face);
+    if abs(normal.z) > 0.5 {
+        return normalize(dir * sign(normal.z));
+    }
+    if abs(normal.y) > 0.5 {
+        return normalize(v_axis * sign(normal.y));
+    }
+    let axis_dot = max(dot(dir, n_axis), 1e-5);
+    let u_world = normalize(u_axis - n_axis * (dot(dir, u_axis) / axis_dot));
+    return normalize(u_world * sign(normal.x));
+}
+
+fn face_box_to_body_bounds(hmin: vec3<f32>, hmax: vec3<f32>) -> mat2x3<f32> {
+    var mn = vec3<f32>(1e20);
+    var mx = vec3<f32>(-1e20);
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+        let corner = vec3<f32>(
+            select(hmin.x, hmax.x, (i & 1u) != 0u),
+            select(hmin.y, hmax.y, (i & 2u) != 0u),
+            select(hmin.z, hmax.z, (i & 4u) != 0u),
+        );
+        let p = face_root_point_to_body(corner);
+        mn = min(mn, p);
+        mx = max(mx, p);
+    }
+    return mat2x3<f32>(mn, mx);
+}
+
+fn march_face_root(
+    root_node_idx: u32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.highlight_min = vec3<f32>(0.0);
+    result.highlight_max = vec3<f32>(0.0);
+    result.frame_scale = 1.0;
+
+    let inv_dir = vec3<f32>(
+        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+    );
+    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
+        return result;
+    }
+
+    let t_start = max(root_hit.t_enter, 0.0) + 0.001;
+    var t = t_start;
+    var steps = 0u;
+    var last_face_id: u32 = 6u;
+    loop {
+        if t >= root_hit.t_exit || steps > 4096u { break; }
+        steps = steps + 1u;
+
+        let local = ray_origin + ray_dir * t;
+        if local.x < 0.0 || local.x >= 3.0 || local.y < 0.0 || local.y >= 3.0 || local.z < 0.0 || local.z >= 3.0 {
+            break;
+        }
+
+        let walk = walk_face_node(
+            root_node_idx,
+            local.x / 3.0,
+            local.y / 3.0,
+            local.z / 3.0,
+            t,
+        );
+
+        if walk.block != 0u {
+            var hit_normal: vec3<f32>;
+            switch last_face_id {
+                case 0u: { hit_normal = vec3<f32>(-1.0, 0.0, 0.0); }
+                case 1u: { hit_normal = vec3<f32>( 1.0, 0.0, 0.0); }
+                case 2u: { hit_normal = vec3<f32>(0.0, -1.0, 0.0); }
+                case 3u: { hit_normal = vec3<f32>(0.0,  1.0, 0.0); }
+                case 4u: { hit_normal = vec3<f32>(0.0, 0.0, -1.0); }
+                case 5u: { hit_normal = vec3<f32>(0.0, 0.0,  1.0); }
+                default: { hit_normal = vec3<f32>(0.0, 0.0, 1.0); }
+            }
+            result.hit = true;
+            result.t = t;
+            result.color = palette.colors[walk.block].rgb;
+            result.normal = hit_normal;
+            return result;
+        }
+
+        let u_lo = walk.u_lo * 3.0;
+        let u_hi = (walk.u_lo + walk.size) * 3.0;
+        let v_lo = walk.v_lo * 3.0;
+        let v_hi = (walk.v_lo + walk.size) * 3.0;
+        let r_lo = walk.r_lo * 3.0;
+        let r_hi = (walk.r_lo + walk.size) * 3.0;
+
+        var t_next = root_hit.t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        if abs(ray_dir.x) > 1e-8 {
+            let cand_u_lo = (u_lo - ray_origin.x) / ray_dir.x;
+            if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+            let cand_u_hi = (u_hi - ray_origin.x) / ray_dir.x;
+            if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        }
+        if abs(ray_dir.y) > 1e-8 {
+            let cand_v_lo = (v_lo - ray_origin.y) / ray_dir.y;
+            if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+            let cand_v_hi = (v_hi - ray_origin.y) / ray_dir.y;
+            if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        }
+        if abs(ray_dir.z) > 1e-8 {
+            let cand_r_lo = (r_lo - ray_origin.z) / ray_dir.z;
+            if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+            let cand_r_hi = (r_hi - ray_origin.z) / ray_dir.z;
+            if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+        }
+
+        if t_next >= root_hit.t_exit { break; }
+        last_face_id = winning_face;
+        let cell_size_local = 3.0 * walk.size;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(cell_size_local * 1e-3, t_ulp);
+        t = t_next + cell_eps;
+    }
+
     return result;
 }
 
@@ -760,10 +1045,16 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 current_idx, body_origin, body_size,
                 inner_r, outer_r, ray_origin, ray_dir,
             );
+        } else if current_kind == ROOT_KIND_FACE {
+            r = march_face_root(current_idx, ray_origin, ray_dir);
         } else {
             r = march_cartesian(current_idx, ray_origin, ray_dir);
         }
         if r.hit {
+            if current_kind == ROOT_KIND_FACE {
+                let hit_pos = ray_origin + ray_dir * r.t;
+                r.normal = face_local_normal_to_body(hit_pos, r.normal);
+            }
             r.frame_level = ribbon_level;
             r.highlight_min = cur_hmin;
             r.highlight_max = cur_hmax;
@@ -775,35 +1066,53 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if ribbon_level >= uniforms.ribbon_count {
             break;
         }
-        let entry = ribbon[ribbon_level];
-        let s = entry.slot;
-        let sx = i32(s % 3u);
-        let sy = i32((s / 3u) % 3u);
-        let sz = i32(s / 9u);
-        // Pop transform: scale ORIGIN by 1/3 + integer offset, but
-        // KEEP `ray_dir` at unit magnitude. Earlier versions divided
-        // dir by 3 to preserve t-units; that underflowed the
-        // 1e-8 parallel-axis check after ~17 pops. Now `t` is no
-        // longer continuous across frames — each frame's DDA runs
-        // its own t starting from where the ray entered.
-        let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
-        ray_origin = slot_off + ray_origin / 3.0;
-        // Same transform on the highlight AABB so it stays in
-        // the ray's current frame coords.
-        cur_hmin = slot_off + cur_hmin / 3.0;
-        cur_hmax = slot_off + cur_hmax / 3.0;
-        cur_scale = cur_scale * (1.0 / 3.0);
-        // ray_dir unchanged.
-        current_idx = entry.node_idx;
-        let k = node_kinds[current_idx].kind;
-        if k == 1u {
+        if current_kind == ROOT_KIND_FACE {
+            let body_pop_level = uniforms.root_face_meta.y;
+            if body_pop_level >= uniforms.ribbon_count {
+                break;
+            }
+            let body_entry = ribbon[body_pop_level];
+            let face_origin = ray_origin;
+            ray_origin = uniforms.root_face_pop_pos.xyz;
+            ray_dir = face_dir_to_body(face_origin, ray_dir, true);
+            if uniforms.highlight_active != 0u {
+                let bounds = face_box_to_body_bounds(cur_hmin, cur_hmax);
+                cur_hmin = bounds[0];
+                cur_hmax = bounds[1];
+            }
+            current_idx = body_entry.node_idx;
             current_kind = ROOT_KIND_BODY;
             inner_r = node_kinds[current_idx].inner_r;
             outer_r = node_kinds[current_idx].outer_r;
+            ribbon_level = body_pop_level + 1u;
         } else {
-            current_kind = ROOT_KIND_CARTESIAN;
+            let entry = ribbon[ribbon_level];
+            let s = entry.slot;
+            let sx = i32(s % 3u);
+            let sy = i32((s / 3u) % 3u);
+            let sz = i32(s / 9u);
+            let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+            ray_origin = slot_off + ray_origin / 3.0;
+            if uniforms.highlight_active != 0u {
+                cur_hmin = slot_off + cur_hmin / 3.0;
+                cur_hmax = slot_off + cur_hmax / 3.0;
+            }
+            cur_scale = cur_scale * (1.0 / 3.0);
+            current_idx = entry.node_idx;
+            if current_kind == ROOT_KIND_FACE {
+                current_kind = ROOT_KIND_FACE;
+            } else {
+                let k = node_kinds[current_idx].kind;
+                if k == 1u {
+                    current_kind = ROOT_KIND_BODY;
+                    inner_r = node_kinds[current_idx].inner_r;
+                    outer_r = node_kinds[current_idx].outer_r;
+                } else {
+                    current_kind = ROOT_KIND_CARTESIAN;
+                }
+            }
+            ribbon_level = ribbon_level + 1u;
         }
-        ribbon_level = ribbon_level + 1u;
     }
 
     var result: HitResult;
@@ -841,7 +1150,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         (0.5 - in.uv.y) * 2.0 * half_fov_tan,
     );
     let ray_dir = normalize(camera.forward + camera.right * ndc.x + camera.up * ndc.y);
-
     let result = march(camera.pos, ray_dir);
 
     var color: vec3<f32>;

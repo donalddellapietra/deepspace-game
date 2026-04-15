@@ -10,6 +10,102 @@ use super::cubesphere::{world_to_coord, FACE_SLOTS};
 use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
+use crate::world::anchor::WORLD_SIZE;
+
+#[derive(Clone, Copy)]
+struct FrameFaceInfo {
+    body_id: NodeId,
+    inner_r: f32,
+    outer_r: f32,
+    face: super::cubesphere::Face,
+    body_depth: usize,
+    body_center_world: [f32; 3],
+    u_lo: f32,
+    v_lo: f32,
+    r_lo: f32,
+    size: f32,
+}
+
+fn frame_face_info(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame_path: &[u8],
+) -> Option<FrameFaceInfo> {
+    if frame_path.len() < 2 {
+        return None;
+    }
+    let root = library.get(world_root)?;
+    let body_slot = CENTER_SLOT;
+    let Child::Node(body_id) = root.children[body_slot] else {
+        return None;
+    };
+    let body = library.get(body_id)?;
+    let NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
+        return None;
+    };
+    if frame_path[0] as usize != body_slot {
+        return None;
+    }
+    let body_size_world = WORLD_SIZE / 3.0;
+    let (sx, sy, sz) = slot_coords(body_slot);
+    let body_center_world = [
+        sx as f32 * body_size_world + body_size_world * 0.5,
+        sy as f32 * body_size_world + body_size_world * 0.5,
+        sz as f32 * body_size_world + body_size_world * 0.5,
+    ];
+    let face_slot = frame_path[1] as usize;
+    let face_idx = FACE_SLOTS.iter().position(|&s| s == face_slot)?;
+    let mut u_lo = 0.0f32;
+    let mut v_lo = 0.0f32;
+    let mut r_lo = 0.0f32;
+    let mut size = 1.0f32;
+    for &slot in &frame_path[2..] {
+        let (us, vs, rs) = slot_coords(slot as usize);
+        let child = size / 3.0;
+        u_lo += us as f32 * child;
+        v_lo += vs as f32 * child;
+        r_lo += rs as f32 * child;
+        size = child;
+    }
+    Some(FrameFaceInfo {
+        body_id,
+        inner_r,
+        outer_r,
+        face: super::cubesphere::Face::from_index(face_idx as u8),
+        body_depth: 1,
+        body_center_world,
+        u_lo,
+        v_lo,
+        r_lo,
+        size,
+    })
+}
+
+fn face_frame_point_to_body(point: [f32; 3], info: FrameFaceInfo) -> [f32; 3] {
+    let un = (info.u_lo + (point[0] / 3.0) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
+    let vn = (info.v_lo + (point[1] / 3.0) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
+    let rn = (info.r_lo + (point[2] / 3.0) * info.size).clamp(0.0, 1.0 - f32::EPSILON);
+    let world = super::cubesphere::coord_to_world(
+        info.body_center_world,
+        super::cubesphere::CubeSphereCoord {
+            face: info.face,
+            u: un * 2.0 - 1.0,
+            v: vn * 2.0 - 1.0,
+            r: info.inner_r + rn * (info.outer_r - info.inner_r),
+        },
+    );
+    [world[0], world[1], world[2]]
+}
+
+fn face_frame_dir_to_body(origin: [f32; 3], dir: [f32; 3], info: FrameFaceInfo) -> [f32; 3] {
+    let eps = (info.size * 1e-3).max(1e-5);
+    let p0 = face_frame_point_to_body(origin, info);
+    let p1 = face_frame_point_to_body(
+        [origin[0] + dir[0] * eps, origin[1] + dir[1] * eps, origin[2] + dir[2] * eps],
+        info,
+    );
+    sdf::normalize([p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]])
+}
 
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
@@ -100,6 +196,74 @@ pub fn cpu_raycast_in_frame(
     }
     let effective_depth = chain.len() - 1; // edges traversed
     let frame_entries = &frame_entries[..effective_depth];
+
+    if let Some(face_info) = frame_face_info(library, world_root, &frame_path[..effective_depth]) {
+        let body_ray_origin = face_frame_point_to_body(cam_local, face_info);
+        let body_ray_dir = face_frame_dir_to_body(cam_local, ray_dir, face_info);
+        let ancestor_prefix: Vec<(NodeId, usize)> =
+            frame_entries.iter().take(face_info.body_depth).cloned().collect();
+        if let Some(hit) = cs_raycast_in_body(
+            library,
+            face_info.body_id,
+            [0.0, 0.0, 0.0],
+            3.0,
+            face_info.inner_r,
+            face_info.outer_r,
+            body_ray_origin,
+            body_ray_dir,
+            &ancestor_prefix,
+            max_face_depth,
+        ) {
+            return Some(hit);
+        }
+        let mut current_frame_depth = face_info.body_depth;
+        let mut ray_origin = body_ray_origin;
+        let ray_dir = body_ray_dir;
+        loop {
+            let frame_root_id = chain[current_frame_depth];
+            let inner_max = max_depth.saturating_sub(current_frame_depth as u32);
+            let frame_node = library.get(frame_root_id);
+            let frame_kind = frame_node.map(|n| n.kind);
+            if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
+                let inner_ancestor: Vec<(NodeId, usize)> =
+                    frame_entries.iter().take(current_frame_depth).cloned().collect();
+                if let Some(hit) = cs_raycast_in_body(
+                    library, frame_root_id, [0.0; 3], 3.0,
+                    inner_r, outer_r, ray_origin, ray_dir,
+                    &inner_ancestor, max_face_depth,
+                ) {
+                    return Some(hit);
+                }
+            } else if let Some(mut hit) = cpu_raycast_with_face_depth(
+                library, frame_root_id, ray_origin, ray_dir, inner_max, max_face_depth,
+            ) {
+                let mut new_path: Vec<(NodeId, usize)> =
+                    Vec::with_capacity(current_frame_depth + hit.path.len());
+                new_path.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                new_path.append(&mut hit.path);
+                hit.path = new_path;
+                if let Some(mut pp) = hit.place_path.take() {
+                    let mut new_pp: Vec<(NodeId, usize)> =
+                        Vec::with_capacity(current_frame_depth + pp.len());
+                    new_pp.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                    new_pp.append(&mut pp);
+                    hit.place_path = Some(new_pp);
+                }
+                return Some(hit);
+            }
+            if current_frame_depth == 0 {
+                return None;
+            }
+            let last_slot = frame_entries[current_frame_depth - 1].1;
+            let (sx, sy, sz) = slot_coords(last_slot);
+            ray_origin = [
+                sx as f32 + ray_origin[0] / 3.0,
+                sy as f32 + ray_origin[1] / 3.0,
+                sz as f32 + ray_origin[2] / 3.0,
+            ];
+            current_frame_depth -= 1;
+        }
+    }
 
     let mut current_frame_depth = effective_depth;
     let mut ray_origin = cam_local;

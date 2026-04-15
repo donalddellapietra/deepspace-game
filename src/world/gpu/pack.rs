@@ -8,17 +8,207 @@
 //! - `pack_tree_lod`: distance-aware. Cartesian subtrees that
 //!   subtend less than `LOD_THRESHOLD` pixels at the camera get
 //!   flattened into a single Block leaf (their representative
-//!   block type). Sphere bodies and face cells are exempt from
-//!   flattening — their geometry semantics need the full subtree.
+//!   block type). Sphere bodies are exempt from distance-based
+//!   flattening. Face cells still keep their geometry-aware walk,
+//!   but uniform face children may collapse to Block/Empty.
 
 use std::collections::HashMap;
 
+use crate::world::cubesphere::{self, Face, FACE_SLOTS};
 use crate::world::tree::{
     slot_coords, Child, NodeId, NodeKind, NodeLibrary,
     CHILDREN_PER_NODE, UNIFORM_EMPTY, UNIFORM_MIXED,
 };
 
 use super::types::{GpuChild, GpuNodeKind, GPU_NODE_SIZE};
+
+#[derive(Clone, Copy)]
+enum QueueGeom {
+    Cartesian {
+        origin: [f32; 3],
+        cell_size: f32,
+    },
+    Body {
+        origin: [f32; 3],
+        body_size: f32,
+        inner_r: f32,
+        outer_r: f32,
+    },
+    Face {
+        body_origin: [f32; 3],
+        body_size: f32,
+        inner_r: f32,
+        outer_r: f32,
+        face: Face,
+        u_lo: f32,
+        v_lo: f32,
+        r_lo: f32,
+        size: f32,
+    },
+}
+
+fn vec3_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn vec3_scale(v: [f32; 3], s: f32) -> [f32; 3] {
+    [v[0] * s, v[1] * s, v[2] * s]
+}
+
+fn vec3_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn face_child_bounds(
+    u_lo: f32,
+    v_lo: f32,
+    r_lo: f32,
+    size: f32,
+    slot: usize,
+) -> (f32, f32, f32, f32) {
+    let (us, vs, rs) = slot_coords(slot);
+    let child_size = size / 3.0;
+    (
+        u_lo + us as f32 * child_size,
+        v_lo + vs as f32 * child_size,
+        r_lo + rs as f32 * child_size,
+        child_size,
+    )
+}
+
+fn child_geom(parent: QueueGeom, slot: usize, child_kind: NodeKind) -> QueueGeom {
+    match parent {
+        QueueGeom::Cartesian { origin, cell_size } => {
+            let (cx, cy, cz) = slot_coords(slot);
+            let child_origin = [
+                origin[0] + cx as f32 * cell_size,
+                origin[1] + cy as f32 * cell_size,
+                origin[2] + cz as f32 * cell_size,
+            ];
+            match child_kind {
+                NodeKind::CubedSphereBody { inner_r, outer_r } => QueueGeom::Body {
+                    origin: child_origin,
+                    body_size: cell_size,
+                    inner_r,
+                    outer_r,
+                },
+                _ => QueueGeom::Cartesian {
+                    origin: child_origin,
+                    cell_size: cell_size / 3.0,
+                },
+            }
+        }
+        QueueGeom::Body { origin, body_size, inner_r, outer_r } => {
+            if let Some(face_idx) = FACE_SLOTS.iter().position(|&s| s == slot) {
+                QueueGeom::Face {
+                    body_origin: origin,
+                    body_size,
+                    inner_r,
+                    outer_r,
+                    face: Face::from_index(face_idx as u8),
+                    u_lo: 0.0,
+                    v_lo: 0.0,
+                    r_lo: 0.0,
+                    size: 1.0,
+                }
+            } else {
+                let child_span = body_size / 3.0;
+                let (cx, cy, cz) = slot_coords(slot);
+                let child_origin = [
+                    origin[0] + cx as f32 * child_span,
+                    origin[1] + cy as f32 * child_span,
+                    origin[2] + cz as f32 * child_span,
+                ];
+                QueueGeom::Cartesian {
+                    origin: child_origin,
+                    cell_size: child_span / 3.0,
+                }
+            }
+        }
+        QueueGeom::Face {
+            body_origin,
+            body_size,
+            inner_r,
+            outer_r,
+            face,
+            u_lo,
+            v_lo,
+            r_lo,
+            size,
+        } => {
+            let (child_u_lo, child_v_lo, child_r_lo, child_size) =
+                face_child_bounds(u_lo, v_lo, r_lo, size, slot);
+            QueueGeom::Face {
+                body_origin,
+                body_size,
+                inner_r,
+                outer_r,
+                face,
+                u_lo: child_u_lo,
+                v_lo: child_v_lo,
+                r_lo: child_r_lo,
+                size: child_size,
+            }
+        }
+    }
+}
+
+fn screen_pixels_for_geom(
+    geom: QueueGeom,
+    camera_pos: [f32; 3],
+    half_fov_recip: f32,
+) -> Option<f32> {
+    match geom {
+        QueueGeom::Cartesian { origin, cell_size } => {
+            let child_center = [
+                origin[0] + cell_size * 1.5,
+                origin[1] + cell_size * 1.5,
+                origin[2] + cell_size * 1.5,
+            ];
+            let dist = vec3_distance(child_center, camera_pos).max(0.001);
+            Some((cell_size * 3.0) / dist * half_fov_recip)
+        }
+        QueueGeom::Body { .. } => None,
+        QueueGeom::Face {
+            body_origin,
+            body_size,
+            inner_r,
+            outer_r,
+            face,
+            u_lo,
+            v_lo,
+            r_lo,
+            size,
+        } => {
+            let body_center = vec3_add(body_origin, [body_size * 0.5; 3]);
+            let shell = (outer_r - inner_r) * body_size;
+            let r_world = inner_r * body_size + r_lo * shell;
+            let corners = cubesphere::block_corners(
+                body_center,
+                face,
+                u_lo * 2.0 - 1.0,
+                v_lo * 2.0 - 1.0,
+                r_world,
+                size * 2.0,
+                size * 2.0,
+                size * shell,
+            );
+            let center = corners
+                .iter()
+                .fold([0.0; 3], |acc, &p| vec3_add(acc, p));
+            let center = vec3_scale(center, 1.0 / 8.0);
+            let radius = corners
+                .iter()
+                .map(|&p| vec3_distance(p, center))
+                .fold(0.0, f32::max);
+            let dist = (vec3_distance(center, camera_pos) - radius).max(0.001);
+            Some((radius * 2.0) / dist * half_fov_recip)
+        }
+    }
+}
 
 /// Pack the visible portion of the tree into flat GPU buffers.
 /// Returns `(tree_data, node_kinds, root_buffer_index)`.
@@ -135,8 +325,7 @@ pub fn pack_tree_lod_preserving(
 
     struct QueueEntry {
         node_id: NodeId,
-        origin: [f32; 3],
-        cell_size: f32,
+        geom: QueueGeom,
     }
 
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
@@ -149,26 +338,23 @@ pub fn pack_tree_lod_preserving(
     overrides.push([None; CHILDREN_PER_NODE]);
     queue.push(QueueEntry {
         node_id: root,
-        origin: [0.0; 3],
-        cell_size: 1.0,
+        geom: QueueGeom::Cartesian {
+            origin: [0.0; 3],
+            cell_size: 1.0,
+        },
     });
     let mut head = 0;
 
     while head < queue.len() {
         let entry = &queue[head];
         let node_id = entry.node_id;
-        let node_origin = entry.origin;
-        let cell_size = entry.cell_size;
+        let node_geom = entry.geom;
         let ordered_idx = head;
         head += 1;
 
         let Some(node) = library.get(node_id) else { continue };
-
-        // Sphere-body and face nodes do NOT participate in
-        // distance-LOD flattening — their children are interpreted
-        // by the shader's NodeKind dispatch. Flattening would lose
-        // the geometric semantics. Only Cartesian nodes apply LOD.
-        let lod_active = matches!(node.kind, NodeKind::Cartesian);
+        let uniform_collapse_active =
+            matches!(node.kind, NodeKind::Cartesian | NodeKind::CubedSphereFace { .. });
 
         for (slot, child) in node.children.iter().enumerate() {
             if let Child::Node(child_id) = child {
@@ -177,14 +363,17 @@ pub fn pack_tree_lod_preserving(
                     None => continue,
                 };
 
-                // Uniform-content collapse — only safe for Cartesian
-                // nodes (face/body subtrees have geometry that the
-                // shader needs to walk). Skipped for slots on the
-                // camera's preserve path so build_ribbon can
-                // descend.
-                let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
+                // Uniform-content collapse is safe for Cartesian and
+                // face subtrees: a terminal Block/Empty child still
+                // occupies the same parent cell, just without paying
+                // to walk deeper into a uniform subtree. Skipped for
+                // slots on the camera's preserve path so build_ribbon
+                // can descend.
+                let child_is_collapseable =
+                    matches!(child_node.kind, NodeKind::Cartesian | NodeKind::CubedSphereFace { .. });
                 let on_preserve = preserve_pairs.contains(&(node_id, slot as u8));
-                if !on_preserve && lod_active && child_is_cartesian
+                let child_geom = child_geom(node_geom, slot, child_node.kind);
+                if !on_preserve && uniform_collapse_active && child_is_collapseable
                     && child_node.uniform_type != UNIFORM_MIXED {
                     let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
                         GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
@@ -195,18 +384,12 @@ pub fn pack_tree_lod_preserving(
                     continue;
                 }
 
-                if !on_preserve && lod_active && child_is_cartesian {
-                    let (cx, cy, cz) = slot_coords(slot);
-                    let child_center = [
-                        node_origin[0] + (cx as f32 + 0.5) * cell_size,
-                        node_origin[1] + (cy as f32 + 0.5) * cell_size,
-                        node_origin[2] + (cz as f32 + 0.5) * cell_size,
-                    ];
-                    let dx = child_center[0] - camera_pos[0];
-                    let dy = child_center[1] - camera_pos[1];
-                    let dz = child_center[2] - camera_pos[2];
-                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
-                    let screen_pixels = cell_size / dist * half_fov_recip;
+                if !on_preserve && !matches!(child_geom, QueueGeom::Body { .. }) {
+                    let screen_pixels = screen_pixels_for_geom(
+                        child_geom,
+                        camera_pos,
+                        half_fov_recip,
+                    ).unwrap_or(f32::INFINITY);
                     if screen_pixels < LOD_THRESHOLD {
                         let gpu = if child_node.representative_block < 255 {
                             GpuChild { tag: 1, block_type: child_node.representative_block, _pad: 0, node_index: 0 }
@@ -223,16 +406,9 @@ pub fn pack_tree_lod_preserving(
                     visited.insert(*child_id, idx);
                     ordered.push(*child_id);
                     overrides.push([None; CHILDREN_PER_NODE]);
-                    let (cx, cy, cz) = slot_coords(slot);
-                    let child_origin = [
-                        node_origin[0] + cx as f32 * cell_size,
-                        node_origin[1] + cy as f32 * cell_size,
-                        node_origin[2] + cz as f32 * cell_size,
-                    ];
                     queue.push(QueueEntry {
                         node_id: *child_id,
-                        origin: child_origin,
-                        cell_size: cell_size / 3.0,
+                        geom: child_geom,
                     });
                 }
             }
@@ -408,6 +584,98 @@ mod tests {
             assert_eq!(data[sib].tag, 0,
                 "sibling slot {sib} should be flattened");
         }
+    }
+
+    #[test]
+    fn pack_lod_collapses_uniform_face_child_off_preserve_path() {
+        let mut lib = NodeLibrary::default();
+        let uniform_leaf_face = lib.insert_with_kind(
+            uniform_children(Child::Block(crate::world::palette::block::STONE)),
+            NodeKind::CubedSphereFace { face: crate::world::cubesphere::Face::PosX },
+        );
+        let mut root_children = empty_children();
+        root_children[0] = Child::Node(uniform_leaf_face);
+        let root = lib.insert_with_kind(
+            root_children,
+            NodeKind::CubedSphereFace { face: crate::world::cubesphere::Face::PosX },
+        );
+        lib.ref_inc(root);
+
+        let camera_pos = [1.5, 2.0, 1.5];
+        let (data, _kinds, _root_idx) = pack_tree_lod_preserving(
+            &lib, root, camera_pos, 1080.0, 1.2, &[],
+        );
+
+        assert_eq!(data[0].tag, 1, "uniform face subtree should collapse to Block");
+        assert_eq!(data[0].block_type, crate::world::palette::block::STONE);
+    }
+
+    #[test]
+    fn pack_lod_flattens_far_face_root() {
+        let mut lib = NodeLibrary::default();
+        let mut face_children = empty_children();
+        face_children[0] = Child::Block(crate::world::palette::block::STONE);
+        let face_root = lib.insert_with_kind(
+            face_children,
+            NodeKind::CubedSphereFace { face: crate::world::cubesphere::Face::PosX },
+        );
+        let mut body_children = empty_children();
+        body_children[FACE_SLOTS[0]] = Child::Node(face_root);
+        let body = lib.insert_with_kind(
+            body_children,
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+        );
+        let mut root_children = empty_children();
+        root_children[CENTER_SLOT] = Child::Node(body);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        let (data, kinds, _) = pack_tree_lod(
+            &lib, root, [1000.0, 1000.0, 1000.0], 1080.0, 1.2,
+        );
+        let body_idx = kinds.iter().position(|k| k.kind == 1).expect("body present");
+        assert_ne!(data[body_idx * 27 + FACE_SLOTS[0]].tag, 2,
+            "far face root should LOD-flatten instead of forcing a node");
+    }
+
+    #[test]
+    fn pack_lod_flattens_far_face_descendant_off_preserve_path() {
+        let mut lib = NodeLibrary::default();
+        let mut inner_children = empty_children();
+        inner_children[0] = Child::Block(crate::world::palette::block::STONE);
+        let inner = lib.insert(inner_children);
+
+        let mut face_children = empty_children();
+        face_children[0] = Child::Node(inner);
+        let face_root = lib.insert_with_kind(
+            face_children,
+            NodeKind::CubedSphereFace { face: crate::world::cubesphere::Face::PosX },
+        );
+
+        let mut body_children = empty_children();
+        body_children[FACE_SLOTS[0]] = Child::Node(face_root);
+        let body = lib.insert_with_kind(
+            body_children,
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+        );
+
+        let mut root_children = empty_children();
+        root_children[CENTER_SLOT] = Child::Node(body);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        let (data, kinds, _) = pack_tree_lod_preserving(
+            &lib,
+            root,
+            [1000.0, 1000.0, 1000.0],
+            1080.0,
+            1.2,
+            &[CENTER_SLOT as u8, FACE_SLOTS[0] as u8],
+        );
+        let body_idx = kinds.iter().position(|k| k.kind == 1).expect("body present");
+        let face_idx = data[body_idx * 27 + FACE_SLOTS[0]].node_index as usize;
+        assert_ne!(data[face_idx * 27].tag, 2,
+            "face descendants should use face-geometry LOD even when stored as Cartesian nodes");
     }
 
     #[test]

@@ -45,10 +45,22 @@ impl App {
         let vd = self.visual_depth();
         let (frame, _) = self.render_frame();
         self.active_frame = frame;
-        let cam_local = self.camera.position.in_frame(&self.active_frame);
+        let chain = super::frame::FrameKindChain::build(
+            &self.world.library, self.world.root, &self.active_frame,
+        );
+        let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
+        let cam_local = super::frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
+        let (fwd_world, right_world, up_world) = self.camera.basis();
+        let cam_gpu = self.camera.gpu_camera_with_basis(
+            cam_local,
+            super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, fwd_world),
+            super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, right_world),
+            super::frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, up_world),
+            1.2,
+        );
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
-            renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
+            renderer.update_camera(&cam_gpu);
         }
         log::info!(
             "Zoom: {}/{}, edit_depth: {}, visual: {}, anchor_depth: {}, frame_depth: {}",
@@ -65,8 +77,14 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(super) fn frame_aware_raycast(&self) -> Option<edit::HitInfo> {
-        let ray_dir = self.camera.forward();
-        let cam_local = self.camera.position.in_frame(&self.active_frame);
+        let chain = super::frame::FrameKindChain::build(
+            &self.world.library, self.world.root, &self.active_frame,
+        );
+        let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
+        let cam_local = super::frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
+        let ray_dir = super::frame::world_dir_to_frame(
+            &self.active_frame, &chain, cam_world, self.camera.forward(),
+        );
         edit::cpu_raycast_in_frame(
             &self.world.library, self.world.root,
             self.active_frame.as_slice(), cam_local, ray_dir,
@@ -151,7 +169,7 @@ impl App {
     /// frame's `[0, 3)³` bubble.
     pub(super) fn upload_tree_lod(&mut self) {
         let (intended_frame, _frame_root_id) = self.render_frame();
-        let cam_world = self.camera.world_pos_f32();
+        let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
         // Preserve the intended frame path through the pack so
         // build_ribbon can walk it. Without this, uniform-empty
         // Cartesian siblings on the camera's path get flattened
@@ -170,23 +188,53 @@ impl App {
         let r = gpu::build_ribbon(&tree_data, intended_frame.as_slice());
         let effective_frame = super::frame::frame_from_slots(&r.reached_slots);
         self.active_frame = effective_frame;
-        let cam_local = self.camera.position.in_frame(&effective_frame);
+        let chain = super::frame::FrameKindChain::build(
+            &self.world.library, self.world.root, &effective_frame,
+        );
+        let cam_local = super::frame::world_point_to_frame(&effective_frame, &chain, cam_world);
+        let (fwd_world, right_world, up_world) = self.camera.basis();
+        let fwd_local =
+            super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, fwd_world);
+        let right_local =
+            super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, right_world);
+        let up_local =
+            super::frame::world_dir_to_frame(&effective_frame, &chain, cam_world, up_world);
+        let cam_gpu = self.camera.gpu_camera_with_basis(
+            cam_local,
+            fwd_local,
+            right_local,
+            up_local,
+            1.2,
+        );
         // Frame kind depends on the EFFECTIVE frame, not the
         // intended one.
         let frame_kind = self.world.library
             .get(self.frame_root_id_for(&effective_frame))
             .map(|n| n.kind)
             .unwrap_or(crate::world::tree::NodeKind::Cartesian);
+        let face_info = super::frame::face_frame_info(&effective_frame, &chain);
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &node_kinds, r.frame_root_idx);
             renderer.update_ribbon(&r.ribbon);
-            renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
-            match frame_kind {
+            renderer.update_camera(&cam_gpu);
+            if let Some(info) = face_info {
+                let pop_pos = super::frame::frame_point_to_body(cam_local, &info);
+                renderer.set_root_kind_face(
+                    info.inner_r,
+                    info.outer_r,
+                    info.face as u32,
+                    info.subtree_depth as u32,
+                    [info.u_lo, info.v_lo, info.r_lo, info.size],
+                    pop_pos,
+                );
+            } else {
+                match frame_kind {
                 crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } => {
                     renderer.set_root_kind_body(inner_r, outer_r);
                 }
                 _ => {
                     renderer.set_root_kind_cartesian();
+                }
                 }
             }
         }
@@ -217,9 +265,12 @@ impl App {
             return;
         }
         let tree_hit = self.frame_aware_raycast();
+        let chain = super::frame::FrameKindChain::build(
+            &self.world.library, self.world.root, &self.active_frame,
+        );
         if let Some(h) = &tree_hit {
-            let cam_world = self.camera.world_pos_f32();
-            let cam_local = self.camera.position.in_frame(&self.active_frame);
+            let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
+            let cam_local = super::frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
             let (frame_origin, frame_size_world) = super::frame_origin_size_world(&self.active_frame);
             let frame_scale = WORLD_SIZE / frame_size_world;
             let (hit_world_min, hit_world_max) = edit::hit_aabb(&self.world.library, h);
@@ -229,7 +280,7 @@ impl App {
                 (hit_world_min[2] + hit_world_max[2]) * 0.5,
             ];
             let hit_frame_center = super::aabb_world_to_frame(
-                &self.active_frame, hit_world_center, hit_world_center,
+                &self.active_frame, &chain, hit_world_center, hit_world_center,
             ).0;
             let cam_to_hit_world = [
                 hit_world_center[0] - cam_world[0],
@@ -268,7 +319,9 @@ impl App {
         let aabb_world = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
         // Transform AABB from world coords to frame-local coords.
         // Shader expects highlight in the same frame as `camera.pos`.
-        let aabb = aabb_world.map(|(mn, mx)| super::aabb_world_to_frame(&self.active_frame, mn, mx));
+        let aabb = aabb_world.map(|(mn, mx)| {
+            super::aabb_world_to_frame(&self.active_frame, &chain, mn, mx)
+        });
         if let Some((mn, mx)) = &aabb {
             eprintln!("highlight (frame-local): min={:?} max={:?} size={:?}",
                 mn, mx, [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]]);
@@ -276,5 +329,35 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(aabb);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::TestConfig;
+
+    #[test]
+    fn perf_smoke_cpu_paths() {
+        let mut app = App::with_test_config(TestConfig {
+            spawn_depth: Some(12),
+            ..Default::default()
+        });
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            app.upload_tree_lod();
+        }
+        let upload_ms = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..50 {
+            let _ = app.frame_aware_raycast();
+        }
+        let raycast_ms = t1.elapsed().as_secs_f64() * 1000.0 / 50.0;
+
+        eprintln!(
+            "perf_smoke_cpu_paths avg_ms upload_tree_lod={:.3} frame_aware_raycast={:.3}",
+            upload_ms, raycast_ms,
+        );
     }
 }

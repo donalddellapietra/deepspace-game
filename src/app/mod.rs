@@ -71,6 +71,9 @@ pub struct App {
     /// Headless test driver. Populated when CLI flags ask for
     /// scripted actions or screenshots. See `test_runner`.
     pub(super) test: Option<test_runner::TestRunner>,
+    /// Deterministic render/debug harness mode.
+    pub(super) render_harness: bool,
+    pub(super) show_harness_window: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -83,6 +86,8 @@ impl App {
     }
 
     pub fn with_test_config(test_cfg: TestConfig) -> Self {
+        let render_harness = test_cfg.use_render_harness();
+        let show_harness_window = test_cfg.show_window;
         // Build a Cartesian world tree, then insert the planet body
         // into its central depth-1 cell. After install, the planet
         // is a `NodeKind::CubedSphereBody` node living inside the
@@ -112,7 +117,9 @@ impl App {
 
         let default_depth = ((tree_depth as i32 - 6 + 1).max(1) as u8).min(60);
         let anchor_depth = test_cfg.spawn_depth.unwrap_or(default_depth);
-        let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
+        let position = WorldPos::from_world_xyz_in(
+            &world.library, world.root, spawn_xyz, anchor_depth,
+        );
         let desired_depth = (position.anchor.depth().saturating_sub(RENDER_FRAME_K))
             .min(RENDER_FRAME_MAX_DEPTH);
         let (active_frame, _) = frame::compute_render_frame(
@@ -152,6 +159,8 @@ impl App {
             planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
+            render_harness,
+            show_harness_window,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -174,8 +183,9 @@ impl App {
     /// The frame can be **Cartesian** (shader runs the XYZ DDA
     /// from it) or **CubedSphereBody** (shader dispatches into
     /// sphere DDA at start-of-march, body fills the `[0, 3)³`
-    /// frame). `CubedSphereFace` frames are out of scope this
-    /// pass — the walker stops before entering a face cell.
+    /// frame) or **CubedSphereFace** (shader starts in the face
+    /// cell's local `(u, v, r)` frame and can pop back to the body
+    /// through the ribbon).
     ///
     /// Cartesian descent is now safe because the GPU pack includes
     /// an ancestor ribbon back to the absolute world root, and
@@ -206,10 +216,21 @@ impl App {
 
     pub(super) fn update(&mut self, dt: f32) {
         player::update(&mut self.camera, dt);
-
-        let cam_local = self.camera.position.in_frame(&self.active_frame);
+        let chain = frame::FrameKindChain::build(
+            &self.world.library, self.world.root, &self.active_frame,
+        );
+        let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
+        let cam_local = frame::world_point_to_frame(&self.active_frame, &chain, cam_world);
+        let (fwd_world, right_world, up_world) = self.camera.basis();
+        let cam_gpu = self.camera.gpu_camera_with_basis(
+            cam_local,
+            frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, fwd_world),
+            frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, right_world),
+            frame::world_dir_to_frame(&self.active_frame, &chain, cam_world, up_world),
+            1.2,
+        );
         if let Some(renderer) = &self.renderer {
-            renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
+            renderer.update_camera(&cam_gpu);
         }
     }
 
@@ -235,7 +256,12 @@ impl App {
             p.anchor.depth(),
             p.anchor.as_slice(),
             p.offset,
-            p.to_world_xyz(),
+            p.to_world_xyz_in(&self.world.library, self.world.root),
         );
+    }
+
+    #[inline]
+    pub(super) fn overlay_enabled(&self) -> bool {
+        !self.render_harness
     }
 }
