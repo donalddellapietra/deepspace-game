@@ -47,7 +47,25 @@ pub struct GpuUniforms {
     /// Cartesian DDA must skip the tree walk in that case — those
     /// cells are bulged voxels and the body pass renders them.
     pub render_root_in_sphere: u32,
-    pub _body_pad: [u32; 2],
+    /// `1` when the render root is inside a face subtree and the
+    /// shader should dispatch `march_face_chunk` (which renders the
+    /// chunk's bulged voxels at the proper visible scale instead of
+    /// the body pass's whole-shell view).
+    pub face_chunk_active: u32,
+    pub face_chunk_face: u32,
+    /// Padding so the next `vec4<f32>` aligns to 16 bytes per WGSL
+    /// uniform buffer rules (std140-like). Without this Rust packs
+    /// 4 bytes shorter than the shader expects.
+    pub _body_pad: [u32; 4],
+    /// (u_lo, u_hi, v_lo, v_hi) of the chunk in face equal-angle
+    /// coords [-1, 1].
+    pub face_chunk_uv: [f32; 4],
+    /// (r_lo, r_hi, _, _) — chunk's radial bounds in WORLD units
+    /// (relative to body center).
+    pub face_chunk_r: [f32; 4],
+    /// Body's world center in render-frame-local coords. Shared by
+    /// body pass and face-chunk pass.
+    pub body_center_local: [f32; 4],
 }
 
 pub struct Renderer {
@@ -77,6 +95,11 @@ pub struct Renderer {
     body_radii: [f32; 4],
     body_idx: u32,
     render_root_in_sphere: u32,
+    face_chunk_active: u32,
+    face_chunk_face: u32,
+    face_chunk_uv: [f32; 4],
+    face_chunk_r: [f32; 4],
+    body_center_local: [f32; 4],
 }
 
 impl Renderer {
@@ -192,7 +215,12 @@ impl Renderer {
             body_radii: [0.0; 4],
             body_idx: u32::MAX,
             render_root_in_sphere: 0,
-            _body_pad: [0; 2],
+            face_chunk_active: 0,
+            face_chunk_face: 0,
+            _body_pad: [0; 4],
+            face_chunk_uv: [0.0; 4],
+            face_chunk_r: [0.0; 4],
+            body_center_local: [0.0; 4],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -340,7 +368,35 @@ impl Renderer {
             body_radii: [0.0; 4],
             body_idx: u32::MAX,
             render_root_in_sphere: 0,
+            face_chunk_active: 0,
+            face_chunk_face: 0,
+            face_chunk_uv: [0.0; 4],
+            face_chunk_r: [0.0; 4],
+            body_center_local: [0.0; 4],
         }
+    }
+
+    /// Set (or clear with `None`) the active face-chunk for the
+    /// current render root. When set, the shader's `march_face_chunk`
+    /// renders the chunk's bulged voxels at the proper visible scale.
+    pub fn set_face_chunk(
+        &mut self,
+        chunk: Option<crate::app::edit_actions::FaceChunk>,
+        body_center_local: [f32; 3],
+    ) {
+        match chunk {
+            Some(c) => {
+                self.face_chunk_active = 1;
+                self.face_chunk_face = c.face;
+                self.face_chunk_uv = [c.u_lo, c.u_hi, c.v_lo, c.v_hi];
+                self.face_chunk_r = [c.r_lo, c.r_hi, 0.0, 0.0];
+            }
+            None => {
+                self.face_chunk_active = 0;
+            }
+        }
+        self.body_center_local = [body_center_local[0], body_center_local[1], body_center_local[2], 0.0];
+        self.write_uniforms();
     }
 
     pub fn set_render_root_in_sphere(&mut self, in_sphere: bool) {
@@ -677,7 +733,12 @@ impl Renderer {
             body_radii: self.body_radii,
             body_idx: self.body_idx,
             render_root_in_sphere: self.render_root_in_sphere,
-            _body_pad: [0; 2],
+            face_chunk_active: self.face_chunk_active,
+            face_chunk_face: self.face_chunk_face,
+            _body_pad: [0; 4],
+            face_chunk_uv: self.face_chunk_uv,
+            face_chunk_r: self.face_chunk_r,
+            body_center_local: self.body_center_local,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

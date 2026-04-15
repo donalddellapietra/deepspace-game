@@ -382,6 +382,44 @@ pub fn pack_tree_lod_multi_with_frame(
     root_origin: [f32; 3],
     root_cell_size: f32,
 ) -> (Vec<GpuChild>, Vec<GpuNodeMeta>, Vec<u32>) {
+    pack_tree_lod_multi_with_frame_inner(
+        library, roots, camera_pos, screen_height, fov,
+        root_origin, root_cell_size, false,
+    )
+}
+
+/// Same as [`pack_tree_lod_multi_with_frame`] but lets the caller
+/// declare the primary root as already inside a sphere subtree —
+/// even when its `NodeKind` is Cartesian. Necessary when the render
+/// frame walks through a body / face and lands on a face-internal
+/// Cartesian node: the kind alone doesn't reveal that the cells
+/// beneath are bulged voxels, but the caller knows from the path.
+pub fn pack_tree_lod_multi_with_frame_in_sphere(
+    library: &NodeLibrary,
+    roots: &[NodeId],
+    camera_pos: [f32; 3],
+    screen_height: f32,
+    fov: f32,
+    root_origin: [f32; 3],
+    root_cell_size: f32,
+    primary_in_sphere: bool,
+) -> (Vec<GpuChild>, Vec<GpuNodeMeta>, Vec<u32>) {
+    pack_tree_lod_multi_with_frame_inner(
+        library, roots, camera_pos, screen_height, fov,
+        root_origin, root_cell_size, primary_in_sphere,
+    )
+}
+
+fn pack_tree_lod_multi_with_frame_inner(
+    library: &NodeLibrary,
+    roots: &[NodeId],
+    camera_pos: [f32; 3],
+    screen_height: f32,
+    fov: f32,
+    root_origin: [f32; 3],
+    root_cell_size: f32,
+    primary_in_sphere: bool,
+) -> (Vec<GpuChild>, Vec<GpuNodeMeta>, Vec<u32>) {
     use super::tree::{UNIFORM_EMPTY, UNIFORM_MIXED, slot_coords};
 
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
@@ -421,12 +459,16 @@ pub fn pack_tree_lod_multi_with_frame(
         let root_kind_non_cartesian = library.get(root)
             .map(|n| !n.kind.is_cartesian())
             .unwrap_or(false);
+        // Primary root may be inside a sphere subtree even when its
+        // own kind is Cartesian (face-internal nodes). The caller
+        // knows from walking the path; we honor that flag here.
+        let in_sphere = root_kind_non_cartesian || (ri == 0 && primary_in_sphere);
         queue.push(QueueEntry {
             node_id: root,
             origin,
             cell_size,
             use_lod: ri == 0,
-            in_sphere_subtree: root_kind_non_cartesian,
+            in_sphere_subtree: in_sphere,
         });
     }
     let mut head = 0;

@@ -56,8 +56,23 @@ struct Uniforms {
     // Cartesian tree walk skips entirely in that case — those
     // cells are bulged voxels, drawn by the body pass.
     render_root_in_sphere: u32,
+    // 1 when the render root is inside a face subtree and
+    // `march_face_chunk` should render the chunk's bulged voxels at
+    // proper visible scale (instead of falling back to the body
+    // pass's whole-shell view).
+    face_chunk_active: u32,
+    face_chunk_face: u32,
     _body_pad0: u32,
     _body_pad1: u32,
+    _body_pad2: u32,
+    _body_pad3: u32,
+    // (u_lo, u_hi, v_lo, v_hi) of the chunk in equal-angle [-1, 1].
+    face_chunk_uv: vec4<f32>,
+    // (r_lo, r_hi, _, _) — chunk radial bounds in WORLD units
+    // (relative to body_center_local).
+    face_chunk_r: vec4<f32>,
+    // Body's center in render-frame-LOCAL coords.
+    body_center_local: vec4<f32>,
 }
 
 /// Per-node metadata — the NodeKind exposed to the shader. Layout
@@ -368,6 +383,142 @@ struct BodyHit {
 
 fn body_hit_miss() -> BodyHit {
     return BodyHit(false, 1e20, vec3<f32>(0.0), vec3<f32>(0.0));
+}
+
+/// Cubed-sphere DDA scoped to the render root's `(u, v, r)` sub-
+/// range within a single face. Each cell is a bulged voxel — same
+/// shell math as `march_body`, but extents come from the face_chunk
+/// uniforms and `sample_face_tree` is rooted at `uniforms.root_index`
+/// (the render root, which IS this chunk's top node) with
+/// (un, vn, rn) normalized to the chunk.
+fn march_face_chunk(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> BodyHit {
+    let face = uniforms.face_chunk_face;
+    let cs_center = uniforms.body_center_local.xyz;
+    let cs_inner = uniforms.face_chunk_r.x;  // chunk r_lo (world)
+    let cs_outer = uniforms.face_chunk_r.y;  // chunk r_hi (world)
+    let shell = cs_outer - cs_inner;
+    let u_lo = uniforms.face_chunk_uv.x;
+    let u_hi = uniforms.face_chunk_uv.y;
+    let v_lo = uniforms.face_chunk_uv.z;
+    let v_hi = uniforms.face_chunk_uv.w;
+    let du = u_hi - u_lo;
+    let dv = v_hi - v_lo;
+
+    // Ray-shell intersect (chunk's r range).
+    let oc = ray_origin - cs_center;
+    let b = dot(oc, ray_dir);
+    let c_outer = dot(oc, oc) - cs_outer * cs_outer;
+    let disc_o = b * b - c_outer;
+    if disc_o <= 0.0 { return body_hit_miss(); }
+    let sq_o = sqrt(disc_o);
+    let t_outer_enter = max(-b - sq_o, 0.0);
+    let t_outer_exit = -b + sq_o;
+    if t_outer_exit <= 0.0 { return body_hit_miss(); }
+
+    let eps = max(shell * 1e-5, 1e-7);
+    var t = t_outer_enter + eps;
+
+    // If origin is inside the inner-shell sphere, jump to its exit.
+    let r_origin = length(oc);
+    if r_origin < cs_inner {
+        let c_inner = dot(oc, oc) - cs_inner * cs_inner;
+        let disc_i = b * b - c_inner;
+        if disc_i <= 0.0 { return body_hit_miss(); }
+        let t_inner_exit = -b + sqrt(disc_i);
+        if t_inner_exit > t { t = t_inner_exit + eps; }
+    }
+
+    var steps = 0u;
+    let max_chunk_steps = 512u;
+    loop {
+        if t >= t_outer_exit || steps > max_chunk_steps { break; }
+        steps = steps + 1u;
+
+        let p = ray_origin + ray_dir * t;
+        let local = p - cs_center;
+        let r = length(local);
+        if r >= cs_outer || r < cs_inner { break; }
+
+        let n = local / r;
+        // The chunk lives entirely on `face`; if the ray's sample
+        // point doesn't project to that face, advance to the chunk
+        // exit boundary instead of sampling.
+        let sample_face = pick_face(n);
+        if sample_face != face {
+            // Step to the next radial cell boundary along the ray
+            // and keep marching — the chunk may still be reached.
+            t = t + max(eps * 8.0, shell * 0.001);
+            continue;
+        }
+
+        let n_axis = face_normal(face);
+        let u_axis = face_u_axis(face);
+        let v_axis = face_v_axis(face);
+        let axis_dot = dot(n, n_axis);
+        let cube_u = dot(n, u_axis) / axis_dot;
+        let cube_v = dot(n, v_axis) / axis_dot;
+        let u_ea = cube_to_ea(cube_u);
+        let v_ea = cube_to_ea(cube_v);
+
+        // Reject points outside the chunk's (u, v) range.
+        if u_ea < u_lo || u_ea >= u_hi || v_ea < v_lo || v_ea >= v_hi {
+            t = t + max(eps * 8.0, shell * 0.001);
+            continue;
+        }
+
+        // Normalize into the chunk's [0, 1)³ frame.
+        let un = clamp((u_ea - u_lo) / du, 0.0, 0.9999999);
+        let vn = clamp((v_ea - v_lo) / dv, 0.0, 0.9999999);
+        let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
+
+        let walk = sample_face_tree(uniforms.root_index, un, vn, rn);
+        let block_id = walk.x;
+        let term_depth = walk.y;
+        if block_id != 0u {
+            return BodyHit(true, t, shade_body_hit(block_id, n, un, vn, rn, face), n);
+        }
+
+        // Empty cell — step to its exit. Cell extents at the
+        // walker's termination depth divide the chunk's range.
+        let cells_d = pow(3.0, f32(term_depth));
+        let iu = floor(un * cells_d);
+        let iv = floor(vn * cells_d);
+        let ir = floor(rn * cells_d);
+
+        // u/v boundary planes through cs_center, in chunk-relative
+        // u_ea/v_ea remapped to global face equal-angle.
+        let u_lo_local = (iu       / cells_d);
+        let u_hi_local = ((iu+1.0) / cells_d);
+        let v_lo_local = (iv       / cells_d);
+        let v_hi_local = ((iv+1.0) / cells_d);
+        let u_lo_ea = u_lo + u_lo_local * du;
+        let u_hi_ea = u_lo + u_hi_local * du;
+        let v_lo_ea = v_lo + v_lo_local * dv;
+        let v_hi_ea = v_lo + v_hi_local * dv;
+        let k_u_lo = ea_to_cube(u_lo_ea);
+        let k_u_hi = ea_to_cube(u_hi_ea);
+        let n_u_lo = u_axis - k_u_lo * n_axis;
+        let n_u_hi = u_axis - k_u_hi * n_axis;
+        let k_v_lo = ea_to_cube(v_lo_ea);
+        let k_v_hi = ea_to_cube(v_hi_ea);
+        let n_v_lo = v_axis - k_v_lo * n_axis;
+        let n_v_hi = v_axis - k_v_hi * n_axis;
+
+        let r_lo_step = cs_inner + (ir       / cells_d) * shell;
+        let r_hi_step = cs_inner + ((ir+1.0) / cells_d) * shell;
+
+        var t_next = t_outer_exit + 1.0;
+        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_u_lo), t);
+        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_u_hi), t);
+        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_v_lo), t);
+        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_v_hi), t);
+        t_next = min_after(t_next, ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo_step, t), t);
+        t_next = min_after(t_next, ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi_step, t), t);
+
+        if t_next >= t_outer_exit { break; }
+        t = t_next + eps;
+    }
+    return body_hit_miss();
 }
 
 /// True 3D DDA over a body's cubed-sphere face subtrees. Each
@@ -859,7 +1010,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     var body_hit = body_hit_miss();
-    if uniforms.body_idx != 0xFFFFFFFFu && uniforms.body_radii.y > 0.0 {
+    if uniforms.face_chunk_active != 0u {
+        // Render root is inside a face subtree — render that
+        // chunk's bulged voxels at proper visible scale.
+        body_hit = march_face_chunk(camera.pos, ray_dir);
+    } else if uniforms.body_idx != 0xFFFFFFFFu && uniforms.body_radii.y > 0.0 {
+        // Body visible from outside (or render root above body).
         let body_frame = body_frame_from(
             uniforms.body_idx,
             uniforms.body_world.xyz,

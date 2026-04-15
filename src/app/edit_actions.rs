@@ -40,6 +40,27 @@ pub(super) struct RenderFrame {
     /// flat-Cartesian DDA must skip those — they're rendered by the
     /// body pass as bulged shell voxels instead.
     pub in_sphere: bool,
+    /// When the render root sits INSIDE a face subtree this carries
+    /// the face index + the (u, v, r) sub-range the render root
+    /// covers within the body shell. The shader's
+    /// `march_face_chunk` uses these to render bulged voxels at the
+    /// proper visible scale (deeper zoom = smaller chunk = surface
+    /// fills more of the view).
+    ///
+    /// `None` when the render root isn't a face descendant.
+    pub face_chunk: Option<FaceChunk>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FaceChunk {
+    pub face: u32,
+    pub u_lo: f32,
+    pub u_hi: f32,
+    pub v_lo: f32,
+    pub v_hi: f32,
+    /// Radii in WORLD units (relative to body center).
+    pub r_lo: f32,
+    pub r_hi: f32,
 }
 
 /// Cubed-sphere edit depth derived from the player's anchor depth.
@@ -278,22 +299,91 @@ impl App {
         // sits inside a sphere subtree where descendant Cartesian
         // cells are bulged voxels — the shader's flat-cube DDA must
         // skip them and let the body pass do the rendering.
+        use crate::world::cubesphere::{body_face_center_slot, Face};
+        use crate::world::tree::NodeKind;
+
         let mut node_id = self.world.root;
         let mut in_sphere = false;
         let mut origin = [0.0f32; 3];
         let mut cell_size = 1.0f32;
+
+        // Face-chunk tracking. Activated when the walk descends past
+        // a `CubedSphereFace` root; subdivided on each subsequent
+        // Cartesian descent according to the slot's (us, vs, rs).
+        let mut face_chunk: Option<FaceChunk> = None;
+
         for i in 0..rf_depth as usize {
             let slot = cam.anchor.slots()[i];
             let Some(node) = self.world.library.get(node_id) else {
-                return RenderFrame { origin, cell_size, node: self.world.root, in_sphere };
+                return RenderFrame {
+                    origin, cell_size, node: self.world.root,
+                    in_sphere, face_chunk,
+                };
             };
-            // The kind of the node we're DESCENDING THROUGH (the
-            // current node, not the child we'll arrive at). If it's
-            // body or face, the slot we're picking is into a sphere
-            // subtree — every node beneath inherits that.
-            if !node.kind.is_cartesian() {
-                in_sphere = true;
+            // Detect entering a face subtree. We must capture this
+            // BEFORE descending into the slot — the next iteration
+            // will be inside the face and start subdividing the
+            // chunk's (u, v, r) range.
+            match node.kind {
+                NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                    in_sphere = true;
+                    // Find which face this slot leads into.
+                    if face_chunk.is_none() {
+                        for &f in &Face::ALL {
+                            if body_face_center_slot(f) == slot as usize {
+                                // body cell width in world = cell_size
+                                // (the parent's cell_size before this
+                                // descent). inner_r/outer_r in body
+                                // local [0, 1) → world via cell_size.
+                                let cube_w = cell_size;
+                                face_chunk = Some(FaceChunk {
+                                    face: f as u32,
+                                    u_lo: -1.0, u_hi: 1.0,
+                                    v_lo: -1.0, v_hi: 1.0,
+                                    r_lo: inner_r * cube_w,
+                                    r_hi: outer_r * cube_w,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+                NodeKind::CubedSphereFace { .. } => {
+                    in_sphere = true;
+                    // Subdivide the chunk by the slot's (us, vs, rs).
+                    if let Some(ref mut c) = face_chunk {
+                        let (us, vs, rs) = slot_coords(slot as usize);
+                        let du = (c.u_hi - c.u_lo) / 3.0;
+                        let dv = (c.v_hi - c.v_lo) / 3.0;
+                        let dr = (c.r_hi - c.r_lo) / 3.0;
+                        c.u_lo = c.u_lo + us as f32 * du;
+                        c.u_hi = c.u_lo + du;
+                        c.v_lo = c.v_lo + vs as f32 * dv;
+                        c.v_hi = c.v_lo + dv;
+                        c.r_lo = c.r_lo + rs as f32 * dr;
+                        c.r_hi = c.r_lo + dr;
+                    }
+                }
+                NodeKind::Cartesian => {
+                    // Cartesian descent inside a face subtree also
+                    // subdivides the chunk (face internals are
+                    // Cartesian-marked but their slot semantics are
+                    // (u, v, r), not (x, y, z)).
+                    if let Some(ref mut c) = face_chunk {
+                        let (us, vs, rs) = slot_coords(slot as usize);
+                        let du = (c.u_hi - c.u_lo) / 3.0;
+                        let dv = (c.v_hi - c.v_lo) / 3.0;
+                        let dr = (c.r_hi - c.r_lo) / 3.0;
+                        c.u_lo = c.u_lo + us as f32 * du;
+                        c.u_hi = c.u_lo + du;
+                        c.v_lo = c.v_lo + vs as f32 * dv;
+                        c.v_hi = c.v_lo + dv;
+                        c.r_lo = c.r_lo + rs as f32 * dr;
+                        c.r_hi = c.r_lo + dr;
+                    }
+                }
             }
+
             match node.children[slot as usize] {
                 Child::Node(child_id) => {
                     let (sx, sy, sz) = slot_coords(slot as usize);
@@ -304,29 +394,21 @@ impl App {
                     node_id = child_id;
                 }
                 _ => {
-                    // Ancestor isn't instantiated; render from world
-                    // root. Shouldn't happen for the generated empty
-                    // tree, which is uniformly subdivided.
                     return RenderFrame {
                         origin: [0.0; 3], cell_size: 1.0,
                         node: self.world.root, in_sphere: false,
+                        face_chunk: None,
                     };
                 }
             }
         }
-        // Final node may itself be non-Cartesian; mark in_sphere.
         if let Some(n) = self.world.library.get(node_id) {
             if !n.kind.is_cartesian() {
                 in_sphere = true;
             }
         }
-        // After walking `rf_depth` levels, `cell_size` is the width
-        // of one cell AT that depth = the width of one root-cell of
-        // the render-frame node. `origin` is its world-space min
-        // corner. The render-frame node itself spans
-        // `[origin, origin + 3 * cell_size) = ROOT_EXTENT / 3^rf_depth`.
-        let _ = ROOT_EXTENT; // ROOT_EXTENT is baked into the numbers above.
-        RenderFrame { origin, cell_size, node: node_id, in_sphere }
+        let _ = ROOT_EXTENT;
+        RenderFrame { origin, cell_size, node: node_id, in_sphere, face_chunk }
     }
 
     /// Walk `body_anchor` from `world.root` and confirm a
@@ -368,6 +450,7 @@ impl App {
         let rf_cell = rf.cell_size;
         let rf_node = rf.node;
         let rf_in_sphere = rf.in_sphere;
+        let rf_face_chunk = rf.face_chunk;
 
         // Re-resolve the body from `body_anchor` each frame. The
         // walk catches cases where a Cartesian edit has replaced
@@ -394,7 +477,7 @@ impl App {
         let mut roots: Vec<u64> = vec![rf_node];
         if let Some(b) = body_node { roots.push(b); }
 
-        let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame(
+        let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame_in_sphere(
             &self.world.library,
             &roots,
             cam_local,
@@ -402,6 +485,7 @@ impl App {
             1.2,
             [0.0, 0.0, 0.0], // render-frame-local origin
             rf_cell,
+            rf_in_sphere,
         );
 
         // Body's footprint in render-local: cube min corner +
@@ -433,11 +517,41 @@ impl App {
             ([0.0; 4], 0.0, 0.0, u32::MAX)
         };
 
+        // Body center in render-local — needed by both body pass and
+        // face-chunk pass so they can compute world positions for
+        // bulged-voxel math without subtracting tiny world coords.
+        let body_center_local = [
+            body_world_local[0] + 0.5 * body_world_local[3],
+            body_world_local[1] + 0.5 * body_world_local[3],
+            body_world_local[2] + 0.5 * body_world_local[3],
+        ];
+
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &tree_metas, root_indices[0]);
             renderer.set_render_frame([0.0, 0.0, 0.0], rf_cell);
             renderer.set_body(body_world_local, inner_r, outer_r, body_idx);
             renderer.set_render_root_in_sphere(rf_in_sphere);
+            // `face_chunk` data is computed and plumbed all the way to
+            // the shader, but `march_face_chunk` is currently disabled
+            // (passing `None`) because the anchor walk uses Cartesian
+            // world-coord slot quantization throughout — even inside
+            // face subtrees. The chunk computed from those slots
+            // doesn't match the camera's geometric position in face
+            // (u, v, r) space, so the chunk renders solid gray from
+            // a different part of the planet.
+            //
+            // The fix is to make the anchor descent face-aware: when
+            // the parent kind is `CubedSphereBody` or
+            // `CubedSphereFace`, slot picking uses (u, v, r)
+            // projection of the camera position, NOT world-space
+            // floor. That's a deeper coords-layer change.
+            //
+            // Until then, we fall back to the body pass, which
+            // renders correctly at any zoom (body footprint is
+            // independent of anchor descent).
+            let _ = rf_face_chunk;
+            let _ = body_center_local;
+            renderer.set_face_chunk(None, body_center_local);
         }
     }
 
