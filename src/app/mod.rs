@@ -152,24 +152,27 @@ impl App {
         }
     }
 
-    /// Per-frame update.
-    ///
-    /// Physics is OFF — all motion goes through discrete debug
-    /// teleports (`App::debug_teleport`) triggered by key presses.
-    /// The camera only moves when W/A/S/D/Space/Shift is pressed,
-    /// and each press jumps exactly one cell at `camera.depth` in a
-    /// world-frame direction regardless of what kind of node the
-    /// camera sits in. This makes rendering easy to compare across
-    /// layers without gravity/inertia perturbing the scene.
-    pub(super) fn update(&mut self, _dt: f32) {
-        let _ = &mut self.velocity;   // intentionally unused
-        let _ = &self.keys;           // key state tracked but not integrated
-        let _ = player::update;       // keep symbol available
+    /// Per-frame update: advance camera physics, then push the new
+    /// camera state to the GPU. Editing, highlights, and tree upload
+    /// live in [`edit_actions`]; the `ApplicationHandler` in
+    /// [`event_loop`] calls them in order.
+    pub(super) fn update(&mut self, dt: f32) {
+        // "cell_size" here matches the old engine's convention
+        // (`1/3^edit_depth` — the extent of one 27-grandchild of the
+        // camera's cell, not the cell itself). Thrust and gravity
+        // scale off this so player speed feels identical to the
+        // pre-refactor game at every zoom level. Geometrically the
+        // camera's own cell is 3× this (3^(1 - depth)).
+        let cell_size = 3.0f32.powi(-(self.camera.position.depth as i32));
 
-        // Pin smoothed_up to world +Y so the horizon doesn't rotate
-        // when crossing the sphere's gravity well. The camera basis
-        // then yaws/pitches relative to a fixed world frame.
-        self.camera.smoothed_up = [0.0, 1.0, 0.0];
+        player::update(
+            &mut self.camera,
+            &mut self.velocity,
+            &self.keys,
+            cell_size,
+            self.cs_planet.as_ref(),
+            dt,
+        );
 
         if let Some(renderer) = &self.renderer {
             let pos = self.camera_pos_in_render_frame();

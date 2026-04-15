@@ -34,7 +34,7 @@ impl App {
     pub(super) fn inject_webview_input(&mut self) {
         for (code, pressed) in overlay::drain_forwarded_keys() {
             if let Some(key) = overlay::js_code_to_keycode(&code) {
-                self.apply_key(key, pressed, false);
+                self.apply_key(key, pressed);
             }
         }
         for (button, pressed) in overlay::drain_forwarded_mouse() {
