@@ -100,16 +100,32 @@ impl App {
             planet_path.as_slice(), world.library.len(), tree_depth,
         );
 
-        // Spawn just above the planet's body cell. Body cell at
-        // depth 1 slot 13 spans world `[1, 2)³`. Sphere outer_r
-        // local = `setup.outer_r`, world = `outer_r * 1.0` (cell
-        // size is 1 world unit at depth 1). Top of sphere at world
-        // y = 1.5 + outer_r. Spawn slightly above.
-        let body_top_y = 1.5 + setup.outer_r;
-        let spawn_xyz = [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5];
+        // Spawn just above the planet body's +Y face. Path-anchored:
+        // body center is `WorldPos::new(planet_path, [0.5, 0.5, 0.5])`
+        // and the spawn is `setup.outer_r + small_margin` above it
+        // along world +Y, expressed in the body-cell-local frame.
+        // Avoids hardcoded `[1.5, ..., 1.5]` so the spawn follows
+        // the planet wherever its path lives.
+        let body_cell_size_world =
+            crate::world::anchor::WORLD_SIZE / 3.0_f32.powi(planet_path.depth() as i32);
+        let above_offset_world = setup.outer_r * body_cell_size_world + 0.05 * body_cell_size_world;
+        let body_center =
+            WorldPos::new(planet_path, [0.5, 0.5, 0.5]).to_world_xyz();
+        let spawn_xyz = [
+            body_center[0],
+            (body_center[1] + above_offset_world).min(WORLD_SIZE - 0.001),
+            body_center[2],
+        ];
         debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
 
-        let anchor_depth = ((tree_depth as i32 - 6 + 1).max(1) as u8).min(60);
+        // Spawn anchor depth: 6 levels shallower than the tree's
+        // depth so the user starts at a moderate zoom (sees the
+        // planet at near-full screen). The `-6` is a UX-tuning
+        // constant, not a precision/system cap.
+        const SPAWN_ZOOM_OFFSET: i32 = 6;
+        let anchor_depth = ((tree_depth as i32 - SPAWN_ZOOM_OFFSET + 1)
+            .max(1) as u8)
+            .min(crate::world::tree::MAX_DEPTH as u8);
         let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
 
         Self {
@@ -231,22 +247,37 @@ pub fn build_ribbon(
         let mut path = anchor;
         path.truncate(depth);
 
-        // Walk world_root to resolve the node at this path. Frames
-        // whose path passes through a sphere body / face subtree
-        // are KEPT — the per-frame sphere DDA in the shader uses
-        // them with frame-local coords for high-precision rendering
-        // at deep face-subtree depths. The Cartesian march skips
-        // them (`frame.sphere_active == 1` in the shader).
+        // Walk world_root to resolve the node at this path AND
+        // detect whether the walk crosses a non-Cartesian node.
+        // Frames whose path passes through a sphere body / face
+        // subtree are SKIPPED — the global sphere pass renders that
+        // content. Per-frame sphere DDA was tried in 343f464 but
+        // reverted (linearization-at-camera produced z-fighting +
+        // seams against the global pass).
         let mut node_id = world_root;
+        let mut inside_sphere = false;
         for k in 0..path.depth() as usize {
             let Some(node) = library.get(node_id) else { break };
+            if !matches!(node.kind, NodeKind::Cartesian) {
+                inside_sphere = true;
+                break;
+            }
             let slot = path.slot(k) as usize;
             match node.children[slot] {
                 Child::Node(cid) => { node_id = cid; }
                 _ => break,
             }
         }
-        let _ = NodeKind::Cartesian; // keep import live
+        if !inside_sphere {
+            if let Some(node) = library.get(node_id) {
+                if !matches!(node.kind, NodeKind::Cartesian) {
+                    inside_sphere = true;
+                }
+            }
+        }
+        if inside_sphere {
+            continue;
+        }
 
         let camera_local = camera.in_frame(&path);
         let world_scale = (1.0_f32 / 3.0_f32).powi(depth as i32);
@@ -376,12 +407,15 @@ mod ribbon_tests {
     }
 
     #[test]
-    fn ribbon_keeps_frames_inside_planet_body() {
-        // Camera anchored INSIDE the planet body's face subtree.
-        // Frames whose path passes through the body are KEPT — the
-        // per-frame sphere DDA in the shader will render them in
-        // frame-local coords (precision-stable at any depth). Only
-        // the Cartesian march skips them (gated by sphere_active).
+    fn ribbon_filters_frames_inside_planet_body() {
+        // Frames whose path passes through the body are FILTERED.
+        // The global sphere pass renders that content; if the
+        // ribbon's Cartesian march also walked it (inside body =
+        // CubedSphereFace + Cartesian descendants), we'd get cubic
+        // cells overlapping the sphere's bulged voxels. Per-frame
+        // sphere DDA was the alternate plan but it produced
+        // z-fighting + seams from linearization-at-camera errors;
+        // reverted.
         let (lib, root, planet_path) = demo_world();
         let mut anchor = planet_path; // [13]
         anchor.push(crate::world::cubesphere::FACE_SLOTS[2] as u8);
@@ -390,16 +424,14 @@ mod ribbon_tests {
         }
         let camera = WorldPos::new(anchor, [0.5; 3]);
         let frames = build_ribbon(&lib, root, &camera);
-        assert!(!frames.is_empty(), "must always have at least the root frame");
-        // Should have multiple frames, including deep ones inside
-        // the body's face subtree (those will be marked
-        // sphere_active=1 in the GPU upload and rendered by the
-        // per-frame sphere DDA).
-        let max_depth = frames.iter().map(|f| f.path.depth()).max().unwrap();
-        assert!(
-            max_depth > 0,
-            "expected at least one deep frame; only got depth-0",
-        );
+        assert!(!frames.is_empty(), "must always have at least root frame");
+        for f in &frames {
+            assert_eq!(
+                f.path.depth(), 0,
+                "frame at depth {} crosses sphere content; should be filtered",
+                f.path.depth(),
+            );
+        }
     }
 
     #[test]

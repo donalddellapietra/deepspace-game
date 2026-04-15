@@ -45,7 +45,12 @@ impl App {
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
-        (self.edit_depth() + 3).min(16)
+        // Renderer's max-depth uniform — the Cartesian DDA's
+        // descent ceiling. No artificial cap; lifted to follow the
+        // tree's actual depth so deep edits aren't clipped by the
+        // shader's at_max check. Bounded by the shader's
+        // MAX_STACK_DEPTH constant on the GPU side.
+        self.edit_depth() + 3
     }
 
     pub fn apply_zoom(&mut self) {

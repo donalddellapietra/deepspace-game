@@ -47,6 +47,15 @@ struct RibbonFrame {
 
 const MAX_RIBBON_FRAMES: u32 = 8u;
 
+// Face-subtree walker max-depth cap. Set to MAX_DEPTH-equivalent
+// so the walker can resolve any cell the tree could possibly hold
+// (the tree's `MAX_DEPTH` is 63; clamp here matches that). Walker
+// terminates early on Block/Empty terminals, so per-pixel cost is
+// content-bounded rather than 63-bounded — only deep mixed
+// subtrees (= user edits) traverse the full depth, and there
+// usually only along a few rays.
+const WALKER_MAX_DEPTH: u32 = 63u;
+
 // Layout-equivalent to Rust `GpuPlanet`. WGSL would round
 // `vec3<u32>` to 16 bytes; using individual u32 padding fields
 // keeps the struct exactly 48 bytes to match the Rust definition.
@@ -240,7 +249,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     var v_lo: f32 = 0.0;
     var r_lo: f32 = 0.0;
     var size: f32 = 1.0;
-    for (var d: u32 = 2u; d <= 22u; d = d + 1u) {
+    for (var d: u32 = 2u; d <= WALKER_MAX_DEPTH; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -293,7 +302,12 @@ fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: v
     );
 }
 
-const MAX_STACK_DEPTH: u32 = 16u;
+// Stack depth for the Cartesian DDA. Sized to match
+// `WALKER_MAX_DEPTH` so a single ribbon frame can descend the full
+// tree without spilling. WGSL requires fixed-size arrays so this is
+// a compile-time constant; runtime cost is per-pixel state size,
+// not per-pixel descent — descent terminates early on terminals.
+const MAX_STACK_DEPTH: u32 = 32u;
 
 struct HitResult {
     hit: bool,
@@ -459,7 +473,7 @@ fn walk_face_subtree_from(
     var r_lo: f32 = 0.0;
     var size: f32 = 1.0;
     var result: WalkResult;
-    for (var d: u32 = 1u; d <= 22u; d = d + 1u) {
+    for (var d: u32 = 1u; d <= WALKER_MAX_DEPTH; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -687,11 +701,13 @@ fn march(frame_root_index: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> Hi
     );
     let delta_dist = abs(inv_dir);
 
-    var s_node_idx: array<u32, 16>;
-    var s_cell: array<vec3<i32>, 16>;
-    var s_side_dist: array<vec3<f32>, 16>;
-    var s_node_origin: array<vec3<f32>, 16>;
-    var s_cell_size: array<f32, 16>;
+    // Sized to MAX_STACK_DEPTH so a Cartesian descent can reach
+    // any tree depth (not capped at 16 levels like the prior code).
+    var s_node_idx: array<u32, 32>;
+    var s_cell: array<vec3<i32>, 32>;
+    var s_side_dist: array<vec3<f32>, 32>;
+    var s_node_origin: array<vec3<f32>, 32>;
+    var s_cell_size: array<f32, 32>;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
@@ -724,7 +740,10 @@ fn march(frame_root_index: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> Hi
     );
 
     var iterations = 0u;
-    let max_iterations = 2048u;
+    // Hard ceiling for the Cartesian DDA's per-pixel iteration
+    // count — purely a runaway-loop guard, not a semantic depth
+    // cap. Most rays terminate well within this.
+    let max_iterations = 16384u;
 
     loop {
         if iterations >= max_iterations { break; }
@@ -915,25 +934,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     for (var i: u32 = 0u; i < uniforms.ribbon_count; i = i + 1u) {
         let frame = uniforms.ribbon[i];
-        // Cartesian march. Skip when the frame is sphere-interior —
-        // the per-frame sphere DDA below renders that content with
-        // bulged geometry instead of cubic.
-        if (frame.sphere_active == 0u) {
-            let r = march(frame.root_index, frame.camera_local.xyz, ray_dir);
-            if (r.hit) {
-                let t_world = r.t * frame.world_scale;
-                if (t_world < best_t_world) {
-                    result = r;
-                    best_t_world = t_world;
-                }
-            }
-        } else {
-            // Per-frame sphere DDA in frame-local coords. Composites
-            // by world t (sphere_in_frame returns t in WORLD units).
-            let r = sphere_in_frame(frame, ray_dir);
-            if (r.hit && r.t < best_t_world) {
+        // Cartesian march only. Per-frame sphere DDA was reverted
+        // — its linearization-at-camera produced inaccurate hits
+        // at shallow frames (linearization error grows quadratically
+        // with frame extent), causing z-fighting + seams when both
+        // the per-frame sphere DDA and the global sphere pass below
+        // rendered the same cells with slightly different positions.
+        // Sphere rendering is now owned exclusively by the global
+        // sphere pass. Future per-frame sphere work needs a more
+        // robust formulation — tracked as next step.
+        let r = march(frame.root_index, frame.camera_local.xyz, ray_dir);
+        if (r.hit) {
+            let t_world = r.t * frame.world_scale;
+            if (t_world < best_t_world) {
                 result = r;
-                best_t_world = r.t;
+                best_t_world = t_world;
             }
         }
     }

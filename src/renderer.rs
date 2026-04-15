@@ -120,8 +120,14 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Initial camera placeholder. Overwritten by `apply_zoom`
+        // before the first frame renders, so the value here only
+        // needs to be valid (no NaN, finite, sensible direction).
+        // Coords no longer hardcode "planet at world center"; the
+        // App's actual spawn position lives in `App::new` and is
+        // computed off the planet's path.
         let camera = GpuCamera {
-            pos: [1.5, 1.75, 1.5],
+            pos: [0.0, 0.0, 0.0],
             _pad0: 0.0,
             forward: [0.0, 0.0, -1.0],
             _pad1: 0.0,
