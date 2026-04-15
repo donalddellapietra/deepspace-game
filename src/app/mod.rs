@@ -101,12 +101,19 @@ impl App {
         // size is 1 world unit at depth 1). Top of sphere at world
         // y = 1.5 + outer_r. Spawn slightly above.
         let body_top_y = 1.5 + setup.outer_r;
-        let spawn_xyz = [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5];
+        let default_spawn = [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5];
+        let spawn_xyz = test_cfg.spawn_xyz.unwrap_or(default_spawn);
         debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
 
         let default_depth = ((tree_depth as i32 - 6 + 1).max(1) as u8).min(60);
         let anchor_depth = test_cfg.spawn_depth.unwrap_or(default_depth);
         let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
+        let spawn_yaw = test_cfg.spawn_yaw.unwrap_or(0.0);
+        let spawn_pitch = test_cfg.spawn_pitch.unwrap_or(-1.2);
+        eprintln!(
+            "spawn: xyz={:?} anchor_depth={} yaw={} pitch={}",
+            spawn_xyz, anchor_depth, spawn_yaw, spawn_pitch,
+        );
 
         Self {
             window: None,
@@ -114,14 +121,15 @@ impl App {
             camera: Camera {
                 position,
                 smoothed_up: [0.0, 1.0, 0.0],
-                yaw: 0.0,
+                yaw: spawn_yaw,
                 // Steep pitch so the planet (below camera) fills
-                // the lower half of the view at spawn.
-                pitch: -1.2,
+                // the lower half of the view at spawn. Override
+                // via --spawn-pitch for screenshot-driven debug.
+                pitch: spawn_pitch,
             },
             world,
             frozen: false,
-            cursor_locked: false,
+            cursor_locked: test_cfg.spawn_depth.is_some() || test_cfg.screenshot.is_some(),
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
             tree_depth,

@@ -35,6 +35,16 @@
 #[derive(Default, Debug, Clone)]
 pub struct TestConfig {
     pub spawn_depth: Option<u8>,
+    /// Explicit camera world-XYZ at spawn. Positions the camera
+    /// at a specific point regardless of zoom level — since the
+    /// in-game zoom function is broken, this is the way to put
+    /// the camera near a feature (e.g., the planet surface) for
+    /// screenshot-driven debugging.
+    pub spawn_xyz: Option<[f32; 3]>,
+    /// Camera yaw at spawn (radians). Default 0.
+    pub spawn_yaw: Option<f32>,
+    /// Camera pitch at spawn (radians). Default -1.2 (steep down).
+    pub spawn_pitch: Option<f32>,
     pub screenshot: Option<String>,
     pub exit_after_frames: Option<u32>,
     /// Wall-clock kill switch in seconds. Defaults to 5.0 so a
@@ -61,6 +71,20 @@ impl TestConfig {
                 "--spawn-depth" => {
                     cfg.spawn_depth = args.next().and_then(|v| v.parse().ok());
                 }
+                "--spawn-xyz" => {
+                    let x: Option<f32> = args.next().and_then(|v| v.parse().ok());
+                    let y: Option<f32> = args.next().and_then(|v| v.parse().ok());
+                    let z: Option<f32> = args.next().and_then(|v| v.parse().ok());
+                    if let (Some(x), Some(y), Some(z)) = (x, y, z) {
+                        cfg.spawn_xyz = Some([x, y, z]);
+                    }
+                }
+                "--spawn-yaw" => {
+                    cfg.spawn_yaw = args.next().and_then(|v| v.parse().ok());
+                }
+                "--spawn-pitch" => {
+                    cfg.spawn_pitch = args.next().and_then(|v| v.parse().ok());
+                }
                 "--screenshot" => {
                     cfg.screenshot = args.next();
                 }
@@ -86,6 +110,9 @@ impl TestConfig {
         self.screenshot.is_some()
             || self.exit_after_frames.is_some()
             || !self.script.is_empty()
+            || self.spawn_xyz.is_some()
+            || self.spawn_yaw.is_some()
+            || self.spawn_pitch.is_some()
     }
 }
 
