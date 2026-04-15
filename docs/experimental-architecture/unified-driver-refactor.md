@@ -15,17 +15,32 @@ anchor refactor; we just haven't paid the cost to get there.
 
 ## Core idea (one paragraph)
 
-Every cell, regardless of NodeKind, is a unit cube `[0, 3)³` in its
-own local frame. The DDA loop only ever marches through unit cubes.
-On cell entry, the current NodeKind's transform is applied: for
-Cartesian, identity; for CubedSphereBody/Face, a Jacobian computed
-once at the cell's center that maps world-space ray direction into
-local (u_ea, v_ea, r_n) coords. Inside the cell, the DDA primitive
-is identical: integer cell boundaries, exact at any depth. On
-descend, the ray rebases into the child's local frame (multiply by
-3, integer offset). On exit, pop to parent and continue. The
+Every cell occupies its own local coordinate frame. The DDA loop
+structure is uniform — same stack, same descend/ascend mechanism,
+same outer flow — but the **boundary test inside each step is
+parameterized by NodeKind**. Cartesian cells use planar boundary
+tests on all three axes. CubedSphereFace cells use planar tests on
+u/v (this is what the current code already does — `n_u_lo` is a
+plane through the body center) and analytical ray-vs-sphere on the
+r-axis (also what the current code already does, via
+`ray_sphere_after`). On cell entry, NodeKind metadata sets up the
+local frame: Cartesian uses cell origin + size; face uses the
+existing `face_*_axis` orientation plus inner_r/outer_r. On descend,
+the ray rebases into the child's local frame via integer arithmetic
+(multiply by 3, integer offset for Cartesian; the same plus axis
+remap on face seams). On exit, pop to parent and continue. The
 "virtual root" is just the deepest cell containing the camera —
-same DDA, just a different starting frame.
+same DDA loop, just a different starting frame. Cell-local coords
+keep f32 precision exact at any tree depth.
+
+**What "unified" means precisely:** one loop, one stack, one
+descend/ascend protocol. Kind-specific behavior is metadata +
+small switches inside the boundary-test step. This is structurally
+different from today's two parallel routines (each with its own
+stack management, entry/exit handling, and outer flow); it's not
+"one identical boundary primitive for every cell shape" — that
+would require linearizing curved cells, which is unnecessary
+because today's planar/spherical mix already works.
 
 ## What lives where in the new design
 
@@ -105,17 +120,34 @@ For rays that exit the virtual root (looking at the sky/horizon):
 
 ### NodeKind transform implementations
 
-| Kind | `world_to_local` | `local_dir` Jacobian | `child_descend` |
-|------|------------------|----------------------|-----------------|
-| Cartesian | `(world - origin) / size` | `world_dir / size` | trivial: `local * 3 - integer_slot * 2` |
-| CubedSphereBody | dispatch on ray-shell intersection → which face | based on entry face's axes | trivial within a face slot |
-| CubedSphereFace | EA projection with per-cell Jacobian linearization | analytical Jacobian of EA at cell center | `local * 3 + (2 - slot * 2)` per axis |
+| Kind | Cell entry setup | Boundary test (u, v, r) | Descend / Ascend |
+|------|------------------|--------------------------|------------------|
+| Cartesian | origin, size | planar / planar / planar | `local * 3 - integer_slot * 2` per axis |
+| CubedSphereBody | analytical ray-vs-cs_outer sphere → entry face | n/a (single layer dispatching to face) | descend into face slot |
+| CubedSphereFace | face_axis vectors + inner_r, outer_r, current u/v cell EA bounds | planar / planar / **spherical (`ray_sphere_after`)** | `local * 3 + (2 - slot * 2)` for u/v; ditto for r in normalized shell coords |
 
-The Jacobian for CubedSphereFace is the only nontrivial math. It's a
-3×3 matrix of partial derivatives of `(world_x, world_y, world_z)`
-w.r.t. `(u_ea, v_ea, r_n)`, evaluated at the cell's center. The
-inverse Jacobian sends world ray direction into local. Curvature
-error within one cell is `O(cell_size²)` — invisible at any depth.
+Notes:
+
+- **Planar u/v boundaries on face cells are not new.** The current
+  shader already constructs them via `n_u_lo = u_axis -
+  ea_to_cube(u_lo_ea) * n_axis` — a plane through the body center
+  that intersects the sphere as a great-circle-like arc. The unified
+  DDA reuses this construction; what changes is that `u_lo_ea` comes
+  from cell-local descent state (precision-safe at any depth)
+  instead of `cells_d = pow(3, depth)` quantization.
+- **Spherical r-axis is a per-NodeKind specialization, not a
+  weakness.** The current shader uses `ray_sphere_after` for the
+  r-boundaries of face cells; the unified loop keeps this — the
+  boundary-test step branches on NodeKind to pick planar vs.
+  spherical for each axis. This is the kind-aware behavior NodeKind
+  exists to express.
+- **No global Jacobian is needed.** Earlier drafts proposed a 3×3
+  per-cell Jacobian to linearize the curved face geometry into a
+  pure box DDA. On reflection that linearization isn't necessary:
+  the boundary tests for face cells already work in world coords
+  with the existing analytical math. The win from cell-local frames
+  is precision (cell bounds expressed via local descent state, not
+  3^d quantization), not geometric simplification.
 
 ## What goes away
 
@@ -181,35 +213,68 @@ on a commit.
 
 ## Risks
 
-- **Jacobian sign conventions.** The 6-face EA projection has 6 sets
-  of axis sign/swap conventions. Getting one wrong renders a face
-  upside-down or mirrored. Mitigation: derive the Jacobian by
-  symbolic differentiation of the existing `face_*_axis` functions in
-  the shader, write a unit test in Rust that compares finite-
-  difference world position vs. analytical Jacobian at sample points.
+- **Face axis sign conventions.** The 6 faces have specific
+  orientations baked into `face_normal`, `face_u_axis`, `face_v_axis`
+  in the current shader. The unified loop reuses these; getting them
+  wrong renders a face inverted. Mitigation: keep the existing
+  axis-vector functions verbatim and verify in Rust with finite-
+  difference checks against sample world positions before porting
+  any new code.
 - **Face-seam transitions.** When a ray walks across the surface and
   hits a cube edge, the unified DDA must pop out of the current face
   cell and push into the neighbor face's frame. The 24-case face
   transition table (6 faces × 4 edges) needs to be in WGSL. Existing
   Rust `cubesphere::face_uv_to_dir` has the math; it just needs to
   be ported as a switch-case shader function. Risk: bugs at seams
-  show as thin artifact lines.
-- **Sphere outer-shell exit.** When a ray inside the sphere exits
-  outward, it pops back to the body's parent (Cartesian) frame and
-  continues there. The body's bounding cell IS the parent's child;
-  the ray is already in that frame's coords post-pop. Risk: getting
-  the t-parameter handoff right (ray didn't restart, it continued).
+  show as thin artifact lines along cube edges of the planet. This
+  is the same special case the current code handles implicitly by
+  re-running `pick_face` every step; the unified version makes it
+  explicit.
+- **Sphere outer-shell exit.** Same special case the current code
+  has. Today, `sphere_in_cell` returns "miss" when the ray exits
+  cs_outer outward, and the caller advances Cartesian DDA past the
+  body cell. The unified loop does the same: r-axis exit at outer
+  boundary → pop face frame → pop body frame → continue Cartesian
+  DDA in the body's parent. Risk: getting the t-parameter handoff
+  right (ray continues from exit point, doesn't restart).
 - **Precision at the absolute root.** When the ancestor ribbon's
-  parent_ascend reaches absolute-root scale (~3^23 of virtual-root
-  units), the local coords get large. f32 still represents them
-  fine, but precision degrades. For sky/horizon rays this is
-  acceptable — at that scale we're picking a sky-color blend, not
-  cell-precise hits.
-- **Performance.** Per-cell transform compute is O(1) but adds a few
-  dozen ops per cell entry vs today's hardcoded Cartesian step.
-  Likely net-positive because we eliminate the giant
-  `sphere_in_cell` analytical plane intersections. To verify with
-  the existing test_runner harness during step 7.
+  parent_ascend reaches absolute-root scale, the local coords inflate
+  by 3^(ancestor depth). f32 still represents them fine for sky/
+  horizon picking — at that scale we're not doing cell-precise hits,
+  just direction-based color blends.
+- **Performance — Cartesian-content overhead.** Today's pure
+  Cartesian DDA step is ~10 ops. Unified adds NodeKind read + branch
+  before the boundary test; estimate ~15 ops per step (~50% overhead
+  for pure Cartesian content). Acceptable trade for the precision
+  win, but verify with `test_runner` during step 7. For sphere
+  content the unified loop should be net-positive vs. today (we
+  eliminate the giant per-step `sphere_in_cell` setup).
+- **Stack pressure.** Per-frame state grows from ~44 to ~100 bytes
+  (NodeKind discriminant + face id + radii + local oc/dir cached at
+  cell entry). 16 frames × 100 = 1600 bytes per pixel. Within
+  typical GPU per-thread budgets (~4 KB). Verify no register spill
+  in the wgpu-naga compile stats.
+
+## Issues that aren't actually issues
+
+These came up during scope review and were rejected after closer
+inspection. Documenting so they don't recur:
+
+- **"Linearization at shallow face cells will facet the planet."**
+  No: the planet's silhouette comes from analytical `cs_outer`
+  sphere intersection, not from u/v cell boundaries. The current
+  code already uses planar u/v boundaries (great-circle-like arcs
+  through the body center); the unified loop reuses them.
+- **"Stack budget for visual depth + ancestor chain overflows."**
+  No: ancestor pop is sequential, not cumulative. Peak stack depth
+  equals max single-descent path, ~16.
+- **"3×3 per-cell Jacobian needed for face cells."** No: not needed
+  if we keep the existing analytical boundary tests. The Jacobian
+  was an early sketch for a fully-linear box DDA, which isn't the
+  design we're shipping.
+- **"CPU/GPU drift risk from dual-implementing transforms."** No
+  worse than today; current code has the same dual implementation
+  for both Cartesian and sphere math.
 
 ## Estimated size
 
