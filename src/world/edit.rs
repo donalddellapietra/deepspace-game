@@ -466,6 +466,11 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
 /// that matches the depth of siblings at the placement site, so the
 /// placed block has full recursive structure like the terrain around it.
 pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
+    eprintln!(
+        "place_block: hit.path.len={} face={} place_path.len={:?} block_type={}",
+        hit.path.len(), hit.face,
+        hit.place_path.as_ref().map(|p| p.len()), block_type,
+    );
     // Figure out how deep siblings are at the placement site.
     // The hit path has `path.len()` levels from root. The sibling
     // nodes at that depth have some subtree depth. We match it.
@@ -487,8 +492,11 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> boo
         0
     };
 
+    eprintln!("place_block: sibling_depth={}", sibling_depth);
     let child = world.library.build_uniform_subtree(block_type, sibling_depth);
-    place_child(world, hit, child)
+    let result = place_child(world, hit, child);
+    eprintln!("place_block: result={}", result);
+    result
 }
 
 /// Compute depth of a single node (non-memoized, but uniform nodes are O(1)).
