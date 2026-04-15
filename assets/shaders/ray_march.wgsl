@@ -572,6 +572,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let eps = max(shell * 1e-5, 1e-7);
             var t = t_enter + eps;
             var steps = 0u;
+            // Last cell boundary the DDA crossed. 0=u_lo, 1=u_hi,
+            // 2=v_lo, 3=v_hi, 4=r_lo, 5=r_hi, 6=outer-shell entry
+            // (no in-shell crossing yet). Used to compute a
+            // per-face shading normal so adjacent cells have
+            // different brightness instead of all sharing the
+            // smooth radial direction (which made cells look 2D).
+            var last_face_id: u32 = 6u;
             loop {
                 if t >= t_exit || steps > 512u { break; }
                 steps = steps + 1u;
@@ -604,10 +611,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 if block_id != 0u {
                     cs_hit = true;
                     cs_t = t;
-                    cs_normal = n;
+
+                    // Per-face shading normal from the boundary the
+                    // DDA last advanced through. u/v boundaries use
+                    // the face's tangent axes; r boundaries use the
+                    // radial direction. The sign flips with which
+                    // side of the boundary the ray came from.
+                    var hit_normal: vec3<f32>;
+                    switch last_face_id {
+                        case 0u: { hit_normal = -u_axis; }    // crossed u_lo, came from -u
+                        case 1u: { hit_normal =  u_axis; }    // crossed u_hi, came from +u
+                        case 2u: { hit_normal = -v_axis; }
+                        case 3u: { hit_normal =  v_axis; }
+                        case 4u: { hit_normal = -n; }         // crossed r_lo, came from above
+                        case 5u: { hit_normal =  n; }         // crossed r_hi, came from below
+                        default: { hit_normal =  n; }         // first hit on shell entry
+                    }
+                    cs_normal = hit_normal;
+
                     let cell_color = palette.colors[block_id].rgb;
                     let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-                    let diffuse = max(dot(n, sun_dir), 0.0);
+                    let diffuse = max(dot(hit_normal, sun_dir), 0.0);
                     let ambient = 0.25;
                     var surface = cell_color * (ambient + diffuse * 0.75);
 
@@ -681,20 +705,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
 
                 var t_next = t_exit + 1.0;
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_u_lo), t);
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_u_hi), t);
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_v_lo), t);
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_v_hi), t);
-                t_next = min_after(t_next,
-                    ray_sphere_after(camera.pos, ray_dir, cs_center, r_lo, t), t);
-                t_next = min_after(t_next,
-                    ray_sphere_after(camera.pos, ray_dir, cs_center, r_hi, t), t);
+                var winning_face: u32 = 6u;
+                let cand_u_lo = ray_plane_t(camera.pos, ray_dir, cs_center, n_u_lo);
+                if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+                let cand_u_hi = ray_plane_t(camera.pos, ray_dir, cs_center, n_u_hi);
+                if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+                let cand_v_lo = ray_plane_t(camera.pos, ray_dir, cs_center, n_v_lo);
+                if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+                let cand_v_hi = ray_plane_t(camera.pos, ray_dir, cs_center, n_v_hi);
+                if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+                let cand_r_lo = ray_sphere_after(camera.pos, ray_dir, cs_center, r_lo, t);
+                if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+                let cand_r_hi = ray_sphere_after(camera.pos, ray_dir, cs_center, r_hi, t);
+                if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
 
                 if t_next >= t_exit { break; }
+                // Record which boundary we crossed so the next
+                // sample knows which face it just entered through.
+                last_face_id = winning_face;
                 // Advance just past the boundary so the next sample
                 // lands inside the neighboring cell.
                 t = t_next + eps;
