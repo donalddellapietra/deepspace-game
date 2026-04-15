@@ -155,35 +155,114 @@ fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
     return -1.0;
 }
 
+// Result of walking a face subtree: which terminal (block_id),
+// what depth it sits at, AND the cell's bounds in face-normalized
+// `(un, vn, rn) ∈ [0, 1]³` coords. Bounds come from incremental
+// Kahan-compensated accumulation during descent — they don't suffer
+// the precision wall that `cells_d = pow(3, depth)` quantization
+// hits past depth 14.
+struct FaceWalkResult {
+    block: u32,
+    depth: u32,
+    u_lo: f32,  // cell's lo bound in normalized face EA u
+    v_lo: f32,
+    r_lo: f32,
+    size: f32,  // cell width = 3^-depth (same on all axes)
+}
+
 // Walk a face subtree from the body node's face-center child slot,
-// using normalized `(un, vn, rn) ∈ [0, 1]³` coords. Returns
-// `(block_id, term_depth)`.
+// returning the terminal AND the cell's normalized bounds. Bounds
+// are accumulated via Kahan compensation so cumulative error stays
+// at ~1 ULP regardless of depth (vs. ~depth ULPs naive).
+//
+// MAX_FACE_WALK_DEPTH=30: matches the lifted face subtree cap.
 fn walk_face_subtree(body_node_idx: u32, face: u32,
-                     un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u32> {
+                     un_in: f32, vn_in: f32, rn_in: f32) -> FaceWalkResult {
+    var result: FaceWalkResult;
+    result.u_lo = 0.0;
+    result.v_lo = 0.0;
+    result.r_lo = 0.0;
+    result.size = 1.0;
+    result.depth = 1u;
+
     let fs = face_slot(face);
     let face_packed = child_packed(body_node_idx, fs);
     let face_tag = child_tag(face_packed);
-    if face_tag == 0u { return vec2<u32>(0u, 1u); }
-    if face_tag == 1u { return vec2<u32>(child_block_type(face_packed), 1u); }
+    if face_tag == 0u {
+        result.block = 0u;
+        return result;
+    }
+    if face_tag == 1u {
+        result.block = child_block_type(face_packed);
+        return result;
+    }
     var node = child_node_index(body_node_idx, fs);
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
-    for (var d: u32 = 2u; d <= 22u; d = d + 1u) {
+
+    // Kahan-compensated boundary accumulators per axis.
+    var u_sum: f32 = 0.0; var u_comp: f32 = 0.0;
+    var v_sum: f32 = 0.0; var v_comp: f32 = 0.0;
+    var r_sum: f32 = 0.0; var r_comp: f32 = 0.0;
+    var size: f32 = 1.0;
+
+    for (var d: u32 = 2u; d <= 30u; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
         let packed = child_packed(node, slot);
         let tag = child_tag(packed);
-        if tag == 0u { return vec2<u32>(0u, d); }
-        if tag == 1u { return vec2<u32>(child_block_type(packed), d); }
+
+        // Boundary update: this step's child within the parent
+        // contributes (size/3) * slot to the lo-bound, and shrinks
+        // size by 3. Done with Kahan compensation.
+        let step_size = size * (1.0 / 3.0);
+        let u_add = step_size * f32(us);
+        let v_add = step_size * f32(vs);
+        let r_add = step_size * f32(rs);
+
+        let yu = u_add - u_comp;
+        let tu = u_sum + yu;
+        u_comp = (tu - u_sum) - yu;
+        u_sum = tu;
+
+        let yv = v_add - v_comp;
+        let tv = v_sum + yv;
+        v_comp = (tv - v_sum) - yv;
+        v_sum = tv;
+
+        let yr = r_add - r_comp;
+        let tr = r_sum + yr;
+        r_comp = (tr - r_sum) - yr;
+        r_sum = tr;
+
+        size = step_size;
+
+        if tag == 0u || tag == 1u {
+            result.block = select(0u, child_block_type(packed), tag == 1u);
+            result.depth = d;
+            result.u_lo = u_sum + u_comp;
+            result.v_lo = v_sum + v_comp;
+            result.r_lo = r_sum + r_comp;
+            result.size = size;
+            return result;
+        }
         node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
     }
-    return vec2<u32>(0u, 22u);
+
+    // Hit max depth without terminal: report deepest LOD bounds.
+    result.block = 0u;
+    result.depth = 30u;
+    result.u_lo = u_sum + u_comp;
+    result.v_lo = v_sum + v_comp;
+    result.r_lo = r_sum + r_comp;
+    result.size = size;
+    return result;
 }
 
 // -------------- Ray-AABB --------------
@@ -271,8 +350,8 @@ fn sphere_in_cell(
         let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
 
         let walk = walk_face_subtree(body_node_idx, face, un, vn, rn);
-        let block_id = walk.x;
-        let term_depth = walk.y;
+        let block_id = walk.block;
+        let term_depth = walk.depth;
 
         if block_id != 0u {
             var hit_normal: vec3<f32>;
@@ -297,23 +376,21 @@ fn sphere_in_cell(
         }
 
         deepest_term_depth = max(deepest_term_depth, term_depth);
-        let cells_d = pow(3.0, f32(deepest_term_depth));
-        let iu = floor(un * cells_d);
-        let iv = floor(vn * cells_d);
-        let ir = floor(rn * cells_d);
-
-        let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
-        let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
+        // Cell bounds come from the walker's Kahan-compensated
+        // accumulation. No more `floor(un * 3^depth)` quantization,
+        // so depths past 14 stay precision-correct.
+        let u_lo_ea = walk.u_lo * 2.0 - 1.0;
+        let u_hi_ea = (walk.u_lo + walk.size) * 2.0 - 1.0;
         let n_u_lo = u_axis - ea_to_cube(u_lo_ea) * n_axis;
         let n_u_hi = u_axis - ea_to_cube(u_hi_ea) * n_axis;
 
-        let v_lo_ea = (iv       / cells_d) * 2.0 - 1.0;
-        let v_hi_ea = ((iv+1.0) / cells_d) * 2.0 - 1.0;
+        let v_lo_ea = walk.v_lo * 2.0 - 1.0;
+        let v_hi_ea = (walk.v_lo + walk.size) * 2.0 - 1.0;
         let n_v_lo = v_axis - ea_to_cube(v_lo_ea) * n_axis;
         let n_v_hi = v_axis - ea_to_cube(v_hi_ea) * n_axis;
 
-        let r_lo = cs_inner + (ir       / cells_d) * shell;
-        let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
+        let r_lo = cs_inner + walk.r_lo * shell;
+        let r_hi = cs_inner + (walk.r_lo + walk.size) * shell;
 
         var t_next = t_exit + 1.0;
         var winning_face: u32 = 6u;
@@ -333,7 +410,11 @@ fn sphere_in_cell(
 
         if t_next >= t_exit { break; }
         last_face_id = winning_face;
-        let cell_eps = max(shell / cells_d * 1e-3, 1e-7);
+        // Cell-eps scales with t-magnitude so close-camera rays
+        // don't artificially overshoot. Floor at relative ULP of t.
+        let cell_world = shell * walk.size;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(cell_world * 1e-3, t_ulp);
         t = t_next + cell_eps;
     }
 
