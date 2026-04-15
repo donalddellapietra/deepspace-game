@@ -72,7 +72,7 @@ impl App {
 
     pub(super) fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f64();
+        let camera_pos = self.camera.world_pos_f32();
         let hit = edit::cpu_raycast_with_face_depth(
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
@@ -120,7 +120,7 @@ impl App {
 
     pub(super) fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f64();
+        let camera_pos = self.camera.world_pos_f32();
         let hit = edit::cpu_raycast_with_face_depth(
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
@@ -521,7 +521,7 @@ impl App {
             return;
         }
         let ray_dir = self.camera.forward();
-        let camera_pos = self.camera.world_pos_f64();
+        let camera_pos = self.camera.world_pos_f32();
         let tree_hit = edit::cpu_raycast_with_face_depth(
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
