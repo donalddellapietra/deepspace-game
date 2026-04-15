@@ -15,7 +15,6 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::renderer::Renderer;
-use crate::world::edit;
 use crate::world::gpu;
 
 use super::App;
@@ -132,38 +131,7 @@ impl App {
             self.zoom_level += 1;
         }
         self.apply_zoom();
-        let steps = self.zoom_level - old_zoom;
-        if steps != 0 {
-            let ray_dir = self.camera.forward();
-            let hit = edit::cpu_raycast(
-                &self.world.library,
-                self.world.root,
-                self.camera.pos,
-                ray_dir,
-                self.edit_depth(),
-            );
-            let anchor = if let Some(h) = hit {
-                [
-                    self.camera.pos[0] + ray_dir[0] * h.t,
-                    self.camera.pos[1] + ray_dir[1] * h.t,
-                    self.camera.pos[2] + ray_dir[2] * h.t,
-                ]
-            } else {
-                // No hit — anchor at a reasonable distance ahead.
-                let td = self.tree_depth as i32;
-                let cell_size = 1.0 / 3.0f32.powi(td - self.zoom_level);
-                let d = cell_size * 10.0;
-                [
-                    self.camera.pos[0] + ray_dir[0] * d,
-                    self.camera.pos[1] + ray_dir[1] * d,
-                    self.camera.pos[2] + ray_dir[2] * d,
-                ]
-            };
-            let scale = 3.0f32.powi(-steps);
-            for i in 0..3 {
-                self.camera.pos[i] = anchor[i] + (self.camera.pos[i] - anchor[i]) * scale;
-            }
-        }
+        let _ = old_zoom;
     }
 
     /// One full frame: webview sync, per-frame state push, physics,

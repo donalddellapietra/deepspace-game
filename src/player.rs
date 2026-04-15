@@ -23,44 +23,9 @@ pub fn update(
     dt: f32,
 ) {
     let world_up = [0.0f32, 1.0, 0.0];
-    let (target_up, gravity_acc) = if let Some(p) = cs_planet {
-        let to_player = sdf::sub(camera.pos, p.center);
-        let r = sdf::length(to_player);
-        let surface_r = p.outer_r;
-        let influence_r = surface_r * 2.0;
-        let weight = if r <= surface_r {
-            1.0
-        } else if r >= influence_r {
-            0.0
-        } else {
-            let t = (r - surface_r) / (influence_r - surface_r);
-            let s = 1.0 - t;
-            s * s * (3.0 - 2.0 * s)
-        };
-        let radial_up = if r > 1e-6 {
-            sdf::scale(to_player, 1.0 / r)
-        } else {
-            world_up
-        };
-        let up_blend = sdf::normalize(sdf::add(
-            sdf::scale(radial_up, weight),
-            sdf::scale(world_up, 1.0 - weight),
-        ));
-        // Gravity magnitude scales with cell_size so fall speed
-        // is visible at every zoom. Tuned so holding Space
-        // (thrust = 5 * cell_size) noticeably overpowers gravity
-        // and you can fly off the planet.
-        let g_mag = 8.0 * cell_size * weight;
-        let grav = if r > 1e-6 {
-            sdf::scale(radial_up, -g_mag)
-        } else {
-            [0.0, 0.0, 0.0]
-        };
-        (up_blend, grav)
-    } else {
-        (world_up, [0.0, 0.0, 0.0])
-    };
-    camera.update_up(target_up, dt);
+    let _ = cs_planet;
+    let gravity_acc = [0.0f32, 0.0, 0.0];
+    camera.update_up(world_up, dt);
 
     // Integrate gravity into persistent velocity, then damp so we
     // have a terminal fall speed rather than unbounded divergence.

@@ -303,6 +303,22 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
         return result;
     }
 
+    // Entry-face normal: whichever slab gave the maximum t_lo is the
+    // face we entered through. Without this, the first hit cell
+    // shades with the default up-normal and looks flat.
+    let t1_root = (vec3<f32>(0.0) - ray_origin) * inv_dir;
+    let t2_root = (vec3<f32>(3.0) - ray_origin) * inv_dir;
+    let t_lo_root = min(t1_root, t2_root);
+    if root_hit.t_enter > 0.0 {
+        if t_lo_root.x >= t_lo_root.y && t_lo_root.x >= t_lo_root.z {
+            normal = vec3<f32>(select(1.0, -1.0, ray_dir.x >= 0.0), 0.0, 0.0);
+        } else if t_lo_root.y >= t_lo_root.z {
+            normal = vec3<f32>(0.0, select(1.0, -1.0, ray_dir.y >= 0.0), 0.0);
+        } else {
+            normal = vec3<f32>(0.0, 0.0, select(1.0, -1.0, ray_dir.z >= 0.0));
+        }
+    }
+
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
 
@@ -572,6 +588,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let eps = max(shell * 1e-5, 1e-7);
             var t = t_enter + eps;
             var steps = 0u;
+            // Normal of the surface we most recently crossed to enter
+            // the current cell. On first iteration this is the outer
+            // sphere; on subsequent iterations it's whichever cell
+            // boundary (u/v cube-plane or r-sphere) we stepped across.
+            // Using this as the block-hit normal gives faces of cubes
+            // distinct shading instead of a smooth radial gradient.
+            let first_p = camera.pos + ray_dir * t_enter;
+            var entry_normal = normalize(first_p - cs_center);
             loop {
                 if t >= t_exit || steps > 512u { break; }
                 steps = steps + 1u;
@@ -602,14 +626,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let block_id = walk.x;
                 let term_depth = walk.y;
                 if block_id != 0u {
+                    // Face the normal against the ray so shading is
+                    // never backlit through a surface we just crossed.
+                    var face_n = entry_normal;
+                    if dot(face_n, ray_dir) > 0.0 { face_n = -face_n; }
                     cs_hit = true;
                     cs_t = t;
-                    cs_normal = n;
+                    cs_normal = face_n;
                     let cell_color = palette.colors[block_id].rgb;
                     let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-                    let diffuse = max(dot(n, sun_dir), 0.0);
-                    let ambient = 0.25;
-                    var surface = cell_color * (ambient + diffuse * 0.75);
+                    let diffuse = max(dot(face_n, sun_dir), 0.0);
+                    // Per-axis tint: top brighter than sides, +x/-x
+                    // and +z/-z slightly different. Cheap "minecraft"
+                    // cue that makes cube faces pop visually even
+                    // when the sun happens to hit them at similar
+                    // angles.
+                    let axis_tint = abs(face_n.y) * 1.0
+                                  + (abs(face_n.x) + abs(face_n.z)) * 0.82;
+                    let ambient = 0.22;
+                    var surface = cell_color * (ambient + diffuse * 0.78) * axis_tint;
 
                     // Cursor highlight: the selected cell can live at
                     // any subtree depth, not just the finest. At
@@ -681,23 +716,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
 
                 var t_next = t_exit + 1.0;
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_u_lo), t);
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_u_hi), t);
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_v_lo), t);
-                t_next = min_after(t_next,
-                    ray_plane_t(camera.pos, ray_dir, cs_center, n_v_hi), t);
-                t_next = min_after(t_next,
-                    ray_sphere_after(camera.pos, ray_dir, cs_center, r_lo, t), t);
-                t_next = min_after(t_next,
-                    ray_sphere_after(camera.pos, ray_dir, cs_center, r_hi, t), t);
+                var n_next = vec3<f32>(0.0, 1.0, 0.0);
+
+                let t_u_lo = ray_plane_t(camera.pos, ray_dir, cs_center, n_u_lo);
+                if t_u_lo > t && t_u_lo < t_next { t_next = t_u_lo; n_next = normalize(n_u_lo); }
+                let t_u_hi = ray_plane_t(camera.pos, ray_dir, cs_center, n_u_hi);
+                if t_u_hi > t && t_u_hi < t_next { t_next = t_u_hi; n_next = normalize(n_u_hi); }
+                let t_v_lo = ray_plane_t(camera.pos, ray_dir, cs_center, n_v_lo);
+                if t_v_lo > t && t_v_lo < t_next { t_next = t_v_lo; n_next = normalize(n_v_lo); }
+                let t_v_hi = ray_plane_t(camera.pos, ray_dir, cs_center, n_v_hi);
+                if t_v_hi > t && t_v_hi < t_next { t_next = t_v_hi; n_next = normalize(n_v_hi); }
+                let t_r_lo = ray_sphere_after(camera.pos, ray_dir, cs_center, r_lo, t);
+                if t_r_lo > t && t_r_lo < t_next {
+                    t_next = t_r_lo;
+                    n_next = normalize(camera.pos + ray_dir * t_r_lo - cs_center);
+                }
+                let t_r_hi = ray_sphere_after(camera.pos, ray_dir, cs_center, r_hi, t);
+                if t_r_hi > t && t_r_hi < t_next {
+                    t_next = t_r_hi;
+                    n_next = normalize(camera.pos + ray_dir * t_r_hi - cs_center);
+                }
 
                 if t_next >= t_exit { break; }
                 // Advance just past the boundary so the next sample
                 // lands inside the neighboring cell.
                 t = t_next + eps;
+                entry_normal = n_next;
             }
         }
     }
@@ -707,8 +751,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if tree_closer {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
-        let ambient = 0.3;
-        let lit = result.color * (ambient + diffuse * 0.7);
+        let axis_tint = abs(result.normal.y) * 1.0
+                      + (abs(result.normal.x) + abs(result.normal.z)) * 0.82;
+        let ambient = 0.22;
+        let lit = result.color * (ambient + diffuse * 0.78) * axis_tint;
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else if cs_hit {
         color = pow(cs_color, vec3<f32>(1.0 / 2.2));
