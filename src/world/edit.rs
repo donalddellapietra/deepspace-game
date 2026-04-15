@@ -856,16 +856,24 @@ fn walk_face_subtree_with_path(
             Child::Empty => return Some((0, d, path)),
             Child::Block(b) => return Some((b, d, path)),
             Child::Node(nid) => {
-                // Mirror the GPU shader's behavior: pack-time
-                // flattens uniform-content subtrees so the GPU
-                // walker sees them as a single tag=1/0 cell at
-                // this depth. The CPU walker stops here too —
-                // descending further would target an
-                // indistinguishable sub-cell, breaking the
-                // assumption that "what the user clicks is what
-                // gets broken."
+                // Mirror `pack_tree_lod`'s exact flattening rule
+                // (gpu.rs:202, 214): uniform-content collapse only
+                // fires when BOTH the parent being walked AND the
+                // child are Cartesian. At the face root (kind =
+                // CubedSphereFace) the packer preserves children
+                // as tag=2 even when the subtree is uniform. If we
+                // applied the stop unconditionally the CPU walker
+                // would return one level shallower than the shader
+                // — targeting a coarser cell than the user sees,
+                // which is what "below layer 15 is broken" felt
+                // like: cursor drift on every zoomed interaction.
                 if let Some(child_node) = library.get(nid) {
-                    if child_node.uniform_type != UNIFORM_MIXED {
+                    let parent_is_cartesian = matches!(node.kind, NodeKind::Cartesian);
+                    let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
+                    if parent_is_cartesian
+                        && child_is_cartesian
+                        && child_node.uniform_type != UNIFORM_MIXED
+                    {
                         let block = if child_node.uniform_type == UNIFORM_EMPTY {
                             0
                         } else {
