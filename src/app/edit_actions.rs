@@ -130,19 +130,29 @@ impl App {
         self.upload_tree_lod();
     }
 
-    /// Pack the tree subtree at the current render frame and push
-    /// it (along with the parallel `node_kinds` buffer) to the GPU.
-    /// Also updates the renderer's root_kind dispatch so the shader
-    /// knows whether to enter Cartesian DDA or sphere DDA.
+    /// Pack the world tree (LOD-aware from the absolute root) and
+    /// push it to the GPU, along with the ancestor ribbon that
+    /// lets the shader pop from the frame back up to the absolute
+    /// root.
+    ///
+    /// Pack runs in **world** coordinates (camera passed as world
+    /// XYZ), so distance-LOD decisions are at world scale and the
+    /// buffer is shared by all frame depths. The shader starts
+    /// DDA at `frame_root_idx` with the camera in **frame-local**
+    /// coordinates, and pops via the ribbon when rays exit the
+    /// frame's `[0, 3)³` bubble.
     pub(super) fn upload_tree_lod(&mut self) {
-        let (frame, frame_root) = self.render_frame();
+        let (frame, _frame_root_id) = self.render_frame();
         let cam_local = self.camera.position.in_frame(&frame);
-        let (tree_data, node_kinds, root_index) = gpu::pack_tree_lod(
-            &self.world.library, frame_root, cam_local, 1440.0, 1.2,
+        let cam_world = self.camera.world_pos_f32();
+        let (tree_data, node_kinds, _world_root_idx) = gpu::pack_tree_lod(
+            &self.world.library, self.world.root, cam_world, 1440.0, 1.2,
         );
+        let (frame_root_idx, ribbon) = gpu::build_ribbon(&tree_data, frame.as_slice());
         let frame_kind = self.render_frame_kind();
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, &node_kinds, root_index);
+            renderer.update_tree(&tree_data, &node_kinds, frame_root_idx);
+            renderer.update_ribbon(&ribbon);
             renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
             match frame_kind {
                 crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } => {
@@ -173,22 +183,7 @@ impl App {
         // Transform AABB from world coords to frame-local coords.
         // Shader expects highlight in the same frame as `camera.pos`.
         let (frame, _) = self.render_frame();
-        let (frame_origin, frame_size) = frame_origin_size_world(&frame);
-        let scale = crate::world::anchor::WORLD_SIZE / frame_size;
-        let aabb = aabb_world.map(|(mn, mx)| {
-            (
-                [
-                    (mn[0] - frame_origin[0]) * scale,
-                    (mn[1] - frame_origin[1]) * scale,
-                    (mn[2] - frame_origin[2]) * scale,
-                ],
-                [
-                    (mx[0] - frame_origin[0]) * scale,
-                    (mx[1] - frame_origin[1]) * scale,
-                    (mx[2] - frame_origin[2]) * scale,
-                ],
-            )
-        });
+        let aabb = aabb_world.map(|(mn, mx)| super::aabb_world_to_frame(&frame, mn, mx));
         if let Some((mn, mx)) = &aabb {
             eprintln!("highlight (frame-local): min={:?} max={:?} size={:?}",
                 mn, mx, [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]]);
@@ -199,21 +194,3 @@ impl App {
     }
 }
 
-/// World-space origin and size of the cell at `path`. Origin is the
-/// world XYZ of the cell's `(0, 0, 0)` corner; size is its side
-/// length in world units.
-fn frame_origin_size_world(path: &crate::world::anchor::Path) -> ([f32; 3], f32) {
-    use crate::world::anchor::WORLD_SIZE;
-    use crate::world::tree::slot_coords;
-    let mut origin = [0.0f32; 3];
-    let mut size = WORLD_SIZE;
-    for k in 0..path.depth() as usize {
-        let (sx, sy, sz) = slot_coords(path.slot(k) as usize);
-        let child = size / 3.0;
-        origin[0] += sx as f32 * child;
-        origin[1] += sy as f32 * child;
-        origin[2] += sz as f32 * child;
-        size = child;
-    }
-    (origin, size)
-}

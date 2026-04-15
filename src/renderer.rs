@@ -8,7 +8,12 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette};
+use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+
+/// Maximum ancestor-ribbon depth supported by the shader. Larger
+/// ribbons get truncated at upload (anything beyond can't pop).
+/// 64 covers MAX_DEPTH=63 with one slack.
+pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `RootKind*`
 /// constants in `ray_march.wgsl`.
@@ -29,7 +34,9 @@ pub struct GpuUniforms {
     /// start-of-march; the body fills the `[0, 3)³` frame, and
     /// `root_inner_r`/`root_outer_r` give the body's radii.
     pub root_kind: u32,
-    pub _pad0: u32,
+    /// Number of ancestor ribbon entries. 0 = frame is at world
+    /// root, no pop possible.
+    pub ribbon_count: u32,
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
     /// Body radii (used iff `root_kind == 1`). Stored in the body
@@ -50,6 +57,7 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     uniforms_buffer: wgpu::Buffer,
+    ribbon_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     root_index: u32,
     node_count: u32,
@@ -59,6 +67,7 @@ pub struct Renderer {
     highlight_max: [f32; 4],
     root_kind: u32,
     root_radii: [f32; 4],
+    ribbon_count: u32,
 }
 
 impl Renderer {
@@ -162,11 +171,20 @@ impl Renderer {
             max_depth: 16,
             highlight_active: 0,
             root_kind: ROOT_KIND_CARTESIAN,
-            _pad0: 0,
+            ribbon_count: 0,
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             root_radii: [0.0; 4],
         };
+
+        // Initial ribbon buffer is empty (just a stub of zero
+        // entries; storage buffers can't be zero-sized so we
+        // allocate one stub entry).
+        let ribbon_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ribbon"),
+            contents: bytemuck::cast_slice(&[GpuRibbonEntry { node_idx: 0, slot: 0 }]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
             contents: bytemuck::bytes_of(&uniforms),
@@ -211,13 +229,21 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Ancestor ribbon (binding 5).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
         let bind_group = make_bind_group(
             &device, &bind_group_layout,
             &tree_buffer, &camera_buffer, &palette_buffer,
-            &uniforms_buffer, &node_kinds_buffer,
+            &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -266,13 +292,57 @@ impl Renderer {
             device, queue, surface, config, pipeline, bind_group_layout,
             tree_buffer, node_kinds_buffer,
             camera_buffer, palette_buffer, uniforms_buffer,
+            ribbon_buffer,
             bind_group,
             root_index, node_count,
             max_depth: 16, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
             root_radii: [0.0; 4],
+            ribbon_count: 0,
         }
+    }
+
+    /// Upload the ancestor ribbon (pop chain from frame's direct
+    /// parent up to the absolute root). Resizes the ribbon buffer
+    /// if needed and recreates the bind group.
+    pub fn update_ribbon(&mut self, ribbon: &[GpuRibbonEntry]) {
+        let truncated = if ribbon.len() > MAX_RIBBON_LEN {
+            &ribbon[..MAX_RIBBON_LEN]
+        } else {
+            ribbon
+        };
+        // Always upload at least one entry — empty storage buffers
+        // break the bind group.
+        let stub_storage = [GpuRibbonEntry { node_idx: 0, slot: 0 }];
+        let payload: &[GpuRibbonEntry] = if truncated.is_empty() {
+            &stub_storage
+        } else {
+            truncated
+        };
+
+        self.ribbon_count = truncated.len() as u32;
+        let needed = (payload.len() * std::mem::size_of::<GpuRibbonEntry>()) as u64;
+
+        let mut recreate_bind_group = false;
+        if needed > self.ribbon_buffer.size() {
+            self.ribbon_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ribbon"),
+                contents: bytemuck::cast_slice(payload),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            recreate_bind_group = true;
+        } else {
+            self.queue.write_buffer(&self.ribbon_buffer, 0, bytemuck::cast_slice(payload));
+        }
+        if recreate_bind_group {
+            self.bind_group = make_bind_group(
+                &self.device, &self.bind_group_layout,
+                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+            );
+        }
+        self.write_uniforms();
     }
 
     /// Set the frame-root NodeKind: Cartesian (default) or
@@ -397,7 +467,7 @@ impl Renderer {
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
-                &self.uniforms_buffer, &self.node_kinds_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
             );
         }
 
@@ -413,7 +483,7 @@ impl Renderer {
             max_depth: self.max_depth,
             highlight_active: self.highlight_active,
             root_kind: self.root_kind,
-            _pad0: 0,
+            ribbon_count: self.ribbon_count,
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             root_radii: self.root_radii,
@@ -430,6 +500,7 @@ fn make_bind_group(
     palette: &wgpu::Buffer,
     uniforms: &wgpu::Buffer,
     node_kinds: &wgpu::Buffer,
+    ribbon: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -440,6 +511,7 @@ fn make_bind_group(
             wgpu::BindGroupEntry { binding: 2, resource: palette.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: uniforms.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: node_kinds.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
         ],
     })
 }

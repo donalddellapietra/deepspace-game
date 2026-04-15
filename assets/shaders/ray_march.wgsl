@@ -32,7 +32,11 @@ struct Uniforms {
     /// body (body fills [0, 3) frame; dispatch directly to
     /// sphere_in_cell at start-of-march).
     root_kind: u32,
-    _pad0: u32,
+    /// Number of ancestor ribbon entries available. When the ray
+    /// exits the frame's [0, 3)³ bubble at depth 0, the shader
+    /// pops upward, walking ribbon[0]..ribbon[ribbon_count-1].
+    /// 0 = no ancestors (frame is at world root).
+    ribbon_count: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
@@ -42,6 +46,14 @@ struct Uniforms {
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
+
+/// One entry in the ancestor ribbon. `node_idx` is the buffer
+/// index of the ancestor's node; `slot` is the slot in that
+/// ancestor that contained the level we're popping FROM.
+struct RibbonEntry {
+    node_idx: u32,
+    slot: u32,
+}
 
 struct NodeKindGpu {
     kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
@@ -55,6 +67,7 @@ struct NodeKindGpu {
 @group(0) @binding(2) var<uniform> palette: Palette;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 @group(0) @binding(4) var<storage, read> node_kinds: array<NodeKindGpu>;
+@group(0) @binding(5) var<storage, read> ribbon: array<RibbonEntry>;
 
 // -------------- Tree access helpers --------------
 
@@ -434,26 +447,16 @@ fn sphere_in_cell(
 
 // -------------- Stack-based Cartesian tree DDA --------------
 
-fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
+/// Cartesian DDA in a single frame rooted at `root_node_idx`. The
+/// frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
+/// Returns hit on cell terminal; on miss (ray exits the frame),
+/// returns hit=false so the caller can pop to the ancestor ribbon.
+fn march_cartesian(
+    root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
+) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
-
-    // Frame-root dispatch. When the render frame is a sphere body,
-    // the body fills the [0, 3)³ shader frame and we go straight
-    // into sphere_in_cell — there is no Cartesian DDA to run
-    // because the body's 27 children are interpreted by NodeKind,
-    // not as XYZ cells.
-    if uniforms.root_kind == ROOT_KIND_BODY {
-        let body_origin = vec3<f32>(0.0);
-        let body_size = 3.0;  // body fills the frame
-        let inner_r = uniforms.root_radii.x;
-        let outer_r = uniforms.root_radii.y;
-        return sphere_in_cell(
-            uniforms.root_index, body_origin, body_size,
-            inner_r, outer_r, ray_origin, ray_dir,
-        );
-    }
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -476,7 +479,7 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
-    s_node_idx[0] = uniforms.root_index;
+    s_node_idx[0] = root_node_idx;
     s_node_origin[0] = vec3<f32>(0.0);
     s_cell_size[0] = 1.0;
 
@@ -692,6 +695,76 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
         }
     }
 
+    return result;
+}
+
+// -------------- Frame dispatch + ancestor pop --------------
+
+/// Top-level march. Dispatches the current frame's DDA on its
+/// NodeKind (Cartesian or sphere body), then on miss pops to the
+/// next ancestor in the ribbon and continues. When ribbon is
+/// exhausted, returns sky (hit=false).
+///
+/// Each pop transforms the ray into the parent's frame coords:
+/// `parent_pos = slot_xyz + frame_pos / 3`, `parent_dir = frame_dir / 3`.
+/// The parent's frame cell still spans `[0, 3)³` in its own
+/// coords, so the inner DDA is unchanged — only the ray is
+/// rescaled and the buffer node_idx swapped.
+fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
+    var ray_origin = world_ray_origin;
+    var ray_dir = world_ray_dir;
+    var current_idx = uniforms.root_index;
+    var current_kind = uniforms.root_kind;
+    var inner_r = uniforms.root_radii.x;
+    var outer_r = uniforms.root_radii.y;
+    var ribbon_level: u32 = 0u;
+
+    var hops: u32 = 0u;
+    loop {
+        if hops > 80u { break; }
+        hops = hops + 1u;
+
+        var r: HitResult;
+        if current_kind == ROOT_KIND_BODY {
+            let body_origin = vec3<f32>(0.0);
+            let body_size = 3.0;
+            r = sphere_in_cell(
+                current_idx, body_origin, body_size,
+                inner_r, outer_r, ray_origin, ray_dir,
+            );
+        } else {
+            r = march_cartesian(current_idx, ray_origin, ray_dir);
+        }
+        if r.hit {
+            return r;
+        }
+
+        // Ray exited the current frame. Try popping to ancestor.
+        if ribbon_level >= uniforms.ribbon_count {
+            break;
+        }
+        let entry = ribbon[ribbon_level];
+        let s = entry.slot;
+        let sx = i32(s % 3u);
+        let sy = i32((s / 3u) % 3u);
+        let sz = i32(s / 9u);
+        ray_origin = vec3<f32>(f32(sx), f32(sy), f32(sz)) + ray_origin / 3.0;
+        ray_dir = ray_dir / 3.0;
+        current_idx = entry.node_idx;
+        let k = node_kinds[current_idx].kind;
+        if k == 1u {
+            current_kind = ROOT_KIND_BODY;
+            inner_r = node_kinds[current_idx].inner_r;
+            outer_r = node_kinds[current_idx].outer_r;
+        } else {
+            current_kind = ROOT_KIND_CARTESIAN;
+        }
+        ribbon_level = ribbon_level + 1u;
+    }
+
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
     return result;
 }
 
