@@ -340,6 +340,27 @@ impl App {
                 renderer.set_face_roots(face_roots);
             }
         }
+        // One-shot pack diagnostic: dump the tree-root's 27 GpuChild
+        // entries plus the kind tag of every Node child. Once we
+        // understand why "the whole world is stone," remove.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!("[pack] root_idx={} packed_node_count={} kinds_count={} face_roots={:?}",
+                root_indices[0], tree_data.len() / 27, kinds_data.len(), &root_indices[1..]);
+            let root_buf_idx = root_indices[0] as usize;
+            for slot in 0..27 {
+                let gc = tree_data[root_buf_idx * 27 + slot];
+                let kind = if gc.tag == 2 {
+                    let ci = gc.node_index as usize;
+                    if ci < kinds_data.len() {
+                        Some(kinds_data[ci].tag)
+                    } else { None }
+                } else { None };
+                eprintln!("  root[slot={:2}] tag={} bt={} idx={} kind_tag_at_idx={:?}",
+                    slot, gc.tag, gc.block_type, gc.node_index, kind);
+            }
+        }
         // The `cs_planet` uniform is in WHATEVER frame the shader is
         // rendering in. With dynamic render frame the shader's
         // `[0, 3)³` traversal volume is the render-root cell, not

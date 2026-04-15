@@ -425,12 +425,10 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             // axis-aligned voxels.
             let ci = child_node_index(s_node_idx[depth], slot);
             let kind_tag = kinds[ci].tag;
-            // Body (1) and Face (2) children are rendered by the
-            // cs_planet sphere DDA, not the Cartesian march. Walking
-            // a face subtree as if it were Cartesian produces "walls
-            // floating in the sky" because face-subtree slots index
-            // (u, v, r) cells, not axis-aligned voxels.
-            if kind_tag == 1u || kind_tag == 2u {
+            // DEBUG: hard-skip ALL Node children. If the user still
+            // sees stone, the renderer is hitting Block(STONE) tag=1
+            // children directly (not through the Node descent path).
+            if true || kind_tag == 1u || kind_tag == 2u {
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
