@@ -146,10 +146,18 @@ impl App {
     /// live in [`edit_actions`]; the `ApplicationHandler` in
     /// [`event_loop`] calls them in order.
     pub(super) fn update(&mut self, dt: f32) {
-        // Debug mode: no physics. The only motion is one-cell
-        // teleports fired from `apply_key`. We still re-blend the
-        // up-vector each frame so look smoothing stays smooth.
-        player::update(&mut self.camera, &mut self.velocity, dt);
+        if self.debug_frozen {
+            return;
+        }
+        player::update(
+            &mut self.camera,
+            &mut self.velocity,
+            &self.keys,
+            self.body_anchor,
+            &self.world.library,
+            self.world.root,
+            dt,
+        );
 
         if let Some(renderer) = &self.renderer {
             renderer.update_camera(&self.camera.gpu_camera(1.2));
