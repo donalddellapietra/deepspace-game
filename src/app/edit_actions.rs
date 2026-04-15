@@ -44,16 +44,17 @@ impl App {
     pub fn apply_zoom(&mut self) {
         self.ui.zoom_level = self.zoom_level();
         let vd = self.visual_depth();
-        let (frame, _) = self.render_frame();
-        let cam_local = self.camera.position.in_frame(&frame);
+        let world_pos = self.camera.world_pos_f32();
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
-            renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
+            renderer.update_camera(&self.camera.gpu_camera_at(world_pos, 1.2));
         }
+        // Rebuild the ribbon + tree pack from the new anchor.
+        self.upload_tree_lod();
         log::info!(
-            "Zoom: {}/{}, edit_depth: {}, visual: {}, anchor_depth: {}, frame_depth: {}",
+            "Zoom: {}/{}, edit_depth: {}, visual: {}, anchor_depth: {}",
             self.zoom_level(), self.tree_depth as i32,
-            self.edit_depth(), vd, self.anchor_depth(), frame.depth(),
+            self.edit_depth(), vd, self.anchor_depth(),
         );
     }
 
@@ -133,17 +134,123 @@ impl App {
         self.upload_tree_lod();
     }
 
-    /// Pack the tree subtree at the current render frame and push
-    /// it (along with the parallel `node_kinds` buffer) to the GPU.
+    /// Pack the tree from world root into one buffer and build the
+    /// ribbon uniform. Every ribbon frame's node is kept walkable by
+    /// passing the camera's anchor as the packer's `preserve_path`,
+    /// so LOD flattening can't strand a frame root.
     pub(super) fn upload_tree_lod(&mut self) {
-        let (frame, frame_root) = self.render_frame();
-        let cam_local = self.camera.position.in_frame(&frame);
-        let (tree_data, node_kinds, root_index) = gpu::pack_tree_lod(
-            &self.world.library, frame_root, cam_local, 1440.0, 1.2,
+        let ribbon = self.render_ribbon();
+        let world_pos = self.camera.world_pos_f32();
+        let anchor = self.camera.position.anchor;
+        let (tree_data, node_kinds, _world_root_idx, visited) = gpu::pack_tree_lod(
+            &self.world.library, self.world.root,
+            world_pos, 1440.0, 1.2,
+            &anchor,
         );
+
+        // Compute the planet uniform. Walks `planet_path` to find the
+        // current body node (paths persist across edits via content-
+        // addressed rebuild, but the NodeId at the end of the path
+        // changes each time the subtree mutates — look it up fresh).
+        let planet_gpu = self.compute_planet_uniform(&visited);
+        // Map each ribbon frame's NodeId to its buffer index. If a
+        // frame's node wasn't reachable (shouldn't happen with the
+        // preserve_path pass, but defensive), fall back to the root.
+        let mut gpu_ribbon: Vec<gpu::GpuRibbonFrame> = Vec::with_capacity(ribbon.len());
+        for f in &ribbon {
+            let root_index = visited.get(&f.node_id).copied().unwrap_or(0);
+            gpu_ribbon.push(gpu::GpuRibbonFrame {
+                root_index,
+                _pad0: 0,
+                world_scale: f.world_scale,
+                _pad1: 0,
+                camera_local: [f.camera_local[0], f.camera_local[1], f.camera_local[2], 0.0],
+            });
+        }
         if let Some(renderer) = &mut self.renderer {
-            renderer.update_tree(&tree_data, &node_kinds, root_index);
-            renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
+            renderer.update_tree(&tree_data, &node_kinds, &gpu_ribbon);
+            renderer.set_planet(planet_gpu);
+            renderer.update_camera(&self.camera.gpu_camera_at(world_pos, 1.2));
+        }
+    }
+
+    /// Compute the planet uniform from the current world state and
+    /// camera. Uses path-anchored `offset_from` so `oc_world` stays
+    /// bounded (magnitude ≤ body cell size in world units)
+    /// regardless of the camera's anchor depth — this is the
+    /// precision-safe replacement for passing the world-scale
+    /// camera/center through a frame-local scaling.
+    ///
+    /// `active=0` is returned when the planet isn't reachable via
+    /// `planet_path` (e.g., the planet hasn't been installed yet or
+    /// the pack truncated before the body) — the shader skips its
+    /// sphere pass entirely.
+    fn compute_planet_uniform(
+        &self,
+        visited: &std::collections::HashMap<crate::world::tree::NodeId, u32>,
+    ) -> gpu::GpuPlanet {
+        use crate::world::anchor::WorldPos;
+        use crate::world::tree::{Child, NodeKind};
+
+        // Walk planet_path to find the body NodeId.
+        let mut node_id = self.world.root;
+        for k in 0..self.planet_path.depth() as usize {
+            let Some(node) = self.world.library.get(node_id) else {
+                return gpu::GpuPlanet::default();
+            };
+            let slot = self.planet_path.slot(k) as usize;
+            match node.children[slot] {
+                Child::Node(cid) => node_id = cid,
+                _ => return gpu::GpuPlanet::default(),
+            }
+        }
+        let body_id = node_id;
+        let Some(body_node) = self.world.library.get(body_id) else {
+            return gpu::GpuPlanet::default();
+        };
+        let (inner_r_local, outer_r_local) = match body_node.kind {
+            NodeKind::CubedSphereBody { inner_r, outer_r } => (inner_r, outer_r),
+            _ => return gpu::GpuPlanet::default(),
+        };
+
+        // Body cell size in world units. At depth 1, cell_size =
+        // WORLD_SIZE / 3 = 1.0. More generally: WORLD_SIZE / 3^depth.
+        let body_depth = self.planet_path.depth();
+        let body_cell_size = crate::world::anchor::WORLD_SIZE
+            / (3.0_f32).powi(body_depth as i32);
+        let inner_r_world = inner_r_local * body_cell_size;
+        let outer_r_world = outer_r_local * body_cell_size;
+
+        // Body center in WorldPos form, then path-anchored offset
+        // from the camera. `offset_from` composes positions in their
+        // common ancestor's frame — the body node IS the common
+        // ancestor when the camera is inside the body's subtree, so
+        // precision is bounded by body_cell_size * 1e-7 in that case.
+        let body_center = WorldPos::new(self.planet_path, [0.5, 0.5, 0.5]);
+        let oc = self.camera.position.offset_from(&body_center);
+
+        // Walker's max_term_depth cap for sphere boundary math. The
+        // sphere DDA floors cell_eps at the cap so ray advancement
+        // stays representable in f32 regardless of content depth;
+        // deeper edits still register as hits via the walker's per-
+        // sample block lookup. Value chosen empirically: 3^12 ≈ 5e5
+        // keeps `cells_d` integer-exact in f32 and cell-eps
+        // advancement above f32 ULP at typical ray distances.
+        let max_term_depth = 12;
+
+        let body_node_index = visited.get(&body_id).copied().unwrap_or(u32::MAX);
+        if body_node_index == u32::MAX {
+            return gpu::GpuPlanet::default();
+        }
+
+        gpu::GpuPlanet {
+            enabled: 1,
+            body_node_index,
+            inner_r_world,
+            outer_r_world,
+            oc_world: [oc[0], oc[1], oc[2], 0.0],
+            max_term_depth,
+            _pad: [0; 3],
         }
     }
 

@@ -29,12 +29,26 @@ impl ApplicationHandler for App {
         #[cfg(not(target_arch = "wasm32"))]
         crate::platform::prepare_window(&window);
 
+        // Initial pack uses the non-LOD `pack_tree` to get a
+        // full-fidelity buffer on first upload; `apply_zoom` below
+        // immediately re-packs with the ribbon-aware path.
         let (tree_data, node_kinds, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
+        // Single-entry ribbon pointing at the packed root — correct
+        // for "no camera yet / no ribbon computed." `apply_zoom`
+        // overwrites this below.
+        let initial_ribbon = [gpu::GpuRibbonFrame {
+            root_index,
+            _pad0: 0,
+            world_scale: 1.0,
+            _pad1: 0,
+            camera_local: [1.5, 1.75, 1.5, 0.0],
+        }];
         let renderer = pollster::block_on(
-            Renderer::new(window, &tree_data, &node_kinds, root_index),
+            Renderer::new(window, &tree_data, &node_kinds, &initial_ribbon),
         );
         self.renderer = Some(renderer);
+        self.upload_tree_lod();
         self.apply_zoom();
         self.last_frame = std::time::Instant::now();
     }

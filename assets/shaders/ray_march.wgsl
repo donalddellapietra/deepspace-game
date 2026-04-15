@@ -21,17 +21,44 @@ struct Palette {
     colors: array<vec4<f32>, 256>,
 }
 
-struct Uniforms {
+struct RibbonFrame {
     root_index: u32,
+    _pad0: u32,
+    world_scale: f32,
+    _pad1: u32,
+    camera_local: vec4<f32>,
+}
+
+const MAX_RIBBON_FRAMES: u32 = 8u;
+
+// Layout-equivalent to Rust `GpuPlanet`. WGSL would round
+// `vec3<u32>` to 16 bytes; using individual u32 padding fields
+// keeps the struct exactly 48 bytes to match the Rust definition.
+struct Planet {
+    enabled: u32,
+    body_node_index: u32,
+    inner_r_world: f32,
+    outer_r_world: f32,
+    oc_world: vec4<f32>,
+    max_term_depth: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct Uniforms {
     node_count: u32,
     screen_width: f32,
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
+    ribbon_count: u32,
     _pad0: u32,
     _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    planet: Planet,
+    ribbon: array<RibbonFrame, 8>,
 }
 
 struct NodeKindGpu {
@@ -210,29 +237,37 @@ struct HitResult {
     t: f32,
 }
 
-// Sphere DDA running inside one CubedSphereBody cell. The body cell
-// is given in the render-frame's coords (origin + size); radii are
-// scaled into the same frame. Returns hit/miss; on miss the caller
-// continues the Cartesian DDA past the body cell.
+// Sphere DDA running in sphere-relative world coords. `oc` is
+// `camera_world - sphere_center_world`, CPU-computed via
+// `WorldPos::offset_from` so it's path-anchored and bounded by the
+// body cell size — magnitudes stay in [-shell, +shell] regardless
+// of where the camera is anchored in the tree.
+//
+// `max_term_depth_cap` floors the ray-advance eps so cell-boundary
+// math can't collapse below f32 ULP at arbitrary content depth:
+// cells deeper than the cap still appear in hits (the walker
+// descends to the real block), but the DDA advances at the capped
+// depth's cell scale.
+//
+// Returns a HitResult with `t` in world units. Caller composites
+// with ribbon-frame marches by comparing world-scale t.
 fn sphere_in_cell(
     body_node_idx: u32,
-    body_cell_origin: vec3<f32>,
-    body_cell_size: f32,
-    inner_r_local: f32,
-    outer_r_local: f32,
-    ray_origin: vec3<f32>,
+    oc_world: vec3<f32>,
     ray_dir: vec3<f32>,
+    inner_r_world: f32,
+    outer_r_world: f32,
+    max_term_depth_cap: u32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
 
-    let cs_center = body_cell_origin + vec3<f32>(body_cell_size * 0.5);
-    let cs_outer = outer_r_local * body_cell_size;
-    let cs_inner = inner_r_local * body_cell_size;
+    let cs_outer = outer_r_world;
+    let cs_inner = inner_r_world;
     let shell = cs_outer - cs_inner;
 
-    let oc = ray_origin - cs_center;
+    let oc = oc_world;
     let b = dot(oc, ray_dir);
     let c_outer = dot(oc, oc) - cs_outer * cs_outer;
     let disc = b * b - c_outer;
@@ -296,8 +331,14 @@ fn sphere_in_cell(
             return result;
         }
 
+        // Cap the boundary-math depth so `cells_d` stays in the
+        // f32 integer-exact range (2^24 ≈ 1.6e7, `3^15 ≈ 1.4e7`)
+        // AND so cell-eps stays advancing the ray. Per-sample walker
+        // still reports the real block depth — only the DDA's grid
+        // scale is capped.
         deepest_term_depth = max(deepest_term_depth, term_depth);
-        let cells_d = pow(3.0, f32(deepest_term_depth));
+        let capped_depth = min(deepest_term_depth, max_term_depth_cap);
+        let cells_d = pow(3.0, f32(capped_depth));
         let iu = floor(un * cells_d);
         let iv = floor(vn * cells_d);
         let ir = floor(rn * cells_d);
@@ -342,10 +383,19 @@ fn sphere_in_cell(
 
 // -------------- Stack-based Cartesian tree DDA --------------
 
-fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
+fn march(frame_root_index: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+
+    // Sphere bodies are rendered by a separate pass in fs_main using
+    // path-anchored `oc_world` for precision. March() skips sphere
+    // content entirely — if the frame's root is itself a sphere
+    // body or face-subtree node, return no-hit.
+    let root_kind_entry = node_kinds[frame_root_index];
+    if (root_kind_entry.kind != 0u) {
+        return result;
+    }
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -368,7 +418,7 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
-    s_node_idx[0] = uniforms.root_index;
+    s_node_idx[0] = frame_root_index;
     s_node_origin[0] = vec3<f32>(0.0);
     s_cell_size[0] = 1.0;
 
@@ -457,49 +507,12 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             let child_idx = child_node_index(s_node_idx[depth], slot);
             let kind = node_kinds[child_idx].kind;
 
-            if kind == 1u {
-                // CubedSphereBody: dispatch sphere DDA in this body's cell.
-                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-                let body_size = s_cell_size[depth];
-                let inner_r = node_kinds[child_idx].inner_r;
-                let outer_r = node_kinds[child_idx].outer_r;
-                let sph = sphere_in_cell(
-                    child_idx, body_origin, body_size,
-                    inner_r, outer_r, ray_origin, ray_dir,
-                );
-                if sph.hit {
-                    return sph;
-                }
-                // Sphere missed — advance Cartesian DDA past this cell.
-                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
-                    s_cell[depth].x += step.x;
-                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
-                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if s_side_dist[depth].y < s_side_dist[depth].z {
-                    s_cell[depth].y += step.y;
-                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                } else {
-                    s_cell[depth].z += step.z;
-                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                }
-                continue;
-            }
-            if false {
-                // Real path (re-enable after diagnostic confirms dispatch):
-                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-                let body_size = s_cell_size[depth];
-                let inner_r = node_kinds[child_idx].inner_r;
-                let outer_r = node_kinds[child_idx].outer_r;
-                let sph = sphere_in_cell(
-                    child_idx, body_origin, body_size,
-                    inner_r, outer_r, ray_origin, ray_dir,
-                );
-                if sph.hit {
-                    return sph;
-                }
-                // Sphere missed — advance Cartesian DDA past this cell.
+            // Sphere body or face-subtree child: skip. The sphere
+            // pass (outside this march) handles all body content via
+            // path-anchored coords so the ribbon's Cartesian march
+            // doesn't paint cubic cells over the sphere's bulged
+            // voxels. Advance DDA past this cell and continue.
+            if kind != 0u {
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -613,7 +626,50 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     );
     let ray_dir = normalize(camera.forward + camera.right * ndc.x + camera.up * ndc.y);
 
-    let result = march(camera.pos, ray_dir);
+    // Ribbon compositor: march each frame in its local coords and
+    // keep the hit with smallest world-scale t. Frames come deepest-
+    // first from the CPU. Ribbon marches skip sphere content — that
+    // comes from the dedicated sphere pass below.
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    var best_t_world: f32 = 1e20;
+
+    for (var i: u32 = 0u; i < uniforms.ribbon_count; i = i + 1u) {
+        let frame = uniforms.ribbon[i];
+        let r = march(frame.root_index, frame.camera_local.xyz, ray_dir);
+        if (r.hit) {
+            let t_world = r.t * frame.world_scale;
+            if (t_world < best_t_world) {
+                result = r;
+                best_t_world = t_world;
+            }
+        }
+    }
+
+    // Sphere pass: single global ray-sphere + face-subtree walk in
+    // path-anchored sphere-relative coords. Precision stays bounded
+    // at any camera anchor depth because `oc_world` is CPU-computed
+    // via path arithmetic (not by subtracting two large world-scale
+    // f32 vectors).
+    if (uniforms.planet.enabled != 0u) {
+        let sphere_r = sphere_in_cell(
+            uniforms.planet.body_node_index,
+            uniforms.planet.oc_world.xyz,
+            ray_dir,
+            uniforms.planet.inner_r_world,
+            uniforms.planet.outer_r_world,
+            uniforms.planet.max_term_depth,
+        );
+        if (sphere_r.hit && sphere_r.t < best_t_world) {
+            result = sphere_r;
+            best_t_world = sphere_r.t;
+        }
+    }
+
+    // Convert best hit's t to world units for the highlight depth
+    // test below (which uses camera.pos world coords).
+    result.t = best_t_world;
 
     var color: vec3<f32>;
     if result.hit {
