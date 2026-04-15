@@ -614,8 +614,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let lit = result.color * (ambient + diffuse * 0.7);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else {
-        let sky_t = ray_dir.y * 0.5 + 0.5;
-        color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
+        // DIAGNOSTIC: bright yellow for empty/sky pixels. If the
+        // surrounding cells are correctly empty you'll see yellow
+        // where the sky used to be; if you see stone, some Block
+        // hit is firing in those cells.
+        color = vec3<f32>(1.0, 1.0, 0.0);
     }
 
     if uniforms.highlight_active != 0u {
