@@ -32,6 +32,22 @@ pub struct GpuUniforms {
     /// `[xyz, xyz + 3·w)`). When the render frame is the world root,
     /// this is `(0, 0, 0, 1)`.
     pub render_frame: [f32; 4],
+    /// Sphere body's render-frame-local footprint. xyz = body cube's
+    /// min corner in render-local units; w = cube side length. The
+    /// shader uses this independent of where the camera's render
+    /// root sits in the tree, so the body stays visible at any zoom.
+    pub body_world: [f32; 4],
+    /// `(inner_r, outer_r, _, _)` in body-local `[0, 1)` units. When
+    /// `outer_r == 0` no body is rendered.
+    pub body_radii: [f32; 4],
+    /// Packed-buffer index of the body node. `u32::MAX` = no body.
+    pub body_idx: u32,
+    /// `1` when the render root sits inside a sphere subtree (body
+    /// itself or any descendant face cell). The shader's flat-
+    /// Cartesian DDA must skip the tree walk in that case — those
+    /// cells are bulged voxels and the body pass renders them.
+    pub render_root_in_sphere: u32,
+    pub _body_pad: [u32; 2],
 }
 
 pub struct Renderer {
@@ -57,6 +73,10 @@ pub struct Renderer {
     body_highlight_active: [f32; 4],
     body_highlight_cell: [f32; 4],
     render_frame: [f32; 4],
+    body_world: [f32; 4],
+    body_radii: [f32; 4],
+    body_idx: u32,
+    render_root_in_sphere: u32,
 }
 
 impl Renderer {
@@ -168,6 +188,11 @@ impl Renderer {
             body_highlight_active: [0.0; 4],
             body_highlight_cell: [0.0; 4],
             render_frame: [0.0, 0.0, 0.0, 1.0],
+            body_world: [0.0; 4],
+            body_radii: [0.0; 4],
+            body_idx: u32::MAX,
+            render_root_in_sphere: 0,
+            _body_pad: [0; 2],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -311,7 +336,35 @@ impl Renderer {
             body_highlight_active: [0.0; 4],
             body_highlight_cell: [0.0; 4],
             render_frame: [0.0, 0.0, 0.0, 1.0],
+            body_world: [0.0; 4],
+            body_radii: [0.0; 4],
+            body_idx: u32::MAX,
+            render_root_in_sphere: 0,
         }
+    }
+
+    pub fn set_render_root_in_sphere(&mut self, in_sphere: bool) {
+        let v = if in_sphere { 1 } else { 0 };
+        if self.render_root_in_sphere != v {
+            self.render_root_in_sphere = v;
+            self.write_uniforms();
+        }
+    }
+
+    /// Set the body's render-frame-local footprint, kind payload,
+    /// and packed-buffer index. `body_idx == u32::MAX` hides the
+    /// body. Call each frame after recomputing the render frame.
+    pub fn set_body(
+        &mut self,
+        world: [f32; 4],
+        inner_r: f32,
+        outer_r: f32,
+        buf_idx: u32,
+    ) {
+        self.body_world = world;
+        self.body_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.body_idx = buf_idx;
+        self.write_uniforms();
     }
 
     /// Declare the world-space footprint of the packed tree's root.
@@ -546,6 +599,19 @@ impl Renderer {
         tree_metas: &[GpuNodeMeta],
         root_index: u32,
     ) {
+        // Guard against a runaway pack. A healthy world has on the
+        // order of 10³ nodes; 10⁶ means something exploded — better
+        // to skip the upload and keep last frame's data than to
+        // allocate gigabytes of GPU memory and freeze the system.
+        const MAX_NODES: usize = 1_000_000;
+        if tree_data.len() / 27 > MAX_NODES {
+            log::error!(
+                "renderer: refusing tree upload of {} nodes (cap {}); keeping previous frame",
+                tree_data.len() / 27, MAX_NODES,
+            );
+            return;
+        }
+
         self.root_index = root_index;
         self.node_count = (tree_data.len() / 27) as u32;
 
@@ -607,6 +673,11 @@ impl Renderer {
             body_highlight_active: self.body_highlight_active,
             body_highlight_cell: self.body_highlight_cell,
             render_frame: self.render_frame,
+            body_world: self.body_world,
+            body_radii: self.body_radii,
+            body_idx: self.body_idx,
+            render_root_in_sphere: self.render_root_in_sphere,
+            _body_pad: [0; 2],
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

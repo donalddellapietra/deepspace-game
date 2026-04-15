@@ -210,11 +210,12 @@ impl App {
         }
 
         let test = self.test.as_mut().unwrap();
-        // One frame before exit, capture the screenshot. Re-fetch
-        // the renderer after running script commands so any tree
-        // re-uploads have settled.
+        let timed_out = test.timed_out();
+        let frame_budget_done = frame + 1 >= test.exit_after_frames;
+        // Capture the screenshot just before exit (whichever budget
+        // — frames or wall-clock — fires first).
         if let Some(path) = test.screenshot_path.clone() {
-            if !test.screenshot_done && frame + 1 >= test.exit_after_frames {
+            if !test.screenshot_done && (frame_budget_done || timed_out) {
                 if let Some(r) = &mut self.renderer {
                     match r.capture_to_png(&path) {
                         Ok(()) => eprintln!("test_runner: screenshot saved to {path}"),
@@ -225,7 +226,13 @@ impl App {
             }
         }
 
-        if frame >= self.test.as_ref().unwrap().exit_after_frames {
+        if timed_out {
+            eprintln!(
+                "test_runner: timeout {:.1}s reached at frame {frame}, quitting",
+                self.test.as_ref().unwrap().timeout_secs,
+            );
+            event_loop.exit();
+        } else if frame >= self.test.as_ref().unwrap().exit_after_frames {
             eprintln!("test_runner: exit_after_frames={frame} reached, quitting");
             event_loop.exit();
         }

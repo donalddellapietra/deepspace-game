@@ -13,6 +13,10 @@
 //! --screenshot PATH       Capture the rendered frame to PATH (PNG)
 //!                         after the warm-up + script settle, then exit.
 //! --exit-after-frames N   Exit after N rendered frames (default ~120).
+//! --timeout-secs SECS     Wall-clock kill switch (default 5.0). Triggers
+//!                         a screenshot + exit if the frame budget hasn't
+//!                         already done so. Catches perf regressions:
+//!                         a hung shader can't run a test forever.
 //! --script CMDS           Comma-separated commands run in order:
 //!                           break          left-click (break a block)
 //!                           place          right-click (place a block)
@@ -33,6 +37,11 @@ pub struct TestConfig {
     pub spawn_depth: Option<u8>,
     pub screenshot: Option<String>,
     pub exit_after_frames: Option<u32>,
+    /// Wall-clock kill switch in seconds. Defaults to 5.0 so a
+    /// perf regression (hung shader, runaway DDA) can't block the
+    /// test loop indefinitely. Override with `--timeout-secs N`
+    /// for scenarios that genuinely need longer settle time.
+    pub timeout_secs: Option<f32>,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -57,6 +66,9 @@ impl TestConfig {
                 }
                 "--exit-after-frames" => {
                     cfg.exit_after_frames = args.next().and_then(|v| v.parse().ok());
+                }
+                "--timeout-secs" => {
+                    cfg.timeout_secs = args.next().and_then(|v| v.parse().ok());
                 }
                 "--script" => {
                     if let Some(s) = args.next() {
@@ -101,6 +113,11 @@ pub struct TestRunner {
     pub exit_after_frames: u32,
     /// Pre-flattened action queue: each entry is `(at_frame, cmd)`.
     pub script: Vec<(u32, ScriptCmd)>,
+    /// Wall-clock start; combined with `timeout_secs` to bail on
+    /// perf hangs without depending on frame counting (a stuck
+    /// renderer might never advance frames).
+    pub started_at: std::time::Instant,
+    pub timeout_secs: f32,
 }
 
 impl TestRunner {
@@ -124,7 +141,14 @@ impl TestRunner {
             screenshot_done: false,
             exit_after_frames: exit_after,
             script: schedule,
+            started_at: std::time::Instant::now(),
+            timeout_secs: cfg.timeout_secs.unwrap_or(5.0),
         })
+    }
+
+    /// True once the wall-clock timeout has fired.
+    pub fn timed_out(&self) -> bool {
+        self.started_at.elapsed().as_secs_f32() >= self.timeout_secs
     }
 
     /// Pop any commands whose scheduled frame is `<= self.frame`.

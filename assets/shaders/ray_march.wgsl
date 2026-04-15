@@ -39,10 +39,25 @@ struct Uniforms {
     // (face, iu, iv, ir) of the highlighted cell at `body_highlight_active.y` depth.
     body_highlight_cell: vec4<f32>,
     // Render frame: the packed tree's root represents this sub-cube
-    // of world space. xyz = world-space min corner, w = width of one
-    // root-cell (root node spans [xyz, xyz + 3*w)). When the render
-    // frame is the world root, this is (0, 0, 0, 1).
+    // of world space. xyz = render-local min corner (zero when the
+    // CPU shifts everything into render-local), w = width of one
+    // root-cell.
     render_frame: vec4<f32>,
+    // Body cube's render-frame-LOCAL footprint: xyz = min corner,
+    // w = cube side length. The body pass uses this to march the
+    // shell independently of where the camera's render root sits in
+    // the tree.
+    body_world: vec4<f32>,
+    // Body radii in body-local `[0, 1)` units. xy = (inner_r, outer_r).
+    body_radii: vec4<f32>,
+    // Packed-buffer index of the body node. 0xFFFFFFFF = no body.
+    body_idx: u32,
+    // 1 when the render root sits inside a sphere subtree. The
+    // Cartesian tree walk skips entirely in that case — those
+    // cells are bulged voxels, drawn by the body pass.
+    render_root_in_sphere: u32,
+    _body_pad0: u32,
+    _body_pad1: u32,
 }
 
 /// Per-node metadata — the NodeKind exposed to the shader. Layout
@@ -235,7 +250,7 @@ fn sample_face_tree(root_idx: u32, un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
     }
-    return vec2<u32>(0u, 12u);
+    return vec2<u32>(0u, 22u);
 }
 
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
@@ -368,7 +383,11 @@ fn march_body(ray_origin: vec3<f32>, ray_dir: vec3<f32>, body: BodyFrame) -> Bod
     // neighboring cell instead of looping on the same plane.
     let eps = max(shell * 1e-5, 1e-7);
     var t = t_enter + eps;
-    let max_body_steps: u32 = 4096u;
+    // Hard step cap. Keep this small enough that even a worst-case
+    // ray (camera deep inside body, samples returning depth 22 →
+    // 1/3^22 stride) bails fast. Larger values risk pegging the GPU
+    // and freezing macOS. 1024 is plenty for visible-scale shells.
+    let max_body_steps: u32 = 1024u;
 
     // If the ray begins inside the inner core (`r < cs_inner`),
     // the sample loop's `if r < cs_inner { break }` would bail
@@ -541,26 +560,6 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     s_node_origin[0] = rf_origin;
     s_cell_size[0] = rf_cell;
 
-    // If the render root IS a body node, the entire render volume
-    // is one body cell — dispatch the cubed-sphere DDA directly,
-    // no Cartesian descent needed (and not even possible — body's
-    // children are face roots in (u, v, r), not Cartesian).
-    let root_meta = node_metas[uniforms.root_index];
-    if root_meta.kind_tag == 1u {
-        let body_frame = body_frame_from(
-            uniforms.root_index, rf_origin, 3.0 * rf_cell,
-            root_meta.inner_r, root_meta.outer_r,
-        );
-        let bh = march_body(ray_origin, ray_dir, body_frame);
-        if bh.hit {
-            result.hit = true;
-            result.t = bh.t;
-            result.color = bh.color;
-            result.normal = bh.normal;
-        }
-        return result;
-    }
-
     // Intersect ray with the render frame's root box.
     let root_min = rf_origin;
     let root_max = rf_origin + vec3<f32>(3.0 * rf_cell);
@@ -675,52 +674,14 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.normal = normal;
             return result;
         } else if tag == 2u {
-            // Node — dispatch on NodeKind. The body is rendered
-            // INLINE here, in the cell's local frame derived from
-            // the descent context — no separate uniform pipeline.
+            // Node — body / face cells are rendered by the SEPARATE
+            // body pass in `fs_main` (with its own render-local
+            // uniforms). The Cartesian walk treats them as empty so
+            // it doesn't double-render or punch flat-cube artifacts
+            // through the bulged shell voxels.
             let candidate_idx = child_node_index(s_node_idx[depth], slot);
             let candidate_meta = node_metas[candidate_idx];
-            if candidate_meta.kind_tag == 1u {
-                // CubedSphereBody: run cubed-sphere DDA for this
-                // cell, using its world-space (origin, cube_w) from
-                // the descent context and (inner_r, outer_r) from
-                // the kind metadata. On hit, return; on miss, treat
-                // the cell as empty for the parent walk.
-                let parent_origin = s_node_origin[depth];
-                let parent_cell_size = s_cell_size[depth];
-                let body_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
-                let body_frame = body_frame_from(
-                    candidate_idx, body_origin, parent_cell_size,
-                    candidate_meta.inner_r, candidate_meta.outer_r,
-                );
-                let bh = march_body(ray_origin, ray_dir, body_frame);
-                if bh.hit {
-                    result.hit = true;
-                    result.t = bh.t;
-                    result.color = bh.color;
-                    result.normal = bh.normal;
-                    return result;
-                }
-                // Body missed — advance DDA past this cell.
-                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
-                    s_cell[depth].x += step.x;
-                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
-                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if s_side_dist[depth].y < s_side_dist[depth].z {
-                    s_cell[depth].y += step.y;
-                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                } else {
-                    s_cell[depth].z += step.z;
-                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                }
-                continue;
-            }
-            if candidate_meta.kind_tag == 2u {
-                // CubedSphereFace shouldn't appear as a Cartesian
-                // child (faces always sit under bodies). Treat as
-                // empty if encountered.
+            if candidate_meta.kind_tag != 0u {
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -865,19 +826,45 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         camera.forward + camera.right * ndc.x + camera.up * ndc.y
     );
 
-    // Single unified march. The Cartesian tree walk dispatches on
-    // NodeKind when it hits a body cell — the cubed-sphere DDA runs
-    // INLINE inside `march()`, in the cell's local frame derived
-    // from descent context. No separate uniform-driven body pass.
-    let tree_hit = march(camera.pos, ray_dir);
+    // Two passes, independent: the Cartesian tree DDA over the
+    // render frame's content + the body DDA over the planet's
+    // shell. Both run in render-frame-local coordinates. The body
+    // pass uses the per-body uniforms (`body_world` / `body_radii`
+    // / `body_idx`) so it stays anchored to the planet regardless
+    // of where the camera's render root lives in the tree.
+    //
+    // When the render root is INSIDE a sphere subtree, every node
+    // its tree walk would visit lives in (u, v, r) — drawing them
+    // as flat Cartesian cells produces shear-cube artifacts that
+    // shadow the bulged shell voxels. Skip the Cartesian pass in
+    // that case; the body pass still renders correctly.
+    var tree_hit = HitResult(false, vec3<f32>(0.0), vec3<f32>(0.0, 1.0, 0.0), 1e20);
+    if uniforms.render_root_in_sphere == 0u {
+        tree_hit = march(camera.pos, ray_dir);
+    }
+
+    var body_hit = body_hit_miss();
+    if uniforms.body_idx != 0xFFFFFFFFu && uniforms.body_radii.y > 0.0 {
+        let body_frame = body_frame_from(
+            uniforms.body_idx,
+            uniforms.body_world.xyz,
+            uniforms.body_world.w,
+            uniforms.body_radii.x,
+            uniforms.body_radii.y,
+        );
+        body_hit = march_body(camera.pos, ray_dir, body_frame);
+    }
 
     var color: vec3<f32>;
-    if tree_hit.hit {
+    let tree_closer = tree_hit.hit && (!body_hit.hit || tree_hit.t <= body_hit.t);
+    if tree_closer {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(tree_hit.normal, sun_dir), 0.0);
         let ambient = 0.3;
         let lit = tree_hit.color * (ambient + diffuse * 0.7);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
+    } else if body_hit.hit {
+        color = pow(body_hit.color, vec3<f32>(1.0 / 2.2));
     } else {
         let sky_t = ray_dir.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
@@ -885,9 +872,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Block highlight outline: Minecraft-style wireframe cube.
     // Draws all 12 edges with screen-space constant-pixel width.
-    // Occluded against the unified march — body and Cartesian hits
-    // both come back through `tree_hit`.
-    let occluder_t = select(1e20, tree_hit.t, tree_hit.hit);
+    // Occluded against the nearer of the tree and body hits.
+    let occluder_t = select(
+        select(1e20, body_hit.t, body_hit.hit),
+        tree_hit.t,
+        tree_hit.hit && (!body_hit.hit || tree_hit.t <= body_hit.t),
+    );
     if uniforms.highlight_active != 0u {
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;

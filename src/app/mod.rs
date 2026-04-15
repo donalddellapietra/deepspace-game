@@ -185,7 +185,8 @@ impl App {
             // local frame `upload_tree_lod` packs into. Subtract
             // the render frame's world origin so f32 has plenty of
             // precision for sub-cell math regardless of zoom depth.
-            let (rf_origin_world, _, _) = self.render_frame();
+            let rf = self.render_frame();
+            let rf_origin_world = rf.origin;
             let cam_world = crate::world::coords::world_pos_to_f32(&self.camera.position);
             let cam_local = [
                 cam_world[0] - rf_origin_world[0],

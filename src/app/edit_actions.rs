@@ -12,7 +12,7 @@ use crate::world::cubesphere::SphericalPlanet;
 use crate::world::edit;
 use crate::world::gpu;
 use crate::world::state::WorldState;
-use crate::world::tree::{slot_coords, Child, NodeId};
+use crate::world::tree::{slot_coords, Child};
 
 use super::App;
 
@@ -27,6 +27,20 @@ use super::App;
 /// (rf_origin = 0, camera.pos and cell origins all bounded by
 /// `3 × rf_cell` in render-local units).
 pub(super) const RENDER_FRAME_K: u8 = 3;
+
+/// World-space footprint of the packed tree's root, plus the
+/// `NodeId` it resolves to and a flag for "lives inside a sphere
+/// subtree." Returned by [`App::render_frame`].
+pub(super) struct RenderFrame {
+    pub origin: [f32; 3],
+    pub cell_size: f32,
+    pub node: crate::world::tree::NodeId,
+    /// `true` when the render root is the body itself or any of its
+    /// descendants (face roots / face internals). The shader's
+    /// flat-Cartesian DDA must skip those — they're rendered by the
+    /// body pass as bulged shell voxels instead.
+    pub in_sphere: bool,
+}
 
 /// Cubed-sphere edit depth derived from the player's anchor depth.
 /// Capped below `f32` integer-precision so the shader's `floor(un ·
@@ -248,27 +262,38 @@ impl App {
     /// hasn't spelled out at that depth), falls back to the world
     /// root. The world-generated empty tree is fully instantiated so
     /// this fallback only fires on partially-built worlds.
-    pub(super) fn render_frame(&self) -> ([f32; 3], f32, NodeId) {
+    pub(super) fn render_frame(&self) -> RenderFrame {
         let cam = &self.camera.position;
         let cam_depth = cam.anchor.depth();
-        // Render root must NEVER descend past the body — the
-        // shader needs to see the body cell to dispatch its DDA.
-        // Inside a face subtree the shader has no way to interpret
-        // Cartesian-marked face-internal cells as bulged shell
-        // voxels. Cap rf_depth at body's anchor depth.
-        let rf_depth = cam_depth
-            .saturating_sub(RENDER_FRAME_K)
-            .min(self.body_anchor.depth());
+        // Render root descends with the camera per spec §6a so the
+        // visible volume scales with zoom. The body is rendered
+        // SEPARATELY by the shader's `march_body` (data passed via
+        // the body uniforms below), so the render root can sit
+        // anywhere — inside a face subtree, in empty space, etc. —
+        // without losing the planet from view.
+        let rf_depth = cam_depth.saturating_sub(RENDER_FRAME_K);
         // Walk from world.root down rf_depth slots, tracking world
-        // origin. Root cells are 1.0 wide (span [0, ROOT_EXTENT)).
+        // origin AND whether we've descended through any non-
+        // Cartesian (body/face) ancestor. If so, the render root
+        // sits inside a sphere subtree where descendant Cartesian
+        // cells are bulged voxels — the shader's flat-cube DDA must
+        // skip them and let the body pass do the rendering.
         let mut node_id = self.world.root;
+        let mut in_sphere = false;
         let mut origin = [0.0f32; 3];
         let mut cell_size = 1.0f32;
         for i in 0..rf_depth as usize {
             let slot = cam.anchor.slots()[i];
             let Some(node) = self.world.library.get(node_id) else {
-                return (origin, cell_size, self.world.root);
+                return RenderFrame { origin, cell_size, node: self.world.root, in_sphere };
             };
+            // The kind of the node we're DESCENDING THROUGH (the
+            // current node, not the child we'll arrive at). If it's
+            // body or face, the slot we're picking is into a sphere
+            // subtree — every node beneath inherits that.
+            if !node.kind.is_cartesian() {
+                in_sphere = true;
+            }
             match node.children[slot as usize] {
                 Child::Node(child_id) => {
                     let (sx, sy, sz) = slot_coords(slot as usize);
@@ -282,8 +307,17 @@ impl App {
                     // Ancestor isn't instantiated; render from world
                     // root. Shouldn't happen for the generated empty
                     // tree, which is uniformly subdivided.
-                    return ([0.0; 3], 1.0, self.world.root);
+                    return RenderFrame {
+                        origin: [0.0; 3], cell_size: 1.0,
+                        node: self.world.root, in_sphere: false,
+                    };
                 }
+            }
+        }
+        // Final node may itself be non-Cartesian; mark in_sphere.
+        if let Some(n) = self.world.library.get(node_id) {
+            if !n.kind.is_cartesian() {
+                in_sphere = true;
             }
         }
         // After walking `rf_depth` levels, `cell_size` is the width
@@ -292,7 +326,7 @@ impl App {
         // corner. The render-frame node itself spans
         // `[origin, origin + 3 * cell_size) = ROOT_EXTENT / 3^rf_depth`.
         let _ = ROOT_EXTENT; // ROOT_EXTENT is baked into the numbers above.
-        (origin, cell_size, node_id)
+        RenderFrame { origin, cell_size, node: node_id, in_sphere }
     }
 
     /// Walk `body_anchor` from `world.root` and confirm a
@@ -329,12 +363,16 @@ impl App {
     /// This keeps every coordinate the shader sees bounded by
     /// `3 × rf_cell`, so f32 precision survives at any zoom depth.
     pub(super) fn upload_tree_lod(&mut self) {
-        let (rf_origin_world, rf_cell, rf_node) = self.render_frame();
+        let rf = self.render_frame();
+        let rf_origin_world = rf.origin;
+        let rf_cell = rf.cell_size;
+        let rf_node = rf.node;
+        let rf_in_sphere = rf.in_sphere;
 
         // Re-resolve the body from `body_anchor` each frame. The
         // walk catches cases where a Cartesian edit has replaced
         // the body cell — stale ids can't sneak into the packer.
-        let _ = self.refresh_body_node();
+        let body_node = self.refresh_body_node();
 
         // Camera position in RENDER-FRAME-LOCAL space. Subtract
         // the render frame's world origin so all GPU math stays in
@@ -348,9 +386,17 @@ impl App {
             cam_world[2] - rf_origin_world[2],
         ];
 
+        // Pin the body as a secondary pack root so it's always in
+        // the packed buffer with a known index — even when the
+        // render root is buried deep inside (or alongside) the body
+        // in the tree. The shader's body pass uses this index +
+        // the body's render-local frame to march the shell.
+        let mut roots: Vec<u64> = vec![rf_node];
+        if let Some(b) = body_node { roots.push(b); }
+
         let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
-            &[rf_node],
+            &roots,
             cam_local,
             1440.0,
             1.2,
@@ -358,9 +404,40 @@ impl App {
             rf_cell,
         );
 
+        // Body's footprint in render-local: cube min corner +
+        // side length. Inner / outer radii come straight off the
+        // `CubedSphereBody` kind payload.
+        let (body_world_local, inner_r, outer_r, body_idx) = if let Some(_) = body_node {
+            use crate::world::coords::{world_pos_to_f32, WorldPos, ROOT_EXTENT};
+            use crate::world::tree::NodeKind;
+            let (inner_r, outer_r) = self.cs_planet.as_ref()
+                .and_then(|p| self.world.library.get(p.body_node))
+                .and_then(|n| match n.kind {
+                    NodeKind::CubedSphereBody { inner_r, outer_r } => Some((inner_r, outer_r)),
+                    _ => None,
+                })
+                .unwrap_or((0.0, 0.0));
+            let cube_w = ROOT_EXTENT / 3f32.powi(self.body_anchor.depth() as i32);
+            let body_origin_world = world_pos_to_f32(&WorldPos {
+                anchor: self.body_anchor,
+                offset: [0.0, 0.0, 0.0],
+            });
+            let body_origin_local = [
+                body_origin_world[0] - rf_origin_world[0],
+                body_origin_world[1] - rf_origin_world[1],
+                body_origin_world[2] - rf_origin_world[2],
+                cube_w,
+            ];
+            (body_origin_local, inner_r, outer_r, root_indices[1])
+        } else {
+            ([0.0; 4], 0.0, 0.0, u32::MAX)
+        };
+
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &tree_metas, root_indices[0]);
             renderer.set_render_frame([0.0, 0.0, 0.0], rf_cell);
+            renderer.set_body(body_world_local, inner_r, outer_r, body_idx);
+            renderer.set_render_root_in_sphere(rf_in_sphere);
         }
     }
 
