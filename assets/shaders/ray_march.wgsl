@@ -368,6 +368,19 @@ fn march_body(ray_origin: vec3<f32>, ray_dir: vec3<f32>, body: BodyFrame) -> Bod
     // neighboring cell instead of looping on the same plane.
     let eps = max(shell * 1e-5, 1e-7);
     var t = t_enter + eps;
+
+    // If the ray begins inside the inner core (`r < cs_inner`),
+    // the sample loop's `if r < cs_inner { break }` would bail
+    // immediately. Skip past the inner-shell exit (going outward
+    // along the ray) and resume sampling from there.
+    let r_origin = length(oc);
+    if r_origin < cs_inner {
+        let c_inner = dot(oc, oc) - cs_inner * cs_inner;
+        let disc_i = b * b - c_inner;
+        if disc_i <= 0.0 { return body_hit_miss(); }
+        let t_inner_exit = -b + sqrt(disc_i);
+        if t_inner_exit > t { t = t_inner_exit + eps; }
+    }
     var steps = 0u;
     loop {
         if t >= t_exit || steps > 512u { break; }
@@ -517,14 +530,35 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var depth: u32 = 0u;
 
     // Initialize root level. The render frame declares where the
-    // packed tree's root lives in world space: `rf_origin` is its
-    // world-space min corner, `rf_cell` is the world width of one
-    // root-cell (root node spans [rf_origin, rf_origin + 3*rf_cell)).
+    // packed tree's root lives in render-local space: `rf_origin`
+    // is its min corner (`(0, 0, 0)` when CPU-side translates the
+    // camera into render-frame-local), `rf_cell` is the width of
+    // one root-cell (root node spans [rf_origin, rf_origin + 3*rf_cell)).
     let rf_origin = uniforms.render_frame.xyz;
     let rf_cell = uniforms.render_frame.w;
     s_node_idx[0] = uniforms.root_index;
     s_node_origin[0] = rf_origin;
     s_cell_size[0] = rf_cell;
+
+    // If the render root IS a body node, the entire render volume
+    // is one body cell — dispatch the cubed-sphere DDA directly,
+    // no Cartesian descent needed (and not even possible — body's
+    // children are face roots in (u, v, r), not Cartesian).
+    let root_meta = node_metas[uniforms.root_index];
+    if root_meta.kind_tag == 1u {
+        let body_frame = body_frame_from(
+            uniforms.root_index, rf_origin, 3.0 * rf_cell,
+            root_meta.inner_r, root_meta.outer_r,
+        );
+        let bh = march_body(ray_origin, ray_dir, body_frame);
+        if bh.hit {
+            result.hit = true;
+            result.t = bh.t;
+            result.color = bh.color;
+            result.normal = bh.normal;
+        }
+        return result;
+    }
 
     // Intersect ray with the render frame's root box.
     let root_min = rf_origin;

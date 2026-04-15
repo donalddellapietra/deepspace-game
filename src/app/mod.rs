@@ -101,14 +101,23 @@ impl App {
         let body_center = crate::world::coords::world_pos_to_f32(
             &crate::world::coords::WorldPos { anchor: scene.body_anchor, offset: [0.5, 0.5, 0.5] },
         );
-        // Camera default look direction is `-Z` (with a small -0.3
-        // pitch, so it tilts down). Spawn 1.0 world units south of
-        // the body on the `+Z` side so that "forward" looks straight
-        // at the planet, just outside its influence radius.
+        // Spawn INSIDE the body's depth-1 cell column so the render
+        // frame walks down `body_anchor`'s prefix and sees the body
+        // at every zoom depth. The body cube spans
+        // `[body_center - outer_r, body_center + outer_r]` plus the
+        // empty corners of the cell — placing the camera at the top
+        // of the cell (Y just under the cell's upper edge) keeps it
+        // in body's column with the surface directly below.
+        let body_cell_top = body_center[1] + 0.5 - 1e-3;
         let spawn_pos = [
             body_center[0],
-            body_center[1],
-            (body_center[2] + 1.0).min(2.95),
+            body_center[1] + setup.outer_r + 0.05,
+            body_center[2],
+        ];
+        let spawn_pos = [
+            spawn_pos[0],
+            spawn_pos[1].min(body_cell_top),
+            spawn_pos[2],
         ];
 
         let world = scene.world;
@@ -122,7 +131,10 @@ impl App {
                 position: crate::world::coords::world_pos_from_f32(spawn_pos, 4),
                 smoothed_up: [0.0, 1.0, 0.0],
                 yaw: 0.0,
-                pitch: -0.3,
+                // Look mostly straight down — body is directly below
+                // the spawn point. Slight offset from `-π/2` avoids
+                // the basis-degenerate case at exactly straight-down.
+                pitch: -1.4,
             },
             velocity: [0.0, 0.0, 0.0],
             world,
@@ -155,7 +167,20 @@ impl App {
         player::update(&mut self.camera, &mut self.velocity, dt);
 
         if let Some(renderer) = &self.renderer {
-            renderer.update_camera(&self.camera.gpu_camera(1.2));
+            // Camera position in RENDER-FRAME-LOCAL space — same
+            // local frame `upload_tree_lod` packs into. Subtract
+            // the render frame's world origin so f32 has plenty of
+            // precision for sub-cell math regardless of zoom depth.
+            let (rf_origin_world, _, _) = self.render_frame();
+            let cam_world = crate::world::coords::world_pos_to_f32(&self.camera.position);
+            let cam_local = [
+                cam_world[0] - rf_origin_world[0],
+                cam_world[1] - rf_origin_world[1],
+                cam_world[2] - rf_origin_world[2],
+            ];
+            let mut gpu_cam = self.camera.gpu_camera(1.2);
+            gpu_cam.pos = cam_local;
+            renderer.update_camera(&gpu_cam);
         }
     }
 }

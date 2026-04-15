@@ -16,11 +16,17 @@ use crate::world::tree::{slot_coords, Child, NodeId};
 
 use super::App;
 
-/// Render-frame ancestor offset. Set to a saturating-large value so
-/// the render root is ALWAYS the world root, regardless of camera
-/// anchor depth — zooming changes the layer the player operates at
-/// without shifting the rendered view.
-pub(super) const RENDER_FRAME_K: u8 = 255;
+/// Render-frame ancestor offset (per decisions §6a). The render
+/// root is the camera's ancestor at `anchor_depth - K`. K=3 →
+/// "your cell plus three layers up" as the rendered volume.
+///
+/// The render frame MUST descend with the camera so all GPU math
+/// stays in a bounded local frame — at deep zoom, world cell sizes
+/// drop below f32 precision relative to absolute world magnitudes,
+/// so the shader operates in coordinates LOCAL to the render root
+/// (rf_origin = 0, camera.pos and cell origins all bounded by
+/// `3 × rf_cell` in render-local units).
+pub(super) const RENDER_FRAME_K: u8 = 3;
 
 /// Cubed-sphere edit depth derived from the player's anchor depth.
 /// Capped below `f32` integer-precision so the shader's `floor(un ·
@@ -245,7 +251,14 @@ impl App {
     pub(super) fn render_frame(&self) -> ([f32; 3], f32, NodeId) {
         let cam = &self.camera.position;
         let cam_depth = cam.anchor.depth();
-        let rf_depth = cam_depth.saturating_sub(RENDER_FRAME_K);
+        // Render root must NEVER descend past the body — the
+        // shader needs to see the body cell to dispatch its DDA.
+        // Inside a face subtree the shader has no way to interpret
+        // Cartesian-marked face-internal cells as bulged shell
+        // voxels. Cap rf_depth at body's anchor depth.
+        let rf_depth = cam_depth
+            .saturating_sub(RENDER_FRAME_K)
+            .min(self.body_anchor.depth());
         // Walk from world.root down rf_depth slots, tracking world
         // origin. Root cells are 1.0 wide (span [0, ROOT_EXTENT)).
         let mut node_id = self.world.root;
@@ -308,31 +321,46 @@ impl App {
 
     /// Re-pack and upload the tree with LOD culling based on camera position.
     /// Called every frame so distant terrain stays flattened as the camera moves.
+    ///
+    /// All GPU coordinates are RENDER-FRAME-LOCAL: `rf_origin` is
+    /// passed to the renderer as `(0, 0, 0, rf_cell)`, the camera
+    /// position is shifted to `world_pos − rf_origin_world`, and
+    /// the LOD distance check operates in the same local frame.
+    /// This keeps every coordinate the shader sees bounded by
+    /// `3 × rf_cell`, so f32 precision survives at any zoom depth.
     pub(super) fn upload_tree_lod(&mut self) {
-        let (rf_origin, rf_cell, rf_node) = self.render_frame();
+        let (rf_origin_world, rf_cell, rf_node) = self.render_frame();
 
         // Re-resolve the body from `body_anchor` each frame. The
         // walk catches cases where a Cartesian edit has replaced
         // the body cell — stale ids can't sneak into the packer.
         let _ = self.refresh_body_node();
 
-        // Single-root pack. The body and its face subtrees are
-        // reachable as Cartesian descendants of the world root, so
-        // BFS picks them up automatically. The shader's tree walk
-        // dispatches on NodeKind when it descends into the body.
+        // Camera position in RENDER-FRAME-LOCAL space. Subtract
+        // the render frame's world origin so all GPU math stays in
+        // a small bounded frame regardless of how deep the camera
+        // is anchored. Matched by `set_render_frame((0,0,0), ...)`
+        // below — the shader treats the render root as origin.
+        let cam_world = crate::world::coords::world_pos_to_f32(&self.camera.position);
+        let cam_local = [
+            cam_world[0] - rf_origin_world[0],
+            cam_world[1] - rf_origin_world[1],
+            cam_world[2] - rf_origin_world[2],
+        ];
+
         let (tree_data, tree_metas, root_indices) = gpu::pack_tree_lod_multi_with_frame(
             &self.world.library,
             &[rf_node],
-            crate::world::coords::world_pos_to_f32(&self.camera.position),
+            cam_local,
             1440.0,
             1.2,
-            rf_origin,
+            [0.0, 0.0, 0.0], // render-frame-local origin
             rf_cell,
         );
 
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &tree_metas, root_indices[0]);
-            renderer.set_render_frame(rf_origin, rf_cell);
+            renderer.set_render_frame([0.0, 0.0, 0.0], rf_cell);
         }
     }
 

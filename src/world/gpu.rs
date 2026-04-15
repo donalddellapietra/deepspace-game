@@ -448,22 +448,32 @@ pub fn pack_tree_lod_multi_with_frame(
                     Some(n) => n,
                     None => continue,
                 };
-                // Once we're inside a body or face subtree, ALL
-                // descendants stay as full Node children. The BFS's
-                // Cartesian `cell_size` is geometric nonsense for
-                // (u, v, r) cells, so any LOD / uniform flattening
-                // would corrupt what the cubed-sphere DDA reads
-                // back via `child_node_index`. Sphere subtree
-                // membership propagates through the whole BFS.
+                // Sphere-subtree membership propagates so the
+                // cubed-sphere DDA's `child_node_index` reads always
+                // return real subtree pointers — never flattened
+                // Block placeholders that would render as flat
+                // Cartesian boxes in the (u, v, r) frame.
+                //
+                // Two exceptions inside sphere subtrees:
+                //   - Uniform-EMPTY collapses to `tag=0`. Empty is
+                //     empty in any frame, and the body DDA needs
+                //     this skip-empty speedup or its 512-step limit
+                //     blows out walking through deep air fillers.
+                //   - Uniform-SOLID stays as a full Node so the
+                //     cubed-sphere DDA still sees per-cell bulged
+                //     voxels rather than a single flat Block.
                 let child_in_sphere = in_sphere_subtree
                     || !child_node.kind.is_cartesian();
+                if child_node.uniform_type == UNIFORM_EMPTY {
+                    overrides[ordered_idx][slot] = Some(GpuChild {
+                        tag: 0, block_type: 0, _pad: 0, node_index: 0,
+                    });
+                    continue;
+                }
                 if !child_in_sphere && child_node.uniform_type != UNIFORM_MIXED {
-                    let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
-                        GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
-                    } else {
-                        GpuChild { tag: 1, block_type: child_node.uniform_type, _pad: 0, node_index: 0 }
-                    };
-                    overrides[ordered_idx][slot] = Some(gpu);
+                    overrides[ordered_idx][slot] = Some(GpuChild {
+                        tag: 1, block_type: child_node.uniform_type, _pad: 0, node_index: 0,
+                    });
                     continue;
                 }
                 if use_lod && !child_in_sphere {
