@@ -39,22 +39,23 @@ pub mod overlay_integration;
 pub mod test_runner;
 
 pub use frame::{
-    aabb_world_to_frame, compute_render_frame, frame_origin_size_world, frame_point_to_body,
-    point_world_to_frame, with_render_margin, world_dir_to_frame, ActiveFrame, ActiveFrameKind,
+    compute_render_frame, frame_origin_size_world, with_render_margin, ActiveFrame,
+    ActiveFrameKind,
 };
 pub use test_runner::TestConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LodUploadKey {
     pub root: u64,
-    pub camera_world_bits: [u32; 3],
+    pub camera_anchor: Path,
+    pub camera_offset_bits: [u32; 3],
     pub render_path: Path,
     pub logical_path: Path,
     pub kind_tag: u8,
 }
 
 impl LodUploadKey {
-    pub(super) fn new(root: u64, camera_world: [f32; 3], frame: &ActiveFrame) -> Self {
+    pub(super) fn new(root: u64, camera: &WorldPos, frame: &ActiveFrame) -> Self {
         let kind_tag = match frame.kind {
             ActiveFrameKind::Cartesian => 0,
             ActiveFrameKind::Body { .. } => 1,
@@ -62,7 +63,8 @@ impl LodUploadKey {
         };
         Self {
             root,
-            camera_world_bits: camera_world.map(f32::to_bits),
+            camera_anchor: camera.anchor,
+            camera_offset_bits: camera.offset.map(f32::to_bits),
             render_path: frame.render_path,
             logical_path: frame.logical_path,
             kind_tag,
@@ -109,6 +111,9 @@ pub struct App {
     /// branch. Bypasses the native overlay/event-loop path so we can
     /// isolate renderer regressions from WKWebView issues.
     pub(super) render_harness: bool,
+    /// Test/harness runs should measure renderer cost, not native
+    /// vsync pacing. Interactive runs keep the default present mode.
+    pub(super) low_latency_present: bool,
     pub(super) show_harness_window: bool,
     pub(super) disable_overlay: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -124,6 +129,7 @@ impl App {
 
     pub fn with_test_config(test_cfg: TestConfig) -> Self {
         let render_harness = test_cfg.render_harness;
+        let low_latency_present = test_cfg.is_active();
         let show_harness_window = test_cfg.show_window;
         let disable_overlay = test_cfg.disable_overlay;
         // Build a Cartesian world tree, then insert the planet body
@@ -208,6 +214,7 @@ impl App {
             test: test_runner::TestRunner::from_config(test_cfg),
             last_lod_upload_key: None,
             render_harness,
+            low_latency_present,
             show_harness_window,
             disable_overlay,
             #[cfg(not(target_arch = "wasm32"))]
@@ -290,31 +297,27 @@ impl App {
     pub(super) fn log_location(&self) {
         let p = &self.camera.position;
         log::info!(
-            "camera anchor depth={} slots={:?} offset={:?} world={:?}",
+            "camera anchor depth={} slots={:?} offset={:?}",
             p.anchor.depth(),
             p.anchor.as_slice(),
             p.offset,
-            p.to_world_xyz(),
         );
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_world = self.camera.world_pos_f32();
         let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => frame::point_world_to_body_frame(&sphere, cam_world),
+            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 self.camera.position.in_frame(&frame.render_path)
             }
         };
         if self.startup_profile_frames < 4 {
-            let projected = frame::point_world_to_frame(frame, cam_world);
             eprintln!(
-                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?} projected={:?}",
+                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",
                 frame.kind,
                 frame.render_path.as_slice(),
                 frame.logical_path.as_slice(),
                 cam_local,
-                projected,
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
@@ -325,9 +328,9 @@ impl App {
                 crate::world::sdf::normalize(up_world),
             ),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
-                frame::world_dir_to_frame(frame, cam_world, fwd_world),
-                frame::world_dir_to_frame(frame, cam_world, right_world),
-                frame::world_dir_to_frame(frame, cam_world, up_world),
+                crate::world::sdf::normalize(fwd_world),
+                crate::world::sdf::normalize(right_world),
+                crate::world::sdf::normalize(up_world),
             ),
         };
         if self.startup_profile_frames < 4 {

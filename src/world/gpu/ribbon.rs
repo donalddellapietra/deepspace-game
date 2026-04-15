@@ -92,6 +92,7 @@ pub fn build_ribbon(tree: &[GpuChild], frame_slots: &[u8]) -> RibbonResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::anchor::WorldPos;
     use crate::world::tree::{empty_children, uniform_children, Child, NodeKind, NodeLibrary, CENTER_SLOT};
     use super::super::pack::pack_tree_lod;
 
@@ -184,12 +185,16 @@ mod tests {
         crate::world::state::WorldState { root, library: lib }
     }
 
+    fn camera_at(xyz: [f32; 3]) -> WorldPos {
+        WorldPos::from_world_xyz(xyz, 10)
+    }
+
     #[test]
     fn ribbon_for_path_into_body_in_planet_world() {
         let world = planet_world();
-        let camera_pos = [1.5, 2.0, 1.5];
+        let camera = camera_at([1.5, 2.0, 1.5]);
         let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, camera_pos, 1080.0, 1.2,
+            &world.library, world.root, &camera, 1080.0, 1.2,
         );
         let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&data, &[13]);
         assert!(frame_idx > 0, "body packed at non-zero index");
@@ -204,9 +209,9 @@ mod tests {
         // it's uniform-empty. Walking deep into it via build_ribbon
         // should stop at the world root with reached_slots empty.
         let world = planet_world();
-        let camera_pos = [1.5, 2.0, 1.5];
+        let camera = camera_at([1.5, 2.0, 1.5]);
         let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, camera_pos, 1080.0, 1.2,
+            &world.library, world.root, &camera, 1080.0, 1.2,
         );
         // Slot 16 is uniform-empty Cartesian Node — pack flattens
         // it to tag=0. Asking the ribbon to descend into [16, 13]
@@ -221,9 +226,9 @@ mod tests {
     #[test]
     fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
         let world = planet_world();
-        let camera_pos = [0.5, 0.5, 0.5];
+        let camera = camera_at([0.5, 0.5, 0.5]);
         let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, camera_pos, 1080.0, 1.2,
+            &world.library, world.root, &camera, 1080.0, 1.2,
         );
         let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&data, &[]);
         assert_eq!(frame_idx, 0);

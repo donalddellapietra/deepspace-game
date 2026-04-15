@@ -86,7 +86,8 @@ pub struct DebugOverlayStateJs {
     pub tree_depth: u32,
     pub edit_depth: u32,
     pub visual_depth: u32,
-    pub camera_pos: [f32; 3],
+    pub camera_anchor_depth: u32,
+    pub camera_local: [f32; 3],
     pub fov: f32,
     pub node_count: usize,
 }

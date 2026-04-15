@@ -5,14 +5,16 @@
 //! - `pack_tree`: full BFS, no LOD. Used by tests and for sanity
 //!   debugging. Every reachable node ends up in the buffer at full
 //!   detail.
-//! - `pack_tree_lod`: distance-aware. Cartesian subtrees that
-//!   subtend less than `LOD_THRESHOLD` pixels at the camera get
-//!   flattened into a single Block leaf (their representative
-//!   block type). Sphere bodies and face cells are exempt from
-//!   flattening — their geometry semantics need the full subtree.
+//! - `pack_tree_lod`: path-local LOD. Cartesian subtrees that
+//!   subtend less than `LOD_THRESHOLD` pixels in the current node's
+//!   local frame get flattened into a single Block leaf (their
+//!   representative block type). Sphere bodies and face cells are
+//!   exempt from flattening — their geometry semantics need the
+//!   full subtree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::world::anchor::{Path, WorldPos};
 use crate::world::tree::{
     slot_coords, Child, NodeId, NodeKind, NodeLibrary,
     CHILDREN_PER_NODE, UNIFORM_EMPTY, UNIFORM_MIXED,
@@ -28,7 +30,7 @@ pub fn pack_tree(
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
     let mut ordered: Vec<NodeId> = Vec::new();
-    let mut head = 0;
+    let mut head = 0usize;
     visited.insert(root, 0);
     ordered.push(root);
     while head < ordered.len() {
@@ -57,13 +59,17 @@ pub fn pack_tree(
                 Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
                 Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
                 Child::Node(child_id) => {
-                    let repr = library.get(*child_id)
-                        .map(|n| n.representative_block).unwrap_or(0);
+                    let repr = library
+                        .get(*child_id)
+                        .map(|n| n.representative_block)
+                        .unwrap_or(0);
                     GpuChild {
-                        tag: 2, block_type: repr, _pad: 0,
+                        tag: 2,
+                        block_type: repr,
+                        _pad: 0,
                         node_index: *visited.get(child_id).expect("child must be visited"),
                     }
-                },
+                }
             });
         }
     }
@@ -72,73 +78,73 @@ pub fn pack_tree(
     (data, kinds, root_idx)
 }
 
+fn child_screen_pixels(
+    camera: &WorldPos,
+    node_path: &Path,
+    slot: usize,
+    screen_height: f32,
+    fov: f32,
+) -> f32 {
+    let camera_local = camera.in_frame(node_path);
+    let (cx, cy, cz) = slot_coords(slot);
+    let child_center = [cx as f32 + 0.5, cy as f32 + 0.5, cz as f32 + 0.5];
+    let dx = child_center[0] - camera_local[0];
+    let dy = child_center[1] - camera_local[1];
+    let dz = child_center[2] - camera_local[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
+    let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
+    half_fov_recip / dist
+}
+
 /// LOD-aware tree packing: only uploads nodes large enough to see.
 ///
-/// Same dual-buffer output as `pack_tree`, plus distance-aware
-/// flattening of subtrees that cover less than `LOD_THRESHOLD`
-/// pixels on screen. The shader walks whatever ends up in the
-/// buffer; flattened cells appear as Block/Empty leaves.
-///
-/// `camera_pos` is in the same coord system as the BFS uses
-/// internally — for `root = world.root` that's world XYZ; the
-/// caller is responsible for matching units.
+/// Unlike the legacy packer, the LOD decision is made entirely in
+/// the node's own local frame. `camera` is a path-anchored
+/// `WorldPos`; for each queued node we project that position into
+/// the node frame with `WorldPos::in_frame(node_path)` and compare it
+/// against the candidate child center in that same local metric.
 pub fn pack_tree_lod(
     library: &NodeLibrary,
     root: NodeId,
-    camera_pos: [f32; 3],
+    camera: &WorldPos,
     screen_height: f32,
     fov: f32,
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
-    pack_tree_lod_preserving(library, root, camera_pos, screen_height, fov, &[])
+    pack_tree_lod_preserving(library, root, camera, screen_height, fov, &[])
 }
 
-/// Like `pack_tree_lod`, but with a `preserve_path`: the slots
-/// on the camera's anchor from `root`. Slots on the preserve
-/// path are NEVER LOD-flattened or uniform-collapsed — they're
-/// always emitted as Node children so `build_ribbon` can walk
-/// the full chain and the shader can lift the camera frame
-/// arbitrarily deep.
+/// Like `pack_tree_lod`, but with one or more `preserve_paths`.
 ///
-/// This is what unlocks layer-1 descent: with `preserve_path`
-/// passed, the frame can sit at any depth in the camera's
-/// anchor chain regardless of how distant or uniform the
-/// surrounding cells are.
+/// Slots on a preserve path are never uniform-collapsed or
+/// distance-LOD flattened. This guarantees the renderer can rebuild
+/// the ribbon and descend to the requested active frame even when the
+/// surrounding Cartesian region is visually coarse.
 pub fn pack_tree_lod_preserving(
     library: &NodeLibrary,
     root: NodeId,
-    camera_pos: [f32; 3],
+    camera: &WorldPos,
     screen_height: f32,
     fov: f32,
     preserve_paths: &[&[u8]],
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
-    use std::collections::HashSet;
+    const LOD_THRESHOLD: f32 = 0.5;
 
-    // Build the set of (parent_node_id, slot) pairs on the camera
-    // path that must NOT be flattened. Walk from root following
-    // `preserve_path` slot-by-slot, recording the (current,
-    // slot) pair at each step.
     let mut preserve_pairs: HashSet<(NodeId, u8)> = HashSet::new();
-    {
-        for preserve_path in preserve_paths {
-            let mut current = root;
-            for &slot in *preserve_path {
-                preserve_pairs.insert((current, slot));
-                let Some(node) = library.get(current) else { break };
-                match node.children[slot as usize] {
-                    Child::Node(child_id) => { current = child_id; }
-                    _ => break,
-                }
+    for preserve_path in preserve_paths {
+        let mut current = root;
+        for &slot in *preserve_path {
+            preserve_pairs.insert((current, slot));
+            let Some(node) = library.get(current) else { break };
+            match node.children[slot as usize] {
+                Child::Node(child_id) => current = child_id,
+                _ => break,
             }
         }
     }
 
-    let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
-    const LOD_THRESHOLD: f32 = 0.5;
-
     struct QueueEntry {
         node_id: NodeId,
-        origin: [f32; 3],
-        cell_size: f32,
+        path: Path,
     }
 
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
@@ -149,117 +155,97 @@ pub fn pack_tree_lod_preserving(
     visited.insert(root, 0);
     ordered.push(root);
     overrides.push([None; CHILDREN_PER_NODE]);
-    queue.push(QueueEntry {
-        node_id: root,
-        origin: [0.0; 3],
-        cell_size: 1.0,
-    });
-    let mut head = 0;
+    queue.push(QueueEntry { node_id: root, path: Path::root() });
 
+    let mut head = 0usize;
     while head < queue.len() {
         let entry = &queue[head];
         let node_id = entry.node_id;
-        let node_origin = entry.origin;
-        let cell_size = entry.cell_size;
+        let node_path = entry.path;
         let ordered_idx = head;
         head += 1;
 
         let Some(node) = library.get(node_id) else { continue };
-
-        // Sphere-body and face nodes do NOT participate in
-        // distance-LOD flattening — their children are interpreted
-        // by the shader's NodeKind dispatch. Flattening would lose
-        // the geometric semantics. Only Cartesian nodes apply LOD.
         let lod_active = matches!(node.kind, NodeKind::Cartesian);
 
         for (slot, child) in node.children.iter().enumerate() {
-            if let Child::Node(child_id) = child {
-                let child_node = match library.get(*child_id) {
-                    Some(n) => n,
-                    None => continue,
-                };
+            let Child::Node(child_id) = child else { continue };
+            let Some(child_node) = library.get(*child_id) else { continue };
 
-                // Uniform-content collapse — only safe for Cartesian
-                // nodes (face/body subtrees have geometry that the
-                // shader needs to walk). Skipped for slots on the
-                // camera's preserve path so build_ribbon can
-                // descend.
-                let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
-                let on_preserve = preserve_pairs.contains(&(node_id, slot as u8));
-                if !on_preserve && lod_active && child_is_cartesian
-                    && child_node.uniform_type != UNIFORM_MIXED {
-                    let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
-                        GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
+            let on_preserve = preserve_pairs.contains(&(node_id, slot as u8));
+            let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
+
+            if !on_preserve && lod_active && child_is_cartesian
+                && child_node.uniform_type != UNIFORM_MIXED
+            {
+                overrides[ordered_idx][slot] = Some(if child_node.uniform_type == UNIFORM_EMPTY {
+                    GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
+                } else {
+                    GpuChild {
+                        tag: 1,
+                        block_type: child_node.uniform_type,
+                        _pad: 0,
+                        node_index: 0,
+                    }
+                });
+                continue;
+            }
+
+            if !on_preserve && lod_active && child_is_cartesian {
+                let screen_pixels =
+                    child_screen_pixels(camera, &node_path, slot, screen_height, fov);
+                if screen_pixels < LOD_THRESHOLD {
+                    overrides[ordered_idx][slot] = Some(if child_node.representative_block < 255 {
+                        GpuChild {
+                            tag: 1,
+                            block_type: child_node.representative_block,
+                            _pad: 0,
+                            node_index: 0,
+                        }
                     } else {
-                        GpuChild { tag: 1, block_type: child_node.uniform_type, _pad: 0, node_index: 0 }
-                    };
-                    overrides[ordered_idx][slot] = Some(gpu);
+                        GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
+                    });
                     continue;
                 }
+            }
 
-                if !on_preserve && lod_active && child_is_cartesian {
-                    let (cx, cy, cz) = slot_coords(slot);
-                    let child_center = [
-                        node_origin[0] + (cx as f32 + 0.5) * cell_size,
-                        node_origin[1] + (cy as f32 + 0.5) * cell_size,
-                        node_origin[2] + (cz as f32 + 0.5) * cell_size,
-                    ];
-                    let dx = child_center[0] - camera_pos[0];
-                    let dy = child_center[1] - camera_pos[1];
-                    let dz = child_center[2] - camera_pos[2];
-                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
-                    let screen_pixels = cell_size / dist * half_fov_recip;
-                    if screen_pixels < LOD_THRESHOLD {
-                        let gpu = if child_node.representative_block < 255 {
-                            GpuChild { tag: 1, block_type: child_node.representative_block, _pad: 0, node_index: 0 }
-                        } else {
-                            GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
-                        };
-                        overrides[ordered_idx][slot] = Some(gpu);
-                        continue;
-                    }
-                }
-
-                if !visited.contains_key(child_id) {
-                    let idx = ordered.len() as u32;
-                    visited.insert(*child_id, idx);
-                    ordered.push(*child_id);
-                    overrides.push([None; CHILDREN_PER_NODE]);
-                    let (cx, cy, cz) = slot_coords(slot);
-                    let child_origin = [
-                        node_origin[0] + cx as f32 * cell_size,
-                        node_origin[1] + cy as f32 * cell_size,
-                        node_origin[2] + cz as f32 * cell_size,
-                    ];
-                    queue.push(QueueEntry {
-                        node_id: *child_id,
-                        origin: child_origin,
-                        cell_size: cell_size / 3.0,
-                    });
-                }
+            if !visited.contains_key(child_id) {
+                let idx = ordered.len() as u32;
+                visited.insert(*child_id, idx);
+                ordered.push(*child_id);
+                overrides.push([None; CHILDREN_PER_NODE]);
+                let mut child_path = node_path;
+                child_path.push(slot as u8);
+                queue.push(QueueEntry {
+                    node_id: *child_id,
+                    path: child_path,
+                });
             }
         }
     }
 
     let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
     let mut kinds: Vec<GpuNodeKind> = Vec::with_capacity(ordered.len());
-    for (oi, &nid) in ordered.iter().enumerate() {
-        let node = library.get(nid).expect("node in ordered list must exist");
+    for (ordered_idx, &node_id) in ordered.iter().enumerate() {
+        let node = library.get(node_id).expect("node in ordered list must exist");
         kinds.push(GpuNodeKind::from_node_kind(node.kind));
         for (slot, child) in node.children.iter().enumerate() {
-            if let Some(gpu) = overrides[oi][slot] {
+            if let Some(gpu) = overrides[ordered_idx][slot] {
                 data.push(gpu);
-            } else {
-                data.push(match child {
-                    Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
-                    Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
-                    Child::Node(child_id) => {
-                        let repr = library.get(*child_id).map(|n| n.representative_block).unwrap_or(0);
-                        let idx = visited.get(child_id).copied().unwrap_or(0);
-                        GpuChild { tag: 2, block_type: repr, _pad: 0, node_index: idx }
-                    },
-                });
+                continue;
             }
+            data.push(match child {
+                Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
+                Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
+                Child::Node(child_id) => {
+                    let repr = library
+                        .get(*child_id)
+                        .map(|n| n.representative_block)
+                        .unwrap_or(0);
+                    let idx = visited.get(child_id).copied().unwrap_or(0);
+                    GpuChild { tag: 2, block_type: repr, _pad: 0, node_index: idx }
+                }
+            });
         }
     }
 
@@ -270,6 +256,7 @@ pub fn pack_tree_lod_preserving(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::anchor::WorldPos;
     use crate::world::tree::{empty_children, uniform_children, CENTER_SLOT};
 
     #[test]
@@ -280,8 +267,8 @@ mod tests {
         assert_eq!(root_idx, 0);
         assert_eq!(data.len() / 27, world.library.len());
         assert_eq!(kinds.len(), world.library.len());
-        for k in &kinds {
-            assert_eq!(k.kind, 0);
+        for kind in &kinds {
+            assert_eq!(kind.kind, 0);
         }
     }
 
@@ -299,14 +286,18 @@ mod tests {
         crate::world::state::WorldState { root, library: lib }
     }
 
+    fn camera_at(xyz: [f32; 3]) -> WorldPos {
+        WorldPos::from_world_xyz(xyz, 10)
+    }
+
     #[test]
     fn pack_includes_body_kind_and_radii() {
         let world = planet_world();
-        let camera_pos = [1.5, 2.0, 1.5];
+        let camera = camera_at([1.5, 2.0, 1.5]);
         let (_data, kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, camera_pos, 1080.0, 1.2,
+            &world.library, world.root, &camera, 1080.0, 1.2,
         );
-        let body = kinds.iter().find(|k| k.kind == 1).expect("body kind in buffer");
+        let body = kinds.iter().find(|kind| kind.kind == 1).expect("body kind in buffer");
         assert!((body.inner_r - 0.12).abs() < 1e-6);
         assert!((body.outer_r - 0.45).abs() < 1e-6);
     }
@@ -314,13 +305,11 @@ mod tests {
     #[test]
     fn pack_lod_flattens_far_uniform_cartesian() {
         let world = planet_world();
-        let camera_pos = [1.5, 2.0, 1.5];
+        let camera = camera_at([1.5, 2.0, 1.5]);
         let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, camera_pos, 1080.0, 1.2,
+            &world.library, world.root, &camera, 1080.0, 1.2,
         );
-        // Slot 0 (corner, far from camera, uniform empty) → tag=0.
         assert_eq!(data[0].tag, 0);
-        // Slot 13 = body, must be a Node tag.
         assert_eq!(data[13].tag, 2);
         assert!(data[13].node_index > 0);
     }
@@ -328,47 +317,38 @@ mod tests {
     #[test]
     fn pack_planet_body_present() {
         let world = planet_world();
-        let camera_pos = [1.5, 2.0, 1.5];
+        let camera = camera_at([1.5, 2.0, 1.5]);
         let (_data, kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, camera_pos, 1080.0, 1.2,
+            &world.library, world.root, &camera, 1080.0, 1.2,
         );
-        assert!(kinds.iter().any(|k| k.kind == 1), "body kind present");
+        assert!(kinds.iter().any(|kind| kind.kind == 1), "body kind present");
     }
 
     #[test]
     fn preserve_path_prevents_uniform_collapse() {
-        // World: root with uniform-empty Cartesian Node at every
-        // slot. Without preserve_path, all slots get tag=0
-        // (flattened). With preserve_path = [16], slot 16 stays
-        // as a Node so the ribbon can descend.
         let mut lib = NodeLibrary::default();
         let air = lib.insert(empty_children());
         let root = lib.insert(uniform_children(Child::Node(air)));
         lib.ref_inc(root);
-        let camera_pos = [1.5, 2.0, 1.5];
+        let camera = camera_at([1.5, 2.0, 1.5]);
 
         let (no_preserve, _, _) = pack_tree_lod(
-            &lib, root, camera_pos, 1080.0, 1.2,
+            &lib, root, &camera, 1080.0, 1.2,
         );
-        assert_eq!(no_preserve[16].tag, 0,
-            "without preserve, slot 16 collapses to tag=0");
+        assert_eq!(no_preserve[16].tag, 0);
 
         let (with_preserve, _, _) = pack_tree_lod_preserving(
-            &lib, root, camera_pos, 1080.0, 1.2,
-            &[16],
+            &lib, root, &camera, 1080.0, 1.2,
+            &[&[16u8]],
         );
-        assert_eq!(with_preserve[16].tag, 2,
-            "with preserve_path=[16], slot 16 stays as a Node");
-        assert!(with_preserve[16].node_index > 0,
-            "preserved slot points to a real buffer entry");
+        assert_eq!(with_preserve[16].tag, 2);
+        assert!(with_preserve[16].node_index > 0);
     }
 
     #[test]
     fn preserve_path_chain_lets_ribbon_descend_to_depth_n() {
         use super::super::ribbon::build_ribbon;
-        // Build a chain of empty Cartesian nodes 10 deep. With
-        // preserve_path = [13;10], build_ribbon should walk all
-        // 10 levels.
+
         let mut lib = NodeLibrary::default();
         let mut node = lib.insert(empty_children());
         for _ in 1..10 {
@@ -376,47 +356,38 @@ mod tests {
         }
         let root = node;
         lib.ref_inc(root);
-        let camera_pos = [1.5, 1.5, 1.5];
-        let path = [13u8; 9];  // 9 descents = depth 9 frame
+        let camera = camera_at([1.5, 1.5, 1.5]);
+        let path = [13u8; 9];
 
         let (data, _kinds, _root_idx) = pack_tree_lod_preserving(
-            &lib, root, camera_pos, 1080.0, 1.2,
-            &path,
+            &lib, root, &camera, 1080.0, 1.2,
+            &[&path],
         );
-        let r = build_ribbon(&data, &path);
-        assert_eq!(r.reached_slots.len(), 9,
-            "preserve_path enables descent through 9 levels");
-        assert_eq!(r.ribbon.len(), 9);
+        let ribbon = build_ribbon(&data, &path);
+        assert_eq!(ribbon.reached_slots.len(), 9);
+        assert_eq!(ribbon.ribbon.len(), 9);
     }
 
     #[test]
     fn preserve_path_only_affects_chain_slots() {
-        // Verify that OTHER slots (not on preserve_path) still
-        // get LOD-flattened.
         let mut lib = NodeLibrary::default();
         let air = lib.insert(empty_children());
         let root = lib.insert(uniform_children(Child::Node(air)));
         lib.ref_inc(root);
-        let camera_pos = [1.5, 2.0, 1.5];
+        let camera = camera_at([1.5, 2.0, 1.5]);
 
         let (data, _, _) = pack_tree_lod_preserving(
-            &lib, root, camera_pos, 1080.0, 1.2,
-            &[16],
+            &lib, root, &camera, 1080.0, 1.2,
+            &[&[16u8]],
         );
-        // Slot 16 preserved (Node). Slots 0, 5, 13, 26 should
-        // still be flattened (tag=0).
         assert_eq!(data[16].tag, 2);
-        for sib in [0, 5, 13, 26] {
-            assert_eq!(data[sib].tag, 0,
-                "sibling slot {sib} should be flattened");
+        for sibling in [0, 5, 13, 26] {
+            assert_eq!(data[sibling].tag, 0, "sibling slot {sibling} should be flattened");
         }
     }
 
     #[test]
     fn pack_lod_keeps_near_subtrees_full() {
-        // A subtree with mixed content close to the camera should
-        // descend (not flatten). Build a root with a non-uniform
-        // child near camera; verify the child is still a Node tag.
         let mut lib = NodeLibrary::default();
         let air = lib.insert(empty_children());
         let mut mixed = empty_children();
@@ -427,12 +398,10 @@ mod tests {
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        // Camera VERY close so the center cell subtends many pixels.
-        let camera_pos = [1.5, 1.5, 1.6];
+        let camera = camera_at([1.5, 1.5, 1.6]);
         let (data, _kinds, _root_idx) = pack_tree_lod(
-            &lib, root, camera_pos, 1080.0, 1.2,
+            &lib, root, &camera, 1080.0, 1.2,
         );
-        // Center slot 13 should be a Node tag (not flattened).
         assert_eq!(data[CENTER_SLOT].tag, 2);
     }
 }

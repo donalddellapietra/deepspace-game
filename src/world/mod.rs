@@ -6,5 +6,6 @@ pub mod gpu;
 pub mod edit;
 pub mod sdf;
 pub mod cubesphere;
+pub mod cubesphere_local;
 pub mod worldgen;
 pub mod spherical_worldgen;

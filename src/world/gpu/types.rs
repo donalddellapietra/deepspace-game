@@ -62,8 +62,6 @@ impl GpuNodeKind {
 pub struct GpuCamera {
     pub pos: [f32; 3],
     pub _pad0: f32,
-    pub world_pos: [f32; 3],
-    pub _pad_world: f32,
     pub forward: [f32; 3],
     pub _pad1: f32,
     pub right: [f32; 3],

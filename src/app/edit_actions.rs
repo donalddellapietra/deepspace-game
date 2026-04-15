@@ -7,6 +7,8 @@
 //! separate coarser edit path.
 
 use crate::game_state::HotbarItem;
+use crate::world::cubesphere::FACE_SLOTS;
+use crate::world::cubesphere_local;
 use crate::world::anchor::{Path, WORLD_SIZE};
 use crate::world::edit;
 use crate::world::gpu;
@@ -17,12 +19,9 @@ use super::{
 };
 
 const MAX_LOCAL_VISUAL_DEPTH: u32 = 8;
-const MAX_BODY_VISUAL_DEPTH: u32 = 3;
-const MAX_SPHERE_VISUAL_DEPTH: u32 = 3;
 const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
-const RENDER_FOV: f32 = 1.2;
-const SPHERE_VISUAL_MIN_PIXELS: f32 = 48.0;
-const MIN_SPHERE_VISUAL_DEPTH: u32 = 2;
+const FRAME_VISUAL_MIN_PIXELS: f32 = 3.0;
+const SPHERE_FOCUS_MIN_PIXELS: f32 = 24.0;
 
 impl App {
     fn debug_path_kinds(&self, path: &Path) -> Vec<String> {
@@ -99,241 +98,43 @@ impl App {
         let local_target = self.edit_depth()
             .saturating_sub(self.active_frame.render_path.depth() as u32)
             .max(1);
-        match self.active_frame.kind {
-            ActiveFrameKind::Body { inner_r, outer_r } => {
-                self.visual_depth_cap_for_sphere(inner_r, outer_r, 1.0)
-                    .min(MAX_BODY_VISUAL_DEPTH)
-            }
-            ActiveFrameKind::Sphere(sphere) => {
-                self.visual_depth_cap_for_sphere_frame(&sphere)
-                    .max(MIN_SPHERE_VISUAL_DEPTH)
-                    .min(MAX_SPHERE_VISUAL_DEPTH)
-                    .min(local_target.min(MAX_LOCAL_VISUAL_DEPTH))
-            }
-            ActiveFrameKind::Cartesian => local_target
-                .min(MAX_LOCAL_VISUAL_DEPTH)
-                .min(crate::world::tree::MAX_DEPTH as u32),
-        }
-    }
-
-    fn visual_depth_cap_for_sphere(&self, inner_r: f32, outer_r: f32, face_size: f32) -> u32 {
-        let screen_height = self
-            .window
-            .as_ref()
-            .map(|w| w.inner_size().height.max(1) as f32)
-            .unwrap_or(1080.0);
-        let pixels_per_unit = screen_height / (2.0 * (RENDER_FOV * 0.5).tan());
-        let cam_world = self.camera.world_pos_f32();
-        let body_path = self.active_frame.render_path;
-        let (body_origin, body_size) = super::frame::frame_origin_size_world(&body_path);
-        let body_center = [
-            body_origin[0] + body_size * 0.5,
-            body_origin[1] + body_size * 0.5,
-            body_origin[2] + body_size * 0.5,
-        ];
-        let outer_r_world = outer_r * body_size;
-        let shell_world = (outer_r - inner_r) * body_size * face_size.max(1.0 / 3.0);
-        if shell_world <= 0.0 {
-            return 1;
-        }
-        let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-        let oc = [
-            cam_world[0] - body_center[0],
-            cam_world[1] - body_center[1],
-            cam_world[2] - body_center[2],
-        ];
-        let b = oc[0] * ray_dir[0] + oc[1] * ray_dir[1] + oc[2] * ray_dir[2];
-        let c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - outer_r_world * outer_r_world;
-        let disc = b * b - c;
-        let surface_dist = if disc > 0.0 {
-            let sq = disc.sqrt();
-            let t_enter = (-b - sq).max(0.0);
-            let t_exit = -b + sq;
-            if t_enter > 0.0 { t_enter } else { t_exit.max(0.001) }
+        let pixels = self.frame_projected_pixels(&self.active_frame);
+        let local_cap = if pixels <= FRAME_VISUAL_MIN_PIXELS {
+            1
         } else {
-            (crate::world::sdf::length(oc) - outer_r_world).abs().max(0.001)
+            let extra = (pixels / FRAME_VISUAL_MIN_PIXELS).ln() / 3.0_f32.ln();
+            extra.floor().max(1.0) as u32
         };
-        let root_pixels = shell_world / surface_dist * pixels_per_unit;
-        let mut depth = 1u32;
-        let mut cell_pixels = root_pixels;
-        while depth < MAX_LOCAL_VISUAL_DEPTH && cell_pixels >= SPHERE_VISUAL_MIN_PIXELS * 3.0 {
-            depth += 1;
-            cell_pixels /= 3.0;
-        }
-        depth.max(1)
-    }
-
-    fn visual_depth_cap_for_sphere_frame(&self, sphere: &super::frame::SphereFrame) -> u32 {
-        let screen_height = self
-            .window
-            .as_ref()
-            .map(|w| w.inner_size().height.max(1) as f32)
-            .unwrap_or(1080.0);
-        let pixels_per_unit = screen_height / (2.0 * (RENDER_FOV * 0.5).tan());
-        let cam_world = self.camera.world_pos_f32();
-        let (body_origin, body_size) = super::frame::frame_origin_size_world(&sphere.body_path);
-        let body_center = [
-            body_origin[0] + body_size * 0.5,
-            body_origin[1] + body_size * 0.5,
-            body_origin[2] + body_size * 0.5,
-        ];
-        let outer_r_world = sphere.outer_r * body_size;
-        let shell_world =
-            (sphere.outer_r - sphere.inner_r) * body_size * sphere.face_size.max(1.0 / 3.0);
-        if shell_world <= 0.0 {
-            return 1;
-        }
-        let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-        let oc = [
-            cam_world[0] - body_center[0],
-            cam_world[1] - body_center[1],
-            cam_world[2] - body_center[2],
-        ];
-        let b = oc[0] * ray_dir[0] + oc[1] * ray_dir[1] + oc[2] * ray_dir[2];
-        let c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - outer_r_world * outer_r_world;
-        let disc = b * b - c;
-        let surface_dist = if disc > 0.0 {
-            let sq = disc.sqrt();
-            let t_enter = (-b - sq).max(0.0);
-            let t_exit = -b + sq;
-            if t_enter > 0.0 { t_enter } else { t_exit.max(0.001) }
-        } else {
-            (crate::world::sdf::length(oc) - outer_r_world).abs().max(0.001)
-        };
-        let root_pixels = shell_world / surface_dist * pixels_per_unit;
-        let mut depth = 1u32;
-        let mut cell_pixels = root_pixels;
-        while depth < MAX_LOCAL_VISUAL_DEPTH && cell_pixels >= SPHERE_VISUAL_MIN_PIXELS * 3.0 {
-            depth += 1;
-            cell_pixels /= 3.0;
-        }
-        depth.max(1)
-    }
-
-    fn sphere_frame_fits_frustum(&self, sphere: &super::frame::SphereFrame) -> bool {
-        let Some(window) = &self.window else {
-            return false;
-        };
-        let size = window.inner_size();
-        let aspect = if size.height == 0 {
-            16.0 / 9.0
-        } else {
-            size.width.max(1) as f32 / size.height as f32
-        };
-        let half_fov_tan = (RENDER_FOV * 0.5).tan();
-        let cam_world = self.camera.world_pos_f32();
-        let (body_origin, body_size) = super::frame::frame_origin_size_world(&sphere.body_path);
-        let body_center = [
-            body_origin[0] + body_size * 0.5,
-            body_origin[1] + body_size * 0.5,
-            body_origin[2] + body_size * 0.5,
-        ];
-        let outer_r_world = sphere.outer_r * body_size;
-        let (fwd, right, up) = self.camera.basis();
-        let samples = [
-            (0.0f32, 0.0f32),
-            (-1.0, -1.0),
-            (1.0, -1.0),
-            (-1.0, 1.0),
-            (1.0, 1.0),
-            (0.0, -1.0),
-            (0.0, 1.0),
-            (-1.0, 0.0),
-            (1.0, 0.0),
-        ];
-        let bounds_min = [
-            sphere.face_u_min - sphere.face_size * 0.02,
-            sphere.face_v_min - sphere.face_size * 0.02,
-            sphere.face_r_min - sphere.face_size * 0.02,
-        ];
-        let bounds_max = [
-            sphere.face_u_min + sphere.face_size * 1.02,
-            sphere.face_v_min + sphere.face_size * 1.02,
-            sphere.face_r_min + sphere.face_size * 1.02,
-        ];
-        let mut hits_considered = 0u32;
-
-        for (sx, sy) in samples {
-            let ndc_x = sx * aspect * half_fov_tan;
-            let ndc_y = -sy * half_fov_tan;
-            let ray_dir = crate::world::sdf::normalize([
-                fwd[0] + right[0] * ndc_x + up[0] * ndc_y,
-                fwd[1] + right[1] * ndc_x + up[1] * ndc_y,
-                fwd[2] + right[2] * ndc_x + up[2] * ndc_y,
-            ]);
-            let oc = [
-                cam_world[0] - body_center[0],
-                cam_world[1] - body_center[1],
-                cam_world[2] - body_center[2],
-            ];
-            let b = oc[0] * ray_dir[0] + oc[1] * ray_dir[1] + oc[2] * ray_dir[2];
-            let c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - outer_r_world * outer_r_world;
-            let disc = b * b - c;
-            if disc <= 0.0 {
-                continue;
-            }
-            let sq = disc.sqrt();
-            let t_enter = (-b - sq).max(0.0);
-            let t_exit = -b + sq;
-            let t = if t_enter > 0.0 { t_enter } else { t_exit };
-            if t <= 0.0 {
-                continue;
-            }
-            let hit_world = [
-                cam_world[0] + ray_dir[0] * t,
-                cam_world[1] + ray_dir[1] * t,
-                cam_world[2] + ray_dir[2] * t,
-            ];
-            let Some(coord) = crate::world::cubesphere::world_to_coord(body_center, hit_world) else {
-                continue;
-            };
-            hits_considered += 1;
-            if coord.face != sphere.face {
-                if self.startup_profile_frames < 8 {
-                    eprintln!(
-                        "sphere_fit reject reason=face sample=({sx:.1},{sy:.1}) sample_face={:?} frame_face={:?} render_path={:?}",
-                        coord.face,
-                        sphere.face,
-                        sphere.frame_path.as_slice(),
-                    );
-                }
-                return false;
-            }
-            let un = (coord.u + 1.0) * 0.5;
-            let vn = (coord.v + 1.0) * 0.5;
-            let rn = ((coord.r / body_size) - sphere.inner_r) / (sphere.outer_r - sphere.inner_r);
-            let in_bounds = (bounds_min[0]..=bounds_max[0]).contains(&un)
-                && (bounds_min[1]..=bounds_max[1]).contains(&vn)
-                && (bounds_min[2]..=bounds_max[2]).contains(&rn);
-            if !in_bounds {
-                if self.startup_profile_frames < 8 {
-                    eprintln!(
-                        "sphere_fit reject reason=bounds sample=({sx:.1},{sy:.1}) un={:.6} vn={:.6} rn={:.6} bounds_u=[{:.6},{:.6}] bounds_v=[{:.6},{:.6}] bounds_r=[{:.6},{:.6}] render_path={:?}",
-                        un, vn, rn,
-                        bounds_min[0], bounds_max[0],
-                        bounds_min[1], bounds_max[1],
-                        bounds_min[2], bounds_max[2],
-                        sphere.frame_path.as_slice(),
-                    );
-                }
-                return false;
-            }
-        }
-
-        if self.startup_profile_frames < 8 {
-            eprintln!(
-                "sphere_fit accept hits_considered={} render_path={:?} face_depth={} face_size={:.8}",
-                hits_considered,
-                sphere.frame_path.as_slice(),
-                sphere.face_depth,
-                sphere.face_size,
-            );
-        }
-        hits_considered > 0
+        local_target
+            .min(local_cap)
+            .min(MAX_LOCAL_VISUAL_DEPTH)
+            .min(crate::world::tree::MAX_DEPTH as u32)
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
-        let cam_local = super::point_world_to_frame(frame, self.camera.world_pos_f32());
+        let cam_local = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => {
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                if let Some(face_point) = cubesphere_local::body_point_to_face_space(
+                    cam_body,
+                    sphere.inner_r,
+                    sphere.outer_r,
+                    WORLD_SIZE,
+                ) {
+                    let scale = WORLD_SIZE / sphere.face_size;
+                    [
+                        (face_point.un - sphere.face_u_min) * scale,
+                        (face_point.vn - sphere.face_v_min) * scale,
+                        (face_point.rn - sphere.face_r_min) * scale,
+                    ]
+                } else {
+                    [f32::NAN; 3]
+                }
+            }
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                self.camera.position.in_frame(&frame.render_path)
+            }
+        };
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
@@ -371,44 +172,35 @@ impl App {
             eprintln!("sphere_focus: path {:?} resolved to non-body kind {:?}", body_path.as_slice(), body.kind);
             return None;
         };
-        let (body_origin, body_size) = super::frame::frame_origin_size_world(&body_path);
-        let body_center = [
-            body_origin[0] + body_size * 0.5,
-            body_origin[1] + body_size * 0.5,
-            body_origin[2] + body_size * 0.5,
-        ];
-        let cam_world = self.camera.world_pos_f32();
-        let radial = crate::world::sdf::sub(cam_world, body_center);
-        let radial_len = crate::world::sdf::length(radial);
-        if radial_len <= 1e-6 {
-            eprintln!("sphere_focus: radial_len too small cam_world={:?} body_center={:?}", cam_world, body_center);
-            return None;
-        }
-        let radial_dir = crate::world::sdf::scale(radial, 1.0 / radial_len);
-        let surface_world = crate::world::sdf::add(
-            body_center,
-            crate::world::sdf::scale(radial_dir, outer_r * body_size),
-        );
-        let Some(coord) = crate::world::cubesphere::world_to_coord(body_center, surface_world) else {
+        let cam_body = self.camera.position.in_frame(&body_path);
+        let ray_dir = crate::world::sdf::normalize(self.camera.forward());
+        let Some(t) = cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE) else {
             eprintln!(
-                "sphere_focus: world_to_coord failed body_center={:?} surface_world={:?}",
-                body_center,
-                surface_world
+                "sphere_focus: miss cam_body={:?} ray_dir={:?} body_path={:?}",
+                cam_body,
+                ray_dir,
+                body_path.as_slice(),
             );
             return None;
         };
+        let hit_body = crate::world::sdf::add(cam_body, crate::world::sdf::scale(ray_dir, t));
+        let Some(face_point) = cubesphere_local::body_point_to_face_space(
+            hit_body,
+            inner_r,
+            outer_r,
+            WORLD_SIZE,
+        ) else {
+            eprintln!("sphere_focus: degenerate hit_body={:?}", hit_body);
+            return None;
+        };
+        let face = face_point.face;
         let mut path = body_path;
-        path.push(crate::world::cubesphere::FACE_SLOTS[coord.face as usize] as u8);
+        path.push(FACE_SLOTS[face as usize] as u8);
 
         let eps = 1e-5f32;
-        let mut un = ((coord.u + 1.0) * 0.5).clamp(eps, 1.0 - eps);
-        let mut vn = ((coord.v + 1.0) * 0.5).clamp(eps, 1.0 - eps);
-        let shell_world = (outer_r - inner_r) * body_size;
-        if shell_world <= 0.0 {
-            eprintln!("sphere_focus: non-positive shell_world={shell_world}");
-            return None;
-        }
-        let mut rn = ((coord.r - inner_r * body_size) / shell_world).clamp(1.0 - eps, 1.0 - eps);
+        let mut un = face_point.un.clamp(eps, 1.0 - eps);
+        let mut vn = face_point.vn.clamp(eps, 1.0 - eps);
+        let mut rn = face_point.rn.clamp(eps, 1.0 - eps);
 
         let target_depth = desired_depth.max(body_path.depth() + 1);
         let mut u_min = 0.0f32;
@@ -435,43 +227,53 @@ impl App {
             path.as_slice(),
             desired_depth,
             body_path.as_slice(),
-            coord.face,
+            face,
         );
         Some(path)
+    }
+
+    fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
+        let (cam_local, frame_center_local, frame_span) = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => (
+                self.camera.position.in_frame(&sphere.body_path),
+                super::frame::frame_point_to_body([1.5, 1.5, 1.5], &sphere),
+                (crate::world::anchor::WORLD_SIZE * sphere.face_size).max(1e-6),
+            ),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
+                self.camera.position.in_frame(&frame.render_path),
+                [1.5, 1.5, 1.5],
+                crate::world::anchor::WORLD_SIZE,
+            ),
+        };
+        let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
+        let dist = crate::world::sdf::length(to_center).max(0.05);
+        let half_fov_recip = 720.0f32 / (2.0f32 * (1.2f32 * 0.5f32).tan());
+        frame_span / dist * half_fov_recip
     }
 
     fn target_render_frame(&self) -> ActiveFrame {
         let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut frame = self
+        let frame = self
             .camera_local_sphere_focus_path(desired_depth)
             .map(|path| {
-                let logical = super::frame::compute_render_frame(
+                super::frame::with_render_margin(
                     &self.world.library,
                     self.world.root,
                     &path,
-                    path.depth(),
-                );
-                match logical.kind {
-                    ActiveFrameKind::Sphere(sphere) => ActiveFrame {
-                        render_path: sphere.body_path,
-                        logical_path: logical.logical_path,
-                        node_id: sphere.body_node_id,
-                        kind: ActiveFrameKind::Body {
-                            inner_r: sphere.inner_r,
-                            outer_r: sphere.outer_r,
-                        },
-                    },
-                    _ => super::frame::with_render_margin(
-                        &self.world.library,
-                        self.world.root,
-                        &path,
-                        RENDER_FRAME_CONTEXT,
-                    ),
-                }
+                    RENDER_FRAME_CONTEXT,
+                )
             })
             .unwrap_or_else(|| self.render_frame());
-        while !self.camera_fits_frame(&frame) && frame.render_path.depth() > 0 {
+        let mut frame = frame;
+        while frame.render_path.depth() > 0
+            && (!self.camera_fits_frame(&frame)
+                || matches!(
+                    frame.kind,
+                    ActiveFrameKind::Sphere(ref sphere)
+                        if self.frame_projected_pixels(&frame) < SPHERE_FOCUS_MIN_PIXELS
+                ))
+        {
             let logical_path = frame.logical_path;
             let mut shallower = frame.render_path;
             shallower.truncate(frame.render_path.depth().saturating_sub(1));
@@ -490,11 +292,26 @@ impl App {
         }
         if self.startup_profile_frames < 4 {
             eprintln!(
+                "target_frame local anchor_path={:?} render_path={:?} logical_path={:?} kind={:?}",
+                self.camera.position.anchor.as_slice(),
+                frame.render_path.as_slice(),
+                frame.logical_path.as_slice(),
+                frame.kind,
+            );
+        }
+        if self.startup_profile_frames < 4 {
+            let cam_local = match frame.kind {
+                ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
+                ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                    self.camera.position.in_frame(&frame.render_path)
+                }
+            };
+            eprintln!(
                 "target_frame stable render_path={:?} logical_path={:?} kind={:?} cam_local={:?}",
                 frame.render_path.as_slice(),
                 frame.logical_path.as_slice(),
                 frame.kind,
-                super::point_world_to_frame(&frame, self.camera.world_pos_f32()),
+                cam_local,
             );
         }
         frame
@@ -525,10 +342,9 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(super) fn frame_aware_raycast(&self) -> Option<edit::HitInfo> {
-        let cam_world = self.camera.world_pos_f32();
         let hit = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = super::frame::point_world_to_body_frame(&sphere, cam_world);
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
                 edit::cpu_raycast_in_sphere_frame(
                     &self.world.library,
                     self.world.root,
@@ -549,8 +365,7 @@ impl App {
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
-                let ray_dir =
-                    super::world_dir_to_frame(&self.active_frame, cam_world, self.camera.forward());
+                let ray_dir = crate::world::sdf::normalize(self.camera.forward());
                 edit::cpu_raycast_in_frame(
                     &self.world.library,
                     self.world.root,
@@ -564,12 +379,12 @@ impl App {
         };
         if self.startup_profile_frames < 16 {
             eprintln!(
-                "frame_raycast frame={} kind={:?} render_path={:?} logical_path={:?} cam_world={:?} hit={}",
+                "frame_raycast frame={} kind={:?} render_path={:?} logical_path={:?} cam_anchor={:?} hit={}",
                 self.startup_profile_frames,
                 self.active_frame.kind,
                 self.active_frame.render_path.as_slice(),
                 self.active_frame.logical_path.as_slice(),
-                cam_world,
+                self.camera.position.anchor.as_slice(),
                 hit.is_some(),
             );
             if let Some(ref h) = hit {
@@ -668,21 +483,17 @@ impl App {
         self.upload_tree_lod();
     }
 
-    /// Pack the world tree (LOD-aware from the absolute root) and
-    /// push it to the GPU, along with the ancestor ribbon that
-    /// lets the shader pop from the frame back up to the absolute
-    /// root.
+    /// Pack the world tree (LOD-aware from the root) and push it
+    /// to the GPU, along with the ancestor ribbon that lets the
+    /// shader pop from the active frame back up the tree.
     ///
-    /// Pack runs in **world** coordinates (camera passed as world
-    /// XYZ), so distance-LOD decisions are at world scale and the
-    /// buffer is shared by all frame depths. The shader starts
-    /// DDA at `frame_root_idx` with the camera in **frame-local**
-    /// coordinates, and pops via the ribbon when rays exit the
-    /// frame's `[0, 3)³` bubble.
+    /// The packer now uses the camera's path-anchored `WorldPos`
+    /// directly. Every LOD decision is made in the current node's
+    /// local `[0, 3)³` frame via `WorldPos::in_frame`, so upload,
+    /// render, and edit all agree on the same locality model.
     pub(super) fn upload_tree_lod(&mut self) {
         let intended_frame = self.target_render_frame();
-        let cam_world = self.camera.world_pos_f32();
-        let upload_key = LodUploadKey::new(self.world.root, cam_world, &intended_frame);
+        let upload_key = LodUploadKey::new(self.world.root, &self.camera.position, &intended_frame);
         let mut pack_elapsed = std::time::Duration::ZERO;
         let mut ribbon_elapsed = std::time::Duration::ZERO;
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
@@ -701,7 +512,7 @@ impl App {
             let (tree_data, node_kinds, _world_root_idx) = gpu::pack_tree_lod_preserving(
                 &self.world.library,
                 self.world.root,
-                cam_world,
+                &self.camera.position,
                 1440.0,
                 1.2,
                 &preserve_paths,
@@ -751,7 +562,7 @@ impl App {
                         sphere.face as u32,
                         sphere.face_depth,
                         [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
-                        super::frame::point_world_to_body_frame(&sphere, cam_world),
+                        self.camera.position.in_frame(&sphere.body_path),
                     );
                 }
                 ActiveFrameKind::Body { inner_r, outer_r } => {
@@ -790,13 +601,10 @@ impl App {
                 tree_hit.is_some(),
             );
         }
-        let aabb_world = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
-        let aabb = aabb_world.map(|(mn, mx)| match self.active_frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                super::frame::aabb_world_to_body_frame(&sphere, mn, mx)
-            }
+        let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
+            ActiveFrameKind::Sphere(_) => edit::hit_aabb_body_local(&self.world.library, hit),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                super::aabb_world_to_frame(&self.active_frame, mn, mx)
+                edit::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
             }
         });
         if let Some(renderer) = &mut self.renderer {

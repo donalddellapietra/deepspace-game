@@ -2,8 +2,8 @@
 //!
 //! The camera's position is a `WorldPos` — a symbolic path-anchor
 //! plus an offset held in `[0, 1)³` of that cell — NOT a raw XYZ.
-//! Rendering, editing, and physics derive world-space coordinates
-//! on demand via `world_pos_f32()`.
+//! Rendering, editing, and GPU upload operate on local frame
+//! projections derived from `position.in_frame(...)`.
 
 use crate::world::anchor::WorldPos;
 use crate::world::gpu::GpuCamera;
@@ -24,14 +24,6 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// World-space XYZ derived from the `WorldPos`. Used by legacy
-    /// XYZ-native call sites (renderer, cubed-sphere raycast, LOD
-    /// distance culling). Canonical storage stays in `position`.
-    #[inline]
-    pub fn world_pos_f32(&self) -> [f32; 3] {
-        self.position.to_world_xyz()
-    }
-
     /// World-space size of the anchor's cell. Flight speed,
     /// crosshair reach, and physics integration all scale with this
     /// so movement "feels" the same at every zoom level.
@@ -79,10 +71,6 @@ impl Camera {
 
     pub fn forward(&self) -> [f32; 3] { self.basis().0 }
 
-    pub fn gpu_camera(&self, fov: f32) -> GpuCamera {
-        self.gpu_camera_at(self.world_pos_f32(), fov)
-    }
-
     /// Build a `GpuCamera` with an explicit position. Used by the
     /// render-frame pipeline: position is the camera's frame-local
     /// coordinate (f32-safe at any anchor depth), not world XYZ.
@@ -102,8 +90,6 @@ impl Camera {
         GpuCamera {
             pos,
             _pad0: 0.0,
-            world_pos: self.world_pos_f32(),
-            _pad_world: 0.0,
             forward,
             _pad1: 0.0,
             right,

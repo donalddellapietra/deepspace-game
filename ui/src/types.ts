@@ -65,7 +65,8 @@ export interface DebugOverlayState {
   treeDepth: number;
   editDepth: number;
   visualDepth: number;
-  cameraPos: [number, number, number];
+  cameraAnchorDepth: number;
+  cameraLocal: [number, number, number];
   fov: number;
   nodeCount: number;
 }

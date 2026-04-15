@@ -6,7 +6,9 @@
 //! raycast descends, so the same code breaks a single block at fine
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
-use super::cubesphere::{world_to_coord, FACE_SLOTS};
+use super::cubesphere::FACE_SLOTS;
+use super::cubesphere_local;
+use super::anchor::{Path, WORLD_SIZE};
 use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
@@ -198,7 +200,7 @@ pub fn cpu_raycast_in_sphere_frame(
     world_root: NodeId,
     frame_path: &[u8],
     cam_local: [f32; 3],
-    ray_origin_world: [f32; 3],
+    ray_origin_body: [f32; 3],
     ray_dir: [f32; 3],
     max_face_depth: u32,
     face: u32,
@@ -242,7 +244,7 @@ pub fn cpu_raycast_in_sphere_frame(
                 3.0,
                 inner_r_local,
                 outer_r_local,
-                ray_origin_world,
+                ray_origin_body,
                 ray_dir,
                 &[],
                 face,
@@ -1035,6 +1037,7 @@ fn cs_raycast_in_body(
     ancestor_path: &[(NodeId, usize)],
     max_face_depth: u32,
 ) -> Option<HitInfo> {
+    let debug_probe = max_face_depth <= 2 && ancestor_path.len() <= 1;
     let cs_center = [
         body_origin[0] + body_size * 0.5,
         body_origin[1] + body_size * 0.5,
@@ -1056,6 +1059,12 @@ fn cs_raycast_in_body(
     let t_enter = (-b - sq).max(0.0);
     let t_exit = -b + sq;
     if t_exit <= 0.0 { return None; }
+    if debug_probe {
+        eprintln!(
+            "cs_raycast_in_body start origin={:?} dir={:?} body_origin={:?} body_size={} inner={} outer={} t_enter={} t_exit={}",
+            ray_origin, ray_dir, body_origin, body_size, inner_r_local, outer_r_local, t_enter, t_exit,
+        );
+    }
 
     // Step size scales with the deepest face-subtree depth observed.
     // Start coarse (1/3 of shell) and refine as we sample finer cells.
@@ -1073,15 +1082,33 @@ fn cs_raycast_in_body(
     // solid rock, making placement silently fail).
     let mut prev_place_path: Option<Vec<(NodeId, usize)>> = None;
     let max_steps = 8_000usize;
-    for _ in 0..max_steps {
+    for step_index in 0..max_steps {
         if t >= t_exit { break; }
         let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
         let local = sdf::sub(p, cs_center);
         let r = sdf::length(local);
-        if r >= cs_outer || r < cs_inner { break; }
+        if r > cs_outer {
+            if debug_probe && step_index < 12 {
+                eprintln!("cs_raycast_in_body step={} t={} outside_outer r={} outer={}", step_index, t, r, cs_outer);
+            }
+            t += eps * 8.0;
+            continue;
+        }
+        if r < cs_inner {
+            if debug_probe && step_index < 12 {
+                eprintln!("cs_raycast_in_body step={} t={} below_inner r={} inner={}", step_index, t, r, cs_inner);
+            }
+            break;
+        }
 
-        let coord = world_to_coord(cs_center, p)?;
-        let face = coord.face;
+        let p_body = [
+            p[0] - body_origin[0],
+            p[1] - body_origin[1],
+            p[2] - body_origin[2],
+        ];
+        let face_point =
+            cubesphere_local::body_point_to_face_space(p_body, inner_r_local, outer_r_local, body_size)?;
+        let face = face_point.face;
         let face_slot = FACE_SLOTS[face as usize];
         let body_node = library.get(body_id)?;
         let face_root_id = match body_node.children[face_slot] {
@@ -1091,11 +1118,24 @@ fn cs_raycast_in_body(
                 continue;
             }
         };
-        let un = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
-        let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
-        let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
+        let un = face_point.un;
+        let vn = face_point.vn;
+        let rn = face_point.rn;
 
         let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn, max_face_depth);
+        if debug_probe && step_index < 12 {
+            eprintln!(
+                "cs_raycast_in_body step={} t={} r={} face={:?} un={} vn={} rn={} walk={:?}",
+                step_index,
+                t,
+                r,
+                face,
+                un,
+                vn,
+                rn,
+                walk.as_ref().map(|(block_id, term_depth, path)| (*block_id, *term_depth, path.len())),
+            );
+        }
         if let Some((block_id, term_depth, mut face_path)) = walk {
             if block_id != 0 {
                 let mut full_path = ancestor_path.to_vec();
@@ -1180,15 +1220,27 @@ fn cs_raycast_in_body_bounded(
         let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
         let local = sdf::sub(p, cs_center);
         let r = sdf::length(local);
-        if r >= cs_outer || r < cs_inner { break; }
-
-        let coord = world_to_coord(cs_center, p)?;
-        if coord.face as u32 != frame_face {
+        if r > cs_outer {
+            t += eps * 8.0;
+            continue;
+        }
+        if r < cs_inner {
             break;
         }
-        let un_abs = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
-        let vn_abs = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
-        let rn_abs = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
+
+        let p_body = [
+            p[0] - body_origin[0],
+            p[1] - body_origin[1],
+            p[2] - body_origin[2],
+        ];
+        let face_point =
+            cubesphere_local::body_point_to_face_space(p_body, inner_r_local, outer_r_local, body_size)?;
+        if face_point.face as u32 != frame_face {
+            break;
+        }
+        let un_abs = face_point.un;
+        let vn_abs = face_point.vn;
+        let rn_abs = face_point.rn;
         if un_abs < frame_u_min || un_abs >= frame_u_min + frame_size ||
            vn_abs < frame_v_min || vn_abs >= frame_v_min + frame_size ||
            rn_abs < frame_r_min || rn_abs >= frame_r_min + frame_size {
@@ -1332,6 +1384,116 @@ fn walk_face_subtree_with_path(
 /// `(u_slot, v_slot, r_slot)` in cube-sphere coords. The bulged
 /// voxel's world AABB is computed from `cubesphere::block_corners`
 /// at the cell's `(face, u, v, r)` extents.
+fn hit_path_slots(hit: &HitInfo) -> Path {
+    let mut path = Path::root();
+    for &(_, slot) in &hit.path {
+        path.push(slot as u8);
+    }
+    path
+}
+
+pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [f32; 3]) {
+    let cell_path = hit_path_slots(hit);
+    let common = cell_path.common_prefix_len(frame_path) as usize;
+
+    let mut cell_min_common = [0.0f32; 3];
+    let mut cell_size_common = WORLD_SIZE;
+    for depth in common..cell_path.depth() as usize {
+        let (sx, sy, sz) = slot_coords(cell_path.slot(depth) as usize);
+        let child_size = cell_size_common / 3.0;
+        cell_min_common[0] += sx as f32 * child_size;
+        cell_min_common[1] += sy as f32 * child_size;
+        cell_min_common[2] += sz as f32 * child_size;
+        cell_size_common = child_size;
+    }
+
+    let mut frame_min_common = [0.0f32; 3];
+    let mut frame_size_common = WORLD_SIZE;
+    for depth in common..frame_path.depth() as usize {
+        let (sx, sy, sz) = slot_coords(frame_path.slot(depth) as usize);
+        let child_size = frame_size_common / 3.0;
+        frame_min_common[0] += sx as f32 * child_size;
+        frame_min_common[1] += sy as f32 * child_size;
+        frame_min_common[2] += sz as f32 * child_size;
+        frame_size_common = child_size;
+    }
+
+    let scale = WORLD_SIZE / frame_size_common;
+    let min = [
+        (cell_min_common[0] - frame_min_common[0]) * scale,
+        (cell_min_common[1] - frame_min_common[1]) * scale,
+        (cell_min_common[2] - frame_min_common[2]) * scale,
+    ];
+    let extent = cell_size_common * scale;
+    (
+        min,
+        [min[0] + extent, min[1] + extent, min[2] + extent],
+    )
+}
+
+pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+    use super::cubesphere::Face;
+
+    for (index, &(node_id, slot)) in hit.path.iter().enumerate() {
+        let Some(node) = library.get(node_id) else { break };
+        let Child::Node(child_id) = node.children[slot] else { continue };
+        let Some(child_node) = library.get(child_id) else { continue };
+        let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind else {
+            continue;
+        };
+
+        let Some(&(_, face_slot)) = hit.path.get(index + 1) else {
+            return ([0.0, 0.0, 0.0], [WORLD_SIZE, WORLD_SIZE, WORLD_SIZE]);
+        };
+        let Some(face_index) = (0..6).find(|&face| FACE_SLOTS[face] == face_slot) else {
+            return ([0.0, 0.0, 0.0], [WORLD_SIZE, WORLD_SIZE, WORLD_SIZE]);
+        };
+        let face = Face::from_index(face_index as u8);
+
+        let mut iu = 0u32;
+        let mut iv = 0u32;
+        let mut ir = 0u32;
+        let mut depth = 0u32;
+        for &(_, face_child_slot) in &hit.path[index + 2..] {
+            let (us, vs, rs) = slot_coords(face_child_slot);
+            iu = iu * 3 + us as u32;
+            iv = iv * 3 + vs as u32;
+            ir = ir * 3 + rs as u32;
+            depth += 1;
+        }
+
+        let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
+        let un0 = iu as f32 / cells;
+        let vn0 = iv as f32 / cells;
+        let rn0 = ir as f32 / cells;
+        let du = 1.0 / cells;
+        let dv = 1.0 / cells;
+        let dr = 1.0 / cells;
+
+        let corners = [
+            cubesphere_local::face_space_to_body_point(face, un0, vn0, rn0, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0, rn0, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(face, un0, vn0 + dv, rn0, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0 + dv, rn0, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(face, un0, vn0, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(face, un0, vn0 + dv, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0 + dv, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
+        ];
+        let mut min = corners[0];
+        let mut max = corners[0];
+        for corner in &corners[1..] {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(corner[axis]);
+                max[axis] = max[axis].max(corner[axis]);
+            }
+        }
+        return (min, max);
+    }
+
+    hit_aabb_in_frame_local(hit, &Path::root())
+}
+
 pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
     use super::cubesphere::{block_corners, Face, FACE_SLOTS};
 

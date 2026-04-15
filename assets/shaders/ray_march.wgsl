@@ -9,8 +9,6 @@
 struct Camera {
     pos: vec3<f32>,
     _pad0: f32,
-    world_pos: vec3<f32>,
-    _pad_world: f32,
     forward: vec3<f32>,
     _pad1: f32,
     right: vec3<f32>,
@@ -324,13 +322,6 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     result.r_lo = r_sum + r_comp;
     result.size = size;
     return result;
-}
-
-fn sphere_empty_step(frame_shell: f32, region_size: f32, t: f32) -> f32 {
-    let nominal = frame_shell * region_size * 0.33;
-    let coarse_floor = frame_shell * 0.01;
-    let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
-    return max(max(nominal, coarse_floor), t_ulp * 4.0);
 }
 
 const FACE_ROOT_LOD_THRESHOLD_PIXELS: f32 = 1.0;
@@ -657,7 +648,40 @@ fn march_face_root(
             return result;
         }
 
-        t = t + sphere_empty_step(shell * bounds.w, walk.size, t);
+        let u_lo_ea = (bounds.x + walk.u_lo * bounds.w) * 2.0 - 1.0;
+        let u_hi_ea = (bounds.x + (walk.u_lo + walk.size) * bounds.w) * 2.0 - 1.0;
+        let n_u_lo = u_axis - ea_to_cube(u_lo_ea) * n_axis;
+        let n_u_hi = u_axis - ea_to_cube(u_hi_ea) * n_axis;
+
+        let v_lo_ea = (bounds.y + walk.v_lo * bounds.w) * 2.0 - 1.0;
+        let v_hi_ea = (bounds.y + (walk.v_lo + walk.size) * bounds.w) * 2.0 - 1.0;
+        let n_v_lo = v_axis - ea_to_cube(v_lo_ea) * n_axis;
+        let n_v_hi = v_axis - ea_to_cube(v_hi_ea) * n_axis;
+
+        let r_lo = cs_inner + (bounds.z + walk.r_lo * bounds.w) * shell;
+        let r_hi = cs_inner + (bounds.z + (walk.r_lo + walk.size) * bounds.w) * shell;
+
+        var t_next = t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        let zero3 = vec3<f32>(0.0);
+        let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+        let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+        let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
+        if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+        let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
+        if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+
+        if t_next >= t_exit { break; }
+        last_face_id = winning_face;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(shell * walk.size * bounds.w * 1e-3, t_ulp * 4.0);
+        t = t_next + cell_eps;
     }
 
     return result;
@@ -765,7 +789,40 @@ fn sphere_in_cell(
         // Cell bounds come from the walker's Kahan-compensated
         // accumulation. No more `floor(un * 3^depth)` quantization,
         // so depths past 14 stay precision-correct.
-        t = t + sphere_empty_step(shell, walk.size, t);
+        let u_lo_ea = walk.u_lo * 2.0 - 1.0;
+        let u_hi_ea = (walk.u_lo + walk.size) * 2.0 - 1.0;
+        let n_u_lo = u_axis - ea_to_cube(u_lo_ea) * n_axis;
+        let n_u_hi = u_axis - ea_to_cube(u_hi_ea) * n_axis;
+
+        let v_lo_ea = walk.v_lo * 2.0 - 1.0;
+        let v_hi_ea = (walk.v_lo + walk.size) * 2.0 - 1.0;
+        let n_v_lo = v_axis - ea_to_cube(v_lo_ea) * n_axis;
+        let n_v_hi = v_axis - ea_to_cube(v_hi_ea) * n_axis;
+
+        let r_lo = cs_inner + walk.r_lo * shell;
+        let r_hi = cs_inner + (walk.r_lo + walk.size) * shell;
+
+        var t_next = t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        let zero3 = vec3<f32>(0.0);
+        let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+        let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+        let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
+        if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+        let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
+        if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+
+        if t_next >= t_exit { break; }
+        last_face_id = winning_face;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(shell * walk.size * 1e-3, t_ulp * 4.0);
+        t = t_next + cell_eps;
     }
 
     return result;
@@ -781,7 +838,7 @@ fn sphere_in_face_window(
     face_depth: u32,
     inner_r_local: f32,
     outer_r_local: f32,
-    ray_origin_world: vec3<f32>,
+    ray_origin_body: vec3<f32>,
     ray_dir: vec3<f32>,
 ) -> HitResult {
     var result: HitResult;
@@ -801,7 +858,7 @@ fn sphere_in_face_window(
     let cs_inner = inner_r_local * body_size;
     let shell = cs_outer - cs_inner;
 
-    let oc = ray_origin_world - cs_center;
+    let oc = ray_origin_body - cs_center;
     let b = dot(oc, ray_dir);
     let c_outer = dot(oc, oc) - cs_outer * cs_outer;
     let disc = b * b - c_outer;
@@ -874,7 +931,40 @@ fn sphere_in_face_window(
             return result;
         }
 
-        t = t + sphere_empty_step(shell * face_size, walk.size, t);
+        let u_lo_ea = walk.u_lo * 2.0 - 1.0;
+        let u_hi_ea = (walk.u_lo + walk.size) * 2.0 - 1.0;
+        let n_u_lo = u_axis - ea_to_cube(u_lo_ea) * n_axis;
+        let n_u_hi = u_axis - ea_to_cube(u_hi_ea) * n_axis;
+
+        let v_lo_ea = walk.v_lo * 2.0 - 1.0;
+        let v_hi_ea = (walk.v_lo + walk.size) * 2.0 - 1.0;
+        let n_v_lo = v_axis - ea_to_cube(v_lo_ea) * n_axis;
+        let n_v_hi = v_axis - ea_to_cube(v_hi_ea) * n_axis;
+
+        let r_lo = cs_inner + walk.r_lo * shell;
+        let r_hi = cs_inner + (walk.r_lo + walk.size) * shell;
+
+        var t_next = t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        let zero3 = vec3<f32>(0.0);
+        let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+        let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+        let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
+        if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+        let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
+        if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+
+        if t_next >= t_exit { break; }
+        last_face_id = winning_face;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(shell * walk.size * 1e-3, t_ulp * 4.0);
+        t = t_next + cell_eps;
     }
 
     return result;

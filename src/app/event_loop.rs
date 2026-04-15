@@ -139,7 +139,17 @@ impl App {
         eprintln!("startup_perf {source}: tree_packed ms={:.2} nodes={}", pack_elapsed.as_secs_f64() * 1000.0, tree_data.len() / 27);
         let renderer_start = std::time::Instant::now();
         let renderer = pollster::block_on(
-            Renderer::new(window, &tree_data, &node_kinds, root_index),
+            Renderer::new(
+                window,
+                &tree_data,
+                &node_kinds,
+                root_index,
+                if self.low_latency_present {
+                    wgpu::PresentMode::AutoNoVsync
+                } else {
+                    wgpu::PresentMode::AutoVsync
+                },
+            ),
         );
         let renderer_elapsed = renderer_start.elapsed();
         eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);
@@ -205,6 +215,14 @@ impl App {
         let overlay_start = frame_start;
         #[cfg(not(target_arch = "wasm32"))]
         if self.overlay_enabled() {
+            let camera_local = match self.active_frame.kind {
+                crate::app::ActiveFrameKind::Sphere(sphere) => {
+                    self.camera.position.in_frame(&sphere.body_path)
+                }
+                crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
+                    self.camera.position.in_frame(&self.active_frame.render_path)
+                }
+            };
             self.try_create_webview();
             self.inject_webview_input();
             self.poll_ui_commands();
@@ -222,7 +240,8 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_pos: self.camera.world_pos_f32(),
+                    camera_anchor_depth: self.camera.position.anchor.depth() as u32,
+                    camera_local,
                     fov: 1.2,
                     node_count: self.world.library.len(),
                 },

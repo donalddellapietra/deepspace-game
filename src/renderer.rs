@@ -84,6 +84,7 @@ impl Renderer {
         tree_data: &[GpuChild],
         node_kinds: &[GpuNodeKind],
         root_index: u32,
+        present_mode: wgpu::PresentMode,
     ) -> Self {
         let size = window.inner_size();
 
@@ -128,7 +129,7 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -150,8 +151,6 @@ impl Renderer {
         let camera = GpuCamera {
             pos: [1.5, 1.75, 1.5],
             _pad0: 0.0,
-            world_pos: [1.5, 1.75, 1.5],
-            _pad_world: 0.0,
             forward: [0.0, 0.0, -1.0],
             _pad1: 0.0,
             right: [1.0, 0.0, 0.0],

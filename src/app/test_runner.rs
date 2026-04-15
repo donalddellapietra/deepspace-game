@@ -492,7 +492,11 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     let (tree_data, node_kinds, root_index) =
         crate::world::gpu::pack_tree(&app.world.library, app.world.root);
     let renderer = pollster::block_on(Renderer::new(
-        window.clone(), &tree_data, &node_kinds, root_index,
+        window.clone(),
+        &tree_data,
+        &node_kinds,
+        root_index,
+        wgpu::PresentMode::AutoNoVsync,
     ));
     app.window = Some(window);
     app.renderer = Some(renderer);

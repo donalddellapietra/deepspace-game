@@ -75,7 +75,8 @@ const debugOverlayStore = createStore<DebugOverlayState>({
   treeDepth: 0,
   editDepth: 0,
   visualDepth: 0,
-  cameraPos: [0, 0, 0],
+  cameraAnchorDepth: 0,
+  cameraLocal: [0, 0, 0],
   fov: 0,
   nodeCount: 0,
 });
