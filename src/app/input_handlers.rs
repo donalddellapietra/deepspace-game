@@ -13,7 +13,7 @@ use winit::keyboard::KeyCode;
 use super::App;
 
 impl App {
-    pub(super) fn apply_key(&mut self, code: KeyCode, pressed: bool) {
+    pub(super) fn apply_key(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
         self.keys.apply(code, pressed);
 
         if pressed && code == KeyCode::Escape {
@@ -38,6 +38,30 @@ impl App {
             self.save_mode = !self.save_mode;
             log::info!("Save mode: {}", self.save_mode);
             return;
+        }
+
+        // Debug-mode movement: WASD/Space/Shift teleport one cell of
+        // width `3^-camera.depth` in a world-frame direction. R
+        // resets to the canonical inspection pose. All movement is
+        // discrete — no held-key acceleration, no auto-repeat.
+        if pressed && !repeat && self.cursor_locked {
+            let dir: Option<[f32; 3]> = match code {
+                KeyCode::KeyW => Some([0.0, 0.0, -1.0]),
+                KeyCode::KeyS => Some([0.0, 0.0,  1.0]),
+                KeyCode::KeyA => Some([-1.0, 0.0, 0.0]),
+                KeyCode::KeyD => Some([ 1.0, 0.0, 0.0]),
+                KeyCode::Space      => Some([0.0,  1.0, 0.0]),
+                KeyCode::ShiftLeft  => Some([0.0, -1.0, 0.0]),
+                KeyCode::KeyR => {
+                    self.debug_reset_pose();
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(d) = dir {
+                self.debug_teleport(d);
+                return;
+            }
         }
 
         let panel_changed = self.ui.handle_key(code, pressed);

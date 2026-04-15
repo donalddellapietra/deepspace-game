@@ -14,6 +14,57 @@ use crate::world::gpu;
 use super::App;
 
 impl App {
+    /// Debug-mode teleport: jump exactly one cell of width
+    /// `3^-camera.depth` in a world-frame direction, regardless of
+    /// what kind of node the camera currently sits in. Used by the
+    /// WASD/Space/Shift bindings to make movement predictable while
+    /// inspecting the renderer across layers.
+    ///
+    /// `dir` is a unit vector in world Cartesian `(x, y, z)`. The
+    /// camera's Position is reconstructed by walking the tree from
+    /// the root for the new world XYZ, so the path stays
+    /// NodeKind-correct even when the step crosses body / face
+    /// boundaries.
+    pub(super) fn debug_teleport(&mut self, dir: [f32; 3]) {
+        let depth = self.camera.position.depth;
+        let cell_size = 3.0f32.powi(-(depth as i32));
+        let world = self.camera.position.pos_in_ancestor_frame_in_tree(
+            0,
+            &self.world.library,
+            self.world.root,
+        );
+        let target = [
+            (world[0] + dir[0] * cell_size).clamp(0.0, 3.0 - f32::EPSILON * 4.0),
+            (world[1] + dir[1] * cell_size).clamp(0.0, 3.0 - f32::EPSILON * 4.0),
+            (world[2] + dir[2] * cell_size).clamp(0.0, 3.0 - f32::EPSILON * 4.0),
+        ];
+        self.camera.position = crate::world::position::Position::from_world_pos_in_tree(
+            target,
+            depth,
+            &self.world.library,
+            self.world.root,
+        );
+        self.apply_zoom();
+    }
+
+    /// Reset the camera to a canonical inspection pose: world XYZ
+    /// directly above the planet's north pole at the starting layer,
+    /// looking straight down. Bound to the `R` key in debug mode.
+    pub(super) fn debug_reset_pose(&mut self) {
+        let depth = self.camera.position.depth;
+        let target = [1.5, 2.0, 1.5]; // just above the body cell at the north-pole surface
+        self.camera.position = crate::world::position::Position::from_world_pos_in_tree(
+            target,
+            depth,
+            &self.world.library,
+            self.world.root,
+        );
+        self.camera.yaw = 0.0;
+        self.camera.pitch = -std::f32::consts::FRAC_PI_2; // straight down
+        self.camera.smoothed_up = [0.0, 1.0, 0.0];
+        self.apply_zoom();
+    }
+
     /// CPU raycast depth: how far below the render root the cursor
     /// ray descends. Equals `camera.depth - render_root_depth` so
     /// editing resolution tracks the camera regardless of where the

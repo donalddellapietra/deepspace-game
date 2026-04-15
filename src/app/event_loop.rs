@@ -60,11 +60,16 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput {
-                event: KeyEvent { physical_key: PhysicalKey::Code(code), state, .. },
+                event: KeyEvent {
+                    physical_key: PhysicalKey::Code(code),
+                    state,
+                    repeat,
+                    ..
+                },
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
-                self.apply_key(code, pressed);
+                self.apply_key(code, pressed, repeat);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
