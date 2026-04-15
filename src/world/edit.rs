@@ -6,7 +6,7 @@
 //! raycast descends, so the same code breaks a single block at fine
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
-use super::cubesphere::{world_to_coord, FACE_SLOTS};
+use super::cubesphere::{coord_to_world, world_to_coord, CubeSphereCoord, Face, FACE_SLOTS};
 use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
@@ -24,6 +24,87 @@ struct FrameFaceInfo {
     size: f32,
 }
 
+fn planet_from_body_kind(kind: NodeKind) -> Option<super::sdf::Planet> {
+    let NodeKind::CubedSphereBody {
+        surface_r,
+        noise_scale,
+        noise_freq,
+        noise_seed,
+        surface_block,
+        core_block,
+        ..
+    } = kind else {
+        return None;
+    };
+    Some(super::sdf::Planet {
+        center: [0.5, 0.5, 0.5],
+        radius: surface_r,
+        noise_scale,
+        noise_freq,
+        noise_seed,
+        gravity: 0.0,
+        influence_radius: 1.0,
+        surface_block,
+        core_block,
+    })
+}
+
+fn procedural_face_cell_classification(
+    planet: &super::sdf::Planet,
+    face: Face,
+    inner_r: f32,
+    outer_r: f32,
+    u_lo: f32,
+    v_lo: f32,
+    r_lo: f32,
+    size: f32,
+) -> Result<Option<u8>, u8> {
+    let shell = outer_r - inner_r;
+    let u_c = (u_lo + 0.5 * size) * 2.0 - 1.0;
+    let v_c = (v_lo + 0.5 * size) * 2.0 - 1.0;
+    let r_c = inner_r + (r_lo + 0.5 * size) * shell;
+    let p_center = coord_to_world([0.5, 0.5, 0.5], CubeSphereCoord {
+        face,
+        u: u_c,
+        v: v_c,
+        r: r_c,
+    });
+    let d_center = planet.distance(p_center);
+    let r_hi = inner_r + (r_lo + size) * shell;
+    let lateral_half = r_hi * size;
+    let radial_half = 0.5 * size * shell;
+    let cell_rad = (lateral_half * lateral_half + radial_half * radial_half).sqrt();
+    if d_center > cell_rad {
+        Ok(None)
+    } else if d_center < -cell_rad {
+        Ok(Some(planet.block_at(p_center)))
+    } else {
+        Err(0)
+    }
+}
+
+fn procedural_face_block_at_query(
+    planet: &super::sdf::Planet,
+    face: Face,
+    inner_r: f32,
+    outer_r: f32,
+    un: f32,
+    vn: f32,
+    rn: f32,
+) -> Option<u8> {
+    let p = coord_to_world([0.5, 0.5, 0.5], CubeSphereCoord {
+        face,
+        u: un * 2.0 - 1.0,
+        v: vn * 2.0 - 1.0,
+        r: inner_r + rn * (outer_r - inner_r),
+    });
+    if planet.distance(p) < 0.0 {
+        Some(planet.block_at(p))
+    } else {
+        None
+    }
+}
+
 fn frame_face_info(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -38,7 +119,7 @@ fn frame_face_info(
         return None;
     };
     let body = library.get(body_id)?;
-    let NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
+    let NodeKind::CubedSphereBody { inner_r, outer_r, .. } = body.kind else {
         return None;
     };
     if frame_path[0] as usize != body_slot {
@@ -214,7 +295,7 @@ pub fn cpu_raycast_in_frame(
             let inner_max = max_depth.saturating_sub(current_frame_depth as u32);
             let frame_node = library.get(frame_root_id);
             let frame_kind = frame_node.map(|n| n.kind);
-            if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
+            if let Some(NodeKind::CubedSphereBody { inner_r, outer_r, .. }) = frame_kind {
                 let inner_ancestor: Vec<(NodeId, usize)> =
                     frame_entries.iter().take(current_frame_depth).cloned().collect();
                 if let Some(hit) = cs_raycast_in_body(
@@ -273,7 +354,7 @@ pub fn cpu_raycast_in_frame(
         // with the body filling the [0, 3)³ frame.
         let frame_node = library.get(frame_root_id);
         let frame_kind = frame_node.map(|n| n.kind);
-        if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
+        if let Some(NodeKind::CubedSphereBody { inner_r, outer_r, .. }) = frame_kind {
             let body_origin = [0.0f32; 3];
             let body_size = 3.0;
             // ancestor_path inside the inner call must be the path
@@ -455,7 +536,7 @@ pub fn cpu_raycast_with_face_depth(
 
                 // NodeKind dispatch — sphere body cells switch to
                 // sphere DDA in the body cell's local frame.
-                if let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind {
+                if let NodeKind::CubedSphereBody { inner_r, outer_r, .. } = child_node.kind {
                     let parent_origin = stack[depth].node_origin;
                     let parent_cell_size = stack[depth].cell_size;
                     let body_origin = [
@@ -1114,7 +1195,6 @@ fn cs_raycast_in_body(
         let local = sdf::sub(p, cs_center);
         let r = sdf::length(local);
         if r >= cs_outer || r < cs_inner { break; }
-
         let coord = world_to_coord(cs_center, p)?;
         let face = coord.face;
         let face_slot = face_slots[face as usize];
@@ -1127,7 +1207,7 @@ fn cs_raycast_in_body(
         let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
 
         let walk = walk_face_subtree_bounded(
-            library, face_root_id, un, vn, rn, max_face_depth,
+            library, body_id, face_root_id, face, un, vn, rn, max_face_depth,
         );
 
         if walk.block != 0 {
@@ -1280,13 +1360,118 @@ pub struct FaceWalkResult {
     pub size: f32,
 }
 
+fn procedural_face_walk_from_cell(
+    library: &NodeLibrary,
+    body_id: NodeId,
+    face: Face,
+    start_node_id: NodeId,
+    start_depth: u32,
+    start_path: &[(NodeId, usize)],
+    start_u_lo: f32,
+    start_v_lo: f32,
+    start_r_lo: f32,
+    start_size: f32,
+    start_un: f32,
+    start_vn: f32,
+    start_rn: f32,
+    max_depth: u32,
+) -> FaceWalkResult {
+    let mut result = FaceWalkResult {
+        block: 0,
+        depth: start_depth,
+        path: start_path.to_vec(),
+        u_lo: start_u_lo,
+        v_lo: start_v_lo,
+        r_lo: start_r_lo,
+        size: start_size,
+    };
+    let Some(body) = library.get(body_id) else { return result };
+    let Some(planet) = planet_from_body_kind(body.kind) else { return result };
+    let NodeKind::CubedSphereBody { inner_r, outer_r, .. } = body.kind else {
+        return result;
+    };
+
+    let mut current_depth = start_depth;
+    let mut current_node_id = start_node_id;
+    let mut u_lo = start_u_lo;
+    let mut v_lo = start_v_lo;
+    let mut r_lo = start_r_lo;
+    let mut size = start_size;
+    let mut un = start_un;
+    let mut vn = start_vn;
+    let mut rn = start_rn;
+    let limit = max_depth.min(crate::world::tree::MAX_DEPTH as u32);
+
+    loop {
+        match procedural_face_cell_classification(
+            &planet, face, inner_r, outer_r, u_lo, v_lo, r_lo, size,
+        ) {
+            Ok(Some(block)) => {
+                result.block = block;
+                result.depth = current_depth;
+                result.u_lo = u_lo;
+                result.v_lo = v_lo;
+                result.r_lo = r_lo;
+                result.size = size;
+                return result;
+            }
+            Ok(None) => {
+                result.block = 0;
+                result.depth = current_depth;
+                result.u_lo = u_lo;
+                result.v_lo = v_lo;
+                result.r_lo = r_lo;
+                result.size = size;
+                return result;
+            }
+            Err(_) => {}
+        }
+
+        if current_depth >= limit {
+            result.block = procedural_face_block_at_query(
+                &planet,
+                face,
+                inner_r,
+                outer_r,
+                u_lo + un * size,
+                v_lo + vn * size,
+                r_lo + rn * size,
+            ).unwrap_or(0);
+            result.depth = current_depth;
+            result.u_lo = u_lo;
+            result.v_lo = v_lo;
+            result.r_lo = r_lo;
+            result.size = size;
+            return result;
+        }
+
+        let us = ((un * 3.0) as usize).min(2);
+        let vs = ((vn * 3.0) as usize).min(2);
+        let rs = ((rn * 3.0) as usize).min(2);
+        let slot = slot_index(us, vs, rs);
+        result.path.push((current_node_id, slot));
+        let child_size = size / 3.0;
+        u_lo += us as f32 * child_size;
+        v_lo += vs as f32 * child_size;
+        r_lo += rs as f32 * child_size;
+        size = child_size;
+        un = un * 3.0 - us as f32;
+        vn = vn * 3.0 - vs as f32;
+        rn = rn * 3.0 - rs as f32;
+        current_depth += 1;
+        current_node_id = EMPTY_NODE;
+    }
+}
+
 /// Kahan-accumulating face-subtree walker. Loop bound comes from
 /// `max_depth` with no hardcoded upper cap beyond `MAX_DEPTH` (the
 /// tree's architectural limit). Mirror of `walk_face_subtree` in
 /// the shader.
 pub fn walk_face_subtree_bounded(
     library: &NodeLibrary,
+    body_id: NodeId,
     face_root_id: NodeId,
+    face: Face,
     un_in: f32, vn_in: f32, rn_in: f32,
     max_depth: u32,
 ) -> FaceWalkResult {
@@ -1357,6 +1542,27 @@ pub fn walk_face_subtree_bounded(
                 return result;
             }
             Child::Node(nid) => {
+                if matches!(
+                    library.get(nid).map(|n| n.kind),
+                    Some(NodeKind::CubedSphereProceduralFace { .. })
+                ) {
+                    return procedural_face_walk_from_cell(
+                        library,
+                        body_id,
+                        face,
+                        nid,
+                        d,
+                        &result.path,
+                        u_sum + u_comp,
+                        v_sum + v_comp,
+                        r_sum + r_comp,
+                        size,
+                        un * 3.0 - us as f32,
+                        vn * 3.0 - vs as f32,
+                        rn * 3.0 - rs as f32,
+                        limit,
+                    );
+                }
                 if d == limit {
                     // Cap: report this Node's representative block
                     // so the cell shows its content at any zoom
@@ -1521,7 +1727,7 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
         let child = node.children[slot];
         if let Child::Node(child_id) = child {
             if let Some(child_node) = library.get(child_id) {
-                if let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind {
+                if let NodeKind::CubedSphereBody { inner_r, outer_r, .. } = child_node.kind {
                     let (x, y, z) = slot_coords(slot);
                     let body_origin = [
                         origin[0] + x as f32 * cell_size,
@@ -2018,5 +2224,38 @@ mod tests {
             !place_block(&mut world, &hit, block::BRICK),
             "Should reject placement outside world bounds"
         );
+    }
+
+    #[test]
+    fn face_walk_continues_past_materialized_stub_depth() {
+        let mut lib = NodeLibrary::default();
+        let sdf = Planet {
+            center: [0.5, 0.5, 0.5],
+            radius: 0.30,
+            noise_scale: 0.0,
+            noise_freq: 1.0,
+            noise_seed: 0,
+            gravity: 0.0,
+            influence_radius: 1.0,
+            surface_block: block::GRASS,
+            core_block: block::STONE,
+        };
+        let body_id = insert_spherical_body(&mut lib, 0.12, 0.45, 20, &sdf);
+        let body = lib.get(body_id).unwrap();
+        let face_root_id = match body.children[FACE_SLOTS[crate::world::cubesphere::Face::PosZ as usize]] {
+            Child::Node(id) => id,
+            _ => panic!("missing face root"),
+        };
+        let walk = walk_face_subtree_bounded(
+            &lib,
+            body_id,
+            face_root_id,
+            crate::world::cubesphere::Face::PosZ,
+            0.5,
+            0.5,
+            0.55,
+            12,
+        );
+        assert!(walk.depth > 6, "expected procedural continuation, got depth {}", walk.depth);
     }
 }

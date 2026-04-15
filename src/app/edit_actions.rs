@@ -21,22 +21,6 @@ impl App {
         self.anchor_depth().saturating_sub(1).max(1)
     }
 
-    /// Sphere face-subtree edit depth.
-    ///
-    /// The old port kept sphere edits 3 levels coarser than
-    /// Cartesian edits (`anchor_depth - 4` vs `anchor_depth - 1`).
-    /// That created the exact cross-layer asymmetry the refactor is
-    /// supposed to eliminate: at the same zoom, sphere placement
-    /// targeted much larger cells, so placed blocks ballooned as the
-    /// player went deeper.
-    ///
-    /// Use the same edit depth for both paths. The body/face wrappers
-    /// are structural node kinds, not a reason to coarsen the user's
-    /// interaction scale.
-    pub(super) fn cs_edit_depth(&self) -> u32 {
-        self.edit_depth()
-    }
-
     pub(super) fn visual_depth(&self) -> u32 {
         let local_target = self.edit_depth()
             .saturating_sub(self.active_frame.depth() as u32)
@@ -95,36 +79,21 @@ impl App {
         );
     }
 
-    /// Cast a ray from the camera into the world using the same
-    /// frame-aware machinery as the renderer: the cpu raycast
-    /// runs in frame-local coordinates and pops upward via the
-    /// camera's anchor when it exits the frame's bubble. This is
-    /// what makes deep-zoom block placement land in the cell
-    /// that's actually under the crosshair, instead of being
-    /// pinned to the f32-precision wall of world XYZ.
+    /// Cast a ray from the camera into the world for cursor
+    /// highlight / break / place.
+    ///
+    /// Keep the cursor on a single stable policy while the
+    /// body/face-local CPU raycast is still being rewritten:
+    /// cast from world-space so the selected block does not change
+    /// as the camera anchor depth changes.
     pub(super) fn frame_aware_raycast(&self) -> Option<edit::HitInfo> {
-        let chain = super::frame::FrameKindChain::build(
-            &self.world.library, self.world.root, &self.active_frame,
-        );
         let cam_world = self.camera.position.to_world_xyz_in(&self.world.library, self.world.root);
-        let cam_local = super::frame::position_in_frame(
+        edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            &self.active_frame,
-            &self.camera.position,
-        );
-        let ray_dir = if let Some(info) = super::frame::face_frame_info(&self.active_frame, &chain) {
-            let cam_body = super::frame::frame_point_to_body(cam_local, &info);
-            super::frame::body_dir_to_frame(cam_body, self.camera.forward(), &info)
-        } else {
-            super::frame::world_dir_to_frame(
-                &self.active_frame, &chain, cam_world, self.camera.forward(),
-            )
-        };
-        edit::cpu_raycast_in_frame(
-            &self.world.library, self.world.root,
-            self.active_frame.as_slice(), cam_local, ray_dir,
-            self.edit_depth(), self.cs_edit_depth(),
+            cam_world,
+            self.camera.forward(),
+            self.edit_depth(),
         )
     }
 
@@ -270,11 +239,35 @@ impl App {
                     info.subtree_depth as u32,
                     [info.u_lo, info.v_lo, info.r_lo, info.size],
                     pop_pos,
+                    info.surface_r,
+                    info.noise_scale,
+                    info.noise_freq,
+                    info.noise_seed,
+                    info.surface_block,
+                    info.core_block,
                 );
             } else {
                 match frame_kind {
-                crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } => {
-                    renderer.set_root_kind_body(inner_r, outer_r);
+                crate::world::tree::NodeKind::CubedSphereBody {
+                    inner_r,
+                    outer_r,
+                    surface_r,
+                    noise_scale,
+                    noise_freq,
+                    noise_seed,
+                    surface_block,
+                    core_block,
+                } => {
+                    renderer.set_root_kind_body(
+                        inner_r,
+                        outer_r,
+                        surface_r,
+                        noise_scale,
+                        noise_freq,
+                        noise_seed,
+                        surface_block,
+                        core_block,
+                    );
                 }
                 _ => {
                     renderer.set_root_kind_cartesian();
@@ -351,5 +344,27 @@ mod tests {
             "perf_smoke_cpu_paths avg_ms upload_tree_lod={:.3} frame_aware_raycast={:.3}",
             upload_ms, raycast_ms,
         );
+    }
+
+    #[test]
+    fn frame_aware_raycast_is_stable_across_anchor_depths() {
+        let mut shallow = App::with_test_config(TestConfig {
+            spawn_depth: Some(12),
+            ..Default::default()
+        });
+        let mut deep = App::with_test_config(TestConfig {
+            spawn_depth: Some(18),
+            ..Default::default()
+        });
+
+        shallow.upload_tree_lod();
+        deep.upload_tree_lod();
+
+        let shallow_hit = shallow.frame_aware_raycast().expect("shallow hit");
+        let deep_hit = deep.frame_aware_raycast().expect("deep hit");
+
+        assert_eq!(shallow_hit.face, deep_hit.face);
+        assert_eq!(shallow_hit.path, deep_hit.path);
+        assert_eq!(shallow_hit.place_path, deep_hit.place_path);
     }
 }

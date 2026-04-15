@@ -89,7 +89,7 @@ fn child_geom(parent: QueueGeom, slot: usize, child_kind: NodeKind) -> QueueGeom
                 origin[2] + cz as f32 * cell_size,
             ];
             match child_kind {
-                NodeKind::CubedSphereBody { inner_r, outer_r } => QueueGeom::Body {
+                NodeKind::CubedSphereBody { inner_r, outer_r, .. } => QueueGeom::Body {
                     origin: child_origin,
                     body_size: cell_size,
                     inner_r,
@@ -353,8 +353,12 @@ pub fn pack_tree_lod_preserving(
         head += 1;
 
         let Some(node) = library.get(node_id) else { continue };
-        let uniform_collapse_active =
-            matches!(node.kind, NodeKind::Cartesian | NodeKind::CubedSphereFace { .. });
+        let uniform_collapse_active = matches!(
+            node.kind,
+            NodeKind::Cartesian
+                | NodeKind::CubedSphereFace { .. }
+                | NodeKind::CubedSphereProceduralFace { .. }
+        );
 
         for (slot, child) in node.children.iter().enumerate() {
             if let Child::Node(child_id) = child {
@@ -369,8 +373,12 @@ pub fn pack_tree_lod_preserving(
                 // to walk deeper into a uniform subtree. Skipped for
                 // slots on the camera's preserve path so build_ribbon
                 // can descend.
-                let child_is_collapseable =
-                    matches!(child_node.kind, NodeKind::Cartesian | NodeKind::CubedSphereFace { .. });
+                let child_is_collapseable = matches!(
+                    child_node.kind,
+                    NodeKind::Cartesian
+                        | NodeKind::CubedSphereFace { .. }
+                        | NodeKind::CubedSphereProceduralFace { .. }
+                );
                 let on_preserve = preserve_pairs.contains(&(node_id, slot as u8));
                 let child_geom = child_geom(node_geom, slot, child_node.kind);
                 if !on_preserve && uniform_collapse_active && child_is_collapseable
@@ -465,7 +473,16 @@ mod tests {
         let mut root_children = uniform_children(Child::Node(leaf_air));
         let body_id = lib.insert_with_kind(
             empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.12,
+                outer_r: 0.45,
+                surface_r: 0.30,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
         root_children[CENTER_SLOT] = Child::Node(body_id);
         let root = lib.insert(root_children);
@@ -623,7 +640,16 @@ mod tests {
         body_children[FACE_SLOTS[0]] = Child::Node(face_root);
         let body = lib.insert_with_kind(
             body_children,
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.12,
+                outer_r: 0.45,
+                surface_r: 0.30,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
         let mut root_children = empty_children();
         root_children[CENTER_SLOT] = Child::Node(body);
@@ -656,7 +682,16 @@ mod tests {
         body_children[FACE_SLOTS[0]] = Child::Node(face_root);
         let body = lib.insert_with_kind(
             body_children,
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.12,
+                outer_r: 0.45,
+                surface_r: 0.30,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
 
         let mut root_children = empty_children();

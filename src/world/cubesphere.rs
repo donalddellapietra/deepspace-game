@@ -207,11 +207,11 @@ pub const BLOCK_EDGES: [(usize, usize); 12] = [
 
 // ────────────────────────────────────────────────── body insertion
 
-/// Max levels the SDF recursion is allowed to descend into a face
-/// subtree. Below this, each straddling cell commits to solid-or-
-/// empty based on the center sample and wraps the remaining tree
-/// depth in a dedup'd uniform filler.
-const SDF_DETAIL_LEVELS: u32 = 4;
+/// Max levels the explicit face tree is allowed to descend before
+/// it switches to procedural continuation stubs. Uniform empty /
+/// solid regions can still terminate above or below this if the
+/// SDF classification proves them homogeneous.
+const MATERIALIZED_FACE_LEVELS: u32 = 4;
 
 /// Build the 6 face subtrees + interior filler + body node, insert
 /// the body into `lib`, and return its `NodeId`. The caller is
@@ -236,7 +236,7 @@ pub fn insert_spherical_body(
         "radii must satisfy 0 < inner_r < outer_r <= 0.5 (cell-local)");
 
     let body_center: Vec3 = [0.5, 0.5, 0.5]; // body cell-local
-    let sdf_budget = depth.min(SDF_DETAIL_LEVELS);
+    let sdf_budget = depth.min(MATERIALIZED_FACE_LEVELS);
 
     // Build the 6 face subtrees. Each face's TOP node carries
     // `NodeKind::CubedSphereFace { face }` so downstream walkers
@@ -283,7 +283,16 @@ pub fn insert_spherical_body(
 
     lib.insert_with_kind(
         body_children,
-        NodeKind::CubedSphereBody { inner_r, outer_r },
+        NodeKind::CubedSphereBody {
+            inner_r,
+            outer_r,
+            surface_r: sdf.radius,
+            noise_scale: sdf.noise_scale,
+            noise_freq: sdf.noise_freq,
+            noise_seed: sdf.noise_seed,
+            surface_block: sdf.surface_block,
+            core_block: sdf.core_block,
+        },
     )
 }
 
@@ -341,11 +350,13 @@ fn build_face_subtree(
         };
     }
     if sdf_budget == 0 {
-        return if d_center < 0.0 {
-            lib.build_uniform_subtree(sdf.block_at(p_center), depth)
-        } else {
-            Child::Node(build_uniform_empty(lib, depth))
-        };
+        let stub_id = lib.insert_with_kind_summary(
+            empty_children(),
+            NodeKind::CubedSphereProceduralFace { face },
+            Some(sdf.surface_block),
+            Some(super::tree::UNIFORM_MIXED),
+        );
+        return Child::Node(stub_id);
     }
 
     let mut children = empty_children();

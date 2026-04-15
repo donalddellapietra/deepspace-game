@@ -39,17 +39,78 @@ pub struct GpuNodeKind {
     pub face: u32,
     pub inner_r: f32,
     pub outer_r: f32,
+    pub surface_r: f32,
+    pub noise_scale: f32,
+    pub noise_freq: f32,
+    pub noise_seed: u32,
+    pub surface_block: u32,
+    pub core_block: u32,
+    pub _pad: [u32; 2],
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
-            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
-                kind: 1, face: 0, inner_r, outer_r,
+            NodeKind::Cartesian => Self {
+                kind: 0,
+                face: 0,
+                inner_r: 0.0,
+                outer_r: 0.0,
+                surface_r: 0.0,
+                noise_scale: 0.0,
+                noise_freq: 0.0,
+                noise_seed: 0,
+                surface_block: 0,
+                core_block: 0,
+                _pad: [0; 2],
+            },
+            NodeKind::CubedSphereBody {
+                inner_r,
+                outer_r,
+                surface_r,
+                noise_scale,
+                noise_freq,
+                noise_seed,
+                surface_block,
+                core_block,
+            } => Self {
+                kind: 1,
+                face: 0,
+                inner_r,
+                outer_r,
+                surface_r,
+                noise_scale,
+                noise_freq,
+                noise_seed,
+                surface_block: surface_block as u32,
+                core_block: core_block as u32,
+                _pad: [0; 2],
             },
             NodeKind::CubedSphereFace { face } => Self {
-                kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
+                kind: 2,
+                face: face as u32,
+                inner_r: 0.0,
+                outer_r: 0.0,
+                surface_r: 0.0,
+                noise_scale: 0.0,
+                noise_freq: 0.0,
+                noise_seed: 0,
+                surface_block: 0,
+                core_block: 0,
+                _pad: [0; 2],
+            },
+            NodeKind::CubedSphereProceduralFace { face } => Self {
+                kind: 3,
+                face: face as u32,
+                inner_r: 0.0,
+                outer_r: 0.0,
+                surface_r: 0.0,
+                noise_scale: 0.0,
+                noise_freq: 0.0,
+                noise_seed: 0,
+                surface_block: 0,
+                core_block: 0,
+                _pad: [0; 2],
             },
         }
     }
@@ -98,7 +159,7 @@ mod tests {
 
     #[test]
     fn gpu_node_kind_size() {
-        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 16);
+        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 48);
     }
 
     #[test]
@@ -111,10 +172,17 @@ mod tests {
     fn from_node_kind_body_carries_radii() {
         let k = GpuNodeKind::from_node_kind(NodeKind::CubedSphereBody {
             inner_r: 0.12, outer_r: 0.45,
+            surface_r: 0.30,
+            noise_scale: 0.0,
+            noise_freq: 1.0,
+            noise_seed: 0,
+            surface_block: 1,
+            core_block: 2,
         });
         assert_eq!(k.kind, 1);
         assert!((k.inner_r - 0.12).abs() < 1e-7);
         assert!((k.outer_r - 0.45).abs() < 1e-7);
+        assert!((k.surface_r - 0.30).abs() < 1e-7);
     }
 
     #[test]

@@ -42,6 +42,12 @@ pub struct FaceFrameInfo {
     pub subtree_depth: usize,
     pub inner_r: f32,
     pub outer_r: f32,
+    pub surface_r: f32,
+    pub noise_scale: f32,
+    pub noise_freq: f32,
+    pub noise_seed: u32,
+    pub surface_block: u8,
+    pub core_block: u8,
     pub u_lo: f32,
     pub v_lo: f32,
     pub r_lo: f32,
@@ -108,11 +114,15 @@ impl FrameKindChain {
     /// Body radii — walks the chain to find the CubedSphereBody.
     pub fn body_radii(&self) -> Option<(f32, f32)> {
         for k in &self.kinds {
-            if let NodeKind::CubedSphereBody { inner_r, outer_r } = k {
+            if let NodeKind::CubedSphereBody { inner_r, outer_r, .. } = k {
                 return Some((*inner_r, *outer_r));
             }
         }
         None
+    }
+
+    pub fn body_kind(&self) -> Option<NodeKind> {
+        self.kinds.iter().copied().find(|k| matches!(k, NodeKind::CubedSphereBody { .. }))
     }
 }
 
@@ -145,7 +155,18 @@ pub fn face_cell_bounds_from_path(face_subtree_slots: &[u8]) -> (f32, f32, f32, 
 
 pub fn face_frame_info(frame: &Path, chain: &FrameKindChain) -> Option<FaceFrameInfo> {
     let (body_depth, face) = chain.body_and_face(frame)?;
-    let (inner_r, outer_r) = chain.body_radii()?;
+    let NodeKind::CubedSphereBody {
+        inner_r,
+        outer_r,
+        surface_r,
+        noise_scale,
+        noise_freq,
+        noise_seed,
+        surface_block,
+        core_block,
+    } = chain.body_kind()? else {
+        return None;
+    };
     let face_subtree_slots = &frame.as_slice()[(body_depth + 1)..];
     let (u_lo, v_lo, r_lo, size) = face_cell_bounds_from_path(face_subtree_slots);
     Some(FaceFrameInfo {
@@ -154,6 +175,12 @@ pub fn face_frame_info(frame: &Path, chain: &FrameKindChain) -> Option<FaceFrame
         subtree_depth: frame.depth() as usize - (body_depth + 1),
         inner_r,
         outer_r,
+        surface_r,
+        noise_scale,
+        noise_freq,
+        noise_seed,
+        surface_block,
+        core_block,
         u_lo,
         v_lo,
         r_lo,
@@ -686,7 +713,16 @@ mod tests {
         body_children[14] = Child::Node(face);
         let body = lib.insert_with_kind(
             body_children,
-            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.1,
+                outer_r: 0.4,
+                surface_r: 0.3,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);
@@ -706,7 +742,16 @@ mod tests {
         let mut lib = NodeLibrary::default();
         let body = lib.insert_with_kind(
             empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.1,
+                outer_r: 0.4,
+                surface_r: 0.3,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);
@@ -757,7 +802,16 @@ mod tests {
         body_children[14] = Child::Node(face);
         let body = lib.insert_with_kind(
             body_children,
-            NodeKind::CubedSphereBody { inner_r: 0.3, outer_r: 0.49 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.3,
+                outer_r: 0.49,
+                surface_r: 0.4,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);

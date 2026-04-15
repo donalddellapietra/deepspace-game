@@ -54,7 +54,7 @@ fn canonical_body_info(library: &NodeLibrary, world_root: NodeId) -> Option<Cano
         return None;
     };
     let body = library.get(body_id)?;
-    let NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
+    let NodeKind::CubedSphereBody { inner_r, outer_r, .. } = body.kind else {
         return None;
     };
     let (sx, sy, sz) = slot_coords(body_slot);

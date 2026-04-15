@@ -176,7 +176,16 @@ mod tests {
         let mut root_children = uniform_children(Child::Node(leaf_air));
         let body_id = lib.insert_with_kind(
             empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.12,
+                outer_r: 0.45,
+                surface_r: 0.30,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
         root_children[CENTER_SLOT] = Child::Node(body_id);
         let root = lib.insert(root_children);

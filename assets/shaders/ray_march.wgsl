@@ -47,6 +47,8 @@ struct Uniforms {
     /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
+    root_planet_f32: vec4<f32>,
+    root_planet_u32: vec4<u32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
@@ -62,10 +64,17 @@ struct RibbonEntry {
 }
 
 struct NodeKindGpu {
-    kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
+    kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace, 3=ProceduralFace
     face: u32,
     inner_r: f32,
     outer_r: f32,
+    surface_r: f32,
+    noise_scale: f32,
+    noise_freq: f32,
+    noise_seed: u32,
+    surface_block: u32,
+    core_block: u32,
+    _pad: vec2<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
@@ -192,6 +201,365 @@ fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
     return -1.0;
 }
 
+fn smoothstep01(t: f32) -> f32 {
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn hash_lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
+    var h = seed;
+    h = h * 374761393u + bitcast<u32>(ix);
+    h = h * 668265263u + bitcast<u32>(iy);
+    h = h * 1274126177u + bitcast<u32>(iz);
+    h = h ^ (h >> 13u);
+    h = h * 1274126177u;
+    h = h ^ (h >> 16u);
+    return f32(h & 0xFFFFu) / 32768.0 - 1.0;
+}
+
+fn noise3d(p: vec3<f32>, seed: u32) -> f32 {
+    let px = floor(p.x);
+    let py = floor(p.y);
+    let pz = floor(p.z);
+    let xi = i32(px);
+    let yi = i32(py);
+    let zi = i32(pz);
+    let xf = p.x - px;
+    let yf = p.y - py;
+    let zf = p.z - pz;
+    let ux = smoothstep01(xf);
+    let uy = smoothstep01(yf);
+    let uz = smoothstep01(zf);
+
+    let c000 = hash_lattice(xi, yi, zi, seed);
+    let c100 = hash_lattice(xi + 1, yi, zi, seed);
+    let c010 = hash_lattice(xi, yi + 1, zi, seed);
+    let c110 = hash_lattice(xi + 1, yi + 1, zi, seed);
+    let c001 = hash_lattice(xi, yi, zi + 1, seed);
+    let c101 = hash_lattice(xi + 1, yi, zi + 1, seed);
+    let c011 = hash_lattice(xi, yi + 1, zi + 1, seed);
+    let c111 = hash_lattice(xi + 1, yi + 1, zi + 1, seed);
+
+    let x00 = mix(c000, c100, ux);
+    let x10 = mix(c010, c110, ux);
+    let x01 = mix(c001, c101, ux);
+    let x11 = mix(c011, c111, ux);
+    let y0 = mix(x00, x10, uy);
+    let y1 = mix(x01, x11, uy);
+    return mix(y0, y1, uz);
+}
+
+fn planet_displacement(body_node_idx: u32, p: vec3<f32>) -> f32 {
+    let body = node_kinds[body_node_idx];
+    let n = noise3d(p * body.noise_freq, body.noise_seed);
+    if n < 0.0 {
+        return 0.5 * n * body.noise_scale;
+    }
+    return n * body.noise_scale;
+}
+
+fn planet_distance(body_node_idx: u32, p: vec3<f32>) -> f32 {
+    let body = node_kinds[body_node_idx];
+    let to = p - vec3<f32>(0.5);
+    let base = length(to) - body.surface_r;
+    if base > body.noise_scale * 1.25 {
+        return base;
+    }
+    return base - planet_displacement(body_node_idx, p);
+}
+
+fn planet_block(body_node_idx: u32, p: vec3<f32>) -> u32 {
+    let body = node_kinds[body_node_idx];
+    let r = length(p - vec3<f32>(0.5));
+    let under = body.surface_r - r;
+    let grass_band = body.noise_scale * 0.15;
+    let dirt_band = body.noise_scale * 0.6;
+    if under < grass_band {
+        return body.surface_block;
+    }
+    if under < dirt_band {
+        return 3u;
+    }
+    return body.core_block;
+}
+
+fn classify_face_cell(body_node_idx: u32, face: u32,
+                      u_lo: f32, v_lo: f32, r_lo: f32, size: f32) -> vec2<i32> {
+    let body = node_kinds[body_node_idx];
+    let shell = body.outer_r - body.inner_r;
+    let u_c = (u_lo + 0.5 * size) * 2.0 - 1.0;
+    let v_c = (v_lo + 0.5 * size) * 2.0 - 1.0;
+    let r_c = body.inner_r + (r_lo + 0.5 * size) * shell;
+    let p_center = vec3<f32>(0.5) + face_uv_to_dir(face, u_c, v_c) * r_c;
+    let d_center = planet_distance(body_node_idx, p_center);
+    let r_hi = body.inner_r + (r_lo + size) * shell;
+    let lateral_half = r_hi * size;
+    let radial_half = 0.5 * size * shell;
+    let cell_rad = sqrt(lateral_half * lateral_half + radial_half * radial_half);
+    if d_center > cell_rad {
+        return vec2<i32>(0, 0);
+    }
+    if d_center < -cell_rad {
+        return vec2<i32>(1, i32(planet_block(body_node_idx, p_center)));
+    }
+    return vec2<i32>(-1, 0);
+}
+
+fn planet_distance_root(p: vec3<f32>) -> f32 {
+    let to = p - vec3<f32>(0.5);
+    let base = length(to) - uniforms.root_planet_f32.x;
+    if base > uniforms.root_planet_f32.y * 1.25 {
+        return base;
+    }
+    let n = noise3d(p * uniforms.root_planet_f32.z, uniforms.root_planet_u32.x);
+    let disp = select(n * uniforms.root_planet_f32.y, 0.5 * n * uniforms.root_planet_f32.y, n < 0.0);
+    return base - disp;
+}
+
+fn planet_block_root(p: vec3<f32>) -> u32 {
+    let r = length(p - vec3<f32>(0.5));
+    let under = uniforms.root_planet_f32.x - r;
+    let grass_band = uniforms.root_planet_f32.y * 0.15;
+    let dirt_band = uniforms.root_planet_f32.y * 0.6;
+    if under < grass_band {
+        return uniforms.root_planet_u32.y;
+    }
+    if under < dirt_band {
+        return 3u;
+    }
+    return uniforms.root_planet_u32.z;
+}
+
+fn classify_root_face_cell(face: u32,
+                           u_lo: f32, v_lo: f32, r_lo: f32, size: f32) -> vec2<i32> {
+    let shell = uniforms.root_radii.y - uniforms.root_radii.x;
+    let u_c = (u_lo + 0.5 * size) * 2.0 - 1.0;
+    let v_c = (v_lo + 0.5 * size) * 2.0 - 1.0;
+    let r_c = uniforms.root_radii.x + (r_lo + 0.5 * size) * shell;
+    let p_center = vec3<f32>(0.5) + face_uv_to_dir(face, u_c, v_c) * r_c;
+    let d_center = planet_distance_root(p_center);
+    let r_hi = uniforms.root_radii.x + (r_lo + size) * shell;
+    let lateral_half = r_hi * size;
+    let radial_half = 0.5 * size * shell;
+    let cell_rad = sqrt(lateral_half * lateral_half + radial_half * radial_half);
+    if d_center > cell_rad {
+        return vec2<i32>(0, 0);
+    }
+    if d_center < -cell_rad {
+        return vec2<i32>(1, i32(planet_block_root(p_center)));
+    }
+    return vec2<i32>(-1, 0);
+}
+
+fn face_repr_block(body_node_idx: u32, face: u32,
+                   u_lo: f32, v_lo: f32, size: f32) -> u32 {
+    let body = node_kinds[body_node_idx];
+    let u_c = (u_lo + 0.5 * size) * 2.0 - 1.0;
+    let v_c = (v_lo + 0.5 * size) * 2.0 - 1.0;
+    let dir = face_uv_to_dir(face, u_c, v_c);
+    let base_p = vec3<f32>(0.5) + dir * body.surface_r;
+    let disp = planet_displacement(body_node_idx, base_p);
+    let sample_r = max(body.inner_r, body.surface_r + disp - max(body.noise_scale * 0.35, 0.002));
+    return planet_block(body_node_idx, vec3<f32>(0.5) + dir * sample_r);
+}
+
+fn root_face_repr_block(face: u32, u_lo: f32, v_lo: f32, size: f32) -> u32 {
+    let u_c = (u_lo + 0.5 * size) * 2.0 - 1.0;
+    let v_c = (v_lo + 0.5 * size) * 2.0 - 1.0;
+    let dir = face_uv_to_dir(face, u_c, v_c);
+    let base_p = vec3<f32>(0.5) + dir * uniforms.root_planet_f32.x;
+    let n = noise3d(base_p * uniforms.root_planet_f32.z, uniforms.root_planet_u32.x);
+    let disp = select(n * uniforms.root_planet_f32.y, 0.5 * n * uniforms.root_planet_f32.y, n < 0.0);
+    let sample_r = max(uniforms.root_radii.x, uniforms.root_planet_f32.x + disp - max(uniforms.root_planet_f32.y * 0.35, 0.002));
+    return planet_block_root(vec3<f32>(0.5) + dir * sample_r);
+}
+
+fn walk_procedural_face(body_node_idx: u32, face: u32,
+                        start_node_idx: u32, start_depth: u32,
+                        start_u_lo: f32, start_v_lo: f32, start_r_lo: f32,
+                        start_size: f32,
+                        start_un: f32, start_vn: f32, start_rn: f32,
+                        ray_t: f32) -> FaceWalkResult {
+    var result: FaceWalkResult;
+    result.block = 0u;
+    result.depth = start_depth;
+    result.u_lo = start_u_lo;
+    result.v_lo = start_v_lo;
+    result.r_lo = start_r_lo;
+    result.size = start_size;
+
+    let body = node_kinds[body_node_idx];
+    var current_depth = start_depth;
+    var current_node_idx = start_node_idx;
+    var u_lo = start_u_lo;
+    var v_lo = start_v_lo;
+    var r_lo = start_r_lo;
+    var size = start_size;
+    var un = start_un;
+    var vn = start_vn;
+    var rn = start_rn;
+
+    loop {
+        let cell = classify_face_cell(body_node_idx, face, u_lo, v_lo, r_lo, size);
+        if cell.x == 0 {
+            result.block = 0u;
+            result.depth = current_depth;
+            result.u_lo = u_lo;
+            result.v_lo = v_lo;
+            result.r_lo = r_lo;
+            result.size = size;
+            return result;
+        }
+        if cell.x == 1 {
+            result.block = u32(cell.y);
+            result.depth = current_depth;
+            result.u_lo = u_lo;
+            result.v_lo = v_lo;
+            result.r_lo = r_lo;
+            result.size = size;
+            return result;
+        }
+
+        let cell_size_local = 3.0 * size;
+        let ray_dist = max(ray_t, 0.001);
+        let lod_pixels = cell_size_local / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+        let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
+        let at_max = current_depth >= uniforms.max_depth || current_depth >= MAX_FACE_DEPTH;
+        if at_lod || at_max {
+            result.block = face_repr_block(body_node_idx, face, u_lo, v_lo, size);
+            result.depth = current_depth;
+            result.u_lo = u_lo;
+            result.v_lo = v_lo;
+            result.r_lo = r_lo;
+            result.size = size;
+            return result;
+        }
+
+        let us = min(u32(un * 3.0), 2u);
+        let vs = min(u32(vn * 3.0), 2u);
+        let rs = min(u32(rn * 3.0), 2u);
+        let slot = rs * 9u + vs * 3u + us;
+        let packed = child_packed(current_node_idx, slot);
+        let tag = child_tag(packed);
+        if tag == 1u {
+            result.block = child_block_type(packed);
+            result.depth = current_depth + 1u;
+            result.u_lo = u_lo + f32(us) * (size / 3.0);
+            result.v_lo = v_lo + f32(vs) * (size / 3.0);
+            result.r_lo = r_lo + f32(rs) * (size / 3.0);
+            result.size = size / 3.0;
+            return result;
+        }
+        if tag == 2u && node_kinds[child_node_index(current_node_idx, slot)].kind != 3u {
+            current_node_idx = child_node_index(current_node_idx, slot);
+        } else {
+            current_node_idx = 0u;
+        }
+        let child_size = size / 3.0;
+        u_lo = u_lo + f32(us) * child_size;
+        v_lo = v_lo + f32(vs) * child_size;
+        r_lo = r_lo + f32(rs) * child_size;
+        size = child_size;
+        un = un * 3.0 - f32(us);
+        vn = vn * 3.0 - f32(vs);
+        rn = rn * 3.0 - f32(rs);
+        current_depth = current_depth + 1u;
+    }
+    return result;
+}
+
+fn walk_procedural_face_root(face: u32,
+                             start_node_idx: u32, start_depth: u32,
+                             start_u_lo: f32, start_v_lo: f32, start_r_lo: f32,
+                             start_size: f32,
+                             start_un: f32, start_vn: f32, start_rn: f32,
+                             ray_t: f32) -> FaceWalkResult {
+    var result: FaceWalkResult;
+    result.block = 0u;
+    result.depth = start_depth;
+    result.u_lo = start_u_lo;
+    result.v_lo = start_v_lo;
+    result.r_lo = start_r_lo;
+    result.size = start_size;
+
+    var current_depth = start_depth;
+    var current_node_idx = start_node_idx;
+    var u_lo = start_u_lo;
+    var v_lo = start_v_lo;
+    var r_lo = start_r_lo;
+    var size = start_size;
+    var un = start_un;
+    var vn = start_vn;
+    var rn = start_rn;
+
+    loop {
+        let cell = classify_root_face_cell(face, u_lo, v_lo, r_lo, size);
+        if cell.x == 0 {
+            result.block = 0u;
+            result.depth = current_depth;
+            result.u_lo = u_lo;
+            result.v_lo = v_lo;
+            result.r_lo = r_lo;
+            result.size = size;
+            return result;
+        }
+        if cell.x == 1 {
+            result.block = u32(cell.y);
+            result.depth = current_depth;
+            result.u_lo = u_lo;
+            result.v_lo = v_lo;
+            result.r_lo = r_lo;
+            result.size = size;
+            return result;
+        }
+
+        let cell_size_local = 3.0 * size;
+        let ray_dist = max(ray_t, 0.001);
+        let lod_pixels = cell_size_local / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+        let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
+        let at_max = current_depth >= uniforms.max_depth || current_depth >= MAX_FACE_DEPTH;
+        if at_lod || at_max {
+            result.block = root_face_repr_block(face, u_lo, v_lo, size);
+            result.depth = current_depth;
+            result.u_lo = u_lo;
+            result.v_lo = v_lo;
+            result.r_lo = r_lo;
+            result.size = size;
+            return result;
+        }
+
+        let us = min(u32(un * 3.0), 2u);
+        let vs = min(u32(vn * 3.0), 2u);
+        let rs = min(u32(rn * 3.0), 2u);
+        let slot = rs * 9u + vs * 3u + us;
+        let packed = child_packed(current_node_idx, slot);
+        let tag = child_tag(packed);
+        if tag == 1u {
+            result.block = child_block_type(packed);
+            result.depth = current_depth + 1u;
+            result.u_lo = u_lo + f32(us) * (size / 3.0);
+            result.v_lo = v_lo + f32(vs) * (size / 3.0);
+            result.r_lo = r_lo + f32(rs) * (size / 3.0);
+            result.size = size / 3.0;
+            return result;
+        }
+        if tag == 2u && node_kinds[child_node_index(current_node_idx, slot)].kind != 3u {
+            current_node_idx = child_node_index(current_node_idx, slot);
+        } else {
+            current_node_idx = 0u;
+        }
+        let child_size = size / 3.0;
+        u_lo = u_lo + f32(us) * child_size;
+        v_lo = v_lo + f32(vs) * child_size;
+        r_lo = r_lo + f32(rs) * child_size;
+        size = child_size;
+        un = un * 3.0 - f32(us);
+        vn = vn * 3.0 - f32(vs);
+        rn = rn * 3.0 - f32(rs);
+        current_depth = current_depth + 1u;
+    }
+    return result;
+}
+
 // Result of walking a face subtree: which terminal (block_id),
 // what depth it sits at, AND the cell's bounds in face-normalized
 // `(un, vn, rn) ∈ [0, 1]³` coords. Bounds come from incremental
@@ -218,7 +586,8 @@ struct FaceWalkResult {
 const MAX_FACE_DEPTH: u32 = 63u;
 const FACE_ROOT_LOD_THRESHOLD_PIXELS: f32 = 3.0;
 fn walk_face_subtree(body_node_idx: u32, face: u32,
-                     un_in: f32, vn_in: f32, rn_in: f32) -> FaceWalkResult {
+                     un_in: f32, vn_in: f32, rn_in: f32,
+                     ray_t: f32) -> FaceWalkResult {
     var result: FaceWalkResult;
     result.u_lo = 0.0;
     result.v_lo = 0.0;
@@ -249,6 +618,13 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     var size: f32 = 1.0;
 
     for (var d: u32 = 2u; d <= MAX_FACE_DEPTH; d = d + 1u) {
+        if node_kinds[node].kind == 3u {
+            return walk_procedural_face(
+                body_node_idx, face, node, d - 1u,
+                u_sum + u_comp, v_sum + v_comp, r_sum + r_comp, size,
+                un, vn, rn, ray_t,
+            );
+        }
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -283,6 +659,21 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
         if tag == 0u || tag == 1u {
             result.block = select(0u, child_block_type(packed), tag == 1u);
+            result.depth = d;
+            result.u_lo = u_sum + u_comp;
+            result.v_lo = v_sum + v_comp;
+            result.r_lo = r_sum + r_comp;
+            result.size = size;
+            return result;
+        }
+
+        let cell_size_local = 3.0 * size;
+        let ray_dist = max(ray_t, 0.001);
+        let lod_pixels = cell_size_local / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+        let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
+        let at_max = d >= uniforms.max_depth;
+        if at_lod || at_max {
+            result.block = face_repr_block(body_node_idx, face, u_sum + u_comp, v_sum + v_comp, size);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
             result.v_lo = v_sum + v_comp;
@@ -333,6 +724,15 @@ fn walk_face_node(node_idx: u32,
     var size: f32 = 1.0;
 
     for (var d: u32 = 1u; d <= MAX_FACE_DEPTH; d = d + 1u) {
+        if node_kinds[node].kind == 3u {
+            return walk_procedural_face_root(
+                uniforms.root_face_meta.x,
+                node,
+                d - 1u,
+                u_sum + u_comp, v_sum + v_comp, r_sum + r_comp, size,
+                un, vn, rn, ray_t,
+            );
+        }
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -378,8 +778,7 @@ fn walk_face_node(node_idx: u32,
         let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
         let at_max = d >= uniforms.max_depth;
         if at_lod || at_max {
-            let bt = child_block_type(packed);
-            result.block = select(0u, bt, bt != 255u);
+            result.block = root_face_repr_block(uniforms.root_face_meta.x, u_sum + u_comp, v_sum + v_comp, size);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
             result.v_lo = v_sum + v_comp;
@@ -677,7 +1076,7 @@ fn sphere_in_cell(
         let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
         let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
 
-        let walk = walk_face_subtree(body_node_idx, face, un, vn, rn);
+        let walk = walk_face_subtree(body_node_idx, face, un, vn, rn, t);
         let block_id = walk.block;
         let term_depth = walk.depth;
 

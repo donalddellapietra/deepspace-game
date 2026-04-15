@@ -72,10 +72,24 @@ pub enum NodeKind {
     /// Root of a cubed-sphere body. 6 children at face-center
     /// slots are `CubedSphereFace` subtrees. Radii are in the
     /// body cell's local [0, 1) frame: 0 < inner_r < outer_r <= 0.5.
-    CubedSphereBody { inner_r: f32, outer_r: f32 },
+    CubedSphereBody {
+        inner_r: f32,
+        outer_r: f32,
+        surface_r: f32,
+        noise_scale: f32,
+        noise_freq: f32,
+        noise_seed: u32,
+        surface_block: u8,
+        core_block: u8,
+    },
     /// One face of a cubed-sphere body. Children are interpreted
     /// on (u_slot, v_slot, r_slot) axes.
     CubedSphereFace { face: Face },
+    /// A sparse face-subtree node whose untouched descendants are
+    /// generated procedurally from the owning body's planet params.
+    /// Explicit children still override procedurally generated
+    /// content, so edits can materialize below the stub.
+    CubedSphereProceduralFace { face: Face },
 }
 
 impl Default for NodeKind {
@@ -91,11 +105,24 @@ impl Hash for NodeKind {
         std::mem::discriminant(self).hash(state);
         match self {
             NodeKind::Cartesian => {}
-            NodeKind::CubedSphereBody { inner_r, outer_r } => {
+            NodeKind::CubedSphereBody {
+                inner_r, outer_r,
+                surface_r, noise_scale, noise_freq, noise_seed,
+                surface_block, core_block,
+            } => {
                 inner_r.to_bits().hash(state);
                 outer_r.to_bits().hash(state);
+                surface_r.to_bits().hash(state);
+                noise_scale.to_bits().hash(state);
+                noise_freq.to_bits().hash(state);
+                noise_seed.hash(state);
+                surface_block.hash(state);
+                core_block.hash(state);
             }
             NodeKind::CubedSphereFace { face } => {
+                face.hash(state);
+            }
+            NodeKind::CubedSphereProceduralFace { face } => {
                 face.hash(state);
             }
         }
@@ -171,6 +198,24 @@ impl NodeLibrary {
     /// node has identical children AND kind, return its id
     /// (content-addressed dedup).
     pub fn insert_with_kind(&mut self, children: Children, kind: NodeKind) -> NodeId {
+        self.insert_with_kind_summary(
+            children,
+            kind,
+            None,
+            None,
+        )
+    }
+
+    /// Insert a node with explicit summary metadata overrides.
+    /// Used for procedural sphere stubs whose real content is not
+    /// represented by their placeholder children array.
+    pub fn insert_with_kind_summary(
+        &mut self,
+        children: Children,
+        kind: NodeKind,
+        representative_block_override: Option<u8>,
+        uniform_type_override: Option<u8>,
+    ) -> NodeId {
         let h = hash_node_content(&children, &kind);
         if let Some(candidates) = self.by_hash.get(&h) {
             for &id in candidates {
@@ -209,15 +254,17 @@ impl NodeLibrary {
                 Child::Empty => {}
             }
         }
-        let representative_block = counts
-            .iter()
-            .enumerate()
-            .max_by_key(|&(_, count)| *count)
-            .filter(|&(_, count)| *count > 0)
-            .map(|(i, _)| i as u8)
-            .unwrap_or(255);
+        let representative_block = representative_block_override.unwrap_or_else(|| {
+            counts
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, count)| *count)
+                .filter(|&(_, count)| *count > 0)
+                .map(|(i, _)| i as u8)
+                .unwrap_or(255)
+        });
         // Compute uniform_type: is the entire subtree one block type?
-        let uniform_type = {
+        let uniform_type = uniform_type_override.unwrap_or_else(|| {
             let mut first: Option<u8> = None;
             let mut uniform = true;
             for c in &children {
@@ -236,7 +283,7 @@ impl NodeLibrary {
                 }
             }
             if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
-        };
+        });
         self.nodes.insert(id, Node { children, kind, ref_count: 0, representative_block, uniform_type });
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
@@ -371,7 +418,16 @@ mod tests {
         assert_eq!(a, b, "identical Cartesian kind should dedup");
         let c = lib.insert_with_kind(
             children,
-            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.1,
+                outer_r: 0.4,
+                surface_r: 0.3,
+                noise_scale: 0.0,
+                noise_freq: 1.0,
+                noise_seed: 0,
+                surface_block: 1,
+                core_block: 2,
+            },
         );
         assert_ne!(a, c, "different kind must not dedup");
         assert_eq!(lib.len(), 2);

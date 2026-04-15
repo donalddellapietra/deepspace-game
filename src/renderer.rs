@@ -47,6 +47,8 @@ pub struct GpuUniforms {
     pub root_face_meta: [u32; 4], // [face_id, subtree_depth, _, _]
     pub root_face_bounds: [f32; 4], // [u_lo, v_lo, r_lo, size]
     pub root_face_pop_pos: [f32; 4],
+    pub root_planet_f32: [f32; 4],
+    pub root_planet_u32: [u32; 4],
 }
 
 pub struct Renderer {
@@ -75,6 +77,8 @@ pub struct Renderer {
     root_face_meta: [u32; 4],
     root_face_bounds: [f32; 4],
     root_face_pop_pos: [f32; 4],
+    root_planet_f32: [f32; 4],
+    root_planet_u32: [u32; 4],
 }
 
 impl Renderer {
@@ -185,6 +189,8 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
+            root_planet_f32: [0.0; 4],
+            root_planet_u32: [0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -313,6 +319,8 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
+            root_planet_f32: [0.0; 4],
+            root_planet_u32: [0; 4],
         }
     }
 
@@ -414,6 +422,8 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
+            root_planet_f32: [0.0; 4],
+            root_planet_u32: [0; 4],
         };
 
         let ribbon_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -549,6 +559,8 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
+            root_planet_f32: [0.0; 4],
+            root_planet_u32: [0; 4],
         }
     }
 
@@ -603,15 +615,29 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
+        self.root_planet_f32 = [0.0; 4];
+        self.root_planet_u32 = [0; 4];
         self.write_uniforms();
     }
 
-    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
+    pub fn set_root_kind_body(
+        &mut self,
+        inner_r: f32,
+        outer_r: f32,
+        surface_r: f32,
+        noise_scale: f32,
+        noise_freq: f32,
+        noise_seed: u32,
+        surface_block: u8,
+        core_block: u8,
+    ) {
         self.root_kind = ROOT_KIND_BODY;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
+        self.root_planet_f32 = [surface_r, noise_scale, noise_freq, 0.0];
+        self.root_planet_u32 = [noise_seed, surface_block as u32, core_block as u32, 0];
         self.write_uniforms();
     }
 
@@ -623,12 +649,20 @@ impl Renderer {
         subtree_depth: u32,
         bounds: [f32; 4],
         pop_pos: [f32; 3],
+        surface_r: f32,
+        noise_scale: f32,
+        noise_freq: f32,
+        noise_seed: u32,
+        surface_block: u8,
+        core_block: u8,
     ) {
         self.root_kind = ROOT_KIND_FACE;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
         self.root_face_meta = [face_id, subtree_depth, 0, 0];
         self.root_face_bounds = bounds;
         self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
+        self.root_planet_f32 = [surface_r, noise_scale, noise_freq, 0.0];
+        self.root_planet_u32 = [noise_seed, surface_block as u32, core_block as u32, 0];
         self.write_uniforms();
     }
 
@@ -917,6 +951,8 @@ impl Renderer {
             root_face_meta: self.root_face_meta,
             root_face_bounds: self.root_face_bounds,
             root_face_pop_pos: self.root_face_pop_pos,
+            root_planet_f32: self.root_planet_f32,
+            root_planet_u32: self.root_planet_u32,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
