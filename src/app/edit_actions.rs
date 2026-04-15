@@ -25,8 +25,18 @@ impl App {
     /// size is exactly 3^N cells per face axis. The previous
     /// `anchor - 4` formula was off by one — placements at Layer
     /// N landed at face-subtree depth N-1 ("Layer N+1 block").
+    ///
+    /// Cap at 19 (= face_subtree_depth - 1) to allow editing down
+    /// to Layer 1. CPU walker and `propagate_edit` are precise at
+    /// any depth via path arithmetic; the SHADER's sphere DDA
+    /// currently loses precision for `cell_eps < f32 ULP` at deep
+    /// term_depths, producing sparse-sample artifacts when
+    /// rendering large regions of fine edits. The edit itself is
+    /// correct in the tree — what you place is what's stored — and
+    /// the shader precision fix (frame-local sphere DDA) is the
+    /// next increment of the anchor refactor.
     pub(super) fn cs_edit_depth(&self) -> u32 {
-        ((self.anchor_depth() as i32) - 3).clamp(1, 14) as u32
+        ((self.anchor_depth() as i32) - 3).clamp(1, 19) as u32
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
