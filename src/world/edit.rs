@@ -932,13 +932,24 @@ fn cs_raycast_in_body(
                 });
             }
             // Empty cell — record its full path as the candidate
-            // placement target; refine step to one third of its width.
+            // placement target. Step refinement uses the cell's
+            // nominal width, BUT clamped to a sane minimum so we
+            // don't crawl through huge empty regions one
+            // sub-cell at a time. With max_face_depth deep + the
+            // surface several levels deeper than the cap, every
+            // cap-empty cell is part of a much bigger empty
+            // region and refining to nominal cell width burns the
+            // entire `max_steps` budget before reaching content.
+            // Floor at shell/100 so we always traverse the shell
+            // in O(100) steps regardless of cap depth.
             let mut empty_full = ancestor_path.to_vec();
             empty_full.push((body_id, face_slot));
             empty_full.append(&mut face_path);
             prev_place_path = Some(empty_full);
             let cells_d = 3.0_f32.powi(term_depth as i32);
-            step_world = (shell / cells_d * 0.33).max(eps * 4.0);
+            let nominal = shell / cells_d * 0.33;
+            let coarse_floor = shell * 0.01;
+            step_world = nominal.max(coarse_floor).max(eps * 4.0);
         }
         t += step_world;
     }
