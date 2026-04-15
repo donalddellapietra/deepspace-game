@@ -10,6 +10,11 @@ use wgpu::util::DeviceExt;
 
 use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette};
 
+/// `root_kind` discriminant — must mirror the WGSL `RootKind*`
+/// constants in `ray_march.wgsl`.
+pub const ROOT_KIND_CARTESIAN: u32 = 0;
+pub const ROOT_KIND_BODY: u32 = 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuUniforms {
@@ -19,9 +24,18 @@ pub struct GpuUniforms {
     pub screen_height: f32,
     pub max_depth: u32,
     pub highlight_active: u32,
-    pub _pad: [u32; 2],
+    /// 0 = Cartesian, 1 = CubedSphereBody. Mirrors the `RootKind*`
+    /// constants. When 1, the shader dispatches into sphere DDA at
+    /// start-of-march; the body fills the `[0, 3)³` frame, and
+    /// `root_inner_r`/`root_outer_r` give the body's radii.
+    pub root_kind: u32,
+    pub _pad0: u32,
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
+    /// Body radii (used iff `root_kind == 1`). Stored in the body
+    /// cell's local `[0, 1)` frame; the shader scales by 3.0
+    /// (= WORLD_SIZE) to get shader-frame units.
+    pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
 }
 
 pub struct Renderer {
@@ -43,6 +57,8 @@ pub struct Renderer {
     highlight_active: u32,
     highlight_min: [f32; 4],
     highlight_max: [f32; 4],
+    root_kind: u32,
+    root_radii: [f32; 4],
 }
 
 impl Renderer {
@@ -145,9 +161,11 @@ impl Renderer {
             screen_height: config.height as f32,
             max_depth: 16,
             highlight_active: 0,
-            _pad: [0; 2],
+            root_kind: ROOT_KIND_CARTESIAN,
+            _pad0: 0,
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
+            root_radii: [0.0; 4],
         };
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -252,7 +270,24 @@ impl Renderer {
             root_index, node_count,
             max_depth: 16, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
+            root_kind: ROOT_KIND_CARTESIAN,
+            root_radii: [0.0; 4],
         }
+    }
+
+    /// Set the frame-root NodeKind: Cartesian (default) or
+    /// CubedSphereBody. For Body, also pass radii in the body
+    /// cell's local `[0, 1)` frame.
+    pub fn set_root_kind_cartesian(&mut self) {
+        self.root_kind = ROOT_KIND_CARTESIAN;
+        self.root_radii = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
+        self.root_kind = ROOT_KIND_BODY;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.write_uniforms();
     }
 
     pub fn update_palette(&self, palette: &GpuPalette) {
@@ -377,9 +412,11 @@ impl Renderer {
             screen_height: self.config.height as f32,
             max_depth: self.max_depth,
             highlight_active: self.highlight_active,
-            _pad: [0; 2],
+            root_kind: self.root_kind,
+            _pad0: 0,
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
+            root_radii: self.root_radii,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

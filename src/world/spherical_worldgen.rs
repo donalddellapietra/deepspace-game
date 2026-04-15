@@ -35,7 +35,7 @@ pub fn demo_planet() -> PlanetSetup {
     PlanetSetup {
         inner_r,
         outer_r,
-        depth: 25,
+        depth: 20,
         sdf: Planet {
             center,
             radius: 0.30,

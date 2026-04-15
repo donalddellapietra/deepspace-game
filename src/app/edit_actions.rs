@@ -22,18 +22,16 @@ impl App {
     /// Face-subtree depth at which sphere edits land — picks a
     /// user-visible cell granularity instead of the planet's
     /// deepest sub-pixel resolution. Without this cap the walker
-    /// descends all face-subtree levels and breaks/places modify
-    /// cells smaller than a pixel — they succeed but are invisible.
-    /// Mirrors the old `cs_edit_depth = 4 + (15 - zoom_level)`
-    /// formula, clamped to `[1, 18]`.
+    /// descends all 20 face-subtree levels and breaks/places
+    /// modify cells smaller than a pixel — they succeed but are
+    /// invisible. Mirrors the old `cs_edit_depth = 4 + (15 -
+    /// zoom_level)` formula, clamped to `[1, 14]`.
     ///
-    /// Cap raised from 14 → 18 in the Kahan-precision pass: face
-    /// DDA boundaries now come from incremental Kahan-compensated
-    /// accumulation in `walk_face_subtree`, so the precision wall
-    /// is at ~1 ULP regardless of depth (was ~depth ULPs). Reliable
-    /// through depth 18; degrades past 20.
+    /// The 14 cap is tactical and disappears with the unified
+    /// driver refactor (camera-precision via virtual-root + face
+    /// DDA in cell-local frames).
     pub(super) fn cs_edit_depth(&self) -> u32 {
-        ((self.anchor_depth() as i32) - 4).clamp(1, 18) as u32
+        ((self.anchor_depth() as i32) - 4).clamp(1, 14) as u32
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
@@ -134,15 +132,26 @@ impl App {
 
     /// Pack the tree subtree at the current render frame and push
     /// it (along with the parallel `node_kinds` buffer) to the GPU.
+    /// Also updates the renderer's root_kind dispatch so the shader
+    /// knows whether to enter Cartesian DDA or sphere DDA.
     pub(super) fn upload_tree_lod(&mut self) {
         let (frame, frame_root) = self.render_frame();
         let cam_local = self.camera.position.in_frame(&frame);
         let (tree_data, node_kinds, root_index) = gpu::pack_tree_lod(
             &self.world.library, frame_root, cam_local, 1440.0, 1.2,
         );
+        let frame_kind = self.render_frame_kind();
         if let Some(renderer) = &mut self.renderer {
             renderer.update_tree(&tree_data, &node_kinds, root_index);
             renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
+            match frame_kind {
+                crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                    renderer.set_root_kind_body(inner_r, outer_r);
+                }
+                _ => {
+                    renderer.set_root_kind_cartesian();
+                }
+            }
         }
     }
 
@@ -160,13 +169,51 @@ impl App {
             camera_pos, ray_dir, self.edit_depth(),
             self.cs_edit_depth(),
         );
-        let aabb = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
+        let aabb_world = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
+        // Transform AABB from world coords to frame-local coords.
+        // Shader expects highlight in the same frame as `camera.pos`.
+        let (frame, _) = self.render_frame();
+        let (frame_origin, frame_size) = frame_origin_size_world(&frame);
+        let scale = crate::world::anchor::WORLD_SIZE / frame_size;
+        let aabb = aabb_world.map(|(mn, mx)| {
+            (
+                [
+                    (mn[0] - frame_origin[0]) * scale,
+                    (mn[1] - frame_origin[1]) * scale,
+                    (mn[2] - frame_origin[2]) * scale,
+                ],
+                [
+                    (mx[0] - frame_origin[0]) * scale,
+                    (mx[1] - frame_origin[1]) * scale,
+                    (mx[2] - frame_origin[2]) * scale,
+                ],
+            )
+        });
         if let Some((mn, mx)) = &aabb {
-            eprintln!("highlight: min={:?} max={:?} size={:?}",
+            eprintln!("highlight (frame-local): min={:?} max={:?} size={:?}",
                 mn, mx, [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]]);
         }
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(aabb);
         }
     }
+}
+
+/// World-space origin and size of the cell at `path`. Origin is the
+/// world XYZ of the cell's `(0, 0, 0)` corner; size is its side
+/// length in world units.
+fn frame_origin_size_world(path: &crate::world::anchor::Path) -> ([f32; 3], f32) {
+    use crate::world::anchor::WORLD_SIZE;
+    use crate::world::tree::slot_coords;
+    let mut origin = [0.0f32; 3];
+    let mut size = WORLD_SIZE;
+    for k in 0..path.depth() as usize {
+        let (sx, sy, sz) = slot_coords(path.slot(k) as usize);
+        let child = size / 3.0;
+        origin[0] += sx as f32 * child;
+        origin[1] += sy as f32 * child;
+        origin[2] += sz as f32 * child;
+        size = child;
+    }
+    (origin, size)
 }

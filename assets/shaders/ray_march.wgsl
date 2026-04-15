@@ -28,11 +28,20 @@ struct Uniforms {
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
+    /// 0 = Cartesian (run main DDA from frame root), 1 = sphere
+    /// body (body fills [0, 3) frame; dispatch directly to
+    /// sphere_in_cell at start-of-march).
+    root_kind: u32,
     _pad0: u32,
-    _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
+    /// Used when root_kind == 1.
+    root_radii: vec4<f32>,
 }
+
+const ROOT_KIND_CARTESIAN: u32 = 0u;
+const ROOT_KIND_BODY: u32 = 1u;
 
 struct NodeKindGpu {
     kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
@@ -175,7 +184,9 @@ struct FaceWalkResult {
 // are accumulated via Kahan compensation so cumulative error stays
 // at ~1 ULP regardless of depth (vs. ~depth ULPs naive).
 //
-// MAX_FACE_WALK_DEPTH=30: matches the lifted face subtree cap.
+// Loop bound stays at 22 to match the demo planet's face subtree
+// depth (20 + 2 levels of overhead for body + face root). The bound
+// disappears entirely with the unified-driver refactor.
 fn walk_face_subtree(body_node_idx: u32, face: u32,
                      un_in: f32, vn_in: f32, rn_in: f32) -> FaceWalkResult {
     var result: FaceWalkResult;
@@ -207,7 +218,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     var r_sum: f32 = 0.0; var r_comp: f32 = 0.0;
     var size: f32 = 1.0;
 
-    for (var d: u32 = 2u; d <= 30u; d = d + 1u) {
+    for (var d: u32 = 2u; d <= 22u; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -257,7 +268,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
     // Hit max depth without terminal: report deepest LOD bounds.
     result.block = 0u;
-    result.depth = 30u;
+    result.depth = 22u;
     result.u_lo = u_sum + u_comp;
     result.v_lo = v_sum + v_comp;
     result.r_lo = r_sum + r_comp;
@@ -427,6 +438,22 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+
+    // Frame-root dispatch. When the render frame is a sphere body,
+    // the body fills the [0, 3)³ shader frame and we go straight
+    // into sphere_in_cell — there is no Cartesian DDA to run
+    // because the body's 27 children are interpreted by NodeKind,
+    // not as XYZ cells.
+    if uniforms.root_kind == ROOT_KIND_BODY {
+        let body_origin = vec3<f32>(0.0);
+        let body_size = 3.0;  // body fills the frame
+        let inner_r = uniforms.root_radii.x;
+        let outer_r = uniforms.root_radii.y;
+        return sphere_in_cell(
+            uniforms.root_index, body_origin, body_size,
+            inner_r, outer_r, ray_origin, ray_dir,
+        );
+    }
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
