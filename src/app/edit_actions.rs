@@ -130,9 +130,25 @@ impl App {
     /// Camera XYZ in the render root's local `[0, 3)³` frame.
     /// NodeKind-aware: passing through a body ancestor reconstructs
     /// the cartesian XYZ inside the body cell via sphere geometry.
+    /// Used ONLY for the GPU camera uniform — the shader renders in
+    /// the render-root's frame.
     pub(super) fn camera_pos_in_render_frame(&self) -> [f32; 3] {
         self.camera.position.pos_in_ancestor_frame_in_tree(
             self.render_root_depth(),
+            &self.world.library,
+            self.world.root,
+        )
+    }
+
+    /// Camera XYZ in the **tree root's** `[0, 3)³` world frame.
+    /// CPU-side raycasts (`planet.raycast`, `edit::cpu_raycast`) all
+    /// operate in world coordinates because they reach the planet's
+    /// `center` and the tree's [0, 3)³ root span directly. Passing
+    /// render-frame coords here makes the ray miss everything when
+    /// `render_root_depth > 0`.
+    pub(super) fn camera_pos_world(&self) -> [f32; 3] {
+        self.camera.position.pos_in_ancestor_frame_in_tree(
+            0,
             &self.world.library,
             self.world.root,
         )
@@ -179,7 +195,7 @@ impl App {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
         let zoom_level = self.zoom_level();
-        let camera_pos = self.camera_pos_in_render_frame();
+        let camera_pos = self.camera_pos_world();
 
         // Spherical-tree break: clear the targeted subtree if the
         // planet is hit closer than any Cartesian tree block.
@@ -197,7 +213,7 @@ impl App {
         let hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera_pos_in_render_frame(),
+            self.camera_pos_world(),
             ray_dir,
             self.edit_depth(),
         );
@@ -244,7 +260,7 @@ impl App {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
         let zoom_level = self.zoom_level();
-        let camera_pos = self.camera_pos_in_render_frame();
+        let camera_pos = self.camera_pos_world();
 
         // Spherical place: fill the cell adjacent to the first solid
         // cell with the active hotbar block. Meshes fall through to
@@ -266,7 +282,7 @@ impl App {
         let hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera_pos_in_render_frame(),
+            self.camera_pos_world(),
             ray_dir,
             self.edit_depth(),
         );
@@ -374,21 +390,19 @@ impl App {
             return;
         }
         let ray_dir = self.camera.forward();
+        let cam_world = self.camera_pos_world();
         let tree_hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera_pos_in_render_frame(),
+            cam_world,
             ray_dir,
             self.edit_depth(),
         );
         let tree_t = tree_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
 
-        // Cubed-sphere cursor. Highlight depth comes from the same
-        // `cs_edit_depth` the break path uses, so what you see is
-        // exactly what you break.
         let cs_depth = editing::cs_edit_depth(self.cs_planet.as_ref(), self.zoom_level());
         let cs_hit = self.cs_planet.as_ref().and_then(|p| {
-            p.raycast(&self.world.library, self.camera_pos_in_render_frame(), ray_dir, cs_depth)
+            p.raycast(&self.world.library, cam_world, ray_dir, cs_depth)
         });
         let cs_t = cs_hit.as_ref().map(|h| h.t).unwrap_or(f32::INFINITY);
 
