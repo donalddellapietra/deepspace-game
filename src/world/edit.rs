@@ -856,24 +856,11 @@ fn walk_face_subtree_with_path(
             Child::Empty => return Some((0, d, path)),
             Child::Block(b) => return Some((b, d, path)),
             Child::Node(nid) => {
-                // Mirror the GPU shader's behavior: pack-time
-                // flattens uniform-content subtrees so the GPU
-                // walker sees them as a single tag=1/0 cell at
-                // this depth. The CPU walker stops here too —
-                // descending further would target an
-                // indistinguishable sub-cell, breaking the
-                // assumption that "what the user clicks is what
-                // gets broken."
-                if let Some(child_node) = library.get(nid) {
-                    if child_node.uniform_type != UNIFORM_MIXED {
-                        let block = if child_node.uniform_type == UNIFORM_EMPTY {
-                            0
-                        } else {
-                            child_node.uniform_type
-                        };
-                        return Some((block, d, path));
-                    }
-                }
+                // Descend fully down to `limit` even through
+                // uniform-content subtrees — this is how zoom
+                // reveals finer edit cells inside the planet's
+                // uniform interior. Propagate_edit + library
+                // dedup handle COW-splitting the path on write.
                 if d == limit {
                     // Hit the depth cap mid-descent on a mixed
                     // child. Report the subtree's representative
