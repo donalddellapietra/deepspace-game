@@ -284,6 +284,10 @@ pub fn cpu_raycast_with_face_depth(
                 }
 
                 if (depth as u32 + 1) >= max_depth {
+                    eprintln!(
+                        "  cpu_raycast: max_depth check depth={} max_depth={} child_id={} rep_block={} node_id={} slot={}",
+                        depth, max_depth, child_id, child_node.representative_block, node_id, slot,
+                    );
                     // At max depth, treat node as solid — unless its
                     // subtree is all-empty (dominant_block == 255).
                     if child_node.representative_block == 255 {
@@ -1320,6 +1324,41 @@ mod tests {
             &frame_path, cam, dir, 8, 6,
         );
         // Just verify no panic — covered the ascent code.
+    }
+
+    #[test]
+    fn planet_world_raycast_hits_sphere() {
+        // Reproduce the user's bug: at shallow anchor (anchor=4),
+        // edit_depth=3, cs_edit_depth=1, frame_path=[16]. Cursor
+        // ray pointing down at the planet should produce a sphere
+        // hit (face=4), not a Cartesian fallback (face=2).
+        use crate::world::worldgen::generate_world;
+        use crate::world::spherical_worldgen::{demo_planet, install_at_root_center};
+
+        let mut world = generate_world();
+        let setup = demo_planet();
+        let (new_root, _planet_path) =
+            install_at_root_center(&mut world.library, world.root, &setup);
+        world.swap_root(new_root);
+
+        let cam_local = [1.5, 0.0, 1.5];
+        let ray_dir = [0.0, -0.9320391, -0.3623577];
+        let frame_path = [16u8];
+        let edit_depth = 3u32;
+        let cs_edit_depth = 1u32;
+
+        let hit = cpu_raycast_in_frame(
+            &world.library, world.root,
+            &frame_path, cam_local, ray_dir,
+            edit_depth, cs_edit_depth,
+        );
+        eprintln!("planet_world_raycast hit = {:?}",
+            hit.as_ref().map(|h| (h.path.len(), h.face, h.t,
+                h.place_path.as_ref().map(|p| p.len()))));
+        assert!(hit.is_some(), "ray should hit planet");
+        let h = hit.unwrap();
+        assert_eq!(h.face, 4,
+            "should be sphere hit (face=4), not Cartesian fallback");
     }
 
     #[test]
