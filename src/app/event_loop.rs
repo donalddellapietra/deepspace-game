@@ -9,8 +9,6 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::renderer::Renderer;
-use crate::world::anchor::WorldPos;
-use crate::world::edit;
 use crate::world::gpu;
 
 use super::App;
@@ -103,70 +101,27 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// Mouse-wheel zoom: change the camera's anchor depth by one,
-    /// then translate the camera along its forward ray so the block
-    /// under the crosshair stays at the same apparent size.
+    /// Mouse-wheel zoom: change the camera's anchor depth by one.
+    /// Pure anchor mutation via `WorldPos::zoom_in` / `zoom_out` —
+    /// the world-space position of the camera is preserved exactly.
+    /// No dolly, no translation; only the depth scale changes.
     fn handle_scroll_zoom(&mut self, delta: winit::event::MouseScrollDelta) {
         if self.frozen { return; }
         let y = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => y,
             winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
         };
+        // Positive y = scroll up = zoom in (deeper anchor).
         let step: i32 = if y > 0.0 { 1 } else if y < 0.0 { -1 } else { return };
-        let new_anchor_depth = (self.anchor_depth() as i32 + step)
-            .clamp(1, (self.tree_depth as i32).max(1));
-        if new_anchor_depth == self.anchor_depth() as i32 { return; }
-
-        // Dolly anchor: world-space point under the crosshair. Try
-        // the Cartesian tree first, then the cubed-sphere planet.
-        // Without the sphere fallback, an empty tree produces no
-        // hit and the dolly uses a phantom "10 cell-widths ahead"
-        // point; at shallow anchors (big cells) that pushes the
-        // camera well outside the root cell, where `from_world_xyz`
-        // clamps to the root boundary and the resulting view no
-        // longer intersects the planet → blue screen.
-        let cam_world = self.camera.world_pos_f32();
-        let ray_dir = self.camera.forward();
-        let tree_t = edit::cpu_raycast(
-            &self.world.library,
-            self.world.root,
-            cam_world,
-            ray_dir,
-            self.edit_depth(),
-        ).map(|h| h.t);
-        let cs_t = self.cs_planet.as_ref().and_then(|p| {
-            p.raycast(&self.world.library, cam_world, ray_dir, p.depth.min(4))
-                .map(|h| h.t)
-        });
-        let hit_t = match (tree_t, cs_t) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        let anchor_world = if let Some(t) = hit_t {
-            [
-                cam_world[0] + ray_dir[0] * t,
-                cam_world[1] + ray_dir[1] * t,
-                cam_world[2] + ray_dir[2] * t,
-            ]
+        let cur = self.anchor_depth() as i32;
+        let max_depth = (self.tree_depth as i32).max(1);
+        let new_depth = (cur + step).clamp(1, max_depth);
+        if new_depth == cur { return; }
+        if step > 0 {
+            self.camera.position.zoom_in();
         } else {
-            let d = self.camera.cell_size() * 10.0;
-            [
-                cam_world[0] + ray_dir[0] * d,
-                cam_world[1] + ray_dir[1] * d,
-                cam_world[2] + ray_dir[2] * d,
-            ]
-        };
-
-        let scale = 3.0f32.powi(-step);
-        let new_cam_world = [
-            anchor_world[0] + (cam_world[0] - anchor_world[0]) * scale,
-            anchor_world[1] + (cam_world[1] - anchor_world[1]) * scale,
-            anchor_world[2] + (cam_world[2] - anchor_world[2]) * scale,
-        ];
-        self.camera.position = WorldPos::from_world_xyz(new_cam_world, new_anchor_depth as u8);
-
+            self.camera.position.zoom_out();
+        }
         self.apply_zoom();
     }
 
