@@ -8,26 +8,24 @@ use crate::world::tree::Child;
 
 /// Depth at which cubed-sphere edits and highlighting operate.
 ///
-/// Scales with zoom around a visually-sensible base: default zoom
-/// highlights a cell whose on-screen size feels like a "block," and
-/// each scroll-in or scroll-out drops or adds one level of 3× finer
-/// or coarser cells. Capped below `f32` integer-precision so the
-/// shader's `floor(un * 3^depth) == hl_i` comparison stays exact.
-/// Past planet.depth = 14 the shader can't distinguish adjacent
-/// cells reliably (2^24 ≈ 1.6e7; 3^14 ≈ 4.8e6 — just under).
+/// Scales with zoom: default zoom highlights a cell whose on-screen
+/// size feels block-sized, each scroll-in/out drops or adds one
+/// level of 3× finer or coarser cells. The depth is bounded only by
+/// the planet's actual subtree depth — there's no lower cap. The
+/// shader-side highlight `floor(un * 3^depth) == hl_i` compare may
+/// alias for `depth > 14` (f32 integer precision wall at 2^24), but
+/// that's a wireframe-rendering issue, not an editing-correctness
+/// issue: `set_cell_at_depth` works on integer face/u/v/r indices
+/// and is precision-stable at any depth. The CPU raycast is true-
+/// DDA so it doesn't have the fixed-step-budget failure mode the
+/// pre-DDA implementation hit at deep zoom.
 pub fn cs_edit_depth(cs_planet: Option<&SphericalPlanet>, zoom_level: i32) -> u32 {
     let planet_depth = cs_planet.map(|p| p.depth).unwrap_or(0);
     if planet_depth == 0 { return 0; }
-    // Default base depth: cells at ~1/81 of a face edge — visible
-    // block-sized on the shell, roughly cubic in all three axes.
     const BASE_DEPTH: i32 = 4;
     const BASELINE_ZOOM: i32 = 15;
-    // Shader-safe upper bound on 3^depth so f32 integer compares stay exact.
-    const SHADER_SAFE_MAX: i32 = 14;
-    // Scroll in (zoom_level < 15) → finer; scroll out → coarser.
     let d = BASE_DEPTH + (BASELINE_ZOOM - zoom_level);
-    let max_d = (planet_depth as i32).min(SHADER_SAFE_MAX);
-    d.clamp(1, max_d) as u32
+    d.clamp(1, planet_depth as i32) as u32
 }
 
 /// Raycast the planet at the current edit depth AND ensure the

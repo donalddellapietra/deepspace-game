@@ -584,58 +584,195 @@ impl SphericalPlanet {
         dir: Vec3,
         highlight_depth: u32,
     ) -> Option<CsRayHit> {
-        let oc = sdf::sub(origin, self.center);
-        let b = sdf::dot(oc, dir);
-        let c = sdf::dot(oc, oc) - self.outer_r * self.outer_r;
-        let disc = b * b - c;
+        // True cell-by-cell DDA in f64: walks the cubed-sphere shell
+        // one analytic boundary at a time (planes for u/v, spheres
+        // for r) — same algorithm the WGSL `march_sphere_body` uses,
+        // ported to the CPU. Step count = O(cells the ray crosses),
+        // not O(shell / step_size), so depth 20 takes ~hundreds of
+        // steps instead of millions. f64 throughout the parameter
+        // arithmetic keeps the cell boundaries distinguishable past
+        // the f32 precision wall the old fixed-step march hit.
+        let center = [self.center[0] as f64, self.center[1] as f64, self.center[2] as f64];
+        let origin_d = [origin[0] as f64, origin[1] as f64, origin[2] as f64];
+        let dir_d = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
+        let outer_r = self.outer_r as f64;
+        let inner_r = self.inner_r as f64;
+        let shell = outer_r - inner_r;
+        if shell <= 0.0 { return None; }
+
+        let oc = [origin_d[0] - center[0], origin_d[1] - center[1], origin_d[2] - center[2]];
+        let b = oc[0] * dir_d[0] + oc[1] * dir_d[1] + oc[2] * dir_d[2];
+        let c_outer = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - outer_r * outer_r;
+        let disc = b * b - c_outer;
         if disc <= 0.0 { return None; }
         let sq = disc.sqrt();
         let t_enter = (-b - sq).max(0.0);
         let t_exit = -b + sq;
         if t_exit <= 0.0 { return None; }
 
-        let shell = self.outer_r - self.inner_r;
         let d_eff = highlight_depth.clamp(1, self.depth);
-        // Cap step-size resolution at 3^8 = 6561 per axis. Deeper
-        // subtrees (depth 20) don't need a 3^20-granularity CPU
-        // raycast; the cursor can't visibly distinguish individual
-        // sub-picometer cells. The subtree walker still samples at
-        // the requested `d_eff` — only the ray's stride is capped,
-        // and a feature smaller than the step that the walker does
-        // see will still register when its cell is sampled.
-        let step_cells = 3u32.pow(d_eff.min(8)) as f32;
-        let step = (shell / step_cells) * 0.5;
-        if step <= 0.0 { return None; }
-        let cells_at_depth = 3u32.pow(d_eff) as f32;
+        let cells_at_depth = 3u32.pow(d_eff) as f64;
         let cells_max = cells_at_depth as u32 - 1;
-        let mut t = t_enter + step * 0.25;
+        let eps = (shell * 1e-9).max(1e-15);
+
+        let mut t = t_enter + eps;
         let mut prev: Option<(Face, u32, u32, u32)> = None;
-        let max_steps = 20_000usize;
-        for _ in 0..max_steps {
+        // Cell-DDA: each iteration samples one cell, then steps to
+        // the next analytic boundary. Max iterations bounded by the
+        // sphere-traverse chord at the finest meaningful resolution;
+        // 100k is well above what any visible ray needs.
+        for _ in 0..100_000usize {
             if t >= t_exit { break; }
-            let p = sdf::add(origin, sdf::scale(dir, t));
-            if let Some((face, un, vn, rn)) = self.world_to_normalized(p) {
-                let (block, _) = self.sample_subtree(lib, face, un, vn, rn, d_eff);
-                let iu = ((un * cells_at_depth).floor() as u32).min(cells_max);
-                let iv = ((vn * cells_at_depth).floor() as u32).min(cells_max);
-                let ir = ((rn * cells_at_depth).floor() as u32).min(cells_max);
-                if block != 0 {
-                    return Some(CsRayHit {
-                        t, face, iu, iv, ir, depth: d_eff, prev,
-                    });
-                }
-                // Update prev only when we actually move to a
-                // different cell — otherwise a sub-step oversample
-                // would keep overwriting prev with the same coords.
-                let new_prev = Some((face, iu, iv, ir));
-                if new_prev != prev {
-                    prev = new_prev;
-                }
+
+            let p = [
+                origin_d[0] + dir_d[0] * t,
+                origin_d[1] + dir_d[1] * t,
+                origin_d[2] + dir_d[2] * t,
+            ];
+            let local = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+            let r = (local[0] * local[0] + local[1] * local[1] + local[2] * local[2]).sqrt();
+            if r >= outer_r || r < inner_r { break; }
+
+            let inv_r = 1.0 / r;
+            let n = [local[0] * inv_r, local[1] * inv_r, local[2] * inv_r];
+            let face = pick_face_f64(n);
+            let (n_axis, u_axis, v_axis) = face_basis_f64(face);
+            let axis_dot = n[0] * n_axis[0] + n[1] * n_axis[1] + n[2] * n_axis[2];
+            let cube_u = (n[0] * u_axis[0] + n[1] * u_axis[1] + n[2] * u_axis[2]) / axis_dot;
+            let cube_v = (n[0] * v_axis[0] + n[1] * v_axis[1] + n[2] * v_axis[2]) / axis_dot;
+            let u_ea = cube_to_ea_f64(cube_u);
+            let v_ea = cube_to_ea_f64(cube_v);
+
+            let un = ((u_ea + 1.0) * 0.5).clamp(0.0, 1.0 - 1e-9);
+            let vn = ((v_ea + 1.0) * 0.5).clamp(0.0, 1.0 - 1e-9);
+            let rn = ((r - inner_r) / shell).clamp(0.0, 1.0 - 1e-9);
+
+            let iu = ((un * cells_at_depth) as u32).min(cells_max);
+            let iv = ((vn * cells_at_depth) as u32).min(cells_max);
+            let ir = ((rn * cells_at_depth) as u32).min(cells_max);
+
+            // Sample the face subtree at this cell. `sample_subtree`
+            // accepts f32; convert. Precision is fine here — we're
+            // sampling a single cell, not accumulating across cells.
+            let (block, _) = self.sample_subtree(
+                lib,
+                face,
+                un as f32, vn as f32, rn as f32,
+                d_eff,
+            );
+            if block != 0 {
+                return Some(CsRayHit {
+                    t: t as f32, face, iu, iv, ir, depth: d_eff, prev,
+                });
             }
-            t += step;
+            let here = (face, iu, iv, ir);
+            if Some(here) != prev {
+                prev = Some(here);
+            }
+
+            // Compute the t at which the ray exits this cell. Six
+            // candidate boundaries: u_lo, u_hi, v_lo, v_hi (planes
+            // through center), r_lo, r_hi (spheres around center).
+            // Pick the smallest t > current.
+            let cells_d = cells_at_depth;
+            let u_lo_ea = ((iu       as f64) / cells_d) * 2.0 - 1.0;
+            let u_hi_ea = ((iu as f64 + 1.0) / cells_d) * 2.0 - 1.0;
+            let v_lo_ea = ((iv       as f64) / cells_d) * 2.0 - 1.0;
+            let v_hi_ea = ((iv as f64 + 1.0) / cells_d) * 2.0 - 1.0;
+            let r_lo = inner_r + (ir       as f64 / cells_d) * shell;
+            let r_hi = inner_r + ((ir + 1) as f64 / cells_d) * shell;
+
+            let k_u_lo = ea_to_cube_f64(u_lo_ea);
+            let k_u_hi = ea_to_cube_f64(u_hi_ea);
+            let k_v_lo = ea_to_cube_f64(v_lo_ea);
+            let k_v_hi = ea_to_cube_f64(v_hi_ea);
+
+            let n_u_lo = vec_sub(u_axis, vec_scale(n_axis, k_u_lo));
+            let n_u_hi = vec_sub(u_axis, vec_scale(n_axis, k_u_hi));
+            let n_v_lo = vec_sub(v_axis, vec_scale(n_axis, k_v_lo));
+            let n_v_hi = vec_sub(v_axis, vec_scale(n_axis, k_v_hi));
+
+            let mut t_next = t_exit;
+            t_next = min_after(t_next, ray_plane_t_f64(origin_d, dir_d, center, n_u_lo), t);
+            t_next = min_after(t_next, ray_plane_t_f64(origin_d, dir_d, center, n_u_hi), t);
+            t_next = min_after(t_next, ray_plane_t_f64(origin_d, dir_d, center, n_v_lo), t);
+            t_next = min_after(t_next, ray_plane_t_f64(origin_d, dir_d, center, n_v_hi), t);
+            t_next = min_after(t_next, ray_sphere_after_f64(origin_d, dir_d, center, r_lo, t), t);
+            t_next = min_after(t_next, ray_sphere_after_f64(origin_d, dir_d, center, r_hi, t), t);
+
+            if t_next >= t_exit { break; }
+            t = t_next + eps;
         }
         None
     }
+}
+
+// ───────────────────────── f64 helpers for the CPU sphere DDA
+
+fn pick_face_f64(n: [f64; 3]) -> Face {
+    let ax = n[0].abs(); let ay = n[1].abs(); let az = n[2].abs();
+    if ax >= ay && ax >= az {
+        if n[0] > 0.0 { Face::PosX } else { Face::NegX }
+    } else if ay >= az {
+        if n[1] > 0.0 { Face::PosY } else { Face::NegY }
+    } else if n[2] > 0.0 { Face::PosZ } else { Face::NegZ }
+}
+
+/// Returns (n_axis, u_axis, v_axis) for the given face — same
+/// convention as `Face::tangents` but in f64.
+fn face_basis_f64(face: Face) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    match face {
+        Face::PosX => ([ 1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+        Face::NegX => ([-1.0, 0.0, 0.0], [0.0, 0.0,  1.0], [0.0, 1.0, 0.0]),
+        Face::PosY => ([0.0,  1.0, 0.0], [1.0, 0.0,  0.0], [0.0, 0.0, -1.0]),
+        Face::NegY => ([0.0, -1.0, 0.0], [1.0, 0.0,  0.0], [0.0, 0.0,  1.0]),
+        Face::PosZ => ([0.0, 0.0,  1.0], [1.0, 0.0,  0.0], [0.0, 1.0, 0.0]),
+        Face::NegZ => ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    }
+}
+
+#[inline]
+fn cube_to_ea_f64(c: f64) -> f64 {
+    c.atan() * (4.0 / std::f64::consts::PI)
+}
+
+#[inline]
+fn ea_to_cube_f64(e: f64) -> f64 {
+    (e * std::f64::consts::FRAC_PI_4).tan()
+}
+
+#[inline]
+fn vec_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline]
+fn vec_scale(a: [f64; 3], s: f64) -> [f64; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+fn ray_plane_t_f64(origin: [f64; 3], dir: [f64; 3], through: [f64; 3], plane_n: [f64; 3]) -> f64 {
+    let denom = dir[0] * plane_n[0] + dir[1] * plane_n[1] + dir[2] * plane_n[2];
+    if denom.abs() < 1e-20 { return -1.0; }
+    let oc = vec_sub(origin, through);
+    -(oc[0] * plane_n[0] + oc[1] * plane_n[1] + oc[2] * plane_n[2]) / denom
+}
+
+fn ray_sphere_after_f64(origin: [f64; 3], dir: [f64; 3], center: [f64; 3], radius: f64, after: f64) -> f64 {
+    let oc = vec_sub(origin, center);
+    let b = oc[0] * dir[0] + oc[1] * dir[1] + oc[2] * dir[2];
+    let c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 { return -1.0; }
+    let sq = disc.sqrt();
+    let t0 = -b - sq;
+    let t1 = -b + sq;
+    if t0 > after { t0 } else if t1 > after { t1 } else { -1.0 }
+}
+
+#[inline]
+fn min_after(best: f64, cand: f64, cur: f64) -> f64 {
+    if cand > cur && cand < best { cand } else { best }
 }
 
 /// Output of a cursor raycast against the planet.
