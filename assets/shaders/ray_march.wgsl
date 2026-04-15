@@ -639,18 +639,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let hb = ray_box(camera.pos, h_inv_dir, h_min, h_max);
         if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
             let t = max(hb.t_enter, 0.0);
-            if t <= result.t + h_size.x * 0.01 {
+            // Visibility test: highlight box must be at-or-near the
+            // rendered hit. Generous tolerance so bulged-voxel
+            // cells (where the actual surface may sit in front of
+            // the AABB face) still register.
+            if t <= result.t + max(h_size.x * 0.5, 0.001) {
                 let hit_pos = camera.pos + ray_dir * t;
                 let from_min = hit_pos - h_min;
                 let from_max = h_max - hit_pos;
+                // Edge band: thicker line so wireframe is visible
+                // even for screen-tiny cells (a few pixels across).
                 let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
-                let ew = max(pixel_world * 1.5, h_size.x * 0.003);
+                let ew = max(pixel_world * 3.0, h_size.x * 0.08);
                 let near_x = from_min.x < ew || from_max.x < ew;
                 let near_y = from_min.y < ew || from_max.y < ew;
                 let near_z = from_min.z < ew || from_max.z < ew;
                 let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
                 if edge_count >= 2u {
-                    color = mix(color, vec3<f32>(0.1, 0.1, 0.1), 0.7);
+                    // Bright yellow outline so it's unmistakable.
+                    color = mix(color, vec3<f32>(1.0, 0.95, 0.2), 0.85);
                 }
             }
         }
