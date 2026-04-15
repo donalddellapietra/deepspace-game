@@ -24,6 +24,11 @@ pub struct GpuUniforms {
     pub _pad: [u32; 2],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
+    /// Camera position in the highlight AABB's local frame. The
+    /// AABB and this camera share the SAME frame, so the ray-box
+    /// test is layer-local f32 — precision bounded by WORLD_SIZE
+    /// regardless of the camera's anchor depth.
+    pub highlight_camera: [f32; 4],
     pub planet: GpuPlanet,
     pub ribbon: [GpuRibbonFrame; MAX_RIBBON_FRAMES],
 }
@@ -46,6 +51,7 @@ pub struct Renderer {
     highlight_active: u32,
     highlight_min: [f32; 4],
     highlight_max: [f32; 4],
+    highlight_camera: [f32; 4],
     ribbon_count: u32,
     ribbon: [GpuRibbonFrame; MAX_RIBBON_FRAMES],
     planet: GpuPlanet,
@@ -166,6 +172,7 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
+            highlight_camera: [0.0; 4],
             planet,
             ribbon,
         };
@@ -272,6 +279,7 @@ impl Renderer {
             node_count,
             max_depth: 16, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
+            highlight_camera: [0.0; 4],
             ribbon_count, ribbon,
             planet,
         }
@@ -298,12 +306,22 @@ impl Renderer {
         self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
     }
 
-    pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {
+    /// Set the highlight AABB **and** the camera position in the
+    /// AABB's local frame. Both must be in the SAME frame — that's
+    /// what makes the shader's ray-box test precision-safe at deep
+    /// anchor. The caller builds the frame via `WorldPos::in_frame`
+    /// and `edit::hit_aabb(..., frame_depth)`.
+    pub fn set_highlight(
+        &mut self,
+        aabb: Option<([f32; 3], [f32; 3])>,
+        camera_in_frame: [f32; 3],
+    ) {
         match aabb {
             Some((min, max)) => {
                 self.highlight_active = 1;
                 self.highlight_min = [min[0], min[1], min[2], 0.0];
                 self.highlight_max = [max[0], max[1], max[2], 0.0];
+                self.highlight_camera = [camera_in_frame[0], camera_in_frame[1], camera_in_frame[2], 0.0];
             }
             None => { self.highlight_active = 0; }
         }
@@ -425,6 +443,7 @@ impl Renderer {
             _pad: [0; 2],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
+            highlight_camera: self.highlight_camera,
             planet: self.planet,
             ribbon: self.ribbon,
         };

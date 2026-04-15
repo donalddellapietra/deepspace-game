@@ -403,7 +403,9 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
     }
 
     // Cross-node: compute world-space target center and look up from root.
-    let (aabb_min, aabb_max) = hit_aabb(&world.library, hit);
+    // Frame-depth 0 keeps the world-root interpretation that
+    // `place_child_at_point` expects for its root-based walk.
+    let (aabb_min, aabb_max) = hit_aabb(&world.library, hit, 0);
     let cell_size = aabb_max[0] - aabb_min[0];
     let target = [
         (aabb_min[0] + aabb_max[0]) * 0.5 + dx as f32 * cell_size,
@@ -1031,21 +1033,38 @@ fn walk_face_subtree_with_path(
     Some((0, limit, path))
 }
 
-/// Compute the world-space AABB of the block at the hit location.
+/// Compute the hit block's AABB in a given frame's local coords.
+///
+/// `frame_depth` is the number of ancestor slots in `hit.path` that
+/// define the frame; they are SKIPPED. The AABB is returned in that
+/// frame's `[0, WORLD_SIZE)³` local coordinate system — the same
+/// frame that a `RibbonFrame` at `anchor_path.prefix(frame_depth)`
+/// uses. Precision is independent of how deep the frame sits in the
+/// world tree because nothing is accumulated at world-root scale.
+///
+/// Set `frame_depth = 0` for the legacy root-frame AABB.
 ///
 /// Walks the path Cartesian-style until it encounters a
 /// `NodeKind::CubedSphereBody` ancestor; from there the path
 /// continues into a face subtree where cell indices are
-/// `(u_slot, v_slot, r_slot)` in cube-sphere coords. The bulged
-/// voxel's world AABB is computed from `cubesphere::block_corners`
-/// at the cell's `(face, u, v, r)` extents.
-pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+/// `(u_slot, v_slot, r_slot)`.
+pub fn hit_aabb(
+    library: &NodeLibrary,
+    hit: &HitInfo,
+    frame_depth: usize,
+) -> ([f32; 3], [f32; 3]) {
     use super::cubesphere::{block_corners, Face, FACE_SLOTS};
 
+    // Frame origin = [0, 0, 0] in its OWN local coord system; cell
+    // size starts at WORLD_SIZE / 3 = 1.0 (root of the frame's
+    // 3³ child grid). The skipped ancestor slots are NOT walked —
+    // this is exactly what makes the output frame-local.
     let mut origin = [0.0f32; 3];
     let mut cell_size = 1.0f32;
 
-    for (i, &(node_id, slot)) in hit.path.iter().enumerate() {
+    let skip = frame_depth.min(hit.path.len());
+    for (i_rel, &(node_id, slot)) in hit.path[skip..].iter().enumerate() {
+        let i = i_rel + skip;
         let node = match library.get(node_id) {
             Some(n) => n,
             None => break,
@@ -1385,7 +1404,7 @@ mod tests {
         );
         assert!(hit.is_some(), "Should hit ground");
         let hit = hit.unwrap();
-        let (aabb_min, aabb_max) = hit_aabb(&world.library, &hit);
+        let (aabb_min, aabb_max) = hit_aabb(&world.library, &hit, 0);
         let cell_size = aabb_max[0] - aabb_min[0];
 
         // Check that the block above the hit is in a different node

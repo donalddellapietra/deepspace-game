@@ -82,6 +82,10 @@ struct Uniforms {
     _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    // Camera in the highlight AABB's local frame. AABB + camera
+    // share this frame so the ray-box test is layer-local f32,
+    // precision bounded by WORLD_SIZE regardless of anchor depth.
+    highlight_camera: vec4<f32>,
     planet: Planet,
     ribbon: array<RibbonFrame, 8>,
 }
@@ -1018,11 +1022,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
             select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
         );
-        let hb = ray_box(camera.pos, h_inv_dir, h_min, h_max);
+        let h_cam = uniforms.highlight_camera.xyz;
+        let hb = ray_box(h_cam, h_inv_dir, h_min, h_max);
         if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
             let t = max(hb.t_enter, 0.0);
             if t <= result.t + h_size.x * 0.01 {
-                let hit_pos = camera.pos + ray_dir * t;
+                let hit_pos = h_cam + ray_dir * t;
                 let from_min = hit_pos - h_min;
                 let from_max = h_max - hit_pos;
                 let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;

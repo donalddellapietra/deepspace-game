@@ -516,7 +516,7 @@ impl App {
     pub(super) fn update_highlight(&mut self) {
         if !self.cursor_locked {
             if let Some(renderer) = &mut self.renderer {
-                renderer.set_highlight(None);
+                renderer.set_highlight(None, [0.0; 3]);
             }
             return;
         }
@@ -527,13 +527,26 @@ impl App {
             &anchor, &self.camera.position, ray_dir,
             self.edit_depth(), self.cs_edit_depth(),
         );
-        let aabb = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
+        // Highlight frame = the same layer-local frame the raycast
+        // ran in. ray_origin lives in `[0, WORLD_SIZE)` of that
+        // frame, and so does the AABB — precision is identical at
+        // any anchor depth.
+        let start_depth = self.edit_depth()
+            .saturating_sub(1)
+            .min(self.anchor_depth()) as usize;
+        let mut frame_path = crate::world::anchor::Path::root();
+        for k in 0..start_depth {
+            frame_path.push(anchor.slot(k));
+        }
+        let cam_in_frame = self.camera.position.in_frame(&frame_path);
+        let aabb = tree_hit.as_ref()
+            .map(|h| edit::hit_aabb(&self.world.library, h, start_depth));
         if let Some((mn, mx)) = &aabb {
             eprintln!("highlight: min={:?} max={:?} size={:?}",
                 mn, mx, [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]]);
         }
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_highlight(aabb);
+            renderer.set_highlight(aabb, cam_in_frame);
         }
     }
 }

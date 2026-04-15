@@ -9,7 +9,9 @@ use crate::game_state::{GameUiState, SavedMeshes};
 use crate::input::Keys;
 use crate::player;
 use crate::renderer::Renderer;
-use crate::world::anchor::{Path, WorldPos, WORLD_SIZE};
+use crate::world::anchor::{Path, WorldPos};
+#[cfg(test)]
+use crate::world::anchor::WORLD_SIZE;
 use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{Child, NodeId};
@@ -106,27 +108,25 @@ impl App {
         // along world +Y, expressed in the body-cell-local frame.
         // Avoids hardcoded `[1.5, ..., 1.5]` so the spawn follows
         // the planet wherever its path lives.
-        let body_cell_size_world =
-            crate::world::anchor::WORLD_SIZE / 3.0_f32.powi(planet_path.depth() as i32);
-        let above_offset_world = setup.outer_r * body_cell_size_world + 0.05 * body_cell_size_world;
-        let body_center =
-            WorldPos::new(planet_path, [0.5, 0.5, 0.5]).to_world_xyz();
-        let spawn_xyz = [
-            body_center[0],
-            (body_center[1] + above_offset_world).min(WORLD_SIZE - 0.001),
-            body_center[2],
-        ];
-        debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
+        // Spawn anchored to the planet path — pure path-slot math,
+        // no absolute XYZ accumulation. The body's cell spans
+        // `[0, 1)³` in offset space relative to `planet_path`; the
+        // camera's offset along +Y is `outer_r + margin` in that
+        // cell-fraction space. No `to_world_xyz` / `from_world_xyz`
+        // round-trip, no WORLD_SIZE constants.
+        // Body center is at [0.5, 0.5, 0.5] in the planet_path cell;
+        // outer_r is expressed in that same [0, 1) cell frame.
+        let spawn_offset_y = (0.5 + setup.outer_r + 0.05).min(1.0 - 1e-4);
+        let spawn = WorldPos::new(planet_path, [0.5, spawn_offset_y, 0.5]);
 
-        // Spawn anchor depth: 6 levels shallower than the tree's
-        // depth so the user starts at a moderate zoom (sees the
-        // planet at near-full screen). The `-6` is a UX-tuning
-        // constant, not a precision/system cap.
+        // Spawn anchor depth: 6 levels shallower than tree depth so
+        // user starts at moderate zoom. UX tuning, not a precision
+        // cap. `deepened_to` walks pure path slots.
         const SPAWN_ZOOM_OFFSET: i32 = 6;
         let anchor_depth = ((tree_depth as i32 - SPAWN_ZOOM_OFFSET + 1)
             .max(1) as u8)
             .min(crate::world::tree::MAX_DEPTH as u8);
-        let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
+        let position = spawn.deepened_to(anchor_depth);
 
         Self {
             window: None,
