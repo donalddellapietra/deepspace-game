@@ -231,37 +231,22 @@ pub fn build_ribbon(
         let mut path = anchor;
         path.truncate(depth);
 
-        // Walk world_root to resolve the node at this path AND
-        // detect whether the walk crosses a non-Cartesian node.
-        // Frames whose root is inside a sphere body / face subtree
-        // are SKIPPED — the sphere pass renders that content via
-        // path-anchored oc, so letting the ribbon's Cartesian march
-        // ALSO paint those cells produces conflicting hits (cubes
-        // overlapping bulged voxels).
+        // Walk world_root to resolve the node at this path. Frames
+        // whose path passes through a sphere body / face subtree
+        // are KEPT — the per-frame sphere DDA in the shader uses
+        // them with frame-local coords for high-precision rendering
+        // at deep face-subtree depths. The Cartesian march skips
+        // them (`frame.sphere_active == 1` in the shader).
         let mut node_id = world_root;
-        let mut inside_sphere = false;
         for k in 0..path.depth() as usize {
             let Some(node) = library.get(node_id) else { break };
-            if !matches!(node.kind, NodeKind::Cartesian) {
-                inside_sphere = true;
-                break;
-            }
             let slot = path.slot(k) as usize;
             match node.children[slot] {
                 Child::Node(cid) => { node_id = cid; }
                 _ => break,
             }
         }
-        if !inside_sphere {
-            if let Some(node) = library.get(node_id) {
-                if !matches!(node.kind, NodeKind::Cartesian) {
-                    inside_sphere = true;
-                }
-            }
-        }
-        if inside_sphere {
-            continue;
-        }
+        let _ = NodeKind::Cartesian; // keep import live
 
         let camera_local = camera.in_frame(&path);
         let world_scale = (1.0_f32 / 3.0_f32).powi(depth as i32);
@@ -391,18 +376,14 @@ mod ribbon_tests {
     }
 
     #[test]
-    fn ribbon_filters_frames_inside_planet_body() {
+    fn ribbon_keeps_frames_inside_planet_body() {
         // Camera anchored INSIDE the planet body's face subtree.
-        // Every ribbon frame whose path passes through the body
-        // (kind=CubedSphereBody) or its face_root (CubedSphereFace)
-        // should be filtered out — leaving only the root frame
-        // (which is Cartesian) so the sphere pass owns sphere
-        // rendering exclusively.
+        // Frames whose path passes through the body are KEPT — the
+        // per-frame sphere DDA in the shader will render them in
+        // frame-local coords (precision-stable at any depth). Only
+        // the Cartesian march skips them (gated by sphere_active).
         let (lib, root, planet_path) = demo_world();
-        // Camera anchored deep through (root → body → face_slot →
-        // face subtree). Build the path manually.
         let mut anchor = planet_path; // [13]
-        // Push face_slot (PosY = 16), then face-subtree slots.
         anchor.push(crate::world::cubesphere::FACE_SLOTS[2] as u8);
         for _ in 0..6 {
             anchor.push(13);
@@ -410,15 +391,15 @@ mod ribbon_tests {
         let camera = WorldPos::new(anchor, [0.5; 3]);
         let frames = build_ribbon(&lib, root, &camera);
         assert!(!frames.is_empty(), "must always have at least the root frame");
-        // No frame should be at depth >= 1 (since depth-1 slot 13
-        // IS the body). Assert all frames are root-only.
-        for f in &frames {
-            assert_eq!(
-                f.path.depth(), 0,
-                "ribbon frame at depth {} crosses sphere content; should have been filtered",
-                f.path.depth(),
-            );
-        }
+        // Should have multiple frames, including deep ones inside
+        // the body's face subtree (those will be marked
+        // sphere_active=1 in the GPU upload and rendered by the
+        // per-frame sphere DDA).
+        let max_depth = frames.iter().map(|f| f.path.depth()).max().unwrap();
+        assert!(
+            max_depth > 0,
+            "expected at least one deep frame; only got depth-0",
+        );
     }
 
     #[test]

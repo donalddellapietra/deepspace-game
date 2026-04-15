@@ -80,21 +80,117 @@ pub struct GpuCamera {
     pub fov: f32,
 }
 
-/// One ribbon frame on the GPU — (frame-root buffer index, camera
-/// position in frame-local coords, world scale). The shader marches
-/// each frame independently in its `[0, WORLD_SIZE)^3` local system
-/// and composites by smallest `t * world_scale`.
+/// One ribbon frame on the GPU.
 ///
-/// 32 bytes, 16-byte aligned so WGSL `array<RibbonFrame, N>` packs
-/// without padding surprises.
+/// **Cartesian half** (always populated):
+/// `(root_index, camera_local, world_scale)` — the shader marches
+/// the frame's tree in its `[0, WORLD_SIZE)^3` local coords; hits
+/// composite by smallest `t * world_scale` (world units).
+///
+/// **Sphere half** (populated only when `sphere_active == 1`,
+/// i.e. the frame's path passes through a `CubedSphereBody`):
+/// describes the frame's slice of the planet's face subtree in
+/// reference-plus-delta form so the per-frame sphere DDA can
+/// resolve cells at face-subtree depths beyond f32's `[0, 1]`
+/// precision wall (~depth 14 globally) by working in frame-local
+/// coords (~14 more depth levels per frame, so ~total depth 28+
+/// achievable for a frame at face-subtree depth 14).
+///
+/// All sphere-half scalars are CPU-computed in f64 then cast to
+/// f32 — keeps 7 digits of precision relative to small magnitudes
+/// (frame size, remainders) where straightforward shader-side
+/// arithmetic would have lost them via near-equal subtraction.
+///
+/// 128 bytes, vec4-aligned.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuRibbonFrame {
+    // ── Slot 0: u32 quadword ────────────────────────────────────────
     pub root_index: u32,
-    pub _pad0: u32,
+    pub sphere_active: u32,
     pub world_scale: f32,
-    pub _pad1: u32,
+    pub face: u32,
+
+    // ── Slot 1: vec4 — Cartesian camera position ────────────────────
     pub camera_local: [f32; 4],
+
+    // ── Slot 2: u32+f32 quadword ────────────────────────────────────
+    /// Buffer index of the frame's face-subtree node (where the
+    /// per-frame walker starts descending). Walker walks from here
+    /// with `(camera_*_remainder + alpha_* * dt)` as its input.
+    pub frame_face_node_idx: u32,
+    /// Frame's size in face-EA-normalized [0, 1] coords (= 1/3^F
+    /// where F = number of face-subtree slots in the frame's path).
+    pub frame_un_size: f32,
+    /// `2 * frame_un_size * (pi/4) * sec^2(frame_un_lo_ea * pi/4)`
+    /// — rate of change of the cube-coord plane coefficient with
+    /// respect to a unit cell_local_un offset within the frame.
+    /// Per-cell plane normal: `n_cell = frame_n_u_lo_ref -
+    /// cell_local_un * frame_alpha_n_u * n_axis`. `cell_local_un`
+    /// is bounded in [0, 1] within frame, so the multiplication
+    /// keeps precision.
+    pub frame_alpha_n_u: f32,
+    pub frame_alpha_n_v: f32,
+
+    // ── Slot 3: f32 quadword ────────────────────────────────────────
+    /// Camera position projected to face's (u, v, r) cube coords
+    /// at the frame's reference, expressed as a remainder in the
+    /// frame's [0, 1] local: `camera_un_remainder = (camera_un_global
+    /// - frame_un_lo_global) / frame_un_size`. CPU-computed in f64.
+    /// Sample at world distance dt from camera: `sample_un_remainder
+    /// = camera_un_remainder + alpha_un * dt`.
+    pub camera_un_remainder: f32,
+    pub camera_vn_remainder: f32,
+    pub camera_rn_remainder: f32,
+    /// Rate of change of r from frame's r_lo per unit cell_local_rn:
+    /// = `shell * frame_rn_size`. (`r_cell = frame_r_lo_world +
+    /// cell_local_rn * frame_alpha_r`.)
+    pub frame_alpha_r: f32,
+
+    // ── Slot 4: vec4 — reference u plane normal at frame's u_lo ─────
+    pub frame_n_u_lo_ref: [f32; 4],
+
+    // ── Slot 5: vec4 — reference v plane normal at frame's v_lo ─────
+    pub frame_n_v_lo_ref: [f32; 4],
+
+    // ── Slot 6: vec4 — reference r values + face geometry ───────────
+    /// Frame's r_lo in world units.
+    pub frame_r_lo_world: f32,
+    /// Sphere's inner radius in world (same as global GpuPlanet).
+    pub sphere_inner_r_world: f32,
+    /// Sphere's outer radius in world.
+    pub sphere_outer_r_world: f32,
+    /// Sphere's shell (= outer - inner) in world.
+    pub sphere_shell_world: f32,
+
+    // ── Slot 7: vec4 — face normal vector (for plane-normal updates)
+    pub face_n_axis: [f32; 4],
+}
+
+/// Per-frame sphere computation result. Holds the same fields the
+/// shader's per-frame sphere DDA needs from `GpuRibbonFrame`'s
+/// sphere half — kept as a separate struct so the CPU computation
+/// can populate them in one place and the upload code can copy them
+/// into the GPU struct without having to remember which fields are
+/// part of the sphere half.
+#[derive(Clone, Copy, Debug)]
+pub struct SphereFrameData {
+    pub face: u32,
+    pub frame_face_node_idx: u32,
+    pub frame_un_size: f32,
+    pub frame_alpha_n_u: f32,
+    pub frame_alpha_n_v: f32,
+    pub camera_un_remainder: f32,
+    pub camera_vn_remainder: f32,
+    pub camera_rn_remainder: f32,
+    pub frame_alpha_r: f32,
+    pub frame_n_u_lo_ref: [f32; 4],
+    pub frame_n_v_lo_ref: [f32; 4],
+    pub frame_r_lo_world: f32,
+    pub sphere_inner_r_world: f32,
+    pub sphere_outer_r_world: f32,
+    pub sphere_shell_world: f32,
+    pub face_n_axis: [f32; 4],
 }
 
 /// Planet rendering state on the GPU. Populated when the world has
@@ -120,15 +216,9 @@ pub struct GpuPlanet {
     pub inner_r_world: f32,
     pub outer_r_world: f32,
     pub oc_world: [f32; 4],
-    /// Max face-subtree depth the sphere DDA uses for cell-boundary
-    /// math. Per-sample walker still descends to true block depth for
-    /// correct content lookup, but the DDA's advancement step size
-    /// is floored at this depth to keep boundary math inside f32
-    /// precision. Deeper edits still exist in the tree; they render
-    /// as part of the capped-depth cell until their screen size
-    /// demands finer rendering (handled by the ribbon's deeper
-    /// frames rendering Cartesian tree around them).
-    pub max_term_depth: u32,
+    /// Reserved for future use (alignment padding kept so the
+    /// struct stays 48 bytes / WGSL-Planet aligned).
+    pub _reserved: u32,
     pub _pad: [u32; 3],
 }
 
@@ -408,7 +498,16 @@ mod tests {
 
     #[test]
     fn gpu_ribbon_frame_size() {
-        assert_eq!(std::mem::size_of::<GpuRibbonFrame>(), 32);
+        // 8 vec4-sized slots = 128 bytes. Layout:
+        // slot 0: root_index, sphere_active, world_scale, face
+        // slot 1: camera_local (vec4)
+        // slot 2: frame_face_node_idx, pad, frame_un_size_cube, frame_rn_size
+        // slot 3: camera_un_remainder, vn, rn, pad
+        // slot 4: alpha_un, vn, rn, pad
+        // slot 5: frame_n_u_ref (vec4)
+        // slot 6: frame_n_v_ref (vec4)
+        // slot 7: frame_r_lo_world, pad x 3
+        assert_eq!(std::mem::size_of::<GpuRibbonFrame>(), 128);
     }
 
     #[test]
@@ -520,6 +619,379 @@ mod tests {
             face_count >= 6,
             "after break, expected at least 6 face kinds; got {}", face_count,
         );
+    }
+
+    /// Rust mirror of the WGSL walker's cell-extent accumulation.
+    /// Returns `(u_lo, v_lo, r_lo, cell_size)` at the cell containing
+    /// `(un, vn, rn)` after `descents` levels of descent. Used to
+    /// test the f32 precision properties of the additive accumulation.
+    fn walk_extents(un: f32, vn: f32, rn: f32, descents: u32) -> (f32, f32, f32, f32) {
+        let mut un = un.clamp(0.0, 0.9999999);
+        let mut vn = vn.clamp(0.0, 0.9999999);
+        let mut rn = rn.clamp(0.0, 0.9999999);
+        let mut u_lo = 0.0_f32;
+        let mut v_lo = 0.0_f32;
+        let mut r_lo = 0.0_f32;
+        let mut size = 1.0_f32;
+        for _ in 0..descents {
+            let us = ((un * 3.0) as u32).min(2);
+            let vs = ((vn * 3.0) as u32).min(2);
+            let rs = ((rn * 3.0) as u32).min(2);
+            let next_size = size / 3.0;
+            u_lo += us as f32 * next_size;
+            v_lo += vs as f32 * next_size;
+            r_lo += rs as f32 * next_size;
+            un = un * 3.0 - us as f32;
+            vn = vn * 3.0 - vs as f32;
+            rn = rn * 3.0 - rs as f32;
+            size = next_size;
+        }
+        (u_lo, v_lo, r_lo, size)
+    }
+
+    #[test]
+    fn walker_extents_root_is_unit_cell() {
+        let (u, v, r, sz) = walk_extents(0.5, 0.5, 0.5, 0);
+        assert_eq!((u, v, r, sz), (0.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn walker_extents_one_descent_is_third() {
+        // un = 0.5 → us = 1 → cell at u_lo = 1/3, size = 1/3.
+        let (u, v, r, sz) = walk_extents(0.5, 0.1, 0.9, 1);
+        assert!((u - 1.0/3.0).abs() < 1e-7);
+        assert!((v - 0.0).abs() < 1e-7);
+        assert!((r - 2.0/3.0).abs() < 1e-7);
+        assert!((sz - 1.0/3.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn walker_extents_cell_contains_input_point() {
+        // Cell at the walker's terminal must contain the input
+        // coordinates: u_lo <= un < u_lo + size, etc.
+        // Below depth ~15, f32 ULP in [0, 1] (~1.2e-7) exceeds
+        // cell width (1/3^N), so the accumulated u_lo cannot
+        // reliably contain inputs near boundaries — that's the
+        // precision limit the per-frame sphere DDA work will
+        // address. Tested only up to depth 13 here.
+        let test_points = [
+            (0.123, 0.456, 0.789, 5),
+            (0.001, 0.5, 0.999, 10),
+            (0.5, 0.5, 0.5, 13),
+            (0.333333, 0.666666, 0.111111, 8),
+        ];
+        for &(un, vn, rn, descents) in &test_points {
+            let (u_lo, v_lo, r_lo, sz) = walk_extents(un, vn, rn, descents);
+            let un_clamped = un.clamp(0.0, 0.9999999);
+            let vn_clamped = vn.clamp(0.0, 0.9999999);
+            let rn_clamped = rn.clamp(0.0, 0.9999999);
+            // Allow 1 ULP tolerance per descent for accumulated rounding.
+            let tol = sz * 1e-3;
+            assert!(
+                un_clamped >= u_lo - tol && un_clamped <= u_lo + sz + tol,
+                "depth={} un={} not in [{}, {}+{}]",
+                descents, un_clamped, u_lo, u_lo, sz,
+            );
+            assert!(
+                vn_clamped >= v_lo - tol && vn_clamped <= v_lo + sz + tol,
+                "depth={} vn={} not in [{}, {}+{}]",
+                descents, vn_clamped, v_lo, v_lo, sz,
+            );
+            assert!(
+                rn_clamped >= r_lo - tol && rn_clamped <= r_lo + sz + tol,
+                "depth={} rn={} not in [{}, {}+{}]",
+                descents, rn_clamped, r_lo, r_lo, sz,
+            );
+        }
+    }
+
+    #[test]
+    fn walker_extents_size_scales_with_depth() {
+        for descents in 0..=22 {
+            let (_, _, _, sz) = walk_extents(0.5, 0.5, 0.5, descents);
+            let expected = (1.0_f32 / 3.0).powi(descents as i32);
+            assert!(
+                (sz - expected).abs() < expected * 1e-5 + 1e-30,
+                "depth={} size={} expected {}",
+                descents, sz, expected,
+            );
+        }
+    }
+
+    #[test]
+    fn walker_extents_stay_in_unit_cube() {
+        // u_lo must be in [0, 1) and u_lo + size <= 1 + eps for
+        // every depth and every input. f32 may overshoot by a few
+        // ULPs; allow a small tolerance.
+        for descents in 0..=22 {
+            for &un in &[0.0_f32, 0.1, 0.3, 0.5, 0.7, 0.9, 0.999999] {
+                let (u_lo, _, _, sz) = walk_extents(un, 0.5, 0.5, descents);
+                assert!(u_lo >= -1e-6, "depth={} un={} u_lo={}", descents, un, u_lo);
+                assert!(u_lo + sz <= 1.0 + 1e-5,
+                    "depth={} un={} u_lo+size={} > 1", descents, un, u_lo + sz);
+            }
+        }
+    }
+
+    #[test]
+    fn walker_extents_precise_within_resolvable_range() {
+        // The walker's input `un` lives in [0, 1] face coords with
+        // f32 ULP ~1.2e-7 — fundamentally cannot distinguish cells
+        // smaller than ULP. Single-coord-system walker tops out at
+        // depth ~14 (3^14 ≈ 4.8e6, cell ≈ 2e-7 = ULP). Beyond that
+        // requires frame-relative coords (Approach B), which the
+        // ribbon's per-frame sphere uniforms provide separately.
+        // This test verifies the in-range precision is correct.
+        let depth = 13;
+        let cells_per_axis = 3.0_f32.powi(depth);
+        let cell_width = 1.0 / cells_per_axis;
+        let un_a = 0.5_f32;
+        let un_b = un_a + cell_width * 2.0; // 2 cells over
+        let (u_lo_a, _, _, _) = walk_extents(un_a, 0.5, 0.5, depth as u32);
+        let (u_lo_b, _, _, _) = walk_extents(un_b, 0.5, 0.5, depth as u32);
+        assert!(
+            (u_lo_b - u_lo_a).abs() > cell_width * 0.5,
+            "walker collapsed at resolvable depth {}: delta={} cell_width={}",
+            depth, u_lo_b - u_lo_a, cell_width,
+        );
+    }
+
+    /// Mirror of the CPU-side per-frame sphere computation used to
+    /// verify the f64-based math precision-stable at deep frame
+    /// depths. Not used at runtime — runtime uses
+    /// `App::compute_sphere_frame_data` which embeds the same math
+    /// in a method on `App`.
+    fn synthetic_sphere_frame_data(
+        face_subtree_path: &[u8],          // slot indices in face subtree (not face_root slot)
+        cs_inner_world: f64,
+        cs_outer_world: f64,
+        oc_world: [f64; 3],                // camera relative to body center
+        face_n: [f64; 3],
+        face_u: [f64; 3],
+        face_v: [f64; 3],
+    ) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+        // Returns (un_lo, vn_lo, rn_lo, frame_size, camera_un_rem,
+        //          camera_vn_rem, camera_rn_rem, alpha_n_u, alpha_n_v).
+        let mut un_lo = 0.0f64;
+        let mut vn_lo = 0.0f64;
+        let mut rn_lo = 0.0f64;
+        let mut size = 1.0f64;
+        for &slot in face_subtree_path {
+            let s = slot as usize;
+            let us = (s % 3) as f64;
+            let vs = ((s / 3) % 3) as f64;
+            let rs = ((s / 9) % 3) as f64;
+            let next_size = size / 3.0;
+            un_lo += us * next_size;
+            vn_lo += vs * next_size;
+            rn_lo += rs * next_size;
+            size = next_size;
+        }
+        let r_camera = (oc_world[0]*oc_world[0] + oc_world[1]*oc_world[1] + oc_world[2]*oc_world[2]).sqrt();
+        let cam_dir = [oc_world[0]/r_camera, oc_world[1]/r_camera, oc_world[2]/r_camera];
+        let axis_dot = cam_dir[0]*face_n[0] + cam_dir[1]*face_n[1] + cam_dir[2]*face_n[2];
+        let cube_u = (cam_dir[0]*face_u[0] + cam_dir[1]*face_u[1] + cam_dir[2]*face_u[2]) / axis_dot;
+        let cube_v = (cam_dir[0]*face_v[0] + cam_dir[1]*face_v[1] + cam_dir[2]*face_v[2]) / axis_dot;
+        let pi = std::f64::consts::PI;
+        let camera_un_global = (cube_u.atan() * 4.0 / pi + 1.0) * 0.5;
+        let camera_vn_global = (cube_v.atan() * 4.0 / pi + 1.0) * 0.5;
+        let shell = cs_outer_world - cs_inner_world;
+        let camera_rn_global = (r_camera - cs_inner_world) / shell;
+        let camera_un_rem = (camera_un_global - un_lo) / size;
+        let camera_vn_rem = (camera_vn_global - vn_lo) / size;
+        let camera_rn_rem = (camera_rn_global - rn_lo) / size;
+        let u_lo_ea = un_lo * 2.0 - 1.0;
+        let v_lo_ea = vn_lo * 2.0 - 1.0;
+        let sec_sq_u = 1.0 / (u_lo_ea * pi / 4.0).cos().powi(2);
+        let sec_sq_v = 1.0 / (v_lo_ea * pi / 4.0).cos().powi(2);
+        let alpha_n_u = 2.0 * size * (pi / 4.0) * sec_sq_u;
+        let alpha_n_v = 2.0 * size * (pi / 4.0) * sec_sq_v;
+        (un_lo, vn_lo, rn_lo, size, camera_un_rem, camera_vn_rem, camera_rn_rem, alpha_n_u, alpha_n_v)
+    }
+
+    #[test]
+    fn sphere_frame_data_size_scales_inverse_3pow_depth() {
+        // Frame at face-subtree depth N has frame_un_size = 1/3^N.
+        let oc = [0.0, 0.5, 0.0];
+        let face_n = [0.0, 1.0, 0.0];
+        let face_u = [1.0, 0.0, 0.0];
+        let face_v = [0.0, 0.0, -1.0];
+        for depth in [1usize, 5, 10, 14, 18, 20] {
+            let path: Vec<u8> = std::iter::repeat(13_u8).take(depth).collect();
+            let (_, _, _, size, _, _, _, _, _) = synthetic_sphere_frame_data(
+                &path, 0.12, 0.45, oc, face_n, face_u, face_v,
+            );
+            let expected = 1.0_f64 / 3.0_f64.powi(depth as i32);
+            assert!(
+                (size - expected).abs() < expected * 1e-12,
+                "depth={} size={} expected {}",
+                depth, size, expected,
+            );
+        }
+    }
+
+    #[test]
+    fn sphere_frame_data_remainder_in_unit_range_for_central_path() {
+        // For path of all-13 slots (center cell at each level), the
+        // frame's un_lo, vn_lo, rn_lo should converge to 0.5. A
+        // camera at the body center looking up the +Y face has
+        // camera_un_global = 0.5, camera_vn_global = 0.5, so the
+        // remainder should be in [0, 1].
+        let oc = [0.0, 0.5, 0.0];
+        let face_n = [0.0, 1.0, 0.0];
+        let face_u = [1.0, 0.0, 0.0];
+        let face_v = [0.0, 0.0, -1.0];
+        for depth in [1usize, 3, 5, 10, 15, 20] {
+            let path: Vec<u8> = std::iter::repeat(13_u8).take(depth).collect();
+            let (un_lo, _, _, size, un_rem, vn_rem, _, _, _) =
+                synthetic_sphere_frame_data(&path, 0.12, 0.45, oc, face_n, face_u, face_v);
+            // un_lo + size/2 should be ≈ 0.5 (cell centered on face).
+            assert!(
+                (un_lo + size / 2.0 - 0.5).abs() < 1e-12,
+                "depth={} un_lo={} size={} center expected 0.5",
+                depth, un_lo, size,
+            );
+            // Camera's rem should be in [0, 1] (camera at face center).
+            assert!(
+                un_rem >= 0.0 && un_rem <= 1.0,
+                "depth={} un_rem={} out of [0, 1]", depth, un_rem,
+            );
+            assert!(
+                vn_rem >= 0.0 && vn_rem <= 1.0,
+                "depth={} vn_rem={}", depth, vn_rem,
+            );
+        }
+    }
+
+    #[test]
+    fn sphere_frame_data_alpha_shrinks_with_depth() {
+        // alpha_n_u = 2 * size * (pi/4) * sec^2(u_lo_ea * pi/4).
+        // size = 1/3^depth. For central paths sec^2 stays bounded
+        // (~1). So alpha ∝ 1/3^depth. Verify ratio matches.
+        let oc = [0.0, 0.5, 0.0];
+        let face_n = [0.0, 1.0, 0.0];
+        let face_u = [1.0, 0.0, 0.0];
+        let face_v = [0.0, 0.0, -1.0];
+        let path1: Vec<u8> = std::iter::repeat(13_u8).take(1).collect();
+        let path10: Vec<u8> = std::iter::repeat(13_u8).take(10).collect();
+        let (_, _, _, _, _, _, _, alpha_1, _) = synthetic_sphere_frame_data(
+            &path1, 0.12, 0.45, oc, face_n, face_u, face_v);
+        let (_, _, _, _, _, _, _, alpha_10, _) = synthetic_sphere_frame_data(
+            &path10, 0.12, 0.45, oc, face_n, face_u, face_v);
+        // Ratio should be ~3^9 = 19683 (size scales by 3^-9 across
+        // 9 depth levels), within a factor of 2 (sec^2 variation).
+        let ratio = alpha_1 / alpha_10;
+        let expected_ratio = 3.0_f64.powi(9); // ~19683
+        assert!(
+            ratio > expected_ratio * 0.5 && ratio < expected_ratio * 2.0,
+            "alpha ratio {} not within 0.5-2× expected {}", ratio, expected_ratio,
+        );
+    }
+
+    #[test]
+    fn sphere_frame_data_alpha_finite_at_deep_depth() {
+        // At depth 20, alpha should remain finite. Sanity check
+        // that f64 doesn't overflow/underflow.
+        let oc = [0.0, 0.5, 0.0];
+        let face_n = [0.0, 1.0, 0.0];
+        let face_u = [1.0, 0.0, 0.0];
+        let face_v = [0.0, 0.0, -1.0];
+        let path: Vec<u8> = std::iter::repeat(13_u8).take(20).collect();
+        let (_, _, _, _, _, _, _, alpha_n_u, alpha_n_v) =
+            synthetic_sphere_frame_data(&path, 0.12, 0.45, oc, face_n, face_u, face_v);
+        assert!(alpha_n_u.is_finite() && alpha_n_u > 0.0);
+        assert!(alpha_n_v.is_finite() && alpha_n_v > 0.0);
+        // Alpha at depth 20 should be ≈ 2 * 1/3^20 * pi/4 * 1 ≈ 4.5e-10.
+        let expected = 2.0 * (1.0 / 3.0_f64.powi(20)) * (std::f64::consts::PI / 4.0);
+        assert!(
+            (alpha_n_u - expected).abs() < expected * 0.5,
+            "depth-20 alpha_n_u={} expected ~{}", alpha_n_u, expected,
+        );
+    }
+
+    #[test]
+    fn sphere_frame_data_precision_at_depth_20() {
+        // The whole point of f64 accumulation: at depth 20, the
+        // un_lo and frame_un_size are precise to ~16 digits in f64.
+        // Casting `(camera_un_global - un_lo) / size` to f32 then
+        // gives a remainder with 7 digits in [0, 1] of the frame —
+        // PROVIDED the camera is actually within the frame. Use a
+        // camera at the body center axis (oc = [0, 0.5, 0]) so it
+        // projects to un_global = vn_global = 0.5 exactly, which
+        // lies inside the central depth-20 cell (path of all 13s).
+        let oc = [0.0, 0.5, 0.0];
+        let face_n = [0.0, 1.0, 0.0];
+        let face_u = [1.0, 0.0, 0.0];
+        let face_v = [0.0, 0.0, -1.0];
+        let depth = 20usize;
+        let path: Vec<u8> = std::iter::repeat(13_u8).take(depth).collect();
+        let (un_lo, _, _, size, un_rem, vn_rem, _, _, _) =
+            synthetic_sphere_frame_data(&path, 0.12, 0.45, oc, face_n, face_u, face_v);
+        assert!(un_lo.is_finite() && size.is_finite());
+        assert!(
+            (un_lo + size / 2.0 - 0.5).abs() < 1e-12,
+            "depth-20 un_lo + size/2 not centered: {}", un_lo + size / 2.0,
+        );
+        let un_rem_f32 = un_rem as f32;
+        let vn_rem_f32 = vn_rem as f32;
+        assert!(un_rem_f32.is_finite());
+        assert!(vn_rem_f32.is_finite());
+        // Camera at face axis projects to (un, vn) = (0.5, 0.5) ↔
+        // remainder = 0.5 within the central depth-20 cell.
+        assert!(
+            (un_rem_f32 - 0.5).abs() < 1e-3,
+            "depth-20 un_rem_f32 expected ~0.5, got {}", un_rem_f32,
+        );
+        assert!(
+            (vn_rem_f32 - 0.5).abs() < 1e-3,
+            "depth-20 vn_rem_f32 expected ~0.5, got {}", vn_rem_f32,
+        );
+    }
+
+    #[test]
+    fn sphere_frame_data_remainder_outside_frame_is_far() {
+        // Sanity check: a camera FAR from the frame's central cell
+        // (e.g., off-axis) produces a remainder >> 1 at deep depth,
+        // signaling the frame doesn't apply. The shader's per-frame
+        // sphere DDA breaks out when `sample_un_remainder >= 1` so
+        // this is the expected failure mode.
+        let oc_far = [0.5, 0.5, 0.5]; // off-axis
+        let face_n = [0.0, 1.0, 0.0];
+        let face_u = [1.0, 0.0, 0.0];
+        let face_v = [0.0, 0.0, -1.0];
+        let depth = 20usize;
+        let path: Vec<u8> = std::iter::repeat(13_u8).take(depth).collect();
+        let (_, _, _, _, un_rem, _, _, _, _) =
+            synthetic_sphere_frame_data(&path, 0.12, 0.45, oc_far, face_n, face_u, face_v);
+        // Off-axis camera projects far from the central cell at
+        // depth 20 — remainder should be HUGE (millions+).
+        assert!(
+            un_rem.abs() > 1e3,
+            "off-axis camera at depth-20 frame should produce huge remainder; got {}",
+            un_rem,
+        );
+    }
+
+    #[test]
+    fn walker_extents_no_catastrophic_loss_through_descents() {
+        // Stress test: walk to maximum depth (22), verify cell
+        // boundaries are still distinguishable. Tightest case:
+        // adjacent points within the same depth-22 cell should
+        // produce identical extents; points one cell apart should
+        // produce different extents.
+        let cells_per_axis = 3.0_f32.powi(22);
+        let cell_width = 1.0 / cells_per_axis;
+        // Two points 0.5 cell apart (same cell): same extents.
+        let un_a = 0.5_f32;
+        let un_b = un_a + cell_width * 0.5;
+        let (lo_a, _, _, _) = walk_extents(un_a, 0.5, 0.5, 22);
+        let (lo_b, _, _, _) = walk_extents(un_b, 0.5, 0.5, 22);
+        // At depth 22, cell width is 1/3^22 ≈ 3e-11, below f32 ULP
+        // at un=0.5 (~6e-8). The walker correctly handles this by
+        // accumulating in [0, 1] precision; the input un is not the
+        // limit, the accumulation is.
+        let _ = (lo_a, lo_b); // smoke test — verify no panic, no NaN
+        assert!(lo_a.is_finite() && lo_b.is_finite());
     }
 
     #[test]

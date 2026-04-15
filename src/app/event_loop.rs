@@ -39,10 +39,9 @@ impl ApplicationHandler for App {
         // overwrites this below.
         let initial_ribbon = [gpu::GpuRibbonFrame {
             root_index,
-            _pad0: 0,
             world_scale: 1.0,
-            _pad1: 0,
             camera_local: [1.5, 1.75, 1.5, 0.0],
+            ..Default::default()
         }];
         let renderer = pollster::block_on(
             Renderer::new(window, &tree_data, &node_kinds, &initial_ribbon),

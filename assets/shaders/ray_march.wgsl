@@ -21,12 +21,28 @@ struct Palette {
     colors: array<vec4<f32>, 256>,
 }
 
+// Mirrors Rust `GpuRibbonFrame`: 8 vec4-sized slots = 128 bytes.
 struct RibbonFrame {
     root_index: u32,
-    _pad0: u32,
+    sphere_active: u32,
     world_scale: f32,
-    _pad1: u32,
+    face: u32,
     camera_local: vec4<f32>,
+    frame_face_node_idx: u32,
+    frame_un_size: f32,
+    frame_alpha_n_u: f32,
+    frame_alpha_n_v: f32,
+    camera_un_remainder: f32,
+    camera_vn_remainder: f32,
+    camera_rn_remainder: f32,
+    frame_alpha_r: f32,
+    frame_n_u_lo_ref: vec4<f32>,
+    frame_n_v_lo_ref: vec4<f32>,
+    frame_r_lo_world: f32,
+    sphere_inner_r_world: f32,
+    sphere_outer_r_world: f32,
+    sphere_shell_world: f32,
+    face_n_axis: vec4<f32>,
 }
 
 const MAX_RIBBON_FRAMES: u32 = 8u;
@@ -40,7 +56,7 @@ struct Planet {
     inner_r_world: f32,
     outer_r_world: f32,
     oc_world: vec4<f32>,
-    max_term_depth: u32,
+    _reserved: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
@@ -183,34 +199,83 @@ fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
 }
 
 // Walk a face subtree from the body node's face-center child slot,
-// using normalized `(un, vn, rn) ∈ [0, 1]³` coords. Returns
-// `(block_id, term_depth)`.
+// using normalized `(un, vn, rn) ∈ [0, 1]³` coords.
+//
+// Returns the terminal cell's block + depth AND its precise extent
+// in normalized face coords `(u_lo, v_lo, r_lo, size)` — accumulated
+// incrementally during descent so f32 precision stays bounded by
+// ~7 digits regardless of depth. The sphere DDA uses these values
+// directly for cell-boundary math, sidestepping the
+// `iu = floor(un * pow(3, depth))` precision wall that capped
+// rendering at depth ~12 in the previous implementation.
+struct WalkResult {
+    block_id: u32,
+    term_depth: u32,
+    u_lo: f32,
+    v_lo: f32,
+    r_lo: f32,
+    cell_size: f32,
+}
+
 fn walk_face_subtree(body_node_idx: u32, face: u32,
-                     un_in: f32, vn_in: f32, rn_in: f32) -> vec2<u32> {
+                     un_in: f32, vn_in: f32, rn_in: f32) -> WalkResult {
     let fs = face_slot(face);
     let face_packed = child_packed(body_node_idx, fs);
     let face_tag = child_tag(face_packed);
-    if face_tag == 0u { return vec2<u32>(0u, 1u); }
-    if face_tag == 1u { return vec2<u32>(child_block_type(face_packed), 1u); }
+    var result: WalkResult;
+    if (face_tag == 0u || face_tag == 1u) {
+        result.block_id = select(0u, child_block_type(face_packed), face_tag == 1u);
+        result.term_depth = 1u;
+        result.u_lo = 0.0;
+        result.v_lo = 0.0;
+        result.r_lo = 0.0;
+        result.cell_size = 1.0;
+        return result;
+    }
     var node = child_node_index(body_node_idx, fs);
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
+    var u_lo: f32 = 0.0;
+    var v_lo: f32 = 0.0;
+    var r_lo: f32 = 0.0;
+    var size: f32 = 1.0;
     for (var d: u32 = 2u; d <= 22u; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
+        let next_size = size / 3.0;
+        let next_u_lo = u_lo + f32(us) * next_size;
+        let next_v_lo = v_lo + f32(vs) * next_size;
+        let next_r_lo = r_lo + f32(rs) * next_size;
         let slot = rs * 9u + vs * 3u + us;
         let packed = child_packed(node, slot);
         let tag = child_tag(packed);
-        if tag == 0u { return vec2<u32>(0u, d); }
-        if tag == 1u { return vec2<u32>(child_block_type(packed), d); }
+        if tag == 0u {
+            result.block_id = 0u; result.term_depth = d;
+            result.u_lo = next_u_lo; result.v_lo = next_v_lo; result.r_lo = next_r_lo;
+            result.cell_size = next_size;
+            return result;
+        }
+        if tag == 1u {
+            result.block_id = child_block_type(packed); result.term_depth = d;
+            result.u_lo = next_u_lo; result.v_lo = next_v_lo; result.r_lo = next_r_lo;
+            result.cell_size = next_size;
+            return result;
+        }
         node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
+        u_lo = next_u_lo;
+        v_lo = next_v_lo;
+        r_lo = next_r_lo;
+        size = next_size;
     }
-    return vec2<u32>(0u, 22u);
+    result.block_id = 0u; result.term_depth = 22u;
+    result.u_lo = u_lo; result.v_lo = v_lo; result.r_lo = r_lo;
+    result.cell_size = size;
+    return result;
 }
 
 // -------------- Ray-AABB --------------
@@ -243,21 +308,19 @@ struct HitResult {
 // body cell size — magnitudes stay in [-shell, +shell] regardless
 // of where the camera is anchored in the tree.
 //
-// `max_term_depth_cap` floors the ray-advance eps so cell-boundary
-// math can't collapse below f32 ULP at arbitrary content depth:
-// cells deeper than the cap still appear in hits (the walker
-// descends to the real block), but the DDA advances at the capped
-// depth's cell scale.
-//
 // Returns a HitResult with `t` in world units. Caller composites
 // with ribbon-frame marches by comparing world-scale t.
+//
+// No max-depth cap: the walker returns each terminal cell's exact
+// `(u_lo, v_lo, r_lo, size)` via additive accumulation during
+// descent, so cell-boundary math is precision-stable at any depth
+// (no `cells_d = pow(3, depth)` to overflow f32 integer-exact).
 fn sphere_in_cell(
     body_node_idx: u32,
     oc_world: vec3<f32>,
     ray_dir: vec3<f32>,
     inner_r_world: f32,
     outer_r_world: f32,
-    max_term_depth_cap: u32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -281,9 +344,8 @@ fn sphere_in_cell(
     var t = t_enter + eps_init;
     var steps = 0u;
     var last_face_id: u32 = 6u;
-    var deepest_term_depth: u32 = 1u;
     loop {
-        if t >= t_exit || steps > 4096u { break; }
+        if t >= t_exit || steps > 16384u { break; }
         steps = steps + 1u;
 
         let local = oc + ray_dir * t;
@@ -306,8 +368,7 @@ fn sphere_in_cell(
         let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
 
         let walk = walk_face_subtree(body_node_idx, face, un, vn, rn);
-        let block_id = walk.x;
-        let term_depth = walk.y;
+        let block_id = walk.block_id;
 
         if block_id != 0u {
             var hit_normal: vec3<f32>;
@@ -331,30 +392,29 @@ fn sphere_in_cell(
             return result;
         }
 
-        // Cap the boundary-math depth so `cells_d` stays in the
-        // f32 integer-exact range (2^24 ≈ 1.6e7, `3^15 ≈ 1.4e7`)
-        // AND so cell-eps stays advancing the ray. Per-sample walker
-        // still reports the real block depth — only the DDA's grid
-        // scale is capped.
-        deepest_term_depth = max(deepest_term_depth, term_depth);
-        let capped_depth = min(deepest_term_depth, max_term_depth_cap);
-        let cells_d = pow(3.0, f32(capped_depth));
-        let iu = floor(un * cells_d);
-        let iv = floor(vn * cells_d);
-        let ir = floor(rn * cells_d);
+        // Cell extent comes from the walker, computed via additive
+        // accumulation during descent. Each extent value is bounded
+        // in [0, 1] regardless of `term_depth`, so f32 precision in
+        // the boundary-plane coefficients stays at ~7 digits even
+        // for face-subtree depths in the high teens or twenties.
+        // No more `cells_d = pow(3, depth)` precision wall.
+        let u_lo_n = walk.u_lo;
+        let v_lo_n = walk.v_lo;
+        let r_lo_n = walk.r_lo;
+        let cell_n = walk.cell_size;
 
-        let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
-        let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
+        let u_lo_ea = u_lo_n * 2.0 - 1.0;
+        let u_hi_ea = (u_lo_n + cell_n) * 2.0 - 1.0;
         let n_u_lo = u_axis - ea_to_cube(u_lo_ea) * n_axis;
         let n_u_hi = u_axis - ea_to_cube(u_hi_ea) * n_axis;
 
-        let v_lo_ea = (iv       / cells_d) * 2.0 - 1.0;
-        let v_hi_ea = ((iv+1.0) / cells_d) * 2.0 - 1.0;
+        let v_lo_ea = v_lo_n * 2.0 - 1.0;
+        let v_hi_ea = (v_lo_n + cell_n) * 2.0 - 1.0;
         let n_v_lo = v_axis - ea_to_cube(v_lo_ea) * n_axis;
         let n_v_hi = v_axis - ea_to_cube(v_hi_ea) * n_axis;
 
-        let r_lo = cs_inner + (ir       / cells_d) * shell;
-        let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
+        let r_lo = cs_inner + r_lo_n * shell;
+        let r_hi = cs_inner + (r_lo_n + cell_n) * shell;
 
         var t_next = t_exit + 1.0;
         var winning_face: u32 = 6u;
@@ -374,7 +434,225 @@ fn sphere_in_cell(
 
         if t_next >= t_exit { break; }
         last_face_id = winning_face;
-        let cell_eps = max(shell / cells_d * 1e-3, 1e-7);
+        let cell_eps = max(shell * cell_n * 1e-3, 1e-7);
+        t = t_next + cell_eps;
+    }
+
+    return result;
+}
+
+// Walker that descends a face subtree starting from an ARBITRARY
+// node (typically deep inside the face subtree, not necessarily the
+// face_root). Same accumulation as `walk_face_subtree`; the caller
+// provides starting (un, vn, rn) which are interpreted as the
+// FRAME-LOCAL coords (in [0, 1] of the frame's subregion).
+fn walk_face_subtree_from(
+    start_node_idx: u32,
+    un_in: f32, vn_in: f32, rn_in: f32,
+) -> WalkResult {
+    var node = start_node_idx;
+    var un = clamp(un_in, 0.0, 0.9999999);
+    var vn = clamp(vn_in, 0.0, 0.9999999);
+    var rn = clamp(rn_in, 0.0, 0.9999999);
+    var u_lo: f32 = 0.0;
+    var v_lo: f32 = 0.0;
+    var r_lo: f32 = 0.0;
+    var size: f32 = 1.0;
+    var result: WalkResult;
+    for (var d: u32 = 1u; d <= 22u; d = d + 1u) {
+        let us = min(u32(un * 3.0), 2u);
+        let vs = min(u32(vn * 3.0), 2u);
+        let rs = min(u32(rn * 3.0), 2u);
+        let next_size = size / 3.0;
+        let next_u_lo = u_lo + f32(us) * next_size;
+        let next_v_lo = v_lo + f32(vs) * next_size;
+        let next_r_lo = r_lo + f32(rs) * next_size;
+        let slot = rs * 9u + vs * 3u + us;
+        let packed = child_packed(node, slot);
+        let tag = child_tag(packed);
+        if tag == 0u {
+            result.block_id = 0u; result.term_depth = d;
+            result.u_lo = next_u_lo; result.v_lo = next_v_lo; result.r_lo = next_r_lo;
+            result.cell_size = next_size;
+            return result;
+        }
+        if tag == 1u {
+            result.block_id = child_block_type(packed); result.term_depth = d;
+            result.u_lo = next_u_lo; result.v_lo = next_v_lo; result.r_lo = next_r_lo;
+            result.cell_size = next_size;
+            return result;
+        }
+        node = child_node_index(node, slot);
+        un = un * 3.0 - f32(us);
+        vn = vn * 3.0 - f32(vs);
+        rn = rn * 3.0 - f32(rs);
+        u_lo = next_u_lo;
+        v_lo = next_v_lo;
+        r_lo = next_r_lo;
+        size = next_size;
+    }
+    result.block_id = 0u; result.term_depth = 22u;
+    result.u_lo = u_lo; result.v_lo = v_lo; result.r_lo = r_lo;
+    result.cell_size = size;
+    return result;
+}
+
+// Per-frame sphere DDA. Operates entirely in the frame's local face
+// coords [0, 1] for descent, with reference-plus-delta plane normals
+// for ray-cell intersection. Linearizes the cube-sphere mapping at
+// the camera; valid for samples within the frame's world extent
+// (~ shell / 3^frame_face_subtree_depth). Returns a HitResult with
+// `t` in WORLD units so it composites with other ribbon frames'
+// hits and the global sphere pass.
+fn sphere_in_frame(frame: RibbonFrame, ray_dir: vec3<f32>) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    if frame.sphere_active == 0u { return result; }
+
+    let oc = uniforms.planet.oc_world.xyz;  // camera relative to body center, world units
+    let cs_outer = frame.sphere_outer_r_world;
+    let cs_inner = frame.sphere_inner_r_world;
+    let shell = frame.sphere_shell_world;
+
+    // Outer sphere intersection (numerical-recipes form for stability).
+    let b = dot(oc, ray_dir);
+    let c_outer = dot(oc, oc) - cs_outer * cs_outer;
+    let disc = b * b - c_outer;
+    if disc <= 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_enter = max(-b - sq, 0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return result; }
+
+    // Camera projection onto the frame's face. We use the FRAME's
+    // face axes, not pick_face — the frame has a pre-determined
+    // face-subtree branch. If camera is on a different face the
+    // dot products are still well-defined; the walker just rejects
+    // samples outside the frame's [0, 1] region.
+    let n_axis = frame.face_n_axis.xyz;
+    let u_axis_w = face_u_axis(frame.face);
+    let v_axis_w = face_v_axis(frame.face);
+
+    // Sample's (un, vn, rn) parameterized via linearization at the
+    // camera. Validity: errors grow as `t^2 * curvature`. Within a
+    // ribbon frame's world extent (~ shell / 3^K for K = frame's
+    // face-subtree depth), this stays << one frame-local cell.
+    let oc_n = dot(oc, n_axis);
+    if abs(oc_n) < 1e-10 { return result; }
+    let cube_u_cam = dot(oc, u_axis_w) / oc_n;
+    let cube_v_cam = dot(oc, v_axis_w) / oc_n;
+    let dcube_u_dt = (dot(ray_dir, u_axis_w) - cube_u_cam * dot(ray_dir, n_axis)) / oc_n;
+    let dcube_v_dt = (dot(ray_dir, v_axis_w) - cube_v_cam * dot(ray_dir, n_axis)) / oc_n;
+    let inv_one_plus_uu = 1.0 / (1.0 + cube_u_cam * cube_u_cam);
+    let inv_one_plus_vv = 1.0 / (1.0 + cube_v_cam * cube_v_cam);
+    let dun_dt = 0.5 * (4.0 / PI_F) * inv_one_plus_uu * dcube_u_dt;
+    let dvn_dt = 0.5 * (4.0 / PI_F) * inv_one_plus_vv * dcube_v_dt;
+    let r_camera = sqrt(dot(oc, oc));
+    let drn_dt = (dot(oc, ray_dir) / r_camera) / shell;
+
+    let inv_size = 1.0 / max(frame.frame_un_size, 1e-30);
+    let alpha_un_remainder = dun_dt * inv_size;
+    let alpha_vn_remainder = dvn_dt * inv_size;
+    let alpha_rn_remainder = drn_dt * inv_size;
+
+    let frame_n_u_lo = frame.frame_n_u_lo_ref.xyz;
+    let frame_n_v_lo = frame.frame_n_v_lo_ref.xyz;
+    let alpha_n_u = frame.frame_alpha_n_u;
+    let alpha_n_v = frame.frame_alpha_n_v;
+    let alpha_r = frame.frame_alpha_r;
+
+    let eps_init = max(shell * 1e-5, 1e-7);
+    var t = t_enter + eps_init;
+    var steps = 0u;
+    var last_face_id: u32 = 6u;
+
+    loop {
+        if t >= t_exit || steps > 4096u { break; }
+        steps = steps + 1u;
+
+        // Sample's frame-local remainders via linearization.
+        let dt = t;
+        let sample_un = frame.camera_un_remainder + alpha_un_remainder * dt;
+        let sample_vn = frame.camera_vn_remainder + alpha_vn_remainder * dt;
+        let sample_rn = frame.camera_rn_remainder + alpha_rn_remainder * dt;
+
+        // Validity: sample must lie within the frame's [0, 1]
+        // subregion AND the sphere shell.
+        if sample_un < 0.0 || sample_un >= 1.0 { break; }
+        if sample_vn < 0.0 || sample_vn >= 1.0 { break; }
+        if sample_rn < 0.0 || sample_rn >= 1.0 { break; }
+
+        // Walk face subtree from the frame's root, with frame-local
+        // (un, vn, rn) in [0, 1].
+        let walk = walk_face_subtree_from(
+            frame.frame_face_node_idx,
+            sample_un, sample_vn, sample_rn,
+        );
+
+        if walk.block_id != 0u {
+            // Hit. Normal: use last crossed face axis (cube approx).
+            var hit_normal: vec3<f32>;
+            switch last_face_id {
+                case 0u: { hit_normal = -u_axis_w; }
+                case 1u: { hit_normal =  u_axis_w; }
+                case 2u: { hit_normal = -v_axis_w; }
+                case 3u: { hit_normal =  v_axis_w; }
+                case 4u: { hit_normal = -n_axis; }
+                case 5u: { hit_normal =  n_axis; }
+                default: { hit_normal =  n_axis; }
+            }
+            let cell_color = palette.colors[walk.block_id].rgb;
+            let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
+            let diffuse = max(dot(hit_normal, sun_dir), 0.0);
+            let ambient = 0.25;
+            result.hit = true;
+            result.t = t;
+            result.normal = hit_normal;
+            result.color = cell_color * (ambient + diffuse * 0.75);
+            return result;
+        }
+
+        // Cell boundary planes via reference-plus-delta. The cell's
+        // u_lo in the frame's [0, 1] is `walk.u_lo`. World plane
+        // normal at that boundary:
+        //   n_u_at_walk_u_lo = frame_n_u_lo_ref - walk.u_lo * alpha_n_u * n_axis
+        // Both terms have bounded f32 magnitudes; the product
+        // `walk.u_lo * alpha_n_u` is small (alpha is ~frame_un_size *
+        // sec^2, frame_un_size << 1 for deep frames). Subtraction
+        // gives a precision-stable plane normal.
+        let n_u_lo = frame_n_u_lo - walk.u_lo * alpha_n_u * n_axis;
+        let n_u_hi = frame_n_u_lo - (walk.u_lo + walk.cell_size) * alpha_n_u * n_axis;
+        let n_v_lo = frame_n_v_lo - walk.v_lo * alpha_n_v * n_axis;
+        let n_v_hi = frame_n_v_lo - (walk.v_lo + walk.cell_size) * alpha_n_v * n_axis;
+
+        let r_lo = frame.frame_r_lo_world + walk.r_lo * alpha_r;
+        let r_hi = frame.frame_r_lo_world + (walk.r_lo + walk.cell_size) * alpha_r;
+
+        var t_next = t_exit + 1.0;
+        var winning_face: u32 = 6u;
+        let zero3 = vec3<f32>(0.0);
+        let cand_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if cand_u_lo > t && cand_u_lo < t_next { t_next = cand_u_lo; winning_face = 0u; }
+        let cand_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if cand_u_hi > t && cand_u_hi < t_next { t_next = cand_u_hi; winning_face = 1u; }
+        let cand_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if cand_v_lo > t && cand_v_lo < t_next { t_next = cand_v_lo; winning_face = 2u; }
+        let cand_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if cand_v_hi > t && cand_v_hi < t_next { t_next = cand_v_hi; winning_face = 3u; }
+        let cand_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo, t);
+        if cand_r_lo > t && cand_r_lo < t_next { t_next = cand_r_lo; winning_face = 4u; }
+        let cand_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi, t);
+        if cand_r_hi > t && cand_r_hi < t_next { t_next = cand_r_hi; winning_face = 5u; }
+
+        if t_next >= t_exit { break; }
+        last_face_id = winning_face;
+        // Advance step: scaled to current cell's WORLD size to
+        // prevent overstepping at deep cells. Floor at 1e-7 keeps t
+        // moving when the cell-scaled value falls below f32 ULP
+        // (deep deep cells; ray will skip but won't infinite-loop).
+        let cell_world_size = max(alpha_r * walk.cell_size, 1e-30);
+        let cell_eps = max(cell_world_size * 1e-3, 1e-7);
         t = t_next + cell_eps;
     }
 
@@ -637,12 +915,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     for (var i: u32 = 0u; i < uniforms.ribbon_count; i = i + 1u) {
         let frame = uniforms.ribbon[i];
-        let r = march(frame.root_index, frame.camera_local.xyz, ray_dir);
-        if (r.hit) {
-            let t_world = r.t * frame.world_scale;
-            if (t_world < best_t_world) {
+        // Cartesian march. Skip when the frame is sphere-interior —
+        // the per-frame sphere DDA below renders that content with
+        // bulged geometry instead of cubic.
+        if (frame.sphere_active == 0u) {
+            let r = march(frame.root_index, frame.camera_local.xyz, ray_dir);
+            if (r.hit) {
+                let t_world = r.t * frame.world_scale;
+                if (t_world < best_t_world) {
+                    result = r;
+                    best_t_world = t_world;
+                }
+            }
+        } else {
+            // Per-frame sphere DDA in frame-local coords. Composites
+            // by world t (sphere_in_frame returns t in WORLD units).
+            let r = sphere_in_frame(frame, ray_dir);
+            if (r.hit && r.t < best_t_world) {
                 result = r;
-                best_t_world = t_world;
+                best_t_world = r.t;
             }
         }
     }
@@ -659,7 +950,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             ray_dir,
             uniforms.planet.inner_r_world,
             uniforms.planet.outer_r_world,
-            uniforms.planet.max_term_depth,
         );
         if (sphere_r.hit && sphere_r.t < best_t_world) {
             result = sphere_r;
