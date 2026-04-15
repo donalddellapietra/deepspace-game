@@ -222,14 +222,6 @@ impl App {
             return;
         }
         let tree_hit = self.frame_aware_raycast();
-        if let Some(h) = &tree_hit {
-            eprintln!(
-                "highlight tree_hit: path.len={} face={} t={} place_path.len={:?} edit_depth={} cs_edit_depth={}",
-                h.path.len(), h.face, h.t,
-                h.place_path.as_ref().map(|p| p.len()),
-                self.edit_depth(), self.cs_edit_depth(),
-            );
-        }
         let aabb_world = tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h));
         // Transform AABB from world coords to frame-local coords.
         // Shader expects highlight in the same frame as `camera.pos`.

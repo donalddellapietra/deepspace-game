@@ -107,9 +107,50 @@ pub fn cpu_raycast_in_frame(
 
     loop {
         let frame_root_id = chain[current_frame_depth];
-        // Inner raycast at this frame.
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
-        if let Some(mut hit) = cpu_raycast_with_face_depth(
+
+        // Frame-root NodeKind dispatch (mirror of the renderer's
+        // root_kind). When the frame IS a sphere body, the body's
+        // children aren't Cartesian XYZ slots — they're 6 face
+        // subtrees + interior + voids. Running cpu_raycast_with_face_depth
+        // on the body would descend the face subtree as if it were
+        // Cartesian, returning bogus rep-block hits at random face
+        // cells. Dispatch directly to cs_raycast_in_body instead,
+        // with the body filling the [0, 3)³ frame.
+        let frame_node = library.get(frame_root_id);
+        let frame_kind = frame_node.map(|n| n.kind);
+        if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
+            let body_origin = [0.0f32; 3];
+            let body_size = 3.0;
+            // ancestor_path inside the inner call must be the path
+            // from the inner root (the body itself). Empty here:
+            // the body IS the root of this raycast, and the
+            // outer prepend-loop will glue on the frame entries
+            // (which include the body's parent slot).
+            let inner_ancestor: Vec<(NodeId, usize)> = Vec::new();
+            if let Some(mut hit) = cs_raycast_in_body(
+                library, frame_root_id, body_origin, body_size,
+                inner_r, outer_r,
+                ray_origin, ray_dir,
+                &inner_ancestor, max_face_depth,
+            ) {
+                let mut new_path: Vec<(NodeId, usize)> =
+                    Vec::with_capacity(current_frame_depth + hit.path.len());
+                new_path.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                new_path.append(&mut hit.path);
+                hit.path = new_path;
+                if let Some(mut pp) = hit.place_path.take() {
+                    let mut new_pp: Vec<(NodeId, usize)> =
+                        Vec::with_capacity(current_frame_depth + pp.len());
+                    new_pp.extend(frame_entries.iter().take(current_frame_depth).cloned());
+                    new_pp.append(&mut pp);
+                    hit.place_path = Some(new_pp);
+                }
+                return Some(hit);
+            }
+            // Sphere missed in this frame — fall through to the
+            // pop logic below.
+        } else if let Some(mut hit) = cpu_raycast_with_face_depth(
             library, frame_root_id, ray_origin, ray_dir,
             inner_max, max_face_depth,
         ) {
@@ -284,10 +325,6 @@ pub fn cpu_raycast_with_face_depth(
                 }
 
                 if (depth as u32 + 1) >= max_depth {
-                    eprintln!(
-                        "  cpu_raycast: max_depth check depth={} max_depth={} child_id={} rep_block={} node_id={} slot={}",
-                        depth, max_depth, child_id, child_node.representative_block, node_id, slot,
-                    );
                     // At max depth, treat node as solid — unless its
                     // subtree is all-empty (dominant_block == 255).
                     if child_node.representative_block == 255 {
@@ -1359,6 +1396,43 @@ mod tests {
         let h = hit.unwrap();
         assert_eq!(h.face, 4,
             "should be sphere hit (face=4), not Cartesian fallback");
+    }
+
+    #[test]
+    fn cpu_raycast_in_frame_dispatches_sphere_when_frame_is_body() {
+        // Regression: when the camera frame is itself the
+        // CubedSphereBody (camera path goes [13, ...]), the inner
+        // raycast must dispatch to cs_raycast_in_body, not run a
+        // Cartesian DDA on the body's children. Prior bug: face
+        // subtree nodes (CubedSphereFace kind) didn't trigger
+        // sphere dispatch and got returned as Cartesian solid hits
+        // via the rep-block max_depth fallback (face=2, path=5+).
+        use crate::world::worldgen::generate_world;
+        use crate::world::spherical_worldgen::{demo_planet, install_at_root_center};
+
+        let mut world = generate_world();
+        let setup = demo_planet();
+        let (new_root, _planet_path) =
+            install_at_root_center(&mut world.library, world.root, &setup);
+        world.swap_root(new_root);
+
+        // Camera inside the body cell, frame = [13] (body).
+        // cam_local in body's [0, 3) frame.
+        let cam_local = [1.5, 1.5, 1.5];
+        let ray_dir = [0.0, -1.0, 0.0];
+        let frame_path = [13u8];
+
+        let hit = cpu_raycast_in_frame(
+            &world.library, world.root,
+            &frame_path, cam_local, ray_dir,
+            10, 4,
+        );
+        if let Some(h) = &hit {
+            assert_eq!(h.face, 4,
+                "body-as-frame must produce sphere hit (face=4), \
+                 not Cartesian fallback (face=2). Got path.len={} face={}",
+                h.path.len(), h.face);
+        }
     }
 
     #[test]
