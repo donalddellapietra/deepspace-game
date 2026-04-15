@@ -259,12 +259,33 @@ struct HitResult {
     color: vec3<f32>,
     normal: vec3<f32>,
     t: f32,
+    cell_min: vec3<f32>,
+    cell_size: f32,
+}
+
+fn face_uv_for_normal(local: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let an = abs(normal);
+    if an.x >= an.y && an.x >= an.z {
+        return local.yz;
+    }
+    if an.y >= an.z {
+        return local.xz;
+    }
+    return local.xy;
+}
+
+fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let uv = face_uv_for_normal(local, normal);
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    return smoothstep(0.02, 0.14, edge);
 }
 
 fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -419,6 +440,8 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette.colors[child_block_type(packed)].rgb;
             result.normal = normal;
+            result.cell_min = cell_min_h;
+            result.cell_size = s_cell_size[depth];
             return result;
         } else if tag == 2u {
             // Node — check if we should descend or treat as solid.
@@ -463,6 +486,8 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                     result.t = max(cell_box_l.t_enter, 0.0);
                     result.color = palette.colors[bt].rgb;
                     result.normal = normal;
+                    result.cell_min = cell_min_l;
+                    result.cell_size = s_cell_size[depth];
                     return result;
                 }
             }
@@ -625,6 +650,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let walk = sample_face_tree(face_root(face), un, vn, rn);
                 let block_id = walk.x;
                 let term_depth = walk.y;
+                let cells_d = pow(3.0, f32(term_depth));
+                let iu = floor(un * cells_d);
+                let iv = floor(vn * cells_d);
+                let ir = floor(rn * cells_d);
                 if block_id != 0u {
                     // Face the normal against the ray so shading is
                     // never backlit through a surface we just crossed.
@@ -644,7 +673,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     let axis_tint = abs(face_n.y) * 1.0
                                   + (abs(face_n.x) + abs(face_n.z)) * 0.82;
                     let ambient = 0.22;
-                    var surface = cell_color * (ambient + diffuse * 0.78) * axis_tint;
+                    let cell_u = un * cells_d - iu;
+                    let cell_v = vn * cells_d - iv;
+                    let cell_r = rn * cells_d - ir;
+                    let face_edge = min(
+                        min(cell_u, 1.0 - cell_u),
+                        min(cell_v, 1.0 - cell_v),
+                    );
+                    let radial_edge = min(cell_r, 1.0 - cell_r);
+                    let bevel = smoothstep(0.02, 0.14, face_edge);
+                    let rim = smoothstep(0.02, 0.10, radial_edge);
+                    let block_shape = (0.72 + 0.28 * bevel) * (0.9 + 0.1 * rim);
+                    var surface = cell_color * (ambient + diffuse * 0.78) * axis_tint * block_shape;
 
                     // Cursor highlight: the selected cell can live at
                     // any subtree depth, not just the finest. At
@@ -673,10 +713,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                                 min(min(cell_u, 1.0 - cell_u),
                                     min(cell_v, 1.0 - cell_v)),
                                 min(cell_r, 1.0 - cell_r));
-                            // Line width: ~3% of cell, roughly one
-                            // visible "rim" at any zoom.
-                            if edge < 0.05 {
-                                surface = vec3<f32>(1.0, 0.9, 0.2);
+                            if edge < 0.08 {
+                                let glow = 1.0 - smoothstep(0.01, 0.08, edge);
+                                surface = mix(surface, vec3<f32>(1.0, 0.9, 0.15), glow);
                             }
                         }
                     }
@@ -691,11 +730,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // speedup: if the walker bottomed out at depth 1
                 // because the whole 1/27 chunk is empty, we jump
                 // 1/3 of the face per step instead of 1/3^depth.
-                let cells_d = pow(3.0, f32(term_depth));
-                let iu = floor(un * cells_d);
-                let iv = floor(vn * cells_d);
-                let ir = floor(rn * cells_d);
-
                 // u-boundaries as world planes through center.
                 let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
                 let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
@@ -748,13 +782,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var color: vec3<f32>;
     let tree_closer = result.hit && result.t <= cs_t;
+    let any_hit = tree_closer || cs_hit;
     if tree_closer {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let axis_tint = abs(result.normal.y) * 1.0
                       + (abs(result.normal.x) + abs(result.normal.z)) * 0.82;
         let ambient = 0.22;
-        let lit = result.color * (ambient + diffuse * 0.78) * axis_tint;
+        let hit_pos = camera.pos + ray_dir * result.t;
+        let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
+        let bevel = cube_face_bevel(local, result.normal);
+        let lit = result.color * (ambient + diffuse * 0.78) * axis_tint * (0.7 + 0.3 * bevel);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else if cs_hit {
         color = pow(cs_color, vec3<f32>(1.0 / 2.2));
@@ -770,6 +808,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;
         let h_size = h_max - h_min;
+        let pad = max(h_size.x * 0.02, 0.002);
+        let box_min = h_min - vec3<f32>(pad);
+        let box_max = h_max + vec3<f32>(pad);
 
         let h_inv_dir = vec3<f32>(
             select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -777,20 +818,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
         );
 
-        let hb = ray_box(camera.pos, h_inv_dir, h_min, h_max);
+        let hb = ray_box(camera.pos, h_inv_dir, box_min, box_max);
 
         if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
             let t = max(hb.t_enter, 0.0);
 
             // Only draw if the outline is in front of (or at) geometry.
-            if t <= result.t + h_size.x * 0.01 {
+            if t <= result.t + h_size.x * 0.05 {
                 let hit_pos = camera.pos + ray_dir * t;
-                let from_min = hit_pos - h_min;
-                let from_max = h_max - hit_pos;
+                let from_min = hit_pos - box_min;
+                let from_max = box_max - hit_pos;
 
                 // Screen-space edge width: ~1.5 pixels regardless of distance.
                 let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
-                let ew = max(pixel_world * 1.5, h_size.x * 0.003);
+                let ew = max(pixel_world * 2.25, h_size.x * 0.02);
 
                 // An edge exists where at least 2 of the 3 axes are near a face boundary.
                 let near_x = from_min.x < ew || from_max.x < ew;
@@ -799,7 +840,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
 
                 if edge_count >= 2u {
-                    color = mix(color, vec3<f32>(0.1, 0.1, 0.1), 0.7);
+                    color = mix(color, vec3<f32>(1.0, 0.92, 0.18), 0.92);
                 }
             }
         }
@@ -815,8 +856,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_crosshair = (d.x < cross_thickness && d.y >= gap && d.y < cross_size)
                     || (d.y < cross_thickness && d.x >= gap && d.x < cross_size);
     if is_crosshair {
-        // Invert color for visibility against any background.
-        color = vec3<f32>(1.0) - color;
+        let cross_color = select(
+            vec3<f32>(0.95, 0.95, 0.98),
+            vec3<f32>(1.0, 0.92, 0.18),
+            any_hit,
+        );
+        color = mix(color, cross_color, 0.95);
     }
 
     return vec4<f32>(color, 1.0);
