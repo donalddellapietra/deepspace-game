@@ -243,28 +243,59 @@ pub fn build_ribbon(
         emitted_depths.remove(penultimate);
     }
 
+    // Body-interior frames whose face-subtree depth is below this
+    // threshold are filtered from the ribbon. At shallow face-
+    // subtree depths:
+    //   1. `frame_root` is a Cartesian face-subtree internal node
+    //      (kind = 0). If kept, the shader's `march()` would walk
+    //      it Cartesian-style and render face-subtree cells as
+    //      cubes overlapping the sphere — the "world becomes
+    //      stone" symptom.
+    //   2. The per-frame sphere DDA's camera-anchored linearization
+    //      isn't accurate enough at shallow K anyway (error
+    //      ~ frame_extent² × curvature grows faster than cell
+    //      size).
+    // Below MIN_SPHERE_FRAME_FACE_DEPTH, the global sphere pass
+    // handles sphere rendering; at or above, the frame stays with
+    // sphere_active=1 for per-frame DDA.
+    const MIN_SPHERE_FRAME_FACE_DEPTH: u8 = 6;
+
     for &depth in &emitted_depths {
         let mut path = anchor;
         path.truncate(depth);
 
-        // Walk world_root to resolve the node at this path. KEEP
-        // body-interior frames in the ribbon — the per-frame sphere
-        // DDA in the shader will render them with frame-local
-        // precision. The Cartesian march in the shader skips them
-        // (its `root_kind != 0u` early-out). The CPU's
-        // `compute_sphere_frame_data` decides per-frame whether to
-        // set sphere_active=1 (deep enough for accurate
-        // linearization) or 0 (fall back to global sphere pass).
+        // Walk world_root. Track whether the walk crosses a
+        // CubedSphereBody and where (so we can compute the frame's
+        // face-subtree depth for the filter).
         let mut node_id = world_root;
+        let mut body_crossed_at: Option<u8> = None;
         for k in 0..path.depth() as usize {
             let Some(node) = library.get(node_id) else { break };
+            if matches!(node.kind, NodeKind::CubedSphereBody { .. })
+                && body_crossed_at.is_none()
+            {
+                body_crossed_at = Some(k as u8);
+            }
             let slot = path.slot(k) as usize;
             match node.children[slot] {
                 Child::Node(cid) => { node_id = cid; }
                 _ => break,
             }
         }
-        let _ = NodeKind::Cartesian; // keep import live
+
+        // If body_crossed_at == Some(K), the body is at path depth
+        // K, so the face subtree starts at path depth K+1 and this
+        // frame's face-subtree depth = path.depth() - K - 1.
+        if let Some(body_depth) = body_crossed_at {
+            let face_subtree_depth = path.depth()
+                .saturating_sub(body_depth)
+                .saturating_sub(1);
+            if face_subtree_depth < MIN_SPHERE_FRAME_FACE_DEPTH {
+                // Shallow body-interior — filter out. Global sphere
+                // pass will render this region.
+                continue;
+            }
+        }
 
         let camera_local = camera.in_frame(&path);
         let world_scale = (1.0_f32 / 3.0_f32).powi(depth as i32);
