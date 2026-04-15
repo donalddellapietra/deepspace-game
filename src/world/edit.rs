@@ -934,28 +934,37 @@ fn cs_raycast_in_body(
     let t_exit = -b + sq;
     if t_exit <= 0.0 { return None; }
 
-    // Step size scales with the deepest face-subtree depth observed.
-    // Start coarse (1/3 of shell) and refine as we sample finer cells.
+    // Step size scales with the deepest face-subtree depth
+    // observed. One step = 1/3 of the current cell. The loop
+    // exits via `t >= t_exit` (ray left the shell) or
+    // when a hit is found — no absolute-scale caps.
+    //
+    // Architectural note: this loop is still approximation-based
+    // (step-and-sample) rather than a proper analytical cell-DDA
+    // like the shader's sphere_in_cell. A fully symmetric CPU
+    // raycast would port the shader's boundary-intersection math
+    // (ray-plane for u/v, ray-sphere for r) and step exactly to
+    // the next cell boundary each iteration. Tracked in undone.md.
+    let eps = shell * 1e-5;
     let mut step_world = shell * 0.33;
-    let eps = (shell * 1e-5).max(1e-7);
     let mut t = t_enter + eps;
-    // Tracks the last empty cell's face-subtree path. On block hit,
-    // THIS is the placement target: it's the cell the ray was in one
-    // step before striking the block, which by construction is empty
-    // and adjacent to the block along the ray. This replaces the
-    // broken `face_for_placement` mapping that tried to infer an
-    // xyz-axis delta from which cubed-sphere boundary was crossed —
-    // face-subtree slots are (u,v,r), not (x,y,z), so an xyz delta
-    // applied via `place_child` landed in the wrong cell (or into
-    // solid rock, making placement silently fail).
-    let mut prev_place_path: Option<Vec<(NodeId, usize)>> = None;
-    let max_steps = 8_000usize;
-    for _ in 0..max_steps {
+    // `last_axis`: which of the 6 cell boundaries was most
+    // recently crossed. 4 = r_lo (going inward), 5 = r_hi
+    // (outward), 0/1 = u_lo/u_hi, 2/3 = v_lo/v_hi. Used to
+    // derive the placement cell as the hit's neighbor along
+    // the ray's approach direction.
+    let mut last_axis: u8 = 4; // default: ray coming from outside
+    for _ in 0..8_000usize {
         if t >= t_exit { break; }
         let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
         let local = sdf::sub(p, cs_center);
         let r = sdf::length(local);
-        if r >= cs_outer || r < cs_inner { break; }
+        if r >= cs_outer {
+            last_axis = 5; t += step_world; continue;
+        }
+        if r < cs_inner {
+            last_axis = 4; t += step_world; continue;
+        }
 
         let coord = world_to_coord(cs_center, p)?;
         let face = coord.face;
@@ -963,52 +972,88 @@ fn cs_raycast_in_body(
         let body_node = library.get(body_id)?;
         let face_root_id = match body_node.children[face_slot] {
             Child::Node(id) => id,
-            _ => {
-                t += step_world;
-                continue;
-            }
+            _ => { t += step_world; continue; }
         };
         let un = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
 
-        let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn, max_face_depth);
-        if let Some((block_id, term_depth, mut face_path)) = walk {
+        let walk = walk_face_subtree_with_path(
+            library, face_root_id, un, vn, rn, max_face_depth,
+        );
+        if let Some((block_id, term_depth, face_path)) = walk {
             if block_id != 0 {
                 let mut full_path = ancestor_path.to_vec();
                 full_path.push((body_id, face_slot));
-                full_path.append(&mut face_path);
+                full_path.extend(face_path.iter().cloned());
+                // Place_path: the hit cell's neighbor along the
+                // ray's approach axis. Derived from the cell
+                // itself, not from step-traced sampling — so it's
+                // scale-invariant and correct at any cs_edit_depth.
+                let place_path = derive_place_path(
+                    ancestor_path, body_id, face_slot,
+                    &face_path, last_axis,
+                );
                 return Some(HitInfo {
                     path: full_path,
-                    face: 4, // unused for sphere hits; place_path drives placement
+                    face: 4,
                     t,
-                    place_path: prev_place_path,
+                    place_path,
                 });
             }
-            // Empty cell — record its full path as the candidate
-            // placement target. Step refinement uses the cell's
-            // nominal width, BUT clamped to a sane minimum so we
-            // don't crawl through huge empty regions one
-            // sub-cell at a time. With max_face_depth deep + the
-            // surface several levels deeper than the cap, every
-            // cap-empty cell is part of a much bigger empty
-            // region and refining to nominal cell width burns the
-            // entire `max_steps` budget before reaching content.
-            // Floor at shell/100 so we always traverse the shell
-            // in O(100) steps regardless of cap depth.
-            let mut empty_full = ancestor_path.to_vec();
-            empty_full.push((body_id, face_slot));
-            empty_full.append(&mut face_path);
-            prev_place_path = Some(empty_full);
+            // Empty cell — refine step to cell width / 3.
             let cells_d = 3.0_f32.powi(term_depth as i32);
-            let nominal = shell / cells_d * 0.33;
-            let coarse_floor = shell * 0.01;
-            step_world = nominal.max(coarse_floor).max(eps * 4.0);
+            step_world = (shell / cells_d * 0.33).max(eps * 4.0);
         }
         t += step_world;
     }
 
     None
+}
+
+/// Given the hit's face subtree path and the ray's last-crossed
+/// boundary, compute the neighbor cell's face subtree path. The
+/// neighbor is the cell the ray WAS in just before entering the
+/// hit cell, along the approach axis — the natural placement
+/// target for "block in front of player."
+///
+/// Returns `None` when the neighbor is outside the hit cell's
+/// immediate parent (requires cross-parent walk, not yet handled).
+fn derive_place_path(
+    ancestor_path: &[(NodeId, usize)],
+    body_id: NodeId,
+    face_slot: usize,
+    face_path: &[(NodeId, usize)],
+    last_axis: u8,
+) -> Option<Vec<(NodeId, usize)>> {
+    let &last_entry = face_path.last()?;
+    let (parent_id, slot) = last_entry;
+    let (us, vs, rs) = slot_coords(slot);
+    // last_axis semantics: 0=u_lo crossed (ray going -u), 1=u_hi
+    // (+u), 2=v_lo (-v), 3=v_hi (+v), 4=r_lo (going inward,
+    // came from outer = rs+1), 5=r_hi (outward, from rs-1).
+    let (du, dv, dr): (i32, i32, i32) = match last_axis {
+        0 => (1, 0, 0),
+        1 => (-1, 0, 0),
+        2 => (0, 1, 0),
+        3 => (0, -1, 0),
+        4 => (0, 0, 1),
+        5 => (0, 0, -1),
+        _ => return None,
+    };
+    let nu = us as i32 + du;
+    let nv = vs as i32 + dv;
+    let nr = rs as i32 + dr;
+    if !(0..=2).contains(&nu) || !(0..=2).contains(&nv) || !(0..=2).contains(&nr) {
+        return None; // cross-parent neighbor — not handled
+    }
+    let neighbor_slot = slot_index(nu as usize, nv as usize, nr as usize);
+    let mut place = ancestor_path.to_vec();
+    place.push((body_id, face_slot));
+    // Copy face_path except LAST entry, replace that with (parent, neighbor_slot).
+    place.extend(face_path[..face_path.len() - 1].iter().cloned());
+    place.push((parent_id, neighbor_slot));
+    Some(place)
 }
 
 /// CPU walker mirror of the shader's `walk_face_subtree`.
