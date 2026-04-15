@@ -19,6 +19,17 @@ impl App {
         self.anchor_depth().saturating_sub(1).max(1)
     }
 
+    /// Face-subtree depth at which sphere edits land — picks a
+    /// user-visible cell granularity instead of the planet's
+    /// deepest sub-pixel resolution. Without this cap the walker
+    /// descends all 20 face-subtree levels and breaks/places
+    /// modify cells smaller than a pixel — they succeed but are
+    /// invisible. Mirrors the old `cs_edit_depth = 4 + (15 -
+    /// zoom_level)` formula, clamped to `[1, 14]`.
+    pub(super) fn cs_edit_depth(&self) -> u32 {
+        ((self.anchor_depth() as i32) - 4).clamp(1, 14) as u32
+    }
+
     pub(super) fn visual_depth(&self) -> u32 {
         (self.edit_depth() + 3).min(16)
     }
@@ -42,9 +53,10 @@ impl App {
     pub(super) fn do_break(&mut self) {
         let ray_dir = self.camera.forward();
         let camera_pos = self.camera.world_pos_f32();
-        let hit = edit::cpu_raycast(
+        let hit = edit::cpu_raycast_with_face_depth(
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
+            self.cs_edit_depth(),
         );
         eprintln!("do_break: hit={:?}",
             hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
@@ -81,9 +93,10 @@ impl App {
     pub(super) fn do_place(&mut self) {
         let ray_dir = self.camera.forward();
         let camera_pos = self.camera.world_pos_f32();
-        let hit = edit::cpu_raycast(
+        let hit = edit::cpu_raycast_with_face_depth(
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
+            self.cs_edit_depth(),
         );
         eprintln!("do_place: hit={:?}",
             hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
@@ -136,9 +149,10 @@ impl App {
         }
         let ray_dir = self.camera.forward();
         let camera_pos = self.camera.world_pos_f32();
-        let tree_hit = edit::cpu_raycast(
+        let tree_hit = edit::cpu_raycast_with_face_depth(
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
+            self.cs_edit_depth(),
         );
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(

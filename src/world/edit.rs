@@ -45,6 +45,22 @@ pub fn cpu_raycast(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
+    cpu_raycast_with_face_depth(library, root, ray_origin, ray_dir, max_depth, 6)
+}
+
+/// Same as `cpu_raycast` but with an explicit cap on how deep the
+/// face-subtree walker descends inside a `CubedSphereBody`. Cells
+/// at the deepest planet depth are sub-pixel; the cap selects the
+/// user-visible cell granularity (~3^max_face_depth cells per face
+/// axis).
+pub fn cpu_raycast_with_face_depth(
+    library: &NodeLibrary,
+    root: NodeId,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    max_depth: u32,
+    max_face_depth: u32,
+) -> Option<HitInfo> {
     let inv_dir = [
         if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
         if ray_dir[1].abs() > 1e-8 { 1.0 / ray_dir[1] } else { 1e10 },
@@ -159,6 +175,7 @@ pub fn cpu_raycast(
                         inner_r, outer_r,
                         ray_origin, ray_dir,
                         &path,
+                        max_face_depth,
                     ) {
                         return Some(sphere_hit);
                     }
@@ -716,6 +733,7 @@ fn cs_raycast_in_body(
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     ancestor_path: &[(NodeId, usize)],
+    max_face_depth: u32,
 ) -> Option<HitInfo> {
     let cs_center = [
         body_origin[0] + body_size * 0.5,
@@ -773,8 +791,10 @@ fn cs_raycast_in_body(
         let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
 
-        // Walk face subtree, tracking path.
-        let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn);
+        // Walk face subtree, tracking path. Capped at
+        // `max_face_depth` so the hit lands at a user-visible
+        // cell, not the planet's deepest sub-pixel resolution.
+        let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn, max_face_depth);
         if let Some((block_id, term_depth, mut face_path)) = walk {
             if block_id != 0 {
                 // Build full path: ancestor chain + (body's parent
@@ -817,13 +837,15 @@ fn walk_face_subtree_with_path(
     library: &NodeLibrary,
     face_root_id: NodeId,
     un_in: f32, vn_in: f32, rn_in: f32,
+    max_depth: u32,
 ) -> Option<(u8, u32, Vec<(NodeId, usize)>)> {
     let mut node_id = face_root_id;
     let mut un = un_in.clamp(0.0, 0.9999999);
     let mut vn = vn_in.clamp(0.0, 0.9999999);
     let mut rn = rn_in.clamp(0.0, 0.9999999);
     let mut path: Vec<(NodeId, usize)> = Vec::new();
-    for d in 1u32..=22 {
+    let limit = max_depth.min(22);
+    for d in 1u32..=limit {
         let node = library.get(node_id)?;
         let us = ((un * 3.0) as usize).min(2);
         let vs = ((vn * 3.0) as usize).min(2);
@@ -834,6 +856,17 @@ fn walk_face_subtree_with_path(
             Child::Empty => return Some((0, d, path)),
             Child::Block(b) => return Some((b, d, path)),
             Child::Node(nid) => {
+                if d == limit {
+                    // Hit the depth cap mid-descent. Treat the
+                    // cell at this path entry as the target and
+                    // report what's there: the subtree's
+                    // representative block (so the cursor lands
+                    // on a chunk-sized cell, not pixel-deep).
+                    let rep = library.get(nid)
+                        .map(|n| n.representative_block).unwrap_or(255);
+                    let block = if rep < 255 { rep } else { 0 };
+                    return Some((block, d, path));
+                }
                 node_id = nid;
                 un = un * 3.0 - us as f32;
                 vn = vn * 3.0 - vs as f32;
@@ -841,7 +874,7 @@ fn walk_face_subtree_with_path(
             }
         }
     }
-    Some((0, 22, path))
+    Some((0, limit, path))
 }
 
 /// Compute the world-space AABB of the block at the hit location.
