@@ -101,10 +101,14 @@ impl App {
         let body_center = crate::world::coords::world_pos_to_f32(
             &crate::world::coords::WorldPos { anchor: scene.body_anchor, offset: [0.5, 0.5, 0.5] },
         );
+        // Camera default look direction is `-Z` (with a small -0.3
+        // pitch, so it tilts down). Spawn 1.0 world units south of
+        // the body on the `+Z` side so that "forward" looks straight
+        // at the planet, just outside its influence radius.
         let spawn_pos = [
             body_center[0],
-            (body_center[1] - 1.0).max(0.2),
-            body_center[2],
+            body_center[1],
+            (body_center[2] + 1.0).min(2.95),
         ];
 
         let world = scene.world;
