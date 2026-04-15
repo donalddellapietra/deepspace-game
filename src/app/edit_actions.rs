@@ -144,8 +144,14 @@ impl App {
     pub(super) fn upload_tree_lod(&mut self) {
         let (intended_frame, _frame_root_id) = self.render_frame();
         let cam_world = self.camera.world_pos_f32();
-        let (tree_data, node_kinds, _world_root_idx) = gpu::pack_tree_lod(
+        // Preserve the intended frame path through the pack so
+        // build_ribbon can walk it. Without this, uniform-empty
+        // Cartesian siblings on the camera's path get flattened
+        // and the ribbon stops at world.root — defeating frame
+        // descent and pinning camera precision regardless of zoom.
+        let (tree_data, node_kinds, _world_root_idx) = gpu::pack_tree_lod_preserving(
             &self.world.library, self.world.root, cam_world, 1440.0, 1.2,
+            intended_frame.as_slice(),
         );
         // build_ribbon may stop short of the intended frame when
         // pack LOD-flattened a sibling on the way down (uniform-

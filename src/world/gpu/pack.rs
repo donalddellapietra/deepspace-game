@@ -89,6 +89,47 @@ pub fn pack_tree_lod(
     screen_height: f32,
     fov: f32,
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
+    pack_tree_lod_preserving(library, root, camera_pos, screen_height, fov, &[])
+}
+
+/// Like `pack_tree_lod`, but with a `preserve_path`: the slots
+/// on the camera's anchor from `root`. Slots on the preserve
+/// path are NEVER LOD-flattened or uniform-collapsed — they're
+/// always emitted as Node children so `build_ribbon` can walk
+/// the full chain and the shader can lift the camera frame
+/// arbitrarily deep.
+///
+/// This is what unlocks layer-1 descent: with `preserve_path`
+/// passed, the frame can sit at any depth in the camera's
+/// anchor chain regardless of how distant or uniform the
+/// surrounding cells are.
+pub fn pack_tree_lod_preserving(
+    library: &NodeLibrary,
+    root: NodeId,
+    camera_pos: [f32; 3],
+    screen_height: f32,
+    fov: f32,
+    preserve_path: &[u8],
+) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
+    use std::collections::HashSet;
+
+    // Build the set of (parent_node_id, slot) pairs on the camera
+    // path that must NOT be flattened. Walk from root following
+    // `preserve_path` slot-by-slot, recording the (current,
+    // slot) pair at each step.
+    let mut preserve_pairs: HashSet<(NodeId, u8)> = HashSet::new();
+    {
+        let mut current = root;
+        for &slot in preserve_path {
+            preserve_pairs.insert((current, slot));
+            let Some(node) = library.get(current) else { break };
+            match node.children[slot as usize] {
+                Child::Node(child_id) => { current = child_id; }
+                _ => break,
+            }
+        }
+    }
+
     let half_fov_recip = screen_height / (2.0 * (fov * 0.5).tan());
     const LOD_THRESHOLD: f32 = 0.5;
 
@@ -138,9 +179,12 @@ pub fn pack_tree_lod(
 
                 // Uniform-content collapse — only safe for Cartesian
                 // nodes (face/body subtrees have geometry that the
-                // shader needs to walk).
+                // shader needs to walk). Skipped for slots on the
+                // camera's preserve path so build_ribbon can
+                // descend.
                 let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
-                if lod_active && child_is_cartesian
+                let on_preserve = preserve_pairs.contains(&(node_id, slot as u8));
+                if !on_preserve && lod_active && child_is_cartesian
                     && child_node.uniform_type != UNIFORM_MIXED {
                     let gpu = if child_node.uniform_type == UNIFORM_EMPTY {
                         GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
@@ -151,7 +195,7 @@ pub fn pack_tree_lod(
                     continue;
                 }
 
-                if lod_active && child_is_cartesian {
+                if !on_preserve && lod_active && child_is_cartesian {
                     let (cx, cy, cz) = slot_coords(slot);
                     let child_center = [
                         node_origin[0] + (cx as f32 + 0.5) * cell_size,
@@ -287,6 +331,83 @@ mod tests {
             &world.library, world.root, camera_pos, 1080.0, 1.2,
         );
         assert!(kinds.iter().any(|k| k.kind == 1), "body kind present");
+    }
+
+    #[test]
+    fn preserve_path_prevents_uniform_collapse() {
+        // World: root with uniform-empty Cartesian Node at every
+        // slot. Without preserve_path, all slots get tag=0
+        // (flattened). With preserve_path = [16], slot 16 stays
+        // as a Node so the ribbon can descend.
+        let mut lib = NodeLibrary::default();
+        let air = lib.insert(empty_children());
+        let root = lib.insert(uniform_children(Child::Node(air)));
+        lib.ref_inc(root);
+        let camera_pos = [1.5, 2.0, 1.5];
+
+        let (no_preserve, _, _) = pack_tree_lod(
+            &lib, root, camera_pos, 1080.0, 1.2,
+        );
+        assert_eq!(no_preserve[16].tag, 0,
+            "without preserve, slot 16 collapses to tag=0");
+
+        let (with_preserve, _, _) = pack_tree_lod_preserving(
+            &lib, root, camera_pos, 1080.0, 1.2,
+            &[16],
+        );
+        assert_eq!(with_preserve[16].tag, 2,
+            "with preserve_path=[16], slot 16 stays as a Node");
+        assert!(with_preserve[16].node_index > 0,
+            "preserved slot points to a real buffer entry");
+    }
+
+    #[test]
+    fn preserve_path_chain_lets_ribbon_descend_to_depth_n() {
+        use super::super::ribbon::build_ribbon;
+        // Build a chain of empty Cartesian nodes 10 deep. With
+        // preserve_path = [13;10], build_ribbon should walk all
+        // 10 levels.
+        let mut lib = NodeLibrary::default();
+        let mut node = lib.insert(empty_children());
+        for _ in 1..10 {
+            node = lib.insert(uniform_children(Child::Node(node)));
+        }
+        let root = node;
+        lib.ref_inc(root);
+        let camera_pos = [1.5, 1.5, 1.5];
+        let path = [13u8; 9];  // 9 descents = depth 9 frame
+
+        let (data, _kinds, _root_idx) = pack_tree_lod_preserving(
+            &lib, root, camera_pos, 1080.0, 1.2,
+            &path,
+        );
+        let r = build_ribbon(&data, &path);
+        assert_eq!(r.reached_slots.len(), 9,
+            "preserve_path enables descent through 9 levels");
+        assert_eq!(r.ribbon.len(), 9);
+    }
+
+    #[test]
+    fn preserve_path_only_affects_chain_slots() {
+        // Verify that OTHER slots (not on preserve_path) still
+        // get LOD-flattened.
+        let mut lib = NodeLibrary::default();
+        let air = lib.insert(empty_children());
+        let root = lib.insert(uniform_children(Child::Node(air)));
+        lib.ref_inc(root);
+        let camera_pos = [1.5, 2.0, 1.5];
+
+        let (data, _, _) = pack_tree_lod_preserving(
+            &lib, root, camera_pos, 1080.0, 1.2,
+            &[16],
+        );
+        // Slot 16 preserved (Node). Slots 0, 5, 13, 26 should
+        // still be flattened (tag=0).
+        assert_eq!(data[16].tag, 2);
+        for sib in [0, 5, 13, 26] {
+            assert_eq!(data[sib].tag, 0,
+                "sibling slot {sib} should be flattened");
+        }
     }
 
     #[test]
