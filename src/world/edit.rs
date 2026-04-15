@@ -156,10 +156,20 @@ pub fn cpu_raycast(
                 });
             }
             Child::Node(child_id) => {
+                // Sphere body / face cells are owned by the cubed-
+                // sphere DDA (see `editing::cs_cursor_hit`). The
+                // Cartesian raycast must treat them as empty so it
+                // doesn't punch a spurious hit through the body
+                // cube and shadow the real sphere selection.
+                let child_node = library.get(child_id)?;
+                if !child_node.kind.is_cartesian() {
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
+
                 if (depth as u32 + 1) >= max_depth {
                     // At max depth, treat node as solid — unless its
                     // subtree is all-empty (dominant_block == 255).
-                    let child_node = library.get(child_id)?;
                     if child_node.representative_block == 255 {
                         advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
                         continue;
