@@ -195,11 +195,12 @@ struct FaceWalkResult {
 // Walk a face subtree from the body node's face-center child slot,
 // returning the terminal AND the cell's normalized bounds. Bounds
 // are accumulated via Kahan compensation so cumulative error stays
-// at ~1 ULP regardless of depth (vs. ~depth ULPs naive).
+// at ~1 ULP regardless of depth.
 //
-// Loop bound stays at 22 to match the demo planet's face subtree
-// depth (20 + 2 levels of overhead for body + face root). The bound
-// disappears entirely with the unified-driver refactor.
+// Loop bound = MAX_FACE_DEPTH (matches the tree's architectural
+// limit, NOT a per-planet cap). The walker exits on Empty/Block
+// terminals, so this is effectively unbounded for real content.
+const MAX_FACE_DEPTH: u32 = 63u;
 fn walk_face_subtree(body_node_idx: u32, face: u32,
                      un_in: f32, vn_in: f32, rn_in: f32) -> FaceWalkResult {
     var result: FaceWalkResult;
@@ -231,7 +232,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     var r_sum: f32 = 0.0; var r_comp: f32 = 0.0;
     var size: f32 = 1.0;
 
-    for (var d: u32 = 2u; d <= 22u; d = d + 1u) {
+    for (var d: u32 = 2u; d <= MAX_FACE_DEPTH; d = d + 1u) {
         let us = min(u32(un * 3.0), 2u);
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
@@ -281,7 +282,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
     // Hit max depth without terminal: report deepest LOD bounds.
     result.block = 0u;
-    result.depth = 22u;
+    result.depth = MAX_FACE_DEPTH;
     result.u_lo = u_sum + u_comp;
     result.v_lo = v_sum + v_comp;
     result.r_lo = r_sum + r_comp;

@@ -934,78 +934,134 @@ fn cs_raycast_in_body(
     let t_exit = -b + sq;
     if t_exit <= 0.0 { return None; }
 
-    // Step size scales with the deepest face-subtree depth
-    // observed. One step = 1/3 of the current cell. The loop
-    // exits via `t >= t_exit` (ray left the shell) or
-    // when a hit is found — no absolute-scale caps.
+    // Analytical cell DDA — one cell per iteration, no step-size
+    // constants. Mirrors the shader's `sphere_in_cell`:
+    //   - Get current (un, vn, rn) at ray position.
+    //   - Walker returns cell's Kahan-accumulated bounds.
+    //   - If block → hit (derive place_path from last-crossed axis).
+    //   - Else: compute cell boundary crossings (ray-plane for
+    //     u/v, ray-sphere for r), step t to nearest, track which
+    //     boundary was crossed.
     //
-    // Architectural note: this loop is still approximation-based
-    // (step-and-sample) rather than a proper analytical cell-DDA
-    // like the shader's sphere_in_cell. A fully symmetric CPU
-    // raycast would port the shader's boundary-intersection math
-    // (ray-plane for u/v, ray-sphere for r) and step exactly to
-    // the next cell boundary each iteration. Tracked in undone.md.
-    let eps = shell * 1e-5;
-    let mut step_world = shell * 0.33;
-    let mut t = t_enter + eps;
-    // `last_axis`: which of the 6 cell boundaries was most
-    // recently crossed. 4 = r_lo (going inward), 5 = r_hi
-    // (outward), 0/1 = u_lo/u_hi, 2/3 = v_lo/v_hi. Used to
-    // derive the placement cell as the hit's neighbor along
-    // the ray's approach direction.
-    let mut last_axis: u8 = 4; // default: ray coming from outside
-    for _ in 0..8_000usize {
+    // Loop bound = MAX_DEPTH * 6 (generous: every cell traversal
+    // crosses at most 6 boundaries across the whole subtree).
+    let body_node = library.get(body_id)?;
+    let face_slots = FACE_SLOTS;
+    // Entry eps: step slightly past the outer-shell intersection
+    // so the `r < cs_outer` guard doesn't fire from float precision.
+    // Relative to `shell` → scale-invariant.
+    let t_eps = shell * 1e-3_f32;
+    let mut t = t_enter + t_eps;
+    let mut last_axis: u8 = 4;
+    let cell_iter_cap = (crate::world::tree::MAX_DEPTH as usize) * 6;
+    for _ in 0..cell_iter_cap {
         if t >= t_exit { break; }
         let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
         let local = sdf::sub(p, cs_center);
         let r = sdf::length(local);
-        if r >= cs_outer {
-            last_axis = 5; t += step_world; continue;
-        }
-        if r < cs_inner {
-            last_axis = 4; t += step_world; continue;
-        }
+        if r >= cs_outer || r < cs_inner { break; }
 
         let coord = world_to_coord(cs_center, p)?;
         let face = coord.face;
-        let face_slot = FACE_SLOTS[face as usize];
-        let body_node = library.get(body_id)?;
+        let face_slot = face_slots[face as usize];
         let face_root_id = match body_node.children[face_slot] {
             Child::Node(id) => id,
-            _ => { t += step_world; continue; }
+            _ => break,
         };
         let un = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
 
-        let walk = walk_face_subtree_with_path(
+        let walk = walk_face_subtree_bounded(
             library, face_root_id, un, vn, rn, max_face_depth,
         );
-        if let Some((block_id, term_depth, face_path)) = walk {
-            if block_id != 0 {
-                let mut full_path = ancestor_path.to_vec();
-                full_path.push((body_id, face_slot));
-                full_path.extend(face_path.iter().cloned());
-                // Place_path: the hit cell's neighbor along the
-                // ray's approach axis. Derived from the cell
-                // itself, not from step-traced sampling — so it's
-                // scale-invariant and correct at any cs_edit_depth.
-                let place_path = derive_place_path(
-                    ancestor_path, body_id, face_slot,
-                    &face_path, last_axis,
-                );
-                return Some(HitInfo {
-                    path: full_path,
-                    face: 4,
-                    t,
-                    place_path,
-                });
-            }
-            // Empty cell — refine step to cell width / 3.
-            let cells_d = 3.0_f32.powi(term_depth as i32);
-            step_world = (shell / cells_d * 0.33).max(eps * 4.0);
+
+        if walk.block != 0 {
+            let mut full_path = ancestor_path.to_vec();
+            full_path.push((body_id, face_slot));
+            full_path.extend(walk.path.iter().cloned());
+            let place_path = derive_place_path(
+                ancestor_path, body_id, face_slot,
+                &walk.path, last_axis,
+            );
+            return Some(HitInfo {
+                path: full_path, face: 4, t,
+                place_path,
+            });
         }
-        t += step_world;
+
+        // Empty cell — compute analytical boundary crossing.
+        // Face EA axes (in cube-space) via face tangents & normal.
+        let n_axis = face.normal();
+        let (u_axis, v_axis) = face.tangents();
+        // Cell bounds in EA coords.
+        let u_lo_ea = walk.u_lo * 2.0 - 1.0;
+        let u_hi_ea = (walk.u_lo + walk.size) * 2.0 - 1.0;
+        let v_lo_ea = walk.v_lo * 2.0 - 1.0;
+        let v_hi_ea = (walk.v_lo + walk.size) * 2.0 - 1.0;
+        // ea → cube: tan(ea * π/4).
+        let ea2c = |e: f32| (e * std::f32::consts::FRAC_PI_4).tan();
+        let n_u_lo = sdf::sub(u_axis, sdf::scale(n_axis, ea2c(u_lo_ea)));
+        let n_u_hi = sdf::sub(u_axis, sdf::scale(n_axis, ea2c(u_hi_ea)));
+        let n_v_lo = sdf::sub(v_axis, sdf::scale(n_axis, ea2c(v_lo_ea)));
+        let n_v_hi = sdf::sub(v_axis, sdf::scale(n_axis, ea2c(v_hi_ea)));
+        let r_lo = cs_inner + walk.r_lo * shell;
+        let r_hi = cs_inner + (walk.r_lo + walk.size) * shell;
+
+        let oc = sdf::sub(ray_origin, cs_center);
+        // Ray-plane t: given plane through origin with normal n,
+        // t such that (oc + t*dir) · n = 0 → t = -oc·n / dir·n.
+        let plane_t = |plane_n: [f32; 3]| -> f32 {
+            let d = sdf::dot(ray_dir, plane_n);
+            if d.abs() < 1e-30 { return f32::INFINITY; }
+            -sdf::dot(oc, plane_n) / d
+        };
+        // Ray-sphere-after: next crossing with radius-R sphere at
+        // center, t > `after`.
+        let sphere_t = |radius: f32, after: f32| -> f32 {
+            let b = sdf::dot(oc, ray_dir);
+            let c = sdf::dot(oc, oc) - radius * radius;
+            let disc = b * b - c;
+            if disc < 0.0 { return f32::INFINITY; }
+            let sq = disc.sqrt();
+            let s = if b >= 0.0 { 1.0 } else { -1.0 };
+            let q = -b - s * sq;
+            if q.abs() < 1e-30 { return f32::INFINITY; }
+            let t0 = q;
+            let t1 = c / q;
+            let t_lo_ = t0.min(t1);
+            let t_hi_ = t0.max(t1);
+            if t_lo_ > after { return t_lo_; }
+            if t_hi_ > after { return t_hi_; }
+            f32::INFINITY
+        };
+
+        let c_u_lo = plane_t(n_u_lo);
+        let c_u_hi = plane_t(n_u_hi);
+        let c_v_lo = plane_t(n_v_lo);
+        let c_v_hi = plane_t(n_v_hi);
+        let c_r_lo = sphere_t(r_lo, t);
+        let c_r_hi = sphere_t(r_hi, t);
+
+        let mut t_next = f32::INFINITY;
+        let mut winning: u8 = 6;
+        let take = |cand: f32, axis: u8, t_next: &mut f32, winning: &mut u8| {
+            if cand > t && cand < *t_next {
+                *t_next = cand; *winning = axis;
+            }
+        };
+        take(c_u_lo, 0, &mut t_next, &mut winning);
+        take(c_u_hi, 1, &mut t_next, &mut winning);
+        take(c_v_lo, 2, &mut t_next, &mut winning);
+        take(c_v_hi, 3, &mut t_next, &mut winning);
+        take(c_r_lo, 4, &mut t_next, &mut winning);
+        take(c_r_hi, 5, &mut t_next, &mut winning);
+        if t_next >= t_exit || t_next.is_infinite() { break; }
+        last_axis = winning;
+        // Cell-eps scales with t so close-camera rays don't overshoot.
+        let t_ulp = (t.abs() * 1.2e-7).max(f32::MIN_POSITIVE);
+        let cell_eps = (shell * walk.size * 1e-3).max(t_ulp);
+        t = t_next + cell_eps;
     }
 
     None
@@ -1056,8 +1112,140 @@ fn derive_place_path(
     Some(place)
 }
 
-/// CPU walker mirror of the shader's `walk_face_subtree`.
-/// Returns `(block_id, term_depth, path)` on success.
+/// Walker result including cell bounds (Kahan-accumulated) —
+/// mirror of the shader's `FaceWalkResult`. The bounds let the
+/// caller run a proper analytical cell DDA instead of sampling.
+#[derive(Clone, Debug)]
+pub struct FaceWalkResult {
+    pub block: u8,
+    pub depth: u32,
+    pub path: Vec<(NodeId, usize)>,
+    pub u_lo: f32,
+    pub v_lo: f32,
+    pub r_lo: f32,
+    pub size: f32,
+}
+
+/// Kahan-accumulating face-subtree walker. Loop bound comes from
+/// `max_depth` with no hardcoded upper cap beyond `MAX_DEPTH` (the
+/// tree's architectural limit). Mirror of `walk_face_subtree` in
+/// the shader.
+pub fn walk_face_subtree_bounded(
+    library: &NodeLibrary,
+    face_root_id: NodeId,
+    un_in: f32, vn_in: f32, rn_in: f32,
+    max_depth: u32,
+) -> FaceWalkResult {
+    let mut result = FaceWalkResult {
+        block: 0, depth: 1,
+        path: Vec::new(),
+        u_lo: 0.0, v_lo: 0.0, r_lo: 0.0, size: 1.0,
+    };
+    // Depth 1 = the face root itself. If the caller asked for
+    // max_depth=1, we report the whole-face cell with the face
+    // root's representative block (or 0 if all empty).
+    if let Some(face_root) = library.get(face_root_id) {
+        if max_depth <= 1 {
+            result.block = match face_root.uniform_type {
+                UNIFORM_EMPTY => 0,
+                UNIFORM_MIXED => {
+                    let rep = face_root.representative_block;
+                    if rep < 255 { rep } else { 0 }
+                }
+                b => b,
+            };
+            return result;
+        }
+    }
+    let mut node_id = face_root_id;
+    let mut un = un_in.clamp(0.0, 0.9999999);
+    let mut vn = vn_in.clamp(0.0, 0.9999999);
+    let mut rn = rn_in.clamp(0.0, 0.9999999);
+    let (mut u_sum, mut u_comp) = (0.0f32, 0.0f32);
+    let (mut v_sum, mut v_comp) = (0.0f32, 0.0f32);
+    let (mut r_sum, mut r_comp) = (0.0f32, 0.0f32);
+    let mut size = 1.0f32;
+    let limit = max_depth.min(crate::world::tree::MAX_DEPTH as u32);
+    for d in 2u32..=limit {
+        let Some(node) = library.get(node_id) else { break };
+        let us = ((un * 3.0) as usize).min(2);
+        let vs = ((vn * 3.0) as usize).min(2);
+        let rs = ((rn * 3.0) as usize).min(2);
+        let slot = slot_index(us, vs, rs);
+        let step_size = size * (1.0 / 3.0);
+        let u_add = step_size * us as f32;
+        let v_add = step_size * vs as f32;
+        let r_add = step_size * rs as f32;
+        // Kahan
+        let yu = u_add - u_comp; let tu = u_sum + yu;
+        u_comp = (tu - u_sum) - yu; u_sum = tu;
+        let yv = v_add - v_comp; let tv = v_sum + yv;
+        v_comp = (tv - v_sum) - yv; v_sum = tv;
+        let yr = r_add - r_comp; let tr = r_sum + yr;
+        r_comp = (tr - r_sum) - yr; r_sum = tr;
+        size = step_size;
+        result.path.push((node_id, slot));
+        match node.children[slot] {
+            Child::Empty => {
+                result.block = 0; result.depth = d;
+                result.u_lo = u_sum + u_comp;
+                result.v_lo = v_sum + v_comp;
+                result.r_lo = r_sum + r_comp;
+                result.size = size;
+                return result;
+            }
+            Child::Block(b) => {
+                result.block = b; result.depth = d;
+                result.u_lo = u_sum + u_comp;
+                result.v_lo = v_sum + v_comp;
+                result.r_lo = r_sum + r_comp;
+                result.size = size;
+                return result;
+            }
+            Child::Node(nid) => {
+                if d == limit {
+                    // Cap: report this Node's representative block
+                    // so the cell shows its content at any zoom
+                    // (not an empty "it has children but we stop").
+                    let cap_block = match library.get(nid) {
+                        Some(c) => match c.uniform_type {
+                            UNIFORM_EMPTY => 0,
+                            UNIFORM_MIXED => {
+                                let rep = c.representative_block;
+                                if rep < 255 { rep } else { 0 }
+                            }
+                            b => b,
+                        },
+                        None => 0,
+                    };
+                    result.block = cap_block;
+                    result.depth = d;
+                    result.u_lo = u_sum + u_comp;
+                    result.v_lo = v_sum + v_comp;
+                    result.r_lo = r_sum + r_comp;
+                    result.size = size;
+                    return result;
+                }
+                node_id = nid;
+                un = un * 3.0 - us as f32;
+                vn = vn * 3.0 - vs as f32;
+                rn = rn * 3.0 - rs as f32;
+            }
+        }
+    }
+    // Reached max_depth without terminal.
+    result.block = 0; result.depth = limit;
+    result.u_lo = u_sum + u_comp;
+    result.v_lo = v_sum + v_comp;
+    result.r_lo = r_sum + r_comp;
+    result.size = size;
+    result
+}
+
+/// Legacy walker used by earlier sampling-based raycast. Kept
+/// for reference; the analytical cell DDA uses
+/// `walk_face_subtree_bounded` instead.
+#[allow(dead_code)]
 fn walk_face_subtree_with_path(
     library: &NodeLibrary,
     face_root_id: NodeId,
@@ -1069,7 +1257,7 @@ fn walk_face_subtree_with_path(
     let mut vn = vn_in.clamp(0.0, 0.9999999);
     let mut rn = rn_in.clamp(0.0, 0.9999999);
     let mut path: Vec<(NodeId, usize)> = Vec::new();
-    let limit = max_depth.min(22);
+    let limit = max_depth.min(crate::world::tree::MAX_DEPTH as u32);
     // After an empty terminal at d < limit, the tree gives us no
     // further structure to walk — but placement at the user's chosen
     // cs_edit_depth requires a path of uniform depth so the placed
