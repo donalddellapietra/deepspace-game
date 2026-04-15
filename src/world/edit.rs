@@ -22,6 +22,14 @@ pub struct HitInfo {
     pub face: u32,
     /// Distance along the ray to the hit point.
     pub t: f32,
+    /// Optional explicit path where a place_block should land. For
+    /// Cartesian hits this is `None` — `place_child` derives the
+    /// adjacent cell via `face`. For sphere hits `face`'s xyz-axis
+    /// semantics don't apply (face-subtree slots are (u,v,r)), so
+    /// `cs_raycast_in_body` fills this with the last empty cell the
+    /// ray traversed before striking the block, which IS the correct
+    /// placement target regardless of which cube face was entered.
+    pub place_path: Option<Vec<(NodeId, usize)>>,
 }
 
 /// Stack frame for iterative DDA traversal.
@@ -154,6 +162,7 @@ pub fn cpu_raycast_with_face_depth(
                     path: path.clone(),
                     face: normal_face,
                     t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                    place_path: None,
                 });
             }
             Child::Node(child_id) => {
@@ -195,6 +204,7 @@ pub fn cpu_raycast_with_face_depth(
                         path: path.clone(),
                         face: normal_face,
                         t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                        place_path: None,
                     });
                 }
 
@@ -261,6 +271,19 @@ pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
 /// For blocks, use `Child::Block(idx)`. For saved meshes, use
 /// `Child::Node(saved_node_id)`.
 pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bool {
+    // Sphere hits carry an explicit placement path (the last empty
+    // cell the ray traversed before hitting the block). Place there
+    // directly — the face→xyz-delta derivation below is nonsense for
+    // face-subtree (u,v,r) slots.
+    if let Some(ref place_path) = hit.place_path {
+        let place_hit = HitInfo {
+            path: place_path.clone(),
+            face: hit.face,
+            t: hit.t,
+            place_path: None,
+        };
+        return propagate_edit(world, &place_hit, new_child);
+    }
     let (_parent_id, slot) = *hit.path.last().unwrap();
     let (x, y, z) = slot_coords(slot);
     let (dx, dy, dz): (i32, i32, i32) = match hit.face {
@@ -398,7 +421,7 @@ fn place_child_at_point(
             }
             child if is_last && is_placeable(&world.library, child) => {
                 // Target cell is empty (or all-empty subtree) — place directly.
-                let place_hit = HitInfo { path, face: 0, t: 0.0 };
+                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
                 return propagate_edit(world, &place_hit, new_child);
             }
             child if !is_last && is_placeable(&world.library, child) => {
@@ -418,7 +441,7 @@ fn place_child_at_point(
                     remaining,
                     new_child,
                 );
-                let place_hit = HitInfo { path, face: 0, t: 0.0 };
+                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
                 return propagate_edit(world, &place_hit, Child::Node(chain_id));
             }
             _ => {
@@ -762,7 +785,16 @@ fn cs_raycast_in_body(
     let mut step_world = shell * 0.33;
     let eps = (shell * 1e-5).max(1e-7);
     let mut t = t_enter + eps;
-    let mut last_face_id: u32 = 6; // 0..5 = u_lo..r_hi crossing, 6 = shell entry
+    // Tracks the last empty cell's face-subtree path. On block hit,
+    // THIS is the placement target: it's the cell the ray was in one
+    // step before striking the block, which by construction is empty
+    // and adjacent to the block along the ray. This replaces the
+    // broken `face_for_placement` mapping that tried to infer an
+    // xyz-axis delta from which cubed-sphere boundary was crossed —
+    // face-subtree slots are (u,v,r), not (x,y,z), so an xyz delta
+    // applied via `place_child` landed in the wrong cell (or into
+    // solid rock, making placement silently fail).
+    let mut prev_place_path: Option<Vec<(NodeId, usize)>> = None;
     let max_steps = 8_000usize;
     for _ in 0..max_steps {
         if t >= t_exit { break; }
@@ -771,9 +803,6 @@ fn cs_raycast_in_body(
         let r = sdf::length(local);
         if r >= cs_outer || r < cs_inner { break; }
 
-        // Convert sample to face + (un, vn, rn) via the canonical
-        // world_to_coord. (Avoids a separate pick_face that could
-        // disagree at f32 boundary cases.)
         let coord = world_to_coord(cs_center, p)?;
         let face = coord.face;
         let face_slot = FACE_SLOTS[face as usize];
@@ -781,8 +810,6 @@ fn cs_raycast_in_body(
         let face_root_id = match body_node.children[face_slot] {
             Child::Node(id) => id,
             _ => {
-                // No face subtree at this slot — shouldn't happen
-                // for a properly built body. Advance and try again.
                 t += step_world;
                 continue;
             }
@@ -791,39 +818,27 @@ fn cs_raycast_in_body(
         let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
 
-        // Walk face subtree, tracking path. Capped at
-        // `max_face_depth` so the hit lands at a user-visible
-        // cell, not the planet's deepest sub-pixel resolution.
         let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn, max_face_depth);
         if let Some((block_id, term_depth, mut face_path)) = walk {
             if block_id != 0 {
-                // Build full path: ancestor chain + (body's parent
-                // entry already in ancestor) + (body_id, face_slot)
-                // + face subtree descent path.
                 let mut full_path = ancestor_path.to_vec();
                 full_path.push((body_id, face_slot));
                 full_path.append(&mut face_path);
-                let face_for_placement = match last_face_id {
-                    0 => 1, // u_lo crossed → adjacent in -u → -X face slot delta
-                    1 => 0,
-                    2 => 3,
-                    3 => 2,
-                    4 => 5,
-                    5 => 4,
-                    _ => 4, // shell entry: place outward (+r ≈ +Z slot delta)
-                };
                 return Some(HitInfo {
                     path: full_path,
-                    face: face_for_placement,
+                    face: 4, // unused for sphere hits; place_path drives placement
                     t,
+                    place_path: prev_place_path,
                 });
             }
-            // Empty cell — refine step to one third of cell width.
+            // Empty cell — record its full path as the candidate
+            // placement target; refine step to one third of its width.
+            let mut empty_full = ancestor_path.to_vec();
+            empty_full.push((body_id, face_slot));
+            empty_full.append(&mut face_path);
+            prev_place_path = Some(empty_full);
             let cells_d = 3.0_f32.powi(term_depth as i32);
             step_world = (shell / cells_d * 0.33).max(eps * 4.0);
-            // Determine which boundary advancement crosses next (rough).
-            // For simplicity, just advance by step_world.
-            last_face_id = 6; // reset — step-based march doesn't track per-axis crossings
         }
         t += step_world;
     }
@@ -1075,7 +1090,7 @@ mod tests {
                 (body_id, crate::world::cubesphere::FACE_SLOTS[0]),
                 (face_root_id, 0),
             ],
-            face: 0, t: 1.0,
+            face: 0, t: 1.0, place_path: None,
         };
         assert!(propagate_edit(&mut world, &hit, Child::Empty));
 
@@ -1283,7 +1298,7 @@ mod tests {
         let hit = HitInfo {
             path: vec![(world.root, slot_index(1, 2, 1))],
             face: 2, // +Y
-            t: 1.0,
+            t: 1.0, place_path: None,
         };
         assert!(
             !place_block(&mut world, &hit, block::BRICK),
