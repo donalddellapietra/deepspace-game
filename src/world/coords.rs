@@ -13,7 +13,8 @@
 //! For the full design see
 //! `docs/experimental-architecture/anchor-refactor-decisions.md`.
 
-use super::cubesphere::Face;
+use super::cubesphere::{body_face_center_slot, Face};
+use super::face_transitions::{face_basis, offset_remap_on_overflow_axis, seam_neighbor, FaceBasis, Seam};
 use super::tree::{slot_coords, slot_index, Child, MAX_DEPTH, NodeKind, NodeLibrary, NodeId};
 
 // ---------------------------------------------------------------- Path
@@ -268,6 +269,45 @@ pub fn deepest_kind(lib: &NodeLibrary, root: NodeId, path: &Path) -> NodeKind {
         .unwrap_or(NodeKind::Cartesian)
 }
 
+/// Walk `path` from `root` and return `(face_root_depth, face)` for
+/// the deepest `CubedSphereFace` ancestor of the current anchor, or
+/// `None` if the anchor is not inside any face subtree.
+///
+/// `face_root_depth` is the depth at which the face root node lives
+/// (i.e., the anchor's `slots()[face_root_depth-1]` is the body's
+/// face-center slot choosing this face root). The anchor's own
+/// cells are at `face_root_depth+1` or deeper when inside the face.
+pub fn find_face_ancestor(
+    lib: &NodeLibrary,
+    root: NodeId,
+    path: &Path,
+) -> Option<(u8, Face)> {
+    let kinds = resolve_kinds_along(lib, root, path);
+    // kinds[0] = root node's kind, kinds[i] = kind reached by descending i slots.
+    // Face root at depth i means kinds[i] is CubedSphereFace (after i descent slots).
+    let mut deepest: Option<(u8, Face)> = None;
+    for (i, k) in kinds.iter().enumerate() {
+        if let NodeKind::CubedSphereFace { face } = *k {
+            deepest = Some((i as u8, face_from_index(face)));
+        }
+    }
+    deepest
+}
+
+/// Helper: given the face_anc from before a step and the new anchor
+/// state, decide the new face_anc. Pure path inspection — if the
+/// anchor is still at or below the face root level, the ancestor is
+/// unchanged; if it popped above it, there's no face ancestor.
+fn face_ancestor_from_anchor_kinds(
+    prior: Option<(u8, Face)>,
+    anchor: &Path,
+) -> Option<(u8, Face)> {
+    match prior {
+        Some((fd, f)) if anchor.depth() > fd => Some((fd, f)),
+        _ => None,
+    }
+}
+
 // ------------------------------------------------------------ Transition
 
 /// Semantic event emitted when the anchor crosses a coordinate-meaning
@@ -316,48 +356,152 @@ impl WorldPos {
         }
     }
 
-    /// Add `delta` to `offset` and cross cell boundaries as needed.
-    /// Dispatches on the anchor's deepest `NodeKind` (looked up from
-    /// `root` via `lib`). Returns a `Transition` describing any
-    /// coordinate-meaning boundary that was crossed during the step.
+    /// Add `delta` (interpreted in world `(x, y, z)`) to `offset` and
+    /// cross cell boundaries as needed.
     ///
-    /// Cartesian and CubedSphereBody dispatch to the pure Cartesian
-    /// neighbor step. CubedSphereFace also does a Cartesian step in
-    /// the `(u, v, r)` local frame — the face subtree IS a 27-ary
-    /// base-3 tree, just with axes relabelled — but emits a
-    /// `FaceExit` transition when the step bubbles out of the face
-    /// root, and `CubeSeam` stubs for future u/v seam handling.
+    /// Kind-aware: if the anchor sits inside a `CubedSphereFace`
+    /// subtree, the world delta is first transformed into the face's
+    /// local `(u, v, r)` basis (orthonormal approximation — exact at
+    /// the face center), then cells are stepped in face-local axes.
+    /// When a step overflows the face root on `u` or `v`, the seam
+    /// table in [`super::face_transitions`] remaps the anchor onto
+    /// the neighbor face instead of bubbling up through the body.
+    ///
+    /// For Cartesian / CubedSphereBody anchors the basis is identity
+    /// and stepping bubbles normally through the 3-ary tree.
+    ///
+    /// Returns the last coordinate-meaning transition crossed. When
+    /// no transition happens, returns `Transition::None`.
     pub fn add_local(
         &mut self,
-        delta: [f32; 3],
+        delta_world: [f32; 3],
         lib: &NodeLibrary,
         root: NodeId,
     ) -> Transition {
         let kind_before = deepest_kind(lib, root, &self.anchor);
-        let depth_before = self.anchor.depth();
+        let mut face_anc = find_face_ancestor(lib, root, &self.anchor);
+        let basis = match face_anc {
+            Some((_, f)) => face_basis(f),
+            None => FaceBasis::IDENTITY,
+        };
+        let delta_local = basis.world_to_local(delta_world);
         for i in 0..3 {
-            self.offset[i] += delta[i];
+            self.offset[i] += delta_local[i];
         }
-        for axis in 0..3usize {
-            while self.offset[axis] >= 1.0 {
-                if !self.anchor.step_neighbor_cartesian(axis as u8, 1) {
-                    self.offset[axis] = below_one();
-                    break;
+
+        // Cell-by-cell overflow resolution. Done iteratively rather
+        // than axis-by-axis because a seam crossing on one axis can
+        // flip another axis's offset, requiring a re-check. Capped
+        // at a generous iteration count to avoid infinite loops if
+        // something pathological happens.
+        let mut last_seam: Option<(Face, Face)> = None;
+        const MAX_ITERS: usize = 128;
+        'outer: for _ in 0..MAX_ITERS {
+            for axis in 0..3u8 {
+                let a = axis as usize;
+                if self.offset[a] >= 1.0 {
+                    self.offset[a] -= 1.0;
+                    if !self.try_step_cell(axis, 1, face_anc, &mut last_seam, &mut face_anc) {
+                        self.offset[a] = below_one();
+                    }
+                    continue 'outer;
+                } else if self.offset[a] < 0.0 {
+                    self.offset[a] += 1.0;
+                    if !self.try_step_cell(axis, -1, face_anc, &mut last_seam, &mut face_anc) {
+                        self.offset[a] = 0.0;
+                    }
+                    continue 'outer;
                 }
-                self.offset[axis] -= 1.0;
             }
-            while self.offset[axis] < 0.0 {
-                if !self.anchor.step_neighbor_cartesian(axis as u8, -1) {
-                    self.offset[axis] = 0.0;
-                    break;
-                }
-                self.offset[axis] += 1.0;
-            }
+            break;
         }
-        if self.anchor.depth() == depth_before && matches!(kind_before, NodeKind::Cartesian | NodeKind::CubedSphereBody { .. }) {
+
+        if let Some((from, to)) = last_seam {
+            return Transition::CubeSeam { from_face: from, to_face: to };
+        }
+        let kind_after = deepest_kind(lib, root, &self.anchor);
+        if kind_before == kind_after {
             return Transition::None;
         }
         classify_transition(lib, root, kind_before, &self.anchor)
+    }
+
+    /// Step the anchor one cell in `axis` / `dir`. If the anchor sits
+    /// at the direct-child level of a `CubedSphereFace` root and this
+    /// step would overflow on `u` or `v`, apply a seam remap to the
+    /// neighboring face. Otherwise fall through to the pure Cartesian
+    /// neighbor step. Returns false only when clamped at the world
+    /// root (nowhere left to step).
+    fn try_step_cell(
+        &mut self,
+        axis: u8,
+        dir: i8,
+        face_anc: Option<(u8, Face)>,
+        last_seam: &mut Option<(Face, Face)>,
+        face_anc_out: &mut Option<(u8, Face)>,
+    ) -> bool {
+        if let Some((fd, face)) = face_anc {
+            if axis < 2 && self.anchor.depth() == fd + 1 {
+                // At the face-root's direct-child level. If this cell's
+                // slot on the axis is already at the +/- boundary AND
+                // we're stepping further out, it's a seam crossing.
+                let leaf = self.anchor.last_slot().unwrap() as usize;
+                let (cx, cy, cz) = slot_coords(leaf);
+                let old_coords = [cx, cy, cz];
+                let would_overflow = match dir {
+                    1 => old_coords[axis as usize] == 2,
+                    -1 => old_coords[axis as usize] == 0,
+                    _ => false,
+                };
+                if would_overflow {
+                    let seam = seam_neighbor(face, axis, dir);
+                    self.apply_seam(axis, seam, old_coords);
+                    *last_seam = Some((face, seam.to_face));
+                    *face_anc_out = Some((fd, seam.to_face));
+                    return true;
+                }
+            }
+        }
+        // Non-seam path.
+        let moved = self.anchor.step_neighbor_cartesian(axis, dir);
+        if moved {
+            // Face membership may have changed (e.g., r-axis bubble
+            // out of face into body). Re-resolve so subsequent seam
+            // checks use the right basis.
+            *face_anc_out = face_ancestor_from_anchor_kinds(face_anc, &self.anchor);
+        }
+        moved
+    }
+
+    /// Apply a seam crossing: rewrite the anchor and offset so the
+    /// position moves from the old face subtree into `seam.to_face`.
+    /// Assumes `self.offset[axis_overflow]` has already been wrapped
+    /// into `[0, 1)` by the caller (the "just past old edge" value).
+    fn apply_seam(&mut self, axis_overflow: u8, seam: Seam, old_coords: [usize; 3]) {
+        let old_offset = self.offset;
+        // Pop leaf + old face-root body-slot, land on body level.
+        self.anchor.pop();
+        self.anchor.pop();
+        // Push new face-root body-slot.
+        self.anchor.push(body_face_center_slot(seam.to_face) as u8);
+
+        let mut new_slot = [0usize; 3];
+        let mut new_offset = [0.0f32; 3];
+        for i in 0..3 {
+            let new_axis = seam.axis_map[i] as usize;
+            if i == axis_overflow as usize {
+                // Overflow axis: slot is the entering edge; offset is
+                // the wrapped value, possibly mirrored.
+                new_slot[new_axis] = if seam.entering_sign == -1 { 0 } else { 2 };
+                new_offset[new_axis] =
+                    offset_remap_on_overflow_axis(old_offset[i], seam.entering_sign);
+            } else {
+                new_slot[new_axis] = if seam.flip[i] { 2 - old_coords[i] } else { old_coords[i] };
+                new_offset[new_axis] = if seam.flip[i] { 1.0 - old_offset[i] } else { old_offset[i] };
+            }
+        }
+        self.anchor.push(slot_index(new_slot[0], new_slot[1], new_slot[2]) as u8);
+        self.offset = new_offset;
     }
 
     /// Backwards-compatible shim: equivalent to calling `add_local`
@@ -826,6 +970,46 @@ mod tests {
         assert!(back[0] >= 0.0 && back[0] < ROOT_EXTENT);
         assert!(back[1] >= 0.0 && back[1] < ROOT_EXTENT);
         assert!((back[2] - 1.5).abs() < 1e-4);
+    }
+
+    /// Seam integration: anchor sits at the +u edge slot of a
+    /// CubedSphereFace root; delta on the face-local u axis (expressed
+    /// in world coords via the face basis) crosses the seam onto the
+    /// expected neighbor face.
+    #[test]
+    fn add_local_crosses_seam_from_posx_to_negz() {
+        use super::super::spherical_worldgen::{build, demo_planet};
+        let setup = demo_planet();
+        let scene = build(&setup);
+        let body_anchor = scene.body_anchor;
+        let world = scene.world;
+
+        // Build an anchor: body_anchor + body's +X face-center slot +
+        // face-root child at us=2 (the +u edge slot).
+        let mut anchor = body_anchor;
+        anchor.push(body_face_center_slot(Face::PosX) as u8);
+        anchor.push(slot_index(2, 1, 1) as u8); // +u edge, v=middle, r=middle
+        let mut p = WorldPos { anchor, offset: [0.9, 0.5, 0.5] };
+
+        // Push in +u direction (world tu(+X) = (0, 0, -1)), enough to
+        // cross the edge. delta_world = tu * 0.2 in the face frame.
+        let tu: [f32; 3] = [0.0, 0.0, -1.0];
+        let step: f32 = 0.2;
+        let delta = [tu[0] * step, tu[1] * step, tu[2] * step];
+        let t = p.add_local(delta, &world.library, world.root);
+
+        // Should have emitted a CubeSeam transition from +X to -Z.
+        match t {
+            Transition::CubeSeam { from_face: Face::PosX, to_face: Face::NegZ } => {}
+            other => panic!("expected CubeSeam PosX→NegZ, got {:?}", other),
+        }
+        // Anchor now sits under the -Z face-center slot of the body.
+        let slots = p.anchor.slots();
+        let body_d = body_anchor.depth() as usize;
+        assert_eq!(slots[body_d], body_face_center_slot(Face::NegZ) as u8);
+        // Entering edge: us=0 on -Z (flip on axis 0 was true).
+        let (cx, _cy, _cz) = slot_coords(slots[body_d + 1] as usize);
+        assert_eq!(cx, 0, "entering us on -Z must be 0 (the u=-1 edge slot)");
     }
 
     #[test]
