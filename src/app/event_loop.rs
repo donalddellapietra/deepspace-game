@@ -107,6 +107,7 @@ impl App {
     /// then translate the camera along its forward ray so the block
     /// under the crosshair stays at the same apparent size.
     fn handle_scroll_zoom(&mut self, delta: winit::event::MouseScrollDelta) {
+        if self.frozen { return; }
         let y = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => y,
             winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,

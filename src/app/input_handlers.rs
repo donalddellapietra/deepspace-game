@@ -16,6 +16,35 @@ impl App {
     pub(super) fn apply_key(&mut self, code: KeyCode, pressed: bool) {
         self.keys.apply(code, pressed);
 
+        // Debug chunk-teleport. Fires on key-down only so each press
+        // is one step — holding WASD doesn't auto-repeat. All
+        // motion is gated by `cursor_locked` (so it doesn't fight
+        // with typing into UI panels) and by `!self.frozen`.
+        if pressed && self.cursor_locked && !self.ui.any_panel_open() {
+            let step = match code {
+                KeyCode::KeyW => Some((2usize, -1)), // forward = -Z
+                KeyCode::KeyS => Some((2, 1)),       // back = +Z
+                KeyCode::KeyA => Some((0, -1)),      // left = -X
+                KeyCode::KeyD => Some((0, 1)),       // right = +X
+                KeyCode::Space => Some((1, 1)),      // up = +Y
+                KeyCode::ShiftLeft => Some((1, -1)), // down = -Y
+                _ => None,
+            };
+            if let Some((axis, dir)) = step {
+                self.step_chunk(axis, dir);
+                return;
+            }
+            if code == KeyCode::KeyF {
+                self.frozen = !self.frozen;
+                log::info!("debug freeze: {}", self.frozen);
+                return;
+            }
+            if code == KeyCode::KeyG {
+                self.log_location();
+                return;
+            }
+        }
+
         if pressed && code == KeyCode::Escape {
             if self.ui.any_panel_open() {
                 self.ui

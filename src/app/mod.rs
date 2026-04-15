@@ -46,8 +46,11 @@ pub struct App {
     pub(super) window: Option<Arc<Window>>,
     pub(super) renderer: Option<Renderer>,
     pub(super) camera: Camera,
-    pub(super) velocity: [f32; 3],
     pub(super) world: WorldState,
+    /// Debug freeze. When true, WASD / Space / Shift / scroll zoom
+    /// are all ignored; the camera only turns with the mouse. Toggled
+    /// with `F` in-game.
+    pub(super) frozen: bool,
     pub(super) cursor_locked: bool,
     pub(super) keys: Keys,
     pub(super) last_frame: std::time::Instant,
@@ -108,8 +111,8 @@ impl App {
                 yaw: 0.0,
                 pitch: -0.3,
             },
-            velocity: [0.0, 0.0, 0.0],
             world,
+            frozen: false,
             cursor_locked: false,
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
@@ -171,21 +174,51 @@ impl App {
     }
 
     pub(super) fn update(&mut self, dt: f32) {
-        player::update(
-            &mut self.camera,
-            &mut self.velocity,
-            &self.keys,
-            self.cs_planet.as_ref(),
-            &self.world.library,
-            dt,
-        );
+        player::update(&mut self.camera, dt);
 
-        // Camera moved — push its new frame-local position to the
-        // GPU so the next render consumes f32-safe coordinates.
         let (frame, _) = self.render_frame();
         let cam_local = self.camera.position.in_frame(&frame);
         if let Some(renderer) = &self.renderer {
             renderer.update_camera(&self.camera.gpu_camera_at(cam_local, 1.2));
         }
+    }
+
+    /// Debug chunk teleport. Step the camera's anchor one cell
+    /// along `axis` (0 = X, 1 = Y, 2 = Z) in `direction` (±1). The
+    /// anchor's depth is preserved; offset snaps to the cell center
+    /// so successive steps land deterministically regardless of
+    /// where the camera used to be inside the old cell. Bubble-up
+    /// across parent cells is handled by
+    /// `Path::step_neighbor_cartesian`.
+    pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {
+        if self.frozen { return; }
+        self.camera.position.anchor.step_neighbor_cartesian(axis, direction);
+        self.camera.position.offset = [0.5, 0.5, 0.5];
+    }
+
+    /// Jump the camera to a specific path + cell-local offset.
+    /// Offset must be in `[0, 1)³`; anchor slots are `[0, 27)`.
+    /// Clears `frozen` so the teleport takes effect even from a
+    /// frozen state.
+    pub fn debug_teleport(&mut self, slots: &[u8], offset: [f32; 3]) {
+        let mut anchor = Path::root();
+        for &s in slots.iter().take(crate::world::tree::MAX_DEPTH) {
+            anchor.push(s);
+        }
+        self.camera.position = WorldPos::new(anchor, offset);
+        self.apply_zoom();
+    }
+
+    /// Log the camera's current anchor path and offset to the
+    /// console — handy for picking debug-teleport destinations.
+    pub(super) fn log_location(&self) {
+        let p = &self.camera.position;
+        log::info!(
+            "camera anchor depth={} slots={:?} offset={:?} world={:?}",
+            p.anchor.depth(),
+            p.anchor.as_slice(),
+            p.offset,
+            p.to_world_xyz(),
+        );
     }
 }
