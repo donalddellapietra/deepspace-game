@@ -108,7 +108,14 @@ impl App {
         // too weak to close even a small spawn-above gap in a
         // reasonable time, so place the camera on the surface Y
         // directly rather than above it + wait-for-gravity.
-        let spawn_y = (setup.center[1] + setup.outer_r).min(2.99);
+        // Spawn just INSIDE the outer shell — at exactly `outer_r` the
+        // camera sits on the sphere boundary, where the sphere DDA
+        // exits the shell on its first step (r >= outer_r check), so
+        // rendering returns skybox instead of terrain. Subtract a
+        // small bias (one cell width at depth-6, ~1.4e-3 world units)
+        // so the spawn is unambiguously inside the shell at any depth
+        // representable in f32.
+        let spawn_y = (setup.center[1] + setup.outer_r - 0.002).min(2.99);
         let spawn_pos = [setup.center[0], spawn_y, setup.center[2]];
         let spawn_depth = (tree_depth as i32 - 10).clamp(1, tree_depth as i32) as u8;
 

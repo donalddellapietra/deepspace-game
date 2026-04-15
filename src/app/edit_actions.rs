@@ -32,21 +32,48 @@ impl App {
         self.tree_depth as i32 - self.edit_depth() as i32
     }
 
-    /// Node id of the "render root" — the ancestor whose subtree the
-    /// GPU walks each frame. Today this is always the tree root. Step
-    /// 5 introduces the concept so the plumbing can later pick a
-    /// smaller ancestor for precision (see §3a of
-    /// refactor-decisions.md).
-    pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
-        self.world.root
+    /// Render frame: `(render_root_id, render_root_depth)`.
+    ///
+    /// Descends the camera's path from the tree root through Cartesian
+    /// node children, descends once into a `CubedSphereBody` (shader
+    /// handles body-as-root via a root-kind branch), and stops. Never
+    /// descends into a `CubedSphereFace` — the shader cannot render
+    /// from a face-local frame without body context. Also capped at
+    /// `camera.depth - RENDER_FRAME_K` so deep zoom in open Cartesian
+    /// space keeps the render volume f32-small.
+    fn render_frame(&self) -> (crate::world::tree::NodeId, u8) {
+        use crate::world::tree::{Child, NodeKind};
+        const RENDER_FRAME_K: u8 = 3;
+        let target = self.camera.position.depth.saturating_sub(RENDER_FRAME_K);
+        let mut id = self.world.root;
+        let mut depth = 0u8;
+        while depth < target {
+            let Some(node) = self.world.library.get(id) else { break };
+            let slot = self.camera.position.path[depth as usize] as usize;
+            let Child::Node(child_id) = node.children[slot] else { break };
+            let Some(child) = self.world.library.get(child_id) else { break };
+            match child.kind {
+                NodeKind::Cartesian => {
+                    id = child_id;
+                    depth += 1;
+                }
+                NodeKind::CubedSphereBody { .. } => {
+                    id = child_id;
+                    depth += 1;
+                    break;
+                }
+                NodeKind::CubedSphereFace { .. } => break,
+            }
+        }
+        (id, depth)
     }
 
-    /// Depth (number of leading slots in the camera's path) that sits
-    /// above the render root. `0` means the render root is the tree
-    /// root itself. Paired with
-    /// [`Position::pos_in_ancestor_frame`](crate::world::position::Position::pos_in_ancestor_frame).
+    pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
+        self.render_frame().0
+    }
+
     pub(super) fn render_root_depth(&self) -> u8 {
-        0
+        self.render_frame().1
     }
 
     /// Camera position expressed in the render root's local `[0, 3)³`
@@ -100,14 +127,15 @@ impl App {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
         let zoom_level = self.zoom_level();
-        let camera_pos = self.camera_pos_in_render_frame();
+        // `try_cs_*` reason against `planet.center` (root-frame XYZ);
+        // `cpu_raycast` walks Cartesian from the tree root. Both get
+        // root-frame camera pos regardless of render frame.
+        let camera_pos_root = self.camera.position.pos_in_ancestor_frame(0);
 
-        // Spherical-tree break: clear the targeted subtree if the
-        // planet is hit closer than any Cartesian tree block.
         if editing::try_cs_break(
             &mut self.world,
             self.cs_planet.as_mut(),
-            camera_pos,
+            camera_pos_root,
             ray_dir,
             zoom_level,
             edit_depth,
@@ -118,7 +146,7 @@ impl App {
         let hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera_pos_in_render_frame(),
+            camera_pos_root,
             ray_dir,
             self.edit_depth(),
         );
@@ -165,16 +193,13 @@ impl App {
         let ray_dir = self.camera.forward();
         let edit_depth = self.edit_depth();
         let zoom_level = self.zoom_level();
-        let camera_pos = self.camera_pos_in_render_frame();
+        let camera_pos_root = self.camera.position.pos_in_ancestor_frame(0);
 
-        // Spherical place: fill the cell adjacent to the first solid
-        // cell with the active hotbar block. Meshes fall through to
-        // the Cartesian tree placer below.
         if let Some(block_type) = self.ui.active_block_type() {
             if editing::try_cs_place(
                 &mut self.world,
                 self.cs_planet.as_mut(),
-                camera_pos,
+                camera_pos_root,
                 ray_dir,
                 zoom_level,
                 edit_depth,
@@ -187,7 +212,7 @@ impl App {
         let hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera_pos_in_render_frame(),
+            camera_pos_root,
             ray_dir,
             self.edit_depth(),
         );
@@ -244,11 +269,22 @@ impl App {
             }
             return;
         }
+        // Highlight AABB is in root-frame XYZ (`hit_aabb`), but the
+        // shader draws in render-frame XYZ. Suppress the highlight
+        // when the render root is not the tree root — a later pass
+        // can remap the AABB into render frame.
+        if self.render_root_id() != self.world.root {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_highlight(None);
+            }
+            return;
+        }
         let ray_dir = self.camera.forward();
+        let camera_pos_root = self.camera.position.pos_in_ancestor_frame(0);
         let tree_hit = edit::cpu_raycast(
             &self.world.library,
             self.world.root,
-            self.camera_pos_in_render_frame(),
+            camera_pos_root,
             ray_dir,
             self.edit_depth(),
         );

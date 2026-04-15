@@ -418,6 +418,28 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
+    // Root-kind dispatch: if the render root IS a CubedSphereBody,
+    // the whole [0, 3)³ volume IS the body cell. Skip the Cartesian
+    // DDA and go straight to sphere DDA.
+    if kinds[uniforms.root_index].tag == 1u {
+        let body_hit = march_sphere_body(
+            uniforms.root_index,
+            vec3<f32>(0.0),
+            3.0,
+            kinds[uniforms.root_index].inner_r,
+            kinds[uniforms.root_index].outer_r,
+            ray_origin,
+            ray_dir,
+        );
+        if body_hit.hit {
+            result.hit = true;
+            result.t = body_hit.t;
+            result.color = body_hit.color;
+            result.normal = body_hit.normal;
+        }
+        return result;
+    }
+
     // Initialize root level.
     s_node_idx[0] = uniforms.root_index;
     s_node_origin[0] = vec3<f32>(0.0);
