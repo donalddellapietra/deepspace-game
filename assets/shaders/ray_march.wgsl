@@ -932,23 +932,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     result.t = 1e20;
     var best_t_world: f32 = 1e20;
 
+    // Track whether ANY ribbon frame's per-frame sphere DDA produced
+    // a hit. If so, the global sphere pass below is skipped — the
+    // per-frame DDA's hit is at higher precision (camera-anchored
+    // linearization within the frame's bounded world extent), and
+    // letting the global pass also render would z-fight against it.
+    var sphere_hit_from_frame = false;
+
     for (var i: u32 = 0u; i < uniforms.ribbon_count; i = i + 1u) {
         let frame = uniforms.ribbon[i];
-        // Cartesian march only. Per-frame sphere DDA was reverted
-        // — its linearization-at-camera produced inaccurate hits
-        // at shallow frames (linearization error grows quadratically
-        // with frame extent), causing z-fighting + seams when both
-        // the per-frame sphere DDA and the global sphere pass below
-        // rendered the same cells with slightly different positions.
-        // Sphere rendering is now owned exclusively by the global
-        // sphere pass. Future per-frame sphere work needs a more
-        // robust formulation — tracked as next step.
-        let r = march(frame.root_index, frame.camera_local.xyz, ray_dir);
-        if (r.hit) {
-            let t_world = r.t * frame.world_scale;
-            if (t_world < best_t_world) {
+        if (frame.sphere_active != 0u) {
+            // Per-frame sphere DDA in frame-local coords. CPU only
+            // sets sphere_active=1 for frames deep enough that
+            // camera-anchored linearization stays accurate
+            // (face_subtree_depth ≥ MIN_FRAME_FACE_DEPTH on the
+            // CPU side); for shallow frames, the global sphere
+            // pass below renders.
+            let r = sphere_in_frame(frame, ray_dir);
+            if (r.hit && r.t < best_t_world) {
                 result = r;
-                best_t_world = t_world;
+                best_t_world = r.t;
+                sphere_hit_from_frame = true;
+            }
+        } else {
+            let r = march(frame.root_index, frame.camera_local.xyz, ray_dir);
+            if (r.hit) {
+                let t_world = r.t * frame.world_scale;
+                if (t_world < best_t_world) {
+                    result = r;
+                    best_t_world = t_world;
+                }
             }
         }
     }
@@ -958,7 +971,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // at any camera anchor depth because `oc_world` is CPU-computed
     // via path arithmetic (not by subtracting two large world-scale
     // f32 vectors).
-    if (uniforms.planet.enabled != 0u) {
+    // Skip the global sphere pass when ANY per-frame sphere DDA
+    // already produced a hit. The per-frame hit is at higher
+    // precision; running the global pass too would z-fight with
+    // it (both rendering nearly the same cell at slightly
+    // different positions). For frames where per-frame DOESN'T
+    // apply (shallow body-interior frames, or no body-interior
+    // frames at all e.g. camera flying above the planet), the
+    // global pass handles sphere rendering on its own.
+    if (uniforms.planet.enabled != 0u && !sphere_hit_from_frame) {
         let sphere_r = sphere_in_cell(
             uniforms.planet.body_node_index,
             uniforms.planet.oc_world.xyz,

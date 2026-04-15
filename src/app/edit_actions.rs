@@ -341,6 +341,26 @@ impl App {
         }
         let frame_face_node_idx = visited.get(&node_id).copied()?;
 
+        // Per-frame sphere DDA only fires when the frame is deep
+        // enough into the face subtree for camera-anchored
+        // linearization to be accurate. Linearization error is
+        // O(world_extent^2 * curvature). A frame at face-subtree
+        // depth K has world extent ~shell/3^K; error/cell ratio at
+        // frame-local depth M is ~3^(M-K). Require K ≥ MIN_K so
+        // linearization is bounded for samples within the frame's
+        // world extent. Shallow frames (K < MIN_K) fall back to the
+        // global sphere pass via sphere_active=0.
+        const MIN_FRAME_FACE_DEPTH: u8 = 6;
+        // `depth` here is the frame_path's total depth (i.e., body
+        // depth + face_subtree_depth + 1 for the body→face_slot
+        // edge). face_subtree_depth = depth - body_depth - 1.
+        let body_depth = body_info.body_path.depth();
+        let face_subtree_depth =
+            depth.saturating_sub(body_depth).saturating_sub(1);
+        if face_subtree_depth < MIN_FRAME_FACE_DEPTH {
+            return None;
+        }
+
         // 3. Camera in face EA-norm coords (f64).
         let body_center = crate::world::anchor::WorldPos::new(
             body_info.body_path, [0.5, 0.5, 0.5],
