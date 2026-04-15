@@ -551,20 +551,30 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
 
     for i in (0..hit.path.len()).rev() {
         let (node_id, slot) = hit.path[i];
-        let node = match world.library.get(node_id) {
-            Some(n) => n,
-            None => return false,
+        // EMPTY_NODE sentinel = "synthesize a fresh empty Cartesian
+        // node for this level" — used by sphere placement to extend
+        // the placement path past the tree's existing empty
+        // terminals down to the user's chosen cs_edit_depth, so the
+        // placed block's cell size is consistent regardless of how
+        // deep the nearest real empty terminal lived.
+        let (children_template, original_kind) = if node_id == EMPTY_NODE {
+            (empty_children(), NodeKind::Cartesian)
+        } else {
+            let node = match world.library.get(node_id) {
+                Some(n) => n,
+                None => return false,
+            };
+            // CRITICAL: preserve the original NodeKind when rebuilding.
+            // Without this, an edit through a `CubedSphereBody` or
+            // `CubedSphereFace` ancestor reinserts it as Cartesian,
+            // the shader's NodeKind dispatch stops firing, and the
+            // walker descends into the body's children Cartesian-style
+            // — painting the planet's interior-stone fillers as cube
+            // blocks. (Spec §1b: NodeKind is part of node identity.)
+            (node.children, node.kind)
         };
-        // CRITICAL: preserve the original NodeKind when rebuilding.
-        // Without this, an edit through a `CubedSphereBody` or
-        // `CubedSphereFace` ancestor reinserts it as Cartesian,
-        // the shader's NodeKind dispatch stops firing, and the
-        // walker descends into the body's children Cartesian-style
-        // — painting the planet's interior-stone fillers as cube
-        // blocks. (Spec §1b: NodeKind is part of node identity.)
-        let original_kind = node.kind;
 
-        let mut new_children = node.children;
+        let mut new_children = children_template;
         if let Some(nid) = replacement {
             new_children[slot] = Child::Node(nid);
         } else {
@@ -860,6 +870,28 @@ fn walk_face_subtree_with_path(
     let mut rn = rn_in.clamp(0.0, 0.9999999);
     let mut path: Vec<(NodeId, usize)> = Vec::new();
     let limit = max_depth.min(22);
+    // After an empty terminal at d < limit, the tree gives us no
+    // further structure to walk — but placement at the user's chosen
+    // cs_edit_depth requires a path of uniform depth so the placed
+    // cell size is consistent (without this, block size varies with
+    // wherever the nearest empty chain happened to terminate: tiny
+    // above the SDF-detail surface, huge over uniform-empty regions).
+    // Synthesize EMPTY_NODE-tagged slot entries for the remaining
+    // levels; propagate_edit materializes empty nodes on rebuild.
+    let pad_to_limit = |path: &mut Vec<(NodeId, usize)>,
+                        mut un: f32, mut vn: f32, mut rn: f32,
+                        from_d: u32| {
+        for _ in from_d..limit {
+            let us = ((un * 3.0) as usize).min(2);
+            let vs = ((vn * 3.0) as usize).min(2);
+            let rs = ((rn * 3.0) as usize).min(2);
+            let slot = slot_index(us, vs, rs);
+            path.push((EMPTY_NODE, slot));
+            un = un * 3.0 - us as f32;
+            vn = vn * 3.0 - vs as f32;
+            rn = rn * 3.0 - rs as f32;
+        }
+    };
     for d in 1u32..=limit {
         let node = library.get(node_id)?;
         let us = ((un * 3.0) as usize).min(2);
@@ -868,7 +900,13 @@ fn walk_face_subtree_with_path(
         let slot = slot_index(us, vs, rs);
         path.push((node_id, slot));
         match node.children[slot] {
-            Child::Empty => return Some((0, d, path)),
+            Child::Empty => {
+                let sub_un = un * 3.0 - us as f32;
+                let sub_vn = vn * 3.0 - vs as f32;
+                let sub_rn = rn * 3.0 - rs as f32;
+                pad_to_limit(&mut path, sub_un, sub_vn, sub_rn, d);
+                return Some((0, limit, path));
+            }
             Child::Block(b) => return Some((b, d, path)),
             Child::Node(nid) => {
                 // Descend all the way to `limit` (= cs_edit_depth).
