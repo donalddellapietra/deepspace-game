@@ -158,6 +158,14 @@ fn ray_plane_t(origin: vec3<f32>, dir: vec3<f32>,
 
 /// First t strictly greater than `after` at which the ray hits the
 /// sphere of given radius around `center`. -1 if no such hit.
+///
+/// Numerical-Recipes stable form: when `oc` is near the shell
+/// surface, `c = |oc|² − r²` is small and the conventional
+/// `-b ± √disc` roots suffer catastrophic cancellation in one of
+/// the two combinations (whichever has the same sign as b). Compute
+/// `q = -b − sign(b)·√disc` first (the well-conditioned root),
+/// then derive the other via Vieta's `t·t' = c → t' = c/q`. Both
+/// roots end up at full f32 precision regardless of cancellation.
 fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
                     center: vec3<f32>, radius: f32, after: f32) -> f32 {
     let oc = origin - center;
@@ -166,10 +174,18 @@ fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
     let disc = b * b - c;
     if disc < 0.0 { return -1.0; }
     let sq = sqrt(disc);
-    let t0 = -b - sq;
-    let t1 = -b + sq;
-    if t0 > after { return t0; }
-    if t1 > after { return t1; }
+    let s = select(-1.0, 1.0, b >= 0.0);
+    let q = -b - s * sq;
+    // `q` is non-zero unless the ray is exactly tangent (disc=0
+    // AND b=0 simultaneously) — return -1 in that edge case
+    // rather than dividing by zero.
+    if abs(q) < 1e-30 { return -1.0; }
+    let t0 = q;
+    let t1 = c / q;
+    let t_lo = min(t0, t1);
+    let t_hi = max(t0, t1);
+    if t_lo > after { return t_lo; }
+    if t_hi > after { return t_hi; }
     return -1.0;
 }
 
@@ -578,8 +594,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // thickness. Advances t past a boundary so the next
             // iteration samples the neighboring cell instead of
             // looping on the same boundary plane.
-            let eps = max(shell * 1e-5, 1e-7);
-            var t = t_enter + eps;
+            // `eps` is the advance past a cell boundary. It must
+            // be (a) large enough to push the ray off the boundary
+            // plane in float arithmetic, and (b) small enough not
+            // to skip an entire neighbor cell. The previous fixed
+            // `shell * 1e-5` violated (b) at deep cs_edit depths
+            // (cell radial width = shell / cells_d drops below the
+            // fixed eps once cells_d > 1e5), so the DDA stepped
+            // past the cell that the next sample should have
+            // landed in — invisible cells at deep depths and
+            // misaligned advances at moderate depths (the seams).
+            // `eps_for(cells_d)` scales eps to the current
+            // boundary granularity.
+            var t = t_enter + max(shell * 1e-5, 1e-7);
             var steps = 0u;
             // Last cell boundary the DDA crossed. 0=u_lo, 1=u_hi,
             // 2=v_lo, 3=v_hi, 4=r_lo, 5=r_hi, 6=outer-shell entry
@@ -605,7 +632,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // never misses a true boundary.
             var deepest_term_depth: u32 = 1u;
             loop {
-                if t >= t_exit || steps > 512u { break; }
+                // 4096 step budget supports deep-depth empty
+                // traversals at small per-step advances (eps and
+                // cell-width scale with cells_d).
+                if t >= t_exit || steps > 4096u { break; }
                 steps = steps + 1u;
 
                 // `local` is the sample point relative to the sphere
@@ -759,9 +789,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // Record which boundary we crossed so the next
                 // sample knows which face it just entered through.
                 last_face_id = winning_face;
-                // Advance just past the boundary so the next sample
-                // lands inside the neighboring cell.
-                t = t_next + eps;
+                // Advance past the boundary by a fraction of the
+                // current cell's radial width — keeps the new
+                // sample firmly inside the neighbor cell while
+                // never skipping past it. f32-precision floor
+                // protects against degenerate eps when cells_d is
+                // huge enough to make `shell / cells_d` below the
+                // representable scale at world magnitudes.
+                let cell_eps = max(shell / cells_d * 1e-3, 1e-7);
+                t = t_next + cell_eps;
             }
         }
     }
