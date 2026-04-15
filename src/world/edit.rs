@@ -6,7 +6,7 @@
 //! raycast descends, so the same code breaks a single block at fine
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
-use super::cubesphere::{pick_face, world_to_coord, FACE_SLOTS};
+use super::cubesphere::{world_to_coord, FACE_SLOTS};
 use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
@@ -280,7 +280,7 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
     }
 
     // Cross-node: compute world-space target center and look up from root.
-    let (aabb_min, aabb_max) = hit_aabb(hit);
+    let (aabb_min, aabb_max) = hit_aabb(&world.library, hit);
     let cell_size = aabb_max[0] - aabb_min[0];
     let target = [
         (aabb_min[0] + aabb_max[0]) * 0.5 + dx as f32 * cell_size,
@@ -753,8 +753,11 @@ fn cs_raycast_in_body(
         let r = sdf::length(local);
         if r >= cs_outer || r < cs_inner { break; }
 
-        let n = sdf::scale(local, 1.0 / r);
-        let face = pick_face(n);
+        // Convert sample to face + (un, vn, rn) via the canonical
+        // world_to_coord. (Avoids a separate pick_face that could
+        // disagree at f32 boundary cases.)
+        let coord = world_to_coord(cs_center, p)?;
+        let face = coord.face;
         let face_slot = FACE_SLOTS[face as usize];
         let body_node = library.get(body_id)?;
         let face_root_id = match body_node.children[face_slot] {
@@ -766,13 +769,9 @@ fn cs_raycast_in_body(
                 continue;
             }
         };
-
-        // Convert (face, n, r) to (un, vn, rn) in [0, 1).
-        let coord = world_to_coord(cs_center, p)?;
         let un = ((coord.u + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let vn = ((coord.v + 1.0) * 0.5).clamp(0.0, 0.9999999);
         let rn = ((r - cs_inner) / shell).clamp(0.0, 0.9999999);
-        debug_assert_eq!(coord.face, face);
 
         // Walk face subtree, tracking path.
         let walk = walk_face_subtree_with_path(library, face_root_id, un, vn, rn);
@@ -846,11 +845,88 @@ fn walk_face_subtree_with_path(
 }
 
 /// Compute the world-space AABB of the block at the hit location.
-pub fn hit_aabb(hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+///
+/// Walks the path Cartesian-style until it encounters a
+/// `NodeKind::CubedSphereBody` ancestor; from there the path
+/// continues into a face subtree where cell indices are
+/// `(u_slot, v_slot, r_slot)` in cube-sphere coords. The bulged
+/// voxel's world AABB is computed from `cubesphere::block_corners`
+/// at the cell's `(face, u, v, r)` extents.
+pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+    use super::cubesphere::{block_corners, Face, FACE_SLOTS};
+
     let mut origin = [0.0f32; 3];
     let mut cell_size = 1.0f32;
 
-    for &(_node_id, slot) in &hit.path {
+    for (i, &(node_id, slot)) in hit.path.iter().enumerate() {
+        let node = match library.get(node_id) {
+            Some(n) => n,
+            None => break,
+        };
+        // If THIS node is the body, the next path entry uses
+        // a face slot — switch to bulged-voxel AABB math.
+        if let NodeKind::CubedSphereBody { inner_r, outer_r } = node.kind {
+            // Body cell occupies [origin, origin + cell_size)^3.
+            let body_origin = origin;
+            let body_size = cell_size;
+            let body_center = [
+                body_origin[0] + body_size * 0.5,
+                body_origin[1] + body_size * 0.5,
+                body_origin[2] + body_size * 0.5,
+            ];
+            // Determine which face from this path entry's slot.
+            let face = match (0..6).find(|&f| FACE_SLOTS[f] == slot) {
+                Some(f) => Face::from_index(f as u8),
+                None => {
+                    // Hit is in the body's interior or non-face slot
+                    // — fall back to the body's AABB.
+                    return (body_origin, [
+                        body_origin[0] + body_size,
+                        body_origin[1] + body_size,
+                        body_origin[2] + body_size,
+                    ]);
+                }
+            };
+            // Walk remaining path slots inside the face subtree to
+            // accumulate cell indices and depth.
+            let mut iu: u32 = 0;
+            let mut iv: u32 = 0;
+            let mut ir: u32 = 0;
+            let mut depth: u32 = 0;
+            for &(_face_node_id, face_slot_idx) in &hit.path[i + 1..] {
+                let (us, vs, rs) = slot_coords(face_slot_idx);
+                iu = iu * 3 + us as u32;
+                iv = iv * 3 + vs as u32;
+                ir = ir * 3 + rs as u32;
+                depth += 1;
+            }
+            // Cell extent in the face's normalized (u, v, r) frame.
+            let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
+            let u_lo = (iu as f32 / cells) * 2.0 - 1.0;
+            let v_lo = (iv as f32 / cells) * 2.0 - 1.0;
+            let r_lo_n = ir as f32 / cells;
+            let du = 2.0 / cells;
+            let dv = 2.0 / cells;
+            let drn = 1.0 / cells;
+            let r_world_lo = inner_r * body_size + r_lo_n * (outer_r - inner_r) * body_size;
+            let dr_world = drn * (outer_r - inner_r) * body_size;
+            // World corners of the bulged voxel.
+            let corners = block_corners(
+                body_center, face,
+                u_lo, v_lo, r_world_lo,
+                du, dv, dr_world,
+            );
+            let mut aabb_min = corners[0];
+            let mut aabb_max = corners[0];
+            for c in &corners[1..] {
+                for k in 0..3 {
+                    if c[k] < aabb_min[k] { aabb_min[k] = c[k]; }
+                    if c[k] > aabb_max[k] { aabb_max[k] = c[k]; }
+                }
+            }
+            return (aabb_min, aabb_max);
+        }
+        // Cartesian step.
         let (x, y, z) = slot_coords(slot);
         origin = [
             origin[0] + x as f32 * cell_size,
@@ -859,9 +935,8 @@ pub fn hit_aabb(hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
         ];
         cell_size /= 3.0;
     }
-    // Undo the last division — the final path entry IS the hit cell.
+    // Undo last division — the final path entry IS the hit cell.
     cell_size *= 3.0;
-
     let aabb_max = [
         origin[0] + cell_size,
         origin[1] + cell_size,
@@ -1098,7 +1173,7 @@ mod tests {
         );
         assert!(hit.is_some(), "Should hit ground");
         let hit = hit.unwrap();
-        let (aabb_min, aabb_max) = hit_aabb(&hit);
+        let (aabb_min, aabb_max) = hit_aabb(&world.library, &hit);
         let cell_size = aabb_max[0] - aabb_min[0];
 
         // Check that the block above the hit is in a different node

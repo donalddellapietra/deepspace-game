@@ -46,6 +46,8 @@ impl App {
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
         );
+        eprintln!("do_break: hit={:?}",
+            hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
         let Some(hit) = hit else { return };
 
         if self.save_mode {
@@ -69,7 +71,9 @@ impl App {
             return;
         }
 
-        if edit::break_block(&mut self.world, &hit) {
+        let changed = edit::break_block(&mut self.world, &hit);
+        eprintln!("do_break: break_block returned {}", changed);
+        if changed {
             self.upload_tree();
         }
     }
@@ -81,6 +85,8 @@ impl App {
             &self.world.library, self.world.root,
             camera_pos, ray_dir, self.edit_depth(),
         );
+        eprintln!("do_place: hit={:?}",
+            hit.as_ref().map(|h| (h.path.len(), h.face, h.t)));
         let Some(hit) = hit else { return };
 
         match &self.ui.slots[self.ui.active_slot] {
@@ -135,7 +141,9 @@ impl App {
             camera_pos, ray_dir, self.edit_depth(),
         );
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_highlight(tree_hit.as_ref().map(edit::hit_aabb));
+            renderer.set_highlight(
+                tree_hit.as_ref().map(|h| edit::hit_aabb(&self.world.library, h)),
+            );
         }
     }
 }
