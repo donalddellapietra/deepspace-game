@@ -46,6 +46,10 @@ pub struct App {
     pub(super) world: WorldState,
     pub(super) cursor_locked: bool,
     pub(super) keys: Keys,
+    /// Debug freeze: when true, all teleport keys are ignored. Toggle
+    /// with F. Provides a way to lock the camera in place while
+    /// inspecting a frame.
+    pub(super) debug_frozen: bool,
     pub(super) last_frame: std::time::Instant,
     /// Cached tree depth (recomputed only after edits). Used to clamp
     /// anchor depth so the player can't zoom past the tree's finest
@@ -119,6 +123,7 @@ impl App {
             world,
             cursor_locked: false,
             keys: Keys::default(),
+            debug_frozen: false,
             last_frame: std::time::Instant::now(),
             tree_depth,
             palette: ColorRegistry::new(),
@@ -141,23 +146,10 @@ impl App {
     /// live in [`edit_actions`]; the `ApplicationHandler` in
     /// [`event_loop`] calls them in order.
     pub(super) fn update(&mut self, dt: f32) {
-        // World-space width of one cell at the camera's current
-        // anchor depth: `ROOT_EXTENT / 3^depth`. Feeds player gravity
-        // and flight-thrust tuning so motion feels proportional to
-        // the layer the player is operating at.
-        let depth = self.camera.position.anchor.depth() as i32;
-        let cell_size = crate::world::coords::ROOT_EXTENT / 3.0f32.powi(depth);
-
-        player::update(
-            &mut self.camera,
-            &mut self.velocity,
-            &self.keys,
-            cell_size,
-            &self.body_anchor,
-            &self.world.library,
-            self.world.root,
-            dt,
-        );
+        // Debug mode: no physics. The only motion is one-cell
+        // teleports fired from `apply_key`. We still re-blend the
+        // up-vector each frame so look smoothing stays smooth.
+        player::update(&mut self.camera, &mut self.velocity, dt);
 
         if let Some(renderer) = &self.renderer {
             renderer.update_camera(&self.camera.gpu_camera(1.2));

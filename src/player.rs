@@ -1,61 +1,70 @@
-//! Per-frame player physics.
-//!
-//! Testing mode: gravity is disabled and flight speed is a fixed
-//! world-units-per-second constant, independent of the camera's
-//! anchor depth. Re-enable the body-pull + depth-proportional speed
-//! once the refactor is visually verified.
+//! Debug-only camera control. Physics + continuous movement are
+//! disabled while the anchor refactor is being verified — every
+//! position change goes through an explicit one-cell teleport.
 
 use crate::camera::Camera;
-use crate::input::Keys;
-use crate::world::coords::{Path, ROOT_EXTENT};
-use crate::world::sdf;
 use crate::world::tree::{NodeId, NodeLibrary};
 
-/// Fixed world-space flight speed (units per second). Chosen so
-/// crossing a root-extent cell (3 units) takes ~1s.
-const FLIGHT_SPEED: f32 = 3.0;
-
-/// Step the camera forward one frame. Gravity disabled for testing;
-/// flight thrust is direct per-frame displacement in world units.
-/// The final step is converted to offset units at the camera's
-/// current anchor depth and handed to `WorldPos::add_local`.
+/// Per-frame update. With debug movement on, this is just an up-vector
+/// re-blend toward world +Y; nothing physical happens. WASD / Space
+/// / Shift fire one-shot teleports through `apply_key` instead.
 pub fn update(
     camera: &mut Camera,
-    velocity: &mut [f32; 3],
-    keys: &Keys,
-    _cell_size: f32,
-    _body_anchor: &Path,
-    library: &NodeLibrary,
-    world_root: NodeId,
+    _velocity: &mut [f32; 3],
     dt: f32,
 ) {
-    // Clear any residual velocity from a previous frame — gravity off.
-    *velocity = [0.0, 0.0, 0.0];
     camera.update_up([0.0, 1.0, 0.0], dt);
+}
 
-    let (fwd, right, up) = camera.basis();
-    let mut d = [0.0f32; 3];
-    if keys.w { d = sdf::add(d, fwd); }
-    if keys.s { d = sdf::sub(d, fwd); }
-    if keys.d { d = sdf::add(d, right); }
-    if keys.a { d = sdf::sub(d, right); }
-    if keys.space { d = sdf::add(d, up); }
-    if keys.shift { d = sdf::sub(d, up); }
-    let l = sdf::length(d);
-    let step_world = if l > 1e-4 {
-        sdf::scale(d, FLIGHT_SPEED * dt / l)
-    } else {
-        return;
+/// Teleport the camera by exactly one cell at its current anchor
+/// depth, along world axis `axis` (0=X, 1=Y, 2=Z) in direction
+/// `dir` (`+1` or `-1`). Hits a non-Cartesian boundary? `add_local`
+/// emits the corresponding `Transition`; we ignore it for now.
+pub fn teleport_one_cell(
+    camera: &mut Camera,
+    axis: u8,
+    dir: i8,
+    library: &NodeLibrary,
+    world_root: NodeId,
+) {
+    debug_assert!(axis < 3 && (dir == 1 || dir == -1));
+    let mut delta = [0.0f32; 3];
+    delta[axis as usize] = dir as f32;
+    let _ = camera.position.add_local(delta, library, world_root);
+}
+
+/// Teleport along the camera's horizontal forward (snapped to the
+/// nearest world axis). Useful for WASD movement that always runs
+/// in cardinal Cartesian directions, "regardless of the sphere."
+pub fn teleport_along_camera(
+    camera: &mut Camera,
+    component: CameraDir,
+    library: &NodeLibrary,
+    world_root: NodeId,
+) {
+    let (fwd, right, _up) = camera.basis();
+    let v = match component {
+        CameraDir::Forward  => fwd,
+        CameraDir::Backward => [-fwd[0], -fwd[1], -fwd[2]],
+        CameraDir::Right    => right,
+        CameraDir::Left     => [-right[0], -right[1], -right[2]],
     };
+    let (axis, dir) = snap_to_cardinal(v);
+    teleport_one_cell(camera, axis, dir, library, world_root);
+}
 
-    // Convert the world-space step into offset units at the camera's
-    // anchor depth; `add_local` handles cell crossings and bubble-up.
-    let depth = camera.position.anchor.depth();
-    let cell_world = ROOT_EXTENT / 3f32.powi(depth as i32);
-    let delta_local = [
-        step_world[0] / cell_world,
-        step_world[1] / cell_world,
-        step_world[2] / cell_world,
-    ];
-    let _transition = camera.position.add_local(delta_local, library, world_root);
+#[derive(Clone, Copy, Debug)]
+pub enum CameraDir { Forward, Backward, Right, Left }
+
+/// Pick the world axis whose absolute component in `v` is largest.
+/// Returns `(axis, +1 or -1)` aligned with the sign of that component.
+fn snap_to_cardinal(v: [f32; 3]) -> (u8, i8) {
+    let ax = v[0].abs();
+    let ay = v[1].abs();
+    let az = v[2].abs();
+    let axis = if ax >= ay && ax >= az { 0 }
+               else if ay >= az { 1 }
+               else { 2 };
+    let dir = if v[axis as usize] >= 0.0 { 1 } else { -1 };
+    (axis, dir)
 }
