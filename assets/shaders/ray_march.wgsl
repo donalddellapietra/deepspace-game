@@ -32,6 +32,17 @@ struct Uniforms {
     _pad1: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    // Cubed-sphere planet: xyz = world-space center,
+    //                      w   = outer radius (0 disables).
+    cs_planet: vec4<f32>,
+    // x = inner radius. y, z reserved. w = highlight-active flag.
+    cs_params: vec4<f32>,
+    // Highlighted cell: (face, i, j, k) as f32.
+    cs_highlight: vec4<f32>,
+    // GPU buffer indices of the 6 face subtree roots, packed into
+    // two vec4<u32>. Order: PosX, NegX, PosY, NegY, PosZ, NegZ.
+    cs_face_roots_a: vec4<u32>,
+    cs_face_roots_b: vec4<u32>,
 }
 
 /// Per-node kind descriptor, parallel to the tree buffer. Indexed by
@@ -87,17 +98,10 @@ fn ea_to_cube(e: f32) -> f32 {
     return tan(e * FRAC_PI_4);
 }
 
-/// Face index → body-node slot. Matches the insertion in
-/// `spherical_worldgen::build`. Order: +X, −X, +Y, −Y, +Z, −Z.
-/// slot_index(x,y,z) = z*9 + y*3 + x:
-///   +X = (2,1,1) = 14   −X = (0,1,1) = 12
-///   +Y = (1,2,1) = 16   −Y = (1,0,1) = 10
-///   +Z = (1,1,2) = 22   −Z = (1,1,0) =  4
-const FACE_CENTER_SLOTS: array<u32, 6> = array<u32, 6>(14u, 12u, 16u, 10u, 22u, 4u);
-
-/// Buffer index of the face subtree at `face` inside a body node.
-fn face_root_in_body(body_node_idx: u32, face: u32) -> u32 {
-    return child_node_index(body_node_idx, FACE_CENTER_SLOTS[face]);
+/// Look up the `cs_face_roots` packed uniform by face index 0..6.
+fn face_root(face: u32) -> u32 {
+    if face < 4u { return uniforms.cs_face_roots_a[face]; }
+    return uniforms.cs_face_roots_b[face - 4u];
 }
 
 /// Outward-pointing normal of the given cube face.
@@ -268,125 +272,6 @@ struct HitResult {
     t: f32,
 }
 
-/// Sphere DDA inside a single `CubedSphereBody` cell.
-///
-/// `body_origin` / `body_extent` are the cell's lower-corner and
-/// edge length in the render frame; `inner_r_local` / `outer_r_local`
-/// are the body's radii in body-cell local coords (`[0, 1)`). The
-/// sphere is centered at `body_origin + body_extent * 0.5`.
-///
-/// Returns `hit=true` + block color if the ray hits a solid face cell;
-/// `hit=false` otherwise — the caller then advances the parent march
-/// past this body cell.
-fn march_sphere_body(
-    body_node_idx: u32,
-    body_origin: vec3<f32>,
-    body_extent: f32,
-    inner_r_local: f32,
-    outer_r_local: f32,
-    ray_origin: vec3<f32>,
-    ray_dir: vec3<f32>,
-) -> HitResult {
-    var result: HitResult;
-    result.hit = false;
-    result.t = 1e20;
-
-    let cs_center = body_origin + vec3<f32>(body_extent) * 0.5;
-    let cs_outer = outer_r_local * body_extent;
-    let cs_inner = inner_r_local * body_extent;
-    let shell = cs_outer - cs_inner;
-
-    let oc = ray_origin - cs_center;
-    let b = dot(oc, ray_dir);
-    let c_outer = dot(oc, oc) - cs_outer * cs_outer;
-    let disc = b * b - c_outer;
-    if disc <= 0.0 { return result; }
-
-    let sq = sqrt(disc);
-    let t_enter = max(-b - sq, 0.0);
-    let t_exit = -b + sq;
-    let eps = max(shell * 1e-5, 1e-7);
-    var t = t_enter + eps;
-    var steps = 0u;
-
-    loop {
-        if t >= t_exit || steps > 512u { break; }
-        steps = steps + 1u;
-
-        let p = ray_origin + ray_dir * t;
-        let local = p - cs_center;
-        let r = length(local);
-        if r >= cs_outer || r < cs_inner { break; }
-
-        let n = local / r;
-        let face = pick_face(n);
-        let n_axis = face_normal(face);
-        let u_axis = face_u_axis(face);
-        let v_axis = face_v_axis(face);
-        let axis_dot = dot(n, n_axis);
-        let cube_u = dot(n, u_axis) / axis_dot;
-        let cube_v = dot(n, v_axis) / axis_dot;
-        let u_ea = cube_to_ea(cube_u);
-        let v_ea = cube_to_ea(cube_v);
-
-        let un = clamp((u_ea + 1.0) * 0.5, 0.0, 0.9999999);
-        let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
-        let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
-
-        let face_root_idx = face_root_in_body(body_node_idx, face);
-        let walk = sample_face_tree(face_root_idx, un, vn, rn);
-        let block_id = walk.x;
-        let term_depth = walk.y;
-        if block_id != 0u {
-            result.hit = true;
-            result.t = t;
-            result.normal = n;
-            let cell_color = palette.colors[block_id].rgb;
-            let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-            let diffuse = max(dot(n, sun_dir), 0.0);
-            let ambient = 0.25;
-            result.color = cell_color * (ambient + diffuse * 0.75);
-            return result;
-        }
-
-        // Empty cell — step to exit via analytic boundary math
-        // (same as the old fs_main sphere DDA).
-        let cells_d = pow(3.0, f32(term_depth));
-        let iu = floor(un * cells_d);
-        let iv = floor(vn * cells_d);
-        let ir = floor(rn * cells_d);
-
-        let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
-        let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
-        let k_u_lo = ea_to_cube(u_lo_ea);
-        let k_u_hi = ea_to_cube(u_hi_ea);
-        let n_u_lo = u_axis - k_u_lo * n_axis;
-        let n_u_hi = u_axis - k_u_hi * n_axis;
-
-        let v_lo_ea = (iv       / cells_d) * 2.0 - 1.0;
-        let v_hi_ea = ((iv+1.0) / cells_d) * 2.0 - 1.0;
-        let k_v_lo = ea_to_cube(v_lo_ea);
-        let k_v_hi = ea_to_cube(v_hi_ea);
-        let n_v_lo = v_axis - k_v_lo * n_axis;
-        let n_v_hi = v_axis - k_v_hi * n_axis;
-
-        let r_lo = cs_inner + (ir       / cells_d) * shell;
-        let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
-
-        var t_next = t_exit + 1.0;
-        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_u_lo), t);
-        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_u_hi), t);
-        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_v_lo), t);
-        t_next = min_after(t_next, ray_plane_t(ray_origin, ray_dir, cs_center, n_v_hi), t);
-        t_next = min_after(t_next, ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t), t);
-        t_next = min_after(t_next, ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t), t);
-
-        if t_next >= t_exit { break; }
-        t = t_next + eps;
-    }
-    return result;
-}
-
 fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -531,33 +416,16 @@ fn march(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             result.normal = normal;
             return result;
         } else if tag == 2u {
-            // Node — inspect its kind. CubedSphereBody children get
-            // rendered by the sphere DDA; this replaces the old
-            // top-of-fs_main cs_planet-uniform path.
+            // Node — inspect its kind. A CubedSphereBody child is
+            // rendered by the sphere DDA below (driven by the
+            // cs_planet uniform until shader-side NodeKind dispatch
+            // lands in a later commit); here we just step past its
+            // cell as if it were Empty, so the Cartesian march
+            // doesn't try to interpret face-subtree children as
+            // axis-aligned voxels.
             let ci = child_node_index(s_node_idx[depth], slot);
             let kind_tag = kinds[ci].tag;
             if kind_tag == 1u {
-                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-                let body_extent = s_cell_size[depth];
-                let body_hit = march_sphere_body(
-                    ci,
-                    body_origin,
-                    body_extent,
-                    kinds[ci].inner_r,
-                    kinds[ci].outer_r,
-                    ray_origin,
-                    ray_dir,
-                );
-                if body_hit.hit {
-                    result.hit = true;
-                    result.t = body_hit.t;
-                    result.color = body_hit.color;
-                    result.normal = body_hit.normal;
-                    return result;
-                }
-                // Missed the sphere — step past this body cell as if
-                // Empty. (The body occupies exactly one parent cell;
-                // exiting its AABB IS exiting the parent cell.)
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -704,16 +572,181 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let result = march(camera.pos, ray_dir);
 
-    // Sphere rendering lives inside `march()` now — the old
-    // uniform-driven cs_planet path in fs_main is gone.
+    // Spherical planet: true 3D DDA through the face subtrees.
+    //
+    // Each iteration finds the (face, iu, iv, ir) cell the ray is
+    // currently in at the finest subtree depth, samples that cell's
+    // block via the subtree walker, and either hits or steps to the
+    // exit boundary of that cell via analytic ray-plane (u/v) or
+    // ray-sphere (r) intersection. No fixed step, no aliasing —
+    // every pixel settles on the same cell regardless of depth or
+    // camera distance.
+    var cs_hit = false;
+    var cs_t = 1e20;
+    var cs_color = vec3<f32>(0.0);
+    var cs_normal = vec3<f32>(0.0, 1.0, 0.0);
+
+    let cs_outer = uniforms.cs_planet.w;
+    if cs_outer > 0.0 {
+        let cs_center = uniforms.cs_planet.xyz;
+        let cs_inner = uniforms.cs_params.x;
+        let shell = cs_outer - cs_inner;
+
+        let oc = camera.pos - cs_center;
+        let b = dot(oc, ray_dir);
+        let c_outer = dot(oc, oc) - cs_outer * cs_outer;
+        let disc = b * b - c_outer;
+        if disc > 0.0 {
+            let sq = sqrt(disc);
+            let t_enter = max(-b - sq, 0.0);
+            let t_exit = -b + sq;
+            // Small epsilon in world units, anchored to shell
+            // thickness. Advances t past a boundary so the next
+            // iteration samples the neighboring cell instead of
+            // looping on the same boundary plane.
+            let eps = max(shell * 1e-5, 1e-7);
+            var t = t_enter + eps;
+            var steps = 0u;
+            loop {
+                if t >= t_exit || steps > 512u { break; }
+                steps = steps + 1u;
+
+                let p = camera.pos + ray_dir * t;
+                let local = p - cs_center;
+                let r = length(local);
+                // The outer sphere intersect keeps us inside the
+                // shell in practice, but guard both boundaries.
+                if r >= cs_outer || r < cs_inner { break; }
+
+                let n = local / r;
+                let face = pick_face(n);
+                let n_axis = face_normal(face);
+                let u_axis = face_u_axis(face);
+                let v_axis = face_v_axis(face);
+                let axis_dot = dot(n, n_axis);
+                let cube_u = dot(n, u_axis) / axis_dot;
+                let cube_v = dot(n, v_axis) / axis_dot;
+                let u_ea = cube_to_ea(cube_u);
+                let v_ea = cube_to_ea(cube_v);
+
+                let un = clamp((u_ea + 1.0) * 0.5, 0.0, 0.9999999);
+                let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
+                let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
+
+                let walk = sample_face_tree(face_root(face), un, vn, rn);
+                let block_id = walk.x;
+                let term_depth = walk.y;
+                if block_id != 0u {
+                    cs_hit = true;
+                    cs_t = t;
+                    cs_normal = n;
+                    let cell_color = palette.colors[block_id].rgb;
+                    let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
+                    let diffuse = max(dot(n, sun_dir), 0.0);
+                    let ambient = 0.25;
+                    var surface = cell_color * (ambient + diffuse * 0.75);
+
+                    // Cursor highlight: the selected cell can live at
+                    // any subtree depth, not just the finest. At
+                    // `highlight_depth = 1` the wireframe encloses a
+                    // 3³-cell chunk; at `highlight_depth = subtree_depth`
+                    // it encloses one finest cell.
+                    if uniforms.cs_params.w > 0.5 {
+                        let hl_depth = max(uniforms.cs_params.z, 1.0);
+                        let hl_cells = pow(3.0, hl_depth);
+                        let hl_face = u32(uniforms.cs_highlight.x);
+                        let iu_h = floor(un * hl_cells);
+                        let iv_h = floor(vn * hl_cells);
+                        let ir_h = floor(rn * hl_cells);
+                        if face == hl_face
+                            && iu_h == uniforms.cs_highlight.y
+                            && iv_h == uniforms.cs_highlight.z
+                            && ir_h == uniforms.cs_highlight.w
+                        {
+                            // Edge-distance in the highlight cell's
+                            // local (0,1) space. Lines near any of
+                            // the six bulged faces of the cell.
+                            let cell_u = un * hl_cells - iu_h;
+                            let cell_v = vn * hl_cells - iv_h;
+                            let cell_r = rn * hl_cells - ir_h;
+                            let edge = min(
+                                min(min(cell_u, 1.0 - cell_u),
+                                    min(cell_v, 1.0 - cell_v)),
+                                min(cell_r, 1.0 - cell_r));
+                            // Line width: ~3% of cell, roughly one
+                            // visible "rim" at any zoom.
+                            if edge < 0.05 {
+                                surface = vec3<f32>(1.0, 0.9, 0.2);
+                            }
+                        }
+                    }
+
+                    cs_color = surface;
+                    break;
+                }
+
+                // Empty cell — step to its exit. Cell bounds are at
+                // the SUBTREE WALKER'S termination depth, not at a
+                // fixed finest depth. This is the octree skip-empty
+                // speedup: if the walker bottomed out at depth 1
+                // because the whole 1/27 chunk is empty, we jump
+                // 1/3 of the face per step instead of 1/3^depth.
+                let cells_d = pow(3.0, f32(term_depth));
+                let iu = floor(un * cells_d);
+                let iv = floor(vn * cells_d);
+                let ir = floor(rn * cells_d);
+
+                // u-boundaries as world planes through center.
+                let u_lo_ea = (iu       / cells_d) * 2.0 - 1.0;
+                let u_hi_ea = ((iu+1.0) / cells_d) * 2.0 - 1.0;
+                let k_u_lo = ea_to_cube(u_lo_ea);
+                let k_u_hi = ea_to_cube(u_hi_ea);
+                let n_u_lo = u_axis - k_u_lo * n_axis;
+                let n_u_hi = u_axis - k_u_hi * n_axis;
+
+                let v_lo_ea = (iv       / cells_d) * 2.0 - 1.0;
+                let v_hi_ea = ((iv+1.0) / cells_d) * 2.0 - 1.0;
+                let k_v_lo = ea_to_cube(v_lo_ea);
+                let k_v_hi = ea_to_cube(v_hi_ea);
+                let n_v_lo = v_axis - k_v_lo * n_axis;
+                let n_v_hi = v_axis - k_v_hi * n_axis;
+
+                // r-boundaries as spheres around center.
+                let r_lo = cs_inner + (ir       / cells_d) * shell;
+                let r_hi = cs_inner + ((ir+1.0) / cells_d) * shell;
+
+                var t_next = t_exit + 1.0;
+                t_next = min_after(t_next,
+                    ray_plane_t(camera.pos, ray_dir, cs_center, n_u_lo), t);
+                t_next = min_after(t_next,
+                    ray_plane_t(camera.pos, ray_dir, cs_center, n_u_hi), t);
+                t_next = min_after(t_next,
+                    ray_plane_t(camera.pos, ray_dir, cs_center, n_v_lo), t);
+                t_next = min_after(t_next,
+                    ray_plane_t(camera.pos, ray_dir, cs_center, n_v_hi), t);
+                t_next = min_after(t_next,
+                    ray_sphere_after(camera.pos, ray_dir, cs_center, r_lo, t), t);
+                t_next = min_after(t_next,
+                    ray_sphere_after(camera.pos, ray_dir, cs_center, r_hi, t), t);
+
+                if t_next >= t_exit { break; }
+                // Advance just past the boundary so the next sample
+                // lands inside the neighboring cell.
+                t = t_next + eps;
+            }
+        }
+    }
 
     var color: vec3<f32>;
-    if result.hit {
+    let tree_closer = result.hit && result.t <= cs_t;
+    if tree_closer {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
         let lit = result.color * (ambient + diffuse * 0.7);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
+    } else if cs_hit {
+        color = pow(cs_color, vec3<f32>(1.0 / 2.2));
     } else {
         let sky_t = ray_dir.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
