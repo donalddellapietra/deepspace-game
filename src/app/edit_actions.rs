@@ -14,6 +14,58 @@ use crate::world::gpu;
 use super::App;
 
 impl App {
+    /// Rebuild `camera.position` at `new_depth` from a target world
+    /// XYZ via `from_world_pos_in_tree`. Used by debug teleports and
+    /// scroll-zoom — both want "same world spot, possibly different
+    /// path depth."
+    pub(super) fn reanchor_camera(&mut self, world: [f32; 3], new_depth: u8) {
+        let clamped = [
+            world[0].clamp(0.0, 3.0 - f32::EPSILON * 4.0),
+            world[1].clamp(0.0, 3.0 - f32::EPSILON * 4.0),
+            world[2].clamp(0.0, 3.0 - f32::EPSILON * 4.0),
+        ];
+        self.camera.position = crate::world::position::Position::from_world_pos_in_tree(
+            clamped,
+            new_depth,
+            &self.world.library,
+            self.world.root,
+        );
+    }
+
+    /// Debug-mode teleport: jump exactly one cell of width
+    /// `3^-camera.depth` along a world-frame direction.
+    pub(super) fn debug_teleport(&mut self, dir: [f32; 3]) {
+        let depth = self.camera.position.depth;
+        let cell_size = 3.0f32.powi(-(depth as i32));
+        let world = self.camera.position.pos_in_ancestor_frame_in_tree(
+            0,
+            &self.world.library,
+            self.world.root,
+        );
+        let target = [
+            world[0] + dir[0] * cell_size,
+            world[1] + dir[1] * cell_size,
+            world[2] + dir[2] * cell_size,
+        ];
+        eprintln!(
+            "[teleport] dir={:?} from={:?} to={:?} cell_size={:.3e}",
+            dir, world, target, cell_size,
+        );
+        self.reanchor_camera(target, depth);
+        self.apply_zoom();
+    }
+
+    /// Reset to a known inspection pose at world (1.5, 2.0, 1.5)
+    /// looking straight down. Bound to `R`.
+    pub(super) fn debug_reset_pose(&mut self) {
+        let depth = self.camera.position.depth;
+        self.reanchor_camera([1.5, 2.0, 1.5], depth);
+        self.camera.yaw = 0.0;
+        self.camera.pitch = -std::f32::consts::FRAC_PI_2;
+        self.camera.smoothed_up = [0.0, 1.0, 0.0];
+        self.apply_zoom();
+    }
+
     /// CPU raycast depth: how far below the render root to descend
     /// when testing the cursor ray. Derived from the camera's path
     /// depth (the "zoom anchor") minus the render-root depth. Under

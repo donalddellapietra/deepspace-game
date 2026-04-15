@@ -13,8 +13,27 @@ use winit::keyboard::KeyCode;
 use super::App;
 
 impl App {
-    pub(super) fn apply_key(&mut self, code: KeyCode, pressed: bool) {
+    pub(super) fn apply_key(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
         self.keys.apply(code, pressed);
+
+        // Debug-mode discrete teleports — fire on the FIRST press
+        // only (no auto-repeat) when the cursor is locked.
+        if pressed && !repeat && self.cursor_locked {
+            let dir: Option<[f32; 3]> = match code {
+                KeyCode::KeyW => Some([ 0.0, 0.0, -1.0]),
+                KeyCode::KeyS => Some([ 0.0, 0.0,  1.0]),
+                KeyCode::KeyA => Some([-1.0, 0.0,  0.0]),
+                KeyCode::KeyD => Some([ 1.0, 0.0,  0.0]),
+                KeyCode::Space     => Some([0.0,  1.0, 0.0]),
+                KeyCode::ShiftLeft => Some([0.0, -1.0, 0.0]),
+                KeyCode::KeyR => { self.debug_reset_pose(); return; }
+                _ => None,
+            };
+            if let Some(d) = dir {
+                self.debug_teleport(d);
+                return;
+            }
+        }
 
         if pressed && code == KeyCode::Escape {
             if self.ui.any_panel_open() {

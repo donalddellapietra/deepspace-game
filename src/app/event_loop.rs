@@ -71,11 +71,16 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput {
-                event: KeyEvent { physical_key: PhysicalKey::Code(code), state, .. },
+                event: KeyEvent {
+                    physical_key: PhysicalKey::Code(code),
+                    state,
+                    repeat,
+                    ..
+                },
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
-                self.apply_key(code, pressed);
+                self.apply_key(code, pressed, repeat);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -115,33 +120,29 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// Mouse-wheel zoom — path-native.
-    ///
-    /// Scrolling up pushes a slot onto the camera's path (`zoom_in`),
-    /// scrolling down pops (`zoom_out`). Both operations preserve the
-    /// camera's world position, so the block under the crosshair
-    /// stays fixed in space and the shader just renders a finer or
-    /// coarser level of detail around it. No XYZ dolly needed.
+    /// Mouse-wheel zoom — keeps the camera's WORLD position fixed
+    /// and only changes its anchoring depth. Each tick rebuilds
+    /// `camera.position` via `from_world_pos_in_tree` at the new
+    /// depth using the current world XYZ — no offset rescaling drift
+    /// from successive `zoom_in`/`zoom_out` calls.
     fn handle_scroll_zoom(&mut self, delta: winit::event::MouseScrollDelta) {
         let y = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => y,
             winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
         };
         let td = self.tree_depth as u8;
-        if y > 0.0 {
-            // Scroll up → zoom in (finer).
-            if self.camera.position.depth < td {
-                self.camera.position.zoom_in();
-            }
-        } else if y < 0.0 {
-            // Scroll down → zoom out (coarser). depth ≥ 1 stays
-            // anchored inside at least one root-level slot.
-            if self.camera.position.depth > 1 {
-                self.camera.position.zoom_out();
-            }
-        } else {
-            return;
-        }
+        let mut new_depth = self.camera.position.depth as i32;
+        if y > 0.0 { new_depth += 1; }
+        else if y < 0.0 { new_depth -= 1; }
+        else { return; }
+        let new_depth = new_depth.clamp(1, td as i32) as u8;
+        if new_depth == self.camera.position.depth { return; }
+        let world = self.camera.position.pos_in_ancestor_frame_in_tree(
+            0,
+            &self.world.library,
+            self.world.root,
+        );
+        self.reanchor_camera(world, new_depth);
         self.apply_zoom();
     }
 

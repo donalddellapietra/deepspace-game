@@ -155,23 +155,13 @@ impl App {
     /// camera state to the GPU. Editing, highlights, and tree upload
     /// live in [`edit_actions`]; the `ApplicationHandler` in
     /// [`event_loop`] calls them in order.
-    pub(super) fn update(&mut self, dt: f32) {
-        // "cell_size" here matches the old engine's convention
-        // (`1/3^edit_depth` — the extent of one 27-grandchild of the
-        // camera's cell, not the cell itself). Thrust and gravity
-        // scale off this so player speed feels identical to the
-        // pre-refactor game at every zoom level. Geometrically the
-        // camera's own cell is 3× this (3^(1 - depth)).
-        let cell_size = 3.0f32.powi(-(self.camera.position.depth as i32));
-
-        player::update(
-            &mut self.camera,
-            &mut self.velocity,
-            &self.keys,
-            cell_size,
-            self.cs_planet.as_ref(),
-            dt,
-        );
+    pub(super) fn update(&mut self, _dt: f32) {
+        // Physics OFF — debug mode. All motion goes through
+        // `App::debug_teleport` (WASD/Space/Shift) and
+        // `App::debug_reset_pose` (R). Smoothed-up locked to world
+        // +Y so the horizon doesn't auto-rotate near the planet.
+        let _ = (&self.velocity, &self.keys, &player::update);
+        self.camera.smoothed_up = [0.0, 1.0, 0.0];
 
         if let Some(renderer) = &self.renderer {
             let pos = self.camera_pos_in_render_frame();
