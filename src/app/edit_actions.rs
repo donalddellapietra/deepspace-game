@@ -26,17 +26,15 @@ impl App {
     /// `anchor - 4` formula was off by one — placements at Layer
     /// N landed at face-subtree depth N-1 ("Layer N+1 block").
     ///
-    /// Cap at 19 (= face_subtree_depth - 1) to allow editing down
-    /// to Layer 1. CPU walker and `propagate_edit` are precise at
-    /// any depth via path arithmetic; the SHADER's sphere DDA
-    /// currently loses precision for `cell_eps < f32 ULP` at deep
-    /// term_depths, producing sparse-sample artifacts when
-    /// rendering large regions of fine edits. The edit itself is
-    /// correct in the tree — what you place is what's stored — and
-    /// the shader precision fix (frame-local sphere DDA) is the
-    /// next increment of the anchor refactor.
+    /// No numerical depth cap. Any ceiling would be an admission
+    /// the shader's rendering doesn't honor path-anchored
+    /// precision (camera in root-scale f32 breaks at anchor ~15,
+    /// `cells_d = pow(3, depth)` overflows f32-integer-exact at
+    /// depth 16). Those are shader bugs to fix, not budgets to
+    /// ration. The lower bound of 1 is the only actual content
+    /// constraint — depth 0 would place above the face root.
     pub(super) fn cs_edit_depth(&self) -> u32 {
-        ((self.anchor_depth() as i32) - 3).clamp(1, 19) as u32
+        ((self.anchor_depth() as i32) - 3).max(1) as u32
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
