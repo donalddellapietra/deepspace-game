@@ -26,8 +26,9 @@ const FLIGHT_CELLS_PER_SEC: f32 = 0.5;
 /// Maximum gravity velocity in cell-widths per second.
 const TERMINAL_FALL_CELLS_PER_SEC: f32 = 4.0;
 /// Gravity acceleration in cell-widths per second² inside the
-/// influence radius.
-const GRAVITY_CELLS_PER_SEC2: f32 = 8.0;
+/// influence radius. Set to `0.0` for pure-flight debug mode;
+/// re-enable when surface gameplay is being verified.
+const GRAVITY_CELLS_PER_SEC2: f32 = 0.0;
 /// Velocity damping rate (1/s); higher = more drag.
 const VELOCITY_DAMP_PER_SEC: f32 = 2.5;
 

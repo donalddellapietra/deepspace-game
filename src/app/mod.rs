@@ -93,16 +93,17 @@ impl App {
             scene.body_anchor, tree_depth, scene.world.library.len(),
         );
 
-        // Body's world-space center: the anchor cell's center (local
-        // offset = 0.5 on every axis), which equals the slot-coords
-        // times the cell size plus half a cell. Spawn one 30%-outer-r
-        // hop above the north pole.
+        // Body's world-space center: the anchor cell's center.
+        // Spawn well clear of the body so the player can survey the
+        // whole planet without being inside the influence radius —
+        // 1.0 world units away on the +Z side, clamped into the
+        // root's `[0, 3)` extent.
         let body_center = crate::world::coords::world_pos_to_f32(
             &crate::world::coords::WorldPos { anchor: scene.body_anchor, offset: [0.5, 0.5, 0.5] },
         );
         let spawn_pos = [
             body_center[0],
-            body_center[1] + setup.outer_r + 0.3,
+            (body_center[1] - 1.0).max(0.2),
             body_center[2],
         ];
 
