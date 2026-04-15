@@ -32,48 +32,31 @@ impl App {
         self.tree_depth as i32 - self.edit_depth() as i32
     }
 
-    /// How many leading slots of the camera's path sit above the
-    /// render root. Pinned `RENDER_FRAME_K` levels above the camera
-    /// so the shader's `[0, 3)³` traversal volume stays a small f32
-    /// magnitude regardless of camera depth — which is what
-    /// eliminates the per-layer absolute-coords jitter.
-    pub(super) fn render_root_depth(&self) -> u8 {
-        const RENDER_FRAME_K: u8 = 3;
-        self.camera.position.depth.saturating_sub(RENDER_FRAME_K)
-    }
-
-    /// NodeId of the render root — walks `camera.position.path[..]`
-    /// from the tree root. Because the path was built via
-    /// `Position::from_world_pos_in_tree` (NodeKind-aware), each
-    /// slot along the walk resolves to the correct tree node even
-    /// where the path threads through body/face subtrees. Falls back
-    /// to the tree root if the walk hits a non-Node slot.
+    /// Node id of the "render root" — the ancestor whose subtree the
+    /// GPU walks each frame. Today this is always the tree root. Step
+    /// 5 introduces the concept so the plumbing can later pick a
+    /// smaller ancestor for precision (see §3a of
+    /// refactor-decisions.md).
     pub(super) fn render_root_id(&self) -> crate::world::tree::NodeId {
-        use crate::world::tree::Child;
-        let target = self.render_root_depth() as usize;
-        let mut id = self.world.root;
-        for k in 0..target {
-            let Some(node) = self.world.library.get(id) else {
-                return self.world.root;
-            };
-            let slot = self.camera.position.path[k] as usize;
-            match node.children[slot] {
-                Child::Node(child) => id = child,
-                _ => return self.world.root,
-            }
-        }
-        id
+        self.world.root
     }
 
-    /// Camera XYZ in the render root's local `[0, 3)³` frame.
-    /// NodeKind-aware: crossing a body ancestor reconstructs the
-    /// cartesian XYZ inside the body cell via sphere geometry.
+    /// Depth (number of leading slots in the camera's path) that sits
+    /// above the render root. `0` means the render root is the tree
+    /// root itself. Paired with
+    /// [`Position::pos_in_ancestor_frame`](crate::world::position::Position::pos_in_ancestor_frame).
+    pub(super) fn render_root_depth(&self) -> u8 {
+        0
+    }
+
+    /// Camera position expressed in the render root's local `[0, 3)³`
+    /// frame. This is the path-native replacement for
+    /// `camera.world_pos()` at upload sites; they produce the same
+    /// numbers today because `render_root_depth() == 0`.
     pub(super) fn camera_pos_in_render_frame(&self) -> [f32; 3] {
-        self.camera.position.pos_in_ancestor_frame_in_tree(
-            self.render_root_depth(),
-            &self.world.library,
-            self.world.root,
-        )
+        self.camera
+            .position
+            .pos_in_ancestor_frame(self.render_root_depth())
     }
 
     /// GPU visual depth: edit_depth + 3 (see 27×27×27 detail).
@@ -97,8 +80,8 @@ impl App {
         }
         let vd = self.visual_depth();
         self.ui.zoom_level = self.zoom_level();
-        let pos = self.camera_pos_in_render_frame();
-        let gpu_cam = self.camera.gpu_camera(1.2, pos);
+        let frame_depth = self.render_root_depth();
+        let gpu_cam = self.camera.gpu_camera(1.2, frame_depth);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
             renderer.update_camera(&gpu_cam);
