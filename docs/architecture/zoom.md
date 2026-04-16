@@ -1,64 +1,75 @@
 # Zoom
 
-## What Zoom Is
+Zoom is tree navigation, not camera manipulation. Scrolling the mouse
+wheel moves the camera's anchor up or down the tree. The renderer
+always renders at full per-pixel LOD — zoom doesn't change the FOV or
+the ray-march budget.
 
-Zoom is not a camera operation. It is tree navigation. The ray marcher always renders full visual detail (automatic per-pixel LOD). Zoom changes what the player can **interact with** — the scale of blocks they break, the grid they collide with, and how fast they move.
+Source of truth:
+- `src/world/anchor.rs` — `WorldPos::zoom_in` / `zoom_out` primitives.
+- `src/app/event_loop.rs` — scroll handler + `zoom_anchor(step)`.
+- `src/app/harness_emit.rs` — script `zoom_in:N` / `zoom_out:N`.
 
-## Controls
-
-- **Q (zoom out):** View layer increases by 1. The player ascends the tree. Gameplay blocks get coarser (each covers 3× more world per axis). Movement speed scales up proportionally. The player effectively becomes a giant.
-
-- **E (zoom in):** View layer decreases by 1. The player descends into a child node. Gameplay blocks get finer. Movement speed scales down. The player effectively becomes tiny.
-
-## What Changes on Zoom
-
-| System | Effect |
-|--------|--------|
-| Interaction layer | Blocks the player breaks/places are at layer N-3 (one cell of the 27³ grid) |
-| Collision layer | Solid/empty checks are at layer N-4 (one layer below gameplay blocks) |
-| Movement speed | walk_speed × cell_size_at_layer(N). Same cells/second at every zoom. |
-| Gravity | gravity × cell_size_at_layer(N). Same jump height in cells at every zoom. |
-| Player AABB | Scales with cell size. Always 0.3 × 1.7 cells. |
-
-## What Does NOT Change on Zoom
-
-| System | Why |
-|--------|-----|
-| Visual detail | The ray marcher always renders to per-pixel LOD. Zooming out doesn't make things look worse — things just get smaller on screen, and the ray stops descending earlier because cells are sub-pixel sooner. |
-| Render performance | Same number of pixels, similar number of ray steps. The LOD cutoff adjusts automatically. |
-| Tree data | No entities spawned or despawned. No mesh invalidation. The GPU buffer may need different nodes loaded, but the streaming system handles this. |
-
-## Zoom Transition
-
-On zoom change:
-
-1. Snap the player to ground at the new collision layer (the grid changed, the player might be inside a block or floating).
-2. Zero vertical velocity (prevent residual velocity from the old scale launching the player).
-3. Optionally animate the camera height from the old cell size to the new one (cosmetic smoothing).
-
-## NavStack
-
-The NavStack records which child the player entered when zooming in, so they can zoom back out to the same position:
+## What the code does
 
 ```rust
-struct NavEntry {
-    child_index: u8,  // which of 27 children we entered
-}
-
-struct NavStack {
-    entries: Vec<NavEntry>,
+pub(super) fn zoom_anchor(&mut self, step: i32) {
+    let cur = self.anchor_depth() as i32;
+    let new_depth = (cur + step).clamp(1, MAX_DEPTH as i32);
+    if new_depth == cur { return; }
+    if step > 0 { self.camera.position.zoom_in(); }
+    else        { self.camera.position.zoom_out(); }
+    self.apply_zoom();
 }
 ```
 
-- **E (zoom in):** Push the current child index onto the NavStack. The player enters that child.
-- **Q (zoom out):** Pop the NavStack. The player returns to the parent node at the recorded child position.
+- **Zoom in (step > 0)**: `WorldPos::zoom_in` pushes a slot equal to
+  `floor(offset * 3)` onto the anchor path and rescales offset into
+  the child cell. Anchor depth increases.
+- **Zoom out (step < 0)**: pops the last slot and rescales offset
+  back out. Anchor depth decreases. Clamps at depth 1.
 
-If the NavStack is empty and the player presses Q, they're at the highest zoom level. No-op (or the maximum layer is capped).
+Both primitives are O(1) with no tree reads. They do not *move* the
+player — they re-express the same position at a different granularity.
 
-## Why Zoom Exists If Rendering Is Automatic
+`apply_zoom` follows by recomputing the active frame, resetting the
+LOD cache key, and repacking the GPU tree.
 
-The ray marcher renders everything at correct detail regardless of zoom. So why have zoom at all?
+## What changes
 
-Because the game is about **interacting** at different scales. At layer 9, you place blocks to build a house. At layer 12, you place trees to build a forest. At layer 18, you place continents to shape a planet. At layer 54, you arrange galaxies.
+| What | How |
+|---|---|
+| Anchor depth | ±1 per scroll step. |
+| UI `layer` | `tree_depth − anchor_depth + 1`. Shown on the hotbar overlay. |
+| Edit granularity | The CPU raycast descends up to `edit_depth()` = current `anchor_depth` (overridable via `--force-edit-depth`). Shallower anchor ⇒ coarser edits. |
+| Render frame | `compute_render_frame` picks a new frame root when the camera's ancestor chain changes. |
 
-The visual is always correct. Zoom controls what "one click" means — what scale of thing you're manipulating. It's the difference between a brush size in Photoshop and the zoom level of the canvas. Both matter independently.
+## What doesn't change
+
+- **Visual detail.** The renderer runs the same DDA per pixel; LOD
+  cut-off is a function of cell-on-screen size, not zoom. Zooming out
+  just means the same pixel covers more world.
+- **FOV or camera orientation.**
+- **The tree.** No nodes are allocated or freed on zoom.
+
+## What's explicitly *not* implemented
+
+The code has zoom primitives and the anchor-depth change — that's it.
+Aspirational side effects described in older docs (walk speed ∝
+cell size, gravity ∝ cell size, AABB scaling, collision layer at
+`anchor_depth − 1`) are **not in the current code**. Player motion
+today is debug-only: WASD teleports one child cell at the current
+anchor depth (`App::step_chunk`); `src/player.rs::update` is a
+no-op. See [../design/collision.md](../design/collision.md) for the
+intended eventual behavior.
+
+## Controls
+
+| Input | Effect |
+|---|---|
+| Mouse wheel up | `zoom_anchor(+1)` — anchor deeper. |
+| Mouse wheel down | `zoom_anchor(-1)` — anchor shallower. |
+| Script `zoom_in:N` / `zoom_out:N` | Repeated `zoom_anchor` from the test harness. |
+
+`E` / `Q` keys are *not* bound to zoom today (older docs claimed they
+were).

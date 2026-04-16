@@ -12,7 +12,7 @@ Load-bearing invariants. Every subsystem must honor these.
 - [principles/locality-prime-directive.md](principles/locality-prime-directive.md)
 - [principles/scaling-deep-trees.md](principles/scaling-deep-trees.md)
 
-## Architecture
+## Architecture (implemented)
 
 How the code works today. Normative — if code and doc disagree, the
 doc is wrong.
@@ -22,26 +22,31 @@ doc is wrong.
 - [architecture/coordinates.md](architecture/coordinates.md) — path-anchored `WorldPos`.
 - [architecture/rendering.md](architecture/rendering.md) — GPU ray march, render frame, ribbon pop.
 - [architecture/editing.md](architecture/editing.md) — CPU raycast + `propagate_edit`.
-- [architecture/collision.md](architecture/collision.md) — swept-AABB physics.
 - [architecture/zoom.md](architecture/zoom.md) — zoom = anchor depth change.
 - [architecture/cubed-sphere.md](architecture/cubed-sphere.md) — planetary bodies.
-- [architecture/content-pipeline.md](architecture/content-pipeline.md) — voxelizing `.vox` into subtrees.
-- [architecture/streaming.md](architecture/streaming.md) — content-addressed streaming model.
 - [architecture/scale.md](architecture/scale.md) — per-layer real-world scale reference.
+
+## Design (not yet implemented)
+
+Designs the code has *room for* but hasn't wired up yet.
+
+- [design/README.md](design/README.md)
+- [design/collision.md](design/collision.md) — swept-AABB physics.
+- [design/content-pipeline.md](design/content-pipeline.md) — GLB voxelization.
+- [design/streaming.md](design/streaming.md) — CDN / multiplayer.
 
 ## Testing
 
-- [testing/README.md](testing/README.md) — tier overview + quick commands.
+- [testing/README.md](testing/README.md) — overview + quick commands.
 - [testing/harness.md](testing/harness.md) — render-harness CLI + `HARNESS_*` protocol.
 - [testing/e2e-layer-descent.md](testing/e2e-layer-descent.md) — flagship self-similarity test.
-- [testing/playwright.md](testing/playwright.md) — browser UI specs.
 - [testing/perf-isolation.md](testing/perf-isolation.md) — perf regression playbook.
 - [testing/screenshot.md](testing/screenshot.md) — macOS headless window capture.
 
 ## Workflow
 
 - [workflow/worktree-dev.md](workflow/worktree-dev.md) — worktree + dev-loop setup.
-- [workflow/gotchas/](workflow/gotchas/) — sharp edges you'll run into.
+- [workflow/gotchas/](workflow/gotchas/) — sharp edges you'll run into, including a [legacy-code inventory](workflow/gotchas/legacy-code.md).
 
 ## History
 

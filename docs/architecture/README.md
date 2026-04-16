@@ -4,17 +4,18 @@ These docs describe the live architecture of the game as it exists in
 code today. They are *normative* — if a doc disagrees with `src/`, the
 doc is wrong and should be fixed.
 
-For invariants that every piece of the engine must honor, see
-`docs/principles/`. For landed refactors and superseded plans, see
-`docs/history/`.
+For forward-looking designs that the code does not yet implement, see
+[`../design/`](../design/). For invariants every subsystem must honor,
+see [`../principles/`](../principles/). For landed refactors and
+superseded plans, see [`../history/`](../history/).
 
 ## The five-minute tour
 
 The game is a recursive voxel engine. Every node in the world is a
 `3×3×3 = 27`-child tree node (`src/world/tree.rs`). The same code
-renders, edits, and simulates at every level — there is no "leaf"
-layer. A player can zoom from a continent-sized node down through 63
-levels of subdivision without changing subsystems.
+renders and edits at every level — there is no "leaf" layer. A player
+can zoom from a continent-sized node down through 63 levels of
+subdivision without changing subsystems.
 
 - **Tree** — `src/world/tree.rs`. Content-addressed immutable nodes
   with `Cartesian`, `CubedSphereBody`, and `CubedSphereFace` kinds.
@@ -33,22 +34,25 @@ levels of subdivision without changing subsystems.
   march mirrors the shader's DDA to select a cell; `propagate_edit`
   rebuilds ancestors clone-on-write. See [editing.md](editing.md).
 
-- **Collision** — Swept AABB against the tree at a collision depth
-  one finer than the player's anchor. See [collision.md](collision.md).
-
-- **Zoom** — `E` / `Q` / mouse wheel move the anchor up or down the
-  tree. No FOV change. See [zoom.md](zoom.md).
+- **Zoom** — mouse wheel moves the anchor up or down the tree.
+  Anchor-depth change is implemented; side-effect physics (walk
+  speed, gravity scaling) is not. See [zoom.md](zoom.md).
 
 - **Cubed-sphere** — Planetary geometry lives in `CubedSphereBody`
   nodes and six `CubedSphereFace` subtrees. See
   [cubed-sphere.md](cubed-sphere.md).
 
-- **Content** — Worlds are built offline by voxelizing `.vox` meshes
-  or procedural rules into tree subtrees. See
-  [content-pipeline.md](content-pipeline.md).
-
-- **Streaming** — Content-addressed nodes enable CDN caching and
-  merge-friendly edits. See [streaming.md](streaming.md).
-
 - **Scale** — Reference table of what each layer represents in
   approximate real-world units. See [scale.md](scale.md).
+
+## What's *not* here
+
+The following subsystems were designed but are not wired into the
+game today:
+
+- **Collision / physics** — `src/player.rs` is a no-op; gravity in
+  `sdf.rs` is unused. See [../design/collision.md](../design/collision.md).
+- **Content pipeline** — `src/import/` parses `.vox` but nothing
+  calls it. See [../design/content-pipeline.md](../design/content-pipeline.md).
+- **Streaming / multiplayer** — content-addressed dedup is real,
+  network code is not. See [../design/streaming.md](../design/streaming.md).
