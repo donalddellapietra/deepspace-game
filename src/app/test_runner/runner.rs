@@ -280,6 +280,10 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             max_iter_count: render_timing.shader_stats.max_iter_count,
             avg_steps: render_timing.shader_stats.avg_steps(),
             max_steps: render_timing.shader_stats.max_steps,
+            avg_steps_oob: render_timing.shader_stats.avg_steps_oob(),
+            avg_steps_empty: render_timing.shader_stats.avg_steps_empty(),
+            avg_steps_descend: render_timing.shader_stats.avg_steps_descend(),
+            avg_steps_lod_terminal: render_timing.shader_stats.avg_steps_lod_terminal(),
             packed_node_count,
             ribbon_len,
             effective_visual_depth,
@@ -371,6 +375,10 @@ struct FrameSample {
     max_iter_count: u32,
     avg_steps: f64,
     max_steps: u32,
+    avg_steps_oob: f64,
+    avg_steps_empty: f64,
+    avg_steps_descend: f64,
+    avg_steps_lod_terminal: f64,
     packed_node_count: u32,
     ribbon_len: u32,
     effective_visual_depth: u32,
@@ -463,6 +471,10 @@ struct PerfAgg {
     max_max_steps: u32,
     worst_avg_steps: f64,
     worst_avg_steps_frame: u32,
+    sum_avg_steps_oob: f64,
+    sum_avg_steps_empty: f64,
+    sum_avg_steps_descend: f64,
+    sum_avg_steps_lod_terminal: f64,
     sum_packed_node_count: u64,
     sum_ribbon_len: u64,
     worst_total_ms: f64,
@@ -521,6 +533,10 @@ impl PerfAgg {
         self.sum_miss_count += s.miss_count as u64;
         self.sum_max_iter_count += s.max_iter_count as u64;
         self.sum_avg_steps += s.avg_steps;
+        self.sum_avg_steps_oob += s.avg_steps_oob;
+        self.sum_avg_steps_empty += s.avg_steps_empty;
+        self.sum_avg_steps_descend += s.avg_steps_descend;
+        self.sum_avg_steps_lod_terminal += s.avg_steps_lod_terminal;
         if s.max_steps > self.max_max_steps {
             self.max_max_steps = s.max_steps;
         }
@@ -607,13 +623,17 @@ impl PerfAgg {
             self.sum_max_iter_count as f64 / self.sum_ray_count as f64
         };
         eprintln!(
-            "render_harness_shader frames={} avg_steps={:.2} worst_avg_steps={:.2}@frame{} max_steps={} hit_fraction={:.4} max_iter_fraction={:.6}",
+            "render_harness_shader frames={} avg_steps={:.2} worst_avg_steps={:.2}@frame{} max_steps={} hit_fraction={:.4} max_iter_fraction={:.6} avg_oob={:.2} avg_empty={:.2} avg_descend={:.2} avg_lod_terminal={:.2}",
             self.frame_count,
             avg_steps_overall,
             self.worst_avg_steps, self.worst_avg_steps_frame,
             self.max_max_steps,
             hit_frac,
             max_iter_frac,
+            self.sum_avg_steps_oob / n,
+            self.sum_avg_steps_empty / n,
+            self.sum_avg_steps_descend / n,
+            self.sum_avg_steps_lod_terminal / n,
         );
     }
 }

@@ -46,6 +46,14 @@ pub struct ShaderStatsFrame {
     pub max_iter_count: u32,
     pub sum_steps_div4: u32,
     pub max_steps: u32,
+    /// Per-branch breakdown of the ray_steps total. Each step lands
+    /// in exactly one branch, so `sum_steps ≈ oob + empty + descend +
+    /// lod_terminal` (the terminal-hit branch returns immediately
+    /// without incrementing ray_steps for that iteration).
+    pub sum_steps_oob_div4: u32,
+    pub sum_steps_empty_div4: u32,
+    pub sum_steps_node_descend_div4: u32,
+    pub sum_steps_lod_terminal_div4: u32,
 }
 
 impl ShaderStatsFrame {
@@ -55,6 +63,26 @@ impl ShaderStatsFrame {
         } else {
             (self.sum_steps_div4 as f64 * 4.0) / self.ray_count as f64
         }
+    }
+
+    pub fn avg_steps_oob(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_steps_oob_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_steps_empty(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_steps_empty_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_steps_descend(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_steps_node_descend_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_steps_lod_terminal(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_steps_lod_terminal_div4 as f64 * 4.0) / self.ray_count as f64 }
     }
 
     pub fn hit_fraction(&self) -> f64 {
@@ -131,7 +159,7 @@ impl Renderer {
             encoder.copy_buffer_to_buffer(
                 &self.shader_stats_buffer, 0,
                 &self.shader_stats_readback, 0,
-                32,
+                64,
             );
         }
         let encode_elapsed = encode_start.elapsed();
@@ -171,7 +199,7 @@ impl Renderer {
             };
         if slow {
             eprintln!(
-                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} gpu_pass_ms={} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={}",
+                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} gpu_pass_ms={} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={} avg_oob={:.1} avg_empty={:.1} avg_descend={:.1} avg_lod_terminal={:.1}",
                 acquire_elapsed.as_secs_f64() * 1000.0,
                 encode_elapsed.as_secs_f64() * 1000.0,
                 submit_elapsed.as_secs_f64() * 1000.0,
@@ -185,6 +213,10 @@ impl Renderer {
                 shader_stats.max_iter_count,
                 shader_stats.avg_steps(),
                 shader_stats.max_steps,
+                shader_stats.avg_steps_oob(),
+                shader_stats.avg_steps_empty(),
+                shader_stats.avg_steps_descend(),
+                shader_stats.avg_steps_lod_terminal(),
             );
         }
         Ok(())
@@ -262,7 +294,7 @@ impl Renderer {
             encoder.copy_buffer_to_buffer(
                 &self.shader_stats_buffer, 0,
                 &self.shader_stats_readback, 0,
-                32,
+                64,
             );
         }
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
@@ -336,6 +368,10 @@ impl Renderer {
             max_iter_count: read_u32(12),
             sum_steps_div4: read_u32(16),
             max_steps: read_u32(20),
+            sum_steps_oob_div4: read_u32(24),
+            sum_steps_empty_div4: read_u32(28),
+            sum_steps_node_descend_div4: read_u32(32),
+            sum_steps_lod_terminal_div4: read_u32(36),
         };
         drop(data);
         self.shader_stats_readback.unmap();

@@ -76,8 +76,19 @@ struct ShaderStats {
     max_iter_count: atomic<u32>,
     sum_steps_div4: atomic<u32>,
     max_steps: atomic<u32>,
+    // Per-branch step sums (div-4 to fit u32 at high res). Each
+    // inner-DDA iteration lands in exactly one branch, so
+    // sum_steps == sum_oob + sum_empty + sum_node + sum_lod_terminal.
+    sum_steps_oob_div4: atomic<u32>,
+    sum_steps_empty_div4: atomic<u32>,
+    sum_steps_node_descend_div4: atomic<u32>,
+    sum_steps_lod_terminal_div4: atomic<u32>,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
 }
 
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
@@ -91,6 +102,13 @@ struct ShaderStats {
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.
 var<private> ray_steps: u32 = 0u;
+/// Per-fragment-thread counters for each branch of march_cartesian's
+/// inner loop. At the end of fs_main they get atomicAdd'd into the
+/// ShaderStats buffer. Off when ENABLE_STATS is false (compiled out).
+var<private> ray_steps_oob: u32 = 0u;
+var<private> ray_steps_empty: u32 = 0u;
+var<private> ray_steps_node_descend: u32 = 0u;
+var<private> ray_steps_lod_terminal: u32 = 0u;
 
 /// Pipeline-override constant: when false, fs_main skips all
 /// atomic writes to shader_stats and DDA loops skip the `ray_steps`

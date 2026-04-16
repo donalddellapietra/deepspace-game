@@ -84,6 +84,7 @@ fn march_cartesian(
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
             depth -= 1u;
+            if ENABLE_STATS { ray_steps_oob = ray_steps_oob + 1u; }
 
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
@@ -107,6 +108,7 @@ fn march_cartesian(
 
         if tag == 0u {
             // Empty — DDA advance.
+            if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
                 s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -230,6 +232,7 @@ fn march_cartesian(
             let at_lod = lod_pixels < 1.0;
 
             if at_max || at_lod {
+                if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
                 let bt = child_block_type(packed);
                 if bt == 255u {
                     if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
@@ -258,6 +261,7 @@ fn march_cartesian(
                     return result;
                 }
             } else {
+                if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
                 let parent_origin = s_node_origin[depth];
                 let parent_cell_size = s_cell_size[depth];
                 let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;

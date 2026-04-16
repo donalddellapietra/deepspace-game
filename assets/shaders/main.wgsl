@@ -112,6 +112,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         atomicAdd(&shader_stats.sum_steps_div4, ray_steps >> 2u);
         atomicMax(&shader_stats.max_steps, ray_steps);
+        atomicAdd(&shader_stats.sum_steps_oob_div4, ray_steps_oob >> 2u);
+        atomicAdd(&shader_stats.sum_steps_empty_div4, ray_steps_empty >> 2u);
+        atomicAdd(&shader_stats.sum_steps_node_descend_div4, ray_steps_node_descend >> 2u);
+        atomicAdd(&shader_stats.sum_steps_lod_terminal_div4, ray_steps_lod_terminal >> 2u);
     }
 
     return vec4<f32>(color, 1.0);

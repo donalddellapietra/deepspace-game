@@ -158,7 +158,7 @@ impl Renderer {
 
         let shader_stats_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shader_stats"),
-            size: 32,
+            size: 64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -166,7 +166,7 @@ impl Renderer {
         });
         let shader_stats_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shader_stats_readback"),
-            size: 32,
+            size: 64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
