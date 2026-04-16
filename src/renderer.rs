@@ -79,6 +79,16 @@ pub struct Renderer {
     offscreen_texture: Option<wgpu::Texture>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OffscreenRenderTiming {
+    pub texture_alloc_ms: f64,
+    pub view_ms: f64,
+    pub encode_ms: f64,
+    pub submit_ms: f64,
+    pub wait_ms: f64,
+    pub total_ms: f64,
+}
+
 impl Renderer {
     fn select_present_mode(
         surface_caps: &wgpu::SurfaceCapabilities,
@@ -470,7 +480,9 @@ impl Renderer {
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
     }
 
-    pub fn render_offscreen(&mut self) {
+    pub fn render_offscreen(&mut self) -> OffscreenRenderTiming {
+        let frame_start = std::time::Instant::now();
+        let alloc_start = frame_start;
         if self.offscreen_texture.is_none() {
             self.offscreen_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("offscreen-frame"),
@@ -487,11 +499,15 @@ impl Renderer {
                 view_formats: &[],
             }));
         }
+        let texture_alloc_ms = alloc_start.elapsed().as_secs_f64() * 1000.0;
+        let view_start = std::time::Instant::now();
         let texture = self
             .offscreen_texture
             .as_ref()
             .expect("offscreen texture initialized");
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view_ms = view_start.elapsed().as_secs_f64() * 1000.0;
+        let encode_start = std::time::Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offscreen-frame"),
         });
@@ -515,8 +531,35 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
+        let submit_start = std::time::Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
+        let submit_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
+        let wait_start = std::time::Instant::now();
         let _ = self.device.poll(wgpu::PollType::Wait);
+        let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        if total_ms >= 10.0 {
+            eprintln!(
+                "renderer_offscreen_slow size={}x{} texture_alloc_ms={:.2} view_ms={:.2} encode_ms={:.2} submit_ms={:.2} wait_ms={:.2} total_ms={:.2}",
+                self.config.width,
+                self.config.height,
+                texture_alloc_ms,
+                view_ms,
+                encode_ms,
+                submit_ms,
+                wait_ms,
+                total_ms,
+            );
+        }
+        OffscreenRenderTiming {
+            texture_alloc_ms,
+            view_ms,
+            encode_ms,
+            submit_ms,
+            wait_ms,
+            total_ms,
+        }
     }
 
     /// Render an off-screen frame and write a PNG to `path`. Used

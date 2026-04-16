@@ -119,6 +119,11 @@ pub struct App {
     pub(super) low_latency_present: bool,
     pub(super) show_harness_window: bool,
     pub(super) disable_overlay: bool,
+    pub(super) disable_highlight: bool,
+    pub(super) forced_visual_depth: Option<u32>,
+    pub(super) force_cartesian_lod: bool,
+    pub(super) harness_width: u32,
+    pub(super) harness_height: u32,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -135,6 +140,10 @@ impl App {
         let low_latency_present = test_cfg.is_active();
         let show_harness_window = test_cfg.show_window;
         let disable_overlay = test_cfg.disable_overlay;
+        let disable_highlight = test_cfg.disable_highlight;
+        let forced_visual_depth = test_cfg.force_visual_depth;
+        let force_cartesian_lod = test_cfg.force_cartesian_lod;
+        let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let world = bootstrap.world;
         let tree_depth = world.tree_depth();
@@ -189,7 +198,7 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
-            startup_profile_frames: 0,
+            startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
             planet_path: bootstrap.planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
@@ -198,6 +207,11 @@ impl App {
             low_latency_present,
             show_harness_window,
             disable_overlay,
+            disable_highlight,
+            forced_visual_depth,
+            force_cartesian_lod,
+            harness_width,
+            harness_height,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]

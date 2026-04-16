@@ -111,7 +111,7 @@ impl App {
 
         let attrs = WindowAttributes::default()
             .with_title("Deep Space")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
+            .with_inner_size(winit::dpi::LogicalSize::new(self.harness_width, self.harness_height))
             .with_visible(!self.render_harness || self.show_harness_window);
 
         let window_start = std::time::Instant::now();
@@ -153,6 +153,15 @@ impl App {
         );
         let renderer_elapsed = renderer_start.elapsed();
         eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);
+        let mut renderer = renderer;
+        if self.render_harness {
+            renderer.resize(self.harness_width, self.harness_height);
+            eprintln!(
+                "startup_perf {source}: harness_resize width={} height={}",
+                self.harness_width,
+                self.harness_height,
+            );
+        }
         self.renderer = Some(renderer);
         let zoom_start = std::time::Instant::now();
         self.apply_zoom();

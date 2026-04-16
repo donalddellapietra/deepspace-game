@@ -126,6 +126,9 @@ impl App {
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
+        if let Some(depth) = self.forced_visual_depth {
+            return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
+        }
         let local_target = self.edit_depth()
             .saturating_sub(self.active_frame.render_path.depth() as u32)
             .max(1);
@@ -572,9 +575,7 @@ impl App {
 
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-            let (tree_data, node_kinds, _world_root_idx) = if matches!(intended_frame.kind, ActiveFrameKind::Cartesian) {
-                gpu::pack_tree(&self.world.library, self.world.root)
-            } else {
+            let (tree_data, node_kinds, _world_root_idx) = {
                 let mut preserve_path_storage = vec![intended_frame.render_path];
                 if intended_frame.logical_path != intended_frame.render_path {
                     preserve_path_storage.push(intended_frame.logical_path);
@@ -591,6 +592,7 @@ impl App {
                 )
             };
             pack_elapsed = pack_start.elapsed();
+            let packed_node_count = tree_data.len() / 27;
 
             // build_ribbon may stop short of the intended frame when
             // pack LOD-flattened a sibling on the way down (uniform-
@@ -619,6 +621,15 @@ impl App {
             if let Some(renderer) = &mut self.renderer {
                 renderer.update_tree(&tree_data, &node_kinds, r.frame_root_idx);
                 renderer.update_ribbon(&r.ribbon);
+            }
+            if self.render_harness {
+                eprintln!(
+                    "render_harness_pack kind={:?} cartesian_lod_enabled={} packed_nodes={} library_nodes={}",
+                    intended_frame.kind,
+                    true,
+                    packed_node_count,
+                    self.world.library.len(),
+                );
             }
         }
 
@@ -658,6 +669,12 @@ impl App {
         }
     }
     pub(super) fn update_highlight(&mut self) {
+        if self.disable_highlight {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_highlight(None);
+            }
+            return;
+        }
         if !self.cursor_locked {
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);

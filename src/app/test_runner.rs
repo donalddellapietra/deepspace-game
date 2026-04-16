@@ -72,6 +72,12 @@ pub struct TestConfig {
     pub render_harness: bool,
     pub show_window: bool,
     pub disable_overlay: bool,
+    pub disable_highlight: bool,
+    pub suppress_startup_logs: bool,
+    pub force_visual_depth: Option<u32>,
+    pub force_cartesian_lod: bool,
+    pub harness_width: Option<u32>,
+    pub harness_height: Option<u32>,
     pub world_preset: WorldPreset,
     pub plain_layers: Option<u8>,
     pub spawn_depth: Option<u8>,
@@ -127,6 +133,24 @@ impl TestConfig {
                 }
                 "--disable-overlay" => {
                     cfg.disable_overlay = true;
+                }
+                "--disable-highlight" => {
+                    cfg.disable_highlight = true;
+                }
+                "--suppress-startup-logs" => {
+                    cfg.suppress_startup_logs = true;
+                }
+                "--force-visual-depth" => {
+                    cfg.force_visual_depth = args.next().and_then(|v| v.parse().ok());
+                }
+                "--force-cartesian-lod" => {
+                    cfg.force_cartesian_lod = true;
+                }
+                "--harness-width" => {
+                    cfg.harness_width = args.next().and_then(|v| v.parse().ok());
+                }
+                "--harness-height" => {
+                    cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => {
                     cfg.world_preset = WorldPreset::PlainTest;
@@ -200,6 +224,13 @@ impl TestConfig {
 
     pub fn plain_layers(&self) -> u8 {
         self.plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)
+    }
+
+    pub fn harness_size(&self) -> (u32, u32) {
+        (
+            self.harness_width.unwrap_or(1280),
+            self.harness_height.unwrap_or(720),
+        )
     }
 
     /// True if any flag asks the test runner to take action.
@@ -520,6 +551,13 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         root_index,
         wgpu::PresentMode::AutoNoVsync,
     ));
+    let mut renderer = renderer;
+    renderer.resize(app.harness_width, app.harness_height);
+    eprintln!(
+        "render_harness: resize width={} height={}",
+        app.harness_width,
+        app.harness_height,
+    );
     app.window = Some(window);
     app.renderer = Some(renderer);
     app.apply_zoom();
@@ -529,6 +567,11 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     let mut total_upload = 0.0f64;
     let mut total_highlight = 0.0f64;
     let mut total_render = 0.0f64;
+    let mut total_render_texture_alloc = 0.0f64;
+    let mut total_render_view = 0.0f64;
+    let mut total_render_encode = 0.0f64;
+    let mut total_render_submit = 0.0f64;
+    let mut total_render_wait = 0.0f64;
     let mut frame_count = 0u32;
 
     loop {
@@ -544,16 +587,22 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         app.update_highlight();
         let t_highlight = t2.elapsed().as_secs_f64() * 1000.0;
 
-        let t3 = std::time::Instant::now();
-        if let Some(renderer) = &mut app.renderer {
-            renderer.render_offscreen();
-        }
-        let t_render = t3.elapsed().as_secs_f64() * 1000.0;
+        let render_timing = if let Some(renderer) = &mut app.renderer {
+            renderer.render_offscreen()
+        } else {
+            crate::renderer::OffscreenRenderTiming::default()
+        };
+        let t_render = render_timing.total_ms;
 
         total_update += t_update;
         total_upload += t_upload;
         total_highlight += t_highlight;
         total_render += t_render;
+        total_render_texture_alloc += render_timing.texture_alloc_ms;
+        total_render_view += render_timing.view_ms;
+        total_render_encode += render_timing.encode_ms;
+        total_render_submit += render_timing.submit_ms;
+        total_render_wait += render_timing.wait_ms;
         frame_count += 1;
 
         let (due, frame, frame_budget_done, timed_out, exit_after, screenshot) = {
@@ -613,11 +662,16 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
 
     if frame_count > 0 {
         eprintln!(
-            "render_harness_timing avg_ms update={:.3} upload={:.3} highlight={:.3} render={:.3} total={:.3}",
+            "render_harness_timing avg_ms update={:.3} upload={:.3} highlight={:.3} render={:.3} render_texture_alloc={:.3} render_view={:.3} render_encode={:.3} render_submit={:.3} render_wait={:.3} total={:.3}",
             total_update / frame_count as f64,
             total_upload / frame_count as f64,
             total_highlight / frame_count as f64,
             total_render / frame_count as f64,
+            total_render_texture_alloc / frame_count as f64,
+            total_render_view / frame_count as f64,
+            total_render_encode / frame_count as f64,
+            total_render_submit / frame_count as f64,
+            total_render_wait / frame_count as f64,
             (total_update + total_upload + total_highlight + total_render) / frame_count as f64,
         );
     }
