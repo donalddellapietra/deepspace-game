@@ -530,6 +530,7 @@ impl App {
 
         let changed = edit::break_block(&mut self.world, &hit);
         eprintln!("do_break: changed={changed}");
+        self.harness_emit_edit("broke", &hit, changed);
         if changed {
             self.upload_tree();
         }
@@ -560,6 +561,7 @@ impl App {
             HotbarItem::Block(block_type) => {
                 let changed = edit::place_block(&mut self.world, &hit, *block_type);
                 eprintln!("do_place: block_type={} changed={changed}", block_type);
+                self.harness_emit_edit("placed", &hit, changed);
                 if changed {
                     self.upload_tree();
                 }
@@ -572,6 +574,7 @@ impl App {
                     crate::world::tree::Child::Node(node_id),
                 );
                 eprintln!("do_place: mesh_idx={} node_id={} changed={changed}", idx, node_id);
+                self.harness_emit_edit("placed", &hit, changed);
                 if changed {
                     self.upload_tree();
                 }

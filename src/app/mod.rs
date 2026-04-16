@@ -34,6 +34,7 @@ pub mod cursor;
 pub mod edit_actions;
 pub mod event_loop;
 pub mod frame;
+pub mod harness_emit;
 pub mod input_handlers;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod overlay_integration;

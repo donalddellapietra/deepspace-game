@@ -117,6 +117,22 @@ pub enum ScriptCmd {
     ZoomIn(u32),
     ZoomOut(u32),
     ToggleDebugOverlay,
+    /// Capture the current rendered frame to `PATH` (PNG). Fires after
+    /// the current frame's render, so it reflects the state AS OF the
+    /// scheduled frame — any mutations from commands later in the same
+    /// tick only show up in the next frame's render.
+    Screenshot(String),
+    /// Set `camera.pitch` to an absolute value in radians.
+    Pitch(f32),
+    /// Set `camera.yaw` to an absolute value in radians.
+    Yaw(f32),
+    /// Run a CPU raycast straight down from the camera in world space
+    /// and emit a `HARNESS_PROBE` line to stdout with the hit path.
+    ProbeDown,
+    /// Emit a `HARNESS_MARK` line to stdout with the given label plus
+    /// the current ui_layer / anchor_depth / frame. Timeline marker
+    /// for correlating screenshots to actions in a test trace.
+    Emit(String),
 }
 
 impl TestConfig {
@@ -274,6 +290,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "break" { return Some(ScriptCmd::Break); }
             if raw == "place" { return Some(ScriptCmd::Place); }
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
+            if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }
@@ -282,6 +299,18 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             }
             if let Some(n) = raw.strip_prefix("zoom_out:") {
                 if let Ok(steps) = n.parse() { return Some(ScriptCmd::ZoomOut(steps)); }
+            }
+            if let Some(path) = raw.strip_prefix("screenshot:") {
+                return Some(ScriptCmd::Screenshot(path.to_string()));
+            }
+            if let Some(r) = raw.strip_prefix("pitch:") {
+                if let Ok(rad) = r.parse() { return Some(ScriptCmd::Pitch(rad)); }
+            }
+            if let Some(r) = raw.strip_prefix("yaw:") {
+                if let Ok(rad) = r.parse() { return Some(ScriptCmd::Yaw(rad)); }
+            }
+            if let Some(label) = raw.strip_prefix("emit:") {
+                return Some(ScriptCmd::Emit(label.to_string()));
             }
             eprintln!("test_runner: ignoring unknown script command {raw:?}");
             None
@@ -624,24 +653,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         };
 
         for cmd in due {
-            match cmd {
-                ScriptCmd::Break => app.do_break(),
-                ScriptCmd::Place => app.do_place(),
-                ScriptCmd::Wait(_) => {}
-                ScriptCmd::ZoomIn(steps) => {
-                    for _ in 0..steps {
-                        app.zoom_anchor(1);
-                    }
-                }
-                ScriptCmd::ZoomOut(steps) => {
-                    for _ in 0..steps {
-                        app.zoom_anchor(-1);
-                    }
-                }
-                ScriptCmd::ToggleDebugOverlay => {
-                    app.debug_overlay_visible = !app.debug_overlay_visible;
-                }
-            }
+            app.handle_script_cmd(cmd, frame);
         }
 
         if let Some(path) = screenshot {

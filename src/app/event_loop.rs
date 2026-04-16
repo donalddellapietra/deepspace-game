@@ -421,24 +421,7 @@ impl App {
             (due, frame, frame_budget_done, timed_out, perf_active, exit_after, screenshot)
         };
         for cmd in due {
-            match cmd {
-                super::test_runner::ScriptCmd::Break => self.do_break(),
-                super::test_runner::ScriptCmd::Place => self.do_place(),
-                super::test_runner::ScriptCmd::Wait(_) => {}
-                super::test_runner::ScriptCmd::ZoomIn(steps) => {
-                    for _ in 0..steps {
-                        self.zoom_anchor(1);
-                    }
-                }
-                super::test_runner::ScriptCmd::ZoomOut(steps) => {
-                    for _ in 0..steps {
-                        self.zoom_anchor(-1);
-                    }
-                }
-                super::test_runner::ScriptCmd::ToggleDebugOverlay => {
-                    self.debug_overlay_visible = !self.debug_overlay_visible;
-                }
-            }
+            self.handle_script_cmd(cmd, frame);
         }
         if let Some(path) = screenshot {
             let already_done = self.test.as_ref().is_some_and(|t| t.screenshot_done);
