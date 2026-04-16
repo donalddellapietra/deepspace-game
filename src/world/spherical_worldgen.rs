@@ -10,7 +10,7 @@ use super::anchor::Path;
 use super::cubesphere::insert_spherical_body;
 use super::palette::block;
 use super::sdf::{Planet, Vec3};
-use super::tree::{slot_index, Child, NodeId, NodeLibrary};
+use super::tree::{Child, NodeId, NodeLibrary, slot_index};
 
 /// Declarative planet description. Radii are in **the body cell's
 /// local `[0, 1)` frame** (per spec §1d). The body cell's actual
@@ -69,9 +69,7 @@ pub fn insert_into_tree(
 ) -> (NodeId, Path, Path) {
     assert!(!host_slots.is_empty(), "host_slots must point at a child");
 
-    let body_id = insert_spherical_body(
-        lib, setup.inner_r, setup.outer_r, setup.depth, &setup.sdf,
-    );
+    let body_id = insert_spherical_body(lib, setup.inner_r, setup.outer_r, setup.depth, &setup.sdf);
 
     // Rebuild the path from world_root downward, replacing the
     // target slot with the body. Only the path levels are
@@ -79,19 +77,16 @@ pub fn insert_into_tree(
     let new_root = install_body(lib, world_root, host_slots, body_id);
 
     let mut body_path = Path::root();
-    for &s in host_slots { body_path.push(s); }
+    for &s in host_slots {
+        body_path.push(s);
+    }
     (new_root, body_path, body_path)
 }
 
 /// Walk down `slots`, expanding any uniform terminals on the path
 /// into Node children, then install `new_node` at the leaf and
 /// rebuild parents on the way up. Returns the new world root id.
-fn install_body(
-    lib: &mut NodeLibrary,
-    root: NodeId,
-    slots: &[u8],
-    new_node: NodeId,
-) -> NodeId {
+fn install_body(lib: &mut NodeLibrary, root: NodeId, slots: &[u8], new_node: NodeId) -> NodeId {
     fn rebuild(
         lib: &mut NodeLibrary,
         current: NodeId,
@@ -100,7 +95,9 @@ fn install_body(
         new_node: NodeId,
     ) -> NodeId {
         let target = slots[level] as usize;
-        let node = lib.get(current).expect("install path must exist in library");
+        let node = lib
+            .get(current)
+            .expect("install path must exist in library");
         let mut new_children = node.children;
         if level + 1 == slots.len() {
             new_children[target] = Child::Node(new_node);
@@ -126,9 +123,8 @@ pub fn install_at_root_center(
     world_root: NodeId,
     setup: &PlanetSetup,
 ) -> (NodeId, Path) {
-    let (new_root, body_path, _) = insert_into_tree(
-        lib, world_root, &[slot_index(1, 1, 1) as u8], setup,
-    );
+    let (new_root, body_path, _) =
+        insert_into_tree(lib, world_root, &[slot_index(1, 1, 1) as u8], setup);
     (new_root, body_path)
 }
 

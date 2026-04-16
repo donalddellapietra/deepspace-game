@@ -1,0 +1,22 @@
+pub const RAY_MARCH_WGSL: &str = concat!(
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/shaders/ray_march/preamble.wgsl"
+    )),
+    "\n",
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/shaders/ray_march/sphere_and_face.wgsl"
+    )),
+    "\n",
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/shaders/ray_march/cartesian.wgsl"
+    )),
+    "\n",
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/shaders/ray_march/dispatch_and_entry.wgsl"
+    )),
+    "\n",
+);

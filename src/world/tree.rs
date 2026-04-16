@@ -224,20 +224,41 @@ impl NodeLibrary {
                 let ct = match c {
                     Child::Empty => UNIFORM_EMPTY,
                     Child::Block(bt) => *bt,
-                    Child::Node(nid) => {
-                        self.nodes.get(nid).map(|n| n.uniform_type).unwrap_or(UNIFORM_MIXED)
-                    }
+                    Child::Node(nid) => self
+                        .nodes
+                        .get(nid)
+                        .map(|n| n.uniform_type)
+                        .unwrap_or(UNIFORM_MIXED),
                 };
-                if ct == UNIFORM_MIXED { uniform = false; break; }
+                if ct == UNIFORM_MIXED {
+                    uniform = false;
+                    break;
+                }
                 match first {
                     None => first = Some(ct),
                     Some(f) if f == ct => {}
-                    _ => { uniform = false; break; }
+                    _ => {
+                        uniform = false;
+                        break;
+                    }
                 }
             }
-            if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
+            if uniform {
+                first.unwrap_or(UNIFORM_EMPTY)
+            } else {
+                UNIFORM_MIXED
+            }
         };
-        self.nodes.insert(id, Node { children, kind, ref_count: 0, representative_block, uniform_type });
+        self.nodes.insert(
+            id,
+            Node {
+                children,
+                kind,
+                ref_count: 0,
+                representative_block,
+                uniform_type,
+            },
+        );
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
             self.ref_inc(nid);
@@ -271,16 +292,22 @@ impl NodeLibrary {
     }
 
     pub fn ref_inc(&mut self, id: NodeId) {
-        if id == EMPTY_NODE { return; }
+        if id == EMPTY_NODE {
+            return;
+        }
         if let Some(node) = self.nodes.get_mut(&id) {
             node.ref_count = node.ref_count.saturating_add(1);
         }
     }
 
     pub fn ref_dec(&mut self, id: NodeId) {
-        if id == EMPTY_NODE { return; }
+        if id == EMPTY_NODE {
+            return;
+        }
         let should_evict = {
-            let Some(node) = self.nodes.get_mut(&id) else { return };
+            let Some(node) = self.nodes.get_mut(&id) else {
+                return;
+            };
             node.ref_count = node.ref_count.saturating_sub(1);
             node.ref_count == 0
         };
@@ -290,11 +317,15 @@ impl NodeLibrary {
     }
 
     fn evict(&mut self, id: NodeId) {
-        let Some(node) = self.nodes.remove(&id) else { return };
+        let Some(node) = self.nodes.remove(&id) else {
+            return;
+        };
         let h = hash_node_content(&node.children, &node.kind);
         if let Some(v) = self.by_hash.get_mut(&h) {
             v.retain(|&i| i != id);
-            if v.is_empty() { self.by_hash.remove(&h); }
+            if v.is_empty() {
+                self.by_hash.remove(&h);
+            }
         }
         for child in &node.children {
             if let Child::Node(nid) = child {
@@ -371,7 +402,10 @@ mod tests {
         assert_eq!(a, b, "identical Cartesian kind should dedup");
         let c = lib.insert_with_kind(
             children,
-            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.1,
+                outer_r: 0.4,
+            },
         );
         assert_ne!(a, c, "different kind must not dedup");
         assert_eq!(lib.len(), 2);

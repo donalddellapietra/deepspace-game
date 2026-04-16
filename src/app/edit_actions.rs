@@ -7,15 +7,16 @@
 //! separate coarser edit path.
 
 use crate::game_state::HotbarItem;
+use crate::world::anchor::{Path, WORLD_SIZE};
 use crate::world::cubesphere::FACE_SLOTS;
 use crate::world::cubesphere_local;
-use crate::world::anchor::{Path, WORLD_SIZE};
 use crate::world::edit;
 use crate::world::gpu;
 
+use super::shells::CartesianShellStack;
 use super::{
-    App, ActiveFrame, ActiveFrameKind, HighlightCacheKey, LodUploadKey, RENDER_FRAME_CONTEXT, RENDER_FRAME_K,
-    RENDER_FRAME_MAX_DEPTH,
+    ActiveFrame, ActiveFrameKind, App, HighlightCacheKey, LodUploadKey, RENDER_FRAME_CONTEXT,
+    RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH,
 };
 
 const MAX_LOCAL_VISUAL_DEPTH: u32 = 12;
@@ -24,6 +25,25 @@ const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
 impl App {
+    fn highlight_aabb_for_cartesian_hit(&self, hit: &edit::HitInfo) -> ([f32; 3], [f32; 3]) {
+        const MIN_VISIBLE_EXTENT: f32 = 1e-4;
+        let mut display_hit = hit.clone();
+        loop {
+            let (min, max) = edit::hit_aabb_in_frame_local(&display_hit, &self.active_frame.render_path);
+            let extent = (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2]);
+            if min.iter().all(|v| v.is_finite())
+                && max.iter().all(|v| v.is_finite())
+                && extent >= MIN_VISIBLE_EXTENT
+            {
+                return (min, max);
+            }
+            if display_hit.path.len() <= 1 {
+                return (min, max);
+            }
+            display_hit.path.pop();
+        }
+    }
+
     fn ray_dir_in_frame(&self, frame_path: &Path) -> [f32; 3] {
         let world_dir = crate::world::sdf::normalize(self.camera.forward());
         let (_, frame_size_world) = super::frame::frame_origin_size_world(frame_path);
@@ -36,32 +56,35 @@ impl App {
 
         let mut out = Vec::new();
         let mut node_id = self.world.root;
-        out.push(format!("root:{:?}", self.world.library.get(node_id).map(|n| n.kind)));
+        out.push(format!(
+            "root:{:?}",
+            self.world.library.get(node_id).map(|n| n.kind)
+        ));
         for (depth, &slot) in path.as_slice().iter().enumerate() {
             let kind = self.world.library.get(node_id).map(|n| n.kind);
-            let next = self
-                .world
-                .library
-                .get(node_id)
-                .and_then(|n| match n.children[slot as usize] {
-                    Child::Node(child_id) => Some(child_id),
-                    Child::Block(block) => {
-                        out.push(format!(
-                            "d{} slot={} parent={kind:?} -> Block({block})",
-                            depth + 1,
-                            slot
-                        ));
-                        None
-                    }
-                    Child::Empty => {
-                        out.push(format!(
-                            "d{} slot={} parent={kind:?} -> Empty",
-                            depth + 1,
-                            slot
-                        ));
-                        None
-                    }
-                });
+            let next =
+                self.world
+                    .library
+                    .get(node_id)
+                    .and_then(|n| match n.children[slot as usize] {
+                        Child::Node(child_id) => Some(child_id),
+                        Child::Block(block) => {
+                            out.push(format!(
+                                "d{} slot={} parent={kind:?} -> Block({block})",
+                                depth + 1,
+                                slot
+                            ));
+                            None
+                        }
+                        Child::Empty => {
+                            out.push(format!(
+                                "d{} slot={} parent={kind:?} -> Empty",
+                                depth + 1,
+                                slot
+                            ));
+                            None
+                        }
+                    });
             let Some(child_id) = next else { break };
             let child_kind = self.world.library.get(child_id).map(|n| n.kind);
             out.push(format!(
@@ -101,9 +124,7 @@ impl App {
                     .map(|child| {
                         format!(
                             "Node({child_id}) kind={:?} uniform_type={} rep_block={}",
-                            child.kind,
-                            child.uniform_type,
-                            child.representative_block
+                            child.kind, child.uniform_type, child.representative_block
                         )
                     })
                     .unwrap_or_else(|| format!("Node({child_id}) missing"));
@@ -136,13 +157,18 @@ impl App {
     }
 
     pub(super) fn visual_depth(&self) -> u32 {
+        self.visual_depth_for_frame(&self.active_frame)
+    }
+
+    pub(super) fn visual_depth_for_frame(&self, frame: &ActiveFrame) -> u32 {
         if let Some(depth) = self.forced_visual_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        let local_target = self.edit_depth()
-            .saturating_sub(self.active_frame.render_path.depth() as u32)
+        let local_target = self
+            .edit_depth()
+            .saturating_sub(frame.render_path.depth() as u32)
             .max(1);
-        let pixels = self.frame_projected_pixels(&self.active_frame);
+        let pixels = self.frame_projected_pixels(frame);
         let local_cap = if pixels <= FRAME_VISUAL_MIN_PIXELS {
             1
         } else {
@@ -181,8 +207,7 @@ impl App {
         };
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
-                (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
-                    ..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
+                (-MAX_FOCUSED_FRAME_CAMERA_EXTENT..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
                     .contains(&v)
             })
     }
@@ -192,7 +217,10 @@ impl App {
         let mut node_id = self.world.root;
         for &slot in body_path.as_slice() {
             let Some(node) = self.world.library.get(node_id) else {
-                eprintln!("sphere_focus: missing node for path {:?} at node_id={node_id}", body_path.as_slice());
+                eprintln!(
+                    "sphere_focus: missing node for path {:?} at node_id={node_id}",
+                    body_path.as_slice()
+                );
                 return None;
             };
             match node.children[slot as usize] {
@@ -213,12 +241,18 @@ impl App {
             return None;
         };
         let crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
-            eprintln!("sphere_focus: path {:?} resolved to non-body kind {:?}", body_path.as_slice(), body.kind);
+            eprintln!(
+                "sphere_focus: path {:?} resolved to non-body kind {:?}",
+                body_path.as_slice(),
+                body.kind
+            );
             return None;
         };
         let cam_body = self.camera.position.in_frame(&body_path);
         let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-        let Some(t) = cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE) else {
+        let Some(t) =
+            cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE)
+        else {
             eprintln!(
                 "sphere_focus: miss cam_body={:?} ray_dir={:?} body_path={:?}",
                 cam_body,
@@ -228,12 +262,9 @@ impl App {
             return None;
         };
         let hit_body = crate::world::sdf::add(cam_body, crate::world::sdf::scale(ray_dir, t));
-        let Some(face_point) = cubesphere_local::body_point_to_face_space(
-            hit_body,
-            inner_r,
-            outer_r,
-            WORLD_SIZE,
-        ) else {
+        let Some(face_point) =
+            cubesphere_local::body_point_to_face_space(hit_body, inner_r, outer_r, WORLD_SIZE)
+        else {
             eprintln!("sphere_focus: degenerate hit_body={:?}", hit_body);
             return None;
         };
@@ -278,6 +309,25 @@ impl App {
         Some(path)
     }
 
+    fn camera_local_cartesian_focus_path(&self, desired_depth: u8) -> Option<Path> {
+        let cam_world = self.camera.position.to_world_xyz();
+        let ray_world = crate::world::sdf::normalize(self.camera.forward());
+        let probe_depth = desired_depth.min(8).max(1) as u32;
+        let hit = edit::cpu_raycast(
+            &self.world.library,
+            self.world.root,
+            cam_world,
+            ray_world,
+            probe_depth,
+        )?;
+        let mut path = Path::root();
+        for &(_, slot) in &hit.path {
+            path.push(slot as u8);
+        }
+        path.truncate(desired_depth.min(path.depth()));
+        Some(path)
+    }
+
     fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Sphere(sphere) => (
@@ -309,6 +359,16 @@ impl App {
                     &path,
                     RENDER_FRAME_CONTEXT,
                 )
+            })
+            .or_else(|| {
+                self.camera_local_cartesian_focus_path(desired_depth)
+                    .map(|path| {
+                        super::App::frame_for_logical_path(
+                            &self.world.library,
+                            self.world.root,
+                            &path,
+                        )
+                    })
             })
             .unwrap_or_else(|| self.render_frame());
         let mut frame = frame;
@@ -371,8 +431,12 @@ impl App {
         }
         log::info!(
             "Zoom: {}/{}, edit_depth: {}, visual: {}, anchor_depth: {}, frame_depth: {}",
-            self.zoom_level(), self.tree_depth as i32,
-            self.edit_depth(), vd, self.anchor_depth(), frame.logical_path.depth(),
+            self.zoom_level(),
+            self.tree_depth as i32,
+            self.edit_depth(),
+            vd,
+            self.anchor_depth(),
+            frame.logical_path.depth(),
         );
     }
 
@@ -384,7 +448,7 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(super) fn frame_aware_raycast(&self) -> Option<edit::HitInfo> {
-        let hit = match self.active_frame.kind {
+        let mut hit = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
                 let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
@@ -407,11 +471,11 @@ impl App {
                 )
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                let frame_path = Path::root();
+                let frame_path = self.active_frame.render_path;
                 let mut hit = None;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
-                let min_depth = frame_path.depth() as u32 + 1;
+                let min_depth = 1;
                 let mut depth = self.edit_depth();
                 while depth >= min_depth {
                     hit = edit::cpu_raycast_in_frame(
@@ -439,6 +503,24 @@ impl App {
                 hit
             }
         };
+        if let Some(current_hit) = hit.as_ref() {
+            if matches!(
+                self.active_frame.kind,
+                ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. }
+            ) && current_hit.path.len() < self.edit_depth() as usize
+            {
+                let cam_world = self.camera.position.to_world_xyz();
+                let ray_world = crate::world::sdf::normalize(self.camera.forward());
+                let target_world =
+                    edit::hit_point_world(&self.world.library, current_hit, cam_world, ray_world);
+                hit = Some(edit::refine_cartesian_hit_to_depth(
+                    &self.world.library,
+                    current_hit,
+                    target_world,
+                    self.edit_depth() as usize,
+                ));
+            }
+        }
         if self.startup_profile_frames < 16 {
             eprintln!(
                 "frame_raycast frame={} kind={:?} render_path={:?} logical_path={:?} cam_anchor={:?} hit={}",
@@ -451,9 +533,7 @@ impl App {
             );
             if let Some(ref h) = hit {
                 let (aabb_min, aabb_max) = match self.active_frame.kind {
-                    ActiveFrameKind::Sphere(_) => {
-                        edit::hit_aabb_body_local(&self.world.library, h)
-                    }
+                    ActiveFrameKind::Sphere(_) => edit::hit_aabb_body_local(&self.world.library, h),
                     ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                         edit::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
                     }
@@ -544,13 +624,19 @@ impl App {
                 }
             }
             HotbarItem::Mesh(idx) => {
-                let Some(saved) = self.saved_meshes.items.get(*idx) else { return };
+                let Some(saved) = self.saved_meshes.items.get(*idx) else {
+                    return;
+                };
                 let node_id = saved.node_id;
                 let changed = edit::place_child(
-                    &mut self.world, &hit,
+                    &mut self.world,
+                    &hit,
                     crate::world::tree::Child::Node(node_id),
                 );
-                eprintln!("do_place: mesh_idx={} node_id={} changed={changed}", idx, node_id);
+                eprintln!(
+                    "do_place: mesh_idx={} node_id={} changed={changed}",
+                    idx, node_id
+                );
                 if changed {
                     self.upload_tree();
                 }
@@ -575,7 +661,11 @@ impl App {
     /// render, and edit all agree on the same locality model.
     pub(super) fn upload_tree_lod(&mut self) {
         let intended_frame = self.target_render_frame();
-        let effective_visual_depth = self.visual_depth();
+        let effective_visual_depth = self.visual_depth_for_frame(&intended_frame);
+        let cartesian_shells =
+            matches!(intended_frame.kind, ActiveFrameKind::Cartesian).then(|| {
+                CartesianShellStack::build(intended_frame.render_path, effective_visual_depth)
+            });
         let upload_key = LodUploadKey::new(
             self.world.root,
             &self.camera.position,
@@ -595,15 +685,10 @@ impl App {
                 }
                 let preserve_paths: Vec<&[u8]> =
                     preserve_path_storage.iter().map(Path::as_slice).collect();
-                let mut preserve_regions = Vec::new();
-                if matches!(intended_frame.kind, ActiveFrameKind::Cartesian)
-                    && !intended_frame.render_path.is_root()
-                {
-                    preserve_regions.push((
-                        intended_frame.render_path,
-                        effective_visual_depth.min(u8::MAX as u32) as u8,
-                    ));
-                }
+                let preserve_regions = cartesian_shells
+                    .as_ref()
+                    .map(CartesianShellStack::preserve_regions)
+                    .unwrap_or_default();
                 gpu::pack_tree_lod_selective(
                     &self.world.library,
                     self.world.root,
@@ -611,7 +696,7 @@ impl App {
                     1440.0,
                     1.2,
                     &preserve_paths,
-                    &preserve_regions,
+                    preserve_regions.as_slice(),
                 )
             };
             pack_elapsed = pack_start.elapsed();
@@ -658,38 +743,36 @@ impl App {
 
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
-            let local_visual_depth = if matches!(self.active_frame.kind, ActiveFrameKind::Cartesian)
-                && !self.active_frame.render_path.is_root()
-            {
-                1
-            } else {
-                effective_visual_depth
-            };
-            renderer.set_max_depth(local_visual_depth);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Sphere(sphere) => {
+                    renderer.set_max_depth(effective_visual_depth);
                     renderer.set_root_kind_face(
                         sphere.inner_r,
                         sphere.outer_r,
                         sphere.face as u32,
                         sphere.face_depth,
-                        [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
+                        [
+                            sphere.face_u_min,
+                            sphere.face_v_min,
+                            sphere.face_r_min,
+                            sphere.face_size,
+                        ],
                         self.camera.position.in_frame(&sphere.body_path),
                     );
                 }
                 ActiveFrameKind::Body { inner_r, outer_r } => {
+                    renderer.set_max_depth(effective_visual_depth);
                     renderer.set_root_kind_body(inner_r, outer_r);
                 }
                 ActiveFrameKind::Cartesian => {
-                    let (jump_origin, jump_size_world) =
-                        super::frame::frame_origin_size_world(&self.active_frame.render_path);
-                    let jump_scale = jump_size_world / WORLD_SIZE;
-                    renderer.set_root_kind_cartesian(
-                        jump_origin,
-                        jump_scale,
+                    let shell_stack = CartesianShellStack::build(
+                        self.active_frame.render_path,
                         effective_visual_depth,
                     );
+                    renderer.set_max_depth(shell_stack.deepest_depth_limit());
+                    let (shell_pairs, shell_count) = shell_stack.shader_pairs();
+                    renderer.set_root_kind_cartesian(shell_pairs, shell_count);
                 }
             }
         }
@@ -752,7 +835,7 @@ impl App {
         let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
             ActiveFrameKind::Sphere(_) => edit::hit_aabb_body_local(&self.world.library, hit),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                edit::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
+                self.highlight_aabb_for_cartesian_hit(hit)
             }
         });
         let set_start = std::time::Instant::now();

@@ -6,9 +6,9 @@
 //! raycast descends, so the same code breaks a single block at fine
 //! zoom or an entire node (3x3x3 group) at coarse zoom.
 
+use super::anchor::{Path, WORLD_SIZE};
 use super::cubesphere::FACE_SLOTS;
 use super::cubesphere_local;
-use super::anchor::{Path, WORLD_SIZE};
 use super::sdf;
 use super::state::WorldState;
 use super::tree::*;
@@ -92,7 +92,9 @@ pub fn cpu_raycast_in_frame(
     {
         let mut current = world_root;
         for &slot in frame_path {
-            let Some(node) = library.get(current) else { break };
+            let Some(node) = library.get(current) else {
+                break;
+            };
             frame_entries.push((current, slot as usize));
             match node.children[slot as usize] {
                 Child::Node(child_id) => {
@@ -107,13 +109,23 @@ pub fn cpu_raycast_in_frame(
     let frame_entries = &frame_entries[..effective_depth];
 
     let mut current_frame_depth = effective_depth;
-    let mut ray_origin = cam_local;
-    let mut ray_dir = ray_dir;
+    let mut ray_origin = cam_local.map(|v| v as f64);
+    let mut ray_dir_metric = ray_dir.map(|v| v as f64);
     let total_max_depth = max_depth;
 
     loop {
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
+        let ray_origin_query = [
+            ray_origin[0] as f32,
+            ray_origin[1] as f32,
+            ray_origin[2] as f32,
+        ];
+        let ray_dir_query = sdf::normalize([
+            ray_dir_metric[0] as f32,
+            ray_dir_metric[1] as f32,
+            ray_dir_metric[2] as f32,
+        ]);
 
         // Frame-root NodeKind dispatch (mirror of the renderer's
         // root_kind). When the frame IS a sphere body, the body's
@@ -135,10 +147,16 @@ pub fn cpu_raycast_in_frame(
             // (which include the body's parent slot).
             let inner_ancestor: Vec<(NodeId, usize)> = Vec::new();
             if let Some(mut hit) = cs_raycast_in_body(
-                library, frame_root_id, body_origin, body_size,
-                inner_r, outer_r,
-                ray_origin, ray_dir,
-                &inner_ancestor, max_face_depth,
+                library,
+                frame_root_id,
+                body_origin,
+                body_size,
+                inner_r,
+                outer_r,
+                ray_origin_query,
+                ray_dir_query,
+                &inner_ancestor,
+                max_face_depth,
             ) {
                 let mut new_path: Vec<(NodeId, usize)> =
                     Vec::with_capacity(current_frame_depth + hit.path.len());
@@ -157,8 +175,12 @@ pub fn cpu_raycast_in_frame(
             // Sphere missed in this frame — fall through to the
             // pop logic below.
         } else if let Some(mut hit) = cpu_raycast_with_face_depth(
-            library, frame_root_id, ray_origin, ray_dir,
-            inner_max, max_face_depth,
+            library,
+            frame_root_id,
+            ray_origin_query,
+            ray_dir_query,
+            inner_max,
+            max_face_depth,
         ) {
             // Prepend frame entries (from world_root down to
             // frame_root, exclusive of frame_root).
@@ -184,14 +206,14 @@ pub fn cpu_raycast_in_frame(
         let last_slot = frame_entries[current_frame_depth - 1].1;
         let (sx, sy, sz) = slot_coords(last_slot);
         ray_origin = [
-            sx as f32 + ray_origin[0] / 3.0,
-            sy as f32 + ray_origin[1] / 3.0,
-            sz as f32 + ray_origin[2] / 3.0,
+            sx as f64 + ray_origin[0] / 3.0,
+            sy as f64 + ray_origin[1] / 3.0,
+            sz as f64 + ray_origin[2] / 3.0,
         ];
-        ray_dir = [
-            ray_dir[0] / 3.0,
-            ray_dir[1] / 3.0,
-            ray_dir[2] / 3.0,
+        ray_dir_metric = [
+            ray_dir_metric[0] / 3.0,
+            ray_dir_metric[1] / 3.0,
+            ray_dir_metric[2] / 3.0,
         ];
         current_frame_depth -= 1;
     }
@@ -224,7 +246,9 @@ pub fn cpu_raycast_in_sphere_frame(
     {
         let mut current = world_root;
         for &slot in frame_path {
-            let Some(node) = library.get(current) else { break };
+            let Some(node) = library.get(current) else {
+                break;
+            };
             frame_entries.push((current, slot as usize));
             match node.children[slot as usize] {
                 Child::Node(child_id) => {
@@ -238,10 +262,21 @@ pub fn cpu_raycast_in_sphere_frame(
     let effective_depth = chain.len() - 1;
     let frame_entries = &frame_entries[..effective_depth];
     let mut current_frame_depth = effective_depth;
-    let mut ray_origin_local = cam_local;
+    let mut ray_origin_local = cam_local.map(|v| v as f64);
+    let mut ray_dir_local = ray_dir.map(|v| v as f64);
 
     loop {
         let frame_root_id = chain[current_frame_depth];
+        let ray_origin_query = [
+            ray_origin_local[0] as f32,
+            ray_origin_local[1] as f32,
+            ray_origin_local[2] as f32,
+        ];
+        let ray_dir_query = sdf::normalize([
+            ray_dir_local[0] as f32,
+            ray_dir_local[1] as f32,
+            ray_dir_local[2] as f32,
+        ]);
         if current_frame_depth == effective_depth {
             if let Some(mut hit) = cs_raycast_in_body_bounded(
                 library,
@@ -251,7 +286,7 @@ pub fn cpu_raycast_in_sphere_frame(
                 inner_r_local,
                 outer_r_local,
                 ray_origin_body,
-                ray_dir,
+                ray_dir_query,
                 &[],
                 face,
                 face_u_min,
@@ -286,8 +321,8 @@ pub fn cpu_raycast_in_sphere_frame(
                     3.0,
                     inner_r,
                     outer_r,
-                    ray_origin_local,
-                    ray_dir,
+                    ray_origin_query,
+                    ray_dir_query,
                     &[],
                     max_face_depth,
                 )
@@ -295,8 +330,8 @@ pub fn cpu_raycast_in_sphere_frame(
                 cpu_raycast_with_face_depth(
                     library,
                     frame_root_id,
-                    ray_origin_local,
-                    ray_dir,
+                    ray_origin_query,
+                    ray_dir_query,
                     inner_max,
                     max_face_depth,
                 )
@@ -323,9 +358,14 @@ pub fn cpu_raycast_in_sphere_frame(
         let last_slot = frame_entries[current_frame_depth - 1].1;
         let (sx, sy, sz) = slot_coords(last_slot);
         ray_origin_local = [
-            sx as f32 + ray_origin_local[0] / 3.0,
-            sy as f32 + ray_origin_local[1] / 3.0,
-            sz as f32 + ray_origin_local[2] / 3.0,
+            sx as f64 + ray_origin_local[0] / 3.0,
+            sy as f64 + ray_origin_local[1] / 3.0,
+            sz as f64 + ray_origin_local[2] / 3.0,
+        ];
+        ray_dir_local = [
+            ray_dir_local[0] / 3.0,
+            ray_dir_local[1] / 3.0,
+            ray_dir_local[2] / 3.0,
         ];
         current_frame_depth -= 1;
     }
@@ -344,10 +384,26 @@ pub fn cpu_raycast_with_face_depth(
     max_depth: u32,
     max_face_depth: u32,
 ) -> Option<HitInfo> {
+    let ray_speed = sdf::length(ray_dir);
+    if ray_speed <= 1e-12 {
+        return None;
+    }
     let inv_dir = [
-        if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
-        if ray_dir[1].abs() > 1e-8 { 1.0 / ray_dir[1] } else { 1e10 },
-        if ray_dir[2].abs() > 1e-8 { 1.0 / ray_dir[2] } else { 1e10 },
+        if ray_dir[0].abs() > 1e-8 {
+            1.0 / ray_dir[0]
+        } else {
+            1e10
+        },
+        if ray_dir[1].abs() > 1e-8 {
+            1.0 / ray_dir[1]
+        } else {
+            1e10
+        },
+        if ray_dir[2].abs() > 1e-8 {
+            1.0 / ray_dir[2]
+        } else {
+            1e10
+        },
     ];
 
     let step = [
@@ -364,7 +420,7 @@ pub fn cpu_raycast_with_face_depth(
         return None;
     }
 
-    let t_start = t_enter.max(0.0) + 0.001;
+    let t_start = t_enter.max(0.0) + (0.001 / ray_speed);
     let entry_pos = [
         ray_origin[0] + ray_dir[0] * t_start,
         ray_origin[1] + ray_dir[1] * t_start,
@@ -377,7 +433,11 @@ pub fn cpu_raycast_with_face_depth(
         (entry_pos[2].floor() as i32).clamp(0, 2),
     ];
 
-    let cell_f = [initial_cell[0] as f32, initial_cell[1] as f32, initial_cell[2] as f32];
+    let cell_f = [
+        initial_cell[0] as f32,
+        initial_cell[1] as f32,
+        initial_cell[2] as f32,
+    ];
 
     let mut stack: Vec<Frame> = Vec::with_capacity(max_depth as usize + 1);
     let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(max_depth as usize + 1);
@@ -385,7 +445,9 @@ pub fn cpu_raycast_with_face_depth(
     stack.push(Frame {
         node_id: root,
         cell: initial_cell,
-        side_dist: compute_initial_side_dist(&entry_pos, &cell_f, &inv_dir, &ray_dir, 1.0, &[0.0; 3]),
+        side_dist: compute_initial_side_dist(
+            &entry_pos, &cell_f, &inv_dir, &ray_dir, 1.0, &[0.0; 3],
+        ),
         node_origin: [0.0; 3],
         cell_size: 1.0,
     });
@@ -456,9 +518,14 @@ pub fn cpu_raycast_with_face_depth(
                     ];
                     let body_size = parent_cell_size;
                     if let Some(sphere_hit) = cs_raycast_in_body(
-                        library, child_id, body_origin, body_size,
-                        inner_r, outer_r,
-                        ray_origin, ray_dir,
+                        library,
+                        child_id,
+                        body_origin,
+                        body_size,
+                        inner_r,
+                        outer_r,
+                        ray_origin,
+                        ray_dir,
                         &path,
                         max_face_depth,
                     ) {
@@ -500,7 +567,7 @@ pub fn cpu_raycast_with_face_depth(
                     child_origin[2] + parent_cell_size,
                 ];
                 let (ct_enter, _) = ray_aabb(ray_origin, inv_dir, child_origin, child_max);
-                let ct_start = ct_enter.max(0.0) + 0.0001 * child_cell_size;
+                let ct_start = ct_enter.max(0.0) + ((0.0001 * child_cell_size) / ray_speed);
                 let child_entry = [
                     ray_origin[0] + ray_dir[0] * ct_start,
                     ray_origin[1] + ray_dir[1] * ct_start,
@@ -519,14 +586,22 @@ pub fn cpu_raycast_with_face_depth(
                     (local_entry[2].floor() as i32).clamp(0, 2),
                 ];
 
-                let lc = [child_cell[0] as f32, child_cell[1] as f32, child_cell[2] as f32];
+                let lc = [
+                    child_cell[0] as f32,
+                    child_cell[1] as f32,
+                    child_cell[2] as f32,
+                ];
 
                 stack.push(Frame {
                     node_id: child_id,
                     cell: child_cell,
                     side_dist: compute_initial_side_dist(
-                        &ray_origin, &lc, &inv_dir, &ray_dir,
-                        child_cell_size, &child_origin,
+                        &ray_origin,
+                        &lc,
+                        &inv_dir,
+                        &ray_dir,
+                        child_cell_size,
+                        &child_origin,
                     ),
                     node_origin: child_origin,
                     cell_size: child_cell_size,
@@ -621,7 +696,9 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> boo
             for child in &parent.children {
                 if let Child::Node(nid) = child {
                     let d = depth_of_node(&world.library, *nid);
-                    if d > max_d { max_d = d; }
+                    if d > max_d {
+                        max_d = d;
+                    }
                 }
             }
             max_d
@@ -632,13 +709,17 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> boo
         0
     };
 
-    let child = world.library.build_uniform_subtree(block_type, sibling_depth);
+    let child = world
+        .library
+        .build_uniform_subtree(block_type, sibling_depth);
     place_child(world, hit, child)
 }
 
 /// Compute depth of a single node (non-memoized, but uniform nodes are O(1)).
 fn depth_of_node(library: &super::tree::NodeLibrary, id: super::tree::NodeId) -> u32 {
-    let Some(node) = library.get(id) else { return 0 };
+    let Some(node) = library.get(id) else {
+        return 0;
+    };
     // For uniform nodes (all children identical), just check one child.
     let first_child = node.children[0];
     match first_child {
@@ -657,9 +738,12 @@ fn place_child_at_point(
     new_child: Child,
 ) -> bool {
     // Bounds check: must be inside root [0, 3).
-    if target[0] < 0.0 || target[0] >= 3.0
-        || target[1] < 0.0 || target[1] >= 3.0
-        || target[2] < 0.0 || target[2] >= 3.0
+    if target[0] < 0.0
+        || target[0] >= 3.0
+        || target[1] < 0.0
+        || target[1] >= 3.0
+        || target[2] < 0.0
+        || target[2] >= 3.0
     {
         return false;
     }
@@ -671,9 +755,15 @@ fn place_child_at_point(
 
     for level in 0..depth {
         let cell = [
-            ((target[0] - origin[0]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[1] - origin[1]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[2] - origin[2]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+            ((target[0] - origin[0]) / cell_size)
+                .floor()
+                .clamp(0.0, 2.0) as i32,
+            ((target[1] - origin[1]) / cell_size)
+                .floor()
+                .clamp(0.0, 2.0) as i32,
+            ((target[2] - origin[2]) / cell_size)
+                .floor()
+                .clamp(0.0, 2.0) as i32,
         ];
         let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
         path.push((current_id, slot));
@@ -697,7 +787,12 @@ fn place_child_at_point(
             }
             child if is_last && is_placeable(&world.library, child) => {
                 // Target cell is empty (or all-empty subtree) — place directly.
-                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
+                let place_hit = HitInfo {
+                    path,
+                    face: 0,
+                    t: 0.0,
+                    place_path: None,
+                };
                 return propagate_edit(world, &place_hit, new_child);
             }
             child if !is_last && is_placeable(&world.library, child) => {
@@ -717,7 +812,12 @@ fn place_child_at_point(
                     remaining,
                     new_child,
                 );
-                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
+                let place_hit = HitInfo {
+                    path,
+                    face: 0,
+                    t: 0.0,
+                    place_path: None,
+                };
                 return propagate_edit(world, &place_hit, Child::Node(chain_id));
             }
             _ => {
@@ -744,9 +844,15 @@ fn build_placement_chain(
     let mut slots = Vec::with_capacity(remaining);
     for _ in 0..remaining {
         let cell = [
-            ((target[0] - origin[0]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[1] - origin[1]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[2] - origin[2]) / cell_size).floor().clamp(0.0, 2.0) as i32,
+            ((target[0] - origin[0]) / cell_size)
+                .floor()
+                .clamp(0.0, 2.0) as i32,
+            ((target[1] - origin[1]) / cell_size)
+                .floor()
+                .clamp(0.0, 2.0) as i32,
+            ((target[2] - origin[2]) / cell_size)
+                .floor()
+                .clamp(0.0, 2.0) as i32,
         ];
         let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
         slots.push(slot);
@@ -782,7 +888,9 @@ fn build_placement_chain(
 ///
 /// Used for placing saved meshes / imported models.
 pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_node_id: NodeId) {
-    if ancestor_slots.is_empty() { return; }
+    if ancestor_slots.is_empty() {
+        return;
+    }
 
     // Phase 1: Descent — record (parent_id, slot) pairs.
     let mut descent: Vec<(NodeId, usize)> = Vec::with_capacity(ancestor_slots.len());
@@ -790,7 +898,9 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_nod
 
     for &slot in ancestor_slots {
         descent.push((current_id, slot));
-        let Some(node) = world.library.get(current_id) else { return };
+        let Some(node) = world.library.get(current_id) else {
+            return;
+        };
         match node.children[slot] {
             Child::Node(child_id) => current_id = child_id,
             _ => {
@@ -805,7 +915,9 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_nod
     // Preserve each ancestor's NodeKind (see `propagate_edit`).
     let mut child = Child::Node(new_node_id);
     for &(parent_id, slot) in descent.iter().rev() {
-        let Some(node) = world.library.get(parent_id) else { return };
+        let Some(node) = world.library.get(parent_id) else {
+            return;
+        };
         let original_kind = node.kind;
         let mut new_children = node.children;
         new_children[slot] = child;
@@ -961,16 +1073,14 @@ fn cell_entry_t(frame: &Frame, ray_origin: &[f32; 3], inv_dir: &[f32; 3]) -> f32
 /// the given tree depth. Walks the tree from root, mapping the
 /// position to slot indices at each level. Returns true if the cell
 /// is Block or Node (has content); false if Empty or out of bounds.
-pub fn is_solid_at(
-    library: &NodeLibrary,
-    root: NodeId,
-    pos: [f32; 3],
-    max_depth: u32,
-) -> bool {
+pub fn is_solid_at(library: &NodeLibrary, root: NodeId, pos: [f32; 3], max_depth: u32) -> bool {
     // The root spans [0, 3) on each axis.
-    if pos[0] < 0.0 || pos[0] >= 3.0
-        || pos[1] < 0.0 || pos[1] >= 3.0
-        || pos[2] < 0.0 || pos[2] >= 3.0
+    if pos[0] < 0.0
+        || pos[0] >= 3.0
+        || pos[1] < 0.0
+        || pos[1] >= 3.0
+        || pos[2] < 0.0
+        || pos[2] >= 3.0
     {
         return false;
     }
@@ -1053,23 +1163,41 @@ fn cs_raycast_in_body(
     let cs_outer = outer_r_local * body_size;
     let cs_inner = inner_r_local * body_size;
     let shell = cs_outer - cs_inner;
-    if shell <= 0.0 { return None; }
+    if shell <= 0.0 {
+        return None;
+    }
 
     // Ray-sphere with outer radius. Standard form (cursor accuracy
     // is fine; we don't need the Numerical-Recipes fallback).
+    let ray_speed = sdf::length(ray_dir);
+    if ray_speed <= 1e-12 {
+        return None;
+    }
     let oc = sdf::sub(ray_origin, cs_center);
+    let a = sdf::dot(ray_dir, ray_dir);
     let b = sdf::dot(oc, ray_dir);
     let c = sdf::dot(oc, oc) - cs_outer * cs_outer;
-    let disc = b * b - c;
-    if disc <= 0.0 { return None; }
+    let disc = b * b - a * c;
+    if disc <= 0.0 {
+        return None;
+    }
     let sq = disc.sqrt();
-    let t_enter = (-b - sq).max(0.0);
-    let t_exit = -b + sq;
-    if t_exit <= 0.0 { return None; }
+    let t_enter = ((-b - sq) / a).max(0.0);
+    let t_exit = (-b + sq) / a;
+    if t_exit <= 0.0 {
+        return None;
+    }
     if debug_probe {
         eprintln!(
             "cs_raycast_in_body start origin={:?} dir={:?} body_origin={:?} body_size={} inner={} outer={} t_enter={} t_exit={}",
-            ray_origin, ray_dir, body_origin, body_size, inner_r_local, outer_r_local, t_enter, t_exit,
+            ray_origin,
+            ray_dir,
+            body_origin,
+            body_size,
+            inner_r_local,
+            outer_r_local,
+            t_enter,
+            t_exit,
         );
     }
 
@@ -1077,7 +1205,7 @@ fn cs_raycast_in_body(
     // Start coarse (1/3 of shell) and refine as we sample finer cells.
     let mut step_world = shell * 0.33;
     let eps = (shell * 1e-5).max(1e-7);
-    let mut t = t_enter + eps;
+    let mut t = t_enter + (eps / ray_speed);
     // Tracks the last empty cell's face-subtree path. On block hit,
     // THIS is the placement target: it's the cell the ray was in one
     // step before striking the block, which by construction is empty
@@ -1090,20 +1218,28 @@ fn cs_raycast_in_body(
     let mut prev_place_path: Option<Vec<(NodeId, usize)>> = None;
     let max_steps = 8_000usize;
     for step_index in 0..max_steps {
-        if t >= t_exit { break; }
+        if t >= t_exit {
+            break;
+        }
         let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
         let local = sdf::sub(p, cs_center);
         let r = sdf::length(local);
         if r > cs_outer {
             if debug_probe && step_index < 12 {
-                eprintln!("cs_raycast_in_body step={} t={} outside_outer r={} outer={}", step_index, t, r, cs_outer);
+                eprintln!(
+                    "cs_raycast_in_body step={} t={} outside_outer r={} outer={}",
+                    step_index, t, r, cs_outer
+                );
             }
-            t += eps * 8.0;
+            t += (eps * 8.0) / ray_speed;
             continue;
         }
         if r < cs_inner {
             if debug_probe && step_index < 12 {
-                eprintln!("cs_raycast_in_body step={} t={} below_inner r={} inner={}", step_index, t, r, cs_inner);
+                eprintln!(
+                    "cs_raycast_in_body step={} t={} below_inner r={} inner={}",
+                    step_index, t, r, cs_inner
+                );
             }
             break;
         }
@@ -1113,8 +1249,12 @@ fn cs_raycast_in_body(
             p[1] - body_origin[1],
             p[2] - body_origin[2],
         ];
-        let face_point =
-            cubesphere_local::body_point_to_face_space(p_body, inner_r_local, outer_r_local, body_size)?;
+        let face_point = cubesphere_local::body_point_to_face_space(
+            p_body,
+            inner_r_local,
+            outer_r_local,
+            body_size,
+        )?;
         let face = face_point.face;
         let face_slot = FACE_SLOTS[face as usize];
         let body_node = library.get(body_id)?;
@@ -1140,7 +1280,11 @@ fn cs_raycast_in_body(
                 un,
                 vn,
                 rn,
-                walk.as_ref().map(|(block_id, term_depth, path)| (*block_id, *term_depth, path.len())),
+                walk.as_ref().map(|(block_id, term_depth, path)| (
+                    *block_id,
+                    *term_depth,
+                    path.len()
+                )),
             );
         }
         if let Some((block_id, term_depth, mut face_path)) = walk {
@@ -1175,7 +1319,7 @@ fn cs_raycast_in_body(
             let coarse_floor = shell * 0.01;
             step_world = nominal.max(coarse_floor).max(eps * 4.0);
         }
-        t += step_world;
+        t += step_world / ray_speed;
     }
 
     None
@@ -1206,29 +1350,42 @@ fn cs_raycast_in_body_bounded(
     let cs_outer = outer_r_local * body_size;
     let cs_inner = inner_r_local * body_size;
     let shell = cs_outer - cs_inner;
-    if shell <= 0.0 { return None; }
+    if shell <= 0.0 {
+        return None;
+    }
 
+    let ray_speed = sdf::length(ray_dir);
+    if ray_speed <= 1e-12 {
+        return None;
+    }
     let oc = sdf::sub(ray_origin, cs_center);
+    let a = sdf::dot(ray_dir, ray_dir);
     let b = sdf::dot(oc, ray_dir);
     let c = sdf::dot(oc, oc) - cs_outer * cs_outer;
-    let disc = b * b - c;
-    if disc <= 0.0 { return None; }
+    let disc = b * b - a * c;
+    if disc <= 0.0 {
+        return None;
+    }
     let sq = disc.sqrt();
-    let t_enter = (-b - sq).max(0.0);
-    let t_exit = -b + sq;
-    if t_exit <= 0.0 { return None; }
+    let t_enter = ((-b - sq) / a).max(0.0);
+    let t_exit = (-b + sq) / a;
+    if t_exit <= 0.0 {
+        return None;
+    }
 
     let mut step_world = shell * frame_size * 0.33;
     let eps = (shell * 1e-5).max(1e-7);
-    let mut t = t_enter + eps;
+    let mut t = t_enter + (eps / ray_speed);
     let mut prev_place_path: Option<Vec<(NodeId, usize)>> = None;
     for _ in 0..8_000usize {
-        if t >= t_exit { break; }
+        if t >= t_exit {
+            break;
+        }
         let p = sdf::add(ray_origin, sdf::scale(ray_dir, t));
         let local = sdf::sub(p, cs_center);
         let r = sdf::length(local);
         if r > cs_outer {
-            t += eps * 8.0;
+            t += (eps * 8.0) / ray_speed;
             continue;
         }
         if r < cs_inner {
@@ -1240,17 +1397,25 @@ fn cs_raycast_in_body_bounded(
             p[1] - body_origin[1],
             p[2] - body_origin[2],
         ];
-        let face_point =
-            cubesphere_local::body_point_to_face_space(p_body, inner_r_local, outer_r_local, body_size)?;
+        let face_point = cubesphere_local::body_point_to_face_space(
+            p_body,
+            inner_r_local,
+            outer_r_local,
+            body_size,
+        )?;
         if face_point.face as u32 != frame_face {
             break;
         }
         let un_abs = face_point.un;
         let vn_abs = face_point.vn;
         let rn_abs = face_point.rn;
-        if un_abs < frame_u_min || un_abs >= frame_u_min + frame_size ||
-           vn_abs < frame_v_min || vn_abs >= frame_v_min + frame_size ||
-           rn_abs < frame_r_min || rn_abs >= frame_r_min + frame_size {
+        if un_abs < frame_u_min
+            || un_abs >= frame_u_min + frame_size
+            || vn_abs < frame_v_min
+            || vn_abs >= frame_v_min + frame_size
+            || rn_abs < frame_r_min
+            || rn_abs >= frame_r_min + frame_size
+        {
             break;
         }
 
@@ -1286,7 +1451,7 @@ fn cs_raycast_in_body_bounded(
             let coarse_floor = shell * frame_size * 0.01;
             step_world = nominal.max(coarse_floor).max(eps * 4.0);
         }
-        t += step_world;
+        t += step_world / ray_speed;
     }
     None
 }
@@ -1296,7 +1461,9 @@ fn cs_raycast_in_body_bounded(
 fn walk_face_subtree_with_path(
     library: &NodeLibrary,
     face_root_id: NodeId,
-    un_in: f32, vn_in: f32, rn_in: f32,
+    un_in: f32,
+    vn_in: f32,
+    rn_in: f32,
     max_depth: u32,
 ) -> Option<(u8, u32, Vec<(NodeId, usize)>)> {
     let mut node_id = face_root_id;
@@ -1313,20 +1480,19 @@ fn walk_face_subtree_with_path(
     // above the SDF-detail surface, huge over uniform-empty regions).
     // Synthesize EMPTY_NODE-tagged slot entries for the remaining
     // levels; propagate_edit materializes empty nodes on rebuild.
-    let pad_to_limit = |path: &mut Vec<(NodeId, usize)>,
-                        mut un: f32, mut vn: f32, mut rn: f32,
-                        from_d: u32| {
-        for _ in from_d..limit {
-            let us = ((un * 3.0) as usize).min(2);
-            let vs = ((vn * 3.0) as usize).min(2);
-            let rs = ((rn * 3.0) as usize).min(2);
-            let slot = slot_index(us, vs, rs);
-            path.push((EMPTY_NODE, slot));
-            un = un * 3.0 - us as f32;
-            vn = vn * 3.0 - vs as f32;
-            rn = rn * 3.0 - rs as f32;
-        }
-    };
+    let pad_to_limit =
+        |path: &mut Vec<(NodeId, usize)>, mut un: f32, mut vn: f32, mut rn: f32, from_d: u32| {
+            for _ in from_d..limit {
+                let us = ((un * 3.0) as usize).min(2);
+                let vs = ((vn * 3.0) as usize).min(2);
+                let rs = ((rn * 3.0) as usize).min(2);
+                let slot = slot_index(us, vs, rs);
+                path.push((EMPTY_NODE, slot));
+                un = un * 3.0 - us as f32;
+                vn = vn * 3.0 - vs as f32;
+                rn = rn * 3.0 - rs as f32;
+            }
+        };
     for d in 1u32..=limit {
         let node = library.get(node_id)?;
         let us = ((un * 3.0) as usize).min(2);
@@ -1399,6 +1565,94 @@ fn hit_path_slots(hit: &HitInfo) -> Path {
     path
 }
 
+pub fn hit_point_world(
+    library: &NodeLibrary,
+    hit: &HitInfo,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+) -> [f32; 3] {
+    let (aabb_min, aabb_max) = hit_aabb(library, hit);
+    let inv_dir = [
+        if ray_dir[0].abs() > 1e-8 {
+            1.0 / ray_dir[0]
+        } else {
+            1e10
+        },
+        if ray_dir[1].abs() > 1e-8 {
+            1.0 / ray_dir[1]
+        } else {
+            1e10
+        },
+        if ray_dir[2].abs() > 1e-8 {
+            1.0 / ray_dir[2]
+        } else {
+            1e10
+        },
+    ];
+    let (t_enter, _) = ray_aabb(ray_origin, inv_dir, aabb_min, aabb_max);
+    let t = t_enter.max(0.0);
+    [
+        ray_origin[0] + ray_dir[0] * t,
+        ray_origin[1] + ray_dir[1] * t,
+        ray_origin[2] + ray_dir[2] * t,
+    ]
+}
+
+pub fn refine_cartesian_hit_to_depth(
+    library: &NodeLibrary,
+    hit: &HitInfo,
+    target_world: [f32; 3],
+    target_depth: usize,
+) -> HitInfo {
+    if hit.path.len() >= target_depth {
+        return hit.clone();
+    }
+    let mut refined = hit.clone();
+    let Some(&(parent_id, slot)) = refined.path.last() else {
+        return refined;
+    };
+    let Some(parent) = library.get(parent_id) else {
+        return refined;
+    };
+    let Child::Node(mut current_node_id) = parent.children[slot] else {
+        return refined;
+    };
+    let (mut cell_min, cell_max) = hit_aabb(library, hit);
+    let mut cell_size = cell_max[0] - cell_min[0];
+
+    while refined.path.len() < target_depth {
+        let Some(node) = library.get(current_node_id) else {
+            break;
+        };
+        let child_size = cell_size / 3.0;
+        let cell = [
+            ((target_world[0] - cell_min[0]) / child_size)
+                .floor()
+                .clamp(0.0, 2.0) as usize,
+            ((target_world[1] - cell_min[1]) / child_size)
+                .floor()
+                .clamp(0.0, 2.0) as usize,
+            ((target_world[2] - cell_min[2]) / child_size)
+                .floor()
+                .clamp(0.0, 2.0) as usize,
+        ];
+        let next_slot = slot_index(cell[0], cell[1], cell[2]);
+        refined.path.push((current_node_id, next_slot));
+        cell_min = [
+            cell_min[0] + cell[0] as f32 * child_size,
+            cell_min[1] + cell[1] as f32 * child_size,
+            cell_min[2] + cell[2] as f32 * child_size,
+        ];
+        cell_size = child_size;
+        match node.children[next_slot] {
+            Child::Node(next_id) => current_node_id = next_id,
+            Child::Block(_) | Child::Empty => break,
+        }
+    }
+
+    refined
+}
+
 pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [f32; 3]) {
     let cell_path = hit_path_slots(hit);
     let common = cell_path.common_prefix_len(frame_path) as usize;
@@ -1432,19 +1686,22 @@ pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [
         (cell_min_common[2] - frame_min_common[2]) * scale,
     ];
     let extent = cell_size_common * scale;
-    (
-        min,
-        [min[0] + extent, min[1] + extent, min[2] + extent],
-    )
+    (min, [min[0] + extent, min[1] + extent, min[2] + extent])
 }
 
 pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
     use super::cubesphere::Face;
 
     for (index, &(node_id, slot)) in hit.path.iter().enumerate() {
-        let Some(node) = library.get(node_id) else { break };
-        let Child::Node(child_id) = node.children[slot] else { continue };
-        let Some(child_node) = library.get(child_id) else { continue };
+        let Some(node) = library.get(node_id) else {
+            break;
+        };
+        let Child::Node(child_id) = node.children[slot] else {
+            continue;
+        };
+        let Some(child_node) = library.get(child_id) else {
+            continue;
+        };
         let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind else {
             continue;
         };
@@ -1469,7 +1726,11 @@ pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [
             depth += 1;
         }
 
-        let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
+        let cells = if depth == 0 {
+            1.0
+        } else {
+            3.0_f32.powi(depth as i32)
+        };
         let un0 = iu as f32 / cells;
         let vn0 = iv as f32 / cells;
         let rn0 = ir as f32 / cells;
@@ -1478,14 +1739,72 @@ pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [
         let dr = 1.0 / cells;
 
         let corners = [
-            cubesphere_local::face_space_to_body_point(face, un0, vn0, rn0, inner_r, outer_r, WORLD_SIZE),
-            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0, rn0, inner_r, outer_r, WORLD_SIZE),
-            cubesphere_local::face_space_to_body_point(face, un0, vn0 + dv, rn0, inner_r, outer_r, WORLD_SIZE),
-            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0 + dv, rn0, inner_r, outer_r, WORLD_SIZE),
-            cubesphere_local::face_space_to_body_point(face, un0, vn0, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
-            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
-            cubesphere_local::face_space_to_body_point(face, un0, vn0 + dv, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
-            cubesphere_local::face_space_to_body_point(face, un0 + du, vn0 + dv, rn0 + dr, inner_r, outer_r, WORLD_SIZE),
+            cubesphere_local::face_space_to_body_point(
+                face, un0, vn0, rn0, inner_r, outer_r, WORLD_SIZE,
+            ),
+            cubesphere_local::face_space_to_body_point(
+                face,
+                un0 + du,
+                vn0,
+                rn0,
+                inner_r,
+                outer_r,
+                WORLD_SIZE,
+            ),
+            cubesphere_local::face_space_to_body_point(
+                face,
+                un0,
+                vn0 + dv,
+                rn0,
+                inner_r,
+                outer_r,
+                WORLD_SIZE,
+            ),
+            cubesphere_local::face_space_to_body_point(
+                face,
+                un0 + du,
+                vn0 + dv,
+                rn0,
+                inner_r,
+                outer_r,
+                WORLD_SIZE,
+            ),
+            cubesphere_local::face_space_to_body_point(
+                face,
+                un0,
+                vn0,
+                rn0 + dr,
+                inner_r,
+                outer_r,
+                WORLD_SIZE,
+            ),
+            cubesphere_local::face_space_to_body_point(
+                face,
+                un0 + du,
+                vn0,
+                rn0 + dr,
+                inner_r,
+                outer_r,
+                WORLD_SIZE,
+            ),
+            cubesphere_local::face_space_to_body_point(
+                face,
+                un0,
+                vn0 + dv,
+                rn0 + dr,
+                inner_r,
+                outer_r,
+                WORLD_SIZE,
+            ),
+            cubesphere_local::face_space_to_body_point(
+                face,
+                un0 + du,
+                vn0 + dv,
+                rn0 + dr,
+                inner_r,
+                outer_r,
+                WORLD_SIZE,
+            ),
         ];
         let mut min = corners[0];
         let mut max = corners[0];
@@ -1502,7 +1821,7 @@ pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [
 }
 
 pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
-    use super::cubesphere::{block_corners, Face, FACE_SLOTS};
+    use super::cubesphere::{FACE_SLOTS, Face, block_corners};
 
     let mut origin = [0.0f32; 3];
     let mut cell_size = 1.0f32;
@@ -1542,21 +1861,27 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
                     let face_slot = match hit.path.get(i + 1) {
                         Some(&(_, fs)) => fs,
                         None => {
-                            return (body_origin, [
-                                body_origin[0] + body_size,
-                                body_origin[1] + body_size,
-                                body_origin[2] + body_size,
-                            ]);
+                            return (
+                                body_origin,
+                                [
+                                    body_origin[0] + body_size,
+                                    body_origin[1] + body_size,
+                                    body_origin[2] + body_size,
+                                ],
+                            );
                         }
                     };
                     let face = match (0..6).find(|&f| FACE_SLOTS[f] == face_slot) {
                         Some(f) => Face::from_index(f as u8),
                         None => {
-                            return (body_origin, [
-                                body_origin[0] + body_size,
-                                body_origin[1] + body_size,
-                                body_origin[2] + body_size,
-                            ]);
+                            return (
+                                body_origin,
+                                [
+                                    body_origin[0] + body_size,
+                                    body_origin[1] + body_size,
+                                    body_origin[2] + body_size,
+                                ],
+                            );
                         }
                     };
                     // Remaining entries AFTER (body, face_slot) walk
@@ -1574,7 +1899,11 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
                         depth += 1;
                     }
                     // Cell extent in the face's normalized (u, v, r) frame.
-                    let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
+                    let cells = if depth == 0 {
+                        1.0
+                    } else {
+                        3.0_f32.powi(depth as i32)
+                    };
                     let u_lo = (iu as f32 / cells) * 2.0 - 1.0;
                     let v_lo = (iv as f32 / cells) * 2.0 - 1.0;
                     let r_lo_n = ir as f32 / cells;
@@ -1583,17 +1912,18 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
                     let drn = 1.0 / cells;
                     let r_world_lo = inner_r * body_size + r_lo_n * (outer_r - inner_r) * body_size;
                     let dr_world = drn * (outer_r - inner_r) * body_size;
-                    let corners = block_corners(
-                        body_center, face,
-                        u_lo, v_lo, r_world_lo,
-                        du, dv, dr_world,
-                    );
+                    let corners =
+                        block_corners(body_center, face, u_lo, v_lo, r_world_lo, du, dv, dr_world);
                     let mut aabb_min = corners[0];
                     let mut aabb_max = corners[0];
                     for c in &corners[1..] {
                         for k in 0..3 {
-                            if c[k] < aabb_min[k] { aabb_min[k] = c[k]; }
-                            if c[k] > aabb_max[k] { aabb_max[k] = c[k]; }
+                            if c[k] < aabb_min[k] {
+                                aabb_min[k] = c[k];
+                            }
+                            if c[k] > aabb_max[k] {
+                                aabb_max[k] = c[k];
+                            }
                         }
                     }
                     return (aabb_min, aabb_max);
@@ -1622,9 +1952,14 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::Camera;
+    use crate::world::bootstrap::bootstrap_world;
+    use crate::world::bootstrap::plain_world;
     use crate::world::bootstrap::plain_test_world;
-    use crate::world::palette::block;
+    use crate::world::bootstrap::WorldPreset;
     use crate::world::cubesphere::insert_spherical_body;
+    use crate::world::palette::block;
+    use crate::world::sdf;
     use crate::world::sdf::Planet;
 
     #[test]
@@ -1639,9 +1974,14 @@ mod tests {
         let mut lib = NodeLibrary::default();
         let sdf = Planet {
             center: [0.5, 0.5, 0.5],
-            radius: 0.30, noise_scale: 0.0, noise_freq: 1.0, noise_seed: 0,
-            gravity: 0.0, influence_radius: 1.0,
-            surface_block: block::GRASS, core_block: block::STONE,
+            radius: 0.30,
+            noise_scale: 0.0,
+            noise_freq: 1.0,
+            noise_seed: 0,
+            gravity: 0.0,
+            influence_radius: 1.0,
+            surface_block: block::GRASS,
+            core_block: block::STONE,
         };
         let body_id = insert_spherical_body(&mut lib, 0.12, 0.45, 6, &sdf);
         let body_kind_before = lib.get(body_id).unwrap().kind;
@@ -1664,7 +2004,10 @@ mod tests {
         let mut world_children = empty_children();
         world_children[0] = Child::Node(body_id);
         let world_root = lib.insert(world_children);
-        let mut world = WorldState { root: world_root, library: lib };
+        let mut world = WorldState {
+            root: world_root,
+            library: lib,
+        };
         world.library.ref_inc(world_root);
 
         // Build a HitInfo at body → face_root → slot 0.
@@ -1674,7 +2017,9 @@ mod tests {
                 (body_id, crate::world::cubesphere::FACE_SLOTS[0]),
                 (face_root_id, 0),
             ],
-            face: 0, t: 1.0, place_path: None,
+            face: 0,
+            t: 1.0,
+            place_path: None,
         };
         assert!(propagate_edit(&mut world, &hit, Child::Empty));
 
@@ -1682,23 +2027,32 @@ mod tests {
         // edit path are preserved (NOT collapsed to Cartesian).
         let new_world_root = world.root;
         let new_root_kind = world.library.get(new_world_root).unwrap().kind;
-        assert!(matches!(new_root_kind, NodeKind::Cartesian),
-            "world root must stay Cartesian");
+        assert!(
+            matches!(new_root_kind, NodeKind::Cartesian),
+            "world root must stay Cartesian"
+        );
         let new_body = match world.library.get(new_world_root).unwrap().children[0] {
             Child::Node(id) => id,
             _ => panic!("slot 0 must still be the body"),
         };
         let new_body_kind = world.library.get(new_body).unwrap().kind;
-        assert!(matches!(new_body_kind, NodeKind::CubedSphereBody { .. }),
-            "body NodeKind must survive the edit (was: {:?})", new_body_kind);
-        let new_face = match world.library.get(new_body).unwrap()
-            .children[crate::world::cubesphere::FACE_SLOTS[0]] {
+        assert!(
+            matches!(new_body_kind, NodeKind::CubedSphereBody { .. }),
+            "body NodeKind must survive the edit (was: {:?})",
+            new_body_kind
+        );
+        let new_face = match world.library.get(new_body).unwrap().children
+            [crate::world::cubesphere::FACE_SLOTS[0]]
+        {
             Child::Node(id) => id,
             _ => panic!("face slot must still be a Node"),
         };
         let new_face_kind = world.library.get(new_face).unwrap().kind;
-        assert!(matches!(new_face_kind, NodeKind::CubedSphereFace { .. }),
-            "face NodeKind must survive the edit (was: {:?})", new_face_kind);
+        assert!(
+            matches!(new_face_kind, NodeKind::CubedSphereFace { .. }),
+            "face NodeKind must survive the edit (was: {:?})",
+            new_face_kind
+        );
     }
 
     #[test]
@@ -1724,23 +2078,45 @@ mod tests {
         // equivalent to the legacy world-coord raycast.
         let world = plain_test_world();
         let world_hit = cpu_raycast(
-            &world.library, world.root,
-            [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
+            &world.library,
+            world.root,
+            [1.5, 2.5, 1.5],
+            [0.0, -1.0, 0.0],
             8,
         );
         let frame_hit = cpu_raycast_in_frame(
-            &world.library, world.root,
-            &[],  // empty frame == world root
-            [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
-            8, 6,
+            &world.library,
+            world.root,
+            &[], // empty frame == world root
+            [1.5, 2.5, 1.5],
+            [0.0, -1.0, 0.0],
+            8,
+            6,
         );
         assert!(world_hit.is_some());
         assert!(frame_hit.is_some());
         let w = world_hit.unwrap();
         let f = frame_hit.unwrap();
-        assert_eq!(w.path.len(), f.path.len(),
-            "same hit depth via both paths");
+        assert_eq!(w.path.len(), f.path.len(), "same hit depth via both paths");
         assert_eq!(w.face, f.face);
+    }
+
+    #[test]
+    fn cpu_raycast_in_frame_is_invariant_to_ray_scale() {
+        let world = plain_test_world();
+        let origin = [1.5, 2.5, 1.5];
+        let unit_dir = [0.0, -1.0, 0.0];
+        let scaled_dir = [0.0, -1.0e9, 0.0];
+
+        let unit_hit =
+            cpu_raycast_in_frame(&world.library, world.root, &[], origin, unit_dir, 8, 6)
+                .expect("unit ray should hit ground");
+        let scaled_hit =
+            cpu_raycast_in_frame(&world.library, world.root, &[], origin, scaled_dir, 8, 6)
+                .expect("scaled ray should hit the same ground");
+
+        assert_eq!(unit_hit.face, scaled_hit.face);
+        assert_eq!(unit_hit.path, scaled_hit.path);
     }
 
     #[test]
@@ -1760,10 +2136,7 @@ mod tests {
         // Cam at edge of frame, ray pointing in arbitrary dir.
         let cam = [0.5, 0.5, 0.5];
         let dir = [0.7, 0.7, 0.0];
-        let _ = cpu_raycast_in_frame(
-            &world.library, world.root,
-            &frame_path, cam, dir, 8, 6,
-        );
+        let _ = cpu_raycast_in_frame(&world.library, world.root, &frame_path, cam, dir, 8, 6);
         // Just verify no panic — covered the ascent code.
     }
 
@@ -1773,8 +2146,8 @@ mod tests {
         // edit_depth=3, cs_edit_depth=1, frame_path=[16]. Cursor
         // ray pointing down at the planet should produce a sphere
         // hit (face=4), not a Cartesian fallback (face=2).
-        use crate::world::worldgen::generate_world;
         use crate::world::spherical_worldgen::{demo_planet, install_at_root_center};
+        use crate::world::worldgen::generate_world;
 
         let mut world = generate_world();
         let setup = demo_planet();
@@ -1789,17 +2162,73 @@ mod tests {
         let cs_edit_depth = 1u32;
 
         let hit = cpu_raycast_in_frame(
-            &world.library, world.root,
-            &frame_path, cam_local, ray_dir,
-            edit_depth, cs_edit_depth,
+            &world.library,
+            world.root,
+            &frame_path,
+            cam_local,
+            ray_dir,
+            edit_depth,
+            cs_edit_depth,
         );
-        eprintln!("planet_world_raycast hit = {:?}",
-            hit.as_ref().map(|h| (h.path.len(), h.face, h.t,
-                h.place_path.as_ref().map(|p| p.len()))));
+        eprintln!(
+            "planet_world_raycast hit = {:?}",
+            hit.as_ref().map(|h| (
+                h.path.len(),
+                h.face,
+                h.t,
+                h.place_path.as_ref().map(|p| p.len())
+            ))
+        );
         assert!(hit.is_some(), "ray should hit planet");
         let h = hit.unwrap();
-        assert_eq!(h.face, 4,
-            "should be sphere hit (face=4), not Cartesian fallback");
+        assert_eq!(
+            h.face, 4,
+            "should be sphere hit (face=4), not Cartesian fallback"
+        );
+    }
+
+    #[test]
+    fn planet_world_raycast_hits_sphere_with_scaled_direction() {
+        use crate::world::spherical_worldgen::{demo_planet, install_at_root_center};
+        use crate::world::worldgen::generate_world;
+
+        let mut world = generate_world();
+        let setup = demo_planet();
+        let (new_root, _planet_path) =
+            install_at_root_center(&mut world.library, world.root, &setup);
+        world.swap_root(new_root);
+
+        let cam_local = [1.5, 0.0, 1.5];
+        let unit_dir = [0.0, -0.9320391, -0.3623577];
+        let scaled_dir = [0.0, -9.320391e8, -3.623577e8];
+        let frame_path = [16u8];
+        let edit_depth = 3u32;
+        let cs_edit_depth = 1u32;
+
+        let unit_hit = cpu_raycast_in_frame(
+            &world.library,
+            world.root,
+            &frame_path,
+            cam_local,
+            unit_dir,
+            edit_depth,
+            cs_edit_depth,
+        )
+        .expect("unit ray should hit planet");
+        let scaled_hit = cpu_raycast_in_frame(
+            &world.library,
+            world.root,
+            &frame_path,
+            cam_local,
+            scaled_dir,
+            edit_depth,
+            cs_edit_depth,
+        )
+        .expect("scaled ray should hit the same planet");
+
+        assert_eq!(unit_hit.face, 4);
+        assert_eq!(scaled_hit.face, 4);
+        assert_eq!(unit_hit.path, scaled_hit.path);
     }
 
     #[test]
@@ -1811,8 +2240,8 @@ mod tests {
         // subtree nodes (CubedSphereFace kind) didn't trigger
         // sphere dispatch and got returned as Cartesian solid hits
         // via the rep-block max_depth fallback (face=2, path=5+).
-        use crate::world::worldgen::generate_world;
         use crate::world::spherical_worldgen::{demo_planet, install_at_root_center};
+        use crate::world::worldgen::generate_world;
 
         let mut world = generate_world();
         let setup = demo_planet();
@@ -1827,15 +2256,23 @@ mod tests {
         let frame_path = [13u8];
 
         let hit = cpu_raycast_in_frame(
-            &world.library, world.root,
-            &frame_path, cam_local, ray_dir,
-            10, 4,
+            &world.library,
+            world.root,
+            &frame_path,
+            cam_local,
+            ray_dir,
+            10,
+            4,
         );
         if let Some(h) = &hit {
-            assert_eq!(h.face, 4,
+            assert_eq!(
+                h.face,
+                4,
                 "body-as-frame must produce sphere hit (face=4), \
                  not Cartesian fallback (face=2). Got path.len={} face={}",
-                h.path.len(), h.face);
+                h.path.len(),
+                h.face
+            );
         }
     }
 
@@ -1844,12 +2281,156 @@ mod tests {
         // The returned path's first entry must be (world.root, _).
         let world = plain_test_world();
         let hit = cpu_raycast_in_frame(
-            &world.library, world.root,
-            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
-            8, 6,
-        ).expect("should hit ground");
-        assert_eq!(hit.path[0].0, world.root,
-            "path begins at world.root");
+            &world.library,
+            world.root,
+            &[],
+            [1.5, 2.5, 1.5],
+            [0.0, -1.0, 0.0],
+            8,
+            6,
+        )
+        .expect("should hit ground");
+        assert_eq!(hit.path[0].0, world.root, "path begins at world.root");
+    }
+
+    #[test]
+    fn deep_plain_world_frame_raycast_matches_world_raycast() {
+        let bootstrap = bootstrap_world(WorldPreset::PlainTest, Some(40));
+        let world = plain_world(40);
+        let anchor_depth = 34u8;
+        let position = crate::app::harness::spawn_position(
+            bootstrap.default_spawn_xyz,
+            anchor_depth,
+            bootstrap.default_spawn_depth,
+        );
+        let mut logical_path = position.anchor;
+        logical_path.truncate(anchor_depth - crate::app::RENDER_FRAME_K);
+        let frame = crate::app::App::frame_for_logical_path(&world.library, world.root, &logical_path);
+        let (yaw, pitch) = crate::app::harness::derive_view_angles(
+            &world,
+            position,
+            WorldPreset::PlainTest,
+            bootstrap.default_spawn_depth,
+            bootstrap.default_spawn_yaw,
+            bootstrap.default_spawn_pitch,
+            None,
+            None,
+        );
+        let camera = Camera {
+            position,
+            smoothed_up: [0.0, 1.0, 0.0],
+            yaw,
+            pitch,
+        };
+        let cam_world = position.to_world_xyz();
+        let ray_world = sdf::normalize(camera.forward());
+
+        let world_hit = crate::app::harness::center_world_raycast_hit(
+            &world,
+            position,
+            yaw,
+            pitch,
+            bootstrap.default_spawn_depth as u32,
+        );
+        let frame_hit = crate::app::harness::center_frame_raycast_hit(
+            &world,
+            &frame,
+            position,
+            yaw,
+            pitch,
+        );
+        let mut diagnostic = Vec::new();
+        let direct_ray_world = sdf::normalize(camera.forward());
+        let mut hit_depth_diagnostic = Vec::new();
+        for sample_depth in [0u8, 4, 8, 12, 16, 20, 24, 28, frame.render_path.depth()] {
+            let mut sample_path = position.anchor;
+            sample_path.truncate(sample_depth);
+            let sample_frame =
+                crate::app::App::frame_for_logical_path(&world.library, world.root, &sample_path);
+            let hit = crate::app::harness::center_frame_raycast_hit(
+                &world,
+                &sample_frame,
+                position,
+                yaw,
+                pitch,
+            );
+            diagnostic.push((sample_frame.render_path.depth(), hit));
+            if matches!(sample_frame.render_path.depth(), 8 | 12 | 31) {
+                let cam_local = position.in_frame(&sample_frame.render_path);
+                let (_, frame_size_world) =
+                    crate::app::frame_origin_size_world(&sample_frame.render_path);
+                let ray_dir = sdf::scale(
+                    direct_ray_world,
+                    crate::world::anchor::WORLD_SIZE / frame_size_world.max(1e-30),
+                );
+                let mut first_hit = None;
+                for total_depth in (1..=anchor_depth as u32 - 1).rev() {
+                    if cpu_raycast_in_frame(
+                        &world.library,
+                        world.root,
+                        sample_frame.render_path.as_slice(),
+                        cam_local,
+                        ray_dir,
+                        total_depth,
+                        anchor_depth as u32 - 1,
+                    )
+                    .is_some()
+                    {
+                        first_hit = Some(total_depth);
+                    }
+                }
+                hit_depth_diagnostic.push((sample_frame.render_path.depth(), first_hit));
+            }
+        }
+        let mut popped_origin = position.in_frame(&frame.render_path);
+        let mut popped_ray_dir = {
+            let (_, frame_size_world) = crate::app::frame_origin_size_world(&frame.render_path);
+            sdf::scale(
+                direct_ray_world,
+                crate::world::anchor::WORLD_SIZE / frame_size_world.max(1e-30),
+            )
+        };
+        let mut origin_diagnostic = Vec::new();
+        let mut sample_path = frame.render_path;
+        while sample_path.depth() > 0 {
+            let slot = sample_path.pop().unwrap() as usize;
+            let (sx, sy, sz) = slot_coords(slot);
+            popped_origin = [
+                sx as f32 + popped_origin[0] / 3.0,
+                sy as f32 + popped_origin[1] / 3.0,
+                sz as f32 + popped_origin[2] / 3.0,
+            ];
+            popped_ray_dir = [
+                popped_ray_dir[0] / 3.0,
+                popped_ray_dir[1] / 3.0,
+                popped_ray_dir[2] / 3.0,
+            ];
+            if matches!(sample_path.depth(), 8 | 12) {
+                let exact = position.in_frame(&sample_path);
+                let (_, frame_size_world) = crate::app::frame_origin_size_world(&sample_path);
+                let exact_ray_dir = sdf::scale(
+                    direct_ray_world,
+                    crate::world::anchor::WORLD_SIZE / frame_size_world.max(1e-30),
+                );
+                origin_diagnostic.push((
+                    sample_path.depth(),
+                    popped_origin,
+                    exact,
+                    popped_ray_dir,
+                    exact_ray_dir,
+                ));
+            }
+        }
+
+        assert!(
+            world_hit,
+            "harness-derived world raycast should hit ground from the default deep plain spawn; cam_world={cam_world:?} ray_world={ray_world:?}"
+        );
+        assert!(
+            frame_hit,
+            "frame-local raycast should match the harness-derived world hit; frame_path={:?} cam_world={cam_world:?} ray_world={ray_world:?} sampled_frame_hits={diagnostic:?} hit_depth_diagnostic={hit_depth_diagnostic:?} origin_diagnostic={origin_diagnostic:?}",
+            frame.render_path.as_slice(),
+        );
     }
 
     #[test]
@@ -1876,7 +2457,8 @@ mod tests {
             [1.5, 2.5, 1.5],
             [0.0, -1.0, 0.0],
             8,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(break_block(&mut world, &hit));
         assert_ne!(world.root, old_root, "Root should change after edit");
     }
@@ -1891,7 +2473,8 @@ mod tests {
             [1.5, 2.5, 1.5],
             [0.0, -1.0, 0.0],
             8,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(break_block(&mut world, &hit));
 
         // Now cast again — should hit the block below the one we removed.
@@ -1901,7 +2484,8 @@ mod tests {
             [1.5, 2.5, 1.5],
             [0.0, -1.0, 0.0],
             8,
-        ).unwrap();
+        )
+        .unwrap();
         let old_root = world.root;
         // Place on top of the newly exposed surface.
         assert!(place_block(&mut world, &hit2, block::BRICK));
@@ -2016,7 +2600,8 @@ mod tests {
         let hit = HitInfo {
             path: vec![(world.root, slot_index(1, 2, 1))],
             face: 2, // +Y
-            t: 1.0, place_path: None,
+            t: 1.0,
+            place_path: None,
         };
         assert!(
             !place_block(&mut world, &hit, block::BRICK),

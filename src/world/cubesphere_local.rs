@@ -1,4 +1,4 @@
-use super::cubesphere::{cube_to_ea, face_uv_to_dir, pick_face, Face};
+use super::cubesphere::{Face, cube_to_ea, face_uv_to_dir, pick_face};
 use super::sdf;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

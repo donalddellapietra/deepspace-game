@@ -11,19 +11,33 @@ use super::palette::block;
 pub type Vec3 = [f32; 3];
 
 #[inline]
-pub fn add(a: Vec3, b: Vec3) -> Vec3 { [a[0]+b[0], a[1]+b[1], a[2]+b[2]] }
+pub fn add(a: Vec3, b: Vec3) -> Vec3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
 #[inline]
-pub fn sub(a: Vec3, b: Vec3) -> Vec3 { [a[0]-b[0], a[1]-b[1], a[2]-b[2]] }
+pub fn sub(a: Vec3, b: Vec3) -> Vec3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
 #[inline]
-pub fn scale(a: Vec3, s: f32) -> Vec3 { [a[0]*s, a[1]*s, a[2]*s] }
+pub fn scale(a: Vec3, s: f32) -> Vec3 {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
 #[inline]
-pub fn dot(a: Vec3, b: Vec3) -> f32 { a[0]*b[0]+a[1]*b[1]+a[2]*b[2] }
+pub fn dot(a: Vec3, b: Vec3) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
 #[inline]
-pub fn length(a: Vec3) -> f32 { dot(a, a).sqrt() }
+pub fn length(a: Vec3) -> f32 {
+    dot(a, a).sqrt()
+}
 #[inline]
 pub fn normalize(a: Vec3) -> Vec3 {
     let l = length(a);
-    if l > 1e-12 { scale(a, 1.0/l) } else { [0.0, 1.0, 0.0] }
+    if l > 1e-12 {
+        scale(a, 1.0 / l)
+    } else {
+        [0.0, 1.0, 0.0]
+    }
 }
 
 /// Orthonormal basis in the plane perpendicular to `up`. Picks a
@@ -78,7 +92,9 @@ impl Planet {
     pub fn distance(&self, p: Vec3) -> f32 {
         let to = sub(p, self.center);
         let base = length(to) - self.radius;
-        if base > self.noise_scale * 1.25 { return base; }
+        if base > self.noise_scale * 1.25 {
+            return base;
+        }
         base - self.displacement(p)
     }
 
@@ -87,7 +103,11 @@ impl Planet {
     /// higher than valleys go down, like the Godot plugin's planet.
     pub fn displacement(&self, p: Vec3) -> f32 {
         let n = noise3d(scale(p, self.noise_freq), self.noise_seed);
-        if n < 0.0 { 0.5 * n * self.noise_scale } else { n * self.noise_scale }
+        if n < 0.0 {
+            0.5 * n * self.noise_scale
+        } else {
+            n * self.noise_scale
+        }
     }
 
     /// Block type at point p. Top of surface = surface block,
@@ -99,9 +119,13 @@ impl Planet {
         let under = self.radius - r;
         let grass_band = self.noise_scale * 0.15;
         let dirt_band = self.noise_scale * 0.6;
-        if under < grass_band { self.surface_block }
-        else if under < dirt_band { block::DIRT }
-        else { self.core_block }
+        if under < grass_band {
+            self.surface_block
+        } else if under < dirt_band {
+            block::DIRT
+        } else {
+            self.core_block
+        }
     }
 
     /// Gravity acceleration vector at p (world units / s²).
@@ -110,7 +134,9 @@ impl Planet {
     pub fn gravity_at(&self, p: Vec3) -> Vec3 {
         let to = sub(self.center, p);
         let r = length(to);
-        if r > self.influence_radius || r < 1e-8 { return [0.0, 0.0, 0.0]; }
+        if r > self.influence_radius || r < 1e-8 {
+            return [0.0, 0.0, 0.0];
+        }
         let up_to_center = scale(to, 1.0 / r);
         // Full gravity from surface outward to influence_radius, ramps down.
         let t = if r < self.radius {
@@ -126,7 +152,11 @@ impl Planet {
     pub fn up_at(&self, p: Vec3) -> Vec3 {
         let to = sub(p, self.center);
         let l = length(to);
-        if l > 1e-8 { scale(to, 1.0 / l) } else { [0.0, 1.0, 0.0] }
+        if l > 1e-8 {
+            scale(to, 1.0 / l)
+        } else {
+            [0.0, 1.0, 0.0]
+        }
     }
 }
 
@@ -146,14 +176,14 @@ pub fn noise3d(p: Vec3, seed: u32) -> f32 {
 
     let h = |ix: i32, iy: i32, iz: i32| -> f32 { hash_lattice(ix, iy, iz, seed) };
 
-    let c000 = h(xi,   yi,   zi);
-    let c100 = h(xi+1, yi,   zi);
-    let c010 = h(xi,   yi+1, zi);
-    let c110 = h(xi+1, yi+1, zi);
-    let c001 = h(xi,   yi,   zi+1);
-    let c101 = h(xi+1, yi,   zi+1);
-    let c011 = h(xi,   yi+1, zi+1);
-    let c111 = h(xi+1, yi+1, zi+1);
+    let c000 = h(xi, yi, zi);
+    let c100 = h(xi + 1, yi, zi);
+    let c010 = h(xi, yi + 1, zi);
+    let c110 = h(xi + 1, yi + 1, zi);
+    let c001 = h(xi, yi, zi + 1);
+    let c101 = h(xi + 1, yi, zi + 1);
+    let c011 = h(xi, yi + 1, zi + 1);
+    let c111 = h(xi + 1, yi + 1, zi + 1);
 
     let x00 = lerp(c000, c100, ux);
     let x10 = lerp(c010, c110, ux);
@@ -168,8 +198,12 @@ fn floor_frac(x: f32) -> (i32, f32) {
     let f = x.floor();
     (f as i32, x - f)
 }
-fn smoothstep(t: f32) -> f32 { t * t * (3.0 - 2.0 * t) }
-fn lerp(a: f32, b: f32, t: f32) -> f32 { a + (b - a) * t }
+fn smoothstep(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
 
 fn hash_lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
     let mut h = seed;
@@ -227,7 +261,11 @@ mod tests {
     fn sdf_early_exit_matches_base() {
         // Well outside noise influence, distance should equal base.
         let p = test_planet();
-        let q = [p.center[0] + p.radius + p.noise_scale * 3.0, p.center[1], p.center[2]];
+        let q = [
+            p.center[0] + p.radius + p.noise_scale * 3.0,
+            p.center[1],
+            p.center[2],
+        ];
         let base = length(sub(q, p.center)) - p.radius;
         assert!((p.distance(q) - base).abs() < 1e-5);
     }
@@ -245,7 +283,11 @@ mod tests {
     #[test]
     fn gravity_zero_far_away() {
         let p = test_planet();
-        let q = [p.center[0] + p.influence_radius + 1.0, p.center[1], p.center[2]];
+        let q = [
+            p.center[0] + p.influence_radius + 1.0,
+            p.center[1],
+            p.center[2],
+        ];
         let g = p.gravity_at(q);
         assert_eq!(g, [0.0, 0.0, 0.0]);
     }

@@ -5,7 +5,7 @@
 //! world tree or camera — those stay in `App`.
 
 use crate::bridge::*;
-use crate::world::palette::{self, block, ColorRegistry};
+use crate::world::palette::{self, ColorRegistry, block};
 use crate::world::tree::NodeId;
 
 // ── Hotbar slot ──────────────────────────────────────────────────
@@ -116,7 +116,9 @@ impl GameUiState {
 
         match cmd {
             UiCommand::SelectHotbarSlot { slot } => {
-                if slot < 10 { self.active_slot = slot; }
+                if slot < 10 {
+                    self.active_slot = slot;
+                }
             }
             UiCommand::AssignBlockToSlot { voxel } => {
                 self.slots[self.active_slot] = HotbarItem::Block(voxel);
@@ -140,11 +142,15 @@ impl GameUiState {
             }
             UiCommand::ToggleInventory => {
                 self.inventory_open = !self.inventory_open;
-                if self.inventory_open { self.color_picker_open = false; }
+                if self.inventory_open {
+                    self.color_picker_open = false;
+                }
             }
             UiCommand::ToggleColorPicker => {
                 self.color_picker_open = !self.color_picker_open;
-                if self.color_picker_open { self.inventory_open = false; }
+                if self.color_picker_open {
+                    self.inventory_open = false;
+                }
             }
             UiCommand::CloseAllPanels => {
                 self.inventory_open = false;
@@ -162,29 +168,55 @@ impl GameUiState {
     /// Handle a key press. Returns true if panel state changed.
     pub fn handle_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) -> bool {
         use winit::keyboard::KeyCode;
-        if !pressed { return false; }
+        if !pressed {
+            return false;
+        }
 
         let panels_were_open = self.any_panel_open();
 
         match code {
             KeyCode::KeyE => {
                 self.inventory_open = !self.inventory_open;
-                if self.inventory_open { self.color_picker_open = false; }
+                if self.inventory_open {
+                    self.color_picker_open = false;
+                }
             }
             KeyCode::KeyC => {
                 self.color_picker_open = !self.color_picker_open;
-                if self.color_picker_open { self.inventory_open = false; }
+                if self.color_picker_open {
+                    self.inventory_open = false;
+                }
             }
-            KeyCode::Digit1 => { self.active_slot = 0; }
-            KeyCode::Digit2 => { self.active_slot = 1; }
-            KeyCode::Digit3 => { self.active_slot = 2; }
-            KeyCode::Digit4 => { self.active_slot = 3; }
-            KeyCode::Digit5 => { self.active_slot = 4; }
-            KeyCode::Digit6 => { self.active_slot = 5; }
-            KeyCode::Digit7 => { self.active_slot = 6; }
-            KeyCode::Digit8 => { self.active_slot = 7; }
-            KeyCode::Digit9 => { self.active_slot = 8; }
-            KeyCode::Digit0 => { self.active_slot = 9; }
+            KeyCode::Digit1 => {
+                self.active_slot = 0;
+            }
+            KeyCode::Digit2 => {
+                self.active_slot = 1;
+            }
+            KeyCode::Digit3 => {
+                self.active_slot = 2;
+            }
+            KeyCode::Digit4 => {
+                self.active_slot = 3;
+            }
+            KeyCode::Digit5 => {
+                self.active_slot = 4;
+            }
+            KeyCode::Digit6 => {
+                self.active_slot = 5;
+            }
+            KeyCode::Digit7 => {
+                self.active_slot = 6;
+            }
+            KeyCode::Digit8 => {
+                self.active_slot = 7;
+            }
+            KeyCode::Digit9 => {
+                self.active_slot = 8;
+            }
+            KeyCode::Digit0 => {
+                self.active_slot = 9;
+            }
             _ => {}
         }
 
@@ -198,26 +230,29 @@ impl GameUiState {
         let layer = self.zoom_level.max(0) as u8;
 
         // Hotbar
-        let slots: Vec<SlotInfo> = self.slots.iter().map(|item| {
-            match item {
-                HotbarItem::Block(voxel) => {
-                    SlotInfo {
-                        kind: "block",
-                        index: *voxel as u32,
-                        name: registry.name(*voxel).to_string(),
-                        color: registry.color(*voxel),
-                    }
-                }
+        let slots: Vec<SlotInfo> = self
+            .slots
+            .iter()
+            .map(|item| match item {
+                HotbarItem::Block(voxel) => SlotInfo {
+                    kind: "block",
+                    index: *voxel as u32,
+                    name: registry.name(*voxel).to_string(),
+                    color: registry.color(*voxel),
+                },
                 HotbarItem::Mesh(idx) => SlotInfo {
-                    kind: "model", index: *idx as u32,
+                    kind: "model",
+                    index: *idx as u32,
                     name: format!("Mesh #{}", idx),
                     color: [0.20, 0.85, 0.75, 0.7],
                 },
-            }
-        }).collect();
+            })
+            .collect();
 
         let hotbar = HotbarState {
-            active: self.active_slot, slots, layer,
+            active: self.active_slot,
+            slots,
+            layer,
         };
         if self.last_hotbar_sent.as_ref() != Some(&hotbar) {
             overlay::push_state(&GameStateUpdate::Hotbar(hotbar.clone()));
@@ -225,17 +260,32 @@ impl GameUiState {
         }
 
         // Inventory: builtin blocks from the palette
-        let builtin_blocks: Vec<BlockInfo> = palette::BUILTINS.iter().map(|&(idx, name, color)| {
-            BlockInfo { voxel: idx, name: name.to_string(), color }
-        }).collect();
+        let builtin_blocks: Vec<BlockInfo> = palette::BUILTINS
+            .iter()
+            .map(|&(idx, name, color)| BlockInfo {
+                voxel: idx,
+                name: name.to_string(),
+                color,
+            })
+            .collect();
 
-        let custom_blocks: Vec<BlockInfo> = self.custom_blocks.iter().enumerate().map(|(i, cb)| {
-            BlockInfo { voxel: block::BUILTIN_COUNT + i as u8, name: cb.name.clone(), color: cb.color }
-        }).collect();
+        let custom_blocks: Vec<BlockInfo> = self
+            .custom_blocks
+            .iter()
+            .enumerate()
+            .map(|(i, cb)| BlockInfo {
+                voxel: block::BUILTIN_COUNT + i as u8,
+                name: cb.name.clone(),
+                color: cb.color,
+            })
+            .collect();
 
         let inventory = InventoryStateJs {
-            open: self.inventory_open, builtin_blocks, custom_blocks,
-            saved_meshes: Vec::new(), layer,
+            open: self.inventory_open,
+            builtin_blocks,
+            custom_blocks,
+            saved_meshes: Vec::new(),
+            layer,
         };
         if self.last_inventory_sent.as_ref() != Some(&inventory) {
             overlay::push_state(&GameStateUpdate::Inventory(inventory.clone()));
@@ -244,7 +294,10 @@ impl GameUiState {
 
         // Color picker
         let color_picker = ColorPickerStateJs {
-            open: self.color_picker_open, r: self.picker_r, g: self.picker_g, b: self.picker_b,
+            open: self.color_picker_open,
+            r: self.picker_r,
+            g: self.picker_g,
+            b: self.picker_b,
         };
         if self.last_color_picker_sent.as_ref() != Some(&color_picker) {
             overlay::push_state(&GameStateUpdate::ColorPicker(color_picker.clone()));
@@ -253,7 +306,10 @@ impl GameUiState {
 
         // Mode indicator
         let mode_indicator = ModeIndicatorStateJs {
-            layer, save_mode: false, save_eligible: false, entity_edit_mode: false,
+            layer,
+            save_mode: false,
+            save_eligible: false,
+            entity_edit_mode: false,
         };
         if self.last_mode_indicator_sent.as_ref() != Some(&mode_indicator) {
             overlay::push_state(&GameStateUpdate::ModeIndicator(mode_indicator.clone()));

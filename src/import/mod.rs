@@ -3,8 +3,8 @@
 //! Converts external voxel formats (`.vox`) into the base-3 tree.
 //! The pipeline: parse → color map → tree build → NodeId ready to place.
 
-pub mod vox;
 pub mod tree_builder;
+pub mod vox;
 
 /// A parsed voxel model: flat 3D grid of palette indices.
 /// 0 = empty/air, 1-255 = palette index from `ColorRegistry`.

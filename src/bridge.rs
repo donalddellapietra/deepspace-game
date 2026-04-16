@@ -110,16 +110,28 @@ pub enum GameStateUpdate {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 pub enum UiCommand {
-    SelectHotbarSlot { slot: usize },
-    AssignBlockToSlot { voxel: u8 },
+    SelectHotbarSlot {
+        slot: usize,
+    },
+    AssignBlockToSlot {
+        voxel: u8,
+    },
     #[serde(rename_all = "camelCase")]
-    AssignMeshToSlot { mesh_index: usize },
-    SetColorPickerRgb { r: f32, g: f32, b: f32 },
+    AssignMeshToSlot {
+        mesh_index: usize,
+    },
+    SetColorPickerRgb {
+        r: f32,
+        g: f32,
+        b: f32,
+    },
     CreateBlock,
     ToggleInventory,
     ToggleColorPicker,
     CloseAllPanels,
-    UiFocused { focused: bool },
+    UiFocused {
+        focused: bool,
+    },
     PointerLockLost,
     SaveGame,
     LoadGame,

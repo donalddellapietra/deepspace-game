@@ -18,8 +18,12 @@ impl WorldState {
     }
 
     fn depth_of(&self, id: NodeId, cache: &mut std::collections::HashMap<NodeId, u32>) -> u32 {
-        if let Some(&d) = cache.get(&id) { return d; }
-        let Some(node) = self.library.get(id) else { return 0 };
+        if let Some(&d) = cache.get(&id) {
+            return d;
+        }
+        let Some(node) = self.library.get(id) else {
+            return 0;
+        };
         let mut max_child_depth = 0u32;
         for child in &node.children {
             if let Child::Node(child_id) = child {
@@ -32,7 +36,9 @@ impl WorldState {
     }
 
     pub fn swap_root(&mut self, new_root: NodeId) {
-        if new_root == self.root { return; }
+        if new_root == self.root {
+            return;
+        }
         self.library.ref_inc(new_root);
         let old = self.root;
         self.root = new_root;

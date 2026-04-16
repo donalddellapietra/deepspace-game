@@ -5,8 +5,8 @@
 //! addressed dedup in `NodeLibrary` collapses identical subtrees
 //! automatically.
 
-use crate::world::tree::*;
 use super::VoxelModel;
+use crate::world::tree::*;
 
 /// Build a base-3 tree from a voxel model. Returns the root `NodeId`.
 ///
@@ -51,12 +51,8 @@ fn build_node(
         for z in 0..BRANCH {
             for y in 0..BRANCH {
                 for x in 0..BRANCH {
-                    children[slot_index(x, y, z)] = leaf_child(
-                        model,
-                        origin_x + x,
-                        origin_y + y,
-                        origin_z + z,
-                    );
+                    children[slot_index(x, y, z)] =
+                        leaf_child(model, origin_x + x, origin_y + y, origin_z + z);
                 }
             }
         }
@@ -67,7 +63,8 @@ fn build_node(
             for y in 0..BRANCH {
                 for x in 0..BRANCH {
                     children[slot_index(x, y, z)] = build_node(
-                        model, library,
+                        model,
+                        library,
                         origin_x + x * cell_size,
                         origin_y + y * cell_size,
                         origin_z + z * cell_size,
@@ -92,7 +89,11 @@ fn build_node(
 fn leaf_child(model: &VoxelModel, x: usize, y: usize, z: usize) -> Child {
     if x < model.size_x && y < model.size_y && z < model.size_z {
         let v = model.get(x, y, z);
-        if v == 0 { Child::Empty } else { Child::Block(v) }
+        if v == 0 {
+            Child::Empty
+        } else {
+            Child::Block(v)
+        }
     } else {
         Child::Empty
     }
@@ -116,7 +117,9 @@ mod tests {
     #[test]
     fn uniform_3x3x3() {
         let model = VoxelModel {
-            size_x: 3, size_y: 3, size_z: 3,
+            size_x: 3,
+            size_y: 3,
+            size_z: 3,
             data: vec![block::STONE; 27],
         };
         let mut lib = NodeLibrary::default();
@@ -124,14 +127,20 @@ mod tests {
         // Uniform → collapsed to one node with 27 Block children.
         assert_eq!(lib.len(), 1);
         let node = lib.get(root).unwrap();
-        assert!(node.children.iter().all(|c| *c == Child::Block(block::STONE)));
+        assert!(
+            node.children
+                .iter()
+                .all(|c| *c == Child::Block(block::STONE))
+        );
     }
 
     /// A fully empty model produces a single all-empty node.
     #[test]
     fn empty_model() {
         let model = VoxelModel {
-            size_x: 3, size_y: 3, size_z: 3,
+            size_x: 3,
+            size_y: 3,
+            size_z: 3,
             data: vec![0; 27],
         };
         let mut lib = NodeLibrary::default();
@@ -146,7 +155,12 @@ mod tests {
     fn padding() {
         let mut data = vec![0u8; 4 * 4 * 4];
         data[0] = block::STONE; // one non-empty voxel
-        let model = VoxelModel { size_x: 4, size_y: 4, size_z: 4, data };
+        let model = VoxelModel {
+            size_x: 4,
+            size_y: 4,
+            size_z: 4,
+            data,
+        };
         let mut lib = NodeLibrary::default();
         let _root = build_tree(&model, &mut lib);
         // Should have created some nodes (not everything collapsed).
@@ -159,15 +173,28 @@ mod tests {
         // 9x9x9 model: two 3x3x3 quadrants of stone, rest empty.
         let mut data = vec![0u8; 9 * 9 * 9];
         // Fill (0,0,0)-(2,2,2) with stone.
-        for z in 0..3 { for y in 0..3 { for x in 0..3 {
-            data[(z * 9 + y) * 9 + x] = block::STONE;
-        }}}
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    data[(z * 9 + y) * 9 + x] = block::STONE;
+                }
+            }
+        }
         // Fill (3,0,0)-(5,2,2) with stone (identical subtree).
-        for z in 0..3 { for y in 0..3 { for x in 3..6 {
-            data[(z * 9 + y) * 9 + x] = block::STONE;
-        }}}
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 3..6 {
+                    data[(z * 9 + y) * 9 + x] = block::STONE;
+                }
+            }
+        }
 
-        let model = VoxelModel { size_x: 9, size_y: 9, size_z: 9, data };
+        let model = VoxelModel {
+            size_x: 9,
+            size_y: 9,
+            size_z: 9,
+            data,
+        };
         let mut lib = NodeLibrary::default();
         let _root = build_tree(&model, &mut lib);
         // The two stone 3x3x3 cubes should share a NodeId via dedup.
@@ -181,14 +208,25 @@ mod tests {
         let mut data = vec![0u8; 27];
         data[0] = block::STONE;
         data[13] = block::GRASS; // center: (1,1,1)
-        let model = VoxelModel { size_x: 3, size_y: 3, size_z: 3, data };
+        let model = VoxelModel {
+            size_x: 3,
+            size_y: 3,
+            size_z: 3,
+            data,
+        };
         let mut lib = NodeLibrary::default();
         let root = build_tree(&model, &mut lib);
 
         // Walk the tree to check specific voxels.
         let node = lib.get(root).unwrap();
-        assert_eq!(node.children[slot_index(0, 0, 0)], Child::Block(block::STONE));
-        assert_eq!(node.children[slot_index(1, 1, 1)], Child::Block(block::GRASS));
+        assert_eq!(
+            node.children[slot_index(0, 0, 0)],
+            Child::Block(block::STONE)
+        );
+        assert_eq!(
+            node.children[slot_index(1, 1, 1)],
+            Child::Block(block::GRASS)
+        );
         assert_eq!(node.children[slot_index(2, 2, 2)], Child::Empty);
     }
 }

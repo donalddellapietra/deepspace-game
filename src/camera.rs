@@ -57,10 +57,7 @@ impl Camera {
         let horiz_fwd = sdf::sub(sdf::scale(t_fwd, cy), sdf::scale(t_right, sy));
         let horiz_right = sdf::add(sdf::scale(t_right, cy), sdf::scale(t_fwd, sy));
         let (sp, cp) = self.pitch.sin_cos();
-        let fwd = sdf::normalize(sdf::add(
-            sdf::scale(horiz_fwd, cp),
-            sdf::scale(ref_up, sp),
-        ));
+        let fwd = sdf::normalize(sdf::add(sdf::scale(horiz_fwd, cp), sdf::scale(ref_up, sp)));
         let up = [
             horiz_right[1] * fwd[2] - horiz_right[2] * fwd[1],
             horiz_right[2] * fwd[0] - horiz_right[0] * fwd[2],
@@ -69,7 +66,9 @@ impl Camera {
         (fwd, horiz_right, sdf::normalize(up))
     }
 
-    pub fn forward(&self) -> [f32; 3] { self.basis().0 }
+    pub fn forward(&self) -> [f32; 3] {
+        self.basis().0
+    }
 
     /// Build a `GpuCamera` with an explicit position. Used by the
     /// render-frame pipeline: position is the camera's frame-local

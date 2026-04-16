@@ -16,18 +16,15 @@ use std::collections::{HashMap, HashSet};
 
 use crate::world::anchor::{Path, WorldPos};
 use crate::world::tree::{
-    slot_coords, Child, NodeId, NodeKind, NodeLibrary,
-    CHILDREN_PER_NODE, UNIFORM_EMPTY, UNIFORM_MIXED,
+    CHILDREN_PER_NODE, Child, NodeId, NodeKind, NodeLibrary, UNIFORM_EMPTY, UNIFORM_MIXED,
+    slot_coords,
 };
 
-use super::types::{GpuChild, GpuNodeKind, GPU_NODE_SIZE};
+use super::types::{GPU_NODE_SIZE, GpuChild, GpuNodeKind};
 
 /// Pack the visible portion of the tree into flat GPU buffers.
 /// Returns `(tree_data, node_kinds, root_buffer_index)`.
-pub fn pack_tree(
-    library: &NodeLibrary,
-    root: NodeId,
-) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
+pub fn pack_tree(library: &NodeLibrary, root: NodeId) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
     let mut ordered: Vec<NodeId> = Vec::new();
     let mut head = 0usize;
@@ -56,8 +53,18 @@ pub fn pack_tree(
         kinds.push(GpuNodeKind::from_node_kind(node.kind));
         for child in &node.children {
             data.push(match child {
-                Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
-                Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
+                Child::Empty => GpuChild {
+                    tag: 0,
+                    block_type: 0,
+                    _pad: 0,
+                    node_index: 0,
+                },
+                Child::Block(bt) => GpuChild {
+                    tag: 1,
+                    block_type: *bt,
+                    _pad: 0,
+                    node_index: 0,
+                },
                 Child::Node(child_id) => {
                     let repr = library
                         .get(*child_id)
@@ -163,7 +170,9 @@ pub fn pack_tree_lod_selective(
         let mut current = root;
         for &slot in *preserve_path {
             preserve_pairs.insert((current, slot));
-            let Some(node) = library.get(current) else { break };
+            let Some(node) = library.get(current) else {
+                break;
+            };
             match node.children[slot as usize] {
                 Child::Node(child_id) => current = child_id,
                 _ => break,
@@ -193,7 +202,10 @@ pub fn pack_tree_lod_selective(
     visited.insert(root, 0);
     ordered.push(root);
     overrides.push([None; CHILDREN_PER_NODE]);
-    queue.push(QueueEntry { node_id: root, path: Path::root() });
+    queue.push(QueueEntry {
+        node_id: root,
+        path: Path::root(),
+    });
 
     let mut head = 0usize;
     while head < queue.len() {
@@ -203,12 +215,18 @@ pub fn pack_tree_lod_selective(
         let ordered_idx = head;
         head += 1;
 
-        let Some(node) = library.get(node_id) else { continue };
+        let Some(node) = library.get(node_id) else {
+            continue;
+        };
         let lod_active = matches!(node.kind, NodeKind::Cartesian);
 
         for (slot, child) in node.children.iter().enumerate() {
-            let Child::Node(child_id) = child else { continue };
-            let Some(child_node) = library.get(*child_id) else { continue };
+            let Child::Node(child_id) = child else {
+                continue;
+            };
+            let Some(child_node) = library.get(*child_id) else {
+                continue;
+            };
 
             let mut child_path = node_path;
             child_path.push(slot as u8);
@@ -216,11 +234,18 @@ pub fn pack_tree_lod_selective(
                 || in_preserve_region(&child_path, &preserve_regions);
             let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
 
-            if !on_preserve && lod_active && child_is_cartesian
+            if !on_preserve
+                && lod_active
+                && child_is_cartesian
                 && child_node.uniform_type != UNIFORM_MIXED
             {
                 overrides[ordered_idx][slot] = Some(if child_node.uniform_type == UNIFORM_EMPTY {
-                    GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
+                    GpuChild {
+                        tag: 0,
+                        block_type: 0,
+                        _pad: 0,
+                        node_index: 0,
+                    }
                 } else {
                     GpuChild {
                         tag: 1,
@@ -244,7 +269,12 @@ pub fn pack_tree_lod_selective(
                             node_index: 0,
                         }
                     } else {
-                        GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }
+                        GpuChild {
+                            tag: 0,
+                            block_type: 0,
+                            _pad: 0,
+                            node_index: 0,
+                        }
                     });
                     continue;
                 }
@@ -266,7 +296,9 @@ pub fn pack_tree_lod_selective(
     let mut data: Vec<GpuChild> = Vec::with_capacity(ordered.len() * GPU_NODE_SIZE);
     let mut kinds: Vec<GpuNodeKind> = Vec::with_capacity(ordered.len());
     for (ordered_idx, &node_id) in ordered.iter().enumerate() {
-        let node = library.get(node_id).expect("node in ordered list must exist");
+        let node = library
+            .get(node_id)
+            .expect("node in ordered list must exist");
         kinds.push(GpuNodeKind::from_node_kind(node.kind));
         for (slot, child) in node.children.iter().enumerate() {
             if let Some(gpu) = overrides[ordered_idx][slot] {
@@ -274,15 +306,30 @@ pub fn pack_tree_lod_selective(
                 continue;
             }
             data.push(match child {
-                Child::Empty => GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 },
-                Child::Block(bt) => GpuChild { tag: 1, block_type: *bt, _pad: 0, node_index: 0 },
+                Child::Empty => GpuChild {
+                    tag: 0,
+                    block_type: 0,
+                    _pad: 0,
+                    node_index: 0,
+                },
+                Child::Block(bt) => GpuChild {
+                    tag: 1,
+                    block_type: *bt,
+                    _pad: 0,
+                    node_index: 0,
+                },
                 Child::Node(child_id) => {
                     let repr = library
                         .get(*child_id)
                         .map(|n| n.representative_block)
                         .unwrap_or(0);
                     let idx = visited.get(child_id).copied().unwrap_or(0);
-                    GpuChild { tag: 2, block_type: repr, _pad: 0, node_index: idx }
+                    GpuChild {
+                        tag: 2,
+                        block_type: repr,
+                        _pad: 0,
+                        node_index: idx,
+                    }
                 }
             });
         }
@@ -297,7 +344,7 @@ mod tests {
     use super::*;
     use crate::world::anchor::WorldPos;
     use crate::world::bootstrap::plain_test_world;
-    use crate::world::tree::{empty_children, uniform_children, CENTER_SLOT};
+    use crate::world::tree::{CENTER_SLOT, empty_children, uniform_children};
 
     #[test]
     fn pack_test_world() {
@@ -318,7 +365,10 @@ mod tests {
         let mut root_children = uniform_children(Child::Node(leaf_air));
         let body_id = lib.insert_with_kind(
             empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.12,
+                outer_r: 0.45,
+            },
         );
         root_children[CENTER_SLOT] = Child::Node(body_id);
         let root = lib.insert(root_children);
@@ -334,10 +384,12 @@ mod tests {
     fn pack_includes_body_kind_and_radii() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (_data, kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
-        let body = kinds.iter().find(|kind| kind.kind == 1).expect("body kind in buffer");
+        let (_data, kinds, _root_idx) =
+            pack_tree_lod(&world.library, world.root, &camera, 1080.0, 1.2);
+        let body = kinds
+            .iter()
+            .find(|kind| kind.kind == 1)
+            .expect("body kind in buffer");
         assert!((body.inner_r - 0.12).abs() < 1e-6);
         assert!((body.outer_r - 0.45).abs() < 1e-6);
     }
@@ -346,9 +398,8 @@ mod tests {
     fn pack_lod_flattens_far_uniform_cartesian() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
+        let (data, _kinds, _root_idx) =
+            pack_tree_lod(&world.library, world.root, &camera, 1080.0, 1.2);
         assert_eq!(data[0].tag, 0);
         assert_eq!(data[13].tag, 2);
         assert!(data[13].node_index > 0);
@@ -358,9 +409,8 @@ mod tests {
     fn pack_planet_body_present() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (_data, kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
+        let (_data, kinds, _root_idx) =
+            pack_tree_lod(&world.library, world.root, &camera, 1080.0, 1.2);
         assert!(kinds.iter().any(|kind| kind.kind == 1), "body kind present");
     }
 
@@ -372,15 +422,11 @@ mod tests {
         lib.ref_inc(root);
         let camera = camera_at([1.5, 2.0, 1.5]);
 
-        let (no_preserve, _, _) = pack_tree_lod(
-            &lib, root, &camera, 1080.0, 1.2,
-        );
+        let (no_preserve, _, _) = pack_tree_lod(&lib, root, &camera, 1080.0, 1.2);
         assert_eq!(no_preserve[16].tag, 0);
 
-        let (with_preserve, _, _) = pack_tree_lod_preserving(
-            &lib, root, &camera, 1080.0, 1.2,
-            &[&[16u8]],
-        );
+        let (with_preserve, _, _) =
+            pack_tree_lod_preserving(&lib, root, &camera, 1080.0, 1.2, &[&[16u8]]);
         assert_eq!(with_preserve[16].tag, 2);
         assert!(with_preserve[16].node_index > 0);
     }
@@ -399,10 +445,8 @@ mod tests {
         let camera = camera_at([1.5, 1.5, 1.5]);
         let path = [13u8; 9];
 
-        let (data, _kinds, _root_idx) = pack_tree_lod_preserving(
-            &lib, root, &camera, 1080.0, 1.2,
-            &[&path],
-        );
+        let (data, _kinds, _root_idx) =
+            pack_tree_lod_preserving(&lib, root, &camera, 1080.0, 1.2, &[&path]);
         let ribbon = build_ribbon(&data, &path);
         assert_eq!(ribbon.reached_slots.len(), 9);
         assert_eq!(ribbon.ribbon.len(), 9);
@@ -416,13 +460,13 @@ mod tests {
         lib.ref_inc(root);
         let camera = camera_at([1.5, 2.0, 1.5]);
 
-        let (data, _, _) = pack_tree_lod_preserving(
-            &lib, root, &camera, 1080.0, 1.2,
-            &[&[16u8]],
-        );
+        let (data, _, _) = pack_tree_lod_preserving(&lib, root, &camera, 1080.0, 1.2, &[&[16u8]]);
         assert_eq!(data[16].tag, 2);
         for sibling in [0, 5, 13, 26] {
-            assert_eq!(data[sibling].tag, 0, "sibling slot {sibling} should be flattened");
+            assert_eq!(
+                data[sibling].tag, 0,
+                "sibling slot {sibling} should be flattened"
+            );
         }
     }
 
@@ -439,9 +483,7 @@ mod tests {
         lib.ref_inc(root);
 
         let camera = camera_at([1.5, 1.5, 1.6]);
-        let (data, _kinds, _root_idx) = pack_tree_lod(
-            &lib, root, &camera, 1080.0, 1.2,
-        );
+        let (data, _kinds, _root_idx) = pack_tree_lod(&lib, root, &camera, 1080.0, 1.2);
         assert_eq!(data[CENTER_SLOT].tag, 2);
     }
 }

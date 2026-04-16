@@ -2,7 +2,7 @@
 
 use winit::event_loop::EventLoop;
 
-use deepspace_game::app::{test_runner, App, TestConfig};
+use deepspace_game::app::{App, TestConfig, test_runner};
 
 fn main() {
     env_logger::init();

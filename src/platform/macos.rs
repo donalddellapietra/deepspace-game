@@ -27,13 +27,19 @@ use winit::window::Window;
 /// Make the `NSWindow` key and set its content view as first
 /// responder. Call once at window creation.
 pub fn prepare_window(window: &Window) {
-    let Ok(handle) = window.window_handle() else { return; };
-    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return; };
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
     // SAFETY: The pointers come from winit's live window and are
     // valid for the duration of this call.
     unsafe {
         let ns_view = appkit.ns_view.as_ptr() as *mut NSView;
-        let Some(ns_window) = (*ns_view).window() else { return; };
+        let Some(ns_window) = (*ns_view).window() else {
+            return;
+        };
         ns_window.makeKeyAndOrderFront(None);
         ns_window.makeFirstResponder(Some(&*ns_view));
     }
@@ -54,13 +60,19 @@ pub fn after_overlay_created(window: &Window) {
 /// the responder half of the handshake is needed (e.g. on each
 /// cursor-lock transition) without reordering the window.
 pub fn refocus_content_view(window: &Window) {
-    let Ok(handle) = window.window_handle() else { return; };
-    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return; };
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
     // SAFETY: The pointers come from winit's live window and are
     // valid for the duration of this call.
     unsafe {
         let ns_view = appkit.ns_view.as_ptr() as *mut NSView;
-        let Some(ns_window) = (*ns_view).window() else { return; };
+        let Some(ns_window) = (*ns_view).window() else {
+            return;
+        };
         ns_window.makeFirstResponder(Some(&*ns_view));
     }
 }

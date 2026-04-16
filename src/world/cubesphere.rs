@@ -26,7 +26,7 @@
 
 use super::sdf::{self, Planet, Vec3};
 use super::tree::{
-    empty_children, slot_index, uniform_children, Child, NodeId, NodeKind, NodeLibrary,
+    Child, NodeId, NodeKind, NodeLibrary, empty_children, slot_index, uniform_children,
 };
 
 /// One of the six cube faces.
@@ -42,39 +42,45 @@ pub enum Face {
 
 impl Face {
     pub const ALL: [Face; 6] = [
-        Face::PosX, Face::NegX,
-        Face::PosY, Face::NegY,
-        Face::PosZ, Face::NegZ,
+        Face::PosX,
+        Face::NegX,
+        Face::PosY,
+        Face::NegY,
+        Face::PosZ,
+        Face::NegZ,
     ];
 
     pub fn from_index(i: u8) -> Face {
         match i {
-            0 => Face::PosX, 1 => Face::NegX,
-            2 => Face::PosY, 3 => Face::NegY,
-            4 => Face::PosZ, 5 => Face::NegZ,
+            0 => Face::PosX,
+            1 => Face::NegX,
+            2 => Face::PosY,
+            3 => Face::NegY,
+            4 => Face::PosZ,
+            5 => Face::NegZ,
             _ => panic!("invalid face index {i}"),
         }
     }
 
     pub fn normal(self) -> Vec3 {
         match self {
-            Face::PosX => [ 1.0,  0.0,  0.0],
-            Face::NegX => [-1.0,  0.0,  0.0],
-            Face::PosY => [ 0.0,  1.0,  0.0],
-            Face::NegY => [ 0.0, -1.0,  0.0],
-            Face::PosZ => [ 0.0,  0.0,  1.0],
-            Face::NegZ => [ 0.0,  0.0, -1.0],
+            Face::PosX => [1.0, 0.0, 0.0],
+            Face::NegX => [-1.0, 0.0, 0.0],
+            Face::PosY => [0.0, 1.0, 0.0],
+            Face::NegY => [0.0, -1.0, 0.0],
+            Face::PosZ => [0.0, 0.0, 1.0],
+            Face::NegZ => [0.0, 0.0, -1.0],
         }
     }
 
     pub fn tangents(self) -> (Vec3, Vec3) {
         match self {
-            Face::PosX => ([ 0.0,  0.0, -1.0], [ 0.0,  1.0,  0.0]),
-            Face::NegX => ([ 0.0,  0.0,  1.0], [ 0.0,  1.0,  0.0]),
-            Face::PosY => ([ 1.0,  0.0,  0.0], [ 0.0,  0.0, -1.0]),
-            Face::NegY => ([ 1.0,  0.0,  0.0], [ 0.0,  0.0,  1.0]),
-            Face::PosZ => ([ 1.0,  0.0,  0.0], [ 0.0,  1.0,  0.0]),
-            Face::NegZ => ([-1.0,  0.0,  0.0], [ 0.0,  1.0,  0.0]),
+            Face::PosX => ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+            Face::NegX => ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+            Face::PosY => ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+            Face::NegY => ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            Face::PosZ => ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            Face::NegZ => ([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
         }
     }
 }
@@ -150,25 +156,39 @@ pub fn coord_to_world(center: Vec3, c: CubeSphereCoord) -> Vec3 {
 pub fn world_to_coord(center: Vec3, pos: Vec3) -> Option<CubeSphereCoord> {
     let d = sdf::sub(pos, center);
     let r = sdf::length(d);
-    if r < 1e-12 { return None; }
+    if r < 1e-12 {
+        return None;
+    }
     let dir = sdf::scale(d, 1.0 / r);
 
     let ax = dir[0].abs();
     let ay = dir[1].abs();
     let az = dir[2].abs();
     let (face, cube_u, cube_v) = if ax >= ay && ax >= az {
-        if dir[0] > 0.0 { (Face::PosX, -dir[2] / ax,  dir[1] / ax) }
-        else            { (Face::NegX,  dir[2] / ax,  dir[1] / ax) }
+        if dir[0] > 0.0 {
+            (Face::PosX, -dir[2] / ax, dir[1] / ax)
+        } else {
+            (Face::NegX, dir[2] / ax, dir[1] / ax)
+        }
     } else if ay >= az {
-        if dir[1] > 0.0 { (Face::PosY,  dir[0] / ay, -dir[2] / ay) }
-        else            { (Face::NegY,  dir[0] / ay,  dir[2] / ay) }
+        if dir[1] > 0.0 {
+            (Face::PosY, dir[0] / ay, -dir[2] / ay)
+        } else {
+            (Face::NegY, dir[0] / ay, dir[2] / ay)
+        }
     } else {
-        if dir[2] > 0.0 { (Face::PosZ,  dir[0] / az,  dir[1] / az) }
-        else            { (Face::NegZ, -dir[0] / az,  dir[1] / az) }
+        if dir[2] > 0.0 {
+            (Face::PosZ, dir[0] / az, dir[1] / az)
+        } else {
+            (Face::NegZ, -dir[0] / az, dir[1] / az)
+        }
     };
 
     Some(CubeSphereCoord {
-        face, u: cube_to_ea(cube_u), v: cube_to_ea(cube_v), r,
+        face,
+        u: cube_to_ea(cube_u),
+        v: cube_to_ea(cube_v),
+        r,
     })
 }
 
@@ -177,22 +197,34 @@ pub fn world_to_coord(center: Vec3, pos: Vec3) -> Option<CubeSphereCoord> {
 pub fn block_corners(
     center: Vec3,
     face: Face,
-    u: f32, v: f32, r: f32,
-    du: f32, dv: f32, dr: f32,
+    u: f32,
+    v: f32,
+    r: f32,
+    du: f32,
+    dv: f32,
+    dr: f32,
 ) -> [Vec3; 8] {
     let mut out = [[0.0; 3]; 8];
     let coords = [
-        (u,      v,      r),
-        (u + du, v,      r),
-        (u,      v + dv, r),
+        (u, v, r),
+        (u + du, v, r),
+        (u, v + dv, r),
         (u + du, v + dv, r),
-        (u,      v,      r + dr),
-        (u + du, v,      r + dr),
-        (u,      v + dv, r + dr),
+        (u, v, r + dr),
+        (u + du, v, r + dr),
+        (u, v + dv, r + dr),
         (u + du, v + dv, r + dr),
     ];
     for (i, &(cu, cv, cr)) in coords.iter().enumerate() {
-        out[i] = coord_to_world(center, CubeSphereCoord { face, u: cu, v: cv, r: cr });
+        out[i] = coord_to_world(
+            center,
+            CubeSphereCoord {
+                face,
+                u: cu,
+                v: cv,
+                r: cr,
+            },
+        );
     }
     out
 }
@@ -200,9 +232,18 @@ pub fn block_corners(
 /// The twelve edges of a cubed-sphere block as pairs of corner
 /// indices into `block_corners`'s output.
 pub const BLOCK_EDGES: [(usize, usize); 12] = [
-    (0, 1), (1, 3), (3, 2), (2, 0),
-    (4, 5), (5, 7), (7, 6), (6, 4),
-    (0, 4), (1, 5), (2, 6), (3, 7),
+    (0, 1),
+    (1, 3),
+    (3, 2),
+    (2, 0),
+    (4, 5),
+    (5, 7),
+    (7, 6),
+    (6, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
 ];
 
 // ────────────────────────────────────────────────── body insertion
@@ -232,8 +273,10 @@ pub fn insert_spherical_body(
     depth: u32,
     sdf: &Planet,
 ) -> NodeId {
-    debug_assert!(0.0 < inner_r && inner_r < outer_r && outer_r <= 0.5,
-        "radii must satisfy 0 < inner_r < outer_r <= 0.5 (cell-local)");
+    debug_assert!(
+        0.0 < inner_r && inner_r < outer_r && outer_r <= 0.5,
+        "radii must satisfy 0 < inner_r < outer_r <= 0.5 (cell-local)"
+    );
 
     let body_center: Vec3 = [0.5, 0.5, 0.5]; // body cell-local
     let sdf_budget = depth.min(SDF_DETAIL_LEVELS);
@@ -248,9 +291,20 @@ pub fn insert_spherical_body(
     let mut face_root_children: [Child; 6] = [Child::Empty; 6];
     for &face in &Face::ALL {
         let child = build_face_subtree(
-            lib, face, body_center, inner_r, outer_r,
-            -1.0, 1.0, -1.0, 1.0, inner_r, outer_r,
-            depth, sdf_budget, sdf,
+            lib,
+            face,
+            body_center,
+            inner_r,
+            outer_r,
+            -1.0,
+            1.0,
+            -1.0,
+            1.0,
+            inner_r,
+            outer_r,
+            depth,
+            sdf_budget,
+            sdf,
         );
         let face_root_id = match child {
             Child::Node(id) => {
@@ -303,9 +357,12 @@ fn build_face_subtree(
     body_center: Vec3,
     _body_inner_r: f32,
     _body_outer_r: f32,
-    u_lo: f32, u_hi: f32,
-    v_lo: f32, v_hi: f32,
-    r_lo: f32, r_hi: f32,
+    u_lo: f32,
+    u_hi: f32,
+    v_lo: f32,
+    v_hi: f32,
+    r_lo: f32,
+    r_hi: f32,
     depth: u32,
     sdf_budget: u32,
     sdf: &Planet,
@@ -313,7 +370,15 @@ fn build_face_subtree(
     let u_c = 0.5 * (u_lo + u_hi);
     let v_c = 0.5 * (v_lo + v_hi);
     let r_c = 0.5 * (r_lo + r_hi);
-    let p_center = coord_to_world(body_center, CubeSphereCoord { face, u: u_c, v: v_c, r: r_c });
+    let p_center = coord_to_world(
+        body_center,
+        CubeSphereCoord {
+            face,
+            u: u_c,
+            v: v_c,
+            r: r_c,
+        },
+    );
     let d_center = sdf.distance(p_center);
 
     let du = u_hi - u_lo;
@@ -324,12 +389,16 @@ fn build_face_subtree(
     let cell_rad = (lateral_half * lateral_half + radial_half * radial_half).sqrt();
 
     if d_center > cell_rad {
-        if depth == 0 { return Child::Empty; }
+        if depth == 0 {
+            return Child::Empty;
+        }
         return Child::Node(build_uniform_empty(lib, depth));
     }
     if d_center < -cell_rad {
         let b = sdf.block_at(p_center);
-        if depth == 0 { return Child::Block(b); }
+        if depth == 0 {
+            return Child::Block(b);
+        }
         return lib.build_uniform_subtree(b, depth);
     }
 
@@ -359,9 +428,20 @@ fn build_face_subtree(
                 let rs_lo = r_lo + dr * (rs as f32) / 3.0;
                 let rs_hi = r_lo + dr * (rs as f32 + 1.0) / 3.0;
                 children[slot_index(us, vs, rs)] = build_face_subtree(
-                    lib, face, body_center, _body_inner_r, _body_outer_r,
-                    us_lo, us_hi, vs_lo, vs_hi, rs_lo, rs_hi,
-                    depth - 1, sdf_budget - 1, sdf,
+                    lib,
+                    face,
+                    body_center,
+                    _body_inner_r,
+                    _body_outer_r,
+                    us_lo,
+                    us_hi,
+                    vs_lo,
+                    vs_hi,
+                    rs_lo,
+                    rs_hi,
+                    depth - 1,
+                    sdf_budget - 1,
+                    sdf,
                 );
             }
         }
@@ -384,7 +464,9 @@ mod tests {
     use super::*;
     use crate::world::palette::block;
 
-    fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-5 }
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
     fn approx_v(a: Vec3, b: Vec3) -> bool {
         approx(a[0], b[0]) && approx(a[1], b[1]) && approx(a[2], b[2])
     }
@@ -400,8 +482,14 @@ mod tests {
     #[test]
     fn face_corners_are_unit_vectors() {
         for &f in &Face::ALL {
-            for &(u, v) in &[(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0),
-                              (0.5, -0.3), (0.0, 0.0)] {
+            for &(u, v) in &[
+                (1.0, 1.0),
+                (-1.0, 1.0),
+                (1.0, -1.0),
+                (-1.0, -1.0),
+                (0.5, -0.3),
+                (0.0, 0.0),
+            ] {
                 let d = face_uv_to_dir(f, u, v);
                 assert!(approx(sdf::length(d), 1.0));
             }
@@ -431,9 +519,13 @@ mod tests {
         let sdf = Planet {
             center: [0.5, 0.5, 0.5],
             radius: 0.32,
-            noise_scale: 0.0, noise_freq: 1.0, noise_seed: 0,
-            gravity: 0.0, influence_radius: 1.0,
-            surface_block: block::GRASS, core_block: block::STONE,
+            noise_scale: 0.0,
+            noise_freq: 1.0,
+            noise_seed: 0,
+            gravity: 0.0,
+            influence_radius: 1.0,
+            surface_block: block::GRASS,
+            core_block: block::STONE,
         };
         let body_id = insert_spherical_body(&mut lib, 0.12, 0.45, 6, &sdf);
         let body = lib.get(body_id).expect("body node exists");
@@ -463,10 +555,16 @@ mod tests {
         }
         // The 20 other slots are Empty.
         for slot in 0..27 {
-            if slot == INTERIOR_SLOT { continue; }
-            if FACE_SLOTS.contains(&slot) { continue; }
-            assert!(matches!(body.children[slot], Child::Empty),
-                "slot {slot} should be Empty");
+            if slot == INTERIOR_SLOT {
+                continue;
+            }
+            if FACE_SLOTS.contains(&slot) {
+                continue;
+            }
+            assert!(
+                matches!(body.children[slot], Child::Empty),
+                "slot {slot} should be Empty"
+            );
         }
     }
 }

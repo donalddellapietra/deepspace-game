@@ -19,7 +19,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use super::types::{GpuChild, GPU_NODE_SIZE};
+use super::types::{GPU_NODE_SIZE, GpuChild};
 
 /// One entry in the ancestor ribbon. The shader pops from the
 /// frame upward; `ribbon[0]` is the frame's direct parent, then
@@ -68,9 +68,13 @@ pub fn build_ribbon(tree: &[GpuChild], frame_slots: &[u8]) -> RibbonResult {
     let mut current = 0u32;
     for &slot in frame_slots {
         let idx = (current as usize) * GPU_NODE_SIZE + slot as usize;
-        if idx >= tree.len() { break; }
+        if idx >= tree.len() {
+            break;
+        }
         let child = tree[idx];
-        if child.tag != 2 { break; }
+        if child.tag != 2 {
+            break;
+        }
         current = child.node_index;
         walk.push(current);
         reached_slots.push(slot);
@@ -86,15 +90,21 @@ pub fn build_ribbon(tree: &[GpuChild], frame_slots: &[u8]) -> RibbonResult {
             slot: slot as u32,
         });
     }
-    RibbonResult { frame_root_idx, ribbon, reached_slots }
+    RibbonResult {
+        frame_root_idx,
+        ribbon,
+        reached_slots,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::pack::pack_tree_lod;
     use super::*;
     use crate::world::anchor::WorldPos;
-    use crate::world::tree::{empty_children, uniform_children, Child, NodeKind, NodeLibrary, CENTER_SLOT};
-    use super::super::pack::pack_tree_lod;
+    use crate::world::tree::{
+        CENTER_SLOT, Child, NodeKind, NodeLibrary, empty_children, uniform_children,
+    };
 
     #[test]
     fn gpu_ribbon_entry_size() {
@@ -103,22 +113,47 @@ mod tests {
     }
 
     fn one_node_tree() -> Vec<GpuChild> {
-        vec![GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }; 27]
+        vec![
+            GpuChild {
+                tag: 0,
+                block_type: 0,
+                _pad: 0,
+                node_index: 0
+            };
+            27
+        ]
     }
 
     fn two_node_tree(parent_slot: u8) -> Vec<GpuChild> {
         // Two nodes in buffer: index 0 (parent) has Node child at
         // `parent_slot` pointing to index 1. Child at idx 1 has
         // 27 Empty children.
-        let mut data = vec![GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }; 54];
-        data[parent_slot as usize] = GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 1 };
+        let mut data = vec![
+            GpuChild {
+                tag: 0,
+                block_type: 0,
+                _pad: 0,
+                node_index: 0
+            };
+            54
+        ];
+        data[parent_slot as usize] = GpuChild {
+            tag: 2,
+            block_type: 0,
+            _pad: 0,
+            node_index: 1,
+        };
         data
     }
 
     #[test]
     fn empty_path_gives_empty_ribbon() {
         let tree = one_node_tree();
-        let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&tree, &[]);
+        let RibbonResult {
+            frame_root_idx: frame_idx,
+            ribbon,
+            ..
+        } = build_ribbon(&tree, &[]);
         assert_eq!(frame_idx, 0);
         assert!(ribbon.is_empty());
     }
@@ -126,10 +161,20 @@ mod tests {
     #[test]
     fn single_step() {
         let tree = two_node_tree(13);
-        let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&tree, &[13]);
+        let RibbonResult {
+            frame_root_idx: frame_idx,
+            ribbon,
+            ..
+        } = build_ribbon(&tree, &[13]);
         assert_eq!(frame_idx, 1);
         assert_eq!(ribbon.len(), 1);
-        assert_eq!(ribbon[0], GpuRibbonEntry { node_idx: 0, slot: 13 });
+        assert_eq!(
+            ribbon[0],
+            GpuRibbonEntry {
+                node_idx: 0,
+                slot: 13
+            }
+        );
     }
 
     #[test]
@@ -137,7 +182,11 @@ mod tests {
         // Path requests slot 13 → Node, then slot 5 → ... but child
         // at idx 1 has only Empty children. Walker stops at frame=1.
         let tree = two_node_tree(13);
-        let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&tree, &[13, 5]);
+        let RibbonResult {
+            frame_root_idx: frame_idx,
+            ribbon,
+            ..
+        } = build_ribbon(&tree, &[13, 5]);
         assert_eq!(frame_idx, 1);
         assert_eq!(ribbon.len(), 1);
     }
@@ -145,28 +194,79 @@ mod tests {
     #[test]
     fn multi_step_pop_order() {
         // Three nodes: 0 → slot 16 → 1 → slot 8 → 2.
-        let mut data = vec![GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }; 81];
-        data[16] = GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 1 };
-        data[27 + 8] = GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 2 };
+        let mut data = vec![
+            GpuChild {
+                tag: 0,
+                block_type: 0,
+                _pad: 0,
+                node_index: 0
+            };
+            81
+        ];
+        data[16] = GpuChild {
+            tag: 2,
+            block_type: 0,
+            _pad: 0,
+            node_index: 1,
+        };
+        data[27 + 8] = GpuChild {
+            tag: 2,
+            block_type: 0,
+            _pad: 0,
+            node_index: 2,
+        };
 
-        let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&data, &[16, 8]);
+        let RibbonResult {
+            frame_root_idx: frame_idx,
+            ribbon,
+            ..
+        } = build_ribbon(&data, &[16, 8]);
         assert_eq!(frame_idx, 2);
         assert_eq!(ribbon.len(), 2);
         // Pop order: ribbon[0] = direct parent (idx 1, came from
         // slot 8); ribbon[1] = grandparent (idx 0, came from slot 16).
-        assert_eq!(ribbon[0], GpuRibbonEntry { node_idx: 1, slot: 8 });
-        assert_eq!(ribbon[1], GpuRibbonEntry { node_idx: 0, slot: 16 });
+        assert_eq!(
+            ribbon[0],
+            GpuRibbonEntry {
+                node_idx: 1,
+                slot: 8
+            }
+        );
+        assert_eq!(
+            ribbon[1],
+            GpuRibbonEntry {
+                node_idx: 0,
+                slot: 16
+            }
+        );
     }
 
     #[test]
     fn out_of_bounds_index_safe() {
         // Crafted child with node_index past tree end: walker must
         // not panic.
-        let mut data = vec![GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }; 27];
-        data[5] = GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 999 };
+        let mut data = vec![
+            GpuChild {
+                tag: 0,
+                block_type: 0,
+                _pad: 0,
+                node_index: 0
+            };
+            27
+        ];
+        data[5] = GpuChild {
+            tag: 2,
+            block_type: 0,
+            _pad: 0,
+            node_index: 999,
+        };
         // Walking [5] → tag=2 advances to idx 999, then [5] → idx
         // 999*27+5 = 26978 which is past tree.len(). Walker breaks.
-        let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&data, &[5, 5]);
+        let RibbonResult {
+            frame_root_idx: frame_idx,
+            ribbon,
+            ..
+        } = build_ribbon(&data, &[5, 5]);
         assert_eq!(frame_idx, 999);
         assert_eq!(ribbon.len(), 1);
     }
@@ -177,7 +277,10 @@ mod tests {
         let mut root_children = uniform_children(Child::Node(leaf_air));
         let body_id = lib.insert_with_kind(
             empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.12,
+                outer_r: 0.45,
+            },
         );
         root_children[CENTER_SLOT] = Child::Node(body_id);
         let root = lib.insert(root_children);
@@ -193,10 +296,13 @@ mod tests {
     fn ribbon_for_path_into_body_in_planet_world() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
-        let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&data, &[13]);
+        let (data, _kinds, _root_idx) =
+            pack_tree_lod(&world.library, world.root, &camera, 1080.0, 1.2);
+        let RibbonResult {
+            frame_root_idx: frame_idx,
+            ribbon,
+            ..
+        } = build_ribbon(&data, &[13]);
         assert!(frame_idx > 0, "body packed at non-zero index");
         assert_eq!(ribbon.len(), 1);
         assert_eq!(ribbon[0].node_idx, 0, "world root at index 0");
@@ -210,27 +316,31 @@ mod tests {
         // should stop at the world root with reached_slots empty.
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
+        let (data, _kinds, _root_idx) =
+            pack_tree_lod(&world.library, world.root, &camera, 1080.0, 1.2);
         // Slot 16 is uniform-empty Cartesian Node — pack flattens
         // it to tag=0. Asking the ribbon to descend into [16, 13]
         // should stop at depth 0.
         let r = build_ribbon(&data, &[16, 13]);
         assert_eq!(r.frame_root_idx, 0, "stayed at world root");
         assert!(r.ribbon.is_empty());
-        assert!(r.reached_slots.is_empty(),
-            "no slot reachable past flattened sibling");
+        assert!(
+            r.reached_slots.is_empty(),
+            "no slot reachable past flattened sibling"
+        );
     }
 
     #[test]
     fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
         let world = planet_world();
         let camera = camera_at([0.5, 0.5, 0.5]);
-        let (data, _kinds, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
-        let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&data, &[]);
+        let (data, _kinds, _root_idx) =
+            pack_tree_lod(&world.library, world.root, &camera, 1080.0, 1.2);
+        let RibbonResult {
+            frame_root_idx: frame_idx,
+            ribbon,
+            ..
+        } = build_ribbon(&data, &[]);
         assert_eq!(frame_idx, 0);
         assert!(ribbon.is_empty());
     }

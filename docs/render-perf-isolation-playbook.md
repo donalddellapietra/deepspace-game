@@ -33,7 +33,7 @@ cargo run --bin deepspace-game -- \
   --harness-width 1280 \
   --harness-height 720 \
   --exit-after-frames 2 \
-  --timeout-secs 6
+  --timeout-secs 4
 ```
 
 For live-loop perf checks (window/surface path), always include:
@@ -41,6 +41,9 @@ For live-loop perf checks (window/surface path), always include:
 ```bash
 --max-any-frame-ms 250 --max-frame-gap-ms 400 --frame-gap-warmup-frames 2
 ```
+
+Keep timeout budgets tight. Prefer `4s` unless the scenario has a concrete
+reason to run longer.
 
 ## Isolation Order
 

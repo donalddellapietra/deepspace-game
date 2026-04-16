@@ -4,8 +4,12 @@ use winit::keyboard::KeyCode;
 
 #[derive(Default)]
 pub struct Keys {
-    pub w: bool, pub a: bool, pub s: bool, pub d: bool,
-    pub space: bool, pub shift: bool,
+    pub w: bool,
+    pub a: bool,
+    pub s: bool,
+    pub d: bool,
+    pub space: bool,
+    pub shift: bool,
 }
 
 impl Keys {

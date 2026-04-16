@@ -44,12 +44,23 @@ pub struct GpuNodeKind {
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
+            NodeKind::Cartesian => Self {
+                kind: 0,
+                face: 0,
+                inner_r: 0.0,
+                outer_r: 0.0,
+            },
             NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
-                kind: 1, face: 0, inner_r, outer_r,
+                kind: 1,
+                face: 0,
+                inner_r,
+                outer_r,
             },
             NodeKind::CubedSphereFace { face } => Self {
-                kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
+                kind: 2,
+                face: face as u32,
+                inner_r: 0.0,
+                outer_r: 0.0,
             },
         }
     }
@@ -110,7 +121,8 @@ mod tests {
     #[test]
     fn from_node_kind_body_carries_radii() {
         let k = GpuNodeKind::from_node_kind(NodeKind::CubedSphereBody {
-            inner_r: 0.12, outer_r: 0.45,
+            inner_r: 0.12,
+            outer_r: 0.45,
         });
         assert_eq!(k.kind, 1);
         assert!((k.inner_r - 0.12).abs() < 1e-7);

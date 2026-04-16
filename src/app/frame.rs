@@ -13,7 +13,7 @@
 use crate::world::anchor::{Path, WORLD_SIZE};
 use crate::world::cubesphere::Face;
 use crate::world::cubesphere_local;
-use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary, slot_coords};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SphereFrame {
@@ -217,16 +217,28 @@ pub fn compute_render_frame(
     let mut body_info: Option<(Path, NodeId, f32, f32)> = None;
     let mut sphere_info: Option<(Face, NodeId, f32, f32, f32, f32)> = None;
     for k in 0..target.depth() as usize {
-        let Some(node) = library.get(node_id) else { break };
+        let Some(node) = library.get(node_id) else {
+            break;
+        };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
-                let Some(child) = library.get(child_id) else { break };
+                let Some(child) = library.get(child_id) else {
+                    break;
+                };
                 reached.push(slot as u8);
                 match child.kind {
                     NodeKind::Cartesian => {
                         node_id = child_id;
-                        if let Some((_, _, ref mut u_min, ref mut v_min, ref mut r_min, ref mut size)) = sphere_info {
+                        if let Some((
+                            _,
+                            _,
+                            ref mut u_min,
+                            ref mut v_min,
+                            ref mut r_min,
+                            ref mut size,
+                        )) = sphere_info
+                        {
                             let (us, vs, rs) = slot_coords(slot);
                             let child_size = *size / 3.0;
                             *u_min += us as f32 * child_size;
@@ -274,7 +286,10 @@ pub fn compute_render_frame(
             }),
         }
     } else {
-        let kind = library.get(node_id).map(|n| n.kind).unwrap_or(NodeKind::Cartesian);
+        let kind = library
+            .get(node_id)
+            .map(|n| n.kind)
+            .unwrap_or(NodeKind::Cartesian);
         ActiveFrame {
             render_path: reached,
             logical_path: reached,
@@ -297,7 +312,9 @@ pub fn with_render_margin(
 ) -> ActiveFrame {
     let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
     let min_render_depth = match logical.kind {
-        ActiveFrameKind::Sphere(sphere) => (sphere.body_path.depth() + 1).min(logical.logical_path.depth()),
+        ActiveFrameKind::Sphere(sphere) => {
+            (sphere.body_path.depth() + 1).min(logical.logical_path.depth())
+        }
         ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
         ActiveFrameKind::Cartesian => 0,
     };
@@ -351,7 +368,9 @@ mod tests {
     fn render_frame_root_when_desired_depth_zero() {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
-        for _ in 0..3 { anchor.push(13); }
+        for _ in 0..3 {
+            anchor.push(13);
+        }
         let frame = compute_render_frame(&lib, root, &anchor, 0);
         assert_eq!(frame.render_path.depth(), 0);
         assert_eq!(frame.node_id, root);
@@ -361,7 +380,9 @@ mod tests {
     fn render_frame_descends_through_cartesian() {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
-        for _ in 0..4 { anchor.push(13); }
+        for _ in 0..4 {
+            anchor.push(13);
+        }
         let frame = compute_render_frame(&lib, root, &anchor, 3);
         assert_eq!(frame.render_path.depth(), 3);
     }
@@ -379,7 +400,10 @@ mod tests {
         body_children[14] = Child::Node(face);
         let body = lib.insert_with_kind(
             body_children,
-            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.1,
+                outer_r: 0.4,
+            },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);
@@ -401,7 +425,10 @@ mod tests {
         let mut lib = NodeLibrary::default();
         let body = lib.insert_with_kind(
             empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
+            NodeKind::CubedSphereBody {
+                inner_r: 0.1,
+                outer_r: 0.4,
+            },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);
@@ -436,7 +463,11 @@ mod tests {
         anchor.push(5);
         anchor.push(0);
         let frame = compute_render_frame(&lib, root, &anchor, 2);
-        assert_eq!(frame.render_path.depth(), 0, "Block child terminates descent");
+        assert_eq!(
+            frame.render_path.depth(),
+            0,
+            "Block child terminates descent"
+        );
     }
 
     // --------- frame_origin_size_world ---------

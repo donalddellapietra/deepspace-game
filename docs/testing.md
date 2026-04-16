@@ -10,7 +10,7 @@ cargo run --bin deepspace-game -- \
   --disable-overlay \
   --spawn-depth 17 \
   --run-for-secs 2 \
-  --timeout-secs 6 \
+  --timeout-secs 4 \
   --max-any-frame-ms 250 \
   --max-frame-gap-ms 400 \
   --frame-gap-warmup-frames 2 \
@@ -22,6 +22,20 @@ Key rule:
 - `--max-any-frame-ms` and a small frame-gap warm-up (`2`) are required for
   regression tests, so startup acquire/present stalls cannot be hidden by
   FPS warm-up windows.
+- Keep `--timeout-secs` short. The harness default is now `4s`.
+
+## Screenshot Regressions
+
+For deep-layer screenshot checks, do not choose ad hoc absolute world
+coordinates per layer. Use the normal reference spawn, deepen locally, and
+only apply a deterministic local nudge if the deep anchor lands exactly on a
+boundary singularity.
+
+Important caveat:
+- Until the image assertions have been validated against repeated manual
+  inspection, read the PNGs directly as the source of truth.
+- Treat the image-code verdict as advisory until it has matched the visual
+  failure mode across multiple iterations.
 
 ## Playwright (UI overlay tests)
 

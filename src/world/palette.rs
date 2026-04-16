@@ -24,27 +24,27 @@ pub struct PaletteEntry {
 /// The builtin block types. Index 0 is reserved (empty sentinel in
 /// `VoxelModel`), so builtins start at 1.
 pub const BUILTINS: &[(u8, &str, [f32; 4])] = &[
-    (1,  "Stone",  [0.50, 0.50, 0.50, 1.0]),
-    (2,  "Dirt",   [0.45, 0.30, 0.15, 1.0]),
-    (3,  "Grass",  [0.30, 0.60, 0.20, 1.0]),
-    (4,  "Wood",   [0.55, 0.35, 0.15, 1.0]),
-    (5,  "Leaf",   [0.20, 0.50, 0.10, 1.0]),
-    (6,  "Sand",   [0.85, 0.80, 0.55, 1.0]),
-    (7,  "Water",  [0.20, 0.40, 0.80, 1.0]),
-    (8,  "Brick",  [0.70, 0.30, 0.20, 1.0]),
-    (9,  "Metal",  [0.75, 0.75, 0.80, 1.0]),
-    (10, "Glass",  [0.85, 0.90, 1.00, 1.0]),
+    (1, "Stone", [0.50, 0.50, 0.50, 1.0]),
+    (2, "Dirt", [0.45, 0.30, 0.15, 1.0]),
+    (3, "Grass", [0.30, 0.60, 0.20, 1.0]),
+    (4, "Wood", [0.55, 0.35, 0.15, 1.0]),
+    (5, "Leaf", [0.20, 0.50, 0.10, 1.0]),
+    (6, "Sand", [0.85, 0.80, 0.55, 1.0]),
+    (7, "Water", [0.20, 0.40, 0.80, 1.0]),
+    (8, "Brick", [0.70, 0.30, 0.20, 1.0]),
+    (9, "Metal", [0.75, 0.75, 0.80, 1.0]),
+    (10, "Glass", [0.85, 0.90, 1.00, 1.0]),
 ];
 
 /// Named constants for the builtin indices — use these instead of
 /// the old `BlockType` enum. Index 0 is reserved (empty in VoxelModel).
 pub mod block {
     pub const STONE: u8 = 1;
-    pub const DIRT:  u8 = 2;
+    pub const DIRT: u8 = 2;
     pub const GRASS: u8 = 3;
-    pub const WOOD:  u8 = 4;
-    pub const LEAF:  u8 = 5;
-    pub const SAND:  u8 = 6;
+    pub const WOOD: u8 = 4;
+    pub const LEAF: u8 = 5;
+    pub const SAND: u8 = 6;
     pub const WATER: u8 = 7;
     pub const BRICK: u8 = 8;
     pub const METAL: u8 = 9;
@@ -75,7 +75,10 @@ impl ColorRegistry {
             let b = (color[2] * 255.0) as u8;
             let a = (color[3] * 255.0) as u8;
             let idx = reg.entries.len() as u8;
-            reg.entries.push(PaletteEntry { name: name.to_string(), color });
+            reg.entries.push(PaletteEntry {
+                name: name.to_string(),
+                color,
+            });
             reg.seen.insert((r, g, b, a), idx);
         }
         reg
@@ -117,13 +120,15 @@ impl ColorRegistry {
     }
 
     pub fn name(&self, index: u8) -> &str {
-        self.entries.get(index as usize)
+        self.entries
+            .get(index as usize)
             .map(|e| e.name.as_str())
             .unwrap_or("Unknown")
     }
 
     pub fn color(&self, index: u8) -> [f32; 4] {
-        self.entries.get(index as usize)
+        self.entries
+            .get(index as usize)
             .map(|e| e.color)
             .unwrap_or([0.3, 0.3, 0.3, 1.0])
     }

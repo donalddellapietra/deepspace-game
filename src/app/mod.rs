@@ -9,11 +9,11 @@ use crate::game_state::{GameUiState, SavedMeshes};
 use crate::input::Keys;
 use crate::player;
 use crate::renderer::Renderer;
-use crate::world::anchor::{Path, WorldPos, WORLD_SIZE};
+use crate::world::anchor::{Path, WORLD_SIZE, WorldPos};
 use crate::world::bootstrap;
 use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
-use crate::world::tree::{NodeKind, MAX_DEPTH};
+use crate::world::tree::{MAX_DEPTH, NodeId, NodeKind, NodeLibrary};
 
 /// Levels shallower than the camera's anchor at which the render
 /// frame sits. The frame walks down the camera's path until either
@@ -34,14 +34,15 @@ pub mod cursor;
 pub mod edit_actions;
 pub mod event_loop;
 pub mod frame;
+pub mod harness;
 pub mod input_handlers;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod overlay_integration;
+pub mod shells;
 pub mod test_runner;
 
 pub use frame::{
-    compute_render_frame, frame_origin_size_world, with_render_margin, ActiveFrame,
-    ActiveFrameKind,
+    ActiveFrame, ActiveFrameKind, compute_render_frame, frame_origin_size_world, with_render_margin,
 };
 pub use test_runner::TestConfig;
 
@@ -174,21 +175,26 @@ impl App {
         let forced_visual_depth = test_cfg.force_visual_depth;
         let forced_edit_depth = test_cfg.force_edit_depth;
         let (harness_width, harness_height) = test_cfg.harness_size();
-        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
+        let bootstrap =
+            bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let world = bootstrap.world;
         let tree_depth = world.tree_depth();
         let spawn_xyz = test_cfg.spawn_xyz.unwrap_or(bootstrap.default_spawn_xyz);
         debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
 
-        let anchor_depth = test_cfg.spawn_depth.unwrap_or(bootstrap.default_spawn_depth);
-        let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
-        let desired_depth = (position.anchor.depth().saturating_sub(RENDER_FRAME_K))
-            .min(RENDER_FRAME_MAX_DEPTH);
+        let anchor_depth = test_cfg
+            .spawn_depth
+            .unwrap_or(bootstrap.default_spawn_depth);
+        let position = harness::spawn_position(
+            spawn_xyz,
+            anchor_depth,
+            bootstrap.default_spawn_depth,
+        );
+        let desired_depth =
+            (position.anchor.depth().saturating_sub(RENDER_FRAME_K)).min(RENDER_FRAME_MAX_DEPTH);
         let mut logical_path = position.anchor;
         logical_path.truncate(desired_depth);
-        let active_frame = frame::with_render_margin(
-            &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
-        );
+        let active_frame = Self::frame_for_logical_path(&world.library, world.root, &logical_path);
         eprintln!(
             "startup_perf initial_frame kind={:?} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
             active_frame.kind,
@@ -197,8 +203,23 @@ impl App {
             desired_depth,
             position.anchor.depth(),
         );
-        let spawn_yaw = test_cfg.spawn_yaw.unwrap_or(bootstrap.default_spawn_yaw);
-        let spawn_pitch = test_cfg.spawn_pitch.unwrap_or(bootstrap.default_spawn_pitch);
+        let (spawn_yaw, spawn_pitch) = if test_cfg.is_active() {
+            harness::derive_view_angles(
+                &world,
+                position,
+                test_cfg.world_preset,
+                bootstrap.default_spawn_depth,
+                bootstrap.default_spawn_yaw,
+                bootstrap.default_spawn_pitch,
+                test_cfg.spawn_yaw,
+                test_cfg.spawn_pitch,
+            )
+        } else {
+            (
+                test_cfg.spawn_yaw.unwrap_or(bootstrap.default_spawn_yaw),
+                test_cfg.spawn_pitch.unwrap_or(bootstrap.default_spawn_pitch),
+            )
+        };
         eprintln!(
             "spawn: xyz={:?} anchor_depth={} yaw={} pitch={}",
             spawn_xyz, anchor_depth, spawn_yaw, spawn_pitch,
@@ -228,7 +249,11 @@ impl App {
             ui: GameUiState::new(),
             debug_overlay_visible: false,
             fps_smooth: 0.0,
-            startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
+            startup_profile_frames: if test_cfg.suppress_startup_logs {
+                u32::MAX
+            } else {
+                0
+            },
             planet_path: bootstrap.planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
@@ -273,10 +298,20 @@ impl App {
             .min(RENDER_FRAME_MAX_DEPTH);
         let mut logical_path = self.camera.position.anchor;
         logical_path.truncate(desired_depth);
-        frame::with_render_margin(
-            &self.world.library, self.world.root,
-            &logical_path, RENDER_FRAME_CONTEXT,
-        )
+        Self::frame_for_logical_path(&self.world.library, self.world.root, &logical_path)
+    }
+
+    pub(crate) fn frame_for_logical_path(
+        library: &NodeLibrary,
+        world_root: NodeId,
+        logical_path: &Path,
+    ) -> ActiveFrame {
+        let logical =
+            frame::compute_render_frame(library, world_root, logical_path, logical_path.depth());
+        match logical.kind {
+            ActiveFrameKind::Cartesian => logical,
+            _ => frame::with_render_margin(library, world_root, logical_path, RENDER_FRAME_CONTEXT),
+        }
     }
 
     /// `NodeKind` of the *intended* render-frame root from a tree
@@ -309,8 +344,13 @@ impl App {
     }
 
     pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {
-        if self.frozen { return; }
-        self.camera.position.anchor.step_neighbor_cartesian(axis, direction);
+        if self.frozen {
+            return;
+        }
+        self.camera
+            .position
+            .anchor
+            .step_neighbor_cartesian(axis, direction);
         self.camera.position.offset = [0.5, 0.5, 0.5];
     }
 
@@ -356,18 +396,10 @@ impl App {
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
-                fwd_world,
-                fwd_local,
-                right_local,
-                up_local,
+                fwd_world, fwd_local, right_local, up_local,
             );
         }
-        self.camera.gpu_camera_with_basis(
-            cam_local,
-            fwd_local,
-            right_local,
-            up_local,
-            1.2,
-        )
+        self.camera
+            .gpu_camera_with_basis(cam_local, fwd_local, right_local, up_local, 1.2)
     }
 }

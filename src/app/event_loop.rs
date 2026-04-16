@@ -54,7 +54,12 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput {
-                event: KeyEvent { physical_key: PhysicalKey::Code(code), state, .. },
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state,
+                        ..
+                    },
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
@@ -80,18 +85,12 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn device_event(
-        &mut self,
-        _: &ActiveEventLoop,
-        _: winit::event::DeviceId,
-        event: DeviceEvent,
-    ) {
+    fn device_event(&mut self, _: &ActiveEventLoop, _: winit::event::DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.cursor_locked {
                 const SENS: f64 = 0.003;
                 self.camera.yaw -= (delta.0 * SENS) as f32;
-                self.camera.pitch = (self.camera.pitch - (delta.1 * SENS) as f32)
-                    .clamp(-1.5, 1.5);
+                self.camera.pitch = (self.camera.pitch - (delta.1 * SENS) as f32).clamp(-1.5, 1.5);
             }
         }
     }
@@ -111,13 +110,19 @@ impl App {
 
         let attrs = WindowAttributes::default()
             .with_title("Deep Space")
-            .with_inner_size(winit::dpi::LogicalSize::new(self.harness_width, self.harness_height))
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.harness_width,
+                self.harness_height,
+            ))
             .with_visible(!self.render_harness || self.show_harness_window);
 
         let window_start = std::time::Instant::now();
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let window_elapsed = window_start.elapsed();
-        eprintln!("startup_perf {source}: window_created ms={:.2}", window_elapsed.as_secs_f64() * 1000.0);
+        eprintln!(
+            "startup_perf {source}: window_created ms={:.2}",
+            window_elapsed.as_secs_f64() * 1000.0
+        );
         self.window = Some(window.clone());
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -128,7 +133,10 @@ impl App {
         } else {
             std::time::Duration::ZERO
         };
-        eprintln!("startup_perf {source}: window_prepared ms={:.2}", prepare_elapsed.as_secs_f64() * 1000.0);
+        eprintln!(
+            "startup_perf {source}: window_prepared ms={:.2}",
+            prepare_elapsed.as_secs_f64() * 1000.0
+        );
         #[cfg(target_arch = "wasm32")]
         let prepare_elapsed = std::time::Duration::ZERO;
 
@@ -136,37 +144,44 @@ impl App {
         let (tree_data, node_kinds, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
         let pack_elapsed = pack_start.elapsed();
-        eprintln!("startup_perf {source}: tree_packed ms={:.2} nodes={}", pack_elapsed.as_secs_f64() * 1000.0, tree_data.len() / 27);
-        let renderer_start = std::time::Instant::now();
-        let renderer = pollster::block_on(
-            Renderer::new(
-                window,
-                &tree_data,
-                &node_kinds,
-                root_index,
-                if self.low_latency_present {
-                    wgpu::PresentMode::AutoNoVsync
-                } else {
-                    wgpu::PresentMode::AutoVsync
-                },
-            ),
+        eprintln!(
+            "startup_perf {source}: tree_packed ms={:.2} nodes={}",
+            pack_elapsed.as_secs_f64() * 1000.0,
+            tree_data.len() / 27
         );
+        let renderer_start = std::time::Instant::now();
+        let renderer = pollster::block_on(Renderer::new(
+            window,
+            &tree_data,
+            &node_kinds,
+            root_index,
+            if self.low_latency_present {
+                wgpu::PresentMode::AutoNoVsync
+            } else {
+                wgpu::PresentMode::AutoVsync
+            },
+        ));
         let renderer_elapsed = renderer_start.elapsed();
-        eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);
+        eprintln!(
+            "startup_perf {source}: renderer_created ms={:.2}",
+            renderer_elapsed.as_secs_f64() * 1000.0
+        );
         let mut renderer = renderer;
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
             eprintln!(
                 "startup_perf {source}: harness_resize width={} height={}",
-                self.harness_width,
-                self.harness_height,
+                self.harness_width, self.harness_height,
             );
         }
         self.renderer = Some(renderer);
         let zoom_start = std::time::Instant::now();
         self.apply_zoom();
         let zoom_elapsed = zoom_start.elapsed();
-        eprintln!("startup_perf {source}: apply_zoom ms={:.2}", zoom_elapsed.as_secs_f64() * 1000.0);
+        eprintln!(
+            "startup_perf {source}: apply_zoom ms={:.2}",
+            zoom_elapsed.as_secs_f64() * 1000.0
+        );
         #[cfg(not(target_arch = "wasm32"))]
         if self.overlay_enabled() {
             self.frames_waited = crate::app::overlay_integration::WAIT_FRAMES;
@@ -199,13 +214,21 @@ impl App {
     /// the world-space position of the camera is preserved exactly.
     /// No dolly, no translation; only the depth scale changes.
     fn handle_scroll_zoom(&mut self, delta: winit::event::MouseScrollDelta) {
-        if self.frozen { return; }
+        if self.frozen {
+            return;
+        }
         let y = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => y,
             winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
         };
         // Positive y = scroll up = zoom in (deeper anchor).
-        let step: i32 = if y > 0.0 { 1 } else if y < 0.0 { -1 } else { return };
+        let step: i32 = if y > 0.0 {
+            1
+        } else if y < 0.0 {
+            -1
+        } else {
+            return;
+        };
         self.zoom_anchor(step);
     }
 
@@ -228,9 +251,11 @@ impl App {
                 crate::app::ActiveFrameKind::Sphere(sphere) => {
                     self.camera.position.in_frame(&sphere.body_path)
                 }
-                crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
-                    self.camera.position.in_frame(&self.active_frame.render_path)
-                }
+                crate::app::ActiveFrameKind::Cartesian
+                | crate::app::ActiveFrameKind::Body { .. } => self
+                    .camera
+                    .position
+                    .in_frame(&self.active_frame.render_path),
             };
             self.try_create_webview();
             self.inject_webview_input();
@@ -308,16 +333,15 @@ impl App {
                     test.monitor.perf_failed.store(true, Ordering::Relaxed);
                     eprintln!(
                         "test_runner: hard frame stall detected in loop: frame={} frame_ms={:.2} threshold_ms={:.2}",
-                        test.frame,
-                        pre_tail_ms,
-                        max_any_frame_ms,
+                        test.frame, pre_tail_ms, max_any_frame_ms,
                     );
                 }
             }
             let mut frame_sample = None;
             let mut cadence_sample = None;
             if test.frame >= test.fps_warmup_frames {
-                test.perf_samples.record_frame(pre_tail_elapsed.as_secs_f64());
+                test.perf_samples
+                    .record_frame(pre_tail_elapsed.as_secs_f64());
                 frame_sample = Some(pre_tail_elapsed.as_secs_f64());
             }
             if test.frame >= test.cadence_warmup_frames {
@@ -339,7 +363,11 @@ impl App {
                 self.startup_profile_frames,
                 pre_tail_elapsed.as_secs_f64() * 1000.0,
                 dt as f64 * 1000.0,
-                if pre_tail_elapsed.as_secs_f64() > 0.0 { 1.0 / pre_tail_elapsed.as_secs_f64() } else { 0.0 },
+                if pre_tail_elapsed.as_secs_f64() > 0.0 {
+                    1.0 / pre_tail_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                },
                 overlay_elapsed.as_secs_f64() * 1000.0,
                 update_elapsed.as_secs_f64() * 1000.0,
                 upload_elapsed.as_secs_f64() * 1000.0,
@@ -394,15 +422,18 @@ impl App {
                 dt as f64 * 1000.0,
             );
         }
-
     }
 
     pub(super) fn zoom_anchor(&mut self, step: i32) {
-        if step == 0 { return; }
+        if step == 0 {
+            return;
+        }
         let cur = self.anchor_depth() as i32;
         let max_depth = crate::world::tree::MAX_DEPTH as i32;
         let new_depth = (cur + step).clamp(1, max_depth);
-        if new_depth == cur { return; }
+        if new_depth == cur {
+            return;
+        }
         if step > 0 {
             self.camera.position.zoom_in();
         } else {
@@ -422,8 +453,12 @@ impl App {
                 test.perf_samples.avg_cadence_fps().unwrap_or(0.0),
                 test.perf_samples.worst_frame_secs * 1000.0,
                 test.perf_samples.worst_cadence_secs * 1000.0,
-                test.monitor.worst_any_frame_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
-                test.monitor.worst_any_dt_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
+                test.monitor
+                    .worst_any_frame_ms
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64,
+                test.monitor
+                    .worst_any_dt_ms
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64,
             );
         }
     }
@@ -431,7 +466,9 @@ impl App {
     fn tick_test_runner_after_frame(&mut self) {
         // Borrow checker: collect commands into a local first.
         let (due, frame, frame_budget_done, timed_out, perf_active, exit_after, screenshot) = {
-            let Some(test) = self.test.as_mut() else { return };
+            let Some(test) = self.test.as_mut() else {
+                return;
+            };
             test.frame += 1;
             let frame = test.frame;
             let due = test.drain_due();
@@ -442,7 +479,15 @@ impl App {
                 || test.max_any_frame_ms.is_some();
             let exit_after = test.exit_after_frames;
             let screenshot = test.screenshot_path.clone();
-            (due, frame, frame_budget_done, timed_out, perf_active, exit_after, screenshot)
+            (
+                due,
+                frame,
+                frame_budget_done,
+                timed_out,
+                perf_active,
+                exit_after,
+                screenshot,
+            )
         };
         for cmd in due {
             match cmd {
@@ -483,16 +528,22 @@ impl App {
                 if test.frame < test.fps_warmup_frames || test.perf_samples.count == 0 {
                     false
                 } else {
-                    test.perf_samples.avg_frame_fps().is_some_and(|avg_fps| avg_fps < min_fps)
+                    test.perf_samples
+                        .avg_frame_fps()
+                        .is_some_and(|avg_fps| avg_fps < min_fps)
                 }
             } else {
                 false
             };
             let cadence_failed = if let Some(min_fps) = test.min_cadence_fps {
-                if test.frame < test.cadence_warmup_frames || test.perf_samples.total_cadence_secs <= 0.0 {
+                if test.frame < test.cadence_warmup_frames
+                    || test.perf_samples.total_cadence_secs <= 0.0
+                {
                     false
                 } else {
-                    test.perf_samples.avg_cadence_fps().is_some_and(|avg_fps| avg_fps < min_fps)
+                    test.perf_samples
+                        .avg_cadence_fps()
+                        .is_some_and(|avg_fps| avg_fps < min_fps)
                 }
             } else {
                 false
@@ -520,7 +571,9 @@ impl App {
         if timed_out {
             self.print_perf_summary();
             if perf_active {
-                eprintln!("test_runner: timeout reached before satisfying perf test at frame {frame}, quitting");
+                eprintln!(
+                    "test_runner: timeout reached before satisfying perf test at frame {frame}, quitting"
+                );
                 std::process::exit(1);
             } else {
                 eprintln!("test_runner: timeout reached at frame {frame}, quitting");

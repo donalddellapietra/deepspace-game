@@ -14,7 +14,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::world::tree::{slot_coords, slot_index, NodeLibrary, MAX_DEPTH};
+use crate::world::tree::{MAX_DEPTH, NodeLibrary, slot_coords, slot_index};
 
 /// Root cell spans `[0, WORLD_SIZE)³` in world units.
 ///
@@ -35,7 +35,10 @@ pub struct Path {
 
 impl Path {
     pub const fn root() -> Self {
-        Self { slots: [0u8; MAX_DEPTH], depth: 0 }
+        Self {
+            slots: [0u8; MAX_DEPTH],
+            depth: 0,
+        }
     }
 
     #[inline]
@@ -154,7 +157,9 @@ impl std::fmt::Debug for Path {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Path(d={},[", self.depth)?;
         for (i, s) in self.as_slice().iter().enumerate() {
-            if i > 0 { write!(f, ",")?; }
+            if i > 0 {
+                write!(f, ",")?;
+            }
             write!(f, "{}", s)?;
         }
         write!(f, "])")
@@ -200,7 +205,10 @@ impl WorldPos {
     }
 
     pub const fn root_origin() -> Self {
-        Self { anchor: Path::root(), offset: [0.0, 0.0, 0.0] }
+        Self {
+            anchor: Path::root(),
+            offset: [0.0, 0.0, 0.0],
+        }
     }
 
     /// Restore `offset[i] ∈ [0, 1)` by stepping the anchor along
@@ -463,7 +471,9 @@ impl WorldPos {
     /// Pop the deepest slot. Offset rescaled so the world position
     /// is unchanged. Clamps at root.
     pub fn zoom_out(&mut self) -> Transition {
-        let Some(slot) = self.anchor.pop() else { return Transition::None; };
+        let Some(slot) = self.anchor.pop() else {
+            return Transition::None;
+        };
         let (sx, sy, sz) = slot_coords(slot as usize);
         self.offset[0] = (self.offset[0] + sx as f32) / 3.0;
         self.offset[1] = (self.offset[1] + sy as f32) / 3.0;
@@ -526,8 +536,12 @@ mod tests {
     fn common_prefix() {
         let mut a = Path::root();
         let mut b = Path::root();
-        for s in [1u8, 2, 3, 4] { a.push(s); }
-        for s in [1u8, 2, 9, 0] { b.push(s); }
+        for s in [1u8, 2, 3, 4] {
+            a.push(s);
+        }
+        for s in [1u8, 2, 9, 0] {
+            b.push(s);
+        }
         assert_eq!(a.common_prefix_len(&b), 2);
     }
 
@@ -662,7 +676,9 @@ mod tests {
                     assert!(
                         (back[i] - xyz[i]).abs() < WORLD_SIZE * 1e-5,
                         "depth {}: xyz {:?} round-tripped to {:?}",
-                        depth, xyz, back
+                        depth,
+                        xyz,
+                        back
                     );
                 }
             }
@@ -730,8 +746,11 @@ mod tests {
             let cam = WorldPos::from_world_xyz([1.5, 2.32, 1.5], cam_depth);
             let oc = cam.offset_from(&planet);
             assert!(oc[0].abs() < 1e-4, "depth {cam_depth}: oc.x = {}", oc[0]);
-            assert!((oc[1] - 0.82).abs() < 1e-4,
-                "depth {cam_depth}: oc.y = {}", oc[1]);
+            assert!(
+                (oc[1] - 0.82).abs() < 1e-4,
+                "depth {cam_depth}: oc.y = {}",
+                oc[1]
+            );
             assert!(oc[2].abs() < 1e-4, "depth {cam_depth}: oc.z = {}", oc[2]);
         }
     }
@@ -743,7 +762,9 @@ mod tests {
         // freshly constructed depth-13 camera at the same world XYZ.
         let planet = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
         let mut cam = WorldPos::from_world_xyz([1.5, 2.32, 1.5], 16);
-        for _ in 0..7 { cam.zoom_out(); }
+        for _ in 0..7 {
+            cam.zoom_out();
+        }
         assert_eq!(cam.anchor.depth(), 9);
         let baseline = WorldPos::from_world_xyz([1.5, 2.32, 1.5], 9);
         let oc_chained = cam.offset_from(&planet);
@@ -752,11 +773,15 @@ mod tests {
             assert!(
                 (oc_chained[i] - oc_baseline[i]).abs() < 1e-4,
                 "axis {}: chained {} vs baseline {}",
-                i, oc_chained[i], oc_baseline[i],
+                i,
+                oc_chained[i],
+                oc_baseline[i],
             );
         }
-        assert!(oc_chained[1].abs() > 0.5,
-            "oc.y collapsed to 0 after zoom chain — sphere would be invisible");
+        assert!(
+            oc_chained[1].abs() > 0.5,
+            "oc.y collapsed to 0 after zoom chain — sphere would be invisible"
+        );
     }
 
     #[test]
@@ -777,8 +802,13 @@ mod tests {
         let ab = a.offset_from(&b);
         let ba = b.offset_from(&a);
         for i in 0..3 {
-            assert!((ab[i] + ba[i]).abs() < 1e-5,
-                "axis {}: ab={} ba={}", i, ab[i], ba[i]);
+            assert!(
+                (ab[i] + ba[i]).abs() < 1e-5,
+                "axis {}: ab={} ba={}",
+                i,
+                ab[i],
+                ba[i]
+            );
         }
     }
 
@@ -792,8 +822,13 @@ mod tests {
         let bc = b.offset_from(&c);
         for i in 0..3 {
             let sum = ab[i] + bc[i];
-            assert!((ac[i] - sum).abs() < 1e-5,
-                "axis {}: ac={} ab+bc={}", i, ac[i], sum);
+            assert!(
+                (ac[i] - sum).abs() < 1e-5,
+                "axis {}: ac={} ab+bc={}",
+                i,
+                ac[i],
+                sum
+            );
         }
     }
 
@@ -809,7 +844,10 @@ mod tests {
                 assert!(
                     (o[i] - baseline[i]).abs() < 1e-5,
                     "depth {}: axis {}: {} vs baseline {}",
-                    depth, i, o[i], baseline[i],
+                    depth,
+                    i,
+                    o[i],
+                    baseline[i],
                 );
             }
         }
@@ -819,12 +857,21 @@ mod tests {
     fn zoom_in_then_zoom_out_preserves_world_xyz() {
         let mut p = WorldPos::from_world_xyz([1.234, 2.345, 0.567], 4);
         let before = p.to_world_xyz();
-        for _ in 0..16 { p.zoom_in(); }
-        for _ in 0..16 { p.zoom_out(); }
+        for _ in 0..16 {
+            p.zoom_in();
+        }
+        for _ in 0..16 {
+            p.zoom_out();
+        }
         let after = p.to_world_xyz();
         for i in 0..3 {
-            assert!((after[i] - before[i]).abs() < 1e-4,
-                "axis {}: {} -> {}", i, before[i], after[i]);
+            assert!(
+                (after[i] - before[i]).abs() < 1e-4,
+                "axis {}: {} -> {}",
+                i,
+                before[i],
+                after[i]
+            );
         }
     }
 
@@ -836,9 +883,14 @@ mod tests {
             p.zoom_in();
             let after = p.to_world_xyz();
             for i in 0..3 {
-                assert!((after[i] - before[i]).abs() < 1e-4,
+                assert!(
+                    (after[i] - before[i]).abs() < 1e-4,
                     "after {} zoom_ins, axis {}: {} -> {}",
-                    k + 1, i, before[i], after[i]);
+                    k + 1,
+                    i,
+                    before[i],
+                    after[i]
+                );
             }
         }
     }
@@ -851,8 +903,14 @@ mod tests {
             let a = p.to_world_xyz();
             let b = q.to_world_xyz();
             for i in 0..3 {
-                assert!((a[i] - b[i]).abs() < 1e-4,
-                    "depth {}: axis {}: {} vs {}", d, i, a[i], b[i]);
+                assert!(
+                    (a[i] - b[i]).abs() < 1e-4,
+                    "depth {}: axis {}: {} vs {}",
+                    d,
+                    i,
+                    a[i],
+                    b[i]
+                );
             }
         }
     }
@@ -866,9 +924,14 @@ mod tests {
             let deeper = base.deepened_to(d);
             let o = deeper.offset_from(&target);
             for i in 0..3 {
-                assert!((o[i] - base_o[i]).abs() < 1e-5,
+                assert!(
+                    (o[i] - base_o[i]).abs() < 1e-5,
                     "depth {}: axis {}: {} vs base {}",
-                    d, i, o[i], base_o[i]);
+                    d,
+                    i,
+                    o[i],
+                    base_o[i]
+                );
             }
         }
     }
@@ -892,7 +955,9 @@ mod tests {
         // precision even though to_world_xyz of either is bounded
         // by f32 precision at magnitude ~1.5.
         let mut anchor = Path::root();
-        for _ in 0..12 { anchor.push(slot_index(1, 1, 1) as u8); }
+        for _ in 0..12 {
+            anchor.push(slot_index(1, 1, 1) as u8);
+        }
         let a = WorldPos::new(anchor, [0.30, 0.50, 0.70]);
         let b = WorldPos::new(anchor, [0.20, 0.50, 0.70]);
         let o = a.offset_from(&b);
@@ -900,8 +965,12 @@ mod tests {
         let expected_x = 0.10 * cell;
         // f32 precision at magnitude `cell` is ~cell * 1e-7,
         // way below the 1e-5 *cell tolerance below.
-        assert!((o[0] - expected_x).abs() < cell * 1e-5,
-            "diff {} expected {}", o[0], expected_x);
+        assert!(
+            (o[0] - expected_x).abs() < cell * 1e-5,
+            "diff {} expected {}",
+            o[0],
+            expected_x
+        );
         assert!(o[1].abs() < cell * 1e-5);
         assert!(o[2].abs() < cell * 1e-5);
     }
@@ -940,7 +1009,9 @@ mod tests {
         for i in 0..3 {
             assert!(
                 (actual[i] - expected[i]).abs() < 1e-3,
-                "axis {i}: got {} expected {}", actual[i], expected[i],
+                "axis {i}: got {} expected {}",
+                actual[i],
+                expected[i],
             );
         }
     }
@@ -955,7 +1026,10 @@ mod tests {
         frame.truncate(frame.depth() - 3);
         let local = p.in_frame(&frame);
         for &v in &local {
-            assert!((0.0..super::WORLD_SIZE).contains(&v), "local {v} out of frame");
+            assert!(
+                (0.0..super::WORLD_SIZE).contains(&v),
+                "local {v} out of frame"
+            );
         }
     }
 

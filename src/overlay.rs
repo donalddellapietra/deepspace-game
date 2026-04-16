@@ -18,8 +18,8 @@
 //!
 //! Only compiled on non-wasm32 targets.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::runtime::{AnyObject, Imp, Sel};
 use objc2::sel;
@@ -27,7 +27,7 @@ use objc2_foundation::CGPoint;
 use raw_window_handle::HasWindowHandle;
 use winit::window::Window;
 use wry::WebViewExtMacOS;
-use wry::{dpi::*, Rect, WebViewBuilder};
+use wry::{Rect, WebViewBuilder, dpi::*};
 
 use crate::bridge::{GameStateUpdate, UiCommand};
 
@@ -100,7 +100,9 @@ pub fn push_state(update: &GameStateUpdate) {
 /// Call this once per frame from the render loop.
 pub fn flush_to_webview(webview: &wry::WebView) {
     let jsons: Vec<String> = {
-        let Ok(mut outbox) = OUTBOX.lock() else { return };
+        let Ok(mut outbox) = OUTBOX.lock() else {
+            return;
+        };
         outbox.drain(..).collect()
     };
     if !jsons.is_empty() {
@@ -303,7 +305,10 @@ fn route_ipc_message(body: &str) {
         // Forwarded key event
         if let Some(key) = val.get("__key") {
             let code = key.get("code").and_then(|c| c.as_str()).unwrap_or("");
-            let pressed = key.get("pressed").and_then(|p| p.as_bool()).unwrap_or(false);
+            let pressed = key
+                .get("pressed")
+                .and_then(|p| p.as_bool())
+                .unwrap_or(false);
             if let Ok(mut q) = FORWARDED_KEYS.lock() {
                 q.push((code.to_string(), pressed));
             }

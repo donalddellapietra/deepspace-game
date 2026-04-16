@@ -35,7 +35,9 @@ pub struct WorldBootstrap {
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
     match preset {
         WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
-        WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
+        WorldPreset::PlainTest => {
+            bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS))
+        }
     }
 }
 
@@ -189,7 +191,9 @@ pub fn plain_world(layers: u8) -> WorldState {
         let id = if depth == 1 {
             match fill {
                 UniformFill::Empty => lib.insert(empty_children()),
-                UniformFill::Block(block_type) => lib.insert(uniform_children(Child::Block(block_type))),
+                UniformFill::Block(block_type) => {
+                    lib.insert(uniform_children(Child::Block(block_type)))
+                }
             }
         } else {
             let child = uniform_subtree(lib, cache, depth - 1, fill);
@@ -274,12 +278,11 @@ pub fn plain_world(layers: u8) -> WorldState {
 fn bootstrap_demo_sphere_world() -> WorldBootstrap {
     let mut world = crate::world::worldgen::generate_world();
     let setup = crate::world::spherical_worldgen::demo_planet();
-    let (new_root, planet_path) =
-        crate::world::spherical_worldgen::install_at_root_center(
-            &mut world.library,
-            world.root,
-            &setup,
-        );
+    let (new_root, planet_path) = crate::world::spherical_worldgen::install_at_root_center(
+        &mut world.library,
+        world.root,
+        &setup,
+    );
     world.swap_root(new_root);
     let tree_depth = world.tree_depth();
     eprintln!(

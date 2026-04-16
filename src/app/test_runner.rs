@@ -24,7 +24,7 @@
 //! --screenshot PATH       Capture the rendered frame to PATH (PNG)
 //!                         after the warm-up + script settle, then exit.
 //! --exit-after-frames N   Exit after N rendered frames (default ~120).
-//! --timeout-secs SECS     Wall-clock kill switch (default 5.0). Triggers
+//! --timeout-secs SECS     Wall-clock kill switch (default 4.0). Triggers
 //!                         a screenshot + exit if the frame budget hasn't
 //!                         already done so. Catches perf regressions:
 //!                         a hung shader can't run a test forever.
@@ -67,7 +67,7 @@
 //!     --script "wait:30,break,wait:30" --exit-after-frames 90
 //! ```
 
-use crate::world::bootstrap::{WorldPreset, DEFAULT_PLAIN_LAYERS};
+use crate::world::bootstrap::{DEFAULT_PLAIN_LAYERS, WorldPreset};
 
 #[derive(Default, Debug, Clone)]
 pub struct TestConfig {
@@ -95,7 +95,7 @@ pub struct TestConfig {
     pub spawn_pitch: Option<f32>,
     pub screenshot: Option<String>,
     pub exit_after_frames: Option<u32>,
-    /// Wall-clock kill switch in seconds. Defaults to 5.0 so a
+    /// Wall-clock kill switch in seconds. Defaults to 4.0 so a
     /// perf regression (hung shader, runaway DDA) can't block the
     /// test loop indefinitely. Override with `--timeout-secs N`
     /// for scenarios that genuinely need longer settle time.
@@ -259,14 +259,12 @@ impl TestConfig {
 
     pub fn prefers_live_loop(&self) -> bool {
         self.screenshot.is_none()
-            && (
-                self.min_fps.is_some()
-                    || self.min_cadence_fps.is_some()
-                    || self.run_for_secs.is_some()
-                    || self.max_frame_gap_ms.is_some()
-                    || self.max_any_frame_ms.is_some()
-                    || self.require_webview
-            )
+            && (self.min_fps.is_some()
+                || self.min_cadence_fps.is_some()
+                || self.run_for_secs.is_some()
+                || self.max_frame_gap_ms.is_some()
+                || self.max_any_frame_ms.is_some()
+                || self.require_webview)
     }
 
     pub fn use_render_harness(&self) -> bool {
@@ -278,18 +276,32 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
     s.split(',')
         .filter_map(|raw| {
             let raw = raw.trim();
-            if raw.is_empty() { return None; }
-            if raw == "break" { return Some(ScriptCmd::Break); }
-            if raw == "place" { return Some(ScriptCmd::Place); }
-            if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
+            if raw.is_empty() {
+                return None;
+            }
+            if raw == "break" {
+                return Some(ScriptCmd::Break);
+            }
+            if raw == "place" {
+                return Some(ScriptCmd::Place);
+            }
+            if raw == "debug_overlay" {
+                return Some(ScriptCmd::ToggleDebugOverlay);
+            }
             if let Some(n) = raw.strip_prefix("wait:") {
-                if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
+                if let Ok(frames) = n.parse() {
+                    return Some(ScriptCmd::Wait(frames));
+                }
             }
             if let Some(n) = raw.strip_prefix("zoom_in:") {
-                if let Ok(steps) = n.parse() { return Some(ScriptCmd::ZoomIn(steps)); }
+                if let Ok(steps) = n.parse() {
+                    return Some(ScriptCmd::ZoomIn(steps));
+                }
             }
             if let Some(n) = raw.strip_prefix("zoom_out:") {
-                if let Ok(steps) = n.parse() { return Some(ScriptCmd::ZoomOut(steps)); }
+                if let Ok(steps) = n.parse() {
+                    return Some(ScriptCmd::ZoomOut(steps));
+                }
             }
             eprintln!("test_runner: ignoring unknown script command {raw:?}");
             None
@@ -449,7 +461,9 @@ pub struct TestRunner {
 
 impl TestRunner {
     pub fn from_config(cfg: TestConfig) -> Option<Self> {
-        if !cfg.is_active() { return None; }
+        if !cfg.is_active() {
+            return None;
+        }
         // If the caller asked for a wall-clock run, do not silently
         // pre-empt it with the old default 120-frame budget.
         let exit_after = match (cfg.exit_after_frames, cfg.run_for_secs) {
@@ -457,7 +471,7 @@ impl TestRunner {
             (None, Some(_)) => u32::MAX,
             (None, None) => 120,
         };
-        let timeout_secs = cfg.timeout_secs.unwrap_or(5.0);
+        let timeout_secs = cfg.timeout_secs.unwrap_or(4.0);
         let min_fps = cfg.min_fps;
         let min_cadence_fps = cfg.min_cadence_fps;
         let run_for_secs = cfg.run_for_secs;
@@ -500,8 +514,7 @@ impl TestRunner {
                         if worst_any_frame_ms as f32 > max_any_frame_ms {
                             eprintln!(
                                 "test_runner: hard frame stall detected: worst_any_frame_ms={} threshold_ms={:.2}",
-                                worst_any_frame_ms,
-                                max_any_frame_ms,
+                                worst_any_frame_ms, max_any_frame_ms,
                             );
                             print_monitor_summary(&monitor);
                             std::process::exit(1);
@@ -512,17 +525,20 @@ impl TestRunner {
                         if elapsed_secs >= run_for_secs {
                             print_monitor_summary(&monitor);
                             if monitor.perf_failed.load(Ordering::Relaxed) {
-                                eprintln!("test_runner: perf threshold failed during timed run, quitting");
+                                eprintln!(
+                                    "test_runner: perf threshold failed during timed run, quitting"
+                                );
                                 std::process::exit(1);
                             }
                             if require_webview && !monitor.webview_created.load(Ordering::Relaxed) {
-                                eprintln!("test_runner: timed run ended without webview creation, quitting");
+                                eprintln!(
+                                    "test_runner: timed run ended without webview creation, quitting"
+                                );
                                 std::process::exit(1);
                             }
                             eprintln!(
                                 "test_runner: run_for_secs={:.2} reached with {} rendered frames, quitting",
-                                run_for_secs,
-                                frame_count,
+                                run_for_secs, frame_count,
                             );
                             std::process::exit(0);
                         }
@@ -531,11 +547,19 @@ impl TestRunner {
                     if elapsed_secs >= timeout_secs {
                         print_monitor_summary(&monitor);
                         if require_webview && !monitor.webview_created.load(Ordering::Relaxed) {
-                            eprintln!("test_runner: wall-clock timeout hit before webview creation, quitting");
+                            eprintln!(
+                                "test_runner: wall-clock timeout hit before webview creation, quitting"
+                            );
                             std::process::exit(1);
                         }
-                        if min_fps.is_some() || min_cadence_fps.is_some() || run_for_secs.is_some() || max_frame_gap_ms.is_some() {
-                            eprintln!("test_runner: wall-clock timeout hit before perf test completed, quitting");
+                        if min_fps.is_some()
+                            || min_cadence_fps.is_some()
+                            || run_for_secs.is_some()
+                            || max_frame_gap_ms.is_some()
+                        {
+                            eprintln!(
+                                "test_runner: wall-clock timeout hit before perf test completed, quitting"
+                            );
                             std::process::exit(1);
                         }
                         eprintln!("test_runner: wall-clock timeout hit, quitting");
@@ -550,8 +574,12 @@ impl TestRunner {
         let mut schedule = Vec::new();
         for cmd in cfg.script {
             match cmd {
-                ScriptCmd::Wait(frames) => { t += frames; }
-                other => { schedule.push((t, other)); }
+                ScriptCmd::Wait(frames) => {
+                    t += frames;
+                }
+                other => {
+                    schedule.push((t, other));
+                }
             }
         }
         Some(TestRunner {
@@ -587,7 +615,12 @@ impl TestRunner {
         let mut due = Vec::new();
         let frame = self.frame;
         self.script.retain(|(at, cmd)| {
-            if *at <= frame { due.push(cmd.clone()); false } else { true }
+            if *at <= frame {
+                due.push(cmd.clone());
+                false
+            } else {
+                true
+            }
         });
         due
     }
@@ -604,12 +637,14 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
 
     let mut app = App::with_test_config(cfg.clone());
     let event_loop = EventLoop::new()?;
-    let window = Arc::new(event_loop.create_window(
-        WindowAttributes::default()
-            .with_title("Deep Space Render Harness")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
-            .with_visible(cfg.show_window),
-    )?);
+    let window = Arc::new(
+        event_loop.create_window(
+            WindowAttributes::default()
+                .with_title("Deep Space Render Harness")
+                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
+                .with_visible(cfg.show_window),
+        )?,
+    );
     let (tree_data, node_kinds, root_index) =
         crate::world::gpu::pack_tree(&app.world.library, app.world.root);
     let renderer = pollster::block_on(Renderer::new(
@@ -623,8 +658,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     renderer.resize(app.harness_width, app.harness_height);
     eprintln!(
         "render_harness: resize width={} height={}",
-        app.harness_width,
-        app.harness_height,
+        app.harness_width, app.harness_height,
     );
     app.window = Some(window);
     app.renderer = Some(renderer);
@@ -715,7 +749,15 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             let timed_out = test.timed_out();
             let exit_after = test.exit_after_frames;
             let screenshot = test.screenshot_path.clone();
-            (due, frame, frame_budget_done, timed_out, exit_after, screenshot, test.hard_frame_fail)
+            (
+                due,
+                frame,
+                frame_budget_done,
+                timed_out,
+                exit_after,
+                screenshot,
+                test.hard_frame_fail,
+            )
         };
 
         for cmd in due {
@@ -812,8 +854,12 @@ fn print_monitor_summary(monitor: &std::sync::Arc<TestMonitor>) {
     if let Ok(perf) = monitor.perf_samples.lock() {
         print_perf_summary_from_samples(
             &perf,
-            monitor.worst_any_frame_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
-            monitor.worst_any_dt_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
+            monitor
+                .worst_any_frame_ms
+                .load(std::sync::atomic::Ordering::Relaxed) as f64,
+            monitor
+                .worst_any_dt_ms
+                .load(std::sync::atomic::Ordering::Relaxed) as f64,
         );
     }
 }

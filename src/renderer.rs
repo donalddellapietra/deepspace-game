@@ -8,6 +8,7 @@
 
 use wgpu::util::DeviceExt;
 
+use crate::app::shells::MAX_CARTESIAN_SHELLS;
 use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
@@ -44,10 +45,12 @@ pub struct GpuUniforms {
     /// Body radii (used iff `root_kind == 1`). Stored in the body
     /// cell's local `[0, 1)` frame; the shader scales by 3.0
     /// (= WORLD_SIZE) to get shader-frame units.
-    pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
+    pub root_radii: [f32; 4], // [inner_r, outer_r, _, _]
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_jump: [f32; 4],
+    pub cartesian_shell_meta: [u32; 4],
+    pub cartesian_shell_pairs: [[u32; 4]; MAX_CARTESIAN_SHELLS / 2],
 }
 
 pub struct Renderer {
@@ -75,6 +78,8 @@ pub struct Renderer {
     root_face_meta: [u32; 4],
     root_face_bounds: [f32; 4],
     root_jump: [f32; 4],
+    cartesian_shell_meta: [u32; 4],
+    cartesian_shell_pairs: [[u32; 4]; MAX_CARTESIAN_SHELLS / 2],
     ribbon_count: u32,
     offscreen_texture: Option<wgpu::Texture>,
 }
@@ -158,7 +163,9 @@ impl Renderer {
             .expect("Failed to create GPU device");
 
         let surface_caps = surface.get_capabilities(&adapter);
-        let format = surface_caps.formats.iter()
+        let format = surface_caps
+            .formats
+            .iter()
             .find(|f| f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
@@ -234,6 +241,8 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_jump: [0.0, 0.0, 0.0, 1.0],
+            cartesian_shell_meta: [0; 4],
+            cartesian_shell_pairs: [[0; 4]; MAX_CARTESIAN_SHELLS / 2],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -241,7 +250,10 @@ impl Renderer {
         // allocate one stub entry).
         let ribbon_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ribbon"),
-            contents: bytemuck::cast_slice(&[GpuRibbonEntry { node_idx: 0, slot: 0 }]),
+            contents: bytemuck::cast_slice(&[GpuRibbonEntry {
+                node_idx: 0,
+                slot: 0,
+            }]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -254,62 +266,83 @@ impl Renderer {
             label: Some("ray_march"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
                 // Ancestor ribbon (binding 5).
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
             ],
         });
 
         let bind_group = make_bind_group(
-            &device, &bind_group_layout,
-            &tree_buffer, &camera_buffer, &palette_buffer,
-            &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
+            &device,
+            &bind_group_layout,
+            &tree_buffer,
+            &camera_buffer,
+            &palette_buffer,
+            &uniforms_buffer,
+            &node_kinds_buffer,
+            &ribbon_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ray_march"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../assets/shaders/ray_march.wgsl").into()
-            ),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::RAY_MARCH_WGSL.into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -348,19 +381,32 @@ impl Renderer {
         });
 
         Self {
-            device, queue, surface, config, pipeline, bind_group_layout,
-            tree_buffer, node_kinds_buffer,
-            camera_buffer, palette_buffer, uniforms_buffer,
+            device,
+            queue,
+            surface,
+            config,
+            pipeline,
+            bind_group_layout,
+            tree_buffer,
+            node_kinds_buffer,
+            camera_buffer,
+            palette_buffer,
+            uniforms_buffer,
             ribbon_buffer,
             bind_group,
-            root_index, node_count,
-            max_depth: MAX_DEPTH as u32, highlight_active: 0,
-            highlight_min: [0.0; 4], highlight_max: [0.0; 4],
+            root_index,
+            node_count,
+            max_depth: MAX_DEPTH as u32,
+            highlight_active: 0,
+            highlight_min: [0.0; 4],
+            highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
             root_radii: [0.0; 4],
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_jump: [0.0, 0.0, 0.0, 1.0],
+            cartesian_shell_meta: [0; 4],
+            cartesian_shell_pairs: [[0; 4]; MAX_CARTESIAN_SHELLS / 2],
             ribbon_count: 0,
             offscreen_texture: None,
         }
@@ -377,7 +423,10 @@ impl Renderer {
         };
         // Always upload at least one entry — empty storage buffers
         // break the bind group.
-        let stub_storage = [GpuRibbonEntry { node_idx: 0, slot: 0 }];
+        let stub_storage = [GpuRibbonEntry {
+            node_idx: 0,
+            slot: 0,
+        }];
         let payload: &[GpuRibbonEntry] = if truncated.is_empty() {
             &stub_storage
         } else {
@@ -389,20 +438,28 @@ impl Renderer {
 
         let mut recreate_bind_group = false;
         if needed > self.ribbon_buffer.size() {
-            self.ribbon_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("ribbon"),
-                contents: bytemuck::cast_slice(payload),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
+            self.ribbon_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("ribbon"),
+                        contents: bytemuck::cast_slice(payload),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    });
             recreate_bind_group = true;
         } else {
-            self.queue.write_buffer(&self.ribbon_buffer, 0, bytemuck::cast_slice(payload));
+            self.queue
+                .write_buffer(&self.ribbon_buffer, 0, bytemuck::cast_slice(payload));
         }
         if recreate_bind_group {
             self.bind_group = make_bind_group(
-                &self.device, &self.bind_group_layout,
-                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
-                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.device,
+                &self.bind_group_layout,
+                &self.tree_buffer,
+                &self.camera_buffer,
+                &self.palette_buffer,
+                &self.uniforms_buffer,
+                &self.node_kinds_buffer,
+                &self.ribbon_buffer,
             );
         }
         self.write_uniforms();
@@ -413,15 +470,16 @@ impl Renderer {
     /// cell's local `[0, 1)` frame.
     pub fn set_root_kind_cartesian(
         &mut self,
-        jump_origin: [f32; 3],
-        jump_scale: f32,
-        root_max_depth: u32,
+        shell_pairs: [[u32; 4]; MAX_CARTESIAN_SHELLS / 2],
+        shell_count: u32,
     ) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
-        self.root_face_meta = [0, 0, root_max_depth, 0];
+        self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
-        self.root_jump = [jump_origin[0], jump_origin[1], jump_origin[2], jump_scale];
+        self.root_jump = [0.0, 0.0, 0.0, 1.0];
+        self.cartesian_shell_meta = [shell_count, 0, 0, 0];
+        self.cartesian_shell_pairs = shell_pairs;
         self.write_uniforms();
     }
 
@@ -431,6 +489,8 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_jump = [0.0, 0.0, 0.0, 1.0];
+        self.cartesian_shell_meta = [0; 4];
+        self.cartesian_shell_pairs = [[0; 4]; MAX_CARTESIAN_SHELLS / 2];
         self.write_uniforms();
     }
 
@@ -448,11 +508,14 @@ impl Renderer {
         self.root_face_meta = [face_id, subtree_depth, 0, 0];
         self.root_face_bounds = bounds;
         self.root_jump = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
+        self.cartesian_shell_meta = [0; 4];
+        self.cartesian_shell_pairs = [[0; 4]; MAX_CARTESIAN_SHELLS / 2];
         self.write_uniforms();
     }
 
     pub fn update_palette(&self, palette: &GpuPalette) {
-        self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
+        self.queue
+            .write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
     }
 
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {
@@ -462,7 +525,9 @@ impl Renderer {
                 self.highlight_min = [min[0], min[1], min[2], 0.0];
                 self.highlight_max = [max[0], max[1], max[2], 0.0];
             }
-            None => { self.highlight_active = 0; }
+            None => {
+                self.highlight_active = 0;
+            }
         }
         self.write_uniforms();
     }
@@ -473,7 +538,9 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 { return; }
+        if width == 0 || height == 0 {
+            return;
+        }
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
@@ -482,7 +549,8 @@ impl Renderer {
     }
 
     pub fn update_camera(&self, camera: &GpuCamera) {
-        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
     }
 
     pub fn render_offscreen(&mut self) -> OffscreenRenderTiming {
@@ -513,9 +581,11 @@ impl Renderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let view_ms = view_start.elapsed().as_secs_f64() * 1000.0;
         let encode_start = std::time::Instant::now();
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("offscreen-frame"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("offscreen-frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("offscreen-ray-march"),
@@ -524,7 +594,10 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.1,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -577,7 +650,11 @@ impl Renderer {
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -599,9 +676,11 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("capture-frame"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capture-frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("capture-pass"),
@@ -610,7 +689,10 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.1,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -637,13 +719,19 @@ impl Renderer {
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let slice = buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
         self.device.poll(wgpu::PollType::Wait)?;
         rx.recv()??;
 
@@ -681,11 +769,15 @@ impl Renderer {
         let acquire_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
         let acquire_elapsed = acquire_start.elapsed();
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let encode_start = std::time::Instant::now();
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("frame"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ray_march"),
@@ -694,7 +786,10 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.1,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -745,32 +840,43 @@ impl Renderer {
         let mut recreate_bind_group = false;
 
         if tree_size > self.tree_buffer.size() {
-            self.tree_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tree"),
-                contents: bytemuck::cast_slice(tree_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
+            self.tree_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tree"),
+                    contents: bytemuck::cast_slice(tree_data),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
             recreate_bind_group = true;
         } else {
-            self.queue.write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
+            self.queue
+                .write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(tree_data));
         }
 
         if kinds_size > self.node_kinds_buffer.size() {
-            self.node_kinds_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("node_kinds"),
-                contents: bytemuck::cast_slice(node_kinds),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
+            self.node_kinds_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("node_kinds"),
+                        contents: bytemuck::cast_slice(node_kinds),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    });
             recreate_bind_group = true;
         } else {
-            self.queue.write_buffer(&self.node_kinds_buffer, 0, bytemuck::cast_slice(node_kinds));
+            self.queue
+                .write_buffer(&self.node_kinds_buffer, 0, bytemuck::cast_slice(node_kinds));
         }
 
         if recreate_bind_group {
             self.bind_group = make_bind_group(
-                &self.device, &self.bind_group_layout,
-                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
-                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.device,
+                &self.bind_group_layout,
+                &self.tree_buffer,
+                &self.camera_buffer,
+                &self.palette_buffer,
+                &self.uniforms_buffer,
+                &self.node_kinds_buffer,
+                &self.ribbon_buffer,
             );
         }
 
@@ -793,8 +899,11 @@ impl Renderer {
             root_face_meta: self.root_face_meta,
             root_face_bounds: self.root_face_bounds,
             root_jump: self.root_jump,
+            cartesian_shell_meta: self.cartesian_shell_meta,
+            cartesian_shell_pairs: self.cartesian_shell_pairs,
         };
-        self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.queue
+            .write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 }
 
@@ -812,12 +921,30 @@ fn make_bind_group(
         label: Some("ray_march"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tree.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: camera.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: palette.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: node_kinds.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: tree.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: palette.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: node_kinds.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: ribbon.as_entire_binding(),
+            },
         ],
     })
 }

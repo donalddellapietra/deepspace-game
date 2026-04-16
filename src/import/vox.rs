@@ -2,17 +2,13 @@
 
 use std::path::Path;
 
-use crate::world::palette::ColorRegistry;
 use super::VoxelModel;
+use crate::world::palette::ColorRegistry;
 
 /// Load the first model from a `.vox` file on disk.
-pub fn load_first_model(
-    path: &Path,
-    registry: &mut ColorRegistry,
-) -> Result<VoxelModel, String> {
-    let data = dot_vox::load(
-        path.to_str().ok_or("path contains non-UTF-8 characters")?,
-    ).map_err(|e| e.to_string())?;
+pub fn load_first_model(path: &Path, registry: &mut ColorRegistry) -> Result<VoxelModel, String> {
+    let data = dot_vox::load(path.to_str().ok_or("path contains non-UTF-8 characters")?)
+        .map_err(|e| e.to_string())?;
     let model = data.models.first().ok_or("no models in .vox file")?;
     Ok(convert_model(model, &data.palette, registry))
 }
@@ -62,5 +58,10 @@ fn convert_model(
         }
     }
 
-    VoxelModel { size_x: out_x, size_y: out_y, size_z: out_z, data }
+    VoxelModel {
+        size_x: out_x,
+        size_y: out_y,
+        size_z: out_z,
+        data,
+    }
 }
