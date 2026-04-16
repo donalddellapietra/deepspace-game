@@ -340,7 +340,20 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
+            // Cap Cartesian descent at uniforms.max_depth levels
+            // below the frame root. Prior code used MAX_STACK_DEPTH
+            // (64) which effectively meant "no cap" — the shader
+            // descended as deep as at_lod allowed, which at close
+            // range is never. That's why avg_descend=45 per ray.
+            // With this gate, rays stop at the LOD terminal at
+            // depth=max_depth and avg_descend/avg_empty should drop
+            // sharply. `+ 1u` so max_depth=3 actually permits
+            // descending 3 levels (at_max fires at depth+1>max_depth).
+            let cart_depth_limit = min(
+                uniforms.max_depth + 1u,
+                MAX_STACK_DEPTH,
+            );
+            r = march_cartesian(current_idx, ray_origin, ray_dir, cart_depth_limit, skip_slot);
         }
         if r.hit {
             r.frame_level = ribbon_level;
