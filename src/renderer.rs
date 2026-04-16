@@ -308,7 +308,7 @@ impl Renderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ray_march"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../assets/shaders/ray_march.wgsl").into()
+                crate::shader_compose::compose("main.wgsl").into()
             ),
         });
 

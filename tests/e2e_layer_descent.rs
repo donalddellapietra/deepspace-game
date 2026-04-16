@@ -18,11 +18,17 @@
 #[path = "e2e_layer_descent/harness.rs"]
 mod harness;
 
-use harness::{ScriptBuilder, run, tmp_dir};
+use harness::{ScriptBuilder, run, sky_dominance_top_half, tmp_dir};
 
 // Plain world with 40 layers. Spawn-depth 4 == UI layer 37
 // per `docs/gotchas/layer-vs-depth.md` (zoom_level = tree_depth -
 // anchor_depth + 1).
+//
+// `--spawn-xyz 1.5 1.01 1.5` bypasses `bootstrap::plain_surface_spawn`
+// (which targets the dirt/grass boundary at y≈0.95 and carves an air
+// pocket inside the ground) and places the camera one depth-4 cell
+// above the grass surface at y=1.0. From there, looking up sees open
+// sky; looking down sees grass.
 const HARNESS_ARGS: &[&str] = &[
     "--render-harness",
     "--plain-world",
@@ -30,18 +36,23 @@ const HARNESS_ARGS: &[&str] = &[
     "40",
     "--spawn-depth",
     "4",
+    "--spawn-xyz",
+    "1.5",
+    "1.01",
+    "1.5",
     "--spawn-pitch",
     "-1.5707",
     "--spawn-yaw",
     "0",
+    "--disable-highlight",
     "--harness-width",
     "640",
     "--harness-height",
     "360",
     "--exit-after-frames",
-    "120",
+    "300",
     "--timeout-secs",
-    "10",
+    "15",
 ];
 
 #[test]
@@ -223,6 +234,175 @@ fn layers_37_to_36_descend_and_break() {
         assert!(
             std::path::Path::new(p).exists(),
             "screenshot {p} missing"
+        );
+    }
+}
+
+/// Per-layer verifications, running as one harness process: for each
+/// of `N_LAYERS` iterations starting at `anchor_depth=4` (UI layer
+/// 37), look up → screenshot → assert sky visible; look down → probe
+/// → break → assert changed; zoom_in + teleport to the next layer.
+///
+/// Asserts, per layer:
+///   - sky pixel-dominance above threshold on the look-up screenshot,
+///   - exactly one break with `changed=true`,
+///   - probe anchor matches edit anchor.
+///
+/// Failure message names the failing layer so a regression at
+/// layer 35 says "layer 35", not "layer <unknown>".
+#[test]
+fn descent_sees_sky_and_breaks_at_every_layer() {
+    const N_LAYERS: u32 = 5;
+    // A sky-dominant aperture must cover at least this fraction of
+    // the top half. Permissive: at deep layers the nested aperture
+    // subtends less of the view. Tighten once we have data.
+    const SKY_THRESHOLD: f32 = 0.05;
+    // Starting anchor_depth. Layer labels below are purely mnemonic.
+    const START_ANCHOR_DEPTH: u32 = 4;
+
+    let dir = tmp_dir("descent_sees_sky_and_breaks");
+    let mut sky_paths = Vec::<String>::new();
+    let mut labels = Vec::<String>::new();
+
+    let mut script = ScriptBuilder::new();
+    for i in 0..N_LAYERS {
+        // Label is the nominal "UI layer" assuming monotonic descent
+        // (see the 2-layer test doc about why actual ui_layer drifts).
+        let anchor_depth_here = START_ANCHOR_DEPTH + i;
+        let label = format!("d{anchor_depth_here}");
+        let sky_path = dir
+            .join(format!("{label}_sky.png"))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&sky_path);
+
+        script = script
+            .emit(&label)
+            .look_up()
+            .wait(5)
+            .screenshot(&sky_path)
+            .look_down()
+            .wait(5)
+            .probe_down()
+            .break_()
+            .wait(10)
+            .zoom_in(1)
+            .teleport_above_last_edit()
+            .wait(5);
+
+        sky_paths.push(sky_path);
+        labels.push(label);
+    }
+    script = script.emit("descent_end");
+
+    let trace = run(HARNESS_ARGS, &script);
+
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr ---\n{}\n--- stdout tail ---\n{}",
+        trace.stderr,
+        trace
+            .stdout
+            .lines()
+            .rev()
+            .take(60)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    // Marks: N per-layer + 1 descent_end.
+    assert_eq!(
+        trace.marks.len(),
+        (N_LAYERS + 1) as usize,
+        "expected {} marks, got labels {:?}",
+        N_LAYERS + 1,
+        trace.marks.iter().map(|m| &m.label).collect::<Vec<_>>()
+    );
+    for (i, mark) in trace.marks.iter().take(N_LAYERS as usize).enumerate() {
+        assert_eq!(mark.label, labels[i], "mark {i} label mismatch");
+        assert_eq!(
+            mark.anchor_depth,
+            START_ANCHOR_DEPTH + i as u32,
+            "mark {} ({}) anchor_depth should be {}, got {}",
+            i,
+            labels[i],
+            START_ANCHOR_DEPTH + i as u32,
+            mark.anchor_depth,
+        );
+    }
+    assert_eq!(trace.marks.last().unwrap().label, "descent_end");
+
+    // Edits: one per layer, all changed=true, anchor_depth increasing.
+    assert_eq!(
+        trace.edits.len(),
+        N_LAYERS as usize,
+        "expected {} edits, got {:?}",
+        N_LAYERS,
+        trace.edits
+    );
+    for (i, edit) in trace.edits.iter().enumerate() {
+        assert_eq!(edit.action, "broke", "edit {} ({}) action", i, labels[i]);
+        assert!(
+            edit.changed,
+            "break at layer {} (anchor_depth {}) did not change world state",
+            labels[i],
+            START_ANCHOR_DEPTH + i as u32,
+        );
+        assert_eq!(
+            edit.anchor_depth,
+            START_ANCHOR_DEPTH + i as u32,
+            "edit {} ({}) anchor_depth",
+            i,
+            labels[i],
+        );
+        assert_eq!(
+            edit.anchor.len(),
+            (START_ANCHOR_DEPTH + i as u32) as usize,
+            "edit {} ({}) anchor path length",
+            i,
+            labels[i],
+        );
+    }
+
+    // Probes: one per layer, all hit, matching corresponding edit.
+    assert_eq!(
+        trace.probes.len(),
+        N_LAYERS as usize,
+        "expected {} probes, got {:?}",
+        N_LAYERS,
+        trace.probes
+    );
+    for (i, probe) in trace.probes.iter().enumerate() {
+        assert!(
+            probe.hit,
+            "probe at layer {} (anchor_depth {}) missed",
+            labels[i],
+            START_ANCHOR_DEPTH + i as u32,
+        );
+        assert_eq!(
+            probe.anchor, trace.edits[i].anchor,
+            "layer {} probe anchor doesn't match the cell break removed",
+            labels[i],
+        );
+    }
+
+    // Sky screenshots: each must be on disk and have above-threshold
+    // sky-dominance in the top half.
+    for (i, path) in sky_paths.iter().enumerate() {
+        assert!(
+            std::path::Path::new(path).exists(),
+            "layer {} sky screenshot {} missing",
+            labels[i],
+            path,
+        );
+        let frac = sky_dominance_top_half(path);
+        assert!(
+            frac >= SKY_THRESHOLD,
+            "layer {} sky screenshot {}: sky-dominance {:.3} below threshold {}",
+            labels[i],
+            path,
+            frac,
+            SKY_THRESHOLD,
         );
     }
 }

@@ -1,6 +1,7 @@
 pub mod world;
 pub mod import;
 pub mod renderer;
+pub mod shader_compose;
 pub mod bridge;
 pub mod game_state;
 pub mod camera;
