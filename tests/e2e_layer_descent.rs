@@ -50,9 +50,9 @@ const HARNESS_ARGS: &[&str] = &[
     "--harness-height",
     "360",
     "--exit-after-frames",
-    "300",
+    "1500",
     "--timeout-secs",
-    "15",
+    "60",
 ];
 
 #[test]
@@ -252,7 +252,10 @@ fn layers_37_to_36_descend_and_break() {
 /// layer 35 says "layer 35", not "layer <unknown>".
 #[test]
 fn descent_sees_sky_and_breaks_at_every_layer() {
-    const N_LAYERS: u32 = 5;
+    // Full descent: start at anchor_depth=4 (UI layer 37), break +
+    // zoom + teleport 37 times, ending at anchor_depth=40 (UI layer
+    // 1) — one break per layer, all the way down.
+    const N_LAYERS: u32 = 37;
     // A sky-dominant aperture must cover at least this fraction of
     // the top half. Permissive: at deep layers the nested aperture
     // subtends less of the view. Tighten once we have data.
