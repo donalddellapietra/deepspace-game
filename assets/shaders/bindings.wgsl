@@ -142,7 +142,13 @@ override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 override BASE_DETAIL_DEPTH: u32 = 4u;
 
 const MAX_FACE_DEPTH: u32 = 63u;
-const MAX_STACK_DEPTH: u32 = 64u;
+/// Cartesian DDA stack depth — must be ≥ `BASE_DETAIL_DEPTH + 1`.
+/// 5 matches the default BASE_DETAIL_DEPTH=4 exactly. Previously 64,
+/// which allocated 3.5 KB of per-fragment scratch and forced the
+/// Apple Silicon register allocator to spill to local memory on
+/// every DDA iteration. If you raise BASE_DETAIL_DEPTH, raise this
+/// to match or the shader silently caps descent.
+const MAX_STACK_DEPTH: u32 = 5u;
 
 struct HitResult {
     hit: bool,
