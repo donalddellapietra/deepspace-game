@@ -123,7 +123,9 @@ impl App {
         if let Some(depth) = self.forced_edit_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        self.anchor_depth().saturating_sub(1).max(1)
+        // Must reach at least render_path.depth + SHELL_BUDGET so the
+        // inner shell's march can fully descend to leaf blocks.
+        self.anchor_depth().max(1)
     }
 
     /// Sphere face-subtree edit depth.
@@ -414,35 +416,26 @@ impl App {
                 )
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                // Always raycast from root — cpu_raycast_in_frame's
-                // pop loop handles finding hits at any depth via
-                // slot-arithmetic frame transitions.
-                let frame_path = Path::root();
-                let mut hit = None;
-                let cam_local = self.camera.position.in_frame(&frame_path);
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
-                let min_depth = frame_path.depth() as u32 + 1;
-                let mut depth = self.edit_depth();
-                while depth >= min_depth {
-                    hit = edit::cpu_raycast_in_frame(
-                        &self.world.library,
-                        self.world.root,
-                        frame_path.as_slice(),
-                        cam_local,
-                        ray_dir,
-                        depth,
-                        self.cs_edit_depth(),
-                    );
-                    if hit.is_some() || depth == min_depth {
-                        break;
-                    }
-                    depth -= 1;
-                }
+                // Raycast from the render frame — f32 can only represent
+                // positions a few levels deeper than the frame root.
+                // cpu_raycast_in_frame's pop loop handles finding hits
+                // at coarser depths via slot-arithmetic frame transitions.
+                let frame_path = &self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame(frame_path);
+                let ray_dir = self.ray_dir_in_frame(frame_path);
+                let hit = edit::cpu_raycast_in_frame(
+                    &self.world.library,
+                    self.world.root,
+                    frame_path.as_slice(),
+                    cam_local,
+                    ray_dir,
+                    self.edit_depth(),
+                    self.cs_edit_depth(),
+                );
                 if hit.is_none() && self.startup_profile_frames < 16 {
                     eprintln!(
-                        "frame_raycast_cartesian_fallback_failed edit_depth={} min_depth={} render_path={:?}",
+                        "frame_raycast_cartesian_miss edit_depth={} render_path={:?}",
                         self.edit_depth(),
-                        min_depth,
                         frame_path.as_slice(),
                     );
                 }
@@ -656,7 +649,15 @@ impl App {
 
             if let Some(renderer) = &mut self.renderer {
                 renderer.update_tree(&tree_data, &node_kinds, r.frame_root_idx);
-                renderer.update_ribbon(&r.ribbon);
+                // Cap ribbon to limit GPU shell count. Each shell
+                // pops SHELL_BUDGET entries; 5 shells = 5 march calls.
+                let max_ribbon = (5 * SHELL_BUDGET) as usize;
+                let capped_ribbon = if r.ribbon.len() > max_ribbon {
+                    &r.ribbon[..max_ribbon]
+                } else {
+                    &r.ribbon
+                };
+                renderer.update_ribbon(capped_ribbon);
             }
             if self.render_harness {
                 eprintln!(

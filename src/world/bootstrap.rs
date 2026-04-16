@@ -309,15 +309,102 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
     }
 }
 
+/// Build a spawn position that tracks the dirt/grass boundary at any
+/// anchor depth. The boundary at y ≈ 0.95 (PLAIN_SURFACE_Y −
+/// PLAIN_GRASS_THICKNESS) is NOT ternary-rational: its base-3
+/// expansion is 0.2211̄ (repeating "2211"). This means every render
+/// frame at this y contains mixed dirt/grass children — the grid
+/// between different block colors is always visible.
+///
+/// f64 arithmetic loses precision past depth ~34 (cell_size drops
+/// below the f64 epsilon), so we use the exact periodic ternary
+/// expansion directly.
+pub fn plain_surface_spawn(anchor_depth: u8) -> WorldPos {
+    // y ≈ 0.95 in [0, WORLD_SIZE=3). Ternary expansion:
+    //   depth 1:  digit 0  (root y ∈ [0,1))
+    //   depth 2+: repeating [2, 2, 1, 1]
+    const Y_PATTERN: [usize; 4] = [2, 2, 1, 1];
+
+    let mut path = Path::root();
+    for d in 0..anchor_depth as usize {
+        let y_row = if d == 0 { 0 } else { Y_PATTERN[(d - 1) % 4] };
+        let slot = slot_index(1, y_row, 1); // x=1, z=1 center
+        path.push(slot as u8);
+    }
+
+    // Camera near center of cell. After carve_air_pocket clears
+    // this cell, the camera is in a 1-block air pocket looking at
+    // surrounding dirt/grass blocks.
+    WorldPos::new(path, [0.5, 0.5, 0.5])
+}
+
+/// Carve a 3x3x3-block air cavity at the camera's anchor position.
+///
+/// Clears the cell at `anchor.depth() - 1` (the parent of the leaf)
+/// to `Child::Empty`. Since that parent cell contains a 3x3x3 grid
+/// of leaf blocks, this creates a 27-block air cavity. The camera
+/// inside the cavity can see 3x3 grids on each wall — with the
+/// y-axis showing different materials where the dirt/grass boundary
+/// crosses the cavity.
+///
+/// The carve is 1 level above the anchor's leaf, which is still
+/// below the render frame (anchor − RENDER_FRAME_K), so it doesn't
+/// affect frame computation.
+pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path) {
+    if anchor.depth() < 2 { return; }
+    let slots = anchor.as_slice();
+    // Walk to depth (anchor_depth - 2): the grandparent of the leaf.
+    // We'll clear the child at slots[anchor_depth - 2] which is the
+    // parent cell of the leaf.
+    let carve_depth = (anchor.depth() - 1) as usize; // slot index of parent cell
+    let mut node_stack: Vec<(NodeId, NodeKind)> = Vec::with_capacity(carve_depth);
+    let mut node_id = world.root;
+    for &slot in &slots[..carve_depth] {
+        let Some(node) = world.library.get(node_id) else { return };
+        node_stack.push((node_id, node.kind));
+        match node.children[slot as usize] {
+            Child::Node(child_id) => node_id = child_id,
+            _ => return,
+        }
+    }
+    let Some(node) = world.library.get(node_id) else { return };
+    node_stack.push((node_id, node.kind));
+
+    // The cell to clear is at slots[carve_depth - 1] in node_stack.last().
+    // Wait — carve_depth is the slot index we want to CLEAR at.
+    // node_stack.last() is the node that CONTAINS slots[carve_depth].
+    // But actually, we walked up to (but not including) carve_depth in
+    // the forward walk. So node_stack has `carve_depth` entries.
+    // node_stack[carve_depth-1] is the node at depth carve_depth-1,
+    // and the child at slots[carve_depth-1] is the cell to clear.
+
+    let clear_slot = slots[carve_depth] as usize; // the parent-of-leaf slot
+
+    // Build replacement bottom-up.
+    let mut replacement: Option<NodeId> = None;
+    for (i, &(nid, kind)) in node_stack.iter().enumerate().rev() {
+        let Some(node) = world.library.get(nid) else { return };
+        let mut new_children = node.children;
+        if let Some(rep) = replacement {
+            new_children[slots[i] as usize] = Child::Node(rep);
+        } else {
+            // Bottom of chain: clear the parent-of-leaf cell.
+            new_children[clear_slot] = Child::Empty;
+        }
+        replacement = Some(world.library.insert_with_kind(new_children, kind));
+    }
+    if let Some(new_root) = replacement {
+        world.swap_root(new_root);
+    }
+}
+
 fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
     let world = plain_world(plain_layers);
-    // Construct at shallow depth (2) where f32 decomposition is
-    // precise, then deepen to anchor depth 8 via pure slot arithmetic.
-    let spawn_pos = WorldPos::from_frame_local(
-        &Path::root(),
-        [1.5, (PLAIN_SURFACE_Y + 0.08).min(WORLD_SIZE - 0.001), 1.5],
-        2,
-    ).deepened_to(8);
+    let spawn_pos = plain_surface_spawn(8);
+    // NOTE: don't carve here — the default spawn is at depth 8 and
+    // carving here would clear a cell that's an ancestor of any deeper
+    // --spawn-depth override. Carving happens in App::with_test_config
+    // after the final spawn position is known.
     WorldBootstrap {
         world,
         planet_path: None,

@@ -1011,7 +1011,7 @@ fn sphere_in_face_window(
 /// returns hit=false so the caller can pop to the ancestor ribbon.
 fn march_cartesian(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
-    depth_limit: u32, skip_node_idx: u32,
+    depth_limit: u32, skip_slot: u32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -1199,10 +1199,12 @@ fn march_cartesian(
             }
 
             // Shell skip: when re-entering a parent shell after a
-            // ribbon pop, skip the child node we already traversed
-            // in the inner shell. This prevents redundant descent
-            // into the same subtree at each ribbon level.
-            if depth == 0u && child_idx == skip_node_idx {
+            // ribbon pop, skip the SLOT we already traversed in the
+            // inner shell. Uses slot index (not node_idx) so it works
+            // correctly in deduplicated trees where siblings share the
+            // same packed node.
+            let cell_slot = u32(s_cell[depth].x) + u32(s_cell[depth].y) * 3u + u32(s_cell[depth].z) * 9u;
+            if depth == 0u && cell_slot == skip_slot {
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -1220,7 +1222,9 @@ fn march_cartesian(
             }
 
             // Cartesian Node: depth/LOD check, then descend.
-            let at_max = depth + 1u >= depth_limit || depth + 1u >= MAX_STACK_DEPTH;
+            // SHELL_BUDGET=3 means 3 descents: 0→1→2→3. Use strict
+            // greater-than so depth_limit=3 lets depth reach 3.
+            let at_max = depth + 1u > depth_limit || depth + 1u >= MAX_STACK_DEPTH;
             let child_cell_size = s_cell_size[depth] / 3.0;
             let cell_world_size = child_cell_size;
             let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
@@ -1317,10 +1321,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var cur_hmax = uniforms.highlight_max.xyz;
     var cur_scale: f32 = 1.0;
 
-    // skip_node_idx: after a ribbon pop, the inner shell's root node
-    // index is passed here so march_cartesian skips re-entering that
-    // subtree (it was already traversed by the inner shell).
-    var skip_node_idx: u32 = 0xFFFFFFFFu;
+    // skip_slot: after a ribbon pop, the slot index (in the parent)
+    // of the child we just left. march_cartesian skips this slot at
+    // depth 0 to avoid re-entering the subtree already traversed by
+    // the inner shell. Uses slot (not node_idx) for dedup correctness.
+    var skip_slot: u32 = 0xFFFFFFFFu;
 
     var hops: u32 = 0u;
     loop {
@@ -1338,7 +1343,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            r = march_cartesian(current_idx, ray_origin, ray_dir, SHELL_BUDGET, skip_node_idx);
+            r = march_cartesian(current_idx, ray_origin, ray_dir, SHELL_BUDGET, skip_slot);
         }
         if r.hit {
             r.frame_level = ribbon_level;
@@ -1411,7 +1416,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 let sy = i32((s / 3u) % 3u);
                 let sz = i32(s / 9u);
                 let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
-                skip_node_idx = current_idx;
+                skip_slot = entry.slot;
                 ray_origin = slot_off + ray_origin / 3.0;
                 ray_dir = ray_dir / 3.0;
                 if uniforms.highlight_active != 0u {
