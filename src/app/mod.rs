@@ -154,6 +154,11 @@ pub struct App {
     pub(super) last_highlight_set_ms: f64,
     pub(super) highlight_epoch: u64,
     pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
+    /// Slot path from the last successful break/place edit. Used as a
+    /// preserve_path during the next GPU pack so the packer keeps
+    /// fine detail along the edit path visible, even when the camera
+    /// is far enough from the surface that LOD would normally collapse it.
+    pub(super) last_edit_slots: Option<Path>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -281,6 +286,7 @@ impl App {
             last_highlight_set_ms: 0.0,
             highlight_epoch: 0,
             cached_highlight: None,
+            last_edit_slots: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]

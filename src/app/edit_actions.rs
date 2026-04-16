@@ -23,11 +23,12 @@ const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
 const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
-/// Per-shell depth budget for the GPU ray marcher. Must match
-/// `SHELL_BUDGET` in `ray_march.wgsl`. Each `march_cartesian` call
-/// descends at most this many levels. The ribbon provides outer
-/// shells for coarser context.
-const SHELL_BUDGET: u32 = 3;
+/// Minimum preserve depth per ribbon shell in the GPU pack. This
+/// ensures each shell in the packed tree has enough un-collapsed
+/// nodes for the shader's LOD-bounded DDA to descend into. The
+/// shader itself has no per-shell budget — it descends as deep as
+/// LOD allows.
+const SHELL_PRESERVE_DEPTH: u8 = 6;
 
 impl App {
     fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
@@ -123,8 +124,8 @@ impl App {
         if let Some(depth) = self.forced_edit_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        // Must reach at least render_path.depth + SHELL_BUDGET so the
-        // inner shell's march can fully descend to leaf blocks.
+        // Edit depth = anchor depth. The CPU raycast's pop loop
+        // ensures the ray reaches the surface at this resolution.
         self.anchor_depth().max(1)
     }
 
@@ -431,7 +432,7 @@ impl App {
                     ray_dir,
                     self.edit_depth(),
                     self.cs_edit_depth(),
-                    Some(SHELL_BUDGET),
+                    None,
                 );
                 if hit.is_none() && self.startup_profile_frames < 16 {
                     eprintln!(
@@ -518,6 +519,15 @@ impl App {
             return;
         }
 
+        // Store the edit path's slot sequence so upload_tree_lod can
+        // preserve it, making the fine edit visible in the packed tree
+        // even when the camera is far enough that LOD would collapse it.
+        let mut edit_slots = Path::root();
+        for &(_, slot) in &hit.path {
+            edit_slots.push(slot as u8);
+        }
+        self.last_edit_slots = Some(edit_slots);
+
         let changed = edit::break_block(&mut self.world, &hit);
         eprintln!("do_break: changed={changed}");
         if changed {
@@ -538,6 +548,13 @@ impl App {
             hit.place_path.as_ref().map(|p| p.len()),
             self.ui.active_slot,
         );
+
+        // Store edit slot path for preserve_paths.
+        let mut edit_slots = Path::root();
+        for &(_, slot) in &hit.path {
+            edit_slots.push(slot as u8);
+        }
+        self.last_edit_slots = Some(edit_slots);
 
         match &self.ui.slots[self.ui.active_slot] {
             HotbarItem::Block(block_type) => {
@@ -597,34 +614,37 @@ impl App {
                 if intended_frame.logical_path != intended_frame.render_path {
                     preserve_path_storage.push(intended_frame.logical_path);
                 }
+                // If a recent edit landed deeper than the render frame,
+                // preserve the exact slot path so the packer keeps
+                // fine-grained detail along the edit visible.
+                if let Some(ref edit_path) = self.last_edit_slots {
+                    preserve_path_storage.push(*edit_path);
+                }
                 let preserve_paths: Vec<&[u8]> =
                     preserve_path_storage.iter().map(Path::as_slice).collect();
-                // Build preserve regions: keep full detail around
-                // the render frame AND each ribbon-reachable shell.
-                // The shader multi-pops SHELL_BUDGET entries at a time,
-                // then descends SHELL_BUDGET levels.  Preserve enough
-                // nodes at each shell so the packed buffer has the
-                // detail the shader needs.
+                // Preserve regions: keep enough detail at each
+                // ribbon-ancestor shell so the shader's LOD-bounded
+                // DDA can descend into the packed tree. Each shell
+                // gets SHELL_PRESERVE_DEPTH levels of un-collapsed
+                // nodes; the LOD check in the shader decides how
+                // deep to actually go at render time.
                 let mut preserve_regions = Vec::new();
                 if matches!(intended_frame.kind, ActiveFrameKind::Cartesian)
                     && !intended_frame.render_path.is_root()
                 {
+                    let rd = intended_frame.render_path.depth();
                     // The render frame itself.
                     preserve_regions.push((
                         intended_frame.render_path,
-                        SHELL_BUDGET.min(u8::MAX as u32) as u8,
+                        SHELL_PRESERVE_DEPTH,
                     ));
-                    // Each ribbon-ancestor shell: pop SHELL_BUDGET
-                    // levels from the current depth, then the shader
-                    // descends SHELL_BUDGET levels from there.
-                    let rd = intended_frame.render_path.depth();
-                    let sb = SHELL_BUDGET as u8;
-                    let mut d = rd.saturating_sub(sb);
-                    while d > 0 {
+                    // Each ribbon-ancestor shell: pop 1 level at a
+                    // time from the render frame to the root,
+                    // preserving SHELL_PRESERVE_DEPTH levels at each.
+                    for d in (1..rd).rev() {
                         let mut ancestor = intended_frame.render_path;
                         ancestor.truncate(d);
-                        preserve_regions.push((ancestor, sb));
-                        d = d.saturating_sub(sb);
+                        preserve_regions.push((ancestor, SHELL_PRESERVE_DEPTH));
                     }
                 }
                 gpu::pack_tree_lod_selective(

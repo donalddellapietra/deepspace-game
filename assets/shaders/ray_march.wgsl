@@ -326,11 +326,11 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
 const FACE_ROOT_LOD_THRESHOLD_PIXELS: f32 = 4.0;
 
-// Shell architecture: each march_cartesian call uses a bounded depth
-// budget. The ribbon provides outer shells for context at coarser
-// scales. This prevents pathological traversal in heavily deduplicated
-// trees where depth_limit=6+ causes the DDA to exhaust iterations.
-const SHELL_BUDGET: u32 = 3u;
+// Each march_cartesian call can descend up to MAX_STACK_DEPTH levels.
+// The DDA's LOD check (`lod_pixels < 1.0`) naturally stops descent
+// when cells become sub-pixel — no artificial budget needed.
+// The ribbon provides ancestor shells via single-level pops; skip_slot
+// prevents re-entering the immediate child that was already traversed.
 
 fn sample_face_node(node_idx: u32,
                     un_in: f32, vn_in: f32, rn_in: f32,
@@ -1222,8 +1222,8 @@ fn march_cartesian(
             }
 
             // Cartesian Node: depth/LOD check, then descend.
-            // SHELL_BUDGET=3 means 3 descents: 0→1→2→3. Use strict
-            // greater-than so depth_limit=3 lets depth reach 3.
+            // depth_limit = MAX_STACK_DEPTH — LOD controls the
+            // effective depth, not an artificial per-shell budget.
             let at_max = depth + 1u > depth_limit || depth + 1u >= MAX_STACK_DEPTH;
             let child_cell_size = s_cell_size[depth] / 3.0;
             let cell_world_size = child_cell_size;
@@ -1343,7 +1343,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            r = march_cartesian(current_idx, ray_origin, ray_dir, SHELL_BUDGET, skip_slot);
+            r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
         }
         if r.hit {
             r.frame_level = ribbon_level;
@@ -1403,12 +1403,10 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else {
             // Single-level ribbon pop: pop exactly 1 ancestor entry
             // per outer-loop iteration, then re-enter march_cartesian.
-            // Multi-pop (SHELL_BUDGET at a time) skips intermediate
-            // levels whose content the inner shell never traversed —
-            // surfaces between the frame root and the outer shell
-            // become invisible.  Single pop keeps skip_slot correct
-            // (it only skips the immediate child, which WAS fully
-            // traversed by the prior march_cartesian call).
+            // skip_slot correctly covers only the immediate child
+            // (which the prior march_cartesian fully traversed via
+            // LOD-bounded DDA). Multi-pop would skip intermediate
+            // levels containing un-traversed surface detail.
             var pops: u32 = 0u;
             loop {
                 if pops >= 1u { break; }

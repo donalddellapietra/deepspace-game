@@ -88,18 +88,15 @@ pub fn cpu_raycast_in_frame(
     )
 }
 
-/// Frame-aware raycast with an explicit per-shell depth budget.
+/// Frame-aware raycast that mirrors the shader's ribbon-pop
+/// architecture. Each shell's DDA descends from the shell root
+/// toward `max_depth`, bounded only by the remaining depth (no
+/// artificial per-shell budget). On miss, pops one ribbon level
+/// and retries.
 ///
-/// When `shell_budget` is `Some(n)`, the raycast mirrors the GPU
-/// shader's behaviour: after the initial frame miss, pop `n` levels
-/// at once and descend at most `n` levels per shell.  This ensures
-/// the CPU hit depth never exceeds what the shader can render, so
-/// edits are always visible.
-///
-/// When `shell_budget` is `None`, the raycast uses an unbounded
-/// depth per shell (`max_depth - current_depth`), which is useful
-/// for tests that need root-to-leaf precision regardless of the
-/// shader's shell architecture.
+/// This ensures the CPU hit depth matches what the shader renders
+/// (LOD-bounded, not budget-bounded), so edits always land at the
+/// user's zoom resolution.
 pub fn cpu_raycast_in_frame_with_budget(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -108,7 +105,7 @@ pub fn cpu_raycast_in_frame_with_budget(
     ray_dir: [f32; 3],
     max_depth: u32,
     max_face_depth: u32,
-    shell_budget: Option<u32>,
+    _shell_budget: Option<u32>,
 ) -> Option<HitInfo> {
     // Walk world_root down frame_path collecting (parent_id, slot)
     // entries AND the chain of NodeIds. The chain is used as
@@ -138,13 +135,11 @@ pub fn cpu_raycast_in_frame_with_budget(
     let mut ray_origin = cam_local;
     let mut ray_dir = ray_dir;
     let total_max_depth = max_depth;
-    let budget = shell_budget.unwrap_or(u32::MAX);
 
     loop {
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth
-            .saturating_sub(current_frame_depth as u32)
-            .min(budget);
+            .saturating_sub(current_frame_depth as u32);
 
         // Frame-root NodeKind dispatch (mirror of the renderer's
         // root_kind). When the frame IS a sphere body, the body's
