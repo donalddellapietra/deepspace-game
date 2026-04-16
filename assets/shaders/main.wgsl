@@ -110,12 +110,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if ray_steps >= 2048u {
             atomicAdd(&shader_stats.max_iter_count, 1u);
         }
-        atomicAdd(&shader_stats.sum_steps_div4, ray_steps >> 2u);
+        // Round up on the /4 divide so single-step rays are
+        // detectable (otherwise ray_steps=1 shifts to 0 and we lose
+        // the signal at high LOD thresholds). u32 sum at 2560x1440
+        // with avg_steps=170 = 630M, fits with room to spare.
+        atomicAdd(&shader_stats.sum_steps_div4, (ray_steps + 3u) >> 2u);
         atomicMax(&shader_stats.max_steps, ray_steps);
-        atomicAdd(&shader_stats.sum_steps_oob_div4, ray_steps_oob >> 2u);
-        atomicAdd(&shader_stats.sum_steps_empty_div4, ray_steps_empty >> 2u);
-        atomicAdd(&shader_stats.sum_steps_node_descend_div4, ray_steps_node_descend >> 2u);
-        atomicAdd(&shader_stats.sum_steps_lod_terminal_div4, ray_steps_lod_terminal >> 2u);
+        atomicAdd(&shader_stats.sum_steps_oob_div4, (ray_steps_oob + 3u) >> 2u);
+        atomicAdd(&shader_stats.sum_steps_empty_div4, (ray_steps_empty + 3u) >> 2u);
+        atomicAdd(&shader_stats.sum_steps_node_descend_div4, (ray_steps_node_descend + 3u) >> 2u);
+        atomicAdd(&shader_stats.sum_steps_lod_terminal_div4, (ray_steps_lod_terminal + 3u) >> 2u);
     }
 
     return vec4<f32>(color, 1.0);

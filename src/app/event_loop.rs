@@ -139,6 +139,8 @@ impl App {
         eprintln!("startup_perf {source}: tree_packed ms={:.2} nodes={}", pack_elapsed.as_secs_f64() * 1000.0, tree_data.len() / 27);
         let renderer_start = std::time::Instant::now();
         let shader_stats_enabled = self.shader_stats_enabled;
+        let lod_pixel_threshold = self.lod_pixel_threshold;
+        let lod_base_depth = self.lod_base_depth;
         let renderer = pollster::block_on(
             Renderer::new(
                 window,
@@ -151,6 +153,8 @@ impl App {
                     wgpu::PresentMode::AutoVsync
                 },
                 shader_stats_enabled,
+                lod_pixel_threshold,
+                lod_base_depth,
             ),
         );
         let renderer_elapsed = renderer_start.elapsed();

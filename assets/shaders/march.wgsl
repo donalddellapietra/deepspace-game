@@ -229,7 +229,14 @@ fn march_cartesian(
             let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
             let ray_dist = max(min_side * ray_metric, 0.001);
             let lod_pixels = cell_world_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
-            let at_lod = lod_pixels < 1.0;
+            // Distance-based LOD: stop descending when the child
+            // cell would be smaller than LOD_PIXEL_THRESHOLD pixels
+            // on screen. Tunable override (default 1.0 = strict
+            // Nyquist; higher values descend less). This is
+            // invariant under zoom: the same physical content
+            // produces the same lod_pixels regardless of what
+            // `anchor_depth` the frame is rooted at.
+            let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
 
             if at_max || at_lod {
                 if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
@@ -340,19 +347,22 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            // Cap Cartesian descent at uniforms.max_depth levels
-            // below the frame root. Prior code used MAX_STACK_DEPTH
-            // (64) which effectively meant "no cap" — the shader
-            // descended as deep as at_lod allowed, which at close
-            // range is never. That's why avg_descend=45 per ray.
-            // With this gate, rays stop at the LOD terminal at
-            // depth=max_depth and avg_descend/avg_empty should drop
-            // sharply. `+ 1u` so max_depth=3 actually permits
-            // descending 3 levels (at_max fires at depth+1>max_depth).
-            let cart_depth_limit = min(
-                uniforms.max_depth + 1u,
-                MAX_STACK_DEPTH,
+            // Ribbon-level LOD budget: the ancestor pop count is
+            // the tree's native distance metric. Inside our anchor
+            // cell (ribbon_level=0) we allow `BASE_DETAIL_DEPTH`
+            // levels of descent; each additional shell (ribbon pop)
+            // drops the budget by one, bottoming out at 1. This
+            // gives cubic LOD shells that are invariant under zoom
+            // — zooming out grows the ribbon by one outer shell at
+            // budget=1 and leaves everything else unchanged.
+            // Nyquist (LOD_PIXEL_THRESHOLD) still acts as an inner
+            // floor so we don't descend into sub-pixel detail.
+            let detail_budget = select(
+                1u,
+                BASE_DETAIL_DEPTH - ribbon_level,
+                ribbon_level < BASE_DETAIL_DEPTH,
             );
+            let cart_depth_limit = min(detail_budget, MAX_STACK_DEPTH);
             r = march_cartesian(current_idx, ray_origin, ray_dir, cart_depth_limit, skip_slot);
         }
         if r.hit {

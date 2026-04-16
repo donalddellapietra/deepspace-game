@@ -73,6 +73,46 @@ if [ "$SEL" = "world" ] || [ "$SEL" = "all" ]; then
   run "world_sphere" --sphere-world --harness-width 1280 --harness-height 720 --spawn-depth 6
 fi
 
+if [ "$SEL" = "grassland" ] || [ "$SEL" = "all" ]; then
+  echo "### MATRIX: grassland zoom (plain, retina 2560x1440, --shader-stats) ###"
+  # Stationary overlook at various anchor depths. Simulates the
+  # user's "overlooking grassland, zoom out to layer 37, slow" case.
+  # Invariant we care about: avg_steps and gpu_pass should stay
+  # roughly flat across zoom levels when distance-based LOD works.
+  for d in 3 5 8 12 17; do
+    run "grassland_still_d${d}" \
+      --harness-width 2560 --harness-height 1440 \
+      --spawn-depth "$d" --spawn-pitch -1.0 --shader-stats
+  done
+
+  # Zoom-out walk (simulated): start at d=8 (layer 33) and issue
+  # zoom_out steps. Each zoom_out drops anchor_depth by 1; with the
+  # OLD level-count cap this would linearly slow down the frame, with
+  # the distance-based LOD it should stay flat. Each step takes N
+  # frames to settle (pack + LOD upload) so we space them.
+  run "grassland_zoom_out_walk" \
+    --harness-width 2560 --harness-height 1440 \
+    --spawn-depth 8 --spawn-pitch -1.0 --shader-stats \
+    --script "wait:30,zoom_out:1,wait:40,zoom_out:1,wait:40,zoom_out:1,wait:40,zoom_out:1,wait:40,zoom_out:1,wait:100"
+
+  # Zoom-in walk: start at d=3 (layer 38, the user's specific case)
+  # and zoom back in. Confirms symmetry.
+  run "grassland_zoom_in_walk" \
+    --harness-width 2560 --harness-height 1440 \
+    --spawn-depth 3 --spawn-pitch -1.0 --shader-stats \
+    --script "wait:30,zoom_in:1,wait:40,zoom_in:1,wait:40,zoom_in:1,wait:40,zoom_in:1,wait:40,zoom_in:1,wait:100"
+
+  # Tightness sweep at the user's problem spot: depth=3 layer=38
+  # across LOD thresholds. Tells us how much visual detail each ms
+  # of perf buys.
+  for lp in 1 10 20 50 100; do
+    run "grassland_d3_lod${lp}" \
+      --harness-width 2560 --harness-height 1440 \
+      --spawn-depth 3 --spawn-pitch -1.0 --shader-stats \
+      --lod-pixels "$lp"
+  done
+fi
+
 if [ "$SEL" = "room" ] || [ "$SEL" = "all" ]; then
   echo "### MATRIX: room / openness (1280x720, plain, --shader-stats) ###"
   # Baseline: flat ground, camera one cell up. Every ray hits the

@@ -155,6 +155,13 @@ pub struct App {
     /// can emit per-frame shader stats when the `--shader-stats`
     /// flag is set.
     pub(super) shader_stats_enabled: bool,
+    /// Nyquist LOD pixel threshold for the Cartesian shader.
+    /// Threaded to `Renderer::new` where it's baked into the
+    /// pipeline as a WGSL `override` constant.
+    pub(super) lod_pixel_threshold: f32,
+    /// Ribbon-level base detail budget. See bindings.wgsl
+    /// `BASE_DETAIL_DEPTH`.
+    pub(super) lod_base_depth: u32,
     pub(super) last_highlight_raycast_ms: f64,
     pub(super) last_highlight_set_ms: f64,
     /// Cost of packing the tree into GPU-friendly form. Set by
@@ -202,6 +209,10 @@ impl App {
         let forced_visual_depth = test_cfg.force_visual_depth;
         let forced_edit_depth = test_cfg.force_edit_depth;
         let shader_stats_enabled = test_cfg.shader_stats;
+        // Nyquist floor: sub-pixel rejection only. Primary LOD gate
+        // is ribbon-level-based (`lod_base_depth`).
+        let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
+        let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let mut world = bootstrap.world;
@@ -307,6 +318,8 @@ impl App {
             harness_width,
             harness_height,
             shader_stats_enabled,
+            lod_pixel_threshold,
+            lod_base_depth,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
             last_pack_ms: 0.0,

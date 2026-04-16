@@ -18,6 +18,8 @@ impl Renderer {
         root_index: u32,
         present_mode: wgpu::PresentMode,
         shader_stats_enabled: bool,
+        lod_pixel_threshold: f32,
+        lod_base_depth: u32,
     ) -> Self {
         let size = window.inner_size();
 
@@ -248,15 +250,22 @@ impl Renderer {
             push_constant_ranges: &[],
         });
 
-        let stats_constants: &[(&str, f64)] = if shader_stats_enabled {
-            &[("ENABLE_STATS", 1.0)]
-        } else {
-            &[("ENABLE_STATS", 0.0)]
-        };
+        let lod_pixels_const = lod_pixel_threshold as f64;
+        let enable_stats_const = if shader_stats_enabled { 1.0 } else { 0.0 };
+        let base_detail_depth_const = lod_base_depth as f64;
+        let override_constants: [(&str, f64); 3] = [
+            ("ENABLE_STATS", enable_stats_const),
+            ("LOD_PIXEL_THRESHOLD", lod_pixels_const),
+            ("BASE_DETAIL_DEPTH", base_detail_depth_const),
+        ];
         let frag_compilation_options = wgpu::PipelineCompilationOptions {
-            constants: stats_constants,
+            constants: &override_constants,
             zero_initialize_workgroup_memory: false,
         };
+        eprintln!(
+            "renderer_pipeline lod_pixels={:.2} lod_base_depth={} shader_stats={}",
+            lod_pixel_threshold, lod_base_depth, shader_stats_enabled,
+        );
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ray_march"),
             layout: Some(&pipeline_layout),

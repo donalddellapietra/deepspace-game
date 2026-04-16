@@ -116,6 +116,31 @@ var<private> ray_steps_lod_terminal: u32 = 0u;
 /// cost. Default off; the harness enables it via `--shader-stats`.
 override ENABLE_STATS: bool = false;
 
+/// Pipeline-override constant: Nyquist pixel floor. Acts as a
+/// minimum — a Node child is treated as a LOD terminal when its
+/// projected screen size is below this many pixels
+/// (`cell_size / ray_dist * screen_height / (2 tan(fov/2))
+///  < LOD_PIXEL_THRESHOLD`). Default 1.0 = classic sub-pixel
+/// rejection. This is a FLOOR: we never waste work on sub-pixel
+/// detail. The CEILING is set by `BASE_DETAIL_DEPTH` below.
+override LOD_PIXEL_THRESHOLD: f32 = 1.0;
+
+/// Pipeline-override constant: detail budget inside the anchor
+/// cell (ribbon_level=0). Each additional ribbon-pop shell gets
+/// one less level of detail — so a ray that's walked N ancestor
+/// shells away from the camera is clamped to descend
+/// `max(BASE_DETAIL_DEPTH - N, 1)` levels in its current frame.
+///
+/// This is the primary LOD gate. It's frame-local (uses the
+/// tree's own ribbon structure as the distance metric), so it's
+/// invariant under zoom: zooming out adds one outer shell at
+/// budget=1 and leaves everything else unchanged.
+///
+/// Default 4 gives detailed close content (4 levels under anchor)
+/// while keeping far content cheap (1-level LOD terminal beyond
+/// ribbon shell 3). Tune via `--lod-base-depth <N>`.
+override BASE_DETAIL_DEPTH: u32 = 4u;
+
 const MAX_FACE_DEPTH: u32 = 63u;
 const MAX_STACK_DEPTH: u32 = 64u;
 

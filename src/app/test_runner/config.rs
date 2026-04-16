@@ -57,6 +57,17 @@ pub struct TestConfig {
     /// contention, so it's off by default and only turned on for
     /// diagnostic runs. See `docs/testing/perf-isolation.md`.
     pub shader_stats: bool,
+    /// Nyquist floor: pixels below this threshold get LOD-terminal.
+    /// Default 1.0 = standard sub-pixel rejection. This is a
+    /// FLOOR, not the primary LOD gate — the primary gate is
+    /// `lod_base_depth` (ribbon-level cube shells).
+    pub lod_pixels: Option<f32>,
+    /// Detail budget inside the anchor cell. Each additional
+    /// ribbon-pop shell gets one less level of detail. Default 4.
+    /// Lower = faster + coarser; higher = slower + crisper distant
+    /// content. Baked into the pipeline as the WGSL `override`
+    /// `BASE_DETAIL_DEPTH`. See `docs/testing/perf-lod-diagnosis.md`.
+    pub lod_base_depth: Option<u32>,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -175,6 +186,12 @@ impl TestConfig {
                         .unwrap_or(0);
                 }
                 "--shader-stats" => { cfg.shader_stats = true; }
+                "--lod-pixels" => {
+                    cfg.lod_pixels = args.next().and_then(|v| v.parse().ok());
+                }
+                "--lod-base-depth" => {
+                    cfg.lod_base_depth = args.next().and_then(|v| v.parse().ok());
+                }
                 _ => {}
             }
         }
