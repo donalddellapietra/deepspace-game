@@ -423,7 +423,7 @@ impl App {
                 let frame_path = &self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(frame_path);
                 let ray_dir = self.ray_dir_in_frame(frame_path);
-                let hit = edit::cpu_raycast_in_frame(
+                let hit = edit::cpu_raycast_in_frame_with_budget(
                     &self.world.library,
                     self.world.root,
                     frame_path.as_slice(),
@@ -431,6 +431,7 @@ impl App {
                     ray_dir,
                     self.edit_depth(),
                     self.cs_edit_depth(),
+                    Some(SHELL_BUDGET),
                 );
                 if hit.is_none() && self.startup_profile_frames < 16 {
                     eprintln!(
@@ -599,16 +600,32 @@ impl App {
                 let preserve_paths: Vec<&[u8]> =
                     preserve_path_storage.iter().map(Path::as_slice).collect();
                 // Build preserve regions: keep full detail around
-                // the render frame so the shader's local shell has
-                // enough nodes to descend into.
+                // the render frame AND each ribbon-reachable shell.
+                // The shader multi-pops SHELL_BUDGET entries at a time,
+                // then descends SHELL_BUDGET levels.  Preserve enough
+                // nodes at each shell so the packed buffer has the
+                // detail the shader needs.
                 let mut preserve_regions = Vec::new();
                 if matches!(intended_frame.kind, ActiveFrameKind::Cartesian)
                     && !intended_frame.render_path.is_root()
                 {
+                    // The render frame itself.
                     preserve_regions.push((
                         intended_frame.render_path,
                         SHELL_BUDGET.min(u8::MAX as u32) as u8,
                     ));
+                    // Each ribbon-ancestor shell: pop SHELL_BUDGET
+                    // levels from the current depth, then the shader
+                    // descends SHELL_BUDGET levels from there.
+                    let rd = intended_frame.render_path.depth();
+                    let sb = SHELL_BUDGET as u8;
+                    let mut d = rd.saturating_sub(sb);
+                    while d > 0 {
+                        let mut ancestor = intended_frame.render_path;
+                        ancestor.truncate(d);
+                        preserve_regions.push((ancestor, sb));
+                        d = d.saturating_sub(sb);
+                    }
                 }
                 gpu::pack_tree_lod_selective(
                     &self.world.library,

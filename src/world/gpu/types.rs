@@ -17,7 +17,7 @@ pub const GPU_NODE_SIZE: usize = 27;
 /// - `_pad` (u16): alignment.
 /// - `node_index` (u32): buffer-local index, valid when `tag == 2`.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
 pub struct GpuChild {
     pub tag: u8,
     pub block_type: u8,

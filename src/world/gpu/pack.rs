@@ -437,4 +437,80 @@ mod tests {
         );
         assert_eq!(data[CENTER_SLOT].tag, 2);
     }
+
+    /// Verify that breaking a block at various depths actually changes
+    /// the packed GPU tree data. This catches dedup bugs where the
+    /// library returns the same node after a break, producing an
+    /// identical packed buffer.
+    #[test]
+    fn break_at_every_depth_changes_packed_data() {
+        use crate::world::anchor::Path;
+        use crate::world::bootstrap;
+        use crate::world::edit;
+
+        for spawn_depth in [4u8, 8, 11, 15, 20, 25, 30, 33, 38] {
+            let boot = bootstrap::bootstrap_world(
+                bootstrap::WorldPreset::PlainTest,
+                Some(40),
+            );
+            let mut world = boot.world;
+            let pos = bootstrap::plain_surface_spawn(spawn_depth);
+            bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
+
+            let camera = pos;
+            let frame_depth = spawn_depth.saturating_sub(3);
+            let mut frame_path = camera.anchor;
+            frame_path.truncate(frame_depth);
+
+            let preserve_paths: Vec<&[u8]> = vec![frame_path.as_slice()];
+            let frame_path_owned = frame_path;
+            let preserve_regions = vec![(frame_path_owned, 3u8)];
+
+            let (data_before, _, _) = pack_tree_lod_selective(
+                &world.library,
+                world.root,
+                &camera,
+                720.0,
+                1.2,
+                &preserve_paths,
+                &preserve_regions,
+            );
+
+            // CPU raycast to find a block to break.
+            // cpu_raycast works from root, so ray_origin must be
+            // root-local [0,3)^3, not frame-local.
+            let ray_origin = camera.in_frame(&Path::root());
+            let ray_dir = [0.0f32, -0.4, -0.9]; // forward-down
+            let hit = edit::cpu_raycast(
+                &world.library,
+                world.root,
+                ray_origin,
+                ray_dir,
+                spawn_depth as u32,
+            );
+            let Some(hit) = hit else {
+                panic!("no raycast hit at spawn_depth={spawn_depth}");
+            };
+            assert!(
+                edit::break_block(&mut world, &hit),
+                "break_block returned false at spawn_depth={spawn_depth}",
+            );
+
+            let (data_after, _, _) = pack_tree_lod_selective(
+                &world.library,
+                world.root,
+                &camera,
+                720.0,
+                1.2,
+                &preserve_paths,
+                &preserve_regions,
+            );
+
+            assert_ne!(
+                data_before, data_after,
+                "packed GPU data unchanged after break at spawn_depth={spawn_depth} \
+                 (library dedup may be collapsing the edit)"
+            );
+        }
+    }
 }

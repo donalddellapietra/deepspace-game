@@ -82,6 +82,34 @@ pub fn cpu_raycast_in_frame(
     max_depth: u32,
     max_face_depth: u32,
 ) -> Option<HitInfo> {
+    cpu_raycast_in_frame_with_budget(
+        library, world_root, frame_path, cam_local, ray_dir,
+        max_depth, max_face_depth, None,
+    )
+}
+
+/// Frame-aware raycast with an explicit per-shell depth budget.
+///
+/// When `shell_budget` is `Some(n)`, the raycast mirrors the GPU
+/// shader's behaviour: after the initial frame miss, pop `n` levels
+/// at once and descend at most `n` levels per shell.  This ensures
+/// the CPU hit depth never exceeds what the shader can render, so
+/// edits are always visible.
+///
+/// When `shell_budget` is `None`, the raycast uses an unbounded
+/// depth per shell (`max_depth - current_depth`), which is useful
+/// for tests that need root-to-leaf precision regardless of the
+/// shader's shell architecture.
+pub fn cpu_raycast_in_frame_with_budget(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame_path: &[u8],
+    cam_local: [f32; 3],
+    ray_dir: [f32; 3],
+    max_depth: u32,
+    max_face_depth: u32,
+    shell_budget: Option<u32>,
+) -> Option<HitInfo> {
     // Walk world_root down frame_path collecting (parent_id, slot)
     // entries AND the chain of NodeIds. The chain is used as
     // ribbon storage; frame_entries[] becomes the prefix prepended
@@ -110,10 +138,13 @@ pub fn cpu_raycast_in_frame(
     let mut ray_origin = cam_local;
     let mut ray_dir = ray_dir;
     let total_max_depth = max_depth;
+    let budget = shell_budget.unwrap_or(u32::MAX);
 
     loop {
         let frame_root_id = chain[current_frame_depth];
-        let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
+        let inner_max = total_max_depth
+            .saturating_sub(current_frame_depth as u32)
+            .min(budget);
 
         // Frame-root NodeKind dispatch (mirror of the renderer's
         // root_kind). When the frame IS a sphere body, the body's
@@ -177,23 +208,31 @@ pub fn cpu_raycast_in_frame(
             }
             return Some(hit);
         }
-        // Miss in current frame. Pop to parent.
+        // Miss in current frame. Pop one level toward root.
+        // Single-level pops match the shader: after each pop,
+        // skip_slot only covers the immediate child (which the
+        // inner shell fully traversed). Multi-popping would skip
+        // intermediate levels containing un-traversed content
+        // (surfaces between frames become invisible).
         if current_frame_depth == 0 {
             return None;
         }
-        let last_slot = frame_entries[current_frame_depth - 1].1;
-        let (sx, sy, sz) = slot_coords(last_slot);
-        ray_origin = [
-            sx as f32 + ray_origin[0] / 3.0,
-            sy as f32 + ray_origin[1] / 3.0,
-            sz as f32 + ray_origin[2] / 3.0,
-        ];
-        ray_dir = [
-            ray_dir[0] / 3.0,
-            ray_dir[1] / 3.0,
-            ray_dir[2] / 3.0,
-        ];
-        current_frame_depth -= 1;
+        let pops = 1;
+        for _ in 0..pops {
+            let last_slot = frame_entries[current_frame_depth - 1].1;
+            let (sx, sy, sz) = slot_coords(last_slot);
+            ray_origin = [
+                sx as f32 + ray_origin[0] / 3.0,
+                sy as f32 + ray_origin[1] / 3.0,
+                sz as f32 + ray_origin[2] / 3.0,
+            ];
+            ray_dir = [
+                ray_dir[0] / 3.0,
+                ray_dir[1] / 3.0,
+                ray_dir[2] / 3.0,
+            ];
+            current_frame_depth -= 1;
+        }
     }
 }
 
@@ -2012,6 +2051,122 @@ mod tests {
             assert!(
                 is_solid_at(&world.library, world.root, target, 8),
                 "Placed block should be solid at target"
+            );
+        }
+    }
+
+    /// Replicate the interactive game's frame-aware raycast at depths
+    /// from 4 to 38 using direct spawns. This mirrors what
+    /// `App::frame_aware_raycast` does when spawned at each depth.
+    #[test]
+    fn frame_aware_raycast_hits_at_all_depths() {
+        use crate::world::bootstrap;
+
+        let render_frame_k = 3u8;
+
+        for anchor_depth in [4u8, 6, 8, 10, 11, 12, 15, 20, 25, 30, 33, 38] {
+            let boot = bootstrap::bootstrap_world(
+                bootstrap::WorldPreset::PlainTest,
+                Some(40),
+            );
+            let mut world = boot.world;
+            let pos = bootstrap::plain_surface_spawn(anchor_depth);
+            bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
+
+            let frame_depth = anchor_depth.saturating_sub(render_frame_k);
+            let mut frame_path = pos.anchor;
+            frame_path.truncate(frame_depth);
+
+            let cam_local = pos.in_frame(&frame_path);
+            let ray_dir = crate::world::sdf::normalize([0.0, -0.434, -0.901]);
+            let edit_depth = anchor_depth as u32;
+
+            let hit = cpu_raycast_in_frame(
+                &world.library,
+                world.root,
+                frame_path.as_slice(),
+                cam_local,
+                ray_dir,
+                edit_depth,
+                6,
+            );
+
+            assert!(
+                hit.is_some(),
+                "direct-spawn raycast missed at anchor_depth={anchor_depth}: \
+                 frame_path={:?} cam_local={:?} edit_depth={edit_depth}",
+                frame_path.as_slice(), cam_local,
+            );
+
+            let h = hit.unwrap();
+            let old_root = world.root;
+            let changed = break_block(&mut world, &h);
+            assert!(
+                changed,
+                "break_block failed at anchor_depth={anchor_depth}: path_len={} face={}",
+                h.path.len(), h.face,
+            );
+            assert_ne!(world.root, old_root,
+                "root unchanged after break at anchor_depth={anchor_depth}");
+        }
+    }
+
+    /// Replicate the INTERACTIVE flow: spawn at depth 8, then zoom_in
+    /// incrementally to deeper depths, raycast + break at each.
+    /// This is the exact path the player takes when zooming in.
+    #[test]
+    fn frame_aware_raycast_hits_after_zoom_in_from_spawn() {
+        use crate::world::bootstrap;
+
+        let render_frame_k = 3u8;
+        let initial_depth = 8u8;
+
+        let boot = bootstrap::bootstrap_world(
+            bootstrap::WorldPreset::PlainTest,
+            Some(40),
+        );
+        let mut world = boot.world;
+        let mut pos = bootstrap::plain_surface_spawn(initial_depth);
+        bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
+
+        // Test at each depth from initial through 38
+        for target_depth in (initial_depth + 1)..=38u8 {
+            pos.zoom_in();
+
+            let anchor_depth = pos.anchor.depth();
+            assert_eq!(anchor_depth, target_depth,
+                "zoom_in should increase depth by 1");
+
+            let frame_depth = anchor_depth.saturating_sub(render_frame_k);
+            let mut frame_path = pos.anchor;
+            frame_path.truncate(frame_depth);
+
+            let cam_local = pos.in_frame(&frame_path);
+            let ray_dir = crate::world::sdf::normalize([0.0, -0.434, -0.901]);
+            let edit_depth = anchor_depth as u32;
+
+            let hit = cpu_raycast_in_frame(
+                &world.library,
+                world.root,
+                frame_path.as_slice(),
+                cam_local,
+                ray_dir,
+                edit_depth,
+                6,
+            );
+
+            assert!(
+                hit.is_some(),
+                "zoom-in raycast missed at depth={target_depth}: \
+                 frame_path={:?} cam_local={:?} edit_depth={edit_depth} \
+                 anchor_slots={:?}",
+                frame_path.as_slice(), cam_local, pos.anchor.as_slice(),
+            );
+
+            let h = hit.unwrap();
+            eprintln!(
+                "zoom-in depth={target_depth}: hit path_len={} face={} t={}",
+                h.path.len(), h.face, h.t,
             );
         }
     }

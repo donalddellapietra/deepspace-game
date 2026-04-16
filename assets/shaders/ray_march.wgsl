@@ -1401,13 +1401,17 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             outer_r = node_kinds[current_idx].outer_r;
             ribbon_level = body_pop_level + 1u;
         } else {
-            // Multi-level ribbon pop: pop up to SHELL_BUDGET entries
-            // at once before the next march_cartesian call. This cuts
-            // the number of march calls from render_depth+1 to
-            // ceil(render_depth/SHELL_BUDGET)+1.
+            // Single-level ribbon pop: pop exactly 1 ancestor entry
+            // per outer-loop iteration, then re-enter march_cartesian.
+            // Multi-pop (SHELL_BUDGET at a time) skips intermediate
+            // levels whose content the inner shell never traversed —
+            // surfaces between the frame root and the outer shell
+            // become invisible.  Single pop keeps skip_slot correct
+            // (it only skips the immediate child, which WAS fully
+            // traversed by the prior march_cartesian call).
             var pops: u32 = 0u;
             loop {
-                if pops >= SHELL_BUDGET { break; }
+                if pops >= 1u { break; }
                 if ribbon_level >= uniforms.ribbon_count { break; }
 
                 let entry = ribbon[ribbon_level];
