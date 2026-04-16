@@ -31,6 +31,23 @@ coordinates per layer. Use the normal reference spawn, deepen locally, and
 only apply a deterministic local nudge if the deep anchor lands exactly on a
 boundary singularity.
 
+Short utility commands:
+
+```bash
+# one screenshot
+scripts/harness-run.sh screenshot 39
+
+# one break/place run with a screenshot after the action
+scripts/harness-run.sh break 22
+scripts/harness-run.sh place 22
+
+# representative sweep with per-image metrics
+scripts/harness-sweep.sh screenshot
+
+# inspect image metrics directly
+scripts/analyze-png.py /tmp/deepspace-depth39-screenshot.png
+```
+
 Important caveat:
 - Until the image assertions have been validated against repeated manual
   inspection, read the PNGs directly as the source of truth.

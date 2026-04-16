@@ -430,7 +430,7 @@ impl App {
         }
         let cur = self.anchor_depth() as i32;
         let max_depth = crate::world::tree::MAX_DEPTH as i32;
-        let new_depth = (cur + step).clamp(1, max_depth);
+        let new_depth = (cur + step).clamp(4, max_depth);
         if new_depth == cur {
             return;
         }

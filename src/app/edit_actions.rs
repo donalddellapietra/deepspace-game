@@ -85,10 +85,8 @@ impl App {
     }
 
     fn ray_dir_in_frame(&self, frame_path: &Path) -> [f32; 3] {
-        let world_dir = crate::world::sdf::normalize(self.camera.forward());
-        let (_, frame_size_world) = super::frame::frame_origin_size_world(frame_path);
-        let scale = WORLD_SIZE / frame_size_world.max(1e-30);
-        crate::world::sdf::scale(world_dir, scale)
+        let _ = frame_path;
+        crate::world::sdf::normalize(self.camera.forward())
     }
 
     fn debug_path_kinds(&self, path: &Path) -> Vec<String> {
@@ -373,17 +371,6 @@ impl App {
             .min(RENDER_FRAME_MAX_DEPTH);
         let mut anchor_logical = self.camera.position.anchor;
         anchor_logical.truncate(desired_depth);
-        let mut focus_logical = None;
-        if let Some(hit) = self.frame_aware_raycast() {
-            let mut path = Path::root();
-            for &(_, slot) in &hit.path {
-                path.push(slot as u8);
-            }
-            path.truncate(desired_depth.min(path.depth()));
-            if !path.is_root() {
-                focus_logical = Some(path);
-            }
-        }
 
         let base_cartesian =
             super::App::frame_for_logical_path(&self.world.library, self.world.root, &anchor_logical);
@@ -396,15 +383,6 @@ impl App {
                     &path,
                     RENDER_FRAME_CONTEXT,
                 )
-            })
-            .or_else(|| {
-                focus_logical.map(|path| {
-                    super::App::frame_for_logical_path(
-                        &self.world.library,
-                        self.world.root,
-                        &path,
-                    )
-                })
             })
             .unwrap_or(base_cartesian);
         let mut frame = frame;
@@ -715,25 +693,29 @@ impl App {
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
             let (tree_data, node_kinds, _world_root_idx) = {
-                let mut preserve_path_storage = vec![intended_frame.render_path];
-                if intended_frame.logical_path != intended_frame.render_path {
-                    preserve_path_storage.push(intended_frame.logical_path);
+                if self.render_harness {
+                    gpu::pack_tree(&self.world.library, self.world.root)
+                } else {
+                    let mut preserve_path_storage = vec![intended_frame.render_path];
+                    if intended_frame.logical_path != intended_frame.render_path {
+                        preserve_path_storage.push(intended_frame.logical_path);
+                    }
+                    let preserve_paths: Vec<&[u8]> =
+                        preserve_path_storage.iter().map(Path::as_slice).collect();
+                    let preserve_regions = cartesian_shells
+                        .as_ref()
+                        .map(CartesianShellStack::preserve_regions)
+                        .unwrap_or_default();
+                    gpu::pack_tree_lod_selective(
+                        &self.world.library,
+                        self.world.root,
+                        &self.camera.position,
+                        1440.0,
+                        1.2,
+                        &preserve_paths,
+                        preserve_regions.as_slice(),
+                    )
                 }
-                let preserve_paths: Vec<&[u8]> =
-                    preserve_path_storage.iter().map(Path::as_slice).collect();
-                let preserve_regions = cartesian_shells
-                    .as_ref()
-                    .map(CartesianShellStack::preserve_regions)
-                    .unwrap_or_default();
-                gpu::pack_tree_lod_selective(
-                    &self.world.library,
-                    self.world.root,
-                    &self.camera.position,
-                    1440.0,
-                    1.2,
-                    &preserve_paths,
-                    preserve_regions.as_slice(),
-                )
             };
             pack_elapsed = pack_start.elapsed();
             let packed_node_count = tree_data.len() / 27;

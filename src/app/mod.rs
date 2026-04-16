@@ -375,10 +375,12 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
+        let (cam_local, frame_path) = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => {
+                (self.camera.position.in_frame(&sphere.body_path), sphere.body_path)
+            }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+                (self.camera.position.in_frame(&frame.render_path), frame.render_path)
             }
         };
         if self.startup_profile_frames < 4 {
@@ -396,8 +398,12 @@ impl App {
         let up_local = crate::world::sdf::normalize(up_world);
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
-                fwd_world, fwd_local, right_local, up_local,
+                "gpu_camera basis frame_path={:?} world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
+                frame_path.as_slice(),
+                fwd_world,
+                fwd_local,
+                right_local,
+                up_local,
             );
         }
         self.camera
