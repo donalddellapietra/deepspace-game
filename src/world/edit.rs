@@ -392,9 +392,10 @@ pub fn cpu_raycast_with_face_depth(
 
     let mut normal_face: u32 = 2; // default +Y
     let mut iterations = 0u32;
+    let max_iterations = (max_depth.max(1) * 4096).max(8192);
 
     loop {
-        if iterations >= 512 || stack.is_empty() {
+        if iterations >= max_iterations || stack.is_empty() {
             break;
         }
         iterations += 1;

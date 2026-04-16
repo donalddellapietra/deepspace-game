@@ -1189,7 +1189,8 @@ fn march_cartesian(
 
             // Cartesian Node: depth/LOD check, then descend.
             let at_max = depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH;
-            let cell_world_size = s_cell_size[depth];
+            let child_cell_size = s_cell_size[depth] / 3.0;
+            let cell_world_size = child_cell_size;
             let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
             let ray_dist = max(min_side, 0.001);
             let lod_pixels = cell_world_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
@@ -1227,7 +1228,6 @@ fn march_cartesian(
                 let parent_origin = s_node_origin[depth];
                 let parent_cell_size = s_cell_size[depth];
                 let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
-                let child_cell_size = parent_cell_size / 3.0;
 
                 let child_max = child_origin + vec3<f32>(parent_cell_size);
                 let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);

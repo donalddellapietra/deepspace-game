@@ -52,11 +52,12 @@ pub(super) struct LodUploadKey {
     pub camera_offset_bits: [u32; 3],
     pub render_path: Path,
     pub logical_path: Path,
+    pub visual_depth: u8,
     pub kind_tag: u8,
 }
 
 impl LodUploadKey {
-    pub(super) fn new(root: u64, camera: &WorldPos, frame: &ActiveFrame) -> Self {
+    pub(super) fn new(root: u64, camera: &WorldPos, frame: &ActiveFrame, visual_depth: u8) -> Self {
         let kind_tag = match frame.kind {
             ActiveFrameKind::Cartesian => 0,
             ActiveFrameKind::Body { .. } => 1,
@@ -68,6 +69,7 @@ impl LodUploadKey {
             camera_offset_bits: camera.offset.map(f32::to_bits),
             render_path: frame.render_path,
             logical_path: frame.logical_path,
+            visual_depth,
             kind_tag,
         }
     }
@@ -284,18 +286,10 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let (cam_local, frame_scale) = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_local = self.camera.position.in_frame(&sphere.body_path);
-                let (_origin, frame_size_world) = frame::frame_origin_size_world(&sphere.body_path);
-                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
-                (cam_local, frame_scale)
-            }
+        let cam_local = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                let cam_local = self.camera.position.in_frame(&frame.render_path);
-                let (_origin, frame_size_world) = frame::frame_origin_size_world(&frame.render_path);
-                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
-                (cam_local, frame_scale)
+                self.camera.position.in_frame(&frame.render_path)
             }
         };
         if self.startup_profile_frames < 4 {
@@ -308,17 +302,16 @@ impl App {
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::scale(crate::world::sdf::normalize(fwd_world), frame_scale);
-        let right_local = crate::world::sdf::scale(crate::world::sdf::normalize(right_world), frame_scale);
-        let up_local = crate::world::sdf::scale(crate::world::sdf::normalize(up_world), frame_scale);
+        let fwd_local = crate::world::sdf::normalize(fwd_world);
+        let right_local = crate::world::sdf::normalize(right_world);
+        let up_local = crate::world::sdf::normalize(up_world);
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?} frame_scale={}",
+                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
                 fwd_world,
                 fwd_local,
                 right_local,
                 up_local,
-                frame_scale,
             );
         }
         self.camera.gpu_camera_with_basis(

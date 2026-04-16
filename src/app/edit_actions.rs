@@ -18,9 +18,9 @@ use super::{
     RENDER_FRAME_MAX_DEPTH,
 };
 
-const MAX_LOCAL_VISUAL_DEPTH: u32 = 1;
+const MAX_LOCAL_VISUAL_DEPTH: u32 = 12;
 const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
-const FRAME_VISUAL_MIN_PIXELS: f32 = 9.0;
+const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
 impl App {
@@ -72,6 +72,37 @@ impl App {
             }
         }
         out
+    }
+
+    fn debug_hit_terminal(&self, hit: &edit::HitInfo) -> String {
+        use crate::world::tree::Child;
+
+        let Some(&(node_id, slot)) = hit.path.last() else {
+            return "empty-hit-path".to_string();
+        };
+        let Some(node) = self.world.library.get(node_id) else {
+            return format!("missing-node node_id={node_id} slot={slot}");
+        };
+        match node.children[slot] {
+            Child::Empty => format!("Empty node_id={node_id} slot={slot}"),
+            Child::Block(block) => format!("Block({block}) node_id={node_id} slot={slot}"),
+            Child::Node(child_id) => {
+                let desc = self
+                    .world
+                    .library
+                    .get(child_id)
+                    .map(|child| {
+                        format!(
+                            "Node({child_id}) kind={:?} uniform_type={} rep_block={}",
+                            child.kind,
+                            child.uniform_type,
+                            child.representative_block
+                        )
+                    })
+                    .unwrap_or_else(|| format!("Node({child_id}) missing"));
+                format!("{desc} node_id={node_id} slot={slot}")
+            }
+        }
     }
 
     pub(super) fn edit_depth(&self) -> u32 {
@@ -343,10 +374,7 @@ impl App {
         let hit = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let (_origin, frame_size_world) = super::frame::frame_origin_size_world(&sphere.body_path);
-                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
-                let ray_dir_local =
-                    crate::world::sdf::scale(crate::world::sdf::normalize(self.camera.forward()), frame_scale);
+                let ray_dir_local = crate::world::sdf::normalize(self.camera.forward());
                 edit::cpu_raycast_in_sphere_frame(
                     &self.world.library,
                     self.world.root,
@@ -367,22 +395,34 @@ impl App {
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
-                let (_origin, frame_size_world) =
-                    super::frame::frame_origin_size_world(&self.active_frame.render_path);
-                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
-                let ray_dir = crate::world::sdf::scale(
-                    crate::world::sdf::normalize(self.camera.forward()),
-                    frame_scale,
-                );
-                edit::cpu_raycast_in_frame(
-                    &self.world.library,
-                    self.world.root,
-                    self.active_frame.render_path.as_slice(),
-                    cam_local,
-                    ray_dir,
-                    self.edit_depth(),
-                    self.cs_edit_depth(),
-                )
+                let ray_dir = crate::world::sdf::normalize(self.camera.forward());
+                let min_depth = self.active_frame.render_path.depth() as u32 + 1;
+                let mut depth = self.edit_depth();
+                let mut hit = None;
+                while depth >= min_depth {
+                    hit = edit::cpu_raycast_in_frame(
+                        &self.world.library,
+                        self.world.root,
+                        self.active_frame.render_path.as_slice(),
+                        cam_local,
+                        ray_dir,
+                        depth,
+                        self.cs_edit_depth(),
+                    );
+                    if hit.is_some() || depth == min_depth {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                if hit.is_none() && self.startup_profile_frames < 16 {
+                    eprintln!(
+                        "frame_raycast_cartesian_fallback_failed edit_depth={} min_depth={} render_path={:?}",
+                        self.edit_depth(),
+                        min_depth,
+                        self.active_frame.render_path.as_slice(),
+                    );
+                }
+                hit
             }
         };
         if self.startup_profile_frames < 16 {
@@ -396,12 +436,30 @@ impl App {
                 hit.is_some(),
             );
             if let Some(ref h) = hit {
+                let (aabb_min, aabb_max) = match self.active_frame.kind {
+                    ActiveFrameKind::Sphere(_) => {
+                        edit::hit_aabb_body_local(&self.world.library, h)
+                    }
+                    ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                        edit::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
+                    }
+                };
                 eprintln!(
-                    "frame_raycast_hit path_len={} face={} t={} place_path_len={:?}",
+                    "frame_raycast_hit path_len={} face={} t={} place_path_len={:?} terminal={} aabb_min={:?} aabb_max={:?} path_kinds={:?}",
                     h.path.len(),
                     h.face,
                     h.t,
                     h.place_path.as_ref().map(|p| p.len()),
+                    self.debug_hit_terminal(h),
+                    aabb_min,
+                    aabb_max,
+                    self.debug_path_kinds(&{
+                        let mut p = Path::root();
+                        for &(_, slot) in &h.path {
+                            p.push(slot as u8);
+                        }
+                        p
+                    }),
                 );
             }
         }
@@ -501,30 +559,37 @@ impl App {
     /// render, and edit all agree on the same locality model.
     pub(super) fn upload_tree_lod(&mut self) {
         let intended_frame = self.target_render_frame();
-        let upload_key = LodUploadKey::new(self.world.root, &self.camera.position, &intended_frame);
+        let effective_visual_depth = self.visual_depth();
+        let upload_key = LodUploadKey::new(
+            self.world.root,
+            &self.camera.position,
+            &intended_frame,
+            effective_visual_depth.min(u8::MAX as u32) as u8,
+        );
         let mut pack_elapsed = std::time::Duration::ZERO;
         let mut ribbon_elapsed = std::time::Duration::ZERO;
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
 
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-            // Preserve the intended frame path through the pack so
-            // build_ribbon can walk it. Without this, uniform-empty
-            // Cartesian siblings on the camera's path get flattened
-            // and the ribbon stops at world.root — defeating frame
-            // descent and pinning camera precision regardless of zoom.
-            let preserve_paths = [
-                intended_frame.render_path.as_slice(),
-                intended_frame.logical_path.as_slice(),
-            ];
-            let (tree_data, node_kinds, _world_root_idx) = gpu::pack_tree_lod_preserving(
-                &self.world.library,
-                self.world.root,
-                &self.camera.position,
-                1440.0,
-                1.2,
-                &preserve_paths,
-            );
+            let (tree_data, node_kinds, _world_root_idx) = if matches!(intended_frame.kind, ActiveFrameKind::Cartesian) {
+                gpu::pack_tree(&self.world.library, self.world.root)
+            } else {
+                let mut preserve_path_storage = vec![intended_frame.render_path];
+                if intended_frame.logical_path != intended_frame.render_path {
+                    preserve_path_storage.push(intended_frame.logical_path);
+                }
+                let preserve_paths: Vec<&[u8]> =
+                    preserve_path_storage.iter().map(Path::as_slice).collect();
+                gpu::pack_tree_lod_preserving(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position,
+                    1440.0,
+                    1.2,
+                    &preserve_paths,
+                )
+            };
             pack_elapsed = pack_start.elapsed();
 
             // build_ribbon may stop short of the intended frame when
@@ -557,7 +622,6 @@ impl App {
             }
         }
 
-        let effective_visual_depth = self.visual_depth();
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(effective_visual_depth);
