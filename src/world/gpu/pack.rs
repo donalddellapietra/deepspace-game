@@ -110,7 +110,7 @@ pub fn pack_tree_lod(
     screen_height: f32,
     fov: f32,
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
-    pack_tree_lod_preserving(library, root, camera, screen_height, fov, &[])
+    pack_tree_lod_selective(library, root, camera, screen_height, fov, &[], &[])
 }
 
 /// Like `pack_tree_lod`, but with one or more `preserve_paths`.
@@ -127,6 +127,25 @@ pub fn pack_tree_lod_preserving(
     fov: f32,
     preserve_paths: &[&[u8]],
 ) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
+    pack_tree_lod_selective(library, root, camera, screen_height, fov, preserve_paths, &[])
+}
+
+/// Like `pack_tree_lod_preserving`, but also supports bounded preserve regions.
+///
+/// Each preserve region is `(path, extra_depth)`: nodes whose path
+/// starts with `path` and whose depth ≤ `path.depth() + extra_depth`
+/// are never uniform-collapsed or distance-LOD flattened. This keeps
+/// the near field around a local render frame detailed even when the
+/// surrounding Cartesian region is visually coarse.
+pub fn pack_tree_lod_selective(
+    library: &NodeLibrary,
+    root: NodeId,
+    camera: &WorldPos,
+    screen_height: f32,
+    fov: f32,
+    preserve_paths: &[&[u8]],
+    preserve_regions: &[(Path, u8)],
+) -> (Vec<GpuChild>, Vec<GpuNodeKind>, u32) {
     const LOD_THRESHOLD: f32 = 0.5;
 
     let mut preserve_pairs: HashSet<(NodeId, u8)> = HashSet::new();
@@ -140,6 +159,16 @@ pub fn pack_tree_lod_preserving(
                 _ => break,
             }
         }
+    }
+
+    let preserve_regions: Vec<(Path, u8)> = preserve_regions.to_vec();
+
+    fn in_preserve_region(path: &Path, preserve_regions: &[(Path, u8)]) -> bool {
+        preserve_regions.iter().any(|(region_root, extra_depth)| {
+            let required_depth = region_root.depth().saturating_add(*extra_depth);
+            path.depth() <= required_depth
+                && path.common_prefix_len(region_root) == region_root.depth()
+        })
     }
 
     struct QueueEntry {
@@ -172,7 +201,10 @@ pub fn pack_tree_lod_preserving(
             let Child::Node(child_id) = child else { continue };
             let Some(child_node) = library.get(*child_id) else { continue };
 
-            let on_preserve = preserve_pairs.contains(&(node_id, slot as u8));
+            let mut child_path = node_path;
+            child_path.push(slot as u8);
+            let on_preserve = preserve_pairs.contains(&(node_id, slot as u8))
+                || in_preserve_region(&child_path, &preserve_regions);
             let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
 
             if !on_preserve && lod_active && child_is_cartesian
@@ -214,8 +246,6 @@ pub fn pack_tree_lod_preserving(
                 visited.insert(*child_id, idx);
                 ordered.push(*child_id);
                 overrides.push([None; CHILDREN_PER_NODE]);
-                let mut child_path = node_path;
-                child_path.push(slot as u8);
                 queue.push(QueueEntry {
                     node_id: *child_id,
                     path: child_path,

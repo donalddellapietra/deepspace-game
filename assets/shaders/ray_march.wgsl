@@ -326,6 +326,12 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
 const FACE_ROOT_LOD_THRESHOLD_PIXELS: f32 = 4.0;
 
+// Shell architecture: each march_cartesian call uses a bounded depth
+// budget. The ribbon provides outer shells for context at coarser
+// scales. This prevents pathological traversal in heavily deduplicated
+// trees where depth_limit=6+ causes the DDA to exhaust iterations.
+const SHELL_BUDGET: u32 = 3u;
+
 fn sample_face_node(node_idx: u32,
                     un_in: f32, vn_in: f32, rn_in: f32,
                     depth_limit: u32) -> vec2<u32> {
@@ -1005,6 +1011,7 @@ fn sphere_in_face_window(
 /// returns hit=false so the caller can pop to the ancestor ribbon.
 fn march_cartesian(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
+    depth_limit: u32, skip_node_idx: u32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -1021,6 +1028,10 @@ fn march_cartesian(
         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
         select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
     );
+    // After ribbon pops, ray_dir magnitude shrinks (÷3 per pop).
+    // LOD pixel calculations need world-space distances, so scale
+    // side_dist by ray_metric to get actual distance.
+    let ray_metric = max(length(ray_dir), 1e-6);
     let step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
         select(-1, 1, ray_dir.y >= 0.0),
@@ -1187,12 +1198,33 @@ fn march_cartesian(
                 continue;
             }
 
+            // Shell skip: when re-entering a parent shell after a
+            // ribbon pop, skip the child node we already traversed
+            // in the inner shell. This prevents redundant descent
+            // into the same subtree at each ribbon level.
+            if depth == 0u && child_idx == skip_node_idx {
+                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                    s_cell[depth].x += step.x;
+                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                    s_cell[depth].y += step.y;
+                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                } else {
+                    s_cell[depth].z += step.z;
+                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                }
+                continue;
+            }
+
             // Cartesian Node: depth/LOD check, then descend.
-            let at_max = depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH;
+            let at_max = depth + 1u >= depth_limit || depth + 1u >= MAX_STACK_DEPTH;
             let child_cell_size = s_cell_size[depth] / 3.0;
             let cell_world_size = child_cell_size;
             let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
-            let ray_dist = max(min_side, 0.001);
+            let ray_dist = max(min_side * ray_metric, 0.001);
             let lod_pixels = cell_world_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
             let at_lod = lod_pixels < 1.0;
 
@@ -1285,6 +1317,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var cur_hmax = uniforms.highlight_max.xyz;
     var cur_scale: f32 = 1.0;
 
+    // skip_node_idx: after a ribbon pop, the inner shell's root node
+    // index is passed here so march_cartesian skips re-entering that
+    // subtree (it was already traversed by the inner shell).
+    var skip_node_idx: u32 = 0xFFFFFFFFu;
+
     var hops: u32 = 0u;
     loop {
         if hops > 80u { break; }
@@ -1301,13 +1338,26 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            r = march_cartesian(current_idx, ray_origin, ray_dir);
+            r = march_cartesian(current_idx, ray_origin, ray_dir, SHELL_BUDGET, skip_node_idx);
         }
         if r.hit {
             r.frame_level = ribbon_level;
             r.highlight_min = cur_hmin;
             r.highlight_max = cur_hmax;
             r.frame_scale = cur_scale;
+            // Transform cell_min/cell_size from the popped frame back
+            // to the camera frame so the fragment shader's bevel/grid
+            // computation uses consistent coordinates.
+            if cur_scale < 1.0 {
+                let hit_popped = ray_origin + ray_dir * r.t;
+                let cell_local = clamp(
+                    (hit_popped - r.cell_min) / r.cell_size,
+                    vec3<f32>(0.0), vec3<f32>(1.0),
+                );
+                let hit_camera = world_ray_origin + world_ray_dir * r.t;
+                r.cell_size = r.cell_size / cur_scale;
+                r.cell_min = hit_camera - cell_local * r.cell_size;
+            }
             return r;
         }
 
@@ -1346,29 +1396,42 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             outer_r = node_kinds[current_idx].outer_r;
             ribbon_level = body_pop_level + 1u;
         } else {
-            let entry = ribbon[ribbon_level];
-            let s = entry.slot;
-            let sx = i32(s % 3u);
-            let sy = i32((s / 3u) % 3u);
-            let sz = i32(s / 9u);
-            let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
-            ray_origin = slot_off + ray_origin / 3.0;
-            ray_dir = ray_dir / 3.0;
-            if uniforms.highlight_active != 0u {
-                cur_hmin = slot_off + cur_hmin / 3.0;
-                cur_hmax = slot_off + cur_hmax / 3.0;
-            }
-            cur_scale = cur_scale * (1.0 / 3.0);
-            current_idx = entry.node_idx;
-            let k = node_kinds[current_idx].kind;
-            if k == 1u {
-                current_kind = ROOT_KIND_BODY;
-                inner_r = node_kinds[current_idx].inner_r;
-                outer_r = node_kinds[current_idx].outer_r;
-            } else {
+            // Multi-level ribbon pop: pop up to SHELL_BUDGET entries
+            // at once before the next march_cartesian call. This cuts
+            // the number of march calls from render_depth+1 to
+            // ceil(render_depth/SHELL_BUDGET)+1.
+            var pops: u32 = 0u;
+            loop {
+                if pops >= SHELL_BUDGET { break; }
+                if ribbon_level >= uniforms.ribbon_count { break; }
+
+                let entry = ribbon[ribbon_level];
+                let s = entry.slot;
+                let sx = i32(s % 3u);
+                let sy = i32((s / 3u) % 3u);
+                let sz = i32(s / 9u);
+                let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+                skip_node_idx = current_idx;
+                ray_origin = slot_off + ray_origin / 3.0;
+                ray_dir = ray_dir / 3.0;
+                if uniforms.highlight_active != 0u {
+                    cur_hmin = slot_off + cur_hmin / 3.0;
+                    cur_hmax = slot_off + cur_hmax / 3.0;
+                }
+                cur_scale = cur_scale * (1.0 / 3.0);
+                current_idx = entry.node_idx;
+                ribbon_level = ribbon_level + 1u;
+                pops = pops + 1u;
+
+                let k = node_kinds[current_idx].kind;
+                if k == 1u {
+                    current_kind = ROOT_KIND_BODY;
+                    inner_r = node_kinds[current_idx].inner_r;
+                    outer_r = node_kinds[current_idx].outer_r;
+                    break;
+                }
                 current_kind = ROOT_KIND_CARTESIAN;
             }
-            ribbon_level = ribbon_level + 1u;
         }
     }
 

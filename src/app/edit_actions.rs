@@ -23,6 +23,12 @@ const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
 const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
+/// Per-shell depth budget for the GPU ray marcher. Must match
+/// `SHELL_BUDGET` in `ray_march.wgsl`. Each `march_cartesian` call
+/// descends at most this many levels. The ribbon provides outer
+/// shells for coarser context.
+const SHELL_BUDGET: u32 = 3;
+
 impl App {
     fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
         // In Cartesian frames, all levels share the same axes — the
@@ -408,10 +414,13 @@ impl App {
                 )
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                let frame_path = &self.active_frame.render_path;
+                // Always raycast from root — cpu_raycast_in_frame's
+                // pop loop handles finding hits at any depth via
+                // slot-arithmetic frame transitions.
+                let frame_path = Path::root();
                 let mut hit = None;
-                let cam_local = self.camera.position.in_frame(frame_path);
-                let ray_dir = self.ray_dir_in_frame(frame_path);
+                let cam_local = self.camera.position.in_frame(&frame_path);
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
                 let min_depth = frame_path.depth() as u32 + 1;
                 let mut depth = self.edit_depth();
                 while depth >= min_depth {
@@ -596,13 +605,26 @@ impl App {
                 }
                 let preserve_paths: Vec<&[u8]> =
                     preserve_path_storage.iter().map(Path::as_slice).collect();
-                gpu::pack_tree_lod_preserving(
+                // Build preserve regions: keep full detail around
+                // the render frame so the shader's local shell has
+                // enough nodes to descend into.
+                let mut preserve_regions = Vec::new();
+                if matches!(intended_frame.kind, ActiveFrameKind::Cartesian)
+                    && !intended_frame.render_path.is_root()
+                {
+                    preserve_regions.push((
+                        intended_frame.render_path,
+                        SHELL_BUDGET.min(u8::MAX as u32) as u8,
+                    ));
+                }
+                gpu::pack_tree_lod_selective(
                     &self.world.library,
                     self.world.root,
                     &self.camera.position,
                     1440.0,
                     1.2,
                     &preserve_paths,
+                    &preserve_regions,
                 )
             };
             pack_elapsed = pack_start.elapsed();

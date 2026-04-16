@@ -15,8 +15,6 @@ use crate::world::cubesphere::Face;
 use crate::world::cubesphere_local;
 use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
 
-const MAX_CARTESIAN_RENDER_DEPTH: u8 = 0;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SphereFrame {
     pub body_path: Path,
@@ -178,20 +176,20 @@ pub fn with_render_margin(
     render_margin: u8,
 ) -> ActiveFrame {
     let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
-    let is_cartesian = matches!(logical.kind, ActiveFrameKind::Cartesian);
     let min_render_depth = match logical.kind {
         ActiveFrameKind::Sphere(sphere) => (sphere.body_path.depth() + 1).min(logical.logical_path.depth()),
         ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
-        ActiveFrameKind::Cartesian => 0,
+        // Shell architecture: the render frame IS the innermost
+        // shell root. The shader pops outward via the ribbon for
+        // coarser context. No render_margin needed — each shell
+        // has a bounded depth budget.
+        ActiveFrameKind::Cartesian => logical.logical_path.depth(),
     };
-    let mut render_depth = logical
+    let render_depth = logical
         .logical_path
         .depth()
         .saturating_sub(render_margin)
         .max(min_render_depth);
-    if is_cartesian {
-        render_depth = render_depth.min(MAX_CARTESIAN_RENDER_DEPTH);
-    }
     if render_depth == logical.logical_path.depth() {
         return logical;
     }

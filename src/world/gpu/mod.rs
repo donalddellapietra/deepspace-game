@@ -27,6 +27,6 @@ mod pack;
 mod ribbon;
 mod types;
 
-pub use pack::{pack_tree, pack_tree_lod, pack_tree_lod_preserving};
+pub use pack::{pack_tree, pack_tree_lod, pack_tree_lod_preserving, pack_tree_lod_selective};
 pub use ribbon::{build_ribbon, GpuRibbonEntry};
 pub use types::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GPU_NODE_SIZE};
