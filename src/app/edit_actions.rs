@@ -24,11 +24,12 @@ const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
 impl App {
-    fn ray_dir_in_frame(&self, frame_path: &Path) -> [f32; 3] {
-        let world_dir = crate::world::sdf::normalize(self.camera.forward());
-        let (_, frame_size_world) = super::frame::frame_origin_size_world(frame_path);
-        let scale = WORLD_SIZE / frame_size_world.max(1e-30);
-        crate::world::sdf::scale(world_dir, scale)
+    fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
+        // In Cartesian frames, all levels share the same axes — the
+        // direction is identical in every frame.  The DDA only cares
+        // about the *direction*, not the magnitude.  The old code
+        // scaled by 3^depth which overflows f32 past depth ~20.
+        crate::world::sdf::normalize(self.camera.forward())
     }
 
     fn debug_path_kinds(&self, path: &Path) -> Vec<String> {

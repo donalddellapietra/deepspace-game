@@ -288,7 +288,9 @@ mod tests {
     }
 
     fn camera_at(xyz: [f32; 3]) -> WorldPos {
-        WorldPos::from_world_xyz(xyz, 10)
+        // Root-frame-local coords at shallow depth, then deepened.
+        WorldPos::from_frame_local(&crate::world::anchor::Path::root(), xyz, 2)
+            .deepened_to(10)
     }
 
     #[test]

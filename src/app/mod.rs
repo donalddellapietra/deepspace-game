@@ -40,7 +40,7 @@ pub mod overlay_integration;
 pub mod test_runner;
 
 pub use frame::{
-    compute_render_frame, frame_origin_size_world, with_render_margin, ActiveFrame,
+    compute_render_frame, with_render_margin, ActiveFrame,
     ActiveFrameKind,
 };
 pub use test_runner::TestConfig;
@@ -177,11 +177,29 @@ impl App {
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let world = bootstrap.world;
         let tree_depth = world.tree_depth();
-        let spawn_xyz = test_cfg.spawn_xyz.unwrap_or(bootstrap.default_spawn_xyz);
-        debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
-
-        let anchor_depth = test_cfg.spawn_depth.unwrap_or(bootstrap.default_spawn_depth);
-        let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
+        // Resolve spawn position: CLI --spawn-xyz overrides with
+        // root-frame-local coords (precise at shallow depth, then
+        // deepened via slot arithmetic); otherwise use bootstrap's
+        // pre-built WorldPos.
+        let position = match test_cfg.spawn_xyz {
+            Some(xyz) => {
+                debug_assert!(xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
+                let depth = test_cfg.spawn_depth.unwrap_or(
+                    bootstrap.default_spawn_pos.anchor.depth(),
+                );
+                WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
+                    .deepened_to(depth)
+            }
+            None => {
+                let mut pos = bootstrap.default_spawn_pos;
+                if let Some(depth) = test_cfg.spawn_depth {
+                    while pos.anchor.depth() > depth { pos.zoom_out(); }
+                    pos = pos.deepened_to(depth);
+                }
+                pos
+            }
+        };
+        let anchor_depth = position.anchor.depth();
         let desired_depth = (position.anchor.depth().saturating_sub(RENDER_FRAME_K))
             .min(RENDER_FRAME_MAX_DEPTH);
         let mut logical_path = position.anchor;
@@ -200,8 +218,9 @@ impl App {
         let spawn_yaw = test_cfg.spawn_yaw.unwrap_or(bootstrap.default_spawn_yaw);
         let spawn_pitch = test_cfg.spawn_pitch.unwrap_or(bootstrap.default_spawn_pitch);
         eprintln!(
-            "spawn: xyz={:?} anchor_depth={} yaw={} pitch={}",
-            spawn_xyz, anchor_depth, spawn_yaw, spawn_pitch,
+            "spawn: anchor_depth={} slots={:?} offset={:?} yaw={} pitch={}",
+            anchor_depth, position.anchor.as_slice(), position.offset,
+            spawn_yaw, spawn_pitch,
         );
 
         Self {

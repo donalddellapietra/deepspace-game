@@ -1044,6 +1044,10 @@ fn cs_raycast_in_body(
     ancestor_path: &[(NodeId, usize)],
     max_face_depth: u32,
 ) -> Option<HitInfo> {
+    // Normalize direction: the ray-sphere intersection (disc = b²-c)
+    // requires |ray_dir| = 1. Callers may pass non-unit direction
+    // (e.g. after the pop loop divides by 3.0).
+    let ray_dir = sdf::normalize(ray_dir);
     let debug_probe = max_face_depth <= 2 && ancestor_path.len() <= 1;
     let cs_center = [
         body_origin[0] + body_size * 0.5,

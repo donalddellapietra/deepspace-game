@@ -4,7 +4,7 @@
 //! This module owns composition: which world we start with, whether it
 //! contains a planet, and where the default spawn should be.
 
-use super::anchor::{Path, WORLD_SIZE};
+use super::anchor::{Path, WorldPos, WORLD_SIZE};
 use super::palette::block;
 use super::state::WorldState;
 use super::tree::*;
@@ -25,10 +25,12 @@ const PLAIN_DIRT_THICKNESS: f32 = 0.25;
 pub struct WorldBootstrap {
     pub world: WorldState,
     pub planet_path: Option<Path>,
-    pub default_spawn_xyz: [f32; 3],
+    /// Spawn position as a path-anchored `WorldPos`. Constructed at
+    /// shallow depth (where f32 decomposition is precise) then
+    /// `deepened_to` the target anchor depth via pure slot arithmetic.
+    pub default_spawn_pos: WorldPos,
     pub default_spawn_yaw: f32,
     pub default_spawn_pitch: f32,
-    pub default_spawn_depth: u8,
     pub plain_layers: u8,
 }
 
@@ -290,27 +292,38 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
     );
 
     let body_top_y = 1.5 + setup.outer_r;
-    let default_spawn_xyz = [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5];
+    // Construct at shallow depth (2) where f32 decomposition is
+    // precise, then deepen to anchor depth 16 via pure slot arithmetic.
+    let spawn_pos = WorldPos::from_frame_local(
+        &Path::root(),
+        [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5],
+        2,
+    ).deepened_to(16);
     WorldBootstrap {
         world,
         planet_path: Some(planet_path),
-        default_spawn_xyz,
+        default_spawn_pos: spawn_pos,
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -1.2,
-        default_spawn_depth: 16,
         plain_layers: 0,
     }
 }
 
 fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
     let world = plain_world(plain_layers);
+    // Construct at shallow depth (2) where f32 decomposition is
+    // precise, then deepen to anchor depth 8 via pure slot arithmetic.
+    let spawn_pos = WorldPos::from_frame_local(
+        &Path::root(),
+        [1.5, (PLAIN_SURFACE_Y + 0.08).min(WORLD_SIZE - 0.001), 1.5],
+        2,
+    ).deepened_to(8);
     WorldBootstrap {
         world,
         planet_path: None,
-        default_spawn_xyz: [1.5, (PLAIN_SURFACE_Y + 0.08).min(WORLD_SIZE - 0.001), 1.5],
+        default_spawn_pos: spawn_pos,
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -0.45,
-        default_spawn_depth: 8,
         plain_layers,
     }
 }
