@@ -133,6 +133,13 @@ pub enum ScriptCmd {
     /// the current ui_layer / anchor_depth / frame. Timeline marker
     /// for correlating screenshots to actions in a test trace.
     Emit(String),
+    /// Teleport the camera to the horizontal center of the cell
+    /// affected by the most recent break/place, positioned inside the
+    /// bottom child of that cell at the current anchor depth.
+    /// Intended use: after `zoom_in:1` following a break, this drops
+    /// the camera to "one layer-N cell above the new ground" (where N
+    /// is the current UI layer), matching the descent flow.
+    TeleportAboveLastEdit,
 }
 
 impl TestConfig {
@@ -291,6 +298,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "place" { return Some(ScriptCmd::Place); }
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
+            if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }

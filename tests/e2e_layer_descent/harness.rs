@@ -94,6 +94,11 @@ impl ScriptBuilder {
         self
     }
 
+    pub fn teleport_above_last_edit(mut self) -> Self {
+        self.parts.push("teleport_above_last_edit".to_string());
+        self
+    }
+
     pub fn compile(&self) -> String {
         self.parts.join(",")
     }

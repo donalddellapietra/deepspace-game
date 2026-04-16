@@ -17,7 +17,25 @@
 
 use super::App;
 use super::test_runner::ScriptCmd;
+use crate::world::anchor::{Path, WorldPos, WORLD_SIZE};
 use crate::world::edit::HitInfo;
+use crate::world::tree::slot_coords;
+
+/// World-space (origin, size) of the cell addressed by `path`.
+/// Origin = (0,0,0) corner of the cell; size = side length.
+fn cell_origin_size_world(path: &Path) -> ([f32; 3], f32) {
+    let mut origin = [0.0_f32; 3];
+    let mut size = WORLD_SIZE;
+    for k in 0..path.depth() as usize {
+        let (sx, sy, sz) = slot_coords(path.slot(k) as usize);
+        let child = size / 3.0;
+        origin[0] += sx as f32 * child;
+        origin[1] += sy as f32 * child;
+        origin[2] += sz as f32 * child;
+        size = child;
+    }
+    (origin, size)
+}
 
 /// Format a slot path as `[13,13,13,16]`.
 fn path_repr(hit: &HitInfo) -> String {
@@ -123,6 +141,35 @@ impl App {
             }
             ScriptCmd::ProbeDown => self.harness_probe_down(),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
+            ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
         }
+    }
+
+    /// Position the camera horizontally centered on the last-broken or
+    /// last-placed cell, at `y = bottom_of_broken_cell + 0.5 *
+    /// current_cell_size`. Intended use: after `zoom_in:1`, this drops
+    /// the camera inside the bottom-most child of the previously
+    /// broken cell — "one current-layer cell above the new ground" in
+    /// the descent flow.
+    pub(super) fn teleport_above_last_edit(&mut self) {
+        let Some(last) = self.last_edit_slots else {
+            eprintln!("teleport_above_last_edit: no last edit recorded; skipping");
+            return;
+        };
+        let (origin, broken_size) = cell_origin_size_world(&last);
+        let current_depth = self.anchor_depth() as i32;
+        let new_cell_size = WORLD_SIZE * 3.0_f32.powi(-current_depth);
+        let target = [
+            origin[0] + 0.5 * broken_size,
+            origin[1] + 0.5 * new_cell_size,
+            origin[2] + 0.5 * broken_size,
+        ];
+        self.camera.position =
+            WorldPos::from_frame_local(&Path::root(), target, current_depth as u8);
+        self.apply_zoom();
+        eprintln!(
+            "teleport_above_last_edit: broken_path={:?} broken_size={} new_cell_size={} target_xyz={:?} current_depth={}",
+            last.as_slice(), broken_size, new_cell_size, target, current_depth,
+        );
     }
 }

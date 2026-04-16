@@ -119,3 +119,110 @@ fn layer_37_break_below_is_registered_three_ways() {
         "post-break screenshot {post_png} missing"
     );
 }
+
+#[test]
+fn layers_37_to_36_descend_and_break() {
+    let dir = tmp_dir("layers_37_to_36");
+    let paths = [
+        dir.join("layer37_pre.png"),
+        dir.join("layer37_post.png"),
+        dir.join("layer36_pre.png"),
+        dir.join("layer36_post.png"),
+    ];
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+    let [pre37, post37, pre36, post36]: [String; 4] =
+        paths.map(|p| p.to_string_lossy().into_owned());
+
+    let script = ScriptBuilder::new()
+        // Layer 37
+        .emit("layer_37_start")
+        .screenshot(&pre37)
+        .probe_down()
+        .break_()
+        .wait(15)
+        .screenshot(&post37)
+        // Descend to layer 36: zoom_in changes depth only; teleport
+        // positions the camera inside the bottom child of the cell
+        // we just broke.
+        .zoom_in(1)
+        .teleport_above_last_edit()
+        .wait(15)
+        // Layer 36
+        .emit("layer_36_start")
+        .screenshot(&pre36)
+        .probe_down()
+        .break_()
+        .wait(15)
+        .screenshot(&post36)
+        .emit("layer_36_end");
+
+    let trace = run(HARNESS_ARGS, &script);
+
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr ---\n{}\n--- stdout tail ---\n{}",
+        trace.stderr,
+        trace.stdout.lines().rev().take(40).collect::<Vec<_>>().join("\n"),
+    );
+
+    // Marks: 3 (layer_37_start, layer_36_start, layer_36_end).
+    // Note: we assert on anchor_depth, not ui_layer. `ui_layer =
+    // tree_depth - anchor_depth + 1`, and break_block currently
+    // subdivides a uniform node which bumps tree_depth. That keeps
+    // ui_layer visually stuck at 37 across the zoom-in. anchor_depth
+    // is the deterministic truth.
+    assert_eq!(trace.marks.len(), 3, "expected 3 marks, got {:?}", trace.marks);
+    assert_eq!(trace.marks[0].label, "layer_37_start");
+    assert_eq!(trace.marks[0].anchor_depth, 4);
+    assert_eq!(trace.marks[1].label, "layer_36_start");
+    assert_eq!(
+        trace.marks[1].anchor_depth, 5,
+        "after zoom_in:1 anchor_depth must go from 4 to 5"
+    );
+    assert_eq!(trace.marks[2].label, "layer_36_end");
+
+    // Edits: exactly two breaks, one per layer.
+    assert_eq!(trace.edits.len(), 2, "expected 2 edits, got {:?}", trace.edits);
+    assert_eq!(trace.edits[0].action, "broke");
+    assert!(trace.edits[0].changed, "layer-37 break must succeed");
+    assert_eq!(trace.edits[0].anchor_depth, 4);
+    assert_eq!(trace.edits[0].anchor.len(), 4, "layer-37 edit anchor depth");
+
+    assert_eq!(trace.edits[1].action, "broke");
+    assert!(trace.edits[1].changed, "layer-36 break must succeed");
+    assert_eq!(trace.edits[1].anchor_depth, 5);
+    assert_eq!(
+        trace.edits[1].anchor.len(), 5,
+        "layer-36 edit anchor must be one level deeper than layer-37's"
+    );
+    assert_ne!(
+        trace.edits[1].anchor, trace.edits[0].anchor,
+        "layer-36 break must target a different cell than layer-37's break"
+    );
+
+    // Probes: two (one before each break), both must hit and match the
+    // corresponding edit's anchor.
+    assert_eq!(trace.probes.len(), 2, "expected 2 probes, got {:?}", trace.probes);
+    assert!(trace.probes[0].hit, "layer-37 probe must hit solid ground");
+    assert_eq!(trace.probes[0].anchor_depth, 4);
+    assert_eq!(
+        trace.probes[0].anchor, trace.edits[0].anchor,
+        "layer-37 probe anchor must match what break removed"
+    );
+    assert!(trace.probes[1].hit, "layer-36 probe must hit solid ground");
+    assert_eq!(trace.probes[1].anchor_depth, 5);
+    assert_eq!(
+        trace.probes[1].anchor, trace.edits[1].anchor,
+        "layer-36 probe anchor must match what break removed"
+    );
+
+    // Screenshots landed on disk.
+    for p in [&pre37, &post37, &pre36, &post36] {
+        assert!(
+            std::path::Path::new(p).exists(),
+            "screenshot {p} missing"
+        );
+    }
+}
