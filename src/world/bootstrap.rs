@@ -338,26 +338,35 @@ pub fn plain_surface_spawn(anchor_depth: u8) -> WorldPos {
     WorldPos::new(path, [0.5, 0.5, 0.5])
 }
 
-/// Carve a 3x3x3-block air cavity at the camera's anchor position.
+/// Create a uniform air subtree of the given depth. All children are
+/// recursively air nodes, so the render-frame tree walk can descend
+/// through this region just like it would through a normal tree.
+/// Content-addressed dedup means only O(depth) nodes are allocated
+/// regardless of how wide the subtree is.
+fn air_subtree(lib: &mut NodeLibrary, depth: u8) -> NodeId {
+    if depth == 0 {
+        return lib.insert(empty_children());
+    }
+    let child = air_subtree(lib, depth - 1);
+    lib.insert(uniform_children(Child::Node(child)))
+}
+
+/// Carve an air cavity at the camera's anchor position.
 ///
-/// Clears the cell at `anchor.depth() - 1` (the parent of the leaf)
-/// to `Child::Empty`. Since that parent cell contains a 3x3x3 grid
-/// of leaf blocks, this creates a 27-block air cavity. The camera
-/// inside the cavity can see 3x3 grids on each wall — with the
-/// y-axis showing different materials where the dirt/grass boundary
-/// crosses the cavity.
+/// Replaces the cell at `anchor.depth()` with an air-filled Node
+/// subtree (not `Child::Empty`) so the render-frame tree walk can
+/// descend through the carved region. This is critical: if the carved
+/// cell were `Child::Empty`, the walk would stop there and the render
+/// frame would be stuck at a shallow depth — zooming deeper would
+/// show no visual change.
 ///
-/// The carve is 1 level above the anchor's leaf, which is still
-/// below the render frame (anchor − RENDER_FRAME_K), so it doesn't
-/// affect frame computation.
-pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path) {
+/// The air subtree extends to `total_depth` so the user can zoom to
+/// any depth inside the cavity and still get a deep render frame.
+pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) {
     if anchor.depth() < 2 { return; }
     let slots = anchor.as_slice();
-    // Walk to depth (anchor_depth - 2): the grandparent of the leaf.
-    // We'll clear the child at slots[anchor_depth - 2] which is the
-    // parent cell of the leaf.
-    let carve_depth = (anchor.depth() - 1) as usize; // slot index of parent cell
-    let mut node_stack: Vec<(NodeId, NodeKind)> = Vec::with_capacity(carve_depth);
+    let carve_depth = (anchor.depth() - 1) as usize;
+    let mut node_stack: Vec<(NodeId, NodeKind)> = Vec::with_capacity(carve_depth + 1);
     let mut node_id = world.root;
     for &slot in &slots[..carve_depth] {
         let Some(node) = world.library.get(node_id) else { return };
@@ -370,15 +379,18 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path) {
     let Some(node) = world.library.get(node_id) else { return };
     node_stack.push((node_id, node.kind));
 
-    // The cell to clear is at slots[carve_depth - 1] in node_stack.last().
-    // Wait — carve_depth is the slot index we want to CLEAR at.
-    // node_stack.last() is the node that CONTAINS slots[carve_depth].
-    // But actually, we walked up to (but not including) carve_depth in
-    // the forward walk. So node_stack has `carve_depth` entries.
-    // node_stack[carve_depth-1] is the node at depth carve_depth-1,
-    // and the child at slots[carve_depth-1] is the cell to clear.
+    let clear_slot = slots[carve_depth] as usize;
 
-    let clear_slot = slots[carve_depth] as usize; // the parent-of-leaf slot
+    // How many additional levels of air nodes below the cleared cell.
+    // The cleared cell is at absolute depth `carve_depth + 1`.
+    // We need air down to `total_depth`.
+    let cleared_abs_depth = (carve_depth + 1) as u8;
+    let air_depth = total_depth.saturating_sub(cleared_abs_depth);
+    let air_node = if air_depth > 0 {
+        Child::Node(air_subtree(&mut world.library, air_depth))
+    } else {
+        Child::Empty
+    };
 
     // Build replacement bottom-up.
     let mut replacement: Option<NodeId> = None;
@@ -388,8 +400,7 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path) {
         if let Some(rep) = replacement {
             new_children[slots[i] as usize] = Child::Node(rep);
         } else {
-            // Bottom of chain: clear the parent-of-leaf cell.
-            new_children[clear_slot] = Child::Empty;
+            new_children[clear_slot] = air_node;
         }
         replacement = Some(world.library.insert_with_kind(new_children, kind));
     }

@@ -197,7 +197,7 @@ impl App {
                         // the tree at the target depth instead of blindly
                         // deepening (which drifts away from the surface).
                         let pos = bootstrap::plain_surface_spawn(depth);
-                        bootstrap::carve_air_pocket(&mut world, &pos.anchor);
+                        bootstrap::carve_air_pocket(&mut world, &pos.anchor, bootstrap.plain_layers);
                         pos
                     } else {
                         let mut pos = bootstrap.default_spawn_pos;
@@ -209,7 +209,7 @@ impl App {
                     // Carve the default spawn for plain worlds so the
                     // camera starts in air, not embedded in a block.
                     if bootstrap.plain_layers > 0 {
-                        bootstrap::carve_air_pocket(&mut world, &bootstrap.default_spawn_pos.anchor);
+                        bootstrap::carve_air_pocket(&mut world, &bootstrap.default_spawn_pos.anchor, bootstrap.plain_layers);
                     }
                     bootstrap.default_spawn_pos
                 }
