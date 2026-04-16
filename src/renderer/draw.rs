@@ -75,7 +75,16 @@ impl ShaderStatsFrame {
 }
 
 impl Renderer {
-    pub fn render(&self) -> Result<(), wgpu::SurfaceError> {
+    /// Live-surface render path. Matches `render_offscreen`'s
+    /// instrumentation when `shader_stats_enabled`: timestamp
+    /// queries, `on_submitted_work_done` callback, stats-buffer
+    /// clear/copy/readback. When disabled, the only extra cost over
+    /// the old render() is an `on_submitted_work_done` registration
+    /// (trivial). The enriched `renderer_slow` log fires whenever a
+    /// frame exceeds 30ms total, reporting the per-phase breakdown
+    /// the harness surfaces — so a live-game regression can be
+    /// diagnosed from stderr without running the offscreen harness.
+    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let frame_start = std::time::Instant::now();
         let acquire_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
@@ -84,6 +93,14 @@ impl Renderer {
         let encode_start = std::time::Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
+        });
+        if self.shader_stats_enabled {
+            encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
+        }
+        let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
+            query_set: &ts.query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -99,28 +116,75 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                ..Default::default()
+                timestamp_writes,
+                occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        if let Some(ts) = self.timestamp.as_ref() {
+            encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
+            encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
+        }
+        if self.shader_stats_enabled {
+            encoder.copy_buffer_to_buffer(
+                &self.shader_stats_buffer, 0,
+                &self.shader_stats_readback, 0,
+                32,
+            );
+        }
         let encode_elapsed = encode_start.elapsed();
+        let done_slot: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let submit_start = std::time::Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
+        {
+            let done_slot = std::sync::Arc::clone(&done_slot);
+            self.queue.on_submitted_work_done(move || {
+                let mut slot = done_slot.lock().unwrap();
+                *slot = Some(std::time::Instant::now());
+            });
+        }
         let submit_elapsed = submit_start.elapsed();
         let present_start = std::time::Instant::now();
         output.present();
         let present_elapsed = present_start.elapsed();
         let frame_elapsed = frame_start.elapsed();
-        if frame_elapsed.as_secs_f64() * 1000.0 >= 30.0 {
+        // Poll + stats readback only when enabled, and only on slow
+        // frames. The poll blocks the CPU on GPU completion, so we
+        // don't want to stall every frame — but during a slowdown we
+        // want the data.
+        let slow = frame_elapsed.as_secs_f64() * 1000.0 >= 30.0;
+        let (gpu_pass_ms, submitted_done_ms, shader_stats) =
+            if self.shader_stats_enabled && slow {
+                let _ = self.device.poll(wgpu::PollType::Wait);
+                let submitted_done_ms = done_slot
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.map(|t| t.duration_since(submit_start).as_secs_f64() * 1000.0));
+                let (gpu_pass_ms, _) = self.read_timestamps();
+                let stats = self.read_shader_stats();
+                (gpu_pass_ms, submitted_done_ms, stats)
+            } else {
+                (None, None, ShaderStatsFrame::default())
+            };
+        if slow {
             eprintln!(
-                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2}",
+                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} gpu_pass_ms={} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={}",
                 acquire_elapsed.as_secs_f64() * 1000.0,
                 encode_elapsed.as_secs_f64() * 1000.0,
                 submit_elapsed.as_secs_f64() * 1000.0,
                 present_elapsed.as_secs_f64() * 1000.0,
                 frame_elapsed.as_secs_f64() * 1000.0,
+                gpu_pass_ms.map(|v| format!("{v:.2}")).unwrap_or_else(|| "na".into()),
+                submitted_done_ms.map(|v| format!("{v:.2}")).unwrap_or_else(|| "na".into()),
+                shader_stats.ray_count,
+                shader_stats.hit_count,
+                shader_stats.miss_count,
+                shader_stats.max_iter_count,
+                shader_stats.avg_steps(),
+                shader_stats.max_steps,
             );
         }
         Ok(())

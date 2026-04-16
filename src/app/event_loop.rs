@@ -138,6 +138,7 @@ impl App {
         let pack_elapsed = pack_start.elapsed();
         eprintln!("startup_perf {source}: tree_packed ms={:.2} nodes={}", pack_elapsed.as_secs_f64() * 1000.0, tree_data.len() / 27);
         let renderer_start = std::time::Instant::now();
+        let shader_stats_enabled = self.shader_stats_enabled;
         let renderer = pollster::block_on(
             Renderer::new(
                 window,
@@ -149,7 +150,7 @@ impl App {
                 } else {
                     wgpu::PresentMode::AutoVsync
                 },
-                false,
+                shader_stats_enabled,
             ),
         );
         let renderer_elapsed = renderer_start.elapsed();
@@ -285,7 +286,7 @@ impl App {
         let highlight_elapsed = highlight_start.elapsed();
 
         let render_start = std::time::Instant::now();
-        if let Some(renderer) = &self.renderer {
+        if let Some(renderer) = &mut self.renderer {
             match renderer.render() {
                 Ok(()) => {}
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {

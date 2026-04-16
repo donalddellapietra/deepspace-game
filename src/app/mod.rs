@@ -149,6 +149,12 @@ pub struct App {
     pub(super) forced_edit_depth: Option<u32>,
     pub(super) harness_width: u32,
     pub(super) harness_height: u32,
+    /// Whether to enable shader-side ray-step atomic counters in the
+    /// fragment shader. Mirrors `TestConfig::shader_stats`; threaded
+    /// into `Renderer::new` so the live event-loop `render()` path
+    /// can emit per-frame shader stats when the `--shader-stats`
+    /// flag is set.
+    pub(super) shader_stats_enabled: bool,
     pub(super) last_highlight_raycast_ms: f64,
     pub(super) last_highlight_set_ms: f64,
     /// Cost of packing the tree into GPU-friendly form. Set by
@@ -195,6 +201,7 @@ impl App {
         let disable_highlight = test_cfg.disable_highlight;
         let forced_visual_depth = test_cfg.force_visual_depth;
         let forced_edit_depth = test_cfg.force_edit_depth;
+        let shader_stats_enabled = test_cfg.shader_stats;
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let mut world = bootstrap.world;
@@ -299,6 +306,7 @@ impl App {
             forced_edit_depth,
             harness_width,
             harness_height,
+            shader_stats_enabled,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
             last_pack_ms: 0.0,
