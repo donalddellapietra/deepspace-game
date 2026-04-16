@@ -5,6 +5,7 @@
 /ui/node_modules
 /ui/dist
 /ui/test-results
+/tmp
 
 # Downloaded test assets (large .vox files, etc.)
 /assets/vox/*.vox

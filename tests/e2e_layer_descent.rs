@@ -18,7 +18,7 @@
 #[path = "e2e_layer_descent/harness.rs"]
 mod harness;
 
-use harness::{ScriptBuilder, run};
+use harness::{ScriptBuilder, run, tmp_dir};
 
 // Plain world with 40 layers. Spawn-depth 4 == UI layer 37
 // per `docs/gotchas/layer-vs-depth.md` (zoom_level = tree_depth -
@@ -46,20 +46,23 @@ const HARNESS_ARGS: &[&str] = &[
 
 #[test]
 fn layer_37_break_below_is_registered_three_ways() {
-    let pre_png = "/tmp/e2e_layer37_pre.png";
-    let post_png = "/tmp/e2e_layer37_post.png";
+    let dir = tmp_dir("layer_37_break_below");
+    let pre_png = dir.join("pre.png");
+    let post_png = dir.join("post.png");
     // Remove leftovers so "file exists" is a real signal.
-    let _ = std::fs::remove_file(pre_png);
-    let _ = std::fs::remove_file(post_png);
+    let _ = std::fs::remove_file(&pre_png);
+    let _ = std::fs::remove_file(&post_png);
+    let pre_png = pre_png.to_string_lossy().into_owned();
+    let post_png = post_png.to_string_lossy().into_owned();
 
     let script = ScriptBuilder::new()
         .emit("start")
-        .screenshot(pre_png)
+        .screenshot(&pre_png)
         .probe_down()
         .break_()
         .wait(15)
         .probe_down()
-        .screenshot(post_png)
+        .screenshot(&post_png)
         .emit("end");
 
     let trace = run(HARNESS_ARGS, &script);
@@ -108,11 +111,11 @@ fn layer_37_break_below_is_registered_three_ways() {
 
     // Screenshots landed on disk.
     assert!(
-        std::path::Path::new(pre_png).exists(),
+        std::path::Path::new(&pre_png).exists(),
         "pre-break screenshot {pre_png} missing"
     );
     assert!(
-        std::path::Path::new(post_png).exists(),
+        std::path::Path::new(&post_png).exists(),
         "post-break screenshot {post_png} missing"
     );
 }

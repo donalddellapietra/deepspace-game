@@ -18,7 +18,21 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
+
+/// Gitignored artifact directory for a test scenario.
+///
+/// Returns `<project root>/tmp/<name>/`, creating it if missing. The
+/// project root is `CARGO_MANIFEST_DIR` — Cargo's per-crate directory
+/// — which is stable across machines and independent of CWD when the
+/// test binary runs.
+pub fn tmp_dir(name: &str) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tmp").join(name);
+    std::fs::create_dir_all(&root)
+        .unwrap_or_else(|e| panic!("failed to create tmp dir {root:?}: {e}"));
+    root
+}
 
 /// Builds a comma-separated `--script` argument.
 pub struct ScriptBuilder {
