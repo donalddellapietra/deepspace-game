@@ -80,10 +80,7 @@ struct HitResult {
     t: f32,
     /// Which ancestor-pop level the hit happened in. 0 = original
     /// camera frame; >0 = popped that many times into ancestors.
-    /// `t` is in this frame's units, not the camera's.
     frame_level: u32,
-    highlight_min: vec3<f32>,
-    highlight_max: vec3<f32>,
     frame_scale: f32,
     cell_min: vec3<f32>,
     cell_size: f32,

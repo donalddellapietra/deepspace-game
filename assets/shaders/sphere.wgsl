@@ -44,8 +44,6 @@ fn march_face_root(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -200,8 +198,6 @@ fn sphere_in_cell(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -341,8 +337,6 @@ fn sphere_in_face_window(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;

@@ -52,8 +52,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if uniforms.highlight_active != 0u {
-        let h_min = select(uniforms.highlight_min.xyz, result.highlight_min, result.hit);
-        let h_max = select(uniforms.highlight_max.xyz, result.highlight_max, result.hit);
+        // Highlight AABB is always in the camera's frame-local system.
+        // t is invariant across ribbon pop transforms (origin and dir
+        // both ÷3 per pop), so hit_pos = camera.pos + ray_dir * t is
+        // always in the original frame regardless of which ribbon
+        // level the DDA actually found the hit.
+        let h_min = uniforms.highlight_min.xyz;
+        let h_max = uniforms.highlight_max.xyz;
         let h_size = h_max - h_min;
         if result.hit {
             let hit_pos = camera.pos + ray_dir * result.t;
@@ -68,32 +73,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 );
                 let glow = 1.0 - smoothstep(0.02, 0.12, edge);
                 color = mix(color, vec3<f32>(1.0, 0.92, 0.18), glow * 0.85);
-            }
-        }
-        let pad = max(h_size.x * 0.02, 0.002);
-        let box_min = h_min - vec3<f32>(pad);
-        let box_max = h_max + vec3<f32>(pad);
-        let h_inv_dir = vec3<f32>(
-            select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
-            select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
-            select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
-        );
-        let hb = ray_box(camera.pos, h_inv_dir, box_min, box_max);
-        if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
-            let t = max(hb.t_enter, 0.0);
-            if t <= result.t + h_size.x * 0.05 {
-                let hit_pos = camera.pos + ray_dir * t;
-                let from_min = hit_pos - box_min;
-                let from_max = box_max - hit_pos;
-                let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
-                let ew = max(pixel_world * 2.25, h_size.x * 0.02);
-                let near_x = from_min.x < ew || from_max.x < ew;
-                let near_y = from_min.y < ew || from_max.y < ew;
-                let near_z = from_min.z < ew || from_max.z < ew;
-                let edge_count = u32(near_x) + u32(near_y) + u32(near_z);
-                if edge_count >= 2u {
-                    color = mix(color, vec3<f32>(1.0, 0.92, 0.18), 0.92);
-                }
             }
         }
     }

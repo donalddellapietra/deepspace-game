@@ -15,8 +15,6 @@ fn march_cartesian(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -313,8 +311,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var outer_r = uniforms.root_radii.y;
     var cur_face_bounds = uniforms.root_face_bounds;
     var ribbon_level: u32 = 0u;
-    var cur_hmin = uniforms.highlight_min.xyz;
-    var cur_hmax = uniforms.highlight_max.xyz;
     var cur_scale: f32 = 1.0;
 
     // skip_slot: after a ribbon pop, the slot index (in the parent)
@@ -343,8 +339,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         }
         if r.hit {
             r.frame_level = ribbon_level;
-            r.highlight_min = cur_hmin;
-            r.highlight_max = cur_hmax;
             r.frame_scale = cur_scale;
             // Transform cell_min/cell_size from the popped frame back
             // to the camera frame so the fragment shader's bevel/grid
@@ -417,10 +411,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 skip_slot = entry.slot;
                 ray_origin = slot_off + ray_origin / 3.0;
                 ray_dir = ray_dir / 3.0;
-                if uniforms.highlight_active != 0u {
-                    cur_hmin = slot_off + cur_hmin / 3.0;
-                    cur_hmax = slot_off + cur_hmax / 3.0;
-                }
                 cur_scale = cur_scale * (1.0 / 3.0);
                 current_idx = entry.node_idx;
                 ribbon_level = ribbon_level + 1u;
@@ -442,8 +432,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = cur_hmin;
-    result.highlight_max = cur_hmax;
     result.frame_scale = cur_scale;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
