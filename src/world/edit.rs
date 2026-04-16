@@ -2299,6 +2299,7 @@ mod tests {
         let world = plain_world(40);
         let anchor_depth = 34u8;
         let position = crate::app::harness::spawn_position(
+            WorldPreset::PlainTest,
             bootstrap.default_spawn_xyz,
             anchor_depth,
             bootstrap.default_spawn_depth,

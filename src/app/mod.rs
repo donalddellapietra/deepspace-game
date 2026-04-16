@@ -186,6 +186,7 @@ impl App {
             .spawn_depth
             .unwrap_or(bootstrap.default_spawn_depth);
         let position = harness::spawn_position(
+            test_cfg.world_preset,
             spawn_xyz,
             anchor_depth,
             bootstrap.default_spawn_depth,

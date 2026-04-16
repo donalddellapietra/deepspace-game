@@ -18,7 +18,7 @@ pub enum WorldPreset {
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
-const PLAIN_SURFACE_Y: f32 = 1.0;
+const PLAIN_SURFACE_Y: f32 = 1.5;
 const PLAIN_GRASS_THICKNESS: f32 = 0.05;
 const PLAIN_DIRT_THICKNESS: f32 = 0.25;
 

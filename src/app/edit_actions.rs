@@ -7,7 +7,7 @@
 //! separate coarser edit path.
 
 use crate::game_state::HotbarItem;
-use crate::world::anchor::{Path, WORLD_SIZE};
+use crate::world::anchor::{Path, WORLD_SIZE, WorldPos};
 use crate::world::cubesphere::FACE_SLOTS;
 use crate::world::cubesphere_local;
 use crate::world::edit;
@@ -25,6 +25,46 @@ const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
 impl App {
+    fn zoom_frame_path(frame: &ActiveFrame) -> Path {
+        match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => sphere.body_path,
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => frame.render_path,
+        }
+    }
+
+    fn zoom_focus_local(&self, frame_path: &Path) -> [f32; 3] {
+        let cam_local = self.camera.position.in_frame(frame_path);
+        if let Some(hit) = self.frame_aware_raycast() {
+            let (min, max) = edit::hit_aabb_in_frame_local(&hit, frame_path);
+            return [
+                cam_local[0].clamp(min[0], max[0]),
+                cam_local[1].clamp(min[1], max[1]),
+                cam_local[2].clamp(min[2], max[2]),
+            ];
+        }
+        let ray_dir = crate::world::sdf::normalize(self.ray_dir_in_frame(frame_path));
+        [
+            (cam_local[0] + ray_dir[0] * 0.35).clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            (cam_local[1] + ray_dir[1] * 0.35).clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            (cam_local[2] + ray_dir[2] * 0.35).clamp(0.0, WORLD_SIZE - f32::EPSILON),
+        ]
+    }
+
+    pub(super) fn zoom_position_about_focus(&self, new_depth: u8) -> WorldPos {
+        let frame = self.active_frame;
+        let frame_path = Self::zoom_frame_path(&frame);
+        let cam_local = self.camera.position.in_frame(&frame_path);
+        let focus_local = self.zoom_focus_local(&frame_path);
+        let cur_depth = self.anchor_depth() as u8;
+        let scale = if new_depth > cur_depth { 1.0 / 3.0 } else { 3.0 };
+        let next_local = [
+            focus_local[0] + (cam_local[0] - focus_local[0]) * scale,
+            focus_local[1] + (cam_local[1] - focus_local[1]) * scale,
+            focus_local[2] + (cam_local[2] - focus_local[2]) * scale,
+        ];
+        WorldPos::from_frame_local(&frame_path, next_local, new_depth)
+    }
+
     fn highlight_aabb_for_cartesian_hit(&self, hit: &edit::HitInfo) -> ([f32; 3], [f32; 3]) {
         const MIN_VISIBLE_EXTENT: f32 = 1e-4;
         let mut display_hit = hit.clone();
@@ -309,25 +349,6 @@ impl App {
         Some(path)
     }
 
-    fn camera_local_cartesian_focus_path(&self, desired_depth: u8) -> Option<Path> {
-        let cam_world = self.camera.position.to_world_xyz();
-        let ray_world = crate::world::sdf::normalize(self.camera.forward());
-        let probe_depth = desired_depth.min(8).max(1) as u32;
-        let hit = edit::cpu_raycast(
-            &self.world.library,
-            self.world.root,
-            cam_world,
-            ray_world,
-            probe_depth,
-        )?;
-        let mut path = Path::root();
-        for &(_, slot) in &hit.path {
-            path.push(slot as u8);
-        }
-        path.truncate(desired_depth.min(path.depth()));
-        Some(path)
-    }
-
     fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Sphere(sphere) => (
@@ -350,6 +371,22 @@ impl App {
     fn target_render_frame(&self) -> ActiveFrame {
         let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
+        let mut anchor_logical = self.camera.position.anchor;
+        anchor_logical.truncate(desired_depth);
+        let mut focus_logical = None;
+        if let Some(hit) = self.frame_aware_raycast() {
+            let mut path = Path::root();
+            for &(_, slot) in &hit.path {
+                path.push(slot as u8);
+            }
+            path.truncate(desired_depth.min(path.depth()));
+            if !path.is_root() {
+                focus_logical = Some(path);
+            }
+        }
+
+        let base_cartesian =
+            super::App::frame_for_logical_path(&self.world.library, self.world.root, &anchor_logical);
         let frame = self
             .camera_local_sphere_focus_path(desired_depth)
             .map(|path| {
@@ -361,18 +398,17 @@ impl App {
                 )
             })
             .or_else(|| {
-                self.camera_local_cartesian_focus_path(desired_depth)
-                    .map(|path| {
-                        super::App::frame_for_logical_path(
-                            &self.world.library,
-                            self.world.root,
-                            &path,
-                        )
-                    })
+                focus_logical.map(|path| {
+                    super::App::frame_for_logical_path(
+                        &self.world.library,
+                        self.world.root,
+                        &path,
+                    )
+                })
             })
-            .unwrap_or_else(|| self.render_frame());
+            .unwrap_or(base_cartesian);
         let mut frame = frame;
-        while frame.render_path.depth() > 0
+        while matches!(frame.kind, ActiveFrameKind::Sphere(_)) && frame.render_path.depth() > 0
             && (!self.camera_fits_frame(&frame)
                 || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
         {

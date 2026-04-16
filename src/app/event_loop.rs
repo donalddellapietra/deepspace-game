@@ -434,11 +434,7 @@ impl App {
         if new_depth == cur {
             return;
         }
-        if step > 0 {
-            self.camera.position.zoom_in();
-        } else {
-            self.camera.position.zoom_out();
-        }
+        self.camera.position = self.zoom_position_about_focus(new_depth as u8);
         self.apply_zoom();
     }
 }

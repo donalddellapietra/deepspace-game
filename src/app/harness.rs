@@ -11,6 +11,7 @@ use crate::world::bootstrap::WorldPreset;
 use crate::world::edit;
 use crate::world::sdf;
 use crate::world::state::WorldState;
+use crate::world::tree::{slot_coords, slot_index};
 use crate::world::tree::MAX_DEPTH;
 
 use super::{frame_origin_size_world, ActiveFrame, ActiveFrameKind};
@@ -18,14 +19,19 @@ use super::{frame_origin_size_world, ActiveFrame, ActiveFrameKind};
 const TEST_UP: [f32; 3] = [0.0, 1.0, 0.0];
 const BOUNDARY_EPS: f32 = 1e-6;
 const STABLE_OFFSET: f32 = 0.375;
+const PLAIN_SURFACE_OFFSET: [f32; 3] = [0.5, 0.65, 0.5];
 const YAW_OFFSETS: [f32; 7] = [0.0, -0.15, 0.15, -0.3, 0.3, -0.45, 0.45];
 const PITCH_OFFSETS: [f32; 7] = [0.0, -0.12, 0.12, -0.24, 0.24, -0.36, 0.36];
 
 pub(crate) fn spawn_position(
+    world_preset: WorldPreset,
     spawn_xyz: [f32; 3],
     target_depth: u8,
     reference_depth: u8,
 ) -> WorldPos {
+    if matches!(world_preset, WorldPreset::PlainTest) && target_depth > 0 {
+        return plain_surface_spawn(spawn_xyz, target_depth, reference_depth);
+    }
     let base_depth = target_depth.min(reference_depth);
     let base = WorldPos::from_world_xyz(spawn_xyz, base_depth);
     let position = if target_depth <= base_depth {
@@ -34,6 +40,18 @@ pub(crate) fn spawn_position(
         base.deepened_to(target_depth)
     };
     stabilize_spawn(position)
+}
+
+fn plain_surface_spawn(spawn_xyz: [f32; 3], target_depth: u8, reference_depth: u8) -> WorldPos {
+    let base_depth = target_depth.min(reference_depth).max(1);
+    let base = WorldPos::from_world_xyz(spawn_xyz, base_depth).deepened_to(target_depth);
+    let mut anchor = Path::root();
+    for depth in 0..target_depth as usize {
+        let (sx, _, sz) = slot_coords(base.anchor.slot(depth) as usize);
+        let sy = if depth == 0 { 1 } else { 0 };
+        anchor.push(slot_index(sx, sy, sz) as u8);
+    }
+    WorldPos::new(anchor, PLAIN_SURFACE_OFFSET)
 }
 
 pub(crate) fn stabilize_spawn(mut position: WorldPos) -> WorldPos {
@@ -251,8 +269,9 @@ mod tests {
     #[test]
     fn derived_plain_harness_view_hits_representative_layers() {
         let bootstrap = bootstrap_world(WorldPreset::PlainTest, Some(40));
-        for depth in [32u8, 34, 36, 39] {
+        for depth in [39u8, 36, 34, 32, 22, 20, 18, 16] {
             let position = spawn_position(
+                WorldPreset::PlainTest,
                 bootstrap.default_spawn_xyz,
                 depth,
                 bootstrap.default_spawn_depth,
@@ -285,6 +304,33 @@ mod tests {
                 ),
                 "derived harness view should produce a stable world hit at depth {depth}; yaw={yaw} pitch={pitch} frame={:?}",
                 frame.render_path.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn plain_surface_spawn_hugs_surface_at_representative_layers() {
+        let bootstrap = bootstrap_world(WorldPreset::PlainTest, Some(40));
+        for depth in [39u8, 36, 34, 32, 22, 20, 18, 16] {
+            let position = spawn_position(
+                WorldPreset::PlainTest,
+                bootstrap.default_spawn_xyz,
+                depth,
+                bootstrap.default_spawn_depth,
+            );
+            let y0 = slot_coords(position.anchor.slot(0) as usize).1;
+            assert_eq!(y0, 1, "plain spawn must stay in the air layer at depth {depth}");
+            for level in 1..position.anchor.depth() as usize {
+                let y = slot_coords(position.anchor.slot(level) as usize).1;
+                assert_eq!(
+                    y, 0,
+                    "plain spawn should descend toward the surface from above at depth {depth}, level {level}"
+                );
+            }
+            assert!(
+                position.offset[1] < 0.8,
+                "plain spawn should remain close to the surface at depth {depth}: {:?}",
+                position.offset
             );
         }
     }
