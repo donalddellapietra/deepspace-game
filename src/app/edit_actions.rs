@@ -14,7 +14,7 @@ use crate::world::edit;
 use crate::world::gpu;
 
 use super::{
-    App, ActiveFrame, ActiveFrameKind, LodUploadKey, RENDER_FRAME_CONTEXT, RENDER_FRAME_K,
+    App, ActiveFrame, ActiveFrameKind, HighlightCacheKey, LodUploadKey, RENDER_FRAME_CONTEXT, RENDER_FRAME_K,
     RENDER_FRAME_MAX_DEPTH,
 };
 
@@ -24,6 +24,13 @@ const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
 impl App {
+    fn ray_dir_in_frame(&self, frame_path: &Path) -> [f32; 3] {
+        let world_dir = crate::world::sdf::normalize(self.camera.forward());
+        let (_, frame_size_world) = super::frame::frame_origin_size_world(frame_path);
+        let scale = WORLD_SIZE / frame_size_world.max(1e-30);
+        crate::world::sdf::scale(world_dir, scale)
+    }
+
     fn debug_path_kinds(&self, path: &Path) -> Vec<String> {
         use crate::world::tree::{Child, NodeKind};
 
@@ -106,6 +113,9 @@ impl App {
     }
 
     pub(super) fn edit_depth(&self) -> u32 {
+        if let Some(depth) = self.forced_edit_depth {
+            return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
+        }
         self.anchor_depth().saturating_sub(1).max(1)
     }
 
@@ -377,7 +387,7 @@ impl App {
         let hit = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let ray_dir_local = crate::world::sdf::normalize(self.camera.forward());
+                let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
                 edit::cpu_raycast_in_sphere_frame(
                     &self.world.library,
                     self.world.root,
@@ -397,16 +407,17 @@ impl App {
                 )
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
-                let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-                let min_depth = self.active_frame.render_path.depth() as u32 + 1;
-                let mut depth = self.edit_depth();
+                let frame_path = &self.active_frame.render_path;
                 let mut hit = None;
+                let cam_local = self.camera.position.in_frame(frame_path);
+                let ray_dir = self.ray_dir_in_frame(frame_path);
+                let min_depth = frame_path.depth() as u32 + 1;
+                let mut depth = self.edit_depth();
                 while depth >= min_depth {
                     hit = edit::cpu_raycast_in_frame(
                         &self.world.library,
                         self.world.root,
-                        self.active_frame.render_path.as_slice(),
+                        frame_path.as_slice(),
                         cam_local,
                         ray_dir,
                         depth,
@@ -422,7 +433,7 @@ impl App {
                         "frame_raycast_cartesian_fallback_failed edit_depth={} min_depth={} render_path={:?}",
                         self.edit_depth(),
                         min_depth,
-                        self.active_frame.render_path.as_slice(),
+                        frame_path.as_slice(),
                     );
                 }
                 hit
@@ -549,6 +560,8 @@ impl App {
 
     pub(super) fn upload_tree(&mut self) {
         self.tree_depth = self.world.tree_depth();
+        self.highlight_epoch = self.highlight_epoch.wrapping_add(1);
+        self.cached_highlight = None;
         self.upload_tree_lod();
     }
 
@@ -670,18 +683,38 @@ impl App {
     }
     pub(super) fn update_highlight(&mut self) {
         if self.disable_highlight {
+            self.last_highlight_raycast_ms = 0.0;
+            self.last_highlight_set_ms = 0.0;
+            self.cached_highlight = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);
             }
             return;
         }
         if !self.cursor_locked {
+            self.last_highlight_raycast_ms = 0.0;
+            self.last_highlight_set_ms = 0.0;
+            self.cached_highlight = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);
             }
             return;
         }
+        let cache_key = HighlightCacheKey::new(self);
+        if let Some((cached_key, cached_aabb)) = self.cached_highlight {
+            if cached_key == cache_key {
+                self.last_highlight_raycast_ms = 0.0;
+                let set_start = std::time::Instant::now();
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_highlight(cached_aabb);
+                }
+                self.last_highlight_set_ms = set_start.elapsed().as_secs_f64() * 1000.0;
+                return;
+            }
+        }
+        let raycast_start = std::time::Instant::now();
         let tree_hit = self.frame_aware_raycast();
+        self.last_highlight_raycast_ms = raycast_start.elapsed().as_secs_f64() * 1000.0;
         if self.startup_profile_frames < 16 {
             eprintln!(
                 "highlight_update frame={} cursor_locked={} hit={}",
@@ -696,8 +729,11 @@ impl App {
                 edit::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
             }
         });
+        let set_start = std::time::Instant::now();
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(aabb);
         }
+        self.last_highlight_set_ms = set_start.elapsed().as_secs_f64() * 1000.0;
+        self.cached_highlight = Some((cache_key, aabb));
     }
 }

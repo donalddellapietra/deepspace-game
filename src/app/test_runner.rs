@@ -75,7 +75,7 @@ pub struct TestConfig {
     pub disable_highlight: bool,
     pub suppress_startup_logs: bool,
     pub force_visual_depth: Option<u32>,
-    pub force_cartesian_lod: bool,
+    pub force_edit_depth: Option<u32>,
     pub harness_width: Option<u32>,
     pub harness_height: Option<u32>,
     pub world_preset: WorldPreset,
@@ -143,8 +143,8 @@ impl TestConfig {
                 "--force-visual-depth" => {
                     cfg.force_visual_depth = args.next().and_then(|v| v.parse().ok());
                 }
-                "--force-cartesian-lod" => {
-                    cfg.force_cartesian_lod = true;
+                "--force-edit-depth" => {
+                    cfg.force_edit_depth = args.next().and_then(|v| v.parse().ok());
                 }
                 "--harness-width" => {
                     cfg.harness_width = args.next().and_then(|v| v.parse().ok());
@@ -566,6 +566,8 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     let mut total_update = 0.0f64;
     let mut total_upload = 0.0f64;
     let mut total_highlight = 0.0f64;
+    let mut total_highlight_raycast = 0.0f64;
+    let mut total_highlight_set = 0.0f64;
     let mut total_render = 0.0f64;
     let mut total_render_texture_alloc = 0.0f64;
     let mut total_render_view = 0.0f64;
@@ -586,6 +588,8 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         let t2 = std::time::Instant::now();
         app.update_highlight();
         let t_highlight = t2.elapsed().as_secs_f64() * 1000.0;
+        let t_highlight_raycast = app.last_highlight_raycast_ms;
+        let t_highlight_set = app.last_highlight_set_ms;
 
         let render_timing = if let Some(renderer) = &mut app.renderer {
             renderer.render_offscreen()
@@ -597,6 +601,8 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         total_update += t_update;
         total_upload += t_upload;
         total_highlight += t_highlight;
+        total_highlight_raycast += t_highlight_raycast;
+        total_highlight_set += t_highlight_set;
         total_render += t_render;
         total_render_texture_alloc += render_timing.texture_alloc_ms;
         total_render_view += render_timing.view_ms;
@@ -662,10 +668,12 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
 
     if frame_count > 0 {
         eprintln!(
-            "render_harness_timing avg_ms update={:.3} upload={:.3} highlight={:.3} render={:.3} render_texture_alloc={:.3} render_view={:.3} render_encode={:.3} render_submit={:.3} render_wait={:.3} total={:.3}",
+            "render_harness_timing avg_ms update={:.3} upload={:.3} highlight={:.3} highlight_raycast={:.3} highlight_set={:.3} render={:.3} render_texture_alloc={:.3} render_view={:.3} render_encode={:.3} render_submit={:.3} render_wait={:.3} total={:.3}",
             total_update / frame_count as f64,
             total_upload / frame_count as f64,
             total_highlight / frame_count as f64,
+            total_highlight_raycast / frame_count as f64,
+            total_highlight_set / frame_count as f64,
             total_render / frame_count as f64,
             total_render_texture_alloc / frame_count as f64,
             total_render_view / frame_count as f64,

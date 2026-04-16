@@ -56,6 +56,32 @@ pub(super) struct LodUploadKey {
     pub kind_tag: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HighlightCacheKey {
+    pub lod: LodUploadKey,
+    pub yaw_bits: u32,
+    pub pitch_bits: u32,
+    pub cursor_locked: bool,
+    pub epoch: u64,
+}
+
+impl HighlightCacheKey {
+    pub(super) fn new(app: &App) -> Self {
+        Self {
+            lod: LodUploadKey::new(
+                app.world.root,
+                &app.camera.position,
+                &app.active_frame,
+                app.visual_depth().min(u8::MAX as u32) as u8,
+            ),
+            yaw_bits: app.camera.yaw.to_bits(),
+            pitch_bits: app.camera.pitch.to_bits(),
+            cursor_locked: app.cursor_locked,
+            epoch: app.highlight_epoch,
+        }
+    }
+}
+
 impl LodUploadKey {
     pub(super) fn new(root: u64, camera: &WorldPos, frame: &ActiveFrame, visual_depth: u8) -> Self {
         let kind_tag = match frame.kind {
@@ -121,9 +147,13 @@ pub struct App {
     pub(super) disable_overlay: bool,
     pub(super) disable_highlight: bool,
     pub(super) forced_visual_depth: Option<u32>,
-    pub(super) force_cartesian_lod: bool,
+    pub(super) forced_edit_depth: Option<u32>,
     pub(super) harness_width: u32,
     pub(super) harness_height: u32,
+    pub(super) last_highlight_raycast_ms: f64,
+    pub(super) last_highlight_set_ms: f64,
+    pub(super) highlight_epoch: u64,
+    pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -142,7 +172,7 @@ impl App {
         let disable_overlay = test_cfg.disable_overlay;
         let disable_highlight = test_cfg.disable_highlight;
         let forced_visual_depth = test_cfg.force_visual_depth;
-        let force_cartesian_lod = test_cfg.force_cartesian_lod;
+        let forced_edit_depth = test_cfg.force_edit_depth;
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let world = bootstrap.world;
@@ -209,9 +239,13 @@ impl App {
             disable_overlay,
             disable_highlight,
             forced_visual_depth,
-            force_cartesian_lod,
+            forced_edit_depth,
             harness_width,
             harness_height,
+            last_highlight_raycast_ms: 0.0,
+            last_highlight_set_ms: 0.0,
+            highlight_epoch: 0,
+            cached_highlight: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
