@@ -8,6 +8,6 @@ Never assume something worked. After running any command (build, dev server, tes
 
 If you are on a worktree, always commit and push your changes unless they are broken. If you are on my branch, always ask me first. You should always be on a worktree unless otherwise specified.
 
-Never use -force, reset hard, checkout, or any other destructive changes without my permission.
+Never use -force, reset hard, checkout, or git stash, or any other destructive changes without my permission.
 
 The source of truth for all docs is always my current worktree, not yours. If you are to write a new doc, write it on my worktree, then move back to yours.
