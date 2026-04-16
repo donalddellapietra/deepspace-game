@@ -122,8 +122,6 @@ When a file is structurally wrong, the procedure is:
    meaningful.
 5. If a file is large and mixed-responsibility, do not do exact patches through
    the middle of it. Split it first, then rewrite the resulting files cleanly.
-6. If a split produces awkward glue code, stop and restructure it properly.
-   Do not hide large rewrites behind brittle `include_str!` stacking or similar shortcuts.
 
 The purpose of this procedure is to avoid accumulating patch stacks on top of a
 broken architecture.
