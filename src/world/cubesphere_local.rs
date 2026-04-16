@@ -1,5 +1,6 @@
 use super::cubesphere::{cube_to_ea, face_uv_to_dir, pick_face, Face};
 use super::sdf;
+use super::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalFacePoint {
@@ -87,4 +88,27 @@ pub fn face_space_to_body_point(
     let radius = (inner_r_local + rn * (outer_r_local - inner_r_local)) * body_size;
     let dir = face_uv_to_dir(face, un * 2.0 - 1.0, vn * 2.0 - 1.0);
     sdf::add(center, sdf::scale(dir, radius))
+}
+
+/// Scan a hit path for the first entry whose child is a
+/// `NodeKind::CubedSphereBody` node. Returns the index in `hit_path`
+/// where the body is the child, plus its radii.
+///
+/// Used by both sphere raycast dispatch and AABB reconstruction:
+/// once the body entry is located, callers extract the face slot
+/// from `hit_path[index + 1]` and the per-face-subtree slot indices
+/// from `hit_path[index + 2..]`.
+pub fn find_body_ancestor_in_path(
+    library: &NodeLibrary,
+    hit_path: &[(NodeId, usize)],
+) -> Option<(usize, f32, f32)> {
+    for (index, &(node_id, slot)) in hit_path.iter().enumerate() {
+        let Some(node) = library.get(node_id) else { continue };
+        let Child::Node(child_id) = node.children[slot] else { continue };
+        let Some(child) = library.get(child_id) else { continue };
+        if let NodeKind::CubedSphereBody { inner_r, outer_r } = child.kind {
+            return Some((index, inner_r, outer_r));
+        }
+    }
+    None
 }

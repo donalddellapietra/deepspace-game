@@ -48,7 +48,7 @@ pub fn generate_world() -> WorldState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::edit;
+    use crate::world::raycast;
 
     #[test]
     fn generated_world_is_empty() {
@@ -57,7 +57,7 @@ mod tests {
         assert_eq!(depth as usize, TARGET_DEPTH);
         // Every point in the world box should read as empty.
         for &p in &[[0.5, 0.5, 0.5], [1.5, 1.5, 1.5], [2.5, 2.5, 2.5]] {
-            assert!(!edit::is_solid_at(&w.library, w.root, p, depth),
+            assert!(!raycast::is_solid_at(&w.library, w.root, p, depth),
                 "expected empty at {:?}", p);
         }
     }
