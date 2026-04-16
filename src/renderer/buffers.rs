@@ -41,6 +41,7 @@ impl Renderer {
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.shader_stats_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -81,6 +82,7 @@ impl Renderer {
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.shader_stats_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -153,6 +155,7 @@ pub(super) fn make_bind_group(
     uniforms: &wgpu::Buffer,
     node_kinds: &wgpu::Buffer,
     ribbon: &wgpu::Buffer,
+    shader_stats: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -164,6 +167,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 3, resource: uniforms.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: node_kinds.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
         ],
     })
 }

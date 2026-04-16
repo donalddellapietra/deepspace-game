@@ -149,6 +149,7 @@ impl App {
                 } else {
                     wgpu::PresentMode::AutoVsync
                 },
+                false,
             ),
         );
         let renderer_elapsed = renderer_start.elapsed();

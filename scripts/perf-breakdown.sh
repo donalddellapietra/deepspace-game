@@ -42,7 +42,7 @@ run() {
     --exit-after-frames 60 --timeout-secs 12 \
     --perf-trace "$csv" --perf-trace-warmup 10 \
     --suppress-startup-logs \
-    "$@" 2>&1 | grep -E "^render_harness_timing|^render_harness_worst|^render_harness_workload|^renderer_features|^perf_trace:"
+    "$@" 2>&1 | grep -E "^render_harness_timing|^render_harness_worst|^render_harness_workload|^render_harness_shader|^renderer_features|^perf_trace:"
   rc=$?
   set -e
   if [ $rc -ne 0 ]; then
@@ -71,6 +71,30 @@ if [ "$SEL" = "world" ] || [ "$SEL" = "all" ]; then
   echo "### MATRIX: world preset (1280x720, spawn_depth=6) ###"
   run "world_plain" --harness-width 1280 --harness-height 720 --spawn-depth 6
   run "world_sphere" --sphere-world --harness-width 1280 --harness-height 720 --spawn-depth 6
+fi
+
+if [ "$SEL" = "room" ] || [ "$SEL" = "all" ]; then
+  echo "### MATRIX: room / openness (1280x720, plain, --shader-stats) ###"
+  # Baseline: flat ground, camera one cell up. Every ray hits the
+  # surface immediately — closest-case workload.
+  run "room_baseline" \
+    --harness-width 1280 --harness-height 720 --spawn-depth 6 --shader-stats
+  # One break: carves a single anchor-sized cell directly below the
+  # camera. A few rays near the crosshair pass into the void before
+  # hitting the deeper surface — longer marches through empty space.
+  run "room_break_one" \
+    --harness-width 1280 --harness-height 720 --spawn-depth 6 --shader-stats \
+    --script "wait:15,break,wait:40"
+  # Zoom out, break a big cell, zoom back in. The carved volume
+  # spans 3^2 anchor cells; most rays now traverse a large void.
+  run "room_break_big" \
+    --harness-width 1280 --harness-height 720 --spawn-depth 6 --shader-stats \
+    --script "wait:10,zoom_out:2,wait:5,break,wait:5,zoom_in:2,wait:30"
+  # Pitch upward inside the carved volume so rays travel along the
+  # open horizontal axis rather than into the floor immediately.
+  run "room_break_big_horiz" \
+    --harness-width 1280 --harness-height 720 --spawn-depth 6 --shader-stats \
+    --script "wait:10,zoom_out:2,wait:5,break,wait:5,zoom_in:2,wait:5,pitch:-0.3,wait:25"
 fi
 
 echo "[done] CSVs under tmp/perf/"

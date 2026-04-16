@@ -94,5 +94,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(color, cross_color, 0.95);
     }
 
+    // Emit per-ray stats to the shader_stats buffer. Gated behind
+    // the `ENABLE_STATS` override so the off-state has zero runtime
+    // cost — per-pixel atomic contention on a 32-byte buffer can
+    // add ~0.5–1ms at 1280x720 and would distort baseline perf
+    // measurements. Enabled only when the harness passes
+    // `--shader-stats`.
+    if ENABLE_STATS {
+        atomicAdd(&shader_stats.ray_count, 1u);
+        if result.hit {
+            atomicAdd(&shader_stats.hit_count, 1u);
+        } else {
+            atomicAdd(&shader_stats.miss_count, 1u);
+        }
+        if ray_steps >= 2048u {
+            atomicAdd(&shader_stats.max_iter_count, 1u);
+        }
+        atomicAdd(&shader_stats.sum_steps_div4, ray_steps >> 2u);
+        atomicMax(&shader_stats.max_steps, ray_steps);
+    }
+
     return vec4<f32>(color, 1.0);
 }

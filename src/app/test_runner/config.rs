@@ -52,6 +52,11 @@ pub struct TestConfig {
     /// starting to record. Defaults to 0 (record everything,
     /// including startup). Set this to skip warm-up frames.
     pub perf_trace_warmup: u32,
+    /// Enable per-pixel DDA step-count atomics in the fragment
+    /// shader. Adds ~0.5–1 ms per frame at 1280x720 from atomic
+    /// contention, so it's off by default and only turned on for
+    /// diagnostic runs. See `docs/testing/perf-isolation.md`.
+    pub shader_stats: bool,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -169,6 +174,7 @@ impl TestConfig {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                 }
+                "--shader-stats" => { cfg.shader_stats = true; }
                 _ => {}
             }
         }

@@ -188,6 +188,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         &node_kinds,
         root_index,
         wgpu::PresentMode::AutoNoVsync,
+        cfg.shader_stats,
     ));
     let mut renderer = renderer;
     renderer.resize(app.harness_width, app.harness_height);
@@ -273,6 +274,12 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             gpu_pass_ms: render_timing.gpu_pass_ms,
             gpu_readback_ms: render_timing.gpu_readback_ms,
             submitted_done_ms: render_timing.submitted_done_ms,
+            ray_count: render_timing.shader_stats.ray_count,
+            hit_count: render_timing.shader_stats.hit_count,
+            miss_count: render_timing.shader_stats.miss_count,
+            max_iter_count: render_timing.shader_stats.max_iter_count,
+            avg_steps: render_timing.shader_stats.avg_steps(),
+            max_steps: render_timing.shader_stats.max_steps,
             packed_node_count,
             ribbon_len,
             effective_visual_depth,
@@ -358,6 +365,12 @@ struct FrameSample {
     gpu_pass_ms: Option<f64>,
     gpu_readback_ms: f64,
     submitted_done_ms: Option<f64>,
+    ray_count: u32,
+    hit_count: u32,
+    miss_count: u32,
+    max_iter_count: u32,
+    avg_steps: f64,
+    max_steps: u32,
     packed_node_count: u32,
     ribbon_len: u32,
     effective_visual_depth: u32,
@@ -382,7 +395,7 @@ impl PerfTraceWriter {
         use std::io::Write;
         writeln!(
             writer,
-            "frame,wall_ms,update_ms,camera_write_ms,upload_total_ms,pack_ms,ribbon_build_ms,tree_write_ms,ribbon_write_ms,bind_group_rebuild_ms,highlight_ms,highlight_raycast_ms,highlight_set_ms,render_total_ms,render_texture_alloc_ms,render_view_ms,render_encode_ms,render_submit_ms,render_wait_ms,gpu_pass_ms,gpu_readback_ms,submitted_done_ms,packed_node_count,ribbon_len,effective_visual_depth,reused_gpu_tree"
+            "frame,wall_ms,update_ms,camera_write_ms,upload_total_ms,pack_ms,ribbon_build_ms,tree_write_ms,ribbon_write_ms,bind_group_rebuild_ms,highlight_ms,highlight_raycast_ms,highlight_set_ms,render_total_ms,render_texture_alloc_ms,render_view_ms,render_encode_ms,render_submit_ms,render_wait_ms,gpu_pass_ms,gpu_readback_ms,submitted_done_ms,ray_count,hit_count,miss_count,max_iter_count,avg_steps,max_steps,packed_node_count,ribbon_len,effective_visual_depth,reused_gpu_tree"
         )?;
         Ok(Self { path: path.to_string(), writer })
     }
@@ -393,13 +406,14 @@ impl PerfTraceWriter {
         let submitted_done = s.submitted_done_ms.map(|v| format!("{v:.4}")).unwrap_or_else(|| String::new());
         let _ = writeln!(
             self.writer,
-            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{},{},{},{},{}",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{},{},{},{},{},{:.2},{},{},{},{},{}",
             s.frame, s.wall_ms,
             s.update_ms, s.camera_write_ms,
             s.upload_total_ms, s.pack_ms, s.ribbon_build_ms, s.tree_write_ms, s.ribbon_write_ms, s.bind_group_rebuild_ms,
             s.highlight_ms, s.highlight_raycast_ms, s.highlight_set_ms,
             s.render_total_ms, s.render_texture_alloc_ms, s.render_view_ms, s.render_encode_ms, s.render_submit_ms, s.render_wait_ms,
             gpu, s.gpu_readback_ms, submitted_done,
+            s.ray_count, s.hit_count, s.miss_count, s.max_iter_count, s.avg_steps, s.max_steps,
             s.packed_node_count, s.ribbon_len, s.effective_visual_depth,
             u32::from(s.reused_gpu_tree),
         );
@@ -441,6 +455,14 @@ struct PerfAgg {
     sum_gpu_readback: f64,
     sum_submitted_done: f64,
     submitted_done_count: u32,
+    sum_ray_count: u64,
+    sum_hit_count: u64,
+    sum_miss_count: u64,
+    sum_max_iter_count: u64,
+    sum_avg_steps: f64,
+    max_max_steps: u32,
+    worst_avg_steps: f64,
+    worst_avg_steps_frame: u32,
     sum_packed_node_count: u64,
     sum_ribbon_len: u64,
     worst_total_ms: f64,
@@ -493,6 +515,18 @@ impl PerfAgg {
         if let Some(v) = s.submitted_done_ms {
             self.sum_submitted_done += v;
             self.submitted_done_count += 1;
+        }
+        self.sum_ray_count += s.ray_count as u64;
+        self.sum_hit_count += s.hit_count as u64;
+        self.sum_miss_count += s.miss_count as u64;
+        self.sum_max_iter_count += s.max_iter_count as u64;
+        self.sum_avg_steps += s.avg_steps;
+        if s.max_steps > self.max_max_steps {
+            self.max_max_steps = s.max_steps;
+        }
+        if s.avg_steps > self.worst_avg_steps {
+            self.worst_avg_steps = s.avg_steps;
+            self.worst_avg_steps_frame = s.frame;
         }
         let total = s.update_ms + s.upload_total_ms + s.highlight_ms + s.render_total_ms;
         if total > self.worst_total_ms {
@@ -560,6 +594,26 @@ impl PerfAgg {
             self.max_packed_node_count,
             self.sum_ribbon_len / self.frame_count as u64,
             self.max_ribbon_len,
+        );
+        let avg_steps_overall = self.sum_avg_steps / n;
+        let hit_frac = if self.sum_ray_count == 0 {
+            0.0
+        } else {
+            self.sum_hit_count as f64 / self.sum_ray_count as f64
+        };
+        let max_iter_frac = if self.sum_ray_count == 0 {
+            0.0
+        } else {
+            self.sum_max_iter_count as f64 / self.sum_ray_count as f64
+        };
+        eprintln!(
+            "render_harness_shader frames={} avg_steps={:.2} worst_avg_steps={:.2}@frame{} max_steps={} hit_fraction={:.4} max_iter_fraction={:.6}",
+            self.frame_count,
+            avg_steps_overall,
+            self.worst_avg_steps, self.worst_avg_steps_frame,
+            self.max_max_steps,
+            hit_frac,
+            max_iter_frac,
         );
     }
 }

@@ -63,12 +63,40 @@ struct NodeKindGpu {
     outer_r: f32,
 }
 
+/// Per-frame shader-side counters. Reset to zero each frame by the
+/// renderer via `encoder.clear_buffer`, then atomically accumulated
+/// across all fragment invocations. Layout is fixed: the CPU reads
+/// back these u32s in this exact order. `sum_steps_div4` divides by
+/// 4 to keep the sum under u32::MAX at 1920x1080 (2.07M pixels *
+/// 2048 cap = 4.24G, divided by 4 = 1.06G).
+struct ShaderStats {
+    ray_count: atomic<u32>,
+    hit_count: atomic<u32>,
+    miss_count: atomic<u32>,
+    max_iter_count: atomic<u32>,
+    sum_steps_div4: atomic<u32>,
+    max_steps: atomic<u32>,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
 @group(0) @binding(1) var<uniform> camera: Camera;
 @group(0) @binding(2) var<uniform> palette: Palette;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 @group(0) @binding(4) var<storage, read> node_kinds: array<NodeKindGpu>;
 @group(0) @binding(5) var<storage, read> ribbon: array<RibbonEntry>;
+@group(0) @binding(6) var<storage, read_write> shader_stats: ShaderStats;
+
+/// Per-fragment-thread counter; each DDA inner-loop iteration
+/// increments it. Emitted to `shader_stats` at the end of fs_main.
+var<private> ray_steps: u32 = 0u;
+
+/// Pipeline-override constant: when false, fs_main skips all
+/// atomic writes to shader_stats and DDA loops skip the `ray_steps`
+/// increment. Compile-time folded, so off-state has zero runtime
+/// cost. Default off; the harness enables it via `--shader-stats`.
+override ENABLE_STATS: bool = false;
 
 const MAX_FACE_DEPTH: u32 = 63u;
 const MAX_STACK_DEPTH: u32 = 64u;

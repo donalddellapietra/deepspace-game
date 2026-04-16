@@ -70,6 +70,7 @@ fn march_face_root(
     loop {
         if t >= t_exit || steps > 4096u { break; }
         steps = steps + 1u;
+        if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
         let local = oc + ray_dir * t;
         let r = length(local);
@@ -225,6 +226,7 @@ fn sphere_in_cell(
     loop {
         if t >= t_exit || steps > 4096u { break; }
         steps = steps + 1u;
+        if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
         let local = oc + ray_dir * t;
         let r = length(local);
@@ -366,6 +368,7 @@ fn sphere_in_face_window(
     loop {
         if t >= t_exit || steps > 4096u { break; }
         steps = steps + 1u;
+        if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
         let local = oc + ray_dir * t;
         let r = length(local);

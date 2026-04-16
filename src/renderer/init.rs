@@ -17,6 +17,7 @@ impl Renderer {
         node_kinds: &[GpuNodeKind],
         root_index: u32,
         present_mode: wgpu::PresentMode,
+        shader_stats_enabled: bool,
     ) -> Self {
         let size = window.inner_size();
 
@@ -155,6 +156,21 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let shader_stats_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shader_stats"),
+            size: 32,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let shader_stats_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shader_stats_readback"),
+            size: 32,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ray_march"),
             entries: &[
@@ -201,6 +217,14 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Shader stats (binding 6, read_write for atomics).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
@@ -208,6 +232,7 @@ impl Renderer {
             &device, &bind_group_layout,
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
+            &shader_stats_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -223,6 +248,15 @@ impl Renderer {
             push_constant_ranges: &[],
         });
 
+        let stats_constants: &[(&str, f64)] = if shader_stats_enabled {
+            &[("ENABLE_STATS", 1.0)]
+        } else {
+            &[("ENABLE_STATS", 0.0)]
+        };
+        let frag_compilation_options = wgpu::PipelineCompilationOptions {
+            constants: stats_constants,
+            zero_initialize_workgroup_memory: false,
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ray_march"),
             layout: Some(&pipeline_layout),
@@ -240,7 +274,7 @@ impl Renderer {
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
-                compilation_options: Default::default(),
+                compilation_options: frag_compilation_options,
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -297,6 +331,9 @@ impl Renderer {
             last_ribbon_write_ms: 0.0,
             last_tree_write_ms: 0.0,
             last_bind_group_rebuild_ms: 0.0,
+            shader_stats_buffer,
+            shader_stats_readback,
+            shader_stats_enabled,
         }
     }
 }

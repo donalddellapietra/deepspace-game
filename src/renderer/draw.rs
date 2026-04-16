@@ -29,6 +29,49 @@ pub struct OffscreenRenderTiming {
     /// `gpu_pass_ms`, the cost is outside the measured pass:
     /// typically tile resolve, flush, or driver scheduling.
     pub submitted_done_ms: Option<f64>,
+    /// Shader-side per-ray counters for the frame. Populated by
+    /// atomic writes in the fragment shader, read back by copy to
+    /// the `shader_stats_readback` buffer + map_async.
+    pub shader_stats: ShaderStatsFrame,
+}
+
+/// Decoded `shader_stats` buffer for one frame. `avg_steps` is
+/// computed CPU-side as `sum_steps_div4 * 4 / ray_count` (the GPU
+/// side stored div-by-4 to avoid u32 overflow).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShaderStatsFrame {
+    pub ray_count: u32,
+    pub hit_count: u32,
+    pub miss_count: u32,
+    pub max_iter_count: u32,
+    pub sum_steps_div4: u32,
+    pub max_steps: u32,
+}
+
+impl ShaderStatsFrame {
+    pub fn avg_steps(&self) -> f64 {
+        if self.ray_count == 0 {
+            0.0
+        } else {
+            (self.sum_steps_div4 as f64 * 4.0) / self.ray_count as f64
+        }
+    }
+
+    pub fn hit_fraction(&self) -> f64 {
+        if self.ray_count == 0 {
+            0.0
+        } else {
+            self.hit_count as f64 / self.ray_count as f64
+        }
+    }
+
+    pub fn max_iter_fraction(&self) -> f64 {
+        if self.ray_count == 0 {
+            0.0
+        } else {
+            self.max_iter_count as f64 / self.ray_count as f64
+        }
+    }
 }
 
 impl Renderer {
@@ -114,6 +157,13 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offscreen-frame"),
         });
+        if self.shader_stats_enabled {
+            // Zero the shader_stats buffer so atomics accumulate from
+            // 0 this frame. `clear_buffer` is a GPU-side fill; no
+            // CPU synchronization cost, and serializes with the
+            // subsequent render pass on the same encoder.
+            encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
+        }
         let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
             query_set: &ts.query_set,
             beginning_of_pass_write_index: Some(0),
@@ -144,6 +194,13 @@ impl Renderer {
             encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
             encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
         }
+        if self.shader_stats_enabled {
+            encoder.copy_buffer_to_buffer(
+                &self.shader_stats_buffer, 0,
+                &self.shader_stats_readback, 0,
+                32,
+            );
+        }
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
         let done_slot: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -170,6 +227,11 @@ impl Renderer {
             .ok()
             .and_then(|slot| slot.map(|t| t.duration_since(submit_start).as_secs_f64() * 1000.0));
         let (gpu_pass_ms, gpu_readback_ms) = self.read_timestamps();
+        let shader_stats = if self.shader_stats_enabled {
+            self.read_shader_stats()
+        } else {
+            ShaderStatsFrame::default()
+        };
         let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         if total_ms >= 10.0 {
             eprintln!(
@@ -182,8 +244,38 @@ impl Renderer {
         }
         OffscreenRenderTiming {
             texture_alloc_ms, view_ms, encode_ms, submit_ms, wait_ms, total_ms,
-            gpu_pass_ms, gpu_readback_ms, submitted_done_ms,
+            gpu_pass_ms, gpu_readback_ms, submitted_done_ms, shader_stats,
         }
+    }
+
+    /// Map `shader_stats_readback`, decode the 6 u32 counters, and
+    /// unmap. Called after the render-pass submit has completed on
+    /// GPU (verified by the earlier `poll(Wait)`), and after the
+    /// timestamp readback has already fired its own poll pass.
+    fn read_shader_stats(&self) -> ShaderStatsFrame {
+        let slice = self.shader_stats_readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            self.shader_stats_readback.unmap();
+            return ShaderStatsFrame::default();
+        }
+        let data = slice.get_mapped_range();
+        let read_u32 = |offset: usize| {
+            u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap())
+        };
+        let stats = ShaderStatsFrame {
+            ray_count: read_u32(0),
+            hit_count: read_u32(4),
+            miss_count: read_u32(8),
+            max_iter_count: read_u32(12),
+            sum_steps_div4: read_u32(16),
+            max_steps: read_u32(20),
+        };
+        drop(data);
+        self.shader_stats_readback.unmap();
+        stats
     }
 
     /// Map the staging buffer (if present), read back the two

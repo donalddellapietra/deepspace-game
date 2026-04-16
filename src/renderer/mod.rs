@@ -10,7 +10,7 @@ mod buffers;
 mod draw;
 mod init;
 
-pub use draw::OffscreenRenderTiming;
+pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
 
 /// Maximum ancestor-ribbon depth supported by the shader. Larger
 /// ribbons get truncated at upload (anything beyond can't pop).
@@ -90,6 +90,19 @@ pub struct Renderer {
     pub(super) last_ribbon_write_ms: f64,
     pub(super) last_tree_write_ms: f64,
     pub(super) last_bind_group_rebuild_ms: f64,
+    /// Shader-side atomic counters written by the fragment shader
+    /// each frame (ray_count, hit_count, miss_count, max_iter_count,
+    /// sum_steps_div4, max_steps, + 2 u32 pad). 32 bytes total.
+    pub(super) shader_stats_buffer: wgpu::Buffer,
+    /// Mappable COPY_DST shadow of `shader_stats_buffer`. Populated
+    /// via `copy_buffer_to_buffer` at the end of the render pass,
+    /// mapped after `poll(Wait)` so the harness can read the 8 u32s.
+    pub(super) shader_stats_readback: wgpu::Buffer,
+    /// When false, `render_offscreen` skips the stats clear / copy /
+    /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
+    /// shader's atomic writes are compiled out via the `ENABLE_STATS`
+    /// override so there's no per-pixel cost either.
+    pub(super) shader_stats_enabled: bool,
 }
 
 /// GPU timestamp query resources. `query_set` holds two timestamp

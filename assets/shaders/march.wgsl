@@ -77,6 +77,7 @@ fn march_cartesian(
     loop {
         if iterations >= max_iterations { break; }
         iterations += 1u;
+        if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
         let cell = s_cell[depth];
 
