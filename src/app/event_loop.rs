@@ -300,6 +300,20 @@ impl App {
 
         let pre_tail_elapsed = frame_start.elapsed();
         if let Some(test) = self.test.as_mut() {
+            let pre_tail_ms = pre_tail_elapsed.as_secs_f64() * 1000.0;
+            if let Some(max_any_frame_ms) = test.max_any_frame_ms {
+                if pre_tail_ms > max_any_frame_ms as f64 && !test.hard_frame_fail {
+                    test.hard_frame_fail = true;
+                    use std::sync::atomic::Ordering;
+                    test.monitor.perf_failed.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "test_runner: hard frame stall detected in loop: frame={} frame_ms={:.2} threshold_ms={:.2}",
+                        test.frame,
+                        pre_tail_ms,
+                        max_any_frame_ms,
+                    );
+                }
+            }
             let mut frame_sample = None;
             let mut cadence_sample = None;
             if test.frame >= test.fps_warmup_frames {
@@ -310,7 +324,13 @@ impl App {
                 test.perf_samples.record_cadence(dt as f64);
                 cadence_sample = Some(dt as f64);
             }
-            test.monitor.record_frame(test.started_at.elapsed(), frame_sample, cadence_sample);
+            test.monitor.record_frame(
+                test.started_at.elapsed(),
+                frame_sample,
+                cadence_sample,
+                pre_tail_elapsed.as_secs_f64(),
+                dt as f64,
+            );
         }
 
         if self.startup_profile_frames < 12 {
@@ -396,12 +416,14 @@ impl App {
     fn print_perf_summary(&self) {
         if let Some(test) = self.test.as_ref() {
             eprintln!(
-                "test_runner: perf summary samples={} avg_frame_fps={:.2} avg_cadence_fps={:.2} worst_frame_ms={:.2} worst_dt_ms={:.2}",
+                "test_runner: perf summary samples={} avg_frame_fps={:.2} avg_cadence_fps={:.2} worst_frame_ms={:.2} worst_dt_ms={:.2} worst_any_frame_ms={:.2} worst_any_dt_ms={:.2}",
                 test.perf_samples.count,
                 test.perf_samples.avg_frame_fps().unwrap_or(0.0),
                 test.perf_samples.avg_cadence_fps().unwrap_or(0.0),
                 test.perf_samples.worst_frame_secs * 1000.0,
                 test.perf_samples.worst_cadence_secs * 1000.0,
+                test.monitor.worst_any_frame_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
+                test.monitor.worst_any_dt_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
             );
         }
     }
@@ -415,7 +437,9 @@ impl App {
             let due = test.drain_due();
             let frame_budget_done = frame + 1 >= test.exit_after_frames;
             let timed_out = test.timed_out();
-            let perf_active = test.min_fps.is_some() || test.min_cadence_fps.is_some();
+            let perf_active = test.min_fps.is_some()
+                || test.min_cadence_fps.is_some()
+                || test.max_any_frame_ms.is_some();
             let exit_after = test.exit_after_frames;
             let screenshot = test.screenshot_path.clone();
             (due, frame, frame_budget_done, timed_out, perf_active, exit_after, screenshot)
@@ -473,7 +497,7 @@ impl App {
             } else {
                 false
             };
-            frame_failed || cadence_failed
+            frame_failed || cadence_failed || test.hard_frame_fail
         });
         if let Some(test) = self.test.as_ref() {
             if perf_failed {

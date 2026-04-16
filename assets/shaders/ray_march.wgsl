@@ -46,6 +46,9 @@ struct Uniforms {
     /// Current face-frame cell bounds inside the full face:
     /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
     root_face_bounds: vec4<f32>,
+    /// For Cartesian local shells, xyz = root-frame origin of the
+    /// current frame and w = local->root scale. For sphere roots,
+    /// this remains reserved.
     root_face_pop_pos: vec4<f32>,
 }
 
@@ -1004,7 +1007,7 @@ fn sphere_in_face_window(
 /// Returns hit on cell terminal; on miss (ray exits the frame),
 /// returns hit=false so the caller can pop to the ancestor ribbon.
 fn march_cartesian(
-    root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
+    root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>, depth_limit: u32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -1021,6 +1024,7 @@ fn march_cartesian(
         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
         select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
     );
+    let ray_metric = max(length(ray_dir), 1e-6);
     let step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
         select(-1, 1, ray_dir.y >= 0.0),
@@ -1188,11 +1192,11 @@ fn march_cartesian(
             }
 
             // Cartesian Node: depth/LOD check, then descend.
-            let at_max = depth + 1u >= uniforms.max_depth || depth + 1u >= MAX_STACK_DEPTH;
+            let at_max = depth + 1u >= depth_limit || depth + 1u >= MAX_STACK_DEPTH;
             let child_cell_size = s_cell_size[depth] / 3.0;
             let cell_world_size = child_cell_size;
             let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
-            let ray_dist = max(min_side, 0.001);
+            let ray_dist = max(min_side * ray_metric, 0.001);
             let lod_pixels = cell_world_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
             let at_lod = lod_pixels < 1.0;
 
@@ -1284,6 +1288,8 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var cur_hmin = uniforms.highlight_min.xyz;
     var cur_hmax = uniforms.highlight_max.xyz;
     var cur_scale: f32 = 1.0;
+    var jumped_to_root = false;
+    var current_cartesian_max_depth: u32 = uniforms.max_depth;
 
     var hops: u32 = 0u;
     loop {
@@ -1301,7 +1307,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            r = march_cartesian(current_idx, ray_origin, ray_dir);
+            r = march_cartesian(current_idx, ray_origin, ray_dir, current_cartesian_max_depth);
         }
         if r.hit {
             r.frame_level = ribbon_level;
@@ -1309,6 +1315,28 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             r.highlight_max = cur_hmax;
             r.frame_scale = cur_scale;
             return r;
+        }
+
+        // Ray exited the current frame. Cartesian local shells jump
+        // directly to the root shell so fallback cost stays constant.
+        if current_kind == ROOT_KIND_CARTESIAN && !jumped_to_root {
+            let jump_scale = uniforms.root_face_pop_pos.w;
+            if jump_scale < 0.999999 {
+                let jump_origin = uniforms.root_face_pop_pos.xyz;
+                ray_origin = jump_origin + ray_origin * jump_scale;
+                ray_dir = ray_dir * jump_scale;
+                if uniforms.highlight_active != 0u {
+                    cur_hmin = jump_origin + cur_hmin * jump_scale;
+                    cur_hmax = jump_origin + cur_hmax * jump_scale;
+                }
+                cur_scale = cur_scale * jump_scale;
+                current_idx = 0u;
+                current_kind = ROOT_KIND_CARTESIAN;
+                current_cartesian_max_depth = uniforms.root_face_meta.z;
+                ribbon_level = uniforms.ribbon_count;
+                jumped_to_root = true;
+                continue;
+            }
         }
 
         // Ray exited the current frame. Try popping to ancestor.
@@ -1409,6 +1437,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         (0.5 - in.uv.y) * 2.0 * half_fov_tan,
     );
     let ray_dir = camera.forward + camera.right * ndc.x + camera.up * ndc.y;
+    let ray_metric = max(length(ray_dir), 1e-6);
 
     let result = march(camera.pos, ray_dir);
 
@@ -1457,11 +1486,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let hb = ray_box(camera.pos, h_inv_dir, box_min, box_max);
         if hb.t_enter < hb.t_exit && hb.t_exit > 0.0 {
             let t = max(hb.t_enter, 0.0);
-            if t <= result.t + h_size.x * 0.05 {
+            let t_local = t * ray_metric;
+            let result_local = result.t * ray_metric;
+            if t_local <= result_local + h_size.x * 0.05 {
                 let hit_pos = camera.pos + ray_dir * t;
                 let from_min = hit_pos - box_min;
                 let from_max = box_max - hit_pos;
-                let pixel_world = max(t, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
+                let pixel_world = max(t_local, 0.001) * 2.0 * tan(camera.fov * 0.5) / uniforms.screen_height;
                 let ew = max(pixel_world * 2.25, h_size.x * 0.02);
                 let near_x = from_min.x < ew || from_max.x < ew;
                 let near_y = from_min.y < ew || from_max.y < ew;

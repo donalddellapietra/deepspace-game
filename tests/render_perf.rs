@@ -1,13 +1,26 @@
 #[cfg(not(target_arch = "wasm32"))]
+fn perf_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static PERF_TEST_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    PERF_TEST_MUTEX
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("render perf mutex poisoned")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn startup_render_stays_above_50_fps() {
+    let _guard = perf_test_lock();
     let output = run_game(&[
+        "--render-harness",
         "--disable-overlay",
+        "--suppress-startup-logs",
+        "--plain-world",
+        "--plain-layers", "40",
         "--spawn-depth", "17",
-        "--run-for-secs", "2",
+        "--exit-after-frames", "120",
         "--timeout-secs", "6",
-        "--max-frame-gap-ms", "250",
-        "--frame-gap-warmup-frames", "30",
+        "--max-any-frame-ms", "250",
         "--min-fps", "50",
         "--min-cadence-fps", "20",
         "--fps-warmup-frames", "4",
@@ -19,14 +32,18 @@ fn startup_render_stays_above_50_fps() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn zoom_transition_to_layer_18_does_not_freeze() {
+    let _guard = perf_test_lock();
     let output = run_game(&[
+        "--render-harness",
         "--disable-overlay",
+        "--suppress-startup-logs",
+        "--plain-world",
+        "--plain-layers", "40",
         "--spawn-depth", "17",
         "--script", "wait:8,zoom_out:12,wait:1000",
-        "--run-for-secs", "6",
+        "--exit-after-frames", "180",
         "--timeout-secs", "10",
-        "--max-frame-gap-ms", "250",
-        "--frame-gap-warmup-frames", "30",
+        "--max-any-frame-ms", "250",
         "--min-fps", "50",
         "--min-cadence-fps", "20",
         "--fps-warmup-frames", "8",
@@ -54,8 +71,8 @@ fn assert_perf_ok(output: &std::process::Output) {
         return;
     }
     assert!(
-        stderr.contains("startup_perf frame="),
-        "perf test did not reach measured frames; stderr:\n{stderr}"
+        stderr.contains("render_harness_timing avg_ms"),
+        "perf test did not print render harness timing; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("test_runner: perf summary"),

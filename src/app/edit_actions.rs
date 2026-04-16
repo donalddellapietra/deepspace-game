@@ -407,10 +407,10 @@ impl App {
                 )
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                let frame_path = &self.active_frame.render_path;
+                let frame_path = Path::root();
                 let mut hit = None;
-                let cam_local = self.camera.position.in_frame(frame_path);
-                let ray_dir = self.ray_dir_in_frame(frame_path);
+                let cam_local = self.camera.position.in_frame(&frame_path);
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
                 let min_depth = frame_path.depth() as u32 + 1;
                 let mut depth = self.edit_depth();
                 while depth >= min_depth {
@@ -595,13 +595,23 @@ impl App {
                 }
                 let preserve_paths: Vec<&[u8]> =
                     preserve_path_storage.iter().map(Path::as_slice).collect();
-                gpu::pack_tree_lod_preserving(
+                let mut preserve_regions = Vec::new();
+                if matches!(intended_frame.kind, ActiveFrameKind::Cartesian)
+                    && !intended_frame.render_path.is_root()
+                {
+                    preserve_regions.push((
+                        intended_frame.render_path,
+                        effective_visual_depth.min(u8::MAX as u32) as u8,
+                    ));
+                }
+                gpu::pack_tree_lod_selective(
                     &self.world.library,
                     self.world.root,
                     &self.camera.position,
                     1440.0,
                     1.2,
                     &preserve_paths,
+                    &preserve_regions,
                 )
             };
             pack_elapsed = pack_start.elapsed();
@@ -648,7 +658,14 @@ impl App {
 
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_max_depth(effective_visual_depth);
+            let local_visual_depth = if matches!(self.active_frame.kind, ActiveFrameKind::Cartesian)
+                && !self.active_frame.render_path.is_root()
+            {
+                1
+            } else {
+                effective_visual_depth
+            };
+            renderer.set_max_depth(local_visual_depth);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Sphere(sphere) => {
@@ -664,7 +681,16 @@ impl App {
                 ActiveFrameKind::Body { inner_r, outer_r } => {
                     renderer.set_root_kind_body(inner_r, outer_r);
                 }
-                ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
+                ActiveFrameKind::Cartesian => {
+                    let (jump_origin, jump_size_world) =
+                        super::frame::frame_origin_size_world(&self.active_frame.render_path);
+                    let jump_scale = jump_size_world / WORLD_SIZE;
+                    renderer.set_root_kind_cartesian(
+                        jump_origin,
+                        jump_scale,
+                        effective_visual_depth,
+                    );
+                }
             }
         }
         if self.startup_profile_frames < 12 {

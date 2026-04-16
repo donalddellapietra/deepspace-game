@@ -47,7 +47,7 @@ pub struct GpuUniforms {
     pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
-    pub root_face_pop_pos: [f32; 4],
+    pub root_jump: [f32; 4],
 }
 
 pub struct Renderer {
@@ -74,7 +74,7 @@ pub struct Renderer {
     root_radii: [f32; 4],
     root_face_meta: [u32; 4],
     root_face_bounds: [f32; 4],
-    root_face_pop_pos: [f32; 4],
+    root_jump: [f32; 4],
     ribbon_count: u32,
     offscreen_texture: Option<wgpu::Texture>,
 }
@@ -233,7 +233,7 @@ impl Renderer {
             root_radii: [0.0; 4],
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
-            root_face_pop_pos: [0.0; 4],
+            root_jump: [0.0, 0.0, 0.0, 1.0],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -360,7 +360,7 @@ impl Renderer {
             root_radii: [0.0; 4],
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
-            root_face_pop_pos: [0.0; 4],
+            root_jump: [0.0, 0.0, 0.0, 1.0],
             ribbon_count: 0,
             offscreen_texture: None,
         }
@@ -411,12 +411,17 @@ impl Renderer {
     /// Set the frame-root NodeKind: Cartesian (default) or
     /// CubedSphereBody. For Body, also pass radii in the body
     /// cell's local `[0, 1)` frame.
-    pub fn set_root_kind_cartesian(&mut self) {
+    pub fn set_root_kind_cartesian(
+        &mut self,
+        jump_origin: [f32; 3],
+        jump_scale: f32,
+        root_max_depth: u32,
+    ) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
-        self.root_face_meta = [0; 4];
+        self.root_face_meta = [0, 0, root_max_depth, 0];
         self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
+        self.root_jump = [jump_origin[0], jump_origin[1], jump_origin[2], jump_scale];
         self.write_uniforms();
     }
 
@@ -425,7 +430,7 @@ impl Renderer {
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
+        self.root_jump = [0.0, 0.0, 0.0, 1.0];
         self.write_uniforms();
     }
 
@@ -442,7 +447,7 @@ impl Renderer {
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
         self.root_face_meta = [face_id, subtree_depth, 0, 0];
         self.root_face_bounds = bounds;
-        self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
+        self.root_jump = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
     }
 
@@ -787,7 +792,7 @@ impl Renderer {
             root_radii: self.root_radii,
             root_face_meta: self.root_face_meta,
             root_face_bounds: self.root_face_bounds,
-            root_face_pop_pos: self.root_face_pop_pos,
+            root_jump: self.root_jump,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

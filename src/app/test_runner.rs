@@ -45,6 +45,8 @@
 //! --frame-gap-warmup-frames N
 //!                         Ignore max-frame-gap checks until at least N
 //!                         frames have rendered. Default: 30.
+//! --max-any-frame-ms MS   Fail if any rendered frame exceeds this total
+//!                         frame time budget. No warm-up bypass.
 //! --require-webview       Fail if the native WKWebView overlay never
 //!                         comes up during the test scenario.
 //! --script CMDS           Comma-separated commands run in order:
@@ -105,6 +107,7 @@ pub struct TestConfig {
     pub run_for_secs: Option<f32>,
     pub max_frame_gap_ms: Option<f32>,
     pub frame_gap_warmup_frames: Option<u32>,
+    pub max_any_frame_ms: Option<f32>,
     pub require_webview: bool,
     pub script: Vec<ScriptCmd>,
 }
@@ -213,6 +216,9 @@ impl TestConfig {
                 "--frame-gap-warmup-frames" => {
                     cfg.frame_gap_warmup_frames = args.next().and_then(|v| v.parse().ok());
                 }
+                "--max-any-frame-ms" => {
+                    cfg.max_any_frame_ms = args.next().and_then(|v| v.parse().ok());
+                }
                 "--require-webview" => {
                     cfg.require_webview = true;
                 }
@@ -247,6 +253,7 @@ impl TestConfig {
             || self.run_for_secs.is_some()
             || self.max_frame_gap_ms.is_some()
             || self.frame_gap_warmup_frames.is_some()
+            || self.max_any_frame_ms.is_some()
             || self.require_webview
     }
 
@@ -257,12 +264,13 @@ impl TestConfig {
                     || self.min_cadence_fps.is_some()
                     || self.run_for_secs.is_some()
                     || self.max_frame_gap_ms.is_some()
+                    || self.max_any_frame_ms.is_some()
                     || self.require_webview
             )
     }
 
     pub fn use_render_harness(&self) -> bool {
-        (self.render_harness && !self.prefers_live_loop()) || self.screenshot.is_some()
+        self.render_harness || self.screenshot.is_some()
     }
 }
 
@@ -332,6 +340,8 @@ pub struct TestMonitor {
     pub last_frame_ms: std::sync::atomic::AtomicU64,
     pub perf_failed: std::sync::atomic::AtomicBool,
     pub webview_created: std::sync::atomic::AtomicBool,
+    pub worst_any_frame_ms: std::sync::atomic::AtomicU64,
+    pub worst_any_dt_ms: std::sync::atomic::AtomicU64,
     pub perf_samples: std::sync::Mutex<PerfSamples>,
 }
 
@@ -342,6 +352,8 @@ impl TestMonitor {
             last_frame_ms: std::sync::atomic::AtomicU64::new(0),
             perf_failed: std::sync::atomic::AtomicBool::new(false),
             webview_created: std::sync::atomic::AtomicBool::new(false),
+            worst_any_frame_ms: std::sync::atomic::AtomicU64::new(0),
+            worst_any_dt_ms: std::sync::atomic::AtomicU64::new(0),
             perf_samples: std::sync::Mutex::new(PerfSamples::default()),
         }
     }
@@ -351,6 +363,8 @@ impl TestMonitor {
         elapsed_since_start: std::time::Duration,
         frame_secs: Option<f64>,
         cadence_secs: Option<f64>,
+        all_frame_secs: f64,
+        all_cadence_secs: f64,
     ) {
         use std::sync::atomic::Ordering;
 
@@ -359,6 +373,14 @@ impl TestMonitor {
             elapsed_since_start.as_millis().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
+        update_atomic_max(
+            &self.worst_any_frame_ms,
+            (all_frame_secs * 1000.0).max(0.0) as u64,
+        );
+        update_atomic_max(
+            &self.worst_any_dt_ms,
+            (all_cadence_secs * 1000.0).max(0.0) as u64,
+        );
         if let Ok(mut perf) = self.perf_samples.lock() {
             if let Some(frame_secs) = frame_secs {
                 perf.record_frame(frame_secs);
@@ -366,6 +388,34 @@ impl TestMonitor {
             if let Some(cadence_secs) = cadence_secs {
                 perf.record_cadence(cadence_secs);
             }
+        }
+    }
+}
+
+fn print_perf_summary_from_samples(
+    perf: &PerfSamples,
+    worst_any_frame_ms: f64,
+    worst_any_dt_ms: f64,
+) {
+    eprintln!(
+        "test_runner: perf summary samples={} avg_frame_fps={:.2} avg_cadence_fps={:.2} worst_frame_ms={:.2} worst_dt_ms={:.2} worst_any_frame_ms={:.2} worst_any_dt_ms={:.2}",
+        perf.count,
+        perf.avg_frame_fps().unwrap_or(0.0),
+        perf.avg_cadence_fps().unwrap_or(0.0),
+        perf.worst_frame_secs * 1000.0,
+        perf.worst_cadence_secs * 1000.0,
+        worst_any_frame_ms,
+        worst_any_dt_ms,
+    );
+}
+
+fn update_atomic_max(target: &std::sync::atomic::AtomicU64, value: u64) {
+    use std::sync::atomic::Ordering;
+    let mut cur = target.load(Ordering::Relaxed);
+    while value > cur {
+        match target.compare_exchange_weak(cur, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => cur = next,
         }
     }
 }
@@ -390,6 +440,8 @@ pub struct TestRunner {
     pub run_for_secs: Option<f32>,
     pub max_frame_gap_ms: Option<f32>,
     pub frame_gap_warmup_frames: u32,
+    pub max_any_frame_ms: Option<f32>,
+    pub hard_frame_fail: bool,
     pub require_webview: bool,
     pub perf_samples: PerfSamples,
     pub monitor: std::sync::Arc<TestMonitor>,
@@ -411,6 +463,7 @@ impl TestRunner {
         let run_for_secs = cfg.run_for_secs;
         let max_frame_gap_ms = cfg.max_frame_gap_ms;
         let frame_gap_warmup_frames = cfg.frame_gap_warmup_frames.unwrap_or(30);
+        let max_any_frame_ms = cfg.max_any_frame_ms;
         let require_webview = cfg.require_webview;
         let started_at = std::time::Instant::now();
         let monitor = std::sync::Arc::new(TestMonitor::new());
@@ -439,6 +492,19 @@ impl TestRunner {
                                 print_monitor_summary(&monitor);
                                 std::process::exit(1);
                             }
+                        }
+                    }
+
+                    if let Some(max_any_frame_ms) = max_any_frame_ms {
+                        let worst_any_frame_ms = monitor.worst_any_frame_ms.load(Ordering::Relaxed);
+                        if worst_any_frame_ms as f32 > max_any_frame_ms {
+                            eprintln!(
+                                "test_runner: hard frame stall detected: worst_any_frame_ms={} threshold_ms={:.2}",
+                                worst_any_frame_ms,
+                                max_any_frame_ms,
+                            );
+                            print_monitor_summary(&monitor);
+                            std::process::exit(1);
                         }
                     }
 
@@ -503,6 +569,8 @@ impl TestRunner {
             run_for_secs,
             max_frame_gap_ms,
             frame_gap_warmup_frames,
+            max_any_frame_ms,
+            hard_frame_fail: false,
             require_webview,
             perf_samples: PerfSamples::default(),
             monitor,
@@ -574,6 +642,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     let mut total_render_encode = 0.0f64;
     let mut total_render_submit = 0.0f64;
     let mut total_render_wait = 0.0f64;
+    let mut worst_total_ms = 0.0f64;
     let mut frame_count = 0u32;
 
     loop {
@@ -591,8 +660,19 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         let t_highlight_raycast = app.last_highlight_raycast_ms;
         let t_highlight_set = app.last_highlight_set_ms;
 
+        let render_start = std::time::Instant::now();
         let render_timing = if let Some(renderer) = &mut app.renderer {
-            renderer.render_offscreen()
+            if app.show_harness_window {
+                match renderer.render() {
+                    Ok(()) => crate::renderer::OffscreenRenderTiming {
+                        total_ms: render_start.elapsed().as_secs_f64() * 1000.0,
+                        ..crate::renderer::OffscreenRenderTiming::default()
+                    },
+                    Err(e) => return Err(format!("render_harness: render failed: {e:?}").into()),
+                }
+            } else {
+                renderer.render_offscreen()
+            }
         } else {
             crate::renderer::OffscreenRenderTiming::default()
         };
@@ -609,18 +689,33 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         total_render_encode += render_timing.encode_ms;
         total_render_submit += render_timing.submit_ms;
         total_render_wait += render_timing.wait_ms;
+        let frame_total_ms = t_update + t_upload + t_highlight + t_render;
+        worst_total_ms = worst_total_ms.max(frame_total_ms);
         frame_count += 1;
+        app.startup_profile_frames = app.startup_profile_frames.saturating_add(1);
 
-        let (due, frame, frame_budget_done, timed_out, exit_after, screenshot) = {
+        let (due, frame, frame_budget_done, timed_out, exit_after, screenshot, hard_frame_fail) = {
             let Some(test) = app.test.as_mut() else { break };
             test.frame += 1;
             let frame = test.frame;
+            let frame_secs = frame_total_ms / 1000.0;
+            if let Some(max_any_frame_ms) = test.max_any_frame_ms {
+                if frame_total_ms > max_any_frame_ms as f64 {
+                    test.hard_frame_fail = true;
+                }
+            }
+            if frame >= test.fps_warmup_frames {
+                test.perf_samples.record_frame(frame_secs);
+            }
+            if frame >= test.cadence_warmup_frames {
+                test.perf_samples.record_cadence(frame_secs);
+            }
             let due = test.drain_due();
             let frame_budget_done = frame + 1 >= test.exit_after_frames;
             let timed_out = test.timed_out();
             let exit_after = test.exit_after_frames;
             let screenshot = test.screenshot_path.clone();
-            (due, frame, frame_budget_done, timed_out, exit_after, screenshot)
+            (due, frame, frame_budget_done, timed_out, exit_after, screenshot, test.hard_frame_fail)
         };
 
         for cmd in due {
@@ -664,6 +759,9 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             eprintln!("render_harness: exit_after_frames={frame} reached, quitting");
             break;
         }
+        if hard_frame_fail {
+            break;
+        }
     }
 
     if frame_count > 0 {
@@ -684,18 +782,38 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         );
     }
 
+    if let Some(test) = app.test.as_ref() {
+        let worst_any_frame_ms = worst_total_ms;
+        let worst_any_dt_ms = worst_any_frame_ms;
+        print_perf_summary_from_samples(&test.perf_samples, worst_any_frame_ms, worst_any_dt_ms);
+        if test.hard_frame_fail {
+            return Err("render_harness: hard frame stall detected".into());
+        }
+        if test.min_fps.is_some_and(|min_fps| {
+            test.perf_samples
+                .avg_frame_fps()
+                .is_some_and(|fps| fps < min_fps)
+        }) {
+            return Err("render_harness: avg_frame_fps below threshold".into());
+        }
+        if test.min_cadence_fps.is_some_and(|min_fps| {
+            test.perf_samples
+                .avg_cadence_fps()
+                .is_some_and(|fps| fps < min_fps)
+        }) {
+            return Err("render_harness: avg_cadence_fps below threshold".into());
+        }
+    }
+
     Ok(())
 }
 
 fn print_monitor_summary(monitor: &std::sync::Arc<TestMonitor>) {
     if let Ok(perf) = monitor.perf_samples.lock() {
-        eprintln!(
-            "test_runner: perf summary samples={} avg_frame_fps={:.2} avg_cadence_fps={:.2} worst_frame_ms={:.2} worst_dt_ms={:.2}",
-            perf.count,
-            perf.avg_frame_fps().unwrap_or(0.0),
-            perf.avg_cadence_fps().unwrap_or(0.0),
-            perf.worst_frame_secs * 1000.0,
-            perf.worst_cadence_secs * 1000.0,
+        print_perf_summary_from_samples(
+            &perf,
+            monitor.worst_any_frame_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
+            monitor.worst_any_dt_ms.load(std::sync::atomic::Ordering::Relaxed) as f64,
         );
     }
 }

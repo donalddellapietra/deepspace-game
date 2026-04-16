@@ -12,6 +12,10 @@ time and avoid mixing renderer cost, harness artifacts, and CPU debug overhead.
 4. Use screenshots to confirm that a perf fix did not reintroduce visual
    regressions.
 5. Separate GPU cost from CPU cost before reasoning about "render slowness".
+6. Never rely only on warm-up-gated FPS metrics. Always enforce a hard
+   startup-inclusive stall gate with:
+   - `--max-any-frame-ms`
+   - `--max-frame-gap-ms --frame-gap-warmup-frames 2`
 
 ## Baseline Harness
 
@@ -30,6 +34,12 @@ cargo run --bin deepspace-game -- \
   --harness-height 720 \
   --exit-after-frames 2 \
   --timeout-secs 6
+```
+
+For live-loop perf checks (window/surface path), always include:
+
+```bash
+--max-any-frame-ms 250 --max-frame-gap-ms 400 --frame-gap-warmup-frames 2
 ```
 
 ## Isolation Order
@@ -131,3 +141,4 @@ Do not do these:
 - changing render budget and packer strategy in the same experiment
 - mixing overlay/native-window issues into harness-based renderer debugging
 - leaving verbose deep-path debug logging on while trying to compare CPU timings
+- trusting `min-fps`/`min-cadence-fps` alone while warm-up hides startup stalls

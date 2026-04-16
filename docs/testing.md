@@ -1,5 +1,28 @@
 # Testing
 
+## Native render perf harness
+
+For native frame-loop perf checks, do not rely only on warm-up-gated FPS.
+Always include hard stall gates that apply from startup:
+
+```bash
+cargo run --bin deepspace-game -- \
+  --disable-overlay \
+  --spawn-depth 17 \
+  --run-for-secs 2 \
+  --timeout-secs 6 \
+  --max-any-frame-ms 250 \
+  --max-frame-gap-ms 400 \
+  --frame-gap-warmup-frames 2 \
+  --min-fps 50 \
+  --min-cadence-fps 20
+```
+
+Key rule:
+- `--max-any-frame-ms` and a small frame-gap warm-up (`2`) are required for
+  regression tests, so startup acquire/present stalls cannot be hidden by
+  FPS warm-up windows.
+
 ## Playwright (UI overlay tests)
 
 Tests live in `ui/tests/`. They run against a live `trunk serve` instance.
