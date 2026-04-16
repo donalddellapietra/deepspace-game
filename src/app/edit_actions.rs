@@ -84,11 +84,8 @@ impl App {
         }
     }
 
-    fn ray_dir_in_frame(&self, frame_path: &Path) -> [f32; 3] {
-        let world_dir = crate::world::sdf::normalize(self.camera.forward());
-        let (_, frame_size_world) = super::frame::frame_origin_size_world(frame_path);
-        let scale = WORLD_SIZE / frame_size_world.max(1e-30);
-        crate::world::sdf::scale(world_dir, scale)
+    fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
+        crate::world::sdf::normalize(self.camera.forward())
     }
 
     fn debug_path_kinds(&self, path: &Path) -> Vec<String> {
@@ -373,15 +370,22 @@ impl App {
             .min(RENDER_FRAME_MAX_DEPTH);
         let mut anchor_logical = self.camera.position.anchor;
         anchor_logical.truncate(desired_depth);
-        let mut focus_logical = None;
+        let mut cartesian_focus_logical = None;
         if let Some(hit) = self.frame_aware_raycast() {
-            let mut path = Path::root();
+            let mut hit_path = Path::root();
             for &(_, slot) in &hit.path {
-                path.push(slot as u8);
+                hit_path.push(slot as u8);
             }
-            path.truncate(desired_depth.min(path.depth()));
-            if !path.is_root() {
-                focus_logical = Some(path);
+            let shared_depth = self
+                .camera
+                .position
+                .anchor
+                .common_prefix_len(&hit_path)
+                .min(desired_depth);
+            if shared_depth > 0 && shared_depth < desired_depth {
+                let mut shared = self.camera.position.anchor;
+                shared.truncate(shared_depth);
+                cartesian_focus_logical = Some(shared);
             }
         }
 
@@ -398,7 +402,7 @@ impl App {
                 )
             })
             .or_else(|| {
-                focus_logical.map(|path| {
+                cartesian_focus_logical.map(|path| {
                     super::App::frame_for_logical_path(
                         &self.world.library,
                         self.world.root,
@@ -545,14 +549,19 @@ impl App {
                 ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. }
             ) && current_hit.path.len() < self.edit_depth() as usize
             {
-                let cam_world = self.camera.position.to_world_xyz();
-                let ray_world = crate::world::sdf::normalize(self.camera.forward());
-                let target_world =
-                    edit::hit_point_world(&self.world.library, current_hit, cam_world, ray_world);
-                hit = Some(edit::refine_cartesian_hit_to_depth(
+                let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
+                let ray_local = self.ray_dir_in_frame(&self.active_frame.render_path);
+                let target_local = edit::hit_point_in_frame_local(
+                    current_hit,
+                    &self.active_frame.render_path,
+                    cam_local,
+                    ray_local,
+                );
+                hit = Some(edit::refine_cartesian_hit_to_depth_in_frame(
                     &self.world.library,
                     current_hit,
-                    target_world,
+                    &self.active_frame.render_path,
+                    target_local,
                     self.edit_depth() as usize,
                 ));
             }

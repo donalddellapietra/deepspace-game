@@ -670,16 +670,10 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
         return propagate_edit(world, &place_hit, new_child);
     }
 
-    // Cross-node: compute world-space target center and look up from root.
-    let (aabb_min, aabb_max) = hit_aabb(&world.library, hit);
-    let cell_size = aabb_max[0] - aabb_min[0];
-    let target = [
-        (aabb_min[0] + aabb_max[0]) * 0.5 + dx as f32 * cell_size,
-        (aabb_min[1] + aabb_max[1]) * 0.5 + dy as f32 * cell_size,
-        (aabb_min[2] + aabb_max[2]) * 0.5 + dz as f32 * cell_size,
-    ];
-
-    place_child_at_point(world, target, hit.path.len(), new_child)
+    let Some(target_path) = adjacent_cartesian_path(hit, dx, dy, dz) else {
+        return false;
+    };
+    place_child_at_path(world, &target_path, new_child)
 }
 
 /// Place a block adjacent to the hit face. Builds a uniform subtree
@@ -728,44 +722,54 @@ fn depth_of_node(library: &super::tree::NodeLibrary, id: super::tree::NodeId) ->
     }
 }
 
-/// Place a block at the given world-space point, descending `depth`
-/// levels from root. If the path crosses empty subtrees, intermediate
-/// nodes are materialized automatically.
-fn place_child_at_point(
-    world: &mut WorldState,
-    target: [f32; 3],
-    depth: usize,
-    new_child: Child,
-) -> bool {
-    // Bounds check: must be inside root [0, 3).
-    if target[0] < 0.0
-        || target[0] >= 3.0
-        || target[1] < 0.0
-        || target[1] >= 3.0
-        || target[2] < 0.0
-        || target[2] >= 3.0
-    {
-        return false;
+fn adjacent_cartesian_path(hit: &HitInfo, dx: i32, dy: i32, dz: i32) -> Option<Path> {
+    let mut path = hit_path_slots(hit);
+    let (axis, direction) = if dx != 0 {
+        (0, dx)
+    } else if dy != 0 {
+        (1, dy)
+    } else {
+        (2, dz)
+    };
+    if step_path_bounded(&mut path, axis, direction) {
+        Some(path)
+    } else {
+        None
     }
+}
 
+fn step_path_bounded(path: &mut Path, axis: usize, direction: i32) -> bool {
+    debug_assert!(direction == 1 || direction == -1);
+    let wrap = if direction < 0 { 2 } else { 0 };
+    for idx in (0..path.depth() as usize).rev() {
+        let (x, y, z) = slot_coords(path.slot(idx) as usize);
+        let mut coords = [x, y, z];
+        let next = coords[axis] as i32 + direction;
+        if (0..3).contains(&next) {
+            coords[axis] = next as usize;
+            path.set_slot(idx, slot_index(coords[0], coords[1], coords[2]) as u8);
+            for deeper in idx + 1..path.depth() as usize {
+                let (dx, dy, dz) = slot_coords(path.slot(deeper) as usize);
+                let mut deeper_coords = [dx, dy, dz];
+                deeper_coords[axis] = wrap;
+                path.set_slot(
+                    deeper,
+                    slot_index(deeper_coords[0], deeper_coords[1], deeper_coords[2]) as u8,
+                );
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn place_child_at_path(world: &mut WorldState, target_path: &Path, new_child: Child) -> bool {
+    let depth = target_path.depth() as usize;
     let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(depth);
     let mut current_id = world.root;
-    let mut origin = [0.0f32; 3];
-    let mut cell_size = 1.0f32;
 
     for level in 0..depth {
-        let cell = [
-            ((target[0] - origin[0]) / cell_size)
-                .floor()
-                .clamp(0.0, 2.0) as i32,
-            ((target[1] - origin[1]) / cell_size)
-                .floor()
-                .clamp(0.0, 2.0) as i32,
-            ((target[2] - origin[2]) / cell_size)
-                .floor()
-                .clamp(0.0, 2.0) as i32,
-        ];
-        let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
+        let slot = target_path.slot(level) as usize;
         path.push((current_id, slot));
 
         let node = match world.library.get(current_id) {
@@ -777,16 +781,9 @@ fn place_child_at_point(
 
         match node.children[slot] {
             Child::Node(child_id) if !is_last => {
-                origin = [
-                    origin[0] + cell[0] as f32 * cell_size,
-                    origin[1] + cell[1] as f32 * cell_size,
-                    origin[2] + cell[2] as f32 * cell_size,
-                ];
-                cell_size /= 3.0;
                 current_id = child_id;
             }
             child if is_last && is_placeable(&world.library, child) => {
-                // Target cell is empty (or all-empty subtree) — place directly.
                 let place_hit = HitInfo {
                     path,
                     face: 0,
@@ -796,22 +793,8 @@ fn place_child_at_point(
                 return propagate_edit(world, &place_hit, new_child);
             }
             child if !is_last && is_placeable(&world.library, child) => {
-                // Empty subtree but we need to go deeper. Build a chain
-                // of empty nodes with the child at the target position.
-                let child_origin = [
-                    origin[0] + cell[0] as f32 * cell_size,
-                    origin[1] + cell[1] as f32 * cell_size,
-                    origin[2] + cell[2] as f32 * cell_size,
-                ];
-                let remaining = depth - level - 1;
-                let chain_id = build_placement_chain(
-                    world,
-                    target,
-                    child_origin,
-                    cell_size / 3.0,
-                    remaining,
-                    new_child,
-                );
+                let chain_id =
+                    build_placement_chain_from_slots(world, &target_path.as_slice()[level + 1..], new_child);
                 let place_hit = HitInfo {
                     path,
                     face: 0,
@@ -830,45 +813,15 @@ fn place_child_at_point(
     false
 }
 
-/// Build a chain of `remaining` empty-children nodes with one block
-/// placed at the position determined by `target` coordinates.
-/// Returns the NodeId of the top of the chain.
-fn build_placement_chain(
+fn build_placement_chain_from_slots(
     world: &mut WorldState,
-    target: [f32; 3],
-    mut origin: [f32; 3],
-    mut cell_size: f32,
-    remaining: usize,
+    slots: &[u8],
     leaf_child: Child,
 ) -> NodeId {
-    let mut slots = Vec::with_capacity(remaining);
-    for _ in 0..remaining {
-        let cell = [
-            ((target[0] - origin[0]) / cell_size)
-                .floor()
-                .clamp(0.0, 2.0) as i32,
-            ((target[1] - origin[1]) / cell_size)
-                .floor()
-                .clamp(0.0, 2.0) as i32,
-            ((target[2] - origin[2]) / cell_size)
-                .floor()
-                .clamp(0.0, 2.0) as i32,
-        ];
-        let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
-        slots.push(slot);
-        origin = [
-            origin[0] + cell[0] as f32 * cell_size,
-            origin[1] + cell[1] as f32 * cell_size,
-            origin[2] + cell[2] as f32 * cell_size,
-        ];
-        cell_size /= 3.0;
-    }
-
-    // Build bottom-up: leaf child at the deepest level, wrapped in empty nodes.
     let mut child = leaf_child;
     for &slot in slots.iter().rev() {
         let mut children = empty_children();
-        children[slot] = child;
+        children[slot as usize] = child;
         let id = world.library.insert(children);
         child = Child::Node(id);
     }
@@ -1154,6 +1107,7 @@ fn cs_raycast_in_body(
     ancestor_path: &[(NodeId, usize)],
     max_face_depth: u32,
 ) -> Option<HitInfo> {
+    let ray_dir = sdf::normalize(ray_dir);
     let debug_probe = max_face_depth <= 2 && ancestor_path.len() <= 1;
     let cs_center = [
         body_origin[0] + body_size * 0.5,
@@ -1565,6 +1519,7 @@ fn hit_path_slots(hit: &HitInfo) -> Path {
     path
 }
 
+#[cfg(test)]
 pub fn hit_point_world(
     library: &NodeLibrary,
     hit: &HitInfo,
@@ -1598,6 +1553,28 @@ pub fn hit_point_world(
     ]
 }
 
+pub fn hit_point_in_frame_local(
+    hit: &HitInfo,
+    frame_path: &Path,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+) -> [f32; 3] {
+    let (aabb_min, aabb_max) = hit_aabb_in_frame_local(hit, frame_path);
+    let inv_dir = [
+        if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
+        if ray_dir[1].abs() > 1e-8 { 1.0 / ray_dir[1] } else { 1e10 },
+        if ray_dir[2].abs() > 1e-8 { 1.0 / ray_dir[2] } else { 1e10 },
+    ];
+    let (t_enter, _) = ray_aabb(ray_origin, inv_dir, aabb_min, aabb_max);
+    let t = t_enter.max(0.0);
+    [
+        ray_origin[0] + ray_dir[0] * t,
+        ray_origin[1] + ray_dir[1] * t,
+        ray_origin[2] + ray_dir[2] * t,
+    ]
+}
+
+#[cfg(test)]
 pub fn refine_cartesian_hit_to_depth(
     library: &NodeLibrary,
     hit: &HitInfo,
@@ -1633,6 +1610,62 @@ pub fn refine_cartesian_hit_to_depth(
                 .floor()
                 .clamp(0.0, 2.0) as usize,
             ((target_world[2] - cell_min[2]) / child_size)
+                .floor()
+                .clamp(0.0, 2.0) as usize,
+        ];
+        let next_slot = slot_index(cell[0], cell[1], cell[2]);
+        refined.path.push((current_node_id, next_slot));
+        cell_min = [
+            cell_min[0] + cell[0] as f32 * child_size,
+            cell_min[1] + cell[1] as f32 * child_size,
+            cell_min[2] + cell[2] as f32 * child_size,
+        ];
+        cell_size = child_size;
+        match node.children[next_slot] {
+            Child::Node(next_id) => current_node_id = next_id,
+            Child::Block(_) | Child::Empty => break,
+        }
+    }
+
+    refined
+}
+
+pub fn refine_cartesian_hit_to_depth_in_frame(
+    library: &NodeLibrary,
+    hit: &HitInfo,
+    frame_path: &Path,
+    target_local: [f32; 3],
+    target_depth: usize,
+) -> HitInfo {
+    if hit.path.len() >= target_depth {
+        return hit.clone();
+    }
+    let mut refined = hit.clone();
+    let Some(&(parent_id, slot)) = refined.path.last() else {
+        return refined;
+    };
+    let Some(parent) = library.get(parent_id) else {
+        return refined;
+    };
+    let Child::Node(mut current_node_id) = parent.children[slot] else {
+        return refined;
+    };
+    let (mut cell_min, cell_max) = hit_aabb_in_frame_local(hit, frame_path);
+    let mut cell_size = cell_max[0] - cell_min[0];
+
+    while refined.path.len() < target_depth {
+        let Some(node) = library.get(current_node_id) else {
+            break;
+        };
+        let child_size = cell_size / 3.0;
+        let cell = [
+            ((target_local[0] - cell_min[0]) / child_size)
+                .floor()
+                .clamp(0.0, 2.0) as usize,
+            ((target_local[1] - cell_min[1]) / child_size)
+                .floor()
+                .clamp(0.0, 2.0) as usize,
+            ((target_local[2] - cell_min[2]) / child_size)
                 .floor()
                 .clamp(0.0, 2.0) as usize,
         ];
@@ -1820,6 +1853,7 @@ pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [
     hit_aabb_in_frame_local(hit, &Path::root())
 }
 
+#[cfg(test)]
 pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
     use super::cubesphere::{FACE_SLOTS, Face, block_corners};
 
@@ -2300,9 +2334,9 @@ mod tests {
         let anchor_depth = 34u8;
         let position = crate::app::harness::spawn_position(
             WorldPreset::PlainTest,
-            bootstrap.default_spawn_xyz,
+            bootstrap.default_spawn_pos.in_frame(&Path::root()),
             anchor_depth,
-            bootstrap.default_spawn_depth,
+            bootstrap.default_spawn_pos.anchor.depth(),
         );
         let mut logical_path = position.anchor;
         logical_path.truncate(anchor_depth - crate::app::RENDER_FRAME_K);
@@ -2311,7 +2345,7 @@ mod tests {
             &world,
             position,
             WorldPreset::PlainTest,
-            bootstrap.default_spawn_depth,
+            bootstrap.default_spawn_pos.anchor.depth(),
             bootstrap.default_spawn_yaw,
             bootstrap.default_spawn_pitch,
             None,
@@ -2323,16 +2357,6 @@ mod tests {
             yaw,
             pitch,
         };
-        let cam_world = position.to_world_xyz();
-        let ray_world = sdf::normalize(camera.forward());
-
-        let world_hit = crate::app::harness::center_world_raycast_hit(
-            &world,
-            position,
-            yaw,
-            pitch,
-            bootstrap.default_spawn_depth as u32,
-        );
         let frame_hit = crate::app::harness::center_frame_raycast_hit(
             &world,
             &frame,
@@ -2358,12 +2382,7 @@ mod tests {
             diagnostic.push((sample_frame.render_path.depth(), hit));
             if matches!(sample_frame.render_path.depth(), 8 | 12 | 31) {
                 let cam_local = position.in_frame(&sample_frame.render_path);
-                let (_, frame_size_world) =
-                    crate::app::frame_origin_size_world(&sample_frame.render_path);
-                let ray_dir = sdf::scale(
-                    direct_ray_world,
-                    crate::world::anchor::WORLD_SIZE / frame_size_world.max(1e-30),
-                );
+                let ray_dir = direct_ray_world;
                 let mut first_hit = None;
                 for total_depth in (1..=anchor_depth as u32 - 1).rev() {
                     if cpu_raycast_in_frame(
@@ -2384,13 +2403,7 @@ mod tests {
             }
         }
         let mut popped_origin = position.in_frame(&frame.render_path);
-        let mut popped_ray_dir = {
-            let (_, frame_size_world) = crate::app::frame_origin_size_world(&frame.render_path);
-            sdf::scale(
-                direct_ray_world,
-                crate::world::anchor::WORLD_SIZE / frame_size_world.max(1e-30),
-            )
-        };
+        let mut popped_ray_dir = direct_ray_world;
         let mut origin_diagnostic = Vec::new();
         let mut sample_path = frame.render_path;
         while sample_path.depth() > 0 {
@@ -2408,11 +2421,7 @@ mod tests {
             ];
             if matches!(sample_path.depth(), 8 | 12) {
                 let exact = position.in_frame(&sample_path);
-                let (_, frame_size_world) = crate::app::frame_origin_size_world(&sample_path);
-                let exact_ray_dir = sdf::scale(
-                    direct_ray_world,
-                    crate::world::anchor::WORLD_SIZE / frame_size_world.max(1e-30),
-                );
+                let exact_ray_dir = direct_ray_world;
                 origin_diagnostic.push((
                     sample_path.depth(),
                     popped_origin,
@@ -2424,12 +2433,8 @@ mod tests {
         }
 
         assert!(
-            world_hit,
-            "harness-derived world raycast should hit ground from the default deep plain spawn; cam_world={cam_world:?} ray_world={ray_world:?}"
-        );
-        assert!(
             frame_hit,
-            "frame-local raycast should match the harness-derived world hit; frame_path={:?} cam_world={cam_world:?} ray_world={ray_world:?} sampled_frame_hits={diagnostic:?} hit_depth_diagnostic={hit_depth_diagnostic:?} origin_diagnostic={origin_diagnostic:?}",
+            "frame-local raycast should hit ground from the default deep plain spawn; frame_path={:?} sampled_frame_hits={diagnostic:?} hit_depth_diagnostic={hit_depth_diagnostic:?} origin_diagnostic={origin_diagnostic:?}",
             frame.render_path.as_slice(),
         );
     }

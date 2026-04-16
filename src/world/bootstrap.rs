@@ -4,7 +4,7 @@
 //! This module owns composition: which world we start with, whether it
 //! contains a planet, and where the default spawn should be.
 
-use super::anchor::{Path, WORLD_SIZE};
+use super::anchor::{Path, WorldPos, WORLD_SIZE};
 use super::palette::block;
 use super::state::WorldState;
 use super::tree::*;
@@ -18,17 +18,16 @@ pub enum WorldPreset {
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
-const PLAIN_SURFACE_Y: f32 = 1.5;
+pub(crate) const PLAIN_SURFACE_Y: f32 = 1.5;
 const PLAIN_GRASS_THICKNESS: f32 = 0.05;
 const PLAIN_DIRT_THICKNESS: f32 = 0.25;
 
 pub struct WorldBootstrap {
     pub world: WorldState,
     pub planet_path: Option<Path>,
-    pub default_spawn_xyz: [f32; 3],
+    pub default_spawn_pos: WorldPos,
     pub default_spawn_yaw: f32,
     pub default_spawn_pitch: f32,
-    pub default_spawn_depth: u8,
     pub plain_layers: u8,
 }
 
@@ -293,27 +292,30 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
     );
 
     let body_top_y = 1.5 + setup.outer_r;
-    let default_spawn_xyz = [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5];
+    let default_spawn_pos =
+        WorldPos::from_root_local([1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5], 16);
     WorldBootstrap {
         world,
         planet_path: Some(planet_path),
-        default_spawn_xyz,
+        default_spawn_pos,
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -1.2,
-        default_spawn_depth: 16,
         plain_layers: 0,
     }
 }
 
 fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
     let world = plain_world(plain_layers);
+    let default_spawn_pos = WorldPos::from_root_local(
+        [1.5, (PLAIN_SURFACE_Y + 0.08).min(WORLD_SIZE - 0.001), 1.5],
+        8,
+    );
     WorldBootstrap {
         world,
         planet_path: None,
-        default_spawn_xyz: [1.5, (PLAIN_SURFACE_Y + 0.08).min(WORLD_SIZE - 0.001), 1.5],
+        default_spawn_pos,
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -0.45,
-        default_spawn_depth: 8,
         plain_layers,
     }
 }

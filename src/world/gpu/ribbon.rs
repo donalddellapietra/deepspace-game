@@ -289,7 +289,7 @@ mod tests {
     }
 
     fn camera_at(xyz: [f32; 3]) -> WorldPos {
-        WorldPos::from_world_xyz(xyz, 10)
+        WorldPos::from_root_local(xyz, 10)
     }
 
     #[test]

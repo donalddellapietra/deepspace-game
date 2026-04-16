@@ -6,15 +6,16 @@
 //! synthesizes a canonical center-ray view from the local scene.
 
 use crate::camera::Camera;
-use crate::world::anchor::{Path, WORLD_SIZE, WorldPos};
+use crate::world::anchor::{Path, WorldPos};
 use crate::world::bootstrap::WorldPreset;
+#[cfg(test)]
+use crate::world::bootstrap::PLAIN_SURFACE_Y;
 use crate::world::edit;
 use crate::world::sdf;
 use crate::world::state::WorldState;
 use crate::world::tree::{slot_coords, slot_index};
-use crate::world::tree::MAX_DEPTH;
 
-use super::{frame_origin_size_world, ActiveFrame, ActiveFrameKind};
+use super::{ActiveFrame, ActiveFrameKind, RENDER_FRAME_K};
 
 const TEST_UP: [f32; 3] = [0.0, 1.0, 0.0];
 const BOUNDARY_EPS: f32 = 1e-6;
@@ -33,7 +34,7 @@ pub(crate) fn spawn_position(
         return plain_surface_spawn(spawn_xyz, target_depth, reference_depth);
     }
     let base_depth = target_depth.min(reference_depth);
-    let base = WorldPos::from_world_xyz(spawn_xyz, base_depth);
+    let base = WorldPos::from_root_local(spawn_xyz, base_depth);
     let position = if target_depth <= base_depth {
         base
     } else {
@@ -44,11 +45,14 @@ pub(crate) fn spawn_position(
 
 fn plain_surface_spawn(spawn_xyz: [f32; 3], target_depth: u8, reference_depth: u8) -> WorldPos {
     let base_depth = target_depth.min(reference_depth).max(1);
-    let base = WorldPos::from_world_xyz(spawn_xyz, base_depth).deepened_to(target_depth);
+    let base = WorldPos::from_root_local(spawn_xyz, base_depth).deepened_to(target_depth);
     let mut anchor = Path::root();
     for depth in 0..target_depth as usize {
         let (sx, _, sz) = slot_coords(base.anchor.slot(depth) as usize);
-        let sy = if depth == 0 { 1 } else { 0 };
+        // The flat plain surface sits at y = 1.5, whose ternary
+        // expansion is 1.11111... . Keeping every deep y-slot at 1
+        // makes the camera converge to the surface from above.
+        let sy = 1;
         anchor.push(slot_index(sx, sy, sz) as u8);
     }
     WorldPos::new(anchor, PLAIN_SURFACE_OFFSET)
@@ -66,31 +70,27 @@ pub(crate) fn stabilize_spawn(mut position: WorldPos) -> WorldPos {
 pub(crate) fn derive_view_angles(
     world: &WorldState,
     position: WorldPos,
-    world_preset: WorldPreset,
+    _world_preset: WorldPreset,
     reference_depth: u8,
     fallback_yaw: f32,
     fallback_pitch: f32,
     explicit_yaw: Option<f32>,
     explicit_pitch: Option<f32>,
 ) -> (f32, f32) {
-    let (base_yaw, base_pitch) = canonical_view_angles(
-        world,
-        position,
-        world_preset,
-        reference_depth,
-        fallback_yaw,
-        fallback_pitch,
-    );
+    let mut logical_path = position.anchor;
+    logical_path.truncate(reference_depth.saturating_sub(RENDER_FRAME_K));
+    let frame = crate::app::App::frame_for_logical_path(&world.library, world.root, &logical_path);
+    let base_yaw = fallback_yaw;
+    let base_pitch = fallback_pitch;
     let seed_yaw = explicit_yaw.unwrap_or(base_yaw);
     let seed_pitch = explicit_pitch.unwrap_or(base_pitch);
 
     let mut best = (seed_yaw, seed_pitch);
-    let world_probe_depth = reference_depth.clamp(1, MAX_DEPTH as u8) as u32;
     for &pitch_offset in &PITCH_OFFSETS {
         for &yaw_offset in &YAW_OFFSETS {
             let yaw = seed_yaw + yaw_offset;
             let pitch = (seed_pitch + pitch_offset).clamp(-1.55, 1.55);
-            if center_world_raycast_hit(world, position, yaw, pitch, world_probe_depth) {
+            if center_frame_raycast_hit(world, &frame, position, yaw, pitch) {
                 return (yaw, pitch);
             }
             if yaw_offset == 0.0 && pitch_offset == 0.0 {
@@ -101,86 +101,9 @@ pub(crate) fn derive_view_angles(
     best
 }
 
-fn canonical_view_angles(
-    world: &WorldState,
-    position: WorldPos,
-    world_preset: WorldPreset,
-    reference_depth: u8,
-    fallback_yaw: f32,
-    fallback_pitch: f32,
-) -> (f32, f32) {
-    let cam_world = position.to_world_xyz();
-    let up = TEST_UP;
-    let down = match world_preset {
-        WorldPreset::PlainTest => [0.0, -1.0, 0.0],
-        WorldPreset::DemoSphere => [0.0, -1.0, 0.0],
-    };
-    let probe_depth = reference_depth.clamp(1, MAX_DEPTH as u8) as u32;
-    let Some(surface_hit) = edit::cpu_raycast(
-        &world.library,
-        world.root,
-        cam_world,
-        down,
-        probe_depth,
-    ) else {
-        return (fallback_yaw, fallback_pitch);
-    };
-    let (aabb_min, aabb_max) = edit::hit_aabb(&world.library, &surface_hit);
-    let center = [
-        (aabb_min[0] + aabb_max[0]) * 0.5,
-        (aabb_min[1] + aabb_max[1]) * 0.5,
-        (aabb_min[2] + aabb_max[2]) * 0.5,
-    ];
-    let cell_size = (aabb_max[0] - aabb_min[0]).max(1e-5);
-    let (_, tangent_forward) = sdf::tangent_basis(up);
-    let height_above_surface = sdf::dot(sdf::sub(cam_world, center), up).abs();
-    let tangent_offset = (height_above_surface * 1.25).max(cell_size * 3.0);
-    let target = sdf::add(center, sdf::scale(tangent_forward, tangent_offset));
-    let forward = sdf::normalize(sdf::sub(target, cam_world));
-    if sdf::length(forward) < 1e-5 {
-        return (fallback_yaw, fallback_pitch);
-    }
-    yaw_pitch_for_forward(up, forward)
-}
-
-fn yaw_pitch_for_forward(up: [f32; 3], forward: [f32; 3]) -> (f32, f32) {
-    let forward = sdf::normalize(forward);
-    let pitch = sdf::dot(forward, up).asin().clamp(-1.55, 1.55);
-    let horiz = sdf::normalize(sdf::sub(forward, sdf::scale(up, sdf::dot(forward, up))));
-    let (tangent_right, tangent_forward) = sdf::tangent_basis(up);
-    let sin_yaw = -sdf::dot(horiz, tangent_right);
-    let cos_yaw = sdf::dot(horiz, tangent_forward);
-    let yaw = sin_yaw.atan2(cos_yaw);
-    (yaw, pitch)
-}
-
 fn ray_dir_in_frame(forward_world: [f32; 3], frame_path: &Path) -> [f32; 3] {
-    let (_, frame_size_world) = frame_origin_size_world(frame_path);
-    let scale = WORLD_SIZE / frame_size_world.max(1e-30);
-    sdf::scale(sdf::normalize(forward_world), scale)
-}
-
-pub(crate) fn center_world_raycast_hit(
-    world: &WorldState,
-    position: WorldPos,
-    yaw: f32,
-    pitch: f32,
-    probe_depth: u32,
-) -> bool {
-    let camera = Camera {
-        position,
-        smoothed_up: TEST_UP,
-        yaw,
-        pitch,
-    };
-    edit::cpu_raycast(
-        &world.library,
-        world.root,
-        position.to_world_xyz(),
-        sdf::normalize(camera.forward()),
-        probe_depth,
-    )
-    .is_some()
+    let _ = frame_path;
+    sdf::normalize(forward_world)
 }
 
 pub(crate) fn center_frame_raycast_hit(
@@ -226,7 +149,7 @@ pub(crate) fn center_frame_raycast_hit(
             let min_depth = 1;
             let mut depth = edit_depth;
             while depth >= min_depth {
-                if let Some(hit) = edit::cpu_raycast_in_frame(
+                if edit::cpu_raycast_in_frame(
                     &world.library,
                     world.root,
                     frame.render_path.as_slice(),
@@ -234,21 +157,9 @@ pub(crate) fn center_frame_raycast_hit(
                     ray_dir,
                     depth,
                     edit_depth,
-                ) {
-                    if hit.path.len() < edit_depth as usize {
-                        let target_world = edit::hit_point_world(
-                            &world.library,
-                            &hit,
-                            position.to_world_xyz(),
-                            sdf::normalize(camera.forward()),
-                        );
-                        let _ = edit::refine_cartesian_hit_to_depth(
-                            &world.library,
-                            &hit,
-                            target_world,
-                            edit_depth as usize,
-                        );
-                    }
+                )
+                .is_some()
+                {
                     return true;
                 }
                 if depth == min_depth {
@@ -272,9 +183,9 @@ mod tests {
         for depth in [39u8, 36, 34, 32, 22, 20, 18, 16] {
             let position = spawn_position(
                 WorldPreset::PlainTest,
-                bootstrap.default_spawn_xyz,
+                bootstrap.default_spawn_pos.in_frame(&Path::root()),
                 depth,
-                bootstrap.default_spawn_depth,
+                bootstrap.default_spawn_pos.anchor.depth(),
             );
             let mut logical_path = position.anchor;
             let desired_depth = depth.saturating_sub(crate::app::RENDER_FRAME_K);
@@ -288,21 +199,15 @@ mod tests {
                 &bootstrap.world,
                 position,
                 WorldPreset::PlainTest,
-                bootstrap.default_spawn_depth,
+                bootstrap.default_spawn_pos.anchor.depth(),
                 bootstrap.default_spawn_yaw,
                 bootstrap.default_spawn_pitch,
                 None,
                 None,
             );
             assert!(
-                center_world_raycast_hit(
-                    &bootstrap.world,
-                    position,
-                    yaw,
-                    pitch,
-                    bootstrap.default_spawn_depth as u32,
-                ),
-                "derived harness view should produce a stable world hit at depth {depth}; yaw={yaw} pitch={pitch} frame={:?}",
+                center_frame_raycast_hit(&bootstrap.world, &frame, position, yaw, pitch),
+                "derived harness view should produce a stable frame-local hit at depth {depth}; yaw={yaw} pitch={pitch} frame={:?}",
                 frame.render_path.as_slice()
             );
         }
@@ -314,23 +219,28 @@ mod tests {
         for depth in [39u8, 36, 34, 32, 22, 20, 18, 16] {
             let position = spawn_position(
                 WorldPreset::PlainTest,
-                bootstrap.default_spawn_xyz,
+                bootstrap.default_spawn_pos.in_frame(&Path::root()),
                 depth,
-                bootstrap.default_spawn_depth,
+                bootstrap.default_spawn_pos.anchor.depth(),
             );
             let y0 = slot_coords(position.anchor.slot(0) as usize).1;
             assert_eq!(y0, 1, "plain spawn must stay in the air layer at depth {depth}");
             for level in 1..position.anchor.depth() as usize {
                 let y = slot_coords(position.anchor.slot(level) as usize).1;
                 assert_eq!(
-                    y, 0,
-                    "plain spawn should descend toward the surface from above at depth {depth}, level {level}"
+                    y, 1,
+                    "plain spawn should track the flat y=1.5 surface ternary prefix at depth {depth}, level {level}"
                 );
             }
             assert!(
-                position.offset[1] < 0.8,
-                "plain spawn should remain close to the surface at depth {depth}: {:?}",
-                position.offset
+                position.offset[1] > 0.5,
+                "plain spawn should sit above the surface boundary at depth {depth}: {:?}",
+                position.offset,
+            );
+            let root_y = position.in_frame(&Path::root())[1];
+            assert!(
+                root_y > PLAIN_SURFACE_Y,
+                "plain spawn must be above the surface at depth {depth}: y={root_y}",
             );
         }
     }

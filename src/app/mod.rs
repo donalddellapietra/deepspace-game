@@ -42,7 +42,7 @@ pub mod shells;
 pub mod test_runner;
 
 pub use frame::{
-    ActiveFrame, ActiveFrameKind, compute_render_frame, frame_origin_size_world, with_render_margin,
+    ActiveFrame, ActiveFrameKind, compute_render_frame, with_render_margin,
 };
 pub use test_runner::TestConfig;
 
@@ -179,18 +179,19 @@ impl App {
             bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let world = bootstrap.world;
         let tree_depth = world.tree_depth();
-        let spawn_xyz = test_cfg.spawn_xyz.unwrap_or(bootstrap.default_spawn_xyz);
+        let spawn_xyz = test_cfg
+            .spawn_xyz
+            .unwrap_or_else(|| bootstrap.default_spawn_pos.in_frame(&Path::root()));
         debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
-
-        let anchor_depth = test_cfg
-            .spawn_depth
-            .unwrap_or(bootstrap.default_spawn_depth);
         let position = harness::spawn_position(
             test_cfg.world_preset,
             spawn_xyz,
-            anchor_depth,
-            bootstrap.default_spawn_depth,
+            test_cfg
+                .spawn_depth
+                .unwrap_or(bootstrap.default_spawn_pos.anchor.depth()),
+            bootstrap.default_spawn_pos.anchor.depth(),
         );
+        let anchor_depth = position.anchor.depth();
         let desired_depth =
             (position.anchor.depth().saturating_sub(RENDER_FRAME_K)).min(RENDER_FRAME_MAX_DEPTH);
         let mut logical_path = position.anchor;
@@ -209,7 +210,7 @@ impl App {
                 &world,
                 position,
                 test_cfg.world_preset,
-                bootstrap.default_spawn_depth,
+                bootstrap.default_spawn_pos.anchor.depth(),
                 bootstrap.default_spawn_yaw,
                 bootstrap.default_spawn_pitch,
                 test_cfg.spawn_yaw,
@@ -222,8 +223,12 @@ impl App {
             )
         };
         eprintln!(
-            "spawn: xyz={:?} anchor_depth={} yaw={} pitch={}",
-            spawn_xyz, anchor_depth, spawn_yaw, spawn_pitch,
+            "spawn: anchor_depth={} slots={:?} offset={:?} yaw={} pitch={}",
+            anchor_depth,
+            position.anchor.as_slice(),
+            position.offset,
+            spawn_yaw,
+            spawn_pitch,
         );
 
         Self {

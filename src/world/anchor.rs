@@ -16,11 +16,9 @@ use std::hash::{Hash, Hasher};
 
 use crate::world::tree::{MAX_DEPTH, NodeLibrary, slot_coords, slot_index};
 
-/// Root cell spans `[0, WORLD_SIZE)³` in world units.
-///
-/// Every cell at anchor depth `d` is `WORLD_SIZE / 3^d` wide. The
-/// whole engine uses this as the single convention for converting
-/// between `WorldPos` and f32 world-space XYZ.
+/// Local frame convention: every node's children span `[0, WORLD_SIZE)³`
+/// because there are 3 children per axis. This is a frame-local
+/// coordinate constant, not an absolute world-scale measurement.
 pub const WORLD_SIZE: f32 = 3.0;
 
 // --------------------------------------------------------------- Path
@@ -55,6 +53,13 @@ impl Path {
     pub fn slot(&self, i: usize) -> u8 {
         debug_assert!(i < self.depth as usize);
         self.slots[i]
+    }
+
+    #[inline]
+    pub fn set_slot(&mut self, i: usize, slot: u8) {
+        debug_assert!(i < self.depth as usize);
+        debug_assert!((slot as usize) < 27);
+        self.slots[i] = slot;
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -211,6 +216,15 @@ impl WorldPos {
         }
     }
 
+    /// Construct from root-frame-local coordinates without doing a
+    /// deep root-relative float decomposition. The local point is
+    /// first resolved at a shallow precise depth, then deepened via
+    /// pure slot arithmetic.
+    pub fn from_root_local(local: [f32; 3], anchor_depth: u8) -> Self {
+        let shallow_depth = anchor_depth.min(12);
+        Self::from_frame_local(&Path::root(), local, shallow_depth).deepened_to(anchor_depth)
+    }
+
     /// Restore `offset[i] ∈ [0, 1)` by stepping the anchor along
     /// each axis as needed. Cartesian interpretation only (step 1).
     fn renormalize_cartesian(&mut self) {
@@ -266,79 +280,10 @@ impl WorldPos {
         Transition::None
     }
 
-    /// World-space XYZ this position represents. Root cell spans
-    /// `[0, WORLD_SIZE)³`; each anchor slot narrows that cell by 1/3.
-    pub fn to_world_xyz(&self) -> [f32; 3] {
-        let mut origin = [0.0f32; 3];
-        let mut size = WORLD_SIZE;
-        for k in 0..self.anchor.depth() as usize {
-            let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
-            let child = size / 3.0;
-            origin[0] += sx as f32 * child;
-            origin[1] += sy as f32 * child;
-            origin[2] += sz as f32 * child;
-            size = child;
-        }
-        [
-            origin[0] + self.offset[0] * size,
-            origin[1] + self.offset[1] * size,
-            origin[2] + self.offset[2] * size,
-        ]
-    }
-
-    /// Build a `WorldPos` anchored at `anchor_depth` for a world-space
-    /// XYZ point. The XYZ is clamped into `[0, WORLD_SIZE)` — positions
-    /// outside the root cell are not representable and collapse to the
-    /// boundary.
-    pub fn from_world_xyz(xyz: [f32; 3], anchor_depth: u8) -> Self {
-        let clamped = [
-            xyz[0].clamp(0.0, WORLD_SIZE - f32::EPSILON),
-            xyz[1].clamp(0.0, WORLD_SIZE - f32::EPSILON),
-            xyz[2].clamp(0.0, WORLD_SIZE - f32::EPSILON),
-        ];
-        let mut anchor = Path::root();
-        let mut origin = [0.0f32; 3];
-        let mut size = WORLD_SIZE;
-        let depth = (anchor_depth as usize).min(MAX_DEPTH);
-        for _ in 0..depth {
-            let child = size / 3.0;
-            let mut s = [0usize; 3];
-            for i in 0..3 {
-                let v = ((clamped[i] - origin[i]) / child).floor().clamp(0.0, 2.0) as usize;
-                s[i] = v;
-                origin[i] += v as f32 * child;
-            }
-            anchor.push(slot_index(s[0], s[1], s[2]) as u8);
-            size = child;
-        }
-        let offset = [
-            ((clamped[0] - origin[0]) / size).clamp(0.0, 1.0 - f32::EPSILON),
-            ((clamped[1] - origin[1]) / size).clamp(0.0, 1.0 - f32::EPSILON),
-            ((clamped[2] - origin[2]) / size).clamp(0.0, 1.0 - f32::EPSILON),
-        ];
-        Self { anchor, offset }
-    }
-
-    /// World-space size of the anchor's cell.
-    pub fn cell_size(&self) -> f32 {
-        WORLD_SIZE / 3.0f32.powi(self.anchor.depth() as i32)
-    }
-
-    /// Vector from `other` to `self`, in world units, computed
-    /// without ever materializing either position at world scale.
-    ///
-    /// **Precision-safe.** Both positions are walked in their
-    /// common ancestor cell's frame (size = `WORLD_SIZE / 3^C`),
-    /// and the subtraction happens at that local scale — so the
-    /// difference's f32 precision is bounded by `cell_size_at_C *
-    /// 1e-7` rather than by `WORLD_SIZE * 1e-7`. When `self` and
-    /// `other` share a deep prefix (camera near a tracked entity),
-    /// precision improves geometrically with that depth.
-    ///
-    /// Returns `self - other` as a world-units `[f32; 3]`.
+    /// Vector from `other` to `self`, computed without materializing
+    /// either position at root-relative scale.
     pub fn offset_from(&self, other: &Self) -> [f32; 3] {
         let c = self.anchor.common_prefix_len(&other.anchor) as usize;
-        // Cell size of the common ancestor in world units.
         let mut common_size = WORLD_SIZE;
         for _ in 0..c {
             common_size /= 3.0;
@@ -661,288 +606,209 @@ mod tests {
     }
 
     #[test]
-    fn world_xyz_round_trip() {
-        for depth in [0u8, 1, 3, 7, 12] {
-            for xyz in [
-                [0.0, 0.0, 0.0],
-                [1.5, 2.3, 1.5],
-                [2.999, 0.001, 1.0],
-                [0.5, 0.5, 0.5],
-            ] {
-                let p = WorldPos::from_world_xyz(xyz, depth);
-                assert_eq!(p.anchor.depth(), depth);
-                let back = p.to_world_xyz();
-                for i in 0..3 {
-                    assert!(
-                        (back[i] - xyz[i]).abs() < WORLD_SIZE * 1e-5,
-                        "depth {}: xyz {:?} round-tripped to {:?}",
-                        depth,
-                        xyz,
-                        back
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn cell_size_matches_depth() {
-        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 0);
-        assert!((p.cell_size() - WORLD_SIZE).abs() < 1e-5);
-        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 1);
-        assert!((p.cell_size() - 1.0).abs() < 1e-5);
-        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 7);
-        assert!((p.cell_size() - (WORLD_SIZE / 3.0f32.powi(7))).abs() < 1e-7);
-    }
-
-    #[test]
-    fn zoom_preserves_world_xyz() {
-        let mut p = WorldPos::from_world_xyz([1.23, 2.34, 0.56], 5);
-        let before = p.to_world_xyz();
+    fn zoom_preserves_position() {
+        let mut p = WorldPos::from_root_local([1.23, 2.34, 0.56], 5);
+        let before = p.in_frame(&Path::root());
         p.zoom_in();
-        let after_in = p.to_world_xyz();
+        let after_in = p.in_frame(&Path::root());
         for i in 0..3 {
             assert!((before[i] - after_in[i]).abs() < 1e-4);
         }
         p.zoom_out();
-        let after_out = p.to_world_xyz();
+        let after_out = p.in_frame(&Path::root());
         for i in 0..3 {
             assert!((before[i] - after_out[i]).abs() < 1e-4);
         }
     }
 
     #[test]
-    fn in_frame_is_identity_at_root_frame() {
-        let p = WorldPos::from_world_xyz([1.5, 2.25, 0.75], 7);
-        let local = p.in_frame(&Path::root());
-        let world = p.to_world_xyz();
-        for i in 0..3 {
-            assert!((local[i] - world[i]).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn in_frame_round_trip_via_from_frame_local() {
-        let p = WorldPos::from_world_xyz([1.5, 2.1, 0.9], 12);
-        let mut frame = p.anchor;
-        frame.truncate(frame.depth() - 3);
-        let local = p.in_frame(&frame);
-        let q = WorldPos::from_frame_local(&frame, local, p.anchor.depth());
-        let world_back = q.to_world_xyz();
-        let world_orig = p.to_world_xyz();
-        for i in 0..3 {
-            assert!((world_back[i] - world_orig[i]).abs() < 1e-4);
-        }
-    }
-
-    #[test]
-    fn offset_from_camera_at_spawn_matches_pre_refactor() {
-        // The exact scenario the shader sees on boot. Camera spawned
-        // 0.82 world above the planet's north pole; cs_oc must be
-        // `(0, 0.82, 0)` to single-precision regardless of which
-        // anchor depth the camera sits at.
-        let planet = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
-        for cam_depth in [4u8, 8, 12, 13, 16, 18] {
-            let cam = WorldPos::from_world_xyz([1.5, 2.32, 1.5], cam_depth);
-            let oc = cam.offset_from(&planet);
-            assert!(oc[0].abs() < 1e-4, "depth {cam_depth}: oc.x = {}", oc[0]);
-            assert!(
-                (oc[1] - 0.82).abs() < 1e-4,
-                "depth {cam_depth}: oc.y = {}",
-                oc[1]
-            );
-            assert!(oc[2].abs() < 1e-4, "depth {cam_depth}: oc.z = {}", oc[2]);
-        }
-    }
-
-    #[test]
-    fn offset_from_after_zoom_chain_matches_baseline() {
-        // The user's flow: spawn at depth 16, scroll out 7 times to
-        // layer 9 (anchor depth 13). cs_oc must be identical to a
-        // freshly constructed depth-13 camera at the same world XYZ.
-        let planet = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
-        let mut cam = WorldPos::from_world_xyz([1.5, 2.32, 1.5], 16);
-        for _ in 0..7 {
-            cam.zoom_out();
-        }
-        assert_eq!(cam.anchor.depth(), 9);
-        let baseline = WorldPos::from_world_xyz([1.5, 2.32, 1.5], 9);
-        let oc_chained = cam.offset_from(&planet);
-        let oc_baseline = baseline.offset_from(&planet);
-        for i in 0..3 {
-            assert!(
-                (oc_chained[i] - oc_baseline[i]).abs() < 1e-4,
-                "axis {}: chained {} vs baseline {}",
-                i,
-                oc_chained[i],
-                oc_baseline[i],
-            );
-        }
-        assert!(
-            oc_chained[1].abs() > 0.5,
-            "oc.y collapsed to 0 after zoom chain — sphere would be invisible"
-        );
-    }
-
-    #[test]
-    fn offset_from_self_is_zero() {
-        for d in [1u8, 4, 8, 12, 16] {
-            let p = WorldPos::from_world_xyz([1.5, 2.0, 0.7], d);
-            let o = p.offset_from(&p);
-            for v in o {
-                assert!(v.abs() < 1e-6, "depth {}: o = {:?}", d, o);
-            }
-        }
-    }
-
-    #[test]
-    fn offset_from_is_antisymmetric() {
-        let a = WorldPos::from_world_xyz([1.5, 2.0, 0.7], 8);
-        let b = WorldPos::from_world_xyz([0.5, 1.5, 1.5], 8);
-        let ab = a.offset_from(&b);
-        let ba = b.offset_from(&a);
-        for i in 0..3 {
-            assert!(
-                (ab[i] + ba[i]).abs() < 1e-5,
-                "axis {}: ab={} ba={}",
-                i,
-                ab[i],
-                ba[i]
-            );
-        }
-    }
-
-    #[test]
-    fn offset_from_satisfies_triangle_equality() {
-        let a = WorldPos::from_world_xyz([0.5, 1.5, 1.5], 6);
-        let b = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 6);
-        let c = WorldPos::from_world_xyz([2.0, 1.5, 1.5], 6);
-        let ac = a.offset_from(&c);
-        let ab = a.offset_from(&b);
-        let bc = b.offset_from(&c);
-        for i in 0..3 {
-            let sum = ab[i] + bc[i];
-            assert!(
-                (ac[i] - sum).abs() < 1e-5,
-                "axis {}: ac={} ab+bc={}",
-                i,
-                ac[i],
-                sum
-            );
-        }
-    }
-
-    #[test]
-    fn offset_from_invariant_under_anchor_depth() {
-        let world = [1.5, 2.0, 0.7];
-        let target = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
-        let baseline = WorldPos::from_world_xyz(world, 4).offset_from(&target);
-        for depth in [4u8, 6, 8, 12, 16, 20] {
-            let p = WorldPos::from_world_xyz(world, depth);
-            let o = p.offset_from(&target);
-            for i in 0..3 {
-                assert!(
-                    (o[i] - baseline[i]).abs() < 1e-5,
-                    "depth {}: axis {}: {} vs baseline {}",
-                    depth,
-                    i,
-                    o[i],
-                    baseline[i],
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn zoom_in_then_zoom_out_preserves_world_xyz() {
-        let mut p = WorldPos::from_world_xyz([1.234, 2.345, 0.567], 4);
-        let before = p.to_world_xyz();
+    fn zoom_in_then_zoom_out_preserves_position() {
+        let mut p = WorldPos::from_root_local([1.234, 2.345, 0.567], 4);
+        let before = p.in_frame(&Path::root());
         for _ in 0..16 {
             p.zoom_in();
         }
         for _ in 0..16 {
             p.zoom_out();
         }
-        let after = p.to_world_xyz();
+        let after = p.in_frame(&Path::root());
         for i in 0..3 {
-            assert!(
-                (after[i] - before[i]).abs() < 1e-4,
-                "axis {}: {} -> {}",
-                i,
-                before[i],
-                after[i]
-            );
+            assert!((after[i] - before[i]).abs() < 1e-4);
         }
     }
 
     #[test]
-    fn many_zoom_ins_preserve_world_xyz() {
-        let mut p = WorldPos::from_world_xyz([1.234, 2.345, 0.567], 4);
-        let before = p.to_world_xyz();
-        for k in 0..15 {
+    fn many_zoom_ins_preserve_position() {
+        let mut p = WorldPos::from_root_local([1.234, 2.345, 0.567], 4);
+        let before = p.in_frame(&Path::root());
+        for _ in 0..15 {
             p.zoom_in();
-            let after = p.to_world_xyz();
+            let after = p.in_frame(&Path::root());
             for i in 0..3 {
-                assert!(
-                    (after[i] - before[i]).abs() < 1e-4,
-                    "after {} zoom_ins, axis {}: {} -> {}",
-                    k + 1,
-                    i,
-                    before[i],
-                    after[i]
-                );
+                assert!((after[i] - before[i]).abs() < 1e-4);
             }
         }
     }
 
     #[test]
-    fn deepened_to_preserves_world_xyz() {
-        for d in [4u8, 6, 8, 12, 16, 20] {
-            let p = WorldPos::from_world_xyz([1.234, 2.345, 0.567], 4);
+    fn deepened_to_preserves_position() {
+        let p = WorldPos::from_root_local([1.234, 2.345, 0.567], 4);
+        let before = p.in_frame(&Path::root());
+        for d in [4u8, 6, 8, 12] {
             let q = p.deepened_to(d);
-            let a = p.to_world_xyz();
-            let b = q.to_world_xyz();
+            let after = q.in_frame(&Path::root());
             for i in 0..3 {
-                assert!(
-                    (a[i] - b[i]).abs() < 1e-4,
-                    "depth {}: axis {}: {} vs {}",
-                    d,
-                    i,
-                    a[i],
-                    b[i]
-                );
+                assert!((before[i] - after[i]).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn in_frame_at_root_gives_expected_coords() {
+        let p = WorldPos::from_root_local([1.5, 2.25, 0.75], 7);
+        let local = p.in_frame(&Path::root());
+        assert!((local[0] - 1.5).abs() < 1e-4);
+        assert!((local[1] - 2.25).abs() < 1e-4);
+        assert!((local[2] - 0.75).abs() < 1e-4);
+    }
+
+    #[test]
+    fn in_frame_round_trip_via_from_frame_local() {
+        let p = WorldPos::from_root_local([1.5, 2.1, 0.9], 12);
+        let mut frame = p.anchor;
+        frame.truncate(frame.depth() - 3);
+        let local = p.in_frame(&frame);
+        let q = WorldPos::from_frame_local(&frame, local, p.anchor.depth());
+        let back = q.in_frame(&Path::root());
+        let orig = p.in_frame(&Path::root());
+        for i in 0..3 {
+            assert!((back[i] - orig[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn in_frame_cross_branch() {
+        let point = WorldPos::from_root_local([2.5, 0.25, 1.5], 4);
+        let mut frame = Path::root();
+        frame.push(slot_index(0, 2, 0) as u8);
+        frame.push(slot_index(1, 1, 1) as u8);
+        let actual = point.in_frame(&frame);
+        assert!(actual[0] > WORLD_SIZE || actual[1] < 0.0);
+    }
+
+    #[test]
+    fn in_frame_precision_at_deep_anchor() {
+        let p = WorldPos::from_root_local([1.5, 1.5, 1.5], 4).deepened_to(18);
+        let mut frame = p.anchor;
+        frame.truncate(frame.depth() - 3);
+        let local = p.in_frame(&frame);
+        for &v in &local {
+            assert!((0.0..super::WORLD_SIZE).contains(&v));
+        }
+    }
+
+    #[test]
+    fn offset_from_consistent_across_depths() {
+        let planet = WorldPos::from_root_local([1.5, 1.5, 1.5], 4);
+        let cam_shallow = WorldPos::from_root_local([1.5, 2.32, 1.5], 4);
+        let baseline = cam_shallow.offset_from(&planet);
+        assert!((baseline[1] - 0.82).abs() < 1e-4);
+        for d in [4u8, 8, 12, 16, 20] {
+            let cam = cam_shallow.deepened_to(d);
+            let oc = cam.offset_from(&planet);
+            for i in 0..3 {
+                assert!((oc[i] - baseline[i]).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn offset_from_after_zoom_chain_matches_baseline() {
+        let planet = WorldPos::from_root_local([1.5, 1.5, 1.5], 4);
+        let cam = WorldPos::from_root_local([1.5, 2.32, 1.5], 4).deepened_to(16);
+        let mut zoomed = cam;
+        for _ in 0..7 {
+            zoomed.zoom_out();
+        }
+        assert_eq!(zoomed.anchor.depth(), 9);
+        let oc_chained = zoomed.offset_from(&planet);
+        let oc_deep = cam.offset_from(&planet);
+        for i in 0..3 {
+            assert!((oc_chained[i] - oc_deep[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn offset_from_self_is_zero() {
+        let base = WorldPos::from_root_local([1.5, 2.0, 0.7], 4);
+        for d in [4u8, 8, 12, 16] {
+            let p = base.deepened_to(d);
+            let o = p.offset_from(&p);
+            for v in o {
+                assert!(v.abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn offset_from_is_antisymmetric() {
+        let a = WorldPos::from_root_local([1.5, 2.0, 0.7], 8);
+        let b = WorldPos::from_root_local([0.5, 1.5, 1.5], 8);
+        let ab = a.offset_from(&b);
+        let ba = b.offset_from(&a);
+        for i in 0..3 {
+            assert!((ab[i] + ba[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn offset_from_satisfies_triangle_equality() {
+        let a = WorldPos::from_root_local([0.5, 1.5, 1.5], 6);
+        let b = WorldPos::from_root_local([1.5, 1.5, 1.5], 6);
+        let c = WorldPos::from_root_local([2.0, 1.5, 1.5], 6);
+        let ac = a.offset_from(&c);
+        let ab = a.offset_from(&b);
+        let bc = b.offset_from(&c);
+        for i in 0..3 {
+            assert!((ac[i] - (ab[i] + bc[i])).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn offset_from_invariant_under_anchor_depth() {
+        let target = WorldPos::from_root_local([1.5, 1.5, 1.5], 4);
+        let base = WorldPos::from_root_local([1.5, 2.0, 0.7], 4);
+        let baseline = base.offset_from(&target);
+        for depth in [4u8, 6, 8, 12, 16, 20] {
+            let p = base.deepened_to(depth);
+            let o = p.offset_from(&target);
+            for i in 0..3 {
+                assert!((o[i] - baseline[i]).abs() < 1e-5);
             }
         }
     }
 
     #[test]
     fn deepened_offset_from_matches_base() {
-        let target = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
-        let base = WorldPos::from_world_xyz([1.5, 2.0, 0.7], 4);
+        let target = WorldPos::from_root_local([1.5, 1.5, 1.5], 4);
+        let base = WorldPos::from_root_local([1.5, 2.0, 0.7], 4);
         let base_o = base.offset_from(&target);
         for d in [4u8, 6, 8, 12, 16, 20] {
             let deeper = base.deepened_to(d);
             let o = deeper.offset_from(&target);
             for i in 0..3 {
-                assert!(
-                    (o[i] - base_o[i]).abs() < 1e-5,
-                    "depth {}: axis {}: {} vs base {}",
-                    d,
-                    i,
-                    o[i],
-                    base_o[i]
-                );
+                assert!((o[i] - base_o[i]).abs() < 1e-5);
             }
         }
     }
 
     #[test]
-    fn offset_from_matches_world_diff_at_shallow_anchors() {
-        let a = WorldPos::from_world_xyz([2.5, 0.25, 1.5], 4);
-        let b = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 4);
+    fn offset_from_matches_in_frame_diff_at_shallow_anchors() {
+        let a = WorldPos::from_root_local([2.5, 0.25, 1.5], 4);
+        let b = WorldPos::from_root_local([1.5, 1.5, 1.5], 4);
         let o = a.offset_from(&b);
-        let aw = a.to_world_xyz();
-        let bw = b.to_world_xyz();
+        let aw = a.in_frame(&Path::root());
+        let bw = b.in_frame(&Path::root());
         for i in 0..3 {
             assert!((o[i] - (aw[i] - bw[i])).abs() < 1e-5);
         }
@@ -950,10 +816,6 @@ mod tests {
 
     #[test]
     fn offset_from_precision_at_deep_common_prefix() {
-        // Two positions inside the same depth-12 cell — common
-        // prefix is 12, so the offset should resolve at sub-cell
-        // precision even though to_world_xyz of either is bounded
-        // by f32 precision at magnitude ~1.5.
         let mut anchor = Path::root();
         for _ in 0..12 {
             anchor.push(slot_index(1, 1, 1) as u8);
@@ -963,74 +825,9 @@ mod tests {
         let o = a.offset_from(&b);
         let cell = WORLD_SIZE / 3.0f32.powi(12);
         let expected_x = 0.10 * cell;
-        // f32 precision at magnitude `cell` is ~cell * 1e-7,
-        // way below the 1e-5 *cell tolerance below.
-        assert!(
-            (o[0] - expected_x).abs() < cell * 1e-5,
-            "diff {} expected {}",
-            o[0],
-            expected_x
-        );
+        assert!((o[0] - expected_x).abs() < cell * 1e-5);
         assert!(o[1].abs() < cell * 1e-5);
         assert!(o[2].abs() < cell * 1e-5);
-    }
-
-    #[test]
-    fn in_frame_cross_branch_matches_world_diff() {
-        // Point and frame living in different depth-1 branches: the
-        // returned local coords fall outside [0, WORLD_SIZE) and must
-        // match (world_pos - frame_world_origin) * (WORLD_SIZE /
-        // frame_size) to within f32 precision.
-        let point = WorldPos::from_world_xyz([2.5, 0.25, 1.5], 4);
-        let mut frame = Path::root();
-        frame.push(slot_index(0, 2, 0) as u8); // depth-1 cell (0, 2, 0) = y-top-left
-        frame.push(slot_index(1, 1, 1) as u8); // depth-2 center within it
-        let frame_size = super::WORLD_SIZE / 3.0f32.powi(frame.depth() as i32);
-        let mut frame_origin = [0.0f32; 3];
-        let mut size = super::WORLD_SIZE;
-        for k in 0..frame.depth() as usize {
-            let (sx, sy, sz) = slot_coords(frame.slot(k) as usize);
-            let child = size / 3.0;
-            frame_origin[0] += sx as f32 * child;
-            frame_origin[1] += sy as f32 * child;
-            frame_origin[2] += sz as f32 * child;
-            size = child;
-        }
-        let expected = {
-            let w = point.to_world_xyz();
-            let s = super::WORLD_SIZE / frame_size;
-            [
-                (w[0] - frame_origin[0]) * s,
-                (w[1] - frame_origin[1]) * s,
-                (w[2] - frame_origin[2]) * s,
-            ]
-        };
-        let actual = point.in_frame(&frame);
-        for i in 0..3 {
-            assert!(
-                (actual[i] - expected[i]).abs() < 1e-3,
-                "axis {i}: got {} expected {}",
-                actual[i],
-                expected[i],
-            );
-        }
-    }
-
-    #[test]
-    fn in_frame_precision_at_deep_anchor() {
-        // At anchor depth 18, absolute world XYZ near 1.5 loses
-        // sub-cell precision in f32. The frame-local coord should
-        // hit f32-safe magnitudes inside the frame's [0, WORLD_SIZE).
-        let p = WorldPos::from_world_xyz([1.5, 1.5, 1.5], 18);
-        let mut frame = p.anchor;
-        frame.truncate(frame.depth() - 3);
-        let local = p.in_frame(&frame);
-        for &v in &local {
-            assert!(
-                (0.0..super::WORLD_SIZE).contains(&v),
-                "local {v} out of frame"
-            );
-        }
     }
 
     #[test]

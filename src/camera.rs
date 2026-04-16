@@ -24,14 +24,6 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// World-space size of the anchor's cell. Flight speed,
-    /// crosshair reach, and physics integration all scale with this
-    /// so movement "feels" the same at every zoom level.
-    #[inline]
-    pub fn cell_size(&self) -> f32 {
-        self.position.cell_size()
-    }
-
     /// Lerp `smoothed_up` toward `target_up` at rate `k` per dt.
     pub fn update_up(&mut self, target_up: [f32; 3], dt: f32) {
         let k = (dt * 4.0).min(1.0);
