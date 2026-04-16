@@ -447,6 +447,7 @@ mod tests {
         use crate::world::anchor::Path;
         use crate::world::bootstrap;
         use crate::world::edit;
+        use crate::world::raycast;
 
         for spawn_depth in [4u8, 8, 11, 15, 20, 25, 30, 33, 38] {
             let boot = bootstrap::bootstrap_world(
@@ -481,7 +482,7 @@ mod tests {
             // root-local [0,3)^3, not frame-local.
             let ray_origin = camera.in_frame(&Path::root());
             let ray_dir = [0.0f32, -0.4, -0.9]; // forward-down
-            let hit = edit::cpu_raycast(
+            let hit = raycast::cpu_raycast(
                 &world.library,
                 world.root,
                 ray_origin,
