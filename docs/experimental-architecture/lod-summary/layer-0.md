@@ -1,1 +1,0 @@
-Base-3 recursive tree where every node is 27 children, every layer is Minecraft, and a GPU ray marcher traverses the tree per-pixel — descending deep for nearby detail and stopping early for distant terrain — so LOD is automatic, edits are instant, and content streams as tiny immutable nodes.

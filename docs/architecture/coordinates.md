@@ -1,251 +1,151 @@
-# Coordinates and positions
+# Coordinates
 
-## Model
+Every position in the world is `(anchor, offset)`. The anchor is a
+symbolic `Path` through the 27-ary tree — exact at any depth. The
+offset is a tiny `[f32; 3]` kept in `[0, 1)³` of the anchor's cell.
+**f32 never accumulates across cells.** As motion overflows a cell,
+the anchor advances; as the player zooms, the anchor's depth changes.
 
-The world is a tree of voxel nodes (see `voxels.md`). Every position in
-the game is **always at the leaf layer**. Zooming the camera in or out
-shows different layers of the tree, but the player, entities, physics,
-and collision all live at the leaf. This is "Model A" — a single
-coordinate system.
+Source of truth: `src/world/anchor.rs`.
 
-The tree's depth is fixed at world creation. No re-rooting, no dynamic
-growth. Pick a `MAX_LAYER` large enough for the world you want and be
-done with it.
-
-## Layer numbering
-
-- **Layer 0 = root** (coarsest — one big node covering the whole world).
-- **Layer MAX_LAYER = leaves** (finest — individual voxel nodes).
-- A node's layer number equals the length of its path from the root:
-  `layer = path.len()`. Zero arithmetic, no offset.
-- Adding more layers to a world extends downward into larger layer
-  numbers. Layer 0 stays layer 0 forever.
-
-Design choice: `MAX_LAYER = 12`. That gives `25 × 5^12 ≈ 6 billion`
-voxels per axis — effectively unbounded for a single-origin space game,
-and still well inside `f32` / `u64` / `SmallVec` budgets.
-
-## Position type
+## `Path`
 
 ```rust
-pub const MAX_LAYER: u8 = 12;
-
-/// A position in the world. Always leaf-layer.
-pub struct Position {
-    /// Slot indices from the root to the leaf node. Length is always
-    /// exactly `MAX_LAYER`. Each slot is 0..125.
-    path: SmallVec<[u8; MAX_LAYER as usize]>,
-    /// Which voxel inside the leaf node's 25³ grid. Each 0..25.
-    voxel: (u8, u8, u8),
-    /// Sub-voxel offset inside that voxel. Each 0.0..1.0.
-    offset: (f32, f32, f32),
+pub struct Path {
+    slots: [u8; MAX_DEPTH],   // MAX_DEPTH = 63
+    depth: u8,
 }
 ```
 
-Invariants:
-- `path.len() == MAX_LAYER` always.
-- `voxel.x, voxel.y, voxel.z < 25`.
-- `0.0 <= offset.x, offset.y, offset.z < 1.0`.
+Each slot is `0..27`, the child index into a node's 3×3×3 grid.
+Root is `depth == 0`. Two paths are "near" iff they share a long
+common prefix; the length of the shared prefix defines their scale
+of separation.
 
-Nothing is ever a "big number." Every component is bounded.
+Equality is `memcmp`-fast on `slots[..depth]`.
 
-## Slot encoding
-
-A child's slot index in its parent's 5³ child array is:
+## `WorldPos`
 
 ```rust
-pub const fn slot_index(x: u8, y: u8, z: u8) -> u8 {
-    z * 25 + y * 5 + x
-}
-
-pub const fn slot_coords(slot: u8) -> (u8, u8, u8) {
-    (slot % 5, (slot / 5) % 5, slot / 25)
+pub struct WorldPos {
+    pub anchor: Path,
+    pub offset: [f32; 3],     // invariant: each axis ∈ [0, 1)
 }
 ```
 
-This is the one encoding used everywhere. It's arbitrary but must be
-consistent.
+**Hard invariant**: `offset[i] ∈ [0, 1)` at all times. The coordinate
+primitives preserve this; callers should not poke the field directly.
 
-## Camera is separate
+Because the offset is bounded to one cell, f32 has its full ~7 digits
+of precision available locally. No large-world accumulation.
 
-The camera carries its own "which layer am I showing":
+## `WORLD_SIZE`
+
+`WORLD_SIZE = 3.0` is a *frame-local* coordinate constant — one
+node's three children span `[0, 3)` on each axis in the local frame
+the renderer uses. It is **not** an absolute-world scale measurement.
+See [../principles/no-absolute-coordinates.md](../principles/no-absolute-coordinates.md).
+
+## Offset interpretation depends on NodeKind
+
+The semantic axes of `offset` track the deepest node's kind:
+
+- `Cartesian` / `CubedSphereBody`: offset is `(x, y, z)` in Cartesian
+  local coords.
+- `CubedSphereFace`: offset is `(u, v, r)` in the face's equal-angle
+  + radial frame.
+
+When the anchor descends into or exits a face subtree, the offset's
+meaning changes. The coordinate primitives handle the rewrite; game-
+level effects (camera up-vector, motion feel) are handled by
+transition callbacks (see below).
+
+## Primitives
+
+### `add_local(delta)`
 
 ```rust
-pub struct CameraZoom {
-    /// Which tree layer the camera renders. 0..=MAX_LAYER.
-    /// Clamped to a UX-friendly range (e.g. 2..=MAX_LAYER-2) so the
-    /// player never zooms out to "one voxel" or into sub-voxel noise.
-    layer: u8,
+impl WorldPos {
+    pub fn add_local(&mut self, delta: [f32; 3], lib: &NodeLibrary) -> Transition;
 }
 ```
 
-The camera's `layer` is a view state. Changing it does not change any
-`Position`. "Drilling" / "zooming" is purely a camera operation.
+The only movement entry point. Adds `delta` to `offset`; if any axis
+overflows `[0, 1)`, steps to the neighboring cell at the current
+depth (bubbling up the path if needed). Dispatches on the deepest
+node's `NodeKind` (Cartesian vs. face seam). Returns a `Transition`
+describing any crossing.
 
-## Walking
-
-Movement is expressed as a delta in leaf-voxel-space, applied per axis.
-A step is split into three carries:
-
-1. **Offset carry.** `offset.x += dx`. If `offset.x` leaves `0.0..1.0`,
-   carry into `voxel.x`.
-2. **Voxel carry.** If `voxel.x` leaves `0..25`, carry into `path` — a
-   **neighbor walk** across leaf node boundaries.
-3. **Path carry.** If the neighbor walk needs to cross the root, the
-   walk returns `None` — the edge of the world. No re-rooting happens.
-
-### Neighbor walk
-
-To find the leaf node to the `+x` of the current one:
-
-1. If `voxel.x` is still inside `0..25`, no walk needed.
-2. Pop the last slot off `path`. Compute `slot_coords(popped)` → 3D.
-3. If the popped slot's x is `< 4`, increment it, push the new slot,
-   set `voxel.x = 0`.
-4. If the popped slot's x is already `4`, recurse: the walk needs to
-   cross the parent's x boundary too. Pop again, repeat.
-5. When re-descending, all popped layers pick the opposite-axis slot
-   (`x = 0` when crossing `+x`) with the same `(y, z)` slot indices
-   as on the way up.
-
-Worst case walks all the way to the root — `O(MAX_LAYER)`. Normal case
-is one step.
-
-Diagonal movement is decomposed into independent per-axis steps. Each
-axis does its own carry/walk.
-
-## Worked example
-
-Setup: `MAX_LAYER = 3` (small, for readability).
-
-### Start at a leaf
-
-```
-path   = [72, 37, 16]
-voxel  = (0, 5, 20)
-offset = (0.0, 0.0, 0.0)
-```
-
-`path.len() == 3 == MAX_LAYER` ✓. We're at the leaf.
-
-### Walk +x by 0.5 leaf voxels
-
-`offset.x` goes `0.0 → 0.5`. No carry.
-
-```
-path   = [72, 37, 16]
-voxel  = (0, 5, 20)
-offset = (0.5, 0.0, 0.0)
-```
-
-### Walk another +0.7
-
-`offset.x = 1.2` — carries. `voxel.x = 1`, `offset.x = 0.2`.
-
-```
-path   = [72, 37, 16]
-voxel  = (1, 5, 20)
-offset = (0.2, 0.0, 0.0)
-```
-
-### Walk far enough to cross the leaf node (+24 voxels)
-
-`voxel.x` walks up to `24`. One more step → `voxel.x = 25`. Carry into
-path.
-
-- Pop `16`. `slot_coords(16) = (1, 3, 0)`.
-- x is `1 < 4`, increment to `2`. New slot = `slot_index(2, 3, 0) = 17`.
-- Push `17`. Reset `voxel.x = 0`.
-
-```
-path   = [72, 37, 17]
-voxel  = (0, 5, 20)
-offset = (0.2, 0.0, 0.0)
-```
-
-### Keep walking until we cross slot 37 too
-
-After four more leaf-node crossings, we walked through slots
-`17 → 18 → 19 → 20` — wait, `slot_index(4, 3, 0) = 0*25 + 3*5 + 4 = 19`,
-and `(5, 3, 0)` doesn't exist. So the sequence is `17 → 18 → 19`, then
-we try to cross the parent too.
-
-- Current last slot `19 = (4, 3, 0)`. x is already `4`. Recurse.
-- Pop `19`. Look at the next slot up: `37 = (2, 2, 1)`. x is `2 < 4`,
-  increment to `3`. New slot = `slot_index(3, 2, 1) = 38`.
-- Push `38`, then re-descend. The new leaf we enter picks `x = 0`
-  (opposite face) and keeps `(y, z) = (3, 0)` from the popped slot.
-  New last slot = `slot_index(0, 3, 0) = 15`.
-- Push `15`. Reset `voxel.x = 0`.
-
-```
-path   = [72, 38, 15]
-voxel  = (0, 5, 20)
-offset = (0.2, 0.0, 0.0)
-```
-
-That was a two-level neighbor walk: we crossed a layer-3 node boundary
-*and* a layer-2 node boundary in the same step. Still `O(MAX_LAYER)`.
-
-### Camera zoom
-
-The player's `Position` above never changes when the camera zooms. The
-camera carries its own `zoom.layer: u8`; incrementing it shows a deeper
-node centred on the player; decrementing shows a shallower one. All
-rendering does is walk the tree to `zoom.layer` and emit entities for
-the nodes it finds there.
-
-## Why this never overflows
-
-- `voxel.x, y, z < 25` → `u8`.
-- `offset.x, y, z ∈ [0, 1)` → `f32` with no precision drift, ever.
-- `path` slots are each `< 125` → `u8`.
-- `path.len() == MAX_LAYER == 12` → `SmallVec<[u8; 12]>`, always
-  stack-allocated.
-- No coordinate spans more than one tree layer. No integer ever grows
-  past `125`. No float ever leaves `0..1`.
-
-## `LayerPos`: a cell at an arbitrary view layer
-
-`Position` is always leaf-layer. The renderer, editor, input layer,
-and picking code all want the opposite: a cell at the *current camera
-view layer*, without projecting through a leaf position.
+### `zoom_in() / zoom_out()`
 
 ```rust
-pub struct LayerPos {
-    pub path:  Vec<u8>,       // length == layer, 0 for root
-    pub cell:  [u8; 3],       // each component 0..25
-    pub layer: u8,            // 0..=MAX_LAYER
+impl WorldPos {
+    pub fn zoom_in(&mut self);
+    pub fn zoom_out(&mut self);
 }
 ```
 
-Same bounded-ness: `path` slots `< 125`, `cell` components `< 25`.
-`LayerPos.path.len() == LayerPos.layer`.
+Both are O(1), no tree reads.
 
-`LayerPos::from_leaf(&Position, layer)` walks up the leaf's path
-applying the downsample's inverse one step at a time:
+- **Zoom in** pushes a new slot equal to `floor(offset * 3)`, rescales
+  `offset[i] = fract(offset[i] * 3)`.
+- **Zoom out** pops the last slot, rescales
+  `offset[i] = (offset[i] + popped_slot_coord[i]) / 3`. Clamps at root.
 
+Zoom does not move the player — it re-expresses the same position at
+a different granularity.
+
+## Transitions
+
+```rust
+pub enum Transition {
+    None,
+    SphereEntry { body_path: Path },
+    SphereExit  { body_path: Path },
+    FaceEntry   { face: Face },
+    FaceExit    { face: Face },
+    CubeSeam    { from_face: Face, to_face: Face },
+}
 ```
-cx, cy, cz = leaf.voxel
-for i in (layer..NODE_PATH_LEN).rev():
-    (sx, sy, sz) = slot_coords(leaf.path[i])
-    cx = 5 * sx + cx / 5
-    cy = 5 * sy + cy / 5
-    cz = 5 * sz + cz / 5
+
+Returned from `add_local` and `zoom_in`/`zoom_out`. Game code reacts:
+sphere entry rotates the camera's "up" to the radial direction; cube
+seams re-express yaw/pitch in the new face's axes; and so on. The
+coordinate primitives never implement the *game* effects — only the
+*math* rewrite.
+
+## Camera
+
+```rust
+pub struct Camera {
+    pub position: WorldPos,
+    pub smoothed_up: [f32; 3],   // in the current anchor's frame
+    pub yaw: f32,
+    pub pitch: f32,
+}
 ```
 
-Every intermediate `(cx, cy, cz)` stays in `0..25`, because
-`5 * sx < 25`, `cx / 5 < 5`, and their sum is `< 25`. That's the
-bounded-ness invariant proving itself at runtime.
+The camera has no world-space `[f32; 3]` position — anywhere. Its
+location is always `position.anchor + position.offset`. `smoothed_up`,
+`yaw`, and `pitch` are interpreted in the current anchor's frame, and
+transition handlers re-express them when frames change.
 
-`LayerPos` was originally added in the 2D prototype — the 3D design
-only had `Position`, and every non-physics caller ended up re-writing
-the same projection logic. Making the view-layer cell a first-class
-type removed a lot of duplication.
+## Velocity
 
-## Not covered here
+Velocity is in **offset-units per second at the current anchor
+depth**. One unit = one cell width at that depth. Zoom in ⇒ same
+number means smaller world motion, matching the intuition "when I'm
+small, moving at the same speed gets me through less world."
 
-- **Editing and propagation.** How edits flow up the tree and keep
-  voxels + meshes consistent at every layer. See `editing.md`.
-- **Rendering LOD.** How the renderer picks which layer to emit
-  entities at. See `rendering.md`.
+## What this replaces
+
+This model supersedes the old world-XYZ plumbing:
+
+- No `Camera.pos: [f32; 3]` — gone.
+- No `SphericalPlanet` / `cs_planet` — the sphere is just a node with
+  `NodeKind::CubedSphereBody` in the tree.
+- No separate `edit_depth` / `visual_depth` / `cs_edit_depth` — edit
+  depth is the depth the raycast resolves to. Zoom in, hit deeper
+  cells; zoom out, hit shallower chunks.
+- No `to_world_xyz` / `from_world_xyz` helpers. See
+  [../principles/no-absolute-coordinates.md](../principles/no-absolute-coordinates.md).

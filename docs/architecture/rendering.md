@@ -1,188 +1,133 @@
 # Rendering
 
-## Model: uniform-layer camera (Option A)
+The renderer is a per-pixel GPU ray marcher that walks the world tree
+inside a *frame-local* coordinate system, chosen fresh each frame from
+the camera's anchor path. There is no global world transform, no mesh
+buffer, and no CPU geometry stage.
 
-The camera carries one integer: which tree layer to render. Every
-visible entity in the frame is emitted at that layer. There is no
-distance-based LOD mixing. Zooming the camera in or out changes the
-layer for the whole frame at once.
+Source of truth:
+- `src/renderer.rs` — wgpu pipeline, buffer management, present loop.
+- `src/app/frame.rs` — frame selection (pure; unit-testable).
+- `src/world/gpu/` — packing, ribbon, GPU-side types.
+- `assets/shaders/*.wgsl` — the ray marcher itself.
 
-```rust
-pub struct CameraZoom {
-    /// Which tree layer the camera renders. 0..=MAX_LAYER.
-    /// Clamped to a UX-friendly range so the player never sees the
-    /// whole world as one voxel (layer 0) or walks into sub-voxel
-    /// noise (layer MAX_LAYER).
-    layer: u8,
-}
-```
+## One-frame walkthrough
 
-- **Zoom in** → `layer += 1` → finer nodes, smaller visible area.
-- **Zoom out** → `layer -= 1` → coarser nodes, larger visible area.
+1. **Pick the render frame.** `compute_render_frame` walks up the
+   camera's anchor path until it finds a path whose node can serve
+   as a frame root — either a Cartesian ancestor at `camera_depth - K`,
+   or a `CubedSphereBody` cell the camera sits inside. Returns an
+   `ActiveFrame { render_path, logical_path, kind, node_id }`.
 
-The player's `Position` does not change when the camera zooms. The
-camera is a pure view state.
+2. **Project the camera.** `Camera::gpu_camera_at(frame)` produces a
+   `GpuCamera` whose position is in the frame's `[0, 3)³` local box.
+   All f32 math is safe: the frame box is bounded.
 
-## Target layer: sample two layers below the view layer
+3. **Pack the tree.** `gpu::pack::pack_tree_lod_preserving` BFS-packs
+   the subtree rooted at the frame into two flat buffers:
+   - `tree_buffer` — one `GpuChild` per child slot (8B: tag, block,
+     node_index).
+   - `node_kinds_buffer` — one `GpuNodeKind` per packed node (16B:
+     kind discriminant, face, inner/outer radii).
 
-A naive renderer at view layer `L` would emit one entity per node at
-layer `L`, textured from that node's majority-vote 25³ downsample. That
-discards most of the tree — at view layer 5, every on-screen cell is
-averaging `5^(MAX_LAYER - 5) × 5³` leaf voxels into one value.
+   Cartesian subtrees that subtend fewer than LOD_THRESHOLD pixels are
+   flattened to their `representative_block`. Spheres are exempt —
+   their DDA is cheap and their silhouette must be preserved.
 
-Instead, the renderer emits one entity per **layer-`(L + 2)` node**
-(clamped to `MAX_LAYER`). The reason is the same `(c / 5, c % 5)`
-decomposition the editor uses: inside a layer-`L` node's 25³ grid, one
-cell `(cx, cy, cz)` decomposes into exactly two more slot steps, so one
-view cell corresponds to exactly *one* layer-`(L + 2)` subtree. The
-renderer can hand that subtree's raw voxel grid straight to the greedy
-mesher without involving the downsample at all — detail never gets
-smoothed away by zooming out, because we're always reading from two
-layers below whatever the camera is showing.
+4. **Build the ribbon.** `gpu::ribbon::build_ribbon` emits the chain
+   of ancestors from the frame's *parent* up to the world root. When a
+   ray exits the frame's `[0, 3)³` box, the shader pops up this ribbon
+   to find a containing sibling or terminal — this is how the rendered
+   volume extends "past the walls" without the packer having to
+   pre-flatten every ancestor.
 
-At `L = MAX_LAYER` and `L = MAX_LAYER - 1` the clamp degenerates into
-"just emit at the leaf layer," which is the right behaviour: there's no
-deeper layer to sample. This rule was ported from the 2D prototype's
-`subtexture_25` / `subtexture_5` helpers.
+5. **Upload buffers.** `renderer.update_tree`, `update_ribbon`,
+   `update_camera`, `update_uniforms` write to wgpu buffers. An
+   `LodUploadKey` (root, camera anchor, offset bits, render path,
+   logical path, visual depth, kind tag) gates repacking — if the key
+   is unchanged, the upload is skipped.
 
-## Per-frame tree walk
+6. **Render.** A full-screen quad triggers `fs_main`. The fragment
+   shader reconstructs a ray from NDC, calls `march()`, shades the hit,
+   and composites the cursor highlight AABB.
 
-Rendering walks the tree from the root to the target layer, emitting
-one entity per visited node at `target_layer = (zoom.layer + 2).min(MAX_LAYER)`.
-The walk is a recursive descent with culling:
+## Shaders
 
-```
-render_walk(node_id, path, layer, camera_frustum, out):
-    aabb = world_aabb_for(path, layer)
-    if aabb does not intersect camera_frustum:
-        return
-    if layer == zoom.layer:
-        out.push((path, node_id, aabb))
-        return
-    let node = library.get(node_id)
-    for slot in 0..125:
-        child_id = node.children[slot]
-        if child_id == EMPTY_NODE:
-            continue
-        render_walk(child_id, path.push(slot), layer + 1, ...)
-```
+All WGSL in `assets/shaders/` is stitched together by
+`src/shader_compose.rs` (minimal `#include` resolver) starting from
+`main.wgsl`:
 
-For each position collected by the walk, the renderer spawns one
-Bevy entity with the node's baked mesh handle, translated to the
-node's world-space origin.
+- **`main.wgsl`** — entry. Vertex stage draws the quad; fragment
+  stage builds the primary ray and calls `march`.
+- **`march.wgsl`** — unified tree walker. Switches on `NodeKind` at
+  each descent: Cartesian DDA, or cubed-sphere dispatch.
+- **`tree.wgsl`** — child access, slot math, representative-block
+  LOD fallback when a subtree can't be descended further.
+- **`sphere.wgsl`**, **`face_math.wgsl`**, **`face_walk.wgsl`** —
+  cubed-sphere DDA: one face at a time, with face-seam crossings
+  handled by axis remapping. See [cubed-sphere.md](cubed-sphere.md).
+- **`ray_prim.wgsl`** — ray–box, ray–sphere intersections.
+- **`bindings.wgsl`** — bind-group layouts shared by Rust and WGSL.
 
-## Why this is cheap even at large zoom numbers
+All shaders march in the frame's local coordinates. None of them know
+the frame's *depth in the world tree* — that's the point.
 
-A naive walk to layer K visits up to `125^K` nodes — astronomically
-too many. Two things cut the cost to something reasonable:
+## GPU buffers
 
-1. **Cell-radius culling (v1).** Proper frustum culling is deferred;
-   the current walker drops any node whose AABB is more than
-   `RADIUS_VIEW_CELLS` cells from the camera, measured at the current
-   view layer. That is, the radius is
-   `RADIUS_VIEW_CELLS * cell_size_at_layer(view_layer)` Bevy units,
-   which grows by 5× per layer as you zoom out. The visible world
-   covers a roughly constant number of cells regardless of zoom —
-   ported from the 2D prototype's "viewport counts cells, not pixels"
-   behaviour. A real frustum test will replace this once it shows up
-   in a profile.
-2. **Content dedup.** Multiple entities at different world positions
-   reference the same `NodeId` and share the same mesh handle. GPU
-   upload is paid once per unique pattern, not once per entity. An
-   infinite grassland world emits thousands of entities per frame but
-   they all point at one mesh.
+| Buffer | Size | Purpose |
+|---|---|---|
+| `tree` | N × 8 B | packed children (tag, block, node_index) |
+| `node_kinds` | M × 16 B | per-node kind + sphere radii / face |
+| `ribbon` | R × 8 B | ancestor chain for frame-exit pops |
+| `camera` | 96 B | frame-local pos, basis vectors, fov |
+| `palette` | 256 × 4 B | block-type colors |
+| `uniforms` | 96 B | screen size, root index/kind, max_depth, highlight AABB, ribbon count |
 
-The frame cost is dominated by entity spawn/despawn bookkeeping and
-the per-node AABB check, not by mesh data.
+## Frame selection
 
-## Mesh cache keyed on NodeId
+`compute_render_frame` in `src/app/frame.rs` returns one of three
+`ActiveFrameKind`s:
 
-`RenderState.meshes: HashMap<NodeId, Vec<BakedSubMesh>>` caches the
-baked mesh for every `NodeId` that has ever been rendered. An entry
-survives across frames *and* across zoom layer changes — the mesh is
-a function of the node's voxel grid, nothing layer-specific.
+- **`Cartesian`** — render root is a plain 3×3×3 Cartesian node.
+  `render_path == logical_path`.
+- **`Body { inner_r, outer_r }`** — render root is a
+  `CubedSphereBody`. Rays first intersect the body sphere; inside,
+  the shader dispatches into face DDA.
+- **`Sphere(SphereFrame)`** — render root stays at the containing
+  body, but the player's `logical_path` is inside a specific face
+  subtree. The shader walks the face with an explicit `(u_min, v_min,
+  r_min, size)` window. This is what lets the player stand on a
+  planet surface without the body cell blowing the camera's f32
+  budget.
 
-Because the cache is keyed on `NodeId`, it inherits the library's
-dedup guarantee for free: every grass leaf in the world shares the
-same `NodeId`, so grassland bakes exactly one mesh regardless of how
-many entities are on screen. The same "sub-texture cache" trick the
-2D prototype uses.
+`render_path` drives the GPU ribbon. `logical_path` drives editing,
+highlight, and UI — it can be deeper than `render_path` when the
+player is inside a face subtree.
 
-v1 never evicts from this cache. Long edit sessions will grow it by
-roughly one entry per unique node ever seen; not a concern yet.
+## Precision budget
 
-## Entity management across frames
+f32 at depth 14 hits its ulp limit (1/3¹⁴ ≈ 2×10⁻⁷). This is why the
+renderer never runs in world-root coordinates. `K = 3` levels up from
+the camera's anchor gives a 27³ = ~20k-cell viewport that stays well
+inside f32. Deeper than that is rendered via *pop up the ribbon*, not
+via more precision.
 
-The renderer keeps a map of `path → entity, node_id` like the current
-`RenderState`. On each frame:
+If you need the theoretical backdrop, see
+[../principles/scaling-deep-trees.md](../principles/scaling-deep-trees.md)
+and [../history/camera-rewrite-first-principles.md](../history/camera-rewrite-first-principles.md).
 
-1. Compute the set of layer-K positions in the frustum (tree walk).
-2. For each position in the new set:
-   - If it's already rendered and the `NodeId` matches, reuse.
-   - If `NodeId` changed (ancestor edit propagation replaced this
-     subtree), despawn the old entity and spawn a new one.
-   - If it's brand new (camera moved into view), spawn.
-3. For each position in the old set but not the new set (camera
-   moved out of view, or layer changed), despawn.
+## Cache keys
 
-When `zoom.layer` changes, the whole entity set is rebuilt from
-scratch — the previous set becomes stale because every position is at
-a different layer now.
+Two structs gate expensive work:
 
-## World transforms
+- `LodUploadKey` — (root, camera anchor, offset bits, render path,
+  logical path, visual depth, kind tag). Equal to last frame ⇒ skip
+  the packer + upload.
+- `HighlightCacheKey` — (`LodUploadKey`, yaw/pitch bits, cursor
+  locked, epoch). Equal ⇒ skip the cursor raycast.
 
-Each emitted entity needs a `Transform` in Bevy's float world space.
-Transforms accumulate as the walk descends:
+## Offscreen / screenshot rendering
 
-- The root occupies some fixed region in Bevy space (decide the exact
-  scale at implementation time — most natural is "one Bevy unit = one
-  leaf voxel," but this depends on how the camera is set up).
-- Each descent multiplies the child's extent by `1/5` and adds the
-  slot's offset.
-- At layer K, a node is `(1/5)^K` of the root's extent.
-
-Precision is not a problem because the frustum is always local to the
-camera — even at deep zoom, the visible nodes are near the camera's
-world position, not out at the root's corner.
-
-## What happens when the player edits
-
-Edits change node content via the propagation walk in `editing.md`.
-Every affected ancestor mints a new `NodeId` and gets a fresh mesh. On
-the next frame, the tree walk sees the new `NodeId` at the affected
-positions and respawns the corresponding entities.
-
-The renderer does not need to be informed of edits explicitly — the
-tree walk naturally picks up the new ids because it always reads the
-current tree from the root on every frame.
-
-## What rendering doesn't need
-
-- No "dirty" flag. Meshes are always current (edit walk keeps them
-  so). The renderer never asks "has this changed?"
-- No explicit LOD management per region. Every node at `zoom.layer`
-  renders at the same scale.
-- No special handling for procedurally-generated vs edited nodes —
-  they look identical from the tree's perspective.
-- No material per entity — each `BakedSubMesh` carries its block type
-  and the renderer picks the material from a `BlockMaterials`
-  resource (same pattern as the current code).
-
-## Deferred
-
-- **Proper frustum culling.** v1 uses a "within N view cells of the
-  camera" radius test instead of a real frustum intersection. Replace
-  once it shows up in a profile.
-- **Smooth zoom transitions.** Changing `zoom.layer` is currently a
-  hard swap (the entity set is rebuilt from scratch when
-  `target_layer` changes). A cross-fade or a short interpolation frame
-  would feel nicer.
-- **Background mesh baking.** Bakes currently happen on the main
-  thread. For procedurally-rich worlds, move them to worker threads.
-  Not needed for grassland v1.
-- **Mesh cache eviction.** `RenderState.meshes` grows monotonically.
-  Fine for grassland; revisit when edit-heavy workloads start pushing
-  its size.
-- **Partial tree walks.** The walk currently re-descends from the root
-  every frame. A cached "last frame's visits" + delta-walk can limit
-  work to only the nodes entering or leaving view.
+`renderer.render_offscreen()` renders to a target texture;
+`capture_to_png` reads it back. Used by the test harness for
+deterministic screenshots. See [../testing/harness.md](../testing/harness.md).
