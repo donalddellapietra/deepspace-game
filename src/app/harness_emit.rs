@@ -18,7 +18,7 @@
 use super::App;
 use super::test_runner::ScriptCmd;
 use crate::world::anchor::{Path, WorldPos};
-use crate::world::raycast::HitInfo;
+use crate::world::edit::HitInfo;
 use crate::world::tree::slot_index;
 
 /// Format a slot path as `[13,13,13,16]`.

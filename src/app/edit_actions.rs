@@ -10,7 +10,7 @@ use crate::game_state::HotbarItem;
 use crate::world::cubesphere::FACE_SLOTS;
 use crate::world::cubesphere_local;
 use crate::world::anchor::{Path, WORLD_SIZE};
-use crate::world::{aabb, edit, raycast};
+use crate::world::edit;
 use crate::world::gpu;
 
 use super::{
@@ -89,7 +89,7 @@ impl App {
         out
     }
 
-    fn debug_hit_terminal(&self, hit: &raycast::HitInfo) -> String {
+    fn debug_hit_terminal(&self, hit: &edit::HitInfo) -> String {
         use crate::world::tree::Child;
 
         let Some(&(node_id, slot)) = hit.path.last() else {
@@ -393,12 +393,12 @@ impl App {
     /// what makes deep-zoom block placement land in the cell
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
-    pub(super) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
+    pub(super) fn frame_aware_raycast(&self) -> Option<edit::HitInfo> {
         let hit = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
                 let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
-                raycast::cpu_raycast_in_sphere_frame(
+                edit::cpu_raycast_in_sphere_frame(
                     &self.world.library,
                     self.world.root,
                     sphere.body_path.as_slice(),
@@ -424,7 +424,7 @@ impl App {
                 let frame_path = &self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(frame_path);
                 let ray_dir = self.ray_dir_in_frame(frame_path);
-                let hit = raycast::cpu_raycast_in_frame_with_budget(
+                let hit = edit::cpu_raycast_in_frame_with_budget(
                     &self.world.library,
                     self.world.root,
                     frame_path.as_slice(),
@@ -457,10 +457,10 @@ impl App {
             if let Some(ref h) = hit {
                 let (aabb_min, aabb_max) = match self.active_frame.kind {
                     ActiveFrameKind::Sphere(_) => {
-                        aabb::hit_aabb_body_local(&self.world.library, h)
+                        edit::hit_aabb_body_local(&self.world.library, h)
                     }
                     ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                        aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
+                        edit::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
                     }
                 };
                 eprintln!(
@@ -780,9 +780,9 @@ impl App {
             );
         }
         let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
-            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, hit),
+            ActiveFrameKind::Sphere(_) => edit::hit_aabb_body_local(&self.world.library, hit),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
+                edit::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
             }
         });
         let set_start = std::time::Instant::now();
