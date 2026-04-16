@@ -4,7 +4,8 @@ use crate::world::anchor::{Path, WORLD_SIZE};
 use crate::world::cubesphere::FACE_SLOTS;
 use crate::world::cubesphere_local;
 
-use super::super::{ActiveFrame, ActiveFrameKind, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
+use crate::app::frame;
+use crate::app::{ActiveFrame, ActiveFrameKind, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
 use super::{
     FRAME_FOCUS_MIN_PIXELS, FRAME_VISUAL_MIN_PIXELS, MAX_FOCUSED_FRAME_CAMERA_EXTENT,
     MAX_LOCAL_VISUAL_DEPTH,
@@ -168,7 +169,7 @@ impl App {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Sphere(sphere) => (
                 self.camera.position.in_frame(&sphere.body_path),
-                super::super::frame::frame_point_to_body([1.5, 1.5, 1.5], &sphere),
+                frame::frame_point_to_body([1.5, 1.5, 1.5], &sphere),
                 (crate::world::anchor::WORLD_SIZE * sphere.face_size).max(1e-6),
             ),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
@@ -189,7 +190,7 @@ impl App {
         let frame = self
             .camera_local_sphere_focus_path(desired_depth)
             .map(|path| {
-                super::super::frame::with_render_margin(
+                frame::with_render_margin(
                     &self.world.library,
                     self.world.root,
                     &path,
@@ -205,7 +206,7 @@ impl App {
             let logical_path = frame.logical_path;
             let mut shallower = frame.render_path;
             shallower.truncate(frame.render_path.depth().saturating_sub(1));
-            let render = super::super::frame::compute_render_frame(
+            let render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
                 &shallower,

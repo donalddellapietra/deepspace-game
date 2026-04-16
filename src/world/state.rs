@@ -1,6 +1,6 @@
 //! Runtime world state: the content-addressed tree.
 
-use super::tree::*;
+use super::tree::{Child, NodeId, NodeLibrary};
 
 pub struct WorldState {
     pub root: NodeId,

@@ -75,7 +75,7 @@ impl App {
                 let frame_path = &self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(frame_path);
                 let ray_dir = self.ray_dir_in_frame(frame_path);
-                let hit = raycast::cpu_raycast_in_frame_with_budget(
+                let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,
                     self.world.root,
                     frame_path.as_slice(),
@@ -83,7 +83,6 @@ impl App {
                     ray_dir,
                     self.edit_depth(),
                     self.cs_edit_depth(),
-                    None,
                 );
                 if hit.is_none() && self.startup_profile_frames < 16 {
                     eprintln!(

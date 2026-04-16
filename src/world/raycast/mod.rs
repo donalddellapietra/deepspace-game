@@ -49,10 +49,12 @@ pub fn cpu_raycast(
     cartesian::cpu_raycast_with_face_depth(library, root, ray_origin, ray_dir, max_depth, 6)
 }
 
-/// Frame-aware raycast. Mirrors the renderer's frame architecture so
-/// cell-precision is bounded by the frame depth (camera in `[0, 3)`
-/// regardless of absolute path), and the ray pops upward into
-/// ancestor frames when it exits the current frame's bubble.
+/// Frame-aware raycast. Mirrors the renderer's ribbon-pop
+/// architecture so the CPU hit depth matches what the shader
+/// renders (LOD-bounded, not budget-bounded): cell-precision is
+/// bounded by the frame depth (camera in `[0, 3)` regardless of
+/// absolute path), and the ray pops upward into ancestor frames
+/// when it exits the current frame's bubble.
 pub fn cpu_raycast_in_frame(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -61,27 +63,6 @@ pub fn cpu_raycast_in_frame(
     ray_dir: [f32; 3],
     max_depth: u32,
     max_face_depth: u32,
-) -> Option<HitInfo> {
-    cpu_raycast_in_frame_with_budget(
-        library, world_root, frame_path, cam_local, ray_dir,
-        max_depth, max_face_depth, None,
-    )
-}
-
-/// Frame-aware raycast that mirrors the shader's ribbon-pop
-/// architecture. Each shell's DDA descends from the shell root
-/// toward `max_depth`, bounded only by the remaining depth (no
-/// artificial per-shell budget). On miss, pops one ribbon level
-/// and retries.
-pub fn cpu_raycast_in_frame_with_budget(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    frame_path: &[u8],
-    cam_local: [f32; 3],
-    ray_dir: [f32; 3],
-    max_depth: u32,
-    max_face_depth: u32,
-    _shell_budget: Option<u32>,
 ) -> Option<HitInfo> {
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
     let effective_depth = chain.len() - 1;

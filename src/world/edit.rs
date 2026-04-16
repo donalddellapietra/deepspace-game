@@ -10,7 +10,9 @@
 use super::anchor::Path;
 use super::raycast::HitInfo;
 use super::state::WorldState;
-use super::tree::*;
+use super::tree::{
+    empty_children, slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, EMPTY_NODE,
+};
 
 /// Break (remove) the block at the hit location.
 pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {

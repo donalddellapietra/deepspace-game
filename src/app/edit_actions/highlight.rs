@@ -3,7 +3,7 @@
 
 use crate::world::aabb;
 
-use super::super::{ActiveFrameKind, App, HighlightCacheKey};
+use crate::app::{ActiveFrameKind, App, HighlightCacheKey};
 
 impl App {
     pub(in crate::app) fn update_highlight(&mut self) {

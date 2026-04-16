@@ -5,7 +5,7 @@ use crate::game_state::HotbarItem;
 use crate::world::anchor::Path;
 use crate::world::edit;
 
-use super::super::App;
+use crate::app::App;
 
 impl App {
     pub(in crate::app) fn do_break(&mut self) {

@@ -7,7 +7,10 @@
 use super::anchor::{Path, WorldPos, WORLD_SIZE};
 use super::palette::block;
 use super::state::WorldState;
-use super::tree::*;
+use super::tree::{
+    empty_children, slot_index, uniform_children, BRANCH, Child, NodeId, NodeKind, NodeLibrary,
+    MAX_DEPTH,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
