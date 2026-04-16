@@ -57,7 +57,7 @@ pub fn cpu_raycast(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
-    cpu_raycast_with_face_depth(library, root, ray_origin, ray_dir, max_depth, 6)
+    cpu_raycast_with_face_depth(library, root, ray_origin, ray_dir, max_depth, 6, f32::MAX)
 }
 
 /// Frame-aware raycast. Mirrors the renderer's frame architecture
@@ -84,19 +84,22 @@ pub fn cpu_raycast_in_frame(
 ) -> Option<HitInfo> {
     cpu_raycast_in_frame_with_budget(
         library, world_root, frame_path, cam_local, ray_dir,
-        max_depth, max_face_depth, None,
+        max_depth, max_face_depth,
     )
 }
+/// Raycast reach in frame-local units. The render frame spans
+/// `[0, 3)` per axis (3 cells). A reach of 24 means the ray can
+/// travel 8 cell-widths — roughly equivalent to Minecraft's
+/// ~5-block reach.
+const RAYCAST_REACH: f32 = 24.0;
 
-/// Frame-aware raycast that mirrors the shader's ribbon-pop
-/// architecture. Each shell's DDA descends from the shell root
-/// toward `max_depth`, bounded only by the remaining depth (no
-/// artificial per-shell budget). On miss, pops one ribbon level
-/// and retries.
-///
-/// This ensures the CPU hit depth matches what the shader renders
-/// (LOD-bounded, not budget-bounded), so edits always land at the
-/// user's zoom resolution.
+/// Maximum number of ribbon pops the CPU raycast will attempt.
+/// Each pop moves one level toward the root. The render frame is
+/// `RENDER_FRAME_K` levels above the anchor, so 6 pops covers the
+/// frame plus a few ancestor shells — enough to find walls of
+/// carved cavities without scanning the entire tree.
+const MAX_RAYCAST_POPS: usize = 6;
+
 pub fn cpu_raycast_in_frame_with_budget(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -105,7 +108,6 @@ pub fn cpu_raycast_in_frame_with_budget(
     ray_dir: [f32; 3],
     max_depth: u32,
     max_face_depth: u32,
-    _shell_budget: Option<u32>,
 ) -> Option<HitInfo> {
     // Walk world_root down frame_path collecting (parent_id, slot)
     // entries AND the chain of NodeIds. The chain is used as
@@ -135,99 +137,79 @@ pub fn cpu_raycast_in_frame_with_budget(
     let mut ray_origin = cam_local;
     let mut ray_dir = ray_dir;
     let total_max_depth = max_depth;
+    let mut pops_done: usize = 0;
 
     loop {
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth
             .saturating_sub(current_frame_depth as u32);
 
-        // Frame-root NodeKind dispatch (mirror of the renderer's
-        // root_kind). When the frame IS a sphere body, the body's
-        // children aren't Cartesian XYZ slots — they're 6 face
-        // subtrees + interior + voids. Running cpu_raycast_with_face_depth
-        // on the body would descend the face subtree as if it were
-        // Cartesian, returning bogus rep-block hits at random face
-        // cells. Dispatch directly to cs_raycast_in_body instead,
-        // with the body filling the [0, 3)³ frame.
+        // Frame-root NodeKind dispatch: sphere body vs Cartesian.
         let frame_node = library.get(frame_root_id);
         let frame_kind = frame_node.map(|n| n.kind);
         if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
-            let body_origin = [0.0f32; 3];
-            let body_size = 3.0;
-            // ancestor_path inside the inner call must be the path
-            // from the inner root (the body itself). Empty here:
-            // the body IS the root of this raycast, and the
-            // outer prepend-loop will glue on the frame entries
-            // (which include the body's parent slot).
             let inner_ancestor: Vec<(NodeId, usize)> = Vec::new();
             if let Some(mut hit) = cs_raycast_in_body(
-                library, frame_root_id, body_origin, body_size,
+                library, frame_root_id, [0.0; 3], 3.0,
                 inner_r, outer_r,
                 ray_origin, ray_dir,
                 &inner_ancestor, max_face_depth,
             ) {
-                let mut new_path: Vec<(NodeId, usize)> =
-                    Vec::with_capacity(current_frame_depth + hit.path.len());
-                new_path.extend(frame_entries.iter().take(current_frame_depth).cloned());
-                new_path.append(&mut hit.path);
-                hit.path = new_path;
-                if let Some(mut pp) = hit.place_path.take() {
-                    let mut new_pp: Vec<(NodeId, usize)> =
-                        Vec::with_capacity(current_frame_depth + pp.len());
-                    new_pp.extend(frame_entries.iter().take(current_frame_depth).cloned());
-                    new_pp.append(&mut pp);
-                    hit.place_path = Some(new_pp);
-                }
+                prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
                 return Some(hit);
             }
-            // Sphere missed in this frame — fall through to the
-            // pop logic below.
         } else if let Some(mut hit) = cpu_raycast_with_face_depth(
             library, frame_root_id, ray_origin, ray_dir,
-            inner_max, max_face_depth,
+            inner_max, max_face_depth, RAYCAST_REACH,
         ) {
-            // Prepend frame entries (from world_root down to
-            // frame_root, exclusive of frame_root).
-            let mut new_path: Vec<(NodeId, usize)> =
-                Vec::with_capacity(current_frame_depth + hit.path.len());
-            new_path.extend(frame_entries.iter().take(current_frame_depth).cloned());
-            new_path.append(&mut hit.path);
-            hit.path = new_path;
-            // Same prepend for place_path if present.
-            if let Some(mut pp) = hit.place_path.take() {
-                let mut new_pp: Vec<(NodeId, usize)> =
-                    Vec::with_capacity(current_frame_depth + pp.len());
-                new_pp.extend(frame_entries.iter().take(current_frame_depth).cloned());
-                new_pp.append(&mut pp);
-                hit.place_path = Some(new_pp);
-            }
+            prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
             return Some(hit);
         }
-        // Miss in current frame. Pop one level toward root.
-        // Single-level pops match the shader: after each pop,
-        // skip_slot only covers the immediate child (which the
-        // inner shell fully traversed). Multi-popping would skip
-        // intermediate levels containing un-traversed content
-        // (surfaces between frames become invisible).
-        if current_frame_depth == 0 {
+
+        // Miss. Pop one level toward root, up to MAX_RAYCAST_POPS.
+        if current_frame_depth == 0 || pops_done >= MAX_RAYCAST_POPS {
             return None;
         }
-        let pops = 1;
-        for _ in 0..pops {
-            let last_slot = frame_entries[current_frame_depth - 1].1;
-            let (sx, sy, sz) = slot_coords(last_slot);
-            ray_origin = [
-                sx as f32 + ray_origin[0] / 3.0,
-                sy as f32 + ray_origin[1] / 3.0,
-                sz as f32 + ray_origin[2] / 3.0,
-            ];
-            ray_dir = [
-                ray_dir[0] / 3.0,
-                ray_dir[1] / 3.0,
-                ray_dir[2] / 3.0,
-            ];
-            current_frame_depth -= 1;
-        }
+        let last_slot = frame_entries[current_frame_depth - 1].1;
+        let (sx, sy, sz) = slot_coords(last_slot);
+        ray_origin = [
+            sx as f32 + ray_origin[0] / 3.0,
+            sy as f32 + ray_origin[1] / 3.0,
+            sz as f32 + ray_origin[2] / 3.0,
+        ];
+        // ray_dir is divided by 3 on pop to match the coordinate
+        // transform, then re-normalized so `t` values remain in
+        // frame-local distance units (not inflated by accumulated
+        // ÷3 factors). Without normalization, `t` grows by 3× per
+        // pop, making RAYCAST_REACH meaningless after a few pops.
+        ray_dir = super::sdf::normalize([
+            ray_dir[0] / 3.0,
+            ray_dir[1] / 3.0,
+            ray_dir[2] / 3.0,
+        ]);
+        current_frame_depth -= 1;
+        pops_done += 1;
+    }
+}
+
+/// Prepend frame entries (root → frame_root path) to a hit's path
+/// and place_path.
+fn prepend_frame_entries(
+    hit: &mut HitInfo,
+    frame_entries: &[(NodeId, usize)],
+    depth: usize,
+) {
+    let mut new_path: Vec<(NodeId, usize)> =
+        Vec::with_capacity(depth + hit.path.len());
+    new_path.extend(frame_entries.iter().take(depth).cloned());
+    new_path.append(&mut hit.path);
+    hit.path = new_path;
+    if let Some(mut pp) = hit.place_path.take() {
+        let mut new_pp: Vec<(NodeId, usize)> =
+            Vec::with_capacity(depth + pp.len());
+        new_pp.extend(frame_entries.iter().take(depth).cloned());
+        new_pp.append(&mut pp);
+        hit.place_path = Some(new_pp);
     }
 }
 
@@ -333,6 +315,7 @@ pub fn cpu_raycast_in_sphere_frame(
                     ray_dir,
                     inner_max,
                     max_face_depth,
+                    RAYCAST_REACH,
                 )
             };
             if let Some(mut hit) = hit {
@@ -370,6 +353,9 @@ pub fn cpu_raycast_in_sphere_frame(
 /// at the deepest planet depth are sub-pixel; the cap selects the
 /// user-visible cell granularity (~3^max_face_depth cells per face
 /// axis).
+///
+/// `max_t` limits the ray's reach in frame-local units. Hits beyond
+/// `max_t` are discarded. Pass `f32::MAX` for unlimited range.
 pub fn cpu_raycast_with_face_depth(
     library: &NodeLibrary,
     root: NodeId,
@@ -377,6 +363,7 @@ pub fn cpu_raycast_with_face_depth(
     ray_dir: [f32; 3],
     max_depth: u32,
     max_face_depth: u32,
+    max_t: f32,
 ) -> Option<HitInfo> {
     let inv_dir = [
         if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
@@ -468,10 +455,14 @@ pub fn cpu_raycast_with_face_depth(
                 advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
             }
             Child::Block(_) => {
+                let t = cell_entry_t(&stack[depth], &ray_origin, &inv_dir);
+                if t > max_t {
+                    return None;
+                }
                 return Some(HitInfo {
                     path: path.clone(),
                     face: normal_face,
-                    t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                    t,
                     place_path: None,
                 });
             }
@@ -514,10 +505,14 @@ pub fn cpu_raycast_with_face_depth(
                 }
 
                 if (depth as u32 + 1) >= max_depth {
+                    let t = cell_entry_t(&stack[depth], &ray_origin, &inv_dir);
+                    if t > max_t {
+                        return None;
+                    }
                     return Some(HitInfo {
                         path: path.clone(),
                         face: normal_face,
-                        t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                        t,
                         place_path: None,
                     });
                 }
@@ -2068,14 +2063,28 @@ mod tests {
     }
 
     /// Replicate the INTERACTIVE flow: spawn at depth 8, then zoom_in
-    /// incrementally to deeper depths, raycast + break at each.
-    /// This is the exact path the player takes when zooming in.
+    /// incrementally to deeper depths, raycasting at each.
+    ///
+    /// `carve_air_pocket` creates a uniform-air subtree from the
+    /// spawn cell (depth 8) down to depth 40. Deeper frame roots sit
+    /// inside this all-air subtree. The DDA at each popped level
+    /// finds nothing until it pops above the air subtree boundary
+    /// (depth 7). With MAX_RAYCAST_POPS=6 and RENDER_FRAME_K=3, the
+    /// deepest reachable frame is depth 7+6=13 → anchor depth 16.
+    /// Beyond that the raycast correctly returns None: there's
+    /// nothing solid within reach, just as Minecraft's reach limit
+    /// prevents targeting blocks thousands of voxels away.
     #[test]
     fn frame_aware_raycast_hits_after_zoom_in_from_spawn() {
         use crate::world::bootstrap;
 
         let render_frame_k = 3u8;
         let initial_depth = 8u8;
+        // carve_air_pocket clears the cell at depth 7. The air
+        // subtree fills depths 8..40. MAX_RAYCAST_POPS=6 from
+        // frame depth 13 can pop to depth 7 (the boundary). So
+        // the max anchor depth with hits is 13 + RENDER_FRAME_K = 16.
+        let max_hittable_depth = 7u8 + MAX_RAYCAST_POPS as u8 + render_frame_k;
 
         let boot = bootstrap::bootstrap_world(
             bootstrap::WorldPreset::PlainTest,
@@ -2085,8 +2094,7 @@ mod tests {
         let mut pos = bootstrap::plain_surface_spawn(initial_depth);
         bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
 
-        // Test at each depth from initial through 38
-        for target_depth in (initial_depth + 1)..=38u8 {
+        for target_depth in (initial_depth + 1)..=30u8 {
             pos.zoom_in();
 
             let anchor_depth = pos.anchor.depth();
@@ -2111,20 +2119,94 @@ mod tests {
                 6,
             );
 
-            assert!(
-                hit.is_some(),
-                "zoom-in raycast missed at depth={target_depth}: \
-                 frame_path={:?} cam_local={:?} edit_depth={edit_depth} \
-                 anchor_slots={:?}",
-                frame_path.as_slice(), cam_local, pos.anchor.as_slice(),
-            );
-
-            let h = hit.unwrap();
-            eprintln!(
-                "zoom-in depth={target_depth}: hit path_len={} face={} t={}",
-                h.path.len(), h.face, h.t,
-            );
+            if target_depth <= max_hittable_depth {
+                assert!(
+                    hit.is_some(),
+                    "zoom-in raycast missed at depth={target_depth}: \
+                     frame_path={:?} cam_local={:?} edit_depth={edit_depth} \
+                     anchor_slots={:?}",
+                    frame_path.as_slice(), cam_local, pos.anchor.as_slice(),
+                );
+                let h = hit.unwrap();
+                eprintln!(
+                    "zoom-in depth={target_depth}: hit path_len={} face={} t={}",
+                    h.path.len(), h.face, h.t,
+                );
+            } else {
+                // Beyond pop range: the air pocket has no solid
+                // content within MAX_RAYCAST_POPS. Correctly None.
+                assert!(
+                    hit.is_none(),
+                    "expected miss at depth={target_depth} (beyond pop range), \
+                     but got a hit",
+                );
+            }
         }
+    }
+
+    /// Deep raycast with solid content within reach. This simulates
+    /// the real gameplay scenario: the player breaks blocks at their
+    /// current zoom level, so walls are always nearby. Here we build
+    /// a world with a single empty cell (the camera's) surrounded by
+    /// 26 solid siblings at a deep depth, and verify the raycast
+    /// finds the adjacent solid cell without any pops.
+    #[test]
+    fn deep_raycast_hits_nearby_solid() {
+        let depth: usize = 35;
+        let mut lib = NodeLibrary::default();
+
+        // Build a solid subtree extending below the target depth.
+        let solid_child = lib.build_uniform_subtree(block::STONE, (depth - 1) as u32);
+
+        // Build the target-depth node: one empty cell (camera slot),
+        // 26 solid cells around it.
+        let camera_slot = slot_index(1, 1, 1); // center
+        let mut children = uniform_children(solid_child);
+        children[camera_slot] = Child::Empty;
+        let mut root = lib.insert(children);
+
+        // Wrap in ancestor nodes up to the root.
+        for _ in 0..(depth - 1) {
+            let mut c = uniform_children(solid_child);
+            c[camera_slot] = Child::Node(root);
+            root = lib.insert(c);
+        }
+
+        // Camera at center of the frame, looking -Z.
+        let frame_depth = depth.saturating_sub(3);
+        let mut frame_path = crate::world::anchor::Path::root();
+        for _ in 0..frame_depth {
+            frame_path.push(camera_slot as u8);
+        }
+
+        // Camera is 3 levels below frame: (1 + (1 + (1+0.5)/3)/3)/3... = 1.5
+        let cam_local = [1.5, 1.5, 1.5];
+        let ray_dir = crate::world::sdf::normalize([0.0, 0.0, -1.0]);
+
+        let hit = cpu_raycast_in_frame(
+            &lib,
+            root,
+            frame_path.as_slice(),
+            cam_local,
+            ray_dir,
+            depth as u32,
+            6,
+        );
+
+        assert!(
+            hit.is_some(),
+            "raycast at depth={depth} should find adjacent solid cell"
+        );
+        let h = hit.unwrap();
+        assert!(
+            h.t < RAYCAST_REACH,
+            "hit t={} should be within RAYCAST_REACH={}",
+            h.t, RAYCAST_REACH,
+        );
+        eprintln!(
+            "deep_raycast depth={}: hit path_len={} face={} t={}",
+            depth, h.path.len(), h.face, h.t,
+        );
     }
 
     #[test]

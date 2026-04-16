@@ -432,7 +432,6 @@ impl App {
                     ray_dir,
                     self.edit_depth(),
                     self.cs_edit_depth(),
-                    None,
                 );
                 if hit.is_none() && self.startup_profile_frames < 16 {
                     eprintln!(
