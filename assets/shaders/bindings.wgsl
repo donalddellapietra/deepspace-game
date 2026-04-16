@@ -49,12 +49,20 @@ const ROOT_KIND_BODY: u32 = 1u;
 const ROOT_KIND_FACE: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
-/// index of the ancestor's node; `slot` is the slot in that
-/// ancestor that contained the level we're popping FROM.
+/// index of the ancestor's node. `slot_bits` packs:
+/// - low 5 bits: slot (0..27) of the child we're popping FROM
+/// - bit 31: `siblings_all_empty` — when set, every other slot of
+///   `node_idx` has tag=0 (Empty). The shader uses this to fast-
+///   exit the whole shell with a single ray–box intersection,
+///   bypassing the DDA across ~3–5 empty cells per shell that
+///   otherwise compounds linearly with ribbon depth.
 struct RibbonEntry {
     node_idx: u32,
-    slot: u32,
+    slot_bits: u32,
 }
+
+const RIBBON_SLOT_MASK: u32 = 0x1Fu;
+const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
     kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace

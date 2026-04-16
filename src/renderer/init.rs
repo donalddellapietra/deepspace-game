@@ -20,6 +20,7 @@ impl Renderer {
         shader_stats_enabled: bool,
         lod_pixel_threshold: f32,
         lod_base_depth: u32,
+        live_sample_every_frames: u32,
     ) -> Self {
         let size = window.inner_size();
 
@@ -149,7 +150,7 @@ impl Renderer {
         // allocate one stub entry).
         let ribbon_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ribbon"),
-            contents: bytemuck::cast_slice(&[GpuRibbonEntry { node_idx: 0, slot: 0 }]),
+            contents: bytemuck::cast_slice(&[GpuRibbonEntry { node_idx: 0, slot_bits: 0 }]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -343,6 +344,8 @@ impl Renderer {
             shader_stats_buffer,
             shader_stats_readback,
             shader_stats_enabled,
+            live_frame_counter: 0,
+            live_sample_every_frames,
         }
     }
 }

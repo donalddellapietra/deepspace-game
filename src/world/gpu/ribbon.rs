@@ -25,16 +25,45 @@ use super::types::{GpuChild, GPU_NODE_SIZE};
 /// frame upward; `ribbon[0]` is the frame's direct parent, then
 /// `ribbon[1]` the grandparent, etc., up to the absolute root.
 ///
-/// `node_idx` is the buffer index of the ancestor's node. `slot`
-/// is the slot in the ancestor that contained the level the ray
-/// is popping FROM — the shader uses `slot_coords(slot)` to add
-/// the integer offset when remapping the ray into the ancestor's
-/// frame.
+/// `node_idx` is the buffer index of the ancestor's node.
+///
+/// `slot_bits` packs two things into a u32:
+/// - Low 5 bits: slot (0..27) in the ancestor that contained the
+///   level the ray is popping FROM.
+/// - Bit 31: `siblings_all_empty` flag. When set, every child slot
+///   of the ancestor OTHER than `slot` is `tag=0` (Empty). The
+///   shader uses this to fast-exit the whole shell with a single
+///   ray–box intersection instead of DDA-traversing empty cells.
+///   Matters for the "zoomed-in inside empty sky" workload where
+///   rays need to pop through many ancestor shells before finding
+///   any content; without this flag each shell costs ~3–5 empty
+///   DDA iterations, compounding linearly with ribbon depth.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq, Eq)]
 pub struct GpuRibbonEntry {
     pub node_idx: u32,
-    pub slot: u32,
+    pub slot_bits: u32,
+}
+
+/// Bit mask for the `siblings_all_empty` flag in `slot_bits`.
+pub const SIBLINGS_ALL_EMPTY_BIT: u32 = 1 << 31;
+/// Bit mask isolating the slot index (0..27) in `slot_bits`.
+pub const SLOT_MASK: u32 = 0x1F;
+
+impl GpuRibbonEntry {
+    pub fn new(node_idx: u32, slot: u8, siblings_all_empty: bool) -> Self {
+        let flags = if siblings_all_empty { SIBLINGS_ALL_EMPTY_BIT } else { 0 };
+        Self {
+            node_idx,
+            slot_bits: (slot as u32) | flags,
+        }
+    }
+
+    pub fn slot(&self) -> u32 { self.slot_bits & SLOT_MASK }
+
+    pub fn siblings_all_empty(&self) -> bool {
+        (self.slot_bits & SIBLINGS_ALL_EMPTY_BIT) != 0
+    }
 }
 
 /// What `build_ribbon` returns: the chosen frame root in the
@@ -81,12 +110,27 @@ pub fn build_ribbon(tree: &[GpuChild], frame_slots: &[u8]) -> RibbonResult {
     for pop in 0..depth {
         let ancestor_idx = walk[depth - 1 - pop];
         let slot = reached_slots[depth - 1 - pop];
-        ribbon.push(GpuRibbonEntry {
-            node_idx: ancestor_idx,
-            slot: slot as u32,
-        });
+        let siblings_all_empty =
+            siblings_all_empty(tree, ancestor_idx, slot);
+        ribbon.push(GpuRibbonEntry::new(ancestor_idx, slot, siblings_all_empty));
     }
     RibbonResult { frame_root_idx, ribbon, reached_slots }
+}
+
+/// True when every child of `node_idx` other than `popped_slot`
+/// has `tag == 0` (Empty). Used by the shader to fast-exit whole
+/// ancestor shells via ray–box on ribbon pop, bypassing the DDA
+/// that would otherwise traverse ~3–5 empty cells per shell. The
+/// packer already flattens uniform-empty subtrees to tag=0 so this
+/// is a cheap 26-slot scan over already-flat data.
+fn siblings_all_empty(tree: &[GpuChild], node_idx: u32, popped_slot: u8) -> bool {
+    let base = (node_idx as usize) * GPU_NODE_SIZE;
+    if base + GPU_NODE_SIZE > tree.len() { return false; }
+    for slot in 0..GPU_NODE_SIZE {
+        if slot == popped_slot as usize { continue; }
+        if tree[base + slot].tag != 0 { return false; }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -129,7 +173,11 @@ mod tests {
         let RibbonResult { frame_root_idx: frame_idx, ribbon, .. } = build_ribbon(&tree, &[13]);
         assert_eq!(frame_idx, 1);
         assert_eq!(ribbon.len(), 1);
-        assert_eq!(ribbon[0], GpuRibbonEntry { node_idx: 0, slot: 13 });
+        assert_eq!(ribbon[0].node_idx, 0);
+        assert_eq!(ribbon[0].slot(), 13);
+        // The test tree has slot 13 = Node, all other slots = Empty.
+        // With slot 13 popped, the remaining 26 are Empty → flag set.
+        assert!(ribbon[0].siblings_all_empty());
     }
 
     #[test]
@@ -154,8 +202,10 @@ mod tests {
         assert_eq!(ribbon.len(), 2);
         // Pop order: ribbon[0] = direct parent (idx 1, came from
         // slot 8); ribbon[1] = grandparent (idx 0, came from slot 16).
-        assert_eq!(ribbon[0], GpuRibbonEntry { node_idx: 1, slot: 8 });
-        assert_eq!(ribbon[1], GpuRibbonEntry { node_idx: 0, slot: 16 });
+        assert_eq!(ribbon[0].node_idx, 1);
+        assert_eq!(ribbon[0].slot(), 8);
+        assert_eq!(ribbon[1].node_idx, 0);
+        assert_eq!(ribbon[1].slot(), 16);
     }
 
     #[test]
@@ -202,7 +252,7 @@ mod tests {
         assert!(frame_idx > 0, "body packed at non-zero index");
         assert_eq!(ribbon.len(), 1);
         assert_eq!(ribbon[0].node_idx, 0, "world root at index 0");
-        assert_eq!(ribbon[0].slot, 13);
+        assert_eq!(ribbon[0].slot(), 13);
     }
 
     #[test]

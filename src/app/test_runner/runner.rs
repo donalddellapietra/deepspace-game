@@ -191,6 +191,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         cfg.shader_stats,
         cfg.lod_pixels.unwrap_or(1.0),
         cfg.lod_base_depth.unwrap_or(4),
+        cfg.live_sample_every_frames.unwrap_or(0),
     ));
     let mut renderer = renderer;
     renderer.resize(app.harness_width, app.harness_height);

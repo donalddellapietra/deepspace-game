@@ -103,6 +103,15 @@ pub struct Renderer {
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
     /// override so there's no per-pixel cost either.
     pub(super) shader_stats_enabled: bool,
+    /// Rolling counter of live-surface frames rendered. Used by
+    /// `render()` to periodically emit a `render_live_sample` line
+    /// with per-phase CPU timings, so we can see the steady-state
+    /// breakdown without waiting for a slow frame.
+    pub(super) live_frame_counter: u64,
+    /// When > 0, `render()` emits a `render_live_sample` every N
+    /// frames. CPU-side only — no `device.poll(Wait)` stall. Set via
+    /// `--live-sample-every N` CLI flag; 0 (default) disables.
+    pub(super) live_sample_every_frames: u32,
 }
 
 /// GPU timestamp query resources. `query_set` holds two timestamp

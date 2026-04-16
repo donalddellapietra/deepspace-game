@@ -155,6 +155,7 @@ impl App {
                 shader_stats_enabled,
                 lod_pixel_threshold,
                 lod_base_depth,
+                self.live_sample_every_frames,
             ),
         );
         let renderer_elapsed = renderer_start.elapsed();

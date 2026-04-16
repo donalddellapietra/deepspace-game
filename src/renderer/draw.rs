@@ -197,6 +197,25 @@ impl Renderer {
             } else {
                 (None, None, ShaderStatsFrame::default())
             };
+        // Periodic steady-state sample: CPU-side timings only, no
+        // device.poll(Wait) stall. Gives us acquire/encode/submit/
+        // present/total on NORMAL frames, not just slow ones — which
+        // is what we need to diagnose where the 16 ms budget is spent
+        // at 60 FPS.
+        self.live_frame_counter = self.live_frame_counter.wrapping_add(1);
+        let sample = self.live_sample_every_frames > 0
+            && self.live_frame_counter % self.live_sample_every_frames as u64 == 0;
+        if sample && !slow {
+            eprintln!(
+                "render_live_sample frame={} acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2}",
+                self.live_frame_counter,
+                acquire_elapsed.as_secs_f64() * 1000.0,
+                encode_elapsed.as_secs_f64() * 1000.0,
+                submit_elapsed.as_secs_f64() * 1000.0,
+                present_elapsed.as_secs_f64() * 1000.0,
+                frame_elapsed.as_secs_f64() * 1000.0,
+            );
+        }
         if slow {
             eprintln!(
                 "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} gpu_pass_ms={} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={} avg_oob={:.1} avg_empty={:.1} avg_descend={:.1} avg_lod_terminal={:.1}",

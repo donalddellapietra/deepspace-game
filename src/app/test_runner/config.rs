@@ -77,6 +77,13 @@ pub struct TestConfig {
     /// interaction range scale with your current zoom, same as the
     /// LOD shells — symmetric cursor/interaction gate.
     pub interaction_radius: Option<u32>,
+    /// When set and > 0, the live-surface render path emits a
+    /// `render_live_sample` line every N frames (CPU-side phase
+    /// timings only — no `device.poll(Wait)` stall). Lets us see
+    /// the steady-state breakdown at 60 FPS without waiting for
+    /// the `renderer_slow` 30 ms threshold. `None` or `Some(0)`
+    /// disables.
+    pub live_sample_every_frames: Option<u32>,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -203,6 +210,9 @@ impl TestConfig {
                 }
                 "--interaction-radius" => {
                     cfg.interaction_radius = args.next().and_then(|v| v.parse().ok());
+                }
+                "--live-sample-every" => {
+                    cfg.live_sample_every_frames = args.next().and_then(|v| v.parse().ok());
                 }
                 _ => {}
             }

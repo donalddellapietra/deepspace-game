@@ -392,7 +392,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             let body_pop_level = uniforms.root_face_meta.y;
             if ribbon_level < body_pop_level {
                 let entry = ribbon[ribbon_level];
-                let s = entry.slot;
+                let s = entry.slot_bits & RIBBON_SLOT_MASK;
                 let sx = i32(s % 3u);
                 let sy = i32((s / 3u) % 3u);
                 let sz = i32(s / 9u);
@@ -419,39 +419,67 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             outer_r = node_kinds[current_idx].outer_r;
             ribbon_level = body_pop_level + 1u;
         } else {
-            // Single-level ribbon pop: pop exactly 1 ancestor entry
-            // per outer-loop iteration, then re-enter march_cartesian.
-            // skip_slot correctly covers only the immediate child
-            // (which the prior march_cartesian fully traversed via
-            // LOD-bounded DDA). Multi-pop would skip intermediate
-            // levels containing un-traversed surface detail.
-            var pops: u32 = 0u;
-            loop {
-                if pops >= 1u { break; }
-                if ribbon_level >= uniforms.ribbon_count { break; }
-
+            // Single-level ribbon pop with empty-shell fast-exit.
+            //
+            // Pop exactly one ancestor entry, transform the ray into
+            // the ancestor's [0,3)³ frame, then fall through to the
+            // outer loop which re-enters march_cartesian. When the
+            // ribbon entry's `siblings_all_empty` flag is set, every
+            // slot of the ancestor other than the one we popped out
+            // of is tag=0 — so the DDA would only traverse empty
+            // cells. Skip it: ray_box to the shell exit, advance
+            // ray_origin, and let the outer loop pop again.
+            //
+            // This is the "zoomed-in inside empty sky" fast path.
+            // Without it, each empty ancestor shell costs ~3–5 empty
+            // DDA iterations, compounding linearly with ribbon depth
+            // (10+ shells in the regressed workload).
+            if ribbon_level < uniforms.ribbon_count {
                 let entry = ribbon[ribbon_level];
-                let s = entry.slot;
+                let s = entry.slot_bits & RIBBON_SLOT_MASK;
                 let sx = i32(s % 3u);
                 let sy = i32((s / 3u) % 3u);
                 let sz = i32(s / 9u);
                 let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
-                skip_slot = entry.slot;
+                skip_slot = s;
                 ray_origin = slot_off + ray_origin / 3.0;
                 ray_dir = ray_dir / 3.0;
                 cur_scale = cur_scale * (1.0 / 3.0);
                 current_idx = entry.node_idx;
                 ribbon_level = ribbon_level + 1u;
-                pops = pops + 1u;
 
                 let k = node_kinds[current_idx].kind;
                 if k == 1u {
                     current_kind = ROOT_KIND_BODY;
                     inner_r = node_kinds[current_idx].inner_r;
                     outer_r = node_kinds[current_idx].outer_r;
-                    break;
+                } else {
+                    current_kind = ROOT_KIND_CARTESIAN;
+                    // Empty-shell fast exit: if every sibling is
+                    // empty, skip this shell's DDA and advance the
+                    // ray to the shell's exit boundary. Next outer
+                    // iteration will pop again.
+                    let siblings_all_empty =
+                        (entry.slot_bits & RIBBON_SIBLINGS_ALL_EMPTY) != 0u;
+                    if siblings_all_empty {
+                        let inv_dir_shell = vec3<f32>(
+                            select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+                            select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+                            select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+                        );
+                        let shell_hit = ray_box(
+                            ray_origin, inv_dir_shell,
+                            vec3<f32>(0.0), vec3<f32>(3.0),
+                        );
+                        if shell_hit.t_exit > 0.0 {
+                            // Advance past the shell boundary so the
+                            // next pop lands us OUTSIDE this shell's
+                            // [0,3)³ in grandparent coords.
+                            ray_origin = ray_origin + ray_dir * (shell_hit.t_exit + 0.001);
+                            if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+                        }
+                    }
                 }
-                current_kind = ROOT_KIND_CARTESIAN;
             }
         }
     }
