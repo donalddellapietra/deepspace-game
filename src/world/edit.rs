@@ -633,16 +633,26 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
         return propagate_edit(world, &place_hit, new_child);
     }
 
-    // Cross-node: compute world-space target center and look up from root.
-    let (aabb_min, aabb_max) = hit_aabb(&world.library, hit);
-    let cell_size = aabb_max[0] - aabb_min[0];
-    let target = [
-        (aabb_min[0] + aabb_max[0]) * 0.5 + dx as f32 * cell_size,
-        (aabb_min[1] + aabb_max[1]) * 0.5 + dy as f32 * cell_size,
-        (aabb_min[2] + aabb_max[2]) * 0.5 + dz as f32 * cell_size,
-    ];
+    // Cross-node: use pure slot/path arithmetic — no f32 coordinates.
+    // Build a Path from the hit's slot indices, step it in the face
+    // normal direction (with carry/borrow propagation), then walk the
+    // tree along the new path.
+    let (axis, direction) = match hit.face {
+        0 => (0usize, 1i32),
+        1 => (0, -1),
+        2 => (1, 1),
+        3 => (1, -1),
+        4 => (2, 1),
+        5 => (2, -1),
+        _ => return false,
+    };
+    let mut target_path = Path::root();
+    for &(_, slot) in &hit.path {
+        target_path.push(slot as u8);
+    }
+    target_path.step_neighbor_cartesian(axis, direction);
 
-    place_child_at_point(world, target, hit.path.len(), new_child)
+    place_child_at_path(world, &target_path, new_child)
 }
 
 /// Place a block adjacent to the hit face. Builds a uniform subtree
@@ -685,35 +695,26 @@ fn depth_of_node(library: &super::tree::NodeLibrary, id: super::tree::NodeId) ->
     }
 }
 
-/// Place a block at the given world-space point, descending `depth`
-/// levels from root. If the path crosses empty subtrees, intermediate
-/// nodes are materialized automatically.
-fn place_child_at_point(
+/// Place a block at the position identified by a slot path. Walks the
+/// tree along the path, materializing empty intermediate nodes as
+/// needed. Uses pure integer slot arithmetic — no f32 coordinates —
+/// so it works at all 63 layers without precision loss.
+fn place_child_at_path(
     world: &mut WorldState,
-    target: [f32; 3],
-    depth: usize,
+    target_path: &Path,
     new_child: Child,
 ) -> bool {
-    // Bounds check: must be inside root [0, 3).
-    if target[0] < 0.0 || target[0] >= 3.0
-        || target[1] < 0.0 || target[1] >= 3.0
-        || target[2] < 0.0 || target[2] >= 3.0
-    {
+    let target_depth = target_path.depth() as usize;
+    if target_depth == 0 {
         return false;
     }
+    let slots = target_path.as_slice();
 
-    let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(depth);
+    let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(target_depth);
     let mut current_id = world.root;
-    let mut origin = [0.0f32; 3];
-    let mut cell_size = 1.0f32;
 
-    for level in 0..depth {
-        let cell = [
-            ((target[0] - origin[0]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[1] - origin[1]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[2] - origin[2]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-        ];
-        let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
+    for level in 0..target_depth {
+        let slot = slots[level] as usize;
         path.push((current_id, slot));
 
         let node = match world.library.get(current_id) {
@@ -721,45 +722,27 @@ fn place_child_at_point(
             None => return false,
         };
 
-        let is_last = level == depth - 1;
+        let is_last = level == target_depth - 1;
 
         match node.children[slot] {
             Child::Node(child_id) if !is_last => {
-                origin = [
-                    origin[0] + cell[0] as f32 * cell_size,
-                    origin[1] + cell[1] as f32 * cell_size,
-                    origin[2] + cell[2] as f32 * cell_size,
-                ];
-                cell_size /= 3.0;
                 current_id = child_id;
             }
             child if is_last && is_placeable(&world.library, child) => {
-                // Target cell is empty (or all-empty subtree) — place directly.
                 let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
                 return propagate_edit(world, &place_hit, new_child);
             }
             child if !is_last && is_placeable(&world.library, child) => {
-                // Empty subtree but we need to go deeper. Build a chain
-                // of empty nodes with the child at the target position.
-                let child_origin = [
-                    origin[0] + cell[0] as f32 * cell_size,
-                    origin[1] + cell[1] as f32 * cell_size,
-                    origin[2] + cell[2] as f32 * cell_size,
-                ];
-                let remaining = depth - level - 1;
-                let chain_id = build_placement_chain(
-                    world,
-                    target,
-                    child_origin,
-                    cell_size / 3.0,
-                    remaining,
-                    new_child,
+                // Empty subtree — build a chain of empty nodes with
+                // the target block at the correct slot at each level.
+                let remaining_slots = &slots[level + 1..target_depth];
+                let chain_id = build_placement_chain_from_slots(
+                    world, remaining_slots, new_child,
                 );
                 let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
                 return propagate_edit(world, &place_hit, Child::Node(chain_id));
             }
             _ => {
-                // Block or occupied Node at target — can't place here.
                 return false;
             }
         }
@@ -768,39 +751,17 @@ fn place_child_at_point(
     false
 }
 
-/// Build a chain of `remaining` empty-children nodes with one block
-/// placed at the position determined by `target` coordinates.
-/// Returns the NodeId of the top of the chain.
-fn build_placement_chain(
+/// Build a chain of empty nodes along `slots`, placing `leaf_child`
+/// at the deepest level. Pure slot arithmetic, no f32.
+fn build_placement_chain_from_slots(
     world: &mut WorldState,
-    target: [f32; 3],
-    mut origin: [f32; 3],
-    mut cell_size: f32,
-    remaining: usize,
+    slots: &[u8],
     leaf_child: Child,
 ) -> NodeId {
-    let mut slots = Vec::with_capacity(remaining);
-    for _ in 0..remaining {
-        let cell = [
-            ((target[0] - origin[0]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[1] - origin[1]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-            ((target[2] - origin[2]) / cell_size).floor().clamp(0.0, 2.0) as i32,
-        ];
-        let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
-        slots.push(slot);
-        origin = [
-            origin[0] + cell[0] as f32 * cell_size,
-            origin[1] + cell[1] as f32 * cell_size,
-            origin[2] + cell[2] as f32 * cell_size,
-        ];
-        cell_size /= 3.0;
-    }
-
-    // Build bottom-up: leaf child at the deepest level, wrapped in empty nodes.
     let mut child = leaf_child;
     for &slot in slots.iter().rev() {
         let mut children = empty_children();
-        children[slot] = child;
+        children[slot as usize] = child;
         let id = world.library.insert(children);
         child = Child::Node(id);
     }
@@ -2180,5 +2141,100 @@ mod tests {
             !place_block(&mut world, &hit, block::BRICK),
             "Should reject placement outside world bounds"
         );
+    }
+
+    /// Cross-node placement must work identically at shallow and deep
+    /// layers. The old f32-based `place_child_at_point` lost precision
+    /// past depth ~23; the new path-based `place_child_at_path` uses
+    /// pure slot arithmetic and works at all 63 layers.
+    #[test]
+    fn cross_node_placement_works_at_depth_40() {
+        use crate::world::anchor::Path;
+
+        let depth: usize = 40;
+        let mut lib = NodeLibrary::default();
+        let solid = lib.build_uniform_subtree(block::BRICK, depth as u32);
+
+        // Root: only slot (0,1,1) is solid; (1,1,1) is empty.
+        let mut root_children = empty_children();
+        root_children[slot_index(0, 1, 1)] = solid;
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+        let mut world = WorldState { root, library: lib };
+
+        // Build a hit path at depth 40 along x=2 at every level
+        // inside the solid subtree. The carry from stepping +X at
+        // depth 40 propagates all the way up to root, crossing from
+        // slot (0,1,1) to (1,1,1) — which is empty.
+        let mut path = Vec::new();
+        let mut current = root;
+        for level in 0..depth {
+            let slot = if level == 0 {
+                slot_index(0, 1, 1) // enter solid at root
+            } else {
+                slot_index(2, 1, 1) // rightmost x at every deeper level
+            };
+            path.push((current, slot));
+            if let Some(node) = world.library.get(current) {
+                if let Child::Node(child_id) = node.children[slot] {
+                    current = child_id;
+                }
+            }
+        }
+
+        let hit = HitInfo {
+            path: path.clone(),
+            face: 0, // +X
+            t: 1.0,
+            place_path: None,
+        };
+
+        let result = place_block(&mut world, &hit, block::STONE);
+        assert!(result, "Cross-node placement at depth {} must succeed", depth);
+
+        // Verify the block landed at the expected path.
+        let mut verify_path = Path::root();
+        for &(_, slot) in &path {
+            verify_path.push(slot as u8);
+        }
+        verify_path.step_neighbor_cartesian(0, 1);
+
+        // The stepped path should start with slot (1,1,1) at root
+        // (crossed from x=0 to x=1) and then (0,1,1) at every
+        // deeper level (all x=2 wrapped to x=0).
+        assert_eq!(
+            verify_path.as_slice()[0],
+            slot_index(1, 1, 1) as u8,
+            "root slot must cross from x=0 to x=1"
+        );
+        for d in 1..depth {
+            assert_eq!(
+                verify_path.as_slice()[d],
+                slot_index(0, 1, 1) as u8,
+                "depth {} must wrap x=2 to x=0", d + 1,
+            );
+        }
+
+        // Walk the tree to verify the block exists.
+        let placed_slots = verify_path.as_slice();
+        let mut node_id = world.root;
+        for (i, &slot) in placed_slots.iter().enumerate() {
+            let node = world.library.get(node_id).expect("node must exist");
+            let child = node.children[slot as usize];
+            if i == placed_slots.len() - 1 {
+                assert!(
+                    !matches!(child, Child::Empty),
+                    "Placed block at depth {} must not be empty (slot {})",
+                    i + 1, slot,
+                );
+            } else if let Child::Node(next) = child {
+                node_id = next;
+            } else {
+                panic!(
+                    "Expected Node at depth {} slot {}, got {:?}",
+                    i + 1, slot, child,
+                );
+            }
+        }
     }
 }
