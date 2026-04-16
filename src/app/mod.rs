@@ -232,16 +232,7 @@ impl App {
             position.anchor.depth(),
         );
         let spawn_yaw = test_cfg.spawn_yaw.unwrap_or(bootstrap.default_spawn_yaw);
-        let spawn_pitch = test_cfg.spawn_pitch.unwrap_or_else(|| {
-            // Deep plain worlds: use a steeper pitch (-1.2) so the
-            // camera looks down at block boundaries. At shallow depths,
-            // use the bootstrap default.
-            if bootstrap.plain_layers > 0 && test_cfg.spawn_depth.map_or(false, |d| d > 10) {
-                -1.2
-            } else {
-                bootstrap.default_spawn_pitch
-            }
-        });
+        let spawn_pitch = test_cfg.spawn_pitch.unwrap_or(bootstrap.default_spawn_pitch);
         eprintln!(
             "spawn: anchor_depth={} slots={:?} offset={:?} yaw={} pitch={}",
             anchor_depth, position.anchor.as_slice(), position.offset,

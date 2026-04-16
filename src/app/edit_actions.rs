@@ -649,15 +649,7 @@ impl App {
 
             if let Some(renderer) = &mut self.renderer {
                 renderer.update_tree(&tree_data, &node_kinds, r.frame_root_idx);
-                // Cap ribbon to limit GPU shell count. Each shell
-                // pops SHELL_BUDGET entries; 5 shells = 5 march calls.
-                let max_ribbon = (5 * SHELL_BUDGET) as usize;
-                let capped_ribbon = if r.ribbon.len() > max_ribbon {
-                    &r.ribbon[..max_ribbon]
-                } else {
-                    &r.ribbon
-                };
-                renderer.update_ribbon(capped_ribbon);
+                renderer.update_ribbon(&r.ribbon);
             }
             if self.render_harness {
                 eprintln!(

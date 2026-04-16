@@ -469,13 +469,17 @@ pub fn cpu_raycast_with_face_depth(
                     continue;
                 }
 
+                // Short-circuit fully-empty subtrees at any depth.
+                // Without this, the DDA descends into uniform-air
+                // nodes recursively, visiting O(3^depth) leaf cells
+                // before escaping — easily exceeding the iteration
+                // budget for deep carved cavities.
+                if child_node.representative_block == 255 {
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
+
                 if (depth as u32 + 1) >= max_depth {
-                    // At max depth, treat node as solid — unless its
-                    // subtree is all-empty (dominant_block == 255).
-                    if child_node.representative_block == 255 {
-                        advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
-                        continue;
-                    }
                     return Some(HitInfo {
                         path: path.clone(),
                         face: normal_face,
