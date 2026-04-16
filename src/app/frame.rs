@@ -299,7 +299,10 @@ pub fn with_render_margin(
     let min_render_depth = match logical.kind {
         ActiveFrameKind::Sphere(sphere) => (sphere.body_path.depth() + 1).min(logical.logical_path.depth()),
         ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
-        ActiveFrameKind::Cartesian => 0,
+        // Cartesian frames can stay fully local: ancestor visibility
+        // comes from ribbon popping, so forcing a shallower fixed-margin
+        // root just inflates the marched bubble and tanks perf.
+        ActiveFrameKind::Cartesian => logical.logical_path.depth(),
     };
     let render_depth = logical
         .logical_path

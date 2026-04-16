@@ -257,11 +257,12 @@ pub fn pack_tree_lod_preserving(
 mod tests {
     use super::*;
     use crate::world::anchor::WorldPos;
+    use crate::world::bootstrap::plain_test_world;
     use crate::world::tree::{empty_children, uniform_children, CENTER_SLOT};
 
     #[test]
     fn pack_test_world() {
-        let world = crate::world::state::WorldState::test_world();
+        let world = plain_test_world();
         let (data, kinds, root_idx) = pack_tree(&world.library, world.root);
         assert_eq!(data.len() % 27, 0);
         assert_eq!(root_idx, 0);

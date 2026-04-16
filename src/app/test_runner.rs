@@ -15,6 +15,11 @@
 //!                         visible instead of hidden.
 //! --disable-overlay       Keep the native window/surface path, but skip
 //!                         WKWebView creation and overlay flushing.
+//! --plain-world           Start in the Cartesian plain test world instead
+//!                         of the default sphere demo world.
+//! --sphere-world          Explicitly select the default sphere demo world.
+//! --plain-layers N        Layer count for the Cartesian plain preset.
+//!                         Default: 40.
 //! --spawn-depth N         Camera anchor starts at depth N (default 4).
 //! --screenshot PATH       Capture the rendered frame to PATH (PNG)
 //!                         after the warm-up + script settle, then exit.
@@ -60,11 +65,15 @@
 //!     --script "wait:30,break,wait:30" --exit-after-frames 90
 //! ```
 
+use crate::world::bootstrap::{WorldPreset, DEFAULT_PLAIN_LAYERS};
+
 #[derive(Default, Debug, Clone)]
 pub struct TestConfig {
     pub render_harness: bool,
     pub show_window: bool,
     pub disable_overlay: bool,
+    pub world_preset: WorldPreset,
+    pub plain_layers: Option<u8>,
     pub spawn_depth: Option<u8>,
     /// Explicit camera world-XYZ at spawn. Positions the camera
     /// at a specific point regardless of zoom level — since the
@@ -118,6 +127,15 @@ impl TestConfig {
                 }
                 "--disable-overlay" => {
                     cfg.disable_overlay = true;
+                }
+                "--plain-world" => {
+                    cfg.world_preset = WorldPreset::PlainTest;
+                }
+                "--sphere-world" => {
+                    cfg.world_preset = WorldPreset::DemoSphere;
+                }
+                "--plain-layers" => {
+                    cfg.plain_layers = args.next().and_then(|v| v.parse().ok());
                 }
                 "--spawn-depth" => {
                     cfg.spawn_depth = args.next().and_then(|v| v.parse().ok());
@@ -178,6 +196,10 @@ impl TestConfig {
             }
         }
         cfg
+    }
+
+    pub fn plain_layers(&self) -> u8 {
+        self.plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)
     }
 
     /// True if any flag asks the test runner to take action.
@@ -523,7 +545,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         let t_highlight = t2.elapsed().as_secs_f64() * 1000.0;
 
         let t3 = std::time::Instant::now();
-        if let Some(renderer) = &app.renderer {
+        if let Some(renderer) = &mut app.renderer {
             renderer.render_offscreen();
         }
         let t_render = t3.elapsed().as_secs_f64() * 1000.0;

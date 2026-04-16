@@ -18,10 +18,10 @@ use super::{
     RENDER_FRAME_MAX_DEPTH,
 };
 
-const MAX_LOCAL_VISUAL_DEPTH: u32 = 8;
+const MAX_LOCAL_VISUAL_DEPTH: u32 = 1;
 const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
-const FRAME_VISUAL_MIN_PIXELS: f32 = 3.0;
-const SPHERE_FOCUS_MIN_PIXELS: f32 = 24.0;
+const FRAME_VISUAL_MIN_PIXELS: f32 = 9.0;
+const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
 
 impl App {
     fn debug_path_kinds(&self, path: &Path) -> Vec<String> {
@@ -144,7 +144,7 @@ impl App {
     }
 
     fn camera_local_sphere_focus_path(&self, desired_depth: u8) -> Option<Path> {
-        let body_path = self.planet_path;
+        let body_path = self.planet_path?;
         let mut node_id = self.world.root;
         for &slot in body_path.as_slice() {
             let Some(node) = self.world.library.get(node_id) else {
@@ -222,13 +222,15 @@ impl App {
             vn = vn.clamp(v_min + inner_eps, v_min + size - inner_eps);
             rn = rn.clamp(r_min + inner_eps, r_min + size - inner_eps);
         }
-        eprintln!(
-            "sphere_focus: path={:?} desired_depth={} body_path={:?} face={:?}",
-            path.as_slice(),
-            desired_depth,
-            body_path.as_slice(),
-            face,
-        );
+        if self.startup_profile_frames < 16 {
+            eprintln!(
+                "sphere_focus: path={:?} desired_depth={} body_path={:?} face={:?}",
+                path.as_slice(),
+                desired_depth,
+                body_path.as_slice(),
+                face,
+            );
+        }
         Some(path)
     }
 
@@ -268,11 +270,7 @@ impl App {
         let mut frame = frame;
         while frame.render_path.depth() > 0
             && (!self.camera_fits_frame(&frame)
-                || matches!(
-                    frame.kind,
-                    ActiveFrameKind::Sphere(ref sphere)
-                        if self.frame_projected_pixels(&frame) < SPHERE_FOCUS_MIN_PIXELS
-                ))
+                || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
         {
             let logical_path = frame.logical_path;
             let mut shallower = frame.render_path;
@@ -345,13 +343,17 @@ impl App {
         let hit = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                let (_origin, frame_size_world) = super::frame::frame_origin_size_world(&sphere.body_path);
+                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
+                let ray_dir_local =
+                    crate::world::sdf::scale(crate::world::sdf::normalize(self.camera.forward()), frame_scale);
                 edit::cpu_raycast_in_sphere_frame(
                     &self.world.library,
                     self.world.root,
-                    self.active_frame.render_path.as_slice(),
+                    sphere.body_path.as_slice(),
                     cam_body,
                     cam_body,
-                    crate::world::sdf::normalize(self.camera.forward()),
+                    ray_dir_local,
                     self.cs_edit_depth(),
                     sphere.face as u32,
                     sphere.face_u_min,
@@ -365,7 +367,13 @@ impl App {
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
-                let ray_dir = crate::world::sdf::normalize(self.camera.forward());
+                let (_origin, frame_size_world) =
+                    super::frame::frame_origin_size_world(&self.active_frame.render_path);
+                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
+                let ray_dir = crate::world::sdf::scale(
+                    crate::world::sdf::normalize(self.camera.forward()),
+                    frame_scale,
+                );
                 edit::cpu_raycast_in_frame(
                     &self.world.library,
                     self.world.root,

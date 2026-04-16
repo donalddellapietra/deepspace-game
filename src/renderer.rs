@@ -76,9 +76,38 @@ pub struct Renderer {
     root_face_bounds: [f32; 4],
     root_face_pop_pos: [f32; 4],
     ribbon_count: u32,
+    offscreen_texture: Option<wgpu::Texture>,
 }
 
 impl Renderer {
+    fn select_present_mode(
+        surface_caps: &wgpu::SurfaceCapabilities,
+        requested: wgpu::PresentMode,
+    ) -> wgpu::PresentMode {
+        if surface_caps.present_modes.contains(&requested) {
+            return requested;
+        }
+        if matches!(requested, wgpu::PresentMode::AutoNoVsync) {
+            for candidate in [
+                wgpu::PresentMode::Immediate,
+                wgpu::PresentMode::Mailbox,
+                wgpu::PresentMode::FifoRelaxed,
+            ] {
+                if surface_caps.present_modes.contains(&candidate) {
+                    return candidate;
+                }
+            }
+        }
+        if matches!(requested, wgpu::PresentMode::AutoVsync) {
+            for candidate in [wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox] {
+                if surface_caps.present_modes.contains(&candidate) {
+                    return candidate;
+                }
+            }
+        }
+        requested
+    }
+
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
         tree_data: &[GpuChild],
@@ -124,6 +153,14 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        let requested_present_mode = present_mode;
+        let present_mode = Self::select_present_mode(&surface_caps, requested_present_mode);
+        eprintln!(
+            "renderer_present requested={requested:?} selected={selected:?} supported={supported:?}",
+            requested = requested_present_mode,
+            selected = present_mode,
+            supported = surface_caps.present_modes,
+        );
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -315,6 +352,7 @@ impl Renderer {
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
             ribbon_count: 0,
+            offscreen_texture: None,
         }
     }
 
@@ -424,6 +462,7 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.offscreen_texture = None;
         self.write_uniforms();
     }
 
@@ -431,21 +470,27 @@ impl Renderer {
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
     }
 
-    pub fn render_offscreen(&self) {
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen-frame"),
-            size: wgpu::Extent3d {
-                width: self.config.width,
-                height: self.config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
+    pub fn render_offscreen(&mut self) {
+        if self.offscreen_texture.is_none() {
+            self.offscreen_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("offscreen-frame"),
+                size: wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            }));
+        }
+        let texture = self
+            .offscreen_texture
+            .as_ref()
+            .expect("offscreen texture initialized");
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offscreen-frame"),

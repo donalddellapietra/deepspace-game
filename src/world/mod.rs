@@ -1,4 +1,5 @@
 pub mod anchor;
+pub mod bootstrap;
 pub mod tree;
 pub mod palette;
 pub mod state;

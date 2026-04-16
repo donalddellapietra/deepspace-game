@@ -317,8 +317,8 @@ impl App {
                 highlight_elapsed.as_secs_f64() * 1000.0,
                 render_elapsed.as_secs_f64() * 1000.0,
             );
-            self.startup_profile_frames += 1;
         }
+        self.startup_profile_frames = self.startup_profile_frames.saturating_add(1);
         if pre_tail_elapsed.as_secs_f64() * 1000.0 >= 30.0 {
             let frame_index = self.test.as_ref().map_or(0, |test| test.frame);
             eprintln!(

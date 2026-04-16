@@ -10,6 +10,7 @@ use crate::input::Keys;
 use crate::player;
 use crate::renderer::Renderer;
 use crate::world::anchor::{Path, WorldPos, WORLD_SIZE};
+use crate::world::bootstrap;
 use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeKind, MAX_DEPTH};
@@ -94,7 +95,7 @@ pub struct App {
     /// teleport / cursor logic; rendering reads the body via the
     /// normal tree walk + `NodeKind` dispatch.
     #[allow(dead_code)]
-    pub(super) planet_path: Path,
+    pub(super) planet_path: Option<Path>,
     /// The actual frame the renderer is using right now. This may
     /// be shallower than `render_frame()` when GPU packing flattened
     /// a slot on the intended path and `build_ribbon` had to stop
@@ -132,35 +133,13 @@ impl App {
         let low_latency_present = test_cfg.is_active();
         let show_harness_window = test_cfg.show_window;
         let disable_overlay = test_cfg.disable_overlay;
-        // Build a Cartesian world tree, then insert the planet body
-        // into its central depth-1 cell. After install, the planet
-        // is a `NodeKind::CubedSphereBody` node living inside the
-        // tree — there's no parallel `cs_planet` handle.
-        let mut world = crate::world::worldgen::generate_world();
-        let setup = crate::world::spherical_worldgen::demo_planet();
-        let (new_root, planet_path) =
-            crate::world::spherical_worldgen::install_at_root_center(
-                &mut world.library, world.root, &setup,
-            );
-        world.swap_root(new_root);
+        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
+        let world = bootstrap.world;
         let tree_depth = world.tree_depth();
-        eprintln!(
-            "Planet inserted at path {:?}; library has {} nodes, depth {}",
-            planet_path.as_slice(), world.library.len(), tree_depth,
-        );
-
-        // Spawn just above the planet's body cell. Body cell at
-        // depth 1 slot 13 spans world `[1, 2)³`. Sphere outer_r
-        // local = `setup.outer_r`, world = `outer_r * 1.0` (cell
-        // size is 1 world unit at depth 1). Top of sphere at world
-        // y = 1.5 + outer_r. Spawn slightly above.
-        let body_top_y = 1.5 + setup.outer_r;
-        let default_spawn = [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5];
-        let spawn_xyz = test_cfg.spawn_xyz.unwrap_or(default_spawn);
+        let spawn_xyz = test_cfg.spawn_xyz.unwrap_or(bootstrap.default_spawn_xyz);
         debug_assert!(spawn_xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
 
-        let default_depth = ((tree_depth as i32 - 6 + 1).max(1) as u8).min(60);
-        let anchor_depth = test_cfg.spawn_depth.unwrap_or(default_depth);
+        let anchor_depth = test_cfg.spawn_depth.unwrap_or(bootstrap.default_spawn_depth);
         let position = WorldPos::from_world_xyz(spawn_xyz, anchor_depth);
         let desired_depth = (position.anchor.depth().saturating_sub(RENDER_FRAME_K))
             .min(RENDER_FRAME_MAX_DEPTH);
@@ -177,8 +156,8 @@ impl App {
             desired_depth,
             position.anchor.depth(),
         );
-        let spawn_yaw = test_cfg.spawn_yaw.unwrap_or(0.0);
-        let spawn_pitch = test_cfg.spawn_pitch.unwrap_or(-1.2);
+        let spawn_yaw = test_cfg.spawn_yaw.unwrap_or(bootstrap.default_spawn_yaw);
+        let spawn_pitch = test_cfg.spawn_pitch.unwrap_or(bootstrap.default_spawn_pitch);
         eprintln!(
             "spawn: xyz={:?} anchor_depth={} yaw={} pitch={}",
             spawn_xyz, anchor_depth, spawn_yaw, spawn_pitch,
@@ -209,7 +188,7 @@ impl App {
             debug_overlay_visible: false,
             fps_smooth: 0.0,
             startup_profile_frames: 0,
-            planet_path,
+            planet_path: bootstrap.planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
             last_lod_upload_key: None,
@@ -305,10 +284,18 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
+        let (cam_local, frame_scale) = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => {
+                let cam_local = self.camera.position.in_frame(&sphere.body_path);
+                let (_origin, frame_size_world) = frame::frame_origin_size_world(&sphere.body_path);
+                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
+                (cam_local, frame_scale)
+            }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+                let cam_local = self.camera.position.in_frame(&frame.render_path);
+                let (_origin, frame_size_world) = frame::frame_origin_size_world(&frame.render_path);
+                let frame_scale = WORLD_SIZE / frame_size_world.max(f32::MIN_POSITIVE);
+                (cam_local, frame_scale)
             }
         };
         if self.startup_profile_frames < 4 {
@@ -321,25 +308,17 @@ impl App {
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let (fwd_local, right_local, up_local) = match frame.kind {
-            ActiveFrameKind::Sphere(_) => (
-                crate::world::sdf::normalize(fwd_world),
-                crate::world::sdf::normalize(right_world),
-                crate::world::sdf::normalize(up_world),
-            ),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
-                crate::world::sdf::normalize(fwd_world),
-                crate::world::sdf::normalize(right_world),
-                crate::world::sdf::normalize(up_world),
-            ),
-        };
+        let fwd_local = crate::world::sdf::scale(crate::world::sdf::normalize(fwd_world), frame_scale);
+        let right_local = crate::world::sdf::scale(crate::world::sdf::normalize(right_world), frame_scale);
+        let up_local = crate::world::sdf::scale(crate::world::sdf::normalize(up_world), frame_scale);
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
+                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?} frame_scale={}",
                 fwd_world,
                 fwd_local,
                 right_local,
                 up_local,
+                frame_scale,
             );
         }
         self.camera.gpu_camera_with_basis(

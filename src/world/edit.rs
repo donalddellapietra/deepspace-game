@@ -68,7 +68,8 @@ pub fn cpu_raycast(
 /// `frame_path` is the camera's anchor truncated to the desired
 /// frame depth (matches what `compute_render_frame` returns +
 /// `pack_tree_lod_preserving` packs). `cam_local` is
-/// `WorldPos::in_frame(&frame_path)`. `ray_dir` stays world-unit.
+/// `WorldPos::in_frame(&frame_path)`. `ray_dir` must be expressed
+/// in that same frame-local metric.
 ///
 /// Returns a `HitInfo` whose `path` is from `world_root` (the
 /// frame slots are prepended to whatever the inner DDA found).
@@ -107,6 +108,7 @@ pub fn cpu_raycast_in_frame(
 
     let mut current_frame_depth = effective_depth;
     let mut ray_origin = cam_local;
+    let mut ray_dir = ray_dir;
     let total_max_depth = max_depth;
 
     loop {
@@ -186,7 +188,11 @@ pub fn cpu_raycast_in_frame(
             sy as f32 + ray_origin[1] / 3.0,
             sz as f32 + ray_origin[2] / 3.0,
         ];
-        // ray_dir unchanged (stays unit).
+        ray_dir = [
+            ray_dir[0] / 3.0,
+            ray_dir[1] / 3.0,
+            ray_dir[2] / 3.0,
+        ];
         current_frame_depth -= 1;
     }
 }
@@ -1615,6 +1621,7 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::bootstrap::plain_test_world;
     use crate::world::palette::block;
     use crate::world::cubesphere::insert_spherical_body;
     use crate::world::sdf::Planet;
@@ -1695,7 +1702,7 @@ mod tests {
 
     #[test]
     fn raycast_hits_ground() {
-        let world = WorldState::test_world();
+        let world = plain_test_world();
         // Cast straight down from above the ground.
         let hit = cpu_raycast(
             &world.library,
@@ -1714,7 +1721,7 @@ mod tests {
     fn cpu_raycast_in_frame_at_root_matches_world_raycast() {
         // With frame_path empty, frame_aware raycast should be
         // equivalent to the legacy world-coord raycast.
-        let world = WorldState::test_world();
+        let world = plain_test_world();
         let world_hit = cpu_raycast(
             &world.library, world.root,
             [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
@@ -1741,7 +1748,7 @@ mod tests {
         // in the frame's bubble), but the ray points UP toward
         // a sibling that has content. Frame ascent must find
         // the hit in the ancestor.
-        let world = WorldState::test_world();
+        let world = plain_test_world();
         // Frame at slot 16 (top-row middle): some test_world
         // slots there have features. Camera in that frame's
         // [0, 3) coords pointing... actually the test world is
@@ -1834,7 +1841,7 @@ mod tests {
     #[test]
     fn cpu_raycast_in_frame_path_starts_from_world_root() {
         // The returned path's first entry must be (world.root, _).
-        let world = WorldState::test_world();
+        let world = plain_test_world();
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
@@ -1846,7 +1853,7 @@ mod tests {
 
     #[test]
     fn raycast_misses_sky() {
-        let world = WorldState::test_world();
+        let world = plain_test_world();
         // Cast straight up from a position in pure air (root y=2, x=0, z=0 is air_l2).
         let hit = cpu_raycast(
             &world.library,
@@ -1860,7 +1867,7 @@ mod tests {
 
     #[test]
     fn break_block_modifies_world() {
-        let mut world = WorldState::test_world();
+        let mut world = plain_test_world();
         let old_root = world.root;
         let hit = cpu_raycast(
             &world.library,
@@ -1875,7 +1882,7 @@ mod tests {
 
     #[test]
     fn place_block_on_ground() {
-        let mut world = WorldState::test_world();
+        let mut world = plain_test_world();
         // First break a block to create an empty space, then place into it.
         let hit = cpu_raycast(
             &world.library,
@@ -1902,7 +1909,7 @@ mod tests {
 
     #[test]
     fn zoom_controls_edit_depth() {
-        let world = WorldState::test_world();
+        let world = plain_test_world();
         // At max_depth=1, the ray should hit a node (coarse edit).
         let hit_coarse = cpu_raycast(
             &world.library,
@@ -1927,7 +1934,7 @@ mod tests {
 
     #[test]
     fn cross_node_placement_upward() {
-        let mut world = WorldState::test_world();
+        let mut world = plain_test_world();
         // Hit the ground surface from above. The test world has grass
         // surface around y≈1 (level-2 node). At depth 2, cells are
         // 1.0 wide, so cell (x, 2, z) at depth 1 is the top of a
@@ -1962,7 +1969,7 @@ mod tests {
 
     #[test]
     fn cross_node_placement_into_empty_subtree() {
-        let mut world = WorldState::test_world();
+        let mut world = plain_test_world();
         // The test world has air_l2 at (0, 2, 0). Hit the ground
         // surface below it and place upward into the empty air region.
         let hit = cpu_raycast(
@@ -2002,7 +2009,7 @@ mod tests {
 
     #[test]
     fn placement_outside_world_returns_false() {
-        let mut world = WorldState::test_world();
+        let mut world = plain_test_world();
         // Create a fake hit at the world boundary (cell y=2 at depth 1).
         // Placing above would go outside [0, 3).
         let hit = HitInfo {
