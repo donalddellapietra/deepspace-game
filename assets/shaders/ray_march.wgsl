@@ -531,10 +531,7 @@ struct HitResult {
     t: f32,
     /// Which ancestor-pop level the hit happened in. 0 = original
     /// camera frame; >0 = popped that many times into ancestors.
-    /// `t` is in this frame's units, not the camera's.
     frame_level: u32,
-    highlight_min: vec3<f32>,
-    highlight_max: vec3<f32>,
     frame_scale: f32,
     cell_min: vec3<f32>,
     cell_size: f32,
@@ -581,8 +578,6 @@ fn march_face_root(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -737,8 +732,6 @@ fn sphere_in_cell(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -878,8 +871,6 @@ fn sphere_in_face_window(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -1017,8 +1008,6 @@ fn march_cartesian(
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = vec3<f32>(0.0);
-    result.highlight_max = vec3<f32>(0.0);
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -1317,8 +1306,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var outer_r = uniforms.root_radii.y;
     var cur_face_bounds = uniforms.root_face_bounds;
     var ribbon_level: u32 = 0u;
-    var cur_hmin = uniforms.highlight_min.xyz;
-    var cur_hmax = uniforms.highlight_max.xyz;
     var cur_scale: f32 = 1.0;
 
     // skip_slot: after a ribbon pop, the slot index (in the parent)
@@ -1347,8 +1334,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         }
         if r.hit {
             r.frame_level = ribbon_level;
-            r.highlight_min = cur_hmin;
-            r.highlight_max = cur_hmax;
             r.frame_scale = cur_scale;
             // Transform cell_min/cell_size from the popped frame back
             // to the camera frame so the fragment shader's bevel/grid
@@ -1421,10 +1406,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 skip_slot = entry.slot;
                 ray_origin = slot_off + ray_origin / 3.0;
                 ray_dir = ray_dir / 3.0;
-                if uniforms.highlight_active != 0u {
-                    cur_hmin = slot_off + cur_hmin / 3.0;
-                    cur_hmax = slot_off + cur_hmax / 3.0;
-                }
                 cur_scale = cur_scale * (1.0 / 3.0);
                 current_idx = entry.node_idx;
                 ribbon_level = ribbon_level + 1u;
@@ -1446,8 +1427,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     result.hit = false;
     result.t = 1e20;
     result.frame_level = 0u;
-    result.highlight_min = cur_hmin;
-    result.highlight_max = cur_hmax;
     result.frame_scale = cur_scale;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
@@ -1498,8 +1477,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if uniforms.highlight_active != 0u {
-        let h_min = select(uniforms.highlight_min.xyz, result.highlight_min, result.hit);
-        let h_max = select(uniforms.highlight_max.xyz, result.highlight_max, result.hit);
+        // Highlight AABB is always in the camera's frame-local system.
+        // t is invariant across ribbon pop transforms (origin and dir
+        // both ÷3 per pop), so hit_pos = camera.pos + ray_dir * t is
+        // always in the original frame regardless of which ribbon
+        // level the DDA actually found the hit.
+        let h_min = uniforms.highlight_min.xyz;
+        let h_max = uniforms.highlight_max.xyz;
         let h_size = h_max - h_min;
         if result.hit {
             let hit_pos = camera.pos + ray_dir * result.t;
