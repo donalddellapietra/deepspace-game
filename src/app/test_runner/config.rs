@@ -68,6 +68,15 @@ pub struct TestConfig {
     /// content. Baked into the pipeline as the WGSL `override`
     /// `BASE_DETAIL_DEPTH`. See `docs/testing/perf-lod-diagnosis.md`.
     pub lod_base_depth: Option<u32>,
+    /// Block-interaction radius, in anchor-cell units. The cursor
+    /// raycast (highlight) and break/place only return hits at
+    /// distances ≤ `interaction_radius × anchor_cell_size`. Default
+    /// 6. At a high layer the anchor cell is physically huge so 6
+    /// cells is a big world distance; at a deep layer the cell is
+    /// tiny so 6 cells is a small world distance. This makes the
+    /// interaction range scale with your current zoom, same as the
+    /// LOD shells — symmetric cursor/interaction gate.
+    pub interaction_radius: Option<u32>,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -191,6 +200,9 @@ impl TestConfig {
                 }
                 "--lod-base-depth" => {
                     cfg.lod_base_depth = args.next().and_then(|v| v.parse().ok());
+                }
+                "--interaction-radius" => {
+                    cfg.interaction_radius = args.next().and_then(|v| v.parse().ok());
                 }
                 _ => {}
             }

@@ -162,6 +162,12 @@ pub struct App {
     /// Ribbon-level base detail budget. See bindings.wgsl
     /// `BASE_DETAIL_DEPTH`.
     pub(super) lod_base_depth: u32,
+    /// Block-interaction radius in anchor-cell units. Caps the
+    /// cursor raycast distance so break/place only succeed when
+    /// the target is within `interaction_radius × anchor_cell_size`
+    /// of the camera. Mirrors the LOD shells: zoom-aware, no
+    /// absolute-coordinate math.
+    pub(super) interaction_radius_cells: u32,
     pub(super) last_highlight_raycast_ms: f64,
     pub(super) last_highlight_set_ms: f64,
     /// Cost of packing the tree into GPU-friendly form. Set by
@@ -213,6 +219,7 @@ impl App {
         // is ribbon-level-based (`lod_base_depth`).
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
         let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
+        let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
         let mut world = bootstrap.world;
@@ -320,6 +327,7 @@ impl App {
             shader_stats_enabled,
             lod_pixel_threshold,
             lod_base_depth,
+            interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
             last_pack_ms: 0.0,
