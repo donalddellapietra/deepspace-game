@@ -169,32 +169,101 @@ Both are cheap to compute — the shader already has `ray_dist` and
 `cell_world_size` in scope at the descend site. The existing
 `at_lod` branch is the right place to change.
 
-## What the harness should tell us next
+## Resolution
 
-The per-branch counters already show `avg_lod_terminal` when the
-distance-based LOD fires, so we can directly measure: with
-`lod_pixels < 4.0`, what's the new breakdown? Expected:
+Three changes landed after the diagnosis. Each solves a specific
+flaw that kept revealing itself in the shader-stats breakdown.
 
-- `avg_descend` stays moderate (more descent than the hard cap,
-  less than unbounded)
-- `avg_empty` stays near zero (empty is collapsed to tag=0 at the
-  packer level already)
-- `avg_lod_terminal` grows to replace the deep-descent steps
-- **Crucially: the breakdown should be invariant under zoom**, not
-  scale with `anchor_depth`
+### 1. Ribbon-level LOD (INV4, commit `4e7b445`)
 
-If we see invariance across zoom levels, distance-based LOD is
-working correctly.
+Replaced the level-count cap and the 2D Nyquist gate with a
+tree-native distance metric: `ribbon_level` (ancestor-pop count).
+
+- Inside the anchor cell (ribbon_level=0): `BASE_DETAIL_DEPTH`
+  levels of descent (default 4).
+- Each additional ribbon shell: detail budget drops by 1,
+  bottoming out at 1.
+- Nyquist (`LOD_PIXEL_THRESHOLD`, default 1.0) stays as a
+  sub-pixel floor.
+
+Implemented as a WGSL `override` constant `BASE_DETAIL_DEPTH` with
+CLI flag `--lod-base-depth N`. Removed the earlier
+`LOD_WORLD_RADIUS` stopgap.
+
+Why this is right: ribbon pops correspond to successively-larger
+cubic shells (3³ = 27 cells per shell) around the camera in the
+tree's own structure. Detail budget per shell = a **cubic LOD
+gradient by construction**. Invariant under zoom because
+ribbon_level only counts pops from the current anchor, not from
+the root.
+
+Measured (2560×1440, plain, 60 frames, `BASE_DETAIL_DEPTH=4`):
+
+| depth | layer | avg_steps | submitted_done_ms |
+|---|---|---|---|
+| 3  | 38 |  5.9 | 31.9 |
+| 5  | 36 | 24.8 | 33.5 |
+| 8  | 33 | 24.5 | 33.7 |
+| 12 | 29 | 25.2 | 33.9 |
+| 17 | 24 | 25.2 | 33.6 |
+
+`avg_steps` flat across the zoom range — the regression under
+zoom that killed the level-count cap is gone.
+
+### 2. Interaction radius gate (INV5, commit `4ad74bb`)
+
+Cursor raycast + break/place share a distance cap:
+
+```
+max_t_in_frame = interaction_radius_cells × anchor_cell_size_in_frame
+anchor_cell_size_in_frame = 3 / 3^K    where K = anchor_depth - frame_depth
+```
+
+Since `ray_dir_in_frame` is normalized, `HitInfo.t` is a frame-local
+distance and compares directly to `max_t`. Applies to both
+Cartesian (render frame) and sphere (body frame) paths.
+
+CLI flag `--interaction-radius N` (default 6). Zoom-aware by the
+same mechanism as the LOD shells: anchor cell size scales with
+zoom, so the physical reach adjusts automatically. "Floating in
+space" semantic: when you're too far from content for your current
+zoom level to reach it, the cursor shows no highlight — either
+move closer or zoom out.
+
+### 3. Stack-depth shrink (INV6, commit `81a4fad`)
+
+The single biggest GPU win, independent of algorithm: the
+`march_cartesian` DDA stacks were declared at `MAX_STACK_DEPTH=64`,
+allocating ~3.5 KB of per-fragment scratch across 5 arrays.
+Apple Silicon's register allocator can't fit that per invocation,
+so **every DDA iteration spilled to threadgroup memory**.
+
+Since ribbon-level LOD caps descent at `BASE_DETAIL_DEPTH=4`, we
+only need ~5 stack slots. Dropped `MAX_STACK_DEPTH` to 5:
+
+| MAX_STACK_DEPTH | submitted_done_ms | live FPS |
+|---|---|---|
+| 64 | 33.9 | ~30 |
+|  8 | 24.0 | ~42 |
+|  5 | 16.8 | ~60 |
+
+Live game at 2560×1440 retina: `avg_frame_fps = 60.89` across 586
+samples, steady through a scripted zoom-out across layers 33→37.
+
+If BASE_DETAIL_DEPTH is raised later, `MAX_STACK_DEPTH` must be
+raised to match or descent is silently capped.
 
 ## Related instrumentation
 
 - `scripts/perf-breakdown.sh` — matrix runner.
 - `--shader-stats` — enable atomics and stats readback.
 - `--perf-trace <path>` — per-frame CSV.
-- `renderer_slow ...` stderr lines in live mode with all phase
-  timings + branch counters.
+- `--lod-base-depth N` — ribbon-level detail budget.
+- `--lod-pixels N` — Nyquist floor.
+- `--interaction-radius N` — cursor / break reach cap.
+- `renderer_slow …` stderr lines in live mode with phase timings
+  + branch counters.
 
 See also:
-- `docs/testing/perf-isolation.md` — the isolation playbook + the
-  original (pre-diagnosis) findings table.
+- `docs/testing/perf-isolation.md` — the isolation playbook.
 - `docs/testing/harness.md` — flag reference.

@@ -59,6 +59,15 @@ Fail the run if any threshold is tripped after warmup:
 | `--frame-gap-warmup-frames N` | Default 30. |
 | `--require-webview` | Fail if the WKWebView overlay never comes up. |
 
+## Shader stats + LOD knobs
+
+| Flag | Effect |
+|---|---|
+| `--shader-stats` | Enable per-pixel atomics in the fragment shader (ray counts, step histograms, per-branch breakdown). Gated behind a WGSL `override` so off-state has zero overhead. Required to see the `render_harness_shader` / `renderer_slow avg_steps=…` output. |
+| `--lod-base-depth N` | Ribbon-level detail budget: descent inside your anchor cell is capped at `N` levels, then drops by 1 per ribbon-pop shell. Default 4. Primary LOD gate. See `docs/testing/perf-lod-diagnosis.md`. |
+| `--lod-pixels N` | Nyquist pixel floor: cells projecting to fewer than `N` pixels get LOD-terminal. Default 1.0 (sub-pixel rejection). |
+| `--interaction-radius N` | Cursor / break-place reach cap, in anchor-cell units. Default 6. Hits beyond `N × anchor_cell_size` are dropped. Zoom-aware automatically. |
+
 ## Perf trace (per-frame CSV)
 
 | Flag | Effect |
@@ -72,13 +81,21 @@ via Metal `TIMESTAMP_QUERY`, `submitted_done_ms` via `on_submitted_work_done`),
 and workload context (`packed_node_count`, `ribbon_len`, `effective_visual_depth`,
 `reused_gpu_tree`). See `docs/testing/perf-isolation.md` for interpretation.
 
-The harness also emits three structured summary lines to stderr at end-of-run:
+The harness also emits four structured summary lines to stderr at end-of-run:
 
 ```
 render_harness_timing avg_ms update=... camera_write=... pack=... ... gpu_pass=... submitted_done=... total=...
 render_harness_worst total_ms=...@frameN gpu_ms=...@frameN upload_ms=...@frameN
 render_harness_workload frames=... avg_packed_nodes=... max_packed_nodes=... avg_ribbon_len=... max_ribbon_len=...
+render_harness_shader frames=... avg_steps=... max_steps=... hit_fraction=... avg_oob=... avg_empty=... avg_descend=... avg_lod_terminal=...
 ```
+
+The `render_harness_shader` line only populates when `--shader-stats`
+is on. Per-branch averages (oob / empty / descend / lod_terminal) sum
+to roughly `avg_steps` and tell you which part of the DDA is doing
+the work — `avg_lod_terminal` dominating usually means LOD is
+correctly short-circuiting; `avg_descend + avg_empty` dominating
+means rays are marching through lots of inner tree structure.
 
 ## Script
 
