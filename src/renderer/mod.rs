@@ -78,6 +78,29 @@ pub struct Renderer {
     pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
     pub(super) offscreen_texture: Option<wgpu::Texture>,
+    /// Optional GPU timestamp-query scaffolding. Present only when
+    /// the adapter reports `Features::TIMESTAMP_QUERY`. Used by
+    /// `render_offscreen` to measure the ray-march pass on the GPU
+    /// side, not just the CPU-side `device.poll(Wait)` duration.
+    pub(super) timestamp: Option<TimestampScratch>,
+    /// Last queue.write_buffer durations (camera/ribbon/tree) in ms.
+    /// Populated by the buffer-upload path so the harness can break
+    /// "upload" into per-buffer sub-phases.
+    pub(super) last_camera_write_ms: f64,
+    pub(super) last_ribbon_write_ms: f64,
+    pub(super) last_tree_write_ms: f64,
+    pub(super) last_bind_group_rebuild_ms: f64,
+}
+
+/// GPU timestamp query resources. `query_set` holds two timestamp
+/// slots (pass start, pass end); `resolve` is the COPY_SRC buffer
+/// that `resolve_query_set` writes ticks into; `staging` is a
+/// MAP_READ buffer used to read the ticks back on the CPU.
+pub struct TimestampScratch {
+    pub query_set: wgpu::QuerySet,
+    pub resolve: wgpu::Buffer,
+    pub staging: wgpu::Buffer,
+    pub period_ns: f32,
 }
 
 impl Renderer {

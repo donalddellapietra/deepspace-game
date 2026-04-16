@@ -160,6 +160,9 @@ impl TestRunner {
     }
 }
 
+// winit 0.30 split EventLoop::create_window off into ActiveEventLoop;
+// this harness drives the loop manually (no ApplicationHandler trait),
+// so we keep the deprecated path deliberately.
 #[allow(deprecated)]
 pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
@@ -197,27 +200,43 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     app.apply_zoom();
     app.last_frame = std::time::Instant::now();
 
-    let mut total_update = 0.0f64;
-    let mut total_upload = 0.0f64;
-    let mut total_highlight = 0.0f64;
-    let mut total_highlight_raycast = 0.0f64;
-    let mut total_highlight_set = 0.0f64;
-    let mut total_render = 0.0f64;
-    let mut total_render_texture_alloc = 0.0f64;
-    let mut total_render_view = 0.0f64;
-    let mut total_render_encode = 0.0f64;
-    let mut total_render_submit = 0.0f64;
-    let mut total_render_wait = 0.0f64;
-    let mut frame_count = 0u32;
+    let mut agg = PerfAgg::default();
+    let mut trace_writer = cfg.perf_trace.as_ref().map(|path| {
+        let w = PerfTraceWriter::new(path).expect("failed to open perf trace file");
+        eprintln!("render_harness: perf trace -> {path} (warmup={})", cfg.perf_trace_warmup);
+        w
+    });
+    let trace_warmup = cfg.perf_trace_warmup;
 
     loop {
+        // Reset per-frame timings on the renderer. The upload-reuse
+        // fast path skips update_tree/update_ribbon entirely; without
+        // this reset, stale startup values would leak forward and
+        // make every frame look like it uploaded a fresh tree.
+        if let Some(r) = app.renderer.as_mut() {
+            r.last_camera_write_ms = 0.0;
+            r.last_tree_write_ms = 0.0;
+            r.last_ribbon_write_ms = 0.0;
+            r.last_bind_group_rebuild_ms = 0.0;
+        }
+
         let t0 = std::time::Instant::now();
         app.update(1.0 / 60.0);
         let t_update = t0.elapsed().as_secs_f64() * 1000.0;
+        let t_camera_write = app.renderer.as_ref().map(|r| r.last_camera_write_ms).unwrap_or(0.0);
 
         let t1 = std::time::Instant::now();
         app.upload_tree_lod();
-        let t_upload = t1.elapsed().as_secs_f64() * 1000.0;
+        let t_upload_total = t1.elapsed().as_secs_f64() * 1000.0;
+        let t_pack = app.last_pack_ms;
+        let t_ribbon_build = app.last_ribbon_build_ms;
+        let t_tree_write = app.renderer.as_ref().map(|r| r.last_tree_write_ms).unwrap_or(0.0);
+        let t_ribbon_write = app.renderer.as_ref().map(|r| r.last_ribbon_write_ms).unwrap_or(0.0);
+        let t_bind_group_rebuild = app.renderer.as_ref().map(|r| r.last_bind_group_rebuild_ms).unwrap_or(0.0);
+        let packed_node_count = app.last_packed_node_count;
+        let ribbon_len = app.last_ribbon_len;
+        let effective_visual_depth = app.last_effective_visual_depth;
+        let reused_gpu_tree = app.last_reused_gpu_tree;
 
         let t2 = std::time::Instant::now();
         app.update_highlight();
@@ -230,20 +249,41 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         } else {
             crate::renderer::OffscreenRenderTiming::default()
         };
-        let t_render = render_timing.total_ms;
 
-        total_update += t_update;
-        total_upload += t_upload;
-        total_highlight += t_highlight;
-        total_highlight_raycast += t_highlight_raycast;
-        total_highlight_set += t_highlight_set;
-        total_render += t_render;
-        total_render_texture_alloc += render_timing.texture_alloc_ms;
-        total_render_view += render_timing.view_ms;
-        total_render_encode += render_timing.encode_ms;
-        total_render_submit += render_timing.submit_ms;
-        total_render_wait += render_timing.wait_ms;
-        frame_count += 1;
+        let sample = FrameSample {
+            frame: agg.frame_count,
+            wall_ms: app.last_frame.elapsed().as_secs_f64() * 1000.0,
+            update_ms: t_update,
+            camera_write_ms: t_camera_write,
+            upload_total_ms: t_upload_total,
+            pack_ms: t_pack,
+            ribbon_build_ms: t_ribbon_build,
+            tree_write_ms: t_tree_write,
+            ribbon_write_ms: t_ribbon_write,
+            bind_group_rebuild_ms: t_bind_group_rebuild,
+            highlight_ms: t_highlight,
+            highlight_raycast_ms: t_highlight_raycast,
+            highlight_set_ms: t_highlight_set,
+            render_total_ms: render_timing.total_ms,
+            render_texture_alloc_ms: render_timing.texture_alloc_ms,
+            render_view_ms: render_timing.view_ms,
+            render_encode_ms: render_timing.encode_ms,
+            render_submit_ms: render_timing.submit_ms,
+            render_wait_ms: render_timing.wait_ms,
+            gpu_pass_ms: render_timing.gpu_pass_ms,
+            gpu_readback_ms: render_timing.gpu_readback_ms,
+            submitted_done_ms: render_timing.submitted_done_ms,
+            packed_node_count,
+            ribbon_len,
+            effective_visual_depth,
+            reused_gpu_tree,
+        };
+        agg.record(&sample);
+        if let Some(w) = trace_writer.as_mut() {
+            if sample.frame >= trace_warmup {
+                w.write(&sample);
+            }
+        }
 
         let (due, frame, frame_budget_done, timed_out, exit_after, screenshot) = {
             let Some(test) = app.test.as_mut() else { break };
@@ -283,25 +323,245 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    if frame_count > 0 {
-        eprintln!(
-            "render_harness_timing avg_ms update={:.3} upload={:.3} highlight={:.3} highlight_raycast={:.3} highlight_set={:.3} render={:.3} render_texture_alloc={:.3} render_view={:.3} render_encode={:.3} render_submit={:.3} render_wait={:.3} total={:.3}",
-            total_update / frame_count as f64,
-            total_upload / frame_count as f64,
-            total_highlight / frame_count as f64,
-            total_highlight_raycast / frame_count as f64,
-            total_highlight_set / frame_count as f64,
-            total_render / frame_count as f64,
-            total_render_texture_alloc / frame_count as f64,
-            total_render_view / frame_count as f64,
-            total_render_encode / frame_count as f64,
-            total_render_submit / frame_count as f64,
-            total_render_wait / frame_count as f64,
-            (total_update + total_upload + total_highlight + total_render) / frame_count as f64,
-        );
+    agg.print_summary();
+    if let Some(w) = trace_writer {
+        if let Err(e) = w.finish() {
+            eprintln!("perf_trace: failed to flush trace file: {e}");
+        }
     }
 
     Ok(())
+}
+
+/// One row in the per-frame trace. Mirrors the CSV header.
+#[derive(Debug, Clone, Copy)]
+struct FrameSample {
+    frame: u32,
+    wall_ms: f64,
+    update_ms: f64,
+    camera_write_ms: f64,
+    upload_total_ms: f64,
+    pack_ms: f64,
+    ribbon_build_ms: f64,
+    tree_write_ms: f64,
+    ribbon_write_ms: f64,
+    bind_group_rebuild_ms: f64,
+    highlight_ms: f64,
+    highlight_raycast_ms: f64,
+    highlight_set_ms: f64,
+    render_total_ms: f64,
+    render_texture_alloc_ms: f64,
+    render_view_ms: f64,
+    render_encode_ms: f64,
+    render_submit_ms: f64,
+    render_wait_ms: f64,
+    gpu_pass_ms: Option<f64>,
+    gpu_readback_ms: f64,
+    submitted_done_ms: Option<f64>,
+    packed_node_count: u32,
+    ribbon_len: u32,
+    effective_visual_depth: u32,
+    reused_gpu_tree: bool,
+}
+
+/// CSV writer for the per-frame trace. Buffered; flushed on finish.
+struct PerfTraceWriter {
+    path: String,
+    writer: std::io::BufWriter<std::fs::File>,
+}
+
+impl PerfTraceWriter {
+    fn new(path: &str) -> std::io::Result<Self> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        use std::io::Write;
+        writeln!(
+            writer,
+            "frame,wall_ms,update_ms,camera_write_ms,upload_total_ms,pack_ms,ribbon_build_ms,tree_write_ms,ribbon_write_ms,bind_group_rebuild_ms,highlight_ms,highlight_raycast_ms,highlight_set_ms,render_total_ms,render_texture_alloc_ms,render_view_ms,render_encode_ms,render_submit_ms,render_wait_ms,gpu_pass_ms,gpu_readback_ms,submitted_done_ms,packed_node_count,ribbon_len,effective_visual_depth,reused_gpu_tree"
+        )?;
+        Ok(Self { path: path.to_string(), writer })
+    }
+
+    fn write(&mut self, s: &FrameSample) {
+        use std::io::Write;
+        let gpu = s.gpu_pass_ms.map(|v| format!("{v:.4}")).unwrap_or_else(|| String::new());
+        let submitted_done = s.submitted_done_ms.map(|v| format!("{v:.4}")).unwrap_or_else(|| String::new());
+        let _ = writeln!(
+            self.writer,
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{},{},{},{},{}",
+            s.frame, s.wall_ms,
+            s.update_ms, s.camera_write_ms,
+            s.upload_total_ms, s.pack_ms, s.ribbon_build_ms, s.tree_write_ms, s.ribbon_write_ms, s.bind_group_rebuild_ms,
+            s.highlight_ms, s.highlight_raycast_ms, s.highlight_set_ms,
+            s.render_total_ms, s.render_texture_alloc_ms, s.render_view_ms, s.render_encode_ms, s.render_submit_ms, s.render_wait_ms,
+            gpu, s.gpu_readback_ms, submitted_done,
+            s.packed_node_count, s.ribbon_len, s.effective_visual_depth,
+            u32::from(s.reused_gpu_tree),
+        );
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        self.writer.flush()?;
+        eprintln!("perf_trace: flushed -> {}", self.path);
+        Ok(())
+    }
+}
+
+/// Running accumulator: sums, counts, worst-frame tracking, and
+/// `gpu_pass_ms` fraction (only over frames where the GPU reported
+/// a value). Prints a structured, single-line summary at the end.
+#[derive(Default)]
+struct PerfAgg {
+    frame_count: u32,
+    gpu_pass_count: u32,
+    sum_update: f64,
+    sum_camera_write: f64,
+    sum_upload: f64,
+    sum_pack: f64,
+    sum_ribbon_build: f64,
+    sum_tree_write: f64,
+    sum_ribbon_write: f64,
+    sum_bind_group_rebuild: f64,
+    sum_highlight: f64,
+    sum_hi_raycast: f64,
+    sum_hi_set: f64,
+    sum_render: f64,
+    sum_render_alloc: f64,
+    sum_render_view: f64,
+    sum_render_encode: f64,
+    sum_render_submit: f64,
+    sum_render_wait: f64,
+    sum_gpu_pass: f64,
+    sum_gpu_readback: f64,
+    sum_submitted_done: f64,
+    submitted_done_count: u32,
+    sum_packed_node_count: u64,
+    sum_ribbon_len: u64,
+    worst_total_ms: f64,
+    worst_total_frame: u32,
+    worst_gpu_ms: f64,
+    worst_gpu_frame: u32,
+    worst_upload_ms: f64,
+    worst_upload_frame: u32,
+    max_packed_node_count: u32,
+    max_ribbon_len: u32,
+}
+
+impl PerfAgg {
+    fn record(&mut self, s: &FrameSample) {
+        self.frame_count += 1;
+        self.sum_update += s.update_ms;
+        self.sum_camera_write += s.camera_write_ms;
+        self.sum_upload += s.upload_total_ms;
+        self.sum_pack += s.pack_ms;
+        self.sum_ribbon_build += s.ribbon_build_ms;
+        self.sum_tree_write += s.tree_write_ms;
+        self.sum_ribbon_write += s.ribbon_write_ms;
+        self.sum_bind_group_rebuild += s.bind_group_rebuild_ms;
+        self.sum_highlight += s.highlight_ms;
+        self.sum_hi_raycast += s.highlight_raycast_ms;
+        self.sum_hi_set += s.highlight_set_ms;
+        self.sum_render += s.render_total_ms;
+        self.sum_render_alloc += s.render_texture_alloc_ms;
+        self.sum_render_view += s.render_view_ms;
+        self.sum_render_encode += s.render_encode_ms;
+        self.sum_render_submit += s.render_submit_ms;
+        self.sum_render_wait += s.render_wait_ms;
+        self.sum_gpu_readback += s.gpu_readback_ms;
+        self.sum_packed_node_count += s.packed_node_count as u64;
+        self.sum_ribbon_len += s.ribbon_len as u64;
+        if s.packed_node_count > self.max_packed_node_count {
+            self.max_packed_node_count = s.packed_node_count;
+        }
+        if s.ribbon_len > self.max_ribbon_len {
+            self.max_ribbon_len = s.ribbon_len;
+        }
+        if let Some(v) = s.gpu_pass_ms {
+            self.sum_gpu_pass += v;
+            self.gpu_pass_count += 1;
+            if v > self.worst_gpu_ms {
+                self.worst_gpu_ms = v;
+                self.worst_gpu_frame = s.frame;
+            }
+        }
+        if let Some(v) = s.submitted_done_ms {
+            self.sum_submitted_done += v;
+            self.submitted_done_count += 1;
+        }
+        let total = s.update_ms + s.upload_total_ms + s.highlight_ms + s.render_total_ms;
+        if total > self.worst_total_ms {
+            self.worst_total_ms = total;
+            self.worst_total_frame = s.frame;
+        }
+        if s.upload_total_ms > self.worst_upload_ms {
+            self.worst_upload_ms = s.upload_total_ms;
+            self.worst_upload_frame = s.frame;
+        }
+    }
+
+    fn print_summary(&self) {
+        if self.frame_count == 0 {
+            return;
+        }
+        let n = self.frame_count as f64;
+        let gpu_avg = if self.gpu_pass_count > 0 {
+            self.sum_gpu_pass / self.gpu_pass_count as f64
+        } else {
+            0.0
+        };
+        let submitted_done_avg = if self.submitted_done_count > 0 {
+            self.sum_submitted_done / self.submitted_done_count as f64
+        } else {
+            0.0
+        };
+        let total_avg = (self.sum_update + self.sum_upload + self.sum_highlight + self.sum_render) / n;
+        eprintln!(
+            "render_harness_timing avg_ms update={:.3} camera_write={:.3} upload={:.3} pack={:.3} ribbon_build={:.3} tree_write={:.3} ribbon_write={:.3} bind_group_rebuild={:.3} highlight={:.3} highlight_raycast={:.3} highlight_set={:.3} render={:.3} render_texture_alloc={:.3} render_view={:.3} render_encode={:.3} render_submit={:.3} render_wait={:.3} gpu_pass={:.3} gpu_pass_samples={} gpu_readback={:.3} submitted_done={:.3} submitted_done_samples={} total={:.3}",
+            self.sum_update / n,
+            self.sum_camera_write / n,
+            self.sum_upload / n,
+            self.sum_pack / n,
+            self.sum_ribbon_build / n,
+            self.sum_tree_write / n,
+            self.sum_ribbon_write / n,
+            self.sum_bind_group_rebuild / n,
+            self.sum_highlight / n,
+            self.sum_hi_raycast / n,
+            self.sum_hi_set / n,
+            self.sum_render / n,
+            self.sum_render_alloc / n,
+            self.sum_render_view / n,
+            self.sum_render_encode / n,
+            self.sum_render_submit / n,
+            self.sum_render_wait / n,
+            gpu_avg,
+            self.gpu_pass_count,
+            self.sum_gpu_readback / n,
+            submitted_done_avg,
+            self.submitted_done_count,
+            total_avg,
+        );
+        eprintln!(
+            "render_harness_worst total_ms={:.3}@frame{} gpu_ms={:.3}@frame{} upload_ms={:.3}@frame{}",
+            self.worst_total_ms, self.worst_total_frame,
+            self.worst_gpu_ms, self.worst_gpu_frame,
+            self.worst_upload_ms, self.worst_upload_frame,
+        );
+        eprintln!(
+            "render_harness_workload frames={} avg_packed_nodes={} max_packed_nodes={} avg_ribbon_len={} max_ribbon_len={}",
+            self.frame_count,
+            self.sum_packed_node_count / self.frame_count as u64,
+            self.max_packed_node_count,
+            self.sum_ribbon_len / self.frame_count as u64,
+            self.max_ribbon_len,
+        );
+    }
 }
 
 fn print_monitor_summary(monitor: &std::sync::Arc<TestMonitor>) {

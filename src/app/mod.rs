@@ -120,10 +120,8 @@ pub struct App {
     pub(super) fps_smooth: f64,
     pub(super) startup_profile_frames: u32,
     /// Path from `world.root` to the planet's body node. Used for
-    /// spawn-position derivation and as a hint for future debug
-    /// teleport / cursor logic; rendering reads the body via the
-    /// normal tree walk + `NodeKind` dispatch.
-    #[allow(dead_code)]
+    /// spawn-position derivation and for camera-local sphere focus
+    /// (`edit_actions::zoom::camera_local_sphere_focus_path`).
     pub(super) planet_path: Option<Path>,
     /// The actual frame the renderer is using right now. This may
     /// be shallower than `render_frame()` when GPU packing flattened
@@ -153,6 +151,24 @@ pub struct App {
     pub(super) harness_height: u32,
     pub(super) last_highlight_raycast_ms: f64,
     pub(super) last_highlight_set_ms: f64,
+    /// Cost of packing the tree into GPU-friendly form. Set by
+    /// `upload_tree_lod`. `0.0` when the LOD key was reused.
+    pub(super) last_pack_ms: f64,
+    /// Cost of building the ancestor ribbon from the packed tree.
+    /// Set by `upload_tree_lod`. `0.0` when the LOD key was reused.
+    pub(super) last_ribbon_build_ms: f64,
+    /// Number of GpuChild-striped nodes in the most recent packed
+    /// tree. Static signal: tells the harness how much data the
+    /// shader had to walk.
+    pub(super) last_packed_node_count: u32,
+    /// Length of the ancestor ribbon pushed to the GPU.
+    pub(super) last_ribbon_len: u32,
+    /// Effective `visual_depth` the renderer was run with. Diverges
+    /// from anchor depth when LOD/force flags clamp the budget.
+    pub(super) last_effective_visual_depth: u32,
+    /// Whether `upload_tree_lod` reused a previously packed tree
+    /// instead of repacking. When true, pack/ribbon_build are 0.
+    pub(super) last_reused_gpu_tree: bool,
     pub(super) highlight_epoch: u64,
     pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
     /// Slot path from the last successful break/place edit. Used as a
@@ -285,6 +301,12 @@ impl App {
             harness_height,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
+            last_pack_ms: 0.0,
+            last_ribbon_build_ms: 0.0,
+            last_packed_node_count: 0,
+            last_ribbon_len: 0,
+            last_effective_visual_depth: 0,
+            last_reused_gpu_tree: false,
             highlight_epoch: 0,
             cached_highlight: None,
             last_edit_slots: None,
@@ -339,7 +361,7 @@ impl App {
     pub(super) fn update(&mut self, dt: f32) {
         player::update(&mut self.camera, dt);
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
-        if let Some(renderer) = &self.renderer {
+        if let Some(renderer) = &mut self.renderer {
             renderer.update_camera(&cam_gpu);
         }
     }

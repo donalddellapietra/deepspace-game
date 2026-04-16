@@ -59,6 +59,27 @@ Fail the run if any threshold is tripped after warmup:
 | `--frame-gap-warmup-frames N` | Default 30. |
 | `--require-webview` | Fail if the WKWebView overlay never comes up. |
 
+## Perf trace (per-frame CSV)
+
+| Flag | Effect |
+|---|---|
+| `--perf-trace PATH` | Write one CSV row per rendered frame to `PATH`. Header and column meanings documented in `src/app/test_runner/runner.rs::PerfTraceWriter`. |
+| `--perf-trace-warmup N` | Skip the first N rendered frames before recording (default 0). Use to exclude startup stalls. |
+
+Captures every measurable phase: CPU (`update`, `pack`, `ribbon_build`,
+`tree_write`, `highlight_*`, `encode`, `submit`, `wait`), GPU (`gpu_pass_ms`
+via Metal `TIMESTAMP_QUERY`, `submitted_done_ms` via `on_submitted_work_done`),
+and workload context (`packed_node_count`, `ribbon_len`, `effective_visual_depth`,
+`reused_gpu_tree`). See `docs/testing/perf-isolation.md` for interpretation.
+
+The harness also emits three structured summary lines to stderr at end-of-run:
+
+```
+render_harness_timing avg_ms update=... camera_write=... pack=... ... gpu_pass=... submitted_done=... total=...
+render_harness_worst total_ms=...@frameN gpu_ms=...@frameN upload_ms=...@frameN
+render_harness_workload frames=... avg_packed_nodes=... max_packed_nodes=... avg_ribbon_len=... max_ribbon_len=...
+```
+
 ## Script
 
 `--script "cmd1,cmd2,..."` runs commands in order.

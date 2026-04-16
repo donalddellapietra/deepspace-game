@@ -135,6 +135,120 @@ At the time of writing:
 - The remaining obvious cost center is the CPU highlight/raycast path, not the
   GPU renderer.
 
+## Deep Per-Phase Breakdown (2026-04)
+
+The harness now captures every measurable phase per frame, not just averages.
+See `scripts/perf-breakdown.sh` and the `--perf-trace PATH` flag.
+
+### New per-frame signals
+
+| signal | origin | meaning |
+|---|---|---|
+| `update_ms`, `camera_write_ms` | `App::update` | player + camera buffer write |
+| `pack_ms` | `upload_tree_lod` | `pack_tree_lod_selective` CPU cost |
+| `ribbon_build_ms` | `upload_tree_lod` | `build_ribbon` CPU cost |
+| `tree_write_ms`, `ribbon_write_ms` | `Renderer::update_{tree,ribbon}` | `queue.write_buffer` cost |
+| `bind_group_rebuild_ms` | buffer upload | rebuild when buffer outgrew allocation |
+| `highlight_ms`, `highlight_raycast_ms`, `highlight_set_ms` | `update_highlight` | already existed |
+| `render_{encode,submit,wait}_ms` | `render_offscreen` | CPU-side cost of each phase |
+| `gpu_pass_ms` | Metal `TIMESTAMP_QUERY` | GPU ray-march pass start→end |
+| `submitted_done_ms` | `queue.on_submitted_work_done` | true submit→GPU-done |
+| `packed_node_count`, `ribbon_len`, `effective_visual_depth`, `reused_gpu_tree` | `App` state | what the frame was asked to do |
+
+The harness emits three summary lines at end-of-run (`render_harness_timing`,
+`render_harness_worst`, `render_harness_workload`) and, when `--perf-trace PATH`
+is set, one CSV row per frame for post-hoc analysis.
+
+### Known caveats
+
+- **Apple Silicon Metal timestamp quirk.** Per-pass timestamps occasionally
+  report `end_tick < start_tick` for passes under ~1 ms. The harness takes the
+  absolute value and clamps physically impossible values (>5 s) to `None` in
+  the CSV. `gpu_pass_samples` in the summary reflects the valid count.
+- **`gpu_pass_ms` undercounts TBDR resolve.** Apple's tile-based deferred
+  renderer does the tile→main-memory resolve *after* the `endOfPassWrite`
+  timestamp sample. Resolve time shows up in `submitted_done_ms` but not in
+  `gpu_pass_ms`. For "how long did the GPU really take", use `submitted_done_ms`.
+
+### Matrix results (plain world, warmup=10, 60 frames)
+
+Resolution sweep at spawn_depth=6:
+
+| size | render_total | render_wait | submitted_done | gpu_pass |
+|---|---|---|---|---|
+| 64×64     | 5.3 ms  | 5.2 ms  | 5.2 ms  | 1.8 ms  |
+| 320×180   | 4.2 ms  | 4.1 ms  | 4.1 ms  | 1.4 ms  |
+| 640×360   | 7.9 ms  | 7.8 ms  | 7.9 ms  | 3.4 ms  |
+| 1280×720  | 21.4 ms | 21.3 ms | 21.3 ms | 10.0 ms |
+| 1920×1080 | 40.7 ms | 40.5 ms | 40.5 ms | 16.7 ms |
+
+Depth sweep at 1280×720:
+
+| depth | packed_nodes | ribbon_len | render_total | gpu_pass |
+|---|---|---|---|---|
+| 3  | 15 | 0  | 9.1 ms  | 3.3 ms  |
+| 6  | 40 | 3  | 21.3 ms | 8.4 ms  |
+| 10 | 58 | 7  | 21.7 ms | 9.2 ms  |
+| 14 | 66 | 11 | 21.4 ms | 9.7 ms  |
+| 17 | 76 | 14 | 21.7 ms | 11.7 ms |
+
+World preset at 1280×720, spawn_depth=6:
+
+| preset | packed_nodes | render_total | gpu_pass |
+|---|---|---|---|
+| plain  | 40  | 21.7 ms | 9.9 ms |
+| sphere | 779 | 9.3 ms  | 3.8 ms |
+
+### Conclusions
+
+- **CPU phases are sub-percent.** `update + upload + highlight + encode + submit`
+  sum to ≤ 0.2 ms at every resolution and depth. The CPU is not the bottleneck.
+- **`render_wait_ms` ≈ `submitted_done_ms`.** The CPU-side poll accurately
+  reflects GPU-done time on Metal. No hidden CPU stall.
+- **`gpu_pass_ms` is ~half of `submitted_done_ms`.** The remaining ~10–12 ms at
+  1280×720 is outside the per-pass timestamp window. On Apple Silicon this is
+  almost entirely the TBDR tile-resolve phase. Lowering the render target
+  resolution directly lowers this cost.
+- **Depth-independent shader cost from layer 6+.** With LOD working, shader
+  time plateaus around ~9–12 ms at 1280×720 regardless of anchor depth — a big
+  improvement over the old "deeper = slower" behavior.
+- **Sphere world is ~2.3× faster than plain world at depth 6** despite 20× more
+  packed nodes. Sky-dominant framings cheap-out early in the DDA; the flat
+  plain at depth 6 is the worst-case workload (every pixel hits the surface).
+
+### How to use the harness
+
+Run the full matrix:
+
+```bash
+scripts/perf-breakdown.sh all
+```
+
+Or just one dimension:
+
+```bash
+scripts/perf-breakdown.sh resolution
+scripts/perf-breakdown.sh depth
+scripts/perf-breakdown.sh world
+```
+
+CSVs land under `tmp/perf/<label>.csv`. Columns are documented in
+`src/app/test_runner/runner.rs::PerfTraceWriter::new`.
+
+For a single ad-hoc run:
+
+```bash
+cargo run --bin deepspace-game -- \
+  --render-harness --plain-world --plain-layers 20 \
+  --spawn-depth 6 --harness-width 1280 --harness-height 720 \
+  --exit-after-frames 60 --timeout-secs 7 \
+  --perf-trace tmp/perf/my_run.csv --perf-trace-warmup 10 \
+  --suppress-startup-logs
+```
+
+The three summary lines (`render_harness_timing`, `render_harness_worst`,
+`render_harness_workload`) print at end of run.
+
 ## Anti-Patterns
 
 Do not do these:

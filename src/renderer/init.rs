@@ -8,7 +8,7 @@ use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonE
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
-use super::{GpuUniforms, Renderer, ROOT_KIND_CARTESIAN};
+use super::{GpuUniforms, Renderer, TimestampScratch, ROOT_KIND_CARTESIAN};
 
 impl Renderer {
     pub async fn new(
@@ -38,10 +38,17 @@ impl Renderer {
             .await
             .expect("No suitable GPU adapter found");
 
+        let adapter_features = adapter.features();
+        let want_timestamp = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = if want_timestamp {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("deepspace"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::downlevel_defaults()
                     .using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -49,6 +56,11 @@ impl Renderer {
             })
             .await
             .expect("Failed to create GPU device");
+        eprintln!(
+            "renderer_features timestamp_query_supported={} enabled={}",
+            adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY),
+            device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+        );
 
         let surface_caps = surface.get_capabilities(&adapter);
         let format = surface_caps.formats.iter()
@@ -240,6 +252,30 @@ impl Renderer {
             cache: None,
         });
 
+        let timestamp = if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("ray_march_timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp_resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp_staging"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let period_ns = queue.get_timestamp_period();
+            Some(TimestampScratch { query_set, resolve, staging, period_ns })
+        } else {
+            None
+        };
+
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
             tree_buffer, node_kinds_buffer,
@@ -256,6 +292,11 @@ impl Renderer {
             root_face_pop_pos: [0.0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
+            timestamp,
+            last_camera_write_ms: 0.0,
+            last_ribbon_write_ms: 0.0,
+            last_tree_write_ms: 0.0,
+            last_bind_group_rebuild_ms: 0.0,
         }
     }
 }

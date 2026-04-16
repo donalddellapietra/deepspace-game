@@ -23,6 +23,7 @@ impl Renderer {
         self.node_count = (tree_data.len() / 27) as u32;
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let write_start = std::time::Instant::now();
         let tree_grew = upload_or_recreate(
             &mut self.tree_buffer, &self.device, &self.queue,
             "tree", tree_data, storage,
@@ -31,13 +32,17 @@ impl Renderer {
             &mut self.node_kinds_buffer, &self.device, &self.queue,
             "node_kinds", node_kinds, storage,
         );
+        self.last_tree_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
 
+        self.last_bind_group_rebuild_ms = 0.0;
         if tree_grew || kinds_grew {
+            let rebuild_start = std::time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
             );
+            self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
 
         self.write_uniforms();
@@ -64,16 +69,20 @@ impl Renderer {
         self.ribbon_count = truncated.len() as u32;
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let write_start = std::time::Instant::now();
         let grew = upload_or_recreate(
             &mut self.ribbon_buffer, &self.device, &self.queue,
             "ribbon", payload, storage,
         );
+        self.last_ribbon_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
         if grew {
+            let rebuild_start = std::time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
             );
+            self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
         self.write_uniforms();
     }
@@ -82,8 +91,10 @@ impl Renderer {
         self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
     }
 
-    pub fn update_camera(&self, camera: &GpuCamera) {
+    pub fn update_camera(&mut self, camera: &GpuCamera) {
+        let write_start = std::time::Instant::now();
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.last_camera_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
     }
 
     pub(super) fn write_uniforms(&self) {

@@ -41,6 +41,17 @@ pub struct TestConfig {
     pub max_frame_gap_ms: Option<f32>,
     pub frame_gap_warmup_frames: Option<u32>,
     pub require_webview: bool,
+    /// If set, the harness writes a per-frame CSV trace to this
+    /// path. One row per rendered frame; header includes every
+    /// phase the harness can see (CPU + GPU). Enables post-hoc
+    /// analysis of worst-frame spikes, warm-up tails, and phase
+    /// correlation across the run — things the `avg_ms` summary
+    /// alone washes out.
+    pub perf_trace: Option<String>,
+    /// When `perf_trace` is set, skip the first N frames before
+    /// starting to record. Defaults to 0 (record everything,
+    /// including startup). Set this to skip warm-up frames.
+    pub perf_trace_warmup: u32,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -152,6 +163,12 @@ impl TestConfig {
                     cfg.frame_gap_warmup_frames = args.next().and_then(|v| v.parse().ok());
                 }
                 "--require-webview" => { cfg.require_webview = true; }
+                "--perf-trace" => { cfg.perf_trace = args.next(); }
+                "--perf-trace-warmup" => {
+                    cfg.perf_trace_warmup = args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                }
                 _ => {}
             }
         }

@@ -5,7 +5,8 @@
 use crate::world::anchor::Path;
 use crate::world::gpu;
 
-use super::super::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
+use crate::app::frame;
+use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use super::SHELL_PRESERVE_DEPTH;
 
 impl App {
@@ -36,6 +37,11 @@ impl App {
         let mut pack_elapsed = std::time::Duration::ZERO;
         let mut ribbon_elapsed = std::time::Duration::ZERO;
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
+        // Workload counters — recorded every frame, even when the
+        // LOD key hit, so the harness sees what the frame was asked
+        // to do (not just how long each phase took).
+        self.last_effective_visual_depth = effective_visual_depth;
+        self.last_reused_gpu_tree = reused_gpu_tree;
 
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
@@ -85,6 +91,7 @@ impl App {
             };
             pack_elapsed = pack_start.elapsed();
             let packed_node_count = tree_data.len() / 27;
+            self.last_packed_node_count = packed_node_count as u32;
 
             // build_ribbon may stop short of the intended frame when
             // pack LOD-flattened a sibling on the way down (uniform-
@@ -95,8 +102,9 @@ impl App {
             let ribbon_start = std::time::Instant::now();
             let r = gpu::build_ribbon(&tree_data, intended_frame.render_path.as_slice());
             ribbon_elapsed = ribbon_start.elapsed();
-            let effective_path = super::super::frame::frame_from_slots(&r.reached_slots);
-            let effective_render = super::super::frame::compute_render_frame(
+            self.last_ribbon_len = r.ribbon.len() as u32;
+            let effective_path = frame::frame_from_slots(&r.reached_slots);
+            let effective_render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
                 &effective_path,
@@ -146,13 +154,15 @@ impl App {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
             }
         }
+        self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
+        self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
         if self.startup_profile_frames < 12 {
             eprintln!(
                 "startup_perf upload_tree_lod frame={} reused={} pack_ms={:.2} ribbon_ms={:.2} frame_depth={} render_depth={} visual_depth={} kind={:?}",
                 self.startup_profile_frames,
                 reused_gpu_tree,
-                pack_elapsed.as_secs_f64() * 1000.0,
-                ribbon_elapsed.as_secs_f64() * 1000.0,
+                self.last_pack_ms,
+                self.last_ribbon_build_ms,
                 self.active_frame.logical_path.depth(),
                 self.active_frame.render_path.depth(),
                 effective_visual_depth,
