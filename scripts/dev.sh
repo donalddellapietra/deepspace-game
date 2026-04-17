@@ -15,4 +15,7 @@ until curl -s http://localhost:5173 > /dev/null 2>&1; do sleep 0.2; done
 echo "Vite ready"
 
 # Start native game (wry WebView overlay loads from Vite)
-cargo run --bin deepspace-game
+# Any extra arguments to this script are forwarded to the game binary
+# after `--`, so e.g. `scripts/dev.sh --menger-world --lod-base-depth 20`
+# launches with those flags active.
+cargo run --bin deepspace-game -- "$@"

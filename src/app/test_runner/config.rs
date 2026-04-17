@@ -145,6 +145,7 @@ impl TestConfig {
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
                 "--sphere-world" => { cfg.world_preset = WorldPreset::DemoSphere; }
+                "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
                 "--plain-layers" => {
                     cfg.plain_layers = args.next().and_then(|v| v.parse().ok());
                 }

@@ -18,6 +18,12 @@ pub enum WorldPreset {
     #[default]
     PlainTest,
     DemoSphere,
+    /// Menger sponge — canonical ternary fractal. Each non-empty
+    /// cell subdivides into 20 non-empty + 7 empty children (the 7
+    /// are the cube centroid + 6 face centroids). 74% occupancy
+    /// per level, no uniform collapse — stresses the packer's
+    /// preserved-detail path in a way plain/sphere don't.
+    Menger,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -41,6 +47,67 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
     match preset {
         WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
+        WorldPreset::Menger => bootstrap_menger_world(plain_layers.unwrap_or(20)),
+    }
+}
+
+/// Build a Menger sponge of the given depth. Content-addressed
+/// dedup means storage is O(depth), not O(20^depth) — all 20
+/// non-empty cells at each level point to the same sub-sponge.
+pub fn menger_world(depth: u8) -> WorldState {
+    let mut lib = NodeLibrary::default();
+
+    // Level 1: 27 children, leaves are stone/empty per Menger pattern.
+    let mut children = empty_children();
+    for z in 0..BRANCH {
+        for y in 0..BRANCH {
+            for x in 0..BRANCH {
+                let count = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
+                if count >= 2 { continue; }
+                children[slot_index(x, y, z)] = Child::Block(block::STONE);
+            }
+        }
+    }
+    let mut current = lib.insert(children);
+
+    // Levels 2..=depth: each non-empty slot points to the previous
+    // level's node. Dedup compresses this to one node per level.
+    for _ in 1..depth {
+        let mut children = empty_children();
+        for z in 0..BRANCH {
+            for y in 0..BRANCH {
+                for x in 0..BRANCH {
+                    let count = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
+                    if count >= 2 { continue; }
+                    children[slot_index(x, y, z)] = Child::Node(current);
+                }
+            }
+        }
+        current = lib.insert(children);
+    }
+
+    lib.ref_inc(current);
+    WorldState { root: current, library: lib }
+}
+
+fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
+    let depth = depth.min(MAX_DEPTH as u8);
+    let world = menger_world(depth);
+    // Spawn outside the sponge looking toward it. Menger sits in
+    // [0, 3)³ at the root; place the camera at (2.5, 2.0, 2.5) so
+    // the sponge fills the lower-left view.
+    let spawn_pos = WorldPos::from_frame_local(
+        &Path::root(),
+        [2.5, 2.0, 2.5],
+        2,
+    ).deepened_to(8);
+    WorldBootstrap {
+        world,
+        planet_path: None,
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: -std::f32::consts::FRAC_PI_4,
+        default_spawn_pitch: -0.6,
+        plain_layers: depth,
     }
 }
 
