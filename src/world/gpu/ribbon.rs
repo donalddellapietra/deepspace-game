@@ -309,7 +309,7 @@ mod tests {
     fn ribbon_for_path_into_body_in_planet_world() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _brick_data, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         let RibbonResult { frame_root_idx, ribbon, .. } =
@@ -324,7 +324,7 @@ mod tests {
     fn reached_slots_truncated_when_pack_flattens_sibling() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _brick_data, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         // Slot 16 is uniform-empty Cartesian → absent from pack.
@@ -340,7 +340,7 @@ mod tests {
     fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
         let world = planet_world();
         let camera = camera_at([0.5, 0.5, 0.5]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _brick_data, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         let RibbonResult { frame_root_idx, ribbon, .. } =

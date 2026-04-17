@@ -16,6 +16,7 @@ impl Renderer {
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        brick_data: &[u32],
         root_bfs_index: u32,
         present_mode: wgpu::PresentMode,
         shader_stats_enabled: bool,
@@ -50,10 +51,11 @@ impl Renderer {
         } else {
             wgpu::Features::empty()
         };
-        // Sparse tree needs 5 storage buffers (tree, node_kinds,
-        // ribbon, shader_stats, node_offsets). `downlevel_defaults`
-        // caps that at 4; bump to 8 (the WebGPU spec default) so
-        // the limit is portable to the browser backend too.
+        // Sparse tree + bricks needs 6 storage buffers (tree,
+        // node_kinds, ribbon, shader_stats, node_offsets, brick_data).
+        // `downlevel_defaults` caps that at 4; bump to 8 (the WebGPU
+        // spec default) so the limit is portable to the browser
+        // backend too.
         let required_limits = wgpu::Limits {
             max_storage_buffers_per_shader_stage: 8,
             ..wgpu::Limits::downlevel_defaults()
@@ -107,9 +109,11 @@ impl Renderer {
         // Storage buffers cannot be zero-sized; stub any empty inputs.
         let stub_tree = [0u32, 2u32]; // one empty-node header
         let stub_offsets = [0u32];
+        let stub_brick = [0u32];
         let tree_init: &[u32] = if tree.is_empty() { &stub_tree } else { tree };
         let offsets_init: &[u32] =
             if node_offsets.is_empty() { &stub_offsets } else { node_offsets };
+        let brick_init: &[u32] = if brick_data.is_empty() { &stub_brick } else { brick_data };
 
         let tree_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree"),
@@ -126,6 +130,12 @@ impl Renderer {
         let node_offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("node_offsets"),
             contents: bytemuck::cast_slice(offsets_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let brick_data_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("brick_data"),
+            contents: bytemuck::cast_slice(brick_init),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -261,6 +271,16 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Brick data (binding 8) — flat 27³ voxel storage for
+                // every brick-eligible subtree. Indexed via
+                // `node_kinds[child_idx].face` when kind==3.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
@@ -269,6 +289,7 @@ impl Renderer {
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
             &shader_stats_buffer, &node_offsets_buffer,
+            &brick_data_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -356,6 +377,7 @@ impl Renderer {
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
             tree_buffer, node_offsets_buffer, node_kinds_buffer,
+            brick_data_buffer,
             camera_buffer, palette_buffer, uniforms_buffer,
             ribbon_buffer,
             bind_group,

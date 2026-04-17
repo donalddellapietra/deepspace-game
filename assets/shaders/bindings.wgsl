@@ -65,11 +65,23 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
+    kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace, 3=Brick
+    /// For kind==2 (Face): face id. For kind==3 (Brick): u32-offset
+    /// into `brick_data[]` of this brick's first cell. Other kinds: 0.
     face: u32,
     inner_r: f32,
     outer_r: f32,
 }
+
+/// Edge length of a brick in cells. 27 = 3³, three tree levels
+/// collapsed into one flat 3D DDA. 19683 cells per brick.
+const BRICK_DIM: u32 = 27u;
+const BRICK_DIM_F: f32 = 27.0;
+const BRICK_VOXELS: u32 = 19683u;
+/// Each u32 in `brick_data[]` holds 4 packed u8 cells (little-endian
+/// byte order: bits 0..7 = cell+0, 8..15 = cell+1, etc.). Per-brick
+/// storage = ceil(19683 / 4) = 4921 u32s.
+const BRICK_U32S: u32 = 4921u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated
@@ -123,6 +135,12 @@ struct ShaderStats {
 /// (touched on descent and ribbon pops). The inner DDA loop never
 /// reads this buffer.
 @group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
+/// Flat brickmap storage. When the outer Cartesian DDA encounters a
+/// child whose `node_kinds[child_idx].kind == 3u` (Brick), the
+/// dispatch reads `node_kinds[child_idx].face` as a u32-offset into
+/// this buffer and walks a 27³ flat 3D DDA inside it. Each u32 packs
+/// 4 cell palette indices (1 byte per cell, 0 = empty).
+@group(0) @binding(8) var<storage, read> brick_data: array<u32>;
 
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.

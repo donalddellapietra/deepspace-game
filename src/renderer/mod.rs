@@ -68,6 +68,10 @@ pub struct Renderer {
     /// only on descent / ribbon pop (cold path).
     pub(super) node_offsets_buffer: wgpu::Buffer,
     pub(super) node_kinds_buffer: wgpu::Buffer,
+    /// Brick voxel storage. Each brick = 4921 u32s (27³ cells, 4 cells
+    /// per u32). Touched only when the outer DDA dispatches into
+    /// `march_brick`. May be a 1-u32 stub when no bricks exist.
+    pub(super) brick_data_buffer: wgpu::Buffer,
     pub(super) camera_buffer: wgpu::Buffer,
     pub(super) palette_buffer: wgpu::Buffer,
     pub(super) uniforms_buffer: wgpu::Buffer,

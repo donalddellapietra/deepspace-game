@@ -2,6 +2,7 @@
 #include "tree.wgsl"
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
+#include "brick.wgsl"
 
 // Cartesian DDA in a single frame rooted at `root_node_idx`. The
 // frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
@@ -232,6 +233,29 @@ fn march_cartesian(
                 s_cell[depth] += vec3<i32>(m_sph) * step;
                 cur_side_dist += m_sph * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_sph;
+                continue;
+            }
+
+            if kind == 3u {
+                // Brick: flat 27³ DDA in this cell's world bounds. The
+                // brick REPLACES a 3-level Cartesian subtree that would
+                // otherwise occupy this cell — semantics match: each
+                // brick cell is cur_cell_size / 27 across.
+                let brick_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                let brick_offset = node_kinds[child_idx].face;
+                let brk = march_brick(
+                    brick_offset, brick_origin, cur_cell_size,
+                    ray_origin, ray_dir, normal,
+                );
+                if brk.hit {
+                    if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
+                    return brk;
+                }
+                // Brick missed — advance Cartesian DDA past its cell.
+                let m_brk = min_axis_mask(cur_side_dist);
+                s_cell[depth] += vec3<i32>(m_brk) * step;
+                cur_side_dist += m_brk * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_brk;
                 continue;
             }
             // Empty-representative fast path: when the packed

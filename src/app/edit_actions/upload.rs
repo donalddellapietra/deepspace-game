@@ -45,7 +45,7 @@ impl App {
 
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-            let (tree_packed, node_kinds, node_offsets, _world_root_idx) = {
+            let (tree_packed, node_kinds, node_offsets, brick_data, _world_root_idx) = {
                 let mut preserve_path_storage = vec![intended_frame.render_path];
                 if intended_frame.logical_path != intended_frame.render_path {
                     preserve_path_storage.push(intended_frame.logical_path);
@@ -127,6 +127,7 @@ impl App {
                     &tree_packed,
                     &node_kinds,
                     &node_offsets,
+                    &brick_data,
                     r.frame_root_idx,
                 );
                 renderer.update_ribbon(&r.ribbon);

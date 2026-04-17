@@ -20,6 +20,7 @@ impl Renderer {
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        brick_data: &[u32],
         root_bfs_index: u32,
     ) {
         self.root_index = root_bfs_index;
@@ -32,11 +33,17 @@ impl Renderer {
         // the ribbon is empty and the root is the only node read.
         let stub_tree = [0u32, 2u32]; // empty node header.
         let stub_offsets = [0u32];
+        let stub_brick = [0u32]; // never read when no Brick kind exists
         let tree_payload: &[u32] = if tree.is_empty() { &stub_tree } else { tree };
         let offsets_payload: &[u32] = if node_offsets.is_empty() {
             &stub_offsets
         } else {
             node_offsets
+        };
+        let brick_payload: &[u32] = if brick_data.is_empty() {
+            &stub_brick
+        } else {
+            brick_data
         };
 
         // Probe for packed-tree size exceeding the device's storage
@@ -70,16 +77,21 @@ impl Renderer {
             &mut self.node_offsets_buffer, &self.device, &self.queue,
             "node_offsets", offsets_payload, storage,
         );
+        let brick_grew = upload_or_recreate(
+            &mut self.brick_data_buffer, &self.device, &self.queue,
+            "brick_data", brick_payload, storage,
+        );
         self.last_tree_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
 
         self.last_bind_group_rebuild_ms = 0.0;
-        if tree_grew || kinds_grew || offsets_grew {
+        if tree_grew || kinds_grew || offsets_grew || brick_grew {
             let rebuild_start = std::time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.brick_data_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -121,6 +133,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.brick_data_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -195,6 +208,7 @@ pub(super) fn make_bind_group(
     ribbon: &wgpu::Buffer,
     shader_stats: &wgpu::Buffer,
     node_offsets: &wgpu::Buffer,
+    brick_data: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -208,6 +222,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: brick_data.as_entire_binding() },
         ],
     })
 }

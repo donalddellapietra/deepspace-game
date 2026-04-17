@@ -41,7 +41,17 @@ pub struct GpuChild {
 ///
 /// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns
 /// cleanly. `kind` discriminant: 0 = Cartesian, 1 = CubedSphereBody,
-/// 2 = CubedSphereFace.
+/// 2 = CubedSphereFace, 3 = Brick.
+///
+/// Field reuse by kind:
+/// - Cartesian: all zero.
+/// - CubedSphereBody: inner_r / outer_r carry sphere radii.
+/// - CubedSphereFace: face carries the face id (0..6).
+/// - Brick: face carries the u32-offset into `brick_data[]` of this
+///   brick's first cell. The Brick's tree[] header is a stub (the
+///   shader dispatches on kind==3 BEFORE descending), and the brick
+///   itself is 27³ flat cells inside `brick_data[]` — see
+///   `assets/shaders/brick.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -62,6 +72,12 @@ impl GpuNodeKind {
                 kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
             },
         }
+    }
+
+    /// A Brick kind entry. `brick_data_offset` is the u32-index into
+    /// `brick_data[]` where this brick's first cell lives.
+    pub fn brick(brick_data_offset: u32) -> Self {
+        Self { kind: 3, face: brick_data_offset, inner_r: 0.0, outer_r: 0.0 }
     }
 }
 
