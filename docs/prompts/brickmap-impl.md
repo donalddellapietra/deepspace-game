@@ -2,7 +2,7 @@
 
 ## Your assignment
 
-Implement base-3 brickmaps on a new worktree branched off `main`. The previous attempt on `compute-shader-migration` failed by shipping a single-depth (3³) dense-child shortcut that wasn't really a brickmap — it collapsed one tree level into 7 u32s and measured zero perf win. **Do not repeat that design.**
+Implement base-3 brickmaps on a new worktree branched off `.claude/worktrees/occupancy-stack-slim`. The previous attempt on `compute-shader-migration` failed by shipping a single-depth (3³) dense-child shortcut that wasn't really a brickmap — it collapsed one tree level into 7 u32s and measured zero perf win. **Do not repeat that design.**
 
 This prompt spells out the correct design. If any detail here conflicts with what you think is better, push back before writing code. Don't silently redesign.
 
