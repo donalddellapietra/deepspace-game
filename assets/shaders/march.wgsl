@@ -40,6 +40,11 @@ fn march_cartesian(
     var s_side_dist: array<vec3<f32>, MAX_STACK_DEPTH>;
     var s_node_origin: array<vec3<f32>, MAX_STACK_DEPTH>;
     var s_cell_size: array<f32, MAX_STACK_DEPTH>;
+    // Cached sparse-layout header per stack depth. Written when
+    // we push a new depth or start the march; re-used across all
+    // slot checks at that depth without re-loading nodes[].
+    var s_occupancy: array<u32, MAX_STACK_DEPTH>;
+    var s_first_child: array<u32, MAX_STACK_DEPTH>;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
@@ -47,6 +52,9 @@ fn march_cartesian(
     s_node_idx[0] = root_node_idx;
     s_node_origin[0] = vec3<f32>(0.0);
     s_cell_size[0] = 1.0;
+    let root_header = nodes[root_node_idx];
+    s_occupancy[0] = root_header.occupancy;
+    s_first_child[0] = root_header.first_child;
 
     let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
@@ -103,12 +111,13 @@ fn march_cartesian(
         }
 
         let slot = slot_from_xyz(cell.x, cell.y, cell.z);
-        // Sparse fast-path: occupancy-bit test first — an empty slot
-        // costs one u32 load of the node header (cached by WGSL CSE
-        // across successive slot checks at the same node) and no
-        // memory access to the compact child array.
-        if child_empty(s_node_idx[depth], slot) {
-            // Empty — DDA advance.
+        // Header is already cached in s_occupancy/s_first_child at
+        // this stack depth — no memory load per iteration.
+        let occupancy = s_occupancy[depth];
+        let first_child = s_first_child[depth];
+        let slot_bit = 1u << slot;
+        if ((occupancy & slot_bit) == 0u) {
+            // Empty — DDA advance. No access to the compact array.
             if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
@@ -126,41 +135,29 @@ fn march_cartesian(
             continue;
         }
 
-        let packed = child_packed(s_node_idx[depth], slot);
-        let tag = child_tag(packed);
+        // Non-empty: compute rank via popcount, then load the
+        // compact child entry (2 u32s: packed tag/block_type/pad
+        // and node_index).
+        let rank = countOneBits(occupancy & (slot_bit - 1u));
+        let child_base = (first_child + rank) * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
 
-        if tag == 0u {
-            // Unreachable in the sparse layout — `child_empty` above
-            // already handled the empty case. Kept for belt-and-
-            // suspenders; compiler should DCE it.
-            if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
-            if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
-                s_cell[depth].x += step.x;
-                s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
-                normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-            } else if s_side_dist[depth].y < s_side_dist[depth].z {
-                s_cell[depth].y += step.y;
-                s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
-                normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-            } else {
-                s_cell[depth].z += step.z;
-                s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
-                normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-            }
-        } else if tag == 1u {
+        if tag == 1u {
             let cell_min_h = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
             let cell_max_h = cell_min_h + vec3<f32>(s_cell_size[depth]);
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
             result.hit = true;
             result.t = max(cell_box_h.t_enter, 0.0);
-            result.color = palette.colors[child_block_type(packed)].rgb;
+            result.color = palette.colors[(packed >> 8u) & 0xFFu].rgb;
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = s_cell_size[depth];
             return result;
         } else {
-            // tag == 2u: Node child. Look up its kind.
-            let child_idx = child_node_index(s_node_idx[depth], slot);
+            // tag == 2u: Node child. Load node_index from the
+            // second u32 of the compact entry we already located.
+            let child_idx = tree[child_base + 1u];
             let kind = node_kinds[child_idx].kind;
 
             if kind == 1u {
@@ -340,6 +337,9 @@ fn march_cartesian(
 
                 depth += 1u;
                 s_node_idx[depth] = child_idx;
+                let child_header = nodes[child_idx];
+                s_occupancy[depth] = child_header.occupancy;
+                s_first_child[depth] = child_header.first_child;
                 s_node_origin[depth] = child_origin;
                 s_cell_size[depth] = child_cell_size;
                 s_cell[depth] = vec3<i32>(
