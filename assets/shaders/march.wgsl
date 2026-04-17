@@ -39,14 +39,18 @@ fn march_cartesian(
     var s_cell: array<vec3<i32>, MAX_STACK_DEPTH>;
     var s_side_dist: array<vec3<f32>, MAX_STACK_DEPTH>;
     var s_node_origin: array<vec3<f32>, MAX_STACK_DEPTH>;
-    var s_cell_size: array<f32, MAX_STACK_DEPTH>;
+
+    // Current-depth cell size. Pure function of `depth` (1/3^depth), so
+    // a scalar mutated on push (÷3) / pop (×3) is exactly equivalent
+    // to a per-depth array. Saves ~20 B of per-thread state and helps
+    // fragment-shader occupancy (see perf-occupancy-stack-slim.md).
+    var cur_cell_size: f32 = 1.0;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
     s_node_idx[0] = root_node_idx;
     s_node_origin[0] = vec3<f32>(0.0);
-    s_cell_size[0] = 1.0;
 
     // Interleaved-layout header for the CURRENT depth, cached in
     // scalar registers. Written on entry, refreshed on descend AND
@@ -96,6 +100,9 @@ fn march_cartesian(
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
             depth -= 1u;
+            // cur_cell_size was stored as scalar; undo the descend
+            // divide so it now reflects the parent's cell size.
+            cur_cell_size = cur_cell_size * 3.0;
             if ENABLE_STATS { ray_steps_oob = ray_steps_oob + 1u; }
 
             // Popped to a shallower depth. Reload cur_occupancy /
@@ -107,15 +114,15 @@ fn march_cartesian(
 
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
-                s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                s_side_dist[depth].x += delta_dist.x * cur_cell_size;
                 normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
             } else if s_side_dist[depth].y < s_side_dist[depth].z {
                 s_cell[depth].y += step.y;
-                s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                s_side_dist[depth].y += delta_dist.y * cur_cell_size;
                 normal = vec3<f32>(0.0, f32(-step.y), 0.0);
             } else {
                 s_cell[depth].z += step.z;
-                s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                s_side_dist[depth].z += delta_dist.z * cur_cell_size;
                 normal = vec3<f32>(0.0, 0.0, f32(-step.z));
             }
             continue;
@@ -131,15 +138,15 @@ fn march_cartesian(
             if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
-                s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                s_side_dist[depth].x += delta_dist.x * cur_cell_size;
                 normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
             } else if s_side_dist[depth].y < s_side_dist[depth].z {
                 s_cell[depth].y += step.y;
-                s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                s_side_dist[depth].y += delta_dist.y * cur_cell_size;
                 normal = vec3<f32>(0.0, f32(-step.y), 0.0);
             } else {
                 s_cell[depth].z += step.z;
-                s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                s_side_dist[depth].z += delta_dist.z * cur_cell_size;
                 normal = vec3<f32>(0.0, 0.0, f32(-step.z));
             }
             continue;
@@ -157,15 +164,15 @@ fn march_cartesian(
         let tag = packed & 0xFFu;
 
         if tag == 1u {
-            let cell_min_h = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-            let cell_max_h = cell_min_h + vec3<f32>(s_cell_size[depth]);
+            let cell_min_h = s_node_origin[depth] + vec3<f32>(cell) * cur_cell_size;
+            let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
             result.hit = true;
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette.colors[(packed >> 8u) & 0xFFu].rgb;
             result.normal = normal;
             result.cell_min = cell_min_h;
-            result.cell_size = s_cell_size[depth];
+            result.cell_size = cur_cell_size;
             return result;
         } else {
             // tag == 2u: Node child. Load node_index from the
@@ -183,15 +190,15 @@ fn march_cartesian(
             if depth == 0u && cell_slot == skip_slot {
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
-                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    s_side_dist[depth].x += delta_dist.x * cur_cell_size;
                     normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
                 } else if s_side_dist[depth].y < s_side_dist[depth].z {
                     s_cell[depth].y += step.y;
-                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    s_side_dist[depth].y += delta_dist.y * cur_cell_size;
                     normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                 } else {
                     s_cell[depth].z += step.z;
-                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    s_side_dist[depth].z += delta_dist.z * cur_cell_size;
                     normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                 }
                 continue;
@@ -201,8 +208,8 @@ fn march_cartesian(
 
             if kind == 1u {
                 // CubedSphereBody: dispatch sphere DDA in this body's cell.
-                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-                let body_size = s_cell_size[depth];
+                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * cur_cell_size;
+                let body_size = cur_cell_size;
                 let inner_r = node_kinds[child_idx].inner_r;
                 let outer_r = node_kinds[child_idx].outer_r;
                 let sph = sphere_in_cell(
@@ -215,15 +222,15 @@ fn march_cartesian(
                 // Sphere missed — advance Cartesian DDA past this cell.
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
-                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    s_side_dist[depth].x += delta_dist.x * cur_cell_size;
                     normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
                 } else if s_side_dist[depth].y < s_side_dist[depth].z {
                     s_cell[depth].y += step.y;
-                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    s_side_dist[depth].y += delta_dist.y * cur_cell_size;
                     normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                 } else {
                     s_cell[depth].z += step.z;
-                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    s_side_dist[depth].z += delta_dist.z * cur_cell_size;
                     normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                 }
                 continue;
@@ -248,15 +255,15 @@ fn march_cartesian(
                 if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
-                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    s_side_dist[depth].x += delta_dist.x * cur_cell_size;
                     normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
                 } else if s_side_dist[depth].y < s_side_dist[depth].z {
                     s_cell[depth].y += step.y;
-                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    s_side_dist[depth].y += delta_dist.y * cur_cell_size;
                     normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                 } else {
                     s_cell[depth].z += step.z;
-                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    s_side_dist[depth].z += delta_dist.z * cur_cell_size;
                     normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                 }
                 continue;
@@ -266,7 +273,7 @@ fn march_cartesian(
             // depth_limit = MAX_STACK_DEPTH — LOD controls the
             // effective depth, not an artificial per-shell budget.
             let at_max = depth + 1u > depth_limit || depth + 1u >= MAX_STACK_DEPTH;
-            let child_cell_size = s_cell_size[depth] / 3.0;
+            let child_cell_size = cur_cell_size / 3.0;
             let cell_world_size = child_cell_size;
             let min_side = min(s_side_dist[depth].x, min(s_side_dist[depth].y, s_side_dist[depth].z));
             let ray_dist = max(min_side * ray_metric, 0.001);
@@ -286,33 +293,33 @@ fn march_cartesian(
                 if bt == 255u {
                     if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                         s_cell[depth].x += step.x;
-                        s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                        s_side_dist[depth].x += delta_dist.x * cur_cell_size;
                         normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
                     } else if s_side_dist[depth].y < s_side_dist[depth].z {
                         s_cell[depth].y += step.y;
-                        s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                        s_side_dist[depth].y += delta_dist.y * cur_cell_size;
                         normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                     } else {
                         s_cell[depth].z += step.z;
-                        s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                        s_side_dist[depth].z += delta_dist.z * cur_cell_size;
                         normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                     }
                 } else {
-                    let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-                    let cell_max_l = cell_min_l + vec3<f32>(s_cell_size[depth]);
+                    let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * cur_cell_size;
+                    let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
                     result.color = palette.colors[bt].rgb;
                     result.normal = normal;
                     result.cell_min = cell_min_l;
-                    result.cell_size = s_cell_size[depth];
+                    result.cell_size = cur_cell_size;
                     return result;
                 }
             } else {
                 if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
                 let parent_origin = s_node_origin[depth];
-                let parent_cell_size = s_cell_size[depth];
+                let parent_cell_size = cur_cell_size;
                 let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
 
                 let child_max = child_origin + vec3<f32>(parent_cell_size);
@@ -324,7 +331,7 @@ fn march_cartesian(
                 depth += 1u;
                 s_node_idx[depth] = child_idx;
                 s_node_origin[depth] = child_origin;
-                s_cell_size[depth] = child_cell_size;
+                cur_cell_size = child_cell_size;
                 // Load the new current-depth header into scalar
                 // registers so the inner loop never re-reads tree[]
                 // headers. `node_offsets` is the only per-descent

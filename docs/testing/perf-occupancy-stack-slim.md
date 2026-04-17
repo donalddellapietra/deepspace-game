@@ -89,7 +89,23 @@ pressure regime.
 
 ### Step 1: `s_cell_size` → scalar `cur_cell_size` (-20 B)
 
-Results pending.
+Slow-soldier @ 2560×1440, 300 frames.
+
+| counter | baseline | step 1 | Δ |
+|---|---|---|---|
+| Fragment Occupancy | 12.04% | **12.20%** | +0.16 pp (noise) |
+| ALU Utilization | 21.70% | 24.43% | +2.7 pp |
+| Buffer Read Limiter | 4.84% | 3.00% | −1.84 pp |
+| `submitted_done_ms` avg | 17.67 ms | **16.43 ms** | −7% |
+
+**Interpretation:** Fragment Occupancy didn't move. 20 B on its own is
+within the compiler's "doesn't cross the register-budget threshold"
+slack — the diagnosis doc predicted ~3 pp of occupancy from this
+change and we got less than that. The small wall-clock improvement
+(~7%) is likely just "the compiler had an easier time scheduling the
+scalar than the indexed array access." Screenshots pixel-identical.
+Continue to step 2; real occupancy gains should arrive when the
+cumulative register savings cross the threshold.
 
 ### Step 2: `s_node_origin` → scalar `cur_node_origin` (-60 B)
 
