@@ -1,26 +1,26 @@
-// Compute-shader port of fs_main. Per-thread state is identical to
-// the fragment path — NO threadgroup memory. Isolates "compute
-// dispatch pipeline" from "threadgroup optimization" so the Step 1
-// measurement tells us how much the compute pipeline itself costs
-// or saves on Apple Silicon occupancy.
+// Compute-shader ray-march entry. One thread per pixel at
+// @workgroup_size(8, 8, 1); each thread owns a row of the workgroup-
+// memory stack used by `march_cartesian`. Writes the final RGBA color
+// to an rgba16float storage texture that `blit.wgsl` copies to the
+// surface.
 
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
+#include "march_cartesian.wgsl"
 #include "march.wgsl"
 
 @group(1) @binding(0) var output_color: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8, 8, 1)
-fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn cs_main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
     let width_u = u32(uniforms.screen_width);
     let height_u = u32(uniforms.screen_height);
     if gid.x >= width_u || gid.y >= height_u { return; }
 
-    // Match the fragment rasterizer's sample point: center-of-pixel.
-    // The big-triangle fs_main interpolates in.uv to (x+0.5)/w,
-    // (y+0.5)/h at pixel (x, y). Keep the same sampling so ray_dir
-    // at pixel (x, y) matches the fragment path bit-for-bit.
     let uv = vec2<f32>(
         (f32(gid.x) + 0.5) / uniforms.screen_width,
         (f32(gid.y) + 0.5) / uniforms.screen_height,
@@ -33,7 +33,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let ray_dir = camera.forward + camera.right * ndc.x + camera.up * ndc.y;
 
-    let result = march(camera.pos, ray_dir);
+    let result = march(camera.pos, ray_dir, lid);
 
     var color: vec3<f32>;
     if result.hit {
@@ -71,8 +71,6 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Crosshair: same pixel math as fs_main. `in.uv * screen_dim`
-    // there resolves to `gid + 0.5` here.
     let pixel = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
     let center = vec2<f32>(uniforms.screen_width * 0.5, uniforms.screen_height * 0.5);
     let d = abs(pixel - center);

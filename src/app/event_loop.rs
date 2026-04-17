@@ -162,7 +162,6 @@ impl App {
                 lod_pixel_threshold,
                 lod_base_depth,
                 self.live_sample_every_frames,
-                self.renderer_mode,
             ),
         );
         let renderer_elapsed = renderer_start.elapsed();

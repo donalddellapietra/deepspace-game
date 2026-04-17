@@ -1,10 +1,12 @@
-//! wgpu renderer: full-screen ray march shader.
+//! wgpu renderer: compute-shader ray-march with a fullscreen blit.
 //!
 //! Five buffers: tree (per-child), node_kinds (per-node), camera,
-//! palette, uniforms, plus an ancestor-ribbon storage buffer. The
-//! shader walks the unified tree and dispatches on `NodeKind` when
-//! descending — there are no parallel buffers for sphere content,
-//! no `cs_*` uniforms, and no absolute-coord shimming.
+//! palette, uniforms, plus an ancestor-ribbon storage buffer. A
+//! compute pass dispatches `cs_main` into an rgba16float storage
+//! texture; a blit pass copies that texture to the surface. The
+//! compute shader walks the unified tree and dispatches on `NodeKind`
+//! when descending — there are no parallel buffers for sphere
+//! content, no `cs_*` uniforms, and no absolute-coord shimming.
 
 mod buffers;
 mod draw;
@@ -22,25 +24,6 @@ pub const MAX_RIBBON_LEN: usize = 64;
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
 pub const ROOT_KIND_FACE: u32 = 2;
-
-/// Which shader-stage drives the ray-march. `Fragment` (default) uses
-/// the original fs_main path; `Compute` dispatches `cs_main` into a
-/// storage texture and blits to the surface. See
-/// `docs/prompts/compute-shader-migration.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RendererMode {
-    Fragment,
-    Compute,
-}
-
-impl RendererMode {
-    pub fn from_cli(s: Option<&str>) -> Self {
-        match s {
-            Some("compute") => RendererMode::Compute,
-            _ => RendererMode::Fragment,
-        }
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -75,22 +58,23 @@ pub struct Renderer {
     pub(super) queue: wgpu::Queue,
     pub(super) surface: wgpu::Surface<'static>,
     pub(super) config: wgpu::SurfaceConfiguration,
-    pub(super) pipeline: wgpu::RenderPipeline,
-    pub(super) bind_group_layout: wgpu::BindGroupLayout,
-    pub(super) render_mode: RendererMode,
-    /// Compute pipeline + resources. Populated for both modes (cheap
-    /// setup cost) so toggling between fragment and compute at runtime
-    /// doesn't require re-creating GPU state.
+    /// Compute pipeline running `cs_main`. Shares `bind_group_layout`
+    /// (group 0) with the blit; `compute_texture_layout` (group 1)
+    /// wires the rgba16float storage texture it writes.
     pub(super) compute_pipeline: wgpu::ComputePipeline,
     pub(super) compute_texture_layout: wgpu::BindGroupLayout,
+    /// Fullscreen blit pipeline: samples the compute output and
+    /// writes to the surface (or a same-format offscreen texture).
     pub(super) blit_pipeline: wgpu::RenderPipeline,
     pub(super) blit_bind_group_layout: wgpu::BindGroupLayout,
-    /// Storage texture the compute shader writes into. Sized to
-    /// config.width × config.height. Reset to `None` on resize and
-    /// lazily re-created on the next compute dispatch.
+    /// Storage texture the compute shader writes into. Lazily (re)
+    /// allocated on the first dispatch after a resize.
     pub(super) compute_output: Option<wgpu::Texture>,
     pub(super) compute_texture_bind_group: Option<wgpu::BindGroup>,
     pub(super) blit_bind_group: Option<wgpu::BindGroup>,
+    /// Bind-group layout for group 0 (ray-march data buffers). Used
+    /// by both the compute and capture-to-png paths.
+    pub(super) bind_group_layout: wgpu::BindGroupLayout,
     /// Interleaved tree buffer (4 B × u32). Each packed node
     /// occupies `2 + 2*popcount(occupancy)` u32s: a 2-u32 header
     /// (occupancy mask + first_child u32-offset in this same buffer)
@@ -121,8 +105,8 @@ pub struct Renderer {
     pub(super) offscreen_texture: Option<wgpu::Texture>,
     /// Optional GPU timestamp-query scaffolding. Present only when
     /// the adapter reports `Features::TIMESTAMP_QUERY`. Used by
-    /// `render_offscreen` to measure the ray-march pass on the GPU
-    /// side, not just the CPU-side `device.poll(Wait)` duration.
+    /// `render_offscreen` to measure the compute dispatch itself,
+    /// not just the CPU-side `device.poll(Wait)` duration.
     pub(super) timestamp: Option<TimestampScratch>,
     /// Last queue.write_buffer durations (camera/ribbon/tree) in ms.
     /// Populated by the buffer-upload path so the harness can break
@@ -131,18 +115,19 @@ pub struct Renderer {
     pub(super) last_ribbon_write_ms: f64,
     pub(super) last_tree_write_ms: f64,
     pub(super) last_bind_group_rebuild_ms: f64,
-    /// Shader-side atomic counters written by the fragment shader
+    /// Shader-side atomic counters written by the compute shader
     /// each frame (ray_count, hit_count, miss_count, max_iter_count,
-    /// sum_steps_div4, max_steps, + 2 u32 pad). 32 bytes total.
+    /// sum_steps_div4, max_steps, + per-branch breakdown). 64 bytes
+    /// total including padding.
     pub(super) shader_stats_buffer: wgpu::Buffer,
     /// Mappable COPY_DST shadow of `shader_stats_buffer`. Populated
     /// via `copy_buffer_to_buffer` at the end of the render pass,
-    /// mapped after `poll(Wait)` so the harness can read the 8 u32s.
+    /// mapped after `poll(Wait)` so the harness can read the u32s.
     pub(super) shader_stats_readback: wgpu::Buffer,
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
-    /// shader's atomic writes are compiled out via the `ENABLE_STATS`
-    /// override so there's no per-pixel cost either.
+    /// compute shader's atomic writes are compiled out via the
+    /// `ENABLE_STATS` override so there's no per-pixel cost either.
     pub(super) shader_stats_enabled: bool,
     /// Rolling counter of live-surface frames rendered. Used by
     /// `render()` to periodically emit a `render_live_sample` line

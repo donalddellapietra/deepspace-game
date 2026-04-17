@@ -1,6 +1,6 @@
 //! Frame rendering: on-surface, offscreen, and readback-to-PNG.
 
-use super::{Renderer, RendererMode};
+use super::Renderer;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OffscreenRenderTiming {
@@ -10,12 +10,10 @@ pub struct OffscreenRenderTiming {
     pub submit_ms: f64,
     pub wait_ms: f64,
     pub total_ms: f64,
-    /// Ray-march render pass duration as reported by the GPU itself,
-    /// via the `TIMESTAMP_QUERY` scaffolding. `Some(0.0)` is a valid
-    /// result (pass was truly trivial), `None` means the adapter
-    /// does not support timestamp queries. On CPU-bound frames this
-    /// will be much smaller than `wait_ms`; when they're close, the
-    /// frame is genuinely GPU-bound.
+    /// Ray-march compute dispatch duration as reported by the GPU
+    /// itself, via the `TIMESTAMP_QUERY` scaffolding. `Some(0.0)` is
+    /// a valid result (dispatch was truly trivial), `None` means the
+    /// adapter does not support timestamp queries. Blit is excluded.
     pub gpu_pass_ms: Option<f64>,
     /// Staging-buffer map_async + read-back cost for the timestamp
     /// values themselves. Included in `wait_ms`; broken out so it
@@ -23,15 +21,11 @@ pub struct OffscreenRenderTiming {
     pub gpu_readback_ms: f64,
     /// Time from `queue.submit` to the `on_submitted_work_done`
     /// callback firing. Captures *all* GPU work including the
-    /// TBDR tile-resolve phase on Apple Silicon — which
-    /// `gpu_pass_ms` (render-pass-boundary timestamps) can miss.
-    /// When this is close to `wait_ms` and much larger than
-    /// `gpu_pass_ms`, the cost is outside the measured pass:
-    /// typically tile resolve, flush, or driver scheduling.
+    /// blit + tile resolve on Apple Silicon.
     pub submitted_done_ms: Option<f64>,
     /// Shader-side per-ray counters for the frame. Populated by
-    /// atomic writes in the fragment shader, read back by copy to
-    /// the `shader_stats_readback` buffer + map_async.
+    /// atomic writes in the compute shader, read back via
+    /// `shader_stats_readback` + map_async.
     pub shader_stats: ShaderStatsFrame,
 }
 
@@ -105,9 +99,9 @@ impl ShaderStatsFrame {
 impl Renderer {
     /// Lazily allocate the compute-output storage texture + its two
     /// bind groups (storage view for compute, sampled view for blit).
-    /// Called on the first compute dispatch after a resize / init; the
-    /// resize path clears all three `Option`s, so the next dispatch
-    /// rebuilds them at the new size.
+    /// Called on the first dispatch after a resize / init; the resize
+    /// path clears the three `Option`s, so the next dispatch rebuilds
+    /// them at the new size.
     fn ensure_compute_resources(&mut self) {
         if self.compute_output.is_some()
             && self.compute_texture_bind_group.is_some()
@@ -154,109 +148,68 @@ impl Renderer {
     }
 
     /// Encode the ray-march work into `encoder`, writing the final
-    /// color to `target_view`. Dispatches on `render_mode`:
-    /// - `Fragment`: one render pass running `fs_main`.
-    /// - `Compute`: a compute dispatch writing a storage texture,
-    ///   followed by a fragment blit pass copying it to `target_view`.
+    /// color to `target_view`. Dispatches the compute pipeline into a
+    /// storage texture, then blits that texture to `target_view`.
     ///
     /// Timestamp queries (when the feature is enabled) wrap the
-    /// ray-march work itself (fragment pass or compute dispatch). The
-    /// blit pass is excluded so `gpu_pass_ms` remains comparable across
-    /// modes; the blit's cost shows up in `submitted_done_ms` instead.
+    /// compute dispatch only; the blit pass is excluded so
+    /// `gpu_pass_ms` is directly comparable across frames.
     fn encode_raymarch(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         target_view: &wgpu::TextureView,
         label: &'static str,
     ) {
-        match self.render_mode {
-            RendererMode::Fragment => {
-                let timestamp_writes = self.timestamp.as_ref().map(|ts| {
-                    wgpu::RenderPassTimestampWrites {
-                        query_set: &ts.query_set,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    }
-                });
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(label),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.05, g: 0.05, b: 0.1, a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes,
-                    occlusion_query_set: None,
-                });
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.draw(0..3, 0..1);
+        self.ensure_compute_resources();
+        let timestamp_writes = self.timestamp.as_ref().map(|ts| {
+            wgpu::ComputePassTimestampWrites {
+                query_set: &ts.query_set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
             }
-            RendererMode::Compute => {
-                self.ensure_compute_resources();
-                let timestamp_writes = self.timestamp.as_ref().map(|ts| {
-                    wgpu::ComputePassTimestampWrites {
-                        query_set: &ts.query_set,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    }
-                });
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some(label),
-                        timestamp_writes,
-                    });
-                    cpass.set_pipeline(&self.compute_pipeline);
-                    cpass.set_bind_group(0, &self.bind_group, &[]);
-                    cpass.set_bind_group(
-                        1,
-                        self.compute_texture_bind_group.as_ref().unwrap(),
-                        &[],
-                    );
-                    let wg_x = self.config.width.div_ceil(8);
-                    let wg_y = self.config.height.div_ceil(8);
-                    cpass.dispatch_workgroups(wg_x, wg_y, 1);
-                }
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("blit"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: target_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.05, g: 0.05, b: 0.1, a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    pass.set_pipeline(&self.blit_pipeline);
-                    pass.set_bind_group(0, self.blit_bind_group.as_ref().unwrap(), &[]);
-                    pass.draw(0..3, 0..1);
-                }
-            }
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes,
+            });
+            cpass.set_pipeline(&self.compute_pipeline);
+            cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.set_bind_group(
+                1,
+                self.compute_texture_bind_group.as_ref().unwrap(),
+                &[],
+            );
+            let wg_x = self.config.width.div_ceil(8);
+            let wg_y = self.config.height.div_ceil(8);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.blit_pipeline);
+            pass.set_bind_group(0, self.blit_bind_group.as_ref().unwrap(), &[]);
+            pass.draw(0..3, 0..1);
         }
     }
 
-    /// Live-surface render path. Matches `render_offscreen`'s
-    /// instrumentation when `shader_stats_enabled`: timestamp
-    /// queries, `on_submitted_work_done` callback, stats-buffer
-    /// clear/copy/readback. When disabled, the only extra cost over
-    /// the old render() is an `on_submitted_work_done` registration
-    /// (trivial). The enriched `renderer_slow` log fires whenever a
-    /// frame exceeds 30ms total, reporting the per-phase breakdown
-    /// the harness surfaces — so a live-game regression can be
-    /// diagnosed from stderr without running the offscreen harness.
+    /// Live-surface render path. When `shader_stats_enabled`, a slow
+    /// frame (≥30 ms) triggers a `device.poll(Wait)` + stats readback
+    /// and emits a `renderer_slow` line with the per-phase breakdown.
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let frame_start = std::time::Instant::now();
         let acquire_start = std::time::Instant::now();
@@ -299,10 +252,6 @@ impl Renderer {
         output.present();
         let present_elapsed = present_start.elapsed();
         let frame_elapsed = frame_start.elapsed();
-        // Poll + stats readback only when enabled, and only on slow
-        // frames. The poll blocks the CPU on GPU completion, so we
-        // don't want to stall every frame — but during a slowdown we
-        // want the data.
         let slow = frame_elapsed.as_secs_f64() * 1000.0 >= 30.0;
         let (gpu_pass_ms, submitted_done_ms, shader_stats) =
             if self.shader_stats_enabled && slow {
@@ -317,11 +266,6 @@ impl Renderer {
             } else {
                 (None, None, ShaderStatsFrame::default())
             };
-        // Periodic steady-state sample: CPU-side timings only, no
-        // device.poll(Wait) stall. Gives us acquire/encode/submit/
-        // present/total on NORMAL frames, not just slow ones — which
-        // is what we need to diagnose where the 16 ms budget is spent
-        // at 60 FPS.
         self.live_frame_counter = self.live_frame_counter.wrapping_add(1);
         let sample = self.live_sample_every_frames > 0
             && self.live_frame_counter % self.live_sample_every_frames as u64 == 0;
@@ -396,7 +340,7 @@ impl Renderer {
             // Zero the shader_stats buffer so atomics accumulate from
             // 0 this frame. `clear_buffer` is a GPU-side fill; no
             // CPU synchronization cost, and serializes with the
-            // subsequent render pass on the same encoder.
+            // subsequent compute pass on the same encoder.
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
         self.encode_raymarch(&mut encoder, &view, "offscreen-ray-march");
@@ -458,10 +402,10 @@ impl Renderer {
         }
     }
 
-    /// Map `shader_stats_readback`, decode the 6 u32 counters, and
-    /// unmap. Called after the render-pass submit has completed on
-    /// GPU (verified by the earlier `poll(Wait)`), and after the
-    /// timestamp readback has already fired its own poll pass.
+    /// Map `shader_stats_readback`, decode the u32 counters, and
+    /// unmap. Called after the submit has completed on GPU (verified
+    /// by the earlier `poll(Wait)`), and after the timestamp readback
+    /// has already fired its own poll pass.
     fn read_shader_stats(&self) -> ShaderStatsFrame {
         let slice = self.shader_stats_readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -506,10 +450,6 @@ impl Renderer {
         let slice = ts.staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        // map_async's callback is only driven when the device is
-        // polled; poll(Wait) here is bounded because the submit
-        // that resolved the query set already completed during the
-        // earlier wait in render_offscreen.
         let _ = self.device.poll(wgpu::PollType::Wait);
         if rx.recv().is_err() {
             ts.staging.unmap();
@@ -521,13 +461,6 @@ impl Renderer {
         let end_tick = u64::from_ne_bytes(data[8..16].try_into().unwrap());
         drop(data);
         ts.staging.unmap();
-        // Known wgpu/Metal quirk on Apple Silicon: the per-render-pass
-        // start/end timestamp counters are not guaranteed to be
-        // monotonic for fast passes — we sometimes see end < start by
-        // a few milliseconds. Take the magnitude as a best-effort
-        // estimate; `wait_ms` stays as the authoritative GPU-bound
-        // signal on Metal. On vendors where the counters behave,
-        // `abs` is a no-op vs. the direct subtraction.
         let delta_ticks = if end_tick >= start_tick {
             end_tick - start_tick
         } else {
@@ -535,20 +468,14 @@ impl Renderer {
         };
         let ms = (delta_ticks as f64) * (ts.period_ns as f64) / 1_000_000.0;
         let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
-        // Guard against Apple Silicon Metal's timestamp counters
-        // returning nonsense for sub-ms passes (we've seen values
-        // ~13e6 ms, = 3+ hours, from a frame that actually took
-        // milliseconds). Cap at 5 seconds per pass — anything above
-        // that is physically impossible in a render-harness run and
-        // should be treated as "no reliable sample".
         const MAX_PLAUSIBLE_MS: f64 = 5000.0;
         let reported = if ms <= MAX_PLAUSIBLE_MS { Some(ms) } else { None };
         (reported, readback_ms)
     }
 
-    /// Render an off-screen frame and write a PNG to `path`. Used
-    /// by the headless test driver so the agent can iterate on
-    /// rendering issues without a window.
+    /// Render an off-screen frame and write a PNG to `path`. Used by
+    /// the headless test driver so the agent can iterate on rendering
+    /// issues without a window.
     pub fn capture_to_png(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let width = self.config.width;
         let height = self.config.height;

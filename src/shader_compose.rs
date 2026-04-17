@@ -13,16 +13,16 @@
 use std::collections::HashSet;
 
 const SOURCES: &[(&str, &str)] = &[
-    ("bindings.wgsl",  include_str!("../assets/shaders/bindings.wgsl")),
-    ("tree.wgsl",      include_str!("../assets/shaders/tree.wgsl")),
-    ("face_math.wgsl", include_str!("../assets/shaders/face_math.wgsl")),
-    ("ray_prim.wgsl",  include_str!("../assets/shaders/ray_prim.wgsl")),
-    ("face_walk.wgsl", include_str!("../assets/shaders/face_walk.wgsl")),
-    ("sphere.wgsl",    include_str!("../assets/shaders/sphere.wgsl")),
-    ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
-    ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
-    ("march_compute.wgsl", include_str!("../assets/shaders/march_compute.wgsl")),
-    ("blit.wgsl",      include_str!("../assets/shaders/blit.wgsl")),
+    ("bindings.wgsl",        include_str!("../assets/shaders/bindings.wgsl")),
+    ("tree.wgsl",            include_str!("../assets/shaders/tree.wgsl")),
+    ("face_math.wgsl",       include_str!("../assets/shaders/face_math.wgsl")),
+    ("ray_prim.wgsl",        include_str!("../assets/shaders/ray_prim.wgsl")),
+    ("face_walk.wgsl",       include_str!("../assets/shaders/face_walk.wgsl")),
+    ("sphere.wgsl",          include_str!("../assets/shaders/sphere.wgsl")),
+    ("march_cartesian.wgsl", include_str!("../assets/shaders/march_cartesian.wgsl")),
+    ("march.wgsl",           include_str!("../assets/shaders/march.wgsl")),
+    ("march_compute.wgsl",   include_str!("../assets/shaders/march_compute.wgsl")),
+    ("blit.wgsl",            include_str!("../assets/shaders/blit.wgsl")),
 ];
 
 fn lookup(name: &str) -> &'static str {
@@ -81,19 +81,19 @@ mod tests {
 
     #[test]
     fn composes_entry_point() {
-        let src = compose("main.wgsl");
-        assert!(src.contains("@vertex"), "vs_main missing");
-        assert!(src.contains("@fragment"), "fs_main missing");
+        let src = compose("march_compute.wgsl");
+        assert!(src.contains("@compute"), "cs_main missing");
         assert!(src.contains("fn march("), "march missing");
         assert!(src.contains("fn march_cartesian("), "march_cartesian missing");
         assert!(src.contains("fn sphere_in_cell("), "sphere_in_cell missing");
         assert!(src.contains("struct Uniforms"), "Uniforms missing");
+        assert!(src.contains("var<workgroup>"), "workgroup stack missing");
         assert!(!src.contains("#include"), "directive leaked into output");
     }
 
     #[test]
     fn dedupes_diamond_imports() {
-        let src = compose("main.wgsl");
+        let src = compose("march_compute.wgsl");
         let binding_count = src.matches("@group(0) @binding(0)").count();
         assert_eq!(binding_count, 1, "bindings.wgsl included more than once");
     }
