@@ -4,46 +4,27 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::world::tree::NodeKind;
 
-/// Per-node header in the sparse GPU layout. 8 bytes:
+/// One child entry in the interleaved sparse-tree layout. 8 bytes.
 ///
-/// - `occupancy` (u32): low 27 bits form a bitmask where bit `s`
-///   is set iff slot `s` is non-empty. Bits 27..31 are reserved for
-///   per-node flags.
-/// - `first_child` (u32): offset into the packed children buffer
-///   (in `GpuChild` units) of this node's run of non-empty children.
-///   Entries are stored in slot-ascending order; the `k`-th popcount
-///   of occupancy bits below slot `s` is the rank of slot `s` within
-///   the run.
+/// The child entry is emitted inline into the `tree: Vec<u32>` buffer
+/// immediately after its parent's 2-u32 header. For each non-empty
+/// slot `s` at BFS position `b` the pack emits two u32s:
 ///
-/// Look up slot `s`:
 /// ```text
-/// let h = nodes[n];
-/// let bit = 1u32 << s;
-/// if h.occupancy & bit == 0 { EMPTY }
-/// else {
-///     let rank = (h.occupancy & (bit - 1)).count_ones();
-///     children[h.first_child + rank]
-/// }
+/// tree[header_offset[b] + 2 + rank*2 + 0]  = packed (tag|block_type|pad)
+/// tree[header_offset[b] + 2 + rank*2 + 1]  = node_index (tag=2)
 /// ```
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq, Default)]
-pub struct NodeHeader {
-    pub occupancy: u32,
-    pub first_child: u32,
-}
-
-/// One child entry in the packed children buffer. 8 bytes.
-/// Empty slots are absent from the buffer — they're encoded by
-/// a clear bit in the parent's `NodeHeader.occupancy`. Only two
-/// tag values appear: `1 = Block`, `2 = Node`.
 ///
 /// - `tag` (u8): 1 = Block, 2 = Node. (tag=0 never appears.)
 /// - `block_type` (u8): valid when `tag == 1` (LOD-flattened or
 ///   leaf block). For `tag == 2` it carries the child's
-///   representative block — a hint the shader can use without
-///   descending.
+///   representative block — a hint the shader uses for the
+///   empty-representative fast path without descending.
 /// - `_pad` (u16): reserved for per-child flags.
-/// - `node_index` (u32): buffer-local index, valid when `tag == 2`.
+/// - `node_index` (u32): BFS position of the child node when
+///   `tag == 2`. Used to index `node_kinds[]` and `node_offsets[]`.
+///   The header u32-offset in `tree[]` is
+///   `node_offsets[node_index]`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
 pub struct GpuChild {
@@ -55,7 +36,8 @@ pub struct GpuChild {
 
 /// Per-packed-node metadata: which `NodeKind` this node is, plus
 /// the per-kind data the shader needs to render its content.
-/// Indexed by the same buffer index used in `GpuChild::node_index`.
+/// Indexed by BFS position — the same `node_index` used in
+/// `GpuChild::node_index`.
 ///
 /// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns
 /// cleanly. `kind` discriminant: 0 = Cartesian, 1 = CubedSphereBody,
@@ -118,11 +100,6 @@ impl Default for GpuPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn node_header_size() {
-        assert_eq!(std::mem::size_of::<NodeHeader>(), 8);
-    }
 
     #[test]
     fn gpu_child_size() {

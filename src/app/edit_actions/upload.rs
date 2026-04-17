@@ -45,7 +45,7 @@ impl App {
 
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-            let (nodes_packed, children_packed, node_kinds, _world_root_idx) = {
+            let (tree_packed, node_kinds, node_offsets, _world_root_idx) = {
                 let mut preserve_path_storage = vec![intended_frame.render_path];
                 if intended_frame.logical_path != intended_frame.render_path {
                     preserve_path_storage.push(intended_frame.logical_path);
@@ -90,7 +90,7 @@ impl App {
                 )
             };
             pack_elapsed = pack_start.elapsed();
-            let packed_node_count = nodes_packed.len();
+            let packed_node_count = node_kinds.len();
             self.last_packed_node_count = packed_node_count as u32;
 
             // build_ribbon may stop short of the intended frame when
@@ -101,8 +101,8 @@ impl App {
             // cam_local against the truncated path.
             let ribbon_start = std::time::Instant::now();
             let r = gpu::build_ribbon(
-                &nodes_packed,
-                &children_packed,
+                &tree_packed,
+                &node_offsets,
                 intended_frame.render_path.as_slice(),
             );
             ribbon_elapsed = ribbon_start.elapsed();
@@ -124,20 +124,20 @@ impl App {
 
             if let Some(renderer) = &mut self.renderer {
                 renderer.update_tree(
-                    &nodes_packed,
-                    &children_packed,
+                    &tree_packed,
                     &node_kinds,
+                    &node_offsets,
                     r.frame_root_idx,
                 );
                 renderer.update_ribbon(&r.ribbon);
             }
             if self.render_harness {
                 eprintln!(
-                    "render_harness_pack kind={:?} cartesian_lod_enabled={} packed_nodes={} packed_children={} library_nodes={}",
+                    "render_harness_pack kind={:?} cartesian_lod_enabled={} packed_nodes={} tree_u32s={} library_nodes={}",
                     intended_frame.kind,
                     true,
                     packed_node_count,
-                    children_packed.len(),
+                    tree_packed.len(),
                     self.world.library.len(),
                 );
             }

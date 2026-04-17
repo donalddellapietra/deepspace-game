@@ -99,16 +99,19 @@ struct ShaderStats {
     _pad5: u32,
 }
 
-/// Per-packed-node header in the sparse tree layout. 8 bytes.
-/// `occupancy` is a bitmask (low 27 bits) — bit `s` is set iff
-/// slot `s` is non-empty. `first_child` is the offset into `tree`
-/// (the compact child array) of this node's run of non-empty
-/// children, stored in slot-ascending order.
-struct NodeHeader {
-    occupancy: u32,
-    first_child: u32,
-}
-
+/// Interleaved sparse-tree storage. Each node occupies
+/// `2 + 2*popcount(occupancy)` contiguous u32s:
+///
+/// ```
+/// tree[base + 0] = occupancy mask (27 bits)
+/// tree[base + 1] = first_child_offset (absolute u32 index into tree[])
+/// tree[first_child_offset + rank*2]     = packed (tag|block_type|pad)
+/// tree[first_child_offset + rank*2 + 1] = child.node_index (BFS idx,
+///                                         valid when tag==2)
+/// ```
+///
+/// Header + first child share a 64-byte cache line, so the
+/// popcount→child chain hits L1 on the second load.
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
 @group(0) @binding(1) var<uniform> camera: Camera;
 @group(0) @binding(2) var<uniform> palette: Palette;
@@ -116,7 +119,10 @@ struct NodeHeader {
 @group(0) @binding(4) var<storage, read> node_kinds: array<NodeKindGpu>;
 @group(0) @binding(5) var<storage, read> ribbon: array<RibbonEntry>;
 @group(0) @binding(6) var<storage, read_write> shader_stats: ShaderStats;
-@group(0) @binding(7) var<storage, read> nodes: array<NodeHeader>;
+/// BFS index → header u32-offset in `tree[]`. Cold path only
+/// (touched on descent and ribbon pops). The inner DDA loop never
+/// reads this buffer.
+@group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
 
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.

@@ -1,11 +1,12 @@
 //! Ancestor ribbon: the chain that lets the shader pop upward
 //! when a ray exits the render frame's `[0, 3)³` bubble.
 //!
-//! The ribbon is computed AFTER the tree pack: it walks the sparse
-//! GPU buffer along the frame path, recording (ancestor_node_idx,
-//! slot) pairs. The shader pops in order — `ribbon[0]` is the
-//! frame's direct parent (one level above the frame), `ribbon[1]`
-//! is the grandparent, and so on up to the absolute world root.
+//! The ribbon is computed AFTER the tree pack: it walks the
+//! interleaved GPU buffer along the frame path, recording
+//! (ancestor_bfs_idx, slot) pairs. The shader pops in order —
+//! `ribbon[0]` is the frame's direct parent (one level above the
+//! frame), `ribbon[1]` is the grandparent, and so on up to the
+//! absolute world root.
 //!
 //! At each pop, the shader rescales the ray:
 //!
@@ -14,18 +15,18 @@
 //! parent_dir = frame_dir / 3.0
 //! ```
 //!
-//! This brings the ray into the parent's `[0, 3)³` frame coords
-//! and the DDA continues unchanged at the parent's buffer index.
+//! This brings the ray into the parent's `[0, 3)³` frame coords and
+//! the DDA continues at the parent's BFS index (looked up via
+//! `node_offsets[]` to find the parent's header in `tree[]`).
 
 use bytemuck::{Pod, Zeroable};
-
-use super::types::{GpuChild, NodeHeader};
 
 /// One entry in the ancestor ribbon. The shader pops from the
 /// frame upward; `ribbon[0]` is the frame's direct parent, then
 /// `ribbon[1]` the grandparent, etc., up to the absolute root.
 ///
-/// `node_idx` is the buffer index of the ancestor's node.
+/// `node_idx` is the BFS position of the ancestor's node — the
+/// shader maps this to a `tree[]` u32-offset via `node_offsets[]`.
 ///
 /// `slot_bits` packs two things into a u32:
 /// - Low 5 bits: slot (0..27) in the ancestor that contained the
@@ -62,14 +63,14 @@ impl GpuRibbonEntry {
     }
 }
 
-/// What `build_ribbon` returns: the chosen frame root in the
-/// buffer, the pop-ordered ribbon, and the slot prefix actually
+/// What `build_ribbon` returns: the chosen frame root (BFS idx) in
+/// the pack, the pop-ordered ribbon, and the slot prefix actually
 /// reached. `reached_slots.len()` is the **effective frame depth**
-/// — which can be shorter than the requested `frame_slots` when
-/// the pack flattened a Cartesian sibling on the way down. The
-/// caller MUST recompute the camera's `in_frame` projection using
-/// `reached_slots` (truncated to its actual length), otherwise
-/// the camera is in coords for a frame the shader doesn't have.
+/// — which can be shorter than the requested `frame_slots` when the
+/// pack flattened a Cartesian sibling on the way down. The caller
+/// MUST recompute the camera's `in_frame` projection using
+/// `reached_slots` (truncated to its actual length), otherwise the
+/// camera is in coords for a frame the shader doesn't have.
 #[derive(Clone, Debug)]
 pub struct RibbonResult {
     pub frame_root_idx: u32,
@@ -77,18 +78,18 @@ pub struct RibbonResult {
     pub reached_slots: Vec<u8>,
 }
 
-/// Walk the sparse GPU buffers from index 0 (world root) along
-/// `frame_slots`, following Node-tagged children. Returns the
-/// frame root in the buffer, the pop-ordered ribbon, and the
-/// slot prefix that the walker actually reached (which may be
-/// shorter than `frame_slots` when the pack LOD-flattened a
-/// Cartesian sibling at some depth).
+/// Walk the interleaved GPU buffer from the root (BFS idx 0) along
+/// `frame_slots`, following Node-tagged children. Returns the frame
+/// root's BFS index, the pop-ordered ribbon, and the slot prefix
+/// that the walker actually reached (which may be shorter than
+/// `frame_slots` when the pack LOD-flattened a Cartesian sibling at
+/// some depth).
 ///
 /// Empty `frame_slots` ⇒ `frame_root_idx = 0`, empty ribbon,
 /// empty `reached_slots`.
 pub fn build_ribbon(
-    nodes: &[NodeHeader],
-    children: &[GpuChild],
+    tree: &[u32],
+    node_offsets: &[u32],
     frame_slots: &[u8],
 ) -> RibbonResult {
     let mut walk: Vec<u32> = Vec::with_capacity(frame_slots.len() + 1);
@@ -96,7 +97,7 @@ pub fn build_ribbon(
     let mut reached_slots: Vec<u8> = Vec::with_capacity(frame_slots.len());
     let mut current = 0u32;
     for &slot in frame_slots {
-        let Some(entry) = sparse_child(nodes, children, current, slot) else { break };
+        let Some(entry) = sparse_child(tree, node_offsets, current, slot) else { break };
         if entry.tag != 2 { break; }
         current = entry.node_index;
         walk.push(current);
@@ -109,43 +110,57 @@ pub fn build_ribbon(
         let ancestor_idx = walk[depth - 1 - pop];
         let slot = reached_slots[depth - 1 - pop];
         let siblings_all_empty =
-            ancestor_siblings_all_empty(nodes, ancestor_idx);
+            ancestor_siblings_all_empty(tree, node_offsets, ancestor_idx);
         ribbon.push(GpuRibbonEntry::new(ancestor_idx, slot, siblings_all_empty));
     }
     RibbonResult { frame_root_idx, ribbon, reached_slots }
 }
 
-/// Look up slot `slot` at `node_idx`. Returns `None` when the slot
-/// is out of bounds or empty; otherwise the packed `GpuChild`.
-fn sparse_child(
-    nodes: &[NodeHeader],
-    children: &[GpuChild],
-    node_idx: u32,
-    slot: u8,
-) -> Option<GpuChild> {
-    let h = *nodes.get(node_idx as usize)?;
-    let bit = 1u32 << slot;
-    if h.occupancy & bit == 0 {
-        return None;
-    }
-    let rank = (h.occupancy & (bit - 1)).count_ones();
-    let idx = h.first_child.checked_add(rank)? as usize;
-    children.get(idx).copied()
+/// Simple decoded GpuChild used by the ribbon builder. Distinct from
+/// `super::types::GpuChild` so the ribbon code is self-contained.
+struct DecodedChild {
+    tag: u8,
+    node_index: u32,
 }
 
-/// True when every child of `node_idx` OTHER than the one we just
+/// Look up slot `slot` at the node with BFS idx `bfs_idx`. Returns
+/// `None` when the slot is out of bounds or empty; otherwise the
+/// decoded child entry.
+fn sparse_child(
+    tree: &[u32],
+    node_offsets: &[u32],
+    bfs_idx: u32,
+    slot: u8,
+) -> Option<DecodedChild> {
+    let header_off = *node_offsets.get(bfs_idx as usize)? as usize;
+    let occupancy = *tree.get(header_off)?;
+    let bit = 1u32 << slot;
+    if occupancy & bit == 0 {
+        return None;
+    }
+    let first_child = *tree.get(header_off + 1)? as usize;
+    let rank = (occupancy & (bit - 1)).count_ones() as usize;
+    let off = first_child + rank * 2;
+    let packed = *tree.get(off)?;
+    let tag = (packed & 0xFF) as u8;
+    let node_index = *tree.get(off + 1)?;
+    Some(DecodedChild { tag, node_index })
+}
+
+/// True when every child of the node OTHER than the one we just
 /// popped out of is empty. In the sparse layout, this is equivalent
 /// to `occupancy.count_ones() == 1` — the only set bit MUST be the
 /// slot we descended through (otherwise the walker couldn't have
 /// reached the child in the first place), so a single-bit occupancy
 /// implies all siblings are empty.
-///
-/// Used by the shader to fast-exit whole ancestor shells via ray–box
-/// on ribbon pop, bypassing the DDA that would otherwise traverse
-/// ~3–5 empty cells per shell.
-fn ancestor_siblings_all_empty(nodes: &[NodeHeader], node_idx: u32) -> bool {
-    let Some(h) = nodes.get(node_idx as usize) else { return false };
-    h.occupancy.count_ones() == 1
+fn ancestor_siblings_all_empty(
+    tree: &[u32],
+    node_offsets: &[u32],
+    bfs_idx: u32,
+) -> bool {
+    let Some(&header_off) = node_offsets.get(bfs_idx as usize) else { return false };
+    let Some(&occupancy) = tree.get(header_off as usize) else { return false };
+    occupancy.count_ones() == 1
 }
 
 #[cfg(test)]
@@ -160,41 +175,55 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuRibbonEntry>(), 8);
     }
 
-    /// A single empty node (no children in the sparse buffer).
-    fn one_node_tree() -> (Vec<NodeHeader>, Vec<GpuChild>) {
-        (
-            vec![NodeHeader { occupancy: 0, first_child: 0 }],
-            vec![],
-        )
+    /// Encode a GpuChild's first u32 (tag + block_type + pad).
+    fn encode_packed(tag: u8, block_type: u8) -> u32 {
+        (tag as u32) | ((block_type as u32) << 8)
+    }
+
+    /// A single empty node in the interleaved layout (2 u32 header,
+    /// no children).
+    fn one_node_tree() -> (Vec<u32>, Vec<u32>) {
+        let tree = vec![0u32 /* occupancy */, 2u32 /* first_child */];
+        let offsets = vec![0u32];
+        (tree, offsets)
     }
 
     /// Two-node tree: root has a single Node child at `parent_slot`
-    /// pointing to buffer index 1. The child is empty.
-    fn two_node_tree(parent_slot: u8) -> (Vec<NodeHeader>, Vec<GpuChild>) {
-        let nodes = vec![
-            NodeHeader { occupancy: 1u32 << parent_slot, first_child: 0 },
-            NodeHeader { occupancy: 0, first_child: 1 },
-        ];
-        let children = vec![
-            GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 1 },
-        ];
-        (nodes, children)
+    /// pointing to BFS idx 1 (which is itself an empty node).
+    ///
+    /// Layout:
+    ///   offset 0: root header  (occupancy=1<<slot, first_child=2)
+    ///   offset 2: root's child (packed tag=2, node_index=1)
+    ///   offset 4: child header (occupancy=0, first_child=6)
+    fn two_node_tree(parent_slot: u8) -> (Vec<u32>, Vec<u32>) {
+        let mut tree: Vec<u32> = Vec::new();
+        // Root header at offset 0.
+        tree.push(1u32 << parent_slot); // occupancy
+        tree.push(2);                    // first_child
+        // Root's one child at offset 2.
+        tree.push(encode_packed(2, 0));
+        tree.push(1); // node_index = BFS idx 1
+        // Child header at offset 4.
+        tree.push(0);
+        tree.push(6);
+        let offsets = vec![0u32, 4u32];
+        (tree, offsets)
     }
 
     #[test]
     fn empty_path_gives_empty_ribbon() {
-        let (nodes, children) = one_node_tree();
+        let (tree, offsets) = one_node_tree();
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&nodes, &children, &[]);
+            build_ribbon(&tree, &offsets, &[]);
         assert_eq!(frame_root_idx, 0);
         assert!(ribbon.is_empty());
     }
 
     #[test]
     fn single_step() {
-        let (nodes, children) = two_node_tree(13);
+        let (tree, offsets) = two_node_tree(13);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&nodes, &children, &[13]);
+            build_ribbon(&tree, &offsets, &[13]);
         assert_eq!(frame_root_idx, 1);
         assert_eq!(ribbon.len(), 1);
         assert_eq!(ribbon[0].node_idx, 0);
@@ -207,9 +236,9 @@ mod tests {
     fn stops_at_non_node_child() {
         // Path requests slot 13 → Node, then slot 5 → empty at child.
         // Walker stops at frame=1.
-        let (nodes, children) = two_node_tree(13);
+        let (tree, offsets) = two_node_tree(13);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&nodes, &children, &[13, 5]);
+            build_ribbon(&tree, &offsets, &[13, 5]);
         assert_eq!(frame_root_idx, 1);
         assert_eq!(ribbon.len(), 1);
     }
@@ -217,18 +246,22 @@ mod tests {
     #[test]
     fn multi_step_pop_order() {
         // Three nodes: 0 → slot 16 → 1 → slot 8 → 2.
-        let nodes = vec![
-            NodeHeader { occupancy: 1u32 << 16, first_child: 0 },
-            NodeHeader { occupancy: 1u32 << 8,  first_child: 1 },
-            NodeHeader { occupancy: 0,          first_child: 2 },
-        ];
-        let children = vec![
-            GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 1 },
-            GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 2 },
-        ];
+        // Layout:
+        //   offset 0: root header (occupancy=1<<16, first_child=2)
+        //   offset 2: root child (tag=2, node_index=1)
+        //   offset 4: node 1 header (occupancy=1<<8, first_child=6)
+        //   offset 6: node 1 child (tag=2, node_index=2)
+        //   offset 8: node 2 header (occupancy=0, first_child=10)
+        let mut tree: Vec<u32> = Vec::new();
+        tree.extend_from_slice(&[1u32 << 16, 2]);              // root
+        tree.extend_from_slice(&[encode_packed(2, 0), 1]);     // root's child
+        tree.extend_from_slice(&[1u32 << 8, 6]);               // node 1
+        tree.extend_from_slice(&[encode_packed(2, 0), 2]);     // node 1's child
+        tree.extend_from_slice(&[0, 10]);                       // node 2
+        let offsets = vec![0u32, 4, 8];
 
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&nodes, &children, &[16, 8]);
+            build_ribbon(&tree, &offsets, &[16, 8]);
         assert_eq!(frame_root_idx, 2);
         assert_eq!(ribbon.len(), 2);
         // Pop order: ribbon[0] = direct parent (idx 1, from slot 8);
@@ -243,14 +276,12 @@ mod tests {
     fn out_of_bounds_index_safe() {
         // A tag=2 child pointing past the nodes array: walker must
         // not panic, just stop the descent.
-        let nodes = vec![
-            NodeHeader { occupancy: 1u32 << 5, first_child: 0 },
-        ];
-        let children = vec![
-            GpuChild { tag: 2, block_type: 0, _pad: 0, node_index: 999 },
-        ];
+        let mut tree: Vec<u32> = Vec::new();
+        tree.extend_from_slice(&[1u32 << 5, 2]);
+        tree.extend_from_slice(&[encode_packed(2, 0), 999]);
+        let offsets = vec![0u32];
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&nodes, &children, &[5, 5]);
+            build_ribbon(&tree, &offsets, &[5, 5]);
         assert_eq!(frame_root_idx, 999);
         assert_eq!(ribbon.len(), 1);
     }
@@ -278,14 +309,14 @@ mod tests {
     fn ribbon_for_path_into_body_in_planet_world() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (nodes, children, _kinds, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&nodes, &children, &[13]);
-        assert!(frame_root_idx > 0, "body packed at non-zero index");
+            build_ribbon(&tree, &offsets, &[13]);
+        assert!(frame_root_idx > 0, "body packed at non-zero BFS idx");
         assert_eq!(ribbon.len(), 1);
-        assert_eq!(ribbon[0].node_idx, 0, "world root at index 0");
+        assert_eq!(ribbon[0].node_idx, 0, "world root at BFS idx 0");
         assert_eq!(ribbon[0].slot(), 13);
     }
 
@@ -293,12 +324,12 @@ mod tests {
     fn reached_slots_truncated_when_pack_flattens_sibling() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (nodes, children, _kinds, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         // Slot 16 is uniform-empty Cartesian → absent from pack.
         // Descent into [16, 13] stops at depth 0.
-        let r = build_ribbon(&nodes, &children, &[16, 13]);
+        let r = build_ribbon(&tree, &offsets, &[16, 13]);
         assert_eq!(r.frame_root_idx, 0, "stayed at world root");
         assert!(r.ribbon.is_empty());
         assert!(r.reached_slots.is_empty(),
@@ -309,11 +340,11 @@ mod tests {
     fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
         let world = planet_world();
         let camera = camera_at([0.5, 0.5, 0.5]);
-        let (nodes, children, _kinds, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&nodes, &children, &[]);
+            build_ribbon(&tree, &offsets, &[]);
         assert_eq!(frame_root_idx, 0);
         assert!(ribbon.is_empty());
     }

@@ -48,15 +48,17 @@ fn march_cartesian(
     s_node_origin[0] = vec3<f32>(0.0);
     s_cell_size[0] = 1.0;
 
-    // Sparse-layout header for the CURRENT depth, cached in scalar
-    // registers. Written on entry, refreshed on descend AND on pop.
-    // Inner-loop slot checks at the same node never re-read nodes[].
-    // This is the doc's "read the entire node header once per
-    // descent" optimization, applied to the Cartesian DDA where we
-    // often check many slots at the same node before advancing.
-    let root_header = nodes[root_node_idx];
-    var cur_occupancy: u32 = root_header.occupancy;
-    var cur_first_child: u32 = root_header.first_child;
+    // Interleaved-layout header for the CURRENT depth, cached in
+    // scalar registers. Written on entry, refreshed on descend AND
+    // on pop. Inner-loop slot checks at the same node never re-read
+    // tree[] headers — the compiler keeps occupancy / first_child in
+    // registers across the inner loop. With the interleaved layout,
+    // the header's two u32s live in the same 64-byte cache line as
+    // the first child entry, so even the initial load pair is a
+    // single-line fetch on Apple Silicon's L1.
+    let root_header_off = node_offsets[root_node_idx];
+    var cur_occupancy: u32 = tree[root_header_off];
+    var cur_first_child: u32 = tree[root_header_off + 1u];
 
     let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
@@ -99,9 +101,9 @@ fn march_cartesian(
             // Popped to a shallower depth. Reload cur_occupancy /
             // cur_first_child for the new depth's node. Pops are
             // rare compared to per-slot checks, so this is cheap.
-            let parent_header = nodes[s_node_idx[depth]];
-            cur_occupancy = parent_header.occupancy;
-            cur_first_child = parent_header.first_child;
+            let parent_header_off = node_offsets[s_node_idx[depth]];
+            cur_occupancy = tree[parent_header_off];
+            cur_first_child = tree[parent_header_off + 1u];
 
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
@@ -144,10 +146,13 @@ fn march_cartesian(
         }
 
         // Non-empty: compute rank via popcount, then load the
-        // compact child entry (2 u32s: packed tag/block_type/pad
-        // and node_index).
+        // interleaved child entry (2 u32s: packed tag/block_type/pad
+        // and BFS node_index). `cur_first_child` is already in
+        // tree[] u32 units; the entry sits at `first_child + rank*2`
+        // in the SAME buffer as the header we just read, typically
+        // on the same cache line.
         let rank = countOneBits(cur_occupancy & (slot_bit - 1u));
-        let child_base = (cur_first_child + rank) * 2u;
+        let child_base = cur_first_child + rank * 2u;
         let packed = tree[child_base];
         let tag = packed & 0xFFu;
 
@@ -348,10 +353,13 @@ fn march_cartesian(
                 s_node_origin[depth] = child_origin;
                 s_cell_size[depth] = child_cell_size;
                 // Load the new current-depth header into scalar
-                // registers so the inner loop never re-reads nodes[].
-                let child_header = nodes[child_idx];
-                cur_occupancy = child_header.occupancy;
-                cur_first_child = child_header.first_child;
+                // registers so the inner loop never re-reads tree[]
+                // headers. `node_offsets` is the only per-descent
+                // cross-buffer hop; subsequent per-cell accesses
+                // stay in registers.
+                let child_header_off = node_offsets[child_idx];
+                cur_occupancy = tree[child_header_off];
+                cur_first_child = tree[child_header_off + 1u];
                 s_cell[depth] = vec3<i32>(
                     clamp(i32(floor(local_entry.x)), 0, 2),
                     clamp(i32(floor(local_entry.y)), 0, 2),
