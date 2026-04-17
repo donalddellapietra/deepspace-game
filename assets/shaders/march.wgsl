@@ -40,11 +40,6 @@ fn march_cartesian(
     var s_side_dist: array<vec3<f32>, MAX_STACK_DEPTH>;
     var s_node_origin: array<vec3<f32>, MAX_STACK_DEPTH>;
     var s_cell_size: array<f32, MAX_STACK_DEPTH>;
-    // Cached sparse-layout header per stack depth. Written when
-    // we push a new depth or start the march; re-used across all
-    // slot checks at that depth without re-loading nodes[].
-    var s_occupancy: array<u32, MAX_STACK_DEPTH>;
-    var s_first_child: array<u32, MAX_STACK_DEPTH>;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
@@ -52,9 +47,6 @@ fn march_cartesian(
     s_node_idx[0] = root_node_idx;
     s_node_origin[0] = vec3<f32>(0.0);
     s_cell_size[0] = 1.0;
-    let root_header = nodes[root_node_idx];
-    s_occupancy[0] = root_header.occupancy;
-    s_first_child[0] = root_header.first_child;
 
     let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
@@ -111,10 +103,12 @@ fn march_cartesian(
         }
 
         let slot = slot_from_xyz(cell.x, cell.y, cell.z);
-        // Header is already cached in s_occupancy/s_first_child at
-        // this stack depth — no memory load per iteration.
-        let occupancy = s_occupancy[depth];
-        let first_child = s_first_child[depth];
+        // Inline header fetch. WGSL CSE across iterations on the
+        // same depth (s_node_idx[depth] unchanged until we push/pop)
+        // makes this a single nodes[] load per node visit.
+        let header = nodes[s_node_idx[depth]];
+        let occupancy = header.occupancy;
+        let first_child = header.first_child;
         let slot_bit = 1u << slot;
         if ((occupancy & slot_bit) == 0u) {
             // Empty — DDA advance. No access to the compact array.
@@ -337,9 +331,6 @@ fn march_cartesian(
 
                 depth += 1u;
                 s_node_idx[depth] = child_idx;
-                let child_header = nodes[child_idx];
-                s_occupancy[depth] = child_header.occupancy;
-                s_first_child[depth] = child_header.first_child;
                 s_node_origin[depth] = child_origin;
                 s_cell_size[depth] = child_cell_size;
                 s_cell[depth] = vec3<i32>(
