@@ -70,11 +70,23 @@ pub(crate) const BRICK_DIM: usize = 27;
 pub(crate) const BRICK_VOXELS: usize = BRICK_DIM * BRICK_DIM * BRICK_DIM;
 /// u32 words per brick when packing 4 cells per word, ceil-divided.
 pub(crate) const BRICK_U32S: usize = (BRICK_VOXELS + 3) / 4;
-/// Minimum non-empty fraction needed to brick a subtree. Below this
-/// the subtree stays sparse — bricks aren't a storage win for nearly-
-/// empty content (19.2 KiB per brick), and most rays through them
-/// would exit without hitting anything.
-const BRICK_DENSITY_THRESHOLD: f32 = 0.05;
+/// Minimum non-empty fraction needed to brick a subtree.
+///
+/// **PHASE 1 RESULT: bricks regress every workload measured. Set to
+/// 2.0 (impossible) to disable brick emission while keeping the
+/// dispatch path in the shader for future re-enabling. See
+/// `docs/testing/perf-brickmap-null-result.md` for the full writeup.**
+///
+/// Brief: any threshold low enough to emit bricks emits sparse ones
+/// that lose to the recursive DDA's empty-representative bypass; any
+/// threshold high enough to avoid sparse bricks emits zero, leaving
+/// only the dispatch tax (~+1.2 ms steady-state on soldier even with
+/// zero bricks). The recursive DDA on this branch has been heavily
+/// optimized (AABB cull, empty-repr bypass, scalar header cache,
+/// branchless min-axis); the per-cell win brickmaps capture against
+/// naive sparse octrees has already been captured here, so the
+/// brick's per-cell efficiency advantage has nothing left to give.
+const BRICK_DENSITY_THRESHOLD: f32 = 2.0;
 
 /// One slot in the BFS-ordered output. Sparse nodes carry a real
 /// `NodeId` (their children get walked); bricks carry the offset of

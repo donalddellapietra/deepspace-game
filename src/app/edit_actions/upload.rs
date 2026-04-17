@@ -133,13 +133,16 @@ impl App {
                 renderer.update_ribbon(&r.ribbon);
             }
             if self.render_harness {
+                let brick_count = node_kinds.iter().filter(|k| k.kind == 3).count();
                 eprintln!(
-                    "render_harness_pack kind={:?} cartesian_lod_enabled={} packed_nodes={} tree_u32s={} library_nodes={}",
+                    "render_harness_pack kind={:?} cartesian_lod_enabled={} packed_nodes={} tree_u32s={} library_nodes={} bricks={} brick_data_u32s={}",
                     intended_frame.kind,
                     true,
                     packed_node_count,
                     tree_packed.len(),
                     self.world.library.len(),
+                    brick_count,
+                    brick_data.len(),
                 );
             }
         }
