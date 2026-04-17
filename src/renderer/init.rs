@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonEntry, NodeHeader};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -13,7 +13,8 @@ use super::{GpuUniforms, Renderer, TimestampScratch, ROOT_KIND_CARTESIAN};
 impl Renderer {
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
-        tree_data: &[GpuChild],
+        nodes: &[NodeHeader],
+        children: &[GpuChild],
         node_kinds: &[GpuNodeKind],
         root_index: u32,
         present_mode: wgpu::PresentMode,
@@ -49,12 +50,19 @@ impl Renderer {
         } else {
             wgpu::Features::empty()
         };
+        // Sparse tree needs 5 storage buffers (tree, node_kinds,
+        // ribbon, shader_stats, nodes). `downlevel_defaults` caps
+        // that at 4; bump to 8 (the WebGPU spec default) so the
+        // limit is portable to the browser backend too.
+        let required_limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 8,
+            ..wgpu::Limits::downlevel_defaults()
+        }.using_resolution(adapter.limits());
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("deepspace"),
                 required_features,
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
@@ -92,9 +100,22 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
+        // Storage buffers cannot be zero-sized; stub any empty inputs.
+        let stub_nodes = [NodeHeader { occupancy: 0, first_child: 0 }];
+        let stub_children = [GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }];
+        let nodes_init: &[NodeHeader] = if nodes.is_empty() { &stub_nodes } else { nodes };
+        let children_init: &[GpuChild] =
+            if children.is_empty() { &stub_children } else { children };
+
+        let nodes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nodes"),
+            contents: bytemuck::cast_slice(nodes_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let tree_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree"),
-            contents: bytemuck::cast_slice(tree_data),
+            contents: bytemuck::cast_slice(children_init),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -127,7 +148,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let node_count = (tree_data.len() / 27) as u32;
+        let node_count = nodes.len() as u32;
         let uniforms = GpuUniforms {
             root_index,
             node_count,
@@ -212,7 +233,6 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
-                // Ancestor ribbon (binding 5).
                 wgpu::BindGroupLayoutEntry {
                     binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
@@ -220,11 +240,19 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
-                // Shader stats (binding 6, read_write for atomics).
                 wgpu::BindGroupLayoutEntry {
                     binding: 6, visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
+                // Node headers (binding 7) — sparse-layout occupancy
+                // mask + first_child offset per packed node.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
@@ -235,7 +263,7 @@ impl Renderer {
             &device, &bind_group_layout,
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
-            &shader_stats_buffer,
+            &shader_stats_buffer, &nodes_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -322,7 +350,7 @@ impl Renderer {
 
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
-            tree_buffer, node_kinds_buffer,
+            tree_buffer, nodes_buffer, node_kinds_buffer,
             camera_buffer, palette_buffer, uniforms_buffer,
             ribbon_buffer,
             bind_group,

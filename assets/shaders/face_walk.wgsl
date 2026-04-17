@@ -34,12 +34,12 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     result.depth = 1u;
 
     let fs = face_slot(face);
-    let face_packed = child_packed(body_node_idx, fs);
-    let face_tag = child_tag(face_packed);
-    if face_tag == 0u {
+    if child_empty(body_node_idx, fs) {
         result.block = 0u;
         return result;
     }
+    let face_packed = child_packed(body_node_idx, fs);
+    let face_tag = child_tag(face_packed);
     if face_tag == 1u {
         result.block = child_block_type(face_packed);
         return result;
@@ -142,11 +142,11 @@ fn sample_face_node(node_idx: u32,
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
-        let packed = child_packed(node, slot);
-        let tag = child_tag(packed);
-        if tag == 0u {
+        if child_empty(node, slot) {
             return vec2<u32>(0u, d);
         }
+        let packed = child_packed(node, slot);
+        let tag = child_tag(packed);
         if tag == 1u {
             return vec2<u32>(child_block_type(packed), d);
         }

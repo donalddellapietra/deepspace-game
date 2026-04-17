@@ -103,11 +103,36 @@ fn march_cartesian(
         }
 
         let slot = slot_from_xyz(cell.x, cell.y, cell.z);
+        // Sparse fast-path: occupancy-bit test first — an empty slot
+        // costs one u32 load of the node header (cached by WGSL CSE
+        // across successive slot checks at the same node) and no
+        // memory access to the compact child array.
+        if child_empty(s_node_idx[depth], slot) {
+            // Empty — DDA advance.
+            if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+            if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                s_cell[depth].x += step.x;
+                s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+            } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                s_cell[depth].y += step.y;
+                s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+            } else {
+                s_cell[depth].z += step.z;
+                s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+            }
+            continue;
+        }
+
         let packed = child_packed(s_node_idx[depth], slot);
         let tag = child_tag(packed);
 
         if tag == 0u {
-            // Empty — DDA advance.
+            // Unreachable in the sparse layout — `child_empty` above
+            // already handled the empty case. Kept for belt-and-
+            // suspenders; compiler should DCE it.
             if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;

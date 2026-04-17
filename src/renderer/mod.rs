@@ -58,7 +58,12 @@ pub struct Renderer {
     pub(super) config: wgpu::SurfaceConfiguration,
     pub(super) pipeline: wgpu::RenderPipeline,
     pub(super) bind_group_layout: wgpu::BindGroupLayout,
+    /// Compact child-entry buffer (8 B × non-empty-children). Indexed
+    /// via the header's `first_child + popcount(occupancy & mask)`.
     pub(super) tree_buffer: wgpu::Buffer,
+    /// Per-node header buffer (8 B × packed nodes): occupancy bitmask
+    /// + `first_child` offset into the compact child array.
+    pub(super) nodes_buffer: wgpu::Buffer,
     pub(super) node_kinds_buffer: wgpu::Buffer,
     pub(super) camera_buffer: wgpu::Buffer,
     pub(super) palette_buffer: wgpu::Buffer,

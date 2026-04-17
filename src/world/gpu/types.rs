@@ -4,17 +4,45 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::world::tree::NodeKind;
 
-/// One node in the GPU buffer = 27 GpuChild = 216 bytes.
-pub const GPU_NODE_SIZE: usize = 27;
-
-/// One child slot in the packed tree buffer. 8 bytes total:
+/// Per-node header in the sparse GPU layout. 8 bytes:
 ///
-/// - `tag` (u8): 0 = Empty, 1 = Block, 2 = Node
+/// - `occupancy` (u32): low 27 bits form a bitmask where bit `s`
+///   is set iff slot `s` is non-empty. Bits 27..31 are reserved for
+///   per-node flags.
+/// - `first_child` (u32): offset into the packed children buffer
+///   (in `GpuChild` units) of this node's run of non-empty children.
+///   Entries are stored in slot-ascending order; the `k`-th popcount
+///   of occupancy bits below slot `s` is the rank of slot `s` within
+///   the run.
+///
+/// Look up slot `s`:
+/// ```text
+/// let h = nodes[n];
+/// let bit = 1u32 << s;
+/// if h.occupancy & bit == 0 { EMPTY }
+/// else {
+///     let rank = (h.occupancy & (bit - 1)).count_ones();
+///     children[h.first_child + rank]
+/// }
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq, Default)]
+pub struct NodeHeader {
+    pub occupancy: u32,
+    pub first_child: u32,
+}
+
+/// One child entry in the packed children buffer. 8 bytes.
+/// Empty slots are absent from the buffer — they're encoded by
+/// a clear bit in the parent's `NodeHeader.occupancy`. Only two
+/// tag values appear: `1 = Block`, `2 = Node`.
+///
+/// - `tag` (u8): 1 = Block, 2 = Node. (tag=0 never appears.)
 /// - `block_type` (u8): valid when `tag == 1` (LOD-flattened or
 ///   leaf block). For `tag == 2` it carries the child's
 ///   representative block — a hint the shader can use without
 ///   descending.
-/// - `_pad` (u16): alignment.
+/// - `_pad` (u16): reserved for per-child flags.
 /// - `node_index` (u32): buffer-local index, valid when `tag == 2`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
@@ -90,6 +118,11 @@ impl Default for GpuPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_header_size() {
+        assert_eq!(std::mem::size_of::<NodeHeader>(), 8);
+    }
 
     #[test]
     fn gpu_child_size() {

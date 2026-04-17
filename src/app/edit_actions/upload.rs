@@ -45,7 +45,7 @@ impl App {
 
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-            let (tree_data, node_kinds, _world_root_idx) = {
+            let (nodes_packed, children_packed, node_kinds, _world_root_idx) = {
                 let mut preserve_path_storage = vec![intended_frame.render_path];
                 if intended_frame.logical_path != intended_frame.render_path {
                     preserve_path_storage.push(intended_frame.logical_path);
@@ -90,17 +90,21 @@ impl App {
                 )
             };
             pack_elapsed = pack_start.elapsed();
-            let packed_node_count = tree_data.len() / 27;
+            let packed_node_count = nodes_packed.len();
             self.last_packed_node_count = packed_node_count as u32;
 
             // build_ribbon may stop short of the intended frame when
             // pack LOD-flattened a sibling on the way down (uniform-
-            // empty Cartesian children become tag=0 leaves). The
-            // shader can only operate at the depth the buffer
-            // actually reached, so we recompute cam_local against the
-            // truncated path.
+            // empty Cartesian children become absent from the
+            // occupancy mask). The shader can only operate at the
+            // depth the buffer actually reached, so we recompute
+            // cam_local against the truncated path.
             let ribbon_start = std::time::Instant::now();
-            let r = gpu::build_ribbon(&tree_data, intended_frame.render_path.as_slice());
+            let r = gpu::build_ribbon(
+                &nodes_packed,
+                &children_packed,
+                intended_frame.render_path.as_slice(),
+            );
             ribbon_elapsed = ribbon_start.elapsed();
             self.last_ribbon_len = r.ribbon.len() as u32;
             let effective_path = frame::frame_from_slots(&r.reached_slots);
@@ -119,15 +123,21 @@ impl App {
             self.last_lod_upload_key = Some(upload_key);
 
             if let Some(renderer) = &mut self.renderer {
-                renderer.update_tree(&tree_data, &node_kinds, r.frame_root_idx);
+                renderer.update_tree(
+                    &nodes_packed,
+                    &children_packed,
+                    &node_kinds,
+                    r.frame_root_idx,
+                );
                 renderer.update_ribbon(&r.ribbon);
             }
             if self.render_harness {
                 eprintln!(
-                    "render_harness_pack kind={:?} cartesian_lod_enabled={} packed_nodes={} library_nodes={}",
+                    "render_harness_pack kind={:?} cartesian_lod_enabled={} packed_nodes={} packed_children={} library_nodes={}",
                     intended_frame.kind,
                     true,
                     packed_node_count,
+                    children_packed.len(),
                     self.world.library.len(),
                 );
             }

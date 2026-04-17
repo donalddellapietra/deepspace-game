@@ -5,28 +5,46 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuRibbonEntry, NodeHeader};
 
 use super::{GpuUniforms, Renderer, MAX_RIBBON_LEN};
 
 impl Renderer {
-    /// Re-upload the tree + node_kinds buffers after an edit or
-    /// re-pack. Recreates the GPU buffers and bind group when the
-    /// data outgrew the previous allocation.
+    /// Re-upload the sparse tree buffers after an edit or re-pack.
+    /// Three parallel uploads: node headers (occupancy + first_child
+    /// offsets), the compact non-empty child array, and the per-node
+    /// kind metadata. Recreates GPU buffers and rebinds when any of
+    /// them outgrew the previous allocation.
     pub fn update_tree(
         &mut self,
-        tree_data: &[GpuChild],
+        nodes: &[NodeHeader],
+        children: &[GpuChild],
         node_kinds: &[GpuNodeKind],
         root_index: u32,
     ) {
         self.root_index = root_index;
-        self.node_count = (tree_data.len() / 27) as u32;
+        self.node_count = nodes.len() as u32;
+
+        // Storage buffers cannot be zero-sized. Supply a single
+        // zero-filled stub so a freshly-created library with zero
+        // nodes (only seen in pathological edge cases) still has a
+        // valid bind group — the shader never indexes into it because
+        // the ribbon is empty and the root is the only node read.
+        let stub_nodes = [NodeHeader { occupancy: 0, first_child: 0 }];
+        let stub_children = [GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 }];
+        let nodes_payload: &[NodeHeader] = if nodes.is_empty() { &stub_nodes } else { nodes };
+        let children_payload: &[GpuChild] =
+            if children.is_empty() { &stub_children } else { children };
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let write_start = std::time::Instant::now();
+        let nodes_grew = upload_or_recreate(
+            &mut self.nodes_buffer, &self.device, &self.queue,
+            "nodes", nodes_payload, storage,
+        );
         let tree_grew = upload_or_recreate(
             &mut self.tree_buffer, &self.device, &self.queue,
-            "tree", tree_data, storage,
+            "tree", children_payload, storage,
         );
         let kinds_grew = upload_or_recreate(
             &mut self.node_kinds_buffer, &self.device, &self.queue,
@@ -35,13 +53,13 @@ impl Renderer {
         self.last_tree_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
 
         self.last_bind_group_rebuild_ms = 0.0;
-        if tree_grew || kinds_grew {
+        if nodes_grew || tree_grew || kinds_grew {
             let rebuild_start = std::time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
-                &self.shader_stats_buffer,
+                &self.shader_stats_buffer, &self.nodes_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -82,7 +100,7 @@ impl Renderer {
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
-                &self.shader_stats_buffer,
+                &self.shader_stats_buffer, &self.nodes_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -156,6 +174,7 @@ pub(super) fn make_bind_group(
     node_kinds: &wgpu::Buffer,
     ribbon: &wgpu::Buffer,
     shader_stats: &wgpu::Buffer,
+    nodes: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -168,6 +187,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 4, resource: node_kinds.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: nodes.as_entire_binding() },
         ],
     })
 }

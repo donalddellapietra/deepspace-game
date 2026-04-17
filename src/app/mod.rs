@@ -181,9 +181,9 @@ pub struct App {
     /// Cost of building the ancestor ribbon from the packed tree.
     /// Set by `upload_tree_lod`. `0.0` when the LOD key was reused.
     pub(super) last_ribbon_build_ms: f64,
-    /// Number of GpuChild-striped nodes in the most recent packed
-    /// tree. Static signal: tells the harness how much data the
-    /// shader had to walk.
+    /// Number of packed nodes in the most recent packed tree (i.e.
+    /// `nodes.len()` in the sparse layout). Static signal: tells the
+    /// harness how much data the shader had to walk.
     pub(super) last_packed_node_count: u32,
     /// Length of the ancestor ribbon pushed to the GPU.
     pub(super) last_ribbon_len: u32,

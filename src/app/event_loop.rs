@@ -133,10 +133,15 @@ impl App {
         let prepare_elapsed = std::time::Duration::ZERO;
 
         let pack_start = std::time::Instant::now();
-        let (tree_data, node_kinds, root_index) =
+        let (nodes_packed, children_packed, node_kinds, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
         let pack_elapsed = pack_start.elapsed();
-        eprintln!("startup_perf {source}: tree_packed ms={:.2} nodes={}", pack_elapsed.as_secs_f64() * 1000.0, tree_data.len() / 27);
+        eprintln!(
+            "startup_perf {source}: tree_packed ms={:.2} nodes={} children={}",
+            pack_elapsed.as_secs_f64() * 1000.0,
+            nodes_packed.len(),
+            children_packed.len(),
+        );
         let renderer_start = std::time::Instant::now();
         let shader_stats_enabled = self.shader_stats_enabled;
         let lod_pixel_threshold = self.lod_pixel_threshold;
@@ -144,7 +149,8 @@ impl App {
         let renderer = pollster::block_on(
             Renderer::new(
                 window,
-                &tree_data,
+                &nodes_packed,
+                &children_packed,
                 &node_kinds,
                 root_index,
                 if self.low_latency_present {
@@ -189,14 +195,15 @@ impl App {
             window.request_redraw();
         }
         eprintln!(
-            "startup_perf {source} total_ms={:.2} window_ms={:.2} prepare_ms={:.2} pack_ms={:.2} renderer_ms={:.2} apply_zoom_ms={:.2} nodes={} kinds={}",
+            "startup_perf {source} total_ms={:.2} window_ms={:.2} prepare_ms={:.2} pack_ms={:.2} renderer_ms={:.2} apply_zoom_ms={:.2} nodes={} children={} kinds={}",
             resumed_start.elapsed().as_secs_f64() * 1000.0,
             window_elapsed.as_secs_f64() * 1000.0,
             prepare_elapsed.as_secs_f64() * 1000.0,
             pack_elapsed.as_secs_f64() * 1000.0,
             renderer_elapsed.as_secs_f64() * 1000.0,
             zoom_elapsed.as_secs_f64() * 1000.0,
-            tree_data.len() / 27,
+            nodes_packed.len(),
+            children_packed.len(),
             node_kinds.len(),
         );
     }
