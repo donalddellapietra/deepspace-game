@@ -319,6 +319,63 @@ Pixel correctness: plain_d8 and sphere pixel-identical. zoom3 one
 pixel differs by max intensity 6 — floating-point rounding at an
 edge, not a correctness bug.
 
+## `s_cell` scalarization (tried — null)
+
+Followed the same pattern as the three scalar-stack wins (s_cell_size,
+s_node_origin, s_side_dist): keep `s_cell` as a stash-only array, hoist
+a `cur_cell: vec3<i32>` scalar for the hot path, stash on descend,
+restore on pop.
+
+Slow-soldier @ 2560×1440, 300 frames, 3-run median:
+
+| metric | branchless (baseline) | + s_cell scalar |
+|---|---|---|
+| submitted_done_ms | 6.39 | 6.36 |
+
+−0.03 ms, inside run-to-run noise (±0.05 ms). Reverted.
+
+**Why it didn't land when the other three did.** The other stack arrays
+held `vec3<f32>` / `f32` data that was modified with `+= * f` every
+iteration — the compiler couldn't registerize `s_side_dist[depth]`
+across writes because of aliasing conservatism, so it was really
+spilling through thread-local memory. `s_cell` holds `vec3<i32>` that
+only gets `+= step` with a constant index pattern; Naga/MSL apparently
+already promotes this pattern to registers. The manual stash/restore
+adds write/read pairs on descend and pop that exactly cancel what was
+saved in the hot path.
+
+**Takeaway.** The "scalarize every stack array" heuristic that worked
+for steps 1–3 doesn't generalize past the three we landed. The
+remaining arrays (`s_cell`, `s_node_idx`) are the ones the compiler can
+already handle. Not worth keeping.
+
+## Branchless min-axis DDA advance (−18%)
+
+Replaced 7 copies of the `if cur_side_dist.x < y && x < z { … } else
+if y < z { … } else { … }` chain with a pure-arithmetic `vec3` mask
+(`min_axis_mask()` in `ray_prim.wgsl`). The four compares inside the
+helper are pairwise independent, so the compiler can issue them in
+parallel instead of serializing an if/else-if chain with a 3-deep
+dependent predicate.
+
+Slow-soldier @ 2560×1440, 300 frames, 3-run median:
+
+| metric | AABB folded (baseline) | + branchless min-axis |
+|---|---|---|
+| submitted_done_ms | 7.81 | **6.39** (−18.2%) |
+
+Pixel-identical on plain_d8, sphere, zoom3.
+
+**Cumulative from slow-soldier baseline: 17.77 → 6.39 ms = 2.78× FPS.**
+
+**Why this worked when `s_cell` scalarization didn't.** The branching
+min-axis was ALU-dependency-chain-limited, not memory-limited. The
+7-copy if/else-if pattern forced dependent predication; replacing it
+with the `vec3` mask exposes parallelism the compiler can schedule. The
+Top-Performance-Limiter counter confirmed "ALU Limiter" was the
+dominant category even after the stack-scalar steps — this is the
+change that attacks that category directly.
+
 ## LOD tuning (tried — null)
 
 Runtime flag `--lod-pixels 2.0` doubled the sub-pixel-rejection
