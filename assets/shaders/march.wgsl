@@ -48,6 +48,16 @@ fn march_cartesian(
     s_node_origin[0] = vec3<f32>(0.0);
     s_cell_size[0] = 1.0;
 
+    // Sparse-layout header for the CURRENT depth, cached in scalar
+    // registers. Written on entry, refreshed on descend AND on pop.
+    // Inner-loop slot checks at the same node never re-read nodes[].
+    // This is the doc's "read the entire node header once per
+    // descent" optimization, applied to the Cartesian DDA where we
+    // often check many slots at the same node before advancing.
+    let root_header = nodes[root_node_idx];
+    var cur_occupancy: u32 = root_header.occupancy;
+    var cur_first_child: u32 = root_header.first_child;
+
     let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
@@ -86,6 +96,13 @@ fn march_cartesian(
             depth -= 1u;
             if ENABLE_STATS { ray_steps_oob = ray_steps_oob + 1u; }
 
+            // Popped to a shallower depth. Reload cur_occupancy /
+            // cur_first_child for the new depth's node. Pops are
+            // rare compared to per-slot checks, so this is cheap.
+            let parent_header = nodes[s_node_idx[depth]];
+            cur_occupancy = parent_header.occupancy;
+            cur_first_child = parent_header.first_child;
+
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                 s_cell[depth].x += step.x;
                 s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
@@ -103,14 +120,11 @@ fn march_cartesian(
         }
 
         let slot = slot_from_xyz(cell.x, cell.y, cell.z);
-        // Inline header fetch. WGSL CSE across iterations on the
-        // same depth (s_node_idx[depth] unchanged until we push/pop)
-        // makes this a single nodes[] load per node visit.
-        let header = nodes[s_node_idx[depth]];
-        let occupancy = header.occupancy;
-        let first_child = header.first_child;
+        // Use the cached current-depth header. No storage-buffer
+        // load per iteration — the compiler keeps cur_occupancy /
+        // cur_first_child in registers across the inner loop.
         let slot_bit = 1u << slot;
-        if ((occupancy & slot_bit) == 0u) {
+        if ((cur_occupancy & slot_bit) == 0u) {
             // Empty — DDA advance. No access to the compact array.
             if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
@@ -132,8 +146,8 @@ fn march_cartesian(
         // Non-empty: compute rank via popcount, then load the
         // compact child entry (2 u32s: packed tag/block_type/pad
         // and node_index).
-        let rank = countOneBits(occupancy & (slot_bit - 1u));
-        let child_base = (first_child + rank) * 2u;
+        let rank = countOneBits(cur_occupancy & (slot_bit - 1u));
+        let child_base = (cur_first_child + rank) * 2u;
         let packed = tree[child_base];
         let tag = packed & 0xFFu;
 
@@ -333,6 +347,11 @@ fn march_cartesian(
                 s_node_idx[depth] = child_idx;
                 s_node_origin[depth] = child_origin;
                 s_cell_size[depth] = child_cell_size;
+                // Load the new current-depth header into scalar
+                // registers so the inner loop never re-reads nodes[].
+                let child_header = nodes[child_idx];
+                cur_occupancy = child_header.occupancy;
+                cur_first_child = child_header.first_child;
                 s_cell[depth] = vec3<i32>(
                     clamp(i32(floor(local_entry.x)), 0, 2),
                     clamp(i32(floor(local_entry.y)), 0, 2),
