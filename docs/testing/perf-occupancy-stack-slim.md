@@ -210,47 +210,96 @@ was a plausible-but-wrong hypothesis. The actual story:
 The `gpu-telemetry.md` interpretation rule "Fragment Occupancy <25% →
 register pressure" needs a caveat for ALU-bound shaders.
 
-## Empty-run batching experiment (reverted)
+## Empty-run batching experiments (all reverted)
 
-Attempted a shader-only variant of INV9: after the normal DDA empty-
-advance, peek at the next slot along the dominant axis in the same
-node's occupancy mask; if it's also empty AND the axis is still
-dominant after one step, do a second advance inline (batch size ≤ 2).
+Two attempts at empty-cell batching in the DDA path; both regressed.
 
-| metric | step 3 (scalar stack) | step 4 (in-node empty-run) |
+### Attempt 1: single extra step, shader-only (step 4)
+
+After a normal DDA empty-advance, peek the next slot along the
+dominant axis; if empty AND axis still dominant, do a second step
+inline (batch size ≤ 2, no pack changes).
+
+| metric | step 3 | attempt 1 |
 |---|---|---|
-| submitted_done_ms | 9.82 ms | **13.53 ms** |
+| submitted_done_ms | 9.82 ms | **13.53 ms (+38%)** |
 | avg_steps | 31.6 | 31.33 |
 
-**38% regression.** avg_steps barely moved — batch fires in <1% of
-empty iterations. In this scene, rays cross diagonally; dominant axis
-typically switches every single step, so the "same axis still
-dominant" condition rarely holds. The unconditional ~10 ALU ops of
-bounds+slot+empty+dominance checks dwarf the rare batch savings.
+Batch fires in <1% of empty iterations — dominant axis switches too
+often on diagonal rays for the "still dominant" constraint to hold.
+~10 ALU ops of unconditional check overhead dwarfs the rare savings.
 
-Reverted. The empirical takeaway: on sparse diagonally-viewed
-geometry, in-node empty runs of length ≥ 2 along the dominant axis
-are rare. The cross-level variant (full INV9, per-node precomputed
-run lengths across multiple depths) operates where the actual long
-runs live — entire empty subtrees covering many-cell spans at the
-parent/grandparent level. That's the version worth implementing.
+### Attempt 2: row-empty fast-forward to OOB
 
-## Next steps
+Promoted from single-step to "skip to OOB in the dominant axis if the
+entire axis-row is empty AND the ray will exit the row before crossing
+either other axis plane." Uses `row_mask = (1 << s) | (1 << s+stride)
+| (1 << s+2*stride)` against `cur_occupancy`, plus a DDA-safety check
+`t_oob < min(other_side_dists)`. Safe in principle because the row-
+empty condition guarantees no missed cells.
 
-Further wins from here require attacking ALU work per ray, NOT
-occupancy:
+| metric | step 3 | attempt 2 |
+|---|---|---|
+| submitted_done_ms | 9.82 ms | **11.39 ms (+16%)** |
+| avg_steps | 31.6 | 30.53 |
+| avg_empty | 14.6 | 14.62 |
 
-- **Full INV9** — per-node precomputed empty-run metadata at pack
-  time, crossing child-subtree boundaries. The `child_bt == 255u`
-  fast path already captures "whole subtree empty" for ONE level;
-  full INV9 extends this to multi-level runs.
-- **Compute shader + threadgroup tree cache** — cuts storage-buffer
-  load instructions (which show up as ALU), NOT register pressure.
-  Reframed from the original motivation but the technique is still
-  valid.
-- **F16 DDA state where precision allows** — f16 ops run at 2× rate
-  on Apple Silicon. F32 Utilization is 2-5% in our traces; there's
-  headroom.
+avg_steps dropped only 3%. The row-empty + DDA-safety conjunction
+fires roughly in ~3-5% of empty iterations — not enough to cover the
+~10-15 ALU ops of unconditional check overhead per empty iteration.
+
+### Takeaway
+
+On this scene (sparse voxelized geometry viewed diagonally at zoom=4),
+the DDA-correct empty-run batchable cases are simply **too rare for
+any flavor of in-node INV9 to help**. The long empty runs that DDA
+would naturally traverse along a single axis are the exception, not
+the rule — even when entire rows ARE empty, the ray is usually
+heading toward a y-plane or z-plane crossing first.
+
+Full pack-time INV9 would have the same structural problem: same
+DDA-correctness constraint, same rare hit rate. Precomputing the
+metadata would save only ~3 ALU ops per lookup; the check overhead
+(dominance, DDA safety) is what actually kills the bet. Not worth
+implementing.
+
+What's NOT tested here:
+
+- **Node-level AABB culling** — store a tight bounding box of non-
+  empty content per node at pack time; ray-box-test at node entry to
+  skip the entire 3×3×3 DDA if the ray misses the AABB. This attacks
+  descend-cost rather than empty-cost, and descend cost is arguably
+  higher (avg_descend=11.5 iterations at ~30 ALU/each = ~345 ops/ray
+  vs. avg_empty=14.6 × ~20 ALU/each = ~292 ops/ray).
+- **f16 DDA state** — Apple Silicon runs f16 ops at 2× the rate of
+  f32. Our F32 Utilization is 2-5% (lots of headroom to spend on
+  precision). The DDA side_dist and cell_size values could use f16
+  without visual regression (LOD is already quantized).
+- **Reducing descent count** — avg_descend=11.5 seems high; may
+  indicate LOD thresholds are too aggressive, or the ribbon-level
+  LOD could cut more.
+
+## Next steps (revised after empty-run experiments)
+
+Empty-cell batching is a dead end on this scene (see above). Real
+ALU savings lie elsewhere:
+
+- **Node-level content AABB culling** — per-node "smallest AABB
+  enclosing occupied content" stored at pack time. Ray-box-test at
+  node entry; if the ray misses the AABB, skip the whole 3×3×3 DDA.
+  Attacks descend-cost (~345 ALU ops/ray) directly. Biggest
+  theoretical win.
+- **F16 DDA state** — Apple Silicon runs f16 ops at 2× f32 rate.
+  Current F32 Utilization is 2-5%, plenty of headroom. DDA state
+  (side_dist, cell_size) can go f16 without visual regression; LOD
+  is already quantized.
+- **Reduce descent count** — avg_descend=11.5 seems high for a 5-
+  deep anchor. Tuning LOD_PIXEL_THRESHOLD or ribbon-level LOD may
+  cut descents directly. Each saved descent ≈ 30 ALU ops.
+- **Compute shader with threadgroup tree cache** — cuts storage-
+  buffer load instructions (which compile to ALU on Apple). Reframed
+  from the original "register pressure" motivation but technique
+  still valid.
 
 ## Related docs
 
