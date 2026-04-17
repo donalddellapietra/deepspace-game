@@ -472,42 +472,34 @@ fn march_cartesian(
 
         if (child_occ_peek & BRICK_FLAG_BIT) != 0u {
             // ── brick child ──
-            // Compute the brick's own cell size from its side.
             let brick_side = brick_side_from_header(child_occ_peek);
             let brick_cell_size = parent_cell_size / f32(brick_side);
             let brick_side_i = i32(brick_side);
 
-            // Resolve the ray's entry point into the brick. Use a
-            // FRESH ray_box against the brick's actual volume and
-            // snap just inside to land in the first cell. Epsilon is
-            // relative to brick_cell_size so it's proportional to
-            // the smallest feature we care about.
+            // Entry point just inside the brick's volume.
             let child_max = child_origin + vec3<f32>(parent_cell_size);
             let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);
             let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * brick_cell_size;
             let child_entry = ray_origin + ray_dir * ct_start;
 
-            // Compute brick-local entry cell. `local_brick` in
-            // [0, side). Clamp because ray_box precision near a
-            // corner can put local_brick just outside the valid
-            // range.
+            // Entry cell in brick-local coords [0, side).
             let local_brick = (child_entry - child_origin) / brick_cell_size;
             let new_cell_brick = vec3<i32>(
                 clamp(i32(floor(local_brick.x)), 0, brick_side_i - 1),
                 clamp(i32(floor(local_brick.y)), 0, brick_side_i - 1),
                 clamp(i32(floor(local_brick.z)), 0, brick_side_i - 1),
             );
+            // side_dist uses child_entry as the reference — self-
+            // contained brick DDA. Matches what `march_brick` will
+            // step with: `side_dist[i] += delta[i] * brick_cell_size`.
             let lc = vec3<f32>(new_cell_brick);
-            // side_dist references entry_pos (root-frame) to match
-            // the sparse-descent convention. DDA stepping only cares
-            // about invariant offsets; any consistent reference works.
             let new_side_dist_brick = vec3<f32>(
-                select((child_origin.x + lc.x * brick_cell_size - entry_pos.x) * inv_dir.x,
-                       (child_origin.x + (lc.x + 1.0) * brick_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                select((child_origin.y + lc.y * brick_cell_size - entry_pos.y) * inv_dir.y,
-                       (child_origin.y + (lc.y + 1.0) * brick_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-                select((child_origin.z + lc.z * brick_cell_size - entry_pos.z) * inv_dir.z,
-                       (child_origin.z + (lc.z + 1.0) * brick_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+                select((child_origin.x + lc.x * brick_cell_size - child_entry.x) * inv_dir.x,
+                       (child_origin.x + (lc.x + 1.0) * brick_cell_size - child_entry.x) * inv_dir.x, ray_dir.x >= 0.0),
+                select((child_origin.y + lc.y * brick_cell_size - child_entry.y) * inv_dir.y,
+                       (child_origin.y + (lc.y + 1.0) * brick_cell_size - child_entry.y) * inv_dir.y, ray_dir.y >= 0.0),
+                select((child_origin.z + lc.z * brick_cell_size - child_entry.z) * inv_dir.z,
+                       (child_origin.z + (lc.z + 1.0) * brick_cell_size - child_entry.z) * inv_dir.z, ray_dir.z >= 0.0),
             );
 
             let brick_result = march_brick(
