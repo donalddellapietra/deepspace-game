@@ -84,6 +84,11 @@ pub struct TestConfig {
     /// the `renderer_slow` 30 ms threshold. `None` or `Some(0)`
     /// disables.
     pub live_sample_every_frames: Option<u32>,
+    /// Which shader stage runs the ray-march. `None` or `"fragment"`
+    /// uses the legacy fs_main path; `"compute"` dispatches `cs_main`
+    /// into a storage texture and blits. See
+    /// `docs/prompts/compute-shader-migration.md`.
+    pub renderer: Option<String>,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -220,6 +225,7 @@ impl TestConfig {
                 "--live-sample-every" => {
                     cfg.live_sample_every_frames = args.next().and_then(|v| v.parse().ok());
                 }
+                "--renderer" => { cfg.renderer = args.next(); }
                 _ => {}
             }
         }

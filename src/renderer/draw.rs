@@ -1,6 +1,6 @@
 //! Frame rendering: on-surface, offscreen, and readback-to-PNG.
 
-use super::Renderer;
+use super::{Renderer, RendererMode};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OffscreenRenderTiming {
@@ -103,6 +103,151 @@ impl ShaderStatsFrame {
 }
 
 impl Renderer {
+    /// Lazily allocate the compute-output storage texture + its two
+    /// bind groups (storage view for compute, sampled view for blit).
+    /// Called on the first compute dispatch after a resize / init; the
+    /// resize path clears all three `Option`s, so the next dispatch
+    /// rebuilds them at the new size.
+    fn ensure_compute_resources(&mut self) {
+        if self.compute_output.is_some()
+            && self.compute_texture_bind_group.is_some()
+            && self.blit_bind_group.is_some()
+        {
+            return;
+        }
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("compute_output"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let storage_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampled_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let compute_texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("compute_output_storage"),
+            layout: &self.compute_texture_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&storage_view),
+            }],
+        });
+        let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit_source"),
+            layout: &self.blit_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&sampled_view),
+            }],
+        });
+        self.compute_output = Some(tex);
+        self.compute_texture_bind_group = Some(compute_texture_bind_group);
+        self.blit_bind_group = Some(blit_bind_group);
+    }
+
+    /// Encode the ray-march work into `encoder`, writing the final
+    /// color to `target_view`. Dispatches on `render_mode`:
+    /// - `Fragment`: one render pass running `fs_main`.
+    /// - `Compute`: a compute dispatch writing a storage texture,
+    ///   followed by a fragment blit pass copying it to `target_view`.
+    ///
+    /// Timestamp queries (when the feature is enabled) wrap the
+    /// ray-march work itself (fragment pass or compute dispatch). The
+    /// blit pass is excluded so `gpu_pass_ms` remains comparable across
+    /// modes; the blit's cost shows up in `submitted_done_ms` instead.
+    fn encode_raymarch(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        label: &'static str,
+    ) {
+        match self.render_mode {
+            RendererMode::Fragment => {
+                let timestamp_writes = self.timestamp.as_ref().map(|ts| {
+                    wgpu::RenderPassTimestampWrites {
+                        query_set: &ts.query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }
+                });
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(label),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            RendererMode::Compute => {
+                self.ensure_compute_resources();
+                let timestamp_writes = self.timestamp.as_ref().map(|ts| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set: &ts.query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }
+                });
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some(label),
+                        timestamp_writes,
+                    });
+                    cpass.set_pipeline(&self.compute_pipeline);
+                    cpass.set_bind_group(0, &self.bind_group, &[]);
+                    cpass.set_bind_group(
+                        1,
+                        self.compute_texture_bind_group.as_ref().unwrap(),
+                        &[],
+                    );
+                    let wg_x = self.config.width.div_ceil(8);
+                    let wg_y = self.config.height.div_ceil(8);
+                    cpass.dispatch_workgroups(wg_x, wg_y, 1);
+                }
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("blit"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.blit_pipeline);
+                    pass.set_bind_group(0, self.blit_bind_group.as_ref().unwrap(), &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
+    }
+
     /// Live-surface render path. Matches `render_offscreen`'s
     /// instrumentation when `shader_stats_enabled`: timestamp
     /// queries, `on_submitted_work_done` callback, stats-buffer
@@ -125,32 +270,7 @@ impl Renderer {
         if self.shader_stats_enabled {
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
-        let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
-            query_set: &ts.query_set,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ray_march"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.encode_raymarch(&mut encoder, &view, "ray_march");
         if let Some(ts) = self.timestamp.as_ref() {
             encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
             encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
@@ -279,32 +399,7 @@ impl Renderer {
             // subsequent render pass on the same encoder.
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
-        let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
-            query_set: &ts.query_set,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("offscreen-ray-march"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.encode_raymarch(&mut encoder, &view, "offscreen-ray-march");
         if let Some(ts) = self.timestamp.as_ref() {
             encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
             encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
@@ -486,26 +581,7 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("capture-frame"),
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("capture-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.encode_raymarch(&mut encoder, &view, "capture-pass");
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,

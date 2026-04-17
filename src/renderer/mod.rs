@@ -23,6 +23,25 @@ pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
 pub const ROOT_KIND_FACE: u32 = 2;
 
+/// Which shader-stage drives the ray-march. `Fragment` (default) uses
+/// the original fs_main path; `Compute` dispatches `cs_main` into a
+/// storage texture and blits to the surface. See
+/// `docs/prompts/compute-shader-migration.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererMode {
+    Fragment,
+    Compute,
+}
+
+impl RendererMode {
+    pub fn from_cli(s: Option<&str>) -> Self {
+        match s {
+            Some("compute") => RendererMode::Compute,
+            _ => RendererMode::Fragment,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuUniforms {
@@ -58,6 +77,20 @@ pub struct Renderer {
     pub(super) config: wgpu::SurfaceConfiguration,
     pub(super) pipeline: wgpu::RenderPipeline,
     pub(super) bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) render_mode: RendererMode,
+    /// Compute pipeline + resources. Populated for both modes (cheap
+    /// setup cost) so toggling between fragment and compute at runtime
+    /// doesn't require re-creating GPU state.
+    pub(super) compute_pipeline: wgpu::ComputePipeline,
+    pub(super) compute_texture_layout: wgpu::BindGroupLayout,
+    pub(super) blit_pipeline: wgpu::RenderPipeline,
+    pub(super) blit_bind_group_layout: wgpu::BindGroupLayout,
+    /// Storage texture the compute shader writes into. Sized to
+    /// config.width × config.height. Reset to `None` on resize and
+    /// lazily re-created on the next compute dispatch.
+    pub(super) compute_output: Option<wgpu::Texture>,
+    pub(super) compute_texture_bind_group: Option<wgpu::BindGroup>,
+    pub(super) blit_bind_group: Option<wgpu::BindGroup>,
     /// Interleaved tree buffer (4 B × u32). Each packed node
     /// occupies `2 + 2*popcount(occupancy)` u32s: a 2-u32 header
     /// (occupancy mask + first_child u32-offset in this same buffer)
@@ -195,6 +228,9 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.offscreen_texture = None;
+        self.compute_output = None;
+        self.compute_texture_bind_group = None;
+        self.blit_bind_group = None;
         self.write_uniforms();
     }
 }

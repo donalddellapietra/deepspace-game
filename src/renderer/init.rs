@@ -8,7 +8,7 @@ use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
-use super::{GpuUniforms, Renderer, TimestampScratch, ROOT_KIND_CARTESIAN};
+use super::{GpuUniforms, Renderer, RendererMode, TimestampScratch, ROOT_KIND_CARTESIAN};
 
 impl Renderer {
     pub async fn new(
@@ -22,6 +22,7 @@ impl Renderer {
         lod_pixel_threshold: f32,
         lod_base_depth: u32,
         live_sample_every_frames: u32,
+        render_mode: RendererMode,
     ) -> Self {
         let size = window.inner_size();
 
@@ -199,53 +200,57 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Shared group 0 layout. FRAGMENT | COMPUTE visibility so the
+        // same bind group drives both the fs_main render pipeline and
+        // the cs_main compute pipeline.
+        let shared_visibility = wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE;
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ray_march"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 0, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 1, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 2, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 3, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 4, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 5, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 6, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 6, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false, min_binding_size: None,
@@ -255,7 +260,7 @@ impl Renderer {
                 // of that node's header in `tree[]`. Cold path only
                 // (touched on descent / ribbon pop).
                 wgpu::BindGroupLayoutEntry {
-                    binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 7, visibility: shared_visibility,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
@@ -329,6 +334,102 @@ impl Renderer {
             cache: None,
         });
 
+        // Compute pipeline: same buffers (group 0, shared layout) plus a
+        // storage texture (group 1) the shader writes color into.
+        let compute_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("compute_output_texture"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }],
+        });
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("march_compute"),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::shader_compose::compose("march_compute.wgsl").into()
+            ),
+        });
+        let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("march_compute"),
+            bind_group_layouts: &[&bind_group_layout, &compute_texture_layout],
+            push_constant_ranges: &[],
+        });
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("march_compute"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &override_constants,
+                zero_initialize_workgroup_memory: false,
+            },
+            cache: None,
+        });
+
+        // Blit pipeline: samples the compute output texture and writes
+        // to the surface. Uses `textureLoad` (no sampler) at integer
+        // pixel coords so the blit is pixel-for-pixel identity.
+        let blit_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::shader_compose::compose("blit.wgsl").into()
+            ),
+        });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit"),
+            bind_group_layouts: &[&blit_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        eprintln!(
+            "renderer_mode selected={:?} workgroup_size=8x8",
+            render_mode,
+        );
+
         let timestamp = if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("ray_march_timestamps"),
@@ -355,6 +456,14 @@ impl Renderer {
 
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
+            render_mode,
+            compute_pipeline,
+            compute_texture_layout,
+            blit_pipeline,
+            blit_bind_group_layout,
+            compute_output: None,
+            compute_texture_bind_group: None,
+            blit_bind_group: None,
             tree_buffer, node_offsets_buffer, node_kinds_buffer,
             camera_buffer, palette_buffer, uniforms_buffer,
             ribbon_buffer,
