@@ -19,6 +19,15 @@
 //! `first_child_offset == base + 2` — the header + first child
 //! entry share a 64-byte cache line.
 //!
+//! The `_pad` field of `GpuChild` (bits 16..32 of the first u32
+//! per child entry) carries the child subtree's LOD color packed
+//! as RGB565. The shader's LOD-terminal path reads this directly
+//! instead of resolving `block_type` through the palette, so
+//! detailed imported models degrade to a smooth averaged color
+//! rather than the dominant palette slot. The `block_type` byte
+//! retains its empty-subtree sentinel (255) so the INV8 fast
+//! skip continues to fire before any RGB unpacking.
+//!
 //! Two parallel side-buffers:
 //!
 //! - `node_kinds: Vec<GpuNodeKind>` — indexed by BFS position.
@@ -131,14 +140,13 @@ pub fn pack_tree(
                     tag: 1, block_type: *bt, _pad: 0, node_index: 0,
                 },
                 Child::Node(child_id) => {
-                    let repr = library
-                        .get(*child_id)
-                        .map(|n| n.representative_block)
-                        .unwrap_or(0);
+                    let child_node = library.get(*child_id);
+                    let repr = child_node.map(|n| n.representative_block).unwrap_or(0);
+                    let lod = child_node.map(|n| rgb565(n.lod_rgb)).unwrap_or(0);
                     GpuChild {
                         tag: 2,
                         block_type: repr,
-                        _pad: 0,
+                        _pad: lod,
                         node_index: *visited.get(child_id).expect("child must be visited"),
                     }
                 }
@@ -157,6 +165,19 @@ pub fn pack_tree(
 /// Encode a child's first u32: tag | (block_type << 8) | (_pad << 16).
 fn pack_child_first(c: GpuChild) -> u32 {
     (c.tag as u32) | ((c.block_type as u32) << 8) | ((c._pad as u32) << 16)
+}
+
+/// Pack an 8-bit-per-channel RGB into RGB565 for the `_pad` field.
+/// Bit layout: RRRRRGGG GGGBBBBB — high bits of each channel, matching
+/// the shader's `unpack_rgb565` reconstruction. The 16-bit form fits
+/// the free `_pad: u16` in `GpuChild` so the GPU LOD color costs zero
+/// extra bytes per node.
+#[inline]
+fn rgb565(rgb: [u8; 3]) -> u16 {
+    let r = (rgb[0] as u16 >> 3) & 0x1F;
+    let g = (rgb[1] as u16 >> 2) & 0x3F;
+    let b = (rgb[2] as u16 >> 3) & 0x1F;
+    (r << 11) | (g << 5) | b
 }
 
 fn child_screen_pixels(
@@ -333,8 +354,9 @@ pub fn pack_tree_lod_selective(
             }
             let child_idx = *visited.get(child_id).expect("child just visited");
             let repr = child_node.representative_block;
+            let lod = rgb565(child_node.lod_rgb);
             per_node[ordered_idx][slot] = Some(GpuChild {
-                tag: 2, block_type: repr, _pad: 0, node_index: child_idx,
+                tag: 2, block_type: repr, _pad: lod, node_index: child_idx,
             });
         }
     }

@@ -54,6 +54,24 @@ fn child_node_index(node_idx: u32, slot: u32) -> u32 {
 fn child_tag(packed: u32) -> u32 { return packed & 0xFFu; }
 fn child_block_type(packed: u32) -> u32 { return (packed >> 8u) & 0xFFu; }
 
+// Unpack the RGB565 LOD color the CPU packer wrote into the `_pad`
+// bits of a tag=2 child entry. Used at LOD-terminal instead of a
+// palette lookup so imported voxel models degrade to their averaged
+// subtree color, not the single dominant palette slot.
+fn child_lod_rgb(packed: u32) -> vec3<f32> {
+    let p = (packed >> 16u) & 0xFFFFu;
+    let r5 = (p >> 11u) & 0x1Fu;
+    let g6 = (p >> 5u)  & 0x3Fu;
+    let b5 =  p         & 0x1Fu;
+    // 5/6-bit → unit-interval float with standard high-bit replication
+    // so 0x1F maps to 1.0 exactly. Matches the CPU `rgb565(rgb)`
+    // encoding (`u8 >> 3 / >> 2`) in `src/world/gpu/pack.rs`.
+    let r = f32((r5 << 3u) | (r5 >> 2u)) / 255.0;
+    let g = f32((g6 << 2u) | (g6 >> 4u)) / 255.0;
+    let b = f32((b5 << 3u) | (b5 >> 2u)) / 255.0;
+    return vec3<f32>(r, g, b);
+}
+
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
     return u32(z * 9 + y * 3 + x);
 }

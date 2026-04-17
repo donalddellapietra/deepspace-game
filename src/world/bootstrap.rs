@@ -118,7 +118,6 @@ fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBo
 
     let total_depth = total_depth.max(1).min(MAX_DEPTH as u8);
 
-    let mut lib = NodeLibrary::default();
     let mut registry = crate::world::palette::ColorRegistry::new();
 
     let model = import::load(path, &mut registry)
@@ -128,6 +127,12 @@ fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBo
         path, model.size_x, model.size_y, model.size_z,
         model.data.iter().filter(|&&v| v != 0).count(),
     );
+
+    // Construct library AFTER palette extension so imported model
+    // colors are available for `lod_rgb` computation during insert.
+    // Order matters: lib.insert needs palette_rgb[bt] for each leaf
+    // Block(bt), and imported colors land at indices 11..254.
+    let mut lib = NodeLibrary::with_palette(&registry);
 
     let model_root_id = tree_builder::build_tree(&model, &mut lib);
 

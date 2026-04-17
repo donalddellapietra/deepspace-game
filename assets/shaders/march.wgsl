@@ -303,7 +303,12 @@ fn march_cartesian(
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
-                    result.color = palette.colors[bt].rgb;
+                    // LOD-terminal color: averaged RGB of the subtree,
+                    // packed as RGB565 into `_pad` by the CPU packer.
+                    // Replaces the old palette[bt] lookup — detailed
+                    // imported models degrade to their averaged color
+                    // instead of a single dominant block slot.
+                    result.color = child_lod_rgb(packed);
                     result.normal = normal;
                     result.cell_min = cell_min_l;
                     result.cell_size = s_cell_size[depth];

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use super::cubesphere::Face;
+use super::palette::ColorRegistry;
 
 // ------------------------------------------------------------- constants
 
@@ -106,17 +107,28 @@ pub struct Node {
     pub children: Children,
     pub kind: NodeKind,
     pub ref_count: u32,
-    /// Presence-preserving representative block type for this subtree.
-    /// The most common NON-EMPTY block type among all terminals in the
-    /// subtree. Used by the renderer at LOD cutoff — when a cell is too
-    /// small to descend into, it renders as this color.
-    /// 255 = all empty (no solid content in this subtree).
+    /// Presence-preserving dominant block type for this subtree: the
+    /// most common non-empty palette index among all terminals. 255 =
+    /// all empty (no solid content anywhere below). Retained for
+    /// CPU-side consumers (raycast, edits) that need a palette index
+    /// to hand back to game logic.
     ///
-    /// Presence-preserving means: if ANY child is non-empty, the
-    /// representative is non-empty. A tree trunk (1 voxel of wood in
-    /// 26 air voxels) gets representative = Wood, not Air. Thin
-    /// features survive cascaded LOD across arbitrary depth.
+    /// The GPU renderer uses `lod_rgb` instead — averaged color rather
+    /// than dominant palette slot.
     pub representative_block: u8,
+    /// Averaged RGB of non-empty descendants (8-bit per channel).
+    /// Computed as the mean over non-empty child contributions: each
+    /// `Child::Block(bt)` contributes `palette[bt]`; each
+    /// `Child::Node(id)` contributes its own `lod_rgb`. Empty children
+    /// are dropped from the mean — thin features (one wood voxel in
+    /// 26 air) project their full color, not a faded wash.
+    ///
+    /// Only meaningful when `representative_block != 255`. When the
+    /// subtree is all-empty the value is `[0, 0, 0]` and callers must
+    /// not use it. The GPU pack encodes this as RGB565 into
+    /// `GpuChild._pad`; the shader's LOD-terminal path renders from
+    /// that field directly, bypassing the palette lookup.
+    pub lod_rgb: [u8; 3],
     /// If the entire subtree is one type: 0-253 = that BlockType,
     /// 254 = all empty, 255 = mixed (not uniform).
     /// Uniform nodes can be flattened to a single Block during GPU packing.
@@ -148,14 +160,47 @@ pub struct NodeLibrary {
     nodes: HashMap<NodeId, Node>,
     by_hash: HashMap<u64, Vec<NodeId>>,
     next_id: u64,
+    /// Palette RGB snapshot, indexed by block type. Set at library
+    /// construction and used to compute `Node::lod_rgb` during
+    /// `insert_with_kind` — we resolve `Child::Block(bt)` to a
+    /// concrete RGB here so leaves contribute real color to the
+    /// recursive average.
+    ///
+    /// If a bootstrap registers additional imported-model colors
+    /// AFTER library construction, use `with_palette` at the point
+    /// where the full palette is known. Default construction uses
+    /// the builtin palette only — sufficient for tests and
+    /// builtin-only worlds.
+    palette_rgb: [[u8; 3]; 256],
 }
 
 impl Default for NodeLibrary {
     fn default() -> Self {
+        Self::with_palette(&ColorRegistry::new())
+    }
+}
+
+impl NodeLibrary {
+    /// Construct a library with the given palette. The palette's RGB
+    /// values are snapshotted — later palette extensions won't
+    /// retroactively update existing nodes' `lod_rgb`. Use this at
+    /// the point in bootstrap where the full palette is known (e.g.
+    /// after a .vox/.vxs importer has registered all model colors).
+    pub fn with_palette(palette: &ColorRegistry) -> Self {
+        let mut palette_rgb = [[0u8; 3]; 256];
+        for i in 0..=255u8 {
+            let c = palette.color(i);
+            palette_rgb[i as usize] = [
+                (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+            ];
+        }
         Self {
             nodes: HashMap::new(),
             by_hash: HashMap::new(),
             next_id: 1, // 0 reserved for EMPTY_NODE
+            palette_rgb,
         }
     }
 }
@@ -190,19 +235,44 @@ impl NodeLibrary {
                 _ => None,
             })
             .collect();
-        // Compute representative block (presence-preserving):
-        // Most common NON-EMPTY block type among children. Empty children
-        // are ignored so that thin features (a single wood voxel in air)
-        // survive cascaded LOD. For Node children, inherit their
-        // representative_block recursively.
+        // Compute representative block (presence-preserving): most
+        // common non-empty block type among children. Used only by
+        // CPU-side consumers (raycast, edits).
+        //
+        // Compute lod_rgb in the same pass: mean of non-empty child
+        // contributions, where Block children contribute
+        // palette[block_type] and Node children inherit their own
+        // lod_rgb. This is the GPU LOD color — what a LOD-terminal
+        // pixel shows when the shader refuses to descend further.
+        //
+        // Simple (non-mass-weighted) mean is intentional: at a
+        // one-pixel LOD terminal the eye integrates the rendered
+        // color over the cell area, so "dominant slot hue" and
+        // "averaged hue" are equally visible. Weighting by leaf
+        // count would shift toward the densest subtree, which is
+        // the same bias that made `representative_block` look wrong
+        // on organic models.
         let mut counts = [0u32; 256];
+        let mut rgb_sum: [u32; 3] = [0, 0, 0];
+        let mut non_empty_children: u32 = 0;
         for c in &children {
             match c {
-                Child::Block(bt) => counts[*bt as usize] += 1,
+                Child::Block(bt) => {
+                    counts[*bt as usize] += 1;
+                    let rgb = self.palette_rgb[*bt as usize];
+                    rgb_sum[0] += rgb[0] as u32;
+                    rgb_sum[1] += rgb[1] as u32;
+                    rgb_sum[2] += rgb[2] as u32;
+                    non_empty_children += 1;
+                }
                 Child::Node(nid) => {
                     if let Some(child_node) = self.nodes.get(nid) {
                         if child_node.representative_block < 255 {
                             counts[child_node.representative_block as usize] += 1;
+                            rgb_sum[0] += child_node.lod_rgb[0] as u32;
+                            rgb_sum[1] += child_node.lod_rgb[1] as u32;
+                            rgb_sum[2] += child_node.lod_rgb[2] as u32;
+                            non_empty_children += 1;
                         }
                     }
                 }
@@ -216,6 +286,16 @@ impl NodeLibrary {
             .filter(|&(_, count)| *count > 0)
             .map(|(i, _)| i as u8)
             .unwrap_or(255);
+        let lod_rgb = if non_empty_children > 0 {
+            let n = non_empty_children;
+            [
+                (rgb_sum[0] / n) as u8,
+                (rgb_sum[1] / n) as u8,
+                (rgb_sum[2] / n) as u8,
+            ]
+        } else {
+            [0, 0, 0]
+        };
         // Compute uniform_type: is the entire subtree one block type?
         let uniform_type = {
             let mut first: Option<u8> = None;
@@ -237,7 +317,10 @@ impl NodeLibrary {
             }
             if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
         };
-        self.nodes.insert(id, Node { children, kind, ref_count: 0, representative_block, uniform_type });
+        self.nodes.insert(id, Node {
+            children, kind, ref_count: 0,
+            representative_block, lod_rgb, uniform_type,
+        });
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
             self.ref_inc(nid);
