@@ -527,6 +527,79 @@ rebuilding the correct binary from the worktree, actual delta was
 negligible. Lesson: always verify `pwd` before running a measurement,
 especially when using worktrees.
 
+## Direct register-pressure measurement via compute-pipeline proxy
+
+Apple Silicon doesn't expose register count for fragment pipelines via
+any public API or CLI. But we CAN measure register pressure for the
+same shader logic by adding a `@compute` wrapper and querying Metal's
+`MTLComputePipelineState.maxTotalThreadsPerThreadgroup`, which is
+directly inversely proportional to per-thread register usage.
+
+Tool: `assets/shaders/measure_compute.wgsl` + `/tmp/query_pipeline_stats.swift`.
+
+Pipeline:
+1. `python3 compose_shader.py measure_compute.wgsl > composed.wgsl`
+2. `naga --metal-version 2.4 composed.wgsl composed.metal`
+3. `xcrun metal -c composed.metal -o composed.air -std=macos-metal2.4`
+4. `xcrun metal composed.air -o composed.metallib`
+5. `swift query_pipeline_stats.swift composed.metallib cs_measure`
+
+### Baseline measurements
+
+- Trivial empty kernel: **1024** max_threads (ceiling)
+- Our fragment-branch DDA: **512** max_threads (~2× register pressure vs. empty)
+- Compute-branch DDA: 384 max_threads (~2.67× — worse, because compute
+  branch pays workgroup-memory overhead for its TG stacks)
+
+### What moves register pressure
+
+| cut | max_threads | Δ |
+|---|---|---|
+| baseline (HEAD) | 512 | — |
+| +256 B scalar waste | 448 | −64 (state matters!) |
+| Normal-defer | 512 | 0 (compiler already elided) |
+| HitResult hoist | 512 | 0 (compiler already elided) |
+| MAX_STACK_DEPTH 5→4 | 576 | +64 (tier jump) |
+| MAX_STACK_DEPTH 5→3 | 576 | +64 (same tier) |
+| MAX_STACK_DEPTH 5→2 | 576 | +64 (same tier) |
+| MAX_STACK_DEPTH 5→1 | 704 | +192 (another tier) |
+
+The normal-defer and HitResult hoist are genuinely elided by the
+compiler — source-level changes don't move the register allocator.
+Stack arrays DO cost register pressure on the fragment branch (unlike
+the compute branch where they're in threadgroup memory).
+
+### But: register pressure reduction doesn't translate to wall-clock
+
+Decisive controlled test:
+
+| config | max_threads | wall-clock |
+|---|---|---|
+| MAX_STACK_DEPTH=5, BASE_DETAIL_DEPTH=4 | 512 | 6.39 ms |
+| MAX_STACK_DEPTH=4 (implicit detail cap at 3) | 576 | 5.10 ms |
+| MAX_STACK_DEPTH=5, `--lod-base-depth 3` | **512** | **5.09 ms** |
+
+The −20% wall-clock came entirely from reducing descent work
+(3 levels instead of 4), NOT from reduced register pressure.
+Max_threads 512 → 576 produced zero wall-clock change. The register-
+pressure tier is not the binding constraint for this workload.
+
+### Conclusion for the occupancy-stack-slim thesis
+
+The whole premise of "cross the 256 B tier" was wrong because
+register pressure isn't what's pinning wall-clock. Our occupancy
+sweep diagnostic earlier today showed this indirectly (flat Fragment
+Occupancy across ±256 B). The max_threads experiment confirms it
+directly: register pressure CAN be moved, but doing so doesn't help.
+
+What actually moves wall-clock:
+- Reducing ALU work per ray (e.g. branchless min-axis, −18%)
+- Reducing iterations per ray (e.g. AABB culling, −22%;
+  `--lod-base-depth 3`, −20%)
+- Algorithmic changes (brickmap-style restructuring)
+
+Register/occupancy optimization is a dead lever on this workload.
+
 ## LOD tuning (tried — null)
 
 Runtime flag `--lod-pixels 2.0` doubled the sub-pixel-rejection
