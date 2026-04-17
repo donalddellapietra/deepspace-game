@@ -784,6 +784,42 @@ mod tests {
         assert_eq!(brick_cell(&tree, &offsets, brick_bfs_idx, 2, 2, 2), BRICK_EMPTY_BT);
     }
 
+    /// Write a distinctive voxel pattern into a side-9 brick and verify
+    /// every cell round-trips through the packed GPU buffer. Catches
+    /// slot-encoding / byte-ordering mismatches between pack.rs and
+    /// march_brick's `slot = x + y*side + z*side²`.
+    #[test]
+    fn brick_side9_full_roundtrip() {
+        let side: u8 = 9;
+        let s = side as usize;
+        // Distinctive: cell value = 1 + (x + y*2 + z*3) mod 200 so
+        // every position has a unique (and non-255) byte.
+        let mut cells = vec![0u8; s * s * s];
+        for z in 0..s { for y in 0..s { for x in 0..s {
+            cells[z * s * s + y * s + x] = 1 + ((x + y * 2 + z * 3) % 200) as u8;
+        }}}
+
+        let mut lib = NodeLibrary::default();
+        let brick_id = lib.insert_brick(cells.clone(), side);
+        let mut root_children = empty_children();
+        root_children[CENTER_SLOT] = Child::Node(brick_id);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        let (tree, _kinds, offsets, _root_idx) = pack_tree(&lib, root);
+        let brick_bfs_idx = sparse_child(&tree, &offsets, 0, CENTER_SLOT as u8).node_index;
+
+        // Probe every cell.
+        for z in 0..s { for y in 0..s { for x in 0..s {
+            let expected = cells[z * s * s + y * s + x];
+            let actual = brick_cell(&tree, &offsets, brick_bfs_idx, x, y, z);
+            assert_eq!(
+                actual, expected,
+                "cell ({x}, {y}, {z}) mismatch: expected {expected}, got {actual}",
+            );
+        }}}
+    }
+
     #[test]
     fn brick_side_encoding_round_trip() {
         for &side in &VALID_BRICK_SIDES {
