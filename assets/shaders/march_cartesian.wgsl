@@ -85,7 +85,9 @@ fn march_brick(
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var iterations = 0u;
-    let max_brick_iter = 3u * side;
+    // Ray can traverse up to 3·side cells along a brick diagonal;
+    // give a healthy margin for float-precision drift.
+    let max_brick_iter = 4u * side;
     let side_i = i32(side);
     let side_sq = side * side;
 
@@ -475,28 +477,30 @@ fn march_cartesian(
             let brick_cell_size = parent_cell_size / f32(brick_side);
             let brick_side_i = i32(brick_side);
 
-            // Ray's entry point into the brick (in world-frame coords).
-            // Epsilon uses parent_cell_size (brick total extent) rather
-            // than brick_cell_size so the nudge is proportional to the
-            // geometry the ray_box was computed against. Using
-            // brick_cell_size caused float-precision misalignment for
-            // large sides where brick_cell_size shrinks below the
-            // effective precision of the box intersection.
+            // Resolve the ray's entry point into the brick. Use a
+            // FRESH ray_box against the brick's actual volume and
+            // snap just inside to land in the first cell. Epsilon is
+            // relative to brick_cell_size so it's proportional to
+            // the smallest feature we care about.
             let child_max = child_origin + vec3<f32>(parent_cell_size);
             let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);
-            let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * parent_cell_size;
+            let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * brick_cell_size;
             let child_entry = ray_origin + ray_dir * ct_start;
 
-            let local_entry = (child_entry - child_origin) / brick_cell_size;
+            // Compute brick-local entry cell. `local_brick` in
+            // [0, side). Clamp because ray_box precision near a
+            // corner can put local_brick just outside the valid
+            // range.
+            let local_brick = (child_entry - child_origin) / brick_cell_size;
             let new_cell_brick = vec3<i32>(
-                clamp(i32(floor(local_entry.x)), 0, brick_side_i - 1),
-                clamp(i32(floor(local_entry.y)), 0, brick_side_i - 1),
-                clamp(i32(floor(local_entry.z)), 0, brick_side_i - 1),
+                clamp(i32(floor(local_brick.x)), 0, brick_side_i - 1),
+                clamp(i32(floor(local_brick.y)), 0, brick_side_i - 1),
+                clamp(i32(floor(local_brick.z)), 0, brick_side_i - 1),
             );
             let lc = vec3<f32>(new_cell_brick);
-            // Use entry_pos as the side_dist reference to keep values
-            // consistent with the outer tree DDA (invariant under
-            // constant offset of the reference point).
+            // side_dist references entry_pos (root-frame) to match
+            // the sparse-descent convention. DDA stepping only cares
+            // about invariant offsets; any consistent reference works.
             let new_side_dist_brick = vec3<f32>(
                 select((child_origin.x + lc.x * brick_cell_size - entry_pos.x) * inv_dir.x,
                        (child_origin.x + (lc.x + 1.0) * brick_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
