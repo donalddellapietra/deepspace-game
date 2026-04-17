@@ -73,6 +73,10 @@ impl Renderer {
             adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY),
             device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
         );
+        eprintln!(
+            "renderer_limits max_storage_buffer_binding_size={}",
+            device.limits().max_storage_buffer_binding_size,
+        );
 
         let surface_caps = surface.get_capabilities(&adapter);
         let format = surface_caps.formats.iter()

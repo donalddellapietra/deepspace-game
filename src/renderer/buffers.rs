@@ -39,6 +39,23 @@ impl Renderer {
             node_offsets
         };
 
+        // Probe for packed-tree size exceeding the device's storage
+        // buffer binding cap. wgpu will error on its own if we go over,
+        // but the message is opaque; surface a clear, actionable
+        // warning first. Don't abort — still attempt the upload so the
+        // user sees both our diagnostic and wgpu's error.
+        let tree_byte_size = std::mem::size_of_val(tree_payload) as u64;
+        let max_binding_size =
+            self.device.limits().max_storage_buffer_binding_size as u64;
+        if tree_byte_size > max_binding_size {
+            eprintln!(
+                "tree_buffer_size_warning packed={} bytes, limit={} bytes \
+                 — raise maxStorageBufferBindingSize via requiredLimits or \
+                 reduce scene scale",
+                tree_byte_size, max_binding_size,
+            );
+        }
+
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let write_start = std::time::Instant::now();
         let tree_grew = upload_or_recreate(
