@@ -220,6 +220,40 @@ fn march_cartesian(
                 continue;
             }
 
+            // Empty-representative fast path: when the packed
+            // child's representative_block is 255, the subtree has
+            // no non-empty content (either uniform-empty deeper in
+            // the tree, or a sub-pixel LOD'd collection of empty
+            // cells). Descending into it will just bottom out at
+            // LOD-terminal with bt==255 and advance one cell anyway
+            // — same visual result, wasted levels of traversal.
+            // Skip straight to DDA advance, matching the tag=0
+            // branch above.
+            //
+            // This is the dominant cost source when zoomed-in over
+            // empty space: rays hit tag=2 cells whose subtrees are
+            // effectively empty, descend N levels to LOD-terminal,
+            // advance one cell, repeat — 2-3 iterations where one
+            // would do.
+            let child_bt = child_block_type(packed);
+            if child_bt == 255u {
+                if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                    s_cell[depth].x += step.x;
+                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                    s_cell[depth].y += step.y;
+                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                } else {
+                    s_cell[depth].z += step.z;
+                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                }
+                continue;
+            }
+
             // Cartesian Node: depth/LOD check, then descend.
             // depth_limit = MAX_STACK_DEPTH — LOD controls the
             // effective depth, not an artificial per-shell budget.
