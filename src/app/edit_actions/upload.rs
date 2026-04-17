@@ -79,6 +79,11 @@ impl App {
                         preserve_regions.push((ancestor, SHELL_PRESERVE_DEPTH));
                     }
                 }
+                let effective_lod_leaf_depth = if std::env::var("DEEPSPACE_NO_BRICK").is_ok() {
+                    u32::MAX
+                } else {
+                    self.lod_base_depth
+                };
                 gpu::pack_tree_lod_selective(
                     &self.world.library,
                     self.world.root,
@@ -87,6 +92,7 @@ impl App {
                     1.2,
                     &preserve_paths,
                     &preserve_regions,
+                    effective_lod_leaf_depth,
                 )
             };
             pack_elapsed = pack_start.elapsed();

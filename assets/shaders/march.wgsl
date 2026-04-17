@@ -45,13 +45,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>, lid: u32) -> Hit
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            let detail_budget = select(
-                1u,
-                BASE_DETAIL_DEPTH - ribbon_level,
-                ribbon_level < BASE_DETAIL_DEPTH,
-            );
-            let cart_depth_limit = min(detail_budget, MAX_STACK_DEPTH);
-            r = march_cartesian(current_idx, ray_origin, ray_dir, cart_depth_limit, skip_slot, lid);
+            r = march_cartesian(current_idx, ray_origin, ray_dir, skip_slot, lid);
         }
         if r.hit {
             r.frame_level = ribbon_level;

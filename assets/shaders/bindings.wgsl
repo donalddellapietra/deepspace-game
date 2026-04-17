@@ -48,6 +48,15 @@ const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
 const ROOT_KIND_FACE: u32 = 2u;
 
+/// When set in a packed node's occupancy header, the node is stored
+/// as a BRICK: 7 u32s immediately after the 2-u32 header pack 27
+/// u8 block types (4 per word, slot = x + y*3 + z*9). A brick node
+/// has no recursive child nodes — every child is either empty
+/// (block_type = 255) or a terminal block. Flag lives at bit 27
+/// because the occupancy mask only uses bits 0..26 (27 slots).
+const BRICK_FLAG_BIT: u32 = 0x08000000u;  // 1 << 27
+const BRICK_EMPTY_BT: u32 = 255u;
+
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
 /// - low 5 bits: slot (0..27) of the child we're popping FROM
@@ -91,10 +100,10 @@ struct ShaderStats {
     sum_steps_empty_div4: atomic<u32>,
     sum_steps_node_descend_div4: atomic<u32>,
     sum_steps_lod_terminal_div4: atomic<u32>,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
+    brick_entries: atomic<u32>,
+    brick_first_cell_hits: atomic<u32>,
+    brick_advance_hits: atomic<u32>,
+    brick_no_hits: atomic<u32>,
     _pad4: u32,
     _pad5: u32,
 }

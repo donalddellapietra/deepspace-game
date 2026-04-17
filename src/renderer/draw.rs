@@ -48,6 +48,10 @@ pub struct ShaderStatsFrame {
     pub sum_steps_empty_div4: u32,
     pub sum_steps_node_descend_div4: u32,
     pub sum_steps_lod_terminal_div4: u32,
+    pub brick_entries: u32,
+    pub brick_first_cell_hits: u32,
+    pub brick_advance_hits: u32,
+    pub brick_no_hits: u32,
 }
 
 impl ShaderStatsFrame {
@@ -430,7 +434,23 @@ impl Renderer {
             sum_steps_empty_div4: read_u32(28),
             sum_steps_node_descend_div4: read_u32(32),
             sum_steps_lod_terminal_div4: read_u32(36),
+            brick_entries: read_u32(40),
+            brick_first_cell_hits: read_u32(44),
+            brick_advance_hits: read_u32(48),
+            brick_no_hits: read_u32(52),
         };
+        if stats.brick_entries > 0 {
+            eprintln!(
+                "brick_debug entries={} first_cell_hits={} ({:.1}%) advance_hits={} ({:.1}%) no_hits={} ({:.1}%)",
+                stats.brick_entries,
+                stats.brick_first_cell_hits,
+                100.0 * stats.brick_first_cell_hits as f64 / stats.brick_entries as f64,
+                stats.brick_advance_hits,
+                100.0 * stats.brick_advance_hits as f64 / stats.brick_entries as f64,
+                stats.brick_no_hits,
+                100.0 * stats.brick_no_hits as f64 / stats.brick_entries as f64,
+            );
+        }
         drop(data);
         self.shader_stats_readback.unmap();
         stats

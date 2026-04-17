@@ -30,7 +30,7 @@
 //! - `pack`: BFS packing (`pack_tree`, `pack_tree_lod`).
 //! - `ribbon`: ancestor ribbon (`build_ribbon`, `GpuRibbonEntry`).
 
-mod pack;
+pub mod pack;
 mod ribbon;
 mod types;
 

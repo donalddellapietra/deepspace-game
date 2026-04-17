@@ -19,6 +19,34 @@
 //! `first_child_offset == base + 2` — the header + first child
 //! entry share a 64-byte cache line.
 //!
+//! ## Brick nodes
+//!
+//! A Cartesian node whose children are ALL terminal (every slot is
+//! either `Child::Empty` or `Child::Block(bt)` — no `Child::Node`)
+//! is packed as a BRICK instead of sparse. The shader detects this
+//! via `BRICK_FLAG_BIT` (bit 27) set in the occupancy mask, and
+//! walks the node's 3×3×3 cells with a flat DDA — no popcount,
+//! no per-cell rank indexing, no tree-recursion. Just
+//! `block_type = brick[slot/4] >> ((slot%4)*8) & 0xFF` per cell.
+//!
+//! Brick layout (9 u32s total):
+//!
+//! ```text
+//! tree[base + 0]      = occupancy_mask | BRICK_FLAG_BIT
+//! tree[base + 1]      = first_child_offset (= base + 2; unused by
+//!                        the shader's brick path but kept for layout
+//!                        uniformity so node_offsets still works)
+//! tree[base + 2..8]  = 27 u8 block types, 4 per u32, little-endian.
+//!                        slot = x + y*3 + z*9, stored at
+//!                        brick[slot/4] byte (slot%4).
+//!                        block_type = 255 = "empty" sentinel.
+//! ```
+//!
+//! Dense nodes save a lot of space as bricks: 27 fully-populated
+//! terminal slots would cost 2 + 27*2 = 56 u32s as sparse but only
+//! 9 u32s as brick. Symmetric with layer semantics — a node is
+//! brickable iff its content is brickable, irrespective of depth.
+//!
 //! Two parallel side-buffers:
 //!
 //! - `node_kinds: Vec<GpuNodeKind>` — indexed by BFS position.
@@ -43,11 +71,43 @@ use std::collections::{HashMap, HashSet};
 
 use crate::world::anchor::{Path, WorldPos};
 use crate::world::tree::{
-    slot_coords, Child, NodeId, NodeKind, NodeLibrary,
-    CHILDREN_PER_NODE, UNIFORM_EMPTY, UNIFORM_MIXED,
+    slot_coords, Child, Node, NodeId, NodeKind, NodeLibrary, CHILDREN_PER_NODE,
 };
 
 use super::types::{GpuChild, GpuNodeKind};
+
+/// Occupancy-mask flag bit marking a brick-packed node. Must stay in
+/// sync with `BRICK_FLAG_BIT` in `assets/shaders/bindings.wgsl`.
+/// Lives at bit 27 since the occupancy mask itself only uses 0..26.
+const BRICK_FLAG_BIT: u32 = 1 << 27;
+
+/// Empty-slot sentinel for brick entries. Must match `BRICK_EMPTY_BT`
+/// in `bindings.wgsl`.
+const BRICK_EMPTY_BT: u8 = 255;
+
+/// A Cartesian node is brick-eligible iff every child is a terminal
+/// (Empty or Block); no recursive Node children. We only brick
+/// Cartesian nodes — sphere/face nodes have per-kind traversal paths
+/// that don't match the flat-DDA brick layout.
+fn is_node_brickable(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Cartesian)
+        && node.children.iter().all(|child| !matches!(child, Child::Node(_)))
+}
+
+/// Byte layout of a brick's children block: 27 u8 block_types packed
+/// into 7 u32s (4 per word, little-endian within each word).
+const BRICK_DATA_U32S: u32 = 7;
+const BRICK_TOTAL_U32S: u32 = 2 + BRICK_DATA_U32S;
+
+/// Pack 27 per-slot block types into 7 contiguous u32s.
+fn pack_brick_words(slots: impl Iterator<Item = u8>) -> [u32; BRICK_DATA_U32S as usize] {
+    let mut words = [0u32; BRICK_DATA_U32S as usize];
+    for (slot, bt) in slots.enumerate() {
+        if slot >= CHILDREN_PER_NODE { break; }
+        words[slot / 4] |= (bt as u32) << ((slot % 4) * 8);
+    }
+    words
+}
 
 /// Result of packing: (tree, node_kinds, node_offsets, root_bfs_index).
 ///
@@ -92,6 +152,7 @@ pub fn pack_tree(
 
     let n_nodes = ordered.len();
     let mut occupancies: Vec<u32> = Vec::with_capacity(n_nodes);
+    let mut brickable: Vec<bool> = Vec::with_capacity(n_nodes);
     for &nid in &ordered {
         let node = library.get(nid).expect("node in ordered list must exist");
         let mut occ: u32 = 0;
@@ -101,14 +162,19 @@ pub fn pack_tree(
             }
         }
         occupancies.push(occ);
+        brickable.push(is_node_brickable(node));
     }
 
     // Phase 2: compute each node's header offset in tree[].
     let mut node_offsets: Vec<u32> = Vec::with_capacity(n_nodes);
     let mut running: u32 = 0;
-    for &occ in &occupancies {
+    for i in 0..n_nodes {
         node_offsets.push(running);
-        running = running + 2 + 2 * occ.count_ones();
+        running += if brickable[i] {
+            BRICK_TOTAL_U32S
+        } else {
+            2 + 2 * occupancies[i].count_ones()
+        };
     }
     let total_u32s = running as usize;
 
@@ -122,6 +188,21 @@ pub fn pack_tree(
         let header_off = node_offsets[i];
         let first_child_off = header_off + 2;
         debug_assert_eq!(tree.len() as u32, header_off);
+
+        if brickable[i] {
+            tree.push(occupancy | BRICK_FLAG_BIT);
+            tree.push(first_child_off);
+            let words = pack_brick_words((0..CHILDREN_PER_NODE).map(|slot| {
+                match node.children[slot] {
+                    Child::Empty => BRICK_EMPTY_BT,
+                    Child::Block(bt) => bt,
+                    Child::Node(_) => unreachable!("brickable node has no Node children"),
+                }
+            }));
+            for w in words { tree.push(w); }
+            continue;
+        }
+
         tree.push(occupancy);
         tree.push(first_child_off);
         for (slot, child) in node.children.iter().enumerate() {
@@ -159,6 +240,10 @@ fn pack_child_first(c: GpuChild) -> u32 {
     (c.tag as u32) | ((c.block_type as u32) << 8) | ((c._pad as u32) << 16)
 }
 
+/// Per-child screen-pixel estimate in the parent node's local frame.
+/// Matches the shader's `lod_pixels = cell_size / ray_dist *
+/// screen_height / (2 tan(fov/2))` but sampled at pack time using
+/// the cell center instead of the per-ray DDA position.
 fn child_screen_pixels(
     camera: &WorldPos,
     node_path: &Path,
@@ -177,7 +262,12 @@ fn child_screen_pixels(
     half_fov_recip / dist
 }
 
-/// LOD-aware tree packing: only uploads nodes large enough to see.
+/// Legacy parameter, retained for API compat. Previously controlled
+/// force-collapse depth; now unused (the only pack-time LOD is
+/// per-pixel, applied uniformly at every depth).
+pub const DEFAULT_LOD_LEAF_DEPTH: u32 = 4;
+
+/// LOD-aware tree packing.
 pub fn pack_tree_lod(
     library: &NodeLibrary,
     root: NodeId,
@@ -185,7 +275,7 @@ pub fn pack_tree_lod(
     screen_height: f32,
     fov: f32,
 ) -> PackedTree {
-    pack_tree_lod_selective(library, root, camera, screen_height, fov, &[], &[])
+    pack_tree_lod_selective(library, root, camera, screen_height, fov, &[], &[], DEFAULT_LOD_LEAF_DEPTH)
 }
 
 /// Like `pack_tree_lod`, but with one or more `preserve_paths`.
@@ -197,10 +287,19 @@ pub fn pack_tree_lod_preserving(
     fov: f32,
     preserve_paths: &[&[u8]],
 ) -> PackedTree {
-    pack_tree_lod_selective(library, root, camera, screen_height, fov, preserve_paths, &[])
+    pack_tree_lod_selective(library, root, camera, screen_height, fov, preserve_paths, &[], DEFAULT_LOD_LEAF_DEPTH)
 }
 
 /// Like `pack_tree_lod_preserving`, but also supports bounded preserve regions.
+///
+/// `lod_leaf_depth` is the packed-tree depth at which the renderer
+/// stops descending (= shader's `BASE_DETAIL_DEPTH`). Nodes at this
+/// depth force-collapse their tag=2 subtree children into tag=1
+/// (using the child's representative_block), so the node becomes
+/// brickable — the shader descends into it via `march_brick` and
+/// does a flat-byte lookup instead of per-cell tag dispatch. Visually
+/// equivalent to the shader's at_max LOD-terminal behavior, just
+/// baked into the GPU data layout.
 pub fn pack_tree_lod_selective(
     library: &NodeLibrary,
     root: NodeId,
@@ -209,8 +308,22 @@ pub fn pack_tree_lod_selective(
     fov: f32,
     preserve_paths: &[&[u8]],
     preserve_regions: &[(Path, u8)],
+    _lod_leaf_depth: u32,
 ) -> PackedTree {
-    const LOD_THRESHOLD: f32 = 0.5;
+    // The only pack-time LOD is per-pixel: a Cartesian child whose
+    // projected screen size is below `LOD_PIXEL_THRESHOLD` is stored
+    // as a tag=1 terminal with `representative_block` instead of
+    // descending. This matches the shader's `at_lod` check exactly.
+    // No force-collapse, no uniform-type collapse, no depth cap —
+    // bricks are used only where a node is NATURALLY brickable
+    // (every child is Block or Empty), which preserves real voxel
+    // data losslessly.
+    //
+    // Preserve-paths (exact ribbon ancestors) and preserve-regions
+    // (wide near-camera area) skip per-pixel collapse so the CPU
+    // ribbon builder can descend and so near-camera content keeps
+    // full detail regardless of projected size.
+    const LOD_PIXEL_THRESHOLD: f32 = 1.0;
 
     let mut preserve_pairs: HashSet<(NodeId, u8)> = HashSet::new();
     for preserve_path in preserve_paths {
@@ -249,10 +362,12 @@ pub fn pack_tree_lod_selective(
     let mut queue: Vec<QueueEntry> = Vec::new();
     let mut ordered: Vec<NodeId> = Vec::new();
     let mut per_node: Vec<SlotOverride> = Vec::new();
+    let mut node_depths: Vec<u8> = Vec::new();
 
     visited.insert(root, 0);
     ordered.push(root);
     per_node.push([None; CHILDREN_PER_NODE]);
+    node_depths.push(0);
     queue.push(QueueEntry { node_id: root, path: Path::root() });
 
     let mut head = 0usize;
@@ -287,26 +402,15 @@ pub fn pack_tree_lod_selective(
                 || in_preserve_region(&child_path, &preserve_regions);
             let child_is_cartesian = matches!(child_node.kind, NodeKind::Cartesian);
 
-            if !on_preserve && lod_active && child_is_cartesian
-                && child_node.uniform_type != UNIFORM_MIXED
-            {
-                per_node[ordered_idx][slot] = if child_node.uniform_type == UNIFORM_EMPTY {
-                    None
-                } else {
-                    Some(GpuChild {
-                        tag: 1,
-                        block_type: child_node.uniform_type,
-                        _pad: 0,
-                        node_index: 0,
-                    })
-                };
-                continue;
-            }
-
+            // Per-pixel LOD: if the child cell projects below
+            // LOD_PIXEL_THRESHOLD pixels in the node's local frame,
+            // store it as a tag=1 terminal with representative_block.
+            // This matches the shader's runtime `at_lod` check so far
+            // content doesn't expand the packed tree unnecessarily.
             if !on_preserve && lod_active && child_is_cartesian {
-                let screen_pixels =
+                let pixels =
                     child_screen_pixels(camera, &node_path, slot, screen_height, fov);
-                if screen_pixels < LOD_THRESHOLD {
+                if pixels < LOD_PIXEL_THRESHOLD {
                     per_node[ordered_idx][slot] = if child_node.representative_block < 255 {
                         Some(GpuChild {
                             tag: 1,
@@ -326,6 +430,7 @@ pub fn pack_tree_lod_selective(
                 visited.insert(*child_id, idx);
                 ordered.push(*child_id);
                 per_node.push([None; CHILDREN_PER_NODE]);
+                node_depths.push(child_path.depth() as u8);
                 queue.push(QueueEntry {
                     node_id: *child_id,
                     path: child_path,
@@ -342,7 +447,8 @@ pub fn pack_tree_lod_selective(
     // Phase 2: compute per-node header offsets.
     let n_nodes = ordered.len();
     let mut occupancies: Vec<u32> = Vec::with_capacity(n_nodes);
-    for slots in &per_node {
+    let mut brickable: Vec<bool> = Vec::with_capacity(n_nodes);
+    for (i, slots) in per_node.iter().enumerate() {
         let mut occ: u32 = 0;
         for (slot, entry) in slots.iter().enumerate() {
             if entry.is_some() {
@@ -350,12 +456,35 @@ pub fn pack_tree_lod_selective(
             }
         }
         occupancies.push(occ);
+        // A packed node is brickable iff it's Cartesian AND every
+        // non-empty slot is a terminal Block entry (tag == 1). Any
+        // tag == 2 forces the sparse layout (recursion lives
+        // through the child's node_index).
+        //
+        // A/B switch: DEEPSPACE_NO_BRICK disables the brick format
+        // entirely (natural-brickable nodes get packed as sparse
+        // instead). Used for perf comparison; shouldn't change
+        // visible output.
+        let bricks_disabled = std::env::var("DEEPSPACE_NO_BRICK").is_ok();
+        let node = library.get(ordered[i])
+            .expect("node in ordered list must exist");
+        let is_cart = matches!(node.kind, NodeKind::Cartesian);
+        let all_terminal = !bricks_disabled && slots.iter().all(|e| match e {
+            None => true,
+            Some(c) => c.tag == 1,
+        });
+        brickable.push(is_cart && all_terminal);
     }
+
     let mut node_offsets: Vec<u32> = Vec::with_capacity(n_nodes);
     let mut running: u32 = 0;
-    for &occ in &occupancies {
+    for i in 0..n_nodes {
         node_offsets.push(running);
-        running = running + 2 + 2 * occ.count_ones();
+        running += if brickable[i] {
+            BRICK_TOTAL_U32S
+        } else {
+            2 + 2 * occupancies[i].count_ones()
+        };
     }
     let total_u32s = running as usize;
 
@@ -369,6 +498,20 @@ pub fn pack_tree_lod_selective(
         let header_off = node_offsets[i];
         let first_child_off = header_off + 2;
         debug_assert_eq!(tree.len() as u32, header_off);
+
+        if brickable[i] {
+            tree.push(occupancy | BRICK_FLAG_BIT);
+            tree.push(first_child_off);
+            let words = pack_brick_words((0..CHILDREN_PER_NODE).map(|slot| {
+                match per_node[i][slot] {
+                    None => BRICK_EMPTY_BT,
+                    Some(c) => c.block_type,
+                }
+            }));
+            for w in words { tree.push(w); }
+            continue;
+        }
+
         tree.push(occupancy);
         tree.push(first_child_off);
         for slot in 0..CHILDREN_PER_NODE {
@@ -653,6 +796,7 @@ mod tests {
                 1.2,
                 &preserve_paths,
                 &preserve_regions,
+                DEFAULT_LOD_LEAF_DEPTH,
             );
 
             // CPU raycast to find a block to break.
@@ -681,6 +825,7 @@ mod tests {
                 1.2,
                 &preserve_paths,
                 &preserve_regions,
+                DEFAULT_LOD_LEAF_DEPTH,
             );
 
             assert!(
