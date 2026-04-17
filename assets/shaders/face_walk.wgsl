@@ -34,22 +34,17 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     result.depth = 1u;
 
     let fs = face_slot(face);
-    // Inline the sparse lookup to read the body's header once.
-    let body_header = nodes[body_node_idx];
-    let fs_bit = 1u << fs;
-    if ((body_header.occupancy & fs_bit) == 0u) {
+    if child_empty(body_node_idx, fs) {
         result.block = 0u;
         return result;
     }
-    let fs_rank = countOneBits(body_header.occupancy & (fs_bit - 1u));
-    let fs_base = (body_header.first_child + fs_rank) * 2u;
-    let face_packed = tree[fs_base];
-    let face_tag = face_packed & 0xFFu;
+    let face_packed = child_packed(body_node_idx, fs);
+    let face_tag = child_tag(face_packed);
     if face_tag == 1u {
-        result.block = (face_packed >> 8u) & 0xFFu;
+        result.block = child_block_type(face_packed);
         return result;
     }
-    var node = tree[fs_base + 1u];
+    var node = child_node_index(body_node_idx, fs);
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
@@ -71,19 +66,8 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
-        // Single header read per iteration; reuse for occupancy
-        // test, rank, and both compact-child u32s.
-        let header = nodes[node];
-        let bit = 1u << slot;
-        let is_empty = (header.occupancy & bit) == 0u;
-        var packed: u32 = 0u;
-        var child_base: u32 = 0u;
-        if (!is_empty) {
-            let rank = countOneBits(header.occupancy & (bit - 1u));
-            child_base = (header.first_child + rank) * 2u;
-            packed = tree[child_base];
-        }
-        let tag = packed & 0xFFu;
+        let packed = child_packed(node, slot);
+        let tag = child_tag(packed);
 
         // Boundary update: this step's child within the parent
         // contributes (size/3) * slot to the lo-bound, and shrinks
@@ -110,8 +94,8 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
         size = step_size;
 
-        if is_empty || tag == 1u {
-            result.block = select(0u, (packed >> 8u) & 0xFFu, tag == 1u);
+        if tag == 0u || tag == 1u {
+            result.block = select(0u, child_block_type(packed), tag == 1u);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
             result.v_lo = v_sum + v_comp;
@@ -120,7 +104,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
             return result;
         }
         if d >= limit {
-            let bt = (packed >> 8u) & 0xFFu;
+            let bt = child_block_type(packed);
             result.block = select(0u, bt, bt != 255u);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
@@ -129,7 +113,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
             result.size = size;
             return result;
         }
-        node = tree[child_base + 1u];
+        node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
@@ -158,19 +142,15 @@ fn sample_face_node(node_idx: u32,
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
-        let header = nodes[node];
-        let bit = 1u << slot;
-        if ((header.occupancy & bit) == 0u) {
+        if child_empty(node, slot) {
             return vec2<u32>(0u, d);
         }
-        let rank = countOneBits(header.occupancy & (bit - 1u));
-        let child_base = (header.first_child + rank) * 2u;
-        let packed = tree[child_base];
-        let tag = packed & 0xFFu;
+        let packed = child_packed(node, slot);
+        let tag = child_tag(packed);
         if tag == 1u {
-            return vec2<u32>((packed >> 8u) & 0xFFu, d);
+            return vec2<u32>(child_block_type(packed), d);
         }
-        node = tree[child_base + 1u];
+        node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
@@ -205,17 +185,8 @@ fn walk_face_node(node_idx: u32,
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
-        let header = nodes[node];
-        let bit = 1u << slot;
-        let is_empty = (header.occupancy & bit) == 0u;
-        var packed: u32 = 0u;
-        var child_base: u32 = 0u;
-        if (!is_empty) {
-            let rank = countOneBits(header.occupancy & (bit - 1u));
-            child_base = (header.first_child + rank) * 2u;
-            packed = tree[child_base];
-        }
-        let tag = packed & 0xFFu;
+        let packed = child_packed(node, slot);
+        let tag = child_tag(packed);
 
         let step_size = size * (1.0 / 3.0);
         u_lo = u_lo + step_size * f32(us);
@@ -223,8 +194,8 @@ fn walk_face_node(node_idx: u32,
         r_lo = r_lo + step_size * f32(rs);
         size = step_size;
 
-        if is_empty || tag == 1u {
-            result.block = select(0u, (packed >> 8u) & 0xFFu, tag == 1u);
+        if tag == 0u || tag == 1u {
+            result.block = select(0u, child_block_type(packed), tag == 1u);
             result.depth = d;
             result.u_lo = u_lo;
             result.v_lo = v_lo;
@@ -239,7 +210,7 @@ fn walk_face_node(node_idx: u32,
         let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
         let at_max = d >= uniforms.max_depth;
         if at_lod || at_max {
-            let bt = (packed >> 8u) & 0xFFu;
+            let bt = child_block_type(packed);
             result.block = select(0u, bt, bt != 255u);
             result.depth = d;
             result.u_lo = u_lo;
@@ -249,7 +220,7 @@ fn walk_face_node(node_idx: u32,
             return result;
         }
 
-        node = tree[child_base + 1u];
+        node = child_node_index(node, slot);
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
