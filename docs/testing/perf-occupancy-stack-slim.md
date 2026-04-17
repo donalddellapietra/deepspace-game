@@ -279,7 +279,66 @@ What's NOT tested here:
   indicate LOD thresholds are too aggressive, or the ribbon-level
   LOD could cut more.
 
-## Next steps (revised after empty-run experiments)
+## Content AABB culling (kept — 22% wall-clock win)
+
+**Big win.** Per-child content AABB stored at pack time in the spare
+12 bits of each tag=2 entry's `_pad` (zero memory overhead). Shader
+uses it for two things in one ray-box test:
+
+1. Skip descents where ray misses content (cull)
+2. Start child DDA at the AABB entry (skip leading empty cells)
+
+Slow-soldier @ 2560×1440, 300 frames, 3-run median:
+
+| metric | step 3 | AABB folded | Δ |
+|---|---|---|---|
+| submitted_done_ms | 9.88 | **7.70** | **−22%** |
+| avg_steps | 31.60 | **17.02** | −46% |
+| avg_empty | 14.62 | **7.60** | −48% |
+| avg_descend | 11.53 | 7.93 | −31% |
+| avg_oob | 7.53 | 3.93 | −48% |
+
+**Cumulative from baseline: 17.77 → 7.70 ms = 2.31× FPS** (vs 1.81×
+after the three scalar-stack steps alone).
+
+**Why the folding matters.** A naive implementation that adds an AABB
+ray-box BEFORE the existing child ray-box (keeping both) netted only
+~2% wall-clock, because the added ray-box cost on taken descents
+roughly cancelled the savings on culled descents. Replacing the old
+child ray-box with the AABB ray-box (using `aabb_hit.t_enter` as the
+DDA entry t) eliminates 20 ALU ops per taken descent × 7.93 descents
+= 159 ops/ray. That's what tipped the net from "noise" to "real win."
+
+**Why this worked when empty-run batching didn't.** Empty-run batching
+attacks a high-frequency branch (avg_empty=14.6) but with check
+overhead that dominates. AABB culling attacks a moderate-frequency
+branch (avg_descend=11.5) and folds its cost into work the shader was
+ALREADY doing (the child ray-box). Net: overhead ≈ 0, savings ≈ full.
+
+Pixel correctness: plain_d8 and sphere pixel-identical. zoom3 one
+pixel differs by max intensity 6 — floating-point rounding at an
+edge, not a correctness bug.
+
+## LOD tuning (tried — null)
+
+Runtime flag `--lod-pixels 2.0` doubled the sub-pixel-rejection
+threshold. Shader stats byte-identical to baseline (avg_descend,
+avg_lod_terminal unchanged), ~2% wall-clock delta within noise. In
+the zoom=4 soldier scene, the cells DDA visits are already ≥2 pixels
+on screen, so doubling the threshold catches no new cells. Higher
+values would blockify the image. Not landed.
+
+## f16 DDA state (skipped — insufficient theoretical upside)
+
+Didn't attempt. Analysis: the empty-advance hot path has ~2 FP ops
+per iteration (1 mul, 1 add). Going f16 at 2× rate would save at
+most ~14 ALU ops/ray out of ~700 total = 2% best case. Implementation
+cost (feature flag, `enable f16`, type conversions, precision
+validation) was not justified vs. the AABB path's known high
+upside. Documented here so future work can reconsider if the lever
+set changes.
+
+## Next steps (revised)
 
 Empty-cell batching is a dead end on this scene (see above). Real
 ALU savings lie elsewhere:
