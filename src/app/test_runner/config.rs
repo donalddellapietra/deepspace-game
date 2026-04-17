@@ -118,6 +118,12 @@ pub enum ScriptCmd {
     /// the current ui_layer / anchor_depth / frame. Timeline marker
     /// for correlating screenshots to actions in a test trace.
     Emit(String),
+    /// Nudge the camera along an axis (`0=x, 1=y, 2=z`) by `delta`
+    /// units in the current anchor-cell's local frame. Cumulative;
+    /// re-normalizes `WorldPos` so cell crossings update `anchor`.
+    /// Used by perf repros that need to exercise the smooth-motion
+    /// LOD/pack path without full player physics.
+    Step { axis: u8, delta: f32 },
     /// Teleport the camera to the horizontal center of the cell
     /// affected by the most recent break/place, positioned inside the
     /// bottom child of that cell at the current anchor depth.
@@ -310,6 +316,25 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             }
             if let Some(label) = raw.strip_prefix("emit:") {
                 return Some(ScriptCmd::Emit(label.to_string()));
+            }
+            if let Some(rest) = raw.strip_prefix("step:") {
+                // "step:x+", "step:y-", "step:z+:0.25"
+                let (dir, delta_str) = match rest.split_once(':') {
+                    Some((d, s)) => (d, Some(s)),
+                    None => (rest, None),
+                };
+                if dir.len() == 2 {
+                    let axis = match &dir[0..1] {
+                        "x" => 0u8, "y" => 1, "z" => 2, _ => return None,
+                    };
+                    let sign: f32 = match &dir[1..2] {
+                        "+" => 1.0, "-" => -1.0, _ => return None,
+                    };
+                    let mag: f32 = delta_str
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.10);
+                    return Some(ScriptCmd::Step { axis, delta: sign * mag });
+                }
             }
             eprintln!("test_runner: ignoring unknown script command {raw:?}");
             None

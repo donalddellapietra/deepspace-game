@@ -49,7 +49,6 @@ pub use test_runner::TestConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LodUploadKey {
     pub root: u64,
-    pub camera_anchor: Path,
     pub render_path: Path,
     pub logical_path: Path,
     pub visual_depth: u8,
@@ -83,7 +82,7 @@ impl HighlightCacheKey {
 }
 
 impl LodUploadKey {
-    pub(super) fn new(root: u64, camera: &WorldPos, frame: &ActiveFrame, visual_depth: u8) -> Self {
+    pub(super) fn new(root: u64, _camera: &WorldPos, frame: &ActiveFrame, visual_depth: u8) -> Self {
         let kind_tag = match frame.kind {
             ActiveFrameKind::Cartesian => 0,
             ActiveFrameKind::Body { .. } => 1,
@@ -91,7 +90,6 @@ impl LodUploadKey {
         };
         Self {
             root,
-            camera_anchor: camera.anchor,
             render_path: frame.render_path,
             logical_path: frame.logical_path,
             visual_depth,
