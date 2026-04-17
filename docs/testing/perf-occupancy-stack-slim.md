@@ -376,6 +376,47 @@ Top-Performance-Limiter counter confirmed "ALU Limiter" was the
 dominant category even after the stack-scalar steps — this is the
 change that attacks that category directly.
 
+## `tan(fov/2)` hoist (tried — null)
+
+Moved `uniforms.screen_height / (2.0 * tan(camera.fov * 0.5))` out of
+the per-descend LOD calc and into a loop-invariant `focal_px` scalar
+at the top of `march_cartesian`.
+
+Slow-soldier, 1 run: 6.41 ms vs 6.39 ms baseline. Inside noise.
+
+The wgpu/Naga→MSL pipeline was already hoisting `tan()` out of the
+hot loop — the result was still only evaluated once per invocation.
+No behavioral change, no perf change. Reverted.
+
+## OOB fold (tried — null, two approaches)
+
+The OOB check at the top of each iter — `cell.x < 0 || cell.x > 2 ||
+cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2` — is 11 ops
+(6 compares + 5 ORs) and fires every iteration (avg_oob=7.53 / 31.6
+= 24% taken, 76% short-circuited).
+
+**Attempt 1:** `any((cell < vec3(0)) | (cell > vec3(2)))`.
+
+Slow-soldier, 1 run: **6.51 ms (+1.8%)**. REGRESSION.
+
+The scalar chain short-circuits early on the common "in-bounds" case
+(76%). The vectorized form computes all 6 compares + vec-or + any()
+unconditionally — more work on the fast path than it saves on the
+slow path.
+
+**Attempt 2:** `min(cell.xyz)` + `max(cell.xyz)` reduction, then
+`cell_lo < 0 || cell_hi > 2`. 7 ops total, short dependency chain.
+
+Slow-soldier, 1 run: 6.39 ms — exact match to baseline, zero change.
+
+Compiler likely lowered both versions to similar code after
+optimization; Apple Silicon's scalar-per-lane scheduling doesn't
+benefit from the min/max reduction over the short-circuit chain.
+
+**Takeaway.** The scalar OR-chain with short-circuit is already
+well-matched to the compile pipeline. Moving on; the OOB check isn't
+the bottleneck the earlier ALU-count analysis implied.
+
 ## LOD tuning (tried — null)
 
 Runtime flag `--lod-pixels 2.0` doubled the sub-pixel-rejection
