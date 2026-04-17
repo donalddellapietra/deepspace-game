@@ -74,15 +74,16 @@ it regresses, the change is wrong.
 
 ### Baseline (sparse-tree @ 809660e)
 
-Slow-soldier @ 2560×1440, 300 frames, release build.
+Slow-soldier @ 2560×1440, 300 frames, release build, direct-binary
+invocation (not `cargo run`, which adds 5-10 ms of noise on this scene).
 
 | counter | mean | p99 |
 |---|---|---|
 | Fragment Occupancy | **12.04%** | 13.93% |
 | ALU Utilization | 21.70% | 23.65% |
 | Buffer Read Limiter | 4.84% | 5.28% |
-| `submitted_done_ms` avg | **17.67 ms** (≈ 57 FPS) | — |
-| `gpu_pass_ms` avg | 2.04 ms (undercount, see diagnosis) | — |
+| `submitted_done_ms` avg | **17.77 ms** (≈ 56 FPS) | — |
+| `gpu_pass_ms` avg | 2.22 ms (undercount, see diagnosis) | — |
 
 Matches the diagnosis doc: Fragment Occupancy ≈ 12%, confirming register-
 pressure regime.
@@ -137,7 +138,56 @@ Screenshots pixel-identical (plain_d8, sphere, zoom3). `cargo test
 
 ### Step 3: `s_side_dist` → scalar `cur_side_dist` (-60 B)
 
-Results pending.
+Slow-soldier @ 2560×1440, 300 frames.
+
+| counter | baseline | step 1 | step 2 | step 3 | Δ vs baseline |
+|---|---|---|---|---|---|
+| Fragment Occupancy (mean) | 12.04% | 12.20% | 12.65% | 12.41% | +0.37 pp |
+| Fragment Occupancy (p99)  | 13.93% | 12.85% | 36.29% | 21.61% | +7.7 pp |
+| ALU Utilization (mean)    | 21.70% | 24.43% | 30.24% | **36.66%** | **+14.96 pp** |
+| Buffer Read Limiter       | 4.84%  | 3.00%  | 2.90%  | 1.47%  | −3.4 pp |
+| Buffer Write Limiter      | 5.23%  | 4.13%  | 2.34%  | 0.32%  | −4.9 pp |
+| `submitted_done_ms` avg   | 17.77  | 16.43  | 12.67  | **9.82** | **−44.7% (1.81× FPS)** |
+
+**Interpretation.** Mean Fragment Occupancy still basically static —
+the compiler didn't cross whatever Apple-specific threshold unlocks a
+higher-occupancy scheduling mode. But the **ALU Utilization jump from
+21.7 → 36.7%** and the corresponding wall-clock improvement tell the
+real story: per-thread state dropped enough that the ALU is now
+getting fed almost twice as much work per unit time, even with mean
+occupancy unchanged.
+
+Buffer Read Limiter **dropped from 4.84% → 1.47%** — 3× less memory
+traffic. Removing the indexed stack accesses (`s_side_dist[depth]`)
+eliminated whatever compiler-emitted spill/reload instructions that
+counter was tracking.
+
+Screenshots pixel-identical on plain_d8, sphere, zoom3 — the entry_pos
+vs ray_origin reference unification doesn't move any pixels in these
+scenes because `t_start ≈ 0.001` for in-box cameras.
+
+## Conclusion
+
+Three scalar swaps preserving the DDA algorithm yielded:
+
+- **1.81× FPS on the slow-soldier scene** (17.77 ms → 9.82 ms)
+- **+15 pp ALU utilization** (21.7% → 36.7%) — the clean "shader is
+  doing more work per second" signal
+- **−70% Buffer Read traffic** (4.84% → 1.47%)
+- Fragment Occupancy mean essentially unchanged (~12%) — register-
+  pressure regime technically still holds on Apple's scheduler, but
+  other throughput signals all improved materially
+
+If you want to push further without restructuring:
+
+- `s_node_idx` (20 B) is the only remaining stack array other than
+  `s_cell`. Eliminating it requires re-walking the cell chain on pop
+  to rebuild `parent_node_idx` — adds O(depth) tree reads per pop.
+  Probably not worth it given pops are infrequent anyway.
+- Further wins from here likely require the compute-shader route
+  (`docs/prompts/compute-shader-migration.md`): move stack state
+  entirely off registers into threadgroup memory, unlocking the
+  "mean Fragment Occupancy" signal we didn't move here.
 
 ## Related docs
 
