@@ -174,20 +174,83 @@ Three scalar swaps preserving the DDA algorithm yielded:
 - **+15 pp ALU utilization** (21.7% → 36.7%) — the clean "shader is
   doing more work per second" signal
 - **−70% Buffer Read traffic** (4.84% → 1.47%)
-- Fragment Occupancy mean essentially unchanged (~12%) — register-
-  pressure regime technically still holds on Apple's scheduler, but
-  other throughput signals all improved materially
+- Fragment Occupancy mean essentially unchanged (~12%) — see below
+  for why this was NOT what we thought.
 
-If you want to push further without restructuring:
+## What the Top Performance Limiter counter actually says
 
-- `s_node_idx` (20 B) is the only remaining stack array other than
-  `s_cell`. Eliminating it requires re-walking the cell chain on pop
-  to rebuild `parent_node_idx` — adds O(depth) tree reads per pop.
-  Probably not worth it given pops are infrequent anyway.
-- Further wins from here likely require the compute-shader route
-  (`docs/prompts/compute-shader-migration.md`): move stack state
-  entirely off registers into threadgroup memory, unlocking the
-  "mean Fragment Occupancy" signal we didn't move here.
+After the three steps landed, I finally read the `Top Performance
+Limiter` counter from the trace (the Metal counter that tells you
+*which* resource is gating the GPU at each 20 µs sample). This counter
+was not in the `FOCUS` whitelist in `parse-metal-trace.py` and thus
+didn't show up in any earlier analysis.
+
+Distribution on the slow-soldier scene:
+
+| state | top limiter | % of samples |
+|---|---|---|
+| baseline | **ALU Limiter** | 99.1% |
+| step 3   | **ALU Limiter** | 98.2% |
+
+The shader is and always was **ALU-bound**, not register-pressure-
+bound. `perf-occupancy-diagnosis.md` interpreted the 12% Fragment
+Occupancy as register pressure via byte-counting (260 B > 128 B). That
+was a plausible-but-wrong hypothesis. The actual story:
+
+- Apple's scheduler keeps just enough SIMD groups in flight to
+  saturate the next bottleneck. When the ALU is the bottleneck,
+  low mean occupancy is a **symptom, not a cause** — more groups
+  wouldn't help because the ALU can't process them any faster.
+- The 1.81× speedup came from **reducing ALU instructions per pixel**
+  (scalar access vs indexed address arithmetic for stack arrays), NOT
+  from freeing registers. Every `s_cell_size[depth]` in the hot path
+  compiled to an address-compute + load; replacing it with a scalar
+  register read cut that ALU overhead.
+
+The `gpu-telemetry.md` interpretation rule "Fragment Occupancy <25% →
+register pressure" needs a caveat for ALU-bound shaders.
+
+## Empty-run batching experiment (reverted)
+
+Attempted a shader-only variant of INV9: after the normal DDA empty-
+advance, peek at the next slot along the dominant axis in the same
+node's occupancy mask; if it's also empty AND the axis is still
+dominant after one step, do a second advance inline (batch size ≤ 2).
+
+| metric | step 3 (scalar stack) | step 4 (in-node empty-run) |
+|---|---|---|
+| submitted_done_ms | 9.82 ms | **13.53 ms** |
+| avg_steps | 31.6 | 31.33 |
+
+**38% regression.** avg_steps barely moved — batch fires in <1% of
+empty iterations. In this scene, rays cross diagonally; dominant axis
+typically switches every single step, so the "same axis still
+dominant" condition rarely holds. The unconditional ~10 ALU ops of
+bounds+slot+empty+dominance checks dwarf the rare batch savings.
+
+Reverted. The empirical takeaway: on sparse diagonally-viewed
+geometry, in-node empty runs of length ≥ 2 along the dominant axis
+are rare. The cross-level variant (full INV9, per-node precomputed
+run lengths across multiple depths) operates where the actual long
+runs live — entire empty subtrees covering many-cell spans at the
+parent/grandparent level. That's the version worth implementing.
+
+## Next steps
+
+Further wins from here require attacking ALU work per ray, NOT
+occupancy:
+
+- **Full INV9** — per-node precomputed empty-run metadata at pack
+  time, crossing child-subtree boundaries. The `child_bt == 255u`
+  fast path already captures "whole subtree empty" for ONE level;
+  full INV9 extends this to multi-level runs.
+- **Compute shader + threadgroup tree cache** — cuts storage-buffer
+  load instructions (which show up as ALU), NOT register pressure.
+  Reframed from the original motivation but the technique is still
+  valid.
+- **F16 DDA state where precision allows** — f16 ops run at 2× rate
+  on Apple Silicon. F32 Utilization is 2-5% in our traces; there's
+  headroom.
 
 ## Related docs
 
