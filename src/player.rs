@@ -26,12 +26,12 @@ use bevy::prelude::*;
 use crate::camera::FpsCam;
 use crate::inventory::InventoryState;
 use crate::world::collision::{self, PLAYER_H};
-use crate::world::position::Position;
-use crate::world::generator::MAX_TERRAIN_AMPLITUDE;
-use crate::world::state::{sphere_center, SPHERE_RADIUS};
+use crate::world::position::{Position, NODE_PATH_LEN};
+use crate::world::state::GROUND_TRANSITION_DEPTH;
+use crate::world::tree::{slot_index, NODE_VOXELS_PER_AXIS};
 use crate::world::view::{
-    bevy_from_position, cell_size_at_layer, position_from_leaf_coord,
-    position_to_leaf_coord, norm_for_layer, scale_for_layer, target_layer_for, WorldAnchor,
+    bevy_from_position, cell_size_at_layer, position_to_leaf_coord,
+    scale_for_layer, target_layer_for, WorldAnchor,
 };
 use crate::world::{CameraZoom, WorldPosition, WorldState};
 
@@ -66,18 +66,37 @@ pub struct Player;
 #[derive(Component)]
 pub struct Velocity(pub Vec3);
 
-/// Spawn 2 voxels above the north pole of the sphere, at the
-/// world's x/z centre. The floating [`WorldAnchor`] tracks the
-/// player's integer leaf coord, so precision is perfect regardless
-/// of where in the 6-billion-leaf root this lands.
+/// Path-based spawn position at the **arithmetic centre of the
+/// root**. Every path slot is `(2, _, 2)` on `x`/`z`, which picks
+/// the middle of each `5³` child array, and the in-leaf voxel is
+/// also centred.
+///
+/// The grass/air transition in the tree happens at depth
+/// [`GROUND_TRANSITION_DEPTH`] (= 2): at that depth, the child
+/// extent first equals `GROUND_Y_VOXELS`, so `sy = 1` is the first
+/// air slot. All slots above that depth stay `sy = 0` to remain in
+/// the grass "bottom" subtree, and all below stay `sy = 0` to sit
+/// flush with the ground surface.
+///
+/// This spawn is only possible thanks to the floating
+/// [`WorldAnchor`]: under a constant `ROOT_ORIGIN` the centre of
+/// the `25 × 5^12`-leaf root would be at Bevy `(≈3e9, ≈3e9)` and
+/// `f32` step size there is hundreds of leaves, breaking leaf-
+/// level collision and picking. With the anchor tracking the
+/// player's integer leaf coord, the player's `Transform` stays
+/// sub-voxel regardless of where in the tree they are.
 pub fn spawn_position() -> Position {
-    let center = sphere_center();
-    let max_h = SPHERE_RADIUS + MAX_TERRAIN_AMPLITUDE as i64;
-    let coord = [center[0], center[1] + max_h + 2, center[2]];
-    let mut pos = position_from_leaf_coord(coord)
-        .expect("sphere spawn position inside world bounds");
-    pos.offset = [0.5, 0.0, 0.5];
-    pos
+    let mut path = [slot_index(2, 0, 2) as u8; NODE_PATH_LEN];
+    // Depth GROUND_TRANSITION_DEPTH: sy = 1 → first air region above
+    // the ground. At this depth the child extent equals
+    // GROUND_Y_VOXELS, so sy = 1 places us at y = GROUND_Y_VOXELS.
+    path[GROUND_TRANSITION_DEPTH] = slot_index(2, 1, 2) as u8;
+    let mid = (NODE_VOXELS_PER_AXIS / 2) as u8;
+    Position {
+        path,
+        voxel: [mid, 2, mid],
+        offset: [0.5, 0.0, 0.5],
+    }
 }
 
 /// The [`WorldAnchor`] that would place the spawn `Position` at
@@ -87,7 +106,7 @@ pub fn spawn_anchor() -> WorldAnchor {
     WorldAnchor {
         leaf_coord: position_to_leaf_coord(&spawn_position()),
         // Start at leaf layer (MAX_LAYER), target = MAX_LAYER, norm = 1.0
-        norm: norm_for_layer(crate::world::tree::MAX_LAYER),
+        norm: scale_for_layer(target_layer_for(crate::world::tree::MAX_LAYER)),
     }
 }
 
@@ -130,11 +149,7 @@ pub fn move_player(
     let Ok(cam) = camera_q.single() else {
         return;
     };
-    // Clamp dt to prevent runaway physics on slow frames (e.g.
-    // mesh baking burst after a zoom change). Without this, a
-    // 2-second bake frame causes enormous gravity velocity →
-    // huge collision sweep → even slower frame → feedback loop.
-    let dt = time.delta_secs().min(0.1);
+    let dt = time.delta_secs();
 
     // Convert cell-rate constants into leaves-per-second values for
     // the current zoom level. At view L=12 (leaves) cell_size = 1,
@@ -213,9 +228,10 @@ pub fn sync_anchor_to_player(
     if let Ok(pos) = player_q.single() {
         anchor.leaf_coord = position_to_leaf_coord(&pos.0);
     }
-    // Normalization disabled — raw leaf-voxel coordinates avoid tile
-    // boundary seams. Re-enable when LOD composition is implemented.
-    anchor.norm = 1.0;
+    // Keep the normalization divisor in sync with the target layer
+    // so Bevy-space coordinates stay bounded.
+    let target = target_layer_for(zoom.layer);
+    anchor.norm = scale_for_layer(target);
 }
 
 /// Derive every entity's `Transform.translation` from its

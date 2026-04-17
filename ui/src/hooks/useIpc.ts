@@ -43,15 +43,3 @@ export function toggleColorPicker() {
 export function setUiFocused(focused: boolean) {
   sendCommand({ cmd: "uiFocused", focused });
 }
-
-export function saveGame() {
-  sendCommand({ cmd: "saveGame" });
-}
-
-export function loadGame() {
-  sendCommand({ cmd: "loadGame" });
-}
-
-export function closePauseMenu() {
-  sendCommand({ cmd: "closePauseMenu" });
-}

@@ -30,12 +30,6 @@ use crate::camera::CursorLocked;
 use crate::inventory::InventoryState;
 use crate::overlay::{PointerLockLost, UiFocused};
 
-#[derive(Resource, Default)]
-pub struct PauseMenuState {
-    pub open: bool,
-    pub save_status: Option<String>,
-}
-
 // ── Plugin ─────────────────────────────────────────────────────────
 
 pub struct UiPlugin;
@@ -43,7 +37,6 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(color_picker::ColorPickerPlugin)
-            .init_resource::<PauseMenuState>()
             .add_systems(Update, sync_cursor);
     }
 }
@@ -53,7 +46,6 @@ impl Plugin for UiPlugin {
 pub fn sync_cursor(
     mut inv: ResMut<InventoryState>,
     mut picker: ResMut<color_picker::ColorPickerState>,
-    mut pause_menu: ResMut<PauseMenuState>,
     mut ui_focused: ResMut<UiFocused>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut keyboard: ResMut<ButtonInput<KeyCode>>,
@@ -64,28 +56,11 @@ pub fn sync_cursor(
     #[cfg(not(target_arch = "wasm32"))]
     primary: Query<Entity, With<PrimaryWindow>>,
 ) {
-    // ── 1. Escape — toggle pause menu (close panels first) ──
+    // ── 1. Escape — close everything, go to Unfocused ──
     if keyboard.just_pressed(KeyCode::Escape) {
-        if inv.open || picker.open {
-            // Close panels first, don't open pause menu.
-            inv.open = false;
-            picker.open = false;
-            go_unlocked(&mut cursor_options, &mut cursor_locked, &mut ui_focused, &mut lock_lost);
-        } else {
-            // Toggle pause menu.
-            pause_menu.open = !pause_menu.open;
-            pause_menu.save_status = None;
-            if pause_menu.open {
-                go_unlocked(&mut cursor_options, &mut cursor_locked, &mut ui_focused, &mut lock_lost);
-            } else {
-                go_locked(
-                    &mut cursor_options, &mut cursor_locked,
-                    &mut ui_focused, &mut keyboard,
-                    #[cfg(not(target_arch = "wasm32"))]
-                    &primary,
-                );
-            }
-        }
+        inv.open = false;
+        picker.open = false;
+        go_unlocked(&mut cursor_options, &mut cursor_locked, &mut ui_focused, &mut lock_lost);
         return;
     }
 
@@ -98,7 +73,7 @@ pub fn sync_cursor(
     }
     lock_lost.0 = false;
 
-    let any_panel = inv.open || picker.open || pause_menu.open;
+    let any_panel = inv.open || picker.open;
 
     // ── 3. A panel is open → stay unlocked ──
     if any_panel {

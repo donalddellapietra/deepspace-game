@@ -18,10 +18,6 @@ pub const CHILDREN_PER_NODE: usize = 125; // 5³
 pub const NODE_VOXELS_PER_AXIS: usize = 25;
 pub const NODE_VOXELS: usize = 15_625; // 25³
 pub const MAX_LAYER: u8 = 12;
-/// How many layers of sub-cell detail the renderer shows below the
-/// current view layer. At view layer `L`, one visible cell maps to a
-/// layer-`(L + DETAIL_DEPTH)` node (clamped to `MAX_LAYER`).
-pub const DETAIL_DEPTH: u8 = 2;
 
 // ---------------------------------------------------------------- voxel
 
@@ -149,43 +145,6 @@ impl Default for NodeLibrary {
 }
 
 impl NodeLibrary {
-    /// Create a library with a specific `next_id` (used by deserialization).
-    pub fn with_next_id(next_id: u64) -> Self {
-        Self {
-            nodes: HashMap::new(),
-            leaf_by_hash: HashMap::new(),
-            non_leaf_by_hash: HashMap::new(),
-            next_id,
-        }
-    }
-
-    /// The next NodeId that would be assigned.
-    pub fn next_id(&self) -> u64 {
-        self.next_id
-    }
-
-    /// Ensure `next_id` is above `id` (used after loading overrides).
-    pub fn ensure_next_id_above(&mut self, id: u64) {
-        if self.next_id <= id {
-            self.next_id = id + 1;
-        }
-    }
-
-    /// Insert a node with a specific id, bypassing dedup and refcounting.
-    /// Used by deserialization to reconstruct the library exactly.
-    pub fn insert_raw(&mut self, id: NodeId, node: Node) {
-        if id >= self.next_id {
-            self.next_id = id + 1;
-        }
-        self.nodes.insert(id, node);
-        // Hash indices are rebuilt in bulk after all inserts.
-    }
-
-    /// Iterate over all nodes in the library.
-    pub fn iter_nodes(&self) -> impl Iterator<Item = (&NodeId, &Node)> {
-        self.nodes.iter()
-    }
-
     /// Insert a leaf. If an existing leaf has identical voxel content,
     /// its id is returned and the input `voxels` is dropped.
     pub fn insert_leaf(&mut self, voxels: VoxelGrid) -> NodeId {
@@ -313,46 +272,6 @@ impl NodeLibrary {
 
     pub fn len(&self) -> usize {
         self.nodes.len()
-    }
-
-    /// Rebuild the hash indices from the current node map.
-    /// Called after deserialization inserts nodes via `insert_raw`.
-    pub fn rebuild_hash_indices(&mut self) {
-        self.leaf_by_hash.clear();
-        self.non_leaf_by_hash.clear();
-        for (&id, node) in self.nodes.iter() {
-            match &node.children {
-                None => {
-                    let h = hash_voxels(&node.voxels);
-                    self.leaf_by_hash.entry(h).or_default().push(id);
-                }
-                Some(children) => {
-                    let h = hash_children(children);
-                    self.non_leaf_by_hash.entry(h).or_default().push(id);
-                }
-            }
-        }
-    }
-
-    /// Rebuild refcounts by walking all non-leaf nodes and counting
-    /// child references. Call `ref_inc(root)` separately for the
-    /// external root reference.
-    pub fn rebuild_refcounts(&mut self) {
-        for node in self.nodes.values_mut() {
-            node.ref_count = 0;
-        }
-        let child_refs: Vec<NodeId> = self
-            .nodes
-            .values()
-            .filter_map(|n| n.children.as_ref())
-            .flat_map(|c| c.iter().copied())
-            .filter(|&id| id != EMPTY_NODE)
-            .collect();
-        for id in child_refs {
-            if let Some(node) = self.nodes.get_mut(&id) {
-                node.ref_count = node.ref_count.saturating_add(1);
-            }
-        }
     }
 }
 

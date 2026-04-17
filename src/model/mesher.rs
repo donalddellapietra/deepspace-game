@@ -109,122 +109,17 @@ pub struct FaceData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 4]>,
-    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
-}
-
-// ------------------------------------------------ compact serialization
-//
-// On disk, each vertex is 5 bytes (3×u8 position + 1 byte normal +
-// 1 byte AO level) instead of 44 bytes (3×f32 pos + 3×f32 normal +
-// 4×f32 color). Indices are u16 instead of u32.
-
-const NORMAL_DIRS: [[f32; 3]; 6] = [
-    [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0], [0.0, -1.0, 0.0],
-    [0.0, 0.0, 1.0], [0.0, 0.0, -1.0],
-];
-
-fn encode_normal(n: &[f32; 3]) -> u8 {
-    for (i, dir) in NORMAL_DIRS.iter().enumerate() {
-        if n == dir { return i as u8; }
-    }
-    0
-}
-
-fn ao_level_from_brightness(b: f32) -> u8 {
-    // AO_CURVE = [0.6, 0.75, 0.9, 1.0]
-    if b < 0.67 { 0 }
-    else if b < 0.82 { 1 }
-    else if b < 0.95 { 2 }
-    else { 3 }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CompactFaceData {
-    /// 3 bytes per vertex: [x, y, z] as u8.
-    positions: Vec<u8>,
-    /// 1 byte per vertex: normal direction index (0..6).
-    normals: Vec<u8>,
-    /// 1 byte per vertex: AO level (0..4).
-    ao_levels: Vec<u8>,
-    /// UVs stored as raw f32 (can have fractional values from greedy merge).
-    uvs: Vec<[f32; 2]>,
-    /// Full u32 indices — NOT u16, because merged nodes can have
-    /// 75,000+ vertices (125 children × ~600 vertices each).
-    indices: Vec<u32>,
-}
-
-impl From<&FaceData> for CompactFaceData {
-    fn from(f: &FaceData) -> Self {
-        let n = f.positions.len();
-        let mut positions = Vec::with_capacity(n * 3);
-        let mut normals = Vec::with_capacity(n);
-        let mut ao_levels = Vec::with_capacity(n);
-        for i in 0..n {
-            let p = &f.positions[i];
-            positions.push(p[0] as u8);
-            positions.push(p[1] as u8);
-            positions.push(p[2] as u8);
-            normals.push(encode_normal(&f.normals[i]));
-            ao_levels.push(ao_level_from_brightness(f.colors[i][0]));
-        }
-        let uvs = f.uvs.clone();
-        let indices = f.indices.clone();
-        CompactFaceData { positions, normals, ao_levels, uvs, indices }
-    }
-}
-
-impl From<CompactFaceData> for FaceData {
-    fn from(c: CompactFaceData) -> Self {
-        let n = c.normals.len();
-        let mut positions = Vec::with_capacity(n);
-        let mut normals = Vec::with_capacity(n);
-        let mut colors = Vec::with_capacity(n);
-        for i in 0..n {
-            positions.push([
-                c.positions[i * 3] as f32,
-                c.positions[i * 3 + 1] as f32,
-                c.positions[i * 3 + 2] as f32,
-            ]);
-            normals.push(NORMAL_DIRS[c.normals[i] as usize]);
-            let brightness = AO_CURVE[c.ao_levels[i] as usize];
-            colors.push([brightness, brightness, brightness, 1.0]);
-        }
-        let uvs = c.uvs;
-        let indices = c.indices;
-        FaceData { positions, normals, colors, uvs, indices }
-    }
-}
-
-impl serde::Serialize for FaceData {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        CompactFaceData::from(self).serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for FaceData {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        CompactFaceData::deserialize(deserializer).map(FaceData::from)
-    }
 }
 
 impl FaceData {
     fn add_quad(&mut self, quad: &[Vec3; 4], normal: Vec3, offset: Vec3, ao: [u8; 4]) {
         let base = self.positions.len() as u32;
-        let (u_axis, v_axis) = if normal.x.abs() > 0.5 {
-            (2, 1)
-        } else if normal.y.abs() > 0.5 {
-            (0, 2)
-        } else {
-            (0, 1)
-        };
         for (i, &vert) in quad.iter().enumerate() {
             self.positions.push((vert + offset).to_array());
             self.normals.push(normal.to_array());
             let brightness = AO_CURVE[ao[i] as usize];
             self.colors.push([brightness, brightness, brightness, 1.0]);
-            self.uvs.push([vert[u_axis], vert[v_axis]]);
         }
         if ao[0] + ao[2] > ao[1] + ao[3] {
             self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -253,7 +148,6 @@ impl FaceData {
             self.normals.push(normal_arr);
             let brightness = AO_CURVE[ao_level as usize];
             self.colors.push([brightness, brightness, brightness, 1.0]);
-            self.uvs.push([vert[axes.1] * (w as f32), vert[axes.2] * (h as f32)]);
         }
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -262,7 +156,7 @@ impl FaceData {
         self.positions.is_empty()
     }
 
-    pub fn build(self) -> Mesh {
+    fn build(self) -> Mesh {
         if self.positions.is_empty() {
             return Mesh::new(
                 PrimitiveTopology::TriangleList,
@@ -276,7 +170,6 @@ impl FaceData {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
         .with_inserted_indices(Indices::U32(self.indices))
     }
 }
@@ -386,22 +279,13 @@ fn bake_faces<F: Fn(i32, i32, i32) -> Option<u8>>(
 /// Bake a `size³` volume into per-voxel-type sub-meshes with greedy
 /// meshing. Used for leaf nodes and any case where incremental
 /// baking isn't needed.
-/// Bake a volume into raw `(voxel, FaceData)` pairs without Bevy.
-pub fn bake_volume_raw<F: Fn(i32, i32, i32) -> Option<u8>>(
-    size: i32,
-    get: F,
-) -> Vec<(u8, FaceData)> {
-    bake_faces(size, &get, [0, 0, 0])
-        .into_iter()
-        .collect()
-}
-
 pub fn bake_volume<F: Fn(i32, i32, i32) -> Option<u8>>(
     size: i32,
     get: F,
     meshes: &mut Assets<Mesh>,
 ) -> Vec<BakedSubMesh> {
-    bake_volume_raw(size, &get)
+    let faces = bake_faces(size, &get, [0, 0, 0]);
+    faces
         .into_iter()
         .map(|(voxel, data)| BakedSubMesh {
             mesh: meshes.add(data.build()),
@@ -566,11 +450,14 @@ pub fn flatten_children(
     flat
 }
 
-/// Merge 125 children's `ChildFaces` into raw `(voxel, FaceData)` pairs.
-/// This does all the CPU-side work (concatenation, index offset) without
-/// requiring Bevy `Assets<Mesh>`. Used by both the runtime renderer and
-/// the offline prebake tool.
-pub fn merge_child_faces_raw(children: &[ChildFaces]) -> Vec<(u8, FaceData)> {
+/// Merge 125 children's `ChildFaces` into final `BakedSubMesh`es.
+/// Each child's face data is concatenated (with index offsets) into
+/// one mesh per voxel type.
+pub fn merge_child_faces(
+    children: &[ChildFaces],
+    meshes: &mut Assets<Mesh>,
+) -> Vec<BakedSubMesh> {
+    // Collect all voxel types across all children.
     let mut all_voxels: Vec<u8> = Vec::new();
     for child in children {
         for &v in child.keys() {
@@ -590,7 +477,6 @@ pub fn merge_child_faces_raw(children: &[ChildFaces]) -> Vec<(u8, FaceData)> {
                     merged.positions.extend_from_slice(&data.positions);
                     merged.normals.extend_from_slice(&data.normals);
                     merged.colors.extend_from_slice(&data.colors);
-                    merged.uvs.extend_from_slice(&data.uvs);
                     for &idx in &data.indices {
                         merged.indices.push(base + idx);
                     }
@@ -600,44 +486,10 @@ pub fn merge_child_faces_raw(children: &[ChildFaces]) -> Vec<(u8, FaceData)> {
                 return None;
             }
 
-            // Smooth AO at child boundaries: the per-child greedy merge
-            // can't merge across 25-voxel child edges, so adjacent
-            // children's quads can have different AO levels at their
-            // shared edge, creating visible dark lines. Setting
-            // boundary vertices to full brightness removes the
-            // discontinuity without affecting interior AO.
-            let child_size: f32 = 25.0; // NODE_VOXELS_PER_AXIS
-            let eps = 0.01;
-            for (i, pos) in merged.positions.iter().enumerate() {
-                let on_child_edge =
-                    pos[0].rem_euclid(child_size) < eps
-                    || (child_size - pos[0].rem_euclid(child_size)) < eps
-                    || pos[1].rem_euclid(child_size) < eps
-                    || (child_size - pos[1].rem_euclid(child_size)) < eps
-                    || pos[2].rem_euclid(child_size) < eps
-                    || (child_size - pos[2].rem_euclid(child_size)) < eps;
-                if on_child_edge {
-                    merged.colors[i] = [1.0, 1.0, 1.0, 1.0];
-                }
-            }
-
-            Some((voxel, merged))
-        })
-        .collect()
-}
-
-/// Merge 125 children's `ChildFaces` into final `BakedSubMesh`es.
-/// Each child's face data is concatenated (with index offsets) into
-/// one mesh per voxel type.
-pub fn merge_child_faces(
-    children: &[ChildFaces],
-    meshes: &mut Assets<Mesh>,
-) -> Vec<BakedSubMesh> {
-    merge_child_faces_raw(children)
-        .into_iter()
-        .map(|(voxel, data)| BakedSubMesh {
-            mesh: meshes.add(data.build()),
-            voxel,
+            Some(BakedSubMesh {
+                mesh: meshes.add(merged.build()),
+                voxel,
+            })
         })
         .collect()
 }

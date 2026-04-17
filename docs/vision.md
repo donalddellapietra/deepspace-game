@@ -119,12 +119,8 @@ it: destruction, voxel-level physics, zoom-coherent rendering.
 
 ## What needs to be built (roughly, in order)
 
-1. **Canned structure pipeline.** Offline build tool that generates
-   world content (terrain, biomes, structures) as precomputed library
-   patterns, serializes them to disk, and loads them at runtime. This
-   replaces runtime procedural generation entirely. Player edits are
-   stored as deltas against the canned base. See
-   `docs/architecture/canned-structures.md`.
+1. **Persistence and serialization.** The world must survive between
+   sessions. Entity versioning from day one so save formats can evolve.
 
 2. **Async meshing with priority queues.** Near-player chunks at high
    priority, distant chunks at low priority. Required before the world
@@ -134,11 +130,9 @@ it: destruction, voxel-level physics, zoom-coherent rendering.
    faction) to tree nodes at coarse layers. This is the statistical
    simulation tier.
 
-4. **Canned runs.** Offline simulation tool that evolves canned
-   structures over time and snapshots the results. A forest at T=0 is
-   saplings; at T=200 it's old growth; at T=300 it's post-fire
-   regrowth. Each snapshot is a canned structure in the library. The
-   game selects the snapshot matching the current simulation time.
+4. **Aggregate simulation systems.** Grand strategy ticks at layers
+   1-6: economy, diplomacy, war, population growth. These run every
+   N frames, not every frame.
 
 5. **Entity spawning/despawning driven by zoom.** As the player zooms
    into a city, the population stat spawns representative NPCs. Zoom
@@ -151,7 +145,11 @@ it: destruction, voxel-level physics, zoom-coherent rendering.
    cities enter wartime production at layer 8; NPCs reference it in
    dialogue at layer 12. Message-passing that flows down the tree.
 
-8. **Two adjacent layers working together.** The proof-of-concept
+8. **Procedural generation at every tier.** GPU-accelerated terrain
+   (noise pipelines), WFC-based structure generation for cities and
+   dungeons, procedural NPC generation from population seeds.
+
+9. **Two adjacent layers working together.** The proof-of-concept
    milestone: city management + street-level exploration, with seamless
    zoom and coherent simulation handoff. Everything else expands from
    this.

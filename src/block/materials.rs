@@ -5,8 +5,7 @@ use super::{PaletteMaterial, Palette};
 pub fn init_palette(
     mut commands: Commands,
     mut materials: ResMut<Assets<PaletteMaterial>>,
-    asset_server: Res<AssetServer>,
 ) {
-    let palette = Palette::new(&mut materials, &asset_server);
+    let palette = Palette::new(&mut materials);
     commands.insert_resource(palette);
 }

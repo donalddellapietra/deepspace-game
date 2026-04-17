@@ -70,13 +70,6 @@ pub struct ToastMessageJs {
 }
 
 #[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct PauseMenuStateJs {
-    pub open: bool,
-    pub save_status: Option<String>,
-}
-
-#[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "camelCase")]
 pub enum GameStateUpdate {
@@ -85,7 +78,6 @@ pub enum GameStateUpdate {
     ColorPicker(ColorPickerStateJs),
     ModeIndicator(ModeIndicatorStateJs),
     Toast(ToastMessageJs),
-    PauseMenu(PauseMenuStateJs),
 }
 
 // ── JS → Rust commands ────────────────────────────────────────────
@@ -104,7 +96,4 @@ pub enum UiCommand {
     CloseAllPanels,
     UiFocused { focused: bool },
     PointerLockLost,
-    SaveGame,
-    LoadGame,
-    ClosePauseMenu,
 }

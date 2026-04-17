@@ -52,19 +52,13 @@ export interface ToastMessage {
   id: number;
 }
 
-export interface PauseMenuState {
-  open: boolean;
-  saveStatus: string | null;
-}
-
 // Union of all state updates pushed from Rust
 export type GameStateUpdate =
   | { type: "hotbar"; data: HotbarState }
   | { type: "inventory"; data: InventoryState }
   | { type: "colorPicker"; data: ColorPickerState }
   | { type: "modeIndicator"; data: ModeIndicatorState }
-  | { type: "toast"; data: ToastMessage }
-  | { type: "pauseMenu"; data: PauseMenuState };
+  | { type: "toast"; data: ToastMessage };
 
 // Commands sent from React to Rust
 export type UiCommand =
@@ -76,7 +70,4 @@ export type UiCommand =
   | { cmd: "toggleInventory" }
   | { cmd: "toggleColorPicker" }
   | { cmd: "closeAllPanels" }
-  | { cmd: "uiFocused"; focused: boolean }
-  | { cmd: "saveGame" }
-  | { cmd: "loadGame" }
-  | { cmd: "closePauseMenu" };
+  | { cmd: "uiFocused"; focused: boolean };

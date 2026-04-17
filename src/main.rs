@@ -1,15 +1,26 @@
+mod block;
+mod camera;
+mod diagnostics;
+mod editor;
+mod import;
+mod interaction;
+mod inventory;
+mod model;
+mod npc;
+mod overlay;
+mod player;
+mod ui;
+mod world;
+
 use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
 
-use deepspace_game::block::{self, BslMaterial, PaletteMaterial};
-use deepspace_game::{camera, diagnostics, editor, import, interaction, inventory, model, npc, overlay, player, ui, world};
+use block::{BslMaterial, PaletteMaterial};
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins
-        .set(ImagePlugin::default())
-        .set(WindowPlugin {
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Deep Space".into(),
                 fit_canvas_to_parent: true,

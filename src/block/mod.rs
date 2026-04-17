@@ -3,7 +3,6 @@ pub mod materials;
 
 pub use bsl_material::BslMaterial;
 
-use bevy::image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bsl_material::{BslExtension, BslParams};
 
@@ -55,21 +54,6 @@ impl BlockType {
     pub fn voxel(&self) -> u8 {
         (*self as u8) + 1
     }
-
-    pub fn texture_name(self) -> &'static str {
-        match self {
-            Self::Stone => "stone",
-            Self::Dirt => "dirt",
-            Self::Grass => "grass",
-            Self::Wood => "wood",
-            Self::Leaf => "leaf",
-            Self::Sand => "sand",
-            Self::Water => "water",
-            Self::Brick => "brick",
-            Self::Metal => "metal",
-            Self::Glass => "glass",
-        }
-    }
 }
 
 // ---------------------------------------------------------------- Palette
@@ -82,7 +66,6 @@ pub struct PaletteEntry {
     pub roughness: f32,
     pub metallic: f32,
     pub alpha_mode: AlphaMode,
-    pub texture: Option<Handle<Image>>,
 }
 
 /// The concrete material type the palette creates handles for.
@@ -100,32 +83,12 @@ pub struct Palette {
 
 impl Palette {
     /// Create a new palette pre-populated with the 10 built-in blocks.
-    pub fn new(
-        mat_assets: &mut Assets<PaletteMaterial>,
-        asset_server: &AssetServer,
-    ) -> Self {
+    pub fn new(mat_assets: &mut Assets<PaletteMaterial>) -> Self {
         let mut palette = Self {
             entries: Vec::new(),
             materials: Vec::new(),
         };
         for bt in BlockType::ALL {
-            #[cfg(feature = "textures")]
-            let texture = {
-                let path = format!("textures/blocks/{}.png", bt.texture_name());
-                Some(asset_server.load_with_settings(path, |s: &mut ImageLoaderSettings| {
-                    s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-                        address_mode_u: ImageAddressMode::Repeat,
-                        address_mode_v: ImageAddressMode::Repeat,
-                        address_mode_w: ImageAddressMode::Repeat,
-                        mag_filter: ImageFilterMode::Nearest,
-                        min_filter: ImageFilterMode::Nearest,
-                        mipmap_filter: ImageFilterMode::Nearest,
-                        ..default()
-                    });
-                }))
-            };
-            #[cfg(not(feature = "textures"))]
-            let texture: Option<Handle<Image>> = None;
             palette.register(
                 PaletteEntry {
                     name: format!("{:?}", bt),
@@ -133,7 +96,6 @@ impl Palette {
                     roughness: bt.roughness(),
                     metallic: bt.metallic(),
                     alpha_mode: bt.alpha_mode(),
-                    texture,
                 },
                 mat_assets,
             );
@@ -195,15 +157,9 @@ impl Palette {
             "Leaf" | "Water" | "Glass" => 0.5,
             _ => 0.0,
         };
-        let base_color = if entry.texture.is_some() {
-            Color::WHITE
-        } else {
-            entry.color
-        };
         let handle = mat_assets.add(BslMaterial {
             base: StandardMaterial {
-                base_color,
-                base_color_texture: entry.texture.clone(),
+                base_color: entry.color,
                 perceptual_roughness: entry.roughness,
                 metallic: entry.metallic,
                 alpha_mode: entry.alpha_mode,
