@@ -14,13 +14,27 @@ use super::VoxelModel;
 /// voxels are treated as empty. Uniform subtrees (all one block type
 /// or all empty) are collapsed — they don't create intermediate nodes.
 pub fn build_tree(model: &VoxelModel, library: &mut NodeLibrary) -> NodeId {
+    build_tree_with_interior(model, library, 0)
+}
+
+/// Like `build_tree`, but each non-empty voxel is expanded into a
+/// uniform subtree of `interior_depth`. A voxel that would have been
+/// a single `Child::Block(v)` becomes a `Child::Node(...)` whose
+/// subtree is `interior_depth` levels deep and filled with `v`. This
+/// turns each voxel into a diggable cube with interior sub-cells —
+/// useful for perf scenarios that need deep anchor depths inside a
+/// recognizable silhouette. `interior_depth == 0` matches `build_tree`.
+pub fn build_tree_with_interior(
+    model: &VoxelModel,
+    library: &mut NodeLibrary,
+    interior_depth: u8,
+) -> NodeId {
     let max_dim = model.size_x.max(model.size_y).max(model.size_z).max(1);
     let padded = next_power_of_3(max_dim);
 
-    let root_child = build_node(model, library, 0, 0, 0, padded / BRANCH);
+    let root_child = build_node(model, library, 0, 0, 0, padded / BRANCH, interior_depth);
     match root_child {
         Child::Node(id) => id,
-        // Entire model collapsed to a single block or empty — wrap in a node.
         other => library.insert(uniform_children(other)),
     }
 }
@@ -30,6 +44,8 @@ pub fn build_tree(model: &VoxelModel, library: &mut NodeLibrary) -> NodeId {
 /// `origin_x/y/z` is the world-space corner of this region.
 /// `cell_size` is the size of one child cell (the region spans
 /// `cell_size * 3` along each axis).
+/// `interior_depth` is passed through to leaf-level voxels; each
+/// non-empty voxel is wrapped in a uniform subtree of that depth.
 fn build_node(
     model: &VoxelModel,
     library: &mut NodeLibrary,
@@ -37,6 +53,7 @@ fn build_node(
     origin_y: usize,
     origin_z: usize,
     cell_size: usize,
+    interior_depth: u8,
 ) -> Child {
     // Early out: entire region is outside the model bounds.
     if origin_x >= model.size_x && origin_y >= model.size_y && origin_z >= model.size_z {
@@ -52,10 +69,11 @@ fn build_node(
             for y in 0..BRANCH {
                 for x in 0..BRANCH {
                     children[slot_index(x, y, z)] = leaf_child(
-                        model,
+                        model, library,
                         origin_x + x,
                         origin_y + y,
                         origin_z + z,
+                        interior_depth,
                     );
                 }
             }
@@ -72,6 +90,7 @@ fn build_node(
                         origin_y + y * cell_size,
                         origin_z + z * cell_size,
                         sub_size,
+                        interior_depth,
                     );
                 }
             }
@@ -87,12 +106,30 @@ fn build_node(
     Child::Node(library.insert(children))
 }
 
-/// Read a single voxel from the model (or Empty if out of bounds).
+/// Read a single voxel from the model. Empty outside the model; a
+/// single `Child::Block(v)` when `interior_depth == 0`; otherwise a
+/// `Child::Node(...)` to a uniform subtree of `interior_depth` levels
+/// filled with `v`, so the voxel behaves as a diggable cube.
 #[inline]
-fn leaf_child(model: &VoxelModel, x: usize, y: usize, z: usize) -> Child {
+fn leaf_child(
+    model: &VoxelModel,
+    library: &mut NodeLibrary,
+    x: usize, y: usize, z: usize,
+    interior_depth: u8,
+) -> Child {
     if x < model.size_x && y < model.size_y && z < model.size_z {
         let v = model.get(x, y, z);
-        if v == 0 { Child::Empty } else { Child::Block(v) }
+        if v == 0 {
+            Child::Empty
+        } else if interior_depth == 0 {
+            Child::Block(v)
+        } else {
+            // build_uniform_subtree(v, N) → chain of N uniform-`v`
+            // nodes terminating in Block(v). Content-addressed dedup
+            // means all leaves of the same block type share one
+            // NodeId, regardless of how many voxels invoke this.
+            library.build_uniform_subtree(v, interior_depth as u32)
+        }
     } else {
         Child::Empty
     }

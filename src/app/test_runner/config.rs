@@ -161,8 +161,39 @@ impl TestConfig {
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
                 "--vox-model" => {
                     if let Some(path_str) = args.next() {
-                        cfg.world_preset = WorldPreset::VoxModel(path_str.into());
+                        // Interior depth may be set before or after this
+                        // flag; capture the existing value if any.
+                        let interior_depth = match &cfg.world_preset {
+                            WorldPreset::VoxModel { interior_depth, .. } => *interior_depth,
+                            _ => 0,
+                        };
+                        cfg.world_preset = WorldPreset::VoxModel {
+                            path: path_str.into(),
+                            interior_depth,
+                        };
                     }
+                }
+                "--vox-interior-depth" => {
+                    let n: u8 = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    // Update existing VoxModel if already set, otherwise
+                    // stash as a zero-path VoxModel so a later
+                    // --vox-model inherits it.
+                    cfg.world_preset = match std::mem::take(&mut cfg.world_preset) {
+                        WorldPreset::VoxModel { path, .. } => WorldPreset::VoxModel {
+                            path,
+                            interior_depth: n,
+                        },
+                        other => {
+                            // No --vox-model yet; hold the interior_depth
+                            // in a zero-path placeholder. If --vox-model
+                            // arrives later it will pick this up.
+                            cfg.world_preset = other;
+                            WorldPreset::VoxModel {
+                                path: std::path::PathBuf::new(),
+                                interior_depth: n,
+                            }
+                        }
+                    };
                 }
                 "--plain-layers" => {
                     cfg.plain_layers = args.next().and_then(|v| v.parse().ok());

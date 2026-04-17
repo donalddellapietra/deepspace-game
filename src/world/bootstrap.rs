@@ -31,7 +31,17 @@ pub enum WorldPreset {
     /// camera spawn is reasonable out-of-the-box. Stresses the
     /// packer's real-content path: tens of thousands of unique
     /// library nodes, every visible cell is mesh detail.
-    VoxModel(std::path::PathBuf),
+    ///
+    /// `interior_depth`: if > 0, each model voxel (originally a
+    /// `Child::Block`) is expanded into a uniform subtree of that
+    /// depth, so the voxel becomes a diggable cube. The world's
+    /// total depth is chosen so the silhouette lands at the same
+    /// ancestor cell regardless of `interior_depth` (so spawn
+    /// framing is stable across runs).
+    VoxModel {
+        path: std::path::PathBuf,
+        interior_depth: u8,
+    },
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -62,7 +72,9 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
         WorldPreset::Menger => bootstrap_menger_world(plain_layers.unwrap_or(20)),
-        WorldPreset::VoxModel(path) => bootstrap_vox_model_world(&path, plain_layers.unwrap_or(8)),
+        WorldPreset::VoxModel { path, interior_depth } => bootstrap_vox_model_world(
+            &path, plain_layers.unwrap_or(8), interior_depth,
+        ),
     }
 }
 
@@ -112,7 +124,11 @@ pub fn menger_world(depth: u8) -> WorldState {
 ///
 /// Panics if the file doesn't exist or doesn't parse — this is a
 /// bootstrap function, not a content runtime path.
-fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBootstrap {
+fn bootstrap_vox_model_world(
+    path: &std::path::Path,
+    total_depth: u8,
+    interior_depth: u8,
+) -> WorldBootstrap {
     use crate::import::{self, tree_builder};
     use crate::world::tree::{CENTER_SLOT, empty_children};
 
@@ -124,24 +140,28 @@ fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBo
     let model = import::load(path, &mut registry)
         .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
     eprintln!(
-        "vox_world: loaded {:?} ({}x{}x{} = {} voxels)",
+        "vox_world: loaded {:?} ({}x{}x{} = {} voxels, interior_depth={})",
         path, model.size_x, model.size_y, model.size_z,
         model.data.iter().filter(|&&v| v != 0).count(),
+        interior_depth,
     );
 
-    let model_root_id = tree_builder::build_tree(&model, &mut lib);
+    let model_root_id = tree_builder::build_tree_with_interior(&model, &mut lib, interior_depth);
 
-    // How many tree levels does the model itself occupy? ceil(log3(max_dim)).
+    // Silhouette depth: log3(max_dim). Each voxel then contributes
+    // `interior_depth` additional levels (uniform-fill subtree),
+    // so the model's full tree footprint is silhouette + interior.
     let max_dim = model.size_x.max(model.size_y).max(model.size_z).max(1);
     let mut dim = 1usize;
-    let mut model_depth: u8 = 0;
+    let mut silhouette_depth: u8 = 0;
     while dim < max_dim {
         dim *= BRANCH;
-        model_depth += 1;
+        silhouette_depth += 1;
     }
+    let model_depth = silhouette_depth.saturating_add(interior_depth);
     eprintln!(
-        "vox_world: model tree depth={}, library nodes after build={}",
-        model_depth, lib.len(),
+        "vox_world: silhouette depth={}, interior depth={}, model total={}, library nodes after build={}",
+        silhouette_depth, interior_depth, model_depth, lib.len(),
     );
 
     // Wrap in outer air layers up to target total_depth. Each wrap
@@ -189,8 +209,10 @@ fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBo
     // That cell's world extent is `[wrap_origin, wrap_origin+wrap_size]^3`
     // with `wrap_size = 3 * (1/3)^wraps` and `wrap_origin = 1.5 - wrap_size/2`.
     // Inside that cell, the model's voxel grid fills
-    // `[0, size_axis/padded]` of the cell, where `padded = 3^model_depth`.
-    let padded = BRANCH.pow(model_depth as u32) as f32;
+    // `[0, size_axis/padded]` of the cell, where `padded = 3^silhouette_depth`
+    // (silhouette-only; interior_depth adds layers *inside* each voxel but
+    // doesn't change the voxel grid's extent inside the wrap cell).
+    let padded = BRANCH.pow(silhouette_depth as u32) as f32;
     let wrap_size = 3.0 * (1.0 / BRANCH as f32).powi(wraps as i32);
     let wrap_origin = 1.5 - wrap_size / 2.0;
     let extent_x = wrap_size * (model.size_x as f32 / padded);
