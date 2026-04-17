@@ -1,21 +1,18 @@
 //! wgpu renderer: full-screen ray march shader.
 //!
-//! Five buffers: tree (per-child), node_kinds (per-node), camera,
-//! palette, uniforms, plus an ancestor-ribbon storage buffer. The
-//! shader walks the unified tree and dispatches on `NodeKind` when
-//! descending — there are no parallel buffers for sphere content,
-//! no `cs_*` uniforms, and no absolute-coord shimming.
+//! Storage buffers: tree (per-child), node_kinds (per-node),
+//! parent_info (per-node), node_offsets (per-node), shader_stats
+//! (atomic). Uniforms: camera, palette, uniforms. The shader walks
+//! the unified tree and dispatches on `NodeKind` when descending —
+//! there are no parallel buffers for sphere content, no `cs_*`
+//! uniforms, and no absolute-coord shimming. Pop-up uses
+//! `parent_info[current_idx]` instead of a pre-built ribbon.
 
 mod buffers;
 mod draw;
 mod init;
 
 pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
-
-/// Maximum ancestor-ribbon depth supported by the shader. Larger
-/// ribbons get truncated at upload (anything beyond can't pop).
-/// 64 covers MAX_DEPTH=63 with one slack.
-pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `RootKind*`
 /// constants in `bindings.wgsl`.
@@ -37,9 +34,7 @@ pub struct GpuUniforms {
     /// start-of-march; the body fills the `[0, 3)³` frame, and
     /// `root_inner_r`/`root_outer_r` give the body's radii.
     pub root_kind: u32,
-    /// Number of ancestor ribbon entries. 0 = frame is at world
-    /// root, no pop possible.
-    pub ribbon_count: u32,
+    pub _pad: u32,
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
     /// Body radii (used iff `root_kind == 1`). Stored in the body
@@ -71,7 +66,10 @@ pub struct Renderer {
     pub(super) camera_buffer: wgpu::Buffer,
     pub(super) palette_buffer: wgpu::Buffer,
     pub(super) uniforms_buffer: wgpu::Buffer,
-    pub(super) ribbon_buffer: wgpu::Buffer,
+    /// `parent_info[bfs_idx]` = (parent_node_idx, slot_in_parent +
+    /// flags). The shader walks this on pop-up; no separate ribbon
+    /// is built per frame.
+    pub(super) parent_info_buffer: wgpu::Buffer,
     pub(super) bind_group: wgpu::BindGroup,
     pub(super) root_index: u32,
     pub(super) node_count: u32,
@@ -84,7 +82,6 @@ pub struct Renderer {
     pub(super) root_face_meta: [u32; 4],
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
-    pub(super) ribbon_count: u32,
     pub(super) offscreen_texture: Option<wgpu::Texture>,
     /// Integer downscale divisor for the ray-march pass. 1 = render
     /// at full `config.{width,height}`; 2 = render at half per-axis
@@ -106,11 +103,10 @@ pub struct Renderer {
     /// `render_offscreen` to measure the ray-march pass on the GPU
     /// side, not just the CPU-side `device.poll(Wait)` duration.
     pub(super) timestamp: Option<TimestampScratch>,
-    /// Last queue.write_buffer durations (camera/ribbon/tree) in ms.
+    /// Last queue.write_buffer durations (camera/tree) in ms.
     /// Populated by the buffer-upload path so the harness can break
     /// "upload" into per-buffer sub-phases.
     pub(super) last_camera_write_ms: f64,
-    pub(super) last_ribbon_write_ms: f64,
     pub(super) last_tree_write_ms: f64,
     pub(super) last_bind_group_rebuild_ms: f64,
     /// Shader-side atomic counters written by the fragment shader

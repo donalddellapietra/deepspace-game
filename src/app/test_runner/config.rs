@@ -125,6 +125,11 @@ pub enum ScriptCmd {
     /// the camera to "one layer-N cell above the new ground" (where N
     /// is the current UI layer), matching the descent flow.
     TeleportAboveLastEdit,
+    /// Step the camera one cell at the current anchor depth along one
+    /// axis. `axis` is 0=X, 1=Y, 2=Z; `dir` is +1 or -1. Mirrors the
+    /// live event-loop's WASD handler; used to reproduce movement-
+    /// triggered repack lag in the harness.
+    Step(u8, i8),
 }
 
 impl TestConfig {
@@ -285,6 +290,12 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
         .filter_map(|raw| {
             let raw = raw.trim();
             if raw.is_empty() { return None; }
+            if let Some(rest) = raw.strip_prefix("step:") {
+                // step:x+  step:x-  step:y+  step:y-  step:z+  step:z-
+                let axis = match rest.chars().next()? { 'x' => 0u8, 'y' => 1u8, 'z' => 2u8, _ => return None };
+                let dir = match rest.chars().nth(1)? { '+' => 1i8, '-' => -1i8, _ => return None };
+                return Some(ScriptCmd::Step(axis, dir));
+            }
             if raw == "break" { return Some(ScriptCmd::Break); }
             if raw == "place" { return Some(ScriptCmd::Place); }
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }

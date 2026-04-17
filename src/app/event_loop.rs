@@ -133,7 +133,7 @@ impl App {
         let prepare_elapsed = std::time::Duration::ZERO;
 
         let pack_start = std::time::Instant::now();
-        let (tree_packed, node_kinds, node_offsets, root_index) =
+        let (tree_packed, node_kinds, node_offsets, parent_info, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
         let pack_elapsed = pack_start.elapsed();
         eprintln!(
@@ -152,6 +152,7 @@ impl App {
                 &tree_packed,
                 &node_kinds,
                 &node_offsets,
+                &parent_info,
                 root_index,
                 if self.low_latency_present {
                     wgpu::PresentMode::AutoNoVsync

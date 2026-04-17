@@ -180,13 +180,14 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
             .with_visible(cfg.show_window),
     )?);
-    let (tree_packed, node_kinds, node_offsets, root_index) =
+    let (tree_packed, node_kinds, node_offsets, parent_info, root_index) =
         crate::world::gpu::pack_tree(&app.world.library, app.world.root);
     let renderer = pollster::block_on(Renderer::new(
         window.clone(),
         &tree_packed,
         &node_kinds,
         &node_offsets,
+        &parent_info,
         root_index,
         wgpu::PresentMode::AutoNoVsync,
         cfg.shader_stats,
@@ -217,13 +218,12 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
 
     loop {
         // Reset per-frame timings on the renderer. The upload-reuse
-        // fast path skips update_tree/update_ribbon entirely; without
-        // this reset, stale startup values would leak forward and
-        // make every frame look like it uploaded a fresh tree.
+        // fast path skips update_tree entirely; without this reset,
+        // stale startup values would leak forward and make every
+        // frame look like it uploaded a fresh tree.
         if let Some(r) = app.renderer.as_mut() {
             r.last_camera_write_ms = 0.0;
             r.last_tree_write_ms = 0.0;
-            r.last_ribbon_write_ms = 0.0;
             r.last_bind_group_rebuild_ms = 0.0;
         }
 
@@ -236,12 +236,9 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         app.upload_tree_lod();
         let t_upload_total = t1.elapsed().as_secs_f64() * 1000.0;
         let t_pack = app.last_pack_ms;
-        let t_ribbon_build = app.last_ribbon_build_ms;
         let t_tree_write = app.renderer.as_ref().map(|r| r.last_tree_write_ms).unwrap_or(0.0);
-        let t_ribbon_write = app.renderer.as_ref().map(|r| r.last_ribbon_write_ms).unwrap_or(0.0);
         let t_bind_group_rebuild = app.renderer.as_ref().map(|r| r.last_bind_group_rebuild_ms).unwrap_or(0.0);
         let packed_node_count = app.last_packed_node_count;
-        let ribbon_len = app.last_ribbon_len;
         let effective_visual_depth = app.last_effective_visual_depth;
         let reused_gpu_tree = app.last_reused_gpu_tree;
 
@@ -264,9 +261,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             camera_write_ms: t_camera_write,
             upload_total_ms: t_upload_total,
             pack_ms: t_pack,
-            ribbon_build_ms: t_ribbon_build,
             tree_write_ms: t_tree_write,
-            ribbon_write_ms: t_ribbon_write,
             bind_group_rebuild_ms: t_bind_group_rebuild,
             highlight_ms: t_highlight,
             highlight_raycast_ms: t_highlight_raycast,
@@ -291,7 +286,6 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             avg_steps_descend: render_timing.shader_stats.avg_steps_descend(),
             avg_steps_lod_terminal: render_timing.shader_stats.avg_steps_lod_terminal(),
             packed_node_count,
-            ribbon_len,
             effective_visual_depth,
             reused_gpu_tree,
         };
@@ -359,9 +353,7 @@ struct FrameSample {
     camera_write_ms: f64,
     upload_total_ms: f64,
     pack_ms: f64,
-    ribbon_build_ms: f64,
     tree_write_ms: f64,
-    ribbon_write_ms: f64,
     bind_group_rebuild_ms: f64,
     highlight_ms: f64,
     highlight_raycast_ms: f64,
@@ -386,7 +378,6 @@ struct FrameSample {
     avg_steps_descend: f64,
     avg_steps_lod_terminal: f64,
     packed_node_count: u32,
-    ribbon_len: u32,
     effective_visual_depth: u32,
     reused_gpu_tree: bool,
 }
@@ -409,7 +400,7 @@ impl PerfTraceWriter {
         use std::io::Write;
         writeln!(
             writer,
-            "frame,wall_ms,update_ms,camera_write_ms,upload_total_ms,pack_ms,ribbon_build_ms,tree_write_ms,ribbon_write_ms,bind_group_rebuild_ms,highlight_ms,highlight_raycast_ms,highlight_set_ms,render_total_ms,render_texture_alloc_ms,render_view_ms,render_encode_ms,render_submit_ms,render_wait_ms,gpu_pass_ms,gpu_readback_ms,submitted_done_ms,ray_count,hit_count,miss_count,max_iter_count,avg_steps,max_steps,packed_node_count,ribbon_len,effective_visual_depth,reused_gpu_tree"
+            "frame,wall_ms,update_ms,camera_write_ms,upload_total_ms,pack_ms,tree_write_ms,bind_group_rebuild_ms,highlight_ms,highlight_raycast_ms,highlight_set_ms,render_total_ms,render_texture_alloc_ms,render_view_ms,render_encode_ms,render_submit_ms,render_wait_ms,gpu_pass_ms,gpu_readback_ms,submitted_done_ms,ray_count,hit_count,miss_count,max_iter_count,avg_steps,max_steps,packed_node_count,effective_visual_depth,reused_gpu_tree"
         )?;
         Ok(Self { path: path.to_string(), writer })
     }
@@ -420,15 +411,15 @@ impl PerfTraceWriter {
         let submitted_done = s.submitted_done_ms.map(|v| format!("{v:.4}")).unwrap_or_else(|| String::new());
         let _ = writeln!(
             self.writer,
-            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{},{},{},{},{},{:.2},{},{},{},{},{}",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{},{},{},{},{},{:.2},{},{},{},{}",
             s.frame, s.wall_ms,
             s.update_ms, s.camera_write_ms,
-            s.upload_total_ms, s.pack_ms, s.ribbon_build_ms, s.tree_write_ms, s.ribbon_write_ms, s.bind_group_rebuild_ms,
+            s.upload_total_ms, s.pack_ms, s.tree_write_ms, s.bind_group_rebuild_ms,
             s.highlight_ms, s.highlight_raycast_ms, s.highlight_set_ms,
             s.render_total_ms, s.render_texture_alloc_ms, s.render_view_ms, s.render_encode_ms, s.render_submit_ms, s.render_wait_ms,
             gpu, s.gpu_readback_ms, submitted_done,
             s.ray_count, s.hit_count, s.miss_count, s.max_iter_count, s.avg_steps, s.max_steps,
-            s.packed_node_count, s.ribbon_len, s.effective_visual_depth,
+            s.packed_node_count, s.effective_visual_depth,
             u32::from(s.reused_gpu_tree),
         );
     }
@@ -452,9 +443,7 @@ struct PerfAgg {
     sum_camera_write: f64,
     sum_upload: f64,
     sum_pack: f64,
-    sum_ribbon_build: f64,
     sum_tree_write: f64,
-    sum_ribbon_write: f64,
     sum_bind_group_rebuild: f64,
     sum_highlight: f64,
     sum_hi_raycast: f64,
@@ -482,7 +471,6 @@ struct PerfAgg {
     sum_avg_steps_descend: f64,
     sum_avg_steps_lod_terminal: f64,
     sum_packed_node_count: u64,
-    sum_ribbon_len: u64,
     worst_total_ms: f64,
     worst_total_frame: u32,
     worst_gpu_ms: f64,
@@ -490,7 +478,6 @@ struct PerfAgg {
     worst_upload_ms: f64,
     worst_upload_frame: u32,
     max_packed_node_count: u32,
-    max_ribbon_len: u32,
 }
 
 impl PerfAgg {
@@ -500,9 +487,7 @@ impl PerfAgg {
         self.sum_camera_write += s.camera_write_ms;
         self.sum_upload += s.upload_total_ms;
         self.sum_pack += s.pack_ms;
-        self.sum_ribbon_build += s.ribbon_build_ms;
         self.sum_tree_write += s.tree_write_ms;
-        self.sum_ribbon_write += s.ribbon_write_ms;
         self.sum_bind_group_rebuild += s.bind_group_rebuild_ms;
         self.sum_highlight += s.highlight_ms;
         self.sum_hi_raycast += s.highlight_raycast_ms;
@@ -515,12 +500,8 @@ impl PerfAgg {
         self.sum_render_wait += s.render_wait_ms;
         self.sum_gpu_readback += s.gpu_readback_ms;
         self.sum_packed_node_count += s.packed_node_count as u64;
-        self.sum_ribbon_len += s.ribbon_len as u64;
         if s.packed_node_count > self.max_packed_node_count {
             self.max_packed_node_count = s.packed_node_count;
-        }
-        if s.ribbon_len > self.max_ribbon_len {
-            self.max_ribbon_len = s.ribbon_len;
         }
         if let Some(v) = s.gpu_pass_ms {
             self.sum_gpu_pass += v;
@@ -578,14 +559,12 @@ impl PerfAgg {
         };
         let total_avg = (self.sum_update + self.sum_upload + self.sum_highlight + self.sum_render) / n;
         eprintln!(
-            "render_harness_timing avg_ms update={:.3} camera_write={:.3} upload={:.3} pack={:.3} ribbon_build={:.3} tree_write={:.3} ribbon_write={:.3} bind_group_rebuild={:.3} highlight={:.3} highlight_raycast={:.3} highlight_set={:.3} render={:.3} render_texture_alloc={:.3} render_view={:.3} render_encode={:.3} render_submit={:.3} render_wait={:.3} gpu_pass={:.3} gpu_pass_samples={} gpu_readback={:.3} submitted_done={:.3} submitted_done_samples={} total={:.3}",
+            "render_harness_timing avg_ms update={:.3} camera_write={:.3} upload={:.3} pack={:.3} tree_write={:.3} bind_group_rebuild={:.3} highlight={:.3} highlight_raycast={:.3} highlight_set={:.3} render={:.3} render_texture_alloc={:.3} render_view={:.3} render_encode={:.3} render_submit={:.3} render_wait={:.3} gpu_pass={:.3} gpu_pass_samples={} gpu_readback={:.3} submitted_done={:.3} submitted_done_samples={} total={:.3}",
             self.sum_update / n,
             self.sum_camera_write / n,
             self.sum_upload / n,
             self.sum_pack / n,
-            self.sum_ribbon_build / n,
             self.sum_tree_write / n,
-            self.sum_ribbon_write / n,
             self.sum_bind_group_rebuild / n,
             self.sum_highlight / n,
             self.sum_hi_raycast / n,
@@ -610,12 +589,10 @@ impl PerfAgg {
             self.worst_upload_ms, self.worst_upload_frame,
         );
         eprintln!(
-            "render_harness_workload frames={} avg_packed_nodes={} max_packed_nodes={} avg_ribbon_len={} max_ribbon_len={}",
+            "render_harness_workload frames={} avg_packed_nodes={} max_packed_nodes={}",
             self.frame_count,
             self.sum_packed_node_count / self.frame_count as u64,
             self.max_packed_node_count,
-            self.sum_ribbon_len / self.frame_count as u64,
-            self.max_ribbon_len,
         );
         let avg_steps_overall = self.sum_avg_steps / n;
         let hit_frac = if self.sum_ray_count == 0 {

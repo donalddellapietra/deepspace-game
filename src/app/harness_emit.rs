@@ -126,6 +126,7 @@ impl App {
             ScriptCmd::ProbeDown => self.harness_probe_down(),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
             ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
+            ScriptCmd::Step(axis, dir) => self.step_chunk(axis as usize, dir as i32),
         }
     }
 

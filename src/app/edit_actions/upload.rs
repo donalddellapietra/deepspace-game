@@ -1,6 +1,11 @@
-//! GPU upload: pack the world tree LOD-aware, build the ancestor
-//! ribbon, and push both (plus the per-frame uniforms) to the
-//! renderer.
+//! GPU upload: pack the world tree LOD-aware and push the packed
+//! buffers (tree, node_kinds, node_offsets, parent_info) plus the
+//! per-frame uniforms to the renderer.
+//!
+//! Ancestor pop-up no longer needs a side ribbon: the shader walks
+//! `parent_info[current_idx]` on each pop. The CPU still needs the
+//! frame's BFS index to seed `uniforms.root_index`, which is what
+//! `walk_to_frame_root` returns.
 
 use crate::world::anchor::Path;
 use crate::world::gpu;
@@ -18,10 +23,11 @@ impl App {
     }
 
     /// Pack the world tree (LOD-aware from the root) and push it
-    /// to the GPU, along with the ancestor ribbon that lets the
-    /// shader pop from the active frame back up the tree.
+    /// to the GPU. The packer emits a `parent_info[]` array
+    /// alongside the tree; the shader uses it to pop upward from
+    /// the active frame without a side ribbon.
     ///
-    /// The packer now uses the camera's path-anchored `WorldPos`
+    /// The packer uses the camera's path-anchored `WorldPos`
     /// directly. Every LOD decision is made in the current node's
     /// local `[0, 3)³` frame via `WorldPos::in_frame`, so upload,
     /// render, and edit all agree on the same locality model.
@@ -35,7 +41,6 @@ impl App {
             effective_visual_depth.min(u8::MAX as u32) as u8,
         );
         let mut pack_elapsed = std::time::Duration::ZERO;
-        let mut ribbon_elapsed = std::time::Duration::ZERO;
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
         // Workload counters — recorded every frame, even when the
         // LOD key hit, so the harness sees what the frame was asked
@@ -45,7 +50,7 @@ impl App {
 
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-            let (tree_packed, node_kinds, node_offsets, _world_root_idx) = {
+            let (tree_packed, node_kinds, node_offsets, parent_info, _world_root_idx) = {
                 let mut preserve_path_storage = vec![intended_frame.render_path];
                 if intended_frame.logical_path != intended_frame.render_path {
                     preserve_path_storage.push(intended_frame.logical_path);
@@ -93,21 +98,18 @@ impl App {
             let packed_node_count = node_kinds.len();
             self.last_packed_node_count = packed_node_count as u32;
 
-            // build_ribbon may stop short of the intended frame when
-            // pack LOD-flattened a sibling on the way down (uniform-
-            // empty Cartesian children become absent from the
-            // occupancy mask). The shader can only operate at the
-            // depth the buffer actually reached, so we recompute
-            // cam_local against the truncated path.
-            let ribbon_start = std::time::Instant::now();
-            let r = gpu::build_ribbon(
+            // The packer's LOD pass may flatten a sibling on the
+            // intended frame path (uniform-empty Cartesian children
+            // disappear from the occupancy mask). The shader can
+            // only operate at the depth the buffer actually reached,
+            // so we walk the packed tree and recompute cam_local
+            // against the truncated path.
+            let (frame_root_idx, reached_slots) = gpu::walk_to_frame_root(
                 &tree_packed,
                 &node_offsets,
                 intended_frame.render_path.as_slice(),
             );
-            ribbon_elapsed = ribbon_start.elapsed();
-            self.last_ribbon_len = r.ribbon.len() as u32;
-            let effective_path = frame::frame_from_slots(&r.reached_slots);
+            let effective_path = frame::frame_from_slots(&reached_slots);
             let effective_render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
@@ -127,9 +129,9 @@ impl App {
                     &tree_packed,
                     &node_kinds,
                     &node_offsets,
-                    r.frame_root_idx,
+                    &parent_info,
+                    frame_root_idx,
                 );
-                renderer.update_ribbon(&r.ribbon);
             }
             if self.render_harness {
                 eprintln!(
@@ -165,14 +167,12 @@ impl App {
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
-        self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
         if self.startup_profile_frames < 12 {
             eprintln!(
-                "startup_perf upload_tree_lod frame={} reused={} pack_ms={:.2} ribbon_ms={:.2} frame_depth={} render_depth={} visual_depth={} kind={:?}",
+                "startup_perf upload_tree_lod frame={} reused={} pack_ms={:.2} frame_depth={} render_depth={} visual_depth={} kind={:?}",
                 self.startup_profile_frames,
                 reused_gpu_tree,
                 self.last_pack_ms,
-                self.last_ribbon_build_ms,
                 self.active_frame.logical_path.depth(),
                 self.active_frame.render_path.depth(),
                 effective_visual_depth,

@@ -14,10 +14,11 @@
 //!   radii, cube face index).
 //! - `node_offsets: Vec<u32>` — indexed by BFS position. Maps BFS
 //!   position to the header's u32-offset in `tree[]`. Touched only
-//!   on descent and ribbon pops (cold path).
-//! - `ribbon: Vec<GpuRibbonEntry>` — pop-ordered ancestors from
-//!   frame's direct parent up to the absolute world root. See
-//!   `ribbon.rs`.
+//!   on descent and pop-up (cold path).
+//! - `parent_info: Vec<GpuParentInfo>` — indexed by BFS position.
+//!   Each entry records the node's parent BFS index, the slot it
+//!   occupies in its parent, and a `siblings_all_empty` flag. The
+//!   shader walks this on pop-up; no side ribbon is built per frame.
 //!
 //! The key property of the interleaved layout is that a node's
 //! header and its first non-empty child entry share a 64-byte cache
@@ -26,14 +27,16 @@
 //!
 //! Submodules:
 //!
-//! - `types`: GPU-layout types (`GpuChild`, `GpuNodeKind`, etc.).
-//! - `pack`: BFS packing (`pack_tree`, `pack_tree_lod`).
-//! - `ribbon`: ancestor ribbon (`build_ribbon`, `GpuRibbonEntry`).
+//! - `types`: GPU-layout types (`GpuChild`, `GpuNodeKind`,
+//!   `GpuParentInfo`, etc.).
+//! - `pack`: BFS packing (`pack_tree`, `pack_tree_lod`,
+//!   `walk_to_frame_root`).
 
 mod pack;
-mod ribbon;
 mod types;
 
-pub use pack::{pack_tree, pack_tree_lod, pack_tree_lod_preserving, pack_tree_lod_selective};
-pub use ribbon::{build_ribbon, GpuRibbonEntry};
-pub use types::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette};
+pub use pack::{
+    pack_tree, pack_tree_lod, pack_tree_lod_preserving, pack_tree_lod_selective,
+    walk_to_frame_root,
+};
+pub use types::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette, GpuParentInfo};

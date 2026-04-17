@@ -49,13 +49,32 @@ pub use test_runner::TestConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LodUploadKey {
     pub root: u64,
-    pub camera_anchor: Path,
-    pub camera_offset_bits: [u32; 3],
+    /// Cell-quantized camera anchor: full anchor truncated by
+    /// `LOD_CAMERA_QUANTIZE_LEVELS` so cell crossings within a
+    /// coarse cell hit the cache. Without this, every step:x+ cell
+    /// crossing forces a full `pack_tree_lod_selective()` traversal
+    /// (≈80 ms on a 91 k-node tree at depth 7).
+    pub camera_quantized_anchor: Path,
     pub render_path: Path,
     pub logical_path: Path,
     pub visual_depth: u8,
     pub kind_tag: u8,
 }
+
+/// Number of trailing slots stripped from `camera.position.anchor`
+/// before it enters the `LodUploadKey`. Each level multiplies the
+/// cache-coverage region by 27 cells. With `LOD_CAMERA_QUANTIZE_LEVELS
+/// = 2` the camera can cross up to 8 cells (2×2×2 octant of a coarse
+/// cell, in the worst case 3³=27 cells of one quantized cell) before
+/// invalidating the LOD pack.
+///
+/// Fidelity tradeoff: between cache hits, `child_screen_pixels()`
+/// LOD decisions use a camera position that's at most 3^N cells stale
+/// from the actual camera. Pack's preserve_paths/preserve_regions
+/// logic keeps the render frame's 3-shell fully detailed regardless,
+/// so the staleness only affects LOD-collapsed far content where it's
+/// well below the LOD-pixel threshold.
+pub const LOD_CAMERA_QUANTIZE_LEVELS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HighlightCacheKey {
@@ -90,10 +109,14 @@ impl LodUploadKey {
             ActiveFrameKind::Body { .. } => 1,
             ActiveFrameKind::Sphere(_) => 2,
         };
+        let mut camera_quantized_anchor = camera.anchor;
+        let target_depth = camera_quantized_anchor
+            .depth()
+            .saturating_sub(LOD_CAMERA_QUANTIZE_LEVELS);
+        camera_quantized_anchor.truncate(target_depth);
         Self {
             root,
-            camera_anchor: camera.anchor,
-            camera_offset_bits: camera.offset.map(f32::to_bits),
+            camera_quantized_anchor,
             render_path: frame.render_path,
             logical_path: frame.logical_path,
             visual_depth,
@@ -125,15 +148,15 @@ pub struct App {
     pub(super) planet_path: Option<Path>,
     /// The actual frame the renderer is using right now. This may
     /// be shallower than `render_frame()` when GPU packing flattened
-    /// a slot on the intended path and `build_ribbon` had to stop
+    /// a slot on the intended path and the frame walker had to stop
     /// early.
     pub(super) active_frame: ActiveFrame,
     /// Headless test driver. Populated when CLI flags ask for
     /// scripted actions or screenshots. See `test_runner`.
     pub(super) test: Option<test_runner::TestRunner>,
     /// Last world/frame/camera tuple that required a full GPU tree
-    /// repack + ribbon rebuild. If unchanged, we can keep the same
-    /// tree/node-kind/ribbon buffers and just refresh camera/uniforms.
+    /// repack. If unchanged, we can keep the same tree / node-kind /
+    /// parent_info buffers and just refresh camera / uniforms.
     pub(super) last_lod_upload_key: Option<LodUploadKey>,
     /// Deterministic renderer harness mode from the old deep-layers
     /// branch. Bypasses the native overlay/event-loop path so we can
@@ -182,20 +205,15 @@ pub struct App {
     /// Cost of packing the tree into GPU-friendly form. Set by
     /// `upload_tree_lod`. `0.0` when the LOD key was reused.
     pub(super) last_pack_ms: f64,
-    /// Cost of building the ancestor ribbon from the packed tree.
-    /// Set by `upload_tree_lod`. `0.0` when the LOD key was reused.
-    pub(super) last_ribbon_build_ms: f64,
     /// Number of packed nodes in the most recent packed tree (i.e.
     /// `nodes.len()` in the sparse layout). Static signal: tells the
     /// harness how much data the shader had to walk.
     pub(super) last_packed_node_count: u32,
-    /// Length of the ancestor ribbon pushed to the GPU.
-    pub(super) last_ribbon_len: u32,
     /// Effective `visual_depth` the renderer was run with. Diverges
     /// from anchor depth when LOD/force flags clamp the budget.
     pub(super) last_effective_visual_depth: u32,
     /// Whether `upload_tree_lod` reused a previously packed tree
-    /// instead of repacking. When true, pack/ribbon_build are 0.
+    /// instead of repacking. When true, pack_ms is 0.
     pub(super) last_reused_gpu_tree: bool,
     pub(super) highlight_epoch: u64,
     pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
@@ -225,7 +243,7 @@ impl App {
         let forced_edit_depth = test_cfg.force_edit_depth;
         let shader_stats_enabled = test_cfg.shader_stats;
         // Nyquist floor: sub-pixel rejection only. Primary LOD gate
-        // is ribbon-level-based (`lod_base_depth`).
+        // is pop-level-based (`lod_base_depth`).
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
         let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
@@ -345,9 +363,7 @@ impl App {
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
             last_pack_ms: 0.0,
-            last_ribbon_build_ms: 0.0,
             last_packed_node_count: 0,
-            last_ribbon_len: 0,
             last_effective_visual_depth: 0,
             last_reused_gpu_tree: false,
             highlight_epoch: 0,
@@ -388,8 +404,9 @@ impl App {
 
     /// `NodeKind` of the *intended* render-frame root from a tree
     /// walk (no buffer-truncation awareness). `upload_tree_lod`
-    /// uses the effective frame instead — the one build_ribbon
-    /// could actually reach. Kept for tests / debugging.
+    /// uses the effective frame instead — the one the frame walker
+    /// could actually reach in the packed tree. Kept for tests /
+    /// debugging.
     #[allow(dead_code)]
     pub(super) fn render_frame_kind(&self) -> NodeKind {
         match self.render_frame().kind {

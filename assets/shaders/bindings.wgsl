@@ -25,11 +25,7 @@ struct Uniforms {
     highlight_active: u32,
     /// 0 = Cartesian, 1 = body root, 2 = face-space root.
     root_kind: u32,
-    /// Number of ancestor ribbon entries available. When the ray
-    /// exits the frame's [0, 3)³ bubble at depth 0, the shader
-    /// pops upward, walking ribbon[0]..ribbon[ribbon_count-1].
-    /// 0 = no ancestors (frame is at world root).
-    ribbon_count: u32,
+    _pad: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
@@ -48,21 +44,26 @@ const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
 const ROOT_KIND_FACE: u32 = 2u;
 
-/// One entry in the ancestor ribbon. `node_idx` is the buffer
-/// index of the ancestor's node. `slot_bits` packs:
-/// - low 5 bits: slot (0..27) of the child we're popping FROM
+/// Per-node parent pointer. Indexed by the child's BFS index — the
+/// shader does `parent_info[current_idx]` on each pop instead of
+/// reading a pre-built ribbon. `parent_node_idx == 0xFFFFFFFFu`
+/// marks the world root (no parent — terminates the pop loop).
+///
+/// `slot_and_flags` packs:
+/// - low 5 bits: slot (0..27) the child occupies in its parent
 /// - bit 31: `siblings_all_empty` — when set, every other slot of
-///   `node_idx` has tag=0 (Empty). The shader uses this to fast-
-///   exit the whole shell with a single ray–box intersection,
-///   bypassing the DDA across ~3–5 empty cells per shell that
-///   otherwise compounds linearly with ribbon depth.
-struct RibbonEntry {
-    node_idx: u32,
-    slot_bits: u32,
+///   `parent_node_idx` is empty. The shader uses this to fast-exit
+///   the whole shell with a single ray–box intersection, bypassing
+///   the DDA across the ~3–5 empty cells per shell that otherwise
+///   compound linearly with depth.
+struct ParentInfo {
+    parent_node_idx: u32,
+    slot_and_flags: u32,
 }
 
-const RIBBON_SLOT_MASK: u32 = 0x1Fu;
-const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
+const PARENT_SLOT_MASK: u32 = 0x1Fu;
+const PARENT_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
+const PARENT_NONE: u32 = 0xFFFFFFFFu;
 
 struct NodeKindGpu {
     kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
@@ -117,10 +118,10 @@ struct ShaderStats {
 @group(0) @binding(2) var<uniform> palette: Palette;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 @group(0) @binding(4) var<storage, read> node_kinds: array<NodeKindGpu>;
-@group(0) @binding(5) var<storage, read> ribbon: array<RibbonEntry>;
+@group(0) @binding(5) var<storage, read> parent_info: array<ParentInfo>;
 @group(0) @binding(6) var<storage, read_write> shader_stats: ShaderStats;
 /// BFS index → header u32-offset in `tree[]`. Cold path only
-/// (touched on descent and ribbon pops). The inner DDA loop never
+/// (touched on descent and pop-up). The inner DDA loop never
 /// reads this buffer.
 @group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
 
@@ -151,19 +152,19 @@ override ENABLE_STATS: bool = false;
 override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 
 /// Pipeline-override constant: detail budget inside the anchor
-/// cell (ribbon_level=0). Each additional ribbon-pop shell gets
-/// one less level of detail — so a ray that's walked N ancestor
-/// shells away from the camera is clamped to descend
+/// cell (pop_level=0). Each additional pop shell gets one less
+/// level of detail — so a ray that's walked N ancestor shells
+/// away from the camera is clamped to descend
 /// `max(BASE_DETAIL_DEPTH - N, 1)` levels in its current frame.
 ///
 /// This is the primary LOD gate. It's frame-local (uses the
-/// tree's own ribbon structure as the distance metric), so it's
-/// invariant under zoom: zooming out adds one outer shell at
-/// budget=1 and leaves everything else unchanged.
+/// tree's ancestor distance as the metric), so it's invariant
+/// under zoom: zooming out adds one outer shell at budget=1 and
+/// leaves everything else unchanged.
 ///
 /// Default 4 gives detailed close content (4 levels under anchor)
 /// while keeping far content cheap (1-level LOD terminal beyond
-/// ribbon shell 3). Tune via `--lod-base-depth <N>`.
+/// shell 3). Tune via `--lod-base-depth <N>`.
 override BASE_DETAIL_DEPTH: u32 = 4u;
 
 const MAX_FACE_DEPTH: u32 = 63u;
@@ -180,7 +181,7 @@ struct HitResult {
     color: vec3<f32>,
     normal: vec3<f32>,
     t: f32,
-    /// Which ancestor-pop level the hit happened in. 0 = original
+    /// Which ancestor-pop count the hit happened at. 0 = original
     /// camera frame; >0 = popped that many times into ancestors.
     frame_level: u32,
     frame_scale: f32,

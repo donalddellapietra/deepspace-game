@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuParentInfo};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -16,6 +16,7 @@ impl Renderer {
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        parent_info: &[GpuParentInfo],
         root_bfs_index: u32,
         present_mode: wgpu::PresentMode,
         shader_stats_enabled: bool,
@@ -52,7 +53,7 @@ impl Renderer {
             wgpu::Features::empty()
         };
         // Sparse tree needs 5 storage buffers (tree, node_kinds,
-        // ribbon, shader_stats, node_offsets). `downlevel_defaults`
+        // parent_info, shader_stats, node_offsets). `downlevel_defaults`
         // caps that at 4; bump to 8 (the WebGPU spec default) so
         // the limit is portable to the browser backend too.
         let required_limits = wgpu::Limits {
@@ -108,9 +109,12 @@ impl Renderer {
         // Storage buffers cannot be zero-sized; stub any empty inputs.
         let stub_tree = [0u32, 2u32]; // one empty-node header
         let stub_offsets = [0u32];
+        let stub_parent_info = [GpuParentInfo::root()];
         let tree_init: &[u32] = if tree.is_empty() { &stub_tree } else { tree };
         let offsets_init: &[u32] =
             if node_offsets.is_empty() { &stub_offsets } else { node_offsets };
+        let parent_info_init: &[GpuParentInfo] =
+            if parent_info.is_empty() { &stub_parent_info } else { parent_info };
 
         let tree_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree"),
@@ -162,7 +166,7 @@ impl Renderer {
             max_depth: MAX_DEPTH as u32,
             highlight_active: 0,
             root_kind: ROOT_KIND_CARTESIAN,
-            ribbon_count: 0,
+            _pad: 0,
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             root_radii: [0.0; 4],
@@ -171,12 +175,9 @@ impl Renderer {
             root_face_pop_pos: [0.0; 4],
         };
 
-        // Initial ribbon buffer is empty (just a stub of zero
-        // entries; storage buffers can't be zero-sized so we
-        // allocate one stub entry).
-        let ribbon_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ribbon"),
-            contents: bytemuck::cast_slice(&[GpuRibbonEntry { node_idx: 0, slot_bits: 0 }]),
+        let parent_info_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("parent_info"),
+            contents: bytemuck::cast_slice(parent_info_init),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -254,7 +255,7 @@ impl Renderer {
                 },
                 // Node offsets (binding 7) — BFS index → u32-offset
                 // of that node's header in `tree[]`. Cold path only
-                // (touched on descent / ribbon pop).
+                // (touched on descent / pop-up).
                 wgpu::BindGroupLayoutEntry {
                     binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
@@ -268,7 +269,7 @@ impl Renderer {
         let bind_group = make_bind_group(
             &device, &bind_group_layout,
             &tree_buffer, &camera_buffer, &palette_buffer,
-            &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
+            &uniforms_buffer, &node_kinds_buffer, &parent_info_buffer,
             &shader_stats_buffer, &node_offsets_buffer,
         );
 
@@ -432,7 +433,7 @@ impl Renderer {
             device, queue, surface, config, pipeline, bind_group_layout,
             tree_buffer, node_offsets_buffer, node_kinds_buffer,
             camera_buffer, palette_buffer, uniforms_buffer,
-            ribbon_buffer,
+            parent_info_buffer,
             bind_group,
             root_index: root_bfs_index, node_count,
             max_depth: MAX_DEPTH as u32, highlight_active: 0,
@@ -442,7 +443,6 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
-            ribbon_count: 0,
             offscreen_texture: None,
             render_scale: render_scale.max(1),
             ray_march_target: None,
@@ -451,7 +451,6 @@ impl Renderer {
             blit_sampler,
             timestamp,
             last_camera_write_ms: 0.0,
-            last_ribbon_write_ms: 0.0,
             last_tree_write_ms: 0.0,
             last_bind_group_rebuild_ms: 0.0,
             shader_stats_buffer,

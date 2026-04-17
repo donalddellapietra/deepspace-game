@@ -5,38 +5,45 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuParentInfo};
 
-use super::{GpuUniforms, Renderer, MAX_RIBBON_LEN};
+use super::{GpuUniforms, Renderer};
 
 impl Renderer {
     /// Re-upload the sparse tree buffers after an edit or re-pack.
-    /// Three parallel uploads: the interleaved `tree` u32 buffer
+    /// Four parallel uploads: the interleaved `tree` u32 buffer
     /// (headers + inline child entries), the per-node-kind metadata,
-    /// and the BFS-index → tree-offset mapping. Recreates GPU buffers
+    /// the BFS-index → tree-offset mapping, and the per-node parent
+    /// pointer used by the shader's pop-up. Recreates GPU buffers
     /// and rebinds when any of them outgrew the previous allocation.
     pub fn update_tree(
         &mut self,
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        parent_info: &[GpuParentInfo],
         root_bfs_index: u32,
     ) {
         self.root_index = root_bfs_index;
         self.node_count = node_kinds.len() as u32;
 
-        // Storage buffers cannot be zero-sized. Supply a single
-        // zero-filled stub so a freshly-created library with zero
-        // nodes (only seen in pathological edge cases) still has a
-        // valid bind group — the shader never indexes into it because
-        // the ribbon is empty and the root is the only node read.
+        // Storage buffers cannot be zero-sized. Supply zero-filled
+        // stubs so a freshly-created library with zero nodes (only
+        // seen in pathological edge cases) still has a valid bind
+        // group — the shader's first read is at the root index.
         let stub_tree = [0u32, 2u32]; // empty node header.
         let stub_offsets = [0u32];
+        let stub_parent_info = [GpuParentInfo::root()];
         let tree_payload: &[u32] = if tree.is_empty() { &stub_tree } else { tree };
         let offsets_payload: &[u32] = if node_offsets.is_empty() {
             &stub_offsets
         } else {
             node_offsets
+        };
+        let parent_info_payload: &[GpuParentInfo] = if parent_info.is_empty() {
+            &stub_parent_info
+        } else {
+            parent_info
         };
 
         // Probe for packed-tree size exceeding the device's storage
@@ -70,60 +77,24 @@ impl Renderer {
             &mut self.node_offsets_buffer, &self.device, &self.queue,
             "node_offsets", offsets_payload, storage,
         );
+        let parent_info_grew = upload_or_recreate(
+            &mut self.parent_info_buffer, &self.device, &self.queue,
+            "parent_info", parent_info_payload, storage,
+        );
         self.last_tree_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
 
         self.last_bind_group_rebuild_ms = 0.0;
-        if tree_grew || kinds_grew || offsets_grew {
+        if tree_grew || kinds_grew || offsets_grew || parent_info_grew {
             let rebuild_start = std::time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
-                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.parent_info_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
 
-        self.write_uniforms();
-    }
-
-    /// Upload the ancestor ribbon (pop chain from frame's direct
-    /// parent up to the absolute root). Resizes the ribbon buffer
-    /// if needed and recreates the bind group.
-    pub fn update_ribbon(&mut self, ribbon: &[GpuRibbonEntry]) {
-        let truncated = if ribbon.len() > MAX_RIBBON_LEN {
-            &ribbon[..MAX_RIBBON_LEN]
-        } else {
-            ribbon
-        };
-        // Always upload at least one entry — empty storage buffers
-        // break the bind group.
-        let stub_storage = [GpuRibbonEntry { node_idx: 0, slot_bits: 0 }];
-        let payload: &[GpuRibbonEntry] = if truncated.is_empty() {
-            &stub_storage
-        } else {
-            truncated
-        };
-
-        self.ribbon_count = truncated.len() as u32;
-
-        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let write_start = std::time::Instant::now();
-        let grew = upload_or_recreate(
-            &mut self.ribbon_buffer, &self.device, &self.queue,
-            "ribbon", payload, storage,
-        );
-        self.last_ribbon_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
-        if grew {
-            let rebuild_start = std::time::Instant::now();
-            self.bind_group = make_bind_group(
-                &self.device, &self.bind_group_layout,
-                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
-                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
-                &self.shader_stats_buffer, &self.node_offsets_buffer,
-            );
-            self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
-        }
         self.write_uniforms();
     }
 
@@ -147,7 +118,7 @@ impl Renderer {
             max_depth: self.max_depth,
             highlight_active: self.highlight_active,
             root_kind: self.root_kind,
-            ribbon_count: self.ribbon_count,
+            _pad: 0,
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             root_radii: self.root_radii,
@@ -193,7 +164,7 @@ pub(super) fn make_bind_group(
     palette: &wgpu::Buffer,
     uniforms: &wgpu::Buffer,
     node_kinds: &wgpu::Buffer,
-    ribbon: &wgpu::Buffer,
+    parent_info: &wgpu::Buffer,
     shader_stats: &wgpu::Buffer,
     node_offsets: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
@@ -206,7 +177,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 2, resource: palette.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: uniforms.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: node_kinds.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: parent_info.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
         ],

@@ -47,43 +47,54 @@ use crate::world::tree::{
     CHILDREN_PER_NODE, UNIFORM_EMPTY, UNIFORM_MIXED,
 };
 
-use super::types::{GpuChild, GpuNodeKind};
+use super::types::{GpuChild, GpuNodeKind, GpuParentInfo};
 
-/// Result of packing: (tree, node_kinds, node_offsets, root_bfs_index).
+/// Result of packing: (tree, node_kinds, node_offsets, parent_info, root_bfs_index).
 ///
 /// - `tree`: single interleaved u32 buffer holding headers +
 ///   children inline. See module docs.
 /// - `node_kinds`: per-BFS-node kind metadata.
 /// - `node_offsets`: BFS index → tree[] u32-offset of that node's
 ///   header.
+/// - `parent_info`: BFS index → `(parent_node_idx, slot_in_parent,
+///   siblings_all_empty)`. The shader uses this to pop upward
+///   without consulting a side ribbon. Root entry is the sentinel
+///   `GpuParentInfo::root()`.
 /// - `root_bfs_index`: BFS index of the root node. The renderer
 ///   converts this to a tree-offset via `node_offsets[root]`.
-pub type PackedTree = (Vec<u32>, Vec<GpuNodeKind>, Vec<u32>, u32);
+pub type PackedTree = (Vec<u32>, Vec<GpuNodeKind>, Vec<u32>, Vec<GpuParentInfo>, u32);
 
 /// Pack the visible portion of the tree into the interleaved GPU
-/// buffer. Returns `(tree, node_kinds, node_offsets, root_bfs_idx)`.
+/// buffer. Returns `(tree, node_kinds, node_offsets, parent_info, root_bfs_idx)`.
 pub fn pack_tree(
     library: &NodeLibrary,
     root: NodeId,
 ) -> PackedTree {
     // Phase 1: BFS-visit every node; assign a BFS index and compute
     // each node's occupancy (so we know how many u32s its block
-    // occupies).
+    // occupies). Track each child's parent (BFS idx + slot) for
+    // parent_info.
     let mut visited: HashMap<NodeId, u32> = HashMap::new();
     let mut ordered: Vec<NodeId> = Vec::new();
+    // parent_link[child_bfs] = (parent_bfs, slot_in_parent). Root
+    // entry is filled with the sentinel.
+    let mut parent_link: Vec<(u32, u8)> = Vec::new();
     let mut head = 0usize;
     visited.insert(root, 0);
     ordered.push(root);
+    parent_link.push((u32::MAX, 0));
     while head < ordered.len() {
         let nid = ordered[head];
+        let parent_bfs = head as u32;
         head += 1;
         if let Some(node) = library.get(nid) {
-            for child in &node.children {
+            for (slot, child) in node.children.iter().enumerate() {
                 if let Child::Node(child_id) = child {
                     if !visited.contains_key(child_id) {
                         let idx = ordered.len() as u32;
                         visited.insert(*child_id, idx);
                         ordered.push(*child_id);
+                        parent_link.push((parent_bfs, slot as u8));
                     }
                 }
             }
@@ -152,8 +163,33 @@ pub fn pack_tree(
     }
     debug_assert_eq!(tree.len(), total_u32s);
 
+    let parent_info = build_parent_info(&parent_link, &occupancies);
     let root_idx = *visited.get(&root).unwrap();
-    (tree, kinds, node_offsets, root_idx)
+    (tree, kinds, node_offsets, parent_info, root_idx)
+}
+
+/// Build `parent_info[]` from the BFS parent links and per-node
+/// occupancies. Root entry is the sentinel; each non-root entry
+/// records its parent's BFS idx, the slot it occupies in its
+/// parent, and the `siblings_all_empty` flag (parent has exactly
+/// one occupied slot — the one we descended through).
+fn build_parent_info(
+    parent_link: &[(u32, u8)],
+    occupancies: &[u32],
+) -> Vec<GpuParentInfo> {
+    let mut out = Vec::with_capacity(parent_link.len());
+    for (i, &(parent_bfs, slot)) in parent_link.iter().enumerate() {
+        if i == 0 {
+            out.push(GpuParentInfo::root());
+            continue;
+        }
+        let siblings_all_empty = occupancies
+            .get(parent_bfs as usize)
+            .map(|occ| occ.count_ones() == 1)
+            .unwrap_or(false);
+        out.push(GpuParentInfo::new(parent_bfs, slot, siblings_all_empty));
+    }
+    out
 }
 
 /// Encode a child's first u32: tag | (block_type << 8) | (_pad << 16).
@@ -300,10 +336,14 @@ pub fn pack_tree_lod_selective(
     let mut queue: Vec<QueueEntry> = Vec::new();
     let mut ordered: Vec<NodeId> = Vec::new();
     let mut per_node: Vec<SlotOverride> = Vec::new();
+    // parent_link[child_bfs] = (parent_bfs, slot_in_parent). Root
+    // entry is filled with the sentinel.
+    let mut parent_link: Vec<(u32, u8)> = Vec::new();
 
     visited.insert(root, 0);
     ordered.push(root);
     per_node.push([None; CHILDREN_PER_NODE]);
+    parent_link.push((u32::MAX, 0));
     queue.push(QueueEntry { node_id: root, path: Path::root() });
 
     let mut head = 0usize;
@@ -377,6 +417,7 @@ pub fn pack_tree_lod_selective(
                 visited.insert(*child_id, idx);
                 ordered.push(*child_id);
                 per_node.push([None; CHILDREN_PER_NODE]);
+                parent_link.push((ordered_idx as u32, slot as u8));
                 queue.push(QueueEntry {
                     node_id: *child_id,
                     path: child_path,
@@ -438,8 +479,59 @@ pub fn pack_tree_lod_selective(
     }
     debug_assert_eq!(tree.len(), total_u32s);
 
+    let parent_info = build_parent_info(&parent_link, &occupancies);
     let root_idx = *visited.get(&root).unwrap();
-    (tree, kinds, node_offsets, root_idx)
+    (tree, kinds, node_offsets, parent_info, root_idx)
+}
+
+/// Walk the packed tree from BFS root along `frame_slots`, following
+/// only Node-tagged children. Stops when a slot is empty / the child
+/// is a Block / a slot-OOB step is requested. Returns the deepest
+/// reached BFS index and the actual prefix of `frame_slots` walked.
+///
+/// Replaces `build_ribbon`'s frame-walk side-effect: the renderer
+/// uses the returned `(frame_root_idx, reached_slots)` to set the
+/// shader's starting node and reproject the camera. Pop-up itself
+/// is now driven by `parent_info[current_idx]` inside the shader,
+/// so we no longer accumulate the ancestor chain here.
+pub fn walk_to_frame_root(
+    tree: &[u32],
+    node_offsets: &[u32],
+    frame_slots: &[u8],
+) -> (u32, Vec<u8>) {
+    let mut reached: Vec<u8> = Vec::with_capacity(frame_slots.len());
+    let mut current: u32 = 0;
+    for &slot in frame_slots {
+        let Some(entry) = sparse_lookup(tree, node_offsets, current, slot) else { break };
+        if entry.0 != 2 { break; }
+        current = entry.1;
+        reached.push(slot);
+    }
+    (current, reached)
+}
+
+/// Decode (tag, node_index) for `slot` at the BFS-indexed node,
+/// returning `None` if the slot is OOB or empty. Used by
+/// `walk_to_frame_root`.
+fn sparse_lookup(
+    tree: &[u32],
+    node_offsets: &[u32],
+    bfs_idx: u32,
+    slot: u8,
+) -> Option<(u8, u32)> {
+    let header_off = *node_offsets.get(bfs_idx as usize)? as usize;
+    let occupancy = *tree.get(header_off)?;
+    let bit = 1u32 << slot;
+    if occupancy & bit == 0 {
+        return None;
+    }
+    let first_child = *tree.get(header_off + 1)? as usize;
+    let rank = (occupancy & (bit - 1)).count_ones() as usize;
+    let off = first_child + rank * 2;
+    let packed = *tree.get(off)?;
+    let tag = (packed & 0xFF) as u8;
+    let node_index = *tree.get(off + 1)?;
+    Some((tag, node_index))
 }
 
 #[cfg(test)]
@@ -477,7 +569,7 @@ mod tests {
     #[test]
     fn pack_test_world() {
         let world = plain_test_world();
-        let (tree, kinds, node_offsets, root_idx) = pack_tree(&world.library, world.root);
+        let (tree, kinds, node_offsets, _parent_info, root_idx) = pack_tree(&world.library, world.root);
         assert_eq!(root_idx, 0);
         assert_eq!(kinds.len(), world.library.len());
         assert_eq!(node_offsets.len(), world.library.len());
@@ -513,7 +605,7 @@ mod tests {
     fn pack_includes_body_kind_and_radii() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (_tree, kinds, _offsets, _root_idx) = pack_tree_lod(
+        let (_tree, kinds, _offsets, _parent_info, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         let body = kinds.iter().find(|kind| kind.kind == 1).expect("body kind in buffer");
@@ -525,7 +617,7 @@ mod tests {
     fn pack_lod_flattens_far_uniform_cartesian() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _parent_info, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         // Slot 0 (uniform-empty) has no bit in the root's occupancy.
@@ -540,7 +632,7 @@ mod tests {
     fn pack_planet_body_present() {
         let world = planet_world();
         let camera = camera_at([1.5, 2.0, 1.5]);
-        let (_tree, kinds, _offsets, _root_idx) = pack_tree_lod(
+        let (_tree, kinds, _offsets, _parent_info, _root_idx) = pack_tree_lod(
             &world.library, world.root, &camera, 1080.0, 1.2,
         );
         assert!(kinds.iter().any(|kind| kind.kind == 1), "body kind present");
@@ -554,12 +646,12 @@ mod tests {
         lib.ref_inc(root);
         let camera = camera_at([1.5, 2.0, 1.5]);
 
-        let (tree, _, offsets, _) = pack_tree_lod(
+        let (tree, _, offsets, _, _) = pack_tree_lod(
             &lib, root, &camera, 1080.0, 1.2,
         );
         assert_eq!(sparse_child(&tree, &offsets, 0, 16).tag, 0);
 
-        let (tree2, _, offsets2, _) = pack_tree_lod_preserving(
+        let (tree2, _, offsets2, _, _) = pack_tree_lod_preserving(
             &lib, root, &camera, 1080.0, 1.2,
             &[&[16u8]],
         );
@@ -569,9 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn preserve_path_chain_lets_ribbon_descend_to_depth_n() {
-        use super::super::ribbon::build_ribbon;
-
+    fn preserve_path_chain_lets_walker_descend_to_depth_n() {
         let mut lib = NodeLibrary::default();
         let mut node = lib.insert(empty_children());
         for _ in 1..10 {
@@ -582,13 +672,23 @@ mod tests {
         let camera = camera_at([1.5, 1.5, 1.5]);
         let path = [13u8; 9];
 
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod_preserving(
+        let (tree, _kinds, offsets, parent_info, _root_idx) = pack_tree_lod_preserving(
             &lib, root, &camera, 1080.0, 1.2,
             &[&path],
         );
-        let ribbon = build_ribbon(&tree, &offsets, &path);
-        assert_eq!(ribbon.reached_slots.len(), 9);
-        assert_eq!(ribbon.ribbon.len(), 9);
+        let (frame_root_idx, reached) = walk_to_frame_root(&tree, &offsets, &path);
+        assert_eq!(reached.len(), 9);
+        assert!(frame_root_idx > 0);
+        // Walking parent_info from the frame root back to root must
+        // visit exactly 9 ancestors before hitting the sentinel.
+        let mut hops = 0;
+        let mut cur = frame_root_idx;
+        while !parent_info[cur as usize].is_root() {
+            cur = parent_info[cur as usize].parent_node_idx;
+            hops += 1;
+            assert!(hops <= 32, "pop chain looped");
+        }
+        assert_eq!(hops, 9);
     }
 
     #[test]
@@ -599,7 +699,7 @@ mod tests {
         lib.ref_inc(root);
         let camera = camera_at([1.5, 2.0, 1.5]);
 
-        let (tree, _, offsets, _) = pack_tree_lod_preserving(
+        let (tree, _, offsets, _, _) = pack_tree_lod_preserving(
             &lib, root, &camera, 1080.0, 1.2,
             &[&[16u8]],
         );
@@ -625,7 +725,7 @@ mod tests {
         lib.ref_inc(root);
 
         let camera = camera_at([1.5, 1.5, 1.6]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
+        let (tree, _kinds, offsets, _parent_info, _root_idx) = pack_tree_lod(
             &lib, root, &camera, 1080.0, 1.2,
         );
         assert_eq!(sparse_child(&tree, &offsets, 0, CENTER_SLOT as u8).tag, 2);
@@ -638,7 +738,7 @@ mod tests {
     #[test]
     fn menger_pack_size_regression() {
         let world = menger_world(5);
-        let (tree, _kinds, _offsets, _root) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, _offsets, _parent_info, _root) = pack_tree(&world.library, world.root);
         let u32s = tree.len();
         eprintln!(
             "menger depth=5 pack size: {} u32s ({} bytes)",
@@ -659,7 +759,7 @@ mod tests {
     #[test]
     fn plain_pack_size_regression() {
         let world = plain_world(5);
-        let (tree, _kinds, _offsets, _root) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, _offsets, _parent_info, _root) = pack_tree(&world.library, world.root);
         let u32s = tree.len();
         eprintln!(
             "plain layers=5 pack size: {} u32s ({} bytes)",
@@ -703,7 +803,7 @@ mod tests {
             let frame_path_owned = frame_path;
             let preserve_regions = vec![(frame_path_owned, 3u8)];
 
-            let (tree_before, _, offsets_before, _) = pack_tree_lod_selective(
+            let (tree_before, _, offsets_before, _, _) = pack_tree_lod_selective(
                 &world.library,
                 world.root,
                 &camera,
@@ -731,7 +831,7 @@ mod tests {
                 "break_block returned false at spawn_depth={spawn_depth}",
             );
 
-            let (tree_after, _, offsets_after, _) = pack_tree_lod_selective(
+            let (tree_after, _, offsets_after, _, _) = pack_tree_lod_selective(
                 &world.library,
                 world.root,
                 &camera,
