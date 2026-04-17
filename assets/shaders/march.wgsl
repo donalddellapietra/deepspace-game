@@ -171,6 +171,32 @@ fn march_cartesian(
             // tag == 2u: Node child. Load node_index from the
             // second u32 of the compact entry we already located.
             let child_idx = tree[child_base + 1u];
+
+            // Shell skip: when re-entering a parent shell after a
+            // ribbon pop, skip the SLOT we already traversed in the
+            // inner shell. Uses slot index (not node_idx) so it works
+            // correctly in deduplicated trees where siblings share the
+            // same packed node. Checked BEFORE the kind lookup so a
+            // ribbon-pop landing on a sphere-body slot doesn't
+            // re-dispatch the sphere DDA we already traversed.
+            let cell_slot = u32(s_cell[depth].x) + u32(s_cell[depth].y) * 3u + u32(s_cell[depth].z) * 9u;
+            if depth == 0u && cell_slot == skip_slot {
+                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
+                    s_cell[depth].x += step.x;
+                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
+                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+                } else if s_side_dist[depth].y < s_side_dist[depth].z {
+                    s_cell[depth].y += step.y;
+                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+                } else {
+                    s_cell[depth].z += step.z;
+                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
+                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+                }
+                continue;
+            }
+
             let kind = node_kinds[child_idx].kind;
 
             if kind == 1u {
@@ -216,29 +242,6 @@ fn march_cartesian(
                     return sph;
                 }
                 // Sphere missed — advance Cartesian DDA past this cell.
-                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
-                    s_cell[depth].x += step.x;
-                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
-                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if s_side_dist[depth].y < s_side_dist[depth].z {
-                    s_cell[depth].y += step.y;
-                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                } else {
-                    s_cell[depth].z += step.z;
-                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                }
-                continue;
-            }
-
-            // Shell skip: when re-entering a parent shell after a
-            // ribbon pop, skip the SLOT we already traversed in the
-            // inner shell. Uses slot index (not node_idx) so it works
-            // correctly in deduplicated trees where siblings share the
-            // same packed node.
-            let cell_slot = u32(s_cell[depth].x) + u32(s_cell[depth].y) * 3u + u32(s_cell[depth].z) * 9u;
-            if depth == 0u && cell_slot == skip_slot {
                 if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
                     s_cell[depth].x += step.x;
                     s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
