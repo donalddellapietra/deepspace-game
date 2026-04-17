@@ -147,13 +147,31 @@ fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBo
     // Wrap in outer air layers up to target total_depth. Each wrap
     // places the current subtree at the center slot of a 27-child
     // node whose other 26 slots are Empty.
+    //
+    // When `vox_copies > 1`, the FINAL wrap layer fills multiple slots
+    // instead of just the center — content-addressed dedup means all
+    // copies share the same NodeId, so library size doesn't grow, but
+    // ray-traversal working set does. Used for scene-scaling stress tests.
+    let copies = std::env::var("VOX_COPIES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 27);
     let mut current = model_root_id;
     let wraps = total_depth.saturating_sub(model_depth);
-    for _ in 0..wraps {
+    for w in 0..wraps {
         let mut children = empty_children();
-        children[CENTER_SLOT] = Child::Node(current);
+        if copies > 1 && w == wraps - 1 {
+            // Outermost wrap: place `copies` instances across slots.
+            for slot in 0..(copies as usize) {
+                children[slot] = Child::Node(current);
+            }
+        } else {
+            children[CENTER_SLOT] = Child::Node(current);
+        }
         current = lib.insert(children);
     }
+    eprintln!("vox_world: placed {} copies in outermost wrap", copies);
     eprintln!(
         "vox_world: wrapped {} layers, final tree depth={}, library total={}",
         wraps, wraps + model_depth, lib.len(),
