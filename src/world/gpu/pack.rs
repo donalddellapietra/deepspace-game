@@ -388,7 +388,7 @@ pub fn pack_tree_lod_selective(
 mod tests {
     use super::*;
     use crate::world::anchor::WorldPos;
-    use crate::world::bootstrap::plain_test_world;
+    use crate::world::bootstrap::{menger_world, plain_test_world, plain_world};
     use crate::world::tree::{empty_children, uniform_children, CENTER_SLOT};
 
     /// Read the child at (bfs_idx, slot) from a packed tree. Returns
@@ -571,6 +571,49 @@ mod tests {
             &lib, root, &camera, 1080.0, 1.2,
         );
         assert_eq!(sparse_child(&tree, &offsets, 0, CENTER_SLOT as u8).tag, 2);
+    }
+
+    /// Baseline-capture test: builds a Menger sponge at depth 5 and
+    /// packs it without LOD. Asserts the interleaved tree buffer stays
+    /// below a hardcoded cap so silent pack-size drift (e.g. the 3.7%
+    /// regression on fully-occupied nodes under sparse) trips CI.
+    #[test]
+    fn menger_pack_size_regression() {
+        let world = menger_world(5);
+        let (tree, _kinds, _offsets, _root) = pack_tree(&world.library, world.root);
+        let u32s = tree.len();
+        eprintln!(
+            "menger depth=5 pack size: {} u32s ({} bytes)",
+            u32s, u32s * 4
+        );
+        // Measured baseline (sparse interleaved layout): 210 u32s.
+        // Threshold is ~1.5x the measured baseline so normal churn
+        // doesn't trip it but material regressions (>50%) do.
+        const MENGER_D5_MAX_U32S: usize = 320;
+        assert!(
+            u32s < MENGER_D5_MAX_U32S,
+            "menger depth=5 pack size regressed: {} u32s (> {} u32s)",
+            u32s, MENGER_D5_MAX_U32S,
+        );
+    }
+
+    /// Baseline-capture test for the plain-world preset.
+    #[test]
+    fn plain_pack_size_regression() {
+        let world = plain_world(5);
+        let (tree, _kinds, _offsets, _root) = pack_tree(&world.library, world.root);
+        let u32s = tree.len();
+        eprintln!(
+            "plain layers=5 pack size: {} u32s ({} bytes)",
+            u32s, u32s * 4
+        );
+        // Measured baseline (sparse interleaved layout): 898 u32s.
+        const PLAIN_L5_MAX_U32S: usize = 1400;
+        assert!(
+            u32s < PLAIN_L5_MAX_U32S,
+            "plain layers=5 pack size regressed: {} u32s (> {} u32s)",
+            u32s, PLAIN_L5_MAX_U32S,
+        );
     }
 
     /// Verify that breaking a block at various depths actually changes
