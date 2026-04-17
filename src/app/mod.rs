@@ -50,7 +50,6 @@ pub use test_runner::TestConfig;
 pub(super) struct LodUploadKey {
     pub root: u64,
     pub camera_anchor: Path,
-    pub camera_offset_bits: [u32; 3],
     pub render_path: Path,
     pub logical_path: Path,
     pub visual_depth: u8,
@@ -93,7 +92,6 @@ impl LodUploadKey {
         Self {
             root,
             camera_anchor: camera.anchor,
-            camera_offset_bits: camera.offset.map(f32::to_bits),
             render_path: frame.render_path,
             logical_path: frame.logical_path,
             visual_depth,
