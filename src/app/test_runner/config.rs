@@ -146,6 +146,11 @@ impl TestConfig {
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
                 "--sphere-world" => { cfg.world_preset = WorldPreset::DemoSphere; }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
+                "--vox-model" => {
+                    if let Some(path_str) = args.next() {
+                        cfg.world_preset = WorldPreset::VoxModel(path_str.into());
+                    }
+                }
                 "--plain-layers" => {
                     cfg.plain_layers = args.next().and_then(|v| v.parse().ok());
                 }

@@ -167,6 +167,12 @@ impl App {
         let renderer_elapsed = renderer_start.elapsed();
         eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);
         let mut renderer = renderer;
+        // Push the App's color registry into the GPU palette buffer.
+        // Bootstrap presets that import models (e.g. --vox-model) add
+        // per-model colors to this registry; without this upload the
+        // shader still sees GpuPalette::default() (builtins only) and
+        // every imported voxel renders as palette[0] = transparent black.
+        renderer.update_palette(&self.palette.to_gpu_palette());
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
             eprintln!(

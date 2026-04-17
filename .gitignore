@@ -21,3 +21,6 @@
 
 .claude/
 ui/assets/
+
+# Voxelized models (regenerated from GLB via tools/glb_to_vox.py)
+assets/vox/

@@ -195,6 +195,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         cfg.live_sample_every_frames.unwrap_or(0),
     ));
     let mut renderer = renderer;
+    renderer.update_palette(&app.palette.to_gpu_palette());
     renderer.resize(app.harness_width, app.harness_height);
     eprintln!(
         "render_harness: resize width={} height={}",

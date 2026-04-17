@@ -53,46 +53,189 @@ def voxelize_glb(path, resolution):
 
 
 def sample_colors(mesh, voxelized, filled_coords):
-    """Sample mesh vertex colors at voxel centers. Falls back to grey."""
-    has_colors = (hasattr(mesh.visual, 'vertex_colors') and
-                  mesh.visual.vertex_colors is not None and
-                  len(mesh.visual.vertex_colors) > 0)
+    """Sample mesh colors at voxel centers.
 
-    if not has_colors:
-        # Try face colors
-        has_colors = (hasattr(mesh.visual, 'face_colors') and
-                      mesh.visual.face_colors is not None)
+    Fast path: precompute per-vertex colors from the texture (one UV
+    lookup per vertex, not per voxel), then nearest-vertex lookup via
+    scipy cKDTree for each voxel. O(V log V) tree build + O(N log V)
+    queries instead of O(N * M) mesh-surface queries on faces.
 
-    if not has_colors:
-        print("  No vertex/face colors found, using uniform grey", file=sys.stderr)
-        return np.full((len(filled_coords), 4), [128, 128, 128, 255], dtype=np.uint8)
-
-    # Get world-space centers of filled voxels
+    Priority:
+      1. Texture: build per-vertex colors from baseColorTexture @ UVs.
+      2. Vertex colors baked in the mesh.
+      3. Face colors.
+      4. Fallback uniform grey.
+    """
     centers = voxelized.indices_to_points(filled_coords)
 
-    # Find nearest face for each voxel center
-    closest_points, distances, face_indices = mesh.nearest.on_surface(centers)
+    # --- Step 1: resolve per-vertex RGBA colors ---
+    vertex_colors = _resolve_vertex_colors(mesh)
+    if vertex_colors is None:
+        print("  No texture / vertex / face colors found, using uniform grey",
+              file=sys.stderr)
+        return np.full((len(filled_coords), 4), [128, 128, 128, 255],
+                       dtype=np.uint8)
 
-    if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None:
-        vc = mesh.visual.vertex_colors
-        # Average vertex colors of the nearest face
-        face_verts = mesh.faces[face_indices]  # (N, 3) vertex indices
-        colors = np.mean(vc[face_verts], axis=1).astype(np.uint8)
+    # --- Step 2: nearest-vertex query for each voxel ---
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        print("  scipy missing — falling back to slow mesh.nearest path",
+              file=sys.stderr)
+        return _slow_face_colors(mesh, vertex_colors, centers)
+
+    tree = cKDTree(mesh.vertices)
+    _dist, nearest_vidx = tree.query(centers, k=1, workers=-1)
+    colors = vertex_colors[nearest_vidx].copy()
+    # Force full opacity — a voxel that survived the fill pass IS present.
+    # Texture alpha channels are commonly used for mask/cutout in GLBs,
+    # which we don't want interpreted as per-voxel transparency.
+    colors[:, 3] = 255
+    return colors
+
+
+def _resolve_vertex_colors(mesh):
+    """Return Nx4 uint8 RGBA per vertex, or None."""
+    n_verts = len(mesh.vertices)
+
+    # Attempt 1: sample the texture at each vertex's UV.
+    img = _get_texture_image(mesh)
+    uvs = _get_uvs(mesh)
+    if img is not None and uvs is not None:
+        print(f"  Texture: {img.size[0]}x{img.size[1]} ({img.mode}), "
+              f"UVs present — sampling per-vertex",
+              file=sys.stderr)
+        w, h = img.size
+        px = np.clip((uvs[:, 0] * w).astype(np.int32), 0, w - 1)
+        py = np.clip(((1.0 - uvs[:, 1]) * h).astype(np.int32), 0, h - 1)
+        img_rgba = np.asarray(img.convert('RGBA'))   # (H, W, 4)
+        colors = img_rgba[py, px, :].astype(np.uint8)
+        if len(colors) == n_verts:
+            return colors
+
+    # Attempt 2: baked vertex colors.
+    vc = getattr(mesh.visual, 'vertex_colors', None)
+    if vc is not None and len(vc) == n_verts:
+        colors = np.asarray(vc).astype(np.uint8)
+        if colors.shape[1] == 3:
+            alpha = np.full((n_verts, 1), 255, dtype=np.uint8)
+            colors = np.hstack([colors, alpha])
+        return colors[:, :4]
+
+    # Attempt 3: face colors — expand to per-vertex by averaging adjacent faces.
+    fc = getattr(mesh.visual, 'face_colors', None)
+    if fc is not None and len(fc) == len(mesh.faces):
+        # Accumulate each vertex's incident face colors.
+        sums = np.zeros((n_verts, 4), dtype=np.float64)
+        counts = np.zeros(n_verts, dtype=np.int64)
+        for face_idx, face in enumerate(mesh.faces):
+            c = fc[face_idx][:4]
+            for v in face:
+                sums[v] += c
+                counts[v] += 1
+        counts = np.maximum(counts, 1)
+        return (sums / counts[:, None]).astype(np.uint8)
+
+    return None
+
+
+def _slow_face_colors(mesh, vertex_colors, centers):
+    """Fallback path without scipy — slower but works."""
+    _cp, _d, face_indices = mesh.nearest.on_surface(centers)
+    face_verts = mesh.faces[face_indices]                  # (N, 3)
+    colors = np.mean(vertex_colors[face_verts], axis=1).astype(np.uint8)
+    return colors
+
+
+def _get_texture_image(mesh):
+    """Return the baseColor PIL image from a PBR material, or None."""
+    visual = mesh.visual
+    if not hasattr(visual, 'material') or visual.material is None:
+        return None
+    mat = visual.material
+    for attr in ('baseColorTexture', 'image'):
+        img = getattr(mat, attr, None)
+        if img is not None:
+            return img
+    return None
+
+
+def _get_uvs(mesh):
+    """Return per-vertex UVs (Nx2 array) or None."""
+    if not hasattr(mesh.visual, 'uv') or mesh.visual.uv is None:
+        return None
+    uv = np.asarray(mesh.visual.uv)
+    if uv.shape[0] != len(mesh.vertices):
+        return None
+    return uv
+
+
+def write_output(path, filled, colors, shape):
+    """Dispatch write based on file extension and grid size.
+
+    - `.vxs` → custom sparse binary (no per-axis limit, arbitrary palette).
+    - `.vox` → MagicaVoxel binary (256-per-axis limit, 255-color palette).
+      When any dimension exceeds 256, we auto-switch to `.vxs` with a
+      warning so content doesn't get silently truncated.
+    """
+    path = str(path)
+    sx, sy, sz = int(shape[0]), int(shape[1]), int(shape[2])
+    if path.endswith('.vxs') or max(sx, sy, sz) > 256:
+        if path.endswith('.vox'):
+            path = path[:-4] + '.vxs'
+            print(f"  grid {sx}x{sy}x{sz} exceeds 256 — writing .vxs at {path}",
+                  file=sys.stderr)
+        write_vxs(path, filled, colors, shape)
     else:
-        colors = mesh.visual.face_colors[face_indices].astype(np.uint8)
+        write_vox(path, filled, colors, shape)
 
-    # Ensure RGBA
-    if colors.shape[1] == 3:
-        alpha = np.full((len(colors), 1), 255, dtype=np.uint8)
-        colors = np.hstack([colors, alpha])
 
-    return colors[:, :4]
+def write_vxs(path, filled, colors, shape):
+    """Custom sparse voxel format.
+
+    Layout:
+        magic:        b"DSVX"           (4 bytes)
+        version:      u32 (=1)
+        size_x, y, z: u32 × 3
+        palette_n:    u32               (1..=4096, dedup'd RGBA)
+        palette:      [u8; 4] × palette_n
+        voxel_n:      u32
+        voxels:       (u32 x, u32 y, u32 z, u32 palette_idx) × voxel_n
+
+    Read by `src/import/vxs.rs`.
+    """
+    # Cap palette at 200 colors to fit comfortably in ColorRegistry
+    # (which has a 256-entry limit shared with system/block colors).
+    unique_colors, color_indices = quantize_palette(colors, max_colors=200)
+    sx, sy, sz = int(shape[0]), int(shape[1]), int(shape[2])
+
+    with open(path, 'wb') as f:
+        f.write(b'DSVX')
+        f.write(struct.pack('<I', 1))                       # version
+        f.write(struct.pack('<III', sx, sy, sz))
+        f.write(struct.pack('<I', len(unique_colors)))
+        for r, g, b, a in unique_colors:
+            f.write(struct.pack('<BBBB', r, g, b, a))
+        f.write(struct.pack('<I', len(filled)))
+        # Pack as contiguous ndarray for speed. trimesh is already Y-up,
+        # matching our convention — no axis swap needed.
+        idx = np.asarray(color_indices, dtype=np.uint32)    # 0-based
+        buf = np.empty((len(filled), 4), dtype=np.uint32)
+        buf[:, 0] = filled[:, 0]
+        buf[:, 1] = filled[:, 1]
+        buf[:, 2] = filled[:, 2]
+        buf[:, 3] = idx
+        f.write(buf.tobytes())
+
+    print(f"  Written: {path} ({len(filled)} voxels, "
+          f"{len(unique_colors)} palette colors, vxs format)", file=sys.stderr)
 
 
 def write_vox(path, filled, colors, shape):
     """Write a MagicaVoxel .vox file.
 
     .vox format: https://github.com/ephtracy/voxel-model/blob/master/MagicaVoxel-file-format-vox.txt
+    Limited to 256-per-axis and 255 palette colors. Use .vxs for larger.
     """
     # Build palette: quantize colors to 256 entries
     unique_colors, color_indices = quantize_palette(colors)
@@ -193,7 +336,7 @@ def main():
     print(f"Loading: {args.input}", file=sys.stderr)
     filled, colors, shape = voxelize_glb(args.input, args.resolution)
 
-    write_vox(args.output, filled, colors, shape)
+    write_output(args.output, filled, colors, shape)
 
 
 if __name__ == "__main__":

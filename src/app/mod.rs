@@ -227,8 +227,9 @@ impl App {
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
-        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset, Some(test_cfg.plain_layers()));
+        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), Some(test_cfg.plain_layers()));
         let mut world = bootstrap.world;
+        let bootstrap_color_registry = bootstrap.color_registry;
         let tree_depth = world.tree_depth();
         // Resolve spawn position: CLI --spawn-xyz overrides with
         // root-frame-local coords (precise at shallow depth, then
@@ -310,7 +311,7 @@ impl App {
             keys: Keys::default(),
             last_frame: std::time::Instant::now(),
             tree_depth,
-            palette: ColorRegistry::new(),
+            palette: bootstrap_color_registry,
             saved_meshes: SavedMeshes::default(),
             save_mode: false,
             ui: GameUiState::new(),

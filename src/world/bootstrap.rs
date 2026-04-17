@@ -13,7 +13,7 @@ use super::tree::{
 };
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum WorldPreset {
     #[default]
     PlainTest,
@@ -24,6 +24,14 @@ pub enum WorldPreset {
     /// per level, no uniform collapse — stresses the packer's
     /// preserved-detail path in a way plain/sphere don't.
     Menger,
+    /// Imported `.vox` model placed inside a plain world. Uses the
+    /// GLB→vox→tree pipeline (see `src/import/` and
+    /// `tools/glb_to_vox.py`). The model is planted at the center
+    /// of a plain world of depth `plain_layers` (default 8), so
+    /// camera spawn is reasonable out-of-the-box. Stresses the
+    /// packer's real-content path: tens of thousands of unique
+    /// library nodes, every visible cell is mesh detail.
+    VoxModel(std::path::PathBuf),
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -41,6 +49,12 @@ pub struct WorldBootstrap {
     pub default_spawn_yaw: f32,
     pub default_spawn_pitch: f32,
     pub plain_layers: u8,
+    /// Color registry populated by the bootstrap — contains every
+    /// palette entry the world needs to render. Callers take this
+    /// instead of constructing a fresh `ColorRegistry::new()` so that
+    /// imported-model colors (from `.vox`/`.vxs`) survive into the
+    /// render path. Always contains the builtins as a prefix.
+    pub color_registry: crate::world::palette::ColorRegistry,
 }
 
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
@@ -48,6 +62,7 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
         WorldPreset::Menger => bootstrap_menger_world(plain_layers.unwrap_or(20)),
+        WorldPreset::VoxModel(path) => bootstrap_vox_model_world(&path, plain_layers.unwrap_or(8)),
     }
 }
 
@@ -90,6 +105,125 @@ pub fn menger_world(depth: u8) -> WorldState {
     WorldState { root: current, library: lib }
 }
 
+/// Load a `.vox` file via the import pipeline and embed it as the
+/// child of a tree of `total_depth` levels. The model sits at the
+/// center slot of each wrapper layer so the camera can spawn in
+/// air nearby and look at it from any side.
+///
+/// Panics if the file doesn't exist or doesn't parse — this is a
+/// bootstrap function, not a content runtime path.
+fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBootstrap {
+    use crate::import::{self, tree_builder};
+    use crate::world::tree::{CENTER_SLOT, empty_children};
+
+    let total_depth = total_depth.max(1).min(MAX_DEPTH as u8);
+
+    let mut lib = NodeLibrary::default();
+    let mut registry = crate::world::palette::ColorRegistry::new();
+
+    let model = import::load(path, &mut registry)
+        .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
+    eprintln!(
+        "vox_world: loaded {:?} ({}x{}x{} = {} voxels)",
+        path, model.size_x, model.size_y, model.size_z,
+        model.data.iter().filter(|&&v| v != 0).count(),
+    );
+
+    let model_root_id = tree_builder::build_tree(&model, &mut lib);
+
+    // How many tree levels does the model itself occupy? ceil(log3(max_dim)).
+    let max_dim = model.size_x.max(model.size_y).max(model.size_z).max(1);
+    let mut dim = 1usize;
+    let mut model_depth: u8 = 0;
+    while dim < max_dim {
+        dim *= BRANCH;
+        model_depth += 1;
+    }
+    eprintln!(
+        "vox_world: model tree depth={}, library nodes after build={}",
+        model_depth, lib.len(),
+    );
+
+    // Wrap in outer air layers up to target total_depth. Each wrap
+    // places the current subtree at the center slot of a 27-child
+    // node whose other 26 slots are Empty.
+    let mut current = model_root_id;
+    let wraps = total_depth.saturating_sub(model_depth);
+    for _ in 0..wraps {
+        let mut children = empty_children();
+        children[CENTER_SLOT] = Child::Node(current);
+        current = lib.insert(children);
+    }
+    eprintln!(
+        "vox_world: wrapped {} layers, final tree depth={}, library total={}",
+        wraps, wraps + model_depth, lib.len(),
+    );
+
+    lib.ref_inc(current);
+    let world = WorldState { root: current, library: lib };
+
+    // Compute the model's world-space bounds so spawn is always at a
+    // position the camera can see the model from, regardless of the
+    // model's voxel dimensions or how deep the wrap put it.
+    //
+    // Geometry: the model is wrapped at `CENTER_SLOT=(1,1,1)` of each
+    // outer layer, so it lives in cell (1,1,1)^(wraps) of the root.
+    // That cell's world extent is `[wrap_origin, wrap_origin+wrap_size]^3`
+    // with `wrap_size = 3 * (1/3)^wraps` and `wrap_origin = 1.5 - wrap_size/2`.
+    // Inside that cell, the model's voxel grid fills
+    // `[0, size_axis/padded]` of the cell, where `padded = 3^model_depth`.
+    let padded = BRANCH.pow(model_depth as u32) as f32;
+    let wrap_size = 3.0 * (1.0 / BRANCH as f32).powi(wraps as i32);
+    let wrap_origin = 1.5 - wrap_size / 2.0;
+    let extent_x = wrap_size * (model.size_x as f32 / padded);
+    let extent_y = wrap_size * (model.size_y as f32 / padded);
+    let extent_z = wrap_size * (model.size_z as f32 / padded);
+    let center_x = wrap_origin + extent_x / 2.0;
+    let center_y = wrap_origin + extent_y / 2.0;
+    let center_z = wrap_origin + extent_z / 2.0;
+    eprintln!(
+        "vox_world: model world bounds x=[{:.3}..{:.3}] y=[{:.3}..{:.3}] z=[{:.3}..{:.3}], center=({:.3},{:.3},{:.3})",
+        wrap_origin, wrap_origin + extent_x,
+        wrap_origin, wrap_origin + extent_y,
+        wrap_origin, wrap_origin + extent_z,
+        center_x, center_y, center_z,
+    );
+
+    // Spawn directly above the model's x/z centroid, outside the
+    // wrap cell (y > wrap_cell_max), looking straight down.
+    //
+    // Why this spawn layout works reliably:
+    //  - Camera x,z inside the model's voxel footprint → rays going
+    //    down the pitch axis hit model cells (not empty siblings).
+    //  - Camera y > 2.0 places it in a root cell ABOVE the wrap cell,
+    //    so rays traverse an empty cell first, then enter the model
+    //    tree via the wrap — no "inside-the-model-tree at spawn"
+    //    edge case.
+    //  - Pitch ≈ -π/2 keeps the ray direction aligned with the
+    //    thin-slab Z axis of most humanoid GLBs (soldier, fox), so
+    //    you see the whole silhouette in one view.
+    let cam_x = center_x.clamp(0.05, 2.95);
+    let cam_y = (wrap_origin + wrap_size + 0.5).min(2.95);
+    let cam_z = center_z.clamp(0.05, 2.95);
+    let spawn_pos = WorldPos::from_frame_local(
+        &Path::root(),
+        [cam_x, cam_y, cam_z],
+        2,
+    ).deepened_to(3);
+    let yaw = 0.0;
+    let pitch = -1.5;   // nearly straight down
+
+    WorldBootstrap {
+        world,
+        planet_path: None,
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: yaw,
+        default_spawn_pitch: pitch,
+        plain_layers: total_depth,
+        color_registry: registry,
+    }
+}
+
 fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
     let depth = depth.min(MAX_DEPTH as u8);
     let world = menger_world(depth);
@@ -108,6 +242,7 @@ fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
         default_spawn_yaw: -std::f32::consts::FRAC_PI_4,
         default_spawn_pitch: -0.6,
         plain_layers: depth,
+        color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
 
@@ -376,6 +511,7 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -1.2,
         plain_layers: 0,
+        color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
 
@@ -493,6 +629,7 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -0.45,
         plain_layers,
+        color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
 

@@ -4,7 +4,22 @@
 //! The pipeline: parse → color map → tree build → NodeId ready to place.
 
 pub mod vox;
+pub mod vxs;
 pub mod tree_builder;
+
+/// Dispatch load by file extension. `.vox` → MagicaVoxel format;
+/// `.vxs` → our custom sparse format for models exceeding the
+/// 256-per-axis `.vox` limit. Both produce a `VoxelModel`.
+pub fn load(
+    path: &std::path::Path,
+    registry: &mut crate::world::palette::ColorRegistry,
+) -> Result<VoxelModel, String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        "vxs" => vxs::load(path, registry),
+        _ => vox::load_first_model(path, registry),
+    }
+}
 
 /// A parsed voxel model: flat 3D grid of palette indices.
 /// 0 = empty/air, 1-255 = palette index from `ColorRegistry`.
