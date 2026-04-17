@@ -84,6 +84,13 @@ pub struct TestConfig {
     /// the `renderer_slow` 30 ms threshold. `None` or `Some(0)`
     /// disables.
     pub live_sample_every_frames: Option<u32>,
+    /// Integer downscale divisor for the ray-march pass. 1 = render
+    /// at the surface's full pixel count (legacy behavior). 2 =
+    /// ray-march at half-per-axis (quarter pixel count), bilinear-
+    /// upscale to the surface. Trades a small quality hit on voxel
+    /// edges for a ~2.5× FPS win; see
+    /// `docs/testing/proposed-perf-speedups.md` (Speedup A).
+    pub render_scale: Option<u32>,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -219,6 +226,9 @@ impl TestConfig {
                 }
                 "--live-sample-every" => {
                     cfg.live_sample_every_frames = args.next().and_then(|v| v.parse().ok());
+                }
+                "--render-scale" => {
+                    cfg.render_scale = args.next().and_then(|v| v.parse().ok());
                 }
                 _ => {}
             }
