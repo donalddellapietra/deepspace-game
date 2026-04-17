@@ -38,19 +38,27 @@ fn march_cartesian(
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
     var s_cell: array<vec3<i32>, MAX_STACK_DEPTH>;
     var s_side_dist: array<vec3<f32>, MAX_STACK_DEPTH>;
-    var s_node_origin: array<vec3<f32>, MAX_STACK_DEPTH>;
 
     // Current-depth cell size. Pure function of `depth` (1/3^depth), so
     // a scalar mutated on push (÷3) / pop (×3) is exactly equivalent
-    // to a per-depth array. Saves ~20 B of per-thread state and helps
-    // fragment-shader occupancy (see perf-occupancy-stack-slim.md).
+    // to a per-depth array. Saves ~20 B of per-thread state.
     var cur_cell_size: f32 = 1.0;
+
+    // Current-depth node origin (world coords of the current frame's
+    // [0,0,0] corner). Updated incrementally:
+    //   descend: += vec3<f32>(s_cell[depth]) * parent_cell_size
+    //   pop:     -= vec3<f32>(s_cell[new_depth]) * new_parent_cell_size
+    // Reversible because s_cell[parent_depth] is preserved while we're
+    // descended into the child — the DDA only advances s_cell[depth]
+    // at the CURRENT depth. On pop we subtract the same contribution
+    // we added on descend. Saves ~60 B of per-thread state. See
+    // perf-occupancy-stack-slim.md.
+    var cur_node_origin: vec3<f32> = vec3<f32>(0.0);
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
     s_node_idx[0] = root_node_idx;
-    s_node_origin[0] = vec3<f32>(0.0);
 
     // Interleaved-layout header for the CURRENT depth, cached in
     // scalar registers. Written on entry, refreshed on descend AND
@@ -100,9 +108,13 @@ fn march_cartesian(
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
             depth -= 1u;
-            // cur_cell_size was stored as scalar; undo the descend
-            // divide so it now reflects the parent's cell size.
+            // Restore parent-depth scalars. cur_cell_size ×3 undoes
+            // the descend divide; cur_node_origin subtracts the exact
+            // vec we added on descend (s_cell[parent_depth] was
+            // preserved while we were inside the child, so this is
+            // byte-exact — no accumulated floating-point error).
             cur_cell_size = cur_cell_size * 3.0;
+            cur_node_origin = cur_node_origin - vec3<f32>(s_cell[depth]) * cur_cell_size;
             if ENABLE_STATS { ray_steps_oob = ray_steps_oob + 1u; }
 
             // Popped to a shallower depth. Reload cur_occupancy /
@@ -164,7 +176,7 @@ fn march_cartesian(
         let tag = packed & 0xFFu;
 
         if tag == 1u {
-            let cell_min_h = s_node_origin[depth] + vec3<f32>(cell) * cur_cell_size;
+            let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
             let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
             result.hit = true;
@@ -208,7 +220,7 @@ fn march_cartesian(
 
             if kind == 1u {
                 // CubedSphereBody: dispatch sphere DDA in this body's cell.
-                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * cur_cell_size;
+                let body_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
                 let body_size = cur_cell_size;
                 let inner_r = node_kinds[child_idx].inner_r;
                 let outer_r = node_kinds[child_idx].outer_r;
@@ -305,7 +317,7 @@ fn march_cartesian(
                         normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                     }
                 } else {
-                    let cell_min_l = s_node_origin[depth] + vec3<f32>(cell) * cur_cell_size;
+                    let cell_min_l = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
                     let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
@@ -318,7 +330,7 @@ fn march_cartesian(
                 }
             } else {
                 if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
-                let parent_origin = s_node_origin[depth];
+                let parent_origin = cur_node_origin;
                 let parent_cell_size = cur_cell_size;
                 let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
 
@@ -330,7 +342,7 @@ fn march_cartesian(
 
                 depth += 1u;
                 s_node_idx[depth] = child_idx;
-                s_node_origin[depth] = child_origin;
+                cur_node_origin = child_origin;
                 cur_cell_size = child_cell_size;
                 // Load the new current-depth header into scalar
                 // registers so the inner loop never re-reads tree[]

@@ -109,7 +109,31 @@ cumulative register savings cross the threshold.
 
 ### Step 2: `s_node_origin` → scalar `cur_node_origin` (-60 B)
 
-Results pending.
+Slow-soldier @ 2560×1440, 300 frames. Timing measured from direct
+binary (`target/release/deepspace-game`) for apples-to-apples — `cargo
+run` adds ~5-10 ms of noise per run on this scenario.
+
+| counter | baseline | step 1 | step 2 | Δ vs baseline |
+|---|---|---|---|---|
+| Fragment Occupancy (mean) | 12.04% | 12.20% | **12.65%** | +0.6 pp |
+| Fragment Occupancy (p99)  | 13.93% | 12.85% | **36.29%** | +22 pp |
+| ALU Utilization (mean)    | 21.70% | 24.43% | **30.24%** | +8.5 pp |
+| Buffer Read Limiter       | 4.84%  | 3.00%  | 2.90%  | −1.9 pp |
+| `submitted_done_ms` avg   | 17.67  | 16.43  | **12.67** | **−28%** |
+
+**Interpretation.** The headline is the ALU Utilization jump from 21.7%
+→ 30.2% — that's the clean "threads are actually doing more work per
+second" signal. `submitted_done_ms` dropping 28% is the matching
+wall-clock win.
+
+Interestingly, Fragment Occupancy **mean** barely moved (12.04 →
+12.65), but **p99** jumped from 13.93% to 36.29%. The compiler isn't
+finding enough register room to raise the steady-state occupancy yet,
+but it's finding windows where occupancy can spike — enough that the
+ALU gets fed materially more work overall.
+
+Screenshots pixel-identical (plain_d8, sphere, zoom3). `cargo test
+--lib gpu` passes.
 
 ### Step 3: `s_side_dist` → scalar `cur_side_dist` (-60 B)
 
