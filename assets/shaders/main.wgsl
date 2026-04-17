@@ -26,11 +26,21 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Use @builtin(position).xy (exact fp32 pixel-center coords the
+    // rasterizer emits) instead of interpolated in.uv. The compute
+    // entry uses f32(gid.xy) + 0.5, which matches this bit-for-bit;
+    // going through linearly-interpolated in.uv introduced barycentric
+    // fp32 rounding that diverged from the compute path at pixel
+    // boundaries (notably the crosshair thickness edge).
+    let pixel_uv = vec2<f32>(
+        in.position.x / uniforms.screen_width,
+        in.position.y / uniforms.screen_height,
+    );
     let aspect = uniforms.screen_width / uniforms.screen_height;
     let half_fov_tan = tan(camera.fov * 0.5);
     let ndc = vec2<f32>(
-        (in.uv.x - 0.5) * 2.0 * aspect * half_fov_tan,
-        (0.5 - in.uv.y) * 2.0 * half_fov_tan,
+        (pixel_uv.x - 0.5) * 2.0 * aspect * half_fov_tan,
+        (0.5 - pixel_uv.y) * 2.0 * half_fov_tan,
     );
     let ray_dir = camera.forward + camera.right * ndc.x + camera.up * ndc.y;
 
@@ -77,7 +87,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let pixel = vec2<f32>(in.uv.x * uniforms.screen_width, in.uv.y * uniforms.screen_height);
+    let pixel = in.position.xy;
     let center = vec2<f32>(uniforms.screen_width * 0.5, uniforms.screen_height * 0.5);
     let d = abs(pixel - center);
     let cross_size = 12.0;
