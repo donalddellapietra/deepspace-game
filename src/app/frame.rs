@@ -126,6 +126,9 @@ pub fn compute_render_frame(
                             body_info = Some((body_path, body_node_id, inner_r, outer_r));
                         }
                     }
+                    // Brick leaves have no descendable children — the
+                    // frame walk terminates here.
+                    NodeKind::Brick => break,
                 }
             }
             Child::Block(_) | Child::Empty => break,

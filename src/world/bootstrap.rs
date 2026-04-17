@@ -131,16 +131,14 @@ fn bootstrap_vox_model_world(path: &std::path::Path, total_depth: u8) -> WorldBo
 
     let model_root_id = tree_builder::build_tree(&model, &mut lib);
 
-    // How many tree levels does the model itself occupy? ceil(log3(max_dim)).
-    let max_dim = model.size_x.max(model.size_y).max(model.size_z).max(1);
-    let mut dim = 1usize;
-    let mut model_depth: u8 = 0;
-    while dim < max_dim {
-        dim *= BRANCH;
-        model_depth += 1;
-    }
+    // Content depth: how many levels of world-tree subdivision the
+    // model's content occupies. Pre-bricks this was just
+    // ceil(log3(max_dim)). With brick materialization this needs to
+    // measure the actual materialized tree — a side-9 brick counts
+    // as 2 content levels in 1 tree node.
+    let model_depth = tree_builder::content_depth(&lib, model_root_id);
     eprintln!(
-        "vox_world: model tree depth={}, library nodes after build={}",
+        "vox_world: model content depth={}, library nodes after build={}",
         model_depth, lib.len(),
     );
 

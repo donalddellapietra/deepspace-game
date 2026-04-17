@@ -7,33 +7,27 @@
 //                       `cur_side_dist`, `cur_cell`, `cur_node_idx`:
 //     shadow the current depth's stack slot in a thread-private
 //     register. The inner DDA loop reads and mutates them every
-//     iteration for the cost of a register access — no workgroup-
-//     memory round-trip, no address math, no load latency.
+//     iteration for the cost of a register access.
 //
 //   workgroup memory (`s_cell_tg`, `s_node_idx_tg`) — PARENT depths only:
 //     written once when we descend (save the parent's final state so
-//     a later pop can recover it), read once when we pop (restore
-//     what the parent was doing). The current depth's state stays in
-//     registers; TG memory is used as the "depth stack" storage.
-//     This shrinks the per-iteration TG traffic from 2 ops/iter to 0.
+//     a later pop can recover it), read once when we pop.
 //
 // `cur_cell` at the current depth is read and mutated every DDA
-// iteration, but the WGSL compiler can't keep an array slot
-// (`s_cell_tg[depth_base]`) in a register across iterations because
-// workgroup memory has shared-aliasing semantics (another thread
-// could theoretically write there). Shadowing it in a local `var`
-// tells the compiler "this is thread-private" and it lives in a
-// register. Same trick as the three scalar fields above, applied to
-// the remaining stack arrays.
-//
-// Workgroup budget: MAX_STACK_DEPTH * TG_STRIDE slots × (16 B cell +
-// 4 B node_idx) = 5 * 64 * 20 = 6400 B / workgroup. Unchanged from
-// the previous commit — the arrays are still sized for full-depth
-// save/restore, just accessed less often.
+// iteration; shadowing it in a thread-local `var` keeps it in a
+// register instead of hitting workgroup-shared memory every step.
 //
 // Addressing: depth-major stride by TG_STRIDE (= @workgroup_size.x *
 // @workgroup_size.y = 64) so adjacent threads hit consecutive banks.
-//   index = depth * TG_STRIDE + lid
+//
+// Bricks: `march_brick` handles first-class `NodeKind::Brick`
+// leaves. The brick header's side code (bits 28-29) tells us whether
+// the brick is a 3³, 9³, or 27³ dense grid; march_brick walks the
+// grid with a flat byte read per cell — no popcount, no rank, no
+// tag dispatch. The caller (this `march_cartesian`) detects the
+// brick by peeking the child's header word, decodes the side, and
+// sets up the initial cell + side_dist at the brick's own cell
+// resolution (parent_cell_size / side).
 
 #include "tree.wgsl"
 #include "ray_prim.wgsl"
@@ -45,29 +39,29 @@ const TG_SLOTS: u32 = TG_STRIDE * MAX_STACK_DEPTH;
 var<workgroup> s_node_idx_tg: array<u32,       TG_SLOTS>;
 var<workgroup> s_cell_tg:     array<vec3<i32>, TG_SLOTS>;
 
-/// Flat DDA through a single brick node. A brick packs all 27 cells
-/// of a Cartesian node's 3×3×3 grid as block-type bytes in 7 u32s,
-/// right after the 2-u32 header. This function does NOT recurse —
-/// every cell is terminal (block, or block_type=255 meaning empty).
-/// Returns `hit=true` with the terminal cell, or `hit=false` when
-/// the ray exits the brick without hitting anything (caller then
-/// advances its parent DDA past this brick's cell as if it were an
-/// empty LOD-terminal).
-///
-/// Caller must provide the initial `cur_cell` and `cur_side_dist`
-/// already set up for the brick entry point — same math the tree
-/// descent path uses to initialize its child's stack. Reusing the
-/// caller's computed values avoids duplicating the ray_box +
-/// local_entry divides that are already the only expensive part of
-/// the brick-entry critical path.
-///
-/// `brick_data_off` points at the first of the 7 packed-data u32s
-/// (= brick_header_off + 2). `brick_origin` / `brick_cell_size` are
-/// the world-frame placement of the brick — brick_cell_size is the
-/// size of EACH of the 3×3×3 cells inside, i.e. parent_cell_size/3
-/// from the caller's descent frame.
+// ───────── brick header decoding ─────────
+// Bits 28-29 of a brick's first u32 carry the side code:
+//   0 → side = 3, 1 → side = 9, 2 → side = 27.
+fn brick_side_from_header(header: u32) -> u32 {
+    let code = (header >> 28u) & 3u;
+    return select(select(27u, 9u, code == 1u), 3u, code == 0u);
+}
+
+// ───────── march_brick ─────────
+// Flat DDA across a brick's `side³` cells. Returns `hit=true` with
+// the first non-empty cell along the ray, or `hit=false` when the
+// ray exits the brick without hitting any solid cell.
+//
+// Cell indexing: `slot = x + y*side + z*side²`, with the per-slot
+// block-type byte stored at `cells_u32[slot/4] >> ((slot%4)*8)`.
+// Empty cells carry `BRICK_EMPTY_BT` (255).
+//
+// The caller pre-computes the initial `cur_cell` and `cur_side_dist`
+// at the brick's own cell resolution. max-iter cap scales with side:
+// a ray traverses at most ~3·side cells along a brick's diagonal.
 fn march_brick(
     brick_data_off: u32,
+    side: u32,
     ray_origin: vec3<f32>,
     ray_dir: vec3<f32>,
     brick_origin: vec3<f32>,
@@ -91,7 +85,9 @@ fn march_brick(
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var iterations = 0u;
-    let max_brick_iter = 12u;
+    let max_brick_iter = 3u * side;
+    let side_i = i32(side);
+    let side_sq = side * side;
 
     if ENABLE_STATS { atomicAdd(&shader_stats.brick_entries, 1u); }
 
@@ -103,14 +99,14 @@ fn march_brick(
         iterations += 1u;
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
-        if cur_cell.x < 0 || cur_cell.x > 2
-        || cur_cell.y < 0 || cur_cell.y > 2
-        || cur_cell.z < 0 || cur_cell.z > 2 {
+        if cur_cell.x < 0 || cur_cell.x >= side_i
+        || cur_cell.y < 0 || cur_cell.y >= side_i
+        || cur_cell.z < 0 || cur_cell.z >= side_i {
             if ENABLE_STATS { atomicAdd(&shader_stats.brick_no_hits, 1u); }
             return result;
         }
 
-        let slot = u32(cur_cell.x) + u32(cur_cell.y) * 3u + u32(cur_cell.z) * 9u;
+        let slot = u32(cur_cell.x) + u32(cur_cell.y) * side + u32(cur_cell.z) * side_sq;
         let word = tree[brick_data_off + (slot >> 2u)];
         let bt = (word >> ((slot & 3u) * 8u)) & 0xFFu;
 
@@ -155,6 +151,8 @@ fn march_brick(
     return result;
 }
 
+// ───────── march_cartesian ─────────
+
 fn march_cartesian(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
     skip_slot: u32, lid: u32,
@@ -172,9 +170,9 @@ fn march_cartesian(
         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
         select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
     );
-    // After ribbon pops, ray_dir magnitude shrinks (÷3 per pop). LOD
+    // After ribbon pops, ray_dir magnitude shrinks (÷3 per pop); LOD
     // pixel calculations need world-space distances, so scale
-    // side_dist by ray_metric to get actual distance.
+    // side_dist by ray_metric.
     let ray_metric = max(length(ray_dir), 1e-6);
     let step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
@@ -201,20 +199,17 @@ fn march_cartesian(
     var w14 = vec4<f32>(ray_dir * 13.0, 14.0);
     var w15 = vec4<f32>(ray_dir * 14.0, 15.0);
 
-    // All the "stack-slim" scalars (initial values for depth=0).
+    // Stack-slim scalars for the current depth.
     var cur_cell_size: f32 = 1.0;
     var cur_node_origin: vec3<f32> = vec3<f32>(0.0);
     var cur_side_dist: vec3<f32>;
-    // Register-scalar shadows for s_cell / s_node_idx at the current
-    // depth. Mutated every iteration; TG backing store is only
-    // touched on depth transitions.
     var cur_cell: vec3<i32>;
     var cur_node_idx: u32 = root_node_idx;
 
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
-    // Keep waste live — guard never fires but keeps state resident.
+    // Keep the waste state live (guard never fires).
     if w0.x + w1.x + w2.x + w3.x + w4.x + w5.x + w6.x + w7.x
      + w8.x + w9.x + w10.x + w11.x + w12.x + w13.x + w14.x + w15.x > 1e30 {
         return result;
@@ -231,6 +226,42 @@ fn march_cartesian(
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
 
+    // ── root-brick shortcut ─────────────
+    // If the frame root is itself a brick, go straight to march_brick.
+    // The root's brick cell_size depends on its side: side-3 has
+    // cells of size 1 (same as Cartesian at depth 0), side-9 has
+    // cells of size 1/3, side-27 has cells of size 1/9.
+    if (cur_occupancy & BRICK_FLAG_BIT) != 0u {
+        let root_brick_side = brick_side_from_header(cur_occupancy);
+        let root_brick_cell_size = 3.0 / f32(root_brick_side);
+        let root_side_i = i32(root_brick_side);
+        let entry_local = entry_pos;
+        let init_cell = vec3<i32>(
+            clamp(i32(floor(entry_local.x / root_brick_cell_size)), 0, root_side_i - 1),
+            clamp(i32(floor(entry_local.y / root_brick_cell_size)), 0, root_side_i - 1),
+            clamp(i32(floor(entry_local.z / root_brick_cell_size)), 0, root_side_i - 1),
+        );
+        let lc = vec3<f32>(init_cell);
+        let init_side_dist = vec3<f32>(
+            select((lc.x * root_brick_cell_size - entry_local.x) * inv_dir.x,
+                   ((lc.x + 1.0) * root_brick_cell_size - entry_local.x) * inv_dir.x, ray_dir.x >= 0.0),
+            select((lc.y * root_brick_cell_size - entry_local.y) * inv_dir.y,
+                   ((lc.y + 1.0) * root_brick_cell_size - entry_local.y) * inv_dir.y, ray_dir.y >= 0.0),
+            select((lc.z * root_brick_cell_size - entry_local.z) * inv_dir.z,
+                   ((lc.z + 1.0) * root_brick_cell_size - entry_local.z) * inv_dir.z, ray_dir.z >= 0.0),
+        );
+        return march_brick(
+            root_header_off + 2u,
+            root_brick_side,
+            ray_origin, ray_dir,
+            vec3<f32>(0.0), root_brick_cell_size,
+            inv_dir, step, delta_dist,
+            init_cell, init_side_dist,
+        );
+    }
+
+    var cur_first_child: u32 = tree[root_header_off + 1u];
+
     cur_cell = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
         clamp(i32(floor(entry_pos.y)), 0, 2),
@@ -246,23 +277,6 @@ fn march_cartesian(
                (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
     );
 
-    // If the frame root itself is brick-packed, short-circuit the
-    // sparse-descent loop. The root's entry-setup (cur_cell,
-    // cur_side_dist) above is exactly what march_brick needs since
-    // the root brick is at origin (0,0,0) with cell size 1 — the
-    // same coordinate system as the root frame.
-    if (cur_occupancy & BRICK_FLAG_BIT) != 0u {
-        return march_brick(
-            root_header_off + 2u,
-            ray_origin, ray_dir,
-            vec3<f32>(0.0), 1.0,
-            inv_dir, step, delta_dist,
-            cur_cell, cur_side_dist,
-        );
-    }
-
-    var cur_first_child: u32 = tree[root_header_off + 1u];
-
     var iterations = 0u;
     let max_iterations = 2048u;
 
@@ -271,24 +285,15 @@ fn march_cartesian(
         iterations += 1u;
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
+        // Out-of-bounds → pop to parent depth.
         if cur_cell.x < 0 || cur_cell.x > 2 || cur_cell.y < 0 || cur_cell.y > 2 || cur_cell.z < 0 || cur_cell.z > 2 {
             if depth == 0u { break; }
             depth -= 1u;
-            // Restore parent-depth scalars. cur_cell_size ×3 undoes
-            // the descend divide; cur_node_origin subtracts the exact
-            // vec we added on descend (saved parent cell lives in TG
-            // because we wrote it there on descend). Byte-exact — no
-            // accumulated floating-point error.
             cur_cell_size = cur_cell_size * 3.0;
             let parent_base = depth * TG_STRIDE + lid;
-            // Reload parent's saved cell + node into registers.
             cur_cell = s_cell_tg[parent_base];
             cur_node_idx = s_node_idx_tg[parent_base];
             cur_node_origin = cur_node_origin - vec3<f32>(cur_cell) * cur_cell_size;
-            // Recompute cur_side_dist from scratch at the parent
-            // depth. Same formula as the descend-site init — same
-            // entry_pos reference. ~6 FMAs per pop, amortized to
-            // ~free vs. the per-thread register savings.
             let lc_pop = vec3<f32>(cur_cell);
             cur_side_dist = vec3<f32>(
                 select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
@@ -356,222 +361,213 @@ fn march_cartesian(
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
             return result;
-        } else {
-            let child_idx = tree[child_base + 1u];
-
-            let cell_slot = u32(cur_cell.x) + u32(cur_cell.y) * 3u + u32(cur_cell.z) * 9u;
-            if depth == 0u && cell_slot == skip_slot {
-                if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
-                    cur_cell.x += step.x;
-                    cur_side_dist.x += delta_dist.x * cur_cell_size;
-                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if cur_side_dist.y < cur_side_dist.z {
-                    cur_cell.y += step.y;
-                    cur_side_dist.y += delta_dist.y * cur_cell_size;
-                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                } else {
-                    cur_cell.z += step.z;
-                    cur_side_dist.z += delta_dist.z * cur_cell_size;
-                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                }
-                continue;
-            }
-
-            let kind = node_kinds[child_idx].kind;
-
-            if kind == 1u {
-                let body_origin = cur_node_origin + vec3<f32>(cur_cell) * cur_cell_size;
-                let body_size = cur_cell_size;
-                let inner_r = node_kinds[child_idx].inner_r;
-                let outer_r = node_kinds[child_idx].outer_r;
-                let sph = sphere_in_cell(
-                    child_idx, body_origin, body_size,
-                    inner_r, outer_r, ray_origin, ray_dir,
-                );
-                if sph.hit {
-                    return sph;
-                }
-                if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
-                    cur_cell.x += step.x;
-                    cur_side_dist.x += delta_dist.x * cur_cell_size;
-                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if cur_side_dist.y < cur_side_dist.z {
-                    cur_cell.y += step.y;
-                    cur_side_dist.y += delta_dist.y * cur_cell_size;
-                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                } else {
-                    cur_cell.z += step.z;
-                    cur_side_dist.z += delta_dist.z * cur_cell_size;
-                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                }
-                continue;
-            }
-            let child_bt = child_block_type(packed);
-            if child_bt == 255u {
-                if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
-                if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
-                    cur_cell.x += step.x;
-                    cur_side_dist.x += delta_dist.x * cur_cell_size;
-                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if cur_side_dist.y < cur_side_dist.z {
-                    cur_cell.y += step.y;
-                    cur_side_dist.y += delta_dist.y * cur_cell_size;
-                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                } else {
-                    cur_cell.z += step.z;
-                    cur_side_dist.z += delta_dist.z * cur_cell_size;
-                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                }
-                continue;
-            }
-
-            // Stack-safety cap: shader can hold MAX_STACK_DEPTH levels
-            // of parent state in TG memory, so depth cannot exceed
-            // MAX_STACK_DEPTH - 1. Normally the packer force-collapses
-            // at DEFAULT_LOD_LEAF_DEPTH = MAX_STACK_DEPTH - 1, so this
-            // only fires inside preserve-regions where deeper tag=2
-            // subtrees survive the pack-time collapse.
-            let at_stack_cap = depth + 1u >= MAX_STACK_DEPTH;
-            let child_cell_size = cur_cell_size / 3.0;
-            // Per-pixel LOD: terminate if the child cell projects to
-            // less than LOD_PIXEL_THRESHOLD pixels on screen.
-            let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
-            let ray_dist = max(min_side * ray_metric, 0.001);
-            let lod_pixels = child_cell_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
-            let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
-
-            if at_stack_cap || at_lod {
-                if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
-                let bt = child_block_type(packed);
-                if bt == 255u {
-                    if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
-                        cur_cell.x += step.x;
-                        cur_side_dist.x += delta_dist.x * cur_cell_size;
-                        normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                    } else if cur_side_dist.y < cur_side_dist.z {
-                        cur_cell.y += step.y;
-                        cur_side_dist.y += delta_dist.y * cur_cell_size;
-                        normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                    } else {
-                        cur_cell.z += step.z;
-                        cur_side_dist.z += delta_dist.z * cur_cell_size;
-                        normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                    }
-                } else {
-                    let cell_min_l = cur_node_origin + vec3<f32>(cur_cell) * cur_cell_size;
-                    let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
-                    let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
-                    result.hit = true;
-                    result.t = max(cell_box_l.t_enter, 0.0);
-                    result.color = palette.colors[bt].rgb;
-                    result.normal = normal;
-                    result.cell_min = cell_min_l;
-                    result.cell_size = cur_cell_size;
-                    return result;
-                }
-            } else {
-                if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
-
-                let parent_origin = cur_node_origin;
-                let parent_cell_size = cur_cell_size;
-                let child_origin = parent_origin + vec3<f32>(cur_cell) * parent_cell_size;
-
-                // Shared entry-setup for both brick and tree descent.
-                // Computing once (rather than duplicating inside
-                // march_brick) is the critical bit for brick perf —
-                // the 3 divides in local_entry and the vec3 side_dist
-                // init add up to ~50 ALU which dominates short brick
-                // walks otherwise.
-                let child_max = child_origin + vec3<f32>(parent_cell_size);
-                let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);
-                let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
-                let child_entry = ray_origin + ray_dir * ct_start;
-                let local_entry = (child_entry - child_origin) / child_cell_size;
-                let new_cell = vec3<i32>(
-                    clamp(i32(floor(local_entry.x)), 0, 2),
-                    clamp(i32(floor(local_entry.y)), 0, 2),
-                    clamp(i32(floor(local_entry.z)), 0, 2),
-                );
-                let lc = vec3<f32>(new_cell);
-                // Brick path references ray_origin; tree path uses
-                // entry_pos (matches the root init so side_dist values
-                // at different depths share a reference). Two
-                // initializations because the DDA reference for a
-                // brick is self-contained — no relationship to the
-                // outer entry_pos.
-                let new_side_dist_tree = vec3<f32>(
-                    select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
-                           (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                    select((child_origin.y + lc.y * child_cell_size - entry_pos.y) * inv_dir.y,
-                           (child_origin.y + (lc.y + 1.0) * child_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-                    select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
-                           (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
-                );
-
-                // Peek at the child's header to decide between brick
-                // (flat inline DDA, no depth change) and tree (push
-                // parent state + recurse).
-                let child_header_off = node_offsets[child_idx];
-                let child_occ_peek = tree[child_header_off];
-
-                if (child_occ_peek & BRICK_FLAG_BIT) != 0u {
-                    // Brick child: flat DDA inside its 3×3×3, no
-                    // stack push. Hit → return; miss → advance parent
-                    // DDA past this cell same as an empty LOD-terminal
-                    // and continue at current depth.
-                    //
-                    // Reuse `new_side_dist_tree` for the brick's
-                    // initial side_dist: the DDA's axis-choice logic
-                    // (`min(side_dist.x, side_dist.y, side_dist.z)`)
-                    // is invariant under constant offset of the
-                    // reference point, and `side_dist += delta *
-                    // cell_size` per iteration preserves that offset
-                    // as well. Using entry_pos as the brick's
-                    // reference (like the tree) costs nothing and
-                    // shares the vec3-select init — about 18 ALU per
-                    // brick entry saved.
-                    let brick_result = march_brick(
-                        child_header_off + 2u,
-                        ray_origin, ray_dir,
-                        child_origin, child_cell_size,
-                        inv_dir, step, delta_dist,
-                        new_cell, new_side_dist_tree,
-                    );
-                    if brick_result.hit {
-                        return brick_result;
-                    }
-                    if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
-                        cur_cell.x += step.x;
-                        cur_side_dist.x += delta_dist.x * cur_cell_size;
-                        normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                    } else if cur_side_dist.y < cur_side_dist.z {
-                        cur_cell.y += step.y;
-                        cur_side_dist.y += delta_dist.y * cur_cell_size;
-                        normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                    } else {
-                        cur_cell.z += step.z;
-                        cur_side_dist.z += delta_dist.z * cur_cell_size;
-                        normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                    }
-                    continue;
-                }
-
-                // Non-brick child: normal descent. Save parent's cell
-                // + node to TG before pushing the stack.
-                let parent_base = depth * TG_STRIDE + lid;
-                s_cell_tg[parent_base] = cur_cell;
-                s_node_idx_tg[parent_base] = cur_node_idx;
-
-                depth += 1u;
-                cur_node_idx = child_idx;
-                cur_node_origin = child_origin;
-                cur_cell_size = child_cell_size;
-                cur_occupancy = child_occ_peek;
-                cur_first_child = tree[child_header_off + 1u];
-                cur_cell = new_cell;
-                cur_side_dist = new_side_dist_tree;
-            }
         }
+
+        // tag == 2: pointer to a child node.
+        let child_idx = tree[child_base + 1u];
+
+        let cell_slot = u32(cur_cell.x) + u32(cur_cell.y) * 3u + u32(cur_cell.z) * 9u;
+        if depth == 0u && cell_slot == skip_slot {
+            if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                cur_cell.x += step.x;
+                cur_side_dist.x += delta_dist.x * cur_cell_size;
+                normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+            } else if cur_side_dist.y < cur_side_dist.z {
+                cur_cell.y += step.y;
+                cur_side_dist.y += delta_dist.y * cur_cell_size;
+                normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+            } else {
+                cur_cell.z += step.z;
+                cur_side_dist.z += delta_dist.z * cur_cell_size;
+                normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+            }
+            continue;
+        }
+
+        let kind = node_kinds[child_idx].kind;
+
+        // ── sphere body child ──
+        if kind == 1u {
+            let body_origin = cur_node_origin + vec3<f32>(cur_cell) * cur_cell_size;
+            let body_size = cur_cell_size;
+            let inner_r = node_kinds[child_idx].inner_r;
+            let outer_r = node_kinds[child_idx].outer_r;
+            let sph = sphere_in_cell(
+                child_idx, body_origin, body_size,
+                inner_r, outer_r, ray_origin, ray_dir,
+            );
+            if sph.hit { return sph; }
+            if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                cur_cell.x += step.x;
+                cur_side_dist.x += delta_dist.x * cur_cell_size;
+                normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+            } else if cur_side_dist.y < cur_side_dist.z {
+                cur_cell.y += step.y;
+                cur_side_dist.y += delta_dist.y * cur_cell_size;
+                normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+            } else {
+                cur_cell.z += step.z;
+                cur_side_dist.z += delta_dist.z * cur_cell_size;
+                normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+            }
+            continue;
+        }
+
+        // ── stored rep_block sentinel ──
+        // If the stored rep_block is empty (255), the shader treats
+        // this slot as air — advance past without descending.
+        let child_bt = child_block_type(packed);
+        if child_bt == 255u {
+            if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+            if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                cur_cell.x += step.x;
+                cur_side_dist.x += delta_dist.x * cur_cell_size;
+                normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+            } else if cur_side_dist.y < cur_side_dist.z {
+                cur_cell.y += step.y;
+                cur_side_dist.y += delta_dist.y * cur_cell_size;
+                normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+            } else {
+                cur_cell.z += step.z;
+                cur_side_dist.z += delta_dist.z * cur_cell_size;
+                normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+            }
+            continue;
+        }
+
+        // ── LOD + stack-cap terminal ──
+        let child_cell_size = cur_cell_size / 3.0;
+        let at_stack_cap = depth + 1u >= MAX_STACK_DEPTH;
+        let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
+        let ray_dist = max(min_side * ray_metric, 0.001);
+        let lod_pixels = child_cell_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+        let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
+
+        if at_stack_cap || at_lod {
+            if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
+            let cell_min_l = cur_node_origin + vec3<f32>(cur_cell) * cur_cell_size;
+            let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
+            let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
+            result.hit = true;
+            result.t = max(cell_box_l.t_enter, 0.0);
+            result.color = palette.colors[child_bt].rgb;
+            result.normal = normal;
+            result.cell_min = cell_min_l;
+            result.cell_size = cur_cell_size;
+            return result;
+        }
+
+        // ── descent ──
+        if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
+
+        let parent_origin = cur_node_origin;
+        let parent_cell_size = cur_cell_size;
+        let child_origin = parent_origin + vec3<f32>(cur_cell) * parent_cell_size;
+
+        // Peek child header to decide brick vs sparse descent.
+        let child_header_off = node_offsets[child_idx];
+        let child_occ_peek = tree[child_header_off];
+
+        if (child_occ_peek & BRICK_FLAG_BIT) != 0u {
+            // ── brick child ──
+            // Compute the brick's own cell size from its side.
+            let brick_side = brick_side_from_header(child_occ_peek);
+            let brick_cell_size = parent_cell_size / f32(brick_side);
+            let brick_side_i = i32(brick_side);
+
+            // Ray's entry point into the brick (in world-frame coords).
+            // Epsilon uses parent_cell_size (brick total extent) rather
+            // than brick_cell_size so the nudge is proportional to the
+            // geometry the ray_box was computed against. Using
+            // brick_cell_size caused float-precision misalignment for
+            // large sides where brick_cell_size shrinks below the
+            // effective precision of the box intersection.
+            let child_max = child_origin + vec3<f32>(parent_cell_size);
+            let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_max);
+            let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * parent_cell_size;
+            let child_entry = ray_origin + ray_dir * ct_start;
+
+            let local_entry = (child_entry - child_origin) / brick_cell_size;
+            let new_cell_brick = vec3<i32>(
+                clamp(i32(floor(local_entry.x)), 0, brick_side_i - 1),
+                clamp(i32(floor(local_entry.y)), 0, brick_side_i - 1),
+                clamp(i32(floor(local_entry.z)), 0, brick_side_i - 1),
+            );
+            let lc = vec3<f32>(new_cell_brick);
+            // Use entry_pos as the side_dist reference to keep values
+            // consistent with the outer tree DDA (invariant under
+            // constant offset of the reference point).
+            let new_side_dist_brick = vec3<f32>(
+                select((child_origin.x + lc.x * brick_cell_size - entry_pos.x) * inv_dir.x,
+                       (child_origin.x + (lc.x + 1.0) * brick_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                select((child_origin.y + lc.y * brick_cell_size - entry_pos.y) * inv_dir.y,
+                       (child_origin.y + (lc.y + 1.0) * brick_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                select((child_origin.z + lc.z * brick_cell_size - entry_pos.z) * inv_dir.z,
+                       (child_origin.z + (lc.z + 1.0) * brick_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+            );
+
+            let brick_result = march_brick(
+                child_header_off + 2u,
+                brick_side,
+                ray_origin, ray_dir,
+                child_origin, brick_cell_size,
+                inv_dir, step, delta_dist,
+                new_cell_brick, new_side_dist_brick,
+            );
+            if brick_result.hit {
+                return brick_result;
+            }
+            // Brick miss → advance parent DDA past this cell.
+            if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                cur_cell.x += step.x;
+                cur_side_dist.x += delta_dist.x * cur_cell_size;
+                normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
+            } else if cur_side_dist.y < cur_side_dist.z {
+                cur_cell.y += step.y;
+                cur_side_dist.y += delta_dist.y * cur_cell_size;
+                normal = vec3<f32>(0.0, f32(-step.y), 0.0);
+            } else {
+                cur_cell.z += step.z;
+                cur_side_dist.z += delta_dist.z * cur_cell_size;
+                normal = vec3<f32>(0.0, 0.0, f32(-step.z));
+            }
+            continue;
+        }
+
+        // ── sparse-node descent ──
+        // Child is a recursive Cartesian/Sphere/Face node: push parent
+        // state to TG, drop into the child's frame.
+        let child_hit = ray_box(ray_origin, inv_dir, child_origin, child_origin + vec3<f32>(parent_cell_size));
+        let ct_start = max(child_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
+        let child_entry = ray_origin + ray_dir * ct_start;
+        let local_entry = (child_entry - child_origin) / child_cell_size;
+        let new_cell = vec3<i32>(
+            clamp(i32(floor(local_entry.x)), 0, 2),
+            clamp(i32(floor(local_entry.y)), 0, 2),
+            clamp(i32(floor(local_entry.z)), 0, 2),
+        );
+        let lc = vec3<f32>(new_cell);
+        let new_side_dist = vec3<f32>(
+            select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
+                   (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+            select((child_origin.y + lc.y * child_cell_size - entry_pos.y) * inv_dir.y,
+                   (child_origin.y + (lc.y + 1.0) * child_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+            select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
+                   (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+        );
+
+        let parent_base = depth * TG_STRIDE + lid;
+        s_cell_tg[parent_base] = cur_cell;
+        s_node_idx_tg[parent_base] = cur_node_idx;
+
+        depth += 1u;
+        cur_node_idx = child_idx;
+        cur_node_origin = child_origin;
+        cur_cell_size = child_cell_size;
+        cur_occupancy = child_occ_peek;
+        cur_first_child = tree[child_header_off + 1u];
+        cur_cell = new_cell;
+        cur_side_dist = new_side_dist;
     }
 
     return result;

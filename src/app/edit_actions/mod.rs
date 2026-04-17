@@ -221,6 +221,9 @@ impl App {
                 | Some(NodeKind::CubedSphereFace { .. }) => {
                     node_id = child_id;
                 }
+                // Brick children have no recursive descent — the path
+                // walk terminates at the brick node itself.
+                Some(NodeKind::Brick) => break,
                 None => break,
             }
         }

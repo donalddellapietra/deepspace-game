@@ -51,15 +51,31 @@ pub struct GpuNodeKind {
     pub outer_r: f32,
 }
 
+/// Shader-side NodeKind discriminant. Keep in sync with the
+/// `node_kinds[].kind` dispatch in `march.wgsl`.
+pub const GPU_NODE_KIND_CARTESIAN: u32 = 0;
+pub const GPU_NODE_KIND_SPHERE_BODY: u32 = 1;
+pub const GPU_NODE_KIND_SPHERE_FACE: u32 = 2;
+pub const GPU_NODE_KIND_BRICK: u32 = 3;
+
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
+            NodeKind::Cartesian => Self {
+                kind: GPU_NODE_KIND_CARTESIAN,
+                face: 0, inner_r: 0.0, outer_r: 0.0,
+            },
             NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
-                kind: 1, face: 0, inner_r, outer_r,
+                kind: GPU_NODE_KIND_SPHERE_BODY,
+                face: 0, inner_r, outer_r,
             },
             NodeKind::CubedSphereFace { face } => Self {
-                kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
+                kind: GPU_NODE_KIND_SPHERE_FACE,
+                face: face as u32, inner_r: 0.0, outer_r: 0.0,
+            },
+            NodeKind::Brick => Self {
+                kind: GPU_NODE_KIND_BRICK,
+                face: 0, inner_r: 0.0, outer_r: 0.0,
             },
         }
     }
