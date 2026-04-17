@@ -480,6 +480,53 @@ TLP.
   know whether there's a meaningful TLP win to chase. Currently seems
   unreachable without compute shader + threadgroup memory.
 
+## s_cell pack into u32 (tried — null, but informative)
+
+Packed `s_cell: array<vec3<i32>, 5>` into `array<u32, 5>` using 8-bit
+signed fields per axis (pack_cell / unpack_cell helpers in ray_prim.wgsl).
+Expected ~40 B state reduction to cross Apple's 256 B tier edge.
+
+Slow-soldier, 1 run:
+
+| metric | baseline | +pack |
+|---|---|---|
+| submitted_done_ms | 6.39 | **6.35** (inside noise) |
+| Fragment Occupancy (mean) | 12.98% | 12.05% (**went DOWN**) |
+| ALU Utilization (mean) | 32.96% | **38.12%** (+5 pp) |
+| Buffer Read Limiter | 2.89% | 1.27% (−1.6 pp) |
+| Buffer Store Limiter | 2.90% | **0.09%** (~30× reduction) |
+
+**The change DID materialize in memory-traffic counters** — Buffer
+Store Limiter dropping from 2.90% → 0.09% confirms the vec3<i32>
+array was being spilled to thread-local memory, and the u32 version
+keeps it in registers. ALU Utilization rose 5 pp because previous
+idle cycles (waiting on those spills) are now filled.
+
+**But occupancy went DOWN**, not up. And wall-clock didn't move. The
+hypothesis that we'd cross a tier was wrong — the pack/unpack
+temporaries added enough register pressure to offset the array
+reduction, AND the pack/unpack ALU cost roughly equals the saved
+memory-traffic time. Net zero.
+
+**Key lesson:** The "60 B vec3<i32> stack" I was counting was
+apparently already in thread-local memory, not registers. Moving it
+to a u32 array traded "40 B of spill space" for "14 ops of pack/unpack
+per iter." The register-allocator view of state didn't actually shrink.
+
+**What to do next:** The cuts that target genuinely register-resident
+state (normal inner-loop writes, HitResult hoist) are more promising.
+Pack-cell is a dead end because it didn't move register budget — it
+moved spill-vs-compute tradeoff.
+
+**Process note (directory confusion):** First measurement after
+the pack change showed 86 ms (14× regression!). This was caused by
+running `cargo build` from the main repo directory (on a different
+branch without any stack-scalar optimizations), not from the worktree.
+The "regression" was comparing to a completely different shader. After
+rebuilding the correct binary from the worktree, actual delta was
+negligible. Lesson: always verify `pwd` before running a measurement,
+especially when using worktrees.
+
 ## LOD tuning (tried — null)
 
 Runtime flag `--lod-pixels 2.0` doubled the sub-pixel-rejection
