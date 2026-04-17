@@ -1,19 +1,33 @@
 // Inner DDA: march within a single frame rooted at `root_node_idx`.
-// Per-depth stack state lives in workgroup (threadgroup) memory,
-// hoisted out of the register file to raise Apple Silicon occupancy.
 //
-// Layout: depth-major stride by `TG_STRIDE` (= @workgroup_size.x *
-// @workgroup_size.y = 64) so adjacent threads in a SIMD group read
-// consecutive banks. Slot for thread `lid` at stack depth `depth`:
-//   index = depth * TG_STRIDE + lid
+// Per-depth state is split across three storage classes, chosen by
+// how the state changes with depth:
 //
-// Budget: MAX_STACK_DEPTH * TG_STRIDE = 5 * 64 = 320 slots.
-//   s_node_idx_tg:    320 × u32       =  1280 B
-//   s_cell_tg:        320 × vec3<i32> =  5120 B (16-byte aligned)
-//   s_side_dist_tg:   320 × vec3<f32> =  5120 B
-//   s_node_origin_tg: 320 × vec3<f32> =  5120 B
-//   s_cell_size_tg:   320 × f32       =  1280 B
-//                                    = 17920 B / workgroup
+//   register scalars — `cur_cell_size`, `cur_node_origin`, `cur_side_dist`:
+//     mutated on every descend/pop but uniquely derivable from the
+//     current depth alone. Maintaining a single scalar and updating
+//     it on transition is equivalent to a per-depth array but uses
+//     one register slot per field instead of MAX_STACK_DEPTH slots.
+//     Matches the occupancy-stack-slim branch's trick: these three
+//     fields are recoverable on pop (cell_size ×3, node_origin
+//     subtracts the descend contribution, side_dist recomputed in
+//     ~6 FMAs from entry_pos).
+//
+//   workgroup memory (this file's `s_*_tg` arrays) — `s_cell`, `s_node_idx`:
+//     `s_cell` advances per-iteration in the CURRENT depth's slot
+//     while staying pinned at parent depths (so parents can recover
+//     their own state on pop). `s_node_idx` is read on OOB pop to
+//     refresh the tree header. Neither can be replaced by a scalar
+//     plus math — they're genuinely stateful per depth.
+//
+// Workgroup budget: MAX_STACK_DEPTH * TG_STRIDE slots × (16 B cell +
+//  4 B node_idx) = 5 * 64 * 20 = 6400 B / workgroup. Well under the
+// 32 KB pool so multiple workgroups share a core.
+//
+// Addressing: depth-major stride by TG_STRIDE (= @workgroup_size.x *
+// @workgroup_size.y = 64) so adjacent threads in a SIMD group hit
+// consecutive banks. Slot for thread `lid` at depth `d`:
+//   index = d * TG_STRIDE + lid
 
 #include "tree.wgsl"
 #include "ray_prim.wgsl"
@@ -22,11 +36,8 @@
 const TG_STRIDE: u32 = 64u;  // matches @workgroup_size(8, 8, 1)
 const TG_SLOTS: u32 = TG_STRIDE * MAX_STACK_DEPTH;
 
-var<workgroup> s_node_idx_tg:    array<u32,       TG_SLOTS>;
-var<workgroup> s_cell_tg:        array<vec3<i32>, TG_SLOTS>;
-var<workgroup> s_side_dist_tg:   array<vec3<f32>, TG_SLOTS>;
-var<workgroup> s_node_origin_tg: array<vec3<f32>, TG_SLOTS>;
-var<workgroup> s_cell_size_tg:   array<f32,       TG_SLOTS>;
+var<workgroup> s_node_idx_tg: array<u32,       TG_SLOTS>;
+var<workgroup> s_cell_tg:     array<vec3<i32>, TG_SLOTS>;
 
 fn march_cartesian(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
@@ -45,6 +56,9 @@ fn march_cartesian(
         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
         select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
     );
+    // After ribbon pops, ray_dir magnitude shrinks (÷3 per pop). LOD
+    // pixel calculations need world-space distances, so scale
+    // side_dist by ray_metric to get actual distance.
     let ray_metric = max(length(ray_dir), 1e-6);
     let step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
@@ -53,12 +67,16 @@ fn march_cartesian(
     );
     let delta_dist = abs(inv_dir);
 
+    // Scalar stack fields — see module docstring. Initialised for
+    // depth=0 here; updated on descend/pop below.
+    var cur_cell_size: f32 = 1.0;
+    var cur_node_origin: vec3<f32> = vec3<f32>(0.0);
+    var cur_side_dist: vec3<f32>;
+
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
     s_node_idx_tg[0u * TG_STRIDE + lid] = root_node_idx;
-    s_node_origin_tg[0u * TG_STRIDE + lid] = vec3<f32>(0.0);
-    s_cell_size_tg[0u * TG_STRIDE + lid] = 1.0;
 
     let root_header_off = node_offsets[root_node_idx];
     var cur_occupancy: u32 = tree[root_header_off];
@@ -79,7 +97,7 @@ fn march_cartesian(
     );
     s_cell_tg[0u * TG_STRIDE + lid] = entry_cell;
     let cell_f = vec3<f32>(entry_cell);
-    s_side_dist_tg[0u * TG_STRIDE + lid] = vec3<f32>(
+    cur_side_dist = vec3<f32>(
         select((cell_f.x - entry_pos.x) * inv_dir.x,
                (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
         select((cell_f.y - entry_pos.y) * inv_dir.y,
@@ -98,37 +116,53 @@ fn march_cartesian(
 
         let depth_base = depth * TG_STRIDE + lid;
         let cell = s_cell_tg[depth_base];
-        let side_dist = s_side_dist_tg[depth_base];
-        let cell_size = s_cell_size_tg[depth_base];
 
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
             depth -= 1u;
+            // Restore parent-depth scalars. cur_cell_size ×3 undoes
+            // the descend divide; cur_node_origin subtracts the exact
+            // vec we added on descend (s_cell[parent_depth] was
+            // preserved while we were inside the child, so this is
+            // byte-exact — no accumulated floating-point error).
+            cur_cell_size = cur_cell_size * 3.0;
+            let parent_base = depth * TG_STRIDE + lid;
+            let parent_cell = s_cell_tg[parent_base];
+            cur_node_origin = cur_node_origin - vec3<f32>(parent_cell) * cur_cell_size;
+            // Recompute cur_side_dist from scratch at the parent
+            // depth. Same formula as the descend-site init, same
+            // entry_pos reference. ~6 FMAs per pop, amortized to
+            // ~free vs. the per-thread register savings.
+            let lc_pop = vec3<f32>(parent_cell);
+            cur_side_dist = vec3<f32>(
+                select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
+                       (cur_node_origin.x + (lc_pop.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                select((cur_node_origin.y + lc_pop.y * cur_cell_size - entry_pos.y) * inv_dir.y,
+                       (cur_node_origin.y + (lc_pop.y + 1.0) * cur_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                select((cur_node_origin.z + lc_pop.z * cur_cell_size - entry_pos.z) * inv_dir.z,
+                       (cur_node_origin.z + (lc_pop.z + 1.0) * cur_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+            );
             if ENABLE_STATS { ray_steps_oob = ray_steps_oob + 1u; }
 
-            let new_base = depth * TG_STRIDE + lid;
-            let parent_header_off = node_offsets[s_node_idx_tg[new_base]];
+            let parent_header_off = node_offsets[s_node_idx_tg[parent_base]];
             cur_occupancy = tree[parent_header_off];
             cur_first_child = tree[parent_header_off + 1u];
 
-            var sd = s_side_dist_tg[new_base];
-            let cs = s_cell_size_tg[new_base];
-            var cl = s_cell_tg[new_base];
-            if sd.x < sd.y && sd.x < sd.z {
-                cl.x += step.x;
-                sd.x += delta_dist.x * cs;
+            var new_cell = parent_cell;
+            if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                new_cell.x += step.x;
+                cur_side_dist.x += delta_dist.x * cur_cell_size;
                 normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-            } else if sd.y < sd.z {
-                cl.y += step.y;
-                sd.y += delta_dist.y * cs;
+            } else if cur_side_dist.y < cur_side_dist.z {
+                new_cell.y += step.y;
+                cur_side_dist.y += delta_dist.y * cur_cell_size;
                 normal = vec3<f32>(0.0, f32(-step.y), 0.0);
             } else {
-                cl.z += step.z;
-                sd.z += delta_dist.z * cs;
+                new_cell.z += step.z;
+                cur_side_dist.z += delta_dist.z * cur_cell_size;
                 normal = vec3<f32>(0.0, 0.0, f32(-step.z));
             }
-            s_cell_tg[new_base] = cl;
-            s_side_dist_tg[new_base] = sd;
+            s_cell_tg[parent_base] = new_cell;
             continue;
         }
 
@@ -136,23 +170,21 @@ fn march_cartesian(
         let slot_bit = 1u << slot;
         if ((cur_occupancy & slot_bit) == 0u) {
             if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
-            var cl = cell;
-            var sd = side_dist;
-            if sd.x < sd.y && sd.x < sd.z {
-                cl.x += step.x;
-                sd.x += delta_dist.x * cell_size;
+            var new_cell = cell;
+            if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                new_cell.x += step.x;
+                cur_side_dist.x += delta_dist.x * cur_cell_size;
                 normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-            } else if sd.y < sd.z {
-                cl.y += step.y;
-                sd.y += delta_dist.y * cell_size;
+            } else if cur_side_dist.y < cur_side_dist.z {
+                new_cell.y += step.y;
+                cur_side_dist.y += delta_dist.y * cur_cell_size;
                 normal = vec3<f32>(0.0, f32(-step.y), 0.0);
             } else {
-                cl.z += step.z;
-                sd.z += delta_dist.z * cell_size;
+                new_cell.z += step.z;
+                cur_side_dist.z += delta_dist.z * cur_cell_size;
                 normal = vec3<f32>(0.0, 0.0, f32(-step.z));
             }
-            s_cell_tg[depth_base] = cl;
-            s_side_dist_tg[depth_base] = sd;
+            s_cell_tg[depth_base] = new_cell;
             continue;
         }
 
@@ -162,48 +194,44 @@ fn march_cartesian(
         let tag = packed & 0xFFu;
 
         if tag == 1u {
-            let node_origin = s_node_origin_tg[depth_base];
-            let cell_min_h = node_origin + vec3<f32>(cell) * cell_size;
-            let cell_max_h = cell_min_h + vec3<f32>(cell_size);
+            let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+            let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
             result.hit = true;
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette.colors[(packed >> 8u) & 0xFFu].rgb;
             result.normal = normal;
             result.cell_min = cell_min_h;
-            result.cell_size = cell_size;
+            result.cell_size = cur_cell_size;
             return result;
         } else {
             let child_idx = tree[child_base + 1u];
 
             let cell_slot = u32(cell.x) + u32(cell.y) * 3u + u32(cell.z) * 9u;
             if depth == 0u && cell_slot == skip_slot {
-                var cl = cell;
-                var sd = side_dist;
-                if sd.x < sd.y && sd.x < sd.z {
-                    cl.x += step.x;
-                    sd.x += delta_dist.x * cell_size;
+                var new_cell = cell;
+                if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                    new_cell.x += step.x;
+                    cur_side_dist.x += delta_dist.x * cur_cell_size;
                     normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if sd.y < sd.z {
-                    cl.y += step.y;
-                    sd.y += delta_dist.y * cell_size;
+                } else if cur_side_dist.y < cur_side_dist.z {
+                    new_cell.y += step.y;
+                    cur_side_dist.y += delta_dist.y * cur_cell_size;
                     normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                 } else {
-                    cl.z += step.z;
-                    sd.z += delta_dist.z * cell_size;
+                    new_cell.z += step.z;
+                    cur_side_dist.z += delta_dist.z * cur_cell_size;
                     normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                 }
-                s_cell_tg[depth_base] = cl;
-                s_side_dist_tg[depth_base] = sd;
+                s_cell_tg[depth_base] = new_cell;
                 continue;
             }
 
             let kind = node_kinds[child_idx].kind;
 
             if kind == 1u {
-                let node_origin = s_node_origin_tg[depth_base];
-                let body_origin = node_origin + vec3<f32>(cell) * cell_size;
-                let body_size = cell_size;
+                let body_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                let body_size = cur_cell_size;
                 let inner_r = node_kinds[child_idx].inner_r;
                 let outer_r = node_kinds[child_idx].outer_r;
                 let sph = sphere_in_cell(
@@ -213,52 +241,48 @@ fn march_cartesian(
                 if sph.hit {
                     return sph;
                 }
-                var cl = cell;
-                var sd = side_dist;
-                if sd.x < sd.y && sd.x < sd.z {
-                    cl.x += step.x;
-                    sd.x += delta_dist.x * cell_size;
+                var new_cell = cell;
+                if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                    new_cell.x += step.x;
+                    cur_side_dist.x += delta_dist.x * cur_cell_size;
                     normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if sd.y < sd.z {
-                    cl.y += step.y;
-                    sd.y += delta_dist.y * cell_size;
+                } else if cur_side_dist.y < cur_side_dist.z {
+                    new_cell.y += step.y;
+                    cur_side_dist.y += delta_dist.y * cur_cell_size;
                     normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                 } else {
-                    cl.z += step.z;
-                    sd.z += delta_dist.z * cell_size;
+                    new_cell.z += step.z;
+                    cur_side_dist.z += delta_dist.z * cur_cell_size;
                     normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                 }
-                s_cell_tg[depth_base] = cl;
-                s_side_dist_tg[depth_base] = sd;
+                s_cell_tg[depth_base] = new_cell;
                 continue;
             }
             let child_bt = child_block_type(packed);
             if child_bt == 255u {
                 if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
-                var cl = cell;
-                var sd = side_dist;
-                if sd.x < sd.y && sd.x < sd.z {
-                    cl.x += step.x;
-                    sd.x += delta_dist.x * cell_size;
+                var new_cell = cell;
+                if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                    new_cell.x += step.x;
+                    cur_side_dist.x += delta_dist.x * cur_cell_size;
                     normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if sd.y < sd.z {
-                    cl.y += step.y;
-                    sd.y += delta_dist.y * cell_size;
+                } else if cur_side_dist.y < cur_side_dist.z {
+                    new_cell.y += step.y;
+                    cur_side_dist.y += delta_dist.y * cur_cell_size;
                     normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                 } else {
-                    cl.z += step.z;
-                    sd.z += delta_dist.z * cell_size;
+                    new_cell.z += step.z;
+                    cur_side_dist.z += delta_dist.z * cur_cell_size;
                     normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                 }
-                s_cell_tg[depth_base] = cl;
-                s_side_dist_tg[depth_base] = sd;
+                s_cell_tg[depth_base] = new_cell;
                 continue;
             }
 
             let at_max = depth + 1u > depth_limit || depth + 1u >= MAX_STACK_DEPTH;
-            let child_cell_size = cell_size / 3.0;
+            let child_cell_size = cur_cell_size / 3.0;
             let cell_world_size = child_cell_size;
-            let min_side = min(side_dist.x, min(side_dist.y, side_dist.z));
+            let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
             let ray_dist = max(min_side * ray_metric, 0.001);
             let lod_pixels = cell_world_size / ray_dist * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
             let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
@@ -267,40 +291,37 @@ fn march_cartesian(
                 if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
                 let bt = child_block_type(packed);
                 if bt == 255u {
-                    var cl = cell;
-                    var sd = side_dist;
-                    if sd.x < sd.y && sd.x < sd.z {
-                        cl.x += step.x;
-                        sd.x += delta_dist.x * cell_size;
+                    var new_cell = cell;
+                    if cur_side_dist.x < cur_side_dist.y && cur_side_dist.x < cur_side_dist.z {
+                        new_cell.x += step.x;
+                        cur_side_dist.x += delta_dist.x * cur_cell_size;
                         normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                    } else if sd.y < sd.z {
-                        cl.y += step.y;
-                        sd.y += delta_dist.y * cell_size;
+                    } else if cur_side_dist.y < cur_side_dist.z {
+                        new_cell.y += step.y;
+                        cur_side_dist.y += delta_dist.y * cur_cell_size;
                         normal = vec3<f32>(0.0, f32(-step.y), 0.0);
                     } else {
-                        cl.z += step.z;
-                        sd.z += delta_dist.z * cell_size;
+                        new_cell.z += step.z;
+                        cur_side_dist.z += delta_dist.z * cur_cell_size;
                         normal = vec3<f32>(0.0, 0.0, f32(-step.z));
                     }
-                    s_cell_tg[depth_base] = cl;
-                    s_side_dist_tg[depth_base] = sd;
+                    s_cell_tg[depth_base] = new_cell;
                 } else {
-                    let node_origin = s_node_origin_tg[depth_base];
-                    let cell_min_l = node_origin + vec3<f32>(cell) * cell_size;
-                    let cell_max_l = cell_min_l + vec3<f32>(cell_size);
+                    let cell_min_l = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                    let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
                     result.color = palette.colors[bt].rgb;
                     result.normal = normal;
                     result.cell_min = cell_min_l;
-                    result.cell_size = cell_size;
+                    result.cell_size = cur_cell_size;
                     return result;
                 }
             } else {
                 if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
-                let parent_origin = s_node_origin_tg[depth_base];
-                let parent_cell_size = cell_size;
+                let parent_origin = cur_node_origin;
+                let parent_cell_size = cur_cell_size;
                 let child_origin = parent_origin + vec3<f32>(cell) * parent_cell_size;
 
                 let child_max = child_origin + vec3<f32>(parent_cell_size);
@@ -312,8 +333,8 @@ fn march_cartesian(
                 depth += 1u;
                 let new_base = depth * TG_STRIDE + lid;
                 s_node_idx_tg[new_base] = child_idx;
-                s_node_origin_tg[new_base] = child_origin;
-                s_cell_size_tg[new_base] = child_cell_size;
+                cur_node_origin = child_origin;
+                cur_cell_size = child_cell_size;
                 let child_header_off = node_offsets[child_idx];
                 cur_occupancy = tree[child_header_off];
                 cur_first_child = tree[child_header_off + 1u];
@@ -324,13 +345,22 @@ fn march_cartesian(
                 );
                 s_cell_tg[new_base] = new_cell;
                 let lc = vec3<f32>(new_cell);
-                s_side_dist_tg[new_base] = vec3<f32>(
-                    select((child_origin.x + lc.x * child_cell_size - ray_origin.x) * inv_dir.x,
-                           (child_origin.x + (lc.x + 1.0) * child_cell_size - ray_origin.x) * inv_dir.x, ray_dir.x >= 0.0),
-                    select((child_origin.y + lc.y * child_cell_size - ray_origin.y) * inv_dir.y,
-                           (child_origin.y + (lc.y + 1.0) * child_cell_size - ray_origin.y) * inv_dir.y, ray_dir.y >= 0.0),
-                    select((child_origin.z + lc.z * child_cell_size - ray_origin.z) * inv_dir.z,
-                           (child_origin.z + (lc.z + 1.0) * child_cell_size - ray_origin.z) * inv_dir.z, ray_dir.z >= 0.0),
+                // Use `entry_pos` as the reference (matching the root
+                // init). In the baseline stacked version the root used
+                // entry_pos and descent used ray_origin — that meant
+                // side_dist values at different depths were offset by
+                // t_start from each other. With a single scalar we
+                // pick one reference; entry_pos keeps root behavior
+                // byte-exact and shifts descent values by -t_start
+                // (typically <0.001 when the camera is inside the
+                // root box, negligible for the LOD-pixel check).
+                cur_side_dist = vec3<f32>(
+                    select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
+                           (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                    select((child_origin.y + lc.y * child_cell_size - entry_pos.y) * inv_dir.y,
+                           (child_origin.y + (lc.y + 1.0) * child_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                    select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
+                           (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
                 );
             }
         }
