@@ -34,17 +34,26 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     result.depth = 1u;
 
     let fs = face_slot(face);
-    if child_empty(body_node_idx, fs) {
+    // Scalar-cache the body node's header: one load pair instead of
+    // three (child_empty + child_packed + child_node_index each
+    // re-read tree[h], tree[h+1] independently).
+    let body_header_off = node_offsets[body_node_idx];
+    let body_occupancy = tree[body_header_off];
+    let body_first_child = tree[body_header_off + 1u];
+    let body_bit = 1u << fs;
+    if (body_occupancy & body_bit) == 0u {
         result.block = 0u;
         return result;
     }
-    let face_packed = child_packed(body_node_idx, fs);
-    let face_tag = child_tag(face_packed);
+    let body_rank = countOneBits(body_occupancy & (body_bit - 1u));
+    let body_child_base = body_first_child + body_rank * 2u;
+    let face_packed = tree[body_child_base];
+    let face_tag = face_packed & 0xFFu;
     if face_tag == 1u {
-        result.block = child_block_type(face_packed);
+        result.block = (face_packed >> 8u) & 0xFFu;
         return result;
     }
-    var node = child_node_index(body_node_idx, fs);
+    var node = tree[body_child_base + 1u];
     var un = clamp(un_in, 0.0, 0.9999999);
     var vn = clamp(vn_in, 0.0, 0.9999999);
     var rn = clamp(rn_in, 0.0, 0.9999999);
@@ -57,7 +66,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
     let limit = min(depth_limit, MAX_FACE_DEPTH);
     if limit <= 1u {
-        let bt = child_block_type(face_packed);
+        let bt = (face_packed >> 8u) & 0xFFu;
         result.block = select(0u, bt, bt != 255u);
         return result;
     }
@@ -66,8 +75,18 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
-        let packed = child_packed(node, slot);
-        let tag = child_tag(packed);
+        // Scalar-cache node header: one rank, one packed load, one
+        // node_index load — all reusing the same (occupancy,
+        // first_child) locals.
+        let header_off = node_offsets[node];
+        let occupancy = tree[header_off];
+        let first_child = tree[header_off + 1u];
+        let bit = 1u << slot;
+        let occupied = (occupancy & bit) != 0u;
+        let rank = countOneBits(occupancy & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = select(0u, tree[child_base], occupied);
+        let tag = packed & 0xFFu;
 
         // Boundary update: this step's child within the parent
         // contributes (size/3) * slot to the lo-bound, and shrinks
@@ -95,7 +114,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
         size = step_size;
 
         if tag == 0u || tag == 1u {
-            result.block = select(0u, child_block_type(packed), tag == 1u);
+            result.block = select(0u, (packed >> 8u) & 0xFFu, tag == 1u);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
             result.v_lo = v_sum + v_comp;
@@ -104,7 +123,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
             return result;
         }
         if d >= limit {
-            let bt = child_block_type(packed);
+            let bt = (packed >> 8u) & 0xFFu;
             result.block = select(0u, bt, bt != 255u);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
@@ -113,7 +132,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
             result.size = size;
             return result;
         }
-        node = child_node_index(node, slot);
+        node = tree[child_base + 1u];
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
@@ -142,15 +161,23 @@ fn sample_face_node(node_idx: u32,
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
-        if child_empty(node, slot) {
+        // Scalar-cache header: single rank computation reused for
+        // packed + node_index loads.
+        let header_off = node_offsets[node];
+        let occupancy = tree[header_off];
+        let bit = 1u << slot;
+        if (occupancy & bit) == 0u {
             return vec2<u32>(0u, d);
         }
-        let packed = child_packed(node, slot);
-        let tag = child_tag(packed);
+        let first_child = tree[header_off + 1u];
+        let rank = countOneBits(occupancy & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
         if tag == 1u {
-            return vec2<u32>(child_block_type(packed), d);
+            return vec2<u32>((packed >> 8u) & 0xFFu, d);
         }
-        node = child_node_index(node, slot);
+        node = tree[child_base + 1u];
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
@@ -185,8 +212,17 @@ fn walk_face_node(node_idx: u32,
         let vs = min(u32(vn * 3.0), 2u);
         let rs = min(u32(rn * 3.0), 2u);
         let slot = rs * 9u + vs * 3u + us;
-        let packed = child_packed(node, slot);
-        let tag = child_tag(packed);
+        // Scalar-cache header: single rank computation reused for
+        // packed + node_index loads.
+        let header_off = node_offsets[node];
+        let occupancy = tree[header_off];
+        let first_child = tree[header_off + 1u];
+        let bit = 1u << slot;
+        let occupied = (occupancy & bit) != 0u;
+        let rank = countOneBits(occupancy & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = select(0u, tree[child_base], occupied);
+        let tag = packed & 0xFFu;
 
         let step_size = size * (1.0 / 3.0);
         u_lo = u_lo + step_size * f32(us);
@@ -195,7 +231,7 @@ fn walk_face_node(node_idx: u32,
         size = step_size;
 
         if tag == 0u || tag == 1u {
-            result.block = select(0u, child_block_type(packed), tag == 1u);
+            result.block = select(0u, (packed >> 8u) & 0xFFu, tag == 1u);
             result.depth = d;
             result.u_lo = u_lo;
             result.v_lo = v_lo;
@@ -210,7 +246,7 @@ fn walk_face_node(node_idx: u32,
         let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
         let at_max = d >= uniforms.max_depth;
         if at_lod || at_max {
-            let bt = child_block_type(packed);
+            let bt = (packed >> 8u) & 0xFFu;
             result.block = select(0u, bt, bt != 255u);
             result.depth = d;
             result.u_lo = u_lo;
@@ -220,7 +256,7 @@ fn walk_face_node(node_idx: u32,
             return result;
         }
 
-        node = child_node_index(node, slot);
+        node = tree[child_base + 1u];
         un = un * 3.0 - f32(us);
         vn = vn * 3.0 - f32(vs);
         rn = rn * 3.0 - f32(rs);
