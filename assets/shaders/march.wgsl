@@ -228,36 +228,6 @@ fn march_cartesian(
                 }
                 continue;
             }
-            if false {
-                // Real path (re-enable after diagnostic confirms dispatch):
-                let body_origin = s_node_origin[depth] + vec3<f32>(cell) * s_cell_size[depth];
-                let body_size = s_cell_size[depth];
-                let inner_r = node_kinds[child_idx].inner_r;
-                let outer_r = node_kinds[child_idx].outer_r;
-                let sph = sphere_in_cell(
-                    child_idx, body_origin, body_size,
-                    inner_r, outer_r, ray_origin, ray_dir,
-                );
-                if sph.hit {
-                    return sph;
-                }
-                // Sphere missed — advance Cartesian DDA past this cell.
-                if s_side_dist[depth].x < s_side_dist[depth].y && s_side_dist[depth].x < s_side_dist[depth].z {
-                    s_cell[depth].x += step.x;
-                    s_side_dist[depth].x += delta_dist.x * s_cell_size[depth];
-                    normal = vec3<f32>(f32(-step.x), 0.0, 0.0);
-                } else if s_side_dist[depth].y < s_side_dist[depth].z {
-                    s_cell[depth].y += step.y;
-                    s_side_dist[depth].y += delta_dist.y * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, f32(-step.y), 0.0);
-                } else {
-                    s_cell[depth].z += step.z;
-                    s_side_dist[depth].z += delta_dist.z * s_cell_size[depth];
-                    normal = vec3<f32>(0.0, 0.0, f32(-step.z));
-                }
-                continue;
-            }
-
             // Empty-representative fast path: when the packed
             // child's representative_block is 255, the subtree has
             // no non-empty content (either uniform-empty deeper in
