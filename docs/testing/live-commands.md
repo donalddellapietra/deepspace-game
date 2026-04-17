@@ -1,79 +1,87 @@
-# Useful Live Commands
+# Useful Commands
 
-Commands for interactive exploration (GUI window, mouse/keyboard input). Paste each as a single line — shell line-wrapping can split `--flag value` pairs and break things.
+Paste each as one line. Shell line-wrapping can split `--flag value` pairs and break things.
 
-For automated harness testing (headless, perf gates, screenshots) see [cookbook.md](cookbook.md) instead.
+## Live GUI
 
-## Prerequisite
-
-`scripts/dev.sh` forwards its arguments to the game binary (after starting the Vite overlay in the background). This means any `--flag` that the binary accepts also works on the dev script:
+`scripts/dev.sh` forwards `"$@"` to the binary. Any game flag works:
 
 ```bash
-scripts/dev.sh <flags>
+scripts/dev.sh                                                      # plain world, default spawn
+scripts/dev.sh --sphere-world                                       # planet demo
+scripts/dev.sh --menger-world --plain-layers 15 --lod-base-depth 20 # ternary fractal
 ```
 
-## Menger sponge (fractal stress test)
+`--lod-base-depth 20` disables the ribbon-level budget decay (pixel Nyquist still applies — the shader won't render sub-pixel detail).
 
-The Menger sponge is a ternary fractal — 20 of 27 children non-empty per level — useful for stressing the renderer with content that can't be uniform-collapsed by the packer.
+### With stats in the terminal
+
+Append `--shader-stats --live-sample-every 60` to any live command. `renderer_slow` fires on any >30 ms frame; `render_live_sample` prints CPU phase timings every N frames.
+
+### Flags that cause auto-exit in live mode
+
+These trigger test-runner mode (exits after 120 frames): `--render-harness`, `--screenshot`, `--script`, `--spawn-xyz`, `--spawn-depth`, `--spawn-yaw`, `--spawn-pitch`, `--exit-after-frames`, `--run-for-secs`, `--min-fps`. Use them only in harness commands below, or add `--run-for-secs 3600 --timeout-secs 3600` if you want them in an interactive session.
+
+## Headless benchmarks (harness)
+
+The harness runs offscreen, no vsync, reports pure GPU time. Use this — not the live loop — for perf measurement.
+
+### Single run
 
 ```bash
-scripts/dev.sh --menger-world --plain-layers 15 --lod-base-depth 20
+timeout 12 cargo run --bin deepspace-game --quiet -- --render-harness --plain-world --spawn-depth 8 --spawn-pitch -1.0 --harness-width 1920 --harness-height 1080 --exit-after-frames 120 --timeout-secs 12 --suppress-startup-logs --shader-stats 2>&1 | grep -E "render_harness_timing|render_harness_shader"
 ```
 
-- `--menger-world` — selects the preset.
-- `--plain-layers 15` — sponge depth (15 gives fully interactive, visible detail down to small scales).
-- `--lod-base-depth 20` — effectively disables the ribbon-level budget decay (the shader clamps to `MAX_STACK_DEPTH=5` regardless, and pixel-size Nyquist still stops sub-pixel descent). Use this when you want full per-shell detail for visual inspection, not the default 4-3-2-1 fall-off.
+Read `gpu_pass=X.XXX` (pure shader time) and `submitted_done=X.XXX` (includes TBDR resolve). `avg_steps`, `avg_empty`, etc. come from `render_harness_shader`.
 
-Default spawn is at `(2.5, 2.0, 2.5)` looking into the sponge from a corner. Scroll the mouse wheel to zoom in/out; WASD to move.
-
-**With shader stats printed to stderr every 60 frames:**
+### 5-run mean (drop first as warmup)
 
 ```bash
-scripts/dev.sh --menger-world --plain-layers 15 --lod-base-depth 20 --shader-stats --live-sample-every 60
+for i in 1 2 3 4 5; do timeout 12 cargo run --bin deepspace-game --quiet -- --render-harness --plain-world --spawn-depth 8 --spawn-pitch -1.0 --harness-width 1920 --harness-height 1080 --exit-after-frames 120 --timeout-secs 12 --suppress-startup-logs --shader-stats 2>&1 | grep "render_harness_timing" | grep -oE "gpu_pass=[0-9.]+ |submitted_done=[0-9.]+"; echo "---"; done
 ```
 
-`render_live_sample` lines show CPU-side phase timings; `renderer_slow` lines fire for any frame >30ms with the full GPU breakdown.
+First run is shader compile + cache warmup — discard. Average runs 2-5.
 
-## Plain world (standard baseline)
+### Fractal stress scenario
+
+Camera inside a Menger sponge, looking down the central corridor:
 
 ```bash
-scripts/dev.sh
+for i in 1 2 3 4 5; do timeout 12 cargo run --bin deepspace-game --quiet -- --render-harness --menger-world --plain-layers 15 --spawn-xyz 1.5 2.8 1.5 --spawn-depth 8 --spawn-pitch -0.8 --harness-width 1920 --harness-height 1080 --exit-after-frames 120 --timeout-secs 12 --suppress-startup-logs --shader-stats 2>&1 | grep "render_harness_timing" | grep -oE "gpu_pass=[0-9.]+ |submitted_done=[0-9.]+"; echo "---"; done
 ```
 
-No flags → plain world, default spawn at grassland surface.
+### Zoom-in perf regression (INV8 scenario)
 
-## Sphere world
+Zooms from shallow layer to deep via script, captures sustained-post-zoom perf:
 
 ```bash
-scripts/dev.sh --sphere-world
+timeout 20 cargo run --bin deepspace-game -- --plain-world --plain-layers 40 --spawn-depth 3 --spawn-pitch -1.0 --disable-overlay --shader-stats --live-sample-every 120 --script "wait:60,zoom_in:10,wait:600" --run-for-secs 14 --timeout-secs 20 2>&1 | grep -E "renderer_slow|heartbeat" | tail -8
 ```
 
-## Common flag reference for live use
+## Visual correctness screenshots
 
-| flag | effect |
-|---|---|
-| `--menger-world` / `--sphere-world` / `--plain-world` | World preset. |
-| `--plain-layers N` | Tree depth for the selected preset (default 40 for plain, 15 is a good Menger starting point). |
-| `--lod-base-depth N` | Ribbon-level LOD budget. 4 (default) uses 4/3/2/1 shell decay. 20 effectively disables shell decay; pixel Nyquist still applies. |
-| `--lod-pixels N` | Pixel-size Nyquist floor. 1.0 (default) = strict sub-pixel rejection. Raise to 2-4 if you want cheaper distant content at the cost of some detail. |
-| `--shader-stats` | Enable per-pixel atomic counters for DDA step-count output. Adds ~0.5-1ms per frame at 1280×720 from atomic contention. |
-| `--live-sample-every N` | Print a `render_live_sample` line every N frames to stderr with acquire/encode/submit/present/total timings. 0 disables. |
-| `--disable-overlay` | Skip the WKWebView overlay (no hotbar, no debug panel). Useful when you want a pixel-stable window. |
+```bash
+timeout 8 cargo run --bin deepspace-game -- --plain-world --spawn-depth 8 --spawn-pitch -1.0 --disable-overlay --screenshot tmp/shot.png --harness-width 1280 --harness-height 720 --timeout-secs 8
+```
 
-## Avoid in live mode
+Change `--plain-world` to `--sphere-world` or `--menger-world --plain-layers 15` for other scenes. Read the PNG to verify — timing numbers don't catch visual regressions.
 
-These flags trigger **test-runner mode** which auto-exits the game after 120 frames (or `--run-for-secs N` seconds). Use them in `cookbook.md` harness commands, not for interactive sessions:
+## A/B comparison across branches
 
-- `--render-harness`
-- `--screenshot PATH`
-- `--exit-after-frames N`
-- `--script "..."`
-- `--spawn-xyz X Y Z` — positional spawn, also triggers auto-exit
-- `--spawn-depth N`, `--spawn-yaw RAD`, `--spawn-pitch RAD`
-- `--min-fps`, `--run-for-secs`, `--max-frame-gap-ms`
+Same command, different worktree:
 
-If you *do* pass one of these and still want a long-lived interactive window, add `--run-for-secs 3600 --timeout-secs 3600` to keep it alive for an hour.
+```bash
+cd /Users/donalddellapietra/GitHub/deepspace-game/.claude/worktrees/sparse-tree && <command>
+cd /Users/donalddellapietra/GitHub/deepspace-game/.claude/worktrees/testing-infra && <command>
+```
 
-## Switching branches for A/B comparison
+The `menger-test` branch in the testing-infra worktree has the Menger preset cherry-picked for A/B against the dense layout baseline.
 
-The Menger preset + dev.sh forwarding live on the `sparse-tree` branch (in the `.claude/worktrees/sparse-tree/` worktree). The dense-layout baseline with the same preset lives on the `menger-test` branch (in `.claude/worktrees/testing-infra/`). Run the same `scripts/dev.sh ...` command from each worktree to compare FPS side-by-side.
+## Prime directives
+
+- One command per shell invocation. Never chain with `&&`.
+- Always wrap `cargo run` with `timeout N` (matches `--timeout-secs N`).
+- Never `cargo clean` (20-min rebuild). If incremental cache breaks: `rm -rf target/debug/incremental/deepspace_game-*`.
+- Always read the output. A command launching is not a success.
+
+See [cookbook.md](cookbook.md) for deeper perf-debugging methodology and [harness.md](harness.md) for the full flag reference.
