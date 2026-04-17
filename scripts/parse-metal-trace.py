@@ -52,13 +52,17 @@ def extract_xml(trace_path: str, out_path: str) -> None:
         sys.exit(result.returncode)
 
 
-def parse_xml(path: str) -> dict[str, list[float]]:
-    """Stream-parse the XML, returning per-counter non-zero sample lists.
+def parse_xml(path: str) -> tuple[dict[str, list[float]], dict[str, int]]:
+    """Stream-parse the XML.
 
-    Each row in the XML references a counter by id or ref; we resolve
-    refs back to the name. Values come from either `<percent>` or
-    `<fixed-decimal>` elements; both store the pre-formatted percent
-    (e.g. text "0.142594111" represents 0.1426%, NOT a fraction).
+    Returns (numeric_samples, top_limiter_counts).
+
+    Each row references a counter by id or ref; we resolve refs to the
+    name. Most counters store a pre-formatted percent in `<percent>` or
+    `<fixed-decimal>` elements (text "0.142594111" = 0.1426%, not a
+    fraction). `Top Performance Limiter` is categorical — its
+    `<formatted-label>` embeds the winning limiter name, e.g.
+    "0.0148% (9.Texture Write Limiter)" — so we tally those instead.
     """
     NAME_ID = re.compile(r'<gpu-counter-name id="(\d+)" fmt="([^"]*)">')
     NAME_REF = re.compile(r'<gpu-counter-name ref="(\d+)"/>')
@@ -68,9 +72,12 @@ def parse_xml(path: str) -> dict[str, list[float]]:
     DECIMAL = re.compile(
         r'<fixed-decimal [^/>]*fmt="([^"]+)"[^/>]*>([0-9.]+)</fixed-decimal>'
     )
+    LABEL = re.compile(r'<formatted-label[^>]*fmt="([^"]+)"')
+    LIM_PAREN = re.compile(r'\(([^)]+)\)')
 
     id_to_name: dict[str, str] = {}
     peak: dict[str, list[float]] = defaultdict(list)
+    top_limiter: dict[str, int] = defaultdict(int)
     n_rows = 0
     n_nonzero = 0
 
@@ -94,6 +101,13 @@ def parse_xml(path: str) -> dict[str, list[float]]:
             if name is None:
                 continue
 
+            if name == "Top Performance Limiter":
+                lm = LABEL.search(s)
+                if lm:
+                    pm = LIM_PAREN.search(lm.group(1))
+                    top_limiter[pm.group(1) if pm else lm.group(1)] += 1
+                continue
+
             val: float | None = None
             m = PERCENT.search(s)
             if m:
@@ -115,7 +129,7 @@ def parse_xml(path: str) -> dict[str, list[float]]:
             peak[name].append(val)
 
     sys.stderr.write(f"rows={n_rows} non_zero={n_nonzero}\n")
-    return peak
+    return peak, top_limiter
 
 
 # Counters most useful for diagnosing ray-march shader perf.
@@ -138,11 +152,10 @@ FOCUS = [
     "MMU TLB Miss Rate",
     "Threadgroup/Imageblock Load Limiter",
     "Threadgroup/Imageblock Store Limiter",
-    "Top Performance Limiter",
 ]
 
 
-def summarize(peak: dict[str, list[float]]) -> None:
+def summarize(peak: dict[str, list[float]], top_limiter: dict[str, int]) -> None:
     print(f"{'counter':<42} {'samples':>8} {'mean':>8} {'p50':>8} "
           f"{'p90':>8} {'p99':>8} {'max':>8}")
     print("-" * 100)
@@ -160,6 +173,15 @@ def summarize(peak: dict[str, list[float]]) -> None:
             f"{ss[min(int(n * 0.99), n - 1)]:>8.2f} "
             f"{ss[-1]:>8.2f}"
         )
+    print()
+    if top_limiter:
+        total = sum(top_limiter.values())
+        print(f"Top Performance Limiter ({total} samples):")
+        for lim, n in sorted(top_limiter.items(), key=lambda x: -x[1]):
+            pct = 100.0 * n / max(total, 1)
+            print(f"  {pct:6.2f}%  {n:>6}  {lim}")
+    else:
+        print("Top Performance Limiter: (no samples)")
 
 
 def main() -> None:
@@ -179,8 +201,8 @@ def main() -> None:
         size_mb = os.path.getsize(xml_path) / 1e6
         sys.stderr.write(f"xml size: {size_mb:.1f} MB\n")
 
-        peak = parse_xml(xml_path)
-        summarize(peak)
+        peak, top_limiter = parse_xml(xml_path)
+        summarize(peak, top_limiter)
     finally:
         os.unlink(xml_path)
 
