@@ -131,6 +131,8 @@ pub fn pack_tree(
                     tag: 1, block_type: *bt, _pad: 0, node_index: 0,
                 },
                 Child::Node(child_id) => {
+                    let child_bfs = *visited.get(child_id).expect("child must be visited");
+                    let child_aabb = content_aabb(occupancies[child_bfs as usize]);
                     let repr = library
                         .get(*child_id)
                         .map(|n| n.representative_block)
@@ -138,8 +140,8 @@ pub fn pack_tree(
                     GpuChild {
                         tag: 2,
                         block_type: repr,
-                        _pad: 0,
-                        node_index: *visited.get(child_id).expect("child must be visited"),
+                        _pad: child_aabb,
+                        node_index: child_bfs,
                     }
                 }
             };
@@ -157,6 +159,55 @@ pub fn pack_tree(
 /// Encode a child's first u32: tag | (block_type << 8) | (_pad << 16).
 fn pack_child_first(c: GpuChild) -> u32 {
     (c.tag as u32) | ((c.block_type as u32) << 8) | ((c._pad as u32) << 16)
+}
+
+/// Compute a tight axis-aligned bounding box (slot-granular) of the
+/// occupied slots in a 3×3×3 node. Returns a 12-bit packed value:
+///
+/// ```text
+/// bits  0-1: min_x (0..=2, inclusive)
+/// bits  2-3: min_y
+/// bits  4-5: min_z
+/// bits  6-7: max_x (0..=2, inclusive — shader treats as max+1 exclusive)
+/// bits  8-9: max_y
+/// bits 10-11: max_z
+/// ```
+///
+/// Used by the ray-march shader to cull descents: on a non-empty
+/// child, ray-box-test against the child's content AABB before
+/// committing to the child DDA. If the ray misses the AABB, skip
+/// the descent entirely. See `assets/shaders/march.wgsl`.
+///
+/// For an empty occupancy mask (shouldn't happen for a referenced
+/// child), returns `0` — the shader treats an all-zero AABB as a
+/// degenerate "no content" box that never hits, so a miss falls
+/// through to the usual DDA path.
+pub(crate) fn content_aabb(occupancy: u32) -> u16 {
+    if occupancy == 0 {
+        return 0;
+    }
+    let mut min_x = 3u32;
+    let mut max_x = 0u32;
+    let mut min_y = 3u32;
+    let mut max_y = 0u32;
+    let mut min_z = 3u32;
+    let mut max_z = 0u32;
+    for slot in 0..27u32 {
+        if (occupancy >> slot) & 1 == 0 {
+            continue;
+        }
+        let x = slot % 3;
+        let y = (slot / 3) % 3;
+        let z = slot / 9;
+        if x < min_x { min_x = x; }
+        if x > max_x { max_x = x; }
+        if y < min_y { min_y = y; }
+        if y > max_y { max_y = y; }
+        if z < min_z { min_z = z; }
+        if z > max_z { max_z = z; }
+    }
+    ((min_x << 0) | (min_y << 2) | (min_z << 4)
+        | (max_x << 6) | (max_y << 8) | (max_z << 10)) as u16
 }
 
 fn child_screen_pixels(
@@ -372,7 +423,14 @@ pub fn pack_tree_lod_selective(
         tree.push(occupancy);
         tree.push(first_child_off);
         for slot in 0..CHILDREN_PER_NODE {
-            if let Some(entry) = per_node[i][slot] {
+            if let Some(mut entry) = per_node[i][slot] {
+                // For tag=2 node children, stash the child's content
+                // AABB in `_pad` so the shader can ray-box-cull the
+                // descent before committing. tag=1 block leaves have
+                // no subtree; leave `_pad` as 0.
+                if entry.tag == 2 {
+                    entry._pad = content_aabb(occupancies[entry.node_index as usize]);
+                }
                 tree.push(pack_child_first(entry));
                 tree.push(entry.node_index);
             }
