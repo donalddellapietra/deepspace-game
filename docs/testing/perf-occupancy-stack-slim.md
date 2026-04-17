@@ -417,6 +417,69 @@ benefit from the min/max reduction over the short-circuit chain.
 well-matched to the compile pipeline. Moving on; the OOB check isn't
 the bottleneck the earlier ALU-count analysis implied.
 
+## Occupancy sweep diagnostic (decisive — we're in a flat region)
+
+Direct test of whether adding per-thread state drops Fragment Occupancy
+enough to matter. Added 256 B of live scalar `vec4` state (16 `var`s,
+each updated every iter, dep-chained into a guard condition), captured
+xctrace counters, compared against HEAD baseline.
+
+Slow-soldier @ 2560×1440, 300 frames, release build.
+
+| counter | baseline (6.39 ms) | +256 B scalars (8.87 ms, +39%) |
+|---|---|---|
+| Fragment Occupancy (mean) | **12.98%** | **12.63%** |
+| Fragment Occupancy (p99) | 68.12% | 51.02% |
+| ALU Utilization (mean) | **32.96%** | **32.19%** |
+| ALU Utilization (p99) | 52.49% | 40.97% |
+
+**Mean Fragment Occupancy did not move.** Mean ALU Utilization did not
+move. The entire 39% wall-clock regression came from the added ALU ops
+(16 parallel `vec4 += d` chains + a reduce-sum guard), not from lost
+TLP.
+
+### What this rules out
+
+- **"We're register-pressure-limited."** Adding 256 B of live scalar
+  state should have dropped Fragment Occupancy a tier (e.g., 13% →
+  6.5%) if we were at the cliff. It didn't. We're in a flat region of
+  the occupancy curve.
+- **"Shrinking state further will unlock more SIMDs."** Stack-scalar
+  commits already cut 170 B (450→280) without moving mean occupancy.
+  This test confirms the curve is flat in both directions around our
+  current state size.
+- **"Compute shader migration (same algorithm, different stage) will
+  help via TLP."** It won't, unless it meaningfully reduces per-thread
+  state — likely to below ~128 B, which is 50% below where we are now.
+  That's a significant refactor, not a shader-stage swap.
+
+### What this confirms
+
+- **We're ALU-work-bound at the margin.** Removing ALU ops is linearly
+  effective (stack-scalar: -44%, branchless min-axis: -18%). Adding ALU
+  ops is linearly ineffective (this test: +39% for +256 B).
+- **ALU Utilization sitting at 33% with a flat occupancy response means
+  the 67% idle ALU time is NOT fillable by more ops-per-thread.**
+  Either the existing SIMDs are dep-chain-blocked (waiting on their own
+  results, can't issue) OR they're memory-blocked (waiting on
+  storage-buffer loads). Adding more ops to the same SIMDs doesn't
+  help — only more SIMDs would. And we can't get more SIMDs at the
+  current state size.
+- **The remaining wall-clock gap is mostly structural** — not
+  addressable by local WGSL-level optimization without a large
+  register-budget cut.
+
+### Residual questions the diagnostic didn't answer
+
+- **Which mechanism dominates the 67% ALU idle?** Dep-chain stalls vs
+  storage-buffer memory latency. A dep-chain amplification test would
+  disambiguate: artificially extend the critical chain length and
+  measure wall-clock sensitivity.
+- **What tier of occupancy is below us?** Need to probe the state-size
+  floor. If we could get per-thread state to ~128 B and measure, we'd
+  know whether there's a meaningful TLP win to chase. Currently seems
+  unreachable without compute shader + threadgroup memory.
+
 ## LOD tuning (tried — null)
 
 Runtime flag `--lod-pixels 2.0` doubled the sub-pixel-rejection
