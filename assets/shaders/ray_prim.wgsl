@@ -52,3 +52,22 @@ fn pow3_u(exp: u32) -> f32 {
 fn max_component(v: vec3<f32>) -> f32 {
     return max(v.x, max(v.y, v.z));
 }
+
+// Branchless argmin mask for the DDA min-side_dist selection.
+// Returns a (0/1) vec3 where exactly one component is 1: the axis whose
+// `side_dist` is smallest. Tie-break priority matches the original
+// if/else if/else chain: x > y > z (z wins all-equal ties).
+//
+// The three `pick_*` bools are pairwise independent — compiler can
+// issue the 4 compares in parallel, shortening the loop-carried
+// dependency chain that a branching `if/else if` version forces.
+fn min_axis_mask(sd: vec3<f32>) -> vec3<f32> {
+    let pick_x = sd.x < sd.y && sd.x < sd.z;
+    let pick_y = sd.x >= sd.y && sd.y < sd.z;
+    let pick_z = !pick_x && !pick_y;
+    return vec3<f32>(
+        select(0.0, 1.0, pick_x),
+        select(0.0, 1.0, pick_y),
+        select(0.0, 1.0, pick_z),
+    );
+}
