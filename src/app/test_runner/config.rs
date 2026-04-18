@@ -84,6 +84,16 @@ pub struct TestConfig {
     /// the `renderer_slow` 30 ms threshold. `None` or `Some(0)`
     /// disables.
     pub live_sample_every_frames: Option<u32>,
+    /// Enable TAAU (temporal anti-aliasing + upscale). Ray-march
+    /// pass runs at half per-axis (¼ pixel count); a resolve pass
+    /// reprojects the previous frame's history, neighborhood-clamps
+    /// against 3×3 of the new half-res samples, and blends. Recovers
+    /// full-resolution detail after ~4 frames of camera stillness.
+    /// Costs: one resolve pass (cheap), two full-res RGBA16F history
+    /// textures, plus the 3×3 neighborhood loads in the resolve shader.
+    /// See `docs/testing/proposed-perf-speedups.md` and the TAAU
+    /// discussion in this session's chat log.
+    pub taa: bool,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -264,6 +274,7 @@ impl TestConfig {
                 "--live-sample-every" => {
                     cfg.live_sample_every_frames = args.next().and_then(|v| v.parse().ok());
                 }
+                "--taa" => { cfg.taa = true; }
                 _ => {}
             }
         }

@@ -3,9 +3,13 @@
 
 struct Camera {
     pos: vec3<f32>,
-    _pad0: f32,
+    /// Sub-pixel jitter offset in scaled-res texel units. Zero when
+    /// TAAU is off — the ray-march shader adds it to the NDC offset
+    /// so each frame samples a different sub-pixel position within
+    /// each output pixel, enabling temporal supersampling.
+    jitter_x_px: f32,
     forward: vec3<f32>,
-    _pad1: f32,
+    jitter_y_px: f32,
     right: vec3<f32>,
     _pad2: f32,
     up: vec3<f32>,

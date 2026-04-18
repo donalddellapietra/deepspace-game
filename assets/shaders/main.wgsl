@@ -24,16 +24,37 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+/// Compute the ray direction for `uv` under the current camera,
+/// with the per-frame sub-pixel jitter baked in. Used by both
+/// fragment entry points so the ray-march runs on the jittered
+/// sample regardless of whether TAAU is the active resolve path.
+/// Jitter is zero when TAAU is off, so the non-TAA path behaves
+/// exactly like before.
+fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
     let aspect = uniforms.screen_width / uniforms.screen_height;
     let half_fov_tan = tan(camera.fov * 0.5);
+    // Jitter is specified in output-texel units; convert to NDC.
+    let jitter_ndc_x = camera.jitter_x_px / uniforms.screen_width * 2.0 * aspect * half_fov_tan;
+    let jitter_ndc_y = camera.jitter_y_px / uniforms.screen_height * 2.0 * half_fov_tan;
     let ndc = vec2<f32>(
-        (in.uv.x - 0.5) * 2.0 * aspect * half_fov_tan,
-        (0.5 - in.uv.y) * 2.0 * half_fov_tan,
+        (uv.x - 0.5) * 2.0 * aspect * half_fov_tan + jitter_ndc_x,
+        (0.5 - uv.y) * 2.0 * half_fov_tan + jitter_ndc_y,
     );
-    let ray_dir = camera.forward + camera.right * ndc.x + camera.up * ndc.y;
+    return camera.forward + camera.right * ndc.x + camera.up * ndc.y;
+}
 
+/// Shared pixel-shading kernel. Returns both the (gamma-corrected)
+/// RGB color that fs_main writes to the swapchain and the raw
+/// HitResult so callers that need the hit t (fs_main_taa) can pass
+/// it through without re-running the march.
+///
+/// Color is the same value `fs_main` used to return — including the
+/// manual `pow(1/2.2)` gamma correction it applies before write. TAAU
+/// uses this same value so visual output stays consistent with the
+/// non-TAAU path; the gamma-space clamp + blend in the resolve shader
+/// is a small precision hit but not a visible one.
+fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
+    let ray_dir = jittered_ray_dir(uv);
     let result = march(camera.pos, ray_dir);
 
     var color: vec3<f32>;
@@ -52,11 +73,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if uniforms.highlight_active != 0u {
-        // Highlight AABB is always in the camera's frame-local system.
-        // t is invariant across ribbon pop transforms (origin and dir
-        // both ÷3 per pop), so hit_pos = camera.pos + ray_dir * t is
-        // always in the original frame regardless of which ribbon
-        // level the DDA actually found the hit.
         let h_min = uniforms.highlight_min.xyz;
         let h_max = uniforms.highlight_max.xyz;
         let h_size = h_max - h_min;
@@ -77,7 +93,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let pixel = vec2<f32>(in.uv.x * uniforms.screen_width, in.uv.y * uniforms.screen_height);
+    let pixel = vec2<f32>(uv.x * uniforms.screen_width, uv.y * uniforms.screen_height);
     let center = vec2<f32>(uniforms.screen_width * 0.5, uniforms.screen_height * 0.5);
     let d = abs(pixel - center);
     let cross_size = 12.0;
@@ -96,10 +112,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Emit per-ray stats to the shader_stats buffer. Gated behind
     // the `ENABLE_STATS` override so the off-state has zero runtime
-    // cost — per-pixel atomic contention on a 32-byte buffer can
-    // add ~0.5–1ms at 1280x720 and would distort baseline perf
-    // measurements. Enabled only when the harness passes
-    // `--shader-stats`.
+    // cost.
     if ENABLE_STATS {
         atomicAdd(&shader_stats.ray_count, 1u);
         if result.hit {
@@ -110,10 +123,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if ray_steps >= 2048u {
             atomicAdd(&shader_stats.max_iter_count, 1u);
         }
-        // Round up on the /4 divide so single-step rays are
-        // detectable (otherwise ray_steps=1 shifts to 0 and we lose
-        // the signal at high LOD thresholds). u32 sum at 2560x1440
-        // with avg_steps=170 = 630M, fits with room to spare.
         atomicAdd(&shader_stats.sum_steps_div4, (ray_steps + 3u) >> 2u);
         atomicMax(&shader_stats.max_steps, ray_steps);
         atomicAdd(&shader_stats.sum_steps_oob_div4, (ray_steps_oob + 3u) >> 2u);
@@ -122,5 +131,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         atomicAdd(&shader_stats.sum_steps_lod_terminal_div4, (ray_steps_lod_terminal + 3u) >> 2u);
     }
 
-    return vec4<f32>(color, 1.0);
+    // Stash t in the alpha channel so fs_main_taa can route it into
+    // a second render attachment without re-running the march.
+    return vec4<f32>(color, result.t);
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let shaded = shade_pixel(in.uv);
+    return vec4<f32>(shaded.rgb, 1.0);
+}
+
+/// TAAU entry point. Writes color to `@location(0)` and hit t to
+/// `@location(1)` (R32Float), both at the half-res render target.
+/// The resolve pass reconstructs world-space hit positions from
+/// `(camera.pos, ray_dir, t)` to reproject history across frames.
+struct TaaFragOut {
+    @location(0) color: vec4<f32>,
+    @location(1) t: f32,
+}
+
+@fragment
+fn fs_main_taa(in: VertexOutput) -> TaaFragOut {
+    let shaded = shade_pixel(in.uv);
+    var out: TaaFragOut;
+    out.color = vec4<f32>(shaded.rgb, 1.0);
+    out.t = shaded.a;
+    return out;
 }

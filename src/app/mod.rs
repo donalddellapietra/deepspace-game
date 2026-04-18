@@ -156,6 +156,9 @@ pub struct App {
     /// timings (acquire / encode / submit / present / total). 0
     /// disables. Set via `--live-sample-every N`.
     pub(super) live_sample_every_frames: u32,
+    /// Whether TAAU is enabled. Threaded to `Renderer::new` so the
+    /// live and harness paths share the same resolve setup.
+    pub(super) taa_enabled: bool,
     /// Block-interaction radius in anchor-cell units. Caps the
     /// cursor raycast distance so break/place only succeed when
     /// the target is within `interaction_radius × anchor_cell_size`
@@ -214,6 +217,7 @@ impl App {
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
         let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
+        let taa_enabled = test_cfg.taa;
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), Some(test_cfg.plain_layers()));
@@ -325,6 +329,7 @@ impl App {
             lod_pixel_threshold,
             lod_base_depth,
             live_sample_every_frames,
+            taa_enabled,
             interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,

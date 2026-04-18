@@ -67,13 +67,20 @@ impl GpuNodeKind {
 
 /// Camera uniforms in shader-frame coords. `pos`/`forward`/etc. are
 /// in the current render frame's local `[0, 3)³` space.
+///
+/// The `jitter_x_px` / `jitter_y_px` slots carry a sub-pixel offset
+/// applied to the NDC coordinates in the ray-march fragment shader.
+/// Zero when TAAU is disabled (no visual change); non-zero when
+/// TAAU is enabled so successive frames sample distinct sub-pixel
+/// positions within each output pixel. Units: texels in the scaled-
+/// resolution framebuffer (range `(-0.5, +0.5)`).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuCamera {
     pub pos: [f32; 3],
-    pub _pad0: f32,
+    pub jitter_x_px: f32,
     pub forward: [f32; 3],
-    pub _pad1: f32,
+    pub jitter_y_px: f32,
     pub right: [f32; 3],
     pub _pad2: f32,
     pub up: [f32; 3],

@@ -8,6 +8,7 @@ use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
+use super::taa::{TaaState, MARCH_COLOR_FORMAT, MARCH_T_FORMAT};
 use super::{GpuUniforms, Renderer, TimestampScratch, ROOT_KIND_CARTESIAN};
 
 impl Renderer {
@@ -22,6 +23,7 @@ impl Renderer {
         lod_pixel_threshold: f32,
         lod_base_depth: u32,
         live_sample_every_frames: u32,
+        taa_enabled: bool,
     ) -> Self {
         let size = window.inner_size();
 
@@ -139,9 +141,9 @@ impl Renderer {
 
         let camera = GpuCamera {
             pos: [1.5, 1.75, 1.5],
-            _pad0: 0.0,
+            jitter_x_px: 0.0,
             forward: [0.0, 0.0, -1.0],
-            _pad1: 0.0,
+            jitter_y_px: 0.0,
             right: [1.0, 0.0, 0.0],
             _pad2: 0.0,
             up: [0.0, 1.0, 0.0],
@@ -325,7 +327,7 @@ impl Renderer {
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
-                compilation_options: frag_compilation_options,
+                compilation_options: frag_compilation_options.clone(),
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -336,6 +338,59 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+
+        // When TAAU is enabled, compile a second ray-march pipeline
+        // with the `fs_main_taa` entry point — two color attachments
+        // (linear RGBA16F color + R32F hit t) at half-res. Both
+        // pipelines share the same bind group layout so buffer state
+        // is identical between them; only the fragment-output shape
+        // and target formats differ.
+        let (pipeline_taa, taa_state) = if taa_enabled {
+            let pipeline_taa = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ray_march_taa"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main_taa"),
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: MARCH_COLOR_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: MARCH_T_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::RED,
+                        }),
+                    ],
+                    compilation_options: frag_compilation_options,
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+            let taa_state = TaaState::new(&device, config.format, config.width, config.height);
+            eprintln!(
+                "renderer_taa enabled scaled_size={}x{} full_size={}x{}",
+                taa_state.scaled_width, taa_state.scaled_height,
+                taa_state.full_width, taa_state.full_height,
+            );
+            (Some(pipeline_taa), Some(taa_state))
+        } else {
+            (None, None)
+        };
 
         let timestamp = if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -370,7 +425,9 @@ impl Renderer {
             uploaded_tree_u32s,
             uploaded_kinds_count,
             uploaded_offsets_count,
-            camera_buffer, palette_buffer, uniforms_buffer,
+            camera_buffer,
+            last_camera: camera,
+            palette_buffer, uniforms_buffer,
             ribbon_buffer,
             bind_group,
             root_index: root_bfs_index, node_count,
@@ -383,6 +440,8 @@ impl Renderer {
             root_face_pop_pos: [0.0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
+            pipeline_taa,
+            taa: taa_state,
             timestamp,
             last_camera_write_ms: 0.0,
             last_ribbon_write_ms: 0.0,

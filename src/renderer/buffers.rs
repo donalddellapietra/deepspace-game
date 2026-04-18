@@ -135,14 +135,28 @@ impl Renderer {
         let write_start = std::time::Instant::now();
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
         self.last_camera_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
+        // Keep a CPU-side copy with jitter cleared — the TAA resolve
+        // path stashes this as `prev_camera` and re-derives ray
+        // directions at pixel centers, so the stored form must NOT
+        // carry whatever jitter was overlaid on the GPU buffer below
+        // by the TAA path (see `render()`).
+        let mut mirror = *camera;
+        mirror.jitter_x_px = 0.0;
+        mirror.jitter_y_px = 0.0;
+        self.last_camera = mirror;
     }
 
     pub(super) fn write_uniforms(&self) {
+        // When TAAU is on the ray-march pipeline writes into a
+        // half-res target; feeding full-res dimensions here would
+        // mis-scale the jitter NDC and shrink the crosshair 2×
+        // under upscale. Use the march-pass dimensions instead.
+        let (sw, sh) = self.march_dims();
         let uniforms = GpuUniforms {
             root_index: self.root_index,
             node_count: self.node_count,
-            screen_width: self.config.width as f32,
-            screen_height: self.config.height as f32,
+            screen_width: sw as f32,
+            screen_height: sh as f32,
             max_depth: self.max_depth,
             highlight_active: self.highlight_active,
             root_kind: self.root_kind,

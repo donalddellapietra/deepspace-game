@@ -9,8 +9,10 @@
 mod buffers;
 mod draw;
 mod init;
+mod taa;
 
 pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
+pub use taa::{FrameSignature, TaaState};
 
 /// Maximum ancestor-ribbon depth supported by the shader. Larger
 /// ribbons get truncated at upload (anything beyond can't pop).
@@ -77,6 +79,13 @@ pub struct Renderer {
     pub(super) uploaded_kinds_count: u64,
     pub(super) uploaded_offsets_count: u64,
     pub(super) camera_buffer: wgpu::Buffer,
+    /// CPU-side mirror of the most recent GpuCamera uploaded via
+    /// `update_camera()`, with `jitter_x_px` / `jitter_y_px` always
+    /// zero regardless of the real GPU-side jitter. The TAA resolve
+    /// path needs the un-jittered camera to reconstruct ray
+    /// directions at pixel centers; it also stashes a copy as the
+    /// `prev_camera` for next frame's reprojection.
+    pub(super) last_camera: crate::world::gpu::GpuCamera,
     pub(super) palette_buffer: wgpu::Buffer,
     pub(super) uniforms_buffer: wgpu::Buffer,
     pub(super) ribbon_buffer: wgpu::Buffer,
@@ -94,6 +103,14 @@ pub struct Renderer {
     pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
     pub(super) offscreen_texture: Option<wgpu::Texture>,
+    /// Second ray-march pipeline compiled to the TAAU entry point
+    /// (`fs_main_taa`) with two color attachments — linear RGBA16F
+    /// color and R32F hit-t. `None` when TAAU is disabled; the draw
+    /// path then uses the single-attachment `pipeline`.
+    pub(super) pipeline_taa: Option<wgpu::RenderPipeline>,
+    /// TAAU state: history textures, resolve pipeline, jitter,
+    /// previous camera. `None` when TAAU is disabled.
+    pub(super) taa: Option<TaaState>,
     /// Optional GPU timestamp-query scaffolding. Present only when
     /// the adapter reports `Features::TIMESTAMP_QUERY`. Used by
     /// `render_offscreen` to measure the ray-march pass on the GPU
@@ -212,6 +229,48 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.offscreen_texture = None;
+        if let Some(taa) = self.taa.as_mut() {
+            taa.resize(&self.device, width, height);
+        }
         self.write_uniforms();
+    }
+
+    /// Mark the TAAU history as invalid for the next few frames.
+    /// Callers must invoke this whenever the render-frame root
+    /// shifts (zoom, ribbon pop, teleport, spawn). A shift means
+    /// the camera's local coordinate system is no longer the same
+    /// as the one that produced the previous history, so naive
+    /// reprojection would sample garbage. The frame-signature
+    /// comparison inside `TaaState::begin_frame` also catches
+    /// automatic changes via `set_frame_root` / `set_root_kind_*`,
+    /// so this is primarily for app-level events.
+    pub fn invalidate_taa_history(&mut self) {
+        if let Some(taa) = self.taa.as_mut() {
+            taa.invalidate_history();
+        }
+    }
+
+    /// Whether TAAU is enabled for this renderer. Read-only — the
+    /// flag is set at `new` time; toggling at runtime would require
+    /// rebuilding pipelines.
+    pub fn taa_enabled(&self) -> bool { self.taa.is_some() }
+
+    /// Dimensions of the ray-march output attachment. Equal to the
+    /// swapchain size when TAAU is off; equal to the TAAU half-res
+    /// target when TAAU is on. The uniforms and shader jitter math
+    /// both care about this, not the swapchain size.
+    pub(super) fn march_dims(&self) -> (u32, u32) {
+        match self.taa.as_ref() {
+            Some(t) => (t.scaled_width, t.scaled_height),
+            None => (self.config.width, self.config.height),
+        }
+    }
+
+    pub(super) fn current_frame_signature(&self) -> FrameSignature {
+        FrameSignature {
+            root_index: self.root_index,
+            root_kind: self.root_kind,
+            ribbon_count: self.ribbon_count,
+        }
     }
 }
