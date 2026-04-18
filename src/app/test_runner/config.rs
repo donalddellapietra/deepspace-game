@@ -26,6 +26,14 @@ pub struct TestConfig {
     pub spawn_yaw: Option<f32>,
     /// Camera pitch at spawn (radians). Default -1.2 (steep down).
     pub spawn_pitch: Option<f32>,
+    /// Path-based surface-tracking spawn. When set, picks a
+    /// `WorldPos` that places the camera just above the world's
+    /// natural surface at `--spawn-depth` — accurate at any depth,
+    /// unlike `--spawn-xyz` whose f32 world coords quantize past
+    /// ~depth 15. Dispatches on the world preset: plain →
+    /// `plain_surface_spawn`; sphere (demo planet) →
+    /// `demo_sphere_surface_spawn`.
+    pub spawn_on_surface: bool,
     pub screenshot: Option<String>,
     pub exit_after_frames: Option<u32>,
     /// Wall-clock kill switch in seconds. Defaults to 5.0 so a
@@ -218,6 +226,7 @@ impl TestConfig {
                 }
                 "--spawn-yaw" => { cfg.spawn_yaw = args.next().and_then(|v| v.parse().ok()); }
                 "--spawn-pitch" => { cfg.spawn_pitch = args.next().and_then(|v| v.parse().ok()); }
+                "--spawn-on-surface" => { cfg.spawn_on_surface = true; }
                 "--screenshot" => { cfg.screenshot = args.next(); }
                 "--exit-after-frames" => {
                     cfg.exit_after_frames = args.next().and_then(|v| v.parse().ok());
@@ -300,6 +309,7 @@ impl TestConfig {
             || self.spawn_xyz.is_some()
             || self.spawn_yaw.is_some()
             || self.spawn_pitch.is_some()
+            || self.spawn_on_surface
             || self.min_fps.is_some()
             || self.min_cadence_fps.is_some()
             || self.run_for_secs.is_some()

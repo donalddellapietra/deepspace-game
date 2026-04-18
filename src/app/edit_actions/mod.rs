@@ -30,34 +30,37 @@ impl App {
         crate::world::sdf::normalize(self.camera.forward())
     }
 
-    /// Interaction distance cap in the given frame's local units.
-    ///
-    /// **Cartesian:** `interaction_radius_cells × anchor_cell_size_in_frame`,
-    /// where `anchor_cell_size_in_frame = 3 / 3^K` for `K = anchor_depth
-    /// − frame_depth`. The user's reach scales with their zoom — deep
-    /// zoom shrinks both the visible content AND the reach proportionally,
-    /// so "6 cells away" stays meaningful.
-    ///
-    /// **Sphere:** anchor-cell scaling is wrong here: the sphere's
-    /// surface sits at a *world-fixed* distance from the camera
-    /// (determined by `outer_r` and camera altitude), so an
-    /// anchor-cell reach becomes tiny vs. the physical surface
-    /// distance at deep zoom — the user sees terrain but can't
-    /// break/place. Instead, use the body cell's full width as the
-    /// reach: anything inside the planet body is reachable. The CPU
-    /// sphere raycast already measures `t` in body-frame units (the
-    /// `cap_frame` is `sphere.body_path`), and the body cell spans
-    /// `[0, 3)³` in those units, so `2 × outer_r × body_size = 2 ×
-    /// outer_r × 3` caps reach at the sphere's diameter.
-    pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
-        if let ActiveFrameKind::Sphere(sphere) = self.active_frame.kind {
-            // Body cell = 3 body-frame units wide. Diameter of the
-            // sphere in body-frame units = 2 × outer_r × 3 = 6 × outer_r.
-            // For the demo planet (outer_r = 0.45) that's 2.7 body-units
-            // ≈ 0.9 world-units — enough to reach any visible surface
-            // cell from any camera position above the body.
-            return 6.0 * sphere.outer_r;
+    /// Trim a walker-found hit down to the current `edit_depth`. The
+    /// walker returns a path all the way to the tree leaf so the
+    /// cursor always hits something concrete; callers that act on
+    /// the hit (break, place, highlight) want to operate at the
+    /// user's current layer instead, so we strip trailing slots
+    /// before returning. `place_path` receives the same trim so the
+    /// "where would I place a new block" preview is layer-correct.
+    fn truncate_hit_to_edit_depth(&self, mut hit: raycast::HitInfo) -> raycast::HitInfo {
+        let edit_depth = self.edit_depth() as usize;
+        if hit.path.len() > edit_depth {
+            hit.path.truncate(edit_depth);
         }
+        if let Some(ref mut pp) = hit.place_path {
+            if pp.len() > edit_depth {
+                pp.truncate(edit_depth);
+            }
+        }
+        hit
+    }
+
+    /// Interaction distance cap in the given frame's local units.
+    /// `interaction_radius_cells × anchor_cell_size_in_frame`, where
+    /// `anchor_cell_size_in_frame = 3 / 3^K` for `K = anchor_depth −
+    /// frame_depth`. The user's reach scales with their zoom — deep
+    /// zoom shrinks both the visible content AND the reach
+    /// proportionally, so "N layer-sized cells away" stays
+    /// meaningful. Works uniformly for Cartesian and Sphere: both
+    /// frames carry `t` in the same unit system (the frame's local
+    /// `[0,3)³`), and `anchor_cell_size_in_frame` already encodes the
+    /// world-ratio via `k`.
+    pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
         let frame_depth = frame_path.depth();
         let anchor_depth = self.camera.position.anchor.depth();
         let k = anchor_depth.saturating_sub(frame_depth) as i32;
@@ -82,6 +85,15 @@ impl App {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
                 let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
+                // Walker descends to the actual leaf so the cursor
+                // lands on the fine cell the user is pointing at, not
+                // on a coarser LOD representative that may read as
+                // empty at shallow anchors (bug: "cursor sometimes
+                // doesn't show up" + "outlines the seams of a bigger
+                // collapsed block"). The hit path is then truncated
+                // to `edit_depth` slots in `do_break` / `do_place`
+                // before the edit lands, so breaks/places still
+                // happen at the user's current layer.
                 let hit = raycast::cpu_raycast_in_sphere_frame(
                     &self.world.library,
                     self.world.root,
@@ -89,7 +101,7 @@ impl App {
                     cam_body,
                     cam_body,
                     ray_dir_local,
-                    self.cs_edit_depth(),
+                    self.raycast_max_depth(),
                     sphere.face as u32,
                     sphere.face_u_min,
                     sphere.face_v_min,
@@ -150,6 +162,17 @@ impl App {
                 None
             }
         });
+
+        // Truncate to edit_depth. The walker descends all the way to
+        // the leaf so the cursor ALWAYS lands on something (bug:
+        // cursor doesn't show when the leaf is small and the
+        // anchor-depth coarse cell reads as empty). But break/place
+        // — and the cursor highlight that previews them — must
+        // operate at the user's current layer, not at the leaf.
+        // Stripping the tail of `hit.path` / `hit.place_path` down to
+        // `edit_depth` slots gives all consumers the correct
+        // layer-N cell while still benefiting from the deeper walk.
+        let hit = hit.map(|h| self.truncate_hit_to_edit_depth(h));
         if self.startup_profile_frames < 16 {
             eprintln!(
                 "frame_raycast frame={} kind={:?} render_path={:?} logical_path={:?} cam_anchor={:?} hit={}",

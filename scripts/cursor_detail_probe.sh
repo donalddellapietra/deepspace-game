@@ -7,14 +7,22 @@
 # and when it does it only outlines the seams of the BIG collapsed
 # block — not the small block you're actually touching."
 #
-# Root cause hypothesis: CPU-side LOD. `cs_edit_depth() == anchor_depth`
-# so the raycast walker stops descending at the current zoom level and
-# returns a coarse "representative block" instead of walking to the
-# real leaf cell. At a shallow anchor, that terminal IS the big block.
+# Design (post-rewrite):
+#   - Raycast walker descends to tree_depth so the cursor ALWAYS finds
+#     a concrete leaf cell, never bails out on an "empty" coarse
+#     representative.
+#   - Hit path is truncated to `edit_depth` (= anchor_depth) before
+#     the cursor highlight / break / place fires — user edits at
+#     their current layer.
+#   - Interaction radius = 12 anchor cells (capped reach, scales with
+#     zoom).
+#
+# Expectation in this harness:
+#   probe_depth == anchor_depth (the truncated layer-N path length),
+#   hit=true whenever the surface is within 12 anchor cells.
 #
 # Fast iteration: one binary invocation per test case, probe_down in
-# script, parse `HARNESS_PROBE` stdout. No PNG reads. Each run emits a
-# single line: "(preset, depth, camera) → probe_depth (expected: X)".
+# script, parse `HARNESS_PROBE` stdout. No PNG reads.
 #
 # Usage:
 #   scripts/cursor_detail_probe.sh                # both world presets
@@ -37,15 +45,20 @@ cargo build --bin deepspace-game 2>&1 | grep -E "error" || true
 run_probe() {
     local world=$1
     local depth=$2
-    local spawn_xyz=$3
-    local spawn_pitch=$4
-    local world_args=$5
-    local tree_depth=$6
+    local spawn_pitch=$3
+    local world_args=$4
+    local tree_depth=$5
+
+    # `--spawn-on-surface` dispatches on world preset to a
+    # path-based spawn that tracks the surface at any depth (plain
+    # → dirt/grass boundary, sphere → SDF terrain at the north pole).
+    # Avoids the f32-quantization failure mode of `--spawn-xyz` at
+    # deep zooms.
 
     # shellcheck disable=SC2086
     out=$(timeout 20 ./target/debug/deepspace-game --render-harness \
         $world_args \
-        --spawn-xyz $spawn_xyz \
+        --spawn-on-surface \
         --spawn-pitch "$spawn_pitch" \
         --spawn-yaw 0 \
         --spawn-depth "$depth" \
@@ -70,37 +83,41 @@ run_probe() {
         probe_depth=$(printf '%s\n' "$inner" | awk -F',' '{print NF}')
     fi
 
-    printf "    d=%-3s  hit=%-5s  probe_depth=%-3s  (tree_depth=%s)  anchor=%s\n" \
-        "$depth" "$hit" "$probe_depth" "$tree_depth" "$anchor"
+    # Report PASS/FAIL versus the expectation:
+    # probe_depth should equal anchor_depth AND hit should be true
+    # (the walker found the surface and the hit is within interaction
+    # radius). Anything else is the bug.
+    if [ "$hit" = "true" ] && [ "$probe_depth" = "$depth" ]; then
+        status="ok"
+    else
+        status="FAIL"
+    fi
+    printf "    %-5s  d=%-3s  hit=%-5s  probe_depth=%-3s  (expected=%s)  anchor=%s\n" \
+        "$status" "$depth" "$hit" "$probe_depth" "$depth" "$anchor"
 }
 
 echo "=== cursor-detail probe sweep ==="
-echo "    Expectation: probe_depth should be ~= tree_depth (probe reaches"
-echo "    the actual leaf cell). If it equals the anchor depth, CPU LOD is"
-echo "    stopping the walker at zoom granularity — the user-reported bug."
+echo "    Expectation: probe_depth == anchor_depth (walker found a hit,"
+echo "    then the truncate-to-edit_depth step left a layer-N path). A"
+echo "    'hit=false' or 'probe_depth < anchor_depth' means the walker"
+echo "    missed the surface OR the interaction-radius gate rejected it."
 echo
 
 for world in $WORLDS; do
     case "$world" in
         plain)
-            echo "-- plain world, $PLAIN_LAYERS layers, camera at dirt/grass boundary --"
-            # Plain world has a dirt/grass boundary at y≈0.95. Put camera
-            # one cell above the surface at every anchor.
+            echo "-- plain world, $PLAIN_LAYERS layers --"
             for d in $DEPTHS; do
-                run_probe "plain" "$d" \
-                    "1.5 0.96 1.5" "-1.5707963" \
+                run_probe "plain" "$d" "-1.5707963" \
                     "--plain-world --plain-layers $PLAIN_LAYERS" \
                     "$PLAIN_LAYERS"
             done
             ;;
         sphere)
-            echo "-- sphere world (tree_depth=30), camera above north pole --"
-            # Sphere outer shell top at y=1.95. Camera 0.03 above.
+            echo "-- sphere world (tree_depth=30) --"
             for d in $DEPTHS; do
-                run_probe "sphere" "$d" \
-                    "1.5 1.98 1.5" "-1.5707963" \
-                    "--sphere-world" \
-                    "30"
+                run_probe "sphere" "$d" "-1.5707963" \
+                    "--sphere-world" "30"
             done
             ;;
     esac

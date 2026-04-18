@@ -12,27 +12,33 @@ use super::{
 };
 
 impl App {
-    /// Maximum depth the CPU raycast + editor walk to.
-    ///
-    /// Previously tied to `anchor_depth()` — that "CPU-side LOD" caused
-    /// the cursor to report a coarse collapsed cell (the big block you
-    /// see the seams of at shallow zoom) instead of the small leaf the
-    /// user is actually touching. The GPU already applies its own
-    /// per-pixel Nyquist cap (`face_lod_depth_cap` + the Cartesian LOD
-    /// test in `march.wgsl`) so there is no reason to also cap CPU.
-    ///
-    /// Honor `forced_edit_depth` when set (test harness / CLI override);
-    /// otherwise walk to the tree's actual depth.
+    /// Depth at which break/place edits land — the user's current
+    /// layer. A break at layer N removes a layer-N-sized cell,
+    /// regardless of whether the raycast found a smaller leaf cell
+    /// inside.
     pub(in crate::app) fn edit_depth(&self) -> u32 {
         if let Some(depth) = self.forced_edit_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
+        self.anchor_depth().max(1)
+    }
+
+    /// Maximum depth the CPU raycast walker descends to. Decoupled
+    /// from `edit_depth`: the walker needs to reach the actual leaf
+    /// cell under the cursor so that (a) the cursor highlights what
+    /// the user is visually pointing at, and (b) empty coarse
+    /// representatives don't short-circuit the walk and cause "no
+    /// hit" misfires near mixed-content boundaries.
+    ///
+    /// The caller truncates `hit.path` to `edit_depth()` slots before
+    /// applying an edit, so this deeper walk never lets break/place
+    /// land on a cell below the user's current layer.
+    pub(in crate::app) fn raycast_max_depth(&self) -> u32 {
         (self.tree_depth as u32).max(1)
     }
 
-    /// Sphere face-subtree edit depth. Same contract as `edit_depth` —
-    /// walk the face subtree to its actual depth, not to the user's
-    /// current anchor depth.
+    /// Sphere face-subtree edit depth — mirrors `edit_depth` so placed
+    /// blocks are always at the user's current layer.
     pub(in crate::app) fn cs_edit_depth(&self) -> u32 {
         self.edit_depth()
     }

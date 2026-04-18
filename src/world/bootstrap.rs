@@ -584,6 +584,48 @@ pub fn plain_surface_spawn(anchor_depth: u8) -> WorldPos {
     WorldPos::new(path, [0.5, 0.5, 0.5])
 }
 
+/// Demo-planet north-pole spawn that tracks the SDF terrain surface
+/// at any anchor depth. Mirrors `plain_surface_spawn`: walk a
+/// ternary-digit path for `y = 0.80` body-local (= world y = 1.80,
+/// which is the SDF boundary `r = 0.30` from body center at the
+/// pole), then place the camera at offset `y = 0.95` inside the
+/// terminal cell so it sits just above the SDF surface regardless
+/// of depth.
+///
+/// Path-only arithmetic — no f32 world-coord accumulation — so the
+/// camera stays one fractional anchor-cell above terrain at any
+/// `anchor_depth` up to `MAX_DEPTH`. Necessary for test harnesses
+/// that want the cursor/raycast to be within the interaction gate
+/// (`interaction_radius_cells × anchor_cell_size`) at deep zoom.
+pub fn demo_sphere_surface_spawn(anchor_depth: u8) -> WorldPos {
+    // 0.80 base-3 = 0.2̄1̄0̄1̄ repeating period 4 (verify: 2/3 + 1/9 +
+    // 0/27 + 1/81 = 54/81 + 9/81 + 0 + 1/81 = 64/81 = 0.7901, then
+    // cycle contributes the remainder). First digit inside the body
+    // cell (at body depth 1 = root depth 2) is `2`; the pattern
+    // below picks up from there.
+    const Y_PATTERN: [usize; 4] = [2, 1, 0, 1];
+
+    let mut path = Path::root();
+    // Body cell at root center.
+    path.push(slot_index(1, 1, 1) as u8);
+
+    // Digits after the body-cell slot: one per additional depth.
+    let depth = anchor_depth as usize;
+    let body_depth = depth.saturating_sub(1);
+    for d in 0..body_depth {
+        let y_row = Y_PATTERN[d % 4];
+        let slot = slot_index(1, y_row, 1); // x, z centered at north pole
+        path.push(slot as u8);
+    }
+
+    // Offset 0.95 in y puts the camera near the top of the terminal
+    // cell. The surface (y = 0.80 body-local) lies inside that cell
+    // by construction of the path, so offset 0.95 is always strictly
+    // above the surface — distance shrinks geometrically with depth
+    // but stays within the 12-cell interaction radius.
+    WorldPos::new(path, [0.5, 0.95, 0.5])
+}
+
 /// Create a uniform air subtree of the given depth. All children are
 /// recursively air nodes, so the render-frame tree walk can descend
 /// through this region just like it would through a normal tree.

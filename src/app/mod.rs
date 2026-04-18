@@ -224,47 +224,74 @@ impl App {
         let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let render_scale = test_cfg.render_scale.unwrap_or(1).max(1);
-        let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
+        let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(12);
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), Some(test_cfg.plain_layers()));
         let mut world = bootstrap.world;
         let bootstrap_color_registry = bootstrap.color_registry;
         let tree_depth = world.tree_depth();
-        // Resolve spawn position: CLI --spawn-xyz overrides with
-        // root-frame-local coords (precise at shallow depth, then
-        // deepened via slot arithmetic); otherwise use bootstrap's
-        // pre-built WorldPos.
-        let position = match test_cfg.spawn_xyz {
-            Some(xyz) => {
-                debug_assert!(xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
-                let depth = test_cfg.spawn_depth.unwrap_or(
-                    bootstrap.default_spawn_pos.anchor.depth(),
+        // Resolve spawn position. Precedence:
+        //   1. `--spawn-on-surface` — dispatch on world preset to a
+        //      path-based surface-tracking spawn. Works at any depth
+        //      (no f32 world-coord quantization) and keeps the
+        //      camera within the interaction gate regardless of zoom.
+        //   2. `--spawn-xyz` — root-frame-local coords, precise at
+        //      shallow depth and then deepened via slot arithmetic.
+        //      OK for shallow zooms; drifts beyond reach at deep
+        //      zooms because the offset within the anchor cell can't
+        //      track a feature whose world distance is below f32
+        //      epsilon.
+        //   3. Bootstrap's pre-built `default_spawn_pos`.
+        let position = if test_cfg.spawn_on_surface {
+            let depth = test_cfg.spawn_depth.unwrap_or(
+                bootstrap.default_spawn_pos.anchor.depth(),
+            );
+            if bootstrap.plain_layers > 0 {
+                let pos = bootstrap::plain_surface_spawn(depth);
+                bootstrap::carve_air_pocket(&mut world, &pos.anchor, bootstrap.plain_layers);
+                pos
+            } else if bootstrap.planet_path.is_some() {
+                bootstrap::demo_sphere_surface_spawn(depth)
+            } else {
+                eprintln!(
+                    "--spawn-on-surface: no surface-spawn available for this world preset; \
+                     falling back to default_spawn_pos.deepened_to({depth})"
                 );
-                WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
-                    .deepened_to(depth)
+                bootstrap.default_spawn_pos.deepened_to(depth)
             }
-            None => {
-                if let Some(depth) = test_cfg.spawn_depth {
-                    if bootstrap.plain_layers > 0 {
-                        // Surface-tracking spawn: follow the ground through
-                        // the tree at the target depth instead of blindly
-                        // deepening (which drifts away from the surface).
-                        let pos = bootstrap::plain_surface_spawn(depth);
-                        bootstrap::carve_air_pocket(&mut world, &pos.anchor, bootstrap.plain_layers);
-                        pos
+        } else {
+            match test_cfg.spawn_xyz {
+                Some(xyz) => {
+                    debug_assert!(xyz.iter().all(|&v| (0.0..WORLD_SIZE).contains(&v)));
+                    let depth = test_cfg.spawn_depth.unwrap_or(
+                        bootstrap.default_spawn_pos.anchor.depth(),
+                    );
+                    WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
+                        .deepened_to(depth)
+                }
+                None => {
+                    if let Some(depth) = test_cfg.spawn_depth {
+                        if bootstrap.plain_layers > 0 {
+                            // Surface-tracking spawn: follow the ground through
+                            // the tree at the target depth instead of blindly
+                            // deepening (which drifts away from the surface).
+                            let pos = bootstrap::plain_surface_spawn(depth);
+                            bootstrap::carve_air_pocket(&mut world, &pos.anchor, bootstrap.plain_layers);
+                            pos
+                        } else {
+                            let mut pos = bootstrap.default_spawn_pos;
+                            while pos.anchor.depth() > depth { pos.zoom_out(); }
+                            pos = pos.deepened_to(depth);
+                            pos
+                        }
                     } else {
-                        let mut pos = bootstrap.default_spawn_pos;
-                        while pos.anchor.depth() > depth { pos.zoom_out(); }
-                        pos = pos.deepened_to(depth);
-                        pos
+                        // Carve the default spawn for plain worlds so the
+                        // camera starts in air, not embedded in a block.
+                        if bootstrap.plain_layers > 0 {
+                            bootstrap::carve_air_pocket(&mut world, &bootstrap.default_spawn_pos.anchor, bootstrap.plain_layers);
+                        }
+                        bootstrap.default_spawn_pos
                     }
-                } else {
-                    // Carve the default spawn for plain worlds so the
-                    // camera starts in air, not embedded in a block.
-                    if bootstrap.plain_layers > 0 {
-                        bootstrap::carve_air_pocket(&mut world, &bootstrap.default_spawn_pos.anchor, bootstrap.plain_layers);
-                    }
-                    bootstrap.default_spawn_pos
                 }
             }
         };

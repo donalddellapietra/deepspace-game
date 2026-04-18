@@ -67,14 +67,13 @@ pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [
     };
     let face = Face::from_index(face_index as u8);
 
-    let (iu, iv, ir, depth) = face_cell_indices(&hit.path[body_index + 2..]);
-    let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
-    let un0 = iu as f32 / cells;
-    let vn0 = iv as f32 / cells;
-    let rn0 = ir as f32 / cells;
-    let du = 1.0 / cells;
-    let dv = 1.0 / cells;
-    let dr = 1.0 / cells;
+    let b = face_cell_bounds(&hit.path[body_index + 2..]);
+    let un0 = b.u_lo;
+    let vn0 = b.v_lo;
+    let rn0 = b.r_lo;
+    let du = b.size;
+    let dv = b.size;
+    let dr = b.size;
 
     let corners = [
         cubesphere_local::face_space_to_body_point(face, un0,      vn0,      rn0,      inner_r, outer_r, WORLD_SIZE),
@@ -139,14 +138,13 @@ pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
         };
         let face = Face::from_index(face_index as u8);
 
-        let (iu, iv, ir, depth) = face_cell_indices(&hit.path[body_index + 2..]);
-        let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
-        let u_lo = (iu as f32 / cells) * 2.0 - 1.0;
-        let v_lo = (iv as f32 / cells) * 2.0 - 1.0;
-        let r_lo_n = ir as f32 / cells;
-        let du = 2.0 / cells;
-        let dv = 2.0 / cells;
-        let drn = 1.0 / cells;
+        let b = face_cell_bounds(&hit.path[body_index + 2..]);
+        let u_lo = b.u_lo * 2.0 - 1.0;
+        let v_lo = b.v_lo * 2.0 - 1.0;
+        let r_lo_n = b.r_lo;
+        let du = 2.0 * b.size;
+        let dv = 2.0 * b.size;
+        let drn = b.size;
         let r_world_lo = inner_r * body_size + r_lo_n * (outer_r - inner_r) * body_size;
         let dr_world = drn * (outer_r - inner_r) * body_size;
         let corners = block_corners(body_center, face, u_lo, v_lo, r_world_lo, du, dv, dr_world);
@@ -176,25 +174,58 @@ fn hit_path_slots(hit: &HitInfo) -> Path {
     path
 }
 
-/// Accumulate face-subtree slot indices (u, v, r) through the given
-/// path slice. Each slot contributes one base-3 digit per axis.
-///
-/// Use `u64` so we don't overflow at face-subtree depth > 20 (u32
-/// caps out around `3^20 ≈ 3.5e9`). Demo sphere has face depth 28;
-/// the face-tree already goes to tree_depth=30 world-paths.
-fn face_cell_indices(face_path: &[(super::tree::NodeId, usize)]) -> (u64, u64, u64, u32) {
-    let mut iu = 0u64;
-    let mut iv = 0u64;
-    let mut ir = 0u64;
-    let mut depth = 0u32;
+/// A face-subtree cell, expressed directly in normalized `[0, 1]³`
+/// face coordinates as `(u_lo, v_lo, r_lo, size)` — no base-3 integer
+/// indices. Computed via Kahan-compensated f32 accumulation so depth
+/// is not bounded by any integer type's range (`3^40 ≈ 1.2e19`
+/// already exceeds u64; f32 integer accumulation loses precision by
+/// depth ~24). The accumulator mirrors the shader's
+/// `walk_face_subtree` in `face_walk.wgsl`, so CPU + GPU produce the
+/// same bounds at any depth up to `MAX_DEPTH = 63`.
+struct FaceCellBounds {
+    u_lo: f32,
+    v_lo: f32,
+    r_lo: f32,
+    /// Normalized cell width = `3^(-depth)` in face coords.
+    size: f32,
+    depth: u32,
+}
+
+fn face_cell_bounds(face_path: &[(super::tree::NodeId, usize)]) -> FaceCellBounds {
+    // Kahan-compensated running sums per axis. Without compensation,
+    // `u_sum += step_size * us` loses the added term to f32 rounding
+    // once `step_size` falls below ~`u_sum * eps` — which happens
+    // around depth 24 and completely swamps the contribution at
+    // deeper layers.
+    let mut u_sum: f32 = 0.0; let mut u_comp: f32 = 0.0;
+    let mut v_sum: f32 = 0.0; let mut v_comp: f32 = 0.0;
+    let mut r_sum: f32 = 0.0; let mut r_comp: f32 = 0.0;
+    let mut size: f32 = 1.0;
+    let mut depth: u32 = 0;
     for &(_, slot) in face_path {
         let (us, vs, rs) = slot_coords(slot);
-        iu = iu * 3 + us as u64;
-        iv = iv * 3 + vs as u64;
-        ir = ir * 3 + rs as u64;
+        let step_size = size * (1.0 / 3.0);
+        kahan_add(&mut u_sum, &mut u_comp, step_size * us as f32);
+        kahan_add(&mut v_sum, &mut v_comp, step_size * vs as f32);
+        kahan_add(&mut r_sum, &mut r_comp, step_size * rs as f32);
+        size = step_size;
         depth += 1;
     }
-    (iu, iv, ir, depth)
+    FaceCellBounds {
+        u_lo: u_sum + u_comp,
+        v_lo: v_sum + v_comp,
+        r_lo: r_sum + r_comp,
+        size,
+        depth,
+    }
+}
+
+#[inline]
+fn kahan_add(sum: &mut f32, comp: &mut f32, addend: f32) {
+    let y = addend - *comp;
+    let t = *sum + y;
+    *comp = (t - *sum) - y;
+    *sum = t;
 }
 
 fn bounding_box(corners: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
