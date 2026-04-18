@@ -19,7 +19,7 @@ use super::{ActiveFrameKind, App};
 pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = 12;
 pub(super) const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
 pub(super) const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
-pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
+pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 1.0;
 
 impl App {
     pub(super) fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
