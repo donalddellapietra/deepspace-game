@@ -8,7 +8,7 @@
 //! This reuses all the tree-walking machinery; entities are a
 //! different starting root, nothing more.
 
-use crate::world::anchor::{WorldPos, WORLD_SIZE};
+use crate::world::anchor::WORLD_SIZE;
 use crate::world::raycast::{self, HitInfo};
 
 use crate::app::App;
@@ -74,12 +74,11 @@ impl App {
         let mut best_t = f32::INFINITY;
 
         for (i, e) in self.entities.entities.iter().enumerate() {
-            let anchor_depth = e.anchor.depth() as i32;
+            let anchor_depth = e.pos.anchor.depth() as i32;
             if anchor_depth < frame_depth {
                 continue;
             }
-            let origin_pos = WorldPos::new_unchecked(e.anchor, [0.0, 0.0, 0.0]);
-            let bbox_min = origin_pos.in_frame(&frame);
+            let bbox_min = e.pos.in_frame(&frame);
             let size = WORLD_SIZE / 3.0_f32.powi(anchor_depth - frame_depth);
             let bbox_max = [
                 bbox_min[0] + size,

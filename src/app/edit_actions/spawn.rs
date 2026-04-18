@@ -13,10 +13,24 @@
 use std::path::Path as FsPath;
 
 use crate::import;
+use crate::world::anchor::WorldPos;
 use crate::world::palette::block;
 use crate::world::tree::{Child, NodeId};
 
 use crate::app::App;
+
+/// Per-index velocity pattern for test spawns. Deterministic so
+/// rendering tests can reproduce motion exactly.
+///
+/// Uses sin/cos of the entity index to scatter directions across
+/// the horizontal plane; y-component is small so they don't drift
+/// up into the sky. Magnitude ~0.3 cells/sec gives ~0.15 cells of
+/// motion in 30 frames at 60fps — visually obvious without entities
+/// walking off-screen during a short test.
+fn entity_velocity(i: u32) -> [f32; 3] {
+    let phase = i as f32 * 0.173;
+    [phase.sin() * 0.30, phase.cos() * 0.05, phase.cos() * 0.30]
+}
 
 impl App {
     /// Spawn `n` stone-cube entities in front of the camera.
@@ -74,7 +88,9 @@ impl App {
     }
 
     /// Shared grid layout: `n` entities starting one cell in front of
-    /// the camera, filling +X then +Y then +Z. 9x9x... grid.
+    /// the camera, filling +X then +Y then +Z in a 9x9x... pattern.
+    /// Each entity gets a deterministic per-index velocity from
+    /// `entity_velocity(i)` so they drift in varied directions.
     fn spawn_grid(&mut self, subtree_id: NodeId, n: u32) {
         let cam_anchor = self.camera.position.anchor;
         let mut base = cam_anchor;
@@ -98,7 +114,10 @@ impl App {
             for _ in 0..stack {
                 anchor.step_neighbor_cartesian(2, -1);
             }
-            self.entities.spawn(&mut self.world.library, anchor, subtree_id);
+            let pos = WorldPos::new_unchecked(anchor, [0.0, 0.0, 0.0]);
+            let velocity = entity_velocity(i);
+            self.entities
+                .spawn(&mut self.world.library, pos, velocity, subtree_id);
         }
         let after = self.entities.len();
         log::info!(

@@ -4,50 +4,50 @@
 //! Entities share voxel content with each other and with the world
 //! via the content-addressed `NodeLibrary`. A crowd of 10k identical
 //! NPCs stores 1 NodeId in the library plus 10k `Entity` records —
-//! per-instance state is just a Path + a pointer into the library.
+//! per-instance state is just a position + velocity + a pointer
+//! into the library.
 //!
 //! Editing is clone-on-write: breaking a voxel inside an entity
 //! calls `propagate_edit_on_library` against the entity's current
 //! root, producing a new NodeId that gets stashed in
 //! `override_root`. The base `subtree_root` stays shared.
 //!
-//! Rendering: the entity buffer is uploaded to the GPU each frame;
-//! a separate `march_entities` shader pass tests rays against
-//! entity bounding cubes, transforms into local space, and reuses
-//! the existing `march_cartesian` to walk the voxel subtree. The
-//! world ray-march (`march` / ribbon / sphere / face dispatch)
-//! is untouched; occlusion is handled by a depth-test composition
-//! in `main.wgsl`.
+//! Motion: each entity carries a `velocity` in anchor-cell units
+//! per second. `tick(library, dt)` advances `pos.add_local(vel*dt)`
+//! per entity. Movement across cell boundaries is transparent
+//! (WorldPos renormalizes), so anchor cells update automatically.
 //!
-//! V1 scope: entities are axis-aligned, scale = one cell at their
-//! anchor depth, no rotation, no animation, no hash-grid spatial
-//! index. The shader iterates entities linearly per ray — fine up
-//! to ~1k; hash grid is a follow-up for 100k+.
+//! Rendering: the entity buffer is rebuilt every frame (positions
+//! change each tick). `march_entities` in WGSL tests rays against
+//! each entity's AABB, transforms into local subtree space, and
+//! reuses the existing `march_cartesian` to walk voxels.
 
-use crate::world::anchor::Path;
+use crate::world::anchor::WorldPos;
 use crate::world::tree::{NodeId, NodeLibrary};
 
 /// A single entity in the world.
 ///
-/// `anchor` defines both the entity's position AND its bounding
-/// cell: the entity's voxel subtree fills exactly the cell at
-/// `anchor` (one cell at layer `anchor.depth()`). To move within
-/// a cell is currently not supported — moves cross cell boundaries
-/// by stepping the anchor Path.
+/// `pos` is a full `WorldPos` (anchor cell + sub-cell offset),
+/// so sub-cell motion shifts the entity's bbox continuously each
+/// frame without jumping. `velocity` is in anchor-cell units per
+/// second — 1.0 means "cross one anchor cell per second".
 pub struct Entity {
-    /// Bounding cell. The entity's active subtree renders into this
-    /// cell's [0, 3)³ local frame.
-    pub anchor: Path,
+    /// World position of the entity's bbox_min corner. Sub-cell
+    /// offset carries the fine motion; anchor re-normalizes
+    /// automatically when offset crosses a cell boundary.
+    pub pos: WorldPos,
+    /// Per-axis velocity in anchor-cell units per second.
+    pub velocity: [f32; 3],
     /// Canonical voxel content. Shared across entities via library
     /// dedup. NodeLibrary refcount is incremented on spawn.
     pub subtree_root: NodeId,
     /// Per-entity clone-on-write override. `None` = use
-    /// `subtree_root`; `Some` = this entity has been edited and owns
-    /// its own NodeId chain.
+    /// `subtree_root`; `Some` = this entity has been edited and
+    /// owns its own NodeId chain.
     pub override_root: Option<NodeId>,
     /// Cached BFS idx into the GPU tree buffer for `active_root()`.
     /// Written by the upload path; invalid between a mutation and
-    /// the next `sync_pack`. 0 = "not yet packed" sentinel.
+    /// the next upload. 0 = "not yet packed" sentinel.
     pub bfs_idx: u32,
 }
 
@@ -75,19 +75,21 @@ impl EntityStore {
     pub fn len(&self) -> usize { self.entities.len() }
     pub fn is_empty(&self) -> bool { self.entities.is_empty() }
 
-    /// Spawn a new entity at `anchor` backed by `subtree_root`.
-    /// Ref-counts the subtree in the library so it's not evicted
-    /// while an entity references it.
+    /// Spawn a new entity at `pos` with initial `velocity`, backed
+    /// by `subtree_root`. Ref-counts the subtree in the library so
+    /// it's not evicted while an entity references it.
     pub fn spawn(
         &mut self,
         library: &mut NodeLibrary,
-        anchor: Path,
+        pos: WorldPos,
+        velocity: [f32; 3],
         subtree_root: NodeId,
     ) -> u32 {
         library.ref_inc(subtree_root);
         let idx = self.entities.len() as u32;
         self.entities.push(Entity {
-            anchor,
+            pos,
+            velocity,
             subtree_root,
             override_root: None,
             bfs_idx: 0,
@@ -121,5 +123,24 @@ impl EntityStore {
             library.ref_dec(old);
         }
         e.override_root = Some(new_root);
+    }
+
+    /// Advance every entity by `velocity * dt` in its anchor cell's
+    /// local frame. `WorldPos::add_local` renormalizes so crossing a
+    /// cell boundary steps the anchor and wraps the offset — nothing
+    /// else on the entity changes.
+    ///
+    /// CPU cost is O(N). At 10k entities × 60fps = 600k add_local
+    /// calls per second — trivial. The shader's O(N) ray iteration
+    /// is the scaling bottleneck, not this.
+    pub fn tick(&mut self, library: &NodeLibrary, dt: f32) {
+        for e in &mut self.entities {
+            let delta = [
+                e.velocity[0] * dt,
+                e.velocity[1] * dt,
+                e.velocity[2] * dt,
+            ];
+            e.pos.add_local(delta, library);
+        }
     }
 }

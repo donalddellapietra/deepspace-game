@@ -133,21 +133,39 @@ impl Renderer {
         self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
     }
 
-    /// Upload the entity list. Same append/recreate machinery as the
-    /// tree and ribbon buffers — writes a tail when the list grows,
-    /// recreates the buffer on overflow (and rebuilds the bind group
-    /// in that case). `entity_count` on the uniforms gates shader
-    /// iteration so the one-entry stub allocated at init is never
-    /// read when no entities are live.
+    /// Upload the entity list. Always overwrites the buffer from
+    /// offset 0 — unlike the tree/ribbon append-only paths, entity
+    /// positions change every frame under motion, so a tail-only
+    /// write would miss updates to entities whose index didn't
+    /// grow. Recreates the buffer with 1.5× headroom on overflow.
+    ///
+    /// `entity_count` on the uniforms gates shader iteration so the
+    /// one-entry stub allocated at init is never read when no
+    /// entities are live.
     pub fn update_entities(&mut self, entities: &[GpuEntity]) {
         self.entity_count = entities.len() as u32;
         let stub = [GpuEntity::default()];
         let payload: &[GpuEntity] = if entities.is_empty() { &stub } else { entities };
-        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let grew = append_or_recreate(
-            &mut self.entity_buffer, &mut self.uploaded_entities_count,
-            &self.device, &self.queue, "entities", payload, storage,
+        let needed = std::mem::size_of_val(payload) as u64;
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+
+        let mut grew = false;
+        if needed > self.entity_buffer.size() {
+            let raw = (needed * 3 / 2).max(needed + 256);
+            let new_size = raw.div_ceil(16) * 16;
+            self.entity_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("entities"),
+                size: new_size,
+                usage,
+                mapped_at_creation: false,
+            });
+            grew = true;
+        }
+        self.queue.write_buffer(
+            &self.entity_buffer, 0, bytemuck::cast_slice(payload),
         );
+        self.uploaded_entities_count = entities.len() as u64;
+
         if grew {
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,

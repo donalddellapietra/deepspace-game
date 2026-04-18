@@ -464,6 +464,12 @@ impl App {
 
     pub(super) fn update(&mut self, dt: f32) {
         player::update(&mut self.camera, dt);
+        // Advance entities by velocity * dt. WorldPos renormalizes
+        // on each entity, so cell-boundary crossings are handled
+        // without the bbox computation seeing discontinuities.
+        if !self.entities.is_empty() {
+            self.entities.tick(&self.world.library, dt);
+        }
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
             renderer.update_camera(&cam_gpu);

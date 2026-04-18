@@ -8,7 +8,7 @@
 
 use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
-use crate::world::anchor::{WorldPos, WORLD_SIZE};
+use crate::world::anchor::WORLD_SIZE;
 use crate::world::gpu::{self, GpuEntity};
 
 impl App {
@@ -49,20 +49,23 @@ impl App {
                 cache.root_bfs_idx,
             );
         }
-        // Build per-frame GPU records. Skip entities at or above
-        // the frame (v1: entities smaller than the frame only;
-        // larger entities would contain the camera, which needs
-        // special handling we'll add with LOD).
+        // Build per-frame GPU records. `pos.in_frame(frame)` gives
+        // the entity's bbox_min corner in the current frame's local
+        // [0, 3)³ coords — sub-cell offset shifts this continuously
+        // each frame, driving smooth motion under `EntityStore::tick`.
+        //
+        // Skip entities at or above the frame depth (v1: entities
+        // must be smaller than the frame cell; larger entities
+        // would contain the camera — handled later with LOD).
         let frame = self.active_frame.render_path;
         let frame_depth = frame.depth() as i32;
         let mut gpu = Vec::with_capacity(self.entities.len());
         for e in &self.entities.entities {
-            let anchor_depth = e.anchor.depth() as i32;
+            let anchor_depth = e.pos.anchor.depth() as i32;
             if anchor_depth < frame_depth {
                 continue;
             }
-            let origin_pos = WorldPos::new_unchecked(e.anchor, [0.0, 0.0, 0.0]);
-            let bbox_min = origin_pos.in_frame(&frame);
+            let bbox_min = e.pos.in_frame(&frame);
             let size = WORLD_SIZE / 3.0_f32.powi(anchor_depth - frame_depth);
             gpu.push(GpuEntity {
                 bbox_min,

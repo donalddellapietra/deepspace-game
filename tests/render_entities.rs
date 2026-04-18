@@ -175,6 +175,47 @@ fn many_soldiers_change_large_area() {
     );
 }
 
+/// Motion at 100 entities: capture frame 0 and frame 60 of the
+/// same run; with per-entity velocity, the pixel images must
+/// differ. Proves `EntityStore::tick` + per-frame re-upload are
+/// wired through to the rendered output.
+#[test]
+fn soldiers_move_100() {
+    let _guard = visibility_test_lock();
+    ensure_soldier_vox();
+    run_motion_test("motion_100", 100, 60, 0.01);
+}
+
+/// Motion at 1000 entities. Same check, expecting a larger delta
+/// because more soldiers are drifting independently. If this fails
+/// at 1000 while 100 passes, the issue is most likely the shader
+/// iterating a stale entity buffer (bind group not rebound?).
+#[test]
+fn soldiers_move_1000() {
+    let _guard = visibility_test_lock();
+    ensure_soldier_vox();
+    run_motion_test("motion_1000", 1000, 60, 0.02);
+}
+
+/// Motion at 10000 entities. Pushes the O(N) shader scan hard —
+/// expect frame times in the tens-of-ms at 640×360. Test allows
+/// more wall-clock time (20s timeout) and fewer tick frames (30)
+/// to stay inside the budget. Hash-grid binning in a follow-up
+/// should drop this test's frame time by an order of magnitude.
+#[test]
+fn soldiers_move_10000() {
+    let _guard = visibility_test_lock();
+    ensure_soldier_vox();
+    run_motion_test_with_budget(
+        "motion_10000",
+        10000,
+        30,   // fewer ticks to keep wall-clock reasonable
+        0.02,
+        "80", // total run frames (script needs wait:5 + screenshot + wait:30 + screenshot + tail)
+        "120", // timeout secs: 10k entities at O(N) shader scan can hit 100ms+/frame
+    );
+}
+
 /// Camera pointed away from the spawn cell should NOT show the
 /// entity — the AABB cull must reject rays that miss the entity
 /// box. Guards against "entities rendered on every ray" bugs.
@@ -224,6 +265,103 @@ fn soldier_invisible_when_camera_faces_away() {
         "entity leaked into view when camera faces away: changed_frac={:.4} bbox={:?}",
         diff.changed_frac, diff.bbox,
     );
+}
+
+// ------------------------------------------------------- motion runner
+
+/// Run the harness once, spawn `count` soldiers, capture a
+/// screenshot before motion and after `tick_frames` of simulation,
+/// and assert the two images differ by at least `min_frac`.
+fn run_motion_test(name: &str, count: u32, tick_frames: u32, min_frac: f64) {
+    // Total frames must cover: a few settle frames + both
+    // screenshots + the wait between them.
+    let total_frames = (tick_frames + 40).to_string();
+    run_motion_test_with_budget(name, count, tick_frames, min_frac, &total_frames, "30");
+}
+
+fn run_motion_test_with_budget(
+    name: &str,
+    count: u32,
+    tick_frames: u32,
+    min_frac: f64,
+    total_frames: &str,
+    timeout_secs: &str,
+) {
+    let dir = tmp_dir(name);
+    let frame_a = dir.join("frame_a.png");
+    let frame_b = dir.join("frame_b.png");
+    let _ = std::fs::remove_file(&frame_a);
+    let _ = std::fs::remove_file(&frame_b);
+
+    let count_str = count.to_string();
+    let script = format!(
+        "wait:5,screenshot:{},wait:{},screenshot:{}",
+        frame_a.display(),
+        tick_frames,
+        frame_b.display(),
+    );
+
+    let args: &[&str] = &[
+        "--render-harness",
+        "--disable-overlay",
+        "--disable-highlight",
+        "--plain-world",
+        "--plain-layers", "40",
+        "--spawn-depth", "6",
+        "--spawn-xyz", "1.5", "1.5", "1.8",
+        "--spawn-yaw", "0",
+        "--spawn-pitch", "0",
+        "--harness-width", "640",
+        "--harness-height", "360",
+        "--exit-after-frames", total_frames,
+        "--timeout-secs", timeout_secs,
+        "--spawn-entity", "assets/vox/soldier.vox",
+        "--spawn-entity-count", &count_str,
+        "--script", &script,
+    ];
+
+    let exe = env!("CARGO_BIN_EXE_deepspace-game");
+    let mut cmd = Command::new(exe);
+    for a in args { cmd.arg(a); }
+    let output = cmd.output().expect("run harness");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{name} harness did not exit 0; stderr tail:\n{}",
+        stderr.lines().rev().take(30).collect::<Vec<_>>().join("\n"),
+    );
+    assert!(frame_a.exists(), "{name}: frame_a missing");
+    assert!(frame_b.exists(), "{name}: frame_b missing");
+
+    let before = load_png_rgb(&frame_a);
+    let after = load_png_rgb(&frame_b);
+    let diff = image_diff(&before, &after);
+    let frame_ms = parse_avg_frame_ms(&stderr).unwrap_or(0.0);
+    eprintln!(
+        "{name}: count={count} tick_frames={tick_frames} changed_frac={:.4} avg_frame_ms={:.2}",
+        diff.changed_frac, frame_ms,
+    );
+    assert!(
+        diff.changed_frac > min_frac,
+        "{name}: entities didn't move enough between frames: changed_frac={:.4} (threshold {}); \
+         frame_a={} frame_b={}",
+        diff.changed_frac, min_frac,
+        frame_a.display(), frame_b.display(),
+    );
+}
+
+/// Extract `avg_ms ... total=<x>` from the harness's timing log
+/// line so scale tests can report per-count perf costs.
+fn parse_avg_frame_ms(stderr: &str) -> Option<f64> {
+    for line in stderr.lines() {
+        if !line.contains("render_harness_timing") { continue; }
+        for field in line.split_whitespace() {
+            if let Some(v) = field.strip_prefix("total=") {
+                return v.parse().ok();
+            }
+        }
+    }
+    None
 }
 
 // ------------------------------------------------------- helpers
