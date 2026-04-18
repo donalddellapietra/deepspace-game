@@ -169,6 +169,10 @@ impl TestConfig {
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
                 "--sphere-world" => { cfg.world_preset = WorldPreset::DemoSphere; }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
+                "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
+                "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }
+                "--jerusalem-cross-world" => { cfg.world_preset = WorldPreset::JerusalemCross; }
+                "--sierpinski-pyramid-world" => { cfg.world_preset = WorldPreset::SierpinskiPyramid; }
                 "--vox-model" => {
                     if let Some(path_str) = args.next() {
                         // Interior depth may be set before or after this

@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod cubesphere;
 pub mod cubesphere_local;
 pub mod edit;
+pub mod fractals;
 pub mod gpu;
 pub mod palette;
 pub mod raycast;

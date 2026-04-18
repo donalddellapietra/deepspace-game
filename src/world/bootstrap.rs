@@ -24,6 +24,21 @@ pub enum WorldPreset {
     /// per level, no uniform collapse — stresses the packer's
     /// preserved-detail path in a way plain/sphere don't.
     Menger,
+    /// Sierpinski tetrahedron — 4 tetrahedral corners per level
+    /// (trinary adaptation of PySpace's `FoldSierpinski + FoldScale(2)`).
+    /// Very sparse: 4/27 cells filled.
+    SierpinskiTet,
+    /// Cantor dust in 3D — 8 corner cells per level (all coords ∈
+    /// {0, 2}). The canonical ternary set extended to three dimensions.
+    /// Colored as an 8-hue prismatic orbit trap.
+    CantorDust,
+    /// Jerusalem cross / axial plus — the complement of Menger: 7
+    /// cells (body centre + 6 face centres) per level. A delicate
+    /// self-similar scaffold of orthogonal rods.
+    JerusalemCross,
+    /// Stepped Sierpinski pyramid — 4 base corners + 1 apex per
+    /// level. Ziggurat-like self-similarity with a distinct "up" axis.
+    SierpinskiPyramid,
     /// Imported `.vox` model placed inside a plain world. Uses the
     /// GLB→vox→tree pipeline (see `src/import/` and
     /// `tools/glb_to_vox.py`). The model is planted at the center
@@ -71,51 +86,39 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
     match preset {
         WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
-        WorldPreset::Menger => bootstrap_menger_world(plain_layers.unwrap_or(20)),
+        WorldPreset::Menger => crate::world::fractals::menger::bootstrap_menger_world(
+            plain_layers.unwrap_or(20),
+        ),
+        WorldPreset::SierpinskiTet => {
+            crate::world::fractals::sierpinski_tet::bootstrap_sierpinski_tet_world(
+                plain_layers.unwrap_or(20),
+            )
+        }
+        WorldPreset::CantorDust => {
+            crate::world::fractals::cantor_dust::bootstrap_cantor_dust_world(
+                plain_layers.unwrap_or(20),
+            )
+        }
+        WorldPreset::JerusalemCross => {
+            crate::world::fractals::jerusalem_cross::bootstrap_jerusalem_cross_world(
+                plain_layers.unwrap_or(20),
+            )
+        }
+        WorldPreset::SierpinskiPyramid => {
+            crate::world::fractals::sierpinski_pyramid::bootstrap_sierpinski_pyramid_world(
+                plain_layers.unwrap_or(20),
+            )
+        }
         WorldPreset::VoxModel { path, interior_depth } => bootstrap_vox_model_world(
             &path, plain_layers.unwrap_or(8), interior_depth,
         ),
     }
 }
 
-/// Build a Menger sponge of the given depth. Content-addressed
-/// dedup means storage is O(depth), not O(20^depth) — all 20
-/// non-empty cells at each level point to the same sub-sponge.
-pub fn menger_world(depth: u8) -> WorldState {
-    let mut lib = NodeLibrary::default();
-
-    // Level 1: 27 children, leaves are stone/empty per Menger pattern.
-    let mut children = empty_children();
-    for z in 0..BRANCH {
-        for y in 0..BRANCH {
-            for x in 0..BRANCH {
-                let count = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-                if count >= 2 { continue; }
-                children[slot_index(x, y, z)] = Child::Block(block::STONE);
-            }
-        }
-    }
-    let mut current = lib.insert(children);
-
-    // Levels 2..=depth: each non-empty slot points to the previous
-    // level's node. Dedup compresses this to one node per level.
-    for _ in 1..depth {
-        let mut children = empty_children();
-        for z in 0..BRANCH {
-            for y in 0..BRANCH {
-                for x in 0..BRANCH {
-                    let count = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-                    if count >= 2 { continue; }
-                    children[slot_index(x, y, z)] = Child::Node(current);
-                }
-            }
-        }
-        current = lib.insert(children);
-    }
-
-    lib.ref_inc(current);
-    WorldState { root: current, library: lib }
-}
+/// Re-export of [`crate::world::fractals::menger::menger_world`] for
+/// existing call-sites (e.g. `gpu/pack.rs` baseline tests). The full
+/// colored bootstrap lives in [`crate::world::fractals::menger`].
+pub use crate::world::fractals::menger::menger_world;
 
 /// Load a `.vox` file via the import pipeline and embed it as the
 /// child of a tree of `total_depth` levels. The model sits at the
@@ -261,28 +264,6 @@ fn bootstrap_vox_model_world(
         default_spawn_pitch: pitch,
         plain_layers: total_depth,
         color_registry: registry,
-    }
-}
-
-fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
-    let depth = depth.min(MAX_DEPTH as u8);
-    let world = menger_world(depth);
-    // Spawn outside the sponge looking toward it. Menger sits in
-    // [0, 3)³ at the root; place the camera at (2.5, 2.0, 2.5) so
-    // the sponge fills the lower-left view.
-    let spawn_pos = WorldPos::from_frame_local(
-        &Path::root(),
-        [2.5, 2.0, 2.5],
-        2,
-    ).deepened_to(8);
-    WorldBootstrap {
-        world,
-        planet_path: None,
-        default_spawn_pos: spawn_pos,
-        default_spawn_yaw: -std::f32::consts::FRAC_PI_4,
-        default_spawn_pitch: -0.6,
-        plain_layers: depth,
-        color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
 
