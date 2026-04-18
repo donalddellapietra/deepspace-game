@@ -1,19 +1,77 @@
 //! `do_break` / `do_place`: cursor-driven edits that feed the hit
 //! into `world::edit` and re-upload on success.
+//!
+//! The cursor raycast returns either a world hit (existing behavior)
+//! or an entity hit. Entity edits bypass the world tree entirely —
+//! they clone-on-write the entity's subtree via
+//! `propagate_edit_on_library` and stash the new root in
+//! `entity.override_root`. The world root is untouched; only the
+//! per-entity NodeId changes. 10k identical NPCs stay deduped
+//! except for the one whose voxel you just damaged.
 
 use crate::game_state::HotbarItem;
 use crate::world::anchor::Path;
 use crate::world::edit;
+use crate::world::raycast::HitInfo;
+use crate::world::tree::Child;
 
+use super::CursorHit;
 use crate::app::App;
 
 impl App {
     pub(in crate::app) fn do_break(&mut self) {
-        let hit = self.frame_aware_raycast();
-        let Some(hit) = hit else {
+        let Some(hit) = self.cursor_raycast() else {
             eprintln!("do_break: no hit");
             return;
         };
+        match hit {
+            CursorHit::World(h) => self.do_break_world(h),
+            CursorHit::Entity { entity_idx, inner } => {
+                self.do_break_entity(entity_idx, inner);
+            }
+        }
+    }
+
+    pub(in crate::app) fn do_place(&mut self) {
+        let Some(hit) = self.cursor_raycast() else {
+            eprintln!("do_place: no hit");
+            return;
+        };
+        match hit {
+            CursorHit::World(h) => self.do_place_world(h),
+            CursorHit::Entity { entity_idx, inner } => {
+                // Placement into an entity: for v1 we support "break"
+                // (click = turn voxel to air). Placement into entities
+                // is a follow-up — it needs a face-direction notion
+                // that works inside the entity's local frame.
+                eprintln!(
+                    "do_place_entity: not implemented yet, entity_idx={} path_len={}",
+                    entity_idx, inner.path.len(),
+                );
+            }
+        }
+    }
+
+    fn do_break_entity(&mut self, entity_idx: u32, inner: HitInfo) {
+        eprintln!(
+            "do_break_entity: entity_idx={} path_len={} face={}",
+            entity_idx, inner.path.len(), inner.face,
+        );
+        if inner.path.is_empty() {
+            return;
+        }
+        let new_root = edit::propagate_edit_on_library(
+            &mut self.world.library,
+            &inner.path,
+            Child::Empty,
+        );
+        let Some(new_root) = new_root else { return };
+        self.entities
+            .set_override(&mut self.world.library, entity_idx, new_root);
+        self.upload_tree();
+    }
+
+    fn do_break_world(&mut self, hit: HitInfo) {
         eprintln!(
             "do_break: hit path_len={} face={} place_path_len={:?}",
             hit.path.len(),
@@ -22,7 +80,6 @@ impl App {
         );
 
         if self.save_mode {
-            use crate::world::tree::Child;
             let mut saved_id = None;
             if let Some(&(parent_id, slot)) = hit.path.last() {
                 if let Some(node) = self.world.library.get(parent_id) {
@@ -59,12 +116,7 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn do_place(&mut self) {
-        let hit = self.frame_aware_raycast();
-        let Some(hit) = hit else {
-            eprintln!("do_place: no hit");
-            return;
-        };
+    fn do_place_world(&mut self, hit: HitInfo) {
         eprintln!(
             "do_place: hit path_len={} face={} place_path_len={:?} active_slot={}",
             hit.path.len(),
@@ -93,7 +145,7 @@ impl App {
                 let node_id = saved.node_id;
                 let changed = edit::place_child(
                     &mut self.world, &hit,
-                    crate::world::tree::Child::Node(node_id),
+                    Child::Node(node_id),
                 );
                 eprintln!("do_place: mesh_idx={} node_id={} changed={changed}", idx, node_id);
                 self.harness_emit_edit("placed", &hit, changed);

@@ -5,7 +5,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuPalette, GpuRibbonEntry};
 
 use super::{GpuUniforms, Renderer, MAX_RIBBON_LEN};
 
@@ -72,6 +72,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.entity_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -121,6 +122,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.entity_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -129,6 +131,33 @@ impl Renderer {
 
     pub fn update_palette(&self, palette: &GpuPalette) {
         self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
+    }
+
+    /// Upload the entity list. Same append/recreate machinery as the
+    /// tree and ribbon buffers — writes a tail when the list grows,
+    /// recreates the buffer on overflow (and rebuilds the bind group
+    /// in that case). `entity_count` on the uniforms gates shader
+    /// iteration so the one-entry stub allocated at init is never
+    /// read when no entities are live.
+    pub fn update_entities(&mut self, entities: &[GpuEntity]) {
+        self.entity_count = entities.len() as u32;
+        let stub = [GpuEntity::default()];
+        let payload: &[GpuEntity] = if entities.is_empty() { &stub } else { entities };
+        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let grew = append_or_recreate(
+            &mut self.entity_buffer, &mut self.uploaded_entities_count,
+            &self.device, &self.queue, "entities", payload, storage,
+        );
+        if grew {
+            self.bind_group = make_bind_group(
+                &self.device, &self.bind_group_layout,
+                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.entity_buffer,
+            );
+        }
+        self.write_uniforms();
     }
 
     pub fn update_camera(&mut self, camera: &GpuCamera) {
@@ -161,6 +190,8 @@ impl Renderer {
             highlight_active: self.highlight_active,
             root_kind: self.root_kind,
             ribbon_count: self.ribbon_count,
+            entity_count: self.entity_count,
+            _pad_entity: [0; 3],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             root_radii: self.root_radii,
@@ -253,6 +284,7 @@ pub(super) fn make_bind_group(
     ribbon: &wgpu::Buffer,
     shader_stats: &wgpu::Buffer,
     node_offsets: &wgpu::Buffer,
+    entities: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -266,6 +298,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: entities.as_entire_binding() },
         ],
     })
 }

@@ -1,0 +1,125 @@
+//! Entities: voxel subtrees placed at arbitrary cells in the world
+//! tree, kept outside the tree in a flat buffer.
+//!
+//! Entities share voxel content with each other and with the world
+//! via the content-addressed `NodeLibrary`. A crowd of 10k identical
+//! NPCs stores 1 NodeId in the library plus 10k `Entity` records —
+//! per-instance state is just a Path + a pointer into the library.
+//!
+//! Editing is clone-on-write: breaking a voxel inside an entity
+//! calls `propagate_edit_on_library` against the entity's current
+//! root, producing a new NodeId that gets stashed in
+//! `override_root`. The base `subtree_root` stays shared.
+//!
+//! Rendering: the entity buffer is uploaded to the GPU each frame;
+//! a separate `march_entities` shader pass tests rays against
+//! entity bounding cubes, transforms into local space, and reuses
+//! the existing `march_cartesian` to walk the voxel subtree. The
+//! world ray-march (`march` / ribbon / sphere / face dispatch)
+//! is untouched; occlusion is handled by a depth-test composition
+//! in `main.wgsl`.
+//!
+//! V1 scope: entities are axis-aligned, scale = one cell at their
+//! anchor depth, no rotation, no animation, no hash-grid spatial
+//! index. The shader iterates entities linearly per ray — fine up
+//! to ~1k; hash grid is a follow-up for 100k+.
+
+use crate::world::anchor::Path;
+use crate::world::tree::{NodeId, NodeLibrary};
+
+/// A single entity in the world.
+///
+/// `anchor` defines both the entity's position AND its bounding
+/// cell: the entity's voxel subtree fills exactly the cell at
+/// `anchor` (one cell at layer `anchor.depth()`). To move within
+/// a cell is currently not supported — moves cross cell boundaries
+/// by stepping the anchor Path.
+pub struct Entity {
+    /// Bounding cell. The entity's active subtree renders into this
+    /// cell's [0, 3)³ local frame.
+    pub anchor: Path,
+    /// Canonical voxel content. Shared across entities via library
+    /// dedup. NodeLibrary refcount is incremented on spawn.
+    pub subtree_root: NodeId,
+    /// Per-entity clone-on-write override. `None` = use
+    /// `subtree_root`; `Some` = this entity has been edited and owns
+    /// its own NodeId chain.
+    pub override_root: Option<NodeId>,
+    /// Cached BFS idx into the GPU tree buffer for `active_root()`.
+    /// Written by the upload path; invalid between a mutation and
+    /// the next `sync_pack`. 0 = "not yet packed" sentinel.
+    pub bfs_idx: u32,
+}
+
+impl Entity {
+    /// NodeId actually used for rendering/editing — the override if
+    /// one exists, otherwise the shared subtree root.
+    pub fn active_root(&self) -> NodeId {
+        self.override_root.unwrap_or(self.subtree_root)
+    }
+}
+
+/// Flat storage for all entities. Separate from the world tree;
+/// lives on the App alongside `world: WorldState`.
+pub struct EntityStore {
+    pub entities: Vec<Entity>,
+}
+
+impl Default for EntityStore {
+    fn default() -> Self { Self::new() }
+}
+
+impl EntityStore {
+    pub fn new() -> Self { Self { entities: Vec::new() } }
+
+    pub fn len(&self) -> usize { self.entities.len() }
+    pub fn is_empty(&self) -> bool { self.entities.is_empty() }
+
+    /// Spawn a new entity at `anchor` backed by `subtree_root`.
+    /// Ref-counts the subtree in the library so it's not evicted
+    /// while an entity references it.
+    pub fn spawn(
+        &mut self,
+        library: &mut NodeLibrary,
+        anchor: Path,
+        subtree_root: NodeId,
+    ) -> u32 {
+        library.ref_inc(subtree_root);
+        let idx = self.entities.len() as u32;
+        self.entities.push(Entity {
+            anchor,
+            subtree_root,
+            override_root: None,
+            bfs_idx: 0,
+        });
+        idx
+    }
+
+    /// Remove all entities. Decrements library refs for every
+    /// subtree/override so unused content can be reclaimed.
+    pub fn clear(&mut self, library: &mut NodeLibrary) {
+        for e in self.entities.drain(..) {
+            library.ref_dec(e.subtree_root);
+            if let Some(o) = e.override_root {
+                library.ref_dec(o);
+            }
+        }
+    }
+
+    /// Replace entity `idx`'s override_root with `new_root`, updating
+    /// library refcounts. Old override (if any) gets decremented;
+    /// new one gets incremented.
+    pub fn set_override(
+        &mut self,
+        library: &mut NodeLibrary,
+        idx: u32,
+        new_root: NodeId,
+    ) {
+        let e = &mut self.entities[idx as usize];
+        library.ref_inc(new_root);
+        if let Some(old) = e.override_root {
+            library.ref_dec(old);
+        }
+        e.override_root = Some(new_root);
+    }
+}

@@ -107,6 +107,16 @@ impl CachedTree {
         self.root_bfs_idx = bfs;
     }
 
+    /// Ensure `nid` is packed into this buffer and return its BFS
+    /// idx. Same content-addressed reuse as `update_root`: hitting
+    /// a previously-packed NodeId is O(1) with zero buffer writes.
+    ///
+    /// Used for auxiliary roots (entity subtrees) that live outside
+    /// `world.root` but share the same GPU tree buffer.
+    pub fn ensure_root(&mut self, library: &NodeLibrary, nid: NodeId) -> u32 {
+        self.emit_or_lookup(library, nid)
+    }
+
     /// Resolve a NodeId to a BFS idx, packing it (and any missing
     /// descendants) on the fly. Content-addressed reuse via
     /// `bfs_by_nid`: if we packed this NodeId earlier, return that

@@ -9,6 +9,7 @@
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
 #include "march.wgsl"
+#include "entities.wgsl"
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -55,7 +56,17 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 /// is a small precision hit but not a visible one.
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir = jittered_ray_dir(uv);
-    let result = march(camera.pos, ray_dir);
+    let world_hit = march(camera.pos, ray_dir);
+    // Entity pass: untouched world march + a separate scan over the
+    // entity buffer. The two hits compose by min-t — voxel in front
+    // of entity wins via standard depth ordering, and vice versa.
+    let entity_hit = march_entities(camera.pos, ray_dir);
+    var result: HitResult;
+    if entity_hit.hit && (!world_hit.hit || entity_hit.t < world_hit.t) {
+        result = entity_hit;
+    } else {
+        result = world_hit;
+    }
 
     var color: vec3<f32>;
     if result.hit {

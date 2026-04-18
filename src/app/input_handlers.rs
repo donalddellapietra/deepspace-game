@@ -43,6 +43,14 @@ impl App {
                 self.log_location();
                 return;
             }
+            if code == KeyCode::KeyN {
+                self.spawn_test_entities(10);
+                return;
+            }
+            if code == KeyCode::KeyM {
+                self.spawn_test_entities(1000);
+                return;
+            }
         }
 
         if pressed && code == KeyCode::Escape {

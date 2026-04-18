@@ -87,6 +87,24 @@ pub struct GpuCamera {
     pub fov: f32,
 }
 
+/// One entity instance on the GPU: a bounding cube in the current
+/// render frame's [0, 3)³ local coords plus a BFS idx into the
+/// shared `tree[]` buffer for the entity's voxel subtree.
+///
+/// The shader ray-marches against `bbox_min`/`bbox_max`; on AABB
+/// hit it transforms the ray into the subtree's local [0, 3)³
+/// space and calls the existing `march_cartesian(subtree_bfs, ...)`.
+///
+/// 32 bytes total (vec4-aligned for WGSL storage buffer).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
+pub struct GpuEntity {
+    pub bbox_min: [f32; 3],
+    pub _pad0: f32,
+    pub bbox_max: [f32; 3],
+    pub subtree_bfs: u32,
+}
+
 /// Block color palette — up to 256 RGBA colors indexed by block type.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

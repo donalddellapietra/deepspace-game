@@ -8,7 +8,8 @@
 
 use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
-use crate::world::gpu;
+use crate::world::anchor::{WorldPos, WORLD_SIZE};
+use crate::world::gpu::{self, GpuEntity};
 
 impl App {
     pub(in crate::app) fn upload_tree(&mut self) {
@@ -16,6 +17,61 @@ impl App {
         self.highlight_epoch = self.highlight_epoch.wrapping_add(1);
         self.cached_highlight = None;
         self.upload_tree_lod();
+    }
+
+    /// Pack every entity's active root into the shared GPU tree
+    /// buffer, then build a per-frame `GpuEntity` list and upload it
+    /// to the entity buffer. Runs at the end of `upload_tree_lod`
+    /// so `self.active_frame.render_path` is already set.
+    ///
+    /// Entity subtrees live in the same `tree[]` as the world root —
+    /// the content-addressed cache means 10k identical entities
+    /// share one packed subtree at zero cost.
+    pub(in crate::app) fn upload_entities(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        if self.entities.is_empty() {
+            renderer.update_entities(&[]);
+            return;
+        }
+        let Some(cache) = self.cached_tree.as_mut() else { return };
+        let len_before_u32 = cache.tree.len();
+        let kinds_before = cache.node_kinds.len();
+        for e in self.entities.entities.iter_mut() {
+            e.bfs_idx = cache.ensure_root(&self.world.library, e.active_root());
+        }
+        // If packing entity content appended new nodes, push the
+        // tail to GPU — same append-only path world edits use.
+        if cache.tree.len() != len_before_u32 || cache.node_kinds.len() != kinds_before {
+            renderer.update_tree(
+                &cache.tree,
+                &cache.node_kinds,
+                &cache.node_offsets,
+                cache.root_bfs_idx,
+            );
+        }
+        // Build per-frame GPU records. Skip entities at or above
+        // the frame (v1: entities smaller than the frame only;
+        // larger entities would contain the camera, which needs
+        // special handling we'll add with LOD).
+        let frame = self.active_frame.render_path;
+        let frame_depth = frame.depth() as i32;
+        let mut gpu = Vec::with_capacity(self.entities.len());
+        for e in &self.entities.entities {
+            let anchor_depth = e.anchor.depth() as i32;
+            if anchor_depth < frame_depth {
+                continue;
+            }
+            let origin_pos = WorldPos::new_unchecked(e.anchor, [0.0, 0.0, 0.0]);
+            let bbox_min = origin_pos.in_frame(&frame);
+            let size = WORLD_SIZE / 3.0_f32.powi(anchor_depth - frame_depth);
+            gpu.push(GpuEntity {
+                bbox_min,
+                _pad0: 0.0,
+                bbox_max: [bbox_min[0] + size, bbox_min[1] + size, bbox_min[2] + size],
+                subtree_bfs: e.bfs_idx,
+            });
+        }
+        renderer.update_entities(&gpu);
     }
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
@@ -111,6 +167,13 @@ impl App {
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
+
+        // Entity pass: pack entity subtrees into the shared tree
+        // buffer (if not already) and upload per-frame bboxes. Runs
+        // every frame — entity bboxes depend on the render frame,
+        // which shifts as the camera zooms.
+        self.upload_entities();
+
         if self.startup_profile_frames < 12 {
             eprintln!(
                 "startup_perf upload_tree_lod frame={} reused={} pack_ms={:.2} ribbon_ms={:.2} frame_depth={} render_depth={} visual_depth={} kind={:?}",

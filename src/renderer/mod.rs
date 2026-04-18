@@ -42,6 +42,11 @@ pub struct GpuUniforms {
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
     pub ribbon_count: u32,
+    /// Number of live entities in the entity buffer (binding 8).
+    /// The shader iterates `0..entity_count` to test entity AABB
+    /// intersections per ray.
+    pub entity_count: u32,
+    pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
     /// Body radii (used iff `root_kind == 1`). Stored in the body
@@ -89,6 +94,13 @@ pub struct Renderer {
     pub(super) palette_buffer: wgpu::Buffer,
     pub(super) uniforms_buffer: wgpu::Buffer,
     pub(super) ribbon_buffer: wgpu::Buffer,
+    /// Per-entity bounding-cube + subtree-BFS storage buffer
+    /// (binding 8). Read by `march_entities` in the fragment
+    /// shader. Flat layout; the shader iterates all `entity_count`
+    /// entries per ray in v1 (hash-grid binning comes later).
+    pub(super) entity_buffer: wgpu::Buffer,
+    pub(super) uploaded_entities_count: u64,
+    pub(super) entity_count: u32,
     pub(super) bind_group: wgpu::BindGroup,
     pub(super) root_index: u32,
     pub(super) node_count: u32,

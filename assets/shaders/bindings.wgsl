@@ -34,6 +34,13 @@ struct Uniforms {
     /// pops upward, walking ribbon[0]..ribbon[ribbon_count-1].
     /// 0 = no ancestors (frame is at world root).
     ribbon_count: u32,
+    /// Number of live entities in the entity buffer (binding 8).
+    /// `march_entities` iterates `0..entity_count` — zero means
+    /// skip the entity pass entirely.
+    entity_count: u32,
+    _pad_entity0: u32,
+    _pad_entity1: u32,
+    _pad_entity2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
@@ -127,6 +134,19 @@ struct ShaderStats {
 /// (touched on descent and ribbon pops). The inner DDA loop never
 /// reads this buffer.
 @group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
+
+/// Flat entity list. Each entity carries a bounding cube in the
+/// current render frame's [0, 3)³ local coords plus a BFS idx
+/// into `tree[]` for its voxel subtree. `march_entities` iterates
+/// `0..uniforms.entity_count` per ray (v1; hash-grid binning
+/// replaces the linear scan in v2).
+struct EntityGpu {
+    bbox_min: vec3<f32>,
+    _pad0: f32,
+    bbox_max: vec3<f32>,
+    subtree_bfs: u32,
+}
+@group(0) @binding(8) var<storage, read> entities: array<EntityGpu>;
 
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.

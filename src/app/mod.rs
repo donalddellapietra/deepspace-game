@@ -215,6 +215,10 @@ pub struct App {
     /// fine detail along the edit path visible, even when the camera
     /// is far enough from the surface that LOD would normally collapse it.
     pub(super) last_edit_slots: Option<Path>,
+    /// All live entities. Flat Vec, no ECS — the old npc-instancing
+    /// branch's 40× perf-over-ECS lesson. Visual content shared via
+    /// `NodeLibrary`; position + override state per-entity.
+    pub(super) entities: crate::world::entities::EntityStore,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -396,6 +400,7 @@ impl App {
             last_crosshair_sent: None,
             cached_highlight: None,
             last_edit_slots: None,
+            entities: crate::world::entities::EntityStore::new(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]

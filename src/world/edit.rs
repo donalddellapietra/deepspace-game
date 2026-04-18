@@ -240,34 +240,50 @@ fn build_placement_chain_from_slots(
 
 /// Apply an edit and propagate clone-on-write up to root.
 fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bool {
-    if hit.path.is_empty() {
-        return false;
+    match propagate_edit_on_library(&mut world.library, &hit.path, new_child) {
+        Some(new_root) => {
+            world.swap_root(new_root);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Pure clone-on-write ancestor walk over a library, returning the
+/// new root NodeId. Does not touch any `WorldState` — usable for
+/// entity-subtree edits where the "root" is the entity's part root,
+/// not `world.root`.
+///
+/// EMPTY_NODE sentinel = "synthesize a fresh empty Cartesian node
+/// for this level" — used by sphere placement to extend the
+/// placement path past the tree's existing empty terminals down to
+/// the user's chosen cs_edit_depth, so the placed block's cell size
+/// is consistent regardless of how deep the nearest real empty
+/// terminal lived.
+///
+/// NodeKind preservation is CRITICAL. Without it, an edit through a
+/// `CubedSphereBody` or `CubedSphereFace` ancestor reinserts it as
+/// Cartesian, the shader's NodeKind dispatch stops firing, and the
+/// walker descends into the body's children Cartesian-style —
+/// painting the planet's interior-stone fillers as cube blocks.
+/// (Spec §1b: NodeKind is part of node identity.)
+pub fn propagate_edit_on_library(
+    library: &mut NodeLibrary,
+    path: &[(NodeId, usize)],
+    new_child: Child,
+) -> Option<NodeId> {
+    if path.is_empty() {
+        return None;
     }
 
     let mut replacement: Option<NodeId> = None;
 
-    for i in (0..hit.path.len()).rev() {
-        let (node_id, slot) = hit.path[i];
-        // EMPTY_NODE sentinel = "synthesize a fresh empty Cartesian
-        // node for this level" — used by sphere placement to extend
-        // the placement path past the tree's existing empty
-        // terminals down to the user's chosen cs_edit_depth, so the
-        // placed block's cell size is consistent regardless of how
-        // deep the nearest real empty terminal lived.
+    for i in (0..path.len()).rev() {
+        let (node_id, slot) = path[i];
         let (children_template, original_kind) = if node_id == EMPTY_NODE {
             (empty_children(), NodeKind::Cartesian)
         } else {
-            let node = match world.library.get(node_id) {
-                Some(n) => n,
-                None => return false,
-            };
-            // CRITICAL: preserve the original NodeKind when rebuilding.
-            // Without this, an edit through a `CubedSphereBody` or
-            // `CubedSphereFace` ancestor reinserts it as Cartesian,
-            // the shader's NodeKind dispatch stops firing, and the
-            // walker descends into the body's children Cartesian-style
-            // — painting the planet's interior-stone fillers as cube
-            // blocks. (Spec §1b: NodeKind is part of node identity.)
+            let node = library.get(node_id)?;
             (node.children, node.kind)
         };
 
@@ -278,15 +294,10 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
             new_children[slot] = new_child;
         }
 
-        replacement = Some(world.library.insert_with_kind(new_children, original_kind));
+        replacement = Some(library.insert_with_kind(new_children, original_kind));
     }
 
-    if let Some(new_root) = replacement {
-        world.swap_root(new_root);
-        true
-    } else {
-        false
-    }
+    replacement
 }
 
 /// A cell is placeable if it's Empty or an all-empty Node subtree

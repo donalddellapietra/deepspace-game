@@ -7,9 +7,13 @@
 //! separate coarser edit path.
 
 mod break_place;
+mod cursor;
 mod highlight;
+mod spawn;
 pub(crate) mod upload;
 mod zoom;
+
+pub(crate) use cursor::CursorHit;
 
 use crate::world::anchor::Path;
 use crate::world::{aabb, raycast};
