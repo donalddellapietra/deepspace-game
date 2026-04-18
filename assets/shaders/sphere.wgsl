@@ -34,6 +34,40 @@ fn sphere_cell_shape(cell_u: f32, cell_v: f32, cell_r: f32) -> f32 {
     return 0.78 + 0.22 * bevel;
 }
 
+// Per-ray LOD depth cap for a face-subtree walk.
+//
+// Mirror of the Cartesian distance-based LOD gate in march.wgsl:266-278.
+// A face cell at depth `d` has radial extent `shell * (1/3)^(d-1)` in
+// body-frame units; pick `d` so that extent projects to at least
+// `LOD_PIXEL_THRESHOLD` pixels at the current ray distance. Deeper
+// descent is sub-pixel aliasing — stopping there is what makes the
+// render invariant to anchor_depth (the same cell-to-pixel ratio picks
+// the same terminal regardless of which frame is currently rooted).
+//
+// `ray_dist` and `shell` must be in the same units (both body-frame,
+// both world, etc.); the ratio is unitless. Returns a depth in
+// `[1, MAX_FACE_DEPTH]`, further clamped by the caller against
+// `uniforms.max_depth` (which today is still used as a hard ceiling —
+// future work to retire in favor of pure per-ray LOD).
+fn face_lod_depth_cap(ray_dist: f32, shell: f32) -> u32 {
+    let pixel_density = uniforms.screen_height
+        / (2.0 * tan(camera.fov * 0.5));
+    let safe_ray_dist = max(ray_dist, 1e-6);
+    // `size_at_depth(d) = (1/3)^(d-1)`; cell radial extent = shell *
+    // size. Solve for the largest `d` with `shell*size / ray_dist *
+    // pixel_density >= LOD_PIXEL_THRESHOLD`:
+    //   d <= 1 + log3(shell * pixel_density / (ray_dist * LOD))
+    let ratio = shell * pixel_density
+        / (safe_ray_dist * max(LOD_PIXEL_THRESHOLD, 1e-6));
+    if ratio <= 1.0 {
+        return 1u;
+    }
+    // log3(x) = log2(x) / log2(3); log2 is a WGSL builtin.
+    let log3_ratio = log2(ratio) * (1.0 / 1.5849625);
+    let d_f = 1.0 + log3_ratio;
+    return u32(clamp(d_f, 1.0, f32(MAX_FACE_DEPTH)));
+}
+
 fn march_face_root(
     root_node_idx: u32,
     ray_origin_body: vec3<f32>,
@@ -98,12 +132,17 @@ fn march_face_root(
         let un_local = (un_abs - bounds.x) / bounds.w;
         let vn_local = (vn_abs - bounds.y) / bounds.w;
         let rn_local = (rn_abs - bounds.z) / bounds.w;
+        // Per-ray LOD depth (see `sphere_in_cell` comment). Scale by
+        // `bounds.w` because a deeper face window only covers that
+        // fraction of the full [0,1] face — the physical cell size
+        // at a given walker depth scales with it.
+        let walk_depth = face_lod_depth_cap(t, shell * bounds.w);
         let walk = sample_face_node(
             root_node_idx,
             un_local,
             vn_local,
             rn_local,
-            uniforms.max_depth,
+            walk_depth,
         );
         let block_id = walk.x;
         let term_depth = walk.y;
@@ -247,7 +286,18 @@ fn sphere_in_cell(
         let vn = clamp((v_ea + 1.0) * 0.5, 0.0, 0.9999999);
         let rn = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
 
-        let walk = walk_face_subtree(body_node_idx, face, un, vn, rn, uniforms.max_depth);
+        // Per-ray LOD depth: stop descending the face subtree when
+        // the child cell would be < LOD_PIXEL_THRESHOLD pixels on
+        // screen. This replaces the previous `uniforms.max_depth`
+        // cap — that cap scales with anchor_depth, which is the
+        // source of the anchor-dependent fluctuation. The
+        // `face_lod_depth_cap` here is the same pixel-density
+        // Nyquist bound `march_cartesian` uses; it depends only on
+        // ray distance + cell world size + screen density, so the
+        // same physical view resolves to the same terminal cells no
+        // matter what zoom level the frame is rooted at.
+        let walk_depth = face_lod_depth_cap(t, shell);
+        let walk = walk_face_subtree(body_node_idx, face, un, vn, rn, walk_depth);
         let block_id = walk.block;
         let term_depth = walk.depth;
 

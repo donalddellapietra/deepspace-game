@@ -178,16 +178,20 @@ fn hit_path_slots(hit: &HitInfo) -> Path {
 
 /// Accumulate face-subtree slot indices (u, v, r) through the given
 /// path slice. Each slot contributes one base-3 digit per axis.
-fn face_cell_indices(face_path: &[(super::tree::NodeId, usize)]) -> (u32, u32, u32, u32) {
-    let mut iu = 0u32;
-    let mut iv = 0u32;
-    let mut ir = 0u32;
+///
+/// Use `u64` so we don't overflow at face-subtree depth > 20 (u32
+/// caps out around `3^20 ≈ 3.5e9`). Demo sphere has face depth 28;
+/// the face-tree already goes to tree_depth=30 world-paths.
+fn face_cell_indices(face_path: &[(super::tree::NodeId, usize)]) -> (u64, u64, u64, u32) {
+    let mut iu = 0u64;
+    let mut iv = 0u64;
+    let mut ir = 0u64;
     let mut depth = 0u32;
     for &(_, slot) in face_path {
         let (us, vs, rs) = slot_coords(slot);
-        iu = iu * 3 + us as u32;
-        iv = iv * 3 + vs as u32;
-        ir = ir * 3 + rs as u32;
+        iu = iu * 3 + us as u64;
+        iv = iv * 3 + vs as u64;
+        ir = ir * 3 + rs as u64;
         depth += 1;
     }
     (iu, iv, ir, depth)

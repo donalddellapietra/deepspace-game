@@ -28,6 +28,11 @@ pub struct PlanetSetup {
 
 /// The demo / starter planet. Body cell-local: `outer_r ≤ 0.5` so
 /// the sphere fits cleanly in one cell of its parent.
+///
+/// Face-subtree depth 28 → world `tree_depth = 30` (1 root + 1 body +
+/// 28 face). Interior detail is still capped at `SDF_DETAIL_LEVELS`;
+/// the extra layers beyond the cap are uniform-extension and come
+/// for free via the library's content-addressed dedup.
 pub fn demo_planet() -> PlanetSetup {
     let center: Vec3 = [0.5, 0.5, 0.5];
     let inner_r = 0.12_f32;
@@ -35,7 +40,7 @@ pub fn demo_planet() -> PlanetSetup {
     PlanetSetup {
         inner_r,
         outer_r,
-        depth: 20,
+        depth: 28,
         sdf: Planet {
             center,
             radius: 0.30,

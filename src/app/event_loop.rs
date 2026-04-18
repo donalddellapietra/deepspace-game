@@ -349,23 +349,58 @@ impl App {
             );
         }
         self.startup_profile_frames = self.startup_profile_frames.saturating_add(1);
-        if pre_tail_elapsed.as_secs_f64() * 1000.0 >= 30.0 {
+        // Slow-frame diagnostic: fires on any frame ≥10 ms, AND on
+        // the next 4 frames after any slow frame so we can see the
+        // recovery tail. Edit frames in a 20-layer soldier world
+        // are the main source; this breakdown shows whether the
+        // cost is in pack, upload (tree_write + bg_rebuild),
+        // ribbon, or render internals (encode/submit/wait/gpu_pass).
+        let total_ms = pre_tail_elapsed.as_secs_f64() * 1000.0;
+        if total_ms >= 10.0 {
+            self.slow_frame_tail = 4;
+        }
+        if total_ms >= 10.0 || self.slow_frame_tail > 0 {
             let frame_index = self.test.as_ref().map_or(0, |test| test.frame);
+            let (tw, bg, rw, cw, gpu_pass, enc_ms, sub_ms, wait_ms) = self
+                .renderer
+                .as_ref()
+                .map(|r| (
+                    r.last_tree_write_ms,
+                    r.last_bind_group_rebuild_ms,
+                    r.last_ribbon_write_ms,
+                    r.last_camera_write_ms,
+                    r.last_gpu_pass_ms,
+                    r.last_render_encode_ms,
+                    r.last_render_submit_ms,
+                    r.last_render_wait_ms,
+                ))
+                .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+            let is_edit = !self.last_reused_gpu_tree && self.last_pack_ms < 10.0;
             eprintln!(
-                "slow_frame frame={} total_ms={:.2} dt_ms={:.2} overlay_ms={:.2} update_ms={:.2} upload_ms={:.2} highlight_ms={:.2} render_ms={:.2} zoom_level={} anchor_depth={} visual_depth={} nodes={}",
+                "frame_breakdown frame={} total_ms={:.2} dt_ms={:.2} edit={} \
+                 overlay_ms={:.2} update_ms={:.2} upload_ms={:.2} pack_ms={:.2} ribbon_build_ms={:.2} \
+                 tree_write_ms={:.2} bg_rebuild_ms={:.2} ribbon_write_ms={:.2} camera_write_ms={:.2} \
+                 highlight_ms={:.2} render_ms={:.2} render_encode_ms={:.2} render_submit_ms={:.2} render_wait_ms={:.2} gpu_pass_ms={:.2} \
+                 zoom={} anchor_depth={} visual_depth={} lib_nodes={}",
                 frame_index,
-                pre_tail_elapsed.as_secs_f64() * 1000.0,
+                total_ms,
                 dt as f64 * 1000.0,
+                is_edit,
                 overlay_elapsed.as_secs_f64() * 1000.0,
                 update_elapsed.as_secs_f64() * 1000.0,
                 upload_elapsed.as_secs_f64() * 1000.0,
+                self.last_pack_ms,
+                self.last_ribbon_build_ms,
+                tw, bg, rw, cw,
                 highlight_elapsed.as_secs_f64() * 1000.0,
                 render_elapsed.as_secs_f64() * 1000.0,
+                enc_ms, sub_ms, wait_ms, gpu_pass,
                 self.zoom_level(),
                 self.anchor_depth(),
                 self.visual_depth(),
                 self.world.library.len(),
             );
+            self.slow_frame_tail = self.slow_frame_tail.saturating_sub(1);
         }
 
         // Test driver runs AFTER the frame so the captured image

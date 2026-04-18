@@ -31,12 +31,33 @@ impl App {
     }
 
     /// Interaction distance cap in the given frame's local units.
-    /// = `interaction_radius_cells × anchor_cell_size_in_frame`,
-    /// where `anchor_cell_size_in_frame = 3 / 3^K` for K = anchor
-    /// depth minus frame depth (K ≥ 0). `ray_dir_in_frame` is
-    /// normalized, so `HitInfo.t` is a frame-local distance and
-    /// can be compared directly to this value.
+    ///
+    /// **Cartesian:** `interaction_radius_cells × anchor_cell_size_in_frame`,
+    /// where `anchor_cell_size_in_frame = 3 / 3^K` for `K = anchor_depth
+    /// − frame_depth`. The user's reach scales with their zoom — deep
+    /// zoom shrinks both the visible content AND the reach proportionally,
+    /// so "6 cells away" stays meaningful.
+    ///
+    /// **Sphere:** anchor-cell scaling is wrong here: the sphere's
+    /// surface sits at a *world-fixed* distance from the camera
+    /// (determined by `outer_r` and camera altitude), so an
+    /// anchor-cell reach becomes tiny vs. the physical surface
+    /// distance at deep zoom — the user sees terrain but can't
+    /// break/place. Instead, use the body cell's full width as the
+    /// reach: anything inside the planet body is reachable. The CPU
+    /// sphere raycast already measures `t` in body-frame units (the
+    /// `cap_frame` is `sphere.body_path`), and the body cell spans
+    /// `[0, 3)³` in those units, so `2 × outer_r × body_size = 2 ×
+    /// outer_r × 3` caps reach at the sphere's diameter.
     pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
+        if let ActiveFrameKind::Sphere(sphere) = self.active_frame.kind {
+            // Body cell = 3 body-frame units wide. Diameter of the
+            // sphere in body-frame units = 2 × outer_r × 3 = 6 × outer_r.
+            // For the demo planet (outer_r = 0.45) that's 2.7 body-units
+            // ≈ 0.9 world-units — enough to reach any visible surface
+            // cell from any camera position above the body.
+            return 6.0 * sphere.outer_r;
+        }
         let frame_depth = frame_path.depth();
         let anchor_depth = self.camera.position.anchor.depth();
         let k = anchor_depth.saturating_sub(frame_depth) as i32;

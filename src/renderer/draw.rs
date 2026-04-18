@@ -239,6 +239,13 @@ impl Renderer {
         output.present();
         let present_elapsed = present_start.elapsed();
         let frame_elapsed = frame_start.elapsed();
+        // Surface sub-phase timings for the event loop's slow-frame
+        // diagnostic. `last_render_wait_ms` aliases the present()
+        // duration — on macOS this is where vsync pacing / swap
+        // chain backpressure shows up.
+        self.last_render_encode_ms = encode_elapsed.as_secs_f64() * 1000.0;
+        self.last_render_submit_ms = submit_elapsed.as_secs_f64() * 1000.0;
+        self.last_render_wait_ms = present_elapsed.as_secs_f64() * 1000.0;
         // Poll + stats readback only when enabled, and only on slow
         // frames. The poll blocks the CPU on GPU completion, so we
         // don't want to stall every frame — but during a slowdown we
