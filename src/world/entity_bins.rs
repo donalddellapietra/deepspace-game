@@ -203,7 +203,7 @@ mod tests {
     fn entity(min: [f32; 3], size: f32) -> GpuEntity {
         GpuEntity {
             bbox_min: min,
-            _pad0: 0.0,
+            representative_block: 0,
             bbox_max: [min[0] + size, min[1] + size, min[2] + size],
             subtree_bfs: 0,
         }

@@ -69,9 +69,15 @@ impl App {
             }
             let bbox_min = e.pos.in_frame(&frame);
             let size = WORLD_SIZE / 3.0_f32.powi(anchor_depth - frame_depth);
+            let rep = self
+                .world
+                .library
+                .get(e.active_root())
+                .map(|n| n.representative_block as u32)
+                .unwrap_or(255);
             gpu.push(GpuEntity {
                 bbox_min,
-                _pad0: 0.0,
+                representative_block: rep,
                 bbox_max: [bbox_min[0] + size, bbox_min[1] + size, bbox_min[2] + size],
                 subtree_bfs: e.bfs_idx,
             });

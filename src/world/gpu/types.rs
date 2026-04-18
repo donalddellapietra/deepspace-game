@@ -92,15 +92,23 @@ pub struct GpuCamera {
 /// shared `tree[]` buffer for the entity's voxel subtree.
 ///
 /// The shader ray-marches against `bbox_min`/`bbox_max`; on AABB
-/// hit it transforms the ray into the subtree's local [0, 3)³
-/// space and calls the existing `march_cartesian(subtree_bfs, ...)`.
+/// hit it either splats `representative_block` (sub-pixel entity,
+/// skips the whole subtree descent) or transforms the ray into
+/// the subtree's local [0, 3)³ space and calls `march_cartesian`
+/// with a depth budget sized to the entity's on-screen pixel
+/// count.
 ///
 /// 32 bytes total (vec4-aligned for WGSL storage buffer).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
 pub struct GpuEntity {
     pub bbox_min: [f32; 3],
-    pub _pad0: f32,
+    /// Most-common non-empty block type in the entity's subtree.
+    /// Used as a single-color splat when the entity's bbox
+    /// projects to less than `LOD_PIXEL_THRESHOLD` pixels — the
+    /// full march would LOD-terminate at the same color after
+    /// paying subtree-entry overhead, so we skip straight to it.
+    pub representative_block: u32,
     pub bbox_max: [f32; 3],
     pub subtree_bfs: u32,
 }

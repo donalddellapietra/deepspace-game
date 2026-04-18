@@ -1,4 +1,4 @@
-// Entity ray-march pass — hash-grid DDA.
+// Entity ray-march pass — hash-grid DDA with pixel-threshold LOD.
 //
 // Called from the fragment shader AFTER the world `march(...)` call.
 // The caller composes the two hits with min(t); the world ray-march
@@ -7,39 +7,44 @@
 //
 // ## Spatial index
 //
-// The CPU builds a uniform `BIN_GRID_RES³` grid over the render
-// frame's [0, WORLD_SIZE)³ each frame, registering each entity in
-// every bin its bbox overlaps. Two storage buffers carry the grid:
+// A `BIN_GRID_RES³` hash grid over the frame's [0, WORLD_SIZE)³,
+// built CPU-side each frame. See `src/world/entity_bins.rs`.
 //
-//   entity_bin_offsets[BIN_GRID_RES³ + 1]
-//     prefix sum: entities in bin i live at entries[i..i+1].
-//   entity_bin_entries[total_insertions]
-//     flat entity indices grouped by bin.
+//   entity_bin_offsets[BIN_GRID_RES³ + 1]   prefix sums
+//   entity_bin_entries[total_insertions]   entity indices, grouped
 //
-// ## Algorithm
+// ## LOD gates
 //
-// 1. Ray-box against the grid bounds. Skip if miss.
-// 2. DDA through the grid one bin at a time.
-// 3. For each bin, iterate its entity list, ray-box + subtree march
-//    (the same `march_cartesian` the world walker uses).
-// 4. After each bin, early-out when the current best hit is closer
-//    than the next bin's entry t — no remaining bin can yield a
-//    closer hit along this ray.
+// Per-entity pixel projection drives two optimizations:
 //
-// Duplicate testing: entities spanning multiple bins appear in
-// every bin their bbox touches. A ray may test the same entity
-// twice; min(t) composition keeps it correct, just redundant.
+// 1. **Sub-pixel skip** — when the entity's on-screen bbox
+//    projects to less than `LOD_PIXEL_THRESHOLD` pixels, skip the
+//    whole subtree and splat `representative_block` as a single
+//    color. Avoids paying the ray-transform + subtree-entry
+//    overhead on a descent that's going to LOD-terminate at the
+//    same color anyway.
 //
-// ## Shader/CPU contract
+// 2. **Bounded descent** — for entities above the pixel threshold,
+//    pass `march_cartesian` a `depth_limit` equal to
+//    `floor(log3(entity_pixels / threshold))`. At `D` levels, a
+//    cell occupies `size / 3^D` world units ≈ 1 pixel on screen;
+//    further descent would be sub-pixel and the in-shader
+//    pixel-LOD check would terminate immediately. Pre-computing
+//    the ceiling shaves the final DDA iteration + LOD check per
+//    entity.
 //
-// `BIN_GRID_RES` here MUST match `BIN_GRID_RES` in
-// `src/world/entity_bins.rs`. Hard-coded on both sides so the
-// shader can use a compile-time constant for the DDA bounds.
+// ## Contract
+//
+// `BIN_GRID_RES` MUST match `BIN_GRID_RES` in
+// `src/world/entity_bins.rs`.
 
 const BIN_GRID_RES: u32 = 32u;
 const BIN_GRID_RES_I: i32 = 32;
 const BIN_GRID_RES_F: f32 = 32.0;
 const BIN_SIZE: f32 = 3.0 / BIN_GRID_RES_F;
+
+// 1 / log2(3). `log3(x) = log2(x) * INV_LOG2_3`.
+const INV_LOG2_3: f32 = 0.63092975357145735;
 
 fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     var best: HitResult;
@@ -67,6 +72,10 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     let t_start = max(grid_hit.t_enter, 0.0) + 0.0001;
     let entry = ray_origin + ray_dir * t_start;
 
+    // Pixel-projection helper: entity_size_world × focal_px / ray_dist
+    // gives the bbox's on-screen pixel count (small-angle approx).
+    let focal_px = uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+
     // Initial bin cell under the ray.
     var cell = vec3<i32>(
         clamp(i32(floor(entry.x / BIN_SIZE)), 0, BIN_GRID_RES_I - 1),
@@ -81,8 +90,8 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
     let delta_dist = abs(inv_dir) * BIN_SIZE;
 
     // Initial side_dist: t to the next axis crossing for each axis,
-    // measured from `ray_origin` (NOT from the grid entry). Matches
-    // the DDA invariant `min(side_dist) = t at exit of current bin`.
+    // measured from `ray_origin`. DDA invariant:
+    // `min(side_dist) = t at exit of current bin`.
     let cell_f = vec3<f32>(cell) * BIN_SIZE;
     var side_dist = vec3<f32>(
         select(
@@ -102,9 +111,6 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
         ),
     );
 
-    // DDA ceiling: the ray can visit at most 3*res bins along the
-    // full diagonal; extra slack guards against numerical edge
-    // cases at bin boundaries.
     let max_iter: u32 = BIN_GRID_RES * 3u + 4u;
 
     for (var iter: u32 = 0u; iter < max_iter; iter = iter + 1u) {
@@ -128,16 +134,55 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             if bb.t_enter >= bb.t_exit || bb.t_exit < 0.0 { continue; }
             if bb.t_enter >= best.t { continue; }
 
+            // On-screen projection of this entity at its closest
+            // point along the ray. Entity is cubic (size.x == y == z).
+            let size = e.bbox_max - e.bbox_min;
+            let ray_dist = max(bb.t_enter, 0.001);
+            let entity_pixels = size.x / ray_dist * focal_px;
+
+            // Cheap win #2: sub-pixel entity — skip subtree and
+            // splat the pre-computed representative color. Saves
+            // the ray transform + march_cartesian entry overhead
+            // that would LOD-terminate at the same color anyway.
+            if entity_pixels < LOD_PIXEL_THRESHOLD {
+                let t_hit = max(bb.t_enter, 0.0);
+                let rep_bt = e.representative_block;
+                if rep_bt < 255u {
+                    best.hit = true;
+                    best.t = t_hit;
+                    best.color = palette.colors[rep_bt].rgb;
+                    // Face the camera for shading; bevel math on a
+                    // 1-pixel splat is irrelevant. cell_min/size
+                    // match the bbox so highlight logic works.
+                    best.normal = -normalize(ray_dir);
+                    best.cell_min = e.bbox_min;
+                    best.cell_size = size.x;
+                }
+                continue;
+            }
+
+            // Cheap win #1: per-entity depth budget. Cap descent
+            // at the level where each cell is ~LOD_PIXEL_THRESHOLD
+            // pixels across. In-shader pixel LOD would terminate
+            // one level deeper anyway, but pre-bounding saves the
+            // final setup + LOD-check pair per entity.
+            let log3_px = log2(max(entity_pixels / LOD_PIXEL_THRESHOLD, 1.0))
+                * INV_LOG2_3;
+            let depth_limit = u32(clamp(
+                floor(log3_px) + 1.0,
+                1.0,
+                f32(MAX_STACK_DEPTH),
+            ));
+
             // Ray into entity-local [0, 3)³. Uniform scale means
             // local_t == world_t — no conversion needed.
-            let size = e.bbox_max - e.bbox_min;
             let scale3 = vec3<f32>(3.0) / size;
             let local_origin = (ray_origin - e.bbox_min) * scale3;
             let local_dir = ray_dir * scale3;
 
             let local_hit = march_cartesian(
                 e.subtree_bfs, local_origin, local_dir,
-                MAX_STACK_DEPTH, 0xFFFFFFFFu,
+                depth_limit, 0xFFFFFFFFu,
             );
             if !local_hit.hit { continue; }
             if local_hit.t >= best.t { continue; }
@@ -148,16 +193,11 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             best.cell_size = local_hit.cell_size * size_over_3.x;
         }
 
-        // Early termination: `min(side_dist)` is the t at which the
-        // ray exits the current bin. Any closer hit must already
-        // live in the current or an earlier bin, so we can stop.
         let min_side = min(side_dist.x, min(side_dist.y, side_dist.z));
         if best.hit && best.t <= min_side {
             break;
         }
 
-        // DDA advance: step one unit on the axis with smallest
-        // side_dist, bump that axis's side_dist by delta_dist.
         let mask = min_axis_mask(side_dist);
         cell = cell + vec3<i32>(mask) * step;
         side_dist = side_dist + mask * delta_dist;

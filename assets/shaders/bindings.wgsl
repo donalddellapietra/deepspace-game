@@ -142,7 +142,10 @@ struct ShaderStats {
 /// then indexes back into this buffer.
 struct EntityGpu {
     bbox_min: vec3<f32>,
-    _pad0: f32,
+    /// Most-common non-empty block type in this entity's subtree.
+    /// Used as a single-color splat when the entity's bbox is
+    /// sub-pixel on screen, short-circuiting the subtree descent.
+    representative_block: u32,
     bbox_max: vec3<f32>,
     subtree_bfs: u32,
 }
