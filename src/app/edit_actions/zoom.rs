@@ -12,22 +12,27 @@ use super::{
 };
 
 impl App {
+    /// Maximum depth the CPU raycast + editor walk to.
+    ///
+    /// Previously tied to `anchor_depth()` — that "CPU-side LOD" caused
+    /// the cursor to report a coarse collapsed cell (the big block you
+    /// see the seams of at shallow zoom) instead of the small leaf the
+    /// user is actually touching. The GPU already applies its own
+    /// per-pixel Nyquist cap (`face_lod_depth_cap` + the Cartesian LOD
+    /// test in `march.wgsl`) so there is no reason to also cap CPU.
+    ///
+    /// Honor `forced_edit_depth` when set (test harness / CLI override);
+    /// otherwise walk to the tree's actual depth.
     pub(in crate::app) fn edit_depth(&self) -> u32 {
         if let Some(depth) = self.forced_edit_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        // Edit depth = anchor depth. The CPU raycast's pop loop
-        // ensures the ray reaches the surface at this resolution.
-        self.anchor_depth().max(1)
+        (self.tree_depth as u32).max(1)
     }
 
-    /// Sphere face-subtree edit depth.
-    ///
-    /// Use the same edit depth for both paths. The body/face wrappers
-    /// are structural node kinds, not a reason to coarsen the user's
-    /// interaction scale — the older cross-layer asymmetry
-    /// (`anchor_depth - 4` vs `-1`) made placed blocks balloon as the
-    /// player went deeper.
+    /// Sphere face-subtree edit depth. Same contract as `edit_depth` —
+    /// walk the face subtree to its actual depth, not to the user's
+    /// current anchor depth.
     pub(in crate::app) fn cs_edit_depth(&self) -> u32 {
         self.edit_depth()
     }
