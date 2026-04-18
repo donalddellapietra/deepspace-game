@@ -68,10 +68,14 @@ for d in $DEPTHS; do
 
     script="wait:10,emit:pre,screenshot:${pre_png},probe_down,break,wait:10,probe_down,screenshot:${post_png},emit:post"
 
+    # `--spawn-on-surface` gives a path-based spawn that tracks the
+    # SDF terrain surface at any depth — mandatory for deep-zoom
+    # tests because `--spawn-xyz` quantizes to f32 precision and
+    # drifts above reach at `anchor_depth > ~15`.
     # shellcheck disable=SC2086
     out=$(timeout 25 ./target/debug/deepspace-game --render-harness \
         --sphere-world \
-        --spawn-xyz $SPAWN_XYZ \
+        --spawn-on-surface \
         --spawn-pitch "$SPAWN_PITCH" \
         --spawn-yaw "$SPAWN_YAW" \
         --spawn-depth "$d" \

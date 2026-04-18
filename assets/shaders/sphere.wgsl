@@ -24,14 +24,128 @@ fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
     return smoothstep(0.02, 0.14, edge);
 }
 
-fn sphere_cell_shape(cell_u: f32, cell_v: f32, cell_r: f32) -> f32 {
+// Pixel-aware bevel overlay for a single tree level.
+//
+// Draws a dark band of ~1 screen-pixel width at the cell's UV edges
+// (`r` axis is ignored — radial boundaries overlap the face normal
+// and produce no visible seam from a surface view). Returns a
+// multiplier in `[0.78, 1.0]`: 0.78 at the edge center, 1.0 in the
+// cell interior. When the cell is < 2 pixels on screen the band
+// would wrap the entire cell, so the level short-circuits to 1.0
+// (no contribution) instead of darkening everything indiscriminately.
+//
+// Band width in *normalized cell coords* is `1.0 / cell_px` so the
+// band is always ~1 px wide regardless of how big the cell is on
+// screen, then clamped at 0.25 so shallow, giant cells don't get a
+// quarter-cell-wide band. This is what lets multi-level stacking
+// actually work: deep cells with many screen-pixels get a thin
+// sharp line, coarse zoomed-out cells get a proportionally thin
+// line too.
+fn bevel_level_contribution(
+    un: f32, vn: f32,
+    u_lo: f32, v_lo: f32, size: f32,
+    cell_px: f32,
+) -> f32 {
+    if cell_px < 2.0 {
+        return 1.0;
+    }
+    let cell_u = clamp((un - u_lo) / size, 0.0, 1.0);
+    let cell_v = clamp((vn - v_lo) / size, 0.0, 1.0);
     let face_edge = min(
         min(cell_u, 1.0 - cell_u),
         min(cell_v, 1.0 - cell_v),
     );
-    let bevel = smoothstep(0.02, 0.14, face_edge);
-    _ = cell_r;
+    let band_end = clamp(1.0 / cell_px, 0.0, 0.25);
+    let bevel = smoothstep(0.0, band_end, face_edge);
     return 0.78 + 0.22 * bevel;
+}
+
+// Multi-level voxel-grid bevel. Every rendered cell gets grid lines
+// from every tree level whose cells would be at least ~2 pixels
+// wide on screen; deeper sub-pixel levels contribute nothing.
+//
+// `(u_lo, v_lo, r_lo, size)` is the walker's returned cell (in
+// normalized face-coords). `reference_scale` is the cell's physical
+// scale in frame-local units — i.e. the body-frame shell width for
+// `sphere_in_cell`, or the scaled window width for
+// `march_face_root`. `ray_dist` is `t` at hit time in the same
+// units. `pixel_density = screen_height / (2·tan(fov/2))`.
+//
+// The walk climbs up to `MAX_UP` ancestor cells (each 3× coarser)
+// and descends up to `MAX_DOWN` sub-cells (each 3× finer). Ancestor
+// `u_lo` / `v_lo` come from `floor(lo / parent_size) * parent_size`
+// — the tree is 3-aligned at every depth so this is exact up to
+// f32 precision. Descendant cells are selected to contain the hit
+// point `(un, vn)`.
+//
+// Cost: up to `MAX_UP + MAX_DOWN + 1` evaluations of the 1-level
+// bevel (simple arithmetic, no tree reads). For the default 4+3
+// layout that's 8 levels × ~10 ALU ops each — trivial.
+fn sphere_cell_shape_layered(
+    un: f32, vn: f32, rn: f32,
+    u_lo: f32, v_lo: f32, r_lo: f32,
+    size: f32,
+    reference_scale: f32,
+    ray_dist: f32,
+    pixel_density: f32,
+) -> f32 {
+    let safe_ray_dist = max(ray_dist, 1e-6);
+    let base_cell_px = size * reference_scale / safe_ray_dist * pixel_density;
+
+    var bevel: f32 = 1.0;
+
+    // Walker's own cell.
+    bevel = bevel * bevel_level_contribution(un, vn, u_lo, v_lo, size, base_cell_px);
+
+    // Ancestors: cells 3× wider each step, so grids at progressively
+    // coarser voxel groupings become visible.
+    let MAX_UP: u32 = 4u;
+    var up_u_lo = u_lo;
+    var up_v_lo = v_lo;
+    var up_size = size;
+    var up_px = base_cell_px;
+    for (var i: u32 = 0u; i < MAX_UP; i = i + 1u) {
+        up_size = up_size * 3.0;
+        up_u_lo = floor(up_u_lo / up_size) * up_size;
+        up_v_lo = floor(up_v_lo / up_size) * up_size;
+        up_px = up_px * 3.0;
+        // Very coarse ancestors can become "band-wraps-whole-cell"
+        // even at reasonable zooms; `bevel_level_contribution`'s
+        // `cell_px < 2` short-circuit can't fire here. Cap on the
+        // outer loop to keep the stack bounded.
+        bevel = bevel * bevel_level_contribution(un, vn, up_u_lo, up_v_lo, up_size, up_px);
+    }
+
+    // Descendants: cells 3× finer each step, into the walker's
+    // returned cell. Only meaningful when the walker terminated
+    // early (Child::Block hit above Nyquist); otherwise the first
+    // step is already sub-pixel and the loop breaks.
+    let MAX_DOWN: u32 = 3u;
+    var dn_u_lo = u_lo;
+    var dn_v_lo = v_lo;
+    var dn_size = size;
+    var dn_px = base_cell_px;
+    for (var i: u32 = 0u; i < MAX_DOWN; i = i + 1u) {
+        let child_size = dn_size * (1.0 / 3.0);
+        let child_px = dn_px * (1.0 / 3.0);
+        if child_px < 2.0 {
+            break;
+        }
+        // Pick the sub-cell containing (un, vn).
+        let u_frac = clamp((un - dn_u_lo) / dn_size, 0.0, 0.9999999);
+        let v_frac = clamp((vn - dn_v_lo) / dn_size, 0.0, 0.9999999);
+        let u_idx = floor(u_frac * 3.0);
+        let v_idx = floor(v_frac * 3.0);
+        dn_u_lo = dn_u_lo + u_idx * child_size;
+        dn_v_lo = dn_v_lo + v_idx * child_size;
+        dn_size = child_size;
+        dn_px = child_px;
+        bevel = bevel * bevel_level_contribution(un, vn, dn_u_lo, dn_v_lo, dn_size, dn_px);
+    }
+
+    _ = rn;
+    _ = r_lo;
+    return bevel;
 }
 
 // Per-ray LOD depth cap for a face-subtree walk.
@@ -164,15 +278,28 @@ fn march_face_root(
             }
             result.hit = true;
             result.t = t;
-            let cell_u = un_local * cells_d - iu;
-            let cell_v = vn_local * cells_d - iv;
-            let cell_r = rn_local * cells_d - ir;
             let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
             let diffuse = max(dot(hit_normal, sun_dir), 0.0);
             let axis_tint = abs(hit_normal.y) * 1.0
                           + (abs(hit_normal.x) + abs(hit_normal.z)) * 0.82;
             let ambient = 0.22;
-            let block_shape = sphere_cell_shape(cell_u, cell_v, cell_r);
+            // Multi-level voxel-grid bevel overlay. `reference_scale`
+            // = `shell * bounds.w` because `un_local/vn_local/rn_local`
+            // are window-relative: walker bounds in [0,1] span the
+            // face window of physical extent `shell * bounds.w`.
+            let u_lo = iu / cells_d;
+            let v_lo = iv / cells_d;
+            let r_lo = ir / cells_d;
+            let cell_size = 1.0 / cells_d;
+            let pixel_density = uniforms.screen_height
+                / (2.0 * tan(camera.fov * 0.5));
+            let block_shape = sphere_cell_shape_layered(
+                un_local, vn_local, rn_local,
+                u_lo, v_lo, r_lo, cell_size,
+                shell * bounds.w,
+                t,
+                pixel_density,
+            );
             result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
             result.normal = hit_normal;
             return result;
@@ -318,10 +445,18 @@ fn sphere_in_cell(
             let axis_tint = abs(hit_normal.y) * 1.0
                           + (abs(hit_normal.x) + abs(hit_normal.z)) * 0.82;
             let ambient = 0.22;
-            let cell_u = clamp((un - walk.u_lo) / walk.size, 0.0, 1.0);
-            let cell_v = clamp((vn - walk.v_lo) / walk.size, 0.0, 1.0);
-            let cell_r = clamp((rn - walk.r_lo) / walk.size, 0.0, 1.0);
-            let block_shape = sphere_cell_shape(cell_u, cell_v, cell_r);
+            // Multi-level voxel-grid bevel overlay. `reference_scale`
+            // = `shell` because walker bounds in `sphere_in_cell`
+            // span the full face (no sub-window).
+            let pixel_density = uniforms.screen_height
+                / (2.0 * tan(camera.fov * 0.5));
+            let block_shape = sphere_cell_shape_layered(
+                un, vn, rn,
+                walk.u_lo, walk.v_lo, walk.r_lo, walk.size,
+                shell,
+                t,
+                pixel_density,
+            );
             result.hit = true;
             result.t = t;
             result.normal = hit_normal;
@@ -461,15 +596,23 @@ fn sphere_in_face_window(
             result.hit = true;
             result.t = t;
             result.normal = hit_normal;
-            let cell_u = clamp((un_abs - walk.u_lo) / walk.size, 0.0, 1.0);
-            let cell_v = clamp((vn_abs - walk.v_lo) / walk.size, 0.0, 1.0);
-            let cell_r = clamp((rn_abs - walk.r_lo) / walk.size, 0.0, 1.0);
             let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
             let diffuse = max(dot(hit_normal, sun_dir), 0.0);
             let axis_tint = abs(hit_normal.y) * 1.0
                           + (abs(hit_normal.x) + abs(hit_normal.z)) * 0.82;
             let ambient = 0.22;
-            let block_shape = sphere_cell_shape(cell_u, cell_v, cell_r);
+            // Multi-level voxel-grid bevel overlay. Walker bounds
+            // here are in full-face coords (un_abs etc.), so
+            // `reference_scale` is the full-face shell width.
+            let pixel_density = uniforms.screen_height
+                / (2.0 * tan(camera.fov * 0.5));
+            let block_shape = sphere_cell_shape_layered(
+                un_abs, vn_abs, rn_abs,
+                walk.u_lo, walk.v_lo, walk.r_lo, walk.size,
+                shell,
+                t,
+                pixel_density,
+            );
             result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
             return result;
         }
