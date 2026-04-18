@@ -9,6 +9,7 @@
 use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
 use crate::world::anchor::WORLD_SIZE;
+use crate::world::entity_bins::EntityBins;
 use crate::world::gpu::{self, GpuEntity};
 
 impl App {
@@ -31,6 +32,8 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else { return };
         if self.entities.is_empty() {
             renderer.update_entities(&[]);
+            let empty = EntityBins::empty();
+            renderer.update_entity_bins(&empty.offsets, &empty.entries);
             return;
         }
         let Some(cache) = self.cached_tree.as_mut() else { return };
@@ -39,8 +42,6 @@ impl App {
         for e in self.entities.entities.iter_mut() {
             e.bfs_idx = cache.ensure_root(&self.world.library, e.active_root());
         }
-        // If packing entity content appended new nodes, push the
-        // tail to GPU — same append-only path world edits use.
         if cache.tree.len() != len_before_u32 || cache.node_kinds.len() != kinds_before {
             renderer.update_tree(
                 &cache.tree,
@@ -49,6 +50,7 @@ impl App {
                 cache.root_bfs_idx,
             );
         }
+
         // Build per-frame GPU records. `pos.in_frame(frame)` gives
         // the entity's bbox_min corner in the current frame's local
         // [0, 3)³ coords — sub-cell offset shifts this continuously
@@ -74,7 +76,14 @@ impl App {
                 subtree_bfs: e.bfs_idx,
             });
         }
+
+        // Hash-grid build happens AFTER the GPU list is assembled
+        // (it needs the bboxes) and BEFORE the entity-buffer upload
+        // so entities[] and the bin entries stay consistent with
+        // each other for the ray-march.
+        let bins = EntityBins::build(&gpu);
         renderer.update_entities(&gpu);
+        renderer.update_entity_bins(&bins.offsets, &bins.entries);
     }
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
