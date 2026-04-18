@@ -296,12 +296,16 @@ impl App {
         // Nyquist floor: sub-pixel rejection only. Primary LOD gate
         // is ribbon-level-based (`lod_base_depth`).
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
-        let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
+        let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(20);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let taa_enabled = test_cfg.taa;
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
-        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), Some(test_cfg.plain_layers()));
+        // Pass the raw `Option` through so each preset's
+        // `unwrap_or(...)` default applies when the user didn't
+        // pass --plain-layers. Fractals default to 8 (where Block
+        // leaves are pixel-visible); plain/vox world default to 40.
+        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), test_cfg.plain_layers);
         let mut world = bootstrap.world;
         let bootstrap_color_registry = bootstrap.color_registry;
         let tree_depth = world.tree_depth();

@@ -98,41 +98,41 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
         WorldPreset::Menger => crate::world::fractals::menger::bootstrap_menger_world(
-            plain_layers.unwrap_or(20),
+            plain_layers.unwrap_or(8),
         ),
         WorldPreset::SierpinskiTet => {
             crate::world::fractals::sierpinski_tet::bootstrap_sierpinski_tet_world(
-                plain_layers.unwrap_or(20),
+                plain_layers.unwrap_or(8),
             )
         }
         WorldPreset::CantorDust => {
             crate::world::fractals::cantor_dust::bootstrap_cantor_dust_world(
-                plain_layers.unwrap_or(20),
+                plain_layers.unwrap_or(8),
             )
         }
         WorldPreset::JerusalemCross => {
             crate::world::fractals::jerusalem_cross::bootstrap_jerusalem_cross_world(
-                plain_layers.unwrap_or(20),
+                plain_layers.unwrap_or(8),
             )
         }
         WorldPreset::SierpinskiPyramid => {
             crate::world::fractals::sierpinski_pyramid::bootstrap_sierpinski_pyramid_world(
-                plain_layers.unwrap_or(20),
+                plain_layers.unwrap_or(8),
             )
         }
         WorldPreset::Mausoleum => {
             crate::world::fractals::mausoleum::bootstrap_mausoleum_world(
-                plain_layers.unwrap_or(20),
+                plain_layers.unwrap_or(8),
             )
         }
         WorldPreset::EdgeScaffold => {
             crate::world::fractals::edge_scaffold::bootstrap_edge_scaffold_world(
-                plain_layers.unwrap_or(20),
+                plain_layers.unwrap_or(8),
             )
         }
         WorldPreset::HollowCube => {
             crate::world::fractals::hollow_cube::bootstrap_hollow_cube_world(
-                plain_layers.unwrap_or(20),
+                plain_layers.unwrap_or(8),
             )
         }
         WorldPreset::VoxModel { path, interior_depth } => bootstrap_vox_model_world(
@@ -626,7 +626,21 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
         node_stack.push((node_id, node.kind));
         match node.children[slot as usize] {
             Child::Node(child_id) => node_id = child_id,
-            _ => return,
+            // If the camera's anchor path crosses an Empty or Block
+            // slot before reaching `carve_depth`, install a fresh
+            // empty Node there so the walk can continue. Bottom-up
+            // rebuild below stitches the new Node into the parent's
+            // slot via the replacement chain — the rest of the
+            // parent's siblings stay untouched. This is the fix
+            // for fractals with structural empties (Menger's body-
+            // centres, Sierpinski's 23 unused corners etc.): without
+            // it, `compute_render_frame` stalls at the first empty
+            // and the shader can never render cells small enough
+            // for Nyquist to let a real Block leaf be visible,
+            // which manifests as monochromatic LOD-terminal colour.
+            Child::Empty | Child::Block(_) => {
+                node_id = world.library.insert(empty_children());
+            }
         }
     }
     let Some(node) = world.library.get(node_id) else { return };
