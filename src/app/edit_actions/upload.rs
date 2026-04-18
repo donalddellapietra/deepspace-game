@@ -19,6 +19,15 @@ impl App {
     }
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
+        // Bail early if the renderer isn't built yet. On WASM the
+        // renderer init is async; redraws during that gap would
+        // otherwise trigger a full CPU pack into `cached_tree` that
+        // `finish_init` then overwrites with the already-built init
+        // cache — wasted work. On native the renderer is always ready
+        // before this runs, so this is a no-op guard.
+        if self.renderer.is_none() {
+            return;
+        }
         let intended_frame = self.target_render_frame();
         let effective_visual_depth = self.visual_depth();
         let upload_key = LodUploadKey::new(self.world.root);

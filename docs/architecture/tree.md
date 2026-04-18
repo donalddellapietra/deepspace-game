@@ -88,8 +88,9 @@ possible without re-walking the subtree:
   `254` for all-empty, `255` for mixed. Uniform subtrees flatten to a
   single `Block` during GPU packing.
 
-See `gpu::pack::pack_tree_lod` in `src/world/gpu/pack.rs` for how the
-renderer uses these.
+See `gpu::CachedTree::update_root` in `src/world/gpu/pack.rs` for
+how the renderer uses these (content-addressed emit + optional
+compaction).
 
 ## Refcounting
 

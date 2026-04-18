@@ -145,7 +145,7 @@ See `scripts/perf-breakdown.sh` and the `--perf-trace PATH` flag.
 | signal | origin | meaning |
 |---|---|---|
 | `update_ms`, `camera_write_ms` | `App::update` | player + camera buffer write |
-| `pack_ms` | `upload_tree_lod` | `pack_tree_lod_selective` CPU cost |
+| `pack_ms` | `upload_tree_lod` | `CachedTree::update_root` CPU cost (incremental emit + optional compaction) |
 | `ribbon_build_ms` | `upload_tree_lod` | `build_ribbon` CPU cost |
 | `tree_write_ms`, `ribbon_write_ms` | `Renderer::update_{tree,ribbon}` | `queue.write_buffer` cost |
 | `bind_group_rebuild_ms` | buffer upload | rebuild when buffer outgrew allocation |

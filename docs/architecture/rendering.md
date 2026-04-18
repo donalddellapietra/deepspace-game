@@ -23,15 +23,18 @@ Source of truth:
    `GpuCamera` whose position is in the frame's `[0, 3)³` local box.
    All f32 math is safe: the frame box is bounded.
 
-3. **Pack the tree.** `gpu::pack::pack_tree_lod_preserving` BFS-packs
-   the subtree rooted at the frame into two flat buffers:
-   - `tree_buffer` — one `GpuChild` per child slot (8B: tag, block,
-     node_index).
-   - `node_kinds_buffer` — one `GpuNodeKind` per packed node (16B:
+3. **Pack the tree.** `gpu::CachedTree::update_root` emits the
+   world tree into three flat buffers via content-addressed memo:
+   - `tree` — interleaved header + inline children slab (u32s).
+   - `node_kinds` — one `GpuNodeKind` per packed node (16B:
      kind discriminant, face, inner/outer radii).
+   - `node_offsets` — BFS-idx → tree[] offset.
 
-   Cartesian subtrees that subtend fewer than LOD_THRESHOLD pixels are
-   flattened to their `representative_block`. Spheres are exempt —
+   Edits reuse previously-packed subtrees via `bfs_by_nid` (O(1) per
+   unchanged subtree); only the N+1 new ancestors get appended. LOD
+   lives in the shader — pack does no view-dependent flattening
+   beyond collapsing uniform subtrees (safe at any view). Spheres
+   stay as Node children regardless of uniformity —
    their DDA is cheap and their silhouette must be preserved.
 
 4. **Build the ribbon.** `gpu::ribbon::build_ribbon` emits the chain

@@ -1,12 +1,13 @@
 #!/bin/bash
 #
 # Replicate the "superchunk border" lag: crossing a render_path cell
-# boundary triggers a full pack (~100ms spike).
+# boundary triggers a full pack (~100ms spike on the legacy branch).
 #
 # "Superchunk" = the cell at `anchor_depth - RENDER_FRAME_K` (=3), i.e.
 # one level shallower than the render frame's finest content. Inside
 # that cell the LOD-upload key is stable (see the anchor-drop fix);
-# leaving it forces a full pack_tree_lod_selective + ribbon rebuild.
+# leaving it forced a full CachedTree re-emit + ribbon rebuild before
+# the content-memoized pack landed.
 #
 # Setup: spawn in the 20-layer interior soldier world at anchor_depth=7
 # so render_path sits at depth 4 (cell size = 3^-4 ≈ 0.037 root units).
