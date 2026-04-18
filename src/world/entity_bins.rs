@@ -35,60 +35,103 @@
 //! a follow-up).
 
 use crate::world::anchor::WORLD_SIZE;
-use crate::world::gpu::GpuEntity;
+use crate::world::gpu::{GpuBinEntry, GpuEntity};
 
-/// Per-axis bin count. 32³ = 32768 bins. At sqrt(10_000) ≈ 100
-/// entities/axis, 32 gives ~0.3 entities/bin — each ray tests
-/// roughly that many entities per bin it crosses, vs. O(N) in the
-/// brute-force path.
+/// Per-axis bin count. 128³ = 2 097 152 bins. With ~10k entities in
+/// a dense cluster (the motion_10000 test), 32³ left ~1000
+/// entities/bin and the shader DDA paid O(~1000) AABB tests per
+/// ray. 128³ puts typical dense clusters at ~10 entities/bin and
+/// pushes shader cost roughly linearly lower; the extra bin visits
+/// along the ray (128 vs 32) are cheap array lookups compared to
+/// the AABB tests they save.
 ///
 /// Keep this in sync with the shader-side `BIN_GRID_RES` constant
 /// in `entities.wgsl`.
-pub const BIN_GRID_RES: u32 = 32;
+pub const BIN_GRID_RES: u32 = 64;
 
-/// Built bin data, ready to upload to the GPU.
+/// Cached bin data, rebuilt in place each frame. The owning
+/// allocation is reused across frames to avoid zeroing the
+/// `res³ + 1`-entry offsets buffer every frame (8 MB at res=128).
 ///
-/// `offsets.len() == (BIN_GRID_RES.pow(3) + 1) as usize`.
-/// `entries.len() == offsets.last().unwrap()` (the last prefix sum).
+/// Call [`EntityBins::new`] once at startup, then
+/// [`EntityBins::rebuild`] per frame to overwrite contents. The
+/// public `offsets` / `entries` slices always reflect the most
+/// recent `rebuild` (or the empty scaffold immediately after `new`).
 pub struct EntityBins {
     pub offsets: Vec<u32>,
-    pub entries: Vec<u32>,
+    /// Bin entries carry the entity's bbox INLINE alongside its
+    /// index so the shader's per-bin AABB cull reads sequentially.
+    /// See `GpuBinEntry` doc in `gpu::types` for the layout
+    /// rationale.
+    pub entries: Vec<GpuBinEntry>,
+    /// Scratch buffer reused across rebuilds for the "write cursor"
+    /// pass. Kept alongside `offsets` so we don't clone offsets on
+    /// every rebuild.
+    cursor: Vec<u32>,
 }
 
 impl EntityBins {
-    /// Empty scaffold: one offset of 0, no entries. Used when no
-    /// entities are live (entity_count == 0 in the uniform gates
-    /// the shader's bin-walk entirely).
+    /// Allocate the `res³ + 1` offsets array and empty entries list.
+    /// Zero-initialized so it's a valid empty scaffold immediately.
+    pub fn new() -> Self {
+        let cells = BIN_GRID_RES.pow(3) as usize;
+        Self {
+            offsets: vec![0u32; cells + 1],
+            entries: Vec::new(),
+            cursor: vec![0u32; cells + 1],
+        }
+    }
+
+    /// Convenience ctor for empty state without forcing the large
+    /// allocation. Used by the no-entity fast path so we still have
+    /// a valid `offsets`/`entries` pair to upload without paying
+    /// 8 MB of allocation on an empty frame.
     pub fn empty() -> Self {
         let cells = BIN_GRID_RES.pow(3) as usize;
         Self {
             offsets: vec![0u32; cells + 1],
             entries: Vec::new(),
+            cursor: Vec::new(),
         }
     }
 
-    /// Build a bin grid from the entity list. Each entity is
-    /// registered in every bin its bbox overlaps.
-    ///
-    /// O(N * avg_bins_per_entity) construction. With ~2-3 bins/axis
-    /// per entity at our current scale (~5-20 bins each), 10k
-    /// entities → ~100k insertions — on the order of 0.5 ms on CPU.
+    /// One-shot build used by tests. Allocates fresh vectors; hot
+    /// paths call [`EntityBins::new`] once and [`rebuild`] every
+    /// frame instead.
     pub fn build(entities: &[GpuEntity]) -> Self {
+        let mut bins = Self::new();
+        bins.rebuild(entities);
+        bins
+    }
+
+    /// Rewrite `offsets` and `entries` from `entities`, reusing the
+    /// existing allocations. Correctness is identical to a freshly
+    /// built `EntityBins`; the only difference is no per-frame
+    /// `res³`-entry zeroing allocation.
+    pub fn rebuild(&mut self, entities: &[GpuEntity]) {
         let cells = BIN_GRID_RES.pow(3) as usize;
-        let mut offsets = vec![0u32; cells + 1];
+        debug_assert_eq!(self.offsets.len(), cells + 1);
+        debug_assert_eq!(self.cursor.len(), cells + 1);
 
         if entities.is_empty() {
-            return Self {
-                offsets,
-                entries: Vec::new(),
-            };
+            // Zero the offsets (they may hold stale values from a
+            // previous non-empty frame) and clear entries. Zeroing
+            // 8 MB is still cheaper than allocating it.
+            for o in self.offsets.iter_mut() { *o = 0; }
+            self.entries.clear();
+            return;
         }
 
         let bin_size = WORLD_SIZE / BIN_GRID_RES as f32;
         let res = BIN_GRID_RES as i32;
 
-        // Pass 1: count insertions per bin.
-        let mut counts = vec![0u32; cells];
+        // Pass 1: count insertions per bin. We'd like to write
+        // directly into offsets[i] (the prefix-sum pass then shifts
+        // those counts into starts), but that forces a two-vec
+        // split for the cursor; easier to keep the semantics clear
+        // by zeroing offsets first and treating it as the count
+        // buffer through pass 2.
+        for o in self.offsets.iter_mut() { *o = 0; }
         for e in entities {
             let (raw_min, raw_max) = bin_range(e, bin_size, res);
             if !bin_range_in_grid(raw_min, raw_max, res) {
@@ -99,43 +142,63 @@ impl EntityBins {
                 for by in b_min[1]..=b_max[1] {
                     for bx in b_min[0]..=b_max[0] {
                         let id = bin_id(bx, by, bz);
-                        counts[id] += 1;
+                        self.offsets[id] += 1;
                     }
                 }
             }
         }
 
-        // Pass 2: prefix sum → offsets.
+        // Pass 2: in-place prefix sum. `offsets[i]` becomes the
+        // start offset; `offsets[cells]` is the total.
         let mut running = 0u32;
         for i in 0..cells {
-            offsets[i] = running;
-            running += counts[i];
+            let c = self.offsets[i];
+            self.offsets[i] = running;
+            self.cursor[i] = running;
+            running += c;
         }
-        offsets[cells] = running;
+        self.offsets[cells] = running;
+        self.cursor[cells] = running;
 
-        // Pass 3: fill entries. Use `counts` as a write cursor per
-        // bin, decrementing from the post-sum offset.
-        let mut entries = vec![0u32; running as usize];
-        let mut cursor = offsets.clone();
+        // Pass 3: fill entries. Resize in place so the Vec's capacity
+        // grows but never shrinks across frames. Each entry carries
+        // the entity's bbox inline so the shader's AABB cull reads
+        // sequentially.
+        let total = running as usize;
+        if self.entries.len() < total {
+            self.entries.resize(total, GpuBinEntry::default());
+        } else {
+            self.entries.truncate(total);
+        }
         for (e_idx, e) in entities.iter().enumerate() {
             let (raw_min, raw_max) = bin_range(e, bin_size, res);
             if !bin_range_in_grid(raw_min, raw_max, res) {
                 continue;
             }
             let (b_min, b_max) = clamp_bin_range(raw_min, raw_max, res);
+            let entry = GpuBinEntry {
+                bbox_min: e.bbox_min,
+                e_idx: e_idx as u32,
+                bbox_max: e.bbox_max,
+                _pad: 0,
+            };
             for bz in b_min[2]..=b_max[2] {
                 for by in b_min[1]..=b_max[1] {
                     for bx in b_min[0]..=b_max[0] {
                         let id = bin_id(bx, by, bz);
-                        let slot = cursor[id] as usize;
-                        entries[slot] = e_idx as u32;
-                        cursor[id] += 1;
+                        let slot = self.cursor[id] as usize;
+                        self.entries[slot] = entry;
+                        self.cursor[id] += 1;
                     }
                 }
             }
         }
+    }
+}
 
-        Self { offsets, entries }
+impl Default for EntityBins {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 
@@ -221,11 +284,11 @@ mod tests {
     fn single_entity_in_one_bin() {
         let bin_size = WORLD_SIZE / BIN_GRID_RES as f32;
         let center = bin_size * 0.5;
-        let e = entity([center - 0.01, center - 0.01, center - 0.01], 0.02);
+        let e = entity([center - 0.01 * bin_size, center - 0.01 * bin_size, center - 0.01 * bin_size], 0.02 * bin_size);
         let bins = EntityBins::build(&[e]);
         let bin0 = bin_id(0, 0, 0);
         assert_eq!(bins.offsets[bin0 + 1] - bins.offsets[bin0], 1);
-        assert_eq!(bins.entries[bins.offsets[bin0] as usize], 0);
+        assert_eq!(bins.entries[bins.offsets[bin0] as usize].e_idx, 0);
     }
 
     #[test]
@@ -260,5 +323,38 @@ mod tests {
         let bins = EntityBins::build(&entities);
         let last = *bins.offsets.last().unwrap();
         assert_eq!(last as usize, bins.entries.len());
+    }
+
+    #[test]
+    fn rebuild_reuses_allocation_and_matches_build() {
+        // Build once, then rebuild with a different set and confirm
+        // the resulting offsets/entries match a fresh build.
+        let a: Vec<GpuEntity> = (0..50)
+            .map(|i| entity([(i as f32) * 0.03, 0.4, 0.4], 0.08))
+            .collect();
+        let b: Vec<GpuEntity> = (0..100)
+            .map(|i| entity([0.4, (i as f32) * 0.02, 0.4], 0.06))
+            .collect();
+
+        let mut pool = EntityBins::new();
+        pool.rebuild(&a);
+        pool.rebuild(&b);
+
+        let fresh = EntityBins::build(&b);
+        assert_eq!(pool.offsets, fresh.offsets);
+        assert_eq!(pool.entries, fresh.entries);
+    }
+
+    #[test]
+    fn rebuild_then_empty_clears_entries() {
+        let a: Vec<GpuEntity> = (0..10)
+            .map(|i| entity([(i as f32) * 0.1, 0.4, 0.4], 0.05))
+            .collect();
+        let mut pool = EntityBins::new();
+        pool.rebuild(&a);
+        assert!(!pool.entries.is_empty());
+        pool.rebuild(&[]);
+        assert!(pool.entries.is_empty());
+        assert!(pool.offsets.iter().all(|&o| o == 0));
     }
 }

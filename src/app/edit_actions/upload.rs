@@ -32,8 +32,11 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else { return };
         if self.entities.is_empty() {
             renderer.update_entities(&[]);
-            let empty = EntityBins::empty();
-            renderer.update_entity_bins(&empty.offsets, &empty.entries);
+            self.entity_bins_pool.rebuild(&[]);
+            renderer.update_entity_bins(
+                &self.entity_bins_pool.offsets,
+                &self.entity_bins_pool.entries,
+            );
             return;
         }
         let Some(cache) = self.cached_tree.as_mut() else { return };
@@ -81,13 +84,17 @@ impl App {
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
 
         let t_bins = web_time::Instant::now();
-        let bins = EntityBins::build(&gpu);
+        self.entity_bins_pool.rebuild(&gpu);
         let bins_ms = t_bins.elapsed().as_secs_f64() * 1000.0;
 
-        let entries_len = bins.entries.len();
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let entries_len = self.entity_bins_pool.entries.len();
         let t_upload = web_time::Instant::now();
         renderer.update_entities(&gpu);
-        renderer.update_entity_bins(&bins.offsets, &bins.entries);
+        renderer.update_entity_bins(
+            &self.entity_bins_pool.offsets,
+            &self.entity_bins_pool.entries,
+        );
         let upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
 
         if self.render_harness {

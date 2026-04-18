@@ -38,9 +38,9 @@
 // `BIN_GRID_RES` MUST match `BIN_GRID_RES` in
 // `src/world/entity_bins.rs`.
 
-const BIN_GRID_RES: u32 = 32u;
-const BIN_GRID_RES_I: i32 = 32;
-const BIN_GRID_RES_F: f32 = 32.0;
+const BIN_GRID_RES: u32 = 64u;
+const BIN_GRID_RES_I: i32 = 64;
+const BIN_GRID_RES_F: f32 = 64.0;
 const BIN_SIZE: f32 = 3.0 / BIN_GRID_RES_F;
 
 // 1 / log2(3). `log3(x) = log2(x) * INV_LOG2_3`.
@@ -129,37 +129,47 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
         let entry_end = entity_bin_offsets[bin_id + 1u];
 
         for (var i: u32 = entry_start; i < entry_end; i = i + 1u) {
-            let e_idx = entity_bin_entries[i];
-            let e = entities[e_idx];
+            // Sequential read of bbox + e_idx — no gather into
+            // `entities[]` in the hot AABB cull path. The full
+            // entity is only fetched if the AABB test survives
+            // the `best.t` early-out and we actually march the
+            // subtree.
+            let entry = entity_bin_entries[i];
 
             if ENABLE_STATS { entity_aabb_tests = entity_aabb_tests + 1u; }
-            let bb = ray_box(ray_origin, inv_dir, e.bbox_min, e.bbox_max);
+            let bb = ray_box(ray_origin, inv_dir, entry.bbox_min, entry.bbox_max);
             if bb.t_enter >= bb.t_exit || bb.t_exit < 0.0 { continue; }
             if bb.t_enter >= best.t { continue; }
             if ENABLE_STATS { entity_aabb_hits = entity_aabb_hits + 1u; }
 
             // On-screen projection of this entity at its closest
             // point along the ray. Entity is cubic (size.x == y == z).
-            let size = e.bbox_max - e.bbox_min;
+            let size = entry.bbox_max - entry.bbox_min;
             let ray_dist = max(bb.t_enter, 0.001);
             let entity_pixels = size.x / ray_dist * focal_px;
 
             // Cheap win #2: sub-pixel entity — skip subtree and
-            // splat the pre-computed representative color.
+            // splat the pre-computed representative color. This
+            // still needs the entity's representative_block, so
+            // pay the gather once we're committing.
             if entity_pixels < LOD_PIXEL_THRESHOLD {
                 if ENABLE_STATS { entity_subpixel_skips = entity_subpixel_skips + 1u; }
                 let t_hit = max(bb.t_enter, 0.0);
-                let rep_bt = e.representative_block;
+                let rep_bt = entities[entry.e_idx].representative_block;
                 if rep_bt < 255u {
                     best.hit = true;
                     best.t = t_hit;
                     best.color = palette.colors[rep_bt].rgb;
                     best.normal = -normalize(ray_dir);
-                    best.cell_min = e.bbox_min;
+                    best.cell_min = entry.bbox_min;
                     best.cell_size = size.x;
                 }
                 continue;
             }
+
+            // Surviving entity will be subtree-marched; pay the
+            // gather into `entities[]` once, here.
+            let e = entities[entry.e_idx];
 
             // Cheap win #1: per-entity depth budget.
             let log3_px = log2(max(entity_pixels / LOD_PIXEL_THRESHOLD, 1.0))
@@ -171,7 +181,7 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             ));
 
             let scale3 = vec3<f32>(3.0) / size;
-            let local_origin = (ray_origin - e.bbox_min) * scale3;
+            let local_origin = (ray_origin - entry.bbox_min) * scale3;
             let local_dir = ray_dir * scale3;
 
             if ENABLE_STATS { entity_subtree_marches = entity_subtree_marches + 1u; }
@@ -185,7 +195,7 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
 
             let size_over_3 = size * (1.0 / 3.0);
             best = local_hit;
-            best.cell_min = e.bbox_min + local_hit.cell_min * size_over_3;
+            best.cell_min = entry.bbox_min + local_hit.cell_min * size_over_3;
             best.cell_size = local_hit.cell_size * size_over_3.x;
         }
 

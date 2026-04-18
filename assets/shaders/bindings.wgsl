@@ -157,13 +157,22 @@ struct EntityGpu {
 
 /// Hash-grid bin offsets. Length `BIN_GRID_RES³ + 1`. Prefix sum:
 /// `entity_bin_offsets[i + 1] - entity_bin_offsets[i]` = count of
-/// entity-index entries in bin `i`, and `entity_bin_offsets[i]` is
-/// the start offset into `entity_bin_entries` for that bin.
+/// entries in bin `i`, and `entity_bin_offsets[i]` is the start
+/// offset into `entity_bin_entries` for that bin.
 @group(0) @binding(9) var<storage, read> entity_bin_offsets: array<u32>;
 
-/// Hash-grid entity list. Entity indices into `entities[]`, grouped
-/// by bin. Layout defined by `entity_bin_offsets[]`.
-@group(0) @binding(10) var<storage, read> entity_bin_entries: array<u32>;
+/// Hash-grid entry list. Each entry carries the entity's bbox
+/// INLINE alongside the entity index so the shader's per-bin
+/// AABB cull reads sequentially — no gather into `entities[e_idx]`
+/// until an AABB hit actually needs the subtree for marching.
+/// Layout matches `BinEntryGpu` (32 bytes, vec4-aligned).
+struct BinEntryGpu {
+    bbox_min: vec3<f32>,
+    e_idx: u32,
+    bbox_max: vec3<f32>,
+    _pad: u32,
+}
+@group(0) @binding(10) var<storage, read> entity_bin_entries: array<BinEntryGpu>;
 
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.

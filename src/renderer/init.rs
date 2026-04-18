@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuBinEntry, GpuCamera, GpuEntity, GpuNodeKind, GpuPalette, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -237,7 +237,7 @@ impl Renderer {
         let entity_bin_entries_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("entity_bin_entries"),
-                contents: bytemuck::cast_slice(&[0u32]),
+                contents: bytemuck::bytes_of(&GpuBinEntry::default()),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             },
         );

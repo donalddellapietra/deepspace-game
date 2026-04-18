@@ -219,6 +219,10 @@ pub struct App {
     /// branch's 40× perf-over-ECS lesson. Visual content shared via
     /// `NodeLibrary`; position + override state per-entity.
     pub(super) entities: crate::world::entities::EntityStore,
+    /// CPU-side scratch for the entity hash grid, reused across
+    /// frames so the res³-entry offsets allocation isn't re-zeroed
+    /// from fresh every frame.
+    pub(super) entity_bins_pool: crate::world::entity_bins::EntityBins,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -406,6 +410,7 @@ impl App {
             cached_highlight: None,
             last_edit_slots: None,
             entities: crate::world::entities::EntityStore::new(),
+            entity_bins_pool: crate::world::entity_bins::EntityBins::new(),
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]

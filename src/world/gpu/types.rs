@@ -113,6 +113,26 @@ pub struct GpuEntity {
     pub subtree_bfs: u32,
 }
 
+/// One entry in the entity hash grid's `entries` buffer. Carries the
+/// entity's bbox INLINE so the shader's AABB cull in the hot
+/// per-bin loop reads sequentially — no random gather into
+/// `entities[e_idx]`. `entities[e_idx]` is only fetched when an
+/// AABB hit survives the `best.t` early-out and we actually march
+/// the subtree.
+///
+/// Layout matches `GpuEntity`'s first 32 bytes so the shader's
+/// `BinEntryGpu.bbox_min` / `bbox_max` accesses compile to the same
+/// aligned vector loads. `_pad` keeps the struct 16-byte aligned
+/// for WGSL storage-buffer rules.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default, Debug, PartialEq)]
+pub struct GpuBinEntry {
+    pub bbox_min: [f32; 3],
+    pub e_idx: u32,
+    pub bbox_max: [f32; 3],
+    pub _pad: u32,
+}
+
 /// Block color palette — up to 256 RGBA colors indexed by block type.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

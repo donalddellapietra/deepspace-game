@@ -143,7 +143,11 @@ impl Renderer {
     ///
     /// The entries buffer grows in place; the offsets buffer is
     /// fixed at `BIN_GRID_RES³ + 1` u32s and always fits.
-    pub fn update_entity_bins(&mut self, offsets: &[u32], entries: &[u32]) {
+    pub fn update_entity_bins(
+        &mut self,
+        offsets: &[u32],
+        entries: &[crate::world::gpu::GpuBinEntry],
+    ) {
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
 
         // Offsets buffer: fixed size at init; plain write from 0.
@@ -154,8 +158,9 @@ impl Renderer {
 
         // Entries buffer: may grow. One-entry stub for empty so
         // the storage binding stays valid.
-        let stub = [0u32];
-        let payload: &[u32] = if entries.is_empty() { &stub } else { entries };
+        let stub = [crate::world::gpu::GpuBinEntry::default()];
+        let payload: &[crate::world::gpu::GpuBinEntry] =
+            if entries.is_empty() { &stub } else { entries };
         let needed = std::mem::size_of_val(payload) as u64;
         let mut grew = false;
         if needed > self.entity_bin_entries_buffer.size() {
