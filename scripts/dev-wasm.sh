@@ -19,6 +19,9 @@ trap cleanup EXIT INT TERM
 
 # 1. Build the React UI bundle once. Trunk's index.html copies
 #    ui/dist/{ui.css,ui.js} into the served root, so it must exist.
+#    Cached after first run — `rm -rf ui/dist` to force a rebuild
+#    after editing React source. (Rust changes are live-recompiled
+#    by trunk; only React code is cached.)
 if [[ ! -f "$ROOT/ui/dist/ui.js" ]]; then
     echo "Building React UI bundle (one-time)…"
     (cd "$ROOT/ui" && npm install --no-audit --no-fund && npm run build)

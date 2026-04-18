@@ -54,7 +54,13 @@ pub use test_runner::TestConfig;
 /// backing-store update and the renderer.resize stay in lockstep.
 pub enum UserEvent {
     RendererReady(Box<Renderer>),
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    /// Browser window resized. WASM-only: only sent from the
+    /// `wasm_canvas_setup` resize closure. Native uses
+    /// `WindowEvent::Resized` which already routes to both the
+    /// renderer and the wry overlay — sending `UserEvent::Resize`
+    /// natively would resize the renderer but skip the overlay,
+    /// which is why the variant is gated.
+    #[cfg(target_arch = "wasm32")]
     Resize(winit::dpi::PhysicalSize<u32>),
 }
 

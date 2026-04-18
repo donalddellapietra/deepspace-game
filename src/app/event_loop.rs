@@ -105,6 +105,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::RendererReady(renderer) => {
                 self.finish_init(*renderer);
             }
+            #[cfg(target_arch = "wasm32")]
             UserEvent::Resize(size) => {
                 if let Some(r) = &mut self.renderer {
                     r.resize(size.width.max(1), size.height.max(1));
