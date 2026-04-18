@@ -172,7 +172,11 @@ impl App {
     }
 
     pub(in crate::app) fn target_render_frame(&self) -> ActiveFrame {
-        let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
+        // Render frame depth is derived from `RENDER_ANCHOR_DEPTH`,
+        // not the user's anchor depth — zoom controls interaction
+        // layer, not what the camera renders. See `RENDER_ANCHOR_DEPTH`.
+        let desired_depth = crate::app::RENDER_ANCHOR_DEPTH
+            .saturating_sub(RENDER_FRAME_K as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
         // For sphere worlds the render path should target the physical
         // face surface where the packed tree retains deep structure —

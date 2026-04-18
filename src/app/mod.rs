@@ -30,6 +30,34 @@ use crate::world::tree::{NodeKind, MAX_DEPTH};
 pub const RENDER_FRAME_K: u8 = 3;
 pub const RENDER_FRAME_MAX_DEPTH: u8 = MAX_DEPTH as u8;
 pub const RENDER_FRAME_CONTEXT: u8 = 4;
+
+/// Depth at which the render frame is rooted, *independent of
+/// the user's zoom level*. The camera's `WorldPos` is deepened to
+/// this path depth via `deepened_to` — using the stored f32 offset
+/// to pick slots at every level beyond the user's anchor — and
+/// that deep path drives `compute_render_frame`.
+///
+/// # Why this exists
+///
+/// Zooming is a UI/interaction concept: it controls `edit_depth`
+/// (where break/place operations resolve), not what the camera
+/// actually sees. Two cameras at the same world position should
+/// render identical pixels regardless of their zoom state. Before
+/// this constant existed, `desired_depth = anchor_depth - K`
+/// leaked zoom directly into render-frame depth — so a fractal
+/// looked like chunky cubes when zoomed out and fine mesh when
+/// zoomed in, even though the camera hadn't moved.
+///
+/// # Bound
+///
+/// 14 sits just below the f32 offset precision limit: 3⁻¹⁴ ≈ 2e-7
+/// is near the mantissa resolution, so `deepened_to(14)` still
+/// produces a well-defined sub-cell offset. Pushing to 15+ starts
+/// losing significance in the trailing digits. Combined with the
+/// 5-level DDA stack (`MAX_STACK_DEPTH`) this gives an effective
+/// visible depth of ~19 levels at any zoom — enough to show our
+/// 20-level fractals at pixel fidelity everywhere.
+pub const RENDER_ANCHOR_DEPTH: u8 = 14;
 pub mod cursor;
 pub mod edit_actions;
 pub mod event_loop;
@@ -302,9 +330,15 @@ impl App {
             }
         };
         let anchor_depth = position.anchor.depth();
-        let desired_depth = (position.anchor.depth().saturating_sub(RENDER_FRAME_K))
+        // Render-frame depth is decoupled from the user's anchor
+        // depth (see `RENDER_ANCHOR_DEPTH` docs). We deepen the
+        // camera's `WorldPos` using its f32 offset to a constant
+        // maximum, so zooming only changes `edit_depth`, not what
+        // the camera *sees*.
+        let desired_depth = RENDER_ANCHOR_DEPTH
+            .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = position.anchor;
+        let mut logical_path = position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
         logical_path.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
@@ -406,9 +440,13 @@ impl App {
     /// explicit face-cell window so render/edit share one layer
     /// definition.
     pub(super) fn render_frame(&self) -> ActiveFrame {
-        let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
+        // Deepen the camera's anchor to `RENDER_ANCHOR_DEPTH` so
+        // the render frame depth is a function of camera position,
+        // not the user's zoom level. See `RENDER_ANCHOR_DEPTH`.
+        let desired_depth = RENDER_ANCHOR_DEPTH
+            .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = self.camera.position.anchor;
+        let mut logical_path = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
         logical_path.truncate(desired_depth);
         frame::with_render_margin(
             &self.world.library, self.world.root,
