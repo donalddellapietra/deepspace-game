@@ -27,9 +27,7 @@ fn main() {
     eprintln!("startup_perf main: event_loop_created");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     eprintln!("startup_perf main: control_flow_set");
-    let proxy = event_loop.create_proxy();
-    let mut app = App::with_test_config(test_cfg);
-    app.set_proxy(proxy);
+    let mut app = App::with_test_config(test_cfg, event_loop.create_proxy());
     eprintln!("startup_perf main: app_constructed");
     event_loop.run_app(&mut app).unwrap();
     eprintln!("startup_perf main: run_app_returned");

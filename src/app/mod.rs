@@ -49,9 +49,13 @@ pub use test_runner::TestConfig;
 /// Cross-thread / cross-task signal back into the winit event loop.
 /// The WASM path can't synchronously block on the async wgpu init, so
 /// it spawns the future and posts the finished `Renderer` back via
-/// this enum (native uses the same channel for symmetry).
+/// this enum (native uses the same channel for symmetry). On WASM,
+/// browser-window resize is also routed through here so the canvas
+/// backing-store update and the renderer.resize stay in lockstep.
 pub enum UserEvent {
     RendererReady(Box<Renderer>),
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Resize(winit::dpi::PhysicalSize<u32>),
 }
 
 /// Pack is a pure function of `(library, root)`. The only field that
@@ -211,9 +215,10 @@ pub struct App {
     pub(super) frames_waited: u32,
     /// Loopback into the winit event loop. Required on WASM so the
     /// spawned async renderer-init future can deliver the finished
-    /// `Renderer` back via `UserEvent::RendererReady`. Set in `main`
-    /// before `event_loop.run_app(&mut app)`.
-    pub(super) proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
+    /// `Renderer` back via `UserEvent::RendererReady`, and so the
+    /// browser-window resize closure can post `UserEvent::Resize`.
+    /// Native keeps it for symmetry but doesn't currently send.
+    pub(super) proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     /// True after we kicked off the async renderer init (WASM only).
     /// Stops `ensure_started` from re-spawning the future on every
     /// `resumed` / `about_to_wait` callback before the renderer
@@ -238,11 +243,14 @@ pub(super) struct PendingInit {
 }
 
 impl App {
-    pub fn new() -> Self {
-        Self::with_test_config(TestConfig::default())
+    pub fn new(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Self {
+        Self::with_test_config(TestConfig::default(), proxy)
     }
 
-    pub fn with_test_config(test_cfg: TestConfig) -> Self {
+    pub fn with_test_config(
+        test_cfg: TestConfig,
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    ) -> Self {
         let render_harness = test_cfg.render_harness;
         let low_latency_present = test_cfg.is_active();
         let show_harness_window = test_cfg.show_window;
@@ -386,14 +394,10 @@ impl App {
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
             frames_waited: 0,
-            proxy: None,
+            proxy,
             renderer_init_started: false,
             pending_init: None,
         }
-    }
-
-    pub fn set_proxy(&mut self, proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
-        self.proxy = Some(proxy);
     }
 
     #[inline]

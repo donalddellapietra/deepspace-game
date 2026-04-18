@@ -26,6 +26,21 @@ pub fn push_state(update: &GameStateUpdate) {
 /// pointer-lock is the equivalent and winit handles it.
 pub fn clear_passthrough() {}
 
+/// Tell the JS side that Rust is about to release pointer-lock
+/// (e.g. opening the inventory). The matching JS handler in
+/// `index.html` uses this to suppress the synthetic ESC keypress
+/// it'd otherwise inject when the browser fires `pointerlockchange`
+/// after a real ESC keypress (which Chrome/Firefox swallow).
+pub fn notify_intentional_unlock() {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(handler) = js_sys::Reflect::get(&window, &JsValue::from_str("__rustWillUnlock")) else {
+        return;
+    };
+    if let Ok(func) = handler.dyn_into::<js_sys::Function>() {
+        let _ = func.call0(&window);
+    }
+}
+
 /// Drain commands queued by the React UI via `window.__pollUiCommands()`.
 /// React pushes UiCommands by calling its own `sendCommand` which
 /// queues; this Rust-side poll pulls + parses them per frame.

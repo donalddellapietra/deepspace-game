@@ -29,6 +29,11 @@ impl App {
         let Some(window) = &self.window else { return };
         self.cursor_locked = false;
         self.keys.clear();
+        // Tell JS we initiated this release so the
+        // pointerlockchange listener doesn't synthesize an ESC and
+        // bounce-close whatever panel just opened.
+        #[cfg(target_arch = "wasm32")]
+        crate::overlay::notify_intentional_unlock();
         let _ = window.set_cursor_grab(CursorGrabMode::None);
         window.set_cursor_visible(true);
     }

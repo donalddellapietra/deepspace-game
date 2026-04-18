@@ -105,6 +105,11 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::RendererReady(renderer) => {
                 self.finish_init(*renderer);
             }
+            UserEvent::Resize(size) => {
+                if let Some(r) = &mut self.renderer {
+                    r.resize(size.width.max(1), size.height.max(1));
+                }
+            }
         }
     }
 }
@@ -132,31 +137,11 @@ impl App {
 
         // winit on wasm32 does not append the canvas to the document
         // body for us, and defaults the surface to 1×1 px. Append the
-        // canvas, then size the window to the browser viewport so wgpu
-        // creates a properly-sized swapchain on the first frame.
+        // canvas, stamp the backing store to match the viewport, and
+        // install a `window.onresize` closure that re-stamps + posts
+        // `UserEvent::Resize` so the renderer follows the browser.
         #[cfg(target_arch = "wasm32")]
-        {
-            use winit::platform::web::WindowExtWebSys;
-            if let Some(canvas) = window.canvas() {
-                if let Some(web_window) = web_sys::window() {
-                    let _ = web_window
-                        .document()
-                        .and_then(|d| d.body())
-                        .and_then(|b| b.append_child(&canvas).ok());
-                    let css_w = web_window.inner_width().ok()
-                        .and_then(|v| v.as_f64()).unwrap_or(800.0);
-                    let css_h = web_window.inner_height().ok()
-                        .and_then(|v| v.as_f64()).unwrap_or(600.0);
-                    let dpr = web_window.device_pixel_ratio();
-                    let phys_w = (css_w * dpr) as u32;
-                    let phys_h = (css_h * dpr) as u32;
-                    canvas.set_width(phys_w);
-                    canvas.set_height(phys_h);
-                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(phys_w, phys_h));
-                    log::info!("wasm: canvas {phys_w}x{phys_h} (css {css_w}x{css_h} dpr={dpr})");
-                }
-            }
-        }
+        wasm_canvas_setup(&window, self.proxy.clone());
 
         #[cfg(not(target_arch = "wasm32"))]
         let prepare_elapsed = if self.overlay_enabled() {
@@ -230,10 +215,7 @@ impl App {
                 return;
             }
             self.renderer_init_started = true;
-            let proxy = self
-                .proxy
-                .clone()
-                .expect("App::set_proxy must be called before run_app on wasm");
+            let proxy = self.proxy.clone();
             // Move owned copies into the future — slices can't cross the await.
             let tree_packed = tree_packed.to_vec();
             let node_kinds = node_kinds.to_vec();
@@ -662,4 +644,53 @@ impl App {
             std::process::exit(0);
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_canvas_setup(
+    window: &Arc<winit::window::Window>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+) {
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+    use winit::platform::web::WindowExtWebSys;
+
+    let Some(canvas) = window.canvas() else {
+        log::error!("wasm_canvas_setup: window.canvas() returned None");
+        return;
+    };
+    let Some(web_window) = web_sys::window() else { return };
+    let _ = web_window
+        .document()
+        .and_then(|d| d.body())
+        .and_then(|b| b.append_child(&canvas).ok());
+
+    fn viewport_size(w: &web_sys::Window) -> (u32, u32) {
+        let css_w = w.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+        let css_h = w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+        let dpr = w.device_pixel_ratio();
+        ((css_w * dpr) as u32, (css_h * dpr) as u32)
+    }
+
+    let (phys_w, phys_h) = viewport_size(&web_window);
+    canvas.set_width(phys_w);
+    canvas.set_height(phys_h);
+    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(phys_w, phys_h));
+    log::info!("wasm: canvas {phys_w}x{phys_h} dpr={}", web_window.device_pixel_ratio());
+
+    // Re-stamp canvas + post Resize on every browser-window resize.
+    // The closure must be `forget()`-ed so it outlives this scope.
+    let canvas_clone = canvas.clone();
+    let web_window_clone = web_window.clone();
+    let resize_cb = Closure::wrap(Box::new(move || {
+        let (w, h) = viewport_size(&web_window_clone);
+        canvas_clone.set_width(w);
+        canvas_clone.set_height(h);
+        let _ = proxy.send_event(UserEvent::Resize(winit::dpi::PhysicalSize::new(w, h)));
+    }) as Box<dyn FnMut()>);
+    let _ = web_window.add_event_listener_with_callback(
+        "resize",
+        resize_cb.as_ref().unchecked_ref(),
+    );
+    resize_cb.forget();
 }

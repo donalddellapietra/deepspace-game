@@ -32,17 +32,67 @@
         window.__setPerfData = function(fps, frameTimeMs, entityCount, unbaked, coldBakes) {
             window.__perfData = { fps, frameTimeMs, entityCount, unbaked, coldBakes };
         };
+
+        // ── WASM bridge: install BEFORE wasm + React load ────────────
+        // Two responsibilities, both timing-sensitive enough to warrant
+        // running before any module script:
+        //   1. Buffer state pushes from Rust until React's onState
+        //      handler is registered (avoids dropping the first few
+        //      frames' worth of overlay updates on slow loads).
+        //   2. Detect the browser swallowing the user's first ESC press
+        //      (Chrome/Firefox eat it to release pointer-lock). When
+        //      pointer-lock is lost AND we didn't ask for it (via
+        //      `__rustWillUnlock`), synthesize a fresh ESC keydown.
+        (function() {
+            const buffer = [];
+            let realHandler = null;
+            Object.defineProperty(window, '__onGameState', {
+                configurable: true,
+                get() {
+                    return function(data) {
+                        const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+                        if (realHandler) {
+                            realHandler(parsed);
+                        } else {
+                            buffer.push(parsed);
+                        }
+                    };
+                },
+                set(handler) {
+                    realHandler = handler;
+                    while (buffer.length) handler(buffer.shift());
+                },
+            });
+
+            let intentionalUnlock = false;
+            window.__rustWillUnlock = function() {
+                intentionalUnlock = true;
+                // 200 ms covers the round-trip: Rust calls
+                // set_cursor_grab(None) → winit calls exitPointerLock
+                // → browser fires pointerlockchange. In practice this
+                // resolves within ~16 ms (one frame).
+                setTimeout(function() { intentionalUnlock = false; }, 200);
+            };
+            document.addEventListener('pointerlockchange', function() {
+                if (document.pointerLockElement !== null) return;
+                if (intentionalUnlock) { intentionalUnlock = false; return; }
+                window.dispatchEvent(new KeyboardEvent('keydown', {
+                    code: 'Escape', key: 'Escape',
+                    bubbles: true, cancelable: true,
+                }));
+            });
+        })();
     </script>
 </head>
 <body>
-    <!-- Bevy WASM game -->
+    <!-- WASM game -->
     <link data-trunk rel="rust" data-bin="deepspace-game" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int" />
 
     <!-- React UI mounts here, on top of the canvas -->
     <div id="root"></div>
 
     <script>
-        // Perf data bridge: Bevy WASM writes here, Playwright reads it.
+        // Perf data bridge: WASM writes here, Playwright reads it.
         window.__perfData = { fps: 0, frameTimeMs: 0, entityCount: 0, npcCount: 0 };
         window.__setPerfData = function(fps, frameTimeMs, entityCount, npcCount) {
             window.__perfData = { fps, frameTimeMs, entityCount, npcCount };

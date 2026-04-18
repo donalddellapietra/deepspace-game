@@ -13,28 +13,19 @@ test("WASM → JS state sync — verify overlay updates", async ({ page }) => {
 
   await page.setViewportSize({ width: 1024, height: 768 });
 
-  // Install a probe BEFORE WASM loads, so we count every __onGameState call.
-  await page.addInitScript(() => {
+  await page.goto("/");
+
+  // Install a counting handler via the index.html buffering bridge:
+  // SET on __onGameState routes through the inline-script's setter,
+  // which drains any buffered items and routes future calls here.
+  await page.evaluate(() => {
     (window as any).__stateCalls = 0;
     (window as any).__stateLog = [];
-    let realHandler: ((d: any) => void) | null = null;
-    Object.defineProperty(window, "__onGameState", {
-      configurable: true,
-      get() {
-        return (data: any) => {
-          (window as any).__stateCalls++;
-          const parsed = typeof data === "string" ? JSON.parse(data) : data;
-          (window as any).__stateLog.push(parsed);
-          if (realHandler) realHandler(parsed);
-        };
-      },
-      set(handler) {
-        realHandler = handler;
-      },
-    });
+    (window as any).__onGameState = (data: any) => {
+      (window as any).__stateCalls++;
+      (window as any).__stateLog.push(data);
+    };
   });
-
-  await page.goto("/");
   await page.waitForTimeout(5_000);
 
   const result = await page.evaluate(() => {

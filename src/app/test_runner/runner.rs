@@ -167,13 +167,13 @@ impl TestRunner {
 pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
-    use crate::app::App;
+    use crate::app::{App, UserEvent};
     use crate::renderer::Renderer;
     use winit::event_loop::EventLoop;
     use winit::window::WindowAttributes;
 
-    let mut app = App::with_test_config(cfg.clone());
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let mut app = App::with_test_config(cfg.clone(), event_loop.create_proxy());
     let window = Arc::new(event_loop.create_window(
         WindowAttributes::default()
             .with_title("Deep Space Render Harness")
