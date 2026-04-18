@@ -3,7 +3,9 @@
 fn main() {}
 
 #[cfg(not(target_arch = "wasm32"))]
-use _native::main;
+fn main() {
+    _native::main();
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 mod _native {
@@ -53,7 +55,7 @@ impl ApplicationHandler for ProbeApp {
     }
 }
 
-fn main() {
+pub(super) fn main() {
     eprintln!("probe: begin");
     let event_loop = {
         let mut builder = EventLoop::builder();
