@@ -120,6 +120,8 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             break;
         }
 
+        if ENABLE_STATS { entity_bin_visits = entity_bin_visits + 1u; }
+
         let bin_id = u32(cell.x)
             + u32(cell.y) * BIN_GRID_RES
             + u32(cell.z) * BIN_GRID_RES * BIN_GRID_RES;
@@ -130,9 +132,11 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             let e_idx = entity_bin_entries[i];
             let e = entities[e_idx];
 
+            if ENABLE_STATS { entity_aabb_tests = entity_aabb_tests + 1u; }
             let bb = ray_box(ray_origin, inv_dir, e.bbox_min, e.bbox_max);
             if bb.t_enter >= bb.t_exit || bb.t_exit < 0.0 { continue; }
             if bb.t_enter >= best.t { continue; }
+            if ENABLE_STATS { entity_aabb_hits = entity_aabb_hits + 1u; }
 
             // On-screen projection of this entity at its closest
             // point along the ray. Entity is cubic (size.x == y == z).
@@ -141,19 +145,15 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
             let entity_pixels = size.x / ray_dist * focal_px;
 
             // Cheap win #2: sub-pixel entity — skip subtree and
-            // splat the pre-computed representative color. Saves
-            // the ray transform + march_cartesian entry overhead
-            // that would LOD-terminate at the same color anyway.
+            // splat the pre-computed representative color.
             if entity_pixels < LOD_PIXEL_THRESHOLD {
+                if ENABLE_STATS { entity_subpixel_skips = entity_subpixel_skips + 1u; }
                 let t_hit = max(bb.t_enter, 0.0);
                 let rep_bt = e.representative_block;
                 if rep_bt < 255u {
                     best.hit = true;
                     best.t = t_hit;
                     best.color = palette.colors[rep_bt].rgb;
-                    // Face the camera for shading; bevel math on a
-                    // 1-pixel splat is irrelevant. cell_min/size
-                    // match the bbox so highlight logic works.
                     best.normal = -normalize(ray_dir);
                     best.cell_min = e.bbox_min;
                     best.cell_size = size.x;
@@ -161,11 +161,7 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                 continue;
             }
 
-            // Cheap win #1: per-entity depth budget. Cap descent
-            // at the level where each cell is ~LOD_PIXEL_THRESHOLD
-            // pixels across. In-shader pixel LOD would terminate
-            // one level deeper anyway, but pre-bounding saves the
-            // final setup + LOD-check pair per entity.
+            // Cheap win #1: per-entity depth budget.
             let log3_px = log2(max(entity_pixels / LOD_PIXEL_THRESHOLD, 1.0))
                 * INV_LOG2_3;
             let depth_limit = u32(clamp(
@@ -174,17 +170,17 @@ fn march_entities(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> HitResult {
                 f32(MAX_STACK_DEPTH),
             ));
 
-            // Ray into entity-local [0, 3)³. Uniform scale means
-            // local_t == world_t — no conversion needed.
             let scale3 = vec3<f32>(3.0) / size;
             let local_origin = (ray_origin - e.bbox_min) * scale3;
             let local_dir = ray_dir * scale3;
 
+            if ENABLE_STATS { entity_subtree_marches = entity_subtree_marches + 1u; }
             let local_hit = march_cartesian(
                 e.subtree_bfs, local_origin, local_dir,
                 depth_limit, 0xFFFFFFFFu,
             );
             if !local_hit.hit { continue; }
+            if ENABLE_STATS { entity_subtree_hits = entity_subtree_hits + 1u; }
             if local_hit.t >= best.t { continue; }
 
             let size_over_3 = size * (1.0 / 3.0);

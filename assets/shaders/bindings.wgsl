@@ -102,12 +102,16 @@ struct ShaderStats {
     sum_steps_empty_div4: atomic<u32>,
     sum_steps_node_descend_div4: atomic<u32>,
     sum_steps_lod_terminal_div4: atomic<u32>,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
-    _pad4: u32,
-    _pad5: u32,
+    // Entity-pass counters (div-4 to match the world counters).
+    // Together they tell us where the 10k-entity frame is spending
+    // time: bin DDA iterations vs AABB test count vs subtree
+    // descents. See `march_entities` for the increment sites.
+    entity_bin_visits_div4: atomic<u32>,        // DDA bin iterations
+    entity_aabb_tests_div4: atomic<u32>,        // ray-box tests
+    entity_aabb_hits_div4: atomic<u32>,         // AABB tests that passed
+    entity_subpixel_skips_div4: atomic<u32>,    // took sub-pixel fast path
+    entity_subtree_marches_div4: atomic<u32>,   // entered march_cartesian
+    entity_subtree_hits_div4: atomic<u32>,      // subtree march returned a hit
 }
 
 /// Interleaved sparse-tree storage. Each node occupies
@@ -171,6 +175,16 @@ var<private> ray_steps_oob: u32 = 0u;
 var<private> ray_steps_empty: u32 = 0u;
 var<private> ray_steps_node_descend: u32 = 0u;
 var<private> ray_steps_lod_terminal: u32 = 0u;
+
+/// Per-fragment entity-pass counters. Accumulated inside
+/// `march_entities`, flushed by `fs_main` via `atomicAdd` when
+/// `ENABLE_STATS` is on.
+var<private> entity_bin_visits: u32 = 0u;
+var<private> entity_aabb_tests: u32 = 0u;
+var<private> entity_aabb_hits: u32 = 0u;
+var<private> entity_subpixel_skips: u32 = 0u;
+var<private> entity_subtree_marches: u32 = 0u;
+var<private> entity_subtree_hits: u32 = 0u;
 
 /// Pipeline-override constant: when false, fs_main skips all
 /// atomic writes to shader_stats and DDA loops skip the `ray_steps`

@@ -54,6 +54,16 @@ pub struct ShaderStatsFrame {
     pub sum_steps_empty_div4: u32,
     pub sum_steps_node_descend_div4: u32,
     pub sum_steps_lod_terminal_div4: u32,
+    /// Entity-pass counters. Each is a per-pixel running total,
+    /// div-by-4 for u32 safety at high res. Divide by ray_count
+    /// for per-ray averages. See `march_entities` for increment
+    /// sites.
+    pub entity_bin_visits_div4: u32,
+    pub entity_aabb_tests_div4: u32,
+    pub entity_aabb_hits_div4: u32,
+    pub entity_subpixel_skips_div4: u32,
+    pub entity_subtree_marches_div4: u32,
+    pub entity_subtree_hits_div4: u32,
 }
 
 impl ShaderStatsFrame {
@@ -83,6 +93,36 @@ impl ShaderStatsFrame {
     pub fn avg_steps_lod_terminal(&self) -> f64 {
         if self.ray_count == 0 { 0.0 }
         else { (self.sum_steps_lod_terminal_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_entity_bin_visits(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.entity_bin_visits_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_entity_aabb_tests(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.entity_aabb_tests_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_entity_aabb_hits(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.entity_aabb_hits_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_entity_subpixel_skips(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.entity_subpixel_skips_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_entity_subtree_marches(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.entity_subtree_marches_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_entity_subtree_hits(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.entity_subtree_hits_div4 as f64 * 4.0) / self.ray_count as f64 }
     }
 
     pub fn hit_fraction(&self) -> f64 {
@@ -498,6 +538,12 @@ impl Renderer {
             sum_steps_empty_div4: read_u32(28),
             sum_steps_node_descend_div4: read_u32(32),
             sum_steps_lod_terminal_div4: read_u32(36),
+            entity_bin_visits_div4: read_u32(40),
+            entity_aabb_tests_div4: read_u32(44),
+            entity_aabb_hits_div4: read_u32(48),
+            entity_subpixel_skips_div4: read_u32(52),
+            entity_subtree_marches_div4: read_u32(56),
+            entity_subtree_hits_div4: read_u32(60),
         };
         drop(data);
         self.shader_stats_readback.unmap();

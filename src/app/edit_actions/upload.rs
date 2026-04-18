@@ -37,6 +37,8 @@ impl App {
             return;
         }
         let Some(cache) = self.cached_tree.as_mut() else { return };
+
+        let t_pack = web_time::Instant::now();
         let len_before_u32 = cache.tree.len();
         let kinds_before = cache.node_kinds.len();
         for e in self.entities.entities.iter_mut() {
@@ -50,15 +52,9 @@ impl App {
                 cache.root_bfs_idx,
             );
         }
+        let pack_ms = t_pack.elapsed().as_secs_f64() * 1000.0;
 
-        // Build per-frame GPU records. `pos.in_frame(frame)` gives
-        // the entity's bbox_min corner in the current frame's local
-        // [0, 3)³ coords — sub-cell offset shifts this continuously
-        // each frame, driving smooth motion under `EntityStore::tick`.
-        //
-        // Skip entities at or above the frame depth (v1: entities
-        // must be smaller than the frame cell; larger entities
-        // would contain the camera — handled later with LOD).
+        let t_build = web_time::Instant::now();
         let frame = self.active_frame.render_path;
         let frame_depth = frame.depth() as i32;
         let mut gpu = Vec::with_capacity(self.entities.len());
@@ -82,14 +78,25 @@ impl App {
                 subtree_bfs: e.bfs_idx,
             });
         }
+        let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
 
-        // Hash-grid build happens AFTER the GPU list is assembled
-        // (it needs the bboxes) and BEFORE the entity-buffer upload
-        // so entities[] and the bin entries stay consistent with
-        // each other for the ray-march.
+        let t_bins = web_time::Instant::now();
         let bins = EntityBins::build(&gpu);
+        let bins_ms = t_bins.elapsed().as_secs_f64() * 1000.0;
+
+        let entries_len = bins.entries.len();
+        let t_upload = web_time::Instant::now();
         renderer.update_entities(&gpu);
         renderer.update_entity_bins(&bins.offsets, &bins.entries);
+        let upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
+
+        if self.render_harness {
+            eprintln!(
+                "entity_upload entities={} bin_entries={} pack_ms={:.3} build_ms={:.3} bins_ms={:.3} upload_ms={:.3}",
+                gpu.len(), entries_len,
+                pack_ms, build_ms, bins_ms, upload_ms,
+            );
+        }
     }
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {

@@ -132,6 +132,12 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         atomicAdd(&shader_stats.sum_steps_empty_div4, (ray_steps_empty + 3u) >> 2u);
         atomicAdd(&shader_stats.sum_steps_node_descend_div4, (ray_steps_node_descend + 3u) >> 2u);
         atomicAdd(&shader_stats.sum_steps_lod_terminal_div4, (ray_steps_lod_terminal + 3u) >> 2u);
+        atomicAdd(&shader_stats.entity_bin_visits_div4, (entity_bin_visits + 3u) >> 2u);
+        atomicAdd(&shader_stats.entity_aabb_tests_div4, (entity_aabb_tests + 3u) >> 2u);
+        atomicAdd(&shader_stats.entity_aabb_hits_div4, (entity_aabb_hits + 3u) >> 2u);
+        atomicAdd(&shader_stats.entity_subpixel_skips_div4, (entity_subpixel_skips + 3u) >> 2u);
+        atomicAdd(&shader_stats.entity_subtree_marches_div4, (entity_subtree_marches + 3u) >> 2u);
+        atomicAdd(&shader_stats.entity_subtree_hits_div4, (entity_subtree_hits + 3u) >> 2u);
     }
 
     // Stash t in the alpha channel so fs_main_taa can route it into
