@@ -112,23 +112,31 @@ impl Renderer {
         let offsets_init: &[u32] =
             if node_offsets.is_empty() { &stub_offsets } else { node_offsets };
 
-        let tree_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tree"),
-            contents: bytemuck::cast_slice(tree_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let node_kinds_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("node_kinds"),
-            contents: bytemuck::cast_slice(node_kinds),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let node_offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("node_offsets"),
-            contents: bytemuck::cast_slice(offsets_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        // Allocate tree / node_kinds / node_offsets with 1.5× headroom
+        // past the initial pack size so the first handful of edits
+        // patch in-place (via `queue.write_buffer`) without forcing a
+        // full buffer recreate + bind-group rebuild.
+        let alloc_with_headroom = |device: &wgpu::Device, label: &'static str, bytes: &[u8]| -> wgpu::Buffer {
+            let min = bytes.len() as u64;
+            let size = (min.max(1) * 3 / 2).max(min + 4096);
+            let b = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&b, 0, bytes);
+            b
+        };
+        let tree_buffer = alloc_with_headroom(
+            &device, "tree", bytemuck::cast_slice(tree_init),
+        );
+        let node_kinds_buffer = alloc_with_headroom(
+            &device, "node_kinds", bytemuck::cast_slice(node_kinds),
+        );
+        let node_offsets_buffer = alloc_with_headroom(
+            &device, "node_offsets", bytemuck::cast_slice(offsets_init),
+        );
 
         let camera = GpuCamera {
             pos: [1.5, 1.75, 1.5],
@@ -428,9 +436,15 @@ impl Renderer {
             None
         };
 
+        let uploaded_tree_u32s = tree.len() as u64;
+        let uploaded_kinds_count = node_kinds.len() as u64;
+        let uploaded_offsets_count = node_offsets.len() as u64;
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
             tree_buffer, node_offsets_buffer, node_kinds_buffer,
+            uploaded_tree_u32s,
+            uploaded_kinds_count,
+            uploaded_offsets_count,
             camera_buffer, palette_buffer, uniforms_buffer,
             ribbon_buffer,
             bind_group,

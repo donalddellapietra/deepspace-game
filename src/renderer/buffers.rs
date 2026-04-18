@@ -10,11 +10,16 @@ use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
 use super::{GpuUniforms, Renderer, MAX_RIBBON_LEN};
 
 impl Renderer {
-    /// Re-upload the sparse tree buffers after an edit or re-pack.
-    /// Three parallel uploads: the interleaved `tree` u32 buffer
-    /// (headers + inline child entries), the per-node-kind metadata,
-    /// and the BFS-index → tree-offset mapping. Recreates GPU buffers
-    /// and rebinds when any of them outgrew the previous allocation.
+    /// Sync the GPU tree buffers to match the latest packed state.
+    ///
+    /// The pack buffer is append-only: every edit grows `tree`,
+    /// `node_kinds`, and `node_offsets` with a handful of new
+    /// entries. This method writes ONLY the appended tail via
+    /// `queue.write_buffer` instead of re-uploading the whole thing,
+    /// so edits don't stall the shader behind an 8 MB write barrier.
+    ///
+    /// Falls back to full allocate + bind-group-rebuild only when an
+    /// append would overflow the current GPU buffer allocation.
     pub fn update_tree(
         &mut self,
         tree: &[u32],
@@ -25,52 +30,39 @@ impl Renderer {
         self.root_index = root_bfs_index;
         self.node_count = node_kinds.len() as u32;
 
-        // Storage buffers cannot be zero-sized. Supply a single
-        // zero-filled stub so a freshly-created library with zero
-        // nodes (only seen in pathological edge cases) still has a
-        // valid bind group — the shader never indexes into it because
-        // the ribbon is empty and the root is the only node read.
-        let stub_tree = [0u32, 2u32]; // empty node header.
+        // Storage buffers cannot be zero-sized. Supply stubs for the
+        // pathological "empty pack" case so the bind group stays valid.
+        let stub_tree = [0u32, 2u32];
         let stub_offsets = [0u32];
         let tree_payload: &[u32] = if tree.is_empty() { &stub_tree } else { tree };
-        let offsets_payload: &[u32] = if node_offsets.is_empty() {
-            &stub_offsets
-        } else {
-            node_offsets
-        };
+        let offsets_payload: &[u32] = if node_offsets.is_empty() { &stub_offsets } else { node_offsets };
 
-        // Probe for packed-tree size exceeding the device's storage
-        // buffer binding cap. wgpu will error on its own if we go over,
-        // but the message is opaque; surface a clear, actionable
-        // warning first. Don't abort — still attempt the upload so the
-        // user sees both our diagnostic and wgpu's error.
         let tree_byte_size = std::mem::size_of_val(tree_payload) as u64;
-        let max_binding_size =
-            self.device.limits().max_storage_buffer_binding_size as u64;
+        let max_binding_size = self.device.limits().max_storage_buffer_binding_size as u64;
         if tree_byte_size > max_binding_size {
             eprintln!(
-                "tree_buffer_size_warning packed={} bytes, limit={} bytes \
-                 — raise maxStorageBufferBindingSize via requiredLimits or \
-                 reduce scene scale",
+                "tree_buffer_size_warning packed={} bytes, limit={} bytes",
                 tree_byte_size, max_binding_size,
             );
         }
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let write_start = std::time::Instant::now();
-        let tree_grew = upload_or_recreate(
-            &mut self.tree_buffer, &self.device, &self.queue,
-            "tree", tree_payload, storage,
+        let prev_tree_u32s = self.uploaded_tree_u32s;
+        let tree_grew = append_or_recreate_u32(
+            &mut self.tree_buffer, &mut self.uploaded_tree_u32s,
+            &self.device, &self.queue, "tree", tree_payload, storage,
         );
-        let kinds_grew = upload_or_recreate(
-            &mut self.node_kinds_buffer, &self.device, &self.queue,
-            "node_kinds", node_kinds, storage,
+        let kinds_grew = append_or_recreate(
+            &mut self.node_kinds_buffer, &mut self.uploaded_kinds_count,
+            &self.device, &self.queue, "node_kinds", node_kinds, storage,
         );
-        let offsets_grew = upload_or_recreate(
-            &mut self.node_offsets_buffer, &self.device, &self.queue,
-            "node_offsets", offsets_payload, storage,
+        let offsets_grew = append_or_recreate_u32(
+            &mut self.node_offsets_buffer, &mut self.uploaded_offsets_count,
+            &self.device, &self.queue, "node_offsets", offsets_payload, storage,
         );
         self.last_tree_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
+        let _ = prev_tree_u32s;
 
         self.last_bind_group_rebuild_ms = 0.0;
         if tree_grew || kinds_grew || offsets_grew {
@@ -109,10 +101,18 @@ impl Renderer {
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let write_start = std::time::Instant::now();
-        let grew = upload_or_recreate(
-            &mut self.ribbon_buffer, &self.device, &self.queue,
-            "ribbon", payload, storage,
-        );
+        let needed = std::mem::size_of_val(payload) as u64;
+        let grew = if needed > self.ribbon_buffer.size() {
+            self.ribbon_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ribbon"),
+                contents: bytemuck::cast_slice(payload),
+                usage: storage,
+            });
+            true
+        } else {
+            self.queue.write_buffer(&self.ribbon_buffer, 0, bytemuck::cast_slice(payload));
+            false
+        };
         self.last_ribbon_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
         if grew {
             let rebuild_start = std::time::Instant::now();
@@ -159,30 +159,69 @@ impl Renderer {
     }
 }
 
-/// Upload `data` into `buffer`. If the new payload is larger than
-/// the existing allocation, create a fresh buffer (and signal the
-/// caller via the returned `bool` that the bind group needs to be
-/// rebuilt). Otherwise patch in place with `queue.write_buffer`.
-pub(super) fn upload_or_recreate<T: bytemuck::Pod>(
+/// Append-style buffer sync for generic Pod slices indexed by element
+/// count. When `data.len() > *uploaded_count`, writes only the new
+/// tail via `queue.write_buffer`. If the buffer can't hold `data` at
+/// its current size, recreates it with 1.5× headroom (so the next
+/// few edits patch in-place without another rebuild) and returns
+/// `true` so the caller knows to rebuild the bind group.
+pub(super) fn append_or_recreate<T: bytemuck::Pod>(
     buffer: &mut wgpu::Buffer,
+    uploaded_count: &mut u64,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     label: &'static str,
     data: &[T],
     usage: wgpu::BufferUsages,
 ) -> bool {
-    let needed = std::mem::size_of_val(data) as u64;
+    let elem_size = std::mem::size_of::<T>() as u64;
+    let needed = data.len() as u64 * elem_size;
     if needed > buffer.size() {
-        *buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Overflow: recreate with 1.5× headroom so the next several
+        // edits fit without another grow.
+        let new_size = (needed.max(1) * 3 / 2).max(elem_size);
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            contents: bytemuck::cast_slice(data),
+            size: new_size,
             usage,
+            mapped_at_creation: false,
         });
-        true
-    } else {
-        queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
-        false
+        if !data.is_empty() {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+        }
+        *uploaded_count = data.len() as u64;
+        return true;
     }
+    if data.len() as u64 > *uploaded_count {
+        let start_elem = *uploaded_count as usize;
+        let tail = &data[start_elem..];
+        let byte_offset = *uploaded_count * elem_size;
+        queue.write_buffer(buffer, byte_offset, bytemuck::cast_slice(tail));
+        *uploaded_count = data.len() as u64;
+    } else if (data.len() as u64) < *uploaded_count {
+        // Pack shouldn't shrink, but if it ever does, rewrite from 0
+        // so we don't leak stale tail content.
+        if !data.is_empty() {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+        }
+        *uploaded_count = data.len() as u64;
+    }
+    false
+}
+
+/// Same as `append_or_recreate` but specialized to `&[u32]`. Useful
+/// because `tree: Vec<u32>` and `node_offsets: Vec<u32>` use u32
+/// counts rather than element counts of a larger struct.
+pub(super) fn append_or_recreate_u32(
+    buffer: &mut wgpu::Buffer,
+    uploaded_u32s: &mut u64,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    data: &[u32],
+    usage: wgpu::BufferUsages,
+) -> bool {
+    append_or_recreate(buffer, uploaded_u32s, device, queue, label, data, usage)
 }
 
 pub(super) fn make_bind_group(

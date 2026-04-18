@@ -68,6 +68,14 @@ pub struct Renderer {
     /// only on descent / ribbon pop (cold path).
     pub(super) node_offsets_buffer: wgpu::Buffer,
     pub(super) node_kinds_buffer: wgpu::Buffer,
+    /// Running counts of what's currently uploaded to the GPU
+    /// buffers (u32s for tree; element counts for the BFS-indexed
+    /// side buffers). `update_tree` uses these to write only the
+    /// appended tail via `queue.write_buffer`, avoiding a whole-
+    /// buffer re-upload + GPU write-barrier stall on every edit.
+    pub(super) uploaded_tree_u32s: u64,
+    pub(super) uploaded_kinds_count: u64,
+    pub(super) uploaded_offsets_count: u64,
     pub(super) camera_buffer: wgpu::Buffer,
     pub(super) palette_buffer: wgpu::Buffer,
     pub(super) uniforms_buffer: wgpu::Buffer,
