@@ -8,7 +8,6 @@ pub mod camera;
 pub mod input;
 pub mod player;
 pub mod app;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod overlay;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform;

@@ -61,7 +61,7 @@ impl TestMonitor {
 
     pub fn record_frame(
         &self,
-        elapsed_since_start: std::time::Duration,
+        elapsed_since_start: web_time::Duration,
         frame_secs: Option<f64>,
         cadence_secs: Option<f64>,
     ) {

@@ -11,9 +11,9 @@ use winit::window::{WindowAttributes, WindowId};
 use crate::renderer::Renderer;
 use crate::world::gpu;
 
-use super::App;
+use super::{App, PendingInit, UserEvent};
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {}
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -99,14 +99,24 @@ impl ApplicationHandler for App {
     fn exiting(&mut self, _: &ActiveEventLoop) {
         eprintln!("startup_perf callback: exiting");
     }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::RendererReady(renderer) => {
+                self.finish_init(*renderer);
+            }
+        }
+    }
 }
 
 impl App {
     fn ensure_started(&mut self, event_loop: &ActiveEventLoop, source: &str) {
         if self.window.is_some() {
+            // On WASM the window exists but renderer comes online
+            // asynchronously — nothing more to do here.
             return;
         }
-        let resumed_start = std::time::Instant::now();
+        let resumed_start = web_time::Instant::now();
         eprintln!("startup_perf {source}: begin");
 
         let attrs = WindowAttributes::default()
@@ -114,25 +124,56 @@ impl App {
             .with_inner_size(winit::dpi::LogicalSize::new(self.harness_width, self.harness_height))
             .with_visible(!self.render_harness || self.show_harness_window);
 
-        let window_start = std::time::Instant::now();
+        let window_start = web_time::Instant::now();
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let window_elapsed = window_start.elapsed();
         eprintln!("startup_perf {source}: window_created ms={:.2}", window_elapsed.as_secs_f64() * 1000.0);
         self.window = Some(window.clone());
 
+        // winit on wasm32 does not append the canvas to the document
+        // body for us, and defaults the surface to 1×1 px. Append the
+        // canvas, then size the window to the browser viewport so wgpu
+        // creates a properly-sized swapchain on the first frame.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use winit::platform::web::WindowExtWebSys;
+            if let Some(canvas) = window.canvas() {
+                if let Some(web_window) = web_sys::window() {
+                    let _ = web_window
+                        .document()
+                        .and_then(|d| d.body())
+                        .and_then(|b| b.append_child(&canvas).ok());
+                    let css_w = web_window.inner_width().ok()
+                        .and_then(|v| v.as_f64()).unwrap_or(800.0);
+                    let css_h = web_window.inner_height().ok()
+                        .and_then(|v| v.as_f64()).unwrap_or(600.0);
+                    let dpr = web_window.device_pixel_ratio();
+                    let phys_w = (css_w * dpr) as u32;
+                    let phys_h = (css_h * dpr) as u32;
+                    // Set the canvas backing store directly — winit's
+                    // request_inner_size doesn't take effect until the
+                    // next event tick on web, but wgpu reads the size
+                    // synchronously when creating the surface.
+                    canvas.set_width(phys_w);
+                    canvas.set_height(phys_h);
+                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(phys_w, phys_h));
+                }
+            }
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         let prepare_elapsed = if self.overlay_enabled() {
-            let prepare_start = std::time::Instant::now();
+            let prepare_start = web_time::Instant::now();
             crate::platform::prepare_window(&window);
             prepare_start.elapsed()
         } else {
-            std::time::Duration::ZERO
+            web_time::Duration::ZERO
         };
-        eprintln!("startup_perf {source}: window_prepared ms={:.2}", prepare_elapsed.as_secs_f64() * 1000.0);
         #[cfg(target_arch = "wasm32")]
-        let prepare_elapsed = std::time::Duration::ZERO;
+        let prepare_elapsed = web_time::Duration::ZERO;
+        eprintln!("startup_perf {source}: window_prepared ms={:.2}", prepare_elapsed.as_secs_f64() * 1000.0);
 
-        let pack_start = std::time::Instant::now();
+        let pack_start = web_time::Instant::now();
         let (tree_packed, node_kinds, node_offsets, _node_ids, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
         let pack_elapsed = pack_start.elapsed();
@@ -142,37 +183,115 @@ impl App {
             node_kinds.len(),
             tree_packed.len(),
         );
-        let renderer_start = std::time::Instant::now();
+
+        let renderer_start = web_time::Instant::now();
+        let present_mode = if self.low_latency_present {
+            wgpu::PresentMode::AutoNoVsync
+        } else {
+            wgpu::PresentMode::AutoVsync
+        };
         let shader_stats_enabled = self.shader_stats_enabled;
         let lod_pixel_threshold = self.lod_pixel_threshold;
         let lod_base_depth = self.lod_base_depth;
-        let renderer = pollster::block_on(
-            Renderer::new(
+        let live_sample_every = self.live_sample_every_frames;
+        let taa_enabled = self.taa_enabled;
+        let node_count = node_kinds.len();
+        let tree_u32_count = tree_packed.len();
+
+        self.pending_init = Some(PendingInit {
+            source: source.to_string(),
+            resumed_start,
+            window_elapsed,
+            prepare_elapsed,
+            pack_elapsed,
+            renderer_start,
+            node_count,
+            tree_u32_count,
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let renderer = pollster::block_on(Renderer::new(
                 window,
                 &tree_packed,
                 &node_kinds,
                 &node_offsets,
                 root_index,
-                if self.low_latency_present {
-                    wgpu::PresentMode::AutoNoVsync
-                } else {
-                    wgpu::PresentMode::AutoVsync
-                },
+                present_mode,
                 shader_stats_enabled,
                 lod_pixel_threshold,
                 lod_base_depth,
-                self.live_sample_every_frames,
-                self.taa_enabled,
-            ),
-        );
-        let renderer_elapsed = renderer_start.elapsed();
+                live_sample_every,
+                taa_enabled,
+            ));
+            self.finish_init(renderer);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.renderer_init_started {
+                return;
+            }
+            self.renderer_init_started = true;
+            let proxy = self
+                .proxy
+                .clone()
+                .expect("App::set_proxy must be called before run_app on wasm");
+            // Move owned copies into the future — slices can't cross the await.
+            let tree_packed = tree_packed.to_vec();
+            let node_kinds = node_kinds.to_vec();
+            let node_offsets = node_offsets.to_vec();
+            wasm_bindgen_futures::spawn_local(async move {
+                // Re-stamp the canvas backing store right before
+                // surface creation. Winit's request_inner_size on web
+                // doesn't apply synchronously, so anything we set in
+                // ensure_started can be reset by a resize event tick
+                // before this spawn_local body actually runs.
+                {
+                    use winit::platform::web::WindowExtWebSys;
+                    if let (Some(canvas), Some(web_window)) = (window.canvas(), web_sys::window()) {
+                        let css_w = web_window.inner_width().ok()
+                            .and_then(|v| v.as_f64()).unwrap_or(800.0);
+                        let css_h = web_window.inner_height().ok()
+                            .and_then(|v| v.as_f64()).unwrap_or(600.0);
+                        let dpr = web_window.device_pixel_ratio();
+                        canvas.set_width((css_w * dpr) as u32);
+                        canvas.set_height((css_h * dpr) as u32);
+                    }
+                }
+                let renderer = Renderer::new(
+                    window,
+                    &tree_packed,
+                    &node_kinds,
+                    &node_offsets,
+                    root_index,
+                    present_mode,
+                    shader_stats_enabled,
+                    lod_pixel_threshold,
+                    lod_base_depth,
+                    live_sample_every,
+                    taa_enabled,
+                )
+                .await;
+                if proxy.send_event(UserEvent::RendererReady(Box::new(renderer))).is_err() {
+                    log::error!("RendererReady: event loop already closed");
+                }
+            });
+        }
+    }
+
+    /// Runs after the async (or sync) renderer init lands. Pulls the
+    /// per-source timing breadcrumbs out of `pending_init` so the perf
+    /// log line is identical on native and WASM.
+    pub(super) fn finish_init(&mut self, mut renderer: Renderer) {
+        let Some(pending) = self.pending_init.take() else {
+            log::error!("finish_init called without pending_init — ignoring");
+            return;
+        };
+        let renderer_elapsed = pending.renderer_start.elapsed();
+        let source = pending.source;
         eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);
-        let mut renderer = renderer;
-        // Push the App's color registry into the GPU palette buffer.
-        // Bootstrap presets that import models (e.g. --vox-model) add
-        // per-model colors to this registry; without this upload the
-        // shader still sees GpuPalette::default() (builtins only) and
-        // every imported voxel renders as palette[0] = transparent black.
+
         renderer.update_palette(&self.palette.to_gpu_palette());
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
@@ -183,35 +302,38 @@ impl App {
             );
         }
         self.renderer = Some(renderer);
-        let zoom_start = std::time::Instant::now();
+
+        let zoom_start = web_time::Instant::now();
         self.apply_zoom();
         let zoom_elapsed = zoom_start.elapsed();
         eprintln!("startup_perf {source}: apply_zoom ms={:.2}", zoom_elapsed.as_secs_f64() * 1000.0);
+
         #[cfg(not(target_arch = "wasm32"))]
         if self.overlay_enabled() {
             self.frames_waited = crate::app::overlay_integration::WAIT_FRAMES;
-            let overlay_start = std::time::Instant::now();
+            let overlay_start = web_time::Instant::now();
             self.try_create_webview();
             eprintln!(
                 "startup_perf {source}: overlay_create ms={:.2}",
                 overlay_start.elapsed().as_secs_f64() * 1000.0,
             );
         }
-        self.last_frame = std::time::Instant::now();
+
+        self.last_frame = web_time::Instant::now();
         if let Some(window) = &self.window {
             window.request_redraw();
         }
         eprintln!(
             "startup_perf {source} total_ms={:.2} window_ms={:.2} prepare_ms={:.2} pack_ms={:.2} renderer_ms={:.2} apply_zoom_ms={:.2} nodes={} tree_u32s={} kinds={}",
-            resumed_start.elapsed().as_secs_f64() * 1000.0,
-            window_elapsed.as_secs_f64() * 1000.0,
-            prepare_elapsed.as_secs_f64() * 1000.0,
-            pack_elapsed.as_secs_f64() * 1000.0,
+            pending.resumed_start.elapsed().as_secs_f64() * 1000.0,
+            pending.window_elapsed.as_secs_f64() * 1000.0,
+            pending.prepare_elapsed.as_secs_f64() * 1000.0,
+            pending.pack_elapsed.as_secs_f64() * 1000.0,
             renderer_elapsed.as_secs_f64() * 1000.0,
             zoom_elapsed.as_secs_f64() * 1000.0,
-            node_kinds.len(),
-            tree_packed.len(),
-            node_kinds.len(),
+            pending.node_count,
+            pending.tree_u32_count,
+            pending.node_count,
         );
     }
 
@@ -241,7 +363,7 @@ impl App {
     }
 
     fn handle_redraw_inner(&mut self) {
-        let frame_start = std::time::Instant::now();
+        let frame_start = web_time::Instant::now();
         let overlay_start = frame_start;
         #[cfg(not(target_arch = "wasm32"))]
         if self.overlay_enabled() {
@@ -281,7 +403,7 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         let overlay_elapsed = overlay_start.elapsed();
         #[cfg(target_arch = "wasm32")]
-        let overlay_elapsed = std::time::Duration::ZERO;
+        let overlay_elapsed = web_time::Duration::ZERO;
 
         let now = frame_start;
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
@@ -292,19 +414,19 @@ impl App {
             let alpha = (dt as f64 * 5.0).min(1.0);
             self.fps_smooth = self.fps_smooth * (1.0 - alpha) + instant_fps * alpha;
         }
-        let update_start = std::time::Instant::now();
+        let update_start = web_time::Instant::now();
         self.update(dt);
         let update_elapsed = update_start.elapsed();
 
-        let upload_start = std::time::Instant::now();
+        let upload_start = web_time::Instant::now();
         self.upload_tree_lod();
         let upload_elapsed = upload_start.elapsed();
 
-        let highlight_start = std::time::Instant::now();
+        let highlight_start = web_time::Instant::now();
         self.update_highlight();
         let highlight_elapsed = highlight_start.elapsed();
 
-        let render_start = std::time::Instant::now();
+        let render_start = web_time::Instant::now();
         if let Some(renderer) = &mut self.renderer {
             match renderer.render() {
                 Ok(()) => {}
@@ -370,11 +492,11 @@ impl App {
 
         // Test driver runs AFTER the frame so the captured image
         // reflects what just rendered.
-        let test_tail_start = std::time::Instant::now();
+        let test_tail_start = web_time::Instant::now();
         self.tick_test_runner_after_frame();
         let test_tail_elapsed = test_tail_start.elapsed();
 
-        let redraw_tail_start = std::time::Instant::now();
+        let redraw_tail_start = web_time::Instant::now();
         if let Some(w) = &self.window {
             w.request_redraw();
         }

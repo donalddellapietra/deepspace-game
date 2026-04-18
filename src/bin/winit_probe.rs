@@ -1,3 +1,12 @@
+// Native-only winit/wgpu startup probe. WASM has no winit pump_events.
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
+use _native::main;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod _native {
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,4 +79,5 @@ fn main() {
         std::thread::sleep(Duration::from_millis(16));
     }
     eprintln!("probe: pump_loop_returned");
+}
 }

@@ -25,6 +25,19 @@ impl Renderer {
         live_sample_every_frames: u32,
         taa_enabled: bool,
     ) -> Self {
+        // On web, winit's `inner_size` lags behind the canvas backing
+        // store (request_inner_size doesn't apply synchronously and
+        // ensure_started runs before any resize event), so we read the
+        // canvas dimensions directly to pick a matching swapchain size.
+        #[cfg(target_arch = "wasm32")]
+        let size = {
+            use winit::platform::web::WindowExtWebSys;
+            window
+                .canvas()
+                .map(|c| winit::dpi::PhysicalSize::new(c.width(), c.height()))
+                .unwrap_or_else(|| window.inner_size())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
