@@ -97,14 +97,20 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
 /// that matches the depth of siblings at the placement site, so the
 /// placed block has full recursive structure like the terrain around it.
 pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
-    // Figure out how deep siblings are at the placement site.
+    // Figure out how deep siblings are at the placement site using
+    // the cached `Node::depth` field — O(1) per sibling, and
+    // correct for non-uniform subtrees. The old `depth_of_node`
+    // walked `children[0]` recursively, which returned 1 for any
+    // node whose first slot happened to be a Block (even when
+    // deeper branches existed at other slots).
     let sibling_depth = if let Some(&(parent_id, _)) = hit.path.last() {
         if let Some(parent) = world.library.get(parent_id) {
             let mut max_d = 0u32;
             for child in &parent.children {
                 if let Child::Node(nid) = child {
-                    let d = depth_of_node(&world.library, *nid);
-                    if d > max_d { max_d = d; }
+                    if let Some(n) = world.library.get(*nid) {
+                        if n.depth > max_d { max_d = n.depth; }
+                    }
                 }
             }
             max_d
@@ -150,16 +156,6 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_nod
 
     if let Child::Node(new_root) = child {
         world.swap_root(new_root);
-    }
-}
-
-/// Compute depth of a single node (non-memoized, but uniform nodes are O(1)).
-fn depth_of_node(library: &NodeLibrary, id: NodeId) -> u32 {
-    let Some(node) = library.get(id) else { return 0 };
-    let first_child = node.children[0];
-    match first_child {
-        Child::Node(child_id) => 1 + depth_of_node(library, child_id),
-        _ => 1,
     }
 }
 

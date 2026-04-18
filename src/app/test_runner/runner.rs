@@ -180,14 +180,18 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
             .with_visible(cfg.show_window),
     )?);
-    let (tree_packed, node_kinds, node_offsets, _node_ids, root_index) =
-        crate::world::gpu::pack_tree(&app.world.library, app.world.root);
+    // Build the `CachedTree` once and hand it to both the renderer
+    // (via buffer slices) and the App (via `cached_tree`). Skipping
+    // this handoff caused a second full pack on the first frame;
+    // see `event_loop::start_init`.
+    let mut cache = crate::world::gpu::CachedTree::new();
+    cache.update_root(&app.world.library, app.world.root);
     let renderer = pollster::block_on(Renderer::new(
         window.clone(),
-        &tree_packed,
-        &node_kinds,
-        &node_offsets,
-        root_index,
+        &cache.tree,
+        &cache.node_kinds,
+        &cache.node_offsets,
+        cache.root_bfs_idx,
         wgpu::PresentMode::AutoNoVsync,
         cfg.shader_stats,
         cfg.lod_pixels.unwrap_or(1.0),
@@ -196,6 +200,8 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         cfg.taa,
     ));
     let mut renderer = renderer;
+    app.cached_tree = Some(cache);
+    app.last_lod_upload_key = Some(crate::app::LodUploadKey::new(app.world.root));
     renderer.update_palette(&app.palette.to_gpu_palette());
     renderer.resize(app.harness_width, app.harness_height);
     eprintln!(
@@ -216,6 +222,10 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     let trace_warmup = cfg.perf_trace_warmup;
 
     loop {
+        // Wall-clock stamp at iteration start — `frame_ms` at
+        // sample-record time below = this iter's CPU+GPU work. The
+        // `wall_ms` field remains elapsed-since-harness-start.
+        let iter_start = web_time::Instant::now();
         // Reset per-frame timings on the renderer. The upload-reuse
         // fast path skips update_tree/update_ribbon entirely; without
         // this reset, stale startup values would leak forward and
@@ -260,6 +270,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         let sample = FrameSample {
             frame: agg.frame_count,
             wall_ms: app.last_frame.elapsed().as_secs_f64() * 1000.0,
+            frame_ms: iter_start.elapsed().as_secs_f64() * 1000.0,
             update_ms: t_update,
             camera_write_ms: t_camera_write,
             upload_total_ms: t_upload_total,
@@ -351,10 +362,22 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
 }
 
 /// One row in the per-frame trace. Mirrors the CSV header.
+///
+/// **Timing semantics**:
+/// - `frame_ms`: per-frame duration (wall-clock time for this one
+///   iteration's update + upload + highlight + render). This is
+///   what tools should use for "how long did frame N take" —
+///   frame-to-frame deltas match it.
+/// - `wall_ms`: total elapsed time since harness startup. Monotonic.
+///   Useful for timelines and correlating events across frames; NOT
+///   for per-frame cost. The older `max(wall_ms)` "worst frame"
+///   pattern in some scripts was buggy — it always returned the
+///   last frame. Use `max(frame_ms)` instead.
 #[derive(Debug, Clone, Copy)]
 struct FrameSample {
     frame: u32,
     wall_ms: f64,
+    frame_ms: f64,
     update_ms: f64,
     camera_write_ms: f64,
     upload_total_ms: f64,
@@ -409,7 +432,7 @@ impl PerfTraceWriter {
         use std::io::Write;
         writeln!(
             writer,
-            "frame,wall_ms,update_ms,camera_write_ms,upload_total_ms,pack_ms,ribbon_build_ms,tree_write_ms,ribbon_write_ms,bind_group_rebuild_ms,highlight_ms,highlight_raycast_ms,highlight_set_ms,render_total_ms,render_texture_alloc_ms,render_view_ms,render_encode_ms,render_submit_ms,render_wait_ms,gpu_pass_ms,gpu_readback_ms,submitted_done_ms,ray_count,hit_count,miss_count,max_iter_count,avg_steps,max_steps,packed_node_count,ribbon_len,effective_visual_depth,reused_gpu_tree"
+            "frame,wall_ms,frame_ms,update_ms,camera_write_ms,upload_total_ms,pack_ms,ribbon_build_ms,tree_write_ms,ribbon_write_ms,bind_group_rebuild_ms,highlight_ms,highlight_raycast_ms,highlight_set_ms,render_total_ms,render_texture_alloc_ms,render_view_ms,render_encode_ms,render_submit_ms,render_wait_ms,gpu_pass_ms,gpu_readback_ms,submitted_done_ms,ray_count,hit_count,miss_count,max_iter_count,avg_steps,max_steps,packed_node_count,ribbon_len,effective_visual_depth,reused_gpu_tree"
         )?;
         Ok(Self { path: path.to_string(), writer })
     }
@@ -420,8 +443,8 @@ impl PerfTraceWriter {
         let submitted_done = s.submitted_done_ms.map(|v| format!("{v:.4}")).unwrap_or_else(|| String::new());
         let _ = writeln!(
             self.writer,
-            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{},{},{},{},{},{:.2},{},{},{},{},{}",
-            s.frame, s.wall_ms,
+            "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{},{},{},{},{},{:.2},{},{},{},{},{}",
+            s.frame, s.wall_ms, s.frame_ms,
             s.update_ms, s.camera_write_ms,
             s.upload_total_ms, s.pack_ms, s.ribbon_build_ms, s.tree_write_ms, s.ribbon_write_ms, s.bind_group_rebuild_ms,
             s.highlight_ms, s.highlight_raycast_ms, s.highlight_set_ms,

@@ -214,10 +214,13 @@ impl Renderer {
         self.write_uniforms();
     }
 
-    /// Update the BFS index the shader uses as the frame root. The
-    /// root of the full packed tree is always BFS index 0; this lets
-    /// the shader start rendering from a deeper node (the current
-    /// render frame) without re-uploading the tree buffer.
+    /// Update the BFS index the shader uses as the frame root.
+    /// `CachedTree::update_root` emits in post-order DFS, so the
+    /// world-root entry ends up LAST in the buffer (not at BFS idx
+    /// 0 as a BFS-emit would produce). The current `root_bfs_idx`
+    /// lives on `CachedTree` and is passed through here every frame
+    /// so the shader starts at the correct node — callers should
+    /// prefer `cache.root_bfs_idx` over any assumption about BFS 0.
     pub fn set_frame_root(&mut self, bfs_idx: u32) {
         self.root_index = bfs_idx;
         self.write_uniforms();

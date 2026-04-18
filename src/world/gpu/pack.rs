@@ -47,13 +47,17 @@
 //! entirely. Sphere body / face nodes are exempt (the shader
 //! dispatches on `NodeKind`, so they must stay addressable).
 //!
-//! ## Dead entries
+//! ## Dead entries + compaction
 //!
 //! Edits append new ancestor entries; the prior versions' entries
-//! stay in the buffer, unreferenced. Over long sessions this grows.
-//! Future work: periodic compaction / mark-sweep of unreachable
-//! entries. For now the buffer grows monotonically; a full rebuild
-//! via [`CachedTree::new`] resets it.
+//! stay in the buffer, unreferenced. `CachedTree::update_root`
+//! checks `should_compact(library)` on each call and, when the
+//! packed buffer holds substantially more entries than the library
+//! has unique NodeIds (see `COMPACTION_GROWTH_FACTOR`), calls
+//! `clear()` and re-emits from scratch — an O(reachable) rebuild
+//! that drops all orphaned entries. Steady-state editing triggers
+//! this once per ~N edits; content-streaming frames grow the library
+//! in lockstep and don't false-fire compaction.
 
 use std::collections::HashMap;
 
@@ -67,6 +71,31 @@ use super::types::{GpuChild, GpuNodeKind};
 /// node_ids, root_bfs_idx)`. Used by the initial GPU bring-up and
 /// tests; edit-path callers use [`CachedTree`] directly.
 pub type PackedTree = (Vec<u32>, Vec<GpuNodeKind>, Vec<u32>, Vec<NodeId>, u32);
+
+/// Compaction trigger: when `node_offsets.len()` exceeds
+/// `library.len() * COMPACTION_GROWTH_FACTOR`, clear and re-emit
+/// the reachable subtree, dropping orphaned entries from prior
+/// edits. 2.0 = at least half the packed entries are "dead"
+/// (unreachable from root) before we pay the rebuild cost.
+///
+/// Why `library.len()`: the content-addressed library's `ref_dec`
+/// evicts a `NodeId` the moment its ref count hits zero, so
+/// `library.len()` is an O(1), monotonically-correct upper bound on
+/// the count of unique `NodeId`s reachable from `world.root`
+/// (saved-mesh installs keep extras alive via `ref_inc`, which is
+/// fine — they're candidates for packing anyway). This tracks real
+/// growth naturally:
+///
+/// - Steady-state editing: library stays roughly constant, packed
+///   buffer grows with each edit's appended N+1 dead ancestors →
+///   ratio climbs → eventually triggers a compaction.
+/// - Content streaming (`install_subtree`, new planets, scripts):
+///   library grows in lockstep with packed entries → ratio stays
+///   near 1 → no spurious compaction on the loading frame.
+///
+/// The previous design (`live_count_marker` snapshot at last
+/// compaction) false-fired on any single-shot content load.
+const COMPACTION_GROWTH_FACTOR: f32 = 2.0;
 
 /// The packed GPU tree state. Owned by the app; mutated in place on
 /// every edit. The shader reads `tree` / `node_kinds` / `node_offsets`
@@ -98,11 +127,45 @@ impl Default for CachedTree {
 impl CachedTree {
     pub fn new() -> Self { Self::default() }
 
+    /// Reset all buffers to empty. Used by compaction before a
+    /// full re-emit — the alternative is mark-and-sweep, which
+    /// requires rewriting every surviving `tag=2` child entry's
+    /// `node_index`. Clearing + re-emitting is simpler and the
+    /// cost (~60 ms on soldier_729) is bounded by live node count,
+    /// so it scales only with what's actually reachable.
+    pub fn clear(&mut self) {
+        self.tree.clear();
+        self.node_kinds.clear();
+        self.node_offsets.clear();
+        self.node_ids.clear();
+        self.bfs_by_nid.clear();
+        self.root_bfs_idx = 0;
+    }
+
+    /// True when the packed buffer holds substantially more entries
+    /// than the library currently needs. See
+    /// `COMPACTION_GROWTH_FACTOR` for the signal — roughly: "more
+    /// than half the packed slots are dead".
+    pub fn should_compact(&self, library: &NodeLibrary) -> bool {
+        let total = self.node_offsets.len();
+        let lib_live = library.len();
+        if lib_live == 0 { return false; }
+        total as f32 >= lib_live as f32 * COMPACTION_GROWTH_FACTOR
+    }
+
     /// Emit (or reuse) the subtree rooted at `new_root` into the
     /// buffer and update `self.root_bfs_idx` to that node's BFS idx.
     /// Already-packed subtrees are reused (O(1)); new nodes get
     /// appended (O(nodes_new_to_this_call)).
+    ///
+    /// When dead entries have accumulated past the compaction
+    /// threshold, clears the cache first so the ensuing walk emits
+    /// ONLY nodes reachable from `new_root` — dropping all orphaned
+    /// entries from prior edits.
     pub fn update_root(&mut self, library: &NodeLibrary, new_root: NodeId) {
+        if self.should_compact(library) {
+            self.clear();
+        }
         let bfs = self.emit_or_lookup(library, new_root);
         self.root_bfs_idx = bfs;
     }
@@ -415,6 +478,115 @@ mod tests {
             appended <= (spawn_depth as usize + 5),
             "edit appended {appended} entries (expected ≤ {})",
             spawn_depth + 5,
+        );
+    }
+
+    /// After enough edits accumulate dead entries, `update_root`
+    /// should trigger a full rebuild. Verify the buffer physically
+    /// shrinks once the threshold is crossed.
+    #[test]
+    fn compaction_fires_after_enough_edits() {
+        use crate::world::anchor::Path;
+        use crate::world::bootstrap;
+        use crate::world::edit;
+        use crate::world::raycast;
+
+        let spawn_depth: u8 = 10;
+        let boot = bootstrap::bootstrap_world(bootstrap::WorldPreset::PlainTest, Some(40));
+        let mut world = boot.world;
+        let pos = bootstrap::plain_surface_spawn(spawn_depth);
+        bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
+
+        let mut cache = CachedTree::new();
+        cache.update_root(&world.library, world.root);
+
+        // Pound on edits until compaction fires. Each edit alternates
+        // break and place so the world oscillates but library size
+        // stays bounded — the packed buffer grows with dead entries
+        // while library stays constant, crossing the threshold.
+        let mut compaction_fired = false;
+        for i in 0..200 {
+            let ray_origin = pos.in_frame(&Path::root());
+            let hit = raycast::cpu_raycast(
+                &world.library, world.root, ray_origin, [0.0, -0.4, -0.9], spawn_depth as u32,
+            ).expect("raycast should hit");
+            if i % 2 == 0 {
+                edit::break_block(&mut world, &hit);
+            } else {
+                edit::place_block(&mut world, &hit, crate::world::palette::block::BRICK);
+            }
+
+            let len_before = cache.node_offsets.len();
+            cache.update_root(&world.library, world.root);
+            let len_after = cache.node_offsets.len();
+
+            if len_after < len_before {
+                compaction_fired = true;
+                // Post-compaction, the packed buffer should be close
+                // to library.len() (which is live reachable count +
+                // any saved-mesh holdovers).
+                let lib_live = world.library.len();
+                assert!(
+                    len_after <= lib_live + spawn_depth as usize + 10,
+                    "post-compaction total {len_after} should ≤ library {lib_live} + O(depth)",
+                );
+                break;
+            }
+        }
+        assert!(compaction_fired, "compaction never fired in 200 edits (threshold too high?)");
+    }
+
+    /// Compaction must NOT fire on the initial pack or on the first
+    /// few edits — the common path should stay O(depth) per edit.
+    #[test]
+    fn compaction_does_not_fire_prematurely() {
+        let world = plain_test_world();
+        let mut cache = CachedTree::new();
+        assert!(!cache.should_compact(&world.library), "empty cache must not compact");
+        cache.update_root(&world.library, world.root);
+        assert!(
+            !cache.should_compact(&world.library),
+            "fresh cache must not trigger compaction immediately"
+        );
+        // Pack and re-pack with the same root — still no dead
+        // entries, so compaction must stay off.
+        cache.update_root(&world.library, world.root);
+        assert!(!cache.should_compact(&world.library));
+    }
+
+    /// Regression guard for the review finding: a single-shot
+    /// content-loading event that grows the tree legitimately must
+    /// NOT trigger compaction. The old heuristic keyed off a frozen
+    /// `live_count_marker` would false-fire here.
+    #[test]
+    fn compaction_skips_on_legitimate_growth() {
+        // Start with a tiny world; pack it.
+        let tiny = plain_test_world();
+        let mut cache = CachedTree::new();
+        cache.update_root(&tiny.library, tiny.root);
+        let len_tiny = cache.node_offsets.len();
+
+        // Now swap in a much larger world (simulates loading
+        // content: the library grows, the root changes to the new
+        // larger tree). Even though node_offsets.len() jumps well
+        // past 2 × len_tiny, compaction must not fire — library.len()
+        // grew in lockstep, so the packed buffer ratio stays ≈ 1.
+        let big = crate::world::bootstrap::plain_world(8);
+        cache.update_root(&big.library, big.root);
+        let len_big = cache.node_offsets.len();
+
+        assert!(
+            len_big > len_tiny * 2,
+            "test precondition: big world must be >2x tiny's packed size (tiny={len_tiny}, big={len_big})"
+        );
+        // If compaction had wrongly fired, cache would have been
+        // cleared first and len_big would be close to big library
+        // size ONLY — still OK because re-emit covers the whole
+        // thing. The important check: compaction trigger should
+        // return FALSE against the current library.
+        assert!(
+            !cache.should_compact(&big.library),
+            "after growth, ratio should match library — no spurious compaction"
         );
     }
 

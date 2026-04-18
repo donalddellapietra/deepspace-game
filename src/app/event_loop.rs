@@ -156,10 +156,22 @@ impl App {
         let prepare_elapsed = web_time::Duration::ZERO;
         eprintln!("startup_perf {source}: window_prepared ms={:.2}", prepare_elapsed.as_secs_f64() * 1000.0);
 
+        // Build the `CachedTree` directly instead of calling the
+        // legacy `pack_tree` tuple-returning helper. The renderer
+        // takes buffer slices (same as before), but the cache is
+        // handed off to `finish_init` so the FIRST `upload_tree_lod`
+        // sees a populated cache + matching LOD key and skips a
+        // redundant full re-pack. Fixes the "double pack at startup"
+        // bug where the tree got packed once here and again on the
+        // first frame into a fresh empty cache.
         let pack_start = web_time::Instant::now();
-        let (tree_packed, node_kinds, node_offsets, _node_ids, root_index) =
-            gpu::pack_tree(&self.world.library, self.world.root);
+        let mut cache = gpu::CachedTree::new();
+        cache.update_root(&self.world.library, self.world.root);
         let pack_elapsed = pack_start.elapsed();
+        let tree_packed: &[u32] = &cache.tree;
+        let node_kinds: &[gpu::GpuNodeKind] = &cache.node_kinds;
+        let node_offsets: &[u32] = &cache.node_offsets;
+        let root_index = cache.root_bfs_idx;
         eprintln!(
             "startup_perf {source}: tree_packed ms={:.2} nodes={} tree_u32s={}",
             pack_elapsed.as_secs_f64() * 1000.0,
@@ -181,6 +193,36 @@ impl App {
         let node_count = node_kinds.len();
         let tree_u32_count = tree_packed.len();
 
+        // Native: create renderer synchronously FIRST (borrows into
+        // `cache` live for this call), then move the cache into
+        // `pending_init`. On wasm we take owned copies of the slab
+        // buffers before the move (the async closure needs them
+        // after `cache` has been handed off). The cache itself is
+        // stashed in `pending_init` either way so `finish_init`
+        // installs it on `App::cached_tree` and the first
+        // `upload_tree_lod` is a cache-hit no-op.
+        #[cfg(not(target_arch = "wasm32"))]
+        let maybe_renderer = Some(pollster::block_on(Renderer::new(
+            window,
+            &tree_packed,
+            &node_kinds,
+            &node_offsets,
+            root_index,
+            present_mode,
+            shader_stats_enabled,
+            lod_pixel_threshold,
+            lod_base_depth,
+            live_sample_every,
+            taa_enabled,
+        )));
+
+        #[cfg(target_arch = "wasm32")]
+        let maybe_renderer: Option<Renderer> = None;
+
+        #[cfg(target_arch = "wasm32")]
+        let (tree_packed_owned, node_kinds_owned, node_offsets_owned) =
+            (tree_packed.to_vec(), node_kinds.to_vec(), node_offsets.to_vec());
+
         self.pending_init = Some(PendingInit {
             source: source.to_string(),
             resumed_start,
@@ -190,37 +232,27 @@ impl App {
             renderer_start,
             node_count,
             tree_u32_count,
+            cached_tree: cache,
         });
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let renderer = pollster::block_on(Renderer::new(
-                window,
-                &tree_packed,
-                &node_kinds,
-                &node_offsets,
-                root_index,
-                present_mode,
-                shader_stats_enabled,
-                lod_pixel_threshold,
-                lod_base_depth,
-                live_sample_every,
-                taa_enabled,
-            ));
-            self.finish_init(renderer);
+            if let Some(renderer) = maybe_renderer {
+                self.finish_init(renderer);
+            }
         }
 
         #[cfg(target_arch = "wasm32")]
         {
+            let _ = maybe_renderer;
             if self.renderer_init_started {
                 return;
             }
             self.renderer_init_started = true;
             let proxy = self.proxy.clone();
-            // Move owned copies into the future — slices can't cross the await.
-            let tree_packed = tree_packed.to_vec();
-            let node_kinds = node_kinds.to_vec();
-            let node_offsets = node_offsets.to_vec();
+            let tree_packed = tree_packed_owned;
+            let node_kinds = node_kinds_owned;
+            let node_offsets = node_offsets_owned;
             wasm_bindgen_futures::spawn_local(async move {
                 // Re-stamp the canvas backing store right before
                 // surface creation. Winit's request_inner_size on web
@@ -268,6 +300,13 @@ impl App {
             log::error!("finish_init called without pending_init — ignoring");
             return;
         };
+        // Install the init-time cache and stamp its matching LOD key
+        // so the first `upload_tree_lod` sees `reused_gpu_tree=true`
+        // and skips a full re-pack. Without this the renderer saw
+        // the init pack but the App's cache was empty; the first
+        // frame then re-packed into a fresh cache.
+        self.cached_tree = Some(pending.cached_tree);
+        self.last_lod_upload_key = Some(crate::app::LodUploadKey::new(self.world.root));
         let renderer_elapsed = pending.renderer_start.elapsed();
         let source = pending.source;
         eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);

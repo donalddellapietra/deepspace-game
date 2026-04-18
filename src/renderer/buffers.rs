@@ -217,8 +217,14 @@ pub(super) fn append_or_recreate<T: bytemuck::Pod>(
         queue.write_buffer(buffer, byte_offset, bytemuck::cast_slice(tail));
         *uploaded_count = data.len() as u64;
     } else if (data.len() as u64) < *uploaded_count {
-        // Pack shouldn't shrink, but if it ever does, rewrite from 0
-        // so we don't leak stale tail content.
+        // Shrink path — now a normal hot path because
+        // `CachedTree::update_root` triggers periodic compaction
+        // (clear + re-emit) when dead entries dominate. The GPU
+        // buffer keeps its physical allocation; we overwrite the
+        // live prefix and let the trailing bytes become inaccessible
+        // via the new `uploaded_count`. The shader only indexes
+        // `[0, node_count)` so stale bytes past the new valid range
+        // are unreachable.
         if !data.is_empty() {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
         }

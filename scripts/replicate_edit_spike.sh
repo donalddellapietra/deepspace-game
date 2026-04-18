@@ -43,18 +43,14 @@ budget = float(sys.argv[1])
 rows = list(csv.DictReader(open('tmp/perf/edit-spike.csv')))
 rows.sort(key=lambda r: int(r['frame']))
 
-# Compute wall-delta (ms) between consecutive frames. This is the
-# actual per-frame wall-clock cost the user feels; gpu_pass_ms and
-# submitted_done_ms are not reliable on macOS under our setup.
-walls = [(int(r['frame']), float(r['wall_ms'])) for r in rows]
-deltas = {}
-for (f1, w1), (f2, w2) in zip(walls, walls[1:]):
-    if f2 == f1 + 1:
-        deltas[f2] = w2 - w1  # wall time between sampling frame f1 and f2
+# `frame_ms` is the per-iter wall-clock duration — the honest signal
+# for what the user feels. `gpu_pass_ms` and `submitted_done_ms` are
+# unreliable on macOS (non-monotonic timestamps, submit-ack callback).
+deltas = {int(r['frame']): float(r['frame_ms']) for r in rows}
 
 # Edit frames in this scenario: fly_to_surface at t=40, break/place
 # at t=45,50,55,60,65. Script command fires AFTER the sample for
-# frame N=schedule_t-1, so the NEXT frame's wall-delta captures the
+# frame N=schedule_t-1, so the NEXT frame's frame_ms captures the
 # full cost of (edit work + render of modified tree).
 edit_schedule = [45, 50, 55, 60, 65]
 edit_frame_deltas = {t: deltas[t] for t in edit_schedule if t in deltas}
@@ -82,7 +78,7 @@ print(f"=== Edit-frame wall-clock spike ===")
 print(f"  baseline  (n={len(baseline_deltas)}, non-edit frames):  median={baseline_median:6.2f} ms")
 print(f"  edit frames (n={len(edit_frame_deltas)}):")
 for f, d in edit_frame_deltas.items():
-    print(f"    frame={f:>3}  wall_delta={d:6.2f} ms  overhead={d - baseline_median:+6.2f} ms")
+    print(f"    frame={f:>3}  frame_ms={d:6.2f}  overhead={d - baseline_median:+6.2f} ms")
 print(f"  edit overhead:  mean={overhead_mean:+6.2f} ms  max={overhead_max:+6.2f} ms")
 print(f"  budget={budget:.1f} ms")
 
@@ -98,10 +94,11 @@ phase_fields = [
     'submitted_done_ms',
 ]
 by_frame = {int(r['frame']): r for r in rows}
+frame_range = (min(by_frame), max(by_frame))
 print(f"\n=== Per-phase breakdown (edit vs baseline median) ===")
 print(f"  {'phase':<25} {'baseline':>10} {'edit_mean':>10} {'edit_max':>10} {'delta_mean':>12}")
 for phase in phase_fields:
-    bl_vals = [float(by_frame[k][phase] or 0) for k in range(walls[0][0], walls[-1][0]+1) if k in by_frame and k not in edit_schedule]
+    bl_vals = [float(by_frame[k][phase] or 0) for k in range(frame_range[0], frame_range[1]+1) if k in by_frame and k not in edit_schedule]
     ed_vals = [float(by_frame[e][phase] or 0) for e in edit_schedule if e in by_frame]
     if not bl_vals or not ed_vals:
         continue

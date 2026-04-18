@@ -27,7 +27,8 @@
 //! Submodules:
 //!
 //! - `types`: GPU-layout types (`GpuChild`, `GpuNodeKind`, etc.).
-//! - `pack`: BFS packing (`pack_tree`, `pack_tree_lod`).
+//! - `pack`: content-memoized emit (`CachedTree::update_root`) with
+//!   a legacy `pack_tree` tuple wrapper used by tests + renderer init.
 //! - `ribbon`: ancestor ribbon (`build_ribbon`, `GpuRibbonEntry`).
 
 mod pack;

@@ -58,6 +58,9 @@ if step_packs:
     print(f"  step frames: count={len(step_packs)}  mean pack={sum(step_packs)/len(step_packs):.2f} ms  max={max(step_packs):.2f} ms")
 if wait_packs:
     print(f"  wait frames: count={len(wait_packs)}  mean pack={sum(wait_packs)/len(wait_packs):.2f} ms")
-worst = max(rows, key=lambda r: float(r['wall_ms']))
-print(f"  worst frame: frame={worst['frame']} wall={float(worst['wall_ms']):.1f} ms upload={float(worst['upload_total_ms']):.1f} ms pack={float(worst['pack_ms']):.1f} ms")
+# `frame_ms` = per-frame duration. `wall_ms` is monotonic
+# elapsed-since-harness-start and `max(wall_ms)` would always point
+# at the last sample row (historical bug).
+worst = max(rows, key=lambda r: float(r['frame_ms']))
+print(f"  worst frame: frame={worst['frame']} frame_ms={float(worst['frame_ms']):.1f} upload={float(worst['upload_total_ms']):.1f} pack={float(worst['pack_ms']):.1f}")
 PY

@@ -210,10 +210,12 @@ pub struct App {
     /// overlay only receives an IPC message when the bit actually
     /// flips, not every frame. `None` = we've never pushed.
     pub(super) last_crosshair_sent: Option<crate::bridge::CrosshairStateJs>,
-    /// Slot path from the last successful break/place edit. Used as a
-    /// preserve_path during the next GPU pack so the packer keeps
-    /// fine detail along the edit path visible, even when the camera
-    /// is far enough from the surface that LOD would normally collapse it.
+    /// Slot path from the last successful break/place edit. The
+    /// packer no longer consults this — content-addressed reuse via
+    /// `CachedTree::bfs_by_nid` keeps edit-path detail automatically
+    /// (the new ancestors are unique NodeIds that get emitted on
+    /// demand). Still populated for harness diagnostics and
+    /// `teleport_above_last_edit`.
     pub(super) last_edit_slots: Option<Path>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
@@ -246,6 +248,14 @@ pub(super) struct PendingInit {
     pub(super) renderer_start: web_time::Instant,
     pub(super) node_count: usize,
     pub(super) tree_u32_count: usize,
+    /// Packed tree built during init; moved into `App::cached_tree`
+    /// by `finish_init` so the first `upload_tree_lod` call sees
+    /// `reused_gpu_tree = true` and skips a redundant full re-pack.
+    /// Without this handoff, startup would pack the tree twice
+    /// (once here to seed the renderer, once on first frame into
+    /// a fresh empty `CachedTree`) — 60–100 ms of wasted work on
+    /// a 90k-node world.
+    pub(super) cached_tree: crate::world::gpu::CachedTree,
 }
 
 impl App {
