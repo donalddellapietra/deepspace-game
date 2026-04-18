@@ -204,6 +204,15 @@ impl Renderer {
         self.write_uniforms();
     }
 
+    /// Update the BFS index the shader uses as the frame root. The
+    /// root of the full packed tree is always BFS index 0; this lets
+    /// the shader start rendering from a deeper node (the current
+    /// render frame) without re-uploading the tree buffer.
+    pub fn set_frame_root(&mut self, bfs_idx: u32) {
+        self.root_index = bfs_idx;
+        self.write_uniforms();
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 { return; }
         self.config.width = width;

@@ -8,7 +8,7 @@
 
 mod break_place;
 mod highlight;
-mod upload;
+pub(crate) mod upload;
 mod zoom;
 
 use crate::world::anchor::Path;
@@ -20,13 +20,6 @@ pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = 12;
 pub(super) const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
 pub(super) const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
-
-/// Minimum preserve depth per ribbon shell in the GPU pack. This
-/// ensures each shell in the packed tree has enough un-collapsed
-/// nodes for the shader's LOD-bounded DDA to descend into. The
-/// shader itself has no per-shell budget — it descends as deep as
-/// LOD allows.
-pub(super) const SHELL_PRESERVE_DEPTH: u8 = 6;
 
 impl App {
     pub(super) fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {

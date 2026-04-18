@@ -46,18 +46,21 @@ pub use frame::{
 };
 pub use test_runner::TestConfig;
 
+/// Pack is a pure function of `(library, root)`. The only field that
+/// invalidates the GPU tree buffer is `root` — edits change it; pure
+/// motion does not. Render path, visual depth, camera, etc. live in
+/// per-frame uniforms (cheap to rewrite every frame).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LodUploadKey {
     pub root: u64,
-    pub render_path: Path,
-    pub logical_path: Path,
-    pub visual_depth: u8,
-    pub kind_tag: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HighlightCacheKey {
     pub lod: LodUploadKey,
+    pub render_path: Path,
+    pub logical_path: Path,
+    pub visual_depth: u8,
     pub yaw_bits: u32,
     pub pitch_bits: u32,
     pub cursor_locked: bool,
@@ -67,12 +70,10 @@ pub(super) struct HighlightCacheKey {
 impl HighlightCacheKey {
     pub(super) fn new(app: &App) -> Self {
         Self {
-            lod: LodUploadKey::new(
-                app.world.root,
-                &app.camera.position,
-                &app.active_frame,
-                app.visual_depth().min(u8::MAX as u32) as u8,
-            ),
+            lod: LodUploadKey::new(app.world.root),
+            render_path: app.active_frame.render_path,
+            logical_path: app.active_frame.logical_path,
+            visual_depth: app.visual_depth().min(u8::MAX as u32) as u8,
             yaw_bits: app.camera.yaw.to_bits(),
             pitch_bits: app.camera.pitch.to_bits(),
             cursor_locked: app.cursor_locked,
@@ -82,19 +83,8 @@ impl HighlightCacheKey {
 }
 
 impl LodUploadKey {
-    pub(super) fn new(root: u64, _camera: &WorldPos, frame: &ActiveFrame, visual_depth: u8) -> Self {
-        let kind_tag = match frame.kind {
-            ActiveFrameKind::Cartesian => 0,
-            ActiveFrameKind::Body { .. } => 1,
-            ActiveFrameKind::Sphere(_) => 2,
-        };
-        Self {
-            root,
-            render_path: frame.render_path,
-            logical_path: frame.logical_path,
-            visual_depth,
-            kind_tag,
-        }
+    pub(super) fn new(root: u64) -> Self {
+        Self { root }
     }
 }
 
@@ -127,10 +117,14 @@ pub struct App {
     /// Headless test driver. Populated when CLI flags ask for
     /// scripted actions or screenshots. See `test_runner`.
     pub(super) test: Option<test_runner::TestRunner>,
-    /// Last world/frame/camera tuple that required a full GPU tree
-    /// repack + ribbon rebuild. If unchanged, we can keep the same
-    /// tree/node-kind/ribbon buffers and just refresh camera/uniforms.
+    /// Last world root that triggered a full pack + GPU upload. If
+    /// unchanged, the tree buffer is reusable — only the per-frame
+    /// ribbon + camera uniforms rebuild.
     pub(super) last_lod_upload_key: Option<LodUploadKey>,
+    /// Packed tree + BFS-offsets retained on CPU so the per-frame
+    /// ribbon build doesn't need to re-pack. Refreshed alongside
+    /// `last_lod_upload_key`.
+    pub(super) cached_tree: Option<crate::app::edit_actions::upload::CachedTree>,
     /// Deterministic renderer harness mode from the old deep-layers
     /// branch. Bypasses the native overlay/event-loop path so we can
     /// isolate renderer regressions from WKWebView issues.
@@ -323,6 +317,7 @@ impl App {
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
             last_lod_upload_key: None,
+            cached_tree: None,
             render_harness,
             low_latency_present,
             show_harness_window,

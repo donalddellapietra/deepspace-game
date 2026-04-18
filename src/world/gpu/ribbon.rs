@@ -168,7 +168,7 @@ mod tests {
     use super::*;
     use crate::world::anchor::WorldPos;
     use crate::world::tree::{empty_children, uniform_children, Child, NodeKind, NodeLibrary, CENTER_SLOT};
-    use super::super::pack::pack_tree_lod;
+    use super::super::pack::pack_tree;
 
     #[test]
     fn gpu_ribbon_entry_size() {
@@ -308,10 +308,7 @@ mod tests {
     #[test]
     fn ribbon_for_path_into_body_in_planet_world() {
         let world = planet_world();
-        let camera = camera_at([1.5, 2.0, 1.5]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
+        let (tree, _kinds, offsets, _root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
             build_ribbon(&tree, &offsets, &[13]);
         assert!(frame_root_idx > 0, "body packed at non-zero BFS idx");
@@ -323,10 +320,7 @@ mod tests {
     #[test]
     fn reached_slots_truncated_when_pack_flattens_sibling() {
         let world = planet_world();
-        let camera = camera_at([1.5, 2.0, 1.5]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
+        let (tree, _kinds, offsets, _root_idx) = pack_tree(&world.library, world.root);
         // Slot 16 is uniform-empty Cartesian → absent from pack.
         // Descent into [16, 13] stops at depth 0.
         let r = build_ribbon(&tree, &offsets, &[16, 13]);
@@ -339,10 +333,7 @@ mod tests {
     #[test]
     fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
         let world = planet_world();
-        let camera = camera_at([0.5, 0.5, 0.5]);
-        let (tree, _kinds, offsets, _root_idx) = pack_tree_lod(
-            &world.library, world.root, &camera, 1080.0, 1.2,
-        );
+        let (tree, _kinds, offsets, _root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
             build_ribbon(&tree, &offsets, &[]);
         assert_eq!(frame_root_idx, 0);
