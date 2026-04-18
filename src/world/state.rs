@@ -1,6 +1,6 @@
 //! Runtime world state: the content-addressed tree.
 
-use super::tree::{Child, NodeId, NodeLibrary};
+use super::tree::{NodeId, NodeLibrary};
 
 pub struct WorldState {
     pub root: NodeId,
@@ -8,27 +8,16 @@ pub struct WorldState {
 }
 
 impl WorldState {
-    /// Compute the maximum depth of the tree from the root.
-    /// Depth = number of Node→Node edges from root to the deepest
-    /// terminal (Block/Empty) children.
-    /// Memoized — each unique NodeId is visited at most once.
+    /// Maximum depth of the tree from the root. Depth = number of
+    /// Node→Node edges from root to the deepest terminal
+    /// (Block/Empty) children.
+    ///
+    /// O(1): `Node::depth` is cached at insertion time in
+    /// `NodeLibrary::insert_with_kind`. This used to do a full DFS
+    /// over the library on every call; a 94k-node library took ~38
+    /// ms, and `upload_tree` called it on every edit.
     pub fn tree_depth(&self) -> u32 {
-        let mut cache = std::collections::HashMap::new();
-        self.depth_of(self.root, &mut cache)
-    }
-
-    fn depth_of(&self, id: NodeId, cache: &mut std::collections::HashMap<NodeId, u32>) -> u32 {
-        if let Some(&d) = cache.get(&id) { return d; }
-        let Some(node) = self.library.get(id) else { return 0 };
-        let mut max_child_depth = 0u32;
-        for child in &node.children {
-            if let Child::Node(child_id) = child {
-                max_child_depth = max_child_depth.max(self.depth_of(*child_id, cache));
-            }
-        }
-        let d = 1 + max_child_depth;
-        cache.insert(id, d);
-        d
+        self.library.get(self.root).map(|n| n.depth).unwrap_or(0)
     }
 
     pub fn swap_root(&mut self, new_root: NodeId) {

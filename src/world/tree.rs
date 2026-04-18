@@ -121,6 +121,11 @@ pub struct Node {
     /// 254 = all empty, 255 = mixed (not uniform).
     /// Uniform nodes can be flattened to a single Block during GPU packing.
     pub uniform_type: u8,
+    /// Depth of this subtree: 1 for a leaf node (children are all
+    /// Block/Empty), 1 + max(child.depth) for nodes with Child::Node
+    /// children. Cached at insert time so `WorldState::tree_depth()`
+    /// is O(1) instead of a full DFS on every edit.
+    pub depth: u32,
 }
 
 pub const UNIFORM_EMPTY: u8 = 254;
@@ -237,7 +242,21 @@ impl NodeLibrary {
             }
             if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
         };
-        self.nodes.insert(id, Node { children, kind, ref_count: 0, representative_block, uniform_type });
+        // Cache depth: 1 for leaves (all children are Block/Empty),
+        // 1 + max(child.depth) when any child is Child::Node. O(1)
+        // per insert thanks to child caching.
+        let mut max_child_depth = 0u32;
+        for c in &children {
+            if let Child::Node(nid) = c {
+                if let Some(child_node) = self.nodes.get(nid) {
+                    if child_node.depth > max_child_depth {
+                        max_child_depth = child_node.depth;
+                    }
+                }
+            }
+        }
+        let depth = 1 + max_child_depth;
+        self.nodes.insert(id, Node { children, kind, ref_count: 0, representative_block, uniform_type, depth });
         self.by_hash.entry(h).or_default().push(id);
         for nid in child_node_ids {
             self.ref_inc(nid);

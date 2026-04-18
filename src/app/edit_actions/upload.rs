@@ -29,10 +29,6 @@ impl App {
         let mut pack_elapsed = std::time::Duration::ZERO;
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-
-            // Initial pack: cache is empty; emit the full tree.
-            // Edit path: cache has every unchanged NodeId; emit only
-            // the N+1 new edit-path ancestors.
             let cache = self.cached_tree.get_or_insert_with(gpu::CachedTree::new);
             let len_before = cache.tree.len();
             cache.update_root(&self.world.library, self.world.root);
@@ -63,7 +59,6 @@ impl App {
         }
 
         // Ribbon rebuilds every frame against the cached tree.
-        // render_path-depth walk — effectively free.
         let ribbon_start = std::time::Instant::now();
         let cache = self
             .cached_tree
