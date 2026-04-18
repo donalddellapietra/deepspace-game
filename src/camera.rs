@@ -81,9 +81,9 @@ impl Camera {
     ) -> GpuCamera {
         GpuCamera {
             pos,
-            _pad0: 0.0,
+            jitter_x_px: 0.0,
             forward,
-            _pad1: 0.0,
+            jitter_y_px: 0.0,
             right,
             _pad2: 0.0,
             up,

@@ -1,0 +1,86 @@
+/* Crosshair reticle — native-resolution overlay above the 3D view.
+ *
+ * The `.crosshair` root positions a 24×24 pointer-events-none box at
+ * screen center. Two pseudo-elements draw the vertical and horizontal
+ * arm pairs as pixel-aligned strokes with a small center gap.
+ *
+ * Visibility is driven by the `visible` class (Rust pushes it based
+ * on cursor-lock / gameplay state); on-target color flip is driven
+ * by the `on-target` class (flips to the same yellow the old shader
+ * crosshair used).
+ *
+ * Deliberately NOT using drop-shadow or filter effects — those would
+ * re-rasterize and introduce sub-pixel blur. Crisp 1-pixel strokes
+ * at any DPR are the whole point of moving out of the shader. */
+
+.crosshair {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: 24px;
+  height: 24px;
+  /* Translate by a half-pixel so the 1.5px strokes land on pixel
+   * boundaries under both 1× and 2× DPR, avoiding gray anti-aliasing.
+   */
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 100;
+  /* Default hidden; Rust flips `.visible` when in gameplay mode so
+   * the crosshair isn't visible during menus or while the cursor is
+   * free-moving. */
+  visibility: hidden;
+}
+
+.crosshair.visible {
+  visibility: visible;
+}
+
+/* Vertical arm pair (top + bottom), realized by ::before.
+ * A single linear-gradient draws both segments with a transparent
+ * center gap, so the whole vertical "arm pair" is one pseudo-element
+ * instead of two separate children. */
+.crosshair::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1.5px;
+  margin-left: -0.75px;
+  background: linear-gradient(
+    to bottom,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 0,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 9px,
+    transparent 9px,
+    transparent 15px,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 15px,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 24px
+  );
+}
+
+/* Horizontal arm pair (left + right), realized by ::after. */
+.crosshair::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 1.5px;
+  margin-top: -0.75px;
+  background: linear-gradient(
+    to right,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 0,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 9px,
+    transparent 9px,
+    transparent 15px,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 15px,
+    var(--crosshair-color, rgba(243, 243, 250, 0.95)) 24px
+  );
+}
+
+/* On-target color flip — same yellow the old shader crosshair used
+ * (`vec3(1.0, 0.92, 0.18)` + 0.95 mix). Plain custom property swap
+ * so the gradients recompute automatically; no selector duplication. */
+.crosshair.on-target {
+  --crosshair-color: rgba(255, 235, 46, 0.95);
+}

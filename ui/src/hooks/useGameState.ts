@@ -8,6 +8,7 @@ import type {
   ToastMessage,
   PauseMenuState,
   DebugOverlayState,
+  CrosshairState,
 } from "../types";
 import { getTransport } from "./useTransport";
 
@@ -81,6 +82,15 @@ const debugOverlayStore = createStore<DebugOverlayState>({
   nodeCount: 0,
 });
 
+// Default `visible: true` so the crosshair is present from the very
+// first frame — Rust pushes `visible: false` only when the cursor
+// unlocks. If we defaulted to false, there'd be a one-frame flash
+// of no-crosshair on startup before the first push arrives.
+const crosshairStore = createStore<CrosshairState>({
+  onTarget: false,
+  visible: true,
+});
+
 // ── Dispatch from Rust ────────────────────────────────────────────
 
 function handleGameState(update: GameStateUpdate) {
@@ -105,6 +115,9 @@ function handleGameState(update: GameStateUpdate) {
       break;
     case "debugOverlay":
       debugOverlayStore.set(update.data);
+      break;
+    case "crosshair":
+      crosshairStore.set(update.data);
       break;
   }
 }
@@ -154,6 +167,10 @@ export function usePauseMenu(): PauseMenuState {
 
 export function useDebugOverlay(): DebugOverlayState {
   return useSyncExternalStore(debugOverlayStore.subscribe, debugOverlayStore.get);
+}
+
+export function useCrosshair(): CrosshairState {
+  return useSyncExternalStore(crosshairStore.subscribe, crosshairStore.get);
 }
 
 // For clearing toast after display

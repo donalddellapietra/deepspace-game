@@ -57,6 +57,13 @@ export interface PauseMenuState {
   saveStatus: string | null;
 }
 
+export interface CrosshairState {
+  /** True when the center-pixel CPU raycast hit a voxel this frame. */
+  onTarget: boolean;
+  /** False during menus / unlocked cursor — CSS hides the reticle. */
+  visible: boolean;
+}
+
 export interface DebugOverlayState {
   visible: boolean;
   fps: number;
@@ -79,7 +86,8 @@ export type GameStateUpdate =
   | { type: "modeIndicator"; data: ModeIndicatorState }
   | { type: "toast"; data: ToastMessage }
   | { type: "pauseMenu"; data: PauseMenuState }
-  | { type: "debugOverlay"; data: DebugOverlayState };
+  | { type: "debugOverlay"; data: DebugOverlayState }
+  | { type: "crosshair"; data: CrosshairState };
 
 // Commands sent from React to Rust
 export type UiCommand =

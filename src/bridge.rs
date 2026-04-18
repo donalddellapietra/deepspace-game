@@ -76,6 +76,27 @@ pub struct PauseMenuStateJs {
     pub save_status: Option<String>,
 }
 
+/// Crosshair reticle state. The crosshair is an HTML overlay element
+/// — it's always rendered at physical (native) resolution regardless
+/// of the 3D path's internal scaling or temporal resolves, so voxel
+/// aliasing / TAA blur never touches it. The renderer pushes this
+/// each time the "aimed-at a target" bit flips; CSS toggles the
+/// hit-state color.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CrosshairStateJs {
+    /// True when the center-pixel ray hit any voxel this frame.
+    /// Derived from the same CPU raycast that feeds `update_highlight`,
+    /// so the crosshair stays in sync with cursor-aim feedback without
+    /// a separate ray cast.
+    pub on_target: bool,
+    /// True when the crosshair should be drawn at all. False during
+    /// menus / unlocked cursor / harness runs; the CSS hides the
+    /// element. Bundled here so the UI doesn't need a second state
+    /// channel for "gameplay mode vs. menu".
+    pub visible: bool,
+}
+
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugOverlayStateJs {
@@ -103,6 +124,7 @@ pub enum GameStateUpdate {
     Toast(ToastMessageJs),
     PauseMenu(PauseMenuStateJs),
     DebugOverlay(DebugOverlayStateJs),
+    Crosshair(CrosshairStateJs),
 }
 
 // ── JS → Rust commands ────────────────────────────────────────────

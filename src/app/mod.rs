@@ -156,10 +156,9 @@ pub struct App {
     /// timings (acquire / encode / submit / present / total). 0
     /// disables. Set via `--live-sample-every N`.
     pub(super) live_sample_every_frames: u32,
-    /// Integer downscale divisor for the ray-march pass (Speedup A).
-    /// 1 = no downscale. Threaded into `Renderer::new` so both the
-    /// live and harness paths observe the same downsample behavior.
-    pub(super) render_scale: u32,
+    /// Whether TAAU is enabled. Threaded to `Renderer::new` so the
+    /// live and harness paths share the same resolve setup.
+    pub(super) taa_enabled: bool,
     /// Block-interaction radius in anchor-cell units. Caps the
     /// cursor raycast distance so break/place only succeed when
     /// the target is within `interaction_radius × anchor_cell_size`
@@ -188,6 +187,11 @@ pub struct App {
     pub(super) last_reused_gpu_tree: bool,
     pub(super) highlight_epoch: u64,
     pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
+    /// Last crosshair reticle state pushed to the overlay. Used by
+    /// `update_highlight` to diff-push `CrosshairStateJs`: the
+    /// overlay only receives an IPC message when the bit actually
+    /// flips, not every frame. `None` = we've never pushed.
+    pub(super) last_crosshair_sent: Option<crate::bridge::CrosshairStateJs>,
     /// Slot path from the last successful break/place edit. Used as a
     /// preserve_path during the next GPU pack so the packer keeps
     /// fine detail along the edit path visible, even when the camera
@@ -218,7 +222,7 @@ impl App {
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
         let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
-        let render_scale = test_cfg.render_scale.unwrap_or(1).max(1);
+        let taa_enabled = test_cfg.taa;
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), Some(test_cfg.plain_layers()));
@@ -330,7 +334,7 @@ impl App {
             lod_pixel_threshold,
             lod_base_depth,
             live_sample_every_frames,
-            render_scale,
+            taa_enabled,
             interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
@@ -341,6 +345,7 @@ impl App {
             last_effective_visual_depth: 0,
             last_reused_gpu_tree: false,
             highlight_epoch: 0,
+            last_crosshair_sent: None,
             cached_highlight: None,
             last_edit_slots: None,
             #[cfg(not(target_arch = "wasm32"))]

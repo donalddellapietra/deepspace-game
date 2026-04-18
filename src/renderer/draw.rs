@@ -103,26 +103,146 @@ impl ShaderStatsFrame {
 }
 
 impl Renderer {
-    /// Lazily (re)allocate the scaled-down ray-march target. No-op
-    /// when `render_scale == 1` — the ray-march writes directly to
-    /// the destination in that case. On size/scale change the
-    /// existing texture is dropped and replaced.
-    pub(super) fn ensure_ray_march_target(&mut self) {
-        if self.render_scale <= 1 { return; }
-        let (w, h) = self.scaled_size();
-        if let Some(tex) = self.ray_march_target.as_ref() {
-            if tex.width() == w && tex.height() == h { return; }
+    /// Record the per-frame ray-march (and, when TAAU is enabled,
+    /// the resolve) passes into `encoder`. Written once, called from
+    /// both `render` and `render_offscreen` so the TAA branch lives
+    /// in exactly one place.
+    ///
+    /// Pre-condition: the caller has already uploaded the current
+    /// camera. On the TAA path this helper ticks the jitter counter
+    /// and patches the camera buffer's jitter fields in-place, so
+    /// the march pass sees the sub-pixel offset without requiring
+    /// the caller to know about TAAU.
+    ///
+    /// `timestamp_writes` are attached to the ray-march pass (the
+    /// dominant work), not the resolve pass.
+    fn record_frame_passes(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        dest_view: &wgpu::TextureView,
+        march_label: &'static str,
+    ) {
+        // Stamp jitter into the camera buffer + upload resolve
+        // uniforms. When TAAU is off this is a no-op.
+        if self.taa.is_some() {
+            self.prepare_taa_frame();
         }
-        self.ray_march_target = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ray_march_target"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }));
+
+        // Build timestamp writes after the mutable prepare step
+        // returns; they borrow self.timestamp immutably and have to
+        // outlive the render pass.
+        let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
+            query_set: &ts.query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        });
+
+        // --- Ray-march pass ---
+        if self.pipeline_taa.is_some() {
+            let taa = self.taa.as_ref().expect("pipeline_taa implies TaaState");
+            let pipeline_taa = self.pipeline_taa.as_ref().unwrap();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(march_label),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &taa.color_target_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &taa.t_target_view,
+                        resolve_target: None,
+                        // Cleared to 0 — if the march misses a pixel
+                        // (can't happen for a fullscreen triangle but
+                        // wgpu requires a valid clear op) the resolve
+                        // would see a tiny t and reject the reproject.
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline_taa);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        } else {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(march_label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dest_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // --- Resolve pass (TAA only) ---
+        if let Some(taa) = self.taa.as_ref() {
+            let bg = taa.make_resolve_bind_group(&self.device);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("taa_resolve"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: dest_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: taa.history.write_view(),
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&taa.resolve_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Tick the Halton jitter, build resolve uniforms, and patch the
+    /// jitter bytes of the existing camera buffer. See `GpuCamera` —
+    /// `jitter_x_px` sits at byte offset 12, `jitter_y_px` at offset
+    /// 28 (they occupy the old `_pad0` / `_pad1` slots).
+    fn prepare_taa_frame(&mut self) {
+        let signature = self.current_frame_signature();
+        let last_camera = self.last_camera;
+        let jitter = self
+            .taa
+            .as_mut()
+            .unwrap()
+            .begin_frame(&self.queue, &last_camera, signature);
+        self.queue.write_buffer(&self.camera_buffer, 12, bytemuck::bytes_of(&jitter[0]));
+        self.queue.write_buffer(&self.camera_buffer, 28, bytemuck::bytes_of(&jitter[1]));
     }
 
     /// Live-surface render path. Matches `render_offscreen`'s
@@ -140,11 +260,6 @@ impl Renderer {
         let output = self.surface.get_current_texture()?;
         let acquire_elapsed = acquire_start.elapsed();
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.ensure_ray_march_target();
-        let use_blit = self.render_scale > 1 && self.ray_march_target.is_some();
-        let scaled_view = self.ray_march_target.as_ref().map(|t| {
-            t.create_view(&wgpu::TextureViewDescriptor::default())
-        });
         let encode_start = std::time::Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
@@ -152,65 +267,7 @@ impl Renderer {
         if self.shader_stats_enabled {
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
-        let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
-            query_set: &ts.query_set,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
-        });
-        {
-            let march_view = if use_blit {
-                scaled_view.as_ref().unwrap()
-            } else {
-                &view
-            };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ray_march"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: march_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        if use_blit {
-            let src_view = scaled_view.as_ref().unwrap();
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit"),
-                layout: &self.blit_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.blit_sampler) },
-                ],
-            });
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("blit_to_swapchain"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.blit_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.record_frame_passes(&mut encoder, &view, "ray_march");
         if let Some(ts) = self.timestamp.as_ref() {
             encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
             encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
@@ -235,6 +292,13 @@ impl Renderer {
             });
         }
         let submit_elapsed = submit_start.elapsed();
+        // Swap TAA history textures for next frame. Must happen AFTER
+        // the submit above — the resolve pass wrote into
+        // `history.write_view()`, so end_frame's swap promotes that
+        // to next frame's `read_view()`.
+        if let Some(taa) = self.taa.as_mut() {
+            taa.end_frame();
+        }
         let present_start = std::time::Instant::now();
         output.present();
         let present_elapsed = present_start.elapsed();
@@ -320,8 +384,6 @@ impl Renderer {
                 view_formats: &[],
             }));
         }
-        self.ensure_ray_march_target();
-        let use_blit = self.render_scale > 1 && self.ray_march_target.is_some();
         let texture_alloc_ms = alloc_start.elapsed().as_secs_f64() * 1000.0;
         let view_start = std::time::Instant::now();
         let texture = self
@@ -329,9 +391,6 @@ impl Renderer {
             .as_ref()
             .expect("offscreen texture initialized");
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let scaled_view = self.ray_march_target.as_ref().map(|t| {
-            t.create_view(&wgpu::TextureViewDescriptor::default())
-        });
         let view_ms = view_start.elapsed().as_secs_f64() * 1000.0;
         let encode_start = std::time::Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -344,65 +403,7 @@ impl Renderer {
             // subsequent render pass on the same encoder.
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
-        let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
-            query_set: &ts.query_set,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
-        });
-        {
-            let march_view = if use_blit {
-                scaled_view.as_ref().unwrap()
-            } else {
-                &view
-            };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("offscreen-ray-march"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: march_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        if use_blit {
-            let src_view = scaled_view.as_ref().unwrap();
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit"),
-                layout: &self.blit_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.blit_sampler) },
-                ],
-            });
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("blit_to_offscreen"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.blit_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.record_frame_passes(&mut encoder, &view, "offscreen-ray-march");
         if let Some(ts) = self.timestamp.as_ref() {
             encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
             encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
@@ -432,6 +433,9 @@ impl Renderer {
             });
         }
         let submit_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(taa) = self.taa.as_mut() {
+            taa.end_frame();
+        }
         let wait_start = std::time::Instant::now();
         let _ = self.device.poll(wgpu::PollType::Wait);
         let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
