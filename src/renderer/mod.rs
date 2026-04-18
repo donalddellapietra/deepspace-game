@@ -94,21 +94,13 @@ pub struct Renderer {
     pub(super) palette_buffer: wgpu::Buffer,
     pub(super) uniforms_buffer: wgpu::Buffer,
     pub(super) ribbon_buffer: wgpu::Buffer,
-    /// Per-entity bounding-cube + subtree-BFS storage buffer
-    /// (binding 8). Indexed by `entity_bin_entries` entries — the
-    /// shader looks up candidates per bin rather than iterating the
-    /// whole list.
+    /// Per-entity subtree-BFS + representative-block storage buffer
+    /// (binding 8). Looked up by index from the `Child::EntityRef(idx)`
+    /// cells the shader hits during its unified `march_cartesian`
+    /// tag-3 branch.
     pub(super) entity_buffer: wgpu::Buffer,
     pub(super) uploaded_entities_count: u64,
     pub(super) entity_count: u32,
-    /// Hash-grid prefix-sum offsets (binding 9). Fixed length of
-    /// `BIN_GRID_RES³ + 1` u32s. Allocated once at init; overwritten
-    /// in place each frame by `update_entity_bins`.
-    pub(super) entity_bin_offsets_buffer: wgpu::Buffer,
-    /// Hash-grid flat entity-index list (binding 10). Grows on
-    /// demand via recreate-on-overflow.
-    pub(super) entity_bin_entries_buffer: wgpu::Buffer,
-    pub(super) uploaded_bin_entries_count: u64,
     pub(super) bind_group: wgpu::BindGroup,
     pub(super) root_index: u32,
     pub(super) node_count: u32,

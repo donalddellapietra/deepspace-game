@@ -204,6 +204,14 @@ impl App {
                         ));
                         None
                     }
+                    Child::EntityRef(idx) => {
+                        out.push(format!(
+                            "d{} slot={} parent={kind:?} -> EntityRef({idx})",
+                            depth + 1,
+                            slot
+                        ));
+                        None
+                    }
                 });
             let Some(child_id) = next else { break };
             let child_kind = self.world.library.get(child_id).map(|n| n.kind);
@@ -236,6 +244,7 @@ impl App {
         match node.children[slot] {
             Child::Empty => format!("Empty node_id={node_id} slot={slot}"),
             Child::Block(block) => format!("Block({block}) node_id={node_id} slot={slot}"),
+            Child::EntityRef(idx) => format!("EntityRef({idx}) node_id={node_id} slot={slot}"),
             Child::Node(child_id) => {
                 let desc = self
                     .world

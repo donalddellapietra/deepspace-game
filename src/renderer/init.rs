@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuBinEntry, GpuCamera, GpuEntity, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuPalette, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -66,12 +66,10 @@ impl Renderer {
             wgpu::Features::empty()
         };
         // Storage buffers: tree, node_kinds, ribbon, shader_stats,
-        // node_offsets, entities, entity_bin_offsets,
-        // entity_bin_entries → 8 total. `downlevel_defaults` caps
-        // at 4; bump to 10 (the WebGPU spec default is 10) for
-        // headroom.
+        // node_offsets, entities → 6 total. `downlevel_defaults` caps
+        // at 4; bump to 8 for headroom.
         let required_limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 10,
+            max_storage_buffers_per_shader_stage: 8,
             ..wgpu::Limits::downlevel_defaults()
         }.using_resolution(adapter.limits());
         let (device, queue) = adapter
@@ -220,27 +218,6 @@ impl Renderer {
             contents: bytemuck::cast_slice(&[GpuEntity::default()]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        // Hash-grid buffers. Offsets is fixed at
-        // `BIN_GRID_RES³ + 1` u32s; entries starts at a 1-u32 stub
-        // and grows via `update_entity_bins`.
-        let bin_cells = (crate::world::entity_bins::BIN_GRID_RES.pow(3) + 1) as u64;
-        let entity_bin_offsets_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("entity_bin_offsets"),
-            size: bin_cells * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let zeros = vec![0u32; bin_cells as usize];
-        queue.write_buffer(
-            &entity_bin_offsets_buffer, 0, bytemuck::cast_slice(&zeros),
-        );
-        let entity_bin_entries_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("entity_bin_entries"),
-                contents: bytemuck::bytes_of(&GpuBinEntry::default()),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            },
-        );
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
             contents: bytemuck::bytes_of(&uniforms),
@@ -333,24 +310,6 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
-                // Entity bin offsets (binding 9) — hash-grid prefix
-                // sums, length BIN_GRID_RES³ + 1.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
-                },
-                // Entity bin entries (binding 10) — flat list of
-                // entity indices grouped by bin.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 10, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    }, count: None,
-                },
             ],
         });
 
@@ -359,8 +318,7 @@ impl Renderer {
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
             &shader_stats_buffer, &node_offsets_buffer,
-            &entity_buffer, &entity_bin_offsets_buffer,
-            &entity_bin_entries_buffer,
+            &entity_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -514,9 +472,6 @@ impl Renderer {
             entity_buffer,
             uploaded_entities_count: 0,
             entity_count: 0,
-            entity_bin_offsets_buffer,
-            entity_bin_entries_buffer,
-            uploaded_bin_entries_count: 0,
             bind_group,
             root_index: root_bfs_index, node_count,
             max_depth: MAX_DEPTH as u32, highlight_active: 0,

@@ -191,7 +191,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         wgpu::PresentMode::AutoNoVsync,
         cfg.shader_stats,
         cfg.lod_pixels.unwrap_or(1.0),
-        cfg.lod_base_depth.unwrap_or(4),
+        cfg.lod_base_depth.unwrap_or(8),
         cfg.live_sample_every_frames.unwrap_or(0),
         cfg.taa,
     ));
@@ -290,10 +290,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             avg_steps_empty: render_timing.shader_stats.avg_steps_empty(),
             avg_steps_descend: render_timing.shader_stats.avg_steps_descend(),
             avg_steps_lod_terminal: render_timing.shader_stats.avg_steps_lod_terminal(),
-            avg_entity_bin_visits: render_timing.shader_stats.avg_entity_bin_visits(),
-            avg_entity_aabb_tests: render_timing.shader_stats.avg_entity_aabb_tests(),
-            avg_entity_aabb_hits: render_timing.shader_stats.avg_entity_aabb_hits(),
-            avg_entity_subpixel_skips: render_timing.shader_stats.avg_entity_subpixel_skips(),
+            avg_tag3_hits: render_timing.shader_stats.avg_tag3_hits(),
             avg_entity_subtree_marches: render_timing.shader_stats.avg_entity_subtree_marches(),
             avg_entity_subtree_hits: render_timing.shader_stats.avg_entity_subtree_hits(),
             packed_node_count,
@@ -391,10 +388,7 @@ struct FrameSample {
     avg_steps_empty: f64,
     avg_steps_descend: f64,
     avg_steps_lod_terminal: f64,
-    avg_entity_bin_visits: f64,
-    avg_entity_aabb_tests: f64,
-    avg_entity_aabb_hits: f64,
-    avg_entity_subpixel_skips: f64,
+    avg_tag3_hits: f64,
     avg_entity_subtree_marches: f64,
     avg_entity_subtree_hits: f64,
     packed_node_count: u32,
@@ -493,10 +487,7 @@ struct PerfAgg {
     sum_avg_steps_empty: f64,
     sum_avg_steps_descend: f64,
     sum_avg_steps_lod_terminal: f64,
-    sum_avg_entity_bin_visits: f64,
-    sum_avg_entity_aabb_tests: f64,
-    sum_avg_entity_aabb_hits: f64,
-    sum_avg_entity_subpixel_skips: f64,
+    sum_avg_tag3_hits: f64,
     sum_avg_entity_subtree_marches: f64,
     sum_avg_entity_subtree_hits: f64,
     sum_packed_node_count: u64,
@@ -561,10 +552,7 @@ impl PerfAgg {
         self.sum_avg_steps_empty += s.avg_steps_empty;
         self.sum_avg_steps_descend += s.avg_steps_descend;
         self.sum_avg_steps_lod_terminal += s.avg_steps_lod_terminal;
-        self.sum_avg_entity_bin_visits += s.avg_entity_bin_visits;
-        self.sum_avg_entity_aabb_tests += s.avg_entity_aabb_tests;
-        self.sum_avg_entity_aabb_hits += s.avg_entity_aabb_hits;
-        self.sum_avg_entity_subpixel_skips += s.avg_entity_subpixel_skips;
+        self.sum_avg_tag3_hits += s.avg_tag3_hits;
         self.sum_avg_entity_subtree_marches += s.avg_entity_subtree_marches;
         self.sum_avg_entity_subtree_hits += s.avg_entity_subtree_hits;
         if s.max_steps > self.max_max_steps {
@@ -666,12 +654,9 @@ impl PerfAgg {
             self.sum_avg_steps_lod_terminal / n,
         );
         eprintln!(
-            "render_harness_entity frames={} avg_bin_visits={:.2} avg_aabb_tests={:.2} avg_aabb_hits={:.2} avg_subpixel_skips={:.2} avg_subtree_marches={:.2} avg_subtree_hits={:.2}",
+            "render_harness_entity frames={} avg_tag3_hits={:.2} avg_subtree_marches={:.2} avg_subtree_hits={:.2}",
             self.frame_count,
-            self.sum_avg_entity_bin_visits / n,
-            self.sum_avg_entity_aabb_tests / n,
-            self.sum_avg_entity_aabb_hits / n,
-            self.sum_avg_entity_subpixel_skips / n,
+            self.sum_avg_tag3_hits / n,
             self.sum_avg_entity_subtree_marches / n,
             self.sum_avg_entity_subtree_hits / n,
         );

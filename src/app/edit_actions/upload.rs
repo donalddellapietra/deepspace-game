@@ -5,12 +5,24 @@
 //! emits (or reuses) nodes keyed by `NodeId`. Initial pack and edit
 //! path go through the same function — the edit case is fast because
 //! every sibling of the edit path is already in the cache.
+//!
+//! ## Scene-root overlay
+//!
+//! When entities exist, `upload_tree_lod` builds a per-frame scene
+//! root via `world::scene::build_scene_root` that overlays
+//! `Child::EntityRef(idx)` onto terrain at every entity's anchor
+//! slot. The render pack root becomes the scene root; the ribbon and
+//! render-frame computation walk the scene tree, so the shader's
+//! unified `march_cartesian` encounters entity cells naturally as
+//! `tag=3` DDA leaves — no separate hash-grid pass, no gather.
+//!
+//! When no entities exist the scene root collapses to `world.root`
+//! unchanged (content-addressed fast path).
 
 use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
-use crate::world::anchor::WORLD_SIZE;
-use crate::world::entity_bins::EntityBins;
 use crate::world::gpu::{self, GpuEntity};
+use crate::world::scene::{self, EntityPath};
 
 impl App {
     pub(in crate::app) fn upload_tree(&mut self) {
@@ -20,95 +32,23 @@ impl App {
         self.upload_tree_lod();
     }
 
-    /// Pack every entity's active root into the shared GPU tree
-    /// buffer, then build a per-frame `GpuEntity` list and upload it
-    /// to the entity buffer. Runs at the end of `upload_tree_lod`
-    /// so `self.active_frame.render_path` is already set.
-    ///
-    /// Entity subtrees live in the same `tree[]` as the world root —
-    /// the content-addressed cache means 10k identical entities
-    /// share one packed subtree at zero cost.
-    pub(in crate::app) fn upload_entities(&mut self) {
-        let Some(renderer) = self.renderer.as_mut() else { return };
-        if self.entities.is_empty() {
-            renderer.update_entities(&[]);
-            self.entity_bins_pool.rebuild(&[]);
-            renderer.update_entity_bins(
-                &self.entity_bins_pool.offsets,
-                &self.entity_bins_pool.entries,
-            );
-            return;
-        }
-        let Some(cache) = self.cached_tree.as_mut() else { return };
-
-        let t_pack = web_time::Instant::now();
-        let len_before_u32 = cache.tree.len();
-        let kinds_before = cache.node_kinds.len();
-        for e in self.entities.entities.iter_mut() {
-            e.bfs_idx = cache.ensure_root(&self.world.library, e.active_root());
-        }
-        if cache.tree.len() != len_before_u32 || cache.node_kinds.len() != kinds_before {
-            renderer.update_tree(
-                &cache.tree,
-                &cache.node_kinds,
-                &cache.node_offsets,
-                cache.root_bfs_idx,
-            );
-        }
-        let pack_ms = t_pack.elapsed().as_secs_f64() * 1000.0;
-
-        let t_build = web_time::Instant::now();
-        let frame = self.active_frame.render_path;
-        let frame_depth = frame.depth() as i32;
-        let mut gpu = Vec::with_capacity(self.entities.len());
-        for e in &self.entities.entities {
-            let anchor_depth = e.pos.anchor.depth() as i32;
-            if anchor_depth < frame_depth {
-                continue;
-            }
-            let bbox_min = e.pos.in_frame(&frame);
-            let size = WORLD_SIZE / 3.0_f32.powi(anchor_depth - frame_depth);
-            let rep = self
-                .world
-                .library
-                .get(e.active_root())
-                .map(|n| n.representative_block as u32)
-                .unwrap_or(255);
-            gpu.push(GpuEntity {
-                bbox_min,
-                representative_block: rep,
-                bbox_max: [bbox_min[0] + size, bbox_min[1] + size, bbox_min[2] + size],
-                subtree_bfs: e.bfs_idx,
-            });
-        }
-        let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
-
-        let t_bins = web_time::Instant::now();
-        self.entity_bins_pool.rebuild(&gpu);
-        let bins_ms = t_bins.elapsed().as_secs_f64() * 1000.0;
-
-        let Some(renderer) = self.renderer.as_mut() else { return };
-        let entries_len = self.entity_bins_pool.entries.len();
-        let t_upload = web_time::Instant::now();
-        renderer.update_entities(&gpu);
-        renderer.update_entity_bins(
-            &self.entity_bins_pool.offsets,
-            &self.entity_bins_pool.entries,
-        );
-        let upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
-
-        if self.render_harness {
-            eprintln!(
-                "entity_upload entities={} bin_entries={} pack_ms={:.3} build_ms={:.3} bins_ms={:.3} upload_ms={:.3}",
-                gpu.len(), entries_len,
-                pack_ms, build_ms, bins_ms, upload_ms,
-            );
-        }
-    }
-
     pub(in crate::app) fn upload_tree_lod(&mut self) {
         let intended_frame = self.target_render_frame();
         let effective_visual_depth = self.visual_depth();
+
+        // --- Entity subtree pre-pack ---
+        let cache = self.cached_tree.get_or_insert_with(gpu::CachedTree::new);
+        for e in self.entities.entities.iter_mut() {
+            e.bfs_idx = cache.ensure_root(&self.world.library, e.active_root());
+        }
+
+        // --- Pack WORLD.ROOT for ribbon & LOD baseline ---
+        // Ribbon is computed against terrain only — NOT the scene
+        // overlay. This keeps `ribbon_level` (shader's distance-based
+        // detail budget) identical to a no-entity run, so terrain
+        // renders with the same LOD splat regardless of entity
+        // presence. The scene overlay's job is to make entities
+        // findable from the frame, not to alter terrain detail.
         let upload_key = LodUploadKey::new(self.world.root);
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
         self.last_effective_visual_depth = effective_visual_depth;
@@ -117,23 +57,16 @@ impl App {
         let mut pack_elapsed = web_time::Duration::ZERO;
         if !reused_gpu_tree {
             let pack_start = web_time::Instant::now();
-            let cache = self.cached_tree.get_or_insert_with(gpu::CachedTree::new);
+            let cache = self
+                .cached_tree
+                .as_mut()
+                .expect("cached_tree inserted above");
             let len_before = cache.tree.len();
             cache.update_root(&self.world.library, self.world.root);
             pack_elapsed = pack_start.elapsed();
             let appended_u32s = cache.tree.len().saturating_sub(len_before);
             self.last_packed_node_count = cache.node_offsets.len() as u32;
-
-            if let Some(renderer) = &mut self.renderer {
-                renderer.update_tree(
-                    &cache.tree,
-                    &cache.node_kinds,
-                    &cache.node_offsets,
-                    cache.root_bfs_idx,
-                );
-            }
             self.last_lod_upload_key = Some(upload_key);
-
             if self.render_harness {
                 eprintln!(
                     "render_harness_pack kind={:?} packed_nodes={} library_nodes={} appended_u32s={} pack_ms={:.3}",
@@ -146,7 +79,47 @@ impl App {
             }
         }
 
-        // Ribbon rebuilds every frame against the cached tree.
+        // --- Build + pack scene root ---
+        let intended_render_path = intended_frame.render_path;
+        let mut entity_paths: Vec<EntityPath> = Vec::with_capacity(self.entities.len());
+        for (idx, e) in self.entities.entities.iter().enumerate() {
+            let anchor = e.pos.anchor;
+            if anchor.depth() == 0 {
+                continue;
+            }
+            let anchor_slots = anchor.as_slice();
+            entity_paths.push(EntityPath {
+                entity_idx: idx as u32,
+                path_slots: anchor_slots.to_vec(),
+            });
+        }
+        let scene_result = scene::build_scene_root(
+            &mut self.world.library,
+            self.world.root,
+            &entity_paths,
+        );
+        let scene_root = scene_result.node_id;
+
+        self.world.library.ref_inc(scene_root);
+        if let Some(prev) = self.active_scene_root.replace(scene_root) {
+            self.world.library.ref_dec(prev);
+        }
+
+        let cache = self
+            .cached_tree
+            .as_mut()
+            .expect("cached_tree present");
+        let scene_root_bfs = cache.ensure_root(&self.world.library, scene_root);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.update_tree(
+                &cache.tree,
+                &cache.node_kinds,
+                &cache.node_offsets,
+                cache.root_bfs_idx,
+            );
+        }
+
+        // --- Ribbon on TERRAIN ---
         let ribbon_start = web_time::Instant::now();
         let cache = self
             .cached_tree
@@ -156,11 +129,43 @@ impl App {
             &cache.tree,
             &cache.node_offsets,
             cache.root_bfs_idx,
-            intended_frame.render_path.as_slice(),
+            intended_render_path.as_slice(),
         );
         let ribbon_elapsed = ribbon_start.elapsed();
         self.last_ribbon_len = r.ribbon.len() as u32;
+
+        // --- Frame root: SCENE at terrain's reached depth ---
+        // Walk scene_root down `reached_slots` in the LIBRARY (not
+        // the pack) to find the scene-side equivalent of the node
+        // terrain's ribbon ended at. That NodeId's BFS becomes the
+        // shader's `frame_root_idx`. Rays hitting terrain-sibling
+        // slots of the scene frame render identically to baseline
+        // (same packed NodeIds via content-addressed dedup); rays
+        // hitting the scene-overlay slot follow the ephemeral chain
+        // down to the entity.
         let effective_path = frame::frame_from_slots(&r.reached_slots);
+        let mut scene_frame_id = scene_root;
+        for &slot in r.reached_slots.iter() {
+            let Some(node) = self.world.library.get(scene_frame_id) else { break };
+            match node.children[slot as usize] {
+                crate::world::tree::Child::Node(id) => scene_frame_id = id,
+                _ => break,
+            }
+        }
+        let cache = self.cached_tree.as_mut().expect("cached_tree present");
+        let scene_frame_bfs = cache.ensure_root(
+            &self.world.library, scene_frame_id,
+        );
+        if let Some(renderer) = &mut self.renderer {
+            renderer.update_tree(
+                &cache.tree,
+                &cache.node_kinds,
+                &cache.node_offsets,
+                cache.root_bfs_idx,
+            );
+        }
+        let _ = scene_root_bfs;
+
         let effective_render = frame::compute_render_frame(
             &self.world.library,
             self.world.root,
@@ -174,7 +179,7 @@ impl App {
             kind: effective_render.kind,
         };
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_frame_root(r.frame_root_idx);
+            renderer.set_frame_root(scene_frame_bfs);
             renderer.update_ribbon(&r.ribbon);
         }
 
@@ -200,11 +205,52 @@ impl App {
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
 
-        // Entity pass: pack entity subtrees into the shared tree
-        // buffer (if not already) and upload per-frame bboxes. Runs
-        // every frame — entity bboxes depend on the render frame,
-        // which shifts as the camera zooms.
-        self.upload_entities();
+        // --- Upload entities buffer ---
+        // Entity bbox is in the SCENE frame's [0, 3)^3 coords —
+        // computed from the entity's `in_frame(&effective_path)`
+        // plus its anchor cell size. The shader's tag=3 branch
+        // ray-AABB tests this bbox directly (the scene tree's cell
+        // just locates the entity coarsely; motion within the anchor
+        // cell shifts the bbox sub-cell every frame, which the
+        // ray-box test picks up without rebuilding the tree).
+        let frame_world_size = crate::world::anchor::WORLD_SIZE;
+        let mut gpu_entities: Vec<GpuEntity> = Vec::with_capacity(self.entities.len());
+        for e in &self.entities.entities {
+            let rep = self
+                .world
+                .library
+                .get(e.active_root())
+                .map(|n| n.representative_block as u32)
+                .unwrap_or(255);
+            let anchor_depth = e.pos.anchor.depth() as i32;
+            let frame_depth = effective_path.depth() as i32;
+            let depth_delta = (anchor_depth - frame_depth).max(0) as u32;
+            let size = frame_world_size / 3.0_f32.powi(depth_delta as i32);
+            let bbox_min = e.pos.in_frame(&effective_path);
+            let bbox_max = [
+                bbox_min[0] + size,
+                bbox_min[1] + size,
+                bbox_min[2] + size,
+            ];
+            gpu_entities.push(GpuEntity {
+                bbox_min,
+                representative_block: rep,
+                bbox_max,
+                subtree_bfs: e.bfs_idx,
+            });
+        }
+        if let Some(renderer) = &mut self.renderer {
+            renderer.update_entities(&gpu_entities);
+        }
+        if self.render_harness {
+            eprintln!(
+                "entity_upload entities={} scene_root_id={} scene_frame_bfs={} ribbon_len={}",
+                gpu_entities.len(),
+                scene_root,
+                scene_frame_bfs,
+                r.ribbon.len(),
+            );
+        }
 
         if self.startup_profile_frames < 12 {
             eprintln!(
@@ -219,5 +265,6 @@ impl App {
                 self.active_frame.kind,
             );
         }
+
     }
 }

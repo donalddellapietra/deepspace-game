@@ -102,16 +102,17 @@ struct ShaderStats {
     sum_steps_empty_div4: atomic<u32>,
     sum_steps_node_descend_div4: atomic<u32>,
     sum_steps_lod_terminal_div4: atomic<u32>,
-    // Entity-pass counters (div-4 to match the world counters).
-    // Together they tell us where the 10k-entity frame is spending
-    // time: bin DDA iterations vs AABB test count vs subtree
-    // descents. See `march_entities` for the increment sites.
-    entity_bin_visits_div4: atomic<u32>,        // DDA bin iterations
-    entity_aabb_tests_div4: atomic<u32>,        // ray-box tests
-    entity_aabb_hits_div4: atomic<u32>,         // AABB tests that passed
-    entity_subpixel_skips_div4: atomic<u32>,    // took sub-pixel fast path
-    entity_subtree_marches_div4: atomic<u32>,   // entered march_cartesian
+    // Entity counters — tag=3 dispatch diagnostics for the
+    // tree-integrated scene path. Always incremented unconditionally
+    // (NOT ENABLE_STATS-gated) so the previous regression — "shader
+    // silently skips tag=3 and we can't tell from eyeball
+    // screenshots" — can't recur.
+    tag3_hits_div4: atomic<u32>,                // times tag==3u fired
+    entity_subtree_marches_div4: atomic<u32>,   // called march_entity_subtree
     entity_subtree_hits_div4: atomic<u32>,      // subtree march returned a hit
+    _entity_pad_0: atomic<u32>,                 // reserved
+    _entity_pad_1: atomic<u32>,                 // reserved
+    _entity_pad_2: atomic<u32>,                 // reserved
 }
 
 /// Interleaved sparse-tree storage. Each node occupies
@@ -139,40 +140,20 @@ struct ShaderStats {
 /// reads this buffer.
 @group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
 
-/// Flat entity list. Each entity carries a bounding cube in the
-/// current render frame's [0, 3)³ local coords plus a BFS idx
-/// into `tree[]` for its voxel subtree. `march_entities` walks a
-/// hash grid (bindings 9 + 10) to find relevant entities per ray,
-/// then indexes back into this buffer.
+/// Flat entity list. Each entity carries the BFS idx of its voxel
+/// subtree root in the shared `tree[]` buffer plus a representative
+/// block for LOD-terminal splats. The entity's world-space bbox
+/// comes directly from the tree DDA — a `Child::EntityRef(idx)`
+/// sits at the entity's anchor cell, so that cell IS the entity's
+/// bbox. The unused `bbox_min` / `bbox_max` slots are retained for
+/// ABI compatibility but ignored by the shader.
 struct EntityGpu {
     bbox_min: vec3<f32>,
-    /// Most-common non-empty block type in this entity's subtree.
-    /// Used as a single-color splat when the entity's bbox is
-    /// sub-pixel on screen, short-circuiting the subtree descent.
     representative_block: u32,
     bbox_max: vec3<f32>,
     subtree_bfs: u32,
 }
 @group(0) @binding(8) var<storage, read> entities: array<EntityGpu>;
-
-/// Hash-grid bin offsets. Length `BIN_GRID_RES³ + 1`. Prefix sum:
-/// `entity_bin_offsets[i + 1] - entity_bin_offsets[i]` = count of
-/// entries in bin `i`, and `entity_bin_offsets[i]` is the start
-/// offset into `entity_bin_entries` for that bin.
-@group(0) @binding(9) var<storage, read> entity_bin_offsets: array<u32>;
-
-/// Hash-grid entry list. Each entry carries the entity's bbox
-/// INLINE alongside the entity index so the shader's per-bin
-/// AABB cull reads sequentially — no gather into `entities[e_idx]`
-/// until an AABB hit actually needs the subtree for marching.
-/// Layout matches `BinEntryGpu` (32 bytes, vec4-aligned).
-struct BinEntryGpu {
-    bbox_min: vec3<f32>,
-    e_idx: u32,
-    bbox_max: vec3<f32>,
-    _pad: u32,
-}
-@group(0) @binding(10) var<storage, read> entity_bin_entries: array<BinEntryGpu>;
 
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.
@@ -185,13 +166,12 @@ var<private> ray_steps_empty: u32 = 0u;
 var<private> ray_steps_node_descend: u32 = 0u;
 var<private> ray_steps_lod_terminal: u32 = 0u;
 
-/// Per-fragment entity-pass counters. Accumulated inside
-/// `march_entities`, flushed by `fs_main` via `atomicAdd` when
-/// `ENABLE_STATS` is on.
-var<private> entity_bin_visits: u32 = 0u;
-var<private> entity_aabb_tests: u32 = 0u;
-var<private> entity_aabb_hits: u32 = 0u;
-var<private> entity_subpixel_skips: u32 = 0u;
+/// Per-fragment entity dispatch counters. Incremented unconditionally
+/// (NOT gated on ENABLE_STATS) so tag-3 flow is always observable —
+/// the earlier entities-in-tree attempt rolled back because it was
+/// impossible to tell if the shader was reaching the tag-3 branch
+/// at all. Flushed in `fs_main` via `atomicAdd`.
+var<private> tag3_hits: u32 = 0u;
 var<private> entity_subtree_marches: u32 = 0u;
 var<private> entity_subtree_hits: u32 = 0u;
 
@@ -224,16 +204,18 @@ override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 /// Default 4 gives detailed close content (4 levels under anchor)
 /// while keeping far content cheap (1-level LOD terminal beyond
 /// ribbon shell 3). Tune via `--lod-base-depth <N>`.
-override BASE_DETAIL_DEPTH: u32 = 4u;
+override BASE_DETAIL_DEPTH: u32 = 8u;
 
 const MAX_FACE_DEPTH: u32 = 63u;
 /// Cartesian DDA stack depth — must be ≥ `BASE_DETAIL_DEPTH + 1`.
-/// 5 matches the default BASE_DETAIL_DEPTH=4 exactly. Previously 64,
-/// which allocated 3.5 KB of per-fragment scratch and forced the
-/// Apple Silicon register allocator to spill to local memory on
-/// every DDA iteration. If you raise BASE_DETAIL_DEPTH, raise this
-/// to match or the shader silently caps descent.
-const MAX_STACK_DEPTH: u32 = 5u;
+/// 9 matches the default BASE_DETAIL_DEPTH=8; entity scene overlays
+/// build ephemeral ancestor chains as deep as the entity's anchor
+/// depth (6 in the soldier test), and the march_entity_subtree
+/// needs room to descend into the entity's voxel content on top of
+/// that. Previously 5 (with BASE_DETAIL_DEPTH=4) was enough for
+/// terrain-only rendering; the entities-in-tree overlay makes the
+/// tree deeper by design.
+const MAX_STACK_DEPTH: u32 = 9u;
 
 struct HitResult {
     hit: bool,

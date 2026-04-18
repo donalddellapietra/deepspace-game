@@ -128,7 +128,7 @@ pub fn compute_render_frame(
                     }
                 }
             }
-            Child::Block(_) | Child::Empty => break,
+            Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
     }
     if let Some((face, face_root_id, face_u_min, face_v_min, face_r_min, face_size)) = sphere_info {

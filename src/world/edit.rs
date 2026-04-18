@@ -310,6 +310,11 @@ fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
             .get(id)
             .map_or(false, |n| n.representative_block == 255),
         Child::Block(_) => false,
+        // EntityRef cells aren't placeable — the entity's voxel
+        // subtree occupies the cell. Player interaction with
+        // entities happens through a separate pick-from-entity-list
+        // path (not yet implemented on this branch).
+        Child::EntityRef(_) => false,
     }
 }
 

@@ -106,7 +106,11 @@ pub(super) fn cpu_raycast_with_face_depth(
         }
 
         match child {
-            Child::Empty => {
+            Child::Empty | Child::EntityRef(_) => {
+                // EntityRef cells are scene-overlay only; CPU
+                // raycasts operate on terrain (world.root) which
+                // never contains EntityRef, but treat as empty for
+                // defensive coverage.
                 advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
             }
             Child::Block(_) => {

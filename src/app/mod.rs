@@ -219,10 +219,11 @@ pub struct App {
     /// branch's 40× perf-over-ECS lesson. Visual content shared via
     /// `NodeLibrary`; position + override state per-entity.
     pub(super) entities: crate::world::entities::EntityStore,
-    /// CPU-side scratch for the entity hash grid, reused across
-    /// frames so the res³-entry offsets allocation isn't re-zeroed
-    /// from fresh every frame.
-    pub(super) entity_bins_pool: crate::world::entity_bins::EntityBins,
+    /// Scene root NodeId from the last `upload_tree_lod`. Held via
+    /// `NodeLibrary::ref_inc` so its ephemeral ancestor chain
+    /// survives between frames; released on the next upload when the
+    /// new scene root replaces it.
+    pub(super) active_scene_root: Option<crate::world::tree::NodeId>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -276,7 +277,7 @@ impl App {
         // Nyquist floor: sub-pixel rejection only. Primary LOD gate
         // is ribbon-level-based (`lod_base_depth`).
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
-        let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
+        let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(8);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let taa_enabled = test_cfg.taa;
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
@@ -410,7 +411,7 @@ impl App {
             cached_highlight: None,
             last_edit_slots: None,
             entities: crate::world::entities::EntityStore::new(),
-            entity_bins_pool: crate::world::entity_bins::EntityBins::new(),
+            active_scene_root: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]

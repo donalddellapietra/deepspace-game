@@ -23,11 +23,18 @@ pub const MAX_DEPTH: usize = 63;
 ///
 /// `Block(u8)` holds a palette index. Builtin block indices live in
 /// `palette::block`; imported model colors use indices 10-254.
+///
+/// `EntityRef(idx)` is a per-frame scene overlay: the shader treats
+/// the cell as a portal into an entity's voxel subtree, looked up in
+/// the `entities[idx]` GPU buffer. EntityRef children only appear in
+/// ephemeral scene-root nodes built by `world::scene`; terrain nodes
+/// never carry them. See `docs/design/entities-in-tree.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Child {
     Empty,
     Block(u8),
     Node(NodeId),
+    EntityRef(u32),
 }
 
 impl Child {
@@ -41,6 +48,21 @@ impl Child {
         !self.is_empty()
     }
 }
+
+/// Sentinel `representative_block` for entity-bearing ephemeral
+/// subtrees. Non-255 so the shader's empty-representative fast
+/// path (`child_bt == 255u => skip descent`) never skips a scene
+/// ancestor chain. The shader recognises 254 specifically in the
+/// LOD-terminal branch: instead of splatting `palette[254]` (which
+/// would tint terrain under deep LOD), the tag=2 LOD-terminal with
+/// `bt == 254` advances the outer DDA like an empty cell would —
+/// the ephemeral chain is "transparent at LOD" but still descended
+/// when pixel-projected coverage is above the threshold.
+///
+/// Uses 254 (not 253) because it does NOT conflict with any valid
+/// palette entry (indices 0..=253 are block types; 255 is the
+/// "all-empty" sentinel in representative_block).
+pub const ENTITY_REPRESENTATIVE: u8 = 254;
 
 // --------------------------------------------------------------- node id
 
@@ -199,7 +221,10 @@ impl NodeLibrary {
         // Most common NON-EMPTY block type among children. Empty children
         // are ignored so that thin features (a single wood voxel in air)
         // survive cascaded LOD. For Node children, inherit their
-        // representative_block recursively.
+        // representative_block recursively. EntityRef children count
+        // as `ENTITY_REPRESENTATIVE` (253) so an ancestor holding only
+        // entities still reports a non-255 representative — the shader's
+        // empty-rep fast path never skips a scene ancestor chain.
         let mut counts = [0u32; 256];
         for c in &children {
             match c {
@@ -210,6 +235,9 @@ impl NodeLibrary {
                             counts[child_node.representative_block as usize] += 1;
                         }
                     }
+                }
+                Child::EntityRef(_) => {
+                    counts[ENTITY_REPRESENTATIVE as usize] += 1;
                 }
                 Child::Empty => {}
             }
@@ -222,6 +250,8 @@ impl NodeLibrary {
             .map(|(i, _)| i as u8)
             .unwrap_or(255);
         // Compute uniform_type: is the entire subtree one block type?
+        // EntityRef is always treated as MIXED so pack.rs never tries
+        // to uniform-flatten a scene ancestor into a single Block.
         let uniform_type = {
             let mut first: Option<u8> = None;
             let mut uniform = true;
@@ -232,6 +262,7 @@ impl NodeLibrary {
                     Child::Node(nid) => {
                         self.nodes.get(nid).map(|n| n.uniform_type).unwrap_or(UNIFORM_MIXED)
                     }
+                    Child::EntityRef(_) => UNIFORM_MIXED,
                 };
                 if ct == UNIFORM_MIXED { uniform = false; break; }
                 match first {
@@ -242,9 +273,9 @@ impl NodeLibrary {
             }
             if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
         };
-        // Cache depth: 1 for leaves (all children are Block/Empty),
-        // 1 + max(child.depth) when any child is Child::Node. O(1)
-        // per insert thanks to child caching.
+        // Cache depth: 1 for leaves (all children are Block/Empty/
+        // EntityRef), 1 + max(child.depth) when any child is
+        // Child::Node. O(1) per insert thanks to child caching.
         let mut max_child_depth = 0u32;
         for c in &children {
             if let Child::Node(nid) = c {
@@ -277,6 +308,23 @@ impl NodeLibrary {
     /// depth=1 returns a node whose 27 children are all `Block(block_type)`.
     /// depth=N returns a node of uniform nodes, N levels deep.
     /// Content-addressed dedup means this creates at most N unique nodes.
+    /// Override an existing node's `representative_block`. Used by
+    /// the scene overlay to make ephemeral ancestors inherit the
+    /// terrain's representative at their position — otherwise the
+    /// ephemeral chain's rep would be dominated by a single
+    /// `Child::EntityRef` (253) and the shader's LOD-terminal splat
+    /// would show entity-sentinel instead of terrain color.
+    ///
+    /// ## Safety
+    ///
+    /// The node's `uniform_type` is NOT recomputed; callers must
+    /// ensure the override is consistent with that cached field.
+    pub fn set_representative(&mut self, id: NodeId, rep: u8) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.representative_block = rep;
+        }
+    }
+
     pub fn build_uniform_subtree(&mut self, block_type: u8, depth: u32) -> Child {
         if depth == 0 {
             return Child::Block(block_type);

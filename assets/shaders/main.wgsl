@@ -9,7 +9,6 @@
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
 #include "march.wgsl"
-#include "entities.wgsl"
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -56,17 +55,11 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 /// is a small precision hit but not a visible one.
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir = jittered_ray_dir(uv);
-    let world_hit = march(camera.pos, ray_dir);
-    // Entity pass: untouched world march + a separate scan over the
-    // entity buffer. The two hits compose by min-t — voxel in front
-    // of entity wins via standard depth ordering, and vice versa.
-    let entity_hit = march_entities(camera.pos, ray_dir);
-    var result: HitResult;
-    if entity_hit.hit && (!world_hit.hit || entity_hit.t < world_hit.t) {
-        result = entity_hit;
-    } else {
-        result = world_hit;
-    }
+    // Single unified march. Entities are Child::EntityRef(idx) cells
+    // inside the scene-root tree; the tag==3u branch of
+    // `march_cartesian` dispatches into `march_entity_subtree` for
+    // them. No separate entity pass.
+    let result = march(camera.pos, ray_dir);
 
     var color: vec3<f32>;
     if result.hit {
@@ -132,13 +125,15 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         atomicAdd(&shader_stats.sum_steps_empty_div4, (ray_steps_empty + 3u) >> 2u);
         atomicAdd(&shader_stats.sum_steps_node_descend_div4, (ray_steps_node_descend + 3u) >> 2u);
         atomicAdd(&shader_stats.sum_steps_lod_terminal_div4, (ray_steps_lod_terminal + 3u) >> 2u);
-        atomicAdd(&shader_stats.entity_bin_visits_div4, (entity_bin_visits + 3u) >> 2u);
-        atomicAdd(&shader_stats.entity_aabb_tests_div4, (entity_aabb_tests + 3u) >> 2u);
-        atomicAdd(&shader_stats.entity_aabb_hits_div4, (entity_aabb_hits + 3u) >> 2u);
-        atomicAdd(&shader_stats.entity_subpixel_skips_div4, (entity_subpixel_skips + 3u) >> 2u);
-        atomicAdd(&shader_stats.entity_subtree_marches_div4, (entity_subtree_marches + 3u) >> 2u);
-        atomicAdd(&shader_stats.entity_subtree_hits_div4, (entity_subtree_hits + 3u) >> 2u);
     }
+    // Tag-3 diagnostics fire UNCONDITIONALLY (not gated on
+    // ENABLE_STATS). Previous attempts failed precisely because the
+    // shader's path through tag=3 was invisible from the CPU; we
+    // keep a cheap 3-counter lead on every run so regressions like
+    // "entity rendered 0 pixels" are diagnosable from stderr.
+    atomicAdd(&shader_stats.tag3_hits_div4, (tag3_hits + 3u) >> 2u);
+    atomicAdd(&shader_stats.entity_subtree_marches_div4, (entity_subtree_marches + 3u) >> 2u);
+    atomicAdd(&shader_stats.entity_subtree_hits_div4, (entity_subtree_hits + 3u) >> 2u);
 
     // Stash t in the alpha channel so fs_main_taa can route it into
     // a second render attachment without re-running the march.

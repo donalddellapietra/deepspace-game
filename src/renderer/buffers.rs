@@ -73,7 +73,6 @@ impl Renderer {
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.entity_buffer,
-                &self.entity_bin_offsets_buffer, &self.entity_bin_entries_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -124,7 +123,6 @@ impl Renderer {
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.entity_buffer,
-                &self.entity_bin_offsets_buffer, &self.entity_bin_entries_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -133,65 +131,6 @@ impl Renderer {
 
     pub fn update_palette(&self, palette: &GpuPalette) {
         self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
-    }
-
-    /// Upload hash-grid bin data — prefix-sum offsets (fixed length)
-    /// and the flat entry list (variable). Both buffers get full
-    /// rewrites each frame because every entity may have moved into
-    /// a different bin; binning's O(N) rebuild is cheap compared to
-    /// even one prevented frame's worth of extra shader work.
-    ///
-    /// The entries buffer grows in place; the offsets buffer is
-    /// fixed at `BIN_GRID_RES³ + 1` u32s and always fits.
-    pub fn update_entity_bins(
-        &mut self,
-        offsets: &[u32],
-        entries: &[crate::world::gpu::GpuBinEntry],
-    ) {
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-
-        // Offsets buffer: fixed size at init; plain write from 0.
-        self.queue.write_buffer(
-            &self.entity_bin_offsets_buffer, 0,
-            bytemuck::cast_slice(offsets),
-        );
-
-        // Entries buffer: may grow. One-entry stub for empty so
-        // the storage binding stays valid.
-        let stub = [crate::world::gpu::GpuBinEntry::default()];
-        let payload: &[crate::world::gpu::GpuBinEntry] =
-            if entries.is_empty() { &stub } else { entries };
-        let needed = std::mem::size_of_val(payload) as u64;
-        let mut grew = false;
-        if needed > self.entity_bin_entries_buffer.size() {
-            let raw = (needed * 3 / 2).max(needed + 256);
-            let new_size = raw.div_ceil(4) * 4;
-            self.entity_bin_entries_buffer = self.device.create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: Some("entity_bin_entries"),
-                    size: new_size,
-                    usage,
-                    mapped_at_creation: false,
-                },
-            );
-            grew = true;
-        }
-        self.queue.write_buffer(
-            &self.entity_bin_entries_buffer, 0,
-            bytemuck::cast_slice(payload),
-        );
-        self.uploaded_bin_entries_count = payload.len() as u64;
-
-        if grew {
-            self.bind_group = make_bind_group(
-                &self.device, &self.bind_group_layout,
-                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
-                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
-                &self.shader_stats_buffer, &self.node_offsets_buffer,
-                &self.entity_buffer,
-                &self.entity_bin_offsets_buffer, &self.entity_bin_entries_buffer,
-            );
-        }
     }
 
     /// Upload the entity list. Always overwrites the buffer from
@@ -234,7 +173,6 @@ impl Renderer {
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.entity_buffer,
-                &self.entity_bin_offsets_buffer, &self.entity_bin_entries_buffer,
             );
         }
         self.write_uniforms();
@@ -353,6 +291,7 @@ pub(super) fn append_or_recreate_u32(
     append_or_recreate(buffer, uploaded_u32s, device, queue, label, data, usage)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn make_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -365,8 +304,6 @@ pub(super) fn make_bind_group(
     shader_stats: &wgpu::Buffer,
     node_offsets: &wgpu::Buffer,
     entities: &wgpu::Buffer,
-    entity_bin_offsets: &wgpu::Buffer,
-    entity_bin_entries: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -381,8 +318,6 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: entities.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 9, resource: entity_bin_offsets.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 10, resource: entity_bin_entries.as_entire_binding() },
         ],
     })
 }

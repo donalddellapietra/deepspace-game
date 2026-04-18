@@ -58,7 +58,8 @@
 use std::collections::HashMap;
 
 use crate::world::tree::{
-    Child, NodeId, NodeKind, NodeLibrary, UNIFORM_EMPTY, UNIFORM_MIXED,
+    Child, NodeId, NodeKind, NodeLibrary, ENTITY_REPRESENTATIVE,
+    UNIFORM_EMPTY, UNIFORM_MIXED,
 };
 
 use super::types::{GpuChild, GpuNodeKind};
@@ -181,6 +182,19 @@ impl CachedTree {
             Child::Block(bt) => Some(GpuChild {
                 tag: 1, block_type: bt, _pad: 0, node_index: 0,
             }),
+            // tag=3 carries the entity GPU-buffer index in `node_index`.
+            // `block_type = ENTITY_REPRESENTATIVE` keeps the shader's
+            // empty-rep fast path from skipping the cell; `_pad` set to
+            // the full-box AABB (0..=2 min, 3..=3 max bit-packed) so any
+            // parent's content-AABB cull never silently rejects a
+            // cell that contains an entity whose bbox may span the
+            // full cell.
+            Child::EntityRef(entity_idx) => Some(GpuChild {
+                tag: 3,
+                block_type: ENTITY_REPRESENTATIVE,
+                _pad: FULL_CONTENT_AABB,
+                node_index: entity_idx,
+            }),
             Child::Node(child_id) => {
                 let (is_cart, uniform_type, representative) = {
                     let node = library.get(child_id)?;
@@ -233,6 +247,22 @@ pub fn pack_tree(library: &NodeLibrary, root: NodeId) -> PackedTree {
 pub(crate) fn pack_child_first(c: GpuChild) -> u32 {
     (c.tag as u32) | ((c.block_type as u32) << 8) | ((c._pad as u32) << 16)
 }
+
+/// Full-coverage content AABB (min=(0,0,0), max+1=(3,3,3)). Used
+/// for tag=3 (EntityRef) children where the entity's bbox fills or
+/// straddles the cell — the shader does its own ray-box test against
+/// the per-entity bbox inside `march_cartesian`'s tag==3 branch, so
+/// the parent-level AABB must not cull the descent.
+pub(crate) const FULL_CONTENT_AABB: u16 = {
+    let min_x = 0u16;
+    let min_y = 0u16;
+    let min_z = 0u16;
+    let max_x = 2u16; // stored as max_incl; shader adds 1
+    let max_y = 2u16;
+    let max_z = 2u16;
+    (min_x) | (min_y << 2) | (min_z << 4)
+        | (max_x << 6) | (max_y << 8) | (max_z << 10)
+};
 
 /// Tight axis-aligned bounding box of the occupied slots in a 3×3×3
 /// node, packed into 12 bits. Shader uses it to cull descent before

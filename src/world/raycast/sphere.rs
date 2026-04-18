@@ -206,7 +206,10 @@ pub(super) fn walk_face_subtree_with_path(
         let slot = slot_index(us, vs, rs);
         path.push((node_id, slot));
         match node.children[slot] {
-            Child::Empty => {
+            Child::Empty | Child::EntityRef(_) => {
+                // CPU raycasts operate on terrain; EntityRef only
+                // lives in scene overlays. Treat as empty if
+                // somehow encountered.
                 let sub_un = un * 3.0 - us as f32;
                 let sub_vn = vn * 3.0 - vs as f32;
                 let sub_rn = rn * 3.0 - rs as f32;

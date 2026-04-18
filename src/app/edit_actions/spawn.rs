@@ -138,7 +138,7 @@ impl App {
         let subtree = self.world.library.build_uniform_subtree(block::STONE, 3);
         match subtree {
             Child::Node(id) => id,
-            Child::Block(_) | Child::Empty => {
+            Child::Block(_) | Child::Empty | Child::EntityRef(_) => {
                 // build_uniform_subtree with depth > 0 always returns a Node.
                 panic!("build_uniform_subtree(depth=3) returned a non-node");
             }

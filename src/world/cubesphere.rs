@@ -267,6 +267,9 @@ pub fn insert_spherical_body(
                 let uniform = uniform_children(Child::Block(b));
                 lib.insert_with_kind(uniform, NodeKind::CubedSphereFace { face })
             }
+            Child::EntityRef(_) => unreachable!(
+                "worldgen never emits EntityRef; only scene overlay does"
+            ),
         };
         face_root_children[face as usize] = Child::Node(face_root_id);
     }
