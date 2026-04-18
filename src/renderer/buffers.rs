@@ -191,8 +191,13 @@ pub(super) fn append_or_recreate<T: bytemuck::Pod>(
     let needed = data.len() as u64 * elem_size;
     if needed > buffer.size() {
         // Overflow: recreate with 1.5× headroom so the next several
-        // edits fit without another grow.
-        let new_size = (needed.max(1) * 3 / 2).max(elem_size);
+        // edits fit without another grow. Round UP to a multiple of
+        // `elem_size` so WebGPU's strict binding-size validation
+        // accepts the buffer (it requires storage-binding sizes to be
+        // a whole number of elements). Native Metal silently tolerates
+        // this; WebGPU does not.
+        let raw = (needed.max(1) * 3 / 2).max(elem_size);
+        let new_size = raw.div_ceil(elem_size) * elem_size;
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: new_size,

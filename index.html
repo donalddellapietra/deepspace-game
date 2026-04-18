@@ -81,6 +81,18 @@
                     bubbles: true, cancelable: true,
                 }));
             });
+
+            // Chrome rate-limits `requestPointerLock` for ~1s after a
+            // user-initiated exit. winit calls it from `lock_cursor`
+            // and the rejected Promise lands here as an unhandled
+            // rejection (red console noise). It's benign — the next
+            // click retries successfully — so swallow the noise.
+            window.addEventListener('unhandledrejection', function(e) {
+                if (e.reason && e.reason.name === 'SecurityError' &&
+                    String(e.reason.message).indexOf('Pointer lock') !== -1) {
+                    e.preventDefault();
+                }
+            });
         })();
     </script>
 </head>

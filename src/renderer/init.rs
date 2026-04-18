@@ -132,7 +132,12 @@ impl Renderer {
         // full buffer recreate + bind-group rebuild.
         let alloc_with_headroom = |device: &wgpu::Device, label: &'static str, bytes: &[u8]| -> wgpu::Buffer {
             let min = bytes.len() as u64;
-            let size = (min.max(1) * 3 / 2).max(min + 4096);
+            // Round UP to a multiple of 4: WebGPU requires storage
+            // buffer binding sizes to be a multiple of 4 (and a whole
+            // number of u32s for our u32-typed buffers). Metal is
+            // looser and silently rounded.
+            let raw = (min.max(1) * 3 / 2).max(min + 4096);
+            let size = raw.div_ceil(4) * 4;
             let b = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size,
