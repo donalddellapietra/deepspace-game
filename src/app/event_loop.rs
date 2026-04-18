@@ -150,13 +150,10 @@ impl App {
                     let dpr = web_window.device_pixel_ratio();
                     let phys_w = (css_w * dpr) as u32;
                     let phys_h = (css_h * dpr) as u32;
-                    // Set the canvas backing store directly — winit's
-                    // request_inner_size doesn't take effect until the
-                    // next event tick on web, but wgpu reads the size
-                    // synchronously when creating the surface.
                     canvas.set_width(phys_w);
                     canvas.set_height(phys_h);
                     let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(phys_w, phys_h));
+                    log::info!("wasm: canvas {phys_w}x{phys_h} (css {css_w}x{css_h} dpr={dpr})");
                 }
             }
         }
@@ -365,8 +362,36 @@ impl App {
     fn handle_redraw_inner(&mut self) {
         let frame_start = web_time::Instant::now();
         let overlay_start = frame_start;
+
+        // wry/WKWebView pumping is native-only.
         #[cfg(not(target_arch = "wasm32"))]
         if self.overlay_enabled() {
+            self.try_create_webview();
+            self.inject_webview_input();
+        }
+
+        // Drain UI commands from the React overlay on both platforms.
+        // Native: queued by wry IPC. WASM: queued in JS, polled via
+        // `window.__pollUiCommands`.
+        let pump_ui = {
+            #[cfg(not(target_arch = "wasm32"))]
+            { self.overlay_enabled() }
+            #[cfg(target_arch = "wasm32")]
+            { true }
+        };
+        if pump_ui {
+            self.poll_ui_commands();
+        }
+
+        // State push works on both platforms — native flushes via
+        // wry::WebView::evaluate_script, WASM calls window.__onGameState.
+        let push_overlay_state = {
+            #[cfg(not(target_arch = "wasm32"))]
+            { self.overlay_enabled() }
+            #[cfg(target_arch = "wasm32")]
+            { true }
+        };
+        if push_overlay_state {
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Sphere(sphere) => {
                     self.camera.position.in_frame(&sphere.body_path)
@@ -375,9 +400,6 @@ impl App {
                     self.camera.position.in_frame(&self.active_frame.render_path)
                 }
             };
-            self.try_create_webview();
-            self.inject_webview_input();
-            self.poll_ui_commands();
             self.ui.push_to_overlay(&self.palette);
             crate::overlay::push_state(&crate::bridge::GameStateUpdate::DebugOverlay(
                 crate::bridge::DebugOverlayStateJs {
@@ -398,12 +420,14 @@ impl App {
                     node_count: self.world.library.len(),
                 },
             ));
+        }
+
+        // Wry batch flush is native-only; WASM push_state is direct.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.overlay_enabled() {
             self.flush_overlay();
         }
-        #[cfg(not(target_arch = "wasm32"))]
         let overlay_elapsed = overlay_start.elapsed();
-        #[cfg(target_arch = "wasm32")]
-        let overlay_elapsed = web_time::Duration::ZERO;
 
         let now = frame_start;
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);

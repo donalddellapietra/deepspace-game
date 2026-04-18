@@ -50,15 +50,6 @@ impl App {
         }
     }
 
-    pub(super) fn poll_ui_commands(&mut self) {
-        for cmd in overlay::poll_commands() {
-            let panel_changed = self.ui.handle_command(cmd);
-            if panel_changed {
-                self.sync_cursor_to_panels();
-            }
-        }
-    }
-
     pub(super) fn flush_overlay(&self) {
         if let Some(ref wv) = self.webview {
             overlay::flush_to_webview(wv);

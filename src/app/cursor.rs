@@ -40,4 +40,17 @@ impl App {
             self.lock_cursor();
         }
     }
+
+    /// Drain UI commands from the overlay (WebView IPC on native,
+    /// `window.__pollUiCommands` on WASM) and dispatch them to the
+    /// game UI state. Panels that toggle as a result re-sync the
+    /// cursor lock.
+    pub(super) fn poll_ui_commands(&mut self) {
+        for cmd in crate::overlay::poll_commands() {
+            let panel_changed = self.ui.handle_command(cmd);
+            if panel_changed {
+                self.sync_cursor_to_panels();
+            }
+        }
+    }
 }
