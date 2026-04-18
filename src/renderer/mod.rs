@@ -121,6 +121,13 @@ pub struct Renderer {
     pub(super) last_ribbon_write_ms: f64,
     pub(super) last_tree_write_ms: f64,
     pub(super) last_bind_group_rebuild_ms: f64,
+    /// Last live-surface render sub-phase timings (ms). Populated by
+    /// `render()` so slow-frame diagnostics can pinpoint whether
+    /// cost is in encode, submit, CPU wait for GPU, or GPU pass.
+    pub(super) last_render_encode_ms: f64,
+    pub(super) last_render_submit_ms: f64,
+    pub(super) last_render_wait_ms: f64,
+    pub(super) last_gpu_pass_ms: f64,
     /// Shader-side atomic counters written by the fragment shader
     /// each frame (ray_count, hit_count, miss_count, max_iter_count,
     /// sum_steps_div4, max_steps, + 2 u32 pad). 32 bytes total.

@@ -105,6 +105,11 @@ pub struct App {
     pub(super) debug_overlay_visible: bool,
     pub(super) fps_smooth: f64,
     pub(super) startup_profile_frames: u32,
+    /// Counter for the "log the N frames after a slow frame" tail
+    /// used by the live event loop's `frame_breakdown` diagnostic.
+    /// Lets us see whether an edit-frame spike recovers immediately
+    /// or persists for several frames.
+    pub(super) slow_frame_tail: u32,
     /// Path from `world.root` to the planet's body node. Used for
     /// spawn-position derivation and for camera-local sphere focus
     /// (`edit_actions::zoom::camera_local_sphere_focus_path`).
@@ -312,6 +317,7 @@ impl App {
             debug_overlay_visible: false,
             fps_smooth: 0.0,
             startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
+            slow_frame_tail: 0,
             planet_path: bootstrap.planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
