@@ -1,13 +1,18 @@
-//! Test-entity spawning. Bound to `N` (10 entities) and `M` (1000)
-//! in debug keybinds. Used to smoke-test the entity render + edit
-//! pipeline at small and larger entity counts.
+//! Test-entity spawning. Bound to `N` (10) and `M` (1000) stone
+//! cubes in debug keybinds. Also the entry point for
+//! `--spawn-entity PATH` init-time spawning used by the entity
+//! visibility test suite.
 //!
 //! Spawns entities at the camera's anchor cell stepped forward in
-//! -Z, each in its own cell so they don't overlap. Content is a
-//! uniform-stone subtree — same NodeId reused across every spawn,
-//! so 1000 entities → 1 shared packed subtree in the GPU tree
-//! buffer (content-addressed dedup proving itself).
+//! -Z, each in its own cell so they don't overlap. Content for the
+//! keybind path is a uniform-stone subtree — same NodeId reused
+//! across every spawn, so 1000 entities → 1 shared packed subtree.
+//! The `--spawn-entity` path loads a `.vox` file and uses its
+//! built tree as the shared NodeId instead.
 
+use std::path::Path as FsPath;
+
+use crate::import;
 use crate::world::palette::block;
 use crate::world::tree::{Child, NodeId};
 
@@ -23,16 +28,58 @@ impl App {
             return;
         }
         let subtree_id = self.get_or_build_stone_cube_subtree();
-        let cam_anchor = self.camera.position.anchor;
+        self.spawn_grid(subtree_id, n);
+        // Trigger an upload so the new entities show up on the next frame.
+        self.upload_tree();
+    }
 
-        // Start one cell forward of the camera, then march further.
-        // Step forward (-Z) by 1 cell; subsequent entities step +X
-        // along the row.
+    /// Init-time entity spawn driven by `--spawn-entity PATH`.
+    /// Loads the `.vox` file, builds it into a library subtree, then
+    /// spawns `count` copies in a row in front of the camera, each in
+    /// its own anchor cell so they don't overlap.
+    ///
+    /// Palette entries registered by the vox loader are picked up on
+    /// the next palette upload — see `run_render_harness` which calls
+    /// `update_palette` after App construction.
+    pub fn spawn_vox_entity_at_init(&mut self, path: &FsPath, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let model = match import::load(path, &mut self.palette) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "spawn_entity: load {} failed: {}",
+                    path.display(), e,
+                );
+                return;
+            }
+        };
+        eprintln!(
+            "spawn_entity: loaded {} ({}x{}x{} voxels, count={})",
+            path.display(), model.size_x, model.size_y, model.size_z, count,
+        );
+        let subtree_root = import::tree_builder::build_tree(
+            &model, &mut self.world.library,
+        );
+        self.spawn_grid(subtree_root, count);
+        eprintln!(
+            "spawn_entity: spawned {} entities subtree_node={} base_depth={}",
+            count, subtree_root, self.camera.position.anchor.depth(),
+        );
+        // Don't call upload_tree here — the first frame's
+        // upload_tree_lod picks up the entities through the normal
+        // path. Calling it before the renderer is ready is a no-op
+        // anyway.
+    }
+
+    /// Shared grid layout: `n` entities starting one cell in front of
+    /// the camera, filling +X then +Y then +Z. 9x9x... grid.
+    fn spawn_grid(&mut self, subtree_id: NodeId, n: u32) {
+        let cam_anchor = self.camera.position.anchor;
         let mut base = cam_anchor;
         base.step_neighbor_cartesian(2, -1);
 
-        // For counts >9 we split into a simple grid: row of min(n, 9)
-        // entities along +X, then next row +Y, wrapping +Z.
         let row_len = 9u32;
         let grid_len = 81u32;
 
@@ -42,9 +89,6 @@ impl App {
             let col = i % row_len;
             let stack = i / grid_len;
             let mut anchor = base;
-            // Row positions extend beyond a single cell in X by
-            // calling step_neighbor_cartesian repeatedly — cheap
-            // because it's slot arithmetic.
             for _ in 0..col {
                 anchor.step_neighbor_cartesian(0, 1);
             }
@@ -61,8 +105,6 @@ impl App {
             "spawned {} entities ({} -> {}) subtree_id={} cam_depth={}",
             n, before, after, subtree_id, cam_anchor.depth(),
         );
-        // Trigger an upload so the new entities show up on the next frame.
-        self.upload_tree();
     }
 
     /// Return the cached canonical stone-cube NodeId. Builds it on
@@ -84,4 +126,3 @@ impl App {
         }
     }
 }
-

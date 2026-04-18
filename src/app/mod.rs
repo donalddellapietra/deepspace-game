@@ -343,7 +343,12 @@ impl App {
             spawn_yaw, spawn_pitch,
         );
 
-        Self {
+        // Pull out fields that are used AFTER `from_config(test_cfg)`
+        // consumes the config, since that call moves the struct.
+        let spawn_entity_path = test_cfg.spawn_entity.clone();
+        let spawn_entity_count = test_cfg.spawn_entity_count;
+
+        let mut app = Self {
             window: None,
             renderer: None,
             camera: Camera {
@@ -408,7 +413,12 @@ impl App {
             proxy,
             renderer_init_started: false,
             pending_init: None,
+        };
+        if let Some(ref path) = spawn_entity_path {
+            let count = spawn_entity_count.max(1);
+            app.spawn_vox_entity_at_init(path, count);
         }
+        app
     }
 
     #[inline]

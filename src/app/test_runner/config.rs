@@ -95,6 +95,18 @@ pub struct TestConfig {
     /// discussion in this session's chat log.
     pub taa: bool,
     pub script: Vec<ScriptCmd>,
+    /// Load a `.vox` or `.vxs` file as a visual entity and spawn it
+    /// one cell in front of the camera at startup. Used by the
+    /// entity-visibility test suite to place a known-shape entity
+    /// deterministically without scripted interaction.
+    ///
+    /// When set with `count > 1`, spawns a grid of N copies sharing
+    /// the same library subtree — content-addressed dedup means the
+    /// cost of rendering 1000 identical entities is ~the cost of 1.
+    pub spawn_entity: Option<std::path::PathBuf>,
+    /// Number of copies of `spawn_entity` to place. Defaults to 1;
+    /// higher values arrange them in a grid in front of the camera.
+    pub spawn_entity_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +234,19 @@ impl TestConfig {
                 "--spawn-yaw" => { cfg.spawn_yaw = args.next().and_then(|v| v.parse().ok()); }
                 "--spawn-pitch" => { cfg.spawn_pitch = args.next().and_then(|v| v.parse().ok()); }
                 "--screenshot" => { cfg.screenshot = args.next(); }
+                "--spawn-entity" => {
+                    if let Some(p) = args.next() {
+                        cfg.spawn_entity = Some(std::path::PathBuf::from(p));
+                        if cfg.spawn_entity_count == 0 {
+                            cfg.spawn_entity_count = 1;
+                        }
+                    }
+                }
+                "--spawn-entity-count" => {
+                    cfg.spawn_entity_count = args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                }
                 "--exit-after-frames" => {
                     cfg.exit_after_frames = args.next().and_then(|v| v.parse().ok());
                 }
