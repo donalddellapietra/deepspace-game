@@ -173,6 +173,9 @@ impl TestConfig {
                 "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }
                 "--jerusalem-cross-world" => { cfg.world_preset = WorldPreset::JerusalemCross; }
                 "--sierpinski-pyramid-world" => { cfg.world_preset = WorldPreset::SierpinskiPyramid; }
+                "--mausoleum-world" => { cfg.world_preset = WorldPreset::Mausoleum; }
+                "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
+                "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
                 "--vox-model" => {
                     if let Some(path_str) = args.next() {
                         // Interior depth may be set before or after this

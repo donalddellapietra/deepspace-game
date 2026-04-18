@@ -47,7 +47,10 @@
 //! representation.
 
 pub mod cantor_dust;
+pub mod edge_scaffold;
+pub mod hollow_cube;
 pub mod jerusalem_cross;
+pub mod mausoleum;
 pub mod menger;
 pub mod sierpinski_pyramid;
 pub mod sierpinski_tet;

@@ -39,6 +39,17 @@ pub enum WorldPreset {
     /// Stepped Sierpinski pyramid — 4 base corners + 1 apex per
     /// level. Ziggurat-like self-similarity with a distinct "up" axis.
     SierpinskiPyramid,
+    /// Mausoleum — Menger geometry with authentic PySpace orbit-trap
+    /// ochre palette. Structurally equivalent to [`Menger`] but
+    /// painted with `OrbitMax((0.42, 0.38, 0.19))` derived RGB
+    /// instead of the hybrid bronze+blue.
+    Mausoleum,
+    /// Edge scaffold — 12 edge-midpoint rods per level. Neon axial
+    /// palette (cyan/magenta/yellow per orientation).
+    EdgeScaffold,
+    /// Hollow cube — 18-cell architectural shell (12 edges + 6
+    /// faces, no corners or body). Brushed-steel + brass palette.
+    HollowCube,
     /// Imported `.vox` model placed inside a plain world. Uses the
     /// GLB→vox→tree pipeline (see `src/import/` and
     /// `tools/glb_to_vox.py`). The model is planted at the center
@@ -106,6 +117,21 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         }
         WorldPreset::SierpinskiPyramid => {
             crate::world::fractals::sierpinski_pyramid::bootstrap_sierpinski_pyramid_world(
+                plain_layers.unwrap_or(20),
+            )
+        }
+        WorldPreset::Mausoleum => {
+            crate::world::fractals::mausoleum::bootstrap_mausoleum_world(
+                plain_layers.unwrap_or(20),
+            )
+        }
+        WorldPreset::EdgeScaffold => {
+            crate::world::fractals::edge_scaffold::bootstrap_edge_scaffold_world(
+                plain_layers.unwrap_or(20),
+            )
+        }
+        WorldPreset::HollowCube => {
+            crate::world::fractals::hollow_cube::bootstrap_hollow_cube_world(
                 plain_layers.unwrap_or(20),
             )
         }

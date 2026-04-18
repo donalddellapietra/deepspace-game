@@ -45,6 +45,9 @@ FRACTALS=(
   cantor-dust
   jerusalem-cross
   sierpinski-pyramid
+  mausoleum
+  edge-scaffold
+  hollow-cube
 )
 
 mkdir -p "$OUT_DIR"

@@ -70,9 +70,13 @@ pub(crate) fn bootstrap_jerusalem_cross_world(depth: u8) -> WorldBootstrap {
     let depth = depth.min(MAX_DEPTH as u8);
 
     let mut registry = ColorRegistry::new();
-    // Mausoleum orbit-trap palette: warm gold nucleus + darker ochre rods.
-    let nucleus = registry.register(220, 180, 75, 255).unwrap();
-    let rod = registry.register(140, 105, 48, 255).unwrap();
+    // Mausoleum orbit-trap palette, authentic PySpace RGB:
+    //   `OrbitMax((0.42, 0.38, 0.19))` × 1.0 → (107, 97, 48) rod
+    //                                    × 1.75 → (178, 161, 81) highlight
+    // Nucleus uses the highlight tone so the single-cell core pops
+    // against the 6-rod scaffold at every recursion level.
+    let nucleus = registry.register(178, 161, 81, 255).unwrap();
+    let rod = registry.register(107, 97, 48, 255).unwrap();
 
     let world = jerusalem_cross_world(depth, nucleus, rod);
 
