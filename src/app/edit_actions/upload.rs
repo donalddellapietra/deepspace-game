@@ -1,10 +1,10 @@
-//! GPU upload: pack the world tree and build the ancestor ribbon,
-//! then push both (plus the per-frame uniforms) to the renderer.
+//! GPU upload: keep the cached packed tree in sync with `world.root`
+//! and push per-frame uniforms (camera, ribbon) to the renderer.
 //!
-//! The pack is a pure function of `(library, root)`. LOD lives in
-//! the shader; pure camera motion never repacks. An edit (which
-//! changes `world.root`) is the only thing that invalidates the
-//! buffer.
+//! The packed tree is content-addressed: `CachedTree::update_root`
+//! emits (or reuses) nodes keyed by `NodeId`. Initial pack and edit
+//! path go through the same function — the edit case is fast because
+//! every sibling of the edit path is already in the cache.
 
 use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
@@ -18,59 +18,64 @@ impl App {
         self.upload_tree_lod();
     }
 
-    /// Pack the world tree (content-only, no LOD) and push it to the
-    /// GPU along with the ancestor ribbon. Camera uniforms refresh
-    /// every frame; the packed tree only re-uploads when `root` or a
-    /// view-structural field changes (render_path, logical_path,
-    /// visual_depth, kind_tag).
     pub(in crate::app) fn upload_tree_lod(&mut self) {
         let intended_frame = self.target_render_frame();
         let effective_visual_depth = self.visual_depth();
         let upload_key = LodUploadKey::new(self.world.root);
-        let mut pack_elapsed = std::time::Duration::ZERO;
-        let mut ribbon_elapsed = std::time::Duration::ZERO;
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
         self.last_effective_visual_depth = effective_visual_depth;
         self.last_reused_gpu_tree = reused_gpu_tree;
 
-        // The tree buffer only depends on (library, root). Everything
-        // else — camera, render frame, ribbon — is recomputed every
-        // frame and uploaded cheaply. Pack runs when root changes.
+        let mut pack_elapsed = std::time::Duration::ZERO;
         if !reused_gpu_tree {
             let pack_start = std::time::Instant::now();
-            let (tree_packed, node_kinds, node_offsets, _world_root_idx) =
-                gpu::pack_tree(&self.world.library, self.world.root);
+
+            // Initial pack: cache is empty; emit the full tree.
+            // Edit path: cache has every unchanged NodeId; emit only
+            // the N+1 new edit-path ancestors.
+            let cache = self.cached_tree.get_or_insert_with(gpu::CachedTree::new);
+            let len_before = cache.tree.len();
+            cache.update_root(&self.world.library, self.world.root);
             pack_elapsed = pack_start.elapsed();
-            let packed_node_count = node_kinds.len();
-            self.last_packed_node_count = packed_node_count as u32;
+            let appended_u32s = cache.tree.len().saturating_sub(len_before);
+            self.last_packed_node_count = cache.node_offsets.len() as u32;
 
             if let Some(renderer) = &mut self.renderer {
-                renderer.update_tree(&tree_packed, &node_kinds, &node_offsets, 0);
+                renderer.update_tree(
+                    &cache.tree,
+                    &cache.node_kinds,
+                    &cache.node_offsets,
+                    cache.root_bfs_idx,
+                );
             }
             self.last_lod_upload_key = Some(upload_key);
-            self.cached_tree = Some(CachedTree { tree: tree_packed, node_offsets });
 
             if self.render_harness {
                 eprintln!(
-                    "render_harness_pack kind={:?} packed_nodes={} library_nodes={}",
+                    "render_harness_pack kind={:?} packed_nodes={} library_nodes={} appended_u32s={} pack_ms={:.3}",
                     intended_frame.kind,
-                    packed_node_count,
+                    self.last_packed_node_count,
                     self.world.library.len(),
+                    appended_u32s,
+                    pack_elapsed.as_secs_f64() * 1000.0,
                 );
             }
         }
 
-        // Ribbon depends on (packed tree, render_path). Pure camera
-        // motion can change render_path, so rebuild each frame using
-        // the cached tree buffer. It's a short walk (≤ render depth).
+        // Ribbon rebuilds every frame against the cached tree.
+        // render_path-depth walk — effectively free.
         let ribbon_start = std::time::Instant::now();
-        let cached = self.cached_tree.as_ref().expect("cached_tree populated above");
+        let cache = self
+            .cached_tree
+            .as_ref()
+            .expect("cached_tree populated on first upload_tree_lod");
         let r = gpu::build_ribbon(
-            &cached.tree,
-            &cached.node_offsets,
+            &cache.tree,
+            &cache.node_offsets,
+            cache.root_bfs_idx,
             intended_frame.render_path.as_slice(),
         );
-        ribbon_elapsed = ribbon_start.elapsed();
+        let ribbon_elapsed = ribbon_start.elapsed();
         self.last_ribbon_len = r.ribbon.len() as u32;
         let effective_path = frame::frame_from_slots(&r.reached_slots);
         let effective_render = frame::compute_render_frame(
@@ -125,12 +130,4 @@ impl App {
             );
         }
     }
-}
-
-/// Cached packed tree so the per-frame ribbon walk has something to
-/// traverse without re-packing. Populated on every real pack; lives
-/// as long as the current LOD upload key.
-pub(crate) struct CachedTree {
-    pub tree: Vec<u32>,
-    pub node_offsets: Vec<u32>,
 }

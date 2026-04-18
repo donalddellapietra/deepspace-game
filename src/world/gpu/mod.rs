@@ -34,6 +34,6 @@ mod pack;
 mod ribbon;
 mod types;
 
-pub use pack::pack_tree;
+pub use pack::{pack_tree, CachedTree};
 pub use ribbon::{build_ribbon, GpuRibbonEntry};
 pub use types::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette};

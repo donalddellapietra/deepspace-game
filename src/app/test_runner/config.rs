@@ -124,6 +124,13 @@ pub enum ScriptCmd {
     /// Used by perf repros that need to exercise the smooth-motion
     /// LOD/pack path without full player physics.
     Step { axis: u8, delta: f32 },
+    /// Cast a ray straight down from the camera through the full
+    /// tree depth and reposition the camera a couple anchor cells
+    /// above whatever it hits. Bypasses the normal interaction
+    /// radius cap — used by perf repros that need to land the
+    /// camera on top of terrain regardless of spawn location.
+    /// Following breaks/places then see real hits.
+    FlyToSurface,
     /// Teleport the camera to the horizontal center of the cell
     /// affected by the most recent break/place, positioned inside the
     /// bottom child of that cell at the current anchor depth.
@@ -347,6 +354,9 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             }
             if let Some(label) = raw.strip_prefix("emit:") {
                 return Some(ScriptCmd::Emit(label.to_string()));
+            }
+            if raw == "fly_to_surface" {
+                return Some(ScriptCmd::FlyToSurface);
             }
             if let Some(rest) = raw.strip_prefix("step:") {
                 // "step:x+", "step:y-", "step:z+:0.25"

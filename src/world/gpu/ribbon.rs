@@ -78,24 +78,29 @@ pub struct RibbonResult {
     pub reached_slots: Vec<u8>,
 }
 
-/// Walk the interleaved GPU buffer from the root (BFS idx 0) along
+/// Walk the interleaved GPU buffer from `world_root_bfs` along
 /// `frame_slots`, following Node-tagged children. Returns the frame
 /// root's BFS index, the pop-ordered ribbon, and the slot prefix
 /// that the walker actually reached (which may be shorter than
-/// `frame_slots` when the pack LOD-flattened a Cartesian sibling at
+/// `frame_slots` when pack uniform-flattened a Cartesian sibling at
 /// some depth).
 ///
-/// Empty `frame_slots` ⇒ `frame_root_idx = 0`, empty ribbon,
-/// empty `reached_slots`.
+/// The world root used to be at BFS idx 0; with the recursive
+/// memoized pack it's the last-appended entry (post-order DFS
+/// emission), so callers pass it explicitly.
+///
+/// Empty `frame_slots` ⇒ `frame_root_idx = world_root_bfs`, empty
+/// ribbon, empty `reached_slots`.
 pub fn build_ribbon(
     tree: &[u32],
     node_offsets: &[u32],
+    world_root_bfs: u32,
     frame_slots: &[u8],
 ) -> RibbonResult {
     let mut walk: Vec<u32> = Vec::with_capacity(frame_slots.len() + 1);
-    walk.push(0);
+    walk.push(world_root_bfs);
     let mut reached_slots: Vec<u8> = Vec::with_capacity(frame_slots.len());
-    let mut current = 0u32;
+    let mut current = world_root_bfs;
     for &slot in frame_slots {
         let Some(entry) = sparse_child(tree, node_offsets, current, slot) else { break };
         if entry.tag != 2 { break; }
@@ -214,7 +219,7 @@ mod tests {
     fn empty_path_gives_empty_ribbon() {
         let (tree, offsets) = one_node_tree();
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, &[]);
+            build_ribbon(&tree, &offsets, 0, &[]);
         assert_eq!(frame_root_idx, 0);
         assert!(ribbon.is_empty());
     }
@@ -223,7 +228,7 @@ mod tests {
     fn single_step() {
         let (tree, offsets) = two_node_tree(13);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, &[13]);
+            build_ribbon(&tree, &offsets, 0, &[13]);
         assert_eq!(frame_root_idx, 1);
         assert_eq!(ribbon.len(), 1);
         assert_eq!(ribbon[0].node_idx, 0);
@@ -238,7 +243,7 @@ mod tests {
         // Walker stops at frame=1.
         let (tree, offsets) = two_node_tree(13);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, &[13, 5]);
+            build_ribbon(&tree, &offsets, 0, &[13, 5]);
         assert_eq!(frame_root_idx, 1);
         assert_eq!(ribbon.len(), 1);
     }
@@ -261,7 +266,7 @@ mod tests {
         let offsets = vec![0u32, 4, 8];
 
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, &[16, 8]);
+            build_ribbon(&tree, &offsets, 0, &[16, 8]);
         assert_eq!(frame_root_idx, 2);
         assert_eq!(ribbon.len(), 2);
         // Pop order: ribbon[0] = direct parent (idx 1, from slot 8);
@@ -281,7 +286,7 @@ mod tests {
         tree.extend_from_slice(&[encode_packed(2, 0), 999]);
         let offsets = vec![0u32];
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, &[5, 5]);
+            build_ribbon(&tree, &offsets, 0, &[5, 5]);
         assert_eq!(frame_root_idx, 999);
         assert_eq!(ribbon.len(), 1);
     }
@@ -308,23 +313,23 @@ mod tests {
     #[test]
     fn ribbon_for_path_into_body_in_planet_world() {
         let world = planet_world();
-        let (tree, _kinds, offsets, _root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, offsets, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, &[13]);
-        assert!(frame_root_idx > 0, "body packed at non-zero BFS idx");
+            build_ribbon(&tree, &offsets, root_idx, &[13]);
+        assert_ne!(frame_root_idx, root_idx, "body packed at a different BFS idx");
         assert_eq!(ribbon.len(), 1);
-        assert_eq!(ribbon[0].node_idx, 0, "world root at BFS idx 0");
+        assert_eq!(ribbon[0].node_idx, root_idx, "first pop is the world root");
         assert_eq!(ribbon[0].slot(), 13);
     }
 
     #[test]
     fn reached_slots_truncated_when_pack_flattens_sibling() {
         let world = planet_world();
-        let (tree, _kinds, offsets, _root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, offsets, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         // Slot 16 is uniform-empty Cartesian → absent from pack.
         // Descent into [16, 13] stops at depth 0.
-        let r = build_ribbon(&tree, &offsets, &[16, 13]);
-        assert_eq!(r.frame_root_idx, 0, "stayed at world root");
+        let r = build_ribbon(&tree, &offsets, root_idx, &[16, 13]);
+        assert_eq!(r.frame_root_idx, root_idx, "stayed at world root");
         assert!(r.ribbon.is_empty());
         assert!(r.reached_slots.is_empty(),
             "no slot reachable past flattened sibling");
@@ -333,10 +338,10 @@ mod tests {
     #[test]
     fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
         let world = planet_world();
-        let (tree, _kinds, offsets, _root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, offsets, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, &[]);
-        assert_eq!(frame_root_idx, 0);
+            build_ribbon(&tree, &offsets, root_idx, &[]);
+        assert_eq!(frame_root_idx, root_idx);
         assert!(ribbon.is_empty());
     }
 }

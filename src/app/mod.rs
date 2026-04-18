@@ -121,10 +121,9 @@ pub struct App {
     /// unchanged, the tree buffer is reusable — only the per-frame
     /// ribbon + camera uniforms rebuild.
     pub(super) last_lod_upload_key: Option<LodUploadKey>,
-    /// Packed tree + BFS-offsets retained on CPU so the per-frame
-    /// ribbon build doesn't need to re-pack. Refreshed alongside
-    /// `last_lod_upload_key`.
-    pub(super) cached_tree: Option<crate::app::edit_actions::upload::CachedTree>,
+    /// Packed GPU tree state. Updated by `CachedTree::update_root`
+    /// on edits — same function handles initial pack and edits.
+    pub(super) cached_tree: Option<crate::world::gpu::CachedTree>,
     /// Deterministic renderer harness mode from the old deep-layers
     /// branch. Bypasses the native overlay/event-loop path so we can
     /// isolate renderer regressions from WKWebView issues.
