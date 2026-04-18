@@ -94,21 +94,6 @@ pub struct Renderer {
     pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
     pub(super) offscreen_texture: Option<wgpu::Texture>,
-    /// Integer downscale divisor for the ray-march pass. 1 = render
-    /// at full `config.{width,height}`; 2 = render at half per-axis
-    /// (quarter pixel count) into `ray_march_target` and blit up to
-    /// the destination with a bilinear sampler. The ray-march cost
-    /// drops linearly in pixel count; the blit is a single cheap
-    /// fullscreen sample pass.
-    pub(super) render_scale: u32,
-    /// Scaled-size intermediate target for the ray-march pass, used
-    /// when `render_scale > 1`. Sampled by the blit pipeline on
-    /// upscale. `None` when `render_scale == 1` — the ray-march
-    /// writes directly to the destination in that case.
-    pub(super) ray_march_target: Option<wgpu::Texture>,
-    pub(super) blit_pipeline: wgpu::RenderPipeline,
-    pub(super) blit_bind_group_layout: wgpu::BindGroupLayout,
-    pub(super) blit_sampler: wgpu::Sampler,
     /// Optional GPU timestamp-query scaffolding. Present only when
     /// the adapter reports `Features::TIMESTAMP_QUERY`. Used by
     /// `render_offscreen` to measure the ray-march pass on the GPU
@@ -227,18 +212,6 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.offscreen_texture = None;
-        self.ray_march_target = None;
         self.write_uniforms();
-    }
-
-    /// Logical (ray-marched) render size after applying `render_scale`.
-    /// Both axes are clamped to a 1-pixel floor so a degenerate
-    /// `config` doesn't produce a zero-sized texture.
-    pub(super) fn scaled_size(&self) -> (u32, u32) {
-        let scale = self.render_scale.max(1);
-        (
-            (self.config.width / scale).max(1),
-            (self.config.height / scale).max(1),
-        )
     }
 }

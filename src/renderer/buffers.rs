@@ -138,12 +138,11 @@ impl Renderer {
     }
 
     pub(super) fn write_uniforms(&self) {
-        let (sw, sh) = self.scaled_size();
         let uniforms = GpuUniforms {
             root_index: self.root_index,
             node_count: self.node_count,
-            screen_width: sw as f32,
-            screen_height: sh as f32,
+            screen_width: self.config.width as f32,
+            screen_height: self.config.height as f32,
             max_depth: self.max_depth,
             highlight_active: self.highlight_active,
             root_kind: self.root_kind,

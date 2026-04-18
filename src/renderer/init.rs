@@ -22,7 +22,6 @@ impl Renderer {
         lod_pixel_threshold: f32,
         lod_base_depth: u32,
         live_sample_every_frames: u32,
-        render_scale: u32,
     ) -> Self {
         let size = window.inner_size();
 
@@ -338,80 +337,6 @@ impl Renderer {
             cache: None,
         });
 
-        // Blit pipeline for Speedup A: reads the scaled-down
-        // ray-march target and writes the upscaled result to the
-        // destination attachment. Bilinear sampler handles the
-        // upscale in hardware. Kept in its own layout/pipeline
-        // because it takes a texture+sampler, whereas the ray-march
-        // pipeline takes only storage/uniform buffers.
-        let blit_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("blit"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    }, count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("blit"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(
-                crate::shader_compose::compose("blit.wgsl").into()
-            ),
-        });
-        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("blit"),
-            bind_group_layouts: &[&blit_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blit"),
-            layout: Some(&blit_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &blit_shader,
-                entry_point: Some("vs_blit"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_shader,
-                entry_point: Some("fs_blit"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
         let timestamp = if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("ray_march_timestamps"),
@@ -458,11 +383,6 @@ impl Renderer {
             root_face_pop_pos: [0.0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
-            render_scale: render_scale.max(1),
-            ray_march_target: None,
-            blit_pipeline,
-            blit_bind_group_layout,
-            blit_sampler,
             timestamp,
             last_camera_write_ms: 0.0,
             last_ribbon_write_ms: 0.0,
