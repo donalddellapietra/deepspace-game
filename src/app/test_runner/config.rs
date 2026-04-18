@@ -146,6 +146,15 @@ pub enum ScriptCmd {
     /// the camera to "one layer-N cell above the new ground" (where N
     /// is the current UI layer), matching the descent flow.
     TeleportAboveLastEdit,
+    /// Re-invoke the `--spawn-on-surface` dispatch for the current
+    /// anchor_depth. Sphere-world only (plain world uses
+    /// `TeleportAboveLastEdit`). Face subtrees interpret slot indices
+    /// as `(u, v, r)` while `WorldPos` arithmetic is Cartesian, so
+    /// `TeleportAboveLastEdit`'s `slot_index(1,0,1)` descent drifts
+    /// horizontally across the face instead of radially into the
+    /// sphere. This command bypasses that: it recomputes the
+    /// path-based surface spawn for the new depth.
+    RespawnOnSurface,
 }
 
 impl TestConfig {
@@ -344,6 +353,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
+            if raw == "respawn_on_surface" { return Some(ScriptCmd::RespawnOnSurface); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }

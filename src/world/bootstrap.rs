@@ -624,11 +624,12 @@ pub fn demo_sphere_surface_spawn(anchor_depth: u8) -> WorldPos {
     }
 
     // Offset 0.95 in y puts the camera near the top of the terminal
-    // cell (which contains y=0.80 by construction). At shallow
-    // depth the cell is large and the camera sits well above the
-    // SDF boundary; at deep depth the cell shrinks and the camera
-    // tracks the boundary precisely — path arithmetic keeps the
-    // `WorldPos` exact regardless of how small the terminal cell is.
+    // cell (which contains y=0.80 by construction). At shallow depth
+    // the cell is large and the camera sits well above the SDF
+    // boundary; at deep depth the cell shrinks and the camera tracks
+    // the boundary precisely — which lets each `respawn_on_surface`
+    // naturally sink INTO the previously-broken cell's air, keeping
+    // the next probe within the sphere interaction-reach floor.
     WorldPos::new(path, [0.5, 0.95, 0.5])
 }
 

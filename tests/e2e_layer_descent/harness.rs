@@ -99,6 +99,14 @@ impl ScriptBuilder {
         self
     }
 
+    /// Sphere-only. Re-invokes `--spawn-on-surface` dispatch
+    /// (`demo_sphere_surface_spawn`) for the current `anchor_depth`.
+    /// See `ScriptCmd::RespawnOnSurface` for the rationale.
+    pub fn respawn_on_surface(mut self) -> Self {
+        self.parts.push("respawn_on_surface".to_string());
+        self
+    }
+
     /// Shorthand for `pitch:-1.5707` (straight down, world frame).
     pub fn look_down(self) -> Self {
         self.pitch(-std::f32::consts::FRAC_PI_2)

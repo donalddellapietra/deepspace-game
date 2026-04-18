@@ -126,6 +126,7 @@ impl App {
             ScriptCmd::ProbeDown => self.harness_probe_down(),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
             ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
+            ScriptCmd::RespawnOnSurface => self.respawn_on_surface(),
             ScriptCmd::Step { axis, delta } => {
                 let mut d = [0.0f32; 3];
                 d[axis as usize] = delta;
@@ -183,6 +184,31 @@ impl App {
     /// y≈1), which caused `from_frame_local(target_xyz, 17)` to land
     /// in the wrong (solid) cell. Walking `last_edit_slots + [slot
     /// (1,0,1)]*k` is exact at any depth.
+    /// Respawn the camera above the sphere surface at the current
+    /// `anchor_depth` via `demo_sphere_surface_spawn`. Sphere-only;
+    /// emits a warning and no-ops for plain worlds. Use after
+    /// `zoom_in:1` in descent flows: the face subtree's slot indices
+    /// are `(u, v, r)` whereas `WorldPos` arithmetic is Cartesian,
+    /// so the Cartesian `teleport_above_last_edit` drifts horizontally
+    /// across the face instead of radially into the sphere. This
+    /// respawns on the surface at the new depth so `probe_down` /
+    /// `break` find terrain at every layer.
+    pub(super) fn respawn_on_surface(&mut self) {
+        if self.planet_path.is_none() {
+            eprintln!("respawn_on_surface: world has no planet; skipping (use teleport_above_last_edit for plain worlds)");
+            return;
+        }
+        let depth = self.anchor_depth() as u8;
+        let pos = crate::world::bootstrap::demo_sphere_surface_spawn(depth);
+        self.camera.position = pos;
+        self.apply_zoom();
+        eprintln!(
+            "respawn_on_surface: anchor_depth={} path={:?}",
+            depth,
+            self.camera.position.anchor.as_slice(),
+        );
+    }
+
     pub(super) fn teleport_above_last_edit(&mut self) {
         let Some(last) = self.last_edit_slots else {
             eprintln!("teleport_above_last_edit: no last edit recorded; skipping");
