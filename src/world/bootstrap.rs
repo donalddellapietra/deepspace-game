@@ -91,18 +91,6 @@ pub struct WorldBootstrap {
     /// imported-model colors (from `.vox`/`.vxs`) survive into the
     /// render path. Always contains the builtins as a prefix.
     pub color_registry: crate::world::palette::ColorRegistry,
-    /// Whether the default spawn position lands inside solid
-    /// geometry and therefore needs `carve_air_pocket` to be called
-    /// on the tree before the camera starts rendering.
-    ///
-    /// - `true` for plain-world / imported-model presets, where the
-    ///   spawn sits on or inside surface blocks.
-    /// - `false` for fractal presets: the spawn pose is chosen to
-    ///   land in an air pocket the fractal already contains (e.g.
-    ///   Menger's depth-3 body-centre void near (2.8, 2.8, 2.8)),
-    ///   so carving would punch a visible hole in the fractal
-    ///   wall the player is supposed to be looking at.
-    pub spawn_needs_carve: bool,
 }
 
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
@@ -302,7 +290,6 @@ fn bootstrap_vox_model_world(
         default_spawn_pitch: pitch,
         plain_layers: total_depth,
         color_registry: registry,
-        spawn_needs_carve: false, // spawn is above the model in empty air
     }
 }
 
@@ -572,7 +559,6 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
         default_spawn_pitch: -1.2,
         plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),
-        spawn_needs_carve: false, // demo_sphere spawns above the planet in air
     }
 }
 
@@ -691,7 +677,6 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
         default_spawn_pitch: -0.45,
         plain_layers,
         color_registry: crate::world::palette::ColorRegistry::new(),
-        spawn_needs_carve: true, // plain_test spawns on the dirt/grass surface
     }
 }
 

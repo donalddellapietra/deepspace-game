@@ -320,7 +320,7 @@ impl App {
             }
             None => {
                 if let Some(depth) = test_cfg.spawn_depth {
-                    if bootstrap.spawn_needs_carve {
+                    if bootstrap.plain_layers > 0 {
                         // Surface-tracking spawn: follow the ground through
                         // the tree at the target depth instead of blindly
                         // deepening (which drifts away from the surface).
@@ -334,10 +334,9 @@ impl App {
                         pos
                     }
                 } else {
-                    // Only carve when the preset says the spawn lands
-                    // inside solid geometry — fractals choose their own
-                    // air-pocket spawn and would be destroyed by a carve.
-                    if bootstrap.spawn_needs_carve {
+                    // Carve the default spawn for plain worlds so the
+                    // camera starts in air, not embedded in a block.
+                    if bootstrap.plain_layers > 0 {
                         bootstrap::carve_air_pocket(&mut world, &bootstrap.default_spawn_pos.anchor, bootstrap.plain_layers);
                     }
                     bootstrap.default_spawn_pos

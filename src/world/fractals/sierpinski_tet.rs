@@ -96,7 +96,6 @@ pub(crate) fn bootstrap_sierpinski_tet_world(depth: u8) -> WorldBootstrap {
         default_spawn_pitch: -0.615,
         plain_layers: depth,
         color_registry: registry,
-        spawn_needs_carve: false,
     }
 }
 
