@@ -53,6 +53,89 @@ const HARNESS_ARGS: &[&str] = &[
 const TREE_DEPTH: u32 = 30;
 const START_ANCHOR_DEPTH: u32 = 5;
 
+/// After breaking a cell directly below the camera, tilt the pitch
+/// so the ray enters the new hole. At each tilt angle, the cursor
+/// raycast either returns no hit OR returns a hit whose reported
+/// hit_point lies **inside** the reported AABB.
+///
+/// Regression: when the body-frame sphere raycast missed (because
+/// the break carved a hole through the surface cell), the pop-loop
+/// fallback in `cpu_raycast_in_sphere_frame` re-ran the sphere
+/// raycast at root-frame — whose `t` is in world units, but the
+/// caller expected body-frame units. Downstream consumers
+/// (interaction-radius gate, highlight AABB vs. hit_point check,
+/// shader cursor glow) then compared mismatched units and the
+/// cursor highlight landed in a cell far from where the next
+/// break would edit.
+///
+/// Fix: `cpu_raycast_in_sphere_frame` now multiplies `hit.t` by
+/// `3^pops` so the returned `t` is in the caller's frame (= deepest
+/// frame = body-frame) regardless of which level of the frame chain
+/// produced the hit.
+#[test]
+fn sphere_cursor_hit_point_is_inside_aabb_after_wall_dig() {
+    let dir = tmp_dir("sphere_wall_cursor");
+    let _ = dir;
+
+    // Four tilts sweep through the cone where the ray enters the hole
+    // and then either (a) still falls within reach of a wall cell, or
+    // (b) goes past reach. Both outcomes are acceptable — the bug is
+    // "cursor says hit is here but that 'here' is outside the
+    // cell's AABB." So the assertion is per-hit, not per-tilt.
+    let tilts = [-1.3f32, -1.1, -0.9, -0.7];
+    let mut script = ScriptBuilder::new()
+        .emit("spawn")
+        .probe_cursor()
+        .break_()
+        .wait(10);
+    for (i, pitch) in tilts.iter().enumerate() {
+        script = script
+            .pitch(*pitch)
+            .wait(5)
+            .emit(&format!("tilt_{i}"))
+            .probe_cursor();
+    }
+    script = script.emit("end");
+
+    let harness_args: &[&str] = &[
+        "--render-harness",
+        "--sphere-world",
+        "--spawn-xyz", "1.5", "1.98", "1.5",
+        "--spawn-depth", "5",
+        "--spawn-pitch", "-1.5",
+        "--spawn-yaw", "0",
+        "--disable-highlight",
+        "--harness-width", "320",
+        "--harness-height", "180",
+        "--exit-after-frames", "200",
+        "--timeout-secs", "20",
+        "--interaction-radius", "36",
+    ];
+
+    let trace = run(harness_args, &script);
+
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr tail ---\n{}",
+        trace.stderr.lines().rev().take(30).collect::<Vec<_>>().join("\n"),
+    );
+
+    assert!(
+        !trace.probe_aabbs.is_empty(),
+        "expected at least one HARNESS_PROBE_AABB line; got probes={:?}",
+        trace.probes,
+    );
+    for aabb in &trace.probe_aabbs {
+        assert!(
+            aabb.inside,
+            "cursor hit_point {:?} not inside AABB ({:?} .. {:?}) for anchor {:?} — \
+             this means the highlight box would render on a different cell than the \
+             next break would edit",
+            aabb.hit_point, aabb.aabb_min, aabb.aabb_max, aabb.anchor,
+        );
+    }
+}
+
 #[test]
 fn sphere_layer_26_break_below_is_registered_three_ways() {
     let dir = tmp_dir("sphere_layer_26_break_below");

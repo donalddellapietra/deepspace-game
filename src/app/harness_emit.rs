@@ -88,6 +88,63 @@ impl App {
         }
     }
 
+    /// Cast the camera's current forward ray, emit the hit path, the
+    /// body-frame AABB computed from that path, and the body-frame hit
+    /// point (`cam_body + ray_dir * t`). If `hit_point` is outside the
+    /// AABB, the highlight-AABB computation disagrees with the raycast
+    /// itself — the visible cursor would land in a different cell
+    /// than the one the next break would edit.
+    pub(super) fn harness_probe_cursor(&mut self) {
+        use crate::app::ActiveFrameKind;
+        use crate::world::aabb;
+        let hit = self.frame_aware_raycast();
+        let Some(hit) = hit else {
+            println!(
+                "HARNESS_PROBE direction=cursor hit=false anchor=[] ui_layer={} anchor_depth={}",
+                self.zoom_level(),
+                self.anchor_depth(),
+            );
+            return;
+        };
+        let anchor_path = path_repr(&hit);
+        println!(
+            "HARNESS_PROBE direction=cursor hit=true anchor={} ui_layer={} anchor_depth={} t={:.6}",
+            anchor_path,
+            self.zoom_level(),
+            self.anchor_depth(),
+            hit.t,
+        );
+        let (aabb_min, aabb_max) = match self.active_frame.kind {
+            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, &hit),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                aabb::hit_aabb_in_frame_local(&hit, &self.active_frame.render_path)
+            }
+        };
+        let cap_frame_path = match self.active_frame.kind {
+            ActiveFrameKind::Sphere(sphere) => sphere.body_path,
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                self.active_frame.render_path
+            }
+        };
+        let cam_frame = self.camera.position.in_frame(&cap_frame_path);
+        let ray_dir = self.ray_dir_in_frame(&cap_frame_path);
+        let hit_point = [
+            cam_frame[0] + ray_dir[0] * hit.t,
+            cam_frame[1] + ray_dir[1] * hit.t,
+            cam_frame[2] + ray_dir[2] * hit.t,
+        ];
+        let inside = (0..3).all(|i| hit_point[i] >= aabb_min[i] && hit_point[i] <= aabb_max[i]);
+        println!(
+            "HARNESS_PROBE_AABB direction=cursor anchor={} aabb_min=[{:.5},{:.5},{:.5}] aabb_max=[{:.5},{:.5},{:.5}] hit_point=[{:.5},{:.5},{:.5}] cam_frame=[{:.5},{:.5},{:.5}] inside={}",
+            anchor_path,
+            aabb_min[0], aabb_min[1], aabb_min[2],
+            aabb_max[0], aabb_max[1], aabb_max[2],
+            hit_point[0], hit_point[1], hit_point[2],
+            cam_frame[0], cam_frame[1], cam_frame[2],
+            inside,
+        );
+    }
+
     /// Shared script-command dispatcher. Called from both the live
     /// event loop (`event_loop.rs`) and the render-harness loop
     /// (`test_runner.rs`) so new commands only need one handler.
@@ -124,6 +181,7 @@ impl App {
                 self.camera.yaw = rad;
             }
             ScriptCmd::ProbeDown => self.harness_probe_down(),
+            ScriptCmd::ProbeCursor => self.harness_probe_cursor(),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
             ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
             ScriptCmd::RespawnOnSurface => self.respawn_on_surface(),

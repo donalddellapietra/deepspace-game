@@ -122,6 +122,14 @@ pub enum ScriptCmd {
     /// Run a CPU raycast straight down from the camera in world space
     /// and emit a `HARNESS_PROBE` line to stdout with the hit path.
     ProbeDown,
+    /// Run a CPU raycast along the camera's CURRENT forward vector
+    /// (pitch/yaw as set by the script) and emit a `HARNESS_PROBE
+    /// direction=cursor` line plus a `HARNESS_PROBE_AABB` line with
+    /// the hit cell's body-frame AABB and the world-space hit point.
+    /// Used to diagnose cursor/highlight mismatches — if hit_point is
+    /// outside the AABB, the AABB computation doesn't match what
+    /// frame_aware_raycast returned.
+    ProbeCursor,
     /// Emit a `HARNESS_MARK` line to stdout with the given label plus
     /// the current ui_layer / anchor_depth / frame. Timeline marker
     /// for correlating screenshots to actions in a test trace.
@@ -352,6 +360,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "place" { return Some(ScriptCmd::Place); }
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
+            if raw == "probe_cursor" { return Some(ScriptCmd::ProbeCursor); }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
             if raw == "respawn_on_surface" { return Some(ScriptCmd::RespawnOnSurface); }
             if let Some(n) = raw.strip_prefix("wait:") {

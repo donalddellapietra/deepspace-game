@@ -89,6 +89,17 @@ impl ScriptBuilder {
         self
     }
 
+    /// Raycast along the camera's CURRENT forward vector (pitch/yaw
+    /// as set earlier in the script). Emits `HARNESS_PROBE
+    /// direction=cursor` + `HARNESS_PROBE_AABB`. Used to check that
+    /// the AABB used for the cursor highlight contains the hit
+    /// point — i.e. that the highlight draws on top of the same
+    /// cell the next break would edit.
+    pub fn probe_cursor(mut self) -> Self {
+        self.parts.push("probe_cursor".to_string());
+        self
+    }
+
     pub fn emit(mut self, label: impl Into<String>) -> Self {
         self.parts.push(format!("emit:{}", label.into()));
         self
@@ -148,11 +159,26 @@ pub struct HarnessProbe {
     pub anchor_depth: u32,
 }
 
+/// `HARNESS_PROBE_AABB`: for a cursor-direction raycast, the body-frame
+/// AABB for the hit cell, the hit point, and whether the point lies
+/// inside the AABB. Emitted alongside `HARNESS_PROBE direction=cursor`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HarnessProbeAabb {
+    pub direction: String,
+    pub anchor: Vec<u32>,
+    pub aabb_min: [f32; 3],
+    pub aabb_max: [f32; 3],
+    pub hit_point: [f32; 3],
+    pub cam_frame: [f32; 3],
+    pub inside: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Trace {
     pub marks: Vec<HarnessMark>,
     pub edits: Vec<HarnessEdit>,
     pub probes: Vec<HarnessProbe>,
+    pub probe_aabbs: Vec<HarnessProbeAabb>,
     pub stdout: String,
     pub stderr: String,
     pub exit_success: bool,
@@ -192,6 +218,10 @@ pub fn run(args: &[&str], script: &ScriptBuilder) -> Trace {
         } else if let Some(rest) = line.strip_prefix("HARNESS_EDIT ") {
             if let Some(e) = parse_edit(rest) {
                 trace.edits.push(e);
+            }
+        } else if let Some(rest) = line.strip_prefix("HARNESS_PROBE_AABB ") {
+            if let Some(a) = parse_probe_aabb(rest) {
+                trace.probe_aabbs.push(a);
             }
         } else if let Some(rest) = line.strip_prefix("HARNESS_PROBE ") {
             if let Some(p) = parse_probe(rest) {
@@ -291,5 +321,24 @@ fn parse_probe(rest: &str) -> Option<HarnessProbe> {
         anchor: parse_anchor(kv.get("anchor")?)?,
         ui_layer: kv.get("ui_layer")?.parse().ok()?,
         anchor_depth: kv.get("anchor_depth")?.parse().ok()?,
+    })
+}
+
+fn parse_vec3(s: &str) -> Option<[f32; 3]> {
+    let inner = s.strip_prefix('[')?.strip_suffix(']')?;
+    let parts: Vec<f32> = inner.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+    if parts.len() == 3 { Some([parts[0], parts[1], parts[2]]) } else { None }
+}
+
+fn parse_probe_aabb(rest: &str) -> Option<HarnessProbeAabb> {
+    let kv = parse_kv(rest);
+    Some(HarnessProbeAabb {
+        direction: kv.get("direction")?.clone(),
+        anchor: parse_anchor(kv.get("anchor")?)?,
+        aabb_min: parse_vec3(kv.get("aabb_min")?)?,
+        aabb_max: parse_vec3(kv.get("aabb_max")?)?,
+        hit_point: parse_vec3(kv.get("hit_point")?)?,
+        cam_frame: parse_vec3(kv.get("cam_frame")?)?,
+        inside: kv.get("inside")?.parse().ok()?,
     })
 }

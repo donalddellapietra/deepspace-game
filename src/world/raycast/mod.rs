@@ -186,6 +186,23 @@ pub fn cpu_raycast_in_sphere_frame(
         };
 
         if let Some(mut hit) = hit_opt {
+            // Scale `t` back into the caller's frame (`cam_local`
+            // lives in the deepest frame = `effective_depth`). Each
+            // pop divided `ray_origin_local` by 3, so 1 unit along
+            // `ray_dir` in the popped frame corresponds to `3^pops`
+            // units in the deepest frame. Ray directions are
+            // normalized the same way in every frame, so only `t`
+            // needs this scaling. Without it, hits found at a popped
+            // frame return `t` in the popped frame's units — the
+            // caller then multiplies that `t` by a `cam_local`
+            // (deepest-frame) direction and lands outside the hit
+            // cell's AABB, and the interaction-radius gate uses the
+            // wrong `t` for comparison.
+            let pops = effective_depth - current_frame_depth;
+            if pops > 0 {
+                let scale = 3.0_f32.powi(pops as i32);
+                hit.t *= scale;
+            }
             prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
             return Some(hit);
         }
