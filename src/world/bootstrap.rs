@@ -668,7 +668,21 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
         node_stack.push((node_id, node.kind));
         match node.children[slot as usize] {
             Child::Node(child_id) => node_id = child_id,
-            _ => return,
+            // If the camera's anchor path crosses an Empty or Block
+            // slot before reaching `carve_depth`, install a fresh
+            // empty Node there so the walk can continue. Bottom-up
+            // rebuild below stitches the new Node into the parent's
+            // slot via the replacement chain — the rest of the
+            // parent's siblings stay untouched. This is the fix
+            // for fractals with structural empties (Menger's body-
+            // centres, Sierpinski's 23 unused corners etc.): without
+            // it, `compute_render_frame` stalls at the first empty
+            // and the shader can never render cells small enough
+            // for Nyquist to let a real Block leaf be visible,
+            // which manifests as monochromatic LOD-terminal colour.
+            Child::Empty | Child::Block(_) => {
+                node_id = world.library.insert(empty_children());
+            }
         }
     }
     let Some(node) = world.library.get(node_id) else { return };

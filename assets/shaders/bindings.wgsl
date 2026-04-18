@@ -190,16 +190,23 @@ override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 /// Default 4 gives detailed close content (4 levels under anchor)
 /// while keeping far content cheap (1-level LOD terminal beyond
 /// ribbon shell 3). Tune via `--lod-base-depth <N>`.
-override BASE_DETAIL_DEPTH: u32 = 4u;
+override BASE_DETAIL_DEPTH: u32 = 20u;
 
 const MAX_FACE_DEPTH: u32 = 63u;
 /// Cartesian DDA stack depth — must be ≥ `BASE_DETAIL_DEPTH + 1`.
-/// 5 matches the default BASE_DETAIL_DEPTH=4 exactly. Previously 64,
-/// which allocated 3.5 KB of per-fragment scratch and forced the
-/// Apple Silicon register allocator to spill to local memory on
-/// every DDA iteration. If you raise BASE_DETAIL_DEPTH, raise this
-/// to match or the shader silently caps descent.
-const MAX_STACK_DEPTH: u32 = 5u;
+/// Must be wide enough that the DDA can descend from the render
+/// frame all the way to Block leaves. For a fractal-heavy world
+/// with `plain_layers = 20` and a render frame that stalls at
+/// depth ~2 (because of Empty cells along the camera path), we
+/// need ~18 slots to reach leaves. 20 gives us that + a small
+/// safety margin. At this size the 5 per-fragment DDA stacks
+/// (20 × 60 B each = 1.2 KB total) exceed the Apple Silicon
+/// register-file budget and spill to threadgroup memory — that
+/// was the old 5-level optimization. Fractals need the reach
+/// more than they need the last 20% of perf; we accept the
+/// ~2× GPU-pass-ms hit documented in
+/// `docs/testing/perf-lod-diagnosis.md`.
+const MAX_STACK_DEPTH: u32 = 20u;
 
 struct HitResult {
     hit: bool,

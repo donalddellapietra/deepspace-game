@@ -36,6 +36,10 @@ echo "iter,spawn_depth,submitted_done_avg_ms,gpu_pass_avg_ms,avg_steps,avg_desce
 for depth in "${DEPTHS[@]}"; do
   out_png="$OUT_DIR/${ITER}_d${depth}.png"
   log=$(mktemp)
+  # NOTE: deliberately no --spawn-xyz. The bootstrap's baked spawn
+  # is the real-game scenario; overriding xyz takes a different
+  # code branch that skips auto-carve and therefore hid this class
+  # of bug in earlier harness runs.
   timeout 8 ./target/debug/deepspace-game \
     --render-harness \
     --disable-overlay \
@@ -44,7 +48,6 @@ for depth in "${DEPTHS[@]}"; do
     --"${FRACTAL}"-world \
     --plain-layers 20 \
     --spawn-depth "$depth" \
-    --spawn-xyz 2.8 2.8 2.8 \
     --spawn-yaw 0.785 \
     --spawn-pitch -0.615 \
     --harness-width 960 \
