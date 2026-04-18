@@ -25,6 +25,19 @@ impl Renderer {
         live_sample_every_frames: u32,
         taa_enabled: bool,
     ) -> Self {
+        // On web, winit's `inner_size` lags behind the canvas backing
+        // store (request_inner_size doesn't apply synchronously and
+        // ensure_started runs before any resize event), so we read the
+        // canvas dimensions directly to pick a matching swapchain size.
+        #[cfg(target_arch = "wasm32")]
+        let size = {
+            use winit::platform::web::WindowExtWebSys;
+            window
+                .canvas()
+                .map(|c| winit::dpi::PhysicalSize::new(c.width(), c.height()))
+                .unwrap_or_else(|| window.inner_size())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -118,8 +131,16 @@ impl Renderer {
         // patch in-place (via `queue.write_buffer`) without forcing a
         // full buffer recreate + bind-group rebuild.
         let alloc_with_headroom = |device: &wgpu::Device, label: &'static str, bytes: &[u8]| -> wgpu::Buffer {
+            // Round UP to a multiple of 4: WebGPU requires storage
+            // buffer binding sizes to be a multiple of 4 (and a whole
+            // number of u32s for our u32-typed buffers). Metal is
+            // looser and silently rounded. The assert traps any
+            // future caller whose `T` isn't 4-aligned — would leave a
+            // partial-element tail.
+            debug_assert!(bytes.len() % 4 == 0, "alloc_with_headroom payload not 4-aligned");
             let min = bytes.len() as u64;
-            let size = (min.max(1) * 3 / 2).max(min + 4096);
+            let raw = (min.max(1) * 3 / 2).max(min + 4096);
+            let size = raw.div_ceil(4) * 4;
             let b = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size,

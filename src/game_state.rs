@@ -191,7 +191,6 @@ impl GameUiState {
         panels_were_open != self.any_panel_open()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn push_to_overlay(&mut self, registry: &ColorRegistry) {
         use crate::overlay;
 

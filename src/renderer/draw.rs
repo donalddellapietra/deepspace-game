@@ -255,12 +255,12 @@ impl Renderer {
     /// the harness surfaces — so a live-game regression can be
     /// diagnosed from stderr without running the offscreen harness.
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let frame_start = std::time::Instant::now();
-        let acquire_start = std::time::Instant::now();
+        let frame_start = web_time::Instant::now();
+        let acquire_start = web_time::Instant::now();
         let output = self.surface.get_current_texture()?;
         let acquire_elapsed = acquire_start.elapsed();
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let encode_start = std::time::Instant::now();
+        let encode_start = web_time::Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
@@ -280,15 +280,18 @@ impl Renderer {
             );
         }
         let encode_elapsed = encode_start.elapsed();
-        let done_slot: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+        let done_slot: std::sync::Arc<std::sync::Mutex<Option<web_time::Instant>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
-        let submit_start = std::time::Instant::now();
+        let submit_start = web_time::Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
+        // wgpu 25's WebGPU backend has not implemented
+        // `on_submitted_work_done`; skip the latency probe on WASM.
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let done_slot = std::sync::Arc::clone(&done_slot);
             self.queue.on_submitted_work_done(move || {
                 let mut slot = done_slot.lock().unwrap();
-                *slot = Some(std::time::Instant::now());
+                *slot = Some(web_time::Instant::now());
             });
         }
         let submit_elapsed = submit_start.elapsed();
@@ -299,7 +302,7 @@ impl Renderer {
         if let Some(taa) = self.taa.as_mut() {
             taa.end_frame();
         }
-        let present_start = std::time::Instant::now();
+        let present_start = web_time::Instant::now();
         output.present();
         let present_elapsed = present_start.elapsed();
         let frame_elapsed = frame_start.elapsed();
@@ -366,7 +369,7 @@ impl Renderer {
     }
 
     pub fn render_offscreen(&mut self) -> OffscreenRenderTiming {
-        let frame_start = std::time::Instant::now();
+        let frame_start = web_time::Instant::now();
         let alloc_start = frame_start;
         if self.offscreen_texture.is_none() {
             self.offscreen_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
@@ -385,14 +388,14 @@ impl Renderer {
             }));
         }
         let texture_alloc_ms = alloc_start.elapsed().as_secs_f64() * 1000.0;
-        let view_start = std::time::Instant::now();
+        let view_start = web_time::Instant::now();
         let texture = self
             .offscreen_texture
             .as_ref()
             .expect("offscreen texture initialized");
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let view_ms = view_start.elapsed().as_secs_f64() * 1000.0;
-        let encode_start = std::time::Instant::now();
+        let encode_start = web_time::Instant::now();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offscreen-frame"),
         });
@@ -416,27 +419,29 @@ impl Renderer {
             );
         }
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
-        let done_slot: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+        let done_slot: std::sync::Arc<std::sync::Mutex<Option<web_time::Instant>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
-        let submit_start = std::time::Instant::now();
+        let submit_start = web_time::Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
         // Register the callback *after* submit: wgpu's
         // `on_submitted_work_done` fires when the queue is drained
         // up to the time of the call. Registering before submit
         // fires on the previous frame's completion (usually ~0 ms)
         // and tells us nothing about the current frame.
+        // wgpu 25's WebGPU backend does not implement this — skip on WASM.
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let done_slot = std::sync::Arc::clone(&done_slot);
             self.queue.on_submitted_work_done(move || {
                 let mut slot = done_slot.lock().unwrap();
-                *slot = Some(std::time::Instant::now());
+                *slot = Some(web_time::Instant::now());
             });
         }
         let submit_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
         if let Some(taa) = self.taa.as_mut() {
             taa.end_frame();
         }
-        let wait_start = std::time::Instant::now();
+        let wait_start = web_time::Instant::now();
         let _ = self.device.poll(wgpu::PollType::Wait);
         let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
         let submitted_done_ms = done_slot
@@ -509,7 +514,7 @@ impl Renderer {
             Some(t) => t,
             None => return (None, 0.0),
         };
-        let readback_start = std::time::Instant::now();
+        let readback_start = web_time::Instant::now();
         let slice = ts.staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });

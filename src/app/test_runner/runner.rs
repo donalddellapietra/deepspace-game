@@ -17,7 +17,7 @@ pub struct TestRunner {
     /// Wall-clock start; combined with `timeout_secs` to bail on
     /// perf hangs without depending on frame counting (a stuck
     /// renderer might never advance frames).
-    pub started_at: std::time::Instant,
+    pub started_at: web_time::Instant,
     pub timeout_secs: f32,
     pub min_fps: Option<f32>,
     pub fps_warmup_frames: u32,
@@ -48,7 +48,7 @@ impl TestRunner {
         let max_frame_gap_ms = cfg.max_frame_gap_ms;
         let frame_gap_warmup_frames = cfg.frame_gap_warmup_frames.unwrap_or(30);
         let require_webview = cfg.require_webview;
-        let started_at = std::time::Instant::now();
+        let started_at = web_time::Instant::now();
         let monitor = std::sync::Arc::new(TestMonitor::new());
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -57,7 +57,7 @@ impl TestRunner {
                 use std::sync::atomic::Ordering;
 
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(web_time::Duration::from_millis(50));
                     let elapsed = started_at.elapsed();
                     let elapsed_secs = elapsed.as_secs_f32();
                     let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
@@ -167,13 +167,13 @@ impl TestRunner {
 pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
-    use crate::app::App;
+    use crate::app::{App, UserEvent};
     use crate::renderer::Renderer;
     use winit::event_loop::EventLoop;
     use winit::window::WindowAttributes;
 
-    let mut app = App::with_test_config(cfg.clone());
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let mut app = App::with_test_config(cfg.clone(), event_loop.create_proxy());
     let window = Arc::new(event_loop.create_window(
         WindowAttributes::default()
             .with_title("Deep Space Render Harness")
@@ -205,7 +205,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     app.window = Some(window);
     app.renderer = Some(renderer);
     app.apply_zoom();
-    app.last_frame = std::time::Instant::now();
+    app.last_frame = web_time::Instant::now();
 
     let mut agg = PerfAgg::default();
     let mut trace_writer = cfg.perf_trace.as_ref().map(|path| {
@@ -227,12 +227,12 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             r.last_bind_group_rebuild_ms = 0.0;
         }
 
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         app.update(1.0 / 60.0);
         let t_update = t0.elapsed().as_secs_f64() * 1000.0;
         let t_camera_write = app.renderer.as_ref().map(|r| r.last_camera_write_ms).unwrap_or(0.0);
 
-        let t1 = std::time::Instant::now();
+        let t1 = web_time::Instant::now();
         app.upload_tree_lod();
         let t_upload_total = t1.elapsed().as_secs_f64() * 1000.0;
         let t_pack = app.last_pack_ms;
@@ -245,7 +245,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         let effective_visual_depth = app.last_effective_visual_depth;
         let reused_gpu_tree = app.last_reused_gpu_tree;
 
-        let t2 = std::time::Instant::now();
+        let t2 = web_time::Instant::now();
         app.update_highlight();
         let t_highlight = t2.elapsed().as_secs_f64() * 1000.0;
         let t_highlight_raycast = app.last_highlight_raycast_ms;

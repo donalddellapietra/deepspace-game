@@ -46,6 +46,24 @@ pub use frame::{
 };
 pub use test_runner::TestConfig;
 
+/// Cross-thread / cross-task signal back into the winit event loop.
+/// The WASM path can't synchronously block on the async wgpu init, so
+/// it spawns the future and posts the finished `Renderer` back via
+/// this enum (native uses the same channel for symmetry). On WASM,
+/// browser-window resize is also routed through here so the canvas
+/// backing-store update and the renderer.resize stay in lockstep.
+pub enum UserEvent {
+    RendererReady(Box<Renderer>),
+    /// Browser window resized. WASM-only: only sent from the
+    /// `wasm_canvas_setup` resize closure. Native uses
+    /// `WindowEvent::Resized` which already routes to both the
+    /// renderer and the wry overlay — sending `UserEvent::Resize`
+    /// natively would resize the renderer but skip the overlay,
+    /// which is why the variant is gated.
+    #[cfg(target_arch = "wasm32")]
+    Resize(winit::dpi::PhysicalSize<u32>),
+}
+
 /// Pack is a pure function of `(library, root)`. The only field that
 /// invalidates the GPU tree buffer is `root` — edits change it; pure
 /// motion does not. Render path, visual depth, camera, etc. live in
@@ -96,7 +114,7 @@ pub struct App {
     pub(super) frozen: bool,
     pub(super) cursor_locked: bool,
     pub(super) keys: Keys,
-    pub(super) last_frame: std::time::Instant,
+    pub(super) last_frame: web_time::Instant,
     pub(super) tree_depth: u32,
     pub(super) palette: ColorRegistry,
     pub(super) saved_meshes: SavedMeshes,
@@ -201,14 +219,44 @@ pub struct App {
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) frames_waited: u32,
+    /// Loopback into the winit event loop. Required on WASM so the
+    /// spawned async renderer-init future can deliver the finished
+    /// `Renderer` back via `UserEvent::RendererReady`, and so the
+    /// browser-window resize closure can post `UserEvent::Resize`.
+    /// Native keeps it for symmetry but doesn't currently send.
+    pub(super) proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    /// True after we kicked off the async renderer init (WASM only).
+    /// Stops `ensure_started` from re-spawning the future on every
+    /// `resumed` / `about_to_wait` callback before the renderer
+    /// actually arrives.
+    pub(super) renderer_init_started: bool,
+    /// Captured args we need in `finish_init`, populated by
+    /// `start_init` before the renderer comes online.
+    pub(super) pending_init: Option<PendingInit>,
+}
+
+/// Args that `start_init` computes synchronously and `finish_init`
+/// consumes once the renderer is ready.
+pub(super) struct PendingInit {
+    pub(super) source: String,
+    pub(super) resumed_start: web_time::Instant,
+    pub(super) window_elapsed: web_time::Duration,
+    pub(super) prepare_elapsed: web_time::Duration,
+    pub(super) pack_elapsed: web_time::Duration,
+    pub(super) renderer_start: web_time::Instant,
+    pub(super) node_count: usize,
+    pub(super) tree_u32_count: usize,
 }
 
 impl App {
-    pub fn new() -> Self {
-        Self::with_test_config(TestConfig::default())
+    pub fn new(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Self {
+        Self::with_test_config(TestConfig::default(), proxy)
     }
 
-    pub fn with_test_config(test_cfg: TestConfig) -> Self {
+    pub fn with_test_config(
+        test_cfg: TestConfig,
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    ) -> Self {
         let render_harness = test_cfg.render_harness;
         let low_latency_present = test_cfg.is_active();
         let show_harness_window = test_cfg.show_window;
@@ -307,7 +355,7 @@ impl App {
             frozen: false,
             cursor_locked: test_cfg.spawn_depth.is_some() || test_cfg.screenshot.is_some(),
             keys: Keys::default(),
-            last_frame: std::time::Instant::now(),
+            last_frame: web_time::Instant::now(),
             tree_depth,
             palette: bootstrap_color_registry,
             saved_meshes: SavedMeshes::default(),
@@ -352,6 +400,9 @@ impl App {
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
             frames_waited: 0,
+            proxy,
+            renderer_init_started: false,
+            pending_init: None,
         }
     }
 
@@ -408,6 +459,18 @@ impl App {
     #[inline]
     pub(super) fn overlay_enabled(&self) -> bool {
         !self.render_harness && !self.disable_overlay
+    }
+
+    /// True when the per-frame overlay state push + UI command poll
+    /// should run. Native: gated on `overlay_enabled()` so render
+    /// harness runs skip wry plumbing. WASM: always on — the React
+    /// bridge has no harness mode.
+    #[inline]
+    pub(super) fn overlay_active(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.overlay_enabled() }
+        #[cfg(target_arch = "wasm32")]
+        { true }
     }
 
     pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {

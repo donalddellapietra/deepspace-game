@@ -1,4 +1,7 @@
-The command for running is scripts/dev.sh
+The command for running is scripts/dev.sh (native, with wry overlay).
+For the browser/WASM build, use scripts/dev-wasm.sh — it builds the
+React UI bundle (one-time) and trunk-serves at http://localhost:8080.
+Requires Chrome / Edge or any WebGPU-enabled browser.
 
 When you create a worktree, always check which is our current branch, and create off of that.
 

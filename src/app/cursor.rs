@@ -29,6 +29,11 @@ impl App {
         let Some(window) = &self.window else { return };
         self.cursor_locked = false;
         self.keys.clear();
+        // Tell JS we initiated this release so the
+        // pointerlockchange listener doesn't synthesize an ESC and
+        // bounce-close whatever panel just opened.
+        #[cfg(target_arch = "wasm32")]
+        crate::overlay::notify_intentional_unlock();
         let _ = window.set_cursor_grab(CursorGrabMode::None);
         window.set_cursor_visible(true);
     }
@@ -38,6 +43,19 @@ impl App {
             self.unlock_cursor();
         } else if !self.ui.any_panel_open() && !self.cursor_locked {
             self.lock_cursor();
+        }
+    }
+
+    /// Drain UI commands from the overlay (WebView IPC on native,
+    /// `window.__pollUiCommands` on WASM) and dispatch them to the
+    /// game UI state. Panels that toggle as a result re-sync the
+    /// cursor lock.
+    pub(super) fn poll_ui_commands(&mut self) {
+        for cmd in crate::overlay::poll_commands() {
+            let panel_changed = self.ui.handle_command(cmd);
+            if panel_changed {
+                self.sync_cursor_to_panels();
+            }
         }
     }
 }

@@ -42,7 +42,7 @@ impl App {
         if let Some((cached_key, cached_aabb)) = self.cached_highlight {
             if cached_key == cache_key {
                 self.last_highlight_raycast_ms = 0.0;
-                let set_start = std::time::Instant::now();
+                let set_start = web_time::Instant::now();
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_highlight(cached_aabb);
                 }
@@ -54,7 +54,7 @@ impl App {
                 return;
             }
         }
-        let raycast_start = std::time::Instant::now();
+        let raycast_start = web_time::Instant::now();
         let tree_hit = self.frame_aware_raycast();
         self.last_highlight_raycast_ms = raycast_start.elapsed().as_secs_f64() * 1000.0;
         // Reuse the raycast result for the crosshair reticle. Its
@@ -76,7 +76,7 @@ impl App {
                 aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
             }
         });
-        let set_start = std::time::Instant::now();
+        let set_start = web_time::Instant::now();
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(aabb);
         }

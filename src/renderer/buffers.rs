@@ -47,7 +47,7 @@ impl Renderer {
         }
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let write_start = std::time::Instant::now();
+        let write_start = web_time::Instant::now();
         let prev_tree_u32s = self.uploaded_tree_u32s;
         let tree_grew = append_or_recreate_u32(
             &mut self.tree_buffer, &mut self.uploaded_tree_u32s,
@@ -66,7 +66,7 @@ impl Renderer {
 
         self.last_bind_group_rebuild_ms = 0.0;
         if tree_grew || kinds_grew || offsets_grew {
-            let rebuild_start = std::time::Instant::now();
+            let rebuild_start = web_time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
@@ -100,7 +100,7 @@ impl Renderer {
         self.ribbon_count = truncated.len() as u32;
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let write_start = std::time::Instant::now();
+        let write_start = web_time::Instant::now();
         let needed = std::mem::size_of_val(payload) as u64;
         let grew = if needed > self.ribbon_buffer.size() {
             self.ribbon_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -115,7 +115,7 @@ impl Renderer {
         };
         self.last_ribbon_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
         if grew {
-            let rebuild_start = std::time::Instant::now();
+            let rebuild_start = web_time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
@@ -132,7 +132,7 @@ impl Renderer {
     }
 
     pub fn update_camera(&mut self, camera: &GpuCamera) {
-        let write_start = std::time::Instant::now();
+        let write_start = web_time::Instant::now();
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
         self.last_camera_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
         // Keep a CPU-side copy with jitter cleared — the TAA resolve
@@ -191,8 +191,13 @@ pub(super) fn append_or_recreate<T: bytemuck::Pod>(
     let needed = data.len() as u64 * elem_size;
     if needed > buffer.size() {
         // Overflow: recreate with 1.5× headroom so the next several
-        // edits fit without another grow.
-        let new_size = (needed.max(1) * 3 / 2).max(elem_size);
+        // edits fit without another grow. Round UP to a multiple of
+        // `elem_size` so WebGPU's strict binding-size validation
+        // accepts the buffer (it requires storage-binding sizes to be
+        // a whole number of elements). Native Metal silently tolerates
+        // this; WebGPU does not.
+        let raw = (needed.max(1) * 3 / 2).max(elem_size);
+        let new_size = raw.div_ceil(elem_size) * elem_size;
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: new_size,

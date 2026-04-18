@@ -26,9 +26,9 @@ impl App {
         self.last_effective_visual_depth = effective_visual_depth;
         self.last_reused_gpu_tree = reused_gpu_tree;
 
-        let mut pack_elapsed = std::time::Duration::ZERO;
+        let mut pack_elapsed = web_time::Duration::ZERO;
         if !reused_gpu_tree {
-            let pack_start = std::time::Instant::now();
+            let pack_start = web_time::Instant::now();
             let cache = self.cached_tree.get_or_insert_with(gpu::CachedTree::new);
             let len_before = cache.tree.len();
             cache.update_root(&self.world.library, self.world.root);
@@ -59,7 +59,7 @@ impl App {
         }
 
         // Ribbon rebuilds every frame against the cached tree.
-        let ribbon_start = std::time::Instant::now();
+        let ribbon_start = web_time::Instant::now();
         let cache = self
             .cached_tree
             .as_ref()
