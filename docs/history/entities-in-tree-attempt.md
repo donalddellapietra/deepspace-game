@@ -198,3 +198,150 @@ it's **instrument and confirm** before another code change:
 If next session pins down the exact ancestor-level where the fast
 path fires, the fix is likely one line — the approach isn't wrong,
 the instrumentation was just insufficient to finish in one pass.
+
+## How I tested during the attempt (and what went wrong)
+
+The pattern I fell into, ranked roughly chronologically:
+
+1. Made the refactor in one shot (scene.rs + pack change + shader
+   change + upload rewiring + deletion of hash-grid plumbing).
+2. Ran `cargo test --test render_entities`. All 7 tests failed.
+3. Reached for `eprintln!` CPU-side. Added prints to `scene.rs` and
+   `pack.rs` build_child_entry. Those confirmed the TREE content was
+   correct: EntityRef emitted, tag=3 serialized into the pack
+   buffer, entity GPU buffer populated with the right bbox.
+4. Could not observe the shader. Reached for "forced debug colors"
+   inside `march_cartesian`'s tag=3 branch — a solid green return
+   when tag==3. Screen stayed terrain+sky. Ran the same single-frame
+   screenshot command over and over with different shader tweaks:
+
+   ```
+   timeout 10 target/aarch64-apple-darwin/debug/deepspace-game \
+     --render-harness --disable-overlay --disable-highlight \
+     --plain-world --plain-layers 40 \
+     --spawn-depth 6 --spawn-xyz 1.5 1.5 1.8 \
+     --spawn-yaw 0 --spawn-pitch 0 \
+     --spawn-entity assets/vox/soldier.vox --spawn-entity-count 1 \
+     --harness-width 320 --harness-height 180 \
+     --screenshot tmp/single.png \
+     --exit-after-frames 3 --timeout-secs 6
+   ```
+
+5. Started disabling protections one at a time — empty-rep fast
+   path, AABB cull, bumped `--lod-base-depth 8` — each run a fresh
+   cargo build + screenshot + eyeball.
+
+The failure of that loop:
+
+- **Multiple hypotheses in flight at once.** I was simultaneously
+  suspecting the representative_block fast path, the AABB cull, and
+  the depth budget. I disabled them one at a time but kept each
+  disable in place while testing the next, which means by the end I
+  couldn't tell which of my "fixes" had actually mattered (spoiler:
+  none, since the entity still wasn't visible).
+- **CPU-side prints, GPU-side opacity.** I could see that the scene
+  tree had the EntityRef in the right slot. I could NOT see what
+  the shader's DDA actually did when it got to that cell's
+  parent, or whether it got there at all. The eyeball-the-screenshot
+  loop is a single-bit observation: "did green appear?" No green
+  tells you nothing about WHY.
+- **No dedicated probe.** I had `ENABLE_STATS` counters for world
+  DDA branches, but adding a tag=3-specific atomic counter would
+  have been 3 lines of WGSL. I never did it. Every subsequent run
+  was a re-eyeball instead of a measurement.
+
+## The correct iterative testing loop
+
+For any refactor that changes rendering output, build the test
+before the refactor, not after:
+
+1. **Write a test that demonstrates the current behavior as a
+   golden.** Specifically, a test that exercises the SINGLE
+   path you're about to change. For entity rendering: a one-
+   entity-visible test at a fixed depth, hit_fraction > 0, and a
+   color-match check at the known entity center.
+2. **Run the test — it passes under the current architecture.**
+   Commit the test. This is the reference point.
+3. **Make the refactor in the SMALLEST coherent slice that could
+   keep the test passing.** For entity-in-tree: *first* add the
+   Child variant + pack emission, but route it through the OLD
+   hash-grid reader (shader still walks the bin grid, just needs
+   to tolerate tag=3 showing up there or via a feature flag).
+   Keep the test passing at every step.
+4. **Delete the old path only after the new path passes.**
+
+I did #1 only after the refactor, in the form of the existing
+motion tests. They were too coarse — they just checked that the
+frame differed from a baseline. At 0 entity visibility the frame
+didn't differ, and the test failed, but with no signal about WHERE
+the path broke.
+
+## The correct debugging loop
+
+Once a visual regression like "entity not rendering" shows up, the
+loop is **observe, hypothesize, instrument, change** — in that
+order, one hypothesis at a time:
+
+1. **Observe.** What is the actual data? Not what I think it should
+   be — what the CPU log, the GPU atomic counter, the pack buffer
+   dump actually say. First pass, each layer:
+   - Scene builder: `eprintln!` the resulting scene_root's children
+     at each anchor-path slot. Confirmed the EntityRef is there.
+   - Pack: `eprintln!` the `packed` u32 for each tag=3 emit.
+     Confirmed tag byte is 3 and node_index is the entity idx.
+   - GPU entity buffer: `eprintln!` the first entry. Confirmed.
+   - **Shader: add a single `atomic<u32>` counter that increments
+     each time the DDA loads a non-zero occupancy slot at scene
+     depth 5 (the level of our EntityRef), and separately each
+     time `tag == 3u` fires.** This is the observation I never
+     made.
+2. **Hypothesize — SINGLE hypothesis.** Write down, on paper or in
+   the chat: "I think X is happening because Y." State what
+   observation would confirm or falsify X.
+3. **Instrument, not change.** If the hypothesis is "the
+   representative_block chain is 255 at level N," the instrument
+   is: dump all 5 ancestor levels' `representative_block`. Don't
+   patch anything until you've seen the dump.
+4. **Change only after data.** When the data identifies the layer
+   where the invariant breaks, the fix is usually one line. If the
+   fix is more than 10 lines, you've probably misread the data —
+   go back to step 1.
+
+Specific tools I should have reached for earlier:
+
+- **`cat >> pack.rs` with a CPU-side `pack_dump(scene_root)`
+  function** that walks the pack buffer from scene_root's BFS and
+  prints every `(bfs_idx, header_offset, occupancy, [children
+  tag/block_type/node_index])`. Call it once in upload_tree_lod
+  before the GPU write. Takes 50 lines, gives a ground-truth view
+  of what the shader will see.
+- **A single `atomic<u32>` `tag_3_hits` counter** written in
+  `march_cartesian` with no `ENABLE_STATS` gate (just an unconditional
+  atomicAdd when tag == 3u). Takes 1 line. If it stays 0 over a
+  frame, the bug is upstream; if non-zero, the bug is in the
+  descent path.
+- **Pre-build script that compares the composed shader string
+  before and after the refactor**: `shader_compose::compose("main.wgsl")`
+  → dump to a file, diff against the prior version. Would have
+  instantly shown whether the tag=3 branch was literally present
+  in the pipeline.
+- **A "dry-run" CPU mirror of `march_entity_ref`** that walks the
+  same pack buffer via `cpu_raycast`-style iteration and returns
+  whether the entity should be hit. Running it on the test camera
+  would have told me: "yes the ray should hit; the shader disagrees
+  → the bug is shader-side."
+
+## Why I didn't reach for these at the time
+
+Context budget. Every debug iteration was "edit file + cargo build
++ launch binary + eyeball screenshot." At ~30s per round and 10+
+rounds, that's the session. The time to add proper instrumentation
+felt expensive compared to "try one more shader tweak," and I kept
+betting that the next tweak would show me green. It didn't, and I
+ran out of budget before ever measuring what the shader actually
+saw.
+
+The general rule this enforces: **if you've done three failing
+eyeball-iterations in a row, the cost of adding the proper probe
+is ALREADY less than the cost of four more eyeball-iterations.**
+Skip ahead to step 1 of the correct debugging loop.
