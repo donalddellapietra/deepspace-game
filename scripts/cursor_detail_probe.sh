@@ -115,14 +115,11 @@ for world in $WORLDS; do
             ;;
         sphere)
             echo "-- sphere world (tree_depth=30) --"
-            echo "    Note: demo_planet has SDF_DETAIL_LEVELS=4, so terrain"
-            echo "    cells are ~shell/3^4 ≈ 0.004 world-units thick. A"
-            echo "    12-anchor-cell interaction radius at anchor_depth N"
-            echo "    scales as 12/3^(N-1) world-units — smaller than the"
-            echo "    terrain granularity past N ≈ 8. Beyond that depth the"
-            echo "    first solid cell physically sits beyond reach; the"
-            echo "    sweep caps at 8 so the expectation stays meaningful."
-            sphere_depths="${SPHERE_DEPTHS:-3 5 8}"
+            echo "    Reach is floored at 12 × SDF-min-cell (= shell/3^4)"
+            echo "    for sphere, so the interaction gate doesn't shrink"
+            echo "    past the physical granularity of the tree content."
+            echo "    That keeps cursor-on-surface working at any anchor."
+            sphere_depths="${SPHERE_DEPTHS:-3 5 8 12 16 20}"
             for d in $sphere_depths; do
                 run_probe "sphere" "$d" "-1.5707963" \
                     "--sphere-world" "30"

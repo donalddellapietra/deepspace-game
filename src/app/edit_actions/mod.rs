@@ -51,21 +51,51 @@ impl App {
     }
 
     /// Interaction distance cap in the given frame's local units.
-    /// `interaction_radius_cells × anchor_cell_size_in_frame`, where
-    /// `anchor_cell_size_in_frame = 3 / 3^K` for `K = anchor_depth −
-    /// frame_depth`. The user's reach scales with their zoom — deep
-    /// zoom shrinks both the visible content AND the reach
-    /// proportionally, so "N layer-sized cells away" stays
-    /// meaningful. Works uniformly for Cartesian and Sphere: both
-    /// frames carry `t` in the same unit system (the frame's local
-    /// `[0,3)³`), and `anchor_cell_size_in_frame` already encodes the
-    /// world-ratio via `k`.
+    ///
+    /// Plain: `interaction_radius_cells × anchor_cell_size_in_frame`
+    /// where `anchor_cell_size_in_frame = 3 / 3^K`, `K = anchor_depth −
+    /// frame_depth`. Reach scales with zoom — deep zoom shrinks both
+    /// visible content AND reach proportionally, so "N layer-sized
+    /// cells away" stays meaningful.
+    ///
+    /// Sphere: the same formula fails past `anchor_depth ≈ SDF-detail
+    /// + face-body offset + a few`, because sphere content
+    /// granularity is floored by `SDF_DETAIL_LEVELS` — the physical
+    /// size of the smallest solid cell the tree can represent. When
+    /// `anchor_cell_size` shrinks below that floor, "12 anchor cells"
+    /// becomes smaller than the very first solid cell the walker can
+    /// find, and every hit gets rejected at deep zoom even with the
+    /// camera sitting directly on the surface.
+    ///
+    /// Fix: for sphere frames, floor `anchor_cell_size` at the SDF's
+    /// minimum cell size. That keeps reach meaningful at any zoom
+    /// (below the SDF floor, reach stays constant at 12 SDF cells —
+    /// no more shrinking into the gaps between representable cells).
+    /// Plain path is unchanged.
     pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
         let frame_depth = frame_path.depth();
         let anchor_depth = self.camera.position.anchor.depth();
         let k = anchor_depth.saturating_sub(frame_depth) as i32;
         let anchor_cell_size_in_frame = 3.0_f32.powi(1 - k);
-        self.interaction_radius_cells as f32 * anchor_cell_size_in_frame
+
+        let effective_cell_size = match self.active_frame.kind {
+            ActiveFrameKind::Sphere(sphere) => {
+                // SDF stops subdividing at `SDF_DETAIL_LEVELS` below
+                // each of the 6 face-subtree roots. The minimum
+                // representable solid-cell radial extent is therefore
+                // `shell × (1/3)^SDF_DETAIL_LEVELS`, where
+                // `shell = outer_r − inner_r` in body-local units.
+                // In body-frame units (the cap-frame for sphere
+                // raycasts) the shell is `3 × (outer_r − inner_r)`.
+                const SDF_DETAIL_LEVELS: i32 = 4;
+                let shell_in_frame = 3.0 * (sphere.outer_r - sphere.inner_r);
+                let sdf_min_cell = shell_in_frame
+                    * 3.0_f32.powi(-SDF_DETAIL_LEVELS);
+                anchor_cell_size_in_frame.max(sdf_min_cell)
+            }
+            _ => anchor_cell_size_in_frame,
+        };
+        self.interaction_radius_cells as f32 * effective_cell_size
     }
 
     /// Cast a ray from the camera into the world using the same
