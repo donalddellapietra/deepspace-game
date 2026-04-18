@@ -1,7 +1,16 @@
-//! WASM bridge: in the browser, React UI lives in the page DOM and
-//! talks to WASM through `window.__onGameState` (state) and
-//! `window.__pollUiCommands` (commands). The native overlay's
-//! WebView IPC isn't used.
+//! WASM overlay bridge.
+//!
+//! In the browser, the React UI lives in the page DOM (no WebView)
+//! and talks to WASM through three globals:
+//!
+//! - `window.__onGameState(json)` — Rust → React state pushes,
+//!   buffered pre-mount by the inline script in `index.html`.
+//! - `window.__pollUiCommands()` — React → Rust command queue, drained
+//!   each frame by `App::poll_ui_commands`.
+//! - `window.__rustWillUnlock()` — Rust signals an intentional
+//!   pointer-lock release so the JS pointerlockchange handler doesn't
+//!   synthesize a bogus ESC keydown (the workaround for Chrome's
+//!   first-ESC-eats-the-keydown behavior).
 
 use wasm_bindgen::JsValue;
 use wasm_bindgen::JsCast;

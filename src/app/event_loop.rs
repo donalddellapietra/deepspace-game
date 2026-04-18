@@ -352,28 +352,10 @@ impl App {
             self.inject_webview_input();
         }
 
-        // Drain UI commands from the React overlay on both platforms.
-        // Native: queued by wry IPC. WASM: queued in JS, polled via
-        // `window.__pollUiCommands`.
-        let pump_ui = {
-            #[cfg(not(target_arch = "wasm32"))]
-            { self.overlay_enabled() }
-            #[cfg(target_arch = "wasm32")]
-            { true }
-        };
-        if pump_ui {
+        // Drain UI commands + push state on both platforms. Native:
+        // wry IPC + evaluate_script. WASM: JS queues + window.__onGameState.
+        if self.overlay_active() {
             self.poll_ui_commands();
-        }
-
-        // State push works on both platforms — native flushes via
-        // wry::WebView::evaluate_script, WASM calls window.__onGameState.
-        let push_overlay_state = {
-            #[cfg(not(target_arch = "wasm32"))]
-            { self.overlay_enabled() }
-            #[cfg(target_arch = "wasm32")]
-            { true }
-        };
-        if push_overlay_state {
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Sphere(sphere) => {
                     self.camera.position.in_frame(&sphere.body_path)
@@ -404,7 +386,7 @@ impl App {
             ));
         }
 
-        // Wry batch flush is native-only; WASM push_state is direct.
+        // wry batch flush is native-only; WASM push_state is direct.
         #[cfg(not(target_arch = "wasm32"))]
         if self.overlay_enabled() {
             self.flush_overlay();

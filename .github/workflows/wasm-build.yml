@@ -1,0 +1,31 @@
+# Smoke-build the wasm32 target on every push so the cross-platform
+# build doesn't bitrot. Skips the React UI build + trunk packaging —
+# this is purely "does the Rust still cargo-build for wasm32".
+#
+# Native (macOS) build is not run here because the wry/objc2 deps in
+# Cargo.toml's [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# table are mac-only at the source level, so a Linux/Windows native CI
+# job would need either a macOS runner or a refactor to scope wry to
+# cfg(target_os = "macos"). Punt for now — local mac builds catch it.
+name: wasm-build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cargo-build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - name: cargo build --target wasm32-unknown-unknown
+        run: cargo build --target wasm32-unknown-unknown --bin deepspace-game

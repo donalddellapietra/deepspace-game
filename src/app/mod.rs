@@ -455,6 +455,18 @@ impl App {
         !self.render_harness && !self.disable_overlay
     }
 
+    /// True when the per-frame overlay state push + UI command poll
+    /// should run. Native: gated on `overlay_enabled()` so render
+    /// harness runs skip wry plumbing. WASM: always on — the React
+    /// bridge has no harness mode.
+    #[inline]
+    pub(super) fn overlay_active(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.overlay_enabled() }
+        #[cfg(target_arch = "wasm32")]
+        { true }
+    }
+
     pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {
         if self.frozen { return; }
         self.camera.position.anchor.step_neighbor_cartesian(axis, direction);

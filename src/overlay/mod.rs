@@ -1,5 +1,6 @@
-//! Native: re-export the wry/macOS WKWebView overlay.
-//! WASM: stubs that no-op — React UI lives in the page DOM directly.
+//! Native: re-export the wry/macOS WKWebView overlay bridge.
+//! WASM: re-export the in-page bridge (window.__onGameState +
+//! window.__pollUiCommands).
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
@@ -7,6 +8,6 @@ mod native;
 pub use native::*;
 
 #[cfg(target_arch = "wasm32")]
-mod wasm_stub;
+mod web;
 #[cfg(target_arch = "wasm32")]
-pub use wasm_stub::*;
+pub use web::*;
