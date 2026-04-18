@@ -187,6 +187,11 @@ pub struct App {
     pub(super) last_reused_gpu_tree: bool,
     pub(super) highlight_epoch: u64,
     pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
+    /// Last crosshair reticle state pushed to the overlay. Used by
+    /// `update_highlight` to diff-push `CrosshairStateJs`: the
+    /// overlay only receives an IPC message when the bit actually
+    /// flips, not every frame. `None` = we've never pushed.
+    pub(super) last_crosshair_sent: Option<crate::bridge::CrosshairStateJs>,
     /// Slot path from the last successful break/place edit. Used as a
     /// preserve_path during the next GPU pack so the packer keeps
     /// fine detail along the edit path visible, even when the camera
@@ -340,6 +345,7 @@ impl App {
             last_effective_visual_depth: 0,
             last_reused_gpu_tree: false,
             highlight_epoch: 0,
+            last_crosshair_sent: None,
             cached_highlight: None,
             last_edit_slots: None,
             #[cfg(not(target_arch = "wasm32"))]

@@ -93,22 +93,14 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         }
     }
 
-    let pixel = vec2<f32>(uv.x * uniforms.screen_width, uv.y * uniforms.screen_height);
-    let center = vec2<f32>(uniforms.screen_width * 0.5, uniforms.screen_height * 0.5);
-    let d = abs(pixel - center);
-    let cross_size = 12.0;
-    let cross_thickness = 1.5;
-    let gap = 3.0;
-    let is_crosshair = (d.x < cross_thickness && d.y >= gap && d.y < cross_size)
-                    || (d.y < cross_thickness && d.x >= gap && d.x < cross_size);
-    if is_crosshair {
-        let cross_color = select(
-            vec3<f32>(0.95, 0.95, 0.98),
-            vec3<f32>(1.0, 0.92, 0.18),
-            result.hit,
-        );
-        color = mix(color, cross_color, 0.95);
-    }
+    // The crosshair reticle lives in the HTML overlay — see
+    // `ui/src/components/Crosshair.tsx` and
+    // `src/app/edit_actions/highlight.rs`. Rendering it in the shader
+    // would bake it into the ray-march framebuffer, which either
+    // sits at half-res under TAAU (blurring the 1-pixel strokes) or
+    // aliases against the jitter sequence (pixel crawl on slow
+    // motion). DOM overlay is always at physical resolution and
+    // composites cleanly on top; it's the SOTA separation.
 
     // Emit per-ray stats to the shader_stats buffer. Gated behind
     // the `ENABLE_STATS` override so the off-state has zero runtime
