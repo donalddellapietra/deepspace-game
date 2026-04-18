@@ -24,6 +24,29 @@ fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
     return smoothstep(0.02, 0.14, edge);
 }
 
+// Depth-into-shell tint for sphere hits. `rn` is the hit point's
+// normalized radial coordinate: 0 at the inner shell boundary
+// (deepest interior cell the tree represents), 1 at the outer
+// surface. Maps linearly onto `[0.55, 1.0]` — outward-facing cells
+// come out full-bright, interior cells come out noticeably dimmer.
+//
+// Why: when a break removes a cell and the ray continues to the
+// NEXT cell behind it, the next cell often has the same block type
+// as the broken cell (a uniform stone interior), so material-only
+// shading gives identical colors for "hit broken cell" vs "hit the
+// cell behind the hole." Tinting by `rn` gives the two cells
+// visibly different brightness — deeper cells are darker — so a
+// hole's walls stand out even when material is uniform. Scales with
+// any zoom because `rn` is per-hit; no neighbor lookup or AO pass.
+//
+// Coefficients: 0.55 floor so deep terrain is never pitch-black;
+// 0.45 range gives ~0.017 brightness step per SDF-detail cell
+// (`rn`-delta ≈ 0.037 at `SDF_DETAIL_LEVELS = 4`), well above the
+// 1/255 JND on an 8-bit display.
+fn sphere_depth_tint(rn: f32) -> f32 {
+    return 0.55 + 0.45 * clamp(rn, 0.0, 1.0);
+}
+
 // Pixel-aware bevel overlay for a single tree level.
 //
 // Draws a dark band of ~1 screen-pixel width at the cell's UV edges
@@ -300,7 +323,8 @@ fn march_face_root(
                 t,
                 pixel_density,
             );
-            result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
+            let depth_tint = sphere_depth_tint(rn_abs);
+            result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape * depth_tint;
             result.normal = hit_normal;
             return result;
         }
@@ -457,10 +481,11 @@ fn sphere_in_cell(
                 t,
                 pixel_density,
             );
+            let depth_tint = sphere_depth_tint(rn);
             result.hit = true;
             result.t = t;
             result.normal = hit_normal;
-            result.color = cell_color * (ambient + diffuse * 0.78) * axis_tint * block_shape;
+            result.color = cell_color * (ambient + diffuse * 0.78) * axis_tint * block_shape * depth_tint;
             return result;
         }
 
@@ -613,7 +638,8 @@ fn sphere_in_face_window(
                 t,
                 pixel_density,
             );
-            result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
+            let depth_tint = sphere_depth_tint(rn_abs);
+            result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape * depth_tint;
             return result;
         }
 
