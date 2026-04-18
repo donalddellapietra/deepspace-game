@@ -13,23 +13,20 @@ of time during the debug.
 
 ## Layer ↔ anchor_depth for the demo sphere
 
-`tree_depth = 22` for `bootstrap_demo_sphere_world` (planet subtree depth 20
-+ 1 wrap + 1 root).
+`tree_depth = 30` for `bootstrap_demo_sphere_world` (planet face subtree
+depth 28 + 1 body + 1 root).
 
 ```
 ui_layer = tree_depth − anchor_depth + 1
-anchor_depth = tree_depth − ui_layer + 1 = 23 − ui_layer
+anchor_depth = tree_depth − ui_layer + 1 = 31 − ui_layer
 ```
 
 | UI label         | `--spawn-depth` |
 | ---------------- | --------------: |
-| Layer 22         |               1 |
-| Layer 15         |               8 |
-| Layer  7         |              16 |
-| Layer  1         |              22 |
-
-The reference screenshot ("Layer 15 Terrain", sphere filling ~60% of frame,
-clearly-visible voxel tiles) corresponds to `--spawn-depth 8`.
+| Layer 30         |               1 |
+| Layer 26         |               5 |
+| Layer 15         |              16 |
+| Layer  1         |              30 |
 
 ## `zoom_*` does NOT move the camera
 
