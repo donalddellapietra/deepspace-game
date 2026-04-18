@@ -79,11 +79,12 @@ pub(crate) fn bootstrap_sierpinski_tet_world(depth: u8) -> WorldBootstrap {
 
     let world = sierpinski_tet_world(depth, body, apex);
 
-    // Tetrahedron sits in [0, 3)³; spawn outside on a diagonal that
-    // reveals the tetrahedral silhouette, not an axis-aligned face.
+    // Far-diagonal pose (see `scripts/test-fractals.sh`): body-diagonal
+    // vantage point reveals the tetrahedron's four corners as four
+    // distinct clusters arranged around the centre of frame.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.7, 2.3, 0.3],
+        [2.8, 2.8, 2.8],
         2,
     )
     .deepened_to(8);
@@ -91,8 +92,8 @@ pub(crate) fn bootstrap_sierpinski_tet_world(depth: u8) -> WorldBootstrap {
         world,
         planet_path: None,
         default_spawn_pos: spawn_pos,
-        default_spawn_yaw: 2.4, // face back toward origin
-        default_spawn_pitch: -0.4,
+        default_spawn_yaw: std::f32::consts::FRAC_PI_4,
+        default_spawn_pitch: -0.615,
         plain_layers: depth,
         color_registry: registry,
     }

@@ -84,10 +84,13 @@ pub(crate) fn bootstrap_cantor_dust_world(depth: u8) -> WorldBootstrap {
 
     let world = cantor_dust_world(depth, hue_ids);
 
-    // Spawn offset diagonally so multiple corner hues are visible at once.
+    // Far-diagonal pose (see `scripts/test-fractals.sh`): symmetric
+    // body-diagonal vantage, so all 8 corner hues appear around the
+    // frame (corners closest to camera dominate, opposite corners
+    // shrink into the prism's vanishing point).
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.6, 2.6, 2.6],
+        [2.8, 2.8, 2.8],
         2,
     )
     .deepened_to(8);
@@ -95,8 +98,8 @@ pub(crate) fn bootstrap_cantor_dust_world(depth: u8) -> WorldBootstrap {
         world,
         planet_path: None,
         default_spawn_pos: spawn_pos,
-        default_spawn_yaw: -std::f32::consts::FRAC_PI_4 - 0.3,
-        default_spawn_pitch: -0.5,
+        default_spawn_yaw: std::f32::consts::FRAC_PI_4,
+        default_spawn_pitch: -0.615,
         plain_layers: depth,
         color_registry: registry,
     }

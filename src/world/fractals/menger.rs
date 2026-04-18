@@ -104,11 +104,13 @@ pub(crate) fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
 
     let world = menger_world_two_tone(depth, corner, edge);
 
-    // Spawn outside the sponge looking toward it. Menger sits in
-    // [0, 3)³ at the root; place the camera at (2.5, 2.0, 2.5).
+    // Far-diagonal pose (see `scripts/test-fractals.sh`): (+X,+Y,+Z)
+    // corner of the root cell looking back along the body diagonal.
+    // Reveals the sponge's 3D structure with both corner and edge
+    // tones clearly readable.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.5, 2.0, 2.5],
+        [2.8, 2.8, 2.8],
         2,
     )
     .deepened_to(8);
@@ -116,8 +118,8 @@ pub(crate) fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
         world,
         planet_path: None,
         default_spawn_pos: spawn_pos,
-        default_spawn_yaw: -std::f32::consts::FRAC_PI_4,
-        default_spawn_pitch: -0.6,
+        default_spawn_yaw: std::f32::consts::FRAC_PI_4,
+        default_spawn_pitch: -0.615,
         plain_layers: depth,
         color_registry: registry,
     }

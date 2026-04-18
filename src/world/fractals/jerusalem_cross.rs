@@ -76,10 +76,13 @@ pub(crate) fn bootstrap_jerusalem_cross_world(depth: u8) -> WorldBootstrap {
 
     let world = jerusalem_cross_world(depth, nucleus, rod);
 
-    // The cross extends axially — spawn above one arm and look along it.
+    // Far-diagonal pose (see `scripts/test-fractals.sh`): from the
+    // (+X,+Y,+Z) corner looking back along the body diagonal. The
+    // three orthogonal rods converge toward the camera, giving the
+    // cross its signature ornate filigree silhouette.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [1.5, 2.7, 2.7],
+        [2.8, 2.8, 2.8],
         2,
     )
     .deepened_to(8);
@@ -87,8 +90,8 @@ pub(crate) fn bootstrap_jerusalem_cross_world(depth: u8) -> WorldBootstrap {
         world,
         planet_path: None,
         default_spawn_pos: spawn_pos,
-        default_spawn_yaw: std::f32::consts::PI,
-        default_spawn_pitch: -0.55,
+        default_spawn_yaw: std::f32::consts::FRAC_PI_4,
+        default_spawn_pitch: -0.615,
         plain_layers: depth,
         color_registry: registry,
     }
