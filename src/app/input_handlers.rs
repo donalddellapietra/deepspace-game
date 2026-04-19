@@ -51,6 +51,14 @@ impl App {
                 self.spawn_test_entities(1000);
                 return;
             }
+            if code == KeyCode::KeyB {
+                self.spawn_test_cubes(10);
+                return;
+            }
+            if code == KeyCode::KeyV {
+                self.spawn_test_cubes(1000);
+                return;
+            }
         }
 
         if pressed && code == KeyCode::Escape {

@@ -54,6 +54,21 @@ impl App {
         self.upload_tree();
     }
 
+    /// Spawn `n` uniform-stone-cube entities. Bound to B (10) and V
+    /// (1000) — the original behavior of N/M before the soldier
+    /// model took over those keys. Useful for raster-perf stress
+    /// tests where we want a single-color subtree (greedy meshing
+    /// merges every face of a 27-voxel stone cube into 6 quads, so
+    /// 10k cubes are much cheaper to render than 10k soldiers).
+    pub(in crate::app) fn spawn_test_cubes(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let subtree_id = self.get_or_build_stone_cube_subtree();
+        self.spawn_grid(subtree_id, n);
+        self.upload_tree();
+    }
+
     /// Load `assets/vox/soldier.vox` on first call and stash the
     /// resulting subtree NodeId on `self.cached_soldier_subtree` so
     /// subsequent spawns skip the file read and palette registration.
