@@ -117,6 +117,9 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         }
         atomicAdd(&shader_stats.sum_steps_div4, (ray_steps + 3u) >> 2u);
         atomicMax(&shader_stats.max_steps, ray_steps);
+        if result.hit {
+            atomicAdd(&shader_stats.sum_steps_hits_div4, (ray_steps + 3u) >> 2u);
+        }
         atomicAdd(&shader_stats.sum_steps_oob_div4, (ray_steps_oob + 3u) >> 2u);
         atomicAdd(&shader_stats.sum_steps_empty_div4, (ray_steps_empty + 3u) >> 2u);
         atomicAdd(&shader_stats.sum_steps_node_descend_div4, (ray_steps_node_descend + 3u) >> 2u);

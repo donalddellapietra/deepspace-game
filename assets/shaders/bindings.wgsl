@@ -109,7 +109,11 @@ struct ShaderStats {
     sum_loads_offsets_div4: atomic<u32>,
     sum_loads_kinds_div4: atomic<u32>,
     sum_loads_ribbon_div4: atomic<u32>,
-    _pad5: u32,
+    /// Steps accumulated ONLY for rays that returned hit=true.
+    /// Divided by 4 to fit in u32. Combined with `hit_count`
+    /// this gives avg steps per hit; subtracted from sum_steps
+    /// it gives the per-miss total.
+    sum_steps_hits_div4: atomic<u32>,
 }
 
 /// Interleaved sparse-tree storage. Each node occupies

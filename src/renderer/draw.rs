@@ -56,6 +56,11 @@ pub struct ShaderStatsFrame {
     pub sum_loads_offsets_div4: u32,
     pub sum_loads_kinds_div4: u32,
     pub sum_loads_ribbon_div4: u32,
+    /// Steps accumulated over rays that RETURNED a hit. Divided
+    /// by 4 on the GPU side. Use with `hit_count` to compute avg
+    /// steps per hit; `sum_steps_div4 - sum_steps_hits_div4` gives
+    /// the per-miss total.
+    pub sum_steps_hits_div4: u32,
 }
 
 impl ShaderStatsFrame {
@@ -111,6 +116,18 @@ impl ShaderStatsFrame {
     pub fn avg_loads_total(&self) -> f64 {
         self.avg_loads_tree() + self.avg_loads_offsets()
             + self.avg_loads_kinds() + self.avg_loads_ribbon()
+    }
+
+    pub fn avg_steps_per_hit(&self) -> f64 {
+        if self.hit_count == 0 { 0.0 }
+        else { (self.sum_steps_hits_div4 as f64 * 4.0) / self.hit_count as f64 }
+    }
+
+    pub fn avg_steps_per_miss(&self) -> f64 {
+        let miss_count = self.miss_count;
+        if miss_count == 0 { return 0.0; }
+        let miss_sum_div4 = self.sum_steps_div4.saturating_sub(self.sum_steps_hits_div4);
+        (miss_sum_div4 as f64 * 4.0) / miss_count as f64
     }
 
     pub fn hit_fraction(&self) -> f64 {
@@ -513,6 +530,7 @@ impl Renderer {
             sum_loads_offsets_div4: read_u32(48),
             sum_loads_kinds_div4: read_u32(52),
             sum_loads_ribbon_div4: read_u32(56),
+            sum_steps_hits_div4: read_u32(60),
         };
         drop(data);
         self.shader_stats_readback.unmap();

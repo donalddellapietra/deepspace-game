@@ -292,6 +292,8 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             avg_loads_offsets: render_timing.shader_stats.avg_loads_offsets(),
             avg_loads_kinds: render_timing.shader_stats.avg_loads_kinds(),
             avg_loads_ribbon: render_timing.shader_stats.avg_loads_ribbon(),
+            avg_steps_per_hit: render_timing.shader_stats.avg_steps_per_hit(),
+            avg_steps_per_miss: render_timing.shader_stats.avg_steps_per_miss(),
             packed_node_count,
             ribbon_len,
             effective_visual_depth,
@@ -390,6 +392,8 @@ struct FrameSample {
     avg_loads_offsets: f64,
     avg_loads_kinds: f64,
     avg_loads_ribbon: f64,
+    avg_steps_per_hit: f64,
+    avg_steps_per_miss: f64,
     packed_node_count: u32,
     ribbon_len: u32,
     effective_visual_depth: u32,
@@ -486,6 +490,8 @@ struct PerfAgg {
     sum_avg_loads_offsets: f64,
     sum_avg_loads_kinds: f64,
     sum_avg_loads_ribbon: f64,
+    sum_avg_steps_per_hit: f64,
+    sum_avg_steps_per_miss: f64,
     sum_packed_node_count: u64,
     sum_ribbon_len: u64,
     worst_total_ms: f64,
@@ -550,6 +556,8 @@ impl PerfAgg {
         self.sum_avg_loads_offsets += s.avg_loads_offsets;
         self.sum_avg_loads_kinds += s.avg_loads_kinds;
         self.sum_avg_loads_ribbon += s.avg_loads_ribbon;
+        self.sum_avg_steps_per_hit += s.avg_steps_per_hit;
+        self.sum_avg_steps_per_miss += s.avg_steps_per_miss;
         if s.max_steps > self.max_max_steps {
             self.max_max_steps = s.max_steps;
         }
@@ -649,6 +657,12 @@ impl PerfAgg {
         eprintln!(
             "render_harness_loads frames={} avg_loads_total={:.2} tree={:.2} offsets={:.2} kinds={:.2} ribbon={:.2}",
             self.frame_count, loads_total, loads_tree, loads_offsets, loads_kinds, loads_ribbon,
+        );
+        eprintln!(
+            "render_harness_hitmiss frames={} avg_steps_per_hit={:.2} avg_steps_per_miss={:.2}",
+            self.frame_count,
+            self.sum_avg_steps_per_hit / n,
+            self.sum_avg_steps_per_miss / n,
         );
     }
 }
