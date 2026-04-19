@@ -178,6 +178,7 @@ impl App {
         let lod_base_depth = self.lod_base_depth;
         let live_sample_every = self.live_sample_every_frames;
         let taa_enabled = self.taa_enabled;
+        let entity_render_mode = self.entity_render_mode;
         let node_count = node_kinds.len();
         let tree_u32_count = tree_packed.len();
 
@@ -206,6 +207,7 @@ impl App {
                 lod_base_depth,
                 live_sample_every,
                 taa_enabled,
+                entity_render_mode,
             ));
             self.finish_init(renderer);
         }
@@ -251,6 +253,7 @@ impl App {
                     lod_base_depth,
                     live_sample_every,
                     taa_enabled,
+                    entity_render_mode,
                 )
                 .await;
                 if proxy.send_event(UserEvent::RendererReady(Box::new(renderer))).is_err() {

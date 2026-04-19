@@ -8,10 +8,15 @@ use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuPalette, GpuRibbon
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
+use super::entity_raster::EntityRasterState;
 use super::taa::{TaaState, MARCH_COLOR_FORMAT, MARCH_T_FORMAT};
-use super::{GpuUniforms, Renderer, TimestampScratch, ROOT_KIND_CARTESIAN};
+use super::{
+    create_depth_texture, EntityRenderMode, GpuUniforms, Renderer, TimestampScratch,
+    DEPTH_FORMAT, ROOT_KIND_CARTESIAN,
+};
 
 impl Renderer {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
         tree: &[u32],
@@ -24,7 +29,16 @@ impl Renderer {
         lod_base_depth: u32,
         live_sample_every_frames: u32,
         taa_enabled: bool,
+        entity_render_mode: EntityRenderMode,
     ) -> Self {
+        // Raster entities require a depth handoff from the ray-march
+        // pass; the TAA resolve would need to participate, which
+        // we're not doing in this iteration. Fail loud so misuse is
+        // caught at startup, not debug-hunted at render time.
+        assert!(
+            !(entity_render_mode == EntityRenderMode::Raster && taa_enabled),
+            "--entity-render raster is incompatible with --taa (depth handoff would need half-res adaptation)",
+        );
         // On web, winit's `inner_size` lags behind the canvas backing
         // store (request_inner_size doesn't apply synchronously and
         // ensure_started runs before any resize event), so we read the
@@ -168,6 +182,12 @@ impl Renderer {
             _pad2: 0.0,
             up: [0.0, 1.0, 0.0],
             fov: 1.2,
+            view_proj: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -379,6 +399,57 @@ impl Renderer {
             cache: None,
         });
 
+        // When raster entities are enabled, compile a ray-march
+        // pipeline variant with a Depth32Float attachment and the
+        // `fs_main_depth` fragment entry point, which writes
+        // `@builtin(frag_depth)` derived from `camera.view_proj`.
+        // The subsequent entity raster pass z-tests against that
+        // depth buffer. Keeping this as a separate pipeline (rather
+        // than overriding `depth_stencil: None` on the default one)
+        // means ray-march-only runs pay zero depth-write cost.
+        let (pipeline_with_depth, depth_texture, depth_view, entity_raster) =
+            if matches!(entity_render_mode, EntityRenderMode::Raster) {
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("ray_march_with_depth"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main_depth"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: frag_compilation_options.clone(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Always,
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                });
+                let (tex, view) = create_depth_texture(&device, config.width, config.height);
+                let raster = EntityRasterState::new(&device, config.format, DEPTH_FORMAT);
+                (Some(pipeline), Some(tex), Some(view), Some(raster))
+            } else {
+                (None, None, None, None)
+            };
+
         // When TAAU is enabled, compile a second ray-march pipeline
         // with the `fs_main_taa` entry point — two color attachments
         // (linear RGBA16F color + R32F hit t) at half-res. Both
@@ -495,6 +566,11 @@ impl Renderer {
             shader_stats_enabled,
             live_frame_counter: 0,
             live_sample_every_frames,
+            entity_render_mode,
+            depth_texture,
+            depth_view,
+            pipeline_with_depth,
+            entity_raster,
         }
     }
 }

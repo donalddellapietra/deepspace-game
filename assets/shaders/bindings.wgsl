@@ -14,6 +14,12 @@ struct Camera {
     _pad2: f32,
     up: vec3<f32>,
     fov: f32,
+    /// World → clip-space matrix. Only used by `fs_main_depth`
+    /// (entity raster mode), which writes `@builtin(frag_depth)`
+    /// from `view_proj * world_hit` so the raster pass can z-test
+    /// against the ray-march output. Ignored by `fs_main` /
+    /// `fs_main_taa` — no cost when raster is disabled.
+    view_proj: mat4x4<f32>,
 }
 
 struct Palette {

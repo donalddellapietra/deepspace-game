@@ -8,11 +8,32 @@
 
 mod buffers;
 mod draw;
+pub mod entity_raster;
 mod init;
 mod taa;
 
 pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
+pub use entity_raster::{compute_view_proj, EntityRasterState, InstanceData};
 pub use taa::{FrameSignature, TaaState};
+
+/// How entities are rendered. Chosen at startup via
+/// `--entity-render` and baked into the Renderer (pipelines and
+/// buffers are allocated accordingly). Mutating at runtime isn't
+/// supported — a toggle would require rebuilding the ray-march
+/// pipeline and reallocating the depth texture.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum EntityRenderMode {
+    #[default]
+    /// Entities enter the tree as `Child::EntityRef(idx)` and are
+    /// ray-marched through the tag=3 branch of `march_cartesian`.
+    /// Default. Decent perf up to ~1k entities.
+    RayMarch,
+    /// Entities are rendered as instanced triangle meshes in a
+    /// separate raster pass after the ray-march. Scales to 100k+.
+    /// Incompatible with TAA (depth buffer handoff would need
+    /// half-res adaptation).
+    Raster,
+}
 
 /// Maximum ancestor-ribbon depth supported by the shader. Larger
 /// ribbons get truncated at upload (anything beyond can't pop).
@@ -157,6 +178,48 @@ pub struct Renderer {
     /// frames. CPU-side only — no `device.poll(Wait)` stall. Set via
     /// `--live-sample-every N` CLI flag; 0 (default) disables.
     pub(super) live_sample_every_frames: u32,
+    /// Which entity render path this renderer is wired for. Baked
+    /// at `Renderer::new` time; the raster path allocates the
+    /// depth-aware ray-march pipeline, a depth texture, and an
+    /// `EntityRasterState`.
+    pub(super) entity_render_mode: EntityRenderMode,
+    /// Depth texture used by the raster entity pass. Present iff
+    /// `entity_render_mode == Raster`. The ray-march pass writes
+    /// `@builtin(frag_depth)` via the `fs_main_depth` entry point;
+    /// the raster pass runs second with `depth_compare: Less`.
+    pub(super) depth_texture: Option<wgpu::Texture>,
+    pub(super) depth_view: Option<wgpu::TextureView>,
+    /// Ray-march pipeline compiled with a depth attachment + the
+    /// `fs_main_depth` fragment entry point. Used only when
+    /// `entity_render_mode == Raster`.
+    pub(super) pipeline_with_depth: Option<wgpu::RenderPipeline>,
+    /// Raster pass for entity meshes. Present iff
+    /// `entity_render_mode == Raster`.
+    pub(super) entity_raster: Option<EntityRasterState>,
+}
+
+/// Depth attachment format for the raster entity pass. 32-bit float
+/// gives us plenty of precision at the frame-local scale (cells are
+/// 3 units wide and near/far clip is 0.001/100).
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+pub(super) fn create_depth_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("entity_raster_depth"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 /// GPU timestamp query resources. `query_set` holds two timestamp
@@ -244,8 +307,22 @@ impl Renderer {
         if let Some(taa) = self.taa.as_mut() {
             taa.resize(&self.device, width, height);
         }
+        if self.entity_render_mode == EntityRenderMode::Raster {
+            let (tex, view) = create_depth_texture(&self.device, width, height);
+            self.depth_texture = Some(tex);
+            self.depth_view = Some(view);
+        }
         self.write_uniforms();
     }
+
+    pub fn entity_render_mode(&self) -> EntityRenderMode { self.entity_render_mode }
+
+    pub fn entity_raster_mut(&mut self) -> Option<&mut EntityRasterState> {
+        self.entity_raster.as_mut()
+    }
+
+    pub fn device(&self) -> &wgpu::Device { &self.device }
+    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
 
     /// Mark the TAAU history as invalid for the next few frames.
     /// Callers must invoke this whenever the render-frame root
@@ -277,6 +354,11 @@ impl Renderer {
             None => (self.config.width, self.config.height),
         }
     }
+
+    /// Public wrapper for `march_dims` — used by the app layer to
+    /// build the view+projection matrix with the right aspect ratio
+    /// (the ray-march pass is half-res under TAAU).
+    pub fn march_dims_public(&self) -> (u32, u32) { self.march_dims() }
 
     pub(super) fn current_frame_signature(&self) -> FrameSignature {
         FrameSignature {

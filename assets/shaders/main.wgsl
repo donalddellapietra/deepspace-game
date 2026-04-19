@@ -146,6 +146,39 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(shaded.rgb, 1.0);
 }
 
+/// Raster-entity companion entry point. Writes color plus
+/// `@builtin(frag_depth)` so the subsequent entity raster pass
+/// z-tests against the ray-march's terrain hits. The depth is
+/// `(view_proj * world_hit).z / .w` — the same projection the
+/// raster pipeline uses — so the two passes share a depth buffer
+/// pixel-accurately.
+///
+/// Sky (no hit) writes 1.0 = far plane, so entity pixels over sky
+/// always draw.
+struct DepthFragOut {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+
+@fragment
+fn fs_main_depth(in: VertexOutput) -> DepthFragOut {
+    let ray_dir = jittered_ray_dir(in.uv);
+    let shaded = shade_pixel(in.uv);
+    let t = shaded.a;
+    var depth: f32;
+    if t > 0.0 {
+        let hit = camera.pos + ray_dir * t;
+        let clip = camera.view_proj * vec4<f32>(hit, 1.0);
+        depth = clamp(clip.z / clip.w, 0.0, 1.0);
+    } else {
+        depth = 1.0;
+    }
+    var out: DepthFragOut;
+    out.color = vec4<f32>(shaded.rgb, 1.0);
+    out.depth = depth;
+    return out;
+}
+
 /// TAAU entry point. Writes color to `@location(0)` and hit t to
 /// `@location(1)` (R32Float), both at the half-res render target.
 /// The resolve pass reconstructs world-space hit positions from

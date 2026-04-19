@@ -194,6 +194,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         cfg.lod_base_depth.unwrap_or(8),
         cfg.live_sample_every_frames.unwrap_or(0),
         cfg.taa,
+        cfg.entity_render_mode,
     ));
     let mut renderer = renderer;
     renderer.update_palette(&app.palette.to_gpu_palette());

@@ -22,6 +22,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
     ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
     ("taa_resolve.wgsl", include_str!("../assets/shaders/taa_resolve.wgsl")),
+    ("entity_raster.wgsl", include_str!("../assets/shaders/entity_raster.wgsl")),
 ];
 
 fn lookup(name: &str) -> &'static str {
