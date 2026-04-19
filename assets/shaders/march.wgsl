@@ -444,23 +444,16 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            // Ribbon-level LOD budget: the ancestor pop count is
-            // the tree's native distance metric. Inside our anchor
-            // cell (ribbon_level=0) we allow `BASE_DETAIL_DEPTH`
-            // levels of descent; each additional shell (ribbon pop)
-            // drops the budget by one, bottoming out at 1. This
-            // gives cubic LOD shells that are invariant under zoom
-            // — zooming out grows the ribbon by one outer shell at
-            // budget=1 and leaves everything else unchanged.
-            // Nyquist (LOD_PIXEL_THRESHOLD) still acts as an inner
-            // floor so we don't descend into sub-pixel detail.
-            let detail_budget = select(
-                1u,
-                BASE_DETAIL_DEPTH - ribbon_level,
-                ribbon_level < BASE_DETAIL_DEPTH,
-            );
-            let cart_depth_limit = min(detail_budget, MAX_STACK_DEPTH);
-            r = march_cartesian(current_idx, ray_origin, ray_dir, cart_depth_limit, skip_slot);
+            // Cartesian frame: no depth cap beyond the hardware
+            // stack ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is
+            // the sole visual LOD gate — rays stop descending
+            // when cells fall below the pixel floor, which is
+            // cubic-LOD by construction (cell_size / ray_dist
+            // scales correctly across ribbon-pops since both are
+            // in the same frame-local units). The empty-subtree
+            // fast-path at `march_cartesian` (child_bt == 255)
+            // handles uniform-empty early exit.
+            r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
         }
         if r.hit {
             r.frame_level = ribbon_level;

@@ -16,7 +16,11 @@ use crate::world::{aabb, raycast};
 
 use super::{ActiveFrameKind, App};
 
-pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = 12;
+/// CPU-side ceiling for `visual_depth()` (feeds the sphere/face
+/// walker's `uniforms.max_depth`). Picked equal to the tree's
+/// absolute max so the sphere path isn't artificially capped —
+/// the Cartesian path doesn't use this any more.
+pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
 pub(super) const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
 pub(super) const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 1.0;

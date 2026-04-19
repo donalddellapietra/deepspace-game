@@ -604,17 +604,28 @@ fn air_subtree(lib: &mut NodeLibrary, depth: u8) -> NodeId {
     lib.insert(uniform_children(Child::Node(child)))
 }
 
-/// Carve an air cavity at the camera's anchor position.
+/// Ensure the camera's anchor path is tree-walkable down to
+/// `anchor.depth()`, inserting a fresh empty Node at any slot that
+/// was `Child::Empty` or `Child::Block` along the walk, and carving
+/// an air subtree at the final slot of depth `anchor.depth() - 1`.
 ///
-/// Replaces the cell at `anchor.depth()` with an air-filled Node
-/// subtree (not `Child::Empty`) so the render-frame tree walk can
-/// descend through the carved region. This is critical: if the carved
-/// cell were `Child::Empty`, the walk would stop there and the render
-/// frame would be stuck at a shallow depth — zooming deeper would
-/// show no visual change.
+/// Two guarantees for the renderer:
+/// 1. `compute_render_frame` can walk the anchor path all the way
+///    down — critical for fractals (Menger's body-centre Empties,
+///    Sierpinski's unused corner slots, etc.) where the path would
+///    otherwise stall on a structural Empty at depth 2–3.
+/// 2. The last cell (at `anchor.depth()`) is always air, so plain-
+///    world spawn lands in an air pocket rather than inside a
+///    dirt/grass block.
 ///
-/// The air subtree extends to `total_depth` so the user can zoom to
-/// any depth inside the cavity and still get a deep render frame.
+/// The expand-on-walk is a side effect the renderer *needs*; the
+/// final-cell carve is a side effect plain-worlds *want*. Both
+/// happen together because a single bottom-up rebuild stitches the
+/// new child IDs upward through the whole anchor path.
+///
+/// The air subtree below the final cell extends to `total_depth` so
+/// the user can zoom to any depth inside the cavity and still get a
+/// deep, walkable render frame.
 pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) {
     if anchor.depth() < 2 { return; }
     let slots = anchor.as_slice();

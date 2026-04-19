@@ -250,16 +250,46 @@ only need ~5 stack slots. Dropped `MAX_STACK_DEPTH` to 5:
 Live game at 2560×1440 retina: `avg_frame_fps = 60.89` across 586
 samples, steady through a scripted zoom-out across layers 33→37.
 
-If BASE_DETAIL_DEPTH is raised later, `MAX_STACK_DEPTH` must be
-raised to match or descent is silently capped.
+## Epilogue: ribbon-shell LOD retired (2026-04)
+
+The ribbon-shell `BASE_DETAIL_DEPTH - ribbon_level` gate documented
+above was removed once the fractal presets work exposed its real
+cost: it capped descent at 4 levels inside the anchor cell, which
+for any fractal deeper than `plain_layers = 4` meant the shader hit
+`at_max` before `at_lod` and rendered `representative_block` at
+every ray hit. Menger corners/edges collapsed to a single majority
+colour.
+
+Three related changes made the gate redundant:
+
+- `MAX_STACK_DEPTH` was raised from 5 to 20 so the DDA actually has
+  room to reach Block leaves.
+- `carve_air_pocket` was made to expand Empty cells along the
+  camera's anchor path so `compute_render_frame` doesn't stall at
+  the first structural void (Menger's body-centre at path depth 3).
+- The fractal presets default `plain_layers = 8`, where leaves are
+  pixel-visible at close range — Nyquist then lets rays terminate
+  on real Block leaves (`avg_lod_terminal` went 4.00 → 0.16).
+
+With those in place, `LOD_PIXEL_THRESHOLD` (Nyquist) alone gives
+correct cubic LOD because `cell_size / ray_dist` is frame-invariant.
+The `child_bt == 255` empty-subtree fast path handles the uniform-
+air case the ribbon-shell budget used to catch. `BASE_DETAIL_DEPTH`,
+its `--lod-base-depth` flag, the ribbon-aware detail_budget
+computation in `march.wgsl`, and the WGSL override constant have
+all been deleted.
+
+The plain-world `170 → 21 iter/ray` regression that the gate
+originally solved is no longer reproducible: the stack is deep
+enough to reach Nyquist naturally, and the empty-rep fast path
+cuts through uniform-air cells that used to be walked slot-by-slot.
 
 ## Related instrumentation
 
 - `scripts/perf-breakdown.sh` — matrix runner.
 - `--shader-stats` — enable atomics and stats readback.
 - `--perf-trace <path>` — per-frame CSV.
-- `--lod-base-depth N` — ribbon-level detail budget.
-- `--lod-pixels N` — Nyquist floor.
+- `--lod-pixels N` — Nyquist floor (sole visual LOD gate).
 - `--interaction-radius N` — cursor / break reach cap.
 - `renderer_slow …` stderr lines in live mode with phase timings
   + branch counters.

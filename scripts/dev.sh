@@ -16,6 +16,6 @@ echo "Vite ready"
 
 # Start native game (wry WebView overlay loads from Vite)
 # Any extra arguments to this script are forwarded to the game binary
-# after `--`, so e.g. `scripts/dev.sh --menger-world --lod-base-depth 20`
+# after `--`, so e.g. `scripts/dev.sh --menger-world --lod-pixels 2.0`
 # launches with those flags active.
 cargo run --bin deepspace-game -- "$@"

@@ -150,40 +150,29 @@ override ENABLE_STATS: bool = false;
 /// projected screen size is below this many pixels
 /// (`cell_size / ray_dist * screen_height / (2 tan(fov/2))
 ///  < LOD_PIXEL_THRESHOLD`). Default 1.0 = classic sub-pixel
-/// rejection. This is a FLOOR: we never waste work on sub-pixel
-/// detail. The CEILING is set by `BASE_DETAIL_DEPTH` below.
+/// rejection. This is the ONLY visual LOD gate; the earlier
+/// ribbon-shell budget was removed once Nyquist + empty-subtree
+/// fast-path proved sufficient on their own.
 override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 
-/// Pipeline-override constant: detail budget inside the anchor
-/// cell (ribbon_level=0). Each additional ribbon-pop shell gets
-/// one less level of detail — so a ray that's walked N ancestor
-/// shells away from the camera is clamped to descend
-/// `max(BASE_DETAIL_DEPTH - N, 1)` levels in its current frame.
-///
-/// This is the primary LOD gate. It's frame-local (uses the
-/// tree's own ribbon structure as the distance metric), so it's
-/// invariant under zoom: zooming out adds one outer shell at
-/// budget=1 and leaves everything else unchanged.
-///
-/// Default 4 gives detailed close content (4 levels under anchor)
-/// while keeping far content cheap (1-level LOD terminal beyond
-/// ribbon shell 3). Tune via `--lod-base-depth <N>`.
-override BASE_DETAIL_DEPTH: u32 = 20u;
-
 const MAX_FACE_DEPTH: u32 = 63u;
-/// Cartesian DDA stack depth — must be ≥ `BASE_DETAIL_DEPTH + 1`.
-/// Must be wide enough that the DDA can descend from the render
-/// frame all the way to Block leaves. For a fractal-heavy world
-/// with `plain_layers = 20` and a render frame that stalls at
-/// depth ~2 (because of Empty cells along the camera path), we
-/// need ~18 slots to reach leaves. 20 gives us that + a small
-/// safety margin. At this size the 5 per-fragment DDA stacks
-/// (20 × 60 B each = 1.2 KB total) exceed the Apple Silicon
-/// register-file budget and spill to threadgroup memory — that
-/// was the old 5-level optimization. Fractals need the reach
-/// more than they need the last 20% of perf; we accept the
-/// ~2× GPU-pass-ms hit documented in
-/// `docs/testing/perf-lod-diagnosis.md`.
+/// Cartesian DDA stack depth — the hard descent ceiling.
+///
+/// Sized so a ray starting at any render frame can reach the
+/// deepest Block leaves of the worlds we ship. The fractal
+/// presets generate trees 8 levels deep and the camera's render
+/// frame sits around tree depth 0-2 (Empty cells along the
+/// camera path stop `compute_render_frame` early), so we need
+/// ~8-10 slots for fractals at current sizing. Plain and
+/// imported-vox worlds can go deeper; 20 covers both generously.
+///
+/// Larger values exceed the Apple Silicon register-file budget
+/// per invocation and spill to threadgroup memory: at 64 slots
+/// (the historical pre-perf-diagnosis setting) GPU-pass-ms went
+/// from ~35 ms to ~17 ms when dropped to 5. At 20 the spill
+/// cost is measurable but fractals are much lighter per-ray
+/// than plain-world content was in those measurements. See
+/// `docs/testing/perf-lod-diagnosis.md` for the empirical data.
 const MAX_STACK_DEPTH: u32 = 20u;
 
 struct HitResult {

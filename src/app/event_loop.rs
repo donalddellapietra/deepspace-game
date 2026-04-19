@@ -175,7 +175,6 @@ impl App {
         };
         let shader_stats_enabled = self.shader_stats_enabled;
         let lod_pixel_threshold = self.lod_pixel_threshold;
-        let lod_base_depth = self.lod_base_depth;
         let live_sample_every = self.live_sample_every_frames;
         let taa_enabled = self.taa_enabled;
         let node_count = node_kinds.len();
@@ -203,7 +202,6 @@ impl App {
                 present_mode,
                 shader_stats_enabled,
                 lod_pixel_threshold,
-                lod_base_depth,
                 live_sample_every,
                 taa_enabled,
             ));
@@ -248,7 +246,6 @@ impl App {
                     present_mode,
                     shader_stats_enabled,
                     lod_pixel_threshold,
-                    lod_base_depth,
                     live_sample_every,
                     taa_enabled,
                 )

@@ -15,18 +15,14 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeKind, MAX_DEPTH};
 
-/// Levels shallower than the camera's anchor at which the render
-/// frame sits. The frame walks down the camera's path until either
-/// (a) it reaches `anchor_depth - RENDER_FRAME_K`, or (b) it would
-/// cross into a non-Cartesian node — whichever happens first. The
-/// non-Cartesian stop is required because the shader's main DDA
-/// only knows how to march through Cartesian children at the frame
-/// root (sphere body / face-cell roots are next-session work).
-///
-/// `RENDER_FRAME_MAX_DEPTH` was the historical pin at root (0) used
-/// to validate the sphere dispatch; with the precision rewrite in
-/// place it's now `MAX_DEPTH` so the walker can descend freely
-/// through Cartesian zones.
+/// `render_margin` passed to `with_render_margin`. For Cartesian
+/// frames `min_render_depth = logical.depth()` so this constant is
+/// dormant — render_path = logical_path regardless of K. It still
+/// controls the spread between logical and render paths on Sphere
+/// and Body frames, where the logical path continues through the
+/// face subtree but the render walker stays at the containing body
+/// cell. The `= 3` value is a historical pin kept for sphere path
+/// stability.
 pub const RENDER_FRAME_K: u8 = 3;
 pub const RENDER_FRAME_MAX_DEPTH: u8 = MAX_DEPTH as u8;
 pub const RENDER_FRAME_CONTEXT: u8 = 4;
@@ -192,11 +188,10 @@ pub struct App {
     pub(super) shader_stats_enabled: bool,
     /// Nyquist LOD pixel threshold for the Cartesian shader.
     /// Threaded to `Renderer::new` where it's baked into the
-    /// pipeline as a WGSL `override` constant.
+    /// pipeline as a WGSL `override` constant. This is the sole
+    /// visual LOD gate now that the old ribbon-shell descent
+    /// budget has been retired.
     pub(super) lod_pixel_threshold: f32,
-    /// Ribbon-level base detail budget. See bindings.wgsl
-    /// `BASE_DETAIL_DEPTH`.
-    pub(super) lod_base_depth: u32,
     /// When > 0, the live-surface `render()` path emits a
     /// `render_live_sample` line every N frames with CPU-side phase
     /// timings (acquire / encode / submit / present / total). 0
@@ -293,10 +288,10 @@ impl App {
         let forced_visual_depth = test_cfg.force_visual_depth;
         let forced_edit_depth = test_cfg.force_edit_depth;
         let shader_stats_enabled = test_cfg.shader_stats;
-        // Nyquist floor: sub-pixel rejection only. Primary LOD gate
-        // is ribbon-level-based (`lod_base_depth`).
+        // Nyquist floor: sub-pixel rejection only. This is the
+        // sole visual LOD gate; the stack depth (MAX_STACK_DEPTH
+        // in the shader) is the hard ceiling.
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
-        let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(20);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let taa_enabled = test_cfg.taa;
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
@@ -418,7 +413,6 @@ impl App {
             harness_height,
             shader_stats_enabled,
             lod_pixel_threshold,
-            lod_base_depth,
             live_sample_every_frames,
             taa_enabled,
             interaction_radius_cells,

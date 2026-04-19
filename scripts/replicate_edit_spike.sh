@@ -29,7 +29,7 @@ BUDGET_MS="${EDIT_SPIKE_BUDGET_MS:-5}"
 
 ./target/debug/deepspace-game --render-harness \
     --vox-model assets/vox/soldier_729.vxs \
-    --plain-layers 20 --vox-interior-depth 13 --lod-base-depth 20 --shader-stats \
+    --plain-layers 20 --vox-interior-depth 13 --shader-stats \
     --spawn-xyz 0.5 1.5 0.12 --spawn-depth 10 --spawn-pitch -1.5 \
     --disable-overlay --harness-width 600 --harness-height 400 \
     --script "wait:10,fly_to_surface,wait:5,break,wait:5,place,wait:5,break,wait:5,place,wait:5,break,wait:5" \
