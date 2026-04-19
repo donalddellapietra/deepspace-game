@@ -156,24 +156,30 @@ override ENABLE_STATS: bool = false;
 override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 
 const MAX_FACE_DEPTH: u32 = 63u;
+
 /// Cartesian DDA stack depth — the hard descent ceiling.
 ///
-/// Sized so a ray starting at any render frame can reach the
-/// deepest Block leaves of the worlds we ship. The fractal
-/// presets generate trees 8 levels deep and the camera's render
-/// frame sits around tree depth 0-2 (Empty cells along the
-/// camera path stop `compute_render_frame` early), so we need
-/// ~8-10 slots for fractals at current sizing. Plain and
-/// imported-vox worlds can go deeper; 20 covers both generously.
+/// Sized to the Nyquist-limited descent depth, NOT tree depth.
+/// When a ray ribbon-pops to an ancestor frame, the fresh
+/// `march_cartesian` starts with `depth=0` and must descend
+/// until `cell_size/ray_dist < LOD_PIXEL_THRESHOLD`. The number
+/// of levels that takes is:
 ///
-/// Larger values exceed the Apple Silicon register-file budget
-/// per invocation and spill to threadgroup memory: at 64 slots
-/// (the historical pre-perf-diagnosis setting) GPU-pass-ms went
-/// from ~35 ms to ~17 ms when dropped to 5. At 20 the spill
-/// cost is measurable but fractals are much lighter per-ray
-/// than plain-world content was in those measurements. See
-/// `docs/testing/perf-lod-diagnosis.md` for the empirical data.
-const MAX_STACK_DEPTH: u32 = 20u;
+///     ceil(log₃(S_root · H / (2·tan(fov/2) · d_min · τ))) + 1
+///
+/// For 2560×1440 fov≈70° at `d_min ≈ 4.85` world units (the
+/// fractal-presets canonical spawn) this comes out to 7. We
+/// round up to 8 for headroom at closer zooms. Independent of
+/// `tree_depth` — Nyquist prunes before the tree does, so a
+/// `plain_layers = 40` world still only needs ~7 levels to
+/// reach its effective visible horizon.
+///
+/// Per-invocation register cost scales linearly. At 8 the 5
+/// per-fragment DDA stack arrays (~1 KB total) are just at the
+/// Apple Silicon register-file boundary; larger values spill to
+/// threadgroup memory, adding memory latency to every DDA
+/// iteration. See `docs/testing/perf-lod-diagnosis.md`.
+const MAX_STACK_DEPTH: u32 = 8u;
 
 struct HitResult {
     hit: bool,
