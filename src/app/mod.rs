@@ -181,6 +181,13 @@ pub struct App {
     /// instanced raster (scales to 100k+). Set from CLI
     /// `--entity-render` and baked into Renderer::new.
     pub(super) entity_render_mode: crate::renderer::EntityRenderMode,
+    /// World-coordinate Y where entities naturally rest. `Some` for
+    /// flat worlds (sea level = a specific Y); `None` for sphere/
+    /// fractal worlds where "resting height" is position-dependent.
+    /// Entities snap to this Y at spawn and during motion, so a
+    /// soldier walking around a flat world stays on the grass
+    /// instead of drifting up through the sky over time.
+    pub(super) entity_surface_y: Option<f32>,
     /// Block-interaction radius in anchor-cell units. Caps the
     /// cursor raycast distance so break/place only succeed when
     /// the target is within `interaction_radius × anchor_cell_size`
@@ -285,6 +292,7 @@ impl App {
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let taa_enabled = test_cfg.taa;
         let entity_render_mode = test_cfg.entity_render_mode;
+        let entity_surface_y = bootstrap::surface_y_for_preset(&test_cfg.world_preset);
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
         let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), Some(test_cfg.plain_layers()));
@@ -403,6 +411,7 @@ impl App {
             live_sample_every_frames,
             taa_enabled,
             entity_render_mode,
+            entity_surface_y,
             interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
@@ -480,7 +489,7 @@ impl App {
         // on each entity, so cell-boundary crossings are handled
         // without the bbox computation seeing discontinuities.
         if !self.entities.is_empty() {
-            self.entities.tick(&self.world.library, dt);
+            self.entities.tick(&self.world.library, dt, self.entity_surface_y);
         }
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {

@@ -49,6 +49,23 @@ const PLAIN_SURFACE_Y: f32 = 1.0;
 const PLAIN_GRASS_THICKNESS: f32 = 0.05;
 const PLAIN_DIRT_THICKNESS: f32 = 0.25;
 
+/// World-coordinate Y where entities naturally rest. `Some(y)` for
+/// flat worlds with a single ground plane; `None` for worlds where
+/// "resting height" is position-dependent (sphere worlds). Callers
+/// use this to snap entity Y at spawn and during motion so entities
+/// don't drift off the ground. See `App::entity_surface_y`.
+pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
+    match preset {
+        WorldPreset::PlainTest => Some(PLAIN_SURFACE_Y),
+        // Imported .vox worlds embed the model in a plain world, so
+        // they inherit the same sea level.
+        WorldPreset::VoxModel { .. } => Some(PLAIN_SURFACE_Y),
+        // Sphere and fractal worlds don't have a single surface Y —
+        // callers will skip the snap and entities fly freely.
+        WorldPreset::DemoSphere | WorldPreset::Menger => None,
+    }
+}
+
 pub struct WorldBootstrap {
     pub world: WorldState,
     pub planet_path: Option<Path>,

@@ -133,7 +133,19 @@ impl EntityStore {
     /// CPU cost is O(N). At 10k entities × 60fps = 600k add_local
     /// calls per second — trivial. The shader's O(N) ray iteration
     /// is the scaling bottleneck, not this.
-    pub fn tick(&mut self, library: &NodeLibrary, dt: f32) {
+    /// Advance every entity by `velocity * dt`. When `surface_y` is
+    /// `Some(y)`, clamp each entity's world Y to that value after
+    /// motion — so on a flat world entities walk along the ground
+    /// instead of drifting off into the sky from accumulated Y
+    /// velocity. `None` (sphere, fractal worlds) skips the clamp and
+    /// entities fly freely, matching the old behavior.
+    pub fn tick(
+        &mut self,
+        library: &NodeLibrary,
+        dt: f32,
+        surface_y: Option<f32>,
+    ) {
+        use crate::world::anchor::{Path, WORLD_SIZE};
         for e in &mut self.entities {
             let delta = [
                 e.velocity[0] * dt,
@@ -141,6 +153,28 @@ impl EntityStore {
                 e.velocity[2] * dt,
             ];
             e.pos.add_local(delta, library);
+
+            if let Some(sea_y) = surface_y {
+                // Direct offset correction: add_local changed offset.y
+                // by `velocity.y * dt`; we want the entity to end at
+                // world Y = sea_y. Compute the current world Y and
+                // nudge offset.y by the gap (scaled to cell units).
+                let anchor_depth = e.pos.anchor.depth();
+                if anchor_depth > 0 {
+                    let world_y = e.pos.in_frame(&Path::root())[1];
+                    let gap = sea_y - world_y;
+                    if gap != 0.0 {
+                        let cell_size = WORLD_SIZE
+                            / 3.0_f32.powi(anchor_depth as i32);
+                        e.pos.offset[1] += gap / cell_size;
+                        // Re-run add_local with zero delta to trigger
+                        // the path's built-in renormalize — handles
+                        // any cell-boundary crossings the Y nudge
+                        // introduced without duplicating the logic.
+                        e.pos.add_local([0.0, 0.0, 0.0], library);
+                    }
+                }
+            }
         }
     }
 }

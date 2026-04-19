@@ -87,29 +87,57 @@ impl App {
         // anyway.
     }
 
-    /// Shared grid layout: `n` entities starting one cell in front of
-    /// the camera, filling +X then +Y then +Z in a 9x9x... pattern.
-    /// Each entity gets a deterministic per-index velocity from
-    /// `entity_velocity(i)` so they drift in varied directions.
+    /// Shared grid layout: `n` entities in a horizontal grid in
+    /// front of the camera. Rows/cols step along the two ground-
+    /// plane axes (X and Z); stacks step further forward in -Z when
+    /// the XZ plane is full.
+    ///
+    /// On worlds with a defined sea level (`entity_surface_y`), the
+    /// grid is snapped to that Y — so every entity lands on the
+    /// ground regardless of where the camera is. On sphere/fractal
+    /// worlds we fall back to the camera's Y as before.
     fn spawn_grid(&mut self, subtree_id: NodeId, n: u32) {
         let cam_anchor = self.camera.position.anchor;
+        let anchor_depth = cam_anchor.depth();
+
+        // Pick a base anchor one cell in front of the camera (-Z).
+        // Then override Y to sea level when we have one: build a
+        // world-coords position from the base anchor's XZ and
+        // sea_level Y, and reconstruct an anchor at the same depth.
         let mut base = cam_anchor;
         base.step_neighbor_cartesian(2, -1);
 
+        let base_anchor = if let Some(sea_y) = self.entity_surface_y {
+            let base_pos = WorldPos::new_unchecked(base, [0.0, 0.0, 0.0]);
+            let base_world = base_pos.in_frame(&crate::world::anchor::Path::root());
+            let ground = WorldPos::from_frame_local(
+                &crate::world::anchor::Path::root(),
+                [base_world[0], sea_y, base_world[2]],
+                anchor_depth,
+            );
+            ground.anchor
+        } else {
+            base
+        };
+
         let row_len = 9u32;
-        let grid_len = 81u32;
+        let grid_len = row_len * row_len;
 
         let before = self.entities.len();
         for i in 0..n {
-            let row = (i / row_len) % row_len;
+            // Step along X (col) and Z (row) in the horizontal plane.
+            // When the plane fills up, stack forward in -Z (stack
+            // doesn't change Y, so entities stay at sea level when
+            // we have one).
             let col = i % row_len;
+            let row = (i / row_len) % row_len;
             let stack = i / grid_len;
-            let mut anchor = base;
+            let mut anchor = base_anchor;
             for _ in 0..col {
                 anchor.step_neighbor_cartesian(0, 1);
             }
             for _ in 0..row {
-                anchor.step_neighbor_cartesian(1, 1);
+                anchor.step_neighbor_cartesian(2, 1);
             }
             for _ in 0..stack {
                 anchor.step_neighbor_cartesian(2, -1);
@@ -121,8 +149,8 @@ impl App {
         }
         let after = self.entities.len();
         log::info!(
-            "spawned {} entities ({} -> {}) subtree_id={} cam_depth={}",
-            n, before, after, subtree_id, cam_anchor.depth(),
+            "spawned {} entities ({} -> {}) subtree_id={} cam_depth={} sea_y={:?}",
+            n, before, after, subtree_id, cam_anchor.depth(), self.entity_surface_y,
         );
     }
 
