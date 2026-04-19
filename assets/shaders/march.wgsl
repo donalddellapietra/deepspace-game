@@ -115,6 +115,10 @@ fn march_cartesian(
     let root_header_off = node_offsets[root_node_idx];
     var cur_occupancy: u32 = tree[root_header_off];
     var cur_first_child: u32 = tree[root_header_off + 1u];
+    if ENABLE_STATS {
+        ray_loads_offsets = ray_loads_offsets + 1u;
+        ray_loads_tree = ray_loads_tree + 2u;
+    }
 
     let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
@@ -180,6 +184,10 @@ fn march_cartesian(
             let parent_header_off = node_offsets[s_node_idx[depth]];
             cur_occupancy = tree[parent_header_off];
             cur_first_child = tree[parent_header_off + 1u];
+            if ENABLE_STATS {
+                ray_loads_offsets = ray_loads_offsets + 1u;
+                ray_loads_tree = ray_loads_tree + 2u;
+            }
 
             let m_oob = min_axis_mask(cur_side_dist);
             s_cell[depth] += vec3<i32>(m_oob) * step;
@@ -213,6 +221,7 @@ fn march_cartesian(
         let child_base = cur_first_child + rank * 2u;
         let packed = tree[child_base];
         let tag = packed & 0xFFu;
+        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
 
         if tag == 1u {
             let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
@@ -229,6 +238,7 @@ fn march_cartesian(
             // tag == 2u: Node child. Load node_index from the
             // second u32 of the compact entry we already located.
             let child_idx = tree[child_base + 1u];
+            if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
 
             // Shell skip: when re-entering a parent shell after a
             // ribbon pop, skip the SLOT we already traversed in the
@@ -247,6 +257,7 @@ fn march_cartesian(
             }
 
             let kind = node_kinds[child_idx].kind;
+            if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
 
             if kind == 1u {
                 // CubedSphereBody: dispatch sphere DDA in this body's cell.
@@ -254,6 +265,7 @@ fn march_cartesian(
                 let body_size = cur_cell_size;
                 let inner_r = node_kinds[child_idx].inner_r;
                 let outer_r = node_kinds[child_idx].outer_r;
+                if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 2u; }
                 let sph = sphere_in_cell(
                     child_idx, body_origin, body_size,
                     inner_r, outer_r, ray_origin, ray_dir,
@@ -425,6 +437,10 @@ fn march_cartesian(
                 let child_header_off = node_offsets[child_idx];
                 cur_occupancy = tree[child_header_off];
                 cur_first_child = tree[child_header_off + 1u];
+                if ENABLE_STATS {
+                    ray_loads_offsets = ray_loads_offsets + 1u;
+                    ray_loads_tree = ray_loads_tree + 2u;
+                }
                 s_cell[depth] = vec3<i32>(
                     clamp(i32(floor(local_entry.x)), 0, 2),
                     clamp(i32(floor(local_entry.y)), 0, 2),
@@ -536,6 +552,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             let body_pop_level = uniforms.root_face_meta.y;
             if ribbon_level < body_pop_level {
                 let entry = ribbon[ribbon_level];
+                if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
                 let s = entry.slot_bits & RIBBON_SLOT_MASK;
                 let sx = i32(s % 3u);
                 let sy = i32((s / 3u) % 3u);
@@ -561,6 +578,10 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             current_kind = ROOT_KIND_BODY;
             inner_r = node_kinds[current_idx].inner_r;
             outer_r = node_kinds[current_idx].outer_r;
+            if ENABLE_STATS {
+                ray_loads_ribbon = ray_loads_ribbon + 1u;
+                ray_loads_kinds = ray_loads_kinds + 2u;
+            }
             ribbon_level = body_pop_level + 1u;
         } else {
             // Single-level ribbon pop with empty-shell fast-exit.
@@ -580,6 +601,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             // (10+ shells in the regressed workload).
             if ribbon_level < uniforms.ribbon_count {
                 let entry = ribbon[ribbon_level];
+                if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
                 let s = entry.slot_bits & RIBBON_SLOT_MASK;
                 let sx = i32(s % 3u);
                 let sy = i32((s / 3u) % 3u);
@@ -593,10 +615,12 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 ribbon_level = ribbon_level + 1u;
 
                 let k = node_kinds[current_idx].kind;
+                if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
                 if k == 1u {
                     current_kind = ROOT_KIND_BODY;
                     inner_r = node_kinds[current_idx].inner_r;
                     outer_r = node_kinds[current_idx].outer_r;
+                    if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 2u; }
                 } else {
                     current_kind = ROOT_KIND_CARTESIAN;
                     // Empty-shell fast exit: if every sibling is

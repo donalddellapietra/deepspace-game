@@ -47,6 +47,15 @@ pub struct ShaderStatsFrame {
     /// if the test ran BEFORE descending. Upper-bound on savings a
     /// real path-mask cull could deliver. Does not alter traversal.
     pub sum_steps_would_cull_div4: u32,
+    /// Per-ray storage-buffer u32-load counters, split by which
+    /// buffer is read. On Apple Silicon these are the dominant
+    /// cost source (dependent chains stall L1); ALU counting on
+    /// the same shader is not representative of real frame time.
+    /// Populated only when ENABLE_STATS is true.
+    pub sum_loads_tree_div4: u32,
+    pub sum_loads_offsets_div4: u32,
+    pub sum_loads_kinds_div4: u32,
+    pub sum_loads_ribbon_div4: u32,
 }
 
 impl ShaderStatsFrame {
@@ -81,6 +90,27 @@ impl ShaderStatsFrame {
     pub fn avg_steps_would_cull(&self) -> f64 {
         if self.ray_count == 0 { 0.0 }
         else { (self.sum_steps_would_cull_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_loads_tree(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_tree_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_offsets(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_offsets_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_kinds(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_kinds_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_ribbon(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_ribbon_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_total(&self) -> f64 {
+        self.avg_loads_tree() + self.avg_loads_offsets()
+            + self.avg_loads_kinds() + self.avg_loads_ribbon()
     }
 
     pub fn hit_fraction(&self) -> f64 {
@@ -326,7 +356,7 @@ impl Renderer {
         }
         if slow {
             eprintln!(
-                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={} avg_oob={:.1} avg_empty={:.1} avg_descend={:.1} avg_lod_terminal={:.1} avg_would_cull={:.2}",
+                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={} avg_oob={:.1} avg_empty={:.1} avg_descend={:.1} avg_lod_terminal={:.1} avg_would_cull={:.2} avg_loads_total={:.1} avg_loads_tree={:.1} avg_loads_offsets={:.1} avg_loads_kinds={:.2} avg_loads_ribbon={:.2}",
                 acquire_elapsed.as_secs_f64() * 1000.0,
                 encode_elapsed.as_secs_f64() * 1000.0,
                 submit_elapsed.as_secs_f64() * 1000.0,
@@ -344,6 +374,11 @@ impl Renderer {
                 shader_stats.avg_steps_descend(),
                 shader_stats.avg_steps_lod_terminal(),
                 shader_stats.avg_steps_would_cull(),
+                shader_stats.avg_loads_total(),
+                shader_stats.avg_loads_tree(),
+                shader_stats.avg_loads_offsets(),
+                shader_stats.avg_loads_kinds(),
+                shader_stats.avg_loads_ribbon(),
             );
         }
         Ok(())
@@ -474,6 +509,10 @@ impl Renderer {
             sum_steps_node_descend_div4: read_u32(32),
             sum_steps_lod_terminal_div4: read_u32(36),
             sum_steps_would_cull_div4: read_u32(40),
+            sum_loads_tree_div4: read_u32(44),
+            sum_loads_offsets_div4: read_u32(48),
+            sum_loads_kinds_div4: read_u32(52),
+            sum_loads_ribbon_div4: read_u32(56),
         };
         drop(data);
         self.shader_stats_readback.unmap();

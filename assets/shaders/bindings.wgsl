@@ -100,10 +100,15 @@ struct ShaderStats {
     // BEFORE descending. Doesn't change behaviour — shader only
     // counts, then still descends as normal.
     sum_steps_would_cull_div4: atomic<u32>,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
-    _pad4: u32,
+    // Per-ray memory load counters, split by buffer. Counts every
+    // storage-buffer u32 load a ray performs in the march path.
+    // On Apple Silicon these are the dominant cost source — ALU
+    // is cheap, but dependent tree[]/node_offsets[] loads can
+    // stall hundreds of cycles on L1 miss.
+    sum_loads_tree_div4: atomic<u32>,
+    sum_loads_offsets_div4: atomic<u32>,
+    sum_loads_kinds_div4: atomic<u32>,
+    sum_loads_ribbon_div4: atomic<u32>,
     _pad5: u32,
 }
 
@@ -143,6 +148,10 @@ var<private> ray_steps_empty: u32 = 0u;
 var<private> ray_steps_node_descend: u32 = 0u;
 var<private> ray_steps_lod_terminal: u32 = 0u;
 var<private> ray_steps_would_cull: u32 = 0u;
+var<private> ray_loads_tree: u32 = 0u;
+var<private> ray_loads_offsets: u32 = 0u;
+var<private> ray_loads_kinds: u32 = 0u;
+var<private> ray_loads_ribbon: u32 = 0u;
 
 /// Pipeline-override constant: when false, fs_main skips all
 /// atomic writes to shader_stats and DDA loops skip the `ray_steps`

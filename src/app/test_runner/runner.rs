@@ -288,6 +288,10 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             avg_steps_descend: render_timing.shader_stats.avg_steps_descend(),
             avg_steps_lod_terminal: render_timing.shader_stats.avg_steps_lod_terminal(),
             avg_steps_would_cull: render_timing.shader_stats.avg_steps_would_cull(),
+            avg_loads_tree: render_timing.shader_stats.avg_loads_tree(),
+            avg_loads_offsets: render_timing.shader_stats.avg_loads_offsets(),
+            avg_loads_kinds: render_timing.shader_stats.avg_loads_kinds(),
+            avg_loads_ribbon: render_timing.shader_stats.avg_loads_ribbon(),
             packed_node_count,
             ribbon_len,
             effective_visual_depth,
@@ -382,6 +386,10 @@ struct FrameSample {
     avg_steps_descend: f64,
     avg_steps_lod_terminal: f64,
     avg_steps_would_cull: f64,
+    avg_loads_tree: f64,
+    avg_loads_offsets: f64,
+    avg_loads_kinds: f64,
+    avg_loads_ribbon: f64,
     packed_node_count: u32,
     ribbon_len: u32,
     effective_visual_depth: u32,
@@ -474,6 +482,10 @@ struct PerfAgg {
     sum_avg_steps_descend: f64,
     sum_avg_steps_lod_terminal: f64,
     sum_avg_steps_would_cull: f64,
+    sum_avg_loads_tree: f64,
+    sum_avg_loads_offsets: f64,
+    sum_avg_loads_kinds: f64,
+    sum_avg_loads_ribbon: f64,
     sum_packed_node_count: u64,
     sum_ribbon_len: u64,
     worst_total_ms: f64,
@@ -534,6 +546,10 @@ impl PerfAgg {
         self.sum_avg_steps_descend += s.avg_steps_descend;
         self.sum_avg_steps_lod_terminal += s.avg_steps_lod_terminal;
         self.sum_avg_steps_would_cull += s.avg_steps_would_cull;
+        self.sum_avg_loads_tree += s.avg_loads_tree;
+        self.sum_avg_loads_offsets += s.avg_loads_offsets;
+        self.sum_avg_loads_kinds += s.avg_loads_kinds;
+        self.sum_avg_loads_ribbon += s.avg_loads_ribbon;
         if s.max_steps > self.max_max_steps {
             self.max_max_steps = s.max_steps;
         }
@@ -624,6 +640,15 @@ impl PerfAgg {
             self.sum_avg_steps_descend / n,
             self.sum_avg_steps_lod_terminal / n,
             self.sum_avg_steps_would_cull / n,
+        );
+        let loads_tree = self.sum_avg_loads_tree / n;
+        let loads_offsets = self.sum_avg_loads_offsets / n;
+        let loads_kinds = self.sum_avg_loads_kinds / n;
+        let loads_ribbon = self.sum_avg_loads_ribbon / n;
+        let loads_total = loads_tree + loads_offsets + loads_kinds + loads_ribbon;
+        eprintln!(
+            "render_harness_loads frames={} avg_loads_total={:.2} tree={:.2} offsets={:.2} kinds={:.2} ribbon={:.2}",
+            self.frame_count, loads_total, loads_tree, loads_offsets, loads_kinds, loads_ribbon,
         );
     }
 }
