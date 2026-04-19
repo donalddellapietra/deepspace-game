@@ -3,6 +3,40 @@
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
 
+// Conservative 27-bit "path mask" — the tensor product of per-axis
+// 3-bit masks of cells reachable from `entry_cell` moving in `step`
+// direction. Over-approximates the actual ray path (any axis-wise
+// reachable cell triple, not only the specific 3D path the ray
+// traces). Safe for occupancy-intersection culling: if the full
+// superset misses all occupied slots, the actual path certainly
+// does. Used for instrumentation only right now — does not affect
+// traversal.
+fn path_mask_conservative(entry_cell: vec3<i32>, step: vec3<i32>) -> u32 {
+    let ec = vec3<u32>(
+        u32(clamp(entry_cell.x, 0, 2)),
+        u32(clamp(entry_cell.y, 0, 2)),
+        u32(clamp(entry_cell.z, 0, 2)),
+    );
+    // Per-axis 3-bit mask. step > 0: bits [ec..2]; step < 0: bits
+    // [0..ec]. step is always ±1 in march_cartesian (non-zero).
+    let mx: u32 = select((1u << (ec.x + 1u)) - 1u, (7u << ec.x) & 7u, step.x > 0);
+    let my: u32 = select((1u << (ec.y + 1u)) - 1u, (7u << ec.y) & 7u, step.y > 0);
+    let mz: u32 = select((1u << (ec.z + 1u)) - 1u, (7u << ec.z) & 7u, step.z > 0);
+    // Smear each 3-bit axis mask into its 27-bit "axis active"
+    // pattern. x repeats stride-3 (bits 0,3,6,...); y expands to a
+    // 9-bit xy-plane then repeats stride-9; z gates whole 9-bit
+    // planes. Closed-form — no loops, no lookups.
+    let x_active: u32 = mx * 0x01249249u;
+    let y_9: u32 = ((my & 1u) * 0x007u)
+                 | (((my >> 1u) & 1u) * 0x038u)
+                 | (((my >> 2u) & 1u) * 0x1C0u);
+    let y_active: u32 = y_9 * 0x00040201u;
+    let z_active: u32 = ((mz & 1u) * 0x000001FFu)
+                     | (((mz >> 1u) & 1u) * 0x0003FE00u)
+                     | (((mz >> 2u) & 1u) * 0x07FC0000u);
+    return x_active & y_active & z_active;
+}
+
 // Cartesian DDA in a single frame rooted at `root_node_idx`. The
 // frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
 // Returns hit on cell terminal; on miss (ray exits the frame),
@@ -358,6 +392,26 @@ fn march_cartesian(
                 let ct_start = max(aabb_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
                 let local_entry = (child_entry - child_origin) / child_cell_size;
+
+                // Instrumentation: "would this descent have been culled
+                // by (child_occupancy & path_mask) == 0?" Does NOT alter
+                // traversal — the shader still descends normally. The
+                // counter tells us the ceiling of savings a real cull
+                // could deliver. Off when ENABLE_STATS is false
+                // (compile-time folded → zero runtime cost).
+                if ENABLE_STATS {
+                    let preview_header_off = node_offsets[child_idx];
+                    let preview_occ = tree[preview_header_off];
+                    let preview_entry_cell = vec3<i32>(
+                        i32(floor(local_entry.x)),
+                        i32(floor(local_entry.y)),
+                        i32(floor(local_entry.z)),
+                    );
+                    let pm = path_mask_conservative(preview_entry_cell, step);
+                    if (preview_occ & pm) == 0u {
+                        ray_steps_would_cull = ray_steps_would_cull + 1u;
+                    }
+                }
 
                 depth += 1u;
                 s_node_idx[depth] = child_idx;

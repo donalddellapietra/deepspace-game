@@ -9,7 +9,7 @@ use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
 use super::taa::{TaaState, MARCH_COLOR_FORMAT, MARCH_T_FORMAT};
-use super::{GpuUniforms, Renderer, TimestampScratch, ROOT_KIND_CARTESIAN};
+use super::{GpuUniforms, Renderer, ROOT_KIND_CARTESIAN};
 
 impl Renderer {
     pub async fn new(
@@ -57,13 +57,7 @@ impl Renderer {
             .await
             .expect("No suitable GPU adapter found");
 
-        let adapter_features = adapter.features();
-        let want_timestamp = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
-        let required_features = if want_timestamp {
-            wgpu::Features::TIMESTAMP_QUERY
-        } else {
-            wgpu::Features::empty()
-        };
+        let required_features = wgpu::Features::empty();
         // Sparse tree needs 5 storage buffers (tree, node_kinds,
         // ribbon, shader_stats, node_offsets). `downlevel_defaults`
         // caps that at 4; bump to 8 (the WebGPU spec default) so
@@ -82,11 +76,6 @@ impl Renderer {
             })
             .await
             .expect("Failed to create GPU device");
-        eprintln!(
-            "renderer_features timestamp_query_supported={} enabled={}",
-            adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY),
-            device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
-        );
         eprintln!(
             "renderer_limits max_storage_buffer_binding_size={}",
             device.limits().max_storage_buffer_binding_size,
@@ -410,30 +399,6 @@ impl Renderer {
             (None, None)
         };
 
-        let timestamp = if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
-            let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-                label: Some("ray_march_timestamps"),
-                ty: wgpu::QueryType::Timestamp,
-                count: 2,
-            });
-            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("timestamp_resolve"),
-                size: 16,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            let staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("timestamp_staging"),
-                size: 16,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let period_ns = queue.get_timestamp_period();
-            Some(TimestampScratch { query_set, resolve, staging, period_ns })
-        } else {
-            None
-        };
-
         let uploaded_tree_u32s = tree.len() as u64;
         let uploaded_kinds_count = node_kinds.len() as u64;
         let uploaded_offsets_count = node_offsets.len() as u64;
@@ -460,7 +425,6 @@ impl Renderer {
             offscreen_texture: None,
             pipeline_taa,
             taa: taa_state,
-            timestamp,
             last_camera_write_ms: 0.0,
             last_ribbon_write_ms: 0.0,
             last_tree_write_ms: 0.0,

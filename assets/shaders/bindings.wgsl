@@ -95,7 +95,11 @@ struct ShaderStats {
     sum_steps_empty_div4: atomic<u32>,
     sum_steps_node_descend_div4: atomic<u32>,
     sum_steps_lod_terminal_div4: atomic<u32>,
-    _pad0: u32,
+    // Instrumentation: count of descent candidates that would have
+    // been culled if we tested (child_occupancy & path_mask == 0)
+    // BEFORE descending. Doesn't change behaviour — shader only
+    // counts, then still descends as normal.
+    sum_steps_would_cull_div4: atomic<u32>,
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
@@ -138,6 +142,7 @@ var<private> ray_steps_oob: u32 = 0u;
 var<private> ray_steps_empty: u32 = 0u;
 var<private> ray_steps_node_descend: u32 = 0u;
 var<private> ray_steps_lod_terminal: u32 = 0u;
+var<private> ray_steps_would_cull: u32 = 0u;
 
 /// Pipeline-override constant: when false, fs_main skips all
 /// atomic writes to shader_stats and DDA loops skip the `ray_steps`

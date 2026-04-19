@@ -31,7 +31,7 @@ mkdir -p "$OUT_DIR"
 
 cargo build --bin deepspace-game --quiet
 
-echo "iter,spawn_depth,submitted_done_avg_ms,gpu_pass_avg_ms,avg_steps,avg_descend,avg_lod_terminal,hit_fraction" > "$CSV"
+echo "iter,spawn_depth,submitted_done_avg_ms,avg_steps,avg_descend,avg_lod_terminal,hit_fraction" > "$CSV"
 
 for depth in "${DEPTHS[@]}"; do
   out_png="$OUT_DIR/${ITER}_d${depth}.png"
@@ -60,8 +60,6 @@ for depth in "${DEPTHS[@]}"; do
   # Extract from render_harness_timing avg_ms line (per-metric avg across frames)
   timing=$(grep -E '^render_harness_timing ' "$log" | tail -1 || true)
   submitted=$(echo "$timing" | grep -oE 'submitted_done=[0-9.]+' | cut -d= -f2 | head -1)
-  # gpu_pass on Apple Silicon may be disabled; try to extract anyway
-  gpu_pass=$(echo "$timing" | grep -oE 'gpu_pass=[0-9.]+' | cut -d= -f2 | head -1)
 
   # Extract from render_harness_shader line
   shader=$(grep -E '^render_harness_shader ' "$log" | tail -1 || true)
@@ -70,9 +68,9 @@ for depth in "${DEPTHS[@]}"; do
   avg_lod_terminal=$(echo "$shader" | grep -oE 'avg_lod_terminal=[0-9.]+' | cut -d= -f2 | head -1)
   hit_fraction=$(echo "$shader" | grep -oE 'hit_fraction=[0-9.]+' | cut -d= -f2 | head -1)
 
-  echo "$ITER,$depth,${submitted:-NA},${gpu_pass:-NA},${avg_steps:-NA},${avg_descend:-NA},${avg_lod_terminal:-NA},${hit_fraction:-NA}" >> "$CSV"
-  printf '  d=%-3d  submitted=%-6s  gpu_pass=%-6s  avg_steps=%-6s  avg_descend=%-6s  avg_lodterm=%-6s  hit_frac=%s\n' \
-    "$depth" "${submitted:-NA}" "${gpu_pass:-NA}" "${avg_steps:-NA}" "${avg_descend:-NA}" "${avg_lod_terminal:-NA}" "${hit_fraction:-NA}"
+  echo "$ITER,$depth,${submitted:-NA},${avg_steps:-NA},${avg_descend:-NA},${avg_lod_terminal:-NA},${hit_fraction:-NA}" >> "$CSV"
+  printf '  d=%-3d  submitted=%-6s  avg_steps=%-6s  avg_descend=%-6s  avg_lodterm=%-6s  hit_frac=%s\n' \
+    "$depth" "${submitted:-NA}" "${avg_steps:-NA}" "${avg_descend:-NA}" "${avg_lod_terminal:-NA}" "${hit_fraction:-NA}"
 
   rm -f "$log"
 done

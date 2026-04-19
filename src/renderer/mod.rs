@@ -111,11 +111,6 @@ pub struct Renderer {
     /// TAAU state: history textures, resolve pipeline, jitter,
     /// previous camera. `None` when TAAU is disabled.
     pub(super) taa: Option<TaaState>,
-    /// Optional GPU timestamp-query scaffolding. Present only when
-    /// the adapter reports `Features::TIMESTAMP_QUERY`. Used by
-    /// `render_offscreen` to measure the ray-march pass on the GPU
-    /// side, not just the CPU-side `device.poll(Wait)` duration.
-    pub(super) timestamp: Option<TimestampScratch>,
     /// Last queue.write_buffer durations (camera/ribbon/tree) in ms.
     /// Populated by the buffer-upload path so the harness can break
     /// "upload" into per-buffer sub-phases.
@@ -124,12 +119,12 @@ pub struct Renderer {
     pub(super) last_tree_write_ms: f64,
     pub(super) last_bind_group_rebuild_ms: f64,
     /// Shader-side atomic counters written by the fragment shader
-    /// each frame (ray_count, hit_count, miss_count, max_iter_count,
-    /// sum_steps_div4, max_steps, + 2 u32 pad). 32 bytes total.
+    /// each frame. Layout matches the `ShaderStats` struct in
+    /// `bindings.wgsl`; 64 bytes total (16 u32 slots).
     pub(super) shader_stats_buffer: wgpu::Buffer,
     /// Mappable COPY_DST shadow of `shader_stats_buffer`. Populated
     /// via `copy_buffer_to_buffer` at the end of the render pass,
-    /// mapped after `poll(Wait)` so the harness can read the 8 u32s.
+    /// mapped after `poll(Wait)` so the harness can read it back.
     pub(super) shader_stats_readback: wgpu::Buffer,
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
@@ -145,17 +140,6 @@ pub struct Renderer {
     /// frames. CPU-side only — no `device.poll(Wait)` stall. Set via
     /// `--live-sample-every N` CLI flag; 0 (default) disables.
     pub(super) live_sample_every_frames: u32,
-}
-
-/// GPU timestamp query resources. `query_set` holds two timestamp
-/// slots (pass start, pass end); `resolve` is the COPY_SRC buffer
-/// that `resolve_query_set` writes ticks into; `staging` is a
-/// MAP_READ buffer used to read the ticks back on the CPU.
-pub struct TimestampScratch {
-    pub query_set: wgpu::QuerySet,
-    pub resolve: wgpu::Buffer,
-    pub staging: wgpu::Buffer,
-    pub period_ns: f32,
 }
 
 impl Renderer {
