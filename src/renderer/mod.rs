@@ -9,6 +9,7 @@
 mod buffers;
 mod draw;
 pub mod entity_raster;
+pub mod heightmap;
 mod init;
 mod taa;
 
