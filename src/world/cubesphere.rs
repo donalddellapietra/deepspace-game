@@ -463,6 +463,7 @@ mod tests {
             }
             Child::Block(b) => assert_eq!(b, block::STONE),
             Child::Empty => panic!("interior slot is empty"),
+            Child::EntityRef(_) => panic!("interior slot is an entity ref"),
         }
         // The 20 other slots are Empty.
         for slot in 0..27 {
