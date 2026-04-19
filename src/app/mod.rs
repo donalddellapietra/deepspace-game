@@ -188,6 +188,12 @@ pub struct App {
     /// soldier walking around a flat world stays on the grass
     /// instead of drifting up through the sky over time.
     pub(super) entity_surface_y: Option<f32>,
+    /// Cached subtree NodeId for the soldier model loaded from
+    /// `assets/vox/soldier.vox` on first `spawn_test_entities` call.
+    /// `None` until the first press of N or M. Caches the parsed
+    /// model so repeat presses don't re-read the .vox file or
+    /// re-register palette entries.
+    pub(super) cached_soldier_subtree: Option<crate::world::tree::NodeId>,
     /// Block-interaction radius in anchor-cell units. Caps the
     /// cursor raycast distance so break/place only succeed when
     /// the target is within `interaction_radius × anchor_cell_size`
@@ -412,6 +418,7 @@ impl App {
             taa_enabled,
             entity_render_mode,
             entity_surface_y,
+            cached_soldier_subtree: None,
             interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,

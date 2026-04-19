@@ -33,18 +33,59 @@ fn entity_velocity(i: u32) -> [f32; 3] {
 }
 
 impl App {
-    /// Spawn `n` stone-cube entities in front of the camera.
-    /// Anchored at the camera's anchor depth; content is a single
-    /// uniform-stone subtree shared across every spawn via library
-    /// dedup.
+    /// Spawn `n` soldier entities in front of the camera. The soldier
+    /// model is loaded from `assets/vox/soldier.vox` on first call
+    /// and its subtree NodeId is cached on the App, so repeat N/M
+    /// presses reuse the parsed model (library dedup makes all
+    /// copies share a single voxel subtree anyway).
+    ///
+    /// Falls back to a uniform-stone-cube subtree if the .vox file
+    /// can't be loaded — the old behavior, useful on a dev build
+    /// without the asset.
     pub(in crate::app) fn spawn_test_entities(&mut self, n: u32) {
         if n == 0 {
             return;
         }
-        let subtree_id = self.get_or_build_stone_cube_subtree();
+        let subtree_id = self
+            .get_or_load_soldier_subtree()
+            .unwrap_or_else(|| self.get_or_build_stone_cube_subtree());
         self.spawn_grid(subtree_id, n);
         // Trigger an upload so the new entities show up on the next frame.
         self.upload_tree();
+    }
+
+    /// Load `assets/vox/soldier.vox` on first call and stash the
+    /// resulting subtree NodeId on `self.cached_soldier_subtree` so
+    /// subsequent spawns skip the file read and palette registration.
+    /// Returns `None` if the file is missing / unparseable — callers
+    /// should fall back to a uniform-block subtree.
+    fn get_or_load_soldier_subtree(&mut self) -> Option<NodeId> {
+        if let Some(id) = self.cached_soldier_subtree {
+            return Some(id);
+        }
+        let path = FsPath::new("assets/vox/soldier.vox");
+        let model = match import::load(path, &mut self.palette) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "spawn_test_entities: load {} failed: {} (falling back to stone cube)",
+                    path.display(), e,
+                );
+                return None;
+            }
+        };
+        let id = import::tree_builder::build_tree(&model, &mut self.world.library);
+        eprintln!(
+            "spawn_test_entities: cached soldier subtree node={} ({}x{}x{} voxels)",
+            id, model.size_x, model.size_y, model.size_z,
+        );
+        // Palette gained colors; push them to the GPU so the new
+        // entities render with the correct tints on the next frame.
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.update_palette(&self.palette.to_gpu_palette());
+        }
+        self.cached_soldier_subtree = Some(id);
+        Some(id)
     }
 
     /// Init-time entity spawn driven by `--spawn-entity PATH`.
