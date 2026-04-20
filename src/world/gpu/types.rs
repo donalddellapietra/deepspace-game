@@ -109,6 +109,35 @@ pub struct GpuCamera {
     pub _pad2: f32,
     pub up: [f32; 3],
     pub fov: f32,
+    /// World → clip-space matrix (column-major). The ray-march writes
+    /// this into `@builtin(frag_depth)` via the `fs_main_depth`
+    /// entry point so the entity raster pass can z-test against it.
+    /// When the raster pass is disabled, the matrix is still
+    /// uploaded (trivial cost) but nothing reads it.
+    pub view_proj: [[f32; 4]; 4],
+}
+
+/// One entity instance on the GPU: a bounding cube in the current
+/// render frame's [0, 3)³ local coords plus a BFS idx into the
+/// shared `tree[]` buffer for the entity's voxel subtree.
+///
+/// The shader ray-marches against `bbox_min`/`bbox_max`; on AABB
+/// hit it either splats `representative_block` (sub-pixel entity,
+/// skips the whole subtree descent) or transforms the ray into
+/// the subtree's local [0, 3)³ space and calls `march_cartesian`
+/// with a depth budget sized to the entity's on-screen pixel
+/// count. `representative_block` is stored as u32 to keep the
+/// GPU struct 16-byte aligned even though the CPU-side value is
+/// a u16 palette index.
+///
+/// 32 bytes total (vec4-aligned for WGSL storage buffer).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
+pub struct GpuEntity {
+    pub bbox_min: [f32; 3],
+    pub representative_block: u32,
+    pub bbox_max: [f32; 3],
+    pub subtree_bfs: u32,
 }
 
 // The former fixed-size `GpuPalette` uniform struct has been removed.

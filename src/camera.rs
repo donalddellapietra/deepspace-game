@@ -88,6 +88,16 @@ impl Camera {
             _pad2: 0.0,
             up,
             fov,
+            // view_proj is filled in by the renderer at upload time
+            // using the current march-target aspect ratio. Seed with
+            // identity so a read-before-write (pre-raster-entity
+            // init) still yields well-defined values.
+            view_proj: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
         }
     }
 }
