@@ -5,7 +5,7 @@ use crate::world::cubesphere::FACE_SLOTS;
 use crate::world::cubesphere_local;
 
 use crate::app::frame;
-use crate::app::{ActiveFrame, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
+use crate::app::{ActiveFrame, ActiveFrameKind, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
 use super::{
     FRAME_FOCUS_MIN_PIXELS, FRAME_VISUAL_MIN_PIXELS, MAX_FOCUSED_FRAME_CAMERA_EXTENT,
     MAX_LOCAL_VISUAL_DEPTH,
@@ -95,41 +95,37 @@ impl App {
         };
         let cam_body = self.camera.position.in_frame(&body_path);
         let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-        // Pick the focus face from the CAMERA's own position when
-        // camera is on or inside the outer shell; only use ray-exit-
-        // face when camera is clearly outside the sphere. Otherwise
-        // (on-surface looking down, or camera inside a carved pocket)
-        // ray_outer_sphere_hit returns t_exit on the FAR side, which
-        // pointed sphere_focus at the wrong face and made the render
-        // frame diverge from the camera's face.
+        // Camera-outside-body guard: when the camera sits far enough
+        // outside the outer shell, DON'T descend into a face subtree.
+        // The render frame needs to be the body cell (`ROOT_KIND_BODY`,
+        // curved-UVR body march) so the whole sphere renders with
+        // correct curvature. Descending into a face subtree here
+        // causes `WorldPos::in_frame`'s cartesian projection to place
+        // the camera OUTSIDE the render cell's [0, 3)³ (because
+        // cartesian vs UVR slot semantics diverge) — every pixel
+        // then falls back to LOD-terminal, producing a uniform gray
+        // "cube" appearance. Returning body_path means `with_render_margin`
+        // sees a Body logical kind and keeps render at the body.
         let body_half = WORLD_SIZE * 0.5;
         let cam_offset = crate::world::sdf::sub(cam_body, [body_half; 3]);
         let cam_radius = crate::world::sdf::length(cam_offset);
         let outer_radius = outer_r * WORLD_SIZE;
-        let face_point = if cam_radius <= outer_radius * 1.01 {
-            // Camera at or near the shell — focus the face the camera
-            // is on.
-            cubesphere_local::body_point_to_face_space(
-                cam_body, inner_r, outer_r, WORLD_SIZE,
-            )
-        } else {
-            // Camera outside — focus the face the ray hits.
-            let Some(t) = cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE) else {
-                eprintln!(
-                    "sphere_focus: miss cam_body={:?} ray_dir={:?} body_path={:?}",
-                    cam_body, ray_dir, body_path.as_slice(),
-                );
-                return None;
-            };
-            let hit_body = crate::world::sdf::add(cam_body, crate::world::sdf::scale(ray_dir, t));
-            cubesphere_local::body_point_to_face_space(
-                hit_body, inner_r, outer_r, WORLD_SIZE,
-            )
-        };
+        if cam_radius > outer_radius * 1.01 {
+            // Camera outside the body — render from body cell.
+            return Some(body_path);
+        }
+        // Camera on / inside the shell: focus the face the camera
+        // is on. (Ray-exit-face logic removed — when camera is near
+        // the shell, `ray_outer_sphere_hit` returns t_exit on the
+        // far side, which pointed focus at the wrong face.)
+        let face_point = cubesphere_local::body_point_to_face_space(
+            cam_body, inner_r, outer_r, WORLD_SIZE,
+        );
         let Some(face_point) = face_point else {
-            eprintln!("sphere_focus: degenerate camera/hit body_path={:?}", body_path.as_slice());
-            return None;
+            eprintln!("sphere_focus: degenerate camera body_path={:?}", body_path.as_slice());
+            return Some(body_path);
         };
+        let _ = ray_dir; // unused when camera is inside shell
         let face = face_point.face;
         let mut path = body_path;
         path.push(FACE_SLOTS[face as usize] as u8);
@@ -223,10 +219,35 @@ impl App {
             })
             .unwrap_or_else(|| self.render_frame());
         let mut frame = frame;
-        while frame.render_path.depth() > 0
-            && (!self.camera_fits_frame(&frame)
-                || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
-        {
+        loop {
+            // Face-depth-0 Sphere frames are invalid for rendering:
+            // the flat-UVR march would render the whole face as a
+            // cube. Promote them to Body so the curved-UVR body
+            // march handles them.
+            if let ActiveFrameKind::Sphere(sphere) = frame.kind {
+                if sphere.face_depth == 0 {
+                    let logical_path = frame.logical_path;
+                    let mut body_path = frame.render_path;
+                    body_path.truncate(sphere.body_path.depth());
+                    let body = frame::compute_render_frame(
+                        &self.world.library,
+                        self.world.root,
+                        &body_path,
+                        sphere.body_path.depth(),
+                    );
+                    frame = ActiveFrame {
+                        render_path: body.render_path,
+                        logical_path,
+                        node_id: body.node_id,
+                        kind: body.kind,
+                    };
+                    continue;
+                }
+            }
+            let should_shallow = frame.render_path.depth() > 0
+                && (!self.camera_fits_frame(&frame)
+                    || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS);
+            if !should_shallow { break; }
             let logical_path = frame.logical_path;
             let mut shallower = frame.render_path;
             shallower.truncate(frame.render_path.depth().saturating_sub(1));

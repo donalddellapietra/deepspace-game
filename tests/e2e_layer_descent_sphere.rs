@@ -12,7 +12,9 @@
 #[path = "e2e_layer_descent/harness.rs"]
 mod harness;
 
-use harness::{run, ScriptBuilder};
+use harness::{
+    distinct_non_sky_color_count, planet_pixel_count_at_row, run, ScriptBuilder,
+};
 
 const HARNESS_ARGS: &[&str] = &[
     "--render-harness",
@@ -34,6 +36,132 @@ const HARNESS_ARGS: &[&str] = &[
 ];
 
 const START_ANCHOR_DEPTH: u32 = 5;
+
+// ─────────────────────────────────────────────── visual tests
+
+/// The default `--sphere-world` spawn (no --spawn-xyz override)
+/// must render a correct sphere. This is exactly what the user
+/// sees when running `scripts/dev.sh --sphere-world` — the default
+/// bootstrap spawn, not a test-configured spawn. Regression guard
+/// for "gray cube edge at spawn" where every pixel falls back to
+/// LOD-terminal representative block because the render frame was
+/// mis-aligned with the camera anchor.
+#[test]
+fn default_sphere_world_spawn_renders_correctly() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join("default_spawn");
+    std::fs::create_dir_all(&dir).expect("create tmp dir");
+    let shot_path = dir.join("default.png");
+    let _ = std::fs::remove_file(&shot_path);
+    let shot = shot_path.to_string_lossy().into_owned();
+
+    let script = ScriptBuilder::new().emit("start").screenshot(&shot);
+
+    // Default sphere-world spawn — same path as
+    // `scripts/dev.sh --sphere-world`.
+    let args: &[&str] = &[
+        "--render-harness",
+        "--sphere-world",
+        "--disable-highlight",
+        "--disable-overlay",
+        "--harness-width", "320",
+        "--harness-height", "240",
+        "--exit-after-frames", "180",
+        "--timeout-secs", "20",
+    ];
+
+    let trace = run(args, &script);
+    assert!(trace.exit_success, "binary did not exit 0\n{}", trace.stderr);
+    assert!(std::path::Path::new(&shot).exists(), "screenshot missing");
+
+    let distinct = distinct_non_sky_color_count(&shot);
+    assert!(
+        distinct > 30,
+        "default sphere-world spawn only produced {distinct} distinct colors — \
+         looks like a uniform failure fill (the 'gray cube edge' bug).",
+    );
+}
+
+/// The planet must render as a CURVED silhouette from a camera
+/// outside the body — not a flat face, not a cube, and not a
+/// uniform gray fill from a broken raycast. This is the baseline
+/// smoke test for the sphere render path.
+///
+/// Method: render the planet from above, then:
+/// 1. Confirm there's SOME rendered content (fail on uniform-fill
+///    from broken raycast).
+/// 2. Assert the middle row has substantially more planet pixels
+///    than the top row — a sphere bulges in the middle.
+/// 3. Assert there are at least several dozen distinct non-sky
+///    colors (a real lit surface has lighting gradients + grass/
+///    dirt/stone biome; a uniform LOD-terminal fallback has one).
+#[test]
+fn sphere_renders_as_curved_silhouette_from_above() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join("sphere_curved");
+    std::fs::create_dir_all(&dir).expect("create tmp dir");
+    let shot_path = dir.join("planet.png");
+    let _ = std::fs::remove_file(&shot_path);
+    let shot = shot_path.to_string_lossy().into_owned();
+
+    let script = ScriptBuilder::new().emit("start").screenshot(&shot);
+
+    // Camera above the body, looking down. Body at root slot 13 =
+    // [1, 2]³, outer shell at radius 0.45 from center (1.5, 1.5,
+    // 1.5). Spawn at y=2.7 — well outside the outer shell (y=1.95),
+    // looking straight down to frame the whole planet.
+    let args: &[&str] = &[
+        "--render-harness",
+        "--sphere-world",
+        "--spawn-xyz", "1.5", "2.7", "1.5",
+        "--spawn-depth", "3",
+        "--spawn-pitch", "-1.57",
+        "--spawn-yaw", "0",
+        "--disable-highlight",
+        "--disable-overlay",
+        "--harness-width", "320",
+        "--harness-height", "240",
+        "--exit-after-frames", "180",
+        "--timeout-secs", "20",
+    ];
+
+    let trace = run(args, &script);
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr tail ---\n{}",
+        trace.stderr.lines().rev().take(30).collect::<Vec<_>>().join("\n"),
+    );
+    assert!(
+        std::path::Path::new(&shot).exists(),
+        "screenshot missing: {shot}",
+    );
+
+    let distinct = distinct_non_sky_color_count(&shot);
+    assert!(
+        distinct > 30,
+        "image has only {distinct} distinct non-sky colors — \
+         looks like a uniform failure fill (broken raycast). \
+         A real sphere render has lighting + voxel-grid variance.",
+    );
+
+    let top = planet_pixel_count_at_row(&shot, 0.10);
+    let mid = planet_pixel_count_at_row(&shot, 0.50);
+    let bot = planet_pixel_count_at_row(&shot, 0.90);
+
+    // Round silhouette: middle row fills much more than top.
+    assert!(
+        mid > 0,
+        "middle row has zero planet pixels — planet not in view",
+    );
+    assert!(
+        mid as f32 >= top as f32 * 1.5,
+        "planet silhouette not curved — mid row {mid} must be >= 1.5 * top row {top}. \
+         bot {bot}. If mid ≈ top, the face subtree is rendering as a flat cube.",
+    );
+}
+
 
 /// Break + probe at layer 26. Basic sanity — one break, one probe,
 /// three-way verification (edit+probe+screenshot).
@@ -81,13 +209,17 @@ fn sphere_layer_26_break_below_is_registered() {
     );
 }
 
-/// Full 20-layer descent: break + zoom_in + respawn_on_surface at
-/// every anchor_depth from 5 to 24. Each iteration verifies the
+/// Full 30-layer descent: break + zoom_in + respawn_on_surface at
+/// every anchor_depth from 5 to 34. Each iteration verifies the
 /// break changes world state, the probe anchor matches the edit
-/// anchor, and anchor_depth increments correctly.
+/// anchor, and anchor_depth increments correctly. A failure at
+/// the very last layer (anchor_depth 34, at/past f32 precision
+/// wall for body-frame math) is acceptable — the test's purpose
+/// is to confirm the descent pipeline works across the useful
+/// depth range, not to push past f32 breakdown.
 #[test]
 fn sphere_descent_breaks_at_every_layer() {
-    const N_LAYERS: u32 = 20;
+    const N_LAYERS: u32 = 30;
 
     let mut script = ScriptBuilder::new();
     let mut labels = Vec::<String>::new();

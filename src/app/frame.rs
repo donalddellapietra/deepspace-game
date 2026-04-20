@@ -177,19 +177,22 @@ pub fn with_render_margin(
 ) -> ActiveFrame {
     let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
     let min_render_depth = match logical.kind {
-        // Sphere: at face_depth >= 1 the render root IS the face
-        // subtree cell. Going deeper than that lands in a face-
-        // subtree cartesian descendant, which works but loses the
-        // UVR-semantic bevel/shading. The minimum is `body_path + 1`
-        // — body's face-slot child, i.e., the face subtree root.
+        // Sphere: the render root can be the body cell (face_depth=0,
+        // curved-UVR body march) OR a face subtree cell (face_depth>=1,
+        // flat-UVR face march). At face_depth=0 the face cell is the
+        // WHOLE face — curvature dominates, flat math would render a
+        // cube. Require face_depth >= 1 when rooting at face; below
+        // that, shallow to body.
         ActiveFrameKind::Sphere(sphere) => {
-            (sphere.body_path.depth() + 1).min(logical.logical_path.depth())
+            // Need at least body_path + 1 + 1 (= face_depth=1) to
+            // use the face-rooted flat-UVR path safely. If logical
+            // can't reach that, fall back to body-rooted.
+            (sphere.body_path.depth() + 2).min(logical.logical_path.depth())
         }
         ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
         // Shell architecture: the render frame IS the innermost
         // shell root. The shader pops outward via the ribbon for
-        // coarser context. No render_margin needed — each shell
-        // has a bounded depth budget.
+        // coarser context.
         ActiveFrameKind::Cartesian => logical.logical_path.depth(),
     };
     let render_depth = logical
@@ -198,12 +201,45 @@ pub fn with_render_margin(
         .saturating_sub(render_margin)
         .max(min_render_depth);
     if render_depth == logical.logical_path.depth() {
+        // Logical IS the render frame. But if it's a Sphere with
+        // face_depth == 0, promote to Body (curved sphere math).
+        if let ActiveFrameKind::Sphere(sphere) = logical.kind {
+            if sphere.face_depth == 0 {
+                let mut body_path = logical.logical_path;
+                body_path.truncate(sphere.body_path.depth());
+                let body = compute_render_frame(
+                    library, world_root, &body_path, sphere.body_path.depth(),
+                );
+                return ActiveFrame {
+                    render_path: body.render_path,
+                    logical_path: logical.logical_path,
+                    node_id: body.node_id,
+                    kind: body.kind,
+                };
+            }
+        }
         return logical;
     }
 
     let mut render_path = logical.logical_path;
     render_path.truncate(render_depth);
     let render = compute_render_frame(library, world_root, &render_path, render_depth);
+    // Same face_depth=0 promotion for the margin'd case.
+    if let ActiveFrameKind::Sphere(sphere) = render.kind {
+        if sphere.face_depth == 0 {
+            let mut body_path = render.render_path;
+            body_path.truncate(sphere.body_path.depth());
+            let body = compute_render_frame(
+                library, world_root, &body_path, sphere.body_path.depth(),
+            );
+            return ActiveFrame {
+                render_path: body.render_path,
+                logical_path: logical.logical_path,
+                node_id: body.node_id,
+                kind: body.kind,
+            };
+        }
+    }
     ActiveFrame {
         render_path: render.render_path,
         logical_path: logical.logical_path,

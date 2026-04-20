@@ -293,3 +293,84 @@ fn parse_probe(rest: &str) -> Option<HarnessProbe> {
         anchor_depth: kv.get("anchor_depth")?.parse().ok()?,
     })
 }
+
+// ───────────────────────────────────────────── image analysis
+
+/// Count "planet" pixels (non-sky) at a given horizontal row. Sky is
+/// detected as R < G < B (the engine's blue-gradient). A curved sphere
+/// viewed from outside has a silhouette that's widest in the middle
+/// rows and tapers at top/bottom — this function is the primitive for
+/// asserting "the planet is round, not a cube."
+pub fn planet_pixel_count_at_row(
+    path: impl AsRef<std::path::Path>,
+    row_frac: f32,
+) -> u32 {
+    let file = std::fs::File::open(path.as_ref())
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.as_ref().display()));
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().expect("read png header");
+    let info = reader.info().clone();
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unsupported png color type {other:?}"),
+    };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buf).expect("decode png frame");
+    let data = &buf[..frame.buffer_size()];
+
+    let y = ((row_frac.clamp(0.0, 1.0)) * height as f32) as usize;
+    let y = y.min(height.saturating_sub(1));
+    let mut planet = 0u32;
+    for x in 0..width {
+        let i = (y * width + x) * channels;
+        let r = data[i];
+        let g = data[i + 1];
+        let b = data[i + 2];
+        if !(b > r && b > g) {
+            planet += 1;
+        }
+    }
+    planet
+}
+
+/// Count of distinct non-sky pixel colors in the image. A UNIFORM fill
+/// (e.g. every pixel falling back to LOD-terminal representative gray)
+/// produces a very small count; a real rendered sphere surface with
+/// shading / voxel grid / sdf-derived blocks has hundreds of distinct
+/// shades. Used to catch "every pixel gave up and rendered the same
+/// failure color."
+pub fn distinct_non_sky_color_count(
+    path: impl AsRef<std::path::Path>,
+) -> u32 {
+    let file = std::fs::File::open(path.as_ref())
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.as_ref().display()));
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().expect("read png header");
+    let info = reader.info().clone();
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unsupported png color type {other:?}"),
+    };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buf).expect("decode png frame");
+    let data = &buf[..frame.buffer_size()];
+
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * channels;
+            let r = data[i];
+            let g = data[i + 1];
+            let b = data[i + 2];
+            // Skip sky.
+            if b > r && b > g { continue; }
+            let key = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+            seen.insert(key);
+        }
+    }
+    seen.len() as u32
+}

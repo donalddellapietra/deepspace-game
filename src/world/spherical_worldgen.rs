@@ -127,7 +127,7 @@ pub fn install_at_root_center(
 /// so in_frame lands the camera correctly within the render cell.
 pub fn demo_sphere_surface_spawn(
     body_path: &Path,
-    _setup: &PlanetSetup,
+    setup: &PlanetSetup,
     anchor_depth: u8,
     face: Face,
 ) -> WorldPos {
@@ -135,10 +135,19 @@ pub fn demo_sphere_surface_spawn(
     path.push(FACE_SLOTS[face as usize] as u8);
 
     // Surface coords in face-normalized [0, 1)³: center of face,
-    // just inside the outer shell.
+    // just ABOVE the SDF surface (not at the outer shell).
+    // rn = (sdf_radius - inner_r) / (outer_r - inner_r) gives the
+    // normalized radial position of the SDF surface; add a small
+    // offset so the camera stands atop the ground. Placing camera
+    // AT the outer shell puts it too far from the ground for the
+    // per-anchor-depth-scaled interaction radius to reach.
+    let shell = (setup.outer_r - setup.inner_r).max(1e-6);
+    let sdf_rn = ((setup.sdf.radius - setup.inner_r) / shell).clamp(0.0, 1.0);
+    let rn_target = (sdf_rn + 0.05).min(1.0 - 1e-6);
+
     let mut un: f32 = 0.5;
     let mut vn: f32 = 0.5;
-    let mut rn: f32 = 1.0 - 1e-6;
+    let mut rn: f32 = rn_target;
 
     let remaining = (anchor_depth as i32 - path.depth() as i32).max(0) as usize;
     for _ in 0..remaining {
