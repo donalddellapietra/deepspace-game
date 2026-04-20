@@ -619,31 +619,46 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        // Render frame is always Cartesian or Body now; camera-local
-        // is simply in_frame(&render_path).
         let cam_local = self.camera.position.in_frame(&frame.render_path);
-        if self.startup_profile_frames < 4 {
-            eprintln!(
-                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",
-                frame.kind,
-                frame.render_path.as_slice(),
-                frame.logical_path.as_slice(),
-                cam_local,
-            );
-        }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::normalize(fwd_world);
-        let right_local = crate::world::sdf::normalize(right_world);
-        let up_local = crate::world::sdf::normalize(up_world);
+
+        // For face-rooted frames the render cell's render-frame-local
+        // axes align with the face's (u_axis, v_axis, n_axis) in world
+        // coords. The camera's world-frame basis vectors must be
+        // transformed into that basis so ray dir matches the render
+        // cell's geometry. Cartesian / Body frames are world-aligned,
+        // so no transform needed.
+        let (fwd_local, right_local, up_local) = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => {
+                let n = sphere.face.normal();
+                let (u, v) = sphere.face.tangents();
+                let project = |w: [f32; 3]| -> [f32; 3] {
+                    [
+                        w[0] * u[0] + w[1] * u[1] + w[2] * u[2],
+                        w[0] * v[0] + w[1] * v[1] + w[2] * v[2],
+                        w[0] * n[0] + w[1] * n[1] + w[2] * n[2],
+                    ]
+                };
+                (
+                    crate::world::sdf::normalize(project(fwd_world)),
+                    crate::world::sdf::normalize(project(right_world)),
+                    crate::world::sdf::normalize(project(up_world)),
+                )
+            }
+            _ => (
+                crate::world::sdf::normalize(fwd_world),
+                crate::world::sdf::normalize(right_world),
+                crate::world::sdf::normalize(up_world),
+            ),
+        };
+
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
-                fwd_world,
-                fwd_local,
-                right_local,
-                up_local,
+                "gpu_camera frame_kind={:?} cam_local={:?} fwd_local={:?}",
+                frame.kind, cam_local, fwd_local,
             );
         }
+
         self.camera.gpu_camera_with_basis(
             cam_local,
             fwd_local,
