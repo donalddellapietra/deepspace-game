@@ -270,7 +270,7 @@ fn sphere_in_cell(
     inner_r_local: f32,
     outer_r_local: f32,
     ray_origin: vec3<f32>,
-    ray_dir: vec3<f32>,
+    ray_dir_in: vec3<f32>,
     window_active: u32,
     window_face: u32,
     window_bounds: vec4<f32>,
@@ -282,6 +282,15 @@ fn sphere_in_cell(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+
+    // `ray_sphere_after` + the cubemap-plane intersections assume
+    // unit-length direction. The caller passes a non-unit vector
+    // (camera.forward + right·ndc + up·ndc), so the quadratic
+    // disc = b² − c would be scaled wrong for off-center pixels.
+    // Renormalize up front; the returned `t` is in world units either
+    // way because both walker and caller measure ray distance against
+    // unit direction.
+    let ray_dir = normalize(ray_dir_in);
 
     let cs_center = body_origin + vec3<f32>(body_size * 0.5);
     let cs_outer = outer_r_local * body_size;

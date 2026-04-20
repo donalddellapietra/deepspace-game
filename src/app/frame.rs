@@ -75,9 +75,21 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 }
 
 /// Resolve the active render frame. Walks the camera's anchor path
-/// down to `desired_depth`, building a sphere window on the fly
-/// when the descent crosses a `CubedSphereBody` → `CubedSphereFace`
-/// boundary.
+/// down to `desired_depth`.
+///
+/// Descent rule: a `CubedSphereBody` node is a **terminal render
+/// root**. The anchor path's XYZ slot indices don't carry valid
+/// descent info inside a body — the body's children are partitioned
+/// by cubemap-frustum geometry, not by XYZ slots, so any XYZ-slot
+/// step past the body boundary would pick a face root based on
+/// coincidental slot alignment (e.g., body slot 16 = PosY face root)
+/// and produce a nonsensical face-window when the camera is outside
+/// the shell. The shader handles sub-body detail via `sphere_in_cell`
+/// at render time.
+///
+/// Rendering from deep inside a face subtree (true deep-zoom onto
+/// the surface) requires separate camera-local face-focus logic —
+/// not done here, left as a future refinement.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -90,12 +102,6 @@ pub fn compute_render_frame(
     let mut node_id = world_root;
     let mut reached = Path::root();
 
-    // Sphere-frame accumulator: once we enter a body, start tracking
-    // `(body_path, radii, face_slot_reached, face_window)`.
-    let mut body: Option<(Path, f32, f32)> = None;
-    let mut sphere: Option<(Face, f32, f32, f32, f32, Path)> = None;
-    //                       face  u_min v_min r_min size logical_path
-
     for k in 0..target.depth() as usize {
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
@@ -106,61 +112,20 @@ pub fn compute_render_frame(
         match child.kind {
             NodeKind::Cartesian => {
                 node_id = child_id;
-                // If inside a face subtree, accumulate the slot's
-                // UVR contribution into the face window.
-                if let Some((
-                    _face,
-                    ref mut u_min,
-                    ref mut v_min,
-                    ref mut r_min,
-                    ref mut size,
-                    ref mut logical,
-                )) = sphere {
-                    let (us, vs, rs) = slot_coords(slot);
-                    let child_size = *size / 3.0;
-                    *u_min += us as f32 * child_size;
-                    *v_min += vs as f32 * child_size;
-                    *r_min += rs as f32 * child_size;
-                    *size = child_size;
-                    *logical = reached;
-                }
             }
-            NodeKind::CubedSphereBody { inner_r, outer_r } => {
+            NodeKind::CubedSphereBody { .. } => {
+                // Body is a terminal render root — stop descent.
                 node_id = child_id;
-                body = Some((reached, inner_r, outer_r));
+                break;
             }
-            NodeKind::CubedSphereFace { face } => {
+            NodeKind::CubedSphereFace { .. } => {
+                // Shouldn't happen via normal anchor descent since
+                // faces are only reachable inside a body and we stop
+                // at the body. Break for safety.
                 node_id = child_id;
-                // Entering a face: initialise window to the full face.
-                sphere = Some((face, 0.0, 0.0, 0.0, 1.0, reached));
+                break;
             }
         }
-    }
-
-    if let Some((face, u_min, v_min, r_min, size, logical_path)) = sphere {
-        let (body_path, inner_r, outer_r) =
-            body.expect("sphere frame requires a containing body");
-        // Linear render root stays at the body cell; the face
-        // window carries the deeper info.
-        let body_node_id = library
-            .get(world_root)
-            .and_then(|_| walk_to_node(library, world_root, &body_path))
-            .unwrap_or(node_id);
-        return ActiveFrame {
-            render_path: body_path,
-            logical_path,
-            node_id: body_node_id,
-            kind: ActiveFrameKind::Sphere(SphereFrame {
-                body_path,
-                face,
-                inner_r,
-                outer_r,
-                face_u_min: u_min,
-                face_v_min: v_min,
-                face_r_min: r_min,
-                face_size: size,
-            }),
-        };
     }
 
     let kind = library.get(node_id).map(|n| n.kind).unwrap_or(NodeKind::Cartesian);
@@ -173,18 +138,6 @@ pub fn compute_render_frame(
             _ => ActiveFrameKind::Cartesian,
         },
     }
-}
-
-fn walk_to_node(library: &NodeLibrary, root: NodeId, path: &Path) -> Option<NodeId> {
-    let mut node_id = root;
-    for k in 0..path.depth() as usize {
-        let node = library.get(node_id)?;
-        match node.children[path.slot(k) as usize] {
-            Child::Node(c) => node_id = c,
-            _ => return None,
-        }
-    }
-    Some(node_id)
 }
 
 pub fn with_render_margin(

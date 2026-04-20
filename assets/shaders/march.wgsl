@@ -820,21 +820,29 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
-        // Frame-root dispatch on NodeKind-backed uniform.
-        //   CARTESIAN → Cartesian DDA.
-        //   BODY      → whole-sphere march; body fills [0, 3)³.
-        //   FACE      → bounded face-window march; body fills [0, 3)³.
-        // `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole visual LOD
-        // gate in all three cases.
+        // Frame dispatch on NodeKind. Ribbon pops can move us
+        // through Cartesian → Body → Face or vice-versa, so we
+        // pick the DDA based on the current node's NodeKind, not
+        // the stashed `uniforms.root_kind` (which is only valid at
+        // the initial render root).
+        //
+        // FACE dispatch only makes sense at ribbon_level 0 — that's
+        // the only point where the face-window uniform applies.
+        // After a pop out of a face subtree, the frame is the
+        // containing body, and we handle it as BODY.
+        let cur_kind = node_kinds[current_idx].kind;
         var r: HitResult;
-        if uniforms.root_kind == ROOT_KIND_BODY {
+        if cur_kind == 1u {
+            // Body: whole-sphere march, body fills [0, 3)³.
             r = sphere_in_cell(
                 current_idx, vec3<f32>(0.0), 3.0,
-                uniforms.root_radii.x, uniforms.root_radii.y,
+                node_kinds[current_idx].inner_r,
+                node_kinds[current_idx].outer_r,
                 ray_origin, ray_dir,
                 0u, 0u, vec4<f32>(0.0),
             );
-        } else if uniforms.root_kind == ROOT_KIND_FACE {
+        } else if cur_kind == 2u && ribbon_level == 0u {
+            // Face root at the initial frame: bounded window march.
             r = sphere_in_cell(
                 current_idx, vec3<f32>(0.0), 3.0,
                 uniforms.root_radii.x, uniforms.root_radii.y,
