@@ -378,16 +378,24 @@ fn sphere_in_cell(
         // Palette index 0 is a real block (STONE), so we can't use
         // zero as the empty sentinel.
         if w.block != FACE_WALK_EMPTY {
-            // Hit. Compose shading. Normal comes from whichever
-            // cell-boundary we last crossed.
+            // Hit. The previous step's `last_side` is the face we
+            // crossed to exit the PREVIOUS cell; we entered THIS
+            // cell through the geometrically-same boundary, but
+            // that face's outward normal (from the hit cell's POV)
+            // points back toward where the ray came from — the
+            // opposite direction. So winning face 4 (crossed the
+            // previous cell's r_lo going inward) lands on THIS
+            // cell's r_hi face, outward normal +n; winning 0
+            // (crossed prev u_lo going -u) lands on THIS cell's
+            // u_hi, outward normal +u_axis; etc.
             var hit_normal: vec3<f32>;
             switch last_side {
-                case 0u: { hit_normal = -u_axis; }
-                case 1u: { hit_normal =  u_axis; }
-                case 2u: { hit_normal = -v_axis; }
-                case 3u: { hit_normal =  v_axis; }
-                case 4u: { hit_normal = -n; }
-                case 5u: { hit_normal =  n; }
+                case 0u: { hit_normal =  u_axis; }
+                case 1u: { hit_normal = -u_axis; }
+                case 2u: { hit_normal =  v_axis; }
+                case 3u: { hit_normal = -v_axis; }
+                case 4u: { hit_normal =  n; }
+                case 5u: { hit_normal = -n; }
                 default: { hit_normal =  n; }
             }
             result.hit = true;
