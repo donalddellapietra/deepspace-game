@@ -9,6 +9,7 @@
 
 mod cartesian;
 mod sphere;
+mod sphere_sub;
 
 pub use sphere::{FaceWindow, LodParams};
 
@@ -158,15 +159,41 @@ pub fn cpu_raycast_in_frame(
     }
 }
 
-/// Frame-aware raycast for a sphere sub-frame (render root lives
-/// inside a face subtree). The linear render frame stays rooted at
-/// the containing body cell; the face window tells the sphere DDA
-/// which absolute UVR region the render frame covers.
+/// Frame-aware raycast for a deep face-subtree render frame
+/// (`ActiveFrameKind::SphereSub`). Delegates to the local-frame DDA
+/// in `sphere_sub.rs`, which preserves f32 precision at arbitrary
+/// face-subtree depth via a Jacobian-based ribbon-pop.
 ///
-/// Camera coords are expressed in the body cell's frame (`[0, 3)³`).
-/// `ray_dir` is the world-axis direction in body-local orientation
-/// (shared between Cartesian and sphere because a body cell is
-/// axis-aligned with its parent's frame).
+/// `cam_body` and `ray_dir_body` are the camera / ray in the body
+/// cell's local `[0, 3)³` frame. The sub-frame DDA transforms them
+/// into its own local `[0, 3)³` on entry via `J_inv`.
+pub fn cpu_raycast_in_sub_frame(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    sub: &crate::app::frame::SphereSubFrame,
+    render_path: &[u8],
+    cam_local: [f32; 3],
+    ray_dir_body: [f32; 3],
+    edit_depth: u32,
+    lod: LodParams,
+) -> Option<HitInfo> {
+    let (chain, frame_entries) = build_frame_chain(library, world_root, render_path);
+    let depth = chain.len() - 1;
+    let sub_frame_node = chain[depth];
+    let walker_limit = edit_depth.saturating_sub(depth as u32);
+    if walker_limit == 0 {
+        return None;
+    }
+    let ancestor_path = &frame_entries[..depth];
+    sphere_sub::cs_raycast_local(
+        library, sub, sub_frame_node, ancestor_path,
+        cam_local, ray_dir_body,
+        walker_limit, lod,
+    )
+}
+
+/// DEPRECATED: the old face-window path; kept temporarily while
+/// callers migrate. New callers should use `cpu_raycast_in_sub_frame`.
 pub fn cpu_raycast_in_sphere_frame(
     library: &NodeLibrary,
     world_root: NodeId,

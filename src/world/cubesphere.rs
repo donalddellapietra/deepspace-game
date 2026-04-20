@@ -206,33 +206,38 @@ pub fn mat3_mul_vec(m: &Mat3, v: Vec3) -> Vec3 {
     ]
 }
 
-/// Analytic inverse of a 3×3 matrix. Columns of the input are column-
-/// major (`m[c][r]`). Panics if `|det| < 1e-30`; the cubed-sphere
-/// Jacobian is always well-conditioned (no singularity on the sphere)
-/// so this should never fire in practice.
+/// Analytic inverse of a 3×3 matrix, stored column-major as `m[c][r]`.
+///
+/// Uses f64 arithmetic internally. The face-frame Jacobian has
+/// columns of magnitude O(frame_size · body_scale), so at deep
+/// face-subtree levels the determinant shrinks as O(frame_size³).
+/// f32 intermediate products collapse below subnormal range; f64
+/// preserves precision, and the final division naturally rescales
+/// the inverse entries to O(1/frame_size) which f32 represents
+/// cleanly (magnitudes up to ~3e38).
 pub fn mat3_inv(m: &Mat3) -> Mat3 {
-    let a = m[0][0]; let b = m[1][0]; let c = m[2][0];
-    let d = m[0][1]; let e = m[1][1]; let f = m[2][1];
-    let g = m[0][2]; let h = m[1][2]; let i = m[2][2];
-    let c00 =  (e * i - f * h);
+    let a = m[0][0] as f64; let b = m[1][0] as f64; let c = m[2][0] as f64;
+    let d = m[0][1] as f64; let e = m[1][1] as f64; let f = m[2][1] as f64;
+    let g = m[0][2] as f64; let h = m[1][2] as f64; let i = m[2][2] as f64;
+    let c00 =   e * i - f * h;
     let c01 = -(d * i - f * g);
-    let c02 =  (d * h - e * g);
+    let c02 =   d * h - e * g;
     let c10 = -(b * i - c * h);
-    let c11 =  (a * i - c * g);
+    let c11 =   a * i - c * g;
     let c12 = -(a * h - b * g);
-    let c20 =  (b * f - c * e);
+    let c20 =   b * f - c * e;
     let c21 = -(a * f - c * d);
-    let c22 =  (a * e - b * d);
+    let c22 =   a * e - b * d;
     let det = a * c00 + b * c01 + c * c02;
-    debug_assert!(det.abs() > 1e-30, "mat3_inv: near-singular");
+    debug_assert!(det.abs() > 1e-70, "mat3_inv: near-singular (det={det})");
     let inv_det = 1.0 / det;
-    // A^{-1}[r][c] = C[c][r] / det, and our storage M[c][r] = A[r][c],
-    // so M_inv[c][r] = A^{-1}[r][c] = C[c][r] / det. Column c of the
-    // stored inverse is therefore [C[c][0], C[c][1], C[c][2]] / det.
+    // A^{-1}[r][c] = C[c][r] / det, and storage M[c][r] = A[r][c],
+    // so M_inv[c][r] = C[c][r] / det. Column c of the stored inverse
+    // is therefore [C[c][0], C[c][1], C[c][2]] / det.
     [
-        [c00 * inv_det, c01 * inv_det, c02 * inv_det],
-        [c10 * inv_det, c11 * inv_det, c12 * inv_det],
-        [c20 * inv_det, c21 * inv_det, c22 * inv_det],
+        [(c00 * inv_det) as f32, (c01 * inv_det) as f32, (c02 * inv_det) as f32],
+        [(c10 * inv_det) as f32, (c11 * inv_det) as f32, (c12 * inv_det) as f32],
+        [(c20 * inv_det) as f32, (c21 * inv_det) as f32, (c22 * inv_det) as f32],
     ]
 }
 
