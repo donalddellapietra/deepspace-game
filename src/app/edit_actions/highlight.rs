@@ -11,7 +11,7 @@ use crate::bridge::{CrosshairStateJs, GameStateUpdate};
 use crate::overlay;
 use crate::world::aabb;
 
-use crate::app::{ActiveFrameKind, App, HighlightCacheKey};
+use crate::app::{App, HighlightCacheKey};
 
 impl App {
     pub(in crate::app) fn update_highlight(&mut self) {
@@ -70,9 +70,14 @@ impl App {
                 tree_hit.is_some(),
             );
         }
-        let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
-            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, hit),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+        let aabb = tree_hit.as_ref().map(|hit| {
+            // Dispatch on whether the hit traversed a body ancestor:
+            // sphere hits (path includes a CubedSphereBody) need the
+            // face-bulge AABB, purely cartesian hits use the cell's
+            // local AABB.
+            if aabb::hit_path_crosses_body(&self.world.library, hit) {
+                aabb::hit_aabb_body_local(&self.world.library, hit)
+            } else {
                 aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
             }
         });

@@ -350,6 +350,27 @@ impl App {
                 WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
                     .deepened_to(depth)
             }
+            None if test_cfg.spawn_on_surface => {
+                // Sphere surface spawn: walk face-subtree slots
+                // precision-safely to land on the planet's outer shell.
+                // Only meaningful for sphere worlds — other presets
+                // fall through to the default spawn path.
+                let depth = test_cfg.spawn_depth.unwrap_or(
+                    bootstrap.default_spawn_pos.anchor.depth(),
+                );
+                match bootstrap.planet_path {
+                    Some(body_path) => {
+                        let setup = crate::world::spherical_worldgen::demo_planet();
+                        crate::world::spherical_worldgen::demo_sphere_surface_spawn(
+                            &body_path,
+                            &setup,
+                            depth,
+                            crate::world::cubesphere::Face::PosY,
+                        )
+                    }
+                    None => bootstrap.default_spawn_pos,
+                }
+            }
             None => {
                 if let Some(depth) = test_cfg.spawn_depth {
                     if bootstrap.plain_layers > 0 {
@@ -529,7 +550,13 @@ impl App {
             ActiveFrameKind::Body { inner_r, outer_r } => {
                 NodeKind::CubedSphereBody { inner_r, outer_r }
             }
-            ActiveFrameKind::Sphere(s) => NodeKind::CubedSphereFace { face: s.face },
+            // Sphere can appear when `compute_render_frame` is called
+            // directly (not via with_render_margin) with a deep target.
+            // Report the body kind with the sphere's radii — the face
+            // identity isn't needed by the renderer.
+            ActiveFrameKind::Sphere(s) => {
+                NodeKind::CubedSphereBody { inner_r: s.inner_r, outer_r: s.outer_r }
+            }
         }
     }
 
@@ -592,12 +619,9 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
-        };
+        // Render frame is always Cartesian or Body now; camera-local
+        // is simply in_frame(&render_path).
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",

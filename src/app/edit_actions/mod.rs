@@ -15,7 +15,7 @@ mod zoom;
 use crate::world::anchor::Path;
 use crate::world::{aabb, raycast};
 
-use super::{ActiveFrameKind, App};
+use super::App;
 
 /// CPU-side ceiling for `visual_depth()` (feeds the sphere/face
 /// walker's `uniforms.max_depth`). Picked equal to the tree's
@@ -57,61 +57,31 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
-        // Distance cap frame-path: sphere raycasts measure `t` in
-        // body-frame local units; Cartesian raycasts measure `t` in
-        // render-frame local units. The frame we use for the
-        // anchor-cell-size math must match whichever path produced
-        // the hit.
-        let (hit, cap_frame_path) = match self.active_frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
-                let hit = raycast::cpu_raycast_in_sphere_frame(
-                    &self.world.library,
-                    self.world.root,
-                    sphere.body_path.as_slice(),
-                    cam_body,
-                    cam_body,
-                    ray_dir_local,
-                    self.cs_edit_depth(),
-                    sphere.face as u32,
-                    sphere.face_u_min,
-                    sphere.face_v_min,
-                    sphere.face_r_min,
-                    sphere.face_size,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    sphere.face_depth,
-                );
-                (hit, sphere.body_path)
-            }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                // Raycast from the render frame — f32 can only represent
-                // positions a few levels deeper than the frame root.
-                // The pop loop handles finding hits at coarser depths
-                // via slot-arithmetic frame transitions.
-                let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
-                let hit = raycast::cpu_raycast_in_frame(
-                    &self.world.library,
-                    self.world.root,
-                    frame_path.as_slice(),
-                    cam_local,
-                    ray_dir,
-                    self.edit_depth(),
-                    self.cs_edit_depth(),
-                );
-                if hit.is_none() && self.startup_profile_frames < 16 {
-                    eprintln!(
-                        "frame_raycast_cartesian_miss edit_depth={} render_path={:?}",
-                        self.edit_depth(),
-                        frame_path.as_slice(),
-                    );
-                }
-                (hit, frame_path)
-            }
-        };
+        // Under the new design the render frame never roots at a
+        // face, so the same `cpu_raycast_in_frame` path covers
+        // Cartesian, Body, and Sphere (logical-in-face) alike —
+        // it dispatches on the frame-root NodeKind internally.
+        let frame_path = self.active_frame.render_path;
+        let cam_local = self.camera.position.in_frame(&frame_path);
+        let ray_dir = self.ray_dir_in_frame(&frame_path);
+        let hit = raycast::cpu_raycast_in_frame(
+            &self.world.library,
+            self.world.root,
+            frame_path.as_slice(),
+            cam_local,
+            ray_dir,
+            self.edit_depth(),
+            self.cs_edit_depth(),
+        );
+        if hit.is_none() && self.startup_profile_frames < 16 {
+            eprintln!(
+                "frame_raycast_miss edit_depth={} render_path={:?}",
+                self.edit_depth(),
+                frame_path.as_slice(),
+            );
+        }
+        let cap_frame_path = frame_path;
+        let (hit, cap_frame_path) = (hit, cap_frame_path);
         // Enforce the interaction radius gate: drop hits beyond
         // `interaction_radius_cells × anchor_cell_size`. Same
         // cubic-shell LOD philosophy as the shader — out of range
@@ -145,13 +115,14 @@ impl App {
                 hit.is_some(),
             );
             if let Some(ref h) = hit {
-                let (aabb_min, aabb_max) = match self.active_frame.kind {
-                    ActiveFrameKind::Sphere(_) => {
-                        aabb::hit_aabb_body_local(&self.world.library, h)
-                    }
-                    ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                        aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
-                    }
+                // Dispatch on whether the hit traversed a body ancestor.
+                // For sphere hits the cell AABB is computed from the
+                // face-space bulge of the final (u, v, r) cell; for
+                // purely cartesian hits, just the cell's local AABB.
+                let (aabb_min, aabb_max) = if aabb::hit_path_crosses_body(&self.world.library, h) {
+                    aabb::hit_aabb_body_local(&self.world.library, h)
+                } else {
+                    aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
                 };
                 eprintln!(
                     "frame_raycast_hit path_len={} face={} t={} place_path_len={:?} terminal={} aabb_min={:?} aabb_max={:?} path_kinds={:?}",

@@ -88,7 +88,7 @@ mod tests {
         assert!(src.contains("@fragment"), "fs_main missing");
         assert!(src.contains("fn march("), "march missing");
         assert!(src.contains("fn march_cartesian("), "march_cartesian missing");
-        assert!(src.contains("fn sphere_in_cell("), "sphere_in_cell missing");
+        assert!(src.contains("fn march_sphere_body("), "march_sphere_body missing");
         assert!(src.contains("struct Uniforms"), "Uniforms missing");
         assert!(!src.contains("#include"), "directive leaked into output");
     }

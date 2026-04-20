@@ -99,6 +99,14 @@ impl ScriptBuilder {
         self
     }
 
+    /// Sphere-only. Re-invokes `demo_sphere_surface_spawn` for the
+    /// current anchor_depth so the camera lands back on the outer
+    /// shell after a break+zoom_in cycle.
+    pub fn respawn_on_surface(mut self) -> Self {
+        self.parts.push("respawn_on_surface".to_string());
+        self
+    }
+
     /// Shorthand for `pitch:-1.5707` (straight down, world frame).
     pub fn look_down(self) -> Self {
         self.pitch(-std::f32::consts::FRAC_PI_2)

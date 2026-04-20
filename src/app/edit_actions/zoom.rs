@@ -5,7 +5,7 @@ use crate::world::cubesphere::FACE_SLOTS;
 use crate::world::cubesphere_local;
 
 use crate::app::frame;
-use crate::app::{ActiveFrame, ActiveFrameKind, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
+use crate::app::{ActiveFrame, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
 use super::{
     FRAME_FOCUS_MIN_PIXELS, FRAME_VISUAL_MIN_PIXELS, MAX_FOCUSED_FRAME_CAMERA_EXTENT,
     MAX_LOCAL_VISUAL_DEPTH,
@@ -53,29 +53,11 @@ impl App {
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                if let Some(face_point) = cubesphere_local::body_point_to_face_space(
-                    cam_body,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    WORLD_SIZE,
-                ) {
-                    let scale = WORLD_SIZE / sphere.face_size;
-                    [
-                        (face_point.un - sphere.face_u_min) * scale,
-                        (face_point.vn - sphere.face_v_min) * scale,
-                        (face_point.rn - sphere.face_r_min) * scale,
-                    ]
-                } else {
-                    [f32::NAN; 3]
-                }
-            }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
-        };
+        // Under the new design the render frame is always Cartesian
+        // or Body, so camera-local is just in_frame(&render_path).
+        // Sphere logical paths resolve to Body render frames via
+        // with_render_margin — no face-window projection needed.
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
@@ -166,18 +148,11 @@ impl App {
     }
 
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
-        let (cam_local, frame_center_local, frame_span) = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => (
-                self.camera.position.in_frame(&sphere.body_path),
-                frame::frame_point_to_body([1.5, 1.5, 1.5], &sphere),
-                (crate::world::anchor::WORLD_SIZE * sphere.face_size).max(1e-6),
-            ),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
-                self.camera.position.in_frame(&frame.render_path),
-                [1.5, 1.5, 1.5],
-                crate::world::anchor::WORLD_SIZE,
-            ),
-        };
+        // All render frames span a single [0, WORLD_SIZE)³ cell now
+        // (Cartesian or Body). Face-window scaling is gone.
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
+        let frame_center_local = [1.5, 1.5, 1.5];
+        let frame_span = crate::world::anchor::WORLD_SIZE;
         let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
         let dist = crate::world::sdf::length(to_center).max(0.05);
         let half_fov_recip = 720.0f32 / (2.0f32 * (1.2f32 * 0.5f32).tan());
@@ -234,8 +209,7 @@ impl App {
         }
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
-                ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
-                ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                _ => {
                     self.camera.position.in_frame(&frame.render_path)
                 }
             };

@@ -132,7 +132,25 @@ impl App {
                 self.camera.position.add_local(d, &self.world.library);
             }
             ScriptCmd::FlyToSurface => self.fly_to_surface(),
+            ScriptCmd::RespawnOnSurface => self.respawn_on_surface(),
         }
+    }
+
+    /// Sphere-world spawn helper: re-invokes `demo_sphere_surface_spawn`
+    /// at the camera's current anchor depth, keeping the camera planted
+    /// on the outer shell through a break+zoom+descend sequence.
+    pub(super) fn respawn_on_surface(&mut self) {
+        use crate::world::spherical_worldgen::{demo_planet, demo_sphere_surface_spawn};
+        let Some(body_path) = self.planet_path else { return; };
+        let depth = self.camera.position.anchor.depth();
+        let setup = demo_planet();
+        self.camera.position = demo_sphere_surface_spawn(
+            &body_path,
+            &setup,
+            depth,
+            crate::world::cubesphere::Face::PosY,
+        );
+        self.apply_zoom();
     }
 
     /// Raycast straight down in world-space bypassing the normal

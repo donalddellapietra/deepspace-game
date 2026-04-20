@@ -32,7 +32,7 @@ pub fn demo_planet() -> PlanetSetup {
     PlanetSetup {
         inner_r,
         outer_r,
-        depth: 28,
+        depth: 20,
         sdf: Planet {
             center,
             radius: 0.30,
@@ -122,7 +122,7 @@ pub fn install_at_root_center(
 /// anchor_depth = 20+.
 pub fn demo_sphere_surface_spawn(
     body_path: &Path,
-    setup: &PlanetSetup,
+    _setup: &PlanetSetup,
     anchor_depth: u8,
     face: Face,
 ) -> WorldPos {
@@ -133,9 +133,9 @@ pub fn demo_sphere_surface_spawn(
     let mut path = *body_path;
     path.push(FACE_SLOTS[face as usize] as u8);
 
-    let mut un = 0.5f32;
-    let mut vn = 0.5f32;
-    let mut rn = 1.0 - 1e-6; // just inside the outer shell
+    let mut un: f32 = 0.5;
+    let mut vn: f32 = 0.5;
+    let mut rn: f32 = 1.0 - 1e-6; // just inside the outer shell
 
     // Descend the face subtree one level per remaining depth step.
     let remaining = (anchor_depth as i32 - path.depth() as i32).max(0) as usize;

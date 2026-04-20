@@ -43,10 +43,12 @@ pub enum EntityRenderMode {
 pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `RootKind*`
-/// constants in `bindings.wgsl`.
+/// constants in `bindings.wgsl`. The face-rooted render kind is
+/// gone: `with_render_margin` keeps the render root at the
+/// containing body cell even when the camera has zoomed deep into
+/// a face subtree.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
-pub const ROOT_KIND_FACE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -57,10 +59,10 @@ pub struct GpuUniforms {
     pub screen_height: f32,
     pub max_depth: u32,
     pub highlight_active: u32,
-    /// 0 = Cartesian, 1 = CubedSphereBody. Mirrors the `RootKind*`
-    /// constants. When 1, the shader dispatches into sphere DDA at
-    /// start-of-march; the body fills the `[0, 3)³` frame, and
-    /// `root_inner_r`/`root_outer_r` give the body's radii.
+    /// 0 = Cartesian, 1 = CubedSphereBody. When 1, the shader
+    /// dispatches the unified sphere march at start-of-march; the
+    /// body fills the `[0, 3)³` frame, and `root_radii` carries its
+    /// inner/outer radii.
     pub root_kind: u32,
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
@@ -76,9 +78,6 @@ pub struct GpuUniforms {
     /// cell's local `[0, 1)` frame; the shader scales by 3.0
     /// (= WORLD_SIZE) to get shader-frame units.
     pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
-    pub root_face_meta: [u32; 4],
-    pub root_face_bounds: [f32; 4],
-    pub root_face_pop_pos: [f32; 4],
 }
 
 pub struct Renderer {
@@ -132,9 +131,6 @@ pub struct Renderer {
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
     pub(super) root_radii: [f32; 4],
-    pub(super) root_face_meta: [u32; 4],
-    pub(super) root_face_bounds: [f32; 4],
-    pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -274,37 +270,16 @@ impl Renderer {
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
         self.write_uniforms();
     }
 
     /// Set the frame-root NodeKind to CubedSphereBody with radii in
-    /// the body cell's local `[0, 1)` frame.
+    /// the body cell's local `[0, 1)` frame. The render frame never
+    /// roots at a face subtree — face descent happens via the
+    /// ribbon-pop chain starting from the body.
     pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
         self.root_kind = ROOT_KIND_BODY;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    pub fn set_root_kind_face(
-        &mut self,
-        inner_r: f32,
-        outer_r: f32,
-        face_id: u32,
-        subtree_depth: u32,
-        bounds: [f32; 4],
-        pop_pos: [f32; 3],
-    ) {
-        self.root_kind = ROOT_KIND_FACE;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [face_id, subtree_depth, 0, 0];
-        self.root_face_bounds = bounds;
-        self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
     }
 

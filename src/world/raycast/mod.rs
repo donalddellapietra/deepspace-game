@@ -89,7 +89,6 @@ pub fn cpu_raycast_in_frame(
                 inner_r, outer_r,
                 ray_origin, ray_dir,
                 &[], max_face_depth,
-                None,
             )
         } else {
             cartesian::cpu_raycast_with_face_depth(
@@ -118,88 +117,6 @@ pub fn cpu_raycast_in_frame(
             sz as f32 + ray_origin[2] / 3.0,
         ];
         ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
-        current_frame_depth -= 1;
-    }
-}
-
-/// Frame-aware raycast for a sphere sub-frame. The linear render
-/// frame stays rooted at the containing body cell, but the actual
-/// editable/renderable layer is the bounded face-cell window
-/// described by `(face, *_min, face_size, face_depth)`.
-pub fn cpu_raycast_in_sphere_frame(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    frame_path: &[u8],
-    cam_local: [f32; 3],
-    ray_origin_body: [f32; 3],
-    ray_dir: [f32; 3],
-    max_face_depth: u32,
-    face: u32,
-    face_u_min: f32,
-    face_v_min: f32,
-    face_r_min: f32,
-    face_size: f32,
-    inner_r_local: f32,
-    outer_r_local: f32,
-    face_depth: u32,
-) -> Option<HitInfo> {
-    let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
-    let effective_depth = chain.len() - 1;
-    let frame_entries = &frame_entries[..effective_depth];
-    let mut current_frame_depth = effective_depth;
-    let mut ray_origin_local = cam_local;
-
-    loop {
-        let frame_root_id = chain[current_frame_depth];
-
-        let hit_opt = if current_frame_depth == effective_depth {
-            sphere::cs_raycast_in_body(
-                library, frame_root_id, [0.0; 3], 3.0,
-                inner_r_local, outer_r_local,
-                ray_origin_body, ray_dir, &[],
-                max_face_depth.saturating_sub(face_depth),
-                Some(sphere::FaceBounds {
-                    face,
-                    u_min: face_u_min,
-                    v_min: face_v_min,
-                    r_min: face_r_min,
-                    size: face_size,
-                }),
-            )
-        } else {
-            let inner_max = max_face_depth.saturating_sub(current_frame_depth as u32);
-            let frame_kind = library.get(frame_root_id).map(|n| n.kind);
-            if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
-                sphere::cs_raycast_in_body(
-                    library, frame_root_id, [0.0; 3], 3.0,
-                    inner_r, outer_r,
-                    ray_origin_local, ray_dir, &[],
-                    max_face_depth,
-                    None,
-                )
-            } else {
-                cartesian::cpu_raycast_with_face_depth(
-                    library, frame_root_id, ray_origin_local, ray_dir,
-                    inner_max, max_face_depth,
-                )
-            }
-        };
-
-        if let Some(mut hit) = hit_opt {
-            prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
-            return Some(hit);
-        }
-
-        if current_frame_depth == 0 {
-            return None;
-        }
-        let last_slot = frame_entries[current_frame_depth - 1].1;
-        let (sx, sy, sz) = slot_coords(last_slot);
-        ray_origin_local = [
-            sx as f32 + ray_origin_local[0] / 3.0,
-            sy as f32 + ray_origin_local[1] / 3.0,
-            sz as f32 + ray_origin_local[2] / 3.0,
-        ];
         current_frame_depth -= 1;
     }
 }

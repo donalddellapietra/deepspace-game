@@ -3,7 +3,7 @@
 //! dispatches to `sphere::cs_raycast_in_body` when it descends into
 //! a `CubedSphereBody` child.
 
-use super::sphere::{self, FaceBounds};
+use super::sphere;
 use super::HitInfo;
 use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
@@ -141,7 +141,6 @@ pub(super) fn cpu_raycast_with_face_depth(
                         ray_origin, ray_dir,
                         &path,
                         max_face_depth,
-                        None::<FaceBounds>,
                     ) {
                         return Some(sphere_hit);
                     }

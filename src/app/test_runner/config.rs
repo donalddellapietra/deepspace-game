@@ -26,6 +26,12 @@ pub struct TestConfig {
     pub spawn_yaw: Option<f32>,
     /// Camera pitch at spawn (radians). Default -1.2 (steep down).
     pub spawn_pitch: Option<f32>,
+    /// For sphere worlds: spawn directly on the planet surface at
+    /// the requested anchor depth. Uses `demo_sphere_surface_spawn`
+    /// to walk face-subtree slots precision-safely; the camera
+    /// looks radially inward (down toward the core). Ignored for
+    /// non-sphere presets. Mutually exclusive with `spawn_xyz`.
+    pub spawn_on_surface: bool,
     pub screenshot: Option<String>,
     pub exit_after_frames: Option<u32>,
     /// Wall-clock kill switch in seconds. Defaults to 5.0 so a
@@ -157,6 +163,13 @@ pub enum ScriptCmd {
     /// the camera to "one layer-N cell above the new ground" (where N
     /// is the current UI layer), matching the descent flow.
     TeleportAboveLastEdit,
+    /// Sphere-only. Re-invokes `demo_sphere_surface_spawn` at the
+    /// current anchor depth, planting the camera back on the outer
+    /// shell. Used by the descent test because after a break +
+    /// zoom_in:1, the UVR cells of a face subtree don't align with
+    /// the Cartesian `teleport_above_last_edit` motion — the surface-
+    /// respawn re-aligns radially.
+    RespawnOnSurface,
 }
 
 impl TestConfig {
@@ -260,6 +273,7 @@ impl TestConfig {
                 }
                 "--spawn-yaw" => { cfg.spawn_yaw = args.next().and_then(|v| v.parse().ok()); }
                 "--spawn-pitch" => { cfg.spawn_pitch = args.next().and_then(|v| v.parse().ok()); }
+                "--spawn-on-surface" => { cfg.spawn_on_surface = true; }
                 "--screenshot" => { cfg.screenshot = args.next(); }
                 "--exit-after-frames" => {
                     cfg.exit_after_frames = args.next().and_then(|v| v.parse().ok());
@@ -401,6 +415,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
+            if raw == "respawn_on_surface" { return Some(ScriptCmd::RespawnOnSurface); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }

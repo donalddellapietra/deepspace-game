@@ -177,7 +177,12 @@ pub fn with_render_margin(
 ) -> ActiveFrame {
     let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
     let min_render_depth = match logical.kind {
-        ActiveFrameKind::Sphere(sphere) => (sphere.body_path.depth() + 1).min(logical.logical_path.depth()),
+        // Sphere: the render frame root stays at the containing
+        // body cell — never inside a face subtree. Face-depth
+        // descent happens via the ribbon/walker, not via a deeper
+        // render root. This is what keeps sphere math precision-
+        // safe at arbitrary zoom depth.
+        ActiveFrameKind::Sphere(sphere) => sphere.body_path.depth(),
         ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
         // Shell architecture: the render frame IS the innermost
         // shell root. The shader pops outward via the ribbon for

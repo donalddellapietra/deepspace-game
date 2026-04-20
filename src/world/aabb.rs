@@ -16,6 +16,13 @@ use super::cubesphere_local::{self, find_body_ancestor_in_path};
 use super::raycast::HitInfo;
 use super::tree::{slot_coords, NodeLibrary};
 
+/// True if the hit path descends through a `CubedSphereBody`
+/// ancestor (so the hit is inside a sphere). Used to pick between
+/// sphere-aware AABB construction and plain cartesian cell AABB.
+pub fn hit_path_crosses_body(library: &NodeLibrary, hit: &HitInfo) -> bool {
+    find_body_ancestor_in_path(library, &hit.path).is_some()
+}
+
 pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [f32; 3]) {
     let cell_path = hit_path_slots(hit);
     let common = cell_path.common_prefix_len(frame_path) as usize;
