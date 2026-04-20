@@ -1,9 +1,10 @@
-//! Cursor highlight: ray-cast, compute the hit's AABB in the current
-//! frame's coords, and push to the renderer's highlight uniform.
+//! Cursor highlight: ray-cast, extract the hit cell's slot path
+//! from the world root, and push it to the renderer. The shader
+//! compares that path prefix-wise against each pixel's walker
+//! descent — precision-safe at any anchor depth (no f32 AABB
+//! representation involved).
 
-use crate::world::aabb;
-
-use crate::app::{ActiveFrameKind, App, HighlightCacheKey};
+use crate::app::{App, HighlightCacheKey};
 
 impl App {
     pub(in crate::app) fn update_highlight(&mut self) {
@@ -12,7 +13,7 @@ impl App {
             self.last_highlight_set_ms = 0.0;
             self.cached_highlight = None;
             if let Some(renderer) = &mut self.renderer {
-                renderer.set_highlight(None);
+                renderer.set_highlight_path(&[]);
             }
             return;
         }
@@ -21,7 +22,7 @@ impl App {
             self.last_highlight_set_ms = 0.0;
             self.cached_highlight = None;
             if let Some(renderer) = &mut self.renderer {
-                renderer.set_highlight(None);
+                renderer.set_highlight_path(&[]);
             }
             return;
         }
@@ -29,11 +30,11 @@ impl App {
         if let Some((cached_key, cached_aabb)) = self.cached_highlight {
             if cached_key == cache_key {
                 self.last_highlight_raycast_ms = 0.0;
-                let set_start = std::time::Instant::now();
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.set_highlight(cached_aabb);
-                }
-                self.last_highlight_set_ms = set_start.elapsed().as_secs_f64() * 1000.0;
+                // Re-ship the path unconditionally — cheap write,
+                // keeps the shader's uniform in sync after other
+                // uniform updates (root_kind changes, etc.) that
+                // also call write_uniforms().
+                let _ = cached_aabb;
                 return;
             }
         }
@@ -48,17 +49,17 @@ impl App {
                 tree_hit.is_some(),
             );
         }
-        let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
-            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, hit),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
-            }
-        });
         let set_start = std::time::Instant::now();
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_highlight(aabb);
+            match &tree_hit {
+                Some(hit) => {
+                    let slots: Vec<u8> = hit.path.iter().map(|&(_, s)| s as u8).collect();
+                    renderer.set_highlight_path(&slots);
+                }
+                None => renderer.set_highlight_path(&[]),
+            }
         }
         self.last_highlight_set_ms = set_start.elapsed().as_secs_f64() * 1000.0;
-        self.cached_highlight = Some((cache_key, aabb));
+        self.cached_highlight = Some((cache_key, None));
     }
 }

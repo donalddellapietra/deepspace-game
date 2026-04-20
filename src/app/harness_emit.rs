@@ -58,21 +58,18 @@ impl App {
         );
     }
 
-    /// Raycast straight down in world-space from the camera and emit a
-    /// `HARNESS_PROBE` line. Pitch/yaw are temporarily overridden for
-    /// the raycast and restored before returning — the next render
-    /// sees the camera's original orientation.
+    /// Raycast from the camera and emit a `HARNESS_PROBE` line.
+    ///
+    /// Uses the camera's current pitch/yaw verbatim so the probe
+    /// direction exactly matches what a subsequent `break`/`place`
+    /// would see — any forward-direction reconstruction via the
+    /// camera basis is sub-ULP identical. Tests that want "straight
+    /// down" should spawn with `--spawn-pitch` near `-π/2`; the
+    /// refactored sphere walker is slot-accurate, and the old
+    /// tolerance for sub-ULP direction differences (courtesy of the
+    /// OLD coarse-step sphere DDA) does not carry over.
     pub(super) fn harness_probe_down(&mut self) {
-        use std::f32::consts::FRAC_PI_2;
-        let saved_pitch = self.camera.pitch;
-        let saved_yaw = self.camera.yaw;
-        // -π/2 with yaw 0 points at world -Y regardless of frame.
-        self.camera.pitch = -FRAC_PI_2;
-        self.camera.yaw = 0.0;
         let hit = self.frame_aware_raycast();
-        self.camera.pitch = saved_pitch;
-        self.camera.yaw = saved_yaw;
-
         match hit {
             Some(h) => println!(
                 "HARNESS_PROBE direction=down hit=true anchor={} ui_layer={} anchor_depth={}",
@@ -96,7 +93,7 @@ impl App {
     /// than the one the next break would edit.
     pub(super) fn harness_probe_cursor(&mut self) {
         use crate::app::ActiveFrameKind;
-        use crate::world::aabb;
+        use crate::world::{aabb, anchor::WORLD_SIZE, cubesphere_local, sdf};
         let hit = self.frame_aware_raycast();
         let Some(hit) = hit else {
             println!(
@@ -114,20 +111,52 @@ impl App {
             self.anchor_depth(),
             hit.t,
         );
-        let (aabb_min, aabb_max) = match self.active_frame.kind {
-            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, &hit),
+        // Match the shader's dispatch frame (see upload.rs):
+        //   face_depth ≥ 1 → render-frame-local (face-rotated)
+        //   face_depth == 0 → body-frame (curved sphere render)
+        //   Cartesian / Body → render-frame-local (world axes)
+        let (aabb_min, aabb_max, cam_frame, ray_dir) = match self.active_frame.kind {
+            ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                let face_point = cubesphere_local::body_point_to_face_space(
+                    cam_body,
+                    sphere.inner_r,
+                    sphere.outer_r,
+                    WORLD_SIZE,
+                );
+                let cam = match face_point {
+                    Some(fp) => {
+                        let scale = WORLD_SIZE / sphere.face_size;
+                        [
+                            (fp.un - sphere.face_u_min) * scale,
+                            (fp.vn - sphere.face_v_min) * scale,
+                            (fp.rn - sphere.face_r_min) * scale,
+                        ]
+                    }
+                    None => [WORLD_SIZE * 0.5; 3],
+                };
+                let fwd_world = sdf::normalize(self.camera.forward());
+                let dir = sdf::normalize(cubesphere_local::world_vec_to_face_axes(
+                    fwd_world,
+                    sphere.face,
+                ));
+                let (mn, mx) = aabb::hit_aabb_in_frame_local(&hit, &self.active_frame.render_path);
+                (mn, mx, cam, dir)
+            }
+            ActiveFrameKind::Sphere(sphere) => {
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                let dir = self.ray_dir_in_frame(&sphere.body_path);
+                let (mn, mx) = aabb::hit_aabb_body_local(&self.world.library, &hit);
+                (mn, mx, cam_body, dir)
+            }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                aabb::hit_aabb_in_frame_local(&hit, &self.active_frame.render_path)
+                let frame_path = self.active_frame.render_path;
+                let cam = self.camera.position.in_frame(&frame_path);
+                let dir = self.ray_dir_in_frame(&frame_path);
+                let (mn, mx) = aabb::hit_aabb_in_frame_local(&hit, &frame_path);
+                (mn, mx, cam, dir)
             }
         };
-        let cap_frame_path = match self.active_frame.kind {
-            ActiveFrameKind::Sphere(sphere) => sphere.body_path,
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.active_frame.render_path
-            }
-        };
-        let cam_frame = self.camera.position.in_frame(&cap_frame_path);
-        let ray_dir = self.ray_dir_in_frame(&cap_frame_path);
         let hit_point = [
             cam_frame[0] + ray_dir[0] * hit.t,
             cam_frame[1] + ray_dir[1] * hit.t,

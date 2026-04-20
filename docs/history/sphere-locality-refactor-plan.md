@@ -167,58 +167,70 @@ needs.
 
 ## Open questions a future session should answer before coding
 
-1. **What does `sphere_zoom_invariance.sh` actually compare?**
-   It passes with pixel-identical output at all depths today.
-   Does it compare against a ground-truth body-frame render, or
-   just against itself across anchor depths? If the latter, it
-   doesn't catch geometric wrongness — only consistency. A
-   useful harness addition: a comparison against a WINDOWED
-   render at `spawn-xyz` from outside the body (where the
-   existing sphere-in-cell is known correct) vs. the same spawn
-   at deep `--spawn-depth`.
+*Answered 2026-04-19. Kept as a record of the state before the
+option-B refactor landed; update or delete if the shape changes.*
 
-2. **Where does `gpu_camera_for_frame` actually get the camera
-   into render-frame for Cartesian today?** Read the existing
-   Cartesian code path first — it's already doing what the
-   sphere path *should* do. The sphere path is the anomaly.
+1. **What does `sphere_zoom_invariance.sh` actually compare?**
+   It compares pairwise PNGs across depths and each depth against
+   the deepest as a "reference." Neither is a ground truth — both
+   are self-comparisons. The script therefore detects *consistency*
+   across anchor depth, not geometric correctness. A refactor that
+   changes the geometry consistently still passes.
+
+2. **Where does `gpu_camera_for_frame` get the camera into
+   render-frame for Cartesian today?** `in_frame(&frame.render_path)`.
+   Sphere uses `in_frame(&sphere.body_path)` instead — the body cell
+   path is strictly shallower than the render path, which is why
+   sphere-frame precision is inherited from the body cell regardless
+   of how far the face subtree descends. That asymmetry IS the
+   anomaly.
 
 3. **What does `WorldPos::in_frame` do for a `frame_path` that
-   descends past a face root?** The architecture doc
-   (`coordinates.md`) says face subtrees use `(u, v, r)`
-   semantics for offsets, but the current implementation walks
-   the path Cartesian-style. This might be OK — the tree slot
-   storage happens to use `slot_index(us, vs, rs)` with the
-   same numeric layout as `slot_index(x, y, z)`, so Cartesian
-   accumulation gives the right slot sequence. The *coordinates*
-   produced aren't the face's physical `(u, v, r)`, but the
-   slots match. For a "render axis-aligned past face_depth ≥ 1"
-   design this is actually what you want.
+   descends past a face root?** It walks Cartesian-style
+   (`slot_coords` interprets the slot as `(x, y, z)`). Because the
+   tree's slot numeric layout is shared between `slot_index(x,y,z)`
+   and `slot_index(us,vs,rs)`, the *slot sequence* is correct either
+   way. The produced float coordinates aren't the face's physical
+   `(u,v,r)` — but for "walk the face subtree as an axis-aligned
+   Cartesian tree in render-frame coords" that's exactly the
+   behavior we want.
 
-4. **What do `sphere_in_cell` and `sphere_in_face_window` do on
-   the shader side, and are they both used in the normal render
-   path, or just for ribbon-pop fallback?** `march_face_root` is
-   the one that runs at start-of-march for `ROOT_KIND_FACE`; the
-   other two are called by `march_cartesian` when the DDA
-   descends into a body child. All three hardcode body-frame
-   sphere constants. The ribbon-pop-only ones may be simpler to
-   leave alone for the first iteration.
+4. **Sphere shader functions:** `sphere_in_cell` is called from
+   `march_cartesian` on DDA descent into a body cell, and from
+   `march()` when `ROOT_KIND_BODY`. `march_face_root` is called
+   from `march()` when `ROOT_KIND_FACE`. `sphere_in_face_window`
+   is **dead code** — defined but no callers in the shader. The
+   helper functions in `face_walk.wgsl::face_point_to_body_with_bounds`
+   / `face_root_point_to_body` / `face_dir_to_body` /
+   `face_local_normal_to_body` / `face_box_to_body_bounds` are
+   also dead code. Safe to delete in a follow-up cleanup.
 
-5. **What test actually drives live-highlight correctness?** The
-   existing `sphere_cursor_hit_point_is_inside_aabb_after_wall_dig`
-   tests the CPU raycast / AABB pair, not the shader. No test
-   currently catches "AABB uniform mismatches shader's hit_pos
-   frame." Adding one that pixel-checks the yellow glow would
-   tighten the feedback loop.
+5. **What test drives live-highlight correctness?** No pixel-level
+   test exists. The CPU test pair
+   (`sphere_cursor_hit_point_is_inside_aabb_after_wall_dig`) tests
+   the raycast/AABB contract in isolation. The shader's AABB check
+   has no automated regression — mismatch between CPU-frame-AABB
+   and shader-frame-camera-pos is a silent bug today.
 
-6. **How is `render_path` chosen, and can we assert
-   `render_path.depth ≥ body_path.depth + 1` holds always in
-   sphere mode?** `target_render_frame` does clamping that I
-   don't fully understand — the observation was that
-   `--spawn-depth 25` with `spawn-xyz` produced `render_path`
-   at depth 5 with `face_depth=3`, not `depth 22` / `face_depth
-   = 20` as naively expected. Whatever the clamp rule is, the
-   refactor has to respect it, or the render frame will surprise
-   the raycast.
+6. **`render_path` selection:**
+   - `desired_depth = anchor_depth − RENDER_FRAME_K (= 3)`, clamped
+     to `MAX_DEPTH`.
+   - For sphere frames, `camera_local_sphere_focus_path(desired_depth)`
+     builds a path INTO the face subtree by slot-locating the camera's
+     body-frame position, walking to `desired_depth` slots deep.
+   - Then `target_render_frame` shrinks the render path while
+     `!camera_fits_frame || frame_projected_pixels < FRAME_FOCUS_MIN_PIXELS (192)`.
+   - Net effect for `--spawn-depth 25` at the stock sphere test xyz:
+     render_path lands at depth 5 (`face_depth = 3`), because the
+     frame window at depth 6 would project < 192 pixels from the
+     camera's altitude. The clamp is driven by on-screen projected
+     pixel coverage of the current face window — not by any
+     face-depth-aware heuristic.
+   - Consequence: `face_depth == 0` only happens at shallow anchor
+     depths in practice (where the full face projects to ≥ 192
+     pixels). `face_depth ≥ 1` is the deep-anchor regime. The
+     precision wall is specific to `face_depth ≥ 1` with
+     `anchor_depth ≥ 20`.
 
 ## Testing stance for any attempted implementation
 

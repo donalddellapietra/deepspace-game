@@ -190,6 +190,15 @@ fn march_cartesian(
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
+            // Walker path (slot sequence from this frame's root down
+            // to the hit cell). main.wgsl prepends render_path to get
+            // the full world-root-relative path for highlight match.
+            result.hit_path_depth = depth + 1u;
+            for (var d: u32 = 0u; d <= depth; d = d + 1u) {
+                let c = s_cell[d];
+                let sl = u32(c.x) + u32(c.y) * 3u + u32(c.z) * 9u;
+                pack_slot_into_path(&result.hit_path, d, sl);
+            }
             return result;
         } else {
             // tag == 2u: Node child. Load node_index from the
@@ -295,6 +304,12 @@ fn march_cartesian(
                     result.normal = normal;
                     result.cell_min = cell_min_l;
                     result.cell_size = cur_cell_size;
+                    result.hit_path_depth = depth + 1u;
+                    for (var d: u32 = 0u; d <= depth; d = d + 1u) {
+                        let c = s_cell[d];
+                        let sl = u32(c.x) + u32(c.y) * 3u + u32(c.z) * 9u;
+                        pack_slot_into_path(&result.hit_path, d, sl);
+                    }
                     return result;
                 }
             } else {

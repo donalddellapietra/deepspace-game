@@ -32,6 +32,22 @@ struct Uniforms {
     ribbon_count: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    /// Highlight slot-path identification (precision-safe at any
+    /// anchor depth). When `highlight_path_depth > 0`, the shader's
+    /// per-pixel hit uses path-prefix matching — compare the
+    /// walker's descent slots against these — to decide "glow or
+    /// not", instead of the f32 AABB check above. The path is a
+    /// sequence of slot indices (0..26) relative to the world root,
+    /// packed 4 per u32 (byte 0 = depth 0).
+    ///
+    /// `highlight_path_depth` = 0 falls back to the AABB check (used
+    /// when the path is unavailable, e.g., legacy callers).
+    /// 16 u32s × 4 bytes = 64 slots = MAX_DEPTH.
+    highlight_path: array<vec4<u32>, 4>,
+    highlight_path_depth: u32,
+    _pad_highlight0: u32,
+    _pad_highlight1: u32,
+    _pad_highlight2: u32,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
     /// Used when root_kind == 1 or 2.
     root_radii: vec4<f32>,
@@ -42,6 +58,16 @@ struct Uniforms {
     /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
+    /// World-root-relative slot path of the active render frame.
+    /// Used to reconstruct a hit cell's full path (=
+    /// `render_path[0..render_depth − ribbon_level]` + the walker's
+    /// internal descent slots) for comparison against
+    /// `highlight_path`. Same 4-byte-per-u32 packing.
+    render_path: array<vec4<u32>, 4>,
+    render_path_depth: u32,
+    _pad_render0: u32,
+    _pad_render1: u32,
+    _pad_render2: u32,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
@@ -186,4 +212,49 @@ struct HitResult {
     frame_scale: f32,
     cell_min: vec3<f32>,
     cell_size: f32,
+    /// Hit cell's slot path RELATIVE TO THE WALKER'S FRAME ROOT
+    /// (chain[current_frame_depth] in `main.wgsl`'s march loop).
+    /// 4 slot bytes per u32, matching `Uniforms.highlight_path`.
+    /// `main.wgsl` prepends `render_path[0..render_depth - ribbon_level]`
+    /// to reconstruct the full world-root-relative hit path for
+    /// highlight comparison. `hit_path_depth == 0` means an
+    /// unpopulated path (disables highlight match for that pixel).
+    hit_path: array<vec4<u32>, 4>,
+    hit_path_depth: u32,
+}
+
+/// Write a single slot byte (0..26) into a packed slot-path array at
+/// `depth`. Layout: 4 slots per u32, byte 0 = depth 0, 4 u32s per
+/// vec4, 4 vec4s total = 64 slots (MAX_DEPTH).
+fn pack_slot_into_path(path: ptr<function, array<vec4<u32>, 4>>, depth: u32, slot: u32) {
+    let word = depth / 16u;
+    let lane_idx = (depth / 4u) % 4u;
+    let byte = depth % 4u;
+    let shift = byte * 8u;
+    let mask = 0xFFu << shift;
+    var v = (*path)[word];
+    switch lane_idx {
+        case 0u: { v.x = (v.x & ~mask) | ((slot & 0xFFu) << shift); }
+        case 1u: { v.y = (v.y & ~mask) | ((slot & 0xFFu) << shift); }
+        case 2u: { v.z = (v.z & ~mask) | ((slot & 0xFFu) << shift); }
+        default: { v.w = (v.w & ~mask) | ((slot & 0xFFu) << shift); }
+    }
+    (*path)[word] = v;
+}
+
+/// Read a single slot byte at `depth` from a packed slot-path array.
+fn unpack_slot_from_path(path: array<vec4<u32>, 4>, depth: u32) -> u32 {
+    let word = depth / 16u;
+    let lane_idx = (depth / 4u) % 4u;
+    let byte = depth % 4u;
+    let shift = byte * 8u;
+    let v = path[word];
+    var lane: u32;
+    switch lane_idx {
+        case 0u: { lane = v.x; }
+        case 1u: { lane = v.y; }
+        case 2u: { lane = v.z; }
+        default: { lane = v.w; }
+    }
+    return (lane >> shift) & 0xFFu;
 }

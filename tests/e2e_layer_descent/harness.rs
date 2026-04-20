@@ -313,6 +313,91 @@ pub fn sky_dominance_top_half(path: impl AsRef<std::path::Path>) -> f32 {
     if total == 0 { 0.0 } else { sky as f32 / total as f32 }
 }
 
+/// Count yellow-ish pixels OUTSIDE the screen-center crosshair
+/// square. The crosshair renders ~30 yellow pixels on hit regardless
+/// of whether the actual highlight glow fires, so we exclude a
+/// generous center box (`exclude_radius_px` from center on each
+/// axis) to make the count specific to the highlight-cell glow.
+pub fn highlight_glow_pixel_count(
+    path: impl AsRef<std::path::Path>,
+    exclude_radius_px: u32,
+) -> u32 {
+    let file = std::fs::File::open(path.as_ref())
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.as_ref().display()));
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().expect("read png header");
+    let info = reader.info().clone();
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unsupported png color type {other:?}"),
+    };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buf).expect("decode png frame");
+    let data = &buf[..frame.buffer_size()];
+
+    let cx = width as i64 / 2;
+    let cy = height as i64 / 2;
+    let r_excl = exclude_radius_px as i64;
+    let mut glow = 0u32;
+    for y in 0..height {
+        for x in 0..width {
+            // Skip the crosshair center box.
+            if (x as i64 - cx).abs() <= r_excl && (y as i64 - cy).abs() <= r_excl {
+                continue;
+            }
+            let i = (y * width + x) * channels;
+            let r = data[i] as i32;
+            let g = data[i + 1] as i32;
+            let b = data[i + 2] as i32;
+            // Yellow-ish: R ≥ 180, G ≥ 140, B well below both, with
+            // R and G reasonably close. Tuned to catch the
+            // `(1.0, 0.92, 0.18)` glow after color mixing.
+            if r >= 180 && g >= 140 && b < 140 && (r - g).abs() <= 60 && r - b >= 60 {
+                glow += 1;
+            }
+        }
+    }
+    glow
+}
+
+/// Count of non-sky (planet) pixels in a single horizontal row, where
+/// "sky" matches the engine's sky-blue gradient (R < G < B). Useful
+/// for measuring a planet's visible silhouette: a curved sphere seen
+/// from a distance produces a roughly-circular outline whose width
+/// peaks in the middle rows and tapers toward top/bottom.
+pub fn planet_pixel_count_at_row(path: impl AsRef<std::path::Path>, row_frac: f32) -> u32 {
+    let file = std::fs::File::open(path.as_ref())
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.as_ref().display()));
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().expect("read png header");
+    let info = reader.info().clone();
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unsupported png color type {other:?}"),
+    };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buf).expect("decode png frame");
+    let data = &buf[..frame.buffer_size()];
+
+    let y = ((row_frac.clamp(0.0, 1.0)) * height as f32) as usize;
+    let y = y.min(height.saturating_sub(1));
+    let mut planet = 0u32;
+    for x in 0..width {
+        let i = (y * width + x) * channels;
+        let r = data[i];
+        let g = data[i + 1];
+        let b = data[i + 2];
+        if !(b > r && b > g) {
+            planet += 1;
+        }
+    }
+    planet
+}
+
 fn parse_probe(rest: &str) -> Option<HarnessProbe> {
     let kv = parse_kv(rest);
     Some(HarnessProbe {

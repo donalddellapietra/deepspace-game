@@ -90,6 +90,34 @@ pub fn face_space_to_body_point(
     sdf::add(center, sdf::scale(dir, radius))
 }
 
+/// Rotate a world-frame vector into a face's local `(u, v, r)` axes.
+///
+/// Each cubed-sphere face has an orthonormal basis
+/// `(u_axis, v_axis, n_axis)` = `(Face::tangents(), Face::normal())`
+/// picked so that the face subtree's slot ordering
+/// `slot_index(us, vs, rs)` numerically matches the walker's
+/// `slot_index(x, y, z)` with `(x, y, z) ≡ (u, v, r)`. Expressing a
+/// ray direction in these axes lets the generic Cartesian DDA walk
+/// a face subtree correctly — the per-face axis mapping that
+/// `Attempt 1` of the sphere locality refactor missed.
+///
+/// Linear (no cube→equal-area warp), so valid for local directions
+/// and for positions inside a small sub-cell of the face. For
+/// rendering-scale precision at deep `face_depth` this is
+/// visually exact; at `face_depth == 0` the user has accepted "lose
+/// curvature after a couple of layers" (see
+/// `docs/history/sphere-locality-refactor-plan.md`).
+#[inline]
+pub fn world_vec_to_face_axes(world: [f32; 3], face: Face) -> [f32; 3] {
+    let (u_axis, v_axis) = face.tangents();
+    let n_axis = face.normal();
+    [
+        sdf::dot(world, u_axis),
+        sdf::dot(world, v_axis),
+        sdf::dot(world, n_axis),
+    ]
+}
+
 /// Scan a hit path for the first entry whose child is a
 /// `NodeKind::CubedSphereBody` node. Returns the index in `hit_path`
 /// where the body is the child, plus its radii.

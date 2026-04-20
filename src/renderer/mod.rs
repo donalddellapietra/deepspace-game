@@ -42,6 +42,18 @@ pub struct GpuUniforms {
     pub ribbon_count: u32,
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
+    /// Highlight cell's slot path from world root, packed 4 slot
+    /// bytes per u32 (byte 0 = depth 0). 4 × vec4<u32> = 16 u32s =
+    /// 64 slot bytes = MAX_DEPTH. The shader does path-prefix
+    /// matching instead of f32 AABB checks — precision-safe at any
+    /// anchor depth (see `bindings.wgsl::Uniforms.highlight_path`).
+    ///
+    /// Layout MUST match the WGSL struct order in `bindings.wgsl`.
+    pub highlight_path: [[u32; 4]; 4],
+    pub highlight_path_depth: u32,
+    pub _pad_highlight0: u32,
+    pub _pad_highlight1: u32,
+    pub _pad_highlight2: u32,
     /// Body radii (used iff `root_kind == 1`). Stored in the body
     /// cell's local `[0, 1)` frame; the shader scales by 3.0
     /// (= WORLD_SIZE) to get shader-frame units.
@@ -49,6 +61,14 @@ pub struct GpuUniforms {
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_face_pop_pos: [f32; 4],
+    /// World-root-relative slot path of the active render frame —
+    /// used by the shader to reconstruct full hit-cell paths for
+    /// comparison against `highlight_path`.
+    pub render_path: [[u32; 4]; 4],
+    pub render_path_depth: u32,
+    pub _pad_render0: u32,
+    pub _pad_render1: u32,
+    pub _pad_render2: u32,
 }
 
 pub struct Renderer {
@@ -87,6 +107,10 @@ pub struct Renderer {
     pub(super) highlight_active: u32,
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
+    pub(super) highlight_path: [[u32; 4]; 4],
+    pub(super) highlight_path_depth: u32,
+    pub(super) render_path: [[u32; 4]; 4],
+    pub(super) render_path_depth: u32,
     pub(super) root_kind: u32,
     pub(super) root_radii: [f32; 4],
     pub(super) root_face_meta: [u32; 4],
@@ -211,6 +235,52 @@ impl Renderer {
             }
             None => { self.highlight_active = 0; }
         }
+        self.write_uniforms();
+    }
+
+    /// Ship the highlight as a slot path instead of an f32 AABB.
+    ///
+    /// The shader's per-pixel `march` dispatch populates `hit_path`
+    /// in `HitResult`; `main.wgsl` compares the two as packed slot
+    /// bytes (4 per u32, byte 0 = depth 0). Prefix-match: if the
+    /// walker's hit cell descends through `highlight_path[..depth]`
+    /// the pixel glows. Avoids every f32 precision wall that
+    /// `highlight_min`/`highlight_max` hit below `cell_size <
+    /// ULP(frame_magnitude)`.
+    ///
+    /// `slots` is read up to `MAX_DEPTH = 64` entries; each slot
+    /// value must be `0..27`. Empty slice = no highlight.
+    pub fn set_highlight_path(&mut self, slots: &[u8]) {
+        const MAX: usize = 64;
+        let depth = slots.len().min(MAX);
+        let mut packed = [[0u32; 4]; 4];
+        for (i, &slot) in slots.iter().take(depth).enumerate() {
+            let word = i / 16;
+            let lane = (i / 4) % 4;
+            let byte = i % 4;
+            packed[word][lane] |= (slot as u32) << (byte * 8);
+        }
+        self.highlight_path = packed;
+        self.highlight_path_depth = depth as u32;
+        self.highlight_active = if depth > 0 { 1 } else { 0 };
+        self.write_uniforms();
+    }
+
+    /// Ship the active render frame's slot path (from world root).
+    /// The shader uses it to reconstruct a hit cell's full path for
+    /// comparison against `highlight_path`.
+    pub fn set_render_path(&mut self, slots: &[u8]) {
+        const MAX: usize = 64;
+        let depth = slots.len().min(MAX);
+        let mut packed = [[0u32; 4]; 4];
+        for (i, &slot) in slots.iter().take(depth).enumerate() {
+            let word = i / 16;
+            let lane = (i / 4) % 4;
+            let byte = i % 4;
+            packed[word][lane] |= (slot as u32) << (byte * 8);
+        }
+        self.render_path = packed;
+        self.render_path_depth = depth as u32;
         self.write_uniforms();
     }
 

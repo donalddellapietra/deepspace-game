@@ -326,6 +326,25 @@ fn march_face_root(
             let depth_tint = sphere_depth_tint(rn_abs);
             result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape * depth_tint;
             result.normal = hit_normal;
+            // Post-hoc slot extraction: mirror the walker's descent to
+            // reconstruct its slot sequence for the highlight match.
+            // sample_face_node above uses the same `un = un*3 - us`
+            // recurrence, so stepping `(un_local, vn_local, rn_local)`
+            // through `term_depth` iterations reproduces its slots.
+            var wu = un_local;
+            var wv = vn_local;
+            var wr = rn_local;
+            for (var d: u32 = 0u; d < term_depth; d = d + 1u) {
+                let us = min(u32(wu * 3.0), 2u);
+                let vs = min(u32(wv * 3.0), 2u);
+                let rs = min(u32(wr * 3.0), 2u);
+                let slot = rs * 9u + vs * 3u + us;
+                pack_slot_into_path(&result.hit_path, d, slot);
+                wu = wu * 3.0 - f32(us);
+                wv = wv * 3.0 - f32(vs);
+                wr = wr * 3.0 - f32(rs);
+            }
+            result.hit_path_depth = term_depth;
             return result;
         }
 

@@ -100,62 +100,24 @@ impl App {
         let mut node_id = self.world.root;
         for &slot in body_path.as_slice() {
             let Some(node) = self.world.library.get(node_id) else {
-                eprintln!("sphere_focus: missing node for path {:?} at node_id={node_id}", body_path.as_slice());
                 return None;
             };
             match node.children[slot as usize] {
                 crate::world::tree::Child::Node(child_id) => node_id = child_id,
-                other => {
-                    eprintln!(
-                        "sphere_focus: non-node child at slot={} for body_path={:?}: {:?}",
-                        slot, body_path.as_slice(), other
-                    );
-                    return None;
-                }
+                _ => return None,
             }
         }
         let Some(body) = self.world.library.get(node_id) else {
-            eprintln!("sphere_focus: missing body node_id={node_id}");
             return None;
         };
         let crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
-            eprintln!("sphere_focus: path {:?} resolved to non-body kind {:?}", body_path.as_slice(), body.kind);
             return None;
         };
         let cam_body = self.camera.position.in_frame(&body_path);
-        // Pick the face closest to the camera's body-frame position.
-        // Previously we cast the camera's forward ray and mapped the
-        // outer-shell entry point, but that picks the WRONG face when
-        // the camera sits inside the shell (e.g. camera on terrain
-        // looking straight down → ray exits at the NegY pole even
-        // though the user is at PosY). `body_point_to_face_space`
-        // handles inside / on / outside cases uniformly — it just
-        // projects `cam_body − body_center` onto the cube faces,
-        // which always yields the face the camera is physically
-        // closest to.
-        let focus_point = {
-            let center = [WORLD_SIZE * 0.5, WORLD_SIZE * 0.5, WORLD_SIZE * 0.5];
-            let delta = crate::world::sdf::sub(cam_body, center);
-            if crate::world::sdf::length(delta) <= 1e-6 {
-                // Camera exactly at body center — fall back to the
-                // old ray-based logic to pick something sensible.
-                let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-                let Some(t) = cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE) else {
-                    eprintln!(
-                        "sphere_focus: miss (camera at center) cam_body={:?} ray_dir={:?}",
-                        cam_body, ray_dir,
-                    );
-                    return None;
-                };
-                crate::world::sdf::add(cam_body, crate::world::sdf::scale(ray_dir, t))
-            } else {
-                cam_body
-            }
-        };
+        let focus_point = cam_body;
         let Some(face_point) = cubesphere_local::body_point_to_face_space(
             focus_point, inner_r, outer_r, WORLD_SIZE,
         ) else {
-            eprintln!("sphere_focus: degenerate focus_point={:?}", focus_point);
             return None;
         };
         let face = face_point.face;
@@ -187,12 +149,6 @@ impl App {
             vn = vn.clamp(v_min + inner_eps, v_min + size - inner_eps);
             rn = rn.clamp(r_min + inner_eps, r_min + size - inner_eps);
         }
-        if self.startup_profile_frames < 16 {
-            eprintln!(
-                "sphere_focus: path={:?} desired_depth={} body_path={:?} face={:?}",
-                path.as_slice(), desired_depth, body_path.as_slice(), face,
-            );
-        }
         Some(path)
     }
 
@@ -218,6 +174,16 @@ impl App {
     pub(in crate::app) fn target_render_frame(&self) -> ActiveFrame {
         let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
+        // For sphere worlds the render path should target the physical
+        // face surface where the packed tree retains deep structure —
+        // the camera's raw anchor can point into uniform interior
+        // regions that the packer collapses, capping ribbon depth.
+        // `camera_local_sphere_focus_path` maps the camera's body-
+        // frame position into face coords and walks sub-cells down to
+        // `desired_depth`, always landing on SDF-varying content.
+        //
+        // For Cartesian worlds the camera's anchor IS the path we
+        // want (content richness is spread throughout the volume).
         let frame = self
             .camera_local_sphere_focus_path(desired_depth)
             .map(|path| {

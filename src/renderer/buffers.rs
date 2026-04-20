@@ -150,10 +150,20 @@ impl Renderer {
             ribbon_count: self.ribbon_count,
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
+            highlight_path: self.highlight_path,
+            highlight_path_depth: self.highlight_path_depth,
+            _pad_highlight0: 0,
+            _pad_highlight1: 0,
+            _pad_highlight2: 0,
             root_radii: self.root_radii,
             root_face_meta: self.root_face_meta,
             root_face_bounds: self.root_face_bounds,
             root_face_pop_pos: self.root_face_pop_pos,
+            render_path: self.render_path,
+            render_path_depth: self.render_path_depth,
+            _pad_render0: 0,
+            _pad_render1: 0,
+            _pad_render2: 0,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

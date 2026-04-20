@@ -464,32 +464,100 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
+        use crate::world::{cubesphere_local, sdf};
+        // Per-frame-kind transformation:
+        //
+        // * Cartesian / Body: camera's local position and basis are
+        //   both in world axes aligned with the render_path's frame
+        //   (sub-cell of root). `in_frame(render_path)` gives a
+        //   sub-cell-precise position; the world basis stays as-is.
+        //
+        // * Sphere: the render_path descends into a face subtree
+        //   whose slot layout is `(u, v, r)` semantic — NOT world
+        //   `(x, y, z)`. The Cartesian walker only walks the face
+        //   subtree correctly when the camera's position is given in
+        //   face-normalized `(un, vn, rn)` coords (scaled to the
+        //   render_path sub-cell's [0, WORLD_SIZE)³) AND the camera
+        //   basis (fwd, right, up) is rotated into face axes
+        //   `(face.tangents(), face.normal())`. This is the
+        //   locality-prime-directive-compliant counterpart to the
+        //   old body-frame sphere dispatch: all precision-critical
+        //   math lives in the render_path's frame, and the path is
+        //   a prefix of the hit path so the AABB for highlights
+        //   stays precision-safe at any anchor depth.
+        let (cam_local, fwd_local, right_local, up_local) = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
+                // Face-subtree render frame: camera in face-normalized
+                // (un, vn, rn) scaled to the render_path sub-cell, ray
+                // basis rotated into the face's (u_axis, v_axis,
+                // n_axis). The shader dispatches `march_cartesian` on
+                // this frame (see `upload.rs`). Curvature is sub-pixel
+                // at face_depth ≥ 1 so cube-to-equal-area warp is not
+                // visually required, and precision stays bounded by
+                // local visual depth rather than by the body-frame
+                // ULP wall.
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                let face_point = cubesphere_local::body_point_to_face_space(
+                    cam_body,
+                    sphere.inner_r,
+                    sphere.outer_r,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                let cam_sub = match face_point {
+                    Some(fp) => {
+                        let scale = crate::world::anchor::WORLD_SIZE / sphere.face_size;
+                        [
+                            (fp.un - sphere.face_u_min) * scale,
+                            (fp.vn - sphere.face_v_min) * scale,
+                            (fp.rn - sphere.face_r_min) * scale,
+                        ]
+                    }
+                    None => [crate::world::anchor::WORLD_SIZE * 0.5; 3],
+                };
+                let (fwd_w, right_w, up_w) = self.camera.basis();
+                (
+                    cam_sub,
+                    sdf::normalize(cubesphere_local::world_vec_to_face_axes(fwd_w, sphere.face)),
+                    sdf::normalize(cubesphere_local::world_vec_to_face_axes(right_w, sphere.face)),
+                    sdf::normalize(cubesphere_local::world_vec_to_face_axes(up_w, sphere.face)),
+                )
+            }
+            ActiveFrameKind::Sphere(sphere) => {
+                // face_depth == 0: the shader uses `march_face_root`
+                // with body-frame math and the cube-to-equal-area warp
+                // for a curved planet silhouette. Camera stays in
+                // body-frame `[0, 3)` coords where the body-frame
+                // center sits at (1.5, 1.5, 1.5) — precision is fine
+                // at shallow anchor, which is where face_depth == 0
+                // holds in practice.
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                let (fwd_w, right_w, up_w) = self.camera.basis();
+                (
+                    cam_body,
+                    sdf::normalize(fwd_w),
+                    sdf::normalize(right_w),
+                    sdf::normalize(up_w),
+                )
+            }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+                let cam = self.camera.position.in_frame(&frame.render_path);
+                let (fwd_w, right_w, up_w) = self.camera.basis();
+                (
+                    cam,
+                    sdf::normalize(fwd_w),
+                    sdf::normalize(right_w),
+                    sdf::normalize(up_w),
+                )
             }
         };
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",
+                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?} fwd={:?}",
                 frame.kind,
                 frame.render_path.as_slice(),
                 frame.logical_path.as_slice(),
                 cam_local,
-            );
-        }
-        let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::normalize(fwd_world);
-        let right_local = crate::world::sdf::normalize(right_world);
-        let up_local = crate::world::sdf::normalize(up_world);
-        if self.startup_profile_frames < 4 {
-            eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
-                fwd_world,
                 fwd_local,
-                right_local,
-                up_local,
             );
         }
         self.camera.gpu_camera_with_basis(

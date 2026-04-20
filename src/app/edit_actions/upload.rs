@@ -88,6 +88,10 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(r.frame_root_idx);
             renderer.update_ribbon(&r.ribbon);
+            // Ship the effective render_path's slot sequence so the
+            // shader can reconstruct full hit-cell paths for the
+            // highlight comparison.
+            renderer.set_render_path(self.active_frame.render_path.as_slice());
         }
 
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
@@ -96,12 +100,37 @@ impl App {
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Sphere(sphere) => {
-                    renderer.set_root_kind_face(
-                        sphere.inner_r, sphere.outer_r,
-                        sphere.face as u32, sphere.face_depth,
-                        [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
-                        self.camera.position.in_frame(&sphere.body_path),
-                    );
+                    // Face-depth-conditional dispatch (option B from
+                    // docs/history/sphere-locality-refactor-plan.md):
+                    //
+                    // * face_depth == 0 — whole face visible in the
+                    //   viewport. Keep the curved equal-angle
+                    //   `march_face_root` rendering so the planet
+                    //   silhouette is round. Body-frame math here is
+                    //   precision-safe because anchor depth relative
+                    //   to body stays shallow at this zoom level.
+                    //
+                    // * face_depth ≥ 1 — camera has zoomed into a
+                    //   sub-face whose angular extent is small. Local
+                    //   curvature over the sub-cell is sub-pixel, so
+                    //   dispatching `march_cartesian` on the face
+                    //   subtree (with face-axis-rotated camera basis
+                    //   from `gpu_camera_for_frame`) is visually
+                    //   indistinguishable from the curved version
+                    //   AND eliminates the body-frame precision wall
+                    //   at `anchor_depth ≥ 20` that drove the
+                    //   refactor. See user guidance "lose curvature
+                    //   after a couple of layers".
+                    if sphere.face_depth == 0 {
+                        renderer.set_root_kind_face(
+                            sphere.inner_r, sphere.outer_r,
+                            sphere.face as u32, sphere.face_depth,
+                            [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
+                            self.camera.position.in_frame(&sphere.body_path),
+                        );
+                    } else {
+                        renderer.set_root_kind_cartesian();
+                    }
                 }
                 ActiveFrameKind::Body { inner_r, outer_r } => {
                     renderer.set_root_kind_body(inner_r, outer_r);

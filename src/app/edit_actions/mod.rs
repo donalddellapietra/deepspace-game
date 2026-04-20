@@ -14,7 +14,7 @@ mod zoom;
 use crate::world::anchor::Path;
 use crate::world::{aabb, raycast};
 
-use super::{ActiveFrameKind, App};
+use super::App;
 
 pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = 12;
 pub(super) const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
@@ -52,26 +52,21 @@ impl App {
 
     /// Interaction distance cap in the given frame's local units.
     ///
-    /// Plain: `interaction_radius_cells × anchor_cell_size_in_frame`
-    /// where `anchor_cell_size_in_frame = 3 / 3^K`, `K = anchor_depth −
-    /// frame_depth`. Reach scales with zoom — deep zoom shrinks both
-    /// visible content AND reach proportionally, so "N layer-sized
-    /// cells away" stays meaningful.
+    /// `interaction_radius_cells × anchor_cell_size_in_frame` with
+    /// `anchor_cell_size_in_frame = 3 / 3^K`, `K = anchor_depth −
+    /// frame_depth`. Reach scales with zoom: "N layer-sized cells
+    /// away" stays meaningful whether you're zoomed out viewing a
+    /// whole planet or zoomed in on a single block.
     ///
-    /// Sphere: the same formula fails past `anchor_depth ≈ SDF-detail
-    /// + face-body offset + a few`, because sphere content
-    /// granularity is floored by `SDF_DETAIL_LEVELS` — the physical
-    /// size of the smallest solid cell the tree can represent. When
-    /// `anchor_cell_size` shrinks below that floor, "12 anchor cells"
-    /// becomes smaller than the very first solid cell the walker can
-    /// find, and every hit gets rejected at deep zoom even with the
-    /// camera sitting directly on the surface.
-    ///
-    /// Fix: for sphere frames, floor `anchor_cell_size` at the SDF's
-    /// minimum cell size. That keeps reach meaningful at any zoom
-    /// (below the SDF floor, reach stays constant at 12 SDF cells —
-    /// no more shrinking into the gaps between representable cells).
-    /// Plain path is unchanged.
+    /// Sphere worlds floor `anchor_cell_size` at the SDF's smallest
+    /// representable cell. The SDF stops subdividing at
+    /// `SDF_DETAIL_LEVELS` below each face root; below that the
+    /// walker can't find cells smaller than the floor no matter how
+    /// deep the anchor sits, so "12 anchor cells" below the floor
+    /// would reject hits on content that physically exists. Converting
+    /// to render-frame units multiplies the floor by `3^face_depth`
+    /// (a deeper render frame makes the same physical cell span
+    /// proportionally more frame-local units).
     pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
         let frame_depth = frame_path.depth();
         let anchor_depth = self.camera.position.anchor.depth();
@@ -79,18 +74,18 @@ impl App {
         let anchor_cell_size_in_frame = 3.0_f32.powi(1 - k);
 
         let effective_cell_size = match self.active_frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                // SDF stops subdividing at `SDF_DETAIL_LEVELS` below
-                // each of the 6 face-subtree roots. The minimum
-                // representable solid-cell radial extent is therefore
-                // `shell × (1/3)^SDF_DETAIL_LEVELS`, where
-                // `shell = outer_r − inner_r` in body-local units.
-                // In body-frame units (the cap-frame for sphere
-                // raycasts) the shell is `3 × (outer_r − inner_r)`.
+            crate::app::ActiveFrameKind::Sphere(sphere) => {
                 const SDF_DETAIL_LEVELS: i32 = 4;
-                let shell_in_frame = 3.0 * (sphere.outer_r - sphere.inner_r);
-                let sdf_min_cell = shell_in_frame
-                    * 3.0_f32.powi(-SDF_DETAIL_LEVELS);
+                let body_depth = sphere.body_path.depth();
+                let render_depth = self.active_frame.render_path.depth();
+                let face_depth_i32 =
+                    render_depth.saturating_sub(body_depth) as i32;
+                let shell_body_local = sphere.outer_r - sphere.inner_r;
+                let shell_in_frame = 3.0
+                    * shell_body_local
+                    * 3.0_f32.powi(face_depth_i32);
+                let sdf_min_cell =
+                    shell_in_frame * 3.0_f32.powi(-SDF_DETAIL_LEVELS);
                 anchor_cell_size_in_frame.max(sdf_min_cell)
             }
             _ => anchor_cell_size_in_frame,
@@ -106,24 +101,67 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
-        // Distance cap frame-path: sphere raycasts measure `t` in
-        // body-frame local units; Cartesian raycasts measure `t` in
-        // render-frame local units. The frame we use for the
-        // anchor-cell-size math must match whichever path produced
-        // the hit.
+        // Split matching the shader dispatch (see upload.rs):
+        //
+        // * face_depth == 0: body-frame sphere raycast, same
+        //   precision contract as the shader's `march_face_root`.
+        //   Hit paths returned here are in face-subtree coords and
+        //   the shader renders the curved planet silhouette in
+        //   body-frame; `hit_aabb_body_local` matches its frame.
+        //
+        // * face_depth ≥ 1: face-axis-rotated Cartesian raycast on
+        //   the render_path sub-cell. Mirrors the shader's
+        //   `march_cartesian` dispatch (upload.rs) and the face-
+        //   rotated camera basis (gpu_camera_for_frame). Hit paths
+        //   share a deep prefix with render_path so
+        //   `hit_aabb_in_frame_local` stays precision-safe at any
+        //   anchor depth.
+        //
+        // Cartesian / Body frames follow the generic render-frame
+        // path unchanged.
+        use crate::world::{anchor::WORLD_SIZE, cubesphere_local, sdf};
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
+            crate::app::ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
+                let frame_path = self.active_frame.render_path;
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                let face_point = cubesphere_local::body_point_to_face_space(
+                    cam_body,
+                    sphere.inner_r,
+                    sphere.outer_r,
+                    WORLD_SIZE,
+                );
+                let cam = match face_point {
+                    Some(fp) => {
+                        let scale = WORLD_SIZE / sphere.face_size;
+                        [
+                            (fp.un - sphere.face_u_min) * scale,
+                            (fp.vn - sphere.face_v_min) * scale,
+                            (fp.rn - sphere.face_r_min) * scale,
+                        ]
+                    }
+                    None => [WORLD_SIZE * 0.5; 3],
+                };
+                let fwd_world = sdf::normalize(self.camera.forward());
+                let dir = sdf::normalize(cubesphere_local::world_vec_to_face_axes(
+                    fwd_world,
+                    sphere.face,
+                ));
+                let hit = raycast::cpu_raycast_in_frame(
+                    &self.world.library,
+                    self.world.root,
+                    frame_path.as_slice(),
+                    cam,
+                    dir,
+                    self.raycast_max_depth(),
+                    self.cs_edit_depth(),
+                );
+                (hit, frame_path)
+            }
+            crate::app::ActiveFrameKind::Sphere(sphere) => {
+                // face_depth == 0 — whole-face body-frame sphere
+                // raycast (curved, matches `march_face_root` on GPU).
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
                 let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
-                // Walker descends to the actual leaf so the cursor
-                // lands on the fine cell the user is pointing at, not
-                // on a coarser LOD representative that may read as
-                // empty at shallow anchors (bug: "cursor sometimes
-                // doesn't show up" + "outlines the seams of a bigger
-                // collapsed block"). The hit path is then truncated
-                // to `edit_depth` slots in `do_break` / `do_place`
-                // before the edit lands, so breaks/places still
-                // happen at the user's current layer.
                 let hit = raycast::cpu_raycast_in_sphere_frame(
                     &self.world.library,
                     self.world.root,
@@ -143,11 +181,7 @@ impl App {
                 );
                 (hit, sphere.body_path)
             }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                // Raycast from the render frame — f32 can only represent
-                // positions a few levels deeper than the frame root.
-                // The pop loop handles finding hits at coarser depths
-                // via slot-arithmetic frame transitions.
+            crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
                 let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
@@ -215,10 +249,13 @@ impl App {
             );
             if let Some(ref h) = hit {
                 let (aabb_min, aabb_max) = match self.active_frame.kind {
-                    ActiveFrameKind::Sphere(_) => {
+                    crate::app::ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
+                        aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
+                    }
+                    crate::app::ActiveFrameKind::Sphere(_) => {
                         aabb::hit_aabb_body_local(&self.world.library, h)
                     }
-                    ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                    crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
                         aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
                     }
                 };

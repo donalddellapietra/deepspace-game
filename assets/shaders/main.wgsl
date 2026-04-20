@@ -51,28 +51,51 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
-    if uniforms.highlight_active != 0u {
-        // Highlight AABB is always in the camera's frame-local system.
-        // t is invariant across ribbon pop transforms (origin and dir
-        // both ÷3 per pop), so hit_pos = camera.pos + ray_dir * t is
-        // always in the original frame regardless of which ribbon
-        // level the DDA actually found the hit.
-        let h_min = uniforms.highlight_min.xyz;
-        let h_max = uniforms.highlight_max.xyz;
-        let h_size = h_max - h_min;
-        if result.hit {
-            let hit_pos = camera.pos + ray_dir * result.t;
-            let pad_local = max_component(h_size) * 0.03;
-            let inside = all(hit_pos >= (h_min - vec3<f32>(pad_local))) &&
-                         all(hit_pos <= (h_max + vec3<f32>(pad_local)));
-            if inside {
-                let local_h = clamp((hit_pos - h_min) / max(h_size, vec3<f32>(1e-6)), vec3<f32>(0.0), vec3<f32>(1.0));
-                let edge = min(
-                    min(min(local_h.x, 1.0 - local_h.x), min(local_h.y, 1.0 - local_h.y)),
-                    min(local_h.z, 1.0 - local_h.z)
-                );
-                let glow = 1.0 - smoothstep(0.02, 0.12, edge);
-                color = mix(color, vec3<f32>(1.0, 0.92, 0.18), glow * 0.85);
+    if uniforms.highlight_active != 0u && result.hit {
+        // Path-prefix matching: reconstruct the hit cell's world-
+        // root-relative slot path by prepending the ribbon-pop-
+        // adjusted render_path prefix to the walker's local
+        // `hit_path`, then compare against `highlight_path` one slot
+        // at a time. Precision-safe at any anchor depth — no f32
+        // AABB / hit_pos arithmetic is involved.
+        //
+        // After N ribbon pops, the walker's root sits at
+        // `chain[render_depth − N]` (ancestor), so the valid world-
+        // root prefix is `render_path[0..render_depth − N]`.
+        let h_depth = uniforms.highlight_path_depth;
+        let r_depth = uniforms.render_path_depth;
+        let pop_level = result.frame_level;
+        // Saturating subtract — guards against the (shouldn't-happen)
+        // case of pop_level > r_depth.
+        let frame_prefix_len = select(0u, r_depth - pop_level, r_depth >= pop_level);
+        let walker_depth = result.hit_path_depth;
+        let full_hit_depth = frame_prefix_len + walker_depth;
+        // Prefix match: the walker's hit cell CONTAINS the highlight
+        // iff the walker's full-root path is a prefix of the
+        // highlight path. The walker often terminates shallower than
+        // the highlight's exact depth (LOD cap / packed-uniform
+        // collapse), so we compare up to `min(h_depth, full_hit_depth)`
+        // and only require the shared prefix to match. This is what
+        // makes the highlight glow render consistently at deep
+        // anchor where the packed tree caps the walker short.
+        if h_depth > 0u && full_hit_depth > 0u {
+            let compare_len = min(h_depth, full_hit_depth);
+            var match_ok: bool = true;
+            for (var i: u32 = 0u; i < compare_len; i = i + 1u) {
+                var hit_slot: u32;
+                if i < frame_prefix_len {
+                    hit_slot = unpack_slot_from_path(uniforms.render_path, i);
+                } else {
+                    hit_slot = unpack_slot_from_path(result.hit_path, i - frame_prefix_len);
+                }
+                let hl_slot = unpack_slot_from_path(uniforms.highlight_path, i);
+                if hit_slot != hl_slot {
+                    match_ok = false;
+                    break;
+                }
+            }
+            if match_ok {
+                color = mix(color, vec3<f32>(1.0, 0.92, 0.18), 0.55);
             }
         }
     }

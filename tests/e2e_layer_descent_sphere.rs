@@ -9,7 +9,7 @@
 #[path = "e2e_layer_descent/harness.rs"]
 mod harness;
 
-use harness::{ScriptBuilder, run, tmp_dir};
+use harness::{ScriptBuilder, run, tmp_dir, planet_pixel_count_at_row, highlight_glow_pixel_count};
 
 /// Sphere world. `--spawn-on-surface` dispatches to
 /// `demo_sphere_surface_spawn` which builds a path-based spawn that
@@ -436,4 +436,152 @@ fn sphere_descent_breaks_at_every_layer() {
             path,
         );
     }
+}
+
+/// The planet must render with a CURVED (approximately circular)
+/// silhouette when viewed from outside, not as a flat face / cube.
+///
+/// This is the visual contract the sphere locality refactor broke in
+/// its first attempt: switching `set_root_kind_face` → `_cartesian`
+/// for all sphere frames made the shader dispatch `march_cartesian`
+/// on the face subtree, dropping the cube-to-equal-area warp and
+/// rendering a flat rectangular terrain patch instead of a planet.
+///
+/// Test: capture the sphere from above with the full body in view
+/// (spawn high above the body cell, looking straight down). Count
+/// non-sky pixels in three rows — a band well above the equator, a
+/// middle band, and a band well below. A sphere silhouette has
+/// mostly sky in the top band (pole is small on screen) and far
+/// more planet in the middle (equator fills the view). A flat face
+/// renders either mostly sky (looking above it) or a constant-width
+/// band — both of which fail this check.
+#[test]
+fn sphere_silhouette_is_curved_when_viewed_from_outside() {
+    let dir = tmp_dir("sphere_silhouette");
+    let shot_path = dir.join("planet.png");
+    let _ = std::fs::remove_file(&shot_path);
+    let shot = shot_path.to_string_lossy().into_owned();
+
+    let script = ScriptBuilder::new().emit("start").screenshot(&shot);
+
+    let harness_args: &[&str] = &[
+        "--render-harness",
+        "--sphere-world",
+        // Place camera well above the body cell. Body at root slot 13
+        // spans root [1, 2)³; outer shell at body-local 0.45 = root
+        // radius 0.45 around (1.5, 1.5, 1.5), surface at y ≈ 1.95.
+        // Spawn at y=2.7 — outside outer shell, looking down at the
+        // whole body with sky above.
+        "--spawn-xyz", "1.5", "2.7", "1.5",
+        "--spawn-depth", "3",
+        "--spawn-pitch", "-1.57",
+        "--spawn-yaw", "0",
+        "--disable-highlight",
+        "--disable-overlay",
+        "--harness-width", "320",
+        "--harness-height", "240",
+        "--exit-after-frames", "180",
+        "--timeout-secs", "20",
+    ];
+
+    let trace = run(harness_args, &script);
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr tail ---\n{}",
+        trace.stderr.lines().rev().take(30).collect::<Vec<_>>().join("\n"),
+    );
+    assert!(
+        std::path::Path::new(&shot).exists(),
+        "silhouette screenshot missing: {shot}",
+    );
+
+    let top = planet_pixel_count_at_row(&shot, 0.10);
+    let mid = planet_pixel_count_at_row(&shot, 0.50);
+    let bot = planet_pixel_count_at_row(&shot, 0.90);
+
+    // Core assertion: the middle row must have substantially more
+    // planet pixels than the top row. Sphere silhouette: mid ≈ 2-3×
+    // top. Flat face (post-broken-refactor screenshot): mid ≈ top
+    // (band across whole viewport) or mid < top (sky dominates).
+    assert!(
+        mid as f32 >= top as f32 * 1.5,
+        "planet silhouette not curved at top — middle row {mid} must be ≥1.5× top row {top}. \
+         Bottom row {bot}. If mid≈top the face subtree is rendering as an axis-aligned cube \
+         instead of a curved sphere.",
+    );
+    assert!(
+        mid > 0,
+        "middle row has zero planet pixels — planet is not in view at all",
+    );
+}
+
+/// At deep sphere anchors the cursor highlight glow must actually
+/// render on screen.
+///
+/// Pre-refactor the sphere highlight used body-frame `vec3` AABB
+/// uniforms. Cells past face-subtree depth ~20 collapsed below f32
+/// ULP near `body_center ≈ 1.5`, so the shader's `hit_pos ∈ AABB`
+/// check never fired — the yellow glow silently disappeared.
+///
+/// Post-refactor the highlight uses `(render_path, highlight_path)`
+/// slot-path matching in the shader: every pixel's walker returns
+/// its hit cell's slot sequence and the shader compares it prefix-
+/// wise against the highlighted cell's world-root path. No f32
+/// precision is involved, so the glow fires reliably at any anchor
+/// depth.
+///
+/// Test: spawn with cursor_locked + highlight ENABLED at deep sphere
+/// anchor, render a screenshot, assert yellow glow pixels are
+/// present on the surface.
+#[test]
+fn sphere_highlight_glow_renders_at_deep_anchor() {
+    let dir = tmp_dir("sphere_highlight_deep");
+    let shot_path = dir.join("highlighted.png");
+    let _ = std::fs::remove_file(&shot_path);
+    let shot = shot_path.to_string_lossy().into_owned();
+
+    let script = ScriptBuilder::new()
+        .emit("start")
+        // Wait a few frames for the highlight pipeline to settle —
+        // the first frame's upload happens before the highlight raycast.
+        .wait(5)
+        .screenshot(&shot);
+
+    let harness_args: &[&str] = &[
+        "--render-harness",
+        "--sphere-world",
+        "--spawn-xyz", "1.5", "1.98", "1.5",
+        "--spawn-depth", "22",
+        "--spawn-pitch", "-1.5",
+        "--spawn-yaw", "0",
+        // Highlight enabled this time (no --disable-highlight).
+        "--disable-overlay",
+        "--harness-width", "320",
+        "--harness-height", "180",
+        "--exit-after-frames", "200",
+        "--timeout-secs", "20",
+        "--interaction-radius", "200",
+    ];
+
+    let trace = run(harness_args, &script);
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr tail ---\n{}",
+        trace.stderr.lines().rev().take(30).collect::<Vec<_>>().join("\n"),
+    );
+    assert!(
+        std::path::Path::new(&shot).exists(),
+        "highlight screenshot missing: {shot}",
+    );
+
+    // Exclude the 20-pixel screen-center box so crosshair pixels
+    // (always ~30 when hit registers) don't satisfy the assertion
+    // on their own — we want to count the actual cell glow.
+    let glow = highlight_glow_pixel_count(&shot, 20);
+    assert!(
+        glow > 0,
+        "cursor highlight glow not visible at anchor_depth=22: 0 yellow-ish \
+         pixels outside the crosshair. The shader's path-based match should \
+         fire at deep anchor (no f32 precision wall in the path compare).",
+    );
 }
