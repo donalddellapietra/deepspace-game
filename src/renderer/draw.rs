@@ -202,40 +202,6 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
-        // --- Stencil prep pass ---
-        //
-        // Reads the 5-tap coarse-mask neighborhood and writes stencil=1
-        // for "march me", discards (leaves stencil=0) for "cull me".
-        // Moves the cull decision from the fragment shader's branch to
-        // the stencil hardware — the main pass's `stencil_test = Equal
-        // 1` then kills sky fragments before they reach `shade_pixel`,
-        // eliminating the warp divergence that the old mask-branch
-        // version had. Only runs in the non-TAA path; the TAA pipeline
-        // isn't stencil-tested (no depth_stencil attachment).
-        if self.pipeline_taa.is_none() {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("beam_stencil_prep"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.stencil_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.stencil_prep_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_stencil_reference(1);
-            pass.draw(0..3, 0..1);
-        }
-
         // --- Ray-march pass ---
         if self.pipeline_taa.is_some() {
             let taa = self.taa.as_ref().expect("pipeline_taa implies TaaState");
@@ -274,17 +240,6 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         } else {
-            // Main march pass. Loads the stencil buffer from the
-            // prep pass and runs with stencil_test = Equal(1), so
-            // fragments in culled tiles (stencil=0) are killed
-            // before the fragment shader dispatches.
-            //
-            // Culled pixels are never written by the fragment
-            // shader; they take the clear color. The mid-blue
-            // clear below is a constant-sky placeholder — visually
-            // a sharp cut vs. the gradient the old fs_main produced
-            // for miss rays. Will add a sky fill pass to restore
-            // the gradient once baseline perf is measured.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(march_label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -292,25 +247,17 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.5, g: 0.65, b: 0.9, a: 1.0,
+                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.stencil_view,
-                    depth_ops: None,
-                    stencil_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                }),
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_stencil_reference(1);
             pass.draw(0..3, 0..1);
         }
 
@@ -657,11 +604,26 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("capture-frame"),
         });
-        // Route through the full frame pipeline (coarse → stencil
-        // prep → main) so the capture matches what the live/harness
-        // paths produce. Stencil attachment is required by the main
-        // pipeline's depth-stencil state.
-        self.record_frame_passes(&mut encoder, &view, "capture-pass");
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("capture-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,

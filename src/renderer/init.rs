@@ -16,12 +16,6 @@ use super::{GpuUniforms, Renderer, ROOT_KIND_CARTESIAN};
 /// non-issue.
 pub(super) const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
-/// Depth-stencil format for the beam-prepass stencil buffer. Depth24
-/// is unused but we pair it with Stencil8 for maximum compatibility
-/// (separate-stencil formats like Stencil8 alone are optional in
-/// wgpu's downlevel limits).
-pub(super) const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
-
 /// Coarse-pass tile size in output pixels. MUST match `BEAM_TILE_SIZE`
 /// in `bindings.wgsl`. Changes require rebuilding the shader module
 /// (the const is compiled in, not an override).
@@ -45,29 +39,6 @@ pub(super) fn create_mask_texture(
         dimension: wgpu::TextureDimension::D2,
         format: MASK_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    (tex, view)
-}
-
-pub(super) fn create_stencil_texture(
-    device: &wgpu::Device,
-    swap_w: u32,
-    swap_h: u32,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("beam_stencil"),
-        size: wgpu::Extent3d {
-            width: swap_w.max(1),
-            height: swap_h.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: STENCIL_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -384,13 +355,6 @@ impl Renderer {
         let (mask_texture, mask_view) = create_mask_texture(
             &device, config.width, config.height,
         );
-        // Stencil buffer at full resolution. Shared between the
-        // stencil-prep pass (writes) and the main march pass (reads
-        // via stencil_test = Equal 1 to kill sky pixels before they
-        // reach the fragment shader).
-        let (stencil_texture, stencil_view) = create_stencil_texture(
-            &device, config.width, config.height,
-        );
         // 1×1 dummy mask for the coarse bind group. The coarse shader
         // doesn't sample `coarse_mask` — it writes to the real one as
         // a render target. But the bind group layout requires
@@ -439,31 +403,6 @@ impl Renderer {
             "renderer_pipeline lod_pixels={:.2} shader_stats={}",
             lod_pixel_threshold, shader_stats_enabled,
         );
-        // Depth-stencil state for the main march pipeline. Depth is
-        // not used (always writes/tests disabled). Stencil is:
-        //   - Test: Equal against reference value (set to 1 at draw)
-        //   - Fail: Keep (no write on fail)
-        //   - Pass: Keep (no write on pass either — we only READ)
-        // So fragments with stencil != 1 never reach the fragment
-        // shader; fragments with stencil == 1 execute as normal.
-        let main_depth_stencil = wgpu::DepthStencilState {
-            format: STENCIL_FORMAT,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Always,
-            stencil: wgpu::StencilState {
-                front: wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::Equal,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::Keep,
-                },
-                back: wgpu::StencilFaceState::IGNORE,
-                read_mask: 0xff,
-                write_mask: 0x00,
-            },
-            bias: wgpu::DepthBiasState::default(),
-        };
-
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ray_march"),
             layout: Some(&pipeline_layout),
@@ -487,56 +426,7 @@ impl Renderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
-            depth_stencil: Some(main_depth_stencil.clone()),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        // Stencil-prep pipeline. Runs at full resolution, no color
-        // output. `fs_stencil_prep` reads the coarse mask's 5-tap
-        // neighborhood and `discard`s the fragment when the cull
-        // should fire. Surviving fragments cause the stencil
-        // operation `pass_op = Replace` to write the reference
-        // value 1. The bind group provides the coarse_mask texture
-        // at slot 8 (shared with the main pipeline's layout).
-        let stencil_prep_depth_stencil = wgpu::DepthStencilState {
-            format: STENCIL_FORMAT,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Always,
-            stencil: wgpu::StencilState {
-                front: wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::Always,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::Replace,
-                },
-                back: wgpu::StencilFaceState::IGNORE,
-                read_mask: 0xff,
-                write_mask: 0xff,
-            },
-            bias: wgpu::DepthBiasState::default(),
-        };
-        let stencil_prep_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ray_march_stencil_prep"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_stencil_prep"),
-                targets: &[],
-                compilation_options: frag_compilation_options.clone(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: Some(stencil_prep_depth_stencil),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -658,9 +548,6 @@ impl Renderer {
             dummy_mask_view,
             coarse_pipeline,
             coarse_bind_group,
-            stencil_texture,
-            stencil_view,
-            stencil_prep_pipeline,
             pipeline_taa,
             taa: taa_state,
             last_camera_write_ms: 0.0,
