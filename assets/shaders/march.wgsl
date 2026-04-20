@@ -257,11 +257,38 @@ fn march_cartesian(
                 let outer_r = node_kinds[child_idx].outer_r;
                 let body_origin_sph = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
                 let walker_cap = min(depth_limit, MAX_FACE_DEPTH);
-                let sph = sphere_in_cell(
+                var sph = sphere_in_cell(
                     child_idx, body_origin_sph, cur_cell_size,
                     inner_r, outer_r, ray_origin, ray_dir, walker_cap,
                 );
                 if sph.hit {
+                    // sphere_in_cell's hit_path is body-rooted
+                    // (starts with face_slot, then face subtree
+                    // descent). Prepend the walker's cartesian
+                    // prefix (slots 0..=depth, including the body's
+                    // own slot in the parent) so the final hit_path
+                    // is frame-root-relative.
+                    let prefix_len = depth + 1u;
+                    let sphere_tail_len = sph.hit_path_depth;
+                    // Copy sphere tail to indices [prefix_len ..].
+                    // Iterate from the END so we don't overwrite
+                    // entries before reading them (hit_path is a
+                    // packed array so indices may overlap a word).
+                    // Worst case: prefix_len + sphere_tail_len > 63
+                    // (MAX_DEPTH); clamp to MAX_DEPTH.
+                    let max_copy = min(sphere_tail_len, 63u - prefix_len);
+                    for (var j: u32 = 0u; j < max_copy; j = j + 1u) {
+                        let src_i = max_copy - 1u - j;
+                        let slot_i = unpack_slot_from_path(sph.hit_path, src_i);
+                        pack_slot_into_path(&sph.hit_path, prefix_len + src_i, slot_i);
+                    }
+                    // Write the cartesian prefix.
+                    for (var d: u32 = 0u; d <= depth; d = d + 1u) {
+                        let c = s_cell[d];
+                        let sl = u32(c.x) + u32(c.y) * 3u + u32(c.z) * 9u;
+                        pack_slot_into_path(&sph.hit_path, d, sl);
+                    }
+                    sph.hit_path_depth = prefix_len + max_copy;
                     return sph;
                 }
                 // Sphere missed (ray went past the outer shell) —

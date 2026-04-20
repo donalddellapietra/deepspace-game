@@ -137,6 +137,28 @@ fn sphere_in_cell(
             result.color = sphere_shade(block_id, hit_normal);
             result.cell_min = hit_pos - vec3<f32>(shell * walk.size * 0.5);
             result.cell_size = shell * walk.size;
+            // Populate hit_path: first slot is the body's face-slot
+            // (so the body→face transition is captured), followed
+            // by the walker's internal (us, vs, rs) descent from
+            // the face subtree root. The full body-rooted path is
+            // [face_slot, us/vs/rs slots...]. Callers append this
+            // to their own render/ribbon prefix for the path-prefix
+            // match in `main.wgsl`.
+            pack_slot_into_path(&result.hit_path, 0u, face_slot(face));
+            var wu = un;
+            var wv = vn;
+            var wr = rn;
+            for (var d: u32 = 0u; d < walk.depth; d = d + 1u) {
+                let us = min(u32(wu * 3.0), 2u);
+                let vs = min(u32(wv * 3.0), 2u);
+                let rs = min(u32(wr * 3.0), 2u);
+                let slot = rs * 9u + vs * 3u + us;
+                pack_slot_into_path(&result.hit_path, d + 1u, slot);
+                wu = wu * 3.0 - f32(us);
+                wv = wv * 3.0 - f32(vs);
+                wr = wr * 3.0 - f32(rs);
+            }
+            result.hit_path_depth = walk.depth + 1u;
             return result;
         }
 
