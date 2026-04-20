@@ -70,11 +70,6 @@ pub struct Renderer {
     /// only on descent / ribbon pop (cold path).
     pub(super) node_offsets_buffer: wgpu::Buffer,
     pub(super) node_kinds_buffer: wgpu::Buffer,
-    /// Base-3 acceleration grid over the root frame. Fixed size
-    /// (`GRID_U32_COUNT` u32s); rebuilt on every tree update via
-    /// `update_tree`. Shader reads it in the outer grid-DDA before
-    /// handing off to the tree walker.
-    pub(super) grid_buffer: wgpu::Buffer,
     /// Running counts of what's currently uploaded to the GPU
     /// buffers (u32s for tree; element counts for the BFS-indexed
     /// side buffers). `update_tree` uses these to write only the

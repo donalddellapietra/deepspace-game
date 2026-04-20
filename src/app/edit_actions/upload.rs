@@ -41,7 +41,6 @@ impl App {
                     &cache.tree,
                     &cache.node_kinds,
                     &cache.node_offsets,
-                    &cache.grid,
                     cache.root_bfs_idx,
                 );
             }

@@ -180,14 +180,13 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
             .with_visible(cfg.show_window),
     )?);
-    let (tree_packed, node_kinds, node_offsets, _node_ids, root_index, grid) =
+    let (tree_packed, node_kinds, node_offsets, _node_ids, root_index) =
         crate::world::gpu::pack_tree(&app.world.library, app.world.root);
     let renderer = pollster::block_on(Renderer::new(
         window.clone(),
         &tree_packed,
         &node_kinds,
         &node_offsets,
-        &grid,
         root_index,
         wgpu::PresentMode::AutoNoVsync,
         cfg.shader_stats,
