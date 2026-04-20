@@ -221,28 +221,16 @@ fn march_cartesian(
                 continue;
             }
 
+            // ATLAS EXPERIMENT: formerly, `kind == 1u` (CubedSphereBody)
+            // dispatched to `sphere_in_cell` here, running a curved-
+            // sphere DDA inside the body's [0, 3)³ cell. The current
+            // experiment routes it through normal Cartesian descent —
+            // the body's 27 children (6 face subtrees + interior +
+            // 20 empties) are walked as if they were any other
+            // Cartesian node. Silhouette becomes cubic; all the
+            // body-frame precision math disappears.
             let kind = node_kinds[child_idx].kind;
-
-            if kind == 1u {
-                // CubedSphereBody: dispatch sphere DDA in this body's cell.
-                let body_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-                let body_size = cur_cell_size;
-                let inner_r = node_kinds[child_idx].inner_r;
-                let outer_r = node_kinds[child_idx].outer_r;
-                let sph = sphere_in_cell(
-                    child_idx, body_origin, body_size,
-                    inner_r, outer_r, ray_origin, ray_dir,
-                );
-                if sph.hit {
-                    return sph;
-                }
-                // Sphere missed — advance Cartesian DDA past this cell.
-                let m_sph = min_axis_mask(cur_side_dist);
-                s_cell[depth] += vec3<i32>(m_sph) * step;
-                cur_side_dist += m_sph * delta_dist * cur_cell_size;
-                normal = -vec3<f32>(step) * m_sph;
-                continue;
-            }
+            _ = kind;
             // Empty-representative fast path: when the packed
             // child's representative_block is 255, the subtree has
             // no non-empty content (either uniform-empty deeper in
@@ -449,26 +437,13 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         hops = hops + 1u;
 
         var r: HitResult;
-        if current_kind == ROOT_KIND_BODY {
-            let body_origin = vec3<f32>(0.0);
-            let body_size = 3.0;
-            r = sphere_in_cell(
-                current_idx, body_origin, body_size,
-                inner_r, outer_r, ray_origin, ray_dir,
-            );
-        } else if current_kind == ROOT_KIND_FACE {
-            r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
-        } else {
-            // Ribbon-level LOD budget: the ancestor pop count is
-            // the tree's native distance metric. Inside our anchor
-            // cell (ribbon_level=0) we allow `BASE_DETAIL_DEPTH`
-            // levels of descent; each additional shell (ribbon pop)
-            // drops the budget by one, bottoming out at 1. This
-            // gives cubic LOD shells that are invariant under zoom
-            // — zooming out grows the ribbon by one outer shell at
-            // budget=1 and leaves everything else unchanged.
-            // Nyquist (LOD_PIXEL_THRESHOLD) still acts as an inner
-            // floor so we don't descend into sub-pixel detail.
+        // ATLAS EXPERIMENT: curved-sphere dispatches for ROOT_KIND_BODY
+        // and ROOT_KIND_FACE are routed into march_cartesian. The body
+        // / face nodes are Cartesian-walked in their own [0, 3)³ frame.
+        // Face windowing (cur_face_bounds) is ignored here — the
+        // whole face subtree is walked as a plain 27-ary node.
+        _ = current_kind; _ = inner_r; _ = outer_r; _ = cur_face_bounds;
+        {
             let detail_budget = select(
                 1u,
                 BASE_DETAIL_DEPTH - ribbon_level,
@@ -500,7 +475,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if ribbon_level >= uniforms.ribbon_count {
             break;
         }
-        if current_kind == ROOT_KIND_FACE {
+        // ATLAS EXPERIMENT: pretend every frame is Cartesian for the
+        // ribbon-pop path. The face-specific pop doesn't rescale the
+        // ray, which is incompatible with march_cartesian downstream.
+        current_kind = ROOT_KIND_CARTESIAN;
+        if false {
             let body_pop_level = uniforms.root_face_meta.y;
             if ribbon_level < body_pop_level {
                 let entry = ribbon[ribbon_level];
