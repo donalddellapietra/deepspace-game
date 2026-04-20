@@ -22,5 +22,9 @@
 .claude/
 ui/assets/
 
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
+
 # Voxelized models (regenerated from GLB via tools/glb_to_vox.py)
 assets/vox/
