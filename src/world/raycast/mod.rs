@@ -447,6 +447,54 @@ mod tests {
     }
 
     #[test]
+    fn sphere_sub_frame_hit_at_depth_35() {
+        // End-to-end pipeline check: anchor descends through face
+        // subtree to depth 35. `compute_render_frame` must produce a
+        // `SphereSub`, `cpu_raycast_in_sub_frame` must land a hit.
+        // This is what the body-march cap prevented — depth 35 is
+        // 15 levels beyond the f32 precision wall of the body march.
+        use crate::app::frame::{compute_render_frame, ActiveFrameKind};
+        use crate::world::anchor::Path;
+        use crate::world::bootstrap;
+        use crate::world::cubesphere::{Face, FACE_SLOTS};
+        use crate::world::tree::slot_index;
+
+        let world = bootstrap::bootstrap_world(
+            bootstrap::WorldPreset::DemoSphere,
+            Some(40),
+        ).world;
+
+        // Anchor: body(1,1,1) → face(PosY) → UVR(1,1,1) × 35. Face-
+        // subtree depth = 35. Well past the old max_face_depth = 10.
+        let mut anchor = Path::root();
+        anchor.push(slot_index(1, 1, 1) as u8);
+        anchor.push(FACE_SLOTS[Face::PosY as usize] as u8);
+        for _ in 0..35 {
+            anchor.push(slot_index(1, 1, 1) as u8);
+        }
+        let active = compute_render_frame(
+            &world.library, world.root, &anchor, anchor.depth(),
+        );
+        let sub = match active.kind {
+            ActiveFrameKind::SphereSub(s) => s,
+            k => panic!("expected SphereSub at face-subtree depth 35, got {k:?}"),
+        };
+        let cam_local = [1.5_f32, 1.5, 2.5];
+        let rd_body = crate::world::sdf::scale(
+            crate::world::sdf::normalize([sub.j[2][0], sub.j[2][1], sub.j[2][2]]),
+            -1.0,
+        );
+        let hit = cpu_raycast_in_sub_frame(
+            &world.library, world.root, &sub,
+            active.render_path.as_slice(),
+            cam_local, rd_body,
+            anchor.depth() as u32,
+            LodParams::fixed_max(),
+        );
+        assert!(hit.is_some(), "deep-descent raycast missed at anchor depth 37");
+    }
+
+    #[test]
     fn planet_world_cartesian_descend_triggers_sphere_dispatch() {
         use crate::world::cubesphere::{demo_planet, install_at_root_center};
         use crate::world::worldgen::generate_world;

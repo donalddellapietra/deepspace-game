@@ -69,26 +69,25 @@ impl App {
         };
         let (hit, cap_frame_path) = match self.active_frame.kind {
             ActiveFrameKind::SphereSub(sub) => {
-                // TODO: replace with cpu_raycast_in_sub_frame using
-                // sub.j_inv once cs_raycast_local is implemented.
-                // For now, fall back to the body-level raycast with
-                // the full edit_depth so the existing exact march
-                // handles the query — precision fix arrives with the
-                // sub-frame DDA.
-                let frame_path = sub.body_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
-                let hit = raycast::cpu_raycast_in_frame(
+                // Deep face-subtree render frame: march runs in the
+                // frame's linearized local `[0, 3)³` via `J_inv`.
+                // `cam_local` comes from the anchor-path ribbon-pop
+                // directly — never subtracted from a body-XYZ point
+                // (which would collapse in f32 at deep depth).
+                let render_path = self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame(&render_path);
+                let ray_dir_body = self.ray_dir_in_frame(&sub.body_path);
+                let hit = raycast::cpu_raycast_in_sub_frame(
                     &self.world.library,
                     self.world.root,
-                    frame_path.as_slice(),
+                    &sub,
+                    render_path.as_slice(),
                     cam_local,
-                    ray_dir,
+                    ray_dir_body,
                     self.edit_depth(),
-                    self.cs_edit_depth(),
                     lod,
                 );
-                (hit, frame_path)
+                (hit, sub.body_path)
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 // Raycast from the render frame — f32 can only
