@@ -84,6 +84,7 @@ impl App {
                     sphere.body_path.as_slice(),
                     cam_body,
                     ray_dir,
+                    self.cs_edit_depth(),
                     lod,
                     window,
                     sphere.inner_r,
@@ -106,6 +107,7 @@ impl App {
                     cam_local,
                     ray_dir,
                     self.edit_depth(),
+                    self.cs_edit_depth(),
                     lod,
                 );
                 if hit.is_none() && self.startup_profile_frames < 16 {

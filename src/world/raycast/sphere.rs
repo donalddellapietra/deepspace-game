@@ -321,9 +321,23 @@ fn ray_sphere_after(origin: [f32; 3], dir: [f32; 3], radius: f32, after: f32) ->
 /// CPU mirror of the shader's `sphere_in_cell`. Cell-boundary DDA
 /// through the sphere shell: at each iteration we find the face +
 /// (un, vn, rn) at the current ray position, walk the face subtree
-/// to `face_lod_depth(t, shell, lod)` levels, and either report the
-/// hit or step to the cell's next boundary (ray-plane for u/v,
-/// ray-sphere for r).
+/// to `min(max_face_depth, face_lod_depth(t, shell, lod))` levels,
+/// and either report the hit or step to the cell's next boundary.
+///
+/// `max_face_depth` is the anchor-depth cap (fed by `cs_edit_depth`
+/// = `edit_depth` = anchor depth). This is the Cartesian-analog of
+/// `max_depth`: the walker resolves to ANCHOR-sized cells, not
+/// screen-Nyquist cells. That's why the user's interaction range
+/// ("12 anchor cells") always produces on-screen cells much larger
+/// than 1 pixel — at 12 anchor-cells distance, the projected
+/// anchor cell is ≈ `pixel_density / 12` ≈ 20 px. Sub-pixel edits
+/// are geometrically impossible as long as the camera stays within
+/// `interaction_range_in_frame`.
+///
+/// `lod` is a secondary LOD-Nyquist floor — the walker won't
+/// descend past the screen-size threshold even if the anchor cap
+/// allows it. This mirrors `march_cartesian`'s dual `at_max ||
+/// at_lod` termination. Pass `LodParams::fixed_max()` to disable.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn cs_raycast(
     library: &NodeLibrary,
@@ -335,6 +349,7 @@ pub(super) fn cs_raycast(
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     ancestor_path: &[(NodeId, usize)],
+    max_face_depth: u32,
     lod: LodParams,
     _window: Option<FaceWindow>,
 ) -> Option<HitInfo> {
@@ -397,7 +412,10 @@ pub(super) fn cs_raycast(
             _ => break,
         };
 
-        let walk_depth = face_lod_depth(t, shell, lod);
+        // Anchor cap first, LOD-Nyquist floor second. Matches
+        // Cartesian's `at_max || at_lod` — whichever is reached
+        // earlier wins.
+        let walk_depth = face_lod_depth(t, shell, lod).min(max_face_depth.max(1));
         let w = walk_face_subtree(library, face_root_id, fp.un, fp.vn, fp.rn, walk_depth);
 
         if w.block != EMPTY_CELL {

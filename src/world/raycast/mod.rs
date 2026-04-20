@@ -77,7 +77,7 @@ pub fn cpu_raycast(
 ) -> Option<HitInfo> {
     cartesian::cpu_raycast_with_face_depth(
         library, root, ray_origin, ray_dir, max_depth,
-        LodParams::fixed_max(),
+        MAX_FACE_DEPTH, LodParams::fixed_max(),
     )
 }
 
@@ -94,6 +94,7 @@ pub fn cpu_raycast_in_frame(
     cam_local: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
+    max_face_depth: u32,
     lod: LodParams,
 ) -> Option<HitInfo> {
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
@@ -104,38 +105,32 @@ pub fn cpu_raycast_in_frame(
     let mut ray_origin = cam_local;
     let mut ray_dir = ray_dir;
     let total_max_depth = max_depth;
-    let mut cur_scale: f32 = 1.0;
 
+    // `lod` is NOT scaled as the ray pops through ribbon levels.
+    // `face_lod_depth(t, shell, lod)` is naturally scale-invariant
+    // — the pop transform scales both `t` and `shell` by the same
+    // factor (ray_dir shrinks by 1/3, frame-local distances stretch
+    // by 3), so `shell / t` and therefore the derived depth
+    // stay constant in world units. Scaling the LOD here would
+    // un-balance that invariance and drive hits to coarser cells
+    // at deeper pop depth.
     loop {
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
 
-        // Dispatch on the frame root's NodeKind. A CubedSphereBody
-        // frame-root hands off to the sphere DDA directly — the
-        // body fills the frame's [0, 3)³ bubble.
-        //
-        // `lod` is scaled by `cur_scale` on ribbon pops: each pop
-        // rescales the ray by 1/3, which also scales the effective
-        // body-frame distance that feeds `face_lod_depth`. Without
-        // scaling, the LOD would shift after a pop, causing the
-        // CPU's hit cell to drift from the shader's.
-        let scaled_lod = LodParams {
-            pixel_density: lod.pixel_density * cur_scale,
-            lod_threshold: lod.lod_threshold,
-        };
         let frame_kind = library.get(frame_root_id).map(|n| n.kind);
         let hit_opt = if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
             sphere::cs_raycast(
                 library, frame_root_id, [0.0; 3], 3.0,
                 inner_r, outer_r,
                 ray_origin, ray_dir,
-                &[], scaled_lod,
+                &[], max_face_depth, lod,
                 None,
             )
         } else {
             cartesian::cpu_raycast_with_face_depth(
                 library, frame_root_id, ray_origin, ray_dir,
-                inner_max, scaled_lod,
+                inner_max, max_face_depth, lod,
             )
         };
 
@@ -159,7 +154,6 @@ pub fn cpu_raycast_in_frame(
             sz as f32 + ray_origin[2] / 3.0,
         ];
         ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
-        cur_scale *= 1.0 / 3.0;
         current_frame_depth -= 1;
     }
 }
@@ -179,6 +173,7 @@ pub fn cpu_raycast_in_sphere_frame(
     body_path: &[u8],
     cam_body: [f32; 3],
     ray_dir: [f32; 3],
+    max_face_depth: u32,
     lod: LodParams,
     window: FaceWindow,
     inner_r: f32,
@@ -191,7 +186,7 @@ pub fn cpu_raycast_in_sphere_frame(
         library, body_node_id, [0.0; 3], 3.0,
         inner_r, outer_r,
         cam_body, ray_dir,
-        &[], lod,
+        &[], max_face_depth, lod,
         Some(window),
     );
     if let Some(mut hit) = hit {
@@ -364,7 +359,7 @@ mod tests {
         );
         let frame_hit = cpu_raycast_in_frame(
             &world.library, world.root,
-            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, super::LodParams::fixed_max(),
+            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
         );
         assert!(world_hit.is_some());
         assert!(frame_hit.is_some());
@@ -382,7 +377,7 @@ mod tests {
         let dir = [0.7, 0.7, 0.0];
         let _ = cpu_raycast_in_frame(
             &world.library, world.root,
-            &frame_path, cam, dir, 8, super::LodParams::fixed_max(),
+            &frame_path, cam, dir, 8, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
         );
     }
 
@@ -391,7 +386,7 @@ mod tests {
         let world = plain_test_world();
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
-            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, super::LodParams::fixed_max(),
+            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
         ).expect("should hit ground");
         assert_eq!(hit.path[0].0, world.root);
     }
@@ -412,7 +407,7 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.0, 1.5], [0.0, -1.0, 0.0],
-            30, super::LodParams::fixed_max(),
+            30, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "ray should hit the planet");
         let h = hit.unwrap();
@@ -436,7 +431,7 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
-            30, super::LodParams::fixed_max(),
+            30, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "Cartesian DDA should cross into body cell and dispatch sphere");
     }
@@ -467,7 +462,7 @@ mod tests {
             let hit = cpu_raycast_in_frame(
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
-                edit_depth, super::LodParams::fixed_max(),
+                edit_depth, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
             );
 
             assert!(hit.is_some(),
@@ -518,7 +513,7 @@ mod tests {
             let hit = cpu_raycast_in_frame(
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
-                edit_depth, super::LodParams::fixed_max(),
+                edit_depth, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
             );
 
             assert!(hit.is_some(),

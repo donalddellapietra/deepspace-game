@@ -27,6 +27,7 @@ pub(super) fn cpu_raycast_with_face_depth(
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
+    max_face_depth: u32,
     lod: LodParams,
 ) -> Option<HitInfo> {
     let inv_dir = [
@@ -143,7 +144,7 @@ pub(super) fn cpu_raycast_with_face_depth(
                         inner_r, outer_r,
                         ray_origin, ray_dir,
                         &path[..=depth],
-                        lod,
+                        max_face_depth, lod,
                         None,
                     ) {
                         return Some(hit);
