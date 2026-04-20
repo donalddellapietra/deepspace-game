@@ -119,12 +119,6 @@ impl LodUploadKey {
 pub struct App {
     pub(super) window: Option<Arc<Window>>,
     pub(super) renderer: Option<Renderer>,
-    /// Most recent GPU cursor-probe result. Populated after each
-    /// render via `renderer.read_cursor_probe()`. This is the
-    /// authoritative source of cursor-hit information for the
-    /// highlight + break/place — same `march()` the fragment shader
-    /// uses, no CPU/GPU algorithm divergence.
-    pub(super) last_cursor_hit: Option<crate::renderer::CursorProbe>,
     pub(super) camera: Camera,
     pub(super) world: WorldState,
     pub(super) frozen: bool,
@@ -366,7 +360,6 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            last_cursor_hit: None,
             camera: Camera {
                 position,
                 smoothed_up: [0.0, 1.0, 0.0],

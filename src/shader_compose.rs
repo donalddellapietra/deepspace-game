@@ -21,7 +21,6 @@ const SOURCES: &[(&str, &str)] = &[
     ("sphere.wgsl",    include_str!("../assets/shaders/sphere.wgsl")),
     ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
     ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
-    ("cursor_probe.wgsl", include_str!("../assets/shaders/cursor_probe.wgsl")),
     ("blit.wgsl",      include_str!("../assets/shaders/blit.wgsl")),
 ];
 

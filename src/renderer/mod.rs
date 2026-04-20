@@ -7,12 +7,9 @@
 //! no `cs_*` uniforms, and no absolute-coord shimming.
 
 mod buffers;
-#[allow(non_camel_case_types)]
-pub mod cursor_probe;
 mod draw;
 mod init;
 
-pub use cursor_probe::{CursorProbe, CursorProbeRaw};
 pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
 
 /// Maximum ancestor-ribbon depth supported by the shader. Larger
@@ -155,11 +152,6 @@ pub struct Renderer {
     pub(super) last_render_submit_ms: f64,
     pub(super) last_render_wait_ms: f64,
     pub(super) last_gpu_pass_ms: f64,
-    /// GPU-resident cursor-probe compute pipeline + output/staging
-    /// buffers. Dispatched once per frame from `render_offscreen()`;
-    /// the host reads the staging buffer via `read_cursor_probe()`
-    /// for the highlight uniform and for break/place edits.
-    pub(super) cursor_probe_gpu: cursor_probe::CursorProbe_Gpu,
     /// Shader-side atomic counters written by the fragment shader
     /// each frame (ray_count, hit_count, miss_count, max_iter_count,
     /// sum_steps_div4, max_steps, + 2 u32 pad). 32 bytes total.
@@ -232,40 +224,6 @@ impl Renderer {
         self.root_face_bounds = bounds;
         self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
-    }
-
-    /// Block on the GPU finishing the in-flight cursor-probe copy,
-    /// then map the staging buffer and decode the result. Zero-copy
-    /// read: we keep the buffer mapped only for the duration of the
-    /// decode (drop → unmap) so the next frame can re-fill it.
-    ///
-    /// Sub-millisecond in practice — the compute dispatch is one
-    /// workgroup of size 1 following a single ray, and the staging
-    /// buffer is 80 bytes. The harness probe commands and break/
-    /// place call this synchronously; per-frame highlight updates
-    /// call this too (the copy is already waiting by the time the
-    /// next frame's highlight update runs).
-    pub fn read_cursor_probe(&self) -> cursor_probe::CursorProbe {
-        let slice = self.cursor_probe_gpu.staging_buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        // Pump the device until the map_async callback fires. The
-        // copy was scheduled in the previous submit() so GPU work
-        // is already done or in flight; the poll turns a potentially
-        // long wait into a tight drain.
-        let _ = self.device.poll(wgpu::PollType::Wait);
-        match rx.recv() {
-            Ok(Ok(())) => {}
-            _ => return cursor_probe::CursorProbe::default(),
-        }
-        let raw_bytes = slice.get_mapped_range();
-        let raw: &cursor_probe::CursorProbeRaw = bytemuck::from_bytes(&raw_bytes);
-        let decoded = cursor_probe::CursorProbe::decode(raw);
-        drop(raw_bytes);
-        self.cursor_probe_gpu.staging_buffer.unmap();
-        decoded
     }
 
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {

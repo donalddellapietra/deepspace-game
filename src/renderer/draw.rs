@@ -183,25 +183,6 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        // Cursor-probe compute pass — one ray from the crosshair
-        // using the same `march()` the fragment shader uses. Output
-        // is copied to the staging buffer so the CPU can map it
-        // between frames for the highlight uniform + break/place.
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cursor_probe"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.cursor_probe_gpu.pipeline);
-            cpass.set_bind_group(0, &self.bind_group, &[]);
-            cpass.set_bind_group(1, &self.cursor_probe_gpu.bind_group, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
-        encoder.copy_buffer_to_buffer(
-            &self.cursor_probe_gpu.output_buffer, 0,
-            &self.cursor_probe_gpu.staging_buffer, 0,
-            super::cursor_probe::CURSOR_PROBE_BYTES,
-        );
         if use_blit {
             let src_view = scaled_view.as_ref().unwrap();
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -401,22 +382,6 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        // Cursor-probe compute pass (same as in `render()`).
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cursor_probe"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.cursor_probe_gpu.pipeline);
-            cpass.set_bind_group(0, &self.bind_group, &[]);
-            cpass.set_bind_group(1, &self.cursor_probe_gpu.bind_group, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
-        encoder.copy_buffer_to_buffer(
-            &self.cursor_probe_gpu.output_buffer, 0,
-            &self.cursor_probe_gpu.staging_buffer, 0,
-            super::cursor_probe::CURSOR_PROBE_BYTES,
-        );
         if use_blit {
             let src_view = scaled_view.as_ref().unwrap();
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
