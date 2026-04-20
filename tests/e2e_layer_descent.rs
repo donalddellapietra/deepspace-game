@@ -299,6 +299,8 @@ fn descent_sees_sky_and_breaks_at_every_layer() {
     script = script.emit("descent_end");
 
     let trace = run(HARNESS_ARGS, &script);
+    let _ = std::fs::write(dir.join("stdout.log"), &trace.stdout);
+    let _ = std::fs::write(dir.join("stderr.log"), &trace.stderr);
 
     assert!(
         trace.exit_success,

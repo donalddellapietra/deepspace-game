@@ -148,12 +148,26 @@ impl CursorProbe_Gpu {
             push_constant_ranges: &[],
         });
 
+        // Probe-only overrides: disable the fragment shader's LOD
+        // pixel cutoff so the walker always descends to the library
+        // leaf, regardless of ray distance. Fragment rendering keeps
+        // Nyquist LOD for performance; the probe is a single ray per
+        // frame, so making it deep-walk costs ~microseconds and lets
+        // edits operate at the user's anchor depth even when the
+        // visible surface LOD terminates at a coarser cell.
+        let override_constants: [(&str, f64); 2] = [
+            ("LOD_PIXEL_THRESHOLD", 0.0),
+            ("ENABLE_STATS", 0.0),
+        ];
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("cursor_probe"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("cs_cursor_probe"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &override_constants,
+                zero_initialize_workgroup_memory: false,
+            },
             cache: None,
         });
 

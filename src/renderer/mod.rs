@@ -268,6 +268,36 @@ impl Renderer {
         decoded
     }
 
+    /// Encode a fresh cursor-probe dispatch, submit, wait, and read.
+    /// Use this when the camera state changed THIS frame (e.g. a
+    /// scripted pitch rotation in the harness) and the previous
+    /// frame's probe result is stale. The per-frame render path's
+    /// readback in `read_cursor_probe` reuses the pipeline's staging
+    /// buffer; this variant submits a standalone compute + copy so
+    /// the current uniforms drive the ray.
+    pub fn dispatch_and_read_cursor_probe_sync(&self) -> cursor_probe::CursorProbe {
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("cursor_probe_sync") },
+        );
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cursor_probe_sync"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.cursor_probe_gpu.pipeline);
+            cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.set_bind_group(1, &self.cursor_probe_gpu.bind_group, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.cursor_probe_gpu.output_buffer, 0,
+            &self.cursor_probe_gpu.staging_buffer, 0,
+            cursor_probe::CURSOR_PROBE_BYTES,
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.read_cursor_probe()
+    }
+
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {
         match aabb {
             Some((min, max)) => {
