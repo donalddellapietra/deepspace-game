@@ -11,7 +11,7 @@ use crate::bridge::{CrosshairStateJs, GameStateUpdate};
 use crate::overlay;
 use crate::world::aabb;
 
-use crate::app::{App, HighlightCacheKey};
+use crate::app::{ActiveFrameKind, App, HighlightCacheKey};
 
 impl App {
     pub(in crate::app) fn update_highlight(&mut self) {
@@ -70,9 +70,12 @@ impl App {
                 tree_hit.is_some(),
             );
         }
-        let aabb = tree_hit
-            .as_ref()
-            .map(|hit| aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path));
+        let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
+            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, hit),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
+            }
+        });
         let set_start = web_time::Instant::now();
         if let Some(renderer) = &mut self.renderer {
             renderer.set_highlight(aabb);

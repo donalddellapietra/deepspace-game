@@ -1,9 +1,16 @@
-//! World-space AABBs for ray-march hits. `hit_aabb` walks world-space
-//! (used from outside any frame); `hit_aabb_in_frame_local` expresses
-//! the AABB relative to the current render frame so UI can draw it
-//! without f32 precision loss at deep layers.
+//! World-space AABBs for ray-march hits. Two variants handle the
+//! two coordinate systems: `hit_aabb` walks world-space, while
+//! `hit_aabb_in_frame_local` expresses the AABB relative to the
+//! current render frame for UI precision at deep layers.
+//!
+//! Sphere hits take a different path: once the hit crosses a
+//! `CubedSphereBody` ancestor, the remaining slots are `(u, v, r)`
+//! in face-local coords and the AABB comes from projecting the
+//! cell's eight corners into world space via
+//! `cubesphere::face_space_to_body_point`.
 
 use super::anchor::{Path, WORLD_SIZE};
+use super::cubesphere::{self, face_space_to_body_point, find_body_ancestor_in_path, Face, FACE_SLOTS};
 use super::raycast::HitInfo;
 use super::tree::{slot_coords, NodeLibrary};
 
@@ -43,7 +50,93 @@ pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [
     (min, [min[0] + extent, min[1] + extent, min[2] + extent])
 }
 
-pub fn hit_aabb(_library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+/// Body-local AABB for a sphere hit: the eight corners of the
+/// face-subtree cell, expressed in the body cell's local frame
+/// (so the highlight shader gets a precise box regardless of how
+/// deep the render frame has popped).
+pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+    let Some((body_index, inner_r, outer_r)) =
+        find_body_ancestor_in_path(library, &hit.path)
+    else {
+        return hit_aabb_in_frame_local(hit, &Path::root());
+    };
+
+    let Some(&(_, face_slot)) = hit.path.get(body_index + 1) else {
+        return ([0.0; 3], [WORLD_SIZE; 3]);
+    };
+    let Some(face_index) = (0..6).find(|&f| FACE_SLOTS[f] == face_slot) else {
+        return ([0.0; 3], [WORLD_SIZE; 3]);
+    };
+    let face = Face::from_index(face_index as u8);
+
+    let (iu, iv, ir, depth) = face_cell_indices(&hit.path[body_index + 2..]);
+    let cells = if depth == 0 { 1.0 } else { 3.0_f32.powi(depth as i32) };
+    let un0 = iu as f32 / cells;
+    let vn0 = iv as f32 / cells;
+    let rn0 = ir as f32 / cells;
+    let du = 1.0 / cells;
+
+    let corners = [
+        face_space_to_body_point(face, un0,      vn0,      rn0,      inner_r, outer_r, WORLD_SIZE),
+        face_space_to_body_point(face, un0 + du, vn0,      rn0,      inner_r, outer_r, WORLD_SIZE),
+        face_space_to_body_point(face, un0,      vn0 + du, rn0,      inner_r, outer_r, WORLD_SIZE),
+        face_space_to_body_point(face, un0 + du, vn0 + du, rn0,      inner_r, outer_r, WORLD_SIZE),
+        face_space_to_body_point(face, un0,      vn0,      rn0 + du, inner_r, outer_r, WORLD_SIZE),
+        face_space_to_body_point(face, un0 + du, vn0,      rn0 + du, inner_r, outer_r, WORLD_SIZE),
+        face_space_to_body_point(face, un0,      vn0 + du, rn0 + du, inner_r, outer_r, WORLD_SIZE),
+        face_space_to_body_point(face, un0 + du, vn0 + du, rn0 + du, inner_r, outer_r, WORLD_SIZE),
+    ];
+    bounding_box(&corners)
+}
+
+pub fn hit_aabb(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+    // Sphere hit: compute world-space box via body-local path + face
+    // coords. We reuse `hit_aabb_body_local` and translate by the
+    // body cell's world-space origin (walk the Cartesian prefix of
+    // the hit path).
+    if let Some((body_index, _inner_r, _outer_r)) =
+        find_body_ancestor_in_path(library, &hit.path)
+    {
+        // Accumulate the body cell's origin in world coords by
+        // walking the Cartesian prefix (everything before the body).
+        let mut origin = [0.0f32; 3];
+        let mut cell_size = 1.0f32;
+        for &(_, slot) in hit.path.iter().take(body_index) {
+            let (x, y, z) = slot_coords(slot);
+            origin = [
+                origin[0] + x as f32 * cell_size,
+                origin[1] + y as f32 * cell_size,
+                origin[2] + z as f32 * cell_size,
+            ];
+            cell_size /= 3.0;
+        }
+        let (x, y, z) = slot_coords(hit.path[body_index].1);
+        let body_origin = [
+            origin[0] + x as f32 * cell_size,
+            origin[1] + y as f32 * cell_size,
+            origin[2] + z as f32 * cell_size,
+        ];
+        let body_size = cell_size;
+        // `hit_aabb_body_local` returns the AABB in body-local coords
+        // where the body spans `[0, WORLD_SIZE)^3`; rescale and offset
+        // into world coords.
+        let scale = body_size / WORLD_SIZE;
+        let (bl_min, bl_max) = hit_aabb_body_local(library, hit);
+        return (
+            [
+                body_origin[0] + bl_min[0] * scale,
+                body_origin[1] + bl_min[1] * scale,
+                body_origin[2] + bl_min[2] * scale,
+            ],
+            [
+                body_origin[0] + bl_max[0] * scale,
+                body_origin[1] + bl_max[1] * scale,
+                body_origin[2] + bl_max[2] * scale,
+            ],
+        );
+    }
+
+    // Purely Cartesian hit.
     let mut origin = [0.0f32; 3];
     let mut cell_size = 1.0f32;
     for &(_, slot) in &hit.path {
@@ -66,3 +159,37 @@ fn hit_path_slots(hit: &HitInfo) -> Path {
     }
     path
 }
+
+/// Accumulate face-subtree slot indices through the given path slice.
+/// Each slot contributes one base-3 digit per (u, v, r) axis.
+fn face_cell_indices(face_path: &[(super::tree::NodeId, usize)]) -> (u32, u32, u32, u32) {
+    let mut iu = 0u32;
+    let mut iv = 0u32;
+    let mut ir = 0u32;
+    let mut depth = 0u32;
+    for &(_, slot) in face_path {
+        let (us, vs, rs) = slot_coords(slot);
+        iu = iu * 3 + us as u32;
+        iv = iv * 3 + vs as u32;
+        ir = ir * 3 + rs as u32;
+        depth += 1;
+    }
+    (iu, iv, ir, depth)
+}
+
+fn bounding_box(corners: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+    let mut min = corners[0];
+    let mut max = corners[0];
+    for c in &corners[1..] {
+        for k in 0..3 {
+            if c[k] < min[k] { min[k] = c[k]; }
+            if c[k] > max[k] { max[k] = c[k]; }
+        }
+    }
+    (min, max)
+}
+
+// Silence unused import when sphere-specific helpers are only used
+// via module-qualified paths in tests.
+#[allow(dead_code)]
+fn _cubesphere_used() -> Face { cubesphere::Face::PosX }

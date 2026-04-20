@@ -184,6 +184,7 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
+                "--sphere-world" => { cfg.world_preset = WorldPreset::DemoSphere; }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
                 "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
                 "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }

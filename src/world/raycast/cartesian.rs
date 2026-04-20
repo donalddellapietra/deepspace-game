@@ -1,8 +1,11 @@
 //! Cartesian stack-based DDA. CPU mirror of the shader's
-//! `march_cartesian`. Walks the unified tree in XYZ slot order.
+//! `march_cartesian`. Walks the unified tree in XYZ slot order and
+//! dispatches into `sphere::cs_raycast` when it descends into a
+//! `CubedSphereBody` child.
 
+use super::sphere;
 use super::HitInfo;
-use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Stack frame for iterative DDA traversal.
 pub(super) struct Frame {
@@ -15,15 +18,15 @@ pub(super) struct Frame {
 
 /// Stack-based Cartesian DDA over the unified tree. `max_depth`
 /// caps how deep the walker descends; the deepest cell at that
-/// depth is the hit granularity. `_max_face_depth` is a no-op seam
-/// kept for API parity with coord-system dispatching callers.
+/// depth is the hit granularity. `max_face_depth` is propagated
+/// into sphere dispatch when the DDA crosses a body cell.
 pub(super) fn cpu_raycast_with_face_depth(
     library: &NodeLibrary,
     root: NodeId,
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
-    _max_face_depth: u32,
+    max_face_depth: u32,
 ) -> Option<HitInfo> {
     let inv_dir = [
         if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
@@ -122,6 +125,30 @@ pub(super) fn cpu_raycast_with_face_depth(
             }
             Child::Node(child_id) => {
                 let child_node = library.get(child_id)?;
+
+                // Sphere body dispatch: hand off to the sphere DDA
+                // with the body cell's current-frame origin/size.
+                if let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind {
+                    let parent_origin = stack[depth].node_origin;
+                    let parent_cell_size = stack[depth].cell_size;
+                    let body_origin = [
+                        parent_origin[0] + cell[0] as f32 * parent_cell_size,
+                        parent_origin[1] + cell[1] as f32 * parent_cell_size,
+                        parent_origin[2] + cell[2] as f32 * parent_cell_size,
+                    ];
+                    if let Some(hit) = sphere::cs_raycast(
+                        library, child_id, body_origin, parent_cell_size,
+                        inner_r, outer_r,
+                        ray_origin, ray_dir,
+                        &path[..=depth],
+                        max_face_depth,
+                        None,
+                    ) {
+                        return Some(hit);
+                    }
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
 
                 // Short-circuit fully-empty subtrees at any depth.
                 // Without this, the DDA descends into uniform-air

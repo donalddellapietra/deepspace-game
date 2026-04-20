@@ -2,6 +2,7 @@
 
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
+#include "sphere.wgsl"
 #include "march.wgsl"
 
 struct VertexOutput {

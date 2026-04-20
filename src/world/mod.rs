@@ -1,6 +1,7 @@
 pub mod aabb;
 pub mod anchor;
 pub mod bootstrap;
+pub mod cubesphere;
 pub mod edit;
 pub mod entities;
 pub mod fractals;

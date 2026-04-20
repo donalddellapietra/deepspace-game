@@ -1,6 +1,7 @@
 #include "bindings.wgsl"
 #include "tree.wgsl"
 #include "ray_prim.wgsl"
+#include "sphere.wgsl"
 
 // Cell-packing helpers. Cell coords at each depth range -1..=3
 // (legal 0..=2 plus ±1 over-step to trigger pop). Pack +1-shifted
@@ -552,6 +553,30 @@ fn march_cartesian(
                 continue;
             }
 
+            // Sphere body dispatch: a CubedSphereBody child hands off
+            // to the sphere DDA. On miss, advance Cartesian DDA past.
+            let kind = node_kinds[child_idx].kind;
+            if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
+            if kind == 1u {
+                let body_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                let body_size = cur_cell_size;
+                let inner_r = node_kinds[child_idx].inner_r;
+                let outer_r = node_kinds[child_idx].outer_r;
+                if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 2u; }
+                let sph = sphere_in_cell(
+                    child_idx, body_origin, body_size,
+                    inner_r, outer_r,
+                    ray_origin, ray_dir,
+                    0u, 0u, vec4<f32>(0.0),
+                );
+                if sph.hit { return sph; }
+                let m_sph = min_axis_mask(cur_side_dist);
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_sph) * step);
+                cur_side_dist += m_sph * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_sph;
+                continue;
+            }
+
             // Empty-representative fast path: when the packed
             // child's representative_block is 255, the subtree has
             // no non-empty content (either uniform-empty deeper in
@@ -795,11 +820,30 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
-        // Cartesian frame: no depth cap beyond the hardware stack
-        // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
-        // visual LOD gate — rays stop descending when cells fall
-        // below the pixel floor.
-        var r: HitResult = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
+        // Frame-root dispatch on NodeKind-backed uniform.
+        //   CARTESIAN → Cartesian DDA.
+        //   BODY      → whole-sphere march; body fills [0, 3)³.
+        //   FACE      → bounded face-window march; body fills [0, 3)³.
+        // `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole visual LOD
+        // gate in all three cases.
+        var r: HitResult;
+        if uniforms.root_kind == ROOT_KIND_BODY {
+            r = sphere_in_cell(
+                current_idx, vec3<f32>(0.0), 3.0,
+                uniforms.root_radii.x, uniforms.root_radii.y,
+                ray_origin, ray_dir,
+                0u, 0u, vec4<f32>(0.0),
+            );
+        } else if uniforms.root_kind == ROOT_KIND_FACE {
+            r = sphere_in_cell(
+                current_idx, vec3<f32>(0.0), 3.0,
+                uniforms.root_radii.x, uniforms.root_radii.y,
+                ray_origin, ray_dir,
+                1u, uniforms.root_face_meta.x, uniforms.root_face_bounds,
+            );
+        } else {
+            r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
+        }
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;

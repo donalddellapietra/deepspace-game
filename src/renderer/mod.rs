@@ -43,11 +43,10 @@ pub enum EntityRenderMode {
 pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `ROOT_KIND_*`
-/// constants in `bindings.wgsl`. Only `ROOT_KIND_CARTESIAN` is
-/// populated today; the remaining discriminant values are reserved
-/// as a plug-in seam for coordinate systems that layer onto the
-/// Cartesian substrate.
+/// constants in `bindings.wgsl`.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
+pub const ROOT_KIND_BODY: u32 = 1;
+pub const ROOT_KIND_FACE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -271,13 +270,41 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian (the only variant
-    /// today).
+    /// Frame root is Cartesian.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
+        self.root_face_pop_pos = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Frame root IS a CubedSphereBody cell — shader dispatches the
+    /// whole-sphere march.
+    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
+        self.root_kind = ROOT_KIND_BODY;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_meta = [0; 4];
+        self.root_face_bounds = [0.0; 4];
+        self.root_face_pop_pos = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Frame root is inside a face subtree — shader dispatches the
+    /// bounded face-window march. `bounds = (u_min, v_min, r_min,
+    /// size)` in normalized face coords.
+    pub fn set_root_kind_face(
+        &mut self,
+        inner_r: f32,
+        outer_r: f32,
+        face_id: u32,
+        bounds: [f32; 4],
+    ) {
+        self.root_kind = ROOT_KIND_FACE;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_meta = [face_id, 0, 0, 0];
+        self.root_face_bounds = bounds;
         self.root_face_pop_pos = [0.0; 4];
         self.write_uniforms();
     }

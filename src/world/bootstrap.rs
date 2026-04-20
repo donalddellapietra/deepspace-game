@@ -17,6 +17,9 @@ use std::collections::HashMap;
 pub enum WorldPreset {
     #[default]
     PlainTest,
+    /// Demo cubed-sphere planet. Body at world root's center slot,
+    /// smooth (no noise), stone core, grass surface.
+    DemoSphere,
     /// Menger sponge — canonical ternary fractal. Each non-empty
     /// cell subdivides into 20 non-empty + 7 empty children (the 7
     /// are the cube centroid + 6 face centroids). 74% occupancy
@@ -91,10 +94,11 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         // Imported .vox worlds embed the model in a plain world;
         // they inherit the same sea level.
         WorldPreset::VoxModel { .. } => Some(PLAIN_SURFACE_Y),
-        // Every fractal preset leaves entities to fly freely —
-        // they don't have a single horizontal ground plane
+        // Every fractal / sphere preset leaves entities to fly
+        // freely — they don't have a single horizontal ground plane
         // that a constant sea-level Y could track.
-        WorldPreset::Menger
+        WorldPreset::DemoSphere
+        | WorldPreset::Menger
         | WorldPreset::SierpinskiTet
         | WorldPreset::CantorDust
         | WorldPreset::JerusalemCross
@@ -108,6 +112,9 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
 
 pub struct WorldBootstrap {
     pub world: WorldState,
+    /// Path from world root to a cubed-sphere body, if one was
+    /// planted during bootstrap. `None` for Cartesian-only presets.
+    pub planet_path: Option<Path>,
     /// Spawn position as a path-anchored `WorldPos`. Constructed at
     /// shallow depth (where f32 decomposition is precise) then
     /// `deepened_to` the target anchor depth via pure slot arithmetic.
@@ -125,6 +132,7 @@ pub struct WorldBootstrap {
 
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
     match preset {
+        WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
         WorldPreset::Menger => crate::world::fractals::menger::bootstrap_menger_world(
             plain_layers.unwrap_or(8),
@@ -356,6 +364,7 @@ pub(crate) fn bootstrap_vox_model_world(
 
     WorldBootstrap {
         world,
+            planet_path: None,
         default_spawn_pos: spawn_pos,
         default_spawn_yaw: yaw,
         default_spawn_pitch: pitch,
@@ -734,10 +743,50 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
     // after the final spawn position is known.
     WorldBootstrap {
         world,
+        planet_path: None,
         default_spawn_pos: spawn_pos,
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -0.45,
         plain_layers,
+        color_registry: crate::world::palette::ColorRegistry::new(),
+    }
+}
+
+/// Demo-sphere bootstrap: plant a smooth cubed-sphere planet at the
+/// world root's center slot, spawn the camera just above the outer
+/// surface looking down onto it.
+fn bootstrap_demo_sphere_world() -> WorldBootstrap {
+    use crate::world::cubesphere;
+    let mut world = crate::world::worldgen::generate_world();
+    let setup = cubesphere::demo_planet();
+    let (new_root, planet_path) = cubesphere::install_at_root_center(
+        &mut world.library,
+        world.root,
+        &setup,
+    );
+    world.swap_root(new_root);
+    let tree_depth = world.tree_depth();
+    eprintln!(
+        "Demo sphere world: planet_path={:?}, library_entries={}, depth={}",
+        planet_path.as_slice(),
+        world.library.len(),
+        tree_depth,
+    );
+    let body_top_y = 1.5 + setup.outer_r;
+    // Depth 2 where f32 decomposition is precise, then deepen by
+    // pure slot arithmetic.
+    let spawn_pos = WorldPos::from_frame_local(
+        &Path::root(),
+        [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5],
+        2,
+    ).deepened_to(16);
+    WorldBootstrap {
+        world,
+        planet_path: Some(planet_path),
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: 0.0,
+        default_spawn_pitch: -1.2,
+        plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }

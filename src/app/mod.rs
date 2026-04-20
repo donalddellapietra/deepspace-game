@@ -147,6 +147,10 @@ pub struct App {
     pub(super) debug_overlay_visible: bool,
     pub(super) fps_smooth: f64,
     pub(super) startup_profile_frames: u32,
+    /// Path from world root to the planet body (if the world has
+    /// one). Used by sphere-focus camera logic; `None` for worlds
+    /// without a cubed-sphere preset.
+    pub(super) planet_path: Option<Path>,
     /// The actual frame the renderer is using right now. This may
     /// be shallower than `render_frame()` when GPU packing flattened
     /// a slot on the intended path and `build_ribbon` had to stop
@@ -432,6 +436,7 @@ impl App {
             debug_overlay_visible: false,
             fps_smooth: 0.0,
             startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
+            planet_path: bootstrap.planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
             last_lod_upload_key: None,
@@ -519,6 +524,8 @@ impl App {
     pub(super) fn render_frame_kind(&self) -> NodeKind {
         match self.render_frame().kind {
             ActiveFrameKind::Cartesian => NodeKind::Cartesian,
+            ActiveFrameKind::Body { inner_r, outer_r } => NodeKind::CubedSphereBody { inner_r, outer_r },
+            ActiveFrameKind::Sphere(s) => NodeKind::CubedSphereFace { face: s.face },
         }
     }
 
@@ -581,7 +588,15 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = self.camera.position.in_frame(&frame.render_path);
+        // Sphere frames keep the linear render root at the body cell,
+        // so the camera is expressed in body-local coords regardless
+        // of how deep the logical frame descends into the face.
+        let cam_local = match frame.kind {
+            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                self.camera.position.in_frame(&frame.render_path)
+            }
+        };
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",

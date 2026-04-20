@@ -1,5 +1,5 @@
-//! CPU raycasting — Cartesian DDA, frame-aware ribbon pops, and point
-//! solidity queries.
+//! CPU raycasting — Cartesian DDA, cubed-sphere shell march, frame-
+//! aware ribbon pops, and point solidity queries.
 //!
 //! The CPU ray march mirrors the GPU shader's tree traversal so that
 //! the cell the crosshair targets is the same cell the shader is
@@ -8,8 +8,11 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
+mod sphere;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
+pub use sphere::FaceWindow;
+
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 pub(super) const MAX_FACE_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
 
@@ -73,10 +76,24 @@ pub fn cpu_raycast_in_frame(
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
 
-        let hit_opt = cartesian::cpu_raycast_with_face_depth(
-            library, frame_root_id, ray_origin, ray_dir,
-            inner_max, max_face_depth,
-        );
+        // Dispatch on the frame root's NodeKind. A CubedSphereBody
+        // frame-root hands off to the sphere DDA directly — the
+        // body fills the frame's [0, 3)³ bubble.
+        let frame_kind = library.get(frame_root_id).map(|n| n.kind);
+        let hit_opt = if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
+            sphere::cs_raycast(
+                library, frame_root_id, [0.0; 3], 3.0,
+                inner_r, outer_r,
+                ray_origin, ray_dir,
+                &[], max_face_depth,
+                None,
+            )
+        } else {
+            cartesian::cpu_raycast_with_face_depth(
+                library, frame_root_id, ray_origin, ray_dir,
+                inner_max, max_face_depth,
+            )
+        };
 
         if let Some(mut hit) = hit_opt {
             prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
@@ -99,6 +116,44 @@ pub fn cpu_raycast_in_frame(
         ];
         ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
         current_frame_depth -= 1;
+    }
+}
+
+/// Frame-aware raycast for a sphere sub-frame (render root lives
+/// inside a face subtree). The linear render frame stays rooted at
+/// the containing body cell; the face window tells the sphere DDA
+/// which absolute UVR region the render frame covers.
+///
+/// Camera coords are expressed in the body cell's frame (`[0, 3)³`).
+/// `ray_dir` is the world-axis direction in body-local orientation
+/// (shared between Cartesian and sphere because a body cell is
+/// axis-aligned with its parent's frame).
+pub fn cpu_raycast_in_sphere_frame(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    body_path: &[u8],
+    cam_body: [f32; 3],
+    ray_dir: [f32; 3],
+    max_face_depth: u32,
+    window: FaceWindow,
+    inner_r: f32,
+    outer_r: f32,
+) -> Option<HitInfo> {
+    let (chain, frame_entries) = build_frame_chain(library, world_root, body_path);
+    let effective_depth = chain.len() - 1;
+    let body_node_id = chain[effective_depth];
+    let hit = sphere::cs_raycast(
+        library, body_node_id, [0.0; 3], 3.0,
+        inner_r, outer_r,
+        cam_body, ray_dir,
+        &[], max_face_depth,
+        Some(window),
+    );
+    if let Some(mut hit) = hit {
+        prepend_frame_entries(&mut hit, &frame_entries[..effective_depth], effective_depth);
+        Some(hit)
+    } else {
+        None
     }
 }
 
@@ -294,6 +349,51 @@ mod tests {
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6,
         ).expect("should hit ground");
         assert_eq!(hit.path[0].0, world.root);
+    }
+
+    #[test]
+    fn planet_world_raycast_hits_sphere() {
+        use crate::world::cubesphere::{demo_planet, install_at_root_center};
+        use crate::world::worldgen::generate_world;
+
+        let mut world = generate_world();
+        let setup = demo_planet();
+        let (new_root, _planet_path) =
+            install_at_root_center(&mut world.library, world.root, &setup);
+        world.swap_root(new_root);
+
+        // Camera just above the planet looking straight down. The
+        // sphere is at [1.5, 1.5, 1.5] with outer_r=0.45.
+        let hit = cpu_raycast_in_frame(
+            &world.library, world.root,
+            &[], [1.5, 2.0, 1.5], [0.0, -1.0, 0.0],
+            30, setup.depth,
+        );
+        assert!(hit.is_some(), "ray should hit the planet");
+        let h = hit.unwrap();
+        assert!(h.path.len() >= 2, "hit path should descend into body");
+    }
+
+    #[test]
+    fn planet_world_cartesian_descend_triggers_sphere_dispatch() {
+        use crate::world::cubesphere::{demo_planet, install_at_root_center};
+        use crate::world::worldgen::generate_world;
+
+        let mut world = generate_world();
+        let setup = demo_planet();
+        let (new_root, _planet_path) =
+            install_at_root_center(&mut world.library, world.root, &setup);
+        world.swap_root(new_root);
+
+        // Start from outside the body cell so the Cartesian DDA must
+        // descend into slot 13 and dispatch sphere. Camera [1.5, 2.5,
+        // 1.5] is in slot y=2 (above the body slot).
+        let hit = cpu_raycast_in_frame(
+            &world.library, world.root,
+            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
+            30, setup.depth,
+        );
+        assert!(hit.is_some(), "Cartesian DDA should cross into body cell and dispatch sphere");
     }
 
     #[test]

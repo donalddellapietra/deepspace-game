@@ -79,6 +79,12 @@ impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
             NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
+            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
+                kind: 1, face: 0, inner_r, outer_r,
+            },
+            NodeKind::CubedSphereFace { face } => Self {
+                kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
+            },
         }
     }
 }

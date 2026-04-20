@@ -1,8 +1,10 @@
 //! Break / place / highlight / zoom / GPU upload on the `App`.
 //!
 //! All edits go through the unified frame-aware raycast →
-//! `break_block` / `place_block` pipeline on the Cartesian
-//! active frame.
+//! `break_block` / `place_block` pipeline. Cartesian frames use the
+//! linear Cartesian raycast; sphere frames (render root inside a
+//! face subtree) dispatch through `cpu_raycast_in_sphere_frame` with
+//! the face window derived from the active frame.
 
 mod break_place;
 mod highlight;
@@ -13,7 +15,7 @@ mod zoom;
 use crate::world::anchor::Path;
 use crate::world::{aabb, raycast};
 
-use super::App;
+use super::{ActiveFrameKind, App};
 
 /// CPU-side ceiling for `visual_depth()`. Picked equal to the
 /// tree's absolute max so callers aren't artificially capped.
@@ -53,31 +55,56 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
-        let (hit, cap_frame_path) = {
-            // Raycast from the render frame — f32 can only represent
-            // positions a few levels deeper than the frame root.
-            // The pop loop handles finding hits at coarser depths
-            // via slot-arithmetic frame transitions.
-            let frame_path = self.active_frame.render_path;
-            let cam_local = self.camera.position.in_frame(&frame_path);
-            let ray_dir = self.ray_dir_in_frame(&frame_path);
-            let hit = raycast::cpu_raycast_in_frame(
-                &self.world.library,
-                self.world.root,
-                frame_path.as_slice(),
-                cam_local,
-                ray_dir,
-                self.edit_depth(),
-                self.cs_edit_depth(),
-            );
-            if hit.is_none() && self.startup_profile_frames < 16 {
-                eprintln!(
-                    "frame_raycast_cartesian_miss edit_depth={} render_path={:?}",
-                    self.edit_depth(),
-                    frame_path.as_slice(),
+        let (hit, cap_frame_path) = match self.active_frame.kind {
+            ActiveFrameKind::Sphere(sphere) => {
+                let cam_body = self.camera.position.in_frame(&sphere.body_path);
+                let ray_dir = self.ray_dir_in_frame(&sphere.body_path);
+                let window = raycast::FaceWindow {
+                    face: sphere.face as u32,
+                    u_min: sphere.face_u_min,
+                    v_min: sphere.face_v_min,
+                    r_min: sphere.face_r_min,
+                    size: sphere.face_size,
+                };
+                let hit = raycast::cpu_raycast_in_sphere_frame(
+                    &self.world.library,
+                    self.world.root,
+                    sphere.body_path.as_slice(),
+                    cam_body,
+                    ray_dir,
+                    self.cs_edit_depth(),
+                    window,
+                    sphere.inner_r,
+                    sphere.outer_r,
                 );
+                (hit, sphere.body_path)
             }
-            (hit, frame_path)
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                // Raycast from the render frame — f32 can only
+                // represent positions a few levels deeper than the
+                // frame root. The pop loop handles finding hits at
+                // coarser depths via slot arithmetic.
+                let frame_path = self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame(&frame_path);
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let hit = raycast::cpu_raycast_in_frame(
+                    &self.world.library,
+                    self.world.root,
+                    frame_path.as_slice(),
+                    cam_local,
+                    ray_dir,
+                    self.edit_depth(),
+                    self.cs_edit_depth(),
+                );
+                if hit.is_none() && self.startup_profile_frames < 16 {
+                    eprintln!(
+                        "frame_raycast_miss edit_depth={} render_path={:?}",
+                        self.edit_depth(),
+                        frame_path.as_slice(),
+                    );
+                }
+                (hit, frame_path)
+            }
         };
         // Enforce the interaction radius gate: drop hits beyond
         // `interaction_radius_cells × anchor_cell_size`. Same
@@ -112,8 +139,14 @@ impl App {
                 hit.is_some(),
             );
             if let Some(ref h) = hit {
-                let (aabb_min, aabb_max) =
-                    aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path);
+                let (aabb_min, aabb_max) = match self.active_frame.kind {
+                    ActiveFrameKind::Sphere(_) => {
+                        aabb::hit_aabb_body_local(&self.world.library, h)
+                    }
+                    ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                        aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
+                    }
+                };
                 eprintln!(
                     "frame_raycast_hit path_len={} face={} t={} place_path_len={:?} terminal={} aabb_min={:?} aabb_max={:?} path_kinds={:?}",
                     h.path.len(),
@@ -183,7 +216,9 @@ impl App {
                 slot
             ));
             match child_kind {
-                Some(NodeKind::Cartesian) => {
+                Some(NodeKind::Cartesian)
+                | Some(NodeKind::CubedSphereBody { .. })
+                | Some(NodeKind::CubedSphereFace { .. }) => {
                     node_id = child_id;
                 }
                 None => break,

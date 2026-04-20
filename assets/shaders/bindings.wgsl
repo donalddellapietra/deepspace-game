@@ -61,6 +61,8 @@ struct Uniforms {
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
+const ROOT_KIND_BODY: u32 = 1u;
+const ROOT_KIND_FACE: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:

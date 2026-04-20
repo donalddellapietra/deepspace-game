@@ -89,6 +89,7 @@ pub(crate) fn bootstrap_mausoleum_world(depth: u8) -> WorldBootstrap {
     .deepened_to(8);
     WorldBootstrap {
         world,
+            planet_path: None,
         default_spawn_pos: spawn_pos,
         default_spawn_yaw: std::f32::consts::FRAC_PI_4,
         default_spawn_pitch: -0.615,
