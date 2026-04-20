@@ -188,18 +188,52 @@ pub struct TimestampScratch {
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian. With the unified
-    /// Cartesian walker this is the only dispatch mode — sphere
-    /// silhouettes are handled inside `march_cartesian` via a
-    /// ray-sphere pre-clip on CubedSphereBody children. The old
-    /// sphere-specific uniforms (root_radii / root_face_meta /
-    /// root_face_bounds / root_face_pop_pos) are kept in the buffer
-    /// layout for now but unused by the shader; zeroed here.
+    /// Render root is a plain Cartesian node. The shader walks it
+    /// via `march_cartesian`; any `CubedSphereBody` child
+    /// encountered during descent is handled by
+    /// `march_cartesian`'s `kind == 1u` branch.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
+        self.root_face_pop_pos = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Render root is the body cell itself. Shader dispatches
+    /// `sphere_in_cell` with body at `(0, 0, 0)..(3, 3, 3)` in
+    /// render frame. `inner_r`/`outer_r` in body-cell-local units.
+    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
+        self.root_kind = ROOT_KIND_BODY;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        // Body at render-frame origin, size 3.
+        self.root_face_bounds = [0.0, 0.0, 0.0, 3.0];
+        self.root_face_meta = [0; 4];
+        self.root_face_pop_pos = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Render root is inside a face subtree (Sphere face_depth >= 1).
+    /// The body's bounding box in render-frame coords is shipped so
+    /// the shader can dispatch `sphere_in_cell` with precision-safe
+    /// body-relative math at any anchor depth.
+    pub fn set_root_kind_sphere(
+        &mut self,
+        inner_r: f32,
+        outer_r: f32,
+        body_corner_in_frame: [f32; 3],
+        body_size_in_frame: f32,
+    ) {
+        self.root_kind = ROOT_KIND_FACE;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_bounds = [
+            body_corner_in_frame[0],
+            body_corner_in_frame[1],
+            body_corner_in_frame[2],
+            body_size_in_frame,
+        ];
+        self.root_face_meta = [0; 4];
         self.root_face_pop_pos = [0.0; 4];
         self.write_uniforms();
     }

@@ -238,56 +238,39 @@ fn march_cartesian(
                 continue;
             }
 
-            // Sphere-SDF pre-clip for CubedSphereBody children.
+            // CubedSphereBody child: dispatch the curved sphere DDA
+            // (`sphere_in_cell`) with the body's bounding box
+            // expressed in the caller's render frame. All math
+            // inside `sphere_in_cell` is precision-bounded to this
+            // body's outer radius — no body-frame-absolute hardcodes,
+            // so the ULP wall that crippled the previous iterations
+            // of this code at deep anchor is gone.
             //
-            // The body cell contains 6 face subtrees on face-center
-            // slots, a uniform interior filler in the center slot, and
-            // 20 empty corner slots. Cartesian DDA inside the body is
-            // what walks the voxel terrain, but the outer silhouette
-            // needs to be the smooth sphere — the voxel content at the
-            // outer shell is faceted cubic cells.
-            //
-            // Solution: analytic ray-sphere test in the local frame
-            // (center = body cell center, radius = outer_r *
-            // cell_size). Rays that miss the outer sphere skip the
-            // body cell entirely — no silhouette leak. Rays that hit
-            // descend into the body as a normal 27-ary Cartesian node;
-            // worldgen guarantees voxels only exist inside the sphere,
-            // so voxel hits sample the actual terrain.
-            //
-            // Precision: center and radius live in the current frame's
-            // local coords (cur_node_origin + cell * cur_cell_size),
-            // bounded by the frame's [0, 3)³ box. No body-frame 1.5
-            // absolute math, no ULP wall at deep anchor.
+            // Voxel content is stored in u/v/r face subtree slots
+            // (worldgen samples SDF at spherical positions), so the
+            // walker's r-axis corresponds to local radial at every
+            // (u, v). Stacking rs+1 builds radially outward anywhere
+            // on the sphere.
             let kind = node_kinds[child_idx].kind;
             if kind == 1u {
+                let inner_r = node_kinds[child_idx].inner_r;
                 let outer_r = node_kinds[child_idx].outer_r;
                 let body_origin_sph = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-                let body_size_sph = cur_cell_size;
-                let cs_center = body_origin_sph + vec3<f32>(body_size_sph * 0.5);
-                let cs_outer = outer_r * body_size_sph;
-                let oc = ray_origin - cs_center;
-                let b = dot(oc, ray_dir);
-                let c = dot(oc, oc) - cs_outer * cs_outer;
-                let disc = b * b - c;
-                let sph_outside = disc <= 0.0 || (-b + sqrt(max(disc, 0.0))) <= 0.0;
-                if sph_outside {
-                    // Ray misses the outer sphere — advance DDA past
-                    // the body cell, leaving a round silhouette edge.
-                    let m_sph = min_axis_mask(cur_side_dist);
-                    s_cell[depth] += vec3<i32>(m_sph) * step;
-                    cur_side_dist += m_sph * delta_dist * cur_cell_size;
-                    normal = -vec3<f32>(step) * m_sph;
-                    continue;
+                let walker_cap = min(depth_limit, MAX_FACE_DEPTH);
+                let sph = sphere_in_cell(
+                    child_idx, body_origin_sph, cur_cell_size,
+                    inner_r, outer_r, ray_origin, ray_dir, walker_cap,
+                );
+                if sph.hit {
+                    return sph;
                 }
-                // Hit — record the body's sphere so LOD-terminal
-                // hits inside the body can be clipped against it.
-                // Depth is set to the CHILD's depth (depth + 1);
-                // cleared on pop above that level.
-                active_body_depth = i32(depth + 1u);
-                active_body_center = cs_center;
-                active_body_radius = cs_outer;
-                // Fall through to Node descent.
+                // Sphere missed (ray went past the outer shell) —
+                // advance the Cartesian DDA past the body cell.
+                let m_sph = min_axis_mask(cur_side_dist);
+                s_cell[depth] += vec3<i32>(m_sph) * step;
+                cur_side_dist += m_sph * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_sph;
+                continue;
             }
             // Empty-representative fast path: when the packed
             // child's representative_block is 255, the subtree has
@@ -498,14 +481,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
 
-    // Per-frame sphere-clip hint. When the render root is itself a
-    // body cell (Sphere frame at face_depth == 0), `march_cartesian`'s
-    // `kind == 1u` pre-clip never fires — the walker starts INSIDE
-    // the body. We set this flag per-frame (cleared on ribbon pops
-    // once the frame above IS Cartesian) so the inner DDA can skip
-    // the body entirely when the ray misses the outer sphere.
-    var frame_is_body_root: bool = node_kinds[current_idx].kind == 1u;
-
     // skip_slot: after a ribbon pop, the slot index (in the parent)
     // of the child we just left. march_cartesian skips this slot at
     // depth 0 to avoid re-entering the subtree already traversed by
@@ -529,29 +504,44 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         );
         let cart_depth_limit = min(detail_budget, MAX_STACK_DEPTH);
         var r: HitResult;
-        // If the current frame IS a body cell, do a ray-sphere test
-        // against its `[0, 3)³` outer sphere first. Miss → skip the
-        // inner DDA and go straight to ribbon pop (silhouette stays
-        // round). Hit → descend normally.
-        var skip_march: bool = false;
-        if frame_is_body_root {
-            let outer_r_root = node_kinds[current_idx].outer_r;
-            let cs_center_root = vec3<f32>(1.5);
-            let cs_outer_root = outer_r_root * 3.0;
-            let oc_root = ray_origin - cs_center_root;
-            let b_root = dot(oc_root, ray_dir);
-            let c_root = dot(oc_root, oc_root) - cs_outer_root * cs_outer_root;
-            let disc_root = b_root * b_root - c_root;
-            skip_march = disc_root <= 0.0
-                || (-b_root + sqrt(max(disc_root, 0.0))) <= 0.0;
-        }
-        if skip_march {
-            r.hit = false;
-            r.t = 1e20;
-            r.frame_level = 0u;
-            r.frame_scale = 1.0;
-            r.cell_min = vec3<f32>(0.0);
-            r.cell_size = 1.0;
+        if ribbon_level == 0u
+            && (uniforms.root_kind == ROOT_KIND_BODY
+                || uniforms.root_kind == ROOT_KIND_FACE)
+        {
+            // Render root is a body (face_depth == 0) or inside a
+            // face subtree (face_depth >= 1). Dispatch `sphere_in_cell`
+            // with the body's bounding box in render-frame coords.
+            // For `ROOT_KIND_BODY` that's `(0, 0, 0)..(3, 3, 3)`; for
+            // `ROOT_KIND_FACE` the CPU ships the body's corner and
+            // cell size via `root_face_bounds` (precision-safe — the
+            // box is computed via path arithmetic, not body-frame
+            // absolutes).
+            let walker_cap = min(cart_depth_limit, MAX_FACE_DEPTH);
+            // For ROOT_KIND_FACE the body_node_idx isn't available
+            // via `uniforms.root_index` (which IS the face sub-cell),
+            // so we walk the ribbon to find the ancestor body. The
+            // ribbon is short (≤ face_depth + 1 entries) so this
+            // linear scan is cheap.
+            var body_idx: u32 = current_idx;
+            if uniforms.root_kind == ROOT_KIND_FACE {
+                var i: u32 = 0u;
+                loop {
+                    if i >= uniforms.ribbon_count { break; }
+                    let entry_idx = ribbon[i].node_idx;
+                    if node_kinds[entry_idx].kind == 1u {
+                        body_idx = entry_idx;
+                        break;
+                    }
+                    i = i + 1u;
+                }
+            }
+            let body_origin = uniforms.root_face_bounds.xyz;
+            let body_size = uniforms.root_face_bounds.w;
+            r = sphere_in_cell(
+                body_idx, body_origin, body_size,
+                uniforms.root_radii.x, uniforms.root_radii.y,
+                ray_origin, ray_dir, walker_cap,
+            );
         } else {
             r = march_cartesian(current_idx, ray_origin, ray_dir, cart_depth_limit, skip_slot);
         }
@@ -598,11 +588,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         cur_scale = cur_scale * (1.0 / 3.0);
         current_idx = entry.node_idx;
         ribbon_level = ribbon_level + 1u;
-        // Refresh the body-root flag for the popped frame. Most pops
-        // land on a Cartesian ancestor; occasionally they land on a
-        // body-as-ancestor (if a body contains another body, or if
-        // the render_path passed through a body into a face subtree).
-        frame_is_body_root = node_kinds[current_idx].kind == 1u;
 
         // Empty-shell fast exit: if every sibling is empty, skip
         // this shell's DDA and advance the ray to the shell's exit

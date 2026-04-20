@@ -98,12 +98,50 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(effective_visual_depth);
             renderer.update_camera(&cam_gpu);
-            // Every frame dispatches to the unified Cartesian walker.
-            // The ray-sphere pre-clip for CubedSphereBody children
-            // happens inside march_cartesian's `kind == 1u` branch,
-            // so there's no per-frame root-kind switch.
-            let _ = self.active_frame.kind;
-            renderer.set_root_kind_cartesian();
+            // Per-frame dispatch. Cartesian = pure Cartesian walker.
+            // Body = top-level `sphere_in_cell` with the body at
+            // (0, 0, 0)..(3, 3, 3) in render frame. Sphere = render
+            // root is inside the face subtree; `sphere_in_cell` gets
+            // the body's bounding box expressed in render-frame
+            // coords (computed via path arithmetic below), and the
+            // shader walks the same curved DDA with precision
+            // inherited from render-frame-local math.
+            match self.active_frame.kind {
+                crate::app::ActiveFrameKind::Cartesian => {
+                    renderer.set_root_kind_cartesian();
+                }
+                crate::app::ActiveFrameKind::Body { inner_r, outer_r } => {
+                    renderer.set_root_kind_body(inner_r, outer_r);
+                }
+                crate::app::ActiveFrameKind::Sphere(sphere) => {
+                    // Body origin in render-frame coords: position of
+                    // the body cell's (0, 0, 0) corner. Computed via
+                    // the SHARED f32 path from render_path to
+                    // body_path; `body_cell_size_in_frame =
+                    // WORLD_SIZE ÷ 3^(render_depth − body_depth)`.
+                    use crate::world::anchor::WORLD_SIZE;
+                    let render_depth = self.active_frame.render_path.depth();
+                    let body_depth = sphere.body_path.depth();
+                    let scale = 3.0_f32.powi(
+                        render_depth.saturating_sub(body_depth) as i32,
+                    );
+                    let body_size_in_frame = WORLD_SIZE * scale;
+                    // Position of the body's local `(0, 0, 0)` corner
+                    // expressed in the render frame. WorldPos::new
+                    // with offset `(0, 0, 0)` at body_path is that
+                    // corner; `in_frame(render_path)` projects it to
+                    // render-frame coords via the common-prefix
+                    // arithmetic (precision-safe).
+                    let body_corner = crate::world::anchor::WorldPos::new(
+                        sphere.body_path,
+                        [0.0, 0.0, 0.0],
+                    ).in_frame(&self.active_frame.render_path);
+                    renderer.set_root_kind_sphere(
+                        sphere.inner_r, sphere.outer_r,
+                        body_corner, body_size_in_frame,
+                    );
+                }
+            }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
