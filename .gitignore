@@ -28,3 +28,7 @@ ui/assets/
 
 # Voxelized models (regenerated from GLB via tools/glb_to_vox.py)
 assets/vox/
+
+# Large reference scenes (Sponza, Bistro, San Miguel) — fetched on demand
+# via scripts/fetch-glb-presets.sh
+/assets/scenes/
