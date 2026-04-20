@@ -16,9 +16,18 @@
 //!                                             [--frames N]
 //!                                             [--iter N]
 //!                                             [--stacks N1,N2,...]
+//!                                             [--ambient N]
+//!
+//! - `--ambient N` adds N vec3<f32> "live scalar" variables declared
+//!   at function scope and read/written every iteration. Simulates
+//!   the ambient register load of `cur_node_origin`, `cur_side_dist`,
+//!   `inv_dir`, etc. in march_cartesian. Each vec3 is 12 B of declared
+//!   state; the compiler's intermediate-register overhead on top of
+//!   that is what pushes real shaders past the tier boundary at lower
+//!   declared-byte counts than this synthetic's own cliff.
 //!
 //! Defaults: 2560x1440, 30 frames per config, 64 inner iterations per
-//! pixel, stack sizes 1,2,4,8,16,32,64,128.
+//! pixel, stack sizes 1,2,4,8,16,32,64,128, ambient=0.
 //!
 //! Output: for each stack size, mean/std submitted_done_ms. A step
 //! change in mean between adjacent sizes indicates a tier cliff.
@@ -43,6 +52,7 @@ async fn run() {
     let mut frames = 30u32;
     let mut iter = 64u32;
     let mut stacks: Vec<u32> = vec![1, 2, 4, 8, 16, 32, 64, 128];
+    let mut ambient: u32 = 0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -67,6 +77,10 @@ async fn run() {
                     .collect();
                 i += 2;
             }
+            "--ambient" => {
+                ambient = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -76,7 +90,7 @@ async fn run() {
 
     let (w, h) = resolution;
     println!(
-        "reg_bench: resolution={w}x{h} frames={frames} iter={iter} stacks={stacks:?}"
+        "reg_bench: resolution={w}x{h} frames={frames} iter={iter} stacks={stacks:?} ambient={ambient}"
     );
 
     // --- wgpu setup ---
@@ -216,7 +230,7 @@ async fn run() {
 
     let mut results: Vec<(u32, f64)> = Vec::new();
     for &stack_n in &stacks {
-        let shader_src = shader_with_stack_size(stack_n);
+        let shader_src = shader_with_stack_size(stack_n, ambient);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("reg_bench_shader"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
@@ -359,12 +373,35 @@ fn render_one_frame(
     elapsed.as_secs_f64() * 1000.0
 }
 
-/// Build the shader source with the requested stack size inlined.
-/// The shader does a read-modify-write loop on a dynamically-indexed
-/// array to mimic the register-pressure pattern of `s_cell[depth]`
-/// in `march_cartesian`. The sink atomicAdd at the end prevents the
-/// compiler from DCE'ing the whole loop.
-fn shader_with_stack_size(stack_n: u32) -> String {
+/// Build the shader source with the requested stack size + ambient
+/// vec3 count inlined. The shader does a read-modify-write loop on
+/// a dynamically-indexed array to mimic the register-pressure pattern
+/// of `s_cell[depth]` in `march_cartesian`. AMBIENT vec3 scalars
+/// declared at function scope and read+written every iteration mimic
+/// ambient register load from `cur_node_origin`, `cur_side_dist`,
+/// `inv_dir`, etc. The sink atomicAdd at the end prevents DCE.
+fn shader_with_stack_size(stack_n: u32, ambient: u32) -> String {
+    // Generate ambient scalar declarations, initialisation, per-
+    // iteration updates, and a final "feed-back into acc" that
+    // prevents DCE.
+    let mut amb_decls = String::new();
+    let mut amb_updates = String::new();
+    let mut amb_sink = String::new();
+    for i in 0..ambient {
+        amb_decls.push_str(&format!(
+            "    var amb_{i}: vec3<f32> = vec3<f32>(f32(px + {i}u), f32(py ^ {i}u), f32({i}u) * 0.3);\n"
+        ));
+        // Use all three components of the previous iteration's amb_i
+        // in the next update — ensures the full 12 B stays live.
+        amb_updates.push_str(&format!(
+            "        amb_{i} = amb_{i} * vec3<f32>(1.001, 0.999, 1.0003) + \
+             vec3<f32>(f32(acc & 255u) * 0.01, amb_{i}.z * 0.5, 0.1);\n"
+        ));
+        amb_sink.push_str(&format!(
+            "        acc = acc ^ u32(amb_{i}.x * 100.0) ^ u32(amb_{i}.y * 100.0) ^ u32(amb_{i}.z * 100.0);\n"
+        ));
+    }
+
     format!(
         r#"
 struct Uniforms {{
@@ -386,37 +423,34 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {{
 @fragment
 fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {{
     // Per-thread state: STACK_N-element u32 array indexed dynamically.
-    // This is the patterned-after-s_cell behaviour: the compiler must
-    // either spill to thread-private memory or drop occupancy to keep
-    // this resident.
     var s: array<u32, {stack_n}u>;
 
-    // Seed with pixel-varying values (compiler can't constant-fold).
     let px = u32(frag_coord.x);
     let py = u32(frag_coord.y);
+
+    // Ambient register load — vec3 scalars, live across all iterations.
+{amb_decls}
+    // Seed the stack with per-pixel values.
     for (var i = 0u; i < {stack_n}u; i = i + 1u) {{
         s[i] = px * 31u + py * 41u + i * 137u;
     }}
 
-    // Inner loop: read-modify-write with variable index. The
-    // dependency chain through `depth` and `acc` prevents the
-    // compiler from vectorising this away.
-    //
-    // IMPORTANT: we cycle through a FIXED 4 indices regardless of
-    // STACK_N. That way the access pattern is constant across
-    // configurations, and only the DECLARED state size varies.
-    // If we let `depth` range over `[0, STACK_N)` the cache /
-    // access-pattern behaviour would confound with register pressure.
     var acc: u32 = px ^ py;
     var depth: u32 = 0u;
     for (var iter = 0u; iter < u.n_iter; iter = iter + 1u) {{
-        depth = (depth + (acc & 1u) + 1u) & 3u;  // fixed cycle 0..3
+        // Ambient updates: keep all amb_* live and evolving.
+{amb_updates}
+        // Dynamic-index stack op: fixed 4-element cycle regardless
+        // of STACK_N so access pattern is constant.
+        depth = (depth + (acc & 1u) + 1u) & 3u;
         let v = s[depth];
         acc = acc ^ v;
         s[depth] = v + acc;
+
+        // Feed ambient values back into acc so the compiler can't DCE them.
+{amb_sink}
     }}
 
-    // Sink prevents DCE of the loop/array.
     atomicAdd(&sink[0], acc);
     return vec4<f32>(f32(acc & 0xFFu) / 255.0, 0.0, 0.0, 1.0);
 }}
