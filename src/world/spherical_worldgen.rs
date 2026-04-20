@@ -111,52 +111,51 @@ pub fn install_at_root_center(
 }
 
 /// Build a spawn `WorldPos` on the outer shell of the planet at the
-/// given anchor depth. The camera will sit just outside the body's
-/// outer shell on `face`, ready to look radially inward.
+/// given anchor depth. The anchor follows UVR descent through the
+/// face subtree — each slot (u_slot, v_slot, r_slot) is picked to
+/// bracket the target (u, v, r) face-normalized coord.
 ///
-/// The anchor is built via pure Cartesian descent through the body
-/// cell. That's load-bearing: the tree's face subtree interprets
-/// child slots as `(u, v, r)`, but `WorldPos::in_frame` walks the
-/// anchor with Cartesian `(x, y, z)` semantics. If we built the
-/// anchor with UVR-slot math, `in_frame(&body_path)` would return
-/// a Cartesian-misinterpreted position (e.g., deep inside the shell
-/// instead of on top of it), and the camera would spawn inside the
-/// planet. Cartesian descent keeps the camera's world position
-/// consistent with how `in_frame` reads it.
-///
-/// Side effect: the anchor's path doesn't correspond to the tree's
-/// UVR cell at that depth — it's a purely positional address. The
-/// shader projects from camera *position* (not *anchor*) and the
-/// raycast hits real tree cells regardless.
+/// Why UVR descent matters here: `sphere_focus` in the renderer
+/// builds its render_path via UVR descent too. If the camera's
+/// anchor used cartesian descent, its slots would diverge from
+/// render_path's slots inside the face subtree, and
+/// `WorldPos::in_frame(&render_path)` (which interprets slots
+/// cartesianly) would put the camera outside the render frame's
+/// `[0, 3)³` — a tiny distant view instead of the ground under the
+/// player. Matching both to UVR descent keeps the projection
+/// consistent: slots in both paths point to the same tree cells,
+/// so in_frame lands the camera correctly within the render cell.
 pub fn demo_sphere_surface_spawn(
     body_path: &Path,
-    setup: &PlanetSetup,
+    _setup: &PlanetSetup,
     anchor_depth: u8,
     face: Face,
 ) -> WorldPos {
-    // Surface point in the body cell's local `[0, 1)³` frame, then
-    // scaled to the anchor.rs `WORLD_SIZE = 3.0` convention used by
-    // `from_frame_local`. The outer shell sits at
-    // `body_center + face_normal * outer_r`.
-    let n = face.normal();
-    // Step slightly inside the outer shell so the camera is
-    // guaranteed within the body cell (avoids clamp fallback in
-    // `from_frame_local`).
-    let r = setup.outer_r - f32::EPSILON;
-    let pos_in_body_01 = [
-        0.5 + n[0] * r,
-        0.5 + n[1] * r,
-        0.5 + n[2] * r,
-    ];
-    // `from_frame_local` expects coords in the frame's `[0, 3)³`
-    // cell — body cell local.
-    let pos_in_body_03 = [
-        pos_in_body_01[0] * 3.0,
-        pos_in_body_01[1] * 3.0,
-        pos_in_body_01[2] * 3.0,
-    ];
-    let target_depth = anchor_depth.max(body_path.depth());
-    WorldPos::from_frame_local(body_path, pos_in_body_03, target_depth)
+    let mut path = *body_path;
+    path.push(FACE_SLOTS[face as usize] as u8);
+
+    // Surface coords in face-normalized [0, 1)³: center of face,
+    // just inside the outer shell.
+    let mut un: f32 = 0.5;
+    let mut vn: f32 = 0.5;
+    let mut rn: f32 = 1.0 - 1e-6;
+
+    let remaining = (anchor_depth as i32 - path.depth() as i32).max(0) as usize;
+    for _ in 0..remaining {
+        let us = ((un * 3.0).floor() as usize).min(2);
+        let vs = ((vn * 3.0).floor() as usize).min(2);
+        let rs = ((rn * 3.0).floor() as usize).min(2);
+        path.push(slot_index(us, vs, rs) as u8);
+        un = un * 3.0 - us as f32;
+        vn = vn * 3.0 - vs as f32;
+        rn = rn * 3.0 - rs as f32;
+    }
+
+    WorldPos::new(path, [
+        un.clamp(0.0, 1.0 - f32::EPSILON),
+        vn.clamp(0.0, 1.0 - f32::EPSILON),
+        rn.clamp(0.0, 1.0 - f32::EPSILON),
+    ])
 }
 
 #[cfg(test)]

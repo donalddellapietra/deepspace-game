@@ -187,6 +187,30 @@ impl App {
         let desired_depth = crate::app::RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
+
+        // Sphere-on-surface shortcut: when the camera anchor already
+        // descends into the planet body via UVR slots (spawn-on-
+        // surface / descent test flow), use that path truncated
+        // rather than the ray-hit-derived `sphere_focus`. The
+        // camera's UVR anchor and the render path must share slots
+        // for `in_frame` to land the camera inside the render frame's
+        // [0, 3)³. sphere_focus's ray-based descent picks different
+        // slots, which puts the camera outside the render cell.
+        if let Some(body_path) = self.planet_path {
+            let cam_anchor = self.camera.position.anchor;
+            let common = cam_anchor.common_prefix_len(&body_path);
+            if common == body_path.depth() && cam_anchor.depth() > body_path.depth() {
+                let mut render_path = cam_anchor;
+                render_path.truncate(desired_depth.min(cam_anchor.depth()));
+                return frame::with_render_margin(
+                    &self.world.library,
+                    self.world.root,
+                    &render_path,
+                    RENDER_FRAME_CONTEXT,
+                );
+            }
+        }
+
         let frame = self
             .camera_local_sphere_focus_path(desired_depth)
             .map(|path| {
