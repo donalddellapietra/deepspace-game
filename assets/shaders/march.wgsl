@@ -405,12 +405,14 @@ fn march_cartesian(
                 let child_entry = ray_origin + ray_dir * ct_start;
                 let local_entry = (child_entry - child_origin) / child_cell_size;
 
-                // Instrumentation: "would this descent have been culled
-                // by (child_occupancy & path_mask) == 0?" Does NOT alter
-                // traversal — the shader still descends normally. The
-                // counter tells us the ceiling of savings a real cull
-                // could deliver. Off when ENABLE_STATS is false
-                // (compile-time folded → zero runtime cost).
+                // Instrumentation: count of descents the path-mask
+                // cull would catch if enabled. An earlier experiment
+                // promoted this to a real cull: it reduced avg_steps
+                // 16% and avg_loads 10%, but delivered ZERO wall-
+                // clock improvement on Apple Silicon because the GPU
+                // was already memory-hiding the "wasted" descents.
+                // Reverted to instrumentation-only; the counter stays
+                // as a diagnostic for future perf investigations.
                 if ENABLE_STATS {
                     let preview_header_off = node_offsets[child_idx];
                     let preview_occ = tree[preview_header_off];
