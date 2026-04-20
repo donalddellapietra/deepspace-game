@@ -170,6 +170,38 @@ impl Renderer {
             self.prepare_taa_frame();
         }
 
+        // --- Beam-prepass coarse mask ---
+        //
+        // Renders `fs_coarse_mask` at 1/BEAM_TILE_SIZE per-axis into
+        // the R8Unorm `mask_texture`. Each tile gets one march; the
+        // fine pass then samples a 5-tap neighborhood and skips the
+        // full march entirely for tiles that are definitively sky.
+        //
+        // This is the core of P1: for Jerusalem-nucleus-class scenes
+        // where 88 % of rays miss, the fine pass's expensive work is
+        // skipped for the vast majority of pixels. The prepass's own
+        // cost is ~1/64 of the fine pass because it runs at 1/64 the
+        // ray density — a clear net win on miss-heavy content.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("beam_coarse_mask"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.coarse_pipeline);
+            pass.set_bind_group(0, &self.coarse_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
         // --- Ray-march pass ---
         if self.pipeline_taa.is_some() {
             let taa = self.taa.as_ref().expect("pipeline_taa implies TaaState");

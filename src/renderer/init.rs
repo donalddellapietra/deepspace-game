@@ -11,6 +11,58 @@ use super::buffers::make_bind_group;
 use super::taa::{TaaState, MARCH_COLOR_FORMAT, MARCH_T_FORMAT};
 use super::{GpuUniforms, Renderer, ROOT_KIND_CARTESIAN};
 
+/// Beam-prepass mask format. R8Unorm reads as f32 in the shader, and
+/// the coarse fragment writes only 0.0 or 1.0 so quantisation is a
+/// non-issue.
+pub(super) const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+/// Coarse-pass tile size in output pixels. MUST match `BEAM_TILE_SIZE`
+/// in `bindings.wgsl`. Changes require rebuilding the shader module
+/// (the const is compiled in, not an override).
+pub(super) const BEAM_TILE_SIZE: u32 = 8;
+
+pub(super) fn create_mask_texture(
+    device: &wgpu::Device,
+    swap_w: u32,
+    swap_h: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    // Round up so edge tiles always exist; a non-aligned swapchain
+    // size would otherwise sample one-past-end on the right/bottom
+    // edges and read 0 (= sky) every time, dropping content.
+    let w = (swap_w.max(1) + BEAM_TILE_SIZE - 1) / BEAM_TILE_SIZE;
+    let h = (swap_h.max(1) + BEAM_TILE_SIZE - 1) / BEAM_TILE_SIZE;
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("beam_mask"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: MASK_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+pub(super) fn create_dummy_mask_view(device: &wgpu::Device) -> wgpu::TextureView {
+    // 1×1 R8Unorm texture with any contents. The coarse bind group
+    // slots it in at binding 8 — the coarse shader doesn't sample
+    // `coarse_mask`, so the contents don't matter, only that SOME
+    // texture is bound to satisfy the layout.
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("beam_mask_dummy"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: MASK_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 impl Renderer {
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
@@ -280,14 +332,48 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Coarse beam-prepass mask (binding 8) — R8Unorm
+                // texture populated by the coarse pipeline. Fine
+                // pass reads a 5-tap neighborhood per pixel and
+                // early-outs to sky when the tile is definitively
+                // empty. Sample_type float, not filterable — we
+                // use textureLoad, not textureSample.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    }, count: None,
+                },
             ],
         });
+
+        // Beam-prepass mask texture. R8Unorm at 1/BEAM_TILE_SIZE per
+        // axis — stores `fs_coarse_mask`'s per-tile hit flag. Resized
+        // on window resize via `Renderer::resize`.
+        let (mask_texture, mask_view) = create_mask_texture(
+            &device, config.width, config.height,
+        );
+        // 1×1 dummy mask for the coarse bind group. The coarse shader
+        // doesn't sample `coarse_mask` — it writes to the real one as
+        // a render target. But the bind group layout requires
+        // something at slot 8.
+        let dummy_mask_view = create_dummy_mask_view(&device);
 
         let bind_group = make_bind_group(
             &device, &bind_group_layout,
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
             &shader_stats_buffer, &node_offsets_buffer,
+            &mask_view,
+        );
+        let coarse_bind_group = make_bind_group(
+            &device, &bind_group_layout,
+            &tree_buffer, &camera_buffer, &palette_buffer,
+            &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
+            &shader_stats_buffer, &node_offsets_buffer,
+            &dummy_mask_view,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -333,6 +419,40 @@ impl Renderer {
                     format: config.format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: frag_compilation_options.clone(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Beam-prepass coarse pipeline. Same pipeline layout, same
+        // shader module, different fragment entry (fs_coarse_mask)
+        // and render target (R8Unorm mask texture instead of the
+        // swapchain). Writes per-tile hit flags so the fine pass can
+        // skip sky tiles.
+        let coarse_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ray_march_coarse"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_coarse_mask"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: MASK_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::RED,
                 })],
                 compilation_options: frag_compilation_options.clone(),
             }),
@@ -423,6 +543,11 @@ impl Renderer {
             root_face_pop_pos: [0.0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
+            mask_texture,
+            mask_view,
+            dummy_mask_view,
+            coarse_pipeline,
+            coarse_bind_group,
             pipeline_taa,
             taa: taa_state,
             last_camera_write_ms: 0.0,

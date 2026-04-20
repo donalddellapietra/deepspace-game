@@ -103,6 +103,28 @@ pub struct Renderer {
     pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
     pub(super) offscreen_texture: Option<wgpu::Texture>,
+    /// Beam-prepass mask: 1/BEAM_TILE_SIZE-per-axis R8Unorm render
+    /// target populated by `coarse_pipeline` at the start of each
+    /// frame. `fs_main` samples this 5 times per pixel and returns
+    /// sky directly when every tap reads 0, skipping the
+    /// register-constrained tree walk for sky tiles.
+    pub(super) mask_texture: wgpu::Texture,
+    pub(super) mask_view: wgpu::TextureView,
+    /// 1×1 dummy `texture_2d<f32>` that replaces `mask_texture` at
+    /// bind slot 8 during the coarse pass — a texture can't be
+    /// simultaneously bound as a render target and a sampled input.
+    /// `fs_coarse_mask` doesn't reference `coarse_mask`, so the
+    /// dummy's contents never matter.
+    pub(super) dummy_mask_view: wgpu::TextureView,
+    /// Coarse-pass render pipeline. Same bind group layout as the
+    /// main pipeline (one layout for both simplifies the code) but
+    /// targets R8Unorm at 1/BEAM_TILE_SIZE resolution and uses the
+    /// `fs_coarse_mask` fragment entry.
+    pub(super) coarse_pipeline: wgpu::RenderPipeline,
+    /// Bind group for the coarse pass. Identical to `bind_group`
+    /// except slot 8 is bound to `dummy_mask_view` instead of
+    /// `mask_view`.
+    pub(super) coarse_bind_group: wgpu::BindGroup,
     /// Second ray-march pipeline compiled to the TAAU entry point
     /// (`fs_main_taa`) with two color attachments — linear RGBA16F
     /// color and R32F hit-t. `None` when TAAU is disabled; the draw
@@ -213,6 +235,21 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.offscreen_texture = None;
+        // Beam-prepass mask sizes to 1/BEAM_TILE_SIZE of the new
+        // swapchain. Recreate both texture and bind group.
+        let (mask_texture, mask_view) =
+            self::init::create_mask_texture(&self.device, width, height);
+        self.mask_texture = mask_texture;
+        self.mask_view = mask_view;
+        self.bind_group = self::buffers::make_bind_group(
+            &self.device, &self.bind_group_layout,
+            &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+            &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+            &self.shader_stats_buffer, &self.node_offsets_buffer,
+            &self.mask_view,
+        );
+        // coarse_bind_group uses the dummy mask view which doesn't
+        // resize, so it stays valid across resizes.
         if let Some(taa) = self.taa.as_mut() {
             taa.resize(&self.device, width, height);
         }

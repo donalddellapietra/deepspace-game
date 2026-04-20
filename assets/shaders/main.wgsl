@@ -136,10 +136,51 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(color, result.t);
 }
 
+/// Sky color for a miss ray. Extracted so the mask-cull path in
+/// fs_main can return it without running the full march.
+fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
+    let sky_t = ray_dir.y * 0.5 + 0.5;
+    return mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Beam-prepass cull. The coarse pass (fs_coarse_mask) marks
+    // tiles that might hit content (1.0) vs definitely sky (0.0).
+    // Sample a 5-tap neighborhood (center + 4 cardinal) so tiles
+    // adjacent to a hit stay in the full-march path — this is the
+    // on-the-fly conservative dilation that keeps silhouettes from
+    // eroding.
+    //
+    // When every tap reads 0, no ray near this tile hit anything.
+    // Early-out with the sky color and skip the register-heavy
+    // `march()` entirely. Saves the dominant cost for the ~88 % of
+    // rays that miss on Jerusalem nucleus.
+    let tile = vec2<i32>(in.position.xy / f32(BEAM_TILE_SIZE));
+    let m00 = textureLoad(coarse_mask, tile, 0).r;
+    let m10 = textureLoad(coarse_mask, tile + vec2<i32>(1, 0), 0).r;
+    let mn0 = textureLoad(coarse_mask, tile + vec2<i32>(-1, 0), 0).r;
+    let m01 = textureLoad(coarse_mask, tile + vec2<i32>(0, 1), 0).r;
+    let m0n = textureLoad(coarse_mask, tile + vec2<i32>(0, -1), 0).r;
+    let any_hit = max(max(max(m00, m10), max(mn0, m01)), m0n);
+    if any_hit < 0.5 {
+        let ray_dir = jittered_ray_dir(in.uv);
+        return vec4<f32>(sky_color(ray_dir), 1.0);
+    }
+
     let shaded = shade_pixel(in.uv);
     return vec4<f32>(shaded.rgb, 1.0);
+}
+
+/// Coarse beam-prepass fragment. One ray per BEAM_TILE_SIZE×BEAM_TILE_SIZE
+/// tile. Outputs 1.0 on hit, 0.0 on miss to an R8Unorm render target.
+/// Does not sample `coarse_mask` itself — the pipeline binds a 1×1
+/// dummy there since the mask texture is the render target.
+@fragment
+fn fs_coarse_mask(in: VertexOutput) -> @location(0) f32 {
+    let ray_dir = jittered_ray_dir(in.uv);
+    let result = march(camera.pos, ray_dir);
+    return select(0.0, 1.0, result.hit);
 }
 
 /// TAAU entry point. Writes color to `@location(0)` and hit t to

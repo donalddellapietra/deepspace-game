@@ -141,6 +141,21 @@ struct ShaderStats {
 /// reads this buffer.
 @group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
 
+/// Coarse beam-prepass mask. The fine fragment shader samples a 5-tap
+/// neighborhood at each pixel's tile: if every tap reads 0.0, the
+/// pixel is definitively sky and we return the sky color without
+/// running `march()`. Populated by `fs_coarse_mask` at
+/// 1/BEAM_TILE_SIZE per-axis resolution; R8Unorm render target
+/// (stored as f32 in the shader). The coarse pipeline uses a 1×1
+/// dummy texture at this slot (it writes to the real mask as render
+/// target, which can't be simultaneously sampled).
+@group(0) @binding(8) var coarse_mask: texture_2d<f32>;
+
+/// Tile size in output pixels. Finer tiles = more coarse rays but
+/// fewer false positives near silhouettes; coarser tiles = cheaper
+/// prepass but more rays leak through to the fine pass.
+const BEAM_TILE_SIZE: u32 = 8u;
+
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.
 var<private> ray_steps: u32 = 0u;

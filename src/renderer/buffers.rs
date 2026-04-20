@@ -72,6 +72,14 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.mask_view,
+            );
+            self.coarse_bind_group = make_bind_group(
+                &self.device, &self.bind_group_layout,
+                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.dummy_mask_view,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -121,6 +129,14 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.mask_view,
+            );
+            self.coarse_bind_group = make_bind_group(
+                &self.device, &self.bind_group_layout,
+                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.dummy_mask_view,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -253,6 +269,7 @@ pub(super) fn make_bind_group(
     ribbon: &wgpu::Buffer,
     shader_stats: &wgpu::Buffer,
     node_offsets: &wgpu::Buffer,
+    mask_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -266,6 +283,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask_view) },
         ],
     })
 }
