@@ -181,6 +181,7 @@ impl App {
         // flips the compile-time override so the shader's tag==3
         // branch DCEs for pure-fractal perf runs.
         let entities_enabled = !self.disable_entities;
+        let entity_render_mode = self.entity_render_mode;
         let node_count = node_kinds.len();
         let tree_u32_count = tree_packed.len();
 
@@ -210,6 +211,7 @@ impl App {
                 live_sample_every,
                 taa_enabled,
                 entities_enabled,
+                entity_render_mode,
 ));
             self.finish_init(renderer);
         }
@@ -256,6 +258,8 @@ impl App {
                     lod_pixel_threshold,
                     live_sample_every,
                     taa_enabled,
+                    entities_enabled,
+                    entity_render_mode,
                 )
                 .await;
                 if proxy.send_event(UserEvent::RendererReady(Box::new(renderer))).is_err() {

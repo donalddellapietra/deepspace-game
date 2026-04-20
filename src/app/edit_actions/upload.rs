@@ -8,8 +8,10 @@
 
 use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
+use crate::renderer::{compute_view_proj, EntityRenderMode, InstanceData};
 use crate::world::gpu::{self, GpuEntity};
 use crate::world::scene::{self, EntityPath};
+use crate::world::tree::NodeId;
 
 /// Heuristic: should the renderer run the beam-prepass (P1) for this
 /// frame? Returns true iff:
@@ -69,9 +71,29 @@ impl App {
         // ready when we build the entity GPU buffer below. The cache
         // dedups by NodeId, so 10k copies of the same soldier share
         // a single pack of ~100 unique nodes.
+        // In raster mode, entity subtree BFS indices are unused (the
+        // ray-march's tag=3 branch is dead — the raster pass draws
+        // entities as meshes). Skip the pre-pack loop, which at 10k
+        // entities was the dominant per-frame CPU cost.
+        let raster_pre = self
+            .renderer
+            .as_ref()
+            .map(|r| r.entity_render_mode() == EntityRenderMode::Raster)
+            .unwrap_or(false);
         let cache = self.cached_tree.get_or_insert_with(gpu::CachedTree::new);
-        for e in self.entities.entities.iter_mut() {
-            e.bfs_idx = cache.ensure_root(&self.world.library, e.active_root());
+        if !raster_pre {
+            for e in self.entities.entities.iter_mut() {
+                e.bfs_idx = cache.ensure_root(&self.world.library, e.active_root());
+            }
+        }
+
+        // Tree repack → heightmap source may have changed → flag a
+        // rebuild. The renderer's record_frame_passes also detects
+        // frame-root changes internally; this is the edit half.
+        if !reused_gpu_tree {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.mark_heightmap_dirty();
+            }
         }
 
         let mut pack_elapsed = web_time::Duration::ZERO;
@@ -103,16 +125,27 @@ impl App {
         // ancestor chain. Terrain-only slots share NodeIds with
         // `world.root` via content-addressed dedup, so the scene root
         // reuses ~100% of the already-packed terrain buffer.
+        // Raster mode: skip the scene overlay entirely. Entities draw
+        // through the instanced raster pass, not as Child::EntityRef
+        // cells, so the scene root collapses to `world.root` (content-
+        // addressed fast path) and the ribbon stays pure-terrain.
+        let raster_mode = self
+            .renderer
+            .as_ref()
+            .map(|r| r.entity_render_mode() == EntityRenderMode::Raster)
+            .unwrap_or(false);
         let intended_render_path = intended_frame.render_path;
         let mut entity_paths: Vec<EntityPath> =
             Vec::with_capacity(self.entities.len());
-        for (idx, e) in self.entities.entities.iter().enumerate() {
-            let anchor = e.pos.anchor;
-            if anchor.depth() == 0 { continue; }
-            entity_paths.push(EntityPath {
-                entity_idx: idx as u32,
-                path_slots: anchor.as_slice().to_vec(),
-            });
+        if !raster_mode {
+            for (idx, e) in self.entities.entities.iter().enumerate() {
+                let anchor = e.pos.anchor;
+                if anchor.depth() == 0 { continue; }
+                entity_paths.push(EntityPath {
+                    entity_idx: idx as u32,
+                    path_slots: anchor.as_slice().to_vec(),
+                });
+            }
         }
         let scene_result = scene::build_scene_root(
             &mut self.world.library,
@@ -195,7 +228,19 @@ impl App {
             renderer.update_ribbon(&r.ribbon);
         }
 
-        let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
+        let mut cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
+        // Fill in view_proj so fs_main_depth's clip.z/clip.w matches
+        // the raster pipeline's own projection. Seeded as identity at
+        // camera construction; the ray-march path ignores it when
+        // raster is disabled.
+        if let Some(renderer) = &self.renderer {
+            let (w, h) = renderer.march_dims_public();
+            let aspect = w as f32 / h as f32;
+            cam_gpu.view_proj = compute_view_proj(
+                cam_gpu.pos, cam_gpu.forward, cam_gpu.right, cam_gpu.up,
+                cam_gpu.fov, aspect,
+            );
+        }
 
         // Beam-prepass (P1) heuristic: worth running only when the
         // scene is sparse at the root AND the camera sits inside an
@@ -246,39 +291,133 @@ impl App {
         // every frame without rebuilding the tree.
         let frame_world_size = crate::world::anchor::WORLD_SIZE;
         let frame_depth = effective_path.depth() as i32;
-        let mut gpu_entities: Vec<GpuEntity> =
-            Vec::with_capacity(self.entities.len());
-        for e in &self.entities.entities {
-            let rep = self
-                .world
-                .library
-                .get(e.active_root())
-                .map(|n| n.representative_block as u32)
-                .unwrap_or(0xFFFEu32);
-            let anchor_depth = e.pos.anchor.depth() as i32;
-            let depth_delta = (anchor_depth - frame_depth).max(0);
-            let size = frame_world_size / 3.0_f32.powi(depth_delta);
-            let bbox_min = e.pos.in_frame(&effective_path);
-            let bbox_max = [
-                bbox_min[0] + size, bbox_min[1] + size, bbox_min[2] + size,
-            ];
-            gpu_entities.push(GpuEntity {
-                bbox_min,
-                representative_block: rep,
-                bbox_max,
-                subtree_bfs: e.bfs_idx,
-            });
+        if !raster_mode {
+            let mut gpu_entities: Vec<GpuEntity> =
+                Vec::with_capacity(self.entities.len());
+            for e in &self.entities.entities {
+                let rep = self
+                    .world
+                    .library
+                    .get(e.active_root())
+                    .map(|n| n.representative_block as u32)
+                    .unwrap_or(0xFFFEu32);
+                let anchor_depth = e.pos.anchor.depth() as i32;
+                let depth_delta = (anchor_depth - frame_depth).max(0);
+                let size = frame_world_size / 3.0_f32.powi(depth_delta);
+                let bbox_min = e.pos.in_frame(&effective_path);
+                let bbox_max = [
+                    bbox_min[0] + size, bbox_min[1] + size, bbox_min[2] + size,
+                ];
+                gpu_entities.push(GpuEntity {
+                    bbox_min,
+                    representative_block: rep,
+                    bbox_max,
+                    subtree_bfs: e.bfs_idx,
+                });
+            }
+            if let Some(renderer) = &mut self.renderer {
+                renderer.update_entities(&gpu_entities);
+            }
+            if self.render_harness && !self.entities.is_empty() {
+                eprintln!(
+                    "entity_upload entities={} scene_frame_bfs={} ribbon_len={}",
+                    gpu_entities.len(),
+                    scene_frame_bfs,
+                    r.ribbon.len(),
+                );
+            }
+        } else if let Some(renderer) = &mut self.renderer {
+            // Raster mode: ray-march sees zero entities.
+            renderer.update_entities(&[]);
         }
-        if let Some(renderer) = &mut self.renderer {
-            renderer.update_entities(&gpu_entities);
-        }
-        if self.render_harness && !self.entities.is_empty() {
-            eprintln!(
-                "entity_upload entities={} scene_frame_bfs={} ribbon_len={}",
-                gpu_entities.len(),
-                scene_frame_bfs,
-                r.ribbon.len(),
-            );
+
+        // --- Raster entity path ---
+        if raster_mode {
+            let palette = self.palette.to_gpu_palette();
+            let mut per_entity: Vec<(NodeId, InstanceData)> =
+                Vec::with_capacity(self.entities.len());
+            let lod_cube_pixels: f32 = 24.0;
+            let march_h = self
+                .renderer
+                .as_ref()
+                .map(|r| r.march_dims_public().1)
+                .unwrap_or(360);
+            let focal_px = march_h as f32 / (2.0 * (0.6_f32).tan());
+            let cam = self.camera.position.in_frame(&effective_path);
+            let lod_cube_node = crate::renderer::entity_raster::LOD_CUBE_NODE;
+            for e in &self.entities.entities {
+                let anchor_depth = e.pos.anchor.depth() as i32;
+                let depth_delta = (anchor_depth - frame_depth).max(0);
+                let size = frame_world_size / 3.0_f32.powi(depth_delta);
+                let translate = e.pos.in_frame(&effective_path);
+                let half = size * 0.5;
+                let dx = translate[0] + half - cam[0];
+                let dy = translate[1] + half - cam[1];
+                let dz = translate[2] + half - cam[2];
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+                let num_sq = (size * focal_px) * (size * focal_px);
+                let cutoff = lod_cube_pixels * lod_cube_pixels * dist_sq;
+                let use_cube = num_sq < cutoff;
+                let root = e.active_root();
+                let (mesh_id, tint) = if use_cube {
+                    let rep = self
+                        .world
+                        .library
+                        .get(root)
+                        .map(|n| n.representative_block as usize)
+                        .unwrap_or(0);
+                    let c = palette
+                        .get(rep)
+                        .copied()
+                        .unwrap_or([0.5, 0.5, 0.5, 1.0]);
+                    (lod_cube_node, [c[0], c[1], c[2], 1.0])
+                } else {
+                    (root, [1.0, 1.0, 1.0, 1.0])
+                };
+                per_entity.push((mesh_id, InstanceData {
+                    translate,
+                    scale: size,
+                    tint,
+                }));
+            }
+            let max_entity_depth = self
+                .entities
+                .entities
+                .iter()
+                .map(|e| e.pos.anchor.depth() as i32)
+                .max()
+                .unwrap_or(frame_depth);
+            let heightmap_delta = (max_entity_depth + 1 - frame_depth).max(0) as u32;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.ensure_heightmap(heightmap_delta);
+                let device = renderer.device().clone();
+                let queue = renderer.queue().clone();
+                let aspect = {
+                    let (w, h) = renderer.march_dims_public();
+                    w as f32 / h as f32
+                };
+                let view_proj = compute_view_proj(
+                    cam_gpu.pos, cam_gpu.forward, cam_gpu.right, cam_gpu.up,
+                    cam_gpu.fov, aspect,
+                );
+                let library = &self.world.library;
+                if let Some(raster) = renderer.entity_raster_mut() {
+                    for (node_id, _) in &per_entity {
+                        raster.ensure_mesh(&device, library, *node_id, &palette);
+                    }
+                    raster.update_view_proj(&queue, view_proj);
+                    raster.update_instances(&device, &queue, &per_entity);
+                    if self.render_harness {
+                        eprintln!(
+                            "entity_raster_upload entities={} unique_meshes={} batches={} instances={}",
+                            per_entity.len(),
+                            raster.cached_meshes(),
+                            raster.batch_count(),
+                            raster.total_instances(),
+                        );
+                    }
+                }
+            }
         }
 
         if self.startup_profile_frames < 12 {

@@ -198,6 +198,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         // so the shader's tag==3 path DCEs for pure fractal perf
         // runs that wouldn't use entities anyway.
         !cfg.disable_entities,
+        cfg.entity_render_mode,
     ));
     let mut renderer = renderer;
     renderer.update_palette(&app.palette.to_gpu_palette());

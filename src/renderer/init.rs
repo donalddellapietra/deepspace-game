@@ -8,6 +8,7 @@ use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
+use super::entity_raster::EntityRasterState;
 use super::taa::{TaaState, MARCH_COLOR_FORMAT, MARCH_T_FORMAT};
 use super::{GpuUniforms, Renderer, ROOT_KIND_CARTESIAN};
 
@@ -78,6 +79,7 @@ impl Renderer {
         live_sample_every_frames: u32,
         taa_enabled: bool,
         entities_enabled: bool,
+        entity_render_mode: crate::renderer::EntityRenderMode,
     ) -> Self {
         // On web, winit's `inner_size` lags behind the canvas backing
         // store (request_inner_size doesn't apply synchronously and
@@ -532,6 +534,60 @@ impl Renderer {
             cache: None,
         });
 
+        // Raster entity mode: build the depth-writing ray-march
+        // pipeline (fs_main_depth) + depth texture + EntityRasterState
+        // + heightmap compute pipelines. Compiling the depth pipeline
+        // as a separate resource (rather than overriding the default)
+        // means ray-march-only runs pay zero depth-write cost.
+        let (pipeline_with_depth, depth_texture_opt, depth_view_opt, entity_raster, heightmap_gen, entity_heightmap_clamp) =
+            if matches!(entity_render_mode, crate::renderer::EntityRenderMode::Raster) {
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("ray_march_with_depth"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main_depth"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: frag_compilation_options.clone(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: crate::renderer::DEPTH_FORMAT,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Always,
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                });
+                let (tex, view) = crate::renderer::create_depth_texture(
+                    &device, config.width, config.height,
+                );
+                let raster = EntityRasterState::new(
+                    &device, config.format, crate::renderer::DEPTH_FORMAT,
+                );
+                let hgen = super::heightmap::HeightmapGen::new(&device);
+                let hclamp = super::heightmap::EntityHeightmapClamp::new(&device);
+                (Some(pipeline), Some(tex), Some(view), Some(raster), Some(hgen), Some(hclamp))
+            } else {
+                (None, None, None, None, None, None)
+            };
+
         // When TAAU is enabled, compile a second ray-march pipeline
         // with the `fs_main_taa` entry point — two color attachments
         // (linear RGBA16F color + R32F hit t) at half-res. Both
@@ -631,6 +687,16 @@ impl Renderer {
             shader_stats_enabled,
             live_frame_counter: 0,
             live_sample_every_frames,
+            entity_render_mode,
+            depth_texture: depth_texture_opt,
+            depth_view: depth_view_opt,
+            pipeline_with_depth,
+            entity_raster,
+            heightmap_gen,
+            entity_heightmap_clamp,
+            heightmap_texture: None,
+            heightmap_dirty: true,
+            heightmap_frame_root_bfs: u32::MAX,
         }
     }
 }

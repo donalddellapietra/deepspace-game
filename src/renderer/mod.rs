@@ -8,11 +8,13 @@
 
 mod buffers;
 mod draw;
+pub mod entity_raster;
 pub mod heightmap;
 mod init;
 mod taa;
 
 pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
+pub use entity_raster::{compute_view_proj, EntityRasterState, InstanceData};
 pub use taa::{FrameSignature, TaaState};
 
 /// How entities are rendered. Chosen at startup via
@@ -211,6 +213,60 @@ pub struct Renderer {
     /// frames. CPU-side only — no `device.poll(Wait)` stall. Set via
     /// `--live-sample-every N` CLI flag; 0 (default) disables.
     pub(super) live_sample_every_frames: u32,
+    /// Which entity render path this renderer is wired for. Baked
+    /// at `Renderer::new` time; the raster path allocates the
+    /// depth-aware ray-march pipeline, a depth texture, and an
+    /// `EntityRasterState`.
+    pub(super) entity_render_mode: EntityRenderMode,
+    /// Depth texture used by the raster entity pass. Present iff
+    /// `entity_render_mode == Raster`. The ray-march pass writes
+    /// `@builtin(frag_depth)` via the `fs_main_depth` entry point;
+    /// the raster pass runs second with `depth_compare: Less`.
+    pub(super) depth_texture: Option<wgpu::Texture>,
+    pub(super) depth_view: Option<wgpu::TextureView>,
+    /// Ray-march pipeline compiled with a depth attachment + the
+    /// `fs_main_depth` fragment entry point. Used only when
+    /// `entity_render_mode == Raster`.
+    pub(super) pipeline_with_depth: Option<wgpu::RenderPipeline>,
+    /// Raster pass for entity meshes. Present iff
+    /// `entity_render_mode == Raster`.
+    pub(super) entity_raster: Option<EntityRasterState>,
+
+    // --- Heightmap / entity physics (raster mode only) ---
+    /// GPU heightmap-gen compute pipeline.
+    pub(super) heightmap_gen: Option<heightmap::HeightmapGen>,
+    /// GPU per-entity Y-clamp compute pipeline.
+    pub(super) entity_heightmap_clamp: Option<heightmap::EntityHeightmapClamp>,
+    /// Current heightmap texture + its uniforms. Reallocated when
+    /// `delta` (collision depth relative to frame depth) changes.
+    pub(super) heightmap_texture: Option<heightmap::HeightmapTexture>,
+    /// True whenever the tree / frame root / collision depth
+    /// changed since the last `heightmap_gen` dispatch.
+    pub(super) heightmap_dirty: bool,
+    /// Frame-root BFS index the heightmap was last generated for.
+    pub(super) heightmap_frame_root_bfs: u32,
+}
+
+/// Depth attachment format for the raster entity pass.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+pub(super) fn create_depth_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("entity_raster_depth"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 impl Renderer {
@@ -314,8 +370,43 @@ impl Renderer {
         if let Some(taa) = self.taa.as_mut() {
             taa.resize(&self.device, width, height);
         }
+        if self.entity_render_mode == EntityRenderMode::Raster {
+            let (tex, view) = create_depth_texture(&self.device, width, height);
+            self.depth_texture = Some(tex);
+            self.depth_view = Some(view);
+        }
         self.write_uniforms();
     }
+
+    pub fn entity_render_mode(&self) -> EntityRenderMode { self.entity_render_mode }
+
+    pub fn entity_raster_mut(&mut self) -> Option<&mut EntityRasterState> {
+        self.entity_raster.as_mut()
+    }
+
+    /// Force a heightmap rebuild on the next frame.
+    pub fn mark_heightmap_dirty(&mut self) {
+        self.heightmap_dirty = true;
+    }
+
+    /// Ensure a heightmap texture of `3^delta` side exists.
+    /// Reallocates if `delta` changed; no-op otherwise.
+    pub fn ensure_heightmap(&mut self, delta: u32) {
+        let cap_delta = delta.min(6);
+        let need_alloc = match self.heightmap_texture.as_ref() {
+            Some(h) => h.delta != cap_delta,
+            None => true,
+        };
+        if need_alloc {
+            self.heightmap_texture = Some(
+                heightmap::HeightmapTexture::new(&self.device, &self.queue, cap_delta),
+            );
+            self.heightmap_dirty = true;
+        }
+    }
+
+    pub fn device(&self) -> &wgpu::Device { &self.device }
+    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
 
     /// Mark the TAAU history as invalid for the next few frames.
     /// Callers must invoke this whenever the render-frame root
@@ -347,6 +438,11 @@ impl Renderer {
             None => (self.config.width, self.config.height),
         }
     }
+
+    /// Public wrapper for `march_dims` — used by the app layer to
+    /// build the view+projection matrix with the right aspect ratio
+    /// (the ray-march pass is half-res under TAAU).
+    pub fn march_dims_public(&self) -> (u32, u32) { self.march_dims() }
 
     pub(super) fn current_frame_signature(&self) -> FrameSignature {
         FrameSignature {

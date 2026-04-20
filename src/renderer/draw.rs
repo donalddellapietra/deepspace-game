@@ -226,6 +226,59 @@ impl Renderer {
             });
         }
 
+        // --- Heightmap gen (raster mode, when dirty) ---
+        let current_frame_root = self.root_index;
+        if self.heightmap_frame_root_bfs != current_frame_root {
+            self.heightmap_dirty = true;
+            self.heightmap_frame_root_bfs = current_frame_root;
+        }
+        if let (Some(hgen), Some(htex)) =
+            (self.heightmap_gen.as_ref(), self.heightmap_texture.as_ref())
+        {
+            if self.heightmap_dirty {
+                let u = crate::renderer::heightmap::HeightmapUniforms::new(
+                    current_frame_root,
+                    0,
+                    htex.delta,
+                    0.0,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                htex.write_uniforms(&self.queue, &u);
+                let bg = hgen.make_bind_group(
+                    &self.device,
+                    &self.tree_buffer,
+                    &self.node_offsets_buffer,
+                    htex,
+                );
+                hgen.record(encoder, &bg, htex);
+                self.heightmap_dirty = false;
+            }
+        }
+
+        // --- Entity Y clamp (raster mode, every frame with instances) ---
+        if let (Some(clamp), Some(htex), Some(raster)) = (
+            self.entity_heightmap_clamp.as_ref(),
+            self.heightmap_texture.as_ref(),
+            self.entity_raster.as_ref(),
+        ) {
+            let count = raster.total_instances();
+            if count > 0 {
+                let u = crate::renderer::heightmap::ClampUniforms::new(
+                    count,
+                    htex.side,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                let uniforms = clamp.make_uniforms_buffer(&self.device, &u);
+                let bg = clamp.make_bind_group(
+                    &self.device,
+                    raster.instance_buffer(),
+                    &uniforms,
+                    htex,
+                );
+                clamp.record(encoder, &bg, count);
+            }
+        }
+
         // --- Ray-march pass ---
         if self.pipeline_taa.is_some() {
             let taa = self.taa.as_ref().expect("pipeline_taa implies TaaState");
@@ -263,6 +316,37 @@ impl Renderer {
             pass.set_pipeline(pipeline_taa);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+        } else if let (Some(p_with_depth), Some(depth_view)) =
+            (self.pipeline_with_depth.as_ref(), self.depth_view.as_ref())
+        {
+            // Raster-entity mode: ray-march writes color + frag_depth;
+            // entity raster pass runs next and z-tests against it.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(march_label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dest_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(p_with_depth);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
         } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(march_label),
@@ -283,6 +367,13 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        // --- Entity raster pass (raster mode only) ---
+        if let (Some(raster), Some(depth_view)) =
+            (self.entity_raster.as_ref(), self.depth_view.as_ref())
+        {
+            raster.record_pass(encoder, dest_view, depth_view);
         }
 
         // --- Resolve pass (TAA only) ---
