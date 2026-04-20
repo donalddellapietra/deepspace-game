@@ -311,7 +311,6 @@ pub fn insert_spherical_body(
     // on their top node, so the camera pipeline recognises them as
     // "inside a planet face" at `face_depth >= 1`.
     let mut body_children = empty_children();
-    let core_block = sdf.core_block;
     for zs in 0..3 {
         for ys in 0..3 {
             for xs in 0..3 {
@@ -457,14 +456,6 @@ fn tag_with_face(lib: &mut NodeLibrary, child: Child, face: Face) -> Child {
     }
 }
 
-fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
-    let mut id = lib.insert(empty_children());
-    for _ in 1..depth {
-        id = lib.insert(uniform_children(Child::Node(id)));
-    }
-    id
-}
-
 // ────────────────────────────────────────────────────────────── tests
 
 #[cfg(test)]
@@ -552,11 +543,50 @@ mod tests {
             Child::Block(b) => assert_eq!(b, block::STONE),
             Child::Empty => panic!("interior slot is empty"),
         }
-        // Non-face, non-interior slots — with Cartesian-indexed
-        // worldgen these can be non-Empty too when the sphere extends
-        // into their sub-box. We only assert that edge/corner slots
-        // whose bounding sphere is fully outside the planet are Empty.
-        // For this SDF (radius=0.32, no noise), slots whose nearest
-        // corner is past 0.32 from (0.5,0.5,0.5) should be empty.
+        // Classify every non-face, non-interior slot against the
+        // sphere geometry and assert it matches. A slot's sub-box
+        // has corners at integer thirds; sphere radius = 0.32.
+        //   - Sub-box nearest corner > 0.32 from sphere center
+        //     → entirely outside sphere → must be Empty.
+        //   - Sub-box farthest corner < 0.32
+        //     → entirely inside → must be Block(STONE) or a uniform
+        //     stone subtree.
+        //   - Otherwise → straddles → must be Node with mixed content.
+        let r2 = 0.32f32 * 0.32f32;
+        for slot in 0..27 {
+            if slot == INTERIOR_SLOT { continue; }
+            if FACE_SLOTS.contains(&slot) { continue; }
+            let (xs, ys, zs) = crate::world::tree::slot_coords(slot);
+            let xlo = xs as f32 / 3.0; let xhi = xlo + 1.0 / 3.0;
+            let ylo = ys as f32 / 3.0; let yhi = ylo + 1.0 / 3.0;
+            let zlo = zs as f32 / 3.0; let zhi = zlo + 1.0 / 3.0;
+            let clamp_to = |lo: f32, hi: f32| 0.5f32.clamp(lo, hi);
+            let far = |lo: f32, hi: f32| {
+                if (0.5 - lo).abs() > (0.5 - hi).abs() { lo } else { hi }
+            };
+            let near = [clamp_to(xlo, xhi), clamp_to(ylo, yhi), clamp_to(zlo, zhi)];
+            let far_pt = [far(xlo, xhi), far(ylo, yhi), far(zlo, zhi)];
+            let near_d2 = (near[0]-0.5).powi(2) + (near[1]-0.5).powi(2) + (near[2]-0.5).powi(2);
+            let far_d2 = (far_pt[0]-0.5).powi(2) + (far_pt[1]-0.5).powi(2) + (far_pt[2]-0.5).powi(2);
+            let child = body.children[slot];
+            if near_d2 > r2 {
+                assert!(matches!(child, Child::Empty),
+                    "slot {slot} entirely outside sphere should be Empty, got {child:?}");
+            } else if far_d2 < r2 {
+                match child {
+                    Child::Block(b) => assert_eq!(b, block::STONE, "slot {slot} fully inside"),
+                    Child::Node(id) => {
+                        assert_eq!(
+                            lib.get(id).unwrap().uniform_type, block::STONE,
+                            "slot {slot} entirely inside sphere should be uniform stone"
+                        );
+                    }
+                    Child::Empty => panic!("slot {slot} entirely inside sphere should not be Empty"),
+                }
+            } else {
+                assert!(matches!(child, Child::Node(_)),
+                    "slot {slot} straddling sphere should be a subtree, got {child:?}");
+            }
+        }
     }
 }

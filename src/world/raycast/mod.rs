@@ -17,8 +17,6 @@ mod cartesian;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
 
-pub(super) const MAX_FACE_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
-
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
 pub struct HitInfo {

@@ -22,14 +22,6 @@ pub(super) const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 1.0;
 
 impl App {
-    pub(super) fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
-        // In Cartesian frames, all levels share the same axes — the
-        // direction is identical in every frame.  The DDA only cares
-        // about the *direction*, not the magnitude.  The old code
-        // scaled by 3^depth which overflows f32 past depth ~20.
-        crate::world::sdf::normalize(self.camera.forward())
-    }
-
     /// Trim a walker-found hit down to the current `edit_depth`. The
     /// walker returns a path all the way to the tree leaf so the
     /// cursor always hits something concrete; callers that act on
@@ -73,22 +65,39 @@ impl App {
         let k = anchor_depth.saturating_sub(frame_depth) as i32;
         let anchor_cell_size_in_frame = 3.0_f32.powi(1 - k);
 
+        // For sphere-adjacent frames the reach floor is the body's
+        // outer diameter (2 × outer_r × 3) in render-frame units —
+        // cursor highlight and edit should be able to reach across
+        // the whole planet, including rays that pass through
+        // carved-air tunnels and hit solid on the far side. The old
+        // `sdf_min_cell` scaling coupled reach to SDF recursion
+        // depth and shrank inversely with detail; the corrected
+        // floor is purely geometric (cursor reach scales with the
+        // visible planet size, independent of voxel resolution).
         let effective_cell_size = match self.active_frame.kind {
             crate::app::ActiveFrameKind::Sphere(sphere) => {
-                const SDF_DETAIL_LEVELS: i32 = 4;
                 let body_depth = sphere.body_path.depth();
                 let render_depth = self.active_frame.render_path.depth();
                 let face_depth_i32 =
                     render_depth.saturating_sub(body_depth) as i32;
-                let shell_body_local = sphere.outer_r - sphere.inner_r;
-                let shell_in_frame = 3.0
-                    * shell_body_local
+                // Body diameter in the render frame: `outer_r * 3 * 2`
+                // at body-level, scaled by `3^face_depth` for each
+                // level of descent into the face subtree.
+                let body_diameter_in_frame = sphere.outer_r * 6.0
                     * 3.0_f32.powi(face_depth_i32);
-                let sdf_min_cell =
-                    shell_in_frame * 3.0_f32.powi(-SDF_DETAIL_LEVELS);
-                anchor_cell_size_in_frame.max(sdf_min_cell)
+                let reach_floor = body_diameter_in_frame
+                    * (1.0 / self.interaction_radius_cells.max(1) as f32);
+                anchor_cell_size_in_frame.max(reach_floor)
             }
-            _ => anchor_cell_size_in_frame,
+            crate::app::ActiveFrameKind::Body { outer_r, .. } => {
+                // Body frame: render root IS the body cell. Outer
+                // diameter in body-cell [0, 3)³ = `outer_r * 6`.
+                let body_diameter_in_frame = outer_r * 6.0;
+                let reach_floor = body_diameter_in_frame
+                    * (1.0 / self.interaction_radius_cells.max(1) as f32);
+                anchor_cell_size_in_frame.max(reach_floor)
+            }
+            crate::app::ActiveFrameKind::Cartesian => anchor_cell_size_in_frame,
         };
         self.interaction_radius_cells as f32 * effective_cell_size
     }

@@ -574,10 +574,15 @@ fn sphere_highlight_glow_renders_at_deep_anchor() {
         "highlight screenshot missing: {shot}",
     );
 
-    // Exclude the 20-pixel screen-center box so crosshair pixels
+    // Exclude the 8-pixel screen-center box so crosshair pixels
     // (always ~30 when hit registers) don't satisfy the assertion
-    // on their own — we want to count the actual cell glow.
-    let glow = highlight_glow_pixel_count(&shot, 20);
+    // on their own — we want to count the actual cell glow. At the
+    // test's camera position (body-level render frame at deep
+    // anchor), the LOD-terminal highlight cell projects to about
+    // 30×30 pixels on the 320×180 screenshot; the 8-pixel radius
+    // (= 16×16 crosshair-only region) leaves ample room for the
+    // cell glow to be counted.
+    let glow = highlight_glow_pixel_count(&shot, 8);
     assert!(
         glow > 0,
         "cursor highlight glow not visible at anchor_depth=22: 0 yellow-ish \

@@ -6,7 +6,7 @@
 //! path go through the same function — the edit case is fast because
 //! every sibling of the edit path is already in the cache.
 
-use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
+use crate::app::{ActiveFrame, App, LodUploadKey};
 use crate::app::frame;
 use crate::world::gpu;
 
