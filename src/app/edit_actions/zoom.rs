@@ -95,18 +95,39 @@ impl App {
         };
         let cam_body = self.camera.position.in_frame(&body_path);
         let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-        let Some(t) = cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE) else {
-            eprintln!(
-                "sphere_focus: miss cam_body={:?} ray_dir={:?} body_path={:?}",
-                cam_body, ray_dir, body_path.as_slice(),
-            );
-            return None;
+        // Pick the focus face from the CAMERA's own position when
+        // camera is on or inside the outer shell; only use ray-exit-
+        // face when camera is clearly outside the sphere. Otherwise
+        // (on-surface looking down, or camera inside a carved pocket)
+        // ray_outer_sphere_hit returns t_exit on the FAR side, which
+        // pointed sphere_focus at the wrong face and made the render
+        // frame diverge from the camera's face.
+        let body_half = WORLD_SIZE * 0.5;
+        let cam_offset = crate::world::sdf::sub(cam_body, [body_half; 3]);
+        let cam_radius = crate::world::sdf::length(cam_offset);
+        let outer_radius = outer_r * WORLD_SIZE;
+        let face_point = if cam_radius <= outer_radius * 1.01 {
+            // Camera at or near the shell — focus the face the camera
+            // is on.
+            cubesphere_local::body_point_to_face_space(
+                cam_body, inner_r, outer_r, WORLD_SIZE,
+            )
+        } else {
+            // Camera outside — focus the face the ray hits.
+            let Some(t) = cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE) else {
+                eprintln!(
+                    "sphere_focus: miss cam_body={:?} ray_dir={:?} body_path={:?}",
+                    cam_body, ray_dir, body_path.as_slice(),
+                );
+                return None;
+            };
+            let hit_body = crate::world::sdf::add(cam_body, crate::world::sdf::scale(ray_dir, t));
+            cubesphere_local::body_point_to_face_space(
+                hit_body, inner_r, outer_r, WORLD_SIZE,
+            )
         };
-        let hit_body = crate::world::sdf::add(cam_body, crate::world::sdf::scale(ray_dir, t));
-        let Some(face_point) = cubesphere_local::body_point_to_face_space(
-            hit_body, inner_r, outer_r, WORLD_SIZE,
-        ) else {
-            eprintln!("sphere_focus: degenerate hit_body={:?}", hit_body);
+        let Some(face_point) = face_point else {
+            eprintln!("sphere_focus: degenerate camera/hit body_path={:?}", body_path.as_slice());
             return None;
         };
         let face = face_point.face;

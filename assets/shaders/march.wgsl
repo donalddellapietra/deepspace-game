@@ -3,27 +3,7 @@
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
 
-// Cell-packing helpers. Cell coords at each depth range -1..=3
-// (legal 0..=2 plus ±1 over-step to trigger pop). Pack +1-shifted
-// into 3 bits per axis = 9 bits per u32. Shrinks the per-thread
-// `s_cell` stack from 96 B (vec3<i32>×8) to 32 B (u32×8), targeting
-// the Fragment Occupancy register cliff measured at 9.7% on
-// Jerusalem nucleus (rule: <25% = register pressure).
-fn pack_cell(c: vec3<i32>) -> u32 {
-    let ux = u32(c.x + 1) & 7u;
-    let uy = u32(c.y + 1) & 7u;
-    let uz = u32(c.z + 1) & 7u;
-    return ux | (uy << 3u) | (uz << 6u);
-}
-
-fn unpack_cell(p: u32) -> vec3<i32> {
-    return vec3<i32>(
-        i32(p & 7u) - 1,
-        i32((p >> 3u) & 7u) - 1,
-        i32((p >> 6u) & 7u) - 1,
-    );
-}
-
+// pack_cell / unpack_cell moved to tree.wgsl so both marches share.
 // Conservative 27-bit "path mask" — the tensor product of per-axis
 // 3-bit masks of cells reachable from `entry_cell` moving in `step`
 // direction. Over-approximates the actual ray path (any axis-wise
@@ -814,6 +794,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var current_kind = uniforms.root_kind;
     var inner_r = uniforms.root_radii.x;
     var outer_r = uniforms.root_radii.y;
+    var cur_face_bounds = uniforms.root_face_bounds;
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
 
@@ -840,6 +821,12 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 current_idx, body_origin, body_size,
                 inner_r, outer_r, ray_origin, ray_dir,
             );
+        } else if current_kind == ROOT_KIND_FACE {
+            // Render frame root IS a CubedSphereFace subtree node.
+            // UVR-semantic cell walk with flat-at-this-scale DDA —
+            // curvature at face_depth >= 1 falls below f32 precision
+            // so the flat approximation is exact to f32 representability.
+            r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
             // Cartesian frame. Sphere bodies nested inside it are
             // dispatched from within `march_cartesian`'s tag=2 path.
@@ -865,15 +852,75 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         }
 
         // Ray exited the current frame. Pop one level through the
-        // ribbon. The face-rooted pop path is gone — the render
-        // frame never roots at a face, so every pop is a single-
-        // level cartesian pop with the usual `parent = slot +
-        // child/3` transform. When the new root is a CubedSphereBody
-        // the outer loop dispatches `march_sphere_body`; otherwise
-        // it dispatches `march_cartesian`.
+        // ribbon. Two regimes:
+        //
+        // - Face-rooted (current_kind == ROOT_KIND_FACE) and we
+        //   haven't yet reached the body_pop_level: the parent IS
+        //   still a face subtree node; stay face-rooted but grow
+        //   the face bounds by 3x. Ray rescales by the standard
+        //   `parent = slot + child/3`.
+        // - Face-rooted at body_pop_level: the parent IS the body
+        //   cell; switch to body-rooted.
+        // - Body/Cartesian: standard single-level pop.
         if ribbon_level >= uniforms.ribbon_count {
             break;
         }
+
+        if current_kind == ROOT_KIND_FACE {
+            let body_pop_level = uniforms.root_face_meta.y;
+            if ribbon_level < body_pop_level {
+                // Pop within the face subtree. Stay face-rooted;
+                // widen the face bounds by 3x to reflect the larger
+                // parent cell's coverage of the full face.
+                let entry = ribbon[ribbon_level];
+                if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
+                let s = entry.slot_bits & RIBBON_SLOT_MASK;
+                let sx = i32(s % 3u);
+                let sy = i32((s / 3u) % 3u);
+                let sz = i32(s / 9u);
+                let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+                let old_size = cur_face_bounds.w;
+                cur_face_bounds = vec4<f32>(
+                    cur_face_bounds.x - slot_off.x * old_size,
+                    cur_face_bounds.y - slot_off.y * old_size,
+                    cur_face_bounds.z - slot_off.z * old_size,
+                    old_size * 3.0,
+                );
+                skip_slot = s;
+                ray_origin = slot_off + ray_origin / 3.0;
+                ray_dir = ray_dir / 3.0;
+                cur_scale = cur_scale * (1.0 / 3.0);
+                current_idx = entry.node_idx;
+                ribbon_level = ribbon_level + 1u;
+                continue;
+            }
+            // body_pop_level reached: switch to body-rooted frame.
+            if body_pop_level >= uniforms.ribbon_count { break; }
+            let body_entry = ribbon[body_pop_level];
+            if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
+            // The ray is still in face-subtree-local [0, 3)³ coords
+            // at this point; the face subtree's root is the body's
+            // face-slot child, so we need to transform through the
+            // face slot first. ribbon entry at body_pop_level
+            // identifies that face slot.
+            let s = body_entry.slot_bits & RIBBON_SLOT_MASK;
+            let sx = i32(s % 3u);
+            let sy = i32((s / 3u) % 3u);
+            let sz = i32(s / 9u);
+            let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+            ray_origin = slot_off + ray_origin / 3.0;
+            ray_dir = ray_dir / 3.0;
+            cur_scale = cur_scale * (1.0 / 3.0);
+            current_idx = body_entry.node_idx;
+            current_kind = ROOT_KIND_BODY;
+            inner_r = node_kinds[current_idx].inner_r;
+            outer_r = node_kinds[current_idx].outer_r;
+            if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 2u; }
+            ribbon_level = body_pop_level + 1u;
+            continue;
+        }
+
+        // Body / Cartesian single-level pop.
         let entry = ribbon[ribbon_level];
         if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
         let s = entry.slot_bits & RIBBON_SLOT_MASK;

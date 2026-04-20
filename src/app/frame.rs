@@ -176,27 +176,22 @@ pub fn with_render_margin(
     render_margin: u8,
 ) -> ActiveFrame {
     let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
-    // Sphere: the render frame must NEVER descend into a face
-    // subtree. Cap the render depth at body_path so the shader's
-    // root is always the containing `CubedSphereBody` cell — the
-    // only place where `march_sphere_body`'s curved-UVR math is
-    // precision-safe. Face-depth descent happens via the ribbon,
-    // not via a deeper render root.
-    if let ActiveFrameKind::Sphere(sphere) = logical.kind {
-        let render_depth = sphere.body_path.depth();
-        let mut render_path = logical.logical_path;
-        render_path.truncate(render_depth);
-        let render = compute_render_frame(library, world_root, &render_path, render_depth);
-        return ActiveFrame {
-            render_path: render.render_path,
-            logical_path: logical.logical_path,
-            node_id: render.node_id,
-            kind: render.kind,
-        };
-    }
-    // Cartesian / Body: render frame IS the innermost shell root.
-    // The shader pops outward via the ribbon for coarser context.
-    let min_render_depth = logical.logical_path.depth();
+    let min_render_depth = match logical.kind {
+        // Sphere: at face_depth >= 1 the render root IS the face
+        // subtree cell. Going deeper than that lands in a face-
+        // subtree cartesian descendant, which works but loses the
+        // UVR-semantic bevel/shading. The minimum is `body_path + 1`
+        // — body's face-slot child, i.e., the face subtree root.
+        ActiveFrameKind::Sphere(sphere) => {
+            (sphere.body_path.depth() + 1).min(logical.logical_path.depth())
+        }
+        ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
+        // Shell architecture: the render frame IS the innermost
+        // shell root. The shader pops outward via the ribbon for
+        // coarser context. No render_margin needed — each shell
+        // has a bounded depth budget.
+        ActiveFrameKind::Cartesian => logical.logical_path.depth(),
+    };
     let render_depth = logical
         .logical_path
         .depth()

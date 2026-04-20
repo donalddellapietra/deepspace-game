@@ -33,10 +33,11 @@ struct Uniforms {
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
-    /// 0 = Cartesian, 1 = CubedSphereBody. The render frame never
-    /// roots at a face subtree — when the camera's anchor is deep
-    /// inside a face, `with_render_margin` keeps the render root at
-    /// the containing body cell and the ribbon walks the rest.
+    /// 0 = Cartesian, 1 = CubedSphereBody, 2 = CubedSphereFace
+    /// subtree. Face-rooted render is the precision-safe path for
+    /// deep zoom: the shader walks UVR cells using flat-at-this-
+    /// scale DDA (curvature is negligible at face_depth >= 1), so
+    /// body-frame coordinates never get touched at deep depth.
     root_kind: u32,
     /// Number of ancestor ribbon entries available. When the ray
     /// exits the frame's [0, 3)³ bubble at depth 0, the shader
@@ -59,12 +60,21 @@ struct Uniforms {
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
-    /// Used when root_kind == 1 (CubedSphereBody root).
+    /// Used when root_kind == 1 or 2.
     root_radii: vec4<f32>,
+    /// Face-rooted metadata (root_kind == 2):
+    /// x = face id (0..5), y = ribbon level at which the pop moves
+    /// from face subtree to the containing body cell.
+    root_face_meta: vec4<u32>,
+    /// Face-rooted bounds (root_kind == 2): the render cell's
+    /// position within the full face, in face-normalized coords
+    /// (u_min, v_min, r_min, size).
+    root_face_bounds: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
+const ROOT_KIND_FACE: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:

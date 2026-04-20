@@ -303,6 +303,8 @@ impl Renderer {
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             root_radii: self.root_radii,
+            root_face_meta: self.root_face_meta,
+            root_face_bounds: self.root_face_bounds,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

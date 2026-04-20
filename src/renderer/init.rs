@@ -267,6 +267,8 @@ impl Renderer {
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             root_radii: [0.0; 4],
+            root_face_meta: [0; 4],
+            root_face_bounds: [0.0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -662,6 +664,8 @@ impl Renderer {
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
             root_radii: [0.0; 4],
+            root_face_meta: [0; 4],
+            root_face_bounds: [0.0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,

@@ -43,12 +43,13 @@ pub enum EntityRenderMode {
 pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `RootKind*`
-/// constants in `bindings.wgsl`. The face-rooted render kind is
-/// gone: `with_render_margin` keeps the render root at the
-/// containing body cell even when the camera has zoomed deep into
-/// a face subtree.
+/// constants in `bindings.wgsl`. Face-rooted render is the
+/// precision-safe deep-zoom path: UVR cells at face_depth >= 1 are
+/// walked with flat-at-this-scale DDA so body-frame coords never
+/// get touched at deep depth.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
+pub const ROOT_KIND_FACE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -59,10 +60,11 @@ pub struct GpuUniforms {
     pub screen_height: f32,
     pub max_depth: u32,
     pub highlight_active: u32,
-    /// 0 = Cartesian, 1 = CubedSphereBody. When 1, the shader
-    /// dispatches the unified sphere march at start-of-march; the
-    /// body fills the `[0, 3)³` frame, and `root_radii` carries its
-    /// inner/outer radii.
+    /// 0 = Cartesian, 1 = CubedSphereBody, 2 = CubedSphereFace
+    /// subtree. Face-rooted is picked when the camera has zoomed
+    /// into a face subtree; the shader then walks UVR cells with
+    /// flat-at-this-scale DDA, keeping body-frame coords out of
+    /// the hot path.
     pub root_kind: u32,
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
@@ -74,10 +76,18 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Body radii (used iff `root_kind == 1`). Stored in the body
-    /// cell's local `[0, 1)` frame; the shader scales by 3.0
-    /// (= WORLD_SIZE) to get shader-frame units.
+    /// Body radii (used iff `root_kind == 1` or `== 2`). Stored
+    /// in the body cell's local `[0, 1)` frame; the shader scales
+    /// by 3.0 (= WORLD_SIZE) to get shader-frame units.
     pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
+    /// Face-rooted metadata (root_kind == 2). x = face id (0..5),
+    /// y = ribbon level at which the pop moves from face subtree
+    /// to the containing body cell.
+    pub root_face_meta: [u32; 4],
+    /// Face-rooted bounds (root_kind == 2). The render cell's
+    /// position within the full face, in face-normalized coords:
+    /// (u_min, v_min, r_min, size).
+    pub root_face_bounds: [f32; 4],
 }
 
 pub struct Renderer {
@@ -131,6 +141,8 @@ pub struct Renderer {
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
     pub(super) root_radii: [f32; 4],
+    pub(super) root_face_meta: [u32; 4],
+    pub(super) root_face_bounds: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -276,16 +288,41 @@ impl Renderer {
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
+        self.root_face_meta = [0; 4];
+        self.root_face_bounds = [0.0; 4];
         self.write_uniforms();
     }
 
-    /// Set the frame-root NodeKind to CubedSphereBody with radii in
-    /// the body cell's local `[0, 1)` frame. The render frame never
-    /// roots at a face subtree — face descent happens via the
-    /// ribbon-pop chain starting from the body.
+    /// Set the frame-root NodeKind to CubedSphereBody. Used when the
+    /// camera sees the whole body in view (shallow zoom). Shader
+    /// dispatches the curved-UVR body march.
     pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
         self.root_kind = ROOT_KIND_BODY;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_meta = [0; 4];
+        self.root_face_bounds = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Set the frame-root NodeKind to CubedSphereFace (deep zoom into
+    /// a face subtree). Shader walks UVR cells with flat-at-this-
+    /// scale DDA — curvature at face_depth >= 1 falls below f32
+    /// precision anyway, so the flat approximation is exact to
+    /// within f32 representability. Keeps UVR semantics throughout
+    /// (slot addressing, face tangents/normals for shading) while
+    /// avoiding the body-frame precision wall.
+    pub fn set_root_kind_face(
+        &mut self,
+        inner_r: f32,
+        outer_r: f32,
+        face_id: u32,
+        body_pop_level: u32,
+        bounds: [f32; 4],
+    ) {
+        self.root_kind = ROOT_KIND_FACE;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_meta = [face_id, body_pop_level, 0, 0];
+        self.root_face_bounds = bounds;
         self.write_uniforms();
     }
 

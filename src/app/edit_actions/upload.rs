@@ -265,12 +265,16 @@ impl App {
             renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
-                // Sphere: with_render_margin keeps the render root at
-                // the containing body cell, so the shader sees this
-                // as a Body root. The face-depth descent happens via
-                // the ribbon-pop chain inside march_sphere_body.
+                // Sphere: render root IS the face subtree cell.
+                // Upload face id + bounds so the shader's UVR walker
+                // knows where within the full face this render cell
+                // lives (used for depth tint + shading).
                 ActiveFrameKind::Sphere(sphere) => {
-                    renderer.set_root_kind_body(sphere.inner_r, sphere.outer_r);
+                    renderer.set_root_kind_face(
+                        sphere.inner_r, sphere.outer_r,
+                        sphere.face as u32, sphere.face_depth,
+                        [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
+                    );
                 }
                 ActiveFrameKind::Body { inner_r, outer_r } => {
                     renderer.set_root_kind_body(inner_r, outer_r);

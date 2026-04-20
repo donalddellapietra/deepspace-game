@@ -60,3 +60,21 @@ fn child_block_type(packed: u32) -> u32 { return (packed >> 8u) & 0xFFFFu; }
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
     return u32(z * 9 + y * 3 + x);
 }
+
+// Per-depth cell coords pack +1-shifted into 3 bits per axis (legal
+// 0..=2 plus ±1 over-step to trigger pop). Shrinks the DDA stack
+// from 96 B (vec3<i32>×8) to 32 B (u32×8).
+fn pack_cell(c: vec3<i32>) -> u32 {
+    let ux = u32(c.x + 1) & 7u;
+    let uy = u32(c.y + 1) & 7u;
+    let uz = u32(c.z + 1) & 7u;
+    return ux | (uy << 3u) | (uz << 6u);
+}
+
+fn unpack_cell(p: u32) -> vec3<i32> {
+    return vec3<i32>(
+        i32(p & 7u) - 1,
+        i32((p >> 3u) & 7u) - 1,
+        i32((p >> 6u) & 7u) - 1,
+    );
+}
