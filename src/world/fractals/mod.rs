@@ -64,7 +64,7 @@ use super::tree::{empty_children, slot_index, Child, NodeId, NodeLibrary};
 /// the slot holds `Child::Node(<next level>)` so colored cells only
 /// appear at the leaves (which is what makes the fractal "look" like
 /// its palette).
-pub(super) type Slot = (u8, u8, u8, u8);
+pub(super) type Slot = (u8, u8, u8, u16);
 
 /// Build a self-similar fractal of `depth` levels.
 ///

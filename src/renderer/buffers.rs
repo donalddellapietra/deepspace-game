@@ -5,7 +5,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuRibbonEntry};
 
 use super::{GpuUniforms, Renderer, MAX_RIBBON_LEN};
 
@@ -143,8 +143,59 @@ impl Renderer {
         self.write_uniforms();
     }
 
-    pub fn update_palette(&self, palette: &GpuPalette) {
-        self.queue.write_buffer(&self.palette_buffer, 0, bytemuck::bytes_of(palette));
+    /// Upload the current palette. The buffer is a read-only
+    /// storage buffer sized to `registry.len() * 16 bytes`; if the
+    /// new palette is longer than what the buffer can hold, we
+    /// recreate it (and rebuild both bind groups) so it fits.
+    pub fn update_palette(&mut self, palette: &[[f32; 4]]) {
+        // Every color is 16 bytes; the minimum buffer size is 16
+        // (one entry) to keep the storage binding valid.
+        let stub = [[0.0f32; 4]];
+        let payload: &[[f32; 4]] = if palette.is_empty() { &stub } else { palette };
+        let needed = std::mem::size_of_val(payload) as u64;
+        if needed > self.palette_buffer.size() {
+            // Grow with 1.5× headroom, rounded up to a multiple of 16.
+            let raw = (needed.max(16) * 3 / 2).max(16);
+            let new_size = raw.div_ceil(16) * 16;
+            self.palette_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("palette"),
+                size: new_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(payload));
+            // Rebuild both bind groups: palette buffer identity changed.
+            self.bind_group = make_bind_group(
+                &self.device,
+                &self.bind_group_layout,
+                &self.tree_buffer,
+                &self.camera_buffer,
+                &self.palette_buffer,
+                &self.uniforms_buffer,
+                &self.node_kinds_buffer,
+                &self.ribbon_buffer,
+                &self.shader_stats_buffer,
+                &self.node_offsets_buffer,
+                &self.mask_view,
+            );
+            self.coarse_bind_group = make_bind_group(
+                &self.device,
+                &self.bind_group_layout,
+                &self.tree_buffer,
+                &self.camera_buffer,
+                &self.palette_buffer,
+                &self.uniforms_buffer,
+                &self.node_kinds_buffer,
+                &self.ribbon_buffer,
+                &self.shader_stats_buffer,
+                &self.node_offsets_buffer,
+                &self.dummy_mask_view,
+            );
+        } else {
+            self.queue
+                .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(payload));
+        }
     }
 
     pub fn update_camera(&mut self, camera: &GpuCamera) {

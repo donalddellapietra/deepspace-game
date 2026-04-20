@@ -40,7 +40,7 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
-fn edge_scaffold_world(depth: u8, x_axis: u8, y_axis: u8, z_axis: u8) -> WorldState {
+fn edge_scaffold_world(depth: u8, x_axis: u16, y_axis: u16, z_axis: u16) -> WorldState {
     let mut slots: Vec<Slot> = Vec::with_capacity(12);
     for z in 0u8..3 {
         for y in 0u8..3 {

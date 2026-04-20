@@ -50,9 +50,9 @@ pub enum WorldPreset {
     /// Hollow cube — 18-cell architectural shell (12 edges + 6
     /// faces, no corners or body). Brushed-steel + brass palette.
     HollowCube,
-    /// Imported `.vox` model placed inside a plain world. Uses the
-    /// GLB→vox→tree pipeline (see `src/import/` and
-    /// `tools/glb_to_vox.py`). The model is planted at the center
+    /// Imported `.vox` / `.vxs` model placed inside a plain world.
+    /// Uses the GLB→`.vxs`→tree pipeline (see `src/import/` and
+    /// `tools/scene_voxelize/`). The model is planted at the center
     /// of a plain world of depth `plain_layers` (default 8), so
     /// camera spawn is reasonable out-of-the-box. Stresses the
     /// packer's real-content path: tens of thousands of unique
@@ -67,6 +67,12 @@ pub enum WorldPreset {
     VoxModel {
         path: std::path::PathBuf,
         interior_depth: u8,
+    },
+    /// Canonical high-resolution mesh scene (Sponza, San Miguel,
+    /// Bistro) voxelized offline by `tools/scene_voxelize/`. See
+    /// [`crate::world::scenes`].
+    Scene {
+        id: crate::world::scenes::SceneId,
     },
 }
 
@@ -138,6 +144,7 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::VoxModel { path, interior_depth } => bootstrap_vox_model_world(
             &path, plain_layers.unwrap_or(8), interior_depth,
         ),
+        WorldPreset::Scene { id } => crate::world::scenes::bootstrap_scene_world(id),
     }
 }
 
@@ -153,7 +160,7 @@ pub use crate::world::fractals::menger::menger_world;
 ///
 /// Panics if the file doesn't exist or doesn't parse — this is a
 /// bootstrap function, not a content runtime path.
-fn bootstrap_vox_model_world(
+pub(crate) fn bootstrap_vox_model_world(
     path: &std::path::Path,
     total_depth: u8,
     interior_depth: u8,
@@ -166,21 +173,63 @@ fn bootstrap_vox_model_world(
     let mut lib = NodeLibrary::default();
     let mut registry = crate::world::palette::ColorRegistry::new();
 
-    let model = import::load(path, &mut registry)
-        .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
-    eprintln!(
-        "vox_world: loaded {:?} ({}x{}x{} = {} voxels, interior_depth={})",
-        path, model.size_x, model.size_y, model.size_z,
-        model.data.iter().filter(|&&v| v != 0).count(),
-        interior_depth,
-    );
+    // Use the sparse path for `.vxs` when `interior_depth == 0` —
+    // iterates only occupied voxels instead of the padded cube. For
+    // Sponza (5 M voxels in a 729³ ≈ 388 M padded cube) this is
+    // ~77× less work at load time.
+    let ext_is_vxs = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("vxs"))
+        .unwrap_or(false);
 
-    let model_root_id = tree_builder::build_tree_with_interior(&model, &mut lib, interior_depth);
+    let (size_x, size_y, size_z, model_root_id) = if ext_is_vxs && interior_depth == 0 {
+        let t = std::time::Instant::now();
+        let sparse = import::vxs::load_sparse(path, &mut registry)
+            .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
+        eprintln!(
+            "vox_world: loaded (sparse) {:?} ({}x{}x{} = {} voxels) in {:.2?}",
+            path,
+            sparse.size_x,
+            sparse.size_y,
+            sparse.size_z,
+            sparse.voxels.len(),
+            t.elapsed(),
+        );
+        let t = std::time::Instant::now();
+        let root = tree_builder::build_tree_sparse(&sparse, &mut lib);
+        eprintln!(
+            "vox_world: sparse tree build in {:.2?} ({} library nodes)",
+            t.elapsed(),
+            lib.len(),
+        );
+        (
+            sparse.size_x as usize,
+            sparse.size_y as usize,
+            sparse.size_z as usize,
+            root,
+        )
+    } else {
+        let model = import::load(path, &mut registry)
+            .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
+        eprintln!(
+            "vox_world: loaded {:?} ({}x{}x{} = {} voxels, interior_depth={})",
+            path,
+            model.size_x,
+            model.size_y,
+            model.size_z,
+            model.data.iter().filter(|&&v| v != 0).count(),
+            interior_depth,
+        );
+        let root =
+            tree_builder::build_tree_with_interior(&model, &mut lib, interior_depth);
+        (model.size_x, model.size_y, model.size_z, root)
+    };
 
     // Silhouette depth: log3(max_dim). Each voxel then contributes
     // `interior_depth` additional levels (uniform-fill subtree),
     // so the model's full tree footprint is silhouette + interior.
-    let max_dim = model.size_x.max(model.size_y).max(model.size_z).max(1);
+    let max_dim = size_x.max(size_y).max(size_z).max(1);
     let mut dim = 1usize;
     let mut silhouette_depth: u8 = 0;
     while dim < max_dim {
@@ -244,9 +293,9 @@ fn bootstrap_vox_model_world(
     let padded = BRANCH.pow(silhouette_depth as u32) as f32;
     let wrap_size = 3.0 * (1.0 / BRANCH as f32).powi(wraps as i32);
     let wrap_origin = 1.5 - wrap_size / 2.0;
-    let extent_x = wrap_size * (model.size_x as f32 / padded);
-    let extent_y = wrap_size * (model.size_y as f32 / padded);
-    let extent_z = wrap_size * (model.size_z as f32 / padded);
+    let extent_x = wrap_size * (size_x as f32 / padded);
+    let extent_y = wrap_size * (size_y as f32 / padded);
+    let extent_z = wrap_size * (size_z as f32 / padded);
     let center_x = wrap_origin + extent_x / 2.0;
     let center_y = wrap_origin + extent_y / 2.0;
     let center_z = wrap_origin + extent_z / 2.0;
@@ -412,7 +461,7 @@ pub fn plain_world(layers: u8) -> WorldState {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum UniformFill {
         Empty,
-        Block(u8),
+        Block(u16),
     }
 
     fn fill_for_range(y_min: f32, y_max: f32) -> Option<UniformFill> {

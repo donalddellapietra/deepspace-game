@@ -73,7 +73,7 @@ pub fn menger_world(depth: u8) -> WorldState {
 
 /// Two-colour Menger: 8 corner cells painted with `corner_block`, 12
 /// edge-midpoint cells with `edge_block`. See module docs for why.
-fn menger_world_two_tone(depth: u8, corner_block: u8, edge_block: u8) -> WorldState {
+fn menger_world_two_tone(depth: u8, corner_block: u16, edge_block: u16) -> WorldState {
     let mut slots: Vec<Slot> = Vec::with_capacity(20);
     for z in 0u8..3 {
         for y in 0u8..3 {

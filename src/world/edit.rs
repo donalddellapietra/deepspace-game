@@ -96,7 +96,7 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
 /// Place a block adjacent to the hit face. Builds a uniform subtree
 /// that matches the depth of siblings at the placement site, so the
 /// placed block has full recursive structure like the terrain around it.
-pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
+pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u16) -> bool {
     // Figure out how deep siblings are at the placement site.
     let sibling_depth = if let Some(&(parent_id, _)) = hit.path.last() {
         if let Some(parent) = world.library.get(parent_id) {

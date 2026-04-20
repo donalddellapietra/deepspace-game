@@ -143,12 +143,13 @@ impl CachedTree {
         self.tree.push(occ);
         self.tree.push(header_off + 2);
         for entry in slab.iter().flatten() {
-            let mut e = *entry;
-            if e.tag == 2 {
-                let child_header_off = self.node_offsets[e.node_index as usize] as usize;
-                let child_occ = self.tree[child_header_off];
-                e._pad = content_aabb(child_occ);
-            }
+            // `flags` was formerly `_pad` carrying a 12-bit content
+            // AABB — see `content_aabb()`. Dropped when the palette
+            // widened to u16 (bits 16-23 now hold block_type_hi).
+            // TODO: restore via a parallel per-BFS aabbs storage
+            // buffer; for now leave flags == 0 and let the shader
+            // fall back to the child's full [0, 3)^3 AABB.
+            let e = *entry;
             self.tree.push(pack_child_first(e));
             self.tree.push(e.node_index);
         }
@@ -168,9 +169,7 @@ impl CachedTree {
     fn build_child_entry(&mut self, library: &NodeLibrary, child: Child) -> Option<GpuChild> {
         match child {
             Child::Empty => None,
-            Child::Block(bt) => Some(GpuChild {
-                tag: 1, block_type: bt, _pad: 0, node_index: 0,
-            }),
+            Child::Block(bt) => Some(GpuChild::new(1, bt, 0, 0)),
             Child::Node(child_id) => {
                 let (is_cart, uniform_type, representative) = {
                     let node = library.get(child_id)?;
@@ -183,23 +182,13 @@ impl CachedTree {
                 if is_cart && uniform_type == UNIFORM_EMPTY {
                     None
                 } else if is_cart && uniform_type != UNIFORM_MIXED {
-                    Some(GpuChild {
-                        tag: 1,
-                        block_type: uniform_type,
-                        _pad: 0,
-                        node_index: 0,
-                    })
+                    Some(GpuChild::new(1, uniform_type, 0, 0))
                 } else {
                     let child_bfs = self.emit_or_lookup(library, child_id);
-                    // _pad (content AABB) filled in by the caller
-                    // when emitting the parent's slab, at which
-                    // point the child's occupancy is known.
-                    Some(GpuChild {
-                        tag: 2,
-                        block_type: representative,
-                        _pad: 0,
-                        node_index: child_bfs,
-                    })
+                    // `flags` filled in by the caller when emitting
+                    // the parent's slab (carries content AABB bits),
+                    // at which point the child's occupancy is known.
+                    Some(GpuChild::new(2, representative, 0, child_bfs))
                 }
             }
         }
@@ -219,9 +208,16 @@ pub fn pack_tree(library: &NodeLibrary, root: NodeId) -> PackedTree {
     )
 }
 
-/// Encode a child's first u32: tag | (block_type << 8) | (_pad << 16).
+/// Encode a child's first u32:
+/// `tag | (block_type_lo << 8) | (block_type_hi << 16) | (flags << 24)`.
+/// Little-endian across bytes 0-3 → the shader extracts tag as
+/// `packed & 0xFFu` (unchanged) and block_type as
+/// `(packed >> 8) & 0xFFFFu`.
 pub(crate) fn pack_child_first(c: GpuChild) -> u32 {
-    (c.tag as u32) | ((c.block_type as u32) << 8) | ((c._pad as u32) << 16)
+    (c.tag as u32)
+        | ((c.block_type_lo as u32) << 8)
+        | ((c.block_type_hi as u32) << 16)
+        | ((c.flags as u32) << 24)
 }
 
 /// Tight axis-aligned bounding box of the occupied slots in a 3×3×3
@@ -287,16 +283,23 @@ mod tests {
         let first_child = tree[header_off + 1] as usize;
         let bit = 1u32 << slot;
         if occupancy & bit == 0 {
-            return GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 };
+            return GpuChild::new(0, 0, 0, 0);
         }
         let rank = (occupancy & (bit - 1)).count_ones() as usize;
         let off = first_child + rank * 2;
         let packed = tree[off];
         let tag = (packed & 0xFF) as u8;
-        let block_type = ((packed >> 8) & 0xFF) as u8;
-        let _pad = ((packed >> 16) & 0xFFFF) as u16;
+        let block_type_lo = ((packed >> 8) & 0xFF) as u8;
+        let block_type_hi = ((packed >> 16) & 0xFF) as u8;
+        let flags = ((packed >> 24) & 0xFF) as u8;
         let node_index = tree[off + 1];
-        GpuChild { tag, block_type, _pad, node_index }
+        GpuChild {
+            tag,
+            block_type_lo,
+            block_type_hi,
+            flags,
+            node_index,
+        }
     }
 
     #[test]
@@ -358,7 +361,7 @@ mod tests {
         let (tree, kinds, offsets, _, root_idx) = pack_tree(&lib, root);
         let entry = sparse_child(&tree, &offsets, root_idx, 13);
         assert_eq!(entry.tag, 1, "uniform-nonempty subtree flattens to Block");
-        assert_eq!(entry.block_type, crate::world::palette::block::STONE);
+        assert_eq!(entry.block_type(), crate::world::palette::block::STONE);
         assert_eq!(kinds.len(), 1, "only root emitted; uniform subtree pruned");
     }
 

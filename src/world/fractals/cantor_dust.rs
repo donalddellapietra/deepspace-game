@@ -61,7 +61,7 @@ const HUES: [(u8, u8, u8); 8] = [
     (230,  95, 185),   // magenta
 ];
 
-fn cantor_dust_world(depth: u8, hue_indices: [u8; 8]) -> WorldState {
+fn cantor_dust_world(depth: u8, hue_indices: [u16; 8]) -> WorldState {
     let slots: Vec<Slot> = CORNERS
         .iter()
         .zip(hue_indices.iter())
@@ -77,7 +77,7 @@ pub(crate) fn bootstrap_cantor_dust_world(depth: u8) -> WorldBootstrap {
     let depth = depth.min(MAX_DEPTH as u8);
 
     let mut registry = ColorRegistry::new();
-    let mut hue_ids = [0u8; 8];
+    let mut hue_ids = [0u16; 8];
     for (i, &(r, g, b)) in HUES.iter().enumerate() {
         hue_ids[i] = registry.register(r, g, b, 255).unwrap();
     }

@@ -47,7 +47,7 @@ const PYRAMID: [(u8, u8, u8); 5] = [
     (1, 2, 1),
 ];
 
-fn sierpinski_pyramid_world(depth: u8, base: u8, apex: u8) -> WorldState {
+fn sierpinski_pyramid_world(depth: u8, base: u16, apex: u16) -> WorldState {
     let slots: Vec<Slot> = PYRAMID
         .iter()
         .map(|&(x, y, z)| {

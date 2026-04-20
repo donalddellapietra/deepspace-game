@@ -50,7 +50,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     let face_packed = tree[body_child_base];
     let face_tag = face_packed & 0xFFu;
     if face_tag == 1u {
-        result.block = (face_packed >> 8u) & 0xFFu;
+        result.block = (face_packed >> 8u) & 0xFFFFu;
         return result;
     }
     var node = tree[body_child_base + 1u];
@@ -66,7 +66,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
 
     let limit = min(depth_limit, MAX_FACE_DEPTH);
     if limit <= 1u {
-        let bt = (face_packed >> 8u) & 0xFFu;
+        let bt = (face_packed >> 8u) & 0xFFFFu;
         result.block = select(0u, bt, bt != 255u);
         return result;
     }
@@ -114,7 +114,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
         size = step_size;
 
         if tag == 0u || tag == 1u {
-            result.block = select(0u, (packed >> 8u) & 0xFFu, tag == 1u);
+            result.block = select(0u, (packed >> 8u) & 0xFFFFu, tag == 1u);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
             result.v_lo = v_sum + v_comp;
@@ -123,7 +123,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
             return result;
         }
         if d >= limit {
-            let bt = (packed >> 8u) & 0xFFu;
+            let bt = (packed >> 8u) & 0xFFFFu;
             result.block = select(0u, bt, bt != 255u);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
@@ -175,7 +175,7 @@ fn sample_face_node(node_idx: u32,
         let packed = tree[child_base];
         let tag = packed & 0xFFu;
         if tag == 1u {
-            return vec2<u32>((packed >> 8u) & 0xFFu, d);
+            return vec2<u32>((packed >> 8u) & 0xFFFFu, d);
         }
         node = tree[child_base + 1u];
         un = un * 3.0 - f32(us);
@@ -231,7 +231,7 @@ fn walk_face_node(node_idx: u32,
         size = step_size;
 
         if tag == 0u || tag == 1u {
-            result.block = select(0u, (packed >> 8u) & 0xFFu, tag == 1u);
+            result.block = select(0u, (packed >> 8u) & 0xFFFFu, tag == 1u);
             result.depth = d;
             result.u_lo = u_lo;
             result.v_lo = v_lo;
@@ -246,7 +246,7 @@ fn walk_face_node(node_idx: u32,
         let at_lod = lod_pixels < FACE_ROOT_LOD_THRESHOLD_PIXELS;
         let at_max = d >= uniforms.max_depth;
         if at_lod || at_max {
-            let bt = (packed >> 8u) & 0xFFu;
+            let bt = (packed >> 8u) & 0xFFFFu;
             result.block = select(0u, bt, bt != 255u);
             result.depth = d;
             result.u_lo = u_lo;

@@ -6,7 +6,10 @@ use super::{HitInfo, MAX_FACE_DEPTH};
 use crate::world::cubesphere::FACE_SLOTS;
 use crate::world::cubesphere_local;
 use crate::world::sdf;
-use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary, EMPTY_NODE, UNIFORM_EMPTY, UNIFORM_MIXED};
+use crate::world::tree::{
+    slot_index, Child, NodeId, NodeLibrary, EMPTY_NODE, REPRESENTATIVE_EMPTY, UNIFORM_EMPTY,
+    UNIFORM_MIXED,
+};
 
 /// Restricts the sphere march to a sub-region of a single face.
 /// `Some(...)` = the sphere-frame caller's face-window; `None` = a
@@ -175,7 +178,7 @@ pub(super) fn walk_face_subtree_with_path(
     face_root_id: NodeId,
     un_in: f32, vn_in: f32, rn_in: f32,
     max_depth: u32,
-) -> Option<(u8, u32, Vec<(NodeId, usize)>)> {
+) -> Option<(u16, u32, Vec<(NodeId, usize)>)> {
     let mut node_id = face_root_id;
     let mut un = un_in.clamp(0.0, 0.9999999);
     let mut vn = vn_in.clamp(0.0, 0.9999999);
@@ -230,7 +233,11 @@ pub(super) fn walk_face_subtree_with_path(
                     let block = match child_node.uniform_type {
                         UNIFORM_MIXED => {
                             let rep = child_node.representative_block;
-                            if rep < 255 { rep } else { 0 }
+                            if rep != REPRESENTATIVE_EMPTY {
+                                rep
+                            } else {
+                                0
+                            }
                         }
                         UNIFORM_EMPTY => 0,
                         b => b,

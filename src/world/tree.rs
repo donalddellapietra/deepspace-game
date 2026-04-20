@@ -21,12 +21,14 @@ pub const MAX_DEPTH: usize = 63;
 
 /// One child slot in a node's 3x3x3 grid.
 ///
-/// `Block(u8)` holds a palette index. Builtin block indices live in
-/// `palette::block`; imported model colors use indices 10-254.
+/// `Block(u16)` holds a palette index. Builtin block indices live in
+/// `palette::block` (0..=9); imported model colors occupy 10..=65_534.
+/// Emptiness is represented exclusively by `Child::Empty` — palette
+/// index 0 is a real color (Stone), not a sentinel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Child {
     Empty,
-    Block(u8),
+    Block(u16),
     Node(NodeId),
 }
 
@@ -110,17 +112,18 @@ pub struct Node {
     /// The most common NON-EMPTY block type among all terminals in the
     /// subtree. Used by the renderer at LOD cutoff — when a cell is too
     /// small to descend into, it renders as this color.
-    /// 255 = all empty (no solid content in this subtree).
+    /// `REPRESENTATIVE_EMPTY` = all empty (no solid content).
     ///
     /// Presence-preserving means: if ANY child is non-empty, the
     /// representative is non-empty. A tree trunk (1 voxel of wood in
     /// 26 air voxels) gets representative = Wood, not Air. Thin
     /// features survive cascaded LOD across arbitrary depth.
-    pub representative_block: u8,
-    /// If the entire subtree is one type: 0-253 = that BlockType,
-    /// 254 = all empty, 255 = mixed (not uniform).
-    /// Uniform nodes can be flattened to a single Block during GPU packing.
-    pub uniform_type: u8,
+    pub representative_block: u16,
+    /// If the entire subtree is one type: 0..=`MAX_BLOCK_TYPE` = that
+    /// BlockType, `UNIFORM_EMPTY` = all empty, `UNIFORM_MIXED` = not
+    /// uniform. Uniform nodes can be flattened to a single Block
+    /// during GPU packing.
+    pub uniform_type: u16,
     /// Depth of this subtree: 1 for a leaf node (children are all
     /// Block/Empty), 1 + max(child.depth) for nodes with Child::Node
     /// children. Cached at insert time so `WorldState::tree_depth()`
@@ -128,8 +131,15 @@ pub struct Node {
     pub depth: u32,
 }
 
-pub const UNIFORM_EMPTY: u8 = 254;
-pub const UNIFORM_MIXED: u8 = 255;
+/// Sentinel placed in `Node::uniform_type` / `representative_block`
+/// to denote "subtree is wholly empty" (no real palette color).
+pub const UNIFORM_EMPTY: u16 = 0xFFFE;
+/// Sentinel placed in `Node::uniform_type` to denote "subtree
+/// contains multiple block types" (not flattenable).
+pub const UNIFORM_MIXED: u16 = 0xFFFF;
+/// Same sentinel as `UNIFORM_EMPTY`, but for `representative_block`
+/// readers that want a semantically-named constant.
+pub const REPRESENTATIVE_EMPTY: u16 = UNIFORM_EMPTY;
 
 // ---------------------------------------------------------- slot encoding
 
@@ -200,14 +210,21 @@ impl NodeLibrary {
         // are ignored so that thin features (a single wood voxel in air)
         // survive cascaded LOD. For Node children, inherit their
         // representative_block recursively.
-        let mut counts = [0u32; 256];
+        // Sparse tally: with u16 palette indices we can't preallocate
+        // a `[u32; 65536]` on the stack. A `HashMap` keyed by block id
+        // handles both narrow (builtins-only) and wide (scene-palette)
+        // tally cases cleanly, at the cost of a bit of alloc per node.
+        let mut counts: std::collections::HashMap<u16, u32> =
+            std::collections::HashMap::new();
         for c in &children {
             match c {
-                Child::Block(bt) => counts[*bt as usize] += 1,
+                Child::Block(bt) => *counts.entry(*bt).or_insert(0) += 1,
                 Child::Node(nid) => {
                     if let Some(child_node) = self.nodes.get(nid) {
-                        if child_node.representative_block < 255 {
-                            counts[child_node.representative_block as usize] += 1;
+                        if child_node.representative_block != REPRESENTATIVE_EMPTY {
+                            *counts
+                                .entry(child_node.representative_block)
+                                .or_insert(0) += 1;
                         }
                     }
                 }
@@ -216,31 +233,41 @@ impl NodeLibrary {
         }
         let representative_block = counts
             .iter()
-            .enumerate()
-            .max_by_key(|&(_, count)| *count)
-            .filter(|&(_, count)| *count > 0)
-            .map(|(i, _)| i as u8)
-            .unwrap_or(255);
+            .max_by_key(|(_, count)| *count)
+            .map(|(bt, _)| *bt)
+            .unwrap_or(REPRESENTATIVE_EMPTY);
         // Compute uniform_type: is the entire subtree one block type?
         let uniform_type = {
-            let mut first: Option<u8> = None;
+            let mut first: Option<u16> = None;
             let mut uniform = true;
             for c in &children {
                 let ct = match c {
                     Child::Empty => UNIFORM_EMPTY,
                     Child::Block(bt) => *bt,
-                    Child::Node(nid) => {
-                        self.nodes.get(nid).map(|n| n.uniform_type).unwrap_or(UNIFORM_MIXED)
-                    }
+                    Child::Node(nid) => self
+                        .nodes
+                        .get(nid)
+                        .map(|n| n.uniform_type)
+                        .unwrap_or(UNIFORM_MIXED),
                 };
-                if ct == UNIFORM_MIXED { uniform = false; break; }
+                if ct == UNIFORM_MIXED {
+                    uniform = false;
+                    break;
+                }
                 match first {
                     None => first = Some(ct),
                     Some(f) if f == ct => {}
-                    _ => { uniform = false; break; }
+                    _ => {
+                        uniform = false;
+                        break;
+                    }
                 }
             }
-            if uniform { first.unwrap_or(UNIFORM_EMPTY) } else { UNIFORM_MIXED }
+            if uniform {
+                first.unwrap_or(UNIFORM_EMPTY)
+            } else {
+                UNIFORM_MIXED
+            }
         };
         // Cache depth: 1 for leaves (all children are Block/Empty),
         // 1 + max(child.depth) when any child is Child::Node. O(1)
@@ -277,7 +304,7 @@ impl NodeLibrary {
     /// depth=1 returns a node whose 27 children are all `Block(block_type)`.
     /// depth=N returns a node of uniform nodes, N levels deep.
     /// Content-addressed dedup means this creates at most N unique nodes.
-    pub fn build_uniform_subtree(&mut self, block_type: u8, depth: u32) -> Child {
+    pub fn build_uniform_subtree(&mut self, block_type: u16, depth: u32) -> Child {
         if depth == 0 {
             return Child::Block(block_type);
         }

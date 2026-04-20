@@ -53,7 +53,7 @@ const TET_CORNERS: [(u8, u8, u8); 4] = [
     (0, 2, 2),
 ];
 
-fn sierpinski_tet_world(depth: u8, body: u8, apex: u8) -> WorldState {
+fn sierpinski_tet_world(depth: u8, body: u16, apex: u16) -> WorldState {
     // Apex = (0, 2, 2). All others body.
     let slots: Vec<Slot> = TET_CORNERS
         .iter()

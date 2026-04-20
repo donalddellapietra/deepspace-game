@@ -52,7 +52,7 @@ const CROSS: [(u8, u8, u8); 7] = [
     (1, 1, 2),   // +Z face
 ];
 
-fn jerusalem_cross_world(depth: u8, nucleus: u8, rod: u8) -> WorldState {
+fn jerusalem_cross_world(depth: u8, nucleus: u16, rod: u16) -> WorldState {
     let slots: Vec<Slot> = CROSS
         .iter()
         .map(|&(x, y, z)| {

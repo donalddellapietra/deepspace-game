@@ -68,8 +68,8 @@ pub struct Planet {
     pub noise_seed: u32,
     pub gravity: f32,
     pub influence_radius: f32,
-    pub surface_block: u8,
-    pub core_block: u8,
+    pub surface_block: u16,
+    pub core_block: u16,
 }
 
 impl Planet {
@@ -92,7 +92,7 @@ impl Planet {
 
     /// Block type at point p. Top of surface = surface block,
     /// deep interior = core block. Smooth biome transition by depth.
-    pub fn block_at(&self, p: Vec3) -> u8 {
+    pub fn block_at(&self, p: Vec3) -> u16 {
         let to = sub(p, self.center);
         let r = length(to);
         // Depth below the undisplaced radius.

@@ -37,7 +37,7 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
-fn hollow_cube_world(depth: u8, face: u8, edge: u8) -> WorldState {
+fn hollow_cube_world(depth: u8, face: u16, edge: u16) -> WorldState {
     let mut slots: Vec<Slot> = Vec::with_capacity(18);
     for z in 0u8..3 {
         for y in 0u8..3 {

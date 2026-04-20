@@ -16,9 +16,10 @@ struct Camera {
     fov: f32,
 }
 
-struct Palette {
-    colors: array<vec4<f32>, 256>,
-}
+// Palette lives in a read-only storage buffer of dynamic length
+// (see binding 2 below). The `Palette` struct was removed when the
+// palette index widened from u8 → u16 so CPU-side `ColorRegistry`
+// can hold up to 65 535 entries.
 
 struct Uniforms {
     root_index: u32,
@@ -131,7 +132,7 @@ struct ShaderStats {
 /// popcount→child chain hits L1 on the second load.
 @group(0) @binding(0) var<storage, read> tree: array<u32>;
 @group(0) @binding(1) var<uniform> camera: Camera;
-@group(0) @binding(2) var<uniform> palette: Palette;
+@group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 @group(0) @binding(4) var<storage, read> node_kinds: array<NodeKindGpu>;
 @group(0) @binding(5) var<storage, read> ribbon: array<RibbonEntry>;

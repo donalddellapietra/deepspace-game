@@ -171,6 +171,21 @@ impl TestConfig {
                 "--mausoleum-world" => { cfg.world_preset = WorldPreset::Mausoleum; }
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
+                "--sponza-world" => {
+                    cfg.world_preset = WorldPreset::Scene {
+                        id: crate::world::scenes::SceneId::Sponza,
+                    };
+                }
+                "--san-miguel-world" => {
+                    cfg.world_preset = WorldPreset::Scene {
+                        id: crate::world::scenes::SceneId::SanMiguel,
+                    };
+                }
+                "--bistro-world" => {
+                    cfg.world_preset = WorldPreset::Scene {
+                        id: crate::world::scenes::SceneId::Bistro,
+                    };
+                }
                 "--vox-model" => {
                     if let Some(path_str) = args.next() {
                         // Interior depth may be set before or after this
@@ -404,6 +419,12 @@ FRACTAL PRESETS (default plain-layers = 8):
   --jerusalem-cross-world     7 axial cells (body + 6 faces), ochre two-tone
   --edge-scaffold-world       12 edge rods per level, cyan/magenta/yellow
   --hollow-cube-world         18 edges + faces (no corners/body), brass + steel
+
+MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
+scripts/fetch-glb-presets.sh to download source GLBs):
+  --sponza-world              Crytek Sponza atrium (Khronos glTF Sample Assets)
+  --san-miguel-world          Morgan McGuire's San Miguel courtyard (~10.5M tris)
+  --bistro-world              Amazon Lumberyard Bistro (NVIDIA ORCA, Paris street)
 
 WORLD TUNING:
   --plain-layers N            Tree depth (default 40 for plain, 8 for fractals)

@@ -180,8 +180,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuRibbonEntry>(), 8);
     }
 
-    /// Encode a GpuChild's first u32 (tag + block_type + pad).
-    fn encode_packed(tag: u8, block_type: u8) -> u32 {
+    /// Encode a GpuChild's first u32 (tag + block_type_lo + block_type_hi + flags).
+    fn encode_packed(tag: u8, block_type: u16) -> u32 {
         (tag as u32) | ((block_type as u32) << 8)
     }
 

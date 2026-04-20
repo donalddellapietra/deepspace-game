@@ -49,7 +49,7 @@ use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
 /// 8 corners get highlight, 12 edge-midpoints get rod. Same geometry
 /// as `menger::menger_world` but with role-coloring swapped in.
-fn mausoleum_world(depth: u8, corner_highlight: u8, edge_rod: u8) -> WorldState {
+fn mausoleum_world(depth: u8, corner_highlight: u16, edge_rod: u16) -> WorldState {
     let mut slots: Vec<Slot> = Vec::with_capacity(20);
     for z in 0u8..3 {
         for y in 0u8..3 {

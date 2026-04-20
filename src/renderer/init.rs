@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -216,11 +216,17 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let palette = GpuPalette::default();
+        // Seed the palette buffer with the builtin colors. Later
+        // uploads via `Renderer::update_palette` may grow the buffer
+        // if an imported scene's palette exceeds the initial capacity.
+        let builtin_palette: Vec<[f32; 4]> = crate::world::palette::BUILTINS
+            .iter()
+            .map(|&(_, _, c)| c)
+            .collect();
         let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("palette"),
-            contents: bytemuck::bytes_of(&palette),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            contents: bytemuck::cast_slice(&builtin_palette),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let node_count = node_kinds.len() as u32;
@@ -290,7 +296,7 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },

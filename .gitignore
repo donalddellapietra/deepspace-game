@@ -1,4 +1,5 @@
 /target
+/tools/scene_voxelize/target
 /external
 /dist
 /.vercel
@@ -26,7 +27,7 @@ ui/assets/
 .DS_Store
 **/.DS_Store
 
-# Voxelized models (regenerated from GLB via tools/glb_to_vox.py)
+# Voxelized models (regenerated from GLB via tools/scene_voxelize/)
 assets/vox/
 
 # Large reference scenes (Sponza, Bistro, San Miguel) — fetched on demand

@@ -3,45 +3,78 @@
 ## 3D Model → Playable World
 
 ```
-Source model (.glb, .obj, .fbx)
-       │
-       ▼
-  FileToVox (--scale N)
-       │
-       ▼
-  .vox file (assets/vox/)
-       │
-       ▼
-  Game import (import::vox → stamp into WorldState)
-       │
-       ▼
-  Playable, editable voxel world
+Source GLB/glTF (Sponza, San Miguel, Bistro, character models, …)
+        │
+        │  scripts/fetch-glb-presets.sh         (downloads the three
+        │                                        canonical scenes)
+        ▼
+assets/scenes/<name>.glb   (gitignored; multi-GB)
+        │
+        │  tools/scene_voxelize/                (GPU voxelizer;
+        │   cargo run --release                  MIT-licensed copy of
+        │     -- --models <name> \               voxel-raymarching's
+        │        --scale 16                      pipeline — see
+        │                                        ATTRIBUTION.md)
+        ▼
+assets/scenes/<name>.vxs   (sparse palette-indexed voxel grid)
+        │
+        │  src/import/vxs.rs                    (loads .vxs,
+        │                                        merges palette into
+        │                                        ColorRegistry)
+        ▼
+  src/world/tree               (content-addressed base-3 tree)
+        │
+        │  WorldPreset::Scene | WorldPreset::VoxModel
+        ▼
+   Playable, editable voxel world
 ```
 
-## FileToVox
+## scene_voxelize
 
-Converts meshes to MagicaVoxel `.vox` format with color preservation.
+Rust + WGPU GPU voxelizer ported from James Catania's
+[voxel-raymarching](https://github.com/jamescatania/voxel-raymarching)
+under MIT. Triangle-cube intersection in a compute shader, per-triangle
+UV sampling at the voxel/triangle hit (so colors follow the actual
+texel, not a nearest-vertex approximation), and k-means palette
+quantization in Oklab. Up to 200 palette entries.
 
-**Install:** https://github.com/Zarbuz/FileToVox
+See `tools/scene_voxelize/ATTRIBUTION.md` for the full upstream license
+and a list of what was removed/modified.
 
-**Usage:**
+### Usage
+
 ```bash
-./tools/filetovox.sh model.glb assets/vox/model.vox --scale 128
+# one-time: fetch the three canonical benchmark scenes
+scripts/fetch-glb-presets.sh
+
+# voxelize Sponza at 16 voxels/meter (default)
+cd tools/scene_voxelize
+cargo run --release -- --models sponza
+
+# all three at higher res
+cargo run --release -- --models sponza san_miguel bistro --scale 24
 ```
 
-The `--scale` parameter controls resolution:
-- `64` — fast preview, blocky
-- `128` — good balance for most models
-- `256` — maximum MagicaVoxel resolution, high detail
+Output lands at `assets/scenes/<name>.vxs`. Both the source GLBs and
+the generated `.vxs` files live in `assets/scenes/` and are gitignored
+(too large for git) — rebuild with `fetch-glb-presets.sh` +
+`cargo run` whenever the repo is cloned fresh.
 
-## Color Handling
+### Load in-game
 
-The game registers exact RGBA colors from the .vox palette into its runtime `Palette`. Each unique color in the .vox file becomes a distinct material. The palette supports up to 255 entries total (shared across all imported models and the 10 built-in block types).
+```bash
+# high-level scene presets (pick depth automatically)
+scripts/dev.sh -- --sponza-world
+scripts/dev.sh -- --san-miguel-world
+scripts/dev.sh -- --bistro-world
 
-## Test Assets
+# or the generic .vxs path for anything custom
+scripts/dev.sh -- --vox-model assets/scenes/sponza.vxs --plain-layers 9
+```
 
-`assets/vox/` contains test models:
-- `monu1.vox`, `monu3.vox` — monuments (from MagicaVoxel samples)
-- `castle.vox` — colorful castle
-- `chr_knight.vox` — character model
-- `monu9.vox` — large monument
+## Character GLBs
+
+Small rigged characters (`assets/characters/Fox.glb`,
+`Soldier.glb`) are used by the npc pipeline — see
+`build_npc_blueprint.py` / `extract_skeleton.py`. These are separate
+from the scene voxelizer.

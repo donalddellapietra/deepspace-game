@@ -1,18 +1,24 @@
-//! Color palette: maps `u8` block indices to RGBA colors.
+//! Color palette: maps `u16` block indices to RGBA colors.
 //!
 //! The palette is the single source of truth for block definitions.
-//! Indices 0-9 are the builtin block types; 10-254 are available for
-//! imported model colors. Index 255 is reserved (no dominant block).
+//! Indices 0-9 are the builtin block types; 10..=65_534 are available
+//! for imported model colors. `u16::MAX` (65_535) is reserved as a
+//! "missing/unmapped" sentinel — never handed out by `register()`.
 //!
-//! The palette is used both CPU-side (for UI, game logic) and GPU-side
-//! (converted to `GpuPalette` for the shader).
+//! Emptiness is NOT represented in the palette. `Child::Empty` is the
+//! sole empty sentinel throughout the tree. Every palette entry is a
+//! real color meant to be rendered.
 
 use std::collections::HashMap;
 
-use super::gpu::GpuPalette;
+/// Maximum number of palette entries (u16 range, minus `u16::MAX`
+/// reserved as the "missing color" sentinel).
+pub const MAX_ENTRIES: usize = 65_535;
 
-/// Maximum number of palette entries (u8 range, minus 255 reserved).
-pub const MAX_ENTRIES: usize = 255;
+/// Invalid / "no color assigned" sentinel. Never returned by
+/// `register()`; callers that want to represent emptiness should
+/// use `Child::Empty`, not this index.
+pub const INVALID_COLOR: u16 = u16::MAX;
 
 /// A single palette entry: name + RGBA color.
 #[derive(Clone, Debug)]
@@ -21,61 +27,63 @@ pub struct PaletteEntry {
     pub color: [f32; 4],
 }
 
-/// The builtin block types. Index 0 is reserved (empty sentinel in
-/// `VoxelModel`), so builtins start at 1.
-pub const BUILTINS: &[(u8, &str, [f32; 4])] = &[
-    (1,  "Stone",  [0.50, 0.50, 0.50, 1.0]),
-    (2,  "Dirt",   [0.45, 0.30, 0.15, 1.0]),
-    (3,  "Grass",  [0.30, 0.60, 0.20, 1.0]),
-    (4,  "Wood",   [0.55, 0.35, 0.15, 1.0]),
-    (5,  "Leaf",   [0.20, 0.50, 0.10, 1.0]),
-    (6,  "Sand",   [0.85, 0.80, 0.55, 1.0]),
-    (7,  "Water",  [0.20, 0.40, 0.80, 1.0]),
-    (8,  "Brick",  [0.70, 0.30, 0.20, 1.0]),
-    (9,  "Metal",  [0.75, 0.75, 0.80, 1.0]),
-    (10, "Glass",  [0.85, 0.90, 1.00, 1.0]),
+/// The builtin block types. Builtins occupy indices 0..BUILTIN_COUNT;
+/// imported model colors register into slots `BUILTIN_COUNT..`.
+pub const BUILTINS: &[(u16, &str, [f32; 4])] = &[
+    (0, "Stone", [0.50, 0.50, 0.50, 1.0]),
+    (1, "Dirt", [0.45, 0.30, 0.15, 1.0]),
+    (2, "Grass", [0.30, 0.60, 0.20, 1.0]),
+    (3, "Wood", [0.55, 0.35, 0.15, 1.0]),
+    (4, "Leaf", [0.20, 0.50, 0.10, 1.0]),
+    (5, "Sand", [0.85, 0.80, 0.55, 1.0]),
+    (6, "Water", [0.20, 0.40, 0.80, 1.0]),
+    (7, "Brick", [0.70, 0.30, 0.20, 1.0]),
+    (8, "Metal", [0.75, 0.75, 0.80, 1.0]),
+    (9, "Glass", [0.85, 0.90, 1.00, 1.0]),
 ];
 
 /// Named constants for the builtin indices — use these instead of
-/// the old `BlockType` enum. Index 0 is reserved (empty in VoxelModel).
+/// the old `BlockType` enum.
 pub mod block {
-    pub const STONE: u8 = 1;
-    pub const DIRT:  u8 = 2;
-    pub const GRASS: u8 = 3;
-    pub const WOOD:  u8 = 4;
-    pub const LEAF:  u8 = 5;
-    pub const SAND:  u8 = 6;
-    pub const WATER: u8 = 7;
-    pub const BRICK: u8 = 8;
-    pub const METAL: u8 = 9;
-    pub const GLASS: u8 = 10;
-    pub const BUILTIN_COUNT: u8 = 11;
+    pub const STONE: u16 = 0;
+    pub const DIRT: u16 = 1;
+    pub const GRASS: u16 = 2;
+    pub const WOOD: u16 = 3;
+    pub const LEAF: u16 = 4;
+    pub const SAND: u16 = 5;
+    pub const WATER: u16 = 6;
+    pub const BRICK: u16 = 7;
+    pub const METAL: u16 = 8;
+    pub const GLASS: u16 = 9;
+    pub const BUILTIN_COUNT: u16 = 10;
 }
 
 pub struct ColorRegistry {
     entries: Vec<PaletteEntry>,
     /// Dedup: RGBA quantized to u8 -> palette index.
-    seen: HashMap<(u8, u8, u8, u8), u8>,
+    seen: HashMap<(u8, u8, u8, u8), u16>,
 }
 
 impl ColorRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
-            entries: Vec::with_capacity(MAX_ENTRIES),
+            entries: Vec::with_capacity(BUILTINS.len()),
             seen: HashMap::new(),
         };
-        // Index 0 is reserved (empty sentinel in VoxelModel).
-        reg.entries.push(PaletteEntry {
-            name: "Empty".to_string(),
-            color: [0.0, 0.0, 0.0, 0.0],
-        });
-        for &(_, name, color) in BUILTINS {
+        for &(expected_idx, name, color) in BUILTINS {
             let r = (color[0] * 255.0) as u8;
             let g = (color[1] * 255.0) as u8;
             let b = (color[2] * 255.0) as u8;
             let a = (color[3] * 255.0) as u8;
-            let idx = reg.entries.len() as u8;
-            reg.entries.push(PaletteEntry { name: name.to_string(), color });
+            let idx = reg.entries.len() as u16;
+            debug_assert_eq!(
+                idx, expected_idx,
+                "BUILTINS ordering must match registration order"
+            );
+            reg.entries.push(PaletteEntry {
+                name: name.to_string(),
+                color,
+            });
             reg.seen.insert((r, g, b, a), idx);
         }
         reg
@@ -83,10 +91,10 @@ impl ColorRegistry {
 
     /// Register an RGBA color (0-255 per channel). Returns the palette
     /// index. Deduplicates: identical colors return the same index.
-    /// Returns `None` if the palette is full (255 entries).
+    /// Returns `None` if the palette is full (`MAX_ENTRIES` entries).
     /// Transparent colors (a == 0) should not be registered — the
     /// caller should map them to `Child::Empty`.
-    pub fn register(&mut self, r: u8, g: u8, b: u8, a: u8) -> Option<u8> {
+    pub fn register(&mut self, r: u8, g: u8, b: u8, a: u8) -> Option<u16> {
         let key = (r, g, b, a);
         if let Some(&idx) = self.seen.get(&key) {
             return Some(idx);
@@ -94,7 +102,7 @@ impl ColorRegistry {
         if self.entries.len() >= MAX_ENTRIES {
             return None;
         }
-        let idx = self.entries.len() as u8;
+        let idx = self.entries.len() as u16;
         self.entries.push(PaletteEntry {
             name: format!("color_{}", idx),
             color: [
@@ -108,7 +116,7 @@ impl ColorRegistry {
         Some(idx)
     }
 
-    pub fn get(&self, index: u8) -> Option<&PaletteEntry> {
+    pub fn get(&self, index: u16) -> Option<&PaletteEntry> {
         self.entries.get(index as usize)
     }
 
@@ -116,25 +124,24 @@ impl ColorRegistry {
         self.entries.len()
     }
 
-    pub fn name(&self, index: u8) -> &str {
-        self.entries.get(index as usize)
+    pub fn name(&self, index: u16) -> &str {
+        self.entries
+            .get(index as usize)
             .map(|e| e.name.as_str())
             .unwrap_or("Unknown")
     }
 
-    pub fn color(&self, index: u8) -> [f32; 4] {
-        self.entries.get(index as usize)
+    pub fn color(&self, index: u16) -> [f32; 4] {
+        self.entries
+            .get(index as usize)
             .map(|e| e.color)
             .unwrap_or([0.3, 0.3, 0.3, 1.0])
     }
 
-    /// Convert to GPU format for the shader.
-    pub fn to_gpu_palette(&self) -> GpuPalette {
-        let mut colors = [[0.0f32; 4]; 256];
-        for (i, entry) in self.entries.iter().enumerate() {
-            colors[i] = entry.color;
-        }
-        GpuPalette { colors }
+    /// Return the full palette as a flat `Vec<[f32; 4]>` suitable for
+    /// uploading as a storage buffer (one `vec4<f32>` per index).
+    pub fn to_gpu_palette(&self) -> Vec<[f32; 4]> {
+        self.entries.iter().map(|e| e.color).collect()
     }
 }
 
@@ -151,9 +158,7 @@ mod tests {
     #[test]
     fn builtins_registered() {
         let reg = ColorRegistry::new();
-        // 1 reserved (empty) + 10 builtins = 11
-        assert_eq!(reg.len(), 11);
-        assert_eq!(reg.name(0), "Empty");
+        assert_eq!(reg.len(), block::BUILTIN_COUNT as usize);
         assert_eq!(reg.name(block::STONE), "Stone");
         assert_eq!(reg.name(block::GLASS), "Glass");
     }
@@ -164,7 +169,7 @@ mod tests {
         let a = reg.register(255, 0, 0, 255).unwrap();
         let b = reg.register(255, 0, 0, 255).unwrap();
         assert_eq!(a, b);
-        assert_eq!(reg.len(), 12);
+        assert_eq!(reg.len(), (block::BUILTIN_COUNT as usize) + 1);
     }
 
     #[test]
@@ -173,14 +178,33 @@ mod tests {
         let a = reg.register(255, 0, 0, 255).unwrap();
         let b = reg.register(0, 255, 0, 255).unwrap();
         assert_ne!(a, b);
-        assert_eq!(reg.len(), 13);
+        assert_eq!(reg.len(), (block::BUILTIN_COUNT as usize) + 2);
     }
 
     #[test]
     fn gpu_palette_roundtrip() {
         let reg = ColorRegistry::new();
         let gp = reg.to_gpu_palette();
-        assert_eq!(gp.colors[block::STONE as usize], reg.color(block::STONE));
-        assert_eq!(gp.colors[block::GLASS as usize], reg.color(block::GLASS));
+        assert_eq!(gp[block::STONE as usize], reg.color(block::STONE));
+        assert_eq!(gp[block::GLASS as usize], reg.color(block::GLASS));
+    }
+
+    #[test]
+    fn palette_overflow_returns_none() {
+        let mut reg = ColorRegistry::new();
+        // Burn through the entire palette with distinct RGBs.
+        for i in 0..(MAX_ENTRIES - block::BUILTIN_COUNT as usize) {
+            let r = (i & 0xff) as u8;
+            let g = ((i >> 8) & 0xff) as u8;
+            let b = ((i >> 16) & 0xff) as u8;
+            // alpha varies too so we don't collide with prior iters
+            let a = ((i >> 20) & 0xff) as u8;
+            let res = reg.register(r, g, b, a.max(1));
+            assert!(res.is_some(), "iter {} returned None early", i);
+        }
+        assert_eq!(reg.len(), MAX_ENTRIES);
+        // One more should fail.
+        let res = reg.register(123, 45, 67, 89);
+        assert!(res.is_none(), "65_536th register should return None");
     }
 }

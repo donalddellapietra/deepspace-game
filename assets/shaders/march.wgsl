@@ -245,7 +245,7 @@ fn march_cartesian(
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
             result.hit = true;
             result.t = max(cell_box_h.t_enter, 0.0);
-            result.color = palette.colors[(packed >> 8u) & 0xFFu].rgb;
+            result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
@@ -353,7 +353,7 @@ fn march_cartesian(
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
-                    result.color = palette.colors[bt].rgb;
+                    result.color = palette[bt].rgb;
                     result.normal = normal;
                     result.cell_min = cell_min_l;
                     result.cell_size = cur_cell_size;
@@ -362,62 +362,31 @@ fn march_cartesian(
             } else {
                 let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
 
-                // Content AABB culling + DDA init, unified. The
-                // packed child entry carries the child node's content
-                // AABB (in child-local slot coords, 0..=3) in bits
-                // 16-27 — computed at pack time by `content_aabb()`.
-                //
-                // Two wins in one ray-box:
-                //   1. If the ray misses the AABB, skip the entire
-                //      descent (including child DDA iterations).
-                //   2. If the ray hits, use `aabb_hit.t_enter` as the
-                //      DDA entry t instead of a separate ray-box
-                //      against the full child. This skips any leading
-                //      empty cells in the child between the node
-                //      boundary and the content AABB.
-                //
-                // aabb_bits == 0 is a degenerate case (should only
-                // hit empty-subtree edge cases during pack); treat it
-                // as the full node [0, 3)^3 so behavior matches the
-                // pre-AABB code.
-                let aabb_bits = (packed >> 16u) & 0xFFFu;
-                let has_aabb = aabb_bits != 0u;
-                let amin = select(
-                    vec3<f32>(0.0),
-                    vec3<f32>(
-                        f32(aabb_bits & 3u),
-                        f32((aabb_bits >> 2u) & 3u),
-                        f32((aabb_bits >> 4u) & 3u),
-                    ),
-                    has_aabb,
+                // Content-AABB cull (previously bits 16-27 of `packed`)
+                // was removed when the palette index widened from u8 to
+                // u16 — bits 16-23 now carry `block_type_hi`, leaving
+                // no 32-bit room for the 12-bit AABB. Descent always
+                // proceeds; shader still early-outs on occupancy==0 at
+                // the child header. TODO: restore via a parallel per-
+                // BFS `aabbs: array<u32>` storage buffer.
+                let child_bbox_hit = ray_box(
+                    ray_origin, inv_dir,
+                    child_origin,
+                    child_origin + vec3<f32>(3.0) * child_cell_size,
                 );
-                let amax = select(
-                    vec3<f32>(3.0),
-                    vec3<f32>(
-                        f32(((aabb_bits >> 6u) & 3u) + 1u),
-                        f32(((aabb_bits >> 8u) & 3u) + 1u),
-                        f32(((aabb_bits >> 10u) & 3u) + 1u),
-                    ),
-                    has_aabb,
-                );
-                let aabb_min_world = child_origin + amin * child_cell_size;
-                let aabb_max_world = child_origin + amax * child_cell_size;
-                let aabb_hit = ray_box(ray_origin, inv_dir, aabb_min_world, aabb_max_world);
-                if aabb_hit.t_exit <= aabb_hit.t_enter || aabb_hit.t_exit < 0.0 {
-                    // Content AABB missed. Advance parent DDA.
-                    let m_aabb = min_axis_mask(cur_side_dist);
-                    s_cell[depth] = pack_cell(cell + vec3<i32>(m_aabb) * step);
-                    cur_side_dist += m_aabb * delta_dist * cur_cell_size;
-                    normal = -vec3<f32>(step) * m_aabb;
+                if child_bbox_hit.t_exit <= child_bbox_hit.t_enter
+                    || child_bbox_hit.t_exit < 0.0
+                {
+                    let m_bbox = min_axis_mask(cur_side_dist);
+                    s_cell[depth] = pack_cell(cell + vec3<i32>(m_bbox) * step);
+                    cur_side_dist += m_bbox * delta_dist * cur_cell_size;
+                    normal = -vec3<f32>(step) * m_bbox;
                     if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
                     continue;
                 }
 
                 if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
-                // Reuse aabb_hit.t_enter as the child-DDA entry t.
-                // Leading empty cells between child boundary and AABB
-                // are skipped for free.
-                let ct_start = max(aabb_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
+                let ct_start = max(child_bbox_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
                 let local_entry = (child_entry - child_origin) / child_cell_size;
 

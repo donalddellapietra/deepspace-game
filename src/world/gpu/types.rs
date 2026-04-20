@@ -11,16 +11,20 @@ use crate::world::tree::NodeKind;
 /// slot `s` at BFS position `b` the pack emits two u32s:
 ///
 /// ```text
-/// tree[header_offset[b] + 2 + rank*2 + 0]  = packed (tag|block_type|pad)
+/// tree[header_offset[b] + 2 + rank*2 + 0]  = packed (tag|block_type_lo|block_type_hi|flags)
 /// tree[header_offset[b] + 2 + rank*2 + 1]  = node_index (tag=2)
 /// ```
 ///
-/// - `tag` (u8): 1 = Block, 2 = Node. (tag=0 never appears.)
-/// - `block_type` (u8): valid when `tag == 1` (LOD-flattened or
-///   leaf block). For `tag == 2` it carries the child's
-///   representative block — a hint the shader uses for the
-///   empty-representative fast path without descending.
-/// - `_pad` (u16): reserved for per-child flags.
+/// - `tag` (u8): 1 = Block, 2 = Node. (tag=0 never appears.) Kept at
+///   byte 0 so the shader's tag extraction is a simple `packed & 0xFFu`
+///   regardless of palette width.
+/// - `block_type_lo` + `block_type_hi` (u16 little-endian across bytes
+///   1-2): palette index. Valid when `tag == 1` (LOD-flattened or
+///   leaf block). For `tag == 2` it carries the child's representative
+///   block — a hint the shader uses for the empty-representative fast
+///   path without descending. Combined u16 gives 65 536 distinct
+///   palette entries.
+/// - `flags` (u8): reserved for per-child flags.
 /// - `node_index` (u32): BFS position of the child node when
 ///   `tag == 2`. Used to index `node_kinds[]` and `node_offsets[]`.
 ///   The header u32-offset in `tree[]` is
@@ -29,9 +33,29 @@ use crate::world::tree::NodeKind;
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
 pub struct GpuChild {
     pub tag: u8,
-    pub block_type: u8,
-    pub _pad: u16,
+    pub block_type_lo: u8,
+    pub block_type_hi: u8,
+    pub flags: u8,
     pub node_index: u32,
+}
+
+impl GpuChild {
+    #[inline]
+    pub fn new(tag: u8, block_type: u16, flags: u8, node_index: u32) -> Self {
+        let [lo, hi] = block_type.to_le_bytes();
+        Self {
+            tag,
+            block_type_lo: lo,
+            block_type_hi: hi,
+            flags,
+            node_index,
+        }
+    }
+
+    #[inline]
+    pub fn block_type(&self) -> u16 {
+        u16::from_le_bytes([self.block_type_lo, self.block_type_hi])
+    }
 }
 
 /// Per-packed-node metadata: which `NodeKind` this node is, plus
@@ -87,22 +111,10 @@ pub struct GpuCamera {
     pub fov: f32,
 }
 
-/// Block color palette — up to 256 RGBA colors indexed by block type.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct GpuPalette {
-    pub colors: [[f32; 4]; 256],
-}
-
-impl Default for GpuPalette {
-    fn default() -> Self {
-        let mut colors = [[0.0f32; 4]; 256];
-        for &(idx, _, color) in crate::world::palette::BUILTINS {
-            colors[idx as usize] = color;
-        }
-        Self { colors }
-    }
-}
+// The former fixed-size `GpuPalette` uniform struct has been removed.
+// Palette colors now live in a variable-length read-only storage
+// buffer (see `ColorRegistry::to_gpu_palette` -> `Vec<[f32; 4]>`
+// and `src/renderer/init.rs`'s palette buffer binding).
 
 #[cfg(test)]
 mod tests {
