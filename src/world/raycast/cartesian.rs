@@ -79,6 +79,16 @@ pub(super) fn cpu_raycast_with_face_depth(
     let mut iterations = 0u32;
     let max_iterations = (max_depth.max(1) * 4096).max(8192);
 
+    // `current_t` tracks the t-value at which the walker's current
+    // cell was entered. It's updated incrementally on every DDA
+    // advance (new entry = old min-side-dist) and at descent
+    // (computed precisely from the child's boundary). Returning this
+    // at a Block hit instead of re-deriving via `ray_aabb(cell)` is
+    // the difference between a usable t and 0 at deep descent —
+    // `ray_aabb` at walker depth ≥ ~14 below the render root loses
+    // all f32 precision because `cell_min - ray_origin` rounds to 0.
+    let mut current_t: f32 = t_start;
+
     loop {
         if iterations >= max_iterations || stack.is_empty() {
             break;
@@ -95,6 +105,9 @@ pub(super) fn cpu_raycast_with_face_depth(
             }
             if stack.is_empty() { break; }
             let d = stack.len() - 1;
+            let sd = stack[d].side_dist;
+            let min_sd = sd[0].min(sd[1]).min(sd[2]);
+            current_t = current_t.max(min_sd);
             advance_dda(&mut stack[d], &step, &delta_dist, &mut normal_face);
             continue;
         }
@@ -112,13 +125,16 @@ pub(super) fn cpu_raycast_with_face_depth(
 
         match child {
             Child::Empty => {
+                let sd = stack[depth].side_dist;
+                let min_sd = sd[0].min(sd[1]).min(sd[2]);
+                current_t = current_t.max(min_sd);
                 advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
             }
             Child::Block(_) => {
                 return Some(HitInfo {
                     path: path.clone(),
                     face: normal_face,
-                    t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                    t: current_t,
                     place_path: None,
                 });
             }
@@ -131,6 +147,9 @@ pub(super) fn cpu_raycast_with_face_depth(
                 // before escaping — easily exceeding the iteration
                 // budget for deep carved cavities.
                 if child_node.representative_block == 255 {
+                    let sd = stack[depth].side_dist;
+                    let min_sd = sd[0].min(sd[1]).min(sd[2]);
+                    current_t = current_t.max(min_sd);
                     advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
                     continue;
                 }
@@ -139,7 +158,7 @@ pub(super) fn cpu_raycast_with_face_depth(
                     return Some(HitInfo {
                         path: path.clone(),
                         face: normal_face,
-                        t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
+                        t: current_t,
                         place_path: None,
                     });
                 }
@@ -263,17 +282,12 @@ pub(super) fn compute_initial_side_dist(
     ]
 }
 
-pub(super) fn cell_entry_t(frame: &Frame, ray_origin: &[f32; 3], inv_dir: &[f32; 3]) -> f32 {
-    let cell_min = [
-        frame.node_origin[0] + frame.cell[0] as f32 * frame.cell_size,
-        frame.node_origin[1] + frame.cell[1] as f32 * frame.cell_size,
-        frame.node_origin[2] + frame.cell[2] as f32 * frame.cell_size,
-    ];
-    let cell_max = [
-        cell_min[0] + frame.cell_size,
-        cell_min[1] + frame.cell_size,
-        cell_min[2] + frame.cell_size,
-    ];
-    let (t_enter, _) = ray_aabb(*ray_origin, *inv_dir, cell_min, cell_max);
-    t_enter
-}
+// cell_entry_t was the old, precision-brittle way of getting the
+// ray entry time for a cell: recompute `ray_aabb` against
+// `cell_min..cell_max` in f32. At walker depth ≥ ~14 below the
+// render root the subtraction `cell_min - ray_origin` underflows
+// (both sides round to the same f32), so `t_enter` collapsed to 0
+// regardless of how far the ray had actually traveled. The DDA's
+// `side_dist` is precision-preserving because it's updated
+// incrementally from deltas, so we now track `current_t` directly
+// from `side_dist` and this function is gone.
