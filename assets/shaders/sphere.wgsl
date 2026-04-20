@@ -66,10 +66,14 @@ fn bevel_level(
     return 0.78 + 0.22 * bevel;
 }
 
-// Multi-level bevel overlay. Stacks bevel contributions from the hit
-// cell + its ancestors (3× wider each step) + its sub-cells (3×
-// finer each step), skipping any whose on-screen width is
-// sub-pixel. Gives a visible voxel grid at every resolvable scale.
+// Single-level bevel overlay. Only the hit cell itself contributes
+// a grid line — no ancestor or descendant overlays. This keeps the
+// visible voxel grid in 1:1 correspondence with actual walker cells,
+// so the cursor highlight AABB outlines the same cell the user sees.
+// (A prior multi-level stack drew coarser ancestor grids that
+// visually suggested bigger voxels than actually existed, making the
+// depth-8 highlight appear misaligned with the depth-2 "bevel cell"
+// the eye picked.)
 fn sphere_bevel_stack(
     un: f32, vn: f32,
     u_lo: f32, v_lo: f32, size: f32,
@@ -79,45 +83,7 @@ fn sphere_bevel_stack(
 ) -> f32 {
     let safe_dist = max(ray_dist, 1e-6);
     let base_px = size * reference_scale / safe_dist * pixel_density;
-
-    var b: f32 = 1.0;
-    b = b * bevel_level(un, vn, u_lo, v_lo, size, base_px);
-
-    // Ancestors: each 3× wider.
-    let UP: u32 = 4u;
-    var up_u = u_lo;
-    var up_v = v_lo;
-    var up_s = size;
-    var up_px = base_px;
-    for (var i: u32 = 0u; i < UP; i = i + 1u) {
-        up_s = up_s * 3.0;
-        up_u = floor(up_u / up_s) * up_s;
-        up_v = floor(up_v / up_s) * up_s;
-        up_px = up_px * 3.0;
-        b = b * bevel_level(un, vn, up_u, up_v, up_s, up_px);
-    }
-
-    // Descendants: each 3× finer, until sub-pixel.
-    let DN: u32 = 3u;
-    var dn_u = u_lo;
-    var dn_v = v_lo;
-    var dn_s = size;
-    var dn_px = base_px;
-    for (var i: u32 = 0u; i < DN; i = i + 1u) {
-        let child_s = dn_s * (1.0 / 3.0);
-        let child_px = dn_px * (1.0 / 3.0);
-        if child_px < 2.0 { break; }
-        let u_frac = clamp((un - dn_u) / dn_s, 0.0, 0.9999999);
-        let v_frac = clamp((vn - dn_v) / dn_s, 0.0, 0.9999999);
-        let u_idx = floor(u_frac * 3.0);
-        let v_idx = floor(v_frac * 3.0);
-        dn_u = dn_u + u_idx * child_s;
-        dn_v = dn_v + v_idx * child_s;
-        dn_s = child_s;
-        dn_px = child_px;
-        b = b * bevel_level(un, vn, dn_u, dn_v, dn_s, dn_px);
-    }
-    return b;
+    return bevel_level(un, vn, u_lo, v_lo, size, base_px);
 }
 
 // Per-ray LOD depth cap. A face cell at depth `d` has radial extent
