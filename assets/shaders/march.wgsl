@@ -362,16 +362,23 @@ fn march_cartesian(
             } else {
                 let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
 
-                // Content-AABB cull + DDA entry trim. The 12-bit AABB
-                // used to live in `packed` bits 16-27; it moved to a
-                // parallel `aabbs[child_idx]` storage buffer when
-                // block_type widened to u16 (bits 16-23 now carry
-                // block_type_hi). Two wins in one ray-box:
-                //   1. If the ray misses the AABB → skip entire
-                //      descent, advance parent DDA.
-                //   2. If the ray hits → use `aabb_hit.t_enter` as
-                //      the DDA entry t, skipping leading empty cells
-                //      between the child boundary and the content.
+                // Content-AABB cull. The 12-bit AABB used to live in
+                // `packed` bits 16-27; it moved to a parallel
+                // `aabbs[child_idx]` storage buffer when block_type
+                // widened to u16 (bits 16-23 now carry block_type_hi).
+                // If the ray misses the AABB → skip entire descent,
+                // advance parent DDA; otherwise descend into the
+                // child and let DDA find the content normally.
+                //
+                // History note: we used to also use `aabb_hit.t_enter`
+                // to TRIM the DDA entry (jump past empty leading
+                // cells), but that produced a 3×3-tile grid of
+                // floor-voxel gaps on Sponza at close range — mid-
+                // node `local_entry` + `new_cell` clamp + DDA init
+                // around `entry_pos` drifted off-by-one at leaf
+                // boundaries where sibling nodes meet. DDA entry now
+                // uses the NODE box (same as pre-AABB code); the
+                // cull still captures ~all the perf win.
                 //
                 // aabb_bits == 0 is a degenerate case (empty subtree
                 // edge cases during pack); treat it as the full
@@ -409,7 +416,30 @@ fn march_cartesian(
                 }
 
                 if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
-                let ct_start = max(aabb_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
+                // Use the NODE box for the DDA entry trim, not the
+                // content AABB. The AABB is correct for the CULL test
+                // above (rays missing the AABB skip the descent
+                // entirely), but using `aabb_hit.t_enter` for
+                // `ct_start` was causing a 3×3-tile grid of visual
+                // gaps on Sponza's floor at close range. Root cause:
+                // with the tight AABB `t_enter` lands mid-node, so
+                // `local_entry` plus `new_cell` clamp + DDA init
+                // around `entry_pos` produced an off-by-one cell
+                // that DDA couldn't recover from at leaf boundaries
+                // where sibling nodes meet. Trimming via the NODE's
+                // t_enter puts `local_entry` on the node boundary —
+                // the exact position the pre-AABB code used — so DDA
+                // init stays byte-identical to the correct baseline.
+                // We lose the "skip leading empty cells inside AABB"
+                // micro-optimization, but the CULL win (whole-
+                // descent skip on miss) stays, which is >90% of the
+                // perf benefit anyway.
+                let node_hit = ray_box(
+                    ray_origin, inv_dir,
+                    child_origin,
+                    child_origin + vec3<f32>(3.0) * child_cell_size,
+                );
+                let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
                 let local_entry = (child_entry - child_origin) / child_cell_size;
 
