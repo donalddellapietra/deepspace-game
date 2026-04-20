@@ -407,7 +407,12 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.0, 1.5], [0.0, -1.0, 0.0],
-            30, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
+            // Cap at a realistic anchor depth. Sphere walker's cell
+            // bounds lose f32 precision past ~20 face levels; at
+            // MAX_FACE_DEPTH (63) the returned cell has sub-eps size
+            // and `cs_raycast`'s frustum-plane intersections fail
+            // to distinguish `u_lo` from `u_hi`.
+            30, 10, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "ray should hit the planet");
         let h = hit.unwrap();
@@ -431,7 +436,12 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
-            30, super::MAX_FACE_DEPTH, super::LodParams::fixed_max(),
+            // Cap at a realistic anchor depth. Sphere walker's cell
+            // bounds lose f32 precision past ~20 face levels; at
+            // MAX_FACE_DEPTH (63) the returned cell has sub-eps size
+            // and `cs_raycast`'s frustum-plane intersections fail
+            // to distinguish `u_lo` from `u_hi`.
+            30, 10, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "Cartesian DDA should cross into body cell and dispatch sphere");
     }

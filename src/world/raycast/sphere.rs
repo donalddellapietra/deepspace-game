@@ -158,52 +158,21 @@ fn walk_face_subtree(
                 };
             }
             Child::Node(nid) => {
-                // Packer-equivalent flatten: if the child subtree is
-                // uniform (all-empty or single-block), treat it as a
-                // leaf at the CURRENT cell's size. This matches the
-                // shader, which reads the packed occupancy (where
-                // uniform subtrees are flattened to tag=0 or tag=1).
-                // Without this the CPU walker descends the entire
-                // uniform chain to `limit`, returning a cell with
-                // sub-eps size and numerically noisy bounds.
-                if let Some(child) = library.get(nid) {
-                    match child.uniform_type {
-                        UNIFORM_EMPTY => {
-                            // Pad path to `limit` so placement depth
-                            // stays uniform.
-                            let mut sub_un = un * 3.0 - us as f32;
-                            let mut sub_vn = vn * 3.0 - vs as f32;
-                            let mut sub_rn = rn * 3.0 - rs as f32;
-                            for _ in d..limit {
-                                let us2 = ((sub_un * 3.0) as usize).min(2);
-                                let vs2 = ((sub_vn * 3.0) as usize).min(2);
-                                let rs2 = ((sub_rn * 3.0) as usize).min(2);
-                                path.push((EMPTY_NODE, slot_index(us2, vs2, rs2)));
-                                sub_un = sub_un * 3.0 - us2 as f32;
-                                sub_vn = sub_vn * 3.0 - vs2 as f32;
-                                sub_rn = sub_rn * 3.0 - rs2 as f32;
-                            }
-                            return FaceWalk {
-                                block: EMPTY_CELL, depth: d,
-                                u_lo: child_u_lo, v_lo: child_v_lo,
-                                r_lo: child_r_lo, size: child_size,
-                                path,
-                            };
-                        }
-                        UNIFORM_MIXED => { /* real descent */ }
-                        b => {
-                            return FaceWalk {
-                                block: b, depth: d,
-                                u_lo: child_u_lo, v_lo: child_v_lo,
-                                r_lo: child_r_lo, size: child_size,
-                                path,
-                            };
-                        }
-                    }
-                }
-
+                // Descend all the way to `limit` through every
+                // Child::Node, even when the subtree is uniform.
+                // Matches Cartesian's walker: deduplicated chains
+                // are regular Child::Node pointers, and walking
+                // them preserves `hit.path.len() == limit`, so
+                // edits land at the user's chosen zoom size rather
+                // than a dedup-chunk size.
+                //
+                // For our current anchor-depth range (≤ ~15 face
+                // levels) the resulting `w.size` stays well inside
+                // f32 precision. If that range ever grows past ~20
+                // face levels, revisit — at `size < 1e-7`, cell-
+                // boundary ray-plane intersections start to fail
+                // to distinguish `u_lo` from `u_hi`.
                 if d == limit {
-                    // LOD-terminal on a MIXED subtree: use rep block.
                     let Some(child) = library.get(nid) else {
                         return FaceWalk {
                             block: EMPTY_CELL, depth: d,
@@ -212,8 +181,14 @@ fn walk_face_subtree(
                             path,
                         };
                     };
-                    let rep = child.representative_block;
-                    let bt = if rep == REPRESENTATIVE_EMPTY { EMPTY_CELL } else { rep };
+                    let bt = match child.uniform_type {
+                        UNIFORM_EMPTY => EMPTY_CELL,
+                        UNIFORM_MIXED => {
+                            let rep = child.representative_block;
+                            if rep == REPRESENTATIVE_EMPTY { EMPTY_CELL } else { rep }
+                        }
+                        b => b,
+                    };
                     return FaceWalk {
                         block: bt, depth: d,
                         u_lo: child_u_lo, v_lo: child_v_lo,
@@ -415,7 +390,20 @@ pub(super) fn cs_raycast(
         // Anchor cap first, LOD-Nyquist floor second. Matches
         // Cartesian's `at_max || at_lod` — whichever is reached
         // earlier wins.
-        let walk_depth = face_lod_depth(t, shell, lod).min(max_face_depth.max(1));
+        //
+        // `max_face_depth` is the anchor depth measured from the
+        // WORLD root, but the walker counts descents inside the
+        // face subtree alone — the path leading here already ate
+        // two levels (root → body, body → face_root), plus the
+        // Cartesian descents in `ancestor_path` before the body.
+        // Subtract those so a user at world-anchor-depth N gets a
+        // cell at face-subtree depth `N − ancestor_prefix − 2`.
+        let ancestor_prefix = ancestor_path.len() as u32;
+        let body_and_face = 2u32;
+        let walker_cap = max_face_depth
+            .saturating_sub(ancestor_prefix + body_and_face)
+            .max(1);
+        let walk_depth = face_lod_depth(t, shell, lod).min(walker_cap);
         let w = walk_face_subtree(library, face_root_id, fp.un, fp.vn, fp.rn, walk_depth);
 
         if w.block != EMPTY_CELL {
