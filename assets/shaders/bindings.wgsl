@@ -58,11 +58,23 @@ struct Uniforms {
     root_face_meta: vec4<u32>,
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
+
+    // ───────── SphereSub fields (iff root_kind == 3) ─────────
+    sub_c_body: vec4<f32>,
+    sub_j_col0: vec4<f32>,
+    sub_j_col1: vec4<f32>,
+    sub_j_col2: vec4<f32>,
+    sub_j_inv_col0: vec4<f32>,
+    sub_j_inv_col1: vec4<f32>,
+    sub_j_inv_col2: vec4<f32>,
+    sub_face_corner: vec4<f32>,
+    sub_meta: vec4<u32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
 const ROOT_KIND_FACE: u32 = 2u;
+const ROOT_KIND_SPHERE_SUB: u32 = 3u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:

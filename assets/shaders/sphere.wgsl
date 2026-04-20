@@ -457,3 +457,209 @@ fn sphere_in_cell(
 
     return result;
 }
+
+// ─────────────────────── local-frame sphere sub-frame DDA
+
+/// Terminal cell in the sub-frame's local `[0, 3)³` coords.
+struct SubWalkResult {
+    block: u32,
+    u_lo: f32,
+    v_lo: f32,
+    r_lo: f32,
+    size: f32,
+}
+
+/// Walk a sub-frame subtree along local point `(u_l, v_l, r_l) ∈ [0, 3)³`
+/// to `max_depth` levels. Mirrors CPU `walk_sub_frame` in
+/// `src/world/raycast/sphere_sub.rs`.
+fn walk_sub_frame(
+    sub_frame_idx: u32,
+    u_l_in: f32, v_l_in: f32, r_l_in: f32,
+    max_depth: u32,
+) -> SubWalkResult {
+    var res: SubWalkResult;
+    res.block = FACE_WALK_EMPTY;
+    res.u_lo = 0.0;
+    res.v_lo = 0.0;
+    res.r_lo = 0.0;
+    res.size = 3.0;
+
+    let clamp_max = 0.9999999 * 3.0;
+    var u_pt = clamp(u_l_in, 0.0, clamp_max);
+    var v_pt = clamp(v_l_in, 0.0, clamp_max);
+    var r_pt = clamp(r_l_in, 0.0, clamp_max);
+
+    var node_idx = sub_frame_idx;
+    var u_lo: f32 = 0.0;
+    var v_lo: f32 = 0.0;
+    var r_lo: f32 = 0.0;
+    var size: f32 = 3.0;
+
+    for (var d: u32 = 1u; d <= max_depth; d = d + 1u) {
+        let base = node_offsets[node_idx];
+        if ENABLE_STATS { ray_loads_offsets = ray_loads_offsets + 1u; }
+        let occupancy = tree[base];
+        let first_child = tree[base + 1u];
+        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
+
+        let child_size = size / 3.0;
+        let us = min(u32((u_pt - u_lo) / child_size), 2u);
+        let vs = min(u32((v_pt - v_lo) / child_size), 2u);
+        let rs = min(u32((r_pt - r_lo) / child_size), 2u);
+        let slot = rs * 9u + vs * 3u + us;
+        let cu_lo = u_lo + f32(us) * child_size;
+        let cv_lo = v_lo + f32(vs) * child_size;
+        let cr_lo = r_lo + f32(rs) * child_size;
+
+        let mask = (occupancy >> slot) & 1u;
+        if mask == 0u {
+            res.u_lo = cu_lo;
+            res.v_lo = cv_lo;
+            res.r_lo = cr_lo;
+            res.size = child_size;
+            return res;
+        }
+        let rank = countOneBits(occupancy & ((1u << slot) - 1u));
+        let packed = tree[first_child + rank * 2u];
+        let node_index = tree[first_child + rank * 2u + 1u];
+        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
+        let tag = packed & 0xFFu;
+        if tag == 1u {
+            res.block = child_block_type(packed);
+            res.u_lo = cu_lo;
+            res.v_lo = cv_lo;
+            res.r_lo = cr_lo;
+            res.size = child_size;
+            return res;
+        }
+        if d == max_depth {
+            res.block = child_block_type(packed);
+            res.u_lo = cu_lo;
+            res.v_lo = cv_lo;
+            res.r_lo = cr_lo;
+            res.size = child_size;
+            return res;
+        }
+        node_idx = node_index;
+        u_lo = cu_lo;
+        v_lo = cv_lo;
+        r_lo = cr_lo;
+        size = child_size;
+    }
+    res.u_lo = u_lo;
+    res.v_lo = v_lo;
+    res.r_lo = r_lo;
+    res.size = size;
+    return res;
+}
+
+/// Return `(t_enter, t_exit)` for the ray crossing the local
+/// `[0, 3)³` cube. `t_exit ≤ 0` → miss.
+fn ray_sub_box_interval(ro: vec3<f32>, rd: vec3<f32>) -> vec2<f32> {
+    var t_lo: f32 = -1e30;
+    var t_hi: f32 =  1e30;
+    for (var axis: u32 = 0u; axis < 3u; axis = axis + 1u) {
+        let o = ro[axis];
+        let d = rd[axis];
+        if abs(d) < 1e-30 {
+            if o < 0.0 || o >= 3.0 {
+                return vec2<f32>(1e30, -1e30);
+            }
+            continue;
+        }
+        let t0 = (0.0 - o) / d;
+        let t1 = (3.0 - o) / d;
+        let a = min(t0, t1);
+        let b = max(t0, t1);
+        t_lo = max(t_lo, a);
+        t_hi = min(t_hi, b);
+    }
+    return vec2<f32>(t_lo, t_hi);
+}
+
+/// Axis-exit t for a cell `[lo, lo+size]` along one axis. Returns
+/// +∞ for rays parallel / going backward through both faces.
+fn sub_axis_exit_t(p: f32, d: f32, lo: f32, hi: f32) -> f32 {
+    if d > 1e-30  { return (hi - p) / d; }
+    if d < -1e-30 { return (lo - p) / d; }
+    return 1e30;
+}
+
+/// Local-frame sphere DDA. GPU mirror of CPU `cs_raycast_local`.
+/// `ray_origin_local`, `ray_dir_local` are already in sub-frame local
+/// coords (J_inv applied CPU-side on the camera basis).
+fn sphere_in_sub_frame(
+    sub_frame_idx: u32,
+    ray_origin_local: vec3<f32>,
+    ray_dir_local: vec3<f32>,
+    walker_limit: u32,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    if walker_limit == 0u { return result; }
+
+    let interval = ray_sub_box_interval(ray_origin_local, ray_dir_local);
+    let t_enter = interval.x;
+    let t_exit  = interval.y;
+    if t_exit <= 0.0 || t_enter >= t_exit { return result; }
+
+    let t_span = max(abs(t_exit - t_enter), 1e-30);
+    let t_nudge = t_span * 1e-5;
+    var t = max(t_enter, 0.0) + t_nudge;
+
+    var steps: u32 = 0u;
+    loop {
+        if t >= t_exit || steps > 4096u { break; }
+        steps = steps + 1u;
+        if ENABLE_STATS { ray_steps = ray_steps + 1u; }
+
+        let pos = ray_origin_local + ray_dir_local * t;
+        if pos.x < 0.0 || pos.x >= 3.0
+            || pos.y < 0.0 || pos.y >= 3.0
+            || pos.z < 0.0 || pos.z >= 3.0 { break; }
+
+        let w = walk_sub_frame(sub_frame_idx, pos.x, pos.y, pos.z, walker_limit);
+
+        if w.block != FACE_WALK_EMPTY {
+            // Shade the hit. Surface coloring uses simple radial
+            // tinting + axis tint from the cell's exit face. The
+            // full body-XYZ normal would require mapping local back
+            // via the Jacobian, which the shader doesn't carry as a
+            // matrix yet — `-ray_dir_local` normalized suffices for
+            // diffuse lighting (backface avoidance) since the ray
+            // came from outside the cell.
+            result.hit = true;
+            result.t = t;
+            let n_approx = normalize(-ray_dir_local);
+            result.normal = n_approx;
+            let sun = normalize(vec3<f32>(0.4, 0.7, 0.3));
+            let diffuse = max(dot(n_approx, sun), 0.0);
+            let ambient = 0.25;
+            let rn_abs = uniforms.sub_face_corner.z
+                + w.r_lo * uniforms.sub_face_corner.w / 3.0;
+            let tint = 0.55 + 0.45 * clamp(rn_abs, 0.0, 1.0);
+            result.color = palette[w.block].rgb
+                * (ambient + diffuse * 0.78) * tint;
+            result.cell_min = vec3<f32>(w.u_lo, w.v_lo, w.r_lo);
+            result.cell_size = w.size;
+            return result;
+        }
+
+        // Advance past this empty cell. All six boundaries are
+        // axis-aligned in local coords by the linearization.
+        let t_u = sub_axis_exit_t(pos.x, ray_dir_local.x, w.u_lo, w.u_lo + w.size);
+        let t_v = sub_axis_exit_t(pos.y, ray_dir_local.y, w.v_lo, w.v_lo + w.size);
+        let t_r = sub_axis_exit_t(pos.z, ray_dir_local.z, w.r_lo, w.r_lo + w.size);
+        let t_min = min(min(t_u, t_v), t_r);
+        if t_min <= 0.0 || t_min >= 1e29 { break; }
+        t = t + t_min + t_nudge;
+    }
+
+    return result;
+}

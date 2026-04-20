@@ -588,37 +588,37 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        // For `SphereSub` the shader works in the frame's linearized
-        // local `[0, 3)³` via `J_inv`; the app-level cam_local is in
-        // body-local coords and the shader transforms into local on
-        // entry (see `sphere_in_sub_frame`). For `Body` / `Cartesian`
-        // the renderer already expects cam in `render_path`-local.
-        let cam_local = match frame.kind {
-            ActiveFrameKind::SphereSub(sub) => self.camera.position.in_frame(&sub.body_path),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+        // `cam_local` is the camera's position in the render frame's
+        // local `[0, 3)³`. For Cartesian/Body/SphereSub alike this
+        // comes from the anchor-path ribbon-pop — no body-XYZ
+        // subtraction (which would collapse in f32 for deep SphereSub).
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
+        let (fwd_world, right_world, up_world) = self.camera.basis();
+        let (fwd_local, right_local, up_local) = match frame.kind {
+            ActiveFrameKind::SphereSub(sub) => {
+                // Sub-frame local basis isn't world-axis-aligned:
+                // rotate + scale via J_inv. |basis_local| ≈ 3^depth
+                // (large but well within f32 range); DDA operates on
+                // t ratios so the magnitude doesn't affect ordering.
+                (
+                    crate::world::cubesphere::mat3_mul_vec(&sub.j_inv, fwd_world),
+                    crate::world::cubesphere::mat3_mul_vec(&sub.j_inv, right_world),
+                    crate::world::cubesphere::mat3_mul_vec(&sub.j_inv, up_world),
+                )
             }
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
+                crate::world::sdf::normalize(fwd_world),
+                crate::world::sdf::normalize(right_world),
+                crate::world::sdf::normalize(up_world),
+            ),
         };
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",
+                "gpu_camera frame_kind={:?} render_path={:?} cam_local={:?} |fwd|={:.3e}",
                 frame.kind,
                 frame.render_path.as_slice(),
-                frame.logical_path.as_slice(),
                 cam_local,
-            );
-        }
-        let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::normalize(fwd_world);
-        let right_local = crate::world::sdf::normalize(right_world);
-        let up_local = crate::world::sdf::normalize(up_world);
-        if self.startup_profile_frames < 4 {
-            eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
-                fwd_world,
-                fwd_local,
-                right_local,
-                up_local,
+                crate::world::sdf::length(fwd_local),
             );
         }
         self.camera.gpu_camera_with_basis(

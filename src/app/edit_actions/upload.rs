@@ -268,12 +268,14 @@ impl App {
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::SphereSub(sub) => {
-                    // TODO: switch to set_root_kind_sphere_sub once
-                    // the shader's sphere_in_sub_frame lands. For now
-                    // render via the body kind — the shader's body
-                    // march is precision-bound above depth ~15 but
-                    // correct at shallower zoom.
-                    renderer.set_root_kind_body(sub.inner_r, sub.outer_r);
+                    renderer.set_root_kind_sphere_sub(
+                        sub.inner_r, sub.outer_r,
+                        sub.face as u32,
+                        [sub.un_corner, sub.vn_corner, sub.rn_corner, sub.frame_size],
+                        sub.c_body,
+                        sub.j,
+                        sub.j_inv,
+                    );
                 }
                 ActiveFrameKind::Body { inner_r, outer_r } => {
                     renderer.set_root_kind_body(inner_r, outer_r);

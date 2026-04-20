@@ -47,6 +47,10 @@ pub const MAX_RIBBON_LEN: usize = 64;
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
 pub const ROOT_KIND_FACE: u32 = 2;
+/// Face-subtree render frame at face-subtree depth ≥ 3 — shader
+/// dispatches the linearized local-frame sphere DDA in
+/// `sphere_in_sub_frame`.
+pub const ROOT_KIND_SPHERE_SUB: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -72,13 +76,29 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Body radii (used iff `root_kind == 1`). Stored in the body
-    /// cell's local `[0, 1)` frame; the shader scales by 3.0
+    /// Body radii (used iff `root_kind == 1` or `3`). Stored in the
+    /// body cell's local `[0, 1)` frame; the shader scales by 3.0
     /// (= WORLD_SIZE) to get shader-frame units.
     pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_face_pop_pos: [f32; 4],
+
+    // ───────── SphereSub fields (iff root_kind == 3) ─────────
+    /// Body-XYZ of local (0, 0, 0) — sub-frame corner. xyz used.
+    pub sub_c_body: [f32; 4],
+    /// Jacobian columns. xyz used.
+    pub sub_j_col0: [f32; 4],
+    pub sub_j_col1: [f32; 4],
+    pub sub_j_col2: [f32; 4],
+    /// Inverse Jacobian columns. xyz used.
+    pub sub_j_inv_col0: [f32; 4],
+    pub sub_j_inv_col1: [f32; 4],
+    pub sub_j_inv_col2: [f32; 4],
+    /// xyzw = (un_corner, vn_corner, rn_corner, frame_size).
+    pub sub_face_corner: [f32; 4],
+    /// x = face index (0..5), rest padding.
+    pub sub_meta: [u32; 4],
 }
 
 pub struct Renderer {
@@ -135,6 +155,15 @@ pub struct Renderer {
     pub(super) root_face_meta: [u32; 4],
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
+    pub(super) sub_c_body: [f32; 4],
+    pub(super) sub_j_col0: [f32; 4],
+    pub(super) sub_j_col1: [f32; 4],
+    pub(super) sub_j_col2: [f32; 4],
+    pub(super) sub_j_inv_col0: [f32; 4],
+    pub(super) sub_j_inv_col1: [f32; 4],
+    pub(super) sub_j_inv_col2: [f32; 4],
+    pub(super) sub_face_corner: [f32; 4],
+    pub(super) sub_meta: [u32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -277,6 +306,7 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
+        self.clear_sub_fields();
         self.write_uniforms();
     }
 
@@ -288,6 +318,7 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
+        self.clear_sub_fields();
         self.write_uniforms();
     }
 
@@ -306,7 +337,55 @@ impl Renderer {
         self.root_face_meta = [face_id, 0, 0, 0];
         self.root_face_bounds = bounds;
         self.root_face_pop_pos = [0.0; 4];
+        self.clear_sub_fields();
         self.write_uniforms();
+    }
+
+    /// Frame root is a deep face-subtree cell — shader dispatches
+    /// the linearized local-frame sphere DDA (`sphere_in_sub_frame`).
+    ///
+    /// `corner_and_size = (un, vn, rn, frame_size)` in face-normalized
+    /// absolute coords. `c_body` is the body-XYZ of local (0,0,0).
+    /// `j` is the local→body Jacobian (columns are ∂body/∂{u_l, v_l,
+    /// r_l}); `j_inv` is its inverse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_root_kind_sphere_sub(
+        &mut self,
+        inner_r: f32,
+        outer_r: f32,
+        face_id: u32,
+        corner_and_size: [f32; 4],
+        c_body: [f32; 3],
+        j: [[f32; 3]; 3],
+        j_inv: [[f32; 3]; 3],
+    ) {
+        self.root_kind = ROOT_KIND_SPHERE_SUB;
+        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
+        self.root_face_meta = [0; 4];
+        self.root_face_bounds = [0.0; 4];
+        self.root_face_pop_pos = [0.0; 4];
+        self.sub_c_body = [c_body[0], c_body[1], c_body[2], 0.0];
+        self.sub_j_col0 = [j[0][0], j[0][1], j[0][2], 0.0];
+        self.sub_j_col1 = [j[1][0], j[1][1], j[1][2], 0.0];
+        self.sub_j_col2 = [j[2][0], j[2][1], j[2][2], 0.0];
+        self.sub_j_inv_col0 = [j_inv[0][0], j_inv[0][1], j_inv[0][2], 0.0];
+        self.sub_j_inv_col1 = [j_inv[1][0], j_inv[1][1], j_inv[1][2], 0.0];
+        self.sub_j_inv_col2 = [j_inv[2][0], j_inv[2][1], j_inv[2][2], 0.0];
+        self.sub_face_corner = corner_and_size;
+        self.sub_meta = [face_id, 0, 0, 0];
+        self.write_uniforms();
+    }
+
+    fn clear_sub_fields(&mut self) {
+        self.sub_c_body = [0.0; 4];
+        self.sub_j_col0 = [0.0; 4];
+        self.sub_j_col1 = [0.0; 4];
+        self.sub_j_col2 = [0.0; 4];
+        self.sub_j_inv_col0 = [0.0; 4];
+        self.sub_j_inv_col1 = [0.0; 4];
+        self.sub_j_inv_col2 = [0.0; 4];
+        self.sub_face_corner = [0.0; 4];
+        self.sub_meta = [0; 4];
     }
 
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {

@@ -832,7 +832,15 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         // containing body, and we handle it as BODY.
         let cur_kind = node_kinds[current_idx].kind;
         var r: HitResult;
-        if cur_kind == 1u {
+        if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_SPHERE_SUB {
+            // Initial frame is a deep face-subtree cell. Ray is
+            // already in sub-frame local coords (J_inv applied CPU-
+            // side to the camera basis). Local-coord DDA preserves
+            // f32 precision at arbitrary face-subtree depth.
+            r = sphere_in_sub_frame(
+                current_idx, ray_origin, ray_dir, uniforms.max_depth,
+            );
+        } else if cur_kind == 1u {
             // Body: whole-sphere march, body fills [0, 3)³.
             r = sphere_in_cell(
                 current_idx, vec3<f32>(0.0), 3.0,
