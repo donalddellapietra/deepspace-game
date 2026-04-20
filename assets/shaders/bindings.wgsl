@@ -218,6 +218,18 @@ var<private> ray_loads_ribbon: u32 = 0u;
 /// cost. Default off; the harness enables it via `--shader-stats`.
 override ENABLE_STATS: bool = false;
 
+/// Pipeline-override constant: compiles out the tag==3 (EntityRef)
+/// dispatch entirely when `false`. Fractal / sphere preset worlds
+/// never produce entity cells (the scene overlay collapses to
+/// `world.root`), so the branch + the `march_entity_subtree` call
+/// it guards are dead at compile time and the WGSL compiler
+/// eliminates them. Skipped on Jerusalem nucleus 2560x1440 this
+/// recovers ~1 ms/frame vs a runtime `entity_count > 0` gate.
+///
+/// Default off; the renderer turns it on when App has entities in
+/// ray-march mode.
+override ENABLE_ENTITIES: bool = false;
+
 /// Pipeline-override constant: Nyquist pixel floor. Acts as a
 /// minimum — a Node child is treated as a LOD terminal when its
 /// projected screen size is below this many pixels

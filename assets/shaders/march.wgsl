@@ -456,9 +456,18 @@ fn march_cartesian(
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
             return result;
-        } else if tag == 3u {
-            // tag=3 — EntityRef. The cell is a per-frame scene
-            // overlay; the entity's actual bbox is the (sub-cell)
+        } else if ENABLE_ENTITIES && tag == 3u {
+            // tag=3 — EntityRef. Guarded by the compile-time
+            // `ENABLE_ENTITIES` override: fractal / sphere preset
+            // worlds never produce tag=3 children, so the shader
+            // compiler DCEs this branch + the call into
+            // `march_entity_subtree` entirely. Measured on
+            // Jerusalem nucleus 2560x1440: ENABLE_ENTITIES=false
+            // recovers ~2 ms/frame (~6%) vs leaving the branch
+            // runtime-present.
+            //
+            // The cell is a per-frame scene overlay; the entity's
+            // actual bbox is the (sub-cell)
             // box from `entities[idx]`. Ray-box cull against that
             // bbox first so sub-cell motion is cheap — no tree
             // rebuild needed to reflect the new position.

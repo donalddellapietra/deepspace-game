@@ -64,6 +64,7 @@ pub(super) fn create_dummy_mask_view(device: &wgpu::Device) -> wgpu::TextureView
 }
 
 impl Renderer {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
         tree: &[u32],
@@ -76,6 +77,7 @@ impl Renderer {
         lod_pixel_threshold: f32,
         live_sample_every_frames: u32,
         taa_enabled: bool,
+        entities_enabled: bool,
     ) -> Self {
         // On web, winit's `inner_size` lags behind the canvas backing
         // store (request_inner_size doesn't apply synchronously and
@@ -453,9 +455,11 @@ impl Renderer {
 
         let lod_pixels_const = lod_pixel_threshold as f64;
         let enable_stats_const = if shader_stats_enabled { 1.0 } else { 0.0 };
-        let override_constants: [(&str, f64); 2] = [
+        let enable_entities_const = if entities_enabled { 1.0 } else { 0.0 };
+        let override_constants: [(&str, f64); 3] = [
             ("ENABLE_STATS", enable_stats_const),
             ("LOD_PIXEL_THRESHOLD", lod_pixels_const),
+            ("ENABLE_ENTITIES", enable_entities_const),
         ];
         let frag_compilation_options = wgpu::PipelineCompilationOptions {
             constants: &override_constants,

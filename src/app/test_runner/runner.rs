@@ -194,6 +194,10 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         cfg.lod_pixels.unwrap_or(1.0),
         cfg.live_sample_every_frames.unwrap_or(0),
         cfg.taa,
+        // Compile-time entity-branch gate: only compile the tag==3
+        // path into the ray-march shader when the world preset can
+        // actually produce entity cells (flat / vox, not fractals).
+        crate::world::bootstrap::surface_y_for_preset(&cfg.world_preset).is_some(),
     ));
     let mut renderer = renderer;
     renderer.update_palette(&app.palette.to_gpu_palette());
