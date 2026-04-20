@@ -53,8 +53,8 @@ for n in $FRAMES; do
         --render-harness \
         --disable-overlay --disable-highlight \
         --plain-world --plain-layers 10 \
-        --spawn-depth 2 --spawn-xyz 1.5 1.5 2.7 \
-        --spawn-yaw 0 --spawn-pitch -0.4 \
+        --spawn-depth 3 --spawn-xyz 1.5 1.1 2.0 \
+        --spawn-yaw 0 --spawn-pitch -0.3 \
         --harness-width 320 --harness-height 180 \
         --exit-after-frames "$n" --timeout-secs 10 \
         --spawn-entity assets/vox/soldier.vox --spawn-entity-count 1 \
