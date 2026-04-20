@@ -63,6 +63,7 @@ pub fn cpu_raycast_in_frame(
     ray_dir: [f32; 3],
     max_depth: u32,
     max_face_depth: u32,
+    pixel_density: f32,
 ) -> Option<HitInfo> {
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
     let effective_depth = chain.len() - 1;
@@ -81,14 +82,15 @@ pub fn cpu_raycast_in_frame(
         // root_kind). When the frame IS a sphere body, the body's
         // children aren't Cartesian XYZ slots — they're 6 face
         // subtrees + interior + voids. Dispatch directly into sphere
-        // DDA; the body fills the [0, 3)³ frame.
+        // DDA with pixel-density LOD so the CPU lands on the same
+        // cell the shader renders.
         let frame_kind = library.get(frame_root_id).map(|n| n.kind);
         let hit_opt = if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
             sphere::cs_raycast_in_body(
                 library, frame_root_id, [0.0; 3], 3.0,
                 inner_r, outer_r,
                 ray_origin, ray_dir,
-                &[], max_face_depth,
+                &[], pixel_density,
             )
         } else {
             cartesian::cpu_raycast_with_face_depth(
@@ -283,7 +285,7 @@ mod tests {
         );
         let frame_hit = cpu_raycast_in_frame(
             &world.library, world.root,
-            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6,
+            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6, 263.0,
         );
         assert!(world_hit.is_some());
         assert!(frame_hit.is_some());
@@ -301,7 +303,7 @@ mod tests {
         let dir = [0.7, 0.7, 0.0];
         let _ = cpu_raycast_in_frame(
             &world.library, world.root,
-            &frame_path, cam, dir, 8, 6,
+            &frame_path, cam, dir, 8, 6, 263.0,
         );
     }
 
@@ -310,7 +312,7 @@ mod tests {
         let world = plain_test_world();
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
-            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6,
+            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6, 263.0,
         ).expect("should hit ground");
         assert_eq!(hit.path[0].0, world.root);
     }
@@ -329,7 +331,7 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[16u8], [1.5, 0.0, 1.5], [0.0, -0.9320391, -0.3623577],
-            3, 1,
+            3, 1, 263.0,
         );
         assert!(hit.is_some(), "ray should hit planet");
         assert_eq!(hit.unwrap().face, 4, "should be sphere hit (face=4)");
@@ -348,7 +350,7 @@ mod tests {
 
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
-            &[13u8], [1.5, 1.5, 1.5], [0.0, -1.0, 0.0], 10, 4,
+            &[13u8], [1.5, 1.5, 1.5], [0.0, -1.0, 0.0], 10, 4, 263.0,
         );
         if let Some(h) = &hit {
             assert_eq!(h.face, 4,
@@ -383,7 +385,7 @@ mod tests {
             let hit = cpu_raycast_in_frame(
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
-                edit_depth, 6,
+                edit_depth, 6, 263.0,
             );
 
             assert!(hit.is_some(),
@@ -434,7 +436,7 @@ mod tests {
             let hit = cpu_raycast_in_frame(
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
-                edit_depth, 6,
+                edit_depth, 6, 263.0,
             );
 
             assert!(hit.is_some(),

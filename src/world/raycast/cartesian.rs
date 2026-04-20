@@ -135,7 +135,7 @@ pub(super) fn cpu_raycast_with_face_depth(
                         parent_origin[2] + cell[2] as f32 * parent_cell_size,
                     ];
                     let body_size = parent_cell_size;
-                    if let Some(sphere_hit) = sphere::cs_raycast_in_body(
+                    if let Some(sphere_hit) = sphere::cs_raycast_in_body_depth_capped(
                         library, child_id, body_origin, body_size,
                         inner_r, outer_r,
                         ray_origin, ray_dir,

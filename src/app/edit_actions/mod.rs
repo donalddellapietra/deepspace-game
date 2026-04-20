@@ -64,6 +64,20 @@ impl App {
         let frame_path = self.active_frame.render_path;
         let cam_local = self.camera.position.in_frame(&frame_path);
         let ray_dir = self.ray_dir_in_frame(&frame_path);
+        // Pixel density = screen_height / (2 tan(fov/2)). Drives the
+        // CPU sphere raycast's per-ray LOD cap to match the shader's
+        // so the crosshair's hit cell is the same cell the shader
+        // rendered (was previously a deeper sub-cell, causing the
+        // highlight AABB to land inside a chunky visible voxel).
+        let screen_height = self
+            .renderer
+            .as_ref()
+            .map(|r| r.screen_height() as f32)
+            .unwrap_or(720.0);
+        // Camera FOV is a fixed 1.2 radians in this build (see
+        // `renderer::init::new`). If it becomes configurable the CPU
+        // + GPU paths both need to read the same value.
+        let pixel_density = screen_height / (2.0 * (1.2_f32 * 0.5).tan());
         let hit = raycast::cpu_raycast_in_frame(
             &self.world.library,
             self.world.root,
@@ -72,6 +86,7 @@ impl App {
             ray_dir,
             self.edit_depth(),
             self.cs_edit_depth(),
+            pixel_density,
         );
         if hit.is_none() && self.startup_profile_frames < 16 {
             eprintln!(

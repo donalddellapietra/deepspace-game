@@ -266,6 +266,12 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
+    /// Surface height in physical pixels. Used by the CPU raycast
+    /// to match the shader's per-ray LOD cap.
+    pub fn screen_height(&self) -> u32 {
+        self.config.height
+    }
+
     /// Set the frame-root NodeKind to Cartesian (default).
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
