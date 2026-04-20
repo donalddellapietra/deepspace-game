@@ -55,6 +55,18 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
+        // LOD params match the shader's `face_lod_depth`: the CPU
+        // raycast picks the SAME terminal cell the GPU does so the
+        // break / highlight / render all agree.
+        // FOV is hardcoded to 1.2 rad in the camera upload path
+        // (see `event_loop.rs`); keep the same constant here so
+        // `face_lod_depth` matches the shader.
+        const FOV_RAD: f32 = 1.2;
+        let lod = raycast::LodParams {
+            pixel_density: self.harness_height as f32
+                / (2.0 * (FOV_RAD * 0.5).tan()),
+            lod_threshold: self.lod_pixel_threshold.max(1e-3),
+        };
         let (hit, cap_frame_path) = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
@@ -72,7 +84,7 @@ impl App {
                     sphere.body_path.as_slice(),
                     cam_body,
                     ray_dir,
-                    self.cs_edit_depth(),
+                    lod,
                     window,
                     sphere.inner_r,
                     sphere.outer_r,
@@ -94,7 +106,7 @@ impl App {
                     cam_local,
                     ray_dir,
                     self.edit_depth(),
-                    self.cs_edit_depth(),
+                    lod,
                 );
                 if hit.is_none() && self.startup_profile_frames < 16 {
                     eprintln!(
@@ -139,13 +151,16 @@ impl App {
                 hit.is_some(),
             );
             if let Some(ref h) = hit {
-                let (aabb_min, aabb_max) = match self.active_frame.kind {
-                    ActiveFrameKind::Sphere(_) => {
-                        aabb::hit_aabb_body_local(&self.world.library, h)
-                    }
-                    ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                        aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
-                    }
+                // Sphere hits always use `hit_aabb_body_local` (the
+                // body-local cube derived from the hit cell's face-
+                // space bounds). Cartesian-path AABB would decode
+                // the face-subtree slot indices as XYZ and produce
+                // garbage bounds, whether the render frame is Body,
+                // Sphere, or has somehow popped elsewhere.
+                let (aabb_min, aabb_max) = if h.sphere_cell.is_some() {
+                    aabb::hit_aabb_body_local(&self.world.library, h)
+                } else {
+                    aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
                 };
                 eprintln!(
                     "frame_raycast_hit path_len={} face={} t={} place_path_len={:?} terminal={} aabb_min={:?} aabb_max={:?} path_kinds={:?}",

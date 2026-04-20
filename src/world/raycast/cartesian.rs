@@ -3,7 +3,7 @@
 //! dispatches into `sphere::cs_raycast` when it descends into a
 //! `CubedSphereBody` child.
 
-use super::sphere;
+use super::sphere::{self, LodParams};
 use super::HitInfo;
 use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
@@ -18,15 +18,16 @@ pub(super) struct Frame {
 
 /// Stack-based Cartesian DDA over the unified tree. `max_depth`
 /// caps how deep the walker descends; the deepest cell at that
-/// depth is the hit granularity. `max_face_depth` is propagated
-/// into sphere dispatch when the DDA crosses a body cell.
+/// depth is the hit granularity. `lod` is propagated into sphere
+/// dispatch when the DDA crosses a body cell, so the CPU picks
+/// the same terminal cell the shader does.
 pub(super) fn cpu_raycast_with_face_depth(
     library: &NodeLibrary,
     root: NodeId,
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
-    max_face_depth: u32,
+    lod: LodParams,
 ) -> Option<HitInfo> {
     let inv_dir = [
         if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
@@ -121,6 +122,7 @@ pub(super) fn cpu_raycast_with_face_depth(
                     face: normal_face,
                     t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
                     place_path: None,
+                    sphere_cell: None,
                 });
             }
             Child::Node(child_id) => {
@@ -141,7 +143,7 @@ pub(super) fn cpu_raycast_with_face_depth(
                         inner_r, outer_r,
                         ray_origin, ray_dir,
                         &path[..=depth],
-                        max_face_depth,
+                        lod,
                         None,
                     ) {
                         return Some(hit);
@@ -168,6 +170,7 @@ pub(super) fn cpu_raycast_with_face_depth(
                         face: normal_face,
                         t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
                         place_path: None,
+                        sphere_cell: None,
                     });
                 }
 

@@ -236,12 +236,12 @@ mod tests {
         anchor.push(13);
         anchor.push(14);
         let f = compute_render_frame(&lib, root, &anchor, 2);
-        match f.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                assert_eq!(sphere.face, Face::PosX);
-                assert_eq!(sphere.face_size, 1.0);
-            }
-            _ => panic!("expected Sphere"),
-        }
+        // The anchor path would descend XYZ-slot-16 of the body
+        // into the PosX face root, but descent STOPS at the body
+        // (XYZ slots inside a body are partitioned by cubemap
+        // geometry, not tree slots — the shader handles sub-body
+        // detail via `sphere_in_cell`).
+        assert!(matches!(f.kind, ActiveFrameKind::Body { .. }));
+        assert_eq!(f.render_path.depth(), 1);
     }
 }

@@ -70,9 +70,12 @@ impl App {
                 tree_hit.is_some(),
             );
         }
-        let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
-            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, hit),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+        // Sphere hits use body-local AABB regardless of frame kind.
+        // See `frame_aware_raycast` for the rationale.
+        let aabb = tree_hit.as_ref().map(|hit| {
+            if hit.sphere_cell.is_some() {
+                aabb::hit_aabb_body_local(&self.world.library, hit)
+            } else {
                 aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
             }
         });

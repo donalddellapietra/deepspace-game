@@ -51,10 +51,39 @@ pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [
 }
 
 /// Body-local AABB for a sphere hit: the eight corners of the
-/// face-subtree cell, expressed in the body cell's local frame
-/// (so the highlight shader gets a precise box regardless of how
-/// deep the render frame has popped).
+/// terminal face-subtree cell, expressed in the body cell's local
+/// frame so the highlight box aligns pixel-precisely with the
+/// rendered cell regardless of render-frame pop depth.
+///
+/// Prefers `hit.sphere_cell` (recorded at the shader's exact LOD
+/// terminal) over `hit.path` reconstruction — the path can be
+/// shorter than the visible cell when the walker terminated early
+/// on a uniform subtree, which would produce a coarser AABB than
+/// what's visible on screen.
 pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
+    if let Some(cell) = hit.sphere_cell {
+        let face = Face::from_index(cell.face as u8);
+        let u0 = cell.u_lo;
+        let v0 = cell.v_lo;
+        let r0 = cell.r_lo;
+        let du = cell.size;
+        let corners = [
+            face_space_to_body_point(face, u0,      v0,      r0,      cell.inner_r, cell.outer_r, WORLD_SIZE),
+            face_space_to_body_point(face, u0 + du, v0,      r0,      cell.inner_r, cell.outer_r, WORLD_SIZE),
+            face_space_to_body_point(face, u0,      v0 + du, r0,      cell.inner_r, cell.outer_r, WORLD_SIZE),
+            face_space_to_body_point(face, u0 + du, v0 + du, r0,      cell.inner_r, cell.outer_r, WORLD_SIZE),
+            face_space_to_body_point(face, u0,      v0,      r0 + du, cell.inner_r, cell.outer_r, WORLD_SIZE),
+            face_space_to_body_point(face, u0 + du, v0,      r0 + du, cell.inner_r, cell.outer_r, WORLD_SIZE),
+            face_space_to_body_point(face, u0,      v0 + du, r0 + du, cell.inner_r, cell.outer_r, WORLD_SIZE),
+            face_space_to_body_point(face, u0 + du, v0 + du, r0 + du, cell.inner_r, cell.outer_r, WORLD_SIZE),
+        ];
+        return bounding_box(&corners);
+    }
+
+    // Fallback: path-derived AABB (legacy). Only reached when the
+    // hit was produced by a code path that didn't populate
+    // sphere_cell, which shouldn't happen after the unified raycast
+    // rewrite.
     let Some((body_index, inner_r, outer_r)) =
         find_body_ancestor_in_path(library, &hit.path)
     else {

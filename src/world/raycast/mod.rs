@@ -10,11 +10,35 @@
 mod cartesian;
 mod sphere;
 
-pub use sphere::FaceWindow;
+pub use sphere::{FaceWindow, LodParams};
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 pub(super) const MAX_FACE_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
+
+/// Face-space bounds for a sphere cell hit. Used by the highlight
+/// AABB and any caller that needs the exact cell the shader
+/// terminated at, without reconstructing it from `hit.path`.
+///
+/// Bounds are in normalized `[0, 1]` face coords; the 8 cell corners
+/// map to body-local points via `cubesphere::face_space_to_body_point`.
+#[derive(Debug, Clone, Copy)]
+pub struct SphereHitCell {
+    pub face: u32,
+    pub u_lo: f32,
+    pub v_lo: f32,
+    pub r_lo: f32,
+    pub size: f32,
+    pub inner_r: f32,
+    pub outer_r: f32,
+    /// Length of the hit path prefix that lands at the containing
+    /// body cell. `hit.path[..body_path_len]` is the world-to-body
+    /// chain (Cartesian nodes); `hit.path[body_path_len]` is
+    /// `(body_node_id, face_slot)`; the rest is the face-subtree
+    /// descent. The AABB uses this to find the body's world-space
+    /// origin + size for the body-to-world transform.
+    pub body_path_len: usize,
+}
 
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
@@ -32,6 +56,12 @@ pub struct HitInfo {
     /// adjacent cell via `face`. Reserved as a seam for coordinate
     /// systems where face semantics don't map onto an xyz axis.
     pub place_path: Option<Vec<(NodeId, usize)>>,
+    /// When the hit lives inside a cubed-sphere body, this carries
+    /// the exact terminal cell in face-space — the same cell the
+    /// GPU shader rendered (same LOD, same algorithm). Used by the
+    /// highlight AABB so the box aligns with the visible cell.
+    /// `None` for pure Cartesian hits.
+    pub sphere_cell: Option<SphereHitCell>,
 }
 
 /// Cast a ray through the tree, stopping at `max_depth` levels from
@@ -45,7 +75,10 @@ pub fn cpu_raycast(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
-    cartesian::cpu_raycast_with_face_depth(library, root, ray_origin, ray_dir, max_depth, 6)
+    cartesian::cpu_raycast_with_face_depth(
+        library, root, ray_origin, ray_dir, max_depth,
+        LodParams::fixed_max(),
+    )
 }
 
 /// Frame-aware raycast. Mirrors the renderer's ribbon-pop
@@ -61,7 +94,7 @@ pub fn cpu_raycast_in_frame(
     cam_local: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
-    max_face_depth: u32,
+    lod: LodParams,
 ) -> Option<HitInfo> {
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
     let effective_depth = chain.len() - 1;
@@ -71,6 +104,7 @@ pub fn cpu_raycast_in_frame(
     let mut ray_origin = cam_local;
     let mut ray_dir = ray_dir;
     let total_max_depth = max_depth;
+    let mut cur_scale: f32 = 1.0;
 
     loop {
         let frame_root_id = chain[current_frame_depth];
@@ -79,19 +113,29 @@ pub fn cpu_raycast_in_frame(
         // Dispatch on the frame root's NodeKind. A CubedSphereBody
         // frame-root hands off to the sphere DDA directly — the
         // body fills the frame's [0, 3)³ bubble.
+        //
+        // `lod` is scaled by `cur_scale` on ribbon pops: each pop
+        // rescales the ray by 1/3, which also scales the effective
+        // body-frame distance that feeds `face_lod_depth`. Without
+        // scaling, the LOD would shift after a pop, causing the
+        // CPU's hit cell to drift from the shader's.
+        let scaled_lod = LodParams {
+            pixel_density: lod.pixel_density * cur_scale,
+            lod_threshold: lod.lod_threshold,
+        };
         let frame_kind = library.get(frame_root_id).map(|n| n.kind);
         let hit_opt = if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
             sphere::cs_raycast(
                 library, frame_root_id, [0.0; 3], 3.0,
                 inner_r, outer_r,
                 ray_origin, ray_dir,
-                &[], max_face_depth,
+                &[], scaled_lod,
                 None,
             )
         } else {
             cartesian::cpu_raycast_with_face_depth(
                 library, frame_root_id, ray_origin, ray_dir,
-                inner_max, max_face_depth,
+                inner_max, scaled_lod,
             )
         };
 
@@ -115,6 +159,7 @@ pub fn cpu_raycast_in_frame(
             sz as f32 + ray_origin[2] / 3.0,
         ];
         ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
+        cur_scale *= 1.0 / 3.0;
         current_frame_depth -= 1;
     }
 }
@@ -134,7 +179,7 @@ pub fn cpu_raycast_in_sphere_frame(
     body_path: &[u8],
     cam_body: [f32; 3],
     ray_dir: [f32; 3],
-    max_face_depth: u32,
+    lod: LodParams,
     window: FaceWindow,
     inner_r: f32,
     outer_r: f32,
@@ -146,7 +191,7 @@ pub fn cpu_raycast_in_sphere_frame(
         library, body_node_id, [0.0; 3], 3.0,
         inner_r, outer_r,
         cam_body, ray_dir,
-        &[], max_face_depth,
+        &[], lod,
         Some(window),
     );
     if let Some(mut hit) = hit {
@@ -319,7 +364,7 @@ mod tests {
         );
         let frame_hit = cpu_raycast_in_frame(
             &world.library, world.root,
-            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6,
+            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, super::LodParams::fixed_max(),
         );
         assert!(world_hit.is_some());
         assert!(frame_hit.is_some());
@@ -337,7 +382,7 @@ mod tests {
         let dir = [0.7, 0.7, 0.0];
         let _ = cpu_raycast_in_frame(
             &world.library, world.root,
-            &frame_path, cam, dir, 8, 6,
+            &frame_path, cam, dir, 8, super::LodParams::fixed_max(),
         );
     }
 
@@ -346,7 +391,7 @@ mod tests {
         let world = plain_test_world();
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
-            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6,
+            &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, super::LodParams::fixed_max(),
         ).expect("should hit ground");
         assert_eq!(hit.path[0].0, world.root);
     }
@@ -367,7 +412,7 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.0, 1.5], [0.0, -1.0, 0.0],
-            30, setup.depth,
+            30, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "ray should hit the planet");
         let h = hit.unwrap();
@@ -391,7 +436,7 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
-            30, setup.depth,
+            30, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "Cartesian DDA should cross into body cell and dispatch sphere");
     }
@@ -422,7 +467,7 @@ mod tests {
             let hit = cpu_raycast_in_frame(
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
-                edit_depth, 6,
+                edit_depth, super::LodParams::fixed_max(),
             );
 
             assert!(hit.is_some(),
@@ -473,7 +518,7 @@ mod tests {
             let hit = cpu_raycast_in_frame(
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
-                edit_depth, 6,
+                edit_depth, super::LodParams::fixed_max(),
             );
 
             assert!(hit.is_some(),
