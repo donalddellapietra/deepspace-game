@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuPalette, GpuRibbonEntry, GRID_U32_COUNT};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -17,6 +17,7 @@ impl Renderer {
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        grid: &[u32],
         root_bfs_index: u32,
         present_mode: wgpu::PresentMode,
         shader_stats_enabled: bool,
@@ -62,6 +63,9 @@ impl Renderer {
         // ribbon, shader_stats, node_offsets). `downlevel_defaults`
         // caps that at 4; bump to 8 (the WebGPU spec default) so
         // the limit is portable to the browser backend too.
+        // Sparse tree uses 6 storage buffers now (tree, node_kinds,
+        // ribbon, shader_stats, node_offsets, grid). downlevel caps
+        // at 4; bump to the WebGPU-spec default of 8 for headroom.
         let required_limits = wgpu::Limits {
             max_storage_buffers_per_shader_stage: 8,
             ..wgpu::Limits::downlevel_defaults()
@@ -147,6 +151,19 @@ impl Renderer {
         let node_offsets_buffer = alloc_with_headroom(
             &device, "node_offsets", bytemuck::cast_slice(offsets_init),
         );
+        // Grid is a fixed-size dense buffer (3^GRID_DEPTH cells
+        // packed 4-per-u32 = GRID_U32_COUNT u32s). Allocate at exact
+        // size — it never grows because the resolution is constant.
+        // If the pack didn't populate the grid yet (initial call
+        // before CachedTree::update_root writes to it) we still
+        // allocate the full size so the shader binding is valid.
+        let grid_stub = vec![0u32; GRID_U32_COUNT];
+        let grid_init: &[u32] = if grid.len() == GRID_U32_COUNT { grid } else { &grid_stub };
+        let grid_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grid"),
+            contents: bytemuck::cast_slice(grid_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         let camera = GpuCamera {
             pos: [1.5, 1.75, 1.5],
@@ -280,6 +297,16 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Acceleration grid (binding 8) — dense 3^GRID_DEPTH
+                // occupancy + Chebyshev DF over the root frame. Hot
+                // path: the grid DDA reads one cell per iteration.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
@@ -288,6 +315,7 @@ impl Renderer {
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
             &shader_stats_buffer, &node_offsets_buffer,
+            &grid_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -405,6 +433,7 @@ impl Renderer {
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
             tree_buffer, node_offsets_buffer, node_kinds_buffer,
+            grid_buffer,
             uploaded_tree_u32s,
             uploaded_kinds_count,
             uploaded_offsets_count,

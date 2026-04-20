@@ -25,6 +25,7 @@ impl Renderer {
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        grid: &[u32],
         root_bfs_index: u32,
     ) {
         self.root_index = root_bfs_index;
@@ -64,6 +65,16 @@ impl Renderer {
         self.last_tree_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
         let _ = prev_tree_u32s;
 
+        // Re-upload the acceleration grid. Fixed size so no
+        // recreation is ever needed; a single `write_buffer` replaces
+        // the full contents. The grid is a dense function of the
+        // whole tree rooted at `root_bfs_index`, so it has to rewrite
+        // in full on every tree update (unlike the tree / kinds /
+        // offsets arrays, which only append).
+        if !grid.is_empty() {
+            self.queue.write_buffer(&self.grid_buffer, 0, bytemuck::cast_slice(grid));
+        }
+
         self.last_bind_group_rebuild_ms = 0.0;
         if tree_grew || kinds_grew || offsets_grew {
             let rebuild_start = web_time::Instant::now();
@@ -72,6 +83,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.grid_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -121,6 +133,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.grid_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -253,6 +266,7 @@ pub(super) fn make_bind_group(
     ribbon: &wgpu::Buffer,
     shader_stats: &wgpu::Buffer,
     node_offsets: &wgpu::Buffer,
+    grid: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -266,6 +280,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 5, resource: ribbon.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: grid.as_entire_binding() },
         ],
     })
 }

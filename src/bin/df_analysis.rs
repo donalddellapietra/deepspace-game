@@ -68,7 +68,7 @@ fn main() {
     eprintln!("Bootstrapping preset={preset_name} plain_layers={layers}");
     let bootstrap = bootstrap_world(preset, Some(layers));
     eprintln!("Packing tree...");
-    let (tree, _node_kinds, node_offsets, _node_ids, root_bfs_idx) =
+    let (tree, _node_kinds, node_offsets, _node_ids, root_bfs_idx, _grid) =
         pack_tree(&bootstrap.world.library, bootstrap.world.root);
 
     let node_count = node_offsets.len();

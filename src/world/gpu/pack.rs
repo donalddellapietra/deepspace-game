@@ -61,12 +61,13 @@ use crate::world::tree::{
     Child, NodeId, NodeKind, NodeLibrary, UNIFORM_EMPTY, UNIFORM_MIXED,
 };
 
+use super::grid::bake_grid;
 use super::types::{GpuChild, GpuNodeKind};
 
 /// Full pack result tuple: `(tree, node_kinds, node_offsets,
-/// node_ids, root_bfs_idx)`. Used by the initial GPU bring-up and
-/// tests; edit-path callers use [`CachedTree`] directly.
-pub type PackedTree = (Vec<u32>, Vec<GpuNodeKind>, Vec<u32>, Vec<NodeId>, u32);
+/// node_ids, root_bfs_idx, grid)`. Used by the initial GPU bring-up
+/// and tests; edit-path callers use [`CachedTree`] directly.
+pub type PackedTree = (Vec<u32>, Vec<GpuNodeKind>, Vec<u32>, Vec<NodeId>, u32, Vec<u32>);
 
 /// The packed GPU tree state. Owned by the app; mutated in place on
 /// every edit. The shader reads `tree` / `node_kinds` / `node_offsets`
@@ -80,6 +81,12 @@ pub struct CachedTree {
     pub node_ids: Vec<NodeId>,
     pub bfs_by_nid: HashMap<NodeId, u32>,
     pub root_bfs_idx: u32,
+    /// Base-3 acceleration grid (`3^GRID_DEPTH` cells per axis, packed
+    /// 4-cells-per-u32). Rebuilt on every `update_root` so the shader's
+    /// grid DDA always matches the current tree contents. Not content-
+    /// addressed: it's a dense function of the whole tree rooted at
+    /// `root_bfs_idx`, so one rebuild per edit is the right granularity.
+    pub grid: Vec<u32>,
 }
 
 impl Default for CachedTree {
@@ -91,6 +98,7 @@ impl Default for CachedTree {
             node_ids: Vec::new(),
             bfs_by_nid: HashMap::new(),
             root_bfs_idx: 0,
+            grid: Vec::new(),
         }
     }
 }
@@ -105,6 +113,11 @@ impl CachedTree {
     pub fn update_root(&mut self, library: &NodeLibrary, new_root: NodeId) {
         let bfs = self.emit_or_lookup(library, new_root);
         self.root_bfs_idx = bfs;
+        // Rebake the acceleration grid from the new root. `bake_grid`
+        // walks to depth GRID_DEPTH and runs a Chebyshev DT; at 3^4 =
+        // 81 it's sub-millisecond, dwarfed by anything else in the
+        // pack pipeline.
+        self.grid = bake_grid(library, new_root);
     }
 
     /// Resolve a NodeId to a BFS idx, packing it (and any missing
@@ -215,7 +228,7 @@ pub fn pack_tree(library: &NodeLibrary, root: NodeId) -> PackedTree {
     cache.update_root(library, root);
     (
         cache.tree, cache.node_kinds, cache.node_offsets,
-        cache.node_ids, cache.root_bfs_idx,
+        cache.node_ids, cache.root_bfs_idx, cache.grid,
     )
 }
 
@@ -305,7 +318,7 @@ mod tests {
         // root last. Before this refactor root was BFS idx 0; now
         // it's `node_offsets.len() - 1`.
         let world = plain_test_world();
-        let (_, kinds, offsets, _, root_idx) = pack_tree(&world.library, world.root);
+        let (_, kinds, offsets, _, root_idx, _) = pack_tree(&world.library, world.root);
         assert_eq!(root_idx as usize, offsets.len() - 1);
         assert_eq!(kinds.len(), offsets.len());
     }
@@ -327,7 +340,7 @@ mod tests {
     #[test]
     fn pack_includes_body_kind_and_radii() {
         let world = planet_world();
-        let (_, kinds, _, _, _) = pack_tree(&world.library, world.root);
+        let (_, kinds, _, _, _, _) = pack_tree(&world.library, world.root);
         let body = kinds.iter().find(|k| k.kind == 1).expect("body kind in buffer");
         assert!((body.inner_r - 0.12).abs() < 1e-6);
         assert!((body.outer_r - 0.45).abs() < 1e-6);
@@ -336,7 +349,7 @@ mod tests {
     #[test]
     fn pack_flattens_uniform_empty_siblings() {
         let world = planet_world();
-        let (tree, _, offsets, _, root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _, offsets, _, root_idx, _) = pack_tree(&world.library, world.root);
         // Slot 0 of root (uniform-empty Cartesian) should be absent.
         assert_eq!(sparse_child(&tree, &offsets, root_idx, 0).tag, 0);
         // CENTER_SLOT has the sphere body → Node, must stay.
@@ -355,7 +368,7 @@ mod tests {
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        let (tree, kinds, offsets, _, root_idx) = pack_tree(&lib, root);
+        let (tree, kinds, offsets, _, root_idx, _) = pack_tree(&lib, root);
         let entry = sparse_child(&tree, &offsets, root_idx, 13);
         assert_eq!(entry.tag, 1, "uniform-nonempty subtree flattens to Block");
         assert_eq!(entry.block_type, crate::world::palette::block::STONE);
@@ -423,7 +436,7 @@ mod tests {
     #[test]
     fn menger_pack_size_regression() {
         let world = menger_world(5);
-        let (tree, _, _, _, _) = pack_tree(&world.library, world.root);
+        let (tree, _, _, _, _, _) = pack_tree(&world.library, world.root);
         let u32s = tree.len();
         eprintln!("menger depth=5 pack size: {} u32s ({} bytes)", u32s, u32s * 4);
         const MENGER_D5_MAX_U32S: usize = 320;
@@ -433,7 +446,7 @@ mod tests {
     #[test]
     fn plain_pack_size_regression() {
         let world = plain_world(5);
-        let (tree, _, _, _, _) = pack_tree(&world.library, world.root);
+        let (tree, _, _, _, _, _) = pack_tree(&world.library, world.root);
         let u32s = tree.len();
         eprintln!("plain layers=5 pack size: {} u32s ({} bytes)", u32s, u32s * 4);
         const PLAIN_L5_MAX_U32S: usize = 1400;
@@ -457,7 +470,7 @@ mod tests {
             let pos = bootstrap::plain_surface_spawn(spawn_depth);
             bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
 
-            let (tree_before, _, offsets_before, _, _) = pack_tree(&world.library, world.root);
+            let (tree_before, _, offsets_before, _, _, _) = pack_tree(&world.library, world.root);
 
             let ray_origin = pos.in_frame(&Path::root());
             let hit = raycast::cpu_raycast(
@@ -465,7 +478,7 @@ mod tests {
             ).expect(&format!("raycast must hit at depth {spawn_depth}"));
             assert!(edit::break_block(&mut world, &hit));
 
-            let (tree_after, _, offsets_after, _, _) = pack_tree(&world.library, world.root);
+            let (tree_after, _, offsets_after, _, _, _) = pack_tree(&world.library, world.root);
             assert!(
                 tree_before != tree_after || offsets_before != offsets_after,
                 "packed GPU data unchanged after break at depth {spawn_depth}",

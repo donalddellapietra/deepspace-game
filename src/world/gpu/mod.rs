@@ -30,10 +30,12 @@
 //! - `pack`: BFS packing (`pack_tree`, `pack_tree_lod`).
 //! - `ribbon`: ancestor ribbon (`build_ribbon`, `GpuRibbonEntry`).
 
+mod grid;
 mod pack;
 mod ribbon;
 mod types;
 
+pub use grid::{bake_grid, GRID_DEPTH, GRID_DIM, GRID_SIZE, GRID_U32_COUNT};
 pub use pack::{pack_tree, CachedTree};
 pub use ribbon::{build_ribbon, GpuRibbonEntry};
 pub use types::{GpuCamera, GpuChild, GpuNodeKind, GpuPalette};

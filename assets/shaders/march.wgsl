@@ -490,6 +490,143 @@ fn march_cartesian(
     return result;
 }
 
+/// Read one packed 8-bit cell from the acceleration grid. Returns
+/// `{occupied: bit 7, df: bits 0-6}` as a single u32 (caller masks).
+/// Index is assumed in-range; callers guard before calling.
+fn grid_load(gx: i32, gy: i32, gz: i32) -> u32 {
+    let idx = u32(gz) * GRID_DIM * GRID_DIM + u32(gy) * GRID_DIM + u32(gx);
+    let word = grid[idx >> 2u];
+    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+struct GridAdvance {
+    /// Parametric t at which the ray enters the first occupied grid
+    /// cell (or >= 1e20 on definitive sky miss).
+    t_enter: f32,
+    /// Parametric t at which the ray exits that occupied grid cell.
+    /// Caller passes `t_exit - t_enter` as `max_t` to the bounded
+    /// tree walk, then (on no-hit) resumes grid DDA from `t_exit`.
+    t_exit: f32,
+}
+
+/// Grid-accelerated traversal step over the root Cartesian frame.
+///
+/// Starts at parametric `start_t` along the ray and walks the 81³
+/// acceleration grid until it reaches an occupied grid cell. Empty
+/// runs collapse via Chebyshev DF jumps. Returns the t-range of the
+/// occupied cell so the caller can bound a tree walk to just that
+/// cell, then resume grid DDA from `t_exit` on miss.
+///
+/// On definitive sky (ray exits the grid without ever finding an
+/// occupied cell), sets `t_enter = 1e20`.
+fn grid_advance(ray_origin: vec3<f32>, ray_dir: vec3<f32>, start_t: f32) -> GridAdvance {
+    var out: GridAdvance;
+    out.t_enter = 1e20;
+    out.t_exit = 1e20;
+
+    let inv_dir = vec3<f32>(
+        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+    );
+    let box_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    if box_hit.t_exit <= 0.0 || box_hit.t_enter >= box_hit.t_exit {
+        return out;
+    }
+    var t = max(max(box_hit.t_enter, 0.0), start_t);
+    let t_box_exit = box_hit.t_exit;
+    if t >= t_box_exit { return out; }
+
+    let step_x = select(-1, 1, ray_dir.x >= 0.0);
+    let step_y = select(-1, 1, ray_dir.y >= 0.0);
+    let step_z = select(-1, 1, ray_dir.z >= 0.0);
+    let delta_dist = abs(inv_dir) * GRID_CELL_SIZE;
+
+    let pos0 = ray_origin + ray_dir * t;
+    var gx = clamp(i32(floor(pos0.x / GRID_CELL_SIZE)), 0, i32(GRID_DIM) - 1);
+    var gy = clamp(i32(floor(pos0.y / GRID_CELL_SIZE)), 0, i32(GRID_DIM) - 1);
+    var gz = clamp(i32(floor(pos0.z / GRID_CELL_SIZE)), 0, i32(GRID_DIM) - 1);
+
+    // Side distances: absolute t at which the ray crosses each axis'
+    // next cell boundary.
+    var next_x = f32(gx + select(0, 1, step_x > 0)) * GRID_CELL_SIZE;
+    var next_y = f32(gy + select(0, 1, step_y > 0)) * GRID_CELL_SIZE;
+    var next_z = f32(gz + select(0, 1, step_z > 0)) * GRID_CELL_SIZE;
+    var side_dist = vec3<f32>(
+        (next_x - ray_origin.x) * inv_dir.x,
+        (next_y - ray_origin.y) * inv_dir.y,
+        (next_z - ray_origin.z) * inv_dir.z,
+    );
+
+    var iter = 0u;
+    loop {
+        if iter >= 512u { break; }
+        iter = iter + 1u;
+
+        if gx < 0 || gx >= i32(GRID_DIM)
+            || gy < 0 || gy >= i32(GRID_DIM)
+            || gz < 0 || gz >= i32(GRID_DIM)
+            || t >= t_box_exit {
+            return out;
+        }
+
+        let cell = grid_load(gx, gy, gz);
+        let occupied = (cell & 0x80u) != 0u;
+        if occupied {
+            // The ray enters this occupied cell at `t`. It exits
+            // the cell at the minimum of the three axis boundary
+            // crossings (`side_dist`) — that's a parametric t, the
+            // earliest axis plane leave. Return both so the caller
+            // can bound a tree walk to this cell's extent.
+            out.t_enter = t;
+            out.t_exit = min(side_dist.x, min(side_dist.y, side_dist.z));
+            return out;
+        }
+        let df = cell & 0x7Fu;
+        if df > 1u {
+            // Chebyshev DF guarantees no occupied cell within `df`
+            // cells along any axis direction. Advance `df - 1`
+            // cells along the ray — the -1 leaves one cell of
+            // slack so we always step INTO a new cell, preserving
+            // the invariant that side_dist is recomputed for the
+            // cell we're about to check.
+            let jump = f32(df - 1u) * GRID_CELL_SIZE;
+            t = t + jump;
+            if t >= t_box_exit { return out; }
+            let pos = ray_origin + ray_dir * t;
+            gx = clamp(i32(floor(pos.x / GRID_CELL_SIZE)), 0, i32(GRID_DIM) - 1);
+            gy = clamp(i32(floor(pos.y / GRID_CELL_SIZE)), 0, i32(GRID_DIM) - 1);
+            gz = clamp(i32(floor(pos.z / GRID_CELL_SIZE)), 0, i32(GRID_DIM) - 1);
+            next_x = f32(gx + select(0, 1, step_x > 0)) * GRID_CELL_SIZE;
+            next_y = f32(gy + select(0, 1, step_y > 0)) * GRID_CELL_SIZE;
+            next_z = f32(gz + select(0, 1, step_z > 0)) * GRID_CELL_SIZE;
+            side_dist = vec3<f32>(
+                (next_x - ray_origin.x) * inv_dir.x,
+                (next_y - ray_origin.y) * inv_dir.y,
+                (next_z - ray_origin.z) * inv_dir.z,
+            );
+            continue;
+        }
+        // df <= 1: step exactly one cell via standard DDA.
+        let m = min_axis_mask(side_dist);
+        if m.x > 0.5 {
+            t = side_dist.x;
+            gx = gx + step_x;
+            side_dist.x = side_dist.x + delta_dist.x;
+        } else if m.y > 0.5 {
+            t = side_dist.y;
+            gy = gy + step_y;
+            side_dist.y = side_dist.y + delta_dist.y;
+        } else {
+            t = side_dist.z;
+            gz = gz + step_z;
+            side_dist.z = side_dist.z + delta_dist.z;
+        }
+    }
+    // Iteration cap: signal miss. Caller will fall through to sky.
+    return out;
+}
+
 // Top-level march. Dispatches the current frame's DDA on its
 // NodeKind (Cartesian or sphere body), then on miss pops to the
 // next ancestor in the ribbon and continues. When ribbon is
@@ -533,15 +670,24 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         } else if current_kind == ROOT_KIND_FACE {
             r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
         } else {
-            // Cartesian frame: no depth cap beyond the hardware
-            // stack ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is
-            // the sole visual LOD gate — rays stop descending
-            // when cells fall below the pixel floor, which is
-            // cubic-LOD by construction (cell_size / ray_dist
-            // scales correctly across ribbon-pops since both are
-            // in the same frame-local units). The empty-subtree
-            // fast-path at `march_cartesian` (child_bt == 255)
-            // handles uniform-empty early exit.
+            // Cartesian frame. At ribbon_level == 0 (root frame),
+            // we optionally use the acceleration grid as a pre-
+            // filter. The grid only helps when the ray begins
+            // OUTSIDE any occupied grid cell — then it can jump
+            // across long empty runs via Chebyshev DF before handing
+            // off to the tree walker, or skip the tree walk entirely
+            // when the ray exits the grid without touching content.
+            //
+            // When the camera sits INSIDE an occupied grid cell (e.g.
+            // Jerusalem nucleus at (1.5, 1.5, 1.5)), the grid returns
+            // t_enter = 0 on the first probe and the tree walker
+            // runs unbounded from `ray_origin` — same as the no-grid
+            // path. Detect and short-circuit that case so we don't
+            // pay the grid's own iteration cost for zero benefit.
+            //
+            // Ancestor frames after a ribbon pop use the plain
+            // `march_cartesian` path unchanged — the grid is baked
+            // for the current root only.
             r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
         }
         if r.hit {

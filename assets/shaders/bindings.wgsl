@@ -141,6 +141,23 @@ struct ShaderStats {
 /// reads this buffer.
 @group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
 
+/// Base-3 acceleration grid over the root Cartesian frame `[0, 3)³`.
+/// Resolution is `3^GRID_DEPTH = GRID_DIM` per axis. Each cell's 8
+/// bits pack: bit 7 = occupied (any tree content in this sub-region),
+/// bits 0-6 = Chebyshev distance to nearest occupied cell, in grid
+/// cells, clamped to 127. 4 cells per u32 so indexing is `idx >> 2`
+/// for the word and `(idx & 3) << 3` for the shift. See
+/// `src/world/gpu/grid.rs` for bake details.
+@group(0) @binding(8) var<storage, read> grid: array<u32>;
+
+/// Cells per axis in the acceleration grid. Must match
+/// `GRID_DIM` in `src/world/gpu/grid.rs`.
+const GRID_DIM: u32 = 81u;
+/// `3 / f32(GRID_DIM)` — world-space size of one grid cell inside
+/// the root frame `[0, 3)³`. Precomputed to save a divide in the
+/// hot DDA path.
+const GRID_CELL_SIZE: f32 = 3.0 / 81.0;
+
 /// Per-fragment-thread counter; each DDA inner-loop iteration
 /// increments it. Emitted to `shader_stats` at the end of fs_main.
 var<private> ray_steps: u32 = 0u;
