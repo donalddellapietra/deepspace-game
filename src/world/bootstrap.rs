@@ -620,11 +620,17 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
     );
 
     let body_top_y = 1.5 + setup.outer_r;
-    // Construct at shallow depth (2) where f32 decomposition is
-    // precise, then deepen to anchor depth 16 via pure slot arithmetic.
+    // Spawn the camera WELL OUTSIDE the outer shell so the whole
+    // planet is visible in the view — body_top_y + 0.05 (where the
+    // default used to sit) is basically ON the shell, which renders
+    // as a "half on / half off" horizon instead of a recognizable
+    // spherical silhouette. Putting the camera ~0.5 body-cell
+    // diameters above the shell produces a clear, complete planet
+    // view.
+    let spawn_y = (body_top_y + 0.5).min(WORLD_SIZE - 0.001);
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5],
+        [1.5, spawn_y, 1.5],
         2,
     ).deepened_to(16);
     WorldBootstrap {
