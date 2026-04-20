@@ -525,7 +525,7 @@ impl App {
         match self.render_frame().kind {
             ActiveFrameKind::Cartesian => NodeKind::Cartesian,
             ActiveFrameKind::Body { inner_r, outer_r } => NodeKind::CubedSphereBody { inner_r, outer_r },
-            ActiveFrameKind::Sphere(s) => NodeKind::CubedSphereFace { face: s.face },
+            ActiveFrameKind::SphereSub(s) => NodeKind::CubedSphereFace { face: s.face },
         }
     }
 
@@ -588,11 +588,13 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        // Sphere frames keep the linear render root at the body cell,
-        // so the camera is expressed in body-local coords regardless
-        // of how deep the logical frame descends into the face.
+        // For `SphereSub` the shader works in the frame's linearized
+        // local `[0, 3)³` via `J_inv`; the app-level cam_local is in
+        // body-local coords and the shader transforms into local on
+        // entry (see `sphere_in_sub_frame`). For `Body` / `Cartesian`
+        // the renderer already expects cam in `render_path`-local.
         let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
+            ActiveFrameKind::SphereSub(sub) => self.camera.position.in_frame(&sub.body_path),
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 self.camera.position.in_frame(&frame.render_path)
             }

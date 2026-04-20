@@ -68,29 +68,27 @@ impl App {
             lod_threshold: self.lod_pixel_threshold.max(1e-3),
         };
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let ray_dir = self.ray_dir_in_frame(&sphere.body_path);
-                let window = raycast::FaceWindow {
-                    face: sphere.face as u32,
-                    u_min: sphere.face_u_min,
-                    v_min: sphere.face_v_min,
-                    r_min: sphere.face_r_min,
-                    size: sphere.face_size,
-                };
-                let hit = raycast::cpu_raycast_in_sphere_frame(
+            ActiveFrameKind::SphereSub(sub) => {
+                // TODO: replace with cpu_raycast_in_sub_frame using
+                // sub.j_inv once cs_raycast_local is implemented.
+                // For now, fall back to the body-level raycast with
+                // the full edit_depth so the existing exact march
+                // handles the query — precision fix arrives with the
+                // sub-frame DDA.
+                let frame_path = sub.body_path;
+                let cam_local = self.camera.position.in_frame(&frame_path);
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,
                     self.world.root,
-                    sphere.body_path.as_slice(),
-                    cam_body,
+                    frame_path.as_slice(),
+                    cam_local,
                     ray_dir,
+                    self.edit_depth(),
                     self.cs_edit_depth(),
                     lod,
-                    window,
-                    sphere.inner_r,
-                    sphere.outer_r,
                 );
-                (hit, sphere.body_path)
+                (hit, frame_path)
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 // Raycast from the render frame — f32 can only

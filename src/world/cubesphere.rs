@@ -189,6 +189,124 @@ pub fn face_space_to_body_point(
     sdf::add(center, sdf::scale(dir, radius))
 }
 
+// ─────────────────────────────── linearized face-frame Jacobian
+
+/// A small 3×3 matrix used for the face-subtree frame's local ↔ body
+/// transform. Columns are body-XYZ basis vectors of the local frame.
+pub type Mat3 = [[f32; 3]; 3];
+
+/// Body-XYZ position of local `(u_l, v_l, r_l)` under the linearized
+/// face map: `body_pos ≈ c_body + J · (u_l, v_l, r_l)`.
+#[inline]
+pub fn mat3_mul_vec(m: &Mat3, v: Vec3) -> Vec3 {
+    [
+        m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2],
+        m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2],
+        m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+/// Analytic inverse of a 3×3 matrix. Columns of the input are column-
+/// major (`m[c][r]`). Panics if `|det| < 1e-30`; the cubed-sphere
+/// Jacobian is always well-conditioned (no singularity on the sphere)
+/// so this should never fire in practice.
+pub fn mat3_inv(m: &Mat3) -> Mat3 {
+    let a = m[0][0]; let b = m[1][0]; let c = m[2][0];
+    let d = m[0][1]; let e = m[1][1]; let f = m[2][1];
+    let g = m[0][2]; let h = m[1][2]; let i = m[2][2];
+    let c00 =  (e * i - f * h);
+    let c01 = -(d * i - f * g);
+    let c02 =  (d * h - e * g);
+    let c10 = -(b * i - c * h);
+    let c11 =  (a * i - c * g);
+    let c12 = -(a * h - b * g);
+    let c20 =  (b * f - c * e);
+    let c21 = -(a * f - c * d);
+    let c22 =  (a * e - b * d);
+    let det = a * c00 + b * c01 + c * c02;
+    debug_assert!(det.abs() > 1e-30, "mat3_inv: near-singular");
+    let inv_det = 1.0 / det;
+    // A^{-1}[r][c] = C[c][r] / det, and our storage M[c][r] = A[r][c],
+    // so M_inv[c][r] = A^{-1}[r][c] = C[c][r] / det. Column c of the
+    // stored inverse is therefore [C[c][0], C[c][1], C[c][2]] / det.
+    [
+        [c00 * inv_det, c01 * inv_det, c02 * inv_det],
+        [c10 * inv_det, c11 * inv_det, c12 * inv_det],
+        [c20 * inv_det, c21 * inv_det, c22 * inv_det],
+    ]
+}
+
+/// Linearized face-frame transform at the corner of a face-subtree
+/// cell. The cell covers face-normalized range
+/// `[un_corner, un_corner+frame_size] × [vn_corner, vn_corner+frame_size]
+///  × [rn_corner, rn_corner+frame_size]`, which in local `[0, 3)³`
+/// coords is mapped by
+///
+///     body_pos ≈ c_body + J · (u_l, v_l, r_l)
+///
+/// where `J` columns are `∂body_pos / ∂(u_l, v_l, r_l)` evaluated at
+/// the frame corner. The linearization error is `O(frame_size²)` — at
+/// face-subtree depth ≥ 3 this is below 0.14 % of a cell width and
+/// drops geometrically with depth.
+pub fn face_frame_jacobian(
+    face: Face,
+    un_corner: f32, vn_corner: f32, rn_corner: f32,
+    frame_size: f32,
+    inner_r: f32, outer_r: f32,
+    body_size: f32,
+) -> (Vec3, Mat3) {
+    let center = [body_size * 0.5; 3];
+    let n_axis = face.normal();
+    let (u_axis, v_axis) = face.tangents();
+
+    let e_u = un_corner * 2.0 - 1.0;
+    let e_v = vn_corner * 2.0 - 1.0;
+    let cu = ea_to_cube(e_u);
+    let cv = ea_to_cube(e_v);
+    // d(ea_to_cube)/d(un) = sec²(e · π/4) · π/2
+    let cos_u = (e_u * std::f32::consts::FRAC_PI_4).cos();
+    let cos_v = (e_v * std::f32::consts::FRAC_PI_4).cos();
+    let alpha_u = std::f32::consts::FRAC_PI_2 / (cos_u * cos_u);
+    let alpha_v = std::f32::consts::FRAC_PI_2 / (cos_v * cos_v);
+
+    let raw = [
+        n_axis[0] + cu * u_axis[0] + cv * v_axis[0],
+        n_axis[1] + cu * u_axis[1] + cv * v_axis[1],
+        n_axis[2] + cu * u_axis[2] + cv * v_axis[2],
+    ];
+    let nm2 = sdf::dot(raw, raw);
+    let nm = nm2.sqrt();
+    let inv_nm = 1.0 / nm;
+    let dir = sdf::scale(raw, inv_nm);
+
+    let r_body = (inner_r + rn_corner * (outer_r - inner_r)) * body_size;
+    let dr_dbody = (outer_r - inner_r) * body_size;
+
+    let c_body = sdf::add(center, sdf::scale(dir, r_body));
+
+    // ∂dir/∂un = (α_u / nm) · (u_axis − (cu/nm) · dir)
+    // ∂body/∂un = r_body · ∂dir/∂un (R doesn't depend on un)
+    // Scaling to local unit: per-local-u = frame_size/3 of face-normalized u.
+    let s = frame_size / 3.0;
+    let k_u = s * r_body * alpha_u * inv_nm;
+    let k_v = s * r_body * alpha_v * inv_nm;
+    let cu_nm = cu * inv_nm;
+    let cv_nm = cv * inv_nm;
+    let col_u = [
+        k_u * (u_axis[0] - cu_nm * dir[0]),
+        k_u * (u_axis[1] - cu_nm * dir[1]),
+        k_u * (u_axis[2] - cu_nm * dir[2]),
+    ];
+    let col_v = [
+        k_v * (v_axis[0] - cv_nm * dir[0]),
+        k_v * (v_axis[1] - cv_nm * dir[1]),
+        k_v * (v_axis[2] - cv_nm * dir[2]),
+    ];
+    let col_r = [s * dr_dbody * dir[0], s * dr_dbody * dir[1], s * dr_dbody * dir[2]];
+
+    (c_body, [col_u, col_v, col_r])
+}
+
 /// Ray–outer-sphere entry time, in body-frame units. `None` if miss.
 pub fn ray_outer_sphere_hit(
     ray_origin_body: Vec3,
@@ -441,6 +559,92 @@ mod tests {
                 assert!((back.un - u).abs() < 1e-4, "un {u} → {}", back.un);
                 assert!((back.vn - v).abs() < 1e-4);
                 assert!((back.rn - r).abs() < 1e-4);
+            }
+        }
+    }
+
+    fn numeric_jacobian(
+        face: Face, un: f32, vn: f32, rn: f32, frame_size: f32,
+        inner_r: f32, outer_r: f32, body_size: f32,
+    ) -> (Vec3, Mat3) {
+        // Central-difference numerical Jacobian, for cross-checking the
+        // analytical result. Eval at frame corner (local = [0,0,0]).
+        // 1e-2 local-coord step keeps the f32 body_pos delta well above
+        // f32 eps (smaller eps loses precision in the differenced pair).
+        let eps = 1e-2_f32;
+        let s = frame_size / 3.0;
+        let at = |du: f32, dv: f32, dr: f32| {
+            face_space_to_body_point(
+                face,
+                un + du * s, vn + dv * s, rn + dr * s,
+                inner_r, outer_r, body_size,
+            )
+        };
+        let c_body = at(0.0, 0.0, 0.0);
+        let col_u = sdf::scale(sdf::sub(at(eps, 0.0, 0.0), at(-eps, 0.0, 0.0)), 0.5 / eps);
+        let col_v = sdf::scale(sdf::sub(at(0.0, eps, 0.0), at(0.0, -eps, 0.0)), 0.5 / eps);
+        let col_r = sdf::scale(sdf::sub(at(0.0, 0.0, eps), at(0.0, 0.0, -eps)), 0.5 / eps);
+        (c_body, [col_u, col_v, col_r])
+    }
+
+    #[test]
+    fn face_frame_jacobian_matches_numeric() {
+        // A few representative points: face center, off-center,
+        // deeper sub-cell. Central-difference + f32 loses relative
+        // precision as `frame_size` shrinks — past ~1/729 the
+        // differenced body-XYZ pair drops below f32 eps and cannot
+        // serve as a cross-check. The analytical form remains valid
+        // at arbitrary depth (it's a closed-form derivative).
+        let cases: &[(Face, f32, f32, f32, f32)] = &[
+            (Face::PosX, 0.5, 0.5, 0.5, 1.0_f32 / 3.0),
+            (Face::PosX, 0.1, 0.9, 0.3, 1.0_f32 / 27.0),
+            (Face::PosY, 0.75, 0.25, 0.5, 1.0_f32 / 81.0),
+            (Face::NegZ, 0.2, 0.8, 0.8, 1.0_f32 / 243.0),
+        ];
+        for &(face, un, vn, rn, size) in cases {
+            let (c_body, j) = face_frame_jacobian(face, un, vn, rn, size, 0.12, 0.45, 1.0);
+            let (c_num, j_num) = numeric_jacobian(face, un, vn, rn, size, 0.12, 0.45, 1.0);
+            for i in 0..3 {
+                assert!(
+                    (c_body[i] - c_num[i]).abs() < 1e-5,
+                    "c_body mismatch face={face:?} un={un} vn={vn} rn={rn}"
+                );
+            }
+            for col in 0..3 {
+                for row in 0..3 {
+                    let analytic = j[col][row];
+                    let numeric = j_num[col][row];
+                    let scale = analytic.abs().max(numeric.abs()).max(1e-6);
+                    let rel = (analytic - numeric).abs() / scale;
+                    // Central-difference + f32 tops out around 3 % at
+                    // tiny step sizes; tolerate up to 5 %.
+                    assert!(
+                        rel < 5e-2,
+                        "J[{col}][{row}] mismatch face={face:?} un={un} vn={vn} rn={rn} size={size}: \
+                         analytic={analytic}  numeric={numeric}  rel={rel}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mat3_inv_round_trip() {
+        // Invert a face-frame Jacobian and verify J · J_inv = I.
+        let (_, j) = face_frame_jacobian(Face::PosX, 0.5, 0.5, 0.5, 1.0 / 27.0, 0.12, 0.45, 1.0);
+        let j_inv = mat3_inv(&j);
+        // Check J · J_inv applied to basis vectors yields identity.
+        for i in 0..3 {
+            let mut basis = [0.0_f32; 3];
+            basis[i] = 1.0;
+            let temp = mat3_mul_vec(&j_inv, basis);
+            let back = mat3_mul_vec(&j, temp);
+            for k in 0..3 {
+                let expected = if i == k { 1.0 } else { 0.0 };
+                assert!(
+                    (back[k] - expected).abs() < 1e-4,
+                    "J·J_inv[{i}][{k}] = {} ≠ {}", back[k], expected
+                );
             }
         }
     }
