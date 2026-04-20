@@ -256,6 +256,19 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         } else {
             crate::renderer::OffscreenRenderTiming::default()
         };
+        // Read the cursor-probe result the GPU just computed. This
+        // is the authoritative source for the next frame's
+        // highlight + any interactive edit.
+        if let Some(renderer) = app.renderer.as_ref() {
+            let probe = renderer.read_cursor_probe();
+            if probe.hit && app.startup_profile_frames < 16 {
+                eprintln!(
+                    "frame_raycast_hit path_len={} face={} t={} source=gpu",
+                    probe.depth, probe.face, probe.t,
+                );
+            }
+            app.last_cursor_hit = Some(probe);
+        }
 
         let sample = FrameSample {
             frame: agg.frame_count,

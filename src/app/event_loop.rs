@@ -317,6 +317,9 @@ impl App {
                 Err(e) => log::error!("Render error: {e:?}"),
             }
         }
+        if let Some(renderer) = self.renderer.as_ref() {
+            self.last_cursor_hit = Some(renderer.read_cursor_probe());
+        }
         let render_elapsed = render_start.elapsed();
 
         let pre_tail_elapsed = frame_start.elapsed();

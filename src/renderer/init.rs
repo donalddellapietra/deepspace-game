@@ -222,49 +222,49 @@ impl Renderer {
             label: Some("ray_march"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 3, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 4, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 5, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 6, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 6, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false, min_binding_size: None,
@@ -274,7 +274,7 @@ impl Renderer {
                 // of that node's header in `tree[]`. Cold path only
                 // (touched on descent / ribbon pop).
                 wgpu::BindGroupLayoutEntry {
-                    binding: 7, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 7, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false, min_binding_size: None,
@@ -358,7 +358,7 @@ impl Renderer {
             label: Some("blit"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -366,7 +366,7 @@ impl Renderer {
                     }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
@@ -449,6 +449,10 @@ impl Renderer {
         let uploaded_tree_u32s = tree.len() as u64;
         let uploaded_kinds_count = node_kinds.len() as u64;
         let uploaded_offsets_count = node_offsets.len() as u64;
+        let cursor_probe_gpu = super::cursor_probe::CursorProbe_Gpu::new(
+            &device,
+            &bind_group_layout,
+        );
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
             tree_buffer, node_offsets_buffer, node_kinds_buffer,
@@ -486,6 +490,7 @@ impl Renderer {
             last_render_submit_ms: 0.0,
             last_render_wait_ms: 0.0,
             last_gpu_pass_ms: 0.0,
+            cursor_probe_gpu,
             shader_stats_buffer,
             shader_stats_readback,
             shader_stats_enabled,
