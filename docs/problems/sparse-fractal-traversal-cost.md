@@ -15,8 +15,9 @@ papers without a local benchmark) is called out explicitly as such.
 
 | metric | value |
 |---|---:|
-| submitted_done avg | **~60 ms** (session-dependent range 52–70 ms) |
-| submitted_done worst frame | 80–95 ms |
+| submitted_done avg (post-commit 04a2a9b, s_cell packed) | **~52 ms** |
+| submitted_done avg (pre-commit 04a2a9b, baseline) | ~77 ms |
+| submitted_done worst frame | 75-80 ms (post-pack); 85-95 ms (pre-pack) |
 | avg_steps per ray | 136.61 |
 | avg_empty | 61.05 |
 | avg_oob (ribbon pops) | 28.48 |
@@ -144,6 +145,16 @@ For a 7-slot Jerusalem node: 171 free bits.
 For a 20-slot Menger node: 301 free bits.
 
 A per-axis DF at 2 bits × 6 axes × 27 slots = 324 bits doesn't fit in this free space. A per-slot DF at 2 bits × 27 = 54 bits does. Per-axis requires growing node size OR using a side buffer.
+
+## 9b. What HAS worked (measured, merged, non-trivial)
+
+- **Pack `s_cell` from `vec3<i32>×8` to `u32×8`** (commit 04a2a9b). Cell coords range -1..=3, so 3 bits per axis packs into a single u32 per depth. Reduces per-thread DDA stack storage by 64 B (96 B → 32 B).
+
+  Metal GPU Counters diagnosed the bottleneck beforehand: Fragment Occupancy 9.7% mean (rule: <25% = register pressure), ALU Utilization 29%, Buffer Read Limiter 2.5%. Not compute- or bandwidth-bound; occupancy-bound due to per-thread register budget.
+
+  **Measured wall-clock: 77.6 → 52.2 ms (-25.4 ms, -33%)** on Jerusalem nucleus 2560×1440, interleaved A/B (6 samples each, zero distribution overlap). All shader stats counters identical (avg_steps=136.61, hit_fraction=0.1249 etc.) — same traversal, just runs faster.
+
+  First optimisation in this investigation where step-count and load-count stayed flat but wall-clock moved substantially — validates that on Apple Silicon the dominant performance model is occupancy / register budget, not instruction or load count.
 
 ## 10. What we've measured NOT to work (or to be broken)
 
