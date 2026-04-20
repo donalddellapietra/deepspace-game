@@ -620,14 +620,14 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
     );
 
     let body_top_y = 1.5 + setup.outer_r;
-    // Spawn the camera WELL OUTSIDE the outer shell so the whole
-    // planet is visible in the view — body_top_y + 0.05 (where the
-    // default used to sit) is basically ON the shell, which renders
-    // as a "half on / half off" horizon instead of a recognizable
-    // spherical silhouette. Putting the camera ~0.5 body-cell
-    // diameters above the shell produces a clear, complete planet
-    // view.
-    let spawn_y = (body_top_y + 0.5).min(WORLD_SIZE - 0.001);
+    // Spawn the camera well outside the outer shell so the whole
+    // planet is visible — body_top_y + 0.05 (old default) sat
+    // right on the shell producing a "half-on/half-off" horizon.
+    // Offset 0.3 puts the camera close enough that the planet fills
+    // most of the view (vs. a small dot), with the camera aimed
+    // straight down at the body center so the silhouette is
+    // centered on-screen.
+    let spawn_y = (body_top_y + 0.3).min(WORLD_SIZE - 0.001);
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
         [1.5, spawn_y, 1.5],
@@ -638,7 +638,9 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
         planet_path: Some(planet_path),
         default_spawn_pos: spawn_pos,
         default_spawn_yaw: 0.0,
-        default_spawn_pitch: -1.2,
+        // Straight down — camera is directly above the body so
+        // looking at the center aims at the planet.
+        default_spawn_pitch: -std::f32::consts::FRAC_PI_2 + 0.05,
         plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),
     }
