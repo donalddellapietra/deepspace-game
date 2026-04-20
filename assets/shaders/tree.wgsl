@@ -8,9 +8,13 @@
 //
 // - `tree[header_off + 0]` = occupancy bitmask (low 27 bits).
 // - `tree[header_off + 1]` = first_child_offset in tree[] u32 units.
-// - `tree[first_child + rank*2 + 0]` = packed tag|block_type|pad.
-// - `tree[first_child + rank*2 + 1]` = BFS node_index (if tag==2).
-// - `header_off = node_offsets[bfs_idx]` — cold, only on descent.
+// - `tree[first_child + rank*3 + 0]` = packed tag|block_type|pad.
+// - `tree[first_child + rank*3 + 1]` = BFS node_index (if tag==2).
+// - `tree[first_child + rank*3 + 2]` = child_occupancy (if tag==2;
+//   inlined so descend avoids the node_offsets → tree[header_off]
+//   dependent chain. 0 for leaves.)
+// - `header_off = node_offsets[bfs_idx]` — cold, only on descent
+//   (and only needed for `first_child`, not `occupancy` any more).
 //
 // Every helper here takes a BFS node index (`node_idx`). They do the
 // `node_offsets[node_idx]` indirection internally. The hot-path DDA
@@ -40,7 +44,7 @@ fn child_packed(node_idx: u32, slot: u32) -> u32 {
     }
     let first_child = tree[h + 1u];
     let rank = child_rank(occupancy, slot);
-    return tree[first_child + rank * 2u];
+    return tree[first_child + rank * 3u];
 }
 
 fn child_node_index(node_idx: u32, slot: u32) -> u32 {
@@ -48,7 +52,7 @@ fn child_node_index(node_idx: u32, slot: u32) -> u32 {
     let occupancy = tree[h];
     let first_child = tree[h + 1u];
     let rank = child_rank(occupancy, slot);
-    return tree[first_child + rank * 2u + 1u];
+    return tree[first_child + rank * 3u + 1u];
 }
 
 fn child_tag(packed: u32) -> u32 { return packed & 0xFFu; }

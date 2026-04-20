@@ -10,8 +10,9 @@
 //! ```text
 //! tree[base + 0]                     = occupancy mask (27 bits)
 //! tree[base + 1]                     = first_child_offset (= base + 2)
-//! tree[first_child_offset + rank*2]     = packed (tag|block_type|pad)
-//! tree[first_child_offset + rank*2 + 1] = child BFS idx (when tag == 2)
+//! tree[first_child_offset + rank*3]     = packed (tag|block_type|pad)
+//! tree[first_child_offset + rank*3 + 1] = child BFS idx (when tag == 2)
+//! tree[first_child_offset + rank*3 + 2] = child occupancy (when tag == 2)
 //! ```
 //!
 //! Side buffers:
@@ -148,9 +149,11 @@ impl CachedTree {
                 let child_header_off = self.node_offsets[e.node_index as usize] as usize;
                 let child_occ = self.tree[child_header_off];
                 e._pad = content_aabb(child_occ);
+                e.child_occupancy = child_occ;
             }
             self.tree.push(pack_child_first(e));
             self.tree.push(e.node_index);
+            self.tree.push(e.child_occupancy);
         }
 
         let bfs = self.node_offsets.len() as u32;
@@ -169,7 +172,7 @@ impl CachedTree {
         match child {
             Child::Empty => None,
             Child::Block(bt) => Some(GpuChild {
-                tag: 1, block_type: bt, _pad: 0, node_index: 0,
+                tag: 1, block_type: bt, _pad: 0, node_index: 0, child_occupancy: 0,
             }),
             Child::Node(child_id) => {
                 let (is_cart, uniform_type, representative) = {
@@ -188,17 +191,20 @@ impl CachedTree {
                         block_type: uniform_type,
                         _pad: 0,
                         node_index: 0,
+                        child_occupancy: 0,
                     })
                 } else {
                     let child_bfs = self.emit_or_lookup(library, child_id);
-                    // _pad (content AABB) filled in by the caller
-                    // when emitting the parent's slab, at which
-                    // point the child's occupancy is known.
+                    // _pad (content AABB) and child_occupancy both
+                    // filled in by the caller when emitting the
+                    // parent's slab — at that point the child's
+                    // tree[] header is packed and readable.
                     Some(GpuChild {
                         tag: 2,
                         block_type: representative,
                         _pad: 0,
                         node_index: child_bfs,
+                        child_occupancy: 0,
                     })
                 }
             }
@@ -287,16 +293,17 @@ mod tests {
         let first_child = tree[header_off + 1] as usize;
         let bit = 1u32 << slot;
         if occupancy & bit == 0 {
-            return GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 };
+            return GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0, child_occupancy: 0 };
         }
         let rank = (occupancy & (bit - 1)).count_ones() as usize;
-        let off = first_child + rank * 2;
+        let off = first_child + rank * 3;
         let packed = tree[off];
         let tag = (packed & 0xFF) as u8;
         let block_type = ((packed >> 8) & 0xFF) as u8;
         let _pad = ((packed >> 16) & 0xFFFF) as u16;
         let node_index = tree[off + 1];
-        GpuChild { tag, block_type, _pad, node_index }
+        let child_occupancy = tree[off + 2];
+        GpuChild { tag, block_type, _pad, node_index, child_occupancy }
     }
 
     #[test]

@@ -145,7 +145,7 @@ fn sparse_child(
     }
     let first_child = *tree.get(header_off + 1)? as usize;
     let rank = (occupancy & (bit - 1)).count_ones() as usize;
-    let off = first_child + rank * 2;
+    let off = first_child + rank * 3;
     let packed = *tree.get(off)?;
     let tag = (packed & 0xFF) as u8;
     let node_index = *tree.get(off + 1)?;

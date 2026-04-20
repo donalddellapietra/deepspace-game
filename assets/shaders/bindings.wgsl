@@ -122,9 +122,11 @@ struct ShaderStats {
 /// ```
 /// tree[base + 0] = occupancy mask (27 bits)
 /// tree[base + 1] = first_child_offset (absolute u32 index into tree[])
-/// tree[first_child_offset + rank*2]     = packed (tag|block_type|pad)
-/// tree[first_child_offset + rank*2 + 1] = child.node_index (BFS idx,
+/// tree[first_child_offset + rank*3]     = packed (tag|block_type|pad)
+/// tree[first_child_offset + rank*3 + 1] = child.node_index (BFS idx,
 ///                                         valid when tag==2)
+/// tree[first_child_offset + rank*3 + 2] = child.occupancy (27 bits,
+///                                         valid when tag==2; 0 for leaves)
 /// ```
 ///
 /// Header + first child share a 64-byte cache line, so the

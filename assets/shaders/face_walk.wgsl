@@ -46,7 +46,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
         return result;
     }
     let body_rank = countOneBits(body_occupancy & (body_bit - 1u));
-    let body_child_base = body_first_child + body_rank * 2u;
+    let body_child_base = body_first_child + body_rank * 3u;
     let face_packed = tree[body_child_base];
     let face_tag = face_packed & 0xFFu;
     if face_tag == 1u {
@@ -84,7 +84,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
         let bit = 1u << slot;
         let occupied = (occupancy & bit) != 0u;
         let rank = countOneBits(occupancy & (bit - 1u));
-        let child_base = first_child + rank * 2u;
+        let child_base = first_child + rank * 3u;
         let packed = select(0u, tree[child_base], occupied);
         let tag = packed & 0xFFu;
 
@@ -171,7 +171,7 @@ fn sample_face_node(node_idx: u32,
         }
         let first_child = tree[header_off + 1u];
         let rank = countOneBits(occupancy & (bit - 1u));
-        let child_base = first_child + rank * 2u;
+        let child_base = first_child + rank * 3u;
         let packed = tree[child_base];
         let tag = packed & 0xFFu;
         if tag == 1u {
@@ -220,7 +220,7 @@ fn walk_face_node(node_idx: u32,
         let bit = 1u << slot;
         let occupied = (occupancy & bit) != 0u;
         let rank = countOneBits(occupancy & (bit - 1u));
-        let child_base = first_child + rank * 2u;
+        let child_base = first_child + rank * 3u;
         let packed = select(0u, tree[child_base], occupied);
         let tag = packed & 0xFFu;
 
