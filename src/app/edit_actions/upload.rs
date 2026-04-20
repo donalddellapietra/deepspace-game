@@ -138,6 +138,7 @@ impl App {
         let mut entity_paths: Vec<EntityPath> =
             Vec::with_capacity(self.entities.len());
         if !raster_mode {
+            // Primary: anchor cell.
             for (idx, e) in self.entities.entities.iter().enumerate() {
                 let anchor = e.pos.anchor;
                 if anchor.depth() == 0 { continue; }
@@ -145,6 +146,35 @@ impl App {
                     entity_idx: idx as u32,
                     path_slots: anchor.as_slice().to_vec(),
                 });
+            }
+            // Secondary: +1 neighbor cells on axes where offset > 0.
+            // bbox = [anchor_pos + offset * size, anchor_pos + (offset+1) * size]
+            // so it straddles anchor and +1 neighbor on each positive-offset axis.
+            for (idx, e) in self.entities.entities.iter().enumerate() {
+                let anchor = e.pos.anchor;
+                if anchor.depth() == 0 { continue; }
+                let extends = [
+                    e.pos.offset[0] > 0.0,
+                    e.pos.offset[1] > 0.0,
+                    e.pos.offset[2] > 0.0,
+                ];
+                if !(extends[0] || extends[1] || extends[2]) { continue; }
+                for mask in 1u8..8 {
+                    let sx = (mask & 1) != 0;
+                    let sy = (mask & 2) != 0;
+                    let sz = (mask & 4) != 0;
+                    if (sx && !extends[0]) || (sy && !extends[1]) || (sz && !extends[2]) {
+                        continue;
+                    }
+                    let mut path = anchor;
+                    if sx { path.step_neighbor_cartesian(0, 1); }
+                    if sy { path.step_neighbor_cartesian(1, 1); }
+                    if sz { path.step_neighbor_cartesian(2, 1); }
+                    entity_paths.push(EntityPath {
+                        entity_idx: idx as u32,
+                        path_slots: path.as_slice().to_vec(),
+                    });
+                }
             }
         }
         let scene_result = scene::build_scene_root(

@@ -53,11 +53,11 @@ for n in $FRAMES; do
         --render-harness \
         --disable-overlay --disable-highlight \
         --plain-world --plain-layers 10 \
-        --spawn-depth 3 --spawn-xyz 1.5 1.0 2.8 \
-        --spawn-yaw 0 --spawn-pitch -0.3 \
+        --spawn-depth 2 --spawn-xyz 1.5 1.5 2.7 \
+        --spawn-yaw 0 --spawn-pitch -0.4 \
         --harness-width 320 --harness-height 180 \
         --exit-after-frames "$n" --timeout-secs 10 \
-        --spawn-entity assets/vox/soldier.vox --spawn-entity-count 9 \
+        --spawn-entity assets/vox/soldier.vox --spawn-entity-count 1 \
         --entity-render "$MODE" \
         --screenshot "$OUT/f${n}.png" \
         >/dev/null 2>&1
@@ -65,9 +65,8 @@ for n in $FRAMES; do
 done
 
 echo
-echo "Open the PNGs side by side. In ray-march mode (default) the"
-echo "soldier's silhouette shrinks from ~frame 60 onward as the"
-echo "sub-cell z-offset drifts — that's the cutoff. A correct fix"
-echo "leaves the silhouette intact at every frame count. Raster mode"
-echo "has a different spawn-positioning path (scene overlay is skipped),"
-echo "so it's not a useful visual control with these harness flags."
+echo "Open the PNGs side by side. Without the scene-overlay neighbor"
+echo "fix the soldier's silhouette shrinks from ~frame 60 onward as"
+echo "the sub-cell z-offset drifts. The fix places EntityRef at the"
+echo "overlap cells so rays entering from the +offset side still"
+echo "trigger the tag=3 dispatch."
