@@ -1,5 +1,5 @@
-//! `do_break` / `do_place`: cursor-driven edits that feed the hit
-//! into `world::edit` and re-upload on success.
+//! `do_break` / `do_place`: GPU-probe driven cursor edits that feed
+//! the hit into `world::edit` and re-upload on success.
 
 use crate::game_state::HotbarItem;
 use crate::world::anchor::Path;
@@ -9,8 +9,7 @@ use crate::app::App;
 
 impl App {
     pub(in crate::app) fn do_break(&mut self) {
-        let hit = self.frame_aware_raycast();
-        let Some(hit) = hit else {
+        let Some(hit) = self.probe_hit() else {
             eprintln!("do_break: no hit");
             return;
         };
@@ -42,9 +41,6 @@ impl App {
             return;
         }
 
-        // Store the edit path's slot sequence so upload_tree_lod can
-        // preserve it, making the fine edit visible in the packed tree
-        // even when the camera is far enough that LOD would collapse it.
         let mut edit_slots = Path::root();
         for &(_, slot) in &hit.path {
             edit_slots.push(slot as u8);
@@ -60,8 +56,7 @@ impl App {
     }
 
     pub(in crate::app) fn do_place(&mut self) {
-        let hit = self.frame_aware_raycast();
-        let Some(hit) = hit else {
+        let Some(hit) = self.probe_hit() else {
             eprintln!("do_place: no hit");
             return;
         };

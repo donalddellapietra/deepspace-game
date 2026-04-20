@@ -263,8 +263,8 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
             let probe = renderer.read_cursor_probe();
             if probe.hit && app.startup_profile_frames < 16 {
                 eprintln!(
-                    "frame_raycast_hit path_len={} face={} t={} source=gpu",
-                    probe.depth, probe.face, probe.t,
+                    "frame_raycast_hit path_len={} face={} t={} source=gpu slots={:?}",
+                    probe.depth, probe.face, probe.t, probe.slots,
                 );
             }
             app.last_cursor_hit = Some(probe);

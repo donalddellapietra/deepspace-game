@@ -52,36 +52,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if uniforms.highlight_active != 0u && result.hit {
-        // Path-prefix matching: reconstruct the hit cell's world-
-        // root-relative slot path by prepending the ribbon-pop-
-        // adjusted render_path prefix to the walker's local
-        // `hit_path`, then compare against `highlight_path` one slot
-        // at a time. Precision-safe at any anchor depth — no f32
-        // AABB / hit_pos arithmetic is involved.
+        // Highlight-cell test.
         //
-        // After N ribbon pops, the walker's root sits at
-        // `chain[render_depth − N]` (ancestor), so the valid world-
-        // root prefix is `render_path[0..render_depth − N]`.
+        // The CPU ships `highlight_path` as the anchor-depth slot
+        // sequence (truncated to `edit_depth`), matching the cell
+        // that break/place would edit. The walker, however, often
+        // terminates on a PACKED-UNIFORM collapsed block — a single
+        // GPU-side child entry that represents a deep subtree of
+        // identical-content cells. Its `result.cell_min` /
+        // `result.cell_size` cover that whole collapsed chunk. Naive
+        // prefix matching then glowed the entire chunk instead of
+        // the anchor-depth sub-cell the user is targeting.
+        //
+        // Correct test: the anchor cell is inside the walker cell
+        // iff `highlight_path` starts with the walker's full world-
+        // root path. When that holds, reconstruct the anchor cell's
+        // bounds by extending `result.cell_min/cell_size` one slot
+        // at a time through `highlight_path[full_hit_depth..]` — the
+        // walker's cell is the precise reference frame, so each
+        // extra subdivision stays representable until we're roughly
+        // 14 levels below it. Then `hit_pos ∈ anchor_sub_cell` gates
+        // the glow to the anchor-depth footprint of the hit.
         let h_depth = uniforms.highlight_path_depth;
         let r_depth = uniforms.render_path_depth;
         let pop_level = result.frame_level;
-        // Saturating subtract — guards against the (shouldn't-happen)
-        // case of pop_level > r_depth.
         let frame_prefix_len = select(0u, r_depth - pop_level, r_depth >= pop_level);
         let walker_depth = result.hit_path_depth;
         let full_hit_depth = frame_prefix_len + walker_depth;
-        // Prefix match: the walker's hit cell CONTAINS the highlight
-        // iff the walker's full-root path is a prefix of the
-        // highlight path. The walker often terminates shallower than
-        // the highlight's exact depth (LOD cap / packed-uniform
-        // collapse), so we compare up to `min(h_depth, full_hit_depth)`
-        // and only require the shared prefix to match. This is what
-        // makes the highlight glow render consistently at deep
-        // anchor where the packed tree caps the walker short.
-        if h_depth > 0u && full_hit_depth > 0u {
-            let compare_len = min(h_depth, full_hit_depth);
+        if h_depth > 0u && full_hit_depth > 0u && full_hit_depth <= h_depth {
             var match_ok: bool = true;
-            for (var i: u32 = 0u; i < compare_len; i = i + 1u) {
+            for (var i: u32 = 0u; i < full_hit_depth; i = i + 1u) {
                 var hit_slot: u32;
                 if i < frame_prefix_len {
                     hit_slot = unpack_slot_from_path(uniforms.render_path, i);
@@ -95,7 +95,54 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 }
             }
             if match_ok {
-                color = mix(color, vec3<f32>(1.0, 0.92, 0.18), 0.55);
+                // Walker's cell contains the anchor cell. Walk extra
+                // slots to locate the anchor sub-cell bounds within
+                // the walker's frame, then ray-AABB to decide which
+                // pixels fall on the anchor-cell footprint.
+                //
+                // Why ray-AABB, not `hit_pos ∈ sub_cell`: when the
+                // walker terminates on a packed uniform chunk, its
+                // `result.t` is the chunk's outer-face entry, so
+                // `hit_pos = camera + dir * t` sits on the chunk's
+                // surface — outside the anchor sub-cell that lives
+                // deeper inside. Using the ray's intersection with
+                // the sub-cell box instead means every pixel whose
+                // ray actually crosses the sub-cell lights up,
+                // giving a correctly-sized glow regardless of where
+                // the walker's LOD terminal landed.
+                var sub_min = result.cell_min;
+                var sub_size = result.cell_size;
+                for (var i: u32 = full_hit_depth; i < h_depth; i = i + 1u) {
+                    let slot = unpack_slot_from_path(uniforms.highlight_path, i);
+                    let sx = slot % 3u;
+                    let sy = (slot / 3u) % 3u;
+                    let sz = slot / 9u;
+                    sub_size = sub_size * (1.0 / 3.0);
+                    sub_min = sub_min + vec3<f32>(
+                        f32(sx) * sub_size,
+                        f32(sy) * sub_size,
+                        f32(sz) * sub_size,
+                    );
+                }
+                let sub_max = sub_min + vec3<f32>(sub_size);
+                let inv_dir = vec3<f32>(
+                    select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+                    select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+                    select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+                );
+                let anchor_hit = ray_box(camera.pos, inv_dir, sub_min, sub_max);
+                // The ray just needs to traverse the anchor sub-cell
+                // somewhere along its path — if it does, this pixel
+                // is visualising a chunk of the scene that contains
+                // the anchor cell (even if the anchor cell sits
+                // deeper inside a uniform block than the visible
+                // surface the walker hit).  That projection is what
+                // the glow conveys.
+                if anchor_hit.t_enter < anchor_hit.t_exit
+                    && anchor_hit.t_exit > 0.0
+                {
+                    color = mix(color, vec3<f32>(1.0, 0.92, 0.18), 0.55);
+                }
             }
         }
     }

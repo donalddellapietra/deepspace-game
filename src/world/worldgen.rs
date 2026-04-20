@@ -48,17 +48,29 @@ pub fn generate_world() -> WorldState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::raycast;
+    use crate::world::tree::{slot_index, Child};
 
     #[test]
     fn generated_world_is_empty() {
         let w = generate_world();
         let depth = w.tree_depth();
         assert_eq!(depth as usize, TARGET_DEPTH);
-        // Every point in the world box should read as empty.
-        for &p in &[[0.5, 0.5, 0.5], [1.5, 1.5, 1.5], [2.5, 2.5, 2.5]] {
-            assert!(!raycast::is_solid_at(&w.library, w.root, p, depth),
-                "expected empty at {:?}", p);
+        // Walk a few slot paths from root and check each leaf is Empty.
+        let probe_slots = [
+            [slot_index(0, 0, 0); 4],
+            [slot_index(1, 1, 1); 4],
+            [slot_index(2, 2, 2); 4],
+        ];
+        for slots in &probe_slots {
+            let mut cur = w.root;
+            for &slot in slots {
+                let node = w.library.get(cur).expect("node exists");
+                match node.children[slot] {
+                    Child::Node(next) => cur = next,
+                    Child::Empty => { /* ok */ break; }
+                    Child::Block(_) => panic!("generated world should be all empty"),
+                }
+            }
         }
     }
 }

@@ -377,14 +377,16 @@ mod tests {
     }
 
     /// Edit a block and re-pack against the SAME cache. Only a
-    /// bounded number of new entries (the edit-path ancestors)
-    /// should be appended.
+    /// After a synthetic break at spawn depth, the packed cache
+    /// should grow by at most `depth + small` entries — the edit
+    /// rebuilds one node per ancestor clone-on-write path. No extra
+    /// subtrees should be re-packed.
     #[test]
     fn edit_appends_only_depth_entries() {
         use crate::world::anchor::Path;
         use crate::world::bootstrap;
-        use crate::world::edit;
-        use crate::world::raycast;
+        use crate::world::edit::{self, HitInfo};
+        use crate::world::tree::Child;
 
         let spawn_depth: u8 = 10;
         let boot = bootstrap::bootstrap_world(bootstrap::WorldPreset::PlainTest, Some(40));
@@ -396,10 +398,23 @@ mod tests {
         cache.update_root(&world.library, world.root);
         let entries_before = cache.node_offsets.len();
 
-        let ray_origin = pos.in_frame(&Path::root());
-        let hit = raycast::cpu_raycast(
-            &world.library, world.root, ray_origin, [0.0, -0.4, -0.9], spawn_depth as u32,
-        ).expect("raycast should hit ground");
+        let mut ground = Path::root();
+        for &slot in pos.anchor.as_slice() {
+            ground.push(slot);
+        }
+        ground.step_neighbor_cartesian(1, -1);
+        let mut path = Vec::new();
+        let mut current = world.root;
+        for &slot in ground.as_slice() {
+            let slot = slot as usize;
+            path.push((current, slot));
+            if let Some(node) = world.library.get(current) {
+                if let Child::Node(next) = node.children[slot] {
+                    current = next;
+                }
+            }
+        }
+        let hit = HitInfo { path, face: 2, t: 1.0, place_path: None };
         let old_root = world.root;
         assert!(edit::break_block(&mut world, &hit));
         assert_ne!(world.root, old_root);
@@ -408,9 +423,6 @@ mod tests {
         let entries_after = cache.node_offsets.len();
         let appended = entries_after - entries_before;
 
-        // Bound: edit path length + a small safety margin for any
-        // nested subtree that wasn't previously packed. In practice
-        // this is ≤ spawn_depth.
         assert!(
             appended <= (spawn_depth as usize + 5),
             "edit appended {appended} entries (expected ≤ {})",
@@ -440,14 +452,17 @@ mod tests {
         assert!(u32s < PLAIN_L5_MAX_U32S, "plain regressed: {u32s} > {PLAIN_L5_MAX_U32S}");
     }
 
-    /// Break a block at various depths and verify the packed GPU
-    /// data actually changes.
+    /// Break a synthesized block at various depths and verify the
+    /// packed GPU data actually changes. The anchor path from
+    /// `plain_surface_spawn` lands in an air pocket after
+    /// `carve_air_pocket`, so we step one cell down (-y) to target
+    /// the solid ground cell directly below.
     #[test]
     fn break_at_every_depth_changes_packed_data() {
         use crate::world::anchor::Path;
         use crate::world::bootstrap;
-        use crate::world::edit;
-        use crate::world::raycast;
+        use crate::world::edit::{self, HitInfo};
+        use crate::world::tree::Child;
 
         for spawn_depth in [4u8, 8, 11, 15, 20, 25, 30, 33, 38] {
             let boot = bootstrap::bootstrap_world(
@@ -459,11 +474,25 @@ mod tests {
 
             let (tree_before, _, offsets_before, _, _) = pack_tree(&world.library, world.root);
 
-            let ray_origin = pos.in_frame(&Path::root());
-            let hit = raycast::cpu_raycast(
-                &world.library, world.root, ray_origin, [0.0, -0.4, -0.9], spawn_depth as u32,
-            ).expect(&format!("raycast must hit at depth {spawn_depth}"));
-            assert!(edit::break_block(&mut world, &hit));
+            let mut ground = Path::root();
+            for &slot in pos.anchor.as_slice() {
+                ground.push(slot);
+            }
+            ground.step_neighbor_cartesian(1, -1); // -y to the ground cell
+            let mut path = Vec::new();
+            let mut current = world.root;
+            for &slot in ground.as_slice() {
+                let slot = slot as usize;
+                path.push((current, slot));
+                if let Some(node) = world.library.get(current) {
+                    if let Child::Node(next) = node.children[slot] {
+                        current = next;
+                    }
+                }
+            }
+            let hit = HitInfo { path, face: 2, t: 1.0, place_path: None };
+            assert!(edit::break_block(&mut world, &hit),
+                "break_block returned false at depth {spawn_depth}");
 
             let (tree_after, _, offsets_after, _, _) = pack_tree(&world.library, world.root);
             assert!(

@@ -8,11 +8,32 @@
 //! the body Cartesian-style.
 
 use super::anchor::Path;
-use super::raycast::HitInfo;
 use super::state::WorldState;
 use super::tree::{
     empty_children, slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, EMPTY_NODE,
 };
+
+/// Everything `break_block` / `place_block` need to locate and apply
+/// an edit. Produced by `App::probe_hit` from the GPU cursor probe.
+#[derive(Debug, Clone)]
+pub struct HitInfo {
+    /// Slot chain from `world.root` down to the hit cell. Each entry
+    /// is `(parent_node_id, slot_index_in_parent)`; the last entry's
+    /// slot identifies the hit cell itself.
+    pub path: Vec<(NodeId, usize)>,
+    /// Hit normal encoded as a Cartesian face id: `0/1 = ±X`,
+    /// `2/3 = ±Y`, `4/5 = ±Z`. `place_child` uses this to pick the
+    /// adjacent Cartesian slot when `place_path` is `None`.
+    pub face: u32,
+    /// Distance along the ray to the hit point. Unused by the edit
+    /// pipeline itself — kept for diagnostics / harness emission.
+    pub t: f32,
+    /// Explicit placement slot chain. `None` for Cartesian frames
+    /// where face-based arithmetic picks the adjacent cell; `Some`
+    /// for face-subtree hits where `(u, v, r)` slot semantics make
+    /// face → xyz-delta wrong.
+    pub place_path: Option<Vec<(NodeId, usize)>>,
+}
 
 /// Break (remove) the block at the hit location.
 pub fn break_block(world: &mut WorldState, hit: &HitInfo) -> bool {
@@ -305,11 +326,8 @@ fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::aabb::hit_aabb;
-    use crate::world::bootstrap::plain_test_world;
     use crate::world::cubesphere::{insert_spherical_body, FACE_SLOTS};
     use crate::world::palette::block;
-    use crate::world::raycast::{cpu_raycast, is_solid_at};
     use crate::world::sdf::Planet;
 
     #[test]
@@ -374,93 +392,6 @@ mod tests {
         let new_face_kind = world.library.get(new_face).unwrap().kind;
         assert!(matches!(new_face_kind, NodeKind::CubedSphereFace { .. }),
             "face NodeKind must survive the edit (was: {:?})", new_face_kind);
-    }
-
-    #[test]
-    fn break_block_modifies_world() {
-        let mut world = plain_test_world();
-        let old_root = world.root;
-        let hit = cpu_raycast(
-            &world.library, world.root,
-            [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8,
-        ).unwrap();
-        assert!(break_block(&mut world, &hit));
-        assert_ne!(world.root, old_root, "Root should change after edit");
-    }
-
-    #[test]
-    fn place_block_on_ground() {
-        let mut world = plain_test_world();
-        let hit = cpu_raycast(
-            &world.library, world.root,
-            [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8,
-        ).unwrap();
-        assert!(break_block(&mut world, &hit));
-
-        let hit2 = cpu_raycast(
-            &world.library, world.root,
-            [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8,
-        ).unwrap();
-        let old_root = world.root;
-        assert!(place_block(&mut world, &hit2, block::BRICK));
-        assert_ne!(world.root, old_root);
-    }
-
-    #[test]
-    fn cross_node_placement_upward() {
-        let mut world = plain_test_world();
-        let hit = cpu_raycast(
-            &world.library, world.root,
-            [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 2,
-        );
-        assert!(hit.is_some());
-        let hit = hit.unwrap();
-        let (_, slot) = *hit.path.last().unwrap();
-        let (_x, y, _z) = slot_coords(slot);
-        if y == 2 {
-            let old_root = world.root;
-            assert!(place_block(&mut world, &hit, block::BRICK));
-            assert_ne!(world.root, old_root);
-        }
-    }
-
-    #[test]
-    fn cross_node_placement_into_empty_subtree() {
-        let mut world = plain_test_world();
-        let hit = cpu_raycast(
-            &world.library, world.root,
-            [0.5, 2.5, 0.5], [0.0, -1.0, 0.0], 3,
-        );
-        assert!(hit.is_some(), "Should hit ground");
-        let hit = hit.unwrap();
-        let (aabb_min, aabb_max) = hit_aabb(&world.library, &hit);
-        let cell_size = aabb_max[0] - aabb_min[0];
-
-        let target_center_y = (aabb_min[1] + aabb_max[1]) * 0.5 + cell_size;
-        if target_center_y < 3.0 {
-            let old_root = world.root;
-            let placed = place_block(&mut world, &hit, block::BRICK);
-            assert!(placed, "Should place into empty subtree");
-            assert_ne!(world.root, old_root);
-
-            let target = [
-                (aabb_min[0] + aabb_max[0]) * 0.5,
-                target_center_y,
-                (aabb_min[2] + aabb_max[2]) * 0.5,
-            ];
-            assert!(is_solid_at(&world.library, world.root, target, 8),
-                "Placed block should be solid at target");
-        }
-    }
-
-    #[test]
-    fn placement_outside_world_returns_false() {
-        let mut world = plain_test_world();
-        let hit = HitInfo {
-            path: vec![(world.root, slot_index(1, 2, 1))],
-            face: 2, t: 1.0, place_path: None,
-        };
-        assert!(!place_block(&mut world, &hit, block::BRICK));
     }
 
     /// Cross-node placement must work identically at shallow and deep

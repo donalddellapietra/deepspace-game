@@ -9,16 +9,18 @@
 //! - `HARNESS_EDIT  action=broke|placed anchor=[...] changed=... ui_layer=... anchor_depth=...`
 //!   Emitted from `do_break` / `do_place` after the edit attempt.
 //!
-//! - `HARNESS_PROBE direction=... hit=... anchor=[...] ui_layer=... anchor_depth=...`
-//!   Emitted from the `probe_down` script command. CPU raycast
-//!   straight down in world-space; does not affect render orientation.
+//! - `HARNESS_PROBE direction=... hit=... anchor=[...] ui_layer=... anchor_depth=... [t=...]`
+//!   Emitted from the `probe_down` / `probe_cursor` script commands.
+//!   The cursor probe is the GPU-side `march()` readback; the "down"
+//!   probe rotates the camera to point straight down and reads the
+//!   same probe, so both sources of truth collapse to one.
 //!
 //! All lines are single-record, whitespace-separated, `key=value`.
 
 use super::App;
 use super::test_runner::ScriptCmd;
 use crate::world::anchor::{Path, WorldPos};
-use crate::world::raycast::HitInfo;
+use crate::world::edit::HitInfo;
 use crate::world::tree::slot_index;
 
 /// Format a slot path as `[13,13,13,16]`.
@@ -58,24 +60,23 @@ impl App {
         );
     }
 
-    /// Raycast from the camera and emit a `HARNESS_PROBE` line.
-    ///
-    /// Uses the camera's current pitch/yaw verbatim so the probe
-    /// direction exactly matches what a subsequent `break`/`place`
-    /// would see — any forward-direction reconstruction via the
-    /// camera basis is sub-ULP identical. Tests that want "straight
-    /// down" should spawn with `--spawn-pitch` near `-π/2`; the
-    /// refactored sphere walker is slot-accurate, and the old
-    /// tolerance for sub-ULP direction differences (courtesy of the
-    /// OLD coarse-step sphere DDA) does not carry over.
+    /// Rotate the camera straight down (preserving yaw), wait one
+    /// frame for the GPU probe to re-dispatch with the new basis,
+    /// then emit the probe's hit. Tests that used to `probe_down`
+    /// against a CPU raycast now share the same GPU probe everything
+    /// else uses — one source of truth for what the crosshair hits.
     pub(super) fn harness_probe_down(&mut self) {
-        let hit = self.frame_aware_raycast();
+        let saved_pitch = self.camera.pitch;
+        self.camera.pitch = -std::f32::consts::FRAC_PI_2;
+        let hit = self.probe_hit();
+        self.camera.pitch = saved_pitch;
         match hit {
             Some(h) => println!(
-                "HARNESS_PROBE direction=down hit=true anchor={} ui_layer={} anchor_depth={}",
+                "HARNESS_PROBE direction=down hit=true anchor={} ui_layer={} anchor_depth={} t={:.6}",
                 path_repr(&h),
                 self.zoom_level(),
                 self.anchor_depth(),
+                h.t,
             ),
             None => println!(
                 "HARNESS_PROBE direction=down hit=false anchor=[] ui_layer={} anchor_depth={}",
@@ -85,93 +86,23 @@ impl App {
         }
     }
 
-    /// Cast the camera's current forward ray, emit the hit path, the
-    /// body-frame AABB computed from that path, and the body-frame hit
-    /// point (`cam_body + ray_dir * t`). If `hit_point` is outside the
-    /// AABB, the highlight-AABB computation disagrees with the raycast
-    /// itself — the visible cursor would land in a different cell
-    /// than the one the next break would edit.
+    /// Emit the cursor probe's hit unmodified.
     pub(super) fn harness_probe_cursor(&mut self) {
-        use crate::app::ActiveFrameKind;
-        use crate::world::{aabb, anchor::WORLD_SIZE, cubesphere_local, sdf};
-        let hit = self.frame_aware_raycast();
-        let Some(hit) = hit else {
-            println!(
+        let hit = self.probe_hit();
+        match hit {
+            Some(h) => println!(
+                "HARNESS_PROBE direction=cursor hit=true anchor={} ui_layer={} anchor_depth={} t={:.6}",
+                path_repr(&h),
+                self.zoom_level(),
+                self.anchor_depth(),
+                h.t,
+            ),
+            None => println!(
                 "HARNESS_PROBE direction=cursor hit=false anchor=[] ui_layer={} anchor_depth={}",
                 self.zoom_level(),
                 self.anchor_depth(),
-            );
-            return;
-        };
-        let anchor_path = path_repr(&hit);
-        println!(
-            "HARNESS_PROBE direction=cursor hit=true anchor={} ui_layer={} anchor_depth={} t={:.6}",
-            anchor_path,
-            self.zoom_level(),
-            self.anchor_depth(),
-            hit.t,
-        );
-        // Match the shader's dispatch frame (see upload.rs):
-        //   face_depth ≥ 1 → render-frame-local (face-rotated)
-        //   face_depth == 0 → body-frame (curved sphere render)
-        //   Cartesian / Body → render-frame-local (world axes)
-        let (aabb_min, aabb_max, cam_frame, ray_dir) = match self.active_frame.kind {
-            ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let face_point = cubesphere_local::body_point_to_face_space(
-                    cam_body,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    WORLD_SIZE,
-                );
-                let cam = match face_point {
-                    Some(fp) => {
-                        let scale = WORLD_SIZE / sphere.face_size;
-                        [
-                            (fp.un - sphere.face_u_min) * scale,
-                            (fp.vn - sphere.face_v_min) * scale,
-                            (fp.rn - sphere.face_r_min) * scale,
-                        ]
-                    }
-                    None => [WORLD_SIZE * 0.5; 3],
-                };
-                let fwd_world = sdf::normalize(self.camera.forward());
-                let dir = sdf::normalize(cubesphere_local::world_vec_to_face_axes(
-                    fwd_world,
-                    sphere.face,
-                ));
-                let (mn, mx) = aabb::hit_aabb_in_frame_local(&hit, &self.active_frame.render_path);
-                (mn, mx, cam, dir)
-            }
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let dir = self.ray_dir_in_frame(&sphere.body_path);
-                let (mn, mx) = aabb::hit_aabb_body_local(&self.world.library, &hit);
-                (mn, mx, cam_body, dir)
-            }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                let frame_path = self.active_frame.render_path;
-                let cam = self.camera.position.in_frame(&frame_path);
-                let dir = self.ray_dir_in_frame(&frame_path);
-                let (mn, mx) = aabb::hit_aabb_in_frame_local(&hit, &frame_path);
-                (mn, mx, cam, dir)
-            }
-        };
-        let hit_point = [
-            cam_frame[0] + ray_dir[0] * hit.t,
-            cam_frame[1] + ray_dir[1] * hit.t,
-            cam_frame[2] + ray_dir[2] * hit.t,
-        ];
-        let inside = (0..3).all(|i| hit_point[i] >= aabb_min[i] && hit_point[i] <= aabb_max[i]);
-        println!(
-            "HARNESS_PROBE_AABB direction=cursor anchor={} aabb_min=[{:.5},{:.5},{:.5}] aabb_max=[{:.5},{:.5},{:.5}] hit_point=[{:.5},{:.5},{:.5}] cam_frame=[{:.5},{:.5},{:.5}] inside={}",
-            anchor_path,
-            aabb_min[0], aabb_min[1], aabb_min[2],
-            aabb_max[0], aabb_max[1], aabb_max[2],
-            hit_point[0], hit_point[1], hit_point[2],
-            cam_frame[0], cam_frame[1], cam_frame[2],
-            inside,
-        );
+            ),
+        }
     }
 
     /// Shared script-command dispatcher. Called from both the live
@@ -223,32 +154,25 @@ impl App {
         }
     }
 
-    /// Raycast straight down in world-space bypassing the normal
-    /// interaction-radius cap, then place the camera a couple of
-    /// anchor cells above the hit. Used by perf repros that need to
-    /// land "on the ground" regardless of spawn coordinates.
+    /// Rotate the camera straight down, read the GPU probe, then
+    /// reposition the camera a couple of anchor-cells above the hit.
     pub(super) fn fly_to_surface(&mut self) {
-        use crate::world::anchor::{Path, WorldPos};
-        use crate::world::raycast::cpu_raycast;
-
-        let root_cam = self.camera.position.in_frame(&Path::root());
-        let ray_dir = [0.0f32, -1.0, 0.0];
-        // Raycast the full tree depth so deeply-nested content gets
-        // resolved. interaction_radius doesn't apply here — this is
-        // explicit teleport, not a cursor hit.
-        let max_depth = self.tree_depth.saturating_sub(1).max(1);
-        let hit = cpu_raycast(
-            &self.world.library, self.world.root, root_cam, ray_dir, max_depth,
-        );
+        let saved_pitch = self.camera.pitch;
+        self.camera.pitch = -std::f32::consts::FRAC_PI_2;
+        let hit = self.probe_hit();
+        self.camera.pitch = saved_pitch;
         let Some(hit) = hit else {
-            eprintln!("fly_to_surface: no hit from root_cam={root_cam:?}");
+            eprintln!("fly_to_surface: probe returned no hit");
             return;
         };
-        // Position the camera two anchor-cells above the hit's
-        // y-coordinate. Reconstruct as a root-frame WorldPos, then
-        // deepen to the current anchor depth. f32 precision is fine
-        // for this nudge — we just need to land above the surface.
-        let hit_y = root_cam[1] + ray_dir[1] * hit.t;
+        let root_cam = self.camera.position.in_frame(&Path::root());
+        // Probe t is in whatever frame the walker used. For a straight-down
+        // cursor-center ray in a Cartesian frame the ray direction in root
+        // coords is (0, -1, 0), so hit_y = cam_y - t. For frames scaled
+        // through pops the magnitude won't match root-frame exactly, but
+        // this is just a spawn nudge — landing 2 anchor cells above the
+        // coarse surface is tolerant of small errors.
+        let hit_y = (root_cam[1] - hit.t).max(0.0);
         let anchor_depth = self.anchor_depth() as u8;
         let cell = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
         let above_y = hit_y + 2.0 * cell;
@@ -260,26 +184,6 @@ impl App {
         );
     }
 
-    /// Position the camera inside the bottom-center child of the
-    /// last-broken cell. Intended use: after `zoom_in:1` following a
-    /// break, this drops the camera "one current-layer cell above the
-    /// new ground" in the descent flow.
-    ///
-    /// The path is constructed symbolically rather than via world-xyz
-    /// arithmetic. At deep anchors, `1.5 + 3^{-17}` collapses to `1.5`
-    /// in f32 (cell size ≈ 2e-8 below f32's ~7-digit precision at
-    /// y≈1), which caused `from_frame_local(target_xyz, 17)` to land
-    /// in the wrong (solid) cell. Walking `last_edit_slots + [slot
-    /// (1,0,1)]*k` is exact at any depth.
-    /// Respawn the camera above the sphere surface at the current
-    /// `anchor_depth` via `demo_sphere_surface_spawn`. Sphere-only;
-    /// emits a warning and no-ops for plain worlds. Use after
-    /// `zoom_in:1` in descent flows: the face subtree's slot indices
-    /// are `(u, v, r)` whereas `WorldPos` arithmetic is Cartesian,
-    /// so the Cartesian `teleport_above_last_edit` drifts horizontally
-    /// across the face instead of radially into the sphere. This
-    /// respawns on the surface at the new depth so `probe_down` /
-    /// `break` find terrain at every layer.
     pub(super) fn respawn_on_surface(&mut self) {
         if self.planet_path.is_none() {
             eprintln!("respawn_on_surface: world has no planet; skipping (use teleport_above_last_edit for plain worlds)");
@@ -314,7 +218,6 @@ impl App {
         while anchor.depth() < current_depth {
             anchor.push(bottom_center);
         }
-        // Camera at the center of the final cell.
         self.camera.position = WorldPos::new(anchor, [0.5, 0.5, 0.5]);
         self.apply_zoom();
         eprintln!(
