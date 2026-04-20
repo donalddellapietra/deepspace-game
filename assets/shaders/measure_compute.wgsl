@@ -6,7 +6,6 @@
 
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
-#include "sphere.wgsl"
 #include "march.wgsl"
 
 @compute @workgroup_size(8, 8, 1)

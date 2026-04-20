@@ -6,7 +6,7 @@
 //! path go through the same function — the edit case is fast because
 //! every sibling of the edit path is already in the cache.
 
-use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
+use crate::app::{ActiveFrame, App, LodUploadKey};
 use crate::app::frame;
 use crate::renderer::{compute_view_proj, EntityRenderMode, InstanceData};
 use crate::world::gpu::{self, GpuEntity};
@@ -253,31 +253,17 @@ impl App {
         // the cull — the coarse pass is pure overhead there. The
         // renderer skips it and just clears the mask to 1.0 so the
         // fine pass marches every pixel unconditionally.
-        let beam_enabled = matches!(self.active_frame.kind, ActiveFrameKind::Cartesian)
-            && compute_beam_enable(
-                self.cached_tree.as_ref().expect("cached_tree populated"),
-                r.frame_root_idx,
-                cam_gpu.pos,
-            );
+        let beam_enabled = compute_beam_enable(
+            self.cached_tree.as_ref().expect("cached_tree populated"),
+            r.frame_root_idx,
+            cam_gpu.pos,
+        );
 
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(effective_visual_depth);
             renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
-            match self.active_frame.kind {
-                ActiveFrameKind::Sphere(sphere) => {
-                    renderer.set_root_kind_face(
-                        sphere.inner_r, sphere.outer_r,
-                        sphere.face as u32, sphere.face_depth,
-                        [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
-                        self.camera.position.in_frame(&sphere.body_path),
-                    );
-                }
-                ActiveFrameKind::Body { inner_r, outer_r } => {
-                    renderer.set_root_kind_body(inner_r, outer_r);
-                }
-                ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
-            }
+            renderer.set_root_kind_cartesian();
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;

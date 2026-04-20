@@ -33,7 +33,9 @@ struct Uniforms {
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
-    /// 0 = Cartesian, 1 = body root, 2 = face-space root.
+    /// 0 = Cartesian. Reserved as a plug-in seam for future
+    /// coordinate-system variants layered onto the Cartesian
+    /// substrate.
     root_kind: u32,
     /// Number of ancestor ribbon entries available. When the ray
     /// exits the frame's [0, 3)³ bubble at depth 0, the shader
@@ -45,31 +47,20 @@ struct Uniforms {
     /// when zero, there are no EntityRef cells in the tree either,
     /// so the branch is never taken.
     entity_count: u32,
-    // Pad to the next vec4 boundary with scalar u32s. WGSL's
-    // `vec3<u32>` has 16-byte alignment that would force 12 bytes
-    // of skew-pad BEFORE this field, which doesn't match the CPU-
-    // side `[u32; 3]` layout we mirror; scalars are 4-byte aligned
-    // and land byte-for-byte on top of the Rust struct.
     _pad_entities_0: u32,
     _pad_entities_1: u32,
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
-    /// Used when root_kind == 1 or 2.
+    /// Reserved for coord-system plug-ins. Shader ignores when
+    /// root_kind == 0 (Cartesian).
     root_radii: vec4<f32>,
-    /// x = face id, y = how many generic UVR pops remain before the
-    /// next pop crosses from face root to body.
     root_face_meta: vec4<u32>,
-    /// Current face-frame cell bounds inside the full face:
-    /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
-const ROOT_KIND_BODY: u32 = 1u;
-const ROOT_KIND_FACE: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -88,7 +79,7 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
+    kind: u32,        // 0=Cartesian (sole variant today)
     face: u32,
     inner_r: f32,
     outer_r: f32,
@@ -219,8 +210,8 @@ var<private> ray_loads_ribbon: u32 = 0u;
 override ENABLE_STATS: bool = false;
 
 /// Pipeline-override constant: compiles out the tag==3 (EntityRef)
-/// dispatch entirely when `false`. Fractal / sphere preset worlds
-/// never produce entity cells (the scene overlay collapses to
+/// dispatch entirely when `false`. Fractal preset worlds never
+/// produce entity cells (the scene overlay collapses to
 /// `world.root`), so the branch + the `march_entity_subtree` call
 /// it guards are dead at compile time and the WGSL compiler
 /// eliminates them. Skipped on Jerusalem nucleus 2560x1440 this

@@ -352,40 +352,6 @@ mod tests {
         assert_eq!(kinds.len(), offsets.len());
     }
 
-    fn planet_world() -> crate::world::state::WorldState {
-        let mut lib = NodeLibrary::default();
-        let leaf_air = lib.insert(empty_children());
-        let mut root_children = uniform_children(Child::Node(leaf_air));
-        let body_id = lib.insert_with_kind(
-            empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
-        );
-        root_children[CENTER_SLOT] = Child::Node(body_id);
-        let root = lib.insert(root_children);
-        lib.ref_inc(root);
-        crate::world::state::WorldState { root, library: lib }
-    }
-
-    #[test]
-    fn pack_includes_body_kind_and_radii() {
-        let world = planet_world();
-        let (_, kinds, _, _, _, _) = pack_tree(&world.library, world.root);
-        let body = kinds.iter().find(|k| k.kind == 1).expect("body kind in buffer");
-        assert!((body.inner_r - 0.12).abs() < 1e-6);
-        assert!((body.outer_r - 0.45).abs() < 1e-6);
-    }
-
-    #[test]
-    fn pack_flattens_uniform_empty_siblings() {
-        let world = planet_world();
-        let (tree, _, offsets, _, _, root_idx) = pack_tree(&world.library, world.root);
-        // Slot 0 of root (uniform-empty Cartesian) should be absent.
-        assert_eq!(sparse_child(&tree, &offsets, root_idx, 0).tag, 0);
-        // CENTER_SLOT has the sphere body → Node, must stay.
-        let body = sparse_child(&tree, &offsets, root_idx, CENTER_SLOT as u8);
-        assert_eq!(body.tag, 2);
-    }
-
     #[test]
     fn pack_flattens_uniform_nonempty_subtree_to_block() {
         let mut lib = NodeLibrary::default();

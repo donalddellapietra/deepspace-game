@@ -53,6 +53,30 @@ fn max_component(v: vec3<f32>) -> f32 {
     return max(v.x, max(v.y, v.z));
 }
 
+// Cube-face UV lookup: picks the 2D face plane matching the
+// dominant component of `normal` and returns the other two
+// components of `local` as (u, v). Used by the bevel shader and any
+// other per-face cell-shading helper.
+fn face_uv_for_normal(local: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let an = abs(normal);
+    if an.x >= an.y && an.x >= an.z {
+        return local.yz;
+    }
+    if an.y >= an.z {
+        return local.xz;
+    }
+    return local.xy;
+}
+
+// Soft-edge bevel for cube-face cells. Returns 0.0 at the face
+// edges and 1.0 in the face interior, smoothstepped over the
+// outer 2–14 % of the face in each axis.
+fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let uv = face_uv_for_normal(local, normal);
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    return smoothstep(0.02, 0.14, edge);
+}
+
 // Branchless argmin mask for the DDA min-side_dist selection.
 // Returns a (0/1) vec3 where exactly one component is 1: the axis whose
 // `side_dist` is smallest. Tie-break priority matches the original

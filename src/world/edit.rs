@@ -312,74 +312,8 @@ mod tests {
     use super::*;
     use crate::world::aabb::hit_aabb;
     use crate::world::bootstrap::plain_test_world;
-    use crate::world::cubesphere::{insert_spherical_body, FACE_SLOTS};
     use crate::world::palette::block;
     use crate::world::raycast::{cpu_raycast, is_solid_at};
-    use crate::world::sdf::Planet;
-
-    #[test]
-    fn propagate_edit_preserves_node_kinds_through_sphere_path() {
-        // Regression for "world collapses into floating cubes when
-        // I break a block": propagate_edit was reinserting ancestors
-        // via lib.insert (default Cartesian), destroying the body's
-        // CubedSphereBody NodeKind. The shader's NodeKind dispatch
-        // then stopped firing, walker descended into the body
-        // Cartesian-style and rendered the interior-stone fillers
-        // as cube blocks.
-        let mut lib = NodeLibrary::default();
-        let sdf = Planet {
-            center: [0.5, 0.5, 0.5],
-            radius: 0.30, noise_scale: 0.0, noise_freq: 1.0, noise_seed: 0,
-            gravity: 0.0, influence_radius: 1.0,
-            surface_block: block::GRASS, core_block: block::STONE,
-        };
-        let body_id = insert_spherical_body(&mut lib, 0.12, 0.45, 6, &sdf);
-        let body_kind_before = lib.get(body_id).unwrap().kind;
-        assert!(matches!(body_kind_before, NodeKind::CubedSphereBody { .. }));
-
-        let body_node = lib.get(body_id).unwrap();
-        let face_root_id = match body_node.children[FACE_SLOTS[0]] {
-            Child::Node(id) => id,
-            _ => panic!("face slot must be a Node"),
-        };
-        let face_kind_before = lib.get(face_root_id).unwrap().kind;
-        assert!(matches!(face_kind_before, NodeKind::CubedSphereFace { .. }));
-
-        let mut world_children = empty_children();
-        world_children[0] = Child::Node(body_id);
-        let world_root = lib.insert(world_children);
-        let mut world = WorldState { root: world_root, library: lib };
-        world.library.ref_inc(world_root);
-
-        let hit = HitInfo {
-            path: vec![
-                (world_root, 0),
-                (body_id, FACE_SLOTS[0]),
-                (face_root_id, 0),
-            ],
-            face: 0, t: 1.0, place_path: None,
-        };
-        assert!(propagate_edit(&mut world, &hit, Child::Empty));
-
-        let new_world_root = world.root;
-        let new_root_kind = world.library.get(new_world_root).unwrap().kind;
-        assert!(matches!(new_root_kind, NodeKind::Cartesian),
-            "world root must stay Cartesian");
-        let new_body = match world.library.get(new_world_root).unwrap().children[0] {
-            Child::Node(id) => id,
-            _ => panic!("slot 0 must still be the body"),
-        };
-        let new_body_kind = world.library.get(new_body).unwrap().kind;
-        assert!(matches!(new_body_kind, NodeKind::CubedSphereBody { .. }),
-            "body NodeKind must survive the edit (was: {:?})", new_body_kind);
-        let new_face = match world.library.get(new_body).unwrap().children[FACE_SLOTS[0]] {
-            Child::Node(id) => id,
-            _ => panic!("face slot must still be a Node"),
-        };
-        let new_face_kind = world.library.get(new_face).unwrap().kind;
-        assert!(matches!(new_face_kind, NodeKind::CubedSphereFace { .. }),
-            "face NodeKind must survive the edit (was: {:?})", new_face_kind);
-    }
 
     #[test]
     fn break_block_modifies_world() {

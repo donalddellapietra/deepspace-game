@@ -42,11 +42,12 @@ pub enum EntityRenderMode {
 /// 64 covers MAX_DEPTH=63 with one slack.
 pub const MAX_RIBBON_LEN: usize = 64;
 
-/// `root_kind` discriminant — must mirror the WGSL `RootKind*`
-/// constants in `bindings.wgsl`.
+/// `root_kind` discriminant — must mirror the WGSL `ROOT_KIND_*`
+/// constants in `bindings.wgsl`. Only `ROOT_KIND_CARTESIAN` is
+/// populated today; the remaining discriminant values are reserved
+/// as a plug-in seam for coordinate systems that layer onto the
+/// Cartesian substrate.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
-pub const ROOT_KIND_BODY: u32 = 1;
-pub const ROOT_KIND_FACE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -270,41 +271,14 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian (default).
+    /// Set the frame-root NodeKind to Cartesian (the only variant
+    /// today).
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    /// Set the frame-root NodeKind to CubedSphereBody with radii in
-    /// the body cell's local `[0, 1)` frame.
-    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
-        self.root_kind = ROOT_KIND_BODY;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    pub fn set_root_kind_face(
-        &mut self,
-        inner_r: f32,
-        outer_r: f32,
-        face_id: u32,
-        subtree_depth: u32,
-        bounds: [f32; 4],
-        pop_pos: [f32; 3],
-    ) {
-        self.root_kind = ROOT_KIND_FACE;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [face_id, subtree_depth, 0, 0];
-        self.root_face_bounds = bounds;
-        self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
     }
 
