@@ -480,3 +480,330 @@ mod tests {
         }
     }
 }
+
+// ──────────────────────────────────────────────────────────────
+// Feasibility gate for the ribbon-pop sphere proposal. See
+// docs/design/sphere-ribbon-pop-proposal.md.
+//
+// The proposal replaces the monolithic face-subtree raycast (which
+// hits an f32 precision wall at depth ~15) with per-level ribbon-pop
+// using `(n_base, n_delta)`: each frame carries the plane normal at
+// its corner plus the normal's first-order variation across one
+// local unit. Ray-plane intersection becomes a well-conditioned
+// expression in four scalars regardless of absolute depth.
+//
+// These tests prove:
+//   1. The naive f32 form collapses at face-subtree depth 30
+//      (baseline confirming the problem).
+//   2. A directly-computed `(n_base, n_delta)` in f32 delivers
+//      ray-plane intersections within f32 precision of f64 exact.
+//   3. Ribbon-popping `(n_base, n_delta)` through 30 descent levels
+//      (starting from an exact handoff at a shallow depth) preserves
+//      that precision.
+//
+// If these fail, the proposal's architectural claim is wrong and
+// the design must change before implementation.
+
+#[cfg(test)]
+mod ribbon_pop_feasibility {
+    const FRAC_PI_4_F64: f64 = std::f64::consts::FRAC_PI_4;
+    const FRAC_PI_4_F32: f32 = std::f32::consts::FRAC_PI_4;
+
+    // Slot pattern `[2, 0]` (repeated) drives u_face toward 0.75 →
+    // u_ea ≈ 0.5, away from the `±1` face edges where sec² diverges.
+    const SLOT_PATTERN: [u32; 2] = [2, 0];
+
+    fn slots(depth: u32) -> Vec<u32> {
+        (0..depth as usize).map(|i| SLOT_PATTERN[i % SLOT_PATTERN.len()]).collect()
+    }
+
+    /// Exact u_ea corner at the end of `slots` (computed in f64 so
+    /// we have a precision reference at any depth).
+    fn u_ea_at(slots: &[u32]) -> f64 {
+        let mut u = 0.0_f64;
+        let mut size = 1.0_f64;
+        for &s in slots {
+            u += (s as f64) * size / 3.0;
+            size /= 3.0;
+        }
+        2.0 * u - 1.0
+    }
+
+    /// Frame width in ea at this frame depth: `2 / 3^depth`.
+    fn size_ea(depth: u32) -> f64 {
+        2.0 / 3.0_f64.powi(depth as i32)
+    }
+
+    fn norm3_f64(v: [f64; 3]) -> [f64; 3] {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / n, v[1] / n, v[2] / n]
+    }
+
+    /// Ray origin and direction in body-local sphere-centered coords.
+    /// Not perfectly physical — just non-degenerate for the plane.
+    fn ref_ray() -> ([f64; 3], [f64; 3]) {
+        (
+            [0.8_f64, 0.1, 0.1],
+            norm3_f64([1.0, -0.05, -0.05]),
+        )
+    }
+
+    /// PosX face: u_axis = (0, 0, -1), n_axis = (1, 0, 0). Cell
+    /// plane passes through the sphere center, with normal
+    ///   `n = u_axis − n_axis · tan(u_ea · π/4) = (-tan, 0, -1)`.
+    fn plane_n_f64(u_ea: f64) -> [f64; 3] {
+        let t = (u_ea * FRAC_PI_4_F64).tan();
+        [-t, 0.0, -1.0]
+    }
+
+    fn plane_n_f32(u_ea: f32) -> [f32; 3] {
+        let t = (u_ea * FRAC_PI_4_F32).tan();
+        [-t, 0.0, -1.0]
+    }
+
+    fn ray_plane_t_f64(n: [f64; 3], o: [f64; 3], d: [f64; 3]) -> f64 {
+        let num = -(o[0] * n[0] + o[1] * n[1] + o[2] * n[2]);
+        let den = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+        num / den
+    }
+
+    fn ray_plane_t_f32(n: [f32; 3], o: [f32; 3], d: [f32; 3]) -> f32 {
+        let num = -(o[0] * n[0] + o[1] * n[1] + o[2] * n[2]);
+        let den = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+        num / den
+    }
+
+    /// Well-conditioned Δt from K=0 to K=K1 given
+    ///   `n(K) = n_base + K·n_delta`:
+    ///     Δt = K1·(A·b − B·a) / (B · (B + K1·b))
+    /// where (A, B, a, b) = (o·n_base, d·n_base, o·n_delta, d·n_delta).
+    fn delta_t_lin(
+        n_base: [f32; 3],
+        n_delta: [f32; 3],
+        o: [f32; 3],
+        d: [f32; 3],
+        k1: f32,
+    ) -> f32 {
+        let big_a = o[0] * n_base[0] + o[1] * n_base[1] + o[2] * n_base[2];
+        let big_b = d[0] * n_base[0] + d[1] * n_base[1] + d[2] * n_base[2];
+        let sm_a = o[0] * n_delta[0] + o[1] * n_delta[1] + o[2] * n_delta[2];
+        let sm_b = d[0] * n_delta[0] + d[1] * n_delta[1] + d[2] * n_delta[2];
+        let num = k1 * (big_a * sm_b - big_b * sm_a);
+        let den = big_b * (big_b + k1 * sm_b);
+        num / den
+    }
+
+    /// Ribbon-pop descent: start at `(n_base_0, n_delta_0)` (exact at
+    /// the handoff depth), apply for each slot:
+    ///   n_base_child  = n_base + slot · n_delta
+    ///   n_delta_child = n_delta / 3
+    fn ribbon_pop(
+        slots: &[u32],
+        mut n_base: [f32; 3],
+        mut n_delta: [f32; 3],
+    ) -> ([f32; 3], [f32; 3]) {
+        for &s in slots {
+            let k = s as f32;
+            n_base = [
+                n_base[0] + k * n_delta[0],
+                n_base[1] + k * n_delta[1],
+                n_base[2] + k * n_delta[2],
+            ];
+            n_delta = [n_delta[0] / 3.0, n_delta[1] / 3.0, n_delta[2] / 3.0];
+        }
+        (n_base, n_delta)
+    }
+
+    /// f64 exact reference: Δt across one cell (K=0 → K=1) at a
+    /// frame of depth `frame_depth`, whose corner is at `u_ea`.
+    ///
+    /// Naive `tan(u + δ) − tan(u)` suffers catastrophic cancellation
+    /// at deep depths — for `δ ≈ 3e-15`, each `tan` has ~1 ULP absolute
+    /// error `~5e-17`, and their difference has relative error of 1–3%.
+    /// At depth 60 (`δ ≈ 7e-30`) the difference collapses to zero in
+    /// f64.
+    ///
+    /// We use the identity
+    ///   tan(u + δ) − tan(u) = tan(δ)·sec²(u) / (1 − tan(u)·tan(δ))
+    /// which evaluates cleanly in f64 even for tiny δ, because
+    /// `tan(δ) ≈ δ` for small δ and f64 can represent δ down to
+    /// ~2e-308. Then Δt is computed via the same well-conditioned
+    /// `(A, B, a, b)` form used by the f32 path.
+    fn dt_exact(u_ea: f64, frame_depth: u32) -> f64 {
+        let per_local = size_ea(frame_depth + 1);
+        let u_arg = u_ea * FRAC_PI_4_F64;
+        let delta_arg = per_local * FRAC_PI_4_F64;
+        let tan_u = u_arg.tan();
+        let cos_u = u_arg.cos();
+        let sec2_u = 1.0 / (cos_u * cos_u);
+        let tan_d = delta_arg.tan();
+        let dtan = tan_d * sec2_u / (1.0 - tan_u * tan_d);
+
+        let n_base = [-tan_u, 0.0, -1.0];
+        let d_n = [-dtan, 0.0, 0.0];
+        let (o, d) = ref_ray();
+        let big_a = o[0] * n_base[0] + o[1] * n_base[1] + o[2] * n_base[2];
+        let big_b = d[0] * n_base[0] + d[1] * n_base[1] + d[2] * n_base[2];
+        let sm_a = o[0] * d_n[0] + o[1] * d_n[1] + o[2] * d_n[2];
+        let sm_b = d[0] * d_n[0] + d[1] * d_n[1] + d[2] * d_n[2];
+        let num = big_a * sm_b - big_b * sm_a;
+        let den = big_b * (big_b + sm_b);
+        num / den
+    }
+
+    fn o_f32() -> [f32; 3] {
+        let (o, _) = ref_ray();
+        [o[0] as f32, o[1] as f32, o[2] as f32]
+    }
+
+    fn d_f32() -> [f32; 3] {
+        let (_, d) = ref_ray();
+        [d[0] as f32, d[1] as f32, d[2] as f32]
+    }
+
+    /// Compute `(n_base, n_delta)` exactly at a handoff frame of
+    /// depth `depth` whose corner is at `u_ea_corner`. Cast to f32.
+    fn exact_base_delta_f32(u_ea_corner: f64, depth: u32) -> ([f32; 3], [f32; 3]) {
+        let per_local = size_ea(depth + 1);
+        // Compute in f64, cast to f32. At depth ≥ 1 this is within
+        // f32 precision for u_ea_corner ∈ (−1, 1); per_local is a
+        // small representable f32.
+        let tan_w = (u_ea_corner * FRAC_PI_4_F64).tan();
+        let sec2_w = {
+            let c = (u_ea_corner * FRAC_PI_4_F64).cos();
+            1.0 / (c * c)
+        };
+        let delta_scalar = FRAC_PI_4_F64 * sec2_w * per_local;
+        let n_base = [-tan_w as f32, 0.0_f32, -1.0_f32];
+        let n_delta = [-delta_scalar as f32, 0.0_f32, 0.0_f32];
+        (n_base, n_delta)
+    }
+
+    // ───────────────────────────────── test 1: naive f32 collapses
+
+    #[test]
+    fn naive_f32_collapses_at_depth_30() {
+        let s = slots(30);
+        let u_ea_corner_f64 = u_ea_at(&s);
+        let per_local_f64 = size_ea(31);
+
+        // In f32, the corner and corner+per_local round to the same
+        // value at depth 30 — the architectural failure.
+        let u0_f32 = u_ea_corner_f64 as f32;
+        let u1_f32 = (u_ea_corner_f64 + per_local_f64) as f32;
+        assert_eq!(
+            u0_f32, u1_f32,
+            "expected f32 to collapse adjacent u_ea values at depth 30; \
+             got distinct {u0_f32:e} vs {u1_f32:e}",
+        );
+
+        // Consequently the naive Δt is exactly zero.
+        let n0 = plane_n_f32(u0_f32);
+        let n1 = plane_n_f32(u1_f32);
+        let t0 = ray_plane_t_f32(n0, o_f32(), d_f32());
+        let t1 = ray_plane_t_f32(n1, o_f32(), d_f32());
+        assert_eq!(t1 - t0, 0.0);
+    }
+
+    // ───────── test 2: directly-computed linearized matches f64 exact
+
+    #[test]
+    fn directly_computed_linearized_matches_f64_at_depth_30() {
+        let s = slots(30);
+        let u_ea_corner = u_ea_at(&s);
+        let (n_base, n_delta) = exact_base_delta_f32(u_ea_corner, 30);
+        let dt_lin = delta_t_lin(n_base, n_delta, o_f32(), d_f32(), 1.0);
+        let dt_ref = dt_exact(u_ea_corner, 30);
+        let rel = ((dt_lin as f64) - dt_ref).abs() / dt_ref.abs();
+        assert!(
+            rel < 1e-4,
+            "directly-computed: rel_err = {rel:.3e} (Δt_exact = {dt_ref:.3e}, Δt_lin = {:e})",
+            dt_lin
+        );
+    }
+
+    // ─────────────── test 3: ribbon-pop descent preserves precision
+
+    /// Parametric sweep: for each handoff depth `k_start`, compute
+    /// `(n_base, n_delta)` exactly at depth k_start, ribbon-pop to
+    /// depth 30, compare Δt to f64 exact. Report relative errors so
+    /// we can pick a sensible handoff threshold for production.
+    #[test]
+    fn ribbon_pop_descent_to_depth_30_sweep_handoff() {
+        let full_depth = 30u32;
+        let full_slots = slots(full_depth);
+        let u_ea_full = u_ea_at(&full_slots);
+        let dt_ref = dt_exact(u_ea_full, full_depth);
+
+        // Record (handoff_depth, rel_err) for diagnostics.
+        let mut results: Vec<(u32, f64)> = Vec::new();
+        for k_start in 1..=10u32 {
+            let slots_before = &full_slots[..k_start as usize];
+            let slots_after = &full_slots[k_start as usize..];
+            let u_ea_k_start = u_ea_at(slots_before);
+            // Exact handoff state.
+            let (nb, nd) = exact_base_delta_f32(u_ea_k_start, k_start);
+            // Ribbon-pop the remaining (30 − k_start) descents.
+            let (n_base, n_delta) = ribbon_pop(slots_after, nb, nd);
+            let dt_lin = delta_t_lin(n_base, n_delta, o_f32(), d_f32(), 1.0);
+            let rel = ((dt_lin as f64) - dt_ref).abs() / dt_ref.abs();
+            results.push((k_start, rel));
+        }
+
+        let diag: String = results
+            .iter()
+            .map(|(k, r)| format!("  k_start={k:2} rel_err={r:.3e}\n"))
+            .collect();
+        eprintln!("ribbon-pop handoff sweep to depth 30:\n{diag}");
+
+        // Gate: at least one handoff depth between 2 and 10 must
+        // achieve rel_err < 1%. That proves the proposal is feasible;
+        // the exact crossover is an empirical decision.
+        let best = results
+            .iter()
+            .filter(|(k, _)| *k >= 2 && *k <= 10)
+            .map(|(_, r)| *r)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            best < 0.01,
+            "no handoff depth 2..=10 achieved rel_err < 1% — best was {best:.3e}\n{diag}",
+        );
+    }
+
+    /// Same test at depth 60 — upper end of supported zoom.
+    #[test]
+    fn ribbon_pop_descent_to_depth_60_sweep_handoff() {
+        let full_depth = 60u32;
+        let full_slots = slots(full_depth);
+        let u_ea_full = u_ea_at(&full_slots);
+        let dt_ref = dt_exact(u_ea_full, full_depth);
+
+        let mut results: Vec<(u32, f64)> = Vec::new();
+        for k_start in 1..=10u32 {
+            let slots_before = &full_slots[..k_start as usize];
+            let slots_after = &full_slots[k_start as usize..];
+            let u_ea_k_start = u_ea_at(slots_before);
+            let (nb, nd) = exact_base_delta_f32(u_ea_k_start, k_start);
+            let (n_base, n_delta) = ribbon_pop(slots_after, nb, nd);
+            let dt_lin = delta_t_lin(n_base, n_delta, o_f32(), d_f32(), 1.0);
+            let rel = ((dt_lin as f64) - dt_ref).abs() / dt_ref.abs();
+            results.push((k_start, rel));
+        }
+
+        let diag: String = results
+            .iter()
+            .map(|(k, r)| format!("  k_start={k:2} rel_err={r:.3e}\n"))
+            .collect();
+        eprintln!("ribbon-pop handoff sweep to depth 60:\n{diag}");
+
+        let best = results
+            .iter()
+            .filter(|(k, _)| *k >= 2 && *k <= 10)
+            .map(|(_, r)| *r)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            best < 0.01,
+            "no handoff depth 2..=10 achieved rel_err < 1% at depth 60 — best was {best:.3e}\n{diag}",
+        );
+    }
+}
