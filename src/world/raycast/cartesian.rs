@@ -148,7 +148,9 @@ pub(super) fn cpu_raycast_with_face_depth(
                 // nodes recursively, visiting O(3^depth) leaf cells
                 // before escaping — easily exceeding the iteration
                 // budget for deep carved cavities.
-                if child_node.representative_block == 255 {
+                if child_node.representative_block
+                    == crate::world::tree::REPRESENTATIVE_EMPTY
+                {
                     advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
                     continue;
                 }

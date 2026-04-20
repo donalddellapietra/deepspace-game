@@ -290,14 +290,16 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
 }
 
 /// A cell is placeable if it's Empty or an all-empty Node subtree
-/// (representative_block == 255). At coarser zoom levels, air regions
-/// are represented as Node subtrees rather than Child::Empty.
+/// (`representative_block == REPRESENTATIVE_EMPTY`). At coarser zoom
+/// levels, air regions are represented as Node subtrees rather than
+/// Child::Empty.
 fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
+    use crate::world::tree::REPRESENTATIVE_EMPTY;
     match child {
         Child::Empty => true,
         Child::Node(id) => library
             .get(id)
-            .map_or(false, |n| n.representative_block == 255),
+            .map_or(false, |n| n.representative_block == REPRESENTATIVE_EMPTY),
         Child::Block(_) => false,
     }
 }

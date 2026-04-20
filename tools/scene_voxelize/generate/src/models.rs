@@ -209,12 +209,32 @@ fn voxelize_gltf(
         for primitive in &mesh.primitives {
             let indices: &[[u16; 3]] =
                 bytemuck::cast_slice(&gltf.bin[primitive.indices.start..primitive.indices.end]);
-            let positions: &[[f32; 3]] =
-                bytemuck::cast_slice(&gltf.bin[primitive.positions.start..primitive.positions.end]);
+            // Stride-aware position lookup. glTF allows interleaved
+            // vertex attributes (POSITION + NORMAL + … in one buffer);
+            // Sponza uses a 48-byte stride. Reading with a raw cast as
+            // &[[f32; 3]] on byte-stride-48 data would pull garbage
+            // (actually the next attribute's bytes) for every vertex
+            // after the first — producing triangles with random
+            // positions that rasterize as radial streaks outside the
+            // real scene bounds.
+            let pos_stride = if primitive.positions.byte_stride == 0 {
+                12
+            } else {
+                primitive.positions.byte_stride as usize
+            };
+            let pos_base = primitive.positions.start;
+            let read_pos = |i: usize| -> glam::Vec3 {
+                let off = pos_base + i * pos_stride;
+                let bytes: &[u8] = &gltf.bin[off..off + 12];
+                let x = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let y = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                let z = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+                glam::vec3(x, y, z)
+            };
 
             for tri in indices {
                 let pos = tri
-                    .map(|i| glam::Vec3::from_array(positions[i as usize]))
+                    .map(|i| read_pos(i as usize))
                     .map(|p| {
                         (node.transform.transform_point3(p) - base_unscaled)
                             * (voxels_per_unit as f32)
@@ -831,32 +851,64 @@ fn create_bg_voxelize_per_primitive(ctx: &'_ VoxelizeCtx<'_>) -> Vec<PrimitiveGr
                     },
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
+            // De-interleave vertex attributes if the source has a
+            // `byteStride` set. The voxelize shader reads each
+            // attribute as `array<f32>` indexed by `vertex*N + k` (so
+            // it expects tight-packed data); feeding it a strided
+            // source buffer would read garbage (the adjacent
+            // attribute's bytes) for every vertex after the first.
+            let gather_tight = |desc: &gltf::scene::PrimitiveBufferDescriptor,
+                                element_size: usize|
+             -> Vec<u8> {
+                let stride = if desc.byte_stride == 0 {
+                    element_size
+                } else {
+                    desc.byte_stride as usize
+                };
+                if stride == element_size {
+                    // Already tight-packed — zero-copy slice.
+                    ctx.gltf.bin[desc.start..desc.start + element_size * desc.count as usize]
+                        .to_vec()
+                } else {
+                    let mut out = Vec::with_capacity(element_size * desc.count as usize);
+                    for v in 0..desc.count as usize {
+                        let off = desc.start + v * stride;
+                        out.extend_from_slice(&ctx.gltf.bin[off..off + element_size]);
+                    }
+                    out
+                }
+            };
+            let positions_tight = gather_tight(&primitive.positions, 12); // VEC3 f32
+            let normals_tight = gather_tight(&primitive.normals, 12); // VEC3 f32
+            let tangents_tight = gather_tight(&primitive.tangents, 16); // VEC4 f32
+            let uv_tight = gather_tight(&primitive.uv, 8); // VEC2 f32
+
             let buffer_positions =
                 ctx.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("primitive vertex position data"),
-                        contents: &ctx.gltf.bin[primitive.positions.start..primitive.positions.end],
+                        contents: &positions_tight,
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     });
             let buffer_normals = ctx
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("primitive vertex normal data"),
-                    contents: &ctx.gltf.bin[primitive.normals.start..primitive.normals.end],
+                    contents: &normals_tight,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
             let buffer_tangents =
                 ctx.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("primitive vertex tangent data"),
-                        contents: &ctx.gltf.bin[primitive.tangents.start..primitive.tangents.end],
+                        contents: &tangents_tight,
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     });
             let buffer_uv = ctx
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("primitive vertex uv data"),
-                    contents: &ctx.gltf.bin[primitive.uv.start..primitive.uv.end],
+                    contents: &uv_tight,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
 

@@ -67,7 +67,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
     let limit = min(depth_limit, MAX_FACE_DEPTH);
     if limit <= 1u {
         let bt = (face_packed >> 8u) & 0xFFFFu;
-        result.block = select(0u, bt, bt != 255u);
+        result.block = select(0u, bt, bt != 0xFFFEu);
         return result;
     }
     for (var d: u32 = 2u; d <= limit; d = d + 1u) {
@@ -124,7 +124,7 @@ fn walk_face_subtree(body_node_idx: u32, face: u32,
         }
         if d >= limit {
             let bt = (packed >> 8u) & 0xFFFFu;
-            result.block = select(0u, bt, bt != 255u);
+            result.block = select(0u, bt, bt != 0xFFFEu);
             result.depth = d;
             result.u_lo = u_sum + u_comp;
             result.v_lo = v_sum + v_comp;
@@ -247,7 +247,7 @@ fn walk_face_node(node_idx: u32,
         let at_max = d >= uniforms.max_depth;
         if at_lod || at_max {
             let bt = (packed >> 8u) & 0xFFFFu;
-            result.block = select(0u, bt, bt != 255u);
+            result.block = select(0u, bt, bt != 0xFFFEu);
             result.depth = d;
             result.u_lo = u_lo;
             result.v_lo = v_lo;

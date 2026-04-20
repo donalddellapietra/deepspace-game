@@ -312,7 +312,7 @@ fn march_cartesian(
             // advance one cell, repeat — 2-3 iterations where one
             // would do.
             let child_bt = child_block_type(packed);
-            if child_bt == 255u {
+            if child_bt == 0xFFFEu {
                 if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
                 let m_rep = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_rep) * step);
@@ -342,7 +342,7 @@ fn march_cartesian(
             if at_max || at_lod {
                 if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
                 let bt = child_block_type(packed);
-                if bt == 255u {
+                if bt == 0xFFFEu {
                     let m_lodt = min_axis_mask(cur_side_dist);
                     s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
                     cur_side_dist += m_lodt * delta_dist * cur_cell_size;

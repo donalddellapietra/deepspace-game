@@ -72,6 +72,14 @@ pub struct PrimitiveBufferDescriptor {
     pub count: u32,
     pub start: usize,
     pub end: usize,
+    /// Bytes between successive elements in the source buffer. `0`
+    /// means tight-packed (element-size bytes); non-zero means the
+    /// attribute is interleaved with other attributes in the same
+    /// buffer view (e.g. Sponza uses a 48-byte stride with
+    /// POSITION+NORMAL+TANGENT+UV packed together). Callers that
+    /// read this buffer MUST honor the stride — raw byte slicing
+    /// treating the range as tight-packed produces garbage.
+    pub byte_stride: u32,
 }
 
 impl Scene {
@@ -395,8 +403,19 @@ impl Primitive {
                     }
                 };
                 let start = (view.byte_offset + accessor.byte_offset.unwrap_or(0)) as usize;
-                let end = start + (component_length * accessor.count) as usize;
-                if start >= buffer.byte_length as usize || end >= buffer.byte_length as usize {
+                // `end` here is an upper bound that accommodates
+                // interleaved attributes: tight-packed → start +
+                // count*element_size; strided → start + stride *
+                // (count-1) + element_size (covers the LAST element).
+                let byte_stride = view.byte_stride.unwrap_or(0);
+                let end = if byte_stride == 0 {
+                    start + (component_length * accessor.count) as usize
+                } else {
+                    start
+                        + (byte_stride as usize) * ((accessor.count as usize).saturating_sub(1))
+                        + component_length as usize
+                };
+                if start >= buffer.byte_length as usize || end > buffer.byte_length as usize {
                     bail!("accessor view extends beyond buffer's bounds");
                 }
                 Ok((
@@ -405,6 +424,7 @@ impl Primitive {
                         count: accessor.count,
                         start,
                         end,
+                        byte_stride,
                     },
                     [accessor.min.clone(), accessor.max.clone()],
                 ))
