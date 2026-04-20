@@ -188,41 +188,19 @@ pub struct TimestampScratch {
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian (default).
+    /// Set the frame-root NodeKind to Cartesian. With the unified
+    /// Cartesian walker this is the only dispatch mode — sphere
+    /// silhouettes are handled inside `march_cartesian` via a
+    /// ray-sphere pre-clip on CubedSphereBody children. The old
+    /// sphere-specific uniforms (root_radii / root_face_meta /
+    /// root_face_bounds / root_face_pop_pos) are kept in the buffer
+    /// layout for now but unused by the shader; zeroed here.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.root_radii = [0.0; 4];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    /// Set the frame-root NodeKind to CubedSphereBody with radii in
-    /// the body cell's local `[0, 1)` frame.
-    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
-        self.root_kind = ROOT_KIND_BODY;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    pub fn set_root_kind_face(
-        &mut self,
-        inner_r: f32,
-        outer_r: f32,
-        face_id: u32,
-        subtree_depth: u32,
-        bounds: [f32; 4],
-        pop_pos: [f32; 3],
-    ) {
-        self.root_kind = ROOT_KIND_FACE;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [face_id, subtree_depth, 0, 0];
-        self.root_face_bounds = bounds;
-        self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
     }
 

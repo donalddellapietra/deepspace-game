@@ -10,24 +10,29 @@
 //! All functions here are **pure** — no `App` state — for direct
 //! unit testing.
 
-use crate::world::anchor::{Path, WORLD_SIZE};
+use crate::world::anchor::Path;
 use crate::world::cubesphere::Face;
-use crate::world::cubesphere_local;
-use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
+/// Metadata for a render frame whose camera is positioned inside a
+/// cubed-sphere face subtree. The sphere silhouette and voxel content
+/// are handled by the unified Cartesian walker; this struct carries
+/// only the face tag (needed to rotate the camera basis so "up" points
+/// radially) plus body-lookup info for highlight / edit code that
+/// wants to recognize a planet hit.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SphereFrame {
     pub body_path: Path,
     pub body_node_id: NodeId,
-    pub face_root_id: NodeId,
     pub face: Face,
     pub inner_r: f32,
     pub outer_r: f32,
-    pub face_u_min: f32,
-    pub face_v_min: f32,
-    pub face_r_min: f32,
-    pub face_size: f32,
-    pub frame_path: Path,
+    /// Depth of the render frame *inside* the face subtree — 0 when
+    /// the render frame is the face root, N when the camera has
+    /// descended N slots further into the face subtree. Only
+    /// `face_depth >= 1` triggers the face-axis-rotated camera basis;
+    /// at face_depth == 0 the body cell itself is the frame and world
+    /// axes are fine.
     pub face_depth: u32,
 }
 
@@ -49,24 +54,6 @@ pub struct ActiveFrame {
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
-}
-
-pub fn frame_point_to_body(point: [f32; 3], sphere: &SphereFrame) -> [f32; 3] {
-    let un = (sphere.face_u_min + (point[0] / WORLD_SIZE) * sphere.face_size)
-        .clamp(0.0, 1.0 - f32::EPSILON);
-    let vn = (sphere.face_v_min + (point[1] / WORLD_SIZE) * sphere.face_size)
-        .clamp(0.0, 1.0 - f32::EPSILON);
-    let rn = (sphere.face_r_min + (point[2] / WORLD_SIZE) * sphere.face_size)
-        .clamp(0.0, 1.0 - f32::EPSILON);
-    cubesphere_local::face_space_to_body_point(
-        sphere.face,
-        un,
-        vn,
-        rn,
-        sphere.inner_r,
-        sphere.outer_r,
-        WORLD_SIZE,
-    )
 }
 
 /// Build a `Path` from the slot prefix the GPU ribbon walker
@@ -95,7 +82,7 @@ pub fn compute_render_frame(
     let mut node_id = world_root;
     let mut reached = Path::root();
     let mut body_info: Option<(Path, NodeId, f32, f32)> = None;
-    let mut sphere_info: Option<(Face, NodeId, f32, f32, f32, f32)> = None;
+    let mut face_info: Option<(Face, NodeId)> = None;
     for k in 0..target.depth() as usize {
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
@@ -106,14 +93,6 @@ pub fn compute_render_frame(
                 match child.kind {
                     NodeKind::Cartesian => {
                         node_id = child_id;
-                        if let Some((_, _, ref mut u_min, ref mut v_min, ref mut r_min, ref mut size)) = sphere_info {
-                            let (us, vs, rs) = slot_coords(slot);
-                            let child_size = *size / 3.0;
-                            *u_min += us as f32 * child_size;
-                            *v_min += vs as f32 * child_size;
-                            *r_min += rs as f32 * child_size;
-                            *size = child_size;
-                        }
                     }
                     NodeKind::CubedSphereBody { inner_r, outer_r } => {
                         node_id = child_id;
@@ -121,9 +100,8 @@ pub fn compute_render_frame(
                     }
                     NodeKind::CubedSphereFace { face } => {
                         node_id = child_id;
-                        if let Some((body_path, body_node_id, inner_r, outer_r)) = body_info {
-                            sphere_info = Some((face, child_id, 0.0, 0.0, 0.0, 1.0));
-                            body_info = Some((body_path, body_node_id, inner_r, outer_r));
+                        if body_info.is_some() {
+                            face_info = Some((face, child_id));
                         }
                     }
                 }
@@ -131,27 +109,37 @@ pub fn compute_render_frame(
             Child::Block(_) | Child::Empty => break,
         }
     }
-    if let Some((face, face_root_id, face_u_min, face_v_min, face_r_min, face_size)) = sphere_info {
+    if let Some((face, _face_root_id)) = face_info {
         let (body_path, body_node_id, inner_r, outer_r) =
             body_info.expect("sphere frame requires containing body");
-        ActiveFrame {
-            render_path: reached,
-            logical_path: reached,
-            node_id,
-            kind: ActiveFrameKind::Sphere(SphereFrame {
-                body_path,
-                body_node_id,
-                face_root_id,
-                face,
-                inner_r,
-                outer_r,
-                face_u_min,
-                face_v_min,
-                face_r_min,
-                face_size,
-                frame_path: reached,
-                face_depth: reached.depth().saturating_sub(body_path.depth() + 1) as u32,
-            }),
+        let face_depth = reached.depth().saturating_sub(body_path.depth() + 1) as u32;
+        if face_depth == 0 {
+            // Camera is exactly at the face root — descend the render
+            // frame back up to the body so the shader's root is the
+            // body node. That lets the sphere-SDF pre-clip in `march`
+            // cull rays missing the outer sphere and produce a round
+            // silhouette. The `Body` kind signals the camera-basis
+            // pipeline that no face-axis rotation is needed yet.
+            ActiveFrame {
+                render_path: body_path,
+                logical_path: reached,
+                node_id: body_node_id,
+                kind: ActiveFrameKind::Body { inner_r, outer_r },
+            }
+        } else {
+            ActiveFrame {
+                render_path: reached,
+                logical_path: reached,
+                node_id,
+                kind: ActiveFrameKind::Sphere(SphereFrame {
+                    body_path,
+                    body_node_id,
+                    face,
+                    inner_r,
+                    outer_r,
+                    face_depth,
+                }),
+            }
         }
     } else {
         let kind = library.get(node_id).map(|n| n.kind).unwrap_or(NodeKind::Cartesian);

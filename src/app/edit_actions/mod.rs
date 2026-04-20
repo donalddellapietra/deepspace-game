@@ -101,109 +101,40 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
-        // Split matching the shader dispatch (see upload.rs):
+        // Unified Cartesian raycast in the render_path frame.
         //
-        // * face_depth == 0: body-frame sphere raycast, same
-        //   precision contract as the shader's `march_face_root`.
-        //   Hit paths returned here are in face-subtree coords and
-        //   the shader renders the curved planet silhouette in
-        //   body-frame; `hit_aabb_body_local` matches its frame.
+        // The only per-frame-kind adjustment is the ray direction:
+        // when the render frame descends into a face subtree
+        // (Sphere { face_depth >= 1 }), the forward vector must be
+        // rotated into the face's local `(u_axis, v_axis, n_axis)`
+        // basis so the Cartesian walker navigates the face subtree
+        // correctly. Otherwise world axes are fine.
         //
-        // * face_depth ≥ 1: face-axis-rotated Cartesian raycast on
-        //   the render_path sub-cell. Mirrors the shader's
-        //   `march_cartesian` dispatch (upload.rs) and the face-
-        //   rotated camera basis (gpu_camera_for_frame). Hit paths
-        //   share a deep prefix with render_path so
-        //   `hit_aabb_in_frame_local` stays precision-safe at any
-        //   anchor depth.
-        //
-        // Cartesian / Body frames follow the generic render-frame
-        // path unchanged.
-        use crate::world::{anchor::WORLD_SIZE, cubesphere_local, sdf};
-        let (hit, cap_frame_path) = match self.active_frame.kind {
+        // At face_depth == 0 (the body cell IS the render frame) or
+        // outside a sphere, world axes + `in_frame(render_path)` are
+        // precision-clean because the frame is bounded.
+        use crate::world::{cubesphere_local, sdf};
+        let frame_path = self.active_frame.render_path;
+        let cam_local = self.camera.position.in_frame(&frame_path);
+        let fwd_world = sdf::normalize(self.camera.forward());
+        let ray_dir = match self.active_frame.kind {
             crate::app::ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
-                let frame_path = self.active_frame.render_path;
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let face_point = cubesphere_local::body_point_to_face_space(
-                    cam_body,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    WORLD_SIZE,
-                );
-                let cam = match face_point {
-                    Some(fp) => {
-                        let scale = WORLD_SIZE / sphere.face_size;
-                        [
-                            (fp.un - sphere.face_u_min) * scale,
-                            (fp.vn - sphere.face_v_min) * scale,
-                            (fp.rn - sphere.face_r_min) * scale,
-                        ]
-                    }
-                    None => [WORLD_SIZE * 0.5; 3],
-                };
-                let fwd_world = sdf::normalize(self.camera.forward());
-                let dir = sdf::normalize(cubesphere_local::world_vec_to_face_axes(
-                    fwd_world,
-                    sphere.face,
-                ));
-                let hit = raycast::cpu_raycast_in_frame(
-                    &self.world.library,
-                    self.world.root,
-                    frame_path.as_slice(),
-                    cam,
-                    dir,
-                    self.raycast_max_depth(),
-                    self.cs_edit_depth(),
-                );
-                (hit, frame_path)
+                sdf::normalize(cubesphere_local::world_vec_to_face_axes(
+                    fwd_world, sphere.face,
+                ))
             }
-            crate::app::ActiveFrameKind::Sphere(sphere) => {
-                // face_depth == 0 — whole-face body-frame sphere
-                // raycast (curved, matches `march_face_root` on GPU).
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
-                let hit = raycast::cpu_raycast_in_sphere_frame(
-                    &self.world.library,
-                    self.world.root,
-                    sphere.body_path.as_slice(),
-                    cam_body,
-                    cam_body,
-                    ray_dir_local,
-                    self.raycast_max_depth(),
-                    sphere.face as u32,
-                    sphere.face_u_min,
-                    sphere.face_v_min,
-                    sphere.face_r_min,
-                    sphere.face_size,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    sphere.face_depth,
-                );
-                (hit, sphere.body_path)
-            }
-            crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
-                let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
-                let hit = raycast::cpu_raycast_in_frame(
-                    &self.world.library,
-                    self.world.root,
-                    frame_path.as_slice(),
-                    cam_local,
-                    ray_dir,
-                    self.edit_depth(),
-                    self.cs_edit_depth(),
-                );
-                if hit.is_none() && self.startup_profile_frames < 16 {
-                    eprintln!(
-                        "frame_raycast_cartesian_miss edit_depth={} render_path={:?}",
-                        self.edit_depth(),
-                        frame_path.as_slice(),
-                    );
-                }
-                (hit, frame_path)
-            }
+            _ => fwd_world,
         };
+        let hit = raycast::cpu_raycast_in_frame(
+            &self.world.library,
+            self.world.root,
+            frame_path.as_slice(),
+            cam_local,
+            ray_dir,
+            self.raycast_max_depth(),
+            self.cs_edit_depth(),
+        );
+        let (hit, cap_frame_path) = (hit, frame_path);
         // Enforce the interaction radius gate: drop hits beyond
         // `interaction_radius_cells × anchor_cell_size`. Same
         // cubic-shell LOD philosophy as the shader — out of range
@@ -248,17 +179,8 @@ impl App {
                 hit.is_some(),
             );
             if let Some(ref h) = hit {
-                let (aabb_min, aabb_max) = match self.active_frame.kind {
-                    crate::app::ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
-                        aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
-                    }
-                    crate::app::ActiveFrameKind::Sphere(_) => {
-                        aabb::hit_aabb_body_local(&self.world.library, h)
-                    }
-                    crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
-                        aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path)
-                    }
-                };
+                let (aabb_min, aabb_max) =
+                    aabb::hit_aabb_in_frame_local(h, &self.active_frame.render_path);
                 eprintln!(
                     "frame_raycast_hit path_len={} face={} t={} place_path_len={:?} terminal={} aabb_min={:?} aabb_max={:?} path_kinds={:?}",
                     h.path.len(),

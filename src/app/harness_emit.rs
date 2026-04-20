@@ -93,7 +93,7 @@ impl App {
     /// than the one the next break would edit.
     pub(super) fn harness_probe_cursor(&mut self) {
         use crate::app::ActiveFrameKind;
-        use crate::world::{aabb, anchor::WORLD_SIZE, cubesphere_local, sdf};
+        use crate::world::{aabb, cubesphere_local, sdf};
         let hit = self.frame_aware_raycast();
         let Some(hit) = hit else {
             println!(
@@ -111,52 +111,23 @@ impl App {
             self.anchor_depth(),
             hit.t,
         );
-        // Match the shader's dispatch frame (see upload.rs):
-        //   face_depth ≥ 1 → render-frame-local (face-rotated)
-        //   face_depth == 0 → body-frame (curved sphere render)
-        //   Cartesian / Body → render-frame-local (world axes)
-        let (aabb_min, aabb_max, cam_frame, ray_dir) = match self.active_frame.kind {
+        // Unified render-frame-local probe. The camera position is
+        // always `in_frame(render_path)`, which is precision-safe for
+        // any frame (Cartesian, Body, or Sphere at any face_depth).
+        // The ray direction is rotated into face axes when the render
+        // frame is inside a face subtree; otherwise world axes.
+        let frame_path = self.active_frame.render_path;
+        let cam_frame = self.camera.position.in_frame(&frame_path);
+        let fwd_world = sdf::normalize(self.camera.forward());
+        let ray_dir = match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) if sphere.face_depth >= 1 => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let face_point = cubesphere_local::body_point_to_face_space(
-                    cam_body,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    WORLD_SIZE,
-                );
-                let cam = match face_point {
-                    Some(fp) => {
-                        let scale = WORLD_SIZE / sphere.face_size;
-                        [
-                            (fp.un - sphere.face_u_min) * scale,
-                            (fp.vn - sphere.face_v_min) * scale,
-                            (fp.rn - sphere.face_r_min) * scale,
-                        ]
-                    }
-                    None => [WORLD_SIZE * 0.5; 3],
-                };
-                let fwd_world = sdf::normalize(self.camera.forward());
-                let dir = sdf::normalize(cubesphere_local::world_vec_to_face_axes(
-                    fwd_world,
-                    sphere.face,
-                ));
-                let (mn, mx) = aabb::hit_aabb_in_frame_local(&hit, &self.active_frame.render_path);
-                (mn, mx, cam, dir)
+                sdf::normalize(cubesphere_local::world_vec_to_face_axes(
+                    fwd_world, sphere.face,
+                ))
             }
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                let dir = self.ray_dir_in_frame(&sphere.body_path);
-                let (mn, mx) = aabb::hit_aabb_body_local(&self.world.library, &hit);
-                (mn, mx, cam_body, dir)
-            }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                let frame_path = self.active_frame.render_path;
-                let cam = self.camera.position.in_frame(&frame_path);
-                let dir = self.ray_dir_in_frame(&frame_path);
-                let (mn, mx) = aabb::hit_aabb_in_frame_local(&hit, &frame_path);
-                (mn, mx, cam, dir)
-            }
+            _ => fwd_world,
         };
+        let (aabb_min, aabb_max) = aabb::hit_aabb_in_frame_local(&hit, &frame_path);
         let hit_point = [
             cam_frame[0] + ray_dir[0] * hit.t,
             cam_frame[1] + ray_dir[1] * hit.t,

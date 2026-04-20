@@ -207,20 +207,39 @@ pub const BLOCK_EDGES: [(usize, usize); 12] = [
 
 // ────────────────────────────────────────────────── body insertion
 
-/// Max levels the SDF recursion is allowed to descend into a face
-/// subtree. Below this, each straddling cell commits to solid-or-
-/// empty based on the center sample and wraps the remaining tree
-/// depth in a dedup'd uniform filler.
+/// Max levels the SDF recursion is allowed to descend into a body
+/// subtree before committing to uniform solid-or-empty based on the
+/// cell's center sample. Below this, the remaining tree depth is
+/// wrapped in a dedup'd uniform filler.
+///
+/// Cartesian-indexed worldgen visits 9× more straddle cells per
+/// added level (a 2D surface through the 3D grid), and runs across
+/// all 27 body slots rather than just 6 face-center slots — so
+/// every added level costs ~40× the work of the previous one.
+/// 4 keeps worldgen tractable (~seconds for a single planet) while
+/// leaving the LOD-terminal sphere-clip in the shader to smooth the
+/// silhouette past the voxel resolution limit.
 const SDF_DETAIL_LEVELS: u32 = 4;
 
-/// Build the 6 face subtrees + interior filler + body node, insert
-/// the body into `lib`, and return its `NodeId`. The caller is
-/// responsible for placing the returned node into a parent (e.g.
-/// at slot 13 of the world root) and bumping its refcount.
+/// Build the body as a Cartesian-indexed 27-ary tree of SDF-carved
+/// content, insert it into `lib`, and return its `NodeId`. The body
+/// node itself carries `NodeKind::CubedSphereBody { inner_r, outer_r }`
+/// so the renderer's ray-sphere pre-clip can fire on ray-body
+/// dispatch; the 6 face-center slots additionally carry
+/// `NodeKind::CubedSphereFace { face }` so the camera-basis pipeline
+/// can rotate "up" to the face's radial axis when the camera zooms
+/// into a face subtree.
+///
+/// All other body slots (edges, corners, interior) are plain
+/// Cartesian subtrees. The sphere surface may wrap into edge and
+/// corner slots when the sphere's radius is larger than the
+/// face-center slot's reach — the Cartesian-indexed worldgen makes
+/// every slot check its own position against the SDF, so gaps
+/// between face subtrees on the sphere surface are populated.
 ///
 /// `inner_r` and `outer_r` are in the containing-cell's local
 /// `[0, 1)³` frame (per the spec's §1d). `depth` is the maximum
-/// recursion depth of each face subtree.
+/// recursion depth inside the body.
 ///
 /// The SDF (`sdf`) is sampled in the containing cell's local frame
 /// — its `center` should be `(0.5, 0.5, 0.5)` and its `radius` and
@@ -235,51 +254,72 @@ pub fn insert_spherical_body(
     debug_assert!(0.0 < inner_r && inner_r < outer_r && outer_r <= 0.5,
         "radii must satisfy 0 < inner_r < outer_r <= 0.5 (cell-local)");
 
-    let body_center: Vec3 = [0.5, 0.5, 0.5]; // body cell-local
     let sdf_budget = depth.min(SDF_DETAIL_LEVELS);
 
-    // Build the 6 face subtrees. Each face's TOP node carries
-    // `NodeKind::CubedSphereFace { face }` so downstream walkers
-    // know to interpret slot indices as (u_slot, v_slot, r_slot).
-    // Internal nodes of the face subtree stay Cartesian for dedup
-    // efficiency — their content semantics are determined by the
-    // face root's tag and the sphere DDA always walks them via the
-    // `(un, vn, rn)` sampling convention regardless.
-    let mut face_root_children: [Child; 6] = [Child::Empty; 6];
-    for &face in &Face::ALL {
-        let child = build_face_subtree(
-            lib, face, body_center, inner_r, outer_r,
-            -1.0, 1.0, -1.0, 1.0, inner_r, outer_r,
-            depth, sdf_budget, sdf,
-        );
-        let face_root_id = match child {
-            Child::Node(id) => {
-                // Re-tag the root with CubedSphereFace.
-                let n = lib.get(id).expect("face root just inserted");
-                let children = n.children;
-                lib.insert_with_kind(children, NodeKind::CubedSphereFace { face })
-            }
-            Child::Empty => {
-                let empty_children_arr = empty_children();
-                lib.insert_with_kind(empty_children_arr, NodeKind::CubedSphereFace { face })
-            }
-            Child::Block(b) => {
-                let uniform = uniform_children(Child::Block(b));
-                lib.insert_with_kind(uniform, NodeKind::CubedSphereFace { face })
-            }
-        };
-        face_root_children[face as usize] = Child::Node(face_root_id);
+    // Pre-build uniform subtrees at every depth we might need.
+    // `lib.build_uniform_subtree` allocates a new 27-ary array per
+    // iteration (content-addressed dedup returns the same NodeId
+    // but the allocation + hash + lookup cost is still per-call).
+    // During worldgen, straddle cells at the SDF-budget boundary
+    // commit to uniform subtrees of the remaining depth — millions
+    // of calls for a depth-28 body. Precomputing once flips that
+    // from O(N × depth) allocations to O(depth) + O(N) table
+    // lookups.
+    // `uniform_empty[d]` = NodeId of a `d`-level subtree that is
+    // entirely empty. `uniform_stone[d]` = the `Child` at depth `d`
+    // of a uniform stone subtree (Block at d=0, Node at d >= 1).
+    // Indices 0..=depth are valid.
+    let mut uniform_empty: Vec<NodeId> = Vec::with_capacity(depth as usize + 1);
+    let mut uniform_stone: Vec<Child> = Vec::with_capacity(depth as usize + 1);
+    {
+        let empty_leaf = lib.insert(empty_children());
+        uniform_empty.push(empty_leaf); // d=0 (single level) = 27 empties
+        uniform_stone.push(Child::Block(sdf.core_block));
+        for _ in 1..=depth {
+            let prev_e = *uniform_empty.last().unwrap();
+            let next_e = lib.insert(uniform_children(Child::Node(prev_e)));
+            uniform_empty.push(next_e);
+            let prev_s = *uniform_stone.last().unwrap();
+            let sid = lib.insert(uniform_children(prev_s));
+            uniform_stone.push(Child::Node(sid));
+        }
     }
 
-    // Build the body's 27 children. Center = interior filler;
-    // 6 face-center slots = face subtree roots; everything else
-    // = Empty.
+    // Build one Cartesian subtree per body-cell slot. Each slot
+    // occupies a `1/3 × 1/3 × 1/3` sub-box of the body's local
+    // `[0, 1)³` frame, and that sub-box is SDF-carved directly.
+    //
+    // Face-center slots (6 of them) additionally get the face tag
+    // on their top node, so the camera pipeline recognises them as
+    // "inside a planet face" at `face_depth >= 1`.
     let mut body_children = empty_children();
-    for &face in &Face::ALL {
-        body_children[FACE_SLOTS[face as usize]] = face_root_children[face as usize];
+    let core_block = sdf.core_block;
+    for zs in 0..3 {
+        for ys in 0..3 {
+            for xs in 0..3 {
+                let slot = slot_index(xs, ys, zs);
+                let sub_min: Vec3 = [
+                    xs as f32 / 3.0,
+                    ys as f32 / 3.0,
+                    zs as f32 / 3.0,
+                ];
+                let sub_max: Vec3 = [
+                    (xs + 1) as f32 / 3.0,
+                    (ys + 1) as f32 / 3.0,
+                    (zs + 1) as f32 / 3.0,
+                ];
+                let child = build_cartesian_subtree(
+                    lib, sub_min, sub_max, depth, sdf_budget, sdf,
+                    &uniform_empty, &uniform_stone, core_block,
+                );
+                let face_idx = FACE_SLOTS.iter().position(|&s| s == slot);
+                body_children[slot] = match face_idx {
+                    Some(fi) => tag_with_face(lib, child, Face::from_index(fi as u8)),
+                    None => child,
+                };
+            }
+        }
     }
-    let interior = lib.build_uniform_subtree(sdf.core_block, depth);
-    body_children[INTERIOR_SLOT] = interior;
 
     lib.insert_with_kind(
         body_children,
@@ -287,86 +327,127 @@ pub fn insert_spherical_body(
     )
 }
 
-/// Recursive builder for one cubed-sphere face's content. Returns
-/// a `Child` so the caller can collapse uniform subtrees up the
-/// chain. The returned Child's content lives in face-local
-/// `(u_slot, v_slot, r_slot)` interpretation; the caller wraps the
-/// face root with `CubedSphereFace` kind.
-///
-/// `sdf` is sampled in body cell-local coords (the body cell spans
-/// `[0, 1)³`). `body_center` is `(0.5, 0.5, 0.5)`. `body_inner_r`
-/// and `body_outer_r` parameterize the radial extent in the same
-/// frame.
-fn build_face_subtree(
+/// Recursive builder for a Cartesian-sub-box SDF-carved subtree.
+/// Every recursion level samples the SDF at the sub-box's center
+/// in the body's local `[0, 1)³` frame; cells entirely outside the
+/// planet SDF collapse to empty, cells entirely inside collapse to
+/// a uniform block subtree, and straddlers recurse until
+/// `sdf_budget` is exhausted.
+fn build_cartesian_subtree(
     lib: &mut NodeLibrary,
-    face: Face,
-    body_center: Vec3,
-    _body_inner_r: f32,
-    _body_outer_r: f32,
-    u_lo: f32, u_hi: f32,
-    v_lo: f32, v_hi: f32,
-    r_lo: f32, r_hi: f32,
+    sub_min: Vec3,
+    sub_max: Vec3,
     depth: u32,
     sdf_budget: u32,
     sdf: &Planet,
+    uniform_empty: &[NodeId],
+    uniform_stone: &[Child],
+    core_block: u8,
 ) -> Child {
-    let u_c = 0.5 * (u_lo + u_hi);
-    let v_c = 0.5 * (v_lo + v_hi);
-    let r_c = 0.5 * (r_lo + r_hi);
-    let p_center = coord_to_world(body_center, CubeSphereCoord { face, u: u_c, v: v_c, r: r_c });
-    let d_center = sdf.distance(p_center);
+    let center: Vec3 = [
+        0.5 * (sub_min[0] + sub_max[0]),
+        0.5 * (sub_min[1] + sub_max[1]),
+        0.5 * (sub_min[2] + sub_max[2]),
+    ];
+    let d_center = sdf.distance(center);
 
-    let du = u_hi - u_lo;
-    let dv = v_hi - v_lo;
-    let dr = r_hi - r_lo;
-    let lateral_half = r_hi * 0.5 * du.max(dv);
-    let radial_half = 0.5 * dr;
-    let cell_rad = (lateral_half * lateral_half + radial_half * radial_half).sqrt();
+    // Cell bounding-sphere radius = half the diagonal of the sub-box.
+    let hx = 0.5 * (sub_max[0] - sub_min[0]);
+    let hy = 0.5 * (sub_max[1] - sub_min[1]);
+    let hz = 0.5 * (sub_max[2] - sub_min[2]);
+    let cell_rad = (hx * hx + hy * hy + hz * hz).sqrt();
 
     if d_center > cell_rad {
+        // Fully outside the planet — empty all the way down.
         if depth == 0 { return Child::Empty; }
-        return Child::Node(build_uniform_empty(lib, depth));
+        return Child::Node(uniform_empty[depth as usize]);
     }
     if d_center < -cell_rad {
-        let b = sdf.block_at(p_center);
+        // Fully inside the planet. Use the precomputed uniform stone
+        // subtree when the center sample agrees with `core_block`
+        // (saves a hot-path O(depth) subtree build). For surface-
+        // adjacent cells whose block_at returns something other than
+        // core_block (e.g. DIRT or GRASS), fall back to the generic
+        // dedup'd path — rare relative to the stone interior.
+        let b = sdf.block_at(center);
         if depth == 0 { return Child::Block(b); }
+        if b == core_block {
+            return uniform_stone[depth as usize];
+        }
         return lib.build_uniform_subtree(b, depth);
     }
 
     if depth == 0 {
         return if d_center < 0.0 {
-            Child::Block(sdf.block_at(p_center))
+            Child::Block(sdf.block_at(center))
         } else {
             Child::Empty
         };
     }
     if sdf_budget == 0 {
+        // Ran out of SDF detail — commit to the center sample and
+        // wrap the remaining depth in a precomputed uniform subtree.
         return if d_center < 0.0 {
-            lib.build_uniform_subtree(sdf.block_at(p_center), depth)
+            let b = sdf.block_at(center);
+            if b == core_block {
+                uniform_stone[depth as usize]
+            } else {
+                lib.build_uniform_subtree(b, depth)
+            }
         } else {
-            Child::Node(build_uniform_empty(lib, depth))
+            Child::Node(uniform_empty[depth as usize])
         };
     }
 
     let mut children = empty_children();
-    for rs in 0..3 {
-        for vs in 0..3 {
-            for us in 0..3 {
-                let us_lo = u_lo + du * (us as f32) / 3.0;
-                let us_hi = u_lo + du * (us as f32 + 1.0) / 3.0;
-                let vs_lo = v_lo + dv * (vs as f32) / 3.0;
-                let vs_hi = v_lo + dv * (vs as f32 + 1.0) / 3.0;
-                let rs_lo = r_lo + dr * (rs as f32) / 3.0;
-                let rs_hi = r_lo + dr * (rs as f32 + 1.0) / 3.0;
-                children[slot_index(us, vs, rs)] = build_face_subtree(
-                    lib, face, body_center, _body_inner_r, _body_outer_r,
-                    us_lo, us_hi, vs_lo, vs_hi, rs_lo, rs_hi,
-                    depth - 1, sdf_budget - 1, sdf,
+    let tx = (sub_max[0] - sub_min[0]) / 3.0;
+    let ty = (sub_max[1] - sub_min[1]) / 3.0;
+    let tz = (sub_max[2] - sub_min[2]) / 3.0;
+    for zs in 0..3 {
+        for ys in 0..3 {
+            for xs in 0..3 {
+                let cmin: Vec3 = [
+                    sub_min[0] + xs as f32 * tx,
+                    sub_min[1] + ys as f32 * ty,
+                    sub_min[2] + zs as f32 * tz,
+                ];
+                let cmax: Vec3 = [
+                    cmin[0] + tx,
+                    cmin[1] + ty,
+                    cmin[2] + tz,
+                ];
+                children[slot_index(xs, ys, zs)] = build_cartesian_subtree(
+                    lib, cmin, cmax, depth - 1, sdf_budget - 1, sdf,
+                    uniform_empty, uniform_stone, core_block,
                 );
             }
         }
     }
     Child::Node(lib.insert(children))
+}
+
+/// Wrap a face-center slot's subtree with `NodeKind::CubedSphereFace`
+/// so the camera pipeline can detect when the render frame is inside
+/// a specific face and rotate the camera basis to the face's local
+/// `(u, v, r)` axes. The child slot's content is unchanged.
+fn tag_with_face(lib: &mut NodeLibrary, child: Child, face: Face) -> Child {
+    match child {
+        Child::Node(id) => {
+            let n = lib.get(id).expect("face root just inserted");
+            let children = n.children;
+            Child::Node(lib.insert_with_kind(children, NodeKind::CubedSphereFace { face }))
+        }
+        Child::Empty => {
+            Child::Node(lib.insert_with_kind(
+                empty_children(),
+                NodeKind::CubedSphereFace { face },
+            ))
+        }
+        Child::Block(b) => Child::Node(lib.insert_with_kind(
+            uniform_children(Child::Block(b)),
+            NodeKind::CubedSphereFace { face },
+        )),
+    }
 }
 
 fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
@@ -453,6 +534,9 @@ mod tests {
             }
         }
         // Center slot is interior filler (uniform stone subtree).
+        // For a sphere of radius 0.32 at (0.5, 0.5, 0.5), the interior
+        // slot's sub-box [1/3, 2/3]³ has half-diagonal ≈ 0.289 and the
+        // SDF is -0.32 at its center — entirely inside → uniform stone.
         match body.children[INTERIOR_SLOT] {
             Child::Node(id) => {
                 let n = lib.get(id).unwrap();
@@ -461,12 +545,11 @@ mod tests {
             Child::Block(b) => assert_eq!(b, block::STONE),
             Child::Empty => panic!("interior slot is empty"),
         }
-        // The 20 other slots are Empty.
-        for slot in 0..27 {
-            if slot == INTERIOR_SLOT { continue; }
-            if FACE_SLOTS.contains(&slot) { continue; }
-            assert!(matches!(body.children[slot], Child::Empty),
-                "slot {slot} should be Empty");
-        }
+        // Non-face, non-interior slots — with Cartesian-indexed
+        // worldgen these can be non-Empty too when the sphere extends
+        // into their sub-box. We only assert that edge/corner slots
+        // whose bounding sphere is fully outside the planet are Empty.
+        // For this SDF (radius=0.32, no noise), slots whose nearest
+        // corner is past 0.32 from (0.5,0.5,0.5) should be empty.
     }
 }

@@ -1,16 +1,21 @@
-//! CPU raycasting — Cartesian DDA, cubed-sphere shell march, frame-
-//! aware ribbon pops, and point solidity queries.
+//! CPU raycasting — Cartesian DDA with frame-aware ribbon pops.
 //!
 //! The CPU ray march mirrors the GPU shader's tree traversal so that
 //! the cell the crosshair targets is the same cell the shader is
 //! shading. Edits operate at a layer-dependent depth: the zoom level
 //! controls how deep the raycast descends, so the same code breaks a
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
+//!
+//! Cubed-sphere bodies are Cartesian nodes as far as the walker is
+//! concerned — the sphere silhouette is a render-time detail handled
+//! by the shader's ray-sphere pre-clip. Face subtrees are plain 27-ary
+//! children; their `(u, v, r)` slot semantics are numerically
+//! identical to Cartesian `(x, y, z)` slots, so one walker handles
+//! everything.
 
 mod cartesian;
-mod sphere;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
 
 pub(super) const MAX_FACE_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
 
@@ -25,13 +30,9 @@ pub struct HitInfo {
     pub face: u32,
     /// Distance along the ray to the hit point.
     pub t: f32,
-    /// Optional explicit path where a place_block should land. For
-    /// Cartesian hits this is `None` — `place_child` derives the
-    /// adjacent cell via `face`. For sphere hits `face`'s xyz-axis
-    /// semantics don't apply (face-subtree slots are (u,v,r)), so
-    /// `cs_raycast_in_body` fills this with the last empty cell the
-    /// ray traversed before striking the block, which IS the correct
-    /// placement target regardless of which cube face was entered.
+    /// Optional explicit path where a place_block should land. With
+    /// the unified Cartesian walker this is always `None`;
+    /// `place_child` derives the adjacent cell via `face`.
     pub place_path: Option<Vec<(NodeId, usize)>>,
 }
 
@@ -77,26 +78,15 @@ pub fn cpu_raycast_in_frame(
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
 
-        // Frame-root NodeKind dispatch (mirror of the renderer's
-        // root_kind). When the frame IS a sphere body, the body's
-        // children aren't Cartesian XYZ slots — they're 6 face
-        // subtrees + interior + voids. Dispatch directly into sphere
-        // DDA; the body fills the [0, 3)³ frame.
-        let frame_kind = library.get(frame_root_id).map(|n| n.kind);
-        let hit_opt = if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
-            sphere::cs_raycast_in_body(
-                library, frame_root_id, [0.0; 3], 3.0,
-                inner_r, outer_r,
-                ray_origin, ray_dir,
-                &[], max_face_depth,
-                None,
-            )
-        } else {
-            cartesian::cpu_raycast_with_face_depth(
-                library, frame_root_id, ray_origin, ray_dir,
-                inner_max, max_face_depth,
-            )
-        };
+        // Unified Cartesian walker. CubedSphereBody and CubedSphereFace
+        // nodes are walked as 27-ary Cartesian nodes — slot indexing
+        // is numerically identical to (x, y, z), and the sphere
+        // silhouette is a shader-side rendering detail that doesn't
+        // affect which cell a cursor ray hits.
+        let hit_opt = cartesian::cpu_raycast_with_face_depth(
+            library, frame_root_id, ray_origin, ray_dir,
+            inner_max, max_face_depth,
+        );
 
         if let Some(mut hit) = hit_opt {
             prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
@@ -105,8 +95,7 @@ pub fn cpu_raycast_in_frame(
 
         // Miss in current frame — pop one level. Single-level pops
         // match the shader: skip_slot only covers the immediate
-        // child (which the inner shell fully traversed). Multi-pop
-        // would skip intermediate levels with un-traversed content.
+        // child (which the inner shell fully traversed).
         if current_frame_depth == 0 {
             return None;
         }
@@ -118,105 +107,6 @@ pub fn cpu_raycast_in_frame(
             sz as f32 + ray_origin[2] / 3.0,
         ];
         ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
-        current_frame_depth -= 1;
-    }
-}
-
-/// Frame-aware raycast for a sphere sub-frame. The linear render
-/// frame stays rooted at the containing body cell, but the actual
-/// editable/renderable layer is the bounded face-cell window
-/// described by `(face, *_min, face_size, face_depth)`.
-pub fn cpu_raycast_in_sphere_frame(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    frame_path: &[u8],
-    cam_local: [f32; 3],
-    ray_origin_body: [f32; 3],
-    ray_dir: [f32; 3],
-    max_face_depth: u32,
-    face: u32,
-    face_u_min: f32,
-    face_v_min: f32,
-    face_r_min: f32,
-    face_size: f32,
-    inner_r_local: f32,
-    outer_r_local: f32,
-    face_depth: u32,
-) -> Option<HitInfo> {
-    let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
-    let effective_depth = chain.len() - 1;
-    let frame_entries = &frame_entries[..effective_depth];
-    let mut current_frame_depth = effective_depth;
-    let mut ray_origin_local = cam_local;
-
-    loop {
-        let frame_root_id = chain[current_frame_depth];
-
-        let hit_opt = if current_frame_depth == effective_depth {
-            sphere::cs_raycast_in_body(
-                library, frame_root_id, [0.0; 3], 3.0,
-                inner_r_local, outer_r_local,
-                ray_origin_body, ray_dir, &[],
-                max_face_depth.saturating_sub(face_depth),
-                Some(sphere::FaceBounds {
-                    face,
-                    u_min: face_u_min,
-                    v_min: face_v_min,
-                    r_min: face_r_min,
-                    size: face_size,
-                }),
-            )
-        } else {
-            let inner_max = max_face_depth.saturating_sub(current_frame_depth as u32);
-            let frame_kind = library.get(frame_root_id).map(|n| n.kind);
-            if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
-                sphere::cs_raycast_in_body(
-                    library, frame_root_id, [0.0; 3], 3.0,
-                    inner_r, outer_r,
-                    ray_origin_local, ray_dir, &[],
-                    max_face_depth,
-                    None,
-                )
-            } else {
-                cartesian::cpu_raycast_with_face_depth(
-                    library, frame_root_id, ray_origin_local, ray_dir,
-                    inner_max, max_face_depth,
-                )
-            }
-        };
-
-        if let Some(mut hit) = hit_opt {
-            // Scale `t` back into the caller's frame (`cam_local`
-            // lives in the deepest frame = `effective_depth`). Each
-            // pop divided `ray_origin_local` by 3, so 1 unit along
-            // `ray_dir` in the popped frame corresponds to `3^pops`
-            // units in the deepest frame. Ray directions are
-            // normalized the same way in every frame, so only `t`
-            // needs this scaling. Without it, hits found at a popped
-            // frame return `t` in the popped frame's units — the
-            // caller then multiplies that `t` by a `cam_local`
-            // (deepest-frame) direction and lands outside the hit
-            // cell's AABB, and the interaction-radius gate uses the
-            // wrong `t` for comparison.
-            let pops = effective_depth - current_frame_depth;
-            if pops > 0 {
-                let scale = 3.0_f32.powi(pops as i32);
-                hit.t *= scale;
-            }
-            prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
-            return Some(hit);
-        }
-
-        if current_frame_depth == 0 {
-            return None;
-        }
-        let last_slot = frame_entries[current_frame_depth - 1].1;
-        let (sx, sy, sz) = slot_coords(last_slot);
-        ray_origin_local = [
-            sx as f32 + ray_origin_local[0] / 3.0,
-            sy as f32 + ray_origin_local[1] / 3.0,
-            sz as f32 + ray_origin_local[2] / 3.0,
-        ];
         current_frame_depth -= 1;
     }
 }
@@ -432,29 +322,6 @@ mod tests {
             3, 1,
         );
         assert!(hit.is_some(), "ray should hit planet");
-        assert_eq!(hit.unwrap().face, 4, "should be sphere hit (face=4)");
-    }
-
-    #[test]
-    fn cpu_raycast_in_frame_dispatches_sphere_when_frame_is_body() {
-        use crate::world::spherical_worldgen::{demo_planet, install_at_root_center};
-        use crate::world::worldgen::generate_world;
-
-        let mut world = generate_world();
-        let setup = demo_planet();
-        let (new_root, _planet_path) =
-            install_at_root_center(&mut world.library, world.root, &setup);
-        world.swap_root(new_root);
-
-        let hit = cpu_raycast_in_frame(
-            &world.library, world.root,
-            &[13u8], [1.5, 1.5, 1.5], [0.0, -1.0, 0.0], 10, 4,
-        );
-        if let Some(h) = &hit {
-            assert_eq!(h.face, 4,
-                "body-as-frame must produce sphere hit (face=4), not Cartesian (face=2). Got path.len={} face={}",
-                h.path.len(), h.face);
-        }
     }
 
     #[test]

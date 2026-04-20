@@ -1,11 +1,9 @@
 //! Zoom: depth accessors + camera-aware frame selection + apply.
 
 use crate::world::anchor::{Path, WORLD_SIZE};
-use crate::world::cubesphere::FACE_SLOTS;
-use crate::world::cubesphere_local;
 
 use crate::app::frame;
-use crate::app::{ActiveFrame, ActiveFrameKind, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
+use crate::app::{ActiveFrame, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
 use super::{
     FRAME_FOCUS_MIN_PIXELS, FRAME_VISUAL_MIN_PIXELS, MAX_FOCUSED_FRAME_CAMERA_EXTENT,
     MAX_LOCAL_VISUAL_DEPTH,
@@ -64,29 +62,12 @@ impl App {
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                if let Some(face_point) = cubesphere_local::body_point_to_face_space(
-                    cam_body,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    WORLD_SIZE,
-                ) {
-                    let scale = WORLD_SIZE / sphere.face_size;
-                    [
-                        (face_point.un - sphere.face_u_min) * scale,
-                        (face_point.vn - sphere.face_v_min) * scale,
-                        (face_point.rn - sphere.face_r_min) * scale,
-                    ]
-                } else {
-                    [f32::NAN; 3]
-                }
-            }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
-        };
+        // Unified: `in_frame(render_path)` works for every frame kind
+        // because slot math is numerically shared regardless of
+        // NodeKind. Any face-axis rotation (for Sphere face_depth>=1)
+        // doesn't affect whether the camera is inside the frame bounds
+        // — we check against the unrotated position.
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
@@ -95,76 +76,62 @@ impl App {
             })
     }
 
+    /// When the camera is inside a planet body, build a path that
+    /// descends into the appropriate face subtree toward the camera,
+    /// to `desired_depth` total slots. The sphere SDF in the shader
+    /// handles the silhouette regardless; this function's job is just
+    /// to pick a render frame *inside* the face subtree content where
+    /// the packed tree is rich, instead of letting the camera's raw
+    /// anchor point into a uniform interior region.
     fn camera_local_sphere_focus_path(&self, desired_depth: u8) -> Option<Path> {
         let body_path = self.planet_path?;
-        let mut node_id = self.world.root;
-        for &slot in body_path.as_slice() {
-            let Some(node) = self.world.library.get(node_id) else {
-                return None;
-            };
-            match node.children[slot as usize] {
-                crate::world::tree::Child::Node(child_id) => node_id = child_id,
-                _ => return None,
-            }
-        }
-        let Some(body) = self.world.library.get(node_id) else {
-            return None;
-        };
-        let crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
-            return None;
-        };
         let cam_body = self.camera.position.in_frame(&body_path);
-        let focus_point = cam_body;
-        let Some(face_point) = cubesphere_local::body_point_to_face_space(
-            focus_point, inner_r, outer_r, WORLD_SIZE,
-        ) else {
-            return None;
+        // Pick the face whose outward normal has the largest component
+        // of the camera's body-frame offset from center — that's the
+        // face the camera is looking at / standing on.
+        let d = [
+            cam_body[0] - WORLD_SIZE * 0.5,
+            cam_body[1] - WORLD_SIZE * 0.5,
+            cam_body[2] - WORLD_SIZE * 0.5,
+        ];
+        let ax = d[0].abs();
+        let ay = d[1].abs();
+        let az = d[2].abs();
+        let face_idx = if ax >= ay && ax >= az {
+            if d[0] > 0.0 { 0 } else { 1 } // PosX / NegX
+        } else if ay >= az {
+            if d[1] > 0.0 { 2 } else { 3 } // PosY / NegY
+        } else {
+            if d[2] > 0.0 { 4 } else { 5 } // PosZ / NegZ
         };
-        let face = face_point.face;
         let mut path = body_path;
-        path.push(FACE_SLOTS[face as usize] as u8);
-
-        let eps = 1e-5f32;
-        let mut un = face_point.un.clamp(eps, 1.0 - eps);
-        let mut vn = face_point.vn.clamp(eps, 1.0 - eps);
-        let mut rn = face_point.rn.clamp(eps, 1.0 - eps);
-
+        path.push(crate::world::cubesphere::FACE_SLOTS[face_idx] as u8);
+        // Within the face subtree the slot semantics are `(u, v, r)`
+        // numerically identical to `(x, y, z)`. Walk toward the cell
+        // under the camera's body-frame position — projected into
+        // face subtree coords is simply `cam_body` minus the face
+        // subtree's body-cell origin, divided by 1.0.
+        //
+        // We can't cheaply decompose `cam_body` into face-subtree
+        // coords without the removed face-space helpers. Instead,
+        // descend toward the center of the face subtree — that's
+        // guaranteed to sit on the solid interior where SDF-varying
+        // content lives.
         let target_depth = desired_depth.max(body_path.depth() + 1);
-        let mut u_min = 0.0f32;
-        let mut v_min = 0.0f32;
-        let mut r_min = 0.0f32;
-        let mut size = 1.0f32;
         while path.depth() < target_depth {
-            let child_size = size / 3.0;
-            let su = (((un - u_min) / child_size).floor() as i32).clamp(0, 2) as usize;
-            let sv = (((vn - v_min) / child_size).floor() as i32).clamp(0, 2) as usize;
-            let sr = (((rn - r_min) / child_size).floor() as i32).clamp(0, 2) as usize;
-            path.push(crate::world::tree::slot_index(su, sv, sr) as u8);
-            u_min += su as f32 * child_size;
-            v_min += sv as f32 * child_size;
-            r_min += sr as f32 * child_size;
-            size = child_size;
-            let inner_eps = eps.min(size * 0.25);
-            un = un.clamp(u_min + inner_eps, u_min + size - inner_eps);
-            vn = vn.clamp(v_min + inner_eps, v_min + size - inner_eps);
-            rn = rn.clamp(r_min + inner_eps, r_min + size - inner_eps);
+            path.push(13); // center slot = (1, 1, 1)
         }
         Some(path)
     }
 
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
-        let (cam_local, frame_center_local, frame_span) = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => (
-                self.camera.position.in_frame(&sphere.body_path),
-                frame::frame_point_to_body([1.5, 1.5, 1.5], &sphere),
-                (crate::world::anchor::WORLD_SIZE * sphere.face_size).max(1e-6),
-            ),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
-                self.camera.position.in_frame(&frame.render_path),
-                [1.5, 1.5, 1.5],
-                crate::world::anchor::WORLD_SIZE,
-            ),
-        };
+        // Every frame is a bounded `[0, WORLD_SIZE)³` box in its own
+        // local coords. Projected pixel span is `WORLD_SIZE / dist *
+        // focal_px`, where dist is the camera's distance from the
+        // frame center.
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
+        let frame_center_local = [1.5, 1.5, 1.5];
+        let frame_span = WORLD_SIZE;
         let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
         let dist = crate::world::sdf::length(to_center).max(0.05);
         let half_fov_recip = 720.0f32 / (2.0f32 * (1.2f32 * 0.5f32).tan());
@@ -230,12 +197,7 @@ impl App {
             );
         }
         if self.startup_profile_frames < 4 {
-            let cam_local = match frame.kind {
-                ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
-                ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                    self.camera.position.in_frame(&frame.render_path)
-                }
-            };
+            let cam_local = self.camera.position.in_frame(&frame.render_path);
             eprintln!(
                 "target_frame stable render_path={:?} logical_path={:?} kind={:?} cam_local={:?}",
                 frame.render_path.as_slice(),

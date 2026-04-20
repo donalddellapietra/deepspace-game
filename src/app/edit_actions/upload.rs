@@ -98,45 +98,12 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(effective_visual_depth);
             renderer.update_camera(&cam_gpu);
-            match self.active_frame.kind {
-                ActiveFrameKind::Sphere(sphere) => {
-                    // Face-depth-conditional dispatch (option B from
-                    // docs/history/sphere-locality-refactor-plan.md):
-                    //
-                    // * face_depth == 0 — whole face visible in the
-                    //   viewport. Keep the curved equal-angle
-                    //   `march_face_root` rendering so the planet
-                    //   silhouette is round. Body-frame math here is
-                    //   precision-safe because anchor depth relative
-                    //   to body stays shallow at this zoom level.
-                    //
-                    // * face_depth ≥ 1 — camera has zoomed into a
-                    //   sub-face whose angular extent is small. Local
-                    //   curvature over the sub-cell is sub-pixel, so
-                    //   dispatching `march_cartesian` on the face
-                    //   subtree (with face-axis-rotated camera basis
-                    //   from `gpu_camera_for_frame`) is visually
-                    //   indistinguishable from the curved version
-                    //   AND eliminates the body-frame precision wall
-                    //   at `anchor_depth ≥ 20` that drove the
-                    //   refactor. See user guidance "lose curvature
-                    //   after a couple of layers".
-                    if sphere.face_depth == 0 {
-                        renderer.set_root_kind_face(
-                            sphere.inner_r, sphere.outer_r,
-                            sphere.face as u32, sphere.face_depth,
-                            [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
-                            self.camera.position.in_frame(&sphere.body_path),
-                        );
-                    } else {
-                        renderer.set_root_kind_cartesian();
-                    }
-                }
-                ActiveFrameKind::Body { inner_r, outer_r } => {
-                    renderer.set_root_kind_body(inner_r, outer_r);
-                }
-                ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
-            }
+            // Every frame dispatches to the unified Cartesian walker.
+            // The ray-sphere pre-clip for CubedSphereBody children
+            // happens inside march_cartesian's `kind == 1u` branch,
+            // so there's no per-frame root-kind switch.
+            let _ = self.active_frame.kind;
+            renderer.set_root_kind_cartesian();
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
