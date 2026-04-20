@@ -212,13 +212,13 @@ fn march_cartesian(
         }
 
         // Non-empty: compute rank via popcount, then load the
-        // interleaved child entry (3 u32s: packed tag/block_type/pad,
-        // BFS node_index, and child_occupancy). `cur_first_child`
-        // is already in tree[] u32 units; the entry sits at
-        // `first_child + rank*3` in the SAME buffer as the header we
-        // just read, typically on the same cache line.
+        // interleaved child entry (2 u32s: packed tag/block_type/pad
+        // and BFS node_index). `cur_first_child` is already in
+        // tree[] u32 units; the entry sits at `first_child + rank*2`
+        // in the SAME buffer as the header we just read, typically
+        // on the same cache line.
         let rank = countOneBits(cur_occupancy & (slot_bit - 1u));
-        let child_base = cur_first_child + rank * 3u;
+        let child_base = cur_first_child + rank * 2u;
         let packed = tree[child_base];
         let tag = packed & 0xFFu;
         if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
@@ -235,21 +235,10 @@ fn march_cartesian(
             result.cell_size = cur_cell_size;
             return result;
         } else {
-            // tag == 2u: Node child. Load node_index and the
-            // inlined child occupancy from the 2nd and 3rd u32s of
-            // the compact entry — both in the same cache line as
-            // `packed`, so these piggyback on the LOAD 1 miss.
-            //
-            // `child_occ_inlined` is the critical-path optimisation:
-            // it's an exact duplicate of `tree[node_offsets[child_idx]]`
-            // which the shader previously fetched via a 3-hop
-            // dependent chain on descent. Reading it from the parent's
-            // child entry skips one memory hop and lets the inner DDA
-            // start before the `tree[header_off + 1]` first-child
-            // load completes.
+            // tag == 2u: Node child. Load node_index from the
+            // second u32 of the compact entry we already located.
             let child_idx = tree[child_base + 1u];
-            let child_occ_inlined = tree[child_base + 2u];
-            if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
+            if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
 
             // Shell skip: when re-entering a parent shell after a
             // ribbon pop, skip the SLOT we already traversed in the
@@ -417,22 +406,23 @@ fn march_cartesian(
                 let local_entry = (child_entry - child_origin) / child_cell_size;
 
                 // Instrumentation: count of descents the path-mask
-                // cull would catch. An earlier experiment promoted
-                // this to a real cull: it reduced avg_steps 16% and
-                // avg_loads 10%, but delivered ZERO wall-clock
-                // improvement on Apple Silicon because the GPU was
-                // already memory-hiding the "wasted" descents.
-                // Reverted to instrumentation-only; the counter
-                // stays as a diagnostic. Uses `child_occ_inlined`
-                // which we already have in register — no extra loads.
+                // cull would catch if enabled. An earlier experiment
+                // promoted this to a real cull: it reduced avg_steps
+                // 16% and avg_loads 10%, but delivered ZERO wall-
+                // clock improvement on Apple Silicon because the GPU
+                // was already memory-hiding the "wasted" descents.
+                // Reverted to instrumentation-only; the counter stays
+                // as a diagnostic for future perf investigations.
                 if ENABLE_STATS {
+                    let preview_header_off = node_offsets[child_idx];
+                    let preview_occ = tree[preview_header_off];
                     let preview_entry_cell = vec3<i32>(
                         i32(floor(local_entry.x)),
                         i32(floor(local_entry.y)),
                         i32(floor(local_entry.z)),
                     );
                     let pm = path_mask_conservative(preview_entry_cell, step);
-                    if (child_occ_inlined & pm) == 0u {
+                    if (preview_occ & pm) == 0u {
                         ray_steps_would_cull = ray_steps_would_cull + 1u;
                     }
                 }
@@ -441,20 +431,17 @@ fn march_cartesian(
                 s_node_idx[depth] = child_idx;
                 cur_node_origin = child_origin;
                 cur_cell_size = child_cell_size;
-                // Use the inlined occupancy we already have in
-                // register — same 27-bit mask that lives at
-                // `tree[node_offsets[child_idx]]`, but reached via
-                // the parent's child-entry cache line instead of a
-                // 2-hop dependent chain. Only `cur_first_child`
-                // still requires `node_offsets[child_idx] + 1u`, and
-                // its load can overlap with the inner DDA iterations
-                // that process empty cells immediately.
-                cur_occupancy = child_occ_inlined;
+                // Load the new current-depth header into scalar
+                // registers so the inner loop never re-reads tree[]
+                // headers. `node_offsets` is the only per-descent
+                // cross-buffer hop; subsequent per-cell accesses
+                // stay in registers.
                 let child_header_off = node_offsets[child_idx];
+                cur_occupancy = tree[child_header_off];
                 cur_first_child = tree[child_header_off + 1u];
                 if ENABLE_STATS {
                     ray_loads_offsets = ray_loads_offsets + 1u;
-                    ray_loads_tree = ray_loads_tree + 1u;
+                    ray_loads_tree = ray_loads_tree + 2u;
                 }
                 s_cell[depth] = vec3<i32>(
                     clamp(i32(floor(local_entry.x)), 0, 2),
