@@ -548,6 +548,7 @@ impl Renderer {
             dummy_mask_view,
             coarse_pipeline,
             coarse_bind_group,
+            beam_enabled: true,
             pipeline_taa,
             taa: taa_state,
             last_camera_write_ms: 0.0,

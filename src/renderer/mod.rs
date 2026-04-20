@@ -125,6 +125,14 @@ pub struct Renderer {
     /// except slot 8 is bound to `dummy_mask_view` instead of
     /// `mask_view`.
     pub(super) coarse_bind_group: wgpu::BindGroup,
+    /// When true, the coarse pass runs to populate the mask and
+    /// `fs_main`'s 5-tap check culls sky tiles. When false, the
+    /// mask is cleared to 1.0 (every pixel marches) and the coarse
+    /// pass is skipped. Toggled per-frame by `set_beam_enabled`
+    /// based on a CPU heuristic in the app: sparse root + camera
+    /// inside occupied cell → enable; otherwise skip the coarse
+    /// overhead and let the fine pass march every pixel directly.
+    pub(super) beam_enabled: bool,
     /// Second ray-march pipeline compiled to the TAAU entry point
     /// (`fs_main_taa`) with two color attachments — linear RGBA16F
     /// color and R32F hit-t. `None` when TAAU is disabled; the draw
@@ -218,6 +226,16 @@ impl Renderer {
     pub fn set_max_depth(&mut self, depth: u32) {
         self.max_depth = depth;
         self.write_uniforms();
+    }
+
+    /// Per-frame toggle for the beam prepass. Callers compute a
+    /// cheap CPU heuristic (root occupancy popcount, camera's root
+    /// cell) and set this; when false, the renderer skips the
+    /// coarse pass and clears the mask to 1.0 so the fine pass's
+    /// 5-tap check always passes — equivalent to running without
+    /// P1 at all but keeping the shader path constant.
+    pub fn set_beam_enabled(&mut self, enabled: bool) {
+        self.beam_enabled = enabled;
     }
 
     /// Update the BFS index the shader uses as the frame root. The

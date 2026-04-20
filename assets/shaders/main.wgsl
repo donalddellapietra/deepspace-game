@@ -156,31 +156,78 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Early-out with the sky color and skip the register-heavy
     // `march()` entirely. Saves the dominant cost for the ~88 % of
     // rays that miss on Jerusalem nucleus.
+    // Fast-path: check the center tap first. If it's 1.0 (either
+    // because P1 is disabled and the mask is cleared to 1, OR
+    // because the coarse pass marked this tile as a hit), we
+    // already know we're marching — skip the 4 neighbor loads and
+    // fall through to shade_pixel.
+    //
+    // Only when the center is 0 (definite miss per the coarse pass)
+    // do we sample the 4 cardinal neighbors for conservative
+    // dilation. In that case 4 more texture loads are still much
+    // cheaper than a full march(), so it's a worthwhile check.
+    //
+    // Net effect: disabled-P1 pays 1 texture load per pixel (cheap);
+    // enabled-P1 with hit-tiles pays 1 load per pixel; enabled-P1
+    // with miss-tiles pays 5 loads per pixel but skips the march.
     let tile = vec2<i32>(in.position.xy / f32(BEAM_TILE_SIZE));
     let m00 = textureLoad(coarse_mask, tile, 0).r;
-    let m10 = textureLoad(coarse_mask, tile + vec2<i32>(1, 0), 0).r;
-    let mn0 = textureLoad(coarse_mask, tile + vec2<i32>(-1, 0), 0).r;
-    let m01 = textureLoad(coarse_mask, tile + vec2<i32>(0, 1), 0).r;
-    let m0n = textureLoad(coarse_mask, tile + vec2<i32>(0, -1), 0).r;
-    let any_hit = max(max(max(m00, m10), max(mn0, m01)), m0n);
-    if any_hit < 0.5 {
-        let ray_dir = jittered_ray_dir(in.uv);
-        return vec4<f32>(sky_color(ray_dir), 1.0);
+    if m00 < 0.5 {
+        let m10 = textureLoad(coarse_mask, tile + vec2<i32>(1, 0), 0).r;
+        let mn0 = textureLoad(coarse_mask, tile + vec2<i32>(-1, 0), 0).r;
+        let m01 = textureLoad(coarse_mask, tile + vec2<i32>(0, 1), 0).r;
+        let m0n = textureLoad(coarse_mask, tile + vec2<i32>(0, -1), 0).r;
+        let any_neighbor = max(max(m10, mn0), max(m01, m0n));
+        if any_neighbor < 0.5 {
+            let ray_dir = jittered_ray_dir(in.uv);
+            return vec4<f32>(sky_color(ray_dir), 1.0);
+        }
     }
 
     let shaded = shade_pixel(in.uv);
     return vec4<f32>(shaded.rgb, 1.0);
 }
 
-/// Coarse beam-prepass fragment. One ray per BEAM_TILE_SIZE×BEAM_TILE_SIZE
-/// tile. Outputs 1.0 on hit, 0.0 on miss to an R8Unorm render target.
-/// Does not sample `coarse_mask` itself — the pipeline binds a 1×1
-/// dummy there since the mask texture is the render target.
+/// Coarse beam-prepass fragment. Casts **4 rays at the tile corners**
+/// (not center) and outputs 1.0 if ANY hits, 0.0 otherwise. Writes
+/// to an R8Unorm render target at 1/BEAM_TILE_SIZE per axis.
+///
+/// Corner sampling vs center sampling:
+///
+///   Center: tile's fate decided by one ray at the tile's midpoint.
+///   Sub-tile features between tile centers are invisible to the
+///   cull, producing temporal shimmer as small camera motion flips
+///   which feature the center ray happens to cross.
+///
+///   Corners: 4 rays bound the tile's screen footprint. Any feature
+///   larger than the corner-to-corner sampling spacing (≈ half-tile
+///   width) is caught consistently across frames. Shimmer drops to
+///   the floor of sub-half-tile features.
+///
+/// Short-circuits: if any corner ray hits, return immediately without
+/// running the remaining 3 marches. Hit-tiles cost ~1 march; sky
+/// tiles cost 4 marches (still bounded by 1/64 coarse ray density,
+/// so total coarse cost scales to roughly 4× the center-only
+/// version in the worst case).
+///
+/// Does not sample `coarse_mask` — the pipeline binds a 1×1 dummy
+/// there since the mask texture is the render target.
 @fragment
 fn fs_coarse_mask(in: VertexOutput) -> @location(0) f32 {
-    let ray_dir = jittered_ray_dir(in.uv);
-    let result = march(camera.pos, ray_dir);
-    return select(0.0, 1.0, result.hit);
+    // UV span of half the tile's screen footprint. Tile center is at
+    // `in.uv`; corners are at ± half_tile_uv on each axis.
+    let half_tile_uv = 0.5 * vec2<f32>(
+        f32(BEAM_TILE_SIZE) / uniforms.screen_width,
+        f32(BEAM_TILE_SIZE) / uniforms.screen_height,
+    );
+
+    // DIAGNOSTIC: 2-ray (opposite corners). If this is ~1/2 the
+    // 4-ray cost, register pressure in the coarse shader scales
+    // linearly with march count (bad). If it's only slightly
+    // better than 4-ray, march is amortized over divergent warps.
+    if march(camera.pos, jittered_ray_dir(in.uv + vec2<f32>(-half_tile_uv.x, -half_tile_uv.y))).hit { return 1.0; }
+    if march(camera.pos, jittered_ray_dir(in.uv + vec2<f32>( half_tile_uv.x,  half_tile_uv.y))).hit { return 1.0; }
+    return 0.0;
 }
 
 /// TAAU entry point. Writes color to `@location(0)` and hit t to

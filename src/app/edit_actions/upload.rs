@@ -10,6 +10,44 @@ use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
 use crate::world::gpu;
 
+/// Heuristic: should the renderer run the beam-prepass (P1) for this
+/// frame? Returns true iff:
+///   1. The root (= frame-root) node's occupancy popcount is ≤ 10.
+///      Dense roots (Menger at 20/27, plain worlds filling every slot)
+///      have near-100% hit_fraction in the fine pass, so coarse-cull
+///      savings are zero and its cost is pure overhead.
+///   2. The camera's current root cell is OCCUPIED. This distinguishes
+///      "inside sparse content with long empty channels" (Jerusalem
+///      nucleus) — where P1 wins big — from "outside content looking
+///      in" (Jerusalem corner) — where the fine pass is already fast.
+///
+/// Both checks are 2-3 u32 reads + a popcount. Zero-cost heuristic,
+/// no readback, no lag. Revisited every `upload_tree_lod` call
+/// (which fires on camera move + edits).
+fn compute_beam_enable(
+    cache: &gpu::CachedTree,
+    frame_root_bfs: u32,
+    camera_pos: [f32; 3],
+) -> bool {
+    let root_header = cache.node_offsets.get(frame_root_bfs as usize).copied();
+    let Some(off) = root_header else { return false; };
+    let Some(&occupancy) = cache.tree.get(off as usize) else { return false; };
+    if occupancy.count_ones() > 10 {
+        return false; // Dense — P1 can't cull anything meaningful.
+    }
+    // Sparse root: decide by camera position. Inside an occupied
+    // cell → rays traverse long internal empty channels (Jerusalem
+    // nucleus) → P1 wins. Inside an empty cell → rays shoot into
+    // nearby content and hit fast (Jerusalem corner, Cantor default
+    // corner spawn) → fine pass is already fast enough that the
+    // coarse pass's own cost swamps any savings.
+    let cx = camera_pos[0].floor().clamp(0.0, 2.0) as u32;
+    let cy = camera_pos[1].floor().clamp(0.0, 2.0) as u32;
+    let cz = camera_pos[2].floor().clamp(0.0, 2.0) as u32;
+    let slot = cx + cy * 3 + cz * 9;
+    (occupancy >> slot) & 1 != 0
+}
+
 impl App {
     pub(in crate::app) fn upload_tree(&mut self) {
         self.tree_depth = self.world.tree_depth();
@@ -91,8 +129,28 @@ impl App {
         }
 
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
+
+        // Beam-prepass (P1) heuristic: worth running only when the
+        // scene is sparse at the root AND the camera sits inside an
+        // occupied cell (nucleus-like: rays traverse internal empty
+        // channels → miss-heavy → culling wins).
+        //
+        // Dense-root scenes (Menger, plain worlds) or sparse-root
+        // scenes where the camera is in an EMPTY root cell (looking
+        // into content from outside, corner-like) don't benefit from
+        // the cull — the coarse pass is pure overhead there. The
+        // renderer skips it and just clears the mask to 1.0 so the
+        // fine pass marches every pixel unconditionally.
+        let beam_enabled = matches!(self.active_frame.kind, ActiveFrameKind::Cartesian)
+            && compute_beam_enable(
+                self.cached_tree.as_ref().expect("cached_tree populated"),
+                r.frame_root_idx,
+                cam_gpu.pos,
+            );
+
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(effective_visual_depth);
+            renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Sphere(sphere) => {
