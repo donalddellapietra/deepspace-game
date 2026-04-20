@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -116,7 +116,12 @@ impl Renderer {
         // caps that at 4; bump to 8 (the WebGPU spec default) so
         // the limit is portable to the browser backend too.
         let required_limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 8,
+            // tree + palette + node_kinds + ribbon + shader_stats +
+            // node_offsets + aabbs + entities = 8 storage buffers
+            // minimum for the ray-march pipeline. Bump to 10 to
+            // leave slack for compute passes (heightmap / physics)
+            // that reuse this device.
+            max_storage_buffers_per_shader_stage: 10,
             ..wgpu::Limits::downlevel_defaults()
         }.using_resolution(adapter.limits());
         let (device, queue) = adapter
@@ -253,6 +258,8 @@ impl Renderer {
             highlight_active: 0,
             root_kind: ROOT_KIND_CARTESIAN,
             ribbon_count: 0,
+            entity_count: 0,
+            _pad_entity: [0; 3],
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             root_radii: [0.0; 4],
@@ -273,6 +280,16 @@ impl Renderer {
             label: Some("uniforms"),
             contents: bytemuck::bytes_of(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Entity buffer (binding 10) — one-entry stub so the
+        // storage binding isn't zero-sized. `entity_count` on the
+        // uniforms stays 0 until entities spawn, so the shader's
+        // tag=3 dispatch never reads this stub.
+        let entity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("entities"),
+            contents: bytemuck::cast_slice(&[GpuEntity::default()]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let shader_stats_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -376,6 +393,17 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Entities (binding 10) — flat `array<EntityGpu>` of
+                // per-instance bounding-cube + subtree-BFS records.
+                // Shader's tag=3 dispatch uses it when the ray hits
+                // an `EntityRef(idx)` child cell.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
@@ -398,6 +426,7 @@ impl Renderer {
             &shader_stats_buffer, &node_offsets_buffer,
             &aabbs_buffer,
             &mask_view,
+            &entity_buffer,
         );
         let coarse_bind_group = make_bind_group(
             &device, &bind_group_layout,
@@ -406,6 +435,7 @@ impl Renderer {
             &shader_stats_buffer, &node_offsets_buffer,
             &aabbs_buffer,
             &dummy_mask_view,
+            &entity_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -566,6 +596,9 @@ impl Renderer {
             last_camera: camera,
             palette_buffer, uniforms_buffer,
             ribbon_buffer,
+            entity_buffer,
+            uploaded_entities_count: 0,
+            entity_count: 0,
             bind_group,
             root_index: root_bfs_index, node_count,
             max_depth: MAX_DEPTH as u32, highlight_active: 0,

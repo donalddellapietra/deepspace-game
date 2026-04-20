@@ -14,6 +14,11 @@ struct Camera {
     _pad2: f32,
     up: vec3<f32>,
     fov: f32,
+    /// World → clip-space matrix. Only used by `fs_main_depth`
+    /// (entity-raster mode), which writes `@builtin(frag_depth)`
+    /// from `view_proj * world_hit` so a subsequent raster pass can
+    /// z-test against the ray-march output. Ignored by `fs_main`.
+    view_proj: mat4x4<f32>,
 }
 
 // Palette lives in a read-only storage buffer of dynamic length
@@ -35,6 +40,12 @@ struct Uniforms {
     /// pops upward, walking ribbon[0]..ribbon[ribbon_count-1].
     /// 0 = no ancestors (frame is at world root).
     ribbon_count: u32,
+    /// Number of live entities in `entities[]`. The shader uses
+    /// this only as a validity gate in the tag=3 dispatch branch —
+    /// when zero, there are no EntityRef cells in the tree either,
+    /// so the branch is never taken.
+    entity_count: u32,
+    _pad_entities: vec3<u32>,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
     /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
@@ -149,6 +160,19 @@ struct ShaderStats {
 /// doesn't intersect the ray path, and trims the DDA entry point to
 /// the first actually-populated cell.
 @group(0) @binding(9) var<storage, read> aabbs: array<u32>;
+
+/// Flat entity list. Each entity carries the BFS idx of its voxel
+/// subtree root in the shared `tree[]` buffer plus a representative
+/// block for LOD-terminal splats. Ray-march's tag=3 branch reads
+/// this buffer when it hits an `EntityRef(idx)` cell — the idx is
+/// packed into the child entry's node_index field.
+struct EntityGpu {
+    bbox_min: vec3<f32>,
+    representative_block: u32,
+    bbox_max: vec3<f32>,
+    subtree_bfs: u32,
+}
+@group(0) @binding(10) var<storage, read> entities: array<EntityGpu>;
 
 /// Coarse beam-prepass mask. The fine fragment shader samples a 5-tap
 /// neighborhood at each pixel's tile: if every tap reads 0.0, the

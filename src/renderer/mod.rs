@@ -42,6 +42,11 @@ pub struct GpuUniforms {
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
     pub ribbon_count: u32,
+    /// Number of live entities in the entity buffer (binding 10).
+    /// Shader's tag=3 dispatch uses it as a validity gate; zero
+    /// means the entity path is inert.
+    pub entity_count: u32,
+    pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
     /// Body radii (used iff `root_kind == 1`). Stored in the body
@@ -108,6 +113,15 @@ pub struct Renderer {
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
+    /// Number of live entities. Drives the uniforms' `entity_count`
+    /// (shader-side gate for the tag=3 dispatch path) and the
+    /// instance-buffer dispatch count for the raster entity pass.
+    pub(super) entity_count: u32,
+    /// Per-entity storage buffer (binding 10). Populated each frame
+    /// by `update_entities` with the live entity list; the ray-march
+    /// shader indexes into it from tag=3 child entries.
+    pub(super) entity_buffer: wgpu::Buffer,
+    pub(super) uploaded_entities_count: u64,
     pub(super) offscreen_texture: Option<wgpu::Texture>,
     /// Beam-prepass mask: 1/BEAM_TILE_SIZE-per-axis R8Unorm render
     /// target populated by `coarse_pipeline` at the start of each
@@ -272,6 +286,7 @@ impl Renderer {
             &self.shader_stats_buffer, &self.node_offsets_buffer,
             &self.aabbs_buffer,
             &self.mask_view,
+            &self.entity_buffer,
         );
         // coarse_bind_group uses the dummy mask view which doesn't
         // resize, so it stays valid across resizes.

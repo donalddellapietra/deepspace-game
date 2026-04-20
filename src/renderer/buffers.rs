@@ -5,7 +5,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuNodeKind, GpuRibbonEntry};
+use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuRibbonEntry};
 
 use super::{GpuUniforms, Renderer, MAX_RIBBON_LEN};
 
@@ -81,6 +81,7 @@ impl Renderer {
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.aabbs_buffer,
                 &self.mask_view,
+                &self.entity_buffer,
             );
             self.coarse_bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
@@ -89,6 +90,7 @@ impl Renderer {
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.aabbs_buffer,
                 &self.dummy_mask_view,
+                &self.entity_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -140,6 +142,7 @@ impl Renderer {
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.aabbs_buffer,
                 &self.mask_view,
+                &self.entity_buffer,
             );
             self.coarse_bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
@@ -148,6 +151,7 @@ impl Renderer {
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.aabbs_buffer,
                 &self.dummy_mask_view,
+                &self.entity_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -190,6 +194,7 @@ impl Renderer {
                 &self.node_offsets_buffer,
                 &self.aabbs_buffer,
                 &self.mask_view,
+                &self.entity_buffer,
             );
             self.coarse_bind_group = make_bind_group(
                 &self.device,
@@ -204,11 +209,63 @@ impl Renderer {
                 &self.node_offsets_buffer,
                 &self.aabbs_buffer,
                 &self.dummy_mask_view,
+                &self.entity_buffer,
             );
         } else {
             self.queue
                 .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(payload));
         }
+    }
+
+    /// Upload the entity list. Always overwrites the buffer from
+    /// offset 0 — entity positions change every frame under motion,
+    /// so a tail-only write would miss updates. Recreates the
+    /// buffer with 1.5× headroom on overflow; rebuilds both
+    /// bind groups when the buffer identity changes.
+    ///
+    /// `entity_count` on the uniforms gates shader iteration, so
+    /// the one-entry stub allocated at init is never read when no
+    /// entities are live.
+    pub fn update_entities(&mut self, entities: &[GpuEntity]) {
+        self.entity_count = entities.len() as u32;
+        let stub = [GpuEntity::default()];
+        let payload: &[GpuEntity] = if entities.is_empty() { &stub } else { entities };
+        let needed = std::mem::size_of_val(payload) as u64;
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+
+        let mut grew = false;
+        if needed > self.entity_buffer.size() {
+            let raw = (needed * 3 / 2).max(needed + 256);
+            let new_size = raw.div_ceil(16) * 16;
+            self.entity_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("entities"),
+                size: new_size,
+                usage,
+                mapped_at_creation: false,
+            });
+            grew = true;
+        }
+        self.queue
+            .write_buffer(&self.entity_buffer, 0, bytemuck::cast_slice(payload));
+        self.uploaded_entities_count = entities.len() as u64;
+
+        if grew {
+            self.bind_group = make_bind_group(
+                &self.device, &self.bind_group_layout,
+                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.aabbs_buffer, &self.mask_view, &self.entity_buffer,
+            );
+            self.coarse_bind_group = make_bind_group(
+                &self.device, &self.bind_group_layout,
+                &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+                &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+                &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.aabbs_buffer, &self.dummy_mask_view, &self.entity_buffer,
+            );
+        }
+        self.write_uniforms();
     }
 
     pub fn update_camera(&mut self, camera: &GpuCamera) {
@@ -241,6 +298,8 @@ impl Renderer {
             highlight_active: self.highlight_active,
             root_kind: self.root_kind,
             ribbon_count: self.ribbon_count,
+            entity_count: self.entity_count,
+            _pad_entity: [0; 3],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             root_radii: self.root_radii,
@@ -322,6 +381,7 @@ pub(super) fn append_or_recreate_u32(
     append_or_recreate(buffer, uploaded_u32s, device, queue, label, data, usage)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn make_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -335,6 +395,7 @@ pub(super) fn make_bind_group(
     node_offsets: &wgpu::Buffer,
     aabbs: &wgpu::Buffer,
     mask_view: &wgpu::TextureView,
+    entities: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -350,6 +411,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask_view) },
             wgpu::BindGroupEntry { binding: 9, resource: aabbs.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: entities.as_entire_binding() },
         ],
     })
 }
