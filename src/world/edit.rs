@@ -301,6 +301,9 @@ fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
             .get(id)
             .map_or(false, |n| n.representative_block == REPRESENTATIVE_EMPTY),
         Child::Block(_) => false,
+        // Entity cells aren't placeable — something is already there
+        // (the entity). Players edit entities via a different path.
+        Child::EntityRef(_) => false,
     }
 }
 

@@ -25,12 +25,25 @@ pub const MAX_DEPTH: usize = 63;
 /// `palette::block` (0..=9); imported model colors occupy 10..=65_534.
 /// Emptiness is represented exclusively by `Child::Empty` — palette
 /// index 0 is a real color (Stone), not a sentinel.
+///
+/// `EntityRef(idx)` is a per-frame scene overlay: the shader treats
+/// the cell as a portal into an entity's voxel subtree, looked up in
+/// the `entities[idx]` GPU buffer. EntityRef children only appear in
+/// ephemeral scene-root nodes built by `world::scene`; terrain nodes
+/// never carry them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Child {
     Empty,
     Block(u16),
     Node(NodeId),
+    EntityRef(u32),
 }
+
+/// Sentinel `representative_block` for entity-bearing ephemeral
+/// subtrees. Picked above the valid palette range (0..=65_534) and
+/// distinct from `REPRESENTATIVE_EMPTY` so the shader's empty-rep
+/// fast path never skips a scene ancestor chain.
+pub const ENTITY_REPRESENTATIVE: u16 = 0xFFFD;
 
 impl Child {
     #[inline]
@@ -228,6 +241,9 @@ impl NodeLibrary {
                         }
                     }
                 }
+                Child::EntityRef(_) => {
+                    *counts.entry(ENTITY_REPRESENTATIVE).or_insert(0) += 1;
+                }
                 Child::Empty => {}
             }
         }
@@ -249,6 +265,10 @@ impl NodeLibrary {
                         .get(nid)
                         .map(|n| n.uniform_type)
                         .unwrap_or(UNIFORM_MIXED),
+                    // EntityRef children force MIXED so pack.rs never
+                    // tries to uniform-flatten a scene ancestor into
+                    // a single Block.
+                    Child::EntityRef(_) => UNIFORM_MIXED,
                 };
                 if ct == UNIFORM_MIXED {
                     uniform = false;
@@ -304,6 +324,23 @@ impl NodeLibrary {
     /// depth=1 returns a node whose 27 children are all `Block(block_type)`.
     /// depth=N returns a node of uniform nodes, N levels deep.
     /// Content-addressed dedup means this creates at most N unique nodes.
+    /// Override an existing node's `representative_block`. Used by
+    /// the scene overlay to make ephemeral ancestors inherit the
+    /// terrain's representative at their position — otherwise the
+    /// ephemeral chain's rep would be dominated by a single
+    /// `Child::EntityRef` sentinel and the shader's LOD-terminal
+    /// splat would show entity-sentinel instead of terrain color.
+    ///
+    /// ## Safety
+    ///
+    /// The node's `uniform_type` is NOT recomputed; callers must
+    /// ensure the override is consistent with that cached field.
+    pub fn set_representative(&mut self, id: NodeId, rep: u16) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.representative_block = rep;
+        }
+    }
+
     pub fn build_uniform_subtree(&mut self, block_type: u16, depth: u32) -> Child {
         if depth == 0 {
             return Child::Block(block_type);

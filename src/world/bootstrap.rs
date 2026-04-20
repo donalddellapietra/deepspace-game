@@ -698,7 +698,11 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
             // and the shader can never render cells small enough
             // for Nyquist to let a real Block leaf be visible,
             // which manifests as monochromatic LOD-terminal colour.
-            Child::Empty | Child::Block(_) => {
+            // EntityRef should never appear in a terrain edit path
+            // — entities only land in ephemeral scene-root nodes —
+            // but if it does, treat it like an empty and install a
+            // fresh air Node so carve can proceed without panicking.
+            Child::Empty | Child::Block(_) | Child::EntityRef(_) => {
                 node_id = world.library.insert(empty_children());
             }
         }

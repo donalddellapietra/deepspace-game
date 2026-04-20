@@ -260,9 +260,11 @@ mod tests {
     /// A fully empty model produces a single all-empty node.
     #[test]
     fn empty_model() {
+        // EMPTY_CELL is the sentinel — plain `0` would now mean
+        // palette 0 (Stone), not empty.
         let model = VoxelModel {
             size_x: 3, size_y: 3, size_z: 3,
-            data: vec![0; 27],
+            data: vec![crate::import::EMPTY_CELL; 27],
         };
         let mut lib = NodeLibrary::default();
         let root = build_tree(&model, &mut lib);
@@ -274,7 +276,7 @@ mod tests {
     /// A 4x4x4 model is padded to 9x9x9 (next power of 3).
     #[test]
     fn padding() {
-        let mut data = vec![0u8; 4 * 4 * 4];
+        let mut data = vec![crate::import::EMPTY_CELL; 4 * 4 * 4];
         data[0] = block::STONE; // one non-empty voxel
         let model = VoxelModel { size_x: 4, size_y: 4, size_z: 4, data };
         let mut lib = NodeLibrary::default();
@@ -287,7 +289,7 @@ mod tests {
     #[test]
     fn dedup() {
         // 9x9x9 model: two 3x3x3 quadrants of stone, rest empty.
-        let mut data = vec![0u8; 9 * 9 * 9];
+        let mut data = vec![crate::import::EMPTY_CELL; 9 * 9 * 9];
         // Fill (0,0,0)-(2,2,2) with stone.
         for z in 0..3 { for y in 0..3 { for x in 0..3 {
             data[(z * 9 + y) * 9 + x] = block::STONE;
@@ -308,7 +310,7 @@ mod tests {
     /// Round-trip: build tree, then walk it to verify voxels match.
     #[test]
     fn round_trip_3x3x3() {
-        let mut data = vec![0u8; 27];
+        let mut data = vec![crate::import::EMPTY_CELL; 27];
         data[0] = block::STONE;
         data[13] = block::GRASS; // center: (1,1,1)
         let model = VoxelModel { size_x: 3, size_y: 3, size_z: 3, data };

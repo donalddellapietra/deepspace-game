@@ -183,6 +183,18 @@ impl CachedTree {
         match child {
             Child::Empty => None,
             Child::Block(bt) => Some(GpuChild::new(1, bt, 0, 0)),
+            // tag=3: EntityRef cell. `node_index` carries the GPU
+            // entity-buffer index; `block_type` carries the entity-
+            // representative sentinel so the LOD-terminal splat
+            // isn't triggered by an "empty" reading. The shader's
+            // tag==3 branch (`march_cartesian`) transforms the ray
+            // into the per-entity bbox and runs a sub-DDA there.
+            Child::EntityRef(entity_idx) => Some(GpuChild::new(
+                3,
+                crate::world::tree::ENTITY_REPRESENTATIVE,
+                0,
+                entity_idx,
+            )),
             Child::Node(child_id) => {
                 let (is_cart, uniform_type, representative) = {
                     let node = library.get(child_id)?;

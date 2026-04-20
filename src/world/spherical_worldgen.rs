@@ -107,7 +107,7 @@ fn install_body(
         } else {
             let next_id = match node.children[target] {
                 Child::Node(nid) => rebuild(lib, nid, slots, level + 1, new_node),
-                Child::Empty | Child::Block(_) => {
+                Child::Empty | Child::Block(_) | Child::EntityRef(_) => {
                     use super::tree::empty_children;
                     let expanded = lib.insert(empty_children());
                     rebuild(lib, expanded, slots, level + 1, new_node)

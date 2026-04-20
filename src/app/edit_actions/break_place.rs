@@ -28,7 +28,12 @@ impl App {
                 if let Some(node) = self.world.library.get(parent_id) {
                     match node.children[slot] {
                         Child::Node(child_id) => saved_id = Some(child_id),
-                        Child::Block(_) | Child::Empty => saved_id = Some(parent_id),
+                        // Save the parent when the slot is a leaf /
+                        // empty / entity cell — the saveable chunk
+                        // is the containing parent, not the leaf.
+                        Child::Block(_) | Child::Empty | Child::EntityRef(_) => {
+                            saved_id = Some(parent_id);
+                        }
                     }
                 }
             }

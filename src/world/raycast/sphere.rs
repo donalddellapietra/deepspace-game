@@ -209,7 +209,10 @@ pub(super) fn walk_face_subtree_with_path(
         let slot = slot_index(us, vs, rs);
         path.push((node_id, slot));
         match node.children[slot] {
-            Child::Empty => {
+            Child::Empty | Child::EntityRef(_) => {
+                // EntityRef in a sphere face shouldn't happen (face
+                // subtrees are pure terrain), but if one shows up,
+                // treat it like empty to keep the ray moving.
                 let sub_un = un * 3.0 - us as f32;
                 let sub_vn = vn * 3.0 - vs as f32;
                 let sub_rn = rn * 3.0 - rs as f32;

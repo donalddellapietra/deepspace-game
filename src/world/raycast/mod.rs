@@ -241,7 +241,7 @@ pub fn is_solid_at(
 
         let slot = slot_index(cx as usize, cy as usize, cz as usize);
         match node.children[slot] {
-            Child::Empty => return false,
+            Child::Empty | Child::EntityRef(_) => return false,
             Child::Block(_) => return true,
             Child::Node(child_id) => {
                 if depth + 1 >= max_depth {
