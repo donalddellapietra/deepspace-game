@@ -8,6 +8,7 @@
 
 mod buffers;
 mod draw;
+pub mod heightmap;
 mod init;
 mod taa;
 
