@@ -204,6 +204,11 @@ pub struct App {
     /// instanced raster (landed later). Set from CLI
     /// `--entity-render` and baked into Renderer::new.
     pub(super) entity_render_mode: crate::renderer::EntityRenderMode,
+    /// Compile-time entity-branch kill switch. When true, the
+    /// ray-march pipeline is built with `ENABLE_ENTITIES=false`
+    /// so Naga DCEs the tag==3 branch + march_entity_subtree.
+    /// Set via `--no-entities`. Default false = entities enabled.
+    pub(super) disable_entities: bool,
     /// World-coordinate Y where entities naturally rest. `Some` for
     /// flat worlds (sea level = a specific Y); `None` for sphere/
     /// fractal worlds where "resting height" is position-dependent.
@@ -320,6 +325,7 @@ impl App {
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let taa_enabled = test_cfg.taa;
         let entity_render_mode = test_cfg.entity_render_mode;
+        let disable_entities = test_cfg.disable_entities;
         let entity_surface_y = bootstrap::surface_y_for_preset(&test_cfg.world_preset);
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
@@ -449,6 +455,7 @@ impl App {
             live_sample_every_frames,
             taa_enabled,
             entity_render_mode,
+            disable_entities,
             entity_surface_y,
             cached_soldier_subtree: None,
             interaction_radius_cells,

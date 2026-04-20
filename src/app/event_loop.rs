@@ -177,10 +177,10 @@ impl App {
         let lod_pixel_threshold = self.lod_pixel_threshold;
         let live_sample_every = self.live_sample_every_frames;
         let taa_enabled = self.taa_enabled;
-        // Compile-time gate on the shader's tag==3 (entity) branch.
-        // On flat / vox worlds entities can exist, so we leave the
-        // branch in; on fractal / sphere presets it's dead code.
-        let entities_enabled = self.entity_surface_y.is_some();
+        // Default: entities enabled on every preset. `--no-entities`
+        // flips the compile-time override so the shader's tag==3
+        // branch DCEs for pure-fractal perf runs.
+        let entities_enabled = !self.disable_entities;
         let node_count = node_kinds.len();
         let tree_u32_count = tree_packed.len();
 

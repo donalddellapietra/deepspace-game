@@ -95,6 +95,13 @@ pub struct TestConfig {
     /// `--entity-render raster`: instanced mesh raster pass (landed
     /// in a later commit on this branch). Incompatible with TAA.
     pub entity_render_mode: crate::renderer::EntityRenderMode,
+    /// Compile-time disable for the shader's tag==3 (entity)
+    /// dispatch. Default false = entities enabled everywhere. Flip
+    /// to true via `--no-entities` to DCE the entity branch from
+    /// the ray-march shader for pure-fractal perf runs that
+    /// wouldn't use entities anyway (~2 ms/frame recovery on
+    /// Jerusalem nucleus 2560x1440).
+    pub disable_entities: bool,
     /// Load a `.vox` or `.vxs` file as a visual entity and spawn it
     /// one cell in front of the camera at startup. Used by the
     /// entity-visibility test suite to place a known-shape entity
@@ -333,6 +340,7 @@ impl TestConfig {
                         };
                     }
                 }
+                "--no-entities" => { cfg.disable_entities = true; }
                 _ => {}
             }
         }
