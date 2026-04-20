@@ -219,7 +219,7 @@ pub const BLOCK_EDGES: [(usize, usize); 12] = [
 /// 4 keeps worldgen tractable (~seconds for a single planet) while
 /// leaving the LOD-terminal sphere-clip in the shader to smooth the
 /// silhouette past the voxel resolution limit.
-const SDF_DETAIL_LEVELS: u32 = 4;
+const SDF_DETAIL_LEVELS: u32 = 6;
 
 /// Build the body as a Cartesian-indexed 27-ary tree of SDF-carved
 /// content, insert it into `lib`, and return its `NodeId`. The body
@@ -256,37 +256,50 @@ pub fn insert_spherical_body(
 
     let sdf_budget = depth.min(SDF_DETAIL_LEVELS);
 
-    // Pre-build uniform subtrees at every depth we might need.
-    // `lib.build_uniform_subtree` allocates a new 27-ary array per
-    // iteration (content-addressed dedup returns the same NodeId
-    // but the allocation + hash + lookup cost is still per-call).
-    // During worldgen, straddle cells at the SDF-budget boundary
-    // commit to uniform subtrees of the remaining depth — millions
-    // of calls for a depth-28 body. Precomputing once flips that
-    // from O(N × depth) allocations to O(depth) + O(N) table
-    // lookups.
-    // `uniform_empty[d]` (for d >= 1) = NodeId of a `d`-level
-    // subtree that is entirely empty. Index 0 is an unused
-    // placeholder — depth=0 is handled with `Child::Empty` directly
-    // by callers. `uniform_stone[d]` = the `Child` at depth `d` of
-    // a uniform stone subtree (Block at d=0, Node at d >= 1).
-    // Indices 0..=depth are valid.
-    let mut uniform_empty: Vec<NodeId> = Vec::with_capacity(depth as usize + 1);
-    let mut uniform_stone: Vec<Child> = Vec::with_capacity(depth as usize + 1);
+    // Precompute uniform subtrees for every depth 1..=depth for
+    // every block type the SDF's `block_at` can return (surface,
+    // DIRT, core) plus the all-empty subtree. The SDF-carving
+    // recursion hits commit-to-uniform millions of times at the
+    // budget boundary; turning each of those into an O(1) table
+    // lookup instead of an O(depth) `lib.build_uniform_subtree`
+    // call is what keeps worldgen tractable at high SDF budgets
+    // (≈100× speedup at SDF_DETAIL_LEVELS=6).
+    //
+    // `uniform_empty[d]` (d >= 1) = NodeId of a `d`-level all-empty
+    // subtree. `uniform_block[b][d]` = Child for a `d`-level uniform
+    // subtree of block `b` (Block at d=0, Node at d >= 1). Index 0
+    // of uniform_empty is a placeholder (callers handle d=0 with
+    // `Child::Empty` directly).
+    let depth_plus_one = depth as usize + 1;
+    let mut uniform_empty: Vec<NodeId> = Vec::with_capacity(depth_plus_one);
+    let mut uniform_block: std::collections::HashMap<u8, Vec<Child>> =
+        std::collections::HashMap::new();
+    let block_kinds: [u8; 3] = [
+        sdf.surface_block,
+        crate::world::palette::block::DIRT,
+        sdf.core_block,
+    ];
     {
         let empty_leaf = lib.insert(empty_children());
-        uniform_empty.push(empty_leaf); // d=0 placeholder (same as d=1)
-        uniform_empty.push(empty_leaf); // d=1: one level of all-empty
-        uniform_stone.push(Child::Block(sdf.core_block));  // d=0
-        let stone_leaf = lib.insert(uniform_children(Child::Block(sdf.core_block)));
-        uniform_stone.push(Child::Node(stone_leaf));  // d=1
+        uniform_empty.push(empty_leaf);
+        uniform_empty.push(empty_leaf);
         for _ in 2..=depth {
             let prev_e = *uniform_empty.last().unwrap();
             let next_e = lib.insert(uniform_children(Child::Node(prev_e)));
             uniform_empty.push(next_e);
-            let prev_s = *uniform_stone.last().unwrap();
-            let sid = lib.insert(uniform_children(prev_s));
-            uniform_stone.push(Child::Node(sid));
+        }
+        for b in block_kinds.iter().copied() {
+            if uniform_block.contains_key(&b) { continue; }
+            let mut v: Vec<Child> = Vec::with_capacity(depth_plus_one);
+            v.push(Child::Block(b));
+            let leaf = lib.insert(uniform_children(Child::Block(b)));
+            v.push(Child::Node(leaf));
+            for _ in 2..=depth {
+                let prev = *v.last().unwrap();
+                let id = lib.insert(uniform_children(prev));
+                v.push(Child::Node(id));
+            }
+            uniform_block.insert(b, v);
         }
     }
 
@@ -315,7 +328,7 @@ pub fn insert_spherical_body(
                 ];
                 let child = build_cartesian_subtree(
                     lib, sub_min, sub_max, depth, sdf_budget, sdf,
-                    &uniform_empty, &uniform_stone, core_block,
+                    &uniform_empty, &uniform_block,
                 );
                 let face_idx = FACE_SLOTS.iter().position(|&s| s == slot);
                 body_children[slot] = match face_idx {
@@ -346,8 +359,7 @@ fn build_cartesian_subtree(
     sdf_budget: u32,
     sdf: &Planet,
     uniform_empty: &[NodeId],
-    uniform_stone: &[Child],
-    core_block: u8,
+    uniform_block: &std::collections::HashMap<u8, Vec<Child>>,
 ) -> Child {
     let center: Vec3 = [
         0.5 * (sub_min[0] + sub_max[0]),
@@ -363,23 +375,16 @@ fn build_cartesian_subtree(
     let cell_rad = (hx * hx + hy * hy + hz * hz).sqrt();
 
     if d_center > cell_rad {
-        // Fully outside the planet — empty all the way down.
         if depth == 0 { return Child::Empty; }
         return Child::Node(uniform_empty[depth as usize]);
     }
     if d_center < -cell_rad {
-        // Fully inside the planet. Use the precomputed uniform stone
-        // subtree when the center sample agrees with `core_block`
-        // (saves a hot-path O(depth) subtree build). For surface-
-        // adjacent cells whose block_at returns something other than
-        // core_block (e.g. DIRT or GRASS), fall back to the generic
-        // dedup'd path — rare relative to the stone interior.
         let b = sdf.block_at(center);
         if depth == 0 { return Child::Block(b); }
-        if b == core_block {
-            return uniform_stone[depth as usize];
-        }
-        return lib.build_uniform_subtree(b, depth);
+        return uniform_block
+            .get(&b)
+            .and_then(|v| v.get(depth as usize).copied())
+            .unwrap_or_else(|| lib.build_uniform_subtree(b, depth));
     }
 
     if depth == 0 {
@@ -390,15 +395,12 @@ fn build_cartesian_subtree(
         };
     }
     if sdf_budget == 0 {
-        // Ran out of SDF detail — commit to the center sample and
-        // wrap the remaining depth in a precomputed uniform subtree.
         return if d_center < 0.0 {
             let b = sdf.block_at(center);
-            if b == core_block {
-                uniform_stone[depth as usize]
-            } else {
-                lib.build_uniform_subtree(b, depth)
-            }
+            uniform_block
+                .get(&b)
+                .and_then(|v| v.get(depth as usize).copied())
+                .unwrap_or_else(|| lib.build_uniform_subtree(b, depth))
         } else {
             Child::Node(uniform_empty[depth as usize])
         };
@@ -423,7 +425,7 @@ fn build_cartesian_subtree(
                 ];
                 children[slot_index(xs, ys, zs)] = build_cartesian_subtree(
                     lib, cmin, cmax, depth - 1, sdf_budget - 1, sdf,
-                    uniform_empty, uniform_stone, core_block,
+                    uniform_empty, uniform_block,
                 );
             }
         }
