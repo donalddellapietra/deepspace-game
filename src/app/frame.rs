@@ -1,91 +1,105 @@
-//! Render-frame helpers: walking the camera path to find the active
-//! frame, transforming positions/AABBs into that frame.
+//! Render-frame resolution.
 //!
-//! Cartesian frames are linear `[0, 3)³`. A cubed-sphere `Body` frame
-//! renders the full 6-face shell in body-local coords with the exact
-//! (non-linearized) `cs_raycast_body` march. A `SphereSub` frame
-//! lives deeper inside a face subtree: the render frame is a single
-//! face-cell, and ray-march runs in *local* `[0, 3)³` coords of that
-//! cell via the linearized ribbon-pop scheme
-//! (`docs/design/sphere-ribbon-pop-impl-plan.md`).
+//! `compute_render_frame(world, camera, desired_depth)` returns the
+//! frame the shader + CPU raycast operate in. Three kinds:
 //!
-//! `SphereSub` carries a precomputed `(c_body, J, J_inv)` so the
-//! sphere DDA can operate entirely in the local frame — plane
-//! boundaries become axis-aligned in local coords, and ray-sphere
-//! intersection against radial shells reduces to a well-conditioned
-//! quadratic in local `t`. This preserves f32 precision at arbitrary
-//! face-subtree depth.
+//!   * `Cartesian` — slot-XYZ descent through Cartesian nodes.
+//!   * `Body` — render root IS a `CubedSphereBody` cell; shader
+//!     dispatches the exact whole-sphere march.
+//!   * `SphereSub` — render root is a face-subtree cell at
+//!     face-subtree depth ≥ `MIN_SPHERE_SUB_DEPTH`. Shader runs
+//!     the linearized ribbon-pop DDA in the frame's local
+//!     `[0, 3)³`. See `docs/design/sphere-ribbon-pop-impl-plan.md`
+//!     and `docs/design/sphere-ribbon-pop-uvr-state.md`.
 //!
-//! Slot-semantics note: inside a face subtree, a node's 27 children
-//! are indexed by `(u_slot, v_slot, r_slot)` under the face-root's
-//! UVR convention. `compute_render_frame` reinterprets path slots in
-//! UVR coords once it crosses a `CubedSphereFace` boundary.
+//! The `SphereSub` path depends on the camera carrying symbolic UVR
+//! state (`WorldPos.sphere`). When the camera is inside a body,
+//! `compute_render_frame` reads `sphere.uvr_path` directly to build
+//! the sub-frame — no attempt to decode UVR from Cartesian anchor
+//! slots. The caller passes the `WorldPos`; this module does not
+//! touch the `NodeLibrary` for sphere frames at all (body metadata
+//! is cached on `SphereState`).
 //!
-//! Pure functions; no `App` state; unit-testable.
+//! Cartesian descent still walks the tree to check that anchor slots
+//! point at real nodes.
+//!
+//! Pure functions; no `App` state.
 
-use crate::world::anchor::Path;
-use crate::world::cubesphere::{
-    face_frame_jacobian, mat3_inv, Face, Mat3, FACE_SLOTS,
-};
+use crate::world::anchor::{Path, WorldPos};
+use crate::world::cubesphere::{face_frame_jacobian, mat3_inv, Face, Mat3, FACE_SLOTS};
 use crate::world::sdf::Vec3;
-use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
-/// Sphere sub-frame: the render root is a face-subtree cell at depth
-/// ≥ 1 within the body. Ray-march runs in the frame's local
-/// `[0, 3)³` coords; `c_body`, `J`, `J_inv` map local ↔ body-XYZ via
+/// Sphere sub-frame: the render root is a face-subtree cell at face
+/// depth ≥ `MIN_SPHERE_SUB_DEPTH`. Ray-march runs in the frame's
+/// local `[0, 3)³`. `c_body`, `J`, `J_inv` map local ↔ body-XYZ via
 /// the linearized face transform at the frame's corner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SphereSubFrame {
     /// Path from world root to the containing `CubedSphereBody`.
     pub body_path: Path,
+    /// Full path world-root → body → face-root → UVR descent. This
+    /// is the **render path** consumed by CPU raycast / ribbon-pop
+    /// infrastructure — the last entry is the sub-frame's node.
+    pub render_path: Path,
     /// Face this sub-frame lives on.
     pub face: Face,
-    /// Absolute face-normalized coords of the frame's corner (local
-    /// (0,0,0) in body `[0, 1)³` face-normalized coords).
+    /// Absolute face-normalized coords of the sub-frame's corner —
+    /// local (0,0,0) in face `[0, 1)³`.
     pub un_corner: f32,
     pub vn_corner: f32,
     pub rn_corner: f32,
-    /// Size of the frame in face-normalized coords — `1/3^M` where M
-    /// is face-subtree depth.
+    /// Size in face-normalized coords. Equals `1/3^M` where M is the
+    /// face-subtree depth. Carried as f32 — only precision-critical
+    /// combined with `un_corner`, which is itself f32; together they
+    /// represent the corner well enough for the Jacobian evaluation.
+    /// Sub-cell precision lives in `WorldPos.sphere.uvr_offset`, not
+    /// in this field.
     pub frame_size: f32,
     pub inner_r: f32,
     pub outer_r: f32,
-    /// Precomputed linearization at frame corner. `c_body` is the
-    /// body-XYZ of local (0,0,0); `J` maps local → body-XYZ offset;
-    /// `J_inv` maps body-XYZ offset → local.
     pub c_body: Vec3,
     pub j: Mat3,
     pub j_inv: Mat3,
 }
 
+impl SphereSubFrame {
+    /// How many UVR descent levels inside the face subtree this
+    /// sub-frame represents.
+    pub fn depth_levels(&self) -> u32 {
+        // render_path = body_path + face_root_slot + uvr_slots.
+        // Length − body_path.depth() − 1 (the face-root slot) = UVR depth.
+        (self.render_path.depth() as u32)
+            .saturating_sub(self.body_path.depth() as u32)
+            .saturating_sub(1)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
     Cartesian,
-    /// Render root IS a cubed-sphere body cell. No face window — the
-    /// sphere DDA covers all 6 faces in body-local coords.
+    /// Render root is a `CubedSphereBody` cell. Shader runs the full
+    /// whole-sphere march in body-local coords.
     Body { inner_r: f32, outer_r: f32 },
-    /// Render root is a face-subtree cell at face-subtree depth ≥ 1.
-    /// The sphere DDA runs in the frame's local coords.
+    /// Render root is a face-subtree cell at depth ≥ `MIN_SPHERE_SUB_DEPTH`.
     SphereSub(SphereSubFrame),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ActiveFrame {
     /// Path from world root to the render frame's root node. For
-    /// `Cartesian` / `Body` this equals `logical_path`. For
-    /// `SphereSub` this ends at the face-subtree cell that IS the
-    /// render frame.
+    /// `Cartesian` / `Body` this is just the Cartesian descent. For
+    /// `SphereSub` this ends at the sub-frame's node.
     pub render_path: Path,
-    /// Logical interaction layer — the user's edit-depth anchor.
-    /// Equals `render_path` once `compute_render_frame` has consumed
-    /// the full `desired_depth`.
+    /// Logical interaction layer — the user's edit-depth anchor
+    /// (may include symbolic UVR descent through sphere state).
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
 }
 
-/// Build a `Path` from the slot prefix the GPU ribbon walker actually
-/// reached.
+/// Build a `Path` from the slot prefix the GPU ribbon walker
+/// actually reached.
 pub fn frame_from_slots(slots: &[u8]) -> Path {
     let mut frame = Path::root();
     for &slot in slots {
@@ -94,111 +108,127 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
     frame
 }
 
-/// Minimum face-subtree depth at which the linearized `SphereSub`
-/// frame kicks in. Shallower depths (face root + 1 level down) use
-/// the exact `Body` march because linearization error is
-/// perceptible there.
+/// Face-subtree depth at which the linearized `SphereSub` frame
+/// kicks in. Shallower face descents use the exact `Body` march
+/// because linearization error is perceptible there.
 pub const MIN_SPHERE_SUB_DEPTH: u8 = 3;
 
-/// Resolve the active render frame. Walks the camera's anchor path
-/// down to `desired_depth`. Descent rules:
+/// Resolve the active render frame from a camera WorldPos +
+/// desired anchor depth.
 ///
-///   * Cartesian parent ×→ Cartesian child: standard, slot index is
-///     XYZ.
-///   * Cartesian parent ×→ `CubedSphereBody` child: stop here with
-///     `Body` kind unless deeper descent is available through a face
-///     subtree.
-///   * `CubedSphereBody` →`CubedSphereFace`: re-interpret subsequent
-///     slots as UVR. Begin accumulating `un_corner, vn_corner,
-///     rn_corner, frame_size` — initially (0, 0, 0, 1).
-///   * Face-subtree Cartesian descent: slot is UVR, frame_size *=
-///     1/3 each level.
-///
-/// When the descended face-subtree depth is ≥ `MIN_SPHERE_SUB_DEPTH`,
-/// materialize `SphereSub` with precomputed `(c_body, J, J_inv)`.
-/// Shallower face-subtree depths revert to `Body` (the exact march
-/// handles those levels without linearization).
+/// * If the camera is in sphere state with enough UVR depth →
+///   `SphereSub(sub)` with precomputed Jacobian.
+/// * Else if the anchor lands on a `CubedSphereBody` cell →
+///   `Body { inner_r, outer_r }`.
+/// * Else Cartesian.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
-    camera_anchor: &Path,
+    camera: &WorldPos,
     desired_depth: u8,
 ) -> ActiveFrame {
-    let mut target = *camera_anchor;
+    // Sphere case: symbolic UVR state provides everything we need.
+    // Build the sub-frame directly, no tree-walk decoding.
+    if let Some(sphere) = camera.sphere.as_ref() {
+        let logical_m = sphere.uvr_path.depth();
+        // Target face-subtree depth after `desired_depth` truncation.
+        // `desired_depth` is the OVERALL anchor depth; subtract the
+        // body-path length + 1 for the face-root slot to get the
+        // UVR depth we want to render at.
+        let body_depth = sphere.body_path.depth() as i32;
+        let total_anchor_depth = body_depth + 1 + logical_m as i32;
+        let m_logical = logical_m as i32;
+        let m_truncated = (desired_depth as i32 - body_depth - 1).clamp(0, m_logical) as u32;
+
+        // Accumulate un/vn/rn from the first `m_truncated` UVR slots.
+        let (un_corner, vn_corner, rn_corner, frame_size) =
+            uvr_corner(&sphere.uvr_path, m_truncated as usize);
+
+        if m_truncated >= MIN_SPHERE_SUB_DEPTH as u32 {
+            // Build render_path = body_path + face_root_slot +
+            // uvr_path[..m_truncated].
+            let mut render_path = sphere.body_path;
+            render_path.push(FACE_SLOTS[sphere.face as usize] as u8);
+            for k in 0..m_truncated as usize {
+                render_path.push(sphere.uvr_path.slot(k));
+            }
+            // Walk the tree to resolve the sub-frame's node id.
+            let Some(node_id) = resolve_node(library, world_root, &render_path) else {
+                // Tree doesn't reach this depth (e.g., uniform chain
+                // ended early). Fall back to Body.
+                let logical_path = build_logical_path(sphere, desired_depth);
+                return body_frame(library, world_root, sphere, logical_path);
+            };
+            let (c_body, j) = face_frame_jacobian(
+                sphere.face,
+                un_corner, vn_corner, rn_corner, frame_size,
+                sphere.inner_r, sphere.outer_r,
+                3.0, // body_size in the render-frame convention
+            );
+            let j_inv = mat3_inv(&j);
+            let sub = SphereSubFrame {
+                body_path: sphere.body_path,
+                render_path,
+                face: sphere.face,
+                un_corner, vn_corner, rn_corner, frame_size,
+                inner_r: sphere.inner_r,
+                outer_r: sphere.outer_r,
+                c_body, j, j_inv,
+            };
+            let logical_path = build_logical_path(sphere, desired_depth);
+            return ActiveFrame {
+                render_path: sub.render_path,
+                logical_path,
+                node_id,
+                kind: ActiveFrameKind::SphereSub(sub),
+            };
+        }
+        // Shallow face-subtree depth → Body march handles it.
+        let logical_path = build_logical_path(sphere, desired_depth);
+        let _ = total_anchor_depth;
+        return body_frame(library, world_root, sphere, logical_path);
+    }
+
+    // Cartesian case. Walk the anchor slot by slot, checking each
+    // descent resolves to a real Node. Stop early at non-Node
+    // children. If we hit a CubedSphereBody, pick Body kind.
+    let mut target = camera.anchor;
     target.truncate(desired_depth);
 
     let mut node_id = world_root;
     let mut reached = Path::root();
-
-    // Body-subtree state, populated on `CubedSphereBody` descent.
-    let mut body_state: Option<BodyDescendState> = None;
-
+    let mut body_meta: Option<(f32, f32)> = None;
     for k in 0..target.depth() as usize {
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         let Child::Node(child_id) = node.children[slot] else { break };
         let Some(child) = library.get(child_id) else { break };
-
-        match (child.kind, &mut body_state) {
-            (NodeKind::Cartesian, None) => {
+        match child.kind {
+            NodeKind::Cartesian => {
                 node_id = child_id;
                 reached.push(slot as u8);
             }
-            (NodeKind::CubedSphereBody { inner_r, outer_r }, None) => {
+            NodeKind::CubedSphereBody { inner_r, outer_r } => {
                 node_id = child_id;
                 reached.push(slot as u8);
-                body_state = Some(BodyDescendState {
-                    body_path: reached,
-                    inner_r,
-                    outer_r,
-                    face: None,
-                    un_corner: 0.0,
-                    vn_corner: 0.0,
-                    rn_corner: 0.0,
-                    frame_size: 1.0,
-                });
-            }
-            (NodeKind::CubedSphereFace { face }, Some(state)) if state.face.is_none() => {
-                // Descending body → face root. Slot must match the
-                // face's conventional slot. We don't push this slot
-                // onto `reached` as a UVR slot — it's the body's
-                // child slot (XYZ slot index for the face root).
-                node_id = child_id;
-                reached.push(slot as u8);
-                state.face = Some(face);
-                // Face root starts covering the whole face in UVR.
-                state.un_corner = 0.0;
-                state.vn_corner = 0.0;
-                state.rn_corner = 0.0;
-                state.frame_size = 1.0;
-            }
-            (NodeKind::Cartesian, Some(state)) if state.face.is_some() => {
-                // Inside a face subtree — interpret slot as UVR.
-                let (us, vs, rs) = slot_coords(slot);
-                state.frame_size /= 3.0;
-                state.un_corner += us as f32 * state.frame_size;
-                state.vn_corner += vs as f32 * state.frame_size;
-                state.rn_corner += rs as f32 * state.frame_size;
-                node_id = child_id;
-                reached.push(slot as u8);
-            }
-            (NodeKind::CubedSphereBody { .. }, Some(_))
-            | (NodeKind::CubedSphereFace { .. }, _) => {
-                // Malformed: nested body, or face root outside a body
-                // context. Stop descent safely.
+                body_meta = Some((inner_r, outer_r));
                 break;
             }
-            (NodeKind::Cartesian, Some(_)) => {
-                // State flagged for body but face not yet entered.
-                // Body's 27 children are partitioned by cubemap
-                // geometry, not XYZ. Don't descend further through
-                // it — stop with `Body` kind.
+            NodeKind::CubedSphereFace { .. } => {
+                // Face root reachable via Cartesian anchor only if
+                // the user's XYZ slots coincidentally match a face
+                // slot inside a body — but compute_render_frame
+                // doesn't consume further UVR semantics from XYZ
+                // slots (that's what stage 5 fixes). Stop at body.
                 break;
             }
         }
     }
 
-    let kind = resolve_kind(library, node_id, body_state);
+    let kind = match body_meta {
+        Some((inner_r, outer_r)) => ActiveFrameKind::Body { inner_r, outer_r },
+        None => ActiveFrameKind::Cartesian,
+    };
     ActiveFrame {
         render_path: reached,
         logical_path: reached,
@@ -207,129 +237,96 @@ pub fn compute_render_frame(
     }
 }
 
-struct BodyDescendState {
-    body_path: Path,
-    inner_r: f32,
-    outer_r: f32,
-    face: Option<Face>,
-    un_corner: f32,
-    vn_corner: f32,
-    rn_corner: f32,
-    frame_size: f32,
-}
-
-fn resolve_kind(
+/// Walk `path` from `world_root` through each slot; return the
+/// terminal node id if every step resolves to a Node child.
+fn resolve_node(
     library: &NodeLibrary,
-    node_id: NodeId,
-    body_state: Option<BodyDescendState>,
-) -> ActiveFrameKind {
-    let Some(state) = body_state else {
-        return match library.get(node_id).map(|n| n.kind) {
-            Some(NodeKind::Cartesian) | None => ActiveFrameKind::Cartesian,
-            _ => ActiveFrameKind::Cartesian,
-        };
-    };
-
-    match state.face {
-        None => ActiveFrameKind::Body {
-            inner_r: state.inner_r,
-            outer_r: state.outer_r,
-        },
-        Some(face) => {
-            // Face-subtree depth is the number of 1/3-factors applied
-            // to `frame_size`. At `face_root` alone, frame_size = 1.
-            let face_depth = frame_size_to_depth(state.frame_size);
-            if face_depth < MIN_SPHERE_SUB_DEPTH {
-                // Shallow face levels: defer to exact body march.
-                // body_path is the full path to the body (the render
-                // frame's effective root for the Body march).
-                ActiveFrameKind::Body {
-                    inner_r: state.inner_r,
-                    outer_r: state.outer_r,
-                }
-            } else {
-                // Body-local convention used by the renderer is
-                // `[0, 3)³` (the body cell fills one render frame),
-                // so `body_size = 3.0`. Keeps c_body / J in the same
-                // coordinate scale the caller passes camera in.
-                let (c_body, j) = face_frame_jacobian(
-                    face,
-                    state.un_corner,
-                    state.vn_corner,
-                    state.rn_corner,
-                    state.frame_size,
-                    state.inner_r,
-                    state.outer_r,
-                    3.0,
-                );
-                let j_inv = mat3_inv(&j);
-                ActiveFrameKind::SphereSub(SphereSubFrame {
-                    body_path: state.body_path,
-                    face,
-                    un_corner: state.un_corner,
-                    vn_corner: state.vn_corner,
-                    rn_corner: state.rn_corner,
-                    frame_size: state.frame_size,
-                    inner_r: state.inner_r,
-                    outer_r: state.outer_r,
-                    c_body,
-                    j,
-                    j_inv,
-                })
-            }
+    world_root: NodeId,
+    path: &Path,
+) -> Option<NodeId> {
+    let mut node = world_root;
+    for k in 0..path.depth() as usize {
+        let n = library.get(node)?;
+        let slot = path.slot(k) as usize;
+        match n.children[slot] {
+            Child::Node(next) => node = next,
+            _ => return None,
         }
     }
+    Some(node)
 }
 
-fn frame_size_to_depth(frame_size: f32) -> u8 {
-    // frame_size = 1/3^d → d = -log3(frame_size). Use integer rounding
-    // (exact for the powers of 3 we actually produce).
-    let inv = 1.0 / frame_size;
-    let d = inv.ln() / 3.0_f32.ln();
-    d.round() as u8
-}
-
-/// Produce an anchor path that descends into a face subtree. Used by
-/// callers (tests, zoom logic) that need to represent a camera
-/// parked inside a specific face-subtree cell.
-pub fn face_subtree_anchor(
-    body_path: Path,
-    face: Face,
-    u_slots: &[u8],
-    v_slots: &[u8],
-    r_slots: &[u8],
-) -> Path {
-    debug_assert_eq!(u_slots.len(), v_slots.len());
-    debug_assert_eq!(u_slots.len(), r_slots.len());
-    let mut path = body_path;
-    path.push(FACE_SLOTS[face as usize] as u8);
-    for i in 0..u_slots.len() {
-        let us = u_slots[i] as usize;
-        let vs = v_slots[i] as usize;
-        let rs = r_slots[i] as usize;
-        path.push(crate::world::tree::slot_index(us, vs, rs) as u8);
+/// Sum UVR-slot coord contributions from `uvr_path[..m]` into
+/// (un_corner, vn_corner, rn_corner, frame_size). This is the
+/// symbolic → f32 conversion that produces the Jacobian's evaluation
+/// point. f32 precision is limited here, but only the Jacobian cares,
+/// and the Jacobian is a linearization reference — the sub-cell
+/// position (what matters for rendering) comes from
+/// `WorldPos.sphere.uvr_offset` elsewhere.
+fn uvr_corner(uvr_path: &Path, m: usize) -> (f32, f32, f32, f32) {
+    let mut un = 0.0_f32;
+    let mut vn = 0.0_f32;
+    let mut rn = 0.0_f32;
+    let mut size = 1.0_f32;
+    for k in 0..m {
+        let slot = uvr_path.slot(k) as usize;
+        let (us, vs, rs) = crate::world::tree::slot_coords(slot);
+        size /= 3.0;
+        un += us as f32 * size;
+        vn += vs as f32 * size;
+        rn += rs as f32 * size;
     }
-    path
+    (un, vn, rn, size)
+}
+
+fn build_logical_path(
+    sphere: &crate::world::anchor::SphereState,
+    desired_depth: u8,
+) -> Path {
+    let body_depth = sphere.body_path.depth();
+    let mut p = sphere.body_path;
+    p.push(FACE_SLOTS[sphere.face as usize] as u8);
+    let want = desired_depth.saturating_sub(body_depth + 1);
+    let take = (want as usize).min(sphere.uvr_path.depth() as usize);
+    for k in 0..take {
+        p.push(sphere.uvr_path.slot(k));
+    }
+    p
+}
+
+fn body_frame(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    sphere: &crate::world::anchor::SphereState,
+    logical_path: Path,
+) -> ActiveFrame {
+    // Render frame is the body cell itself. Resolve body node.
+    let node_id = resolve_node(library, world_root, &sphere.body_path)
+        .unwrap_or(world_root);
+    ActiveFrame {
+        render_path: sphere.body_path,
+        logical_path,
+        node_id,
+        kind: ActiveFrameKind::Body {
+            inner_r: sphere.inner_r,
+            outer_r: sphere.outer_r,
+        },
+    }
 }
 
 pub fn with_render_margin(
     library: &NodeLibrary,
     world_root: NodeId,
-    logical_path: &Path,
+    camera: &WorldPos,
+    logical_depth: u8,
     render_margin: u8,
 ) -> ActiveFrame {
-    let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
-    let target_depth = logical
-        .logical_path
-        .depth()
-        .saturating_sub(render_margin);
-    if target_depth >= logical.logical_path.depth() {
+    let target_depth = logical_depth.saturating_sub(render_margin);
+    let logical = compute_render_frame(library, world_root, camera, logical_depth);
+    if target_depth >= logical_depth {
         return logical;
     }
-
-    let mut render_path = logical.logical_path;
-    render_path.truncate(target_depth);
-    let render = compute_render_frame(library, world_root, &render_path, target_depth);
+    let render = compute_render_frame(library, world_root, camera, target_depth);
     ActiveFrame {
         render_path: render.render_path,
         logical_path: logical.logical_path,
@@ -360,20 +357,18 @@ mod tests {
         for _ in 0..4 {
             anchor.push(13);
         }
-        let f = compute_render_frame(&lib, root, &anchor, 3);
+        let camera = WorldPos::new(anchor, [0.5; 3]);
+        let f = compute_render_frame(&lib, root, &camera, 3);
         assert_eq!(f.render_path.depth(), 3);
         assert!(matches!(f.kind, ActiveFrameKind::Cartesian));
     }
 
     #[test]
-    fn sphere_body_enters_body_kind() {
+    fn body_kind_when_anchor_ends_on_body() {
         let mut lib = NodeLibrary::default();
         let body = lib.insert_with_kind(
             empty_children(),
-            NodeKind::CubedSphereBody {
-                inner_r: 0.12,
-                outer_r: 0.45,
-            },
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);
@@ -381,14 +376,17 @@ mod tests {
         lib.ref_inc(root);
 
         let mut anchor = Path::root();
-        anchor.push(13);
-        let f = compute_render_frame(&lib, root, &anchor, 1);
+        anchor.push(slot_index(1, 1, 1) as u8);
+        let camera = WorldPos::new(anchor, [0.5; 3]);
+        let f = compute_render_frame(&lib, root, &camera, 1);
         assert!(matches!(f.kind, ActiveFrameKind::Body { .. }));
     }
 
     #[test]
-    fn deep_face_subtree_enters_sphere_sub() {
-        // Build: root → body → face(PosX) → face-cell × MIN_SPHERE_SUB_DEPTH.
+    fn sphere_sub_from_symbolic_uvr_state() {
+        use crate::world::anchor::SphereState;
+        use crate::world::cubesphere::{Face, FACE_SLOTS};
+        // Build: root → body → face(PosY) → uvr chain × MIN_SPHERE_SUB_DEPTH.
         let mut lib = NodeLibrary::default();
         let leaf = lib.insert(empty_children());
         let mut chain = leaf;
@@ -397,35 +395,47 @@ mod tests {
         }
         let face = lib.insert_with_kind(
             uniform_children(Child::Node(chain)),
-            NodeKind::CubedSphereFace { face: Face::PosX },
+            NodeKind::CubedSphereFace { face: Face::PosY },
         );
         let mut body_children = empty_children();
-        body_children[FACE_SLOTS[Face::PosX as usize]] = Child::Node(face);
+        body_children[FACE_SLOTS[Face::PosY as usize]] = Child::Node(face);
         let body = lib.insert_with_kind(
             body_children,
-            NodeKind::CubedSphereBody {
-                inner_r: 0.12,
-                outer_r: 0.45,
-            },
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        // Anchor descends: slot 13 (body), slot 14 (PosX face root),
-        // then MIN_SPHERE_SUB_DEPTH steps through UVR-semantic slots.
-        let mut anchor = Path::root();
-        anchor.push(slot_index(1, 1, 1) as u8);
-        anchor.push(FACE_SLOTS[Face::PosX as usize] as u8);
+        let body_path = {
+            let mut p = Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let mut uvr_path = Path::root();
         for _ in 0..MIN_SPHERE_SUB_DEPTH {
-            anchor.push(slot_index(1, 1, 1) as u8);
+            uvr_path.push(slot_index(1, 1, 1) as u8);
         }
 
-        let f = compute_render_frame(&lib, root, &anchor, anchor.depth());
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face: Face::PosY,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let desired = body_path.depth() + 1 + MIN_SPHERE_SUB_DEPTH;
+        let f = compute_render_frame(&lib, root, &camera, desired);
         match f.kind {
             ActiveFrameKind::SphereSub(sub) => {
-                assert_eq!(sub.face, Face::PosX);
+                assert_eq!(sub.face, Face::PosY);
+                assert_eq!(sub.depth_levels(), MIN_SPHERE_SUB_DEPTH as u32);
                 let expected = (1.0_f32 / 3.0).powi(MIN_SPHERE_SUB_DEPTH as i32);
                 assert!(
                     (sub.frame_size - expected).abs() < 1e-6,
@@ -437,48 +447,40 @@ mod tests {
     }
 
     #[test]
-    fn shallow_face_subtree_stays_body_kind() {
-        // 2 face-subtree levels is below MIN_SPHERE_SUB_DEPTH = 3 →
-        // resolves to Body.
+    fn shallow_sphere_falls_back_to_body() {
+        use crate::world::anchor::SphereState;
+        use crate::world::cubesphere::Face;
         let mut lib = NodeLibrary::default();
-        let leaf = lib.insert(empty_children());
-        let inner = lib.insert(uniform_children(Child::Node(leaf)));
-        let face = lib.insert_with_kind(
-            uniform_children(Child::Node(inner)),
-            NodeKind::CubedSphereFace { face: Face::PosX },
-        );
-        let mut body_children = empty_children();
-        body_children[FACE_SLOTS[Face::PosX as usize]] = Child::Node(face);
         let body = lib.insert_with_kind(
-            body_children,
-            NodeKind::CubedSphereBody {
-                inner_r: 0.12,
-                outer_r: 0.45,
-            },
+            empty_children(),
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
         );
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(body);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        let mut anchor = Path::root();
-        anchor.push(slot_index(1, 1, 1) as u8);
-        anchor.push(FACE_SLOTS[Face::PosX as usize] as u8);
-        anchor.push(slot_index(1, 1, 1) as u8);
-        anchor.push(slot_index(1, 1, 1) as u8);
+        let body_path = {
+            let mut p = Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let mut uvr_path = Path::root();
+        uvr_path.push(slot_index(1, 1, 1) as u8); // depth 1, below MIN
 
-        let f = compute_render_frame(&lib, root, &anchor, anchor.depth());
-        assert!(
-            matches!(f.kind, ActiveFrameKind::Body { .. }),
-            "expected Body at face-depth 2, got {:?}", f.kind
-        );
-    }
-
-    #[test]
-    fn frame_size_to_depth_round_trip() {
-        for d in 0..15_u8 {
-            let size = (1.0_f32 / 3.0).powi(d as i32);
-            assert_eq!(frame_size_to_depth(size), d);
-        }
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face: Face::PosY,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let f = compute_render_frame(&lib, root, &camera, body_path.depth() + 1 + 1);
+        assert!(matches!(f.kind, ActiveFrameKind::Body { .. }));
     }
 }

@@ -347,8 +347,11 @@ impl App {
                 let depth = test_cfg.spawn_depth.unwrap_or(
                     bootstrap.default_spawn_pos.anchor.depth(),
                 );
+                // Use sphere-aware deepening so spawn positions
+                // inside a planet body correctly transition into
+                // symbolic UVR state.
                 WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
-                    .deepened_to(depth)
+                    .deepened_to_with(depth, &world.library, world.root)
             }
             None => {
                 if let Some(depth) = test_cfg.spawn_depth {
@@ -362,7 +365,7 @@ impl App {
                     } else {
                         let mut pos = bootstrap.default_spawn_pos;
                         while pos.anchor.depth() > depth { pos.zoom_out(); }
-                        pos = pos.deepened_to(depth);
+                        pos = pos.deepened_to_with(depth, &world.library, world.root);
                         pos
                     }
                 } else {
@@ -384,10 +387,8 @@ impl App {
         let desired_depth = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
-        logical_path.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
-            &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
+            &world.library, world.root, &position, desired_depth, RENDER_FRAME_CONTEXT,
         );
         eprintln!(
             "startup_perf initial_frame kind={:?} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
@@ -508,11 +509,9 @@ impl App {
         let desired_depth = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
-        logical_path.truncate(desired_depth);
         frame::with_render_margin(
             &self.world.library, self.world.root,
-            &logical_path, RENDER_FRAME_CONTEXT,
+            &self.camera.position, desired_depth, RENDER_FRAME_CONTEXT,
         )
     }
 
@@ -589,17 +588,23 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         // `cam_local` is the camera's position in the render frame's
-        // local `[0, 3)³`. For Cartesian/Body/SphereSub alike this
-        // comes from the anchor-path ribbon-pop — no body-XYZ
-        // subtraction (which would collapse in f32 for deep SphereSub).
-        let cam_local = self.camera.position.in_frame(&frame.render_path);
+        // local `[0, 3)³`. For SphereSub we read the camera's
+        // SYMBOLIC UVR state directly — no body-XYZ subtraction that
+        // would collapse in f32 at deep face-subtree depth. For
+        // Cartesian / Body we use the normal anchor-path ribbon-pop.
+        let cam_local = match frame.kind {
+            ActiveFrameKind::SphereSub(sub) => self.camera.position.in_sub_frame(&sub),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+                self.camera.position.in_frame(&frame.render_path)
+            }
+        };
         let (fwd_world, right_world, up_world) = self.camera.basis();
         let (fwd_local, right_local, up_local) = match frame.kind {
             ActiveFrameKind::SphereSub(sub) => {
                 // Sub-frame local basis isn't world-axis-aligned:
                 // rotate + scale via J_inv. |basis_local| ≈ 3^depth
-                // (large but well within f32 range); DDA operates on
-                // t ratios so the magnitude doesn't affect ordering.
+                // (large but f32-safe); DDA uses t ratios so
+                // magnitude doesn't affect ordering.
                 (
                     crate::world::cubesphere::mat3_mul_vec(&sub.j_inv, fwd_world),
                     crate::world::cubesphere::mat3_mul_vec(&sub.j_inv, right_world),

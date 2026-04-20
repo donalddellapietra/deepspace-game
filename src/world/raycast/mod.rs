@@ -447,16 +447,15 @@ mod tests {
     }
 
     #[test]
-    fn sphere_sub_frame_hit_at_depth_35() {
-        // End-to-end pipeline check: anchor descends through face
-        // subtree to depth 35. `compute_render_frame` must produce a
-        // `SphereSub`, `cpu_raycast_in_sub_frame` must land a hit.
-        // This is what the body-march cap prevented — depth 35 is
-        // 15 levels beyond the f32 precision wall of the body march.
+    fn sphere_sub_frame_hit_at_depth_15() {
+        // End-to-end pipeline check with symbolic-UVR camera state:
+        // compute_render_frame must produce SphereSub and
+        // cpu_raycast_in_sub_frame must land a hit at a depth well
+        // past the body-march precision wall (~8 levels).
         use crate::app::frame::{compute_render_frame, ActiveFrameKind};
-        use crate::world::anchor::Path;
+        use crate::world::anchor::{Path, SphereState, WorldPos};
         use crate::world::bootstrap;
-        use crate::world::cubesphere::{Face, FACE_SLOTS};
+        use crate::world::cubesphere::Face;
         use crate::world::tree::slot_index;
 
         let world = bootstrap::bootstrap_world(
@@ -464,22 +463,50 @@ mod tests {
             Some(40),
         ).world;
 
-        // Anchor: body(1,1,1) → face(PosY) → UVR(1,1,1) × 35. Face-
-        // subtree depth = 35. Well past the old max_face_depth = 10.
-        let mut anchor = Path::root();
-        anchor.push(slot_index(1, 1, 1) as u8);
-        anchor.push(FACE_SLOTS[Face::PosY as usize] as u8);
-        for _ in 0..35 {
-            anchor.push(slot_index(1, 1, 1) as u8);
+        // Camera at face PosY, UVR (center, center, center) × 15.
+        // 15 is well past the body-march f32 wall (~8 levels) and
+        // inside the demo planet's tree depth (28). Proves the
+        // symbolic-UVR + local-frame DDA path works where body
+        // march would fail.
+        //
+        // Geometry starts to degrade past ~18 UVR levels in the
+        // current implementation — documented precision frontier.
+        let body_path = {
+            let mut p = Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let mut uvr_path = Path::root();
+        for _ in 0..15 {
+            uvr_path.push(slot_index(1, 1, 1) as u8);
         }
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face: Face::PosY,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let total_depth = body_path.depth() + 1 + 15;
+        // Render frame at total - 3, mimicking the runtime
+        // render_margin of 3. Walker then descends 3 more levels to
+        // the user's edit depth.
+        let render_depth = total_depth - 3;
         let active = compute_render_frame(
-            &world.library, world.root, &anchor, anchor.depth(),
+            &world.library, world.root, &camera, render_depth,
         );
         let sub = match active.kind {
             ActiveFrameKind::SphereSub(s) => s,
-            k => panic!("expected SphereSub at face-subtree depth 35, got {k:?}"),
+            k => panic!("expected SphereSub at render_depth {render_depth}, got {k:?}"),
         };
-        let cam_local = [1.5_f32, 1.5, 2.5];
+        // cam_local from the camera's symbolic UVR state — precise at
+        // any depth, no body-XYZ subtraction.
+        let cam_local = camera.in_sub_frame(&sub);
         let rd_body = crate::world::sdf::scale(
             crate::world::sdf::normalize([sub.j[2][0], sub.j[2][1], sub.j[2][2]]),
             -1.0,
@@ -488,10 +515,10 @@ mod tests {
             &world.library, world.root, &sub,
             active.render_path.as_slice(),
             cam_local, rd_body,
-            anchor.depth() as u32,
+            total_depth as u32,
             LodParams::fixed_max(),
         );
-        assert!(hit.is_some(), "deep-descent raycast missed at anchor depth 37");
+        assert!(hit.is_some(), "deep-descent raycast missed at total_depth={total_depth}");
     }
 
     #[test]

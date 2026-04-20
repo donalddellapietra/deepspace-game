@@ -69,14 +69,13 @@ impl App {
         };
         let (hit, cap_frame_path) = match self.active_frame.kind {
             ActiveFrameKind::SphereSub(sub) => {
-                // Deep face-subtree render frame: march runs in the
-                // frame's linearized local `[0, 3)³` via `J_inv`.
-                // `cam_local` comes from the anchor-path ribbon-pop
-                // directly — never subtracted from a body-XYZ point
-                // (which would collapse in f32 at deep depth).
-                let render_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&render_path);
+                // `cam_local` comes from the camera's SYMBOLIC UVR
+                // state — `in_sub_frame` returns `uvr_offset * 3`
+                // directly, no body-XYZ subtraction. This is what
+                // preserves f32 precision past the body-march wall.
+                let cam_local = self.camera.position.in_sub_frame(&sub);
                 let ray_dir_body = self.ray_dir_in_frame(&sub.body_path);
+                let render_path = sub.render_path;
                 let hit = raycast::cpu_raycast_in_sub_frame(
                     &self.world.library,
                     self.world.root,

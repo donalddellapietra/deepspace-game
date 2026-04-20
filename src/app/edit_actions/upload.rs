@@ -211,10 +211,14 @@ impl App {
             );
         }
 
+        // The GPU ribbon may have truncated below the camera's
+        // intended render depth. Re-resolve the active frame at the
+        // effective truncated depth, using the camera's WorldPos so
+        // sphere state is preserved.
         let effective_render = frame::compute_render_frame(
             &self.world.library,
             self.world.root,
-            &effective_path,
+            &self.camera.position,
             effective_path.depth(),
         );
         self.active_frame = ActiveFrame {

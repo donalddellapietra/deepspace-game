@@ -362,18 +362,36 @@ mod tests {
         NodeId,
         Vec<(NodeId, usize)>,
     ) {
+        use crate::world::anchor::{SphereState, WorldPos};
         let world = bootstrap::bootstrap_world(
             bootstrap::WorldPreset::DemoSphere,
             Some(40),
         ).world;
-        let mut frame_path = Path::root();
-        frame_path.push(slot_index(1, 1, 1) as u8);
-        frame_path.push(FACE_SLOTS[face as usize] as u8);
+        // Build a WorldPos with explicit SphereState at center-of-face.
+        let body_path = {
+            let mut p = Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let mut uvr_path = Path::root();
         for _ in 0..sub_depth {
-            frame_path.push(slot_index(1, 1, 1) as u8);
+            uvr_path.push(slot_index(1, 1, 1) as u8);
         }
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let desired = body_path.depth() + 1 + sub_depth;
         let active = compute_render_frame(
-            &world.library, world.root, &frame_path, frame_path.depth(),
+            &world.library, world.root, &camera, desired,
         );
         let sub = match active.kind {
             ActiveFrameKind::SphereSub(s) => s,
@@ -473,14 +491,31 @@ mod tests {
             root,
             library: lib,
         };
-        let mut frame_path = Path::root();
-        frame_path.push(slot_index(1, 1, 1) as u8);
-        frame_path.push(FACE_SLOTS[Face::PosY as usize] as u8);
+        use crate::world::anchor::{SphereState, WorldPos};
+        let body_path = {
+            let mut p = Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let mut uvr_path = Path::root();
         for _ in 0..sub_depth {
-            frame_path.push(slot_index(1, 1, 1) as u8);
+            uvr_path.push(slot_index(1, 1, 1) as u8);
         }
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face: Face::PosY,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let desired = body_path.depth() + 1 + sub_depth;
         let active = compute_render_frame(
-            &world.library, world.root, &frame_path, frame_path.depth(),
+            &world.library, world.root, &camera, desired,
         );
         let sub = match active.kind {
             ActiveFrameKind::SphereSub(s) => s,

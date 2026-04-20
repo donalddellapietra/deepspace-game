@@ -14,7 +14,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::world::tree::{slot_coords, slot_index, NodeLibrary, MAX_DEPTH};
+use crate::world::tree::{slot_coords, slot_index, NodeId, NodeLibrary, MAX_DEPTH};
 
 /// Local frame convention: every node's children span
 /// `[0, WORLD_SIZE)³` because there are 3 children per axis.
@@ -178,28 +178,58 @@ pub enum Transition {
 
 // ------------------------------------------------------------ WorldPos
 
+/// Symbolic face-subtree descent + sub-cell offset. When the camera
+/// sits inside a `CubedSphereBody` cell, this tracks the cell
+/// symbolically (UVR-slot path) so precision stays cell-local
+/// regardless of face-subtree depth. See
+/// `docs/design/sphere-ribbon-pop-uvr-state.md`.
+///
+/// `Copy`-compatible so `WorldPos` stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SphereState {
+    /// Path from world root to the body cell. Always equal to
+    /// `WorldPos.anchor` when `sphere.is_some()`.
+    pub body_path: Path,
+    /// Body-local radii, carried here so `in_frame` / exit code can
+    /// reconstruct body-XYZ without a tree walk.
+    pub inner_r: f32,
+    pub outer_r: f32,
+    /// Cube face the camera is on (picked at body entry, preserved
+    /// until exit).
+    pub face: crate::world::cubesphere::Face,
+    /// UVR-semantic symbolic descent from face root. Slot indices use
+    /// the standard `slot_index(us, vs, rs)` formula but the axes
+    /// are face-local (u, v, r), not world (x, y, z).
+    pub uvr_path: Path,
+    /// `[0, 1)³` inside the deepest UVR cell. f32 eps here is
+    /// relative to the innermost cell, not to the body.
+    pub uvr_offset: [f32; 3],
+}
+
 /// `(anchor, offset)` position with the offset held in `[0, 1)³`
-/// by invariant.
+/// by invariant. When inside a cubed-sphere body, `sphere` carries
+/// symbolic UVR-side state — see `SphereState`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldPos {
     pub anchor: Path,
     pub offset: [f32; 3],
+    pub sphere: Option<SphereState>,
 }
 
 impl WorldPos {
     pub const fn new_unchecked(anchor: Path, offset: [f32; 3]) -> Self {
-        Self { anchor, offset }
+        Self { anchor, offset, sphere: None }
     }
 
     /// Construct and renormalize so the invariant holds.
     pub fn new(anchor: Path, offset: [f32; 3]) -> Self {
-        let mut p = Self { anchor, offset };
+        let mut p = Self { anchor, offset, sphere: None };
         p.renormalize_cartesian();
         p
     }
 
     pub const fn root_origin() -> Self {
-        Self { anchor: Path::root(), offset: [0.0, 0.0, 0.0] }
+        Self { anchor: Path::root(), offset: [0.0, 0.0, 0.0], sphere: None }
     }
 
     /// Restore `offset[i] ∈ [0, 1)` by stepping the anchor along
@@ -245,7 +275,31 @@ impl WorldPos {
 
     /// Push a new slot under the current offset. Offset rescaled so
     /// the world position is unchanged.
+    ///
+    /// * Inside a sphere body (`self.sphere.is_some()`): symbolic
+    ///   UVR refinement — push a UVR slot onto `sphere.uvr_path` and
+    ///   rescale `sphere.uvr_offset`. The Cartesian `anchor` and
+    ///   `offset` are left untouched; all deeper symbolic state
+    ///   lives in `sphere.uvr_path`.
+    /// * Otherwise: regular Cartesian push. If the caller cares about
+    ///   body-entry transitions, follow up with
+    ///   `maybe_enter_sphere(&lib, world_root)` — that method walks
+    ///   the tree and initializes `SphereState` when the new anchor
+    ///   cell is a `CubedSphereBody`.
     pub fn zoom_in(&mut self) -> Transition {
+        if let Some(sphere) = self.sphere.as_mut() {
+            let mut coords = [0usize; 3];
+            for i in 0..3 {
+                let s = (sphere.uvr_offset[i] * 3.0).floor();
+                coords[i] = s.clamp(0.0, 2.0) as usize;
+                sphere.uvr_offset[i] =
+                    (sphere.uvr_offset[i] * 3.0 - s).clamp(0.0, 1.0 - f32::EPSILON);
+            }
+            let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
+            sphere.uvr_path.push(slot);
+            return Transition::None;
+        }
+
         let mut coords = [0usize; 3];
         for i in 0..3 {
             let s = (self.offset[i] * 3.0).floor();
@@ -255,6 +309,59 @@ impl WorldPos {
         let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.anchor.push(slot);
         Transition::None
+    }
+
+    /// After a `zoom_in` / teleport / any repositioning, call this
+    /// to detect whether the new anchor cell is a `CubedSphereBody`
+    /// — if so, initialize the symbolic sphere state from the
+    /// current body-local offset. No-op if `self.sphere` is already
+    /// `Some` or if the current anchor cell isn't a body.
+    pub fn maybe_enter_sphere(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) -> Transition {
+        use crate::world::cubesphere::body_point_to_face_space;
+        use crate::world::tree::{Child, NodeKind};
+
+        if self.sphere.is_some() {
+            return Transition::None;
+        }
+        // Walk `anchor` to the deepest node; check if its kind is
+        // CubedSphereBody.
+        let mut node = world_root;
+        for k in 0..self.anchor.depth() as usize {
+            let Some(n) = library.get(node) else { return Transition::None; };
+            let slot = self.anchor.slot(k) as usize;
+            match n.children[slot] {
+                Child::Node(next) => node = next,
+                _ => return Transition::None,
+            }
+        }
+        let Some(n) = library.get(node) else { return Transition::None; };
+        let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind else {
+            return Transition::None;
+        };
+        // Offset is the camera's body-local position in [0, 1)³.
+        // Convert to body-local [0, 3)³ (body_size = 3.0, the render
+        // frame scale) before the face-space lookup.
+        let body_pos = [
+            self.offset[0] * 3.0,
+            self.offset[1] * 3.0,
+            self.offset[2] * 3.0,
+        ];
+        let Some(fp) = body_point_to_face_space(body_pos, inner_r, outer_r, 3.0) else {
+            return Transition::None;
+        };
+        self.sphere = Some(SphereState {
+            body_path: self.anchor,
+            inner_r,
+            outer_r,
+            face: fp.face,
+            uvr_path: Path::root(),
+            uvr_offset: [fp.un, fp.vn, fp.rn],
+        });
+        Transition::SphereEntry { body_path: self.anchor }
     }
 
     /// Vector from `other` to `self`, computed
@@ -297,9 +404,39 @@ impl WorldPos {
         [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
     }
 
+    /// Total symbolic zoom depth: Cartesian anchor depth + (inside a
+    /// sphere: +1 for the implicit face-root slot + uvr_path depth).
+    /// This is the user-visible "zoom level".
+    pub fn total_depth(&self) -> u8 {
+        let cart = self.anchor.depth();
+        match &self.sphere {
+            Some(s) => cart + 1 + s.uvr_path.depth(),
+            None => cart,
+        }
+    }
+
+    /// Sphere-aware version of `deepened_to`. After each zoom-in,
+    /// calls `maybe_enter_sphere` so crossing into a body triggers
+    /// symbolic-UVR state without the caller having to remember.
+    pub fn deepened_to_with(
+        mut self,
+        target_depth: u8,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) -> Self {
+        while self.total_depth() < target_depth {
+            self.zoom_in();
+            self.maybe_enter_sphere(library, world_root);
+        }
+        self
+    }
+
     /// Zoom this position in repeatedly until its anchor reaches
     /// `target_depth`. Precision-safe: each step is pure path-slot
     /// arithmetic, no absolute-XYZ accumulation.
+    ///
+    /// Cartesian-only. For sphere-aware deepening use
+    /// `deepened_to_with`.
     pub fn deepened_to(mut self, target_depth: u8) -> Self {
         while self.anchor.depth() < target_depth {
             self.zoom_in();
@@ -398,12 +535,55 @@ impl WorldPos {
             ((clamped[1] - origin[1]) / size).clamp(0.0, 1.0 - f32::EPSILON),
             ((clamped[2] - origin[2]) / size).clamp(0.0, 1.0 - f32::EPSILON),
         ];
-        Self { anchor, offset }
+        Self { anchor, offset, sphere: None }
     }
 
     /// Pop the deepest slot. Offset rescaled so the world position
     /// is unchanged. Clamps at root.
+    ///
+    /// * Inside a sphere body: pop the deepest UVR slot. If
+    ///   `uvr_path` becomes empty, drop sphere state and restore the
+    ///   Cartesian `offset` to the body-local XYZ of the pre-exit
+    ///   UVR position via `face_space_to_body_point`.
+    /// * Otherwise: regular Cartesian pop.
     pub fn zoom_out(&mut self) -> Transition {
+        if let Some(sphere) = self.sphere.as_mut() {
+            if !sphere.uvr_path.is_root() {
+                let slot = sphere.uvr_path.pop().expect("uvr_path not root");
+                let (us, vs, rs) = slot_coords(slot as usize);
+                sphere.uvr_offset[0] = (sphere.uvr_offset[0] + us as f32) / 3.0;
+                sphere.uvr_offset[1] = (sphere.uvr_offset[1] + vs as f32) / 3.0;
+                sphere.uvr_offset[2] = (sphere.uvr_offset[2] + rs as f32) / 3.0;
+                debug_assert!(sphere.uvr_offset.iter().all(|&x| (0.0..1.0).contains(&x)));
+                return Transition::None;
+            }
+            // uvr_path empty → leaving the sphere. Reconstruct the
+            // body-local offset from the face-space coord.
+            let body_pt = crate::world::cubesphere::face_space_to_body_point(
+                sphere.face,
+                sphere.uvr_offset[0],
+                sphere.uvr_offset[1],
+                sphere.uvr_offset[2],
+                sphere.inner_r,
+                sphere.outer_r,
+                3.0,
+            );
+            let body_path = sphere.body_path;
+            self.sphere = None;
+            self.offset = [body_pt[0] / 3.0, body_pt[1] / 3.0, body_pt[2] / 3.0];
+            // Clamp — face_space round-trip can land at exactly 1.0.
+            for ax in 0..3 {
+                if self.offset[ax] >= 1.0 {
+                    self.offset[ax] = 1.0 - f32::EPSILON;
+                }
+                if self.offset[ax] < 0.0 {
+                    self.offset[ax] = 0.0;
+                }
+            }
+            // Fall through to the Cartesian pop of the body slot.
+            let _ = body_path;
+        }
+
         let Some(slot) = self.anchor.pop() else { return Transition::None; };
         let (sx, sy, sz) = slot_coords(slot as usize);
         self.offset[0] = (self.offset[0] + sx as f32) / 3.0;
@@ -414,6 +594,40 @@ impl WorldPos {
         // stays < 1 as long as offset < 1. Assert in debug.
         debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
         Transition::None
+    }
+
+    /// Return cam_local ∈ [0, 3)³ in the SphereSub frame's local
+    /// coords. `sub` must share the camera's face and be at or
+    /// shallower than the camera's current uvr_path depth (the
+    /// common runtime case — render_margin makes the sub-frame
+    /// slightly shallower than the edit-anchor).
+    ///
+    /// Purely symbolic: the camera's uvr_offset is zoomed-out by the
+    /// excess uvr_path levels not covered by the sub-frame, producing
+    /// a [0, 1)³ local position inside the sub-frame, then scaled to
+    /// [0, 3)³. No body-XYZ subtraction. Precision stays ~1e-7 of the
+    /// deepest cell at any depth.
+    pub fn in_sub_frame(
+        &self,
+        sub: &crate::app::frame::SphereSubFrame,
+    ) -> [f32; 3] {
+        let sphere = self.sphere.as_ref().expect("in_sub_frame: camera not in a sphere");
+        debug_assert_eq!(sphere.face, sub.face);
+        let m_sub = sub.depth_levels() as usize;
+        let m_cam = sphere.uvr_path.depth() as usize;
+        debug_assert!(m_cam >= m_sub, "camera uvr depth {} < sub-frame depth {}", m_cam, m_sub);
+        // Start at [0, 1)³ inside the camera's deepest uvr cell.
+        // Zoom out (m_cam - m_sub) levels, each step adding the
+        // slot-coord offset and dividing by 3.
+        let mut local = sphere.uvr_offset;
+        for k in (m_sub..m_cam).rev() {
+            let slot = sphere.uvr_path.slot(k);
+            let (us, vs, rs) = slot_coords(slot as usize);
+            local[0] = (local[0] + us as f32) / 3.0;
+            local[1] = (local[1] + vs as f32) / 3.0;
+            local[2] = (local[2] + rs as f32) / 3.0;
+        }
+        [local[0] * 3.0, local[1] * 3.0, local[2] * 3.0]
     }
 }
 

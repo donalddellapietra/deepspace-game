@@ -81,13 +81,12 @@ impl App {
                 || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
         {
             let logical_path = frame.logical_path;
-            let mut shallower = frame.render_path;
-            shallower.truncate(frame.render_path.depth().saturating_sub(1));
+            let shallower_depth = frame.render_path.depth().saturating_sub(1);
             let render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
-                &shallower,
-                shallower.depth(),
+                &self.camera.position,
+                shallower_depth,
             );
             frame = ActiveFrame {
                 render_path: render.render_path,
