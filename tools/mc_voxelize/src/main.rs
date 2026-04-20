@@ -25,13 +25,13 @@ use rustmatica::Litematic;
 mod block_map;
 use block_map::{AIR, Rgba, UNKNOWN};
 
-/// One non-empty voxel in the output grid (coords already shifted to
-/// 0-origin, RGBA already resolved).
+/// One non-empty voxel in the output grid (coords shifted to 0-origin,
+/// palette index already resolved).
 struct Voxel {
     x: u32,
     y: u32,
     z: u32,
-    rgba: Rgba,
+    pal_idx: u32,
 }
 
 fn main() -> Result<()> {
@@ -110,24 +110,17 @@ fn main() -> Result<()> {
     let mut voxels: Vec<Voxel> = Vec::with_capacity(occupied.len());
 
     for (gx, gy, gz, rgba) in occupied {
-        let idx = match palette_index.get(&rgba) {
-            Some(&i) => i,
-            None => {
-                let i = palette.len() as u32;
-                palette.push(rgba);
-                palette_index.insert(rgba, i);
-                i
-            }
-        };
+        let pal_idx = *palette_index.entry(rgba).or_insert_with(|| {
+            let i = palette.len() as u32;
+            palette.push(rgba);
+            i
+        });
         voxels.push(Voxel {
             x: (gx - min_x) as u32,
             y: (gy - min_y) as u32,
             z: (gz - min_z) as u32,
-            rgba: [0, 0, 0, idx as u8], // stash index in alpha slot, overwritten below
+            pal_idx,
         });
-        // Actually just store the index directly — keep it simple.
-        let last = voxels.len() - 1;
-        voxels[last].rgba = rgba;
     }
 
     // Report stats so the user can see what happened.
@@ -161,7 +154,7 @@ fn main() -> Result<()> {
     }
 
     // Pass 3: write DSVX v1 binary.
-    write_dsvx(output, size_x, size_y, size_z, &palette, &voxels, &palette_index)
+    write_dsvx(output, size_x, size_y, size_z, &palette, &voxels)
         .with_context(|| format!("writing {:?}", output))?;
 
     Ok(())
@@ -185,7 +178,6 @@ fn write_dsvx(
     size_z: u32,
     palette: &[Rgba],
     voxels: &[Voxel],
-    palette_index: &HashMap<Rgba, u32>,
 ) -> Result<()> {
     if let Some(dir) = out.parent() {
         if !dir.as_os_str().is_empty() {
@@ -205,11 +197,10 @@ fn write_dsvx(
     }
     w.write_all(&(voxels.len() as u32).to_le_bytes())?;
     for v in voxels {
-        let idx = palette_index.get(&v.rgba).copied().unwrap_or(0);
         w.write_all(&v.x.to_le_bytes())?;
         w.write_all(&v.y.to_le_bytes())?;
         w.write_all(&v.z.to_le_bytes())?;
-        w.write_all(&idx.to_le_bytes())?;
+        w.write_all(&v.pal_idx.to_le_bytes())?;
     }
     w.flush()?;
     Ok(())
