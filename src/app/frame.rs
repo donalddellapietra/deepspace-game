@@ -241,8 +241,13 @@ mod tests {
     #[test]
     fn render_frame_enters_sphere_face_logically() {
         let mut lib = NodeLibrary::default();
+        // Build a face subtree with at least one descendable slot so
+        // we can test the face_depth >= 1 case too.
+        let leaf = lib.insert(empty_children());
+        let mut face_children = empty_children();
+        face_children[0] = Child::Node(leaf);
         let face = lib.insert_with_kind(
-            empty_children(),
+            face_children,
             NodeKind::CubedSphereFace {
                 face: crate::world::cubesphere::Face::PosX,
             },
@@ -258,14 +263,25 @@ mod tests {
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
+        // At face_depth == 0, compute_render_frame collapses back to
+        // the body so the shader's root is the body node (needed for
+        // the ray-sphere pre-clip in march()). The logical_path still
+        // reaches the face root for edit/highlight purposes.
         let mut anchor = Path::root();
         anchor.push(13);
         anchor.push(14);
         let frame = compute_render_frame(&lib, root, &anchor, 2);
-        assert_eq!(frame.render_path.depth(), 2);
-        assert_eq!(frame.logical_path.depth(), 2);
-        assert_eq!(frame.node_id, face);
-        assert!(matches!(frame.kind, ActiveFrameKind::Sphere(_)));
+        assert_eq!(frame.render_path.depth(), 1, "render_path stops at body for face_depth==0");
+        assert_eq!(frame.logical_path.depth(), 2, "logical_path reaches the face root");
+        assert!(matches!(frame.kind, ActiveFrameKind::Body { .. }));
+
+        // Descending one slot deeper into the face subtree gives
+        // face_depth == 1 and returns a Sphere frame.
+        let mut deeper = anchor;
+        deeper.push(0);
+        let deep_frame = compute_render_frame(&lib, root, &deeper, 3);
+        assert_eq!(deep_frame.render_path.depth(), 3);
+        assert!(matches!(deep_frame.kind, ActiveFrameKind::Sphere(_)));
     }
 
     #[test]

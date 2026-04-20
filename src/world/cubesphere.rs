@@ -265,17 +265,22 @@ pub fn insert_spherical_body(
     // of calls for a depth-28 body. Precomputing once flips that
     // from O(N × depth) allocations to O(depth) + O(N) table
     // lookups.
-    // `uniform_empty[d]` = NodeId of a `d`-level subtree that is
-    // entirely empty. `uniform_stone[d]` = the `Child` at depth `d`
-    // of a uniform stone subtree (Block at d=0, Node at d >= 1).
+    // `uniform_empty[d]` (for d >= 1) = NodeId of a `d`-level
+    // subtree that is entirely empty. Index 0 is an unused
+    // placeholder — depth=0 is handled with `Child::Empty` directly
+    // by callers. `uniform_stone[d]` = the `Child` at depth `d` of
+    // a uniform stone subtree (Block at d=0, Node at d >= 1).
     // Indices 0..=depth are valid.
     let mut uniform_empty: Vec<NodeId> = Vec::with_capacity(depth as usize + 1);
     let mut uniform_stone: Vec<Child> = Vec::with_capacity(depth as usize + 1);
     {
         let empty_leaf = lib.insert(empty_children());
-        uniform_empty.push(empty_leaf); // d=0 (single level) = 27 empties
-        uniform_stone.push(Child::Block(sdf.core_block));
-        for _ in 1..=depth {
+        uniform_empty.push(empty_leaf); // d=0 placeholder (same as d=1)
+        uniform_empty.push(empty_leaf); // d=1: one level of all-empty
+        uniform_stone.push(Child::Block(sdf.core_block));  // d=0
+        let stone_leaf = lib.insert(uniform_children(Child::Block(sdf.core_block)));
+        uniform_stone.push(Child::Node(stone_leaf));  // d=1
+        for _ in 2..=depth {
             let prev_e = *uniform_empty.last().unwrap();
             let next_e = lib.insert(uniform_children(Child::Node(prev_e)));
             uniform_empty.push(next_e);

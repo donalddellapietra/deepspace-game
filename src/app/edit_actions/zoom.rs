@@ -76,51 +76,24 @@ impl App {
             })
     }
 
-    /// When the camera is inside a planet body, build a path that
-    /// descends into the appropriate face subtree toward the camera,
-    /// to `desired_depth` total slots. The sphere SDF in the shader
-    /// handles the silhouette regardless; this function's job is just
-    /// to pick a render frame *inside* the face subtree content where
-    /// the packed tree is rich, instead of letting the camera's raw
-    /// anchor point into a uniform interior region.
+    /// When the camera's anchor sits inside the planet body, use the
+    /// camera's anchor (truncated to the desired render depth) as the
+    /// focus path. That guarantees the render frame contains the
+    /// camera and sits on the Cartesian-indexed voxel content the
+    /// walker can descend into. Returns None when the camera isn't
+    /// inside the planet — the caller falls back to `render_frame()`
+    /// which uses the camera's anchor directly.
     fn camera_local_sphere_focus_path(&self, desired_depth: u8) -> Option<Path> {
         let body_path = self.planet_path?;
-        let cam_body = self.camera.position.in_frame(&body_path);
-        // Pick the face whose outward normal has the largest component
-        // of the camera's body-frame offset from center — that's the
-        // face the camera is looking at / standing on.
-        let d = [
-            cam_body[0] - WORLD_SIZE * 0.5,
-            cam_body[1] - WORLD_SIZE * 0.5,
-            cam_body[2] - WORLD_SIZE * 0.5,
-        ];
-        let ax = d[0].abs();
-        let ay = d[1].abs();
-        let az = d[2].abs();
-        let face_idx = if ax >= ay && ax >= az {
-            if d[0] > 0.0 { 0 } else { 1 } // PosX / NegX
-        } else if ay >= az {
-            if d[1] > 0.0 { 2 } else { 3 } // PosY / NegY
-        } else {
-            if d[2] > 0.0 { 4 } else { 5 } // PosZ / NegZ
-        };
-        let mut path = body_path;
-        path.push(crate::world::cubesphere::FACE_SLOTS[face_idx] as u8);
-        // Within the face subtree the slot semantics are `(u, v, r)`
-        // numerically identical to `(x, y, z)`. Walk toward the cell
-        // under the camera's body-frame position — projected into
-        // face subtree coords is simply `cam_body` minus the face
-        // subtree's body-cell origin, divided by 1.0.
-        //
-        // We can't cheaply decompose `cam_body` into face-subtree
-        // coords without the removed face-space helpers. Instead,
-        // descend toward the center of the face subtree — that's
-        // guaranteed to sit on the solid interior where SDF-varying
-        // content lives.
-        let target_depth = desired_depth.max(body_path.depth() + 1);
-        while path.depth() < target_depth {
-            path.push(13); // center slot = (1, 1, 1)
+        let anchor = self.camera.position.anchor;
+        let prefix = anchor.common_prefix_len(&body_path);
+        if prefix != body_path.depth() {
+            // Camera isn't inside the body; no sphere-specific focus.
+            return None;
         }
+        let cap = anchor.depth().min(desired_depth);
+        let mut path = anchor;
+        path.truncate(cap);
         Some(path)
     }
 
