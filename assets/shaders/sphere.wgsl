@@ -23,6 +23,27 @@ fn sphere_depth_tint(rn: f32) -> f32 {
     return 0.55 + 0.45 * clamp(rn, 0.0, 1.0);
 }
 
+// Simple single-level bevel used by the fragment shader for
+// Cartesian hits (main.wgsl picks whichever two axes face the hit
+// normal and computes their edge-distance smoothstep). Retained for
+// backward compatibility with cartesian rendering.
+fn face_uv_for_normal(local: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let an = abs(normal);
+    if an.x >= an.y && an.x >= an.z {
+        return local.yz;
+    }
+    if an.y >= an.z {
+        return local.xz;
+    }
+    return local.xy;
+}
+
+fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let uv = face_uv_for_normal(local, normal);
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    return smoothstep(0.02, 0.14, edge);
+}
+
 // Per-level bevel contribution. Draws a dark ~1px band at the cell
 // edges; returns 1.0 when the cell is too small on screen for a
 // visible band (so deep-sub-pixel grid lines don't darken everything).
