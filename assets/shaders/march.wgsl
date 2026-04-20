@@ -3,6 +3,27 @@
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
 
+// Cell-packing helpers. Cell coords at each depth range -1..=3
+// (legal 0..=2 plus ±1 over-step to trigger pop). Pack +1-shifted
+// into 3 bits per axis = 9 bits per u32. Shrinks the per-thread
+// `s_cell` stack from 96 B (vec3<i32>×8) to 32 B (u32×8), targeting
+// the Fragment Occupancy register cliff measured at 9.7% on
+// Jerusalem nucleus (rule: <25% = register pressure).
+fn pack_cell(c: vec3<i32>) -> u32 {
+    let ux = u32(c.x + 1) & 7u;
+    let uy = u32(c.y + 1) & 7u;
+    let uz = u32(c.z + 1) & 7u;
+    return ux | (uy << 3u) | (uz << 6u);
+}
+
+fn unpack_cell(p: u32) -> vec3<i32> {
+    return vec3<i32>(
+        i32(p & 7u) - 1,
+        i32((p >> 3u) & 7u) - 1,
+        i32((p >> 6u) & 7u) - 1,
+    );
+}
+
 // Conservative 27-bit "path mask" — the tensor product of per-axis
 // 3-bit masks of cells reachable from `entry_cell` moving in `step`
 // direction. Over-approximates the actual ray path (any axis-wise
@@ -70,7 +91,9 @@ fn march_cartesian(
     let delta_dist = abs(inv_dir);
 
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
-    var s_cell: array<vec3<i32>, MAX_STACK_DEPTH>;
+    // Packed per-depth cell coords, 32 B total (vs 96 B for the
+    // pre-pack vec3<i32>×8). See pack_cell / unpack_cell above.
+    var s_cell: array<u32, MAX_STACK_DEPTH>;
 
     // Current-depth cell size. Pure function of `depth` (1/3^depth), so
     // a scalar mutated on push (÷3) / pop (×3) is exactly equivalent
@@ -128,12 +151,13 @@ fn march_cartesian(
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
 
-    s_cell[0] = vec3<i32>(
+    let root_cell = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
         clamp(i32(floor(entry_pos.y)), 0, 2),
         clamp(i32(floor(entry_pos.z)), 0, 2),
     );
-    let cell_f = vec3<f32>(s_cell[0]);
+    s_cell[0] = pack_cell(root_cell);
+    let cell_f = vec3<f32>(root_cell);
     cur_side_dist = vec3<f32>(
         select((cell_f.x - entry_pos.x) * inv_dir.x,
                (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
@@ -151,23 +175,15 @@ fn march_cartesian(
         iterations += 1u;
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
-        let cell = s_cell[depth];
+        let cell = unpack_cell(s_cell[depth]);
 
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
             depth -= 1u;
-            // Restore parent-depth scalars. cur_cell_size ×3 undoes
-            // the descend divide; cur_node_origin subtracts the exact
-            // vec we added on descend (s_cell[parent_depth] was
-            // preserved while we were inside the child, so this is
-            // byte-exact — no accumulated floating-point error).
             cur_cell_size = cur_cell_size * 3.0;
-            cur_node_origin = cur_node_origin - vec3<f32>(s_cell[depth]) * cur_cell_size;
-            // Recompute cur_side_dist from scratch at the parent
-            // depth. Same formula as the descend-site init — same
-            // entry_pos reference. ~6 FMAs per pop, amortized to
-            // ~nothing vs. the per-thread register savings.
-            let lc_pop = vec3<f32>(s_cell[depth]);
+            let parent_cell = unpack_cell(s_cell[depth]);
+            cur_node_origin = cur_node_origin - vec3<f32>(parent_cell) * cur_cell_size;
+            let lc_pop = vec3<f32>(parent_cell);
             cur_side_dist = vec3<f32>(
                 select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
                        (cur_node_origin.x + (lc_pop.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
@@ -190,7 +206,7 @@ fn march_cartesian(
             }
 
             let m_oob = min_axis_mask(cur_side_dist);
-            s_cell[depth] += vec3<i32>(m_oob) * step;
+            s_cell[depth] = pack_cell(parent_cell + vec3<i32>(m_oob) * step);
             cur_side_dist += m_oob * delta_dist * cur_cell_size;
             normal = -vec3<f32>(step) * m_oob;
             continue;
@@ -205,7 +221,7 @@ fn march_cartesian(
             // Empty — DDA advance. No access to the compact array.
             if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             let m_empty = min_axis_mask(cur_side_dist);
-            s_cell[depth] += vec3<i32>(m_empty) * step;
+            s_cell[depth] = pack_cell(cell + vec3<i32>(m_empty) * step);
             cur_side_dist += m_empty * delta_dist * cur_cell_size;
             normal = -vec3<f32>(step) * m_empty;
             continue;
@@ -247,10 +263,10 @@ fn march_cartesian(
             // same packed node. Checked BEFORE the kind lookup so a
             // ribbon-pop landing on a sphere-body slot doesn't
             // re-dispatch the sphere DDA we already traversed.
-            let cell_slot = u32(s_cell[depth].x) + u32(s_cell[depth].y) * 3u + u32(s_cell[depth].z) * 9u;
+            let cell_slot = u32(cell.x) + u32(cell.y) * 3u + u32(cell.z) * 9u;
             if depth == 0u && cell_slot == skip_slot {
                 let m_skip = min_axis_mask(cur_side_dist);
-                s_cell[depth] += vec3<i32>(m_skip) * step;
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_skip) * step);
                 cur_side_dist += m_skip * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_skip;
                 continue;
@@ -275,7 +291,7 @@ fn march_cartesian(
                 }
                 // Sphere missed — advance Cartesian DDA past this cell.
                 let m_sph = min_axis_mask(cur_side_dist);
-                s_cell[depth] += vec3<i32>(m_sph) * step;
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_sph) * step);
                 cur_side_dist += m_sph * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_sph;
                 continue;
@@ -299,7 +315,7 @@ fn march_cartesian(
             if child_bt == 255u {
                 if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
                 let m_rep = min_axis_mask(cur_side_dist);
-                s_cell[depth] += vec3<i32>(m_rep) * step;
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_rep) * step);
                 cur_side_dist += m_rep * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_rep;
                 continue;
@@ -328,7 +344,7 @@ fn march_cartesian(
                 let bt = child_block_type(packed);
                 if bt == 255u {
                     let m_lodt = min_axis_mask(cur_side_dist);
-                    s_cell[depth] += vec3<i32>(m_lodt) * step;
+                    s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
                     cur_side_dist += m_lodt * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_lodt;
                 } else {
@@ -390,7 +406,7 @@ fn march_cartesian(
                 if aabb_hit.t_exit <= aabb_hit.t_enter || aabb_hit.t_exit < 0.0 {
                     // Content AABB missed. Advance parent DDA.
                     let m_aabb = min_axis_mask(cur_side_dist);
-                    s_cell[depth] += vec3<i32>(m_aabb) * step;
+                    s_cell[depth] = pack_cell(cell + vec3<i32>(m_aabb) * step);
                     cur_side_dist += m_aabb * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_aabb;
                     if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
@@ -443,12 +459,13 @@ fn march_cartesian(
                     ray_loads_offsets = ray_loads_offsets + 1u;
                     ray_loads_tree = ray_loads_tree + 2u;
                 }
-                s_cell[depth] = vec3<i32>(
+                let new_cell = vec3<i32>(
                     clamp(i32(floor(local_entry.x)), 0, 2),
                     clamp(i32(floor(local_entry.y)), 0, 2),
                     clamp(i32(floor(local_entry.z)), 0, 2),
                 );
-                let lc = vec3<f32>(s_cell[depth]);
+                s_cell[depth] = pack_cell(new_cell);
+                let lc = vec3<f32>(new_cell);
                 // Use `entry_pos` as the reference (matching the root
                 // init). In the baseline stacked version the root used
                 // entry_pos and descent used ray_origin — that meant
