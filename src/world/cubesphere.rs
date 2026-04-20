@@ -722,6 +722,99 @@ mod ribbon_pop_feasibility {
         );
     }
 
+    // ──── test 2b: cross-product form survives at all K ∈ {1, 2, 3}
+
+    /// The "factored absolute t(K)" form `t(K) = −(A + K·a) / (B + K·b)`
+    /// is algebraically identical to the cross-product `Δt(0→K) = K·(A·b
+    /// − B·a) / (B·(B + K·b))`, but it fails at deep depth: `A + K·a`
+    /// with A ~ O(1) and K·a ~ O(1/3^N) loses the small term to f32
+    /// eps for N ≥ 20, so `t(K) = −A/B = t(0)` for every K. Only the
+    /// cross-product form preserves the precision of Δt.
+    fn t_k_factored_f32(
+        n_base: [f32; 3],
+        n_delta: [f32; 3],
+        o: [f32; 3],
+        d: [f32; 3],
+        k: f32,
+    ) -> f32 {
+        let big_a = o[0] * n_base[0] + o[1] * n_base[1] + o[2] * n_base[2];
+        let big_b = d[0] * n_base[0] + d[1] * n_base[1] + d[2] * n_base[2];
+        let sm_a = o[0] * n_delta[0] + o[1] * n_delta[1] + o[2] * n_delta[2];
+        let sm_b = d[0] * n_delta[0] + d[1] * n_delta[1] + d[2] * n_delta[2];
+        -(big_a + k * sm_a) / (big_b + k * sm_b)
+    }
+
+    #[test]
+    fn factored_absolute_form_collapses_at_depth_30_but_cross_product_survives() {
+        // At depth 30, compute t(0), t(1), t(2), t(3) three ways and
+        // verify the cross-product form preserves Δt while the
+        // factored absolute form does not — matching the "1/4 vs 4/4"
+        // finding from the parallel verification.
+        let s = slots(30);
+        let u_ea_corner = u_ea_at(&s);
+        let (n_base, n_delta) = exact_base_delta_f32(u_ea_corner, 30);
+        let o = o_f32();
+        let d = d_f32();
+
+        // f64 reference Δt at each K computed via the tan identity.
+        let per_local = size_ea(31);
+        let u_arg = u_ea_corner * FRAC_PI_4_F64;
+        let tan_u = u_arg.tan();
+        let sec2_u = 1.0 / (u_arg.cos() * u_arg.cos());
+        let n_base_ref = [-tan_u, 0.0, -1.0];
+        let (o_ref, d_ref) = ref_ray();
+        let big_a_ref = o_ref[0] * n_base_ref[0] + o_ref[1] * n_base_ref[1] + o_ref[2] * n_base_ref[2];
+        let big_b_ref = d_ref[0] * n_base_ref[0] + d_ref[1] * n_base_ref[1] + d_ref[2] * n_base_ref[2];
+        let t0_ref = -big_a_ref / big_b_ref;
+
+        let t_factored_0 = t_k_factored_f32(n_base, n_delta, o, d, 0.0);
+        for k in 1..=3u32 {
+            let k_f32 = k as f32;
+            // f64 reference: evaluate tan at u_ea + K·per_local via
+            // the identity (exact in f64).
+            let delta_arg = (k as f64) * per_local * FRAC_PI_4_F64;
+            let tan_d = delta_arg.tan();
+            let dtan = tan_d * sec2_u / (1.0 - tan_u * tan_d);
+            let d_n = [-dtan, 0.0, 0.0];
+            let sm_a_ref = o_ref[0] * d_n[0] + o_ref[1] * d_n[1] + o_ref[2] * d_n[2];
+            let sm_b_ref = d_ref[0] * d_n[0] + d_ref[1] * d_n[1] + d_ref[2] * d_n[2];
+            let dt_ref = (big_a_ref * sm_b_ref - big_b_ref * sm_a_ref)
+                / (big_b_ref * (big_b_ref + sm_b_ref));
+
+            // (1) cross-product f32.
+            let dt_cross = delta_t_lin(n_base, n_delta, o, d, k_f32);
+            let rel_cross = ((dt_cross as f64) - dt_ref).abs() / dt_ref.abs();
+
+            // (2) factored absolute t(K) − t(0), both computed in f32.
+            let t_factored_k = t_k_factored_f32(n_base, n_delta, o, d, k_f32);
+            let dt_factored = (t_factored_k - t_factored_0) as f64;
+            // Absolute delta from f64 truth (not relative — if f32
+            // collapses to 0 the relative form blows up).
+            let abs_factored = (dt_factored - dt_ref).abs();
+
+            // Cross-product: tight precision at every K.
+            assert!(
+                rel_cross < 1e-4,
+                "K={k}: cross-product rel_err = {rel_cross:.3e} (dt_ref = {dt_ref:.3e}, dt_cross = {dt_cross:e})",
+            );
+
+            // Factored absolute: must collapse to zero at depth 30.
+            // If it somehow survived, the whole "only cross-product
+            // works" claim would be wrong.
+            assert_eq!(
+                dt_factored,
+                0.0,
+                "K={k}: factored absolute form unexpectedly produced non-zero Δt = {dt_factored:e}; \
+                 expected collapse at depth 30 (abs err vs truth = {abs_factored:e})",
+            );
+
+            // Use t0_ref to silence unused warning and document that
+            // the cross-product recovers truth while factored yields
+            // t(K)=t(0).
+            let _ = t0_ref;
+        }
+    }
+
     // ─────────────── test 3: ribbon-pop descent preserves precision
 
     /// Parametric sweep: for each handoff depth `k_start`, compute
