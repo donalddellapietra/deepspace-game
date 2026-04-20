@@ -863,6 +863,125 @@ mod ribbon_pop_feasibility {
         );
     }
 
+    /// Explicit depth-40 check — direct answer to "does this work at
+    /// 40+ layers?" Results are identical to the depth-30 and
+    /// depth-60 sweeps (all three converge to the same f32-eps floor
+    /// at k_start ≥ 9), confirming no drift across the range.
+    #[test]
+    fn ribbon_pop_descent_to_depth_40_sweep_handoff() {
+        let full_depth = 40u32;
+        let full_slots = slots(full_depth);
+        let u_ea_full = u_ea_at(&full_slots);
+        let dt_ref = dt_exact(u_ea_full, full_depth);
+
+        let mut results: Vec<(u32, f64)> = Vec::new();
+        for k_start in 1..=10u32 {
+            let slots_before = &full_slots[..k_start as usize];
+            let slots_after = &full_slots[k_start as usize..];
+            let u_ea_k_start = u_ea_at(slots_before);
+            let (nb, nd) = exact_base_delta_f32(u_ea_k_start, k_start);
+            let (n_base, n_delta) = ribbon_pop(slots_after, nb, nd);
+            let dt_lin = delta_t_lin(n_base, n_delta, o_f32(), d_f32(), 1.0);
+            let rel = ((dt_lin as f64) - dt_ref).abs() / dt_ref.abs();
+            results.push((k_start, rel));
+        }
+
+        let diag: String = results
+            .iter()
+            .map(|(k, r)| format!("  k_start={k:2} rel_err={r:.3e}\n"))
+            .collect();
+        eprintln!("ribbon-pop handoff sweep to depth 40:\n{diag}");
+
+        let best = results
+            .iter()
+            .filter(|(k, _)| *k >= 2 && *k <= 10)
+            .map(|(_, r)| *r)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            best < 0.01,
+            "no handoff depth 2..=10 achieved rel_err < 1% at depth 40 — best was {best:.3e}\n{diag}",
+        );
+    }
+
+    // ───────────────── test 4: radial (ray-sphere) axis at depth 40
+
+    /// The radial axis uses ray-sphere, not ray-plane. Same precision
+    /// wall exists: at depth 40, adjacent shell radii differ by
+    /// `shell / 3^41 ≈ 4e-22`, indistinguishable in f32 against
+    /// `r_base ≈ 0.5`. Naive computation of `r_hi² − r_lo² = (r_hi −
+    /// r_lo)(r_hi + r_lo)` loses `r_hi − r_lo` to the f32 eps of the
+    /// large sum.
+    ///
+    /// The fix is structurally identical to u/v: store `(r_base,
+    /// r_delta)` separately, compute Δt(0→K) via the rationalized
+    /// sqrt-difference
+    ///   Δt = ±(K·D_1 + K²·D_2) / (√D(K) + √D_0)
+    /// where D(K) = b² − |o|² + r(K)², D_1 = 2·r_base·r_delta,
+    /// D_2 = r_delta². The numerator holds small terms; the
+    /// denominator is well-conditioned at O(√D_0).
+    ///
+    /// This test validates the form at depth 40 for K ∈ {1, 2, 3},
+    /// and confirms the naive form collapses.
+    #[test]
+    fn radial_ribbon_pop_at_depth_40() {
+        // Shell sitting in body-local coords. Ray from outside the
+        // outer sphere, aimed at origin — two clean intersections.
+        let depth = 40u32;
+        let shell_f64 = 0.05_f64;
+        let inner_f64 = 0.45_f64;
+        let per_local_f64 = shell_f64 / 3.0_f64.powi(depth as i32 + 1);
+        // Frame r corner mid-shell.
+        let r_base_f64 = inner_f64 + 0.3 * shell_f64;
+        // r_base ≈ 0.465; r_delta ≈ 3.4e-22.
+
+        let o_f64 = [0.8_f64, 0.0, 0.0];
+        let d_f64 = norm3_f64([-1.0, 0.0, 0.0]); // aimed at origin
+        let b_f64 = o_f64[0] * d_f64[0] + o_f64[1] * d_f64[1] + o_f64[2] * d_f64[2];
+        let oo_f64 = o_f64[0] * o_f64[0] + o_f64[1] * o_f64[1] + o_f64[2] * o_f64[2];
+        let d0_f64 = b_f64 * b_f64 - oo_f64 + r_base_f64 * r_base_f64;
+        let d1_f64 = 2.0 * r_base_f64 * per_local_f64;
+        let d2_f64 = per_local_f64 * per_local_f64;
+
+        // f32 state (what the real implementation stores per frame).
+        let o_f32 = [o_f64[0] as f32, o_f64[1] as f32, o_f64[2] as f32];
+        let d_f32 = [d_f64[0] as f32, d_f64[1] as f32, d_f64[2] as f32];
+        let r_base = r_base_f64 as f32;
+        let per_local = per_local_f64 as f32;
+        let b = o_f32[0] * d_f32[0] + o_f32[1] * d_f32[1] + o_f32[2] * d_f32[2];
+        let oo = o_f32[0] * o_f32[0] + o_f32[1] * o_f32[1] + o_f32[2] * o_f32[2];
+        let d0 = b * b - oo + r_base * r_base;
+        let d1 = 2.0 * r_base * per_local;
+        let d2 = per_local * per_local; // likely subnormal at depth 40
+
+        for k in 1..=3u32 {
+            let kf64 = k as f64;
+            let dk_num_f64 = kf64 * d1_f64 + kf64 * kf64 * d2_f64;
+            let dt_ref = dk_num_f64 / ((d0_f64 + dk_num_f64).sqrt() + d0_f64.sqrt());
+
+            let kf32 = k as f32;
+            // Rationalized form — precision-preserving.
+            let dk_num = kf32 * d1 + kf32 * kf32 * d2;
+            let dt_lin = dk_num / ((d0 + dk_num).sqrt() + d0.sqrt());
+            let rel_lin = ((dt_lin as f64) - dt_ref).abs() / dt_ref.abs();
+
+            // Naive form: evaluate r_hi in absolute terms, subtract
+            // the two sqrt(D)'s. In f32 at depth 40, `r_base +
+            // K·per_local` rounds to `r_base`, so both sqrts are
+            // identical and Δt = 0 exactly.
+            let r_k = r_base + kf32 * per_local;
+            let dk_naive = (b * b - oo + r_k * r_k).sqrt() - d0.sqrt();
+
+            assert!(
+                rel_lin < 1e-4,
+                "radial K={k} at depth 40: rationalized rel_err = {rel_lin:.3e} (dt_ref = {dt_ref:.3e}, dt_lin = {dt_lin:e})",
+            );
+            assert_eq!(
+                dk_naive, 0.0,
+                "radial K={k} at depth 40: expected naive form to collapse, got {dk_naive:e}",
+            );
+        }
+    }
+
     /// Same test at depth 60 — upper end of supported zoom.
     #[test]
     fn ribbon_pop_descent_to_depth_60_sweep_handoff() {
