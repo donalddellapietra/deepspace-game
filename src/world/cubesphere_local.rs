@@ -1,7 +1,17 @@
+//! CPU-side cubed-sphere projection primitives. Mirrors the
+//! shader's face_math / face_walk precision contract: all inputs are
+//! in a body cell's local frame where the cell spans `[0, body_size)`
+//! and the radii are given as fractions of `body_size`. Nothing in
+//! this module touches a body-absolute constant — callers pass
+//! `body_size` explicitly so the same primitives work at any render
+//! frame scale.
+
 use super::cubesphere::{cube_to_ea, face_uv_to_dir, pick_face, Face};
 use super::sdf;
 use super::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
+/// A point in face-normalized `(un, vn, rn) ∈ [0, 1)³` coords, plus
+/// the world-radial distance at which it sits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalFacePoint {
     pub face: Face,
@@ -11,11 +21,15 @@ pub struct LocalFacePoint {
     pub radius: f32,
 }
 
+/// Body cell center, in body cell-local coords. The body cell spans
+/// `[0, body_size)³` and its center is at `body_size * 0.5`.
 #[inline]
 pub fn body_center(body_size: f32) -> [f32; 3] {
     [body_size * 0.5; 3]
 }
 
+/// Ray vs. outer shell in the body cell's frame. Returns the first
+/// `t > 0` at which the ray crosses the outer sphere, or `None`.
 pub fn ray_outer_sphere_hit(
     ray_origin_body: [f32; 3],
     ray_dir: [f32; 3],
@@ -23,21 +37,23 @@ pub fn ray_outer_sphere_hit(
     body_size: f32,
 ) -> Option<f32> {
     let center = body_center(body_size);
-    let outer_r = outer_r_local * body_size;
+    let outer = outer_r_local * body_size;
     let oc = sdf::sub(ray_origin_body, center);
     let b = sdf::dot(oc, ray_dir);
-    let c = sdf::dot(oc, oc) - outer_r * outer_r;
+    let c = sdf::dot(oc, oc) - outer * outer;
     let disc = b * b - c;
-    if disc <= 0.0 {
-        return None;
-    }
+    if disc <= 0.0 { return None; }
     let sq = disc.sqrt();
     let t_enter = (-b - sq).max(0.0);
     let t_exit = -b + sq;
+    if t_exit <= 0.0 { return None; }
     let t = if t_enter > 0.0 { t_enter } else { t_exit };
     if t > 0.0 { Some(t) } else { None }
 }
 
+/// Project a point inside the body's shell into `(face, un, vn, rn)`
+/// face-normalized coords. Returns `None` for degenerate inputs
+/// (point exactly at body center, or shell collapsed).
 pub fn body_point_to_face_space(
     point_body: [f32; 3],
     inner_r_local: f32,
@@ -47,39 +63,33 @@ pub fn body_point_to_face_space(
     let center = body_center(body_size);
     let local = sdf::sub(point_body, center);
     let radius = sdf::length(local);
-    if radius <= 1e-12 {
-        return None;
-    }
+    if radius <= 1e-12 { return None; }
     let n = sdf::scale(local, 1.0 / radius);
     let face = pick_face(n);
     let n_axis = face.normal();
     let (u_axis, v_axis) = face.tangents();
     let axis_dot = sdf::dot(n, n_axis);
-    if axis_dot.abs() <= 1e-12 {
-        return None;
-    }
-    let cube_u = sdf::dot(n, u_axis) / axis_dot;
-    let cube_v = sdf::dot(n, v_axis) / axis_dot;
-    let inner_r = inner_r_local * body_size;
-    let outer_r = outer_r_local * body_size;
-    let shell = outer_r - inner_r;
-    if shell <= 0.0 {
-        return None;
-    }
+    if axis_dot.abs() <= 1e-12 { return None; }
+    let cu = sdf::dot(n, u_axis) / axis_dot;
+    let cv = sdf::dot(n, v_axis) / axis_dot;
+    let inner = inner_r_local * body_size;
+    let outer = outer_r_local * body_size;
+    let shell = outer - inner;
+    if shell <= 0.0 { return None; }
     Some(LocalFacePoint {
         face,
-        un: ((cube_to_ea(cube_u) + 1.0) * 0.5).clamp(0.0, 0.9999999),
-        vn: ((cube_to_ea(cube_v) + 1.0) * 0.5).clamp(0.0, 0.9999999),
-        rn: ((radius - inner_r) / shell).clamp(0.0, 0.9999999),
+        un: ((cube_to_ea(cu) + 1.0) * 0.5).clamp(0.0, 0.9999999),
+        vn: ((cube_to_ea(cv) + 1.0) * 0.5).clamp(0.0, 0.9999999),
+        rn: ((radius - inner) / shell).clamp(0.0, 0.9999999),
         radius,
     })
 }
 
+/// Inverse of `body_point_to_face_space`: rebuild the body-local
+/// world position from face-normalized coords.
 pub fn face_space_to_body_point(
     face: Face,
-    un: f32,
-    vn: f32,
-    rn: f32,
+    un: f32, vn: f32, rn: f32,
     inner_r_local: f32,
     outer_r_local: f32,
     body_size: f32,
@@ -91,13 +101,9 @@ pub fn face_space_to_body_point(
 }
 
 /// Scan a hit path for the first entry whose child is a
-/// `NodeKind::CubedSphereBody` node. Returns the index in `hit_path`
-/// where the body is the child, plus its radii.
-///
-/// Used by both sphere raycast dispatch and AABB reconstruction:
-/// once the body entry is located, callers extract the face slot
-/// from `hit_path[index + 1]` and the per-face-subtree slot indices
-/// from `hit_path[index + 2..]`.
+/// `NodeKind::CubedSphereBody`. Returns the path-index where the body
+/// sits plus its radii. Callers extract face slot from `path[i+1]`
+/// and UVR slots from `path[i+2..]`.
 pub fn find_body_ancestor_in_path(
     library: &NodeLibrary,
     hit_path: &[(NodeId, usize)],

@@ -1,33 +1,27 @@
-//! Cubed-sphere geometry and worldgen helpers.
+//! Cubed-sphere body topology. A spherical body lives inside the
+//! voxel tree as a `NodeKind::CubedSphereBody` node whose 27
+//! children are laid out as:
 //!
-//! The planet lives **inside the voxel tree** as a `NodeKind::
-//! CubedSphereBody` node. Its 27 children carry the planet's
-//! structure:
+//! - **6 face-center slots** (per [`FACE_SLOTS`]) hold the face
+//!   subtrees. Each face subtree's root is tagged
+//!   `NodeKind::CubedSphereFace { face }` so the walker treats slot
+//!   indices as `(u_slot, v_slot, r_slot)` instead of `(x, y, z)`.
+//! - **Center slot** (1, 1, 1) = [`INTERIOR_SLOT`] holds the
+//!   interior filler (uniform core-block subtree).
+//! - The remaining 20 slots are `Empty` — corners and edges of the
+//!   containing cube cell that the sphere doesn't fill.
 //!
-//! - The **6 face-center slots** (per `FACE_SLOTS` below) hold the
-//!   face subtrees. Each face subtree's root is tagged
-//!   `NodeKind::CubedSphereFace { face }` so the shader / CPU
-//!   raycast know to interpret slot indices as `(u_slot, v_slot,
-//!   r_slot)` instead of `(x_slot, y_slot, z_slot)`.
-//! - The **center slot (1, 1, 1)** holds the uniform interior
-//!   filler — a dedup'd chain of `Block(core_block)`.
-//! - The **other 20 slots** are `Empty` (corners and edges of the
-//!   containing cube cell, which the sphere doesn't fill).
-//!
-//! Radii (`inner_r`, `outer_r`) live on the body node's `NodeKind`
-//! and are expressed in the **containing cell's local `[0, 1)`
-//! frame**. The shader scales them by the body cell's render-frame
-//! size at draw time.
-//!
-//! This module is pure geometry + tree construction. It has no
-//! `SphericalPlanet` struct, no parallel raycaster, no separate
-//! GPU buffers — all of that has been replaced by the unified
-//! tree-walk + NodeKind dispatch in the shader and `edit.rs`.
+//! Radii `inner_r`, `outer_r` are stored on the body node in its
+//! containing cell's local `[0, 1)` frame. The shader multiplies by
+//! the body cell's render-frame size at draw time — this is what
+//! keeps the sphere precision-safe at deep zoom.
 
 use super::sdf::{self, Planet, Vec3};
 use super::tree::{
     empty_children, slot_index, uniform_children, Child, NodeId, NodeKind, NodeLibrary,
 };
+
+// ─────────────────────────────────────────────────────────── Face
 
 /// One of the six cube faces.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -56,6 +50,7 @@ impl Face {
         }
     }
 
+    /// Outward-pointing unit normal.
     pub fn normal(self) -> Vec3 {
         match self {
             Face::PosX => [ 1.0,  0.0,  0.0],
@@ -67,6 +62,8 @@ impl Face {
         }
     }
 
+    /// Orthonormal tangents `(u_axis, v_axis)`. Must match the
+    /// shader's `face_u_axis` / `face_v_axis`.
     pub fn tangents(self) -> (Vec3, Vec3) {
         match self {
             Face::PosX => ([ 0.0,  0.0, -1.0], [ 0.0,  1.0,  0.0]),
@@ -79,10 +76,10 @@ impl Face {
     }
 }
 
-/// Slot in a `CubedSphereBody` node's 27-grid that holds each
-/// face's subtree. Indexed by `Face as usize`. The non-face slots
-/// (center + 20 corners/edges) are filled with the interior or
-/// empty respectively.
+// ─────────────────────────────────────────────────── slot layout
+
+/// Body-grid slot index for each face's subtree. Indexed by
+/// `Face as usize`. Mirror of the shader's `face_slot()`.
 pub const FACE_SLOTS: [usize; 6] = [
     slot_index(2, 1, 1), // PosX
     slot_index(0, 1, 1), // NegX
@@ -92,11 +89,13 @@ pub const FACE_SLOTS: [usize; 6] = [
     slot_index(1, 1, 0), // NegZ
 ];
 
-/// Slot in a `CubedSphereBody` node's 27-grid that holds the
-/// interior filler.
+/// Body-grid slot index for the interior filler (body center).
 pub const INTERIOR_SLOT: usize = slot_index(1, 1, 1);
 
-/// A point in cubed-sphere coordinates.
+// ─────────────────────────────────────────────── projection math
+
+/// A point in cubed-sphere coordinates. `u`/`v` are face-local EA
+/// coords in `[-1, 1]²`; `r` is the radial distance from body center.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct CubeSphereCoord {
     pub face: Face,
@@ -105,24 +104,26 @@ pub struct CubeSphereCoord {
     pub r: f32,
 }
 
-/// Convert (face, u, v) → unit direction (equal-angle warp).
+/// Equal-area cube-face warp: the cube-tangent coordinate `c` maps
+/// to the EA coord `e = atan(c) * 4/π`. Flattens pixel stretching.
+#[inline]
+pub fn cube_to_ea(c: f32) -> f32 { c.atan() * (4.0 / std::f32::consts::PI) }
+
+#[inline]
+pub fn ea_to_cube(e: f32) -> f32 { (e * std::f32::consts::FRAC_PI_4).tan() }
+
+/// Face-local (u, v) ∈ [-1, 1]² -> unit direction on the sphere.
 pub fn face_uv_to_dir(face: Face, u: f32, v: f32) -> Vec3 {
-    let cube_u = (u * std::f32::consts::FRAC_PI_4).tan();
-    let cube_v = (v * std::f32::consts::FRAC_PI_4).tan();
+    let cu = ea_to_cube(u);
+    let cv = ea_to_cube(v);
     let n = face.normal();
     let (ua, va) = face.tangents();
     let cube_pt = [
-        n[0] + cube_u * ua[0] + cube_v * va[0],
-        n[1] + cube_u * ua[1] + cube_v * va[1],
-        n[2] + cube_u * ua[2] + cube_v * va[2],
+        n[0] + cu * ua[0] + cv * va[0],
+        n[1] + cu * ua[1] + cv * va[1],
+        n[2] + cu * ua[2] + cv * va[2],
     ];
     sdf::normalize(cube_pt)
-}
-
-/// Inverse of the equal-angle warp.
-#[inline]
-pub fn cube_to_ea(c: f32) -> f32 {
-    c.atan() * (4.0 / std::f32::consts::PI)
 }
 
 /// Pick the dominant cube face for a unit direction.
@@ -134,54 +135,42 @@ pub fn pick_face(n: Vec3) -> Face {
         if n[0] > 0.0 { Face::PosX } else { Face::NegX }
     } else if ay >= az {
         if n[1] > 0.0 { Face::PosY } else { Face::NegY }
-    } else {
-        if n[2] > 0.0 { Face::PosZ } else { Face::NegZ }
-    }
+    } else if n[2] > 0.0 { Face::PosZ } else { Face::NegZ }
 }
 
-/// Given a planet center and a `CubeSphereCoord`, return the
-/// world-space position of that point.
+/// Cube-sphere coord -> world position around `center`.
 pub fn coord_to_world(center: Vec3, c: CubeSphereCoord) -> Vec3 {
     let dir = face_uv_to_dir(c.face, c.u, c.v);
     sdf::add(center, sdf::scale(dir, c.r))
 }
 
-/// World-space position → cubed-sphere coords relative to a center.
+/// World position -> cube-sphere coord relative to `center`. Returns
+/// `None` if the point is exactly at the center (direction undefined).
 pub fn world_to_coord(center: Vec3, pos: Vec3) -> Option<CubeSphereCoord> {
     let d = sdf::sub(pos, center);
     let r = sdf::length(d);
     if r < 1e-12 { return None; }
     let dir = sdf::scale(d, 1.0 / r);
-
-    let ax = dir[0].abs();
-    let ay = dir[1].abs();
-    let az = dir[2].abs();
-    let (face, cube_u, cube_v) = if ax >= ay && ax >= az {
-        if dir[0] > 0.0 { (Face::PosX, -dir[2] / ax,  dir[1] / ax) }
-        else            { (Face::NegX,  dir[2] / ax,  dir[1] / ax) }
-    } else if ay >= az {
-        if dir[1] > 0.0 { (Face::PosY,  dir[0] / ay, -dir[2] / ay) }
-        else            { (Face::NegY,  dir[0] / ay,  dir[2] / ay) }
-    } else {
-        if dir[2] > 0.0 { (Face::PosZ,  dir[0] / az,  dir[1] / az) }
-        else            { (Face::NegZ, -dir[0] / az,  dir[1] / az) }
-    };
-
+    let face = pick_face(dir);
+    let n_axis = face.normal();
+    let (u_axis, v_axis) = face.tangents();
+    let axis_dot = sdf::dot(dir, n_axis);
+    if axis_dot.abs() <= 1e-12 { return None; }
+    let cu = sdf::dot(dir, u_axis) / axis_dot;
+    let cv = sdf::dot(dir, v_axis) / axis_dot;
     Some(CubeSphereCoord {
-        face, u: cube_to_ea(cube_u), v: cube_to_ea(cube_v), r,
+        face, u: cube_to_ea(cu), v: cube_to_ea(cv), r,
     })
 }
 
-/// The eight world-space corners of a block spanning
-/// `[u, u+du] × [v, v+dv] × [r, r+dr]` on `face`, around `center`.
+/// Eight world-space corners of a UVR block on `face` around `center`.
 pub fn block_corners(
-    center: Vec3,
-    face: Face,
+    center: Vec3, face: Face,
     u: f32, v: f32, r: f32,
     du: f32, dv: f32, dr: f32,
 ) -> [Vec3; 8] {
     let mut out = [[0.0; 3]; 8];
-    let coords = [
+    let cs = [
         (u,      v,      r),
         (u + du, v,      r),
         (u,      v + dv, r),
@@ -191,40 +180,35 @@ pub fn block_corners(
         (u,      v + dv, r + dr),
         (u + du, v + dv, r + dr),
     ];
-    for (i, &(cu, cv, cr)) in coords.iter().enumerate() {
+    for (i, &(cu, cv, cr)) in cs.iter().enumerate() {
         out[i] = coord_to_world(center, CubeSphereCoord { face, u: cu, v: cv, r: cr });
     }
     out
 }
 
-/// The twelve edges of a cubed-sphere block as pairs of corner
-/// indices into `block_corners`'s output.
 pub const BLOCK_EDGES: [(usize, usize); 12] = [
     (0, 1), (1, 3), (3, 2), (2, 0),
     (4, 5), (5, 7), (7, 6), (6, 4),
     (0, 4), (1, 5), (2, 6), (3, 7),
 ];
 
-// ────────────────────────────────────────────────── body insertion
+// ───────────────────────────────────────────── body construction
 
-/// Max levels the SDF recursion is allowed to descend into a face
-/// subtree. Below this, each straddling cell commits to solid-or-
-/// empty based on the center sample and wraps the remaining tree
-/// depth in a dedup'd uniform filler.
+/// Max depth the SDF recursion is allowed to descend into a face
+/// subtree. Below this a cell commits to solid-or-empty based on
+/// its center sample and wraps the remaining depth in a dedup'd
+/// uniform filler. Keeps body-insert wall time bounded independent
+/// of requested `depth`.
 const SDF_DETAIL_LEVELS: u32 = 4;
 
-/// Build the 6 face subtrees + interior filler + body node, insert
-/// the body into `lib`, and return its `NodeId`. The caller is
-/// responsible for placing the returned node into a parent (e.g.
-/// at slot 13 of the world root) and bumping its refcount.
+/// Build the six face subtrees + interior filler + body node and
+/// insert it into `lib`. The caller places the returned body id
+/// into some parent cell and bumps its refcount.
 ///
-/// `inner_r` and `outer_r` are in the containing-cell's local
-/// `[0, 1)³` frame (per the spec's §1d). `depth` is the maximum
-/// recursion depth of each face subtree.
-///
-/// The SDF (`sdf`) is sampled in the containing cell's local frame
-/// — its `center` should be `(0.5, 0.5, 0.5)` and its `radius` and
-/// `noise_scale` should be in cell-local units.
+/// `inner_r`, `outer_r` are in the containing cell's `[0, 1)` frame
+/// (so `outer_r <= 0.5` keeps the sphere inside one cell). `depth` is
+/// the face subtree depth — also the maximum edit depth inside the
+/// face.
 pub fn insert_spherical_body(
     lib: &mut NodeLibrary,
     inner_r: f32,
@@ -232,82 +216,67 @@ pub fn insert_spherical_body(
     depth: u32,
     sdf: &Planet,
 ) -> NodeId {
-    debug_assert!(0.0 < inner_r && inner_r < outer_r && outer_r <= 0.5,
-        "radii must satisfy 0 < inner_r < outer_r <= 0.5 (cell-local)");
+    debug_assert!(
+        0.0 < inner_r && inner_r < outer_r && outer_r <= 0.5,
+        "radii must satisfy 0 < inner_r < outer_r <= 0.5 (cell-local)",
+    );
 
-    let body_center: Vec3 = [0.5, 0.5, 0.5]; // body cell-local
+    let body_center: Vec3 = [0.5, 0.5, 0.5];
     let sdf_budget = depth.min(SDF_DETAIL_LEVELS);
 
-    // Build the 6 face subtrees. Each face's TOP node carries
-    // `NodeKind::CubedSphereFace { face }` so downstream walkers
-    // know to interpret slot indices as (u_slot, v_slot, r_slot).
-    // Internal nodes of the face subtree stay Cartesian for dedup
-    // efficiency — their content semantics are determined by the
-    // face root's tag and the sphere DDA always walks them via the
-    // `(un, vn, rn)` sampling convention regardless.
-    let mut face_root_children: [Child; 6] = [Child::Empty; 6];
+    // Build the six face subtrees. Each face's root is tagged
+    // `CubedSphereFace { face }` so walkers treat its children's
+    // slot coordinates as (u_slot, v_slot, r_slot). Internal nodes
+    // stay Cartesian for dedup efficiency — their content semantics
+    // are determined by the face-root tag.
+    let mut face_roots = [Child::Empty; 6];
     for &face in &Face::ALL {
         let child = build_face_subtree(
-            lib, face, body_center, inner_r, outer_r,
+            lib, face, body_center,
+            inner_r, outer_r,
             -1.0, 1.0, -1.0, 1.0, inner_r, outer_r,
             depth, sdf_budget, sdf,
         );
         let face_root_id = match child {
             Child::Node(id) => {
-                // Re-tag the root with CubedSphereFace.
-                let n = lib.get(id).expect("face root just inserted");
-                let children = n.children;
+                let children = lib.get(id).expect("face root just inserted").children;
                 lib.insert_with_kind(children, NodeKind::CubedSphereFace { face })
             }
             Child::Empty => {
-                let empty_children_arr = empty_children();
-                lib.insert_with_kind(empty_children_arr, NodeKind::CubedSphereFace { face })
+                lib.insert_with_kind(empty_children(), NodeKind::CubedSphereFace { face })
             }
             Child::Block(b) => {
-                let uniform = uniform_children(Child::Block(b));
-                lib.insert_with_kind(uniform, NodeKind::CubedSphereFace { face })
+                lib.insert_with_kind(uniform_children(Child::Block(b)), NodeKind::CubedSphereFace { face })
             }
-            // EntityRef can't appear in terrain — sphere worldgen
-            // builds pure terrain. Panic makes a bug here loud.
-            Child::EntityRef(_) => {
-                unreachable!("sphere worldgen should never produce EntityRef")
-            }
+            Child::EntityRef(_) => unreachable!("sphere worldgen never produces EntityRef"),
         };
-        face_root_children[face as usize] = Child::Node(face_root_id);
+        face_roots[face as usize] = Child::Node(face_root_id);
     }
 
-    // Build the body's 27 children. Center = interior filler;
-    // 6 face-center slots = face subtree roots; everything else
-    // = Empty.
-    let mut body_children = empty_children();
+    // Body children: 6 face subtrees, 1 interior, 20 empty.
+    let mut children = empty_children();
     for &face in &Face::ALL {
-        body_children[FACE_SLOTS[face as usize]] = face_root_children[face as usize];
+        children[FACE_SLOTS[face as usize]] = face_roots[face as usize];
     }
-    let interior = lib.build_uniform_subtree(sdf.core_block, depth);
-    body_children[INTERIOR_SLOT] = interior;
+    children[INTERIOR_SLOT] = lib.build_uniform_subtree(sdf.core_block, depth);
 
     lib.insert_with_kind(
-        body_children,
+        children,
         NodeKind::CubedSphereBody { inner_r, outer_r },
     )
 }
 
-/// Recursive builder for one cubed-sphere face's content. Returns
-/// a `Child` so the caller can collapse uniform subtrees up the
-/// chain. The returned Child's content lives in face-local
-/// `(u_slot, v_slot, r_slot)` interpretation; the caller wraps the
-/// face root with `CubedSphereFace` kind.
-///
-/// `sdf` is sampled in body cell-local coords (the body cell spans
-/// `[0, 1)³`). `body_center` is `(0.5, 0.5, 0.5)`. `body_inner_r`
-/// and `body_outer_r` parameterize the radial extent in the same
-/// frame.
+/// Recursive SDF-driven face subtree builder. Samples the SDF at the
+/// current cell's center; if the cell is fully outside or fully
+/// inside the influence radius, commits to a uniform subtree at that
+/// depth. Otherwise subdivides into 27 children at `(u_slot, v_slot,
+/// r_slot)` until `depth == 0` or `sdf_budget == 0`.
+#[allow(clippy::too_many_arguments)]
 fn build_face_subtree(
     lib: &mut NodeLibrary,
     face: Face,
     body_center: Vec3,
-    _body_inner_r: f32,
-    _body_outer_r: f32,
+    body_inner_r: f32, body_outer_r: f32,
     u_lo: f32, u_hi: f32,
     v_lo: f32, v_hi: f32,
     r_lo: f32, r_hi: f32,
@@ -315,10 +284,10 @@ fn build_face_subtree(
     sdf_budget: u32,
     sdf: &Planet,
 ) -> Child {
-    let u_c = 0.5 * (u_lo + u_hi);
-    let v_c = 0.5 * (v_lo + v_hi);
-    let r_c = 0.5 * (r_lo + r_hi);
-    let p_center = coord_to_world(body_center, CubeSphereCoord { face, u: u_c, v: v_c, r: r_c });
+    let uc = 0.5 * (u_lo + u_hi);
+    let vc = 0.5 * (v_lo + v_hi);
+    let rc = 0.5 * (r_lo + r_hi);
+    let p_center = coord_to_world(body_center, CubeSphereCoord { face, u: uc, v: vc, r: rc });
     let d_center = sdf.distance(p_center);
 
     let du = u_hi - u_lo;
@@ -328,10 +297,12 @@ fn build_face_subtree(
     let radial_half = 0.5 * dr;
     let cell_rad = (lateral_half * lateral_half + radial_half * radial_half).sqrt();
 
+    // Fully outside the SDF surface — uniform empty.
     if d_center > cell_rad {
         if depth == 0 { return Child::Empty; }
-        return Child::Node(build_uniform_empty(lib, depth));
+        return Child::Node(uniform_empty(lib, depth));
     }
+    // Fully inside — uniform block.
     if d_center < -cell_rad {
         let b = sdf.block_at(p_center);
         if depth == 0 { return Child::Block(b); }
@@ -349,7 +320,7 @@ fn build_face_subtree(
         return if d_center < 0.0 {
             lib.build_uniform_subtree(sdf.block_at(p_center), depth)
         } else {
-            Child::Node(build_uniform_empty(lib, depth))
+            Child::Node(uniform_empty(lib, depth))
         };
     }
 
@@ -364,7 +335,8 @@ fn build_face_subtree(
                 let rs_lo = r_lo + dr * (rs as f32) / 3.0;
                 let rs_hi = r_lo + dr * (rs as f32 + 1.0) / 3.0;
                 children[slot_index(us, vs, rs)] = build_face_subtree(
-                    lib, face, body_center, _body_inner_r, _body_outer_r,
+                    lib, face, body_center,
+                    body_inner_r, body_outer_r,
                     us_lo, us_hi, vs_lo, vs_hi, rs_lo, rs_hi,
                     depth - 1, sdf_budget - 1, sdf,
                 );
@@ -374,7 +346,7 @@ fn build_face_subtree(
     Child::Node(lib.insert(children))
 }
 
-fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
+fn uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
     let mut id = lib.insert(empty_children());
     for _ in 1..depth {
         id = lib.insert(uniform_children(Child::Node(id)));
@@ -382,7 +354,7 @@ fn build_uniform_empty(lib: &mut NodeLibrary, depth: u32) -> NodeId {
     id
 }
 
-// ────────────────────────────────────────────────────────────── tests
+// ──────────────────────────────────────────────────────── tests
 
 #[cfg(test)]
 mod tests {
@@ -397,32 +369,29 @@ mod tests {
     #[test]
     fn face_center_matches_normal() {
         for &f in &Face::ALL {
-            let dir = face_uv_to_dir(f, 0.0, 0.0);
-            assert!(approx_v(dir, f.normal()));
+            assert!(approx_v(face_uv_to_dir(f, 0.0, 0.0), f.normal()));
         }
     }
 
     #[test]
     fn face_corners_are_unit_vectors() {
         for &f in &Face::ALL {
-            for &(u, v) in &[(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0),
-                              (0.5, -0.3), (0.0, 0.0)] {
-                let d = face_uv_to_dir(f, u, v);
-                assert!(approx(sdf::length(d), 1.0));
+            for &(u, v) in &[(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (0.5, -0.3)] {
+                assert!(approx(sdf::length(face_uv_to_dir(f, u, v)), 1.0));
             }
         }
     }
 
     #[test]
-    fn world_to_coord_inverts_coord_to_world() {
+    fn world_coord_round_trip() {
         let center = [0.5, 0.5, 0.5];
         for &(face, u, v, r) in &[
             (Face::PosX, 0.0, 0.0, 0.3),
             (Face::NegY, 0.3, -0.7, 0.45),
             (Face::PosZ, -0.9, 0.9, 0.15),
         ] {
-            let world = coord_to_world(center, CubeSphereCoord { face, u, v, r });
-            let back = world_to_coord(center, world).unwrap();
+            let w = coord_to_world(center, CubeSphereCoord { face, u, v, r });
+            let back = world_to_coord(center, w).unwrap();
             assert_eq!(back.face, face);
             assert!(approx(back.u, u));
             assert!(approx(back.v, v));
@@ -431,48 +400,35 @@ mod tests {
     }
 
     #[test]
-    fn insert_body_creates_body_node_with_face_children() {
+    fn insert_body_has_face_and_interior_children() {
         let mut lib = NodeLibrary::default();
         let sdf = Planet {
-            center: [0.5, 0.5, 0.5],
-            radius: 0.32,
+            center: [0.5, 0.5, 0.5], radius: 0.32,
             noise_scale: 0.0, noise_freq: 1.0, noise_seed: 0,
             gravity: 0.0, influence_radius: 1.0,
             surface_block: block::GRASS, core_block: block::STONE,
         };
-        let body_id = insert_spherical_body(&mut lib, 0.12, 0.45, 6, &sdf);
-        let body = lib.get(body_id).expect("body node exists");
-        assert!(matches!(body.kind, NodeKind::CubedSphereBody { .. }));
-        // Each of the 6 face-center slots holds a face subtree.
+        let body = insert_spherical_body(&mut lib, 0.12, 0.45, 6, &sdf);
+        let node = lib.get(body).unwrap();
+        assert!(matches!(node.kind, NodeKind::CubedSphereBody { .. }));
         for &face in &Face::ALL {
             let slot = FACE_SLOTS[face as usize];
-            match body.children[slot] {
-                Child::Node(face_id) => {
-                    let face_node = lib.get(face_id).expect("face root exists");
-                    match face_node.kind {
-                        NodeKind::CubedSphereFace { face: f } => assert_eq!(f, face),
-                        _ => panic!("face slot {slot} not a CubedSphereFace"),
-                    }
-                }
+            match node.children[slot] {
+                Child::Node(id) => match lib.get(id).unwrap().kind {
+                    NodeKind::CubedSphereFace { face: f } => assert_eq!(f, face),
+                    _ => panic!("face slot {slot} not a CubedSphereFace"),
+                },
                 _ => panic!("face slot {slot} not a Node"),
             }
         }
-        // Center slot is interior filler (uniform stone subtree).
-        match body.children[INTERIOR_SLOT] {
-            Child::Node(id) => {
-                let n = lib.get(id).unwrap();
-                assert_eq!(n.uniform_type, block::STONE);
-            }
+        match node.children[INTERIOR_SLOT] {
+            Child::Node(id) => assert_eq!(lib.get(id).unwrap().uniform_type, block::STONE),
             Child::Block(b) => assert_eq!(b, block::STONE),
-            Child::Empty => panic!("interior slot is empty"),
-            Child::EntityRef(_) => panic!("interior slot is an entity ref"),
+            _ => panic!("interior slot missing"),
         }
-        // The 20 other slots are Empty.
         for slot in 0..27 {
-            if slot == INTERIOR_SLOT { continue; }
-            if FACE_SLOTS.contains(&slot) { continue; }
-            assert!(matches!(body.children[slot], Child::Empty),
-                "slot {slot} should be Empty");
+            if slot == INTERIOR_SLOT || FACE_SLOTS.contains(&slot) { continue; }
+            assert!(matches!(node.children[slot], Child::Empty));
         }
     }
 }
