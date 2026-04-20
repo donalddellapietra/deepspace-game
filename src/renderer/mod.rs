@@ -125,6 +125,20 @@ pub struct Renderer {
     /// except slot 8 is bound to `dummy_mask_view` instead of
     /// `mask_view`.
     pub(super) coarse_bind_group: wgpu::BindGroup,
+    /// Depth-stencil texture at full swapchain resolution. Stencil
+    /// is written by `stencil_prep_pipeline` (1 = march this pixel,
+    /// 0 = cull). The main march pipeline's `Equal(1)` stencil test
+    /// kills culled fragments before fragment-shader dispatch — so
+    /// warps entirely inside a culled region skip the shader body
+    /// entirely, eliminating the sky-vs-march divergence cost.
+    /// Recreated on resize alongside `mask_view`.
+    pub(super) stencil_texture: wgpu::Texture,
+    pub(super) stencil_view: wgpu::TextureView,
+    /// Stencil-prep pipeline. Reads `coarse_mask` (5-tap
+    /// neighborhood) and either `discard`s the fragment (no stencil
+    /// write → stencil stays 0) or lets it pass (stencil write = 1
+    /// via `stencil_op_pass = Replace`). No color output.
+    pub(super) stencil_prep_pipeline: wgpu::RenderPipeline,
     /// Second ray-march pipeline compiled to the TAAU entry point
     /// (`fs_main_taa`) with two color attachments — linear RGBA16F
     /// color and R32F hit-t. `None` when TAAU is disabled; the draw
@@ -241,6 +255,11 @@ impl Renderer {
             self::init::create_mask_texture(&self.device, width, height);
         self.mask_texture = mask_texture;
         self.mask_view = mask_view;
+        // Stencil is at full swapchain resolution.
+        let (stencil_texture, stencil_view) =
+            self::init::create_stencil_texture(&self.device, width, height);
+        self.stencil_texture = stencil_texture;
+        self.stencil_view = stencil_view;
         self.bind_group = self::buffers::make_bind_group(
             &self.device, &self.bind_group_layout,
             &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,

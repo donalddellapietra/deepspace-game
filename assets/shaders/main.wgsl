@@ -145,17 +145,27 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Beam-prepass cull. The coarse pass (fs_coarse_mask) marks
-    // tiles that might hit content (1.0) vs definitely sky (0.0).
-    // Sample a 5-tap neighborhood (center + 4 cardinal) so tiles
-    // adjacent to a hit stay in the full-march path — this is the
-    // on-the-fly conservative dilation that keeps silhouettes from
-    // eroding.
-    //
-    // When every tap reads 0, no ray near this tile hit anything.
-    // Early-out with the sky color and skip the register-heavy
-    // `march()` entirely. Saves the dominant cost for the ~88 % of
-    // rays that miss on Jerusalem nucleus.
+    // Stencil pre-pass has already killed culled pixels before this
+    // shader is dispatched — see `fs_stencil_prep`. Every fragment
+    // that reaches here is in a "march" tile, so no mask branch is
+    // needed. Warps entirely inside a sky region never execute this
+    // shader body at all (early stencil test); warps on the
+    // cull-boundary run with the dead lanes permanently masked off
+    // but the surviving lanes all take the same march path — no
+    // intra-warp divergence between sky and march.
+    let shaded = shade_pixel(in.uv);
+    return vec4<f32>(shaded.rgb, 1.0);
+}
+
+/// Stencil-prep fragment. Runs at full resolution, no color output.
+/// Reads the 5-tap coarse-mask neighborhood (same dilation the old
+/// fs_main used to compute inline) and either `discard`s (stencil
+/// stays at the pass's clear value of 0 → pixel is culled from the
+/// subsequent march pass) or lets the fragment pass (`pass_op =
+/// Replace` writes the stencil reference value of 1 → pixel reaches
+/// the march shader).
+@fragment
+fn fs_stencil_prep(in: VertexOutput) {
     let tile = vec2<i32>(in.position.xy / f32(BEAM_TILE_SIZE));
     let m00 = textureLoad(coarse_mask, tile, 0).r;
     let m10 = textureLoad(coarse_mask, tile + vec2<i32>(1, 0), 0).r;
@@ -164,12 +174,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let m0n = textureLoad(coarse_mask, tile + vec2<i32>(0, -1), 0).r;
     let any_hit = max(max(max(m00, m10), max(mn0, m01)), m0n);
     if any_hit < 0.5 {
-        let ray_dir = jittered_ray_dir(in.uv);
-        return vec4<f32>(sky_color(ray_dir), 1.0);
+        discard;
     }
-
-    let shaded = shade_pixel(in.uv);
-    return vec4<f32>(shaded.rgb, 1.0);
 }
 
 /// Coarse beam-prepass fragment. One ray per BEAM_TILE_SIZE×BEAM_TILE_SIZE
