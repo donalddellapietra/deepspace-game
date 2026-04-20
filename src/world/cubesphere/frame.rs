@@ -189,6 +189,222 @@ impl FaceFrame {
         }
         self
     }
+
+    /// Compute Δt from a ray (in body-local, sphere-centered coords)
+    /// to each of the 6 boundaries of the sub-cell at slot
+    /// `(us, vs, rs)` within this frame, return the minimum
+    /// positive Δt and which side it crossed.
+    ///
+    /// `ray_o_centered` — ray origin body-local, relative to sphere
+    /// center. Ray direction `ray_dir` should be unit length.
+    ///
+    /// The returned `t_next` is an ABSOLUTE ray-t (not a Δt). The
+    /// caller is responsible for gating on `t_next > t_current +
+    /// eps`. That design keeps this function stateless — it doesn't
+    /// know the DDA's current t.
+    ///
+    /// Precision: the u/v plane intersection uses the factored form
+    ///   t = −(n_base · o + K · n_delta · o) / (n_base · d + K · n_delta · d)
+    /// which at deep depth has `K · n_delta` smaller than f32 eps of
+    /// `n_base`, so the sum rounds to `n_base` and t(K=0) = t(K=1)
+    /// = … = same value. That is: absolute plane intersection t
+    /// collapses to the same value for every K at deep depth — this
+    /// is expected. The DDA must NOT use this for cell stepping at
+    /// deep depth. Use [`CellBoundaries::delta_t_cross_product`]
+    /// instead, which returns precise per-cell Δt via the cross-
+    /// product identity.
+    pub fn absolute_boundary_ts(
+        &self,
+        ray_o_centered: [f32; 3],
+        ray_dir: [f32; 3],
+        us: u32,
+        vs: u32,
+        rs: u32,
+    ) -> CellBoundaries {
+        let (us_f, vs_f, rs_f) = (us as f32, vs as f32, rs as f32);
+        let n_u_lo = add_scale(self.n_base_u, self.n_delta_u, us_f);
+        let n_u_hi = add_scale(self.n_base_u, self.n_delta_u, us_f + 1.0);
+        let n_v_lo = add_scale(self.n_base_v, self.n_delta_v, vs_f);
+        let n_v_hi = add_scale(self.n_base_v, self.n_delta_v, vs_f + 1.0);
+        let r_lo = self.r_base + rs_f * self.r_delta;
+        let r_hi = self.r_base + (rs_f + 1.0) * self.r_delta;
+
+        CellBoundaries {
+            ray_o_centered,
+            ray_dir,
+            n_u_lo,
+            n_u_hi,
+            n_v_lo,
+            n_v_hi,
+            r_lo,
+            r_hi,
+        }
+    }
+}
+
+/// The 6 boundaries of a sub-cell in body-local. Supports
+/// both absolute ray-t calculation and precision-safe per-cell Δt
+/// computation via cross-product for deep-depth cells.
+#[derive(Copy, Clone, Debug)]
+pub struct CellBoundaries {
+    pub ray_o_centered: [f32; 3],
+    pub ray_dir: [f32; 3],
+    pub n_u_lo: [f32; 3],
+    pub n_u_hi: [f32; 3],
+    pub n_v_lo: [f32; 3],
+    pub n_v_hi: [f32; 3],
+    pub r_lo: f32,
+    pub r_hi: f32,
+}
+
+/// One candidate cell boundary crossing, identified by its `side`
+/// index (0 = u_lo, 1 = u_hi, 2 = v_lo, 3 = v_hi, 4 = r_lo,
+/// 5 = r_hi) and either its absolute `t` along the ray or the
+/// precision-stable `delta_t` from a reference plane.
+#[derive(Copy, Clone, Debug)]
+pub struct BoundaryHit {
+    pub side: u32,
+    pub t: f32,
+}
+
+impl CellBoundaries {
+    /// Ray-plane `t` to a plane with normal `n` passing through the
+    /// sphere center. Returns `f32::INFINITY` for a near-parallel
+    /// ray so `min`-picking correctly skips it.
+    #[inline]
+    fn plane_t(&self, n: [f32; 3]) -> f32 {
+        let denom = dot(self.ray_dir, n);
+        if denom.abs() < 1e-12 { return f32::INFINITY; }
+        -dot(self.ray_o_centered, n) / denom
+    }
+
+    /// Ray-sphere entry/exit t for a concentric sphere of `radius`,
+    /// picking the smallest t > `after`. Uses the
+    /// Numerical-Recipes-stable form to avoid catastrophic
+    /// cancellation for rays tangent to the sphere.
+    #[inline]
+    fn sphere_t_after(&self, radius: f32, after: f32) -> f32 {
+        let b = dot(self.ray_o_centered, self.ray_dir);
+        let c = dot(self.ray_o_centered, self.ray_o_centered) - radius * radius;
+        let disc = b * b - c;
+        if disc < 0.0 { return f32::INFINITY; }
+        let sq = disc.sqrt();
+        let s = if b >= 0.0 { 1.0 } else { -1.0 };
+        let q = -b - s * sq;
+        if q.abs() < 1e-30 { return f32::INFINITY; }
+        let t0 = q;
+        let t1 = c / q;
+        let t_lo = t0.min(t1);
+        let t_hi = t0.max(t1);
+        if t_lo > after { t_lo } else if t_hi > after { t_hi } else { f32::INFINITY }
+    }
+
+    /// All 6 absolute ray-t values, in order: u_lo, u_hi, v_lo,
+    /// v_hi, r_lo, r_hi. Intended for shallow-depth usage. At deep
+    /// depth, absolute t's for adjacent planes collapse to the same
+    /// f32 value — use per-cell Δt via cross-product instead.
+    pub fn all_ts(&self, t_after: f32) -> [f32; 6] {
+        [
+            self.plane_t(self.n_u_lo),
+            self.plane_t(self.n_u_hi),
+            self.plane_t(self.n_v_lo),
+            self.plane_t(self.n_v_hi),
+            self.sphere_t_after(self.r_lo, t_after),
+            self.sphere_t_after(self.r_hi, t_after),
+        ]
+    }
+
+    /// Pick the smallest `t > t_after` among all 6 boundaries.
+    /// Returns `None` if none is in front of the ray. At depths
+    /// where absolute t's collapse, prefer `next_boundary_delta`
+    /// instead.
+    pub fn next_boundary_absolute(&self, t_after: f32) -> Option<BoundaryHit> {
+        let ts = self.all_ts(t_after);
+        let mut best: Option<BoundaryHit> = None;
+        for (side, &t) in ts.iter().enumerate() {
+            if !(t > t_after) { continue; }
+            if best.map_or(true, |b| t < b.t) {
+                best = Some(BoundaryHit { side: side as u32, t });
+            }
+        }
+        best
+    }
+}
+
+// ────────────── precision-stable per-cell Δt between two planes
+
+/// Cross-product Δt from the plane with normal `n_base + K0 ·
+/// n_delta` to the plane with normal `n_base + K1 · n_delta`,
+/// given ray origin/dir and the plane pair.
+///
+/// Expands to
+///   Δt = (K1 − K0) · (A · b − B · a) / ((B + K0·b) · (B + K1·b))
+/// where (A, B, a, b) = (o · n_base, d · n_base, o · n_delta,
+/// d · n_delta). The numerator is a difference of two O(|n_delta|)
+/// products — no cancellation against O(|n_base|) terms. Preserves
+/// f32 precision at arbitrary depth.
+#[inline]
+pub fn delta_t_cross_product(
+    n_base: [f32; 3],
+    n_delta: [f32; 3],
+    ray_o_centered: [f32; 3],
+    ray_dir: [f32; 3],
+    k0: f32,
+    k1: f32,
+) -> f32 {
+    let big_a = dot(ray_o_centered, n_base);
+    let big_b = dot(ray_dir, n_base);
+    let sm_a = dot(ray_o_centered, n_delta);
+    let sm_b = dot(ray_dir, n_delta);
+    let num = (k1 - k0) * (big_a * sm_b - big_b * sm_a);
+    let den = (big_b + k0 * sm_b) * (big_b + k1 * sm_b);
+    if den.abs() < 1e-30 { return f32::INFINITY; }
+    num / den
+}
+
+/// Cross-product rationalized Δt for radial (ray-sphere) boundaries
+/// between two concentric spheres `r_a = r_base + K0 · r_delta` and
+/// `r_b = r_base + K1 · r_delta`. Uses the identity
+///   √D_b − √D_a = (D_b − D_a) / (√D_b + √D_a)
+/// where D = b² − |o|² + r², so
+///   D_b − D_a = r_b² − r_a² = (r_b + r_a)(r_b − r_a) =
+///               (2·r_base + (K0+K1)·r_delta) · (K1 − K0) · r_delta
+/// The numerator holds only small terms; denominator is O(√D₀).
+/// Picks the appropriate root pair based on ray direction.
+#[inline]
+pub fn delta_t_radial(
+    ray_o_centered: [f32; 3],
+    ray_dir: [f32; 3],
+    r_base: f32,
+    r_delta: f32,
+    k0: f32,
+    k1: f32,
+    is_exit_root: bool,
+) -> f32 {
+    let b_ray = dot(ray_o_centered, ray_dir);
+    let oo = dot(ray_o_centered, ray_o_centered);
+    let r_a = r_base + k0 * r_delta;
+    let r_b = r_base + k1 * r_delta;
+    let d_a = b_ray * b_ray - oo + r_a * r_a;
+    let d_b = b_ray * b_ray - oo + r_b * r_b;
+    if d_a < 0.0 || d_b < 0.0 { return f32::INFINITY; }
+    let num = (k1 - k0) * r_delta * (2.0 * r_base + (k0 + k1) * r_delta);
+    let den = d_b.sqrt() + d_a.sqrt();
+    if den.abs() < 1e-30 { return f32::INFINITY; }
+    let sign = if is_exit_root { 1.0 } else { -1.0 };
+    sign * num / den
+}
+
+// ─────────────────────────────────────────── tiny vector helpers
+
+#[inline]
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+#[inline]
+fn add_scale(a: [f32; 3], b: [f32; 3], s: f32) -> [f32; 3] {
+    [a[0] + s * b[0], a[1] + s * b[1], a[2] + s * b[2]]
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -653,3 +869,102 @@ mod face_frame_tests {
         assert_eq!(one.depth, two.depth);
     }
 }
+
+// ────────────────── tests: DDA helpers (step_ray_in_cell, Δt)
+
+#[cfg(test)]
+mod dda_helper_tests {
+    use super::*;
+
+    /// At shallow depth (face root), absolute-t boundary calculation
+    /// works — the planes are well separated in f32.
+    #[test]
+    fn absolute_ts_at_face_root_are_distinct() {
+        let f = FaceFrame::at_face_root(Face::PosX, 0.45, 0.50);
+        // Ray from outside along +X, slight tilt.
+        let o = [0.8_f32, 0.1, 0.05];
+        let d = {
+            let v = [-1.0_f32, 0.05, 0.02];
+            let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            [v[0] / n, v[1] / n, v[2] / n]
+        };
+        let b = f.absolute_boundary_ts(o, d, 1, 1, 0);
+        // Four u/v plane t's should be finite and not all equal.
+        let ts = b.all_ts(0.0);
+        let mut any_diff = false;
+        for i in 1..4 {
+            if (ts[i] - ts[0]).abs() > 1e-6 { any_diff = true; }
+        }
+        assert!(any_diff, "at face root, u/v plane t's should be distinguishable; got {ts:?}");
+    }
+
+    /// Cross-product Δt between adjacent u-planes at depth 40 gives
+    /// the same value whether computed from (K0=0, K1=1) or from
+    /// (K0=2, K1=3) — both are one-cell spans, and the ribbon-pop
+    /// gives the same local-to-local Δ regardless of which slot.
+    ///
+    /// (Actually they differ by second-order warp, but at depth 40
+    /// the difference is far below f32 — checking they're both
+    /// non-zero and same sign is the useful gate.)
+    #[test]
+    fn cross_product_delta_t_survives_at_depth_40() {
+        // Build a FaceFrame via ribbon-pop to depth 40 from PosX
+        // face root, slot pattern [2, 0] repeated (biases toward
+        // u_face = 0.75, u_ea ≈ 0.5).
+        let mut f = FaceFrame::at_face_root(Face::PosX, 0.45, 0.50);
+        for i in 0..40usize {
+            let s = if i % 2 == 0 { 2 } else { 0 };
+            f = f.descend(s, s, 1); // rs=1 keeps us mid-shell radially
+        }
+
+        // Ray: body-local, sphere-centered, aimed at the face.
+        // PosX normal = (1,0,0), so from outside looking -X.
+        let o = [0.45_f32, 0.0, 0.0];
+        let d = {
+            let v = [-1.0_f32, 0.01, 0.01];
+            let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            [v[0] / n, v[1] / n, v[2] / n]
+        };
+
+        // Cross-product Δt from K=0 to K=1 on u axis.
+        let dt_01 = delta_t_cross_product(f.n_base_u, f.n_delta_u, o, d, 0.0, 1.0);
+        let dt_12 = delta_t_cross_product(f.n_base_u, f.n_delta_u, o, d, 1.0, 2.0);
+
+        // Both must be finite, non-zero, same sign.
+        assert!(dt_01.is_finite() && dt_01.abs() > 0.0,
+            "Δt(K0→K1) at depth 40 should be nonzero; got {dt_01:e}");
+        assert!(dt_12.is_finite() && dt_12.abs() > 0.0,
+            "Δt(K1→K2) at depth 40 should be nonzero; got {dt_12:e}");
+        assert_eq!(dt_01.signum(), dt_12.signum(),
+            "adjacent Δt's should have same sign; got {dt_01:e} vs {dt_12:e}");
+
+        // They should be roughly equal (within 10% — second-order
+        // warp variation is small within a single frame at depth 40).
+        let rel_diff = ((dt_01 - dt_12) / dt_01).abs();
+        assert!(rel_diff < 0.1,
+            "adjacent Δt's should be close at depth 40; got {dt_01:e} vs {dt_12:e} (rel={rel_diff:.3e})");
+
+        // Control: the factored absolute form collapses.
+        let b40 = f.absolute_boundary_ts(o, d, 0, 0, 1);
+        let ts = b40.all_ts(0.0);
+        assert_eq!(ts[0], ts[1],
+            "at depth 40, absolute u_lo and u_hi plane t's must collapse; got {}, {}",
+            ts[0], ts[1]);
+    }
+
+    /// Radial rationalized Δt at depth 40 is precision-stable.
+    #[test]
+    fn radial_delta_t_survives_at_depth_40() {
+        let mut f = FaceFrame::at_face_root(Face::PosX, 0.45, 0.50);
+        for _ in 0..40 { f = f.descend(1, 1, 1); }
+
+        // Ray from outside looking through the body along -X.
+        let o = [0.8_f32, 0.0, 0.0];
+        let d = [-1.0_f32, 0.0, 0.0];
+
+        let dt = delta_t_radial(o, d, f.r_base, f.r_delta, 0.0, 1.0, false);
+        assert!(dt.is_finite() && dt.abs() > 0.0,
+            "radial Δt at depth 40 should be nonzero; got {dt:e}");
+    }
+}
+
