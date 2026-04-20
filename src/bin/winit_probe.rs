@@ -53,7 +53,7 @@ impl ApplicationHandler for ProbeApp {
     }
 }
 
-fn main() {
+pub fn main() {
     eprintln!("probe: begin");
     let event_loop = {
         let mut builder = EventLoop::builder();

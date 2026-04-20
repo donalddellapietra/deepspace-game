@@ -9,6 +9,7 @@ pub mod fractals;
 pub mod gpu;
 pub mod palette;
 pub mod raycast;
+pub mod scene;
 pub mod scenes;
 pub mod sdf;
 pub mod spherical_worldgen;

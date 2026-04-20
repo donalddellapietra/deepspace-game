@@ -88,6 +88,21 @@ pub struct TestConfig {
     /// See `docs/testing/proposed-perf-speedups.md` and the TAAU
     /// discussion in this session's chat log.
     pub taa: bool,
+    /// How entities are rendered.
+    /// `--entity-render ray-march` (default): entities live in the
+    /// world tree as `Child::EntityRef` cells; the ray-march
+    /// dispatches into their voxel subtrees. Decent to ~1k.
+    /// `--entity-render raster`: instanced mesh raster pass (landed
+    /// in a later commit on this branch). Incompatible with TAA.
+    pub entity_render_mode: crate::renderer::EntityRenderMode,
+    /// Load a `.vox` or `.vxs` file as a visual entity and spawn it
+    /// one cell in front of the camera at startup. Used by the
+    /// entity-visibility test suite to place a known-shape entity
+    /// deterministically without scripted interaction.
+    pub spawn_entity: Option<std::path::PathBuf>,
+    /// Number of copies of `spawn_entity` to place. Defaults to 1;
+    /// higher values arrange them in a grid in front of the camera.
+    pub spawn_entity_count: u32,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -289,6 +304,35 @@ impl TestConfig {
                     cfg.live_sample_every_frames = args.next().and_then(|v| v.parse().ok());
                 }
                 "--taa" => { cfg.taa = true; }
+                "--spawn-entity" => {
+                    if let Some(p) = args.next() {
+                        cfg.spawn_entity = Some(std::path::PathBuf::from(p));
+                        if cfg.spawn_entity_count == 0 {
+                            cfg.spawn_entity_count = 1;
+                        }
+                    }
+                }
+                "--spawn-entity-count" => {
+                    cfg.spawn_entity_count = args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                }
+                "--entity-render" => {
+                    if let Some(v) = args.next() {
+                        cfg.entity_render_mode = match v.as_str() {
+                            "ray-march" | "raymarch" => {
+                                crate::renderer::EntityRenderMode::RayMarch
+                            }
+                            "raster" => crate::renderer::EntityRenderMode::Raster,
+                            other => {
+                                eprintln!(
+                                    "--entity-render: unknown value {other:?} (expected ray-march|raster)",
+                                );
+                                crate::renderer::EntityRenderMode::RayMarch
+                            }
+                        };
+                    }
+                }
                 _ => {}
             }
         }

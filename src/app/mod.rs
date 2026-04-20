@@ -200,6 +200,22 @@ pub struct App {
     /// Whether TAAU is enabled. Threaded to `Renderer::new` so the
     /// live and harness paths share the same resolve setup.
     pub(super) taa_enabled: bool,
+    /// How entities render — ray-march through tag=3 (default) or
+    /// instanced raster (landed later). Set from CLI
+    /// `--entity-render` and baked into Renderer::new.
+    pub(super) entity_render_mode: crate::renderer::EntityRenderMode,
+    /// World-coordinate Y where entities naturally rest. `Some` for
+    /// flat worlds (sea level = a specific Y); `None` for sphere/
+    /// fractal worlds where "resting height" is position-dependent.
+    /// Consumed by `EntityStore::tick` to zero out the Y velocity
+    /// component so entities stay on the ground they spawned on.
+    pub(super) entity_surface_y: Option<f32>,
+    /// Cached subtree NodeId for the soldier model loaded from
+    /// `assets/vox/soldier.vox` on first `spawn_test_entities` call.
+    /// `None` until the first press of N or M. Caches the parsed
+    /// model so repeat presses don't re-read the .vox file or
+    /// re-register palette entries.
+    pub(super) cached_soldier_subtree: Option<crate::world::tree::NodeId>,
     /// Block-interaction radius in anchor-cell units. Caps the
     /// cursor raycast distance so break/place only succeed when
     /// the target is within `interaction_radius × anchor_cell_size`
@@ -238,6 +254,15 @@ pub struct App {
     /// fine detail along the edit path visible, even when the camera
     /// is far enough from the surface that LOD would normally collapse it.
     pub(super) last_edit_slots: Option<Path>,
+    /// All live entities. Flat Vec, no ECS — the old npc-instancing
+    /// branch's 40× perf-over-ECS lesson. Visual content shared via
+    /// `NodeLibrary`; position + override state per-entity.
+    pub(super) entities: crate::world::entities::EntityStore,
+    /// Scene root NodeId from the last `upload_tree_lod`. Held via
+    /// `NodeLibrary::ref_inc` so its ephemeral ancestor chain
+    /// survives between frames; released on the next upload when the
+    /// new scene root replaces it.
+    pub(super) active_scene_root: Option<crate::world::tree::NodeId>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -294,6 +319,8 @@ impl App {
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let taa_enabled = test_cfg.taa;
+        let entity_render_mode = test_cfg.entity_render_mode;
+        let entity_surface_y = bootstrap::surface_y_for_preset(&test_cfg.world_preset);
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
         // Pass the raw `Option` through so each preset's
@@ -372,7 +399,13 @@ impl App {
             spawn_yaw, spawn_pitch,
         );
 
-        Self {
+        // Pull spawn-entity fields out of `test_cfg` before
+        // `from_config` consumes it, so the init-time entity spawn
+        // can run after the struct is fully built.
+        let spawn_entity_path = test_cfg.spawn_entity.clone();
+        let spawn_entity_count = test_cfg.spawn_entity_count;
+
+        let mut app = Self {
             window: None,
             renderer: None,
             camera: Camera {
@@ -415,6 +448,9 @@ impl App {
             lod_pixel_threshold,
             live_sample_every_frames,
             taa_enabled,
+            entity_render_mode,
+            entity_surface_y,
+            cached_soldier_subtree: None,
             interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
@@ -428,6 +464,8 @@ impl App {
             last_crosshair_sent: None,
             cached_highlight: None,
             last_edit_slots: None,
+            entities: crate::world::entities::EntityStore::new(),
+            active_scene_root: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -435,7 +473,12 @@ impl App {
             proxy,
             renderer_init_started: false,
             pending_init: None,
+        };
+        if let Some(ref path) = spawn_entity_path {
+            let count = spawn_entity_count.max(1);
+            app.spawn_vox_entity_at_init(path, count);
         }
+        app
     }
 
     #[inline]
@@ -485,6 +528,13 @@ impl App {
 
     pub(super) fn update(&mut self, dt: f32) {
         player::update(&mut self.camera, dt);
+        // Advance entities by velocity * dt. WorldPos renormalizes
+        // so cell-boundary crossings are handled transparently; on
+        // worlds with a defined sea level, `tick` zeroes the Y
+        // velocity so entities don't drift off the ground.
+        if !self.entities.is_empty() {
+            self.entities.tick(&self.world.library, dt, self.entity_surface_y);
+        }
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
             renderer.update_camera(&cam_gpu);

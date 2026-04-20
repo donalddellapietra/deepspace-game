@@ -8,6 +8,7 @@
 
 mod break_place;
 mod highlight;
+mod spawn;
 pub(crate) mod upload;
 mod zoom;
 

@@ -14,6 +14,26 @@ mod taa;
 pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
 pub use taa::{FrameSignature, TaaState};
 
+/// How entities are rendered. Chosen at startup via
+/// `--entity-render` and baked into the Renderer (pipelines and
+/// buffers are allocated accordingly). Mutating at runtime isn't
+/// supported — a toggle would require rebuilding the ray-march
+/// pipeline and reallocating the depth texture.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum EntityRenderMode {
+    #[default]
+    /// Entities enter the tree as `Child::EntityRef(idx)` and are
+    /// ray-marched through the tag=3 branch of `march_cartesian`.
+    /// Default. Decent perf up to ~1k entities.
+    RayMarch,
+    /// Entities are rendered as instanced triangle meshes in a
+    /// separate raster pass after the ray-march. Scales to 100k+.
+    /// Incompatible with TAA (depth buffer handoff would need
+    /// half-res adaptation). Landed in a later commit; ray-march
+    /// is the only mode active on this branch until then.
+    Raster,
+}
+
 /// Maximum ancestor-ribbon depth supported by the shader. Larger
 /// ribbons get truncated at upload (anything beyond can't pop).
 /// 64 covers MAX_DEPTH=63 with one slack.
