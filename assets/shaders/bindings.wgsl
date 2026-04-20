@@ -142,6 +142,14 @@ struct ShaderStats {
 /// reads this buffer.
 @group(0) @binding(7) var<storage, read> node_offsets: array<u32>;
 
+/// BFS index → per-node content AABB (12 bits packed in the low 12
+/// bits of each u32). See `content_aabb` in `gpu::pack`. The shader
+/// reads `aabbs[child_idx]` when deciding to descend into a tag=2
+/// child; a tight AABB lets rays skip subtrees whose occupied region
+/// doesn't intersect the ray path, and trims the DDA entry point to
+/// the first actually-populated cell.
+@group(0) @binding(9) var<storage, read> aabbs: array<u32>;
+
 /// Coarse beam-prepass mask. The fine fragment shader samples a 5-tap
 /// neighborhood at each pixel's tile: if every tap reads 0.0, the
 /// pixel is definitively sky and we return the sky color without

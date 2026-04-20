@@ -25,6 +25,7 @@ impl Renderer {
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        aabbs: &[u32],
         root_bfs_index: u32,
     ) {
         self.root_index = root_bfs_index;
@@ -34,8 +35,10 @@ impl Renderer {
         // pathological "empty pack" case so the bind group stays valid.
         let stub_tree = [0u32, 2u32];
         let stub_offsets = [0u32];
+        let stub_aabbs = [0u32];
         let tree_payload: &[u32] = if tree.is_empty() { &stub_tree } else { tree };
         let offsets_payload: &[u32] = if node_offsets.is_empty() { &stub_offsets } else { node_offsets };
+        let aabbs_payload: &[u32] = if aabbs.is_empty() { &stub_aabbs } else { aabbs };
 
         let tree_byte_size = std::mem::size_of_val(tree_payload) as u64;
         let max_binding_size = self.device.limits().max_storage_buffer_binding_size as u64;
@@ -61,17 +64,22 @@ impl Renderer {
             &mut self.node_offsets_buffer, &mut self.uploaded_offsets_count,
             &self.device, &self.queue, "node_offsets", offsets_payload, storage,
         );
+        let aabbs_grew = append_or_recreate_u32(
+            &mut self.aabbs_buffer, &mut self.uploaded_aabbs_count,
+            &self.device, &self.queue, "aabbs", aabbs_payload, storage,
+        );
         self.last_tree_write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
         let _ = prev_tree_u32s;
 
         self.last_bind_group_rebuild_ms = 0.0;
-        if tree_grew || kinds_grew || offsets_grew {
+        if tree_grew || kinds_grew || offsets_grew || aabbs_grew {
             let rebuild_start = web_time::Instant::now();
             self.bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.aabbs_buffer,
                 &self.mask_view,
             );
             self.coarse_bind_group = make_bind_group(
@@ -79,6 +87,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.aabbs_buffer,
                 &self.dummy_mask_view,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
@@ -129,6 +138,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.aabbs_buffer,
                 &self.mask_view,
             );
             self.coarse_bind_group = make_bind_group(
@@ -136,6 +146,7 @@ impl Renderer {
                 &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
+                &self.aabbs_buffer,
                 &self.dummy_mask_view,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
@@ -177,6 +188,7 @@ impl Renderer {
                 &self.ribbon_buffer,
                 &self.shader_stats_buffer,
                 &self.node_offsets_buffer,
+                &self.aabbs_buffer,
                 &self.mask_view,
             );
             self.coarse_bind_group = make_bind_group(
@@ -190,6 +202,7 @@ impl Renderer {
                 &self.ribbon_buffer,
                 &self.shader_stats_buffer,
                 &self.node_offsets_buffer,
+                &self.aabbs_buffer,
                 &self.dummy_mask_view,
             );
         } else {
@@ -320,6 +333,7 @@ pub(super) fn make_bind_group(
     ribbon: &wgpu::Buffer,
     shader_stats: &wgpu::Buffer,
     node_offsets: &wgpu::Buffer,
+    aabbs: &wgpu::Buffer,
     mask_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -335,6 +349,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 6, resource: shader_stats.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: node_offsets.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask_view) },
+            wgpu::BindGroupEntry { binding: 9, resource: aabbs.as_entire_binding() },
         ],
     })
 }

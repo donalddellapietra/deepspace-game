@@ -157,7 +157,7 @@ impl App {
         eprintln!("startup_perf {source}: window_prepared ms={:.2}", prepare_elapsed.as_secs_f64() * 1000.0);
 
         let pack_start = web_time::Instant::now();
-        let (tree_packed, node_kinds, node_offsets, _node_ids, root_index) =
+        let (tree_packed, node_kinds, node_offsets, aabbs, _node_ids, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
         let pack_elapsed = pack_start.elapsed();
         eprintln!(
@@ -198,6 +198,7 @@ impl App {
                 &tree_packed,
                 &node_kinds,
                 &node_offsets,
+                &aabbs,
                 root_index,
                 present_mode,
                 shader_stats_enabled,
@@ -219,6 +220,7 @@ impl App {
             let tree_packed = tree_packed.to_vec();
             let node_kinds = node_kinds.to_vec();
             let node_offsets = node_offsets.to_vec();
+            let aabbs = aabbs.to_vec();
             wasm_bindgen_futures::spawn_local(async move {
                 // Re-stamp the canvas backing store right before
                 // surface creation. Winit's request_inner_size on web
@@ -242,6 +244,7 @@ impl App {
                     &tree_packed,
                     &node_kinds,
                     &node_offsets,
+                    &aabbs,
                     root_index,
                     present_mode,
                     shader_stats_enabled,

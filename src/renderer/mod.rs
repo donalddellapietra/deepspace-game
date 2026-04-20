@@ -69,6 +69,11 @@ pub struct Renderer {
     /// BFS index → tree[] u32-offset of that node's header. Touched
     /// only on descent / ribbon pop (cold path).
     pub(super) node_offsets_buffer: wgpu::Buffer,
+    /// BFS index → packed 12-bit content AABB in the low 12 bits.
+    /// See `gpu::pack::CachedTree::aabbs`. Parallel to
+    /// `node_offsets_buffer`; the ray-march descent uses it to cull
+    /// rays that miss the subtree's occupied region.
+    pub(super) aabbs_buffer: wgpu::Buffer,
     pub(super) node_kinds_buffer: wgpu::Buffer,
     /// Running counts of what's currently uploaded to the GPU
     /// buffers (u32s for tree; element counts for the BFS-indexed
@@ -78,6 +83,7 @@ pub struct Renderer {
     pub(super) uploaded_tree_u32s: u64,
     pub(super) uploaded_kinds_count: u64,
     pub(super) uploaded_offsets_count: u64,
+    pub(super) uploaded_aabbs_count: u64,
     pub(super) camera_buffer: wgpu::Buffer,
     /// CPU-side mirror of the most recent GpuCamera uploaded via
     /// `update_camera()`, with `jitter_x_px` / `jitter_y_px` always
@@ -264,6 +270,7 @@ impl Renderer {
             &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
             &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
             &self.shader_stats_buffer, &self.node_offsets_buffer,
+            &self.aabbs_buffer,
             &self.mask_view,
         );
         // coarse_bind_group uses the dummy mask view which doesn't

@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn ribbon_for_path_into_body_in_planet_world() {
         let world = planet_world();
-        let (tree, _kinds, offsets, _node_ids, root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
             build_ribbon(&tree, &offsets, root_idx, &[13]);
         assert_ne!(frame_root_idx, root_idx, "body packed at a different BFS idx");
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn reached_slots_truncated_when_pack_flattens_sibling() {
         let world = planet_world();
-        let (tree, _kinds, offsets, _node_ids, root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         // Slot 16 is uniform-empty Cartesian → absent from pack.
         // Descent into [16, 13] stops at depth 0.
         let r = build_ribbon(&tree, &offsets, root_idx, &[16, 13]);
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
         let world = planet_world();
-        let (tree, _kinds, offsets, _node_ids, root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
             build_ribbon(&tree, &offsets, root_idx, &[]);
         assert_eq!(frame_root_idx, root_idx);

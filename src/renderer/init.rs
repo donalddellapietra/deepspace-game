@@ -69,6 +69,7 @@ impl Renderer {
         tree: &[u32],
         node_kinds: &[GpuNodeKind],
         node_offsets: &[u32],
+        aabbs: &[u32],
         root_bfs_index: u32,
         present_mode: wgpu::PresentMode,
         shader_stats_enabled: bool,
@@ -198,6 +199,13 @@ impl Renderer {
         );
         let node_offsets_buffer = alloc_with_headroom(
             &device, "node_offsets", bytemuck::cast_slice(offsets_init),
+        );
+        // aabbs is parallel to node_offsets: stub a single entry for
+        // the empty-pack case so the binding stays valid.
+        let stub_aabbs = [0u32];
+        let aabbs_init: &[u32] = if aabbs.is_empty() { &stub_aabbs } else { aabbs };
+        let aabbs_buffer = alloc_with_headroom(
+            &device, "aabbs", bytemuck::cast_slice(aabbs_init),
         );
 
         let camera = GpuCamera {
@@ -352,6 +360,16 @@ impl Renderer {
                         multisampled: false,
                     }, count: None,
                 },
+                // Content AABBs (binding 9) — per-BFS 12-bit AABB in
+                // the low 12 bits of each u32. Parallel to
+                // `node_offsets`. Used by the ray-march descent cull.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
@@ -372,6 +390,7 @@ impl Renderer {
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
             &shader_stats_buffer, &node_offsets_buffer,
+            &aabbs_buffer,
             &mask_view,
         );
         let coarse_bind_group = make_bind_group(
@@ -379,6 +398,7 @@ impl Renderer {
             &tree_buffer, &camera_buffer, &palette_buffer,
             &uniforms_buffer, &node_kinds_buffer, &ribbon_buffer,
             &shader_stats_buffer, &node_offsets_buffer,
+            &aabbs_buffer,
             &dummy_mask_view,
         );
 
@@ -528,12 +548,14 @@ impl Renderer {
         let uploaded_tree_u32s = tree.len() as u64;
         let uploaded_kinds_count = node_kinds.len() as u64;
         let uploaded_offsets_count = node_offsets.len() as u64;
+        let uploaded_aabbs_count = aabbs.len() as u64;
         Self {
             device, queue, surface, config, pipeline, bind_group_layout,
-            tree_buffer, node_offsets_buffer, node_kinds_buffer,
+            tree_buffer, node_offsets_buffer, aabbs_buffer, node_kinds_buffer,
             uploaded_tree_u32s,
             uploaded_kinds_count,
             uploaded_offsets_count,
+            uploaded_aabbs_count,
             camera_buffer,
             last_camera: camera,
             palette_buffer, uniforms_buffer,

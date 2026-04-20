@@ -100,6 +100,18 @@ fn init_device() -> Result<(wgpu::Device, wgpu::Queue)> {
     // couple of limits the voxelize pipeline genuinely needs up to
     // whatever the adapter offers.
     let adapter_limits = adapter.limits();
+    let adapter_info = adapter.get_info();
+    eprintln!(
+        "adapter: {} ({:?}, {:?})",
+        adapter_info.name, adapter_info.backend, adapter_info.device_type
+    );
+    eprintln!(
+        "adapter limits: max_buffer_size={} GB, max_storage_buffer_binding_size={} MB, \
+         max_3d_texture={}^3",
+        adapter_limits.max_buffer_size / (1024 * 1024 * 1024),
+        adapter_limits.max_storage_buffer_binding_size / (1024 * 1024),
+        adapter_limits.max_texture_dimension_3d,
+    );
     let mut limits = adapter_limits.clone();
     limits.max_buffer_size = limits
         .max_buffer_size

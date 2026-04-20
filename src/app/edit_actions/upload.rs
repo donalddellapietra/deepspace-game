@@ -79,6 +79,7 @@ impl App {
                     &cache.tree,
                     &cache.node_kinds,
                     &cache.node_offsets,
+                    &cache.aabbs,
                     cache.root_bfs_idx,
                 );
             }
