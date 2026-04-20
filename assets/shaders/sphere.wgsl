@@ -209,10 +209,11 @@ fn march_sphere_body(
         let u_axis = face_u_axis(face);
         let v_axis = face_v_axis(face);
 
-        // Cube-UV coordinates on the face. axis_dot guards against
-        // grazing angles where the projection is ill-conditioned.
+        // Cube-UV coordinates on the face. At grazing angles the
+        // projection stretches to infinity; the `un`/`vn` clamp to
+        // [0, 0.9999999] below absorbs the out-of-range values so
+        // the walker still finds the nearest cell.
         let axis_dot = dot(n, n_axis);
-        if axis_dot <= 1e-6 { break; }
         let cube_u = dot(n, u_axis) / axis_dot;
         let cube_v = dot(n, v_axis) / axis_dot;
         let u_ea = cube_to_ea(cube_u);

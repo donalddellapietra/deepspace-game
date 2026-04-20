@@ -40,7 +40,13 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
         (uv.x - 0.5) * 2.0 * aspect * half_fov_tan + jitter_ndc_x,
         (0.5 - uv.y) * 2.0 * half_fov_tan + jitter_ndc_y,
     );
-    return camera.forward + camera.right * ndc.x + camera.up * ndc.y;
+    // Must return a UNIT vector: the sphere DDA's ray-sphere
+    // intersection uses the unit-speed quadratic `disc = b² - c`
+    // (not `b² - a·c`), which only works when |ray_dir| = 1. Off-
+    // axis FOV-scaled rays have |ray_dir| > 1, so skipping the
+    // normalize produces t values that don't correspond to real
+    // hits — the planet shrinks to a tiny disc in the center.
+    return normalize(camera.forward + camera.right * ndc.x + camera.up * ndc.y);
 }
 
 /// Shared pixel-shading kernel. Returns both the (gamma-corrected)

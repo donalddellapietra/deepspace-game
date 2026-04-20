@@ -176,20 +176,27 @@ pub fn with_render_margin(
     render_margin: u8,
 ) -> ActiveFrame {
     let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
-    let min_render_depth = match logical.kind {
-        // Sphere: the render frame root stays at the containing
-        // body cell — never inside a face subtree. Face-depth
-        // descent happens via the ribbon/walker, not via a deeper
-        // render root. This is what keeps sphere math precision-
-        // safe at arbitrary zoom depth.
-        ActiveFrameKind::Sphere(sphere) => sphere.body_path.depth(),
-        ActiveFrameKind::Body { .. } => logical.logical_path.depth(),
-        // Shell architecture: the render frame IS the innermost
-        // shell root. The shader pops outward via the ribbon for
-        // coarser context. No render_margin needed — each shell
-        // has a bounded depth budget.
-        ActiveFrameKind::Cartesian => logical.logical_path.depth(),
-    };
+    // Sphere: the render frame must NEVER descend into a face
+    // subtree. Cap the render depth at body_path so the shader's
+    // root is always the containing `CubedSphereBody` cell — the
+    // only place where `march_sphere_body`'s curved-UVR math is
+    // precision-safe. Face-depth descent happens via the ribbon,
+    // not via a deeper render root.
+    if let ActiveFrameKind::Sphere(sphere) = logical.kind {
+        let render_depth = sphere.body_path.depth();
+        let mut render_path = logical.logical_path;
+        render_path.truncate(render_depth);
+        let render = compute_render_frame(library, world_root, &render_path, render_depth);
+        return ActiveFrame {
+            render_path: render.render_path,
+            logical_path: logical.logical_path,
+            node_id: render.node_id,
+            kind: render.kind,
+        };
+    }
+    // Cartesian / Body: render frame IS the innermost shell root.
+    // The shader pops outward via the ribbon for coarser context.
+    let min_render_depth = logical.logical_path.depth();
     let render_depth = logical
         .logical_path
         .depth()
