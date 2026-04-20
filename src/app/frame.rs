@@ -109,37 +109,26 @@ pub fn compute_render_frame(
             Child::Block(_) | Child::Empty => break,
         }
     }
-    if let Some((face, _face_root_id)) = face_info {
+    if let Some((_face, _face_root_id)) = face_info {
         let (body_path, body_node_id, inner_r, outer_r) =
             body_info.expect("sphere frame requires containing body");
-        let face_depth = reached.depth().saturating_sub(body_path.depth() + 1) as u32;
-        if face_depth == 0 {
-            // Camera is exactly at the face root — descend the render
-            // frame back up to the body so the shader's root is the
-            // body node. That lets the sphere-SDF pre-clip in `march`
-            // cull rays missing the outer sphere and produce a round
-            // silhouette. The `Body` kind signals the camera-basis
-            // pipeline that no face-axis rotation is needed yet.
-            ActiveFrame {
-                render_path: body_path,
-                logical_path: reached,
-                node_id: body_node_id,
-                kind: ActiveFrameKind::Body { inner_r, outer_r },
-            }
-        } else {
-            ActiveFrame {
-                render_path: reached,
-                logical_path: reached,
-                node_id,
-                kind: ActiveFrameKind::Sphere(SphereFrame {
-                    body_path,
-                    body_node_id,
-                    face,
-                    inner_r,
-                    outer_r,
-                    face_depth,
-                }),
-            }
+        // Render frame is always the body for sphere content. The
+        // per-ray LOD in `sphere_in_cell` handles zoom intrinsically
+        // (deep anchor = close camera = small ray distance =
+        // pixel-density gate permits deep descent where needed).
+        //
+        // Previously we tried render_path = deeper-into-face-subtree
+        // at face_depth >= 1, but that requires face-axis rotation
+        // of the camera which creates a coordinate mismatch with
+        // the sphere walker's body-local math. Collapsing to the
+        // body path side-steps the entire rotation problem:
+        // positions, basis vectors, and sphere math all live in
+        // un-rotated body-local coords.
+        ActiveFrame {
+            render_path: body_path,
+            logical_path: reached,
+            node_id: body_node_id,
+            kind: ActiveFrameKind::Body { inner_r, outer_r },
         }
     } else {
         let kind = library.get(node_id).map(|n| n.kind).unwrap_or(NodeKind::Cartesian);
@@ -275,13 +264,17 @@ mod tests {
         assert_eq!(frame.logical_path.depth(), 2, "logical_path reaches the face root");
         assert!(matches!(frame.kind, ActiveFrameKind::Body { .. }));
 
-        // Descending one slot deeper into the face subtree gives
-        // face_depth == 1 and returns a Sphere frame.
+        // Descending one slot deeper into the face subtree also
+        // collapses the render frame back to the body: the sphere
+        // walker does LOD intrinsically, so there's no benefit to
+        // rooting deeper than the body (and rooting deeper creates
+        // a coordinate-mismatch that breaks sphere math).
         let mut deeper = anchor;
         deeper.push(0);
         let deep_frame = compute_render_frame(&lib, root, &deeper, 3);
-        assert_eq!(deep_frame.render_path.depth(), 3);
-        assert!(matches!(deep_frame.kind, ActiveFrameKind::Sphere(_)));
+        assert_eq!(deep_frame.render_path.depth(), 1, "render_path stops at body for face_depth>=1");
+        assert_eq!(deep_frame.logical_path.depth(), 3, "logical_path reaches the deep cell");
+        assert!(matches!(deep_frame.kind, ActiveFrameKind::Body { .. }));
     }
 
     #[test]

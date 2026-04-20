@@ -111,7 +111,12 @@ impl App {
                     renderer.set_root_kind_cartesian();
                 }
                 crate::app::ActiveFrameKind::Body { inner_r, outer_r } => {
-                    renderer.set_root_kind_body(inner_r, outer_r);
+                    // At Body frame, render_path = body_path, so
+                    // body_path_depth = render_path_depth.
+                    renderer.set_root_kind_body(
+                        inner_r, outer_r,
+                        self.active_frame.render_path.depth() as u32,
+                    );
                 }
                 crate::app::ActiveFrameKind::Sphere(sphere) => {
                     // Body origin in render-frame coords: position of
@@ -136,9 +141,21 @@ impl App {
                         sphere.body_path,
                         [0.0, 0.0, 0.0],
                     ).in_frame(&self.active_frame.render_path);
+                    // Direct body BFS-idx lookup. Shader reads this
+                    // from root_face_meta.y and walks the body node
+                    // without needing a ribbon scan — the ribbon is
+                    // often shorter than body_depth when the render
+                    // root sits deep inside the face subtree.
+                    let body_bfs_idx = cache
+                        .bfs_by_nid
+                        .get(&sphere.body_node_id)
+                        .copied()
+                        .expect("body node must be packed in cached tree");
                     renderer.set_root_kind_sphere(
                         sphere.inner_r, sphere.outer_r,
                         body_corner, body_size_in_frame,
+                        sphere.body_path.depth() as u32,
+                        body_bfs_idx,
                     );
                 }
             }

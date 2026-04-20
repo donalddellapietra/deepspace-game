@@ -219,15 +219,28 @@ struct HitResult {
     frame_scale: f32,
     cell_min: vec3<f32>,
     cell_size: f32,
-    /// Hit cell's slot path RELATIVE TO THE WALKER'S FRAME ROOT
-    /// (chain[current_frame_depth] in `main.wgsl`'s march loop).
-    /// 4 slot bytes per u32, matching `Uniforms.highlight_path`.
-    /// `main.wgsl` prepends `render_path[0..render_depth - ribbon_level]`
-    /// to reconstruct the full world-root-relative hit path for
-    /// highlight comparison. `hit_path_depth == 0` means an
-    /// unpopulated path (disables highlight match for that pixel).
+    /// Hit cell's slot path. 4 slot bytes per u32, matching
+    /// `Uniforms.highlight_path`. The meaning depends on
+    /// `hit_path_base_depth`:
+    /// - Cartesian hits (base_depth = 0): path is relative to
+    ///   the walker's CURRENT frame root; `main.wgsl` prepends
+    ///   `render_path[0..render_depth − ribbon_level]` to recover
+    ///   the full world-rooted path.
+    /// - Sphere hits from top-level `sphere_in_cell` dispatch
+    ///   (base_depth = body_path.depth()): path is relative to
+    ///   the BODY (starts with face_slot, then face subtree
+    ///   descent); `main.wgsl` takes the first `base_depth`
+    ///   slots from `render_path` and appends `hit_path`.
+    /// `hit_path_depth == 0` means an unpopulated path (disables
+    /// highlight match for that pixel).
     hit_path: array<vec4<u32>, 4>,
     hit_path_depth: u32,
+    /// 0 = Cartesian-rooted hit_path (default); >0 = body-rooted
+    /// hit_path, with `base_depth` slots that come from
+    /// `render_path` (not from `hit_path`). Set by
+    /// `sphere_in_cell` when it's dispatched with a render root
+    /// INSIDE a body's subtree (face_depth >= 0).
+    hit_path_base_depth: u32,
 }
 
 /// Write a single slot byte (0..26) into a packed slot-path array at

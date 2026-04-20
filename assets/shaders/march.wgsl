@@ -514,6 +514,51 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     // the inner shell. Uses slot (not node_idx) for dedup correctness.
     var skip_slot: u32 = 0xFFFFFFFFu;
 
+    // Sphere dispatch tracking. Every ribbon level that's still
+    // inside the body's subtree walks via `sphere_in_cell`; once
+    // we've popped past the body (into an outer Cartesian ancestor)
+    // we drop back to `march_cartesian`. Without this, the walker
+    // at ribbon_level > 0 would walk u/v/r-stored face subtree
+    // content as Cartesian, rendering the sphere's voxels as if
+    // they were axis-aligned cubes — the "Cartesian walls" effect.
+    //
+    // `body_origin_in_frame` / `body_size_in_frame` track the body's
+    // bounding box in the CURRENT ribbon frame's coords. On each
+    // pop they transform: `origin_new = slot_off + origin_old / 3`,
+    // `size_new = size_old / 3` (body is 3× smaller in the parent
+    // frame).
+    var body_origin_in_frame: vec3<f32> = uniforms.root_face_bounds.xyz;
+    var body_size_in_frame: f32 = uniforms.root_face_bounds.w;
+    var body_idx: u32 = 0u;
+    // `inside_body_until_level`: iff `has_body_frame` AND
+    // `ribbon_level <= inside_body_until_level`, the current
+    // iteration walks a level that's still inside the body's
+    // subtree. ROOT_KIND_BODY → 0 (only the render root itself is
+    // the body). ROOT_KIND_FACE → index of body in ribbon + 1
+    // (the pop that lands current_idx on the body is still inside).
+    var has_body_frame: bool = false;
+    var inside_body_until_level: u32 = 0u;
+    if uniforms.root_kind == ROOT_KIND_BODY {
+        body_idx = current_idx;
+        has_body_frame = true;
+        inside_body_until_level = 0u;
+    } else if uniforms.root_kind == ROOT_KIND_FACE {
+        // CPU ships body_bfs_idx directly via `root_face_meta.y` —
+        // the ribbon scan it replaced fails when the ribbon is
+        // shorter than (render_depth − body_depth) (common when the
+        // render root sits several face-subtree levels below the
+        // body). The body's subtree span is the full render_depth
+        // − body_path_depth, so we stay inside sphere dispatch up
+        // to that many pops.
+        body_idx = uniforms.root_face_meta.y;
+        has_body_frame = true;
+        let render_depth = uniforms.render_path_depth;
+        let body_depth = uniforms.root_face_meta.x;
+        inside_body_until_level = render_depth - body_depth;
+    }
+    let body_inner_r: f32 = uniforms.root_radii.x;
+    let body_outer_r: f32 = uniforms.root_radii.y;
+
     var hops: u32 = 0u;
     loop {
         if hops > 80u { break; }
@@ -531,44 +576,23 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         );
         let cart_depth_limit = min(detail_budget, MAX_STACK_DEPTH);
         var r: HitResult;
-        if ribbon_level == 0u
-            && (uniforms.root_kind == ROOT_KIND_BODY
-                || uniforms.root_kind == ROOT_KIND_FACE)
-        {
-            // Render root is a body (face_depth == 0) or inside a
-            // face subtree (face_depth >= 1). Dispatch `sphere_in_cell`
-            // with the body's bounding box in render-frame coords.
-            // For `ROOT_KIND_BODY` that's `(0, 0, 0)..(3, 3, 3)`; for
-            // `ROOT_KIND_FACE` the CPU ships the body's corner and
-            // cell size via `root_face_bounds` (precision-safe — the
-            // box is computed via path arithmetic, not body-frame
-            // absolutes).
+        if has_body_frame && ribbon_level <= inside_body_until_level {
+            // Still inside the body's subtree — dispatch the curved
+            // sphere walker with the body's bounding box in the
+            // current frame's coords.
             let walker_cap = min(cart_depth_limit, MAX_FACE_DEPTH);
-            // For ROOT_KIND_FACE the body_node_idx isn't available
-            // via `uniforms.root_index` (which IS the face sub-cell),
-            // so we walk the ribbon to find the ancestor body. The
-            // ribbon is short (≤ face_depth + 1 entries) so this
-            // linear scan is cheap.
-            var body_idx: u32 = current_idx;
-            if uniforms.root_kind == ROOT_KIND_FACE {
-                var i: u32 = 0u;
-                loop {
-                    if i >= uniforms.ribbon_count { break; }
-                    let entry_idx = ribbon[i].node_idx;
-                    if node_kinds[entry_idx].kind == 1u {
-                        body_idx = entry_idx;
-                        break;
-                    }
-                    i = i + 1u;
-                }
-            }
-            let body_origin = uniforms.root_face_bounds.xyz;
-            let body_size = uniforms.root_face_bounds.w;
             r = sphere_in_cell(
-                body_idx, body_origin, body_size,
-                uniforms.root_radii.x, uniforms.root_radii.y,
+                body_idx, body_origin_in_frame, body_size_in_frame,
+                body_inner_r, body_outer_r,
                 ray_origin, ray_dir, walker_cap,
             );
+            if r.hit {
+                // Mark the hit as body-rooted for path-prefix match
+                // in main.wgsl. First `body_path_depth` slots come
+                // from render_path; hit_path carries the face-slot
+                // and face subtree descent.
+                r.hit_path_base_depth = uniforms.root_face_meta.x;
+            }
         } else {
             r = march_cartesian(current_idx, ray_origin, ray_dir, cart_depth_limit, skip_slot);
         }
@@ -615,6 +639,13 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         cur_scale = cur_scale * (1.0 / 3.0);
         current_idx = entry.node_idx;
         ribbon_level = ribbon_level + 1u;
+        // Transform body_origin / body_size into the new frame's
+        // coords. Same formula as the ray: new = slot_off + old / 3,
+        // size = old / 3. Once we pop past the body
+        // (`ribbon_level > inside_body_until_level`) these stay in
+        // sync but are no longer read (sphere dispatch disabled).
+        body_origin_in_frame = slot_off + body_origin_in_frame / 3.0;
+        body_size_in_frame = body_size_in_frame / 3.0;
 
         // Empty-shell fast exit: if every sibling is empty, skip
         // this shell's DDA and advance the ray to the shell's exit

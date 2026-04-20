@@ -204,12 +204,20 @@ impl Renderer {
     /// Render root is the body cell itself. Shader dispatches
     /// `sphere_in_cell` with body at `(0, 0, 0)..(3, 3, 3)` in
     /// render frame. `inner_r`/`outer_r` in body-cell-local units.
-    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
+    /// `body_path_depth` is shipped so the shader's highlight
+    /// path-prefix match can pull the correct number of slots from
+    /// `render_path` when a sphere hit lands.
+    pub fn set_root_kind_body(
+        &mut self,
+        inner_r: f32,
+        outer_r: f32,
+        body_path_depth: u32,
+    ) {
         self.root_kind = ROOT_KIND_BODY;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
         // Body at render-frame origin, size 3.
         self.root_face_bounds = [0.0, 0.0, 0.0, 3.0];
-        self.root_face_meta = [0; 4];
+        self.root_face_meta = [body_path_depth, 0, 0, 0];
         self.root_face_pop_pos = [0.0; 4];
         self.write_uniforms();
     }
@@ -217,13 +225,24 @@ impl Renderer {
     /// Render root is inside a face subtree (Sphere face_depth >= 1).
     /// The body's bounding box in render-frame coords is shipped so
     /// the shader can dispatch `sphere_in_cell` with precision-safe
-    /// body-relative math at any anchor depth.
+    /// body-relative math at any anchor depth. `body_path_depth` is
+    /// the depth of the body's path from world root — used by the
+    /// shader's highlight match to split `render_path` between the
+    /// prefix (body-path ancestors) and the face-subtree descent
+    /// that's captured in the sphere hit's `hit_path`. `body_bfs_idx`
+    /// is the BFS index of the body node in the packed tree — the
+    /// shader uses it directly as the walker root for
+    /// `sphere_in_cell`, bypassing the ribbon scan that fails when
+    /// the ribbon is shorter than the body's depth from the render
+    /// root.
     pub fn set_root_kind_sphere(
         &mut self,
         inner_r: f32,
         outer_r: f32,
         body_corner_in_frame: [f32; 3],
         body_size_in_frame: f32,
+        body_path_depth: u32,
+        body_bfs_idx: u32,
     ) {
         self.root_kind = ROOT_KIND_FACE;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
@@ -233,7 +252,7 @@ impl Renderer {
             body_corner_in_frame[2],
             body_size_in_frame,
         ];
-        self.root_face_meta = [0; 4];
+        self.root_face_meta = [body_path_depth, body_bfs_idx, 0, 0];
         self.root_face_pop_pos = [0.0; 4];
         self.write_uniforms();
     }

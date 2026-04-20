@@ -65,9 +65,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let h_depth = uniforms.highlight_path_depth;
         let r_depth = uniforms.render_path_depth;
         let pop_level = result.frame_level;
-        // Saturating subtract — guards against the (shouldn't-happen)
-        // case of pop_level > r_depth.
-        let frame_prefix_len = select(0u, r_depth - pop_level, r_depth >= pop_level);
+        // For body-rooted (sphere) hits, the prefix from render_path
+        // is just the body's ancestor depth — NOT `render_path_depth -
+        // pop_level` (which would double-count the face_slot and any
+        // face-subtree descent already in render_path). For
+        // Cartesian hits, `hit_path_base_depth == 0` and we fall
+        // back to the usual pop-level math.
+        var frame_prefix_len: u32;
+        if result.hit_path_base_depth > 0u {
+            frame_prefix_len = result.hit_path_base_depth;
+        } else {
+            frame_prefix_len = select(0u, r_depth - pop_level, r_depth >= pop_level);
+        }
         let walker_depth = result.hit_path_depth;
         let full_hit_depth = frame_prefix_len + walker_depth;
         // Prefix match: the walker's hit cell CONTAINS the highlight
