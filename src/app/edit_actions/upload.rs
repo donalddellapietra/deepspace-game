@@ -67,6 +67,17 @@ impl App {
         self.last_effective_visual_depth = effective_visual_depth;
         self.last_reused_gpu_tree = reused_gpu_tree;
 
+        // Any repack means the tree nodes that back the heightmap
+        // may have changed shape — flag it so the next frame's
+        // `record_frame_passes` reruns the gen compute pass. The
+        // renderer also detects frame-root changes internally;
+        // this is the edit-invalidation half.
+        if !reused_gpu_tree {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.mark_heightmap_dirty();
+            }
+        }
+
         let mut pack_elapsed = web_time::Duration::ZERO;
         if !reused_gpu_tree {
             let pack_start = web_time::Instant::now();
@@ -356,6 +367,22 @@ impl App {
                     scale: size,
                     tint,
                 }));
+            }
+            // Size the heightmap for this frame's entity depth.
+            // Collision granularity is entity_anchor_depth + 1, so
+            // delta = (anchor_depth + 1) - frame_depth. If entities
+            // live at different depths (rare), we use the deepest
+            // to keep the heightmap fine enough for everyone.
+            let max_entity_depth = self
+                .entities
+                .entities
+                .iter()
+                .map(|e| e.pos.anchor.depth() as i32)
+                .max()
+                .unwrap_or(frame_depth);
+            let heightmap_delta = (max_entity_depth + 1 - frame_depth).max(0) as u32;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.ensure_heightmap(heightmap_delta);
             }
             if let Some(renderer) = &mut self.renderer {
                 // Snapshot the device+queue handles so we can borrow

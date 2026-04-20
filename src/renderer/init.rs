@@ -407,7 +407,7 @@ impl Renderer {
         // depth buffer. Keeping this as a separate pipeline (rather
         // than overriding `depth_stencil: None` on the default one)
         // means ray-march-only runs pay zero depth-write cost.
-        let (pipeline_with_depth, depth_texture, depth_view, entity_raster) =
+        let (pipeline_with_depth, depth_texture, depth_view, entity_raster, heightmap_gen, entity_heightmap_clamp) =
             if matches!(entity_render_mode, EntityRenderMode::Raster) {
                 let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("ray_march_with_depth"),
@@ -445,9 +445,11 @@ impl Renderer {
                 });
                 let (tex, view) = create_depth_texture(&device, config.width, config.height);
                 let raster = EntityRasterState::new(&device, config.format, DEPTH_FORMAT);
-                (Some(pipeline), Some(tex), Some(view), Some(raster))
+                let hgen = super::heightmap::HeightmapGen::new(&device);
+                let hclamp = super::heightmap::EntityHeightmapClamp::new(&device);
+                (Some(pipeline), Some(tex), Some(view), Some(raster), Some(hgen), Some(hclamp))
             } else {
-                (None, None, None, None)
+                (None, None, None, None, None, None)
             };
 
         // When TAAU is enabled, compile a second ray-march pipeline
@@ -571,6 +573,11 @@ impl Renderer {
             depth_view,
             pipeline_with_depth,
             entity_raster,
+            heightmap_gen,
+            entity_heightmap_clamp,
+            heightmap_texture: None,
+            heightmap_dirty: false,
+            heightmap_frame_root_bfs: u32::MAX,
         }
     }
 }

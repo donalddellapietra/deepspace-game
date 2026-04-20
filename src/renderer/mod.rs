@@ -197,6 +197,24 @@ pub struct Renderer {
     /// Raster pass for entity meshes. Present iff
     /// `entity_render_mode == Raster`.
     pub(super) entity_raster: Option<EntityRasterState>,
+
+    // --- Heightmap / entity physics (raster mode only) ---
+    /// GPU heightmap-gen compute pipeline. Allocated once per
+    /// renderer lifetime (pipelines are expensive to build).
+    pub(super) heightmap_gen: Option<heightmap::HeightmapGen>,
+    /// GPU per-entity Y-clamp compute pipeline.
+    pub(super) entity_heightmap_clamp: Option<heightmap::EntityHeightmapClamp>,
+    /// Current heightmap texture + its uniforms. Reallocated when
+    /// `delta` (collision depth relative to frame depth) changes.
+    pub(super) heightmap_texture: Option<heightmap::HeightmapTexture>,
+    /// True whenever the tree / frame root / collision depth
+    /// changed since the last `heightmap_gen` dispatch. Cleared
+    /// once we regenerate.
+    pub(super) heightmap_dirty: bool,
+    /// Frame-root BFS index the heightmap was last generated for.
+    /// Used to detect frame-root changes that require a rebuild
+    /// without the app having to manually mark the heightmap dirty.
+    pub(super) heightmap_frame_root_bfs: u32,
 }
 
 /// Depth attachment format for the raster entity pass. 32-bit float
@@ -320,6 +338,31 @@ impl Renderer {
 
     pub fn entity_raster_mut(&mut self) -> Option<&mut EntityRasterState> {
         self.entity_raster.as_mut()
+    }
+
+    /// Force a heightmap rebuild on the next frame. The app calls
+    /// this after tree edits that could change terrain top-Y in
+    /// the current render frame. Frame-root changes are detected
+    /// automatically (see `heightmap_frame_root_bfs`).
+    pub fn mark_heightmap_dirty(&mut self) {
+        self.heightmap_dirty = true;
+    }
+
+    /// Ensure a heightmap texture of `3^delta` side exists.
+    /// Reallocates if `delta` changed; no-op otherwise. Also
+    /// flips the dirty flag so the next frame regenerates.
+    pub fn ensure_heightmap(&mut self, delta: u32) {
+        let cap_delta = delta.min(6); // cap matches the plan doc
+        let need_alloc = match self.heightmap_texture.as_ref() {
+            Some(h) => h.delta != cap_delta,
+            None => true,
+        };
+        if need_alloc {
+            self.heightmap_texture = Some(
+                heightmap::HeightmapTexture::new(&self.device, &self.queue, cap_delta),
+            );
+            self.heightmap_dirty = true;
+        }
     }
 
     pub fn device(&self) -> &wgpu::Device { &self.device }

@@ -162,6 +162,69 @@ impl Renderer {
             end_of_pass_write_index: Some(1),
         });
 
+        // --- Heightmap gen (raster mode, when dirty) ---
+        // The gen dispatch walks the same `tree[]` buffer the
+        // ray-march will read next; ordering it before the render
+        // passes keeps the queue monotonic. It's a no-op unless
+        // both the heightmap pipeline + texture are present.
+        let current_frame_root = self.root_index;
+        if self.heightmap_frame_root_bfs != current_frame_root {
+            self.heightmap_dirty = true;
+            self.heightmap_frame_root_bfs = current_frame_root;
+        }
+        if let (Some(hgen), Some(htex)) =
+            (self.heightmap_gen.as_ref(), self.heightmap_texture.as_ref())
+        {
+            if self.heightmap_dirty {
+                let u = crate::renderer::heightmap::HeightmapUniforms::new(
+                    current_frame_root,
+                    0,
+                    htex.delta,
+                    0.0,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                htex.write_uniforms(&self.queue, &u);
+                let bg = hgen.make_bind_group(
+                    &self.device,
+                    &self.tree_buffer,
+                    &self.node_offsets_buffer,
+                    htex,
+                );
+                hgen.record(encoder, &bg, htex);
+                if std::env::var("DEEPSPACE_LOG_HEIGHTMAP").is_ok() {
+                    eprintln!(
+                        "heightmap_gen frame_root={} delta={} side={}",
+                        current_frame_root, htex.delta, htex.side,
+                    );
+                }
+                self.heightmap_dirty = false;
+            }
+        }
+
+        // --- Entity Y clamp (raster mode, every frame) ---
+        if let (Some(clamp), Some(htex), Some(raster)) = (
+            self.entity_heightmap_clamp.as_ref(),
+            self.heightmap_texture.as_ref(),
+            self.entity_raster.as_ref(),
+        ) {
+            let count = raster.total_instances();
+            if count > 0 {
+                let u = crate::renderer::heightmap::ClampUniforms::new(
+                    count,
+                    htex.side,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                let uniforms = clamp.make_uniforms_buffer(&self.device, &u);
+                let bg = clamp.make_bind_group(
+                    &self.device,
+                    raster.instance_buffer(),
+                    &uniforms,
+                    htex,
+                );
+                clamp.record(encoder, &bg, count);
+            }
+        }
+
         // --- Ray-march pass ---
         if self.pipeline_taa.is_some() {
             let taa = self.taa.as_ref().expect("pipeline_taa implies TaaState");

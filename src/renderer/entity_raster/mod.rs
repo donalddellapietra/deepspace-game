@@ -206,7 +206,13 @@ impl EntityRasterState {
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("entity_raster_instances"),
             size: initial_instance_bytes,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            // STORAGE is required so the entity-heightmap-clamp
+            // compute pass can patch `translate.y` per instance
+            // before the raster pass reads this same buffer as a
+            // vertex attribute input.
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -350,7 +356,9 @@ impl EntityRasterState {
             self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("entity_raster_instances"),
                 size: new_cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             self.instance_capacity = new_cap;
@@ -415,6 +423,12 @@ impl EntityRasterState {
         self.batches.iter().map(|b| b.instance_count).sum()
     }
     pub fn cached_meshes(&self) -> usize { self.mesh_cache.len() }
+
+    /// Instance buffer used both by the raster pass (vertex buffer)
+    /// and the entity-heightmap-clamp compute pass (read_write
+    /// storage). Safe to read outside this module — the underlying
+    /// `wgpu::Buffer` is a shared-handle type.
+    pub fn instance_buffer(&self) -> &wgpu::Buffer { &self.instance_buffer }
 
     #[allow(dead_code)]
     pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
