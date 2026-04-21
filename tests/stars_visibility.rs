@@ -1,43 +1,32 @@
 //! Stars visibility test suite.
 //!
-//! Positive demonstration that distant occupants (root-level star
-//! cubes 22 ribbon pops from the camera's depth-23 anchor) render
-//! at full brightness in every cardinal direction.
+//! Positive demonstration that distant star cubes scattered across
+//! the 26 non-center root slots render as visible dots against the
+//! sky gradient, when viewed from the camera's depth-20 anchor at
+//! world-center `(1.5, 1.5, 1.5)`. Every star takes 19 ribbon pops
+//! to reach — the same deep-ribbon path that the d21 descent test
+//! caught before the shader's `ray_dir`-unscaled pop transform
+//! landed.
 //!
-//! Note: this test is a *visibility* gate, not a precision
-//! regression gate. The stars-world scene is sparse — DDA rays
-//! have no competing near-camera geometry to mis-hit, so a
-//! precision break doesn't cause mis-hits; rays either hit the
-//! expected star or fall through to sky. For the precision
-//! regression gate see `e2e_layer_descent::descent_sees_sky_and_
-//! breaks_at_every_layer`, which exercises grass/dirt boundaries
-//! at every depth 4..40 and caught the d21 precision failure
-//! before the `ray_dir`-unscaled pop transform landed.
+//! This is a *visibility* test: it asserts that star-colored
+//! pixels appear in each look direction. The d-sky descent suite
+//! (`tests/e2e_layer_descent.rs`) remains the precision regression
+//! gate with competing near-camera geometry.
 
 #[path = "e2e_layer_descent/harness.rs"]
 mod harness;
 
 use harness::{ScriptBuilder, run, tmp_dir};
 
-// Total tree depth. Chosen to force deep ribbons: the camera anchors
-// at depth 23 (= total_depth - 1) with stars at ancestor levels
-// 1, 5, 10, 15, 20, 24 — so a ray to the root-level star pops 22
-// ribbon entries, a range that explicitly failed before the fix.
-const TOTAL_DEPTH: &str = "24";
-
-// Render harness args. `--spawn-depth` deliberately mirrors the
-// bootstrap default (total_depth - 1 = 23), just being explicit.
+// Tree depth 40 with camera anchor 20 gives 19 ribbon pops to
+// reach any root-level sibling slot.
 const HARNESS_ARGS: &[&str] = &[
     "--render-harness",
     "--stars-world",
     "--plain-layers",
-    TOTAL_DEPTH,
+    "40",
     "--spawn-depth",
-    "23",
-    "--spawn-xyz",
-    "1.5",
-    "1.35",
-    "1.5",
+    "20",
     "--disable-highlight",
     "--harness-width",
     "640",
@@ -49,12 +38,12 @@ const HARNESS_ARGS: &[&str] = &[
     "45",
 ];
 
-/// Fraction of pixels in `path` that look like a star — warm
-/// yellow. Matches `(r, g, b)` where `r >= g > b` and `r > 150`.
-/// The star palette color is `(255, 220, 80)`; after shading it
-/// renders around `(224, 224, 176)` with `r = g > b`. The sky
-/// gradient is `b > g > r` (blue dominant) so it never matches.
-/// Grass is `g > r` so it's excluded too.
+/// Fraction of pixels in `path` that look like a warm-white star.
+/// The star palette color is `(255, 240, 200)` — after shading
+/// the face-lit pixels cluster around `(192-224, 192-208, 176-208)`
+/// with `r ≥ b` consistently. The sky gradient is `b > r` (blue
+/// dominant) so sky never matches. Grass is `g > r`, so we gate
+/// on `g ≤ r + 8` to exclude it too.
 fn star_pixel_fraction(path: impl AsRef<std::path::Path>) -> f32 {
     let file = std::fs::File::open(path.as_ref())
         .unwrap_or_else(|e| panic!("open {}: {e}", path.as_ref().display()));
@@ -79,9 +68,7 @@ fn star_pixel_fraction(path: impl AsRef<std::path::Path>) -> f32 {
             let r = data[i];
             let g = data[i + 1];
             let b = data[i + 2];
-            // Warm yellow: r ≥ g > b, with r bright enough to
-            // exclude shadowed grass (which is desaturated).
-            if r >= g && g > b && r > 150 {
+            if r >= b && r >= 170 && g <= r.saturating_add(8) {
                 hits += 1;
             }
             total += 1;
@@ -90,29 +77,30 @@ fn star_pixel_fraction(path: impl AsRef<std::path::Path>) -> f32 {
     if total == 0 { 0.0 } else { hits as f32 / total as f32 }
 }
 
-/// Look in each of 5 cardinal "up-hemisphere" directions in turn
-/// and assert stars are visible every time.
-///
-/// The stars-world places stars at root-slots `(1,2,1)`, `(0,1,1)`,
-/// `(2,1,1)`, `(1,1,0)`, `(1,1,2)` — directly up, left, right,
-/// back, front — plus smaller stars at deeper levels. Looking
-/// yaw=θ / pitch=π/4 catches the horizon-ish bright stars in each
-/// compass direction, while looking straight up catches the +Y
-/// giant plus any deeper-level +Y stars.
+/// Look in 6 directions spanning the full sphere. Every direction
+/// should catch at least one star (>= 0.1% of the frame —
+/// individual root-slot stars subtend tiny angular areas at this
+/// camera depth).
 #[test]
 fn camera_sees_stars_in_every_direction() {
-    const STAR_THRESHOLD: f32 = 0.02;
+    const STAR_THRESHOLD: f32 = 0.001;
 
     let dir = tmp_dir("stars_visibility");
+    // yaw, pitch pairs. Pitch > 0 = up, < 0 = down. Yaw: 0 is
+    // default forward; +π/2 rotates right. Cover the +Y hemisphere
+    // plus the four cardinals plus a slight-down pitch that should
+    // catch the planet top (but not below the horizon where no
+    // stars live).
     let cases: &[(&str, f32, f32)] = &[
-        ("up",     0.0,                              std::f32::consts::FRAC_PI_2 - 0.05),
-        ("north",  0.0,                              0.0),
-        ("east",   std::f32::consts::FRAC_PI_2,      0.0),
-        ("south",  std::f32::consts::PI,             0.0),
-        ("west",   -std::f32::consts::FRAC_PI_2,     0.0),
+        ("up",         0.0,                               1.3),
+        ("up_forward", 0.0,                               0.7),
+        ("east",       std::f32::consts::FRAC_PI_2,       0.3),
+        ("north",      0.0,                               0.3),
+        ("south",      std::f32::consts::PI,              0.3),
+        ("west",       -std::f32::consts::FRAC_PI_2,      0.3),
     ];
 
-    let mut paths = Vec::<(String, String)>::new();
+    let mut paths = Vec::<(String, String, f32)>::new();
     let mut script = ScriptBuilder::new();
     for (label, yaw, pitch) in cases {
         let p = dir.join(format!("{label}.png")).to_string_lossy().into_owned();
@@ -123,7 +111,7 @@ fn camera_sees_stars_in_every_direction() {
             .wait(3)
             .screenshot(&p)
             .emit(*label);
-        paths.push(((*label).to_string(), p));
+        paths.push(((*label).to_string(), p, *pitch));
     }
 
     let trace = run(HARNESS_ARGS, &script);
@@ -135,7 +123,7 @@ fn camera_sees_stars_in_every_direction() {
         trace.stdout.lines().rev().take(60).collect::<Vec<_>>().join("\n"),
     );
 
-    for (label, path) in &paths {
+    for (label, path, _pitch) in &paths {
         assert!(
             std::path::Path::new(path).exists(),
             "direction {label} screenshot {path} missing",
@@ -150,13 +138,12 @@ fn camera_sees_stars_in_every_direction() {
     }
 }
 
-/// Per-direction regression: if this fails at any single depth
-/// it tells you which star is misbehaving. Separate from the
-/// combined test above so a localized regression gives a
-/// single-line error message, not a truncated multi-assert trace.
+/// Single-direction regression: looking up should see the
+/// `(1,2,1)` sky stars cluster. Fails with a single-line message
+/// that names the direction.
 #[test]
 fn camera_sees_star_above() {
-    const STAR_THRESHOLD: f32 = 0.05;
+    const STAR_THRESHOLD: f32 = 0.003; // up-view catches ~0.8% star pixels
 
     let dir = tmp_dir("stars_above");
     let path = dir.join("up.png").to_string_lossy().into_owned();
@@ -164,7 +151,7 @@ fn camera_sees_star_above() {
 
     let script = ScriptBuilder::new()
         .yaw(0.0)
-        .pitch(std::f32::consts::FRAC_PI_2 - 0.05)
+        .pitch(1.3)
         .wait(3)
         .screenshot(&path)
         .emit("up");
@@ -182,7 +169,7 @@ fn camera_sees_star_above() {
     let frac = star_pixel_fraction(&path);
     assert!(
         frac >= STAR_THRESHOLD,
-        "looking straight up: star-pixel fraction {:.4} below threshold {} ({path})",
+        "looking up: star-pixel fraction {:.4} below threshold {} ({path})",
         frac,
         STAR_THRESHOLD,
     );

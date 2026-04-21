@@ -178,7 +178,7 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         ),
         WorldPreset::Scene { id } => crate::world::scenes::bootstrap_scene_world(id),
         WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
-            plain_layers.unwrap_or(25),
+            plain_layers.unwrap_or(40),
         ),
     }
 }
