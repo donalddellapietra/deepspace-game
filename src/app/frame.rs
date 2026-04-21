@@ -157,24 +157,32 @@ impl SphereSubFrame {
             return None;
         }
 
-        // Incremental corner update. `un_corner + frame_size` per +axis
-        // step (and the reverse for −axis). Bubble-up preserves this:
-        // at the parent level `frame_size` is 3×, but the child moves
-        // from 2→0 (wrap with parent++) or 0→2 (wrap with parent−−) —
-        // net delta on the axis sum is still ±frame_size.
-        let d = direction as f32;
-        let mut un = self.un_corner;
-        let mut vn = self.vn_corner;
-        let mut rn = self.rn_corner;
-        match axis {
-            0 => un += d * self.frame_size,
-            1 => vn += d * self.frame_size,
-            _ => rn += d * self.frame_size,
+        // Re-derive the corner from the new render_path's UVR suffix
+        // in f64, NOT via `un += d · frame_size` in f32.
+        //
+        // The f32 incremental update drops the delta at `frame_size <
+        // ULP(un) ≈ 6e-8`, which hits around m ≈ 15. The sliding wall
+        // that gave adjacent neighbor sub-frames the SAME `un_corner`
+        // and broke the Jacobian at deep m. The `uvr_corner` helper
+        // already accumulates in f64 and downcasts at the end, so
+        // deriving fresh each transition keeps the corner accurate at
+        // any depth the tree supports.
+        let body_depth_plus_one = face_root_idx + 1;
+        let uvr_suffix_depth = (new_path.depth() as usize)
+            .saturating_sub(body_depth_plus_one);
+        // Build a Path containing just the UVR suffix so uvr_corner
+        // walks the right slots. `Path` doesn't have a slice view, so
+        // we reconstruct by pushing; this is a fresh stack-allocated
+        // Path and the operation is O(uvr_suffix_depth).
+        let mut uvr_only = Path::root();
+        for k in 0..uvr_suffix_depth {
+            uvr_only.push(new_path.slot(body_depth_plus_one + k));
         }
+        let (un, vn, rn, frame_size) = uvr_corner(&uvr_only, uvr_suffix_depth);
 
         let (c_body, j) = crate::world::cubesphere::face_frame_jacobian(
             self.face,
-            un, vn, rn, self.frame_size,
+            un, vn, rn, frame_size,
             self.inner_r, self.outer_r,
             3.0,
         );
@@ -188,7 +196,7 @@ impl SphereSubFrame {
             un_corner: un,
             vn_corner: vn,
             rn_corner: rn,
-            frame_size: self.frame_size,
+            frame_size,
             inner_r: self.inner_r,
             outer_r: self.outer_r,
             c_body,
@@ -399,26 +407,34 @@ fn resolve_node(
 }
 
 /// Sum UVR-slot coord contributions from `uvr_path[..m]` into
-/// (un_corner, vn_corner, rn_corner, frame_size). This is the
-/// symbolic → f32 conversion that produces the Jacobian's evaluation
-/// point. f32 precision is limited here, but only the Jacobian cares,
-/// and the Jacobian is a linearization reference — the sub-cell
-/// position (what matters for rendering) comes from
-/// `WorldPos.sphere.uvr_offset` elsewhere.
+/// (un_corner, vn_corner, rn_corner, frame_size).
+///
+/// Accumulated in **f64** so slot contributions past m ≈ 15 aren't
+/// silently dropped by the additive ULP wall that `un += us · size`
+/// hits in f32 (when `size < ULP(un) ≈ 6e-8` the add is a no-op and
+/// adjacent sub-frames collapse to the same `un_corner`). Downcast to
+/// f32 only at the return boundary so the caller's Jacobian
+/// evaluation receives the closest representable f32 to the truth.
+///
+/// f64 Horner would also work (backward-accumulate to keep magnitudes
+/// small); the forward-accumulate form here is equivalent in f64 and
+/// matches the original structure — at f64 precision 2e-16, even
+/// a straight forward sum survives to m ≈ 50. Our tree caps MAX_DEPTH
+/// well below that.
 fn uvr_corner(uvr_path: &Path, m: usize) -> (f32, f32, f32, f32) {
-    let mut un = 0.0_f32;
-    let mut vn = 0.0_f32;
-    let mut rn = 0.0_f32;
-    let mut size = 1.0_f32;
+    let mut un = 0.0_f64;
+    let mut vn = 0.0_f64;
+    let mut rn = 0.0_f64;
+    let mut size = 1.0_f64;
     for k in 0..m {
         let slot = uvr_path.slot(k) as usize;
         let (us, vs, rs) = crate::world::tree::slot_coords(slot);
         size /= 3.0;
-        un += us as f32 * size;
-        vn += vs as f32 * size;
-        rn += rs as f32 * size;
+        un += us as f64 * size;
+        vn += vs as f64 * size;
+        rn += rs as f64 * size;
     }
-    (un, vn, rn, size)
+    (un as f32, vn as f32, rn as f32, size as f32)
 }
 
 fn build_logical_path(
