@@ -1383,9 +1383,24 @@ fn sphere_in_sub_frame(
         // shade and return; on empty, advance to the nearest cell
         // boundary and re-loop.
         // ------------------------------------------------------------
+        //
+        // LOD-adaptive walker depth: `face_lod_depth` returns the
+        // walker depth that keeps cell_px at the Nyquist threshold —
+        // same mechanism sphere_in_cell uses. Without this, the fixed
+        // `walker_limit = visual_depth` produces wildly-sized cells:
+        // close rays resolve 1-pixel cells × multi-scale = dense grid
+        // of thin lines; far rays render sub-pixel cells that smear
+        // via bevel_layered's 0.25 band-end clamp. Cap at the CPU-
+        // supplied walker_limit so edits at the user's anchor depth
+        // remain resolvable when a ray is close enough to need that
+        // depth.
+        let shell_body_lod = (outer_r - inner_r) * 3.0;
+        let body_dist_so_far = t * length(rd_body);
+        let lod_depth_ray = face_lod_depth(body_dist_so_far, shell_body_lod);
+        let effective_walker_limit = min(walker_limit, lod_depth_ray);
         let w = walk_from_deep_sub_frame_dyn(
             face_root_idx, uvr_slots, uvr_prefix_len,
-            pos.x, pos.y, pos.z, walker_limit,
+            pos.x, pos.y, pos.z, effective_walker_limit,
         );
 
         if w.block != FACE_WALK_EMPTY {
