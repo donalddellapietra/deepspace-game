@@ -290,8 +290,8 @@ impl WorldPos {
         if (face_slot_idx) >= anchor.depth() as usize {
             // Anchor ends exactly AT the body; no face slot yet. This
             // is legal — e.g., the camera occupies the body cell but
-            // hasn't descended. Leave sphere state unset for now; a
-            // later zoom_in + maybe_enter_sphere will establish it.
+            // hasn't descended. Leave sphere state unset; body-march
+            // rendering handles this case.
             let mut p = Self { anchor, offset, sphere: None };
             p.renormalize_cartesian();
             return p;
@@ -381,11 +381,10 @@ impl WorldPos {
     ///   rescale `sphere.uvr_offset`. The Cartesian `anchor` and
     ///   `offset` are left untouched; all deeper symbolic state
     ///   lives in `sphere.uvr_path`.
-    /// * Otherwise: regular Cartesian push. If the caller cares about
-    ///   body-entry transitions, follow up with
-    ///   `maybe_enter_sphere(&lib, world_root)` — that method walks
-    ///   the tree and initializes `SphereState` when the new anchor
-    ///   cell is a `CubedSphereBody`.
+    /// * Otherwise: regular Cartesian push. The camera may end up
+    ///   with an anchor that has descended into a body's face
+    ///   subtree via Cartesian slots; rendering handles that case
+    ///   through the body march path.
     pub fn zoom_in(&mut self) -> Transition {
         if let Some(sphere) = self.sphere.as_mut() {
             let mut coords = [0usize; 3];
@@ -409,59 +408,6 @@ impl WorldPos {
         let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.anchor.push(slot);
         Transition::None
-    }
-
-    /// After a `zoom_in` / teleport / any repositioning, call this
-    /// to detect whether the new anchor cell is a `CubedSphereBody`
-    /// — if so, initialize the symbolic sphere state from the
-    /// current body-local offset. No-op if `self.sphere` is already
-    /// `Some` or if the current anchor cell isn't a body.
-    pub fn maybe_enter_sphere(
-        &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
-    ) -> Transition {
-        use crate::world::cubesphere::body_point_to_face_space;
-        use crate::world::tree::{Child, NodeKind};
-
-        if self.sphere.is_some() {
-            return Transition::None;
-        }
-        // Walk `anchor` to the deepest node; check if its kind is
-        // CubedSphereBody.
-        let mut node = world_root;
-        for k in 0..self.anchor.depth() as usize {
-            let Some(n) = library.get(node) else { return Transition::None; };
-            let slot = self.anchor.slot(k) as usize;
-            match n.children[slot] {
-                Child::Node(next) => node = next,
-                _ => return Transition::None,
-            }
-        }
-        let Some(n) = library.get(node) else { return Transition::None; };
-        let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind else {
-            return Transition::None;
-        };
-        // Offset is the camera's body-local position in [0, 1)³.
-        // Convert to body-local [0, 3)³ (body_size = 3.0, the render
-        // frame scale) before the face-space lookup.
-        let body_pos = [
-            self.offset[0] * 3.0,
-            self.offset[1] * 3.0,
-            self.offset[2] * 3.0,
-        ];
-        let Some(fp) = body_point_to_face_space(body_pos, inner_r, outer_r, 3.0) else {
-            return Transition::None;
-        };
-        self.sphere = Some(SphereState {
-            body_path: self.anchor,
-            inner_r,
-            outer_r,
-            face: fp.face,
-            uvr_path: Path::root(),
-            uvr_offset: [fp.un, fp.vn, fp.rn],
-        });
-        Transition::SphereEntry { body_path: self.anchor }
     }
 
     /// Vector from `other` to `self`, computed
@@ -515,18 +461,21 @@ impl WorldPos {
         }
     }
 
-    /// Sphere-aware version of `deepened_to`. After each zoom-in,
-    /// calls `maybe_enter_sphere` so crossing into a body triggers
-    /// symbolic-UVR state without the caller having to remember.
+    /// Deepen this position via repeated `zoom_in` until
+    /// `total_depth` reaches the target.
+    ///
+    /// Library + world_root parameters are retained so callers don't
+    /// have to update their signatures; they are currently unused
+    /// (sphere-state auto-entry has been retired — rendering into a
+    /// body cell is handled entirely by the body march path).
     pub fn deepened_to_with(
         mut self,
         target_depth: u8,
-        library: &NodeLibrary,
-        world_root: NodeId,
+        _library: &NodeLibrary,
+        _world_root: NodeId,
     ) -> Self {
         while self.total_depth() < target_depth {
             self.zoom_in();
-            self.maybe_enter_sphere(library, world_root);
         }
         self
     }

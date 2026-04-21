@@ -526,12 +526,6 @@ impl App {
         if new_depth == cur { return; }
         if step > 0 {
             self.camera.position.zoom_in();
-            // A zoom-in into a body cell needs to initialize sphere
-            // state. zoom_in itself can't do that — it doesn't have
-            // tree access. The caller (us) does.
-            self.camera.position.maybe_enter_sphere(
-                &self.world.library, self.world.root,
-            );
         } else {
             self.camera.position.zoom_out();
         }
