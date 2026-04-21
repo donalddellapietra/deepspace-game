@@ -316,14 +316,17 @@ pub fn compute_render_frame(
         let logical_m = sphere.uvr_path.depth();
         let body_depth = sphere.body_path.depth() as i32;
         let m_logical = logical_m as i32;
-        // `desired_depth` caps `m_truncated` — the sub-frame lives at
-        // a DEPTH-CAPPED cell that CONTAINS the user's visible pit
-        // content, not at the camera's ultra-deep cell (which would
-        // be INSIDE a single uniform-stone region and show nothing
-        // of the dug structure). The cap is semantically correct for
-        // LOD; precision-freeze (M_FREEZE=12) handles the precision
-        // wall if/when `m_truncated` reaches the freeze threshold.
-        let m_truncated = (desired_depth as i32 - body_depth - 1).clamp(0, m_logical) as u32;
+        // `m_truncated` scopes the render sub-frame. The old cap
+        // `desired_depth - body_depth - 1` pinned it at 5 (at
+        // RENDER_ANCHOR_DEPTH 14 − RENDER_FRAME_K 3 − body − face),
+        // which lands deep inside a uniform-stone region for the
+        // dig-down test and hides the pit. Instead: cap at a SHALLOW
+        // value so the sub-frame spans a wider area; walker
+        // intra-cell DDA (uncapped for SphereSub via visual_depth)
+        // reaches the pit cells inside that area.
+        const SPHERE_SUB_M_CAP: u32 = 3;
+        let m_truncated = (logical_m as u32).min(SPHERE_SUB_M_CAP);
+        let _ = desired_depth;  // Cartesian-centric; SphereSub ignores.
 
         eprintln!(
             "CRF sphere body_depth={} logical_m={} desired={} m_truncated={} MIN={}",
