@@ -367,14 +367,10 @@ fn analytic_sphere_hit(
 
     if !solid_hit { return result; }
 
-    // Face-normal selection:
-    //   - First-iteration surface hit (camera outside, body on cube
-    //     surface via F⁻¹ of unit-sphere q): use argmax(|body|).
-    //   - Subsequent-step or buried-camera hit: use the axis the DDA
-    //     just crossed. For the buried first-iteration case no step
-    //     happened — fall back to argmax, which picks whichever body
-    //     axis is largest.
-    var n_body = vec3<f32>(0.0);
+    // Bevel UV comes from a face pick (argmax for surface hits,
+    // DDA-tracked axis for interior hits). Face choice only drives
+    // bevel placement — lighting uses a purely radial normal below,
+    // so cube-corner seams don't show in the shading gradient.
     var face_axis: u32 = last_face_axis;
     if is_first_surface_hit || iter_count == 0u {
         let abs_body = abs(body);
@@ -382,30 +378,20 @@ fn analytic_sphere_hit(
         var face_mag: f32 = abs_body.x;
         if abs_body.y > face_mag { face_axis = 1u; face_mag = abs_body.y; }
         if abs_body.z > face_mag { face_axis = 2u; face_mag = abs_body.z; }
-        if face_axis == 0u {
-            n_body = vec3<f32>(select(-1.0, 1.0, body.x > 0.0), 0.0, 0.0);
-        } else if face_axis == 1u {
-            n_body = vec3<f32>(0.0, select(-1.0, 1.0, body.y > 0.0), 0.0);
-        } else {
-            n_body = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, body.z > 0.0));
-        }
-    } else {
-        if face_axis == 0u {
-            n_body = vec3<f32>(last_face_sign, 0.0, 0.0);
-        } else if face_axis == 1u {
-            n_body = vec3<f32>(0.0, last_face_sign, 0.0);
-        } else {
-            n_body = vec3<f32>(0.0, 0.0, last_face_sign);
-        }
     }
     var face_uv = vec2<f32>(0.0);
     if face_axis == 0u { face_uv = body.yz; }
     else if face_axis == 1u { face_uv = body.xz; }
     else { face_uv = body.xy; }
 
-    let j = bergamo_jacobian(body);
-    let j_inv_t = mat3_inverse_transpose(j);
-    let world_n = normalize(j_inv_t * n_body);
+    // World normal: radial out from the sphere center at the hit
+    // position. On the unit-sphere surface this equals `J⁻ᵀ·n_body`
+    // exactly (that's what Bergamo is designed to do) but without
+    // the face-axis discontinuity — so surface voxels and interior
+    // voxels past a carved hole shade continuously, and the Y-seams
+    // where three cube faces meet disappear.
+    let world_hit = ray_origin + unit_dir * t_w;
+    let world_n = normalize(world_hit - sphere_center);
 
     let uv_grid = (face_uv + vec2<f32>(1.0)) * (n_per_axis * 0.5);
     let local_uv = fract(uv_grid);
