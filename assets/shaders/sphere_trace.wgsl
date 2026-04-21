@@ -50,10 +50,13 @@ fn sremap_tree_query(root_node_idx: u32, c: vec3<f32>, max_depth: u32) -> vec2<f
     return vec2<f32>(0.0, 1e-3);
 }
 
-// The sphere body fills the frame's [0, 3)^3 cube when it's the root:
-// centered at (1.5, 1.5, 1.5), radius 1.5.
+// The sphere body sits at the center of the frame's [0, 3)^3 cube.
+// Radius 0.6 gives enough room at the edges to place the camera
+// outside the body without bumping the frame boundary. When the
+// architecture is ready for sphere bodies as sub-cells, these will
+// come from the uniform buffer.
 const SREMAP_BALL_CENTER: vec3<f32> = vec3<f32>(1.5, 1.5, 1.5);
-const SREMAP_BALL_RADIUS: f32 = 1.5;
+const SREMAP_BALL_RADIUS: f32 = 0.6;
 
 // The main sphere trace. The sphere body is a ball of radius
 // SREMAP_BALL_RADIUS centered at SREMAP_BALL_CENTER in the input

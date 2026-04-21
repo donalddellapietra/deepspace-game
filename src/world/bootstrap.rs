@@ -220,12 +220,12 @@ fn bootstrap_remap_sphere_world(layers: u8) -> WorldBootstrap {
 
     let world = WorldState { root, library };
 
-    // Spawn outside the ball in frame-local coords. Ball center is
-    // (1.5, 1.5, 1.5) radius 1.5; sit at (1.5, 1.5, -2.5) looking +Z.
-    // anchor_depth=8: enough subdivision for stable camera motion.
+    // Spawn outside the ball. Camera at (1.5, 1.5, 2.8), on the
+    // +Z side of the ball. Default forward (yaw=0, pitch=0) points
+    // in −Z — straight at the ball center (1.5, 1.5, 1.5).
     let spawn = WorldPos::from_frame_local(
         &Path::root(),
-        [1.5, 1.5, -2.5],
+        [1.5, 1.5, 2.8],
         8,
     );
 
@@ -233,9 +233,12 @@ fn bootstrap_remap_sphere_world(layers: u8) -> WorldBootstrap {
         world,
         planet_path: None,
         default_spawn_pos: spawn,
-        default_spawn_yaw: 0.0,
+        default_spawn_yaw: 0.0, // yaw=0 ⇒ forward = −Z, points at ball center
         default_spawn_pitch: 0.0,
-        plain_layers: layers,
+        // plain_layers == 0 tells App::with_test_config NOT to treat
+        // the spawn as a flat-ground surface (which would override
+        // our default_spawn_pos with plain_surface_spawn).
+        plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
