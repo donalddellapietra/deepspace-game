@@ -12,6 +12,7 @@ pub mod raycast;
 pub mod scene;
 pub mod scenes;
 pub mod sdf;
+pub mod sphere_remap;
 pub mod spherical_worldgen;
 pub mod stars;
 pub mod state;
