@@ -13,6 +13,7 @@ pub mod scene;
 pub mod scenes;
 pub mod sdf;
 pub mod spherical_worldgen;
+pub mod stars;
 pub mod state;
 pub mod tree;
 pub mod worldgen;

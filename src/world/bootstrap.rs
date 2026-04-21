@@ -74,6 +74,10 @@ pub enum WorldPreset {
     Scene {
         id: crate::world::scenes::SceneId,
     },
+    /// Planet + distant stars at varying ribbon depths. Validates
+    /// that the ray-march preserves precision across deep pops —
+    /// stars at ancestor-depth 1 through N−1 must all render.
+    Stars,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -104,6 +108,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::Mausoleum
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
+        | WorldPreset::Stars
         | WorldPreset::Scene { .. } => None,
     }
 }
@@ -172,6 +177,9 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             &path, plain_layers.unwrap_or(8), interior_depth,
         ),
         WorldPreset::Scene { id } => crate::world::scenes::bootstrap_scene_world(id),
+        WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
+            plain_layers.unwrap_or(25),
+        ),
     }
 }
 
