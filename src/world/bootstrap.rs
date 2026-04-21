@@ -49,6 +49,12 @@ pub enum WorldPreset {
     /// Hollow cube — 18-cell architectural shell (12 edges + 6
     /// faces, no corners or body). Brushed-steel + brass palette.
     HollowCube,
+    /// Voxelized-ball planet. World root is `NodeKind::SphereBody`;
+    /// every cell inside the inscribed sphere is stone, outside is
+    /// empty. Shader bends shading normals through the analytic
+    /// cube→sphere Jacobian so the voxel ball renders as a smoothly-
+    /// lit planet. See `world::sphere_worldgen`.
+    SphereBody,
     /// Imported `.vox` / `.vxs` model placed inside a plain world.
     /// Uses the GLB→`.vxs`→tree pipeline (see `src/import/` and
     /// `tools/scene_voxelize/`). The model is planted at the center
@@ -93,7 +99,8 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         WorldPreset::VoxModel { .. } => Some(PLAIN_SURFACE_Y),
         // Every fractal preset leaves entities to fly freely —
         // they don't have a single horizontal ground plane
-        // that a constant sea-level Y could track.
+        // that a constant sea-level Y could track. The sphere body
+        // also has no flat sea level — gravity would be radial.
         WorldPreset::Menger
         | WorldPreset::SierpinskiTet
         | WorldPreset::CantorDust
@@ -102,6 +109,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::Mausoleum
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
+        | WorldPreset::SphereBody
         | WorldPreset::Scene { .. } => None,
     }
 }
@@ -162,6 +170,13 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::HollowCube => {
             crate::world::fractals::hollow_cube::bootstrap_hollow_cube_world(
                 plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::SphereBody => {
+            crate::world::sphere_worldgen::bootstrap_sphere_body_world(
+                plain_layers.unwrap_or(
+                    crate::world::sphere_worldgen::DEFAULT_SPHERE_LAYERS,
+                ),
             )
         }
         WorldPreset::VoxModel { path, interior_depth } => bootstrap_vox_model_world(

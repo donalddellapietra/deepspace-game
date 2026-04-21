@@ -296,16 +296,16 @@ impl Renderer {
             screen_height: sh as f32,
             max_depth: self.max_depth,
             highlight_active: self.highlight_active,
-            root_kind: self.root_kind,
+            sphere_flag: self.sphere_flag,
             ribbon_count: self.ribbon_count,
             entity_count: self.entity_count,
             _pad_entity: [0; 3],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
-            root_radii: self.root_radii,
-            root_face_meta: self.root_face_meta,
-            root_face_bounds: self.root_face_bounds,
-            root_face_pop_pos: self.root_face_pop_pos,
+            sphere_j_inv_t_c0: self.sphere_j_inv_t_c0,
+            sphere_j_inv_t_c1: self.sphere_j_inv_t_c1,
+            sphere_j_inv_t_c2: self.sphere_j_inv_t_c2,
+            sphere_origin: self.sphere_origin,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

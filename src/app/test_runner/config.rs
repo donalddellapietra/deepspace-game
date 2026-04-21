@@ -192,6 +192,7 @@ impl TestConfig {
                 "--mausoleum-world" => { cfg.world_preset = WorldPreset::Mausoleum; }
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
+                "--sphere-world" => { cfg.world_preset = WorldPreset::SphereBody; }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,

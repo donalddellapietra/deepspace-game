@@ -42,12 +42,11 @@ pub enum EntityRenderMode {
 /// 64 covers MAX_DEPTH=63 with one slack.
 pub const MAX_RIBBON_LEN: usize = 64;
 
-/// `root_kind` discriminant — must mirror the WGSL `ROOT_KIND_*`
-/// constants in `bindings.wgsl`. Only `ROOT_KIND_CARTESIAN` is
-/// populated today; the remaining discriminant values are reserved
-/// as a plug-in seam for coordinate systems that layer onto the
-/// Cartesian substrate.
-pub const ROOT_KIND_CARTESIAN: u32 = 0;
+/// `sphere_flag` value meaning "active sphere body — apply cube→sphere
+/// normal remap at shading". Zero means the Cartesian fallback (no
+/// remap). Must mirror the `SPHERE_FLAG_*` constants in `bindings.wgsl`.
+pub const SPHERE_FLAG_OFF: u32 = 0;
+pub const SPHERE_FLAG_ON: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -58,11 +57,11 @@ pub struct GpuUniforms {
     pub screen_height: f32,
     pub max_depth: u32,
     pub highlight_active: u32,
-    /// 0 = Cartesian, 1 = CubedSphereBody. Mirrors the `RootKind*`
-    /// constants. When 1, the shader dispatches into sphere DDA at
-    /// start-of-march; the body fills the `[0, 3)³` frame, and
-    /// `root_inner_r`/`root_outer_r` give the body's radii.
-    pub root_kind: u32,
+    /// `SPHERE_FLAG_OFF` / `SPHERE_FLAG_ON`. When `ON` the shader
+    /// applies `world_normal = normalize(J⁻ᵀ · cube_normal)` at every
+    /// hit — turning the underlying Cartesian voxel cube into a
+    /// sphere-shaded planet. J⁻ᵀ is the matrix below.
+    pub sphere_flag: u32,
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
     pub ribbon_count: u32,
@@ -73,13 +72,16 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Body radii (used iff `root_kind == 1`). Stored in the body
-    /// cell's local `[0, 1)` frame; the shader scales by 3.0
-    /// (= WORLD_SIZE) to get shader-frame units.
-    pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
-    pub root_face_meta: [u32; 4],
-    pub root_face_bounds: [f32; 4],
-    pub root_face_pop_pos: [f32; 4],
+    /// `J⁻ᵀ(origin)` at the current render-frame cell's body-frame
+    /// center, packed as 3 padded vec4 columns — maps directly onto
+    /// a WGSL `mat3x3<f32>` uniform.
+    pub sphere_j_inv_t_c0: [f32; 4],
+    pub sphere_j_inv_t_c1: [f32; 4],
+    pub sphere_j_inv_t_c2: [f32; 4],
+    /// Body-frame `[-1, 1]³` center of the current render cell
+    /// (xyz). `w` reserved. Only read by diagnostics — the shader
+    /// relies on the precomputed `J⁻ᵀ` matrix.
+    pub sphere_origin: [f32; 4],
 }
 
 pub struct Renderer {
@@ -131,11 +133,11 @@ pub struct Renderer {
     pub(super) highlight_active: u32,
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
-    pub(super) root_kind: u32,
-    pub(super) root_radii: [f32; 4],
-    pub(super) root_face_meta: [u32; 4],
-    pub(super) root_face_bounds: [f32; 4],
-    pub(super) root_face_pop_pos: [f32; 4],
+    pub(super) sphere_flag: u32,
+    pub(super) sphere_j_inv_t_c0: [f32; 4],
+    pub(super) sphere_j_inv_t_c1: [f32; 4],
+    pub(super) sphere_j_inv_t_c2: [f32; 4],
+    pub(super) sphere_origin: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -271,14 +273,32 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian (the only variant
-    /// today).
-    pub fn set_root_kind_cartesian(&mut self) {
-        self.root_kind = ROOT_KIND_CARTESIAN;
-        self.root_radii = [0.0; 4];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
+    /// Clear any active sphere-body frame. The shader reverts to
+    /// Cartesian shading (no normal remap). Called whenever the
+    /// camera leaves a `NodeKind::SphereBody` subtree.
+    pub fn clear_sphere_frame(&mut self) {
+        self.sphere_flag = SPHERE_FLAG_OFF;
+        self.sphere_j_inv_t_c0 = [0.0; 4];
+        self.sphere_j_inv_t_c1 = [0.0; 4];
+        self.sphere_j_inv_t_c2 = [0.0; 4];
+        self.sphere_origin = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Install a cube→sphere shading frame for the current render
+    /// frame. Called by the app each time the camera's active frame
+    /// root lives inside a `SphereBody` subtree. The shader evaluates
+    /// the Bergamo Jacobian per pixel using `origin`/`scale` to map
+    /// render-frame-local hit positions into body frame.
+    pub fn set_sphere_frame(&mut self, frame: &crate::world::sphere_frame::SphereFrame) {
+        self.sphere_flag = SPHERE_FLAG_ON;
+        // Reserved: padded to keep the uniform struct stable for
+        // future CPU-side precomputed data (e.g. a J⁻ᵀ fast-path at
+        // deep zoom where per-pixel evaluation is wasted work).
+        self.sphere_j_inv_t_c0 = [0.0; 4];
+        self.sphere_j_inv_t_c1 = [0.0; 4];
+        self.sphere_j_inv_t_c2 = [0.0; 4];
+        self.sphere_origin = [frame.origin[0], frame.origin[1], frame.origin[2], frame.scale];
         self.write_uniforms();
     }
 
@@ -421,7 +441,7 @@ impl Renderer {
     pub(super) fn current_frame_signature(&self) -> FrameSignature {
         FrameSignature {
             root_index: self.root_index,
-            root_kind: self.root_kind,
+            sphere_flag: self.sphere_flag,
             ribbon_count: self.ribbon_count,
         }
     }

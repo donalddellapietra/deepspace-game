@@ -58,28 +58,39 @@ impl GpuChild {
     }
 }
 
-/// Per-packed-node metadata: which `NodeKind` this node is, plus
-/// per-kind data the shader needs. Indexed by BFS position — the
-/// same `node_index` used in `GpuChild::node_index`.
+/// Per-packed-node metadata: which `NodeKind` this node is.
+/// Indexed by BFS position — the same `node_index` used in
+/// `GpuChild::node_index`.
 ///
 /// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns cleanly.
-/// `kind` discriminant: 0 = Cartesian (the only variant today; the
-/// remaining fields are reserved for future coordinate-system plug-ins
-/// that piggyback on the Cartesian substrate).
+/// `kind` discriminant:
+///   - `NODE_KIND_CARTESIAN = 0` — standard subdivision
+///   - `NODE_KIND_SPHERE_BODY = 1` — cube whose inscribed sphere is
+///     the planet; shader bends hits inside it through the cube→sphere
+///     Jacobian at shading time (see `world::sphere_frame`).
+///
+/// The payload slots (`_reserved_*`) are unused today; the shader
+/// binding is kept so future kind variants can piggyback without a
+/// buffer-layout migration.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
     pub kind: u32,
-    pub face: u32,
-    pub inner_r: f32,
-    pub outer_r: f32,
+    pub _reserved_0: u32,
+    pub _reserved_1: f32,
+    pub _reserved_2: f32,
 }
+
+pub const NODE_KIND_CARTESIAN: u32 = 0;
+pub const NODE_KIND_SPHERE_BODY: u32 = 1;
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
-        match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
-        }
+        let kind = match k {
+            NodeKind::Cartesian => NODE_KIND_CARTESIAN,
+            NodeKind::SphereBody => NODE_KIND_SPHERE_BODY,
+        };
+        Self { kind, _reserved_0: 0, _reserved_1: 0.0, _reserved_2: 0.0 }
     }
 }
 
@@ -156,6 +167,12 @@ mod tests {
     #[test]
     fn from_node_kind_cartesian() {
         let k = GpuNodeKind::from_node_kind(NodeKind::Cartesian);
-        assert_eq!(k.kind, 0);
+        assert_eq!(k.kind, NODE_KIND_CARTESIAN);
+    }
+
+    #[test]
+    fn from_node_kind_sphere_body() {
+        let k = GpuNodeKind::from_node_kind(NodeKind::SphereBody);
+        assert_eq!(k.kind, NODE_KIND_SPHERE_BODY);
     }
 }

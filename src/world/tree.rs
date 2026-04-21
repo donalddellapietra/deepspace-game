@@ -82,6 +82,15 @@ pub fn uniform_children(child: Child) -> Children {
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
+    /// Sphere body — this cube's inscribed sphere is the planet.
+    /// Storage and ray traversal are identical to Cartesian; the
+    /// shader bends the shading normal through the cube→sphere
+    /// Jacobian when hits land anywhere inside this subtree.
+    ///
+    /// Content and structure are untouched: the 27 children are
+    /// ordinary Cartesian cells. Only the shading transform is
+    /// different.
+    SphereBody,
 }
 
 impl Default for NodeKind {
@@ -416,6 +425,17 @@ mod tests {
         assert!(lib.get(id).is_some());
         lib.ref_dec(id);
         assert!(lib.get(id).is_none());
+    }
+
+    #[test]
+    fn sphere_body_kind_does_not_dedup_with_cartesian() {
+        let mut lib = NodeLibrary::default();
+        let children = uniform_children(Child::Block(block::STONE));
+        let id_cart = lib.insert_with_kind(children, NodeKind::Cartesian);
+        let id_sphere = lib.insert_with_kind(children, NodeKind::SphereBody);
+        assert_ne!(id_cart, id_sphere);
+        assert_eq!(lib.len(), 2);
+        assert_eq!(lib.get(id_sphere).unwrap().kind, NodeKind::SphereBody);
     }
 
     #[test]
