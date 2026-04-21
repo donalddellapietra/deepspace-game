@@ -107,6 +107,25 @@ impl App {
         let frame = self.render_frame();
         let _ = RENDER_FRAME_CONTEXT;
         let mut frame = frame;
+        // SphereSub frames are NOT popped by the fit loop. The sphere
+        // sub-frame is already at the camera's DEEP UVR cell; popping
+        // it would drop to a shallower cell and reintroduce the
+        // linearization-smear bug (the whole reason compute_render_frame
+        // builds sphere at full depth). If the sphere sub-frame fits,
+        // keep it; if not, the callers' fallback behavior at the
+        // sphere branch is handled upstream by compute_render_frame
+        // (Body fallback when UVR depth < MIN_SPHERE_SUB_DEPTH).
+        if matches!(frame.kind, crate::app::ActiveFrameKind::SphereSub(_)) {
+            if self.startup_profile_frames < 4 {
+                eprintln!(
+                    "target_frame sphere_sub render_path={:?} logical_path={:?} kind={:?}",
+                    frame.render_path.as_slice(),
+                    frame.logical_path.as_slice(),
+                    frame.kind,
+                );
+            }
+            return frame;
+        }
         while frame.render_path.depth() > 0
             && (!self.camera_fits_frame(&frame)
                 || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)

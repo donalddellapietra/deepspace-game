@@ -151,6 +151,7 @@ impl App {
             ScriptCmd::ProbeDown => self.harness_probe_down(),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
             ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
+            ScriptCmd::DigStepDown => self.dig_step_down(),
             ScriptCmd::Step { axis, delta } => {
                 let mut d = [0.0f32; 3];
                 d[axis as usize] = delta;
@@ -265,5 +266,133 @@ impl App {
         );
         self.apply_zoom();
         eprintln!("teleport_above_last_edit: post_apply_zoom active_frame.kind={:?}", self.active_frame.kind);
+    }
+
+    /// Position the camera INSIDE the just-broken cell, at the inner
+    /// side of that cell — i.e. just above the "floor" of the hole we
+    /// dug. The anchor/UVR depth is unchanged from the break: we are
+    /// symbolically standing IN the broken cell, not inside one of its
+    /// children. The subsequent `probe_down` raycast exits through the
+    /// inner face and hits the cell directly below (the r-1 sibling
+    /// inside a sphere, or the -y sibling in Cartesian) at the SAME
+    /// total depth.
+    ///
+    /// Sphere case: `sphere.uvr_path` is set to the broken cell's UVR
+    /// descent, `uvr_offset = (0.5, 0.5, 0.05)` — center-u, center-v,
+    /// just inside the inner-r face. The Cartesian `anchor` is the
+    /// body_path only.
+    /// Cartesian case: `anchor` is the broken cell's full path,
+    /// `offset = (0.5, 0.05, 0.5)` — center-xz, just above -y face.
+    ///
+    /// This is the dig-down primitive: each invocation moves the
+    /// camera one cell closer to the core (sphere) or ground
+    /// (Cartesian) without changing depth. Depth changes only happen
+    /// on a separate `zoom_in` — keeping the "dig at this depth" and
+    /// "descend one depth" operations orthogonal.
+    pub(super) fn dig_step_down(&mut self) {
+        let Some(last) = self.last_edit_slots else {
+            eprintln!("dig_step_down: no last edit recorded; skipping");
+            return;
+        };
+        let in_sphere = path_crosses_sphere_body(
+            &self.world.library, self.world.root, &last,
+        );
+        if in_sphere {
+            // Walk `last` to find the body node + extract inner_r /
+            // outer_r. `body_depth` is the anchor-index at which the
+            // node.kind == CubedSphereBody. The slot AT that index
+            // inside `last` is the face-root slot; slots after that
+            // are UVR descent.
+            use crate::world::cubesphere::Face;
+            let mut node = self.world.root;
+            let mut body_info: Option<(u8, f32, f32)> = None;
+            for k in 0..last.depth() as usize {
+                let Some(n) = self.world.library.get(node) else { break };
+                if let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind {
+                    body_info = Some((k as u8, inner_r, outer_r));
+                    break;
+                }
+                let slot = last.slot(k) as usize;
+                match n.children[slot] {
+                    Child::Node(next) => node = next,
+                    _ => break,
+                }
+            }
+            // Check the terminal node too — `last` may END at the body.
+            if body_info.is_none() {
+                if let Some(n) = self.world.library.get(node) {
+                    if let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind {
+                        body_info = Some((last.depth(), inner_r, outer_r));
+                    }
+                }
+            }
+            let Some((body_depth, inner_r, outer_r)) = body_info else {
+                eprintln!("dig_step_down: sphere path but body node not found; skipping");
+                return;
+            };
+            if (body_depth as usize) >= last.depth() as usize {
+                eprintln!(
+                    "dig_step_down: last edit does not descend into body (body_depth={} path_len={}); skipping",
+                    body_depth, last.depth(),
+                );
+                return;
+            }
+            let face_slot = last.slot(body_depth as usize);
+            let Some(face) = Face::from_body_slot(face_slot) else {
+                eprintln!(
+                    "dig_step_down: edit slot {} is not a face slot; skipping",
+                    face_slot,
+                );
+                return;
+            };
+            let body_path = last.with_truncated(body_depth);
+            let mut uvr_path = Path::root();
+            for k in ((body_depth as usize) + 1)..(last.depth() as usize) {
+                uvr_path.push(last.slot(k));
+            }
+            // uvr_offset: center-u, center-v, just inside the inner-r
+            // face of the broken cell. 0.05 (not 0.0) keeps the camera
+            // well clear of the inner-r face for numerical stability
+            // when the ray starts its march.
+            let uvr_offset = [0.5f32, 0.5, 0.05];
+            self.camera.position = crate::world::anchor::WorldPos {
+                anchor: body_path,
+                offset: uvr_offset,
+                sphere: Some(crate::world::anchor::SphereState {
+                    body_path,
+                    inner_r,
+                    outer_r,
+                    face,
+                    uvr_path,
+                    uvr_offset,
+                }),
+            };
+            eprintln!(
+                "dig_step_down: sphere broken_path={:?} body_depth={} face={:?} uvr_path_depth={} total_depth={}",
+                last.as_slice(),
+                body_depth,
+                face,
+                uvr_path.depth(),
+                self.camera.position.total_depth(),
+            );
+        } else {
+            // Cartesian: camera at (0.5, 0.05, 0.5) inside the broken
+            // cell. The anchor is the broken path as-is (no extra
+            // slot push, unlike teleport_above_last_edit). The next
+            // probe_down then exits through the -y face and hits the
+            // cell below at the same depth.
+            self.camera.position = WorldPos::new(last, [0.5, 0.05, 0.5]);
+            eprintln!(
+                "dig_step_down: cartesian broken_path={:?} anchor_depth={}",
+                last.as_slice(),
+                self.camera.position.anchor.depth(),
+            );
+        }
+        self.apply_zoom();
+        eprintln!(
+            "dig_step_down: post_apply_zoom active_frame.kind={:?} anchor_depth={}",
+            self.active_frame.kind,
+            self.anchor_depth(),
+        );
     }
 }

@@ -383,10 +383,19 @@ impl App {
         // depth (see `RENDER_ANCHOR_DEPTH` docs). We deepen the
         // camera's `WorldPos` using its f32 offset to a constant
         // maximum, so zooming only changes `edit_depth`, not what
-        // the camera *sees*.
-        let desired_depth = RENDER_ANCHOR_DEPTH
+        // the camera *sees*. Exception: sphere pipeline uses
+        // symbolic UVR state and needs to dispatch the sphere branch
+        // at the camera's full UVR depth (see `render_frame`).
+        let cart_desired = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
+        let desired_depth = if position.sphere.is_some() {
+            cart_desired
+                .max(position.total_depth())
+                .min(RENDER_FRAME_MAX_DEPTH)
+        } else {
+            cart_desired
+        };
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &position, desired_depth, RENDER_FRAME_CONTEXT,
         );
@@ -507,12 +516,26 @@ impl App {
     /// render root descends from `world.root` along the camera's
     /// anchor path.
     pub(super) fn render_frame(&self) -> ActiveFrame {
-        // Deepen the camera's anchor to `RENDER_ANCHOR_DEPTH` so
-        // the render frame depth is a function of camera position,
-        // not the user's zoom level. See `RENDER_ANCHOR_DEPTH`.
-        let desired_depth = RENDER_ANCHOR_DEPTH
+        // For Cartesian / Body: cap render depth at
+        // `RENDER_ANCHOR_DEPTH - RENDER_FRAME_K` so render depth is
+        // decoupled from the user's zoom. For Sphere: use the
+        // camera's full symbolic depth so the sphere sub-frame is
+        // built at the camera's actual UVR cell — ribbon-pop
+        // constants don't apply to sphere because the symbolic UVR
+        // state stays precise at any depth. `with_render_margin`
+        // short-circuits the SphereSub case; we must pass a
+        // `desired_depth` large enough that `compute_render_frame`
+        // dispatches the sphere branch at the right depth.
+        let cart_desired = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
+        let desired_depth = if self.camera.position.sphere.is_some() {
+            cart_desired
+                .max(self.camera.position.total_depth())
+                .min(RENDER_FRAME_MAX_DEPTH)
+        } else {
+            cart_desired
+        };
         frame::with_render_margin(
             &self.world.library, self.world.root,
             &self.camera.position, desired_depth, RENDER_FRAME_CONTEXT,

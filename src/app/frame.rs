@@ -263,8 +263,16 @@ pub fn compute_render_frame(
     if let Some(sphere) = camera.sphere.as_ref() {
         let logical_m = sphere.uvr_path.depth();
         let body_depth = sphere.body_path.depth() as i32;
-        let m_logical = logical_m as i32;
-        let m_truncated = (desired_depth as i32 - body_depth - 1).clamp(0, m_logical) as u32;
+        // Sphere sub-frame is ALWAYS built at the camera's FULL symbolic
+        // UVR depth — the whole point of the SphereSub path is that the
+        // symbolic UVR state stays precise at any depth (unlike
+        // `desired_depth`, which is a Cartesian ribbon-pop concept
+        // capped at `RENDER_ANCHOR_DEPTH − RENDER_FRAME_K`). Capping
+        // `m_truncated` by `desired_depth` pins the Jacobian's corner
+        // above depth 5 and smears deep cells into linearization error.
+        // For the sphere pipeline, ignore `desired_depth` entirely and
+        // use the camera's real UVR depth.
+        let m_truncated = logical_m as u32;
 
         eprintln!(
             "CRF sphere body_depth={} logical_m={} desired={} m_truncated={} MIN={}",
@@ -466,6 +474,16 @@ pub fn with_render_margin(
     let target_depth = logical_depth.saturating_sub(render_margin);
     let logical = compute_render_frame(library, world_root, camera, logical_depth);
     if target_depth >= logical_depth {
+        return logical;
+    }
+    // Sphere short-circuit: the SphereSub frame is already built at
+    // the camera's FULL UVR depth (see sphere branch in
+    // `compute_render_frame`) — it doesn't respect `desired_depth`.
+    // The Cartesian "take render_path from render, logical_path from
+    // logical" dance makes no sense for sphere: both calls would
+    // produce the same deep sub-frame, and we'd just double the work.
+    // Return the logical directly.
+    if matches!(logical.kind, ActiveFrameKind::SphereSub(_)) {
         return logical;
     }
     let render = compute_render_frame(library, world_root, camera, target_depth);

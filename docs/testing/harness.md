@@ -111,6 +111,7 @@ means rays are marching through lots of inner tree structure.
 | `probe_down` | CPU raycast straight down in world-space, emit `HARNESS_PROBE`. |
 | `emit:LABEL` | Timeline marker; emit `HARNESS_MARK`. |
 | `teleport_above_last_edit` | Position camera inside the bottom child of the last broken cell at current anchor depth. |
+| `dig_step_down` | Position camera INSIDE the last broken cell at its inner face (sphere: inner-r; Cartesian: -y). Anchor depth unchanged; next `probe_down` hits the cell directly below at the same depth. |
 | `debug_overlay` | Toggle the debug overlay panel. |
 
 ## `HARNESS_*` stdout protocol

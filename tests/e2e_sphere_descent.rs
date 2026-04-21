@@ -170,9 +170,32 @@ fn sphere_probe_anchor_equals_break_anchor() {
 /// Sphere dig-down descent. The user reports the rendered planet
 /// geometry breaks down past UI layer ~18-20 when **digging into**
 /// the planet — not when hovering above. This test reproduces the
-/// actual flow: probe → break → zoom_in → teleport_above_last_edit,
-/// repeated through many layers, with a screenshot at every step so
-/// the visual state is recorded alongside the probe/edit trace.
+/// actual flow: probe → break → dig_step_down → zoom_in:1, repeated
+/// through many layers, with a screenshot at every step so the
+/// visual state is recorded alongside the probe/edit trace.
+///
+/// Per iteration (the classic dig-a-hole pattern):
+///   1. probe_down + break: knock out the cell directly beneath the
+///      camera at the current anchor depth D.
+///   2. dig_step_down: reposition the camera INSIDE the just-broken
+///      cell at `uvr_offset = (0.5, 0.5, 0.05)` — center-u/v, just
+///      inside the inner-r face. Anchor depth is unchanged (still D).
+///   3. zoom_in:1: push a UVR slot matching where the camera sits →
+///      slot `(us=1, vs=1, rs=0)` = 4 = center-u/v, inner-r sub-cell
+///      of the broken cell. Now anchor depth is D+1 and the camera
+///      sits on the floor of that sub-cell, looking at an unbroken
+///      cell directly below it.
+///   4. Next iteration's probe+break fires at depth D+1, one level
+///      deeper into the planet.
+///
+/// The INCORRECT flow this replaces — `zoom_in:1 +
+/// teleport_above_last_edit` — placed the camera at the OUTER-r side
+/// of the broken cell (slot 22), one level DEEPER than the break.
+/// That refined the camera's symbolic position INSIDE the broken
+/// cell instead of stepping to the adjacent cell below, so every
+/// iteration's screenshot collapsed to the same corner view of an
+/// already-broken region. The dig was not descending through the
+/// shell.
 ///
 /// Assertion per layer:
 ///   - probe hits (crosshair has a valid target),
@@ -225,8 +248,18 @@ fn sphere_dig_down_descent() {
             .probe_down()
             .break_()
             .wait(10)
+            // Step camera to the floor of the just-broken cell (same
+            // total depth). The subsequent probe_down would now hit
+            // the r-sibling directly below — the "dig a hole" flow.
+            .dig_step_down()
+            // Descend one anchor level so the NEXT iteration's break
+            // lands at depth D+1. Since the camera sits at the
+            // inner-r edge (uvr_offset.rs ≈ 0.05), zoom_in pushes
+            // slot (1, 1, 0) onto uvr_path — the inner-r child of
+            // the broken cell. Following probe_down then exits that
+            // sub-cell through its inner face and hits the adjacent
+            // unbroken cell at depth D+1.
             .zoom_in(1)
-            .teleport_above_last_edit()
             .wait(5);
         shot_paths.push(shot);
     }
