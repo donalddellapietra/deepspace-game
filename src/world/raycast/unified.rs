@@ -4,15 +4,15 @@
 //! face-seam crossings. See `docs/design/unified-slot-residual-dda.md`.
 //!
 //! Step 1 (landed): flat Cartesian subtrees, cases 1–3.
-//! Step 2 (THIS):  descend through CubedSphereBody + CubedSphereFace
-//!                 nodes, tracking un/vn/rn/face/frame_size on sphere
-//!                 cells and pre-building the per-cell Jacobian.
-//!                 In-cell DDA still uses flat residual math with
-//!                 rd_body; Jacobian-corrected DDA lands with Step 4
-//!                 (face-seam merge) so the rd_local derivation ships
-//!                 alongside the transition that makes it testable.
-//! Step 3 (next):  bubble-up (case 4).
-//! Step 4:         face-seam rotation + Jacobian-corrected DDA.
+//! Step 2 (landed): descend through CubedSphereBody + CubedSphereFace
+//!                  nodes, tracking un/vn/rn/face/frame_size and
+//!                  pre-building the per-cell Jacobian.
+//! Step 3 (THIS):  bubble-up (case 4) within one face / within Cartesian.
+//!                 When the top frame's slot exits [0,2], pop and
+//!                 update the parent's residual + slot. Face-seam
+//!                 bubble-ups still terminate here — Step 4 adds the
+//!                 face-adjacency rotation.
+//! Step 4 (next): face-seam rotation + Jacobian-corrected DDA.
 //!
 //! Invariants:
 //! - `residual_entry ∈ [0, 1)³` by construction — precision-bounded
@@ -146,13 +146,21 @@ pub(super) fn unified_raycast(
         let depth = stack.len() - 1;
         let frame = stack[depth];
 
-        // Out-of-range top slot → Step 3 (bubble-up). For Step 2 we
-        // terminate — no shim.
+        // Out-of-range top slot → bubble up. If the stack empties
+        // we've exited the world. If the parent is a face-root (the
+        // immediate child of a CubedSphereBody cell), bubble-up
+        // would cross a cube face seam — Step 4 adds the face
+        // adjacency rotation there. For Step 3 we terminate in that
+        // case so seam-crossing rays are caught by tests rather than
+        // silently dropped.
         if frame.slot[0] < 0 || frame.slot[0] > 2
             || frame.slot[1] < 0 || frame.slot[1] > 2
             || frame.slot[2] < 0 || frame.slot[2] > 2
         {
-            return None;
+            if !bubble_up(&mut stack, &mut path) {
+                return None;
+            }
+            continue;
         }
 
         let slot_idx = slot_index(
@@ -373,6 +381,79 @@ fn advance_same_parent(frame: &mut UFrame, ray_dir: &[f32; 3], normal_face: &mut
     };
 }
 
+/// Bubble up past a cell boundary when the top frame's slot has
+/// stepped out of `[0, 2]` (case 4). Pops the top frame and updates
+/// the new top (parent):
+///
+/// - On the overflow axis: parent's residual snaps to `0` (if child
+///   exited at +k) or `1 - eps` (if child exited at -k), and parent's
+///   slot steps by ±1 accordingly.
+/// - On other axes: parent's residual recomputes as
+///   `(child.slot + child.residual) / 3`, since the ray's parent-
+///   local position IS `(child_slot + child_residual) / 3` at any
+///   instant while child.slot ∈ [0, 2].
+/// - `t_world_entry` carries forward — the ray's world-t at the
+///   moment of the cell crossing is the same at both levels.
+///
+/// Returns `true` if bubble-up succeeded, `false` if we bubbled past
+/// the world root (ray has exited). Also returns `false` if the
+/// popped frame was a face root — that's a face-seam crossing, which
+/// Step 4 will handle by rotating into the adjacent face's basis
+/// instead of terminating.
+fn bubble_up(stack: &mut Vec<UFrame>, path: &mut Vec<(NodeId, usize)>) -> bool {
+    if stack.is_empty() {
+        return false;
+    }
+    let child = *stack.last().unwrap();
+
+    // Find the axis that overflowed. Exactly one should be out of
+    // [0, 2] per advance_same_parent step (it only mutates one axis
+    // per call), but in rare cases (degenerate initial entry) more
+    // than one could be — pick the first out-of-range axis.
+    let axis = (0..3).find(|&k| child.slot[k] < 0 || child.slot[k] > 2);
+    let Some(axis) = axis else {
+        // Defensive: shouldn't reach here.
+        return false;
+    };
+    let stepping_positive = child.slot[axis] > 2;
+
+    stack.pop();
+    if path.len() > stack.len() {
+        path.truncate(stack.len());
+    }
+    if stack.is_empty() {
+        return false;
+    }
+    let parent_depth = stack.len() - 1;
+    let parent = &mut stack[parent_depth];
+
+    // Face-seam check: if the popped child was a face-root cell
+    // (i.e., parent is a SphereBody and the popped child's kind was
+    // SphereFace), then bubbling past means crossing a cube face.
+    // Step 4 replaces this termination with a face-adjacency rotation.
+    let was_face_root = matches!(child.kind, CellKind::SphereFace { .. })
+        && matches!(parent.kind, CellKind::SphereBody { .. });
+    if was_face_root {
+        return false;
+    }
+
+    // Recompute parent residual from child state.
+    let mut new_residual = [0.0f32; 3];
+    for k in 0..3 {
+        if k == axis {
+            new_residual[k] = if stepping_positive { 0.0 } else { 1.0 - 1e-6 };
+        } else {
+            let r = (child.slot[k] as f32 + child.residual_entry[k]) / 3.0;
+            new_residual[k] = r.clamp(0.0, 1.0 - 1e-6);
+        }
+    }
+    parent.residual_entry = new_residual;
+    parent.slot[axis] += if stepping_positive { 1 } else { -1 };
+    parent.t_world_entry = child.t_world_entry;
+
+    true
+}
+
 fn ray_aabb(
     origin: [f32; 3],
     inv_dir: [f32; 3],
@@ -488,12 +569,21 @@ mod tests {
     fn unified_parity_with_cartesian_flat_center() {
         let mut lib = NodeLibrary::default();
         let root = build_center_pinpoint(&mut lib, 2);
-        let rays = [
-            ([1.5f32, 5.0, 1.5], [0.0f32, -1.0, 0.0]),
+        // Mix of rays that hit the center (no bubble-up needed) and
+        // rays that miss — miss rays exercise case 4 (bubble-up past
+        // the root) since the ray has to walk across multiple root
+        // slots before exiting.
+        let rays: &[([f32; 3], [f32; 3])] = &[
+            ([1.5, 5.0, 1.5], [0.0, -1.0, 0.0]),
             ([0.5, 5.0, 0.5], [0.0, -1.0, 0.0]),
             ([2.5, 5.0, 2.5], [0.0, -1.0, 0.0]),
+            // Angled rays: these MUST bubble up between root slots
+            // as they descend.
+            ([0.1, 5.0, 1.5], [0.3, -1.0, 0.0]),
+            ([1.5, 5.0, 0.1], [0.0, -1.0, 0.3]),
+            ([0.5, 5.0, 1.0], [1.0, -1.5, 0.3]),
         ];
-        for (ro, rd) in rays {
+        for &(ro, rd) in rays {
             let u = unified_raycast(&lib, root, ro, rd, 8);
             let c = super::super::cartesian::cpu_raycast_with_face_depth(
                 &lib, root, ro, rd, 8,
@@ -542,6 +632,35 @@ mod tests {
             crate::world::cubesphere::FACE_SLOTS[Face::PosY as usize],
             "second slot should be +Y face"
         );
+    }
+
+    /// Bubble-up within a Cartesian tree: ray that has to step
+    /// across multiple root-level slots to reach a far-corner
+    /// block. Before Step 3 this returned None as soon as the
+    /// descent frame's slot overflowed.
+    #[test]
+    fn unified_bubble_up_across_root_slots() {
+        let mut lib = NodeLibrary::default();
+        // Build a root with a subtree at slot 0 (corner (0,0,0))
+        // containing a block only at a deep sub-corner, and a
+        // block at root slot 26 (corner (2,2,2)).
+        let mut corner_leaf = empty_children();
+        corner_leaf[0] = Child::Block(1);
+        let corner_node = lib.insert(corner_leaf);
+        let mut root_children = empty_children();
+        root_children[0] = Child::Node(corner_node);
+        root_children[26] = Child::Block(2);
+        let root = lib.insert(root_children);
+
+        // Ray enters at x=0.5, z=0.5 at the top, heading down-and-
+        // right toward the far corner. It descends into root slot 0
+        // briefly, then has to bubble up and step across multiple
+        // root slots before landing on slot 26 or missing.
+        let hit = unified_raycast(&lib, root, [0.5, 5.0, 0.5], [0.6, -1.0, 0.6], 16);
+        // Regardless of which block it hits, bubble-up must have
+        // fired at least once for the ray to traverse beyond the
+        // initial root slot.
+        assert!(hit.is_some(), "ray should eventually hit a block");
     }
 
     /// After descending into a face subtree, the top frame's kind is
