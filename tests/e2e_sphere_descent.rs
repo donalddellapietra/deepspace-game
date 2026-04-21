@@ -264,16 +264,43 @@ fn sphere_dig_down_descent() {
     // 16-colors, stddev of luminance. Uniform flood → low distinct +
     // low stddev; crisp cellular render → many distinct + high
     // stddev.
+    let mut healthy = 0usize;
+    let mut flood = 0usize;
+    let mut weak = 0usize;
     for (i, path) in shot_paths.iter().enumerate() {
         let depth = START_DEPTH as usize + i;
         match analyze_shot(path) {
-            Ok(a) => eprintln!(
-                "MOSAIC_ANALYSIS layer={depth} distinct_16col={} luma_std={:.3} dominant_frac={:.2}",
-                a.distinct_colors, a.luma_std, a.dominant_fraction,
-            ),
+            Ok(a) => {
+                // Classification thresholds tuned for the 480x320
+                // screenshot format:
+                //   flood   → almost-single-color (obvious regression)
+                //   weak    → low distinct/low variance (visible
+                //             "smeared gradient" regression)
+                //   healthy → sufficient variation to render cell
+                //             structure
+                let class = if a.distinct_colors <= 2 && a.luma_std < 2.0 {
+                    flood += 1;
+                    "flood"
+                } else if a.distinct_colors < 15 || a.luma_std < 15.0 {
+                    weak += 1;
+                    "weak"
+                } else {
+                    healthy += 1;
+                    "healthy"
+                };
+                eprintln!(
+                    "MOSAIC_ANALYSIS layer={depth} class={class} distinct_16col={} luma_std={:.3} dominant_frac={:.2}",
+                    a.distinct_colors, a.luma_std, a.dominant_fraction,
+                );
+            }
             Err(e) => eprintln!("MOSAIC_ANALYSIS layer={depth} error={e}"),
         }
     }
+    let total = shot_paths.len();
+    eprintln!(
+        "MOSAIC_SUMMARY total={total} healthy={healthy} weak={weak} flood={flood} see {}",
+        mosaic_path.display(),
+    );
 
     assert!(
         failures.is_empty(),
