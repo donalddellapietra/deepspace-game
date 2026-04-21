@@ -48,18 +48,30 @@ fn fill_box(
     }
 }
 
-/// Minimum tree depth: the hand-crafted 27³ scene occupies 3 levels
-/// (silhouette), plus 1 wrap layer for the camera to sit in.
-const MIN_DEPTH: u8 = 4;
+/// Silhouette depth of the 27³ scene grid (log₃(27) = 3).
+const SILHOUETTE_DEPTH: u8 = 3;
+
+/// One wrap layer: scene sits in the center cell of the root so the
+/// camera has empty air above/beside it to spawn in.
+const WRAPS: u8 = 1;
+
+/// Minimum tree depth: silhouette + wraps. At this depth every voxel
+/// is a single Block leaf (not diggable); raise `plain-layers` to
+/// give each voxel an interior subtree.
+const MIN_DEPTH: u8 = SILHOUETTE_DEPTH + WRAPS;
 
 pub fn bootstrap_glass_test_world(plain_layers: u8) -> WorldBootstrap {
-    // `--plain-layers N` controls how many times the scene is wrapped
-    // inside outer empty nodes — i.e., how small the scene is relative
-    // to the world root. Larger N ⇒ scene placed deeper in the tree
-    // ⇒ camera has to zoom in (deepen anchor) to see it at comparable
-    // angular size. N=6 is the old default (3 wraps). N=20 nests it
-    // 17 wraps deep: UI layer changes to reach the scene.
+    // `--plain-layers N` = total tree depth. The scene's physical
+    // size and shape are fixed (one root-cell wrap, 27³ voxel
+    // silhouette); what changes with N is how deep each voxel's
+    // interior subtree is — i.e., how many layers you can drill
+    // into a single glass/brick/colour block before hitting leaves.
+    //
+    // Mirrors the `--vox-model ... --vox-interior-depth N` pattern
+    // (see `bootstrap_vox_model_world`) but derives interior depth
+    // automatically from `plain-layers` so there's only one knob.
     let total_depth = plain_layers.max(MIN_DEPTH).min(MAX_DEPTH as u8);
+    let interior_depth = total_depth.saturating_sub(SILHOUETTE_DEPTH + WRAPS);
     let mut registry = ColorRegistry::new();
 
     // Pale-cyan glass. Alpha 0.3 is well inside the translucent regime
@@ -112,48 +124,32 @@ pub fn bootstrap_glass_test_world(plain_layers: u8) -> WorldBootstrap {
     fill_box(&mut model, 18, 21, 4, 7, 9, 12, yellow);
 
     let mut lib = NodeLibrary::default();
-    let model_root = tree_builder::build_tree(&model, &mut lib);
+    // Each non-empty voxel becomes a uniform subtree of depth
+    // `interior_depth` — exactly like `bootstrap_vox_model_world`
+    // with `--vox-interior-depth`. That's what makes every glass/
+    // brick block drillable: `plain_layers − SILHOUETTE − WRAPS`
+    // levels of recursion inside every cell.
+    let model_root_id =
+        tree_builder::build_tree_with_interior(&model, &mut lib, interior_depth);
 
-    // GRID=27 → silhouette depth = 3. Wrap up to total_depth by
-    // placing the model at the center slot of each outer layer so
-    // there's empty space above/below/around the scene for the
-    // camera to sit in.
-    let silhouette_depth = 3u8;
-    let wraps = total_depth.saturating_sub(silhouette_depth);
+    // Wrap once: scene sits in the center cell of the root.
     assert!((total_depth as usize) <= MAX_DEPTH);
-    let mut current = model_root;
-    for _ in 0..wraps {
-        let mut children = empty_children();
-        children[CENTER_SLOT] = Child::Node(current);
-        current = lib.insert(children);
-    }
-    lib.ref_inc(current);
-    let world = WorldState { root: current, library: lib };
+    let mut root_children = empty_children();
+    root_children[CENTER_SLOT] = Child::Node(model_root_id);
+    let root_id = lib.insert(root_children);
+    lib.ref_inc(root_id);
+    let world = WorldState { root: root_id, library: lib };
 
-    // Camera sits in front of the glass wall looking in -Z (yaw=0,
-    // codebase's default forward is world -Z). The scene lives at
-    // path [CENTER_SLOT; wraps] — i.e., the center cell of each
-    // wrap layer. Express the camera's position in the SCENE's own
-    // frame so precision doesn't drop at deep wraps:
-    //   scene frame spans [0, 3)³, covering 27³ voxels → 1 voxel =
-    //   (1/9) frame units. Camera in voxel coords = (13.5, 7.5, 22).
-    let mut scene_frame = Path::root();
-    for _ in 0..wraps {
-        scene_frame.push(CENTER_SLOT as u8);
-    }
-    let voxel_to_frame = |vx: f32| 3.0 * (vx / GRID as f32);
-    let cam_x = voxel_to_frame(13.5);
-    let cam_y = voxel_to_frame(7.5);
-    let cam_z = voxel_to_frame(22.0);
-    // Anchor depth: place it at the scene's silhouette depth (one
-    // level above the voxel leaves) so the camera can freely move
-    // within the scene without renormalize thrashing.
-    let anchor_depth = (scene_frame.depth() + silhouette_depth)
-        .min(MAX_DEPTH as u8);
+    // Camera lives in the one wrap layer, in front of the scene.
+    // Scene occupies root cell (1,1,1) which spans [1,2)³ in world
+    // coords. Spawn at (1.5, 1.2, 2.3): horizontally centered on
+    // the scene, just above the scene's floor in y, half-a-cell in
+    // front of the scene's +Z face. Looking −Z (yaw=0) points the
+    // camera through the glass wall toward the brick backdrop.
     let spawn_pos = WorldPos::from_frame_local(
-        &scene_frame,
-        [cam_x, cam_y, cam_z],
-        anchor_depth,
+        &Path::root(),
+        [1.5, 1.2, 2.3],
+        WRAPS,
     );
 
     WorldBootstrap {
