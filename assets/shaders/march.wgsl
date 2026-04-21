@@ -865,6 +865,25 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 current_idx, ray_origin, ray_dir,
                 rd_body_recovered, uniforms.max_depth,
             );
+            // sphere_in_sub_frame's result is authoritative for the
+            // face subtree. On miss, don't ribbon-pop: the next pop
+            // target (the face root) would get march_cartesian run
+            // on it, which treats UVR slots as Cartesian XYZ and
+            // produces visible artifacts (misoriented palette blocks
+            // on diagonal lines at grazing rays). Force a sky return.
+            if r.hit {
+                r.frame_level = ribbon_level;
+                r.frame_scale = cur_scale;
+                return r;
+            }
+            var sky_result: HitResult;
+            sky_result.hit = false;
+            sky_result.t = 1e20;
+            sky_result.frame_level = ribbon_level;
+            sky_result.frame_scale = cur_scale;
+            sky_result.cell_min = vec3<f32>(0.0);
+            sky_result.cell_size = 1.0;
+            return sky_result;
         } else if cur_kind == 1u {
             // Body: whole-sphere march, body fills [0, 3)³.
             r = sphere_in_cell(

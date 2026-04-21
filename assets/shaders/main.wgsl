@@ -63,7 +63,15 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         let lit = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else {
-        let sky_t = ray_dir.y * 0.5 + 0.5;
+        // For SphereSub frames, `ray_dir` is in sub-frame-local coords
+        // with magnitude O(3^m), NOT a unit vector. Using it raw in
+        // `ray_dir.y * 0.5 + 0.5` produces sky_t = O(3^m), then mix()
+        // extrapolates to large negative channels, and `pow(neg, 1/2.2)`
+        // returns NaN → pure-black pixels on diagonal sky paths. For
+        // Cartesian / Body frames ray_dir is already near-unit, so
+        // normalize is idempotent.
+        let nd = normalize(ray_dir);
+        let sky_t = nd.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
