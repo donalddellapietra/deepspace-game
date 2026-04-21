@@ -1,108 +1,94 @@
-//! Voxelized-ball worldgen for `NodeKind::SphereBody` worlds.
+//! World bootstrap for the cube-IS-a-sphere architecture.
 //!
-//! Produces a world whose root is a `SphereBody` cube filled with a
-//! stone ball inscribed in the cube's body-frame `[-1, 1]³`. The
-//! shader bends shading normals through the Bergamo cube→sphere
-//! Jacobian so the ball renders as a smoothly-lit sphere, even though
-//! the underlying data is a cube of voxels.
+//! A "planet" is a uniform stone cube flagged `NodeKind::SphereBody`.
+//! Storage dedups trivially: a cube of N layers = N + 2 unique library
+//! entries (N uniform-stone subtrees + the SphereBody node + the
+//! Cartesian wrapper). Zero voxel surface cells.
 //!
-//! The voxelizer recurses down to `layers` levels, dedupping at every
-//! step. Cells fully inside the inscribed sphere become uniform-stone
-//! subtrees; cells fully outside are empty; cells straddling the
-//! sphere surface are descended into until they resolve or bottom out
-//! at `layers`. At the leaf depth, a cell's center decides its fate.
+//! Rendering is handled by the shader's ray-sphere analytic path —
+//! when the DDA descends into a SphereBody cube, it runs a ray vs
+//! the cube's inscribed sphere instead of traversing interior voxels.
+//! Hits return with a radial world-space normal. See `march.wgsl`.
 //!
-//! Depth trade-off: surface voxel count is `O(3^(2·layers))`. At
-//! `layers=8` this is ≈13 k unique straddling cells — totally fine.
-//! At `layers=40` it would be `10²⁴`; defer that to streaming
-//! worldgen (out of MVP scope).
+//! The uniform-stone interior is kept (not collapsed to a single
+//! `Child::Block`) so future edits (`break`, `place`) can carve into
+//! Cartesian cells. The shader ignores the interior content until the
+//! user actually digs.
 
-use super::anchor::{Path, WorldPos, WORLD_SIZE};
+use super::anchor::{Path, WorldPos};
 use super::palette::block;
 use super::state::WorldState;
 use super::tree::{
-    empty_children, slot_index, Child, NodeId, NodeKind, NodeLibrary, BRANCH, CENTER_SLOT,
+    empty_children, uniform_children, Child, NodeKind, NodeLibrary, CENTER_SLOT,
 };
 
-/// Default voxelization depth. Keeps the surface node count modest
-/// (~10k straddling cells) so the initial pack is fast and the
-/// shader's LOD-terminal path handles any deeper rendering via the
-/// representative-block splat.
+/// Default SphereBody subtree depth. The cube is uniform stone at
+/// every level so depth doesn't affect storage cost (O(layers)
+/// unique nodes); it only sets the max depth available for future
+/// editing.
 pub const DEFAULT_SPHERE_LAYERS: u8 = 8;
 
-/// Build a world whose root is `NodeKind::SphereBody` filled with a
-/// solid stone ball.
-pub fn bootstrap_sphere_body_world(layers: u8) -> crate::world::bootstrap::WorldBootstrap {
+/// Build a world containing a single sphere-body planet. The world
+/// root is a Cartesian wrapper with one SphereBody subtree at the
+/// center slot; every other slot is empty sky so the camera can
+/// stand outside the cube and view the planet.
+pub fn bootstrap_sphere_body_world(
+    layers: u8,
+) -> crate::world::bootstrap::WorldBootstrap {
     let world = build_sphere_body_world(layers);
     crate::world::bootstrap::WorldBootstrap {
-        default_spawn_pos: default_spawn(layers),
-        // Camera at body-frame (+0.8, −0.3, +0.8), looking toward the
-        // body origin. With the engine's basis convention (yaw=0 →
-        // fwd=(0,0,-1), positive yaw LEFT around +y, positive pitch
-        // UP), looking toward origin from (+0.8, −0.3, +0.8) gives
-        // direction = normalize(-0.8, +0.3, -0.8). horiz xz direction
-        // = (-1/√2, -1/√2) ⇒ yaw = π/4; sin(pitch) = 0.3 / √1.37 ⇒
-        // pitch ≈ asin(0.256).
-        default_spawn_yaw: std::f32::consts::FRAC_PI_4,
-        default_spawn_pitch: (0.3_f32 / (0.64_f32 + 0.09 + 0.64).sqrt()).asin(),
+        default_spawn_pos: default_spawn(),
+        // World (2.5, 1.5, 1.5) is in the wrapper's slot 14 (= (2, 1, 1)),
+        // an empty sky cell +x of the planet. Look toward −x to frame the
+        // planet. Engine basis: yaw=0 gives fwd=(0,0,−1); positive yaw
+        // rotates LEFT around +y; so fwd=(−1,0,0) requires yaw=π/2.
+        default_spawn_yaw: std::f32::consts::FRAC_PI_2,
+        default_spawn_pitch: 0.0,
         plain_layers: layers,
         color_registry: crate::world::palette::ColorRegistry::new(),
         world,
     }
 }
 
-fn default_spawn(layers: u8) -> WorldPos {
-    // World root IS the SphereBody spanning [0, WORLD_SIZE=3)³. The
-    // planet is a body-frame radius-`BALL_RADIUS` ball centered at
-    // body (0, 0, 0), which in shader coords is a sphere of radius
-    // `BALL_RADIUS · 1.5` centered at (1.5, 1.5, 1.5). The camera
-    // must stay INSIDE the cube (so a SphereBody ancestor exists
-    // → shader sphere-flag on) but OUTSIDE the ball (otherwise we're
-    // inside stone).
-    //
-    // Spawn well outside the planet but still in the cube, offset
-    // from the sun axis so the terminator is visible: body-frame
-    // (+0.8, −0.3, +0.8) is distance ≈ 1.165 from origin — well
-    // outside the radius-0.5 ball, well inside the cube, and the
-    // visible hemisphere catches both lit (+y) and shadowed (−y)
-    // regions.
-    let anchor_depth = layers.min(crate::world::tree::MAX_DEPTH as u8);
-    WorldPos::from_frame_local(
-        &Path::root(),
-        [2.7, 1.05, 2.7],
-        anchor_depth,
-    )
+fn default_spawn() -> WorldPos {
+    // Wrapper root spans world [0, 3)³. Planet cube at slot 13 spans
+    // world [1, 2)³. Camera at world (2.5, 1.5, 1.5): outside the
+    // cube along +x, centered in y/z, looking back at the planet.
+    // Anchor depth 1 puts the camera's cell at wrapper slot 14 — an
+    // empty sky slot, not inside the SphereBody.
+    WorldPos::from_frame_local(&Path::root(), [2.5, 1.5, 1.5], 1)
 }
 
 fn build_sphere_body_world(layers: u8) -> WorldState {
     assert!(layers > 0, "sphere world must have at least one layer");
     let mut lib = NodeLibrary::default();
 
-    // A reusable uniform-stone subtree of each depth we might need.
-    let mut uniform_stone: Vec<NodeId> = Vec::with_capacity(layers as usize + 1);
-    let mut cur = lib.insert(
-        crate::world::tree::uniform_children(Child::Block(block::STONE)),
-    );
-    uniform_stone.push(cur);
-    for _ in 1..layers {
-        cur = lib.insert(crate::world::tree::uniform_children(Child::Node(cur)));
-        uniform_stone.push(cur);
+    // Uniform-stone subtree of `layers` levels, built bottom-up. Each
+    // `insert(uniform_children(Child::Node(prev)))` adds exactly ONE
+    // library entry (content-addressed dedup — all 27 children point
+    // at the same child NodeId, and that parent is unique per depth).
+    let mut current: Child = Child::Block(block::STONE);
+    for _ in 1..=layers {
+        let node_id = lib.insert(uniform_children(current));
+        current = Child::Node(node_id);
     }
 
-    // Build the SphereBody cube — body-frame [-1, 1]³ voxelized as a
-    // stone ball of radius 1 (the inscribed sphere). World root IS
-    // the SphereBody: the camera spawns in a cube-corner pocket
-    // outside the inscribed ball but inside the cube, so every
-    // visible hit has a SphereBody ancestor and the shader sphere-
-    // flag stays active.
-    let root_children = build_ball_children(
-        &mut lib,
-        &uniform_stone,
-        layers,
-        [0.0, 0.0, 0.0],
-        1.0,
+    // Wrap the stone chain in a SphereBody-flagged node. All 27
+    // children share the same deep-stone NodeId ⇒ adds exactly one
+    // more library entry. The shader reads the `node_kinds[child_bfs]`
+    // entry when deciding whether to descend or to do the analytic
+    // ray-sphere test.
+    let sphere_body = lib.insert_with_kind(
+        uniform_children(current),
+        NodeKind::SphereBody,
     );
-    let root = lib.insert_with_kind(root_children, NodeKind::SphereBody);
+
+    // Cartesian wrapper around the SphereBody. Center slot holds the
+    // planet; the other 26 slots stay empty so the camera has sky to
+    // stand in without ending up under a SphereBody ancestor.
+    let mut root_children = empty_children();
+    root_children[CENTER_SLOT] = Child::Node(sphere_body);
+    let root = lib.insert(root_children);
     lib.ref_inc(root);
 
     let world = WorldState { root, library: lib };
@@ -115,116 +101,58 @@ fn build_sphere_body_world(layers: u8) -> WorldState {
     world
 }
 
-/// Body-frame ball radius. Smaller than 1 so the SphereBody cube has
-/// empty space around the planet — the camera can stand in that
-/// space (still under a SphereBody ancestor, so the shader sphere-
-/// flag stays on) and see the whole ball silhouette from a distance.
-const BALL_RADIUS: f32 = 0.5;
-
-fn build_ball_children(
-    lib: &mut NodeLibrary,
-    uniform_stone: &[NodeId],
-    depth_remaining: u8,
-    center: [f32; 3],
-    half: f32,
-) -> crate::world::tree::Children {
-    let mut children = empty_children();
-    let child_half = half / BRANCH as f32;
-    for sz in 0..BRANCH {
-        for sy in 0..BRANCH {
-            for sx in 0..BRANCH {
-                let slot = slot_index(sx, sy, sz);
-                let cc = [
-                    center[0] + (sx as f32 - 1.0) * 2.0 * child_half,
-                    center[1] + (sy as f32 - 1.0) * 2.0 * child_half,
-                    center[2] + (sz as f32 - 1.0) * 2.0 * child_half,
-                ];
-                children[slot] = build_ball_child(
-                    lib,
-                    uniform_stone,
-                    depth_remaining - 1,
-                    cc,
-                    child_half,
-                );
-            }
-        }
-    }
-    children
-}
-
-fn build_ball_child(
-    lib: &mut NodeLibrary,
-    uniform_stone: &[NodeId],
-    depth_remaining: u8,
-    center: [f32; 3],
-    half: f32,
-) -> Child {
-    let dist = (center[0] * center[0] + center[1] * center[1] + center[2] * center[2]).sqrt();
-    // A cube cell's furthest corner from its center is `half * √3`.
-    // If `dist + half√3 ≤ R`, the entire cell is inside the ball;
-    // if `dist − half√3 ≥ R`, entirely outside.
-    let corner = half * 3.0f32.sqrt();
-    if dist + corner <= BALL_RADIUS {
-        // Fully inside. Emit a uniform-stone subtree of depth equal
-        // to `depth_remaining`. depth_remaining==0 means the cell is
-        // a leaf Block; else an existing uniform-stone node.
-        return if depth_remaining == 0 {
-            Child::Block(block::STONE)
-        } else {
-            Child::Node(uniform_stone[depth_remaining as usize - 1])
-        };
-    }
-    if dist >= BALL_RADIUS + corner {
-        return Child::Empty;
-    }
-    if depth_remaining == 0 {
-        // Leaf: decide by the cell's center. Fine for MVP; a surface-
-        // aware leaf would Bresenham-subsample but the Bergamo normal
-        // remap makes leaf-level decisions invisible past ~depth 6.
-        return if dist < BALL_RADIUS {
-            Child::Block(block::STONE)
-        } else {
-            Child::Empty
-        };
-    }
-    // Mixed cell: recurse.
-    let children = build_ball_children(
-        lib,
-        uniform_stone,
-        depth_remaining,
-        center,
-        half,
-    );
-    Child::Node(lib.insert(children))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn world_root_is_sphere_body() {
+    fn world_root_wraps_sphere_body_at_center_slot() {
         let bs = bootstrap_sphere_body_world(1);
         let root = bs.world.library.get(bs.world.root).expect("root");
-        assert_eq!(root.kind, NodeKind::SphereBody);
-    }
-
-    #[test]
-    fn sphere_body_has_voxels_inside_inscribed_sphere() {
-        let bs = bootstrap_sphere_body_world(2);
-        let root = bs.world.library.get(bs.world.root).unwrap();
-        let mut non_empty = 0;
-        for c in root.children.iter() {
-            if !matches!(c, Child::Empty) { non_empty += 1; }
+        assert_eq!(root.kind, NodeKind::Cartesian);
+        match root.children[CENTER_SLOT] {
+            Child::Node(sphere_id) => {
+                let sphere = bs.world.library.get(sphere_id).expect("sphere body");
+                assert_eq!(sphere.kind, NodeKind::SphereBody);
+            }
+            other => panic!("center slot = {:?}, expected SphereBody node", other),
         }
-        // The ball must produce SOME filled content inside the cube.
-        assert!(non_empty > 0, "sphere body produced zero filled cells");
+        for (i, c) in root.children.iter().enumerate() {
+            if i == CENTER_SLOT {
+                continue;
+            }
+            assert!(matches!(c, Child::Empty), "slot {i} = {:?}", c);
+        }
     }
 
     #[test]
-    fn default_layers_world_builds() {
-        let bs = bootstrap_sphere_body_world(DEFAULT_SPHERE_LAYERS);
+    fn storage_is_linear_in_depth() {
+        // The whole point of the cube-is-a-sphere design: library size
+        // scales linearly with `layers`, not with a surface voxel
+        // count. 40 layers should produce ~40 entries.
+        let bs = bootstrap_sphere_body_world(40);
+        let lib_size = bs.world.library.len();
+        // Expected: 40 uniform-stone nodes + SphereBody node +
+        // Cartesian wrapper = 42. Allow a handful of headroom for any
+        // intermediate bookkeeping nodes, but stay well under the
+        // millions that a voxelized-ball approach would produce.
+        assert!(
+            lib_size < 64,
+            "layers=40 produced {lib_size} library entries — storage not dedupping cleanly",
+        );
+    }
+
+    #[test]
+    fn sphere_body_subtree_is_uniform_stone() {
+        let bs = bootstrap_sphere_body_world(3);
         let root = bs.world.library.get(bs.world.root).unwrap();
-        assert_eq!(root.kind, NodeKind::SphereBody);
+        let Child::Node(sphere_id) = root.children[CENTER_SLOT] else {
+            panic!();
+        };
+        let sphere = bs.world.library.get(sphere_id).unwrap();
+        let first = sphere.children[0];
+        for c in sphere.children.iter() {
+            assert_eq!(*c, first, "SphereBody children must all be the same stone subtree");
+        }
     }
 }

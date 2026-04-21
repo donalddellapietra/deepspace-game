@@ -33,12 +33,6 @@ struct Uniforms {
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
-    /// 0 = Cartesian shading (identity), 1 = cube→sphere remap
-    /// active. When 1, the fragment shader applies
-    /// `world_normal = normalize(J_inv_t * cube_normal)` at every
-    /// hit, turning the underlying Cartesian voxel cube into a
-    /// sphere-shaded planet. J_inv_t is the 3×3 matrix below.
-    sphere_flag: u32,
     /// Number of ancestor ribbon entries available. When the ray
     /// exits the frame's [0, 3)³ bubble at depth 0, the shader
     /// pops upward, walking ribbon[0]..ribbon[ribbon_count-1].
@@ -49,25 +43,9 @@ struct Uniforms {
     /// when zero, there are no EntityRef cells in the tree either,
     /// so the branch is never taken.
     entity_count: u32,
-    _pad_entities_0: u32,
-    _pad_entities_1: u32,
-    _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// `J⁻ᵀ(origin)` packed as three padded vec4 columns — only the
-    /// xyz components carry J's nine entries. The shader reconstructs
-    /// a `mat3x3<f32>` for the normal-remap multiply.
-    sphere_j_inv_t_c0: vec4<f32>,
-    sphere_j_inv_t_c1: vec4<f32>,
-    sphere_j_inv_t_c2: vec4<f32>,
-    /// Body-frame `[-1, 1]³` reference point at which J⁻ᵀ was
-    /// evaluated. Diagnostic only; the shader never re-evaluates
-    /// J and uses the precomputed matrix directly.
-    sphere_origin: vec4<f32>,
 }
-
-const SPHERE_FLAG_OFF: u32 = 0u;
-const SPHERE_FLAG_ON: u32 = 1u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -86,15 +64,19 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    /// 0 = Cartesian, 1 = SphereBody. The ray-march DDA ignores this
-    /// — sphere remap is applied at shading via `uniforms.sphere_flag`
-    /// + the precomputed J⁻ᵀ matrix. The buffer stays bound so future
-    /// per-node metadata can piggyback without a layout migration.
+    /// 0 = Cartesian (standard subdivision), 1 = SphereBody (cube
+    /// whose inscribed sphere is the planet). The DDA reads this per
+    /// descent: when entering a SphereBody cell, it runs an analytic
+    /// ray-vs-sphere test against the cell's inscribed sphere
+    /// instead of traversing interior voxels. See `march.wgsl`.
     kind: u32,
     _reserved_0: u32,
     _reserved_1: f32,
     _reserved_2: f32,
 }
+
+const NODE_KIND_CARTESIAN: u32 = 0u;
+const NODE_KIND_SPHERE_BODY: u32 = 1u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated
@@ -270,6 +252,12 @@ const MAX_STACK_DEPTH: u32 = 8u;
 
 struct HitResult {
     hit: bool,
+    /// True when the hit came from the analytic ray-vs-sphere test in
+    /// a `NodeKind::SphereBody` cell (not from cube-cell DDA). The
+    /// shader skips cube-face bevel on these hits: `normal` is already
+    /// the sphere's radial direction, and `cell_size`/`cell_min` encode
+    /// the inscribed sphere's radius/center rather than a voxel cell.
+    is_sphere: bool,
     color: vec3<f32>,
     normal: vec3<f32>,
     t: f32,

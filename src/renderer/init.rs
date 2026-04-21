@@ -10,7 +10,7 @@ use crate::world::tree::MAX_DEPTH;
 use super::buffers::make_bind_group;
 use super::entity_raster::EntityRasterState;
 use super::taa::{TaaState, MARCH_COLOR_FORMAT, MARCH_T_FORMAT};
-use super::{GpuUniforms, Renderer, SPHERE_FLAG_OFF};
+use super::{GpuUniforms, Renderer};
 
 /// Beam-prepass mask format. R8Unorm reads as f32 in the shader, and
 /// the coarse fragment writes only 0.0 or 1.0 so quantisation is a
@@ -260,16 +260,10 @@ impl Renderer {
             screen_height: config.height as f32,
             max_depth: MAX_DEPTH as u32,
             highlight_active: 0,
-            sphere_flag: SPHERE_FLAG_OFF,
             ribbon_count: 0,
             entity_count: 0,
-            _pad_entity: [0; 3],
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
-            sphere_j_inv_t_c0: [0.0; 4],
-            sphere_j_inv_t_c1: [0.0; 4],
-            sphere_j_inv_t_c2: [0.0; 4],
-            sphere_origin: [0.0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -663,11 +657,6 @@ impl Renderer {
             root_index: root_bfs_index, node_count,
             max_depth: MAX_DEPTH as u32, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
-            sphere_flag: SPHERE_FLAG_OFF,
-            sphere_j_inv_t_c0: [0.0; 4],
-            sphere_j_inv_t_c1: [0.0; 4],
-            sphere_j_inv_t_c2: [0.0; 4],
-            sphere_origin: [0.0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,

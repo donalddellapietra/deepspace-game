@@ -1,13 +1,18 @@
-//! Visual regression test for the cube→sphere normal-remap planet.
+//! Visual regression tests for the cube-IS-a-sphere architecture.
 //!
-//! Boots a `SphereBody`-flagged world headless via the render harness,
-//! captures a screenshot, and asserts that the resulting silhouette
-//! is round — width roughly balanced across the image, growing toward
-//! the equator (quadratic-like), not cube-faceted.
+//! Boots a `SphereBody` world (uniform stone cube wrapped in a
+//! Cartesian shell) via the render harness, captures a screenshot,
+//! and asserts:
 //!
-//! These checks don't try to replace visual review; they just catch
-//! gross regressions (the ball disappears, turns into a cube, or
-//! becomes degenerate) in CI-style automation.
+//! 1. The rendered planet has a round silhouette — produced by the
+//!    shader's analytic ray-vs-inscribed-sphere test, NOT by
+//!    voxelizing a ball shape into the tree.
+//! 2. Shading shows a directional-light terminator — normals come
+//!    from `normalize(hit − sphere_center)`, so the sun-facing side
+//!    is meaningfully brighter than the shadowed side.
+//! 3. Storage dedups to O(depth): a depth-40 planet has <1k library
+//!    entries, not the millions that a voxelized-ball approach
+//!    would produce.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -24,8 +29,6 @@ struct RgbImage {
 }
 
 fn tmp_png(label: &str) -> PathBuf {
-    // Per project convention, test artefacts go in the worktree's
-    // `tmp/` dir (not system /tmp). Create on first use.
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tmp");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!(
@@ -74,10 +77,6 @@ fn load_png(path: &Path) -> RgbImage {
     }
 }
 
-/// A pixel is counted as "planet" if it differs meaningfully from the
-/// sky gradient. The shader's sky colors are blue-ish (R low, B high);
-/// stone terrain hits come out gray. We classify by low saturation
-/// OR high red channel relative to blue.
 fn is_planet_pixel(p: [u8; 3]) -> bool {
     let r = p[0] as i32;
     let g = p[1] as i32;
@@ -85,8 +84,6 @@ fn is_planet_pixel(p: [u8; 3]) -> bool {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let sat = max - min;
-    // Sky: blue > red + ~20, and saturation is moderate-high.
-    // Planet (stone-lit): approximately gray, saturation < 15.
     sat < 25 && max > 30
 }
 
@@ -98,43 +95,56 @@ fn is_sandboxed_gui_startup_blocked(stderr: &str) -> bool {
     has_no_frames && has_launchservices_failure
 }
 
-#[test]
-fn sphere_world_produces_round_silhouette() {
-    let png = tmp_png("silhouette");
-    let output = run_game(&[
-        "--render-harness",
-        "--disable-overlay",
-        "--sphere-world",
-        "--plain-layers",
-        "6",
-        "--harness-width",
-        &WIDTH.to_string(),
-        "--harness-height",
-        &HEIGHT.to_string(),
-        "--screenshot",
-        png.to_str().unwrap(),
-        "--exit-after-frames",
-        "2",
-        "--timeout-secs",
-        "10",
-    ]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn run_sphere_screenshot(
+    label: &str,
+    extra_args: &[&str],
+) -> Option<(RgbImage, String)> {
+    let png = tmp_png(label);
+    let mut args: Vec<String> = vec![
+        "--render-harness".into(),
+        "--disable-overlay".into(),
+        // The harness's cursor highlight paints a yellow glow over
+        // the cube-AABB of whatever the CPU raycast hits. For a
+        // uniform-stone SphereBody that's a big yellow rectangle
+        // swamping the sphere silhouette. Disable so pixel analysis
+        // reads the actual shader output.
+        "--disable-highlight".into(),
+        "--sphere-world".into(),
+        "--harness-width".into(),
+        WIDTH.to_string(),
+        "--harness-height".into(),
+        HEIGHT.to_string(),
+        "--screenshot".into(),
+        png.to_string_lossy().into_owned(),
+        "--exit-after-frames".into(),
+        "2".into(),
+        "--timeout-secs".into(),
+        "10".into(),
+    ];
+    for a in extra_args {
+        args.push((*a).to_string());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let output = run_game(&arg_refs);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if is_sandboxed_gui_startup_blocked(&stderr) {
-        eprintln!("sphere silhouette test: skipping in sandboxed GUI env");
-        return;
+        eprintln!("sphere {label}: skipping in sandboxed GUI env");
+        return None;
     }
     assert!(
         output.status.success(),
         "game exited non-zero\nstderr:\n{stderr}"
     );
-    assert!(
-        png.exists(),
-        "screenshot not written at {:?}\nstderr:\n{stderr}",
-        png
-    );
-    let img = load_png(&png);
+    assert!(png.exists(), "screenshot missing at {:?}", png);
+    Some((load_png(&png), stderr))
+}
 
-    // Count planet pixels on each row.
+#[test]
+fn sphere_world_produces_round_silhouette() {
+    let Some((img, _)) = run_sphere_screenshot("silhouette", &[]) else {
+        return;
+    };
+
     let mut rows: Vec<usize> = Vec::with_capacity(img.height);
     let mut total = 0usize;
     for y in 0..img.height {
@@ -148,26 +158,13 @@ fn sphere_world_produces_round_silhouette() {
         total += n;
     }
 
-    // Sanity: planet covers a meaningful fraction of the frame. The
-    // default camera sits at a cube corner just outside the inscribed
-    // sphere, so a close-range view is expected — allow the planet to
-    // dominate the frame but not fill it entirely (would indicate the
-    // camera wound up inside the ball).
     let frac = total as f64 / (img.width * img.height) as f64;
     assert!(
-        frac > 0.05,
-        "planet covers only {:.2}% of frame (expected >5%)",
-        frac * 100.0
-    );
-    assert!(
-        frac < 0.95,
-        "planet covers {:.2}% of frame (expected <95% — camera should frame ~a planet, not be inside it)",
+        (0.02..0.6).contains(&frac),
+        "planet covers {:.2}% of frame (expected 2-60%)",
         frac * 100.0
     );
 
-    // Silhouette should be widest somewhere near the middle row. Find
-    // the argmax and confirm it sits in the central band (not an edge
-    // artifact).
     let (argmax, max_row) = rows
         .iter()
         .enumerate()
@@ -181,64 +178,30 @@ fn sphere_world_produces_round_silhouette() {
         central_band
     );
 
-    // Silhouette width should fall off toward top and bottom — a
-    // cube-silhouette wouldn't (the cube face fills a flat rectangle).
-    // Compare max row width to the top-and-bottom-edge average. For a
-    // round ball the ratio should comfortably exceed 1.5.
     let edge_band = 20usize.min(img.height / 10);
     let top_avg = rows[..edge_band].iter().sum::<usize>() as f64 / edge_band as f64;
-    let bot_avg = rows[(img.height - edge_band)..].iter().sum::<usize>() as f64 / edge_band as f64;
+    let bot_avg =
+        rows[(img.height - edge_band)..].iter().sum::<usize>() as f64 / edge_band as f64;
     let edge_avg = (top_avg + bot_avg) / 2.0;
     assert!(
-        (max_row as f64) > edge_avg * 1.3 + 1.0,
-        "silhouette width peak {} not meaningfully larger than image-edge avg {:.1}",
+        max_row as f64 > edge_avg * 1.5 + 5.0,
+        "silhouette peak {} not much wider than edges {:.1} — shape looks cubic",
         max_row,
-        edge_avg
+        edge_avg,
     );
 
     eprintln!(
-        "sphere silhouette: total_planet_frac={:.3}, argmax_row={argmax}, max_row_px={max_row}, edge_avg={:.1}",
+        "silhouette: frac={:.3} peak_row={argmax} max_row={max_row} edge_avg={:.1}",
         frac, edge_avg
     );
 }
 
-/// Directional-light gradient: the shader's sun points at
-/// `normalize(0.4, 0.7, 0.3)` — mostly up (+y) and slightly right
-/// (+x). The planet should be brighter on the upper-right than on
-/// the lower-left. If the Jacobian normal-remap is broken (e.g. the
-/// identity fallback kicks in or the transpose is wrong), lighting
-/// collapses to flat-face shading and this differential disappears.
 #[test]
 fn sphere_world_lighting_differential() {
-    let png = tmp_png("terminator");
-    let output = run_game(&[
-        "--render-harness",
-        "--disable-overlay",
-        "--sphere-world",
-        "--plain-layers",
-        "6",
-        "--harness-width",
-        &WIDTH.to_string(),
-        "--harness-height",
-        &HEIGHT.to_string(),
-        "--screenshot",
-        png.to_str().unwrap(),
-        "--exit-after-frames",
-        "2",
-        "--timeout-secs",
-        "10",
-    ]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if is_sandboxed_gui_startup_blocked(&stderr) {
-        eprintln!("sphere lighting test: skipping in sandboxed GUI env");
+    let Some((img, _)) = run_sphere_screenshot("terminator", &[]) else {
         return;
-    }
-    assert!(output.status.success());
-    assert!(png.exists());
-    let img = load_png(&png);
+    };
 
-    // Sample planet-interior pixels in the four image quadrants.
-    // Take a band well inside the silhouette (avoid edge aliasing).
     let cx = img.width as i32 / 2;
     let cy = img.height as i32 / 2;
     let r = (img.height as i32 / 4).min(img.width as i32 / 4);
@@ -255,43 +218,65 @@ fn sphere_world_lighting_differential() {
                     continue;
                 }
                 let p = img.pixels[(y as usize) * img.width + x as usize];
-                if !is_planet_pixel(p) { continue; }
+                if !is_planet_pixel(p) {
+                    continue;
+                }
                 total += p[0] as u64 + p[1] as u64 + p[2] as u64;
                 count += 1;
             }
         }
-        if count == 0 { return 0.0; }
+        if count == 0 {
+            return 0.0;
+        }
         total as f64 / (3.0 * count as f64)
     };
 
-    // Image y grows downward → negative dy means upper quadrants.
     let upper_right = sample_quadrant(r / 2, -r / 2);
     let lower_left = sample_quadrant(-r / 2, r / 2);
     let upper_left = sample_quadrant(-r / 2, -r / 2);
     let lower_right = sample_quadrant(r / 2, r / 2);
+
     eprintln!(
-        "quadrant brightness: UL={:.1} UR={:.1} LL={:.1} LR={:.1}",
+        "quadrants: UL={:.1} UR={:.1} LL={:.1} LR={:.1}",
         upper_left, upper_right, lower_left, lower_right,
     );
 
     assert!(
-        upper_right > 0.0 && lower_left > 0.0,
-        "quadrants didn't contain planet pixels: UR={upper_right:.1} LL={lower_left:.1}"
+        [upper_left, upper_right, lower_left, lower_right]
+            .iter()
+            .all(|&v| v > 0.0),
+        "some quadrant had no planet pixels",
     );
-    // Sun is toward +x (slight right) and mostly +y (image up). Top
-    // should outshine bottom by a meaningful margin if normals are
-    // correctly bent.
+
     let top_avg = (upper_left + upper_right) / 2.0;
     let bot_avg = (lower_left + lower_right) / 2.0;
-    // The visible hemisphere is mostly on +x/+z cube faces with
-    // similar sun-dot products, so the top/bottom differential from
-    // sun-dir (+y dominant) is real but subtle — sampling variance
-    // and gamma compression flatten it further. 1.0 is a conservative
-    // noise floor that still catches "remap is broken" (would give
-    // zero differential with cube-aligned normals in this pose).
     assert!(
-        top_avg > bot_avg + 1.0,
+        top_avg > bot_avg + 5.0,
         "no top/bottom lighting differential: top={top_avg:.1} bot={bot_avg:.1}. \
-         Sphere normal remap likely broken."
+         Under analytic radial normals the +y-heavy sun should light the top much \
+         more than the bottom."
     );
+}
+
+#[test]
+fn sphere_world_storage_is_o_depth() {
+    let Some((_, stderr)) = run_sphere_screenshot("deep-40", &["--plain-layers", "40"]) else {
+        return;
+    };
+    let lib_line = stderr
+        .lines()
+        .find(|l| l.contains("Sphere body world: layers=40"))
+        .expect("worldgen banner missing");
+    for part in lib_line.split(',') {
+        if let Some(stripped) = part.trim().strip_prefix("library_entries=") {
+            let n: u64 = stripped.parse().unwrap();
+            assert!(
+                n < 1_000,
+                "layers=40 produced {n} library entries — dedup broken"
+            );
+            eprintln!("depth-40 library entries: {n}");
+            return;
+        }
+    }
+    panic!("could not parse library_entries from stderr: {lib_line}");
 }

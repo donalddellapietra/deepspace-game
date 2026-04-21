@@ -73,6 +73,7 @@ fn march_entity_subtree(
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
+    result.is_sphere = false;
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
@@ -273,6 +274,7 @@ fn march_cartesian(
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
+    result.is_sphere = false;
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
@@ -577,6 +579,56 @@ fn march_cartesian(
                 continue;
             }
 
+            // SphereBody: the child cube IS a planet. Ray-sphere
+            // against its inscribed sphere; skip interior voxel
+            // traversal entirely. Hit normal = radial outward; miss
+            // = advance DDA past the cell (ray passes through a cube
+            // corner).
+            //
+            // This is the "cube IS a sphere" architecture: storage is
+            // a uniform cube (dedups perfectly, scales to any depth),
+            // rendering is analytic sphere (physically correct
+            // silhouette, O(1) shader work per hit, no voxelized-ball
+            // surface cells).
+            if node_kinds[child_idx].kind == NODE_KIND_SPHERE_BODY {
+                let sb_cell_min = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                let sb_center = sb_cell_min + vec3<f32>(cur_cell_size * 0.5);
+                let sb_radius = cur_cell_size * 0.5;
+                // `ray_sphere_after` assumes a unit direction; the
+                // march's `ray_dir` is the un-normalized camera-basis
+                // vector so we solve the quadratic in `t_unit` under
+                // a normalized direction, then rescale to the
+                // parameter of the original ray.
+                let dir_len = length(ray_dir);
+                let unit_dir = ray_dir * (1.0 / dir_len);
+                let t_unit = ray_sphere_after(
+                    ray_origin, unit_dir, sb_center, sb_radius, 0.0,
+                );
+                if t_unit > 0.0 {
+                    let t_sphere = t_unit / dir_len;
+                    let hit_world = ray_origin + ray_dir * t_sphere;
+                    let radial = (hit_world - sb_center) * (1.0 / sb_radius);
+                    result.hit = true;
+                    result.is_sphere = true;
+                    result.t = t_sphere;
+                    let rep = select(0u, u32(child_bt), child_bt < 0xFFFEu);
+                    result.color = palette[rep].rgb;
+                    result.normal = radial;
+                    result.cell_min = sb_center;
+                    result.cell_size = sb_radius;
+                    return result;
+                }
+                // Ray missed the inscribed sphere. Advance DDA past
+                // the cube cell — the ray clipped a corner. No need to
+                // descend; the cube's corner cells are "invisible" in
+                // the sphere-IS-cube architecture.
+                let m_sphere_miss = min_axis_mask(cur_side_dist);
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_sphere_miss) * step);
+                cur_side_dist += m_sphere_miss * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_sphere_miss;
+                continue;
+            }
+
             // Cartesian Node: depth/LOD check, then descend.
             // depth_limit = MAX_STACK_DEPTH — LOD controls the
             // effective depth, not an artificial per-shell budget.
@@ -858,6 +910,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
 
     var result: HitResult;
     result.hit = false;
+    result.is_sphere = false;
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = cur_scale;

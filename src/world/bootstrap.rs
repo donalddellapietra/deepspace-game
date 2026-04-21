@@ -49,11 +49,12 @@ pub enum WorldPreset {
     /// Hollow cube — 18-cell architectural shell (12 edges + 6
     /// faces, no corners or body). Brushed-steel + brass palette.
     HollowCube,
-    /// Voxelized-ball planet. World root is `NodeKind::SphereBody`;
-    /// every cell inside the inscribed sphere is stone, outside is
-    /// empty. Shader bends shading normals through the analytic
-    /// cube→sphere Jacobian so the voxel ball renders as a smoothly-
-    /// lit planet. See `world::sphere_worldgen`.
+    /// Cube-IS-sphere planet. A uniform stone cube flagged
+    /// `NodeKind::SphereBody` sits at the center of a Cartesian
+    /// wrapper; the shader runs an analytic ray-vs-inscribed-sphere
+    /// test when the DDA descends into that cube. Storage is O(depth),
+    /// silhouette is a true sphere, and deep zoom is free because
+    /// the content is one uniform subtree. See `world::sphere_worldgen`.
     SphereBody,
     /// Imported `.vox` / `.vxs` model placed inside a plain world.
     /// Uses the GLB→`.vxs`→tree pipeline (see `src/import/` and

@@ -263,19 +263,6 @@ impl App {
             renderer.set_max_depth(effective_visual_depth);
             renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
-            // Check the tree for an active SphereBody ancestor of the
-            // render frame. If found, upload its precomputed J⁻ᵀ so
-            // the shader bends normals through the cube→sphere remap
-            // for hits inside it. Otherwise revert to plain Cartesian
-            // shading.
-            match crate::world::sphere_frame::find_active_sphere_frame(
-                &self.world.library,
-                self.world.root,
-                &effective_path,
-            ) {
-                Some(frame) => renderer.set_sphere_frame(&frame),
-                None => renderer.clear_sphere_frame(),
-            }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;

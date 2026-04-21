@@ -47,78 +47,6 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 /// uses this same value so visual output stays consistent with the
 /// non-TAAU path; the gamma-space clamp + blend in the resolve shader
 /// is a small precision hit but not a visible one.
-/// Analytic Bergamo cube→sphere Jacobian evaluated at body-frame
-/// `p ∈ [-1, 1]³`. Returns row-major J; `j[i][j] = ∂s_i/∂p_j`.
-/// See `src/world/sphere_frame.rs` for the derivation.
-fn bergamo_jacobian(p: vec3<f32>) -> mat3x3<f32> {
-    let x = p.x;
-    let y = p.y;
-    let z = p.z;
-    let ax = max(1e-12, 1.0 - 0.5 * y * y - 0.5 * z * z + y * y * z * z / 3.0);
-    let ay = max(1e-12, 1.0 - 0.5 * z * z - 0.5 * x * x + z * z * x * x / 3.0);
-    let az = max(1e-12, 1.0 - 0.5 * x * x - 0.5 * y * y + x * x * y * y / 3.0);
-    let sax = sqrt(ax);
-    let say = sqrt(ay);
-    let saz = sqrt(az);
-    // row 0 = ∂s_x/∂(x,y,z)
-    let row0 = vec3<f32>(sax, x * y * (2.0 * z * z - 3.0) / (6.0 * sax), x * z * (2.0 * y * y - 3.0) / (6.0 * sax));
-    let row1 = vec3<f32>(y * x * (2.0 * z * z - 3.0) / (6.0 * say), say, y * z * (2.0 * x * x - 3.0) / (6.0 * say));
-    let row2 = vec3<f32>(z * x * (2.0 * y * y - 3.0) / (6.0 * saz), z * y * (2.0 * x * x - 3.0) / (6.0 * saz), saz);
-    // WGSL mat3x3 is column-major: pass columns, not rows.
-    return mat3x3<f32>(
-        vec3<f32>(row0.x, row1.x, row2.x),
-        vec3<f32>(row0.y, row1.y, row2.y),
-        vec3<f32>(row0.z, row1.z, row2.z),
-    );
-}
-
-/// Inverse-transpose of a 3×3 matrix. Stable at voxel-face hits —
-/// degeneracy only occurs at the 8 cube corners (measure-zero set).
-fn mat3_inverse_transpose(m: mat3x3<f32>) -> mat3x3<f32> {
-    // m is column-major; access entries as m[col][row].
-    let a = m[0][0]; let d = m[0][1]; let g = m[0][2];
-    let b = m[1][0]; let e = m[1][1]; let h = m[1][2];
-    let c = m[2][0]; let f = m[2][1]; let i = m[2][2];
-    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    let inv_det = 1.0 / det;
-    // Cofactor matrix ÷ det = m⁻¹ (row-major). Then transpose → (m⁻¹)ᵀ.
-    // We return (m⁻¹)ᵀ as a column-major mat3x3; column k of (m⁻¹)ᵀ = row k of m⁻¹.
-    let r0 = vec3<f32>( (e * i - f * h), -(b * i - c * h),  (b * f - c * e)) * inv_det;
-    let r1 = vec3<f32>(-(d * i - f * g),  (a * i - c * g), -(a * f - c * d)) * inv_det;
-    let r2 = vec3<f32>( (d * h - e * g), -(a * h - b * g),  (a * e - b * d)) * inv_det;
-    return mat3x3<f32>(r0, r1, r2);
-}
-
-/// Apply the cube→sphere normal remap when `uniforms.sphere_flag` is
-/// set. `cube_normal` is the axis-aligned hit normal from DDA;
-/// `hit_render_local` is the hit position in the current render
-/// frame's `[0, 3)³` coords. Evaluates J per pixel at the hit's
-/// body-frame position so normals bend correctly across the whole
-/// sphere — not just a single linearization point.
-///
-/// Body-frame conversion: `sphere_origin` is the body-frame center
-/// of the render-frame root cell, and `sphere_j_inv_t_c0.w` carries
-/// the render-frame-to-body-frame scale (a single f32). Together:
-///   `body_pos = sphere_origin.xyz + (hit_render_local − 1.5) · scale`
-/// where the 1.5 shift re-centers the render frame's (1.5, 1.5, 1.5)
-/// midpoint onto the body-frame origin.
-fn sphere_shade_normal(cube_normal: vec3<f32>, hit_render_local: vec3<f32>) -> vec3<f32> {
-    if uniforms.sphere_flag != SPHERE_FLAG_ON {
-        return cube_normal;
-    }
-    let scale = uniforms.sphere_origin.w;
-    let body_pos = uniforms.sphere_origin.xyz + (hit_render_local - vec3<f32>(1.5)) * scale;
-    let body_clamped = clamp(body_pos, vec3<f32>(-1.0), vec3<f32>(1.0));
-    let j = bergamo_jacobian(body_clamped);
-    let j_inv_t = mat3_inverse_transpose(j);
-    let remapped = j_inv_t * cube_normal;
-    let n2 = dot(remapped, remapped);
-    if n2 < 1e-12 {
-        return cube_normal;
-    }
-    return remapped * inverseSqrt(n2);
-}
-
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir = jittered_ray_dir(uv);
     let result = march(camera.pos, ray_dir);
@@ -126,12 +54,15 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     var color: vec3<f32>;
     if result.hit {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-        let hit_pos = camera.pos + ray_dir * result.t;
-        let world_normal = sphere_shade_normal(result.normal, hit_pos);
-        let diffuse = max(dot(world_normal, sun_dir), 0.0);
+        let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
+        let hit_pos = camera.pos + ray_dir * result.t;
         let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
-        let bevel = cube_face_bevel(local, result.normal);
+        // Cube-face bevel only applies to cube hits. On analytic sphere
+        // hits `result.cell_size` is the sphere's radius and `result.normal`
+        // is already the radial direction — the bevel math misreads it,
+        // so leave bevel=1 there to keep shading smooth.
+        let bevel = select(cube_face_bevel(local, result.normal), 1.0, result.is_sphere);
         let lit = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else {

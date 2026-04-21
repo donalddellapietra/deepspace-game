@@ -106,11 +106,6 @@ pub struct TaaUniforms {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct FrameSignature {
     pub root_index: u32,
-    /// Captures the sphere-remap mode (0 = Cartesian shading, 1 =
-    /// sphere). A mode change invalidates TAA history just like a
-    /// frame-root swap: lighting normals differ, so blending against
-    /// last frame is unsafe.
-    pub sphere_flag: u32,
     pub ribbon_count: u32,
 }
 
@@ -404,8 +399,8 @@ mod tests {
 
     #[test]
     fn signature_equality() {
-        let a = FrameSignature { root_index: 0, sphere_flag: 0, ribbon_count: 0 };
-        let b = FrameSignature { root_index: 0, sphere_flag: 0, ribbon_count: 0 };
+        let a = FrameSignature { root_index: 0, ribbon_count: 0 };
+        let b = FrameSignature { root_index: 0, ribbon_count: 0 };
         assert_eq!(a, b);
         let c = FrameSignature { root_index: 1, ..a };
         assert_ne!(a, c);
