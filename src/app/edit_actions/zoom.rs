@@ -40,10 +40,18 @@ impl App {
             let extra = (pixels / FRAME_VISUAL_MIN_PIXELS).ln() / 3.0_f32.ln();
             extra.floor().max(1.0) as u32
         };
-        local_target
+        let mut vd = local_target
             .min(local_cap)
             .min(MAX_LOCAL_VISUAL_DEPTH)
-            .min(crate::world::tree::MAX_DEPTH as u32)
+            .min(crate::world::tree::MAX_DEPTH as u32);
+        // Hard cap for SphereSub: deeper walker descent in the sub-
+        // frame's `[0, 3)³` local box crosses f32 ULP precision at
+        // cell boundaries (pos = ro + rd*t cancellation). See
+        // `SPHERE_SUB_WALKER_MAX_DEPTH`.
+        if matches!(self.active_frame.kind, crate::app::ActiveFrameKind::SphereSub(_)) {
+            vd = vd.min(crate::app::frame::SPHERE_SUB_WALKER_MAX_DEPTH);
+        }
+        vd
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {

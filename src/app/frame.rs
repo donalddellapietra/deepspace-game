@@ -123,6 +123,24 @@ pub const MIN_SPHERE_SUB_DEPTH: u8 = 3;
 /// sphere interaction without the linearization.
 pub const SPHERE_WALKER_BUDGET: u32 = 1;
 
+/// Hard cap on walker descent INSIDE a `SphereSub` render frame.
+///
+/// The sub-frame DDA operates in local `[0, 3)³` coords where `|rd_local|`
+/// scales as `3^M_sub`. Per-DDA-step `pos = ro + rd*t` has f32 ULP of
+/// ~1e-7 absolute (pos magnitude stays O(1) in local). Each walker
+/// descent halves ... no, *trices* cell size: at walker depth K, cell
+/// size = `3^(1-K)` local. Precision vs cell ratio = `1e-7 * 3^K`.
+/// That crosses 1% of cell width at K ≈ 8 — past which cell boundaries
+/// become indistinguishable from noise and rendered geometry visibly
+/// collapses into pyramid-shaped ULP artifacts.
+///
+/// The Cartesian march caps at `MAX_STACK_DEPTH = 8` for the same
+/// reason (f32 precision at local-frame scale); this is the sphere
+/// analog. User anchor depth can go arbitrarily deep (up to 64
+/// layers); the walker just doesn't render past the precision-safe
+/// detail level, same way `RENDER_ANCHOR_DEPTH = 14` caps Cartesian.
+pub const SPHERE_SUB_WALKER_MAX_DEPTH: u32 = 8;
+
 /// Resolve the active render frame from a camera WorldPos +
 /// desired anchor depth.
 ///

@@ -80,6 +80,15 @@ impl App {
                 let cam_local = self.camera.position.in_sub_frame(&sub);
                 let ray_dir_body = self.ray_dir_in_frame(&sub.body_path);
                 let render_path = sub.render_path;
+                // Cap walker descent at the precision-safe limit.
+                // The sub-frame DDA operates in `[0, 3)³` local with
+                // f32 pos precision ~1e-7; past walker_limit ~8 the
+                // cell boundaries collapse into ULP noise. See
+                // `SPHERE_SUB_WALKER_MAX_DEPTH`.
+                let render_depth = render_path.depth() as u32;
+                let walker_edit_depth = self.edit_depth().min(
+                    render_depth + crate::app::frame::SPHERE_SUB_WALKER_MAX_DEPTH,
+                );
                 let hit = raycast::cpu_raycast_in_sub_frame(
                     &self.world.library,
                     self.world.root,
@@ -87,7 +96,7 @@ impl App {
                     render_path.as_slice(),
                     cam_local,
                     ray_dir_body,
-                    self.edit_depth(),
+                    walker_edit_depth,
                     lod,
                 );
                 (hit, sub.body_path)
