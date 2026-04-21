@@ -182,6 +182,71 @@ fn bergamo_inverse(q: vec3<f32>) -> vec3<f32> {
     return body;
 }
 
+// Walk the packed tree from `root_bfs` down `depth` levels to decide
+// whether the body-voxel at integer grid `(gx, gy, gz)` (each in
+// `[0, 3^depth)`) is solid stone or an empty carved-out cell.
+//
+// At each level, the grid's current slot digit (base-3, most-
+// significant first) is decoded, combined into a 27-slot index, and
+// looked up in the node's occupancy mask. Hits can terminate early
+// at any tag=1 (flattened Block) cell — the uniform-stone subtree is
+// flat at pack time, so that's the common case. tag=2 descends
+// further. tag=0 (empty slot) = the voxel has been carved, return
+// false so the caller renders a hole.
+//
+// Returns `true` if the voxel is solid. Returns `false` on empty or
+// any unexpected tag / out-of-bounds BFS.
+fn sphere_body_voxel_solid(
+    root_bfs: u32,
+    grid: vec3<i32>,
+    depth: u32,
+) -> bool {
+    var cur_bfs = root_bfs;
+    // Starting shift: 3^(depth-1). For depth=3, shift=9 picks the
+    // most-significant base-3 digit.
+    var shift: i32 = 1;
+    for (var d: u32 = 1u; d < depth; d = d + 1u) {
+        shift = shift * 3;
+    }
+
+    for (var d: u32 = 0u; d < depth; d = d + 1u) {
+        let sx = (grid.x / shift) % 3;
+        let sy = (grid.y / shift) % 3;
+        let sz = (grid.z / shift) % 3;
+        let slot = u32(sx + sy * 3 + sz * 9);
+
+        let header_off = node_offsets[cur_bfs];
+        let occ = tree[header_off];
+        let first_child = tree[header_off + 1u];
+        let slot_bit = 1u << slot;
+        if (occ & slot_bit) == 0u {
+            return false;
+        }
+        let rank = countOneBits(occ & (slot_bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
+        if tag == 1u {
+            // Flattened leaf. Empty sentinel (0xFFFE) = hole; anything
+            // else = real block.
+            let bt = (packed >> 8u) & 0xFFFFu;
+            return bt != 0xFFFEu;
+        }
+        if tag != 2u {
+            // Unknown tag (tag=0 never appears; tag=3 = entity cell
+            // shouldn't live inside a SphereBody).
+            return false;
+        }
+        cur_bfs = tree[child_base + 1u];
+        shift = shift / 3;
+    }
+
+    // Walked the full depth and still on tag=2. The deeper subtree is
+    // non-empty (we'd have bailed on tag=1 with the empty sentinel),
+    // so the voxel is solid.
+    return true;
+}
+
 // Analytic ray-vs-sphere-body hit. Runs ray-sphere against the
 // inscribed sphere at `(sphere_center, sphere_radius)` (render-frame
 // local coords); on hit, inverts Bergamo's F to find the cube-surface
@@ -206,6 +271,8 @@ fn analytic_sphere_hit(
     sphere_radius: f32,
     rep_block: u32,
     n_per_axis: f32,
+    body_root_bfs: u32,
+    body_depth: u32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -258,6 +325,28 @@ fn analytic_sphere_hit(
     let edge = min(min(local_uv.x, 1.0 - local_uv.x),
                    min(local_uv.y, 1.0 - local_uv.y));
     let bevel = smoothstep(0.02, 0.14, edge);
+
+    // Resolve the body-grid integer index from `body_hit`. N voxels
+    // per axis in body space means each axis maps `[-1, 1]` → `[0, N)`.
+    // On the selected face the face axis is pinned to the ±1-most
+    // voxel (N-1 or 0).
+    let n_int = i32(n_per_axis);
+    let grid_f = (body_hit + vec3<f32>(1.0)) * (n_per_axis * 0.5);
+    var grid = vec3<i32>(
+        clamp(i32(floor(grid_f.x)), 0, n_int - 1),
+        clamp(i32(floor(grid_f.y)), 0, n_int - 1),
+        clamp(i32(floor(grid_f.z)), 0, n_int - 1),
+    );
+
+    // Walk the body tree. If the voxel is solid we render the patch;
+    // if the voxel has been carved (empty), return a miss so the
+    // pixel shows the sky (for thin holes; deep carving needs a
+    // curved-ray DDA that's still TODO).
+    let solid = sphere_body_voxel_solid(body_root_bfs, grid, body_depth);
+    if !solid {
+        result.hit = false;
+        return result;
+    }
 
     result.hit = true;
     result.is_sphere = true;

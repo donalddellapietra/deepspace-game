@@ -267,14 +267,18 @@ impl App {
             // render frame lives inside a SphereBody subtree, so surface
             // view and external view render via the same analytic path
             // and don't show a transition at the sphere-body boundary.
+            // Also pass the SphereBody's BFS so the shader can walk the
+            // body-voxel tree and surface broken cells as holes.
             let sphere_info = crate::world::sphere_frame::find_active_sphere_body(
                 &self.world.library,
                 self.world.root,
                 effective_path.as_slice(),
             );
-            renderer.set_sphere_body_active(
-                sphere_info.map(|info| (info.center, info.radius)),
-            );
+            let cache_ref = self.cached_tree.as_ref();
+            renderer.set_sphere_body_active(sphere_info.and_then(|info| {
+                let bfs = cache_ref?.bfs_by_nid.get(&info.node_id).copied()?;
+                Some((info.center, info.radius, bfs))
+            }));
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;

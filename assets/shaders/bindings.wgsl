@@ -52,6 +52,13 @@ struct Uniforms {
     /// running the Cartesian DDA — so surface view and space view use
     /// the same rendering path with no transition.
     sphere_body_active: vec4<f32>,
+    /// BFS index of the active SphereBody node in the packed tree.
+    /// Used by `analytic_sphere_hit` to walk body-voxel sub-cells so
+    /// edits (broken voxels) appear as holes.
+    sphere_body_root_bfs: u32,
+    _pad_sphere_0: u32,
+    _pad_sphere_1: u32,
+    _pad_sphere_2: u32,
 }
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer

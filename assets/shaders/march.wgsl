@@ -592,6 +592,8 @@ fn march_cartesian(
                     ray_origin, ray_dir,
                     sb_center, sb_radius,
                     rep, 27.0,
+                    child_idx,          // SphereBody's own BFS — its subtree is the body-voxel tree
+                    3u,                 // walk 3 levels to match N=27
                 );
                 if sphere_result.hit {
                     return sphere_result;
@@ -819,8 +821,10 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             world_ray_origin, world_ray_dir,
             uniforms.sphere_body_active.xyz,
             uniforms.sphere_body_active.w,
-            0u,      // stone (only material in the MVP planet)
-            27.0,    // voxel-grid resolution per face
+            0u,                                 // stone (MVP planet)
+            27.0,                               // N voxels per axis
+            uniforms.sphere_body_root_bfs,      // root of body tree
+            3u,                                 // log3(27) — walk 3 levels
         );
     }
 

@@ -66,6 +66,13 @@ pub struct GpuUniforms {
     /// view). Computed per frame by walking from world root along the
     /// render-frame path in search of a SphereBody ancestor.
     pub sphere_body_active: [f32; 4],
+    /// BFS index of the active SphereBody node in the packed GPU
+    /// tree. Only meaningful when `sphere_body_active.w > 0`. The
+    /// analytic-sphere shader uses this as the root for body-voxel
+    /// tree walks, so carved-out cells render as holes instead of
+    /// solid stone.
+    pub sphere_body_root_bfs: u32,
+    pub _pad_sphere: [u32; 3],
 }
 
 pub struct Renderer {
@@ -118,6 +125,7 @@ pub struct Renderer {
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
     pub(super) sphere_body_active: [f32; 4],
+    pub(super) sphere_body_root_bfs: u32,
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -254,11 +262,22 @@ pub(super) fn create_depth_texture(
 
 impl Renderer {
     /// Upload the render-frame-local center/radius of the active
-    /// SphereBody ancestor, or `None` to clear.
-    pub fn set_sphere_body_active(&mut self, info: Option<([f32; 3], f32)>) {
+    /// SphereBody ancestor along with its BFS index in the packed
+    /// tree (so the shader can walk body-voxel sub-cells during
+    /// analytic shading). `None` clears — no SphereBody ancestor.
+    pub fn set_sphere_body_active(
+        &mut self,
+        info: Option<([f32; 3], f32, u32)>,
+    ) {
         match info {
-            Some((c, r)) => self.sphere_body_active = [c[0], c[1], c[2], r],
-            None => self.sphere_body_active = [0.0; 4],
+            Some((c, r, bfs)) => {
+                self.sphere_body_active = [c[0], c[1], c[2], r];
+                self.sphere_body_root_bfs = bfs;
+            }
+            None => {
+                self.sphere_body_active = [0.0; 4];
+                self.sphere_body_root_bfs = 0;
+            }
         }
         self.write_uniforms();
     }

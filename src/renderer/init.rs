@@ -265,6 +265,8 @@ impl Renderer {
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             sphere_body_active: [0.0; 4],
+            sphere_body_root_bfs: 0,
+            _pad_sphere: [0; 3],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -659,6 +661,7 @@ impl Renderer {
             max_depth: MAX_DEPTH as u32, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             sphere_body_active: [0.0; 4],
+            sphere_body_root_bfs: 0,
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,

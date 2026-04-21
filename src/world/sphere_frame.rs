@@ -17,6 +17,10 @@ use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
 pub struct SphereBodyInfo {
     pub center: [f32; 3],
     pub radius: f32,
+    /// The `NodeId` of the SphereBody node itself. Callers use this
+    /// to look up the node's BFS index in the packed GPU tree so the
+    /// shader can walk the body-voxel tree during analytic shading.
+    pub node_id: NodeId,
 }
 
 /// Walk from `world_root` along `render_path` checking for the
@@ -37,24 +41,29 @@ pub fn find_active_sphere_body(
     //            the SphereBody node).
     // `None` means we're not inside any SphereBody ancestor yet.
     let mut node_id = world_root;
-    let mut state: Option<([f32; 3], f32)> = None;
+    // `active` is Some((sphere_body_node_id, origin, size)) once we've
+    // entered a SphereBody ancestor. `origin`/`size` describe the
+    // current cell's position within the body-shader frame of that
+    // SphereBody.
+    let mut active: Option<(NodeId, [f32; 3], f32)> = None;
 
     let is_sphere = |nid: NodeId, lib: &NodeLibrary| {
         lib.get(nid).is_some_and(|n| n.kind == NodeKind::SphereBody)
     };
 
     if is_sphere(world_root, library) {
-        state = Some(([0.0; 3], WORLD_SIZE));
+        active = Some((world_root, [0.0; 3], WORLD_SIZE));
     }
 
     for &slot in render_path {
         let Some(node) = library.get(node_id) else { break };
         let Child::Node(child_id) = node.children[slot as usize] else { break };
 
-        if let Some((origin, size)) = state {
+        if let Some((sb_id, origin, size)) = active {
             let (sx, sy, sz) = slot_coords(slot as usize);
             let child_size = size / 3.0;
-            state = Some((
+            active = Some((
+                sb_id,
                 [
                     origin[0] + sx as f32 * child_size,
                     origin[1] + sy as f32 * child_size,
@@ -68,11 +77,11 @@ pub fn find_active_sphere_body(
 
         if is_sphere(node_id, library) {
             // Entered a fresh SphereBody — reset to its top.
-            state = Some(([0.0; 3], WORLD_SIZE));
+            active = Some((node_id, [0.0; 3], WORLD_SIZE));
         }
     }
 
-    state.map(|(origin, cell_size)| {
+    active.map(|(sb_id, origin, cell_size)| {
         // Render frame's `[0, WORLD_SIZE)³` maps to body-shader
         // `[origin, origin + cell_size)³`. Scale from body-shader to
         // render-local = WORLD_SIZE / cell_size.
@@ -86,6 +95,7 @@ pub fn find_active_sphere_body(
                 (sb_center_bs - origin[2]) * scale,
             ],
             radius: sb_radius_bs * scale,
+            node_id: sb_id,
         }
     })
 }

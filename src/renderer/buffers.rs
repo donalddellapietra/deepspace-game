@@ -301,6 +301,8 @@ impl Renderer {
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             sphere_body_active: self.sphere_body_active,
+            sphere_body_root_bfs: self.sphere_body_root_bfs,
+            _pad_sphere: [0; 3],
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
