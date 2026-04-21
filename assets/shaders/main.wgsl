@@ -57,7 +57,10 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir = jittered_ray_dir(uv);
     let result = march(camera.pos, ray_dir);
 
-    var color: vec3<f32>;
+    // Compute the "tail" colour — whatever lies behind the
+    // translucent accumulation along the ray. Either a lit surface
+    // hit, or the sky gradient if the ray ultimately missed.
+    var tail_color: vec3<f32>;
     if result.hit {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
@@ -65,12 +68,25 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         let hit_pos = camera.pos + ray_dir * result.t;
         let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
         let bevel = cube_face_bevel(local, result.normal);
-        let lit = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
-        color = pow(lit, vec3<f32>(1.0 / 2.2));
+        tail_color = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
     } else {
+        // Sky gradient authored in sRGB; convert to linear so it
+        // composites correctly with the linear accumulator. The final
+        // gamma-correct at the end of shade_pixel restores sRGB for
+        // display, keeping the pre-translucency visual when accum=0.
         let sky_t = ray_dir.y * 0.5 + 0.5;
-        color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
+        let sky_sRGB = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
+        tail_color = pow(sky_sRGB, vec3<f32>(2.2));
     }
+
+    // Front-to-back composite: translucent contributions accumulated
+    // in `march()` sit in `accum_color / accum_alpha` (pre-lit
+    // representative colours, already weighted by (1-prior_alpha)
+    // * alpha per step). Blend the tail underneath.
+    let composed = result.accum_color + (1.0 - result.accum_alpha) * tail_color;
+
+    // Gamma-correct once, at the end, on the fully composited colour.
+    var color = pow(composed, vec3<f32>(1.0 / 2.2));
 
     if uniforms.highlight_active != 0u {
         let h_min = uniforms.highlight_min.xyz;
@@ -221,12 +237,16 @@ fn fs_coarse_mask(in: VertexOutput) -> @location(0) f32 {
         f32(BEAM_TILE_SIZE) / uniforms.screen_height,
     );
 
-    // DIAGNOSTIC: 2-ray (opposite corners). If this is ~1/2 the
-    // 4-ray cost, register pressure in the coarse shader scales
-    // linearly with march count (bad). If it's only slightly
-    // better than 4-ray, march is amortized over divergent warps.
-    if march(camera.pos, jittered_ray_dir(in.uv + vec2<f32>(-half_tile_uv.x, -half_tile_uv.y))).hit { return 1.0; }
-    if march(camera.pos, jittered_ray_dir(in.uv + vec2<f32>( half_tile_uv.x,  half_tile_uv.y))).hit { return 1.0; }
+    // 2-ray (opposite corners). "Has content" means either an opaque
+    // surface hit OR non-trivial translucent fog accumulated — both
+    // require the full shade_pixel path in fs_main. Without the
+    // accum_alpha check, translucent-only pixels (rays that composite
+    // fog but never hit a solid) get falsely culled to sky, which
+    // makes sparse-fractal views lose their fog silhouettes.
+    let r1 = march(camera.pos, jittered_ray_dir(in.uv + vec2<f32>(-half_tile_uv.x, -half_tile_uv.y)));
+    if r1.hit || r1.accum_alpha > 0.0 { return 1.0; }
+    let r2 = march(camera.pos, jittered_ray_dir(in.uv + vec2<f32>( half_tile_uv.x,  half_tile_uv.y)));
+    if r2.hit || r2.accum_alpha > 0.0 { return 1.0; }
     return 0.0;
 }
 

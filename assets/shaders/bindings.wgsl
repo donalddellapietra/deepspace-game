@@ -240,6 +240,21 @@ override ENABLE_ENTITIES: bool = false;
 /// fast-path proved sufficient on their own.
 override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 
+/// Translucent-LOD alpha cutoffs. At each LOD terminal for a
+/// non-empty Node child, alpha = popcount(child_occupancy) / 27.0.
+///
+/// - `alpha < ALPHA_FLOOR`: child is effectively empty at this LOD;
+///   advance DDA with no colour contribution.
+/// - `alpha >= ALPHA_CEIL`: child is effectively opaque; paint the
+///   representative colour opaquely and terminate (matches old
+///   behaviour, preserves dense-world perf).
+/// - otherwise: front-to-back composite the representative colour
+///   into the ray's accumulator, advance DDA, continue. When
+///   `accum_alpha >= ALPHA_CEIL` the ray short-circuits to an
+///   opaque splat of the current composited colour.
+override ALPHA_FLOOR: f32 = 0.02;
+override ALPHA_CEIL: f32 = 0.95;
+
 const MAX_FACE_DEPTH: u32 = 63u;
 
 /// Cartesian DDA stack depth — the hard descent ceiling.
@@ -277,4 +292,11 @@ struct HitResult {
     frame_scale: f32,
     cell_min: vec3<f32>,
     cell_size: f32,
+    /// Front-to-back translucent accumulation along the ray, BEFORE
+    /// the tail (the surface hit or sky). `shade_pixel` composites
+    /// `final = accum_color + (1 - accum_alpha) * tail_color`.
+    /// Always written on both hit and miss paths so the caller can
+    /// blend regardless of whether the ray ultimately hit a surface.
+    accum_color: vec3<f32>,
+    accum_alpha: f32,
 }

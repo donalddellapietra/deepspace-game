@@ -79,6 +79,8 @@ fn march_entity_subtree(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.accum_color = vec3<f32>(0.0);
+    result.accum_alpha = 0.0;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -266,11 +268,28 @@ fn march_entity_subtree(
 
 // Cartesian DDA in a single frame rooted at `root_node_idx`. The
 // frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
-// Returns hit on cell terminal; on miss (ray exits the frame),
-// returns hit=false so the caller can pop to the ancestor ribbon.
+//
+// Translucent-LOD accumulator: rays that hit sparse LOD-terminal
+// Node cells front-to-back composite them into (accum_color,
+// accum_alpha). The accumulator flows IN via the last two params and
+// OUT via `result.accum_color/accum_alpha`, so `march()`'s outer
+// ribbon loop can hand it across pops without losing state. Invariants:
+//
+// - On miss (ray exits frame, hit=false): `result.accum_*` hold the
+//   updated accumulator so the caller can pass them into the next
+//   ribbon frame.
+// - On hit (hit=true): the accumulator is ALSO written in, and
+//   `result.color / normal / t / cell_*` describe the TAIL surface
+//   (opaque voxel). `shade_pixel` lights the tail then composites
+//   `accum_color + (1-accum_alpha) * lit_tail`.
+// - If the accumulator itself saturates (`accum_alpha >= ALPHA_CEIL`),
+//   we set hit=true with the current representative block as the
+//   tail (minimal visual contribution under the (1-accum_alpha)
+//   weight, but gives `fs_main_depth` a sensible `t`).
 fn march_cartesian(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
     depth_limit: u32, skip_slot: u32,
+    accum_color_in: vec3<f32>, accum_alpha_in: f32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -279,6 +298,15 @@ fn march_cartesian(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    var accum_color: vec3<f32> = accum_color_in;
+    var accum_alpha: f32 = accum_alpha_in;
+    // Always write accumulator into result on every return path
+    // (miss, opaque hit, saturated splat). The early ray-box miss
+    // below is the one return path that predates this write; we do
+    // it before the box test so the caller sees the input accumulator
+    // preserved if we never entered the frame.
+    result.accum_color = accum_color;
+    result.accum_alpha = accum_alpha;
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -455,6 +483,8 @@ fn march_cartesian(
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
+            result.accum_color = accum_color;
+            result.accum_alpha = accum_alpha;
             return result;
         } else if ENABLE_ENTITIES && tag == 3u {
             // tag=3 — EntityRef. Guarded by the compile-time
@@ -501,6 +531,8 @@ fn march_cartesian(
                     result.normal = -normalize(ray_dir);
                     result.cell_min = entity.bbox_min;
                     result.cell_size = bbox_size.x;
+                    result.accum_color = accum_color;
+                    result.accum_alpha = accum_alpha;
                     return result;
                 }
                 let m_lod_e = min_axis_mask(cur_side_dist);
@@ -526,6 +558,8 @@ fn march_cartesian(
                 result.normal = sub.normal;
                 result.cell_min = entity.bbox_min + sub.cell_min * size_over_3;
                 result.cell_size = sub.cell_size * size_over_3.x;
+                result.accum_color = accum_color;
+                result.accum_alpha = accum_alpha;
                 return result;
             }
             let m_ent_miss = min_axis_mask(cur_side_dist);
@@ -570,7 +604,10 @@ fn march_cartesian(
                     inner_r, outer_r, ray_origin, ray_dir,
                 );
                 if sph.hit {
-                    return sph;
+                    var sph_out = sph;
+                    sph_out.accum_color = accum_color;
+                    sph_out.accum_alpha = accum_alpha;
+                    return sph_out;
                 }
                 // Sphere missed — advance Cartesian DDA past this cell.
                 let m_sph = min_axis_mask(cur_side_dist);
@@ -626,21 +663,98 @@ fn march_cartesian(
                 if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
                 let bt = child_block_type(packed);
                 if bt == 0xFFFEu {
+                    // REPRESENTATIVE_EMPTY — child is uniform-empty;
+                    // advance DDA with no contribution.
                     let m_lodt = min_axis_mask(cur_side_dist);
                     s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
                     cur_side_dist += m_lodt * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_lodt;
                 } else {
+                    // Translucent-LOD three-way branch. Probe the
+                    // child's occupancy bitmask directly: popcount
+                    // / 27 is the fraction of the child cell actually
+                    // filled with voxels, which we use as alpha for
+                    // front-to-back compositing.
+                    //
+                    // One cold load pair (node_offsets + tree header)
+                    // per LOD-terminal Node. Jerusalem popcount=7
+                    // → alpha ≈ 0.259; plain worlds popcount=27
+                    // → alpha = 1.0 → alpha_ceil branch, identical
+                    // perf to the pre-translucency opaque splat.
+                    let child_header_off = node_offsets[child_idx];
+                    let child_occ = tree[child_header_off];
+                    if ENABLE_STATS {
+                        ray_loads_offsets = ray_loads_offsets + 1u;
+                        ray_loads_tree = ray_loads_tree + 1u;
+                    }
+                    let child_popcount = countOneBits(child_occ);
+                    let alpha = f32(child_popcount) * (1.0 / 27.0);
+
                     let cell_min_l = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
                     let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
                     let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
-                    result.hit = true;
-                    result.t = max(cell_box_l.t_enter, 0.0);
-                    result.color = palette[bt].rgb;
-                    result.normal = normal;
-                    result.cell_min = cell_min_l;
-                    result.cell_size = cur_cell_size;
-                    return result;
+                    let cell_t = max(cell_box_l.t_enter, 0.0);
+                    let rep_color = palette[bt].rgb;
+
+                    if alpha < ALPHA_FLOOR {
+                        // Effectively empty at this LOD — skip.
+                        let m_lodt = min_axis_mask(cur_side_dist);
+                        s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
+                        cur_side_dist += m_lodt * delta_dist * cur_cell_size;
+                        normal = -vec3<f32>(step) * m_lodt;
+                    } else if alpha >= ALPHA_CEIL {
+                        // Effectively opaque — terminate. Fast path
+                        // for dense worlds (popcount=27, alpha=1.0);
+                        // byte-identical to the pre-translucency
+                        // opaque splat perf-wise.
+                        result.hit = true;
+                        result.t = cell_t;
+                        result.color = rep_color;
+                        result.normal = normal;
+                        result.cell_min = cell_min_l;
+                        result.cell_size = cur_cell_size;
+                        result.accum_color = accum_color;
+                        result.accum_alpha = accum_alpha;
+                        return result;
+                    } else {
+                        // Front-to-back composite:
+                        //   accum += (1-accum_alpha) * alpha * color
+                        //   alpha += (1-accum_alpha) * alpha
+                        let w = (1.0 - accum_alpha) * alpha;
+                        accum_color = accum_color + w * rep_color;
+                        accum_alpha = accum_alpha + w;
+                        // Intentionally do NOT record `t` here: rays
+                        // that reach a tail (surface or sky) without
+                        // saturating should fall back to far-plane
+                        // depth via `fs_main_depth`'s t<=0 check, so
+                        // entity rasters behind translucent fog still
+                        // draw. `t` is only set on opaque terminations
+                        // (block leaf, alpha_ceil splat, saturation).
+                        if accum_alpha >= ALPHA_CEIL {
+                            // Saturated — short-circuit to opaque
+                            // splat of the current representative
+                            // colour. Tail contribution under
+                            // (1-accum_alpha) is near zero; the
+                            // colour value we store here is nearly
+                            // suppressed downstream, but normal/t
+                            // keep bevel/depth correct.
+                            result.hit = true;
+                            result.t = cell_t;
+                            result.color = rep_color;
+                            result.normal = normal;
+                            result.cell_min = cell_min_l;
+                            result.cell_size = cur_cell_size;
+                            result.accum_color = accum_color;
+                            result.accum_alpha = accum_alpha;
+                            return result;
+                        }
+                        // Not saturated — advance DDA and keep
+                        // compositing along the ray.
+                        let m_lodt = min_axis_mask(cur_side_dist);
+                        s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
+                        cur_side_dist += m_lodt * delta_dist * cur_cell_size;
+                        normal = -vec3<f32>(step) * m_lodt;
+                    }
                 }
             } else {
                 let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
@@ -792,6 +906,11 @@ fn march_cartesian(
         }
     }
 
+    // Fall-through miss: ray exited the frame's [0,3)³ box without
+    // a terminating hit. Write the accumulator so the caller can
+    // hand it across the ribbon pop to the next frame.
+    result.accum_color = accum_color;
+    result.accum_alpha = accum_alpha;
     return result;
 }
 
@@ -815,6 +934,13 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var cur_face_bounds = uniforms.root_face_bounds;
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
+
+    // Translucent-LOD accumulator. Carried across ribbon pops so
+    // rays that accumulate partial coverage in deeper frames keep
+    // their state when they pop to ancestor frames. See
+    // `march_cartesian` for the accumulation rule.
+    var accum_color: vec3<f32> = vec3<f32>(0.0);
+    var accum_alpha: f32 = 0.0;
 
     // skip_slot: after a ribbon pop, the slot index (in the parent)
     // of the child we just left. march_cartesian skips this slot at
@@ -847,11 +973,21 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             // in the same frame-local units). The empty-subtree
             // fast-path at `march_cartesian` (child_bt == 255)
             // handles uniform-empty early exit.
-            r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
+            r = march_cartesian(
+                current_idx, ray_origin, ray_dir,
+                MAX_STACK_DEPTH, skip_slot,
+                accum_color, accum_alpha,
+            );
+            // Pull accumulator back out whether hit or miss —
+            // march_cartesian writes it on both paths.
+            accum_color = r.accum_color;
+            accum_alpha = r.accum_alpha;
         }
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;
+            r.accum_color = accum_color;
+            r.accum_alpha = accum_alpha;
             // Transform cell_min/cell_size from the popped frame back
             // to the camera frame so the fragment shader's bevel/grid
             // computation uses consistent coordinates.
@@ -983,5 +1119,14 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     result.frame_scale = cur_scale;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    // Crucial: the accumulator must flow out to `shade_pixel`
+    // regardless of whether the ribbon was empty, had one entry, or
+    // was fully exhausted. If the Cartesian frame was entered at
+    // all, `accum_*` holds whatever the ray accumulated before
+    // exiting the final frame. Blending against sky downstream
+    // restores the translucent-fog appearance for rays with no
+    // opaque tail.
+    result.accum_color = accum_color;
+    result.accum_alpha = accum_alpha;
     return result;
 }

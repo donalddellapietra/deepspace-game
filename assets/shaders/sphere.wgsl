@@ -47,6 +47,8 @@ fn march_face_root(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.accum_color = vec3<f32>(0.0);
+    result.accum_alpha = 0.0;
 
     let face = uniforms.root_face_meta.x;
     let cs_center = vec3<f32>(1.5);
@@ -202,6 +204,8 @@ fn sphere_in_cell(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.accum_color = vec3<f32>(0.0);
+    result.accum_alpha = 0.0;
 
     let cs_center = body_cell_origin + vec3<f32>(body_cell_size * 0.5);
     let cs_outer = outer_r_local * body_cell_size;
@@ -342,6 +346,8 @@ fn sphere_in_face_window(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.accum_color = vec3<f32>(0.0);
+    result.accum_alpha = 0.0;
 
     let body_origin = vec3<f32>(0.0);
     let body_size = 3.0;
