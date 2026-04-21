@@ -526,34 +526,59 @@ pub(super) fn cs_raycast(
         empty_full.extend(w.path.iter().copied());
         prev_place_path = Some(empty_full);
 
-        // Step to the cell's next boundary. Six candidates: 4 UV
-        // planes (through sphere center), 2 radial spheres.
-        let n_axis = face_normal(face);
-        let u_axis = face_u_axis(face);
-        let v_axis = face_v_axis(face);
-        let u_lo_ea = w.u_lo * 2.0 - 1.0;
-        let u_hi_ea = (w.u_lo + w.size) * 2.0 - 1.0;
-        let v_lo_ea = w.v_lo * 2.0 - 1.0;
-        let v_hi_ea = (w.v_lo + w.size) * 2.0 - 1.0;
-        let n_u_lo = sub_scaled(u_axis, n_axis, ea_to_cube(u_lo_ea));
-        let n_u_hi = sub_scaled(u_axis, n_axis, ea_to_cube(u_hi_ea));
-        let n_v_lo = sub_scaled(v_axis, n_axis, ea_to_cube(v_lo_ea));
-        let n_v_hi = sub_scaled(v_axis, n_axis, ea_to_cube(v_hi_ea));
-        let r_lo = cs_inner + w.r_lo * shell;
-        let r_hi = cs_inner + (w.r_lo + w.size) * shell;
+        // Step to the cell's next boundary. Two paths depending on
+        // cell size:
+        //
+        // SHALLOW (`w.size >= LOCAL_FRAME_STEP_THRESHOLD`): 4 UV
+        //     planes + 2 radial spheres, intersected with the ray in
+        //     body-CENTERED coords. Curvature-accurate — the cube-
+        //     sphere cell's exact boundaries.
+        //
+        // DEEP (`w.size < LOCAL_FRAME_STEP_THRESHOLD`): the 6-plane
+        //     pairs become near-degenerate in f32 (adjacent normals
+        //     differ by only `O(w.size)` against the face normal,
+        //     below ULP of the individual components). Ray-plane `t`
+        //     values are indistinguishable → winning face is
+        //     arbitrary → adjacent pixels take divergent paths →
+        //     rendered blocks appear HOLLOW because rays skip the
+        //     cell interior. Swap in a local-frame mini-sub-frame:
+        //     axis-aligned `(boundary − pos) / dir` in `[0, 3)³`
+        //     local coords is precision-stable at any depth.
+        let (t_next, winning) = if w.size < LOCAL_FRAME_STEP_THRESHOLD {
+            local_frame_cell_exit(
+                face,
+                w.u_lo, w.v_lo, w.r_lo, w.size,
+                inner_r_local, outer_r_local, body_size,
+                oc, ray_dir, t,
+            )
+        } else {
+            let n_axis = face_normal(face);
+            let u_axis = face_u_axis(face);
+            let v_axis = face_v_axis(face);
+            let u_lo_ea = w.u_lo * 2.0 - 1.0;
+            let u_hi_ea = (w.u_lo + w.size) * 2.0 - 1.0;
+            let v_lo_ea = w.v_lo * 2.0 - 1.0;
+            let v_hi_ea = (w.v_lo + w.size) * 2.0 - 1.0;
+            let n_u_lo = sub_scaled(u_axis, n_axis, ea_to_cube(u_lo_ea));
+            let n_u_hi = sub_scaled(u_axis, n_axis, ea_to_cube(u_hi_ea));
+            let n_v_lo = sub_scaled(v_axis, n_axis, ea_to_cube(v_lo_ea));
+            let n_v_hi = sub_scaled(v_axis, n_axis, ea_to_cube(v_hi_ea));
+            let r_lo = cs_inner + w.r_lo * shell;
+            let r_hi = cs_inner + (w.r_lo + w.size) * shell;
 
-        let t_u_lo = ray_plane_t(oc, ray_dir, n_u_lo);
-        let t_u_hi = ray_plane_t(oc, ray_dir, n_u_hi);
-        let t_v_lo = ray_plane_t(oc, ray_dir, n_v_lo);
-        let t_v_hi = ray_plane_t(oc, ray_dir, n_v_hi);
-        let t_r_lo = ray_sphere_after(oc, ray_dir, r_lo, t);
-        let t_r_hi = ray_sphere_after(oc, ray_dir, r_hi, t);
+            let t_u_lo = ray_plane_t(oc, ray_dir, n_u_lo);
+            let t_u_hi = ray_plane_t(oc, ray_dir, n_u_hi);
+            let t_v_lo = ray_plane_t(oc, ray_dir, n_v_lo);
+            let t_v_hi = ray_plane_t(oc, ray_dir, n_v_hi);
+            let t_r_lo = ray_sphere_after(oc, ray_dir, r_lo, t);
+            let t_r_hi = ray_sphere_after(oc, ray_dir, r_hi, t);
 
-        let (t_next, winning) = pick_min_after(
-            t,
-            &[(t_u_lo, 0), (t_u_hi, 1), (t_v_lo, 2), (t_v_hi, 3),
-              (t_r_lo, 4), (t_r_hi, 5)],
-        );
+            pick_min_after(
+                t,
+                &[(t_u_lo, 0), (t_u_hi, 1), (t_v_lo, 2), (t_v_hi, 3),
+                  (t_r_lo, 4), (t_r_hi, 5)],
+            )
+        };
         if t_next >= t_exit { break; }
         last_side = winning;
         let _ = last_side; // currently consumed only by shader
@@ -568,6 +593,104 @@ pub(super) fn cs_raycast(
 #[inline]
 fn sub_scaled(a: [f32; 3], b: [f32; 3], s: f32) -> [f32; 3] {
     [a[0] - b[0] * s, a[1] - b[1] * s, a[2] - b[2] * s]
+}
+
+/// Cell size in FACE-NORMALIZED units below which the 6-plane body-
+/// coord cell-stepper's plane-normal pairs (`n_u_lo` vs `n_u_hi`,
+/// `n_v_lo` vs `n_v_hi`) become near-degenerate in f32 — the pair
+/// separation is `O(w.size)` against the face-normal, and once that
+/// is within a few ULPs of the individual normal components the
+/// ray-plane `t` for adjacent walls becomes indistinguishable.
+/// Adjacent pixels then pick arbitrary winning walls and the ray
+/// "skips" solid cells → HOLLOW BLOCKS at deep depth.
+///
+/// Below this threshold we swap the 6-plane stepper for a local-
+/// frame axis-aligned DDA: build a mini-sub-frame Jacobian at the
+/// cell corner, transform the ray into `[0, 3)³` local coords, and
+/// find the exit wall via trivial `(boundary − pos) / dir` — which
+/// is precision-stable at any depth because all operands are O(1).
+const LOCAL_FRAME_STEP_THRESHOLD: f32 = 5e-5;
+
+/// Local-frame cell-exit: returns `(t_next, winning_face)` for the
+/// ray exiting the walker cell at `(u_lo, v_lo, r_lo, size)` in
+/// face-normalized coords. Drops into the same axis-aligned DDA
+/// primitive as `sphere_in_sub_frame` — precision-safe where the
+/// 6-plane body-coord math fails.
+///
+/// `oc` is the ray origin in body-CENTERED coords (body center at
+/// origin). `ray_dir` is unit. `t_body` is the current DDA t. The
+/// returned `t_next` is in the same body-distance units — the outer
+/// loop advances with `t = t_next + cell_eps` unchanged.
+///
+/// `winning_face` uses the same encoding as the 6-plane stepper:
+/// 0=u_lo, 1=u_hi, 2=v_lo, 3=v_hi, 4=r_lo, 5=r_hi.
+#[allow(clippy::too_many_arguments)]
+fn local_frame_cell_exit(
+    face: u32,
+    u_lo: f32, v_lo: f32, r_lo: f32, size: f32,
+    inner_r_local: f32, outer_r_local: f32, body_size: f32,
+    oc: [f32; 3], ray_dir: [f32; 3], t_body: f32,
+) -> (f32, u32) {
+    use crate::world::cubesphere::{face_frame_jacobian, mat3_inv, mat3_mul_vec, Face};
+
+    // Build the cell's Jacobian at its corner. `face_frame_jacobian`
+    // returns `c_body` in body-LOCAL coords (origin at body's
+    // `[0, 0, 0]`); `oc` is body-CENTERED, so the offset between
+    // ray body-pos and `c_body` is `(body_center + oc) - c_body`.
+    let face_enum = Face::from_index(face as u8);
+    let (c_body_local, j) = face_frame_jacobian(
+        face_enum, u_lo, v_lo, r_lo, size,
+        inner_r_local, outer_r_local, body_size,
+    );
+    let body_center = [body_size * 0.5; 3];
+    let c_body_centered = [
+        c_body_local[0] - body_center[0],
+        c_body_local[1] - body_center[1],
+        c_body_local[2] - body_center[2],
+    ];
+    let j_inv = mat3_inv(&j);
+
+    // Ray at current body t, in body-centered coords.
+    let body_pt_at_t = [
+        oc[0] + ray_dir[0] * t_body,
+        oc[1] + ray_dir[1] * t_body,
+        oc[2] + ray_dir[2] * t_body,
+    ];
+    // Offset from cell corner — this is the subtraction that loses
+    // absolute precision but stays stable ENOUGH at a single cell
+    // entry (one-off precision cost, not compounding).
+    let offset = [
+        body_pt_at_t[0] - c_body_centered[0],
+        body_pt_at_t[1] - c_body_centered[1],
+        body_pt_at_t[2] - c_body_centered[2],
+    ];
+    let ro_local = mat3_mul_vec(&j_inv, offset);
+    let rd_local = mat3_mul_vec(&j_inv, ray_dir);
+
+    // Axis-exit in local `[0, 3)³`. Pick smallest positive t_local.
+    // `rd_body · t_local = body displacement from t_body`, so
+    // `t_next_body = t_body + t_local`.
+    let mut t_local_min = f32::INFINITY;
+    let mut winning: u32 = 6;
+    for axis in 0..3 {
+        let p = ro_local[axis];
+        let d = rd_local[axis];
+        if d.abs() < 1e-30 { continue; }
+        let (boundary, face_id_lo, face_id_hi) = match axis {
+            0 => (if d > 0.0 { 3.0 } else { 0.0 }, 0u32, 1u32),
+            1 => (if d > 0.0 { 3.0 } else { 0.0 }, 2u32, 3u32),
+            _ => (if d > 0.0 { 3.0 } else { 0.0 }, 4u32, 5u32),
+        };
+        let t_cand = (boundary - p) / d;
+        if t_cand > 0.0 && t_cand < t_local_min {
+            t_local_min = t_cand;
+            winning = if d > 0.0 { face_id_hi } else { face_id_lo };
+        }
+    }
+    if !t_local_min.is_finite() {
+        return (f32::INFINITY, 6);
+    }
+    (t_body + t_local_min, winning)
 }
 
 #[inline]
