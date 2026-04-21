@@ -1329,16 +1329,40 @@ fn sphere_in_sub_frame(
             result.hit = true;
             result.t   = t;
 
-            // Body-frame hit normal is approximately −rd_body
-            // normalized (a backface-avoidance trick: the ray came
-            // from outside the cell, so the surface normal opposes
-            // rd_body). Exact per-cell normals would need mapping
-            // local exit face → body-XYZ via J; that's a shading
-            // refinement, not a correctness fix.
-            let n_approx = normalize(-rd_body);
-            result.normal = n_approx;
+            // Hit normal. Two different normals are needed here and
+            // they disagreed in the previous code, producing visible
+            // "concentric circle" artifacts at layers past ~12:
+            //
+            // * `diffuse_n` — a body-frame unit vector for the sun
+            //   dot product. Body-frame because the sun direction is
+            //   in world/body axes, not sub-frame-local. Using
+            //   −rd_body normalized as the approximate surface normal
+            //   (the ray came in along rd_body, so the face opposes).
+            //
+            // * `result.normal` — used by `shade_pixel`'s
+            //   `cube_face_bevel` together with `result.cell_min` /
+            //   `result.cell_size`. cell_min/size are in sub-frame
+            //   LOCAL coords (walker-cell corner in [0,3)³), so the
+            //   bevel's "which face did we hit" pick must also be in
+            //   sub-frame local axes — otherwise the body-frame
+            //   normal picks different cube faces as the body-space
+            //   orientation rotates across the sphere, and each
+            //   different face gives a different `uv`, which
+            //   continuously varies → circular banding on a curved
+            //   surface. Use −rd_local normalized (sub-frame-local)
+            //   so cube_face_bevel's face pick matches the cell's
+            //   actual local-axis face.
+            let diffuse_n = normalize(-rd_body);
+            let local_rd_len_sq = dot(rd_local, rd_local);
+            var local_n: vec3<f32>;
+            if local_rd_len_sq > 1e-30 {
+                local_n = -rd_local / sqrt(local_rd_len_sq);
+            } else {
+                local_n = vec3<f32>(0.0, 1.0, 0.0);
+            }
+            result.normal = local_n;
             let sun = normalize(vec3<f32>(0.4, 0.7, 0.3));
-            let diffuse = max(dot(n_approx, sun), 0.0);
+            let diffuse = max(dot(diffuse_n, sun), 0.0);
             let ambient: f32 = 0.25;
 
             // PRECISION NOTE — tint radial.
