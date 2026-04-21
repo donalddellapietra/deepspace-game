@@ -188,19 +188,14 @@ pub fn bootstrap_stars_world(total_depth: u8) -> WorldBootstrap {
 
     // Camera at world center (1.5, 1.5, 1.5). Anchor depth = 20
     // by default; tree depth is 40 so there's headroom for
-    // further zoom-in. Constructing the anchor path directly
-    // (instead of via `from_frame_local` + `deepened_to`) avoids
-    // f32 drift: `(1.5 - 4/3) / (1/3)` rounds to ≈ 0.5 − 1e-7,
-    // and each subsequent zoom_in triples the error, so by depth
-    // 15 the offset dips below 1/3 and the slot flips from
-    // center (13) to corner (0). Direct construction keeps the
-    // anchor on `(1,1,1)²⁰` exactly.
-    let mut anchor = Path::root();
-    let center_slot = slot_index(1, 1, 1) as u8;
-    for _ in 0..DEFAULT_STARS_SPAWN_DEPTH {
-        anchor.push(center_slot);
-    }
-    let spawn_pos = WorldPos::new(anchor, [0.5, 0.5, 0.5]);
+    // further zoom-in. `uniform_column` constructs the
+    // `(center_slot)^depth` anchor directly — see its docs for
+    // the f32-drift trap it sidesteps.
+    let spawn_pos = WorldPos::uniform_column(
+        slot_index(1, 1, 1) as u8,
+        DEFAULT_STARS_SPAWN_DEPTH,
+        [0.5, 0.5, 0.5],
+    );
 
     WorldBootstrap {
         world,

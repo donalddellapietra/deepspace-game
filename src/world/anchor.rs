@@ -202,6 +202,36 @@ impl WorldPos {
         Self { anchor: Path::root(), offset: [0.0, 0.0, 0.0] }
     }
 
+    /// Precise anchor constructed directly as `slot` repeated `depth`
+    /// times, with a fixed sub-cell `offset ∈ [0, 1)³`. Bypasses
+    /// `from_frame_local + deepened_to` for callers that need an
+    /// exact ternary-rational world position at deep anchors.
+    ///
+    /// # Why this exists
+    ///
+    /// `from_frame_local` decomposes a world xyz into `(path, offset)`
+    /// by walking depth levels and rounding. For a world position
+    /// like `1.5` — which has the *infinite* ternary expansion
+    /// `0.1̄₃` — the expected decomposition is `path = (1,1,1)^depth,
+    /// offset = 0.5`. But the intermediate `(1.5 - 4/3) / (1/3)`
+    /// rounds to `≈ 0.5 − 1e-7` in f32, and each `zoom_in` triples
+    /// that error (`new = old·3 − 1`), so by about depth 15 the
+    /// offset dips below `1/3` and the next slot flips from center
+    /// (13) to corner (0). The resulting anchor is wrong.
+    ///
+    /// This constructor sidesteps the problem: it pushes the same
+    /// slot `depth` times — one exact operation, no f32 arithmetic on
+    /// the offset across levels.
+    pub fn uniform_column(slot: u8, depth: u8, offset: [f32; 3]) -> Self {
+        debug_assert!((slot as usize) < 27, "slot must be < 27");
+        debug_assert!((depth as usize) <= MAX_DEPTH, "depth exceeds MAX_DEPTH");
+        let mut anchor = Path::root();
+        for _ in 0..depth {
+            anchor.push(slot);
+        }
+        Self::new(anchor, offset)
+    }
+
     /// Restore `offset[i] ∈ [0, 1)` by stepping the anchor along
     /// each axis as needed. Cartesian interpretation only (step 1).
     fn renormalize_cartesian(&mut self) {
