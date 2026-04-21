@@ -332,6 +332,23 @@ impl App {
                         &[]
                     };
                     let face_root_depth = sub.body_path.depth() as u32 + 1;
+                    let logical_uvr_depth = self
+                        .camera
+                        .position
+                        .sphere
+                        .as_ref()
+                        .map(|s| s.uvr_path.depth())
+                        .unwrap_or(0);
+                    eprintln!(
+                        "SPHERE_UPLOAD m_truncated={} logical_uvr_depth={} uvr_prefix_len={} \
+                         walker_limit(visual_depth)={} frame_size={:.3e} render_path_depth={}",
+                        uvr_prefix.len(),
+                        logical_uvr_depth,
+                        uvr_prefix.len(),
+                        effective_visual_depth,
+                        sub.frame_size,
+                        sub.render_path.depth(),
+                    );
                     renderer.set_root_kind_sphere_sub(
                         sub.inner_r, sub.outer_r,
                         sub.face as u32,

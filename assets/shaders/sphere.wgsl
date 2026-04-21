@@ -16,6 +16,8 @@
 ///   orange = cross-face terminate (bubble past face root)
 ///   green  = MAX_DDA_STEPS exhaust
 ///   yellow = MAX_SPHERE_SUB_TRANSITIONS exhaust
+///   cyan   = `sign_s == 0` silent miss (t >= t_exit with no axis outside box)
+///   white  = neighbor-transition ray-box interval miss
 ///   palette color = real hit (unchanged)
 /// Left false by default; flip to true and reload the shader to
 /// validate the geometry.
@@ -1105,6 +1107,13 @@ fn sphere_in_sub_frame(
                 // No axis outside the box — we hit the `t >= t_exit`
                 // guard instead. Terminate the DDA; the ray left via
                 // the sub-frame cap without a finite pos delta.
+                if SPHERE_DEBUG_PAINT {
+                    result.hit = true;
+                    result.t = 0.01;
+                    result.color = vec3<f32>(0.0, 0.9, 0.9); // cyan: t>=t_exit silent miss
+                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+                    return result;
+                }
                 return result;
             }
 
@@ -1256,6 +1265,13 @@ fn sphere_in_sub_frame(
             let new_t_enter = interval.x;
             let new_t_exit  = interval.y;
             if new_t_exit <= 0.0 || new_t_enter >= new_t_exit {
+                if SPHERE_DEBUG_PAINT {
+                    result.hit = true;
+                    result.t = 0.01;
+                    result.color = vec3<f32>(1.0, 1.0, 1.0); // white: neighbor interval miss
+                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+                    return result;
+                }
                 return result;
             }
             t_span  = max(abs(new_t_exit - new_t_enter), 1e-30);
