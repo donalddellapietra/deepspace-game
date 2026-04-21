@@ -48,12 +48,18 @@ fn fill_box(
     }
 }
 
-/// Target total tree depth. Small enough that voxels project to many
-/// pixels at the spawn distance, large enough to give the camera some
-/// ancestor cells to sit in.
-const TOTAL_DEPTH: u8 = 6;
+/// Minimum tree depth: the hand-crafted 27³ scene occupies 3 levels
+/// (silhouette), plus 1 wrap layer for the camera to sit in.
+const MIN_DEPTH: u8 = 4;
 
-pub fn bootstrap_glass_test_world(_plain_layers: u8) -> WorldBootstrap {
+pub fn bootstrap_glass_test_world(plain_layers: u8) -> WorldBootstrap {
+    // `--plain-layers N` controls how many times the scene is wrapped
+    // inside outer empty nodes — i.e., how small the scene is relative
+    // to the world root. Larger N ⇒ scene placed deeper in the tree
+    // ⇒ camera has to zoom in (deepen anchor) to see it at comparable
+    // angular size. N=6 is the old default (3 wraps). N=20 nests it
+    // 17 wraps deep: UI layer changes to reach the scene.
+    let total_depth = plain_layers.max(MIN_DEPTH).min(MAX_DEPTH as u8);
     let mut registry = ColorRegistry::new();
 
     // Pale-cyan glass. Alpha 0.3 is well inside the translucent regime
@@ -108,13 +114,13 @@ pub fn bootstrap_glass_test_world(_plain_layers: u8) -> WorldBootstrap {
     let mut lib = NodeLibrary::default();
     let model_root = tree_builder::build_tree(&model, &mut lib);
 
-    // GRID=27 → silhouette depth = 3. Wrap up to TOTAL_DEPTH by
+    // GRID=27 → silhouette depth = 3. Wrap up to total_depth by
     // placing the model at the center slot of each outer layer so
     // there's empty space above/below/around the scene for the
     // camera to sit in.
     let silhouette_depth = 3u8;
-    let wraps = TOTAL_DEPTH.saturating_sub(silhouette_depth);
-    assert!((TOTAL_DEPTH as usize) <= MAX_DEPTH);
+    let wraps = total_depth.saturating_sub(silhouette_depth);
+    assert!((total_depth as usize) <= MAX_DEPTH);
     let mut current = model_root;
     for _ in 0..wraps {
         let mut children = empty_children();
@@ -125,28 +131,30 @@ pub fn bootstrap_glass_test_world(_plain_layers: u8) -> WorldBootstrap {
     let world = WorldState { root: current, library: lib };
 
     // Camera sits in front of the glass wall looking in -Z (yaw=0,
-    // codebase's default forward is world -Z). The wrap puts the
-    // model at cell (1,1,1) of the root, so the model's world-space
-    // footprint is  [wrap_origin, wrap_origin + wrap_size]^3  with
-    //   wrap_size   = 3 * (1/3)^wraps
-    //   wrap_origin = 1.5 - wrap_size / 2
-    let wrap_size = 3.0f32 * (1.0f32 / 3.0f32).powi(wraps as i32);
-    let wrap_origin = 1.5 - wrap_size / 2.0;
-    // Voxel coord → world coord.
-    let voxel_to_world = |vx: f32| wrap_origin + (vx / GRID as f32) * wrap_size;
-    // x: middle of scene. y: 3 voxels above the floor (floor is 4
-    // thick). z: at voxel 22, a few cells ahead of the glass (z=14)
-    // so there's room for the glass + content + brick backdrop in
-    // the field of view.
-    let cam_x = voxel_to_world(13.5).clamp(0.01, 2.99);
-    let cam_y = voxel_to_world(7.5).clamp(0.01, 2.99);
-    let cam_z = voxel_to_world(22.0).clamp(0.01, 2.99);
+    // codebase's default forward is world -Z). The scene lives at
+    // path [CENTER_SLOT; wraps] — i.e., the center cell of each
+    // wrap layer. Express the camera's position in the SCENE's own
+    // frame so precision doesn't drop at deep wraps:
+    //   scene frame spans [0, 3)³, covering 27³ voxels → 1 voxel =
+    //   (1/9) frame units. Camera in voxel coords = (13.5, 7.5, 22).
+    let mut scene_frame = Path::root();
+    for _ in 0..wraps {
+        scene_frame.push(CENTER_SLOT as u8);
+    }
+    let voxel_to_frame = |vx: f32| 3.0 * (vx / GRID as f32);
+    let cam_x = voxel_to_frame(13.5);
+    let cam_y = voxel_to_frame(7.5);
+    let cam_z = voxel_to_frame(22.0);
+    // Anchor depth: place it at the scene's silhouette depth (one
+    // level above the voxel leaves) so the camera can freely move
+    // within the scene without renormalize thrashing.
+    let anchor_depth = (scene_frame.depth() + silhouette_depth)
+        .min(MAX_DEPTH as u8);
     let spawn_pos = WorldPos::from_frame_local(
-        &Path::root(),
+        &scene_frame,
         [cam_x, cam_y, cam_z],
-        2,
-    )
-    .deepened_to(TOTAL_DEPTH.min(8));
+        anchor_depth,
+    );
 
     WorldBootstrap {
         world,
@@ -154,7 +162,7 @@ pub fn bootstrap_glass_test_world(_plain_layers: u8) -> WorldBootstrap {
         default_spawn_pos: spawn_pos,
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -0.1,
-        plain_layers: TOTAL_DEPTH,
+        plain_layers: total_depth,
         color_registry: registry,
     }
 }
