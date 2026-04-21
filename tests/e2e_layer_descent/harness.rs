@@ -99,17 +99,6 @@ impl ScriptBuilder {
         self
     }
 
-    /// Position the camera INSIDE the just-broken cell at its inner
-    /// face (sphere: inner-r; Cartesian: -y). Unlike
-    /// `teleport_above_last_edit`, this does NOT push an extra slot
-    /// onto the anchor — the camera stays at the same total depth as
-    /// the break. Used by the dig-a-hole descent flow: break a cell,
-    /// step to its floor, probe+break the cell beneath, repeat.
-    pub fn dig_step_down(mut self) -> Self {
-        self.parts.push("dig_step_down".to_string());
-        self
-    }
-
     /// Shorthand for `pitch:-1.5707` (straight down, world frame).
     pub fn look_down(self) -> Self {
         self.pitch(-std::f32::consts::FRAC_PI_2)

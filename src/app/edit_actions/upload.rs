@@ -324,29 +324,13 @@ impl App {
                     // walker pre-descends these symbolically from
                     // the face-root (which `set_frame_root` points
                     // `root_index` at) before intra-cell DDA.
-                    //
-                    // The sub-frame is built at the camera's full UVR
-                    // depth (see `compute_render_frame`); at deep
-                    // zoom the prefix can exceed the shader's static
-                    // `MAX_SPHERE_SUB_DEPTH` uniform buffer. Clamp to
-                    // `MAX_SPHERE_SUB_DEPTH - 1` (leave a slot for
-                    // the per-pixel intra-cell descent the shader
-                    // does after the prefix) rather than hard-panic
-                    // in `set_root_kind_sphere_sub`. Deeper cells
-                    // beyond the clamp render as the ancestor cell's
-                    // content — correct fallback, just lower
-                    // resolution than the camera's true zoom.
                     let prefix_start = sub.body_path.depth() as usize + 1;
                     let render_slots = sub.render_path.as_slice();
-                    let uvr_prefix_full: &[u8] = if render_slots.len() > prefix_start {
+                    let uvr_prefix: &[u8] = if render_slots.len() > prefix_start {
                         &render_slots[prefix_start..]
                     } else {
                         &[]
                     };
-                    let max_prefix = crate::renderer::MAX_SPHERE_SUB_DEPTH
-                        .saturating_sub(1);
-                    let prefix_len = uvr_prefix_full.len().min(max_prefix);
-                    let uvr_prefix = &uvr_prefix_full[..prefix_len];
                     let face_root_depth = sub.body_path.depth() as u32 + 1;
                     renderer.set_root_kind_sphere_sub(
                         sub.inner_r, sub.outer_r,

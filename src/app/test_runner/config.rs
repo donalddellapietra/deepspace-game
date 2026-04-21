@@ -157,19 +157,6 @@ pub enum ScriptCmd {
     /// the camera to "one layer-N cell above the new ground" (where N
     /// is the current UI layer), matching the descent flow.
     TeleportAboveLastEdit,
-    /// Position the camera INSIDE the just-broken cell at the inner
-    /// face of that cell — i.e. just above the "floor" of the hole
-    /// we dug. Does NOT push any extra slot; the anchor/uvr depth is
-    /// unchanged from the break. The subsequent `probe_down` raycast
-    /// exits through the inner face and hits the adjacent cell below
-    /// at the same depth. This is the dig-a-hole primitive: stand on
-    /// the floor, break the cell beneath, drop in, repeat.
-    ///
-    /// Sphere semantics: `uvr_offset = (0.5, 0.5, 0.05)` inside the
-    /// broken UVR cell (center-u/v, near inner-r face).
-    /// Cartesian semantics: `offset = (0.5, 0.05, 0.5)` inside the
-    /// broken cell (center-xz, near -y face).
-    DigStepDown,
 }
 
 impl TestConfig {
@@ -414,7 +401,6 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
-            if raw == "dig_step_down" { return Some(ScriptCmd::DigStepDown); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }
