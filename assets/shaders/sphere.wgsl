@@ -815,6 +815,14 @@ fn coords_to_slot(us: u32, vs: u32, rs: u32) -> u32 {
     return rs * 9u + vs * 3u + us;
 }
 
+/// Must match the CPU-side `MAX_EVAL_M` constant in
+/// `src/app/frame.rs`. Jacobian evaluation clamps to this depth
+/// because `un_corner + eval_frame_size` is f32-stable only while
+/// `eval_frame_size ≥ 1/3^MAX_EVAL_M`. Past it, we switch to scaled
+/// J (`J = J_eval · deep_scale`) and do NOT advance the eval corner
+/// per-deep-cell.
+const MAX_EVAL_M: u32 = 12u;
+
 /// Return `(t_enter, t_exit)` for the ray crossing the local
 /// `[0, 3)³` cube. `t_exit ≤ 0` → miss.
 fn ray_sub_box_interval(ro: vec3<f32>, rd: vec3<f32>) -> vec2<f32> {
@@ -997,18 +1005,29 @@ fn sphere_in_sub_frame(
 
     // --- Mutable per-neighbor-transition sub-frame state. ---
 
-    // Face-normalised corner. Magnitude O(1) (∈ [0, 1)). On a
-    // neighbor step we adjust one axis by ±frame_size = ±1/3^m, so at
-    // deep m the increment is BELOW the f32 ULP of un_corner itself.
-    // That's fine for J's evaluation point (J is nearly constant over
-    // the sub-frame region anyway — curvature term O(1/3^(2m))), and
-    // we NEVER form `un_corner + local * frame_size` inside the DDA
-    // loop. See hit-shading block below for the one place we do and
-    // why the tint is tolerant to the precision loss there.
+    // Face-normalised corner, tracked at the JACOBIAN'S EVAL DEPTH
+    // (eval_m ≤ MAX_EVAL_M on CPU). At eval_m the corner + eval
+    // frame_size are f32-stable (eval_frame_size ≥ 1/3^12 ≈ 1.88e-6,
+    // well above ULP of un_corner ~1e-7). Neighbor steps adjust the
+    // corner by ±deep_frame_size = ±(eval_frame_size · deep_scale):
+    // when the deep step is below ULP of un_corner the add is a
+    // silent no-op and the J stays frozen across adjacent deep
+    // cells. That freeze is physically correct — face curvature
+    // between adjacent deep cells is O(1/3^(deep_m + eval_m)),
+    // orders of magnitude below f32 noise.
     var un_corner  = uniforms.sub_face_corner.x;
     var vn_corner  = uniforms.sub_face_corner.y;
     var rn_corner  = uniforms.sub_face_corner.z;
-    let frame_size = uniforms.sub_face_corner.w;
+    let eval_frame_size = uniforms.sub_face_corner.w;
+    // `deep_scale = 3^(eval_m - deep_m)`. Equals 1 on the shallow
+    // sub-frame path; shrinks geometrically past MAX_EVAL_M.
+    let deep_scale = uniforms.sub_c_body.w;
+    let deep_frame_size = eval_frame_size * deep_scale;
+    // Keep `frame_size` as a convenient alias. Most downstream uses
+    // want the DEEP cell size (hit-cell reporting, DDA exit
+    // distances). The Jacobian rebuild on neighbor-steps uses
+    // `eval_frame_size` directly.
+    let frame_size = deep_frame_size;
 
     // Copy the uniform UVR prefix into a function-local buffer so we
     // can mutate it on neighbor steps. Length 64 matches the CPU-side
@@ -1241,29 +1260,53 @@ fn sphere_in_sub_frame(
             // so the position transfer has access to both matrices.
             let j_cur = j;
 
-            // Incremental corner update. Corner is O(1), delta is
-            // O(1/3^m). See precision note near un_corner's declaration.
-            let d_f = f32(sign_s);
-            if axis_k == 0u {
-                un_corner = un_corner + d_f * frame_size;
-            } else if axis_k == 1u {
-                vn_corner = vn_corner + d_f * frame_size;
-            } else {
-                rn_corner = rn_corner + d_f * frame_size;
+            // Rebuild the EVAL corner by walking `uvr_slots[..eval_m]`
+            // FRESH from the post-bubble-up state. This mirrors the
+            // CPU's `uvr_corner_from_slots` in
+            // `SphereSubFrame::with_neighbor_stepped`.
+            //
+            // A naive `un_corner += ±deep_frame_size` is wrong whenever
+            // the neighbor step bubbles up to (or past) the eval depth:
+            // the true eval-level shift in that case is
+            // `±eval_frame_size`, which is `3^(deep_m - eval_m)` times
+            // LARGER than `deep_frame_size`. Over many cells the
+            // incremental error compounds and J's eval point drifts,
+            // producing visible ring artifacts at deep_m ≥ 15.
+            let eval_m_live = min(uvr_prefix_len, MAX_EVAL_M);
+            var un_rebuild: f32 = 0.0;
+            var vn_rebuild: f32 = 0.0;
+            var rn_rebuild: f32 = 0.0;
+            var size_rebuild: f32 = 1.0;
+            for (var k: u32 = 0u; k < eval_m_live; k = k + 1u) {
+                let co_k = slot_to_coords(uvr_slots[k]);
+                size_rebuild = size_rebuild / 3.0;
+                un_rebuild = un_rebuild + f32(co_k.x) * size_rebuild;
+                vn_rebuild = vn_rebuild + f32(co_k.y) * size_rebuild;
+                rn_rebuild = rn_rebuild + f32(co_k.z) * size_rebuild;
             }
+            un_corner = un_rebuild;
+            vn_corner = vn_rebuild;
+            rn_corner = rn_rebuild;
 
+            // Rebuild J at the eval depth (f32-stable), then scale
+            // columns by `deep_scale` to represent the deep cell's
+            // per-local-unit step size. This matches the CPU-side
+            // `compute_render_frame` / `with_neighbor_stepped`.
             let ff = face_frame_jacobian_shader(
-                face, un_corner, vn_corner, rn_corner, frame_size,
+                face, un_corner, vn_corner, rn_corner, eval_frame_size,
                 inner_r, outer_r,
             );
-            j.col_u = ff.col_u;
-            j.col_v = ff.col_v;
-            j.col_r = ff.col_r;
-            // Stable scaled inverse — j's columns are O(frame_size/3)
-            // = O(1/3^m). Naive mat3_inv loses f32 precision at m≥15
-            // and the DDA collapses past layer 20. Passing frame_size/3
-            // pre-scales j to O(1) for the cofactor computation.
-            j_inv = mat3_inv_scaled_shader(j, frame_size / 3.0);
+            j.col_u = ff.col_u * deep_scale;
+            j.col_v = ff.col_v * deep_scale;
+            j.col_r = ff.col_r * deep_scale;
+            // Stable scaled inverse — j's columns are
+            // O(deep_frame_size/3). Passing that as the scale
+            // pre-normalizes j to O(1) before the cofactor math,
+            // dodging the f32 precision cliff at deep_m ≥ 15.
+            j_inv = mat3_inv_scaled_shader(j, deep_frame_size / 3.0);
+            // Keep `d_f` available for the position transfer block
+            // below (it shifts `pos[axis_k]` by ±3 local units).
+            let d_f = f32(sign_s);
 
             // --- Position transfer:
             //     local_new = J_new_inv · J_cur · (local_exit − s·3·e_k)
@@ -1386,15 +1429,23 @@ fn sphere_in_sub_frame(
             let diffuse = max(dot(diffuse_n, sun), 0.0);
             let ambient: f32 = 0.25;
 
-            // PRECISION NOTE — tint radial.
-            //   `rn_corner` is O(1); `w.r_lo * frame_size / 3` is
-            //   O(1/3^m). At deep m the sum loses the small term in
-            //   f32 (ULP of rn_corner ~6e-8). We accept that drift:
-            //   `tint = 0.55 + 0.45 * clamp(rn_abs, 0, 1)` is
-            //   smooth over the whole shell, so a 1e-8 absolute drift
-            //   in rn_abs shifts tint by ~5e-9 — invisible. We DO NOT
-            //   use this sum anywhere else (DDA never needs abs coord).
-            let rn_abs = rn_corner + w.r_lo * frame_size / 3.0;
+            // Radial tint. `rn_corner` is the EVAL depth's r-corner
+            // in face-normalized `[0, 1)`; `uvr_slots[eval_m..]` +
+            // `w.r_lo * deep_frame_size/3` carry the sub-eval radial
+            // refinement. To recover an rn value that varies CELL-
+            // BY-CELL (not just sub-frame-by-sub-frame), accumulate
+            // the post-eval UVR-slot contributions symbolically at
+            // THEIR scale (not jammed into `rn_corner` as a tiny
+            // increment that drops below its ULP).
+            var rn_abs: f32 = rn_corner;
+            var rn_size: f32 = eval_frame_size;
+            for (var kk: u32 = MAX_EVAL_M; kk < uvr_prefix_len; kk = kk + 1u) {
+                let co = slot_to_coords(uvr_slots[kk]);
+                rn_size = rn_size / 3.0;
+                rn_abs = rn_abs + f32(co.z) * rn_size;
+            }
+            // Walker's intra-cell contribution at the deepest scale.
+            rn_abs = rn_abs + w.r_lo * rn_size / 3.0;
             let tint = 0.55 + 0.45 * clamp(rn_abs, 0.0, 1.0);
 
             // Multi-scale cell-grid texture — mirrors sphere_in_cell's
@@ -1405,25 +1456,46 @@ fn sphere_in_sub_frame(
             // pos.x / pos.y are in sub-frame [0, 3) local; the
             // per-local-unit face-normalized step is frame_size/3.
             // walker cell face corner + size are similarly scaled.
-            let fn_step = frame_size / 3.0;
-            let hit_un = un_corner + pos.x * fn_step;
-            let hit_vn = vn_corner + pos.y * fn_step;
-            let cell_u_lo = un_corner + w.u_lo * fn_step;
-            let cell_v_lo = vn_corner + w.v_lo * fn_step;
-            let cell_face_size = w.size * fn_step;
-            let shell_body = (outer_r - inner_r) * 3.0;
+            // Call bevel_layered in SUB-FRAME LOCAL coords rather
+            // than face-normalized coords. The face-normalized
+            // variants `un_corner + pos.x * fn_step` catastrophically
+            // cancel at deep m: at m ≥ 13, `pos.x * fn_step` is below
+            // the ULP of `un_corner` (~1e-7), so `(hit_un - cell_u_lo)
+            // / cell_face_size` inside `bevel_level` evaluates to
+            // noise rather than the true fractional position in the
+            // cell, and the multi-scale grid collapses into concentric
+            // rings. Using local coords keeps all bevel arithmetic
+            // O(1) regardless of depth.
+            //
+            // `reference_scale_local` converts local-frame units to
+            // body distance so `base_px` matches the face-normalized
+            // computation: one local unit = `deep_frame_size/3` in
+            // face-normalized = `shell_body * deep_frame_size / 3` in
+            // body-radial units.
             let pixel_density = uniforms.screen_height
                 / (2.0 * tan(camera.fov * 0.5));
-            // `t` is in sub-frame local scale (O(1/3^m)); convert to
-            // body units for the ray_dist arg by multiplying by the
-            // face-local→body scale (fn_step * body_size / frame_size)
-            // = body_size / 3. Works because rd_local has magnitude
-            // O(3^m) = inverse of fn_step.
-            let ray_dist_body = t * (3.0 * fn_step);
+            let shell_body = (outer_r - inner_r) * 3.0;
+            let reference_scale_local =
+                shell_body * deep_frame_size / 3.0;
+            // `t` in sub-frame local satisfies
+            //   pos_body = c_body + J · pos_local
+            //            = (stuff) + t · (J · rd_local)
+            //            = (stuff) + t · rd_body,
+            // so body distance from ray origin = `t · |rd_body|`.
+            // `rd_body` here is the raw, unnormalized world-frame ray
+            // direction (`fwd + ndc.x · right + ndc.y · up`), so its
+            // magnitude is ~1 for centre pixels, ~1.4 for corner
+            // pixels. The old formula `t * (3.0 * fn_step)` confused
+            // a unit-scale factor with the frame-size scale and
+            // produced `ray_dist_body` that was `deep_frame_size`-
+            // times too small — making `base_px` huge and rendering
+            // bevel grids at sub-pixel scales that manifest as
+            // concentric rings.
+            let ray_dist_body = t * length(rd_body);
             let shape = bevel_layered(
-                hit_un, hit_vn,
-                cell_u_lo, cell_v_lo, cell_face_size,
-                shell_body, ray_dist_body, pixel_density,
+                pos.x, pos.y,
+                w.u_lo, w.v_lo, w.size,
+                reference_scale_local, ray_dist_body, pixel_density,
             );
 
             result.color = palette[w.block].rgb

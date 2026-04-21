@@ -524,25 +524,16 @@ impl App {
         if let Some(sphere) = self.camera.position.sphere.as_ref() {
             let body_depth = sphere.body_path.depth();
             let uvr_depth = sphere.uvr_path.depth();
-            // Cap m_truncated at `MAX_STABLE_SPHERE_SUB_M` (14): past
-            // that, `un_corner += frame_size` in `sphere_in_sub_frame`'s
-            // neighbor transition silently drops the increment
-            // (frame_size = 1/3^15 ≈ 7e-8 is below f32 ULP of the
-            // O(0.5) corner value), and the Jacobian's evaluation
-            // point freezes across transitions — adjacent sub-frames
-            // become indistinguishable and the render collapses.
-            //
-            // Capping keeps the sub-frame shallow enough that corner
-            // updates stay within f32 precision, then relies on the
-            // intra-cell walker (walker_limit = visual_depth) to
-            // descend the remaining levels and resolve the deep
-            // dug-pit content. Net effect: grid visible at any
-            // anchor depth instead of collapsing at d19+.
-            const MAX_STABLE_SPHERE_SUB_M: u8 = 14;
-            let capped_uvr = uvr_depth.min(MAX_STABLE_SPHERE_SUB_M);
+            // Pass the FULL logical UVR depth down to
+            // `compute_render_frame`. The sub-frame internally
+            // evaluates the Jacobian at `eval_m = min(deep_m,
+            // MAX_EVAL_M)` and scales by `deep_scale = 1/3^(deep_m −
+            // eval_m)`, so f32 precision is preserved at arbitrary
+            // deep_m. See `SphereSubFrame` docs + `MAX_EVAL_M`
+            // constant in `src/app/frame.rs`.
             let desired = body_depth
                 .saturating_add(1)
-                .saturating_add(capped_uvr)
+                .saturating_add(uvr_depth)
                 .min(RENDER_FRAME_MAX_DEPTH);
             return frame::compute_render_frame(
                 &self.world.library, self.world.root,

@@ -33,14 +33,46 @@
 //! Pure functions; no `App` state.
 
 use crate::world::anchor::{Path, WorldPos};
-use crate::world::cubesphere::{face_frame_jacobian, mat3_inv, Face, Mat3, FACE_SLOTS};
+use crate::world::cubesphere::{
+    face_frame_jacobian, face_space_to_body_point, mat3_inv, Face, Mat3, FACE_SLOTS,
+};
 use crate::world::sdf::Vec3;
-use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
+
+/// Maximum depth at which we still evaluate the face-space Jacobian
+/// directly. Past this, the root-relative face-normalized corner
+/// `(un, vn, rn)` loses f32 precision (ULP ~1e-7 near magnitude 0.5),
+/// and the neighbor-step increment `un += frame_size = 1/3^deep_m`
+/// silently drops, freezing the Jacobian's eval point across
+/// transitions. We evaluate J at `eval_m = min(deep_m, MAX_EVAL_M)`
+/// and scale its columns by `deep_scale = 1/3^(deep_m - eval_m)` to
+/// represent the deep cell's tinier per-local-unit size. `J_eval`
+/// stays f32-stable at any deep_m because `eval_frame_size` never
+/// drops below `1/3^12 ≈ 1.88e-6`, well above ULP.
+///
+/// At depth `m_eval = 12`, the linearization error from using
+/// `N_eval` instead of `N_deep` is `O(eval_frame_size · deep cell
+/// distance from eval cell center) = O(1/3^12 · 1/3^12) ≈ 3.5e-12`
+/// — orders of magnitude below the f32 noise floor of the ray
+/// parameters. Scaling `J_eval · deep_scale` yields `J` with column
+/// magnitudes `O(1/3^deep_m)` — f32-representable down to `deep_m =
+/// 25` and beyond (`1/3^25 ≈ 1.2e-12`, well above f32 subnormal
+/// `~1.2e-38`).
+pub const MAX_EVAL_M: u8 = 12;
 
 /// Sphere sub-frame: the render root is a face-subtree cell at face
 /// depth ≥ `MIN_SPHERE_SUB_DEPTH`. Ray-march runs in the frame's
 /// local `[0, 3)³`. `c_body`, `J`, `J_inv` map local ↔ body-XYZ via
 /// the linearized face transform at the frame's corner.
+///
+/// The Jacobian is evaluated at a SHALLOW anchor (at `eval_m =
+/// min(deep_m, MAX_EVAL_M)`), where the face-normalized corner
+/// `(un_corner, vn_corner, rn_corner)` is f32-precise, and scaled by
+/// `deep_scale = 1/3^(deep_m − eval_m)` to represent the deeper
+/// cell's tinier per-local-unit size. This keeps J stable at
+/// arbitrary `deep_m` — the previous scheme stored corners at the
+/// full deep_m and collapsed at `deep_m ≥ 15` when `un += frame_size`
+/// became a no-op in f32.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SphereSubFrame {
     /// Path from world root to the containing `CubedSphereBody`.
@@ -60,18 +92,24 @@ pub struct SphereSubFrame {
     /// May contain slots whose tree link is `Child::Empty`; the
     /// walker treats those as uniform-empty sub-frame content.
     pub render_path: Path,
-    /// Absolute face-normalized coords of the sub-frame's corner —
-    /// local (0,0,0) in face `[0, 1)³`.
+    /// Depth at which the Jacobian is evaluated. `eval_m ≤
+    /// MAX_EVAL_M` guarantees `(un_corner, vn_corner, rn_corner,
+    /// frame_size)` are f32-stable.
+    pub eval_m: u8,
+    /// Face-normalized corner at the EVAL anchor (depth `eval_m`),
+    /// in face `[0, 1)³`. Precise in f32 because `eval_m ≤
+    /// MAX_EVAL_M`.
     pub un_corner: f32,
     pub vn_corner: f32,
     pub rn_corner: f32,
-    /// Size in face-normalized coords. Equals `1/3^M` where M is the
-    /// face-subtree depth. Carried as f32 — only precision-critical
-    /// combined with `un_corner`, which is itself f32; together they
-    /// represent the corner well enough for the Jacobian evaluation.
-    /// Sub-cell precision lives in `WorldPos.sphere.uvr_offset`, not
-    /// in this field.
+    /// Size of the EVAL cell in face-normalized coords. Equals
+    /// `1/3^eval_m`. The deep sub-frame's cell size is
+    /// `frame_size * deep_scale`.
     pub frame_size: f32,
+    /// `3^(eval_m − deep_m)` = deep_cell_size / eval_cell_size. Equals
+    /// 1.0 when `eval_m == deep_m` (shallow sub-frame path); less
+    /// than 1.0 when the sub-frame is deeper than `MAX_EVAL_M`.
+    pub deep_scale: f32,
     pub inner_r: f32,
     pub outer_r: f32,
     pub c_body: Vec3,
@@ -81,13 +119,20 @@ pub struct SphereSubFrame {
 
 impl SphereSubFrame {
     /// How many UVR descent levels inside the face subtree this
-    /// sub-frame represents.
+    /// sub-frame represents (the "deep" depth).
     pub fn depth_levels(&self) -> u32 {
         // render_path = body_path + face_root_slot + uvr_slots.
         // Length − body_path.depth() − 1 (the face-root slot) = UVR depth.
         (self.render_path.depth() as u32)
             .saturating_sub(self.body_path.depth() as u32)
             .saturating_sub(1)
+    }
+
+    /// Face-normalized cell size at `deep_m` (the DDA's per-cell
+    /// absolute step). Always f32-representable for `deep_m` up to
+    /// ~25 even though the eval corner is clamped shallower.
+    pub fn deep_frame_size(&self) -> f32 {
+        self.frame_size * self.deep_scale
     }
 
     /// Construct the neighbor sub-frame one local-axis step away along
@@ -157,38 +202,62 @@ impl SphereSubFrame {
             return None;
         }
 
-        // Incremental corner update. `un_corner + frame_size` per +axis
-        // step (and the reverse for −axis). Bubble-up preserves this:
-        // at the parent level `frame_size` is 3×, but the child moves
-        // from 2→0 (wrap with parent++) or 0→2 (wrap with parent−−) —
-        // net delta on the axis sum is still ±frame_size.
-        let d = direction as f32;
-        let mut un = self.un_corner;
-        let mut vn = self.vn_corner;
-        let mut rn = self.rn_corner;
-        match axis {
-            0 => un += d * self.frame_size,
-            1 => vn += d * self.frame_size,
-            _ => rn += d * self.frame_size,
+        // Recompute the EVAL corner fresh from the new render_path.
+        // A neighbor step may bubble through multiple UVR levels; some
+        // of those may be at or shallower than `eval_m`, in which case
+        // the eval corner shifts. Walking just the first `eval_m`
+        // slots from the face root keeps this O(MAX_EVAL_M) cheap
+        // while handling the bubble-up correctly. If all the bubbling
+        // happened below `eval_m`, the eval corner is unchanged and
+        // the Jacobian is frozen — that's the physically-correct
+        // approximation at `deep_m > eval_m` (face curvature between
+        // adjacent deep cells is O(1/3^deep_m · 1/3^eval_m), far
+        // below f32 noise).
+        let uvr_start = face_root_idx + 1;
+        let new_deep_m = (new_path.depth() as usize).saturating_sub(uvr_start);
+        let new_eval_m = new_deep_m.min(MAX_EVAL_M as usize);
+        let eval_slots =
+            &new_path.as_slice()[uvr_start..uvr_start + new_eval_m];
+        let (un, vn, rn, eval_frame_size) = uvr_corner_from_slots(eval_slots);
+        let mut deep_scale = 1.0_f32;
+        for _ in new_eval_m..new_deep_m {
+            deep_scale /= 3.0;
         }
 
-        let (c_body, j) = crate::world::cubesphere::face_frame_jacobian(
+        let (_c_body_eval, j_eval) = face_frame_jacobian(
             self.face,
-            un, vn, rn, self.frame_size,
+            un, vn, rn, eval_frame_size,
             self.inner_r, self.outer_r,
             3.0,
         );
-        let j_inv = crate::world::cubesphere::mat3_inv(&j);
+        let j = scale_mat3_cols(j_eval, deep_scale);
+        let j_inv = mat3_inv(&j);
+
+        // c_body at the DEEP corner. `face_space_to_body_point` is
+        // smooth, so feeding it the sum-over-deep_m un/vn/rn (imprecise
+        // at deep_m ≥ 15) still yields body-XYZ within O(1e-7) of the
+        // true corner — negligible at body-scale O(1).
+        let (un_deep, vn_deep, rn_deep, _deep_fs) = uvr_corner_from_slots(
+            &new_path.as_slice()[uvr_start..uvr_start + new_deep_m],
+        );
+        let c_body = face_space_to_body_point(
+            self.face,
+            un_deep, vn_deep, rn_deep,
+            self.inner_r, self.outer_r,
+            3.0,
+        );
 
         Some(SphereSubFrame {
             body_path: self.body_path,
             face: self.face,
             face_root_id: self.face_root_id,
             render_path: new_path,
+            eval_m: new_eval_m as u8,
             un_corner: un,
             vn_corner: vn,
             rn_corner: rn,
-            frame_size: self.frame_size,
+            frame_size: eval_frame_size,
+            deep_scale,
             inner_r: self.inner_r,
             outer_r: self.outer_r,
             c_body,
@@ -196,6 +265,17 @@ impl SphereSubFrame {
             j_inv,
         })
     }
+}
+
+/// Column-wise scale: `out[c][r] = m[c][r] * s`. Keeps the column-
+/// major storage convention.
+#[inline]
+fn scale_mat3_cols(m: Mat3, s: f32) -> Mat3 {
+    [
+        [m[0][0] * s, m[0][1] * s, m[0][2] * s],
+        [m[1][0] * s, m[1][1] * s, m[1][2] * s],
+        [m[2][0] * s, m[2][1] * s, m[2][2] * s],
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -296,21 +376,48 @@ pub fn compute_render_frame(
                 render_path.push(sphere.uvr_path.slot(k));
             }
 
-            let (un_corner, vn_corner, rn_corner, frame_size) =
-                uvr_corner(&sphere.uvr_path, m_truncated as usize);
-            let (c_body, j) = face_frame_jacobian(
+            let deep_m = m_truncated as usize;
+            let eval_m = deep_m.min(MAX_EVAL_M as usize);
+            let (un_corner, vn_corner, rn_corner, eval_frame_size) =
+                uvr_corner(&sphere.uvr_path, eval_m);
+            let mut deep_scale = 1.0_f32;
+            for _ in eval_m..deep_m {
+                deep_scale /= 3.0;
+            }
+            // J evaluated at the shallow eval corner is f32-stable
+            // and differs from the exact deep-corner J only by face
+            // curvature across the eval cell (O((1/3^eval_m)²)).
+            let (_c_body_eval, j_eval) = face_frame_jacobian(
                 sphere.face,
-                un_corner, vn_corner, rn_corner, frame_size,
+                un_corner, vn_corner, rn_corner, eval_frame_size,
                 sphere.inner_r, sphere.outer_r,
-                3.0, // body_size in the render-frame convention
+                3.0,
             );
+            // Deep J: scale columns by `deep_scale` to reflect the
+            // tinier per-local-unit cell size at `deep_m`.
+            let j = scale_mat3_cols(j_eval, deep_scale);
             let j_inv = mat3_inv(&j);
+            // c_body at the deep corner. face_space_to_body_point is
+            // smooth, so the corner coords' ~1e-7 imprecision at
+            // deep_m ≥ 15 propagates as O(1e-7) body-XYZ error —
+            // fine at body-scale O(1).
+            let (un_deep, vn_deep, rn_deep, _deep_fs) =
+                uvr_corner(&sphere.uvr_path, deep_m);
+            let c_body = face_space_to_body_point(
+                sphere.face,
+                un_deep, vn_deep, rn_deep,
+                sphere.inner_r, sphere.outer_r,
+                3.0,
+            );
             let sub = SphereSubFrame {
                 body_path: sphere.body_path,
                 face: sphere.face,
                 face_root_id,
                 render_path,
-                un_corner, vn_corner, rn_corner, frame_size,
+                eval_m: eval_m as u8,
+                un_corner, vn_corner, rn_corner,
+                frame_size: eval_frame_size,
+                deep_scale,
                 inner_r: sphere.inner_r,
                 outer_r: sphere.outer_r,
                 c_body, j, j_inv,
@@ -401,10 +508,12 @@ fn resolve_node(
 /// Sum UVR-slot coord contributions from `uvr_path[..m]` into
 /// (un_corner, vn_corner, rn_corner, frame_size). This is the
 /// symbolic → f32 conversion that produces the Jacobian's evaluation
-/// point. f32 precision is limited here, but only the Jacobian cares,
-/// and the Jacobian is a linearization reference — the sub-cell
-/// position (what matters for rendering) comes from
-/// `WorldPos.sphere.uvr_offset` elsewhere.
+/// point. At `m ≤ MAX_EVAL_M` (the only call site that matters for
+/// J evaluation), `frame_size = 1/3^m ≥ 1/3^12 ≈ 1.88e-6` — well
+/// above the ULP of `un` (~1e-7 near magnitude 0.5), so the
+/// cumulative sum is f32-stable. Callers passing `m > MAX_EVAL_M`
+/// (e.g., for `c_body` at the deep corner) accept the ~1e-7
+/// imprecision, which is harmless for smooth body-XYZ values.
 fn uvr_corner(uvr_path: &Path, m: usize) -> (f32, f32, f32, f32) {
     let mut un = 0.0_f32;
     let mut vn = 0.0_f32;
@@ -412,7 +521,25 @@ fn uvr_corner(uvr_path: &Path, m: usize) -> (f32, f32, f32, f32) {
     let mut size = 1.0_f32;
     for k in 0..m {
         let slot = uvr_path.slot(k) as usize;
-        let (us, vs, rs) = crate::world::tree::slot_coords(slot);
+        let (us, vs, rs) = slot_coords(slot);
+        size /= 3.0;
+        un += us as f32 * size;
+        vn += vs as f32 * size;
+        rn += rs as f32 * size;
+    }
+    (un, vn, rn, size)
+}
+
+/// Same as `uvr_corner` but reads slots from a `&[u8]` slice —
+/// useful post-neighbor-step when the updated `render_path`'s UVR
+/// tail is different from the camera's `uvr_path`.
+fn uvr_corner_from_slots(slots: &[u8]) -> (f32, f32, f32, f32) {
+    let mut un = 0.0_f32;
+    let mut vn = 0.0_f32;
+    let mut rn = 0.0_f32;
+    let mut size = 1.0_f32;
+    for &slot in slots {
+        let (us, vs, rs) = slot_coords(slot as usize);
         size /= 3.0;
         un += us as f32 * size;
         vn += vs as f32 * size;
@@ -578,14 +705,110 @@ mod tests {
             ActiveFrameKind::SphereSub(sub) => {
                 assert_eq!(sub.face, Face::PosY);
                 assert_eq!(sub.depth_levels(), MIN_SPHERE_SUB_DEPTH as u32);
+                // deep_m = MIN_SPHERE_SUB_DEPTH ≤ MAX_EVAL_M, so
+                // eval_m == deep_m and deep_scale == 1.
                 let expected = (1.0_f32 / 3.0).powi(MIN_SPHERE_SUB_DEPTH as i32);
                 assert!(
                     (sub.frame_size - expected).abs() < 1e-6,
-                    "frame_size {} ≠ {}", sub.frame_size, expected
+                    "frame_size {} ≠ {}", sub.frame_size, expected,
                 );
+                assert_eq!(sub.eval_m, MIN_SPHERE_SUB_DEPTH);
+                assert!((sub.deep_scale - 1.0).abs() < 1e-6);
+                assert!((sub.deep_frame_size() - expected).abs() < 1e-6);
             }
             k => panic!("expected SphereSub, got {k:?}"),
         }
+    }
+
+    #[test]
+    fn deep_sub_frame_uses_shallow_eval() {
+        // At `deep_m > MAX_EVAL_M` the eval corner clamps to
+        // `MAX_EVAL_M` and `deep_scale = 3^-(deep_m - MAX_EVAL_M)`.
+        // J's columns shrink by the same factor; the eval corner
+        // itself stays f32-precise.
+        use crate::world::anchor::SphereState;
+        use crate::world::cubesphere::{Face, FACE_SLOTS};
+        // Build a minimal tree with a face-root node so
+        // `resolve_node` finds the face-root id.
+        let mut lib = NodeLibrary::default();
+        let leaf = lib.insert(empty_children());
+        let face = lib.insert_with_kind(
+            uniform_children(Child::Node(leaf)),
+            NodeKind::CubedSphereFace { face: Face::PosY },
+        );
+        let mut body_children = empty_children();
+        body_children[FACE_SLOTS[Face::PosY as usize]] = Child::Node(face);
+        let body = lib.insert_with_kind(
+            body_children,
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+        );
+        let mut root_children = empty_children();
+        root_children[slot_index(1, 1, 1)] = Child::Node(body);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        let body_path = {
+            let mut p = Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let deep_m: u8 = 20;
+        let mut uvr_path = Path::root();
+        for _ in 0..deep_m {
+            uvr_path.push(slot_index(1, 1, 1) as u8);
+        }
+
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face: Face::PosY,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let desired = body_path.depth() + 1 + deep_m;
+        let f = compute_render_frame(&lib, root, &camera, desired);
+        let sub = match f.kind {
+            ActiveFrameKind::SphereSub(s) => s,
+            k => panic!("expected SphereSub, got {k:?}"),
+        };
+        assert_eq!(sub.eval_m, MAX_EVAL_M);
+        // deep_scale = 1/3^(deep_m - MAX_EVAL_M).
+        let delta = (deep_m - MAX_EVAL_M) as i32;
+        let expected_scale = (1.0_f32 / 3.0).powi(delta);
+        assert!(
+            (sub.deep_scale - expected_scale).abs() < 1e-10,
+            "deep_scale {} ≠ {}", sub.deep_scale, expected_scale,
+        );
+        // Eval corner is the sum over the first MAX_EVAL_M slots —
+        // each (1,1,1), so (un, vn, rn) should all be ~0.5 ·
+        // (1 - 3^-MAX_EVAL_M). frame_size = 1/3^MAX_EVAL_M.
+        let expected_fs = (1.0_f32 / 3.0).powi(MAX_EVAL_M as i32);
+        assert!(
+            (sub.frame_size - expected_fs).abs() < 1e-9,
+            "frame_size {} ≠ {}", sub.frame_size, expected_fs,
+        );
+        let expected_deep_fs = (1.0_f32 / 3.0).powi(deep_m as i32);
+        assert!(
+            (sub.deep_frame_size() - expected_deep_fs).abs()
+                < expected_deep_fs * 1e-3,
+            "deep_frame_size {} ≠ {}", sub.deep_frame_size(), expected_deep_fs,
+        );
+        // J's columns scale with deep cell size. At deep_m=20 a
+        // column should have magnitude O(1/3^20) · body_size ≈ 8.6e-10.
+        let col_u_mag = (sub.j[0][0].powi(2)
+            + sub.j[0][1].powi(2)
+            + sub.j[0][2].powi(2))
+        .sqrt();
+        assert!(
+            col_u_mag < 1e-8 && col_u_mag > 1e-12,
+            "col_u magnitude {} outside expected deep-scale range",
+            col_u_mag,
+        );
     }
 
     #[test]

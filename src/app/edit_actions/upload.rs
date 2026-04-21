@@ -340,13 +340,17 @@ impl App {
                         .map(|s| s.uvr_path.depth())
                         .unwrap_or(0);
                     eprintln!(
-                        "SPHERE_UPLOAD m_truncated={} logical_uvr_depth={} uvr_prefix_len={} \
-                         walker_limit(visual_depth)={} frame_size={:.3e} render_path_depth={}",
-                        uvr_prefix.len(),
+                        "SPHERE_UPLOAD deep_m={} eval_m={} logical_uvr_depth={} uvr_prefix_len={} \
+                         walker_limit(visual_depth)={} eval_frame_size={:.3e} deep_scale={:.3e} \
+                         deep_frame_size={:.3e} render_path_depth={}",
+                        sub.depth_levels(),
+                        sub.eval_m,
                         logical_uvr_depth,
                         uvr_prefix.len(),
                         effective_visual_depth,
                         sub.frame_size,
+                        sub.deep_scale,
+                        sub.deep_frame_size(),
                         sub.render_path.depth(),
                     );
                     renderer.set_root_kind_sphere_sub(
@@ -354,6 +358,7 @@ impl App {
                         sub.face as u32,
                         [sub.un_corner, sub.vn_corner, sub.rn_corner, sub.frame_size],
                         sub.c_body,
+                        sub.deep_scale,
                         sub.j,
                         sub.j_inv,
                         uvr_prefix,

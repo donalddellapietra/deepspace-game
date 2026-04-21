@@ -549,10 +549,13 @@ pub(super) fn cs_raycast_local(
 
             neighbor_transitions += 1;
             eprintln!(
-                "NEIGHBOR_STEP axis={} sign={} new_uvr_depth={} un={} vn={} rn={}",
+                "NEIGHBOR_STEP axis={} sign={} new_deep_m={} eval_m={} \
+                 un_eval={} vn_eval={} rn_eval={} deep_scale={:.3e}",
                 axis_k, sign_s,
                 current_sub.depth_levels(),
+                current_sub.eval_m,
                 current_sub.un_corner, current_sub.vn_corner, current_sub.rn_corner,
+                current_sub.deep_scale,
             );
             continue;
         }
@@ -581,15 +584,39 @@ pub(super) fn cs_raycast_local(
             full_path.extend(w.path.iter().copied());
 
             // Sphere cell in absolute face-normalized coords. The
-            // sub-frame maps local `[0, 3)` to absolute face
-            // `[un_corner, un_corner + frame_size)`, so per-local-unit
-            // absolute-coord-step = frame_size / 3.
-            let step = current_sub.frame_size / 3.0;
-            // The body chain is the first `sub.body_path.depth()`
-            // entries of `full_path` by construction — `ancestor_path`
-            // = body chain + face-root slot, then pre-descent UVR
-            // slots, then walker-internal slots.
+            // sub-frame's deep corner maps local `[0, 3)` to absolute
+            // face `[un_deep, un_deep + deep_frame_size)`. We don't
+            // store `un_deep` explicitly (only the eval corner +
+            // deep_scale); reconstructing it symbolically from
+            // `render_path[face_root+1..face_root+1+deep_m]` keeps
+            // the absolute coords precise for the AABB / edit path
+            // resolution, independent of the (precision-limited)
+            // c_body. Consumers that want body-XYZ should use
+            // `sub_c_body + J · sub_local` anyway, which IS
+            // precision-stable at any deep_m.
+            let deep_fs = current_sub.deep_frame_size();
+            let step = deep_fs / 3.0;
             let body_path_len = current_sub.body_path.depth() as usize;
+            let uvr_start = body_path_len + 1;
+            let deep_m = current_sub.depth_levels() as usize;
+            let render_slots = current_sub.render_path.as_slice();
+            let (un_deep, vn_deep, rn_deep) = {
+                let mut un = 0.0_f32;
+                let mut vn = 0.0_f32;
+                let mut rn = 0.0_f32;
+                let mut size = 1.0_f32;
+                for k in 0..deep_m {
+                    let slot =
+                        render_slots[uvr_start + k] as usize;
+                    let (us, vs, rs) =
+                        crate::world::tree::slot_coords(slot);
+                    size /= 3.0;
+                    un += us as f32 * size;
+                    vn += vs as f32 * size;
+                    rn += rs as f32 * size;
+                }
+                (un, vn, rn)
+            };
 
             return Some(HitInfo {
                 path: full_path,
@@ -600,9 +627,9 @@ pub(super) fn cs_raycast_local(
                 place_path: None,
                 sphere_cell: Some(SphereHitCell {
                     face: current_sub.face as u32,
-                    u_lo: current_sub.un_corner + w.u_lo * step,
-                    v_lo: current_sub.vn_corner + w.v_lo * step,
-                    r_lo: current_sub.rn_corner + w.r_lo * step,
+                    u_lo: un_deep + w.u_lo * step,
+                    v_lo: vn_deep + w.v_lo * step,
+                    r_lo: rn_deep + w.r_lo * step,
                     size: w.size * step,
                     inner_r: current_sub.inner_r,
                     outer_r: current_sub.outer_r,

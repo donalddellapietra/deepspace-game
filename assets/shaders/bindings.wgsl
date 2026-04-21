@@ -60,6 +60,10 @@ struct Uniforms {
     root_face_pop_pos: vec4<f32>,
 
     // ───────── SphereSub fields (iff root_kind == 3) ─────────
+    /// xyz = body-XYZ of the DEEP sub-frame corner.
+    /// w = `deep_scale = 1/3^(deep_m - eval_m)` — multiplier to go
+    /// from eval_frame_size (in `sub_face_corner.w`) to the actual
+    /// deep cell size.
     sub_c_body: vec4<f32>,
     sub_j_col0: vec4<f32>,
     sub_j_col1: vec4<f32>,
@@ -67,6 +71,10 @@ struct Uniforms {
     sub_j_inv_col0: vec4<f32>,
     sub_j_inv_col1: vec4<f32>,
     sub_j_inv_col2: vec4<f32>,
+    /// xyz = `(un_eval, vn_eval, rn_eval)` face-normalized corner at
+    /// the Jacobian's EVAL depth (f32-stable because
+    /// `eval_m ≤ MAX_EVAL_M`). w = `eval_frame_size = 1/3^eval_m`.
+    /// Deep frame size is `eval_frame_size * sub_c_body.w`.
     sub_face_corner: vec4<f32>,
     /// x = face index, y = UVR pre-descent prefix length,
     /// z = face-root depth (= body_path.depth() + 1 — the minimum

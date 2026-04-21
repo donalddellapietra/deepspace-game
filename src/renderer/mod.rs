@@ -91,7 +91,12 @@ pub struct GpuUniforms {
     pub root_face_pop_pos: [f32; 4],
 
     // ───────── SphereSub fields (iff root_kind == 3) ─────────
-    /// Body-XYZ of local (0, 0, 0) — sub-frame corner. xyz used.
+    /// xyz = body-XYZ of local (0, 0, 0) at the DEEP sub-frame
+    /// corner. w = `deep_scale` = `1/3^(deep_m - eval_m)` — the
+    /// ratio between the deep sub-frame's cell size and the eval
+    /// anchor's cell size. Shader multiplies `sub_face_corner.w`
+    /// (eval_frame_size) by `deep_scale` to recover the deep
+    /// `frame_size` for hit-cell reporting + neighbor-step.
     pub sub_c_body: [f32; 4],
     /// Jacobian columns. xyz used.
     pub sub_j_col0: [f32; 4],
@@ -101,7 +106,13 @@ pub struct GpuUniforms {
     pub sub_j_inv_col0: [f32; 4],
     pub sub_j_inv_col1: [f32; 4],
     pub sub_j_inv_col2: [f32; 4],
-    /// xyzw = (un_corner, vn_corner, rn_corner, frame_size).
+    /// xyz = `(un_eval, vn_eval, rn_eval)` face-normalized corner
+    /// at the Jacobian's EVAL depth. w = `eval_frame_size =
+    /// 1/3^eval_m`. The deep sub-frame's absolute corner equals the
+    /// eval corner plus a symbolic offset carried by `sub_uvr_slots`
+    /// from index `eval_m` onward; its cell size equals
+    /// `eval_frame_size * deep_scale` (`deep_scale` in
+    /// `sub_c_body.w`).
     pub sub_face_corner: [f32; 4],
     /// x = face index (0..5), y = UVR pre-descent prefix length
     /// (number of valid entries in `sub_uvr_slots`),
@@ -373,6 +384,15 @@ impl Renderer {
     /// `face_root_depth` = `body_path.depth() + 1` — the minimum UVR
     /// prefix length before a neighbor-step bubble-up becomes a
     /// cross-face transition (terminate threshold for the shader).
+    /// `corner_and_size`: xyz = `(un_eval, vn_eval, rn_eval)`
+    /// face-normalized corner at the Jacobian's EVAL depth
+    /// (`eval_m ≤ MAX_EVAL_M`). w = `eval_frame_size = 1/3^eval_m`.
+    ///
+    /// `deep_scale = 1/3^(deep_m - eval_m)` — packed into
+    /// `sub_c_body.w` so the shader can recover the deep cell size
+    /// (`= eval_frame_size * deep_scale`) during hit-cell
+    /// reconstruction and neighbor-step corner update. Equals
+    /// `1.0` when `deep_m ≤ MAX_EVAL_M` (shallow sub-frame path).
     #[allow(clippy::too_many_arguments)]
     pub fn set_root_kind_sphere_sub(
         &mut self,
@@ -381,6 +401,7 @@ impl Renderer {
         face_id: u32,
         corner_and_size: [f32; 4],
         c_body: [f32; 3],
+        deep_scale: f32,
         j: [[f32; 3]; 3],
         j_inv: [[f32; 3]; 3],
         uvr_prefix_slots: &[u8],
@@ -391,7 +412,7 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
-        self.sub_c_body = [c_body[0], c_body[1], c_body[2], 0.0];
+        self.sub_c_body = [c_body[0], c_body[1], c_body[2], deep_scale];
         self.sub_j_col0 = [j[0][0], j[0][1], j[0][2], 0.0];
         self.sub_j_col1 = [j[1][0], j[1][1], j[1][2], 0.0];
         self.sub_j_col2 = [j[2][0], j[2][1], j[2][2], 0.0];

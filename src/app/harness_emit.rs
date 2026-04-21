@@ -154,8 +154,10 @@ impl App {
                     format!("Body(ir={inner_r},or={outer_r})")
                 }
                 crate::app::ActiveFrameKind::SphereSub(ref s) => format!(
-                    "SphereSub(m={},face={:?},un={:.6e},rn={:.6e},frame_size={:.6e})",
-                    s.depth_levels(), s.face, s.un_corner, s.rn_corner, s.frame_size,
+                    "SphereSub(deep_m={},eval_m={},face={:?},un_eval={:.6e},rn_eval={:.6e},eval_fs={:.6e},deep_scale={:.3e},deep_fs={:.3e})",
+                    s.depth_levels(), s.eval_m, s.face,
+                    s.un_corner, s.rn_corner, s.frame_size,
+                    s.deep_scale, s.deep_frame_size(),
                 ),
             };
             let render_slots: Vec<u32> = app
