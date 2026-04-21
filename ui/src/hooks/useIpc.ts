@@ -24,8 +24,13 @@ export function assignMeshToSlot(meshIndex: number) {
   sendCommand({ cmd: "assignMeshToSlot", meshIndex });
 }
 
-export function setColorPickerRgb(r: number, g: number, b: number) {
-  sendCommand({ cmd: "setColorPickerRgb", r, g, b });
+export function setColorPickerRgb(
+  r: number,
+  g: number,
+  b: number,
+  a: number = 1
+) {
+  sendCommand({ cmd: "setColorPickerRgb", r, g, b, a });
 }
 
 export function createBlock() {

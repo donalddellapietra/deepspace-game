@@ -52,6 +52,12 @@ pub struct ColorPickerStateJs {
     pub r: f32,
     pub g: f32,
     pub b: f32,
+    /// Alpha channel (0 = fully transparent, 1 = fully opaque). The
+    /// UI surfaces this as a slider; values below `ALPHA_FLOOR` render
+    /// as invisible, values above `ALPHA_CEIL` render as opaque, and
+    /// anything in between composites through the ray-march translucency
+    /// path.
+    pub a: f32,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -136,7 +142,7 @@ pub enum UiCommand {
     AssignBlockToSlot { voxel: u16 },
     #[serde(rename_all = "camelCase")]
     AssignMeshToSlot { mesh_index: usize },
-    SetColorPickerRgb { r: f32, g: f32, b: f32 },
+    SetColorPickerRgb { r: f32, g: f32, b: f32, a: f32 },
     CreateBlock,
     ToggleInventory,
     ToggleColorPicker,

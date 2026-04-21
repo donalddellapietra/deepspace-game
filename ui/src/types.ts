@@ -38,6 +38,8 @@ export interface ColorPickerState {
   r: number;
   g: number;
   b: number;
+  /** Alpha channel, 0..1. 1 = fully opaque. */
+  a: number;
 }
 
 export interface ModeIndicatorState {
@@ -94,7 +96,7 @@ export type UiCommand =
   | { cmd: "selectHotbarSlot"; slot: number }
   | { cmd: "assignBlockToSlot"; voxel: number }
   | { cmd: "assignMeshToSlot"; meshIndex: number }
-  | { cmd: "setColorPickerRgb"; r: number; g: number; b: number }
+  | { cmd: "setColorPickerRgb"; r: number; g: number; b: number; a: number }
   | { cmd: "createBlock" }
   | { cmd: "toggleInventory" }
   | { cmd: "toggleColorPicker" }

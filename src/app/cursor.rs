@@ -52,10 +52,19 @@ impl App {
     /// cursor lock.
     pub(super) fn poll_ui_commands(&mut self) {
         for cmd in crate::overlay::poll_commands() {
-            let panel_changed = self.ui.handle_command(cmd);
+            let panel_changed = self.ui.handle_command(cmd, &mut self.palette);
             if panel_changed {
                 self.sync_cursor_to_panels();
             }
+        }
+        // `CreateBlock` registers a new palette entry; push the
+        // updated palette to the GPU so subsequent place actions
+        // actually paint with the right colour.
+        if self.ui.palette_dirty {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.update_palette(&self.palette.to_gpu_palette());
+            }
+            self.ui.palette_dirty = false;
         }
     }
 }

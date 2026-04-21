@@ -39,6 +39,26 @@
   height: 90px;
   border-radius: 10px;
   border: 2px solid rgba(255, 255, 255, 0.15);
+  position: relative;
+  overflow: hidden;
+}
+
+/* Checker background tile — visible wherever the fill is < 100% alpha
+   so translucent colors read as clearly see-through. */
+.cp-checker {
+  background-color: #404040;
+  background-image:
+    linear-gradient(45deg, #606060 25%, transparent 25%),
+    linear-gradient(-45deg, #606060 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #606060 75%),
+    linear-gradient(-45deg, transparent 75%, #606060 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+}
+
+.cp-preview-fill {
+  position: absolute;
+  inset: 0;
   transition: background-color 0.05s;
 }
 
@@ -135,6 +155,7 @@
 .cp-label-r { color: #ff5050; }
 .cp-label-g { color: #50ff50; }
 .cp-label-b { color: #6496ff; }
+.cp-label-a { color: #d8d8d8; }
 
 .cp-slider-row input[type="range"] {
   flex: 1;

@@ -50,6 +50,13 @@ pub enum WorldPreset {
     /// Hollow cube — 18-cell architectural shell (12 edges + 6
     /// faces, no corners or body). Brushed-steel + brass palette.
     HollowCube,
+    /// Hand-crafted translucency showcase: stone floor, a translucent
+    /// cyan glass wall, a brick wall behind the glass, and a few
+    /// solid coloured cubes between them. Built by
+    /// [`crate::world::glass_test`]. The glass block is registered
+    /// with alpha ≈ 0.3 so the shader's per-block translucency path
+    /// kicks in and everything behind the glass reads as tinted.
+    GlassTest,
     /// Imported `.vox` / `.vxs` model placed inside a plain world.
     /// Uses the GLB→`.vxs`→tree pipeline (see `src/import/` and
     /// `tools/scene_voxelize/`). The model is planted at the center
@@ -104,6 +111,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::Mausoleum
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
+        | WorldPreset::GlassTest
         | WorldPreset::Scene { .. } => None,
     }
 }
@@ -166,6 +174,11 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::HollowCube => {
             crate::world::fractals::hollow_cube::bootstrap_hollow_cube_world(
                 plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::GlassTest => {
+            crate::world::glass_test::bootstrap_glass_test_world(
+                plain_layers.unwrap_or(6),
             )
         }
         WorldPreset::VoxModel { path, interior_depth } => bootstrap_vox_model_world(

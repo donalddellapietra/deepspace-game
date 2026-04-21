@@ -6,6 +6,7 @@ pub mod cubesphere_local;
 pub mod edit;
 pub mod entities;
 pub mod fractals;
+pub mod glass_test;
 pub mod gpu;
 pub mod palette;
 pub mod raycast;

@@ -44,9 +44,43 @@
   height: 40px;
   border: 2px solid var(--inactive-border);
   border-radius: 6px;
+  position: relative;
+  overflow: hidden;
 }
 .hotbar-swatch.active {
   border-color: var(--active-border);
+}
+
+/* Translucent slots get a checker background that shows through the
+   semi-transparent fill, so the user can tell at a glance which
+   block-slot is glass-like vs solid. */
+.hotbar-swatch.translucent {
+  background-color: #303030;
+  background-image:
+    linear-gradient(45deg, #555 25%, transparent 25%),
+    linear-gradient(-45deg, #555 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #555 75%),
+    linear-gradient(-45deg, transparent 75%, #555 75%);
+  background-size: 10px 10px;
+  background-position: 0 0, 0 5px, 5px -5px, -5px 0;
+}
+
+.hotbar-swatch-fill {
+  position: absolute;
+  inset: 0;
+}
+
+.hotbar-alpha-badge {
+  position: absolute;
+  bottom: 2px;
+  right: 3px;
+  font-size: 8px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 2px 3px;
+  border-radius: 3px;
+  pointer-events: none;
 }
 
 .hotbar-hint {

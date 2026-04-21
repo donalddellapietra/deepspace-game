@@ -22,8 +22,10 @@ export function Hotbar() {
           const isActive = i === active;
           const keyLabel = i === 9 ? "0" : `${i + 1}`;
 
+          const alpha = slot ? slot.color[3] : 1;
+          const translucent = !!slot && alpha < 0.98;
           const bgColor = slot
-            ? `rgba(${slot.color[0] * 255}, ${slot.color[1] * 255}, ${slot.color[2] * 255}, ${slot.color[3]})`
+            ? `rgba(${slot.color[0] * 255}, ${slot.color[1] * 255}, ${slot.color[2] * 255}, ${alpha})`
             : "rgba(77, 77, 77, 1)";
 
           return (
@@ -32,9 +34,20 @@ export function Hotbar() {
                 {keyLabel}
               </span>
               <div
-                className={`hotbar-swatch ${isActive ? "active" : ""}`}
-                style={{ backgroundColor: bgColor }}
-              />
+                className={`hotbar-swatch ${isActive ? "active" : ""} ${
+                  translucent ? "translucent" : ""
+                }`}
+              >
+                <div
+                  className="hotbar-swatch-fill"
+                  style={{ backgroundColor: bgColor }}
+                />
+                {translucent && (
+                  <span className="hotbar-alpha-badge">
+                    α{alpha.toFixed(2).replace(/^0/, "")}
+                  </span>
+                )}
+              </div>
             </div>
           );
         })}

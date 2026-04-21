@@ -52,6 +52,7 @@ const colorPickerStore = createStore<ColorPickerState>({
   r: 0.5,
   g: 0.5,
   b: 0.5,
+  a: 1,
 });
 
 const modeIndicatorStore = createStore<ModeIndicatorState>({

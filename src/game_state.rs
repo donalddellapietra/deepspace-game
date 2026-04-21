@@ -45,6 +45,12 @@ impl SavedMeshes {
 
 #[derive(Clone, Debug)]
 pub struct CustomBlock {
+    /// Palette index registered into `ColorRegistry`. Stored here so
+    /// the inventory UI can surface the right index in `BlockInfo`
+    /// even when other code paths (vox-model loader, fractal
+    /// bootstraps) interleave their own registrations into the
+    /// registry between user-created blocks.
+    pub voxel: u16,
     pub name: String,
     pub color: [f32; 4],
 }
@@ -59,6 +65,10 @@ pub struct GameUiState {
     pub picker_r: f32,
     pub picker_g: f32,
     pub picker_b: f32,
+    /// Alpha channel of the color picker. 1.0 = fully opaque; values
+    /// below 1.0 register the block as translucent and the shader's
+    /// per-block compositing path paints whatever is behind it.
+    pub picker_a: f32,
     pub custom_blocks: Vec<CustomBlock>,
     pub ui_focused: bool,
     pub zoom_level: i32,
@@ -66,6 +76,10 @@ pub struct GameUiState {
     pub last_inventory_sent: Option<InventoryStateJs>,
     pub last_color_picker_sent: Option<ColorPickerStateJs>,
     pub last_mode_indicator_sent: Option<ModeIndicatorStateJs>,
+    /// Set when `CreateBlock` registers a new palette entry; the app
+    /// drain-polls this flag every tick and pushes a fresh GPU palette
+    /// when it flips.
+    pub palette_dirty: bool,
 }
 
 impl GameUiState {
@@ -88,6 +102,7 @@ impl GameUiState {
             picker_r: 0.5,
             picker_g: 0.5,
             picker_b: 0.5,
+            picker_a: 1.0,
             custom_blocks: Vec::new(),
             ui_focused: false,
             zoom_level: 0,
@@ -95,6 +110,7 @@ impl GameUiState {
             last_inventory_sent: None,
             last_color_picker_sent: None,
             last_mode_indicator_sent: None,
+            palette_dirty: false,
         }
     }
 
@@ -111,7 +127,18 @@ impl GameUiState {
     }
 
     /// Handle a UiCommand. Returns true if panel open/close state changed.
-    pub fn handle_command(&mut self, cmd: UiCommand) -> bool {
+    ///
+    /// `registry` is threaded through so `CreateBlock` can register
+    /// the chosen RGBA in the palette and get back a real index
+    /// (instead of the old open-coded `BUILTIN_COUNT + custom_blocks.len()`
+    /// assumption, which bypassed dedup and broke as soon as anything
+    /// else — vox model loaders, fractal bootstraps — registered a
+    /// non-builtin colour).
+    pub fn handle_command(
+        &mut self,
+        cmd: UiCommand,
+        registry: &mut ColorRegistry,
+    ) -> bool {
         let panels_were_open = self.any_panel_open();
 
         match cmd {
@@ -124,19 +151,39 @@ impl GameUiState {
             UiCommand::AssignMeshToSlot { mesh_index } => {
                 self.slots[self.active_slot] = HotbarItem::Mesh(mesh_index);
             }
-            UiCommand::SetColorPickerRgb { r, g, b } => {
+            UiCommand::SetColorPickerRgb { r, g, b, a } => {
                 self.picker_r = r;
                 self.picker_g = g;
                 self.picker_b = b;
+                self.picker_a = a.clamp(0.0, 1.0);
             }
             UiCommand::CreateBlock => {
-                let idx = block::BUILTIN_COUNT + self.custom_blocks.len() as u16;
-                let name = format!("Custom #{}", self.custom_blocks.len() + 1);
-                let color = [self.picker_r, self.picker_g, self.picker_b, 1.0];
-                self.custom_blocks.push(CustomBlock { name, color });
-                self.slots[self.active_slot] = HotbarItem::Block(idx);
+                let r8 = (self.picker_r.clamp(0.0, 1.0) * 255.0) as u8;
+                let g8 = (self.picker_g.clamp(0.0, 1.0) * 255.0) as u8;
+                let b8 = (self.picker_b.clamp(0.0, 1.0) * 255.0) as u8;
+                let a8 = (self.picker_a.clamp(0.0, 1.0) * 255.0) as u8;
+                if let Some(idx) = registry.register(r8, g8, b8, a8) {
+                    let color = [
+                        r8 as f32 / 255.0,
+                        g8 as f32 / 255.0,
+                        b8 as f32 / 255.0,
+                        a8 as f32 / 255.0,
+                    ];
+                    let name = format!("Custom #{}", self.custom_blocks.len() + 1);
+                    // Dedup: don't double-add an already-registered
+                    // voxel (e.g. user picked the same RGBA twice).
+                    if !self.custom_blocks.iter().any(|b| b.voxel == idx) {
+                        self.custom_blocks.push(CustomBlock { voxel: idx, name, color });
+                    }
+                    self.slots[self.active_slot] = HotbarItem::Block(idx);
+                    self.palette_dirty = true;
+                    log::info!(
+                        "Created custom block voxel={idx} rgba=({r8},{g8},{b8},{a8})",
+                    );
+                } else {
+                    log::warn!("Palette full — cannot register new block");
+                }
                 self.color_picker_open = false;
-                log::info!("Created custom block voxel={idx}");
             }
             UiCommand::ToggleInventory => {
                 self.inventory_open = !self.inventory_open;
@@ -228,8 +275,8 @@ impl GameUiState {
             BlockInfo { voxel: idx, name: name.to_string(), color }
         }).collect();
 
-        let custom_blocks: Vec<BlockInfo> = self.custom_blocks.iter().enumerate().map(|(i, cb)| {
-            BlockInfo { voxel: block::BUILTIN_COUNT + i as u16, name: cb.name.clone(), color: cb.color }
+        let custom_blocks: Vec<BlockInfo> = self.custom_blocks.iter().map(|cb| {
+            BlockInfo { voxel: cb.voxel, name: cb.name.clone(), color: cb.color }
         }).collect();
 
         let inventory = InventoryStateJs {
@@ -243,7 +290,11 @@ impl GameUiState {
 
         // Color picker
         let color_picker = ColorPickerStateJs {
-            open: self.color_picker_open, r: self.picker_r, g: self.picker_g, b: self.picker_b,
+            open: self.color_picker_open,
+            r: self.picker_r,
+            g: self.picker_g,
+            b: self.picker_b,
+            a: self.picker_a,
         };
         if self.last_color_picker_sent.as_ref() != Some(&color_picker) {
             overlay::push_state(&GameStateUpdate::ColorPicker(color_picker.clone()));

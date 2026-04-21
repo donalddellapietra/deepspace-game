@@ -177,16 +177,50 @@ fn march_entity_subtree(
         let tag = packed & 0xFFu;
 
         if tag == 1u {
+            // Per-block translucency inside entity subtrees, symmetric
+            // with the outer march_cartesian treatment. Translucent
+            // blocks composite into the shared accumulator in
+            // `result.accum_*` and continue the DDA; the outer caller
+            // maps the accumulator back into its own frame.
+            let block_rgba_e = palette[(packed >> 8u) & 0xFFFFu];
+            let block_alpha_e = block_rgba_e.a;
             let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
             let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
-            let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
-            result.hit = true;
-            result.t = max(cell_box_h.t_enter, 0.0);
-            result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
-            result.normal = normal;
-            result.cell_min = cell_min_h;
-            result.cell_size = cur_cell_size;
-            return result;
+            if block_alpha_e >= ALPHA_CEIL {
+                let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+                result.hit = true;
+                result.t = max(cell_box_h.t_enter, 0.0);
+                result.color = block_rgba_e.rgb;
+                result.normal = normal;
+                result.cell_min = cell_min_h;
+                result.cell_size = cur_cell_size;
+                return result;
+            }
+            if block_alpha_e < ALPHA_FLOOR {
+                let m_et = min_axis_mask(cur_side_dist);
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_et) * step);
+                cur_side_dist += m_et * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_et;
+                continue;
+            }
+            let w_et = (1.0 - result.accum_alpha) * block_alpha_e;
+            result.accum_color = result.accum_color + w_et * block_rgba_e.rgb;
+            result.accum_alpha = result.accum_alpha + w_et;
+            if result.accum_alpha >= ALPHA_CEIL {
+                let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+                result.hit = true;
+                result.t = max(cell_box_h.t_enter, 0.0);
+                result.color = block_rgba_e.rgb;
+                result.normal = normal;
+                result.cell_min = cell_min_h;
+                result.cell_size = cur_cell_size;
+                return result;
+            }
+            let m_et = min_axis_mask(cur_side_dist);
+            s_cell[depth] = pack_cell(cell + vec3<i32>(m_et) * step);
+            cur_side_dist += m_et * delta_dist * cur_cell_size;
+            normal = -vec3<f32>(step) * m_et;
+            continue;
         }
         // tag == 2u: Cartesian Node descent. tag==3 (EntityRef) is
         // treated as miss inside entity subtrees — no entities-
@@ -474,18 +508,61 @@ fn march_cartesian(
         if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
 
         if tag == 1u {
+            // Per-block translucency. The palette entry's alpha channel
+            // controls compositing behaviour in three regimes:
+            //   * a >= ALPHA_CEIL : opaque, terminate (matches old fast path)
+            //   * a <  ALPHA_FLOOR: invisible, skip as if empty
+            //   * otherwise       : front-to-back composite, continue ray
+            // The third path lets coloured "glass" blocks tint everything
+            // behind them without erasing depth / LOD detail.
+            let block_rgba = palette[(packed >> 8u) & 0xFFFFu];
+            let block_alpha = block_rgba.a;
             let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
             let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
-            let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
-            result.hit = true;
-            result.t = max(cell_box_h.t_enter, 0.0);
-            result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
-            result.normal = normal;
-            result.cell_min = cell_min_h;
-            result.cell_size = cur_cell_size;
-            result.accum_color = accum_color;
-            result.accum_alpha = accum_alpha;
-            return result;
+
+            if block_alpha >= ALPHA_CEIL {
+                let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+                result.hit = true;
+                result.t = max(cell_box_h.t_enter, 0.0);
+                result.color = block_rgba.rgb;
+                result.normal = normal;
+                result.cell_min = cell_min_h;
+                result.cell_size = cur_cell_size;
+                result.accum_color = accum_color;
+                result.accum_alpha = accum_alpha;
+                return result;
+            }
+            if block_alpha < ALPHA_FLOOR {
+                // Effectively invisible — treat as empty, keep marching.
+                let m_blk = min_axis_mask(cur_side_dist);
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_blk) * step);
+                cur_side_dist += m_blk * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_blk;
+                continue;
+            }
+            // Translucent: composite + advance. Front-to-back blend:
+            //   accum += (1-accum_alpha) * alpha * color
+            //   alpha += (1-accum_alpha) * alpha
+            let w_blk = (1.0 - accum_alpha) * block_alpha;
+            accum_color = accum_color + w_blk * block_rgba.rgb;
+            accum_alpha = accum_alpha + w_blk;
+            if accum_alpha >= ALPHA_CEIL {
+                let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+                result.hit = true;
+                result.t = max(cell_box_h.t_enter, 0.0);
+                result.color = block_rgba.rgb;
+                result.normal = normal;
+                result.cell_min = cell_min_h;
+                result.cell_size = cur_cell_size;
+                result.accum_color = accum_color;
+                result.accum_alpha = accum_alpha;
+                return result;
+            }
+            let m_blk = min_axis_mask(cur_side_dist);
+            s_cell[depth] = pack_cell(cell + vec3<i32>(m_blk) * step);
+            cur_side_dist += m_blk * delta_dist * cur_cell_size;
+            normal = -vec3<f32>(step) * m_blk;
+            continue;
         } else if ENABLE_ENTITIES && tag == 3u {
             // tag=3 — EntityRef. Guarded by the compile-time
             // `ENABLE_ENTITIES` override: fractal / sphere preset
@@ -525,15 +602,36 @@ fn march_cartesian(
                 // both mean "don't splat" — advance DDA.
                 let rep = entity.representative_block;
                 if rep < 0xFFFDu {
-                    result.hit = true;
-                    result.t = max(ebb.t_enter, 0.0);
-                    result.color = palette[rep].rgb;
-                    result.normal = -normalize(ray_dir);
-                    result.cell_min = entity.bbox_min;
-                    result.cell_size = bbox_size.x;
-                    result.accum_color = accum_color;
-                    result.accum_alpha = accum_alpha;
-                    return result;
+                    let rep_rgba = palette[rep];
+                    let rep_alpha = rep_rgba.a;
+                    if rep_alpha >= ALPHA_CEIL {
+                        result.hit = true;
+                        result.t = max(ebb.t_enter, 0.0);
+                        result.color = rep_rgba.rgb;
+                        result.normal = -normalize(ray_dir);
+                        result.cell_min = entity.bbox_min;
+                        result.cell_size = bbox_size.x;
+                        result.accum_color = accum_color;
+                        result.accum_alpha = accum_alpha;
+                        return result;
+                    }
+                    if rep_alpha >= ALPHA_FLOOR {
+                        let w_e = (1.0 - accum_alpha) * rep_alpha;
+                        accum_color = accum_color + w_e * rep_rgba.rgb;
+                        accum_alpha = accum_alpha + w_e;
+                        if accum_alpha >= ALPHA_CEIL {
+                            result.hit = true;
+                            result.t = max(ebb.t_enter, 0.0);
+                            result.color = rep_rgba.rgb;
+                            result.normal = -normalize(ray_dir);
+                            result.cell_min = entity.bbox_min;
+                            result.cell_size = bbox_size.x;
+                            result.accum_color = accum_color;
+                            result.accum_alpha = accum_alpha;
+                            return result;
+                        }
+                    }
+                    // below floor OR composited + continue: advance DDA.
                 }
                 let m_lod_e = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_lod_e) * step);

@@ -86,7 +86,7 @@ function hexToRgb(hex: string): [number, number, number] | null {
 // ── Component ─────────────────────────────────────────────────────
 
 export function ColorPicker() {
-  const { open, r, g, b } = useColorPicker();
+  const { open, r, g, b, a } = useColorPicker();
 
   const [hsv, setHsv] = useState<[number, number, number]>(() =>
     rgbToHsv(r, g, b)
@@ -104,18 +104,21 @@ export function ColorPicker() {
     setHexInput(toHex(r, g, b));
   }, [r, g, b]);
 
-  const pushRgb = useCallback((nr: number, ng: number, nb: number) => {
-    setColorPickerRgb(nr, ng, nb);
-    setHexInput(toHex(nr, ng, nb));
-  }, []);
+  const pushRgba = useCallback(
+    (nr: number, ng: number, nb: number, na: number) => {
+      setColorPickerRgb(nr, ng, nb, na);
+      setHexInput(toHex(nr, ng, nb));
+    },
+    []
+  );
 
   const updateFromHsv = useCallback(
     (h: number, s: number, v: number) => {
       setHsv([h, s, v]);
       const [nr, ng, nb] = hsvToRgb(h, s, v);
-      pushRgb(nr, ng, nb);
+      pushRgba(nr, ng, nb, a);
     },
-    [pushRgb]
+    [pushRgba, a]
   );
 
   // ── SV area drag ──
@@ -172,6 +175,11 @@ export function ColorPicker() {
 
   const hex = toHex(r, g, b);
   const hueColor = `hsl(${hsv[0]}, 100%, 50%)`;
+  // rgba(...) preview over a CSS checker background so the user can
+  // see how translucent the chosen colour really is.
+  const previewColor = `rgba(${Math.round(r * 255)}, ${Math.round(
+    g * 255
+  )}, ${Math.round(b * 255)}, ${a})`;
 
   return (
     <div
@@ -181,16 +189,21 @@ export function ColorPicker() {
     >
       <h2 className="cp-title">CREATE BLOCK</h2>
 
-      {/* Preview swatch */}
+      {/* Preview swatch over checker so the alpha channel is visible */}
       <div className="cp-preview-area">
-        <div className="cp-preview" style={{ backgroundColor: hex }} />
+        <div className="cp-preview cp-checker">
+          <div
+            className="cp-preview-fill"
+            style={{ backgroundColor: previewColor }}
+          />
+        </div>
         <input
           className="cp-hex-input"
           value={hexInput}
           onChange={(e) => {
             setHexInput(e.target.value);
             const parsed = hexToRgb(e.target.value);
-            if (parsed) pushRgb(...parsed);
+            if (parsed) pushRgba(parsed[0], parsed[1], parsed[2], a);
           }}
           onKeyDown={(e) => e.stopPropagation()}
         />
@@ -232,7 +245,7 @@ export function ColorPicker() {
         />
       </div>
 
-      {/* RGB sliders */}
+      {/* RGB + A sliders */}
       <div className="cp-sliders">
         <div className="cp-slider-row">
           <span className="cp-label cp-label-r">R</span>
@@ -244,7 +257,7 @@ export function ColorPicker() {
             value={r}
             onChange={(e) => {
               const nr = parseFloat(e.target.value);
-              setColorPickerRgb(nr, g, b);
+              setColorPickerRgb(nr, g, b, a);
             }}
           />
           <span className="cp-value">{Math.round(r * 255)}</span>
@@ -259,7 +272,7 @@ export function ColorPicker() {
             value={g}
             onChange={(e) => {
               const ng = parseFloat(e.target.value);
-              setColorPickerRgb(r, ng, b);
+              setColorPickerRgb(r, ng, b, a);
             }}
           />
           <span className="cp-value">{Math.round(g * 255)}</span>
@@ -274,10 +287,25 @@ export function ColorPicker() {
             value={b}
             onChange={(e) => {
               const nb = parseFloat(e.target.value);
-              setColorPickerRgb(r, g, nb);
+              setColorPickerRgb(r, g, nb, a);
             }}
           />
           <span className="cp-value">{Math.round(b * 255)}</span>
+        </div>
+        <div className="cp-slider-row">
+          <span className="cp-label cp-label-a">A</span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value={a}
+            onChange={(e) => {
+              const na = parseFloat(e.target.value);
+              setColorPickerRgb(r, g, b, na);
+            }}
+          />
+          <span className="cp-value">{a.toFixed(2)}</span>
         </div>
       </div>
 

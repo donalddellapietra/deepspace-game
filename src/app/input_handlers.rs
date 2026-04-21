@@ -63,8 +63,10 @@ impl App {
 
         if pressed && code == KeyCode::Escape {
             if self.ui.any_panel_open() {
-                self.ui
-                    .handle_command(crate::bridge::UiCommand::CloseAllPanels);
+                self.ui.handle_command(
+                    crate::bridge::UiCommand::CloseAllPanels,
+                    &mut self.palette,
+                );
                 self.sync_cursor_to_panels();
             } else if self.cursor_locked {
                 self.unlock_cursor();

@@ -193,6 +193,7 @@ impl TestConfig {
                 "--mausoleum-world" => { cfg.world_preset = WorldPreset::Mausoleum; }
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
+                "--glass-test-world" => { cfg.world_preset = WorldPreset::GlassTest; }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,
@@ -471,6 +472,7 @@ FRACTAL PRESETS (default plain-layers = 8):
   --jerusalem-cross-world     7 axial cells (body + 6 faces), ochre two-tone
   --edge-scaffold-world       12 edge rods per level, cyan/magenta/yellow
   --hollow-cube-world         18 edges + faces (no corners/body), brass + steel
+  --glass-test-world          Translucency showcase: cyan glass over brick + cubes
 
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):

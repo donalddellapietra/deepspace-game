@@ -215,7 +215,7 @@ test.describe("React UI Overlay", () => {
 
       (window as any).__onGameState({
         type: "colorPicker",
-        data: { open: true, r: 0.5, g: 0.5, b: 0.5 },
+        data: { open: true, r: 0.5, g: 0.5, b: 0.5, a: 1 },
       });
 
       await new Promise((r) => setTimeout(r, 100));
