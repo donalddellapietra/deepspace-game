@@ -247,23 +247,27 @@ fn sphere_body_voxel_solid(
     return true;
 }
 
-// Analytic ray-vs-sphere-body hit. Runs ray-sphere against the
-// inscribed sphere at `(sphere_center, sphere_radius)` (render-frame
-// local coords); on hit, inverts Bergamo's F to find the cube-surface
-// point in body space, then returns a HitResult with the appropriate
-// world-space radial normal and a body-space-grid bevel baked into
-// the color. Returns `hit = false` if the ray misses the sphere or
-// enters it from behind the camera.
+// Forward body-space DDA through a SphereBody. Finds the first solid
+// body-voxel along the world-space ray by stepping in world space
+// and inverting F per sample to locate the current body position +
+// grid cell, then consulting the packed tree for solidity.
 //
-// `n_per_axis` sets the body-space voxel grid resolution per face.
-// `rep_block` selects the palette entry for the material.
+// The ray-sphere test is used only as an early cull for rays that
+// miss the inscribed sphere entirely. Otherwise the traversal starts
+// at `max(t_lo, 0)` — sphere surface from outside, or the camera
+// itself if we're already inside. That single rule gives:
+//   - outside camera + surface-bound ray: hit on the sphere surface;
+//   - buried camera: first voxel at t=0 is solid, instant stone fill;
+//   - camera in a carved cavity: walk empty cells until a wall;
+//   - ray threading through a hole: walk the hole's empty cells,
+//     hit solid on the far side or exit back to sky.
+// No "inside vs outside" special case in the shading path.
 //
-// This is the SINGLE sphere-body rendering path — it's called from
-// `march_cartesian`'s tag=2 branch when a SphereBody cell is
-// encountered (external view) AND from `march` entry when the
-// camera's render frame is already inside a SphereBody subtree
-// (surface view). No matter how the ray arrives at the planet, the
-// visual is identical — no transition discontinuity.
+// Step size: `sphere_radius / (2.5 * n_per_axis)`. Picked so that the
+// worst-case body-space step near cube corners (where Bergamo's J⁻¹
+// stretches world → body by ~√3³ ≈ 5) stays below one voxel width.
+// Cap at 150 iterations; beyond that we give up and return sky —
+// enough for thin carvings at N=27 but not bottomless tunnels.
 fn analytic_sphere_hit(
     ray_origin: vec3<f32>,
     ray_dir: vec3<f32>,
@@ -288,35 +292,118 @@ fn analytic_sphere_hit(
     let dir_len = length(ray_dir);
     if dir_len < 1e-8 { return result; }
     let unit_dir = ray_dir * (1.0 / dir_len);
-    let t_unit = ray_sphere_after(
-        ray_origin, unit_dir, sphere_center, sphere_radius, 0.0,
-    );
-    if t_unit <= 0.0 { return result; }
 
-    let t_sphere = t_unit / dir_len;
-    let world_hit = ray_origin + ray_dir * t_sphere;
-    let q = (world_hit - sphere_center) * (1.0 / sphere_radius);
-    let body_hit = bergamo_inverse(q);
+    // Ray-sphere cull: discard rays that don't intersect the
+    // inscribed sphere at all.
+    let oc = ray_origin - sphere_center;
+    let b_c = dot(oc, unit_dir);
+    let c_c = dot(oc, oc) - sphere_radius * sphere_radius;
+    let disc = b_c * b_c - c_c;
+    if disc < 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_lo_w = -b_c - sq;
+    let t_hi_w = -b_c + sq;
+    if t_hi_w <= 0.0 { return result; }  // sphere behind camera
 
-    let abs_body = abs(body_hit);
-    var face_axis: u32 = 0u;
-    var face_mag: f32 = abs_body.x;
-    if abs_body.y > face_mag { face_axis = 1u; face_mag = abs_body.y; }
-    if abs_body.z > face_mag { face_axis = 2u; face_mag = abs_body.z; }
-    var n_body = vec3<f32>(0.0);
-    var face_uv = vec2<f32>(0.0);
-    if face_axis == 0u {
-        n_body = vec3<f32>(select(-1.0, 1.0, body_hit.x > 0.0), 0.0, 0.0);
-        face_uv = body_hit.yz;
-    } else if face_axis == 1u {
-        n_body = vec3<f32>(0.0, select(-1.0, 1.0, body_hit.y > 0.0), 0.0);
-        face_uv = body_hit.xz;
-    } else {
-        n_body = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, body_hit.z > 0.0));
-        face_uv = body_hit.xy;
+    // DDA start: sphere-front if outside, camera position if inside.
+    let t_start_w = max(t_lo_w, 0.0);
+    let camera_outside = t_lo_w > 0.0;
+
+    // Step size in world-space distance units.
+    let world_step = sphere_radius / (2.5 * n_per_axis);
+    let n_int = i32(n_per_axis);
+    let max_iter = 150u;
+
+    var prev_grid = vec3<i32>(-9999);
+    var last_face_axis: u32 = 0u;
+    var last_face_sign: f32 = 0.0;
+    var t_w = t_start_w;
+    var body = vec3<f32>(0.0);
+    var grid = vec3<i32>(0);
+    var solid_hit = false;
+    var is_first_surface_hit = false;
+    var iter_count: u32 = 0u;
+
+    for (var it = 0u; it < max_iter; it = it + 1u) {
+        iter_count = it;
+        let world_hit = ray_origin + unit_dir * t_w;
+        let q = (world_hit - sphere_center) * (1.0 / sphere_radius);
+        if dot(q, q) > 1.02 {
+            // Ray exited the inscribed sphere without striking a
+            // solid voxel — sky.
+            return result;
+        }
+        body = bergamo_inverse(q);
+
+        let grid_f = (body + vec3<f32>(1.0)) * (n_per_axis * 0.5);
+        grid = vec3<i32>(
+            clamp(i32(floor(grid_f.x)), 0, n_int - 1),
+            clamp(i32(floor(grid_f.y)), 0, n_int - 1),
+            clamp(i32(floor(grid_f.z)), 0, n_int - 1),
+        );
+
+        if it > 0u {
+            if grid.x != prev_grid.x {
+                last_face_axis = 0u;
+                last_face_sign = select(-1.0, 1.0, grid.x < prev_grid.x);
+            } else if grid.y != prev_grid.y {
+                last_face_axis = 1u;
+                last_face_sign = select(-1.0, 1.0, grid.y < prev_grid.y);
+            } else if grid.z != prev_grid.z {
+                last_face_axis = 2u;
+                last_face_sign = select(-1.0, 1.0, grid.z < prev_grid.z);
+            }
+        }
+
+        if sphere_body_voxel_solid(body_root_bfs, grid, body_depth) {
+            solid_hit = true;
+            is_first_surface_hit = (it == 0u) && camera_outside;
+            break;
+        }
+
+        prev_grid = grid;
+        t_w = t_w + world_step;
     }
 
-    let j = bergamo_jacobian(body_hit);
+    if !solid_hit { return result; }
+
+    // Face-normal selection:
+    //   - First-iteration surface hit (camera outside, body on cube
+    //     surface via F⁻¹ of unit-sphere q): use argmax(|body|).
+    //   - Subsequent-step or buried-camera hit: use the axis the DDA
+    //     just crossed. For the buried first-iteration case no step
+    //     happened — fall back to argmax, which picks whichever body
+    //     axis is largest.
+    var n_body = vec3<f32>(0.0);
+    var face_axis: u32 = last_face_axis;
+    if is_first_surface_hit || iter_count == 0u {
+        let abs_body = abs(body);
+        face_axis = 0u;
+        var face_mag: f32 = abs_body.x;
+        if abs_body.y > face_mag { face_axis = 1u; face_mag = abs_body.y; }
+        if abs_body.z > face_mag { face_axis = 2u; face_mag = abs_body.z; }
+        if face_axis == 0u {
+            n_body = vec3<f32>(select(-1.0, 1.0, body.x > 0.0), 0.0, 0.0);
+        } else if face_axis == 1u {
+            n_body = vec3<f32>(0.0, select(-1.0, 1.0, body.y > 0.0), 0.0);
+        } else {
+            n_body = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, body.z > 0.0));
+        }
+    } else {
+        if face_axis == 0u {
+            n_body = vec3<f32>(last_face_sign, 0.0, 0.0);
+        } else if face_axis == 1u {
+            n_body = vec3<f32>(0.0, last_face_sign, 0.0);
+        } else {
+            n_body = vec3<f32>(0.0, 0.0, last_face_sign);
+        }
+    }
+    var face_uv = vec2<f32>(0.0);
+    if face_axis == 0u { face_uv = body.yz; }
+    else if face_axis == 1u { face_uv = body.xz; }
+    else { face_uv = body.xy; }
+
+    let j = bergamo_jacobian(body);
     let j_inv_t = mat3_inverse_transpose(j);
     let world_n = normalize(j_inv_t * n_body);
 
@@ -326,31 +413,9 @@ fn analytic_sphere_hit(
                    min(local_uv.y, 1.0 - local_uv.y));
     let bevel = smoothstep(0.02, 0.14, edge);
 
-    // Resolve the body-grid integer index from `body_hit`. N voxels
-    // per axis in body space means each axis maps `[-1, 1]` → `[0, N)`.
-    // On the selected face the face axis is pinned to the ±1-most
-    // voxel (N-1 or 0).
-    let n_int = i32(n_per_axis);
-    let grid_f = (body_hit + vec3<f32>(1.0)) * (n_per_axis * 0.5);
-    var grid = vec3<i32>(
-        clamp(i32(floor(grid_f.x)), 0, n_int - 1),
-        clamp(i32(floor(grid_f.y)), 0, n_int - 1),
-        clamp(i32(floor(grid_f.z)), 0, n_int - 1),
-    );
-
-    // Walk the body tree. If the voxel is solid we render the patch;
-    // if the voxel has been carved (empty), return a miss so the
-    // pixel shows the sky (for thin holes; deep carving needs a
-    // curved-ray DDA that's still TODO).
-    let solid = sphere_body_voxel_solid(body_root_bfs, grid, body_depth);
-    if !solid {
-        result.hit = false;
-        return result;
-    }
-
     result.hit = true;
     result.is_sphere = true;
-    result.t = t_sphere;
+    result.t = t_w / dir_len;
     result.color = palette[rep_block].rgb * (0.7 + 0.3 * bevel);
     result.normal = world_n;
     result.cell_min = sphere_center;
