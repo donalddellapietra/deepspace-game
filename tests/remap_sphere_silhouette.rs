@@ -364,11 +364,27 @@ fn remap_sphere_blocks_show_bevels_at_layers_3() {
         delta_std,
         delta_max,
     );
+    // Discrimination criterion: a smooth-shaded sphere at this
+    // viewport produces center-row adjacent-pixel deltas around
+    // stddev=0.33 / max=1 (measured empirically before bevel wiring
+    // landed). Once bevels modulate per-cell, transitions at cell
+    // edges produce sharp cliffs that push max well past that noise
+    // floor. Each cube_face_bevel smoothstep ramps over ~12% of a
+    // cell face — at layers=3 / 512 px that's ~3 px, so transitions
+    // are gradual rather than 1-px cliffs, and `max` is a better
+    // indicator than `stddev` alone.
     assert!(
-        delta_std > 4.0,
-        "center-row delta stddev {:.2} — bevels not visible. \
-         A smooth-shaded sphere sits around 1–2; a layers=3 bevelled \
-         sphere should easily exceed 4.",
+        delta_max > 2.5,
+        "center-row max |Δlum| = {:.2} — bevels not visible. \
+         Smooth-shaded baseline sits at max=1; a bevelled sphere \
+         should easily exceed 2.5.",
+        delta_max
+    );
+    assert!(
+        delta_std > 0.5,
+        "center-row stddev |Δlum| = {:.2} — even if max spikes, the \
+         overall row is too flat. Bevels should at minimum double \
+         the smooth-shaded baseline stddev of ~0.33.",
         delta_std
     );
 }

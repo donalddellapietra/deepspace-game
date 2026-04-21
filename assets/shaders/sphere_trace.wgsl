@@ -16,18 +16,31 @@
 #include "tree.wgsl"
 #include "sphere_remap.wgsl"
 
-// Per-step tree point-query. Returns:
-//   .x = is_filled (0.0 or 1.0)
-//   .y = safe cube-space distance (L∞ to cell boundary)
-fn sremap_tree_query(root_node_idx: u32, c: vec3<f32>, max_depth: u32) -> vec2<f32> {
+// Tree point-query result: occupancy + palette index + safe distance
+// + the AABB of the containing cell (needed by the hit path so
+// downstream bevel math can compute the per-pixel cube_local).
+struct SremapQuery {
+    filled: u32,         // 0 = empty, 1 = filled
+    block_type: u32,     // palette index
+    safe: f32,           // L∞ distance to nearest cell boundary in cube space
+    cell_size: f32,      // cube-space size of the cell containing `c`
+    cell_min: vec3<f32>, // cube-space min corner of that cell
+}
+
+fn sremap_tree_query(root_node_idx: u32, c: vec3<f32>, max_depth: u32) -> SremapQuery {
+    var out: SremapQuery;
     var cell_min = vec3<f32>(-1.0);
     var cell_size = 2.0;
     var current_idx = root_node_idx;
     for (var depth: u32 = 0u; depth < 64u; depth = depth + 1u) {
         if (depth >= max_depth) {
-            // LOD terminal: treat as filled (conservative — renders
-            // subtree as its representative block; refined later).
-            return vec2<f32>(1.0, max(sremap_safe_cube_l_inf(c, cell_min, cell_size), 1e-5));
+            // LOD terminal: treat as filled (conservative).
+            out.filled = 1u;
+            out.block_type = 0u;
+            out.safe = max(sremap_safe_cube_l_inf(c, cell_min, cell_size), 1e-5);
+            out.cell_min = cell_min;
+            out.cell_size = cell_size;
+            return out;
         }
         let cs = cell_size / 3.0;
         let sx = clamp(i32(floor((c.x - cell_min.x) / cs)), 0, 2);
@@ -39,15 +52,32 @@ fn sremap_tree_query(root_node_idx: u32, c: vec3<f32>, max_depth: u32) -> vec2<f
         cell_min = cell_min + vec3<f32>(f32(sx), f32(sy), f32(sz)) * cs;
         cell_size = cs;
         if (tag == 0u) {
-            return vec2<f32>(0.0, max(sremap_safe_cube_l_inf(c, cell_min, cell_size), 1e-5));
+            out.filled = 0u;
+            out.block_type = 0u;
+            out.safe = max(sremap_safe_cube_l_inf(c, cell_min, cell_size), 1e-5);
+            out.cell_min = cell_min;
+            out.cell_size = cell_size;
+            return out;
         }
         if (tag == 1u) {
-            return vec2<f32>(1.0, max(sremap_safe_cube_l_inf(c, cell_min, cell_size), 1e-5));
+            out.filled = 1u;
+            out.block_type = child_block_type(packed);
+            out.safe = max(sremap_safe_cube_l_inf(c, cell_min, cell_size), 1e-5);
+            out.cell_min = cell_min;
+            out.cell_size = cell_size;
+            return out;
         }
         // tag == 2u: descend
         current_idx = child_node_index(current_idx, slot);
     }
-    return vec2<f32>(0.0, 1e-3);
+    // Step budget exhausted — treat as empty so the march keeps going
+    // rather than painting an artifact.
+    out.filled = 0u;
+    out.block_type = 0u;
+    out.safe = 1e-3;
+    out.cell_min = cell_min;
+    out.cell_size = cell_size;
+    return out;
 }
 
 // The sphere body sits at the center of the frame's [0, 3)^3 cube.
@@ -124,30 +154,47 @@ fn sremap_march(root_node_idx: u32, frame_ray_origin: vec3<f32>, frame_ray_dir: 
         c_warm = c;
 
         let q = sremap_tree_query(root_node_idx, c, max_depth);
-        let filled = q.x > 0.5;
-        let safe = q.y;
+        let filled = q.filled == 1u;
 
         if (filled && !prev_filled) {
             // Crossed empty→filled: refine via linear interp on s.
             let s_hit = select(0.5 * (prev_s + s), s, step == 0u);
             let w_hit_local = origin_local + d * s_hit;
-            // Back to frame space for the normal and hit position.
             let w_hit_frame = w_hit_local * SREMAP_BALL_RADIUS + SREMAP_BALL_CENTER;
-            // Convert local arc length to frame-space t:
-            //   t_frame = s * radius / dmag_frame
+            // Re-invert and re-query at the refined hit position so
+            // the cell AABB below matches the pixel we shade.
+            let c_hit = sremap_inverse(w_hit_local, c_warm, newton_iters);
+            let qh = sremap_tree_query(root_node_idx, c_hit, max_depth);
+            // Cube-space local inside the hit cell, in [0, 1]^3.
+            let cube_local = clamp(
+                (c_hit - qh.cell_min) / qh.cell_size,
+                vec3<f32>(0.0, 0.0, 0.0),
+                vec3<f32>(1.0, 1.0, 1.0),
+            );
+
             result.hit = true;
             result.t = s_hit * SREMAP_BALL_RADIUS / dmag_frame;
+            // Radial normal is correct for outer-shell hits. Interior
+            // voxel walls would want the cube-face normal warped by
+            // J⁻ᵀ — defer until someone's actually carving interior
+            // surfaces; right now this tracer only returns the first
+            // empty→filled transition from outside.
             let nlen = max(length(w_hit_local), 1e-6);
             result.normal = w_hit_local / nlen;
-            result.cell_min = w_hit_frame - vec3<f32>(0.01);
-            result.cell_size = 0.02;
-            result.color = vec3<f32>(0.7);
+            // Pack `cube_local` through the HitResult's cell_min /
+            // cell_size fields: shade_pixel does
+            //   local = (hit_pos - cell_min) / cell_size
+            // With cell_size = 1 and cell_min = hit_pos - cube_local,
+            // that evaluates back to cube_local at this pixel's hit.
+            result.cell_min = w_hit_frame - cube_local;
+            result.cell_size = 1.0;
+            result.color = palette[qh.block_type].rgb;
             return result;
         }
 
         let sigma_raw = sremap_sigma_min(c);
         let sigma = max(sigma_raw, sigma_floor);
-        let step_size = max(safe * sigma, min_local_step);
+        let step_size = max(q.safe * sigma, min_local_step);
         prev_s = s;
         prev_filled = filled;
         s = s + step_size;
