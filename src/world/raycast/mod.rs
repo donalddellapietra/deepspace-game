@@ -10,6 +10,7 @@
 mod cartesian;
 mod sphere;
 mod sphere_sub;
+mod unified;
 
 pub use sphere::{FaceWindow, LodParams};
 
