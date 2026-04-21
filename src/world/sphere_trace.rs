@@ -17,6 +17,7 @@
 //! mechanical.
 
 use super::sphere_remap::{self, V3};
+use super::tree::{slot_index, Child, NodeId, NodeLibrary, REPRESENTATIVE_EMPTY};
 
 // ---------- occupancy interface ----------
 
@@ -239,6 +240,88 @@ pub fn trace<O: CubeOccupancy>(
     }
 
     (None, stats)
+}
+
+// ---------- tree-backed occupancy ----------
+
+/// Wraps a Cartesian `NodeLibrary` + root `NodeId` and exposes it as a
+/// `CubeOccupancy`. The root's children fill cube `[-1, 1]^3`; the tree
+/// is walked by slot-indexing in cube space. `max_depth` caps descent;
+/// past that, a cell's occupancy is taken from its
+/// `representative_block` (LOD-terminal).
+pub struct TreeOccupancy<'a> {
+    pub library: &'a NodeLibrary,
+    pub root: NodeId,
+    pub max_depth: u32,
+}
+
+impl<'a> CubeOccupancy for TreeOccupancy<'a> {
+    fn query(&self, c: V3) -> (bool, f32) {
+        // Start at the root cell, which occupies [-1, 1]^3.
+        let mut cell_min = [-1.0_f32; 3];
+        let mut cell_size = 2.0_f32;
+        let mut current = Child::Node(self.root);
+        let mut depth = 0_u32;
+
+        loop {
+            match current {
+                Child::Block(_) => {
+                    return (true, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
+                }
+                Child::Empty => {
+                    return (false, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
+                }
+                // Scene-overlay cells: treat as empty for sphere trace.
+                Child::EntityRef(_) => {
+                    return (false, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
+                }
+                Child::Node(node_id) => {
+                    // LOD cutoff: use the subtree's representative.
+                    if depth >= self.max_depth {
+                        let filled = self
+                            .library
+                            .get(node_id)
+                            .map(|n| n.representative_block != REPRESENTATIVE_EMPTY)
+                            .unwrap_or(false);
+                        return (filled, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
+                    }
+                    let Some(node) = self.library.get(node_id) else {
+                        return (false, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
+                    };
+                    // Clamp c into the current cell before slotting —
+                    // rays sometimes query just-outside points due to
+                    // f32 slop at cell boundaries.
+                    let cs = cell_size / 3.0;
+                    let sx = (((c[0] - cell_min[0]) / cs).floor() as i32).clamp(0, 2) as usize;
+                    let sy = (((c[1] - cell_min[1]) / cs).floor() as i32).clamp(0, 2) as usize;
+                    let sz = (((c[2] - cell_min[2]) / cs).floor() as i32).clamp(0, 2) as usize;
+                    let slot = slot_index(sx, sy, sz);
+                    current = node.children[slot];
+                    cell_min[0] += sx as f32 * cs;
+                    cell_min[1] += sy as f32 * cs;
+                    cell_min[2] += sz as f32 * cs;
+                    cell_size = cs;
+                    depth += 1;
+                }
+            }
+        }
+    }
+}
+
+/// L∞ distance from `c` to the nearest face of the AABB
+/// `[cell_min, cell_min + cell_size]`. Non-negative when inside.
+#[inline]
+fn safe_cube_l_inf(c: V3, cell_min: V3, cell_size: f32) -> f32 {
+    let mut d = f32::INFINITY;
+    for i in 0..3 {
+        let lo = c[i] - cell_min[i];
+        let hi = cell_min[i] + cell_size - c[i];
+        let m = lo.min(hi);
+        if m < d {
+            d = m;
+        }
+    }
+    d.max(0.0)
 }
 
 // ---------- analytic ray-ball ----------
@@ -523,6 +606,129 @@ mod tests {
         assert!(
             r_std < 0.8,
             "silhouette is not a circle: r_std={r_std:.3} pixels"
+        );
+    }
+
+    // ---- tree-backed occupancy ----
+
+    use crate::world::tree::{empty_children, uniform_children, Child, NodeLibrary};
+
+    /// Build a tree of `depth` levels, all cells filled with `block_type`.
+    /// Returns (library, root_id).
+    fn build_uniform_tree(block_type: u16, depth: u32) -> (NodeLibrary, u64) {
+        let mut lib = NodeLibrary::default();
+        let child = lib.build_uniform_subtree(block_type, depth);
+        let root_id = match child {
+            Child::Node(id) => id,
+            _ => {
+                // depth = 0: wrap in a single-layer node with all cells = Block
+                lib.insert(uniform_children(Child::Block(block_type)))
+            }
+        };
+        (lib, root_id)
+    }
+
+    #[test]
+    fn tree_uniform_filled_silhouette_is_circle() {
+        // Entire cube filled with block type 1, depth 3.
+        let (lib, root) = build_uniform_tree(1, 3);
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 3,
+        };
+        let w = 128;
+        let h = 128;
+        let mask = rasterize_silhouette(&occ, w, h, 1.1);
+        let (cx, cy, r_mean, r_std) = fit_circle(&mask, w, h);
+        let count: usize = mask.iter().filter(|&&b| b).count();
+        eprintln!(
+            "tree-filled silhouette: {count} px, center=({cx:.2}, {cy:.2}), r_mean={r_mean:.3}, r_std={r_std:.3}"
+        );
+        assert!(count > 10_000, "tree silhouette too small: {count}");
+        assert!(r_std < 0.8, "tree silhouette not a circle: r_std={r_std:.3}");
+    }
+
+    #[test]
+    fn tree_empty_silhouette_is_zero() {
+        // All empty tree: no ray should hit.
+        let mut lib = NodeLibrary::default();
+        let root = lib.insert(empty_children());
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 3,
+        };
+        let cfg = TraceConfig {
+            max_steps: 1024,
+            ..TraceConfig::default()
+        };
+        let mut hits = 0;
+        for py in 0..32 {
+            for px in 0..32 {
+                let x = (px as f32 + 0.5) / 32.0 * 2.0 * 1.1 - 1.1;
+                let y = (py as f32 + 0.5) / 32.0 * 2.0 * 1.1 - 1.1;
+                let (h, _) = trace(&occ, [x, y, -2.0], [0.0, 0.0, 1.0], &cfg);
+                if h.is_some() {
+                    hits += 1;
+                }
+            }
+        }
+        assert_eq!(hits, 0, "empty tree should have no hits, got {hits}");
+    }
+
+    #[test]
+    fn tree_shell_silhouette_matches_solid() {
+        // Build a 1-level "shell": at depth 1, fill only the 26 boundary
+        // slots (all except center slot 13). From outside, the silhouette
+        // must still be a circle — the inner void only changes interior
+        // rendering, not the outer boundary.
+        let mut lib = NodeLibrary::default();
+        let mut children = uniform_children(Child::Block(1));
+        children[crate::world::tree::CENTER_SLOT] = Child::Empty;
+        let root = lib.insert(children);
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 2,
+        };
+        let w = 96;
+        let h = 96;
+        let mask = rasterize_silhouette(&occ, w, h, 1.1);
+        let (_, _, r_mean, r_std) = fit_circle(&mask, w, h);
+        let count: usize = mask.iter().filter(|&&b| b).count();
+        eprintln!(
+            "tree-shell silhouette: {count} px, r_mean={r_mean:.3}, r_std={r_std:.3}"
+        );
+        assert!(count > 4_500, "shell silhouette too small: {count}");
+        assert!(r_std < 1.0, "shell silhouette not a circle: r_std={r_std:.3}");
+    }
+
+    #[test]
+    fn tree_inner_face_hit_matches_f_identity() {
+        // Shell with empty center slot: ray from origin along +x should
+        // hit the boundary between center (empty) and +x neighbor (filled)
+        // which is at c = (1/3, 0, 0) in cube coords. F identity on axis
+        // means world hit at t = 1/3.
+        let mut lib = NodeLibrary::default();
+        let mut children = uniform_children(Child::Block(1));
+        children[crate::world::tree::CENTER_SLOT] = Child::Empty;
+        let root = lib.insert(children);
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 2,
+        };
+        let cfg = TraceConfig::default();
+        let (hit, stats) = trace(&occ, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], &cfg);
+        let h = hit.expect("ray from center should hit inner face of shell");
+        eprintln!("inner-face hit: t={}, steps={}", h.t_world, stats.steps);
+        // c = (1/3, 0, 0) → F identity on axis → world (1/3, 0, 0) → t=1/3.
+        assert!(
+            (h.t_world - 1.0 / 3.0).abs() < 0.02,
+            "inner face t={} expected ≈{}",
+            h.t_world,
+            1.0 / 3.0
         );
     }
 
