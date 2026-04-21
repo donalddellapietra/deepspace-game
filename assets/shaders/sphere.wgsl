@@ -101,6 +101,16 @@ struct FaceWalkResult {
     v_lo: f32,
     r_lo: f32,
     size: f32,
+    // Integer ratio form of the cell corner: `u_lo == f32(ratio_u) *
+    // size` up to ~0.5 ULP rounding. Tracked as u32 accumulator
+    // `ratio = parent*3 + slot`, so precision is preserved regardless
+    // of depth. u32 covers ratio_depth ≤ 20 (3^20 ≈ 3.5e9 < 2^32);
+    // for deeper descent the mantissa-cast loses bits but stays more
+    // accurate than the additive accumulator `u_lo += us * child_size`.
+    ratio_u: u32,
+    ratio_v: u32,
+    ratio_r: u32,
+    ratio_depth: u32,
 }
 
 /// Descend a face subtree from its root along `(un, vn, rn)` to the
@@ -135,6 +145,10 @@ fn walk_face_subtree(
     res.v_lo = 0.0;
     res.r_lo = 0.0;
     res.size = 1.0;
+    res.ratio_u = 0u;
+    res.ratio_v = 0u;
+    res.ratio_r = 0u;
+    res.ratio_depth = 0u;
 
     let un_abs = clamp(un_in, 0.0, 0.9999999);
     let vn_abs = clamp(vn_in, 0.0, 0.9999999);
@@ -144,6 +158,10 @@ fn walk_face_subtree(
     var v_lo: f32 = 0.0;
     var r_lo: f32 = 0.0;
     var size: f32 = 1.0;
+    // Integer ratio accumulators — exact at every step.
+    var ratio_u: u32 = 0u;
+    var ratio_v: u32 = 0u;
+    var ratio_r: u32 = 0u;
 
     for (var d: u32 = 1u; d <= max_depth; d = d + 1u) {
         let base = node_offsets[node_idx];
@@ -162,9 +180,19 @@ fn walk_face_subtree(
         let rs = u32(clamp(floor((rn_abs - r_lo) / child_size), 0.0, 2.0));
         let slot = rs * 9u + vs * 3u + us;
 
-        let child_u_lo = u_lo + f32(us) * child_size;
-        let child_v_lo = v_lo + f32(vs) * child_size;
-        let child_r_lo = r_lo + f32(rs) * child_size;
+        let child_ratio_u = ratio_u * 3u + us;
+        let child_ratio_v = ratio_v * 3u + vs;
+        let child_ratio_r = ratio_r * 3u + rs;
+        // Ratio-derived cell corner — one multiply, ~0.5 ULP. The
+        // alternative `u_lo + us*child_size` compounds ~1 ULP per
+        // level; by m ≈ 10 the 6 cell-wall plane normals built from
+        // `ea_to_cube(u_lo*2-1)` have drifted enough that adjacent
+        // walls' normals collapse in f32, the ray marches through
+        // solid content without detecting it, and the cell renders
+        // hollow.
+        let child_u_lo = f32(child_ratio_u) * child_size;
+        let child_v_lo = f32(child_ratio_v) * child_size;
+        let child_r_lo = f32(child_ratio_r) * child_size;
 
         // Is this slot populated?
         let mask = (occupancy >> slot) & 1u;
@@ -175,6 +203,10 @@ fn walk_face_subtree(
             res.v_lo = child_v_lo;
             res.r_lo = child_r_lo;
             res.size = child_size;
+            res.ratio_u = child_ratio_u;
+            res.ratio_v = child_ratio_v;
+            res.ratio_r = child_ratio_r;
+            res.ratio_depth = d;
             return res;
         }
         // Count 1-bits below `slot` to find child rank.
@@ -192,6 +224,10 @@ fn walk_face_subtree(
             res.v_lo = child_v_lo;
             res.r_lo = child_r_lo;
             res.size = child_size;
+            res.ratio_u = child_ratio_u;
+            res.ratio_v = child_ratio_v;
+            res.ratio_r = child_ratio_r;
+            res.ratio_depth = d;
             return res;
         }
         // Tag 2 → descend into node.
@@ -204,6 +240,10 @@ fn walk_face_subtree(
             res.v_lo = child_v_lo;
             res.r_lo = child_r_lo;
             res.size = child_size;
+            res.ratio_u = child_ratio_u;
+            res.ratio_v = child_ratio_v;
+            res.ratio_r = child_ratio_r;
+            res.ratio_depth = d;
             return res;
         }
         node_idx = node_index;
@@ -211,6 +251,9 @@ fn walk_face_subtree(
         v_lo = child_v_lo;
         r_lo = child_r_lo;
         size = child_size;
+        ratio_u = child_ratio_u;
+        ratio_v = child_ratio_v;
+        ratio_r = child_ratio_r;
         // NOTE: un_abs / vn_abs / rn_abs are NOT updated; they stay
         // as the immutable ray-sample reference for the lifetime of
         // the walk. That's the whole point of this reformulation.
@@ -219,6 +262,10 @@ fn walk_face_subtree(
     res.v_lo = v_lo;
     res.r_lo = r_lo;
     res.size = size;
+    res.ratio_u = ratio_u;
+    res.ratio_v = ratio_v;
+    res.ratio_r = ratio_r;
+    res.ratio_depth = max_depth;
     res.depth = max_depth;
     return res;
 }

@@ -39,27 +39,27 @@ pub struct SphereHitCell {
     /// descent. The AABB uses this to find the body's world-space
     /// origin + size for the body-to-world transform.
     pub body_path_len: usize,
+    /// Exact face-normalized cell bounds as a rational:
+    /// `u_lo = ratio_u / 3^ratio_depth`, cell size = `1 / 3^ratio_depth`.
+    /// Populated by the body march (`cs_raycast`) via integer
+    /// accumulation in the walker — precision-free regardless of
+    /// depth. When `ratio_depth > 0`, `hit_aabb_body_local` derives
+    /// the 8 corners via f64 from these ratios. The f32 `u_lo/v_lo/
+    /// r_lo/size` fields above are kept for legacy consumers and
+    /// shallow-depth paths; past m ≈ 8 they lose the tail
+    /// contribution during 8-corner expansion (projection onto
+    /// tangent axes drops sub-ULP deltas), so the ratio form is the
+    /// precision-stable ground truth.
+    pub ratio_u: i64,
+    pub ratio_v: i64,
+    pub ratio_r: i64,
+    pub ratio_depth: u8,
     /// Precision-preserving linearization context — populated by
     /// `cs_raycast_local` (SphereSub hits), left as the zero/default
-    /// sentinel by `cs_raycast` (shallow body march).
-    ///
-    /// `c_body` = body-XYZ of the sub-frame's local (0, 0, 0) corner.
-    /// `j_cols` = sub-frame-local-to-body Jacobian columns.
-    /// `sub_local_lo` / `sub_local_size` = walker cell's extent in
-    /// sub-frame local coords (each ∈ [0, 3), size ∈ [0, 3]).
-    ///
-    /// Callers that want the cell's body-XYZ extent should prefer
-    /// `body_pt = c_body + j_cols · sub_local` over
-    /// `face_space_to_body_point(face, u_lo + size, ...)`: at sub-
-    /// frame depth ≥ 15 the absolute face-normalized (u_lo, v_lo,
-    /// r_lo) values lose the tail contribution below f32 ULP of
-    /// un_corner, so `u_lo + size` rounds back to `u_lo` and the
-    /// 8-corner bounding box degenerates to a single point (or a
-    /// huge region depending on which terms survive), producing the
-    /// visible "highlight becomes a circle at layer 20+" artifact.
-    /// Using the sub-frame Jacobian keeps every arithmetic
-    /// operation on O(1) operands and is precision-stable at any
-    /// depth.
+    /// sentinel by `cs_raycast`. Legacy escape hatch for the
+    /// abandoned sub-frame path; superseded by `ratio_*` for body-
+    /// march hits and scheduled for removal with the SphereSub
+    /// cleanup.
     pub sub_c_body: [f32; 3],
     pub sub_j_cols: [[f32; 3]; 3],
     pub sub_local_lo: [f32; 3],

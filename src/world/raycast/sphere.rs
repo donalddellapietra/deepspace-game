@@ -67,6 +67,14 @@ fn face_lod_depth(t: f32, shell: f32, lod: LodParams) -> u32 {
 /// Walker result — direct mirror of the shader's `FaceWalkResult`
 /// plus the path so the CPU hit has a tree-level identity for edit
 /// propagation.
+///
+/// `u_lo / v_lo / r_lo / size` are the f32 cell bounds used internally
+/// by the body-march cell-stepper (`ray_plane_t` etc.). `ratio_u /
+/// ratio_v / ratio_r / ratio_depth` are the exact rational bounds
+/// tracked by integer accumulation (`ratio = parent*3 + slot`); the
+/// cell is `[ratio_u / 3^ratio_depth, (ratio_u+1) / 3^ratio_depth)`
+/// with zero precision loss at any depth. The hit report passes the
+/// ratios through to `SphereHitCell` for f64 AABB derivation.
 struct FaceWalk {
     block: u16,
     depth: u32,
@@ -74,6 +82,10 @@ struct FaceWalk {
     v_lo: f32,
     r_lo: f32,
     size: f32,
+    ratio_u: i64,
+    ratio_v: i64,
+    ratio_r: i64,
+    ratio_depth: u8,
     path: Vec<(NodeId, usize)>,
 }
 
@@ -131,13 +143,23 @@ fn walk_face_subtree(
     let mut v_lo: f32 = 0.0;
     let mut r_lo: f32 = 0.0;
     let mut size: f32 = 1.0;
+    // Integer-ratio mirror of `(u_lo, v_lo, r_lo)`. Invariant:
+    // `u_lo == ratio_u as f32 / 3_f32.powi(ratio_depth)` up to f32
+    // rounding. Precision-free at any depth. i64 supports ratio_depth
+    // up to ~40.
+    let mut ratio_u: i64 = 0;
+    let mut ratio_v: i64 = 0;
+    let mut ratio_r: i64 = 0;
+    let mut ratio_depth: u8 = 0;
     let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(limit as usize);
 
     for d in 1u32..=limit {
         let Some(node) = library.get(node_id) else {
             return FaceWalk {
                 block: EMPTY_CELL, depth: d.saturating_sub(1),
-                u_lo, v_lo, r_lo, size, path,
+                u_lo, v_lo, r_lo, size,
+                ratio_u, ratio_v, ratio_r, ratio_depth,
+                path,
             };
         };
         let child_size = size / 3.0;
@@ -145,9 +167,22 @@ fn walk_face_subtree(
         let vs = slot_at_level(vn_abs, v_lo, child_size);
         let rs = slot_at_level(rn_abs, r_lo, child_size);
         let slot = slot_index(us, vs, rs);
-        let child_u_lo = u_lo + us as f32 * child_size;
-        let child_v_lo = v_lo + vs as f32 * child_size;
-        let child_r_lo = r_lo + rs as f32 * child_size;
+        let child_ratio_u = ratio_u * 3 + us as i64;
+        let child_ratio_v = ratio_v * 3 + vs as i64;
+        let child_ratio_r = ratio_r * 3 + rs as i64;
+        let child_ratio_depth = ratio_depth + 1;
+        // Ratio-derived cell corner: one multiplication, ~0.5 ULP
+        // error per step. The alternative `u_lo + us * child_size`
+        // compounds ~1 ULP per level, so by m=10 the accumulated
+        // drift is ~10× worse and the 6 cell-wall plane normals
+        // built from `ea_to_cube(u_lo*2-1)` lose enough precision
+        // that adjacent walls collapse — the ray steps through
+        // solid content and the cell renders hollow. Integer
+        // ratios stay exact; a single f32 multiply recovers the
+        // corner with minimum precision loss.
+        let child_u_lo = child_ratio_u as f32 * child_size;
+        let child_v_lo = child_ratio_v as f32 * child_size;
+        let child_r_lo = child_ratio_r as f32 * child_size;
         path.push((node_id, slot));
 
         match node.children[slot] {
@@ -175,6 +210,8 @@ fn walk_face_subtree(
                     block: EMPTY_CELL, depth: d,
                     u_lo: child_u_lo, v_lo: child_v_lo,
                     r_lo: child_r_lo, size: child_size,
+                    ratio_u: child_ratio_u, ratio_v: child_ratio_v,
+                    ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
                     path,
                 };
             }
@@ -183,6 +220,8 @@ fn walk_face_subtree(
                     block: b, depth: d,
                     u_lo: child_u_lo, v_lo: child_v_lo,
                     r_lo: child_r_lo, size: child_size,
+                    ratio_u: child_ratio_u, ratio_v: child_ratio_v,
+                    ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
                     path,
                 };
             }
@@ -191,6 +230,8 @@ fn walk_face_subtree(
                     block: EMPTY_CELL, depth: d,
                     u_lo: child_u_lo, v_lo: child_v_lo,
                     r_lo: child_r_lo, size: child_size,
+                    ratio_u: child_ratio_u, ratio_v: child_ratio_v,
+                    ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
                     path,
                 };
             }
@@ -201,6 +242,8 @@ fn walk_face_subtree(
                             block: EMPTY_CELL, depth: d,
                             u_lo: child_u_lo, v_lo: child_v_lo,
                             r_lo: child_r_lo, size: child_size,
+                            ratio_u: child_ratio_u, ratio_v: child_ratio_v,
+                            ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
                             path,
                         };
                     };
@@ -216,6 +259,8 @@ fn walk_face_subtree(
                         block: bt, depth: d,
                         u_lo: child_u_lo, v_lo: child_v_lo,
                         r_lo: child_r_lo, size: child_size,
+                        ratio_u: child_ratio_u, ratio_v: child_ratio_v,
+                        ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
                         path,
                     };
                 }
@@ -224,6 +269,10 @@ fn walk_face_subtree(
                 v_lo = child_v_lo;
                 r_lo = child_r_lo;
                 size = child_size;
+                ratio_u = child_ratio_u;
+                ratio_v = child_ratio_v;
+                ratio_r = child_ratio_r;
+                ratio_depth = child_ratio_depth;
                 // NOTE: `un_abs`/`vn_abs`/`rn_abs` are NOT updated —
                 // they stay as the immutable ray-sample reference.
                 // That's the whole point of this reformulation.
@@ -232,7 +281,9 @@ fn walk_face_subtree(
     }
     FaceWalk {
         block: EMPTY_CELL, depth: limit,
-        u_lo, v_lo, r_lo, size, path,
+        u_lo, v_lo, r_lo, size,
+        ratio_u, ratio_v, ratio_r, ratio_depth,
+        path,
     }
 }
 
@@ -453,13 +504,10 @@ pub(super) fn cs_raycast(
                     inner_r: inner_r_local,
                     outer_r: outer_r_local,
                     body_path_len,
-                    // Body-march hits: sub-frame linearization not
-                    // available. Leave the sub_* fields as sentinel
-                    // zero values — `hit_aabb_body_local` detects
-                    // this via `sub_local_size == 0` and falls back
-                    // to the face-normalized corner AABB (which
-                    // works at shallow depth where body march is
-                    // the active path).
+                    ratio_u: w.ratio_u,
+                    ratio_v: w.ratio_v,
+                    ratio_r: w.ratio_r,
+                    ratio_depth: w.ratio_depth,
                     sub_c_body: [0.0; 3],
                     sub_j_cols: [[0.0; 3]; 3],
                     sub_local_lo: [0.0; 3],

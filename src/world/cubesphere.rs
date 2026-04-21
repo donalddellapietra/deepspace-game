@@ -201,6 +201,46 @@ pub fn face_space_to_body_point(
     sdf::add(center, sdf::scale(dir, radius))
 }
 
+/// f64 sibling of `face_space_to_body_point`. Used by the highlight
+/// AABB so the 8-corner expansion keeps sub-ULP tangent components
+/// that collapse in f32 at depth ≥ ~8 (the radial derivative
+/// projected onto a tangent axis is `dir[axis] · du · shell`, which
+/// drops below f32 ULP and causes corners to merge — the symptom is
+/// the AABB degenerating to a triangle or square).
+pub fn face_space_to_body_point_f64(
+    face: Face,
+    un: f64, vn: f64, rn: f64,
+    inner_r_local: f64,
+    outer_r_local: f64,
+    body_size: f64,
+) -> [f64; 3] {
+    let center = [body_size * 0.5; 3];
+    let radius = (inner_r_local + rn * (outer_r_local - inner_r_local)) * body_size;
+    let u = un * 2.0 - 1.0;
+    let v = vn * 2.0 - 1.0;
+    let cu = (u * std::f64::consts::FRAC_PI_4).tan();
+    let cv = (v * std::f64::consts::FRAC_PI_4).tan();
+    let (n, ua, va) = match face {
+        Face::PosX => ([ 1.0,  0.0,  0.0], [ 0.0,  0.0, -1.0], [ 0.0,  1.0,  0.0]),
+        Face::NegX => ([-1.0,  0.0,  0.0], [ 0.0,  0.0,  1.0], [ 0.0,  1.0,  0.0]),
+        Face::PosY => ([ 0.0,  1.0,  0.0], [ 1.0,  0.0,  0.0], [ 0.0,  0.0, -1.0]),
+        Face::NegY => ([ 0.0, -1.0,  0.0], [ 1.0,  0.0,  0.0], [ 0.0,  0.0,  1.0]),
+        Face::PosZ => ([ 0.0,  0.0,  1.0], [ 1.0,  0.0,  0.0], [ 0.0,  1.0,  0.0]),
+        Face::NegZ => ([ 0.0,  0.0, -1.0], [-1.0,  0.0,  0.0], [ 0.0,  1.0,  0.0]),
+    };
+    let raw: [f64; 3] = [
+        n[0] + cu * ua[0] + cv * va[0],
+        n[1] + cu * ua[1] + cv * va[1],
+        n[2] + cu * ua[2] + cv * va[2],
+    ];
+    let inv_nm = 1.0 / (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+    [
+        center[0] + raw[0] * inv_nm * radius,
+        center[1] + raw[1] * inv_nm * radius,
+        center[2] + raw[2] * inv_nm * radius,
+    ]
+}
+
 // ─────────────────────────────── linearized face-frame Jacobian
 
 /// A small 3×3 matrix used for the face-subtree frame's local ↔ body

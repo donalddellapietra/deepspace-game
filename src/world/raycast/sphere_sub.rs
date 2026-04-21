@@ -605,11 +605,15 @@ pub(super) fn cs_raycast_local(
                     inner_r: current_sub.inner_r,
                     outer_r: current_sub.outer_r,
                     body_path_len,
-                    // Precision-stable linearization — the AABB and
-                    // any downstream geometry consumer should prefer
-                    // `c_body + J · sub_local` over the absolute
-                    // face-normalized (u_lo + size, …) values, which
-                    // lose the tail at m ≥ 15.
+                    // SphereSub path is abandoned and uses the
+                    // sub_c_body / sub_j_cols escape hatch below
+                    // rather than integer ratios. Leaving ratio_depth
+                    // = 0 tells `hit_aabb_body_local` to fall through
+                    // to the legacy branch.
+                    ratio_u: 0,
+                    ratio_v: 0,
+                    ratio_r: 0,
+                    ratio_depth: 0,
                     sub_c_body: current_sub.c_body,
                     sub_j_cols: current_sub.j,
                     sub_local_lo: [w.u_lo, w.v_lo, w.r_lo],

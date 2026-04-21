@@ -10,7 +10,7 @@
 //! `cubesphere::face_space_to_body_point`.
 
 use super::anchor::{Path, WORLD_SIZE};
-use super::cubesphere::{self, face_space_to_body_point, find_body_ancestor_in_path, Face, FACE_SLOTS};
+use super::cubesphere::{self, face_space_to_body_point, face_space_to_body_point_f64, find_body_ancestor_in_path, Face, FACE_SLOTS};
 use super::raycast::HitInfo;
 use super::tree::{slot_coords, NodeLibrary};
 
@@ -62,23 +62,50 @@ pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [
 /// what's visible on screen.
 pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
     if let Some(cell) = hit.sphere_cell {
-        // Prefer the sub-frame Jacobian projection for SphereSub
-        // hits. `cell.u_lo/v_lo/r_lo` store the absolute face-norm
-        // corner = un_corner + w.u_lo * (frame_size/3); at m ≥ 15
-        // the tail term is below f32 ULP of un_corner and drops,
-        // so the 8-corner AABB via face_space_to_body_point
-        // degenerates (same value at every corner → zero AABB, or
-        // worse, the cell renders as the whole sphere face — a
-        // circle on screen). The sub-frame form `c_body + J ·
-        // sub_local` keeps every arithmetic operation on O(1)
-        // operands and stays precision-stable at any depth.
+        // Preferred path: integer-ratio cell bounds + f64 projection.
+        // `un_lo = ratio_u / 3^ratio_depth` is an exact rational,
+        // tracked by the walker without floating-point accumulation,
+        // so there's no tail-loss at depth. The 8-corner expansion
+        // runs in f64 so projected tangent components stay distinct
+        // down to ratio_depth ≈ 33 (f64 ULP vs cell width).
+        if cell.ratio_depth > 0 {
+            let face = Face::from_index(cell.face as u8);
+            let denom = 3.0_f64.powi(cell.ratio_depth as i32);
+            let un_lo = cell.ratio_u as f64 / denom;
+            let un_hi = (cell.ratio_u + 1) as f64 / denom;
+            let vn_lo = cell.ratio_v as f64 / denom;
+            let vn_hi = (cell.ratio_v + 1) as f64 / denom;
+            let rn_lo = cell.ratio_r as f64 / denom;
+            let rn_hi = (cell.ratio_r + 1) as f64 / denom;
+            let inner_r = cell.inner_r as f64;
+            let outer_r = cell.outer_r as f64;
+            let world_size = WORLD_SIZE as f64;
+            let pt = |u: f64, v: f64, r: f64| -> [f32; 3] {
+                let p = face_space_to_body_point_f64(
+                    face, u, v, r, inner_r, outer_r, world_size,
+                );
+                [p[0] as f32, p[1] as f32, p[2] as f32]
+            };
+            let corners = [
+                pt(un_lo, vn_lo, rn_lo),
+                pt(un_hi, vn_lo, rn_lo),
+                pt(un_lo, vn_hi, rn_lo),
+                pt(un_hi, vn_hi, rn_lo),
+                pt(un_lo, vn_lo, rn_hi),
+                pt(un_hi, vn_lo, rn_hi),
+                pt(un_lo, vn_hi, rn_hi),
+                pt(un_hi, vn_hi, rn_hi),
+            ];
+            return bounding_box(&corners);
+        }
+        // Legacy sub-frame Jacobian path — retained for
+        // `cs_raycast_local` (SphereSub) hits which don't populate
+        // ratios. Scheduled for removal with SphereSub cleanup.
         if cell.sub_local_size > 0.0 {
             let lo = cell.sub_local_lo;
             let sz = cell.sub_local_size;
             let c = cell.sub_c_body;
             let j = cell.sub_j_cols;
-            // Helper: body-XYZ point at (u_l, v_l, r_l) in sub-frame
-            // local via the linearization.
             let pt = |u_l: f32, v_l: f32, r_l: f32| -> [f32; 3] {
                 [
                     c[0] + j[0][0] * u_l + j[1][0] * v_l + j[2][0] * r_l,
@@ -98,8 +125,9 @@ pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [
             ];
             return bounding_box(&corners);
         }
-        // Body-march fallback: absolute face-normalized corners.
-        // Safe at shallow depth where body march is active.
+        // Very old body-march fallback: absolute face-normalized f32
+        // corners. Only reached if neither ratios nor sub-frame
+        // Jacobian populated — shouldn't happen in practice.
         let face = Face::from_index(cell.face as u8);
         let u0 = cell.u_lo;
         let v0 = cell.v_lo;
