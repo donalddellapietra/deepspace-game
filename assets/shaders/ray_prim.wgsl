@@ -182,6 +182,93 @@ fn bergamo_inverse(q: vec3<f32>) -> vec3<f32> {
     return body;
 }
 
+// Analytic ray-vs-sphere-body hit. Runs ray-sphere against the
+// inscribed sphere at `(sphere_center, sphere_radius)` (render-frame
+// local coords); on hit, inverts Bergamo's F to find the cube-surface
+// point in body space, then returns a HitResult with the appropriate
+// world-space radial normal and a body-space-grid bevel baked into
+// the color. Returns `hit = false` if the ray misses the sphere or
+// enters it from behind the camera.
+//
+// `n_per_axis` sets the body-space voxel grid resolution per face.
+// `rep_block` selects the palette entry for the material.
+//
+// This is the SINGLE sphere-body rendering path — it's called from
+// `march_cartesian`'s tag=2 branch when a SphereBody cell is
+// encountered (external view) AND from `march` entry when the
+// camera's render frame is already inside a SphereBody subtree
+// (surface view). No matter how the ray arrives at the planet, the
+// visual is identical — no transition discontinuity.
+fn analytic_sphere_hit(
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    sphere_center: vec3<f32>,
+    sphere_radius: f32,
+    rep_block: u32,
+    n_per_axis: f32,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.is_sphere = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+    result.color = vec3<f32>(0.0);
+    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+
+    let dir_len = length(ray_dir);
+    if dir_len < 1e-8 { return result; }
+    let unit_dir = ray_dir * (1.0 / dir_len);
+    let t_unit = ray_sphere_after(
+        ray_origin, unit_dir, sphere_center, sphere_radius, 0.0,
+    );
+    if t_unit <= 0.0 { return result; }
+
+    let t_sphere = t_unit / dir_len;
+    let world_hit = ray_origin + ray_dir * t_sphere;
+    let q = (world_hit - sphere_center) * (1.0 / sphere_radius);
+    let body_hit = bergamo_inverse(q);
+
+    let abs_body = abs(body_hit);
+    var face_axis: u32 = 0u;
+    var face_mag: f32 = abs_body.x;
+    if abs_body.y > face_mag { face_axis = 1u; face_mag = abs_body.y; }
+    if abs_body.z > face_mag { face_axis = 2u; face_mag = abs_body.z; }
+    var n_body = vec3<f32>(0.0);
+    var face_uv = vec2<f32>(0.0);
+    if face_axis == 0u {
+        n_body = vec3<f32>(select(-1.0, 1.0, body_hit.x > 0.0), 0.0, 0.0);
+        face_uv = body_hit.yz;
+    } else if face_axis == 1u {
+        n_body = vec3<f32>(0.0, select(-1.0, 1.0, body_hit.y > 0.0), 0.0);
+        face_uv = body_hit.xz;
+    } else {
+        n_body = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, body_hit.z > 0.0));
+        face_uv = body_hit.xy;
+    }
+
+    let j = bergamo_jacobian(body_hit);
+    let j_inv_t = mat3_inverse_transpose(j);
+    let world_n = normalize(j_inv_t * n_body);
+
+    let uv_grid = (face_uv + vec2<f32>(1.0)) * (n_per_axis * 0.5);
+    let local_uv = fract(uv_grid);
+    let edge = min(min(local_uv.x, 1.0 - local_uv.x),
+                   min(local_uv.y, 1.0 - local_uv.y));
+    let bevel = smoothstep(0.02, 0.14, edge);
+
+    result.hit = true;
+    result.is_sphere = true;
+    result.t = t_sphere;
+    result.color = palette[rep_block].rgb * (0.7 + 0.3 * bevel);
+    result.normal = world_n;
+    result.cell_min = sphere_center;
+    result.cell_size = sphere_radius;
+    return result;
+}
+
 // Branchless argmin mask for the DDA min-side_dist selection.
 // Returns a (0/1) vec3 where exactly one component is 1: the axis whose
 // `side_dist` is smallest. Tie-break priority matches the original

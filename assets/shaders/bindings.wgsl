@@ -45,6 +45,13 @@ struct Uniforms {
     entity_count: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
+    /// Active SphereBody in render-frame-local coords. xyz = inscribed
+    /// sphere center, w = radius. When w > 0, the camera's render frame
+    /// is inside (a descendant of) a SphereBody node, and the `march`
+    /// entry short-circuits to `analytic_sphere_hit` instead of
+    /// running the Cartesian DDA — so surface view and space view use
+    /// the same rendering path with no transition.
+    sphere_body_active: vec4<f32>,
 }
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer

@@ -300,6 +300,7 @@ impl Renderer {
             entity_count: self.entity_count,
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
+            sphere_body_active: self.sphere_body_active,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

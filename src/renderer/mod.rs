@@ -60,6 +60,12 @@ pub struct GpuUniforms {
     pub entity_count: u32,
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
+    /// Active SphereBody in render-frame-local coords. xyz = inscribed
+    /// sphere center, w = radius. When `w > 0`, the shader's `march`
+    /// entry short-circuits to the analytic sphere rendering (surface
+    /// view). Computed per frame by walking from world root along the
+    /// render-frame path in search of a SphereBody ancestor.
+    pub sphere_body_active: [f32; 4],
 }
 
 pub struct Renderer {
@@ -111,6 +117,7 @@ pub struct Renderer {
     pub(super) highlight_active: u32,
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
+    pub(super) sphere_body_active: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -246,6 +253,16 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
+    /// Upload the render-frame-local center/radius of the active
+    /// SphereBody ancestor, or `None` to clear.
+    pub fn set_sphere_body_active(&mut self, info: Option<([f32; 3], f32)>) {
+        match info {
+            Some((c, r)) => self.sphere_body_active = [c[0], c[1], c[2], r],
+            None => self.sphere_body_active = [0.0; 4],
+        }
+        self.write_uniforms();
+    }
+
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {
         match aabb {
             Some((min, max)) => {

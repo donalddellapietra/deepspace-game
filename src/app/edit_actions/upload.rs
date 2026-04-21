@@ -263,6 +263,18 @@ impl App {
             renderer.set_max_depth(effective_visual_depth);
             renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
+            // Short-circuit the shader's march entry when the camera's
+            // render frame lives inside a SphereBody subtree, so surface
+            // view and external view render via the same analytic path
+            // and don't show a transition at the sphere-body boundary.
+            let sphere_info = crate::world::sphere_frame::find_active_sphere_body(
+                &self.world.library,
+                self.world.root,
+                effective_path.as_slice(),
+            );
+            renderer.set_sphere_body_active(
+                sphere_info.map(|info| (info.center, info.radius)),
+            );
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
