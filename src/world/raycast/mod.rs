@@ -39,6 +39,31 @@ pub struct SphereHitCell {
     /// descent. The AABB uses this to find the body's world-space
     /// origin + size for the body-to-world transform.
     pub body_path_len: usize,
+    /// Precision-preserving linearization context — populated by
+    /// `cs_raycast_local` (SphereSub hits), left as the zero/default
+    /// sentinel by `cs_raycast` (shallow body march).
+    ///
+    /// `c_body` = body-XYZ of the sub-frame's local (0, 0, 0) corner.
+    /// `j_cols` = sub-frame-local-to-body Jacobian columns.
+    /// `sub_local_lo` / `sub_local_size` = walker cell's extent in
+    /// sub-frame local coords (each ∈ [0, 3), size ∈ [0, 3]).
+    ///
+    /// Callers that want the cell's body-XYZ extent should prefer
+    /// `body_pt = c_body + j_cols · sub_local` over
+    /// `face_space_to_body_point(face, u_lo + size, ...)`: at sub-
+    /// frame depth ≥ 15 the absolute face-normalized (u_lo, v_lo,
+    /// r_lo) values lose the tail contribution below f32 ULP of
+    /// un_corner, so `u_lo + size` rounds back to `u_lo` and the
+    /// 8-corner bounding box degenerates to a single point (or a
+    /// huge region depending on which terms survive), producing the
+    /// visible "highlight becomes a circle at layer 20+" artifact.
+    /// Using the sub-frame Jacobian keeps every arithmetic
+    /// operation on O(1) operands and is precision-stable at any
+    /// depth.
+    pub sub_c_body: [f32; 3],
+    pub sub_j_cols: [[f32; 3]; 3],
+    pub sub_local_lo: [f32; 3],
+    pub sub_local_size: f32,
 }
 
 /// Information about a ray hit in the tree.

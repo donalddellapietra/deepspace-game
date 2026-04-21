@@ -62,6 +62,44 @@ pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [
 /// what's visible on screen.
 pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
     if let Some(cell) = hit.sphere_cell {
+        // Prefer the sub-frame Jacobian projection for SphereSub
+        // hits. `cell.u_lo/v_lo/r_lo` store the absolute face-norm
+        // corner = un_corner + w.u_lo * (frame_size/3); at m ≥ 15
+        // the tail term is below f32 ULP of un_corner and drops,
+        // so the 8-corner AABB via face_space_to_body_point
+        // degenerates (same value at every corner → zero AABB, or
+        // worse, the cell renders as the whole sphere face — a
+        // circle on screen). The sub-frame form `c_body + J ·
+        // sub_local` keeps every arithmetic operation on O(1)
+        // operands and stays precision-stable at any depth.
+        if cell.sub_local_size > 0.0 {
+            let lo = cell.sub_local_lo;
+            let sz = cell.sub_local_size;
+            let c = cell.sub_c_body;
+            let j = cell.sub_j_cols;
+            // Helper: body-XYZ point at (u_l, v_l, r_l) in sub-frame
+            // local via the linearization.
+            let pt = |u_l: f32, v_l: f32, r_l: f32| -> [f32; 3] {
+                [
+                    c[0] + j[0][0] * u_l + j[1][0] * v_l + j[2][0] * r_l,
+                    c[1] + j[0][1] * u_l + j[1][1] * v_l + j[2][1] * r_l,
+                    c[2] + j[0][2] * u_l + j[1][2] * v_l + j[2][2] * r_l,
+                ]
+            };
+            let corners = [
+                pt(lo[0],      lo[1],      lo[2]),
+                pt(lo[0] + sz, lo[1],      lo[2]),
+                pt(lo[0],      lo[1] + sz, lo[2]),
+                pt(lo[0] + sz, lo[1] + sz, lo[2]),
+                pt(lo[0],      lo[1],      lo[2] + sz),
+                pt(lo[0] + sz, lo[1],      lo[2] + sz),
+                pt(lo[0],      lo[1] + sz, lo[2] + sz),
+                pt(lo[0] + sz, lo[1] + sz, lo[2] + sz),
+            ];
+            return bounding_box(&corners);
+        }
+        // Body-march fallback: absolute face-normalized corners.
+        // Safe at shallow depth where body march is active.
         let face = Face::from_index(cell.face as u8);
         let u0 = cell.u_lo;
         let v0 = cell.v_lo;

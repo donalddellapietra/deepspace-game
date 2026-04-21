@@ -607,6 +607,15 @@ pub(super) fn cs_raycast_local(
                     inner_r: current_sub.inner_r,
                     outer_r: current_sub.outer_r,
                     body_path_len,
+                    // Precision-stable linearization — the AABB and
+                    // any downstream geometry consumer should prefer
+                    // `c_body + J · sub_local` over the absolute
+                    // face-normalized (u_lo + size, …) values, which
+                    // lose the tail at m ≥ 15.
+                    sub_c_body: current_sub.c_body,
+                    sub_j_cols: current_sub.j,
+                    sub_local_lo: [w.u_lo, w.v_lo, w.r_lo],
+                    sub_local_size: w.size,
                 }),
             });
         }
