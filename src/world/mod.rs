@@ -13,6 +13,7 @@ pub mod scene;
 pub mod scenes;
 pub mod sdf;
 pub mod sphere_remap;
+pub mod sphere_trace;
 pub mod spherical_worldgen;
 pub mod stars;
 pub mod state;
