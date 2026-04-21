@@ -38,12 +38,20 @@ pub fn bootstrap_sphere_body_world(
     let world = build_sphere_body_world(layers);
     crate::world::bootstrap::WorldBootstrap {
         default_spawn_pos: default_spawn(),
-        // World (2.5, 1.5, 1.5) is in the wrapper's slot 14 (= (2, 1, 1)),
-        // an empty sky cell +x of the planet. Look toward −x to frame the
-        // planet. Engine basis: yaw=0 gives fwd=(0,0,−1); positive yaw
-        // rotates LEFT around +y; so fwd=(−1,0,0) requires yaw=π/2.
-        default_spawn_yaw: std::f32::consts::FRAC_PI_2,
-        default_spawn_pitch: 0.0,
+        // Camera at world (2.5, 2.5, 2.5) in the wrapper's +x+y+z
+        // corner slot 26, looking down the diagonal toward the planet
+        // center (1.5, 1.5, 1.5). Direction = normalize(-1, -1, -1) =
+        // (-0.577, -0.577, -0.577). Engine basis:
+        //   yaw=0 → fwd=(0, 0, -1), positive yaw LEFT around +y,
+        //   positive pitch UP (+y).
+        //   horiz_xz=(-1/√2, 0, -1/√2) ⇒ yaw=π/4
+        //   sin(pitch)=-1/√3 ⇒ pitch=-asin(1/√3).
+        // This vantage sees the +x, +y, and +z cube faces of the
+        // SphereBody — three distinct normal orientations with
+        // different dot-products against the sun, so the terminator
+        // on voxel-face shading is visible across quadrants.
+        default_spawn_yaw: std::f32::consts::FRAC_PI_4,
+        default_spawn_pitch: -(1.0_f32 / 3.0_f32.sqrt()).asin(),
         plain_layers: layers,
         color_registry: crate::world::palette::ColorRegistry::new(),
         world,
@@ -52,11 +60,12 @@ pub fn bootstrap_sphere_body_world(
 
 fn default_spawn() -> WorldPos {
     // Wrapper root spans world [0, 3)³. Planet cube at slot 13 spans
-    // world [1, 2)³. Camera at world (2.5, 1.5, 1.5): outside the
-    // cube along +x, centered in y/z, looking back at the planet.
-    // Anchor depth 1 puts the camera's cell at wrapper slot 14 — an
-    // empty sky slot, not inside the SphereBody.
-    WorldPos::from_frame_local(&Path::root(), [2.5, 1.5, 1.5], 1)
+    // world [1, 2)³. Camera at world (2.5, 2.5, 2.5) — in wrapper's
+    // +x+y+z corner slot 26 (empty sky), looking toward the planet
+    // center (1.5, 1.5, 1.5). This vantage sees three cube faces of
+    // the SphereBody, each with a different sun-dot product, so voxel-
+    // face lighting produces a visible terminator.
+    WorldPos::from_frame_local(&Path::root(), [2.5, 2.5, 2.5], 1)
 }
 
 fn build_sphere_body_world(layers: u8) -> WorldState {
