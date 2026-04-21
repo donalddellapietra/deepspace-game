@@ -524,25 +524,20 @@ impl App {
         if let Some(sphere) = self.camera.position.sphere.as_ref() {
             let body_depth = sphere.body_path.depth();
             let uvr_depth = sphere.uvr_path.depth();
-            // Cap m_truncated at `MAX_STABLE_SPHERE_SUB_M` (14): past
-            // that, `un_corner += frame_size` in `sphere_in_sub_frame`'s
-            // neighbor transition silently drops the increment
-            // (frame_size = 1/3^15 ≈ 7e-8 is below f32 ULP of the
-            // O(0.5) corner value), and the Jacobian's evaluation
-            // point freezes across transitions — adjacent sub-frames
-            // become indistinguishable and the render collapses.
+            // Build the sub-frame at the camera's FULL uvr depth.
             //
-            // Capping keeps the sub-frame shallow enough that corner
-            // updates stay within f32 precision, then relies on the
-            // intra-cell walker (walker_limit = visual_depth) to
-            // descend the remaining levels and resolve the deep
-            // dug-pit content. Net effect: grid visible at any
-            // anchor depth instead of collapsing at d19+.
-            const MAX_STABLE_SPHERE_SUB_M: u8 = 14;
-            let capped_uvr = uvr_depth.min(MAX_STABLE_SPHERE_SUB_M);
+            // An earlier version capped `m_truncated` at 14 because
+            // `sphere_in_sub_frame`'s per-neighbor `un_corner += frame_size`
+            // silently lost the increment past that depth (frame_size
+            // below f32 ULP of the O(0.5) corner), and the Jacobian's
+            // evaluation point froze across transitions. The cap is no
+            // longer needed: the shader's neighbor-transition branch
+            // holds J constant and reduces the position transfer to
+            // `pos[axis_k] -= sign·3.0`, so depth-dependence is gone —
+            // all per-step arithmetic is O(1) in sub-frame local coords.
             let desired = body_depth
                 .saturating_add(1)
-                .saturating_add(capped_uvr)
+                .saturating_add(uvr_depth)
                 .min(RENDER_FRAME_MAX_DEPTH);
             return frame::compute_render_frame(
                 &self.world.library, self.world.root,

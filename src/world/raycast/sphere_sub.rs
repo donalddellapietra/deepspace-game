@@ -420,7 +420,10 @@ pub(super) fn cs_raycast_local(
     // that sub-frame's local basis, and the DDA t-cursor.
     let mut current_sub: SphereSubFrame = *sub;
     let mut ro_local = ro_local;
-    let mut rd_local = mat3_mul_vec(&current_sub.j_inv, rd_norm);
+    // Computed once from the starting sub-frame's J_inv; held
+    // constant across every neighbor transition (J is invariant in
+    // this local-vicinity approximation).
+    let rd_local = mat3_mul_vec(&current_sub.j_inv, rd_norm);
 
     // Re-derive the UVR prefix slice on each transition (render_path
     // changes as we step into neighbors).
@@ -500,21 +503,23 @@ pub(super) fn cs_raycast_local(
                 break;
             };
 
-            // Transfer the ray's local position into the neighbor basis.
-            //   body_pos = c_cur + J_cur · local_cur
-            //            = c_new + J_new · local_new
-            //   c_new − c_cur ≈ s · 3 · J_cur[:, k]    (linearization)
-            //   ⇒ local_new = J_new_inv · J_cur · (local_cur − s·3·e_k)
+            // Position transfer with J held CONSTANT across the
+            // neighborhood. The full form
+            //   local_new = J_new_inv · J_cur · (pos − s·3·e_k)
+            // reduces to `pos − s·3·e_k` when J_new == J_cur, because
+            // the matrix product collapses to identity. Over a handful
+            // of cells at deep m, J's curvature drift is O((1/3^m)²)
+            // — geometrically negligible — so the simplification is
+            // both precision-stable AND correct to sub-pixel accuracy.
+            // This matches the GPU shader's `sphere_in_sub_frame` path.
+            // `rd_local` is invariant too (depends only on J_inv).
             let s_f = sign_s as f32;
-            let mut shifted = pos;
-            shifted[axis_k] -= s_f * LOCAL_BOX_MAX;
-            let body_delta = mat3_mul_vec(&current_sub.j, shifted);
-            let local_new = mat3_mul_vec(&new_sub.j_inv, body_delta);
+            let mut ro_new = pos;
+            ro_new[axis_k] -= s_f * LOCAL_BOX_MAX;
 
             // Clamp the entry coordinate just inside the neighbor's
             // box on the axis we crossed — avoids an immediate
             // re-exit on the opposite face due to f32 drift.
-            let mut ro_new = local_new;
             let eps_in = LOCAL_BOX_MAX * 1e-6;
             if sign_s == 1 {
                 ro_new[axis_k] = eps_in;
@@ -532,12 +537,11 @@ pub(super) fn cs_raycast_local(
                 }
             }
 
-            let rd_new = mat3_mul_vec(&new_sub.j_inv, rd_norm);
-
-            // Reset DDA state to the neighbor's local frame.
+            // The neighbor's metadata is used for path + hit-shading;
+            // J is already identical by construction (or close enough
+            // under the linearization), and rd_local is unchanged.
             current_sub = new_sub;
             ro_local = ro_new;
-            rd_local = rd_new;
             let (new_t_enter, new_t_exit) = ray_local_box_interval(ro_local, rd_local);
             if new_t_exit <= 0.0 || new_t_enter >= new_t_exit {
                 break;
@@ -548,12 +552,6 @@ pub(super) fn cs_raycast_local(
             t_exit = new_t_exit;
 
             neighbor_transitions += 1;
-            eprintln!(
-                "NEIGHBOR_STEP axis={} sign={} new_uvr_depth={} un={} vn={} rn={}",
-                axis_k, sign_s,
-                current_sub.depth_levels(),
-                current_sub.un_corner, current_sub.vn_corner, current_sub.rn_corner,
-            );
             continue;
         }
 

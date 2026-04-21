@@ -257,6 +257,60 @@ fn bevel_layered(
     return b;
 }
 
+// Multi-level bevel overlay — LOCAL-COORDS variant for sphere sub-frame.
+//
+// Identical shape logic to `bevel_layered`, but operates entirely in
+// the sub-frame's `[0, 3)` local coords so there's no dependence on
+// the absolute face-normalized corner `un_corner`. That's critical at
+// deep sub-frame depth (m ≥ ~8): the absolute-coords form did
+// `up_u = floor(un_corner + w.u_lo*fn_step / up_s) * up_s` where
+// `un_corner ≈ 0.5` and `up_s = 3^k · fn_step` — the division jitters
+// in f32 and the `floor(...) * up_s` product snaps to a drifting
+// ancestor origin, so adjacent pixels pick different parent cells and
+// the grid either vanishes or renders spurious lines.
+//
+// Ancestor levels whose size exceeds the sub-frame's local box edge
+// (up_s > 3.0) correspond to cells containing the sub-frame itself;
+// they're not derivable from local state alone (we'd need the sub-
+// frame's own position within its parent frame), so the upward loop
+// breaks when it would cross that boundary.
+fn bevel_layered_local(
+    un: f32, vn: f32,           // hit point in sub-frame [0, 3)
+    u_lo: f32, v_lo: f32,        // walker cell corner in sub-frame [0, 3)
+    size: f32,                    // walker cell size in local units
+    base_px: f32,                 // projected base-cell pixel size
+) -> f32 {
+    var b: f32 = bevel_level(un, vn, u_lo, v_lo, size, base_px);
+
+    var up_u = u_lo; var up_v = v_lo; var up_s = size; var up_px = base_px;
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        up_s = up_s * 3.0;
+        // Ancestors larger than the sub-frame box can't be resolved
+        // from local state alone — bail out before they'd snap
+        // ambiguously to 0 and paint spurious edges.
+        if up_s > 3.0 { break; }
+        up_u = floor(up_u / up_s) * up_s;
+        up_v = floor(up_v / up_s) * up_s;
+        up_px = up_px * 3.0;
+        b = b * bevel_level(un, vn, up_u, up_v, up_s, up_px);
+    }
+
+    var dn_u = u_lo; var dn_v = v_lo; var dn_s = size; var dn_px = base_px;
+    for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+        let cs = dn_s * (1.0 / 3.0);
+        let cpx = dn_px * (1.0 / 3.0);
+        if cpx < 2.0 { break; }
+        let uf = clamp((un - dn_u) / dn_s, 0.0, 0.9999999);
+        let vf = clamp((vn - dn_v) / dn_s, 0.0, 0.9999999);
+        dn_u = dn_u + floor(uf * 3.0) * cs;
+        dn_v = dn_v + floor(vf * 3.0) * cs;
+        dn_s = cs;
+        dn_px = cpx;
+        b = b * bevel_level(un, vn, dn_u, dn_v, dn_s, dn_px);
+    }
+    return b;
+}
+
 fn depth_tint(rn: f32) -> f32 { return 0.55 + 0.45 * clamp(rn, 0.0, 1.0); }
 
 // Per-ray LOD for the face walker. Matches the Cartesian
@@ -995,20 +1049,29 @@ fn sphere_in_sub_frame(
     let outer_r        = uniforms.root_radii.y;
     let initial_prefix_len = uniforms.sub_meta.y;
 
-    // --- Mutable per-neighbor-transition sub-frame state. ---
-
-    // Face-normalised corner. Magnitude O(1) (∈ [0, 1)). On a
-    // neighbor step we adjust one axis by ±frame_size = ±1/3^m, so at
-    // deep m the increment is BELOW the f32 ULP of un_corner itself.
-    // That's fine for J's evaluation point (J is nearly constant over
-    // the sub-frame region anyway — curvature term O(1/3^(2m))), and
-    // we NEVER form `un_corner + local * frame_size` inside the DDA
-    // loop. See hit-shading block below for the one place we do and
-    // why the tint is tolerant to the precision loss there.
-    var un_corner  = uniforms.sub_face_corner.x;
-    var vn_corner  = uniforms.sub_face_corner.y;
-    var rn_corner  = uniforms.sub_face_corner.z;
-    let frame_size = uniforms.sub_face_corner.w;
+    // --- Sub-frame constants (read once, never mutated). ---
+    //
+    // `un_corner`/`vn_corner` used to live here as mutable per-
+    // neighbor-transition state, updated by `un_corner += frame_size`
+    // so `face_frame_jacobian_shader` could rebuild J at the new
+    // corner. At depth m ≥ ~14 that increment is below the f32 ULP of
+    // the O(1) corner value, so the "new" J ≡ old J and neighbor
+    // transitions became no-ops. That — plus the companion CPU cap
+    // `MAX_STABLE_SPHERE_SUB_M = 14` — is the precision ceiling this
+    // rewrite eliminates.
+    //
+    // The replacement insight: over a few cells of a deep sub-frame,
+    // the Jacobian's curvature drift is O(frame_size²) = O(1/3^(2m))
+    // — geometrically vanishing. Holding J constant across the
+    // neighborhood introduces a linearization error that's invisible
+    // at any reasonable m, AND the neighbor-step position transfer
+    // degenerates to `pos[axis_k] -= sign · 3.0` — no J
+    // multiplications, no basis rebuild, no precision dependency on
+    // the absolute face-normalized corner at all.
+    //
+    // `rn_corner` still feeds the per-hit depth tint below (a smooth
+    // function of absolute radial position, tolerant of f32 drift).
+    let rn_corner = uniforms.sub_face_corner.z;
 
     // Copy the uniform UVR prefix into a function-local buffer so we
     // can mutate it on neighbor steps. Length 64 matches the CPU-side
@@ -1023,26 +1086,15 @@ fn sphere_in_sub_frame(
     }
     let uvr_prefix_len = initial_prefix_len;
 
-    // J / J_inv seeded from uniforms. On every neighbor transition
-    // they get recomputed from `face_frame_jacobian_shader` at the
-    // new corner; `mat3_inv_shader` handles the 3×3 inversion in f32
-    // (stable because J's columns are linearly independent —
-    // `col_r` along the radial, `col_u`/`col_v` along face tangents).
-    var j: Mat3Columns;
-    j.col_u = uniforms.sub_j_col0.xyz;
-    j.col_v = uniforms.sub_j_col1.xyz;
-    j.col_r = uniforms.sub_j_col2.xyz;
-    var j_inv: Mat3Columns;
-    j_inv.col_u = uniforms.sub_j_inv_col0.xyz;
-    j_inv.col_v = uniforms.sub_j_inv_col1.xyz;
-    j_inv.col_r = uniforms.sub_j_inv_col2.xyz;
-
-    // --- Ray state. `ro_local` is in the current sub-frame's local
-    // coords (O(1)). `rd_local` is in the same frame (O(3^m)). On a
-    // neighbor transition both are recomputed for the new frame;
-    // `rd_body` is invariant across the whole DDA.
+    // --- Ray state. `ro_local` is in the sub-frame's local `[0, 3)`
+    // coords (O(1)). `rd_local` is the same direction expressed in
+    // the sub-frame's basis via J_inv (O(3^m)). Both hold their
+    // magnitudes across the whole DDA now that J is constant — no
+    // basis rebuild means `rd_local` never needs re-derivation from
+    // `rd_body`. `rd_body` itself is still used once, in the hit
+    // shading block, to compute the body-frame sun-diffuse term.
     var ro_local = ray_origin_local;
-    var rd_local = ray_dir_local;
+    let rd_local = ray_dir_local;
 
     // Initial ray-box interval inside `[0, 3)^3`.
     //
@@ -1237,59 +1289,30 @@ fn sphere_in_sub_frame(
                 uvr_slots[i2] = coords_to_slot(d0, d1, d2);
             }
 
-            // --- Basis update. Capture J_cur BEFORE overwriting it
-            // so the position transfer has access to both matrices.
-            let j_cur = j;
-
-            // Incremental corner update. Corner is O(1), delta is
-            // O(1/3^m). See precision note near un_corner's declaration.
+            // --- Position transfer (J held constant across neighbors).
+            //
+            // The Jacobian is invariant across the local vicinity to
+            // first order: J_new − J_cur = O(frame_size), so over a
+            // handful of neighbor steps the curvature drift is
+            // geometrically negligible. Keeping J constant makes the
+            // full matrix transform degenerate to a scalar shift:
+            //
+            //   J_new_inv · J_cur · (pos − sign·3·e_k)
+            //      = I · (pos − sign·3·e_k)
+            //      = pos with `pos[axis_k] -= sign·3.0`
+            //
+            // All remaining arithmetic is O(1) in sub-frame local
+            // coords — depth-independent. No `face_frame_jacobian`
+            // rebuild, no `mat3_inv`, no `un_corner` mutation: the
+            // per-neighbor precision collapse that capped the
+            // sub-frame at m ≤ 14 is structurally eliminated.
             let d_f = f32(sign_s);
-            if axis_k == 0u {
-                un_corner = un_corner + d_f * frame_size;
-            } else if axis_k == 1u {
-                vn_corner = vn_corner + d_f * frame_size;
-            } else {
-                rn_corner = rn_corner + d_f * frame_size;
-            }
-
-            let ff = face_frame_jacobian_shader(
-                face, un_corner, vn_corner, rn_corner, frame_size,
-                inner_r, outer_r,
-            );
-            j.col_u = ff.col_u;
-            j.col_v = ff.col_v;
-            j.col_r = ff.col_r;
-            // Stable scaled inverse — j's columns are O(frame_size/3)
-            // = O(1/3^m). Naive mat3_inv loses f32 precision at m≥15
-            // and the DDA collapses past layer 20. Passing frame_size/3
-            // pre-scales j to O(1) for the cofactor computation.
-            j_inv = mat3_inv_scaled_shader(j, frame_size / 3.0);
-
-            // --- Position transfer:
-            //     local_new = J_new_inv · J_cur · (local_exit − s·3·e_k)
-            //
-            // PRECISION NOTE — each factor:
-            //   (local_exit − s·3·e_k): O(1). One axis zeroes (we're
-            //       crossing it), others stay in [0, 3).
-            //   J_cur · (…): O(1/3^m) · O(1) = O(1/3^m). Body-frame
-            //       delta from the current sub-frame to the neighbor.
-            //   J_new_inv · (…): O(3^m) · O(1/3^m) = O(1). The TWO
-            //       large exponents cancel by multiplication (not by
-            //       subtraction), which is f32-safe.
-            //
-            // So `local_new` stays O(1) in the neighbor frame. The
-            // f32 relative error is O(1e-7), carried forward
-            // unchanged — does NOT compound per neighbor step.
-            var shifted = pos;
-            shifted[axis_k] = shifted[axis_k] - d_f * 3.0;
-            var local_new = mat3_mul_vec_shader(
-                j_inv,
-                mat3_mul_vec_shader(j_cur, shifted),
-            );
+            var local_new = pos;
+            local_new[axis_k] = local_new[axis_k] - d_f * 3.0;
 
             // Clamp the entry axis just inside the neighbor box on
-            // the axis we crossed. Avoids an immediate re-exit on the
-            // opposite face due to f32 drift in the matrix product.
+            // the axis we crossed — protects against f32 drift on
+            // the pos.x arithmetic producing an immediate re-exit.
             let eps_in: f32 = 3.0 * 1e-6;
             if sign_s == 1 {
                 local_new[axis_k] = eps_in;
@@ -1304,14 +1327,9 @@ fn sphere_in_sub_frame(
                 if local_new[k2] >= 3.0 { local_new[k2] = 3.0 - eps_in; }
             }
 
-            // Recompute rd_local from body-frame reference (O(1)
-            // input → O(3^m) output, one f32 matrix*vec). Avoids
-            // compounding multiplicative drift across transitions —
-            // every step gets a fresh local direction from rd_body.
-            let rd_new = mat3_mul_vec_shader(j_inv, rd_body);
-
+            // rd_local is invariant too (depends only on J_inv, which
+            // didn't change). No recompute needed.
             ro_local = local_new;
-            rd_local = rd_new;
             let interval = ray_sub_box_interval(ro_local, rd_local);
             let new_t_enter = interval.x;
             let new_t_exit  = interval.y;
@@ -1388,42 +1406,53 @@ fn sphere_in_sub_frame(
 
             // PRECISION NOTE — tint radial.
             //   `rn_corner` is O(1); `w.r_lo * frame_size / 3` is
-            //   O(1/3^m). At deep m the sum loses the small term in
-            //   f32 (ULP of rn_corner ~6e-8). We accept that drift:
-            //   `tint = 0.55 + 0.45 * clamp(rn_abs, 0, 1)` is
-            //   smooth over the whole shell, so a 1e-8 absolute drift
-            //   in rn_abs shifts tint by ~5e-9 — invisible. We DO NOT
-            //   use this sum anywhere else (DDA never needs abs coord).
-            let rn_abs = rn_corner + w.r_lo * frame_size / 3.0;
-            let tint = 0.55 + 0.45 * clamp(rn_abs, 0.0, 1.0);
+            //   The walker cell offset `w.r_lo * frame_size / 3` is
+            //   a sub-frame-bounded O(1/3^m) contribution. It used to
+            //   be added to `rn_corner` (O(1)) to get the hit's
+            //   absolute radial position — a root-relative sum that
+            //   loses the small term past m ≈ 15 in f32. The tint is
+            //   a smooth linear ramp over [0, 1], and one sub-frame
+            //   covers at most `frame_size` in rn, so every hit in
+            //   the sub-frame has essentially the same tint anyway.
+            //   Use the sub-frame's rn corner directly — O(1),
+            //   depth-independent.
+            let tint = 0.55 + 0.45 * clamp(rn_corner, 0.0, 1.0);
 
-            // Multi-scale cell-grid texture — mirrors sphere_in_cell's
-            // `bevel_layered` call. Converts sub-frame local coords
-            // into face-normalized (un, vn) so the existing
-            // bevel_layered works unchanged.
+            // Multi-scale cell-grid texture — LOCAL-COORDS form.
             //
-            // pos.x / pos.y are in sub-frame [0, 3) local; the
-            // per-local-unit face-normalized step is frame_size/3.
-            // walker cell face corner + size are similarly scaled.
-            let fn_step = frame_size / 3.0;
-            let hit_un = un_corner + pos.x * fn_step;
-            let hit_vn = vn_corner + pos.y * fn_step;
-            let cell_u_lo = un_corner + w.u_lo * fn_step;
-            let cell_v_lo = vn_corner + w.v_lo * fn_step;
-            let cell_face_size = w.size * fn_step;
+            // Everything stays in sub-frame `[0, 3)` local for the
+            // bevel math; we only need the projected pixel size of
+            // the base cell to gate per-level visibility. Converting
+            // to absolute face-normalized coords (un_corner + pos.x *
+            // fn_step) here was the precision trap at m ≥ 8: the
+            // sum of an O(0.5) corner with an O(fn_step) local
+            // contribution, then ancestor cell-origin snapping via
+            // `floor(u / up_s) * up_s`, drifts one ULP per pixel and
+            // the grid dissolves. Sub-frame local coords are O(1)
+            // at every depth — f32 handles them cleanly.
             let shell_body = (outer_r - inner_r) * 3.0;
             let pixel_density = uniforms.screen_height
                 / (2.0 * tan(camera.fov * 0.5));
-            // `t` is in sub-frame local scale (O(1/3^m)); convert to
-            // body units for the ray_dist arg by multiplying by the
-            // face-local→body scale (fn_step * body_size / frame_size)
-            // = body_size / 3. Works because rd_local has magnitude
-            // O(3^m) = inverse of fn_step.
-            let ray_dist_body = t * (3.0 * fn_step);
-            let shape = bevel_layered(
-                hit_un, hit_vn,
-                cell_u_lo, cell_v_lo, cell_face_size,
-                shell_body, ray_dist_body, pixel_density,
+            // base_px = projected base-cell size in screen pixels.
+            //
+            // Derivation (frame_size drops out — the key property):
+            //   cell_body  ≈ w.size · frame_size / 3 · shell_body
+            //                (per-local-unit body scale ≈ frame_size/3
+            //                 at mid-shell; shell_body carries the
+            //                 physical-units coefficient)
+            //   ray_dist_body = t · frame_size  (t is sub-frame-local)
+            //   base_px    = cell_body / ray_dist_body · pixel_density
+            //              = w.size · shell_body
+            //                / (3 · t · max(1, 1e-6)) · pixel_density
+            //
+            // So we use local-coord `t` directly with the frame_size
+            // factors cancelled — O(1) math at every depth.
+            let base_px = w.size * shell_body
+                / (3.0 * max(t, 1e-6)) * pixel_density;
+            let shape = bevel_layered_local(
+                pos.x, pos.y,
+                w.u_lo, w.v_lo, w.size,
+                base_px,
             );
 
             result.color = palette[w.block].rgb
