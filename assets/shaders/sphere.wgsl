@@ -427,6 +427,27 @@ fn sphere_in_cell(
             );
             let tint = depth_tint(rn_abs);
             result.color = palette[w.block].rgb * (ambient + diffuse * 0.78) * axis_tint * shape * tint;
+            // Neutralize `shade_pixel`'s `cube_face_bevel` — it picks
+            // a cube face based on `result.normal` and projects
+            // `(hit_pos - cell_min) / cell_size` onto that face's uv,
+            // then darkens edges. For sphere hits the normal is
+            // either a flat-face axis (±u/v/r) or the smooth radial
+            // direction, and the cube_face_bevel's choice of uv
+            // axes does NOT match the cell's face-normalized
+            // (un, vn, rn) geometry — producing visible concentric-
+            // circle banding across the curved sphere surface as
+            // the radial direction sweeps between body axes. The
+            // bevel here is already handled by `shape = bevel_layered`
+            // above in face-normalized coords; shade_pixel's bevel
+            // would double-apply darkening through the wrong axes.
+            //
+            // Trick: set cell_min/cell_size so `(hit_pos-cell_min)
+            // / cell_size` = 0.5 for every pixel. cube_face_bevel
+            // then gets uv=(0.5, 0.5) → edge=0.5 → smoothstep(0.02,
+            // 0.14, 0.5) = 1.0 → no darkening applied.
+            let cs = max(length(camera.forward), 1.0) * 1e3;
+            result.cell_min = camera.pos + ray_dir * t - vec3<f32>(cs * 0.5);
+            result.cell_size = cs;
             return result;
         }
 
