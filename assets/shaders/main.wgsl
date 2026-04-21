@@ -61,11 +61,13 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     if result.hit {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
-        let ambient = 0.3;
+        let axis_tint = abs(result.normal.y) * 1.0
+                      + (abs(result.normal.x) + abs(result.normal.z)) * 0.82;
+        let ambient = 0.22;
         let hit_pos = camera.pos + ray_dir * result.t;
         let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
         let bevel = cube_face_bevel(local, result.normal);
-        let lit = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
+        let lit = result.color * (ambient + diffuse * 0.78) * axis_tint * (0.7 + 0.3 * bevel);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else {
         let sky_t = ray_dir.y * 0.5 + 0.5;
