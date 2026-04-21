@@ -675,4 +675,151 @@ impl App {
             1.2,
         )
     }
+
+    // ─────────────────── sphere-sub debug pipeline ───────────────────
+    //
+    // Bound to F9/F10 in `input_handlers`. These are NOT part of the
+    // normal zoom flow — they exist so we can force-dispatch the
+    // `sphere_in_sub_frame` render path on a known-good `SphereState`
+    // and observe its output directly. This sidesteps the question of
+    // "how does sphere state get populated in live gameplay" (which is
+    // architecturally unresolved right now — `maybe_enter_sphere` was
+    // removed, and no other path sets `camera.sphere`) and lets us
+    // diagnose whether the sub-frame path itself is correct.
+
+    /// Force sphere state from the camera's current Cartesian anchor
+    /// + body-frame position. Precision-safe: `uvr_path` is built by
+    /// symbolic slot-by-slot zoom from an f32 face-space projection —
+    /// the same per-step primitive `zoom_in` uses, no amplified
+    /// reconstruction chain.
+    ///
+    /// Steps:
+    /// 1. Find the first `CubedSphereBody` ancestor of `anchor`.
+    /// 2. Compute camera body-frame position via `in_frame(body_path)`.
+    /// 3. Project to `(face, un, vn, rn)`.
+    /// 4. Truncate `anchor` to `body_path`, clear `offset`.
+    /// 5. Populate `SphereState` with empty `uvr_path` and the
+    ///    projected `uvr_offset`.
+    /// 6. Symbolically `zoom_in` `(anchor_past_body − 1)` times to
+    ///    restore the user's pre-force zoom depth via the regular
+    ///    UVR descent path.
+    pub(super) fn debug_force_sphere_state(&mut self) {
+        use crate::world::anchor::{Path, SphereState};
+        use crate::world::cubesphere::body_point_to_face_space;
+        use crate::world::tree::{Child, NodeKind};
+
+        if self.camera.position.sphere.is_some() {
+            eprintln!("DEBUG_FORCE_SPHERE: already in sphere state — no-op");
+            return;
+        }
+
+        // Find first CubedSphereBody ancestor along the anchor chain.
+        let mut node = self.world.root;
+        let mut body_idx: Option<usize> = None;
+        let mut body_radii: (f32, f32) = (0.0, 0.0);
+        if let Some(n) = self.world.library.get(node) {
+            if let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind {
+                body_idx = Some(0);
+                body_radii = (inner_r, outer_r);
+            }
+        }
+        if body_idx.is_none() {
+            for k in 0..self.camera.position.anchor.depth() as usize {
+                let Some(n) = self.world.library.get(node) else { break; };
+                let slot = self.camera.position.anchor.slot(k) as usize;
+                let next = match n.children[slot] {
+                    Child::Node(x) => x,
+                    _ => break,
+                };
+                if let Some(child) = self.world.library.get(next) {
+                    if let NodeKind::CubedSphereBody { inner_r, outer_r } = child.kind {
+                        body_idx = Some(k + 1);
+                        body_radii = (inner_r, outer_r);
+                        break;
+                    }
+                }
+                node = next;
+            }
+        }
+        let Some(body_idx) = body_idx else {
+            eprintln!(
+                "DEBUG_FORCE_SPHERE: no CubedSphereBody ancestor in anchor={:?} — no-op",
+                self.camera.position.anchor.as_slice(),
+            );
+            return;
+        };
+        let (inner_r, outer_r) = body_radii;
+
+        // Anchor depth past body = face_slot + uvr descent. Subtract
+        // 1 to get the number of UVR slots the user had descended.
+        let anchor_past_body = (self.camera.position.anchor.depth() as usize)
+            .saturating_sub(body_idx);
+        let uvr_zoom_count = anchor_past_body.saturating_sub(1);
+
+        // Truncate anchor to body_path; derive body-frame position.
+        let mut body_path = self.camera.position.anchor;
+        body_path.truncate(body_idx as u8);
+        let body_pos = self.camera.position.in_frame(&body_path);
+
+        let Some(fp) = body_point_to_face_space(body_pos, inner_r, outer_r, 3.0) else {
+            eprintln!(
+                "DEBUG_FORCE_SPHERE: body_point_to_face_space failed at body_pos={:?} — no-op",
+                body_pos,
+            );
+            return;
+        };
+
+        // Commit sphere state with empty uvr_path + projected offset.
+        self.camera.position.anchor = body_path;
+        self.camera.position.offset = [0.5, 0.5, 0.5];
+        self.camera.position.sphere = Some(SphereState {
+            body_path,
+            inner_r,
+            outer_r,
+            face: fp.face,
+            uvr_path: Path::root(),
+            uvr_offset: [fp.un, fp.vn, fp.rn],
+        });
+
+        // Slot-by-slot zoom-in to match the user's pre-force depth.
+        // Each iteration is one `uvr_offset *= 3; − slot` primitive —
+        // identical to what live zoom_in does, so precision is
+        // whatever the normal flow produces at that depth.
+        for _ in 0..uvr_zoom_count {
+            self.camera.position.zoom_in();
+        }
+
+        let s = self.camera.position.sphere.as_ref().unwrap();
+        eprintln!(
+            "DEBUG_FORCE_SPHERE body_path={:?} face={:?} uvr_depth={} \
+             uvr_offset=[{:.6}, {:.6}, {:.6}] target_total_depth={}",
+            body_path.as_slice(),
+            s.face,
+            s.uvr_path.depth(),
+            s.uvr_offset[0], s.uvr_offset[1], s.uvr_offset[2],
+            body_idx + 1 + s.uvr_path.depth() as usize,
+        );
+
+        // Rebuild the active render frame so the shader picks up
+        // the new SphereSub kind + uniforms on the next upload.
+        self.apply_zoom();
+    }
+
+    /// Revert to body-march rendering by dropping sphere state. The
+    /// Cartesian `anchor` currently sits at `body_path` (truncated
+    /// during force-entry) and the `offset` is `(0.5, 0.5, 0.5)` —
+    /// from here on the camera renders via `sphere_in_cell`.
+    pub(super) fn debug_clear_sphere_state(&mut self) {
+        if self.camera.position.sphere.is_none() {
+            eprintln!("DEBUG_CLEAR_SPHERE: not in sphere state — no-op");
+            return;
+        }
+        self.camera.position.sphere = None;
+        eprintln!(
+            "DEBUG_CLEAR_SPHERE: reverted to body march; anchor={:?} offset={:?}",
+            self.camera.position.anchor.as_slice(),
+            self.camera.position.offset,
+        );
+        self.apply_zoom();
+    }
 }

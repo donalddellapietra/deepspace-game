@@ -59,6 +59,27 @@ impl App {
                 self.spawn_test_cubes(1000);
                 return;
             }
+            // --- Sphere-sub debug pipeline ---
+            // F9 : force sphere state from the camera's current
+            //      Cartesian anchor + body-frame position. Truncates
+            //      anchor to body_path, builds uvr_path by
+            //      slot-by-slot symbolic zoom (one `uvr_offset *= 3;
+            //      uvr_offset -= slot` per level — the same primitive
+            //      the normal zoom_in flow uses, no amplified
+            //      reconstruction). After activation, the renderer
+            //      dispatches `sphere_in_sub_frame` instead of
+            //      `sphere_in_cell`. Per-frame logs show face, uvr
+            //      depth, and offset so we can compare.
+            // F10: clear sphere state, revert to body march. Anchor
+            //      stays at `body_path`; offset defaults to (0.5)³.
+            if code == KeyCode::F9 {
+                self.debug_force_sphere_state();
+                return;
+            }
+            if code == KeyCode::F10 {
+                self.debug_clear_sphere_state();
+                return;
+            }
         }
 
         if pressed && code == KeyCode::Escape {
