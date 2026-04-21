@@ -265,3 +265,110 @@ fn remap_sphere_corner_on_view_still_circular() {
         "corner-on silhouette: r_std={r_std:.3} px — cube-face seams leaked through F"
     );
 }
+
+/// Renders the sphere at `--remap-sphere-layers 3` — 3 levels of
+/// subdivision gives voxel face patches ~25 pixels across at this
+/// viewport. Under that resolution the cube_face_bevel smoothstep
+/// should carve visible dark lines between neighboring cells.
+///
+/// Verifies two things:
+/// - The silhouette stays a circle (lower layer count must not leak
+///   a faceted outline — that would mean F isn't mapping the cube
+///   boundary onto the sphere).
+/// - Adjacent-pixel brightness deltas on the center row have high
+///   stddev, i.e. the image has sharp block boundaries (bevels are
+///   actually modulating), not just smooth diffuse gradient.
+#[test]
+fn remap_sphere_blocks_show_bevels_at_layers_3() {
+    let dir = tmp_dir("remap_sphere_silhouette");
+    let shot = dir.join("blocks_layers_3.png");
+    let _ = std::fs::remove_file(&shot);
+
+    let args: &[&str] = &[
+        "--render-harness",
+        "--remap-sphere-world",
+        "--remap-sphere-layers",
+        "3",
+        "--disable-highlight",
+        "--harness-width",
+        "512",
+        "--harness-height",
+        "512",
+        "--exit-after-frames",
+        "60",
+        "--timeout-secs",
+        "30",
+    ];
+
+    let script = ScriptBuilder::new()
+        .wait(5)
+        .screenshot(shot.to_string_lossy().as_ref())
+        .emit("blocks_layers_3");
+
+    let trace = run(args, &script);
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr ---\n{}",
+        trace.stderr,
+    );
+    assert!(shot.exists(), "screenshot missing: {}", shot.display());
+
+    let (w, h, rgba) = load_png(&shot);
+    let mask = planet_mask(&rgba, w, h);
+    let (cx, cy, _r_mean, r_std, count) = fit_circle(&mask, w, h);
+    eprintln!(
+        "layers=3 silhouette: {count} px, center=({cx:.2}, {cy:.2}), r_std={r_std:.3}"
+    );
+    assert!(count > 30_000, "ball not rendered: {count} px");
+    assert!(
+        r_std < 2.0,
+        "silhouette not circular at layers=3: r_std={r_std:.3} px"
+    );
+
+    // Bevel visibility: scan center row, collect on-ball adjacent-
+    // pixel luminance deltas, report their stddev. Smooth diffuse
+    // shading gives near-constant deltas (~1–2 per pixel). A
+    // bevel-stamped row produces dark cliffs at each cell edge,
+    // inflating the stddev well above that.
+    let y = h / 2;
+    let lum = |rgba: &[u8], idx: usize| -> f64 {
+        0.2126 * rgba[idx] as f64
+            + 0.7152 * rgba[idx + 1] as f64
+            + 0.0722 * rgba[idx + 2] as f64
+    };
+    let mut deltas: Vec<f64> = Vec::new();
+    for x in 1..w {
+        if mask[y * w + x] && mask[y * w + x - 1] {
+            let i_cur = (y * w + x) * 4;
+            let i_prev = (y * w + x - 1) * 4;
+            deltas.push((lum(&rgba, i_cur) - lum(&rgba, i_prev)).abs());
+        }
+    }
+    assert!(
+        deltas.len() > 100,
+        "center row has too few on-ball pairs ({}) — is the ball off-center?",
+        deltas.len()
+    );
+    let mean: f64 = deltas.iter().sum::<f64>() / deltas.len() as f64;
+    let var: f64 =
+        deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / deltas.len() as f64;
+    let delta_std = var.sqrt();
+    // Report max delta too — a single ≥30-intensity cliff is an
+    // unmistakable bevel transition, impossible on a smooth sphere.
+    let delta_max = deltas.iter().copied().fold(0.0_f64, f64::max);
+    eprintln!(
+        "layers=3 center-row bevel probe: {} pairs, mean |Δlum|={:.2}, \
+         stddev={:.2}, max={:.2}",
+        deltas.len(),
+        mean,
+        delta_std,
+        delta_max,
+    );
+    assert!(
+        delta_std > 4.0,
+        "center-row delta stddev {:.2} — bevels not visible. \
+         A smooth-shaded sphere sits around 1–2; a layers=3 bevelled \
+         sphere should easily exceed 4.",
+        delta_std
+    );
+}

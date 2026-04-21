@@ -197,6 +197,11 @@ impl TestConfig {
                 "--remap-sphere-world" => {
                     cfg.world_preset = WorldPreset::RemapSphere { layers: 8 };
                 }
+                "--remap-sphere-layers" => {
+                    if let Some(v) = args.next().and_then(|v| v.parse::<u8>().ok()) {
+                        cfg.world_preset = WorldPreset::RemapSphere { layers: v };
+                    }
+                }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,
