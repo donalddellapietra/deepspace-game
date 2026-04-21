@@ -1322,8 +1322,37 @@ fn sphere_in_sub_frame(
             let rn_abs = rn_corner + w.r_lo * frame_size / 3.0;
             let tint = 0.55 + 0.45 * clamp(rn_abs, 0.0, 1.0);
 
+            // Multi-scale cell-grid texture — mirrors sphere_in_cell's
+            // `bevel_layered` call. Converts sub-frame local coords
+            // into face-normalized (un, vn) so the existing
+            // bevel_layered works unchanged.
+            //
+            // pos.x / pos.y are in sub-frame [0, 3) local; the
+            // per-local-unit face-normalized step is frame_size/3.
+            // walker cell face corner + size are similarly scaled.
+            let fn_step = frame_size / 3.0;
+            let hit_un = un_corner + pos.x * fn_step;
+            let hit_vn = vn_corner + pos.y * fn_step;
+            let cell_u_lo = un_corner + w.u_lo * fn_step;
+            let cell_v_lo = vn_corner + w.v_lo * fn_step;
+            let cell_face_size = w.size * fn_step;
+            let shell_body = (outer_r - inner_r) * 3.0;
+            let pixel_density = uniforms.screen_height
+                / (2.0 * tan(camera.fov * 0.5));
+            // `t` is in sub-frame local scale (O(1/3^m)); convert to
+            // body units for the ray_dist arg by multiplying by the
+            // face-local→body scale (fn_step * body_size / frame_size)
+            // = body_size / 3. Works because rd_local has magnitude
+            // O(3^m) = inverse of fn_step.
+            let ray_dist_body = t * (3.0 * fn_step);
+            let shape = bevel_layered(
+                hit_un, hit_vn,
+                cell_u_lo, cell_v_lo, cell_face_size,
+                shell_body, ray_dist_body, pixel_density,
+            );
+
             result.color = palette[w.block].rgb
-                * (ambient + diffuse * 0.78) * tint;
+                * (ambient + diffuse * 0.78) * tint * shape;
             result.cell_min = vec3<f32>(w.u_lo, w.v_lo, w.r_lo);
             result.cell_size = w.size;
             return result;
