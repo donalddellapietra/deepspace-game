@@ -747,6 +747,32 @@ fn mat3_mul_vec_shader(m: Mat3Columns, v: vec3<f32>) -> vec3<f32> {
     return m.col_u * v.x + m.col_v * v.y + m.col_r * v.z;
 }
 
+/// Stable inverse of a matrix M = s · M_n where M_n has O(1) columns.
+/// The face-frame Jacobian at depth m has M = (frame_size/3) · J_n:
+/// `col_u/v/r` entries are O(1/3^m). At m ≥ 15 those entries fall
+/// below f32 ULP near zero (~6e-8); cofactor products `e·i − f·h` in
+/// `mat3_inv_shader` become two similar O(1/3^(2m)) values subtracted,
+/// losing every significant digit — J_inv is garbage and the DDA
+/// renders a collapsed smear past layer 20.
+///
+/// Fix: divide M by s first (elements become O(1), well-conditioned),
+/// invert in f32 without precision loss, then multiply the result by
+/// 1/s (since (s·M_n)^-1 = M_n^-1 / s). Net cost is two scalar
+/// multiplies + one normal mat3_inv — identical register pressure.
+fn mat3_inv_scaled_shader(m: Mat3Columns, s: f32) -> Mat3Columns {
+    let inv_s = 1.0 / s;
+    var mn: Mat3Columns;
+    mn.col_u = m.col_u * inv_s;
+    mn.col_v = m.col_v * inv_s;
+    mn.col_r = m.col_r * inv_s;
+    let mn_inv = mat3_inv_shader(mn);
+    var out: Mat3Columns;
+    out.col_u = mn_inv.col_u * inv_s;
+    out.col_v = mn_inv.col_v * inv_s;
+    out.col_r = mn_inv.col_r * inv_s;
+    return out;
+}
+
 /// Upper bound on neighbor sub-frame transitions per ray — mirrors
 /// CPU `MAX_NEIGHBOR_TRANSITIONS` in `src/world/raycast/sphere_sub.rs`.
 const MAX_SPHERE_SUB_TRANSITIONS: u32 = 64u;
@@ -1212,7 +1238,11 @@ fn sphere_in_sub_frame(
             j.col_u = ff.col_u;
             j.col_v = ff.col_v;
             j.col_r = ff.col_r;
-            j_inv = mat3_inv_shader(j);
+            // Stable scaled inverse — j's columns are O(frame_size/3)
+            // = O(1/3^m). Naive mat3_inv loses f32 precision at m≥15
+            // and the DDA collapses past layer 20. Passing frame_size/3
+            // pre-scales j to O(1) for the cofactor computation.
+            j_inv = mat3_inv_scaled_shader(j, frame_size / 3.0);
 
             // --- Position transfer:
             //     local_new = J_new_inv · J_cur · (local_exit − s·3·e_k)
