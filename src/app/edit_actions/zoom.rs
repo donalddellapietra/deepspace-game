@@ -185,6 +185,16 @@ impl App {
     }
 
     pub(in crate::app) fn target_render_frame(&self) -> ActiveFrame {
+        // Remap-sphere renders the ball as a unified geometry at a
+        // fixed location (1.5, 1.5, 1.5 radius 0.6) in the render
+        // frame's local coords. If the render frame descends into a
+        // sub-cube as zoom increases, the shader would draw a NEW
+        // ball in that sub-cube — not the same ball visible before.
+        // Pin the render frame at root so the ball geometry stays
+        // continuous across every anchor depth.
+        if self.render_as_remap_sphere {
+            return self.render_frame();
+        }
         // Render frame depth is derived from `RENDER_ANCHOR_DEPTH`,
         // not the user's anchor depth — zoom controls interaction
         // layer, not what the camera renders. See `RENDER_ANCHOR_DEPTH`.

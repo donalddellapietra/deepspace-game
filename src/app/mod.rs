@@ -511,6 +511,17 @@ impl App {
     /// explicit face-cell window so render/edit share one layer
     /// definition.
     pub(super) fn render_frame(&self) -> ActiveFrame {
+        // Remap-sphere preset: the shader always renders the ball
+        // at a fixed position in the render frame. Pin the frame at
+        // root so the ball's world-space position is invariant under
+        // zoom — preventing the "new ball appears in each sub-cube"
+        // behavior when the user descends.
+        if self.render_as_remap_sphere {
+            return frame::compute_render_frame(
+                &self.world.library, self.world.root,
+                &crate::world::anchor::Path::root(), 0,
+            );
+        }
         // Deepen the camera's anchor to `RENDER_ANCHOR_DEPTH` so
         // the render frame depth is a function of camera position,
         // not the user's zoom level. See `RENDER_ANCHOR_DEPTH`.
