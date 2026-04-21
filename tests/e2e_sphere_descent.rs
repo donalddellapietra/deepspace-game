@@ -250,10 +250,195 @@ fn sphere_dig_down_descent() {
             trace.edits.len(),
         ));
     }
+    // Always build a 6-column mosaic so visual inspection is
+    // one-file, multi-depth. Eyeballing 21 individual screenshots
+    // mid-debug is the failure mode we're escaping.
+    let mosaic_path = dir.join("mosaic.png");
+    match build_mosaic(&shot_paths, &mosaic_path, 6) {
+        Ok(_) => eprintln!("mosaic saved to {}", mosaic_path.display()),
+        Err(e) => eprintln!("mosaic build failed: {e}"),
+    }
+    // Per-layer color-variance analysis — quantifies the "shader
+    // collapses into a uniform gradient" regression without needing
+    // human eyeballs. Dumps one line per layer: depth, distinct
+    // 16-colors, stddev of luminance. Uniform flood → low distinct +
+    // low stddev; crisp cellular render → many distinct + high
+    // stddev.
+    for (i, path) in shot_paths.iter().enumerate() {
+        let depth = START_DEPTH as usize + i;
+        match analyze_shot(path) {
+            Ok(a) => eprintln!(
+                "MOSAIC_ANALYSIS layer={depth} distinct_16col={} luma_std={:.3} dominant_frac={:.2}",
+                a.distinct_colors, a.luma_std, a.dominant_fraction,
+            ),
+            Err(e) => eprintln!("MOSAIC_ANALYSIS layer={depth} error={e}"),
+        }
+    }
+
     assert!(
         failures.is_empty(),
-        "sphere dig-down failed — screenshots in {}:\n{}",
+        "sphere dig-down failed — screenshots in {} (see mosaic.png):\n{}",
         dir.display(),
         failures.join("\n"),
     );
+}
+
+struct ShotAnalysis {
+    distinct_colors: usize,
+    luma_std: f32,
+    dominant_fraction: f32,
+}
+
+/// Pixel-level post-process analysis of a single screenshot. The goal
+/// is to OBJECTIVELY detect the "uniform grey gradient" shader-bug
+/// regression: those screenshots have very few distinct colors + low
+/// luma std-dev + high dominant-color fraction, whereas a correctly
+/// rendered screenshot with visible cell walls has many distinct
+/// colors at varied luminance.
+fn analyze_shot(path: &str) -> std::io::Result<ShotAnalysis> {
+    let file = std::fs::File::open(path)?;
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let mut reader = decoder.read_info()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf)?;
+    let chan = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        _ => return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "unsupported color type",
+        )),
+    };
+    // Bucket RGB values into 16 bins per channel (4 bits each).
+    // 4×4×4 = 64 possible "16-color" keys, giving a stable count of
+    // visually distinct hues regardless of exact f32 shading drift.
+    let mut bin_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut luma_sum: f64 = 0.0;
+    let mut luma_sq_sum: f64 = 0.0;
+    let mut n: usize = 0;
+    for px in buf.chunks(chan) {
+        let r = px[0];
+        let g = px[1];
+        let b = px[2];
+        let key = ((r as u32 & 0xF0) << 8) | ((g as u32 & 0xF0) << 4) | (b as u32 & 0xF0);
+        *bin_counts.entry(key).or_insert(0) += 1;
+        let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+        luma_sum += luma;
+        luma_sq_sum += luma * luma;
+        n += 1;
+    }
+    let mean = luma_sum / n as f64;
+    let var = (luma_sq_sum / n as f64 - mean * mean).max(0.0);
+    let luma_std = var.sqrt() as f32;
+    let dominant_fraction = bin_counts
+        .values()
+        .max()
+        .copied()
+        .unwrap_or(0) as f32
+        / n.max(1) as f32;
+    Ok(ShotAnalysis {
+        distinct_colors: bin_counts.len(),
+        luma_std,
+        dominant_fraction,
+    })
+}
+
+/// Read a series of PNG screenshots and compose them into a grid
+/// mosaic. Layout is `cols` columns, `ceil(len/cols)` rows. Each cell
+/// is downscaled 2× via nearest-neighbor so the mosaic stays compact.
+/// One-command pipeline for multi-depth visual verification — the
+/// alternative is eyeballing 21 individual files per iteration.
+fn build_mosaic(
+    shot_paths: &[String],
+    out_path: &std::path::Path,
+    cols: usize,
+) -> std::io::Result<()> {
+    if shot_paths.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no shots",
+        ));
+    }
+    let mut cells: Vec<(u32, u32, Vec<u8>, String)> = Vec::with_capacity(shot_paths.len());
+    for path in shot_paths {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue, // missing shot = empty cell
+        };
+        let decoder = png::Decoder::new(std::io::BufReader::new(file));
+        let mut reader = decoder.read_info()?;
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf)?;
+        let w = info.width;
+        let h = info.height;
+        // Normalize to RGBA for composition; convert RGB if needed.
+        let rgba = match info.color_type {
+            png::ColorType::Rgba => buf,
+            png::ColorType::Rgb => {
+                let mut out = Vec::with_capacity((w * h) as usize * 4);
+                for px in buf.chunks(3) {
+                    out.extend_from_slice(px);
+                    out.push(255);
+                }
+                out
+            }
+            _ => continue,
+        };
+        let label = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        cells.push((w, h, rgba, label));
+    }
+    if cells.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no readable shots",
+        ));
+    }
+    let (src_w, src_h, _, _) = &cells[0];
+    let (src_w, src_h) = (*src_w, *src_h);
+    // 2× downscale.
+    let dst_w = src_w / 2;
+    let dst_h = src_h / 2;
+    let rows = (cells.len() + cols - 1) / cols;
+    let mosaic_w = dst_w as usize * cols;
+    let mosaic_h = dst_h as usize * rows;
+    let mut mosaic = vec![16u8; mosaic_w * mosaic_h * 4];
+    // Set alpha to 255 for the empty background.
+    for px in mosaic.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    for (i, (w, h, rgba, _label)) in cells.iter().enumerate() {
+        if *w != src_w || *h != src_h {
+            continue;
+        }
+        let col = i % cols;
+        let row = i / cols;
+        let base_x = col * dst_w as usize;
+        let base_y = row * dst_h as usize;
+        for dy in 0..dst_h {
+            for dx in 0..dst_w {
+                let sx = dx * 2;
+                let sy = dy * 2;
+                let src_idx = ((sy * src_w + sx) * 4) as usize;
+                let dst_idx = ((base_y + dy as usize) * mosaic_w
+                    + (base_x + dx as usize))
+                    * 4;
+                mosaic[dst_idx..dst_idx + 4].copy_from_slice(&rgba[src_idx..src_idx + 4]);
+            }
+        }
+    }
+    let file = std::fs::File::create(out_path)?;
+    let mut encoder =
+        png::Encoder::new(std::io::BufWriter::new(file), mosaic_w as u32, mosaic_h as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    writer
+        .write_image_data(&mosaic)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    Ok(())
 }
