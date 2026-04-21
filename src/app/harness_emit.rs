@@ -99,17 +99,30 @@ impl App {
         self.camera.yaw = saved_yaw;
 
         match hit {
-            Some(h) => println!(
-                "HARNESS_PROBE direction=down hit=true anchor={} ui_layer={} anchor_depth={}",
-                path_repr(&h),
-                self.zoom_level(),
-                self.anchor_depth(),
-            ),
-            None => println!(
-                "HARNESS_PROBE direction=down hit=false anchor=[] ui_layer={} anchor_depth={}",
-                self.zoom_level(),
-                self.anchor_depth(),
-            ),
+            Some(ref h) => {
+                eprintln!(
+                    "probe_down: hit t={:.6e} path_len={} face={} sphere_cell={:?} path={:?}",
+                    h.t,
+                    h.path.len(),
+                    h.face,
+                    h.sphere_cell,
+                    h.path.iter().map(|(_, s)| *s as u32).collect::<Vec<_>>(),
+                );
+                println!(
+                    "HARNESS_PROBE direction=down hit=true anchor={} ui_layer={} anchor_depth={}",
+                    path_repr(h),
+                    self.zoom_level(),
+                    self.anchor_depth(),
+                );
+            }
+            None => {
+                eprintln!("probe_down: MISS");
+                println!(
+                    "HARNESS_PROBE direction=down hit=false anchor=[] ui_layer={} anchor_depth={}",
+                    self.zoom_level(),
+                    self.anchor_depth(),
+                );
+            }
         }
     }
 
@@ -117,6 +130,57 @@ impl App {
     /// event loop (`event_loop.rs`) and the render-harness loop
     /// (`test_runner.rs`) so new commands only need one handler.
     pub(super) fn handle_script_cmd(&mut self, cmd: ScriptCmd, frame: u32) {
+        // Helper — emit camera/anchor/frame state at every script cmd so
+        // we can see whether commands actually move / zoom / dig.
+        let log_state = |label: &str, app: &App, extra: &str| {
+            let anchor = app.camera.position.anchor;
+            let anchor_slots: Vec<u32> =
+                anchor.as_slice().iter().map(|&s| s as u32).collect();
+            let offset = app.camera.position.offset;
+            let world_pos = app.camera.position.in_frame(
+                &crate::world::anchor::Path::root(),
+            );
+            let sphere_state = app.camera.position.sphere.as_ref().map(|s| {
+                (
+                    s.face as u32,
+                    s.body_path.depth(),
+                    s.uvr_path.depth(),
+                    s.uvr_offset,
+                )
+            });
+            let kind_str = match app.active_frame.kind {
+                crate::app::ActiveFrameKind::Cartesian => "Cartesian".to_string(),
+                crate::app::ActiveFrameKind::Body { inner_r, outer_r } => {
+                    format!("Body(ir={inner_r},or={outer_r})")
+                }
+                crate::app::ActiveFrameKind::SphereSub(ref s) => format!(
+                    "SphereSub(m={},face={:?},un={:.6e},rn={:.6e},frame_size={:.6e})",
+                    s.depth_levels(), s.face, s.un_corner, s.rn_corner, s.frame_size,
+                ),
+            };
+            let render_slots: Vec<u32> = app
+                .active_frame
+                .render_path
+                .as_slice()
+                .iter()
+                .map(|&s| s as u32)
+                .collect();
+            eprintln!(
+                "SCRIPT_STATE [{label}] frame={frame} anchor_depth={} anchor={:?} offset=[{:.6},{:.6},{:.6}] world_pos=[{:.6},{:.6},{:.6}] zoom_level={} edit_depth={} visual_depth={} sphere={:?} kind={} render_path={:?} {extra}",
+                anchor.depth(),
+                anchor_slots,
+                offset[0], offset[1], offset[2],
+                world_pos[0], world_pos[1], world_pos[2],
+                app.zoom_level(),
+                app.edit_depth(),
+                app.visual_depth(),
+                sphere_state,
+                kind_str,
+                render_slots,
+            );
+        };
+
+        log_state("PRE", self, &format!("cmd={:?}", cmd));
         match cmd {
             ScriptCmd::Break => self.do_break(),
             ScriptCmd::Place => self.do_place(),
@@ -159,6 +223,7 @@ impl App {
             }
             ScriptCmd::FlyToSurface => self.fly_to_surface(),
         }
+        log_state("POST", self, "");
     }
 
     /// Raycast straight down in world-space bypassing the normal

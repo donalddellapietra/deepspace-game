@@ -15,10 +15,13 @@ impl App {
             return;
         };
         eprintln!(
-            "do_break: hit path_len={} face={} place_path_len={:?}",
+            "do_break: hit path_len={} face={} place_path_len={:?} t={:.6e} sphere_cell={:?} path={:?}",
             hit.path.len(),
             hit.face,
             hit.place_path.as_ref().map(|p| p.len()),
+            hit.t,
+            hit.sphere_cell,
+            hit.path.iter().map(|(_, s)| *s as u32).collect::<Vec<_>>(),
         );
 
         if self.save_mode {
