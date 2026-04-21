@@ -579,36 +579,101 @@ fn march_cartesian(
                 continue;
             }
 
-            // SphereBody: ray-sphere cull at the inscribed sphere.
-            // Miss ⇒ advance DDA past the cube (clipped corner, nothing
-            // visible). Hit ⇒ continue to the normal descent path, but
-            // override `ct_start` to the sphere entry so the voxel DDA
-            // lands in whichever cell the sphere surface crosses. Cube-
-            // face normals + bevel then come back through the existing
-            // Cartesian hit path — no sphere-specific shading code.
-            var sb_is_body = false;
-            var sb_t_enter = 0.0;
-            var sb_center = vec3<f32>(0.0);
-            var sb_radius = 0.0;
+            // SphereBody: analytic cube→sphere rendering. Storage is a
+            // uniform stone cube in body space; we render the planet
+            // by tracing straight world rays, hitting the inscribed
+            // sphere analytically, inverting Bergamo's F to find the
+            // body-space position on the cube surface, and shading
+            // that with J⁻ᵀ-bent normals + a body-space voxel grid
+            // for per-block bevel.
+            //
+            // This is what warps the voxels: a voxel in body space
+            // (a cube on a body-cube face) projects to a curved patch
+            // on the world sphere. Each pixel's body_hit tells us
+            // which body voxel it's in; the face normal + bevel +
+            // lighting come out sphere-appropriate at any angle.
             if node_kinds[child_idx].kind == NODE_KIND_SPHERE_BODY {
                 let sb_cell_min = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-                sb_center = sb_cell_min + vec3<f32>(cur_cell_size * 0.5);
-                sb_radius = cur_cell_size * 0.5;
-                // `ray_sphere_after` assumes a unit direction; rescale.
+                let sb_center = sb_cell_min + vec3<f32>(cur_cell_size * 0.5);
+                let sb_radius = cur_cell_size * 0.5;
+                // `ray_sphere_after` assumes a unit direction; the
+                // march's `ray_dir` is un-normalized, so solve under a
+                // normalized dir then rescale t back.
                 let sb_dir_len = length(ray_dir);
                 let sb_unit_dir = ray_dir * (1.0 / sb_dir_len);
                 let t_unit = ray_sphere_after(
                     ray_origin, sb_unit_dir, sb_center, sb_radius, 0.0,
                 );
                 if t_unit <= 0.0 {
+                    // Ray missed the inscribed sphere — cube corner
+                    // clip, no voxel visible. Advance DDA past the cell.
                     let m_sphere_miss = min_axis_mask(cur_side_dist);
                     s_cell[depth] = pack_cell(cell + vec3<i32>(m_sphere_miss) * step);
                     cur_side_dist += m_sphere_miss * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_sphere_miss;
                     continue;
                 }
-                sb_is_body = true;
-                sb_t_enter = t_unit / sb_dir_len;
+
+                let t_sphere = t_unit / sb_dir_len;
+                let world_hit = ray_origin + ray_dir * t_sphere;
+                // Map world hit to unit-sphere reference, invert F to
+                // land on the cube surface in body space.
+                let q = (world_hit - sb_center) * (1.0 / sb_radius);
+                let body_hit = bergamo_inverse(q);
+
+                // Pick the cube face: the axis whose |body_hit|
+                // is largest. This is ±x/±y/±z.
+                let abs_body = abs(body_hit);
+                var face_axis: u32 = 0u;
+                var face_mag: f32 = abs_body.x;
+                if abs_body.y > face_mag { face_axis = 1u; face_mag = abs_body.y; }
+                if abs_body.z > face_mag { face_axis = 2u; face_mag = abs_body.z; }
+                var n_body = vec3<f32>(0.0);
+                var face_uv = vec2<f32>(0.0);
+                if face_axis == 0u {
+                    n_body = vec3<f32>(select(-1.0, 1.0, body_hit.x > 0.0), 0.0, 0.0);
+                    face_uv = body_hit.yz;
+                } else if face_axis == 1u {
+                    n_body = vec3<f32>(0.0, select(-1.0, 1.0, body_hit.y > 0.0), 0.0);
+                    face_uv = body_hit.xz;
+                } else {
+                    n_body = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, body_hit.z > 0.0));
+                    face_uv = body_hit.xy;
+                }
+
+                // Transform body-space normal to world space for
+                // lighting. J⁻ᵀ at the hit body position bends the
+                // cube-face normal into the sphere surface normal
+                // appropriate to that spot.
+                let j = bergamo_jacobian(body_hit);
+                let j_inv_t = mat3_inverse_transpose(j);
+                let world_n = normalize(j_inv_t * n_body);
+
+                // Body-space voxel grid on the selected face. N voxels
+                // per axis — matches the canonical "Minecraft-density"
+                // block count at MVP resolution. (Stone is uniform,
+                // so the grid is purely a shading decoration for now;
+                // when edits land, individual voxels will be stored
+                // in the tree at the same N resolution.)
+                let n_per_axis = 27.0;
+                let uv_grid = (face_uv + vec2<f32>(1.0)) * (n_per_axis * 0.5);
+                let local_uv = fract(uv_grid);
+                let edge = min(min(local_uv.x, 1.0 - local_uv.x),
+                               min(local_uv.y, 1.0 - local_uv.y));
+                let bevel = smoothstep(0.02, 0.14, edge);
+
+                let rep = select(0u, u32(child_bt), child_bt < 0xFFFEu);
+                // Bake the bevel into `result.color` so main.wgsl's
+                // shade_pixel doesn't double-apply when it sees
+                // `is_sphere == true`.
+                result.hit = true;
+                result.is_sphere = true;
+                result.t = t_sphere;
+                result.color = palette[rep].rgb * (0.7 + 0.3 * bevel);
+                result.normal = world_n;
+                result.cell_min = sb_center;
+                result.cell_size = sb_radius;
+                return result;
             }
 
             // Cartesian Node: depth/LOD check, then descend.
@@ -637,21 +702,6 @@ fn march_cartesian(
                     s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
                     cur_side_dist += m_lodt * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_lodt;
-                } else if sb_is_body {
-                    // LOD-terminal SphereBody: fall back to analytic
-                    // sphere shading so far-zoom views show a smooth
-                    // round ball, not a cube-shaped splat. Normal is
-                    // the sphere-surface radial at the entry point.
-                    let hit_world = ray_origin + ray_dir * sb_t_enter;
-                    let radial = (hit_world - sb_center) * (1.0 / sb_radius);
-                    result.hit = true;
-                    result.is_sphere = true;
-                    result.t = sb_t_enter;
-                    result.color = palette[bt].rgb;
-                    result.normal = radial;
-                    result.cell_min = sb_center;
-                    result.cell_size = sb_radius;
-                    return result;
                 } else {
                     let cell_min_l = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
                     let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
@@ -744,18 +794,7 @@ fn march_cartesian(
                     child_origin,
                     child_origin + vec3<f32>(3.0) * child_cell_size,
                 );
-                // SphereBody child: start the inner DDA at the sphere
-                // surface, not the cube face. The voxel DDA then lands
-                // in whichever cell the sphere crosses, and the
-                // `normal` value propagated from the outer DDA (the
-                // face the parent cell was entered through) matches
-                // the cube-face normal of that first hit — so the
-                // bevel and lighting come out right for the first
-                // voxel without needing a sphere-specific patch.
-                var ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
-                if sb_is_body {
-                    ct_start = max(ct_start, sb_t_enter + 0.0001 * child_cell_size);
-                }
+                let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
                 let local_entry = (child_entry - child_origin) / child_cell_size;
 

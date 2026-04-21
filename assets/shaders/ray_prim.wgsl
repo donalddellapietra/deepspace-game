@@ -77,6 +77,111 @@ fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
     return smoothstep(0.02, 0.14, edge);
 }
 
+// Bergamo forward cube→sphere map F: [-1, 1]³ → closed unit ball.
+// `A_a(b, c) = 1 − b²/2 − c²/2 + b²c²/3` with cyclic permutation
+// `(a, b, c) ∈ {(x,y,z), (y,z,x), (z,x,y)}`.
+fn bergamo_map(p: vec3<f32>) -> vec3<f32> {
+    let ax = max(0.0, 1.0 - 0.5 * p.y * p.y - 0.5 * p.z * p.z + p.y * p.y * p.z * p.z / 3.0);
+    let ay = max(0.0, 1.0 - 0.5 * p.z * p.z - 0.5 * p.x * p.x + p.z * p.z * p.x * p.x / 3.0);
+    let az = max(0.0, 1.0 - 0.5 * p.x * p.x - 0.5 * p.y * p.y + p.x * p.x * p.y * p.y / 3.0);
+    return vec3<f32>(p.x * sqrt(ax), p.y * sqrt(ay), p.z * sqrt(az));
+}
+
+// Jacobian of F at `p`. Returned in WGSL's native column-major form:
+// column k = `∂F/∂p_k`. `mat3x3<f32> * vec3<f32>` then gives J·v
+// (the correct application for direction transforms like lighting).
+//
+// Diagonal: `∂s_a/∂p_a = √A_a`. Off-diagonal cyclic pattern:
+// `∂s_a/∂p_b = p_a · p_b · (2p_c² − 3) / (6 · √A_a)` where
+// `(a, b, c)` cycles through `(x,y,z), (y,z,x), (z,x,y)`.
+fn bergamo_jacobian(p: vec3<f32>) -> mat3x3<f32> {
+    let x = p.x;
+    let y = p.y;
+    let z = p.z;
+    let ax = max(1e-12, 1.0 - 0.5 * y * y - 0.5 * z * z + y * y * z * z / 3.0);
+    let ay = max(1e-12, 1.0 - 0.5 * z * z - 0.5 * x * x + z * z * x * x / 3.0);
+    let az = max(1e-12, 1.0 - 0.5 * x * x - 0.5 * y * y + x * x * y * y / 3.0);
+    let sax = sqrt(ax);
+    let say = sqrt(ay);
+    let saz = sqrt(az);
+    // Rows of the row-major Jacobian.
+    let r0 = vec3<f32>(sax,
+                       x * y * (2.0 * z * z - 3.0) / (6.0 * sax),
+                       x * z * (2.0 * y * y - 3.0) / (6.0 * sax));
+    let r1 = vec3<f32>(y * x * (2.0 * z * z - 3.0) / (6.0 * say),
+                       say,
+                       y * z * (2.0 * x * x - 3.0) / (6.0 * say));
+    let r2 = vec3<f32>(z * x * (2.0 * y * y - 3.0) / (6.0 * saz),
+                       z * y * (2.0 * x * x - 3.0) / (6.0 * saz),
+                       saz);
+    // Column-major constructor: column k gets (r0[k], r1[k], r2[k]).
+    return mat3x3<f32>(
+        vec3<f32>(r0.x, r1.x, r2.x),
+        vec3<f32>(r0.y, r1.y, r2.y),
+        vec3<f32>(r0.z, r1.z, r2.z),
+    );
+}
+
+// Inverse of a column-major 3×3 matrix via adjugate ÷ determinant.
+// Returned column-major so `M⁻¹ · v` is the expected inverse op.
+fn mat3_inverse(m: mat3x3<f32>) -> mat3x3<f32> {
+    let a = m[0][0]; let d = m[0][1]; let g = m[0][2];
+    let b = m[1][0]; let e = m[1][1]; let h = m[1][2];
+    let c = m[2][0]; let f = m[2][1]; let i = m[2][2];
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    let inv_det = 1.0 / det;
+    // Row-major M⁻¹ rows:
+    let r0 = vec3<f32>( (e * i - f * h), -(b * i - c * h),  (b * f - c * e)) * inv_det;
+    let r1 = vec3<f32>(-(d * i - f * g),  (a * i - c * g), -(a * f - c * d)) * inv_det;
+    let r2 = vec3<f32>( (d * h - e * g), -(a * h - b * g),  (a * e - b * d)) * inv_det;
+    return mat3x3<f32>(
+        vec3<f32>(r0.x, r1.x, r2.x),
+        vec3<f32>(r0.y, r1.y, r2.y),
+        vec3<f32>(r0.z, r1.z, r2.z),
+    );
+}
+
+// Inverse-transpose of a column-major 3×3. Column k of M⁻ᵀ = row k
+// of M⁻¹. Used to transform body-frame surface normals into
+// world-frame lighting normals.
+fn mat3_inverse_transpose(m: mat3x3<f32>) -> mat3x3<f32> {
+    let a = m[0][0]; let d = m[0][1]; let g = m[0][2];
+    let b = m[1][0]; let e = m[1][1]; let h = m[1][2];
+    let c = m[2][0]; let f = m[2][1]; let i = m[2][2];
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    let inv_det = 1.0 / det;
+    let r0 = vec3<f32>( (e * i - f * h), -(b * i - c * h),  (b * f - c * e)) * inv_det;
+    let r1 = vec3<f32>(-(d * i - f * g),  (a * i - c * g), -(a * f - c * d)) * inv_det;
+    let r2 = vec3<f32>( (d * h - e * g), -(a * h - b * g),  (a * e - b * d)) * inv_det;
+    // Column k of (M⁻¹)ᵀ == row k of M⁻¹.
+    return mat3x3<f32>(r0, r1, r2);
+}
+
+// Solve F(body) = q for body, via Newton iteration on the residual
+// `F(body) − q`. `q` should lie on or near the unit sphere; the
+// returned `body` lies on or near the cube surface.
+//
+// Initial guess: project `q` onto the cube surface by scaling so
+// that `max(|body|) = 1`. At face centers and corners this is
+// already the exact answer; at intermediate points 2-3 iterations
+// drive the residual under `1e-5`.
+fn bergamo_inverse(q: vec3<f32>) -> vec3<f32> {
+    let abs_q = abs(q);
+    let max_comp = max(max(abs_q.x, abs_q.y), abs_q.z);
+    var body = q * (1.0 / max(max_comp, 1e-6));
+    for (var i = 0u; i < 6u; i = i + 1u) {
+        let fp = bergamo_map(body);
+        let residual = fp - q;
+        if dot(residual, residual) < 1e-10 {
+            break;
+        }
+        let j = bergamo_jacobian(body);
+        let j_inv = mat3_inverse(j);
+        body = body - j_inv * residual;
+    }
+    return body;
+}
+
 // Branchless argmin mask for the DDA min-side_dist selection.
 // Returns a (0/1) vec3 where exactly one component is 1: the axis whose
 // `side_dist` is smallest. Tie-break priority matches the original
