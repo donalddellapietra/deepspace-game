@@ -109,7 +109,10 @@ pub struct GpuUniforms {
     /// prefix length before a neighbor-step bubble-up becomes a
     /// cross-face transition; the shader terminates the sphere-sub
     /// DDA rather than attempting the cross-face math, which is
-    /// deferred to a follow-up commit), w = pad.
+    /// deferred to a follow-up commit), w = `is_frozen` flag (1 when
+    /// the CPU sub-frame's UVR depth ≥ `M_FREEZE`; the shader reuses
+    /// the uniform-seeded Jacobian instead of rebuilding it per
+    /// neighbor step. See `docs/design/sphere-precision-freeze.md`).
     pub sub_meta: [u32; 4],
     /// UVR slots the shader walker pre-descends from the face-root
     /// before starting intra-cell DDA. Only `sub_meta.y` entries are
@@ -373,6 +376,13 @@ impl Renderer {
     /// `face_root_depth` = `body_path.depth() + 1` — the minimum UVR
     /// prefix length before a neighbor-step bubble-up becomes a
     /// cross-face transition (terminate threshold for the shader).
+    ///
+    /// `is_frozen` — true when the CPU-side sub-frame's UVR depth is
+    /// at/past `M_FREEZE` (the precision wall). Writes `sub_meta.w`;
+    /// the shader uses it to skip the per-neighbor-transition
+    /// `face_frame_jacobian_shader` + `mat3_inv_shader` rebuild and
+    /// reuse the uniform-seeded Jacobian throughout the deep sub-tree.
+    /// See `docs/design/sphere-precision-freeze.md`.
     #[allow(clippy::too_many_arguments)]
     pub fn set_root_kind_sphere_sub(
         &mut self,
@@ -385,6 +395,7 @@ impl Renderer {
         j_inv: [[f32; 3]; 3],
         uvr_prefix_slots: &[u8],
         face_root_depth: u32,
+        is_frozen: bool,
     ) {
         self.root_kind = ROOT_KIND_SPHERE_SUB;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
@@ -400,7 +411,12 @@ impl Renderer {
         self.sub_j_inv_col2 = [j_inv[2][0], j_inv[2][1], j_inv[2][2], 0.0];
         self.sub_face_corner = corner_and_size;
         let prefix_len = uvr_prefix_slots.len().min(MAX_SPHERE_SUB_DEPTH);
-        self.sub_meta = [face_id, prefix_len as u32, face_root_depth, 0];
+        self.sub_meta = [
+            face_id,
+            prefix_len as u32,
+            face_root_depth,
+            if is_frozen { 1 } else { 0 },
+        ];
         let mut slots = [[0u32; 4]; MAX_SPHERE_SUB_DEPTH / 4];
         for (i, &slot) in uvr_prefix_slots.iter().take(prefix_len).enumerate() {
             slots[i / 4][i % 4] = slot as u32;

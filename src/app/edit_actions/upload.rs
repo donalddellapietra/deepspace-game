@@ -8,6 +8,7 @@
 
 use crate::app::{ActiveFrame, ActiveFrameKind, App, LodUploadKey};
 use crate::app::frame;
+use crate::app::frame::M_FREEZE;
 use crate::renderer::{compute_view_proj, EntityRenderMode, InstanceData};
 use crate::world::gpu::{self, GpuEntity};
 use crate::world::scene::{self, EntityPath};
@@ -332,6 +333,7 @@ impl App {
                         &[]
                     };
                     let face_root_depth = sub.body_path.depth() as u32 + 1;
+                    let is_frozen = sub.depth_levels() >= M_FREEZE as u32;
                     renderer.set_root_kind_sphere_sub(
                         sub.inner_r, sub.outer_r,
                         sub.face as u32,
@@ -341,6 +343,7 @@ impl App {
                         sub.j_inv,
                         uvr_prefix,
                         face_root_depth,
+                        is_frozen,
                     );
                 }
                 ActiveFrameKind::Body { inner_r, outer_r } => {

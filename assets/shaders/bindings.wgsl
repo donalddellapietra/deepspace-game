@@ -72,7 +72,12 @@ struct Uniforms {
     /// z = face-root depth (= body_path.depth() + 1 — the minimum
     /// `uvr_prefix_len` before a neighbor-step bubble-up becomes a
     /// cross-face transition; used as the terminate-threshold by the
-    /// sphere-sub DDA), w = pad.
+    /// sphere-sub DDA), w = `is_frozen` flag (1 when the sub-frame's
+    /// UVR depth ≥ `M_FREEZE_SHADER`; the shader then skips the
+    /// `face_frame_jacobian_shader` + `mat3_inv_shader` rebuild at
+    /// each neighbor transition and reuses the uniform-seeded
+    /// `sub_j_*` / `sub_c_body` / `sub_face_corner` values. See
+    /// `docs/design/sphere-precision-freeze.md`).
     sub_meta: vec4<u32>,
     /// UVR slots the shader walker pre-descends from the face-root
     /// (root_index) before starting intra-cell DDA. Only the first

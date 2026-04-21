@@ -749,6 +749,14 @@ fn mat3_mul_vec_shader(m: Mat3Columns, v: vec3<f32>) -> vec3<f32> {
 /// CPU `MAX_NEIGHBOR_TRANSITIONS` in `src/world/raycast/sphere_sub.rs`.
 const MAX_SPHERE_SUB_TRANSITIONS: u32 = 64u;
 
+/// Precision-freeze UVR depth. MUST match `M_FREEZE` in
+/// `src/app/frame.rs`. Past this depth the shader reuses the
+/// uniform-seeded Jacobian across every neighbor-step inside the
+/// sub-tree instead of rebuilding in f32 — the rebuild's relative
+/// error exceeds the curvature residual it would correct. See
+/// `docs/design/sphere-precision-freeze.md` §§2–3.
+const M_FREEZE_SHADER: u32 = 12u;
+
 // ─── symbolic neighbor-step on UVR path (shader mirror of
 // `Path::step_neighbor_cartesian`). Slot packing is identical to XYZ
 // because UVR uses the same `slot_index(us, vs, rs) = rs*9 + vs*3 + us`
@@ -933,18 +941,28 @@ fn sphere_in_sub_frame(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
-    if walker_limit == 0u { return result; }
+    // Tighten walker descent past the freeze boundary. The walker's
+    // intra-cell step doesn't need to render cells smaller than a
+    // pixel; past `M_FREEZE + 3` every cell is sub-pixel at every
+    // realistic view distance (see §7 of
+    // `docs/design/sphere-precision-freeze.md`). Clamping here also
+    // keeps the deep descent away from the f32 wall in
+    // `walk_sub_frame`'s per-level `size /= 3` normalisation.
+    let effective_walker_limit = min(walker_limit, M_FREEZE_SHADER + 3u);
+    if effective_walker_limit == 0u { return result; }
 
     // --- Immutable subtree constants (seeded from uniforms). ---
     // `face`, `inner_r`, `outer_r` don't change across neighbor steps —
     // we stay inside one face subtree. `initial_prefix_len` is the UVR
     // prefix the walker inherits from CPU `compute_render_frame`; it
     // stays constant (neighbor-step preserves UVR path DEPTH via
-    // slot-wrap, only rewrites the trailing slots).
+    // slot-wrap, only rewrites the trailing slots). `is_frozen`
+    // enables the precision-freeze reuse path for deep sub-trees.
     let face           = uniforms.sub_meta.x;
     let inner_r        = uniforms.root_radii.x;
     let outer_r        = uniforms.root_radii.y;
     let initial_prefix_len = uniforms.sub_meta.y;
+    let is_frozen: u32 = uniforms.sub_meta.w;
 
     // --- Mutable per-neighbor-transition sub-frame state. ---
 
@@ -1183,27 +1201,42 @@ fn sphere_in_sub_frame(
 
             // --- Basis update. Capture J_cur BEFORE overwriting it
             // so the position transfer has access to both matrices.
+            //
+            // PRECISION FREEZE — when the CPU marked the sub-frame as
+            // past `M_FREEZE`, rebuilding the Jacobian in f32 on the
+            // GPU introduces noise that exceeds the curvature residual
+            // we'd correct. Reuse J / J_inv / corner / c_body from
+            // uniforms and skip the rebuild entirely. Inside a frozen
+            // sub-tree `j_cur == j` for every step, so the basis
+            // transfer below degenerates to `J_inv · J · shifted` =
+            // `shifted` — which is the correct behavior: adjacent
+            // frozen cells share a single linearisation, so the
+            // neighbor's local coords equal the current cell's
+            // `(local_exit − 3·e_k)`. See
+            // `docs/design/sphere-precision-freeze.md` §§3–4.
             let j_cur = j;
-
-            // Incremental corner update. Corner is O(1), delta is
-            // O(1/3^m). See precision note near un_corner's declaration.
             let d_f = f32(sign_s);
-            if axis_k == 0u {
-                un_corner = un_corner + d_f * frame_size;
-            } else if axis_k == 1u {
-                vn_corner = vn_corner + d_f * frame_size;
-            } else {
-                rn_corner = rn_corner + d_f * frame_size;
-            }
+            if is_frozen == 0u {
+                // Incremental corner update. Corner is O(1), delta is
+                // O(1/3^m). See precision note near un_corner's
+                // declaration.
+                if axis_k == 0u {
+                    un_corner = un_corner + d_f * frame_size;
+                } else if axis_k == 1u {
+                    vn_corner = vn_corner + d_f * frame_size;
+                } else {
+                    rn_corner = rn_corner + d_f * frame_size;
+                }
 
-            let ff = face_frame_jacobian_shader(
-                face, un_corner, vn_corner, rn_corner, frame_size,
-                inner_r, outer_r,
-            );
-            j.col_u = ff.col_u;
-            j.col_v = ff.col_v;
-            j.col_r = ff.col_r;
-            j_inv = mat3_inv_shader(j);
+                let ff = face_frame_jacobian_shader(
+                    face, un_corner, vn_corner, rn_corner, frame_size,
+                    inner_r, outer_r,
+                );
+                j.col_u = ff.col_u;
+                j.col_v = ff.col_v;
+                j.col_r = ff.col_r;
+                j_inv = mat3_inv_shader(j);
+            }
 
             // --- Position transfer:
             //     local_new = J_new_inv · J_cur · (local_exit − s·3·e_k)
@@ -1275,7 +1308,7 @@ fn sphere_in_sub_frame(
         // ------------------------------------------------------------
         let w = walk_from_deep_sub_frame_dyn(
             face_root_idx, uvr_slots, uvr_prefix_len,
-            pos.x, pos.y, pos.z, walker_limit,
+            pos.x, pos.y, pos.z, effective_walker_limit,
         );
 
         if w.block != FACE_WALK_EMPTY {

@@ -37,6 +37,18 @@ use crate::world::cubesphere::{face_frame_jacobian, mat3_inv, Face, Mat3, FACE_S
 use crate::world::sdf::Vec3;
 use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
+/// Precision-freeze depth for the sub-frame Jacobian. Past this UVR
+/// descent depth, `J`, `J_inv`, `c_body`, `un/vn/rn_corner`, and
+/// `frame_size` are inherited from the frozen ancestor sub-frame —
+/// rebuilding them per neighbor step in f32 is noisier than the
+/// curvature residual they'd correct. See
+/// `docs/design/sphere-precision-freeze.md`.
+///
+/// Capped at 14 per §11 (shader `mat3_inv_shader` wall). 12 gives a
+/// curvature residual of ~4.2e-6 relative — five orders below pixel
+/// scale — while staying below the `mat3_inv` precision wall.
+pub const M_FREEZE: u8 = 12;
+
 /// Sphere sub-frame: the render root is a face-subtree cell at face
 /// depth ≥ `MIN_SPHERE_SUB_DEPTH`. Ray-march runs in the frame's
 /// local `[0, 3)³`. `c_body`, `J`, `J_inv` map local ↔ body-XYZ via
@@ -77,6 +89,12 @@ pub struct SphereSubFrame {
     pub c_body: Vec3,
     pub j: Mat3,
     pub j_inv: Mat3,
+    /// Effective UVR depth at which `j` / `j_inv` / `c_body` were
+    /// evaluated. Equals `min(depth_levels(), M_FREEZE)` — the
+    /// Jacobian stops refining past `M_FREEZE` per the precision
+    /// wall. `render_path.depth()` (and therefore the walker prefix)
+    /// still tracks the full render depth.
+    pub freeze_depth: u8,
 }
 
 impl SphereSubFrame {
@@ -88,6 +106,15 @@ impl SphereSubFrame {
         (self.render_path.depth() as u32)
             .saturating_sub(self.body_path.depth() as u32)
             .saturating_sub(1)
+    }
+
+    /// UVR depth at which the Jacobian (`j`, `j_inv`, `c_body`, and
+    /// the `_corner` fields) was evaluated. Equals
+    /// `min(depth_levels(), M_FREEZE)`. Past `M_FREEZE` the Jacobian
+    /// is reused across every deeper sub-tree — the render path still
+    /// carries full walker prefix via `render_path`.
+    pub fn jacobian_depth(&self) -> u32 {
+        self.freeze_depth as u32
     }
 
     /// Construct the neighbor sub-frame one local-axis step away along
@@ -157,6 +184,30 @@ impl SphereSubFrame {
             return None;
         }
 
+        // Freeze branch: past `M_FREEZE`, the neighbor sub-frame
+        // inherits `j`, `j_inv`, `c_body`, `frame_size`, and the
+        // `_corner` fields unchanged. `render_path` still advances
+        // so the walker reaches the correct deep cell. See
+        // `docs/design/sphere-precision-freeze.md` §3.
+        if self.depth_levels() > M_FREEZE as u32 {
+            return Some(SphereSubFrame {
+                body_path: self.body_path,
+                face: self.face,
+                face_root_id: self.face_root_id,
+                render_path: new_path,
+                un_corner: self.un_corner,
+                vn_corner: self.vn_corner,
+                rn_corner: self.rn_corner,
+                frame_size: self.frame_size,
+                inner_r: self.inner_r,
+                outer_r: self.outer_r,
+                c_body: self.c_body,
+                j: self.j,
+                j_inv: self.j_inv,
+                freeze_depth: self.freeze_depth,
+            });
+        }
+
         // Incremental corner update. `un_corner + frame_size` per +axis
         // step (and the reverse for −axis). Bubble-up preserves this:
         // at the parent level `frame_size` is 3×, but the child moves
@@ -194,6 +245,7 @@ impl SphereSubFrame {
             c_body,
             j,
             j_inv,
+            freeze_depth: self.freeze_depth,
         })
     }
 }
@@ -296,8 +348,13 @@ pub fn compute_render_frame(
                 render_path.push(sphere.uvr_path.slot(k));
             }
 
+            // Jacobian / corner are evaluated at `effective_jac_depth`
+            // = min(m_truncated, M_FREEZE). Past the freeze wall the
+            // linearization stops refining — see §2/§3 of
+            // `docs/design/sphere-precision-freeze.md`.
+            let effective_jac_depth = m_truncated.min(M_FREEZE as u32);
             let (un_corner, vn_corner, rn_corner, frame_size) =
-                uvr_corner(&sphere.uvr_path, m_truncated as usize);
+                uvr_corner(&sphere.uvr_path, effective_jac_depth as usize);
             let (c_body, j) = face_frame_jacobian(
                 sphere.face,
                 un_corner, vn_corner, rn_corner, frame_size,
@@ -314,6 +371,7 @@ pub fn compute_render_frame(
                 inner_r: sphere.inner_r,
                 outer_r: sphere.outer_r,
                 c_body, j, j_inv,
+                freeze_depth: effective_jac_depth as u8,
             };
             let logical_path = build_logical_path(sphere, desired_depth);
             return ActiveFrame {
