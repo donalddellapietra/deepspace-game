@@ -515,15 +515,24 @@ impl WorldPos {
         }
     }
 
-    /// Sphere-aware version of `deepened_to`. After each zoom-in,
-    /// calls `maybe_enter_sphere` so crossing into a body triggers
-    /// symbolic-UVR state without the caller having to remember.
+    /// Sphere-aware version of `deepened_to`. Calls
+    /// `maybe_enter_sphere` BEFORE the first iteration AND after
+    /// each zoom-in — the leading call catches the case where the
+    /// initial anchor already sits on a body cell (e.g., the caller
+    /// built `WorldPos` at `body_path.depth()` via
+    /// `from_frame_local`), which `maybe_enter_sphere` needs to see
+    /// before `zoom_in` pushes an extra Cartesian slot and takes
+    /// the terminal past the body. Callers that build a WorldPos at
+    /// a depth already ≥ body_depth + 2 will NOT recover sphere
+    /// state here — those callers must start shallow (e.g., at
+    /// depth 1) and let this method zoom them down.
     pub fn deepened_to_with(
         mut self,
         target_depth: u8,
         library: &NodeLibrary,
         world_root: NodeId,
     ) -> Self {
+        self.maybe_enter_sphere(library, world_root);
         while self.total_depth() < target_depth {
             self.zoom_in();
             self.maybe_enter_sphere(library, world_root);

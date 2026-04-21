@@ -347,10 +347,24 @@ impl App {
                 let depth = test_cfg.spawn_depth.unwrap_or(
                     bootstrap.default_spawn_pos.anchor.depth(),
                 );
-                // Use sphere-aware deepening so spawn positions
-                // inside a planet body correctly transition into
-                // symbolic UVR state.
-                WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
+                // Land at depth 1 first via f32 decomposition (both
+                // precise AND shallow enough that `deepened_to_with`
+                // will call `maybe_enter_sphere` at the body cell
+                // before zoom-in pushes the anchor past it). If we
+                // start `from_frame_local` at any depth > body_depth,
+                // the anchor jumps directly into UVR territory as
+                // Cartesian slots, `maybe_enter_sphere`'s terminal-
+                // cell check fails at every subsequent depth, and
+                // `sphere` stays `None` forever — which flips
+                // `compute_render_frame` to the Cartesian branch and
+                // produces the Menger-sponge artifacts the user sees
+                // when placing/breaking at layer 10+. Starting at
+                // depth 1 is valid for any body placement at depth 1
+                // (the common case, including DemoSphere); deeper
+                // body placements would need a matching shallow
+                // landing depth passed in.
+                let initial_depth = 1u8.min(depth);
+                WorldPos::from_frame_local(&Path::root(), xyz, initial_depth)
                     .deepened_to_with(depth, &world.library, world.root)
             }
             None => {

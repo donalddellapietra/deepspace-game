@@ -773,8 +773,13 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
         tree_depth,
     );
     let body_top_y = 1.5 + setup.outer_r;
-    // Depth 2 where f32 decomposition is precise, then deepen by
-    // pure slot arithmetic.
+    // `deepened_to` is Cartesian-only — if the spawn eventually
+    // lands inside the body, sphere state won't auto-establish.
+    // The default spawn sits ABOVE the body (body_top_y + 0.05)
+    // so that's fine here, but if a future tweak drops the spawn
+    // below the surface, swap in `deepened_to_with(&lib, root)`
+    // and seed from a shallow (≤ body_depth) f32 anchor so
+    // `maybe_enter_sphere` fires at the body-crossing zoom-in.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
         [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5],
