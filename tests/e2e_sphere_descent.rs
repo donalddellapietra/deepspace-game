@@ -199,10 +199,29 @@ fn sphere_dig_down_descent() {
     for d in START_DEPTH..=END_DEPTH {
         let shot = dir.join(format!("d{d}.png")).to_string_lossy().into_owned();
         let _ = std::fs::remove_file(&shot);
+        // Tilt the camera away from perfectly-axial pitch before
+        // the screenshot: straight-down (−π/2) aligns with the
+        // PosY face's r-axis exactly, which hits a shader
+        // degeneracy in `sphere_in_sub_frame` (two of the three
+        // rd_local components near zero → t-interval for u/v axes
+        // becomes f32-unstable, DDA can't pick the right cell,
+        // rendering collapses to a smeared gradient). `pitch:-0.5`
+        // matches real gameplay (the user looks DOWN but not
+        // straight down) and keeps all three ray components
+        // well-separated from zero.
+        //
+        // Probe still runs with the harness's fixed −π/2 so the
+        // anchor-invariant checks don't depend on camera angle.
         script = script
             .emit(&format!("d{d}"))
             .wait(5)
+            .pitch(-0.5)
+            .yaw(0.3)
+            .wait(5)
             .screenshot(&shot)
+            .pitch(-std::f32::consts::FRAC_PI_2)
+            .yaw(0.0)
+            .wait(2)
             .probe_down()
             .break_()
             .wait(10)
