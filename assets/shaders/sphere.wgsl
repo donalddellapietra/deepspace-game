@@ -1430,25 +1430,35 @@ fn sphere_in_sub_frame(
             // `floor(u / up_s) * up_s`, drifts one ULP per pixel and
             // the grid dissolves. Sub-frame local coords are O(1)
             // at every depth — f32 handles them cleanly.
-            let shell_body = (outer_r - inner_r) * 3.0;
             let pixel_density = uniforms.screen_height
                 / (2.0 * tan(camera.fov * 0.5));
             // base_px = projected base-cell size in screen pixels.
             //
-            // Derivation (frame_size drops out — the key property):
-            //   cell_body  ≈ w.size · frame_size / 3 · shell_body
-            //                (per-local-unit body scale ≈ frame_size/3
-            //                 at mid-shell; shell_body carries the
-            //                 physical-units coefficient)
-            //   ray_dist_body = t · frame_size  (t is sub-frame-local)
-            //   base_px    = cell_body / ray_dist_body · pixel_density
-            //              = w.size · shell_body
-            //                / (3 · t · max(1, 1e-6)) · pixel_density
+            // In this DDA `t` is BODY distance (not sub-frame-local).
+            // The identity `J · J_inv = I` makes `rd_body = J · rd_local`
+            // unit-length, so `pos_body − c_body = rd_body · t` places
+            // `t` directly in body-XYZ units of the body cell's [0, 3)
+            // frame. Magnitude of `t` is O(frame_size) — which matches
+            // the body extent the sub-frame actually spans.
             //
-            // So we use local-coord `t` directly with the frame_size
-            // factors cancelled — O(1) math at every depth.
-            let base_px = w.size * shell_body
-                / (3.0 * max(t, 1e-6)) * pixel_density;
+            // Cell body-extent per local unit is `|J_col| ≈ frame_size/3`
+            // (the Jacobian column norm at mid-shell). So a walker cell
+            // of `w.size` local units covers `w.size · frame_size / 3`
+            // body units. That ratio with body distance gives angular
+            // size, times pixel_density gives pixels:
+            //
+            //   base_px = (w.size · frame_size / 3) / t · pixel_density
+            //
+            // At every depth: cell_body / body_distance is O(1) because
+            // both numerator and denominator shrink with frame_size —
+            // the frame_size factors cancel inside the ratio. Result
+            // stays in a sensible pixel range (~tens to thousands) at
+            // any m. An earlier version dropped the numerator's
+            // frame_size factor and produced `base_px` values in the
+            // billions, which made `bevel_level`'s band sub-pixel and
+            // every hit read as cell-interior → flat gray.
+            let base_px = w.size * frame_size
+                / (3.0 * max(t, 1e-30)) * pixel_density;
             let shape = bevel_layered_local(
                 pos.x, pos.y,
                 w.u_lo, w.v_lo, w.size,
