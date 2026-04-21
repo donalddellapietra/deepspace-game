@@ -19,6 +19,8 @@ const SOURCES: &[(&str, &str)] = &[
     ("ray_prim.wgsl",  include_str!("../assets/shaders/ray_prim.wgsl")),
     ("face_walk.wgsl", include_str!("../assets/shaders/face_walk.wgsl")),
     ("sphere.wgsl",    include_str!("../assets/shaders/sphere.wgsl")),
+    ("sphere_remap.wgsl", include_str!("../assets/shaders/sphere_remap.wgsl")),
+    ("sphere_trace.wgsl", include_str!("../assets/shaders/sphere_trace.wgsl")),
     ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
     ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
     ("taa_resolve.wgsl", include_str!("../assets/shaders/taa_resolve.wgsl")),
@@ -89,6 +91,10 @@ mod tests {
         assert!(src.contains("fn march("), "march missing");
         assert!(src.contains("fn march_cartesian("), "march_cartesian missing");
         assert!(src.contains("fn sphere_in_cell("), "sphere_in_cell missing");
+        assert!(src.contains("fn sremap_march("), "sremap_march missing");
+        assert!(src.contains("fn sremap_forward("), "sremap_forward missing");
+        assert!(src.contains("fn sremap_inverse("), "sremap_inverse missing");
+        assert!(src.contains("ROOT_KIND_REMAP_SPHERE"), "REMAP_SPHERE constant missing");
         assert!(src.contains("struct Uniforms"), "Uniforms missing");
         assert!(!src.contains("#include"), "directive leaked into output");
     }
@@ -98,5 +104,25 @@ mod tests {
         let src = compose("main.wgsl");
         let binding_count = src.matches("@group(0) @binding(0)").count();
         assert_eq!(binding_count, 1, "bindings.wgsl included more than once");
+    }
+
+    /// Parse + validate the composed main.wgsl with naga. Catches WGSL
+    /// syntax / type errors at `cargo test` time rather than at
+    /// `create_shader_module` time on the GPU — crucial when adding
+    /// shader code without running the renderer.
+    #[test]
+    fn main_wgsl_validates_with_naga() {
+        let src = compose("main.wgsl");
+        let module = match naga::front::wgsl::parse_str(&src) {
+            Ok(m) => m,
+            Err(e) => panic!("main.wgsl failed WGSL parse:\n{}", e.emit_to_string(&src)),
+        };
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        if let Err(e) = validator.validate(&module) {
+            panic!("main.wgsl failed naga validation: {:#?}", e);
+        }
     }
 }

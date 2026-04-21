@@ -17,6 +17,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 png = "0.17"
 
+[dev-dependencies]
+naga = { version = "25", features = ["wgsl-in"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wry = { version = "0.47", features = ["transparent"] }
 raw-window-handle = "0.6"

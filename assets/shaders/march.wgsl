@@ -2,6 +2,7 @@
 #include "tree.wgsl"
 #include "ray_prim.wgsl"
 #include "sphere.wgsl"
+#include "sphere_trace.wgsl"
 
 // Cell-packing helpers. Cell coords at each depth range -1..=3
 // (legal 0..=2 plus ±1 over-step to trigger pop). Pack +1-shifted
@@ -806,6 +807,14 @@ fn march_cartesian(
 // coords, so the inner DDA is unchanged — only the ray is
 // rescaled and the buffer node_idx swapped.
 fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
+    // Remap-sphere dispatch: when the root is a Cartesian tree to be
+    // rendered as a unit ball via F (Nowell), skip the ribbon-pop
+    // architecture entirely and call the curved-space sphere-trace.
+    // No new NodeKind, no parallel uniforms — just a different march.
+    if (uniforms.root_kind == ROOT_KIND_REMAP_SPHERE) {
+        return sremap_march(uniforms.root_index, world_ray_origin, world_ray_dir);
+    }
+
     var ray_origin = world_ray_origin;
     var ray_dir = world_ray_dir;
     var current_idx = uniforms.root_index;

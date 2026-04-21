@@ -70,6 +70,9 @@ struct Uniforms {
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
 const ROOT_KIND_FACE: u32 = 2u;
+// Cartesian tree rendered as a unit ball via the Nowell cube→sphere
+// remap. Dispatches into `sremap_march` in sphere_trace.wgsl.
+const ROOT_KIND_REMAP_SPHERE: u32 = 3u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
