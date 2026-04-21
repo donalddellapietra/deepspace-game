@@ -1069,9 +1069,12 @@ fn sphere_in_sub_frame(
     // multiplications, no basis rebuild, no precision dependency on
     // the absolute face-normalized corner at all.
     //
-    // `rn_corner` still feeds the per-hit depth tint below (a smooth
+    // `rn_corner` feeds the per-hit depth tint below (a smooth
     // function of absolute radial position, tolerant of f32 drift).
-    let rn_corner = uniforms.sub_face_corner.z;
+    // `frame_size` scales the walker cell's local units into body
+    // distance for the per-pixel bevel base_px computation.
+    let rn_corner  = uniforms.sub_face_corner.z;
+    let frame_size = uniforms.sub_face_corner.w;
 
     // Copy the uniform UVR prefix into a function-local buffer so we
     // can mutate it on neighbor steps. Length 64 matches the CPU-side
