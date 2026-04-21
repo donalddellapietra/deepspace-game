@@ -446,12 +446,140 @@ mod tests {
         assert!(h.path.len() >= 2, "hit path should descend into body");
     }
 
+    /// Build a synthetic uniform-solid world with `sub_depth` UVR
+    /// levels. Every reachable cell inside the face subtree is
+    /// `Block(42)`, so any ray reaching the walker must hit. Isolates
+    /// pipeline / DDA correctness from worldgen content.
+    fn build_solid_sphere_world(sub_depth: u8) -> (
+        crate::world::tree::NodeLibrary,
+        crate::world::tree::NodeId,
+    ) {
+        use crate::world::cubesphere::{Face, CORE_SLOT};
+        use crate::world::tree::{
+            empty_children, slot_index, uniform_children, Child, NodeKind,
+        };
+        let mut lib = crate::world::tree::NodeLibrary::default();
+        // 11-deep uniform-solid chain for the walker to terminate in.
+        let deep_solid = lib.insert(uniform_children(Child::Block(42)));
+        let mut chain = deep_solid;
+        for _ in 0..10u32 {
+            chain = lib.insert(uniform_children(Child::Node(chain)));
+        }
+        // UVR descent: sub_depth levels of slot (1,1,1) into chain.
+        let mut face_subtree = chain;
+        for _ in 0..sub_depth {
+            let mut children = empty_children();
+            children[slot_index(1, 1, 1)] = Child::Node(face_subtree);
+            face_subtree = lib.insert(children);
+        }
+        let mut face_root_children = uniform_children(Child::Node(chain));
+        face_root_children[slot_index(1, 1, 1)] = Child::Node(face_subtree);
+        let face_root = lib.insert_with_kind(
+            face_root_children,
+            NodeKind::CubedSphereFace { face: Face::PosY },
+        );
+        let mut body_children = empty_children();
+        for &f in &Face::ALL {
+            body_children[crate::world::cubesphere::FACE_SLOTS[f as usize]] =
+                Child::Node(face_root);
+        }
+        body_children[CORE_SLOT] = Child::Node(chain);
+        let body = lib.insert_with_kind(
+            body_children,
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+        );
+        let mut root_children = empty_children();
+        root_children[slot_index(1, 1, 1)] = Child::Node(body);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+        (lib, root)
+    }
+
+    /// Drive the full pipeline — compute_render_frame → in_sub_frame →
+    /// cpu_raycast_in_sub_frame — at the given `sub_depth`. Returns
+    /// whether a hit was produced.
+    fn run_full_pipeline_at_depth(
+        lib: &crate::world::tree::NodeLibrary,
+        root: crate::world::tree::NodeId,
+        face: crate::world::cubesphere::Face,
+        sub_depth: u8,
+    ) -> bool {
+        use crate::app::frame::{compute_render_frame, ActiveFrameKind};
+        use crate::world::anchor::{Path, SphereState, WorldPos};
+        use crate::world::tree::slot_index;
+
+        let body_path = {
+            let mut p = Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let mut uvr_path = Path::root();
+        for _ in 0..sub_depth {
+            uvr_path.push(slot_index(1, 1, 1) as u8);
+        }
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let total_depth = body_path.depth() + 1 + sub_depth;
+        // Render-margin of 3 matches runtime: render sits 3 levels
+        // shallower than edit anchor. Caller guarantees sub_depth
+        // is large enough that render_depth still leaves
+        // ≥ MIN_SPHERE_SUB_DEPTH UVR levels under the face root.
+        let render_depth = total_depth - 3;
+        let active = compute_render_frame(lib, root, &camera, render_depth);
+        let sub = match active.kind {
+            ActiveFrameKind::SphereSub(s) => s,
+            _ => return false,
+        };
+        let cam_local = camera.in_sub_frame(&sub);
+        let rd_body = crate::world::sdf::scale(
+            crate::world::sdf::normalize([sub.j[2][0], sub.j[2][1], sub.j[2][2]]),
+            -1.0,
+        );
+        cpu_raycast_in_sub_frame(
+            lib, root, &sub,
+            active.render_path.as_slice(),
+            cam_local, rd_body,
+            total_depth as u32,
+            super::LodParams::fixed_max(),
+        ).is_some()
+    }
+
     #[test]
-    fn sphere_sub_frame_hit_at_depth_15() {
-        // End-to-end pipeline check with symbolic-UVR camera state:
-        // compute_render_frame must produce SphereSub and
-        // cpu_raycast_in_sub_frame must land a hit at a depth well
-        // past the body-march precision wall (~8 levels).
+    fn sphere_sub_full_pipeline_synthetic_sweep() {
+        // Full pipeline on a synthetic uniform-solid world across
+        // UVR depths 6..=30. ANY miss means a pipeline precision
+        // bug (not a worldgen content question) — the world has no
+        // empty cells inside the face subtree. Sub-depths below 6
+        // are excluded because the render_margin of 3 leaves
+        // < MIN_SPHERE_SUB_DEPTH UVR levels, and compute_render_frame
+        // falls back to Body (tested elsewhere).
+        for sub_depth in [6u8, 7, 8, 10, 12, 15, 18, 20, 22, 25, 28, 30] {
+            let (lib, root) = build_solid_sphere_world(sub_depth);
+            assert!(
+                run_full_pipeline_at_depth(
+                    &lib, root, crate::world::cubesphere::Face::PosY, sub_depth,
+                ),
+                "full-pipeline synthetic sweep missed at sub_depth={sub_depth}",
+            );
+        }
+    }
+
+    #[test]
+    fn sphere_sub_full_pipeline_demo_planet_depth_25() {
+        // Full pipeline on the real demo planet at UVR depth 25 —
+        // deep enough to stress sphere-geometry precision (the real
+        // `body_point_to_face_space` / Jacobian path), but within the
+        // demo planet's tree depth (28).
         use crate::app::frame::{compute_render_frame, ActiveFrameKind};
         use crate::world::anchor::{Path, SphereState, WorldPos};
         use crate::world::bootstrap;
@@ -463,21 +591,14 @@ mod tests {
             Some(40),
         ).world;
 
-        // Camera at face PosY, UVR (center, center, center) × 15.
-        // 15 is well past the body-march f32 wall (~8 levels) and
-        // inside the demo planet's tree depth (28). Proves the
-        // symbolic-UVR + local-frame DDA path works where body
-        // march would fail.
-        //
-        // Geometry starts to degrade past ~18 UVR levels in the
-        // current implementation — documented precision frontier.
+        let sub_depth = 25u8;
         let body_path = {
             let mut p = Path::root();
             p.push(slot_index(1, 1, 1) as u8);
             p
         };
         let mut uvr_path = Path::root();
-        for _ in 0..15 {
+        for _ in 0..sub_depth {
             uvr_path.push(slot_index(1, 1, 1) as u8);
         }
         let camera = WorldPos {
@@ -492,20 +613,15 @@ mod tests {
                 uvr_offset: [0.5; 3],
             }),
         };
-        let total_depth = body_path.depth() + 1 + 15;
-        // Render frame at total - 3, mimicking the runtime
-        // render_margin of 3. Walker then descends 3 more levels to
-        // the user's edit depth.
+        let total_depth = body_path.depth() + 1 + sub_depth;
         let render_depth = total_depth - 3;
         let active = compute_render_frame(
             &world.library, world.root, &camera, render_depth,
         );
         let sub = match active.kind {
             ActiveFrameKind::SphereSub(s) => s,
-            k => panic!("expected SphereSub at render_depth {render_depth}, got {k:?}"),
+            k => panic!("expected SphereSub at depth 25, got {k:?}"),
         };
-        // cam_local from the camera's symbolic UVR state — precise at
-        // any depth, no body-XYZ subtraction.
         let cam_local = camera.in_sub_frame(&sub);
         let rd_body = crate::world::sdf::scale(
             crate::world::sdf::normalize([sub.j[2][0], sub.j[2][1], sub.j[2][2]]),
@@ -518,7 +634,7 @@ mod tests {
             total_depth as u32,
             LodParams::fixed_max(),
         );
-        assert!(hit.is_some(), "deep-descent raycast missed at total_depth={total_depth}");
+        assert!(hit.is_some(), "demo-planet depth-25 missed");
     }
 
     #[test]
