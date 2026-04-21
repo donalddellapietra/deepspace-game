@@ -389,3 +389,88 @@ fn remap_sphere_blocks_show_bevels_at_layers_3() {
     );
 }
 
+/// Deep-zoom regression: spawn the camera at a deep anchor depth so
+/// the render frame descends. The ball's world-space position is
+/// invariant; the `remap_cube_xform` uniform tells the shader where
+/// the ball sits in the CURRENT render frame's local coords. A
+/// correct implementation renders the same ball silhouette at
+/// spawn-depth N as at spawn-depth 0 (up to sub-pixel differences),
+/// validating that deep zoom preserves unified geometry.
+#[test]
+fn remap_sphere_deep_zoom_preserves_silhouette() {
+    let dir = tmp_dir("remap_sphere_silhouette");
+    let depths = [1_u8, 8, 16];
+    for d in depths {
+        let _ = std::fs::remove_file(dir.join(format!("deep_zoom_{d}.png")));
+    }
+    let mut stats: Vec<(u8, f64, f64, usize)> = Vec::new();
+    for d in depths {
+        let shot = dir.join(format!("deep_zoom_{d}.png"));
+        let dstr = d.to_string();
+        let args: Vec<&str> = vec![
+            "--render-harness",
+            "--remap-sphere-world",
+            "--disable-highlight",
+            "--harness-width",
+            "512",
+            "--harness-height",
+            "512",
+            "--exit-after-frames",
+            "60",
+            "--timeout-secs",
+            "30",
+            "--spawn-depth",
+            dstr.as_str(),
+        ];
+        let script = ScriptBuilder::new()
+            .wait(5)
+            .screenshot(shot.to_string_lossy().as_ref())
+            .emit(format!("deep_zoom_{d}"));
+        let trace = run(&args, &script);
+        assert!(
+            trace.exit_success,
+            "binary failed at spawn_depth={d}: {}",
+            trace.stderr
+        );
+        assert!(shot.exists(), "missing shot at depth={d}");
+        let (w, h, rgba) = load_png(&shot);
+        let mask = planet_mask(&rgba, w, h);
+        let (_cx, _cy, r_mean, r_std, count) = fit_circle(&mask, w, h);
+        eprintln!(
+            "deep_zoom depth={d}: {count} px, r_mean={r_mean:.3}, r_std={r_std:.3}"
+        );
+        stats.push((d, r_mean, r_std, count));
+    }
+    // Every depth must render a circular silhouette. A deep-zoom
+    // break would typically manifest as either total miss
+    // (count ≈ 0), a distorted shape (r_std ≫ 1), or an off-center
+    // pixel cluster.
+    for (d, r_mean, r_std, count) in &stats {
+        assert!(
+            *count > 30_000,
+            "at spawn_depth={d}, only {count} planet pixels — \
+             render frame descended past the ball or cube_xform is \
+             wrong. r_mean={r_mean:.3}, r_std={r_std:.3}"
+        );
+        assert!(
+            *r_std < 2.0,
+            "at spawn_depth={d}, silhouette is not circular \
+             (r_std={r_std:.3}). Unified geometry broken at this depth."
+        );
+    }
+    // All depths should render approximately the same ball size —
+    // the world-space ball is invariant under zoom, so the
+    // silhouette's radius should be the same within a few pixels
+    // across all spawn depths.
+    let r_ref = stats[0].1;
+    for (d, r_mean, _, _) in &stats {
+        let diff = (r_mean - r_ref).abs();
+        assert!(
+            diff < 5.0,
+            "at spawn_depth={d}, silhouette radius {r_mean:.2} \
+             differs from depth-1 reference {r_ref:.2} by {diff:.2} px. \
+             Ball's apparent size should be invariant under zoom."
+        );
+    }
+}
+

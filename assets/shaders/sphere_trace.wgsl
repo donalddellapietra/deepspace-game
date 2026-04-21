@@ -80,20 +80,26 @@ fn sremap_tree_query(root_node_idx: u32, c: vec3<f32>, max_depth: u32) -> Sremap
     return out;
 }
 
-// The sphere body sits at the center of the frame's [0, 3)^3 cube.
-// Radius 0.6 gives enough room at the edges to place the camera
-// outside the body without bumping the frame boundary. When the
-// architecture is ready for sphere bodies as sub-cells, these will
-// come from the uniform buffer.
-const SREMAP_BALL_CENTER: vec3<f32> = vec3<f32>(1.5, 1.5, 1.5);
-const SREMAP_BALL_RADIUS: f32 = 0.6;
+// The sphere body IS the cube. The cube transform
+// `uniforms.remap_cube_xform = (offset.xyz, scale)` maps
+// render-frame-local coords to absolute cube coords:
+//   c_cube = offset + c_frame * scale
+// Inversion gives the ball's center (cube origin) and radius (1)
+// in frame-local coords:
+//   ball_center_frame = -offset / scale
+//   ball_radius_frame = 1 / scale
+// At world root: offset=(-1,-1,-1), scale=2/3, giving
+// ball_center=(1.5,1.5,1.5), radius=1.5 — the ball inscribes the
+// cube. At deeper render frames, the ball grows larger in local
+// coords (camera is inside a sub-cube of the ball).
 
-// The main sphere trace. The sphere body is a ball of radius
-// SREMAP_BALL_RADIUS centered at SREMAP_BALL_CENTER in the input
-// frame. Walks a frame-space straight ray through it; backing tree
-// lives in cube coords [-1, 1]^3 mapped through F. Returns a
-// HitResult in frame-space units, compatible with the rest of the
-// renderer pipeline.
+// The main sphere trace. The body is a unit ball in cube coords
+// [-1, 1]^3 mapped to world via F (Nowell). The current render
+// frame's cube transform (`remap_cube_xform`) locates the ball's
+// center/radius in frame-local coords at any render frame depth —
+// enabling deep-zoom descent while keeping the ball's geometry
+// continuous across zoom levels. Returns a HitResult in
+// frame-space units, compatible with the rest of the renderer.
 fn sremap_march(root_node_idx: u32, frame_ray_origin: vec3<f32>, frame_ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -105,25 +111,26 @@ fn sremap_march(root_node_idx: u32, frame_ray_origin: vec3<f32>, frame_ray_dir: 
     result.frame_level = 0u;
     result.frame_scale = 1.0;
 
-    // Transform frame-space ray into unit-ball-local space (ball
-    // becomes radius 1 at origin). Frame-space t corresponds to
-    // frame_ray_dir magnitude units; we convert everything to a
-    // unit-direction inside the local space so arc lengths line up.
-    let origin_local = (frame_ray_origin - SREMAP_BALL_CENTER) / SREMAP_BALL_RADIUS;
+    // Current frame's cube transform: c_cube = offset + c_frame * scale.
+    let cube_offset = uniforms.remap_cube_xform.xyz;
+    let cube_scale = uniforms.remap_cube_xform.w;
+    // Ball in frame-local coords. At world root this is center
+    // (1.5, 1.5, 1.5) radius 1.5 (inscribes the cube). At deeper
+    // frames, the ball is much larger than the frame.
+    let ball_radius_frame = 1.0 / cube_scale;
+    let ball_center_frame = -cube_offset / cube_scale;
+
+    // Transform the frame ray into unit-ball-local space (ball
+    // becomes radius 1 at origin) for the analytic sphere test.
+    let origin_local = (frame_ray_origin - ball_center_frame) / ball_radius_frame;
     let dmag_frame = length(frame_ray_dir);
     if (dmag_frame < 1e-6) { return result; }
     let dir_frame_unit = frame_ray_dir / dmag_frame;
-    // In local space, 1 unit of arc = 1 frame unit / radius. The
-    // direction vector's magnitude there is `1/radius` per 1 frame
-    // arc; a unit-length local direction `d` advances by `radius`
-    // frame units per unit of local arc length `s`. We march in `s`
-    // and convert to frame t = s / (1/radius) · (1/dmag_frame)
-    //                        = s * radius / dmag_frame.
-    let d = dir_frame_unit; // direction is scale-invariant (unit)
+    let d = dir_frame_unit;
 
     let rb = sremap_ray_unit_ball(origin_local, d);
     if (rb.z < 0.5) {
-        return result; // miss
+        return result; // ray misses the ball (silhouette)
     }
     let t_enter = rb.x;
     let t_exit = rb.y;
@@ -160,7 +167,7 @@ fn sremap_march(root_node_idx: u32, frame_ray_origin: vec3<f32>, frame_ray_dir: 
             // Crossed empty→filled: refine via linear interp on s.
             let s_hit = select(0.5 * (prev_s + s), s, step == 0u);
             let w_hit_local = origin_local + d * s_hit;
-            let w_hit_frame = w_hit_local * SREMAP_BALL_RADIUS + SREMAP_BALL_CENTER;
+            let w_hit_frame = w_hit_local * ball_radius_frame + ball_center_frame;
             // Re-invert and re-query at the refined hit position so
             // the cell AABB below matches the pixel we shade.
             let c_hit = sremap_inverse(w_hit_local, c_warm, newton_iters);
@@ -173,7 +180,7 @@ fn sremap_march(root_node_idx: u32, frame_ray_origin: vec3<f32>, frame_ray_dir: 
             );
 
             result.hit = true;
-            result.t = s_hit * SREMAP_BALL_RADIUS / dmag_frame;
+            result.t = s_hit * ball_radius_frame / dmag_frame;
             // Radial normal is correct for outer-shell hits. Interior
             // voxel walls would want the cube-face normal warped by
             // J⁻ᵀ — defer until someone's actually carving interior

@@ -82,6 +82,14 @@ pub struct GpuUniforms {
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_face_pop_pos: [f32; 4],
+    /// Remap-sphere transform: maps render-frame-local coords to
+    /// absolute cube coords via `c_cube = xyz + c_frame * w`. At the
+    /// world root, xyz = (-1, -1, -1) and w = 2/3. Deeper render
+    /// frames accumulate slot offsets as they descend. The shader's
+    /// `sremap_march` uses this to locate the ball's center/radius
+    /// in the current frame's coords without referencing absolute
+    /// world position.
+    pub remap_cube_xform: [f32; 4],
 }
 
 pub struct Renderer {
@@ -138,6 +146,7 @@ pub struct Renderer {
     pub(super) root_face_meta: [u32; 4],
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
+    pub(super) remap_cube_xform: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -285,14 +294,18 @@ impl Renderer {
 
     /// Set the frame-root to a remap-sphere: a plain Cartesian tree
     /// rendered as a unit ball via the Nowell cube→sphere remap. The
-    /// ball fills the `[0, 3)^3` frame (center=1.5, radius=1.5);
-    /// `sremap_march` in sphere_trace.wgsl handles dispatch.
-    pub fn set_root_kind_remap_sphere(&mut self) {
+    /// ball fills the root frame's cube (cube coords `[-1, 1]^3`);
+    /// `sremap_march` in sphere_trace.wgsl uses `cube_xform` to map
+    /// frame-local coords to absolute cube coords at any render
+    /// frame depth. `cube_xform = (offset.xyz, scale)` where
+    /// `c_cube = offset + c_frame * scale`.
+    pub fn set_root_kind_remap_sphere(&mut self, cube_xform: [f32; 4]) {
         self.root_kind = ROOT_KIND_REMAP_SPHERE;
         self.root_radii = [0.0; 4];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
+        self.remap_cube_xform = cube_xform;
         self.write_uniforms();
     }
 

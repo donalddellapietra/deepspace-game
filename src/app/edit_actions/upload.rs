@@ -299,7 +299,44 @@ impl App {
             // circuit the ActiveFrameKind dispatch and go straight
             // to the sphere-trace shader path.
             if self.render_as_remap_sphere {
-                renderer.set_root_kind_remap_sphere();
+                // Cube transform: `c_cube = offset + c_frame * scale`.
+                // The ball sits at WORLD coords (1.5, 1.5, 1.5) with
+                // radius 0.6 — fixed across all render frame depths.
+                // For any render frame, compute its world-space
+                // corner from the path, then express the ball's
+                // cube-coord mapping in that frame's local [0, 3).
+                //
+                // Derivation:
+                //   c_cube = (c_world - ball_center) / ball_radius
+                //   c_world = frame_corner_world + c_frame * frame_size_world / 3
+                //   ⇒ c_cube = (frame_corner_world - ball_center
+                //              + c_frame * frame_size_world / 3) / ball_radius
+                //   offset = (frame_corner_world - ball_center) / ball_radius
+                //   scale  = (frame_size_world / 3) / ball_radius
+                const BALL_CENTER: [f32; 3] = [1.5, 1.5, 1.5];
+                const BALL_RADIUS: f32 = 0.6;
+                let mut frame_corner_world = [0.0_f32; 3];
+                let mut frame_size_world: f32 = 3.0;
+                for &slot in self.active_frame.render_path.as_slice() {
+                    let sx = (slot % 3) as f32;
+                    let sy = ((slot / 3) % 3) as f32;
+                    let sz = (slot / 9) as f32;
+                    let child = frame_size_world / 3.0;
+                    frame_corner_world[0] += sx * child;
+                    frame_corner_world[1] += sy * child;
+                    frame_corner_world[2] += sz * child;
+                    frame_size_world = child;
+                }
+                let inv_r = 1.0 / BALL_RADIUS;
+                let offset = [
+                    (frame_corner_world[0] - BALL_CENTER[0]) * inv_r,
+                    (frame_corner_world[1] - BALL_CENTER[1]) * inv_r,
+                    (frame_corner_world[2] - BALL_CENTER[2]) * inv_r,
+                ];
+                let scale = (frame_size_world / 3.0) * inv_r;
+                renderer.set_root_kind_remap_sphere(
+                    [offset[0], offset[1], offset[2], scale],
+                );
             } else {
                 match self.active_frame.kind {
                     ActiveFrameKind::Sphere(sphere) => {

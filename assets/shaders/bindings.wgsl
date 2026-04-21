@@ -65,6 +65,12 @@ struct Uniforms {
     /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
+    /// Remap-sphere cube transform. xyz = cube_offset (cube coord of
+    /// the current render frame's (0, 0, 0) corner), w = cube_scale.
+    /// `c_cube = xyz + c_frame * w`. At world root this is
+    /// (-1, -1, -1, 2/3). Deeper render frames shrink w by 1/3 per
+    /// descent and offset xyz by the accumulated slot corners.
+    remap_cube_xform: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
