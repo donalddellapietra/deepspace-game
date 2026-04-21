@@ -195,7 +195,10 @@ impl TestConfig {
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
                 "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
                 "--remap-sphere-world" => {
-                    cfg.world_preset = WorldPreset::RemapSphere { layers: 8 };
+                    // Tree depth comes from --plain-layers (default 8
+                    // in `bootstrap_world`). Bumping to 30 works —
+                    // storage dedups, LOD caps visual descent.
+                    cfg.world_preset = WorldPreset::RemapSphere;
                 }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {

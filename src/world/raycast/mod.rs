@@ -8,7 +8,10 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
+mod remap_sphere;
 mod sphere;
+
+pub use remap_sphere::cpu_raycast_in_remap_sphere_frame;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 

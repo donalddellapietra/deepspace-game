@@ -331,7 +331,7 @@ impl App {
         let entity_surface_y = bootstrap::surface_y_for_preset(&test_cfg.world_preset);
         let render_as_remap_sphere = matches!(
             test_cfg.world_preset,
-            bootstrap::WorldPreset::RemapSphere { .. }
+            bootstrap::WorldPreset::RemapSphere
         );
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();

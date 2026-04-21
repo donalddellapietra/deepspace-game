@@ -18,8 +18,29 @@
 
 use super::sphere_remap::{self, V3};
 use super::tree::{slot_index, Child, NodeId, NodeLibrary, REPRESENTATIVE_EMPTY};
+use crate::world::raycast::HitInfo;
 
 // ---------- occupancy interface ----------
+
+/// Descent info returned by a path-aware occupancy query: the cell's
+/// AABB in cube coords plus the tree path from world root down to
+/// the cell.
+#[derive(Debug, Clone)]
+pub struct CellDescent {
+    /// Is this cell filled (Block, or LOD-terminal subtree whose
+    /// representative is non-empty)?
+    pub filled: bool,
+    /// L∞ safe cube-space distance to the cell's AABB boundary.
+    pub safe_cube: f32,
+    /// Cell AABB lower corner in cube coords.
+    pub cell_min: V3,
+    /// Cell AABB size (cube = `cell_min` + `cell_size` on every axis).
+    pub cell_size: f32,
+    /// Path of `(parent_node_id, slot_in_parent)` pairs from world
+    /// root down to the cell. Length = descent depth reached (either
+    /// LOD-terminal or leaf-terminal).
+    pub path: Vec<(NodeId, usize)>,
+}
 
 /// Occupancy query for a sphere body. Callers implement this to
 /// expose their data structure (analytic field, voxel tree, brickmap,
@@ -35,6 +56,23 @@ pub trait CubeOccupancy {
     ///
     /// Non-negative. Returning zero will make the trace stall.
     fn query(&self, c: V3) -> (bool, f32);
+
+    /// Path-aware variant: in addition to `(filled, safe_cube)`,
+    /// returns the containing cell's AABB and the tree path that
+    /// leads to it. The default implementation returns an empty path
+    /// + a root-sized cell so purely analytic occupancies still
+    /// compile — callers that need face/path info use a real
+    /// implementation like `TreeOccupancy`.
+    fn query_with_path(&self, c: V3) -> CellDescent {
+        let (filled, safe_cube) = self.query(c);
+        CellDescent {
+            filled,
+            safe_cube,
+            cell_min: [-1.0, -1.0, -1.0],
+            cell_size: 2.0,
+            path: Vec::new(),
+        }
+    }
 }
 
 // ---------- results ----------
@@ -257,54 +295,298 @@ pub struct TreeOccupancy<'a> {
 
 impl<'a> CubeOccupancy for TreeOccupancy<'a> {
     fn query(&self, c: V3) -> (bool, f32) {
+        let descent = self.query_with_path(c);
+        (descent.filled, descent.safe_cube)
+    }
+
+    fn query_with_path(&self, c: V3) -> CellDescent {
         // Start at the root cell, which occupies [-1, 1]^3.
         let mut cell_min = [-1.0_f32; 3];
         let mut cell_size = 2.0_f32;
-        let mut current = Child::Node(self.root);
+        let mut current_id = self.root;
         let mut depth = 0_u32;
+        let mut path: Vec<(NodeId, usize)> = Vec::new();
 
         loop {
-            match current {
+            // LOD cutoff: treat the current subtree as one logical cell.
+            // Its representative tells us filled/empty.
+            if depth >= self.max_depth {
+                let filled = self
+                    .library
+                    .get(current_id)
+                    .map(|n| n.representative_block != REPRESENTATIVE_EMPTY)
+                    .unwrap_or(false);
+                return CellDescent {
+                    filled,
+                    safe_cube: safe_cube_l_inf(c, cell_min, cell_size).max(1e-5),
+                    cell_min,
+                    cell_size,
+                    path,
+                };
+            }
+
+            let Some(node) = self.library.get(current_id) else {
+                return CellDescent {
+                    filled: false,
+                    safe_cube: safe_cube_l_inf(c, cell_min, cell_size).max(1e-5),
+                    cell_min,
+                    cell_size,
+                    path,
+                };
+            };
+
+            // Clamp c into the current cell before slotting — rays
+            // sometimes query just-outside points due to f32 slop at
+            // cell boundaries.
+            let cs = cell_size / 3.0;
+            let sx = (((c[0] - cell_min[0]) / cs).floor() as i32).clamp(0, 2) as usize;
+            let sy = (((c[1] - cell_min[1]) / cs).floor() as i32).clamp(0, 2) as usize;
+            let sz = (((c[2] - cell_min[2]) / cs).floor() as i32).clamp(0, 2) as usize;
+            let slot = slot_index(sx, sy, sz);
+            path.push((current_id, slot));
+
+            let child_min = [
+                cell_min[0] + sx as f32 * cs,
+                cell_min[1] + sy as f32 * cs,
+                cell_min[2] + sz as f32 * cs,
+            ];
+
+            match node.children[slot] {
                 Child::Block(_) => {
-                    return (true, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
-                }
-                Child::Empty => {
-                    return (false, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
-                }
-                // Scene-overlay cells: treat as empty for sphere trace.
-                Child::EntityRef(_) => {
-                    return (false, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
-                }
-                Child::Node(node_id) => {
-                    // LOD cutoff: use the subtree's representative.
-                    if depth >= self.max_depth {
-                        let filled = self
-                            .library
-                            .get(node_id)
-                            .map(|n| n.representative_block != REPRESENTATIVE_EMPTY)
-                            .unwrap_or(false);
-                        return (filled, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
-                    }
-                    let Some(node) = self.library.get(node_id) else {
-                        return (false, safe_cube_l_inf(c, cell_min, cell_size).max(1e-5));
+                    return CellDescent {
+                        filled: true,
+                        safe_cube: safe_cube_l_inf(c, child_min, cs).max(1e-5),
+                        cell_min: child_min,
+                        cell_size: cs,
+                        path,
                     };
-                    // Clamp c into the current cell before slotting —
-                    // rays sometimes query just-outside points due to
-                    // f32 slop at cell boundaries.
-                    let cs = cell_size / 3.0;
-                    let sx = (((c[0] - cell_min[0]) / cs).floor() as i32).clamp(0, 2) as usize;
-                    let sy = (((c[1] - cell_min[1]) / cs).floor() as i32).clamp(0, 2) as usize;
-                    let sz = (((c[2] - cell_min[2]) / cs).floor() as i32).clamp(0, 2) as usize;
-                    let slot = slot_index(sx, sy, sz);
-                    current = node.children[slot];
-                    cell_min[0] += sx as f32 * cs;
-                    cell_min[1] += sy as f32 * cs;
-                    cell_min[2] += sz as f32 * cs;
+                }
+                Child::Empty | Child::EntityRef(_) => {
+                    // Scene-overlay cells: treat as empty for sphere trace.
+                    return CellDescent {
+                        filled: false,
+                        safe_cube: safe_cube_l_inf(c, child_min, cs).max(1e-5),
+                        cell_min: child_min,
+                        cell_size: cs,
+                        path,
+                    };
+                }
+                Child::Node(child_id) => {
+                    current_id = child_id;
+                    cell_min = child_min;
                     cell_size = cs;
                     depth += 1;
                 }
             }
         }
+    }
+}
+
+// ---------- hit-info-emitting trace ----------
+
+/// Ray-march a sphere body and emit a `HitInfo`-compatible hit. The
+/// body is a ball of world radius `ball_radius` centered at
+/// `ball_center` in the caller's frame; internally the ray is
+/// transformed into unit-ball-local space so the tree coord system
+/// is `[-1, 1]^3`, matching the CPU `trace` semantics.
+///
+/// Returns `None` on miss. On hit, `t` is in the caller's frame units
+/// along `ray_dir_in` (preserving the caller's direction magnitude,
+/// analogous to the Cartesian DDA convention).
+///
+/// The returned path is the tree path to the filled cell, and
+/// `place_path` is the tree path to the last empty cell traversed
+/// before the transition — the correct target for a place edit.
+/// `face` encodes which face of the filled cell the ray entered
+/// through using the same `0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z`
+/// convention as the Cartesian raycaster.
+pub fn trace_to_hit<O: CubeOccupancy>(
+    occupancy: &O,
+    ray_origin_frame: V3,
+    ray_dir_frame: V3,
+    cfg: &TraceConfig,
+    ball_center: V3,
+    ball_radius: f32,
+) -> Option<HitInfo> {
+    // Input-direction magnitude preserves the caller's t-scaling
+    // convention: HitInfo.t is measured along ray_dir_frame as given.
+    let dmag_frame =
+        (ray_dir_frame[0].powi(2) + ray_dir_frame[1].powi(2) + ray_dir_frame[2].powi(2)).sqrt();
+    if dmag_frame < 1e-12 || ball_radius <= 0.0 {
+        return None;
+    }
+    let inv_r = 1.0 / ball_radius;
+
+    // Transform ray into unit-ball-local space. Direction is
+    // scale-invariant under uniform scaling; normalize for the march.
+    let origin_local = [
+        (ray_origin_frame[0] - ball_center[0]) * inv_r,
+        (ray_origin_frame[1] - ball_center[1]) * inv_r,
+        (ray_origin_frame[2] - ball_center[2]) * inv_r,
+    ];
+    let dir_unit = [
+        ray_dir_frame[0] / dmag_frame,
+        ray_dir_frame[1] / dmag_frame,
+        ray_dir_frame[2] / dmag_frame,
+    ];
+
+    let (t_enter, t_exit) = ray_unit_ball(origin_local, dir_unit)?;
+    if t_exit < 0.0 {
+        return None;
+    }
+
+    let mut s = t_enter.max(0.0) + cfg.entry_offset;
+    let s_max = t_exit;
+
+    let w_entry = [
+        origin_local[0] + dir_unit[0] * s,
+        origin_local[1] + dir_unit[1] * s,
+        origin_local[2] + dir_unit[2] * s,
+    ];
+    let mut c_warm = w_entry;
+
+    let mut prev_s = s;
+    let mut prev_c: V3 = w_entry;
+    let mut prev_filled = false;
+    let mut last_empty: Option<CellDescent> = None;
+
+    let mut steps: u32 = 0;
+    while steps < cfg.max_steps {
+        steps += 1;
+
+        if s > s_max + cfg.min_world_step {
+            return None;
+        }
+
+        let w = [
+            origin_local[0] + dir_unit[0] * s,
+            origin_local[1] + dir_unit[1] * s,
+            origin_local[2] + dir_unit[2] * s,
+        ];
+
+        let c = match sphere_remap::inverse_from(w, c_warm, cfg.newton_iters) {
+            Some(c) => c,
+            None => {
+                prev_s = s;
+                prev_filled = false;
+                s += cfg.min_world_step;
+                continue;
+            }
+        };
+        c_warm = c;
+
+        let descent = occupancy.query_with_path(c);
+
+        if descent.filled && !prev_filled {
+            // Refine hit s via linear interpolation. First-step hit
+            // (ray origin already inside occupancy) uses the current s.
+            let s_hit = if steps == 1 { s } else { 0.5 * (prev_s + s) };
+            let w_hit_local = [
+                origin_local[0] + dir_unit[0] * s_hit,
+                origin_local[1] + dir_unit[1] * s_hit,
+                origin_local[2] + dir_unit[2] * s_hit,
+            ];
+            let c_hit = sphere_remap::inverse_from(w_hit_local, c_warm, cfg.newton_iters)
+                .unwrap_or(c);
+
+            // Compute face using the last-empty cell's AABB. If the
+            // ray started INSIDE occupancy (no empty cell ever) we
+            // fall back to the ray's local (= approximately cube)
+            // direction: near the ball entry F is approximately
+            // identity along the axes, so `dir_unit` is a reliable
+            // proxy for the cube-space step sign.
+            let face = match &last_empty {
+                Some(empty) => face_from_empty_crossing(empty, c_hit, prev_c, c),
+                None => face_from_cube_step([0.0; 3], dir_unit),
+            };
+
+            let place_path = last_empty.map(|e| e.path);
+
+            // t in the caller's frame units: local s maps to a frame
+            // arc length of `s * ball_radius`; dividing by the input
+            // direction magnitude converts to t measured along
+            // `ray_dir_frame` (matching the Cartesian HitInfo convention).
+            let t = s_hit * ball_radius / dmag_frame;
+
+            return Some(HitInfo {
+                path: descent.path,
+                face,
+                t,
+                place_path,
+            });
+        }
+
+        if !descent.filled {
+            last_empty = Some(descent.clone());
+        }
+
+        let sigma_raw = sphere_remap::sigma_min(c);
+        let sigma = sigma_raw.max(cfg.sigma_floor);
+        let step = (descent.safe_cube * sigma).max(cfg.min_world_step);
+
+        prev_s = s;
+        prev_c = c;
+        prev_filled = descent.filled;
+
+        s += step;
+    }
+    None
+}
+
+/// Determine which face of the filled cell the ray entered through,
+/// using the last empty cell's AABB. The ray must cross the boundary
+/// between the empty cell and its filled neighbor on exactly one face
+/// of the empty cell (up to f32 slop at corners/edges); we pick the
+/// axis with the smallest L∞ slack from `c_hit` to the empty AABB,
+/// and decide the sign from the cube-space ray step.
+fn face_from_empty_crossing(empty: &CellDescent, c_hit: V3, prev_c: V3, c: V3) -> u32 {
+    // Compute signed distance of c_hit to each face plane of the
+    // empty cell; pick the axis with the smallest absolute gap (ray
+    // exit face). Tie-break by ray direction so edges/corners still
+    // resolve deterministically.
+    let mut best_axis: usize = 0;
+    let mut best_gap = f32::INFINITY;
+    for i in 0..3 {
+        let lo_gap = (c_hit[i] - empty.cell_min[i]).abs();
+        let hi_gap = (empty.cell_min[i] + empty.cell_size - c_hit[i]).abs();
+        let gap = lo_gap.min(hi_gap);
+        if gap < best_gap {
+            best_gap = gap;
+            best_axis = i;
+        }
+    }
+    let step_sign = c[best_axis] - prev_c[best_axis];
+    face_for(best_axis, step_sign)
+}
+
+/// Fallback when there was no prior empty cell: pick the axis with
+/// the largest cube-space motion component.
+fn face_from_cube_step(prev_c: V3, c: V3) -> u32 {
+    let dx = c[0] - prev_c[0];
+    let dy = c[1] - prev_c[1];
+    let dz = c[2] - prev_c[2];
+    let ax = dx.abs();
+    let ay = dy.abs();
+    let az = dz.abs();
+    if ax >= ay && ax >= az {
+        face_for(0, dx)
+    } else if ay >= az {
+        face_for(1, dy)
+    } else {
+        face_for(2, dz)
+    }
+}
+
+/// Map (axis, step sign) to HitInfo face code. Convention mirrors
+/// the Cartesian DDA: ray moving `+axis` enters through the cell's
+/// `-axis` face. 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
+#[inline]
+fn face_for(axis: usize, step_sign: f32) -> u32 {
+    let base = (axis as u32) * 2;
+    if step_sign > 0.0 {
+        base + 1
+    } else {
+        base
     }
 }
 
@@ -791,5 +1073,130 @@ mod tests {
             r_std < 1.0,
             "corner-on silhouette shows seams: r_std={r_std:.3}"
         );
+    }
+
+    // ---- query_with_path ----
+
+    #[test]
+    fn query_with_path_short_path_at_shallow_lod() {
+        // Uniform-filled 6-layer tree, but query at max_depth = 2.
+        // At the LOD terminal the returned path has one entry per
+        // descent step (world root → depth-1 → depth-2) = length 2.
+        let (lib, root) = build_uniform_tree(1, 6);
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 2,
+        };
+        let descent = occ.query_with_path([0.0, 0.0, 0.0]);
+        assert!(descent.filled, "center cell filled in uniform tree");
+        assert_eq!(descent.path.len(), 2, "path length == max_depth");
+    }
+
+    #[test]
+    fn query_with_path_deeper_path_at_deeper_lod() {
+        let (lib, root) = build_uniform_tree(1, 6);
+        let shallow = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 2,
+        };
+        let deep = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 5,
+        };
+        // Use an off-center cube coord so each descent picks a
+        // non-center slot — exercises the slot-index path builder.
+        let c = [0.35, -0.12, 0.61];
+        let ds = shallow.query_with_path(c);
+        let dd = deep.query_with_path(c);
+        assert_eq!(ds.path.len(), 2);
+        assert_eq!(dd.path.len(), 5);
+        // Shallow path is a strict prefix of deep path.
+        for i in 0..ds.path.len() {
+            assert_eq!(ds.path[i], dd.path[i], "prefix mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn query_with_path_empty_cell_still_returns_path() {
+        // Root with center slot empty, ring filled. Query inside the
+        // center slot — should return filled = false with a path
+        // that ends at the center slot.
+        let mut lib = NodeLibrary::default();
+        let mut children = uniform_children(Child::Block(1));
+        children[crate::world::tree::CENTER_SLOT] = Child::Empty;
+        let root = lib.insert(children);
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 3,
+        };
+        let descent = occ.query_with_path([0.0, 0.0, 0.0]);
+        assert!(!descent.filled, "center slot is empty");
+        assert_eq!(descent.path.len(), 1);
+        assert_eq!(descent.path[0].1, crate::world::tree::CENTER_SLOT);
+    }
+
+    // ---- trace_to_hit ----
+
+    #[test]
+    fn trace_to_hit_axis_ray_returns_expected_face_and_path() {
+        // Uniform ball of depth 4. Ray from outside enters the
+        // filled volume; path length equals max_depth. Coming from
+        // +Z into solid, face crossed is +Z of the filled cell (4).
+        let (lib, root) = build_uniform_tree(1, 6);
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 4,
+        };
+        let hit = trace_to_hit(
+            &occ,
+            [0.0, 0.0, 2.0],
+            [0.0, 0.0, -1.0],
+            &TraceConfig::default(),
+            [0.0, 0.0, 0.0],
+            1.0,
+        )
+        .expect("axis ray should hit");
+        assert_eq!(hit.path.len(), 4, "path length == max_depth");
+        assert_eq!(hit.face, 4, "face along -Z ray into solid = +Z face (4)");
+    }
+
+    #[test]
+    fn trace_to_hit_from_inside_empty_center_has_place_path() {
+        // Shell tree: center slot empty, 26 ring slots filled at
+        // depth 1. Ray from (0, 0, 0) along +X exits the empty
+        // center slot into the filled +X neighbor. The last empty
+        // cell traversed is the center; place_path should lead
+        // there. Face is -X of the filled cell (1): ray moves +X,
+        // enters the filled cell through its -X face.
+        let mut lib = NodeLibrary::default();
+        let mut children = uniform_children(Child::Block(1));
+        children[crate::world::tree::CENTER_SLOT] = Child::Empty;
+        let root = lib.insert(children);
+        let occ = TreeOccupancy {
+            library: &lib,
+            root,
+            max_depth: 2,
+        };
+        let hit = trace_to_hit(
+            &occ,
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            &TraceConfig::default(),
+            [0.0, 0.0, 0.0],
+            1.0,
+        )
+        .expect("ray from center should hit shell");
+        // Path = [root -> +X-neighbor slot] at depth 1.
+        assert_eq!(hit.path.len(), 1, "shell hit path depth = 1");
+        let pp = hit.place_path.as_ref().expect("place_path should be Some");
+        // Last empty cell is center — path = [(root, CENTER_SLOT)].
+        assert_eq!(pp.len(), 1);
+        assert_eq!(pp[0].1, crate::world::tree::CENTER_SLOT);
+        assert_eq!(hit.face, 1, "ray along +X enters filled cell through its -X face (1)");
     }
 }

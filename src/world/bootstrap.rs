@@ -84,11 +84,11 @@ pub enum WorldPreset {
     /// face subtrees, no Jacobian descent — the tree is a regular
     /// Cartesian ball-shape and the shader bends rays through F.
     /// See `src/world/sphere_remap.rs` + `sphere_trace.rs`.
-    RemapSphere {
-        /// Total depth of the uniform Cartesian tree. Interior is
-        /// filled with stone so a camera outside sees a silhouette.
-        layers: u8,
-    },
+    ///
+    /// Tree depth is controlled by the `--plain-layers N` CLI flag,
+    /// defaulting to 8. Storage is trivially dedup'd regardless of
+    /// depth (uniform STONE subtree collapses to one node per level).
+    RemapSphere,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -120,7 +120,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
         | WorldPreset::Stars
-        | WorldPreset::RemapSphere { .. }
+        | WorldPreset::RemapSphere
         | WorldPreset::Scene { .. } => None,
     }
 }
@@ -192,7 +192,7 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
             plain_layers.unwrap_or(40),
         ),
-        WorldPreset::RemapSphere { layers } => bootstrap_remap_sphere_world(layers),
+        WorldPreset::RemapSphere => bootstrap_remap_sphere_world(plain_layers.unwrap_or(8)),
     }
 }
 

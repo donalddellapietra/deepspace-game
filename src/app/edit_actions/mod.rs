@@ -62,7 +62,28 @@ impl App {
         // render-frame local units. The frame we use for the
         // anchor-cell-size math must match whichever path produced
         // the hit.
-        let (hit, cap_frame_path) = match self.active_frame.kind {
+        // Remap-sphere preset: the renderer dispatches
+        // `sremap_march` regardless of active_frame.kind, so the
+        // cursor must take the matching curved-space CPU path.
+        // Check this FIRST so the branch below doesn't also run.
+        // Ball center/radius mirror `SREMAP_BALL_CENTER` /
+        // `SREMAP_BALL_RADIUS` in `assets/shaders/sphere_trace.wgsl` —
+        // keep them in sync.
+        let (hit, cap_frame_path) = if self.render_as_remap_sphere {
+            let frame_path = self.active_frame.render_path;
+            let cam_local = self.camera.position.in_frame(&frame_path);
+            let ray_dir = self.ray_dir_in_frame(&frame_path);
+            let hit = raycast::cpu_raycast_in_remap_sphere_frame(
+                &self.world.library,
+                self.world.root,
+                cam_local,
+                ray_dir,
+                self.edit_depth(),
+                [1.5, 1.5, 1.5],
+                0.6,
+            );
+            (hit, frame_path)
+        } else { match self.active_frame.kind {
             ActiveFrameKind::Sphere(sphere) => {
                 let cam_body = self.camera.position.in_frame(&sphere.body_path);
                 let ray_dir_local = self.ray_dir_in_frame(&sphere.body_path);
@@ -111,29 +132,40 @@ impl App {
                 }
                 (hit, frame_path)
             }
-        };
+        }};
         // Enforce the interaction radius gate: drop hits beyond
         // `interaction_radius_cells × anchor_cell_size`. Same
         // cubic-shell LOD philosophy as the shader — out of range
         // of your current anchor locality, cursor shows no hit.
-        let hit = hit.and_then(|h| {
-            let max_t = self.interaction_range_in_frame(&cap_frame_path);
-            if h.t <= max_t {
-                Some(h)
-            } else {
-                if self.startup_profile_frames < 16 {
-                    eprintln!(
-                        "interaction_radius_reject t={:.4} max_t={:.4} cells={} anchor_depth={} frame_depth={}",
-                        h.t,
-                        max_t,
-                        self.interaction_radius_cells,
-                        self.camera.position.anchor.depth(),
-                        cap_frame_path.depth(),
-                    );
+        //
+        // Remap-sphere preset: the ball is a fixed-size visual in
+        // the root frame (radius 0.6 regardless of zoom); t is
+        // measured in root-frame units. The anchor-cell-size cap
+        // collapses to sub-ball distances at deep anchor depth, so
+        // we skip it here. Zoom-aware cursor range is a follow-up
+        // once the preset has a proper anchor-frame selection.
+        let hit = if self.render_as_remap_sphere {
+            hit
+        } else {
+            hit.and_then(|h| {
+                let max_t = self.interaction_range_in_frame(&cap_frame_path);
+                if h.t <= max_t {
+                    Some(h)
+                } else {
+                    if self.startup_profile_frames < 16 {
+                        eprintln!(
+                            "interaction_radius_reject t={:.4} max_t={:.4} cells={} anchor_depth={} frame_depth={}",
+                            h.t,
+                            max_t,
+                            self.interaction_radius_cells,
+                            self.camera.position.anchor.depth(),
+                            cap_frame_path.depth(),
+                        );
+                    }
+                    None
                 }
-                None
-            }
-        });
+            })
+        };
         if self.startup_profile_frames < 16 {
             eprintln!(
                 "frame_raycast frame={} kind={:?} render_path={:?} logical_path={:?} cam_anchor={:?} hit={}",
