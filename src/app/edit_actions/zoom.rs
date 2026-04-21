@@ -46,18 +46,41 @@ impl App {
             .min(crate::world::tree::MAX_DEPTH as u32)
     }
 
+    fn cam_local_for_frame(&self, frame: &ActiveFrame) -> [f32; 3] {
+        // For SphereSub frames, the render path contains UVR slots
+        // which are NOT Cartesian-XYZ-semantic. `in_frame` would treat
+        // them as XYZ and produce garbage cam_local; use the symbolic
+        // `in_sub_frame` that walks the camera's own UVR state.
+        match frame.kind {
+            crate::app::ActiveFrameKind::SphereSub(ref sub) => {
+                if self.camera.position.sphere.is_some() {
+                    self.camera.position.in_sub_frame(sub)
+                } else {
+                    self.camera.position.in_frame(&frame.render_path)
+                }
+            }
+            _ => self.camera.position.in_frame(&frame.render_path),
+        }
+    }
+
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
-        let cam_local = self.camera.position.in_frame(&frame.render_path);
-        cam_local.iter().all(|v| v.is_finite())
+        let cam_local = self.cam_local_for_frame(frame);
+        let fits = cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
                     ..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
                     .contains(&v)
-            })
+            });
+        let pixels = self.frame_projected_pixels(frame);
+        eprintln!(
+            "CAMERA_FITS kind={:?} render_path={:?} cam_local={:?} fits={} pixels={:.2} min_pixels={}",
+            frame.kind, frame.render_path.as_slice(), cam_local, fits, pixels, FRAME_FOCUS_MIN_PIXELS,
+        );
+        fits
     }
 
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
-        let cam_local = self.camera.position.in_frame(&frame.render_path);
+        let cam_local = self.cam_local_for_frame(frame);
         let frame_center_local = [1.5, 1.5, 1.5];
         let frame_span = WORLD_SIZE;
         let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
@@ -66,6 +89,14 @@ impl App {
         frame_span / dist * half_fov_recip
     }
 
+    pub(in crate::app) fn target_render_frame_debug_entry(&self) -> ActiveFrame {
+        let f = self.target_render_frame();
+        eprintln!(
+            "TRF_FINAL kind={:?} render_path={:?} logical_path={:?}",
+            f.kind, f.render_path.as_slice(), f.logical_path.as_slice(),
+        );
+        f
+    }
     pub(in crate::app) fn target_render_frame(&self) -> ActiveFrame {
         // Render frame depth is derived from `RENDER_ANCHOR_DEPTH`,
         // not the user's anchor depth — zoom controls interaction
@@ -119,7 +150,7 @@ impl App {
 
     pub fn apply_zoom(&mut self) {
         self.ui.zoom_level = self.zoom_level();
-        let frame = self.target_render_frame();
+        let frame = self.target_render_frame_debug_entry();
         self.active_frame = frame;
         let vd = self.visual_depth();
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);

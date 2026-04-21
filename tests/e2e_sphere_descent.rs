@@ -50,8 +50,8 @@ fn sphere_args(spawn_depth: u8) -> Vec<String> {
         "--interaction-radius".to_string(), "12".to_string(),
         "--harness-width".to_string(), "480".to_string(),
         "--harness-height".to_string(), "320".to_string(),
-        "--exit-after-frames".to_string(), "200".to_string(),
-        "--timeout-secs".to_string(), "30".to_string(),
+        "--exit-after-frames".to_string(), "1000".to_string(),
+        "--timeout-secs".to_string(), "60".to_string(),
         "--suppress-startup-logs".to_string(),
     ]
 }

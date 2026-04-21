@@ -109,9 +109,11 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 }
 
 /// Face-subtree depth at which the linearized `SphereSub` frame
-/// kicks in. Shallower face descents use the exact `Body` march
-/// because linearization error is perceptible there.
-pub const MIN_SPHERE_SUB_DEPTH: u8 = 3;
+/// kicks in. Any UVR descent is eligible — the linearization error
+/// drops geometrically with depth, and the body march has a hard
+/// precision wall past ~8 UVR levels, so SphereSub is always at
+/// least as good when a face-subtree path is available.
+pub const MIN_SPHERE_SUB_DEPTH: u8 = 1;
 
 /// Resolve the active render frame from a camera WorldPos +
 /// desired anchor depth.
@@ -144,21 +146,51 @@ pub fn compute_render_frame(
         let (un_corner, vn_corner, rn_corner, frame_size) =
             uvr_corner(&sphere.uvr_path, m_truncated as usize);
 
+        eprintln!(
+            "CRF sphere body_depth={} logical_m={} desired={} m_truncated={} MIN={}",
+            body_depth, logical_m, desired_depth, m_truncated, MIN_SPHERE_SUB_DEPTH,
+        );
         if m_truncated >= MIN_SPHERE_SUB_DEPTH as u32 {
             // Build render_path = body_path + face_root_slot +
             // uvr_path[..m_truncated].
+            let mut full_render_path = sphere.body_path;
+            full_render_path.push(FACE_SLOTS[sphere.face as usize] as u8);
+            for k in 0..m_truncated as usize {
+                full_render_path.push(sphere.uvr_path.slot(k));
+            }
+            // Walk the tree; if resolution fails (cell was broken →
+            // Child::Empty, or the subtree is uniform-empty) fall
+            // back to the DEEPEST resolvable prefix and rebuild the
+            // sub-frame at that shallower depth. Never fall back to
+            // Body — at deep UVR depth the body-march loses precision.
+            let (node_id, resolved_depth) =
+                resolve_node_prefix(library, world_root, &full_render_path);
+            // Trim the sub-frame to the resolvable depth. Use the
+            // deepest Node prefix we can reach; the walker handles
+            // Child::Empty inside the sub-frame (rendering a dug
+            // pocket as empty space) so we don't require the FULL
+            // requested path to resolve.
+            let resolved_uvr_m = (resolved_depth as i32)
+                .saturating_sub(sphere.body_path.depth() as i32 + 1)
+                .max(0) as u32;
+            eprintln!(
+                "CRF resolved_uvr_m={} resolved_depth={}",
+                resolved_uvr_m, resolved_depth,
+            );
+            if resolved_uvr_m == 0 {
+                // Render root would be the body cell itself — no UVR
+                // descent available. Fall back to Body march.
+                let logical_path = build_logical_path(sphere, desired_depth);
+                let _ = total_anchor_depth;
+                return body_frame(library, world_root, sphere, logical_path);
+            }
             let mut render_path = sphere.body_path;
             render_path.push(FACE_SLOTS[sphere.face as usize] as u8);
-            for k in 0..m_truncated as usize {
+            for k in 0..resolved_uvr_m as usize {
                 render_path.push(sphere.uvr_path.slot(k));
             }
-            // Walk the tree to resolve the sub-frame's node id.
-            let Some(node_id) = resolve_node(library, world_root, &render_path) else {
-                // Tree doesn't reach this depth (e.g., uniform chain
-                // ended early). Fall back to Body.
-                let logical_path = build_logical_path(sphere, desired_depth);
-                return body_frame(library, world_root, sphere, logical_path);
-            };
+            let (un_corner, vn_corner, rn_corner, frame_size) =
+                uvr_corner(&sphere.uvr_path, resolved_uvr_m as usize);
             let (c_body, j) = face_frame_jacobian(
                 sphere.face,
                 un_corner, vn_corner, rn_corner, frame_size,
@@ -254,6 +286,33 @@ fn resolve_node(
         }
     }
     Some(node)
+}
+
+/// Walk `path` as far as Child::Node steps allow; return the deepest
+/// reached `(node_id, depth_reached)`. Stops gracefully when a slot
+/// resolves to Child::Empty / Child::Block / Child::EntityRef — the
+/// tree has no deeper node there, but the prefix walked is valid.
+/// Used when the requested render path extends past a broken cell
+/// (Empty) and we need to render at the deepest available depth.
+fn resolve_node_prefix(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    path: &Path,
+) -> (NodeId, u8) {
+    let mut node = world_root;
+    let mut reached = 0u8;
+    for k in 0..path.depth() as usize {
+        let Some(n) = library.get(node) else { break };
+        let slot = path.slot(k) as usize;
+        match n.children[slot] {
+            Child::Node(next) => {
+                node = next;
+                reached = (k + 1) as u8;
+            }
+            _ => break,
+        }
+    }
+    (node, reached)
 }
 
 /// Sum UVR-slot coord contributions from `uvr_path[..m]` into

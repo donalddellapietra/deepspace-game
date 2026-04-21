@@ -61,6 +61,13 @@ impl App {
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
         let intended_frame = self.target_render_frame();
+        eprintln!(
+            "UPLOAD_ENTRY cam_sphere={:?} cam_anchor={:?} intended_kind={:?} intended_render_path={:?}",
+            self.camera.position.sphere.map(|s| (s.face, s.uvr_path.depth())),
+            self.camera.position.anchor.as_slice(),
+            intended_frame.kind,
+            intended_frame.render_path.as_slice(),
+        );
         let effective_visual_depth = self.visual_depth();
         let upload_key = LodUploadKey::new(self.world.root);
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
@@ -215,6 +222,12 @@ impl App {
         // intended render depth. Re-resolve the active frame at the
         // effective truncated depth, using the camera's WorldPos so
         // sphere state is preserved.
+        eprintln!(
+            "UPLOAD intended_render_path={:?} effective_path={:?} (len={})",
+            intended_render_path.as_slice(),
+            effective_path.as_slice(),
+            effective_path.depth(),
+        );
         let effective_render = frame::compute_render_frame(
             &self.world.library,
             self.world.root,

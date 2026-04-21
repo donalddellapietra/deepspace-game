@@ -228,6 +228,106 @@ impl WorldPos {
         p
     }
 
+    /// Construct a WorldPos at `anchor` / `offset` and populate
+    /// `sphere` by walking the tree to detect a `CubedSphereBody`
+    /// along the path. If the anchor crosses a body, the prefix
+    /// leading to the body becomes `body_path`, the next slot is
+    /// interpreted as the face root slot, and the rest becomes the
+    /// UVR descent. `uvr_offset` is set to the caller-provided
+    /// `offset` (assumed to already be in the camera's deepest UVR
+    /// cell's local [0, 1)³).
+    ///
+    /// This is the sphere-aware constructor for callers that build
+    /// anchors mixing Cartesian + UVR slots (e.g.,
+    /// `teleport_above_last_edit` after a sphere break). Plain
+    /// Cartesian anchors (no body crossing) round-trip to
+    /// `Self::new(anchor, offset)` with `sphere = None`.
+    pub fn new_with_sphere_resolved(
+        anchor: Path,
+        offset: [f32; 3],
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) -> Self {
+        use crate::world::cubesphere::Face;
+        use crate::world::tree::{Child, NodeKind};
+        let mut node = world_root;
+        let mut body_info: Option<(u8, f32, f32)> = None;
+        let mut body_depth: u8 = 0;
+        for k in 0..anchor.depth() as usize {
+            let Some(n) = library.get(node) else { break };
+            let slot = anchor.slot(k) as usize;
+            match n.kind {
+                NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                    body_info = Some((k as u8, inner_r, outer_r));
+                    body_depth = k as u8;
+                    break;
+                }
+                _ => {}
+            }
+            match n.children[slot] {
+                Child::Node(next) => node = next,
+                _ => break,
+            }
+        }
+        // Also check the final node after the loop.
+        if body_info.is_none() {
+            if let Some(n) = library.get(node) {
+                if let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind {
+                    body_info = Some((anchor.depth(), inner_r, outer_r));
+                    body_depth = anchor.depth();
+                }
+            }
+        }
+        let Some((_, inner_r, outer_r)) = body_info else {
+            let mut p = Self { anchor, offset, sphere: None };
+            p.renormalize_cartesian();
+            return p;
+        };
+        // body_depth = number of Cartesian slots before the body.
+        // The slot AT index body_depth lives inside the body — that's
+        // the face-root slot.  Slots [body_depth + 1 ..] are UVR.
+        let face_slot_idx = body_depth as usize;
+        if (face_slot_idx) >= anchor.depth() as usize {
+            // Anchor ends exactly AT the body; no face slot yet. This
+            // is legal — e.g., the camera occupies the body cell but
+            // hasn't descended. Leave sphere state unset for now; a
+            // later zoom_in + maybe_enter_sphere will establish it.
+            let mut p = Self { anchor, offset, sphere: None };
+            p.renormalize_cartesian();
+            return p;
+        }
+        let face_slot = anchor.slot(face_slot_idx);
+        let Some(face) = Face::from_body_slot(face_slot) else {
+            // Slot isn't one of the six face slots (e.g., core slot).
+            // Treat as plain Cartesian.
+            let mut p = Self { anchor, offset, sphere: None };
+            p.renormalize_cartesian();
+            return p;
+        };
+        // Build body_path as the anchor truncated to body_depth.
+        let body_path = anchor.with_truncated(body_depth);
+        // Build UVR path from slots AFTER the face root slot.
+        let mut uvr_path = Path::root();
+        for k in (face_slot_idx + 1)..(anchor.depth() as usize) {
+            uvr_path.push(anchor.slot(k));
+        }
+        // Invariant: when sphere is Some, `anchor == sphere.body_path`.
+        // The face-slot + UVR descent live in sphere.uvr_path so
+        // `total_depth()` doesn't double-count them.
+        Self {
+            anchor: body_path,
+            offset,
+            sphere: Some(SphereState {
+                body_path,
+                inner_r,
+                outer_r,
+                face,
+                uvr_path,
+                uvr_offset: offset,
+            }),
+        }
+    }
+
     pub const fn root_origin() -> Self {
         Self { anchor: Path::root(), offset: [0.0, 0.0, 0.0], sphere: None }
     }

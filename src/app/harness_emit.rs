@@ -19,7 +19,32 @@ use super::App;
 use super::test_runner::ScriptCmd;
 use crate::world::anchor::{Path, WorldPos};
 use crate::world::raycast::HitInfo;
-use crate::world::tree::slot_index;
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
+
+/// Walk `path` from `root`; return true if any step's node has
+/// `CubedSphereBody` kind. Used to detect whether a stored edit path
+/// refers to a sphere cell (UVR slots) or a Cartesian cell (XYZ slots).
+fn path_crosses_sphere_body(
+    library: &NodeLibrary, root: NodeId, path: &Path,
+) -> bool {
+    let mut node = root;
+    for k in 0..path.depth() as usize {
+        let Some(n) = library.get(node) else { return false };
+        if matches!(n.kind, NodeKind::CubedSphereBody { .. }) {
+            return true;
+        }
+        let slot = path.slot(k) as usize;
+        match n.children[slot] {
+            Child::Node(next) => node = next,
+            _ => return false,
+        }
+    }
+    if let Some(n) = library.get(node) {
+        matches!(n.kind, NodeKind::CubedSphereBody { .. })
+    } else {
+        false
+    }
+}
 
 /// Format a slot path as `[13,13,13,16]`.
 fn path_repr(hit: &HitInfo) -> String {
@@ -172,17 +197,25 @@ impl App {
         );
     }
 
-    /// Position the camera inside the bottom-center child of the
+    /// Position the camera inside the "above the edit" child of the
     /// last-broken cell. Intended use: after `zoom_in:1` following a
     /// break, this drops the camera "one current-layer cell above the
     /// new ground" in the descent flow.
     ///
     /// The path is constructed symbolically rather than via world-xyz
     /// arithmetic. At deep anchors, `1.5 + 3^{-17}` collapses to `1.5`
-    /// in f32 (cell size ≈ 2e-8 below f32's ~7-digit precision at
-    /// y≈1), which caused `from_frame_local(target_xyz, 17)` to land
-    /// in the wrong (solid) cell. Walking `last_edit_slots + [slot
-    /// (1,0,1)]*k` is exact at any depth.
+    /// in f32, so walking `last_edit_slots + [above_slot]*k` is the
+    /// only way to land in the right cell at any depth.
+    ///
+    /// For sphere hits, "above the edit" = +r_local (slot (1, 1, 2)
+    /// in UVR), so the camera sits at the outer radial face of the
+    /// broken cell looking inward (toward core). For Cartesian hits,
+    /// "above" = +y (slot (1, 0, 1) in XYZ's bottom-center, where the
+    /// camera then looks -y at the cell it just broke).
+    ///
+    /// After setting the anchor, `WorldPos::new_with_sphere_resolved`
+    /// walks the tree to repopulate `SphereState` so subsequent
+    /// zoom_in / probe / render all see the sphere context.
     pub(super) fn teleport_above_last_edit(&mut self) {
         let Some(last) = self.last_edit_slots else {
             eprintln!("teleport_above_last_edit: no last edit recorded; skipping");
@@ -196,17 +229,41 @@ impl App {
             );
             return;
         }
-        let mut anchor = last;
-        let bottom_center = slot_index(1, 0, 1) as u8;
-        while anchor.depth() < current_depth {
-            anchor.push(bottom_center);
-        }
-        // Camera at the center of the final cell.
-        self.camera.position = WorldPos::new(anchor, [0.5, 0.5, 0.5]);
-        self.apply_zoom();
-        eprintln!(
-            "teleport_above_last_edit: broken_path={:?} final_anchor={:?} current_depth={}",
-            last.as_slice(), anchor.as_slice(), current_depth,
+        // Detect whether `last` crosses a CubedSphereBody: if so, the
+        // descent slots are UVR-semantic and "above" means +r, not -y.
+        let in_sphere = path_crosses_sphere_body(
+            &self.world.library, self.world.root, &last,
         );
+        let mut anchor = last;
+        let above_slot = if in_sphere {
+            // UVR (u, v, r) = (1, 1, 2) → outer-radial, center-u/v.
+            slot_index(1, 1, 2) as u8
+        } else {
+            // Cartesian bottom-center.
+            slot_index(1, 0, 1) as u8
+        };
+        while anchor.depth() < current_depth {
+            anchor.push(above_slot);
+        }
+        // Camera at the center of the final cell; `new_with_sphere_resolved`
+        // walks the tree so deep anchors inside a body re-establish
+        // SphereState automatically.
+        self.camera.position = if in_sphere {
+            WorldPos::new_with_sphere_resolved(
+                anchor,
+                [0.5, 0.5, 0.5],
+                &self.world.library,
+                self.world.root,
+            )
+        } else {
+            WorldPos::new(anchor, [0.5, 0.5, 0.5])
+        };
+        eprintln!(
+            "teleport_above_last_edit: broken_path={:?} final_anchor={:?} current_depth={} sphere={} cam_sphere_after={:?}",
+            last.as_slice(), anchor.as_slice(), current_depth, in_sphere,
+            self.camera.position.sphere.map(|s| (s.face, s.uvr_path.depth())),
+        );
+        self.apply_zoom();
+        eprintln!("teleport_above_last_edit: post_apply_zoom active_frame.kind={:?}", self.active_frame.kind);
     }
 }

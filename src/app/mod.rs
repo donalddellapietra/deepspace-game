@@ -491,7 +491,11 @@ impl App {
 
     #[inline]
     pub(super) fn anchor_depth(&self) -> u32 {
-        self.camera.position.anchor.depth() as u32
+        // User-visible "zoom level". Inside a sphere body this is
+        // the symbolic total depth (Cartesian anchor + face-root
+        // slot + UVR descent). Outside sphere it's just the anchor's
+        // Cartesian depth.
+        self.camera.position.total_depth() as u32
     }
 
     #[inline]

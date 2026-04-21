@@ -44,6 +44,18 @@ impl Face {
         }
     }
 
+    /// Inverse of `FACE_SLOTS[face as usize]`. Returns `None` if the
+    /// slot is not one of the six face slots (e.g., the core slot).
+    pub fn from_body_slot(slot: u8) -> Option<Face> {
+        let s = slot as usize;
+        for (i, &fs) in FACE_SLOTS.iter().enumerate() {
+            if s == fs {
+                return Some(Face::from_index(i as u8));
+            }
+        }
+        None
+    }
+
     pub fn normal(self) -> Vec3 {
         match self {
             Face::PosX => [ 1.0,  0.0,  0.0],

@@ -76,6 +76,11 @@ impl App {
                 let cam_local = self.camera.position.in_sub_frame(&sub);
                 let ray_dir_body = self.ray_dir_in_frame(&sub.body_path);
                 let render_path = sub.render_path;
+                eprintln!(
+                    "SUB_RAYCAST render_path={:?} cam_local={:?} rd_body={:?} edit_depth={} sub_depth_levels={}",
+                    render_path.as_slice(), cam_local, ray_dir_body,
+                    self.edit_depth(), sub.depth_levels(),
+                );
                 let hit = raycast::cpu_raycast_in_sub_frame(
                     &self.world.library,
                     self.world.root,
@@ -86,6 +91,7 @@ impl App {
                     self.edit_depth(),
                     lod,
                 );
+                eprintln!("SUB_RAYCAST_RESULT hit_some={}", hit.is_some());
                 (hit, sub.body_path)
             }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
@@ -138,16 +144,17 @@ impl App {
                 None
             }
         });
+        eprintln!(
+            "frame_raycast frame={} kind={:?} render_path={:?} logical_path={:?} cam_anchor={:?} cam_sphere={:?} hit={}",
+            self.startup_profile_frames,
+            self.active_frame.kind,
+            self.active_frame.render_path.as_slice(),
+            self.active_frame.logical_path.as_slice(),
+            self.camera.position.anchor.as_slice(),
+            self.camera.position.sphere.map(|s| (s.face, s.uvr_path.depth())),
+            hit.is_some(),
+        );
         if self.startup_profile_frames < 16 {
-            eprintln!(
-                "frame_raycast frame={} kind={:?} render_path={:?} logical_path={:?} cam_anchor={:?} hit={}",
-                self.startup_profile_frames,
-                self.active_frame.kind,
-                self.active_frame.render_path.as_slice(),
-                self.active_frame.logical_path.as_slice(),
-                self.camera.position.anchor.as_slice(),
-                hit.is_some(),
-            );
             if let Some(ref h) = hit {
                 // Sphere hits always use `hit_aabb_body_local` (the
                 // body-local cube derived from the hit cell's face-
