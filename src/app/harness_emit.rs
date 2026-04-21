@@ -151,6 +151,7 @@ impl App {
             ScriptCmd::ProbeDown => self.harness_probe_down(),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
             ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
+            ScriptCmd::TeleportIntoLastEdit => self.teleport_into_last_edit(),
             ScriptCmd::Step { axis, delta } => {
                 let mut d = [0.0f32; 3];
                 d[axis as usize] = delta;
@@ -265,5 +266,36 @@ impl App {
         );
         self.apply_zoom();
         eprintln!("teleport_above_last_edit: post_apply_zoom active_frame.kind={:?}", self.active_frame.kind);
+    }
+
+    /// Teleport the camera INTO the most recent dug cell, not the
+    /// cell above it. Sets anchor = last_edit_slots, offset = (0.5,
+    /// 0.5, 0.5). Rays from here look at the pit's walls / floor /
+    /// ceiling from inside the empty cell.
+    pub(super) fn teleport_into_last_edit(&mut self) {
+        let Some(last) = self.last_edit_slots else {
+            eprintln!("teleport_into_last_edit: no last edit recorded; skipping");
+            return;
+        };
+        let in_sphere = path_crosses_sphere_body(
+            &self.world.library, self.world.root, &last,
+        );
+        self.camera.position = if in_sphere {
+            WorldPos::new_with_sphere_resolved(
+                last,
+                [0.5, 0.5, 0.5],
+                &self.world.library,
+                self.world.root,
+            )
+        } else {
+            WorldPos::new(last, [0.5, 0.5, 0.5])
+        };
+        eprintln!(
+            "teleport_into_last_edit: anchor={:?} depth={} sphere={} cam_sphere_after={:?}",
+            last.as_slice(), last.depth(), in_sphere,
+            self.camera.position.sphere.map(|s| (s.face, s.uvr_path.depth())),
+        );
+        self.apply_zoom();
+        eprintln!("teleport_into_last_edit: post_apply_zoom active_frame.kind={:?}", self.active_frame.kind);
     }
 }

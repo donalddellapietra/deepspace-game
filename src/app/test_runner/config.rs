@@ -157,6 +157,11 @@ pub enum ScriptCmd {
     /// the camera to "one layer-N cell above the new ground" (where N
     /// is the current UI layer), matching the descent flow.
     TeleportAboveLastEdit,
+    /// Teleport the camera INTO the center of the dug pit (the cell
+    /// at the last-edit anchor itself, not above it). Intended for
+    /// debug views where we want to see the pit walls from INSIDE
+    /// rather than a sub-pixel view of the pit from the surface.
+    TeleportIntoLastEdit,
 }
 
 impl TestConfig {
@@ -401,6 +406,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
+            if raw == "teleport_into_last_edit" { return Some(ScriptCmd::TeleportIntoLastEdit); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }
