@@ -46,14 +46,10 @@ pub const RENDER_FRAME_CONTEXT: u8 = 4;
 ///
 /// # Bound
 ///
-/// 14 sits just below the f32 offset precision limit: 3⁻¹⁴ ≈ 2e-7
-/// is near the mantissa resolution, so `deepened_to(14)` still
-/// produces a well-defined sub-cell offset. Pushing to 15+ starts
-/// losing significance in the trailing digits. Combined with the
-/// 5-level DDA stack (`MAX_STACK_DEPTH`) this gives an effective
-/// visible depth of ~19 levels at any zoom — enough to show our
-/// 20-level fractals at pixel fidelity everywhere.
-pub const RENDER_ANCHOR_DEPTH: u8 = 14;
+/// Disabled (= MAX_DEPTH) to let the render frame follow the
+/// actual camera anchor. The prior 14 cap was an f32-precision
+/// workaround for the shader's `ray_dir /= 3` per-pop scheme.
+pub const RENDER_ANCHOR_DEPTH: u8 = MAX_DEPTH as u8;
 pub mod cursor;
 pub mod edit_actions;
 pub mod event_loop;

@@ -852,15 +852,18 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;
-            // Transform cell_min/cell_size from the popped frame back
-            // to the camera frame so the fragment shader's bevel/grid
-            // computation uses consistent coordinates.
+            // r.t is FRAME-LOCAL t (ray_dir is kept at camera-frame
+            // magnitude across pops, so each frame's inner DDA computes
+            // a local t, bounded O(1)). Convert to camera-frame t for
+            // the caller and for cell_min/cell_size anchoring.
+            //   t_camera = t_frame / cur_scale   (cur_scale = 1/3^N)
             if cur_scale < 1.0 {
                 let hit_popped = ray_origin + ray_dir * r.t;
                 let cell_local = clamp(
                     (hit_popped - r.cell_min) / r.cell_size,
                     vec3<f32>(0.0), vec3<f32>(1.0),
                 );
+                r.t = r.t / cur_scale;
                 let hit_camera = world_ray_origin + world_ray_dir * r.t;
                 r.cell_size = r.cell_size / cur_scale;
                 r.cell_min = hit_camera - cell_local * r.cell_size;
@@ -932,8 +935,16 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 let sz = i32(s / 9u);
                 let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
                 skip_slot = s;
+                // Ray pop: rescale origin into parent's [0,3)³, keep
+                // ray_dir at camera-frame magnitude. The old scheme
+                // divided ray_dir by 3 on every pop, which kept `t`
+                // invariant across frames but caused ray_dir to
+                // underflow after ~18 pops (3^-18 ≈ 6e-9). With
+                // ray_dir preserved, each frame's DDA runs with O(1)
+                // precision; t inside march_cartesian is frame-local.
+                // Camera-frame t is recovered on hit return as
+                // t_cam = t_frame / cur_scale.
                 ray_origin = slot_off + ray_origin / 3.0;
-                ray_dir = ray_dir / 3.0;
                 cur_scale = cur_scale * (1.0 / 3.0);
                 current_idx = entry.node_idx;
                 ribbon_level = ribbon_level + 1u;
