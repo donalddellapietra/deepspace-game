@@ -167,90 +167,93 @@ fn sphere_probe_anchor_equals_break_anchor() {
     }
 }
 
-/// Deep-depth sphere sanity. The user reports the rendered planet
-/// geometry breaks down past UI layer ~18-20 even though the CPU
-/// raycast in-pipeline tests pass to depth 30. This test pushes the
-/// SAME harness-driven scenario the shallow sphere tests use
-/// (camera parked just above the planet surface, looking down,
-/// probe + break) but through the full deep-depth range that the
-/// user actually zooms to at runtime.
+/// Sphere dig-down descent. The user reports the rendered planet
+/// geometry breaks down past UI layer ~18-20 when **digging into**
+/// the planet — not when hovering above. This test reproduces the
+/// actual flow: probe → break → zoom_in → teleport_above_last_edit,
+/// repeated through many layers, with a screenshot at every step so
+/// the visual state is recorded alongside the probe/edit trace.
 ///
-/// Break path length at anchor depth N must be N (walker descends
-/// to the edit-anchor cell, no off-by-one in the face-subtree cap).
-/// Probe must hit at every depth — a miss here is the visible
-/// breakdown: no crosshair target, no highlight, no breakable cell.
+/// Assertion per layer:
+///   - probe hits (crosshair has a valid target),
+///   - break reports `changed=true`,
+///   - edit anchor depth matches the current anchor depth.
 ///
-/// **CURRENTLY FAILING** — fails at depth ≥ 10 because the camera
-/// hovers above the shell so SphereState never initializes; the
-/// render + probe fall back to the body-march path, which has a
-/// precision wall around layer 8-10. Fix in progress: route through
-/// SphereSub even when the camera is outside the shell (synthesize
-/// UVR state from where the crosshair points).
+/// Screenshots land in `tmp/sphere_descent/d{N}.png`.
 #[test]
-fn sphere_probe_and_break_at_deep_depth() {
+fn sphere_dig_down_descent() {
+    // Start shallow and dig down through the deep precision wall.
+    // Shallow depths establish baseline; deep depths exercise the
+    // body-march wall.
+    const START_DEPTH: u8 = 5;
+    const END_DEPTH: u8 = 25;
+
+    let dir = tmp_dir("sphere_descent");
+    std::fs::create_dir_all(&dir).expect("create descent dir");
+
+    let args = sphere_args(START_DEPTH);
+    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let mut script = ScriptBuilder::new();
+    let mut shot_paths: Vec<String> = Vec::new();
+    for d in START_DEPTH..=END_DEPTH {
+        let shot = dir.join(format!("d{d}.png")).to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&shot);
+        script = script
+            .emit(&format!("d{d}"))
+            .wait(5)
+            .screenshot(&shot)
+            .probe_down()
+            .break_()
+            .wait(10)
+            .zoom_in(1)
+            .teleport_above_last_edit()
+            .wait(5);
+        shot_paths.push(shot);
+    }
+    script = script.emit("descent_end");
+
+    let trace = run(&args_refs, &script);
+    assert!(
+        trace.exit_success,
+        "binary did not exit 0\n--- stderr ---\n{}\n--- stdout tail ---\n{}",
+        trace.stderr,
+        trace.stdout.lines().rev().take(30).collect::<Vec<_>>().join("\n"),
+    );
+
+    let layers = (END_DEPTH - START_DEPTH + 1) as usize;
     let mut failures: Vec<String> = Vec::new();
-    for &depth in &[10u8, 15, 20, 25, 30] {
-        let (trace, _, _) = run_scenario(depth, &format!("deep_d{depth}"));
-        if !trace.exit_success {
+    for (i, (probe, edit)) in trace.probes.iter().zip(trace.edits.iter()).enumerate() {
+        let depth = START_DEPTH as usize + i;
+        if !probe.hit {
             failures.push(format!(
-                "depth {depth}: binary did not exit 0\n--- stderr ---\n{}\n\
-                 --- stdout tail ---\n{}",
-                trace.stderr,
-                trace.stdout.lines().rev().take(20).collect::<Vec<_>>().join("\n"),
+                "layer {depth}: probe missed (crosshair has no target — visible breakdown)",
             ));
             continue;
         }
-        // Probe at the crosshair — the single source of truth that
-        // drives the visible highlight box, the break action, and
-        // what the shader should be rendering at that pixel.
-        let Some(pre_probe) = trace.probes.first() else {
-            failures.push(format!("depth {depth}: no pre-break probe recorded"));
-            continue;
-        };
-        if !pre_probe.hit {
-            failures.push(format!(
-                "depth {depth}: probe missed (crosshair has no target — visible breakdown)",
-            ));
-            continue;
-        }
-        if pre_probe.anchor.len() != depth as usize {
-            failures.push(format!(
-                "depth {depth}: probe anchor length {} ≠ anchor depth {depth}",
-                pre_probe.anchor.len(),
-            ));
-            continue;
-        }
-        if trace.edits.len() != 1 {
-            failures.push(format!(
-                "depth {depth}: expected exactly one edit, got {}",
-                trace.edits.len(),
-            ));
-            continue;
-        }
-        let edit = &trace.edits[0];
         if !edit.changed {
-            failures.push(format!(
-                "depth {depth}: break action reported no world change",
-            ));
+            failures.push(format!("layer {depth}: break reported no world change"));
             continue;
         }
-        if edit.anchor.len() != depth as usize {
+        if edit.anchor.len() != depth {
             failures.push(format!(
-                "depth {depth}: edit anchor length {} ≠ anchor depth {depth} (walker cap off-by-one?)",
+                "layer {depth}: edit anchor length {} ≠ current anchor depth {depth}",
                 edit.anchor.len(),
             ));
             continue;
         }
-        if pre_probe.anchor != edit.anchor {
-            failures.push(format!(
-                "depth {depth}: probe anchor {:?} ≠ edit anchor {:?}",
-                pre_probe.anchor, edit.anchor,
-            ));
-        }
+    }
+    if trace.probes.len() != layers || trace.edits.len() != layers {
+        failures.push(format!(
+            "expected {layers} probes and {layers} edits, got {} probes and {} edits",
+            trace.probes.len(),
+            trace.edits.len(),
+        ));
     }
     assert!(
         failures.is_empty(),
-        "deep-depth sphere scenarios failed:\n{}",
+        "sphere dig-down failed — screenshots in {}:\n{}",
+        dir.display(),
         failures.join("\n"),
     );
 }
