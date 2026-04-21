@@ -68,7 +68,17 @@ struct Uniforms {
     sub_j_inv_col1: vec4<f32>,
     sub_j_inv_col2: vec4<f32>,
     sub_face_corner: vec4<f32>,
+    /// x = face index, y = UVR pre-descent prefix length,
+    /// z = face-root depth (= body_path.depth() + 1 — the minimum
+    /// `uvr_prefix_len` before a neighbor-step bubble-up becomes a
+    /// cross-face transition; used as the terminate-threshold by the
+    /// sphere-sub DDA), w = pad.
     sub_meta: vec4<u32>,
+    /// UVR slots the shader walker pre-descends from the face-root
+    /// (root_index) before starting intra-cell DDA. Only the first
+    /// `sub_meta.y` entries across the whole array are valid.
+    /// Laid out as 16 × vec4<u32> to hit the std140 16-byte stride.
+    sub_uvr_slots: array<vec4<u32>, 16>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;

@@ -9,8 +9,15 @@
 //!   * `SphereSub` — render root is a face-subtree cell at
 //!     face-subtree depth ≥ `MIN_SPHERE_SUB_DEPTH`. Shader runs
 //!     the linearized ribbon-pop DDA in the frame's local
-//!     `[0, 3)³`. See `docs/design/sphere-ribbon-pop-impl-plan.md`
-//!     and `docs/design/sphere-ribbon-pop-uvr-state.md`.
+//!     `[0, 3)³`. The sub-frame is always built at the camera's
+//!     deep `m_truncated` UVR depth so the Jacobian's evaluation
+//!     point sits at the true render corner; pre-descent through
+//!     `Child::Empty` links is handled symbolically by the walker,
+//!     and rays that exit the sub-frame's local box transition to
+//!     the neighbor sub-frame via `with_neighbor_stepped` — symbolic
+//!     UVR-path stepping + fresh Jacobian. Cross-face transitions
+//!     terminate the DDA (deferred to a follow-up commit).
+//!     See `docs/design/sphere-ribbon-pop-two-step.md`.
 //!
 //! The `SphereSub` path depends on the camera carrying symbolic UVR
 //! state (`WorldPos.sphere`). When the camera is inside a body,
@@ -38,12 +45,21 @@ use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 pub struct SphereSubFrame {
     /// Path from world root to the containing `CubedSphereBody`.
     pub body_path: Path,
-    /// Full path world-root → body → face-root → UVR descent. This
-    /// is the **render path** consumed by CPU raycast / ribbon-pop
-    /// infrastructure — the last entry is the sub-frame's node.
-    pub render_path: Path,
     /// Face this sub-frame lives on.
     pub face: Face,
+    /// NodeId of the face-subtree root — always `body + face_slot`,
+    /// so this resolves deterministically regardless of how deep the
+    /// UVR descent reaches into the tree (the UVR descent itself may
+    /// cross `Child::Empty` links for dug-out regions). The local
+    /// walker pre-descends from this root along `uvr_path_prefix`
+    /// before starting intra-cell DDA.
+    pub face_root_id: NodeId,
+    /// Full path world-root → body → face-root → UVR descent. This
+    /// is the **render path** consumed by CPU raycast / ribbon-pop
+    /// infrastructure — the last entry is the sub-frame's deep cell.
+    /// May contain slots whose tree link is `Child::Empty`; the
+    /// walker treats those as uniform-empty sub-frame content.
+    pub render_path: Path,
     /// Absolute face-normalized coords of the sub-frame's corner —
     /// local (0,0,0) in face `[0, 1)³`.
     pub un_corner: f32,
@@ -72,6 +88,113 @@ impl SphereSubFrame {
         (self.render_path.depth() as u32)
             .saturating_sub(self.body_path.depth() as u32)
             .saturating_sub(1)
+    }
+
+    /// Construct the neighbor sub-frame one local-axis step away along
+    /// `axis ∈ {0, 1, 2}` in direction `direction ∈ {+1, −1}`. Used by
+    /// `cs_raycast_local` (CPU) + the shader mirror when a ray exits
+    /// the current sub-frame's local `[0, 3)³` box and needs to keep
+    /// marching into the adjacent deep cell.
+    ///
+    /// Path stepping uses `Path::step_neighbor_cartesian` — the slot
+    /// packing is the same for UVR as it is for XYZ (the semantic
+    /// difference is handled by `face_frame_jacobian`, which reads the
+    /// UVR-corner coords we adjust here).
+    ///
+    /// Returns `None` if the step would bubble past the face-root slot
+    /// (the slot at `body_path.depth()` in `render_path`) — i.e., the
+    /// step touched a path level at or above the face root. That's a
+    /// cross-face transition and is deferred to a future commit; the
+    /// CPU / GPU callers terminate their DDA in that case.
+    ///
+    /// `Path::step_neighbor_cartesian` preserves the path's depth via
+    /// unwind-and-repush; we detect the boundary crossing by checking
+    /// whether the face-root slot at `body_path.depth()` still holds
+    /// the expected `FACE_SLOTS[face]` value.
+    pub fn with_neighbor_stepped(&self, axis: usize, direction: i32) -> Option<Self> {
+        debug_assert!(axis < 3);
+        debug_assert!(direction == 1 || direction == -1);
+
+        // Pre-check: can the step land within the face subtree?
+        // `step_neighbor_cartesian` bubbles on overflow, and when the
+        // bubble reaches `depth == 0` it silently returns (no-op)
+        // while still wrapping child slots on unwind — producing a
+        // "fake" step that doesn't actually advance the path. That
+        // would mis-report a cross-face situation as success. We
+        // detect it by checking whether any UVR level (past the face
+        // root) has an axis-coord NOT at the overflow boundary; if
+        // every UVR level is boundary-pinned for this direction, the
+        // step would bubble past the face root.
+        let face_root_idx = self.body_path.depth() as usize;
+        if (self.render_path.depth() as usize) <= face_root_idx + 1 {
+            return None; // no UVR descent to step
+        }
+        let boundary = if direction > 0 { 2usize } else { 0usize };
+        let mut can_step_in_face = false;
+        for level in (face_root_idx + 1..self.render_path.depth() as usize).rev() {
+            let slot = self.render_path.slot(level) as usize;
+            let (us, vs, rs) = crate::world::tree::slot_coords(slot);
+            let coord = match axis { 0 => us, 1 => vs, _ => rs };
+            if coord != boundary {
+                can_step_in_face = true;
+                break;
+            }
+        }
+        if !can_step_in_face {
+            // Would bubble past face root — cross-face transition
+            // (deferred to a future commit).
+            return None;
+        }
+
+        let mut new_path = self.render_path;
+        new_path.step_neighbor_cartesian(axis, direction);
+
+        // Belt-and-suspenders: after the step, the face-root slot
+        // must still hold the expected `FACE_SLOTS[face]` value.
+        if new_path.depth() as usize <= face_root_idx
+            || new_path.slot(face_root_idx) != FACE_SLOTS[self.face as usize] as u8
+        {
+            return None;
+        }
+
+        // Incremental corner update. `un_corner + frame_size` per +axis
+        // step (and the reverse for −axis). Bubble-up preserves this:
+        // at the parent level `frame_size` is 3×, but the child moves
+        // from 2→0 (wrap with parent++) or 0→2 (wrap with parent−−) —
+        // net delta on the axis sum is still ±frame_size.
+        let d = direction as f32;
+        let mut un = self.un_corner;
+        let mut vn = self.vn_corner;
+        let mut rn = self.rn_corner;
+        match axis {
+            0 => un += d * self.frame_size,
+            1 => vn += d * self.frame_size,
+            _ => rn += d * self.frame_size,
+        }
+
+        let (c_body, j) = crate::world::cubesphere::face_frame_jacobian(
+            self.face,
+            un, vn, rn, self.frame_size,
+            self.inner_r, self.outer_r,
+            3.0,
+        );
+        let j_inv = crate::world::cubesphere::mat3_inv(&j);
+
+        Some(SphereSubFrame {
+            body_path: self.body_path,
+            face: self.face,
+            face_root_id: self.face_root_id,
+            render_path: new_path,
+            un_corner: un,
+            vn_corner: vn,
+            rn_corner: rn,
+            frame_size: self.frame_size,
+            inner_r: self.inner_r,
+            outer_r: self.outer_r,
+            c_body,
+            j,
+            j_inv,
+        })
     }
 }
 
@@ -130,67 +253,51 @@ pub fn compute_render_frame(
     desired_depth: u8,
 ) -> ActiveFrame {
     // Sphere case: symbolic UVR state provides everything we need.
-    // Build the sub-frame directly, no tree-walk decoding.
+    // Build the sub-frame ALWAYS at the camera's deep `m_truncated`
+    // UVR depth. The face-subtree root resolves via `body_path +
+    // face_slot` — that chain is guaranteed to be `Child::Node` at
+    // every step by world construction, so `face_root_id` is always
+    // present. The UVR pre-descent past the face root may hit
+    // `Child::Empty` for dug regions; the walker handles those
+    // symbolically without requiring a real Node at the deep path.
     if let Some(sphere) = camera.sphere.as_ref() {
         let logical_m = sphere.uvr_path.depth();
-        // Target face-subtree depth after `desired_depth` truncation.
-        // `desired_depth` is the OVERALL anchor depth; subtract the
-        // body-path length + 1 for the face-root slot to get the
-        // UVR depth we want to render at.
         let body_depth = sphere.body_path.depth() as i32;
-        let total_anchor_depth = body_depth + 1 + logical_m as i32;
         let m_logical = logical_m as i32;
         let m_truncated = (desired_depth as i32 - body_depth - 1).clamp(0, m_logical) as u32;
-
-        // Accumulate un/vn/rn from the first `m_truncated` UVR slots.
-        let (un_corner, vn_corner, rn_corner, frame_size) =
-            uvr_corner(&sphere.uvr_path, m_truncated as usize);
 
         eprintln!(
             "CRF sphere body_depth={} logical_m={} desired={} m_truncated={} MIN={}",
             body_depth, logical_m, desired_depth, m_truncated, MIN_SPHERE_SUB_DEPTH,
         );
+
         if m_truncated >= MIN_SPHERE_SUB_DEPTH as u32 {
-            // Build render_path = body_path + face_root_slot +
-            // uvr_path[..m_truncated].
-            let mut full_render_path = sphere.body_path;
-            full_render_path.push(FACE_SLOTS[sphere.face as usize] as u8);
-            for k in 0..m_truncated as usize {
-                full_render_path.push(sphere.uvr_path.slot(k));
-            }
-            // Walk the tree; if resolution fails (cell was broken →
-            // Child::Empty, or the subtree is uniform-empty) fall
-            // back to the DEEPEST resolvable prefix and rebuild the
-            // sub-frame at that shallower depth. Never fall back to
-            // Body — at deep UVR depth the body-march loses precision.
-            let (node_id, resolved_depth) =
-                resolve_node_prefix(library, world_root, &full_render_path);
-            // Trim the sub-frame to the resolvable depth. Use the
-            // deepest Node prefix we can reach; the walker handles
-            // Child::Empty inside the sub-frame (rendering a dug
-            // pocket as empty space) so we don't require the FULL
-            // requested path to resolve.
-            let resolved_uvr_m = (resolved_depth as i32)
-                .saturating_sub(sphere.body_path.depth() as i32 + 1)
-                .max(0) as u32;
-            eprintln!(
-                "CRF resolved_uvr_m={} resolved_depth={}",
-                resolved_uvr_m, resolved_depth,
-            );
-            if resolved_uvr_m == 0 {
-                // Render root would be the body cell itself — no UVR
-                // descent available. Fall back to Body march.
+            // Resolve the face-subtree root. Always reachable for a
+            // valid sphere body + face; degeneracy (missing face
+            // root) falls back to Body march so the renderer has
+            // something to dispatch.
+            let mut face_root_path = sphere.body_path;
+            face_root_path.push(FACE_SLOTS[sphere.face as usize] as u8);
+            let Some(face_root_id) = resolve_node(library, world_root, &face_root_path)
+            else {
                 let logical_path = build_logical_path(sphere, desired_depth);
-                let _ = total_anchor_depth;
                 return body_frame(library, world_root, sphere, logical_path);
-            }
+            };
+
+            // Build render_path = body_path + face_root_slot +
+            // uvr_path[..m_truncated]. Unlike the old implementation
+            // this does NOT require the deep path to resolve to a
+            // real Node — `Child::Empty` mid-descent is legal and
+            // represents dug content that the walker renders as
+            // empty.
             let mut render_path = sphere.body_path;
             render_path.push(FACE_SLOTS[sphere.face as usize] as u8);
-            for k in 0..resolved_uvr_m as usize {
+            for k in 0..m_truncated as usize {
                 render_path.push(sphere.uvr_path.slot(k));
             }
+
             let (un_corner, vn_corner, rn_corner, frame_size) =
-                uvr_corner(&sphere.uvr_path, resolved_uvr_m as usize);
+                uvr_corner(&sphere.uvr_path, m_truncated as usize);
             let (c_body, j) = face_frame_jacobian(
                 sphere.face,
                 un_corner, vn_corner, rn_corner, frame_size,
@@ -200,8 +307,9 @@ pub fn compute_render_frame(
             let j_inv = mat3_inv(&j);
             let sub = SphereSubFrame {
                 body_path: sphere.body_path,
-                render_path,
                 face: sphere.face,
+                face_root_id,
+                render_path,
                 un_corner, vn_corner, rn_corner, frame_size,
                 inner_r: sphere.inner_r,
                 outer_r: sphere.outer_r,
@@ -211,13 +319,15 @@ pub fn compute_render_frame(
             return ActiveFrame {
                 render_path: sub.render_path,
                 logical_path,
-                node_id,
+                // The walker starts from `face_root_id` and descends
+                // symbolically via `uvr_path` prefix; that's the
+                // node the GPU shader indexes into too.
+                node_id: face_root_id,
                 kind: ActiveFrameKind::SphereSub(sub),
             };
         }
         // Shallow face-subtree depth → Body march handles it.
         let logical_path = build_logical_path(sphere, desired_depth);
-        let _ = total_anchor_depth;
         return body_frame(library, world_root, sphere, logical_path);
     }
 
@@ -286,33 +396,6 @@ fn resolve_node(
         }
     }
     Some(node)
-}
-
-/// Walk `path` as far as Child::Node steps allow; return the deepest
-/// reached `(node_id, depth_reached)`. Stops gracefully when a slot
-/// resolves to Child::Empty / Child::Block / Child::EntityRef — the
-/// tree has no deeper node there, but the prefix walked is valid.
-/// Used when the requested render path extends past a broken cell
-/// (Empty) and we need to render at the deepest available depth.
-fn resolve_node_prefix(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    path: &Path,
-) -> (NodeId, u8) {
-    let mut node = world_root;
-    let mut reached = 0u8;
-    for k in 0..path.depth() as usize {
-        let Some(n) = library.get(node) else { break };
-        let slot = path.slot(k) as usize;
-        match n.children[slot] {
-            Child::Node(next) => {
-                node = next;
-                reached = (k + 1) as u8;
-            }
-            _ => break,
-        }
-    }
-    (node, reached)
 }
 
 /// Sum UVR-slot coord contributions from `uvr_path[..m]` into

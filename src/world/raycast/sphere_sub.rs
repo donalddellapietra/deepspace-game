@@ -4,11 +4,28 @@
 //! march cannot operate in body-XYZ: at face-subtree depth ≥ ~15,
 //! adjacent cell-boundary plane normals collapse into the same f32
 //! value and the DDA loses the ability to distinguish neighbouring
-//! cells. The fix is the cubed-sphere analog of Cartesian ribbon-pop:
+//! cells. The fix is the cubed-sphere analog of Cartesian ribbon-pop,
+//! built around a SYMBOLIC pre-descent from the face-subtree root
+//! plus SYMBOLIC neighbor-transitions when the ray exits the sub-frame:
 //!
-//! 1. `compute_render_frame` descends through the face subtree to a
-//!    face-cell at face-subtree depth M, and precomputes a linearized
-//!    body-XYZ map at the cell's corner:
+//! 1. `compute_render_frame` resolves the face-subtree root NodeId
+//!    (always reachable: `body + face_slot`) and records it on the
+//!    `SphereSubFrame`. It builds the sub-frame at the camera's deep
+//!    `m_truncated` UVR depth — the tree may contain `Child::Empty`
+//!    at that depth (dug-out region); that's fine, it's handled by
+//!    the walker below. The Jacobian's evaluation point sits at the
+//!    true deep corner so linearization error is O((1/3^m)²).
+//!
+//! 2. `walk_from_deep_sub_frame` pre-descends from the face-root
+//!    symbolically, slot-by-slot, following `uvr_path` prefix. On
+//!    `Child::Empty` / `Child::Block` / `Child::EntityRef` mid-prefix
+//!    it returns a `SubWalk` covering the full local `[0, 3)³` box —
+//!    uniform empty/solid — so the DDA treats that step as a flat
+//!    cell of sub-frame size and advances (or terminates) accordingly.
+//!    Reaching the deep Node, it dispatches into `walk_sub_frame` for
+//!    intra-cell levels.
+//!
+//! 3. The body map linearizes at the deep corner:
 //!
 //!        body_pos ≈ c_body + J · local_pos
 //!
@@ -16,7 +33,7 @@
 //!    the analytical Jacobian of `face_space_to_body_point` at the
 //!    corner (first derivatives w.r.t. local u/v/r).
 //!
-//! 2. Ray is transformed into local coords via `J_inv`. In the local
+//! 4. Ray is transformed into local coords via `J_inv`. In the local
 //!    frame, cell `u = const` / `v = const` boundaries are trivially
 //!    axis-aligned (flat planes). **Radial boundaries** at
 //!    `r_body = const` would in principle be ellipsoids in local
@@ -25,15 +42,27 @@
 //!    `r_local = const` — also flat to first order. All six
 //!    boundaries become axis-aligned in local.
 //!
-//! 3. DDA in local coords uses integer-cell-boundary t-values:
+//! 5. DDA in local coords uses integer-cell-boundary t-values:
 //!    `t_axis = (K − local_pos[axis]) / local_dir[axis]`. These are
 //!    always representable in f32 regardless of absolute face-subtree
 //!    depth — all quantities stay O(1) in the local frame.
 //!
+//! 6. When a ray exits the sub-frame's local `[0, 3)³` box, the DDA
+//!    transitions to the NEIGHBOR sub-frame via
+//!    `SphereSubFrame::with_neighbor_stepped`: step the render path by
+//!    one slot along the exit axis, rebuild `(un, vn, rn, c_body, J,
+//!    J_inv)` at the new corner, and transfer the ray's local position
+//!    + direction into the new basis. The neighbor's Jacobian differs
+//!    from the current one by O(1/3^m) (curvature), so the transfer
+//!    matrix is nearly identity and all quantities stay O(1) in local
+//!    coords — f32-precise at any depth. If the step would bubble past
+//!    the face-root boundary, the DDA terminates (cross-face
+//!    transitions are deferred to a follow-up).
+//!
 //! The linearization is accurate to O(frame_size²) in body-XYZ; at
-//! `MIN_SPHERE_SUB_DEPTH = 3` the error is ~1 % of cell width and
-//! decays geometrically with depth. Face-root and depth-1 / 2 cells
-//! keep the exact body-level march in `sphere.rs`.
+//! deep `m_truncated` the error is geometrically negligible.
+//! Face-root and shallow cells keep the exact body-level march in
+//! `sphere.rs`.
 
 use super::{HitInfo, LodParams, SphereHitCell};
 use crate::app::frame::SphereSubFrame;
@@ -47,6 +76,12 @@ use crate::world::tree::{
 const EMPTY_CELL: u16 = REPRESENTATIVE_EMPTY;
 const LOCAL_BOX_MAX: f32 = 3.0;
 const MAX_DDA_STEPS: usize = 4096;
+/// Upper bound on how many neighbor sub-frame transitions a single ray
+/// can take before we terminate. Protects against pathological grazing
+/// rays that would otherwise ribbon-walk indefinitely. Deep rays under
+/// normal gameplay cross far fewer deep cells than this before hitting
+/// solid content or exiting the face subtree.
+const MAX_NEIGHBOR_TRANSITIONS: usize = 64;
 
 /// Terminal cell found by `walk_sub_frame`. Coords are in the
 /// sub-frame's LOCAL `[0, 3)³` frame.
@@ -60,6 +95,138 @@ struct SubWalk {
     /// render path by the caller. Each entry is `(parent_node_id,
     /// child_slot)` where `child_slot` uses UVR semantics.
     path: Vec<(NodeId, usize)>,
+}
+
+/// Pre-descend from the face-subtree root symbolically along
+/// `uvr_prefix_slots`, then dispatch into `walk_sub_frame` at the
+/// terminal Node reached.
+///
+/// * `face_root_id` — NodeId of the face subtree root (always
+///   resolvable via `body_path + face_slot`; recorded on
+///   `SphereSubFrame::face_root_id`).
+/// * `uvr_prefix_slots` — the UVR slots from the face root down to
+///   the sub-frame's cell. This is `render_path[body_path.depth()+1..]`.
+/// * `u_l`, `v_l`, `r_l` — ray sample point in sub-frame local
+///   `[0, 3)³`.
+/// * `inner_walker_limit` — levels of DDA descent INSIDE the
+///   sub-frame's terminal cell; forwarded to `walk_sub_frame`.
+///
+/// If the pre-descent encounters a non-Node child mid-prefix
+/// (`Child::Empty` for a dug region, `Child::Block` for a uniform
+/// solid subtree, `Child::EntityRef` for an entity cell), the walker
+/// returns a `SubWalk` whose local cell IS the full `[0, 3)³` box and
+/// whose terminal block matches what the mid-prefix child
+/// represents. The DDA above treats this as a uniform cell spanning
+/// the sub-frame — on Block/EntityRef it produces a hit covering the
+/// whole sub-frame; on Empty it advances the ray to the sub-frame
+/// exit boundary.
+fn walk_from_deep_sub_frame(
+    library: &NodeLibrary,
+    face_root_id: NodeId,
+    uvr_prefix_slots: &[u8],
+    u_l: f32,
+    v_l: f32,
+    r_l: f32,
+    inner_walker_limit: u32,
+) -> SubWalk {
+    let mut node = face_root_id;
+    let mut prefix_path: Vec<(NodeId, usize)> =
+        Vec::with_capacity(uvr_prefix_slots.len() + inner_walker_limit.max(1) as usize);
+
+    for &slot_u8 in uvr_prefix_slots.iter() {
+        let Some(n) = library.get(node) else {
+            // Parent missing — treat the remainder of the sub-frame
+            // as uniform empty.
+            return SubWalk {
+                block: EMPTY_CELL,
+                u_lo: 0.0, v_lo: 0.0, r_lo: 0.0, size: LOCAL_BOX_MAX,
+                path: prefix_path,
+            };
+        };
+        let slot = slot_u8 as usize;
+        prefix_path.push((node, slot));
+        match n.children[slot] {
+            Child::Empty => {
+                // Dug region mid-prefix → uniform-empty sub-frame.
+                return SubWalk {
+                    block: EMPTY_CELL,
+                    u_lo: 0.0, v_lo: 0.0, r_lo: 0.0, size: LOCAL_BOX_MAX,
+                    path: prefix_path,
+                };
+            }
+            Child::Block(b) => {
+                // Uniform-solid region mid-prefix → sub-frame is one
+                // big cell of block `b`.
+                return SubWalk {
+                    block: b,
+                    u_lo: 0.0, v_lo: 0.0, r_lo: 0.0, size: LOCAL_BOX_MAX,
+                    path: prefix_path,
+                };
+            }
+            Child::EntityRef(_) => {
+                // Entity cell mid-prefix — render as empty; entity
+                // raster pass (or tag=3 branch) handles the actual
+                // shape.
+                return SubWalk {
+                    block: EMPTY_CELL,
+                    u_lo: 0.0, v_lo: 0.0, r_lo: 0.0, size: LOCAL_BOX_MAX,
+                    path: prefix_path,
+                };
+            }
+            Child::Node(next) => {
+                node = next;
+            }
+        }
+    }
+
+    // Pre-descent reached a real terminal Node. If the caller asked
+    // for zero intra-cell walker descent (user's edit anchor is
+    // exactly at the sub-frame depth), we must NOT descend further —
+    // doing so would report a cell one level deeper than the user's
+    // zoom and produce off-by-one edit anchor lengths. Inspect the
+    // Node's uniform type directly and return a full-box `SubWalk`
+    // so the DDA can either hit (uniform-filled) or step through
+    // (uniform-empty / mixed).
+    if inner_walker_limit == 0 {
+        let Some(n) = library.get(node) else {
+            return SubWalk {
+                block: EMPTY_CELL,
+                u_lo: 0.0, v_lo: 0.0, r_lo: 0.0, size: LOCAL_BOX_MAX,
+                path: prefix_path,
+            };
+        };
+        let bt = match n.uniform_type {
+            UNIFORM_EMPTY => EMPTY_CELL,
+            UNIFORM_MIXED => {
+                if n.representative_block == REPRESENTATIVE_EMPTY {
+                    EMPTY_CELL
+                } else {
+                    n.representative_block
+                }
+            }
+            b => b,
+        };
+        return SubWalk {
+            block: bt,
+            u_lo: 0.0, v_lo: 0.0, r_lo: 0.0, size: LOCAL_BOX_MAX,
+            path: prefix_path,
+        };
+    }
+    // Run the intra-cell walker from here and prepend the pre-descent
+    // path so the hit's `path` is rooted at `face_root_id`.
+    let mut inner = walk_sub_frame(library, node, u_l, v_l, r_l, inner_walker_limit);
+    let mut joined: Vec<(NodeId, usize)> =
+        Vec::with_capacity(prefix_path.len() + inner.path.len());
+    joined.extend(prefix_path);
+    joined.append(&mut inner.path);
+    SubWalk {
+        block: inner.block,
+        u_lo: inner.u_lo,
+        v_lo: inner.v_lo,
+        r_lo: inner.r_lo,
+        size: inner.size,
+        path: joined,
+    }
 }
 
 /// Descend the sub-frame at local point `(u_l, v_l, r_l)` to
@@ -208,8 +375,13 @@ fn ray_local_box_interval(ro: Vec3, rd: Vec3) -> (f32, f32) {
 /// for the body-level march when the render frame is a deep
 /// face-subtree cell.
 ///
-/// * `sub` carries the sub-frame's metadata and linearization.
-/// * `sub_frame_node` is the tree node at the sub-frame's render path.
+/// * `sub` carries the sub-frame's metadata and linearization, plus
+///   the face-subtree root NodeId the walker pre-descends from.
+/// * `ancestor_path` is the full path from world-root up to (but not
+///   including) the face-subtree root's parent — `HitInfo.path` is
+///   prefixed with this so callers can propagate edits against
+///   world-root. Its length is `body_path.depth() + 1` (the body
+///   chain plus the face-root slot).
 /// * `ro_local` is the ray origin **already in sub-frame local**
 ///   `[0, 3)³` coords — derived via the anchor-path ribbon-pop, NOT
 ///   by subtracting `c_body` from body-XYZ (that subtraction collapses
@@ -218,63 +390,189 @@ fn ray_local_box_interval(ro: Vec3, rd: Vec3) -> (f32, f32) {
 ///   length. It's transformed into local via `J_inv` inside — safe
 ///   because `rd_body` is O(1) and `|J_inv · rd_body|` is O(3^depth)
 ///   which f32 handles cleanly.
-/// * `walker_limit` caps walker descent inside the sub-frame.
-/// * `ancestor_path` is the full path from world-root up to (but not
-///   including) the sub-frame — `HitInfo.path` is prefixed with this
-///   so callers can propagate edits against world-root.
-#[allow(clippy::too_many_arguments)]
+/// * `walker_limit` caps walker descent INSIDE the sub-frame's
+///   terminal cell (forwarded to `walk_sub_frame`).
 pub(super) fn cs_raycast_local(
     library: &NodeLibrary,
     sub: &SphereSubFrame,
-    sub_frame_node: NodeId,
     ancestor_path: &[(NodeId, usize)],
     ro_local: Vec3,
     rd_body: Vec3,
     walker_limit: u32,
     _lod: LodParams,
 ) -> Option<HitInfo> {
-    if walker_limit == 0 {
-        return None;
-    }
+    // `walker_limit == 0` is legitimate when the user's edit anchor
+    // is exactly at the sub-frame's depth — `walk_from_deep_sub_frame`
+    // handles it by returning the deep Node's content via
+    // uniform_type without descending further.
 
-    // Ray direction in sub-frame local basis. |rd_local| can be
-    // large (O(3^depth)) but all subsequent DDA operations use
-    // t ratios — no catastrophic addition.
+    // Body-direction of the ray. Held CONSTANT across neighbor
+    // transitions — only the local basis (J_inv) changes per sub-frame,
+    // so rd_local is recomputed but rd_body stays the same.
     let rd_norm = sdf::normalize(rd_body);
-    let rd_local = mat3_mul_vec(&sub.j_inv, rd_norm);
 
+    // The `ancestor_path` prefix (body chain + face-root slot) is
+    // invariant across neighbor transitions inside a single face
+    // subtree — it's the body chain + face-root slot entry. We
+    // re-use it when emitting the hit path below.
+
+    // Mutable per-transition state: current sub-frame metadata, ray in
+    // that sub-frame's local basis, and the DDA t-cursor.
+    let mut current_sub: SphereSubFrame = *sub;
+    let mut ro_local = ro_local;
+    let mut rd_local = mat3_mul_vec(&current_sub.j_inv, rd_norm);
+
+    // Re-derive the UVR prefix slice on each transition (render_path
+    // changes as we step into neighbors).
+    let body_depth_plus_one = current_sub.body_path.depth() as usize + 1;
+
+    // Initial DDA interval in the starting sub-frame.
     let (t_enter, t_exit) = ray_local_box_interval(ro_local, rd_local);
     if t_exit <= 0.0 || t_enter >= t_exit {
         return None;
     }
-
-    // Start just inside the box from t_enter — at t_enter the ray is
-    // exactly on a face and would otherwise be rejected by the
-    // strict box check below. Nudge is a tiny fraction of the span
-    // (NOT clamped to any absolute value); at deep face-subtree
-    // depth the full t-span can be ≪ 1e-9 because rd_local scales
-    // as 3^depth.
     let t_span = (t_exit - t_enter).abs().max(1e-30);
-    let t_nudge = t_span * 1e-5;
+    let mut t_nudge = t_span * 1e-5;
     let mut t = t_enter.max(0.0) + t_nudge;
+    let mut t_exit = t_exit;
 
-    for _ in 0..MAX_DDA_STEPS {
-        if t >= t_exit { break; }
+    let mut neighbor_transitions = 0usize;
+    let mut dda_steps = 0usize;
+
+    loop {
+        if dda_steps >= MAX_DDA_STEPS {
+            break;
+        }
+        dda_steps += 1;
+
         let pos = [
             ro_local[0] + rd_local[0] * t,
             ro_local[1] + rd_local[1] * t,
             ro_local[2] + rd_local[2] * t,
         ];
 
-        // Escape hatch: left the local frame. Nudging past boundary.
-        if pos[0] < 0.0 || pos[0] >= LOCAL_BOX_MAX
+        let out_of_box = pos[0] < 0.0 || pos[0] >= LOCAL_BOX_MAX
             || pos[1] < 0.0 || pos[1] >= LOCAL_BOX_MAX
             || pos[2] < 0.0 || pos[2] >= LOCAL_BOX_MAX
-        {
-            break;
+            || t >= t_exit;
+
+        if out_of_box {
+            // Ray exited the current sub-frame's local box. Step to
+            // the neighbor and continue the DDA there.
+            if neighbor_transitions >= MAX_NEIGHBOR_TRANSITIONS {
+                break;
+            }
+
+            // Pick exit axis k + direction sign s from `pos`. Prefer
+            // whichever axis is actually outside — if multiple are
+            // outside (corner exit) pick the axis with the largest
+            // excursion past the boundary so the neighbor-step picks
+            // the right face.
+            let mut axis_k: usize = 0;
+            let mut sign_s: i32 = 0;
+            let mut best_excess: f32 = -1.0;
+            for k in 0..3 {
+                let v = pos[k];
+                let excess = if v >= LOCAL_BOX_MAX {
+                    v - LOCAL_BOX_MAX
+                } else if v < 0.0 {
+                    -v
+                } else {
+                    -1.0
+                };
+                if excess > best_excess {
+                    best_excess = excess;
+                    axis_k = k;
+                    sign_s = if v >= LOCAL_BOX_MAX { 1 } else { -1 };
+                }
+            }
+            if sign_s == 0 {
+                // No axis truly outside the box — we hit the t_exit
+                // guard, meaning the ray left via the sub-frame cap
+                // without a finite `pos` delta. Terminate.
+                break;
+            }
+
+            let Some(new_sub) = current_sub.with_neighbor_stepped(axis_k, sign_s) else {
+                // Bubble-up past the face-root: cross-face transition
+                // not implemented. Terminate the DDA; hits beyond the
+                // face subtree boundary are out of scope.
+                break;
+            };
+
+            // Transfer the ray's local position into the neighbor basis.
+            //   body_pos = c_cur + J_cur · local_cur
+            //            = c_new + J_new · local_new
+            //   c_new − c_cur ≈ s · 3 · J_cur[:, k]    (linearization)
+            //   ⇒ local_new = J_new_inv · J_cur · (local_cur − s·3·e_k)
+            let s_f = sign_s as f32;
+            let mut shifted = pos;
+            shifted[axis_k] -= s_f * LOCAL_BOX_MAX;
+            let body_delta = mat3_mul_vec(&current_sub.j, shifted);
+            let local_new = mat3_mul_vec(&new_sub.j_inv, body_delta);
+
+            // Clamp the entry coordinate just inside the neighbor's
+            // box on the axis we crossed — avoids an immediate
+            // re-exit on the opposite face due to f32 drift.
+            let mut ro_new = local_new;
+            let eps_in = LOCAL_BOX_MAX * 1e-6;
+            if sign_s == 1 {
+                ro_new[axis_k] = eps_in;
+            } else {
+                ro_new[axis_k] = LOCAL_BOX_MAX - eps_in;
+            }
+            // Keep the non-crossed axes clamped inside [0, 3) too so
+            // that f32 drift on a corner exit doesn't immediately kill
+            // the DDA in the neighbor.
+            for k in 0..3 {
+                if k == axis_k { continue; }
+                if ro_new[k] < 0.0 { ro_new[k] = 0.0; }
+                if ro_new[k] >= LOCAL_BOX_MAX {
+                    ro_new[k] = LOCAL_BOX_MAX - eps_in;
+                }
+            }
+
+            let rd_new = mat3_mul_vec(&new_sub.j_inv, rd_norm);
+
+            // Reset DDA state to the neighbor's local frame.
+            current_sub = new_sub;
+            ro_local = ro_new;
+            rd_local = rd_new;
+            let (new_t_enter, new_t_exit) = ray_local_box_interval(ro_local, rd_local);
+            if new_t_exit <= 0.0 || new_t_enter >= new_t_exit {
+                break;
+            }
+            let span = (new_t_exit - new_t_enter).abs().max(1e-30);
+            t_nudge = span * 1e-5;
+            t = new_t_enter.max(0.0) + t_nudge;
+            t_exit = new_t_exit;
+
+            neighbor_transitions += 1;
+            eprintln!(
+                "NEIGHBOR_STEP axis={} sign={} new_uvr_depth={} un={} vn={} rn={}",
+                axis_k, sign_s,
+                current_sub.depth_levels(),
+                current_sub.un_corner, current_sub.vn_corner, current_sub.rn_corner,
+            );
+            continue;
         }
 
-        let w = walk_sub_frame(library, sub_frame_node, pos[0], pos[1], pos[2], walker_limit);
+        // Re-derive the UVR prefix slice for the CURRENT sub-frame
+        // (render_path is mutated on each neighbor transition).
+        let render_slots = current_sub.render_path.as_slice();
+        let uvr_prefix_slots: &[u8] = if render_slots.len() > body_depth_plus_one {
+            &render_slots[body_depth_plus_one..]
+        } else {
+            &[]
+        };
+
+        let w = walk_from_deep_sub_frame(
+            library,
+            current_sub.face_root_id,
+            uvr_prefix_slots,
+            pos[0], pos[1], pos[2],
+            walker_limit,
+        );
 
         if w.block != EMPTY_CELL {
             let mut full_path: Vec<(NodeId, usize)> =
@@ -286,18 +584,12 @@ pub(super) fn cs_raycast_local(
             // sub-frame maps local `[0, 3)` to absolute face
             // `[un_corner, un_corner + frame_size)`, so per-local-unit
             // absolute-coord-step = frame_size / 3.
-            let step = sub.frame_size / 3.0;
-            let body_path_len = ancestor_path
-                .iter()
-                .take_while(|(nid, _)| {
-                    // First entry whose child IS the body cell.
-                    // Detect by comparing child NodeId to the body's
-                    // known path. Simpler: count by body_path length.
-                    let _ = nid;
-                    true
-                })
-                .count()
-                .min(sub.body_path.depth() as usize);
+            let step = current_sub.frame_size / 3.0;
+            // The body chain is the first `sub.body_path.depth()`
+            // entries of `full_path` by construction — `ancestor_path`
+            // = body chain + face-root slot, then pre-descent UVR
+            // slots, then walker-internal slots.
+            let body_path_len = current_sub.body_path.depth() as usize;
 
             return Some(HitInfo {
                 path: full_path,
@@ -307,13 +599,13 @@ pub(super) fn cs_raycast_local(
                 t,
                 place_path: None,
                 sphere_cell: Some(SphereHitCell {
-                    face: sub.face as u32,
-                    u_lo: sub.un_corner + w.u_lo * step,
-                    v_lo: sub.vn_corner + w.v_lo * step,
-                    r_lo: sub.rn_corner + w.r_lo * step,
+                    face: current_sub.face as u32,
+                    u_lo: current_sub.un_corner + w.u_lo * step,
+                    v_lo: current_sub.vn_corner + w.v_lo * step,
+                    r_lo: current_sub.rn_corner + w.r_lo * step,
                     size: w.size * step,
-                    inner_r: sub.inner_r,
-                    outer_r: sub.outer_r,
+                    inner_r: current_sub.inner_r,
+                    outer_r: current_sub.outer_r,
                     body_path_len,
                 }),
             });
@@ -327,7 +619,11 @@ pub(super) fn cs_raycast_local(
         let t_r = axis_exit_t(pos[2], rd_local[2], w.r_lo, w.r_lo + w.size);
         let t_min = t_u.min(t_v).min(t_r);
         if !t_min.is_finite() || t_min <= 0.0 {
-            break;
+            // Cell is degenerate (parallel ray, zero span, …). Force
+            // exit by nudging to t_exit and let the out-of-box branch
+            // handle the neighbor step on the next iteration.
+            t = t_exit;
+            continue;
         }
         t += t_min + t_nudge;
     }
@@ -349,8 +645,11 @@ mod tests {
     use crate::world::tree::slot_index;
 
     /// Build a demo-planet world and resolve an `ActiveFrame` at the
-    /// given face-subtree depth on `face`, returning the sub-frame,
-    /// the sub-frame's node, and the ancestor path.
+    /// given face-subtree depth on `face`, returning the sub-frame
+    /// and the ancestor path (body chain + face-root slot — the
+    /// prefix that's ALWAYS a real `Child::Node` chain; the UVR
+    /// prefix lives on `sub.render_path` and is handled by the
+    /// walker symbolically).
     ///
     /// The anchor descent uses UVR slot (1, 1, 1) at every
     /// face-subtree level so the sub-frame lives near the face
@@ -359,7 +658,6 @@ mod tests {
     fn planet_with_sub_frame(face: Face, sub_depth: u8) -> (
         crate::world::state::WorldState,
         SphereSubFrame,
-        NodeId,
         Vec<(NodeId, usize)>,
     ) {
         use crate::world::anchor::{SphereState, WorldPos};
@@ -397,9 +695,11 @@ mod tests {
             ActiveFrameKind::SphereSub(s) => s,
             k => panic!("expected SphereSub at sub_depth={sub_depth}, got {k:?}"),
         };
+        // Ancestor prefix stops at the face-root slot entry.
+        let prefix_len = sub.body_path.depth() as usize + 1;
         let mut node_id = world.root;
         let mut ancestors = Vec::new();
-        for i in 0..active.render_path.depth() as usize {
+        for i in 0..prefix_len {
             let slot = active.render_path.slot(i) as usize;
             ancestors.push((node_id, slot));
             node_id = match world.library.get(node_id).unwrap().children[slot] {
@@ -407,7 +707,7 @@ mod tests {
                 other => panic!("render_path step {i}: non-Node child {other:?}"),
             };
         }
-        (world, sub, node_id, ancestors)
+        (world, sub, ancestors)
     }
 
     /// Ray aimed at the sub-frame's LOCAL center from outside along
@@ -428,10 +728,10 @@ mod tests {
 
     #[test]
     fn cs_raycast_local_hits_at_sub_depth_3() {
-        let (world, sub, sub_node, ancestors) = planet_with_sub_frame(Face::PosY, 3);
+        let (world, sub, ancestors) = planet_with_sub_frame(Face::PosY, 3);
         let (cam, rd) = inward_radial_ray(&sub);
         let hit = cs_raycast_local(
-            &world.library, &sub, sub_node, &ancestors,
+            &world.library, &sub, &ancestors,
             cam, rd, 6, LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "sub-depth 3 should hit");
@@ -440,12 +740,11 @@ mod tests {
     /// Build a fully-solid sub-frame: world root → body(at slot 13)
     /// → face(PosY face root at body's slot 16) → depth levels of
     /// uniform `Child::Block(42)` nodes. Everything inside the
-    /// sub-frame is guaranteed solid. Returns world, sub, sub_node,
-    /// ancestors.
+    /// sub-frame is guaranteed solid. Returns world, sub, ancestors
+    /// (body chain + face-root slot).
     fn solid_sub_frame(sub_depth: u8) -> (
         crate::world::state::WorldState,
         SphereSubFrame,
-        NodeId,
         Vec<(NodeId, usize)>,
     ) {
         use crate::world::cubesphere::Face;
@@ -521,9 +820,10 @@ mod tests {
             ActiveFrameKind::SphereSub(s) => s,
             k => panic!("expected SphereSub at sub_depth={sub_depth}, got {k:?}"),
         };
+        let prefix_len = sub.body_path.depth() as usize + 1;
         let mut node_id = world.root;
         let mut ancestors = Vec::new();
-        for i in 0..active.render_path.depth() as usize {
+        for i in 0..prefix_len {
             let slot = active.render_path.slot(i) as usize;
             ancestors.push((node_id, slot));
             node_id = match world.library.get(node_id).unwrap().children[slot] {
@@ -531,7 +831,7 @@ mod tests {
                 other => panic!("non-node at step {i}: {other:?}"),
             };
         }
-        (world, sub, node_id, ancestors)
+        (world, sub, ancestors)
     }
 
     #[test]
@@ -541,10 +841,10 @@ mod tests {
         // a ray straight through the local z axis MUST hit. Depth
         // ≥ 20 exercises the precision-critical local-frame DDA.
         for sub_depth in [3u8, 4, 5, 8, 12, 18, 25, 30, 35] {
-            let (world, sub, sub_node, ancestors) = solid_sub_frame(sub_depth);
+            let (world, sub, ancestors) = solid_sub_frame(sub_depth);
             let (cam, rd) = inward_radial_ray(&sub);
             let hit = cs_raycast_local(
-                &world.library, &sub, sub_node, &ancestors,
+                &world.library, &sub, &ancestors,
                 cam, rd, 3, LodParams::fixed_max(),
             );
             assert!(
@@ -561,10 +861,10 @@ mod tests {
         for &face in &[
             Face::PosX, Face::NegX, Face::PosY, Face::NegY, Face::PosZ, Face::NegZ,
         ] {
-            let (world, sub, sub_node, ancestors) = planet_with_sub_frame(face, 5);
+            let (world, sub, ancestors) = planet_with_sub_frame(face, 5);
             let (cam, rd) = inward_radial_ray(&sub);
             let hit = cs_raycast_local(
-                &world.library, &sub, sub_node, &ancestors,
+                &world.library, &sub, &ancestors,
                 cam, rd, 4, LodParams::fixed_max(),
             );
             assert!(hit.is_some(), "no hit on face={face:?} at sub_depth=5");
@@ -579,7 +879,7 @@ mod tests {
         // same cell (path ends matching) so the highlight/edit
         // resolves to the same block regardless of which path ran.
         use crate::world::raycast::cpu_raycast_in_frame;
-        let (world, sub, _sub_node, _ancestors) =
+        let (world, sub, _ancestors) =
             planet_with_sub_frame(Face::PosY, 3);
         // Camera in body-local: reconstruct from sub-frame local center
         // via c_body + J·(1.5, 1.5, 1.5) — this IS the body-level cam
@@ -685,7 +985,7 @@ mod tests {
         // J · local + c_body should round-trip through J_inv back to
         // local within tight tolerance — the linearization's own
         // consistency check.
-        let (_world, sub, _sub_node, _ancestors) =
+        let (_world, sub, _ancestors) =
             planet_with_sub_frame(Face::PosX, 4);
         for probe in [[0.5_f32, 1.0, 1.5], [2.7, 0.2, 0.9], [1.5, 1.5, 1.5]] {
             let body = [
@@ -705,5 +1005,136 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Synthetic subtree where the starting sub-frame's own deep cell
+    /// is EMPTY but the +r neighbor contains a solid Block. A ray
+    /// aimed along the local +r axis must exit the starting
+    /// sub-frame, transition to the neighbor, and hit in the neighbor
+    /// cell. Exercises the Step 2 neighbor-transition path end-to-end.
+    #[test]
+    fn cs_raycast_local_neighbor_transition() {
+        use crate::app::frame::{compute_render_frame, ActiveFrameKind, MIN_SPHERE_SUB_DEPTH};
+        use crate::world::anchor::{SphereState, WorldPos};
+        use crate::world::cubesphere::Face;
+        use crate::world::tree::{empty_children, uniform_children, NodeKind};
+
+        // Build a face subtree whose depth-1 UVR layout is:
+        //   slot (1,1,1): child is a uniform-EMPTY subtree (the starting
+        //                 sub-frame sits here — its deep cell is empty).
+        //   slot (1,1,2): child is a uniform-BLOCK(42) subtree (the
+        //                 +r neighbor — the ray hits here after the
+        //                 neighbor-step).
+        // Plus a lower depth-1 padding chain so that the starting
+        // sub-frame ends up at MIN_SPHERE_SUB_DEPTH.
+        let mut lib = NodeLibrary::default();
+        // Solid Block(42) subtree — filler for the +r neighbor.
+        let mut solid_chain = lib.insert(uniform_children(Child::Block(42)));
+        for _ in 0..10u32 {
+            solid_chain = lib.insert(uniform_children(Child::Node(solid_chain)));
+        }
+        // Empty subtree — filler for the starting cell.
+        let empty_node = lib.insert(empty_children());
+
+        // Descend MIN_SPHERE_SUB_DEPTH levels via slot (1,1,1). At each
+        // level, slot (1,1,2) holds the solid subtree (the +r
+        // neighbor at that depth).
+        let mut center_chain = empty_node;
+        for _ in 0..MIN_SPHERE_SUB_DEPTH {
+            let mut children = empty_children();
+            children[slot_index(1, 1, 1)] = Child::Node(center_chain);
+            children[slot_index(1, 1, 2)] = Child::Node(solid_chain);
+            center_chain = lib.insert(children);
+        }
+
+        // Face root — wraps the subtree chain above; +r neighbor at
+        // depth 1 relative to face root is slot (1,1,2).
+        let mut face_root_children = uniform_children(Child::Node(solid_chain));
+        face_root_children[slot_index(1, 1, 1)] = Child::Node(center_chain);
+        let face_root = lib.insert_with_kind(
+            face_root_children,
+            NodeKind::CubedSphereFace { face: Face::PosY },
+        );
+
+        // Body cell.
+        let mut body_children = empty_children();
+        for &f in &Face::ALL {
+            body_children[FACE_SLOTS[f as usize]] = Child::Node(face_root);
+        }
+        body_children[crate::world::cubesphere::CORE_SLOT] = Child::Node(solid_chain);
+        let body = lib.insert_with_kind(
+            body_children,
+            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
+        );
+
+        // World root with the body at slot (1,1,1).
+        let mut root_children = empty_children();
+        root_children[slot_index(1, 1, 1)] = Child::Node(body);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+        let world = crate::world::state::WorldState { root, library: lib };
+
+        // Camera sitting at uvr (1,1,1) … (1,1,1) at MIN_SPHERE_SUB_DEPTH
+        // — inside the starting (empty) sub-frame.
+        let body_path = {
+            let mut p = crate::world::anchor::Path::root();
+            p.push(slot_index(1, 1, 1) as u8);
+            p
+        };
+        let mut uvr_path = crate::world::anchor::Path::root();
+        for _ in 0..MIN_SPHERE_SUB_DEPTH {
+            uvr_path.push(slot_index(1, 1, 1) as u8);
+        }
+        let camera = WorldPos {
+            anchor: body_path,
+            offset: [0.5; 3],
+            sphere: Some(SphereState {
+                body_path,
+                inner_r: 0.12,
+                outer_r: 0.45,
+                face: Face::PosY,
+                uvr_path,
+                uvr_offset: [0.5; 3],
+            }),
+        };
+        let desired = body_path.depth() + 1 + MIN_SPHERE_SUB_DEPTH;
+        let active = compute_render_frame(&world.library, world.root, &camera, desired);
+        let sub = match active.kind {
+            ActiveFrameKind::SphereSub(s) => s,
+            k => panic!("expected SphereSub, got {k:?}"),
+        };
+
+        // Build the ancestor chain (body + face-root slot).
+        let prefix_len = sub.body_path.depth() as usize + 1;
+        let mut node_id = world.root;
+        let mut ancestors = Vec::new();
+        for i in 0..prefix_len {
+            let slot = active.render_path.slot(i) as usize;
+            ancestors.push((node_id, slot));
+            node_id = match world.library.get(node_id).unwrap().children[slot] {
+                Child::Node(n) => n,
+                other => panic!("non-Node at step {i}: {other:?}"),
+            };
+        }
+
+        // Ray starts inside the (empty) starting sub-frame, aimed along
+        // the local +r axis. It must exit the starting box on the +r
+        // face and cross into the +r neighbor, where it should hit
+        // Block(42).
+        let cam_local = [1.5_f32, 1.5, 1.5];
+        // rd_body = col_r of the starting frame's Jacobian (which is
+        // aligned with body radial at the corner, outward).
+        let col_r = [sub.j[2][0], sub.j[2][1], sub.j[2][2]];
+        let rd_body = sdf::normalize(col_r);
+
+        let hit = cs_raycast_local(
+            &world.library, &sub, &ancestors,
+            cam_local, rd_body, 4, LodParams::fixed_max(),
+        );
+        assert!(
+            hit.is_some(),
+            "neighbor transition failed: ray from empty sub-frame should \
+             cross into +r-neighbor Block(42) sub-frame and hit",
+        );
     }
 }

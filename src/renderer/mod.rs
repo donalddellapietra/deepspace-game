@@ -52,6 +52,12 @@ pub const ROOT_KIND_FACE: u32 = 2;
 /// `sphere_in_sub_frame`.
 pub const ROOT_KIND_SPHERE_SUB: u32 = 3;
 
+/// Max UVR pre-descent depth supported by the shader's SphereSub
+/// walker. Each slot is packed as u32 (1 per 16-byte uniform array
+/// element to keep std140/uniform alignment simple); tighten to a
+/// u8-packed layout later if the uniform budget becomes a concern.
+pub const MAX_SPHERE_SUB_DEPTH: usize = 64;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuUniforms {
@@ -97,8 +103,19 @@ pub struct GpuUniforms {
     pub sub_j_inv_col2: [f32; 4],
     /// xyzw = (un_corner, vn_corner, rn_corner, frame_size).
     pub sub_face_corner: [f32; 4],
-    /// x = face index (0..5), rest padding.
+    /// x = face index (0..5), y = UVR pre-descent prefix length
+    /// (number of valid entries in `sub_uvr_slots`),
+    /// z = face-root depth (= `body_path.depth() + 1` — the minimum
+    /// prefix length before a neighbor-step bubble-up becomes a
+    /// cross-face transition; the shader terminates the sphere-sub
+    /// DDA rather than attempting the cross-face math, which is
+    /// deferred to a follow-up commit), w = pad.
     pub sub_meta: [u32; 4],
+    /// UVR slots the shader walker pre-descends from the face-root
+    /// before starting intra-cell DDA. Only `sub_meta.y` entries are
+    /// valid; the rest are zero. One u32 per slot keeps the std140
+    /// alignment trivial (16-byte stride via `[u32; 4]` rows).
+    pub sub_uvr_slots: [[u32; 4]; MAX_SPHERE_SUB_DEPTH / 4],
 }
 
 pub struct Renderer {
@@ -164,6 +181,7 @@ pub struct Renderer {
     pub(super) sub_j_inv_col2: [f32; 4],
     pub(super) sub_face_corner: [f32; 4],
     pub(super) sub_meta: [u32; 4],
+    pub(super) sub_uvr_slots: [[u32; 4]; MAX_SPHERE_SUB_DEPTH / 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -347,7 +365,14 @@ impl Renderer {
     /// `corner_and_size = (un, vn, rn, frame_size)` in face-normalized
     /// absolute coords. `c_body` is the body-XYZ of local (0,0,0).
     /// `j` is the local→body Jacobian (columns are ∂body/∂{u_l, v_l,
-    /// r_l}); `j_inv` is its inverse.
+    /// r_l}); `j_inv` is its inverse. `uvr_prefix_slots` carries the
+    /// UVR slots the shader walker pre-descends from the face-root
+    /// (`set_frame_root` already points `root_index` at the face-root
+    /// BFS index). Length is capped at `MAX_SPHERE_SUB_DEPTH`;
+    /// callers pass the actual prefix (typically much shorter).
+    /// `face_root_depth` = `body_path.depth() + 1` — the minimum UVR
+    /// prefix length before a neighbor-step bubble-up becomes a
+    /// cross-face transition (terminate threshold for the shader).
     #[allow(clippy::too_many_arguments)]
     pub fn set_root_kind_sphere_sub(
         &mut self,
@@ -358,6 +383,8 @@ impl Renderer {
         c_body: [f32; 3],
         j: [[f32; 3]; 3],
         j_inv: [[f32; 3]; 3],
+        uvr_prefix_slots: &[u8],
+        face_root_depth: u32,
     ) {
         self.root_kind = ROOT_KIND_SPHERE_SUB;
         self.root_radii = [inner_r, outer_r, 0.0, 0.0];
@@ -372,7 +399,13 @@ impl Renderer {
         self.sub_j_inv_col1 = [j_inv[1][0], j_inv[1][1], j_inv[1][2], 0.0];
         self.sub_j_inv_col2 = [j_inv[2][0], j_inv[2][1], j_inv[2][2], 0.0];
         self.sub_face_corner = corner_and_size;
-        self.sub_meta = [face_id, 0, 0, 0];
+        let prefix_len = uvr_prefix_slots.len().min(MAX_SPHERE_SUB_DEPTH);
+        self.sub_meta = [face_id, prefix_len as u32, face_root_depth, 0];
+        let mut slots = [[0u32; 4]; MAX_SPHERE_SUB_DEPTH / 4];
+        for (i, &slot) in uvr_prefix_slots.iter().take(prefix_len).enumerate() {
+            slots[i / 4][i % 4] = slot as u32;
+        }
+        self.sub_uvr_slots = slots;
         self.write_uniforms();
     }
 
@@ -386,6 +419,7 @@ impl Renderer {
         self.sub_j_inv_col2 = [0.0; 4];
         self.sub_face_corner = [0.0; 4];
         self.sub_meta = [0; 4];
+        self.sub_uvr_slots = [[0; 4]; MAX_SPHERE_SUB_DEPTH / 4];
     }
 
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {

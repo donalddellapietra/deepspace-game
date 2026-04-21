@@ -279,6 +279,7 @@ impl Renderer {
             sub_j_inv_col2: [0.0; 4],
             sub_face_corner: [0.0; 4],
             sub_meta: [0; 4],
+            sub_uvr_slots: [[0; 4]; super::MAX_SPHERE_SUB_DEPTH / 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -686,6 +687,7 @@ impl Renderer {
             sub_j_inv_col2: [0.0; 4],
             sub_face_corner: [0.0; 4],
             sub_meta: [0; 4],
+            sub_uvr_slots: [[0; 4]; super::MAX_SPHERE_SUB_DEPTH / 4],
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,

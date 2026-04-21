@@ -177,16 +177,36 @@ pub fn cpu_raycast_in_sub_frame(
     edit_depth: u32,
     lod: LodParams,
 ) -> Option<HitInfo> {
-    let (chain, frame_entries) = build_frame_chain(library, world_root, render_path);
-    let depth = chain.len() - 1;
-    let sub_frame_node = chain[depth];
-    let walker_limit = edit_depth.saturating_sub(depth as u32);
-    if walker_limit == 0 {
+    // Build the ancestor chain up to (and including the slot entry
+    // FOR) the face-root. `render_path` = body_path + face_slot +
+    // UVR descent; the UVR tail may traverse `Child::Empty` links
+    // (dug regions), so we must not `build_frame_chain` through it
+    // — that chain would terminate at the first broken link and
+    // silently corrupt ancestor indexing.
+    //
+    // `body_path.depth() + 1` is the exact length of the guaranteed-
+    // resolvable prefix (body Cartesian chain + the face-root slot).
+    let ancestor_len = sub.body_path.depth() as usize + 1;
+    let ancestor_slots: &[u8] = if render_path.len() >= ancestor_len {
+        &render_path[..ancestor_len]
+    } else {
+        render_path
+    };
+    let (_chain, frame_entries) = build_frame_chain(library, world_root, ancestor_slots);
+    if frame_entries.len() != ancestor_slots.len() {
+        // Body / face-root slot didn't resolve to a real Node chain.
+        // Shouldn't happen for a valid SphereSub frame; bail out.
         return None;
     }
-    let ancestor_path = &frame_entries[..depth];
+    let total_depth = render_path.len() as u32;
+    // walker_limit == 0 is legitimate (user's edit anchor at the
+    // sub-frame's exact depth): the walker returns the deep cell's
+    // content via uniform_type inspection without descending further.
+    // Neighbor transitions within cs_raycast_local handle cross-cell
+    // traversal regardless of walker_limit.
+    let walker_limit = edit_depth.saturating_sub(total_depth);
     sphere_sub::cs_raycast_local(
-        library, sub, sub_frame_node, ancestor_path,
+        library, sub, &frame_entries,
         cam_local, ray_dir_body,
         walker_limit, lod,
     )

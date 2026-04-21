@@ -835,7 +835,10 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_SPHERE_SUB {
             // Initial frame is a deep face-subtree cell. Ray is
             // already in sub-frame local coords (J_inv applied CPU-
-            // side to the camera basis). Local-coord DDA preserves
+            // side to the camera basis). `current_idx` is the
+            // face-root BFS index; `walk_from_deep_sub_frame` inside
+            // pre-descends along `uniforms.sub_uvr_slots` before
+            // running intra-cell DDA. Local-coord DDA preserves
             // f32 precision at arbitrary face-subtree depth.
             r = sphere_in_sub_frame(
                 current_idx, ray_origin, ray_dir, uniforms.max_depth,

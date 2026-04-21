@@ -315,6 +315,7 @@ impl Renderer {
             sub_j_inv_col2: self.sub_j_inv_col2,
             sub_face_corner: self.sub_face_corner,
             sub_meta: self.sub_meta,
+            sub_uvr_slots: self.sub_uvr_slots,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
