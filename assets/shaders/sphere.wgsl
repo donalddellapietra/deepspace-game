@@ -1457,8 +1457,32 @@ fn sphere_in_sub_frame(
 
             result.color = palette[w.block].rgb
                 * (ambient + diffuse * 0.78) * tint * shape;
-            result.cell_min = vec3<f32>(w.u_lo, w.v_lo, w.r_lo);
-            result.cell_size = w.size;
+            // Neutralize `shade_pixel`'s `cube_face_bevel`.
+            //
+            // `shade_pixel` (main.wgsl) unconditionally computes a
+            // second bevel after the march returns, using
+            //   local = (hit_pos - cell_min) / cell_size
+            //   bevel = cube_face_bevel(local, result.normal)
+            // where `face_uv_for_normal` picks a cube face from the
+            // argmax of `|result.normal|`. Our `result.normal` here is
+            // `−rd_local / |rd_local|`, and `rd_local`'s argmax flips
+            // along axis-equidistance curves across screen — which
+            // trace CIRCLES centered at the body-frame axis
+            // directions. The flip discontinuously swaps the `uv`
+            // face, producing the "concentric ring" artifact that
+            // dominates past m ≈ 10.
+            //
+            // `sphere_in_cell`'s fix (the body-march path) is to set
+            // `cell_min + cell_size` so that `(hit_pos − cell_min) /
+            // cell_size = 0.5` for every pixel, which forces
+            // `edge=0.5`, `smoothstep(0.02, 0.14, 0.5)=1.0`, bevel=1.0
+            // (no darkening). We mirror that here. Our own
+            // `bevel_layered_local` call above provides the intended
+            // cell-grid texture in face-normalized space, so the
+            // shade_pixel bevel is pure noise anyway.
+            let cs = max(length(camera.forward), 1.0) * 1e3;
+            result.cell_min = camera.pos + rd_local * t - vec3<f32>(cs * 0.5);
+            result.cell_size = cs;
             return result;
         }
 
