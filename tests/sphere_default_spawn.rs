@@ -58,6 +58,83 @@ fn planet_fraction(path: &PathBuf) -> f32 {
     planet as f32 / total as f32
 }
 
+/// Regression for the "landing on Earth teleports to layer 29" bug.
+/// Mirrors interactive gameplay: spawn inside the shell, break a cell,
+/// zoom in one level, break another cell. Each break's reported
+/// anchor_depth must match the expected sequence — no sudden collapse
+/// to layer 2 mid-session.
+#[test]
+fn interactive_zoom_between_breaks_preserves_depth() {
+    let _dir = tmp_dir("sphere_zoom_no_teleport");
+    // Spawn at depth 6 with a gap sized for depth 7 — the post-zoom-in
+    // interaction radius is tighter, so both probes need to be within
+    // `12 * 3 / 3^7` world units of the sphere surface.
+    let gap = 12.0_f64 * 3.0_f64 / 3.0_f64.powi(7) * 0.6;
+    let cam_y = 1.80 + gap;
+    let cam_y_str = format!("{cam_y:.6}");
+    let args = vec![
+        "--render-harness",
+        "--sphere-world",
+        "--spawn-depth", "6",
+        "--spawn-xyz", "1.5", &cam_y_str, "1.5",
+        "--spawn-pitch", "-1.5707",
+        "--spawn-yaw", "0",
+        "--interaction-radius", "12",
+        "--harness-width", "480",
+        "--harness-height", "320",
+        "--exit-after-frames", "120",
+        "--timeout-secs", "25",
+        "--suppress-startup-logs",
+    ];
+    let script = ScriptBuilder::new()
+        .emit("start")
+        .wait(10)
+        .probe_down()
+        .break_()
+        .wait(10)
+        .zoom_in(1)
+        .wait(5)
+        .probe_down()
+        .break_()
+        .wait(5)
+        .emit("end");
+    let trace = run(&args, &script);
+    assert!(trace.exit_success, "binary exit failed:\n{}", trace.stderr);
+
+    assert_eq!(
+        trace.edits.len(), 2,
+        "expected two edits, got {:?}.\n\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        trace.edits, trace.stdout, trace.stderr,
+    );
+    let first = &trace.edits[0];
+    let second = &trace.edits[1];
+
+    // First break must land at spawn depth 6.
+    assert_eq!(
+        first.anchor_depth, 6,
+        "first break anchor_depth must equal spawn_depth; got {}",
+        first.anchor_depth,
+    );
+    assert_eq!(
+        first.anchor.len(), 6,
+        "first break hit path must be 6 slots, got {:?}", first.anchor,
+    );
+
+    // Second break (post zoom_in) must land at depth 7 — NOT collapse
+    // to depth 2 (the teleport bug). This is the regression test for
+    // `maybe_enter_sphere`'s aggressive-truncation pitfall.
+    assert_eq!(
+        second.anchor_depth, 7,
+        "second break anchor_depth must be 7 (one deeper after zoom_in); \
+         got {} — teleport bug regression",
+        second.anchor_depth,
+    );
+    assert_eq!(
+        second.anchor.len(), 7,
+        "second break hit path must be 7 slots, got {:?}", second.anchor,
+    );
+}
+
 #[test]
 fn default_sphere_world_shows_planet() {
     let dir = tmp_dir("sphere_default_spawn");

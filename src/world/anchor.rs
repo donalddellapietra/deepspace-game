@@ -311,27 +311,25 @@ impl WorldPos {
         Transition::None
     }
 
-    /// Detect whether any ancestor along `anchor` is a
-    /// `CubedSphereBody`; if so, initialize symbolic sphere state
-    /// from the camera's body-local position and re-anchor to the
-    /// body cell.
+    /// Initialize symbolic sphere state when the anchor's deepest
+    /// cell is a `CubedSphereBody` AND the camera is actually inside
+    /// the shell volume `[inner_r, outer_r]`.
     ///
-    /// This handles two cases:
+    /// This method is **non-destructive**: it never truncates the
+    /// anchor or moves the camera. Precondition is that callers
+    /// invoke it at the moment the anchor lands on a body cell —
+    /// during zoom-in descent (just after pushing the body slot),
+    /// or at spawn construction via `deepened_to_with(..)`. For the
+    /// spawn-xyz-at-deep-depth case, build to depth 1 first, then
+    /// call `deepened_to_with`; the pre-loop `maybe_enter_sphere`
+    /// fires while the anchor is still exactly at the body cell.
     ///
-    /// 1. **Anchor ends exactly at the body cell.** Offset maps
-    ///    directly to body-local XYZ; convert via
-    ///    `body_point_to_face_space` to seed `uvr_offset`.
-    ///
-    /// 2. **Anchor has descended past the body via Cartesian XYZ
-    ///    slots.** This happens when a non-sphere-aware construction
-    ///    (`from_frame_local`, bulk `deepened_to`) pushed slots
-    ///    blindly. The XYZ slots don't map to UVR semantics, so we
-    ///    discard them, truncate `anchor` back to the body cell, and
-    ///    recompute `offset` + `uvr_offset` from the original XYZ
-    ///    position in the body's frame.
-    ///
-    /// No-op if `self.sphere` is already `Some` or if no body
-    /// ancestor exists on `anchor`.
+    /// Gated on shell-volume membership: a camera above `outer_r`
+    /// (free space) or inside `inner_r` (core) stays Cartesian. The
+    /// gate exists because `body_point_to_face_space` clamps rn to
+    /// `[0, 1)` unconditionally — without the gate, an above-shell
+    /// camera would get re-anchored onto the outer shell surface,
+    /// producing the "teleport to layer 2 / into space" symptom.
     pub fn maybe_enter_sphere(
         &mut self,
         library: &NodeLibrary,
@@ -343,45 +341,31 @@ impl WorldPos {
         if self.sphere.is_some() {
             return Transition::None;
         }
-        // Walk `anchor` looking for the first CubedSphereBody node.
-        // `body_cell_depth` is the anchor depth that ends at the body
-        // cell (inclusive), so `anchor[..body_cell_depth]` is the path
-        // to the body itself.
+        // Walk to the deepest anchor cell and check its NodeKind.
         let mut node = world_root;
-        let mut body_info: Option<(u8, f32, f32)> = None;
-        for k in 0..=self.anchor.depth() as usize {
+        for k in 0..self.anchor.depth() as usize {
             let Some(n) = library.get(node) else { return Transition::None; };
-            if let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind {
-                body_info = Some((k as u8, inner_r, outer_r));
-                break;
-            }
-            if k == self.anchor.depth() as usize {
-                break;
-            }
             let slot = self.anchor.slot(k) as usize;
             match n.children[slot] {
                 Child::Node(next) => node = next,
                 _ => return Transition::None,
             }
         }
-        let Some((body_cell_depth, inner_r, outer_r)) = body_info else {
+        let Some(n) = library.get(node) else { return Transition::None; };
+        let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind else {
             return Transition::None;
         };
-        // body-local position of the camera in [0, 3)³. `in_frame`
-        // walks any remaining anchor slots past the body and adds the
-        // final sub-cell offset — precise regardless of whether the
-        // anchor was truncated at the body or descended further.
-        let body_path = self.anchor.with_truncated(body_cell_depth);
-        let body_pos_local = self.in_frame(&body_path);
-        // Only initialize sphere state when the camera is actually
-        // INSIDE the spherical shell volume. Above outer_r the camera
-        // is in free-space (or the body cell's empty corners) and
-        // stays Cartesian; below inner_r it's inside the core, which
-        // has no UVR frame. Without this gate, `body_point_to_face_space`
-        // silently clamps rn into [0, 1) and `maybe_enter_sphere`
-        // re-anchors the camera onto the shell surface — observable
-        // as a teleport into "layer 2" with the camera apparently
-        // flying into the shell from outside.
+        // Camera's body-local XYZ in `[0, 3)³` (offset * body_size).
+        let body_pos_local = [
+            self.offset[0] * 3.0,
+            self.offset[1] * 3.0,
+            self.offset[2] * 3.0,
+        ];
+        // Gate on shell-volume membership: camera must be in
+        // `[inner_r * 3, outer_r * 3]` measured from the body center.
+        // Outside the shell the UVR frame isn't meaningful; stay
+        // Cartesian instead of clamping rn and re-anchoring onto the
+        // shell surface.
         let center = 3.0_f32 * 0.5;
         let dx = body_pos_local[0] - center;
         let dy = body_pos_local[1] - center;
@@ -395,16 +379,7 @@ impl WorldPos {
         let Some(fp) = body_point_to_face_space(body_pos_local, inner_r, outer_r, 3.0) else {
             return Transition::None;
         };
-        // Re-anchor to the body cell. `offset` becomes the body-local
-        // position divided by body_size (3.0) so `offset * 3` still
-        // recovers the camera's body-local XYZ (consumers that ignore
-        // `sphere` state fall back cleanly). Clamp defensively.
-        self.anchor = body_path;
-        self.offset = [
-            (body_pos_local[0] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
-            (body_pos_local[1] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
-            (body_pos_local[2] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
-        ];
+        let body_path = self.anchor;
         self.sphere = Some(SphereState {
             body_path,
             inner_r,
@@ -1201,51 +1176,26 @@ mod tests {
         assert_eq!(s.uvr_path.depth(), 0);
     }
 
+    /// Sanity: if the anchor has ALREADY descended past the body
+    /// via Cartesian slots (legal transient state — the user moves
+    /// around without calling zoom_anchor), `maybe_enter_sphere`
+    /// must NOT truncate the anchor, because that would collapse
+    /// the user's zoom depth on the next `zoom_anchor` call (the
+    /// "teleport to layer 29" bug). Stays Cartesian; the raycast /
+    /// render pipeline handles deep Cartesian anchors inside a body
+    /// via Body frame + body-march fallback.
     #[test]
-    fn maybe_enter_sphere_fires_when_anchor_descended_past_body() {
-        // The non-sphere-aware spawn path (old bug): camera built
-        // via `from_frame_local` at depth 10 lands with a Cartesian
-        // anchor that descends PAST the body cell into XYZ children.
-        // The fix: detect the body ancestor, truncate, and init.
+    fn maybe_enter_sphere_is_no_op_when_anchor_past_body() {
         let (lib, root) = sphere_world();
         let xyz = [1.5_f32, 1.82, 1.5];
         let mut pos = WorldPos::from_frame_local(&Path::root(), xyz, 10);
-        assert_eq!(pos.anchor.depth(), 10, "precondition");
-        assert!(pos.sphere.is_none(), "precondition: sphere not yet set");
-        // Camera XYZ is inside the body cell (slot (1,1,1) of root).
-        // `maybe_enter_sphere` should find the body at depth 1 and
-        // re-anchor to it.
+        assert!(pos.sphere.is_none());
         let t = pos.maybe_enter_sphere(&lib, root);
-        assert!(matches!(t, Transition::SphereEntry { .. }));
-        let s = pos.sphere.expect("sphere initialized");
-        assert_eq!(s.body_path.depth(), 1, "re-anchored to body cell");
-        assert_eq!(pos.anchor.depth(), 1, "anchor truncated to body");
-        // uvr_offset should map back to the camera's body-local
-        // XYZ via face_space_to_body_point. The body occupies world
-        // slot (1,1,1), so body-local = (world - 1) * 3. Compare in
-        // body-local coords at f32 precision.
-        use crate::world::cubesphere::face_space_to_body_point;
-        let recovered_body_local = face_space_to_body_point(
-            s.face, s.uvr_offset[0], s.uvr_offset[1], s.uvr_offset[2],
-            s.inner_r, s.outer_r, 3.0,
-        );
-        let expected_body_local = [
-            (xyz[0] - 1.0) * 3.0,
-            (xyz[1] - 1.0) * 3.0,
-            (xyz[2] - 1.0) * 3.0,
-        ];
-        for i in 0..3 {
-            assert!(
-                (recovered_body_local[i] - expected_body_local[i]).abs() < 1e-4,
-                "axis {i}: recovered {} vs expected {}",
-                recovered_body_local[i], expected_body_local[i],
-            );
-        }
-        // Camera sits inside the outer shell (above surface but below
-        // outer_r), so rn should be in [0, 1). Face = PosY (camera is
-        // above center on the y axis).
-        assert_eq!(s.face, crate::world::cubesphere::Face::PosY);
-        assert!(s.uvr_offset[2] > 0.0 && s.uvr_offset[2] < 1.0);
+        assert!(matches!(t, Transition::None),
+            "maybe_enter_sphere must not fire on deep anchors past body");
+        assert!(pos.sphere.is_none(),
+            "sphere state must not initialize on deep-past-body anchors");
+        assert_eq!(pos.anchor.depth(), 10, "anchor must not be truncated");
     }
 
     #[test]
@@ -1264,21 +1214,47 @@ mod tests {
     }
 
     #[test]
-    fn deepened_to_with_handles_already_deep_cartesian_anchor() {
-        // Reproduces the pre-fix bug: a WorldPos built non-sphere-aware
-        // at depth 10 inside a body cell must still get SphereState
-        // initialized on `deepened_to_with`.
+    fn deepened_to_with_on_already_deep_cartesian_stays_cartesian() {
+        // If `from_frame_local` went straight to a deep Cartesian
+        // anchor past the body, `deepened_to_with` does not
+        // retroactively recover the sphere state — those XYZ slots
+        // aren't UVR. Callers that need a deep sphere anchor must
+        // build from depth 1 first, then deepen.
         let (lib, root) = sphere_world();
         let xyz = [1.5_f32, 1.82, 1.5];
-        // Simulate the old buggy bulk construction.
         let pos = WorldPos::from_frame_local(&Path::root(), xyz, 10);
         assert!(pos.sphere.is_none());
         let pos = pos.deepened_to_with(15, &lib, root);
-        let s = pos.sphere.expect("sphere state initialized mid-deepen");
+        assert!(pos.sphere.is_none(),
+            "deep Cartesian anchor stays Cartesian — don't truncate");
         assert_eq!(pos.total_depth(), 15);
-        // Anchor got re-anchored to body, then symbolic UVR descent.
-        assert_eq!(s.body_path.depth(), 1);
-        assert_eq!(s.uvr_path.depth(), 13);
+    }
+
+    #[test]
+    fn maybe_enter_sphere_does_not_collapse_on_repeated_zoom_in() {
+        // The user-reported "teleport to layer 29" bug: zooming in
+        // from a Cartesian anchor already past the body triggered
+        // `maybe_enter_sphere`, which previously truncated the
+        // anchor and dropped `total_depth` from N+1 to 2.
+        let (lib, root) = sphere_world();
+        let xyz = [1.5_f32, 1.82, 1.5];
+        let pos = WorldPos::from_frame_local(&Path::root(), xyz, 1)
+            .deepened_to_with(6, &lib, root);
+        // At depth 6 with spawn-aware build, we expect sphere state.
+        let s_before = pos.sphere.expect("sphere initialized at shallow");
+        let depth_before = pos.total_depth();
+        assert_eq!(depth_before, 6);
+        // Simulate a single zoom_in + maybe_enter_sphere (what
+        // `zoom_anchor` does). Sphere-Some: uvr_path extends,
+        // maybe_enter_sphere is idempotent.
+        let mut pos2 = pos;
+        pos2.zoom_in();
+        pos2.maybe_enter_sphere(&lib, root);
+        let s_after = pos2.sphere.expect("sphere still set");
+        assert_eq!(pos2.total_depth(), depth_before + 1,
+            "zoom_in must increase total_depth by exactly 1, not collapse");
+        assert_eq!(s_before.body_path, s_after.body_path);
+        assert_eq!(s_after.uvr_path.depth(), s_before.uvr_path.depth() + 1);
     }
 
     /// Regression: a camera positioned INSIDE the body cell but
