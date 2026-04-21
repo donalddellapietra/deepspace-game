@@ -50,11 +50,18 @@ fn sremap_tree_query(root_node_idx: u32, c: vec3<f32>, max_depth: u32) -> vec2<f
     return vec2<f32>(0.0, 1e-3);
 }
 
-// The main sphere trace. Walks a world-space straight ray through a
-// unit-ball-shaped "sphere body" backed by a Cartesian tree in cube
-// coords. Returns a HitResult compatible with the rest of the
-// renderer (hit / t / normal / color / cell_min / cell_size).
-fn sremap_march(root_node_idx: u32, ray_origin: vec3<f32>, ray_dir_in: vec3<f32>) -> HitResult {
+// The sphere body fills the frame's [0, 3)^3 cube when it's the root:
+// centered at (1.5, 1.5, 1.5), radius 1.5.
+const SREMAP_BALL_CENTER: vec3<f32> = vec3<f32>(1.5, 1.5, 1.5);
+const SREMAP_BALL_RADIUS: f32 = 1.5;
+
+// The main sphere trace. The sphere body is a ball of radius
+// SREMAP_BALL_RADIUS centered at SREMAP_BALL_CENTER in the input
+// frame. Walks a frame-space straight ray through it; backing tree
+// lives in cube coords [-1, 1]^3 mapped through F. Returns a
+// HitResult in frame-space units, compatible with the rest of the
+// renderer pipeline.
+fn sremap_march(root_node_idx: u32, frame_ray_origin: vec3<f32>, frame_ray_dir: vec3<f32>) -> HitResult {
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
@@ -65,13 +72,23 @@ fn sremap_march(root_node_idx: u32, ray_origin: vec3<f32>, ray_dir_in: vec3<f32>
     result.frame_level = 0u;
     result.frame_scale = 1.0;
 
-    let dmag = length(ray_dir_in);
-    if (dmag < 1e-6) {
-        return result;
-    }
-    let d = ray_dir_in / dmag;
+    // Transform frame-space ray into unit-ball-local space (ball
+    // becomes radius 1 at origin). Frame-space t corresponds to
+    // frame_ray_dir magnitude units; we convert everything to a
+    // unit-direction inside the local space so arc lengths line up.
+    let origin_local = (frame_ray_origin - SREMAP_BALL_CENTER) / SREMAP_BALL_RADIUS;
+    let dmag_frame = length(frame_ray_dir);
+    if (dmag_frame < 1e-6) { return result; }
+    let dir_frame_unit = frame_ray_dir / dmag_frame;
+    // In local space, 1 unit of arc = 1 frame unit / radius. The
+    // direction vector's magnitude there is `1/radius` per 1 frame
+    // arc; a unit-length local direction `d` advances by `radius`
+    // frame units per unit of local arc length `s`. We march in `s`
+    // and convert to frame t = s / (1/radius) · (1/dmag_frame)
+    //                        = s * radius / dmag_frame.
+    let d = dir_frame_unit; // direction is scale-invariant (unit)
 
-    let rb = sremap_ray_unit_ball(ray_origin, d);
+    let rb = sremap_ray_unit_ball(origin_local, d);
     if (rb.z < 0.5) {
         return result; // miss
     }
@@ -82,25 +99,25 @@ fn sremap_march(root_node_idx: u32, ray_origin: vec3<f32>, ray_dir_in: vec3<f32>
     }
 
     let entry_offset = 1e-3;
-    let min_world_step = 1e-4;
+    let min_local_step = 1e-4;
     let sigma_floor = 0.02;
     let newton_iters = 4u;
     let max_steps = 256u;
     let max_depth = uniforms.max_depth;
 
-    var t = max(t_enter, 0.0) + entry_offset;
-    let w_entry = ray_origin + d * t;
+    var s = max(t_enter, 0.0) + entry_offset;
+    let w_entry = origin_local + d * s;
     var c_warm = w_entry;
 
-    var prev_t = t;
+    var prev_s = s;
     var prev_filled = false;
 
     for (var step: u32 = 0u; step < max_steps; step = step + 1u) {
-        if (t > t_exit + min_world_step) {
+        if (s > t_exit + min_local_step) {
             return result; // exited ball
         }
-        let w = ray_origin + d * t;
-        let c = sremap_inverse(w, c_warm, newton_iters);
+        let w_local = origin_local + d * s;
+        let c = sremap_inverse(w_local, c_warm, newton_iters);
         c_warm = c;
 
         let q = sremap_tree_query(root_node_idx, c, max_depth);
@@ -108,18 +125,18 @@ fn sremap_march(root_node_idx: u32, ray_origin: vec3<f32>, ray_dir_in: vec3<f32>
         let safe = q.y;
 
         if (filled && !prev_filled) {
-            // Crossed empty→filled: refine via linear interp.
-            let t_hit = select(0.5 * (prev_t + t), t, step == 0u);
-            let w_hit = ray_origin + d * t_hit;
-            // Convert back to camera-frame t: the caller's ray_dir
-            // is ray_dir_in (not normalized); world dist = t_hit
-            // since we normalized. Scale by original magnitude.
+            // Crossed empty→filled: refine via linear interp on s.
+            let s_hit = select(0.5 * (prev_s + s), s, step == 0u);
+            let w_hit_local = origin_local + d * s_hit;
+            // Back to frame space for the normal and hit position.
+            let w_hit_frame = w_hit_local * SREMAP_BALL_RADIUS + SREMAP_BALL_CENTER;
+            // Convert local arc length to frame-space t:
+            //   t_frame = s * radius / dmag_frame
             result.hit = true;
-            result.t = t_hit / dmag;
-            let wlen = max(length(w_hit), 1e-6);
-            result.normal = w_hit / wlen;
-            // Placeholder cell: small AABB at hit for highlight math.
-            result.cell_min = w_hit - vec3<f32>(0.01);
+            result.t = s_hit * SREMAP_BALL_RADIUS / dmag_frame;
+            let nlen = max(length(w_hit_local), 1e-6);
+            result.normal = w_hit_local / nlen;
+            result.cell_min = w_hit_frame - vec3<f32>(0.01);
             result.cell_size = 0.02;
             result.color = vec3<f32>(0.7);
             return result;
@@ -127,10 +144,10 @@ fn sremap_march(root_node_idx: u32, ray_origin: vec3<f32>, ray_dir_in: vec3<f32>
 
         let sigma_raw = sremap_sigma_min(c);
         let sigma = max(sigma_raw, sigma_floor);
-        let step_size = max(safe * sigma, min_world_step);
-        prev_t = t;
+        let step_size = max(safe * sigma, min_local_step);
+        prev_s = s;
         prev_filled = filled;
-        t = t + step_size;
+        s = s + step_size;
     }
 
     return result;

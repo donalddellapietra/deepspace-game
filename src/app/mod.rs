@@ -211,6 +211,12 @@ pub struct App {
     /// Consumed by `EntityStore::tick` to zero out the Y velocity
     /// component so entities stay on the ground they spawned on.
     pub(super) entity_surface_y: Option<f32>,
+    /// When true, the renderer dispatches into `sremap_march` (the
+    /// cube→sphere remap shader) regardless of `active_frame.kind`.
+    /// Set from `WorldPreset::RemapSphere`; the tree is a plain
+    /// Cartesian ball and the shader bends rays through F to render
+    /// it as a sphere. See `src/world/sphere_remap.rs`.
+    pub(super) render_as_remap_sphere: bool,
     /// Cached subtree NodeId for the soldier model loaded from
     /// `assets/vox/soldier.vox` on first `spawn_test_entities` call.
     /// `None` until the first press of N or M. Caches the parsed
@@ -323,6 +329,10 @@ impl App {
         let entity_render_mode = test_cfg.entity_render_mode;
         let disable_entities = test_cfg.disable_entities;
         let entity_surface_y = bootstrap::surface_y_for_preset(&test_cfg.world_preset);
+        let render_as_remap_sphere = matches!(
+            test_cfg.world_preset,
+            bootstrap::WorldPreset::RemapSphere { .. }
+        );
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
         // Pass the raw `Option` through so each preset's
@@ -453,6 +463,7 @@ impl App {
             entity_render_mode,
             disable_entities,
             entity_surface_y,
+            render_as_remap_sphere,
             cached_soldier_subtree: None,
             interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,

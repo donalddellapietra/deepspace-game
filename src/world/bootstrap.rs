@@ -78,6 +78,17 @@ pub enum WorldPreset {
     /// that the ray-march preserves precision across deep pops —
     /// stars at ancestor-depth 1 through N−1 must all render.
     Stars,
+    /// "The sphere = cube" experiment: a plain Cartesian tree that
+    /// the renderer displays as a unit ball via the Nowell
+    /// cube→sphere remap. No CubedSphereBody/Face node kinds, no
+    /// face subtrees, no Jacobian descent — the tree is a regular
+    /// Cartesian ball-shape and the shader bends rays through F.
+    /// See `src/world/sphere_remap.rs` + `sphere_trace.rs`.
+    RemapSphere {
+        /// Total depth of the uniform Cartesian tree. Interior is
+        /// filled with stone so a camera outside sees a silhouette.
+        layers: u8,
+    },
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -109,6 +120,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
         | WorldPreset::Stars
+        | WorldPreset::RemapSphere { .. }
         | WorldPreset::Scene { .. } => None,
     }
 }
@@ -180,6 +192,51 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
             plain_layers.unwrap_or(40),
         ),
+        WorldPreset::RemapSphere { layers } => bootstrap_remap_sphere_world(layers),
+    }
+}
+
+/// Bootstrap a uniform-filled Cartesian tree of `layers` levels; the
+/// renderer displays it as a unit ball via the Nowell remap (see
+/// `ROOT_KIND_REMAP_SPHERE`). No special node kinds or face subtrees
+/// — plain Cartesian dedup collapses the whole tree to a chain of
+/// `layers` nodes. Spawn the camera outside the ball, looking in.
+fn bootstrap_remap_sphere_world(layers: u8) -> WorldBootstrap {
+    assert!(layers >= 1, "remap-sphere world must have ≥1 layer");
+    assert!(
+        (layers as usize) <= MAX_DEPTH,
+        "remap-sphere layers {} exceeds MAX_DEPTH {}",
+        layers,
+        MAX_DEPTH,
+    );
+
+    let mut library = NodeLibrary::default();
+    let child = library.build_uniform_subtree(block::STONE, layers as u32);
+    let root = match child {
+        Child::Node(id) => id,
+        // layers == 0 shouldn't happen per the assert; treat as single solid.
+        _ => library.insert(uniform_children(Child::Block(block::STONE))),
+    };
+
+    let world = WorldState { root, library };
+
+    // Spawn outside the ball in frame-local coords. Ball center is
+    // (1.5, 1.5, 1.5) radius 1.5; sit at (1.5, 1.5, -2.5) looking +Z.
+    // anchor_depth=8: enough subdivision for stable camera motion.
+    let spawn = WorldPos::from_frame_local(
+        &Path::root(),
+        [1.5, 1.5, -2.5],
+        8,
+    );
+
+    WorldBootstrap {
+        world,
+        planet_path: None,
+        default_spawn_pos: spawn,
+        default_spawn_yaw: 0.0,
+        default_spawn_pitch: 0.0,
+        plain_layers: layers,
+        color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
 

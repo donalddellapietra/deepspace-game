@@ -194,6 +194,9 @@ impl TestConfig {
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
                 "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
+                "--remap-sphere-world" => {
+                    cfg.world_preset = WorldPreset::RemapSphere { layers: 8 };
+                }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,

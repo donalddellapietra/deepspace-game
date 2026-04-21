@@ -47,6 +47,9 @@ pub const MAX_RIBBON_LEN: usize = 64;
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
 pub const ROOT_KIND_FACE: u32 = 2;
+/// Cartesian tree, rendered as a unit ball via the Nowell cube→sphere
+/// remap. Dispatches into `sremap_march` in sphere_trace.wgsl.
+pub const ROOT_KIND_REMAP_SPHERE: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -273,6 +276,19 @@ impl Renderer {
     /// Set the frame-root NodeKind to Cartesian (default).
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
+        self.root_radii = [0.0; 4];
+        self.root_face_meta = [0; 4];
+        self.root_face_bounds = [0.0; 4];
+        self.root_face_pop_pos = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Set the frame-root to a remap-sphere: a plain Cartesian tree
+    /// rendered as a unit ball via the Nowell cube→sphere remap. The
+    /// ball fills the `[0, 3)^3` frame (center=1.5, radius=1.5);
+    /// `sremap_march` in sphere_trace.wgsl handles dispatch.
+    pub fn set_root_kind_remap_sphere(&mut self) {
+        self.root_kind = ROOT_KIND_REMAP_SPHERE;
         self.root_radii = [0.0; 4];
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
