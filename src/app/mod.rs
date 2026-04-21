@@ -507,6 +507,32 @@ impl App {
     /// render root descends from `world.root` along the camera's
     /// anchor path.
     pub(super) fn render_frame(&self) -> ActiveFrame {
+        // Sphere cameras: build the sub-frame at the camera's FULL
+        // uvr_path depth. Critical for f32 precision — a shallow
+        // sub-frame (via `with_render_margin`) forces `in_sub_frame`
+        // to project the camera's deep anchor into a coarse [0,3)³
+        // box, losing enough precision to collapse multiple anchor
+        // depths to the same local coord. At layer 18+ a render
+        // margin of 4 makes layer N and layer N+1 produce byte-
+        // identical renders (pit geometry invisible past depth ~10).
+        //
+        // For Cartesian cameras we keep the `RENDER_ANCHOR_DEPTH /
+        // K / RENDER_FRAME_CONTEXT` scheme: there the shader marches
+        // a "spatial bubble" around the camera with LOD handling
+        // finer cells, so a deeper render root would only cost
+        // register pressure in the DDA without adding detail.
+        if let Some(sphere) = self.camera.position.sphere.as_ref() {
+            let body_depth = sphere.body_path.depth();
+            let uvr_depth = sphere.uvr_path.depth();
+            let desired = body_depth
+                .saturating_add(1)
+                .saturating_add(uvr_depth)
+                .min(RENDER_FRAME_MAX_DEPTH);
+            return frame::compute_render_frame(
+                &self.world.library, self.world.root,
+                &self.camera.position, desired,
+            );
+        }
         // Deepen the camera's anchor to `RENDER_ANCHOR_DEPTH` so
         // the render frame depth is a function of camera position,
         // not the user's zoom level. See `RENDER_ANCHOR_DEPTH`.
