@@ -166,3 +166,91 @@ fn sphere_probe_anchor_equals_break_anchor() {
         );
     }
 }
+
+/// Deep-depth sphere sanity. The user reports the rendered planet
+/// geometry breaks down past UI layer ~18-20 even though the CPU
+/// raycast in-pipeline tests pass to depth 30. This test pushes the
+/// SAME harness-driven scenario the shallow sphere tests use
+/// (camera parked just above the planet surface, looking down,
+/// probe + break) but through the full deep-depth range that the
+/// user actually zooms to at runtime.
+///
+/// Break path length at anchor depth N must be N (walker descends
+/// to the edit-anchor cell, no off-by-one in the face-subtree cap).
+/// Probe must hit at every depth — a miss here is the visible
+/// breakdown: no crosshair target, no highlight, no breakable cell.
+///
+/// **CURRENTLY FAILING** — fails at depth ≥ 10 because the camera
+/// hovers above the shell so SphereState never initializes; the
+/// render + probe fall back to the body-march path, which has a
+/// precision wall around layer 8-10. Fix in progress: route through
+/// SphereSub even when the camera is outside the shell (synthesize
+/// UVR state from where the crosshair points).
+#[test]
+fn sphere_probe_and_break_at_deep_depth() {
+    let mut failures: Vec<String> = Vec::new();
+    for &depth in &[10u8, 15, 20, 25, 30] {
+        let (trace, _, _) = run_scenario(depth, &format!("deep_d{depth}"));
+        if !trace.exit_success {
+            failures.push(format!(
+                "depth {depth}: binary did not exit 0\n--- stderr ---\n{}\n\
+                 --- stdout tail ---\n{}",
+                trace.stderr,
+                trace.stdout.lines().rev().take(20).collect::<Vec<_>>().join("\n"),
+            ));
+            continue;
+        }
+        // Probe at the crosshair — the single source of truth that
+        // drives the visible highlight box, the break action, and
+        // what the shader should be rendering at that pixel.
+        let Some(pre_probe) = trace.probes.first() else {
+            failures.push(format!("depth {depth}: no pre-break probe recorded"));
+            continue;
+        };
+        if !pre_probe.hit {
+            failures.push(format!(
+                "depth {depth}: probe missed (crosshair has no target — visible breakdown)",
+            ));
+            continue;
+        }
+        if pre_probe.anchor.len() != depth as usize {
+            failures.push(format!(
+                "depth {depth}: probe anchor length {} ≠ anchor depth {depth}",
+                pre_probe.anchor.len(),
+            ));
+            continue;
+        }
+        if trace.edits.len() != 1 {
+            failures.push(format!(
+                "depth {depth}: expected exactly one edit, got {}",
+                trace.edits.len(),
+            ));
+            continue;
+        }
+        let edit = &trace.edits[0];
+        if !edit.changed {
+            failures.push(format!(
+                "depth {depth}: break action reported no world change",
+            ));
+            continue;
+        }
+        if edit.anchor.len() != depth as usize {
+            failures.push(format!(
+                "depth {depth}: edit anchor length {} ≠ anchor depth {depth} (walker cap off-by-one?)",
+                edit.anchor.len(),
+            ));
+            continue;
+        }
+        if pre_probe.anchor != edit.anchor {
+            failures.push(format!(
+                "depth {depth}: probe anchor {:?} ≠ edit anchor {:?}",
+                pre_probe.anchor, edit.anchor,
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "deep-depth sphere scenarios failed:\n{}",
+        failures.join("\n"),
+    );
+}
