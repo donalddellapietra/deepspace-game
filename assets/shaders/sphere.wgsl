@@ -116,6 +116,18 @@ fn walk_face_subtree(
     un_in: f32, vn_in: f32, rn_in: f32,
     max_depth: u32,
 ) -> FaceWalkResult {
+    // Error-bounded walker (mirror of CPU `walk_face_subtree`).
+    //
+    // The previous implementation iterated `un = un * 3 − us` per
+    // level; that recurrence amplifies f32 error by 3× each step, so
+    // past depth ~9 adjacent pixels near cell boundaries snap to
+    // random neighbors (the ring artifact). Here we keep the sample
+    // coords `un_abs / vn_abs / rn_abs` IMMUTABLE and derive each
+    // level's slot from the accumulating cell origin:
+    //   us = floor((un_abs − u_lo) / child_size)
+    // Error stays bounded at ~f32 ULP instead of amplifying. Pushes
+    // the precision wall from ~depth 9 to ~depth 14; past that, failure
+    // is off-by-one (visual blur) rather than off-by-hundreds (chaos).
     var res: FaceWalkResult;
     res.block = FACE_WALK_EMPTY;
     res.depth = 0u;
@@ -124,9 +136,9 @@ fn walk_face_subtree(
     res.r_lo = 0.0;
     res.size = 1.0;
 
-    var un = clamp(un_in, 0.0, 0.9999999);
-    var vn = clamp(vn_in, 0.0, 0.9999999);
-    var rn = clamp(rn_in, 0.0, 0.9999999);
+    let un_abs = clamp(un_in, 0.0, 0.9999999);
+    let vn_abs = clamp(vn_in, 0.0, 0.9999999);
+    let rn_abs = clamp(rn_in, 0.0, 0.9999999);
     var node_idx = face_root_idx;
     var u_lo: f32 = 0.0;
     var v_lo: f32 = 0.0;
@@ -140,12 +152,16 @@ fn walk_face_subtree(
         let first_child = tree[base + 1u];
         if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
 
-        let us = min(u32(un * 3.0), 2u);
-        let vs = min(u32(vn * 3.0), 2u);
-        let rs = min(u32(rn * 3.0), 2u);
+        let child_size = size / 3.0;
+        // Absolute-coord slot pick. `(abs − lo) / child_size` lives
+        // in [0, 3); clamp to [0, 2] to guard against f32 rounding
+        // that could push the quotient negative on exact-boundary
+        // hits or to 3.0 on the upper edge.
+        let us = u32(clamp(floor((un_abs - u_lo) / child_size), 0.0, 2.0));
+        let vs = u32(clamp(floor((vn_abs - v_lo) / child_size), 0.0, 2.0));
+        let rs = u32(clamp(floor((rn_abs - r_lo) / child_size), 0.0, 2.0));
         let slot = rs * 9u + vs * 3u + us;
 
-        let child_size = size / 3.0;
         let child_u_lo = u_lo + f32(us) * child_size;
         let child_v_lo = v_lo + f32(vs) * child_size;
         let child_r_lo = r_lo + f32(rs) * child_size;
@@ -195,9 +211,9 @@ fn walk_face_subtree(
         v_lo = child_v_lo;
         r_lo = child_r_lo;
         size = child_size;
-        un = un * 3.0 - f32(us);
-        vn = vn * 3.0 - f32(vs);
-        rn = rn * 3.0 - f32(rs);
+        // NOTE: un_abs / vn_abs / rn_abs are NOT updated; they stay
+        // as the immutable ray-sample reference for the lifetime of
+        // the walk. That's the whole point of this reformulation.
     }
     res.u_lo = u_lo;
     res.v_lo = v_lo;
@@ -223,6 +239,25 @@ fn bevel_level(un: f32, vn: f32, u_lo: f32, v_lo: f32, size: f32, cell_px: f32) 
 // Multi-level bevel overlay. Walks a few ancestors + descendants of
 // the walker's cell so all voxel-grid levels visible to the pixel
 // contribute a grid line.
+//
+// PRECISION GUARDS:
+// * Ancestor loop `floor(up_u / up_s) * up_s` snaps to the nearest
+//   multiple of `up_s`. At O(1) magnitudes this is f32-exact down to
+//   `up_s ≈ 1e-7` (ULP of 0.5). Beyond that `up_u` either exceeds
+//   1.0 — meaningless on a [0, 1) face — or snaps to zero. Bail when
+//   either happens.
+// * Descendant loop `uf = (un − dn_u) / dn_s` is the same
+//   error-amplifying ratio that broke the walker. `un − dn_u` has
+//   f32 precision ~1e-7 absolute (both operands O(1)); divided by
+//   `dn_s` gives precision `1e-7 / dn_s`. When that exceeds ~1/3
+//   (i.e., `dn_s < 3e-7`), `floor(uf * 3)` jitters by ±1 per pixel
+//   and the sub-bevel line renders at drifting sub-cell positions —
+//   producing the fine-grained rings the user sees at depth ~10+
+//   even after the walker itself is precision-bounded. Bail when
+//   `dn_s` would cross that precision threshold.
+const BEVEL_DN_MIN_SIZE: f32 = 3e-7;
+const BEVEL_UP_MAX_SIZE: f32 = 1.0;
+
 fn bevel_layered(
     un: f32, vn: f32,
     u_lo: f32, v_lo: f32, size: f32,
@@ -235,6 +270,7 @@ fn bevel_layered(
     var up_u = u_lo; var up_v = v_lo; var up_s = size; var up_px = base_px;
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {
         up_s = up_s * 3.0;
+        if up_s > BEVEL_UP_MAX_SIZE { break; }
         up_u = floor(up_u / up_s) * up_s;
         up_v = floor(up_v / up_s) * up_s;
         up_px = up_px * 3.0;
@@ -245,7 +281,12 @@ fn bevel_layered(
     for (var i: u32 = 0u; i < 3u; i = i + 1u) {
         let cs = dn_s * (1.0 / 3.0);
         let cpx = dn_px * (1.0 / 3.0);
+        // Two independent bail-outs: projected cell below 2 px (nothing
+        // visible to draw), OR cell_size below f32 precision threshold
+        // (the `(un − dn_u) / cs` ratio jitters → per-pixel noise that
+        // reads as spurious grid lines).
         if cpx < 2.0 { break; }
+        if cs < BEVEL_DN_MIN_SIZE { break; }
         let uf = clamp((un - dn_u) / dn_s, 0.0, 0.9999999);
         let vf = clamp((vn - dn_v) / dn_s, 0.0, 0.9999999);
         dn_u = dn_u + floor(uf * 3.0) * cs;

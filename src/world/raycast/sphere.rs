@@ -91,11 +91,42 @@ fn walk_face_subtree(
     un_in: f32, vn_in: f32, rn_in: f32,
     max_depth: u32,
 ) -> FaceWalk {
+    // Error-bounded walker (approach #1).
+    //
+    // The previous implementation iterated `un = un * 3 - us` at each
+    // descent level. That recurrence AMPLIFIES any f32 error in `un`
+    // by a factor of 3 per level — a ~1e-7 initial precision becomes
+    // 3^n · 1e-7 by depth n. Past depth ~9 the error exceeds a cell
+    // width and pixels near cell boundaries snap to random neighbors
+    // (the "concentric rings" artifact the user sees).
+    //
+    // Here we keep `un_abs`/`vn_abs`/`rn_abs` IMMUTABLE throughout the
+    // walk and derive each level's slot from the accumulating cell
+    // origin: `us = floor((un_abs − u_lo) / child_size)`. Error stays
+    // bounded at ~f32 ULP absolute, not amplified. The precision wall
+    // shifts from ~depth 9 to ~depth 14 (where cell_size approaches
+    // f32 ULP of the O(1) absolute coords and the subtraction loses
+    // significance). When it fails past that, it fails by off-by-one
+    // slot — a visually smooth blur, not ring chaos.
     let limit = max_depth.min(MAX_FACE_DEPTH).max(1);
+    let un_abs = un_in.clamp(0.0, 0.9999999);
+    let vn_abs = vn_in.clamp(0.0, 0.9999999);
+    let rn_abs = rn_in.clamp(0.0, 0.9999999);
+
+    // Compute a single level's slot from absolute coords + current
+    // cell origin. Shared between the main descent and the empty-cell
+    // padding loop so both use the precision-safe formulation.
+    #[inline]
+    fn slot_at_level(abs_c: f32, lo: f32, child_size: f32) -> usize {
+        // (abs_c − lo) is in [0, size); divide by size/3 → [0, 3).
+        // Clamp guards against f32 rounding that could push the
+        // quotient to a tiny negative (lost slot) or exactly 3.0
+        // (overflow).
+        let raw = ((abs_c - lo) / child_size).floor();
+        raw.clamp(0.0, 2.0) as usize
+    }
+
     let mut node_id = face_root_id;
-    let mut un = un_in.clamp(0.0, 0.9999999);
-    let mut vn = vn_in.clamp(0.0, 0.9999999);
-    let mut rn = rn_in.clamp(0.0, 0.9999999);
     let mut u_lo: f32 = 0.0;
     let mut v_lo: f32 = 0.0;
     let mut r_lo: f32 = 0.0;
@@ -109,11 +140,11 @@ fn walk_face_subtree(
                 u_lo, v_lo, r_lo, size, path,
             };
         };
-        let us = ((un * 3.0) as usize).min(2);
-        let vs = ((vn * 3.0) as usize).min(2);
-        let rs = ((rn * 3.0) as usize).min(2);
-        let slot = slot_index(us, vs, rs);
         let child_size = size / 3.0;
+        let us = slot_at_level(un_abs, u_lo, child_size);
+        let vs = slot_at_level(vn_abs, v_lo, child_size);
+        let rs = slot_at_level(rn_abs, r_lo, child_size);
+        let slot = slot_index(us, vs, rs);
         let child_u_lo = u_lo + us as f32 * child_size;
         let child_v_lo = v_lo + vs as f32 * child_size;
         let child_r_lo = r_lo + rs as f32 * child_size;
@@ -121,18 +152,24 @@ fn walk_face_subtree(
 
         match node.children[slot] {
             Child::Empty => {
-                // Pad path to `limit` so placement depth is uniform.
-                let mut sub_un = un * 3.0 - us as f32;
-                let mut sub_vn = vn * 3.0 - vs as f32;
-                let mut sub_rn = rn * 3.0 - rs as f32;
+                // Pad path to `limit` using the same absolute-coord
+                // slot calc. Each padding level narrows the cell
+                // origin by one more step so `propagate_edit` lands
+                // at a uniform depth.
+                let mut pad_u_lo = child_u_lo;
+                let mut pad_v_lo = child_v_lo;
+                let mut pad_r_lo = child_r_lo;
+                let mut pad_size = child_size;
                 for _ in d..limit {
-                    let us2 = ((sub_un * 3.0) as usize).min(2);
-                    let vs2 = ((sub_vn * 3.0) as usize).min(2);
-                    let rs2 = ((sub_rn * 3.0) as usize).min(2);
+                    let pad_child_size = pad_size / 3.0;
+                    let us2 = slot_at_level(un_abs, pad_u_lo, pad_child_size);
+                    let vs2 = slot_at_level(vn_abs, pad_v_lo, pad_child_size);
+                    let rs2 = slot_at_level(rn_abs, pad_r_lo, pad_child_size);
                     path.push((EMPTY_NODE, slot_index(us2, vs2, rs2)));
-                    sub_un = sub_un * 3.0 - us2 as f32;
-                    sub_vn = sub_vn * 3.0 - vs2 as f32;
-                    sub_rn = sub_rn * 3.0 - rs2 as f32;
+                    pad_u_lo += us2 as f32 * pad_child_size;
+                    pad_v_lo += vs2 as f32 * pad_child_size;
+                    pad_r_lo += rs2 as f32 * pad_child_size;
+                    pad_size = pad_child_size;
                 }
                 return FaceWalk {
                     block: EMPTY_CELL, depth: d,
@@ -158,20 +195,6 @@ fn walk_face_subtree(
                 };
             }
             Child::Node(nid) => {
-                // Descend all the way to `limit` through every
-                // Child::Node, even when the subtree is uniform.
-                // Matches Cartesian's walker: deduplicated chains
-                // are regular Child::Node pointers, and walking
-                // them preserves `hit.path.len() == limit`, so
-                // edits land at the user's chosen zoom size rather
-                // than a dedup-chunk size.
-                //
-                // For our current anchor-depth range (≤ ~15 face
-                // levels) the resulting `w.size` stays well inside
-                // f32 precision. If that range ever grows past ~20
-                // face levels, revisit — at `size < 1e-7`, cell-
-                // boundary ray-plane intersections start to fail
-                // to distinguish `u_lo` from `u_hi`.
                 if d == limit {
                     let Some(child) = library.get(nid) else {
                         return FaceWalk {
@@ -197,13 +220,13 @@ fn walk_face_subtree(
                     };
                 }
                 node_id = nid;
-                un = un * 3.0 - us as f32;
-                vn = vn * 3.0 - vs as f32;
-                rn = rn * 3.0 - rs as f32;
                 u_lo = child_u_lo;
                 v_lo = child_v_lo;
                 r_lo = child_r_lo;
                 size = child_size;
+                // NOTE: `un_abs`/`vn_abs`/`rn_abs` are NOT updated —
+                // they stay as the immutable ray-sample reference.
+                // That's the whole point of this reformulation.
             }
         }
     }
