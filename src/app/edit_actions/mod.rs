@@ -41,7 +41,11 @@ impl App {
     /// can be compared directly to this value.
     pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
         let frame_depth = frame_path.depth();
-        let anchor_depth = self.camera.position.anchor.depth();
+        // Use total_depth — sphere-aware. When the camera is in a
+        // body cell, further zoom lives in `SphereState.uvr_path`,
+        // so the user-facing zoom depth isn't just the Cartesian
+        // anchor.
+        let anchor_depth = self.camera.position.total_depth();
         let k = anchor_depth.saturating_sub(frame_depth) as i32;
         let anchor_cell_size_in_frame = 3.0_f32.powi(1 - k);
         self.interaction_radius_cells as f32 * anchor_cell_size_in_frame

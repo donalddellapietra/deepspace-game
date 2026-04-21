@@ -773,13 +773,16 @@ fn bootstrap_demo_sphere_world() -> WorldBootstrap {
         tree_depth,
     );
     let body_top_y = 1.5 + setup.outer_r;
-    // Depth 2 where f32 decomposition is precise, then deepen by
-    // pure slot arithmetic.
+    // Build at depth 1 (the root-slot level) so `deepened_to_with`
+    // can detect body entry before descending further. Inside a body
+    // cell the descent switches to symbolic UVR space via the
+    // camera's `SphereState`; this is the only spawn path that knows
+    // how to reach deep sphere anchors precisely.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
         [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5],
-        2,
-    ).deepened_to(16);
+        1,
+    ).deepened_to_with(16, &world.library, world.root);
     WorldBootstrap {
         world,
         planet_path: Some(planet_path),

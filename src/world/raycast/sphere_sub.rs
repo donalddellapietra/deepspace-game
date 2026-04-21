@@ -363,6 +363,7 @@ mod tests {
         Vec<(NodeId, usize)>,
     ) {
         use crate::world::anchor::{SphereState, WorldPos};
+        use crate::app::frame::SPHERE_WALKER_BUDGET;
         let world = bootstrap::bootstrap_world(
             bootstrap::WorldPreset::DemoSphere,
             Some(40),
@@ -373,8 +374,14 @@ mod tests {
             p.push(slot_index(1, 1, 1) as u8);
             p
         };
+        // `compute_render_frame` reserves `SPHERE_WALKER_BUDGET`
+        // levels between the SphereSub render depth and the camera's
+        // logical uvr depth (so the DDA has descent budget).
+        // Inflate the camera's uvr_path accordingly so the sub-frame
+        // ends up at the requested `sub_depth`.
+        let uvr_len = sub_depth as u32 + SPHERE_WALKER_BUDGET;
         let mut uvr_path = Path::root();
-        for _ in 0..sub_depth {
+        for _ in 0..uvr_len {
             uvr_path.push(slot_index(1, 1, 1) as u8);
         }
         let camera = WorldPos {
@@ -458,8 +465,13 @@ mod tests {
             chain = lib.insert(uniform_children(Child::Node(chain)));
         }
         // Descend sub_depth levels with slot (1,1,1) each step.
+        // Build `sub_depth + SPHERE_WALKER_BUDGET` levels so both the
+        // sub-frame (at `sub_depth`) and the walker's descent past it
+        // resolve to real nodes, not the placeholder chain above.
+        use crate::app::frame::SPHERE_WALKER_BUDGET;
+        let uvr_len = sub_depth as u32 + SPHERE_WALKER_BUDGET;
         let mut face_subtree = chain;
-        for _ in 0..sub_depth {
+        for _ in 0..uvr_len {
             let mut children = empty_children();
             children[slot_index(1, 1, 1)] = Child::Node(face_subtree);
             face_subtree = lib.insert(children);
@@ -498,7 +510,7 @@ mod tests {
             p
         };
         let mut uvr_path = Path::root();
-        for _ in 0..sub_depth {
+        for _ in 0..uvr_len {
             uvr_path.push(slot_index(1, 1, 1) as u8);
         }
         let camera = WorldPos {

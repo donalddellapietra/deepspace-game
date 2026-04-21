@@ -113,6 +113,16 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 /// because linearization error is perceptible there.
 pub const MIN_SPHERE_SUB_DEPTH: u8 = 3;
 
+/// Walker-budget kept between a `SphereSub` render frame and the
+/// camera's logical depth. The sub-frame DDA descends this many
+/// levels below the render cell to find edit-depth blocks.
+/// `cpu_raycast_in_sub_frame` returns `None` when
+/// `edit_depth == render_path.depth`, so a budget of at least 1 is
+/// required. For `m_logical < MIN_SPHERE_SUB_DEPTH + SPHERE_WALKER_BUDGET`
+/// the frame falls back to Body, whose march can handle shallow
+/// sphere interaction without the linearization.
+pub const SPHERE_WALKER_BUDGET: u32 = 1;
+
 /// Resolve the active render frame from a camera WorldPos +
 /// desired anchor depth.
 ///
@@ -130,15 +140,21 @@ pub fn compute_render_frame(
     // Sphere case: symbolic UVR state provides everything we need.
     // Build the sub-frame directly, no tree-walk decoding.
     if let Some(sphere) = camera.sphere.as_ref() {
-        let logical_m = sphere.uvr_path.depth();
+        let logical_m = sphere.uvr_path.depth() as u32;
         // Target face-subtree depth after `desired_depth` truncation.
         // `desired_depth` is the OVERALL anchor depth; subtract the
         // body-path length + 1 for the face-root slot to get the
         // UVR depth we want to render at.
-        let body_depth = sphere.body_path.depth() as i32;
-        let total_anchor_depth = body_depth + 1 + logical_m as i32;
-        let m_logical = logical_m as i32;
-        let m_truncated = (desired_depth as i32 - body_depth - 1).clamp(0, m_logical) as u32;
+        let body_depth = sphere.body_path.depth() as u32;
+        let total_anchor_depth = (body_depth + 1 + logical_m) as i32;
+        // Reserve `SPHERE_WALKER_BUDGET` levels between the render
+        // frame's uvr depth and the camera's logical uvr depth, so
+        // `cs_raycast_local`'s walker can descend into the sub-frame
+        // to locate edit-depth cells. Without this reservation the
+        // walker_limit collapses to 0 and every raycast misses.
+        let m_ceiling = logical_m.saturating_sub(SPHERE_WALKER_BUDGET);
+        let m_desired = (desired_depth as u32).saturating_sub(body_depth + 1);
+        let m_truncated = m_desired.min(m_ceiling);
 
         // Accumulate un/vn/rn from the first `m_truncated` UVR slots.
         let (un_corner, vn_corner, rn_corner, frame_size) =
@@ -386,11 +402,15 @@ mod tests {
     fn sphere_sub_from_symbolic_uvr_state() {
         use crate::world::anchor::SphereState;
         use crate::world::cubesphere::{Face, FACE_SLOTS};
-        // Build: root → body → face(PosY) → uvr chain × MIN_SPHERE_SUB_DEPTH.
+        // `compute_render_frame` reserves `SPHERE_WALKER_BUDGET`
+        // levels between render depth and logical uvr depth, so
+        // exercising SphereSub at render uvr_depth = MIN_SPHERE_SUB_DEPTH
+        // requires the camera's uvr_path to run deeper.
+        let uvr_len = MIN_SPHERE_SUB_DEPTH as u32 + SPHERE_WALKER_BUDGET;
         let mut lib = NodeLibrary::default();
         let leaf = lib.insert(empty_children());
         let mut chain = leaf;
-        for _ in 0..MIN_SPHERE_SUB_DEPTH {
+        for _ in 0..uvr_len {
             chain = lib.insert(uniform_children(Child::Node(chain)));
         }
         let face = lib.insert_with_kind(
@@ -414,7 +434,7 @@ mod tests {
             p
         };
         let mut uvr_path = Path::root();
-        for _ in 0..MIN_SPHERE_SUB_DEPTH {
+        for _ in 0..uvr_len {
             uvr_path.push(slot_index(1, 1, 1) as u8);
         }
 

@@ -347,10 +347,13 @@ impl App {
                 let depth = test_cfg.spawn_depth.unwrap_or(
                     bootstrap.default_spawn_pos.anchor.depth(),
                 );
-                // Use sphere-aware deepening so spawn positions
-                // inside a planet body correctly transition into
-                // symbolic UVR state.
-                WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
+                // Build to shallow depth 1 first so the initial
+                // anchor slot is set but the body-entry check below
+                // can fire before any Cartesian descent past the body
+                // cell. `deepened_to_with` then descends symbolically
+                // in UVR space when inside a body.
+                let initial_depth = depth.min(1);
+                WorldPos::from_frame_local(&Path::root(), xyz, initial_depth)
                     .deepened_to_with(depth, &world.library, world.root)
             }
             None => {
@@ -491,7 +494,11 @@ impl App {
 
     #[inline]
     pub(super) fn anchor_depth(&self) -> u32 {
-        self.camera.position.anchor.depth() as u32
+        // Total zoom depth, sphere-aware: when the camera is inside
+        // a cubed-sphere body the anchor truncates to the body cell
+        // and further descent lives in `SphereState.uvr_path`. The
+        // user-facing zoom level is `body_depth + 1 + uvr_depth`.
+        self.camera.position.total_depth() as u32
     }
 
     #[inline]
