@@ -215,7 +215,7 @@ fn sphere_dig_down_descent() {
         script = script
             .emit(&format!("d{d}"))
             .wait(5)
-            .pitch(-0.5)
+            .pitch(-0.95)
             .yaw(0.3)
             .wait(5)
             .screenshot(&shot)
