@@ -314,18 +314,12 @@ fn analytic_sphere_hit(
     let n_int = i32(n_per_axis);
     let max_iter = 150u;
 
-    var prev_grid = vec3<i32>(-9999);
-    var last_face_axis: u32 = 0u;
-    var last_face_sign: f32 = 0.0;
     var t_w = t_start_w;
     var body = vec3<f32>(0.0);
     var grid = vec3<i32>(0);
     var solid_hit = false;
-    var is_first_surface_hit = false;
-    var iter_count: u32 = 0u;
 
     for (var it = 0u; it < max_iter; it = it + 1u) {
-        iter_count = it;
         let world_hit = ray_origin + unit_dir * t_w;
         let q = (world_hit - sphere_center) * (1.0 / sphere_radius);
         if dot(q, q) > 1.02 {
@@ -342,43 +336,26 @@ fn analytic_sphere_hit(
             clamp(i32(floor(grid_f.z)), 0, n_int - 1),
         );
 
-        if it > 0u {
-            if grid.x != prev_grid.x {
-                last_face_axis = 0u;
-                last_face_sign = select(-1.0, 1.0, grid.x < prev_grid.x);
-            } else if grid.y != prev_grid.y {
-                last_face_axis = 1u;
-                last_face_sign = select(-1.0, 1.0, grid.y < prev_grid.y);
-            } else if grid.z != prev_grid.z {
-                last_face_axis = 2u;
-                last_face_sign = select(-1.0, 1.0, grid.z < prev_grid.z);
-            }
-        }
-
         if sphere_body_voxel_solid(body_root_bfs, grid, body_depth) {
             solid_hit = true;
-            is_first_surface_hit = (it == 0u) && camera_outside;
             break;
         }
 
-        prev_grid = grid;
         t_w = t_w + world_step;
     }
 
     if !solid_hit { return result; }
 
-    // Bevel UV comes from a face pick (argmax for surface hits,
-    // DDA-tracked axis for interior hits). Face choice only drives
-    // bevel placement — lighting uses a purely radial normal below,
-    // so cube-corner seams don't show in the shading gradient.
-    var face_axis: u32 = last_face_axis;
-    if is_first_surface_hit || iter_count == 0u {
-        let abs_body = abs(body);
-        face_axis = 0u;
-        var face_mag: f32 = abs_body.x;
-        if abs_body.y > face_mag { face_axis = 1u; face_mag = abs_body.y; }
-        if abs_body.z > face_mag { face_axis = 2u; face_mag = abs_body.z; }
-    }
+    // Face pick: always argmax(|body|). Adjacent pixels with nearby
+    // body positions pick the same face, so the bevel UV is smooth
+    // across the visible surface. Seams only appear at cube-corner
+    // projections (three faces meet at one sphere point), which is
+    // inherent to any cube→sphere map.
+    let abs_body = abs(body);
+    var face_axis: u32 = 0u;
+    var face_mag: f32 = abs_body.x;
+    if abs_body.y > face_mag { face_axis = 1u; face_mag = abs_body.y; }
+    if abs_body.z > face_mag { face_axis = 2u; face_mag = abs_body.z; }
     var face_uv = vec2<f32>(0.0);
     if face_axis == 0u { face_uv = body.yz; }
     else if face_axis == 1u { face_uv = body.xz; }
