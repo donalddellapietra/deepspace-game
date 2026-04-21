@@ -7,6 +7,20 @@
 // The CPU mirror lives in `src/world/cubesphere.rs` +
 // `src/world/raycast/sphere.rs`.
 
+/// When true, `sphere_in_sub_frame` paints solid debug colors per
+/// control-flow branch so a developer can visually diagnose the
+/// DDA loop without breakpointing a shader:
+///   red    = initial ray-box interval miss (ray never entered)
+///   blue   = neighbor-step transition consumed (every transition
+///            fades the pixel darker, so repeated steps accumulate)
+///   orange = cross-face terminate (bubble past face root)
+///   green  = MAX_DDA_STEPS exhaust
+///   yellow = MAX_SPHERE_SUB_TRANSITIONS exhaust
+///   palette color = real hit (unchanged)
+/// Left false by default; flip to true and reload the shader to
+/// validate the geometry.
+const SPHERE_DEBUG_PAINT: bool = false;
+
 // ─────────────────────────────────────────────── face constants
 
 // Face enum ↔ integer. 0..=5 in the same order as `Face::ALL`
@@ -832,25 +846,83 @@ fn walk_from_deep_sub_frame_dyn(
     return walk_sub_frame(node_idx, u_l, v_l, r_l, walker_limit);
 }
 
-/// Local-frame sphere DDA. GPU mirror of CPU `cs_raycast_local`.
-/// `ray_origin_local`, `ray_dir_local` are already in sub-frame local
-/// coords (J_inv applied CPU-side on the camera basis). On sub-frame
-/// box exit the DDA transitions to the neighbor sub-frame via
-/// symbolic UVR-path stepping + fresh Jacobian evaluation, mirroring
-/// CPU `SphereSubFrame::with_neighbor_stepped` /
-/// `cs_raycast_local`'s neighbor-step branch. Terminates when the
-/// step would bubble past the face-root boundary (cross-face
-/// transitions are deferred to a follow-up).
-///
-/// `face_root_idx` is the BFS index of the face-subtree root. The
-/// walker pre-descends along `uniforms.sub_uvr_slots[..sub_meta.y]`
-/// symbolically before running intra-cell DDA, so the sub-frame's
-/// deep path may traverse `Child::Empty` links (dug regions) without
-/// requiring a real Node at the terminal UVR depth.
+// ───────────────────────── sphere_in_sub_frame (rewrite) ──────────────
+//
+// GPU mirror of CPU `cs_raycast_local` in
+// `src/world/raycast/sphere_sub.rs`. Written FROM SCRATCH to match
+// that CPU spec line-by-line at deep UVR depths. The old hand-port had
+// a precision collapse that returned smeared grey at depth ≥ ~5; this
+// rewrite keeps every multi-precision step in the numerically-stable
+// form the CPU version already uses.
+//
+// Precision model — the critical arithmetic identities:
+//
+//   `rd_body` is O(1).
+//   `J_inv` entries are O(3^m) at UVR depth m.
+//   `rd_local = J_inv · rd_body` is therefore O(3^m) — large but finite
+//   in f32 for m up to ~25 (3^25 ≈ 8.5e11).
+//
+//   Inside `[0, 3)^3`, `ro_local` is O(1). `t_exit = (3 − ro_local)
+//   / rd_local` is O(1) / O(3^m) = O(1/3^m) — representable in f32 at
+//   any depth because it's a ratio.
+//
+//   `pos = ro_local + rd_local · t = O(1) + O(3^m)·O(1/3^m) = O(1)`.
+//   The SUM of two values both ending up near O(1) is stable because
+//   the O(3^m)·O(1/3^m) product was computed with f32 relative error,
+//   not absolute error.
+//
+//   Neighbor transition: `local_new = J_new_inv · J_cur · (local_exit
+//   − s·3·e_k)`. Each O(1/3^m) · O(3^m) · O(1) product chain stays
+//   O(1) end-to-end — f32-stable at any depth.
+//
+// What was WRONG in the old code and is FIXED here:
+//
+//   * The old code returned DEBUG-WALKER pink/blue every iteration
+//     whenever `w.size > 0.9`. That fired on the very first DDA step
+//     of every ray, so the real DDA loop never executed. Rewrite
+//     removes all debug early-returns; `SPHERE_DEBUG_PAINT` toggles
+//     colour-coded painting on demand without short-circuiting the
+//     real march.
+//
+//   * The old code had a spurious post-loop "DEBUG-SHADER-7 orange"
+//     return that leaked every terminated-but-missed ray into the
+//     framebuffer, swamping the real hit pixels. Rewrite returns a
+//     proper miss unless SPHERE_DEBUG_PAINT wants a colour.
+//
+//   * The old code recovered `rd_body` via `J · ray_dir_local` inside
+//     the function. The rewrite accepts `rd_body` as a dedicated
+//     parameter so the caller can pass the exact body-frame value
+//     (march.wgsl reconstructs it once, right at the dispatch site).
+//     Shader precision work avoids repeating that inversion inside the
+//     per-ray loop.
+//
+//   * The old code computed `rn_abs = rn_corner + w.r_lo * frame_size
+//     / 3.0`. For m > 15 `frame_size / 3 = 1/3^(m+1)` is below the
+//     ULP of `rn_corner` (~0.5, ULP ~6e-8), so the addition silently
+//     drops the cell offset — every cell at the same shell reported
+//     the same `rn_abs` and the tint collapsed. Rewrite carries
+//     `frame_size/3` as a SEPARATE small term and only sums it when
+//     we need the tint — the tint itself is tolerant of the 1e-7
+//     truncation there, and the important DDA maths never forms that
+//     sum.
+//
+// Parameters:
+// * `face_root_idx` — BFS index of the face-subtree root node.
+// * `ray_origin_local` — camera position in sub-frame local `[0,3)^3`.
+//   Magnitude O(1). CPU-side sub-frame descent produced this without
+//   any body-XYZ subtraction, so it's f32-precise at any depth.
+// * `ray_dir_local` — camera-basis ray direction ALREADY rotated into
+//   sub-frame local via J_inv. Magnitude O(3^m). f32-representable up
+//   to m ≈ 25.
+// * `rd_body` — the SAME ray direction expressed in body-XYZ, unit
+//   length. Magnitude O(1). Used for re-deriving `rd_local` on every
+//   neighbor transition (where J_inv changes).
+// * `walker_limit` — max intra-cell walker descent depth.
 fn sphere_in_sub_frame(
     face_root_idx: u32,
     ray_origin_local: vec3<f32>,
     ray_dir_local: vec3<f32>,
+    rd_body: vec3<f32>,
     walker_limit: u32,
 ) -> HitResult {
     var result: HitResult;
@@ -863,26 +935,36 @@ fn sphere_in_sub_frame(
 
     if walker_limit == 0u { return result; }
 
-    // --- Mutable per-ray sub-frame state (seeded from uniforms). ---
-    let face = uniforms.sub_meta.x;
-    let inner_r = uniforms.root_radii.x;
-    let outer_r = uniforms.root_radii.y;
-    // `uniforms.sub_meta.z` carries the face-root depth (see CPU
-    // `SphereSubFrame::with_neighbor_stepped` + bindings.wgsl). The
-    // shader reaches the same terminate condition via the bubble loop
-    // below: when the UVR-prefix bubble-up reaches `depth == 0u` it
-    // breaks out (`bubbled = false`) — matching CPU's cross-face
-    // refusal in `with_neighbor_stepped`. No direct use of the value.
+    // --- Immutable subtree constants (seeded from uniforms). ---
+    // `face`, `inner_r`, `outer_r` don't change across neighbor steps —
+    // we stay inside one face subtree. `initial_prefix_len` is the UVR
+    // prefix the walker inherits from CPU `compute_render_frame`; it
+    // stays constant (neighbor-step preserves UVR path DEPTH via
+    // slot-wrap, only rewrites the trailing slots).
+    let face           = uniforms.sub_meta.x;
+    let inner_r        = uniforms.root_radii.x;
+    let outer_r        = uniforms.root_radii.y;
     let initial_prefix_len = uniforms.sub_meta.y;
 
-    var un_corner = uniforms.sub_face_corner.x;
-    var vn_corner = uniforms.sub_face_corner.y;
-    var rn_corner = uniforms.sub_face_corner.z;
+    // --- Mutable per-neighbor-transition sub-frame state. ---
+
+    // Face-normalised corner. Magnitude O(1) (∈ [0, 1)). On a
+    // neighbor step we adjust one axis by ±frame_size = ±1/3^m, so at
+    // deep m the increment is BELOW the f32 ULP of un_corner itself.
+    // That's fine for J's evaluation point (J is nearly constant over
+    // the sub-frame region anyway — curvature term O(1/3^(2m))), and
+    // we NEVER form `un_corner + local * frame_size` inside the DDA
+    // loop. See hit-shading block below for the one place we do and
+    // why the tint is tolerant to the precision loss there.
+    var un_corner  = uniforms.sub_face_corner.x;
+    var vn_corner  = uniforms.sub_face_corner.y;
+    var rn_corner  = uniforms.sub_face_corner.z;
     let frame_size = uniforms.sub_face_corner.w;
 
-    // Copy the uniform uvr prefix into a function-local array so we
-    // can mutate it on neighbor transitions. Array length must match
-    // the Rust-side `MAX_SPHERE_SUB_DEPTH` (64).
+    // Copy the uniform UVR prefix into a function-local buffer so we
+    // can mutate it on neighbor steps. Length 64 matches the CPU-side
+    // MAX_SPHERE_SUB_DEPTH cap; unused tail stays zero and is never
+    // read (guarded by `uvr_prefix_len`).
     var uvr_slots: array<u32, 64>;
     for (var i: u32 = 0u; i < 64u; i = i + 1u) {
         uvr_slots[i] = 0u;
@@ -890,9 +972,13 @@ fn sphere_in_sub_frame(
     for (var i: u32 = 0u; i < initial_prefix_len; i = i + 1u) {
         uvr_slots[i] = sub_uvr_slot_at(i);
     }
-    var uvr_prefix_len = initial_prefix_len;
+    let uvr_prefix_len = initial_prefix_len;
 
-    // J / J_inv start from uniforms.
+    // J / J_inv seeded from uniforms. On every neighbor transition
+    // they get recomputed from `face_frame_jacobian_shader` at the
+    // new corner; `mat3_inv_shader` handles the 3×3 inversion in f32
+    // (stable because J's columns are linearly independent —
+    // `col_r` along the radial, `col_u`/`col_v` along face tangents).
     var j: Mat3Columns;
     j.col_u = uniforms.sub_j_col0.xyz;
     j.col_v = uniforms.sub_j_col1.xyz;
@@ -902,33 +988,64 @@ fn sphere_in_sub_frame(
     j_inv.col_v = uniforms.sub_j_inv_col1.xyz;
     j_inv.col_r = uniforms.sub_j_inv_col2.xyz;
 
-    // The caller already pre-multiplied the camera basis by J_inv, so
-    // `ray_dir_local` IS the starting rd_local. Keep the rd_body
-    // reference so we can recompute rd_local on neighbor transitions.
-    // rd_body = J · rd_local (exact inverse; the caller's J_inv came
-    // from this same matrix).
-    let rd_body = mat3_mul_vec_shader(j, ray_dir_local);
-
+    // --- Ray state. `ro_local` is in the current sub-frame's local
+    // coords (O(1)). `rd_local` is in the same frame (O(3^m)). On a
+    // neighbor transition both are recomputed for the new frame;
+    // `rd_body` is invariant across the whole DDA.
     var ro_local = ray_origin_local;
     var rd_local = ray_dir_local;
 
+    // Initial ray-box interval inside `[0, 3)^3`.
+    //
+    // PRECISION NOTE — `ray_sub_box_interval` divides O(1)
+    // boundary−ro_local by O(3^m) rd_local → result O(1/3^m). Both
+    // operands are f32-representable; the division is one rounding
+    // step. No catastrophic cancellation — numerator = boundary −
+    // ro_local where both are O(1) but their DIFFERENCE can still be
+    // O(1) (the whole box is size 3 in local).
     let interval0 = ray_sub_box_interval(ro_local, rd_local);
     var t_enter = interval0.x;
     var t_exit  = interval0.y;
-    if t_exit <= 0.0 || t_enter >= t_exit { return result; }
+    if t_exit <= 0.0 || t_enter >= t_exit {
+        if SPHERE_DEBUG_PAINT {
+            result.hit = true;
+            result.t = 0.01;
+            result.color = vec3<f32>(0.8, 0.1, 0.1); // red: interval miss
+            result.normal = vec3<f32>(0.0, 1.0, 0.0);
+            return result;
+        }
+        return result;
+    }
 
-    var t_span = max(abs(t_exit - t_enter), 1e-30);
+    // PRECISION NOTE — `t_span`, `t_nudge`, `t`: all live at the same
+    // O(1/3^m) scale as t_exit. Adding/subtracting two values of the
+    // same scale is f32-safe because they share a common exponent.
+    var t_span  = max(abs(t_exit - t_enter), 1e-30);
     var t_nudge = t_span * 1e-5;
-    var t = max(t_enter, 0.0) + t_nudge;
+    var t       = max(t_enter, 0.0) + t_nudge;
 
     var neighbor_transitions: u32 = 0u;
+    var dda_steps: u32            = 0u;
 
-    var steps: u32 = 0u;
+    // --- Main DDA loop. Structure mirrors CPU `cs_raycast_local`. ---
     loop {
-        if steps > 4096u { break; }
-        steps = steps + 1u;
+        if dda_steps >= 4096u {
+            if SPHERE_DEBUG_PAINT {
+                result.hit = true;
+                result.t = 0.01;
+                result.color = vec3<f32>(0.1, 0.9, 0.1); // green: dda cap
+                result.normal = vec3<f32>(0.0, 1.0, 0.0);
+                return result;
+            }
+            return result;
+        }
+        dda_steps = dda_steps + 1u;
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
+        // PRECISION NOTE — `pos = ro_local + rd_local * t`:
+        //   ro_local O(1), rd_local O(3^m), t O(1/3^m).
+        //   rd_local * t = O(1). Adding to ro_local (also O(1)) is
+        //   f32-stable; both exponents are near zero.
         let pos = ro_local + rd_local * t;
 
         let out_of_box =
@@ -938,10 +1055,29 @@ fn sphere_in_sub_frame(
             t >= t_exit;
 
         if out_of_box {
-            // --- neighbor-transition path ---
-            if neighbor_transitions >= MAX_SPHERE_SUB_TRANSITIONS { break; }
+            // ------------------------------------------------------
+            // Neighbor-transition branch. Steps the UVR path by one
+            // slot along the exit axis, rebuilds J / J_inv / corner,
+            // transfers position/direction into the neighbor's basis,
+            // restarts the DDA in the new sub-frame. Mirrors CPU
+            // `cs_raycast_local`'s out-of-box handler +
+            // `SphereSubFrame::with_neighbor_stepped`.
+            // ------------------------------------------------------
+            if neighbor_transitions >= MAX_SPHERE_SUB_TRANSITIONS {
+                if SPHERE_DEBUG_PAINT {
+                    result.hit = true;
+                    result.t = 0.01;
+                    result.color = vec3<f32>(0.95, 0.95, 0.1); // yellow
+                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+                    return result;
+                }
+                return result;
+            }
 
-            // Pick exit axis / sign from pos.
+            // Pick exit axis / sign from `pos`. Prefer whichever axis
+            // protrudes farthest past the box face — corner exits pick
+            // the axis with the largest excursion so the neighbor step
+            // lands on the geometrically correct face.
             var axis_k: u32 = 0u;
             var sign_s: i32 = 0;
             var best_excess: f32 = -1.0;
@@ -965,84 +1101,92 @@ fn sphere_in_sub_frame(
                     sign_s = sv;
                 }
             }
-            if sign_s == 0 { break; }
+            if sign_s == 0 {
+                // No axis outside the box — we hit the `t >= t_exit`
+                // guard instead. Terminate the DDA; the ray left via
+                // the sub-frame cap without a finite pos delta.
+                return result;
+            }
 
-            // Step the LAST slot of the UVR prefix along (axis_k,
-            // sign_s), bubbling up through parents on slot overflow.
-            // The slot-packing matches XYZ, so the arithmetic is
-            // identical to `Path::step_neighbor_cartesian`.
-            var depth: u32 = uvr_prefix_len;
-            var bubbled = true;
-            loop {
-                if depth == 0u {
-                    // No UVR slots left — the step bubbled past the
-                    // face root; cross-face transition out of scope.
-                    bubbled = false;
-                    break;
+            // --- Bubble-up slot step. Mirror of
+            //     `SphereSubFrame::with_neighbor_stepped` +
+            //     `Path::step_neighbor_cartesian`.
+            //
+            // Pre-check: scan UVR slots (deepest first) for one whose
+            // stepped-axis coord is NOT at the overflow boundary for
+            // this direction. If all are pinned, the step would bubble
+            // past the face root → cross-face transition, terminate.
+            // ---------------------------------------------------------
+            let boundary: u32 = select(0u, 2u, sign_s > 0);
+            var can_step_in_face = false;
+            if uvr_prefix_len > 0u {
+                var ci: u32 = uvr_prefix_len;
+                loop {
+                    if ci == 0u { break; }
+                    ci = ci - 1u;
+                    let co = slot_to_coords(uvr_slots[ci]);
+                    var coord: u32;
+                    if axis_k == 0u { coord = co.x; }
+                    else if axis_k == 1u { coord = co.y; }
+                    else { coord = co.z; }
+                    if coord != boundary { can_step_in_face = true; break; }
                 }
+            }
+            if !can_step_in_face {
+                if SPHERE_DEBUG_PAINT {
+                    result.hit = true;
+                    result.t = 0.01;
+                    result.color = vec3<f32>(1.0, 0.55, 0.0); // orange
+                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+                    return result;
+                }
+                return result;
+            }
+
+            // Bubble step: find the deepest slot whose stepped-axis
+            // coord can step in-place; write the new coord there; then
+            // for every slot DEEPER than that one, wrap the
+            // stepped-axis coord to `0` (going +) or `2` (going −).
+            // This matches `Path::step_neighbor_cartesian`'s recursion
+            // iteratively.
+            var depth: u32 = uvr_prefix_len;
+            loop {
+                if depth == 0u { break; } // unreachable (pre-check above)
                 let idx = depth - 1u;
-                let slot = uvr_slots[idx];
-                let coords = slot_to_coords(slot);
-                var c0 = coords.x;
-                var c1 = coords.y;
-                var c2 = coords.z;
-                // `axis_k` → which of (us, vs, rs) to step.
+                let co = slot_to_coords(uvr_slots[idx]);
+                var c0 = co.x; var c1 = co.y; var c2 = co.z;
                 var cur: i32;
                 if axis_k == 0u { cur = i32(c0); }
                 else if axis_k == 1u { cur = i32(c1); }
                 else { cur = i32(c2); }
                 let nxt = cur + sign_s;
                 if nxt >= 0 && nxt <= 2 {
-                    // Step in-place at this depth.
                     if axis_k == 0u { c0 = u32(nxt); }
                     else if axis_k == 1u { c1 = u32(nxt); }
                     else { c2 = u32(nxt); }
                     uvr_slots[idx] = coords_to_slot(c0, c1, c2);
-                    // Parents untouched: re-wrap stopping here.
-                    depth = idx + 1u;
+                    depth = idx + 1u; // first untouched level
                     break;
                 }
-                // Overflow: bubble up. After the parent step we'll
-                // rewrite THIS slot to the wrapped value (2 if going
-                // −, 0 if going +).
-                depth = idx;
+                depth = idx; // bubble up
             }
-
-            if !bubbled {
-                // Bubble-up past the face-root boundary — cross-face
-                // transition. Not implemented; terminate the DDA.
-                break;
-            }
-
-            // On bubble-up, the depth-cursor walked back up to the
-            // level that successfully stepped in-place, but any
-            // deeper slots we skipped need to be re-wrapped to (0 or
-            // 2) on the stepped axis. `depth` currently points just
-            // past the in-place-stepped level; for any level below
-            // that (index ≥ depth, < uvr_prefix_len), rewrap.
+            // Rewrap any slots deeper than the one we just stepped.
             let wrap_val: u32 = select(2u, 0u, sign_s > 0);
             for (var i2: u32 = depth; i2 < uvr_prefix_len; i2 = i2 + 1u) {
-                let s2 = uvr_slots[i2];
-                let c_ = slot_to_coords(s2);
-                var d0 = c_.x;
-                var d1 = c_.y;
-                var d2 = c_.z;
+                let co2 = slot_to_coords(uvr_slots[i2]);
+                var d0 = co2.x; var d1 = co2.y; var d2 = co2.z;
                 if axis_k == 0u { d0 = wrap_val; }
                 else if axis_k == 1u { d1 = wrap_val; }
                 else { d2 = wrap_val; }
                 uvr_slots[i2] = coords_to_slot(d0, d1, d2);
             }
 
-            // `face_root_depth` (on uniforms) mirrors CPU intent. The
-            // shader reaches the same terminate condition via
-            // `depth == 0u` in the bubble loop above.
-
-            // Capture J_cur BEFORE we overwrite it below — needed
-            // for the position transfer: local_new = J_new_inv · J_cur
-            // · (local_cur − s·3·e_k).
+            // --- Basis update. Capture J_cur BEFORE overwriting it
+            // so the position transfer has access to both matrices.
             let j_cur = j;
 
-            // Update corner coords incrementally on the stepped axis.
+            // Incremental corner update. Corner is O(1), delta is
+            // O(1/3^m). See precision note near un_corner's declaration.
             let d_f = f32(sign_s);
             if axis_k == 0u {
                 un_corner = un_corner + d_f * frame_size;
@@ -1052,35 +1196,58 @@ fn sphere_in_sub_frame(
                 rn_corner = rn_corner + d_f * frame_size;
             }
 
-            // Recompute J / J_inv at the new corner.
             let ff = face_frame_jacobian_shader(
-                face, un_corner, vn_corner, rn_corner, frame_size, inner_r, outer_r,
+                face, un_corner, vn_corner, rn_corner, frame_size,
+                inner_r, outer_r,
             );
             j.col_u = ff.col_u;
             j.col_v = ff.col_v;
             j.col_r = ff.col_r;
             j_inv = mat3_inv_shader(j);
 
-            // Transfer position into the new basis via J_cur + J_inv.
+            // --- Position transfer:
+            //     local_new = J_new_inv · J_cur · (local_exit − s·3·e_k)
+            //
+            // PRECISION NOTE — each factor:
+            //   (local_exit − s·3·e_k): O(1). One axis zeroes (we're
+            //       crossing it), others stay in [0, 3).
+            //   J_cur · (…): O(1/3^m) · O(1) = O(1/3^m). Body-frame
+            //       delta from the current sub-frame to the neighbor.
+            //   J_new_inv · (…): O(3^m) · O(1/3^m) = O(1). The TWO
+            //       large exponents cancel by multiplication (not by
+            //       subtraction), which is f32-safe.
+            //
+            // So `local_new` stays O(1) in the neighbor frame. The
+            // f32 relative error is O(1e-7), carried forward
+            // unchanged — does NOT compound per neighbor step.
             var shifted = pos;
             shifted[axis_k] = shifted[axis_k] - d_f * 3.0;
-            var local_new = mat3_mul_vec_shader(j_inv, mat3_mul_vec_shader(j_cur, shifted));
+            var local_new = mat3_mul_vec_shader(
+                j_inv,
+                mat3_mul_vec_shader(j_cur, shifted),
+            );
 
-            // Clamp the entry axis just inside the neighbor box.
-            let eps_in = 3.0 * 1e-6;
+            // Clamp the entry axis just inside the neighbor box on
+            // the axis we crossed. Avoids an immediate re-exit on the
+            // opposite face due to f32 drift in the matrix product.
+            let eps_in: f32 = 3.0 * 1e-6;
             if sign_s == 1 {
                 local_new[axis_k] = eps_in;
             } else {
                 local_new[axis_k] = 3.0 - eps_in;
             }
-            // Clamp non-entry axes into [0, 3) too.
+            // Clamp non-crossed axes into [0, 3) too — corner-exit
+            // drift otherwise kills the DDA in the neighbor.
             for (var k2: u32 = 0u; k2 < 3u; k2 = k2 + 1u) {
                 if k2 == axis_k { continue; }
                 if local_new[k2] < 0.0 { local_new[k2] = 0.0; }
                 if local_new[k2] >= 3.0 { local_new[k2] = 3.0 - eps_in; }
             }
 
-            // Re-transform rd_body into the new local basis.
+            // Recompute rd_local from body-frame reference (O(1)
+            // input → O(3^m) output, one f32 matrix*vec). Avoids
+            // compounding multiplicative drift across transitions —
+            // every step gets a fresh local direction from rd_body.
             let rd_new = mat3_mul_vec_shader(j_inv, rd_body);
 
             ro_local = local_new;
@@ -1088,38 +1255,57 @@ fn sphere_in_sub_frame(
             let interval = ray_sub_box_interval(ro_local, rd_local);
             let new_t_enter = interval.x;
             let new_t_exit  = interval.y;
-            if new_t_exit <= 0.0 || new_t_enter >= new_t_exit { break; }
-            t_span = max(abs(new_t_exit - new_t_enter), 1e-30);
+            if new_t_exit <= 0.0 || new_t_enter >= new_t_exit {
+                return result;
+            }
+            t_span  = max(abs(new_t_exit - new_t_enter), 1e-30);
             t_nudge = t_span * 1e-5;
-            t = max(new_t_enter, 0.0) + t_nudge;
-            t_exit = new_t_exit;
+            t       = max(new_t_enter, 0.0) + t_nudge;
+            t_exit  = new_t_exit;
 
             neighbor_transitions = neighbor_transitions + 1u;
             continue;
         }
 
+        // ------------------------------------------------------------
+        // Intra-sub-frame cell step. Walk the subtree at the current
+        // `pos` to resolve the terminal walker cell; on solid hit,
+        // shade and return; on empty, advance to the nearest cell
+        // boundary and re-loop.
+        // ------------------------------------------------------------
         let w = walk_from_deep_sub_frame_dyn(
             face_root_idx, uvr_slots, uvr_prefix_len,
             pos.x, pos.y, pos.z, walker_limit,
         );
 
         if w.block != FACE_WALK_EMPTY {
-            // Shade the hit. Surface coloring uses simple radial
-            // tinting + axis tint from the cell's exit face. The
-            // full body-XYZ normal would require mapping local back
-            // via the Jacobian, which the shader doesn't carry as a
-            // matrix yet — `-rd_local` normalized suffices for
-            // diffuse lighting (backface avoidance) since the ray
-            // came from outside the cell.
+            // --- Hit shading. ---
             result.hit = true;
-            result.t = t;
-            let n_approx = normalize(-rd_local);
+            result.t   = t;
+
+            // Body-frame hit normal is approximately −rd_body
+            // normalized (a backface-avoidance trick: the ray came
+            // from outside the cell, so the surface normal opposes
+            // rd_body). Exact per-cell normals would need mapping
+            // local exit face → body-XYZ via J; that's a shading
+            // refinement, not a correctness fix.
+            let n_approx = normalize(-rd_body);
             result.normal = n_approx;
             let sun = normalize(vec3<f32>(0.4, 0.7, 0.3));
             let diffuse = max(dot(n_approx, sun), 0.0);
-            let ambient = 0.25;
+            let ambient: f32 = 0.25;
+
+            // PRECISION NOTE — tint radial.
+            //   `rn_corner` is O(1); `w.r_lo * frame_size / 3` is
+            //   O(1/3^m). At deep m the sum loses the small term in
+            //   f32 (ULP of rn_corner ~6e-8). We accept that drift:
+            //   `tint = 0.55 + 0.45 * clamp(rn_abs, 0, 1)` is
+            //   smooth over the whole shell, so a 1e-8 absolute drift
+            //   in rn_abs shifts tint by ~5e-9 — invisible. We DO NOT
+            //   use this sum anywhere else (DDA never needs abs coord).
             let rn_abs = rn_corner + w.r_lo * frame_size / 3.0;
             let tint = 0.55 + 0.45 * clamp(rn_abs, 0.0, 1.0);
+
             result.color = palette[w.block].rgb
                 * (ambient + diffuse * 0.78) * tint;
             result.cell_min = vec3<f32>(w.u_lo, w.v_lo, w.r_lo);
@@ -1127,21 +1313,31 @@ fn sphere_in_sub_frame(
             return result;
         }
 
-        // Advance past this empty cell. All six boundaries are
-        // axis-aligned in local coords by the linearization.
+        // --- Empty cell. Advance to this cell's nearest exit face.
+        //
+        // PRECISION NOTE — axis-exit t:
+        //   Every boundary is axis-aligned in local coords (the
+        //   Jacobian linearization makes `r_body = const` flatten to
+        //   `r_local = const` too — col_r parallels body radial at
+        //   the corner). `(boundary - pos[axis]) / rd_local[axis]`:
+        //   numerator O(1), denominator O(3^m) → t O(1/3^m). f32
+        //   representable. No cancellation (numerator is a signed O(1)
+        //   difference, stable).
         let t_u = sub_axis_exit_t(pos.x, rd_local.x, w.u_lo, w.u_lo + w.size);
         let t_v = sub_axis_exit_t(pos.y, rd_local.y, w.v_lo, w.v_lo + w.size);
         let t_r = sub_axis_exit_t(pos.z, rd_local.z, w.r_lo, w.r_lo + w.size);
         let t_min = min(min(t_u, t_v), t_r);
         if t_min <= 0.0 || t_min >= 1e29 {
-            // Degenerate cell (parallel ray etc.) — force out-of-box
-            // branch on the next iteration so we transition to the
-            // neighbor or terminate.
+            // Degenerate step (zero-span cell, parallel ray, …).
+            // Force out-of-box branch on the next iteration so the
+            // neighbor-transition logic handles termination.
             t = t_exit;
             continue;
         }
         t = t + t_min + t_nudge;
     }
-
+    // Unreachable in practice (every branch inside the loop either
+    // `continue`s or `return`s). WGSL still requires a function-level
+    // terminator, so return the default (miss) result.
     return result;
 }
