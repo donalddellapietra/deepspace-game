@@ -306,6 +306,7 @@ impl Renderer {
             root_face_meta: self.root_face_meta,
             root_face_bounds: self.root_face_bounds,
             root_face_pop_pos: self.root_face_pop_pos,
+            sphere_debug_mode: [self.sphere_debug_mode, 0, 0, 0],
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

@@ -48,6 +48,25 @@ pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
 pub const ROOT_KIND_FACE: u32 = 2;
 
+/// Number of sphere debug paint modes (0 = off plus N visualizations).
+/// Kept in sync with the `switch` in `sphere_debug_color` in
+/// `sphere.wgsl`. Incrementing here without adding a case there just
+/// paints magenta (default fallthrough).
+pub const SPHERE_DEBUG_MODE_COUNT: u32 = 7;
+
+/// Human-readable name for each sphere debug mode; indexed by the
+/// mode value (0..SPHERE_DEBUG_MODE_COUNT). Used by the key handler
+/// log so the user can tell which mode just got swapped in.
+pub const SPHERE_DEBUG_MODE_NAMES: &[&str] = &[
+    "off",
+    "dda step count (heatmap)",
+    "walker terminal depth (rainbow)",
+    "walker result (green=block / red=empty-advance / blue=loop-exit)",
+    "winning plane axis (u_lo/u_hi/v_lo/v_hi/r_lo/r_hi)",
+    "log cell size (rainbow, darker = smaller)",
+    "ratio_u/ratio_v checkerboard (slot drift detector)",
+];
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuUniforms {
@@ -79,6 +98,10 @@ pub struct GpuUniforms {
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_face_pop_pos: [f32; 4],
+    /// Sphere DDA debug paint mode. `[mode, 0, 0, 0]`; 0 = off
+    /// (normal rendering); 1..=6 visualize walker / plane-advance
+    /// state per pixel. Keyed by F6 in the live app.
+    pub sphere_debug_mode: [u32; 4],
 }
 
 pub struct Renderer {
@@ -135,6 +158,9 @@ pub struct Renderer {
     pub(super) root_face_meta: [u32; 4],
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
+    /// Current sphere debug-paint mode. 0 = off; 1..=6 = per-mode
+    /// diagnostic paint in `sphere_in_cell`.
+    pub(super) sphere_debug_mode: u32,
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -325,6 +351,15 @@ impl Renderer {
         self.max_depth = depth;
         self.write_uniforms();
     }
+
+    /// Swap the sphere DDA debug paint mode (0 = off; 1..=6 distinct
+    /// visualizations). See `SPHERE_DEBUG_MODE_COUNT` for bounds.
+    pub fn set_sphere_debug_mode(&mut self, mode: u32) {
+        self.sphere_debug_mode = mode;
+        self.write_uniforms();
+    }
+
+    pub fn sphere_debug_mode(&self) -> u32 { self.sphere_debug_mode }
 
     /// Per-frame toggle for the beam prepass. Callers compute a
     /// cheap CPU heuristic (root occupancy popcount, camera's root

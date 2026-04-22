@@ -224,39 +224,43 @@ impl App {
 
     /// Raycast straight down in world-space bypassing the normal
     /// interaction-radius cap, then place the camera a couple of
-    /// anchor cells above the hit. Used by perf repros that need to
-    /// land "on the ground" regardless of spawn coordinates.
+    /// anchor cells above the hit. Sphere worlds: the camera stays
+    /// `sphere=None` (same convention as the live game's zoom path —
+    /// sphere state is only populated by explicit teleports); the
+    /// body march renders from the body cell regardless.
     pub(super) fn fly_to_surface(&mut self) {
         use crate::world::anchor::{Path, WorldPos};
         use crate::world::raycast::cpu_raycast;
 
         let root_cam = self.camera.position.in_frame(&Path::root());
         let ray_dir = [0.0f32, -1.0, 0.0];
-        // Raycast the full tree depth so deeply-nested content gets
-        // resolved. interaction_radius doesn't apply here — this is
-        // explicit teleport, not a cursor hit.
         let max_depth = self.tree_depth.saturating_sub(1).max(1);
         let hit = cpu_raycast(
             &self.world.library, self.world.root, root_cam, ray_dir, max_depth,
         );
         let Some(hit) = hit else {
-            eprintln!("fly_to_surface: no hit from root_cam={root_cam:?}");
+            eprintln!("fly_to_surface: MISS root_cam={root_cam:?}");
             return;
         };
-        // Position the camera two anchor-cells above the hit's
-        // y-coordinate. Reconstruct as a root-frame WorldPos, then
-        // deepen to the current anchor depth. f32 precision is fine
-        // for this nudge — we just need to land above the surface.
         let hit_y = root_cam[1] + ray_dir[1] * hit.t;
         let anchor_depth = self.anchor_depth() as u8;
         let cell = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
-        let above_y = hit_y + 2.0 * cell;
-        let new_pos = [root_cam[0], above_y.min(3.0 - cell), root_cam[2]];
-        self.camera.position = WorldPos::from_frame_local(&Path::root(), new_pos, anchor_depth);
+        let above_y = (hit_y + 2.0 * cell).min(3.0 - cell);
+        let new_pos = [root_cam[0], above_y, root_cam[2]];
+        self.camera.position =
+            WorldPos::from_frame_local(&Path::root(), new_pos, anchor_depth);
         eprintln!(
-            "fly_to_surface: t={:.6} hit_y={:.6} new_y={:.6} anchor_depth={}",
-            hit.t, hit_y, above_y, anchor_depth,
+            "fly_to_surface: root_cam=[{:.6},{:.6},{:.6}] t={:.6} hit_y={:.6} new_pos=[{:.6},{:.6},{:.6}] anchor_depth={} anchor={:?}",
+            root_cam[0], root_cam[1], root_cam[2],
+            hit.t, hit_y,
+            new_pos[0], new_pos[1], new_pos[2],
+            anchor_depth,
+            self.camera.position.anchor.as_slice(),
         );
+        // Refresh `active_frame`, ribbon, pack, GPU upload. Without
+        // this the renderer keeps the pre-teleport frame and shows
+        // stale content when the camera moved outside its old frame.
+        self.apply_zoom();
     }
 
     /// Position the camera inside the "above the edit" child of the

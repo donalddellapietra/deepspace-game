@@ -58,6 +58,12 @@ struct Uniforms {
     root_face_meta: vec4<u32>,
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
+    /// Sphere DDA debug paint mode. 0 = off (normal rendering);
+    /// 1..=6 replace `sphere_in_cell`'s output with per-pixel
+    /// diagnostic color. See `sphere_debug.wgsl`. Lives in `.x`;
+    /// `.yzw` reserved for future per-mode tuning (e.g., a depth
+    /// clamp or pixel-magnification factor).
+    sphere_debug_mode: vec4<u32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;

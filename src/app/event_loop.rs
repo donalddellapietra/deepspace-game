@@ -292,6 +292,17 @@ impl App {
         }
         self.renderer = Some(renderer);
 
+        // Push the initial sphere debug mode if one was set via
+        // `--sphere-debug-mode N`. The setter writes the uniforms
+        // buffer so the first rendered frame picks it up; without
+        // this the CLI preset only took effect after the user
+        // pressed F6 once.
+        if self.sphere_debug_mode != 0 {
+            if let Some(r) = &mut self.renderer {
+                r.set_sphere_debug_mode(self.sphere_debug_mode);
+            }
+        }
+
         let zoom_start = web_time::Instant::now();
         self.apply_zoom();
         let zoom_elapsed = zoom_start.elapsed();

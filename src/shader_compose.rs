@@ -16,6 +16,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("bindings.wgsl",  include_str!("../assets/shaders/bindings.wgsl")),
     ("tree.wgsl",      include_str!("../assets/shaders/tree.wgsl")),
     ("ray_prim.wgsl",  include_str!("../assets/shaders/ray_prim.wgsl")),
+    ("sphere_debug.wgsl", include_str!("../assets/shaders/sphere_debug.wgsl")),
     ("sphere.wgsl",    include_str!("../assets/shaders/sphere.wgsl")),
     ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
     ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
@@ -149,6 +150,7 @@ mod tests {
             "root_face_meta",
             "root_face_bounds",
             "root_face_pop_pos",
+            "sphere_debug_mode",
         ];
         let mut cursor = 0;
         for name in expected_order {

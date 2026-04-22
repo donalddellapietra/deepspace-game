@@ -71,6 +71,12 @@ pub struct TestConfig {
     /// interaction range scale with your current zoom, same as the
     /// LOD shells — symmetric cursor/interaction gate.
     pub interaction_radius: Option<u32>,
+    /// Preset sphere DDA debug-paint mode at startup. 0 = off;
+    /// 1..=6 replace the sphere_in_cell hit/miss paint with a
+    /// per-mode diagnostic color. Same cycle as F6 in the live app.
+    /// Mirrored on `App::sphere_debug_mode` so the renderer picks it
+    /// up through the normal setter path.
+    pub sphere_debug_mode: u32,
     /// When set and > 0, the live-surface render path emits a
     /// `render_live_sample` line every N frames (CPU-side phase
     /// timings only — no `device.poll(Wait)` stall). Lets us see
@@ -311,6 +317,12 @@ impl TestConfig {
                 }
                 "--interaction-radius" => {
                     cfg.interaction_radius = args.next().and_then(|v| v.parse().ok());
+                }
+                "--sphere-debug-mode" => {
+                    cfg.sphere_debug_mode = args
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
                 }
                 "--live-sample-every" => {
                     cfg.live_sample_every_frames = args.next().and_then(|v| v.parse().ok());

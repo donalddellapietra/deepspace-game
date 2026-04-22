@@ -209,6 +209,19 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     );
     app.window = Some(window);
     app.renderer = Some(renderer);
+    // Thread the CLI-preset sphere debug mode into the renderer
+    // before the first frame renders. Live event-loop's `finish_init`
+    // does the same; the harness has its own init path that skips
+    // that handler.
+    if app.sphere_debug_mode != 0 {
+        if let Some(r) = app.renderer.as_mut() {
+            r.set_sphere_debug_mode(app.sphere_debug_mode);
+            eprintln!(
+                "render_harness: sphere_debug_mode={} pushed to renderer",
+                app.sphere_debug_mode,
+            );
+        }
+    }
     app.apply_zoom();
     app.last_frame = web_time::Instant::now();
 

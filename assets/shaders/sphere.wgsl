@@ -1,27 +1,16 @@
 #include "bindings.wgsl"
 #include "tree.wgsl"
 #include "ray_prim.wgsl"
+#include "sphere_debug.wgsl"
 
 // Cubed-sphere geometry + DDA. One WGSL file with the face-math
 // helpers, the face-subtree walker, and the unified sphere march.
 // The CPU mirror lives in `src/world/cubesphere.rs` +
 // `src/world/raycast/sphere.rs`.
-
-/// When true, `sphere_in_sub_frame` paints solid debug colors per
-/// control-flow branch so a developer can visually diagnose the
-/// DDA loop without breakpointing a shader:
-///   red    = initial ray-box interval miss (ray never entered)
-///   blue   = neighbor-step transition consumed (every transition
-///            fades the pixel darker, so repeated steps accumulate)
-///   orange = cross-face terminate (bubble past face root)
-///   green  = MAX_DDA_STEPS exhaust
-///   yellow = MAX_SPHERE_SUB_TRANSITIONS exhaust
-///   cyan   = `sign_s == 0` silent miss (t >= t_exit with no axis outside box)
-///   white  = neighbor-transition ray-box interval miss
-///   palette color = real hit (unchanged)
-/// Left false by default; flip to true and reload the shader to
-/// validate the geometry.
-const SPHERE_DEBUG_PAINT: bool = false;
+//
+// A runtime debug-paint mode is wired through
+// `uniforms.sphere_debug_mode.x`; see `sphere_debug.wgsl` for the
+// palette and `SPHERE_DEBUG_MODE_NAMES` (Rust) for the mode list.
 
 // ─────────────────────────────────────────────── face constants
 
@@ -101,12 +90,11 @@ struct FaceWalkResult {
     v_lo: f32,
     r_lo: f32,
     size: f32,
-    // Integer ratio form of the cell corner: `u_lo == f32(ratio_u) *
-    // size` up to ~0.5 ULP rounding. Tracked as u32 accumulator
-    // `ratio = parent*3 + slot`, so precision is preserved regardless
-    // of depth. u32 covers ratio_depth ≤ 20 (3^20 ≈ 3.5e9 < 2^32);
-    // for deeper descent the mantissa-cast loses bits but stays more
-    // accurate than the additive accumulator `u_lo += us * child_size`.
+    // Integer ratio form of the cell corner: `u_lo == f32(ratio_u) /
+    // f32(3^ratio_depth)` bit-exact for ratio_depth ≤ WALK_SCALE_DEPTH
+    // (= 15). Derived by integer divide inside the walker, so the
+    // ratio is the *source of truth* and `u_lo`/`size` are the
+    // reconstructed f32 view for downstream shading.
     ratio_u: u32,
     ratio_v: u32,
     ratio_r: u32,
@@ -121,23 +109,50 @@ struct FaceWalkResult {
 /// Rust's `REPRESENTATIVE_EMPTY`.
 const FACE_WALK_EMPTY: u32 = 0xFFFEu;
 
+/// Max depth at which the integer slot-pick is bit-exact. 3^15 =
+/// 14_348_907 is the largest power of three that's representable as
+/// an exact f32 integer (f32 mantissa = 23 bits + implicit 1; 3^16 =
+/// 43M exceeds 2^24 and would round). The sole remaining precision
+/// cost is in turning the f32 face-UV sample (`un_abs`) into its u32
+/// scaled form — that's one f32 multiply with ≤ 0.5 ULP, so the
+/// slot pick ends up bit-exact for all cells whose integer size is
+/// ≥ 2 units (i.e., d ≤ 13 or so in practice). Walker callers that
+/// pass `max_depth > WALK_SCALE_DEPTH` get clamped implicitly by the
+/// POW3_TABLE index bound.
+const WALK_SCALE_DEPTH: u32 = 15u;
+const WALK_SCALE_U32: u32 = 14348907u;   // 3^15
+const WALK_SCALE_F32: f32 = 14348907.0;
+
+/// 3^d for d in [0, WALK_SCALE_DEPTH]. Module-scope const so it lives
+/// in read-only memory and doesn't spill to registers. Every value is
+/// exact in f32 (see WALK_SCALE_DEPTH doc).
+const POW3_TABLE: array<u32, 16> = array<u32, 16>(
+    1u, 3u, 9u, 27u,
+    81u, 243u, 729u, 2187u,
+    6561u, 19683u, 59049u, 177147u,
+    531441u, 1594323u, 4782969u, 14348907u,
+);
+
 fn walk_face_subtree(
     face_root_idx: u32,
-    un_in: f32, vn_in: f32, rn_in: f32,
+    un_scaled: u32, vn_scaled: u32, rn_scaled: u32,
     max_depth: u32,
 ) -> FaceWalkResult {
-    // Error-bounded walker (mirror of CPU `walk_face_subtree`).
-    //
-    // The previous implementation iterated `un = un * 3 − us` per
-    // level; that recurrence amplifies f32 error by 3× each step, so
-    // past depth ~9 adjacent pixels near cell boundaries snap to
-    // random neighbors (the ring artifact). Here we keep the sample
-    // coords `un_abs / vn_abs / rn_abs` IMMUTABLE and derive each
-    // level's slot from the accumulating cell origin:
-    //   us = floor((un_abs − u_lo) / child_size)
-    // Error stays bounded at ~f32 ULP instead of amplifying. Pushes
-    // the precision wall from ~depth 9 to ~depth 14; past that, failure
-    // is off-by-one (visual blur) rather than off-by-hundreds (chaos).
+    // Integer slot-pick walker. The caller passes the face-UV sample
+    // already scaled to `[0, WALK_SCALE_U32) = [0, 3^15)` u32s. Every
+    // slot index at every depth is then computed by integer divide /
+    // modulo — NO f32 rounding in the pick path. Compared to the
+    // previous `floor((un_abs − u_lo) / child_size)` formulation,
+    // this removes two f32 error sources:
+    //   1. Iterative `child_size /= 3` drift (~6 ULP at d=10).
+    //   2. `(un_abs − u_lo)` / `child_size` quotient jitter, which at
+    //      d=10 peaked at ~6 % of a cell → systematic off-by-one on
+    //      cells aligned to integer slot boundaries (= exactly where
+    //      placed-block edges live → the "hollow" symptom).
+    // f32 fields of FaceWalkResult (`u_lo`, `size`, ...) are still
+    // derived from the integer ratio, so the bevel + plane-DDA paths
+    // downstream see the cleanest possible `child_ratio_u / 3^d`
+    // value — one f32 divide, 0.5 ULP total.
     var res: FaceWalkResult;
     res.block = FACE_WALK_EMPTY;
     res.depth = 0u;
@@ -150,49 +165,49 @@ fn walk_face_subtree(
     res.ratio_r = 0u;
     res.ratio_depth = 0u;
 
-    let un_abs = clamp(un_in, 0.0, 0.9999999);
-    let vn_abs = clamp(vn_in, 0.0, 0.9999999);
-    let rn_abs = clamp(rn_in, 0.0, 0.9999999);
+    // Caller scales, but re-clamp here so the walker is self-defending
+    // against an out-of-range upload (one cheap u32 min).
+    let un_c = min(un_scaled, WALK_SCALE_U32 - 1u);
+    let vn_c = min(vn_scaled, WALK_SCALE_U32 - 1u);
+    let rn_c = min(rn_scaled, WALK_SCALE_U32 - 1u);
+    // Clamp max_depth to the integer-pick horizon. Past d=15 the
+    // cell_size_int drops below 1, and the pick becomes ambiguous —
+    // but face_lod_depth in practice terminates well before here.
+    let depth_cap = min(max_depth, WALK_SCALE_DEPTH);
     var node_idx = face_root_idx;
-    var u_lo: f32 = 0.0;
-    var v_lo: f32 = 0.0;
-    var r_lo: f32 = 0.0;
-    var size: f32 = 1.0;
-    // Integer ratio accumulators — exact at every step.
     var ratio_u: u32 = 0u;
     var ratio_v: u32 = 0u;
     var ratio_r: u32 = 0u;
 
-    for (var d: u32 = 1u; d <= max_depth; d = d + 1u) {
+    for (var d: u32 = 1u; d <= depth_cap; d = d + 1u) {
         let base = node_offsets[node_idx];
         if ENABLE_STATS { ray_loads_offsets = ray_loads_offsets + 1u; }
         let occupancy = tree[base];
         let first_child = tree[base + 1u];
         if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
 
-        let child_size = size / 3.0;
-        // Absolute-coord slot pick. `(abs − lo) / child_size` lives
-        // in [0, 3); clamp to [0, 2] to guard against f32 rounding
-        // that could push the quotient negative on exact-boundary
-        // hits or to 3.0 on the upper edge.
-        let us = u32(clamp(floor((un_abs - u_lo) / child_size), 0.0, 2.0));
-        let vs = u32(clamp(floor((vn_abs - v_lo) / child_size), 0.0, 2.0));
-        let rs = u32(clamp(floor((rn_abs - r_lo) / child_size), 0.0, 2.0));
+        // Integer cell-size at level d — exact for all d ≤ 15.
+        let cell_size_int = POW3_TABLE[WALK_SCALE_DEPTH - d];
+        let pow3_d = POW3_TABLE[d];
+
+        // Slot pick via integer divide — exact: child_ratio_u is the
+        // (d-level) integer coordinate of the cell containing the
+        // sample. `us` is the 0..2 slot within the parent cell.
+        let child_ratio_u = un_c / cell_size_int;
+        let child_ratio_v = vn_c / cell_size_int;
+        let child_ratio_r = rn_c / cell_size_int;
+        let us = min(child_ratio_u - ratio_u * 3u, 2u);
+        let vs = min(child_ratio_v - ratio_v * 3u, 2u);
+        let rs = min(child_ratio_r - ratio_r * 3u, 2u);
         let slot = rs * 9u + vs * 3u + us;
 
-        let child_ratio_u = ratio_u * 3u + us;
-        let child_ratio_v = ratio_v * 3u + vs;
-        let child_ratio_r = ratio_r * 3u + rs;
-        // Ratio-derived cell corner — one multiply, ~0.5 ULP. The
-        // alternative `u_lo + us*child_size` compounds ~1 ULP per
-        // level; by m ≈ 10 the 6 cell-wall plane normals built from
-        // `ea_to_cube(u_lo*2-1)` have drifted enough that adjacent
-        // walls' normals collapse in f32, the ray marches through
-        // solid content without detecting it, and the cell renders
-        // hollow.
-        let child_u_lo = f32(child_ratio_u) * child_size;
-        let child_v_lo = f32(child_ratio_v) * child_size;
-        let child_r_lo = f32(child_ratio_r) * child_size;
+        // f32-derived cell corner + size for downstream consumers.
+        // Single divide each, 0.5 ULP error, independent of d.
+        let inv_pow3_d = 1.0 / f32(pow3_d);
+        let child_u_lo = f32(child_ratio_u) * inv_pow3_d;
+        let child_v_lo = f32(child_ratio_v) * inv_pow3_d;
+        let child_r_lo = f32(child_ratio_r) * inv_pow3_d;
+        let child_size = inv_pow3_d;
 
         // Is this slot populated?
         let mask = (occupancy >> slot) & 1u;
@@ -231,7 +246,7 @@ fn walk_face_subtree(
             return res;
         }
         // Tag 2 → descend into node.
-        if d == max_depth {
+        if d == depth_cap {
             // LOD-terminal. Use representative block; preserve the
             // empty sentinel when the subtree is all-empty.
             res.block = child_block_type(packed);
@@ -247,26 +262,15 @@ fn walk_face_subtree(
             return res;
         }
         node_idx = node_index;
-        u_lo = child_u_lo;
-        v_lo = child_v_lo;
-        r_lo = child_r_lo;
-        size = child_size;
         ratio_u = child_ratio_u;
         ratio_v = child_ratio_v;
         ratio_r = child_ratio_r;
-        // NOTE: un_abs / vn_abs / rn_abs are NOT updated; they stay
-        // as the immutable ray-sample reference for the lifetime of
-        // the walk. That's the whole point of this reformulation.
     }
-    res.u_lo = u_lo;
-    res.v_lo = v_lo;
-    res.r_lo = r_lo;
-    res.size = size;
-    res.ratio_u = ratio_u;
-    res.ratio_v = ratio_v;
-    res.ratio_r = ratio_r;
-    res.ratio_depth = max_depth;
-    res.depth = max_depth;
+    // Loop exited without a terminal (only possible if depth_cap == 0,
+    // which means max_depth == 0 — caller asked for no descent). Return
+    // the root-cell sentinel so downstream treats this as empty.
+    res.depth = depth_cap;
+    res.ratio_depth = depth_cap;
     return res;
 }
 
@@ -419,9 +423,19 @@ fn sphere_in_cell(
     var last_side: u32 = 6u;
     let reference_scale = select(shell, shell * window_bounds.w, window_active != 0u);
 
+    // Per-pixel debug accumulator. Only written when
+    // `uniforms.sphere_debug_mode.x != 0`; otherwise the updates below
+    // still run (cheap, scalar) but the hit/exit paths skip the
+    // override and the normal shading runs. Keeping the accumulator
+    // unconditional means the debug hit-path doesn't need a second
+    // code path for the "hit on first step" case.
+    var dbg: SphereDebug = sphere_debug_init();
+    let dbg_mode = uniforms.sphere_debug_mode.x;
+
     loop {
         if t >= t_exit || steps > 4096u { break; }
         steps = steps + 1u;
+        dbg.steps = steps;
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
         let local = oc + ray_dir * t;
@@ -475,13 +489,32 @@ fn sphere_in_cell(
             walk_rn = (rn_abs - window_bounds.z) / window_bounds.w;
         }
 
+        // Integer-scale the sample coords to `[0, 3^WALK_SCALE_DEPTH)`
+        // before handing off to the walker. One f32 multiply, 0.5 ULP
+        // error; the walker itself picks slots via integer divide
+        // (no further f32 rounding). See `walk_face_subtree` for why
+        // this replaces the previous `floor((un - u_lo)/child_size)`
+        // — that pick systematically flipped off-by-one at d≥10 near
+        // placed-block integer boundaries, and was the hollow-block
+        // root cause visible in the F6 mode-4 sphere-debug paint.
+        let un_scaled = u32(clamp(walk_un * WALK_SCALE_F32, 0.0, WALK_SCALE_F32 - 1.0));
+        let vn_scaled = u32(clamp(walk_vn * WALK_SCALE_F32, 0.0, WALK_SCALE_F32 - 1.0));
+        let rn_scaled = u32(clamp(walk_rn * WALK_SCALE_F32, 0.0, WALK_SCALE_F32 - 1.0));
+
         let walk_depth = face_lod_depth(t, reference_scale);
-        let w = walk_face_subtree(face_node_idx, walk_un, walk_vn, walk_rn, walk_depth);
+        let w = walk_face_subtree(face_node_idx, un_scaled, vn_scaled, rn_scaled, walk_depth);
+
+        dbg.walker_depth = w.depth;
+        dbg.walker_size = w.size;
+        dbg.walker_ratio_u = w.ratio_u;
+        dbg.walker_ratio_v = w.ratio_v;
+        dbg.walker_ratio_depth = w.ratio_depth;
 
         // 0xFFFEu is REPRESENTATIVE_EMPTY — an empty terminal.
         // Palette index 0 is a real block (STONE), so we can't use
         // zero as the empty sentinel.
         if w.block != FACE_WALK_EMPTY {
+            dbg.result_kind = 2u;
             // Hit. The previous step's `last_side` is the face we
             // crossed to exit the PREVIOUS cell; we entered THIS
             // cell through the geometrically-same boundary, but
@@ -505,6 +538,17 @@ fn sphere_in_cell(
             result.hit = true;
             result.t = t;
             result.normal = hit_normal;
+            if dbg_mode != 0u {
+                // Debug path: bypass shading (sun, bevel, palette) and
+                // paint the accumulator directly. We still set t + a
+                // 1e3 flat cell to silence `cube_face_bevel` in
+                // `shade_pixel` — same trick as the normal path below.
+                result.color = sphere_debug_color(dbg_mode, dbg);
+                let cs_dbg = max(length(camera.forward), 1.0) * 1e3;
+                result.cell_min = camera.pos + ray_dir * t - vec3<f32>(cs_dbg * 0.5);
+                result.cell_size = cs_dbg;
+                return result;
+            }
             let sun = normalize(vec3<f32>(0.4, 0.7, 0.3));
             let diffuse = max(dot(hit_normal, sun), 0.0);
             let axis_tint = abs(hit_normal.y) + (abs(hit_normal.x) + abs(hit_normal.z)) * 0.82;
@@ -538,6 +582,8 @@ fn sphere_in_cell(
             result.cell_size = cs;
             return result;
         }
+
+        dbg.result_kind = 1u;
 
         // Empty cell — advance to next cell boundary via ray-plane /
         // ray-sphere intersections on the walker's 6 cell faces.
@@ -575,9 +621,25 @@ fn sphere_in_cell(
 
         if t_next >= t_exit { break; }
         last_side = winning;
+        dbg.winning = winning;
         let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
         let cell_eps = max(shell * w.size * 1e-3, t_ulp * 4.0);
         t = t_next + cell_eps;
+    }
+
+    // Loop exited without hitting content. In debug mode, force a hit
+    // so the pixel renders SOMETHING — paint the debug color based on
+    // the last-touched walker cell + step count. The fake hit's t is
+    // clamped to `t_exit` so shade_pixel's `cell_min` trick still
+    // lands near the ray path.
+    if dbg_mode != 0u && dbg.steps > 0u {
+        result.hit = true;
+        result.t = min(max(t, t_enter + eps_init), t_exit);
+        result.normal = -normalize(ray_dir);
+        result.color = sphere_debug_color(dbg_mode, dbg);
+        let cs_dbg = max(length(camera.forward), 1.0) * 1e3;
+        result.cell_min = camera.pos + ray_dir * result.t - vec3<f32>(cs_dbg * 0.5);
+        result.cell_size = cs_dbg;
     }
 
     return result;

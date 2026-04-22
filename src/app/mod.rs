@@ -286,6 +286,9 @@ pub struct App {
     /// Captured args we need in `finish_init`, populated by
     /// `start_init` before the renderer comes online.
     pub(super) pending_init: Option<PendingInit>,
+    /// Current sphere DDA debug paint mode. 0 = off. Cycled by F6.
+    /// Pushed to `Renderer::set_sphere_debug_mode` on change.
+    pub(super) sphere_debug_mode: u32,
 }
 
 /// Args that `start_init` computes synchronously and `finish_init`
@@ -318,6 +321,7 @@ impl App {
         let forced_visual_depth = test_cfg.force_visual_depth;
         let forced_edit_depth = test_cfg.force_edit_depth;
         let shader_stats_enabled = test_cfg.shader_stats;
+        let initial_sphere_debug_mode = test_cfg.sphere_debug_mode;
         // Nyquist floor: sub-pixel rejection only. This is the
         // sole visual LOD gate; the stack depth (MAX_STACK_DEPTH
         // in the shader) is the hard ceiling.
@@ -481,6 +485,7 @@ impl App {
             proxy,
             renderer_init_started: false,
             pending_init: None,
+            sphere_debug_mode: initial_sphere_debug_mode,
         };
         if let Some(ref path) = spawn_entity_path {
             let count = spawn_entity_count.max(1);

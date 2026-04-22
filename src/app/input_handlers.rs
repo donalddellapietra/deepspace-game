@@ -79,6 +79,11 @@ impl App {
             return;
         }
 
+        if pressed && code == KeyCode::F6 {
+            self.cycle_sphere_debug_mode();
+            return;
+        }
+
         if pressed && code == KeyCode::KeyV && self.cursor_locked {
             self.save_mode = !self.save_mode;
             log::info!("Save mode: {}", self.save_mode);
@@ -88,6 +93,22 @@ impl App {
         let panel_changed = self.ui.handle_key(code, pressed);
         if panel_changed {
             self.sync_cursor_to_panels();
+        }
+    }
+
+    /// Rotate `sphere_debug_mode` through `0..SPHERE_DEBUG_MODE_COUNT`
+    /// and push to the renderer. Logs the new mode's name so the user
+    /// can tell which visualization just got enabled.
+    fn cycle_sphere_debug_mode(&mut self) {
+        let next = (self.sphere_debug_mode + 1) % crate::renderer::SPHERE_DEBUG_MODE_COUNT;
+        self.sphere_debug_mode = next;
+        let name = crate::renderer::SPHERE_DEBUG_MODE_NAMES
+            .get(next as usize)
+            .copied()
+            .unwrap_or("?");
+        log::info!("sphere debug mode: {} ({})", next, name);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_sphere_debug_mode(next);
         }
     }
 
