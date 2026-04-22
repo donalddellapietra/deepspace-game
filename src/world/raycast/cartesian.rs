@@ -3,6 +3,7 @@
 //! dispatches to `sphere::cs_raycast_in_body` when it descends into
 //! a `CubedSphereBody` child.
 
+use super::rotated;
 use super::sphere::{self, FaceBounds};
 use super::HitInfo;
 use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
@@ -144,6 +145,30 @@ pub(super) fn cpu_raycast_with_face_depth(
                         None::<FaceBounds>,
                     ) {
                         return Some(sphere_hit);
+                    }
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
+
+                if let NodeKind::Rotated45Y = child_node.kind {
+                    // Transform ray into the rotated local frame and
+                    // run cartesian DDA on the subtree. Mirrors the
+                    // shader's `march_rotated45y_subtree` dispatch.
+                    let parent_origin = stack[depth].node_origin;
+                    let parent_cell_size = stack[depth].cell_size;
+                    let rot_origin = [
+                        parent_origin[0] + cell[0] as f32 * parent_cell_size,
+                        parent_origin[1] + cell[1] as f32 * parent_cell_size,
+                        parent_origin[2] + cell[2] as f32 * parent_cell_size,
+                    ];
+                    if let Some(rot_hit) = rotated::rotated_raycast_in_cell(
+                        library, child_id,
+                        rot_origin, parent_cell_size,
+                        ray_origin, ray_dir,
+                        &path,
+                        max_depth, max_face_depth,
+                    ) {
+                        return Some(rot_hit);
                     }
                     advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
                     continue;
