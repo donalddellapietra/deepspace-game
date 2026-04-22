@@ -28,13 +28,23 @@ outdir="$WORKTREE/tmp/$label"
 mkdir -p "$outdir"
 outpng="$outdir/depth-$depth.png"
 
-# Camera pose: sphere centered at 1.5, surface at r=0.30 → top at 1.80.
-# Gap shrinks with depth so the interaction envelope always reaches
-# the surface. Match sphere_zoom_seamless exactly.
+# Camera pose: sphere centered at body-local (0.5,0.5,0.5) with
+# outer_r=0.45 in body-local. Body cell at world slot 13 = world
+# [1,2)³ → sphere center world (1.5,1.5,1.5), outer surface top at
+# world y=1.95.
+#
+# (Earlier the base height was 1.80 — that put the camera INSIDE
+# the shell at any depth ≥ ~7 because the "+gap" term shrinks below
+# the 0.15-unit gap-to-actual-surface. The screenshots looked like
+# the body march walling out at depth 9-10 when it was actually the
+# camera being inside the shell looking at the inner stone surface
+# from very close. Fixed to 1.95 + small static nudge so the camera
+# is always JUST ABOVE the outer shell, with the depth-scaled gap
+# preserved.)
 cam_y=$(python3 - <<EOF
 d = $depth
 gap = 12.0 * (3.0 / (3.0 ** d)) * 0.6
-print(f"{1.80 + gap:.6f}")
+print(f"{1.95 + 0.01 + gap:.6f}")
 EOF
 )
 
