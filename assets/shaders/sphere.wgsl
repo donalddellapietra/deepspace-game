@@ -526,20 +526,16 @@ fn sphere_in_cell(
             // cell's r_hi face, outward normal +n; winning 0
             // (crossed prev u_lo going -u) lands on THIS cell's
             // u_hi, outward normal +u_axis; etc.
-            // EXPERIMENT: use the smooth radial normal `n` for all
-            // sphere hits instead of the discrete cell-wall normal
-            // from `last_side`. Rationale: at d≥10 the cell walls
-            // are at sub-pixel scale, so `last_side` flips between
-            // adjacent rays producing mode-0 stripes. The sphere
-            // surface's geometric normal IS radial; per-cell
-            // wall-normal shading is a voxel-grid artifact, not a
-            // property of the represented surface.
-            //
-            // If this looks right for terrain but makes placed
-            // blocks look like rounded blobs, we'll need to split
-            // the shading into "per-cell-wall for block interiors"
-            // vs "smooth radial for terrain".
-            let hit_normal = n;
+            var hit_normal: vec3<f32>;
+            switch last_side {
+                case 0u: { hit_normal =  u_axis; }
+                case 1u: { hit_normal = -u_axis; }
+                case 2u: { hit_normal =  v_axis; }
+                case 3u: { hit_normal = -v_axis; }
+                case 4u: { hit_normal =  n; }
+                case 5u: { hit_normal = -n; }
+                default: { hit_normal =  n; }
+            }
             result.hit = true;
             result.t = t;
             result.normal = hit_normal;
