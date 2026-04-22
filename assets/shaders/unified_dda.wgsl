@@ -179,27 +179,45 @@ fn sign_or_one(x: f32) -> f32 {
     return select(-1.0, 1.0, x >= 0.0);
 }
 
-// ────────────────────────────────── Curved-cell face walker
+// ────────────────────────────── Slot-path + residual face walker
 //
-// Body-local curved DDA over a cubed-sphere face subtree. The ray
-// stays in body-local (ribbon-frame) coords throughout — cell
-// boundaries are the actual curved equal-angle surfaces on the
-// sphere shell, not pretend axis-aligned planes in face-local.
+// Port of the CPU walker in `src/world/cubesphere/walker.rs`. The
+// state model is precision-correct at face-subtree depth 30+: NO
+// absolute f32 quantity scales as `1/3^N` anywhere. See
+// `docs/principles/no-absolute-coordinates.md`.
 //
-// Geometry of a face-subtree cell at face F with face-normalized
-// bounds `[u_lo, u_hi] × [v_lo, v_hi] × [r_lo, r_hi]` (each ∈ [0,1]):
-//   * u = u_const plane: set of directions `normalize(n_F +
-//     cube_u(u_const) · u_axis_F + s · v_axis_F)` for scalar s.
-//     These directions form a 2D plane through body center with
-//     normal = normalize(cross(v_axis_F, n_F + cube_u · u_axis_F)).
-//   * v = v_const plane: symmetric.
-//   * r = r_const shell: sphere centered at body center with
-//     radius = inner_rib + (outer_rib - inner_rib) · r_const.
+// State carried per-iteration (mirrors FaceWalker in walker.rs):
+//   * s_slot_u/v/r[0..depth]   — integer slot chain. THE position.
+//   * s_node_idx[0..depth+1]   — node-index parallel stack.
+//   * cur_us/vs/rs             — child-of-current-cell slot
+//                                (explicit integer tracking; avoids
+//                                the floor-vs-slot race at integer
+//                                boundaries).
+//   * residual_o               — ray origin in the CURRENT cell's
+//                                local `[0, 3)³` frame. Rescaled by
+//                                ×3 on every descent (minus the child
+//                                slot). O(1) magnitude at any depth.
+//   * rd_local                 — ray direction in the current cell's
+//                                local frame. Multiplied by 3 per
+//                                descent. f32-safe through depth
+//                                ~38; only its RATIO is used in
+//                                boundary tests.
+//   * u_c/v_c/r_c              — face-normalized cell LOWER CORNER.
+//                                Tracked for SHADING NORMAL
+//                                evaluation ONLY (tan() on the
+//                                cell-center UV in the face basis).
+//                                NEVER used in any boundary test.
 //
-// This replaces the broken Stage 3 approach that rotated the ray
-// into face-local coords and walked axis-aligned cells — which
-// treated the face's orthonormal basis as globally valid and so
-// rendered the whole sphere as a warped cube.
+// Cell boundaries in the residual frame are the integer values
+// `cur_us, cur_us+1, ...` — exact, no f32 ULP loss. Ray-axis-plane
+// t-values `(boundary - residual_i) / rd_local_i` compute at O(1)
+// precision regardless of depth.
+//
+// Linearization: inside a face subtree, cells are treated as flat
+// parallelograms in face-normalized coords (silhouette error
+// O(cell_size²) body units; sub-pixel at face-subtree depth ≥ 3).
+// The outer shell is still the real curved sphere via Stage 2's
+// ray-sphere entry; this walker only sees the ALREADY-ENTERED ray.
 //
 // Function signature packs the walker's result into HitResult:
 //   * On hit: `hit=true`, `t` is ribbon-frame param, `cell_min` is
@@ -212,9 +230,15 @@ fn sign_or_one(x: f32) -> f32 {
 //     (UV seam exits are handled internally — the walker keeps
 //      walking on the neighbor face until one of the above cases.)
 //
-// The walker computes u/v plane normals fresh per iteration because
-// they depend on the current cell's u_const/v_const edges; the
-// small cross() cost is negligible vs the tree loads.
+// Compile-time guarantee: grep the function body for
+// `1.0 / pow(3.0,` or `cur_u_lo` — they are ABSENT. Cell extent in
+// face-normalized units does not appear as a stored f32 state
+// variable nor as an inline expression in boundary tests; only for
+// smooth shading-normal evaluation (auxiliary `cur_cell_ext`, whose
+// bit-loss at deep depth is insensitive per the architecture doc).
+// Cell boundaries are tested in the residual frame where they are
+// trivially the integer slot lo/hi. See
+// `docs/architecture/sphere-unified-dda.md` §Stage 3d.
 fn march_face_subtree_curved(
     body_occupancy: u32,
     body_first_child: u32,
@@ -236,8 +260,8 @@ fn march_face_subtree_curved(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = -1.0;
 
-    // Body-centered ray: oc = origin - body_center. All t's below
-    // are in ribbon-frame units relative to the original ray_origin.
+    // Body-centered ray in ribbon frame. Used to reconstruct hit
+    // positions for the LOD gate and for the seam-cross reprojection.
     let oc = ray_origin_rib - body_center_rib;
     let rd = ray_dir_rib;
 
@@ -246,120 +270,142 @@ fn march_face_subtree_curved(
     let eps_t = 1e-5 * outer_rib;
     var t_cur: f32 = t_enter_body + eps_t;
 
-
-    // Current face (0..5) — may change on seam crossings.
     var cur_face: u32 = start_face;
 
-    // Face subtree stack. `s_node_idx[d]` = node at depth d. The
-    // face subtree root is at depth 0. `s_slot[d]` holds (u_slot,
-    // v_slot, r_slot) of the CHILD chosen at depth d (packed 2 bits
-    // each) for the range [0, depth). Current-cell slot at depth
-    // `depth` is held in (cur_us, cur_vs, cur_rs) below. When we
-    // descend, we push (cur_us, cur_vs, cur_rs) into s_slot[depth-1]
-    // (wait — actually into s_slot[old_depth]) and depth+=1.
-    // ── Stage 3d precision model: slot-path + cell-center ──
-    //
-    // State that's stored per-iteration:
-    //   * s_slot_u/v/r[0..depth]   — INTEGER slot chain (THE position).
-    //   * s_node_idx[0..depth+1]   — node-index parallel stack.
-    //   * cur_slot_{u,v,r}         — child-of-current-cell slot.
-    //   * u_c, v_c, r_c            — CURRENT cell CENTER in
-    //                                face-normalized [0, 1]. Tracked
-    //                                incrementally on descent as
-    //                                `u_c_new = u_c + (slot-1) * ext/3`.
-    //
-    // State DERIVED (never stored):
-    //   * cur_cell_ext = pow(1/3, depth+1)
-    //
-    // This replaces the Stage 3b walker's `cur_u_lo / cur_v_lo /
-    // cur_r_lo / cur_cell_ext` state, which stored absolute
-    // face-normalized f32 values PLUS a cell_ext that scaled as
-    // 1/3^N — directly violating `docs/principles/no-absolute-
-    // coordinates.md`. Cell center (u_c, v_c, r_c) still lives in
-    // f32 face-normalized [0, 1] — it's used ONLY to evaluate tan()
-    // at the cell center for u-plane / v-plane / r-shell normals
-    // (smooth function, well-conditioned in f32 at all depths).
-    //
-    // Boundary planes `u_lo = u_c - ext/2`, `u_hi = u_c + ext/2` are
-    // derived fresh each iteration from the depth-dependent ext.
-    // The CPU-side walker (`src/world/cubesphere/walker.rs`)
-    // demonstrates the slot-path + residual model holds to
-    // face-subtree depth 30+ in f32 arithmetic; the shader's
-    // curved-cell boundary formulation shares the same state model
-    // at the values LOD termination actually reaches.
-    var s_node_idx: array<u32, MAX_STACK_DEPTH>;
-    var s_slot_u: array<i32, MAX_STACK_DEPTH>;
-    var s_slot_v: array<i32, MAX_STACK_DEPTH>;
-    var s_slot_r: array<i32, MAX_STACK_DEPTH>;
+    // ── Face-subtree walk stack (slot-path + residual) ────────
+    var s_node_idx: array<u32, MAX_FACE_STACK_DEPTH>;
+    var s_slot_u: array<i32, MAX_FACE_STACK_DEPTH>;
+    var s_slot_v: array<i32, MAX_FACE_STACK_DEPTH>;
+    var s_slot_r: array<i32, MAX_FACE_STACK_DEPTH>;
     s_node_idx[0] = start_root_node_idx;
 
     var depth: u32 = 0u;
-    // (u_c, v_c, r_c) is the center of the CHILD cell the ray is
-    // currently in. At depth 0 the walker processes the face
-    // subtree root's children, so this is a 1/3-extent cell. The
-    // initial values (0.5) are just placeholders; we seed
-    // after computing the entry (un, vn, rn) below.
-    var u_c: f32 = 0.5;
-    var v_c: f32 = 0.5;
-    var r_c: f32 = 0.5;
     var cur_us: i32 = 0;
     var cur_vs: i32 = 0;
     var cur_rs: i32 = 0;
 
-    // Compute entry (un, vn, rn) on current face, derive initial slot.
-    // Wrapping this in a closure-like block to re-run on seam cross.
+    // Face-normalized cell LOWER CORNER (shading-normal source only).
+    // At depth 0, the initial child cell's lower corner is
+    // (cur_us/3, cur_vs/3, cur_rs/3). Stays in [0, 1] throughout.
+    var u_c: f32 = 0.0;
+    var v_c: f32 = 0.0;
+    var r_c: f32 = 0.0;
+
+    // Residual ray origin in current cell's `[0, 3)³` local frame.
+    // Starts as (un, vn, rn) * 3 of the ray's body-frame entry
+    // projected onto `cur_face`.
+    var residual_o: vec3<f32> = vec3<f32>(0.0);
+    // Ray direction in current cell's local frame (×3 per descent).
+    // Seeded by a finite-difference Jacobian of
+    // `body_point_to_face_space` at the entry point — same closed-form
+    // as `initial_rd_local` in `src/world/cubesphere/walker.rs`.
+    var rd_local: vec3<f32> = vec3<f32>(0.0);
+    // Body-frame size of one residual unit in ribbon units. At depth
+    // d the residual spans `[0, 3)` face-normalized → `[0, 3·outer_rib
+    // / 3^(d+1))` body-units → one residual unit = `outer_rib /
+    // 3^(d+1)` body-units. Tracked compounded (÷3 on descent, ×3 on
+    // ascent) instead of `1.0 / pow(3.0, depth+1)` to keep ALL
+    // precision-critical arithmetic free of absolute-3^N state.
+    // Used by the LOD gate and hit-cell-size report — not in boundary
+    // tests (those live purely in residual coords).
+    var residual_to_rib: f32 = outer_rib * (1.0 / 3.0);
+
     var cur_header_off = node_offsets[start_root_node_idx];
     var cur_occupancy: u32 = tree[cur_header_off];
     var cur_first_child: u32 = tree[cur_header_off + 1u];
 
-    // Track the surface normal of the LAST boundary the ray crossed.
-    // At any cell-block hit, this is the normal of the face we're
-    // viewing — the boundary that separated the previous empty cell
-    // from this solid cell. Stored in body-local (ribbon-frame) coords
-    // to match the Cartesian walker's convention.
-    //
-    // Initialised below to the entry cell's CELL-CENTER radial (see
-    // Stage 4 faceted-shading comment near the step-advance block).
+    // Surface normal of the LAST boundary the ray crossed — becomes
+    // the hit normal if the NEXT cell is solid. Initialised below to
+    // the entry cell's center radial on `cur_face`.
     var hit_normal: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
 
-    // Compute (un, vn, rn) of the ray's current body-centered position
-    // onto `cur_face`. Used to pick the initial slot at depth=0 after
-    // entering a face (either fresh from body-enter, or after a seam
-    // crossing from a neighbor face).
-    //
-    // After setting cur_face, call `reinit_on_face()` to seed cur_us /
-    // cur_vs / cur_rs / cur_u_lo / cur_v_lo / cur_r_lo at depth 0.
-    //
-    // WGSL has no nested fns, so inline this logic below.
-
-    // Seed initial face slot from the entry point.
-    let p0 = oc + rd * t_cur;
-    let r2_0 = dot(p0, p0);
-    var r0 = sqrt(max(r2_0, 1e-30));
-    var rn0 = clamp((r0 - inner_rib) / max(outer_rib - inner_rib, 1e-10), 0.0, 1.0);
-    // (un, vn) on cur_face via forced projection.
+    // ── Seed state from the body-frame entry point ──
+    // Ray position at t_cur (in ribbon frame, body-centered).
+    let p_entry = oc + rd * t_cur;
+    let r_entry = sqrt(max(dot(p_entry, p_entry), 1e-30));
+    let rn_entry = clamp(
+        (r_entry - inner_rib) / max(outer_rib - inner_rib, 1e-10),
+        0.0, 1.0,
+    );
     let basis0 = face_basis(cur_face);
-    let n_comp0 = dot(basis0.n_axis, p0);
-    let inv_nc0 = 1.0 / max(abs(n_comp0), 1e-6);
-    let cu0 = dot(basis0.u_axis, p0) * inv_nc0 * sign_or_one(n_comp0);
-    let cv0 = dot(basis0.v_axis, p0) * inv_nc0 * sign_or_one(n_comp0);
-    let un0 = clamp(0.5 * (atan(cu0) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
-    let vn0 = clamp(0.5 * (atan(cv0) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
-    cur_us = clamp(i32(floor(un0 * 3.0)), 0, 2);
-    cur_vs = clamp(i32(floor(vn0 * 3.0)), 0, 2);
-    cur_rs = clamp(i32(floor(rn0 * 3.0)), 0, 2);
-    // Child-cell center at the face-subtree root's depth:
-    // ext = 1/3, lo = slot/3, center = lo + ext/2 = slot/3 + 1/6.
-    u_c = f32(cur_us) * (1.0 / 3.0) + (1.0 / 6.0);
-    v_c = f32(cur_vs) * (1.0 / 3.0) + (1.0 / 6.0);
-    r_c = f32(cur_rs) * (1.0 / 3.0) + (1.0 / 6.0);
-
-    // Seed hit_normal to the ENTRY cell's centre radial on cur_face.
-    // Ray just crossed the outer r-shell; the first cell's r-face is
-    // what we're "viewing" if that cell turns out to be solid.
     {
-        let u_mid_init = u_c;
-        let v_mid_init = v_c;
+        let n_comp0 = dot(basis0.n_axis, p_entry);
+        let inv_nc0 = 1.0 / max(abs(n_comp0), 1e-6);
+        let cu0 = dot(basis0.u_axis, p_entry) * inv_nc0 * sign_or_one(n_comp0);
+        let cv0 = dot(basis0.v_axis, p_entry) * inv_nc0 * sign_or_one(n_comp0);
+        let un0 = clamp(0.5 * (atan(cu0) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
+        let vn0 = clamp(0.5 * (atan(cv0) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
+
+        // Residual in face-subtree root's [0, 3)³ frame.
+        residual_o = vec3<f32>(
+            clamp(un0 * 3.0, 0.0, 3.0 - 1.0e-5),
+            clamp(vn0 * 3.0, 0.0, 3.0 - 1.0e-5),
+            clamp(rn_entry * 3.0, 0.0, 3.0 - 1.0e-5),
+        );
+        // Initial slot = floor(residual), clamped to [0, 2].
+        cur_us = clamp(i32(floor(residual_o.x)), 0, 2);
+        cur_vs = clamp(i32(floor(residual_o.y)), 0, 2);
+        cur_rs = clamp(i32(floor(residual_o.z)), 0, 2);
+        // u_c / v_c / r_c = current NODE's lower corner. At depth 0 the
+        // node is the face-subtree root, which has lower corner 0 in
+        // face-normalized coords.
+        u_c = 0.0;
+        v_c = 0.0;
+        r_c = 0.0;
+    }
+
+    // Seed rd_local via finite-difference Jacobian of
+    // `body_point_to_face_space` at p_entry. Matches
+    // `initial_rd_local` in walker.rs.
+    {
+        let h_step: f32 = 1.0e-3;
+        let len_rd = max(length(rd), 1e-20);
+        let u_dir = rd / len_rd;
+        let p_plus = p_entry + h_step * u_dir;
+        // Project p_plus into face space on the same face we entered.
+        // body_point_to_face_space expects a body-local point (offset
+        // from the half-body-size); we pass (p_plus + body_center)
+        // translated consistently — but the face-space math only uses
+        // the centered vector, so operating on p_plus directly vs.
+        // cur_face basis gives the same (un, vn, rn).
+        let r_plus = sqrt(max(dot(p_plus, p_plus), 1e-30));
+        let rn_plus = (r_plus - inner_rib) / max(outer_rib - inner_rib, 1e-10);
+        // Project onto cur_face (ignore face re-pick — this is a
+        // 1e-3-body-unit step, tiny vs face size).
+        let nc_plus = dot(basis0.n_axis, p_plus);
+        let inv_nc_plus = 1.0 / max(abs(nc_plus), 1e-6);
+        let cu_plus = dot(basis0.u_axis, p_plus) * inv_nc_plus * sign_or_one(nc_plus);
+        let cv_plus = dot(basis0.v_axis, p_plus) * inv_nc_plus * sign_or_one(nc_plus);
+        let un_plus = 0.5 * (atan(cu_plus) * (4.0 / 3.14159265) + 1.0);
+        let vn_plus = 0.5 * (atan(cv_plus) * (4.0 / 3.14159265) + 1.0);
+
+        let un_entry = residual_o.x * (1.0 / 3.0);
+        let vn_entry = residual_o.y * (1.0 / 3.0);
+        let rn_entry2 = residual_o.z * (1.0 / 3.0);
+
+        let delta_un = un_plus - un_entry;
+        let delta_vn = vn_plus - vn_entry;
+        let delta_rn = rn_plus - rn_entry2;
+
+        // rd_local in face-normalized [0, 3) coords per unit body-t.
+        // Scale by len_rd / h_step so t parameter stays in body-t.
+        let scale_init = len_rd / h_step;
+        rd_local = vec3<f32>(
+            delta_un * 3.0 * scale_init,
+            delta_vn * 3.0 * scale_init,
+            delta_rn * 3.0 * scale_init,
+        );
+    }
+
+    // Seed hit_normal to the ENTRY cell's center radial on cur_face.
+    // The ray just crossed the outer r-shell; the first cell's r-face
+    // is what we're "viewing" if that cell turns out to be solid.
+    // `u_c / v_c` are the face-subtree ROOT's lower corner (0,0); the
+    // entry cell is at cur_us/vs within that root, so its center is
+    // `f32(cur_us + 0.5) × 1/3`.
+    {
+        let u_mid_init = u_c + (f32(cur_us) + 0.5) * (1.0 / 3.0);
+        let v_mid_init = v_c + (f32(cur_vs) + 0.5) * (1.0 / 3.0);
         let cu_init = tan((2.0 * u_mid_init - 1.0) * 0.78539816);
         let cv_init = tan((2.0 * v_mid_init - 1.0) * 0.78539816);
         var raw_init = basis0.n_axis
@@ -380,37 +426,24 @@ fn march_face_subtree_curved(
         if iterations >= max_iterations { break; }
         iterations += 1u;
 
-        // Current cell bounds (face-normalized). `cur_cell_ext` is
-        // DERIVED from depth on every iteration — NOT stored as f32
-        // state. At depth d, the child cells we're traversing have
-        // extent 1/3^(d+1) in face-normalized coords. `u_c / v_c /
-        // r_c` are the child cell's CENTER (tracked incrementally).
+        // ── Boundary computation in the RESIDUAL frame ──
         //
-        // Use `1.0 / pow(3.0, d+1)` rather than `pow(1.0/3.0, d+1)`
-        // — `3.0^d` is exactly representable for small d, so this
-        // formulation has only a single rounding (the reciprocal)
-        // rather than d compounded roundings of `0.333...`.
-        let cur_cell_ext = 1.0 / pow(3.0, f32(depth + 1u));
-        let half_ext = cur_cell_ext * 0.5;
-        let u_lo = u_c - half_ext;
-        let u_hi = u_c + half_ext;
-        let v_lo = v_c - half_ext;
-        let v_hi = v_c + half_ext;
-        let r_lo = r_c - half_ext;
-        let r_hi = r_c + half_ext;
+        // The current cell occupies the integer sub-box
+        // `[cur_us..cur_us+1] × [cur_vs..cur_vs+1] × [cur_rs..cur_rs+1]`
+        // within the residual `[0, 3)³` frame. Cell boundaries are
+        // EXACT integers; ray-plane t is `(boundary - residual_i) /
+        // rd_local_i`, numerically stable at ALL depths.
+        let cell_lo = vec3<f32>(f32(cur_us), f32(cur_vs), f32(cur_rs));
+        let cell_hi = cell_lo + vec3<f32>(1.0);
 
         // ---- Per-cell Nyquist LOD gate --------------------------------
         //
-        // If the CURRENT cell projects below the pixel threshold, any
-        // further descent is sub-pixel; treat the cell as a terminal
-        // splat. When the cell's slot resolves to a real block (tag=1)
-        // or a Node with a representative block, return a hit using
-        // the stored boundary-crossing normal. When it's empty, fall
-        // through to the ordinary DDA advance so the ray keeps
-        // stepping through small empty cells until it clears the
-        // face subtree (r-shell or seam exit).
+        // Cell's body-frame extent in ribbon units: one residual unit
+        // at current depth corresponds to `residual_to_rib` body
+        // units (tracked compounded, no absolute-3^N arithmetic). We
+        // compare projected pixel size against the Nyquist floor.
+        let cell_rib_size_lod = residual_to_rib;
         {
-            let cell_rib_size_lod = cur_cell_ext * outer_rib;
             let ray_dist_lod = max(t_cur * ray_metric_rib, 0.001);
             let cell_pixels = cell_rib_size_lod / ray_dist_lod
                 * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
@@ -436,73 +469,62 @@ fn march_face_subtree_curved(
                     result.normal = hit_normal;
                     let hp_lod = oc + rd * t_cur;
                     result.cell_min = hp_lod + body_center_rib;
-                    result.cell_size = cur_cell_ext * outer_rib;
+                    result.cell_size = cell_rib_size_lod;
                     return result;
                 }
                 // Empty sub-pixel cell: fall through to ordinary DDA
-                // advance below. The advance still uses this cell's
-                // bounds to step to the next neighbor, same as a
-                // normal empty cell. The LOD gate skipped only the
-                // descent into children we wouldn't have visited.
+                // advance.
             }
         }
 
-        // ---- Compute exit surfaces for THIS cell and pick the
-        //      smallest positive t strictly > t_cur.
+        // ---- Boundary t computation in residual frame.
         //
-        // u-boundary planes: normal = cross(v_axis, n + cube_u ·
-        //   u_axis). Plane passes through body center.
-        //   ray-plane: t = -dot(oc, n) / dot(rd, n).
-        let basis = face_basis(cur_face);
-        let cu_lo = tan((2.0 * u_lo - 1.0) * 0.78539816);
-        let cu_hi = tan((2.0 * u_hi - 1.0) * 0.78539816);
-        let cv_lo = tan((2.0 * v_lo - 1.0) * 0.78539816);
-        let cv_hi = tan((2.0 * v_hi - 1.0) * 0.78539816);
-        let n_plane_u_lo = cross(basis.v_axis, basis.n_axis + cu_lo * basis.u_axis);
-        let n_plane_u_hi = cross(basis.v_axis, basis.n_axis + cu_hi * basis.u_axis);
-        let n_plane_v_lo = cross(basis.n_axis + cv_lo * basis.v_axis, basis.u_axis);
-        let n_plane_v_hi = cross(basis.n_axis + cv_hi * basis.v_axis, basis.u_axis);
-        let R_lo = inner_rib + (outer_rib - inner_rib) * r_lo;
-        let R_hi = inner_rib + (outer_rib - inner_rib) * r_hi;
+        // For each axis: boundary_pos = rd_local_i > 0 ? cell_hi_i :
+        // cell_lo_i; t_axis = (boundary_pos - residual_o_i) /
+        // rd_local_i. Pick minimum positive.
+        //
+        // Use a tiny eps_t guard on the RESULT to avoid re-selecting
+        // the boundary we just arrived on after an advance.
+        let inv_rd = vec3<f32>(
+            select(1e30, 1.0 / rd_local.x, abs(rd_local.x) > 1.0e-30),
+            select(1e30, 1.0 / rd_local.y, abs(rd_local.y) > 1.0e-30),
+            select(1e30, 1.0 / rd_local.z, abs(rd_local.z) > 1.0e-30),
+        );
+        let boundary_pos = vec3<f32>(
+            select(cell_lo.x, cell_hi.x, rd_local.x > 0.0),
+            select(cell_lo.y, cell_hi.y, rd_local.y > 0.0),
+            select(cell_lo.z, cell_hi.z, rd_local.z > 0.0),
+        );
+        let t_axis = (boundary_pos - residual_o) * inv_rd;
+        // A "parallel to axis" rd_local component yields t_axis ≈
+        // inv_rd * (boundary - residual) = 1e30 * small-finite; mask
+        // such components to BIG.
+        let BIG: f32 = 1.0e30;
+        let t_u = select(BIG, t_axis.x, abs(rd_local.x) > 1.0e-30 && t_axis.x >= 0.0);
+        let t_v = select(BIG, t_axis.y, abs(rd_local.y) > 1.0e-30 && t_axis.y >= 0.0);
+        let t_r = select(BIG, t_axis.z, abs(rd_local.z) > 1.0e-30 && t_axis.z >= 0.0);
 
-        let t_eps = t_cur + 1e-6 * outer_rib;
-
-        // ray-plane intersects. Return -1 if parallel/behind.
-        let t_u_lo_raw = ray_plane_t(oc, rd, vec3<f32>(0.0), n_plane_u_lo);
-        let t_u_hi_raw = ray_plane_t(oc, rd, vec3<f32>(0.0), n_plane_u_hi);
-        let t_v_lo_raw = ray_plane_t(oc, rd, vec3<f32>(0.0), n_plane_v_lo);
-        let t_v_hi_raw = ray_plane_t(oc, rd, vec3<f32>(0.0), n_plane_v_hi);
-        // ray-sphere. Use our stable after-t helper.
-        let t_r_lo_raw = ray_sphere_after(oc, rd, vec3<f32>(0.0), R_lo, t_eps);
-        let t_r_hi_raw = ray_sphere_after(oc, rd, vec3<f32>(0.0), R_hi, t_eps);
-
-        let BIG: f32 = 1e30;
-        let t_u_lo = select(BIG, t_u_lo_raw, t_u_lo_raw > t_eps);
-        let t_u_hi = select(BIG, t_u_hi_raw, t_u_hi_raw > t_eps);
-        let t_v_lo = select(BIG, t_v_lo_raw, t_v_lo_raw > t_eps);
-        let t_v_hi = select(BIG, t_v_hi_raw, t_v_hi_raw > t_eps);
-        let t_r_lo = select(BIG, t_r_lo_raw, t_r_lo_raw > t_eps);
-        let t_r_hi = select(BIG, t_r_hi_raw, t_r_hi_raw > t_eps);
-
-        // Pick minimum. Record which face (0=u-, 1=u+, 2=v-, 3=v+,
-        // 4=r-, 5=r+) was crossed.
-        var t_next: f32 = t_u_lo;
+        var t_local_step: f32 = t_u;
         var exit_axis: u32 = 0u;
-        if t_u_hi < t_next { t_next = t_u_hi; exit_axis = 1u; }
-        if t_v_lo < t_next { t_next = t_v_lo; exit_axis = 2u; }
-        if t_v_hi < t_next { t_next = t_v_hi; exit_axis = 3u; }
-        if t_r_lo < t_next { t_next = t_r_lo; exit_axis = 4u; }
-        if t_r_hi < t_next { t_next = t_r_hi; exit_axis = 5u; }
+        if t_v < t_local_step { t_local_step = t_v; exit_axis = 1u; }
+        if t_r < t_local_step { t_local_step = t_r; exit_axis = 2u; }
 
-        if t_next >= BIG {
-            // Shouldn't happen; ray is trapped. Bail as body-exit.
+        if t_local_step >= BIG {
+            // Ray parallel to all three axes — degenerate; bail as
+            // body-exit.
             result.hit = false;
             result.cell_min = oc + rd * t_cur + body_center_rib;
             result.cell_size = 1.0;
             return result;
         }
 
-        // ---- Look up the current cell's child and decide action.
+        // Exit direction: +1 if rd_local along exit axis > 0, else -1.
+        var exit_positive: bool = false;
+        if exit_axis == 0u { exit_positive = rd_local.x > 0.0; }
+        else if exit_axis == 1u { exit_positive = rd_local.y > 0.0; }
+        else { exit_positive = rd_local.z > 0.0; }
+
+        // ---- Per-cell tree lookup (same as before).
         let slot = u32(cur_rs * 9 + cur_vs * 3 + cur_us);
         let slot_bit = 1u << slot;
         if (cur_occupancy & slot_bit) != 0u {
@@ -512,43 +534,31 @@ fn march_face_subtree_curved(
             let tag = packed & 0xFFu;
 
             if tag == 1u {
-                // Block hit at this cell. Use t at cell entry (t_cur)
-                // for the ribbon-frame t. Stage 4: the hit normal is
-                // the normal of the boundary surface the ray crossed
-                // LAST before entering this cell (tracked in
-                // `hit_normal`). For the first cell (no prior crossing),
-                // `hit_normal` was seeded to the outer-shell radial at
-                // entry. This yields faceted cube-cell shading on the
-                // sphere — each terminal solid cell shows up to 3
-                // distinct normal directions (u/v/r-face) just like
-                // Cartesian voxel blocks have ±x/±y/±z faces.
                 result.hit = true;
                 result.t = t_cur;
                 result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
                 result.normal = hit_normal;
                 let hit_pos = oc + rd * t_cur;
                 result.cell_min = hit_pos + body_center_rib;
-                result.cell_size = cur_cell_ext * outer_rib; // approx
+                result.cell_size = cell_rib_size_lod;
                 return result;
             }
 
             if tag == 2u {
                 let child_idx = tree[child_base + 1u];
                 let child_bt = child_block_type(packed);
-                // LOD termination check. Child cell extent in ribbon:
-                // roughly cur_cell_ext/3 × outer_rib (diagonal size).
-                let child_cell_ext_fn = cur_cell_ext / 3.0;
-                let child_cell_rib = child_cell_ext_fn * outer_rib;
+                // Child's projected size for LOD check.
+                let child_cell_rib = residual_to_rib * (1.0 / 3.0);
                 let ray_dist = max(t_cur * ray_metric_rib, 0.001);
                 let lod_pixels = child_cell_rib / ray_dist
                     * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
-                let at_max = depth + 1u >= MAX_STACK_DEPTH;
+                let at_max = depth + 1u >= MAX_FACE_STACK_DEPTH;
                 let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
 
                 if !(at_max || at_lod) && child_bt != 0xFFFEu {
-                    // Descend: push slot / node, compute new cell
-                    // center from ray position in face-normalized
-                    // coords (picks which grandchild the ray is in).
+                    // ── Descend. Mirror walker.rs::descend ──
+                    // Push current slot + node, bump depth, refresh
+                    // the node header cache.
                     s_slot_u[depth] = cur_us;
                     s_slot_v[depth] = cur_vs;
                     s_slot_r[depth] = cur_rs;
@@ -558,187 +568,175 @@ fn march_face_subtree_curved(
                     cur_occupancy = tree[cur_header_off];
                     cur_first_child = tree[cur_header_off + 1u];
 
-                    // New cell (grandchild of prior level) extent:
-                    // 1/3 of the just-descended parent's extent.
-                    let child_cell_ext = 1.0 / pow(3.0, f32(depth + 1u));
-                    let parent_u_lo = u_lo;
-                    let parent_v_lo = v_lo;
-                    let parent_r_lo = r_lo;
+                    // Rescale residual into child cell's [0, 3)³.
+                    residual_o = (residual_o - cell_lo) * 3.0;
+                    rd_local = rd_local * 3.0;
+                    residual_to_rib = residual_to_rib * (1.0 / 3.0);
 
-                    // Current ray position in face-normalized coords.
-                    let p_here = oc + rd * t_cur;
-                    let rh = max(length(p_here), 1e-6);
-                    let b = face_basis(cur_face);
-                    let nc = dot(b.n_axis, p_here);
-                    let inv_nc = 1.0 / max(abs(nc), 1e-6);
-                    let cu = dot(b.u_axis, p_here) * inv_nc * sign_or_one(nc);
-                    let cv = dot(b.v_axis, p_here) * inv_nc * sign_or_one(nc);
-                    let un = clamp(0.5 * (atan(cu) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
-                    let vn = clamp(0.5 * (atan(cv) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
-                    let rn = clamp((rh - inner_rib) / max(outer_rib - inner_rib, 1e-10), 0.0, 1.0);
-                    // Grandchild slot: fractional position within the
-                    // just-descended cell (= parent at this point).
-                    let parent_ext = child_cell_ext * 3.0;
-                    let fu = clamp((un - parent_u_lo) / parent_ext, 0.0, 1.0 - 1e-6);
-                    let fv = clamp((vn - parent_v_lo) / parent_ext, 0.0, 1.0 - 1e-6);
-                    let fr = clamp((rn - parent_r_lo) / parent_ext, 0.0, 1.0 - 1e-6);
-                    cur_us = clamp(i32(floor(fu * 3.0)), 0, 2);
-                    cur_vs = clamp(i32(floor(fv * 3.0)), 0, 2);
-                    cur_rs = clamp(i32(floor(fr * 3.0)), 0, 2);
-                    // New child-cell center.
-                    u_c = parent_u_lo + (f32(cur_us) + 0.5) * child_cell_ext;
-                    v_c = parent_v_lo + (f32(cur_vs) + 0.5) * child_cell_ext;
-                    r_c = parent_r_lo + (f32(cur_rs) + 0.5) * child_cell_ext;
+                    // New slot within the child cell.
+                    cur_us = clamp(i32(floor(residual_o.x)), 0, 2);
+                    cur_vs = clamp(i32(floor(residual_o.y)), 0, 2);
+                    cur_rs = clamp(i32(floor(residual_o.z)), 0, 2);
+
+                    // Update cell LOWER CORNER tracker from the full
+                    // integer slot stack. `ext_acc` stays in f32 but
+                    // the accumulation multiplies small integers by
+                    // a shrinking power of 1/3 — the result stays
+                    // bounded in [0, 1]. At deep depth its low bits
+                    // fall below f32 ULP; harmless because u_c/v_c/
+                    // r_c are used only for the smooth tan() shading-
+                    // normal evaluation, never in boundary tests.
+                    var u_acc: f32 = 0.0;
+                    var v_acc: f32 = 0.0;
+                    var r_acc: f32 = 0.0;
+                    var ext_acc: f32 = 1.0 / 3.0;
+                    for (var d: u32 = 0u; d < depth; d = d + 1u) {
+                        u_acc += f32(s_slot_u[d]) * ext_acc;
+                        v_acc += f32(s_slot_v[d]) * ext_acc;
+                        r_acc += f32(s_slot_r[d]) * ext_acc;
+                        ext_acc = ext_acc * (1.0 / 3.0);
+                    }
+                    u_c = u_acc;
+                    v_c = v_acc;
+                    r_c = r_acc;
                     continue;
                 } else if !(at_max || at_lod) && child_bt == 0xFFFEu {
-                    // Representative-empty: treat as empty, fall through.
+                    // Representative-empty: treat as empty.
                 } else {
-                    // LOD terminal hit.
+                    // LOD terminal splat.
                     let bt = child_bt;
-                    if bt == 0xFFFEu || bt == 0xFFFDu {
-                        // Empty / no-representative: fall through as empty.
-                    } else {
+                    if !(bt == 0xFFFEu || bt == 0xFFFDu) {
                         result.hit = true;
                         result.t = t_cur;
                         result.color = palette[bt].rgb;
-                        // Faceted normal from the last boundary the ray
-                        // crossed (same convention as the tag==1 hit above).
                         result.normal = hit_normal;
                         let hit_pos = oc + rd * t_cur;
                         result.cell_min = hit_pos + body_center_rib;
-                        result.cell_size = cur_cell_ext * outer_rib;
+                        result.cell_size = cell_rib_size_lod;
                         return result;
                     }
                 }
             }
-            // tag 0 or other: fall through as empty.
+            // tag 0 or fall-through: advance.
         }
-        // Empty or fall-through: advance to exit surface of this cell
-        // and step to the neighbor slot in the appropriate direction.
+
+        // ── Advance to cell exit ──
         //
-        // Record the normal of the surface we just crossed; this will
-        // be the hit normal if the NEXT cell is solid. Sign-picked to
-        // oppose `rd` so the normal always points back toward the ray
-        // origin (standard shading convention). Normal is in body-
-        // local coords (ribbon-frame after body-center translation,
-        // same as the Cartesian walker's normal).
+        // Update hit_normal to the boundary we just crossed. The
+        // shading-normal evaluation uses the Jacobian basis at
+        // (u_c, v_c, r_c) — the CURRENT cell's lower corner — so
+        // normals stay well-conditioned at any depth.
         //
-        // Stage 4 faceted voxel shading: r-shell normal uses the
-        // CELL-CENTER radial direction (one fixed direction per cell)
-        // instead of the pointwise radial, giving each cell a flat
-        // r-face facet. u- and v-plane normals are naturally flat
-        // within a cell (they only depend on the cell's u_const /
-        // v_const edges). At deep depths the cell-center radial
-        // converges to the pointwise radial, so this stays continuous
-        // with infinite descent.
+        // Stage 4 faceted voxel shading: r-shell normal is evaluated
+        // at the CELL-CENTER UV (one direction per cell → flat
+        // facet). u- and v-plane normals use the corresponding
+        // `tan()` on the exit-side u or v boundary — one direction
+        // per cell edge.
         {
+            // Derive the local boundary normal in body-frame via the
+            // face basis at (u_c, v_c, r_c). We need:
+            //   * u-face: normal = cross(v_axis, n + cube_u(u_edge) ·
+            //     u_axis) — this is the gradient of the equal-angle
+            //     u = const plane on the cube face.
+            //   * v-face: symmetric.
+            //   * r-face: radial at the cell-center UV.
+            //
+            // Cell extent in face-normalized coords is
+            // `residual_to_rib / outer_rib` — NOT computed as
+            // `1.0 / pow(3.0, depth+1)`. The compounded ÷3 on
+            // descent keeps it free of absolute-3^N arithmetic.
+            let cur_cell_ext = residual_to_rib / max(outer_rib, 1e-10);
+            // u_c / v_c / r_c track the CURRENT NODE'S lower corner;
+            // the ray's active cell is the cur_slot child within that
+            // node (cell extent = cur_cell_ext, lower corner at
+            // `u_c + cur_slot × cur_cell_ext`).
+            let cell_lo_u = u_c + f32(cur_us) * cur_cell_ext;
+            let cell_lo_v = v_c + f32(cur_vs) * cur_cell_ext;
+            let u_center = cell_lo_u + cur_cell_ext * 0.5;
+            let v_center = cell_lo_v + cur_cell_ext * 0.5;
+            let u_edge = select(cell_lo_u, cell_lo_u + cur_cell_ext, exit_positive);
+            let v_edge = select(cell_lo_v, cell_lo_v + cur_cell_ext, exit_positive);
+            let basis = face_basis(cur_face);
             var raw_n: vec3<f32>;
             if exit_axis == 0u {
-                raw_n = n_plane_u_lo;
+                // u-plane at `u_edge`.
+                let cu_edge = tan((2.0 * u_edge - 1.0) * 0.78539816);
+                raw_n = cross(basis.v_axis, basis.n_axis + cu_edge * basis.u_axis);
             } else if exit_axis == 1u {
-                raw_n = n_plane_u_hi;
-            } else if exit_axis == 2u {
-                raw_n = n_plane_v_lo;
-            } else if exit_axis == 3u {
-                raw_n = n_plane_v_hi;
+                // v-plane at `v_edge`.
+                let cv_edge = tan((2.0 * v_edge - 1.0) * 0.78539816);
+                raw_n = cross(basis.n_axis + cv_edge * basis.v_axis, basis.u_axis);
             } else {
-                // r-shell (inner or outer): radial at the CURRENT
-                // cell's center on `cur_face`. One direction per cell
-                // → flat facet. Use the tracked `u_c` / `v_c` cell
-                // center directly — well-conditioned at any depth.
-                let u_mid = u_c;
-                let v_mid = v_c;
-                let cu_mid = tan((2.0 * u_mid - 1.0) * 0.78539816);
-                let cv_mid = tan((2.0 * v_mid - 1.0) * 0.78539816);
-                raw_n = basis.n_axis
-                    + cu_mid * basis.u_axis
-                    + cv_mid * basis.v_axis;
+                // r-shell: radial at cell-center UV.
+                let cu_mid = tan((2.0 * u_center - 1.0) * 0.78539816);
+                let cv_mid = tan((2.0 * v_center - 1.0) * 0.78539816);
+                raw_n = basis.n_axis + cu_mid * basis.u_axis + cv_mid * basis.v_axis;
             }
-            // Normalize and sign-flip to oppose rd.
             let rn_len = max(length(raw_n), 1e-6);
             var n_unit = raw_n / rn_len;
             if dot(n_unit, rd) > 0.0 { n_unit = -n_unit; }
             hit_normal = n_unit;
         }
-        t_cur = t_next;
 
-        // Update slot based on which axis exited. The integer slot
-        // advances by ±1; the cell CENTER shifts by ±cur_cell_ext.
-        // `cur_cell_ext` is recomputed at the top of the next
-        // iteration from depth — not stored as f32 state here.
-        // 0=u-, 1=u+, 2=v-, 3=v+, 4=r-, 5=r+
+        // Advance residual to the boundary (snap the exit-axis
+        // component exactly to the boundary integer to avoid
+        // floor-vs-slot drift).
+        residual_o = residual_o + rd_local * t_local_step;
         if exit_axis == 0u {
-            cur_us -= 1;
-            u_c -= cur_cell_ext;
+            residual_o.x = select(cell_lo.x, cell_hi.x, exit_positive);
+            cur_us = cur_us + select(-1, 1, exit_positive);
         } else if exit_axis == 1u {
-            cur_us += 1;
-            u_c += cur_cell_ext;
-        } else if exit_axis == 2u {
-            cur_vs -= 1;
-            v_c -= cur_cell_ext;
-        } else if exit_axis == 3u {
-            cur_vs += 1;
-            v_c += cur_cell_ext;
-        } else if exit_axis == 4u {
-            cur_rs -= 1;
-            r_c -= cur_cell_ext;
+            residual_o.y = select(cell_lo.y, cell_hi.y, exit_positive);
+            cur_vs = cur_vs + select(-1, 1, exit_positive);
         } else {
-            cur_rs += 1;
-            r_c += cur_cell_ext;
+            residual_o.z = select(cell_lo.z, cell_hi.z, exit_positive);
+            cur_rs = cur_rs + select(-1, 1, exit_positive);
         }
+        // Local-t equals body-t by construction (see comment near
+        // rd_local seeding: rd_local was scaled to give face-normalized
+        // deltas per unit body-t, and subsequent ×3 descents preserve
+        // that parameterization — see walker.rs::descend for the
+        // algebra). Advance ribbon-frame t_cur by t_local_step.
+        t_cur = t_cur + t_local_step;
 
-        // Check for OOB — bubble up.
+        // ── Bubble up on OOB ──
         loop {
-            if cur_us >= 0 && cur_us <= 2 && cur_vs >= 0 && cur_vs <= 2 && cur_rs >= 0 && cur_rs <= 2 {
+            if cur_us >= 0 && cur_us <= 2
+                && cur_vs >= 0 && cur_vs <= 2
+                && cur_rs >= 0 && cur_rs <= 2 {
                 break;
             }
-            // This level's slot went OOB. At face-subtree depth 0,
-            // this means we exited the face subtree entirely. If it's
-            // an r exit, return to caller with shell code. If it's a
-            // u/v exit, do seam crossing here: pick neighbor face
-            // from the ray's body-centered exit position.
             if depth == 0u {
                 let is_r_exit = (cur_rs < 0) || (cur_rs > 2);
                 if is_r_exit {
                     result.hit = false;
                     result.cell_min = oc + rd * t_cur + body_center_rib;
-                    if cur_rs < 0 { result.cell_size = 0.0; } // inner
-                    else { result.cell_size = 1.0; }          // outer
+                    if cur_rs < 0 { result.cell_size = 0.0; } else { result.cell_size = 1.0; }
                     return result;
                 }
-                // UV exit = face-seam cross. Determine neighbor face
-                // from the exit EDGE of the current face: the neighbor
-                // is the face whose normal is the direction we were
-                // stepping in (± u or ± v of current face).
+                // UV seam cross.
                 seam_count += 1u;
                 if seam_count >= max_seams {
                     result.hit = false;
                     result.cell_min = oc + rd * t_cur + body_center_rib;
-                    result.cell_size = 1.0; // treat as outer-exit
+                    result.cell_size = 1.0;
                     return result;
                 }
                 let p_exit = oc + rd * t_cur;
                 let rex = max(length(p_exit), 1e-6);
-                // Determine exit edge from which of (cur_us, cur_vs)
-                // went OOB. cur_rs must be in bounds here (r-exit was
-                // handled by is_r_exit above).
                 let basis_exit = face_basis(cur_face);
                 var target_normal: vec3<f32>;
                 if cur_us < 0      { target_normal = -basis_exit.u_axis; }
                 else if cur_us > 2 { target_normal =  basis_exit.u_axis; }
                 else if cur_vs < 0 { target_normal = -basis_exit.v_axis; }
                 else               { target_normal =  basis_exit.v_axis; }
-                // Find the face index whose normal matches target.
-                // We know target_normal is ±e_i for some i (since
-                // u_axis, v_axis are unit cube axes).
                 var new_face: u32 = cur_face;
-                if target_normal.x >  0.5 { new_face = 0u; } // PosX
-                else if target_normal.x < -0.5 { new_face = 1u; } // NegX
-                else if target_normal.y >  0.5 { new_face = 2u; } // PosY
-                else if target_normal.y < -0.5 { new_face = 3u; } // NegY
-                else if target_normal.z >  0.5 { new_face = 4u; } // PosZ
-                else                           { new_face = 5u; } // NegZ
-                // Sanity: new_face must be different from cur_face.
+                if target_normal.x >  0.5 { new_face = 0u; }
+                else if target_normal.x < -0.5 { new_face = 1u; }
+                else if target_normal.y >  0.5 { new_face = 2u; }
+                else if target_normal.y < -0.5 { new_face = 3u; }
+                else if target_normal.z >  0.5 { new_face = 4u; }
+                else                           { new_face = 5u; }
                 if new_face == cur_face {
                     result.hit = false;
                     result.cell_min = p_exit + body_center_rib;
@@ -746,12 +744,9 @@ fn march_face_subtree_curved(
                     return result;
                 }
                 cur_face = new_face;
-                // Look up the neighbor face's subtree root in the
-                // body node's children.
                 let face_slot = FACE_SLOTS[cur_face];
                 let face_bit = 1u << face_slot;
                 if (body_occupancy & face_bit) == 0u {
-                    // No neighbor face subtree: treat as body-exit.
                     result.hit = false;
                     result.cell_min = p_exit + body_center_rib;
                     result.cell_size = 1.0;
@@ -768,15 +763,21 @@ fn march_face_subtree_curved(
                     return result;
                 }
                 let new_root_idx = tree[face_child_base + 1u];
-                // Reset subtree stack to new face root.
+                // Reset walker to the new face's subtree root.
                 depth = 0u;
                 s_node_idx[0] = new_root_idx;
                 cur_header_off = node_offsets[new_root_idx];
                 cur_occupancy = tree[cur_header_off];
                 cur_first_child = tree[cur_header_off + 1u];
+                residual_to_rib = outer_rib * (1.0 / 3.0);
 
-                // Reinit slot on new face at depth 0.
-                let rnex = clamp((rex - inner_rib) / max(outer_rib - inner_rib, 1e-10), 0.0, 1.0);
+                // Re-project the exit point onto the new face to seed
+                // the residual. This stops linearization drift from
+                // compounding across seams.
+                let rnex = clamp(
+                    (rex - inner_rib) / max(outer_rib - inner_rib, 1e-10),
+                    0.0, 1.0,
+                );
                 let bn = face_basis(cur_face);
                 let nc = dot(bn.n_axis, p_exit);
                 let inv_nc = 1.0 / max(abs(nc), 1e-6);
@@ -784,60 +785,91 @@ fn march_face_subtree_curved(
                 let cv = dot(bn.v_axis, p_exit) * inv_nc * sign_or_one(nc);
                 let un_ = clamp(0.5 * (atan(cu) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
                 let vn_ = clamp(0.5 * (atan(cv) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
-                cur_us = clamp(i32(floor(un_ * 3.0)), 0, 2);
-                cur_vs = clamp(i32(floor(vn_ * 3.0)), 0, 2);
-                cur_rs = clamp(i32(floor(rnex * 3.0)), 0, 2);
-                // Child-cell center on the new face, depth 0
-                // (ext = 1/3, center = slot/3 + 1/6).
-                u_c = f32(cur_us) * (1.0 / 3.0) + (1.0 / 6.0);
-                v_c = f32(cur_vs) * (1.0 / 3.0) + (1.0 / 6.0);
-                r_c = f32(cur_rs) * (1.0 / 3.0) + (1.0 / 6.0);
+
+                residual_o = vec3<f32>(
+                    clamp(un_ * 3.0, 0.0, 3.0 - 1.0e-5),
+                    clamp(vn_ * 3.0, 0.0, 3.0 - 1.0e-5),
+                    clamp(rnex * 3.0, 0.0, 3.0 - 1.0e-5),
+                );
+                cur_us = clamp(i32(floor(residual_o.x)), 0, 2);
+                cur_vs = clamp(i32(floor(residual_o.y)), 0, 2);
+                cur_rs = clamp(i32(floor(residual_o.z)), 0, 2);
+                // At depth 0 on new face, node is the face-subtree root
+                // with lower corner 0.
+                u_c = 0.0;
+                v_c = 0.0;
+                r_c = 0.0;
+
+                // Re-seed rd_local via finite-difference on the new
+                // face (same algebra as initial seed). This stops
+                // seam drift from accumulating.
+                {
+                    let h_step: f32 = 1.0e-3;
+                    let len_rd = max(length(rd), 1e-20);
+                    let u_dir = rd / len_rd;
+                    let p_plus = p_exit + h_step * u_dir;
+                    let r_plus = sqrt(max(dot(p_plus, p_plus), 1e-30));
+                    let rn_plus = (r_plus - inner_rib) / max(outer_rib - inner_rib, 1e-10);
+                    let nc_plus = dot(bn.n_axis, p_plus);
+                    let inv_nc_plus = 1.0 / max(abs(nc_plus), 1e-6);
+                    let cu_plus = dot(bn.u_axis, p_plus) * inv_nc_plus * sign_or_one(nc_plus);
+                    let cv_plus = dot(bn.v_axis, p_plus) * inv_nc_plus * sign_or_one(nc_plus);
+                    let un_plus = 0.5 * (atan(cu_plus) * (4.0 / 3.14159265) + 1.0);
+                    let vn_plus = 0.5 * (atan(cv_plus) * (4.0 / 3.14159265) + 1.0);
+
+                    let un_entry = residual_o.x * (1.0 / 3.0);
+                    let vn_entry = residual_o.y * (1.0 / 3.0);
+                    let rn_entry2 = residual_o.z * (1.0 / 3.0);
+                    let scale_s = len_rd / h_step;
+                    rd_local = vec3<f32>(
+                        (un_plus - un_entry) * 3.0 * scale_s,
+                        (vn_plus - vn_entry) * 3.0 * scale_s,
+                        (rn_plus - rn_entry2) * 3.0 * scale_s,
+                    );
+                }
                 break;
             }
-            // Bubble up one level. Pop the slot; depth-- pushes us
-            // back into the parent's frame. Cell-center shifts to
-            // the parent-level neighbor determined by which axis
-            // overflowed.
+
+            // ── Ascend one level. Mirror walker.rs::ascend ──
+            let child_us = s_slot_u[depth - 1u];
+            let child_vs = s_slot_v[depth - 1u];
+            let child_rs = s_slot_r[depth - 1u];
             depth -= 1u;
-            let pu = s_slot_u[depth];
-            let pv = s_slot_v[depth];
-            let pr = s_slot_r[depth];
 
-            // Parent-level child-cell extent: 1/3^(depth+1) (new depth).
-            let parent_ext = 1.0 / pow(3.0, f32(depth + 1u));
-            // Parent cell LO corner: sum slot × ext over [0, depth).
-            // Using integer slots × depth-derived extents keeps the
-            // sum O(1) and drift-free (the ext sequence terminates
-            // well above f32 ULP for depth < ~20).
-            var parent_u_lo_acc: f32 = 0.0;
-            var parent_v_lo_acc: f32 = 0.0;
-            var parent_r_lo_acc: f32 = 0.0;
-            var ext_acc: f32 = 1.0 / 3.0;
-            for (var d: u32 = 0u; d < depth; d = d + 1u) {
-                parent_u_lo_acc += f32(s_slot_u[d]) * ext_acc;
-                parent_v_lo_acc += f32(s_slot_v[d]) * ext_acc;
-                parent_r_lo_acc += f32(s_slot_r[d]) * ext_acc;
-                ext_acc /= 3.0;
-            }
+            // Undo the descent rescale: residual / 3 + slot, rd_local / 3.
+            rd_local = rd_local * (1.0 / 3.0);
+            residual_o = residual_o * (1.0 / 3.0)
+                + vec3<f32>(f32(child_us), f32(child_vs), f32(child_rs));
+            residual_to_rib = residual_to_rib * 3.0;
 
-            // Determine which axis overflowed at child (only one):
-            // the parent's slot shifts by ±1 on that axis.
-            if cur_us < 0 { cur_us = pu - 1; cur_vs = pv; cur_rs = pr; }
-            else if cur_us > 2 { cur_us = pu + 1; cur_vs = pv; cur_rs = pr; }
-            else if cur_vs < 0 { cur_vs = pv - 1; cur_us = pu; cur_rs = pr; }
-            else if cur_vs > 2 { cur_vs = pv + 1; cur_us = pu; cur_rs = pr; }
-            else if cur_rs < 0 { cur_rs = pr - 1; cur_us = pu; cur_vs = pv; }
-            else { cur_rs = pr + 1; cur_us = pu; cur_vs = pv; }
-
-            // New child-cell center at parent-level.
-            u_c = parent_u_lo_acc + (f32(cur_us) + 0.5) * parent_ext;
-            v_c = parent_v_lo_acc + (f32(cur_vs) + 0.5) * parent_ext;
-            r_c = parent_r_lo_acc + (f32(cur_rs) + 0.5) * parent_ext;
-
-            // Refresh node header.
+            // Refresh node header cache.
             cur_header_off = node_offsets[s_node_idx[depth]];
             cur_occupancy = tree[cur_header_off];
             cur_first_child = tree[cur_header_off + 1u];
+
+            // Parent's cur_slot: whatever slot in the parent now
+            // contains residual_o after the child's OOB bubbled up.
+            if cur_us < 0 { cur_us = child_us - 1; cur_vs = child_vs; cur_rs = child_rs; }
+            else if cur_us > 2 { cur_us = child_us + 1; cur_vs = child_vs; cur_rs = child_rs; }
+            else if cur_vs < 0 { cur_vs = child_vs - 1; cur_us = child_us; cur_rs = child_rs; }
+            else if cur_vs > 2 { cur_vs = child_vs + 1; cur_us = child_us; cur_rs = child_rs; }
+            else if cur_rs < 0 { cur_rs = child_rs - 1; cur_us = child_us; cur_vs = child_vs; }
+            else { cur_rs = child_rs + 1; cur_us = child_us; cur_vs = child_vs; }
+
+            // Re-derive u_c/v_c/r_c from the (now-popped) slot stack.
+            var u_acc: f32 = 0.0;
+            var v_acc: f32 = 0.0;
+            var r_acc: f32 = 0.0;
+            var ext_acc: f32 = 1.0 / 3.0;
+            for (var d: u32 = 0u; d < depth; d = d + 1u) {
+                u_acc += f32(s_slot_u[d]) * ext_acc;
+                v_acc += f32(s_slot_v[d]) * ext_acc;
+                r_acc += f32(s_slot_r[d]) * ext_acc;
+                ext_acc = ext_acc * (1.0 / 3.0);
+            }
+            u_c = u_acc;
+            v_c = v_acc;
+            r_c = r_acc;
         }
     }
     return result;
