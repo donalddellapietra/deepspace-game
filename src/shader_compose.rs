@@ -151,6 +151,7 @@ mod tests {
             "root_face_bounds",
             "root_face_pop_pos",
             "sphere_debug_mode",
+            "probe_pixel",
         ];
         let mut cursor = 0;
         for name in expected_order {

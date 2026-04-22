@@ -154,6 +154,13 @@ pub enum ScriptCmd {
     /// hit paths pre vs post place. Prints `probe_at:` line with the
     /// full SphereHitCell so bit-level comparison works.
     ProbeAt { pitch: f32, yaw: f32 },
+    /// GPU walker-state probe at screen pixel (x, y). Enables the
+    /// `walker_probe` SSBO write for that pixel; the next rendered
+    /// frame captures walker state; CPU reads it back and prints a
+    /// `probe_gpu:` line with all fields. Lets us see EXACTLY what
+    /// the GPU sphere_in_cell returns for a specific pixel, which
+    /// is impossible to infer from CPU cs_raycast alone.
+    ProbeGpu { x: u32, y: u32 },
     /// Emit a `HARNESS_MARK` line to stdout with the given label plus
     /// the current ui_layer / anchor_depth / frame. Timeline marker
     /// for correlating screenshots to actions in a test trace.
@@ -458,6 +465,15 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
                 if parts.len() == 2 {
                     if let (Ok(p), Ok(y)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
                         return Some(ScriptCmd::ProbeAt { pitch: p, yaw: y });
+                    }
+                }
+            }
+            // probe_gpu:<x>:<y>
+            if let Some(rest) = raw.strip_prefix("probe_gpu:") {
+                let parts: Vec<&str> = rest.split(':').collect();
+                if parts.len() == 2 {
+                    if let (Ok(x), Ok(y)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                        return Some(ScriptCmd::ProbeGpu { x, y });
                     }
                 }
             }

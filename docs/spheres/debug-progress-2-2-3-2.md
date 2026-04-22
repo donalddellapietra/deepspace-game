@@ -108,3 +108,59 @@ Investigation path: where exactly does the DDA's advance sequence
 change between pre/post for a ray going past-but-not-through the
 placed cell? This is the remaining precision question.
 
+### 2026-04-22 late-late — GPU SSBO probe landed, root cause identified
+
+Built `probe_gpu:<x>:<y>` script cmd that writes GPU walker state
+into a dedicated 64-byte SSBO for the matching pixel, reads back
+CPU-side, and prints. Ground truth, not inferred.
+
+**Pre-place at y=300 across x=100..500**: every probed pixel returns
+`depth=4 face_node_idx=7 winning=r_lo ratio=(40,40,43,4)`. All rays
+hit the SAME uniform-flat leaf at a shallow depth. Uniform shading.
+
+**Post-place at y=300 across x=100..500**:
+- `x=100,200`: walker terminates at **depth 4**, same shallow cell
+  as before, winning=r_lo. No change from pre-place.
+- `x=300,400,500`: walker descends to **depth 8** (affected by
+  placement), different cell, winning=v_hi, face_node_idx=18
+  (face subtree got a new BFS idx due to the placement's new
+  NodeId ancestor chain).
+
+So the "stripes" are actually a **spatial LOD boundary**: some
+pixels hit the new deep cell at d=8 (winning=v_hi=dark green),
+others hit the old shallow uniform-flat leaf at d=4 (winning=r_lo
+=light blue). The seam between these two regions is what reads as
+a stripe.
+
+**The walker's behavior is correct.** Placing a block un-flattens
+the affected ancestor's uniform-type, pack no longer flattens it,
+walker descends deeper in that spatial region and returns the
+actual deep cell. Rays outside the affected region still hit the
+original uniform-flat ancestor at shallower depth.
+
+**The visual bug** comes from shading discontinuity across the LOD
+boundary: the d=4 region uses a big cell's plane normal, the d=8
+region uses a small cell's plane normal, and those normals differ
+in direction. Adjacent pixels straddling the boundary get different
+shading.
+
+### Fix direction
+
+To eliminate the shading seam, one of:
+1. Prevent the LOD boundary from forming — force consistent depth
+   across the face subtree (disable uniform-flatten on face-subtree
+   descendants; tried in this worktree earlier, partial, see git).
+2. Make the shading CONTINUOUS across LOD boundaries — the hit
+   normal at depth 4 should blend smoothly into the hit normal at
+   depth 8 across the boundary. Requires LOD-aware normal interpo-
+   lation.
+3. Change the shading-source entirely — use the sphere's radial
+   normal everywhere regardless of cell depth. Tried, had downstream
+   issues with `cube_face_bevel` UV.
+
+Option 1 is the proven-working direction — ensuring consistent
+walker depth eliminates the boundary. But it disables an
+optimization. Next iteration: re-test with uniform-flatten disabled
+ONLY for sphere face-subtree descendants, leaving Cartesian flatten
+intact.
+

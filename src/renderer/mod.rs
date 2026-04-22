@@ -13,7 +13,7 @@ pub mod heightmap;
 mod init;
 mod taa;
 
-pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
+pub use draw::{OffscreenRenderTiming, ShaderStatsFrame, WalkerProbeFrame};
 pub use entity_raster::{compute_view_proj, EntityRasterState, InstanceData};
 pub use taa::{FrameSignature, TaaState};
 
@@ -103,6 +103,9 @@ pub struct GpuUniforms {
     /// (normal rendering); 1..=6 visualize walker / plane-advance
     /// state per pixel. Keyed by F6 in the live app.
     pub sphere_debug_mode: [u32; 4],
+    /// `[x, y, active, 0]`: screen pixel to dump walker state for.
+    /// `active == 0` disables probe (no GPU writes).
+    pub probe_pixel: [u32; 4],
 }
 
 pub struct Renderer {
@@ -162,6 +165,9 @@ pub struct Renderer {
     /// Current sphere debug-paint mode. 0 = off; 1..=6 = per-mode
     /// diagnostic paint in `sphere_in_cell`.
     pub(super) sphere_debug_mode: u32,
+    /// Screen-space pixel to probe GPU walker state for. (x, y,
+    /// active). `active == 0` disables probing (no SSBO writes).
+    pub(super) probe_pixel: [u32; 3],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -226,6 +232,12 @@ pub struct Renderer {
     /// via `copy_buffer_to_buffer` at the end of the render pass,
     /// mapped after `poll(Wait)` so the harness can read it back.
     pub(super) shader_stats_readback: wgpu::Buffer,
+    /// Per-pixel walker-state probe buffer — 64 bytes, written by
+    /// `sphere_in_cell` for the pixel matching `uniforms.probe_pixel`
+    /// and gated by `probe_pixel.z != 0`. Read back via
+    /// `walker_probe_readback` after render.
+    pub(super) walker_probe_buffer: wgpu::Buffer,
+    pub(super) walker_probe_readback: wgpu::Buffer,
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
@@ -362,6 +374,15 @@ impl Renderer {
 
     pub fn sphere_debug_mode(&self) -> u32 { self.sphere_debug_mode }
 
+    /// Enable per-pixel GPU walker-state probing at `(x, y)`. Set
+    /// `active=false` to disable. The next rendered frame writes
+    /// walker state into the probe buffer for the matching pixel;
+    /// the caller then calls `read_walker_probe` to get the values.
+    pub fn set_walker_probe_pixel(&mut self, x: u32, y: u32, active: bool) {
+        self.probe_pixel = [x, y, if active { 1 } else { 0 }];
+        self.write_uniforms();
+    }
+
     /// Per-frame toggle for the beam prepass. Callers compute a
     /// cheap CPU heuristic (root occupancy popcount, camera's root
     /// cell) and set this; when false, the renderer skips the
@@ -401,6 +422,7 @@ impl Renderer {
             &self.aabbs_buffer,
             &self.mask_view,
             &self.entity_buffer,
+            &self.walker_probe_buffer,
         );
         // coarse_bind_group uses the dummy mask view which doesn't
         // resize, so it stays valid across resizes.

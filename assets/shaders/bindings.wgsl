@@ -64,6 +64,10 @@ struct Uniforms {
     /// `.yzw` reserved for future per-mode tuning (e.g., a depth
     /// clamp or pixel-magnification factor).
     sphere_debug_mode: vec4<u32>,
+    /// `xy` = screen-space pixel to probe walker state for;
+    /// `z` = non-zero means probing is active (0 disables all
+    /// writes to `walker_probe`). `w` reserved.
+    probe_pixel: vec4<u32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
@@ -180,6 +184,40 @@ struct EntityGpu {
 }
 @group(0) @binding(10) var<storage, read> entities: array<EntityGpu>;
 
+/// Per-pixel walker state probe. A tiny 16-u32 buffer that
+/// `sphere_in_cell` writes into ONLY for the pixel matching
+/// `uniforms.probe_pixel.xy`. Non-atomic stores are safe because
+/// only one fragment invocation passes the pixel-match gate. Used
+/// for in-situ debugging of walker behavior — the CPU reads back
+/// the values after render and prints them.
+struct WalkerProbe {
+    /// 0 = no write, 1 = sphere_in_cell touched the probe pixel.
+    hit_flag: u32,
+    /// DDA iteration count at hit (or at loop-exit).
+    steps: u32,
+    /// Walker return: terminal depth + block type.
+    walker_depth: u32,
+    walker_block: u32,
+    walker_ratio_u: u32,
+    walker_ratio_v: u32,
+    walker_ratio_r: u32,
+    walker_ratio_depth: u32,
+    /// DDA state at return: last winning plane + t bitcast.
+    final_winning: u32,
+    final_t_bits: u32,
+    /// Face dispatch: which cube face the ray landed on, and the
+    /// face subtree's BFS idx the walker descended into.
+    face: u32,
+    face_node_idx: u32,
+    /// Walker f32 fields as bit patterns (so CPU can see full
+    /// precision): u_lo, v_lo, r_lo, size.
+    walker_u_lo_bits: u32,
+    walker_v_lo_bits: u32,
+    walker_r_lo_bits: u32,
+    walker_size_bits: u32,
+}
+@group(0) @binding(11) var<storage, read_write> walker_probe: WalkerProbe;
+
 /// Coarse beam-prepass mask. The fine fragment shader samples a 5-tap
 /// neighborhood at each pixel's tile: if every tap reads 0.0, the
 /// pixel is definitively sky and we return the sky color without
@@ -210,6 +248,11 @@ var<private> ray_loads_tree: u32 = 0u;
 var<private> ray_loads_offsets: u32 = 0u;
 var<private> ray_loads_kinds: u32 = 0u;
 var<private> ray_loads_ribbon: u32 = 0u;
+/// Current pixel coordinate set by `fs_main` / `fs_main_taa` /
+/// `fs_main_depth` before dispatching the per-pixel march. Reads-
+/// back by `sphere_in_cell`'s probe gate without threading
+/// `@builtin(position)` through every call site.
+var<private> current_pixel: vec2<u32> = vec2<u32>(0u, 0u);
 
 /// Pipeline-override constant: when false, fs_main skips all
 /// atomic writes to shader_stats and DDA loops skip the `ray_steps`

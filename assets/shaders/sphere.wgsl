@@ -516,6 +516,32 @@ fn sphere_in_cell(
         // zero as the empty sentinel.
         if w.block != FACE_WALK_EMPTY {
             dbg.result_kind = 2u;
+            // Walker-state probe write — only for the pixel matching
+            // `uniforms.probe_pixel.xy`, gated on `.z != 0`. Writes
+            // are non-atomic because exactly one fragment invocation
+            // passes this gate. Fields are bit-cast where needed so
+            // CPU readback can reconstruct the full f32 precision.
+            if uniforms.probe_pixel.z != 0u
+                && current_pixel.x == uniforms.probe_pixel.x
+                && current_pixel.y == uniforms.probe_pixel.y
+            {
+                walker_probe.hit_flag = 1u;
+                walker_probe.steps = steps;
+                walker_probe.walker_depth = w.depth;
+                walker_probe.walker_block = w.block;
+                walker_probe.walker_ratio_u = w.ratio_u;
+                walker_probe.walker_ratio_v = w.ratio_v;
+                walker_probe.walker_ratio_r = w.ratio_r;
+                walker_probe.walker_ratio_depth = w.ratio_depth;
+                walker_probe.final_winning = last_side;
+                walker_probe.final_t_bits = bitcast<u32>(t);
+                walker_probe.face = f;
+                walker_probe.face_node_idx = face_node_idx;
+                walker_probe.walker_u_lo_bits = bitcast<u32>(w.u_lo);
+                walker_probe.walker_v_lo_bits = bitcast<u32>(w.v_lo);
+                walker_probe.walker_r_lo_bits = bitcast<u32>(w.r_lo);
+                walker_probe.walker_size_bits = bitcast<u32>(w.size);
+            }
             // Hit. The previous step's `last_side` is the face we
             // crossed to exit the PREVIOUS cell; we entered THIS
             // cell through the geometrically-same boundary, but

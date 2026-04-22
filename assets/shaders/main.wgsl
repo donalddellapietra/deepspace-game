@@ -148,6 +148,7 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    current_pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
     // Beam-prepass cull. The coarse pass (fs_coarse_mask) marks
     // tiles that might hit content (1.0) vs definitely sky (0.0).
     // Sample a 5-tap neighborhood (center + 4 cardinal) so tiles

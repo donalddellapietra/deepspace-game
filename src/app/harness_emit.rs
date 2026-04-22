@@ -157,6 +157,42 @@ impl App {
         }
     }
 
+    /// Enable GPU walker-state probing for pixel (x, y). Forces an
+    /// offscreen render so the probe buffer is populated deterministi-
+    /// cally (rather than racing the main event-loop frame). Prints
+    /// one line with all fields decoded to human-readable format.
+    /// `hit_flag == 0` means sphere_in_cell's hit branch never ran
+    /// for that pixel — either the ray missed the sphere entirely,
+    /// or it traversed all empty cells without finding content.
+    pub(super) fn harness_probe_gpu(&mut self, x: u32, y: u32) {
+        // First: ensure GPU tree + camera reflect current state. The
+        // offscreen render below uses the renderer's current bind
+        // group; if the script just performed a place, its tree
+        // update only lands on the NEXT main-loop `upload_tree_lod`.
+        // Call it explicitly so the probe sees the post-edit tree.
+        self.upload_tree_lod();
+        let Some(renderer) = self.renderer.as_mut() else {
+            eprintln!("probe_gpu: no renderer yet, skipping");
+            return;
+        };
+        renderer.set_walker_probe_pixel(x, y, true);
+        let _ = renderer.render_offscreen();
+        let probe = renderer.read_walker_probe();
+        eprintln!(
+            "probe_gpu x={} y={}: hit_flag={} steps={} walker=(depth={} block={} ratio=({},{},{},{}) u_lo={:.6} v_lo={:.6} r_lo={:.6} size={:.6e}) face={} face_node_idx={} final=(winning={} t={:.6e})",
+            x, y,
+            probe.hit_flag,
+            probe.steps,
+            probe.walker_depth, probe.walker_block,
+            probe.walker_ratio_u, probe.walker_ratio_v,
+            probe.walker_ratio_r, probe.walker_ratio_depth,
+            probe.walker_u_lo, probe.walker_v_lo,
+            probe.walker_r_lo, probe.walker_size,
+            probe.face, probe.face_node_idx,
+            probe.final_winning, probe.final_t,
+        );
+    }
+
     /// Shared script-command dispatcher. Called from both the live
     /// event loop (`event_loop.rs`) and the render-harness loop
     /// (`test_runner.rs`) so new commands only need one handler.
@@ -241,6 +277,7 @@ impl App {
             }
             ScriptCmd::ProbeDown => self.harness_probe_down(),
             ScriptCmd::ProbeAt { pitch, yaw } => self.harness_probe_at(pitch, yaw),
+            ScriptCmd::ProbeGpu { x, y } => self.harness_probe_gpu(x, y),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
             ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
             ScriptCmd::TeleportIntoLastEdit => self.teleport_into_last_edit(),

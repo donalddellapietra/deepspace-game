@@ -20,7 +20,34 @@ pub struct OffscreenRenderTiming {
     /// Shader-side per-ray counters for the frame. Populated by
     /// atomic writes in the fragment shader, read back by copy to
     /// the `shader_stats_readback` buffer + map_async.
+    #[allow(dead_code)]
     pub shader_stats: ShaderStatsFrame,
+}
+
+/// Snapshot of `walker_probe` for one rendered frame at the pixel
+/// set via `Renderer::set_walker_probe_pixel`. Populated by
+/// `Renderer::read_walker_probe`. `hit_flag == 0` means the probe
+/// pixel's ray never entered `sphere_in_cell`'s hit path (either
+/// missed the sphere entirely, or hit was overridden by the empty
+/// early-exit).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WalkerProbeFrame {
+    pub hit_flag: u32,
+    pub steps: u32,
+    pub walker_depth: u32,
+    pub walker_block: u32,
+    pub walker_ratio_u: u32,
+    pub walker_ratio_v: u32,
+    pub walker_ratio_r: u32,
+    pub walker_ratio_depth: u32,
+    pub final_winning: u32,
+    pub final_t: f32,
+    pub face: u32,
+    pub face_node_idx: u32,
+    pub walker_u_lo: f32,
+    pub walker_v_lo: f32,
+    pub walker_r_lo: f32,
+    pub walker_size: f32,
 }
 
 /// Decoded `shader_stats` buffer for one frame. `avg_steps` is
@@ -447,6 +474,11 @@ impl Renderer {
         if self.shader_stats_enabled {
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
+        // Always clear + copy the walker probe so consumers reading
+        // `walker_probe_readback` get the current frame's data.
+        // `hit_flag == 0` after readback means the probe pixel never
+        // triggered `sphere_in_cell` (ray missed the body entirely).
+        encoder.clear_buffer(&self.walker_probe_buffer, 0, None);
         self.record_frame_passes(&mut encoder, &view, "ray_march");
         if self.shader_stats_enabled {
             encoder.copy_buffer_to_buffer(
@@ -455,6 +487,11 @@ impl Renderer {
                 64,
             );
         }
+        encoder.copy_buffer_to_buffer(
+            &self.walker_probe_buffer, 0,
+            &self.walker_probe_readback, 0,
+            64,
+        );
         let encode_elapsed = encode_start.elapsed();
         let done_slot: std::sync::Arc<std::sync::Mutex<Option<web_time::Instant>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -586,6 +623,7 @@ impl Renderer {
             // subsequent render pass on the same encoder.
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
+        encoder.clear_buffer(&self.walker_probe_buffer, 0, None);
         self.record_frame_passes(&mut encoder, &view, "offscreen-ray-march");
         if self.shader_stats_enabled {
             encoder.copy_buffer_to_buffer(
@@ -594,6 +632,11 @@ impl Renderer {
                 64,
             );
         }
+        encoder.copy_buffer_to_buffer(
+            &self.walker_probe_buffer, 0,
+            &self.walker_probe_readback, 0,
+            64,
+        );
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
         let done_slot: std::sync::Arc<std::sync::Mutex<Option<web_time::Instant>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -682,6 +725,47 @@ impl Renderer {
         drop(data);
         self.shader_stats_readback.unmap();
         stats
+    }
+
+    /// Map `walker_probe_readback`, decode the 16-u32 probe state,
+    /// and unmap. Must be called AFTER a render pass has completed
+    /// AND the probe was enabled via `set_walker_probe_pixel`. The
+    /// returned tuple is all raw u32s; caller reconstructs f32 via
+    /// `f32::from_bits(v)` where applicable.
+    pub fn read_walker_probe(&self) -> WalkerProbeFrame {
+        let slice = self.walker_probe_readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            self.walker_probe_readback.unmap();
+            return WalkerProbeFrame::default();
+        }
+        let data = slice.get_mapped_range();
+        let read_u32 = |offset: usize| {
+            u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap())
+        };
+        let probe = WalkerProbeFrame {
+            hit_flag: read_u32(0),
+            steps: read_u32(4),
+            walker_depth: read_u32(8),
+            walker_block: read_u32(12),
+            walker_ratio_u: read_u32(16),
+            walker_ratio_v: read_u32(20),
+            walker_ratio_r: read_u32(24),
+            walker_ratio_depth: read_u32(28),
+            final_winning: read_u32(32),
+            final_t: f32::from_bits(read_u32(36)),
+            face: read_u32(40),
+            face_node_idx: read_u32(44),
+            walker_u_lo: f32::from_bits(read_u32(48)),
+            walker_v_lo: f32::from_bits(read_u32(52)),
+            walker_r_lo: f32::from_bits(read_u32(56)),
+            walker_size: f32::from_bits(read_u32(60)),
+        };
+        drop(data);
+        self.walker_probe_readback.unmap();
+        probe
     }
 
     /// Render an off-screen frame and write a PNG to `path`. Used
