@@ -582,8 +582,32 @@ pub(super) fn cs_raycast(
         if t_next >= t_exit { break; }
         last_side = winning;
         let _ = last_side; // currently consumed only by shader
+        // Nudge past the exit boundary. Scale to the **LOD-depth**
+        // cell size (1 / 3^walk_depth), NOT the walker's terminal
+        // `w.size`.
+        //
+        // The old `shell * w.size * 1e-3` scaled to whatever depth
+        // THIS pixel's walker happened to terminate at. With the
+        // packer's tag=1 flattening of uniform subtrees, adjacent
+        // pixels around an edit can terminate at wildly different
+        // depths — tag=1 sibling at face-depth 1 (w.size=1/3), edit
+        // chain at face-depth 10 (w.size=1.7e-5). That's a 20000×
+        // disparity in `cell_eps` across a single screen pixel
+        // boundary. When a ray crosses from a shallow-sibling region
+        // into the deep-edit region, the big nudge pushes `t` PAST
+        // the deep cells entirely — the ray skips solid cells and
+        // renders streaks along the face-grid boundary between
+        // tag=1 flattened and tag=2 rebuilt siblings.
+        //
+        // LOD-depth cell size is a property of pixel distance, not
+        // tree structure — it's the SAME for every adjacent pixel
+        // at a given `t`. Nudging by that scale is safely smaller
+        // than any cell the walker could return at this pixel, so
+        // the ray never overshoots. Still guarded by the `t_ulp * 4`
+        // floor for f32 boundary-drift safety.
+        let lod_cell_size = (1.0_f32 / 3.0_f32).powi(walk_depth as i32);
         let t_ulp = (t.abs() * 1.2e-7).max(1e-30);
-        let cell_eps = (shell * w.size * 1e-3).max(t_ulp * 4.0);
+        let cell_eps = (shell * lod_cell_size * 1e-3).max(t_ulp * 4.0);
         t = t_next + cell_eps;
     }
 
