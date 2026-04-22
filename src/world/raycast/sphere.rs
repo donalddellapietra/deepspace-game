@@ -9,8 +9,9 @@
 //! `HitInfo::sphere_cell`, letting `aabb::hit_aabb_body_local` draw
 //! the exact rendered cell without re-walking the tree.
 
+use super::cartesian;
 use super::{HitInfo, SphereHitCell, MAX_FACE_DEPTH};
-use crate::world::cubesphere::{body_point_to_face_space, FACE_SLOTS};
+use crate::world::cubesphere::{body_point_to_face_space, FACE_SLOTS, SHELL_BLOCK_DEPTH, SHELL_DEPTH};
 use crate::world::sdf;
 use crate::world::tree::{
     slot_index, Child, NodeId, NodeLibrary, EMPTY_NODE, REPRESENTATIVE_EMPTY,
@@ -21,6 +22,14 @@ use crate::world::tree::{
 /// is empty. Using a u16 sentinel (not `0`) because palette index 0
 /// is a real block type (`block::STONE`).
 const EMPTY_CELL: u16 = REPRESENTATIVE_EMPTY;
+
+/// Sentinel returned by `walk_face_subtree` when the walker
+/// terminates at a Cartesian shell-block content node at depth
+/// `SHELL_DEPTH`. Mirrors `SHELL_BLOCK_SENTINEL` in `sphere.wgsl`.
+/// Distinct from `REPRESENTATIVE_EMPTY` (0xFFFE) and
+/// `ENTITY_REPRESENTATIVE` (0xFFFD); palette indices live in
+/// `0..=0xFFFC` so `0xFFFC` itself is unused as a real block.
+const SHELL_BLOCK_SENTINEL: u16 = 0xFFFC;
 
 /// Face-window restriction for sphere raycast (used when the render
 /// frame root lives inside a face subtree). Not consumed by the
@@ -87,6 +96,11 @@ struct FaceWalk {
     ratio_r: i64,
     ratio_depth: u8,
     path: Vec<(NodeId, usize)>,
+    /// When `block == SHELL_BLOCK_SENTINEL`, identifies the Cartesian
+    /// content node at depth `SHELL_DEPTH` that the caller (`cs_raycast`)
+    /// must dispatch a Cartesian DDA into. Mirrors
+    /// `FaceWalkResult.shell_node_idx` in `sphere.wgsl`.
+    shell_node_id: Option<NodeId>,
 }
 
 /// Descend a face subtree from its root along `(un, vn, rn)` to the
@@ -159,7 +173,7 @@ fn walk_face_subtree(
                 block: EMPTY_CELL, depth: d.saturating_sub(1),
                 u_lo, v_lo, r_lo, size,
                 ratio_u, ratio_v, ratio_r, ratio_depth,
-                path,
+                path, shell_node_id: None,
             };
         };
         let child_size = size / 3.0;
@@ -212,7 +226,7 @@ fn walk_face_subtree(
                     r_lo: child_r_lo, size: child_size,
                     ratio_u: child_ratio_u, ratio_v: child_ratio_v,
                     ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
-                    path,
+                    path, shell_node_id: None,
                 };
             }
             Child::Block(b) => {
@@ -222,7 +236,7 @@ fn walk_face_subtree(
                     r_lo: child_r_lo, size: child_size,
                     ratio_u: child_ratio_u, ratio_v: child_ratio_v,
                     ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
-                    path,
+                    path, shell_node_id: None,
                 };
             }
             Child::EntityRef(_) => {
@@ -232,10 +246,26 @@ fn walk_face_subtree(
                     r_lo: child_r_lo, size: child_size,
                     ratio_u: child_ratio_u, ratio_v: child_ratio_v,
                     ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
-                    path,
+                    path, shell_node_id: None,
                 };
             }
             Child::Node(nid) => {
+                // Shell-block dispatch: at SHELL_DEPTH, the descended
+                // child is a Cartesian content subtree (editable voxel
+                // shell-block). Hand off to the caller via sentinel —
+                // matches `sphere.wgsl:266`. This must precede the
+                // LOD-cap fallback so we never collapse shell-block
+                // content into a representative-block splat.
+                if d == SHELL_DEPTH {
+                    return FaceWalk {
+                        block: SHELL_BLOCK_SENTINEL, depth: d,
+                        u_lo: child_u_lo, v_lo: child_v_lo,
+                        r_lo: child_r_lo, size: child_size,
+                        ratio_u: child_ratio_u, ratio_v: child_ratio_v,
+                        ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
+                        path, shell_node_id: Some(nid),
+                    };
+                }
                 if d == limit {
                     let Some(child) = library.get(nid) else {
                         return FaceWalk {
@@ -244,7 +274,7 @@ fn walk_face_subtree(
                             r_lo: child_r_lo, size: child_size,
                             ratio_u: child_ratio_u, ratio_v: child_ratio_v,
                             ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
-                            path,
+                            path, shell_node_id: None,
                         };
                     };
                     let bt = match child.uniform_type {
@@ -261,7 +291,7 @@ fn walk_face_subtree(
                         r_lo: child_r_lo, size: child_size,
                         ratio_u: child_ratio_u, ratio_v: child_ratio_v,
                         ratio_r: child_ratio_r, ratio_depth: child_ratio_depth,
-                        path,
+                        path, shell_node_id: None,
                     };
                 }
                 node_id = nid;
@@ -283,7 +313,7 @@ fn walk_face_subtree(
         block: EMPTY_CELL, depth: limit,
         u_lo, v_lo, r_lo, size,
         ratio_u, ratio_v, ratio_r, ratio_depth,
-        path,
+        path, shell_node_id: None,
     }
 }
 
@@ -489,7 +519,110 @@ pub(super) fn cs_raycast(
         let walk_depth = face_lod_depth(t, shell, lod).min(walker_cap);
         let w = walk_face_subtree(library, face_root_id, fp.un, fp.vn, fp.rn, walk_depth);
 
-        if w.block != EMPTY_CELL {
+        // Shell-block dispatch (mirror sphere.wgsl:753-844). Walker
+        // terminated at a Cartesian content node at SHELL_DEPTH —
+        // transform the world ray into the cell's local UVR-aligned
+        // frame and dispatch a Cartesian DDA into the shell-block.
+        if w.block == SHELL_BLOCK_SENTINEL {
+            let nid = w.shell_node_id
+                .expect("SHELL_BLOCK_SENTINEL implies shell_node_id is Some");
+            let n_axis = face_normal(face);
+            let u_axis = face_u_axis(face);
+            let v_axis = face_v_axis(face);
+
+            let u_corner_ea = w.u_lo * 2.0 - 1.0;
+            let v_corner_ea = w.v_lo * 2.0 - 1.0;
+            let cu_c = ea_to_cube(u_corner_ea);
+            let cv_c = ea_to_cube(v_corner_ea);
+            let dir_corner = sdf::normalize([
+                n_axis[0] + cu_c * u_axis[0] + cv_c * v_axis[0],
+                n_axis[1] + cu_c * u_axis[1] + cv_c * v_axis[1],
+                n_axis[2] + cu_c * u_axis[2] + cv_c * v_axis[2],
+            ]);
+            let r_lo_world_local = cs_inner + w.r_lo * shell;
+            let cell_origin_local = sdf::scale(dir_corner, r_lo_world_local);
+
+            let u_c_ea = (w.u_lo + w.size * 0.5) * 2.0 - 1.0;
+            let v_c_ea = (w.v_lo + w.size * 0.5) * 2.0 - 1.0;
+            let r_c_world = cs_inner + (w.r_lo + w.size * 0.5) * shell;
+            let cos_u = (u_c_ea * std::f32::consts::FRAC_PI_4).cos();
+            let cos_v = (v_c_ea * std::f32::consts::FRAC_PI_4).cos();
+            let sec2_u = 1.0 / (cos_u * cos_u);
+            let sec2_v = 1.0 / (cos_v * cos_v);
+            let u_extent_world = w.size * 2.0 * std::f32::consts::FRAC_PI_4 * r_c_world * sec2_u;
+            let v_extent_world = w.size * 2.0 * std::f32::consts::FRAC_PI_4 * r_c_world * sec2_v;
+            let r_extent_world = w.size * shell;
+
+            let oc_now = sdf::add(oc, sdf::scale(ray_dir, t));
+            let p_rel = sdf::sub(oc_now, cell_origin_local);
+            let local_origin = [
+                3.0 * sdf::dot(p_rel, u_axis) / u_extent_world,
+                3.0 * sdf::dot(p_rel, v_axis) / v_extent_world,
+                3.0 * sdf::dot(p_rel, n_axis) / r_extent_world,
+            ];
+            let local_dir = [
+                3.0 * sdf::dot(ray_dir, u_axis) / u_extent_world,
+                3.0 * sdf::dot(ray_dir, v_axis) / v_extent_world,
+                3.0 * sdf::dot(ray_dir, n_axis) / r_extent_world,
+            ];
+
+            // Pure Cartesian DDA inside the shell-block subtree. The
+            // shell-block has no nested CubedSphereBody nodes, so
+            // `max_face_depth` / `lod` are inert here — pass through.
+            if let Some(sb_hit) = cartesian::cpu_raycast_with_face_depth(
+                library, nid, local_origin, local_dir,
+                SHELL_BLOCK_DEPTH, max_face_depth, lod,
+            ) {
+                let local_hit_pt = [
+                    local_origin[0] + local_dir[0] * sb_hit.t,
+                    local_origin[1] + local_dir[1] * sb_hit.t,
+                    local_origin[2] + local_dir[2] * sb_hit.t,
+                ];
+                let lx = local_hit_pt[0] * u_extent_world / 3.0;
+                let ly = local_hit_pt[1] * v_extent_world / 3.0;
+                let lz = local_hit_pt[2] * r_extent_world / 3.0;
+                let world_offset = [
+                    cell_origin_local[0] + lx * u_axis[0] + ly * v_axis[0] + lz * n_axis[0],
+                    cell_origin_local[1] + lx * u_axis[1] + ly * v_axis[1] + lz * n_axis[1],
+                    cell_origin_local[2] + lx * u_axis[2] + ly * v_axis[2] + lz * n_axis[2],
+                ];
+                let world_hit_abs = sdf::add(cs_center, world_offset);
+                let t_world = sdf::dot(sdf::sub(world_hit_abs, ray_origin), ray_dir);
+
+                // Path: ancestor + (body, face_slot) + face descent +
+                // shell-block descent. `w.path` ends with the slot
+                // pointing to `nid`; `sb_hit.path` begins fresh at
+                // `(nid, ...)`.
+                let mut full_path: Vec<(NodeId, usize)> = Vec::with_capacity(
+                    ancestor_path.len() + 1 + w.path.len() + sb_hit.path.len(),
+                );
+                full_path.extend_from_slice(ancestor_path);
+                full_path.push((body_id, face_slot));
+                full_path.extend(w.path.iter().copied());
+                full_path.extend(sb_hit.path.iter().copied());
+
+                return Some(HitInfo {
+                    path: full_path,
+                    // Local-frame face index (0..5 = ±U/±V/±R). The
+                    // `place_child` adjacency derivation in `edit.rs`
+                    // treats this as XYZ — correct within the
+                    // shell-block since the sub-DDA's coordinate
+                    // system IS Cartesian (in local UVR-aligned axes).
+                    face: sb_hit.face,
+                    t: t_world,
+                    // Don't carry the sphere-DDA `prev_place_path`:
+                    // shell-block placement uses face-direction
+                    // adjacency in the local frame, which the empty
+                    // place_path triggers in `place_child`.
+                    place_path: None,
+                    sphere_cell: None,
+                });
+            }
+            // Shell-block missed (ray punched through hollow interior).
+            // Reset prev_place_path and let the sphere DDA continue
+            // stepping to the cell exit. The empty-cell path-record
+            // happens after this block as if the cell were empty.
+        } else if w.block != EMPTY_CELL {
             let mut full_path: Vec<(NodeId, usize)> =
                 Vec::with_capacity(ancestor_path.len() + 1 + w.path.len());
             full_path.extend_from_slice(ancestor_path);
