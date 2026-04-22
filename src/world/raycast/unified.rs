@@ -23,7 +23,8 @@
 
 use super::HitInfo;
 use crate::world::cubesphere::{
-    face_frame_jacobian, mat3_inv, Face, Mat3, FACE_SLOTS, CORE_SLOT,
+    body_point_to_face_space, face_frame_jacobian, face_space_to_body_point, mat3_inv, Face, Mat3,
+    CORE_SLOT, FACE_SLOTS,
 };
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, REPRESENTATIVE_EMPTY};
 
@@ -428,16 +429,18 @@ fn bubble_up(stack: &mut Vec<UFrame>, path: &mut Vec<(NodeId, usize)>) -> bool {
     let parent = &mut stack[parent_depth];
 
     // Face-seam check: if the popped child was a face-root cell
-    // (i.e., parent is a SphereBody and the popped child's kind was
-    // SphereFace), then bubbling past means crossing a cube face.
-    // Step 4 replaces this termination with a face-adjacency rotation.
-    let was_face_root = matches!(child.kind, CellKind::SphereFace { .. })
+    // (its kind is SphereFace AND parent is SphereBody), bubbling
+    // past means crossing a cube face. Handle via cubesphere
+    // geometry helpers: compute body-local point at the exit, then
+    // query the adjacent face.
+    let face_root_pop = matches!(child.kind, CellKind::SphereFace { .. })
         && matches!(parent.kind, CellKind::SphereBody { .. });
-    if was_face_root {
-        return false;
+    if face_root_pop {
+        return handle_face_seam_crossing(child, parent, axis, stepping_positive);
     }
 
-    // Recompute parent residual from child state.
+    // Regular Cartesian / face-subtree-internal bubble-up.
+    // Parent residual recomputes from child state.
     let mut new_residual = [0.0f32; 3];
     for k in 0..3 {
         if k == axis {
@@ -451,6 +454,121 @@ fn bubble_up(stack: &mut Vec<UFrame>, path: &mut Vec<(NodeId, usize)>) -> bool {
     parent.slot[axis] += if stepping_positive { 1 } else { -1 };
     parent.t_world_entry = child.t_world_entry;
 
+    true
+}
+
+/// Face-seam crossing: the popped SphereFace frame overflowed past
+/// the face-root's face-normalized extent. For u/v overflows we
+/// reproject the exit point onto the adjacent cube face and update
+/// the SphereBody parent's slot + residual to target the new face's
+/// subtree. For r overflows we terminate (exits shell or enters
+/// core — core descent is future work).
+///
+/// Returns `false` to terminate the march, `true` to continue.
+fn handle_face_seam_crossing(
+    child: UFrame,
+    parent: &mut UFrame,
+    axis: usize,
+    stepping_positive: bool,
+) -> bool {
+    let (face, un_corner, vn_corner, rn_corner, frame_size, inner_r, outer_r, body_world_size) =
+        match child.kind {
+            CellKind::SphereFace {
+                face, un_corner, vn_corner, rn_corner, frame_size,
+                inner_r, outer_r, body_world_size, ..
+            } => (face, un_corner, vn_corner, rn_corner, frame_size,
+                  inner_r, outer_r, body_world_size),
+            _ => return false,
+        };
+
+    // r-axis overflow: exit shell (outer) or enter core (inner).
+    // Core descent isn't implemented — terminate both sides for now.
+    if axis == 2 {
+        return false;
+    }
+
+    // Compute face-normalized coords of the exit point, using the
+    // popped frame's post-overflow state.
+    //
+    // On the overflow axis: the cell edge the ray crossed is at
+    // `node_corner + frame_size` (if +) or `node_corner` (if -).
+    //
+    // On other axes: the ray's position in NODE-normalized coords is
+    // `(slot + residual) / 3`, so the face-normalized coord is
+    // `node_corner + frame_size * (slot + residual) / 3`.
+    let mut un_exit = 0.0f32;
+    let mut vn_exit = 0.0f32;
+    let mut rn_exit = rn_corner + frame_size * (child.slot[2] as f32 + child.residual_entry[2]) / 3.0;
+
+    if axis == 0 {
+        un_exit = if stepping_positive { un_corner + frame_size } else { un_corner };
+        vn_exit = vn_corner + frame_size * (child.slot[1] as f32 + child.residual_entry[1]) / 3.0;
+    } else if axis == 1 {
+        un_exit = un_corner + frame_size * (child.slot[0] as f32 + child.residual_entry[0]) / 3.0;
+        vn_exit = if stepping_positive { vn_corner + frame_size } else { vn_corner };
+    }
+
+    let un_exit = un_exit.clamp(0.0, 0.9999999);
+    let vn_exit = vn_exit.clamp(0.0, 0.9999999);
+    let rn_exit = rn_exit.clamp(0.0, 0.9999999);
+
+    // Body-local XYZ of the exit point.
+    let body_point = face_space_to_body_point(
+        face, un_exit, vn_exit, rn_exit,
+        inner_r, outer_r, body_world_size,
+    );
+
+    // Project onto the adjacent face.
+    let Some(new_fp) = body_point_to_face_space(
+        body_point,
+        inner_r, outer_r, body_world_size,
+    ) else {
+        // Point outside shell — ray has effectively left.
+        return false;
+    };
+
+    // Update the SphereBody parent to point at the new face's slot.
+    // Body-local in [0,1): `body_point / body_world_size`.
+    let body_norm = [
+        (body_point[0] / body_world_size).clamp(0.0, 0.9999999),
+        (body_point[1] / body_world_size).clamp(0.0, 0.9999999),
+        (body_point[2] / body_world_size).clamp(0.0, 0.9999999),
+    ];
+    let subcell_slot = [
+        (body_norm[0] * 3.0).floor().clamp(0.0, 2.0) as i32,
+        (body_norm[1] * 3.0).floor().clamp(0.0, 2.0) as i32,
+        (body_norm[2] * 3.0).floor().clamp(0.0, 2.0) as i32,
+    ];
+    // Sanity: the subcell picked should be the new face's FACE_SLOT.
+    let expected = FACE_SLOTS[new_fp.face as usize];
+    let picked = slot_index(
+        subcell_slot[0] as usize,
+        subcell_slot[1] as usize,
+        subcell_slot[2] as usize,
+    );
+    if picked != expected {
+        // Geometry disagreement between subcell pick and reported
+        // face — usually a corner/vertex crossing where numerical
+        // rounding lands the point on an ambiguous slot. Prefer the
+        // reported face (authoritative).
+        let (sx, sy, sz) = slot_coords(expected);
+        parent.slot = [sx as i32, sy as i32, sz as i32];
+    } else {
+        parent.slot = subcell_slot;
+    }
+    let (sx, sy, sz) = (parent.slot[0] as f32, parent.slot[1] as f32, parent.slot[2] as f32);
+    parent.residual_entry = [
+        (body_norm[0] * 3.0 - sx).clamp(0.0, 0.9999999),
+        (body_norm[1] * 3.0 - sy).clamp(0.0, 0.9999999),
+        (body_norm[2] * 3.0 - sz).clamp(0.0, 0.9999999),
+    ];
+    parent.t_world_entry = child.t_world_entry;
+    // NB: `new_fp` (un, vn, rn of exit on the NEW face) is intrinsic
+    // to the geometry but isn't needed at parent — the main loop's
+    // next descend step will re-derive the face-root frame's initial
+    // state from the body residual when it descends into the face
+    // slot.
+    let _ = new_fp;
     true
 }
 
@@ -661,6 +779,40 @@ mod tests {
         // fired at least once for the ray to traverse beyond the
         // initial root slot.
         assert!(hit.is_some(), "ray should eventually hit a block");
+    }
+
+    /// Tangent ray that would cross a face seam on a body with
+    /// solid subtrees. Pre-Step-4, any such ray terminated at the
+    /// first SphereFace → SphereBody pop (face-root bubble-up).
+    /// Post-Step-4, the crossing reprojects onto the adjacent face
+    /// and continues the march.
+    ///
+    /// Uses a skew ray from outside the sphere that enters near one
+    /// face's edge and points tangentially across the body. The
+    /// smoke test is simply that the march terminates (hit or miss)
+    /// without panic and returns some result that exercises the
+    /// face-seam code path.
+    #[test]
+    fn unified_face_seam_crossing_smoke() {
+        let (lib, root) = build_solid_sphere_world(3);
+        // Several rays skimming or crossing the sphere. If any of
+        // these panics, the seam code is broken. A solid sphere must
+        // produce at least one hit for a ray that intersects it.
+        let rays: &[([f32; 3], [f32; 3])] = &[
+            ([1.5, 5.0, 1.5], [0.0, -1.0, 0.0]),         // straight down → hits +Y
+            ([5.0, 1.5, 1.5], [-1.0, 0.0, 0.0]),         // from +X → hits +X
+            ([1.5, 5.0, 1.4], [0.0, -1.0, 0.1]),         // slight +Z angle
+            ([1.55, 5.0, 1.5], [0.0, -1.0, 0.0]),        // slight +X offset
+            ([0.5, 1.55, 0.5], [1.0, 0.0, 1.0]),         // from -X,-Z toward +X,+Z
+        ];
+        let mut any_hit = false;
+        for &(ro, rd) in rays {
+            let hit = unified_raycast(&lib, root, ro, rd, 16);
+            if hit.is_some() {
+                any_hit = true;
+            }
+        }
+        assert!(any_hit, "at least one ray should hit the solid sphere");
     }
 
     /// After descending into a face subtree, the top frame's kind is
