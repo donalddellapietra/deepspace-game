@@ -519,6 +519,9 @@ impl App {
     pub(super) fn render_frame_kind(&self) -> NodeKind {
         match self.render_frame().kind {
             ActiveFrameKind::Cartesian => NodeKind::Cartesian,
+            ActiveFrameKind::Body { inner_r, outer_r } => {
+                NodeKind::CubedSphereBody { inner_r, outer_r }
+            }
         }
     }
 
