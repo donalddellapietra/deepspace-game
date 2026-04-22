@@ -1,9 +1,10 @@
 //! Cartesian stack-based DDA. CPU mirror of the shader's
 //! `march_cartesian`. Walks the unified tree in XYZ slot order and
-//! dispatches into `sphere::cs_raycast` when it descends into a
-//! `CubedSphereBody` child.
+//! dispatches into `unified::unified_raycast` (residual + slot-path
+//! primitive) when it descends into a `CubedSphereBody` child.
 
-use super::sphere::{self, LodParams};
+use super::sphere::LodParams;
+use super::unified;
 use super::HitInfo;
 use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
@@ -18,17 +19,26 @@ pub(super) struct Frame {
 
 /// Stack-based Cartesian DDA over the unified tree. `max_depth`
 /// caps how deep the walker descends; the deepest cell at that
-/// depth is the hit granularity. `lod` is propagated into sphere
-/// dispatch when the DDA crosses a body cell, so the CPU picks
-/// the same terminal cell the shader does.
+/// depth is the hit granularity. When the DDA crosses a body cell,
+/// it hands off to `unified::unified_raycast`, which handles the
+/// residual + slot-path descent through the body and its face
+/// subtrees with bounded f32 precision regardless of depth.
+///
+/// `_max_face_depth` and `_lod` were used by the legacy body-march
+/// primitive to cap face-subtree descent at the screen-LOD
+/// terminal; the unified primitive's stack-based descent stops on
+/// occupancy/empty boundaries and is naturally precision-bounded,
+/// so neither parameter is consulted any more. They are retained in
+/// the signature so callers in the frame-aware dispatcher can stay
+/// untouched while the legacy plumbing is removed.
 pub(super) fn cpu_raycast_with_face_depth(
     library: &NodeLibrary,
     root: NodeId,
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
-    max_face_depth: u32,
-    lod: LodParams,
+    _max_face_depth: u32,
+    _lod: LodParams,
 ) -> Option<HitInfo> {
     let inv_dir = [
         if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
@@ -129,9 +139,11 @@ pub(super) fn cpu_raycast_with_face_depth(
             Child::Node(child_id) => {
                 let child_node = library.get(child_id)?;
 
-                // Sphere body dispatch: hand off to the sphere DDA
-                // with the body cell's current-frame origin/size.
-                if let NodeKind::CubedSphereBody { inner_r, outer_r } = child_node.kind {
+                // Sphere body dispatch: hand off to the unified
+                // residual + slot-path DDA with the ray transformed
+                // into body-local coords (where the body fills
+                // [0, 3)³ — `unified_raycast`'s assumption).
+                if let NodeKind::CubedSphereBody { .. } = child_node.kind {
                     let parent_origin = stack[depth].node_origin;
                     let parent_cell_size = stack[depth].cell_size;
                     let body_origin = [
@@ -139,14 +151,31 @@ pub(super) fn cpu_raycast_with_face_depth(
                         parent_origin[1] + cell[1] as f32 * parent_cell_size,
                         parent_origin[2] + cell[2] as f32 * parent_cell_size,
                     ];
-                    if let Some(hit) = sphere::cs_raycast(
-                        library, child_id, body_origin, parent_cell_size,
-                        inner_r, outer_r,
-                        ray_origin, ray_dir,
-                        &path[..=depth],
-                        max_face_depth, lod,
-                        None,
+                    let scale = 3.0 / parent_cell_size;
+                    let body_ray_origin = [
+                        (ray_origin[0] - body_origin[0]) * scale,
+                        (ray_origin[1] - body_origin[1]) * scale,
+                        (ray_origin[2] - body_origin[2]) * scale,
+                    ];
+                    let inner_max = max_depth.saturating_sub(depth as u32 + 1);
+                    if let Some(mut hit) = unified::unified_raycast(
+                        library, child_id,
+                        body_ray_origin, ray_dir,
+                        inner_max,
                     ) {
+                        // Body-local `t` is in body-local units where
+                        // the body spans 3.0; convert back to the
+                        // caller's distance scale.
+                        hit.t /= scale;
+                        // Prepend the Cartesian prefix (this frame's
+                        // ancestors) so the returned path is rooted
+                        // at the caller's `root` rather than at the
+                        // body cell.
+                        let mut full_path: Vec<(NodeId, usize)> =
+                            Vec::with_capacity(depth + 1 + hit.path.len());
+                        full_path.extend_from_slice(&path[..=depth]);
+                        full_path.append(&mut hit.path);
+                        hit.path = full_path;
                         return Some(hit);
                     }
                     advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);

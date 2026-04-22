@@ -554,7 +554,10 @@ fn march_cartesian(
             }
 
             // Sphere body dispatch: a CubedSphereBody child hands off
-            // to the sphere DDA. On miss, advance Cartesian DDA past.
+            // to the unified sphere DDA (`sphere_dda`). On miss,
+            // advance the Cartesian DDA past. Every sphere render
+            // path routes through this single residual + slot-path
+            // primitive.
             let kind = node_kinds[child_idx].kind;
             if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
             if kind == 1u {
@@ -563,11 +566,10 @@ fn march_cartesian(
                 let inner_r = node_kinds[child_idx].inner_r;
                 let outer_r = node_kinds[child_idx].outer_r;
                 if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 2u; }
-                let sph = sphere_in_cell(
+                let sph = sphere_dda(
                     child_idx, body_origin, body_size,
                     inner_r, outer_r,
                     ray_origin, ray_dir,
-                    0u, 0u, vec4<f32>(0.0),
                 );
                 if sph.hit { return sph; }
                 let m_sph = min_axis_mask(cur_side_dist);
@@ -795,9 +797,8 @@ fn march_cartesian(
 
 // ───────────────────────── unified_dda — per ribbon-level entry ─────
 //
-// Per-ribbon-level dispatch. Internally selects sphere_in_cell
-// (Body), bounded face-window (Face root at ribbon_level 0), or
-// march_cartesian otherwise.
+// Per-ribbon-level dispatch. Internally selects `sphere_dda` (Body)
+// or `march_cartesian` otherwise.
 fn unified_dda(
     current_idx: u32,
     ray_origin: vec3<f32>,
@@ -807,22 +808,20 @@ fn unified_dda(
 ) -> HitResult {
     let cur_kind = node_kinds[current_idx].kind;
     if cur_kind == 1u {
-        return sphere_in_cell(
+        // SphereBody: residual + slot-path + per-cell analytical
+        // Jacobian DDA. Bounded f32 precision regardless of depth.
+        return sphere_dda(
             current_idx, vec3<f32>(0.0), 3.0,
             node_kinds[current_idx].inner_r,
             node_kinds[current_idx].outer_r,
             ray_origin, ray_dir,
-            0u, 0u, vec4<f32>(0.0),
         );
     }
-    if cur_kind == 2u && ribbon_level == 0u {
-        return sphere_in_cell(
-            current_idx, vec3<f32>(0.0), 3.0,
-            uniforms.root_radii.x, uniforms.root_radii.y,
-            ray_origin, ray_dir,
-            1u, uniforms.root_face_meta.x, uniforms.root_face_bounds,
-        );
-    }
+    // Face-root at ribbon level 0 (render-frame root lives inside a
+    // face subtree) is currently rare given `compute_render_frame`
+    // produces only Cartesian or Body roots. Fall through to
+    // `march_cartesian` for those paths — the body-level dispatch
+    // above handles every reachable sphere render path.
     return march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
 }
 
@@ -854,7 +853,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         hops = hops + 1u;
 
         // Single unified dispatch per ribbon level. Internals
-        // delegate to sphere_in_cell / march_cartesian.
+        // delegate to sphere_dda / march_cartesian.
         var r: HitResult = unified_dda(
             current_idx, ray_origin, ray_dir,
             ribbon_level, skip_slot,
@@ -880,7 +879,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         // at ribbon_level > 0): a face-root has no standalone march
         // interpretation — its 27 children index UVR not XYZ, which
         // march_cartesian would mis-interpret. Pop through it to the
-        // body level where sphere_in_cell does the right thing.
+        // body level where sphere_dda does the right thing.
         var pop_iters: u32 = 0u;
         var pop_succeeded = true;
         loop {

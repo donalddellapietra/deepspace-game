@@ -3,9 +3,9 @@
 #include "ray_prim.wgsl"
 
 // Cubed-sphere geometry + DDA. One WGSL file with the face-math
-// helpers, the face-subtree walker, and the unified sphere march.
-// The CPU mirror lives in `src/world/cubesphere.rs` +
-// `src/world/raycast/sphere.rs`.
+// helpers, the face-subtree walker, and the unified sphere march
+// (`sphere_dda`). The CPU mirror lives in `src/world/cubesphere.rs`
+// + `src/world/raycast/unified.rs`.
 
 // ─────────────────────────────────────────────── face constants
 
@@ -342,16 +342,219 @@ fn face_lod_depth(ray_dist: f32, shell: f32) -> u32 {
     return u32(clamp(1.0 + log3r, 1.0, f32(MAX_FACE_DEPTH)));
 }
 
+// ─────────────────────────── face/body coord conversions (mirror of CPU)
+
+fn face_uv_to_dir(face: u32, u: f32, v: f32) -> vec3<f32> {
+    let cu = ea_to_cube(u);
+    let cv = ea_to_cube(v);
+    let n = face_normal(face);
+    let ua = face_u_axis(face);
+    let va = face_v_axis(face);
+    let raw = vec3<f32>(
+        n.x + cu * ua.x + cv * va.x,
+        n.y + cu * ua.y + cv * va.y,
+        n.z + cu * ua.z + cv * va.z,
+    );
+    return normalize(raw);
+}
+
+fn face_space_to_body_point(
+    face: u32,
+    un: f32, vn: f32, rn: f32,
+    inner_r: f32, outer_r: f32,
+    body_size: f32,
+) -> vec3<f32> {
+    let center = vec3<f32>(body_size * 0.5);
+    let radius = (inner_r + rn * (outer_r - inner_r)) * body_size;
+    let dir = face_uv_to_dir(face, un * 2.0 - 1.0, vn * 2.0 - 1.0);
+    return center + dir * radius;
+}
+
+struct FacePointShader {
+    face: u32,
+    un: f32,
+    vn: f32,
+    rn: f32,
+    valid: u32, // 0 = degenerate, 1 = ok
+}
+
+fn body_point_to_face_space(
+    point_body: vec3<f32>,
+    inner_r: f32, outer_r: f32,
+    body_size: f32,
+) -> FacePointShader {
+    var out: FacePointShader;
+    out.valid = 0u;
+    out.face = 0u;
+    out.un = 0.0;
+    out.vn = 0.0;
+    out.rn = 0.0;
+    let center = vec3<f32>(body_size * 0.5);
+    let offset = point_body - center;
+    let r = length(offset);
+    if r <= 1e-12 { return out; }
+    let n = offset / r;
+    let face = pick_face(n);
+    let n_axis = face_normal(face);
+    let u_axis = face_u_axis(face);
+    let v_axis = face_v_axis(face);
+    let axis_dot = dot(n, n_axis);
+    if abs(axis_dot) <= 1e-12 { return out; }
+    let cube_u = dot(n, u_axis) / axis_dot;
+    let cube_v = dot(n, v_axis) / axis_dot;
+    let inner = inner_r * body_size;
+    let outer = outer_r * body_size;
+    let shell = outer - inner;
+    if shell <= 0.0 { return out; }
+    out.face = face;
+    out.un = clamp((cube_to_ea(cube_u) + 1.0) * 0.5, 0.0, 0.9999999);
+    out.vn = clamp((cube_to_ea(cube_v) + 1.0) * 0.5, 0.0, 0.9999999);
+    out.rn = clamp((r - inner) / shell, 0.0, 0.9999999);
+    out.valid = 1u;
+    return out;
+}
+
+// ─────────────────────────────────────────── analytical face Jacobian
+//
+// Mat3Cols is the column-major form of a 3×3 matrix: each `col_*` is
+// one column. `face_jacobian_normalized` returns J such that
+//
+//     d(body_pos) / d(un, vn, rn)  ≈  J  (at the given un/vn/rn).
+//
+// For a face-subtree cell of size `frame_size`, the cell's local
+// residual ∈ [0, 1)³ relates to body-XYZ via
+//
+//     body_pos(residual) ≈ corner_body + frame_size · J · residual
+//
+// where `corner_body = face_space_to_body_point(face, un, vn, rn, …)`
+// at the cell's lower corner. The MULTIPLY by `frame_size` is an exact
+// scalar factor — it's pulled out of the matrix to keep J's columns
+// at O(1) magnitude regardless of cell depth, so the inverse stays
+// well-conditioned.
+//
+// `mat3_inverse_cols` and `mat3_inv_mul_vec` then give the per-axis
+// rate of residual change per unit world-t:
+//
+//     rate = (J_inv · rd_body) / frame_size
+//
+// (with the `/ frame_size` absorbed into `t_exit = … * frame_size /
+// rate_normalized` at the use site so we never form the huge ratio).
+
+struct Mat3Cols {
+    col_u: vec3<f32>,
+    col_v: vec3<f32>,
+    col_r: vec3<f32>,
+}
+
+fn face_jacobian_normalized(
+    face: u32,
+    un: f32, vn: f32, rn: f32,
+    inner_r: f32, outer_r: f32, body_size: f32,
+) -> Mat3Cols {
+    let u = un * 2.0 - 1.0;
+    let v = vn * 2.0 - 1.0;
+    let n_axis = face_normal(face);
+    let u_axis = face_u_axis(face);
+    let v_axis = face_v_axis(face);
+    let cu = ea_to_cube(u);
+    let cv = ea_to_cube(v);
+    let raw = n_axis + cu * u_axis + cv * v_axis;
+    let raw_len = length(raw);
+    let dir = raw / raw_len;
+    let radius = (inner_r + rn * (outer_r - inner_r)) * body_size;
+    // d(cu)/d(un) = sec²(u·π/4) · π/2  (chain rule across u = 2un−1
+    // gives factor 2; sec²·π/4 from d(tan)/du; combined π/2).
+    let cos_u = cos(u * 0.78539816);
+    let cos_v = cos(v * 0.78539816);
+    let alpha_u = 1.5707963 / (cos_u * cos_u);
+    let alpha_v = 1.5707963 / (cos_v * cos_v);
+    let dir_dot_ua = dot(dir, u_axis);
+    let dir_dot_va = dot(dir, v_axis);
+    let d_dir_du = alpha_u * (u_axis - dir * dir_dot_ua) / raw_len;
+    let d_dir_dv = alpha_v * (v_axis - dir * dir_dot_va) / raw_len;
+    var out: Mat3Cols;
+    out.col_u = d_dir_du * radius;
+    out.col_v = d_dir_dv * radius;
+    out.col_r = dir * (outer_r - inner_r) * body_size;
+    return out;
+}
+
+// Inverse of a 3×3 matrix. Returns the inverse in COLUMN-MAJOR form
+// — `inv.col_u` is the FIRST COLUMN of the inverse matrix. To
+// multiply `inverse · vec`, use `mat3_inv_mul_vec` below.
+fn mat3_inverse_cols(m: Mat3Cols) -> Mat3Cols {
+    let cross_vr = cross(m.col_v, m.col_r);
+    let cross_ru = cross(m.col_r, m.col_u);
+    let cross_uv = cross(m.col_u, m.col_v);
+    let det = dot(m.col_u, cross_vr);
+    let inv_det = select(0.0, 1.0 / det, abs(det) > 1e-30);
+    // For inverse(M), row i = cross(M.col_(i+1), M.col_(i+2)) / det.
+    // We store as columns of the result struct — but caller uses
+    // mat3_inv_mul_vec which knows row vs column.
+    var out: Mat3Cols;
+    out.col_u = cross_vr * inv_det;
+    out.col_v = cross_ru * inv_det;
+    out.col_r = cross_uv * inv_det;
+    return out;
+}
+
+// `inv_rows.col_u` is treated as the first ROW of the inverse matrix
+// (mat3_inverse_cols stores rows in `col_*` slots; this is the
+// matching consumer).
+fn mat3_inv_mul_vec(inv_rows: Mat3Cols, v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        dot(inv_rows.col_u, v),
+        dot(inv_rows.col_v, v),
+        dot(inv_rows.col_r, v),
+    );
+}
+
+// 3^n for n ≤ 20 (3^20 ≈ 3.5e9 fits in u32). Beyond that, returns 0
+// — caller must guard `ratio_depth ≤ 20`.
+fn pow_3_u32(n: u32) -> u32 {
+    var p: u32 = 1u;
+    for (var i: u32 = 0u; i < n; i = i + 1u) {
+        p = p * 3u;
+    }
+    return p;
+}
+
 // ─────────────────────────────────────────── unified sphere DDA
 
-/// Sphere shell DDA in one body cell. The body's local `[0, 1)³`
-/// frame is mapped to `(body_origin, body_origin + body_size)³` in
-/// the caller's coords. `inner_r`/`outer_r` are body-local radii.
+/// **Sphere DDA** (residual + slot-path). Mirrors `unified_raycast`
+/// from `src/world/raycast/unified.rs`: per-cell residual ∈ [0, 1)³,
+/// integer slot-ratios for the cell's face-normalized corner, and
+/// per-cell analytical Jacobian via `face_jacobian_normalized`. No
+/// `pos = oc + ray_dir * t` per-step recompute — bounded f32
+/// precision regardless of face-subtree depth.
 ///
-/// When `window_active != 0`, hits are restricted to the face given
-/// by `window_bounds.xyz + window_bounds.w` (u_min, v_min, r_min,
-/// size) on `window_face`.
-fn sphere_in_cell(
+/// State per ray:
+/// - `face`: which cube face the ray is currently in
+/// - `(ratio_u, ratio_v, ratio_r, ratio_depth)`: integer slot path
+///   within the face. The cell's lower corner is at face-norm coords
+///   `ratio / 3^ratio_depth`. Integer arithmetic; precise to depth 20.
+/// - `residual ∈ [0, 1)³`: ray's position within the current cell.
+///   Updated incrementally, snapped lossless on the exit axis.
+/// - `t_world`: accumulated for hit reporting only — never used to
+///   recompute geometry.
+/// - `last_axis ∈ {0,1,2,6}`: which axis the previous step exited
+///   via, so we can skip that plane this step (would re-detect at
+///   t == current).
+///
+/// Per iteration:
+/// 1. Walker descends face_root using `(un, vn, rn) = (ratio +
+///    residual) / 3^ratio_depth`, capped at `face_lod_depth(t_world)`.
+/// 2. Re-align state to walker's terminal depth (might be coarser).
+/// 3. If terminal block != EMPTY: shade and return hit.
+/// 4. Else: compute J at terminal cell corner; rate = J_inv · ray_dir.
+///    Per-axis t_local = (target − residual[k]) · cell_size /
+///    rate_normalized[k]. All operands O(1) — bounded f32 precision
+///    regardless of cell depth.
+/// 5. Snap residual on min-axis (lossless), advance other axes
+///    incrementally; step ratio integer ±1 on min-axis.
+/// 6. If ratio overflows: face-seam (u/v) or shell-exit (r) — both
+///    terminate for now.
+fn sphere_dda(
     body_idx: u32,
     body_origin: vec3<f32>,
     body_size: f32,
@@ -359,9 +562,6 @@ fn sphere_in_cell(
     outer_r_local: f32,
     ray_origin: vec3<f32>,
     ray_dir_in: vec3<f32>,
-    window_active: u32,
-    window_face: u32,
-    window_bounds: vec4<f32>,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -371,21 +571,14 @@ fn sphere_in_cell(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
-    // `ray_sphere_after` + the cubemap-plane intersections assume
-    // unit-length direction. The caller passes a non-unit vector
-    // (camera.forward + right·ndc + up·ndc), so the quadratic
-    // disc = b² − c would be scaled wrong for off-center pixels.
-    // Renormalize up front; the returned `t` is in world units either
-    // way because both walker and caller measure ray distance against
-    // unit direction.
     let ray_dir = normalize(ray_dir_in);
-
     let cs_center = body_origin + vec3<f32>(body_size * 0.5);
     let cs_outer = outer_r_local * body_size;
     let cs_inner = inner_r_local * body_size;
     let shell = cs_outer - cs_inner;
     if shell <= 0.0 { return result; }
 
+    // Ray-sphere intersect with outer shell to find entry t.
     let oc = ray_origin - cs_center;
     let b = dot(oc, ray_dir);
     let c = dot(oc, oc) - cs_outer * cs_outer;
@@ -393,175 +586,338 @@ fn sphere_in_cell(
     if disc <= 0.0 { return result; }
     let sq = sqrt(disc);
     let t_enter = max(-b - sq, 0.0);
-    let t_exit = -b + sq;
-    if t_exit <= 0.0 { return result; }
+    let t_exit_outer = -b + sq;
+    if t_exit_outer <= 0.0 { return result; }
 
-    let eps_init = max(shell * 1e-5, 1e-7);
     let pixel_density = uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
-    var t = t_enter + eps_init;
-    var steps = 0u;
-    var last_side: u32 = 6u;
-    let reference_scale = select(shell, shell * window_bounds.w, window_active != 0u);
+    let eps_init = max(shell * 1e-5, 1e-7);
 
+    // SINGLE absolute-coord recompute: the entry point. From here on,
+    // state is ratio + residual + t_world only — NO `oc + ray_dir * t`
+    // per-step recompute.
+    var t_world = t_enter + eps_init;
+    let entry_local = oc + ray_dir * t_world;
+    let entry_r = length(entry_local);
+    if entry_r >= cs_outer || entry_r < cs_inner { return result; }
+    let entry_n = entry_local / entry_r;
+    var face = pick_face(entry_n);
+
+    // Locate face root via body's child at face_slot.
+    let body_base = node_offsets[body_idx];
+    if ENABLE_STATS { ray_loads_offsets = ray_loads_offsets + 1u; }
+    let body_occ = tree[body_base];
+    let body_first = tree[body_base + 1u];
+    if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
+
+    // Lookup face_node_idx for the current face. Re-fetched on
+    // face-seam crossings.
+    var face_node_idx: u32 = 0u;
+    var fslot = face_slot(face);
+    if ((body_occ >> fslot) & 1u) == 0u { return result; }
+    var frank = countOneBits(body_occ & ((1u << fslot) - 1u));
+    face_node_idx = tree[body_first + frank * 2u + 1u];
+    if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
+
+    // Initial face-norm coords from the entry point. Single absolute
+    // computation — O(1) magnitudes.
+    var n_axis = face_normal(face);
+    var u_axis = face_u_axis(face);
+    var v_axis = face_v_axis(face);
+    var axis_dot = dot(entry_n, n_axis);
+    if abs(axis_dot) < 1e-6 { return result; }
+    var cu_init = dot(entry_n, u_axis) / axis_dot;
+    var cv_init = dot(entry_n, v_axis) / axis_dot;
+    var un_entry = clamp((cube_to_ea(cu_init) + 1.0) * 0.5, 0.0, 0.9999999);
+    var vn_entry = clamp((cube_to_ea(cv_init) + 1.0) * 0.5, 0.0, 0.9999999);
+    var rn_entry = clamp((entry_r - cs_inner) / shell, 0.0, 0.9999999);
+
+    // Initial state at face_root level (depth 0): single cell covers
+    // the whole face. residual is just the entry's face-norm coords.
+    var ratio_u: u32 = 0u;
+    var ratio_v: u32 = 0u;
+    var ratio_r: u32 = 0u;
+    var ratio_depth: u32 = 0u;
+    var residual: vec3<f32> = vec3<f32>(un_entry, vn_entry, rn_entry);
+    var last_axis: u32 = 6u;  // 6 = none / first iteration
+
+    var steps: u32 = 0u;
     loop {
-        if t >= t_exit || steps > 4096u { break; }
+        if t_world >= t_exit_outer || steps > 4096u { break; }
         steps = steps + 1u;
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
-        let local = oc + ray_dir * t;
-        let r = length(local);
-        if r >= cs_outer || r < cs_inner { break; }
+        // Compute walker input: (un, vn, rn) = (ratio + residual) /
+        // cells. PRECISION: ratio + residual fits in f32 mantissa
+        // when ratio_depth ≤ 20 (3^20 ≈ 3.5e9 < 2^32, cast to f32
+        // preserves ~24 bits). For ratio_depth ≤ 16 (3^16 ≈ 4.3e7),
+        // ratio_u as f32 is exact and the divide gives un_abs with
+        // ~7 digits of precision — sufficient for walker descent.
+        let cells_state = pow_3_u32(ratio_depth);
+        let cells_state_f = f32(cells_state);
+        let inv_cells = 1.0 / cells_state_f;
+        let un_abs = (f32(ratio_u) + residual.x) * inv_cells;
+        let vn_abs = (f32(ratio_v) + residual.y) * inv_cells;
+        let rn_abs = (f32(ratio_r) + residual.z) * inv_cells;
 
-        let n = local / r;
-        let f = pick_face(n);
-        if window_active != 0u && f != window_face { break; }
+        // Walker descent. Cap at face_lod_depth based on world-t for
+        // screen-LOD termination.
+        let walker_max_depth = face_lod_depth(t_world, shell);
+        let w = walk_face_subtree(face_node_idx, un_abs, vn_abs, rn_abs, walker_max_depth);
 
-        let n_axis = face_normal(f);
-        let u_axis = face_u_axis(f);
-        let v_axis = face_v_axis(f);
-        let axis_dot = dot(n, n_axis);
-        if abs(axis_dot) < 1e-6 { break; }
-        let cu = dot(n, u_axis) / axis_dot;
-        let cv = dot(n, v_axis) / axis_dot;
-        let un_abs = clamp((cube_to_ea(cu) + 1.0) * 0.5, 0.0, 0.9999999);
-        let vn_abs = clamp((cube_to_ea(cv) + 1.0) * 0.5, 0.0, 0.9999999);
-        let rn_abs = clamp((r - cs_inner) / shell, 0.0, 0.9999999);
-
-        // Window clip.
-        if window_active != 0u {
-            if un_abs < window_bounds.x || un_abs >= window_bounds.x + window_bounds.w ||
-               vn_abs < window_bounds.y || vn_abs >= window_bounds.y + window_bounds.w ||
-               rn_abs < window_bounds.z || rn_abs >= window_bounds.z + window_bounds.w {
-                break;
-            }
+        // Re-align state to walker's terminal depth. The walker's
+        // ratio_u/v/r/depth describes the cell it terminated at. If
+        // walker descended deeper than our state's ratio_depth, our
+        // residual maps into the finer cell. If walker terminated
+        // coarser (LOD-cap or empty subtree), our residual covers a
+        // larger fraction of the coarse cell.
+        if w.ratio_depth > ratio_depth {
+            // Walker is deeper — refine state.
+            let diff = w.ratio_depth - ratio_depth;
+            let factor = pow_3_u32(diff);
+            let factor_f = f32(factor);
+            let scaled_x = residual.x * factor_f;
+            let scaled_y = residual.y * factor_f;
+            let scaled_z = residual.z * factor_f;
+            let frac_x = floor(scaled_x);
+            let frac_y = floor(scaled_y);
+            let frac_z = floor(scaled_z);
+            ratio_u = ratio_u * factor + u32(frac_x);
+            ratio_v = ratio_v * factor + u32(frac_y);
+            ratio_r = ratio_r * factor + u32(frac_z);
+            residual = vec3<f32>(
+                clamp(scaled_x - frac_x, 0.0, 1.0 - 1e-6),
+                clamp(scaled_y - frac_y, 0.0, 1.0 - 1e-6),
+                clamp(scaled_z - frac_z, 0.0, 1.0 - 1e-6),
+            );
+            ratio_depth = w.ratio_depth;
+        } else if w.ratio_depth < ratio_depth {
+            // Walker is coarser — collapse state.
+            let diff = ratio_depth - w.ratio_depth;
+            let factor = pow_3_u32(diff);
+            let factor_f = f32(factor);
+            let new_ratio_u = ratio_u / factor;
+            let new_ratio_v = ratio_v / factor;
+            let new_ratio_r = ratio_r / factor;
+            let local_u = ratio_u - new_ratio_u * factor;
+            let local_v = ratio_v - new_ratio_v * factor;
+            let local_r = ratio_r - new_ratio_r * factor;
+            residual = vec3<f32>(
+                clamp((f32(local_u) + residual.x) / factor_f, 0.0, 1.0 - 1e-6),
+                clamp((f32(local_v) + residual.y) / factor_f, 0.0, 1.0 - 1e-6),
+                clamp((f32(local_r) + residual.z) / factor_f, 0.0, 1.0 - 1e-6),
+            );
+            ratio_u = new_ratio_u;
+            ratio_v = new_ratio_v;
+            ratio_r = new_ratio_r;
+            ratio_depth = w.ratio_depth;
         }
+        // Walker's exact corner (from integer ratios in the walker —
+        // matches our state).
+        let cell_size = w.size;
 
-        // Locate the face root via body → face_slot child.
-        let body_base = node_offsets[body_idx];
-        let body_occ = tree[body_base];
-        let body_first = tree[body_base + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
-        let fslot = face_slot(f);
-        let fmask = (body_occ >> fslot) & 1u;
-        if fmask == 0u { break; }
-        let frank = countOneBits(body_occ & ((1u << fslot) - 1u));
-        let face_node_idx = tree[body_first + frank * 2u + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
-
-        // Walker's UV/R in face-window-local frame when windowed, or
-        // full-face frame otherwise.
-        var walk_un = un_abs;
-        var walk_vn = vn_abs;
-        var walk_rn = rn_abs;
-        if window_active != 0u {
-            walk_un = (un_abs - window_bounds.x) / window_bounds.w;
-            walk_vn = (vn_abs - window_bounds.y) / window_bounds.w;
-            walk_rn = (rn_abs - window_bounds.z) / window_bounds.w;
-        }
-
-        let walk_depth = face_lod_depth(t, reference_scale);
-        let w = walk_face_subtree(face_node_idx, walk_un, walk_vn, walk_rn, walk_depth);
-
-        // 0xFFFEu is REPRESENTATIVE_EMPTY — an empty terminal.
-        // Palette index 0 is a real block (STONE), so we can't use
-        // zero as the empty sentinel.
         if w.block != FACE_WALK_EMPTY {
-            // Hit. The previous step's `last_side` is the face we
-            // crossed to exit the PREVIOUS cell; we entered THIS
-            // cell through the geometrically-same boundary, but
-            // that face's outward normal (from the hit cell's POV)
-            // points back toward where the ray came from — the
-            // opposite direction. So winning face 4 (crossed the
-            // previous cell's r_lo going inward) lands on THIS
-            // cell's r_hi face, outward normal +n; winning 0
-            // (crossed prev u_lo going -u) lands on THIS cell's
-            // u_hi, outward normal +u_axis; etc.
+            // HIT. Shade and return.
+            //
+            // Hit normal: derive from the LAST exit axis (which face
+            // of the cell we entered through). For the initial-cell
+            // case (last_axis == 6), use the radial direction.
+            // Hit normal: derived from the previous step's exit
+            // axis (= current cell's entry axis). For the initial-
+            // hit case (last_axis == 6), use radial (face normal).
+            // last_axis is 0/1/2 = u/v/r axis; sign comes from r_w
+            // sign tracked via `last_axis_sign` if needed (for now,
+            // approximate with face axes).
             var hit_normal: vec3<f32>;
-            switch last_side {
+            switch last_axis {
                 case 0u: { hit_normal =  u_axis; }
-                case 1u: { hit_normal = -u_axis; }
-                case 2u: { hit_normal =  v_axis; }
-                case 3u: { hit_normal = -v_axis; }
-                case 4u: { hit_normal =  n; }
-                case 5u: { hit_normal = -n; }
-                default: { hit_normal =  n; }
+                case 1u: { hit_normal =  v_axis; }
+                case 2u: { hit_normal =  n_axis; }
+                default: { hit_normal =  n_axis; }
             }
             result.hit = true;
-            result.t = t;
+            result.t = t_world;
             result.normal = hit_normal;
             let sun = normalize(vec3<f32>(0.4, 0.7, 0.3));
             let diffuse = max(dot(hit_normal, sun), 0.0);
             let axis_tint = abs(hit_normal.y) + (abs(hit_normal.x) + abs(hit_normal.z)) * 0.82;
             let ambient = 0.22;
             let shape = bevel_layered(
-                walk_un, walk_vn, w.u_lo, w.v_lo, w.size,
-                reference_scale, t, pixel_density,
+                un_abs, vn_abs, w.u_lo, w.v_lo, w.size,
+                shell, t_world, pixel_density,
             );
             let tint = depth_tint(rn_abs);
             result.color = palette[w.block].rgb * (ambient + diffuse * 0.78) * axis_tint * shape * tint;
-            // Neutralize `shade_pixel`'s `cube_face_bevel` — it picks
-            // a cube face based on `result.normal` and projects
-            // `(hit_pos - cell_min) / cell_size` onto that face's uv,
-            // then darkens edges. For sphere hits the normal is
-            // either a flat-face axis (±u/v/r) or the smooth radial
-            // direction, and the cube_face_bevel's choice of uv
-            // axes does NOT match the cell's face-normalized
-            // (un, vn, rn) geometry — producing visible concentric-
-            // circle banding across the curved sphere surface as
-            // the radial direction sweeps between body axes. The
-            // bevel here is already handled by `shape = bevel_layered`
-            // above in face-normalized coords; shade_pixel's bevel
-            // would double-apply darkening through the wrong axes.
-            //
-            // Trick: set cell_min/cell_size so `(hit_pos-cell_min)
-            // / cell_size` = 0.5 for every pixel. cube_face_bevel
-            // then gets uv=(0.5, 0.5) → edge=0.5 → smoothstep(0.02,
-            // 0.14, 0.5) = 1.0 → no darkening applied.
+            // Neutralize shade_pixel's cube_face_bevel: pick a
+            // cell_min/cell_size that maps the hit to (0.5, 0.5, 0.5)
+            // in cube_face_bevel's local frame so its smoothstep
+            // returns 1.0 (no edge darkening) — sphere geometry has
+            // its own bevel via `bevel_layered` in face-norm coords.
             let cs = max(length(camera.forward), 1.0) * 1e3;
-            result.cell_min = camera.pos + ray_dir * t - vec3<f32>(cs * 0.5);
+            result.cell_min = camera.pos + ray_dir * t_world - vec3<f32>(cs * 0.5);
             result.cell_size = cs;
             return result;
         }
 
-        // Empty cell — advance to next cell boundary via ray-plane /
-        // ray-sphere intersections on the walker's 6 cell faces.
-        let cell_u_lo_ea = w.u_lo * 2.0 - 1.0;
-        let cell_u_hi_ea = (w.u_lo + w.size) * 2.0 - 1.0;
-        let cell_v_lo_ea = w.v_lo * 2.0 - 1.0;
-        let cell_v_hi_ea = (w.v_lo + w.size) * 2.0 - 1.0;
-        // Window-local → absolute-face conversion for the radial
-        // boundaries.
-        let cell_r_lo_abs = select(w.r_lo, window_bounds.z + w.r_lo * window_bounds.w, window_active != 0u);
-        let cell_r_hi_abs = select(w.r_lo + w.size, window_bounds.z + (w.r_lo + w.size) * window_bounds.w, window_active != 0u);
-        let r_lo_world = cs_inner + cell_r_lo_abs * shell;
-        let r_hi_world = cs_inner + cell_r_hi_abs * shell;
+        // EMPTY cell. Per-axis residual DDA with analytical Jacobian.
+        //
+        // J = face_jacobian_normalized at the cell corner. For unit
+        // change in (un, vn, rn), J columns give body-XYZ changes.
+        // Cell of size `cell_size` covers face-norm range [w.u_lo,
+        // w.u_lo + cell_size] × … = residual ∈ [0, 1) for each axis.
+        // Local residual derivative: (J_inv · ray_dir) gives
+        // (d_un, d_vn, d_rn)/dt — divide by cell_size to convert to
+        // residual rate.
+        //
+        // Per-axis exit time: residual[k] reaches target (0 or 1).
+        //   t_local = (target − residual[k]) / rate_residual[k]
+        //          = (target − residual[k]) · cell_size / rate_un_per_t[k]
+        //
+        // The MULTIPLY by cell_size is exact (single FMUL); we never
+        // form the huge `1 / cell_size` ratio.
+        let j = face_jacobian_normalized(face, w.u_lo, w.v_lo, w.r_lo, inner_r_local, outer_r_local, body_size);
+        let j_inv = mat3_inverse_cols(j);
+        let rate_un_per_t = mat3_inv_mul_vec(j_inv, ray_dir);
 
-        let n_u_lo = u_axis - ea_to_cube(cell_u_lo_ea) * n_axis;
-        let n_u_hi = u_axis - ea_to_cube(cell_u_hi_ea) * n_axis;
-        let n_v_lo = v_axis - ea_to_cube(cell_v_lo_ea) * n_axis;
-        let n_v_hi = v_axis - ea_to_cube(cell_v_hi_ea) * n_axis;
+        // Per-axis t_local. For each k: target = 1 if rate_un > 0
+        // else 0; t_local = (target − residual[k]) · cell_size /
+        // rate_un[k]. If rate_un[k] is near zero, axis is parallel
+        // to plane → infinite t → never picked.
+        var t_local_axes = vec3<f32>(1e30, 1e30, 1e30);
+        for (var k: u32 = 0u; k < 3u; k = k + 1u) {
+            let r_k = rate_un_per_t[k];
+            if abs(r_k) < 1e-30 { continue; }
+            let tgt = select(0.0, 1.0, r_k > 0.0);
+            let t_k = (tgt - residual[k]) * cell_size / r_k;
+            t_local_axes[k] = select(1e30, t_k, t_k > 0.0);
+        }
+        // Skip the axis we just exited via (would re-detect t=0).
+        if last_axis < 3u {
+            t_local_axes[last_axis] = 1e30;
+        }
+        var winning: u32 = 0u;
+        if t_local_axes[1] < t_local_axes[winning] { winning = 1u; }
+        if t_local_axes[2] < t_local_axes[winning] { winning = 2u; }
+        let t_local = t_local_axes[winning];
+        if t_local >= 1e29 { break; }  // No exit found
 
-        var t_next = t_exit + 1.0;
-        var winning: u32 = 6u;
-        let zero3 = vec3<f32>(0.0);
-        let c_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
-        if c_u_lo > t && c_u_lo < t_next { t_next = c_u_lo; winning = 0u; }
-        let c_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
-        if c_u_hi > t && c_u_hi < t_next { t_next = c_u_hi; winning = 1u; }
-        let c_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
-        if c_v_lo > t && c_v_lo < t_next { t_next = c_v_lo; winning = 2u; }
-        let c_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
-        if c_v_hi > t && c_v_hi < t_next { t_next = c_v_hi; winning = 3u; }
-        let c_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo_world, t);
-        if c_r_lo > t && c_r_lo < t_next { t_next = c_r_lo; winning = 4u; }
-        let c_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi_world, t);
-        if c_r_hi > t && c_r_hi < t_next { t_next = c_r_hi; winning = 5u; }
+        // Update residual: snap winning axis (lossless), advance
+        // other axes incrementally.
+        // Snap convention: if rate is positive, residual was
+        // INCREASING toward 1; on cell exit, NEW cell is the
+        // +winning neighbor, ENTERED on its low side → snap to eps.
+        // If rate is negative, residual was DECREASING toward 0;
+        // exit on -winning, NEW cell entered at high side → 1-eps.
+        let r_w = rate_un_per_t[winning];
+        var new_residual = residual;
+        new_residual[winning] = select(1.0 - 1e-6, 1e-6, r_w > 0.0);
+        for (var k: u32 = 0u; k < 3u; k = k + 1u) {
+            if k == winning { continue; }
+            let r_k = rate_un_per_t[k];
+            if abs(r_k) < 1e-30 { continue; }
+            let advanced = residual[k] + r_k * t_local / cell_size;
+            new_residual[k] = clamp(advanced, 0.0, 1.0 - 1e-6);
+        }
+        residual = new_residual;
+        last_axis = winning;
+        t_world = t_world + t_local;
 
-        if t_next >= t_exit { break; }
-        last_side = winning;
-        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
-        let cell_eps = max(shell * w.size * 1e-3, t_ulp * 4.0);
-        t = t_next + cell_eps;
+        // Step ratio on winning axis. Cells at ratio_depth = 3^d.
+        // u/v overflow: face-seam crossing — reproject onto adjacent
+        // face via cubesphere geometry. r overflow: shell exit (+r)
+        // or inner-shell core entry (-r) — terminate (core-descent
+        // is future work).
+        let cells_at_depth = pow_3_u32(ratio_depth);
+        var seam_crossed = false;
+        if winning == 0u {
+            if r_w > 0.0 {
+                if ratio_u + 1u >= cells_at_depth {
+                    seam_crossed = true;
+                } else {
+                    ratio_u = ratio_u + 1u;
+                }
+            } else {
+                if ratio_u == 0u {
+                    seam_crossed = true;
+                } else {
+                    ratio_u = ratio_u - 1u;
+                }
+            }
+        } else if winning == 1u {
+            if r_w > 0.0 {
+                if ratio_v + 1u >= cells_at_depth {
+                    seam_crossed = true;
+                } else {
+                    ratio_v = ratio_v + 1u;
+                }
+            } else {
+                if ratio_v == 0u {
+                    seam_crossed = true;
+                } else {
+                    ratio_v = ratio_v - 1u;
+                }
+            }
+        } else {
+            // r-axis: shell boundary, terminate.
+            if r_w > 0.0 {
+                if ratio_r + 1u >= cells_at_depth { break; }
+                ratio_r = ratio_r + 1u;
+            } else {
+                if ratio_r == 0u { break; }
+                ratio_r = ratio_r - 1u;
+            }
+        }
+
+        if seam_crossed {
+            // Face-seam crossing. Compute body-XYZ of exit point at
+            // current face's edge, then reproject onto adjacent face.
+            // The exit point's face-norm coords on the OLD face:
+            //   un_exit on overflow axis: 1.0 - eps (if +) or eps (if -)
+            //   on other axes: (ratio[k] + new_residual[k]) / cells
+            let inv_cells_state = 1.0 / f32(cells_at_depth);
+            var un_exit = (f32(ratio_u) + new_residual.x) * inv_cells_state;
+            var vn_exit = (f32(ratio_v) + new_residual.y) * inv_cells_state;
+            var rn_exit = (f32(ratio_r) + new_residual.z) * inv_cells_state;
+            if winning == 0u {
+                un_exit = select(1e-6, 1.0 - 1e-6, r_w > 0.0);
+            } else if winning == 1u {
+                vn_exit = select(1e-6, 1.0 - 1e-6, r_w > 0.0);
+            }
+            un_exit = clamp(un_exit, 0.0, 0.9999999);
+            vn_exit = clamp(vn_exit, 0.0, 0.9999999);
+            rn_exit = clamp(rn_exit, 0.0, 0.9999999);
+
+            // Body-local XYZ of the exit point on the OLD face.
+            let body_point = face_space_to_body_point(
+                face, un_exit, vn_exit, rn_exit,
+                inner_r_local, outer_r_local, body_size,
+            );
+            // Reproject onto adjacent cube face.
+            let new_fp = body_point_to_face_space(
+                body_point, inner_r_local, outer_r_local, body_size,
+            );
+            if new_fp.valid == 0u { break; }
+            // Switch to the new face. Reset state to face_root level
+            // (depth 0, single cell covers whole face).
+            face = new_fp.face;
+            n_axis = face_normal(face);
+            u_axis = face_u_axis(face);
+            v_axis = face_v_axis(face);
+            // Re-fetch face_node_idx for the new face.
+            fslot = face_slot(face);
+            if ((body_occ >> fslot) & 1u) == 0u { break; }
+            frank = countOneBits(body_occ & ((1u << fslot) - 1u));
+            face_node_idx = tree[body_first + frank * 2u + 1u];
+            // Reset state: at face_root, single cell, residual = new
+            // face's coords.
+            ratio_u = 0u;
+            ratio_v = 0u;
+            ratio_r = 0u;
+            ratio_depth = 0u;
+            residual = vec3<f32>(new_fp.un, new_fp.vn, new_fp.rn);
+            // Reset last_axis since we've teleported to a different
+            // face — entry-plane skip from last face is meaningless.
+            last_axis = 6u;
+        }
     }
 
     return result;

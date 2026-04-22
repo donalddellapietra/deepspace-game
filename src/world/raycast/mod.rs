@@ -11,7 +11,7 @@ mod cartesian;
 mod sphere;
 mod unified;
 
-pub use sphere::{FaceWindow, LodParams};
+pub use sphere::LodParams;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
@@ -120,13 +120,13 @@ pub fn cpu_raycast_in_frame(
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
 
         let frame_kind = library.get(frame_root_id).map(|n| n.kind);
-        let hit_opt = if let Some(NodeKind::CubedSphereBody { inner_r, outer_r }) = frame_kind {
-            sphere::cs_raycast(
-                library, frame_root_id, [0.0; 3], 3.0,
-                inner_r, outer_r,
+        let hit_opt = if let Some(NodeKind::CubedSphereBody { .. }) = frame_kind {
+            // Body-rooted frame: ray is already in body-local
+            // [0, 3)³ coords, hand straight to the unified primitive.
+            unified::unified_raycast(
+                library, frame_root_id,
                 ray_origin, ray_dir,
-                &[], max_face_depth, lod,
-                None,
+                inner_max,
             )
         } else {
             cartesian::cpu_raycast_with_face_depth(
@@ -156,38 +156,6 @@ pub fn cpu_raycast_in_frame(
         ];
         ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
         current_frame_depth -= 1;
-    }
-}
-
-/// DEPRECATED: the old face-window path; kept temporarily while
-/// callers migrate.
-pub fn cpu_raycast_in_sphere_frame(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    body_path: &[u8],
-    cam_body: [f32; 3],
-    ray_dir: [f32; 3],
-    max_face_depth: u32,
-    lod: LodParams,
-    window: FaceWindow,
-    inner_r: f32,
-    outer_r: f32,
-) -> Option<HitInfo> {
-    let (chain, frame_entries) = build_frame_chain(library, world_root, body_path);
-    let effective_depth = chain.len() - 1;
-    let body_node_id = chain[effective_depth];
-    let hit = sphere::cs_raycast(
-        library, body_node_id, [0.0; 3], 3.0,
-        inner_r, outer_r,
-        cam_body, ray_dir,
-        &[], max_face_depth, lod,
-        Some(window),
-    );
-    if let Some(mut hit) = hit {
-        prepend_frame_entries(&mut hit, &frame_entries[..effective_depth], effective_depth);
-        Some(hit)
-    } else {
-        None
     }
 }
 
@@ -401,11 +369,11 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.0, 1.5], [0.0, -1.0, 0.0],
-            // Cap at a realistic anchor depth. Sphere walker's cell
-            // bounds lose f32 precision past ~20 face levels; at
-            // MAX_FACE_DEPTH (63) the returned cell has sub-eps size
-            // and `cs_raycast`'s frustum-plane intersections fail
-            // to distinguish `u_lo` from `u_hi`.
+            // Cap at a realistic anchor depth. The unified
+            // primitive's residual descent is precision-bounded at
+            // every face-subtree depth, but the caller's edit /
+            // anchor logic still uses the depth cap for interaction
+            // semantics.
             30, 10, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "ray should hit the planet");
@@ -430,11 +398,11 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0],
-            // Cap at a realistic anchor depth. Sphere walker's cell
-            // bounds lose f32 precision past ~20 face levels; at
-            // MAX_FACE_DEPTH (63) the returned cell has sub-eps size
-            // and `cs_raycast`'s frustum-plane intersections fail
-            // to distinguish `u_lo` from `u_hi`.
+            // Cap at a realistic anchor depth. The unified
+            // primitive's residual descent is precision-bounded at
+            // every face-subtree depth, but the caller's edit /
+            // anchor logic still uses the depth cap for interaction
+            // semantics.
             30, 10, super::LodParams::fixed_max(),
         );
         assert!(hit.is_some(), "Cartesian DDA should cross into body cell and dispatch sphere");

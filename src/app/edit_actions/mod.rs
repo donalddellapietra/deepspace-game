@@ -2,9 +2,9 @@
 //!
 //! All edits go through the unified frame-aware raycast →
 //! `break_block` / `place_block` pipeline. Cartesian frames use the
-//! linear Cartesian raycast; sphere frames (render root inside a
-//! face subtree) dispatch through `cpu_raycast_in_sphere_frame` with
-//! the face window derived from the active frame.
+//! linear Cartesian raycast; body frames (render root on a
+//! `CubedSphereBody`) dispatch through `unified::unified_raycast`,
+//! which also handles face-subtree descent and seam crossings.
 
 mod break_place;
 mod highlight;
