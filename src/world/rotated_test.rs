@@ -36,15 +36,29 @@ pub const ROTATED_INTERIOR_DEPTH: u32 = 30;
 pub(crate) fn bootstrap_rotated_test_world() -> WorldBootstrap {
     let mut lib = NodeLibrary::default();
 
-    // 29 cartesian layers of uniform brick, so wrapping them with
-    // 27 slots in the rotated node yields tree_depth = 30 inside.
-    let interior = lib.build_uniform_subtree(
-        block::BRICK,
-        ROTATED_INTERIOR_DEPTH - 1,
-    );
+    // Interior colored per slot role so each sub-cell is visually
+    // distinguishable — lets us verify the rotation propagates all
+    // the way down instead of "switching to cartesian" after one
+    // layer. Each sub-cell is still a 29-layer uniform chain, so
+    // the subtree's tree_depth is 30.
+    let brick_sub = lib.build_uniform_subtree(block::BRICK, ROTATED_INTERIOR_DEPTH - 1);
+    let stone_sub = lib.build_uniform_subtree(block::STONE, ROTATED_INTERIOR_DEPTH - 1);
+    let wood_sub = lib.build_uniform_subtree(block::WOOD, ROTATED_INTERIOR_DEPTH - 1);
     let mut rot_children = empty_children();
-    for s in 0..27 {
-        rot_children[s] = interior;
+    for z in 0..BRANCH {
+        for y in 0..BRANCH {
+            for x in 0..BRANCH {
+                // 3-colour pattern by (x + y + z) % 3 so no two
+                // adjacent sub-cells share a colour — internal cell
+                // boundaries are visible from any view angle.
+                let sub = match (x + y + z) % 3 {
+                    0 => brick_sub,
+                    1 => stone_sub,
+                    _ => wood_sub,
+                };
+                rot_children[slot_index(x, y, z)] = sub;
+            }
+        }
     }
     let rotated_id = lib.insert_with_kind(rot_children, NodeKind::Rotated45Y);
 
