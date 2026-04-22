@@ -403,28 +403,6 @@ fn sphere_in_cell(
     var last_side: u32 = 6u;
     let reference_scale = select(shell, shell * window_bounds.w, window_active != 0u);
 
-    // PRECISION (post-audit fix). The previous DDA accumulated
-    // `t = t_next + cell_eps` per step and re-derived `local = oc +
-    // ray_dir * t` from accumulated `t`. Both are absolute-coord
-    // operations subject to ULP drift; over thousands of steps at
-    // deep face-subtree depth the (un, vn, rn) sample point became
-    // pinned (slow-axis updates lost below f32 ULP), the walker
-    // descended into the same cell repeatedly, and adjacent
-    // cell-wall plane normals collapsed — producing the user's
-    // "floating phantom cubes / mangled stair-stepping at Layer 20"
-    // artifact.
-    //
-    // Fix: each iteration's `t_next` is computed from independent
-    // cell-wall plane intersects, NOT from accumulated state.
-    // `last_side`-derived `entry_side` skips the cell's entry plane
-    // (same physical plane the previous step exited through) so we
-    // can't re-detect the boundary at t == current t. `t` is
-    // assigned fresh from `t_next` each step — no accumulation, no
-    // `cell_eps` nudge needed. Per-step `local = oc + ray_dir * t`
-    // recompute now has bounded error of ~ULP(t) regardless of how
-    // many steps have happened — instead of growing linearly with
-    // step count.
-
     loop {
         if t >= t_exit || steps > 4096u { break; }
         steps = steps + 1u;
@@ -563,59 +541,27 @@ fn sphere_in_cell(
         let n_v_lo = v_axis - ea_to_cube(cell_v_lo_ea) * n_axis;
         let n_v_hi = v_axis - ea_to_cube(cell_v_hi_ea) * n_axis;
 
-        // Compute the entry plane to skip — it's the cell wall the
-        // PREVIOUS iteration exited through. `last_side` indexes the
-        // plane the previous cell exited via (going OUT of that
-        // cell). The current cell entered through the SAME physical
-        // plane but on the OPPOSITE side: prev exited u_lo (going
-        // -u) → current entered through this cell's u_hi face.
-        // Skip that plane so we can't re-detect t == current t.
-        var entry_side: u32 = 6u;
-        switch last_side {
-            case 0u: { entry_side = 1u; }
-            case 1u: { entry_side = 0u; }
-            case 2u: { entry_side = 3u; }
-            case 3u: { entry_side = 2u; }
-            case 4u: { entry_side = 5u; }
-            case 5u: { entry_side = 4u; }
-            default: { entry_side = 6u; }
-        }
-
         var t_next = t_exit + 1.0;
         var winning: u32 = 6u;
         let zero3 = vec3<f32>(0.0);
-        if entry_side != 0u {
-            let c_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
-            if c_u_lo > t && c_u_lo < t_next { t_next = c_u_lo; winning = 0u; }
-        }
-        if entry_side != 1u {
-            let c_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
-            if c_u_hi > t && c_u_hi < t_next { t_next = c_u_hi; winning = 1u; }
-        }
-        if entry_side != 2u {
-            let c_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
-            if c_v_lo > t && c_v_lo < t_next { t_next = c_v_lo; winning = 2u; }
-        }
-        if entry_side != 3u {
-            let c_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
-            if c_v_hi > t && c_v_hi < t_next { t_next = c_v_hi; winning = 3u; }
-        }
-        if entry_side != 4u {
-            let c_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo_world, t);
-            if c_r_lo > t && c_r_lo < t_next { t_next = c_r_lo; winning = 4u; }
-        }
-        if entry_side != 5u {
-            let c_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi_world, t);
-            if c_r_hi > t && c_r_hi < t_next { t_next = c_r_hi; winning = 5u; }
-        }
+        let c_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if c_u_lo > t && c_u_lo < t_next { t_next = c_u_lo; winning = 0u; }
+        let c_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if c_u_hi > t && c_u_hi < t_next { t_next = c_u_hi; winning = 1u; }
+        let c_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if c_v_lo > t && c_v_lo < t_next { t_next = c_v_lo; winning = 2u; }
+        let c_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if c_v_hi > t && c_v_hi < t_next { t_next = c_v_hi; winning = 3u; }
+        let c_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo_world, t);
+        if c_r_lo > t && c_r_lo < t_next { t_next = c_r_lo; winning = 4u; }
+        let c_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi_world, t);
+        if c_r_hi > t && c_r_hi < t_next { t_next = c_r_hi; winning = 5u; }
 
-        if t_next >= t_exit || winning == 6u { break; }
+        if t_next >= t_exit { break; }
         last_side = winning;
-        // No `cell_eps` nudge — `entry_side` skip already prevents
-        // re-detecting the entry plane, so `t = t_next` exactly is
-        // safe. Avoids the per-step `+ cell_eps` accumulation that
-        // grew `t` away from geometric truth at deep depth.
-        t = t_next;
+        let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
+        let cell_eps = max(shell * w.size * 1e-3, t_ulp * 4.0);
+        t = t_next + cell_eps;
     }
 
     return result;
