@@ -167,3 +167,57 @@ Placing a single d=10 block globally alters the DDA's per-pixel winning-plane ar
 
 Per-pixel walker state dump is the path forward: write `winning`, `steps`, `w.depth`, `w.block`, `w.u_lo`, `w.v_lo`, `w.size` to an SSBO and diff pre vs post place for a single pixel row. That pins down which variable actually mutates between the two runs.
 
+### 2026-04-21 late-late — new findings
+
+- **Mode 6 (ratio checkerboard) differs pre vs post place.** Earlier I thought mode 6 was "mostly uniform blue"; closer inspection shows a rich grid that CHANGES between pre and post. The walker IS returning different cells for the same ray on distant ground (rays spatially unrelated to the placed block).
+- **The change is REVERSIBLE.** After `place` then `break` of the same cell, the scene returns to the pre-place state (uniform light-blue mode 4 ground). So the bug is caused by the presence of the placed block in the tree — not by any permanent pack state or uniform_type corruption.
+- **Still true even with uniform-flatten disabled.** With `pack.rs:217-220`'s flatten branch bypassed, pre-place still shows uniform r_lo ground and post-place still shows stripes. So flatten is not the cause.
+- **Placed block's anchor** — `[13, 16, 13, 13, 22, 13, 25, 19, 22, 22]`. Body slot 13, face slot 16 (PosY), then UVR descent. Block is near the planet's north pole.
+- **Ground stripes span full screen width** — pixels spatially far from the placed block also exhibit the stripes. So the effect is globally-scoped across the face subtree, not just a local artifact.
+- **`update_root` (`pack.rs:121`) is content-addressed**: `emit_or_lookup` caches `nid → bfs_idx` in `self.bfs_by_nid`, so previously-packed subtrees are reused without re-emission. Unchanged subtrees should retain their BFS indices across pack calls.
+
+### Key question now open
+
+**For the same camera / same ray / identical un_scaled input to the walker, what makes the walker's slot-pick path diverge between the two tree states?**
+
+The walker reads `tree[base]` (occupancy) and `tree[base+1]` (first_child pointer) at each depth. If the same `node_idx` appears in both pre and post trees (via dedup reuse), those reads should return identical values. So either:
+- The walker descends into a DIFFERENT `node_idx` at some level (tree's child-pointer at that level changed), or
+- The tree's packed layout shifted such that `tree[base]` or `tree[base+1]` for the same logical node returns different values.
+
+The second is impossible if `bfs_by_nid` is correctly cached. So the first.
+
+Check: does `emit_or_lookup` actually reuse BFS entries, or does it re-emit on every `update_root`? The dedup cache is internal to `CachedTree`; if that cache is CLEARED on each update_root, every pack call re-emits everything, potentially at different BFS offsets across calls.
+
+### Verified (pack.rs:140-185)
+
+- `emit_or_lookup` caches by nid: repeated calls for the same nid return cached bfs without re-emission.
+- No `.clear()` calls on `tree / bfs_by_nid / node_offsets / node_ids` in `src/world/gpu/`. Cache persists across `update_root` calls.
+- So for any unchanged NodeId, its BFS idx + tree[] slab + node_offsets[] entry are stable across a place.
+
+### Discovery: place_block inserts a UNIFORM SUBTREE
+
+`src/world/edit.rs:100-121` — `place_block` calls `world.library.build_uniform_subtree(block_type, sibling_depth)` then `place_child`. So a "place" is NOT inserting a single leaf at d=10 — it installs a uniform-stone subtree to the depth of existing siblings. Ancestor chain up to root gets new NodeIds via `install_subtree`'s ascent phase.
+
+But: only ancestors ON the placement path get new NodeIds. Siblings remain cached. Unchanged rays (not going through edit path) should see identical data.
+
+### Open question
+
+Stripes cover the ENTIRE ground including rays that should be going through unchanged subtrees. Diagnosis requires per-pixel walker state dump to confirm whether `face_node_idx` / terminal `node_idx` / cached cell corners actually differ for a specific "distant" pixel.
+
+### 2026-04-22 early — GPT's lead tested
+
+User shared that GPT in a sibling worktree `sphere-attempt-2-2-3-2-2` reported a fix: force full rewrites of tree / kinds / offsets / aabbs buffers by zeroing `uploaded_*_count` trackers in `renderer/buffers.rs:update_tree`. Claim: the bug lives in the incremental GPU upload path, not sphere DDA math.
+
+Tested in this worktree:
+- **Zeroing uploaded counts alone** → stripes persist. No visible change.
+- **Adding `self.cached_tree = Some(gpu::CachedTree::new())` on every update** → screen goes SOLID GRAY. The fresh CPU pack assigns new BFS indices; without also forcing full GPU rewrites the pointer mismatch kills rendering.
+- **Both together** → solid gray.
+
+Reverted both. GPT's fix does not reproduce the fix in this worktree.
+
+### Divergence hypothesis
+
+Either (a) the sibling worktree had a different baseline state so its bug was a different mechanism, or (b) there's an intermediary in this worktree (the integer-slot-pick walker + sphere debug scaffolding) that breaks when the pack is reset without matched buffer management.
+
+Next: wire a shader debug mode 7 that paints the walker's terminal `node_idx` as a color hash — will show directly whether distant-ground rays get different terminal NodeIds pre vs post place.
+
