@@ -335,6 +335,13 @@ fn depth_tint(rn: f32) -> f32 { return 0.55 + 0.45 * clamp(rn, 0.0, 1.0); }
 // `LOD_PIXEL_THRESHOLD` Nyquist gate.
 fn face_lod_depth(ray_dist: f32, shell: f32) -> u32 {
     let pixel_density = uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+    return face_lod_depth_pd(ray_dist, shell, pixel_density);
+}
+
+// Same as `face_lod_depth` but takes a precomputed `pixel_density`
+// to hoist the per-frame `screen_height / (2·tan(fov/2))` div + tan
+// out of `sphere_dda`'s hot loop.
+fn face_lod_depth_pd(ray_dist: f32, shell: f32, pixel_density: f32) -> u32 {
     let safe_dist = max(ray_dist, 1e-6);
     let ratio = shell * pixel_density / (safe_dist * max(LOD_PIXEL_THRESHOLD, 1e-6));
     if ratio <= 1.0 { return 1u; }
@@ -511,12 +518,23 @@ fn mat3_inv_mul_vec(inv_rows: Mat3Cols, v: vec3<f32>) -> vec3<f32> {
 
 // 3^n for n ≤ 20 (3^20 ≈ 3.5e9 fits in u32). Beyond that, returns 0
 // — caller must guard `ratio_depth ≤ 20`.
+//
+// Table lookup avoids the per-iteration multiply loop. The previous
+// `var p = 1u; for (i in 0..n) { p *= 3u; }` form was ~5 multiplies
+// per call inside `sphere_dda`'s hot loop (called twice per iter at
+// ratio_depth ≈ 5), which alone added ~10× throughput overhead vs the
+// parent commit's `sphere_in_cell` (which computed cell sizes from
+// `w.size` directly, not from `pow_3_u32(ratio_depth)`).
+const POW3_TABLE: array<u32, 21> = array<u32, 21>(
+    1u, 3u, 9u, 27u, 81u, 243u, 729u, 2187u,
+    6561u, 19683u, 59049u, 177147u, 531441u, 1594323u,
+    4782969u, 14348907u, 43046721u, 129140163u,
+    387420489u, 1162261467u, 3486784401u,
+);
+
 fn pow_3_u32(n: u32) -> u32 {
-    var p: u32 = 1u;
-    for (var i: u32 = 0u; i < n; i = i + 1u) {
-        p = p * 3u;
-    }
-    return p;
+    if n <= 20u { return POW3_TABLE[n]; }
+    return 0u;
 }
 
 // ─────────────────────────────────────────── unified sphere DDA
@@ -637,6 +655,13 @@ fn sphere_dda(
     var ratio_v: u32 = 0u;
     var ratio_r: u32 = 0u;
     var ratio_depth: u32 = 0u;
+    // State-maintained `3^ratio_depth` and its reciprocal — eliminate
+    // two `pow_3_u32(ratio_depth)` calls per iteration (the parent
+    // commit's `sphere_in_cell` didn't compute these at all because
+    // it expressed cells via `w.size`, an f32 directly from the
+    // walker). Updated in lockstep with `ratio_depth` below.
+    var cells_at_depth: u32 = 1u;
+    var inv_cells: f32 = 1.0;
     var residual: vec3<f32> = vec3<f32>(un_entry, vn_entry, rn_entry);
     var last_axis: u32 = 6u;  // 6 = none / first iteration
 
@@ -652,16 +677,13 @@ fn sphere_dda(
         // preserves ~24 bits). For ratio_depth ≤ 16 (3^16 ≈ 4.3e7),
         // ratio_u as f32 is exact and the divide gives un_abs with
         // ~7 digits of precision — sufficient for walker descent.
-        let cells_state = pow_3_u32(ratio_depth);
-        let cells_state_f = f32(cells_state);
-        let inv_cells = 1.0 / cells_state_f;
         let un_abs = (f32(ratio_u) + residual.x) * inv_cells;
         let vn_abs = (f32(ratio_v) + residual.y) * inv_cells;
         let rn_abs = (f32(ratio_r) + residual.z) * inv_cells;
 
         // Walker descent. Cap at face_lod_depth based on world-t for
         // screen-LOD termination.
-        let walker_max_depth = face_lod_depth(t_world, shell);
+        let walker_max_depth = face_lod_depth_pd(t_world, shell, pixel_density);
         let w = walk_face_subtree(face_node_idx, un_abs, vn_abs, rn_abs, walker_max_depth);
 
         // Re-align state to walker's terminal depth. The walker's
@@ -690,6 +712,8 @@ fn sphere_dda(
                 clamp(scaled_z - frac_z, 0.0, 1.0 - 1e-6),
             );
             ratio_depth = w.ratio_depth;
+            cells_at_depth = cells_at_depth * factor;
+            inv_cells = 1.0 / f32(cells_at_depth);
         } else if w.ratio_depth < ratio_depth {
             // Walker is coarser — collapse state.
             let diff = ratio_depth - w.ratio_depth;
@@ -710,6 +734,8 @@ fn sphere_dda(
             ratio_v = new_ratio_v;
             ratio_r = new_ratio_r;
             ratio_depth = w.ratio_depth;
+            cells_at_depth = cells_at_depth / factor;
+            inv_cells = 1.0 / f32(cells_at_depth);
         }
         // Walker's exact corner (from integer ratios in the walker —
         // matches our state).
@@ -826,7 +852,7 @@ fn sphere_dda(
         // face via cubesphere geometry. r overflow: shell exit (+r)
         // or inner-shell core entry (-r) — terminate (core-descent
         // is future work).
-        let cells_at_depth = pow_3_u32(ratio_depth);
+        // (cells_at_depth maintained as state; no recompute needed.)
         var seam_crossed = false;
         if winning == 0u {
             if r_w > 0.0 {
@@ -873,10 +899,9 @@ fn sphere_dda(
             // The exit point's face-norm coords on the OLD face:
             //   un_exit on overflow axis: 1.0 - eps (if +) or eps (if -)
             //   on other axes: (ratio[k] + new_residual[k]) / cells
-            let inv_cells_state = 1.0 / f32(cells_at_depth);
-            var un_exit = (f32(ratio_u) + new_residual.x) * inv_cells_state;
-            var vn_exit = (f32(ratio_v) + new_residual.y) * inv_cells_state;
-            var rn_exit = (f32(ratio_r) + new_residual.z) * inv_cells_state;
+            var un_exit = (f32(ratio_u) + new_residual.x) * inv_cells;
+            var vn_exit = (f32(ratio_v) + new_residual.y) * inv_cells;
+            var rn_exit = (f32(ratio_r) + new_residual.z) * inv_cells;
             if winning == 0u {
                 un_exit = select(1e-6, 1.0 - 1e-6, r_w > 0.0);
             } else if winning == 1u {
@@ -913,6 +938,8 @@ fn sphere_dda(
             ratio_v = 0u;
             ratio_r = 0u;
             ratio_depth = 0u;
+            cells_at_depth = 1u;
+            inv_cells = 1.0;
             residual = vec3<f32>(new_fp.un, new_fp.vn, new_fp.rn);
             // Reset last_axis since we've teleported to a different
             // face — entry-plane skip from last face is meaningless.
