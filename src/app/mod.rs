@@ -415,6 +415,14 @@ impl App {
         // can run after the struct is fully built.
         let spawn_entity_path = test_cfg.spawn_entity.clone();
         let spawn_entity_count = test_cfg.spawn_entity_count;
+        // `--spawn-elevation-cells <N>` runs an initial raycast from
+        // the just-built spawn camera and repositions N anchor-cells
+        // above the hit (at the current anchor depth). Elevation in
+        // cells is depth-independent: at d=10, 50 cells looks the
+        // same visual altitude as 50 cells at d=5. Consumed below
+        // once the App is constructed so `fly_to_surface_elevation`
+        // can use the normal `self.camera` path.
+        let spawn_elevation_cells = test_cfg.spawn_elevation_cells;
 
         let mut app = Self {
             window: None,
@@ -490,6 +498,13 @@ impl App {
         if let Some(ref path) = spawn_entity_path {
             let count = spawn_entity_count.max(1);
             app.spawn_vox_entity_at_init(path, count);
+        }
+        if let Some(cells) = spawn_elevation_cells {
+            // Overrides `--spawn-xyz` when both are passed: the
+            // raycast runs from whatever camera position the spawn
+            // branch above produced, then the Y is replaced with
+            // `hit_y + cells * cell_size`.
+            app.fly_to_surface_elevation(cells);
         }
         app
     }

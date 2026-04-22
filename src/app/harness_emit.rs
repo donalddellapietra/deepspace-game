@@ -218,6 +218,9 @@ impl App {
                 self.camera.position.add_local(d, &self.world.library);
             }
             ScriptCmd::FlyToSurface => self.fly_to_surface(),
+            ScriptCmd::FlyToSurfaceElevation(cells) => {
+                self.fly_to_surface_elevation(cells);
+            }
             // Unused — the rich positional stats it was going to
             // emit live in `DebugOverlayStateJs` now (see event_loop's
             // `overlay_active` branch). Kept as a parsed cmd for
@@ -238,6 +241,25 @@ impl App {
     /// populated only by explicit teleports); the body march renders
     /// from the body cell regardless.
     pub(super) fn fly_to_surface(&mut self) {
+        // Preserves the original single-cell-above behavior.
+        self.fly_to_surface_elevation(1);
+    }
+
+    /// Generalized form of `fly_to_surface`: raycast straight down in
+    /// world-space bypassing the normal interaction-radius cap, then
+    /// place the camera exactly `cells` anchor cells above the hit
+    /// (at the current anchor depth). Cell size = `1 / 3^anchor_depth`
+    /// in root-frame units, so the VISUAL altitude (cells above
+    /// terrain) is independent of anchor depth — "50 cells above at
+    /// d=10" and "50 cells above at d=5" look the same, just with
+    /// finer subdivision visible at deeper d.
+    ///
+    /// Sphere worlds: camera stays `sphere=None` (same convention as
+    /// `fly_to_surface` / the live game's zoom path); the body march
+    /// renders from the body cell regardless. The result is clamped
+    /// to stay inside the root cell (`<= 3.0 - cell`) so we never
+    /// produce an out-of-frame WorldPos at extreme elevations.
+    pub(super) fn fly_to_surface_elevation(&mut self, cells: u32) {
         use crate::world::anchor::{Path, WorldPos};
         use crate::world::raycast::cpu_raycast;
 
@@ -248,26 +270,28 @@ impl App {
             &self.world.library, self.world.root, root_cam, ray_dir, max_depth,
         );
         let Some(hit) = hit else {
-            eprintln!("fly_to_surface: MISS root_cam={root_cam:?}");
+            eprintln!(
+                "fly_to_surface_elevation: MISS root_cam={root_cam:?} cells={cells}",
+            );
             return;
         };
         let hit_y = root_cam[1] + ray_dir[1] * hit.t;
         let anchor_depth = self.anchor_depth() as u8;
-        let cell = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
-        // ONE anchor cell above the hit. At depth 10 this is 1/3^10
-        // ≈ 1.69e-5 world units, inside the 6-cell default
-        // interaction radius so the cursor raycast can reach the
-        // surface on the next frame. Closer than this starts losing
-        // the ray-sphere entry epsilon; farther loses interaction
-        // reach.
-        let above_y = (hit_y + 1.0 * cell).min(3.0 - cell);
+        let cell_size = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
+        // `cells` anchor cells above the hit. At d=10, cell_size ≈
+        // 1.69e-5 root units, so 1 cell ≈ the interaction-radius
+        // epsilon; 50 cells ≈ 8.5e-4. The upper clamp keeps us inside
+        // the root cell so `from_frame_local` doesn't saturate.
+        let above_y = (hit_y + cells as f32 * cell_size).min(3.0 - cell_size);
+        let cells_above_actual = ((above_y - hit_y) / cell_size).max(0.0);
         let new_pos = [root_cam[0], above_y, root_cam[2]];
         self.camera.position =
             WorldPos::from_frame_local(&Path::root(), new_pos, anchor_depth);
         eprintln!(
-            "fly_to_surface: root_cam=[{:.6},{:.6},{:.6}] t={:.6} hit_y={:.6} new_pos=[{:.6},{:.6},{:.6}] anchor_depth={} anchor={:?}",
+            "fly_to_surface_elevation: hit_y={:.6e} cell_size={:.6e} above_y={:.6e} cells_above={:.3} (requested={}) root_cam=[{:.6},{:.6},{:.6}] t={:.6e} new_pos=[{:.6e},{:.6e},{:.6e}] anchor_depth={} anchor={:?}",
+            hit_y, cell_size, above_y, cells_above_actual, cells,
             root_cam[0], root_cam[1], root_cam[2],
-            hit.t, hit_y,
+            hit.t,
             new_pos[0], new_pos[1], new_pos[2],
             anchor_depth,
             self.camera.position.anchor.as_slice(),

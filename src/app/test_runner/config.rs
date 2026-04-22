@@ -22,6 +22,15 @@ pub struct TestConfig {
     /// the camera near a feature (e.g., the planet surface) for
     /// screenshot-driven debugging.
     pub spawn_xyz: Option<[f32; 3]>,
+    /// Place the camera N anchor-cells above the nearest sphere-surface
+    /// terrain at spawn, where the cell size is `1 / 3^spawn_depth` in
+    /// root-frame units. Decouples elevation from anchor depth: "50 cells
+    /// above surface at d=10" looks the same visual altitude as "50 cells
+    /// above surface at d=5", just with finer cell subdivision visible.
+    /// Runs after the default spawn is built so the first raycast has a
+    /// valid root-frame camera to shoot from. Wins over `--spawn-xyz` if
+    /// both are set.
+    pub spawn_elevation_cells: Option<u32>,
     /// Camera yaw at spawn (radians). Default 0.
     pub spawn_yaw: Option<f32>,
     /// Camera pitch at spawn (radians). Default -1.2 (steep down).
@@ -156,6 +165,14 @@ pub enum ScriptCmd {
     /// camera on top of terrain regardless of spawn location.
     /// Following breaks/places then see real hits.
     FlyToSurface,
+    /// Raycast straight down from the current camera, then reposition
+    /// the camera exactly N anchor-cells above the hit at the current
+    /// anchor depth. Cell size = `1 / 3^anchor_depth`. Generalizes
+    /// `FlyToSurface` (which is hardcoded to 1 cell). Lets repro scripts
+    /// set "camera at X cells above terrain" independently of anchor
+    /// depth — "50 cells above surface at d=10" is the same visual
+    /// altitude as "50 cells above surface at d=5".
+    FlyToSurfaceElevation(u32),
     /// Teleport the camera to the horizontal center of the cell
     /// affected by the most recent break/place, positioned inside the
     /// bottom child of that cell at the current anchor depth.
@@ -277,6 +294,9 @@ impl TestConfig {
                     if let (Some(x), Some(y), Some(z)) = (x, y, z) {
                         cfg.spawn_xyz = Some([x, y, z]);
                     }
+                }
+                "--spawn-elevation-cells" => {
+                    cfg.spawn_elevation_cells = args.next().and_then(|v| v.parse().ok());
                 }
                 "--spawn-yaw" => { cfg.spawn_yaw = args.next().and_then(|v| v.parse().ok()); }
                 "--spawn-pitch" => { cfg.spawn_pitch = args.next().and_then(|v| v.parse().ok()); }
@@ -453,6 +473,11 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "fly_to_surface" {
                 return Some(ScriptCmd::FlyToSurface);
             }
+            if let Some(n) = raw.strip_prefix("fly_to_surface_elevation:") {
+                if let Ok(cells) = n.parse() {
+                    return Some(ScriptCmd::FlyToSurfaceElevation(cells));
+                }
+            }
             if let Some(rest) = raw.strip_prefix("step:") {
                 // "step:x+", "step:y-", "step:z+:0.25"
                 let (dir, delta_str) = match rest.split_once(':') {
@@ -512,6 +537,8 @@ WORLD TUNING:
 SPAWN:
   --spawn-xyz X Y Z           Override spawn position (root-cell-local, 0..3)
   --spawn-depth N             Camera anchor depth
+  --spawn-elevation-cells N   Place camera N anchor-cells above surface at
+                              the spawn depth (overrides --spawn-xyz)
   --spawn-yaw RAD             Yaw (radians)
   --spawn-pitch RAD           Pitch (radians)
 
