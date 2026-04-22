@@ -8,6 +8,7 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
+mod rotated;
 mod sphere_uv;
 
 pub use sphere_uv::cpu_raycast_sphere_uv;
