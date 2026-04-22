@@ -226,17 +226,50 @@ fn walk_face_subtree(
 
         let tag = packed & 0xFFu;
         if tag == 1u {
-            // Leaf block.
-            res.block = child_block_type(packed);
-            res.depth = d;
-            res.u_lo = child_u_lo;
-            res.v_lo = child_v_lo;
-            res.r_lo = child_r_lo;
-            res.size = child_size;
-            res.ratio_u = child_ratio_u;
-            res.ratio_v = child_ratio_v;
-            res.ratio_r = child_ratio_r;
-            res.ratio_depth = d;
+            // Leaf block — the packer flattened a uniform Cartesian
+            // subtree here. Walker-depth divergence at this
+            // termination (vs neighboring pixels that hit a MIXED
+            // rebuilt chain) is what produces the post-edit
+            // nested-frustum / streak artifacts at deep depths.
+            //
+            // REFINE TO max_depth via a single-shot integer-ratio
+            // promotion (NOT an iterative fake-descent — that hit a
+            // shader-lag wall on the empty-cell path, see revert of
+            // bb3ed8e). Strategy:
+            //   ratio_u_at_max = floor(un_abs · 3^max_depth)
+            // One multiply + floor per axis. f32 precision holds up
+            // to max_depth ≈ 15 (where `un_abs · 3^max_depth` stays
+            // under the f32 exact-integer ceiling 2^24). Beyond that
+            // the floor is off by a small integer — matches the
+            // walker's own precision wall.
+            //
+            // This is ONLY done on tag=1 hits (rendered surface
+            // pixels). Empty-mask traversals stay unchanged — they
+            // fire per DDA step for every sky ray and the extra
+            // per-step work there is what crashed the shader on
+            // bb3ed8e.
+            let leaf_block = child_block_type(packed);
+            var three_pow_max: f32 = 1.0;
+            for (var lk: u32 = 0u; lk < max_depth; lk = lk + 1u) {
+                three_pow_max = three_pow_max * 3.0;
+            }
+            let inv_three_pow_max = 1.0 / three_pow_max;
+            let final_ratio_u = u32(clamp(floor(un_abs * three_pow_max),
+                0.0, three_pow_max - 1.0));
+            let final_ratio_v = u32(clamp(floor(vn_abs * three_pow_max),
+                0.0, three_pow_max - 1.0));
+            let final_ratio_r = u32(clamp(floor(rn_abs * three_pow_max),
+                0.0, three_pow_max - 1.0));
+            res.block = leaf_block;
+            res.depth = max_depth;
+            res.u_lo = f32(final_ratio_u) * inv_three_pow_max;
+            res.v_lo = f32(final_ratio_v) * inv_three_pow_max;
+            res.r_lo = f32(final_ratio_r) * inv_three_pow_max;
+            res.size = inv_three_pow_max;
+            res.ratio_u = final_ratio_u;
+            res.ratio_v = final_ratio_v;
+            res.ratio_r = final_ratio_r;
+            res.ratio_depth = max_depth;
             return res;
         }
         // Tag 2 → descend into node.
