@@ -63,6 +63,50 @@ DDA steps. The current sphere_in_sub_frame uses sub-frame local
 coords with rd_local at O(3^m) magnitude — at m ≥ ~10, the products
 that compute exit times underflow or cancel.
 
+### Root cause in one sentence
+
+At m ≥ ~10, `pos = ro_local + rd_local * t` in the DDA step
+(sphere.wgsl:1270) silently loses the smaller components of
+`rd_local * t` because they're O(1/3^m · other-axis-scale) below the
+f32 ULP of ro_local's O(1) components. The ray effectively stops
+advancing on those axes, so the DDA either:
+- Hits t >= t_exit without any axis crossing the box boundary
+  (the "cyan sentinel" in SPHERE_DEBUG_PAINT); or
+- Advances on ONE axis only, missing all cell boundaries on the
+  others, and eventually returns a miss.
+
+### Concrete port recipe for sphere_in_sub_frame
+
+The CPU `unified_raycast` demonstrates the precision-stable pattern.
+Port recipe:
+
+1. State: per-cell `residual ∈ [0,1)³` (not sub-frame-local `[0,3)`
+   pos). Each cell has its own basis.
+2. Track `cell_slot: vec3<i32>` at current DDA level + `residual` at
+   cell entry. DDA step computes `t_exit[k] = (target[k] - residual[k]) / rd_cell_local[k]`
+   where `rd_cell_local = J_inv_cell · rd_body`.
+3. `J_inv_cell` rebuilt at cell entry via `face_frame_jacobian_shader`
+   at the cell's face-normalized corner. This keeps `J_inv_cell`'s
+   magnitude bounded by the cell's face-subtree depth relative to
+   the CURRENT cell (not the deep global depth), so its components
+   stay at O(3^m_cell · body_size^-1) where m_cell is the walker's
+   local descent from the sub-frame root — bounded.
+4. `rd_body` itself is O(1), invariant. Never accumulate across steps.
+5. Neighbor transition: `cell_slot[k] += sign`, `residual[k]` snaps
+   to 0 or 1-eps on the crossed axis. If `cell_slot` leaves `[0,2]`,
+   bubble up the UVR path (unchanged from current sphere_in_sub_frame).
+6. Face-seam: unchanged pathway (currently returns miss → falls
+   through to body march via the new pop loop from commit `7df88a0`).
+7. Shading: hit-report `body_xyz = c_body_cell + J_cell · residual · 3`
+   where `c_body_cell` is recomputed from face-space coords at hit
+   time.
+
+Most of these helpers exist in sphere.wgsl today
+(`face_frame_jacobian_shader`, `mat3_inv_shader`, `mat3_mul_vec_shader`).
+The `face_space_to_body_point` / `body_point_to_face_space` ports
+added in commit `bcf5924` handle the shading-time body-XYZ
+reconstruction.
+
 The CPU `unified_raycast` in `src/world/raycast/unified.rs` already
 uses cell-local residual ∈ [0,1)³ exclusively, with no f32 quantity
 that scales with global tree depth. Porting that DDA structure to
