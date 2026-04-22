@@ -148,6 +148,12 @@ pub enum ScriptCmd {
     /// Run a CPU raycast straight down from the camera in world space
     /// and emit a `HARNESS_PROBE` line to stdout with the hit path.
     ProbeDown,
+    /// CPU raycast at an ARBITRARY pitch/yaw (absolute radians), NOT
+    /// hardcoded straight-down. Lets us probe multiple adjacent rays
+    /// (pitch deltas of ~1/400 rad for pixel-adjacent) and diff the
+    /// hit paths pre vs post place. Prints `probe_at:` line with the
+    /// full SphereHitCell so bit-level comparison works.
+    ProbeAt { pitch: f32, yaw: f32 },
     /// Emit a `HARNESS_MARK` line to stdout with the given label plus
     /// the current ui_layer / anchor_depth / frame. Timeline marker
     /// for correlating screenshots to actions in a test trace.
@@ -446,6 +452,15 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "place" { return Some(ScriptCmd::Place); }
             if raw == "debug_overlay" { return Some(ScriptCmd::ToggleDebugOverlay); }
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
+            // probe_at:<pitch>:<yaw>
+            if let Some(rest) = raw.strip_prefix("probe_at:") {
+                let parts: Vec<&str> = rest.split(':').collect();
+                if parts.len() == 2 {
+                    if let (Ok(p), Ok(y)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                        return Some(ScriptCmd::ProbeAt { pitch: p, yaw: y });
+                    }
+                }
+            }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
             if raw == "teleport_into_last_edit" { return Some(ScriptCmd::TeleportIntoLastEdit); }
             if raw == "dump_position" { return Some(ScriptCmd::DumpPosition); }

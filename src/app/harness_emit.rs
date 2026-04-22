@@ -126,6 +126,37 @@ impl App {
         }
     }
 
+    /// CPU raycast at arbitrary pitch/yaw. Lets us probe specific
+    /// rays from the scripted harness — the ray direction is set by
+    /// (pitch, yaw), not hardcoded to straight-down. Used for
+    /// bit-level pre vs post place diffing of adjacent rays at the
+    /// pixel-adjacency scale (~1/400 rad pitch delta per pixel).
+    pub(super) fn harness_probe_at(&mut self, pitch: f32, yaw: f32) {
+        let saved_pitch = self.camera.pitch;
+        let saved_yaw = self.camera.yaw;
+        self.camera.pitch = pitch;
+        self.camera.yaw = yaw;
+        let hit = self.frame_aware_raycast();
+        self.camera.pitch = saved_pitch;
+        self.camera.yaw = saved_yaw;
+        match hit {
+            Some(ref h) => {
+                eprintln!(
+                    "probe_at pitch={:+.4} yaw={:+.4}: hit t={:.6e} path_len={} face={} sphere_cell={:?} path={:?}",
+                    pitch, yaw,
+                    h.t,
+                    h.path.len(),
+                    h.face,
+                    h.sphere_cell,
+                    h.path.iter().map(|(_, s)| *s as u32).collect::<Vec<_>>(),
+                );
+            }
+            None => {
+                eprintln!("probe_at pitch={:+.4} yaw={:+.4}: MISS", pitch, yaw);
+            }
+        }
+    }
+
     /// Shared script-command dispatcher. Called from both the live
     /// event loop (`event_loop.rs`) and the render-harness loop
     /// (`test_runner.rs`) so new commands only need one handler.
@@ -209,6 +240,7 @@ impl App {
                 self.camera.yaw = rad;
             }
             ScriptCmd::ProbeDown => self.harness_probe_down(),
+            ScriptCmd::ProbeAt { pitch, yaw } => self.harness_probe_at(pitch, yaw),
             ScriptCmd::Emit(label) => self.harness_emit_mark(&label, frame),
             ScriptCmd::TeleportAboveLastEdit => self.teleport_above_last_edit(),
             ScriptCmd::TeleportIntoLastEdit => self.teleport_into_last_edit(),

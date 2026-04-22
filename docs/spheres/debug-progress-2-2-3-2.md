@@ -65,3 +65,46 @@ ratio/block are identical and t_at_hit differs, hypothesis 2 holds.
 If walker output itself differs, hypothesis 1.
 
 ## Running notes
+
+### 2026-04-22 late — probe_at diagnostic
+
+Added `probe_at:<pitch>:<yaw>` script cmd to CPU-raycast arbitrary
+directions. Compared CPU walker output pre vs post place for 4
+adjacent pitches (-0.494 through -0.503, pixel-adjacent deltas):
+
+- **Pre-place at pitch -0.5**: `ratio_u=3280 ratio_v=3298 ratio_r=3563
+  ratio_depth=8`, `path=[13,16,13,13,22,13,25,19,22,22]`.
+- **Post-place at pitch -0.5**: `ratio_u=3280 ratio_v=3298 ratio_r=3564`,
+  `path=[13,16,13,13,22,22,7,1,4,4]`. **Different cell one r-cell outward.**
+- All adjacent pitches (-0.494, -0.497, -0.5, -0.503) behave IDENTICALLY
+  pre to pre and post to post — not ray-precision.
+
+Probe at distant pitch -0.7 (far from placement): **unchanged** pre
+vs post. So the divergence is LOCALIZED to rays that pass through
+the placed cell's region.
+
+### Attempted fix: single-leaf place_block
+
+Changed `place_block` to insert `Child::Block(block_type)` directly
+instead of `build_uniform_subtree`. Hypothesis: uniform-subtree gets
+flattened by pack to a shallow-depth ancestor. But mode 0 is visually
+UNCHANGED. Reverted.
+
+### Current hypothesis re-aligned
+
+Probing pre/post confirms: walker returns SAME cells for rays that
+don't pass through the placed block's path, and DIFFERENT cells for
+rays that do. That's correct behavior — walker correctly detects
+the new content.
+
+**The mode-4 stripes on distant ground must come from something
+else**: the DDA's `last_side` evolves per iteration. For rays that
+pass through newly-non-empty ancestors (on their way to deeper
+cells), the empty-advance step count changes, altering the final
+`last_side`. Adjacent rays that take different numbers of advances
+see different final last_sides → stripes.
+
+Investigation path: where exactly does the DDA's advance sequence
+change between pre/post for a ray going past-but-not-through the
+placed cell? This is the remaining precision question.
+
