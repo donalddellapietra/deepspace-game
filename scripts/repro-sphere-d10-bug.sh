@@ -2,19 +2,23 @@
 # Reproduces the d=10 sphere "hollow block + striped ground" bug in the
 # headless harness. Output PNGs go to `tmp/bug_mN.png` for mode N.
 #
-# Camera coords matched to a user-provided screenshot that captured the
-# bug in the live game:
-#   - root_xyz       = (1.5, 1.7993, 1.4988)
+# This script uses the USER'S EXACT COORDS from a screenshot where the
+# bug was captured in the live game. Those coords are:
+#   - root_xyz       = (1.5, 1.7993, 1.4988)  — off-PosY-face-axis (z ≠ 1.5)
 #   - anchor_depth   = 10 (layer 21)
 #   - pitch          = -0.5
-# The `--interaction-radius 10000` override lets the cursor raycast
-# reach the surface from a distance that would otherwise be capped.
 #
-# Script: spawn → wait 10 frames → place block → wait 30 frames →
-# screenshot. Matches the live-game "right-click to place" flow.
+# The off-axis z (1.4988 not 1.5) matters: `pick_face(n)` flips between
+# PosY and PosZ subtrees for adjacent rays, producing the mode-4 stripe
+# pattern. Camera at EXACT face center (z = 1.5) makes the stripes
+# disappear — use that variant (`repro-sphere-d10-elevation.sh`) to
+# test close-range d=10 rendering without the face-boundary confound.
+#
+# `--interaction-radius 10000` lets the cursor raycast reach the
+# surface from a distance the default 6-cell cap would block.
 #
 # Usage:
-#   scripts/repro-sphere-d10-bug.sh            # cycles modes 0..6
+#   scripts/repro-sphere-d10-bug.sh            # cycles modes 0..7
 #   scripts/repro-sphere-d10-bug.sh 4          # single mode
 #   SKIP_BUILD=1 scripts/repro-sphere-d10-bug.sh   # skip cargo build
 
@@ -30,7 +34,7 @@ mkdir -p tmp
 
 MODES=("$@")
 if [[ ${#MODES[@]} -eq 0 ]]; then
-    MODES=(0 1 2 3 4 5 6)
+    MODES=(0 1 2 3 4 5 6 7)
 fi
 
 for m in "${MODES[@]}"; do
