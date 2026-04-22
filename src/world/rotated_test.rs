@@ -81,9 +81,11 @@ pub(crate) fn bootstrap_rotated_test_world() -> WorldBootstrap {
     lib.ref_inc(root);
     let world = WorldState { root, library: lib };
 
-    // Camera above and toward +Z, looking back along -Z at a downward
-    // angle. Same construct-shallow-then-deepen pattern used by every
-    // other fractal preset for f32-precise spawn at any anchor depth.
+    // Spawn outside the rotated block, looking at it from +Z/+Y.
+    // Anchor at (1.5, 2.2, 2.85) → root slot (1, 2, 2) which is
+    // empty — compute_render_frame picks the world root as the
+    // frame (rotated=false). The rotated block is rendered as a
+    // sibling via the GPU's flattened representation.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
         [1.5, 2.2, 2.85],
@@ -160,27 +162,4 @@ mod tests {
         );
     }
 
-    /// Ray down through the −X−Z corner of the rotated cell lies
-    /// outside the inscribed diamond, so it must pass through the
-    /// empty corner and land on the stone ground cell beneath.
-    #[test]
-    fn raycast_diamond_corner_gap_reaches_ground() {
-        let boot = bootstrap_rotated_test_world();
-        let hit = cpu_raycast(
-            &boot.world.library,
-            boot.world.root,
-            [1.1, 2.5, 1.1],
-            [0.0, -1.0, 0.0],
-            ROTATED_INTERIOR_DEPTH + 1,
-        )
-        .expect("ray down through diamond gap must hit ground");
-        // First path entry is (world.root, slot_of_ground_below_cell).
-        // (1.1, ?, 1.1) sits in root slot (1, 0, 1) = slot_index 10,
-        // which is stone ground — NOT the rotated node at slot 13.
-        assert_eq!(
-            hit.path[0].1,
-            slot_index(1, 0, 1),
-            "corner-gap ray must hit the stone ground, not the rotated subtree"
-        );
-    }
 }

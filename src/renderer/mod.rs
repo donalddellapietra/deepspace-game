@@ -69,7 +69,14 @@ pub struct GpuUniforms {
     /// Shader's tag=3 dispatch uses it as a validity gate; zero
     /// means the entity path is inert.
     pub entity_count: u32,
-    pub _pad_entity: [u32; 3],
+    /// `1` when the render frame root is inside (or is) a
+    /// `NodeKind::Rotated45Y` subtree. Shader applies the 45° Y
+    /// rotation + √2 XZ stretch to the ray once at entry so the
+    /// existing `march_cartesian` runs unchanged on the transformed
+    /// ray. Stays in `Uniforms`'s padding slot to avoid re-laying out
+    /// the rest of the struct.
+    pub root_rotated: u32,
+    pub _pad_entity: [u32; 2],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
     /// Body radii (used iff `root_kind == 1`). Stored in the body
@@ -131,6 +138,7 @@ pub struct Renderer {
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
+    pub(super) root_rotated: u32,
     pub(super) root_radii: [f32; 4],
     pub(super) root_face_meta: [u32; 4],
     pub(super) root_face_bounds: [f32; 4],
@@ -277,6 +285,18 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    /// Flag the current frame as rotated (frame root is inside a
+    /// `NodeKind::Rotated45Y` subtree). Shader applies the 45° Y
+    /// + √2 XZ-stretch transform to the ray once at entry. Doesn't
+    /// touch the kind discriminant — rotation composes with the
+    /// cartesian root kind.
+    pub fn set_root_rotated(&mut self, rotated: bool) {
+        let flag = if rotated { 1 } else { 0 };
+        if self.root_rotated == flag { return; }
+        self.root_rotated = flag;
         self.write_uniforms();
     }
 

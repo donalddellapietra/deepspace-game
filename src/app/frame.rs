@@ -49,6 +49,14 @@ pub struct ActiveFrame {
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
+    /// `true` when the frame root is inside (or at) a `Rotated45Y`
+    /// subtree — the camera's anchor path crossed such a node on the
+    /// way down. The renderer / CPU raycast transform the ray by the
+    /// frame's rotation once at the boundary and then run ordinary
+    /// cartesian code in the rotated local frame. Propagates through
+    /// cartesian descendants of a rotated node the same way
+    /// `SphereFrame` carries face bounds through its descendants.
+    pub rotated: bool,
 }
 
 pub fn frame_point_to_body(point: [f32; 3], sphere: &SphereFrame) -> [f32; 3] {
@@ -96,6 +104,10 @@ pub fn compute_render_frame(
     let mut reached = Path::root();
     let mut body_info: Option<(Path, NodeId, f32, f32)> = None;
     let mut sphere_info: Option<(Face, NodeId, f32, f32, f32, f32)> = None;
+    // Flips true once the descent crosses a Rotated45Y node and stays
+    // true through all cartesian descendants — the rotation applies
+    // to the entire frame below that boundary.
+    let mut rotated = false;
     for k in 0..target.depth() as usize {
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
@@ -126,12 +138,16 @@ pub fn compute_render_frame(
                             body_info = Some((body_path, body_node_id, inner_r, outer_r));
                         }
                     }
-                    // Rotated subtree behaves like Cartesian for
-                    // descent purposes — the rotation is applied
-                    // only in the shader when the ray enters the
-                    // subtree. Walkable via slot path the same way.
+                    // Rotated subtree: descend the same slot way the
+                    // parent cartesian walk does, but flag the frame
+                    // so the renderer / raycast apply the rotation
+                    // transform once at the frame boundary. Every
+                    // deeper cartesian child inherits the flag (the
+                    // rotation is accumulated with the frame, not
+                    // re-applied per level).
                     NodeKind::Rotated45Y => {
                         node_id = child_id;
+                        rotated = true;
                     }
                 }
             }
@@ -159,6 +175,7 @@ pub fn compute_render_frame(
                 frame_path: reached,
                 face_depth: reached.depth().saturating_sub(body_path.depth() + 1) as u32,
             }),
+            rotated,
         }
     } else {
         let kind = library.get(node_id).map(|n| n.kind).unwrap_or(NodeKind::Cartesian);
@@ -172,6 +189,7 @@ pub fn compute_render_frame(
                 }
                 _ => ActiveFrameKind::Cartesian,
             },
+            rotated,
         }
     }
 }
@@ -209,6 +227,7 @@ pub fn with_render_margin(
         logical_path: logical.logical_path,
         node_id: render.node_id,
         kind: render.kind,
+        rotated: render.rotated,
     }
 }
 
@@ -222,6 +241,7 @@ mod tests {
             render_path: path,
             logical_path: path,
             node_id,
+            rotated: false,
             kind: ActiveFrameKind::Cartesian,
         }
     }

@@ -386,8 +386,9 @@ impl App {
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
         );
         eprintln!(
-            "startup_perf initial_frame kind={:?} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
+            "startup_perf initial_frame kind={:?} rotated={} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
             active_frame.kind,
+            active_frame.rotated,
             active_frame.render_path.depth(),
             active_frame.logical_path.depth(),
             desired_depth,

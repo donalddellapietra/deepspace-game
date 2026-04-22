@@ -54,13 +54,49 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 /// non-TAAU path; the gamma-space clamp + blend in the resolve shader
 /// is a small precision hit but not a visible one.
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
-    let ray_dir = jittered_ray_dir(uv);
+    let ray_dir_world = jittered_ray_dir(uv);
+    // When the active frame is inside a `NodeKind::Rotated45Y`
+    // subtree, transform the ray once here so everything downstream
+    // (camera.pos, cell_min, hit_pos, ray_dir) agrees: it's all in
+    // the rotated local frame. march_cartesian then runs unchanged.
+    // `camera.pos` is already in frame-local coords by construction
+    // (slot-anchored descent preserves the rotation), so only the
+    // world-space ray direction needs to be rotated.
+    //
+    // T(p) = (p.x - p.z, p.y, p.x + p.z) = R_y(-45°) ∘ XZ-stretch(√2).
+    // Applied to a direction vector (no translation, no centering).
+    // Inscribed-prism → unit-cube mapping: a local unit cube in the
+    // rotated frame is a diamond prism of cell-AABB extent in world.
+    let ray_dir = select(
+        ray_dir_world,
+        vec3<f32>(
+            ray_dir_world.x - ray_dir_world.z,
+            ray_dir_world.y,
+            ray_dir_world.x + ray_dir_world.z,
+        ),
+        uniforms.root_rotated != 0u,
+    );
     let result = march(camera.pos, ray_dir);
 
     var color: vec3<f32>;
     if result.hit {
-        let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-        let diffuse = max(dot(result.normal, sun_dir), 0.0);
+        // Sun direction is authored in world. Rotate it into the
+        // frame-local basis (same T as the ray) so the dot-product
+        // with the frame-local normal stays physically correct.
+        // T-transpose-inverse equals T's rotation part (orthogonal),
+        // so the transform simplifies to the same (x-z, y, x+z) form
+        // applied to the world sun vector.
+        let sun_world = normalize(vec3<f32>(0.4, 0.7, 0.3));
+        let sun_frame = select(
+            sun_world,
+            normalize(vec3<f32>(
+                sun_world.x - sun_world.z,
+                sun_world.y,
+                sun_world.x + sun_world.z,
+            )),
+            uniforms.root_rotated != 0u,
+        );
+        let diffuse = max(dot(result.normal, sun_frame), 0.0);
         let ambient = 0.3;
         let hit_pos = camera.pos + ray_dir * result.t;
         let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -68,7 +104,9 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         let lit = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else {
-        let sky_t = ray_dir.y * 0.5 + 0.5;
+        // Sky gradient uses world ray direction so the horizon
+        // stays oriented to world Y even inside a rotated frame.
+        let sky_t = ray_dir_world.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
