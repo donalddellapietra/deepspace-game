@@ -318,3 +318,30 @@ vs the renderer's expected size" (which the user says should NOT
 happen per the infinite-zoom memory), or the walker's cell-bounds
 return has an actual precision bug downstream of the slot-pick fix.
 
+### 2026-04-22 — smooth radial normal — STRIPES FIXED
+
+Replaced the `last_side`→hit_normal switch with `hit_normal = n`
+(radial outward from sphere center) for every sphere hit. Result:
+
+- **d=10 ground: COMPLETELY CLEAN.** No stripes. Uniform gray
+  terrain.
+- **d=10 placed block: renders as a soft rounded yellow square**
+  (loses per-face cube faceting — all faces shade via the same
+  radial direction).
+- **d=8 break cavity: still shows a distinct void** with slight
+  curvature. Grid bevel lines still visible around it.
+
+The stripes were a per-cell-wall-normal artifact from `last_side`
+picking different cube-face normals for adjacent pixel rows. At d≥10
+those normals differ by ~1/3^10 world units — well-resolved per
+cell, but visually discontinuous across pixels when cells project
+near 1:1 with pixels. Smooth-radial-normal sidesteps this by using
+the geometric sphere surface's normal (continuous across the face)
+instead.
+
+Tradeoff: block faces lose their sharp 90° shading edges. Acceptable
+for sphere/terrain rendering where "smooth curved crust" is the
+mental model, but a placed block still looks less cube-faceted than
+before. May want to split: wall-normal for blocks at camera's
+DEEPEST visible depth, radial for shallower LOD cells.
+
