@@ -256,6 +256,7 @@ impl TestConfig {
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
                 "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
+                "--rotated-world" => { cfg.world_preset = WorldPreset::RotatedTest; }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,
@@ -569,6 +570,8 @@ VISIBILITY TEST PRESETS:
                               precision-stable Cartesian DDA below — so
                               40+ deeper layers retain precision the way
                               sphere-DDA descent cannot.
+  --rotated-world             Minimal stone-vs-rotated-subtree diamond demo
+                              (NodeKind::Rotated45Y)
 
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):

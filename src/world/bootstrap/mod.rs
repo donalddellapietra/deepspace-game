@@ -119,6 +119,11 @@ pub enum WorldPreset {
         /// layers above the slab cell anchor depth.
         tangent_planes: bool,
     },
+    /// Minimal test world for [`crate::world::tree::NodeKind::Rotated45Y`].
+    /// A stone floor with `stone | rotated-subtree | stone` in the
+    /// middle row, so the diamond silhouette is visible between two
+    /// normal cubes for side-by-side comparison.
+    RotatedTest,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -149,6 +154,8 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         // but its world-y depends on embedding_depth and slot path
         // — entities don't auto-rest on it in Phase 1.
         WorldPreset::WrappedPlanet { .. } => None,
+        // Rotated test world: middle-row demo, no resting plane.
+        WorldPreset::RotatedTest => None,
     }
 }
 
@@ -233,5 +240,6 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             cell_subtree_depth,
             tangent_planes,
         ),
+        WorldPreset::RotatedTest => crate::world::rotated_test::bootstrap_rotated_test_world(),
     }
 }

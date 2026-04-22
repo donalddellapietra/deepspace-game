@@ -117,6 +117,13 @@ pub enum NodeKind {
     /// (which loses precision at deep zoom) into the precision-stable
     /// Cartesian descent path.
     TangentBlock,
+    /// Cartesian subdivision rendered rotated 45° about the world
+    /// Y axis and stretched by √2 in XZ so the rotated block's
+    /// footprint fits the cell AABB exactly (corners touch cell-
+    /// edge midpoints in XZ; Y fills the full cell). Internally
+    /// the 3×3×3 children are regular cartesian — the shader
+    /// applies the rotation when the ray enters the subtree.
+    Rotated45Y,
 }
 
 impl Default for NodeKind {
@@ -137,6 +144,7 @@ impl Hash for NodeKind {
                 slab_depth.hash(state);
             }
             NodeKind::TangentBlock => {}
+            NodeKind::Rotated45Y => {}
         }
     }
 }

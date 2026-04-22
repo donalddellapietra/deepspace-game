@@ -83,6 +83,13 @@ pub fn compute_render_frame(
                         kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
                         break;
                     }
+                    // Rotated subtree behaves like Cartesian for
+                    // descent purposes — the rotation is applied
+                    // only in the shader when the ray enters the
+                    // subtree. Walkable via slot path the same way.
+                    NodeKind::Rotated45Y => {
+                        node_id = child_id;
+                    }
                 }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,

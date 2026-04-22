@@ -61,13 +61,16 @@ impl GpuChild {
 /// Per-packed-node metadata: indexed by BFS position — the same
 /// `node_index` used in `GpuChild::node_index`. 16 bytes total.
 ///
-/// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock.
+/// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock,
+/// 3 = Rotated45Y.
 /// `dims_x/y/z`: slab dims (cells per axis) for `WrappedPlane`;
-/// unused (zeroed) for `Cartesian` and `TangentBlock`. The shader
-/// reads these in Phase 2 to drive X-wrap and in Phase 3 to derive
-/// the planet radius. `TangentBlock` carries no fields — its TBN
-/// is computed by the descender from current `(lon, lat, r)` cell
-/// bounds at the moment the ray enters the node.
+/// unused (zeroed) for `Cartesian`, `TangentBlock`, and
+/// `Rotated45Y`. The shader reads these in Phase 2 to drive
+/// X-wrap and in Phase 3 to derive the planet radius. `TangentBlock`
+/// carries no fields — its TBN is computed by the descender from
+/// current `(lon, lat, r)` cell bounds at the moment the ray enters
+/// the node. `Rotated45Y` similarly carries no fields — it's a
+/// pure render-frame rotation applied at the dispatch boundary.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -88,6 +91,7 @@ impl GpuNodeKind {
                 dims_z: dims[2],
             },
             NodeKind::TangentBlock => Self { kind: 2, dims_x: 0, dims_y: 0, dims_z: 0 },
+            NodeKind::Rotated45Y => Self { kind: 3, dims_x: 0, dims_y: 0, dims_z: 0 },
         }
     }
 }
