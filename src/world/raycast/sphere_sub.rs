@@ -78,10 +78,15 @@ const LOCAL_BOX_MAX: f32 = 3.0;
 const MAX_DDA_STEPS: usize = 4096;
 /// Upper bound on how many neighbor sub-frame transitions a single ray
 /// can take before we terminate. Protects against pathological grazing
-/// rays that would otherwise ribbon-walk indefinitely. Deep rays under
-/// normal gameplay cross far fewer deep cells than this before hitting
-/// solid content or exiting the face subtree.
-const MAX_NEIGHBOR_TRANSITIONS: usize = 64;
+/// rays that would otherwise ribbon-walk indefinitely.
+///
+/// Was 64 originally. Raised to 1024 to match the GPU shader's
+/// MAX_SPHERE_SUB_TRANSITIONS — the lower cap was the actual cause
+/// of the depth-10-ish render wall (verified via SPHERE_DEBUG_PAINT
+/// at depth 15 painting the yellow exhaustion sentinel). At deep
+/// camera positions near the surface, rays cross many sub-frame
+/// cells angularly before finding solid content.
+const MAX_NEIGHBOR_TRANSITIONS: usize = 1024;
 
 /// Terminal cell found by `walk_sub_frame`. Coords are in the
 /// sub-frame's LOCAL `[0, 3)³` frame.
