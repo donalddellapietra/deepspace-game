@@ -410,34 +410,15 @@ fn bevel_layered_local(
 
 fn depth_tint(rn: f32) -> f32 { return 0.55 + 0.45 * clamp(rn, 0.0, 1.0); }
 
-/// f32-precision cap for the face walker. Past this depth the
-/// walker's `(un_abs − u_lo) / child_size` quotient loses
-/// significance (numerator ~f32 ULP, denominator = `1/3^n`), slot
-/// picks jitter per-pixel, and adjacent-pixel rays mis-classify
-/// cells → rendering shows angular / pyramidal artifacts that look
-/// like holes in the sphere surface. At close camera ranges the
-/// Nyquist-based LOD would drive the walker much deeper (15+); we
-/// cap here to keep cells stable.
-///
-/// Cells past this depth still render — they just render at the
-/// precision-safe parent's scale. Visually: sphere surface retains
-/// cell grid, no holes. Surface loses fine subdivision only when
-/// the camera is so close that the walker WOULD go deeper; on
-/// Apple Silicon at 1080p that's around ~1/3^12 ≈ 0.1mm of body
-/// units from the surface — effectively only at extreme zoom.
-const FACE_LOD_DEPTH_PRECISION_CAP: u32 = 12u;
-
 // Per-ray LOD for the face walker. Matches the Cartesian
-// `LOD_PIXEL_THRESHOLD` Nyquist gate, capped at the walker's f32
-// precision wall.
+// `LOD_PIXEL_THRESHOLD` Nyquist gate.
 fn face_lod_depth(ray_dist: f32, shell: f32) -> u32 {
     let pixel_density = uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
     let safe_dist = max(ray_dist, 1e-6);
     let ratio = shell * pixel_density / (safe_dist * max(LOD_PIXEL_THRESHOLD, 1e-6));
     if ratio <= 1.0 { return 1u; }
     let log3r = log2(ratio) * (1.0 / 1.5849625);
-    let nyquist = u32(clamp(1.0 + log3r, 1.0, f32(MAX_FACE_DEPTH)));
-    return min(nyquist, FACE_LOD_DEPTH_PRECISION_CAP);
+    return u32(clamp(1.0 + log3r, 1.0, f32(MAX_FACE_DEPTH)));
 }
 
 // ─────────────────────────────────────────── unified sphere DDA

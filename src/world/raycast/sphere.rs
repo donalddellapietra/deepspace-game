@@ -51,14 +51,9 @@ impl LodParams {
     }
 }
 
-/// f32-precision cap for the face walker. See shader mirror
-/// `FACE_LOD_DEPTH_PRECISION_CAP` in `assets/shaders/sphere.wgsl`.
-const FACE_LOD_DEPTH_PRECISION_CAP: u32 = 12;
-
 /// Per-ray walker depth (matches shader `face_lod_depth`).
 /// `cell_size = shell * (1/3)^(d-1)`; pick the largest `d` whose
-/// projected cell is ≥ `lod_threshold` pixels at ray distance `t`,
-/// capped at the walker's f32-precision safe depth.
+/// projected cell is ≥ `lod_threshold` pixels at ray distance `t`.
 fn face_lod_depth(t: f32, shell: f32, lod: LodParams) -> u32 {
     let safe_t = t.max(1e-6);
     let ratio = shell * lod.pixel_density / (safe_t * lod.lod_threshold.max(1e-6));
@@ -66,8 +61,7 @@ fn face_lod_depth(t: f32, shell: f32, lod: LodParams) -> u32 {
         return 1;
     }
     let log3_ratio = ratio.ln() / 3.0_f32.ln();
-    let nyquist = (1.0 + log3_ratio).clamp(1.0, MAX_FACE_DEPTH as f32) as u32;
-    nyquist.min(FACE_LOD_DEPTH_PRECISION_CAP)
+    (1.0 + log3_ratio).clamp(1.0, MAX_FACE_DEPTH as f32) as u32
 }
 
 /// Walker result — direct mirror of the shader's `FaceWalkResult`
