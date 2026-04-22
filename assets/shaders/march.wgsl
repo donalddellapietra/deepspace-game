@@ -422,10 +422,19 @@ fn march_rotated45y_subtree(
             let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
             let cell_box_l = ray_box(local_origin, inv_dir, cell_min_l, cell_max_l);
             let t_local = max(cell_box_l.t_enter, 0.0);
-            // Convert local hit back to world position, then back-
-            // project onto world ray to recover t_world. T is non-
-            // uniform, so dividing t_local by a scalar wouldn't work.
             let p_local = local_origin + local_dir * t_local;
+            // Bevel computed in rotated-frame local coords with the
+            // pre-rotation (local) normal, so each inner cell gets the
+            // same edge darkening as a cartesian cube. Pre-baked into
+            // the returned color since main.wgsl has no way to tell
+            // whether a hit is cartesian- or rotated-local.
+            let cell_uv = clamp(
+                (p_local - cell_min_l) / cur_cell_size,
+                vec3<f32>(0.0), vec3<f32>(1.0),
+            );
+            let bevel = cube_face_bevel(cell_uv, normal);
+            // Convert local hit back to world (well, frame-local —
+            // same coord system the caller passed ray_origin in).
             let p_shifted = p_local / s3 - vec3<f32>(cell_size * 0.5);
             let p_world_off = vec3<f32>(
                 (p_shifted.x + p_shifted.z) * 0.5,
@@ -433,15 +442,23 @@ fn march_rotated45y_subtree(
                 (p_shifted.z - p_shifted.x) * 0.5,
             );
             let p_world = p_world_off + cell_center;
+            // T is non-uniform so t_frame ≠ t_local_scalar — back out
+            // world t by projecting the recovered position onto the
+            // world-direction ray.
             let t_world = dot(p_world - ray_origin, ray_dir) / dd;
             result.hit = true;
             result.t = max(t_world, 0.0);
-            result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
+            result.color = palette[(packed >> 8u) & 0xFFFFu].rgb * (0.7 + 0.3 * bevel);
             result.normal = normalize(vec3<f32>(
                 normal.x - normal.z,
                 normal.y,
                 normal.x + normal.z,
             ));
+            // Neutralize main.wgsl's outer cube_face_bevel: center
+            // the AABB on the hit so local UV is (0.5, 0.5, 0.5)
+            // → edge = 0.5 > 0.14 → smoothstep → 1.0 → (0.7+0.3·1) = 1.
+            result.cell_min = p_world - vec3<f32>(0.5);
+            result.cell_size = 1.0;
             return result;
         }
         // tag == 2u: Cartesian Node descent. tag==3 (EntityRef) is
@@ -483,6 +500,11 @@ fn march_rotated45y_subtree(
                 let cell_box_l2 = ray_box(local_origin, inv_dir, cell_min_l2, cell_max_l2);
                 let t_local2 = max(cell_box_l2.t_enter, 0.0);
                 let p_local2 = local_origin + local_dir * t_local2;
+                let cell_uv2 = clamp(
+                    (p_local2 - cell_min_l2) / cur_cell_size,
+                    vec3<f32>(0.0), vec3<f32>(1.0),
+                );
+                let bevel2 = cube_face_bevel(cell_uv2, normal);
                 let p_shifted2 = p_local2 / s3 - vec3<f32>(cell_size * 0.5);
                 let p_world_off2 = vec3<f32>(
                     (p_shifted2.x + p_shifted2.z) * 0.5,
@@ -493,12 +515,14 @@ fn march_rotated45y_subtree(
                 let t_world2 = dot(p_world2 - ray_origin, ray_dir) / dd;
                 result.hit = true;
                 result.t = max(t_world2, 0.0);
-                result.color = palette[bt].rgb;
+                result.color = palette[bt].rgb * (0.7 + 0.3 * bevel2);
                 result.normal = normalize(vec3<f32>(
                     normal.x - normal.z,
                     normal.y,
                     normal.x + normal.z,
                 ));
+                result.cell_min = p_world2 - vec3<f32>(0.5);
+                result.cell_size = 1.0;
                 return result;
             }
         } else {
