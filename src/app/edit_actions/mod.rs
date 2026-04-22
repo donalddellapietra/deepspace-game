@@ -26,7 +26,17 @@ impl App {
         // direction is identical in every frame.  The DDA only cares
         // about the *direction*, not the magnitude.  The old code
         // scaled by 3^depth which overflows f32 past depth ~20.
-        crate::world::sdf::normalize(self.camera.forward())
+        let fwd = self.camera.forward();
+        if self.active_frame.rotated {
+            // Frame is inside a `Rotated45Y` subtree — apply T once
+            // (45° Y rotation + √2 XZ stretch) to map the world ray
+            // direction into frame-local coords so the existing
+            // cartesian DDA walks the rotated subtree correctly.
+            let t = [fwd[0] - fwd[2], fwd[1], fwd[0] + fwd[2]];
+            crate::world::sdf::normalize(t)
+        } else {
+            crate::world::sdf::normalize(fwd)
+        }
     }
 
     /// Interaction distance cap in the given frame's local units.

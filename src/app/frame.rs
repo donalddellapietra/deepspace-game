@@ -31,6 +31,14 @@ pub struct ActiveFrame {
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
+    /// `true` when the frame root is inside (or at) a `Rotated45Y`
+    /// subtree — the camera's anchor path crossed such a node on the
+    /// way down. The renderer / CPU raycast transform the ray by the
+    /// frame's rotation once at the boundary and then run ordinary
+    /// cartesian code in the rotated local frame. Propagates through
+    /// cartesian descendants of a rotated node the same way
+    /// `SphereFrame` carries face bounds through its descendants.
+    pub rotated: bool,
 }
 
 /// Build a `Path` from the slot prefix the GPU ribbon walker
@@ -66,6 +74,10 @@ pub fn compute_render_frame(
         }
         _ => ActiveFrameKind::Cartesian,
     };
+    // Flips true once the descent crosses a Rotated45Y node and stays
+    // true through all cartesian descendants — the rotation applies
+    // to the entire frame below that boundary.
+    let mut rotated = false;
     for k in 0..target.depth() as usize {
         // If we've already landed on a WrappedPlane node, stop —
         // the slab root IS the render frame.
@@ -83,9 +95,17 @@ pub fn compute_render_frame(
                         kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
                         break;
                     }
-                    // TangentBlock and Rotated45Y behave like Cartesian
-                    // for descent — their transform is applied only in
-                    // the shader when the ray enters the subtree.
+                    // Rotated45Y: descent continues like Cartesian, but
+                    // flag the frame so the renderer / raycast apply
+                    // the rotation transform once at the frame
+                    // boundary. Deeper cartesian children inherit the
+                    // flag — rotation accumulates with the frame, not
+                    // re-applied per level.
+                    if matches!(child_node.kind, NodeKind::Rotated45Y) {
+                        rotated = true;
+                    }
+                    // TangentBlock behaves like Cartesian for descent
+                    // — its transform is applied only in the shader.
                 }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
@@ -96,6 +116,7 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
+        rotated,
     }
 }
 
@@ -127,6 +148,7 @@ pub fn with_render_margin(
         logical_path: logical.logical_path,
         node_id: render.node_id,
         kind: render.kind,
+        rotated: render.rotated,
     }
 }
 

@@ -46,12 +46,15 @@ struct Uniforms {
     /// when zero, there are no EntityRef cells in the tree either,
     /// so the branch is never taken.
     entity_count: u32,
-    // Pad to the next vec4 boundary with scalar u32s. WGSL's
-    // `vec3<u32>` has 16-byte alignment that would force 12 bytes
-    // of skew-pad BEFORE this field, which doesn't match the CPU-
-    // side `[u32; 3]` layout we mirror; scalars are 4-byte aligned
-    // and land byte-for-byte on top of the Rust struct.
-    _pad_entities_0: u32,
+    /// `1` when the render frame root is inside a `Rotated45Y`
+    /// subtree. `shade_pixel` applies the 45° Y + √2 XZ-stretch
+    /// transform to the ray once before calling `march()` so the
+    /// existing cartesian walker runs unchanged on the transformed
+    /// ray. Lives in the `entity_count` pad slot to preserve layout.
+    root_rotated: u32,
+    // Pad to the next vec4 boundary. WGSL's `vec3<u32>` has 16-byte
+    // alignment that would force 12 bytes of skew-pad before the
+    // next field; scalar pads are 4-byte aligned and match the CPU.
     _pad_entities_1: u32,
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,

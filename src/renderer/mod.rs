@@ -73,7 +73,14 @@ pub struct GpuUniforms {
     /// Shader's tag=3 dispatch uses it as a validity gate; zero
     /// means the entity path is inert.
     pub entity_count: u32,
-    pub _pad_entity: [u32; 3],
+    /// `1` when the render frame root is inside (or is) a
+    /// `NodeKind::Rotated45Y` subtree. Shader applies the 45° Y
+    /// rotation + √2 XZ stretch to the ray once at entry so the
+    /// existing `march_cartesian` runs unchanged on the transformed
+    /// ray. Stays in `Uniforms`'s padding slot to avoid re-laying out
+    /// the rest of the struct.
+    pub root_rotated: u32,
+    pub _pad_entity: [u32; 2],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
     /// Padding slot retained so the CPU-side `GpuUniforms` matches
@@ -167,6 +174,13 @@ pub struct Renderer {
     /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
     /// shader's X-wrap branch reads the X and W lanes.
     pub(super) slab_dims: [u32; 4],
+    /// `1` when the active render frame is inside a `Rotated45Y`
+    /// subtree. The shader applies the 45° Y rotation + √2 XZ
+    /// stretch to the ray once at frame entry, then runs ordinary
+    /// cartesian DDA in the rotated local frame. Composes with
+    /// `root_kind` — rotation is independent of WrappedPlane vs
+    /// plain Cartesian.
+    pub(super) root_rotated: u32,
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -341,6 +355,18 @@ impl Renderer {
     pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_WRAPPED_PLANE;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
+        self.write_uniforms();
+    }
+
+    /// Flag the current frame as rotated (frame root is inside a
+    /// `NodeKind::Rotated45Y` subtree). Shader applies the 45° Y
+    /// + √2 XZ-stretch transform to the ray once at entry. Doesn't
+    /// touch the kind discriminant — rotation composes with the
+    /// cartesian root kind.
+    pub fn set_root_rotated(&mut self, rotated: bool) {
+        let flag = if rotated { 1 } else { 0 };
+        if self.root_rotated == flag { return; }
+        self.root_rotated = flag;
         self.write_uniforms();
     }
 

@@ -98,6 +98,7 @@ impl App {
                 logical_path,
                 node_id: render.node_id,
                 kind: render.kind,
+                rotated: render.rotated,
             };
         }
         if self.startup_profile_frames < 4 {
