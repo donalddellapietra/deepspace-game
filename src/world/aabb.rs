@@ -98,36 +98,9 @@ pub fn hit_aabb_body_local(library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [
             ];
             return bounding_box(&corners);
         }
-        // Legacy sub-frame Jacobian path — retained for
-        // `cs_raycast_local` (SphereSub) hits which don't populate
-        // ratios. Scheduled for removal with SphereSub cleanup.
-        if cell.sub_local_size > 0.0 {
-            let lo = cell.sub_local_lo;
-            let sz = cell.sub_local_size;
-            let c = cell.sub_c_body;
-            let j = cell.sub_j_cols;
-            let pt = |u_l: f32, v_l: f32, r_l: f32| -> [f32; 3] {
-                [
-                    c[0] + j[0][0] * u_l + j[1][0] * v_l + j[2][0] * r_l,
-                    c[1] + j[0][1] * u_l + j[1][1] * v_l + j[2][1] * r_l,
-                    c[2] + j[0][2] * u_l + j[1][2] * v_l + j[2][2] * r_l,
-                ]
-            };
-            let corners = [
-                pt(lo[0],      lo[1],      lo[2]),
-                pt(lo[0] + sz, lo[1],      lo[2]),
-                pt(lo[0],      lo[1] + sz, lo[2]),
-                pt(lo[0] + sz, lo[1] + sz, lo[2]),
-                pt(lo[0],      lo[1],      lo[2] + sz),
-                pt(lo[0] + sz, lo[1],      lo[2] + sz),
-                pt(lo[0],      lo[1] + sz, lo[2] + sz),
-                pt(lo[0] + sz, lo[1] + sz, lo[2] + sz),
-            ];
-            return bounding_box(&corners);
-        }
         // Very old body-march fallback: absolute face-normalized f32
-        // corners. Only reached if neither ratios nor sub-frame
-        // Jacobian populated — shouldn't happen in practice.
+        // corners. Only reached if ratios aren't populated —
+        // shouldn't happen in practice.
         let face = Face::from_index(cell.face as u8);
         let u0 = cell.u_lo;
         let v0 = cell.v_lo;

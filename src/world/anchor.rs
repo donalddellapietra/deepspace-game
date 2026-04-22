@@ -169,7 +169,6 @@ impl std::fmt::Debug for Path {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     None,
-    SphereEntry { body_path: Path },
     SphereExit { body_path: Path },
     FaceEntry { body_path: Path },
     FaceExit { body_path: Path },
@@ -645,39 +644,6 @@ impl WorldPos {
         Transition::None
     }
 
-    /// Return cam_local ∈ [0, 3)³ in the SphereSub frame's local
-    /// coords. `sub` must share the camera's face and be at or
-    /// shallower than the camera's current uvr_path depth (the
-    /// common runtime case — render_margin makes the sub-frame
-    /// slightly shallower than the edit-anchor).
-    ///
-    /// Purely symbolic: the camera's uvr_offset is zoomed-out by the
-    /// excess uvr_path levels not covered by the sub-frame, producing
-    /// a [0, 1)³ local position inside the sub-frame, then scaled to
-    /// [0, 3)³. No body-XYZ subtraction. Precision stays ~1e-7 of the
-    /// deepest cell at any depth.
-    pub fn in_sub_frame(
-        &self,
-        sub: &crate::app::frame::SphereSubFrame,
-    ) -> [f32; 3] {
-        let sphere = self.sphere.as_ref().expect("in_sub_frame: camera not in a sphere");
-        debug_assert_eq!(sphere.face, sub.face);
-        let m_sub = sub.depth_levels() as usize;
-        let m_cam = sphere.uvr_path.depth() as usize;
-        debug_assert!(m_cam >= m_sub, "camera uvr depth {} < sub-frame depth {}", m_cam, m_sub);
-        // Start at [0, 1)³ inside the camera's deepest uvr cell.
-        // Zoom out (m_cam - m_sub) levels, each step adding the
-        // slot-coord offset and dividing by 3.
-        let mut local = sphere.uvr_offset;
-        for k in (m_sub..m_cam).rev() {
-            let slot = sphere.uvr_path.slot(k);
-            let (us, vs, rs) = slot_coords(slot as usize);
-            local[0] = (local[0] + us as f32) / 3.0;
-            local[1] = (local[1] + vs as f32) / 3.0;
-            local[2] = (local[2] + rs as f32) / 3.0;
-        }
-        [local[0] * 3.0, local[1] * 3.0, local[2] * 3.0]
-    }
 }
 
 // --------------------------------------------------------------- tests

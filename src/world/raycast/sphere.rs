@@ -508,10 +508,6 @@ pub(super) fn cs_raycast(
                     ratio_v: w.ratio_v,
                     ratio_r: w.ratio_r,
                     ratio_depth: w.ratio_depth,
-                    sub_c_body: [0.0; 3],
-                    sub_j_cols: [[0.0; 3]; 3],
-                    sub_local_lo: [0.0; 3],
-                    sub_local_size: 0.0,
                 }),
             });
         }

@@ -832,59 +832,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         // containing body, and we handle it as BODY.
         let cur_kind = node_kinds[current_idx].kind;
         var r: HitResult;
-        if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_SPHERE_SUB {
-            // Initial frame is a deep face-subtree cell. The GPU
-            // camera upload pre-multiplies the camera basis
-            // (forward/right/up) by J_inv on the CPU
-            // (`gpu_camera_for_frame` in src/app/mod.rs → the
-            // SphereSub branch), so `ray_dir` arriving here is in
-            // SUB-FRAME LOCAL coords (magnitude O(3^m)), not
-            // body-XYZ. `sphere_in_sub_frame` needs BOTH:
-            //
-            //   ray_dir_local = ray_dir (already O(3^m))
-            //   rd_body       = J_cur · ray_dir_local  (O(1))
-            //
-            // We reconstruct rd_body ONCE here at the dispatch site
-            // rather than inside the function so the per-ray DDA loop
-            // doesn't repeat an O(3^m) * O(1/3^m) product that can
-            // cancel catastrophically if ray_dir_local is nearly
-            // aligned with a null direction of J. Done once per ray,
-            // the f32 error is ~1e-7 relative — acceptable and
-            // bounded.
-            //
-            // `current_idx` is the face-root BFS index; the function
-            // pre-descends along `uniforms.sub_uvr_slots` before the
-            // intra-cell DDA. Local-coord DDA preserves f32 precision
-            // at arbitrary face-subtree depth.
-            var j_cur: Mat3Columns;
-            j_cur.col_u = uniforms.sub_j_col0.xyz;
-            j_cur.col_v = uniforms.sub_j_col1.xyz;
-            j_cur.col_r = uniforms.sub_j_col2.xyz;
-            let rd_body_recovered = mat3_mul_vec_shader(j_cur, ray_dir);
-            r = sphere_in_sub_frame(
-                current_idx, ray_origin, ray_dir,
-                rd_body_recovered, uniforms.max_depth,
-            );
-            // sphere_in_sub_frame's result is authoritative for the
-            // face subtree. On miss, don't ribbon-pop: the next pop
-            // target (the face root) would get march_cartesian run
-            // on it, which treats UVR slots as Cartesian XYZ and
-            // produces visible artifacts (misoriented palette blocks
-            // on diagonal lines at grazing rays). Force a sky return.
-            if r.hit {
-                r.frame_level = ribbon_level;
-                r.frame_scale = cur_scale;
-                return r;
-            }
-            var sky_result: HitResult;
-            sky_result.hit = false;
-            sky_result.t = 1e20;
-            sky_result.frame_level = ribbon_level;
-            sky_result.frame_scale = cur_scale;
-            sky_result.cell_min = vec3<f32>(0.0);
-            sky_result.cell_size = 1.0;
-            return sky_result;
-        } else if cur_kind == 1u {
+        if cur_kind == 1u {
             // Body: whole-sphere march, body fills [0, 3)³.
             r = sphere_in_cell(
                 current_idx, vec3<f32>(0.0), 3.0,

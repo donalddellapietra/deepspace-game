@@ -47,16 +47,6 @@ pub const MAX_RIBBON_LEN: usize = 64;
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_BODY: u32 = 1;
 pub const ROOT_KIND_FACE: u32 = 2;
-/// Face-subtree render frame at face-subtree depth ≥ 3 — shader
-/// dispatches the linearized local-frame sphere DDA in
-/// `sphere_in_sub_frame`.
-pub const ROOT_KIND_SPHERE_SUB: u32 = 3;
-
-/// Max UVR pre-descent depth supported by the shader's SphereSub
-/// walker. Each slot is packed as u32 (1 per 16-byte uniform array
-/// element to keep std140/uniform alignment simple); tighten to a
-/// u8-packed layout later if the uniform budget becomes a concern.
-pub const MAX_SPHERE_SUB_DEPTH: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -89,33 +79,6 @@ pub struct GpuUniforms {
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_face_pop_pos: [f32; 4],
-
-    // ───────── SphereSub fields (iff root_kind == 3) ─────────
-    /// Body-XYZ of local (0, 0, 0) — sub-frame corner. xyz used.
-    pub sub_c_body: [f32; 4],
-    /// Jacobian columns. xyz used.
-    pub sub_j_col0: [f32; 4],
-    pub sub_j_col1: [f32; 4],
-    pub sub_j_col2: [f32; 4],
-    /// Inverse Jacobian columns. xyz used.
-    pub sub_j_inv_col0: [f32; 4],
-    pub sub_j_inv_col1: [f32; 4],
-    pub sub_j_inv_col2: [f32; 4],
-    /// xyzw = (un_corner, vn_corner, rn_corner, frame_size).
-    pub sub_face_corner: [f32; 4],
-    /// x = face index (0..5), y = UVR pre-descent prefix length
-    /// (number of valid entries in `sub_uvr_slots`),
-    /// z = face-root depth (= `body_path.depth() + 1` — the minimum
-    /// prefix length before a neighbor-step bubble-up becomes a
-    /// cross-face transition; the shader terminates the sphere-sub
-    /// DDA rather than attempting the cross-face math, which is
-    /// deferred to a follow-up commit), w = pad.
-    pub sub_meta: [u32; 4],
-    /// UVR slots the shader walker pre-descends from the face-root
-    /// before starting intra-cell DDA. Only `sub_meta.y` entries are
-    /// valid; the rest are zero. One u32 per slot keeps the std140
-    /// alignment trivial (16-byte stride via `[u32; 4]` rows).
-    pub sub_uvr_slots: [[u32; 4]; MAX_SPHERE_SUB_DEPTH / 4],
 }
 
 pub struct Renderer {
@@ -172,16 +135,6 @@ pub struct Renderer {
     pub(super) root_face_meta: [u32; 4],
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
-    pub(super) sub_c_body: [f32; 4],
-    pub(super) sub_j_col0: [f32; 4],
-    pub(super) sub_j_col1: [f32; 4],
-    pub(super) sub_j_col2: [f32; 4],
-    pub(super) sub_j_inv_col0: [f32; 4],
-    pub(super) sub_j_inv_col1: [f32; 4],
-    pub(super) sub_j_inv_col2: [f32; 4],
-    pub(super) sub_face_corner: [f32; 4],
-    pub(super) sub_meta: [u32; 4],
-    pub(super) sub_uvr_slots: [[u32; 4]; MAX_SPHERE_SUB_DEPTH / 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -324,7 +277,6 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
-        self.clear_sub_fields();
         self.write_uniforms();
     }
 
@@ -336,7 +288,6 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
-        self.clear_sub_fields();
         self.write_uniforms();
     }
 
@@ -355,71 +306,7 @@ impl Renderer {
         self.root_face_meta = [face_id, 0, 0, 0];
         self.root_face_bounds = bounds;
         self.root_face_pop_pos = [0.0; 4];
-        self.clear_sub_fields();
         self.write_uniforms();
-    }
-
-    /// Frame root is a deep face-subtree cell — shader dispatches
-    /// the linearized local-frame sphere DDA (`sphere_in_sub_frame`).
-    ///
-    /// `corner_and_size = (un, vn, rn, frame_size)` in face-normalized
-    /// absolute coords. `c_body` is the body-XYZ of local (0,0,0).
-    /// `j` is the local→body Jacobian (columns are ∂body/∂{u_l, v_l,
-    /// r_l}); `j_inv` is its inverse. `uvr_prefix_slots` carries the
-    /// UVR slots the shader walker pre-descends from the face-root
-    /// (`set_frame_root` already points `root_index` at the face-root
-    /// BFS index). Length is capped at `MAX_SPHERE_SUB_DEPTH`;
-    /// callers pass the actual prefix (typically much shorter).
-    /// `face_root_depth` = `body_path.depth() + 1` — the minimum UVR
-    /// prefix length before a neighbor-step bubble-up becomes a
-    /// cross-face transition (terminate threshold for the shader).
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_root_kind_sphere_sub(
-        &mut self,
-        inner_r: f32,
-        outer_r: f32,
-        face_id: u32,
-        corner_and_size: [f32; 4],
-        c_body: [f32; 3],
-        j: [[f32; 3]; 3],
-        j_inv: [[f32; 3]; 3],
-        uvr_prefix_slots: &[u8],
-        face_root_depth: u32,
-    ) {
-        self.root_kind = ROOT_KIND_SPHERE_SUB;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.sub_c_body = [c_body[0], c_body[1], c_body[2], 0.0];
-        self.sub_j_col0 = [j[0][0], j[0][1], j[0][2], 0.0];
-        self.sub_j_col1 = [j[1][0], j[1][1], j[1][2], 0.0];
-        self.sub_j_col2 = [j[2][0], j[2][1], j[2][2], 0.0];
-        self.sub_j_inv_col0 = [j_inv[0][0], j_inv[0][1], j_inv[0][2], 0.0];
-        self.sub_j_inv_col1 = [j_inv[1][0], j_inv[1][1], j_inv[1][2], 0.0];
-        self.sub_j_inv_col2 = [j_inv[2][0], j_inv[2][1], j_inv[2][2], 0.0];
-        self.sub_face_corner = corner_and_size;
-        let prefix_len = uvr_prefix_slots.len().min(MAX_SPHERE_SUB_DEPTH);
-        self.sub_meta = [face_id, prefix_len as u32, face_root_depth, 0];
-        let mut slots = [[0u32; 4]; MAX_SPHERE_SUB_DEPTH / 4];
-        for (i, &slot) in uvr_prefix_slots.iter().take(prefix_len).enumerate() {
-            slots[i / 4][i % 4] = slot as u32;
-        }
-        self.sub_uvr_slots = slots;
-        self.write_uniforms();
-    }
-
-    fn clear_sub_fields(&mut self) {
-        self.sub_c_body = [0.0; 4];
-        self.sub_j_col0 = [0.0; 4];
-        self.sub_j_col1 = [0.0; 4];
-        self.sub_j_col2 = [0.0; 4];
-        self.sub_j_inv_col0 = [0.0; 4];
-        self.sub_j_inv_col1 = [0.0; 4];
-        self.sub_j_inv_col2 = [0.0; 4];
-        self.sub_face_corner = [0.0; 4];
-        self.sub_meta = [0; 4];
-        self.sub_uvr_slots = [[0; 4]; MAX_SPHERE_SUB_DEPTH / 4];
     }
 
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {

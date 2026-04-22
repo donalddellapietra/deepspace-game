@@ -9,7 +9,6 @@
 
 mod cartesian;
 mod sphere;
-mod sphere_sub;
 
 pub use sphere::{FaceWindow, LodParams};
 
@@ -54,16 +53,6 @@ pub struct SphereHitCell {
     pub ratio_v: i64,
     pub ratio_r: i64,
     pub ratio_depth: u8,
-    /// Precision-preserving linearization context — populated by
-    /// `cs_raycast_local` (SphereSub hits), left as the zero/default
-    /// sentinel by `cs_raycast`. Legacy escape hatch for the
-    /// abandoned sub-frame path; superseded by `ratio_*` for body-
-    /// march hits and scheduled for removal with the SphereSub
-    /// cleanup.
-    pub sub_c_body: [f32; 3],
-    pub sub_j_cols: [[f32; 3]; 3],
-    pub sub_local_lo: [f32; 3],
-    pub sub_local_size: f32,
 }
 
 /// Information about a ray hit in the tree.
@@ -184,61 +173,8 @@ pub fn cpu_raycast_in_frame(
     }
 }
 
-/// Frame-aware raycast for a deep face-subtree render frame
-/// (`ActiveFrameKind::SphereSub`). Delegates to the local-frame DDA
-/// in `sphere_sub.rs`, which preserves f32 precision at arbitrary
-/// face-subtree depth via a Jacobian-based ribbon-pop.
-///
-/// `cam_body` and `ray_dir_body` are the camera / ray in the body
-/// cell's local `[0, 3)³` frame. The sub-frame DDA transforms them
-/// into its own local `[0, 3)³` on entry via `J_inv`.
-pub fn cpu_raycast_in_sub_frame(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    sub: &crate::app::frame::SphereSubFrame,
-    render_path: &[u8],
-    cam_local: [f32; 3],
-    ray_dir_body: [f32; 3],
-    edit_depth: u32,
-    lod: LodParams,
-) -> Option<HitInfo> {
-    // Build the ancestor chain up to (and including the slot entry
-    // FOR) the face-root. `render_path` = body_path + face_slot +
-    // UVR descent; the UVR tail may traverse `Child::Empty` links
-    // (dug regions), so we must not `build_frame_chain` through it
-    // — that chain would terminate at the first broken link and
-    // silently corrupt ancestor indexing.
-    //
-    // `body_path.depth() + 1` is the exact length of the guaranteed-
-    // resolvable prefix (body Cartesian chain + the face-root slot).
-    let ancestor_len = sub.body_path.depth() as usize + 1;
-    let ancestor_slots: &[u8] = if render_path.len() >= ancestor_len {
-        &render_path[..ancestor_len]
-    } else {
-        render_path
-    };
-    let (_chain, frame_entries) = build_frame_chain(library, world_root, ancestor_slots);
-    if frame_entries.len() != ancestor_slots.len() {
-        // Body / face-root slot didn't resolve to a real Node chain.
-        // Shouldn't happen for a valid SphereSub frame; bail out.
-        return None;
-    }
-    let total_depth = render_path.len() as u32;
-    // walker_limit == 0 is legitimate (user's edit anchor at the
-    // sub-frame's exact depth): the walker returns the deep cell's
-    // content via uniform_type inspection without descending further.
-    // Neighbor transitions within cs_raycast_local handle cross-cell
-    // traversal regardless of walker_limit.
-    let walker_limit = edit_depth.saturating_sub(total_depth);
-    sphere_sub::cs_raycast_local(
-        library, sub, &frame_entries,
-        cam_local, ray_dir_body,
-        walker_limit, lod,
-    )
-}
-
 /// DEPRECATED: the old face-window path; kept temporarily while
-/// callers migrate. New callers should use `cpu_raycast_in_sub_frame`.
+/// callers migrate.
 pub fn cpu_raycast_in_sphere_frame(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -538,148 +474,6 @@ mod tests {
         let root = lib.insert(root_children);
         lib.ref_inc(root);
         (lib, root)
-    }
-
-    /// Drive the full pipeline — compute_render_frame → in_sub_frame →
-    /// cpu_raycast_in_sub_frame — at the given `sub_depth`. Returns
-    /// whether a hit was produced.
-    fn run_full_pipeline_at_depth(
-        lib: &crate::world::tree::NodeLibrary,
-        root: crate::world::tree::NodeId,
-        face: crate::world::cubesphere::Face,
-        sub_depth: u8,
-    ) -> bool {
-        use crate::app::frame::{compute_render_frame, ActiveFrameKind};
-        use crate::world::anchor::{Path, SphereState, WorldPos};
-        use crate::world::tree::slot_index;
-
-        let body_path = {
-            let mut p = Path::root();
-            p.push(slot_index(1, 1, 1) as u8);
-            p
-        };
-        let mut uvr_path = Path::root();
-        for _ in 0..sub_depth {
-            uvr_path.push(slot_index(1, 1, 1) as u8);
-        }
-        let camera = WorldPos {
-            anchor: body_path,
-            offset: [0.5; 3],
-            sphere: Some(SphereState {
-                body_path,
-                inner_r: 0.12,
-                outer_r: 0.45,
-                face,
-                uvr_path,
-                uvr_offset: [0.5; 3],
-            }),
-        };
-        let total_depth = body_path.depth() + 1 + sub_depth;
-        // Render-margin of 3 matches runtime: render sits 3 levels
-        // shallower than edit anchor. Caller guarantees sub_depth
-        // is large enough that render_depth still leaves
-        // ≥ MIN_SPHERE_SUB_DEPTH UVR levels under the face root.
-        let render_depth = total_depth - 3;
-        let active = compute_render_frame(lib, root, &camera, render_depth);
-        let sub = match active.kind {
-            ActiveFrameKind::SphereSub(s) => s,
-            _ => return false,
-        };
-        let cam_local = camera.in_sub_frame(&sub);
-        let rd_body = crate::world::sdf::scale(
-            crate::world::sdf::normalize([sub.j[2][0], sub.j[2][1], sub.j[2][2]]),
-            -1.0,
-        );
-        cpu_raycast_in_sub_frame(
-            lib, root, &sub,
-            active.render_path.as_slice(),
-            cam_local, rd_body,
-            total_depth as u32,
-            super::LodParams::fixed_max(),
-        ).is_some()
-    }
-
-    #[test]
-    fn sphere_sub_full_pipeline_synthetic_sweep() {
-        // Full pipeline on a synthetic uniform-solid world across
-        // UVR depths 6..=30. ANY miss means a pipeline precision
-        // bug (not a worldgen content question) — the world has no
-        // empty cells inside the face subtree. Sub-depths below 6
-        // are excluded because the render_margin of 3 leaves
-        // < MIN_SPHERE_SUB_DEPTH UVR levels, and compute_render_frame
-        // falls back to Body (tested elsewhere).
-        for sub_depth in [6u8, 7, 8, 10, 12, 15, 18, 20, 22, 25, 28, 30] {
-            let (lib, root) = build_solid_sphere_world(sub_depth);
-            assert!(
-                run_full_pipeline_at_depth(
-                    &lib, root, crate::world::cubesphere::Face::PosY, sub_depth,
-                ),
-                "full-pipeline synthetic sweep missed at sub_depth={sub_depth}",
-            );
-        }
-    }
-
-    #[test]
-    fn sphere_sub_full_pipeline_demo_planet_depth_25() {
-        // Full pipeline on the real demo planet at UVR depth 25 —
-        // deep enough to stress sphere-geometry precision (the real
-        // `body_point_to_face_space` / Jacobian path), but within the
-        // demo planet's tree depth (28).
-        use crate::app::frame::{compute_render_frame, ActiveFrameKind};
-        use crate::world::anchor::{Path, SphereState, WorldPos};
-        use crate::world::bootstrap;
-        use crate::world::cubesphere::Face;
-        use crate::world::tree::slot_index;
-
-        let world = bootstrap::bootstrap_world(
-            bootstrap::WorldPreset::DemoSphere,
-            Some(40),
-        ).world;
-
-        let sub_depth = 25u8;
-        let body_path = {
-            let mut p = Path::root();
-            p.push(slot_index(1, 1, 1) as u8);
-            p
-        };
-        let mut uvr_path = Path::root();
-        for _ in 0..sub_depth {
-            uvr_path.push(slot_index(1, 1, 1) as u8);
-        }
-        let camera = WorldPos {
-            anchor: body_path,
-            offset: [0.5; 3],
-            sphere: Some(SphereState {
-                body_path,
-                inner_r: 0.12,
-                outer_r: 0.45,
-                face: Face::PosY,
-                uvr_path,
-                uvr_offset: [0.5; 3],
-            }),
-        };
-        let total_depth = body_path.depth() + 1 + sub_depth;
-        let render_depth = total_depth - 3;
-        let active = compute_render_frame(
-            &world.library, world.root, &camera, render_depth,
-        );
-        let sub = match active.kind {
-            ActiveFrameKind::SphereSub(s) => s,
-            k => panic!("expected SphereSub at depth 25, got {k:?}"),
-        };
-        let cam_local = camera.in_sub_frame(&sub);
-        let rd_body = crate::world::sdf::scale(
-            crate::world::sdf::normalize([sub.j[2][0], sub.j[2][1], sub.j[2][2]]),
-            -1.0,
-        );
-        let hit = cpu_raycast_in_sub_frame(
-            &world.library, world.root, &sub,
-            active.render_path.as_slice(),
-            cam_local, rd_body,
-            total_depth as u32,
-            LodParams::fixed_max(),
-        );
-        assert!(hit.is_some(), "demo-planet depth-25 missed");
     }
 
     #[test]

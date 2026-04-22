@@ -68,32 +68,6 @@ impl App {
             lod_threshold: self.lod_pixel_threshold.max(1e-3),
         };
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            ActiveFrameKind::SphereSub(sub) => {
-                // `cam_local` comes from the camera's SYMBOLIC UVR
-                // state — `in_sub_frame` returns `uvr_offset * 3`
-                // directly, no body-XYZ subtraction. This is what
-                // preserves f32 precision past the body-march wall.
-                let cam_local = self.camera.position.in_sub_frame(&sub);
-                let ray_dir_body = self.ray_dir_in_frame(&sub.body_path);
-                let render_path = sub.render_path;
-                eprintln!(
-                    "SUB_RAYCAST render_path={:?} cam_local={:?} rd_body={:?} edit_depth={} sub_depth_levels={}",
-                    render_path.as_slice(), cam_local, ray_dir_body,
-                    self.edit_depth(), sub.depth_levels(),
-                );
-                let hit = raycast::cpu_raycast_in_sub_frame(
-                    &self.world.library,
-                    self.world.root,
-                    &sub,
-                    render_path.as_slice(),
-                    cam_local,
-                    ray_dir_body,
-                    self.edit_depth(),
-                    lod,
-                );
-                eprintln!("SUB_RAYCAST_RESULT hit_some={}", hit.is_some());
-                (hit, sub.body_path)
-            }
             ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
                 // Raycast from the render frame — f32 can only
                 // represent positions a few levels deeper than the

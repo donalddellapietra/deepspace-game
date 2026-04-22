@@ -58,33 +58,11 @@ struct Uniforms {
     root_face_meta: vec4<u32>,
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
-
-    // ───────── SphereSub fields (iff root_kind == 3) ─────────
-    sub_c_body: vec4<f32>,
-    sub_j_col0: vec4<f32>,
-    sub_j_col1: vec4<f32>,
-    sub_j_col2: vec4<f32>,
-    sub_j_inv_col0: vec4<f32>,
-    sub_j_inv_col1: vec4<f32>,
-    sub_j_inv_col2: vec4<f32>,
-    sub_face_corner: vec4<f32>,
-    /// x = face index, y = UVR pre-descent prefix length,
-    /// z = face-root depth (= body_path.depth() + 1 — the minimum
-    /// `uvr_prefix_len` before a neighbor-step bubble-up becomes a
-    /// cross-face transition; used as the terminate-threshold by the
-    /// sphere-sub DDA), w = pad.
-    sub_meta: vec4<u32>,
-    /// UVR slots the shader walker pre-descends from the face-root
-    /// (root_index) before starting intra-cell DDA. Only the first
-    /// `sub_meta.y` entries across the whole array are valid.
-    /// Laid out as 16 × vec4<u32> to hit the std140 16-byte stride.
-    sub_uvr_slots: array<vec4<u32>, 16>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_BODY: u32 = 1u;
 const ROOT_KIND_FACE: u32 = 2u;
-const ROOT_KIND_SPHERE_SUB: u32 = 3u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
