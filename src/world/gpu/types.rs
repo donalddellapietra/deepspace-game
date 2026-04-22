@@ -63,9 +63,12 @@ impl GpuChild {
 /// same `node_index` used in `GpuChild::node_index`.
 ///
 /// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns cleanly.
-/// `kind` discriminant: 0 = Cartesian (the only variant today; the
-/// remaining fields are reserved for future coordinate-system plug-ins
-/// that piggyback on the Cartesian substrate).
+/// `kind` discriminant:
+/// - 0 = Cartesian: the standard slot-pick DDA arm.
+/// - 1 = CubedSphereBody: `inner_r` / `outer_r` carry the sphere
+///   shell radii in body cell-local `[0, 1)` units; `face` unused.
+/// - 2 = CubedSphereFace: `face` carries the face index (0..5) for
+///   the basis lookup; `inner_r` / `outer_r` unused.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -75,24 +78,34 @@ pub struct GpuNodeKind {
     pub outer_r: f32,
 }
 
+/// WGSL-side discriminant for [`GpuNodeKind::kind`]. Must stay in
+/// sync with `NODE_KIND_*` constants in `bindings.wgsl` — the shader
+/// switches on the u32 value.
+pub const GPU_NODE_KIND_CARTESIAN: u32 = 0;
+pub const GPU_NODE_KIND_CUBED_SPHERE_BODY: u32 = 1;
+pub const GPU_NODE_KIND_CUBED_SPHERE_FACE: u32 = 2;
+
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
-            // Stage 0b: the shader isn't sphere-aware yet (Stages 1-3
-            // wire the unified-DDA dispatch), so body/face kinds ride
-            // on the Cartesian GPU encoding for now. This keeps the
-            // ray-march output byte-identical for sphere-tagged nodes
-            // — they render as Cartesian subtrees, exactly what the
-            // existing shader expects. `inner_r` / `outer_r` / `face`
-            // are preserved in the CPU `NodeKind` and will be surfaced
-            // once the shader learns the new dispatch.
-            NodeKind::CubedSphereBody { .. } => {
-                Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 }
-            }
-            NodeKind::CubedSphereFace { .. } => {
-                Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 }
-            }
+            NodeKind::Cartesian => Self {
+                kind: GPU_NODE_KIND_CARTESIAN,
+                face: 0,
+                inner_r: 0.0,
+                outer_r: 0.0,
+            },
+            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
+                kind: GPU_NODE_KIND_CUBED_SPHERE_BODY,
+                face: 0,
+                inner_r,
+                outer_r,
+            },
+            NodeKind::CubedSphereFace { face } => Self {
+                kind: GPU_NODE_KIND_CUBED_SPHERE_FACE,
+                face: face as u32,
+                inner_r: 0.0,
+                outer_r: 0.0,
+            },
         }
     }
 }

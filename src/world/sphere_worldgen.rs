@@ -25,7 +25,7 @@
 //! wherever the body cell lives in the tree.
 
 use super::anchor::Path;
-use super::cubesphere::{Face, CORE_SLOT, FACE_SLOTS};
+use super::cubesphere::{face_space_to_body_point, Face, CORE_SLOT, FACE_SLOTS};
 use super::palette::block;
 use super::sdf::{Planet, Vec3};
 use super::tree::{
@@ -187,80 +187,97 @@ pub fn insert_spherical_body(
         }
     }
 
-    // Build one Cartesian subtree per body-cell slot. Each slot
-    // occupies a `1/3 x 1/3 x 1/3` sub-box of the body's local
-    // `[0, 1)³` frame, and that sub-box is SDF-carved directly.
+    // Build one face subtree per face. Each face subtree partitions
+    // face-normalized `(un, vn, rn) ∈ [0, 1]³` — NOT Cartesian body
+    // XYZ — so its slot index `(us, vs, rs)` maps to a wedge on the
+    // sphere shell. The shader's unified-DDA face walker interprets
+    // slots with these same UVR semantics, so content-placement and
+    // traversal agree.
     //
-    // Face-centre slots (6 of them) additionally get the face tag
-    // on their top node, so the camera pipeline recognises them as
-    // "inside a planet face" at `face_depth >= 1`.
+    // Slot = FACE_SLOTS[face] holds each face's subtree. CORE_SLOT
+    // holds a uniform core block (everything below `inner_r` renders
+    // as solid core). The remaining 20 slots stay empty.
     let mut body_children = empty_children();
-    for zs in 0..3 {
-        for ys in 0..3 {
-            for xs in 0..3 {
-                let slot = slot_index(xs, ys, zs);
-                let sub_min: Vec3 = [xs as f32 / 3.0, ys as f32 / 3.0, zs as f32 / 3.0];
-                let sub_max: Vec3 = [
-                    (xs + 1) as f32 / 3.0,
-                    (ys + 1) as f32 / 3.0,
-                    (zs + 1) as f32 / 3.0,
-                ];
-                let child = build_face_subtree(
-                    lib,
-                    sub_min,
-                    sub_max,
-                    depth,
-                    sdf_budget,
-                    sdf,
-                    &uniform_empty,
-                    &uniform_block,
-                );
-                let face_idx = FACE_SLOTS.iter().position(|&s| s == slot);
-                body_children[slot] = match face_idx {
-                    Some(fi) => tag_with_face(lib, child, Face::from_index(fi as u8)),
-                    None => child,
-                };
-            }
-        }
+    for face in Face::ALL {
+        let face_subtree = build_face_uvr_subtree(
+            lib,
+            face,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            inner_r,
+            outer_r,
+            depth,
+            sdf_budget,
+            sdf,
+            &uniform_empty,
+            &uniform_block,
+        );
+        body_children[FACE_SLOTS[face as usize]] = tag_with_face(lib, face_subtree, face);
     }
+    // Core subtree: uniform `core_block` at the full face depth.
+    body_children[CORE_SLOT] = uniform_block
+        .get(&sdf.core_block)
+        .and_then(|v| v.get(depth as usize).copied())
+        .unwrap_or_else(|| lib.build_uniform_subtree(sdf.core_block, depth));
 
     lib.insert_with_kind(body_children, NodeKind::CubedSphereBody { inner_r, outer_r })
 }
 
-/// Recursive builder for a Cartesian-sub-box SDF-carved subtree.
-/// Every recursion level samples the SDF at the sub-box's centre
-/// in the body's local `[0, 1)³` frame; cells entirely outside the
-/// planet SDF collapse to empty, cells entirely inside collapse to
-/// a uniform block subtree, and straddlers recurse until
-/// `sdf_budget` is exhausted.
+/// Recursive builder for a UVR-axis face subtree. The face subtree
+/// partitions face-normalized `(un, vn, rn) ∈ [0, 1]³` into 27 child
+/// wedges per level; each wedge samples the SDF at its center (mapped
+/// back to body-local coords via [`face_space_to_body_point`]) to
+/// decide whether to commit uniform / recurse further.
 ///
-/// Named `build_face_subtree` because every slot the body visits —
-/// face-centre or otherwise — feeds this routine to build its
-/// local Cartesian subtree; face-centre slots additionally get
-/// re-tagged by [`tag_with_face`] after this returns.
+/// The `sub_min` / `sub_max` arguments are the current level's bounds
+/// in face-normalized coords (`[0, 1]³`) — root call is `(0, 0, 0)`
+/// to `(1, 1, 1)` and each recursion step divides by 3 per axis.
+///
+/// The resulting tree has `NodeKind::Cartesian` on every internal
+/// node (shader reuses the Cartesian slot-pick for UVR cells because
+/// the walker rotates the ray into face-local coords at body entry,
+/// after which slot indices `(us, vs, rs)` already correspond to
+/// face-normalized `[0, 3)³` residual cells). Face axis semantics
+/// come from the shader's body-enter rotation, not from a per-face
+/// NodeKind on interior nodes.
 #[allow(clippy::too_many_arguments)]
-fn build_face_subtree(
+fn build_face_uvr_subtree(
     lib: &mut NodeLibrary,
-    sub_min: Vec3,
-    sub_max: Vec3,
+    face: Face,
+    sub_min: [f32; 3], // (un_min, vn_min, rn_min) ∈ [0, 1]
+    sub_max: [f32; 3], // (un_max, vn_max, rn_max) ∈ [0, 1]
+    inner_r: f32,
+    outer_r: f32,
     depth: u32,
     sdf_budget: u32,
     sdf: &Planet,
     uniform_empty: &[NodeId],
     uniform_block: &std::collections::HashMap<u16, Vec<Child>>,
 ) -> Child {
-    let center: Vec3 = [
-        0.5 * (sub_min[0] + sub_max[0]),
-        0.5 * (sub_min[1] + sub_max[1]),
-        0.5 * (sub_min[2] + sub_max[2]),
-    ];
-    let d_center = sdf.distance(center);
+    let un_c = 0.5 * (sub_min[0] + sub_max[0]);
+    let vn_c = 0.5 * (sub_min[1] + sub_max[1]);
+    let rn_c = 0.5 * (sub_min[2] + sub_max[2]);
+    let body_center =
+        face_space_to_body_point(face, un_c, vn_c, rn_c, inner_r, outer_r, 1.0);
+    let d_center = sdf.distance(body_center);
 
-    // Cell bounding-sphere radius = half the diagonal of the sub-box.
-    let hx = 0.5 * (sub_max[0] - sub_min[0]);
-    let hy = 0.5 * (sub_max[1] - sub_min[1]);
-    let hz = 0.5 * (sub_max[2] - sub_min[2]);
-    let cell_rad = (hx * hx + hy * hy + hz * hz).sqrt();
+    // Cell bounding-sphere radius in body-local units. Estimated as
+    // the max radial extent (a coarse overestimate — actual wedge
+    // shape is curved). The radial span is `(outer_r - inner_r) *
+    // (rs_max - rs_min)`; the angular span is at most the face
+    // width, which at equal-angle `[0, 1]` is ~π/2 * radius. For
+    // a conservative rad, use the full face-normalized diagonal
+    // scaled by `outer_r` (the maximum radius the wedge touches).
+    let hu = 0.5 * (sub_max[0] - sub_min[0]);
+    let hv = 0.5 * (sub_max[1] - sub_min[1]);
+    let hr = 0.5 * (sub_max[2] - sub_min[2]);
+    // Angular half-extent on the face (at worst the full `[0,1]`
+    // span maps to `π/2` equal-angle → cube ratio ~1 → body-local
+    // distance ~outer_r * √(hu² + hv²)). Radial: (outer_r - inner_r)
+    // * hr. Combine in quadrature.
+    let ang_rad = outer_r * ((hu * hu + hv * hv).sqrt());
+    let r_rad = (outer_r - inner_r) * hr;
+    let cell_rad = (ang_rad * ang_rad + r_rad * r_rad).sqrt();
 
     if d_center > cell_rad {
         if depth == 0 {
@@ -269,7 +286,7 @@ fn build_face_subtree(
         return Child::Node(uniform_empty[depth as usize]);
     }
     if d_center < -cell_rad {
-        let b = sdf.block_at(center);
+        let b = sdf.block_at(body_center);
         if depth == 0 {
             return Child::Block(b);
         }
@@ -281,14 +298,14 @@ fn build_face_subtree(
 
     if depth == 0 {
         return if d_center < 0.0 {
-            Child::Block(sdf.block_at(center))
+            Child::Block(sdf.block_at(body_center))
         } else {
             Child::Empty
         };
     }
     if sdf_budget == 0 {
         return if d_center < 0.0 {
-            let b = sdf.block_at(center);
+            let b = sdf.block_at(body_center);
             uniform_block
                 .get(&b)
                 .and_then(|v| v.get(depth as usize).copied())
@@ -299,22 +316,29 @@ fn build_face_subtree(
     }
 
     let mut children = empty_children();
-    let tx = (sub_max[0] - sub_min[0]) / 3.0;
-    let ty = (sub_max[1] - sub_min[1]) / 3.0;
-    let tz = (sub_max[2] - sub_min[2]) / 3.0;
-    for zs in 0..3 {
-        for ys in 0..3 {
-            for xs in 0..3 {
-                let cmin: Vec3 = [
-                    sub_min[0] + xs as f32 * tx,
-                    sub_min[1] + ys as f32 * ty,
-                    sub_min[2] + zs as f32 * tz,
+    let tu = (sub_max[0] - sub_min[0]) / 3.0;
+    let tv = (sub_max[1] - sub_min[1]) / 3.0;
+    let tr = (sub_max[2] - sub_min[2]) / 3.0;
+    // Slot axis mapping: (us, vs, rs) → (xs, ys, zs) in the 27-child
+    // slot grid. This is `slot_index(us, vs, rs)`. The shader's
+    // face-local DDA produces the same mapping because it walks in
+    // (x, y, z) = (u, v, r) face-local coords.
+    for rs in 0..3 {
+        for vs in 0..3 {
+            for us in 0..3 {
+                let cmin = [
+                    sub_min[0] + us as f32 * tu,
+                    sub_min[1] + vs as f32 * tv,
+                    sub_min[2] + rs as f32 * tr,
                 ];
-                let cmax: Vec3 = [cmin[0] + tx, cmin[1] + ty, cmin[2] + tz];
-                children[slot_index(xs, ys, zs)] = build_face_subtree(
+                let cmax = [cmin[0] + tu, cmin[1] + tv, cmin[2] + tr];
+                children[slot_index(us, vs, rs)] = build_face_uvr_subtree(
                     lib,
+                    face,
                     cmin,
                     cmax,
+                    inner_r,
+                    outer_r,
                     depth - 1,
                     sdf_budget - 1,
                     sdf,

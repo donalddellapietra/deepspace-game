@@ -86,8 +86,14 @@ mod tests {
         assert!(src.contains("@fragment"), "fs_main missing");
         assert!(src.contains("fn march("), "march missing");
         assert!(src.contains("fn unified_dda("), "unified_dda missing");
-        // Stage 1: march_cartesian kept as dead code; Stage 2 deletes it.
-        assert!(src.contains("fn march_cartesian("), "march_cartesian missing");
+        assert!(
+            src.contains("fn march_face_subtree("),
+            "Stage 2: march_face_subtree helper missing from unified_dda.wgsl",
+        );
+        assert!(
+            !src.contains("fn march_cartesian("),
+            "Stage 2: march_cartesian dead-code duplicate should be gone",
+        );
         assert!(src.contains("struct Uniforms"), "Uniforms missing");
         assert!(!src.contains("#include"), "directive leaked into output");
     }

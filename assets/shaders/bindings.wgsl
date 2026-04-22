@@ -79,11 +79,33 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0=Cartesian (sole variant today)
+    kind: u32,
     face: u32,
     inner_r: f32,
     outer_r: f32,
 }
+
+/// Shader-side discriminants for `NodeKindGpu.kind`. Must stay in
+/// sync with `GPU_NODE_KIND_*` constants in `src/world/gpu/types.rs`.
+const NODE_KIND_CARTESIAN: u32 = 0u;
+const NODE_KIND_CUBED_SPHERE_BODY: u32 = 1u;
+const NODE_KIND_CUBED_SPHERE_FACE: u32 = 2u;
+
+/// 27-slot indices where each face's subtree lives in a body cell.
+/// Indexed by face discriminant (0=PosX, 1=NegX, 2=PosY, 3=NegY,
+/// 4=PosZ, 5=NegZ). Mirrors `FACE_SLOTS` in `src/world/cubesphere`.
+const FACE_SLOTS: array<u32, 6> = array<u32, 6>(
+    14u, // PosX: slot(2,1,1)
+    12u, // NegX: slot(0,1,1)
+    16u, // PosY: slot(1,2,1)
+    10u, // NegY: slot(1,0,1)
+    22u, // PosZ: slot(1,1,2)
+    4u,  // NegZ: slot(1,1,0)
+);
+
+/// Center slot of a body cell — holds the core subtree beneath
+/// `inner_r`. `slot_index(1,1,1) = 13`.
+const CORE_SLOT: u32 = 13u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated
