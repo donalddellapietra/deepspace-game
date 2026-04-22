@@ -76,6 +76,17 @@ export interface DebugOverlayState {
   cameraLocal: [number, number, number];
   fov: number;
   nodeCount: number;
+  cameraRootXyz: [number, number, number];
+  anchorCellSizeRoot: number;
+  anchorSlotsCsv: string;
+  activeFrameKind: string;
+  renderPathCsv: string;
+  sphereState: string;
+  sphereDistCenter: number;
+  sphereDistOuter: number;
+  sphereDistInner: number;
+  sphereRadii: [number, number];
+  sphereDebugMode: number;
 }
 
 // Union of all state updates pushed from Rust

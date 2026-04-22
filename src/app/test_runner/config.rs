@@ -168,6 +168,15 @@ pub enum ScriptCmd {
     /// debug views where we want to see the pit walls from INSIDE
     /// rather than a sub-pixel view of the pit from the surface.
     TeleportIntoLastEdit,
+    /// Emit a rich `HARNESS_POS` line with the camera's full
+    /// positional state: root-frame XYZ, body-local XYZ (if inside a
+    /// body), anchor path/depth/cell size, distance to sphere
+    /// center / outer shell / inner shell (signed), sphere state,
+    /// active-frame kind, render path, and a probe_down hit path +
+    /// t. One-shot; intended for single-shot repro scripts so a
+    /// human reader can sanity-check the repro position without
+    /// digging through the per-frame log spam.
+    DumpPosition,
 }
 
 impl TestConfig {
@@ -419,6 +428,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
             if raw == "teleport_into_last_edit" { return Some(ScriptCmd::TeleportIntoLastEdit); }
+            if raw == "dump_position" { return Some(ScriptCmd::DumpPosition); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }

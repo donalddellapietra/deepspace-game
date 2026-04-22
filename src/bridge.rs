@@ -111,6 +111,45 @@ pub struct DebugOverlayStateJs {
     pub camera_local: [f32; 3],
     pub fov: f32,
     pub node_count: usize,
+    /// Camera position in root-frame world coords. `camera_local −
+    /// render_path_origin` transformed back to root. Lets a reader
+    /// read "I'm at (x, y, z) in the root cell" directly, without
+    /// knowing the render path.
+    pub camera_root_xyz: [f32; 3],
+    /// `3^−anchor_depth`. One anchor cell's width in root-frame
+    /// units. `camera_root_xyz[i] / anchor_cell_size_root` gives
+    /// the camera's position in anchor cells from the root origin.
+    pub anchor_cell_size_root: f32,
+    /// `[s0, s1, ...]` — the camera's anchor slot path. Rendered
+    /// as a short string in the overlay.
+    pub anchor_slots_csv: String,
+    /// `Cartesian` or `Body(ir, or)`.
+    pub active_frame_kind: String,
+    /// Render path (usually a prefix of the anchor). Empty when
+    /// rendering from root.
+    pub render_path_csv: String,
+    /// Sphere state summary. Empty when the camera is NOT sphere-
+    /// aware (`sphere=None`). Otherwise
+    /// `"face=N body_d=D uvr_d=D uvr_off=[..]"`.
+    pub sphere_state: String,
+    /// Signed distance from the sphere center to the camera, in
+    /// body-local units. Populated when the anchor path crosses a
+    /// `CubedSphereBody` node. `NaN` when no body on path.
+    pub sphere_dist_center: f32,
+    /// Signed distance from camera to the outer shell, body-local.
+    /// Positive = outside shell (above surface), negative = inside
+    /// crust. `NaN` when no body on path.
+    pub sphere_dist_outer: f32,
+    /// Signed distance from camera to the inner shell, body-local.
+    /// Positive = outside inner shell (inside crust or beyond),
+    /// negative = inside the hollow core. `NaN` otherwise.
+    pub sphere_dist_inner: f32,
+    /// Body radii `[inner_r, outer_r]` in body-local (`[0, 1)`-frame)
+    /// units. `[NaN, NaN]` when no body on path.
+    pub sphere_radii: [f32; 2],
+    /// Current sphere debug paint mode (0..=6). Mirrors the renderer
+    /// uniform; cycled by F6.
+    pub sphere_debug_mode: u32,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]

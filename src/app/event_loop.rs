@@ -378,6 +378,56 @@ impl App {
         if self.overlay_active() {
             self.poll_ui_commands();
             let camera_local = self.camera.position.in_frame(&self.active_frame.render_path);
+            let camera_root_xyz = self.camera.position.in_frame(&crate::world::anchor::Path::root());
+            let anchor_depth = self.camera.position.anchor.depth();
+            let anchor_cell_size_root = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
+            let anchor_slots_csv = self
+                .camera
+                .position
+                .anchor
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let active_frame_kind = match self.active_frame.kind {
+                crate::app::ActiveFrameKind::Cartesian => "Cartesian".to_string(),
+                crate::app::ActiveFrameKind::Body { inner_r, outer_r } => {
+                    format!("Body(ir={inner_r:.3},or={outer_r:.3})")
+                }
+            };
+            let render_path_csv = self
+                .active_frame
+                .render_path
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sphere_state = match &self.camera.position.sphere {
+                Some(s) => format!(
+                    "face={} body_d={} uvr_d={} uvr_off=[{:.4},{:.4},{:.4}]",
+                    s.face as u32,
+                    s.body_path.depth(),
+                    s.uvr_path.depth(),
+                    s.uvr_offset[0],
+                    s.uvr_offset[1],
+                    s.uvr_offset[2],
+                ),
+                None => String::new(),
+            };
+
+            // Sphere distances: walk the anchor path from root, find
+            // the first CubedSphereBody node, then compute camera
+            // body-local position and signed distances to its shells.
+            let (sphere_dist_center, sphere_dist_outer, sphere_dist_inner, sphere_radii) =
+                compute_sphere_distances(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position.anchor,
+                    camera_root_xyz,
+                );
+
             self.ui.push_to_overlay(&self.palette);
             crate::overlay::push_state(&crate::bridge::GameStateUpdate::DebugOverlay(
                 crate::bridge::DebugOverlayStateJs {
@@ -392,10 +442,21 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_anchor_depth: self.camera.position.anchor.depth() as u32,
+                    camera_anchor_depth: anchor_depth as u32,
                     camera_local,
                     fov: 1.2,
                     node_count: self.world.library.len(),
+                    camera_root_xyz,
+                    anchor_cell_size_root,
+                    anchor_slots_csv,
+                    active_frame_kind,
+                    render_path_csv,
+                    sphere_state,
+                    sphere_dist_center,
+                    sphere_dist_outer,
+                    sphere_dist_inner,
+                    sphere_radii,
+                    sphere_debug_mode: self.sphere_debug_mode,
                 },
             ));
         }
@@ -689,4 +750,85 @@ fn wasm_canvas_setup(
         resize_cb.as_ref().unchecked_ref(),
     );
     resize_cb.forget();
+}
+
+/// Given the camera's anchor path + its root-frame XYZ position,
+/// find the first `CubedSphereBody` on the anchor path and compute
+/// signed distances from the camera to that body's shells. Returns
+/// `(dist_center, dist_outer, dist_inner, [inner_r, outer_r])` in
+/// BODY-LOCAL units (where the body's own cell frame is `[0, 3)³`
+/// with center at `1.5` and shell radii scaled by `3`).
+///
+/// Returns `NaN` sentinels when the anchor path never touches a
+/// body — the UI treats these as "no sphere context, hide stat".
+fn compute_sphere_distances(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    anchor: &crate::world::anchor::Path,
+    camera_root_xyz: [f32; 3],
+) -> (f32, f32, f32, [f32; 2]) {
+    use crate::world::tree::{Child, NodeKind};
+    let nan = f32::NAN;
+    let miss = (nan, nan, nan, [nan, nan]);
+
+    let mut node = world_root;
+    let mut body_depth: Option<(u32, f32, f32)> = None;
+    let mut cell_origin = [0.0f32; 3];
+    let mut cell_size = crate::world::anchor::WORLD_SIZE;
+
+    // Walk from root. At each step, check the CURRENT node before
+    // stepping into its child — a root that IS itself a body is
+    // unusual but handled.
+    {
+        let Some(n) = library.get(node) else { return miss };
+        if let NodeKind::CubedSphereBody { inner_r, outer_r } = n.kind {
+            body_depth = Some((0, inner_r, outer_r));
+        }
+    }
+
+    for k in 0..anchor.depth() as usize {
+        if body_depth.is_some() { break; }
+        let Some(n) = library.get(node) else { return miss };
+        let slot = anchor.slot(k) as usize;
+        let (sx, sy, sz) = crate::world::tree::slot_coords(slot);
+        let child_size = cell_size / 3.0;
+        cell_origin[0] += sx as f32 * child_size;
+        cell_origin[1] += sy as f32 * child_size;
+        cell_origin[2] += sz as f32 * child_size;
+        cell_size = child_size;
+        let Child::Node(child_id) = n.children[slot] else { return miss };
+        node = child_id;
+        let Some(child) = library.get(node) else { return miss };
+        if let NodeKind::CubedSphereBody { inner_r, outer_r } = child.kind {
+            body_depth = Some((k as u32 + 1, inner_r, outer_r));
+        }
+    }
+
+    let Some((_depth, inner_r, outer_r)) = body_depth else {
+        return miss;
+    };
+
+    // `cell_origin` / `cell_size` are the root-frame bounds of the
+    // body cell. Convert the camera's root-frame position to the
+    // body's `[0, 3)³` local frame: inside the body, `world_size`
+    // stays 3 regardless of scale.
+    let body_local_x = (camera_root_xyz[0] - cell_origin[0]) / cell_size
+        * crate::world::anchor::WORLD_SIZE;
+    let body_local_y = (camera_root_xyz[1] - cell_origin[1]) / cell_size
+        * crate::world::anchor::WORLD_SIZE;
+    let body_local_z = (camera_root_xyz[2] - cell_origin[2]) / cell_size
+        * crate::world::anchor::WORLD_SIZE;
+    let dx = body_local_x - 1.5;
+    let dy = body_local_y - 1.5;
+    let dz = body_local_z - 1.5;
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+    // Shell radii in body-local units: multiply by WORLD_SIZE=3 so
+    // `inner_r=0.12` → `cs_inner_local=0.36` etc.
+    let cs_outer = outer_r * crate::world::anchor::WORLD_SIZE;
+    let cs_inner = inner_r * crate::world::anchor::WORLD_SIZE;
+    let dist_outer = dist - cs_outer;  // >0: above shell; <0: inside crust
+    let dist_inner = dist - cs_inner;  // >0: above inner shell; <0: in core
+
+    (dist, dist_outer, dist_inner, [inner_r, outer_r])
 }

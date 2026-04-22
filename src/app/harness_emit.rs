@@ -218,16 +218,25 @@ impl App {
                 self.camera.position.add_local(d, &self.world.library);
             }
             ScriptCmd::FlyToSurface => self.fly_to_surface(),
+            // Unused — the rich positional stats it was going to
+            // emit live in `DebugOverlayStateJs` now (see event_loop's
+            // `overlay_active` branch). Kept as a parsed cmd for
+            // backwards compat with any scripts that may reference it.
+            ScriptCmd::DumpPosition => {}
         }
         log_state("POST", self, "");
     }
 
     /// Raycast straight down in world-space bypassing the normal
-    /// interaction-radius cap, then place the camera a couple of
-    /// anchor cells above the hit. Sphere worlds: the camera stays
-    /// `sphere=None` (same convention as the live game's zoom path —
-    /// sphere state is only populated by explicit teleports); the
-    /// body march renders from the body cell regardless.
+    /// interaction-radius cap, then place the camera EXACTLY ONE
+    /// anchor cell above the hit (at the current anchor depth). Used
+    /// by the d≥10 repro harness: the camera has to be within one
+    /// cell of the surface so the cursor interaction radius reaches
+    /// it AND the walker's Nyquist LOD allows descent to full anchor
+    /// depth. Sphere worlds: camera stays `sphere=None` (same
+    /// convention as the live game's zoom path — sphere state is
+    /// populated only by explicit teleports); the body march renders
+    /// from the body cell regardless.
     pub(super) fn fly_to_surface(&mut self) {
         use crate::world::anchor::{Path, WorldPos};
         use crate::world::raycast::cpu_raycast;
@@ -245,7 +254,13 @@ impl App {
         let hit_y = root_cam[1] + ray_dir[1] * hit.t;
         let anchor_depth = self.anchor_depth() as u8;
         let cell = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
-        let above_y = (hit_y + 2.0 * cell).min(3.0 - cell);
+        // ONE anchor cell above the hit. At depth 10 this is 1/3^10
+        // ≈ 1.69e-5 world units, inside the 6-cell default
+        // interaction radius so the cursor raycast can reach the
+        // surface on the next frame. Closer than this starts losing
+        // the ray-sphere entry epsilon; farther loses interaction
+        // reach.
+        let above_y = (hit_y + 1.0 * cell).min(3.0 - cell);
         let new_pos = [root_cam[0], above_y, root_cam[2]];
         self.camera.position =
             WorldPos::from_frame_local(&Path::root(), new_pos, anchor_depth);
