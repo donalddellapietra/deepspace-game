@@ -278,8 +278,14 @@ fn march_face_subtree_curved(
     var cur_occupancy: u32 = tree[cur_header_off];
     var cur_first_child: u32 = tree[cur_header_off + 1u];
 
-    // Track exit normal for hit-reporting. Default up; replaced at
-    // the hitting boundary.
+    // Track the surface normal of the LAST boundary the ray crossed.
+    // At any cell-block hit, this is the normal of the face we're
+    // viewing — the boundary that separated the previous empty cell
+    // from this solid cell. Stored in body-local (ribbon-frame) coords
+    // to match the Cartesian walker's convention.
+    //
+    // Initialised below to the entry cell's CELL-CENTER radial (see
+    // Stage 4 faceted-shading comment near the step-advance block).
     var hit_normal: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
 
     // Compute (un, vn, rn) of the ray's current body-centered position
@@ -313,6 +319,23 @@ fn march_face_subtree_curved(
     cur_r_lo = f32(cur_rs) / 3.0;
     cur_cell_ext = 1.0 / 3.0;
 
+    // Seed hit_normal to the ENTRY cell's centre radial on cur_face.
+    // Ray just crossed the outer r-shell; the first cell's r-face is
+    // what we're "viewing" if that cell turns out to be solid.
+    {
+        let u_mid_init = cur_u_lo + 0.5 * cur_cell_ext;
+        let v_mid_init = cur_v_lo + 0.5 * cur_cell_ext;
+        let cu_init = tan((2.0 * u_mid_init - 1.0) * 0.78539816);
+        let cv_init = tan((2.0 * v_mid_init - 1.0) * 0.78539816);
+        var raw_init = basis0.n_axis
+            + cu_init * basis0.u_axis
+            + cv_init * basis0.v_axis;
+        let rln = max(length(raw_init), 1e-6);
+        var nu_init = raw_init / rln;
+        if dot(nu_init, rd) > 0.0 { nu_init = -nu_init; }
+        hit_normal = nu_init;
+    }
+
     var iterations: u32 = 0u;
     let max_iterations: u32 = 2048u;
     var seam_count: u32 = 0u;
@@ -329,6 +352,54 @@ fn march_face_subtree_curved(
         let v_hi = cur_v_lo + cur_cell_ext;
         let r_lo = cur_r_lo;
         let r_hi = cur_r_lo + cur_cell_ext;
+
+        // ---- Per-cell Nyquist LOD gate --------------------------------
+        //
+        // If the CURRENT cell projects below the pixel threshold, any
+        // further descent is sub-pixel; treat the cell as a terminal
+        // splat. When the cell's slot resolves to a real block (tag=1)
+        // or a Node with a representative block, return a hit using
+        // the stored boundary-crossing normal. When it's empty, fall
+        // through to the ordinary DDA advance so the ray keeps
+        // stepping through small empty cells until it clears the
+        // face subtree (r-shell or seam exit).
+        {
+            let cell_rib_size_lod = cur_cell_ext * outer_rib;
+            let ray_dist_lod = max(t_cur * ray_metric_rib, 0.001);
+            let cell_pixels = cell_rib_size_lod / ray_dist_lod
+                * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+            if cell_pixels < LOD_PIXEL_THRESHOLD {
+                let slot_lod = u32(cur_rs * 9 + cur_vs * 3 + cur_us);
+                let slot_bit_lod = 1u << slot_lod;
+                var lod_bt: u32 = 0xFFFEu;
+                if (cur_occupancy & slot_bit_lod) != 0u {
+                    let rank_lod = countOneBits(cur_occupancy & (slot_bit_lod - 1u));
+                    let child_base_lod = cur_first_child + rank_lod * 2u;
+                    let packed_lod = tree[child_base_lod];
+                    let tag_lod = packed_lod & 0xFFu;
+                    if tag_lod == 1u {
+                        lod_bt = (packed_lod >> 8u) & 0xFFFFu;
+                    } else if tag_lod == 2u {
+                        lod_bt = child_block_type(packed_lod);
+                    }
+                }
+                if lod_bt < 0xFFFDu {
+                    result.hit = true;
+                    result.t = t_cur;
+                    result.color = palette[lod_bt].rgb;
+                    result.normal = hit_normal;
+                    let hp_lod = oc + rd * t_cur;
+                    result.cell_min = hp_lod + body_center_rib;
+                    result.cell_size = cur_cell_ext * outer_rib;
+                    return result;
+                }
+                // Empty sub-pixel cell: fall through to ordinary DDA
+                // advance below. The advance still uses this cell's
+                // bounds to step to the next neighbor, same as a
+                // normal empty cell. The LOD gate skipped only the
+                // descent into children we wouldn't have visited.
+            }
+        }
 
         // ---- Compute exit surfaces for THIS cell and pick the
         //      smallest positive t strictly > t_cur.
@@ -396,16 +467,20 @@ fn march_face_subtree_curved(
 
             if tag == 1u {
                 // Block hit at this cell. Use t at cell entry (t_cur)
-                // for the ribbon-frame t.
+                // for the ribbon-frame t. Stage 4: the hit normal is
+                // the normal of the boundary surface the ray crossed
+                // LAST before entering this cell (tracked in
+                // `hit_normal`). For the first cell (no prior crossing),
+                // `hit_normal` was seeded to the outer-shell radial at
+                // entry. This yields faceted cube-cell shading on the
+                // sphere — each terminal solid cell shows up to 3
+                // distinct normal directions (u/v/r-face) just like
+                // Cartesian voxel blocks have ±x/±y/±z faces.
                 result.hit = true;
                 result.t = t_cur;
                 result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
-                // Surface normal: radial outward (good enough for
-                // Stage 3b; proper cell-face normal would require
-                // knowing which boundary we entered from).
+                result.normal = hit_normal;
                 let hit_pos = oc + rd * t_cur;
-                let hit_r = max(length(hit_pos), 1e-6);
-                result.normal = hit_pos / hit_r;
                 result.cell_min = hit_pos + body_center_rib;
                 result.cell_size = cur_cell_ext * outer_rib; // approx
                 return result;
@@ -477,9 +552,10 @@ fn march_face_subtree_curved(
                         result.hit = true;
                         result.t = t_cur;
                         result.color = palette[bt].rgb;
+                        // Faceted normal from the last boundary the ray
+                        // crossed (same convention as the tag==1 hit above).
+                        result.normal = hit_normal;
                         let hit_pos = oc + rd * t_cur;
-                        let hit_r = max(length(hit_pos), 1e-6);
-                        result.normal = hit_pos / hit_r;
                         result.cell_min = hit_pos + body_center_rib;
                         result.cell_size = cur_cell_ext * outer_rib;
                         return result;
@@ -490,6 +566,53 @@ fn march_face_subtree_curved(
         }
         // Empty or fall-through: advance to exit surface of this cell
         // and step to the neighbor slot in the appropriate direction.
+        //
+        // Record the normal of the surface we just crossed; this will
+        // be the hit normal if the NEXT cell is solid. Sign-picked to
+        // oppose `rd` so the normal always points back toward the ray
+        // origin (standard shading convention). Normal is in body-
+        // local coords (ribbon-frame after body-center translation,
+        // same as the Cartesian walker's normal).
+        //
+        // Stage 4 faceted voxel shading: r-shell normal uses the
+        // CELL-CENTER radial direction (one fixed direction per cell)
+        // instead of the pointwise radial, giving each cell a flat
+        // r-face facet. u- and v-plane normals are naturally flat
+        // within a cell (they only depend on the cell's u_const /
+        // v_const edges). At deep depths the cell-center radial
+        // converges to the pointwise radial, so this stays continuous
+        // with infinite descent.
+        {
+            var raw_n: vec3<f32>;
+            if exit_axis == 0u {
+                raw_n = n_plane_u_lo;
+            } else if exit_axis == 1u {
+                raw_n = n_plane_u_hi;
+            } else if exit_axis == 2u {
+                raw_n = n_plane_v_lo;
+            } else if exit_axis == 3u {
+                raw_n = n_plane_v_hi;
+            } else {
+                // r-shell (inner or outer): radial at the CURRENT
+                // cell's center on `cur_face`. One direction per cell
+                // → flat facet. `u_mid`/`v_mid` are face-normalized
+                // coords of the cell's centre; map them to cube
+                // tangent-plane coords via the standard atan → tan
+                // inverse.
+                let u_mid = u_lo + 0.5 * cur_cell_ext;
+                let v_mid = v_lo + 0.5 * cur_cell_ext;
+                let cu_mid = tan((2.0 * u_mid - 1.0) * 0.78539816);
+                let cv_mid = tan((2.0 * v_mid - 1.0) * 0.78539816);
+                raw_n = basis.n_axis
+                    + cu_mid * basis.u_axis
+                    + cv_mid * basis.v_axis;
+            }
+            // Normalize and sign-flip to oppose rd.
+            let rn_len = max(length(raw_n), 1e-6);
+            var n_unit = raw_n / rn_len;
+            if dot(n_unit, rd) > 0.0 { n_unit = -n_unit; }
+            hit_normal = n_unit;
+        }
         t_cur = t_next;
 
         // Update slot based on which axis exited.
