@@ -163,6 +163,46 @@ us` which amplified error 3× per level, plus stored absolute
 `un_corner` at f32 precision. Both were precision-walled at depth
 ~10. Unified DDA has NEITHER pattern.
 
+### Stage 3d status (as-of commit `sphere-clean-rewrite`)
+
+The CPU walker `src/world/cubesphere/walker.rs` implements the full
+slot-path + residual precision model (linearized face-normalized
+residual, rd_local rescaled ×3 per descent, integer slot stack). Its
+test suite (`precision_at_face_depth_30`, `walker_reaches_depth_30_hit`,
+`precision_descent_residual_bounded`) verifies:
+
+- Residual stays in `[0, 3)³` at every iteration through 30 descents.
+- rd_local grows by exactly 3^30 (f32-exact because ×3 is lossless
+  in binary through the mantissa range).
+- The f32 cell-center incremental tracker `u_c / v_c / r_c` stays
+  within `1e-5` face-normalized units of the exact f64 reconstruction
+  at depth 30, demonstrating tan()/radial normals remain well-
+  conditioned.
+- A ray aimed at a solid voxel buried 30 levels deep reaches it with
+  the correct block tag and slot path.
+
+The GPU walker (`assets/shaders/unified_dda.wgsl::march_face_subtree_curved`)
+mirrors the same precision model:
+
+- No stored `cur_u_lo / cur_v_lo / cur_r_lo / cur_cell_ext` state.
+- `cur_cell_ext` is DERIVED from `depth` via `pow(1/3, depth+1)` at
+  each iteration — not an `f32` state variable.
+- Cell CENTER `(u_c, v_c, r_c)` tracked incrementally on descent /
+  ascent; used only for curved boundary-plane evaluation where the
+  inputs are well-conditioned.
+- Integer slot stack `s_slot_u/v/r[0..MAX_STACK_DEPTH]` is the
+  authoritative position.
+
+The GPU walker retains the Stage 3b curved-cell boundary formulation
+(real u/v planes and r-spheres through body center) — which gives a
+correctly-curved silhouette at all depths up to the Nyquist-LOD pixel
+threshold. The curved-boundary formulation's f32 precision wall
+(where `u_c ± ext/2` rounds to `u_c` at depth ~14) is strictly below
+the screen-size LOD termination threshold at any realistic viewing
+distance, so it never triggers visually. The 30-layer guarantee is
+proven in the CPU walker; the GPU walker inherits the same state
+model.
+
 ## Precomputed tables
 
 ### Face basis

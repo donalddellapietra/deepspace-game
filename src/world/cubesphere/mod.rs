@@ -24,8 +24,10 @@ use super::sdf::Vec3;
 use super::tree::slot_index;
 
 pub mod seams;
+pub mod walker;
 
 pub use seams::{seam_rotation, SeamTransition, SEAM_TABLE};
+pub use walker::{BodyRay, FaceWalker, WalkResult, MAX_FACE_WALK_DEPTH};
 
 // ──────────────────────────────────────────────────────────── Face
 

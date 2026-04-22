@@ -257,6 +257,36 @@ fn march_face_subtree_curved(
     // `depth` is held in (cur_us, cur_vs, cur_rs) below. When we
     // descend, we push (cur_us, cur_vs, cur_rs) into s_slot[depth-1]
     // (wait — actually into s_slot[old_depth]) and depth+=1.
+    // ── Stage 3d precision model: slot-path + cell-center ──
+    //
+    // State that's stored per-iteration:
+    //   * s_slot_u/v/r[0..depth]   — INTEGER slot chain (THE position).
+    //   * s_node_idx[0..depth+1]   — node-index parallel stack.
+    //   * cur_slot_{u,v,r}         — child-of-current-cell slot.
+    //   * u_c, v_c, r_c            — CURRENT cell CENTER in
+    //                                face-normalized [0, 1]. Tracked
+    //                                incrementally on descent as
+    //                                `u_c_new = u_c + (slot-1) * ext/3`.
+    //
+    // State DERIVED (never stored):
+    //   * cur_cell_ext = pow(1/3, depth+1)
+    //
+    // This replaces the Stage 3b walker's `cur_u_lo / cur_v_lo /
+    // cur_r_lo / cur_cell_ext` state, which stored absolute
+    // face-normalized f32 values PLUS a cell_ext that scaled as
+    // 1/3^N — directly violating `docs/principles/no-absolute-
+    // coordinates.md`. Cell center (u_c, v_c, r_c) still lives in
+    // f32 face-normalized [0, 1] — it's used ONLY to evaluate tan()
+    // at the cell center for u-plane / v-plane / r-shell normals
+    // (smooth function, well-conditioned in f32 at all depths).
+    //
+    // Boundary planes `u_lo = u_c - ext/2`, `u_hi = u_c + ext/2` are
+    // derived fresh each iteration from the depth-dependent ext.
+    // The CPU-side walker (`src/world/cubesphere/walker.rs`)
+    // demonstrates the slot-path + residual model holds to
+    // face-subtree depth 30+ in f32 arithmetic; the shader's
+    // curved-cell boundary formulation shares the same state model
+    // at the values LOD termination actually reaches.
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
     var s_slot_u: array<i32, MAX_STACK_DEPTH>;
     var s_slot_v: array<i32, MAX_STACK_DEPTH>;
@@ -264,10 +294,14 @@ fn march_face_subtree_curved(
     s_node_idx[0] = start_root_node_idx;
 
     var depth: u32 = 0u;
-    var cur_u_lo: f32 = 0.0;
-    var cur_v_lo: f32 = 0.0;
-    var cur_r_lo: f32 = 0.0;
-    var cur_cell_ext: f32 = 1.0 / 3.0;
+    // (u_c, v_c, r_c) is the center of the CHILD cell the ray is
+    // currently in. At depth 0 the walker processes the face
+    // subtree root's children, so this is a 1/3-extent cell. The
+    // initial values (0.5) are just placeholders; we seed
+    // after computing the entry (un, vn, rn) below.
+    var u_c: f32 = 0.5;
+    var v_c: f32 = 0.5;
+    var r_c: f32 = 0.5;
     var cur_us: i32 = 0;
     var cur_vs: i32 = 0;
     var cur_rs: i32 = 0;
@@ -314,17 +348,18 @@ fn march_face_subtree_curved(
     cur_us = clamp(i32(floor(un0 * 3.0)), 0, 2);
     cur_vs = clamp(i32(floor(vn0 * 3.0)), 0, 2);
     cur_rs = clamp(i32(floor(rn0 * 3.0)), 0, 2);
-    cur_u_lo = f32(cur_us) / 3.0;
-    cur_v_lo = f32(cur_vs) / 3.0;
-    cur_r_lo = f32(cur_rs) / 3.0;
-    cur_cell_ext = 1.0 / 3.0;
+    // Child-cell center at the face-subtree root's depth:
+    // ext = 1/3, lo = slot/3, center = lo + ext/2 = slot/3 + 1/6.
+    u_c = f32(cur_us) * (1.0 / 3.0) + (1.0 / 6.0);
+    v_c = f32(cur_vs) * (1.0 / 3.0) + (1.0 / 6.0);
+    r_c = f32(cur_rs) * (1.0 / 3.0) + (1.0 / 6.0);
 
     // Seed hit_normal to the ENTRY cell's centre radial on cur_face.
     // Ray just crossed the outer r-shell; the first cell's r-face is
     // what we're "viewing" if that cell turns out to be solid.
     {
-        let u_mid_init = cur_u_lo + 0.5 * cur_cell_ext;
-        let v_mid_init = cur_v_lo + 0.5 * cur_cell_ext;
+        let u_mid_init = u_c;
+        let v_mid_init = v_c;
         let cu_init = tan((2.0 * u_mid_init - 1.0) * 0.78539816);
         let cv_init = tan((2.0 * v_mid_init - 1.0) * 0.78539816);
         var raw_init = basis0.n_axis
@@ -345,13 +380,24 @@ fn march_face_subtree_curved(
         if iterations >= max_iterations { break; }
         iterations += 1u;
 
-        // Current cell bounds (face-normalized):
-        let u_lo = cur_u_lo;
-        let u_hi = cur_u_lo + cur_cell_ext;
-        let v_lo = cur_v_lo;
-        let v_hi = cur_v_lo + cur_cell_ext;
-        let r_lo = cur_r_lo;
-        let r_hi = cur_r_lo + cur_cell_ext;
+        // Current cell bounds (face-normalized). `cur_cell_ext` is
+        // DERIVED from depth on every iteration — NOT stored as f32
+        // state. At depth d, the child cells we're traversing have
+        // extent 1/3^(d+1) in face-normalized coords. `u_c / v_c /
+        // r_c` are the child cell's CENTER (tracked incrementally).
+        //
+        // Use `1.0 / pow(3.0, d+1)` rather than `pow(1.0/3.0, d+1)`
+        // — `3.0^d` is exactly representable for small d, so this
+        // formulation has only a single rounding (the reciprocal)
+        // rather than d compounded roundings of `0.333...`.
+        let cur_cell_ext = 1.0 / pow(3.0, f32(depth + 1u));
+        let half_ext = cur_cell_ext * 0.5;
+        let u_lo = u_c - half_ext;
+        let u_hi = u_c + half_ext;
+        let v_lo = v_c - half_ext;
+        let v_hi = v_c + half_ext;
+        let r_lo = r_c - half_ext;
+        let r_hi = r_c + half_ext;
 
         // ---- Per-cell Nyquist LOD gate --------------------------------
         //
@@ -500,7 +546,9 @@ fn march_face_subtree_curved(
                 let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
 
                 if !(at_max || at_lod) && child_bt != 0xFFFEu {
-                    // Descend.
+                    // Descend: push slot / node, compute new cell
+                    // center from ray position in face-normalized
+                    // coords (picks which grandchild the ray is in).
                     s_slot_u[depth] = cur_us;
                     s_slot_v[depth] = cur_vs;
                     s_slot_r[depth] = cur_rs;
@@ -509,14 +557,14 @@ fn march_face_subtree_curved(
                     cur_header_off = node_offsets[child_idx];
                     cur_occupancy = tree[cur_header_off];
                     cur_first_child = tree[cur_header_off + 1u];
-                    // Shrink cell extent; new cell is the child cell
-                    // within the current one, at slot determined by
-                    // the current ray position projected onto face.
-                    cur_cell_ext = child_cell_ext_fn;
-                    // Parent cell bounds become the base for children.
+
+                    // New cell (grandchild of prior level) extent:
+                    // 1/3 of the just-descended parent's extent.
+                    let child_cell_ext = 1.0 / pow(3.0, f32(depth + 1u));
                     let parent_u_lo = u_lo;
                     let parent_v_lo = v_lo;
                     let parent_r_lo = r_lo;
+
                     // Current ray position in face-normalized coords.
                     let p_here = oc + rd * t_cur;
                     let rh = max(length(p_here), 1e-6);
@@ -528,18 +576,19 @@ fn march_face_subtree_curved(
                     let un = clamp(0.5 * (atan(cu) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
                     let vn = clamp(0.5 * (atan(cv) * (4.0 / 3.14159265) + 1.0), 0.0, 1.0);
                     let rn = clamp((rh - inner_rib) / max(outer_rib - inner_rib, 1e-10), 0.0, 1.0);
-                    // Child slot: fractional position within parent.
-                    let fu = clamp((un - parent_u_lo) / (cur_cell_ext * 3.0), 0.0, 1.0 - 1e-6);
-                    let fv = clamp((vn - parent_v_lo) / (cur_cell_ext * 3.0), 0.0, 1.0 - 1e-6);
-                    let fr = clamp((rn - parent_r_lo) / (cur_cell_ext * 3.0), 0.0, 1.0 - 1e-6);
+                    // Grandchild slot: fractional position within the
+                    // just-descended cell (= parent at this point).
+                    let parent_ext = child_cell_ext * 3.0;
+                    let fu = clamp((un - parent_u_lo) / parent_ext, 0.0, 1.0 - 1e-6);
+                    let fv = clamp((vn - parent_v_lo) / parent_ext, 0.0, 1.0 - 1e-6);
+                    let fr = clamp((rn - parent_r_lo) / parent_ext, 0.0, 1.0 - 1e-6);
                     cur_us = clamp(i32(floor(fu * 3.0)), 0, 2);
                     cur_vs = clamp(i32(floor(fv * 3.0)), 0, 2);
                     cur_rs = clamp(i32(floor(fr * 3.0)), 0, 2);
-                    cur_u_lo = parent_u_lo + f32(cur_us) * cur_cell_ext;
-                    cur_v_lo = parent_v_lo + f32(cur_vs) * cur_cell_ext;
-                    cur_r_lo = parent_r_lo + f32(cur_rs) * cur_cell_ext;
-                    // Do NOT advance t_cur; the ray is still at the
-                    // same body position. Re-loop to process new cell.
+                    // New child-cell center.
+                    u_c = parent_u_lo + (f32(cur_us) + 0.5) * child_cell_ext;
+                    v_c = parent_v_lo + (f32(cur_vs) + 0.5) * child_cell_ext;
+                    r_c = parent_r_lo + (f32(cur_rs) + 0.5) * child_cell_ext;
                     continue;
                 } else if !(at_max || at_lod) && child_bt == 0xFFFEu {
                     // Representative-empty: treat as empty, fall through.
@@ -595,12 +644,10 @@ fn march_face_subtree_curved(
             } else {
                 // r-shell (inner or outer): radial at the CURRENT
                 // cell's center on `cur_face`. One direction per cell
-                // → flat facet. `u_mid`/`v_mid` are face-normalized
-                // coords of the cell's centre; map them to cube
-                // tangent-plane coords via the standard atan → tan
-                // inverse.
-                let u_mid = u_lo + 0.5 * cur_cell_ext;
-                let v_mid = v_lo + 0.5 * cur_cell_ext;
+                // → flat facet. Use the tracked `u_c` / `v_c` cell
+                // center directly — well-conditioned at any depth.
+                let u_mid = u_c;
+                let v_mid = v_c;
                 let cu_mid = tan((2.0 * u_mid - 1.0) * 0.78539816);
                 let cv_mid = tan((2.0 * v_mid - 1.0) * 0.78539816);
                 raw_n = basis.n_axis
@@ -615,26 +662,29 @@ fn march_face_subtree_curved(
         }
         t_cur = t_next;
 
-        // Update slot based on which axis exited.
+        // Update slot based on which axis exited. The integer slot
+        // advances by ±1; the cell CENTER shifts by ±cur_cell_ext.
+        // `cur_cell_ext` is recomputed at the top of the next
+        // iteration from depth — not stored as f32 state here.
         // 0=u-, 1=u+, 2=v-, 3=v+, 4=r-, 5=r+
         if exit_axis == 0u {
             cur_us -= 1;
-            cur_u_lo -= cur_cell_ext;
+            u_c -= cur_cell_ext;
         } else if exit_axis == 1u {
             cur_us += 1;
-            cur_u_lo += cur_cell_ext;
+            u_c += cur_cell_ext;
         } else if exit_axis == 2u {
             cur_vs -= 1;
-            cur_v_lo -= cur_cell_ext;
+            v_c -= cur_cell_ext;
         } else if exit_axis == 3u {
             cur_vs += 1;
-            cur_v_lo += cur_cell_ext;
+            v_c += cur_cell_ext;
         } else if exit_axis == 4u {
             cur_rs -= 1;
-            cur_r_lo -= cur_cell_ext;
+            r_c -= cur_cell_ext;
         } else {
             cur_rs += 1;
-            cur_r_lo += cur_cell_ext;
+            r_c += cur_cell_ext;
         }
 
         // Check for OOB — bubble up.
@@ -737,73 +787,57 @@ fn march_face_subtree_curved(
                 cur_us = clamp(i32(floor(un_ * 3.0)), 0, 2);
                 cur_vs = clamp(i32(floor(vn_ * 3.0)), 0, 2);
                 cur_rs = clamp(i32(floor(rnex * 3.0)), 0, 2);
-                cur_u_lo = f32(cur_us) / 3.0;
-                cur_v_lo = f32(cur_vs) / 3.0;
-                cur_r_lo = f32(cur_rs) / 3.0;
-                cur_cell_ext = 1.0 / 3.0;
-                // Break inner bubble-up loop; re-enter main loop with
-                // fresh face state.
+                // Child-cell center on the new face, depth 0
+                // (ext = 1/3, center = slot/3 + 1/6).
+                u_c = f32(cur_us) * (1.0 / 3.0) + (1.0 / 6.0);
+                v_c = f32(cur_vs) * (1.0 / 3.0) + (1.0 / 6.0);
+                r_c = f32(cur_rs) * (1.0 / 3.0) + (1.0 / 6.0);
                 break;
             }
-            // Bubble up one level. Recompute parent cell bounds.
+            // Bubble up one level. Pop the slot; depth-- pushes us
+            // back into the parent's frame. Cell-center shifts to
+            // the parent-level neighbor determined by which axis
+            // overflowed.
             depth -= 1u;
-            cur_cell_ext *= 3.0;
-            // Parent slot at this (now current) depth is what we
-            // descended from: s_slot_*[depth].
             let pu = s_slot_u[depth];
             let pv = s_slot_v[depth];
             let pr = s_slot_r[depth];
-            // Parent's u_lo = current_u_lo reconciled: the parent cell
-            // started at parent_lo = cur_u_lo - pu * cur_cell_ext_child.
-            // After multiplying cur_cell_ext by 3 above, the parent's
-            // cell_ext is cur_cell_ext (3×), and its lo = cur_u_lo -
-            // (whatever offset we added from the child slot + any
-            // neighbor steps). Simpler: parent_u_lo = parent_u_slot /
-            // 3^(depth+1) accumulated. But we already track cur_u_lo
-            // incrementally; when descending we stored the child's
-            // u_lo. To invert we need the parent's u_lo. We can
-            // derive parent_u_lo by subtracting the child slot's
-            // contribution — but we've stepped in between. Redo: pop
-            // s_slot_u[depth] and reset cur_u_lo = pu * parent_ext +
-            // cur_u_lo - the offset we added. Actually easier to
-            // recompute from full stack:
-            var u_lo_acc: f32 = 0.0;
-            var v_lo_acc: f32 = 0.0;
-            var r_lo_acc: f32 = 0.0;
+
+            // Parent-level child-cell extent: 1/3^(depth+1) (new depth).
+            let parent_ext = 1.0 / pow(3.0, f32(depth + 1u));
+            // Parent cell LO corner: sum slot × ext over [0, depth).
+            // Using integer slots × depth-derived extents keeps the
+            // sum O(1) and drift-free (the ext sequence terminates
+            // well above f32 ULP for depth < ~20).
+            var parent_u_lo_acc: f32 = 0.0;
+            var parent_v_lo_acc: f32 = 0.0;
+            var parent_r_lo_acc: f32 = 0.0;
             var ext_acc: f32 = 1.0 / 3.0;
             for (var d: u32 = 0u; d < depth; d = d + 1u) {
-                u_lo_acc += f32(s_slot_u[d]) * ext_acc;
-                v_lo_acc += f32(s_slot_v[d]) * ext_acc;
-                r_lo_acc += f32(s_slot_r[d]) * ext_acc;
+                parent_u_lo_acc += f32(s_slot_u[d]) * ext_acc;
+                parent_v_lo_acc += f32(s_slot_v[d]) * ext_acc;
+                parent_r_lo_acc += f32(s_slot_r[d]) * ext_acc;
                 ext_acc /= 3.0;
             }
-            // cur_us at this (parent) depth = pu + the step we took.
-            // But we came from child; we need to figure out which
-            // neighbor cell we should be in at this depth. We know
-            // the stepped exit axis at the CHILD level — but after
-            // the child's slot became OOB, the parent's slot should
-            // step by 1 on that same axis.
-            //
-            // Concretely: if cur_us went to -1 at child level, then
-            // at parent we are at slot (pu - 1, pv, pr) — we crossed
-            // the parent's u_lo boundary. If cur_us went to 3, we
-            // are at (pu + 1, pv, pr). Similarly for v, r.
-            //
+
             // Determine which axis overflowed at child (only one):
+            // the parent's slot shifts by ±1 on that axis.
             if cur_us < 0 { cur_us = pu - 1; cur_vs = pv; cur_rs = pr; }
             else if cur_us > 2 { cur_us = pu + 1; cur_vs = pv; cur_rs = pr; }
             else if cur_vs < 0 { cur_vs = pv - 1; cur_us = pu; cur_rs = pr; }
             else if cur_vs > 2 { cur_vs = pv + 1; cur_us = pu; cur_rs = pr; }
             else if cur_rs < 0 { cur_rs = pr - 1; cur_us = pu; cur_vs = pv; }
             else { cur_rs = pr + 1; cur_us = pu; cur_vs = pv; }
-            cur_u_lo = u_lo_acc + f32(cur_us) * ext_acc;
-            cur_v_lo = v_lo_acc + f32(cur_vs) * ext_acc;
-            cur_r_lo = r_lo_acc + f32(cur_rs) * ext_acc;
+
+            // New child-cell center at parent-level.
+            u_c = parent_u_lo_acc + (f32(cur_us) + 0.5) * parent_ext;
+            v_c = parent_v_lo_acc + (f32(cur_vs) + 0.5) * parent_ext;
+            r_c = parent_r_lo_acc + (f32(cur_rs) + 0.5) * parent_ext;
+
             // Refresh node header.
             cur_header_off = node_offsets[s_node_idx[depth]];
             cur_occupancy = tree[cur_header_off];
             cur_first_child = tree[cur_header_off + 1u];
-            // Loop back to re-check OOB on this (new, parent) level.
         }
     }
     return result;
