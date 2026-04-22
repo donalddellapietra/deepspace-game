@@ -162,6 +162,12 @@ pub enum ScriptCmd {
     /// debug views where we want to see the pit walls from INSIDE
     /// rather than a sub-pixel view of the pit from the surface.
     TeleportIntoLastEdit,
+    /// Trigger `App::debug_force_sphere_state` (the F9 debug action).
+    /// Promotes the camera into sphere-anchored state with whatever
+    /// UVR depth corresponds to its current anchor — needed to make
+    /// the GPU SphereSub path activate from the test harness, since
+    /// a freshly-spawned camera has no symbolic UVR descent.
+    ForceSphereState,
 }
 
 impl TestConfig {
@@ -407,6 +413,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             if raw == "probe_down" { return Some(ScriptCmd::ProbeDown); }
             if raw == "teleport_above_last_edit" { return Some(ScriptCmd::TeleportAboveLastEdit); }
             if raw == "teleport_into_last_edit" { return Some(ScriptCmd::TeleportIntoLastEdit); }
+            if raw == "force_sphere_state" { return Some(ScriptCmd::ForceSphereState); }
             if let Some(n) = raw.strip_prefix("wait:") {
                 if let Ok(frames) = n.parse() { return Some(ScriptCmd::Wait(frames)); }
             }

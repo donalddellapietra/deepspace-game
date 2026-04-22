@@ -222,6 +222,7 @@ impl App {
                 self.camera.position.add_local(d, &self.world.library);
             }
             ScriptCmd::FlyToSurface => self.fly_to_surface(),
+            ScriptCmd::ForceSphereState => self.debug_force_sphere_state(),
         }
         log_state("POST", self, "");
     }
