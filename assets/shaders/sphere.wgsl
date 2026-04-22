@@ -121,15 +121,6 @@ struct FaceWalkResult {
 /// Rust's `REPRESENTATIVE_EMPTY`.
 const FACE_WALK_EMPTY: u32 = 0xFFFEu;
 
-/// Cell face-normalized size below which the 6-plane body-coord
-/// cell-stepper's pair normals (`n_u_lo` vs `n_u_hi`) go near-
-/// degenerate in f32 and rays "skip" solid cells — rendered blocks
-/// appear HOLLOW at deep depth. Below this we swap to local-frame
-/// axis-aligned DDA via a mini-sub-frame Jacobian, which is
-/// precision-stable at any cell size. Mirror of CPU constant in
-/// `src/world/raycast/sphere.rs`.
-const LOCAL_FRAME_STEP_THRESHOLD: f32 = 5e-5;
-
 fn walk_face_subtree(
     face_root_idx: u32,
     un_in: f32, vn_in: f32, rn_in: f32,
@@ -602,114 +593,39 @@ fn sphere_in_cell(
             return result;
         }
 
-        // Empty cell — advance to next cell boundary.
-        //
-        // Two paths, chosen by cell size:
-        //
-        // SHALLOW (`w.size >= LOCAL_FRAME_STEP_THRESHOLD`): 4 UV planes
-        //     + 2 radial spheres in body-CENTERED coords. Exact
-        //     curvature. Works fine while cells are big enough that
-        //     adjacent plane normals separate cleanly.
-        //
-        // DEEP (`w.size < LOCAL_FRAME_STEP_THRESHOLD`): the n_u_lo /
-        //     n_u_hi pair differ by only `O(w.size)` against n_axis.
-        //     At deep cells that's below f32 ULP of the individual
-        //     components — ray_plane_t can no longer distinguish the
-        //     two walls. Adjacent pixels pick arbitrary winners →
-        //     rays skip cells → rendered content appears HOLLOW.
-        //     Swap to a local-frame axis-aligned DDA: build Jacobian
-        //     at the cell corner, transform the ray via J_inv into
-        //     local [0, 3)³, find exit via trivial
-        //     `(boundary − pos) / dir`. Every operand is O(1) in
-        //     local, so precision stays clean at any depth.
-        var t_next: f32;
-        var winning: u32;
-        let cell_size_ea = w.size * 2.0;  // face-normalized cell size in ea units
-        if w.size < LOCAL_FRAME_STEP_THRESHOLD {
-            // Local-frame exit.
-            let cell_r_lo_abs = select(w.r_lo, window_bounds.z + w.r_lo * window_bounds.w, window_active != 0u);
-            let ff = face_frame_jacobian_shader(
-                f,
-                w.u_lo, w.v_lo, cell_r_lo_abs, w.size,
-                inner_r_local, outer_r_local,
-            );
-            var j: Mat3Columns;
-            j.col_u = ff.col_u;
-            j.col_v = ff.col_v;
-            j.col_r = ff.col_r;
-            let j_inv = mat3_inv_scaled_shader(j, w.size / 3.0);
-            // c_body in body-LOCAL coords (body origin at [0,0,0]); oc is
-            // body-CENTERED (body center at origin). Convert: subtract
-            // body center from c_body.
-            let body_center = vec3<f32>(1.5);  // body_size=3.0 in this frame
-            let c_body_centered = ff.c_body - body_center;
-            let body_pt = oc + ray_dir * t;
-            let offset = body_pt - c_body_centered;
-            let ro_local = mat3_mul_vec_shader(j_inv, offset);
-            let rd_local = mat3_mul_vec_shader(j_inv, ray_dir);
-            var t_local_min: f32 = 1e30;
-            var local_winning: u32 = 6u;
-            // Axis-exit for each of u/v/r.
-            // u: winning = 0 (u_lo) if dir<0, 1 (u_hi) if dir>0.
-            if abs(rd_local.x) > 1e-30 {
-                let boundary = select(0.0, 3.0, rd_local.x > 0.0);
-                let tc = (boundary - ro_local.x) / rd_local.x;
-                if tc > 0.0 && tc < t_local_min {
-                    t_local_min = tc;
-                    local_winning = select(0u, 1u, rd_local.x > 0.0);
-                }
-            }
-            if abs(rd_local.y) > 1e-30 {
-                let boundary = select(0.0, 3.0, rd_local.y > 0.0);
-                let tc = (boundary - ro_local.y) / rd_local.y;
-                if tc > 0.0 && tc < t_local_min {
-                    t_local_min = tc;
-                    local_winning = select(2u, 3u, rd_local.y > 0.0);
-                }
-            }
-            if abs(rd_local.z) > 1e-30 {
-                let boundary = select(0.0, 3.0, rd_local.z > 0.0);
-                let tc = (boundary - ro_local.z) / rd_local.z;
-                if tc > 0.0 && tc < t_local_min {
-                    t_local_min = tc;
-                    local_winning = select(4u, 5u, rd_local.z > 0.0);
-                }
-            }
-            // `J · rd_local = rd_body` unit, so `t_body = t + t_local`.
-            t_next = t + t_local_min;
-            winning = local_winning;
-        } else {
-            // Body-coord 6-plane exit (original path).
-            let cell_u_lo_ea = w.u_lo * 2.0 - 1.0;
-            let cell_u_hi_ea = (w.u_lo + w.size) * 2.0 - 1.0;
-            let cell_v_lo_ea = w.v_lo * 2.0 - 1.0;
-            let cell_v_hi_ea = (w.v_lo + w.size) * 2.0 - 1.0;
-            let cell_r_lo_abs = select(w.r_lo, window_bounds.z + w.r_lo * window_bounds.w, window_active != 0u);
-            let cell_r_hi_abs = select(w.r_lo + w.size, window_bounds.z + (w.r_lo + w.size) * window_bounds.w, window_active != 0u);
-            let r_lo_world = cs_inner + cell_r_lo_abs * shell;
-            let r_hi_world = cs_inner + cell_r_hi_abs * shell;
+        // Empty cell — advance to next cell boundary via ray-plane /
+        // ray-sphere intersections on the walker's 6 cell faces.
+        let cell_u_lo_ea = w.u_lo * 2.0 - 1.0;
+        let cell_u_hi_ea = (w.u_lo + w.size) * 2.0 - 1.0;
+        let cell_v_lo_ea = w.v_lo * 2.0 - 1.0;
+        let cell_v_hi_ea = (w.v_lo + w.size) * 2.0 - 1.0;
+        // Window-local → absolute-face conversion for the radial
+        // boundaries.
+        let cell_r_lo_abs = select(w.r_lo, window_bounds.z + w.r_lo * window_bounds.w, window_active != 0u);
+        let cell_r_hi_abs = select(w.r_lo + w.size, window_bounds.z + (w.r_lo + w.size) * window_bounds.w, window_active != 0u);
+        let r_lo_world = cs_inner + cell_r_lo_abs * shell;
+        let r_hi_world = cs_inner + cell_r_hi_abs * shell;
 
-            let n_u_lo = u_axis - ea_to_cube(cell_u_lo_ea) * n_axis;
-            let n_u_hi = u_axis - ea_to_cube(cell_u_hi_ea) * n_axis;
-            let n_v_lo = v_axis - ea_to_cube(cell_v_lo_ea) * n_axis;
-            let n_v_hi = v_axis - ea_to_cube(cell_v_hi_ea) * n_axis;
+        let n_u_lo = u_axis - ea_to_cube(cell_u_lo_ea) * n_axis;
+        let n_u_hi = u_axis - ea_to_cube(cell_u_hi_ea) * n_axis;
+        let n_v_lo = v_axis - ea_to_cube(cell_v_lo_ea) * n_axis;
+        let n_v_hi = v_axis - ea_to_cube(cell_v_hi_ea) * n_axis;
 
-            t_next = t_exit + 1.0;
-            winning = 6u;
-            let zero3 = vec3<f32>(0.0);
-            let c_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
-            if c_u_lo > t && c_u_lo < t_next { t_next = c_u_lo; winning = 0u; }
-            let c_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
-            if c_u_hi > t && c_u_hi < t_next { t_next = c_u_hi; winning = 1u; }
-            let c_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
-            if c_v_lo > t && c_v_lo < t_next { t_next = c_v_lo; winning = 2u; }
-            let c_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
-            if c_v_hi > t && c_v_hi < t_next { t_next = c_v_hi; winning = 3u; }
-            let c_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo_world, t);
-            if c_r_lo > t && c_r_lo < t_next { t_next = c_r_lo; winning = 4u; }
-            let c_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi_world, t);
-            if c_r_hi > t && c_r_hi < t_next { t_next = c_r_hi; winning = 5u; }
-        }
+        var t_next = t_exit + 1.0;
+        var winning: u32 = 6u;
+        let zero3 = vec3<f32>(0.0);
+        let c_u_lo = ray_plane_t(oc, ray_dir, zero3, n_u_lo);
+        if c_u_lo > t && c_u_lo < t_next { t_next = c_u_lo; winning = 0u; }
+        let c_u_hi = ray_plane_t(oc, ray_dir, zero3, n_u_hi);
+        if c_u_hi > t && c_u_hi < t_next { t_next = c_u_hi; winning = 1u; }
+        let c_v_lo = ray_plane_t(oc, ray_dir, zero3, n_v_lo);
+        if c_v_lo > t && c_v_lo < t_next { t_next = c_v_lo; winning = 2u; }
+        let c_v_hi = ray_plane_t(oc, ray_dir, zero3, n_v_hi);
+        if c_v_hi > t && c_v_hi < t_next { t_next = c_v_hi; winning = 3u; }
+        let c_r_lo = ray_sphere_after(oc, ray_dir, zero3, r_lo_world, t);
+        if c_r_lo > t && c_r_lo < t_next { t_next = c_r_lo; winning = 4u; }
+        let c_r_hi = ray_sphere_after(oc, ray_dir, zero3, r_hi_world, t);
+        if c_r_hi > t && c_r_hi < t_next { t_next = c_r_hi; winning = 5u; }
 
         if t_next >= t_exit { break; }
         last_side = winning;
