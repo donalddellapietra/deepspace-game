@@ -305,20 +305,6 @@ const MAX_SEAM_TRANSITIONS: u32 = 64u;
 /// iteration. See `docs/testing/perf-lod-diagnosis.md`.
 const MAX_STACK_DEPTH: u32 = 8u;
 
-/// Face-subtree walker stack depth. The face walker
-/// (`march_face_subtree_curved`) walks a slot-path + residual precision
-/// model (see `src/world/cubesphere/walker.rs`) and is bounded by
-/// `log3(3^N)` = N, where N = 30+ is the sphere-world target face-
-/// subtree depth. Kept independent of `MAX_STACK_DEPTH` so the
-/// register-sensitive Cartesian dispatcher arms stay slim while the
-/// face walker has room to descend to its precision-proven floor.
-///
-/// Per-invocation cost: the walker holds four `array<iN, 32>` (three
-/// integer slot stacks + one u32 node stack), roughly 512 bytes
-/// threadgroup memory per-fragment when spilled — amortised over the
-/// very small fraction of rays that actually enter a sphere body.
-const MAX_FACE_STACK_DEPTH: u32 = 32u;
-
 struct HitResult {
     hit: bool,
     color: vec3<f32>,
