@@ -320,20 +320,37 @@ pub fn demo_planet() -> PlanetSetup {
     }
 }
 
-/// Max levels of SDF recursion into a face subtree. Below this, each
-/// cell commits to solid-or-empty from its center sample and extends
-/// via uniform dedup. Limits worldgen cost without visibly changing
-/// a smooth sphere.
-const SDF_DETAIL_LEVELS: u32 = 4;
+/// Max levels of UVR descent inside a face subtree. The face tree
+/// only goes this deep — at the leaves, an "interior" cell holds a
+/// CARTESIAN shell-block subtree (editable voxel content) and an
+/// "exterior" cell is empty. The player digs into shell-block content;
+/// the planet has NO core (it's a hollow shell).
+///
+/// At depth 5: 3^5 = 243 cells per face axis. Each shell-block then
+/// holds its own Cartesian subtree of `SHELL_BLOCK_DEPTH` levels.
+pub const SHELL_DEPTH: u32 = 5;
+
+/// Cartesian-content depth inside each shell-block. The shell-block
+/// is one Cartesian subtree of this depth; players can zoom in this
+/// many additional levels past SHELL_DEPTH to interact with
+/// individual voxels. 3^4 = 81 voxels per local axis is enough to
+/// see Cartesian voxel structure on close zoom while keeping
+/// worldgen cheap (content-addressed dedup folds identical shell-
+/// block subtrees to one unique chain).
+pub const SHELL_BLOCK_DEPTH: u32 = 4;
 
 /// Build a spherical body node and return its `NodeId`. Caller is
 /// responsible for placing it inside a parent (e.g., world root's
 /// center slot) and bumping its refcount.
+///
+/// `depth` is now ignored (face subtree depth is fixed at SHELL_DEPTH;
+/// shell-block content depth is SHELL_BLOCK_DEPTH). Kept for
+/// signature compatibility with PlanetSetup.
 pub fn insert_spherical_body(
     lib: &mut NodeLibrary,
     inner_r: f32,
     outer_r: f32,
-    depth: u32,
+    _depth: u32,
     sdf: &Planet,
 ) -> NodeId {
     debug_assert!(0.0 < inner_r && inner_r < outer_r && outer_r <= 0.5);
@@ -346,7 +363,7 @@ pub fn insert_spherical_body(
         let child = build_face_subtree(
             lib, face, inner_r, outer_r,
             -1.0, 1.0, -1.0, 1.0, 0.0, 1.0,
-            depth, depth.min(SDF_DETAIL_LEVELS), sdf,
+            SHELL_DEPTH, sdf,
         );
         let face_root = match child {
             Child::Node(id) => {
@@ -361,14 +378,48 @@ pub fn insert_spherical_body(
         };
         body_children[FACE_SLOTS[face as usize]] = Child::Node(face_root);
     }
-    body_children[CORE_SLOT] = lib.build_uniform_subtree(sdf.core_block, depth);
+    // Hollow planet: NO core fill. Only the shell holds content.
+    // The center body slot stays empty.
 
     lib.insert_with_kind(body_children, NodeKind::CubedSphereBody { inner_r, outer_r })
 }
 
-/// Recursive build of one face subtree. Returns a `Child` so the
-/// caller can collapse uniform subtrees. Emit cells by sampling the
-/// SDF at the cell center under the equal-angle UVR-to-world map.
+/// Build a Cartesian shell-block subtree of `SHELL_BLOCK_DEPTH` levels.
+/// The local frame interprets (x=u-direction, y=v-direction,
+/// z=r-direction = radial outward). The top z-slab (z=2) at every
+/// level holds solid `block_type`; the bottom two z-slabs (z=0,1)
+/// are empty. This produces a "thin shell at the top with hollow
+/// interior" structure — players can dig down through the surface
+/// voxels into the hollow shell-block interior.
+///
+/// Content-addressed dedup folds identical shell-block subtrees
+/// across the planet's ~thousands of interior cells to ONE unique
+/// chain of `SHELL_BLOCK_DEPTH + 1` nodes.
+fn build_shell_block(lib: &mut NodeLibrary, block_type: u16, depth: u32) -> NodeId {
+    if depth == 1 {
+        // Leaf level: 27 children — z=2 slab is solid, z=0,1 empty.
+        let mut children = empty_children();
+        for y in 0..3 {
+            for x in 0..3 {
+                children[slot_index(x, y, 2)] = Child::Block(block_type);
+            }
+        }
+        return lib.insert(children);
+    }
+    // Recurse: z=2 slab (9 cells) holds sub-shell-blocks; z=0,1 empty.
+    let sub = build_shell_block(lib, block_type, depth - 1);
+    let mut children = empty_children();
+    for y in 0..3 {
+        for x in 0..3 {
+            children[slot_index(x, y, 2)] = Child::Node(sub);
+        }
+    }
+    lib.insert(children)
+}
+
+/// Recursive build of one face subtree. UVR descent only — at the
+/// leaves (depth==0) we install Cartesian shell-block subtrees.
+/// Returns a `Child` so the caller can collapse uniform subtrees.
 #[allow(clippy::too_many_arguments)]
 fn build_face_subtree(
     lib: &mut NodeLibrary,
@@ -379,7 +430,6 @@ fn build_face_subtree(
     v_lo: f32, v_hi: f32,
     rn_lo: f32, rn_hi: f32,
     depth: u32,
-    sdf_budget: u32,
     sdf: &Planet,
 ) -> Child {
     let body_size = 1.0f32; // sampled in body-local [0, 1)³
@@ -396,24 +446,22 @@ fn build_face_subtree(
     let lateral_half = 0.5 * (u_hi - u_lo).max(v_hi - v_lo) * outer_r;
     let cell_rad = (lateral_half * lateral_half + radial_half * radial_half).sqrt();
 
+    // Conservative miss test: cell entirely outside surface.
     if d_center > cell_rad {
         return if depth == 0 { Child::Empty } else { Child::Node(uniform_empty_chain(lib, depth)) };
     }
-    if d_center < -cell_rad {
-        let b = sdf.block_at(p_center);
-        return if depth == 0 { Child::Block(b) } else { lib.build_uniform_subtree(b, depth) };
-    }
+    // At face leaves: install a CARTESIAN shell-block subtree if
+    // interior, empty otherwise. The shell-block is editable voxel
+    // content the player can dig into.
     if depth == 0 {
-        return if d_center < 0.0 { Child::Block(sdf.block_at(p_center)) } else { Child::Empty };
-    }
-    if sdf_budget == 0 {
-        return if d_center < 0.0 {
-            lib.build_uniform_subtree(sdf.block_at(p_center), depth)
-        } else {
-            Child::Node(uniform_empty_chain(lib, depth))
-        };
+        if d_center < 0.0 {
+            let block = sdf.block_at(p_center);
+            return Child::Node(build_shell_block(lib, block, SHELL_BLOCK_DEPTH));
+        }
+        return Child::Empty;
     }
 
+    // Recurse on UVR.
     let mut children = empty_children();
     let du = (u_hi - u_lo) / 3.0;
     let dv = (v_hi - v_lo) / 3.0;
@@ -426,7 +474,7 @@ fn build_face_subtree(
                     u_lo + du * us as f32, u_lo + du * (us + 1) as f32,
                     v_lo + dv * vs as f32, v_lo + dv * (vs + 1) as f32,
                     rn_lo + drn * rs as f32, rn_lo + drn * (rs + 1) as f32,
-                    depth - 1, sdf_budget - 1, sdf,
+                    depth - 1, sdf,
                 );
             }
         }
@@ -520,16 +568,14 @@ mod tests {
                 _ => panic!("face slot {slot} not a Node"),
             }
         }
-        match body_node.children[CORE_SLOT] {
-            Child::Node(id) => {
-                assert_eq!(lib.get(id).unwrap().uniform_type, block::STONE);
-            }
-            Child::Block(b) => assert_eq!(b, block::STONE),
-            _ => panic!("core slot empty"),
-        }
+        // Hollow planet: core slot is empty (no longer filled with
+        // uniform stone). Players dig into the editable shell-block
+        // content, not toward a core.
+        assert!(matches!(body_node.children[CORE_SLOT], Child::Empty));
         for s in 0..27 {
-            if s == CORE_SLOT || FACE_SLOTS.contains(&s) { continue; }
-            assert!(matches!(body_node.children[s], Child::Empty));
+            if FACE_SLOTS.contains(&s) { continue; }
+            assert!(matches!(body_node.children[s], Child::Empty),
+                "non-face slot {s} should be empty in hollow planet");
         }
     }
 }

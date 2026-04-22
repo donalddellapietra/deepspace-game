@@ -442,7 +442,16 @@ pub(super) fn cs_raycast(
         if t >= t_exit { break; }
         let local = sdf::add(oc, sdf::scale(ray_dir, t));
         let r = sdf::length(local);
-        if r >= cs_outer || r < cs_inner { break; }
+        if r >= cs_outer { break; }
+        if r < cs_inner {
+            // Hollow planet: traverse the inner void to the back-side
+            // shell. Re-enter the DDA there.
+            let t_inner_exit = ray_sphere_after(oc, ray_dir, cs_inner, t);
+            if !t_inner_exit.is_finite() || t_inner_exit >= t_exit { break; }
+            t = t_inner_exit + (shell * 1e-5).max(1e-7);
+            last_side = 6;
+            continue;
+        }
 
         let n = sdf::scale(local, 1.0 / r);
         let p_body = [
