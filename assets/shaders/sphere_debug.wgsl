@@ -26,6 +26,11 @@ struct SphereDebug {
     /// Axis-crossing for the LAST plane advance (0=u_lo, 1=u_hi,
     /// 2=v_lo, 3=v_hi, 4=r_lo, 5=r_hi). 6 = no plane taken.
     winning: u32,
+    /// Face-subtree root BFS idx at the point sphere_in_cell
+    /// handed off to the walker. For debugging whether a place
+    /// action changes the face_node_idx that the ground rays
+    /// descend into.
+    face_node_idx: u32,
 }
 
 fn sphere_debug_init() -> SphereDebug {
@@ -38,6 +43,7 @@ fn sphere_debug_init() -> SphereDebug {
     d.walker_ratio_depth = 0u;
     d.result_kind = 0u;
     d.winning = 6u;
+    d.face_node_idx = 0u;
     return d;
 }
 
@@ -115,6 +121,20 @@ fn sphere_debug_color(mode: u32, d: SphereDebug) -> vec3<f32> {
             let gm = f32(d.walker_ratio_v & 7u) / 7.0;
             let bm = f32(d.walker_ratio_depth & 7u) / 7.0;
             return vec3<f32>(rm, gm, bm);
+        }
+        // Mode 7: face_node_idx paint via Knuth multiplicative hash
+        // (0x9E3779B1 ~= golden ratio). Scatters adjacent BFS
+        // indices to visually distinct colors so small BFS-idx deltas
+        // between pre and post place become visible. If this painting
+        // differs pre vs post on rays that don't go through the
+        // placed cell, the tree pack or GPU upload is producing
+        // effectively different structure.
+        case 7u: {
+            let h = d.face_node_idx * 2654435761u;
+            let r = f32(h & 0xFFu) / 255.0;
+            let g = f32((h >> 8u) & 0xFFu) / 255.0;
+            let b = f32((h >> 16u) & 0xFFu) / 255.0;
+            return vec3<f32>(r, g, b);
         }
         default: { return vec3<f32>(1.0, 0.0, 1.0); }
     }

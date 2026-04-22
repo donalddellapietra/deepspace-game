@@ -221,3 +221,75 @@ Either (a) the sibling worktree had a different baseline state so its bug was a 
 
 Next: wire a shader debug mode 7 that paints the walker's terminal `node_idx` as a color hash — will show directly whether distant-ground rays get different terminal NodeIds pre vs post place.
 
+### 2026-04-22 — Mode 7 (face_node_idx hash) CONCRETE EVIDENCE
+
+Wired debug mode 7 to paint `face_node_idx * 2654435761` (Knuth
+multiplicative) as RGB. Captured before / after place:
+
+- Before: ground is UNIFORM PINK. Sky band above (different hash,
+  picking a different face). One face_node_idx value across the whole
+  ground.
+- After: ground is STRIPED — alternating WHITE and LIGHT-BLUE rows.
+  **Two distinct face_node_idx values alternating per pixel row.**
+
+### Conclusion
+
+The bug is at `pick_face(n)` (`sphere.wgsl:82-93`) flipping between two
+different faces on adjacent rays post-place — not a walker / pack /
+GPU-upload issue. Pre-place all ground rays pick one face (e.g. PosY);
+post-place adjacent rays alternate between two faces (e.g. PosY and
+PosZ).
+
+**Likely root cause chain:**
+1. Place modifies one subtree → walker's FIRST iteration returns
+   different cell for rays entering that subtree (legitimate).
+2. Different cell → different `w.u_lo/v_lo/r_lo/size` → different
+   plane normals → different `t_next` after empty-advance.
+3. Different `t` → slightly different `local = oc + ray_dir * t` →
+   slightly different `n = local / r` on the NEXT iteration.
+4. `pick_face(n)` is sensitive at face boundaries; a tiny `n` shift
+   flips the dominant axis, sending the ray into a different face
+   subtree.
+5. Adjacent rays flip faces independently → stripes.
+
+Camera being near the body's face boundary (offset 0.0036 from true
+center in z) puts many ground rays right on the PosY/PosZ border — so
+small `t` perturbations produce huge face-pick swings.
+
+### Next fix direction
+
+- Option A: make `pick_face` stable — reflect adjacent-face agreement
+  across the DDA history, not just on the current sample.
+- Option B: fix the t-perturbation upstream — make sure the DDA
+  advance gives identical t trajectories for rays that don't enter
+  the modified subtree.
+- Option C: investigate whether the bug even happens if camera is at
+  EXACT face center (x, z == 1.5 exactly). If no stripes there, it's
+  truly a face-boundary instability and Option A is the minimal fix.
+
+### 2026-04-22 — Option C tested
+
+Reran reproducer with `--spawn-xyz 1.5 1.7993 1.5` (z=1.5 exact,
+not 1.4988). Camera now on the PosY face axis precisely.
+
+- Mode 4 ground POST-place: **UNIFORM LIGHT-BLUE (r_lo)**. No stripes.
+- Mode 0 post-place: gray ground, yellow cube still looks hollow.
+
+**Two distinct bugs** confirmed:
+
+1. **Ground stripes** (camera-position sensitive). Fixed by exact
+   face-center camera. Root cause: `pick_face(n)` flipping between
+   two face subtrees when the ray's `n = local/r` sits near the
+   PosY/PosZ (or PosY/PosX) boundary. A tiny `t` perturbation from
+   DDA post-place shifts `n` across the boundary for some rays.
+
+2. **Hollow cube** (persists at exact face center). The cube's
+   visible faces shade with mixed last_sides (green v_lo and yellow
+   = shaded green) when they should all be r_lo (top face →
+   +n normal). This is a plane-DDA precision bug at d=10 cells —
+   the DDA's `argmin(t_u_lo, t_u_hi, t_v_lo, t_v_hi, t_r_lo, t_r_hi)`
+   is picking lateral planes when it should pick radial.
+
+Next iteration: fix bug 2 (the cube hollow). Keep bug 1 parked until
+bug 2 is addressed, since they're independent.
+

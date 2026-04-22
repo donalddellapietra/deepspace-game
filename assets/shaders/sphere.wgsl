@@ -504,6 +504,7 @@ fn sphere_in_cell(
         let walk_depth = face_lod_depth(t, reference_scale);
         let w = walk_face_subtree(face_node_idx, un_scaled, vn_scaled, rn_scaled, walk_depth);
 
+        dbg.face_node_idx = face_node_idx;
         dbg.walker_depth = w.depth;
         dbg.walker_size = w.size;
         dbg.walker_ratio_u = w.ratio_u;

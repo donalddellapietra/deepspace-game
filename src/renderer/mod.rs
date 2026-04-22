@@ -52,7 +52,7 @@ pub const ROOT_KIND_FACE: u32 = 2;
 /// Kept in sync with the `switch` in `sphere_debug_color` in
 /// `sphere.wgsl`. Incrementing here without adding a case there just
 /// paints magenta (default fallthrough).
-pub const SPHERE_DEBUG_MODE_COUNT: u32 = 7;
+pub const SPHERE_DEBUG_MODE_COUNT: u32 = 8;
 
 /// Human-readable name for each sphere debug mode; indexed by the
 /// mode value (0..SPHERE_DEBUG_MODE_COUNT). Used by the key handler
@@ -65,6 +65,7 @@ pub const SPHERE_DEBUG_MODE_NAMES: &[&str] = &[
     "winning plane axis (u_lo/u_hi/v_lo/v_hi/r_lo/r_hi)",
     "log cell size (rainbow, darker = smaller)",
     "ratio_u/ratio_v checkerboard (slot drift detector)",
+    "face_node_idx hash (tree-pack delta detector)",
 ];
 
 #[repr(C)]
