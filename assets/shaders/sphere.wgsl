@@ -92,6 +92,82 @@ fn pick_face(n: vec3<f32>) -> u32 {
     }
 }
 
+// ─────────────────────── face/body coord conversions
+//
+// GPU ports of src/world/cubesphere.rs face_uv_to_dir /
+// face_space_to_body_point / body_point_to_face_space, used by the
+// (future) GPU face-seam crossing in unified_dda.
+
+fn face_uv_to_dir(face: u32, u: f32, v: f32) -> vec3<f32> {
+    let cu = ea_to_cube(u);
+    let cv = ea_to_cube(v);
+    let n = face_normal(face);
+    let ua = face_u_axis(face);
+    let va = face_v_axis(face);
+    let raw = vec3<f32>(
+        n.x + cu * ua.x + cv * va.x,
+        n.y + cu * ua.y + cv * va.y,
+        n.z + cu * ua.z + cv * va.z,
+    );
+    return normalize(raw);
+}
+
+fn face_space_to_body_point(
+    face: u32,
+    un: f32, vn: f32, rn: f32,
+    inner_r: f32, outer_r: f32,
+    body_size: f32,
+) -> vec3<f32> {
+    let center = vec3<f32>(body_size * 0.5);
+    let radius = (inner_r + rn * (outer_r - inner_r)) * body_size;
+    let dir = face_uv_to_dir(face, un * 2.0 - 1.0, vn * 2.0 - 1.0);
+    return center + dir * radius;
+}
+
+struct FacePointShader {
+    face: u32,
+    un: f32,
+    vn: f32,
+    rn: f32,
+    valid: u32, // 0 = degenerate, 1 = ok
+}
+
+fn body_point_to_face_space(
+    point_body: vec3<f32>,
+    inner_r: f32, outer_r: f32,
+    body_size: f32,
+) -> FacePointShader {
+    var out: FacePointShader;
+    out.valid = 0u;
+    out.face = 0u;
+    out.un = 0.0;
+    out.vn = 0.0;
+    out.rn = 0.0;
+    let center = vec3<f32>(body_size * 0.5);
+    let offset = point_body - center;
+    let r = length(offset);
+    if r <= 1e-12 { return out; }
+    let n = offset / r;
+    let face = pick_face(n);
+    let n_axis = face_normal(face);
+    let u_axis = face_u_axis(face);
+    let v_axis = face_v_axis(face);
+    let axis_dot = dot(n, n_axis);
+    if abs(axis_dot) <= 1e-12 { return out; }
+    let cube_u = dot(n, u_axis) / axis_dot;
+    let cube_v = dot(n, v_axis) / axis_dot;
+    let inner = inner_r * body_size;
+    let outer = outer_r * body_size;
+    let shell = outer - inner;
+    if shell <= 0.0 { return out; }
+    out.face = face;
+    out.un = clamp((cube_to_ea(cube_u) + 1.0) * 0.5, 0.0, 0.9999999);
+    out.vn = clamp((cube_to_ea(cube_v) + 1.0) * 0.5, 0.0, 0.9999999);
+    out.rn = clamp((r - inner) / shell, 0.0, 0.9999999);
+    out.valid = 1u;
+    return out;
+}
+
 // ──────────────────────────────────────── face-subtree walker
 
 struct FaceWalkResult {
