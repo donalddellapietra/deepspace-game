@@ -164,3 +164,78 @@ optimization. Next iteration: re-test with uniform-flatten disabled
 ONLY for sphere face-subtree descendants, leaving Cartesian flatten
 intact.
 
+### 2026-04-22 post-compact — SDF_DETAIL_LEVELS and close-camera
+
+After session restart, re-ran bracket experiment
+`repro-sphere-d10-elevation.sh` at elev=30, 300, 3000 cells. Result:
+
+| Elev (cells) | Cam rn | Walker@step1 | Image |
+|---|---|---|---|
+| 30  | 0.504 | d=3 block=STONE | pure grey |
+| 300 | 0.509 | d=3 block=STONE | pure grey |
+| 3000| 0.647 | d=4 then empty, hit at d=4 step 5 | clean sphere |
+
+Forcing `--force-visual-depth 10` at elev=300: still
+`packed_nodes=11`, walker still terminates at depth=3. The GPU tree
+is simply NOT deeper than 4 in the central face chain, because the
+SDF worldgen caps at `cubesphere.rs:327 SDF_DETAIL_LEVELS = 4`.
+Below that, cells commit to solid/empty from their center sample
+and uniform-dedupe. So `--force-visual-depth` can't create detail
+the library doesn't hold.
+
+At elev=300 the spawn's `fly_to_surface_elevation` placed the
+camera 300 cells above what the CPU RAYCAST thinks is the surface,
+but the SDF-built tree represents that same region as a uniform
+STONE cell at d=3 (ratio 13,13,13 covers rn 0.481–0.518, camera
+rn=0.509 falls inside). Camera is embedded in stone per the GPU's
+tree. That is NOT the striped-ground bug — it is the "SDF detail
+< spawn depth" mismatch.
+
+### The actual striped bug, re-confirmed via GPU probe
+
+`repro-sphere-d10-bug.sh 0` (spawn world 1.5,1.7993,1.4988, pitch
+-0.5, place one block). Probed post-place pixels across the visible
+seam:
+
+- cube-face pixels (x=200 y=80, x=300 y=100/150/250):
+  `depth=8 ratio=(3280,3298,3564,8) winning=3 face_node_idx=18`
+- ground pixels (x=300 y=300, x=450 y=300):
+  `depth=4 ratio=(40,40,43,4) winning=4 face_node_idx=18`
+
+So post-place, adjacent regions terminate at different walker
+depths AND different winning faces. d=4 cell's r-face vs d=8 cell's
+v-face give different hit_normals → different shading. That seam IS
+the stripe.
+
+Placement never descends below d=8 even when anchor is d=10,
+because pack flattens the uniform-stone sub-subtrees into a single
+tag=1 leaf at the shallowest level where it becomes uniform.
+`build_child_entry` line 219: `if is_cart && uniform_type !=
+UNIFORM_MIXED → tag=1 leaf`.
+
+### User's framing restated
+
+"d≤8 intentional and works, d≥10 geometry breaks":
+- d≤8 works = the flattened-leaf cells at d≤8 render with clean
+  face-aligned shading. Every pixel on that region agrees on
+  winning-face.
+- d≥10 breaks = rays that should descend to d=10 (the anchor where
+  placed blocks live) don't, because pack has already flattened to
+  d=8. But adjacent rays that hit the tag=1 leaf at d=8 disagree
+  on winning face from pixels that hit a d=4 leaf → stripes.
+
+### Principled fix candidates (not yet tried, re-ranked)
+
+1. **Don't flatten uniform-stone subtrees inside a face subtree**
+   (sphere-only surgery to `build_child_entry`). Walker reaches the
+   anchor depth in the entire region. Cost: more packed nodes; may
+   blow past the 1M cap if a large stone region.
+2. **Pack all siblings along a placed-block's path at the anchor
+   depth**, not just the path cells. Unifies LOD in a neighborhood
+   of the placement. Lighter than (1) but needs spatial "nearby
+   placement" detection.
+3. **Smooth-radial shading only for sphere-body-face cells, axial
+   for Cartesian cells**. Tried `hit_normal = n` globally and it
+   destroyed the ground (plus hung). Scoped version has not been
+   tried.
+

@@ -119,7 +119,7 @@ impl CachedTree {
     /// Already-packed subtrees are reused (O(1)); new nodes get
     /// appended (O(nodes_new_to_this_call)).
     pub fn update_root(&mut self, library: &NodeLibrary, new_root: NodeId) {
-        let bfs = self.emit_or_lookup(library, new_root);
+        let bfs = self.emit_or_lookup(library, new_root, false);
         self.root_bfs_idx = bfs;
     }
 
@@ -130,14 +130,27 @@ impl CachedTree {
     /// a previously-packed NodeId returns the cached BFS idx with
     /// no buffer writes.
     pub fn ensure_root(&mut self, library: &NodeLibrary, nid: NodeId) -> u32 {
-        self.emit_or_lookup(library, nid)
+        self.emit_or_lookup(library, nid, false)
     }
 
     /// Resolve a NodeId to a BFS idx, packing it (and any missing
     /// descendants) on the fly. Content-addressed reuse via
     /// `bfs_by_nid`: if we packed this NodeId earlier, return that
     /// same BFS idx.
-    fn emit_or_lookup(&mut self, library: &NodeLibrary, nid: NodeId) -> u32 {
+    ///
+    /// `in_face_subtree`: true when any ancestor in the emit stack is
+    /// a `CubedSphereFace` root. Propagates to `build_child_entry` so
+    /// descendants of a face root skip the uniform-flatten optimization
+    /// — the sphere DDA's per-ray LOD terminates when it hits a
+    /// flattened tag=1 leaf, producing a seam between d=4 flattened
+    /// terrain and d=8+ placed-block subtrees (see
+    /// `docs/spheres/debug-progress-2-2-3-2.md`).
+    fn emit_or_lookup(
+        &mut self,
+        library: &NodeLibrary,
+        nid: NodeId,
+        in_face_subtree: bool,
+    ) -> u32 {
         if let Some(&bfs) = self.bfs_by_nid.get(&nid) {
             return bfs;
         }
@@ -148,12 +161,18 @@ impl CachedTree {
             (node.children, node.kind)
         };
 
+        // Descend: if THIS node is the face root, its Cartesian
+        // descendants should not be flattened. Otherwise, propagate
+        // the inherited flag.
+        let child_in_face = in_face_subtree
+            || matches!(kind, NodeKind::CubedSphereFace { .. });
+
         // Resolve every slot. Child::Node that's uniform-flat doesn't
         // recurse; Child::Node that's non-uniform gets packed here
         // (so its BFS idx is known when we push this node's slab).
         let mut slab: [Option<GpuChild>; 27] = [None; 27];
         for s in 0..27 {
-            slab[s] = self.build_child_entry(library, children[s]);
+            slab[s] = self.build_child_entry(library, children[s], child_in_face);
         }
 
         // Compute occupancy from the slab.
@@ -189,7 +208,19 @@ impl CachedTree {
     /// Applies content-driven uniform-flatten (Cartesian only) so
     /// uniform subtrees collapse to a single Block. Non-uniform
     /// Child::Node recursively packs its subtree.
-    fn build_child_entry(&mut self, library: &NodeLibrary, child: Child) -> Option<GpuChild> {
+    ///
+    /// When `in_face_subtree` is true the uniform-flatten is skipped
+    /// for non-empty uniform subtrees: the sphere DDA needs walker
+    /// descent to reach the anchor depth everywhere inside a face
+    /// subtree to avoid LOD-seam stripes at the d=4 terrain / d=10
+    /// placement boundary. Empty subtrees still vanish — the walker
+    /// treats missing slots as empty-cell advance, no shading seam.
+    fn build_child_entry(
+        &mut self,
+        library: &NodeLibrary,
+        child: Child,
+        in_face_subtree: bool,
+    ) -> Option<GpuChild> {
         match child {
             Child::Empty => None,
             Child::Block(bt) => Some(GpuChild::new(1, bt, 0, 0)),
@@ -216,10 +247,13 @@ impl CachedTree {
                 };
                 if is_cart && uniform_type == UNIFORM_EMPTY {
                     None
-                } else if is_cart && uniform_type != UNIFORM_MIXED {
+                } else if is_cart
+                    && uniform_type != UNIFORM_MIXED
+                    && !in_face_subtree
+                {
                     Some(GpuChild::new(1, uniform_type, 0, 0))
                 } else {
-                    let child_bfs = self.emit_or_lookup(library, child_id);
+                    let child_bfs = self.emit_or_lookup(library, child_id, in_face_subtree);
                     // `flags` filled in by the caller when emitting
                     // the parent's slab (carries content AABB bits),
                     // at which point the child's occupancy is known.
