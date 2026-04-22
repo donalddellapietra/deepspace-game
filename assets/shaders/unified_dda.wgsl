@@ -174,6 +174,88 @@ fn body_point_to_face_space(
     return fp;
 }
 
+// Port of `face_space_to_body_point` in `src/world/cubesphere`.
+// Given face-normalized `(un, vn, rn) ∈ [0,1]³` and shell radii in
+// body-size units (body_size = 3), return the body-local point.
+// Used when reconstructing the exit body-space position at a face
+// subtree's seam boundary so the neighbor face's entry point can be
+// computed geometrically.
+fn face_space_to_body_point(
+    face: u32, un: f32, vn: f32, rn: f32,
+    inner_body: f32, outer_body: f32,
+) -> vec3<f32> {
+    let u_ea = 2.0 * un - 1.0;
+    let v_ea = 2.0 * vn - 1.0;
+    // ea_to_cube(x) = tan(x · π/4).
+    let cu = tan(u_ea * 0.78539816);
+    let cv = tan(v_ea * 0.78539816);
+    let basis = face_basis(face);
+    // body direction = normalize(n + cu * u + cv * v). The basis
+    // vectors are unit and mutually orthogonal, so the un-normalized
+    // length is sqrt(1 + cu² + cv²).
+    let px = basis.n_axis.x + cu * basis.u_axis.x + cv * basis.v_axis.x;
+    let py = basis.n_axis.y + cu * basis.u_axis.y + cv * basis.v_axis.y;
+    let pz = basis.n_axis.z + cu * basis.u_axis.z + cv * basis.v_axis.z;
+    let plen = sqrt(px * px + py * py + pz * pz);
+    let inv = 1.0 / max(plen, 1e-12);
+    let dir = vec3<f32>(px * inv, py * inv, pz * inv);
+    let r = inner_body + (outer_body - inner_body) * rn;
+    return vec3<f32>(1.5) + dir * r;
+}
+
+// Project a body-local point onto a SPECIFIED face's normalized
+// `(un, vn, rn)` coords. Unlike `body_point_to_face_space` — which
+// picks the face by dominant axis — this helper is told which face
+// to use and is safe for seam-crossing handoff: points on a shared
+// cube edge (two faces of equal dominant axis) are projected onto
+// the caller's explicit choice.
+//
+// Geometry: normalize the direction from the body center, then
+// project onto the chosen face's plane (component along the face's
+// normal axis). The in-plane components along the face's `(u, v)`
+// tangents give the cube coords; `cube_to_ea` warps them to the
+// equal-angle face coord, scaled into `[0, 1]`. `rn` is the radial
+// position on the shell and is invariant across seams.
+fn body_point_to_face_forced(
+    point_body: vec3<f32>, inner_body: f32, outer_body: f32, face: u32,
+) -> FacePoint {
+    var fp: FacePoint;
+    let d = point_body - vec3<f32>(1.5);
+    let r2 = dot(d, d);
+    if r2 < 1e-12 {
+        fp.face = face;
+        fp.un = 0.5;
+        fp.vn = 0.5;
+        fp.rn = 0.0;
+        fp.r = 0.0;
+        return fp;
+    }
+    let r = sqrt(r2);
+    let n = d / r;
+    let basis = face_basis(face);
+    // `basis.n_axis` is the outward face normal; project n onto it.
+    // `n_comp` is |cos(angle)| — for a point near the face, this is
+    // close to 1. On the shared cube edge it's ~0.707.
+    let n_comp = dot(basis.n_axis, n);
+    // Cube coords: component along face's u/v, divided by n_comp to
+    // undo the oblique-projection foreshortening.
+    let inv_n = 1.0 / max(abs(n_comp), 1e-6);
+    let cube_u = dot(basis.u_axis, n) * inv_n * sign_or_one(n_comp);
+    let cube_v = dot(basis.v_axis, n) * inv_n * sign_or_one(n_comp);
+    let u_ea = atan(cube_u) * (4.0 / 3.14159265);
+    let v_ea = atan(cube_v) * (4.0 / 3.14159265);
+    fp.face = face;
+    fp.un = clamp(0.5 * (u_ea + 1.0), 0.0, 1.0);
+    fp.vn = clamp(0.5 * (v_ea + 1.0), 0.0, 1.0);
+    fp.rn = clamp((r - inner_body) / (outer_body - inner_body), 0.0, 1.0);
+    fp.r = r;
+    return fp;
+}
+
+fn sign_or_one(x: f32) -> f32 {
+    return select(-1.0, 1.0, x >= 0.0);
+}
+
 // ────────────────────────────────── Face subtree walker
 //
 // Cartesian DDA over a face subtree's descendants. Called from
@@ -277,17 +359,35 @@ fn march_face_subtree(
         // Bubble-up: cell OOB in the current node's `[0, 3)³`.
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u {
-                // Root bubble-out: classify which axis exited for the
-                // caller's shell-exit dispatch. Face-local axes
-                // (u, v, r) map to (x, y, z) in the face_dir's frame.
-                let exit_pos = entry_pos + face_dir * min(min(cur_side_dist.x, cur_side_dist.y), cur_side_dist.z);
+                // Root bubble-out: classify which axis exited and
+                // compute the exit point at the face-local boundary
+                // plane the ray crossed. We intersect the ray with
+                // the plane defined by the OOB axis (x=0/3, y=0/3,
+                // or z=0/3) — this is precise regardless of how many
+                // axis steps the DDA took to get here. Face-local
+                // axes (u, v, r) map to (x, y, z) in face_dir's frame.
                 var axis_code: f32 = -1.0;
-                if cell.z < 0 { axis_code = 0.0; }      // r- (inner shell)
-                else if cell.z > 2 { axis_code = 1.0; } // r+ (outer shell)
-                else if cell.x < 0 { axis_code = 2.0; } // u-
-                else if cell.x > 2 { axis_code = 3.0; } // u+
-                else if cell.y < 0 { axis_code = 4.0; } // v-
-                else if cell.y > 2 { axis_code = 5.0; } // v+
+                var t_exit: f32 = 0.0;
+                if cell.z < 0 {
+                    axis_code = 0.0;      // r- (inner shell)
+                    t_exit = (0.0 - entry_pos.z) * inv_dir.z;
+                } else if cell.z > 2 {
+                    axis_code = 1.0;      // r+ (outer shell)
+                    t_exit = (3.0 - entry_pos.z) * inv_dir.z;
+                } else if cell.x < 0 {
+                    axis_code = 2.0;      // u-
+                    t_exit = (0.0 - entry_pos.x) * inv_dir.x;
+                } else if cell.x > 2 {
+                    axis_code = 3.0;      // u+
+                    t_exit = (3.0 - entry_pos.x) * inv_dir.x;
+                } else if cell.y < 0 {
+                    axis_code = 4.0;      // v-
+                    t_exit = (0.0 - entry_pos.y) * inv_dir.y;
+                } else if cell.y > 2 {
+                    axis_code = 5.0;      // v+
+                    t_exit = (3.0 - entry_pos.y) * inv_dir.y;
+                }
+                let exit_pos = entry_pos + face_dir * max(t_exit, 0.0);
                 result.hit = false;
                 result.cell_min = exit_pos;
                 result.cell_size = axis_code;
@@ -569,10 +669,19 @@ fn unified_dda(
             // cur_cell_size` and the outer shell radius is
             // `outer_r * 3 * cur_cell_size`. radii are stored in the
             // cell-local `[0, 1)` convention per the worldgen spec.
+            //
+            // Stage 3: when the face walker exits at a UV boundary we
+            // look up the adjacent face in `seam_table`, rotate the
+            // body-space ray into the neighbor's frame, and restart
+            // the walker on the neighbor face subtree. This continues
+            // up to `MAX_SEAM_TRANSITIONS` times to bound pathological
+            // grazing rays.
             let kind_data = node_kinds[s_node_idx[depth]];
             let body_center = cur_node_origin + vec3<f32>(1.5 * cur_cell_size);
             let outer_rib = kind_data.outer_r * 3.0 * cur_cell_size;
             let inner_rib = kind_data.inner_r * 3.0 * cur_cell_size;
+            let inner_body = inner_rib / cur_cell_size; // in body-size=3 units
+            let outer_body = outer_rib / cur_cell_size;
 
             // Stable Numerical-Recipes ray-sphere (camera can be
             // inside or outside the shell).
@@ -591,26 +700,17 @@ fn unified_dda(
                 continue;
             }
             let sq_outer = sqrt(disc_outer);
-            // Entry: farthest backward intersection still in front
-            // of the camera (camera outside) or t=0 (camera inside
-            // shell). We bias by 0 then optionally step inward.
             let t0 = -b - sq_outer;
             let t1 = -b + sq_outer;
             var t_enter_outer = t0;
             if t_enter_outer < 0.0 { t_enter_outer = t1; }
             if t_enter_outer < 0.0 {
-                // Both intersections behind camera — treat as miss.
                 let m_miss = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_miss) * step);
                 cur_side_dist += m_miss * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_miss;
                 continue;
             }
-            // When the camera is outside the outer shell, step inward
-            // by a tiny epsilon so the entry point is strictly inside.
-            // When the camera is already inside (t0 < 0), t_enter =
-            // t1 represents the exit — don't use it as a face-entry,
-            // fall back to t=0 (camera is already at entry).
             var t_enter = t_enter_outer;
             if t0 < 0.0 {
                 t_enter = 0.0;
@@ -619,95 +719,151 @@ fn unified_dda(
             let entry_rib = ray_origin + ray_dir * t_enter;
             let entry_body = (entry_rib - cur_node_origin) / cur_cell_size; // in [0, 3)
 
-            // Nudge inward along the inward-normal to avoid numerical
-            // boundary issues at rn = 1.0.
-            let fp = body_point_to_face_space(entry_body, inner_rib / cur_cell_size, outer_rib / cur_cell_size);
-            let face = fp.face;
-            let face_slot = FACE_SLOTS[face];
+            // Entry face picked by dominant axis.
+            var fp = body_point_to_face_space(entry_body, inner_body, outer_body);
+            var cur_face: u32 = fp.face;
+            var cur_un: f32 = fp.un;
+            var cur_vn: f32 = fp.vn;
+            var cur_rn: f32 = fp.rn;
 
-            // Check that the body's child slot for this face is a
-            // tag=2 Node child; if not (degenerate body with empty
-            // face), treat as miss.
-            let face_bit = 1u << face_slot;
-            if (cur_occupancy & face_bit) == 0u {
-                let m_ef = min_axis_mask(cur_side_dist);
-                s_cell[depth] = pack_cell(cell + vec3<i32>(m_ef) * step);
-                cur_side_dist += m_ef * delta_dist * cur_cell_size;
-                normal = -vec3<f32>(step) * m_ef;
-                continue;
+            // Loop across seam crossings. Each iteration calls
+            // `march_face_subtree` on the current face; on UV-exit we
+            // hop to the neighbor face via `seam_table` and continue.
+            var seam_hit = false;
+            var seam_result: HitResult;
+            seam_result.hit = false;
+            // Track whether we exited the body cell entirely (r+ or
+            // shell miss), so the outer DDA can advance past it.
+            var body_cell_exit = false;
+            // Whether we should descend into the core subtree after
+            // this iteration (inner shell).
+            var do_core_dispatch = false;
+
+            var seam_count: u32 = 0u;
+            loop {
+                if seam_count >= MAX_SEAM_TRANSITIONS {
+                    // Pathological grazing ray: bail out as if the
+                    // ray passed through without hitting anything.
+                    body_cell_exit = true;
+                    break;
+                }
+                seam_count += 1u;
+
+                let face_slot = FACE_SLOTS[cur_face];
+                let face_bit = 1u << face_slot;
+                if (cur_occupancy & face_bit) == 0u {
+                    // No face subtree present (degenerate body).
+                    body_cell_exit = true;
+                    break;
+                }
+                let face_rank = countOneBits(cur_occupancy & (face_bit - 1u));
+                let face_child_base = cur_first_child + face_rank * 2u;
+                let face_packed = tree[face_child_base];
+                let face_tag = face_packed & 0xFFu;
+                if face_tag != 2u {
+                    body_cell_exit = true;
+                    break;
+                }
+                let face_root_idx = tree[face_child_base + 1u];
+
+                // Rotate ray_dir into current face's local basis.
+                let basis_cur = face_basis(cur_face);
+                let face_dir = vec3<f32>(
+                    dot(basis_cur.u_axis, ray_dir),
+                    dot(basis_cur.v_axis, ray_dir),
+                    dot(basis_cur.n_axis, ray_dir),
+                );
+                let face_origin_local = vec3<f32>(cur_un * 3.0, cur_vn * 3.0, cur_rn * 3.0);
+
+                let sub = march_face_subtree(face_root_idx, face_origin_local, face_dir);
+                if sub.hit {
+                    // Hit inside this face subtree.
+                    seam_result.hit = true;
+                    seam_result.t = t_enter + sub.t * cur_cell_size;
+                    seam_result.color = sub.color;
+                    let face_n = sub.normal;
+                    let body_n = basis_cur.u_axis * face_n.x
+                               + basis_cur.v_axis * face_n.y
+                               + basis_cur.n_axis * face_n.z;
+                    seam_result.normal = body_n;
+                    seam_result.cell_min = entry_rib;
+                    seam_result.cell_size = cur_cell_size;
+                    seam_result.frame_level = 0u;
+                    seam_result.frame_scale = 1.0;
+                    seam_hit = true;
+                    break;
+                }
+
+                let axis_code = sub.cell_size;
+                if axis_code == 0.0 {
+                    // Inner shell exit: break out to core-dispatch
+                    // code below.
+                    do_core_dispatch = true;
+                    break;
+                }
+                if axis_code == 1.0 || axis_code < 0.0 {
+                    // Outer-shell exit or walker exhaustion: the ray
+                    // has passed through the body cell entirely.
+                    body_cell_exit = true;
+                    break;
+                }
+
+                // Axis codes 2..=5 encode a UV boundary exit:
+                //   2 = u- (residual.x < 0)   → edge 0
+                //   3 = u+ (residual.x ≥ 3)   → edge 1
+                //   4 = v- (residual.y < 0)   → edge 2
+                //   5 = v+ (residual.y ≥ 3)   → edge 3
+                // The walker already picked a single exit axis; the
+                // cube-corner tie-break (two axes OOB simultaneously)
+                // is implicit in the walker's priority order
+                // (r first, then x, then y). For grazing rays that
+                // hit a corner the walker's pick is deterministic
+                // and both candidate seams ultimately connect so
+                // either choice is fine geometrically.
+                let exit_pos_face = sub.cell_min; // (u, v, r) * 3
+                var exit_edge: u32;
+                if axis_code == 2.0 { exit_edge = 0u; }
+                else if axis_code == 3.0 { exit_edge = 1u; }
+                else if axis_code == 4.0 { exit_edge = 2u; }
+                else { exit_edge = 3u; } // 5.0 = v+
+
+                // Look up neighbor face from the precomputed seam
+                // table. 4 edges per face; skip the R_seam multiply
+                // for rd_local since `ray_dir` is already in
+                // body-local coords — the next iteration re-rotates
+                // via the neighbor's basis directly (equivalent by
+                // construction: R_nbr · ray_dir = R_seam · R_cur · ray_dir).
+                let seam_idx = cur_face * 4u + exit_edge;
+                let seam = seam_table[seam_idx];
+                let neighbor_face = seam.face_pad.x;
+
+                // Reconstruct the exit body-space point from the
+                // face-local exit (un, vn, rn) and re-project onto
+                // the neighbor face. Both steps are O(1) and stay
+                // in body-local [0, 3)³ coords — no absolute world
+                // coordinates enter.
+                let exit_un = clamp(exit_pos_face.x * (1.0 / 3.0), 0.0, 1.0);
+                let exit_vn = clamp(exit_pos_face.y * (1.0 / 3.0), 0.0, 1.0);
+                let exit_rn = clamp(exit_pos_face.z * (1.0 / 3.0), 0.0, 1.0);
+                let exit_body = face_space_to_body_point(
+                    cur_face, exit_un, exit_vn, exit_rn,
+                    inner_body, outer_body,
+                );
+                let fp_nbr = body_point_to_face_forced(
+                    exit_body, inner_body, outer_body, neighbor_face,
+                );
+
+                cur_face = neighbor_face;
+                cur_un = fp_nbr.un;
+                cur_vn = fp_nbr.vn;
+                cur_rn = fp_nbr.rn;
+                // Loop back and walk the neighbor face subtree.
             }
-            let face_rank = countOneBits(cur_occupancy & (face_bit - 1u));
-            let face_child_base = cur_first_child + face_rank * 2u;
-            let face_packed = tree[face_child_base];
-            let face_tag = face_packed & 0xFFu;
-            if face_tag != 2u {
-                // Shouldn't happen for well-formed bodies, but guard.
-                let m_ef = min_axis_mask(cur_side_dist);
-                s_cell[depth] = pack_cell(cell + vec3<i32>(m_ef) * step);
-                cur_side_dist += m_ef * delta_dist * cur_cell_size;
-                normal = -vec3<f32>(step) * m_ef;
-                continue;
+
+            if seam_hit {
+                return seam_result;
             }
-            let face_root_idx = tree[face_child_base + 1u];
-
-            // Rotate ray_dir into face-local coords. `basis` rows are
-            // (u_axis, v_axis, n_axis) so `face_dir` components are
-            //   face_dir.x = dot(u_axis, ray_dir)   // along u
-            //   face_dir.y = dot(v_axis, ray_dir)   // along v
-            //   face_dir.z = dot(n_axis, ray_dir)   // outward (r+)
-            // All three basis vectors are orthonormal in body-local
-            // coords — the rotation preserves |ray_dir| exactly.
-            let basis = face_basis(face);
-            let face_dir = vec3<f32>(
-                dot(basis.u_axis, ray_dir),
-                dot(basis.v_axis, ray_dir),
-                dot(basis.n_axis, ray_dir),
-            );
-            // Face-local entry at `(un, vn, rn) * 3`, nudged inward
-            // by a small margin along `-n` so the walker starts
-            // strictly inside `[0, 3)³`.
-            let face_origin_local = vec3<f32>(fp.un * 3.0, fp.vn * 3.0, fp.rn * 3.0);
-
-            var sub = march_face_subtree(face_root_idx, face_origin_local, face_dir);
-            if sub.hit {
-                // Convert face-local hit back to ribbon-frame. The
-                // linearization approximation: face-local distance ≈
-                // body-local distance ≈ ribbon distance / cur_cell_size
-                // at the face center; sub.t is in face-local units.
-                //
-                // For depth-buffer purposes the body-entry t_enter
-                // dominates (most rays hit near the outer shell), so
-                // we use t_enter + sub.t * face_to_ribbon_scale where
-                // the scale is cur_cell_size (first-order correct at
-                // the face center).
-                result.hit = true;
-                result.t = t_enter + sub.t * cur_cell_size;
-                result.color = sub.color;
-                // Rotate the face-local normal back to body-local for
-                // a reasonable first-approximation shading normal.
-                let face_n = sub.normal;
-                let body_n = basis.u_axis * face_n.x
-                           + basis.v_axis * face_n.y
-                           + basis.n_axis * face_n.z;
-                result.normal = body_n;
-                // cell_min/cell_size: report the body-local entry
-                // point's immediate neighborhood. For Stage 2 this
-                // is an approximate box; Stage 4 rebuilds it via
-                // face_space_to_body_point on the hit's face-local
-                // cell corners.
-                result.cell_min = entry_rib;
-                result.cell_size = cur_cell_size;
-                return result;
-            }
-
-            // Face walker exited without hitting. Classify the exit
-            // axis (packed into sub.cell_size by the walker):
-            //   0 = r- (inner shell)     → descend into core subtree
-            //   1 = r+ (outer shell)     → body-cell exit
-            //   2,3 = u- / u+ (UV seam)  → Stage 2: terminate as miss
-            //   4,5 = v- / v+ (UV seam)  → Stage 2: terminate as miss
-            let axis_code = sub.cell_size;
-            if axis_code == 0.0 {
+            if do_core_dispatch {
                 // Inner shell → core subtree (CORE_SLOT child).
                 let core_bit = 1u << CORE_SLOT;
                 if (cur_occupancy & core_bit) == 0u {
@@ -724,9 +880,7 @@ fn unified_dda(
                 let core_tag = core_packed & 0xFFu;
                 if core_tag == 1u {
                     // Inner shell hits solid core directly.
-                    let cell_min_h = body_center - vec3<f32>(inner_rib);
                     result.hit = true;
-                    // t_enter_inner: cross the ray-inner-sphere.
                     let c_inner = dot(oc, oc) - inner_rib * inner_rib;
                     let disc_inner = b * b - c_inner;
                     var t_hit = t_enter;
@@ -745,22 +899,10 @@ fn unified_dda(
                     result.cell_size = inner_rib;
                     return result;
                 }
-                // Non-block core: fall through to miss for Stage 2
-                // (core subtree descent not wired — Stage 3 expands
-                // this path into a proper sub-walker).
-                let m_ef = min_axis_mask(cur_side_dist);
-                s_cell[depth] = pack_cell(cell + vec3<i32>(m_ef) * step);
-                cur_side_dist += m_ef * delta_dist * cur_cell_size;
-                normal = -vec3<f32>(step) * m_ef;
-                continue;
+                // Non-block core: fall through to body-cell exit.
             }
-            // Outer shell exit or UV-seam exit: advance past the
-            // body cell. The DDA cell-step handles outer-shell exits
-            // correctly (the ray has effectively passed through the
-            // body without hitting anything); UV-seam exits are
-            // Stage 3's concern — for Stage 2 we also advance past
-            // the body cell, which visually produces cube-edge
-            // silhouette cutoffs (the expected Stage 2 artifact).
+
+            // body_cell_exit fallthrough: advance past the body cell.
             let m_ef = min_axis_mask(cur_side_dist);
             s_cell[depth] = pack_cell(cell + vec3<i32>(m_ef) * step);
             cur_side_dist += m_ef * delta_dist * cur_cell_size;

@@ -138,6 +138,62 @@ pub struct GpuCamera {
     pub view_proj: [[f32; 4]; 4],
 }
 
+/// One entry in the shader-side seam-rotation table. 64 bytes,
+/// std430-compatible. Indexed as `seam_table[face * 4 + edge]`
+/// where `face ∈ 0..6` (Face discriminant) and
+/// `edge ∈ 0..4` (`0 = -u`, `1 = +u`, `2 = -v`, `3 = +v`).
+///
+/// Mirrors `SeamEntry` in `bindings.wgsl`. The shader reads the
+/// neighbor face and then rotates `ray_dir` via `R_seam` to get the
+/// ray direction in the neighbor face's orthonormal `(u, v, n)` basis.
+///
+/// Layout choice: the 3×3 rotation is stored as three `vec4<f32>`
+/// rows (with the last lane padded) so the WGSL struct's alignment
+/// matches the CPU's `repr(C)` layout exactly without any per-row
+/// std140 padding surprises. Each row lives in the first three lanes
+/// of a `vec4`; the shader reconstructs the matrix row-by-row.
+///
+/// Precomputed at renderer init from `SEAM_TABLE` in
+/// `src/world/cubesphere/seams.rs`; never mutated per-frame.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
+pub struct GpuSeamEntry {
+    /// Discriminant of the neighbor `Face` (0..=5).
+    pub neighbor_face: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    /// Row 0 of `R_seam` (first 3 lanes), pad in lane 3.
+    pub rotation_row0: [f32; 4],
+    pub rotation_row1: [f32; 4],
+    pub rotation_row2: [f32; 4],
+}
+
+/// Build the flat GPU-ready seam table from the CPU-side
+/// `SEAM_TABLE`. Produces 24 entries in face-major / edge-minor
+/// order — the same `[face * 4 + edge]` indexing the shader uses.
+///
+/// Called once per renderer at init — the table never changes.
+pub fn build_seam_table() -> [GpuSeamEntry; 24] {
+    use crate::world::cubesphere::seams::SEAM_TABLE;
+    let mut out = [GpuSeamEntry::default(); 24];
+    for (fi, face_rows) in SEAM_TABLE.iter().enumerate() {
+        for (ei, entry) in face_rows.iter().enumerate() {
+            let r = entry.rotation;
+            out[fi * 4 + ei] = GpuSeamEntry {
+                neighbor_face: entry.neighbor_face as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+                rotation_row0: [r[0][0], r[0][1], r[0][2], 0.0],
+                rotation_row1: [r[1][0], r[1][1], r[1][2], 0.0],
+                rotation_row2: [r[2][0], r[2][1], r[2][2], 0.0],
+            };
+        }
+    }
+    out
+}
+
 /// One entity instance on the GPU: a bounding cube in the current
 /// render frame's [0, 3)³ local coords plus a BFS idx into the
 /// shared `tree[]` buffer for the entity's voxel subtree.
@@ -184,5 +240,37 @@ mod tests {
     fn from_node_kind_cartesian() {
         let k = GpuNodeKind::from_node_kind(NodeKind::Cartesian);
         assert_eq!(k.kind, 0);
+    }
+
+    #[test]
+    fn gpu_seam_entry_size() {
+        // 64 bytes = 4 u32 header + 3 vec4 rotation rows.
+        assert_eq!(std::mem::size_of::<GpuSeamEntry>(), 64);
+    }
+
+    #[test]
+    fn build_seam_table_roundtrip() {
+        use crate::world::cubesphere::seams::SEAM_TABLE;
+        let flat = build_seam_table();
+        for (fi, face_rows) in SEAM_TABLE.iter().enumerate() {
+            for (ei, entry) in face_rows.iter().enumerate() {
+                let g = flat[fi * 4 + ei];
+                assert_eq!(
+                    g.neighbor_face,
+                    entry.neighbor_face as u32,
+                    "face {fi} edge {ei} neighbor mismatch",
+                );
+                let r = entry.rotation;
+                for col in 0..3 {
+                    assert_eq!(g.rotation_row0[col], r[0][col], "row0 col{col}");
+                    assert_eq!(g.rotation_row1[col], r[1][col], "row1 col{col}");
+                    assert_eq!(g.rotation_row2[col], r[2][col], "row2 col{col}");
+                }
+            }
+        }
+        // Every edge must point to a valid face index.
+        for entry in flat.iter() {
+            assert!(entry.neighbor_face < 6);
+        }
     }
 }

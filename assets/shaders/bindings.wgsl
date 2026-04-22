@@ -194,6 +194,23 @@ struct EntityGpu {
 }
 @group(0) @binding(10) var<storage, read> entities: array<EntityGpu>;
 
+/// One entry in the seam-rotation table (binding 11). Laid out so
+/// the CPU-side `GpuSeamEntry` is byte-for-byte compatible:
+///   * `neighbor_face` in lane 0 of `face_pad` (+ 3 pad lanes).
+///   * `row0/row1/row2` hold the three rows of `R_seam` (a 3×3
+///     rotation that maps `ray_dir` from the current face's
+///     `(u, v, n)` basis into the neighbor face's `(u, v, n)` basis).
+///     Padding lane 3 is unused.
+/// Indexed by `seam_table[current_face * 4u + edge]`, where
+/// `edge ∈ 0..4` encodes `0 = -u, 1 = +u, 2 = -v, 3 = +v`.
+struct SeamEntry {
+    face_pad: vec4<u32>,
+    row0: vec4<f32>,
+    row1: vec4<f32>,
+    row2: vec4<f32>,
+}
+@group(0) @binding(11) var<storage, read> seam_table: array<SeamEntry>;
+
 /// Coarse beam-prepass mask. The fine fragment shader samples a 5-tap
 /// neighborhood at each pixel's tile: if every tap reads 0.0, the
 /// pixel is definitively sky and we return the sky color without
@@ -254,6 +271,15 @@ override ENABLE_ENTITIES: bool = false;
 override LOD_PIXEL_THRESHOLD: f32 = 1.0;
 
 const MAX_FACE_DEPTH: u32 = 63u;
+
+/// Upper bound on face-seam crossings per ray. A well-behaved ray
+/// crosses at most ~3 seams on its way through a cubed sphere; we
+/// cap higher for pathological grazing rays that might re-enter
+/// the same face after a tangent slide, and bail out to a miss if
+/// the cap triggers. The CPU-side `SEAM_TABLE` guarantees the
+/// `(face, edge) -> (neighbor_face, R_seam)` lookup is closed: no
+/// infinite loop can arise from the rotation data itself.
+const MAX_SEAM_TRANSITIONS: u32 = 64u;
 
 /// Cartesian DDA stack depth — the hard descent ceiling.
 ///

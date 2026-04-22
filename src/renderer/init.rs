@@ -4,7 +4,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::world::gpu::{GpuCamera, GpuEntity, GpuNodeKind, GpuRibbonEntry};
+use crate::world::gpu::{build_seam_table, GpuCamera, GpuEntity, GpuNodeKind, GpuRibbonEntry};
 use crate::world::tree::MAX_DEPTH;
 
 use super::buffers::make_bind_group;
@@ -296,6 +296,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Seam-rotation table (binding 11). 24 entries × 64 bytes =
+        // 1536 bytes, uploaded once at init. The unified DDA's
+        // face-seam-crossing branch reads a `(neighbor_face, R_seam)`
+        // pair by `seam_table[current_face * 4u + edge]`, where
+        // `edge ∈ 0..4` encodes -u / +u / -v / +v.
+        let seam_table_data = build_seam_table();
+        let seam_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("seam_table"),
+            contents: bytemuck::cast_slice(&seam_table_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let shader_stats_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shader_stats"),
             size: 64,
@@ -408,6 +420,18 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Seam-rotation table (binding 11). 24 entries, each
+                // `(neighbor_face, R_seam)` giving the face+rotation
+                // the ray lands in after crossing a face-subtree UV
+                // boundary. Read-only; populated once at init from
+                // `SEAM_TABLE` in `src/world/cubesphere/seams.rs`.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
@@ -431,6 +455,7 @@ impl Renderer {
             &aabbs_buffer,
             &mask_view,
             &entity_buffer,
+            &seam_table_buffer,
         );
         let coarse_bind_group = make_bind_group(
             &device, &bind_group_layout,
@@ -440,6 +465,7 @@ impl Renderer {
             &aabbs_buffer,
             &dummy_mask_view,
             &entity_buffer,
+            &seam_table_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -657,6 +683,7 @@ impl Renderer {
             palette_buffer, uniforms_buffer,
             ribbon_buffer,
             entity_buffer,
+            seam_table_buffer,
             uploaded_entities_count: 0,
             entity_count: 0,
             bind_group,

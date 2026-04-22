@@ -36,4 +36,4 @@ mod types;
 
 pub use pack::{pack_tree, CachedTree};
 pub use ribbon::{build_ribbon, GpuRibbonEntry};
-pub use types::{GpuCamera, GpuChild, GpuEntity, GpuNodeKind};
+pub use types::{build_seam_table, GpuCamera, GpuChild, GpuEntity, GpuNodeKind, GpuSeamEntry};

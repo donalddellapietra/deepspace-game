@@ -124,6 +124,13 @@ pub struct Renderer {
     pub(super) palette_buffer: wgpu::Buffer,
     pub(super) uniforms_buffer: wgpu::Buffer,
     pub(super) ribbon_buffer: wgpu::Buffer,
+    /// Precomputed 24-entry seam-rotation table (binding 11).
+    /// Layout matches `GpuSeamEntry` / shader-side `SeamEntry`:
+    /// 64 bytes per entry × 24 = 1536 bytes total. Uploaded once at
+    /// renderer init from `build_seam_table()`; never mutated. The
+    /// unified DDA's face-seam-crossing branch reads it by
+    /// `seam_table[face * 4u + edge]`.
+    pub(super) seam_table_buffer: wgpu::Buffer,
     pub(super) bind_group: wgpu::BindGroup,
     pub(super) root_index: u32,
     pub(super) node_count: u32,
@@ -338,6 +345,7 @@ impl Renderer {
             &self.aabbs_buffer,
             &self.mask_view,
             &self.entity_buffer,
+            &self.seam_table_buffer,
         );
         // coarse_bind_group uses the dummy mask view which doesn't
         // resize, so it stays valid across resizes.
