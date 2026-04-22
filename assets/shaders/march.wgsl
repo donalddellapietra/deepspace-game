@@ -834,11 +834,13 @@ fn unified_dda(
             current_idx, ray_origin, ray_dir,
             rd_body_recovered, uniforms.max_depth,
         );
-        // On miss, force the caller to stop — do not ribbon-pop.
-        // Authoritative result for the face subtree.
-        if !r.hit {
-            *out_force_terminate = 1u;
-        }
+        // No force_terminate here. Sub-frame miss is now allowed to
+        // ribbon-pop because the march() loop's pop logic now skips
+        // intermediate face-root levels (which were the source of
+        // the original "march_cartesian misinterprets UVR as XYZ"
+        // visual artifacts that motivated force_terminate). Pops
+        // continue to the body level, where sphere_in_cell handles
+        // any face-seam crossing naturally as part of body march.
         return r;
     }
     if cur_kind == 1u {
@@ -927,44 +929,61 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             return r;
         }
 
-        // Ray exited the current frame. Pop one ancestor.
-        if ribbon_level >= uniforms.ribbon_count {
-            break;
-        }
-        let entry = ribbon[ribbon_level];
-        if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
-        let s = entry.slot_bits & RIBBON_SLOT_MASK;
-        let sx = i32(s % 3u);
-        let sy = i32((s / 3u) % 3u);
-        let sz = i32(s / 9u);
-        let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
-        skip_slot = s;
-        ray_origin = slot_off + ray_origin / 3.0;
-        ray_dir = ray_dir / 3.0;
-        cur_scale = cur_scale * (1.0 / 3.0);
-        current_idx = entry.node_idx;
-        ribbon_level = ribbon_level + 1u;
-
-        // Empty-shell fast exit: if every sibling is empty, skip
-        // this shell's DDA and advance the ray to the shell's exit
-        // boundary. Next outer iteration will pop again.
-        let siblings_all_empty =
-            (entry.slot_bits & RIBBON_SIBLINGS_ALL_EMPTY) != 0u;
-        if siblings_all_empty {
-            let inv_dir_shell = vec3<f32>(
-                select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
-                select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
-                select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
-            );
-            let shell_hit = ray_box(
-                ray_origin, inv_dir_shell,
-                vec3<f32>(0.0), vec3<f32>(3.0),
-            );
-            if shell_hit.t_exit > 0.0 {
-                ray_origin = ray_origin + ray_dir * (shell_hit.t_exit + 0.001);
-                if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+        // Ray exited the current frame. Pop one or more ancestors,
+        // skipping past intermediate face-root cells (cur_kind == 2u
+        // at ribbon_level > 0): a face-root has no standalone march
+        // interpretation — its 27 children index UVR not XYZ, which
+        // march_cartesian would mis-interpret. Pop through it to the
+        // body level where sphere_in_cell does the right thing.
+        var pop_iters: u32 = 0u;
+        var pop_succeeded = true;
+        loop {
+            pop_iters = pop_iters + 1u;
+            if pop_iters > 8u { pop_succeeded = false; break; }
+            if ribbon_level >= uniforms.ribbon_count {
+                pop_succeeded = false;
+                break;
             }
+            let entry = ribbon[ribbon_level];
+            if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
+            let s = entry.slot_bits & RIBBON_SLOT_MASK;
+            let sx = i32(s % 3u);
+            let sy = i32((s / 3u) % 3u);
+            let sz = i32(s / 9u);
+            let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+            skip_slot = s;
+            ray_origin = slot_off + ray_origin / 3.0;
+            ray_dir = ray_dir / 3.0;
+            cur_scale = cur_scale * (1.0 / 3.0);
+            current_idx = entry.node_idx;
+            ribbon_level = ribbon_level + 1u;
+
+            // Empty-shell fast exit: if every sibling is empty, skip
+            // this shell's DDA and advance the ray to the shell's exit
+            // boundary. Next outer iteration will pop again.
+            let siblings_all_empty =
+                (entry.slot_bits & RIBBON_SIBLINGS_ALL_EMPTY) != 0u;
+            if siblings_all_empty {
+                let inv_dir_shell = vec3<f32>(
+                    select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+                    select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+                    select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+                );
+                let shell_hit = ray_box(
+                    ray_origin, inv_dir_shell,
+                    vec3<f32>(0.0), vec3<f32>(3.0),
+                );
+                if shell_hit.t_exit > 0.0 {
+                    ray_origin = ray_origin + ray_dir * (shell_hit.t_exit + 0.001);
+                    if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+                }
+            }
+
+            // If we landed on a face-root, pop again. Otherwise we're
+            // at a kind we can march normally — exit this inner loop.
+            if node_kinds[current_idx].kind != 2u { break; }
         }
+        if !pop_succeeded { break; }
     }
 
     var result: HitResult;
