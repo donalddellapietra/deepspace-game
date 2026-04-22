@@ -75,6 +75,47 @@ advancing on those axes, so the DDA either:
 - Advances on ONE axis only, missing all cell boundaries on the
   others, and eventually returns a miss.
 
+### Empirical finding: per-axis incremental update is NOT enough
+
+Tried in this worktree: replace `pos = ro_local + rd_local * t`
+recompute with per-axis incremental update — snap exit axis to its
+exact cell boundary, advance other axes by `rd_local · t_min`. At
+depth 5 the SphereSub render visually changed (lost the inner-shell
+contact view at sphere center, ended up showing sky above the
+outer-shell silhouette — i.e., rays now MISS the inner shell).
+Reverted.
+
+Why per-axis alone is insufficient: the bug is anisotropy in
+`rd_local`, not absolute precision of `pos`. With `rd_local = (1e10,
+1e1, 1e1)`, traversing one cell on the fast u-axis takes
+`t = 1/1e10 = 1e-10`. The slow-axis update is `rd_local.v · t = 1e-9`,
+below the f32 ULP of `pos.v` at O(1) magnitude (~1e-7). The slow
+axes never advance. Per-axis update preserves this property
+identically — incremental and recompute produce the same magnitudes.
+
+### Real fix candidates (sorted by feasibility)
+
+1. **Compensated summation (Kahan)** on per-axis pos updates.
+   Recovers ~30 bits of precision per axis. Survives `rd_local`
+   anisotropy ratios up to ~1e9 with f32 mantissa. ~6 extra
+   instructions per axis per step. Compatible with current
+   sphere_in_sub_frame structure — drop-in replacement for the pos
+   update.
+
+2. **Skip-axis detection** when `|rd_local[k]| · cell_size_max <
+   epsilon · |rd_local_max|`. Mark the axis as "frozen" and exclude
+   from DDA exit checks. Requires re-thawing when accumulated
+   slow-axis position approaches a boundary.
+
+3. **f64 pos** — not portable in WGSL today. Some platforms support
+   `enable f64;` extension; many don't.
+
+4. **Body-XYZ DDA** with explicit plane normals (rows of J_inv per
+   cell). Mathematically equivalent to current rd_local DDA, exposes
+   the same anisotropy in `rate = J_inv · rd_body`. Doesn't fix the
+   bug — restructuring alone doesn't change which precisions are
+   needed.
+
 ### Concrete port recipe for sphere_in_sub_frame
 
 The CPU `unified_raycast` demonstrates the precision-stable pattern.
