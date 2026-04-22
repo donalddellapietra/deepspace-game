@@ -206,16 +206,40 @@ fn walk_face_subtree(
         // Is this slot populated?
         let mask = (occupancy >> slot) & 1u;
         if mask == 0u {
-            // Empty cell — terminate.
-            res.depth = d;
-            res.u_lo = child_u_lo;
-            res.v_lo = child_v_lo;
-            res.r_lo = child_r_lo;
-            res.size = child_size;
-            res.ratio_u = child_ratio_u;
-            res.ratio_v = child_ratio_v;
-            res.ratio_r = child_ratio_r;
-            res.ratio_depth = d;
+            // Empty cell — FAKE-DESCEND to max_depth so every pixel's
+            // walker returns a cell at the SAME depth regardless of
+            // tree structure. Without this the walker stops wherever
+            // empty/tag=1 was hit, and adjacent pixels can terminate
+            // at wildly different depths (see fake_descend comment).
+            var fu = child_u_lo;
+            var fv = child_v_lo;
+            var fr = child_r_lo;
+            var fs = child_size;
+            var fru = child_ratio_u;
+            var frv = child_ratio_v;
+            var frr = child_ratio_r;
+            for (var d2: u32 = d; d2 < max_depth; d2 = d2 + 1u) {
+                let ccs = fs / 3.0;
+                let us2 = u32(clamp(floor((un_abs - fu) / ccs), 0.0, 2.0));
+                let vs2 = u32(clamp(floor((vn_abs - fv) / ccs), 0.0, 2.0));
+                let rs2 = u32(clamp(floor((rn_abs - fr) / ccs), 0.0, 2.0));
+                fru = fru * 3u + us2;
+                frv = frv * 3u + vs2;
+                frr = frr * 3u + rs2;
+                fu = f32(fru) * ccs;
+                fv = f32(frv) * ccs;
+                fr = f32(frr) * ccs;
+                fs = ccs;
+            }
+            res.depth = max_depth;
+            res.u_lo = fu;
+            res.v_lo = fv;
+            res.r_lo = fr;
+            res.size = fs;
+            res.ratio_u = fru;
+            res.ratio_v = frv;
+            res.ratio_r = frr;
+            res.ratio_depth = max_depth;
             return res;
         }
         // Count 1-bits below `slot` to find child rank.
@@ -226,17 +250,55 @@ fn walk_face_subtree(
 
         let tag = packed & 0xFFu;
         if tag == 1u {
-            // Leaf block.
-            res.block = child_block_type(packed);
-            res.depth = d;
-            res.u_lo = child_u_lo;
-            res.v_lo = child_v_lo;
-            res.r_lo = child_r_lo;
-            res.size = child_size;
-            res.ratio_u = child_ratio_u;
-            res.ratio_v = child_ratio_v;
-            res.ratio_r = child_ratio_r;
-            res.ratio_depth = d;
+            // Leaf block — the packer flattened a uniform Cartesian
+            // subtree here. FAKE-DESCEND to max_depth using un_abs
+            // slot-picks so the returned cell bounds are at the
+            // SAME depth every other pixel in this walk returns at.
+            //
+            // Without this, adjacent pixels that happen to land on a
+            // tag=1 flattened sibling vs a tag=2 rebuilt chain (e.g.
+            // after a deep edit) terminate at wildly different
+            // depths → different w.size → the DDA's exit-t / cell_eps
+            // disparity that produces the nested-frustum artifact
+            // visible at d=27 and the streak-lines at d=10. This is
+            // Opus diagnosis #4 (walker-depth divergence) — the root
+            // cause #1 / #8 were only addressing.
+            //
+            // CPU `walk_face_subtree` already descends through every
+            // Child::Node unconditionally to `limit`; this brings the
+            // GPU walker to matching behavior (closes CPU/GPU
+            // divergence, Opus diagnosis #9).
+            let leaf_block = child_block_type(packed);
+            var fu = child_u_lo;
+            var fv = child_v_lo;
+            var fr = child_r_lo;
+            var fs = child_size;
+            var fru = child_ratio_u;
+            var frv = child_ratio_v;
+            var frr = child_ratio_r;
+            for (var d2: u32 = d; d2 < max_depth; d2 = d2 + 1u) {
+                let ccs = fs / 3.0;
+                let us2 = u32(clamp(floor((un_abs - fu) / ccs), 0.0, 2.0));
+                let vs2 = u32(clamp(floor((vn_abs - fv) / ccs), 0.0, 2.0));
+                let rs2 = u32(clamp(floor((rn_abs - fr) / ccs), 0.0, 2.0));
+                fru = fru * 3u + us2;
+                frv = frv * 3u + vs2;
+                frr = frr * 3u + rs2;
+                fu = f32(fru) * ccs;
+                fv = f32(frv) * ccs;
+                fr = f32(frr) * ccs;
+                fs = ccs;
+            }
+            res.block = leaf_block;
+            res.depth = max_depth;
+            res.u_lo = fu;
+            res.v_lo = fv;
+            res.r_lo = fr;
+            res.size = fs;
+            res.ratio_u = fru;
+            res.ratio_v = frv;
+            res.ratio_r = frr;
+            res.ratio_depth = max_depth;
             return res;
         }
         // Tag 2 → descend into node.
