@@ -293,3 +293,28 @@ not 1.4988). Camera now on the PosY face axis precisely.
 Next iteration: fix bug 2 (the cube hollow). Keep bug 1 parked until
 bug 2 is addressed, since they're independent.
 
+### 2026-04-22 — pinned pick_face fix (partial)
+
+Hypothesis: stripes on the ground were from `pick_face(n)` flipping
+between two face subtrees as rays cross face boundaries at sub-pixel
+scales. Implemented by hoisting the face pick out of the DDA loop —
+picked ONCE at the sphere entry point and reused across all
+iterations.
+
+Result:
+- Mode 7 (face_node_idx hash) became UNIFORM across the ground
+  post-place. Pinning works as intended: all ground pixels descend
+  into the same face subtree.
+- **Mode 4 stripes PERSIST.** Different winning planes per pixel row
+  within the single face subtree.
+- **Mode 0 hollow cube + striped ground PERSIST.**
+
+Conclusion: face-pick instability was one confounder but not the
+root cause of the visible bug. Reverted for cleanliness. The
+remaining stripes are the walker returning different cells
+(different `w.u_lo/v_lo/size`) for adjacent rays at d=10 scale —
+either that's "intrinsic geometric aliasing where cells are sub-pixel
+vs the renderer's expected size" (which the user says should NOT
+happen per the infinite-zoom memory), or the walker's cell-bounds
+return has an actual precision bug downstream of the slot-pick fix.
+
