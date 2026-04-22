@@ -73,6 +73,14 @@ pub enum WorldPreset {
     Scene {
         id: crate::world::scenes::SceneId,
     },
+    /// Stage-0b demo sphere: a single SDF-carved planet placed at
+    /// the depth-1 centre cell of a plain-wrapped root. Radii,
+    /// detail and materials come from
+    /// [`crate::world::sphere_worldgen::demo_planet`]. The renderer
+    /// is not sphere-aware yet (that lands in Stages 1-3), so the
+    /// body renders as Cartesian — this preset exists to exercise
+    /// the worldgen / bootstrap path end-to-end.
+    DemoSphere,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -102,7 +110,11 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::Mausoleum
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
-        | WorldPreset::Scene { .. } => None,
+        | WorldPreset::Scene { .. }
+        // Sphere worlds have radial gravity — no flat sea level —
+        // so entities rest radially on the body surface, not at a
+        // fixed Y.
+        | WorldPreset::DemoSphere => None,
     }
 }
 
@@ -121,6 +133,12 @@ pub struct WorldBootstrap {
     /// imported-model colors (from `.vox`/`.vxs`) survive into the
     /// render path. Always contains the builtins as a prefix.
     pub color_registry: crate::world::palette::ColorRegistry,
+    /// Path from the world root to the spherical body node for
+    /// sphere-bearing presets (currently just [`WorldPreset::DemoSphere`]).
+    /// `None` for every other preset. Callers use this to frame the
+    /// camera near the body or to seed sphere-aware gameplay
+    /// (gravity, "up" axis) once those systems land.
+    pub body_path: Option<Path>,
 }
 
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
@@ -168,6 +186,63 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             &path, plain_layers.unwrap_or(8), interior_depth,
         ),
         WorldPreset::Scene { id } => crate::world::scenes::bootstrap_scene_world(id),
+        WorldPreset::DemoSphere => bootstrap_demo_sphere_world(plain_layers.unwrap_or(8)),
+    }
+}
+
+/// Bootstrap the Stage-0b demo sphere: an SDF-carved planet placed
+/// at the depth-1 centre cell of an otherwise-empty root. `depth`
+/// caps the face subtree recursion (shared with `--plain-layers` for
+/// parity with the fractal presets).
+fn bootstrap_demo_sphere_world(depth: u8) -> WorldBootstrap {
+    use crate::world::sphere_worldgen::{self, PlanetSetup};
+
+    let mut lib = NodeLibrary::default();
+    // Start with an empty root — the centre slot will become the
+    // body cell.
+    let root = lib.insert(empty_children());
+
+    let base = sphere_worldgen::demo_planet();
+    // Allow `--plain-layers` to override the face subtree depth so
+    // headless tests can build a tiny planet quickly. The preset's
+    // default `depth` is used when nothing is passed.
+    let setup = PlanetSetup {
+        depth: (depth as u32).max(1),
+        ..base
+    };
+
+    let (new_root, body_path) =
+        sphere_worldgen::install_at_root_center(&mut lib, root, &setup);
+    lib.ref_inc(new_root);
+    let world = WorldState { root: new_root, library: lib };
+
+    // Default spawn: in the root cell above the body cell, looking
+    // roughly at the planet. The body lives at centre (1,1,1) of the
+    // root, so a shallow frame-local position `[1.5, 2.7, 1.5]`
+    // places the camera above the body cell with the whole planet
+    // in frame.
+    let spawn_pos = WorldPos::from_frame_local(
+        &Path::root(),
+        [1.5, 2.7, 1.5],
+        2,
+    )
+    .deepened_to(3);
+
+    eprintln!(
+        "demo_sphere: depth={}, library={}, body_path={:?}",
+        setup.depth,
+        world.library.len(),
+        body_path.as_slice(),
+    );
+
+    WorldBootstrap {
+        world,
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: 0.0,
+        default_spawn_pitch: -0.9,
+        plain_layers: depth,
+        color_registry: crate::world::palette::ColorRegistry::new(),
+        body_path: Some(body_path),
     }
 }
 
@@ -361,6 +436,7 @@ pub(crate) fn bootstrap_vox_model_world(
         default_spawn_pitch: pitch,
         plain_layers: total_depth,
         color_registry: registry,
+        body_path: None,
     }
 }
 
@@ -739,6 +815,7 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
         default_spawn_pitch: -0.45,
         plain_layers,
         color_registry: crate::world::palette::ColorRegistry::new(),
+        body_path: None,
     }
 }
 

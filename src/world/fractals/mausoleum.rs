@@ -94,6 +94,7 @@ pub(crate) fn bootstrap_mausoleum_world(depth: u8) -> WorldBootstrap {
         default_spawn_pitch: -0.615,
         plain_layers: depth,
         color_registry: registry,
+        body_path: None,
     }
 }
 

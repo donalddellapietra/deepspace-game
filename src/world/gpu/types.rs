@@ -79,6 +79,20 @@ impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
             NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
+            // Stage 0b: the shader isn't sphere-aware yet (Stages 1-3
+            // wire the unified-DDA dispatch), so body/face kinds ride
+            // on the Cartesian GPU encoding for now. This keeps the
+            // ray-march output byte-identical for sphere-tagged nodes
+            // — they render as Cartesian subtrees, exactly what the
+            // existing shader expects. `inner_r` / `outer_r` / `face`
+            // are preserved in the CPU `NodeKind` and will be surfaced
+            // once the shader learns the new dispatch.
+            NodeKind::CubedSphereBody { .. } => {
+                Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 }
+            }
+            NodeKind::CubedSphereFace { .. } => {
+                Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 }
+            }
         }
     }
 }

@@ -183,7 +183,12 @@ impl App {
                 slot
             ));
             match child_kind {
-                Some(NodeKind::Cartesian) => {
+                Some(NodeKind::Cartesian)
+                // Stage 0b sphere variants are inert to edit; walk
+                // into them like Cartesian subtrees so the debug
+                // descent doesn't stall at a body / face node.
+                | Some(NodeKind::CubedSphereBody { .. })
+                | Some(NodeKind::CubedSphereFace { .. }) => {
                     node_id = child_id;
                 }
                 None => break,

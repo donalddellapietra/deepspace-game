@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use crate::world::cubesphere::Face;
+
 // ------------------------------------------------------------- constants
 
 pub const BRANCH: usize = 3;
@@ -78,15 +80,45 @@ pub fn uniform_children(child: Child) -> Children {
 ///
 /// Part of the content-addressed hash: two nodes with identical
 /// children but different kinds do NOT dedup into one.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
+    /// Root of a cubed-sphere body. The 6 face-center slots
+    /// (per `cubesphere::FACE_SLOTS`) are `CubedSphereFace`
+    /// subtrees; the centre slot (`cubesphere::CORE_SLOT`)
+    /// carries the interior filler. Radii are in the body cell's
+    /// local `[0, 1)` frame: `0 < inner_r < outer_r <= 0.5`.
+    CubedSphereBody { inner_r: f32, outer_r: f32 },
+    /// One face of a cubed-sphere body. Children on this subtree
+    /// are interpreted on `(u_slot, v_slot, r_slot)` axes instead
+    /// of the Cartesian `(x_slot, y_slot, z_slot)`. Only the
+    /// top-of-face node carries this tag; its descendants stay
+    /// `Cartesian` so they dedup across faces.
+    CubedSphereFace { face: Face },
 }
 
 impl Default for NodeKind {
     fn default() -> Self {
         NodeKind::Cartesian
+    }
+}
+
+impl Eq for NodeKind {}
+
+impl Hash for NodeKind {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            NodeKind::Cartesian => {}
+            NodeKind::CubedSphereBody { inner_r, outer_r } => {
+                inner_r.to_bits().hash(state);
+                outer_r.to_bits().hash(state);
+            }
+            NodeKind::CubedSphereFace { face } => {
+                face.hash(state);
+            }
+        }
     }
 }
 
