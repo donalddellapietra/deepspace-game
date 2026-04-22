@@ -10,19 +10,21 @@ fn ray_plane_t(origin: vec3<f32>, dir: vec3<f32>,
 }
 
 // Numerical-Recipes stable ray-sphere intersection.
+// Full quadratic form handles non-unit `dir`: coefficient on t² is
+// dot(dir, dir) (typically 1 but not guaranteed after ribbon-pop
+// rescales); discriminant = b² - dd·c.
 fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
                     center: vec3<f32>, radius: f32, after: f32) -> f32 {
     let oc = origin - center;
+    let dd = dot(dir, dir);
+    let inv_dd = 1.0 / max(dd, 1e-30);
     let b = dot(oc, dir);
     let c = dot(oc, oc) - radius * radius;
-    let disc = b * b - c;
+    let disc = b * b - dd * c;
     if disc < 0.0 { return -1.0; }
     let sq = sqrt(disc);
-    let s = select(-1.0, 1.0, b >= 0.0);
-    let q = -b - s * sq;
-    if abs(q) < 1e-30 { return -1.0; }
-    let t0 = q;
-    let t1 = c / q;
+    let t0 = (-b - sq) * inv_dd;
+    let t1 = (-b + sq) * inv_dd;
     let t_lo = min(t0, t1);
     let t_hi = max(t0, t1);
     if t_lo > after { return t_lo; }

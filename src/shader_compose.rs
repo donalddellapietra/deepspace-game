@@ -87,8 +87,8 @@ mod tests {
         assert!(src.contains("fn march("), "march missing");
         assert!(src.contains("fn unified_dda("), "unified_dda missing");
         assert!(
-            src.contains("fn march_face_subtree("),
-            "Stage 2: march_face_subtree helper missing from unified_dda.wgsl",
+            src.contains("fn march_face_subtree_curved("),
+            "Stage 3b: march_face_subtree_curved helper missing from unified_dda.wgsl",
         );
         assert!(
             !src.contains("fn march_cartesian("),
