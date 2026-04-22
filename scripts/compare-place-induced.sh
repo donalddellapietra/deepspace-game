@@ -47,15 +47,20 @@ CAM_ARGS=(
 for m in "${MODES[@]}"; do
     echo "=== mode $m ==="
 
-    # BEFORE: render, no script, exit. Clean scene.
+    # BEFORE: wait same number of frames as AFTER before screenshot so
+    # camera physics drift (gravity, player update) is identical
+    # between the pair. The screenshot at frame N must be taken at the
+    # SAME N in both runs or you're comparing drift, not bug.
     timeout 20 "$BIN" "${CAM_ARGS[@]}" \
         --sphere-debug-mode "$m" \
-        --screenshot "tmp/before_m${m}.png" \
-        --exit-after-frames 30 2>&1 \
+        --screenshot "tmp/before_m${m}_tail.png" \
+        --script "wait:41,screenshot:tmp/before_m${m}.png" \
+        --exit-after-frames 80 2>&1 \
         | grep -E "HARNESS_EDIT|render_harness_shader" \
         | head -1 || true
 
-    # AFTER: render, place a d=10 block, wait, screenshot.
+    # AFTER: same timing (41 frames total before screenshot), but with
+    # a place action at frame 10.
     timeout 20 "$BIN" "${CAM_ARGS[@]}" \
         --sphere-debug-mode "$m" \
         --screenshot "tmp/after_m${m}_tail.png" \

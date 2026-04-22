@@ -140,4 +140,30 @@ Starting with hyp 1 (smaller scope, directly testable visual).
 
 ## Running notes
 
-(Append below as iterations land.)
+### 2026-04-21 late — experiments run (all REJECTED)
+
+All of the following tested in the reproducer; none killed the stripes:
+
+- Exp 1: `face_lod_depth` forced to `10u`. Stripes identical.
+- Exp A: `w.u_lo/v_lo/r_lo/size` re-quantized to fixed d=9 before plane math. Stripes identical.
+- Exp B: uniform-flatten disabled in `pack.rs:217-220`. Stripes identical.
+- Exp B + Exp 1 combined. Stripes identical.
+- Exp hardcode body_origin/body_size/inner_r/outer_r to demo_planet literals in `sphere.wgsl:400-403`. Stripes identical (minor view shift from f32 literal vs computed).
+- Plane-normal midpoint-plus-delta rewrite (from first opus consult). Pixel-identical rendering, no change.
+
+All reverted. Shader back to baseline.
+
+### Confounding evidence
+
+- gpu_camera logs bit-identical pre vs post place (`cam_local=[1.4999998, 2.3978996, 1.4964]`, `render_path=[13]`, `frame_kind=Body { inner_r: 0.12, outer_r: 0.45 }`).
+- Mode 2 walker depth: yellow-green ground (d≈7) in both states.
+- Mode 3 walker result: green everywhere on ground (walker returns content) in both states.
+- Mode 6 ratio bucket: uniform blue on ground (walker lands in same ratio mod 8) in both states.
+- Mode 4 winning plane: **UNIFORM r_lo (light-blue) BEFORE place, STRIPED r_lo/v_lo/u_lo AFTER place**. This is the ONLY mode that changes.
+
+Placing a single d=10 block globally alters the DDA's per-pixel winning-plane arg-min outcome for ground rays spatially distant from the placed cell. None of the investigated mechanisms (LOD cap, cell-bound variance, pack uniform-flatten, body-dim drift) account for this.
+
+### Next steps
+
+Per-pixel walker state dump is the path forward: write `winning`, `steps`, `w.depth`, `w.block`, `w.u_lo`, `w.v_lo`, `w.size` to an SSBO and diff pre vs post place for a single pixel row. That pins down which variable actually mutates between the two runs.
+
