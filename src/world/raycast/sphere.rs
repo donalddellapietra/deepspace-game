@@ -131,6 +131,18 @@ fn walk_face_subtree(
     let mut v_lo: f32 = 0.0;
     let mut r_lo: f32 = 0.0;
     let mut size: f32 = 1.0;
+    // Integer-ratio accumulators (post-audit Finding 17 fix). The
+    // additive `u_lo += us * child_size` recurrence drifts ~1 ULP
+    // per level; by depth ~14 the cell-corner f32 lands on a wrong
+    // cell, which together with the cell-boundary plane normals
+    // built from `u_lo` collapses adjacent walls. Tracking the slot
+    // path as integers (`ratio_u = parent * 3 + us`) and casting
+    // to f32 only at use time gives ~0.5 ULP per cell corner —
+    // shifts the precision wall to ~depth 20 (where 3^20 starts to
+    // exceed f32 mantissa). Mirrors the GPU walker fix.
+    let mut ratio_u: u32 = 0;
+    let mut ratio_v: u32 = 0;
+    let mut ratio_r: u32 = 0;
     let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(limit as usize);
 
     for d in 1u32..=limit {
@@ -145,9 +157,15 @@ fn walk_face_subtree(
         let vs = slot_at_level(vn_abs, v_lo, child_size);
         let rs = slot_at_level(rn_abs, r_lo, child_size);
         let slot = slot_index(us, vs, rs);
-        let child_u_lo = u_lo + us as f32 * child_size;
-        let child_v_lo = v_lo + vs as f32 * child_size;
-        let child_r_lo = r_lo + rs as f32 * child_size;
+        // Integer-ratio accumulation, then single f32 multiply at
+        // each level. Avoids the per-level `u_lo += us * child_size`
+        // drift.
+        let child_ratio_u = ratio_u.saturating_mul(3).saturating_add(us as u32);
+        let child_ratio_v = ratio_v.saturating_mul(3).saturating_add(vs as u32);
+        let child_ratio_r = ratio_r.saturating_mul(3).saturating_add(rs as u32);
+        let child_u_lo = child_ratio_u as f32 * child_size;
+        let child_v_lo = child_ratio_v as f32 * child_size;
+        let child_r_lo = child_ratio_r as f32 * child_size;
         path.push((node_id, slot));
 
         match node.children[slot] {
@@ -224,6 +242,9 @@ fn walk_face_subtree(
                 v_lo = child_v_lo;
                 r_lo = child_r_lo;
                 size = child_size;
+                ratio_u = child_ratio_u;
+                ratio_v = child_ratio_v;
+                ratio_r = child_ratio_r;
                 // NOTE: `un_abs`/`vn_abs`/`rn_abs` are NOT updated —
                 // they stay as the immutable ray-sample reference.
                 // That's the whole point of this reformulation.
@@ -483,24 +504,41 @@ pub(super) fn cs_raycast(
         let r_lo = cs_inner + w.r_lo * shell;
         let r_hi = cs_inner + (w.r_lo + w.size) * shell;
 
-        let t_u_lo = ray_plane_t(oc, ray_dir, n_u_lo);
-        let t_u_hi = ray_plane_t(oc, ray_dir, n_u_hi);
-        let t_v_lo = ray_plane_t(oc, ray_dir, n_v_lo);
-        let t_v_hi = ray_plane_t(oc, ray_dir, n_v_hi);
-        let t_r_lo = ray_sphere_after(oc, ray_dir, r_lo, t);
-        let t_r_hi = ray_sphere_after(oc, ray_dir, r_hi, t);
+        // Compute the entry plane to skip — it's the cell wall the
+        // PREVIOUS step exited through (same physical plane the
+        // current cell entered through, on the opposite side).
+        // Skipping prevents re-detecting `t == current t` and
+        // eliminates the need for a `cell_eps` nudge on the next
+        // step. Mirror of the shader fix for sphere_in_cell.
+        let entry_side: u32 = match last_side {
+            0 => 1,
+            1 => 0,
+            2 => 3,
+            3 => 2,
+            4 => 5,
+            5 => 4,
+            _ => 6,
+        };
+
+        let t_u_lo = if entry_side == 0 { f32::INFINITY } else { ray_plane_t(oc, ray_dir, n_u_lo) };
+        let t_u_hi = if entry_side == 1 { f32::INFINITY } else { ray_plane_t(oc, ray_dir, n_u_hi) };
+        let t_v_lo = if entry_side == 2 { f32::INFINITY } else { ray_plane_t(oc, ray_dir, n_v_lo) };
+        let t_v_hi = if entry_side == 3 { f32::INFINITY } else { ray_plane_t(oc, ray_dir, n_v_hi) };
+        let t_r_lo = if entry_side == 4 { f32::INFINITY } else { ray_sphere_after(oc, ray_dir, r_lo, t) };
+        let t_r_hi = if entry_side == 5 { f32::INFINITY } else { ray_sphere_after(oc, ray_dir, r_hi, t) };
 
         let (t_next, winning) = pick_min_after(
             t,
             &[(t_u_lo, 0), (t_u_hi, 1), (t_v_lo, 2), (t_v_hi, 3),
               (t_r_lo, 4), (t_r_hi, 5)],
         );
-        if t_next >= t_exit { break; }
+        if t_next >= t_exit || winning == 6 { break; }
         last_side = winning;
-        let _ = last_side; // currently consumed only by shader
-        let t_ulp = (t.abs() * 1.2e-7).max(1e-30);
-        let cell_eps = (shell * w.size * 1e-3).max(t_ulp * 4.0);
-        t = t_next + cell_eps;
+        // No `cell_eps` nudge — `entry_side` skip handles the
+        // re-detection hazard. `t = t_next` exactly. This eliminates
+        // the per-step `+ cell_eps` accumulation that grew `t` away
+        // from geometric truth at deep depth.
+        t = t_next;
     }
 
     None
