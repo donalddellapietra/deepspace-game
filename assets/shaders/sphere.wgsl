@@ -541,10 +541,15 @@ fn sphere_in_cell(
             result.normal = hit_normal;
             if dbg_mode != 0u {
                 // Debug path: bypass shading (sun, bevel, palette) and
-                // paint the accumulator directly. We still set t + a
-                // 1e3 flat cell to silence `cube_face_bevel` in
-                // `shade_pixel` — same trick as the normal path below.
+                // paint the accumulator directly. We set the SUN NORMAL
+                // here so `shade_pixel` computes full-unity diffuse;
+                // combined with the 1e3 flat cell trick, this makes
+                // debug colors render WITHOUT directional tint or
+                // bevel. Otherwise mode-4 r_lo (0.3, 0.5, 1.0) was
+                // rendering as directional-shaded on cube faces and
+                // becoming unreadable.
                 result.color = sphere_debug_color(dbg_mode, dbg);
+                result.normal = normalize(vec3<f32>(0.4, 0.7, 0.3));
                 let cs_dbg = max(length(camera.forward), 1.0) * 1e3;
                 result.cell_min = camera.pos + ray_dir * t - vec3<f32>(cs_dbg * 0.5);
                 result.cell_size = cs_dbg;
@@ -636,7 +641,9 @@ fn sphere_in_cell(
     if dbg_mode != 0u && dbg.steps > 0u {
         result.hit = true;
         result.t = min(max(t, t_enter + eps_init), t_exit);
-        result.normal = -normalize(ray_dir);
+        // Sun-aligned normal so shade_pixel's diffuse lighting is
+        // unity, letting the debug color pass through untinted.
+        result.normal = normalize(vec3<f32>(0.4, 0.7, 0.3));
         result.color = sphere_debug_color(dbg_mode, dbg);
         let cs_dbg = max(length(camera.forward), 1.0) * 1e3;
         result.cell_min = camera.pos + ray_dir * result.t - vec3<f32>(cs_dbg * 0.5);
