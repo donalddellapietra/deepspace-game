@@ -965,9 +965,26 @@ fn mat3_inv_scaled_shader(m: Mat3Columns, s: f32) -> Mat3Columns {
     return out;
 }
 
-/// Upper bound on neighbor sub-frame transitions per ray — mirrors
-/// CPU `MAX_NEIGHBOR_TRANSITIONS` in `src/world/raycast/sphere_sub.rs`.
-const MAX_SPHERE_SUB_TRANSITIONS: u32 = 64u;
+/// Upper bound on neighbor sub-frame transitions per ray.
+///
+/// Originally 64 (CPU mirror of `MAX_NEIGHBOR_TRANSITIONS` in
+/// `src/world/raycast/sphere_sub.rs`). Verified empirically (sphere-
+/// sub debug-paint screenshot harness, force_sphere_state script
+/// command) that 64 is the actual cause of the layer-10-ish wall
+/// previously attributed to f32 precision: at deep spawn_depths the
+/// camera sits very close to the sphere surface and rays cross many
+/// sub-frame cells angularly before finding a block, hitting the
+/// cap immediately and producing a yellow-tinted miss frame.
+///
+/// Raised to 1024 — unlocks meaningful sphere rendering at depths
+/// 11-14 (previously sky/grey via fall-through to body march).
+/// Per-ray worst-case cost ~95 ms at depth 14 in the diagnostic
+/// harness; normal gameplay (camera not surface-grazing) doesn't
+/// hit the cap and pays no extra cost. Higher caps (4096+) push
+/// past 100 ms at deeper test depths AND don't render meaningful
+/// content past depth 14 because of camera-position precision
+/// limits in the test harness itself.
+const MAX_SPHERE_SUB_TRANSITIONS: u32 = 1024u;
 
 // ─── symbolic neighbor-step on UVR path (shader mirror of
 // `Path::step_neighbor_cartesian`). Slot packing is identical to XYZ
