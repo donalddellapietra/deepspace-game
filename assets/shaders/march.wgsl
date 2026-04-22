@@ -263,6 +263,14 @@ fn march_entity_subtree(
     return result;
 }
 
+// Dead code. Will be deleted in Stage 2 once unified_dda handles
+// every dispatch (sphere body / face arms added, seam rotation in
+// Stage 3). Kept in this one stage so Stage 1 is purely mechanical:
+// `unified_dda` is a structural refactor of this function and the
+// caller (`march`) now dispatches through it. A/B comparison is
+// trivial — revert the single `unified_dda(...)` call in `march`
+// back to `march_cartesian(...)` and render results are identical.
+//
 // Cartesian DDA in a single frame rooted at `root_node_idx`. The
 // frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
 // Returns hit on cell terminal; on miss (ray exits the frame),
@@ -768,7 +776,9 @@ fn march_cartesian(
     return result;
 }
 
-// Top-level march. Dispatches the current frame's Cartesian DDA,
+#include "unified_dda.wgsl"
+
+// Top-level march. Dispatches the current frame's unified DDA,
 // then on miss pops to the next ancestor in the ribbon and
 // continues. When the ribbon is exhausted, returns sky (hit=false).
 //
@@ -795,11 +805,12 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
-        // Cartesian frame: no depth cap beyond the hardware stack
-        // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
-        // visual LOD gate — rays stop descending when cells fall
-        // below the pixel floor.
-        var r: HitResult = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
+        // Single cell-traversal DDA primitive. Stage 1: Cartesian-
+        // only; Stage 2 extends `unified_dda` with sphere body /
+        // face arms without changing this call site. No depth cap
+        // beyond `MAX_STACK_DEPTH`; `LOD_PIXEL_THRESHOLD` (Nyquist)
+        // is the sole visual LOD gate.
+        var r: HitResult = unified_dda(current_idx, ray_origin, ray_dir, skip_slot, MAX_STACK_DEPTH);
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;

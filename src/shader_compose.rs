@@ -13,10 +13,11 @@
 use std::collections::HashSet;
 
 const SOURCES: &[(&str, &str)] = &[
-    ("bindings.wgsl",  include_str!("../assets/shaders/bindings.wgsl")),
-    ("tree.wgsl",      include_str!("../assets/shaders/tree.wgsl")),
-    ("ray_prim.wgsl",  include_str!("../assets/shaders/ray_prim.wgsl")),
-    ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
+    ("bindings.wgsl",   include_str!("../assets/shaders/bindings.wgsl")),
+    ("tree.wgsl",       include_str!("../assets/shaders/tree.wgsl")),
+    ("ray_prim.wgsl",   include_str!("../assets/shaders/ray_prim.wgsl")),
+    ("unified_dda.wgsl", include_str!("../assets/shaders/unified_dda.wgsl")),
+    ("march.wgsl",      include_str!("../assets/shaders/march.wgsl")),
     ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
     ("taa_resolve.wgsl", include_str!("../assets/shaders/taa_resolve.wgsl")),
     ("heightmap_gen.wgsl", include_str!("../assets/shaders/heightmap_gen.wgsl")),
@@ -84,6 +85,8 @@ mod tests {
         assert!(src.contains("@vertex"), "vs_main missing");
         assert!(src.contains("@fragment"), "fs_main missing");
         assert!(src.contains("fn march("), "march missing");
+        assert!(src.contains("fn unified_dda("), "unified_dda missing");
+        // Stage 1: march_cartesian kept as dead code; Stage 2 deletes it.
         assert!(src.contains("fn march_cartesian("), "march_cartesian missing");
         assert!(src.contains("struct Uniforms"), "Uniforms missing");
         assert!(!src.contains("#include"), "directive leaked into output");
