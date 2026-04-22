@@ -366,14 +366,7 @@ impl App {
         // wry IPC + evaluate_script. WASM: JS queues + window.__onGameState.
         if self.overlay_active() {
             self.poll_ui_commands();
-            let camera_local = match self.active_frame.kind {
-                crate::app::ActiveFrameKind::SphereSub(sub) => {
-                    self.camera.position.in_frame(&sub.body_path)
-                }
-                crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
-                    self.camera.position.in_frame(&self.active_frame.render_path)
-                }
-            };
+            let camera_local = self.camera.position.in_frame(&self.active_frame.render_path);
             self.ui.push_to_overlay(&self.palette);
             crate::overlay::push_state(&crate::bridge::GameStateUpdate::DebugOverlay(
                 crate::bridge::DebugOverlayStateJs {

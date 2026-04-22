@@ -7,22 +7,6 @@
 // The CPU mirror lives in `src/world/cubesphere.rs` +
 // `src/world/raycast/sphere.rs`.
 
-/// When true, `sphere_in_sub_frame` paints solid debug colors per
-/// control-flow branch so a developer can visually diagnose the
-/// DDA loop without breakpointing a shader:
-///   red    = initial ray-box interval miss (ray never entered)
-///   blue   = neighbor-step transition consumed (every transition
-///            fades the pixel darker, so repeated steps accumulate)
-///   orange = cross-face terminate (bubble past face root)
-///   green  = MAX_DDA_STEPS exhaust
-///   yellow = MAX_SPHERE_SUB_TRANSITIONS exhaust
-///   cyan   = `sign_s == 0` silent miss (t >= t_exit with no axis outside box)
-///   white  = neighbor-transition ray-box interval miss
-///   palette color = real hit (unchanged)
-/// Left false by default; flip to true and reload the shader to
-/// validate the geometry.
-const SPHERE_DEBUG_PAINT: bool = false;
-
 // ─────────────────────────────────────────────── face constants
 
 // Face enum ↔ integer. 0..=5 in the same order as `Face::ALL`
@@ -92,82 +76,6 @@ fn pick_face(n: vec3<f32>) -> u32 {
     }
 }
 
-// ─────────────────────── face/body coord conversions
-//
-// GPU ports of src/world/cubesphere.rs face_uv_to_dir /
-// face_space_to_body_point / body_point_to_face_space, used by the
-// (future) GPU face-seam crossing in unified_dda.
-
-fn face_uv_to_dir(face: u32, u: f32, v: f32) -> vec3<f32> {
-    let cu = ea_to_cube(u);
-    let cv = ea_to_cube(v);
-    let n = face_normal(face);
-    let ua = face_u_axis(face);
-    let va = face_v_axis(face);
-    let raw = vec3<f32>(
-        n.x + cu * ua.x + cv * va.x,
-        n.y + cu * ua.y + cv * va.y,
-        n.z + cu * ua.z + cv * va.z,
-    );
-    return normalize(raw);
-}
-
-fn face_space_to_body_point(
-    face: u32,
-    un: f32, vn: f32, rn: f32,
-    inner_r: f32, outer_r: f32,
-    body_size: f32,
-) -> vec3<f32> {
-    let center = vec3<f32>(body_size * 0.5);
-    let radius = (inner_r + rn * (outer_r - inner_r)) * body_size;
-    let dir = face_uv_to_dir(face, un * 2.0 - 1.0, vn * 2.0 - 1.0);
-    return center + dir * radius;
-}
-
-struct FacePointShader {
-    face: u32,
-    un: f32,
-    vn: f32,
-    rn: f32,
-    valid: u32, // 0 = degenerate, 1 = ok
-}
-
-fn body_point_to_face_space(
-    point_body: vec3<f32>,
-    inner_r: f32, outer_r: f32,
-    body_size: f32,
-) -> FacePointShader {
-    var out: FacePointShader;
-    out.valid = 0u;
-    out.face = 0u;
-    out.un = 0.0;
-    out.vn = 0.0;
-    out.rn = 0.0;
-    let center = vec3<f32>(body_size * 0.5);
-    let offset = point_body - center;
-    let r = length(offset);
-    if r <= 1e-12 { return out; }
-    let n = offset / r;
-    let face = pick_face(n);
-    let n_axis = face_normal(face);
-    let u_axis = face_u_axis(face);
-    let v_axis = face_v_axis(face);
-    let axis_dot = dot(n, n_axis);
-    if abs(axis_dot) <= 1e-12 { return out; }
-    let cube_u = dot(n, u_axis) / axis_dot;
-    let cube_v = dot(n, v_axis) / axis_dot;
-    let inner = inner_r * body_size;
-    let outer = outer_r * body_size;
-    let shell = outer - inner;
-    if shell <= 0.0 { return out; }
-    out.face = face;
-    out.un = clamp((cube_to_ea(cube_u) + 1.0) * 0.5, 0.0, 0.9999999);
-    out.vn = clamp((cube_to_ea(cube_v) + 1.0) * 0.5, 0.0, 0.9999999);
-    out.rn = clamp((r - inner) / shell, 0.0, 0.9999999);
-    out.valid = 1u;
-    return out;
-}
-
 // ──────────────────────────────────────── face-subtree walker
 
 struct FaceWalkResult {
@@ -177,6 +85,16 @@ struct FaceWalkResult {
     v_lo: f32,
     r_lo: f32,
     size: f32,
+    // Integer ratio form of the cell corner: `u_lo == f32(ratio_u) *
+    // size` up to ~0.5 ULP rounding. Tracked as u32 accumulator
+    // `ratio = parent*3 + slot`, so precision is preserved regardless
+    // of depth. u32 covers ratio_depth ≤ 20 (3^20 ≈ 3.5e9 < 2^32);
+    // for deeper descent the mantissa-cast loses bits but stays more
+    // accurate than the additive accumulator `u_lo += us * child_size`.
+    ratio_u: u32,
+    ratio_v: u32,
+    ratio_r: u32,
+    ratio_depth: u32,
 }
 
 /// Descend a face subtree from its root along `(un, vn, rn)` to the
@@ -211,6 +129,10 @@ fn walk_face_subtree(
     res.v_lo = 0.0;
     res.r_lo = 0.0;
     res.size = 1.0;
+    res.ratio_u = 0u;
+    res.ratio_v = 0u;
+    res.ratio_r = 0u;
+    res.ratio_depth = 0u;
 
     let un_abs = clamp(un_in, 0.0, 0.9999999);
     let vn_abs = clamp(vn_in, 0.0, 0.9999999);
@@ -220,6 +142,10 @@ fn walk_face_subtree(
     var v_lo: f32 = 0.0;
     var r_lo: f32 = 0.0;
     var size: f32 = 1.0;
+    // Integer ratio accumulators — exact at every step.
+    var ratio_u: u32 = 0u;
+    var ratio_v: u32 = 0u;
+    var ratio_r: u32 = 0u;
 
     for (var d: u32 = 1u; d <= max_depth; d = d + 1u) {
         let base = node_offsets[node_idx];
@@ -238,9 +164,19 @@ fn walk_face_subtree(
         let rs = u32(clamp(floor((rn_abs - r_lo) / child_size), 0.0, 2.0));
         let slot = rs * 9u + vs * 3u + us;
 
-        let child_u_lo = u_lo + f32(us) * child_size;
-        let child_v_lo = v_lo + f32(vs) * child_size;
-        let child_r_lo = r_lo + f32(rs) * child_size;
+        let child_ratio_u = ratio_u * 3u + us;
+        let child_ratio_v = ratio_v * 3u + vs;
+        let child_ratio_r = ratio_r * 3u + rs;
+        // Ratio-derived cell corner — one multiply, ~0.5 ULP. The
+        // alternative `u_lo + us*child_size` compounds ~1 ULP per
+        // level; by m ≈ 10 the 6 cell-wall plane normals built from
+        // `ea_to_cube(u_lo*2-1)` have drifted enough that adjacent
+        // walls' normals collapse in f32, the ray marches through
+        // solid content without detecting it, and the cell renders
+        // hollow.
+        let child_u_lo = f32(child_ratio_u) * child_size;
+        let child_v_lo = f32(child_ratio_v) * child_size;
+        let child_r_lo = f32(child_ratio_r) * child_size;
 
         // Is this slot populated?
         let mask = (occupancy >> slot) & 1u;
@@ -251,6 +187,10 @@ fn walk_face_subtree(
             res.v_lo = child_v_lo;
             res.r_lo = child_r_lo;
             res.size = child_size;
+            res.ratio_u = child_ratio_u;
+            res.ratio_v = child_ratio_v;
+            res.ratio_r = child_ratio_r;
+            res.ratio_depth = d;
             return res;
         }
         // Count 1-bits below `slot` to find child rank.
@@ -268,6 +208,10 @@ fn walk_face_subtree(
             res.v_lo = child_v_lo;
             res.r_lo = child_r_lo;
             res.size = child_size;
+            res.ratio_u = child_ratio_u;
+            res.ratio_v = child_ratio_v;
+            res.ratio_r = child_ratio_r;
+            res.ratio_depth = d;
             return res;
         }
         // Tag 2 → descend into node.
@@ -280,6 +224,10 @@ fn walk_face_subtree(
             res.v_lo = child_v_lo;
             res.r_lo = child_r_lo;
             res.size = child_size;
+            res.ratio_u = child_ratio_u;
+            res.ratio_v = child_ratio_v;
+            res.ratio_r = child_ratio_r;
+            res.ratio_depth = d;
             return res;
         }
         node_idx = node_index;
@@ -287,6 +235,9 @@ fn walk_face_subtree(
         v_lo = child_v_lo;
         r_lo = child_r_lo;
         size = child_size;
+        ratio_u = child_ratio_u;
+        ratio_v = child_ratio_v;
+        ratio_r = child_ratio_r;
         // NOTE: un_abs / vn_abs / rn_abs are NOT updated; they stay
         // as the immutable ray-sample reference for the lifetime of
         // the walk. That's the whole point of this reformulation.
@@ -295,6 +246,10 @@ fn walk_face_subtree(
     res.v_lo = v_lo;
     res.r_lo = r_lo;
     res.size = size;
+    res.ratio_u = ratio_u;
+    res.ratio_v = ratio_v;
+    res.ratio_r = ratio_r;
+    res.ratio_depth = max_depth;
     res.depth = max_depth;
     return res;
 }
@@ -363,60 +318,6 @@ fn bevel_layered(
         // reads as spurious grid lines).
         if cpx < 2.0 { break; }
         if cs < BEVEL_DN_MIN_SIZE { break; }
-        let uf = clamp((un - dn_u) / dn_s, 0.0, 0.9999999);
-        let vf = clamp((vn - dn_v) / dn_s, 0.0, 0.9999999);
-        dn_u = dn_u + floor(uf * 3.0) * cs;
-        dn_v = dn_v + floor(vf * 3.0) * cs;
-        dn_s = cs;
-        dn_px = cpx;
-        b = b * bevel_level(un, vn, dn_u, dn_v, dn_s, dn_px);
-    }
-    return b;
-}
-
-// Multi-level bevel overlay — LOCAL-COORDS variant for sphere sub-frame.
-//
-// Identical shape logic to `bevel_layered`, but operates entirely in
-// the sub-frame's `[0, 3)` local coords so there's no dependence on
-// the absolute face-normalized corner `un_corner`. That's critical at
-// deep sub-frame depth (m ≥ ~8): the absolute-coords form did
-// `up_u = floor(un_corner + w.u_lo*fn_step / up_s) * up_s` where
-// `un_corner ≈ 0.5` and `up_s = 3^k · fn_step` — the division jitters
-// in f32 and the `floor(...) * up_s` product snaps to a drifting
-// ancestor origin, so adjacent pixels pick different parent cells and
-// the grid either vanishes or renders spurious lines.
-//
-// Ancestor levels whose size exceeds the sub-frame's local box edge
-// (up_s > 3.0) correspond to cells containing the sub-frame itself;
-// they're not derivable from local state alone (we'd need the sub-
-// frame's own position within its parent frame), so the upward loop
-// breaks when it would cross that boundary.
-fn bevel_layered_local(
-    un: f32, vn: f32,           // hit point in sub-frame [0, 3)
-    u_lo: f32, v_lo: f32,        // walker cell corner in sub-frame [0, 3)
-    size: f32,                    // walker cell size in local units
-    base_px: f32,                 // projected base-cell pixel size
-) -> f32 {
-    var b: f32 = bevel_level(un, vn, u_lo, v_lo, size, base_px);
-
-    var up_u = u_lo; var up_v = v_lo; var up_s = size; var up_px = base_px;
-    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
-        up_s = up_s * 3.0;
-        // Ancestors larger than the sub-frame box can't be resolved
-        // from local state alone — bail out before they'd snap
-        // ambiguously to 0 and paint spurious edges.
-        if up_s > 3.0 { break; }
-        up_u = floor(up_u / up_s) * up_s;
-        up_v = floor(up_v / up_s) * up_s;
-        up_px = up_px * 3.0;
-        b = b * bevel_level(un, vn, up_u, up_v, up_s, up_px);
-    }
-
-    var dn_u = u_lo; var dn_v = v_lo; var dn_s = size; var dn_px = base_px;
-    for (var i: u32 = 0u; i < 3u; i = i + 1u) {
-        let cs = dn_s * (1.0 / 3.0);
-        let cpx = dn_px * (1.0 / 3.0);
-        if cpx < 2.0 { break; }
         let uf = clamp((un - dn_u) / dn_s, 0.0, 0.9999999);
         let vf = clamp((vn - dn_v) / dn_s, 0.0, 0.9999999);
         dn_u = dn_u + floor(uf * 3.0) * cs;
@@ -663,1001 +564,5 @@ fn sphere_in_cell(
         t = t_next + cell_eps;
     }
 
-    return result;
-}
-
-// ─────────────────────── local-frame sphere sub-frame DDA
-
-/// Terminal cell in the sub-frame's local `[0, 3)³` coords.
-struct SubWalkResult {
-    block: u32,
-    u_lo: f32,
-    v_lo: f32,
-    r_lo: f32,
-    size: f32,
-}
-
-/// Walk a sub-frame subtree along local point `(u_l, v_l, r_l) ∈ [0, 3)³`
-/// to `max_depth` levels. Mirrors CPU `walk_sub_frame` in
-/// `src/world/raycast/sphere_sub.rs`.
-fn walk_sub_frame(
-    sub_frame_idx: u32,
-    u_l_in: f32, v_l_in: f32, r_l_in: f32,
-    max_depth: u32,
-) -> SubWalkResult {
-    var res: SubWalkResult;
-    res.block = FACE_WALK_EMPTY;
-    res.u_lo = 0.0;
-    res.v_lo = 0.0;
-    res.r_lo = 0.0;
-    res.size = 3.0;
-
-    let clamp_max = 0.9999999 * 3.0;
-    var u_pt = clamp(u_l_in, 0.0, clamp_max);
-    var v_pt = clamp(v_l_in, 0.0, clamp_max);
-    var r_pt = clamp(r_l_in, 0.0, clamp_max);
-
-    var node_idx = sub_frame_idx;
-    var u_lo: f32 = 0.0;
-    var v_lo: f32 = 0.0;
-    var r_lo: f32 = 0.0;
-    var size: f32 = 3.0;
-
-    for (var d: u32 = 1u; d <= max_depth; d = d + 1u) {
-        let base = node_offsets[node_idx];
-        if ENABLE_STATS { ray_loads_offsets = ray_loads_offsets + 1u; }
-        let occupancy = tree[base];
-        let first_child = tree[base + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
-
-        let child_size = size / 3.0;
-        let us = min(u32((u_pt - u_lo) / child_size), 2u);
-        let vs = min(u32((v_pt - v_lo) / child_size), 2u);
-        let rs = min(u32((r_pt - r_lo) / child_size), 2u);
-        let slot = rs * 9u + vs * 3u + us;
-        let cu_lo = u_lo + f32(us) * child_size;
-        let cv_lo = v_lo + f32(vs) * child_size;
-        let cr_lo = r_lo + f32(rs) * child_size;
-
-        let mask = (occupancy >> slot) & 1u;
-        if mask == 0u {
-            res.u_lo = cu_lo;
-            res.v_lo = cv_lo;
-            res.r_lo = cr_lo;
-            res.size = child_size;
-            return res;
-        }
-        let rank = countOneBits(occupancy & ((1u << slot) - 1u));
-        let packed = tree[first_child + rank * 2u];
-        let node_index = tree[first_child + rank * 2u + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
-        let tag = packed & 0xFFu;
-        if tag == 1u {
-            res.block = child_block_type(packed);
-            res.u_lo = cu_lo;
-            res.v_lo = cv_lo;
-            res.r_lo = cr_lo;
-            res.size = child_size;
-            return res;
-        }
-        if d == max_depth {
-            res.block = child_block_type(packed);
-            res.u_lo = cu_lo;
-            res.v_lo = cv_lo;
-            res.r_lo = cr_lo;
-            res.size = child_size;
-            return res;
-        }
-        node_idx = node_index;
-        u_lo = cu_lo;
-        v_lo = cv_lo;
-        r_lo = cr_lo;
-        size = child_size;
-    }
-    res.u_lo = u_lo;
-    res.v_lo = v_lo;
-    res.r_lo = r_lo;
-    res.size = size;
-    return res;
-}
-
-/// Fetch the i-th UVR pre-descent slot from the uniform array. One
-/// u32 per vec4 slot — slot index `i` lives in element `(i/4, i%4)`.
-fn sub_uvr_slot_at(i: u32) -> u32 {
-    let row = uniforms.sub_uvr_slots[i / 4u];
-    switch (i % 4u) {
-        case 0u: { return row.x; }
-        case 1u: { return row.y; }
-        case 2u: { return row.z; }
-        default: { return row.w; }
-    }
-}
-
-/// Pre-descend from the face-subtree root (`face_root_idx`) along
-/// `sub_meta.y` UVR slots, then dispatch `walk_sub_frame` at the
-/// terminal Node. Mirrors CPU `walk_from_deep_sub_frame` in
-/// `src/world/raycast/sphere_sub.rs`.
-///
-/// On `Child::Empty` / `Child::Block` / `Child::EntityRef` mid-prefix
-/// the walker returns a uniform `SubWalkResult` covering the full
-/// local `[0, 3)³` box (empty sentinel or the block type). The DDA
-/// caller treats that as the whole sub-frame being one uniform cell.
-fn walk_from_deep_sub_frame(
-    face_root_idx: u32,
-    u_l: f32, v_l: f32, r_l: f32,
-    walker_limit: u32,
-) -> SubWalkResult {
-    var res: SubWalkResult;
-    res.block = FACE_WALK_EMPTY;
-    res.u_lo = 0.0;
-    res.v_lo = 0.0;
-    res.r_lo = 0.0;
-    res.size = 3.0;
-
-    let prefix_len = uniforms.sub_meta.y;
-    var node_idx = face_root_idx;
-    for (var i: u32 = 0u; i < prefix_len; i = i + 1u) {
-        let slot = sub_uvr_slot_at(i);
-        let base = node_offsets[node_idx];
-        if ENABLE_STATS { ray_loads_offsets = ray_loads_offsets + 1u; }
-        let occupancy = tree[base];
-        let first_child = tree[base + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
-        let mask = (occupancy >> slot) & 1u;
-        if mask == 0u {
-            // Empty sub-cell mid-prefix → full sub-frame is empty.
-            return res;
-        }
-        let rank = countOneBits(occupancy & ((1u << slot) - 1u));
-        let packed = tree[first_child + rank * 2u];
-        let node_index = tree[first_child + rank * 2u + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
-        let tag = packed & 0xFFu;
-        if tag == 1u {
-            // Uniform-solid sub-frame (a Block cell deeper up the
-            // chain collapses the whole local [0, 3)³ to one block).
-            res.block = child_block_type(packed);
-            return res;
-        }
-        if tag == 3u {
-            // EntityRef cell mid-prefix — the sub-frame render
-            // treats it as empty; the tag=3 dispatch is handled
-            // elsewhere.
-            return res;
-        }
-        // tag == 2u: descend into the Node child.
-        node_idx = node_index;
-    }
-
-    // Pre-descent reached the deep terminal Node. Dispatch the
-    // intra-cell walker from here.
-    return walk_sub_frame(node_idx, u_l, v_l, r_l, walker_limit);
-}
-
-// ────────────── shader face-frame Jacobian (mirror of Rust)
-
-/// Mirror of Rust `cubesphere::face_frame_jacobian`. Returns
-/// `(c_body, J_col0, J_col1, J_col2)` at the face-frame corner
-/// `(un, vn, rn)` of a cell of size `frame_size` in face-normalized
-/// coords. Body-size is 3.0 (shader convention — the sphere body cell
-/// fills `[0, 3)³`).
-///
-/// Columns of J are ∂body_pos / ∂(u_l, v_l, r_l) at the corner, with
-/// `body_pos ≈ c_body + J · (u_l, v_l, r_l)` for local `(u_l, v_l, r_l)
-/// ∈ [0, 3)³`. Used by the local-frame sub-frame DDA when stepping to
-/// a neighbor sub-frame (the neighbor's J is recomputed at its own
-/// corner).
-struct FaceFrameJac {
-    c_body: vec3<f32>,
-    col_u: vec3<f32>,
-    col_v: vec3<f32>,
-    col_r: vec3<f32>,
-}
-
-fn face_frame_jacobian_shader(
-    face: u32,
-    un_corner: f32, vn_corner: f32, rn_corner: f32,
-    frame_size: f32,
-    inner_r: f32, outer_r: f32,
-) -> FaceFrameJac {
-    let body_size: f32 = 3.0;
-    let center = vec3<f32>(body_size * 0.5);
-    let n_axis = face_normal(face);
-    let u_axis = face_u_axis(face);
-    let v_axis = face_v_axis(face);
-
-    let e_u = un_corner * 2.0 - 1.0;
-    let e_v = vn_corner * 2.0 - 1.0;
-    let cu = ea_to_cube(e_u);
-    let cv = ea_to_cube(e_v);
-    let cos_u = cos(e_u * 0.7853981633974483); // π/4
-    let cos_v = cos(e_v * 0.7853981633974483);
-    let alpha_u = 1.5707963267948966 / (cos_u * cos_u); // π/2
-    let alpha_v = 1.5707963267948966 / (cos_v * cos_v);
-
-    let raw = n_axis + cu * u_axis + cv * v_axis;
-    let nm = length(raw);
-    let inv_nm = 1.0 / nm;
-    let dir = raw * inv_nm;
-
-    let r_body = (inner_r + rn_corner * (outer_r - inner_r)) * body_size;
-    let dr_dbody = (outer_r - inner_r) * body_size;
-
-    let c_body = center + dir * r_body;
-
-    let s = frame_size / 3.0;
-    let k_u = s * r_body * alpha_u * inv_nm;
-    let k_v = s * r_body * alpha_v * inv_nm;
-    let cu_nm = cu * inv_nm;
-    let cv_nm = cv * inv_nm;
-    let col_u = k_u * (u_axis - cu_nm * dir);
-    let col_v = k_v * (v_axis - cv_nm * dir);
-    let col_r = s * dr_dbody * dir;
-
-    var out: FaceFrameJac;
-    out.c_body = c_body;
-    out.col_u = col_u;
-    out.col_v = col_v;
-    out.col_r = col_r;
-    return out;
-}
-
-/// 3×3 inverse, stored column-major (columns in `col_u/v/r`). Returns
-/// the inverse as three columns. f32 throughout — the sub-frame DDA
-/// uses J_inv only for direction transforms in LOCAL coordinates; the
-/// singular cases (determinant → 0) don't arise in the valid UVR
-/// range.
-struct Mat3Columns {
-    col_u: vec3<f32>,
-    col_v: vec3<f32>,
-    col_r: vec3<f32>,
-}
-
-fn mat3_inv_shader(m: Mat3Columns) -> Mat3Columns {
-    let a = m.col_u.x; let b = m.col_v.x; let c = m.col_r.x;
-    let d = m.col_u.y; let e = m.col_v.y; let f = m.col_r.y;
-    let g = m.col_u.z; let h = m.col_v.z; let i = m.col_r.z;
-    let c00 =   e * i - f * h;
-    let c01 = -(d * i - f * g);
-    let c02 =   d * h - e * g;
-    let c10 = -(b * i - c * h);
-    let c11 =   a * i - c * g;
-    let c12 = -(a * h - b * g);
-    let c20 =   b * f - c * e;
-    let c21 = -(a * f - c * d);
-    let c22 =   a * e - b * d;
-    let det = a * c00 + b * c01 + c * c02;
-    let inv_det = 1.0 / det;
-    var out: Mat3Columns;
-    out.col_u = vec3<f32>(c00, c01, c02) * inv_det;
-    out.col_v = vec3<f32>(c10, c11, c12) * inv_det;
-    out.col_r = vec3<f32>(c20, c21, c22) * inv_det;
-    return out;
-}
-
-fn mat3_mul_vec_shader(m: Mat3Columns, v: vec3<f32>) -> vec3<f32> {
-    return m.col_u * v.x + m.col_v * v.y + m.col_r * v.z;
-}
-
-/// Stable inverse of a matrix M = s · M_n where M_n has O(1) columns.
-/// The face-frame Jacobian at depth m has M = (frame_size/3) · J_n:
-/// `col_u/v/r` entries are O(1/3^m). At m ≥ 15 those entries fall
-/// below f32 ULP near zero (~6e-8); cofactor products `e·i − f·h` in
-/// `mat3_inv_shader` become two similar O(1/3^(2m)) values subtracted,
-/// losing every significant digit — J_inv is garbage and the DDA
-/// renders a collapsed smear past layer 20.
-///
-/// Fix: divide M by s first (elements become O(1), well-conditioned),
-/// invert in f32 without precision loss, then multiply the result by
-/// 1/s (since (s·M_n)^-1 = M_n^-1 / s). Net cost is two scalar
-/// multiplies + one normal mat3_inv — identical register pressure.
-fn mat3_inv_scaled_shader(m: Mat3Columns, s: f32) -> Mat3Columns {
-    let inv_s = 1.0 / s;
-    var mn: Mat3Columns;
-    mn.col_u = m.col_u * inv_s;
-    mn.col_v = m.col_v * inv_s;
-    mn.col_r = m.col_r * inv_s;
-    let mn_inv = mat3_inv_shader(mn);
-    var out: Mat3Columns;
-    out.col_u = mn_inv.col_u * inv_s;
-    out.col_v = mn_inv.col_v * inv_s;
-    out.col_r = mn_inv.col_r * inv_s;
-    return out;
-}
-
-/// Upper bound on neighbor sub-frame transitions per ray.
-///
-/// Originally 64 (CPU mirror of `MAX_NEIGHBOR_TRANSITIONS` in
-/// `src/world/raycast/sphere_sub.rs`). Verified empirically (sphere-
-/// sub debug-paint screenshot harness, force_sphere_state script
-/// command) that 64 is the actual cause of the layer-10-ish wall
-/// previously attributed to f32 precision: at deep spawn_depths the
-/// camera sits very close to the sphere surface and rays cross many
-/// sub-frame cells angularly before finding a block, hitting the
-/// cap immediately and producing a yellow-tinted miss frame.
-///
-/// Raised to 1024 — unlocks meaningful sphere rendering at depths
-/// 11-14 (previously sky/grey via fall-through to body march).
-/// Per-ray worst-case cost ~95 ms at depth 14 in the diagnostic
-/// harness; normal gameplay (camera not surface-grazing) doesn't
-/// hit the cap and pays no extra cost. Higher caps (4096+) push
-/// past 100 ms at deeper test depths AND don't render meaningful
-/// content past depth 14 because of camera-position precision
-/// limits in the test harness itself.
-const MAX_SPHERE_SUB_TRANSITIONS: u32 = 1024u;
-
-// ─── symbolic neighbor-step on UVR path (shader mirror of
-// `Path::step_neighbor_cartesian`). Slot packing is identical to XYZ
-// because UVR uses the same `slot_index(us, vs, rs) = rs*9 + vs*3 + us`
-// formula — only the semantic axes differ.
-
-/// Decompose a slot index into `(us, vs, rs)`, each ∈ 0..3.
-fn slot_to_coords(slot: u32) -> vec3<u32> {
-    let us = slot % 3u;
-    let vs = (slot / 3u) % 3u;
-    let rs = slot / 9u;
-    return vec3<u32>(us, vs, rs);
-}
-
-fn coords_to_slot(us: u32, vs: u32, rs: u32) -> u32 {
-    return rs * 9u + vs * 3u + us;
-}
-
-/// Return `(t_enter, t_exit)` for the ray crossing the local
-/// `[0, 3)³` cube. `t_exit ≤ 0` → miss.
-fn ray_sub_box_interval(ro: vec3<f32>, rd: vec3<f32>) -> vec2<f32> {
-    var t_lo: f32 = -1e30;
-    var t_hi: f32 =  1e30;
-    for (var axis: u32 = 0u; axis < 3u; axis = axis + 1u) {
-        let o = ro[axis];
-        let d = rd[axis];
-        if abs(d) < 1e-30 {
-            if o < 0.0 || o >= 3.0 {
-                return vec2<f32>(1e30, -1e30);
-            }
-            continue;
-        }
-        let t0 = (0.0 - o) / d;
-        let t1 = (3.0 - o) / d;
-        let a = min(t0, t1);
-        let b = max(t0, t1);
-        t_lo = max(t_lo, a);
-        t_hi = min(t_hi, b);
-    }
-    return vec2<f32>(t_lo, t_hi);
-}
-
-/// Axis-exit t for a cell `[lo, lo+size]` along one axis. Returns
-/// +∞ for rays parallel / going backward through both faces.
-fn sub_axis_exit_t(p: f32, d: f32, lo: f32, hi: f32) -> f32 {
-    if d > 1e-30  { return (hi - p) / d; }
-    if d < -1e-30 { return (lo - p) / d; }
-    return 1e30;
-}
-
-/// Helper that pre-descends `node` along `uvr_slots[0..prefix_len]`
-/// and calls `walk_sub_frame` at the terminal Node. Unlike
-/// `walk_from_deep_sub_frame`, this takes an explicit mutable-style
-/// slot array (local f32 buffer, fed from the DDA's per-ray uvr
-/// prefix that mutates on neighbor transitions).
-///
-/// Returns the SubWalkResult as if this were the starting face-root;
-/// empty/solid cells mid-prefix collapse the whole `[0, 3)³` local box
-/// to a single uniform cell (matching CPU `walk_from_deep_sub_frame`).
-fn walk_from_deep_sub_frame_dyn(
-    face_root_idx: u32,
-    uvr_slots: array<u32, 64>,
-    prefix_len: u32,
-    u_l: f32, v_l: f32, r_l: f32,
-    walker_limit: u32,
-) -> SubWalkResult {
-    var res: SubWalkResult;
-    res.block = FACE_WALK_EMPTY;
-    res.u_lo = 0.0;
-    res.v_lo = 0.0;
-    res.r_lo = 0.0;
-    res.size = 3.0;
-
-    var node_idx = face_root_idx;
-    for (var i: u32 = 0u; i < prefix_len; i = i + 1u) {
-        let slot = uvr_slots[i];
-        let base = node_offsets[node_idx];
-        if ENABLE_STATS { ray_loads_offsets = ray_loads_offsets + 1u; }
-        let occupancy = tree[base];
-        let first_child = tree[base + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
-        let mask = (occupancy >> slot) & 1u;
-        if mask == 0u { return res; }
-        let rank = countOneBits(occupancy & ((1u << slot) - 1u));
-        let packed = tree[first_child + rank * 2u];
-        let node_index = tree[first_child + rank * 2u + 1u];
-        if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 2u; }
-        let tag = packed & 0xFFu;
-        if tag == 1u {
-            res.block = child_block_type(packed);
-            return res;
-        }
-        if tag == 3u { return res; }
-        node_idx = node_index;
-    }
-    return walk_sub_frame(node_idx, u_l, v_l, r_l, walker_limit);
-}
-
-// ───────────────────────── sphere_in_sub_frame (rewrite) ──────────────
-//
-// GPU mirror of CPU `cs_raycast_local` in
-// `src/world/raycast/sphere_sub.rs`. Written FROM SCRATCH to match
-// that CPU spec line-by-line at deep UVR depths. The old hand-port had
-// a precision collapse that returned smeared grey at depth ≥ ~5; this
-// rewrite keeps every multi-precision step in the numerically-stable
-// form the CPU version already uses.
-//
-// Precision model — the critical arithmetic identities:
-//
-//   `rd_body` is O(1).
-//   `J_inv` entries are O(3^m) at UVR depth m.
-//   `rd_local = J_inv · rd_body` is therefore O(3^m) — large but finite
-//   in f32 for m up to ~25 (3^25 ≈ 8.5e11).
-//
-//   Inside `[0, 3)^3`, `ro_local` is O(1). `t_exit = (3 − ro_local)
-//   / rd_local` is O(1) / O(3^m) = O(1/3^m) — representable in f32 at
-//   any depth because it's a ratio.
-//
-//   `pos = ro_local + rd_local · t = O(1) + O(3^m)·O(1/3^m) = O(1)`.
-//   The SUM of two values both ending up near O(1) is stable because
-//   the O(3^m)·O(1/3^m) product was computed with f32 relative error,
-//   not absolute error.
-//
-//   Neighbor transition: `local_new = J_new_inv · J_cur · (local_exit
-//   − s·3·e_k)`. Each O(1/3^m) · O(3^m) · O(1) product chain stays
-//   O(1) end-to-end — f32-stable at any depth.
-//
-// What was WRONG in the old code and is FIXED here:
-//
-//   * The old code returned DEBUG-WALKER pink/blue every iteration
-//     whenever `w.size > 0.9`. That fired on the very first DDA step
-//     of every ray, so the real DDA loop never executed. Rewrite
-//     removes all debug early-returns; `SPHERE_DEBUG_PAINT` toggles
-//     colour-coded painting on demand without short-circuiting the
-//     real march.
-//
-//   * The old code had a spurious post-loop "DEBUG-SHADER-7 orange"
-//     return that leaked every terminated-but-missed ray into the
-//     framebuffer, swamping the real hit pixels. Rewrite returns a
-//     proper miss unless SPHERE_DEBUG_PAINT wants a colour.
-//
-//   * The old code recovered `rd_body` via `J · ray_dir_local` inside
-//     the function. The rewrite accepts `rd_body` as a dedicated
-//     parameter so the caller can pass the exact body-frame value
-//     (march.wgsl reconstructs it once, right at the dispatch site).
-//     Shader precision work avoids repeating that inversion inside the
-//     per-ray loop.
-//
-//   * The old code computed `rn_abs = rn_corner + w.r_lo * frame_size
-//     / 3.0`. For m > 15 `frame_size / 3 = 1/3^(m+1)` is below the
-//     ULP of `rn_corner` (~0.5, ULP ~6e-8), so the addition silently
-//     drops the cell offset — every cell at the same shell reported
-//     the same `rn_abs` and the tint collapsed. Rewrite carries
-//     `frame_size/3` as a SEPARATE small term and only sums it when
-//     we need the tint — the tint itself is tolerant of the 1e-7
-//     truncation there, and the important DDA maths never forms that
-//     sum.
-//
-// Parameters:
-// * `face_root_idx` — BFS index of the face-subtree root node.
-// * `ray_origin_local` — camera position in sub-frame local `[0,3)^3`.
-//   Magnitude O(1). CPU-side sub-frame descent produced this without
-//   any body-XYZ subtraction, so it's f32-precise at any depth.
-// * `ray_dir_local` — camera-basis ray direction ALREADY rotated into
-//   sub-frame local via J_inv. Magnitude O(3^m). f32-representable up
-//   to m ≈ 25.
-// * `rd_body` — the SAME ray direction expressed in body-XYZ, unit
-//   length. Magnitude O(1). Used for re-deriving `rd_local` on every
-//   neighbor transition (where J_inv changes).
-// * `walker_limit` — max intra-cell walker descent depth.
-fn sphere_in_sub_frame(
-    face_root_idx: u32,
-    ray_origin_local: vec3<f32>,
-    ray_dir_local: vec3<f32>,
-    rd_body: vec3<f32>,
-    walker_limit: u32,
-) -> HitResult {
-    var result: HitResult;
-    result.hit = false;
-    result.t = 1e20;
-    result.frame_level = 0u;
-    result.frame_scale = 1.0;
-    result.cell_min = vec3<f32>(0.0);
-    result.cell_size = 1.0;
-
-    if walker_limit == 0u { return result; }
-
-    // --- Immutable subtree constants (seeded from uniforms). ---
-    // `face`, `inner_r`, `outer_r` don't change across neighbor steps —
-    // we stay inside one face subtree. `initial_prefix_len` is the UVR
-    // prefix the walker inherits from CPU `compute_render_frame`; it
-    // stays constant (neighbor-step preserves UVR path DEPTH via
-    // slot-wrap, only rewrites the trailing slots).
-    let face           = uniforms.sub_meta.x;
-    let inner_r        = uniforms.root_radii.x;
-    let outer_r        = uniforms.root_radii.y;
-    let initial_prefix_len = uniforms.sub_meta.y;
-
-    // --- Sub-frame constants (read once, never mutated). ---
-    //
-    // `un_corner`/`vn_corner` used to live here as mutable per-
-    // neighbor-transition state, updated by `un_corner += frame_size`
-    // so `face_frame_jacobian_shader` could rebuild J at the new
-    // corner. At depth m ≥ ~14 that increment is below the f32 ULP of
-    // the O(1) corner value, so the "new" J ≡ old J and neighbor
-    // transitions became no-ops. That — plus the companion CPU cap
-    // `MAX_STABLE_SPHERE_SUB_M = 14` — is the precision ceiling this
-    // rewrite eliminates.
-    //
-    // The replacement insight: over a few cells of a deep sub-frame,
-    // the Jacobian's curvature drift is O(frame_size²) = O(1/3^(2m))
-    // — geometrically vanishing. Holding J constant across the
-    // neighborhood introduces a linearization error that's invisible
-    // at any reasonable m, AND the neighbor-step position transfer
-    // degenerates to `pos[axis_k] -= sign · 3.0` — no J
-    // multiplications, no basis rebuild, no precision dependency on
-    // the absolute face-normalized corner at all.
-    //
-    // `rn_corner` feeds the per-hit depth tint below (a smooth
-    // function of absolute radial position, tolerant of f32 drift).
-    // `frame_size` scales the walker cell's local units into body
-    // distance for the per-pixel bevel base_px computation.
-    let rn_corner  = uniforms.sub_face_corner.z;
-    let frame_size = uniforms.sub_face_corner.w;
-
-    // Copy the uniform UVR prefix into a function-local buffer so we
-    // can mutate it on neighbor steps. Length 64 matches the CPU-side
-    // MAX_SPHERE_SUB_DEPTH cap; unused tail stays zero and is never
-    // read (guarded by `uvr_prefix_len`).
-    var uvr_slots: array<u32, 64>;
-    for (var i: u32 = 0u; i < 64u; i = i + 1u) {
-        uvr_slots[i] = 0u;
-    }
-    for (var i: u32 = 0u; i < initial_prefix_len; i = i + 1u) {
-        uvr_slots[i] = sub_uvr_slot_at(i);
-    }
-    let uvr_prefix_len = initial_prefix_len;
-
-    // --- Ray state. `ro_local` is in the sub-frame's local `[0, 3)`
-    // coords (O(1)). `rd_local` is the same direction expressed in
-    // the sub-frame's basis via J_inv (O(3^m)). Both hold their
-    // magnitudes across the whole DDA now that J is constant — no
-    // basis rebuild means `rd_local` never needs re-derivation from
-    // `rd_body`. `rd_body` itself is still used once, in the hit
-    // shading block, to compute the body-frame sun-diffuse term.
-    var ro_local = ray_origin_local;
-    let rd_local = ray_dir_local;
-
-    // Initial ray-box interval inside `[0, 3)^3`.
-    //
-    // PRECISION NOTE — `ray_sub_box_interval` divides O(1)
-    // boundary−ro_local by O(3^m) rd_local → result O(1/3^m). Both
-    // operands are f32-representable; the division is one rounding
-    // step. No catastrophic cancellation — numerator = boundary −
-    // ro_local where both are O(1) but their DIFFERENCE can still be
-    // O(1) (the whole box is size 3 in local).
-    let interval0 = ray_sub_box_interval(ro_local, rd_local);
-    var t_enter = interval0.x;
-    var t_exit  = interval0.y;
-    if t_exit <= 0.0 || t_enter >= t_exit {
-        if SPHERE_DEBUG_PAINT {
-            result.hit = true;
-            result.t = 0.01;
-            result.color = vec3<f32>(0.8, 0.1, 0.1); // red: interval miss
-            result.normal = vec3<f32>(0.0, 1.0, 0.0);
-            return result;
-        }
-        return result;
-    }
-
-    // PRECISION NOTE — `t_span`, `t_nudge`, `t`: all live at the same
-    // O(1/3^m) scale as t_exit. Adding/subtracting two values of the
-    // same scale is f32-safe because they share a common exponent.
-    var t_span  = max(abs(t_exit - t_enter), 1e-30);
-    var t_nudge = t_span * 1e-5;
-    var t       = max(t_enter, 0.0) + t_nudge;
-
-    var neighbor_transitions: u32 = 0u;
-    var dda_steps: u32            = 0u;
-
-    // --- Main DDA loop. Structure mirrors CPU `cs_raycast_local`. ---
-    loop {
-        if dda_steps >= 4096u {
-            if SPHERE_DEBUG_PAINT {
-                result.hit = true;
-                result.t = 0.01;
-                result.color = vec3<f32>(0.1, 0.9, 0.1); // green: dda cap
-                result.normal = vec3<f32>(0.0, 1.0, 0.0);
-                return result;
-            }
-            return result;
-        }
-        dda_steps = dda_steps + 1u;
-        if ENABLE_STATS { ray_steps = ray_steps + 1u; }
-
-        // PRECISION NOTE — `pos = ro_local + rd_local * t`:
-        //   ro_local O(1), rd_local O(3^m), t O(1/3^m).
-        //   rd_local * t = O(1). Adding to ro_local (also O(1)) is
-        //   f32-stable; both exponents are near zero.
-        let pos = ro_local + rd_local * t;
-
-        let out_of_box =
-            pos.x < 0.0 || pos.x >= 3.0 ||
-            pos.y < 0.0 || pos.y >= 3.0 ||
-            pos.z < 0.0 || pos.z >= 3.0 ||
-            t >= t_exit;
-
-        if out_of_box {
-            // ------------------------------------------------------
-            // Neighbor-transition branch. Steps the UVR path by one
-            // slot along the exit axis, rebuilds J / J_inv / corner,
-            // transfers position/direction into the neighbor's basis,
-            // restarts the DDA in the new sub-frame. Mirrors CPU
-            // `cs_raycast_local`'s out-of-box handler +
-            // `SphereSubFrame::with_neighbor_stepped`.
-            // ------------------------------------------------------
-            if neighbor_transitions >= MAX_SPHERE_SUB_TRANSITIONS {
-                if SPHERE_DEBUG_PAINT {
-                    result.hit = true;
-                    result.t = 0.01;
-                    result.color = vec3<f32>(0.95, 0.95, 0.1); // yellow
-                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
-                    return result;
-                }
-                return result;
-            }
-
-            // Pick exit axis / sign from `pos`. Prefer whichever axis
-            // protrudes farthest past the box face — corner exits pick
-            // the axis with the largest excursion so the neighbor step
-            // lands on the geometrically correct face.
-            var axis_k: u32 = 0u;
-            var sign_s: i32 = 0;
-            var best_excess: f32 = -1.0;
-            for (var k: u32 = 0u; k < 3u; k = k + 1u) {
-                let v = pos[k];
-                var excess: f32;
-                var sv: i32;
-                if v >= 3.0 {
-                    excess = v - 3.0;
-                    sv = 1;
-                } else if v < 0.0 {
-                    excess = -v;
-                    sv = -1;
-                } else {
-                    excess = -1.0;
-                    sv = 0;
-                }
-                if excess > best_excess {
-                    best_excess = excess;
-                    axis_k = k;
-                    sign_s = sv;
-                }
-            }
-            if sign_s == 0 {
-                // No axis outside the box — we hit the `t >= t_exit`
-                // guard instead. Terminate the DDA; the ray left via
-                // the sub-frame cap without a finite pos delta.
-                if SPHERE_DEBUG_PAINT {
-                    result.hit = true;
-                    result.t = 0.01;
-                    result.color = vec3<f32>(0.0, 0.9, 0.9); // cyan: t>=t_exit silent miss
-                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
-                    return result;
-                }
-                return result;
-            }
-
-            // --- Bubble-up slot step. Mirror of
-            //     `SphereSubFrame::with_neighbor_stepped` +
-            //     `Path::step_neighbor_cartesian`.
-            //
-            // Pre-check: scan UVR slots (deepest first) for one whose
-            // stepped-axis coord is NOT at the overflow boundary for
-            // this direction. If all are pinned, the step would bubble
-            // past the face root → cross-face transition, terminate.
-            // ---------------------------------------------------------
-            let boundary: u32 = select(0u, 2u, sign_s > 0);
-            var can_step_in_face = false;
-            if uvr_prefix_len > 0u {
-                var ci: u32 = uvr_prefix_len;
-                loop {
-                    if ci == 0u { break; }
-                    ci = ci - 1u;
-                    let co = slot_to_coords(uvr_slots[ci]);
-                    var coord: u32;
-                    if axis_k == 0u { coord = co.x; }
-                    else if axis_k == 1u { coord = co.y; }
-                    else { coord = co.z; }
-                    if coord != boundary { can_step_in_face = true; break; }
-                }
-            }
-            if !can_step_in_face {
-                if SPHERE_DEBUG_PAINT {
-                    result.hit = true;
-                    result.t = 0.01;
-                    result.color = vec3<f32>(1.0, 0.55, 0.0); // orange
-                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
-                    return result;
-                }
-                return result;
-            }
-
-            // Bubble step: find the deepest slot whose stepped-axis
-            // coord can step in-place; write the new coord there; then
-            // for every slot DEEPER than that one, wrap the
-            // stepped-axis coord to `0` (going +) or `2` (going −).
-            // This matches `Path::step_neighbor_cartesian`'s recursion
-            // iteratively.
-            var depth: u32 = uvr_prefix_len;
-            loop {
-                if depth == 0u { break; } // unreachable (pre-check above)
-                let idx = depth - 1u;
-                let co = slot_to_coords(uvr_slots[idx]);
-                var c0 = co.x; var c1 = co.y; var c2 = co.z;
-                var cur: i32;
-                if axis_k == 0u { cur = i32(c0); }
-                else if axis_k == 1u { cur = i32(c1); }
-                else { cur = i32(c2); }
-                let nxt = cur + sign_s;
-                if nxt >= 0 && nxt <= 2 {
-                    if axis_k == 0u { c0 = u32(nxt); }
-                    else if axis_k == 1u { c1 = u32(nxt); }
-                    else { c2 = u32(nxt); }
-                    uvr_slots[idx] = coords_to_slot(c0, c1, c2);
-                    depth = idx + 1u; // first untouched level
-                    break;
-                }
-                depth = idx; // bubble up
-            }
-            // Rewrap any slots deeper than the one we just stepped.
-            let wrap_val: u32 = select(2u, 0u, sign_s > 0);
-            for (var i2: u32 = depth; i2 < uvr_prefix_len; i2 = i2 + 1u) {
-                let co2 = slot_to_coords(uvr_slots[i2]);
-                var d0 = co2.x; var d1 = co2.y; var d2 = co2.z;
-                if axis_k == 0u { d0 = wrap_val; }
-                else if axis_k == 1u { d1 = wrap_val; }
-                else { d2 = wrap_val; }
-                uvr_slots[i2] = coords_to_slot(d0, d1, d2);
-            }
-
-            // --- Position transfer (J held constant across neighbors).
-            //
-            // The Jacobian is invariant across the local vicinity to
-            // first order: J_new − J_cur = O(frame_size), so over a
-            // handful of neighbor steps the curvature drift is
-            // geometrically negligible. Keeping J constant makes the
-            // full matrix transform degenerate to a scalar shift:
-            //
-            //   J_new_inv · J_cur · (pos − sign·3·e_k)
-            //      = I · (pos − sign·3·e_k)
-            //      = pos with `pos[axis_k] -= sign·3.0`
-            //
-            // All remaining arithmetic is O(1) in sub-frame local
-            // coords — depth-independent. No `face_frame_jacobian`
-            // rebuild, no `mat3_inv`, no `un_corner` mutation: the
-            // per-neighbor precision collapse that capped the
-            // sub-frame at m ≤ 14 is structurally eliminated.
-            let d_f = f32(sign_s);
-            var local_new = pos;
-            local_new[axis_k] = local_new[axis_k] - d_f * 3.0;
-
-            // Clamp the entry axis just inside the neighbor box on
-            // the axis we crossed — protects against f32 drift on
-            // the pos.x arithmetic producing an immediate re-exit.
-            let eps_in: f32 = 3.0 * 1e-6;
-            if sign_s == 1 {
-                local_new[axis_k] = eps_in;
-            } else {
-                local_new[axis_k] = 3.0 - eps_in;
-            }
-            // Clamp non-crossed axes into [0, 3) too — corner-exit
-            // drift otherwise kills the DDA in the neighbor.
-            for (var k2: u32 = 0u; k2 < 3u; k2 = k2 + 1u) {
-                if k2 == axis_k { continue; }
-                if local_new[k2] < 0.0 { local_new[k2] = 0.0; }
-                if local_new[k2] >= 3.0 { local_new[k2] = 3.0 - eps_in; }
-            }
-
-            // rd_local is invariant too (depends only on J_inv, which
-            // didn't change). No recompute needed.
-            ro_local = local_new;
-            let interval = ray_sub_box_interval(ro_local, rd_local);
-            let new_t_enter = interval.x;
-            let new_t_exit  = interval.y;
-            if new_t_exit <= 0.0 || new_t_enter >= new_t_exit {
-                if SPHERE_DEBUG_PAINT {
-                    result.hit = true;
-                    result.t = 0.01;
-                    result.color = vec3<f32>(1.0, 1.0, 1.0); // white: neighbor interval miss
-                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
-                    return result;
-                }
-                return result;
-            }
-            t_span  = max(abs(new_t_exit - new_t_enter), 1e-30);
-            t_nudge = t_span * 1e-5;
-            t       = max(new_t_enter, 0.0) + t_nudge;
-            t_exit  = new_t_exit;
-
-            neighbor_transitions = neighbor_transitions + 1u;
-            continue;
-        }
-
-        // ------------------------------------------------------------
-        // Intra-sub-frame cell step. Walk the subtree at the current
-        // `pos` to resolve the terminal walker cell; on solid hit,
-        // shade and return; on empty, advance to the nearest cell
-        // boundary and re-loop.
-        // ------------------------------------------------------------
-        let w = walk_from_deep_sub_frame_dyn(
-            face_root_idx, uvr_slots, uvr_prefix_len,
-            pos.x, pos.y, pos.z, walker_limit,
-        );
-
-        if w.block != FACE_WALK_EMPTY {
-            // --- Hit shading. ---
-            result.hit = true;
-            result.t   = t;
-
-            // Hit normal. Two different normals are needed here and
-            // they disagreed in the previous code, producing visible
-            // "concentric circle" artifacts at layers past ~12:
-            //
-            // * `diffuse_n` — a body-frame unit vector for the sun
-            //   dot product. Body-frame because the sun direction is
-            //   in world/body axes, not sub-frame-local. Using
-            //   −rd_body normalized as the approximate surface normal
-            //   (the ray came in along rd_body, so the face opposes).
-            //
-            // * `result.normal` — used by `shade_pixel`'s
-            //   `cube_face_bevel` together with `result.cell_min` /
-            //   `result.cell_size`. cell_min/size are in sub-frame
-            //   LOCAL coords (walker-cell corner in [0,3)³), so the
-            //   bevel's "which face did we hit" pick must also be in
-            //   sub-frame local axes — otherwise the body-frame
-            //   normal picks different cube faces as the body-space
-            //   orientation rotates across the sphere, and each
-            //   different face gives a different `uv`, which
-            //   continuously varies → circular banding on a curved
-            //   surface. Use −rd_local normalized (sub-frame-local)
-            //   so cube_face_bevel's face pick matches the cell's
-            //   actual local-axis face.
-            let diffuse_n = normalize(-rd_body);
-            let local_rd_len_sq = dot(rd_local, rd_local);
-            var local_n: vec3<f32>;
-            if local_rd_len_sq > 1e-30 {
-                local_n = -rd_local / sqrt(local_rd_len_sq);
-            } else {
-                local_n = vec3<f32>(0.0, 1.0, 0.0);
-            }
-            result.normal = local_n;
-            let sun = normalize(vec3<f32>(0.4, 0.7, 0.3));
-            let diffuse = max(dot(diffuse_n, sun), 0.0);
-            let ambient: f32 = 0.25;
-
-            // PRECISION NOTE — tint radial.
-            //   `rn_corner` is O(1); `w.r_lo * frame_size / 3` is
-            //   The walker cell offset `w.r_lo * frame_size / 3` is
-            //   a sub-frame-bounded O(1/3^m) contribution. It used to
-            //   be added to `rn_corner` (O(1)) to get the hit's
-            //   absolute radial position — a root-relative sum that
-            //   loses the small term past m ≈ 15 in f32. The tint is
-            //   a smooth linear ramp over [0, 1], and one sub-frame
-            //   covers at most `frame_size` in rn, so every hit in
-            //   the sub-frame has essentially the same tint anyway.
-            //   Use the sub-frame's rn corner directly — O(1),
-            //   depth-independent.
-            let tint = 0.55 + 0.45 * clamp(rn_corner, 0.0, 1.0);
-
-            // Multi-scale cell-grid texture — LOCAL-COORDS form.
-            //
-            // Everything stays in sub-frame `[0, 3)` local for the
-            // bevel math; we only need the projected pixel size of
-            // the base cell to gate per-level visibility. Converting
-            // to absolute face-normalized coords (un_corner + pos.x *
-            // fn_step) here was the precision trap at m ≥ 8: the
-            // sum of an O(0.5) corner with an O(fn_step) local
-            // contribution, then ancestor cell-origin snapping via
-            // `floor(u / up_s) * up_s`, drifts one ULP per pixel and
-            // the grid dissolves. Sub-frame local coords are O(1)
-            // at every depth — f32 handles them cleanly.
-            let pixel_density = uniforms.screen_height
-                / (2.0 * tan(camera.fov * 0.5));
-            // base_px = projected base-cell size in screen pixels.
-            //
-            // In this DDA `t` is BODY distance (not sub-frame-local).
-            // The identity `J · J_inv = I` makes `rd_body = J · rd_local`
-            // unit-length, so `pos_body − c_body = rd_body · t` places
-            // `t` directly in body-XYZ units of the body cell's [0, 3)
-            // frame. Magnitude of `t` is O(frame_size) — which matches
-            // the body extent the sub-frame actually spans.
-            //
-            // Cell body-extent per local unit is `|J_col| ≈ frame_size/3`
-            // (the Jacobian column norm at mid-shell). So a walker cell
-            // of `w.size` local units covers `w.size · frame_size / 3`
-            // body units. That ratio with body distance gives angular
-            // size, times pixel_density gives pixels:
-            //
-            //   base_px = (w.size · frame_size / 3) / t · pixel_density
-            //
-            // At every depth: cell_body / body_distance is O(1) because
-            // both numerator and denominator shrink with frame_size —
-            // the frame_size factors cancel inside the ratio. Result
-            // stays in a sensible pixel range (~tens to thousands) at
-            // any m. An earlier version dropped the numerator's
-            // frame_size factor and produced `base_px` values in the
-            // billions, which made `bevel_level`'s band sub-pixel and
-            // every hit read as cell-interior → flat gray.
-            let base_px = w.size * frame_size
-                / (3.0 * max(t, 1e-30)) * pixel_density;
-            let shape = bevel_layered_local(
-                pos.x, pos.y,
-                w.u_lo, w.v_lo, w.size,
-                base_px,
-            );
-
-            result.color = palette[w.block].rgb
-                * (ambient + diffuse * 0.78) * tint * shape;
-            // Neutralize `shade_pixel`'s `cube_face_bevel`.
-            //
-            // `shade_pixel` (main.wgsl) unconditionally computes a
-            // second bevel after the march returns, using
-            //   local = (hit_pos - cell_min) / cell_size
-            //   bevel = cube_face_bevel(local, result.normal)
-            // where `face_uv_for_normal` picks a cube face from the
-            // argmax of `|result.normal|`. Our `result.normal` here is
-            // `−rd_local / |rd_local|`, and `rd_local`'s argmax flips
-            // along axis-equidistance curves across screen — which
-            // trace CIRCLES centered at the body-frame axis
-            // directions. The flip discontinuously swaps the `uv`
-            // face, producing the "concentric ring" artifact that
-            // dominates past m ≈ 10.
-            //
-            // `sphere_in_cell`'s fix (the body-march path) is to set
-            // `cell_min + cell_size` so that `(hit_pos − cell_min) /
-            // cell_size = 0.5` for every pixel, which forces
-            // `edge=0.5`, `smoothstep(0.02, 0.14, 0.5)=1.0`, bevel=1.0
-            // (no darkening). We mirror that here. Our own
-            // `bevel_layered_local` call above provides the intended
-            // cell-grid texture in face-normalized space, so the
-            // shade_pixel bevel is pure noise anyway.
-            let cs = max(length(camera.forward), 1.0) * 1e3;
-            result.cell_min = camera.pos + rd_local * t - vec3<f32>(cs * 0.5);
-            result.cell_size = cs;
-            return result;
-        }
-
-        // --- Empty cell. Advance to this cell's nearest exit face.
-        //
-        // PRECISION NOTE — axis-exit t:
-        //   Every boundary is axis-aligned in local coords (the
-        //   Jacobian linearization makes `r_body = const` flatten to
-        //   `r_local = const` too — col_r parallels body radial at
-        //   the corner). `(boundary - pos[axis]) / rd_local[axis]`:
-        //   numerator O(1), denominator O(3^m) → t O(1/3^m). f32
-        //   representable. No cancellation (numerator is a signed O(1)
-        //   difference, stable).
-        let t_u = sub_axis_exit_t(pos.x, rd_local.x, w.u_lo, w.u_lo + w.size);
-        let t_v = sub_axis_exit_t(pos.y, rd_local.y, w.v_lo, w.v_lo + w.size);
-        let t_r = sub_axis_exit_t(pos.z, rd_local.z, w.r_lo, w.r_lo + w.size);
-        let t_min = min(min(t_u, t_v), t_r);
-        if t_min <= 0.0 || t_min >= 1e29 {
-            // Degenerate step (zero-span cell, parallel ray, …).
-            // Force out-of-box branch on the next iteration so the
-            // neighbor-transition logic handles termination.
-            t = t_exit;
-            continue;
-        }
-        t = t + t_min + t_nudge;
-    }
-    // Unreachable in practice (every branch inside the loop either
-    // `continue`s or `return`s). WGSL still requires a function-level
-    // terminator, so return the default (miss) result.
     return result;
 }

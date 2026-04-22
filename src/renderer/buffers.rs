@@ -306,16 +306,6 @@ impl Renderer {
             root_face_meta: self.root_face_meta,
             root_face_bounds: self.root_face_bounds,
             root_face_pop_pos: self.root_face_pop_pos,
-            sub_c_body: self.sub_c_body,
-            sub_j_col0: self.sub_j_col0,
-            sub_j_col1: self.sub_j_col1,
-            sub_j_col2: self.sub_j_col2,
-            sub_j_inv_col0: self.sub_j_inv_col0,
-            sub_j_inv_col1: self.sub_j_inv_col1,
-            sub_j_inv_col2: self.sub_j_inv_col2,
-            sub_face_corner: self.sub_face_corner,
-            sub_meta: self.sub_meta,
-            sub_uvr_slots: self.sub_uvr_slots,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

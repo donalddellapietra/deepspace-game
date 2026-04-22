@@ -47,20 +47,7 @@ impl App {
     }
 
     fn cam_local_for_frame(&self, frame: &ActiveFrame) -> [f32; 3] {
-        // For SphereSub frames, the render path contains UVR slots
-        // which are NOT Cartesian-XYZ-semantic. `in_frame` would treat
-        // them as XYZ and produce garbage cam_local; use the symbolic
-        // `in_sub_frame` that walks the camera's own UVR state.
-        match frame.kind {
-            crate::app::ActiveFrameKind::SphereSub(ref sub) => {
-                if self.camera.position.sphere.is_some() {
-                    self.camera.position.in_sub_frame(sub)
-                } else {
-                    self.camera.position.in_frame(&frame.render_path)
-                }
-            }
-            _ => self.camera.position.in_frame(&frame.render_path),
-        }
+        self.camera.position.in_frame(&frame.render_path)
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
@@ -71,11 +58,6 @@ impl App {
                     ..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
                     .contains(&v)
             });
-        let pixels = self.frame_projected_pixels(frame);
-        eprintln!(
-            "CAMERA_FITS kind={:?} render_path={:?} cam_local={:?} fits={} pixels={:.2} min_pixels={}",
-            frame.kind, frame.render_path.as_slice(), cam_local, fits, pixels, FRAME_FOCUS_MIN_PIXELS,
-        );
         fits
     }
 

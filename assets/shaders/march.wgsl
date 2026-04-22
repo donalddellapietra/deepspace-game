@@ -795,54 +795,17 @@ fn march_cartesian(
 
 // ───────────────────────── unified_dda — per ribbon-level entry ─────
 //
-// The unified slot-path + residual DDA (see
-// docs/design/unified-slot-residual-dda.md). This is the single
-// per-ribbon-level entry point that replaces the inlined
-// sphere_sub / body / face / cartesian match in `march()`.
-//
-// Step 5a scope (THIS): consolidate the dispatch into one function.
-// Internally still delegates to sphere_in_sub_frame / sphere_in_cell /
-// march_cartesian — the DDA bodies remain unchanged. Future work
-// inlines them into a single residual DDA loop and adds CPU-parity
-// face-seam crossings here on the GPU.
-//
-// `out_force_terminate` is set to 1 when the callee specifies that
-// the caller must NOT ribbon-pop (currently only the sphere_sub path
-// does this on miss — its result is authoritative for the face
-// subtree, and popping would feed stale UVR slot interpretation
-// into march_cartesian on the face root). Set to 0 otherwise.
+// Per-ribbon-level dispatch. Internally selects sphere_in_cell
+// (Body), bounded face-window (Face root at ribbon_level 0), or
+// march_cartesian otherwise.
 fn unified_dda(
     current_idx: u32,
     ray_origin: vec3<f32>,
     ray_dir: vec3<f32>,
     ribbon_level: u32,
     skip_slot: u32,
-    out_force_terminate: ptr<function, u32>,
 ) -> HitResult {
-    *out_force_terminate = 0u;
     let cur_kind = node_kinds[current_idx].kind;
-    if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_SPHERE_SUB {
-        // Sub-frame dispatch — see the long comment at the original
-        // dispatch site below. rd_body is recovered once here via the
-        // current Jacobian columns.
-        var j_cur: Mat3Columns;
-        j_cur.col_u = uniforms.sub_j_col0.xyz;
-        j_cur.col_v = uniforms.sub_j_col1.xyz;
-        j_cur.col_r = uniforms.sub_j_col2.xyz;
-        let rd_body_recovered = mat3_mul_vec_shader(j_cur, ray_dir);
-        let r = sphere_in_sub_frame(
-            current_idx, ray_origin, ray_dir,
-            rd_body_recovered, uniforms.max_depth,
-        );
-        // No force_terminate here. Sub-frame miss is now allowed to
-        // ribbon-pop because the march() loop's pop logic now skips
-        // intermediate face-root levels (which were the source of
-        // the original "march_cartesian misinterprets UVR as XYZ"
-        // visual artifacts that motivated force_terminate). Pops
-        // continue to the body level, where sphere_in_cell handles
-        // any face-seam crossing naturally as part of body march.
-        return r;
-    }
     if cur_kind == 1u {
         return sphere_in_cell(
             current_idx, vec3<f32>(0.0), 3.0,
@@ -891,28 +854,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         hops = hops + 1u;
 
         // Single unified dispatch per ribbon level. Internals
-        // delegate to sphere_in_sub_frame / sphere_in_cell /
-        // march_cartesian today; later steps inline them into a
-        // real unified residual DDA. `force_terminate` is set by the
-        // sub-frame path when a miss there must NOT ribbon-pop
-        // (popping would feed stale UVR slot interpretation into
-        // march_cartesian on the face root).
-        var force_terminate: u32 = 0u;
+        // delegate to sphere_in_cell / march_cartesian.
         var r: HitResult = unified_dda(
             current_idx, ray_origin, ray_dir,
             ribbon_level, skip_slot,
-            &force_terminate,
         );
-        if force_terminate != 0u {
-            var sky_result: HitResult;
-            sky_result.hit = false;
-            sky_result.t = 1e20;
-            sky_result.frame_level = ribbon_level;
-            sky_result.frame_scale = cur_scale;
-            sky_result.cell_min = vec3<f32>(0.0);
-            sky_result.cell_size = 1.0;
-            return sky_result;
-        }
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;

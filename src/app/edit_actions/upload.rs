@@ -61,13 +61,6 @@ impl App {
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
         let intended_frame = self.target_render_frame();
-        eprintln!(
-            "UPLOAD_ENTRY cam_sphere={:?} cam_anchor={:?} intended_kind={:?} intended_render_path={:?}",
-            self.camera.position.sphere.map(|s| (s.face, s.uvr_path.depth())),
-            self.camera.position.anchor.as_slice(),
-            intended_frame.kind,
-            intended_frame.render_path.as_slice(),
-        );
         let effective_visual_depth = self.visual_depth();
         let upload_key = LodUploadKey::new(self.world.root);
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
@@ -178,30 +171,7 @@ impl App {
         }
 
         // --- Ribbon on TERRAIN ---
-        // For SphereSub intended kinds, the ribbon must only walk to
-        // the FACE ROOT (body_path + face_slot). The deeper UVR
-        // descent in `intended_render_path` can traverse
-        // `Child::Empty` links (dug regions); walking the ribbon
-        // through those would stop prematurely at the first broken
-        // slot and corrupt `effective_path`, which then forces the
-        // active_frame back to a shallow resolved sub-frame (losing
-        // the tight deep Jacobian). The shader navigates the UVR
-        // prefix itself via `uvr_slots` uniforms, so the ribbon only
-        // needs to carry the ancestors up to (and including) the
-        // face root — everything deeper is SphereSub's responsibility.
-        let ribbon_intended_path: crate::world::anchor::Path =
-            if let ActiveFrameKind::SphereSub(ref sub) = intended_frame.kind {
-                let body_depth_plus_one = sub.body_path.depth() as usize + 1;
-                let slots = intended_render_path.as_slice();
-                let clipped = if slots.len() > body_depth_plus_one {
-                    &slots[..body_depth_plus_one]
-                } else {
-                    slots
-                };
-                frame::frame_from_slots(clipped)
-            } else {
-                intended_render_path
-            };
+        let ribbon_intended_path: crate::world::anchor::Path = intended_render_path;
         let ribbon_start = web_time::Instant::now();
         let cache = self.cached_tree.as_ref().expect("cached_tree");
         let r = gpu::build_ribbon(
@@ -242,36 +212,20 @@ impl App {
             );
         }
 
-        // For Cartesian / Body frames, the GPU ribbon may have
-        // truncated below the intended depth — re-resolve the active
-        // frame at the effective truncated depth. For SphereSub,
-        // keep the intended sub-frame as-is: the ribbon only carries
-        // ancestors to the face root (by design above) and the
-        // shader navigates the deep UVR descent itself via
-        // `uvr_slots` uniforms, so the deep sub-frame metadata is
-        // the correct state to render — truncating to
-        // `effective_path.depth()` would lose the tight Jacobian.
-        eprintln!(
-            "UPLOAD intended_render_path={:?} effective_path={:?} (len={})",
-            intended_render_path.as_slice(),
-            effective_path.as_slice(),
-            effective_path.depth(),
-        );
-        self.active_frame = match intended_frame.kind {
-            ActiveFrameKind::SphereSub(_) => intended_frame,
-            _ => {
-                let effective_render = frame::compute_render_frame(
-                    &self.world.library,
-                    self.world.root,
-                    &self.camera.position,
-                    effective_path.depth(),
-                );
-                ActiveFrame {
-                    render_path: effective_render.render_path,
-                    logical_path: intended_frame.logical_path,
-                    node_id: effective_render.node_id,
-                    kind: effective_render.kind,
-                }
+        // GPU ribbon may have truncated below the intended depth —
+        // re-resolve the active frame at the effective truncated depth.
+        self.active_frame = {
+            let effective_render = frame::compute_render_frame(
+                &self.world.library,
+                self.world.root,
+                &self.camera.position,
+                effective_path.depth(),
+            );
+            ActiveFrame {
+                render_path: effective_render.render_path,
+                logical_path: intended_frame.logical_path,
+                node_id: effective_render.node_id,
+                kind: effective_render.kind,
             }
         };
         if let Some(renderer) = &mut self.renderer {
@@ -318,48 +272,6 @@ impl App {
             renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
-                ActiveFrameKind::SphereSub(sub) => {
-                    // UVR prefix slots = render_path minus the body
-                    // Cartesian chain + face-root slot. The shader
-                    // walker pre-descends these symbolically from
-                    // the face-root (which `set_frame_root` points
-                    // `root_index` at) before intra-cell DDA.
-                    let prefix_start = sub.body_path.depth() as usize + 1;
-                    let render_slots = sub.render_path.as_slice();
-                    let uvr_prefix: &[u8] = if render_slots.len() > prefix_start {
-                        &render_slots[prefix_start..]
-                    } else {
-                        &[]
-                    };
-                    let face_root_depth = sub.body_path.depth() as u32 + 1;
-                    let logical_uvr_depth = self
-                        .camera
-                        .position
-                        .sphere
-                        .as_ref()
-                        .map(|s| s.uvr_path.depth())
-                        .unwrap_or(0);
-                    eprintln!(
-                        "SPHERE_UPLOAD m_truncated={} logical_uvr_depth={} uvr_prefix_len={} \
-                         walker_limit(visual_depth)={} frame_size={:.3e} render_path_depth={}",
-                        uvr_prefix.len(),
-                        logical_uvr_depth,
-                        uvr_prefix.len(),
-                        effective_visual_depth,
-                        sub.frame_size,
-                        sub.render_path.depth(),
-                    );
-                    renderer.set_root_kind_sphere_sub(
-                        sub.inner_r, sub.outer_r,
-                        sub.face as u32,
-                        [sub.un_corner, sub.vn_corner, sub.rn_corner, sub.frame_size],
-                        sub.c_body,
-                        sub.j,
-                        sub.j_inv,
-                        uvr_prefix,
-                        face_root_depth,
-                    );
-                }
                 ActiveFrameKind::Body { inner_r, outer_r } => {
                     renderer.set_root_kind_body(inner_r, outer_r);
                 }

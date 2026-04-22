@@ -112,14 +112,6 @@ mod tests {
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("wgsl validation error:\n{:?}", e));
-        // Spot-check: the new SphereSub path lives inside the shader.
-        assert!(src.contains("sphere_in_sub_frame"), "sphere_in_sub_frame missing");
-        assert!(src.contains("walk_sub_frame"), "walk_sub_frame missing");
-        assert!(
-            src.contains("walk_from_deep_sub_frame"),
-            "walk_from_deep_sub_frame missing",
-        );
-        assert!(src.contains("ROOT_KIND_SPHERE_SUB"), "ROOT_KIND_SPHERE_SUB constant missing");
         let _ = info;
     }
 
@@ -157,16 +149,6 @@ mod tests {
             "root_face_meta",
             "root_face_bounds",
             "root_face_pop_pos",
-            "sub_c_body",
-            "sub_j_col0",
-            "sub_j_col1",
-            "sub_j_col2",
-            "sub_j_inv_col0",
-            "sub_j_inv_col1",
-            "sub_j_inv_col2",
-            "sub_face_corner",
-            "sub_meta",
-            "sub_uvr_slots",
         ];
         let mut cursor = 0;
         for name in expected_order {

@@ -153,10 +153,6 @@ impl App {
                 crate::app::ActiveFrameKind::Body { inner_r, outer_r } => {
                     format!("Body(ir={inner_r},or={outer_r})")
                 }
-                crate::app::ActiveFrameKind::SphereSub(ref s) => format!(
-                    "SphereSub(m={},face={:?},un={:.6e},rn={:.6e},frame_size={:.6e})",
-                    s.depth_levels(), s.face, s.un_corner, s.rn_corner, s.frame_size,
-                ),
             };
             let render_slots: Vec<u32> = app
                 .active_frame
@@ -222,7 +218,6 @@ impl App {
                 self.camera.position.add_local(d, &self.world.library);
             }
             ScriptCmd::FlyToSurface => self.fly_to_surface(),
-            ScriptCmd::ForceSphereState => self.debug_force_sphere_state(),
         }
         log_state("POST", self, "");
     }

@@ -453,17 +453,6 @@ pub(super) fn cs_raycast(
                     inner_r: inner_r_local,
                     outer_r: outer_r_local,
                     body_path_len,
-                    // Body-march hits: sub-frame linearization not
-                    // available. Leave the sub_* fields as sentinel
-                    // zero values — `hit_aabb_body_local` detects
-                    // this via `sub_local_size == 0` and falls back
-                    // to the face-normalized corner AABB (which
-                    // works at shallow depth where body march is
-                    // the active path).
-                    sub_c_body: [0.0; 3],
-                    sub_j_cols: [[0.0; 3]; 3],
-                    sub_local_lo: [0.0; 3],
-                    sub_local_size: 0.0,
                 }),
             });
         }

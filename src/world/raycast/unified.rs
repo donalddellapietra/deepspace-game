@@ -23,7 +23,7 @@
 
 use super::HitInfo;
 use crate::world::cubesphere::{
-    body_point_to_face_space, face_frame_jacobian, face_space_to_body_point, mat3_inv, Face, Mat3,
+    body_point_to_face_space, face_space_to_body_point, Face,
     CORE_SLOT, FACE_SLOTS,
 };
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, REPRESENTATIVE_EMPTY};
@@ -50,8 +50,7 @@ enum CellKind {
     /// Inside a face subtree. `un/vn/rn_corner` identify the cell's
     /// face-normalized corner; `frame_size` is the cell's extent in
     /// face-normalized coords at this depth (1.0 at face root, 1/3,
-    /// 1/9, ... as we descend). `c_body` + `j` are the linearized
-    /// map from cell-local to body-XYZ evaluated at the corner.
+    /// 1/9, ... as we descend).
     SphereFace {
         face: Face,
         un_corner: f32,
@@ -61,9 +60,6 @@ enum CellKind {
         inner_r: f32,
         outer_r: f32,
         body_world_size: f32,
-        c_body: [f32; 3],
-        j: Mat3,
-        j_inv: Mat3,
     },
 }
 
@@ -256,21 +252,19 @@ fn derive_child_kind(
         }
         NodeKind::CubedSphereFace { face } => {
             // Face root: whole face span, un/vn/rn_corner = 0,
-            // frame_size = 1. Jacobian at corner.
+            // frame_size = 1. Track corner + extent only —
+            // residual stepping happens in face-normalized space
+            // and downstream consumers re-derive geometry from
+            // un/vn/rn/frame_size as needed.
             let (body_world_size, inner_r, outer_r) = match parent_kind {
                 CellKind::SphereBody { inner_r, outer_r, body_world_size } => {
                     (body_world_size, inner_r, outer_r)
                 }
-                // A face node outside a SphereBody is ill-formed; treat
-                // as Cartesian fallback (can't build Jacobian without
-                // radii). Shouldn't occur in well-formed trees.
+                // A face node outside a SphereBody is ill-formed;
+                // treat as Cartesian fallback. Shouldn't occur in
+                // well-formed trees.
                 _ => return CellKind::Cartesian,
             };
-            let (c_body, j) = face_frame_jacobian(
-                face, 0.0, 0.0, 0.0, 1.0,
-                inner_r, outer_r, body_world_size,
-            );
-            let j_inv = mat3_inv(&j);
             return CellKind::SphereFace {
                 face,
                 un_corner: 0.0,
@@ -279,7 +273,6 @@ fn derive_child_kind(
                 frame_size: 1.0,
                 inner_r, outer_r,
                 body_world_size,
-                c_body, j, j_inv,
             };
         }
         NodeKind::Cartesian => {}
@@ -305,7 +298,7 @@ fn derive_child_kind(
         }
         CellKind::SphereFace {
             face, un_corner, vn_corner, rn_corner, frame_size,
-            inner_r, outer_r, body_world_size, ..
+            inner_r, outer_r, body_world_size,
         } => {
             // Descend inside a face subtree: pick the (u,v,r) slot
             // coords and shrink the frame by 1/3.
@@ -314,11 +307,6 @@ fn derive_child_kind(
             let new_un = un_corner + sx as f32 * new_frame_size;
             let new_vn = vn_corner + sy as f32 * new_frame_size;
             let new_rn = rn_corner + sz as f32 * new_frame_size;
-            let (c_body, j) = face_frame_jacobian(
-                face, new_un, new_vn, new_rn, new_frame_size,
-                inner_r, outer_r, body_world_size,
-            );
-            let j_inv = mat3_inv(&j);
             CellKind::SphereFace {
                 face,
                 un_corner: new_un,
@@ -326,7 +314,6 @@ fn derive_child_kind(
                 rn_corner: new_rn,
                 frame_size: new_frame_size,
                 inner_r, outer_r, body_world_size,
-                c_body, j, j_inv,
             }
         }
     }
@@ -883,15 +870,12 @@ mod tests {
         }
     }
 
-    /// CPU unified_raycast at deep face-subtree levels — the GPU
-    /// sphere_in_sub_frame walls out past depth ~10 (see
-    /// docs/design/sphere-sub-precision-wall.md). The CPU primitive
-    /// uses cell-local residual with per-cell Jacobian rebuilds, so
-    /// it should NOT have the same wall.
+    /// CPU unified_raycast at deep face-subtree levels. The CPU
+    /// primitive uses cell-local residual descent and survives well
+    /// past the absolute-coords precision wall.
     #[test]
     fn unified_raycast_works_past_layer_10() {
-        // sub_depth=10 puts the deepest blocks at face-subtree
-        // depth 10 — past the GPU sphere_in_sub_frame wall.
+        // sub_depth=10 puts the deepest blocks at face-subtree depth 10.
         let (lib, root) = build_solid_sphere_world(10);
         let hit = unified_raycast(
             &lib, root,
@@ -970,9 +954,9 @@ mod tests {
     /// After descending into a face subtree, the top frame's kind is
     /// SphereFace with the correct face + per-cell Jacobian. This
     /// doesn't run the full DDA to completion — it exercises the
-    /// descend / kind-derivation paths that Step 4 will rely on.
+    /// descend / kind-derivation paths.
     #[test]
-    fn unified_sphere_face_kind_has_jacobian() {
+    fn unified_sphere_face_kind_descends() {
         let (lib, root) = build_solid_sphere_world(2);
         // Use a ray that definitely enters the +Y face region.
         let hit = unified_raycast(
@@ -982,10 +966,7 @@ mod tests {
             16,
         );
         // Just assert we got a hit — kind-correctness is checked
-        // structurally via the preceding test. The Jacobian path is
-        // exercised implicitly by descend; if face_frame_jacobian
-        // produced a singular matrix the mat3_inv debug_assert would
-        // fire before we return.
+        // structurally via the preceding test.
         assert!(hit.is_some());
     }
 }
