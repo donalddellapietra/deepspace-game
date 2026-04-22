@@ -883,6 +883,56 @@ mod tests {
         }
     }
 
+    /// CPU unified_raycast at deep face-subtree levels — the GPU
+    /// sphere_in_sub_frame walls out past depth ~10 (see
+    /// docs/design/sphere-sub-precision-wall.md). The CPU primitive
+    /// uses cell-local residual with per-cell Jacobian rebuilds, so
+    /// it should NOT have the same wall.
+    #[test]
+    fn unified_raycast_works_past_layer_10() {
+        // sub_depth=10 puts the deepest blocks at face-subtree
+        // depth 10 — past the GPU sphere_in_sub_frame wall.
+        let (lib, root) = build_solid_sphere_world(10);
+        let hit = unified_raycast(
+            &lib, root,
+            [1.5, 5.0, 1.5],
+            [0.0, -1.0, 0.0],
+            32, // max_depth: well past 10
+        );
+        let h = hit.expect("CPU primitive should hit at sub_depth=10");
+        assert!(
+            h.path.len() >= 4,
+            "expected deep descent, got path of length {}",
+            h.path.len()
+        );
+    }
+
+    #[test]
+    fn unified_raycast_works_at_layer_20() {
+        let (lib, root) = build_solid_sphere_world(20);
+        let hit = unified_raycast(
+            &lib, root,
+            [1.5, 5.0, 1.5],
+            [0.0, -1.0, 0.0],
+            48,
+        );
+        let h = hit.expect("CPU primitive should hit at sub_depth=20");
+        assert!(h.path.len() >= 4);
+    }
+
+    #[test]
+    fn unified_raycast_works_at_layer_30() {
+        let (lib, root) = build_solid_sphere_world(30);
+        let hit = unified_raycast(
+            &lib, root,
+            [1.5, 5.0, 1.5],
+            [0.0, -1.0, 0.0],
+            64,
+        );
+        let h = hit.expect("CPU primitive should hit at sub_depth=30");
+        assert!(h.path.len() >= 4);
+    }
+
     /// Tangent ray that would cross a face seam on a body with
     /// solid subtrees. Pre-Step-4, any such ray terminated at the
     /// first SphereFace → SphereBody pop (face-root bubble-up).
