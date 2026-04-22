@@ -713,22 +713,8 @@ fn sphere_in_cell(
 
         if t_next >= t_exit { break; }
         last_side = winning;
-        // Nudge past the exit boundary. Scale to LOD-depth cell
-        // size (1 / 3^walk_depth), NOT the walker's terminal
-        // `w.size`. See `src/world/raycast/sphere.rs` for the full
-        // rationale. TL;DR: adjacent pixels around a deep edit can
-        // hit walker depths varying by 10× (tag=1 flattened siblings
-        // vs tag=2 rebuilt edit chain), giving a 20000× `cell_eps`
-        // disparity. Large-nudge pixels skip the deep cells → streak
-        // lines. LOD-cell-size is a property of pixel distance, not
-        // tree structure, so it's constant for adjacent pixels and
-        // safely smaller than any walker cell at this ray distance.
-        var lod_cell_size: f32 = 1.0;
-        for (var lk: u32 = 0u; lk < walk_depth; lk = lk + 1u) {
-            lod_cell_size = lod_cell_size * (1.0 / 3.0);
-        }
         let t_ulp = max(abs(t) * 1.2e-7, 1e-30);
-        let cell_eps = max(shell * lod_cell_size * 1e-3, t_ulp * 4.0);
+        let cell_eps = max(shell * w.size * 1e-3, t_ulp * 4.0);
         t = t_next + cell_eps;
     }
 
