@@ -75,6 +75,54 @@ advancing on those axes, so the DDA either:
 - Advances on ONE axis only, missing all cell boundaries on the
   others, and eventually returns a miss.
 
+### Updated empirical finding: the wall is the iteration cap, NOT precision
+
+Verified by enabling `SPHERE_DEBUG_PAINT = true` in sphere.wgsl:24
+and running `scripts/sphere_sub_screenshot.sh debug 15`. Result:
+**solid yellow frame** at depth 15. Yellow corresponds to
+`vec3<f32>(0.95, 0.95, 0.1)` — the `MAX_SPHERE_SUB_TRANSITIONS`
+exhaustion sentinel (sphere.wgsl:1287). Not cyan (DDA cap), not red
+(ray-box miss), not orange (cross-face termination).
+
+**The "precision wall" is `MAX_SPHERE_SUB_TRANSITIONS = 64`** —
+a CPU mirror cap copied without considering GPU per-ray costs. At
+deep face-subtree depths with the camera very close to the surface,
+rays naturally fan out across many sub-frame cells before finding
+a block, blowing past 64 transitions immediately.
+
+But raising the cap doesn't render meaningful content either:
+
+| Cap value | Depth 5 | Depth 10 | Depth 15 | Depth 20+ |
+|-----------|---------|----------|----------|-----------|
+| 64        | OK      | OK       | sky (fall-through) | sky |
+| 4096      | OK      | OK       | sky (160 ms)       | sky |
+| 16384     | OK      | OK       | speckled grey (~400 ms) | TIMEOUT (>1s/frame) |
+
+Even with 16384 transitions, depth 15 only renders sparse colored
+dots — the architecture itself can't produce a coherent image when
+the camera is sub-ULP away from the sphere surface. Depths 20+ have
+the camera position itself collapsing into the surface coordinate
+(`cam_y = 1.80 + 6.2e-9 < ULP(1.80) = 1.5e-7`), so the renderer
+can't distinguish "above surface" from "exactly on surface".
+
+### Bottom line
+
+The "layer-10 wall" decomposes into two independent issues:
+
+1. **`MAX_SPHERE_SUB_TRANSITIONS = 64`** is much too small. Should
+   match `dda_steps` cap (4096). This raises the cap-exhaustion
+   wall to ~depth 14 but doesn't fix anything visually because of:
+
+2. **Camera position precision**: at spawn_depth ≥ 15, the test
+   harness's `cam_y = 1.80 + tiny` collapses to exactly 1.80 in
+   f32. Camera sits exactly on the sphere outer surface. Render
+   from that position is genuinely ambiguous — the unified DDA
+   fix doesn't change this.
+
+The CPU `unified_raycast` doesn't have either issue: no transitions
+cap, and the test harness builds synthetic deep worlds where the
+ray traverses without camera-on-surface degeneracy.
+
 ### Empirical finding: per-axis incremental update is NOT enough
 
 Tried in this worktree: replace `pos = ro_local + rd_local * t`
