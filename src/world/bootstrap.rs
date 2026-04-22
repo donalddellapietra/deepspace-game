@@ -78,6 +78,11 @@ pub enum WorldPreset {
     /// that the ray-march preserves precision across deep pops —
     /// stars at ancestor-depth 1 through N−1 must all render.
     Stars,
+    /// Minimal test world for [`crate::world::tree::NodeKind::Rotated45Y`].
+    /// A stone floor with `stone | rotated-subtree | stone` in the
+    /// middle row, so the diamond silhouette is visible between two
+    /// normal cubes for side-by-side comparison.
+    RotatedTest,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -109,6 +114,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
         | WorldPreset::Stars
+        | WorldPreset::RotatedTest
         | WorldPreset::Scene { .. } => None,
     }
 }
@@ -180,6 +186,8 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
             plain_layers.unwrap_or(40),
         ),
+        WorldPreset::RotatedTest =>
+            crate::world::rotated_test::bootstrap_rotated_test_world(),
     }
 }
 

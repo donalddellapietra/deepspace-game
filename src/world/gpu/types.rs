@@ -65,7 +65,7 @@ impl GpuChild {
 ///
 /// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns
 /// cleanly. `kind` discriminant: 0 = Cartesian, 1 = CubedSphereBody,
-/// 2 = CubedSphereFace.
+/// 2 = CubedSphereFace, 3 = Rotated45Y.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -84,6 +84,9 @@ impl GpuNodeKind {
             },
             NodeKind::CubedSphereFace { face } => Self {
                 kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
+            },
+            NodeKind::Rotated45Y => Self {
+                kind: 3, face: 0, inner_r: 0.0, outer_r: 0.0,
             },
         }
     }

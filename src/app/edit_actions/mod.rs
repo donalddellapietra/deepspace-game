@@ -224,7 +224,8 @@ impl App {
             match child_kind {
                 Some(NodeKind::Cartesian)
                 | Some(NodeKind::CubedSphereBody { .. })
-                | Some(NodeKind::CubedSphereFace { .. }) => {
+                | Some(NodeKind::CubedSphereFace { .. })
+                | Some(NodeKind::Rotated45Y) => {
                     node_id = child_id;
                 }
                 None => break,

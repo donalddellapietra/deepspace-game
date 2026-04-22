@@ -91,6 +91,13 @@ pub enum NodeKind {
     /// One face of a cubed-sphere body. Children are interpreted
     /// on (u_slot, v_slot, r_slot) axes.
     CubedSphereFace { face: Face },
+    /// Cartesian subdivision rendered rotated 45° about the world
+    /// Y axis and stretched by √2 in XZ so the rotated block's
+    /// footprint fits the cell AABB exactly (corners touch cell-
+    /// edge midpoints in XZ; Y fills the full cell). Internally
+    /// the 3×3×3 children are regular cartesian — the shader
+    /// applies the rotation when the ray enters the subtree.
+    Rotated45Y,
 }
 
 impl Default for NodeKind {
@@ -113,6 +120,7 @@ impl Hash for NodeKind {
             NodeKind::CubedSphereFace { face } => {
                 face.hash(state);
             }
+            NodeKind::Rotated45Y => {}
         }
     }
 }
