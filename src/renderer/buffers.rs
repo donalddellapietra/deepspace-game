@@ -316,6 +316,7 @@ impl Renderer {
             _pad_face_pop_pos: [0.0; 4],
             debug_mode: self.debug_mode,
             probe_pixel: self.probe_pixel,
+            curvature: self.curvature,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

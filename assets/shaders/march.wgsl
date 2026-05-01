@@ -846,7 +846,18 @@ fn march_cartesian(
                 );
                 let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
-                let local_entry = (child_entry - child_origin) / child_cell_size;
+                // Phase 3 Step 3.0 — per-descent parabolic bend.
+                // Subtract `A * dist²` from the y component of the
+                // child entry, where dist is the (frame-local) ray
+                // parameter at this descent. Cells selected reflect
+                // the bent path; side_dist init below still uses the
+                // un-bent entry_pos (linear approximation between
+                // descents — small for deep trees, refines as descent
+                // depth grows). `A = 0` (the default) zeroes the drop
+                // and the marcher is bit-identical to the flat path.
+                let curvature_drop = ct_start * ct_start * uniforms.curvature.x;
+                let bent_child_entry = child_entry - vec3<f32>(0.0, curvature_drop, 0.0);
+                let local_entry = (bent_child_entry - child_origin) / child_cell_size;
 
                 // Instrumentation: count of descents the path-mask
                 // cull would catch if enabled. An earlier experiment

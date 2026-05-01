@@ -16,6 +16,12 @@ pub struct TestConfig {
     pub world_preset: WorldPreset,
     pub plain_layers: Option<u8>,
     pub spawn_depth: Option<u8>,
+    /// Phase 3 Step 3.0 debug knob: constant curvature coefficient
+    /// `A` for the per-step parabolic-drop bend. Set via
+    /// `--curvature A`. None ⇒ flat path (default). Useful for
+    /// validating the curvature math on `--plain-world` before
+    /// wiring k(altitude) on the wrapped planet.
+    pub curvature_a: Option<f32>,
     /// Explicit camera world-XYZ at spawn. Positions the camera
     /// at a specific point regardless of zoom level — since the
     /// in-game zoom function is broken, this is the way to put
@@ -285,6 +291,13 @@ impl TestConfig {
                 }
                 "--spawn-depth" => {
                     cfg.spawn_depth = args.next().and_then(|v| v.parse().ok());
+                }
+                // Phase 3 Step 3.0: per-step parabolic-drop coefficient
+                // for the curvature debug knob. `--curvature 0` (default)
+                // = flat. Try `--curvature 0.2` on `--plain-world` to
+                // see ground curve down past the horizon.
+                "--curvature" => {
+                    cfg.curvature_a = args.next().and_then(|v| v.parse().ok());
                 }
                 "--spawn-xyz" => {
                     let x: Option<f32> = args.next().and_then(|v| v.parse().ok());

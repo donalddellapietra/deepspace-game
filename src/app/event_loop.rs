@@ -282,6 +282,14 @@ impl App {
         eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);
 
         renderer.update_palette(&self.palette.to_gpu_palette());
+        // Phase 3 Step 3.0: apply CLI curvature debug knob, if any.
+        // `--curvature A` sets a constant per-step parabolic-drop
+        // coefficient — the simplest form of the bend. Used to
+        // validate the math on `--plain-world` before the k(altitude)
+        // ramp lands in Step 3.4.
+        if let Some(a) = self.startup_curvature_a {
+            renderer.set_curvature_a(a);
+        }
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
             eprintln!(

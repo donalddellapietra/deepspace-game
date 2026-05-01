@@ -80,6 +80,14 @@ struct Uniforms {
     /// `z` = non-zero means probing is active (0 disables all
     /// writes to `walker_probe`). `w` reserved.
     probe_pixel: vec4<u32>,
+    /// Render-time curvature parameters. Phase 3 Step 3.0 ships
+    /// the simplest form: `.x = A`, the per-step parabolic-drop
+    /// coefficient. The shader applies `child_entry.y -= A * dist²`
+    /// at each descent. `A = 0` (default) disables curvature
+    /// entirely, leaving the marcher bit-identical to the flat path.
+    /// `.yzw` reserved for k(altitude) ramp + R_inv + slab_surface_y
+    /// once Step 3.4 wires those.
+    curvature: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;

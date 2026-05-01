@@ -96,6 +96,12 @@ pub struct GpuUniforms {
     /// `z` = non-zero means probing is active (0 disables all writes
     /// to `walker_probe`). `w` reserved.
     pub probe_pixel: [u32; 4],
+    /// Phase 3 Step 3.0 curvature: `.x = A` is the per-step
+    /// parabolic-drop coefficient (`drop = A · dist²` applied to
+    /// `child_entry.y` at each descent). 0 = disabled; the marcher
+    /// stays bit-identical to the flat path. `.yzw` reserved for
+    /// k(altitude) ramp / R_inv / slab_surface_y in later steps.
+    pub curvature: [f32; 4],
 }
 
 pub struct Renderer {
@@ -231,6 +237,11 @@ pub struct Renderer {
     /// Mirror of `uniforms.debug_mode`. `.x` = mode (0..=8); `.yzw`
     /// reserved. Set by `set_debug_mode`.
     pub(super) debug_mode: [u32; 4],
+    /// Mirror of `uniforms.curvature`. `.x = A` is the per-step
+    /// parabolic-drop coefficient applied at every descent in
+    /// `march_cartesian`. 0 = disabled (flat path). Set by
+    /// `set_curvature_a` from a CLI debug flag in Step 3.0.
+    pub(super) curvature: [f32; 4],
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
@@ -484,6 +495,17 @@ impl Renderer {
     /// they return the unwired sentinel until Phase 2 / Phase 3 land.
     pub fn set_debug_mode(&mut self, mode: u32) {
         self.debug_mode = [mode, 0, 0, 0];
+        self.write_uniforms();
+    }
+
+    /// Phase 3 Step 3.0: set the constant curvature coefficient `A`
+    /// for the per-step parabolic-drop bend `child_entry.y -= A·dist²`
+    /// applied at every descent in `march_cartesian`. `A = 0` (the
+    /// default) keeps the marcher bit-identical to the flat path.
+    /// Wired via the `--curvature A` CLI debug flag; later Phase 3
+    /// steps will compute `A` per-frame from camera altitude.
+    pub fn set_curvature_a(&mut self, a: f32) {
+        self.curvature = [a, 0.0, 0.0, 0.0];
         self.write_uniforms();
     }
 }
