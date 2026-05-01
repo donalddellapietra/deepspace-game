@@ -298,6 +298,17 @@ impl App {
                 ActiveFrameKind::UvSphereBody { .. } => {
                     renderer.set_root_kind_uv_sphere_body();
                 }
+                ActiveFrameKind::UvSubCell { .. } => {
+                    // Sub-cell GPU dispatch is wired in a follow-up
+                    // diff (new shader entry + uniforms). Until then,
+                    // route to the body-root marcher so the renderer
+                    // still produces a coherent frame — visuals will
+                    // continue using the body-root DDA, which is the
+                    // path that breaks down at deep zoom; the
+                    // architectural fix lands when the sub-cell
+                    // dispatch arrives.
+                    renderer.set_root_kind_uv_sphere_body();
+                }
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

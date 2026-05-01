@@ -47,11 +47,11 @@ impl App {
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian | ActiveFrameKind::UvSphereBody { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
-        };
+        // Cartesian-safe path: for UV sub-cells the body's path is the
+        // last frame the WorldPos cartesian machinery understands; the
+        // camera is positioned in the body's `[0, 3)³` and the UV
+        // sub-cell is a curved sub-region inside it.
+        let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
@@ -61,13 +61,9 @@ impl App {
     }
 
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
-        let (cam_local, frame_center_local, frame_span) = match frame.kind {
-            ActiveFrameKind::Cartesian | ActiveFrameKind::UvSphereBody { .. } => (
-                self.camera.position.in_frame(&frame.render_path),
-                [1.5, 1.5, 1.5],
-                crate::world::anchor::WORLD_SIZE,
-            ),
-        };
+        let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
+        let frame_center_local = [1.5, 1.5, 1.5];
+        let frame_span = crate::world::anchor::WORLD_SIZE;
         let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
         let dist = crate::world::sdf::length(to_center).max(0.05);
         let half_fov_recip = 720.0f32 / (2.0f32 * (1.2f32 * 0.5f32).tan());
@@ -110,11 +106,7 @@ impl App {
             );
         }
         if self.startup_profile_frames < 4 {
-            let cam_local = match frame.kind {
-                ActiveFrameKind::Cartesian | ActiveFrameKind::UvSphereBody { .. } => {
-                    self.camera.position.in_frame(&frame.render_path)
-                }
-            };
+            let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
             eprintln!(
                 "target_frame stable render_path={:?} logical_path={:?} kind={:?} cam_local={:?}",
                 frame.render_path.as_slice(),

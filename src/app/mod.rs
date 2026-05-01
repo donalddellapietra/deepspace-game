@@ -525,6 +525,12 @@ impl App {
             ActiveFrameKind::UvSphereBody { inner_r, outer_r, theta_cap } => {
                 NodeKind::UvSphereBody { inner_r, outer_r, theta_cap }
             }
+            ActiveFrameKind::UvSubCell { .. } => {
+                // Sub-cells are stored as Cartesian-style 27-children
+                // nodes. The UV semantics live in the frame metadata,
+                // not the node kind.
+                NodeKind::Cartesian
+            }
         }
     }
 
@@ -619,11 +625,13 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian | ActiveFrameKind::UvSphereBody { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
-        };
+        // Camera-local position uses the cartesian-safe path — for UV
+        // sub-cells the WorldPos cartesian machinery only understands
+        // the body's path, not the UV-tier slots beyond it. The
+        // shader's UV-sub-cell dispatch will project the body-frame
+        // camera onto the sub-cell's `(φ, θ, r)` ranges using the
+        // frame metadata (not yet wired in this diff; see follow-up).
+        let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",

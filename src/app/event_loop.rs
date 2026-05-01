@@ -366,12 +366,10 @@ impl App {
         // wry IPC + evaluate_script. WASM: JS queues + window.__onGameState.
         if self.overlay_active() {
             self.poll_ui_commands();
-            let camera_local = match self.active_frame.kind {
-                crate::app::ActiveFrameKind::Cartesian
-                | crate::app::ActiveFrameKind::UvSphereBody { .. } => {
-                    self.camera.position.in_frame(&self.active_frame.render_path)
-                }
-            };
+            let camera_local = self
+                .camera
+                .position
+                .in_frame(&self.active_frame.cartesian_path());
             // Keep the UI's zoom_level in sync with the live anchor
             // depth.
             self.ui.zoom_level = self.zoom_level();
