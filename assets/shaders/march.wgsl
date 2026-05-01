@@ -996,21 +996,78 @@ fn march_cartesian(
     return result;
 }
 
-// Phase 3 REVISED — Step A.0: UV-sphere render of the WrappedPlane
-// frame. Replaces the flat slab DDA when `uniforms.planet_render.x
-// == 1.0`. The slab data is unchanged; what changes is the visual
-// — instead of marching through a flat 2:1 rectangle, we ray-
-// intersect an implied sphere of radius R = body_size / (2π) (=
-// the slab's wrap circumference, since dims_x fully fills the X
-// axis at slab_depth = log_3(dims_x)) and return a hit if the ray
-// strikes the surface. Poles past `lat_max` (planet_render.y) are
-// banned — the ray returns no-hit so the outer loop can pop /
-// skip and the pixel reads as sky.
+// Phase 3 REVISED Step A.1 — sample the slab tree at (cx, cy, cz).
+// Returns the block_type (palette index) of the cell at that
+// integer leaf-level coord, or 0xFFFE (REPRESENTATIVE_EMPTY) if the
+// cell is empty / the path doesn't exist in the packed tree.
 //
-// Step A.0 ships the geometry primitive only — uniform GRASS
-// colour, sphere normal for shading, no slab cell sampling. A.1
-// adds (lon, lat) → (cell_x, cell_z) lookup so the surface shows
-// the slab's actual block colours.
+// Walks `slab_depth` levels of 27-children Cartesian descent. At
+// each level: integer-divide the cell coords by `3^(remaining_levels)`
+// to get the slot index, look up the slab tree's child entry there.
+// On tag=1 (Block leaf) → return its block_type. On tag=2 (Node) at
+// the LAST level → return the entry's representative block_type
+// (works because each slab cell after the anchor-block fix is a
+// uniform-block subtree, so its representative IS the surface
+// material). On tag=2 mid-walk → descend one level. On tag=0 (no
+// child at this slot) → empty.
+fn sample_slab_cell(
+    slab_root_idx: u32,
+    slab_depth: u32,
+    cx: i32, cy: i32, cz: i32,
+) -> u32 {
+    var idx = slab_root_idx;
+    // Initialize cells_per_slot to 3^(slab_depth - 1).
+    var cells_per_slot: i32 = 1;
+    for (var k: u32 = 1u; k < slab_depth; k = k + 1u) {
+        cells_per_slot = cells_per_slot * 3;
+    }
+    for (var level: u32 = 0u; level < slab_depth; level = level + 1u) {
+        let sx = (cx / cells_per_slot) % 3;
+        let sy = (cy / cells_per_slot) % 3;
+        let sz = (cz / cells_per_slot) % 3;
+        let slot = u32(sx + sy * 3 + sz * 9);
+
+        let header_off = node_offsets[idx];
+        let occ = tree[header_off];
+        let bit = 1u << slot;
+        if (occ & bit) == 0u { return 0xFFFEu; }
+        let first_child = tree[header_off + 1u];
+        let rank = countOneBits(occ & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
+        let block_type = (packed >> 8u) & 0xFFFFu;
+
+        if tag == 1u { return block_type; }
+        // Last walked level: this child is a Node anchor block; its
+        // packed block_type is the uniform subtree's representative.
+        if level == slab_depth - 1u { return block_type; }
+        if tag == 2u {
+            idx = tree[child_base + 1u];
+        } else {
+            return 0xFFFEu;
+        }
+        cells_per_slot = cells_per_slot / 3;
+    }
+    return 0xFFFEu;
+}
+
+// Phase 3 REVISED — Step A.0+A.1: UV-sphere render of the
+// WrappedPlane frame. Replaces the flat slab DDA when
+// `uniforms.planet_render.x == 1.0`. The slab data is unchanged;
+// what changes is the visual — instead of marching through a flat
+// 2:1 rectangle, we ray-intersect an implied sphere of radius
+// R = body_size / (2π) (= the slab's wrap circumference, since
+// dims_x fully fills the X axis at slab_depth = log_3(dims_x)) and
+// return a hit if the ray strikes the surface. Poles past `lat_max`
+// (planet_render.y) are banned — the ray returns no-hit so the outer
+// loop can pop / skip and the pixel reads as sky.
+//
+// Step A.0: geometry primitive only.
+// Step A.1: map (lon, lat) → slab (cell_x, cell_z) at GRASS row
+// (cell_y = dims_y - 1), look up cell, color by block_type.
+// Parity-checkerboard tint added so even uniform-grass cells show
+// the lat/lon → cell grid alignment unambiguously.
 fn sphere_uv_in_cell(
     body_idx: u32,
     body_origin: vec3<f32>,
@@ -1056,20 +1113,42 @@ fn sphere_uv_in_cell(
     //   lat = asin(n.y) ∈ [-π/2, π/2]
     //   lon = atan2(n.z, n.x) ∈ [-π, π]
     let lat = asin(clamp(n.y, -1.0, 1.0));
+    let lon = atan2(n.z, n.x);
 
     // Polar ban — return no-hit so the pixel reads as sky.
     if abs(lat) > lat_max { return result; }
 
-    // Step A.0 — placeholder: uniform GRASS colour. A.1 will sample
-    // the slab cell at (lon, lat) and use its block colour.
+    // (lon, lat) → slab (cell_x, cell_z), with cell_y at the slab's
+    // GRASS row (= top of populated band = dims_y - 1).
+    let dims_x = i32(uniforms.slab_dims.x);
+    let dims_y = i32(uniforms.slab_dims.y);
+    let dims_z = i32(uniforms.slab_dims.z);
+    let slab_depth = uniforms.slab_dims.w;
+    let pi = 3.14159265;
+    // u ∈ [0, 1) — longitude wraps; floor-then-clamp safe for u=1
+    // edge.
+    let u = (lon + pi) / (2.0 * pi);
+    // v ∈ [0, 1] — latitude already filtered above to be inside
+    // ±lat_max.
+    let v = (lat + lat_max) / (2.0 * lat_max);
+    let cell_x = clamp(i32(floor(u * f32(dims_x))), 0, dims_x - 1);
+    let cell_z = clamp(i32(floor(v * f32(dims_z))), 0, dims_z - 1);
+    let cell_y = dims_y - 1;  // GRASS row
+
+    let block_type = sample_slab_cell(body_idx, slab_depth, cell_x, cell_y, cell_z);
+    if block_type == 0xFFFEu { return result; }  // empty cell → sky
+
+    // Color from palette + parity-checkerboard tint so adjacent
+    // cells visibly differ even when they're all the same material.
+    // Tint multiplier alternates 0.85 / 1.0 by (cell_x + cell_z)
+    // parity. Removes once Step A.3 (real bevels) lands.
+    let tint = select(0.85, 1.0, ((cell_x + cell_z) & 1) == 0);
+    let base_color = palette[block_type].rgb;
+
     result.hit = true;
-    // `t` returned to the caller is in the un-normalised parameter:
-    // `t_enter` was computed against `normalize(ray_dir_in)`, so
-    // scale back so the caller's `ray_origin + ray_dir_in * t` lands
-    // on the hit point.
     let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
     result.t = t_enter * inv_norm;
-    result.color = vec3<f32>(0.4, 0.78, 0.42);
+    result.color = base_color * tint;
     result.normal = n;
     result.cell_min = hit_pos;
     result.cell_size = body_size / 27.0;
