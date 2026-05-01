@@ -540,6 +540,33 @@ impl App {
     }
 
     pub(super) fn update(&mut self, dt: f32) {
+        // Camera-relative continuous flight (Minecraft-creative-style).
+        // W/S follow camera forward (with pitch — looking down + W
+        // dives), A/D follow camera right, Space/Shift go world ±Y.
+        // Speed is in current-anchor-cell units per second so the
+        // feel stays consistent across zoom levels: at any depth one
+        // second of W moves you the same fraction of the cell.
+        if !self.frozen && self.cursor_locked && !self.ui.any_panel_open() {
+            let (fwd, right, _up) = self.camera.basis();
+            let mut delta = [0.0_f32; 3];
+            if self.keys.w { delta = crate::world::sdf::add(delta, fwd); }
+            if self.keys.s { delta = crate::world::sdf::sub(delta, fwd); }
+            if self.keys.d { delta = crate::world::sdf::add(delta, right); }
+            if self.keys.a { delta = crate::world::sdf::sub(delta, right); }
+            if self.keys.space { delta[1] += 1.0; }
+            if self.keys.shift { delta[1] -= 1.0; }
+            let len = crate::world::sdf::length(delta);
+            if len > 1e-6 {
+                let speed_cells_per_sec = 4.0;
+                let scale = speed_cells_per_sec * dt / len;
+                let step = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
+                self.camera.position.add_local(
+                    step,
+                    &self.world.library,
+                    self.world.root,
+                );
+            }
+        }
         player::update(&mut self.camera, dt);
         // Advance entities by velocity * dt. WorldPos renormalizes
         // so cell-boundary crossings are handled transparently; on
