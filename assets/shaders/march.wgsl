@@ -1109,49 +1109,85 @@ fn sphere_uv_in_cell(
     let hit_pos = ray_origin + ray_dir * t_enter;
     let n = (hit_pos - cs_center) / r_sphere;
 
-    // Latitude / longitude from the surface normal.
-    //   lat = asin(n.y) ∈ [-π/2, π/2]
-    //   lon = atan2(n.z, n.x) ∈ [-π, π]
-    let lat = asin(clamp(n.y, -1.0, 1.0));
-    let lon = atan2(n.z, n.x);
-
-    // Polar ban — return no-hit so the pixel reads as sky.
-    if abs(lat) > lat_max { return result; }
-
-    // (lon, lat) → slab (cell_x, cell_z), with cell_y at the slab's
-    // GRASS row (= top of populated band = dims_y - 1).
+    // A.2 — Shell march. The slab's Y axis maps to the sphere's
+    // radial depth: cell_y = dims_y - 1 (slab top) at radius r_outer,
+    // cell_y = 0 (slab bottom) at radius r_inner. Shell thickness is
+    // a fraction of r_sphere — picked here as 1/4 R; later tunable.
+    // The renderer does NOT know which cells are which material —
+    // it samples whatever's at (cell_x, cell_y, cell_z) and returns
+    // the first solid cell. A dug-out top row reveals the row
+    // beneath it automatically.
     let dims_x = i32(uniforms.slab_dims.x);
     let dims_y = i32(uniforms.slab_dims.y);
     let dims_z = i32(uniforms.slab_dims.z);
     let slab_depth = uniforms.slab_dims.w;
     let pi = 3.14159265;
-    // u ∈ [0, 1) — longitude wraps; floor-then-clamp safe for u=1
-    // edge.
-    let u = (lon + pi) / (2.0 * pi);
-    // v ∈ [0, 1] — latitude already filtered above to be inside
-    // ±lat_max.
-    let v = (lat + lat_max) / (2.0 * lat_max);
-    let cell_x = clamp(i32(floor(u * f32(dims_x))), 0, dims_x - 1);
-    let cell_z = clamp(i32(floor(v * f32(dims_z))), 0, dims_z - 1);
-    let cell_y = dims_y - 1;  // GRASS row
-
-    let block_type = sample_slab_cell(body_idx, slab_depth, cell_x, cell_y, cell_z);
-    if block_type == 0xFFFEu { return result; }  // empty cell → sky
-
-    // Color from palette + parity-checkerboard tint so adjacent
-    // cells visibly differ even when they're all the same material.
-    // Tint multiplier alternates 0.85 / 1.0 by (cell_x + cell_z)
-    // parity. Removes once Step A.3 (real bevels) lands.
-    let tint = select(0.85, 1.0, ((cell_x + cell_z) & 1) == 0);
-    let base_color = palette[block_type].rgb;
-
-    result.hit = true;
+    let shell_thickness = r_sphere * 0.25;
+    let r_outer = r_sphere;
+    let r_inner = r_sphere - shell_thickness;
     let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
-    result.t = t_enter * inv_norm;
-    result.color = base_color * tint;
-    result.normal = n;
-    result.cell_min = hit_pos;
-    result.cell_size = body_size / 27.0;
+
+    // Step size: 4 samples per radial cell layer (so a layer of
+    // shell_thickness / dims_y is sampled 4 times along the ray's
+    // chord through it). Conservative; A.3 / future work can use
+    // analytical (lat, lon, r) DDA for fewer steps per pixel.
+    let dt_radial = shell_thickness / max(f32(dims_y) * 4.0, 1.0);
+    var t = t_enter;
+    var steps: u32 = 0u;
+    loop {
+        if t > t_exit { break; }
+        if steps > 1024u { break; }
+        steps = steps + 1u;
+
+        let pos = ray_origin + ray_dir * t;
+        let off = pos - cs_center;
+        let r = length(off);
+
+        // Outside the populated shell — no solid here. If we've
+        // crossed BELOW the inner radius the ray has exited the
+        // planet's interior; bail (sky beyond / through the planet).
+        if r < r_inner { break; }
+        // Above r_outer means we haven't entered the shell yet (or
+        // are exiting on the back side). Step forward.
+        if r > r_outer + 1e-4 {
+            t = t + dt_radial;
+            continue;
+        }
+
+        let n_step = off / r;
+        let lat = asin(clamp(n_step.y, -1.0, 1.0));
+        if abs(lat) > lat_max {
+            t = t + dt_radial;
+            continue; // banned pole — keep stepping; might re-enter
+        }
+        let lon = atan2(n_step.z, n_step.x);
+        let u = (lon + pi) / (2.0 * pi);
+        let v = (lat + lat_max) / (2.0 * lat_max);
+        let cell_x = clamp(i32(floor(u * f32(dims_x))), 0, dims_x - 1);
+        let cell_z = clamp(i32(floor(v * f32(dims_z))), 0, dims_z - 1);
+        // Radial cell index: r_outer → dims_y - 1 (top, GRASS),
+        // r_inner → 0 (bottom, STONE) — but we never name the
+        // materials. Just walk Y as data.
+        let r_frac = (r - r_inner) / shell_thickness;
+        let cell_y = clamp(i32(floor(r_frac * f32(dims_y))), 0, dims_y - 1);
+
+        let block_type = sample_slab_cell(body_idx, slab_depth, cell_x, cell_y, cell_z);
+        if block_type != 0xFFFEu {
+            // Hit. Plain palette color — the parity-checkerboard tint
+            // from A.1 (verification aid) is removed now that the
+            // cell-lookup math is confirmed correct via tests. A.3
+            // will introduce real bevels for cell-edge visualization.
+            result.hit = true;
+            result.t = t * inv_norm;
+            result.color = palette[block_type].rgb;
+            result.normal = n_step;
+            result.cell_min = pos;
+            result.cell_size = body_size / 27.0;
+            return result;
+        }
+        t = t + dt_radial;
+    }
+
     return result;
 }
 

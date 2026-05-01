@@ -116,72 +116,121 @@ pub fn cpu_raycast_sphere_uv(
         (hit[1] - cs_center[1]) / r_sphere,
         (hit[2] - cs_center[2]) / r_sphere,
     ];
-    let lat = n[1].clamp(-1.0, 1.0).asin();
-    if lat.abs() > lat_max {
-        return None; // banned pole — pixel reads as sky
-    }
-    let lon = n[2].atan2(n[0]);
-
-    // (lon, lat) → slab cell coords. Floor + clamp.
+    // Walk the chord from t_enter to t_exit, sampling cells at each
+    // radial step. Mirrors the GPU shader's A.2 shell march: the slab
+    // Y axis maps to radial depth, with cell_y = dims.y - 1 at
+    // r = r_outer (sphere surface) and cell_y = 0 at r = r_inner.
+    // First non-empty cell wins. The renderer / raycast does NOT name
+    // materials — it just walks Y as data, so a dug-out top cell
+    // reveals the cell beneath automatically.
     let pi = std::f32::consts::PI;
-    let u = (lon + pi) / (2.0 * pi); // [0, 1)
-    let v = (lat + lat_max) / (2.0 * lat_max); // [0, 1]
-    let cell_x = ((u * dims[0] as f32).floor() as i32).clamp(0, dims[0] as i32 - 1);
-    let cell_z = ((v * dims[2] as f32).floor() as i32).clamp(0, dims[2] as i32 - 1);
-    let cell_y = dims[1] as i32 - 1; // GRASS row (top of populated band)
+    let shell_thickness = r_sphere * 0.25;
+    let r_outer = r_sphere;
+    let r_inner = r_sphere - shell_thickness;
+    let dt_radial = shell_thickness / (dims[1] as f32 * 4.0).max(1.0);
 
-    // Walk frame_path from world_root to the slab root, accumulating
-    // the (NodeId, slot) pairs the HitInfo expects.
-    let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(frame_path.len() + slab_depth as usize);
+    // Walk frame_path from world_root to the slab root once
+    // (independent of the chord march below).
+    let mut frame_chain: Vec<(NodeId, usize)> = Vec::with_capacity(frame_path.len());
     let mut cur = world_root;
     for &slot in frame_path.iter() {
         let node = library.get(cur)?;
-        path.push((cur, slot as usize));
+        frame_chain.push((cur, slot as usize));
         match node.children[slot as usize] {
             Child::Node(child) => cur = child,
-            _ => return None, // frame_path doesn't lead to a node
+            _ => return None,
         }
     }
     let slab_root = cur;
 
-    // Walk the slab tree from slab_root down `slab_depth` levels to
-    // reach (cell_x, cell_y, cell_z).
-    let mut idx = slab_root;
-    let mut cells_per_slot: i32 = 1;
-    for _ in 1..slab_depth {
-        cells_per_slot *= 3;
-    }
-    for level in 0..slab_depth {
-        let sx = (cell_x / cells_per_slot).rem_euclid(3);
-        let sy = (cell_y / cells_per_slot).rem_euclid(3);
-        let sz = (cell_z / cells_per_slot).rem_euclid(3);
-        let slot = slot_index(sx as usize, sy as usize, sz as usize);
-        path.push((idx, slot));
-        let node = library.get(idx)?;
-        match node.children[slot] {
-            Child::Block(_) => break,
-            Child::Node(child) => {
-                if level + 1 < slab_depth {
-                    idx = child;
+    let mut t = t_enter;
+    let mut steps: u32 = 0;
+    while t <= t_exit && steps < 1024 {
+        steps += 1;
+        let pos = [
+            cam_local[0] + dir[0] * t,
+            cam_local[1] + dir[1] * t,
+            cam_local[2] + dir[2] * t,
+        ];
+        let off = [
+            pos[0] - cs_center[0],
+            pos[1] - cs_center[1],
+            pos[2] - cs_center[2],
+        ];
+        let r = (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt();
+        if r < r_inner {
+            break; // tunnelled through into the empty interior
+        }
+        if r > r_outer + 1e-4 {
+            t += dt_radial;
+            continue;
+        }
+        let n = [off[0] / r, off[1] / r, off[2] / r];
+        let lat_step = n[1].clamp(-1.0, 1.0).asin();
+        if lat_step.abs() > lat_max {
+            t += dt_radial;
+            continue; // banned latitude band — keep stepping
+        }
+        let lon_step = n[2].atan2(n[0]);
+        let u = (lon_step + pi) / (2.0 * pi);
+        let v = (lat_step + lat_max) / (2.0 * lat_max);
+        let cell_x = ((u * dims[0] as f32).floor() as i32).clamp(0, dims[0] as i32 - 1);
+        let cell_z = ((v * dims[2] as f32).floor() as i32).clamp(0, dims[2] as i32 - 1);
+        let r_frac = (r - r_inner) / shell_thickness;
+        let cell_y = ((r_frac * dims[1] as f32).floor() as i32).clamp(0, dims[1] as i32 - 1);
+
+        // Walk slab tree down to (cell_x, cell_y, cell_z) — same as
+        // the shader's `sample_slab_cell` but returns the path for
+        // HitInfo (or None on empty cell).
+        let mut path = frame_chain.clone();
+        let mut idx = slab_root;
+        let mut cells_per_slot: i32 = 1;
+        for _ in 1..slab_depth {
+            cells_per_slot *= 3;
+        }
+        let mut cell_is_empty = false;
+        for level in 0..slab_depth {
+            let sx = (cell_x / cells_per_slot).rem_euclid(3);
+            let sy = (cell_y / cells_per_slot).rem_euclid(3);
+            let sz = (cell_z / cells_per_slot).rem_euclid(3);
+            let slot = slot_index(sx as usize, sy as usize, sz as usize);
+            path.push((idx, slot));
+            let node = match library.get(idx) {
+                Some(n) => n,
+                None => {
+                    cell_is_empty = true;
+                    break;
+                }
+            };
+            match node.children[slot] {
+                Child::Empty | Child::EntityRef(_) => {
+                    cell_is_empty = true;
+                    break;
+                }
+                Child::Block(_) => break, // hit a leaf block at this level
+                Child::Node(child) => {
+                    if level + 1 < slab_depth {
+                        idx = child;
+                    }
                 }
             }
-            _ => return None, // empty cell — caller treats as miss
+            cells_per_slot /= 3;
         }
-        cells_per_slot /= 3;
+        if !cell_is_empty {
+            // Hit returned: face = +Y (top face — sphere surface
+            // points outward; A.4+ may compute a face from the
+            // sphere normal direction once placement is wired).
+            return Some(HitInfo {
+                path,
+                face: 2,
+                t: t * inv_norm,
+                place_path: None,
+            });
+        }
+        t += dt_radial;
     }
 
-    // Hit returned: face = +Y (top face — the GRASS surface is up).
-    // place_path: insert above the GRASS row (at cell_y + 1) — since
-    // dims.y = 2 and we're already at the top, "above" means we'd
-    // need to extend the slab. Leave None for now; A.4+ can wire
-    // proper placement once the architecture for "above-slab cells"
-    // is decided.
-    Some(HitInfo {
-        path,
-        face: 2,
-        t: t_enter * inv_norm,
-        place_path: None,
-    })
+    None
 }
 
 /// Frame-aware raycast. Mirrors the renderer's ribbon-pop
@@ -578,6 +627,126 @@ mod tests {
             1.26,
         );
         assert!(hit.is_none(), "north-pole ray must be banned");
+    }
+
+    /// A.2 — when the outer (GRASS) cell at the target lat/lon is
+    /// removed, the ray walks through the chord and lands on the
+    /// next layer (STONE). Verifies the shell-march math doesn't
+    /// hardcode "first hit = top cell"; it samples whatever data
+    /// is at each radial step.
+    #[test]
+    fn cpu_raycast_sphere_uv_dug_grass_reveals_layer_below() {
+        use crate::world::bootstrap::wrapped_planet_world;
+        use crate::world::tree::{empty_children, slot_index, Child, NodeKind};
+
+        // Build a slab with a HOLE at (cell_x=13, cell_y=1, cell_z=7)
+        // — that's the +X equator point that the
+        // _east_equator_hits_middle_cell test targets. We do this by
+        // building a custom WrappedPlane subtree in which the GRASS
+        // cell at that position is Child::Empty. Below it (cell_y=0
+        // at the same x, z) STONE is intact.
+        let mut world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        // Walk world tree to the slab root: 2 embedding levels of
+        // slot (1, 1, 1).
+        let mut node_id = world.root;
+        for _ in 0..2 {
+            let n = world.library.get(node_id).unwrap();
+            match n.children[slot_index(1, 1, 1)] {
+                Child::Node(c) => node_id = c,
+                _ => unreachable!(),
+            }
+        }
+        // node_id is now slab root (NodeKind::WrappedPlane). Walk
+        // down to (cell_x=13, cell_y=1, cell_z=7) at slab_depth=3.
+        // Compute slot indices at each level (cells_per_slot 9, 3, 1).
+        let path_slots = {
+            let cx = 13i32; let cy = 1i32; let cz = 7i32;
+            let mut slots = Vec::new();
+            let mut cps = 9i32;
+            for _ in 0..3 {
+                let sx = (cx / cps).rem_euclid(3) as usize;
+                let sy = (cy / cps).rem_euclid(3) as usize;
+                let sz = (cz / cps).rem_euclid(3) as usize;
+                slots.push(slot_index(sx, sy, sz));
+                cps /= 3;
+            }
+            slots
+        };
+
+        // Replace the GRASS leaf at the target with Empty by
+        // re-emitting the path's nodes from scratch with the
+        // modified leaf. Library is content-addressed so we just
+        // build new nodes.
+        let mut current = node_id;
+        // Collect (parent_id, slot, parent_node_kind) for each level
+        // so we can rebuild upward.
+        let mut levels: Vec<(NodeId, usize)> = Vec::with_capacity(3);
+        for &slot in &path_slots {
+            let n = world.library.get(current).unwrap();
+            levels.push((current, slot));
+            match n.children[slot] {
+                Child::Node(c) => current = c,
+                _ => break,
+            }
+        }
+        // Replace leaf at the deepest slot with Empty. Rebuild
+        // upward, preserving each level's NodeKind (slab root is
+        // WrappedPlane; mid-levels are Cartesian).
+        // Last level's parent is `levels[2].0`. Replace its child at
+        // `levels[2].1` with Empty.
+        let (deepest_parent, deepest_slot) = levels[2];
+        let deepest_parent_node = world.library.get(deepest_parent).unwrap();
+        let mut new_children = deepest_parent_node.children;
+        new_children[deepest_slot] = Child::Empty;
+        let new_deepest = world.library.insert_with_kind(new_children, deepest_parent_node.kind);
+        // Rebuild parent of deepest_parent.
+        let (mid_parent, mid_slot) = levels[1];
+        let mid_parent_node = world.library.get(mid_parent).unwrap();
+        let mut mid_children = mid_parent_node.children;
+        mid_children[mid_slot] = Child::Node(new_deepest);
+        let new_mid = world.library.insert_with_kind(mid_children, mid_parent_node.kind);
+        // Rebuild slab root.
+        let (slab_root_id, top_slot) = levels[0];
+        let slab_root_node = world.library.get(slab_root_id).unwrap();
+        let mut slab_children = slab_root_node.children;
+        slab_children[top_slot] = Child::Node(new_mid);
+        let new_slab_root = world.library.insert_with_kind(slab_children, slab_root_node.kind);
+        // Rebuild upward through embedding levels.
+        let mut new_root = new_slab_root;
+        // Walk the world root's path to the slab root, rebuilding.
+        // Embedding has depth 2 with slot (1,1,1) at each level.
+        for _ in 0..2 {
+            // Find the parent of new_root in the existing tree (not
+            // straightforward without back-pointers); easier path:
+            // walk the tree fresh and substitute.
+            // Actually for a 2-level rebuild it's simpler to do it
+            // explicitly: find the embedding node that was pointing
+            // to slab_root, swap its (1,1,1) child for new_root.
+            // Since each embedding level is `empty_children` with
+            // only (1,1,1) populated, we can rebuild from scratch.
+            let mut emb = empty_children();
+            emb[slot_index(1, 1, 1)] = Child::Node(new_root);
+            new_root = world.library.insert_with_kind(emb, NodeKind::Cartesian);
+        }
+        world.root = new_root;
+
+        // Now ray east-of-sphere going west — same setup as the
+        // first test. With the GRASS cell removed, the cell beneath
+        // (cell_y = 0) should be hit instead. The leaf slot for
+        // cell (13, 0, 7) is (1, 0, 1) = slot_index(1, 0, 1).
+        let frame_path = vec![13u8, 13u8];
+        let cam_local = [3.0, 1.5, 1.5];
+        let ray_dir = [-1.0, 0.0, 0.0];
+        let hit = cpu_raycast_sphere_uv(
+            &world.library, world.root, &frame_path,
+            cam_local, ray_dir,
+            [27, 2, 14], 3,
+            1.26,
+        ).expect("dug-through ray must hit stone underneath");
+        let leaf_slot = hit.path.last().unwrap().1;
+        // Expect cell_y = 0 → leaf slot has sy = 0 → slot_index(1, 0, 1) = 10.
+        assert_eq!(leaf_slot, slot_index(1, 0, 1),
+            "expected leaf slot (1,0,1)=10 (cell_y=0 = stone) after digging grass, got {leaf_slot}");
     }
 
     #[test]
