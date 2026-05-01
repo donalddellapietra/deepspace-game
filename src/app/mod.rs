@@ -563,7 +563,16 @@ impl App {
 
     pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {
         if self.frozen { return; }
-        self.camera.position.anchor.step_neighbor_cartesian(axis, direction);
+        // WASD-style one-cell teleport. Use the kind-aware step so an
+        // X-axis step inside a `WrappedPlane` subtree wraps when it
+        // would have left the slab footprint instead of bubbling up
+        // into an empty sibling cell of the embedding chain.
+        self.camera.position.anchor.step_neighbor_in_world(
+            &self.world.library,
+            self.world.root,
+            axis,
+            direction,
+        );
         self.camera.position.offset = [0.5, 0.5, 0.5];
     }
 
