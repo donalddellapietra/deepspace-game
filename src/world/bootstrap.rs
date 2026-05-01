@@ -756,22 +756,29 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
 
 /// Default slab dims (cells along x, y, z) for `--wrapped-planet`.
 ///
-/// Phase 2 X-wrap correctness requires `dims[0] == 3^slab_depth` —
-/// the slab must fully fill the WrappedPlane node along the wrap axis
-/// so the shader's `depth==0 && OOB-on-X` trigger lands on the slab
-/// footprint edge. With `slab_depth = 3` that's `dims[0] = 27`.
+/// Axis convention in this worldgen (NOTE: differs from the
+/// architecture doc — see comment block below):
+/// - `dims[0]` = X = longitude. Wrap-axis. Must equal `3^slab_depth`
+///   for Phase 2 wrap correctness (slab must fully fill the
+///   WrappedPlane node along X so the shader's `depth==0 && OOB-on-X`
+///   trigger lands on the slab footprint edge). With `slab_depth = 3`
+///   that's `dims[0] = 27`.
+/// - `dims[1]` = Y = vertical (gravity-aligned). Grass at the top
+///   row, stone at the bottom row, dirt between. This is the
+///   "dig-down depth" the player experiences. The architecture doc
+///   calls this `Z` ("shallow Z"); we use `Y` because Y is the
+///   game's gravity axis.
+/// - `dims[2]` = Z = latitude (the OTHER horizontal). Bounded; ends
+///   are non-buildable polar strips (Phase 4 handling pending).
 ///
-/// X:Y aspect targets ≈ 2:1 so cells are roughly square when wrapped
-/// onto the sphere (longitude spans 360°, latitude 180°). Exact 2:1 is
-/// impossible while `dims[0] = 3^N` (powers of 3 are always odd); the
-/// closest integer split of 27 is 14 (≈ 1.93:1). True exact 2:1
+/// X:Z aspect targets ≈ 2:1 so cells are roughly square when wrapped
+/// onto the sphere (longitude spans 360°, latitude 180°). Exact 2:1
+/// is impossible while `dims[0] = 3^N` (powers of 3 are always odd);
+/// the closest integer split of 27 is 14 (≈ 1.93:1). True exact 2:1
 /// requires moving the wrap trigger from the WrappedPlane node edge
 /// down to the slab footprint edge — a deeper change deferred until
 /// after the curvature math is settled.
-///
-/// Z stays shallow (2 cells deep) — the architecture says depth-axis
-/// dimensions are gameplay choices, unconstrained by the wrap.
-pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [27, 14, 2];
+pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [27, 2, 14];
 /// Default depth descended below the `WrappedPlane` node to reach
 /// leaf cells. `slab_depth = 3` ⇒ subgrid is 27³, which matches
 /// `dims[0]`. Higher values widen the WrappedPlane so the slab no
@@ -976,20 +983,29 @@ pub fn wrapped_planet_world(
 /// Spawn position for the wrapped planet preset: above the slab top
 /// surface, looking straight down at it.
 ///
-/// Anchor: the (1,1,1) centre-slot path repeated `embedding_depth`
-/// times — this lands the camera inside the WrappedPlane node's
-/// own cell. Offset is in WrappedPlane-cell-local coords (cell spans
-/// `[0, 1)` for x/y/z because WorldPos's offset is normalised to
-/// `[0, 1)`).
+/// **Anchor depth = `embedding_depth + slab_depth`** (slab leaf
+/// level). The deeper anchor is REQUIRED for X-wrap to fire on
+/// player movement: `step_neighbor_in_world` only wraps when an
+/// overflowing slot's parent is the WrappedPlane node, which lives
+/// at tree depth `embedding_depth`. The slot whose parent is the
+/// WrappedPlane is `slots[embedding_depth]` — the slot at tree
+/// depth `embedding_depth + 1`. So the path must be at least
+/// `embedding_depth + 1` slots long for the chain of bubble-up
+/// overflows from offset.x crossing 1.0 to ever reach the
+/// WrappedPlane's children grid. Anchoring at the leaf level
+/// (`embedding_depth + slab_depth`) gives the natural representation
+/// where each `add_local` step crosses a leaf cell, and the wrap
+/// fires after `dims[0]` such steps.
 ///
-/// The slab occupies `[0, dims.i / 3^slab_depth)` along each axis
-/// inside the WrappedPlane cell. Camera offset:
+/// Initial offset is computed in the WrappedPlane cell's `[0, 1)`
+/// frame (where the slab occupies `[0, dims.i / 3^slab_depth)`),
+/// then `deepened_to` pushes the anchor to leaf depth via slot
+/// arithmetic on the offset (precision-stable, no f32 accumulation).
+///
+/// Camera offset (in WrappedPlane cell `[0, 1)` coords):
 /// - cam_x = slab_x_centre = (dims.x / 3^slab_depth) / 2
-/// - cam_y = slab_top + air_gap  = (dims.y / 3^slab_depth) + 0.05
+/// - cam_y = slab_top + air_gap = (dims.y / 3^slab_depth) + clearance
 /// - cam_z = slab_z_centre = (dims.z / 3^slab_depth) / 2
-///
-/// Then `App::with_test_config` deepens the WorldPos to its target
-/// anchor depth via `deepened_to`, which is precision-stable.
 pub fn wrapped_planet_spawn(
     embedding_depth: u8,
     slab_dims: [u32; 3],
@@ -999,23 +1015,21 @@ pub fn wrapped_planet_spawn(
     let frac_x = slab_dims[0] as f32 / subgrid;
     let frac_y = slab_dims[1] as f32 / subgrid;
     let frac_z = slab_dims[2] as f32 / subgrid;
-    // Position camera above the slab's X,Z centre. Camera y is high
-    // enough that a top-down screenshot at default FoV (~70°) shows
-    // the slab's X-edges in frame: required cam_y above slab_top is
-    // roughly slab_width / 2 / tan(35°) ≈ slab_width * 0.7. Total
-    // cam_y = slab_top + clearance, clamped into [0, 1).
     let cam_x = (frac_x * 0.5).clamp(0.001, 0.999);
     let clearance = (frac_x * 0.7).max(0.05);
     let cam_y = (frac_y + clearance).clamp(0.001, 0.95);
     let cam_z = (frac_z * 0.5).clamp(0.001, 0.999);
-    // Anchor at `embedding_depth` (slab root level). Test driver
-    // can deepen further via `--spawn-depth`; slot arithmetic in
-    // `deepened_to` is precision-stable.
+    // Construct at the WrappedPlane cell, then deepen to slab leaf
+    // depth so movement-time `add_local → renormalize_world` sees
+    // a path long enough that X-overflow at the leaf bubbles all
+    // the way up to the WrappedPlane's children grid (`slots[
+    // embedding_depth]`), where the wrap-aware step actually fires.
     WorldPos::uniform_column(
         slot_index(1, 1, 1) as u8,
         embedding_depth,
         [cam_x, cam_y, cam_z],
     )
+    .deepened_to(embedding_depth + slab_depth)
 }
 
 fn bootstrap_wrapped_planet_world(

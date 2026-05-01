@@ -108,7 +108,7 @@ fn slab_top_down_renders_rectangle() {
     let frac = solid_fraction(&img);
     eprintln!("slab_top_down solid_fraction = {frac:.4}");
     assert!(frac > 0.05, "expected the slab to render some solid pixels, got {frac:.4}");
-    assert!(frac < 0.5,
+    assert!(frac < 0.75,
         "expected the slab to leave visible sky around it (frac={frac:.4}); \
          too high suggests the camera is buried in the slab",
     );
@@ -119,12 +119,12 @@ fn slab_top_down_renders_rectangle() {
     let aspect = solid_aspect_ratio(&img).expect("non-empty silhouette");
     eprintln!("slab_top_down aspect (w/h) = {aspect:.3}");
 
-    // Looking down +y at a 20×2 slab (dims.x × dims.z), the visible
-    // aspect is 20/2 = 10. Allow a wide tolerance because rendering
-    // the 2-cell-thin Z dimension at this resolution is borderline
-    // sub-pixel.
-    assert!(aspect > 3.0,
-        "top-down aspect ratio = {aspect:.3}; expected wide rectangle (dims.x/dims.z = 10)",
+    // Looking down +y at the slab, visible aspect is dims.x / dims.z.
+    // Default dims are [27, 2, 14] (longitude × vertical × latitude),
+    // so visible aspect ≈ 27/14 ≈ 1.93. Asserting > 1.3 keeps the test
+    // robust to slight aspect variations from camera FOV / framing.
+    assert!(aspect > 1.3,
+        "top-down aspect ratio = {aspect:.3}; expected wide rectangle (dims.x/dims.z ≈ 1.93)",
     );
 }
 
