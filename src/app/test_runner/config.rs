@@ -184,6 +184,9 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
+                "--wrapped-planet-world" => {
+                    cfg.world_preset = WorldPreset::WrappedPlanet;
+                }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
                 "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
                 "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }
@@ -458,6 +461,7 @@ USAGE:
 
 WORLD PRESETS (pick one; defaults to --plain-world):
   --plain-world               40-level test world with grass/dirt/stone
+  --wrapped-planet-world      Phase 1.2 hardcoded 18x9x3 wrapped slab
   --vox-model PATH            Load .vox / .vxs model (e.g. assets/vox/soldier_729.vxs)
 
 FRACTAL PRESETS (default plain-layers = 8):

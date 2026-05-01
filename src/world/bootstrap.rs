@@ -8,9 +8,10 @@ use super::anchor::{Path, WorldPos, WORLD_SIZE};
 use super::palette::block;
 use super::state::WorldState;
 use super::tree::{
-    empty_children, slot_index, uniform_children, BRANCH, Child, NodeId, NodeKind, NodeLibrary,
-    MAX_DEPTH,
+    empty_children, slot_index, uniform_children, BRANCH, CENTER_SLOT, Child, NodeId, NodeKind,
+    NodeLibrary, MAX_DEPTH,
 };
+use super::wrapped_planet;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -73,6 +74,11 @@ pub enum WorldPreset {
     Scene {
         id: crate::world::scenes::SceneId,
     },
+    /// Phase 1 hardcoded wrapped Cartesian planet: an 18x9x3 active
+    /// slab at `active_subdepth=2`. No wrap or polar handling yet --
+    /// those are Phases 2 and 3. See
+    /// `docs/design/wrapped-planet/HIGH_LEVEL_PLAN.md`.
+    WrappedPlanet,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -103,6 +109,12 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
         | WorldPreset::Scene { .. } => None,
+        // Phase 1 wrapped planet: flat slab, the "ground" is the top
+        // grass row of the active region. Returning None for now
+        // because the planet sits at a deep nested cell and the Y
+        // value would only be meaningful in planet-frame coords --
+        // entity-rest tracking can be wired in a later phase.
+        WorldPreset::WrappedPlanet => None,
     }
 }
 
@@ -168,6 +180,7 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             &path, plain_layers.unwrap_or(8), interior_depth,
         ),
         WorldPreset::Scene { id } => crate::world::scenes::bootstrap_scene_world(id),
+        WorldPreset::WrappedPlanet => bootstrap_wrapped_planet_world(),
     }
 }
 
@@ -722,6 +735,78 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
     }
     if let Some(new_root) = replacement {
         world.swap_root(new_root);
+    }
+}
+
+/// Phase 1.2 wrapped-Cartesian-planet bootstrap: builds an 18x9x3
+/// active slab and wraps it in `PLANET_WORLD_DEPTH` layers of air-
+/// with-center-child so the planet sits at world tree depth 4.
+///
+/// Default spawn places the camera above the active region's grass
+/// top (planet-frame y=1.0), centred longitudinally and through the
+/// active Z column, looking down. From this pose the harness should
+/// see a finite green slab in the foreground with sky at the active
+/// region's edges (banned cells render as empty no-hit -- the wrap
+/// dispatch lands in Phase 2).
+fn bootstrap_wrapped_planet_world() -> WorldBootstrap {
+    /// World-tree depth of the planet root. Shallow enough that
+    /// each level of CENTER_SLOT wrapping is f32-precise; deep
+    /// enough that the planet looks small from the harness default
+    /// spawn so the slab edges are visible.
+    const PLANET_WORLD_DEPTH: u8 = 4;
+
+    let mut lib = NodeLibrary::default();
+    let planet_id = wrapped_planet::build_phase1_planet(&mut lib);
+
+    // Wrap the planet in PLANET_WORLD_DEPTH layers of air, each with
+    // the previous layer as their center child. After this loop,
+    // `current` is the world root.
+    let mut current = planet_id;
+    for _ in 0..PLANET_WORLD_DEPTH {
+        let mut children = empty_children();
+        children[CENTER_SLOT] = Child::Node(current);
+        current = lib.insert(children);
+    }
+    lib.ref_inc(current);
+
+    let world = WorldState { root: current, library: lib };
+
+    // Build the path to the planet root: PLANET_WORLD_DEPTH levels,
+    // each at CENTER_SLOT. This is the frame against which the
+    // planet's local coordinates are expressed.
+    let mut planet_path = Path::root();
+    for _ in 0..PLANET_WORLD_DEPTH {
+        planet_path.push(CENTER_SLOT as u8);
+    }
+
+    // Spawn coords in planet-frame:
+    //   x = 1.0  -> centred in the active X region [0, 2.0)
+    //   y = 1.5  -> 0.5 above the grass top at y=1.0 (active region
+    //               spans y in [0, 1.0))
+    //   z = 0.166 -> centred in the active Z region [0, 1/3)
+    // anchor_depth=PLANET_WORLD_DEPTH lands the anchor exactly at
+    // the planet root (the position decomposes into `(planet_path,
+    // [1.0/3, 1.5/3, 0.166/3])`).
+    let spawn_pos = WorldPos::from_frame_local(
+        &planet_path,
+        [1.0, 1.5, 0.166],
+        PLANET_WORLD_DEPTH,
+    );
+
+    WorldBootstrap {
+        world,
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: 0.0,
+        // Pitch ~= -1.0 rad (~57 deg below horizon) -- the camera
+        // looks down at the slab so the top-Y face is visible.
+        default_spawn_pitch: -1.0,
+        // plain_layers=0 disables carve_air_pocket. The default
+        // spawn at planet-frame y=1.5 is already in air (above the
+        // grass top at y=1.0); carving would replace the planet root
+        // -- which is the center child of the deepest wrapper -- with
+        // an empty air subtree, destroying the slab.
+        plain_layers: 0,
+        color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
 

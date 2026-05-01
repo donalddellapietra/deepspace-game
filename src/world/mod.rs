@@ -13,3 +13,4 @@ pub mod sdf;
 pub mod state;
 pub mod tree;
 pub mod worldgen;
+pub mod wrapped_planet;
