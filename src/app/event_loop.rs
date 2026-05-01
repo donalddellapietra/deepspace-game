@@ -372,6 +372,14 @@ impl App {
                     self.camera.position.in_frame(&self.active_frame.render_path)
                 }
             };
+            // Keep the UI's zoom_level in sync with the live anchor
+            // depth. `edit_actions::zoom` updates it on explicit zoom
+            // input, but startup spawns + bootstrap defaults (e.g. the
+            // wrapped-planet which spawns at embedding_depth + slab_depth
+            // automatically) need this fallback or the on-screen "Layer
+            // N" indicator stays stuck at 0 until the player presses
+            // a zoom key.
+            self.ui.zoom_level = self.zoom_level();
             self.ui.push_to_overlay(&self.palette);
             crate::overlay::push_state(&crate::bridge::GameStateUpdate::DebugOverlay(
                 crate::bridge::DebugOverlayStateJs {

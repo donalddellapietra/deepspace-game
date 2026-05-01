@@ -10,8 +10,9 @@
 
 use deepspace_game::world::anchor::{Path, Transition, WorldPos};
 use deepspace_game::world::bootstrap::{
-    wrapped_planet_world, DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
-    DEFAULT_WRAPPED_PLANET_SLAB_DEPTH, DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
+    wrapped_planet_world, DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
+    DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH, DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
+    DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
 };
 
 /// Build the canonical wrapped-planet world for tests. Returns
@@ -27,7 +28,10 @@ fn canonical_world() -> (
     let embedding_depth = DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH;
     let dims = DEFAULT_WRAPPED_PLANET_SLAB_DIMS;
     let slab_depth = DEFAULT_WRAPPED_PLANET_SLAB_DEPTH;
-    let world = wrapped_planet_world(embedding_depth, dims, slab_depth);
+    let world = wrapped_planet_world(
+        embedding_depth, dims, slab_depth,
+        DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
+    );
     let mut slab_root = Path::root();
     for _ in 0..embedding_depth {
         slab_root.push(deepspace_game::world::tree::slot_index(1, 1, 1) as u8);

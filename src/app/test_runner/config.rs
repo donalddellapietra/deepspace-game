@@ -189,7 +189,36 @@ impl TestConfig {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
                         slab_dims: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
                         slab_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
+                        cell_subtree_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
                     };
+                }
+                // Override the wrapped-planet's total tree depth.
+                // `--planet-layers N` sets total = N. We adjust
+                // `cell_subtree_depth` to absorb the difference, so
+                // each slab cell's recursive subtree gets shallower /
+                // deeper. `embedding_depth` and `slab_depth` stay at
+                // their defaults. The slab cells are STILL anchor
+                // blocks (`Child::Node`), just with N - emb - slab
+                // levels of content beneath them. MUST come AFTER
+                // `--wrapped-planet` on the command line.
+                "--planet-layers" => {
+                    if let Some(layers) = args.next().and_then(|v| v.parse::<u8>().ok()) {
+                        if let WorldPreset::WrappedPlanet {
+                            embedding_depth,
+                            slab_depth,
+                            ref mut cell_subtree_depth,
+                            ..
+                        } = cfg.world_preset
+                        {
+                            let baseline = embedding_depth + slab_depth;
+                            assert!(
+                                layers >= baseline,
+                                "--planet-layers {} must be >= embedding+slab ({})",
+                                layers, baseline,
+                            );
+                            *cell_subtree_depth = layers - baseline;
+                        }
+                    }
                 }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
                 "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
@@ -481,9 +510,16 @@ FRACTAL PRESETS (default plain-layers = 8):
 VISIBILITY TEST PRESETS:
   --stars-world               Planet cube + distant stars at varying ribbon
                               depths; validates precision across deep pops
-  --wrapped-planet            Phase-1 wrapped-Cartesian planet: hardcoded
-                              20x10x2 grass/dirt/stone slab embedded at
-                              depth 22, no wrap or curvature yet
+  --wrapped-planet            Wrapped-Cartesian planet: 27x2x14
+                              grass/dirt/stone slab with X-axis wrap
+                              (longitude). Default total tree depth: 25
+                              (embedding 22 + slab 3). No curvature yet.
+  --planet-layers N           (After --wrapped-planet) Override total
+                              tree depth. e.g. `--planet-layers 40`
+                              puts slab leaves at world-tree depth 40
+                              (embedding 37 + slab 3). Stress-tests the
+                              wrap math at deep precision. Must come
+                              after `--wrapped-planet`.
 
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):

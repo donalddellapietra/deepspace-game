@@ -88,6 +88,14 @@ pub enum WorldPreset {
         embedding_depth: u8,
         slab_dims: [u32; 3],
         slab_depth: u8,
+        /// Depth of the recursive subtree under EACH slab cell. The
+        /// slab cells are `Child::Node(uniform_block_subtree)` of
+        /// this depth — NOT `Child::Block(...)` leaf-terminals — so
+        /// they behave as proper anchor blocks per the
+        /// `[Recursive architecture]` rule (every cell at every layer
+        /// is itself a recursive subdivision). Total tree depth =
+        /// `embedding_depth + slab_depth + cell_subtree_depth`.
+        cell_subtree_depth: u8,
     },
 }
 
@@ -193,8 +201,12 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
             plain_layers.unwrap_or(40),
         ),
-        WorldPreset::WrappedPlanet { embedding_depth, slab_dims, slab_depth } => {
-            bootstrap_wrapped_planet_world(embedding_depth, slab_dims, slab_depth)
+        WorldPreset::WrappedPlanet {
+            embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
+        } => {
+            bootstrap_wrapped_planet_world(
+                embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
+            )
         }
     }
 }
@@ -780,17 +792,23 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
 /// after the curvature math is settled.
 pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [27, 2, 14];
 /// Default depth descended below the `WrappedPlane` node to reach
-/// leaf cells. `slab_depth = 3` ⇒ subgrid is 27³, which matches
-/// `dims[0]`. Higher values widen the WrappedPlane so the slab no
-/// longer fully fills X, breaking the wrap geometry; lower values
-/// shrink the subgrid below `dims[0]`.
+/// the slab cell anchors. `slab_depth = 3` ⇒ subgrid is 27³, which
+/// matches `dims[0]`. Higher values widen the WrappedPlane so the
+/// slab no longer fully fills X, breaking the wrap geometry; lower
+/// values shrink the subgrid below `dims[0]`.
 pub const DEFAULT_WRAPPED_PLANET_SLAB_DEPTH: u8 = 3;
 /// Default tree depth at which the `WrappedPlane` node is installed.
-/// `embedding_depth = 22` puts the slab inside a vanishingly small
-/// embedding cell — the same precision regime as the deep-zoom
-/// Cartesian tests. `slab_depth = 3` adds three more levels, so the
-/// leaves live at world-tree depth 25.
-pub const DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH: u8 = 22;
+/// Slab cell anchors live at `embedding_depth + slab_depth`; each
+/// anchor has a recursive subtree of `cell_subtree_depth` more levels
+/// underneath. Total tree depth = embedding + slab + cell_subtree.
+pub const DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH: u8 = 2;
+/// Default depth of the recursive subtree under each slab cell.
+/// Per `[Recursive architecture]`, slab cells are NOT terminal blocks
+/// — they're `Child::Node(uniform_subtree)` so each cell is a real
+/// anchor with content beneath it. `20` gives layer-5 anchor blocks
+/// (= `EMBEDDING + SLAB`) each with a 20-deep subtree, summing to a
+/// 25-layer tree by default.
+pub const DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH: u8 = 20;
 
 /// Build a `NodeKind::WrappedPlane`-rooted slab embedded in an
 /// otherwise empty world.
@@ -822,14 +840,16 @@ pub fn wrapped_planet_world(
     embedding_depth: u8,
     slab_dims: [u32; 3],
     slab_depth: u8,
+    cell_subtree_depth: u8,
 ) -> WorldState {
     assert!(embedding_depth > 0, "embedding_depth must be >= 1");
     assert!(slab_depth > 0, "slab_depth must be >= 1");
     let total_depth = (embedding_depth as usize)
-        .saturating_add(slab_depth as usize);
+        .saturating_add(slab_depth as usize)
+        .saturating_add(cell_subtree_depth as usize);
     assert!(
         total_depth <= MAX_DEPTH,
-        "embedding_depth + slab_depth ({}) exceeds MAX_DEPTH ({})",
+        "embedding+slab+cell_subtree ({}) exceeds MAX_DEPTH ({})",
         total_depth,
         MAX_DEPTH,
     );
@@ -846,34 +866,53 @@ pub fn wrapped_planet_world(
 
     let mut library = NodeLibrary::default();
 
+    // Per-material uniform anchor subtrees. Each is a chain of
+    // Cartesian nodes `cell_subtree_depth` levels deep, all 27
+    // children pointing to the same material. Content-addressed
+    // dedup means the entire chain is exactly `cell_subtree_depth`
+    // library entries per material — irrespective of the slab
+    // population count. This is what makes each slab cell a
+    // proper anchor block per `[Recursive architecture]`: cells
+    // are `Child::Node(...)`, not `Child::Block(...)`, so the
+    // recursive subdivision goes all the way down.
+    fn build_uniform_anchor(
+        library: &mut NodeLibrary,
+        block: u16,
+        depth: u8,
+    ) -> Child {
+        if depth == 0 {
+            // depth = 0 means no extra subtree: the cell IS a Block
+            // leaf at the slab cell anchor depth (legacy behavior).
+            return Child::Block(block);
+        }
+        let inner = build_uniform_anchor(library, block, depth - 1);
+        Child::Node(library.insert(uniform_children(inner)))
+    }
+    let stone_anchor = build_uniform_anchor(&mut library, block::STONE, cell_subtree_depth);
+    let dirt_anchor  = build_uniform_anchor(&mut library, block::DIRT,  cell_subtree_depth);
+    let grass_anchor = build_uniform_anchor(&mut library, block::GRASS, cell_subtree_depth);
+
     // Build the slab subtree as a flat `subgrid^3` Cartesian volume,
     // sparsely populated to the slab_dims footprint. The simplest
     // exact construction is to walk the leaf-cell grid and at each
-    // (x, y, z) pick the block (or Empty), then bottom-up assemble
-    // 3×3×3 nodes layer by layer.
+    // (x, y, z) pick the per-material anchor (or Empty), then
+    // bottom-up assemble 3×3×3 nodes layer by layer.
     //
     // Leaf-cell selection rule for the slab footprint:
     //   x ∈ [0, dims.x)  AND  y ∈ [0, dims.y)  AND  z ∈ [0, dims.z)
-    //     - bottom row (y == 0): STONE
-    //     - middle rows (1..dims.y-1): DIRT
-    //     - top row (y == dims.y-1): GRASS
+    //     - bottom row (y == 0): stone_anchor
+    //     - middle rows (1..dims.y-1): dirt_anchor
+    //     - top row (y == dims.y-1): grass_anchor
     //   else: Empty
-    //
-    // Build bottom-up in `slab_depth` passes. The first pass groups
-    // the (subgrid)^3 leaves into (subgrid/3)^3 depth-1 nodes; each
-    // subsequent pass groups the previous pass's nodes into
-    // (subgrid/3^k)^3 nodes. After `slab_depth` passes a single
-    // node remains: the WrappedPlane root.
     let leaf_at = |x: u32, y: u32, z: u32| -> Child {
         if x < slab_dims[0] && y < slab_dims[1] && z < slab_dims[2] {
-            let block = if y == 0 {
-                block::STONE
+            if y == 0 {
+                stone_anchor
             } else if y + 1 == slab_dims[1] {
-                block::GRASS
+                grass_anchor
             } else {
-                block::DIRT
-            };
-            Child::Block(block)
+                dirt_anchor
+            }
         } else {
             Child::Empty
         }
@@ -973,8 +1012,8 @@ pub fn wrapped_planet_world(
 
     let world = WorldState { root, library };
     eprintln!(
-        "wrapped_planet world: embedding_depth={}, slab_dims={:?}, slab_depth={}, library_entries={}, tree_depth={}",
-        embedding_depth, slab_dims, slab_depth,
+        "wrapped_planet world: embedding_depth={}, slab_dims={:?}, slab_depth={}, cell_subtree_depth={}, library_entries={}, tree_depth={}",
+        embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
         world.library.len(), world.tree_depth(),
     );
     world
@@ -1036,8 +1075,16 @@ fn bootstrap_wrapped_planet_world(
     embedding_depth: u8,
     slab_dims: [u32; 3],
     slab_depth: u8,
+    cell_subtree_depth: u8,
 ) -> WorldBootstrap {
-    let world = wrapped_planet_world(embedding_depth, slab_dims, slab_depth);
+    let world = wrapped_planet_world(
+        embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
+    );
+    // Camera spawns AT the slab cell anchor depth (just above the
+    // GRASS surface). The cell's subtree below — `cell_subtree_depth`
+    // levels of recursive material — is invisible from this anchor;
+    // zooming IN by N levels reveals the next N layers of the
+    // subtree, all the way down to the leaf Block at total tree depth.
     let spawn_pos = wrapped_planet_spawn(embedding_depth, slab_dims, slab_depth);
     WorldBootstrap {
         world,
@@ -1089,9 +1136,9 @@ mod tests {
     #[test]
     fn wrapped_planet_produces_wrapped_plane_node() {
         let embedding_depth: u8 = 8;
-        let slab_dims = [20u32, 10, 2];
+        let slab_dims = [27u32, 10, 2];
         let slab_depth: u8 = 3;
-        let world = wrapped_planet_world(embedding_depth, slab_dims, slab_depth);
+        let world = wrapped_planet_world(embedding_depth, slab_dims, slab_depth, 0);
         // Walk down centre slot (13 = (1,1,1)) for `embedding_depth`
         // levels.
         let mut node_id = world.root;
@@ -1115,12 +1162,18 @@ mod tests {
         }
     }
 
-    /// The total tree depth must equal embedding_depth + slab_depth
-    /// — the slab's leaf cells live `slab_depth` below the slab
-    /// root.
+    /// The total tree depth must equal
+    /// `embedding_depth + slab_depth + cell_subtree_depth`. The slab
+    /// cell anchors live `slab_depth` below the slab root, and each
+    /// cell's recursive subtree adds `cell_subtree_depth` more.
     #[test]
     fn wrapped_planet_total_tree_depth() {
-        let world = wrapped_planet_world(8, [20, 10, 2], 3);
+        // cell_subtree_depth=0 → cells are bottom-most Block leaves.
+        let world = wrapped_planet_world(8, [27, 10, 2], 3, 0);
         assert_eq!(world.tree_depth(), 8 + 3);
+        // cell_subtree_depth=5 → each cell has a 5-deep uniform
+        // anchor subtree underneath. Total tree depth grows by 5.
+        let world = wrapped_planet_world(8, [27, 10, 2], 3, 5);
+        assert_eq!(world.tree_depth(), 8 + 3 + 5);
     }
 }
