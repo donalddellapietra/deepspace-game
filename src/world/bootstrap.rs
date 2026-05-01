@@ -759,10 +759,19 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
 /// Phase 2 X-wrap correctness requires `dims[0] == 3^slab_depth` —
 /// the slab must fully fill the WrappedPlane node along the wrap axis
 /// so the shader's `depth==0 && OOB-on-X` trigger lands on the slab
-/// footprint edge. With `slab_depth = 3` that's `dims[0] = 27`. Y
-/// and Z stay small (10 thick × 2 deep) — they exit the slab via the
-/// normal ribbon-pop path, no fill constraint there.
-pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [27, 10, 2];
+/// footprint edge. With `slab_depth = 3` that's `dims[0] = 27`.
+///
+/// X:Y aspect targets ≈ 2:1 so cells are roughly square when wrapped
+/// onto the sphere (longitude spans 360°, latitude 180°). Exact 2:1 is
+/// impossible while `dims[0] = 3^N` (powers of 3 are always odd); the
+/// closest integer split of 27 is 14 (≈ 1.93:1). True exact 2:1
+/// requires moving the wrap trigger from the WrappedPlane node edge
+/// down to the slab footprint edge — a deeper change deferred until
+/// after the curvature math is settled.
+///
+/// Z stays shallow (2 cells deep) — the architecture says depth-axis
+/// dimensions are gameplay choices, unconstrained by the wrap.
+pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [27, 14, 2];
 /// Default depth descended below the `WrappedPlane` node to reach
 /// leaf cells. `slab_depth = 3` ⇒ subgrid is 27³, which matches
 /// `dims[0]`. Higher values widen the WrappedPlane so the slab no
