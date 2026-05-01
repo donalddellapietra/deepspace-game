@@ -296,6 +296,32 @@ impl App {
             match self.active_frame.kind {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                    // Per-frame curvature derivation. With the wrap
+                    // invariant `dims[0] == 3^slab_depth` the slab
+                    // circumference in marcher units is exactly 3.0,
+                    // so R = 3.0 / (2π). slab_surface_y is dims[1]
+                    // leaf-cells of marcher size 3.0/3^slab_depth.
+                    // altitude is signed cam-y minus slab-top in
+                    // slab-local marcher coords; clamped to ≥0
+                    // (camera below slab top → no curvature).
+                    //
+                    // k(altitude) is a smooth saturator: 0 at the
+                    // surface, ~0.5 at altitude = R, asymptotic 1.
+                    // The shader will still see [0; 4] until step 3
+                    // wires the bent-Y math; this commit just makes
+                    // the value available.
+                    let subgrid = (crate::world::tree::BRANCH as u32)
+                        .pow(slab_depth as u32) as f32;
+                    let leaf_cell_marcher = 3.0_f32 / subgrid;
+                    let circumference = dims[0] as f32 * leaf_cell_marcher;
+                    let r = circumference / std::f32::consts::TAU;
+                    let r_inv = if r > 1e-6 { 1.0 / r } else { 0.0 };
+                    let slab_surface_y = dims[1] as f32 * leaf_cell_marcher;
+                    let altitude_marcher =
+                        (cam_gpu.pos[1] - slab_surface_y).max(0.0);
+                    let altitude_normalized = altitude_marcher * r_inv;
+                    let k = 1.0 - 1.0 / (1.0 + altitude_normalized.powf(1.5));
+                    renderer.set_curvature(k, r_inv, slab_surface_y);
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
             }
