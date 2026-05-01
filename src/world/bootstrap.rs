@@ -775,18 +775,26 @@ fn bootstrap_uv_sphere_world() -> WorldBootstrap {
 
     let world = WorldState { root, library };
 
-    // Spawn camera at world root depth, OUTSIDE the body cell —
-    // the mid-descent dispatch in march_cartesian hands the ray
-    // to the UV DDA when it descends into the body's slot. This
-    // exercises the full integration path.
+    // Spawn the camera in front of the body, with a non-trivial
+    // anchor depth so `app.edit_depth() = anchor_depth` defaults to
+    // something that lands a break on a real surface cell rather
+    // than a tiny coarse one. Default depth = 8 mirrors plain-world.
     //
-    // World root spans [0, 3)³; body cell at center slot occupies
-    // [1, 2)³ with body center at [1.5, 1.5, 1.5]. Spawn at
-    // [1.5, 1.5, 0.4] looking +Z toward the body. body_size in
-    // root frame = 1.0; outer_r in world = 0.20; body angular
-    // radius from spawn ≈ asin(0.20 / 1.10) ≈ 11°.
+    // World root spans `[0, 3)³`; body cell at slot 13 = [1, 2)³,
+    // body center at world [1.5, 1.5, 1.5], outer_r = 0.20 in
+    // world. Spawn at world [1.5, 1.5, 1.0] looking +Z (= the body
+    // cell's near face, just outside the body's outer shell at
+    // z=1.30). Offset must be expressed in [0, 1)³ of the root cell:
+    // world_pos / WORLD_SIZE = [0.5, 0.5, 1/3].
     let _ = body_path; // body_path retained on planet_path
-    let spawn_pos = WorldPos::new(Path::root(), [1.5, 1.5, 0.4]);
+    // Anchor depth defaults to 1 (= camera at world root + body slot).
+    // interaction_range = 6 cells × 3^(1-K), K = anchor_depth -
+    // frame_depth. With anchor=1, frame=1 → K=0, range = 18 world
+    // units (huge). The default break covers any visible cell on
+    // the body. Zoom in via the scroll wheel to drive edit_depth up
+    // and produce smaller breaks.
+    let spawn_pos = WorldPos::new(Path::root(), [0.5, 0.5, 1.0 / 3.0])
+        .deepened_to(1);
 
     WorldBootstrap {
         world,

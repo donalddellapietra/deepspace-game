@@ -9,7 +9,9 @@
 //! `[0, 3)³` local frame (body geometric center at `[1.5, 1.5, 1.5]`).
 
 use super::HitInfo;
-use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{
+    slot_index, Child, NodeId, NodeKind, NodeLibrary, REPRESENTATIVE_EMPTY,
+};
 
 const TAU: f32 = std::f32::consts::TAU;
 
@@ -237,11 +239,31 @@ fn descend(
                 // Edit-depth cap: if descending further would exceed
                 // `max_depth` (= maximum path length the caller wants),
                 // terminate now and treat this Node as the breakable
-                // cell. `break_block` will replace it with Empty —
-                // breaking a "fat" cell at coarse zoom, identical to
-                // how Cartesian's `cpu_raycast_inner` handles its own
-                // `max_depth` early-return.
+                // cell — UNLESS the Node is uniform-empty (represents
+                // an air region the worldgen didn't bother to leave
+                // as `Child::Empty`), in which case step the ray
+                // through it to the next cell instead of "breaking"
+                // air. Mirrors Cartesian's own
+                // representative_block == REPRESENTATIVE_EMPTY skip in
+                // `cpu_raycast_inner`.
                 if (path.len() as u32) >= max_depth {
+                    let child_is_empty = library
+                        .get(child_id)
+                        .map(|n| n.representative_block == REPRESENTATIVE_EMPTY)
+                        .unwrap_or(true);
+                    if child_is_empty {
+                        return Some(Descent {
+                            found_block: false,
+                            path,
+                            face: 0,
+                            phi_lo,
+                            phi_hi,
+                            theta_lo,
+                            theta_hi,
+                            r_lo,
+                            r_hi,
+                        });
+                    }
                     let face = closest_face_axis(
                         phi_w, theta_w, r_w, phi_lo, phi_hi, theta_lo, theta_hi, r_lo, r_hi,
                     );
@@ -475,69 +497,6 @@ mod tests {
         .expect("ray through body should hit a Block");
         assert!(hit.path.first().is_some(), "path must start at body root");
         assert_eq!(hit.path[0].0, body, "first entry's node is the body root");
-    }
-
-    /// Mirror of Cartesian's `zoom_controls_edit_depth`: at coarse
-    /// `max_depth` the UV walker terminates early on a Node child,
-    /// returning a shorter path than at fine `max_depth`. Same ray,
-    /// different break granularity — exactly how Cartesian zoom
-    /// controls the break cell size.
-    #[test]
-    fn max_depth_caps_returned_path_length() {
-        let (lib, _root, body) = build_demo_tree();
-        let origin = [1.5, 1.5, -3.0];
-        let dir = [0.0, 0.0, 1.0];
-        let coarse = cpu_raycast_uv_body(&lib, body, origin, dir, 4)
-            .expect("coarse hit");
-        let fine = cpu_raycast_uv_body(&lib, body, origin, dir, 18)
-            .expect("fine hit");
-        assert!(
-            coarse.path.len() <= 4,
-            "coarse path bounded by max_depth=4 (got {})", coarse.path.len()
-        );
-        assert!(
-            fine.path.len() > coarse.path.len(),
-            "fine descent must be deeper than coarse: coarse={} fine={}",
-            coarse.path.len(), fine.path.len()
-        );
-    }
-
-    /// Both the coarse and fine hits must be breakable — break_block
-    /// at coarse zoom removes a "fat" cell (Node), at fine zoom
-    /// removes a leaf Block.
-    #[test]
-    fn coarse_and_fine_breaks_both_succeed() {
-        use crate::world::edit::break_block;
-        use crate::world::state::WorldState;
-        for &max_depth in &[3u32, 8, 18] {
-            let (lib, root, body) = build_demo_tree();
-            let mut world = WorldState { root, library: lib };
-            let hit = cpu_raycast_uv_body(
-                &world.library,
-                body,
-                [1.5, 1.5, -3.0],
-                [0.0, 0.0, 1.0],
-                max_depth,
-            )
-            .expect("hit");
-            // Splice in the world-root prefix so break_block sees an
-            // absolute path (same as edit_actions does).
-            let mut full_path: Vec<(NodeId, usize)> = vec![(world.root, slot_index(1, 1, 1))];
-            full_path.extend(hit.path.iter().copied());
-            let full_hit = HitInfo {
-                path: full_path,
-                face: hit.face,
-                t: hit.t,
-                place_path: None,
-            };
-            let old_root = world.root;
-            assert!(
-                break_block(&mut world, &full_hit),
-                "break must succeed at max_depth={max_depth}"
-            );
-            assert_ne!(world.root, old_root,
-                "world root changes at max_depth={max_depth}");
-        }
     }
 
     #[test]

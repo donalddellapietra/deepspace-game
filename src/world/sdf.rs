@@ -59,6 +59,15 @@ pub fn tangent_basis(up: Vec3) -> (Vec3, Vec3) {
 /// acceleration `gravity` at the surface, falling off linearly to
 /// zero at `influence_radius`. Outside `influence_radius` this planet
 /// contributes no gravity (allowing flight / space outside).
+///
+/// `grass_thickness` and `dirt_thickness` are the radial band depths
+/// (world units) — independent of `noise_scale` so a smooth ball can
+/// still have layered content. That's the cartesian-style trick: if
+/// the band radii aren't ternary-rational fractions of the body's r
+/// range, every level of the tree near the surface has mixed cells
+/// → pack can't flatten → break reveals a real 3³ grid at any depth.
+/// When both thicknesses are 0, fall back to the legacy noise-scale-
+/// derived bands so older worldgens keep working unchanged.
 #[derive(Clone, Debug)]
 pub struct Planet {
     pub center: Vec3,
@@ -70,6 +79,8 @@ pub struct Planet {
     pub influence_radius: f32,
     pub surface_block: u16,
     pub core_block: u16,
+    pub grass_thickness: f32,
+    pub dirt_thickness: f32,
 }
 
 impl Planet {
@@ -91,14 +102,21 @@ impl Planet {
     }
 
     /// Block type at point p. Top of surface = surface block,
-    /// deep interior = core block. Smooth biome transition by depth.
+    /// deep interior = core block. The transition radii are taken
+    /// directly from `grass_thickness` / `dirt_thickness`; if both
+    /// are 0, fall back to the noise-scale-derived bands so older
+    /// worldgens keep their behavior.
     pub fn block_at(&self, p: Vec3) -> u16 {
         let to = sub(p, self.center);
         let r = length(to);
         // Depth below the undisplaced radius.
         let under = self.radius - r;
-        let grass_band = self.noise_scale * 0.15;
-        let dirt_band = self.noise_scale * 0.6;
+        let (grass_band, dirt_band) =
+            if self.grass_thickness > 0.0 || self.dirt_thickness > 0.0 {
+                (self.grass_thickness, self.grass_thickness + self.dirt_thickness)
+            } else {
+                (self.noise_scale * 0.15, self.noise_scale * 0.6)
+            };
         if under < grass_band { self.surface_block }
         else if under < dirt_band { block::DIRT }
         else { self.core_block }
@@ -200,6 +218,8 @@ mod tests {
             influence_radius: 0.8,
             surface_block: block::GRASS,
             core_block: block::STONE,
+            grass_thickness: 0.0,
+            dirt_thickness: 0.0,
         }
     }
 

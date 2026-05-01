@@ -300,32 +300,44 @@ pub struct UvSphereSetup {
 pub fn demo_uv_sphere() -> UvSphereSetup {
     // Smaller-than-cell body so the camera (which lives inside the
     // body cell at the [0, 3)³ render frame) can still frame the
-    // whole planet without it filling the entire view. With
-    // outer_r=0.20 in body-local units → 0.60 in render frame, and
-    // camera at body-local [0.5, 0.5, 0.04] = render-frame
-    // [1.5, 1.5, 0.12], the body subtends ≈ 26° from the camera —
-    // comfortably inside the default ~70° vertical FOV.
+    // whole planet without it filling the entire view.
     let inner_r = 0.05_f32;
     let outer_r = 0.20_f32;
     let theta_cap = 80.0_f32.to_radians(); // ~6:1 worst aspect at the cap
+    // Mirror plain_world's "non-ternary-rational band radii" trick.
+    // The body's r range is `[inner_r, outer_r]` = [0.05, 0.20], span
+    // 0.15. Pick band thicknesses so the grass-dirt and dirt-stone
+    // boundaries land at fractions of this range whose lowest-terms
+    // denominators have factors other than 3 — guaranteeing every
+    // recursion level near the surface contains MIXED grass/dirt/
+    // stone cells. Pack can't flatten mixed cells, so breaks reveal
+    // a real 3³ sub-cell grid at any depth, no "warm-up break"
+    // required.
+    //
+    //  surface  at r = 0.15  (frac 2/3 of body r range — ternary-
+    //                          rational, but harmless: cells above
+    //                          are uniform empty, cells below are
+    //                          inside the body)
+    //  grass→dirt at r = 0.1425  (frac 37/60 — denom 60 = 2²·3·5)
+    //  dirt→stone at r = 0.105   (frac 11/30 — denom 30 = 2·3·5)
+    let grass_thickness = 0.0075_f32;  //  5% of r range
+    let dirt_thickness = 0.0375_f32;   // 25% of r range
     UvSphereSetup {
         inner_r,
         outer_r,
         theta_cap,
-        // 20-layer body: 3²⁰ ≈ 3.5 B cells per parameter axis at
-        // the leaf level. The smooth-ball SDF flattens the bulk
-        // into long uniform-stone / uniform-empty chains via dedup,
-        // so the actual library footprint stays small. Edit depth
-        // is driven by `app.edit_depth()` (= anchor depth = zoom
-        // level); break_block scales the cell size from "whole
-        // body slice" at zoom 1 down to a leaf voxel at zoom 20.
+        // 20-layer body. The smooth-ball SDF + non-ternary-rational
+        // band radii produce a thin shell of mixed content at every
+        // tree level; dedup keeps the library small. Edit depth is
+        // driven by `app.edit_depth()` (= anchor depth = zoom level);
+        // break_block scales the cell size from "whole body slice"
+        // at zoom 1 down to a leaf voxel at zoom 20.
         depth: 20,
         sdf: Planet {
             center: [0.5, 0.5, 0.5],
             radius: 0.15,
-            // Smooth ball — no noise. The voxel-cell bevels alone
-            // give the surface its texture; noise stacked on top
-            // makes the silhouette uneven and harder to read.
+            // Smooth ball — no noise. Layered grass / dirt / stone
+            // bands give the surface its variety instead.
             noise_scale: 0.0,
             noise_freq: 1.0,
             noise_seed: 0,
@@ -333,19 +345,59 @@ pub fn demo_uv_sphere() -> UvSphereSetup {
             influence_radius: outer_r * 2.0,
             surface_block: crate::world::palette::block::GRASS,
             core_block: crate::world::palette::block::STONE,
+            grass_thickness,
+            dirt_thickness,
         },
     }
 }
 
-/// Max levels of SDF recursion into a UV cell. Below this, each cell
-/// commits to solid-or-empty from its center sample and extends via
-/// uniform dedup. Limits worldgen cost without visibly changing a
-/// smooth sphere.
-const SDF_DETAIL_LEVELS: u32 = 4;
+/// What fills a UV cell when its r-range lies entirely inside one
+/// radial band. `None` means the cell straddles a band boundary and
+/// must recurse — the analogue of `plain_world::fill_for_range`.
+/// Smooth-ball SDF only — noise displacement isn't represented in
+/// this band check.
+#[derive(Copy, Clone)]
+enum UvFill {
+    Empty,
+    Block(u16),
+}
+
+fn fill_for_uv_cell(
+    sdf: &Planet,
+    inner_r: f32,
+    outer_r: f32,
+    rn_lo: f32,
+    rn_hi: f32,
+) -> Option<UvFill> {
+    let r_lo = inner_r + rn_lo * (outer_r - inner_r);
+    let r_hi = inner_r + rn_hi * (outer_r - inner_r);
+    let surface = sdf.radius;
+    let grass_band_inner = surface - sdf.grass_thickness;
+    let dirt_band_inner = grass_band_inner - sdf.dirt_thickness;
+
+    if r_lo >= surface {
+        return Some(UvFill::Empty);
+    }
+    if r_hi <= dirt_band_inner {
+        return Some(UvFill::Block(sdf.core_block));
+    }
+    if r_lo >= grass_band_inner && r_hi <= surface {
+        return Some(UvFill::Block(sdf.surface_block));
+    }
+    if r_lo >= dirt_band_inner && r_hi <= grass_band_inner {
+        return Some(UvFill::Block(crate::world::palette::block::DIRT));
+    }
+    None
+}
 
 /// Build a UV-sphere body node. Caller is responsible for placing it
 /// inside a parent (e.g., world root's center slot) and managing the
 /// refcount.
+///
+/// Recursion is along r only — for a smooth-ball SDF the (φ, θ)
+/// coordinates don't affect the band-fill decision, so all 9
+/// (φ-tier, θ-tier) combinations within a given r-tier share the
+/// same subtree. That keeps worldgen O(depth) instead of O(9^depth).
 pub fn insert_uv_sphere_body(
     lib: &mut NodeLibrary,
     inner_r: f32,
@@ -358,27 +410,19 @@ pub fn insert_uv_sphere_body(
     debug_assert!(0.0 < theta_cap && theta_cap <= std::f32::consts::FRAC_PI_2);
 
     let mut children = empty_children();
-    let phi_lo = 0.0;
-    let phi_hi = std::f32::consts::TAU;
-    let theta_lo = -theta_cap;
-    let theta_hi = theta_cap;
-    let r_lo_n = 0.0;
-    let r_hi_n = 1.0;
+    let r_lo_n = 0.0_f32;
+    let r_hi_n = 1.0_f32;
+    let drn = (r_hi_n - r_lo_n) / 3.0;
     for rt in 0..3 {
+        let rn_lo = r_lo_n + drn * rt as f32;
+        let rn_hi = rn_lo + drn;
+        let r_child = build_uv_r_subtree(
+            lib, inner_r, outer_r, rn_lo, rn_hi,
+            depth.saturating_sub(1), sdf,
+        );
         for tt in 0..3 {
             for pt in 0..3 {
-                let dphi = (phi_hi - phi_lo) / 3.0;
-                let dth = (theta_hi - theta_lo) / 3.0;
-                let drn = (r_hi_n - r_lo_n) / 3.0;
-                let child = build_uv_subtree(
-                    lib,
-                    inner_r, outer_r, theta_cap,
-                    phi_lo + dphi * pt as f32, phi_lo + dphi * (pt + 1) as f32,
-                    theta_lo + dth * tt as f32, theta_lo + dth * (tt + 1) as f32,
-                    r_lo_n + drn * rt as f32, r_lo_n + drn * (rt + 1) as f32,
-                    depth - 1, depth.min(SDF_DETAIL_LEVELS).saturating_sub(1), sdf,
-                );
-                children[slot_index(pt, tt, rt)] = child;
+                children[slot_index(pt, tt, rt)] = r_child;
             }
         }
     }
@@ -388,91 +432,72 @@ pub fn insert_uv_sphere_body(
     )
 }
 
-/// Recursive build of a UV body subtree. Sample the SDF at the cell
-/// center and decide solid / empty / recurse.
-#[allow(clippy::too_many_arguments)]
-fn build_uv_subtree(
+/// Recursive build along r only. Mirrors `plain_world`'s
+/// `build_plain_subtree` shape: cells fully inside one radial band
+/// commit to a uniform subtree; straddling cells subdivide all the
+/// way to leaf depth. With non-ternary-rational band radii, the
+/// straddle never resolves, so every level near the surface keeps
+/// mixed children — pack can't flatten them, breaks reveal a real
+/// 3³ sub-cell grid.
+///
+/// The (φ, θ) dimensions inside each level are SHARED — all 9
+/// (φ-tier, θ-tier) cells point at the same r-subtree. With the
+/// content-addressed library this happens for free at insert time
+/// (the duplicate-children node dedups), but we don't even build
+/// the duplicates here — `insert_uv_sphere_body` writes the same
+/// `Child` into all 9 slot positions of each r-tier directly.
+fn build_uv_r_subtree(
     lib: &mut NodeLibrary,
-    inner_r: f32, outer_r: f32, _theta_cap: f32,
-    phi_lo: f32, phi_hi: f32,
-    theta_lo: f32, theta_hi: f32,
+    inner_r: f32, outer_r: f32,
     rn_lo: f32, rn_hi: f32,
     depth: u32,
-    sdf_budget: u32,
     sdf: &Planet,
 ) -> Child {
-    let body_size = 1.0_f32;
-    let phi_c = 0.5 * (phi_lo + phi_hi);
-    let theta_c = 0.5 * (theta_lo + theta_hi);
-    let rn_c = 0.5 * (rn_lo + rn_hi);
-    let r_c = inner_r + rn_c * (outer_r - inner_r);
-    let p_center = uv_to_body_point(
-        UvPoint { phi: phi_c, theta: theta_c, r: r_c },
-        body_size,
-    );
-    let d_center = sdf.distance(p_center);
-
-    // Conservative cell radius: use the worst case of the cell's
-    // diagonal in world space. Equator/outer cells dominate; we
-    // overestimate by using `outer_r · max(dphi · cos(θ_inner), dθ) +
-    // dr/2`. Slightly loose but cheap and safe.
-    let dphi = phi_hi - phi_lo;
-    let dth = theta_hi - theta_lo;
-    let drn = rn_hi - rn_lo;
-    let cos_inner = theta_lo.abs().min(theta_hi.abs()).cos();
-    let lateral_phi = outer_r * dphi * cos_inner;
-    let lateral_th = outer_r * dth;
-    let radial = drn * (outer_r - inner_r);
-    let cell_rad = 0.5
-        * (lateral_phi.max(lateral_th).max(radial)
-            + (lateral_phi * lateral_phi + lateral_th * lateral_th + radial * radial).sqrt())
-        * 0.5;
-
-    if d_center > cell_rad {
-        return if depth == 0 {
-            Child::Empty
-        } else {
-            Child::Node(uniform_empty_chain(lib, depth))
+    if let Some(fill) = fill_for_uv_cell(sdf, inner_r, outer_r, rn_lo, rn_hi) {
+        return match fill {
+            UvFill::Empty => {
+                if depth == 0 {
+                    Child::Empty
+                } else {
+                    Child::Node(uniform_empty_chain(lib, depth))
+                }
+            }
+            UvFill::Block(b) => {
+                if depth == 0 {
+                    Child::Block(b)
+                } else {
+                    lib.build_uniform_subtree(b, depth)
+                }
+            }
         };
     }
-    if d_center < -cell_rad {
-        let b = sdf.block_at(p_center);
-        return if depth == 0 {
-            Child::Block(b)
-        } else {
-            lib.build_uniform_subtree(b, depth)
-        };
-    }
+
     if depth == 0 {
-        return if d_center < 0.0 {
-            Child::Block(sdf.block_at(p_center))
-        } else {
+        // Cell still straddles a band at leaf depth — pick the block
+        // type from the cell center's r.
+        let r_c = inner_r + 0.5 * (rn_lo + rn_hi) * (outer_r - inner_r);
+        return if r_c >= sdf.radius {
             Child::Empty
-        };
-    }
-    if sdf_budget == 0 {
-        return if d_center < 0.0 {
-            lib.build_uniform_subtree(sdf.block_at(p_center), depth)
         } else {
-            Child::Node(uniform_empty_chain(lib, depth))
+            // Synthesize a center point on the equator. block_at
+            // depends only on |p - center|, so the (φ, θ) doesn't
+            // matter — any equatorial point at the right r works.
+            let p_center = [0.5 + r_c, 0.5, 0.5];
+            Child::Block(sdf.block_at(p_center))
         };
     }
 
     let mut children = empty_children();
-    let dpc = (phi_hi - phi_lo) / 3.0;
-    let dtc = (theta_hi - theta_lo) / 3.0;
     let drc = (rn_hi - rn_lo) / 3.0;
     for rt in 0..3 {
+        let sub_lo = rn_lo + drc * rt as f32;
+        let sub_hi = sub_lo + drc;
+        let sub = build_uv_r_subtree(
+            lib, inner_r, outer_r, sub_lo, sub_hi, depth - 1, sdf,
+        );
         for tt in 0..3 {
             for pt in 0..3 {
-                children[slot_index(pt, tt, rt)] = build_uv_subtree(
-                    lib,
-                    inner_r, outer_r, _theta_cap,
-                    phi_lo + dpc * pt as f32, phi_lo + dpc * (pt + 1) as f32,
-                    theta_lo + dtc * tt as f32, theta_lo + dtc * (tt + 1) as f32,
-                    rn_lo + drc * rt as f32, rn_lo + drc * (rt + 1) as f32,
-                    depth - 1, sdf_budget - 1, sdf,
-                );
+                children[slot_index(pt, tt, rt)] = sub;
             }
         }
     }
@@ -620,6 +645,7 @@ mod tests {
             noise_scale: 0.0, noise_freq: 1.0, noise_seed: 0,
             gravity: 0.0, influence_radius: 1.0,
             surface_block: block::GRASS, core_block: block::STONE,
+            grass_thickness: 0.0, dirt_thickness: 0.0,
         };
         let body = insert_uv_sphere_body(&mut lib, 0.12, 0.45, 1.4, 6, &sdf);
         let node = lib.get(body).unwrap();
