@@ -86,16 +86,26 @@ impl App {
                 // is rooted at the body. We splice the world-root
                 // → body slot prefix back on so break_block sees
                 // an absolute path.
+                //
+                // edit_depth is total path length budget (anchor
+                // depth = zoom level). Subtract the frame prefix
+                // length so the UV walker only consumes its share —
+                // the prefix is always the world-root → body slot
+                // (since the body is the active frame, frame_path
+                // ends at the body slot).
                 let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 let body_node_id = self.active_frame.node_id;
+                let edit_depth = self.edit_depth();
+                let prefix_len = frame_path.depth() as u32;
+                let uv_budget = edit_depth.saturating_sub(prefix_len).max(1);
                 let hit = raycast::cpu_raycast_uv_body(
                     &self.world.library,
                     body_node_id,
                     cam_local,
                     ray_dir,
-                    crate::world::tree::MAX_DEPTH as u32,
+                    uv_budget,
                 );
                 let hit = hit.map(|mut h| {
                     let mut prefix: Vec<(crate::world::tree::NodeId, usize)> =

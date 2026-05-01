@@ -312,12 +312,14 @@ pub fn demo_uv_sphere() -> UvSphereSetup {
         inner_r,
         outer_r,
         theta_cap,
-        // Chunky voxels for visualization. depth=4 → 3⁴ = 81 cells
-        // per parameter axis at the leaves; from the demo spawn
-        // distance each cell projects to roughly 5–10 px so the UV
-        // bevels are clearly visible. Bump this to grow detail when
-        // the LOD termination lands.
-        depth: 4,
+        // 20-layer body: 3²⁰ ≈ 3.5 B cells per parameter axis at
+        // the leaf level. The smooth-ball SDF flattens the bulk
+        // into long uniform-stone / uniform-empty chains via dedup,
+        // so the actual library footprint stays small. Edit depth
+        // is driven by `app.edit_depth()` (= anchor depth = zoom
+        // level); break_block scales the cell size from "whole
+        // body slice" at zoom 1 down to a leaf voxel at zoom 20.
+        depth: 20,
         sdf: Planet {
             center: [0.5, 0.5, 0.5],
             radius: 0.15,

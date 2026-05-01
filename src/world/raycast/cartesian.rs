@@ -2,7 +2,7 @@
 //! `march_cartesian`. Walks the unified tree in XYZ slot order.
 
 use super::{uvsphere as uv_raycast, HitInfo};
-use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Stack frame for iterative DDA traversal.
 pub(super) struct Frame {
@@ -166,12 +166,20 @@ pub(super) fn cpu_raycast_inner(
                         ray_dir[1] * inv_size,
                         ray_dir[2] * inv_size,
                     ];
+                    // The cartesian descent has already produced
+                    // `depth + 1` path entries (root..parent_of_body).
+                    // `max_depth` is the budget for the whole
+                    // returned path; the UV walker may add at most
+                    // `max_depth - (depth + 1)` more entries before
+                    // it should early-terminate at a Node.
+                    let consumed = (depth as u32).saturating_add(1);
+                    let uv_budget = max_depth.saturating_sub(consumed).max(1);
                     if let Some(uv_hit) = uv_raycast::cpu_raycast_uv_body(
                         library,
                         child_id,
                         uv_origin,
                         uv_dir,
-                        MAX_DEPTH as u32,
+                        uv_budget,
                     ) {
                         // The UV DDA's path starts with `(child_id,
                         // ...)`. The parent's `path[depth]` already
