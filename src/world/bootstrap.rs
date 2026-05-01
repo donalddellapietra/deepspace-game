@@ -1,8 +1,8 @@
 //! World bootstrap presets used by app startup and debugging.
 //!
-//! Low-level generation stays in `worldgen` and `spherical_worldgen`.
-//! This module owns composition: which world we start with, whether it
-//! contains a planet, and where the default spawn should be.
+//! Low-level generation stays in `worldgen`. This module owns
+//! composition: which world we start with, whether it contains a
+//! planet, and where the default spawn should be.
 
 use super::anchor::{Path, WorldPos, WORLD_SIZE};
 use super::palette::block;
@@ -17,7 +17,6 @@ use std::collections::HashMap;
 pub enum WorldPreset {
     #[default]
     PlainTest,
-    DemoSphere,
     /// Menger sponge — canonical ternary fractal. Each non-empty
     /// cell subdivides into 20 non-empty + 7 empty children (the 7
     /// are the cube centroid + 6 face centroids). 74% occupancy
@@ -96,11 +95,10 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         // Imported .vox worlds embed the model in a plain world;
         // they inherit the same sea level.
         WorldPreset::VoxModel { .. } => Some(PLAIN_SURFACE_Y),
-        // Every fractal / sphere preset leaves entities to fly
+        // Every fractal preset leaves entities to fly
         // freely — they don't have a single horizontal ground plane
         // that a constant sea-level Y could track.
-        WorldPreset::DemoSphere
-        | WorldPreset::Menger
+        WorldPreset::Menger
         | WorldPreset::SierpinskiTet
         | WorldPreset::CantorDust
         | WorldPreset::JerusalemCross
@@ -133,7 +131,6 @@ pub struct WorldBootstrap {
 
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
     match preset {
-        WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
         WorldPreset::Menger => crate::world::fractals::menger::bootstrap_menger_world(
             plain_layers.unwrap_or(8),
@@ -607,43 +604,6 @@ pub fn plain_world(layers: u8) -> WorldState {
         world.tree_depth(),
     );
     world
-}
-
-fn bootstrap_demo_sphere_world() -> WorldBootstrap {
-    let mut world = crate::world::worldgen::generate_world();
-    let setup = crate::world::spherical_worldgen::demo_planet();
-    let (new_root, planet_path) =
-        crate::world::spherical_worldgen::install_at_root_center(
-            &mut world.library,
-            world.root,
-            &setup,
-        );
-    world.swap_root(new_root);
-    let tree_depth = world.tree_depth();
-    eprintln!(
-        "Demo sphere world: planet_path={:?}, library_entries={}, depth={}",
-        planet_path.as_slice(),
-        world.library.len(),
-        tree_depth,
-    );
-
-    let body_top_y = 1.5 + setup.outer_r;
-    // Construct at shallow depth (2) where f32 decomposition is
-    // precise, then deepen to anchor depth 16 via pure slot arithmetic.
-    let spawn_pos = WorldPos::from_frame_local(
-        &Path::root(),
-        [1.5, (body_top_y + 0.05).min(WORLD_SIZE - 0.001), 1.5],
-        2,
-    ).deepened_to(16);
-    WorldBootstrap {
-        world,
-        planet_path: Some(planet_path),
-        default_spawn_pos: spawn_pos,
-        default_spawn_yaw: 0.0,
-        default_spawn_pitch: -1.2,
-        plain_layers: 0,
-        color_registry: crate::world::palette::ColorRegistry::new(),
-    }
 }
 
 /// Build a spawn position that tracks the dirt/grass boundary at any

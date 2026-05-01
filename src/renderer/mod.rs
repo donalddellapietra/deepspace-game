@@ -42,11 +42,11 @@ pub enum EntityRenderMode {
 /// 64 covers MAX_DEPTH=63 with one slack.
 pub const MAX_RIBBON_LEN: usize = 64;
 
-/// `root_kind` discriminant — must mirror the WGSL `RootKind*`
-/// constants in `bindings.wgsl`.
+/// `root_kind` discriminant — must mirror the WGSL `ROOT_KIND_*`
+/// constants in `bindings.wgsl`. Currently only `Cartesian` is in
+/// use; the slot is retained as part of the uniform buffer so the
+/// shader and CPU layouts stay in lockstep.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
-pub const ROOT_KIND_BODY: u32 = 1;
-pub const ROOT_KIND_FACE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -57,10 +57,9 @@ pub struct GpuUniforms {
     pub screen_height: f32,
     pub max_depth: u32,
     pub highlight_active: u32,
-    /// 0 = Cartesian, 1 = CubedSphereBody. Mirrors the `RootKind*`
-    /// constants. When 1, the shader dispatches into sphere DDA at
-    /// start-of-march; the body fills the `[0, 3)³` frame, and
-    /// `root_inner_r`/`root_outer_r` give the body's radii.
+    /// 0 = Cartesian. Other discriminants used to dispatch sphere
+    /// DDA branches; those are gone. Field retained so the layout
+    /// matches the shader-side `Uniforms` struct exactly.
     pub root_kind: u32,
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
@@ -72,13 +71,13 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Body radii (used iff `root_kind == 1`). Stored in the body
-    /// cell's local `[0, 1)` frame; the shader scales by 3.0
-    /// (= WORLD_SIZE) to get shader-frame units.
-    pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
-    pub root_face_meta: [u32; 4],
-    pub root_face_bounds: [f32; 4],
-    pub root_face_pop_pos: [f32; 4],
+    /// Padding slots retained so the CPU-side `GpuUniforms` matches
+    /// the WGSL `Uniforms` block byte-for-byte. The shader doesn't
+    /// read them in the wrapped-Cartesian architecture.
+    pub _pad_radii: [f32; 4],
+    pub _pad_face_meta: [u32; 4],
+    pub _pad_face_bounds: [f32; 4],
+    pub _pad_face_pop_pos: [f32; 4],
 }
 
 pub struct Renderer {
@@ -131,10 +130,6 @@ pub struct Renderer {
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
-    pub(super) root_radii: [f32; 4],
-    pub(super) root_face_meta: [u32; 4],
-    pub(super) root_face_bounds: [f32; 4],
-    pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -270,41 +265,10 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian (default).
+    /// Set the frame-root NodeKind to Cartesian (the only kind in
+    /// the wrapped-Cartesian architecture).
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
-        self.root_radii = [0.0; 4];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    /// Set the frame-root NodeKind to CubedSphereBody with radii in
-    /// the body cell's local `[0, 1)` frame.
-    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
-        self.root_kind = ROOT_KIND_BODY;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    pub fn set_root_kind_face(
-        &mut self,
-        inner_r: f32,
-        outer_r: f32,
-        face_id: u32,
-        subtree_depth: u32,
-        bounds: [f32; 4],
-        pop_pos: [f32; 3],
-    ) {
-        self.root_kind = ROOT_KIND_FACE;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [face_id, subtree_depth, 0, 0];
-        self.root_face_bounds = bounds;
-        self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
     }
 

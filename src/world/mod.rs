@@ -1,8 +1,6 @@
 pub mod aabb;
 pub mod anchor;
 pub mod bootstrap;
-pub mod cubesphere;
-pub mod cubesphere_local;
 pub mod edit;
 pub mod entities;
 pub mod fractals;
@@ -12,7 +10,6 @@ pub mod raycast;
 pub mod scene;
 pub mod scenes;
 pub mod sdf;
-pub mod spherical_worldgen;
 pub mod stars;
 pub mod state;
 pub mod tree;

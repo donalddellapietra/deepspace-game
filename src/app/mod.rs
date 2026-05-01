@@ -522,10 +522,6 @@ impl App {
     pub(super) fn render_frame_kind(&self) -> NodeKind {
         match self.render_frame().kind {
             ActiveFrameKind::Cartesian => NodeKind::Cartesian,
-            ActiveFrameKind::Body { inner_r, outer_r } => {
-                NodeKind::CubedSphereBody { inner_r, outer_r }
-            }
-            ActiveFrameKind::Sphere(s) => NodeKind::CubedSphereFace { face: s.face },
         }
     }
 
@@ -589,8 +585,7 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+            ActiveFrameKind::Cartesian => {
                 self.camera.position.in_frame(&frame.render_path)
             }
         };

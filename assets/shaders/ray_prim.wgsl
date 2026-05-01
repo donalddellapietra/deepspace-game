@@ -53,6 +53,26 @@ fn max_component(v: vec3<f32>) -> f32 {
     return max(v.x, max(v.y, v.z));
 }
 
+// Cartesian-cell bevel: pick the two axes orthogonal to the hit
+// normal, then darken cells near their cell-local boundary so each
+// voxel reads as a discrete cube under flat lighting.
+fn face_uv_for_normal(local: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let an = abs(normal);
+    if an.x >= an.y && an.x >= an.z {
+        return local.yz;
+    }
+    if an.y >= an.z {
+        return local.xz;
+    }
+    return local.xy;
+}
+
+fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let uv = face_uv_for_normal(local, normal);
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    return smoothstep(0.02, 0.14, edge);
+}
+
 // Branchless argmin mask for the DDA min-side_dist selection.
 // Returns a (0/1) vec3 where exactly one component is 1: the axis whose
 // `side_dist` is smallest. Tie-break priority matches the original

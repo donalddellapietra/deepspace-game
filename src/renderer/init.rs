@@ -266,10 +266,10 @@ impl Renderer {
             _pad_entity: [0; 3],
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
-            root_radii: [0.0; 4],
-            root_face_meta: [0; 4],
-            root_face_bounds: [0.0; 4],
-            root_face_pop_pos: [0.0; 4],
+            _pad_radii: [0.0; 4],
+            _pad_face_meta: [0; 4],
+            _pad_face_bounds: [0.0; 4],
+            _pad_face_pop_pos: [0.0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -664,10 +664,6 @@ impl Renderer {
             max_depth: MAX_DEPTH as u32, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
-            root_radii: [0.0; 4],
-            root_face_meta: [0; 4],
-            root_face_bounds: [0.0; 4],
-            root_face_pop_pos: [0.0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,
