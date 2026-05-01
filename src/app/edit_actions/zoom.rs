@@ -48,7 +48,9 @@ impl App {
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian => self.camera.position.in_frame(&frame.render_path),
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+                self.camera.position.in_frame(&frame.render_path)
+            }
         };
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
@@ -60,7 +62,7 @@ impl App {
 
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
-            ActiveFrameKind::Cartesian => (
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => (
                 self.camera.position.in_frame(&frame.render_path),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
@@ -109,7 +111,9 @@ impl App {
         }
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
-                ActiveFrameKind::Cartesian => self.camera.position.in_frame(&frame.render_path),
+                ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+                    self.camera.position.in_frame(&frame.render_path)
+                }
             };
             eprintln!(
                 "target_frame stable render_path={:?} logical_path={:?} kind={:?} cam_local={:?}",

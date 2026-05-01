@@ -56,10 +56,16 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// Padding slots retained so the WGSL `Uniforms` block matches
+    /// Padding slot retained so the WGSL `Uniforms` block matches
     /// the CPU-side `GpuUniforms` byte-for-byte. Unused.
     _pad_radii: vec4<f32>,
-    _pad_face_meta: vec4<u32>,
+    /// `WrappedPlane` slab dimensions, populated when `root_kind ==
+    /// ROOT_KIND_WRAPPED_PLANE`. `(dims_x, dims_y, dims_z, slab_depth)`.
+    /// Phase 2 reads `dims_x` + `slab_depth` (the `.x` and `.w` lanes)
+    /// in the X-wrap branch of `march_cartesian` to compute the
+    /// wrap shift; `.y` / `.z` are unused until Phase 3. Zero on
+    /// Cartesian-root frames.
+    slab_dims: vec4<u32>,
     _pad_face_bounds: vec4<f32>,
     _pad_face_pop_pos: vec4<f32>,
 }

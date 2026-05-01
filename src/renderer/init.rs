@@ -267,7 +267,7 @@ impl Renderer {
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             _pad_radii: [0.0; 4],
-            _pad_face_meta: [0; 4],
+            slab_dims: [0; 4],
             _pad_face_bounds: [0.0; 4],
             _pad_face_pop_pos: [0.0; 4],
         };
@@ -664,6 +664,7 @@ impl Renderer {
             max_depth: MAX_DEPTH as u32, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
+            slab_dims: [0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,

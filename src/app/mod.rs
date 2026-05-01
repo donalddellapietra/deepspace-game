@@ -522,6 +522,9 @@ impl App {
     pub(super) fn render_frame_kind(&self) -> NodeKind {
         match self.render_frame().kind {
             ActiveFrameKind::Cartesian => NodeKind::Cartesian,
+            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                NodeKind::WrappedPlane { dims, slab_depth }
+            }
         }
     }
 
@@ -532,7 +535,7 @@ impl App {
         // worlds with a defined sea level, `tick` zeroes the Y
         // velocity so entities don't drift off the ground.
         if !self.entities.is_empty() {
-            self.entities.tick(&self.world.library, dt, self.entity_surface_y);
+            self.entities.tick(&self.world.library, self.world.root, dt, self.entity_surface_y);
         }
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
@@ -585,7 +588,7 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian => {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                 self.camera.position.in_frame(&frame.render_path)
             }
         };
