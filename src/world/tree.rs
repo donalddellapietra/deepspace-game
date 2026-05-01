@@ -82,6 +82,25 @@ pub fn uniform_children(child: Child) -> Children {
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
+    /// Root of a wrapped Cartesian planet. Children are Cartesian (XYZ
+    /// slot order), but the renderer treats this node specially:
+    ///   - Cells outside the active region (banned cells) render no-hit.
+    ///   - Rays leaving along ±X re-enter from the opposite face.
+    ///   - Rays leaving along ±Y or ±Z exit to the parent shell.
+    ///
+    /// `width`, `height`, `depth` are top-level cell counts of the
+    /// active region in units of cells at depth `active_subdepth` below
+    /// this node. With `active_subdepth = 2`, each "active cell" spans
+    /// 1/9 of the planet's [0, 3)³ frame.
+    ///
+    /// Phase 1 hardcodes 18×9×3 with active_subdepth=2 — see
+    /// docs/design/wrapped-planet/REFINEMENTS.md Issue 1.
+    WrappedPlanet {
+        width: u16,
+        height: u16,
+        depth: u16,
+        active_subdepth: u8,
+    },
 }
 
 impl Default for NodeKind {
@@ -97,6 +116,12 @@ impl Hash for NodeKind {
         std::mem::discriminant(self).hash(state);
         match self {
             NodeKind::Cartesian => {}
+            NodeKind::WrappedPlanet { width, height, depth, active_subdepth } => {
+                width.hash(state);
+                height.hash(state);
+                depth.hash(state);
+                active_subdepth.hash(state);
+            }
         }
     }
 }
@@ -417,6 +442,23 @@ mod tests {
         let id2 = lib.insert(uniform_children(Child::Block(block::GRASS)));
         assert_ne!(id1, id2);
         assert_eq!(lib.len(), 2);
+    }
+
+    #[test]
+    fn wrapped_planet_kind_distinct_from_cartesian() {
+        let mut lib = NodeLibrary::default();
+        let children = uniform_children(Child::Block(block::STONE));
+        let a = lib.insert(children);
+        let b = lib.insert_with_kind(
+            children,
+            NodeKind::WrappedPlanet { width: 18, height: 9, depth: 3, active_subdepth: 2 },
+        );
+        assert_ne!(a, b, "WrappedPlanet must be a distinct dedup key from Cartesian");
+        let c = lib.insert_with_kind(
+            children,
+            NodeKind::WrappedPlanet { width: 18, height: 9, depth: 3, active_subdepth: 2 },
+        );
+        assert_eq!(b, c, "identical WrappedPlanet inputs must dedup");
     }
 
     #[test]

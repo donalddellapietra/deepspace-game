@@ -60,6 +60,12 @@ pub fn compute_render_frame(
                     NodeKind::Cartesian => {
                         node_id = child_id;
                     }
+                    // Phase 1.1: descend through identically. The wrap
+                    // is applied at ray-march time, not here. Phase 1.3
+                    // may customize this dispatch.
+                    NodeKind::WrappedPlanet { .. } => {
+                        node_id = child_id;
+                    }
                 }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,

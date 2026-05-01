@@ -65,6 +65,7 @@ struct Uniforms {
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
+const ROOT_KIND_WRAPPED_PLANET: u32 = 1u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -83,11 +84,20 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0=Cartesian
+    kind: u32,        // 0=Cartesian, 1=WrappedPlanet
     geom_a: u32,
-    geom_b: f32,
-    geom_c: f32,
+    geom_b: u32,
+    geom_c: u32,
 }
+
+// WrappedPlanet packs (width, height, depth | (active_subdepth << 16))
+// into geom_a/b/c. These helpers are not called yet — Phase 1.3 wires
+// them into the dispatch site. Adding them now keeps the packing
+// scheme contract documented in code.
+fn wrapped_planet_width(k: NodeKindGpu) -> u32 { return k.geom_a; }
+fn wrapped_planet_height(k: NodeKindGpu) -> u32 { return k.geom_b; }
+fn wrapped_planet_depth(k: NodeKindGpu) -> u32 { return k.geom_c & 0xFFFFu; }
+fn wrapped_planet_active_subdepth(k: NodeKindGpu) -> u32 { return (k.geom_c >> 16) & 0xFFu; }
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated

@@ -63,20 +63,30 @@ impl GpuChild {
 /// `GpuChild::node_index`.
 ///
 /// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns
-/// cleanly. `kind` discriminant: 0 = Cartesian.
+/// cleanly. `kind` discriminant: 0 = Cartesian, 1 = WrappedPlanet.
+///
+/// `geom_a/b/c` are neutral integer slots. WrappedPlanet packs
+/// `(width, height, depth | (active_subdepth << 16))`. Cartesian
+/// leaves them zero.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
     pub kind: u32,
     pub geom_a: u32,
-    pub geom_b: f32,
-    pub geom_c: f32,
+    pub geom_b: u32,
+    pub geom_c: u32,
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, geom_a: 0, geom_b: 0.0, geom_c: 0.0 },
+            NodeKind::Cartesian => Self { kind: 0, geom_a: 0, geom_b: 0, geom_c: 0 },
+            NodeKind::WrappedPlanet { width, height, depth, active_subdepth } => Self {
+                kind: 1,
+                geom_a: width as u32,
+                geom_b: height as u32,
+                geom_c: (depth as u32) | ((active_subdepth as u32) << 16),
+            },
         }
     }
 }
@@ -155,5 +165,20 @@ mod tests {
     fn from_node_kind_cartesian() {
         let k = GpuNodeKind::from_node_kind(NodeKind::Cartesian);
         assert_eq!(k.kind, 0);
+    }
+
+    #[test]
+    fn from_node_kind_wrapped_planet_packs_dims() {
+        let k = GpuNodeKind::from_node_kind(NodeKind::WrappedPlanet {
+            width: 18,
+            height: 9,
+            depth: 3,
+            active_subdepth: 2,
+        });
+        assert_eq!(k.kind, 1);
+        assert_eq!(k.geom_a, 18);
+        assert_eq!(k.geom_b, 9);
+        assert_eq!(k.geom_c & 0xFFFF, 3);
+        assert_eq!((k.geom_c >> 16) & 0xFF, 2);
     }
 }
