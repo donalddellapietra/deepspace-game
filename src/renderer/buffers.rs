@@ -302,10 +302,10 @@ impl Renderer {
             _pad_entity: [0; 3],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
-            root_radii: self.root_radii,
-            root_face_meta: self.root_face_meta,
-            root_face_bounds: self.root_face_bounds,
-            root_face_pop_pos: self.root_face_pop_pos,
+            _pad_radii: [0.0; 4],
+            _pad_face_meta: [0; 4],
+            _pad_face_bounds: [0.0; 4],
+            _pad_face_pop_pos: [0.0; 4],
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

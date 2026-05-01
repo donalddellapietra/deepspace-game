@@ -15,9 +15,7 @@
 //!                         visible instead of hidden.
 //! --disable-overlay       Keep the native window/surface path, but skip
 //!                         WKWebView creation and overlay flushing.
-//! --plain-world           Start in the Cartesian plain test world instead
-//!                         of the default sphere demo world.
-//! --sphere-world          Explicitly select the default sphere demo world.
+//! --plain-world           Start in the Cartesian plain test world.
 //! --plain-layers N        Layer count for the Cartesian plain preset.
 //!                         Default: 40.
 //! --spawn-depth N         Camera anchor starts at depth N (default 4).

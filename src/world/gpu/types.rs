@@ -58,33 +58,24 @@ impl GpuChild {
     }
 }
 
-/// Per-packed-node metadata: which `NodeKind` this node is, plus
-/// the per-kind data the shader needs to render its content.
-/// Indexed by BFS position — the same `node_index` used in
-/// `GpuChild::node_index`.
-///
-/// 16 bytes per node so the WGSL `array<NodeKindGpu>` aligns
-/// cleanly. `kind` discriminant: 0 = Cartesian, 1 = CubedSphereBody,
-/// 2 = CubedSphereFace.
+/// Per-packed-node metadata: indexed by BFS position — the same
+/// `node_index` used in `GpuChild::node_index`. Only Cartesian
+/// nodes exist in this codebase; the type is retained as a 16-byte
+/// padded slot so existing GPU buffer layouts and bind groups stay
+/// untouched.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
     pub kind: u32,
-    pub face: u32,
-    pub inner_r: f32,
-    pub outer_r: f32,
+    pub _pad0: u32,
+    pub _pad1: f32,
+    pub _pad2: f32,
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
-            NodeKind::CubedSphereBody { inner_r, outer_r } => Self {
-                kind: 1, face: 0, inner_r, outer_r,
-            },
-            NodeKind::CubedSphereFace { face } => Self {
-                kind: 2, face: face as u32, inner_r: 0.0, outer_r: 0.0,
-            },
+            NodeKind::Cartesian => Self { kind: 0, _pad0: 0, _pad1: 0.0, _pad2: 0.0 },
         }
     }
 }
@@ -163,24 +154,5 @@ mod tests {
     fn from_node_kind_cartesian() {
         let k = GpuNodeKind::from_node_kind(NodeKind::Cartesian);
         assert_eq!(k.kind, 0);
-    }
-
-    #[test]
-    fn from_node_kind_body_carries_radii() {
-        let k = GpuNodeKind::from_node_kind(NodeKind::CubedSphereBody {
-            inner_r: 0.12, outer_r: 0.45,
-        });
-        assert_eq!(k.kind, 1);
-        assert!((k.inner_r - 0.12).abs() < 1e-7);
-        assert!((k.outer_r - 0.45).abs() < 1e-7);
-    }
-
-    #[test]
-    fn from_node_kind_face_carries_face_id() {
-        let k = GpuNodeKind::from_node_kind(NodeKind::CubedSphereFace {
-            face: crate::world::cubesphere::Face::PosX,
-        });
-        assert_eq!(k.kind, 2);
-        assert_eq!(k.face, crate::world::cubesphere::Face::PosX as u32);
     }
 }

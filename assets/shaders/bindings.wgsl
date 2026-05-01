@@ -33,7 +33,8 @@ struct Uniforms {
     screen_height: f32,
     max_depth: u32,
     highlight_active: u32,
-    /// 0 = Cartesian, 1 = body root, 2 = face-space root.
+    /// 0 = Cartesian. Field retained for layout compatibility with
+    /// the CPU-side `GpuUniforms`; only Cartesian is dispatched.
     root_kind: u32,
     /// Number of ancestor ribbon entries available. When the ray
     /// exits the frame's [0, 3)³ bubble at depth 0, the shader
@@ -55,21 +56,15 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// xy = (inner_r, outer_r) in body cell's local [0, 1) frame.
-    /// Used when root_kind == 1 or 2.
-    root_radii: vec4<f32>,
-    /// x = face id, y = how many generic UVR pops remain before the
-    /// next pop crosses from face root to body.
-    root_face_meta: vec4<u32>,
-    /// Current face-frame cell bounds inside the full face:
-    /// (u_lo, v_lo, r_lo, size) in normalized [0, 1]^3.
-    root_face_bounds: vec4<f32>,
-    root_face_pop_pos: vec4<f32>,
+    /// Padding slots retained so the WGSL `Uniforms` block matches
+    /// the CPU-side `GpuUniforms` byte-for-byte. Unused.
+    _pad_radii: vec4<f32>,
+    _pad_face_meta: vec4<u32>,
+    _pad_face_bounds: vec4<f32>,
+    _pad_face_pop_pos: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
-const ROOT_KIND_BODY: u32 = 1u;
-const ROOT_KIND_FACE: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -88,10 +83,10 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0=Cartesian, 1=CubedSphereBody, 2=CubedSphereFace
-    face: u32,
-    inner_r: f32,
-    outer_r: f32,
+    kind: u32,        // 0 = Cartesian (only kind in this codebase)
+    _pad0: u32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 /// Per-frame shader-side counters. Reset to zero each frame by the

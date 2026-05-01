@@ -9,8 +9,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use super::cubesphere::Face;
-
 // ------------------------------------------------------------- constants
 
 pub const BRANCH: usize = 3;
@@ -84,13 +82,6 @@ pub fn uniform_children(child: Child) -> Children {
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
-    /// Root of a cubed-sphere body. 6 children at face-center
-    /// slots are `CubedSphereFace` subtrees. Radii are in the
-    /// body cell's local [0, 1) frame: 0 < inner_r < outer_r <= 0.5.
-    CubedSphereBody { inner_r: f32, outer_r: f32 },
-    /// One face of a cubed-sphere body. Children are interpreted
-    /// on (u_slot, v_slot, r_slot) axes.
-    CubedSphereFace { face: Face },
 }
 
 impl Default for NodeKind {
@@ -106,13 +97,6 @@ impl Hash for NodeKind {
         std::mem::discriminant(self).hash(state);
         match self {
             NodeKind::Cartesian => {}
-            NodeKind::CubedSphereBody { inner_r, outer_r } => {
-                inner_r.to_bits().hash(state);
-                outer_r.to_bits().hash(state);
-            }
-            NodeKind::CubedSphereFace { face } => {
-                face.hash(state);
-            }
         }
     }
 }
@@ -443,21 +427,6 @@ mod tests {
         assert!(lib.get(id).is_some());
         lib.ref_dec(id);
         assert!(lib.get(id).is_none());
-    }
-
-    #[test]
-    fn dedup_respects_node_kind() {
-        let mut lib = NodeLibrary::default();
-        let children = uniform_children(Child::Block(block::STONE));
-        let a = lib.insert(children);
-        let b = lib.insert_with_kind(children, NodeKind::Cartesian);
-        assert_eq!(a, b, "identical Cartesian kind should dedup");
-        let c = lib.insert_with_kind(
-            children,
-            NodeKind::CubedSphereBody { inner_r: 0.1, outer_r: 0.4 },
-        );
-        assert_ne!(a, c, "different kind must not dedup");
-        assert_eq!(lib.len(), 2);
     }
 
     #[test]

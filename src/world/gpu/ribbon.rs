@@ -171,8 +171,7 @@ fn ancestor_siblings_all_empty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::anchor::WorldPos;
-    use crate::world::tree::{empty_children, uniform_children, Child, NodeKind, NodeLibrary, CENTER_SLOT};
+    use crate::world::tree::{empty_children, uniform_children, Child, NodeLibrary, CENTER_SLOT};
     use super::super::pack::pack_tree;
 
     #[test]
@@ -291,32 +290,29 @@ mod tests {
         assert_eq!(ribbon.len(), 1);
     }
 
-    fn planet_world() -> crate::world::state::WorldState {
+    /// World with a non-uniform interior cell at CENTER and uniform-
+    /// empty siblings, used to exercise pack uniform-flatten + ribbon
+    /// pops.
+    fn pocket_world() -> crate::world::state::WorldState {
         let mut lib = NodeLibrary::default();
         let leaf_air = lib.insert(empty_children());
         let mut root_children = uniform_children(Child::Node(leaf_air));
-        let body_id = lib.insert_with_kind(
-            empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
-        );
-        root_children[CENTER_SLOT] = Child::Node(body_id);
+        let mut interior = empty_children();
+        interior[0] = Child::Block(crate::world::palette::block::STONE);
+        let interior_id = lib.insert(interior);
+        root_children[CENTER_SLOT] = Child::Node(interior_id);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
         crate::world::state::WorldState { root, library: lib }
     }
 
-    fn camera_at(xyz: [f32; 3]) -> WorldPos {
-        WorldPos::from_frame_local(&crate::world::anchor::Path::root(), xyz, 2)
-            .deepened_to(10)
-    }
-
     #[test]
-    fn ribbon_for_path_into_body_in_planet_world() {
-        let world = planet_world();
+    fn ribbon_for_path_into_pocket() {
+        let world = pocket_world();
         let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
             build_ribbon(&tree, &offsets, root_idx, &[13]);
-        assert_ne!(frame_root_idx, root_idx, "body packed at a different BFS idx");
+        assert_ne!(frame_root_idx, root_idx, "interior packed at a different BFS idx");
         assert_eq!(ribbon.len(), 1);
         assert_eq!(ribbon[0].node_idx, root_idx, "first pop is the world root");
         assert_eq!(ribbon[0].slot(), 13);
@@ -324,7 +320,7 @@ mod tests {
 
     #[test]
     fn reached_slots_truncated_when_pack_flattens_sibling() {
-        let world = planet_world();
+        let world = pocket_world();
         let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         // Slot 16 is uniform-empty Cartesian → absent from pack.
         // Descent into [16, 13] stops at depth 0.
@@ -336,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn frame_root_at_world_root_yields_empty_ribbon_in_planet_world() {
-        let world = planet_world();
+    fn frame_root_at_world_root_yields_empty_ribbon() {
+        let world = pocket_world();
         let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
             build_ribbon(&tree, &offsets, root_idx, &[]);

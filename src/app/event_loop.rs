@@ -367,10 +367,7 @@ impl App {
         if self.overlay_active() {
             self.poll_ui_commands();
             let camera_local = match self.active_frame.kind {
-                crate::app::ActiveFrameKind::Sphere(sphere) => {
-                    self.camera.position.in_frame(&sphere.body_path)
-                }
-                crate::app::ActiveFrameKind::Cartesian | crate::app::ActiveFrameKind::Body { .. } => {
+                crate::app::ActiveFrameKind::Cartesian => {
                     self.camera.position.in_frame(&self.active_frame.render_path)
                 }
             };

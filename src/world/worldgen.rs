@@ -1,21 +1,9 @@
 //! Worldgen: produces an empty space tree.
 //!
-//! Planets are no longer baked into the voxel tree — the cubed-sphere
-//! demo planet is rendered directly in the shader from its own data
-//! buffer (see `cubesphere.rs`). The voxel tree is kept as a pure
-//! "space / void" background so the raymarcher has something to hit
-//! (nothing) around the sphere.
-//!
-//! The tree still nests `TARGET_DEPTH` levels deep so zoom levels,
-//! edit depths, and LOD heuristics continue to work unchanged — we
-//! just don't fill any of it with content at worldgen time. Edits
-//! placed in empty space will still materialize correctly.
-//!
-//! This file used to contain SDF-into-voxel-tree planet generation.
-//! That model has been removed in favor of the cubed-sphere approach
-//! which handles large-scale voxel gameplay natively (blocks that
-//! bulge outward on a sphere). If you need the old behavior, look at
-//! the git history for `build_space_subtree`.
+//! The tree nests `TARGET_DEPTH` levels deep so zoom levels, edit
+//! depths, and LOD heuristics work unchanged. No content is filled
+//! in at worldgen time; edits placed in empty space materialize
+//! correctly on demand.
 
 use super::state::WorldState;
 use super::tree::*;
