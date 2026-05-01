@@ -14,10 +14,9 @@ Source of truth:
 ## One-frame walkthrough
 
 1. **Pick the render frame.** `compute_render_frame` walks up the
-   camera's anchor path until it finds a path whose node can serve
-   as a frame root — either a Cartesian ancestor at `camera_depth - K`,
-   or a `CubedSphereBody` cell the camera sits inside. Returns an
-   `ActiveFrame { render_path, logical_path, kind, node_id }`.
+   camera's anchor path until it finds a Cartesian ancestor at
+   `camera_depth - K`. Returns an `ActiveFrame { render_path,
+   logical_path, kind, node_id }`.
 
 2. **Project the camera.** `Camera::gpu_camera_at(frame)` produces a
    `GpuCamera` whose position is in the frame's `[0, 3)³` local box.
@@ -31,8 +30,7 @@ Source of truth:
      kind discriminant, face, inner/outer radii).
 
    Cartesian subtrees that subtend fewer than LOD_THRESHOLD pixels are
-   flattened to their `representative_block`. Spheres are exempt —
-   their DDA is cheap and their silhouette must be preserved.
+   flattened to their `representative_block`.
 
 4. **Build the ribbon.** `gpu::ribbon::build_ribbon` emits the chain
    of ancestors from the frame's *parent* up to the world root. When a
@@ -59,14 +57,10 @@ All WGSL in `assets/shaders/` is stitched together by
 
 - **`main.wgsl`** — entry. Vertex stage draws the quad; fragment
   stage builds the primary ray and calls `march`.
-- **`march.wgsl`** — unified tree walker. Switches on `NodeKind` at
-  each descent: Cartesian DDA, or cubed-sphere dispatch.
+- **`march.wgsl`** — Cartesian tree walker.
 - **`tree.wgsl`** — child access, slot math, representative-block
   LOD fallback when a subtree can't be descended further.
-- **`sphere.wgsl`**, **`face_math.wgsl`**, **`face_walk.wgsl`** —
-  cubed-sphere DDA: one face at a time, with face-seam crossings
-  handled by axis remapping. See [cubed-sphere.md](cubed-sphere.md).
-- **`ray_prim.wgsl`** — ray–box, ray–sphere intersections.
+- **`ray_prim.wgsl`** — ray–box intersection.
 - **`bindings.wgsl`** — bind-group layouts shared by Rust and WGSL.
 
 All shaders march in the frame's local coordinates. None of them know
@@ -77,7 +71,7 @@ the frame's *depth in the world tree* — that's the point.
 | Buffer | Size | Purpose |
 |---|---|---|
 | `tree` | N × 8 B | packed children (tag, block, node_index) |
-| `node_kinds` | M × 16 B | per-node kind + sphere radii / face |
+| `node_kinds` | M × 16 B | per-node kind |
 | `ribbon` | R × 8 B | ancestor chain for frame-exit pops |
 | `camera` | 96 B | frame-local pos, basis vectors, fov |
 | `palette` | 256 × 4 B | block-type colors |
@@ -85,24 +79,9 @@ the frame's *depth in the world tree* — that's the point.
 
 ## Frame selection
 
-`compute_render_frame` in `src/app/frame.rs` returns one of three
-`ActiveFrameKind`s:
-
-- **`Cartesian`** — render root is a plain 3×3×3 Cartesian node.
-  `render_path == logical_path`.
-- **`Body { inner_r, outer_r }`** — render root is a
-  `CubedSphereBody`. Rays first intersect the body sphere; inside,
-  the shader dispatches into face DDA.
-- **`Sphere(SphereFrame)`** — render root stays at the containing
-  body, but the player's `logical_path` is inside a specific face
-  subtree. The shader walks the face with an explicit `(u_min, v_min,
-  r_min, size)` window. This is what lets the player stand on a
-  planet surface without the body cell blowing the camera's f32
-  budget.
-
-`render_path` drives the GPU ribbon. `logical_path` drives editing,
-highlight, and UI — it can be deeper than `render_path` when the
-player is inside a face subtree.
+`compute_render_frame` in `src/app/frame.rs` returns an
+`ActiveFrameKind::Cartesian` whose render root is a plain 3×3×3
+Cartesian node. `render_path == logical_path`.
 
 ## Precision budget
 

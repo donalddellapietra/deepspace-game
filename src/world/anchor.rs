@@ -169,11 +169,6 @@ impl std::fmt::Debug for Path {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     None,
-    SphereEntry { body_path: Path },
-    SphereExit { body_path: Path },
-    FaceEntry { body_path: Path },
-    FaceExit { body_path: Path },
-    CubeSeam { body_path: Path },
 }
 
 // ------------------------------------------------------------ WorldPos
@@ -781,7 +776,7 @@ mod tests {
             );
         }
         assert!(oc_chained[1].abs() > 0.5,
-            "oc.y collapsed to 0 after zoom chain — sphere would be invisible");
+            "oc.y collapsed to 0 after zoom chain");
     }
 
     #[test]

@@ -134,8 +134,8 @@ impl EntityStore {
     /// entities can't drift off the surface over time. Spawn places
     /// them on sea level; this keeps them there without a per-tick
     /// snap (which would walk the anchor path twice per entity).
-    /// `None` (sphere / fractal worlds) applies full 3-axis velocity
-    /// and entities fly freely.
+    /// `None` (fractal worlds) applies full 3-axis velocity and
+    /// entities fly freely.
     ///
     /// CPU cost is O(N). At 10k entities × 60fps = 600k `add_local`
     /// calls/sec — trivial; rendering, not motion, is the bottleneck.

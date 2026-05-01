@@ -71,8 +71,7 @@ impl App {
             );
         }
         let aabb = tree_hit.as_ref().map(|hit| match self.active_frame.kind {
-            ActiveFrameKind::Sphere(_) => aabb::hit_aabb_body_local(&self.world.library, hit),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
+            ActiveFrameKind::Cartesian => {
                 aabb::hit_aabb_in_frame_local(hit, &self.active_frame.render_path)
             }
         });

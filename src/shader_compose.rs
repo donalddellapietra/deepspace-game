@@ -15,10 +15,7 @@ use std::collections::HashSet;
 const SOURCES: &[(&str, &str)] = &[
     ("bindings.wgsl",  include_str!("../assets/shaders/bindings.wgsl")),
     ("tree.wgsl",      include_str!("../assets/shaders/tree.wgsl")),
-    ("face_math.wgsl", include_str!("../assets/shaders/face_math.wgsl")),
     ("ray_prim.wgsl",  include_str!("../assets/shaders/ray_prim.wgsl")),
-    ("face_walk.wgsl", include_str!("../assets/shaders/face_walk.wgsl")),
-    ("sphere.wgsl",    include_str!("../assets/shaders/sphere.wgsl")),
     ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
     ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
     ("taa_resolve.wgsl", include_str!("../assets/shaders/taa_resolve.wgsl")),
@@ -88,7 +85,6 @@ mod tests {
         assert!(src.contains("@fragment"), "fs_main missing");
         assert!(src.contains("fn march("), "march missing");
         assert!(src.contains("fn march_cartesian("), "march_cartesian missing");
-        assert!(src.contains("fn sphere_in_cell("), "sphere_in_cell missing");
         assert!(src.contains("struct Uniforms"), "Uniforms missing");
         assert!(!src.contains("#include"), "directive leaked into output");
     }

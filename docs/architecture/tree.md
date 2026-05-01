@@ -41,22 +41,15 @@ slots, recursively.
 ```rust
 pub enum NodeKind {
     Cartesian,
-    CubedSphereBody { inner_r: f32, outer_r: f32 },
-    CubedSphereFace { face: Face },
 }
 ```
 
 - **Cartesian** — default. Children fill a 3×3×3 grid; slot indices
   are row-major `z*9 + y*3 + x`.
-- **CubedSphereBody** — a node whose six face-center slots are
-  `CubedSphereFace` subtrees. `inner_r` and `outer_r` are in the
-  body cell's local `[0, 1)` frame.
-- **CubedSphereFace** — children are indexed on `(u, v, r)` axes; the
-  ray-march dispatches to a sphere-aware walker when it descends into
-  these. See [cubed-sphere.md](cubed-sphere.md).
 
-`NodeKind` is part of the content-addressed hash. Two nodes with
-identical children but different kinds do *not* dedup.
+`NodeKind` is part of the content-addressed hash. The single
+Cartesian variant is reserved for future kinds (e.g. wrapped-planet
+nodes) without breaking the dedup contract.
 
 ## Slot encoding
 

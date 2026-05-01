@@ -153,8 +153,8 @@ impl App {
     ///
     /// On worlds with a defined sea level (`entity_surface_y`), the
     /// grid is snapped to that Y — so every entity lands on the
-    /// ground regardless of where the camera is. On sphere/fractal
-    /// worlds we fall back to the camera's Y as before.
+    /// ground regardless of where the camera is. On fractal worlds
+    /// we fall back to the camera's Y as before.
     fn spawn_grid(&mut self, subtree_id: NodeId, n: u32) {
         let cam_anchor = self.camera.position.anchor;
         let anchor_depth = cam_anchor.depth();

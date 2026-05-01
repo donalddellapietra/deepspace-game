@@ -18,8 +18,7 @@ can zoom from a continent-sized node down through 63 levels of
 subdivision without changing subsystems.
 
 - **Tree** — `src/world/tree.rs`. Content-addressed immutable nodes
-  with `Cartesian`, `CubedSphereBody`, and `CubedSphereFace` kinds.
-  See [tree.md](tree.md).
+  with the `Cartesian` kind. See [tree.md](tree.md).
 
 - **Coordinates** — `src/world/anchor.rs`. Every position is a `Path`
   (symbolic, exact) plus an `offset ∈ [0, 1)³` (f32, local). f32 never
@@ -37,10 +36,6 @@ subdivision without changing subsystems.
 - **Zoom** — mouse wheel moves the anchor up or down the tree.
   Anchor-depth change is implemented; side-effect physics (walk
   speed, gravity scaling) is not. See [zoom.md](zoom.md).
-
-- **Cubed-sphere** — Planetary geometry lives in `CubedSphereBody`
-  nodes and six `CubedSphereFace` subtrees. See
-  [cubed-sphere.md](cubed-sphere.md).
 
 - **Scale** — Reference table of what each layer represents in
   approximate real-world units. See [scale.md](scale.md).

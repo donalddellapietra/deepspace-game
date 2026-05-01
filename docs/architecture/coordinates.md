@@ -46,19 +46,9 @@ node's three children span `[0, 3)` on each axis in the local frame
 the renderer uses. It is **not** an absolute-world scale measurement.
 See [../principles/no-absolute-coordinates.md](../principles/no-absolute-coordinates.md).
 
-## Offset interpretation depends on NodeKind
+## Offset interpretation
 
-The semantic axes of `offset` track the deepest node's kind:
-
-- `Cartesian` / `CubedSphereBody`: offset is `(x, y, z)` in Cartesian
-  local coords.
-- `CubedSphereFace`: offset is `(u, v, r)` in the face's equal-angle
-  + radial frame.
-
-When the anchor descends into or exits a face subtree, the offset's
-meaning changes. The coordinate primitives handle the rewrite; game-
-level effects (camera up-vector, motion feel) are handled by
-transition callbacks (see below).
+`offset` is `(x, y, z)` in Cartesian local coords for every node.
 
 ## Primitives
 
@@ -142,10 +132,8 @@ small, moving at the same speed gets me through less world."
 This model supersedes the old world-XYZ plumbing:
 
 - No `Camera.pos: [f32; 3]` — gone.
-- No `SphericalPlanet` / `cs_planet` — the sphere is just a node with
-  `NodeKind::CubedSphereBody` in the tree.
-- No separate `edit_depth` / `visual_depth` / `cs_edit_depth` — edit
-  depth is the depth the raycast resolves to. Zoom in, hit deeper
-  cells; zoom out, hit shallower chunks.
+- No separate `edit_depth` / `visual_depth` — edit depth is the depth
+  the raycast resolves to. Zoom in, hit deeper cells; zoom out, hit
+  shallower chunks.
 - No `to_world_xyz` / `from_world_xyz` helpers. See
   [../principles/no-absolute-coordinates.md](../principles/no-absolute-coordinates.md).

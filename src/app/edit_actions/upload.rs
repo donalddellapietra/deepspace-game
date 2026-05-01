@@ -295,17 +295,6 @@ impl App {
             renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
-                ActiveFrameKind::Sphere(sphere) => {
-                    renderer.set_root_kind_face(
-                        sphere.inner_r, sphere.outer_r,
-                        sphere.face as u32, sphere.face_depth,
-                        [sphere.face_u_min, sphere.face_v_min, sphere.face_r_min, sphere.face_size],
-                        self.camera.position.in_frame(&sphere.body_path),
-                    );
-                }
-                ActiveFrameKind::Body { inner_r, outer_r } => {
-                    renderer.set_root_kind_body(inner_r, outer_r);
-                }
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
             }
         }

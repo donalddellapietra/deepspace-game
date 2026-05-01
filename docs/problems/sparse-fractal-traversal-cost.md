@@ -138,7 +138,7 @@ Per Cartesian node, currently unused bits:
 
 - 5 bits in occupancy u32's high bits
 - 4 bits per packed child (in the `_pad` field beyond the 12-bit content_aabb)
-- 96 bits in the node_kinds entry (unused for Cartesian; only CubedSphereBody/Face use them)
+- 96 bits in the node_kinds entry (unused for Cartesian)
 - 6 bits per child in the tag byte
 
 For a 7-slot Jerusalem node: 171 free bits.

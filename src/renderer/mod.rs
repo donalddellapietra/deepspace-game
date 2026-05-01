@@ -2,9 +2,7 @@
 //!
 //! Five buffers: tree (per-child), node_kinds (per-node), camera,
 //! palette, uniforms, plus an ancestor-ribbon storage buffer. The
-//! shader walks the unified tree and dispatches on `NodeKind` when
-//! descending — there are no parallel buffers for sphere content,
-//! no `cs_*` uniforms, and no absolute-coord shimming.
+//! shader walks the unified Cartesian tree.
 
 mod buffers;
 mod draw;
@@ -45,8 +43,6 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// `root_kind` discriminant — must mirror the WGSL `RootKind*`
 /// constants in `bindings.wgsl`.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
-pub const ROOT_KIND_BODY: u32 = 1;
-pub const ROOT_KIND_FACE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -57,10 +53,7 @@ pub struct GpuUniforms {
     pub screen_height: f32,
     pub max_depth: u32,
     pub highlight_active: u32,
-    /// 0 = Cartesian, 1 = CubedSphereBody. Mirrors the `RootKind*`
-    /// constants. When 1, the shader dispatches into sphere DDA at
-    /// start-of-march; the body fills the `[0, 3)³` frame, and
-    /// `root_inner_r`/`root_outer_r` give the body's radii.
+    /// Always 0 (Cartesian). Reserved for future root-kind dispatch.
     pub root_kind: u32,
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
@@ -72,10 +65,8 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Body radii (used iff `root_kind == 1`). Stored in the body
-    /// cell's local `[0, 1)` frame; the shader scales by 3.0
-    /// (= WORLD_SIZE) to get shader-frame units.
-    pub root_radii: [f32; 4],  // [inner_r, outer_r, _, _]
+    /// Reserved (was: body radii). Unused by the Cartesian shader.
+    pub root_radii: [f32; 4],
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_face_pop_pos: [f32; 4],
@@ -277,34 +268,6 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    /// Set the frame-root NodeKind to CubedSphereBody with radii in
-    /// the body cell's local `[0, 1)` frame.
-    pub fn set_root_kind_body(&mut self, inner_r: f32, outer_r: f32) {
-        self.root_kind = ROOT_KIND_BODY;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.write_uniforms();
-    }
-
-    pub fn set_root_kind_face(
-        &mut self,
-        inner_r: f32,
-        outer_r: f32,
-        face_id: u32,
-        subtree_depth: u32,
-        bounds: [f32; 4],
-        pop_pos: [f32; 3],
-    ) {
-        self.root_kind = ROOT_KIND_FACE;
-        self.root_radii = [inner_r, outer_r, 0.0, 0.0];
-        self.root_face_meta = [face_id, subtree_depth, 0, 0];
-        self.root_face_bounds = bounds;
-        self.root_face_pop_pos = [pop_pos[0], pop_pos[1], pop_pos[2], 0.0];
         self.write_uniforms();
     }
 

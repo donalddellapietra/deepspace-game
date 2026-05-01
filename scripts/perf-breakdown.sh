@@ -9,7 +9,7 @@
 # Matrix (default: all):
 #   resolution    — sweep harness dims at fixed spawn_depth
 #   depth         — sweep spawn_depth at fixed 1280x720
-#   world         — plain vs sphere at fixed spawn_depth + 1280x720
+#   world         — plain at fixed spawn_depth + 1280x720
 #
 # Each run:
 #   - 60 rendered frames, warmup=10
@@ -70,7 +70,6 @@ fi
 if [ "$SEL" = "world" ] || [ "$SEL" = "all" ]; then
   echo "### MATRIX: world preset (1280x720, spawn_depth=6) ###"
   run "world_plain" --harness-width 1280 --harness-height 720 --spawn-depth 6
-  run "world_sphere" --sphere-world --harness-width 1280 --harness-height 720 --spawn-depth 6
 fi
 
 if [ "$SEL" = "grassland" ] || [ "$SEL" = "all" ]; then

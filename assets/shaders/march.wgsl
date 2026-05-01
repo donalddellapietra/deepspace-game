@@ -1,7 +1,6 @@
 #include "bindings.wgsl"
 #include "tree.wgsl"
 #include "ray_prim.wgsl"
-#include "sphere.wgsl"
 
 // Cell-packing helpers. Cell coords at each depth range -1..=3
 // (legal 0..=2 plus ±1 over-step to trigger pop). Pack +1-shifted
@@ -59,8 +58,8 @@ fn path_mask_conservative(entry_cell: vec3<i32>, step: vec3<i32>) -> u32 {
 }
 
 // Entity subtree walker. Cartesian DDA walking a standalone voxel
-// subtree — no sphere/face/ribbon dispatch, no AABB side-buffer,
-// no beam-prepass coupling. Called from `march_cartesian`'s tag==3
+// subtree — no ribbon dispatch, no AABB side-buffer, no
+// beam-prepass coupling. Called from `march_cartesian`'s tag==3
 // branch after the ray has been transformed into the entity's
 // `[0, 3)³` local frame. WGSL's no-recursion rule forces this to
 // be a separate function rather than a re-entrant call to
@@ -458,8 +457,8 @@ fn march_cartesian(
             return result;
         } else if ENABLE_ENTITIES && tag == 3u {
             // tag=3 — EntityRef. Guarded by the compile-time
-            // `ENABLE_ENTITIES` override: fractal / sphere preset
-            // worlds never produce tag=3 children, so the shader
+            // `ENABLE_ENTITIES` override: fractal preset worlds
+            // never produce tag=3 children, so the shader
             // compiler DCEs this branch + the call into
             // `march_entity_subtree` entirely. Measured on
             // Jerusalem nucleus 2560x1440: ENABLE_ENTITIES=false
@@ -543,9 +542,7 @@ fn march_cartesian(
             // ribbon pop, skip the SLOT we already traversed in the
             // inner shell. Uses slot index (not node_idx) so it works
             // correctly in deduplicated trees where siblings share the
-            // same packed node. Checked BEFORE the kind lookup so a
-            // ribbon-pop landing on a sphere-body slot doesn't
-            // re-dispatch the sphere DDA we already traversed.
+            // same packed node.
             let cell_slot = u32(cell.x) + u32(cell.y) * 3u + u32(cell.z) * 9u;
             if depth == 0u && cell_slot == skip_slot {
                 let m_skip = min_axis_mask(cur_side_dist);
@@ -555,30 +552,6 @@ fn march_cartesian(
                 continue;
             }
 
-            let kind = node_kinds[child_idx].kind;
-            if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
-
-            if kind == 1u {
-                // CubedSphereBody: dispatch sphere DDA in this body's cell.
-                let body_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-                let body_size = cur_cell_size;
-                let inner_r = node_kinds[child_idx].inner_r;
-                let outer_r = node_kinds[child_idx].outer_r;
-                if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 2u; }
-                let sph = sphere_in_cell(
-                    child_idx, body_origin, body_size,
-                    inner_r, outer_r, ray_origin, ray_dir,
-                );
-                if sph.hit {
-                    return sph;
-                }
-                // Sphere missed — advance Cartesian DDA past this cell.
-                let m_sph = min_axis_mask(cur_side_dist);
-                s_cell[depth] = pack_cell(cell + vec3<i32>(m_sph) * step);
-                cur_side_dist += m_sph * delta_dist * cur_cell_size;
-                normal = -vec3<f32>(step) * m_sph;
-                continue;
-            }
             // Empty-representative fast path: when the packed
             // child's representative_block is 255, the subtree has
             // no non-empty content (either uniform-empty deeper in
@@ -795,24 +768,18 @@ fn march_cartesian(
     return result;
 }
 
-// Top-level march. Dispatches the current frame's DDA on its
-// NodeKind (Cartesian or sphere body), then on miss pops to the
-// next ancestor in the ribbon and continues. When ribbon is
-// exhausted, returns sky (hit=false).
+// Top-level march. Dispatches the current frame's Cartesian DDA,
+// then on miss pops to the next ancestor in the ribbon and
+// continues. When the ribbon is exhausted, returns sky (hit=false).
 //
 // Each pop transforms the ray into the parent's frame coords:
-// `parent_pos = slot_xyz + frame_pos / 3`, `parent_dir = frame_dir / 3`.
-// The parent's frame cell still spans `[0, 3)³` in its own
-// coords, so the inner DDA is unchanged — only the ray is
-// rescaled and the buffer node_idx swapped.
+// `parent_pos = slot_xyz + frame_pos / 3`. ray_dir is kept at
+// camera-frame magnitude across pops; t is frame-local inside
+// march_cartesian and converted back to camera-frame t on hit.
 fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var ray_origin = world_ray_origin;
-    var ray_dir = world_ray_dir;
+    let ray_dir = world_ray_dir;
     var current_idx = uniforms.root_index;
-    var current_kind = uniforms.root_kind;
-    var inner_r = uniforms.root_radii.x;
-    var outer_r = uniforms.root_radii.y;
-    var cur_face_bounds = uniforms.root_face_bounds;
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
 
@@ -827,28 +794,16 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
-        var r: HitResult;
-        if current_kind == ROOT_KIND_BODY {
-            let body_origin = vec3<f32>(0.0);
-            let body_size = 3.0;
-            r = sphere_in_cell(
-                current_idx, body_origin, body_size,
-                inner_r, outer_r, ray_origin, ray_dir,
-            );
-        } else if current_kind == ROOT_KIND_FACE {
-            r = march_face_root(current_idx, ray_origin, ray_dir, cur_face_bounds);
-        } else {
-            // Cartesian frame: no depth cap beyond the hardware
-            // stack ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is
-            // the sole visual LOD gate — rays stop descending
-            // when cells fall below the pixel floor, which is
-            // cubic-LOD by construction (cell_size / ray_dist
-            // scales correctly across ribbon-pops since both are
-            // in the same frame-local units). The empty-subtree
-            // fast-path at `march_cartesian` (child_bt == 255)
-            // handles uniform-empty early exit.
-            r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
-        }
+        // Cartesian frame: no depth cap beyond the hardware
+        // stack ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is
+        // the sole visual LOD gate — rays stop descending
+        // when cells fall below the pixel floor, which is
+        // cubic-LOD by construction (cell_size / ray_dist
+        // scales correctly across ribbon-pops since both are
+        // in the same frame-local units). The empty-subtree
+        // fast-path at `march_cartesian` (child_bt == 255)
+        // handles uniform-empty early exit.
+        var r = march_cartesian(current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot);
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;
@@ -875,114 +830,48 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if ribbon_level >= uniforms.ribbon_count {
             break;
         }
-        if current_kind == ROOT_KIND_FACE {
-            let body_pop_level = uniforms.root_face_meta.y;
-            if ribbon_level < body_pop_level {
-                let entry = ribbon[ribbon_level];
-                if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
-                let s = entry.slot_bits & RIBBON_SLOT_MASK;
-                let sx = i32(s % 3u);
-                let sy = i32((s / 3u) % 3u);
-                let sz = i32(s / 9u);
-                let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
-                let old_size = cur_face_bounds.w;
-                cur_face_bounds = vec4<f32>(
-                    cur_face_bounds.x - slot_off.x * old_size,
-                    cur_face_bounds.y - slot_off.y * old_size,
-                    cur_face_bounds.z - slot_off.z * old_size,
-                    old_size * 3.0,
-                );
-                cur_scale = cur_scale * (1.0 / 3.0);
-                current_idx = entry.node_idx;
-                ribbon_level = ribbon_level + 1u;
-                continue;
-            }
-            if body_pop_level >= uniforms.ribbon_count {
-                break;
-            }
-            let body_entry = ribbon[body_pop_level];
-            current_idx = body_entry.node_idx;
-            current_kind = ROOT_KIND_BODY;
-            inner_r = node_kinds[current_idx].inner_r;
-            outer_r = node_kinds[current_idx].outer_r;
-            if ENABLE_STATS {
-                ray_loads_ribbon = ray_loads_ribbon + 1u;
-                ray_loads_kinds = ray_loads_kinds + 2u;
-            }
-            ribbon_level = body_pop_level + 1u;
-        } else {
-            // Single-level ribbon pop with empty-shell fast-exit.
-            //
-            // Pop exactly one ancestor entry, transform the ray into
-            // the ancestor's [0,3)³ frame, then fall through to the
-            // outer loop which re-enters march_cartesian. When the
-            // ribbon entry's `siblings_all_empty` flag is set, every
-            // slot of the ancestor other than the one we popped out
-            // of is tag=0 — so the DDA would only traverse empty
-            // cells. Skip it: ray_box to the shell exit, advance
-            // ray_origin, and let the outer loop pop again.
-            //
-            // This is the "zoomed-in inside empty sky" fast path.
-            // Without it, each empty ancestor shell costs ~3–5 empty
-            // DDA iterations, compounding linearly with ribbon depth
-            // (10+ shells in the regressed workload).
-            if ribbon_level < uniforms.ribbon_count {
-                let entry = ribbon[ribbon_level];
-                if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
-                let s = entry.slot_bits & RIBBON_SLOT_MASK;
-                let sx = i32(s % 3u);
-                let sy = i32((s / 3u) % 3u);
-                let sz = i32(s / 9u);
-                let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
-                skip_slot = s;
-                // Ray pop: rescale origin into parent's [0,3)³, keep
-                // ray_dir at camera-frame magnitude. The old scheme
-                // divided ray_dir by 3 on every pop, which kept `t`
-                // invariant across frames but caused ray_dir to
-                // underflow after ~18 pops (3^-18 ≈ 6e-9). With
-                // ray_dir preserved, each frame's DDA runs with O(1)
-                // precision; t inside march_cartesian is frame-local.
-                // Camera-frame t is recovered on hit return as
-                // t_cam = t_frame / cur_scale.
-                ray_origin = slot_off + ray_origin / 3.0;
-                cur_scale = cur_scale * (1.0 / 3.0);
-                current_idx = entry.node_idx;
-                ribbon_level = ribbon_level + 1u;
 
-                let k = node_kinds[current_idx].kind;
-                if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
-                if k == 1u {
-                    current_kind = ROOT_KIND_BODY;
-                    inner_r = node_kinds[current_idx].inner_r;
-                    outer_r = node_kinds[current_idx].outer_r;
-                    if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 2u; }
-                } else {
-                    current_kind = ROOT_KIND_CARTESIAN;
-                    // Empty-shell fast exit: if every sibling is
-                    // empty, skip this shell's DDA and advance the
-                    // ray to the shell's exit boundary. Next outer
-                    // iteration will pop again.
-                    let siblings_all_empty =
-                        (entry.slot_bits & RIBBON_SIBLINGS_ALL_EMPTY) != 0u;
-                    if siblings_all_empty {
-                        let inv_dir_shell = vec3<f32>(
-                            select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
-                            select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
-                            select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
-                        );
-                        let shell_hit = ray_box(
-                            ray_origin, inv_dir_shell,
-                            vec3<f32>(0.0), vec3<f32>(3.0),
-                        );
-                        if shell_hit.t_exit > 0.0 {
-                            // Advance past the shell boundary so the
-                            // next pop lands us OUTSIDE this shell's
-                            // [0,3)³ in grandparent coords.
-                            ray_origin = ray_origin + ray_dir * (shell_hit.t_exit + 0.001);
-                            if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
-                        }
-                    }
-                }
+        // Single-level ribbon pop with empty-shell fast-exit.
+        //
+        // Pop exactly one ancestor entry, transform the ray into
+        // the ancestor's [0,3)³ frame, then fall through to the
+        // outer loop which re-enters march_cartesian. When the
+        // ribbon entry's `siblings_all_empty` flag is set, every
+        // slot of the ancestor other than the one we popped out
+        // of is tag=0 — so the DDA would only traverse empty
+        // cells. Skip it: ray_box to the shell exit, advance
+        // ray_origin, and let the outer loop pop again.
+        let entry = ribbon[ribbon_level];
+        if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
+        let s = entry.slot_bits & RIBBON_SLOT_MASK;
+        let sx = i32(s % 3u);
+        let sy = i32((s / 3u) % 3u);
+        let sz = i32(s / 9u);
+        let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
+        skip_slot = s;
+        ray_origin = slot_off + ray_origin / 3.0;
+        cur_scale = cur_scale * (1.0 / 3.0);
+        current_idx = entry.node_idx;
+        ribbon_level = ribbon_level + 1u;
+
+        // Empty-shell fast exit: if every sibling is empty, skip
+        // this shell's DDA and advance the ray to the shell's exit
+        // boundary. Next outer iteration will pop again.
+        let siblings_all_empty =
+            (entry.slot_bits & RIBBON_SIBLINGS_ALL_EMPTY) != 0u;
+        if siblings_all_empty {
+            let inv_dir_shell = vec3<f32>(
+                select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+                select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+                select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+            );
+            let shell_hit = ray_box(
+                ray_origin, inv_dir_shell,
+                vec3<f32>(0.0), vec3<f32>(3.0),
+            );
+            if shell_hit.t_exit > 0.0 {
+                ray_origin = ray_origin + ray_dir * (shell_hit.t_exit + 0.001);
+                if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             }
         }
     }

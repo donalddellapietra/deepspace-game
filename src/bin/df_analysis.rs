@@ -611,9 +611,8 @@ fn expand_into_grid(
             continue;
         }
         if tag != 2 {
-            // Unknown tag (sphere body / face / compact). Treat as
-            // occupied sub-cube conservatively so DF doesn't over-
-            // report skip past it.
+            // Unknown tag. Treat as occupied sub-cube conservatively
+            // so DF doesn't over-report skip past it.
             fill_cube(grid, grid_size, cell_origin, sub_stride);
             continue;
         }

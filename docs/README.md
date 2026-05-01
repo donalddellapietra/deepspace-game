@@ -23,7 +23,6 @@ doc is wrong.
 - [architecture/rendering.md](architecture/rendering.md) — GPU ray march, render frame, ribbon pop.
 - [architecture/editing.md](architecture/editing.md) — CPU raycast + `propagate_edit`.
 - [architecture/zoom.md](architecture/zoom.md) — zoom = anchor depth change.
-- [architecture/cubed-sphere.md](architecture/cubed-sphere.md) — planetary bodies.
 - [architecture/scale.md](architecture/scale.md) — per-layer real-world scale reference.
 
 ## Design (not yet implemented)

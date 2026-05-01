@@ -1,13 +1,7 @@
 // Ray march shader for base-3 recursive voxel tree.
-//
-// One unified tree walker. When it descends into a Node child whose
-// NodeKind is CubedSphereBody, it switches to the cubed-sphere DDA
-// running in that body cell's local frame — no parallel uniforms,
-// no separate face_root buffers, no absolute world coords.
 
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
-#include "sphere.wgsl"
 #include "march.wgsl"
 
 struct VertexOutput {

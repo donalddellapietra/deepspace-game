@@ -14,13 +14,10 @@ Source of truth:
 
 The CPU ray-march runs in the **same frame** as the GPU render so that
 the cell under the crosshair is the same cell the shader shaded. It
-lives in two files:
+lives in:
 
 - `raycast/cartesian.rs` — iterative stack-based Cartesian DDA over
-  the unified tree. Dispatches to `sphere::cs_raycast_in_body` when it
-  descends into a `CubedSphereBody` child.
-- `raycast/sphere.rs` — cubed-sphere DDA. Step-based march; accuracy
-  is tuned for cursor targeting, not rendering fidelity.
+  the unified tree.
 
 Entry points:
 
@@ -51,11 +48,9 @@ pub struct HitInfo {
   the ray stopped at.
 - `face` is which face of the hit cell was crossed; place resolves
   the adjacent cell by `slot + face-delta`.
-- `place_path` is an **explicit placement path**. Sphere hits carry
-  one — the last empty cell the ray traversed before hitting the
-  block — because face-subtree `(u, v, r)` slots don't admit simple
-  `face → xyz-delta` arithmetic. Cartesian hits leave `place_path =
-  None` and let `place_child` derive the neighbor.
+- `place_path` is an optional explicit placement path. Cartesian
+  hits leave `place_path = None` and let `place_child` derive the
+  neighbor from `face`.
 
 ## `propagate_edit`
 

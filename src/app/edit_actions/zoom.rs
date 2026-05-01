@@ -1,11 +1,7 @@
 //! Zoom: depth accessors + camera-aware frame selection + apply.
 
-use crate::world::anchor::{Path, WORLD_SIZE};
-use crate::world::cubesphere::FACE_SLOTS;
-use crate::world::cubesphere_local;
-
 use crate::app::frame;
-use crate::app::{ActiveFrame, ActiveFrameKind, App, RENDER_FRAME_CONTEXT, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
+use crate::app::{ActiveFrame, ActiveFrameKind, App, RENDER_FRAME_K, RENDER_FRAME_MAX_DEPTH};
 use super::{
     FRAME_FOCUS_MIN_PIXELS, FRAME_VISUAL_MIN_PIXELS, MAX_FOCUSED_FRAME_CAMERA_EXTENT,
     MAX_LOCAL_VISUAL_DEPTH,
@@ -19,17 +15,6 @@ impl App {
         // Edit depth = anchor depth. The CPU raycast's pop loop
         // ensures the ray reaches the surface at this resolution.
         self.anchor_depth().max(1)
-    }
-
-    /// Sphere face-subtree edit depth.
-    ///
-    /// Use the same edit depth for both paths. The body/face wrappers
-    /// are structural node kinds, not a reason to coarsen the user's
-    /// interaction scale — the older cross-layer asymmetry
-    /// (`anchor_depth - 4` vs `-1`) made placed blocks balloon as the
-    /// player went deeper.
-    pub(in crate::app) fn cs_edit_depth(&self) -> u32 {
-        self.edit_depth()
     }
 
     pub(in crate::app) fn visual_depth(&self) -> u32 {
@@ -54,125 +39,19 @@ impl App {
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => {
-                let cam_body = self.camera.position.in_frame(&sphere.body_path);
-                if let Some(face_point) = cubesphere_local::body_point_to_face_space(
-                    cam_body,
-                    sphere.inner_r,
-                    sphere.outer_r,
-                    WORLD_SIZE,
-                ) {
-                    let scale = WORLD_SIZE / sphere.face_size;
-                    [
-                        (face_point.un - sphere.face_u_min) * scale,
-                        (face_point.vn - sphere.face_v_min) * scale,
-                        (face_point.rn - sphere.face_r_min) * scale,
-                    ]
-                } else {
-                    [f32::NAN; 3]
-                }
-            }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
+            ActiveFrameKind::Cartesian => self.camera.position.in_frame(&frame.render_path),
         };
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
-                    ..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
+                    ..=crate::world::anchor::WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
                     .contains(&v)
             })
     }
 
-    fn camera_local_sphere_focus_path(&self, desired_depth: u8) -> Option<Path> {
-        let body_path = self.planet_path?;
-        let mut node_id = self.world.root;
-        for &slot in body_path.as_slice() {
-            let Some(node) = self.world.library.get(node_id) else {
-                eprintln!("sphere_focus: missing node for path {:?} at node_id={node_id}", body_path.as_slice());
-                return None;
-            };
-            match node.children[slot as usize] {
-                crate::world::tree::Child::Node(child_id) => node_id = child_id,
-                other => {
-                    eprintln!(
-                        "sphere_focus: non-node child at slot={} for body_path={:?}: {:?}",
-                        slot, body_path.as_slice(), other
-                    );
-                    return None;
-                }
-            }
-        }
-        let Some(body) = self.world.library.get(node_id) else {
-            eprintln!("sphere_focus: missing body node_id={node_id}");
-            return None;
-        };
-        let crate::world::tree::NodeKind::CubedSphereBody { inner_r, outer_r } = body.kind else {
-            eprintln!("sphere_focus: path {:?} resolved to non-body kind {:?}", body_path.as_slice(), body.kind);
-            return None;
-        };
-        let cam_body = self.camera.position.in_frame(&body_path);
-        let ray_dir = crate::world::sdf::normalize(self.camera.forward());
-        let Some(t) = cubesphere_local::ray_outer_sphere_hit(cam_body, ray_dir, outer_r, WORLD_SIZE) else {
-            eprintln!(
-                "sphere_focus: miss cam_body={:?} ray_dir={:?} body_path={:?}",
-                cam_body, ray_dir, body_path.as_slice(),
-            );
-            return None;
-        };
-        let hit_body = crate::world::sdf::add(cam_body, crate::world::sdf::scale(ray_dir, t));
-        let Some(face_point) = cubesphere_local::body_point_to_face_space(
-            hit_body, inner_r, outer_r, WORLD_SIZE,
-        ) else {
-            eprintln!("sphere_focus: degenerate hit_body={:?}", hit_body);
-            return None;
-        };
-        let face = face_point.face;
-        let mut path = body_path;
-        path.push(FACE_SLOTS[face as usize] as u8);
-
-        let eps = 1e-5f32;
-        let mut un = face_point.un.clamp(eps, 1.0 - eps);
-        let mut vn = face_point.vn.clamp(eps, 1.0 - eps);
-        let mut rn = face_point.rn.clamp(eps, 1.0 - eps);
-
-        let target_depth = desired_depth.max(body_path.depth() + 1);
-        let mut u_min = 0.0f32;
-        let mut v_min = 0.0f32;
-        let mut r_min = 0.0f32;
-        let mut size = 1.0f32;
-        while path.depth() < target_depth {
-            let child_size = size / 3.0;
-            let su = (((un - u_min) / child_size).floor() as i32).clamp(0, 2) as usize;
-            let sv = (((vn - v_min) / child_size).floor() as i32).clamp(0, 2) as usize;
-            let sr = (((rn - r_min) / child_size).floor() as i32).clamp(0, 2) as usize;
-            path.push(crate::world::tree::slot_index(su, sv, sr) as u8);
-            u_min += su as f32 * child_size;
-            v_min += sv as f32 * child_size;
-            r_min += sr as f32 * child_size;
-            size = child_size;
-            let inner_eps = eps.min(size * 0.25);
-            un = un.clamp(u_min + inner_eps, u_min + size - inner_eps);
-            vn = vn.clamp(v_min + inner_eps, v_min + size - inner_eps);
-            rn = rn.clamp(r_min + inner_eps, r_min + size - inner_eps);
-        }
-        if self.startup_profile_frames < 16 {
-            eprintln!(
-                "sphere_focus: path={:?} desired_depth={} body_path={:?} face={:?}",
-                path.as_slice(), desired_depth, body_path.as_slice(), face,
-            );
-        }
-        Some(path)
-    }
-
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => (
-                self.camera.position.in_frame(&sphere.body_path),
-                frame::frame_point_to_body([1.5, 1.5, 1.5], &sphere),
-                (crate::world::anchor::WORLD_SIZE * sphere.face_size).max(1e-6),
-            ),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => (
+            ActiveFrameKind::Cartesian => (
                 self.camera.position.in_frame(&frame.render_path),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
@@ -188,21 +67,10 @@ impl App {
         // Render frame depth is derived from `RENDER_ANCHOR_DEPTH`,
         // not the user's anchor depth — zoom controls interaction
         // layer, not what the camera renders. See `RENDER_ANCHOR_DEPTH`.
-        let desired_depth = crate::app::RENDER_ANCHOR_DEPTH
+        let _desired_depth = crate::app::RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K as u8)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let frame = self
-            .camera_local_sphere_focus_path(desired_depth)
-            .map(|path| {
-                frame::with_render_margin(
-                    &self.world.library,
-                    self.world.root,
-                    &path,
-                    RENDER_FRAME_CONTEXT,
-                )
-            })
-            .unwrap_or_else(|| self.render_frame());
-        let mut frame = frame;
+        let mut frame = self.render_frame();
         while frame.render_path.depth() > 0
             && (!self.camera_fits_frame(&frame)
                 || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
@@ -234,10 +102,7 @@ impl App {
         }
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
-                ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
-                ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                    self.camera.position.in_frame(&frame.render_path)
-                }
+                ActiveFrameKind::Cartesian => self.camera.position.in_frame(&frame.render_path),
             };
             eprintln!(
                 "target_frame stable render_path={:?} logical_path={:?} kind={:?} cam_local={:?}",

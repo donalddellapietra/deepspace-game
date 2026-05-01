@@ -10,8 +10,7 @@
 //!   packed tag/block_type/pad + BFS node index). Empty slots never
 //!   appear — they're encoded by a clear occupancy bit.
 //! - `node_kinds: Vec<GpuNodeKind>` — indexed by BFS position.
-//!   Per-node NodeKind discriminant + per-kind data (sphere body
-//!   radii, cube face index).
+//!   Per-node NodeKind discriminant.
 //! - `node_offsets: Vec<u32>` — indexed by BFS position. Maps BFS
 //!   position to the header's u32-offset in `tree[]`. Touched only
 //!   on descent and ribbon pops (cold path).

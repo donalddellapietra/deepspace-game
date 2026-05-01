@@ -17,7 +17,7 @@
 //! Side buffers:
 //!
 //! - `node_kinds: Vec<GpuNodeKind>` — per-BFS-idx kind metadata
-//!   (Cartesian/sphere-body/sphere-face + radii + face id).
+//!   (Cartesian).
 //! - `node_offsets: Vec<u32>` — BFS idx → u32-offset of that node's
 //!   header in `tree[]`.
 //! - `node_ids: Vec<NodeId>` — BFS idx → source `NodeId` (CPU-side
@@ -44,8 +44,7 @@
 //! whose every leaf is one block type (`uniform_type != MIXED`)
 //! collapses to `Child::Block(uniform_type)` in its parent's slab —
 //! it gets no BFS entry of its own. Uniform-empty subtrees vanish
-//! entirely. Sphere body / face nodes are exempt (the shader
-//! dispatches on `NodeKind`, so they must stay addressable).
+//! entirely.
 //!
 //! ## Dead entries
 //!
@@ -307,7 +306,7 @@ pub(crate) fn content_aabb(occupancy: u32) -> u16 {
 mod tests {
     use super::*;
     use crate::world::bootstrap::{menger_world, plain_test_world, plain_world};
-    use crate::world::tree::{empty_children, uniform_children, Child, NodeKind, NodeLibrary, CENTER_SLOT};
+    use crate::world::tree::{empty_children, uniform_children, Child, NodeLibrary, CENTER_SLOT};
 
     /// Read the child at (bfs_idx, slot) from a packed tree. Returns
     /// a synthesized `tag=0` GpuChild when the slot is empty.
@@ -352,14 +351,17 @@ mod tests {
         assert_eq!(kinds.len(), offsets.len());
     }
 
-    fn planet_world() -> crate::world::state::WorldState {
+    fn body_world() -> crate::world::state::WorldState {
+        // World where slot CENTER_SLOT of root holds a non-empty
+        // Node child (a single block in a 27-cell node) so it
+        // doesn't uniform-flatten away. Other root slots hold
+        // uniform-empty Node subtrees that do flatten.
         let mut lib = NodeLibrary::default();
         let leaf_air = lib.insert(empty_children());
+        let mut body_children = empty_children();
+        body_children[0] = Child::Block(crate::world::palette::block::STONE);
+        let body_id = lib.insert(body_children);
         let mut root_children = uniform_children(Child::Node(leaf_air));
-        let body_id = lib.insert_with_kind(
-            empty_children(),
-            NodeKind::CubedSphereBody { inner_r: 0.12, outer_r: 0.45 },
-        );
         root_children[CENTER_SLOT] = Child::Node(body_id);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
@@ -367,21 +369,12 @@ mod tests {
     }
 
     #[test]
-    fn pack_includes_body_kind_and_radii() {
-        let world = planet_world();
-        let (_, kinds, _, _, _, _) = pack_tree(&world.library, world.root);
-        let body = kinds.iter().find(|k| k.kind == 1).expect("body kind in buffer");
-        assert!((body.inner_r - 0.12).abs() < 1e-6);
-        assert!((body.outer_r - 0.45).abs() < 1e-6);
-    }
-
-    #[test]
     fn pack_flattens_uniform_empty_siblings() {
-        let world = planet_world();
+        let world = body_world();
         let (tree, _, offsets, _, _, root_idx) = pack_tree(&world.library, world.root);
         // Slot 0 of root (uniform-empty Cartesian) should be absent.
         assert_eq!(sparse_child(&tree, &offsets, root_idx, 0).tag, 0);
-        // CENTER_SLOT has the sphere body → Node, must stay.
+        // CENTER_SLOT has the body → Node, must stay.
         let body = sparse_child(&tree, &offsets, root_idx, CENTER_SLOT as u8);
         assert_eq!(body.tag, 2);
     }

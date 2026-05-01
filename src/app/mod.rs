@@ -15,14 +15,9 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeKind, MAX_DEPTH};
 
-/// `render_margin` passed to `with_render_margin`. For Cartesian
-/// frames `min_render_depth = logical.depth()` so this constant is
-/// dormant — render_path = logical_path regardless of K. It still
-/// controls the spread between logical and render paths on Sphere
-/// and Body frames, where the logical path continues through the
-/// face subtree but the render walker stays at the containing body
-/// cell. The `= 3` value is a historical pin kept for sphere path
-/// stability.
+/// `render_margin` passed to `with_render_margin`. Currently
+/// dormant for the Cartesian path: `min_render_depth =
+/// logical.depth()` so render_path = logical_path regardless of K.
 pub const RENDER_FRAME_K: u8 = 3;
 pub const RENDER_FRAME_MAX_DEPTH: u8 = MAX_DEPTH as u8;
 pub const RENDER_FRAME_CONTEXT: u8 = 4;
@@ -143,10 +138,6 @@ pub struct App {
     pub(super) debug_overlay_visible: bool,
     pub(super) fps_smooth: f64,
     pub(super) startup_profile_frames: u32,
-    /// Path from `world.root` to the planet's body node. Used for
-    /// spawn-position derivation and for camera-local sphere focus
-    /// (`edit_actions::zoom::camera_local_sphere_focus_path`).
-    pub(super) planet_path: Option<Path>,
     /// The actual frame the renderer is using right now. This may
     /// be shallower than `render_frame()` when GPU packing flattened
     /// a slot on the intended path and `build_ribbon` had to stop
@@ -206,8 +197,8 @@ pub struct App {
     /// Set via `--no-entities`. Default false = entities enabled.
     pub(super) disable_entities: bool,
     /// World-coordinate Y where entities naturally rest. `Some` for
-    /// flat worlds (sea level = a specific Y); `None` for sphere/
-    /// fractal worlds where "resting height" is position-dependent.
+    /// flat worlds (sea level = a specific Y); `None` for fractal
+    /// worlds where "resting height" is position-dependent.
     /// Consumed by `EntityStore::tick` to zero out the Y velocity
     /// component so entities stay on the ground they spawned on.
     pub(super) entity_surface_y: Option<f32>,
@@ -432,7 +423,6 @@ impl App {
             debug_overlay_visible: false,
             fps_smooth: 0.0,
             startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
-            planet_path: bootstrap.planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
             last_lod_upload_key: None,
@@ -494,11 +484,7 @@ impl App {
         (self.tree_depth as i32) - (self.anchor_depth() as i32) + 1
     }
 
-    /// Resolve the active frame for the current zoom. Cartesian
-    /// regions use a linear render root. Sphere regions keep the
-    /// linear root at the containing body cell and carry an
-    /// explicit face-cell window so render/edit share one layer
-    /// definition.
+    /// Resolve the active frame for the current zoom.
     pub(super) fn render_frame(&self) -> ActiveFrame {
         // Deepen the camera's anchor to `RENDER_ANCHOR_DEPTH` so
         // the render frame depth is a function of camera position,
@@ -522,10 +508,6 @@ impl App {
     pub(super) fn render_frame_kind(&self) -> NodeKind {
         match self.render_frame().kind {
             ActiveFrameKind::Cartesian => NodeKind::Cartesian,
-            ActiveFrameKind::Body { inner_r, outer_r } => {
-                NodeKind::CubedSphereBody { inner_r, outer_r }
-            }
-            ActiveFrameKind::Sphere(s) => NodeKind::CubedSphereFace { face: s.face },
         }
     }
 
@@ -589,10 +571,7 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Sphere(sphere) => self.camera.position.in_frame(&sphere.body_path),
-            ActiveFrameKind::Cartesian | ActiveFrameKind::Body { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
+            ActiveFrameKind::Cartesian => self.camera.position.in_frame(&frame.render_path),
         };
         if self.startup_profile_frames < 4 {
             eprintln!(

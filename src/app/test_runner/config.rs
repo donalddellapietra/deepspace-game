@@ -184,7 +184,6 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
-                "--sphere-world" => { cfg.world_preset = WorldPreset::DemoSphere; }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
                 "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
                 "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }
@@ -193,7 +192,6 @@ impl TestConfig {
                 "--mausoleum-world" => { cfg.world_preset = WorldPreset::Mausoleum; }
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
-                "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,
@@ -460,7 +458,6 @@ USAGE:
 
 WORLD PRESETS (pick one; defaults to --plain-world):
   --plain-world               40-level test world with grass/dirt/stone
-  --sphere-world              Demo cubed-sphere planet
   --vox-model PATH            Load .vox / .vxs model (e.g. assets/vox/soldier_729.vxs)
 
 FRACTAL PRESETS (default plain-layers = 8):
@@ -472,10 +469,6 @@ FRACTAL PRESETS (default plain-layers = 8):
   --jerusalem-cross-world     7 axial cells (body + 6 faces), ochre two-tone
   --edge-scaffold-world       12 edge rods per level, cyan/magenta/yellow
   --hollow-cube-world         18 edges + faces (no corners/body), brass + steel
-
-VISIBILITY TEST PRESETS:
-  --stars-world               Planet cube + distant stars at varying ribbon
-                              depths; validates precision across deep pops
 
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):
@@ -534,7 +527,6 @@ EXAMPLES:
   scripts/dev.sh -- --menger-world
   scripts/dev.sh -- --mausoleum-world --plain-layers 10
   scripts/dev.sh -- --vox-model assets/vox/soldier_729.vxs --plain-layers 8
-  scripts/dev.sh -- --sphere-world --spawn-depth 12
   scripts/test-fractals.sh                          # screenshot every fractal
 "#);
     std::process::exit(0);
