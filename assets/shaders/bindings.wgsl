@@ -56,9 +56,18 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// Padding slot retained so the WGSL `Uniforms` block matches
-    /// the CPU-side `GpuUniforms` byte-for-byte. Unused.
-    _pad_radii: vec4<f32>,
+    /// Curvature parameters: `(k, R_inv, slab_surface_y, _spare)`.
+    /// - `k ∈ [0, 1]`: bend amount. 0 = flat (Phase 2 baseline),
+    ///   saturating toward 1 at high altitude. Computed CPU-side
+    ///   per frame from camera altitude when the active frame is
+    ///   a `WrappedPlane`.
+    /// - `R_inv = 1 / R` where R = slab circumference / (2π) in
+    ///   slab-local units. Constant per slab.
+    /// - `slab_surface_y`: slab top y in the slab-root local
+    ///   `[0, 3)` frame.
+    /// Zero-filled when root_kind != WRAPPED_PLANE; the bent-Y math
+    /// degenerates to flat at k=0.
+    curvature: vec4<f32>,
     /// `WrappedPlane` slab dimensions, populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`. `(dims_x, dims_y, dims_z, slab_depth)`.
     /// Phase 2 reads `dims_x` + `slab_depth` (the `.x` and `.w` lanes)

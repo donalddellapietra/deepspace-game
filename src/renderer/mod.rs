@@ -74,9 +74,10 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Padding slot retained so the CPU-side `GpuUniforms` matches
-    /// the WGSL `Uniforms` block byte-for-byte. Unused.
-    pub _pad_radii: [f32; 4],
+    /// Curvature: `(k, R_inv, slab_surface_y, _spare)`. Mirrors
+    /// `Uniforms.curvature` in `assets/shaders/bindings.wgsl`.
+    /// Zero-filled when root_kind is Cartesian.
+    pub curvature: [f32; 4],
     /// `WrappedPlane` slab dimensions: `(dims_x, dims_y, dims_z,
     /// slab_depth)`. Populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`; the shader's X-wrap branch reads
@@ -143,6 +144,10 @@ pub struct Renderer {
     /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
     /// shader's X-wrap branch reads the X and W lanes.
     pub(super) slab_dims: [u32; 4],
+    /// `(k, R_inv, slab_surface_y, _spare)` curvature uniform for
+    /// the active `WrappedPlane` render frame. Set per frame by the
+    /// app via `set_curvature`. Zero-filled on Cartesian frames.
+    pub(super) curvature: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -279,12 +284,23 @@ pub(super) fn create_depth_texture(
 
 impl Renderer {
     /// Set the frame-root NodeKind to Cartesian. Clears
-    /// `slab_dims` so the X-wrap branch in the shader can't fire
-    /// from a stale upload.
+    /// `slab_dims` and `curvature` so the X-wrap and bent-Y branches
+    /// in the shader can't fire from a stale upload.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.slab_dims = [0; 4];
+        self.curvature = [0.0; 4];
         self.write_uniforms();
+    }
+
+    /// Set per-frame curvature for the active `WrappedPlane` render
+    /// frame. `k` is the bend amount (0 = flat, 1 = full sphere),
+    /// `r_inv = 1/R`, `slab_surface_y` is the slab top y in slab-
+    /// local frame. Caller is responsible for passing zeros when
+    /// root_kind is Cartesian. Does NOT call `write_uniforms` —
+    /// caller batches with `set_root_kind_wrapped_plane`.
+    pub fn set_curvature(&mut self, k: f32, r_inv: f32, slab_surface_y: f32) {
+        self.curvature = [k, r_inv, slab_surface_y, 0.0];
     }
 
     /// Set the frame-root NodeKind to `WrappedPlane`, carrying the
