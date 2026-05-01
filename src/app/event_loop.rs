@@ -290,6 +290,10 @@ impl App {
         if let Some(a) = self.startup_curvature_a {
             renderer.set_curvature_a(a);
         }
+        if let Some(mode) = self.startup_planet_render_sphere {
+            // lat_max ≈ 72° = 1.26 rad. Banned past this latitude.
+            renderer.set_planet_render_sphere(mode, 1.26);
+        }
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
             eprintln!(

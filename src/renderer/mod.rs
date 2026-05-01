@@ -102,6 +102,12 @@ pub struct GpuUniforms {
     /// stays bit-identical to the flat path. `.yzw` reserved for
     /// k(altitude) ramp / R_inv / slab_surface_y in later steps.
     pub curvature: [f32; 4],
+    /// Phase 3 REVISED — UV-sphere render mode toggle.
+    /// `.x = 0` → flat slab DDA (current default).
+    /// `.x = 1` → render WrappedPlane frame as a sphere.
+    /// `.y = lat_max` (radians) — poles past this latitude return
+    /// no-hit (banned). `.zw` reserved.
+    pub planet_render: [f32; 4],
 }
 
 pub struct Renderer {
@@ -242,6 +248,9 @@ pub struct Renderer {
     /// `march_cartesian`. 0 = disabled (flat path). Set by
     /// `set_curvature_a` from a CLI debug flag in Step 3.0.
     pub(super) curvature: [f32; 4],
+    /// Mirror of `uniforms.planet_render`. `.x` = render mode:
+    /// 0 = flat slab DDA, 1 = UV-sphere. `.y` = lat_max (radians).
+    pub(super) planet_render: [f32; 4],
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
@@ -506,6 +515,15 @@ impl Renderer {
     /// steps will compute `A` per-frame from camera altitude.
     pub fn set_curvature_a(&mut self, a: f32) {
         self.curvature = [a, 0.0, 0.0, 0.0];
+        self.write_uniforms();
+    }
+
+    /// Phase 3 REVISED: enable UV-sphere render for the WrappedPlane
+    /// frame. `mode = 0` → flat slab DDA (default), `mode = 1` →
+    /// sphere intersect + (lon, lat) → cell. `lat_max` is the polar
+    /// ban threshold in radians (e.g. 1.26 ≈ 72°).
+    pub fn set_planet_render_sphere(&mut self, mode: u32, lat_max_rad: f32) {
+        self.planet_render = [mode as f32, lat_max_rad, 0.0, 0.0];
         self.write_uniforms();
     }
 }

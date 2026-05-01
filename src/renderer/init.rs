@@ -273,6 +273,7 @@ impl Renderer {
             debug_mode: [0; 4],
             probe_pixel: [0; 4],
             curvature: [0.0; 4],
+            planet_render: [0.0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -716,6 +717,7 @@ impl Renderer {
             probe_pixel: [0; 4],
             debug_mode: [0; 4],
             curvature: [0.0; 4],
+            planet_render: [0.0; 4],
             shader_stats_enabled,
             live_frame_counter: 0,
             live_sample_every_frames,

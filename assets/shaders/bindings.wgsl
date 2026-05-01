@@ -88,6 +88,14 @@ struct Uniforms {
     /// `.yzw` reserved for k(altitude) ramp + R_inv + slab_surface_y
     /// once Step 3.4 wires those.
     curvature: vec4<f32>,
+    /// Phase 3 REVISED — UV-sphere render mode for the WrappedPlane
+    /// frame. `.x = 0` (default): use the flat slab DDA (current
+    /// behaviour). `.x = 1`: render the slab as a sphere (analytical
+    /// ray-sphere intersect + (lon, lat) → slab cell lookup, with
+    /// poles banned past `.y` radians of latitude). `.zw` reserved
+    /// (lat_max for poles is `.y`; later: shell inner_radius for
+    /// radial-depth marching).
+    planet_render: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;

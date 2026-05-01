@@ -317,6 +317,7 @@ impl Renderer {
             debug_mode: self.debug_mode,
             probe_pixel: self.probe_pixel,
             curvature: self.curvature,
+            planet_render: self.planet_render,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

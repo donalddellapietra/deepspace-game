@@ -890,7 +890,29 @@ fn march_cartesian(
                 // this depth. On pop, we recompute side_dist using
                 // the parent's stored drop.
                 let horiz_dir_sq = ray_dir.x * ray_dir.x + ray_dir.z * ray_dir.z;
-                let curvature_drop = ct_start * ct_start * horiz_dir_sq * uniforms.curvature.x;
+                let raw_drop = ct_start * ct_start * horiz_dir_sq * uniforms.curvature.x;
+                // Phase 3 Step 3.0 Option 1 — clamp drop to 2R.
+                // Beyond a drop of 2R (= the planet's diameter), the
+                // bent ray has gone "behind" the planet — further
+                // drop is meaningless and only causes the ray to
+                // re-hit the slab via X-wrap from the other side
+                // ("ghost slab" artifact at high altitude). Capping
+                // the drop pulls those rays out of wrap range:
+                // the bent_y stays at -2R below the surface, far
+                // enough below the slab's vertical extent that the
+                // OOB pop fires (slab Y is bounded, no Y-wrap) and
+                // the ray escapes to sky.
+                //
+                // R for the slab: with dims_x = 3^slab_depth (the
+                // fully-fills-X invariant), slab X extent in frame
+                // units = 3.0, so R_frame = 3.0 / (2π) ≈ 0.477.
+                // Hardcoded for now; if curvature is meaningful only
+                // when uniforms.slab_dims.w > 0, we compute it as
+                // (3.0 * cell_size_at_slab) / (2π) = 3 / (2π) for
+                // the canonical slab. Plain world has no implied
+                // radius — the caller passes A=0 to disable.
+                let r_frame = 3.0 / (2.0 * 3.14159265);
+                let curvature_drop = min(raw_drop, 2.0 * r_frame);
                 let bent_child_entry_y = child_entry.y - curvature_drop;
                 let local_entry = vec3<f32>(
                     (child_entry.x - child_origin.x) / child_cell_size,
@@ -974,6 +996,86 @@ fn march_cartesian(
     return result;
 }
 
+// Phase 3 REVISED — Step A.0: UV-sphere render of the WrappedPlane
+// frame. Replaces the flat slab DDA when `uniforms.planet_render.x
+// == 1.0`. The slab data is unchanged; what changes is the visual
+// — instead of marching through a flat 2:1 rectangle, we ray-
+// intersect an implied sphere of radius R = body_size / (2π) (=
+// the slab's wrap circumference, since dims_x fully fills the X
+// axis at slab_depth = log_3(dims_x)) and return a hit if the ray
+// strikes the surface. Poles past `lat_max` (planet_render.y) are
+// banned — the ray returns no-hit so the outer loop can pop /
+// skip and the pixel reads as sky.
+//
+// Step A.0 ships the geometry primitive only — uniform GRASS
+// colour, sphere normal for shading, no slab cell sampling. A.1
+// adds (lon, lat) → (cell_x, cell_z) lookup so the surface shows
+// the slab's actual block colours.
+fn sphere_uv_in_cell(
+    body_idx: u32,
+    body_origin: vec3<f32>,
+    body_size: f32,
+    ray_origin: vec3<f32>,
+    ray_dir_in: vec3<f32>,
+    lat_max: f32,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    // Quadratic discriminant assumes unit ray_dir; the marcher
+    // passes camera.forward + right·ndc + up·ndc which isn't unit.
+    // Renormalise for the intersect — `t` returned to the caller is
+    // in the same parameterisation (scaled by 1 / |ray_dir_in|).
+    let ray_dir = normalize(ray_dir_in);
+
+    // Sphere center: middle of the body cell.
+    // Radius: body_size / (2π) — the slab's circumference is
+    // exactly body_size (since dims_x fills X), so R = C / (2π).
+    let cs_center = body_origin + vec3<f32>(body_size * 0.5);
+    let r_sphere = body_size / (2.0 * 3.14159265);
+
+    let oc = ray_origin - cs_center;
+    let b = dot(oc, ray_dir);
+    let c = dot(oc, oc) - r_sphere * r_sphere;
+    let disc = b * b - c;
+    if disc <= 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_enter = max(-b - sq, 0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return result; }
+
+    let hit_pos = ray_origin + ray_dir * t_enter;
+    let n = (hit_pos - cs_center) / r_sphere;
+
+    // Latitude / longitude from the surface normal.
+    //   lat = asin(n.y) ∈ [-π/2, π/2]
+    //   lon = atan2(n.z, n.x) ∈ [-π, π]
+    let lat = asin(clamp(n.y, -1.0, 1.0));
+
+    // Polar ban — return no-hit so the pixel reads as sky.
+    if abs(lat) > lat_max { return result; }
+
+    // Step A.0 — placeholder: uniform GRASS colour. A.1 will sample
+    // the slab cell at (lon, lat) and use its block colour.
+    result.hit = true;
+    // `t` returned to the caller is in the un-normalised parameter:
+    // `t_enter` was computed against `normalize(ray_dir_in)`, so
+    // scale back so the caller's `ray_origin + ray_dir_in * t` lands
+    // on the hit point.
+    let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
+    result.t = t_enter * inv_norm;
+    result.color = vec3<f32>(0.4, 0.78, 0.42);
+    result.normal = n;
+    result.cell_min = hit_pos;
+    result.cell_size = body_size / 27.0;
+    return result;
+}
+
 // Top-level march. Dispatches the current frame's Cartesian DDA,
 // then on miss pops to the next ancestor in the ribbon and
 // continues. When ribbon is exhausted, returns sky (hit=false).
@@ -1001,13 +1103,30 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
-        // Cartesian frame: no depth cap beyond the hardware stack
-        // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
-        // visual LOD gate — rays stop descending when cells fall
-        // below the pixel floor.
-        var r: HitResult = march_cartesian(
-            current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot,
-        );
+        // Phase 3 REVISED — frame dispatch on NodeKind. When the
+        // current frame root is a `WrappedPlane` AND sphere-render
+        // mode is enabled, replace the flat slab DDA with the
+        // analytical UV-sphere path. Otherwise (Cartesian frame, or
+        // sphere-render disabled) use the regular Cartesian DDA.
+        // `kind == 1u` matches `ROOT_KIND_WRAPPED_PLANE` /
+        // `GpuNodeKind::WrappedPlane` (`from_node_kind`).
+        var r: HitResult;
+        let cur_kind = node_kinds[current_idx].kind;
+        if cur_kind == 1u && uniforms.planet_render.x > 0.5 {
+            r = sphere_uv_in_cell(
+                current_idx, vec3<f32>(0.0), 3.0,
+                ray_origin, ray_dir,
+                uniforms.planet_render.y,
+            );
+        } else {
+            // Cartesian frame: no depth cap beyond the hardware stack
+            // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
+            // visual LOD gate — rays stop descending when cells fall
+            // below the pixel floor.
+            r = march_cartesian(
+                current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot,
+            );
+        }
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;
