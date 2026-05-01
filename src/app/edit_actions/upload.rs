@@ -167,9 +167,30 @@ impl App {
                         continue;
                     }
                     let mut path = anchor;
-                    if sx { path.step_neighbor_cartesian(0, 1); }
-                    if sy { path.step_neighbor_cartesian(1, 1); }
-                    if sz { path.step_neighbor_cartesian(2, 1); }
+                    if sx {
+                        path.step_neighbor_in_world(
+                            &self.world.library,
+                            self.world.root,
+                            0,
+                            1,
+                        );
+                    }
+                    if sy {
+                        path.step_neighbor_in_world(
+                            &self.world.library,
+                            self.world.root,
+                            1,
+                            1,
+                        );
+                    }
+                    if sz {
+                        path.step_neighbor_in_world(
+                            &self.world.library,
+                            self.world.root,
+                            2,
+                            1,
+                        );
+                    }
                     entity_paths.push(EntityPath {
                         entity_idx: idx as u32,
                         path_slots: path.as_slice().to_vec(),
@@ -294,8 +315,39 @@ impl App {
             renderer.set_max_depth(effective_visual_depth);
             renderer.set_beam_enabled(beam_enabled);
             renderer.update_camera(&cam_gpu);
+            // Dispatch on the actual NodeKind of the active frame's
+            // root. ActiveFrameKind is currently always Cartesian
+            // (Phase 1.1 made WrappedPlanet descend through identical
+            // path-walking code), but the GPU root_kind / slab_dims
+            // discriminant must be set from the real NodeKind so the
+            // shader's wrap branch fires.
             match self.active_frame.kind {
-                ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
+                ActiveFrameKind::Cartesian => {
+                    let root_kind = self
+                        .world
+                        .library
+                        .get(self.active_frame.node_id)
+                        .map(|n| n.kind)
+                        .unwrap_or(crate::world::tree::NodeKind::Cartesian);
+                    match root_kind {
+                        crate::world::tree::NodeKind::Cartesian => {
+                            renderer.set_root_kind_cartesian();
+                        }
+                        crate::world::tree::NodeKind::WrappedPlanet {
+                            width,
+                            height,
+                            depth,
+                            active_subdepth,
+                        } => {
+                            renderer.set_root_kind_wrapped_planet(
+                                width,
+                                height,
+                                depth,
+                                active_subdepth,
+                            );
+                        }
+                    }
+                }
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

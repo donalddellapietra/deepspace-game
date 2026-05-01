@@ -268,9 +268,15 @@ fn march_entity_subtree(
 // Returns hit on cell terminal; on miss (ray exits the frame),
 // returns hit=false so the caller can pop to the ancestor ribbon.
 fn march_cartesian(
-    root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
+    root_node_idx: u32, ray_origin_in: vec3<f32>, ray_dir: vec3<f32>,
     depth_limit: u32, skip_slot: u32,
 ) -> HitResult {
+    // Local mutable copy so the WrappedPlanet wrap branch can shift
+    // the ray's effective origin along X. For Cartesian frames this
+    // copy is a no-op — the wrap branch only fires when
+    // uniforms.root_kind == ROOT_KIND_WRAPPED_PLANET.
+    var ray_origin: vec3<f32> = ray_origin_in;
+
     var result: HitResult;
     result.hit = false;
     result.t = 1e20;
@@ -354,7 +360,11 @@ fn march_cartesian(
     }
 
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
-    let entry_pos = ray_origin + ray_dir * t_start;
+    // `entry_pos` is mutable so the WrappedPlanet wrap branch can
+    // re-anchor it after shifting `ray_origin` on a wrap event. For
+    // Cartesian frames this never fires; the var is identical to a
+    // let in that case.
+    var entry_pos = ray_origin + ray_dir * t_start;
 
     let root_cell = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
@@ -381,6 +391,76 @@ fn march_cartesian(
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
         let cell = unpack_cell(s_cell[depth]);
+
+        // Phase 2 — X-wrap inside a WrappedPlanet root frame.
+        //
+        // At the planet's own root frame (depth == 0u of THIS
+        // march_cartesian call) the active region's X extent is
+        // bounded by `active_w_x = slab_dims.x / 3^active_subdepth`
+        // in march-depth-0 cell units. For 18×3×9 with
+        // active_subdepth=2: active_w_x = 18/9 = 2 (cells x=0,1
+        // active; cell x=2 entirely banned). The standard `cell.x > 2`
+        // OOB check would never fire — the ray hits banned cells
+        // before reaching the frame edge. We need to wrap at the
+        // ACTIVE edge instead.
+        //
+        // The wrap fires when:
+        //   - depth == 0u (we're at the planet's own root frame, not
+        //     a sub-cell descent — sub-cell OOB still pops to the
+        //     planet root via the standard logic below).
+        //   - root_kind == WRAPPED_PLANET.
+        //   - cell.x is OOB along the active extent.
+        //   - cell.y, cell.z are within [0, 3) — i.e. the ray hasn't
+        //     exited the planet entirely along Y or Z. Y/Z OOB still
+        //     pops normally so the ray escapes the planet's ribbon.
+        //
+        // The wrap shifts `ray_origin.x` by ±active_w_x · cur_cell_size
+        // (which equals 1.0 at depth 0, so just ±active_w_x in
+        // planet-frame units). Then re-fires `ray_box` to compute new
+        // entry geometry from the shifted origin. The remaining DDA
+        // state — `cur_node_origin`, `cur_cell_size`, `cur_occupancy`,
+        // `cur_first_child` — is unchanged because the planet root
+        // node is unchanged.
+        if depth == 0u && uniforms.root_kind == ROOT_KIND_WRAPPED_PLANET {
+            let active_w_x_f = f32(uniforms.slab_dims.x) / pow3_u(uniforms.slab_dims.w);
+            let active_w_x = i32(active_w_x_f);
+            let x_active_oob = cell.x < 0 || cell.x >= active_w_x;
+            let yz_in_frame = cell.y >= 0 && cell.y <= 2 && cell.z >= 0 && cell.z <= 2;
+            if x_active_oob && yz_in_frame {
+                let east_oob = cell.x >= active_w_x;
+                let wrap_sign = select(1.0, -1.0, east_oob);
+                let wrap_shift = wrap_sign * active_w_x_f * cur_cell_size;
+                ray_origin.x = ray_origin.x + wrap_shift;
+
+                let new_root_hit = ray_box(ray_origin, inv_dir,
+                    vec3<f32>(0.0), vec3<f32>(3.0));
+                if new_root_hit.t_enter >= new_root_hit.t_exit
+                    || new_root_hit.t_exit < 0.0 {
+                    break;
+                }
+                let new_t_start = max(new_root_hit.t_enter, 0.0) + 0.001;
+                entry_pos = ray_origin + ray_dir * new_t_start;
+                let new_cell = vec3<i32>(
+                    clamp(i32(floor(entry_pos.x)), 0, 2),
+                    clamp(i32(floor(entry_pos.y)), 0, 2),
+                    clamp(i32(floor(entry_pos.z)), 0, 2),
+                );
+                s_cell[depth] = pack_cell(new_cell);
+                let new_cell_f = vec3<f32>(new_cell);
+                cur_side_dist = vec3<f32>(
+                    select((new_cell_f.x - entry_pos.x) * inv_dir.x,
+                           (new_cell_f.x + 1.0 - entry_pos.x) * inv_dir.x,
+                           ray_dir.x >= 0.0),
+                    select((new_cell_f.y - entry_pos.y) * inv_dir.y,
+                           (new_cell_f.y + 1.0 - entry_pos.y) * inv_dir.y,
+                           ray_dir.y >= 0.0),
+                    select((new_cell_f.z - entry_pos.z) * inv_dir.z,
+                           (new_cell_f.z + 1.0 - entry_pos.z) * inv_dir.z,
+                           ray_dir.z >= 0.0),
+                );
+                continue;
+            }
+        }
 
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }

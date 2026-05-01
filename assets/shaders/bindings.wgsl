@@ -62,6 +62,18 @@ struct Uniforms {
     /// Reserved (was: face cell bounds). Unused.
     root_face_bounds: vec4<f32>,
     root_face_pop_pos: vec4<f32>,
+    /// Wrapped-planet root metadata. Only valid when
+    /// `root_kind == ROOT_KIND_WRAPPED_PLANET`. Fields:
+    ///   .x = width  (active cells along X / longitude — wraps)
+    ///   .y = height (active cells along Y / vertical — bounded)
+    ///   .z = depth  (active cells along Z / latitude — bounded)
+    ///   .w = active_subdepth (number of /3 subdivisions of the
+    ///        planet root frame where the active region's deepest
+    ///        node level lives — 2 for Phase 1)
+    /// Active-cell size in planet-frame units = 3 / 3^(.w+1). For
+    /// Phase 1 (active_subdepth=2): each active cell = 1/27 planet
+    /// frame.
+    slab_dims: vec4<u32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
