@@ -68,15 +68,15 @@ impl GpuChild {
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
     pub kind: u32,
-    pub face: u32,
-    pub inner_r: f32,
-    pub outer_r: f32,
+    pub geom_a: u32,
+    pub geom_b: f32,
+    pub geom_c: f32,
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, face: 0, inner_r: 0.0, outer_r: 0.0 },
+            NodeKind::Cartesian => Self { kind: 0, geom_a: 0, geom_b: 0.0, geom_c: 0.0 },
         }
     }
 }

@@ -84,9 +84,9 @@ const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
     kind: u32,        // 0=Cartesian
-    face: u32,
-    inner_r: f32,
-    outer_r: f32,
+    geom_a: u32,
+    geom_b: f32,
+    geom_c: f32,
 }
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
