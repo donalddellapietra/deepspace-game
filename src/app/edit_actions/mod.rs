@@ -183,7 +183,7 @@ impl App {
                 slot
             ));
             match child_kind {
-                Some(NodeKind::Cartesian) => {
+                Some(NodeKind::Cartesian) | Some(NodeKind::WrappedPlane { .. }) => {
                     node_id = child_id;
                 }
                 None => break,

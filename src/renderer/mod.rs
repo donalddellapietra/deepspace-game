@@ -43,10 +43,13 @@ pub enum EntityRenderMode {
 pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `ROOT_KIND_*`
-/// constants in `bindings.wgsl`. Currently only `Cartesian` is in
-/// use; the slot is retained as part of the uniform buffer so the
-/// shader and CPU layouts stay in lockstep.
+/// constants in `bindings.wgsl`. Phase 1: WrappedPlane renders
+/// identically to Cartesian (the marcher does not yet branch on
+/// root_kind); the constant exists so the uniform / shader layouts
+/// stay in lockstep with the CPU side once Phase 2 / 3 add wrap and
+/// curvature dispatch.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
+pub const ROOT_KIND_WRAPPED_PLANE: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

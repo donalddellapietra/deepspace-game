@@ -77,6 +77,18 @@ pub enum WorldPreset {
     /// that the ray-march preserves precision across deep pops —
     /// stars at ancestor-depth 1 through N−1 must all render.
     Stars,
+    /// Wrapped-Cartesian planet (Phase 1: hardcoded slab).
+    /// A `NodeKind::WrappedPlane` node is installed at
+    /// `embedding_depth` levels below root, with a flat slab subtree
+    /// of `slab_dims.x × slab_dims.y × slab_dims.z` leaf cells
+    /// `slab_depth` levels below the WrappedPlane node. No wrap and
+    /// no curvature in this phase — it just renders as a small
+    /// rectangular patch of grass/dirt/stone embedded in empty space.
+    WrappedPlanet {
+        embedding_depth: u8,
+        slab_dims: [u32; 3],
+        slab_depth: u8,
+    },
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -108,6 +120,10 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::HollowCube
         | WorldPreset::Stars
         | WorldPreset::Scene { .. } => None,
+        // The wrapped planet has a flat slab top at fixed local-y,
+        // but its world-y depends on embedding_depth and slot path
+        // — entities don't auto-rest on it in Phase 1.
+        WorldPreset::WrappedPlanet { .. } => None,
     }
 }
 
@@ -177,6 +193,9 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
             plain_layers.unwrap_or(40),
         ),
+        WorldPreset::WrappedPlanet { embedding_depth, slab_dims, slab_depth } => {
+            bootstrap_wrapped_planet_world(embedding_depth, slab_dims, slab_depth)
+        }
     }
 }
 
@@ -735,6 +754,280 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
     }
 }
 
+/// Default slab dims (cells along x, y, z) for `--wrapped-planet`.
+///
+/// Picked from the high-level plan: 20 wide × 10 tall × 2 thick.
+/// At `slab_depth = 3` the subgrid is 27³ which comfortably houses
+/// 20×10×2; at `slab_depth = 2` the subgrid is only 9³, so 20×10
+/// would not fit (see `wrapped_planet_world` slab_depth notes).
+pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [20, 10, 2];
+/// Default depth descended below the `WrappedPlane` node to reach
+/// leaf cells. With `dims = [20, 10, 2]` the smallest valid
+/// `slab_depth` is 3 (27³ subgrid). Higher values work but waste
+/// cells; lower values fail the `dims_fit_in_slab` check.
+pub const DEFAULT_WRAPPED_PLANET_SLAB_DEPTH: u8 = 3;
+/// Default tree depth at which the `WrappedPlane` node is installed.
+/// `embedding_depth = 22` puts the slab inside a vanishingly small
+/// embedding cell — the same precision regime as the deep-zoom
+/// Cartesian tests. `slab_depth = 3` adds three more levels, so the
+/// leaves live at world-tree depth 25.
+pub const DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH: u8 = 22;
+
+/// Build a `NodeKind::WrappedPlane`-rooted slab embedded in an
+/// otherwise empty world.
+///
+/// The world tree has the shape:
+///
+/// ```text
+/// root (Cartesian, depth 0)
+///   slot 13 (centre) -> Cartesian (depth 1, all-empty except slot 13)
+///   ...                                          // embedding_depth-1 layers
+///   -> WrappedPlane { dims, slab_depth }         (depth = embedding_depth)
+///        -> Cartesian descendants (slab_depth levels)
+///             -> Block(GRASS|DIRT|STONE) | Empty (depth = embedding_depth+slab_depth)
+/// ```
+///
+/// The slab footprint inside the WrappedPlane's `3^slab_depth` per
+/// axis subgrid is `dims[0] × dims[1] × dims[2]` cells. Cells outside
+/// that footprint are `Child::Empty` (sparse occupancy = absent).
+///
+/// Surface profile within the slab footprint mirrors `--plain-world`:
+/// Y=top → grass; Y=middle → dirt; Y=bottom → stone. With dims.y=10
+/// and slab_dims.y=2 thickness the canonical layout is grass row at
+/// y=1 (top), dirt rows below it; we keep the y=0 row (the lowest)
+/// as stone for a recognisable cross-section.
+///
+/// **Phase 1** does not enable wrap or curvature — the resulting
+/// rectangle just renders as a small flat patch of terrain.
+pub fn wrapped_planet_world(
+    embedding_depth: u8,
+    slab_dims: [u32; 3],
+    slab_depth: u8,
+) -> WorldState {
+    assert!(embedding_depth > 0, "embedding_depth must be >= 1");
+    assert!(slab_depth > 0, "slab_depth must be >= 1");
+    let total_depth = (embedding_depth as usize)
+        .saturating_add(slab_depth as usize);
+    assert!(
+        total_depth <= MAX_DEPTH,
+        "embedding_depth + slab_depth ({}) exceeds MAX_DEPTH ({})",
+        total_depth,
+        MAX_DEPTH,
+    );
+    // Subgrid extent: 3^slab_depth cells per axis. dims must fit.
+    let mut subgrid: u32 = 1;
+    for _ in 0..slab_depth {
+        subgrid = subgrid.checked_mul(BRANCH as u32).expect("slab_depth too large");
+    }
+    assert!(
+        slab_dims[0] <= subgrid && slab_dims[1] <= subgrid && slab_dims[2] <= subgrid,
+        "slab_dims {:?} do not fit in subgrid {} (slab_depth={}); increase slab_depth",
+        slab_dims, subgrid, slab_depth,
+    );
+
+    let mut library = NodeLibrary::default();
+
+    // Build the slab subtree as a flat `subgrid^3` Cartesian volume,
+    // sparsely populated to the slab_dims footprint. The simplest
+    // exact construction is to walk the leaf-cell grid and at each
+    // (x, y, z) pick the block (or Empty), then bottom-up assemble
+    // 3×3×3 nodes layer by layer.
+    //
+    // Leaf-cell selection rule for the slab footprint:
+    //   x ∈ [0, dims.x)  AND  y ∈ [0, dims.y)  AND  z ∈ [0, dims.z)
+    //     - bottom row (y == 0): STONE
+    //     - middle rows (1..dims.y-1): DIRT
+    //     - top row (y == dims.y-1): GRASS
+    //   else: Empty
+    //
+    // Build bottom-up in `slab_depth` passes. The first pass groups
+    // the (subgrid)^3 leaves into (subgrid/3)^3 depth-1 nodes; each
+    // subsequent pass groups the previous pass's nodes into
+    // (subgrid/3^k)^3 nodes. After `slab_depth` passes a single
+    // node remains: the WrappedPlane root.
+    let leaf_at = |x: u32, y: u32, z: u32| -> Child {
+        if x < slab_dims[0] && y < slab_dims[1] && z < slab_dims[2] {
+            let block = if y == 0 {
+                block::STONE
+            } else if y + 1 == slab_dims[1] {
+                block::GRASS
+            } else {
+                block::DIRT
+            };
+            Child::Block(block)
+        } else {
+            Child::Empty
+        }
+    };
+
+    // Layer 0: leaves laid out at subgrid^3.
+    let n0 = subgrid as usize;
+    let mut layer: Vec<Vec<Vec<Child>>> = (0..n0)
+        .map(|z| {
+            (0..n0)
+                .map(|y| (0..n0).map(|x| leaf_at(x as u32, y as u32, z as u32)).collect())
+                .collect()
+        })
+        .collect();
+    // (This builds the 3D array at full subgrid resolution. For the
+    // canonical [20,10,2]@slab_depth=3 case that's 27³ = 19683
+    // entries — cheap.)
+
+    // Successively group every 3×3×3 block into a single Cartesian
+    // node. After `slab_depth` rounds, layer is a 1×1×1 array
+    // containing the WrappedPlane root's children-pre-image: actually
+    // we want to stop the Cartesian-grouping ONE round before that
+    // last grouping, then explicitly insert the WrappedPlane node
+    // for that final 3×3×3 → 1 step so the kind tag attaches.
+    let mut size = n0;
+    for _round in 0..(slab_depth as usize - 1) {
+        let new_size = size / 3;
+        let mut next: Vec<Vec<Vec<Child>>> = (0..new_size)
+            .map(|_| (0..new_size).map(|_| vec![Child::Empty; new_size]).collect())
+            .collect();
+        for nz in 0..new_size {
+            for ny in 0..new_size {
+                for nx in 0..new_size {
+                    let mut children = empty_children();
+                    let mut all_empty = true;
+                    for cz in 0..BRANCH {
+                        for cy in 0..BRANCH {
+                            for cx in 0..BRANCH {
+                                let x = nx * BRANCH + cx;
+                                let y = ny * BRANCH + cy;
+                                let z = nz * BRANCH + cz;
+                                let c = layer[z][y][x];
+                                if !c.is_empty() {
+                                    all_empty = false;
+                                }
+                                children[slot_index(cx, cy, cz)] = c;
+                            }
+                        }
+                    }
+                    next[nz][ny][nx] = if all_empty {
+                        // Pure-empty Cartesian subtree gets dropped
+                        // by uniform-flatten anyway, but constructing
+                        // an explicit Empty here saves a library entry.
+                        Child::Empty
+                    } else {
+                        Child::Node(library.insert_with_kind(children, NodeKind::Cartesian))
+                    };
+                }
+            }
+        }
+        layer = next;
+        size = new_size;
+    }
+    debug_assert_eq!(size, BRANCH as usize, "expected one final 3³ grouping for the WrappedPlane root");
+
+    // Final pass: assemble the 27 layer-cells into one
+    // `NodeKind::WrappedPlane` node. This is the slab root.
+    let mut slab_children = empty_children();
+    for cz in 0..BRANCH {
+        for cy in 0..BRANCH {
+            for cx in 0..BRANCH {
+                slab_children[slot_index(cx, cy, cz)] = layer[cz][cy][cx];
+            }
+        }
+    }
+    let wrapped_plane_root = library.insert_with_kind(
+        slab_children,
+        NodeKind::WrappedPlane { dims: slab_dims, slab_depth },
+    );
+
+    // Embed: wrap in `embedding_depth` Cartesian layers, each
+    // placing the inner subtree at the centre slot (13). Outer slots
+    // are Empty so the slab sits in otherwise empty space.
+    let mut current = Child::Node(wrapped_plane_root);
+    for _ in 0..(embedding_depth as usize) {
+        let mut children = empty_children();
+        children[slot_index(1, 1, 1)] = current;
+        current = Child::Node(library.insert_with_kind(children, NodeKind::Cartesian));
+    }
+    let root = match current {
+        Child::Node(id) => id,
+        // A Block / Empty here would mean embedding_depth = 0 with
+        // a degenerate slab — guarded above with the assert.
+        _ => unreachable!("wrapped-planet embedding produced a non-Node root"),
+    };
+    library.ref_inc(root);
+
+    let world = WorldState { root, library };
+    eprintln!(
+        "wrapped_planet world: embedding_depth={}, slab_dims={:?}, slab_depth={}, library_entries={}, tree_depth={}",
+        embedding_depth, slab_dims, slab_depth,
+        world.library.len(), world.tree_depth(),
+    );
+    world
+}
+
+/// Spawn position for the wrapped planet preset: above the slab top
+/// surface, looking straight down at it.
+///
+/// Anchor: the (1,1,1) centre-slot path repeated `embedding_depth`
+/// times — this lands the camera inside the WrappedPlane node's
+/// own cell. Offset is in WrappedPlane-cell-local coords (cell spans
+/// `[0, 1)` for x/y/z because WorldPos's offset is normalised to
+/// `[0, 1)`).
+///
+/// The slab occupies `[0, dims.i / 3^slab_depth)` along each axis
+/// inside the WrappedPlane cell. Camera offset:
+/// - cam_x = slab_x_centre = (dims.x / 3^slab_depth) / 2
+/// - cam_y = slab_top + air_gap  = (dims.y / 3^slab_depth) + 0.05
+/// - cam_z = slab_z_centre = (dims.z / 3^slab_depth) / 2
+///
+/// Then `App::with_test_config` deepens the WorldPos to its target
+/// anchor depth via `deepened_to`, which is precision-stable.
+pub fn wrapped_planet_spawn(
+    embedding_depth: u8,
+    slab_dims: [u32; 3],
+    slab_depth: u8,
+) -> WorldPos {
+    let subgrid = (BRANCH as u32).pow(slab_depth as u32) as f32;
+    let frac_x = slab_dims[0] as f32 / subgrid;
+    let frac_y = slab_dims[1] as f32 / subgrid;
+    let frac_z = slab_dims[2] as f32 / subgrid;
+    // Position camera above the slab's X,Z centre. Camera y is high
+    // enough that a top-down screenshot at default FoV (~70°) shows
+    // the slab's X-edges in frame: required cam_y above slab_top is
+    // roughly slab_width / 2 / tan(35°) ≈ slab_width * 0.7. Total
+    // cam_y = slab_top + clearance, clamped into [0, 1).
+    let cam_x = (frac_x * 0.5).clamp(0.001, 0.999);
+    let clearance = (frac_x * 0.7).max(0.05);
+    let cam_y = (frac_y + clearance).clamp(0.001, 0.95);
+    let cam_z = (frac_z * 0.5).clamp(0.001, 0.999);
+    // Anchor at `embedding_depth` (slab root level). Test driver
+    // can deepen further via `--spawn-depth`; slot arithmetic in
+    // `deepened_to` is precision-stable.
+    WorldPos::uniform_column(
+        slot_index(1, 1, 1) as u8,
+        embedding_depth,
+        [cam_x, cam_y, cam_z],
+    )
+}
+
+fn bootstrap_wrapped_planet_world(
+    embedding_depth: u8,
+    slab_dims: [u32; 3],
+    slab_depth: u8,
+) -> WorldBootstrap {
+    let world = wrapped_planet_world(embedding_depth, slab_dims, slab_depth);
+    let spawn_pos = wrapped_planet_spawn(embedding_depth, slab_dims, slab_depth);
+    WorldBootstrap {
+        world,
+        planet_path: None,
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: 0.0,
+        default_spawn_pitch: -std::f32::consts::FRAC_PI_2,
+        // `plain_layers = 0` opts out of the spawn-depth surface-
+        // tracking path in `App::with_test_config` — that path
+        // assumes a `--plain-world` ground plane and would otherwise
+        // override our wrapped-planet spawn with `plain_surface_spawn`.
+        plain_layers: 0,
+        color_registry: crate::world::palette::ColorRegistry::new(),
+    }
+}
+
 fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
     let world = plain_world(plain_layers);
     let spawn_pos = plain_surface_spawn(8);
@@ -761,5 +1054,47 @@ mod tests {
     fn plain_world_honors_requested_depth() {
         let world = plain_world(40);
         assert_eq!(world.tree_depth(), 40);
+    }
+
+    /// Worldgen regression: the wrapped planet must produce a tree
+    /// containing a `NodeKind::WrappedPlane` node carrying the
+    /// requested dims. Walk down the centre-slot embedding chain and
+    /// assert.
+    #[test]
+    fn wrapped_planet_produces_wrapped_plane_node() {
+        let embedding_depth: u8 = 8;
+        let slab_dims = [20u32, 10, 2];
+        let slab_depth: u8 = 3;
+        let world = wrapped_planet_world(embedding_depth, slab_dims, slab_depth);
+        // Walk down centre slot (13 = (1,1,1)) for `embedding_depth`
+        // levels.
+        let mut node_id = world.root;
+        for _ in 0..embedding_depth {
+            let node = world.library.get(node_id).expect("node exists");
+            assert_eq!(node.kind, NodeKind::Cartesian, "embedding layer must be Cartesian");
+            match node.children[slot_index(1, 1, 1)] {
+                Child::Node(child) => node_id = child,
+                other => panic!("expected Child::Node at embedding centre, got {:?}", other),
+            }
+        }
+        // The node at depth `embedding_depth` is the slab root —
+        // must be `WrappedPlane` with the right dims.
+        let slab_root = world.library.get(node_id).expect("slab root exists");
+        match slab_root.kind {
+            NodeKind::WrappedPlane { dims, slab_depth: sd } => {
+                assert_eq!(dims, slab_dims);
+                assert_eq!(sd, slab_depth);
+            }
+            other => panic!("expected WrappedPlane at depth {embedding_depth}, got {:?}", other),
+        }
+    }
+
+    /// The total tree depth must equal embedding_depth + slab_depth
+    /// — the slab's leaf cells live `slab_depth` below the slab
+    /// root.
+    #[test]
+    fn wrapped_planet_total_tree_depth() {
+        let world = wrapped_planet_world(8, [20, 10, 2], 3);
+        assert_eq!(world.tree_depth(), 8 + 3);
     }
 }
