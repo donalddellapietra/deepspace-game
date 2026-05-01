@@ -14,7 +14,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH};
+use crate::world::tree::{slot_coords, slot_index, NodeLibrary, MAX_DEPTH};
 
 /// Local frame convention: every node's children span
 /// `[0, WORLD_SIZE)³` because there are 3 children per axis.
@@ -126,146 +126,6 @@ impl Path {
             self.depth += 1;
         }
     }
-
-    /// Step one cell along `axis` (0=X, 1=Y, 2=Z) by `direction` ±1,
-    /// wrap-aware: if any ancestor of the path is a
-    /// `NodeKind::WrappedPlanet` and the path is at the planet's
-    /// active-cell leaf depth (`planet_idx + 3` slots), X-axis steps
-    /// wrap modulo the planet's `width`, and Y/Z steps are bounded
-    /// (banned moves silently no-op).
-    ///
-    /// For paths NOT inside a WrappedPlanet — or for paths inside one
-    /// but not at the active-cell depth — this delegates to
-    /// `step_neighbor_cartesian` (the kind-agnostic step).
-    pub fn step_neighbor_in_world(
-        &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
-        axis: usize,
-        direction: i32,
-    ) {
-        debug_assert!(axis < 3);
-        debug_assert!(direction == 1 || direction == -1);
-
-        let path_slots = self.as_slice();
-        let Some((planet_idx, planet_kind)) =
-            find_wrapped_planet_in_path(library, world_root, path_slots)
-        else {
-            self.step_neighbor_cartesian(axis, direction);
-            return;
-        };
-        let NodeKind::WrappedPlanet {
-            width,
-            height,
-            depth,
-            active_subdepth,
-        } = planet_kind
-        else {
-            // Helper guarantees WrappedPlanet, but be defensive.
-            self.step_neighbor_cartesian(axis, direction);
-            return;
-        };
-
-        // Phase 2 only handles the case where the camera is exactly
-        // at the active-cell leaf level (3 slot levels below the
-        // planet root, matching `wrapped_planet::build_planet`'s
-        // L1/L2/L3 nesting). Other depths fall back to the
-        // kind-agnostic step. With `active_subdepth = 2` Phase 1
-        // hardcodes 3 nesting levels.
-        let _ = active_subdepth;
-        let levels_below_planet = path_slots.len().saturating_sub(planet_idx + 1);
-        if levels_below_planet != 3 {
-            self.step_neighbor_cartesian(axis, direction);
-            return;
-        }
-
-        // Decode (cx, cy, cz) from L1/L2/L3.
-        let (l1x, l1y, l1z) = slot_coords(path_slots[planet_idx + 1] as usize);
-        let (l2x, l2y, l2z) = slot_coords(path_slots[planet_idx + 2] as usize);
-        let (l3x, l3y, l3z) = slot_coords(path_slots[planet_idx + 3] as usize);
-        let cx = l1x * 9 + l2x * 3 + l3x;
-        let cy = l1y * 9 + l2y * 3 + l3y;
-        let cz = l1z * 9 + l2z * 3 + l3z;
-
-        // Apply the step in active-cell coords. X wraps modulo width;
-        // Y / Z are bounded (banned steps no-op).
-        let mut tx = cx as i32 + if axis == 0 { direction } else { 0 };
-        let ty = cy as i32 + if axis == 1 { direction } else { 0 };
-        let tz = cz as i32 + if axis == 2 { direction } else { 0 };
-
-        match axis {
-            0 => {
-                let w = width as i32;
-                tx = tx.rem_euclid(w);
-            }
-            1 => {
-                if ty < 0 || ty >= height as i32 {
-                    return; // banned — silently no-op
-                }
-            }
-            2 => {
-                if tz < 0 || tz >= depth as i32 {
-                    return; // banned — silently no-op
-                }
-            }
-            _ => unreachable!(),
-        }
-
-        // Re-encode L1/L2/L3 from the new (cx, cy, cz).
-        let new_cx = tx as usize;
-        let new_cy = ty as usize;
-        let new_cz = tz as usize;
-        let n_l1 = slot_index(new_cx / 9, new_cy / 9, new_cz / 9) as u8;
-        let n_l2 = slot_index(
-            (new_cx % 9) / 3,
-            (new_cy % 9) / 3,
-            (new_cz % 9) / 3,
-        ) as u8;
-        let n_l3 = slot_index(new_cx % 3, new_cy % 3, new_cz % 3) as u8;
-        self.slots[planet_idx + 1] = n_l1;
-        self.slots[planet_idx + 2] = n_l2;
-        self.slots[planet_idx + 3] = n_l3;
-    }
-}
-
-/// Walk from `world_root` through `path_slots` and return
-/// `(planet_path_idx, planet_node_kind)` for the deepest
-/// `NodeKind::WrappedPlanet` ancestor whose subtree contains the
-/// given path. Returns `None` if no such ancestor exists OR if the
-/// WrappedPlanet sits at `world_root` (no parent slot).
-///
-/// `planet_path_idx` is the index in `path_slots` of the slot that
-/// led INTO the WrappedPlanet node. Slots inside the planet subtree
-/// live at indices `planet_path_idx + 1, planet_path_idx + 2, ...`.
-///
-/// The world-root case is unsupported because the path-arithmetic
-/// caller ([`Path::step_neighbor_in_world`]) needs L1/L2/L3 slots at
-/// `planet_idx + 1..planet_idx + 4`; with no parent slot the
-/// indexing degenerates. Phase 1's bootstrap wraps the planet in
-/// 22 layers of air, so this restriction never fires in practice.
-///
-/// O(depth) per call. Future optimization: cache the deepest
-/// WrappedPlanet ancestor on the camera so WASD doesn't re-walk it.
-fn find_wrapped_planet_in_path(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    path_slots: &[u8],
-) -> Option<(usize, NodeKind)> {
-    let mut current_id = world_root;
-    let mut found: Option<(usize, NodeKind)> = None;
-    for (i, &slot) in path_slots.iter().enumerate() {
-        let Some(node) = library.get(current_id) else { return found };
-        let child = node.children[slot as usize];
-        let Child::Node(child_id) = child else { return found };
-        current_id = child_id;
-        let Some(child_node) = library.get(current_id) else { return found };
-        if matches!(child_node.kind, NodeKind::WrappedPlanet { .. }) {
-            // The slot at index `i` led INTO this WrappedPlanet.
-            // Descendants are at indices i+1, i+2, ... in the path.
-            found = Some((i, child_node.kind));
-        }
-    }
-    found
 }
 
 impl Default for Path {
@@ -368,14 +228,7 @@ impl WorldPos {
     }
 
     /// Restore `offset[i] ∈ [0, 1)` by stepping the anchor along
-    /// each axis as needed. Cartesian interpretation only (no
-    /// WrappedPlanet awareness).
-    ///
-    /// Used by [`Self::new`] which has no library handle. For motion
-    /// integration (which DOES have a library) prefer
-    /// [`Self::renormalize_in_world`] — the kind-agnostic version
-    /// here bubbles straight through a WrappedPlanet's east edge
-    /// instead of wrapping.
+    /// each axis as needed. Cartesian interpretation only (step 1).
     fn renormalize_cartesian(&mut self) {
         for axis in 0..3 {
             // Pull overflow in steps so f32 non-finite inputs don't
@@ -403,65 +256,15 @@ impl WorldPos {
         }
     }
 
-    /// Wrap-aware variant of [`Self::renormalize_cartesian`]. Uses
-    /// [`Path::step_neighbor_in_world`] for the per-axis carry, so
-    /// motion that crosses a WrappedPlanet's east edge wraps modulo
-    /// `width` instead of bubbling out, and motion into a banned
-    /// Y/Z cell silently clamps the offset back into the active
-    /// region.
-    fn renormalize_in_world(&mut self, library: &NodeLibrary, world_root: NodeId) {
-        for axis in 0..3 {
-            let mut guard: i32 = 0;
-            while self.offset[axis] >= 1.0 && guard < 1 << 20 {
-                self.offset[axis] -= 1.0;
-                let before = self.anchor;
-                self.anchor.step_neighbor_in_world(library, world_root, axis, 1);
-                if self.anchor == before {
-                    // step was a no-op (banned axis or root clamp).
-                    // Pin the offset at the cell's far edge and stop
-                    // the carry loop so the player can't stuff
-                    // themselves into a banned cell.
-                    self.offset[axis] = 1.0 - f32::EPSILON;
-                    break;
-                }
-                guard += 1;
-            }
-            while self.offset[axis] < 0.0 && guard < 1 << 20 {
-                self.offset[axis] += 1.0;
-                let before = self.anchor;
-                self.anchor.step_neighbor_in_world(library, world_root, axis, -1);
-                if self.anchor == before {
-                    self.offset[axis] = 0.0;
-                    break;
-                }
-                guard += 1;
-            }
-            if self.offset[axis] >= 1.0 {
-                self.offset[axis] = 1.0 - f32::EPSILON;
-            }
-            if self.offset[axis] < 0.0 {
-                self.offset[axis] = 0.0;
-            }
-        }
-    }
-
     /// Advance by a local delta (in units of the current cell).
-    /// Restores the `[0, 1)` invariant on return.
-    ///
-    /// `world_root` is required so the renormalization can dispatch
-    /// on the camera's deepest `NodeKind::WrappedPlanet` ancestor and
-    /// wrap modularly along X (instead of bubbling out of the planet
-    /// at the east edge).
-    pub fn add_local(
-        &mut self,
-        delta: [f32; 3],
-        lib: &NodeLibrary,
-        world_root: NodeId,
-    ) -> Transition {
+    /// Restores the `[0, 1)` invariant on return. The `_lib`
+    /// argument is the future dispatch surface for non-Cartesian
+    /// anchors; unused in step 1.
+    pub fn add_local(&mut self, delta: [f32; 3], _lib: &NodeLibrary) -> Transition {
         for i in 0..3 {
             self.offset[i] += delta[i];
         }
-        self.renormalize_in_world(lib, world_root);
+        self.renormalize_cartesian();
         Transition::None
     }
 
@@ -762,10 +565,7 @@ mod tests {
     fn add_local_small_delta() {
         let l = lib();
         let mut pos = WorldPos::new(Path::root(), [0.5, 0.5, 0.5]);
-        // No WrappedPlanet ancestor in `lib`, so the wrap-aware
-        // path falls through to the kind-agnostic step. Pass
-        // `EMPTY_NODE` so the helper returns None on the lookup.
-        let t = pos.add_local([0.1, 0.0, 0.0], &l, crate::world::tree::EMPTY_NODE);
+        let t = pos.add_local([0.1, 0.0, 0.0], &l);
         assert_eq!(t, Transition::None);
         assert!((pos.offset[0] - 0.6).abs() < 1e-5);
         assert_eq!(pos.anchor, Path::root());
@@ -778,7 +578,7 @@ mod tests {
         let mut anchor = Path::root();
         anchor.push(slot_index(1, 1, 1) as u8);
         let mut pos = WorldPos::new(anchor, [0.9, 0.5, 0.5]);
-        pos.add_local([0.2, 0.0, 0.0], &l, crate::world::tree::EMPTY_NODE);
+        pos.add_local([0.2, 0.0, 0.0], &l);
         assert_eq!(pos.anchor.slot(0), slot_index(2, 1, 1) as u8);
         assert!((pos.offset[0] - 0.1).abs() < 1e-4);
     }
@@ -792,7 +592,7 @@ mod tests {
         anchor.push(slot_index(1, 1, 1) as u8);
         anchor.push(slot_index(2, 1, 1) as u8);
         let mut pos = WorldPos::new(anchor, [0.9, 0.5, 0.5]);
-        pos.add_local([0.2, 0.0, 0.0], &l, crate::world::tree::EMPTY_NODE);
+        pos.add_local([0.2, 0.0, 0.0], &l);
         assert_eq!(pos.anchor.slot(0), slot_index(2, 1, 1) as u8);
         assert_eq!(pos.anchor.slot(1), slot_index(0, 1, 1) as u8);
         assert!((pos.offset[0] - 0.1).abs() < 1e-4);
@@ -805,7 +605,7 @@ mod tests {
         let mut anchor = Path::root();
         anchor.push(slot_index(2, 1, 1) as u8);
         let mut pos = WorldPos::new(anchor, [0.1, 0.5, 0.5]);
-        pos.add_local([-1.2, 0.0, 0.0], &l, crate::world::tree::EMPTY_NODE);
+        pos.add_local([-1.2, 0.0, 0.0], &l);
         // From slot (2,1,1) step back 2 cells -> (0,1,1); offset
         // becomes 0.1 - 1.2 + 2 = 0.9.
         assert_eq!(pos.anchor.slot(0), slot_index(0, 1, 1) as u8);
@@ -1090,7 +890,7 @@ mod tests {
     fn add_local_offset_is_normalized() {
         let l = lib();
         let mut pos = WorldPos::new(Path::root(), [0.0, 0.0, 0.0]);
-        pos.add_local([0.3, 0.7, 0.999], &l, crate::world::tree::EMPTY_NODE);
+        pos.add_local([0.3, 0.7, 0.999], &l);
         for &v in &pos.offset {
             assert!((0.0..1.0).contains(&v));
         }

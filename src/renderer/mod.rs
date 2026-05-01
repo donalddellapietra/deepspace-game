@@ -43,7 +43,6 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// `root_kind` discriminant — must mirror the WGSL `RootKind*`
 /// constants in `bindings.wgsl`.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
-pub const ROOT_KIND_WRAPPED_PLANET: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -71,11 +70,6 @@ pub struct GpuUniforms {
     pub root_face_meta: [u32; 4],
     pub root_face_bounds: [f32; 4],
     pub root_face_pop_pos: [f32; 4],
-    /// Wrapped-planet root metadata. Only valid when
-    /// `root_kind == ROOT_KIND_WRAPPED_PLANET`. Mirrors the WGSL
-    /// `slab_dims: vec4<u32>` field; layout (x, y, z, w) =
-    /// (width, height, depth, active_subdepth). Zero for Cartesian.
-    pub slab_dims: [u32; 4],
 }
 
 pub struct Renderer {
@@ -132,10 +126,6 @@ pub struct Renderer {
     pub(super) root_face_meta: [u32; 4],
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
-    /// Wrapped-planet active-region dims uploaded to the
-    /// `slab_dims: vec4<u32>` uniform. Zero for Cartesian roots; set
-    /// by `set_root_kind_wrapped_planet`.
-    pub(super) slab_dims: [u32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -278,31 +268,6 @@ impl Renderer {
         self.root_face_meta = [0; 4];
         self.root_face_bounds = [0.0; 4];
         self.root_face_pop_pos = [0.0; 4];
-        self.slab_dims = [0; 4];
-        self.write_uniforms();
-    }
-
-    /// Set the frame-root NodeKind to WrappedPlanet. The shader's
-    /// `march_cartesian` consults `slab_dims` at march-depth 0 to
-    /// decide the active-region X bound for the modular wrap branch.
-    pub fn set_root_kind_wrapped_planet(
-        &mut self,
-        width: u16,
-        height: u16,
-        depth: u16,
-        active_subdepth: u8,
-    ) {
-        self.root_kind = ROOT_KIND_WRAPPED_PLANET;
-        self.root_radii = [0.0; 4];
-        self.root_face_meta = [0; 4];
-        self.root_face_bounds = [0.0; 4];
-        self.root_face_pop_pos = [0.0; 4];
-        self.slab_dims = [
-            width as u32,
-            height as u32,
-            depth as u32,
-            active_subdepth as u32,
-        ];
         self.write_uniforms();
     }
 

@@ -779,14 +779,11 @@ fn bootstrap_wrapped_planet_world() -> WorldBootstrap {
         planet_path.push(CENTER_SLOT as u8);
     }
 
-    // Spawn coords in planet-frame (Phase 2 dims = 18x3x9):
-    //   x = 1.0   -> centred in the active X region [0, 2.0)
-    //   y = 1.5   -> well above the grass top at y=3/9=0.333. The
-    //                active Y region is now thin (only 3 cells), so
-    //                the camera sits ~1.17 planet-frame units above
-    //                the slab.
-    //   z = 0.166 -> inside the active Z region [0, 1.0) but near
-    //                the south edge.
+    // Spawn coords in planet-frame:
+    //   x = 1.0  -> centred in the active X region [0, 2.0)
+    //   y = 1.5  -> 0.5 above the grass top at y=1.0 (active region
+    //               spans y in [0, 1.0))
+    //   z = 0.166 -> centred in the active Z region [0, 1/3)
     // anchor_depth=PLANET_WORLD_DEPTH lands the anchor exactly at
     // the planet root (the position decomposes into `(planet_path,
     // [1.0/3, 1.5/3, 0.166/3])`).
@@ -805,8 +802,8 @@ fn bootstrap_wrapped_planet_world() -> WorldBootstrap {
         default_spawn_pitch: -1.0,
         // plain_layers=0 disables carve_air_pocket. The default
         // spawn at planet-frame y=1.5 is already in air (above the
-        // grass top at y=0.333); carving would replace the planet
-        // root -- the center child of the deepest wrapper -- with
+        // grass top at y=1.0); carving would replace the planet root
+        // -- which is the center child of the deepest wrapper -- with
         // an empty air subtree, destroying the slab.
         plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),

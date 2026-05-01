@@ -270,7 +270,6 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
-            slab_dims: [0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -669,7 +668,6 @@ impl Renderer {
             root_face_meta: [0; 4],
             root_face_bounds: [0.0; 4],
             root_face_pop_pos: [0.0; 4],
-            slab_dims: [0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,

@@ -164,7 +164,7 @@ impl App {
         // world-coords position from the base anchor's XZ and
         // sea_level Y, and reconstruct an anchor at the same depth.
         let mut base = cam_anchor;
-        base.step_neighbor_in_world(&self.world.library, self.world.root, 2, -1);
+        base.step_neighbor_cartesian(2, -1);
 
         let base_anchor = if let Some(sea_y) = self.entity_surface_y {
             let base_pos = WorldPos::new_unchecked(base, [0.0, 0.0, 0.0]);
@@ -193,28 +193,13 @@ impl App {
             let stack = i / grid_len;
             let mut anchor = base_anchor;
             for _ in 0..col {
-                anchor.step_neighbor_in_world(
-                    &self.world.library,
-                    self.world.root,
-                    0,
-                    1,
-                );
+                anchor.step_neighbor_cartesian(0, 1);
             }
             for _ in 0..row {
-                anchor.step_neighbor_in_world(
-                    &self.world.library,
-                    self.world.root,
-                    2,
-                    1,
-                );
+                anchor.step_neighbor_cartesian(2, 1);
             }
             for _ in 0..stack {
-                anchor.step_neighbor_in_world(
-                    &self.world.library,
-                    self.world.root,
-                    2,
-                    -1,
-                );
+                anchor.step_neighbor_cartesian(2, -1);
             }
             let pos = WorldPos::new_unchecked(anchor, [0.0, 0.0, 0.0]);
             let velocity = entity_velocity(i);

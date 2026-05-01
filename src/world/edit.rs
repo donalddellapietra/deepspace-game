@@ -81,7 +81,7 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
     for &(_, slot) in &hit.path {
         target_path.push(slot as u8);
     }
-    target_path.step_neighbor_in_world(&world.library, world.root, axis, direction);
+    target_path.step_neighbor_cartesian(axis, direction);
 
     place_child_at_path(world, &target_path, new_child)
 }

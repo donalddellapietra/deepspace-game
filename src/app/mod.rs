@@ -518,12 +518,7 @@ impl App {
         // worlds with a defined sea level, `tick` zeroes the Y
         // velocity so entities don't drift off the ground.
         if !self.entities.is_empty() {
-            self.entities.tick(
-                &self.world.library,
-                self.world.root,
-                dt,
-                self.entity_surface_y,
-            );
+            self.entities.tick(&self.world.library, dt, self.entity_surface_y);
         }
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
@@ -551,12 +546,7 @@ impl App {
 
     pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {
         if self.frozen { return; }
-        self.camera.position.anchor.step_neighbor_in_world(
-            &self.world.library,
-            self.world.root,
-            axis,
-            direction,
-        );
+        self.camera.position.anchor.step_neighbor_cartesian(axis, direction);
         self.camera.position.offset = [0.5, 0.5, 0.5];
     }
 

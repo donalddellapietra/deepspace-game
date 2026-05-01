@@ -142,7 +142,6 @@ impl EntityStore {
     pub fn tick(
         &mut self,
         library: &NodeLibrary,
-        world_root: NodeId,
         dt: f32,
         surface_y: Option<f32>,
     ) {
@@ -154,7 +153,7 @@ impl EntityStore {
                 vy * dt,
                 e.velocity[2] * dt,
             ];
-            e.pos.add_local(delta, library, world_root);
+            e.pos.add_local(delta, library);
         }
     }
 }

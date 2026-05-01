@@ -129,11 +129,7 @@ impl App {
             ScriptCmd::Step { axis, delta } => {
                 let mut d = [0.0f32; 3];
                 d[axis as usize] = delta;
-                self.camera.position.add_local(
-                    d,
-                    &self.world.library,
-                    self.world.root,
-                );
+                self.camera.position.add_local(d, &self.world.library);
             }
             ScriptCmd::FlyToSurface => self.fly_to_surface(),
         }
