@@ -103,19 +103,11 @@ pub struct TaaUniforms {
 /// If any field changes between frames, reprojection is unsafe —
 /// the current `camera.pos` is in a different local [0, 3)³ than
 /// the previous frame's, and `hit_pos_prev_frame ≠ hit_pos_current_frame`.
-///
-/// `curvature_k_bucket` is `(k * 20.0).floor() as u32` — a 0.05-quantized
-/// bucket of the per-frame curvature parameter. When the bucket changes
-/// the bent ray paths for every pixel shift; the previous frame's hits
-/// don't reproject to the current frame's pixels under the bent
-/// projection, so we invalidate history. Within a bucket k drift is
-/// small enough that TAA's neighborhood clamp absorbs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct FrameSignature {
     pub root_index: u32,
     pub root_kind: u32,
     pub ribbon_count: u32,
-    pub curvature_k_bucket: u32,
 }
 
 /// Per-frame jitter counter. One tick per frame; wraps inside
@@ -408,17 +400,11 @@ mod tests {
 
     #[test]
     fn signature_equality() {
-        let a = FrameSignature {
-            root_index: 0, root_kind: 0, ribbon_count: 0, curvature_k_bucket: 0,
-        };
-        let b = FrameSignature {
-            root_index: 0, root_kind: 0, ribbon_count: 0, curvature_k_bucket: 0,
-        };
+        let a = FrameSignature { root_index: 0, root_kind: 0, ribbon_count: 0 };
+        let b = FrameSignature { root_index: 0, root_kind: 0, ribbon_count: 0 };
         assert_eq!(a, b);
         let c = FrameSignature { root_index: 1, ..a };
         assert_ne!(a, c);
-        let d = FrameSignature { curvature_k_bucket: 1, ..a };
-        assert_ne!(a, d, "k bucket change must invalidate signature");
     }
 
     #[test]
