@@ -39,7 +39,7 @@ mod image_analysis;
 
 use image_analysis::{
     is_sky_pixel, load_png, silhouette_top_edge, solid_aspect_ratio, solid_bounding_box,
-    solid_fraction, top_edge_curvature_residual,
+    solid_fraction, solid_pixels_per_row, top_edge_curvature_residual,
 };
 
 /// Gitignored artifact directory for this test scenario. Mirrors
@@ -139,22 +139,18 @@ fn slab_at_low_altitude_renders_flat() {
     // We aim along the **non-wrap** axis (Z, slab's 2-cell thin face)
     // and steepen the pitch so the camera sees the slab top through
     // a downward-angled cone that exits via Y / Z, not via the wrap.
-    //
-    // Phase 3: at the default cam altitude k ≈ 0.9 → curvature is
-    // engaged → the slab silhouette curves. To preserve the
-    // "low altitude is flat" invariant we override `cam_y` via
-    // `--wrapped-cam-y` to sit just barely above the slab surface
-    // (slab top at frac_y ≈ 0.074, so cam_y = 0.08 puts the
-    // camera ~0.5% of R above the surface → k ≈ 1e-3, drop ≈ 0).
+    // This guards the Phase 1 invariant (Cartesian DDA still flat
+    // when the wrap branch isn't on the visible ray path) without
+    // conflicting with Phase 2's wrap dispatch on the X axis.
     let png_str = png.to_str().expect("utf8 path");
     let args = [
         "--render-harness",
         "--disable-overlay",
         "--disable-highlight",
         "--wrapped-planet",
-        "--wrapped-cam-y", "0.10",  // ≈3·leaf above slab_top (k ≈ 0.05)
-        "--spawn-pitch", "-1.5707",  // top-down — slab fills frame
-        "--spawn-yaw", "0.0",
+        "--spawn-pitch", "-1.0",  // ~57° down, so the slab top sits
+                                  // in the lower frame as a flat band.
+        "--spawn-yaw", "0.0",  // +z — slab's short axis (no wrap)
         "--harness-width", "320",
         "--harness-height", "240",
         "--exit-after-frames", "30",
@@ -168,27 +164,47 @@ fn slab_at_low_altitude_renders_flat() {
 
     let frac = solid_fraction(&img);
     eprintln!("slab_low_altitude solid_fraction = {frac:.4}");
-    // At low altitude (k ≈ 0.05) top-down view, the slab fills
-    // most of the frame since we're right above it. Just a sanity
-    // check that we're seeing solid content.
-    assert!(frac > 0.5, "expected slab to fill most of the frame, got frac={frac:.4}");
-
-    // Phase-3 invariant: at near-zero k the bent-Y math degenerates
-    // to linear. Top-down silhouette aspect ratio should match the
-    // Phase-2 baseline (slab dims.x / dims.z ≈ 1.93 for the default
-    // [27, 2, 14]), with no spherical-bulge distortion.
-    let aspect = solid_aspect_ratio(&img).expect("non-empty silhouette");
-    eprintln!("slab_low_altitude aspect = {aspect:.3}");
-    // At low altitude the slab fills nearly the whole frame (frame
-    // aspect 320/240 = 1.33). When solid_fraction → 1.0 the
-    // bbox-aspect-ratio metric saturates at the frame aspect.
-    // Tolerate >= 1.3 (frame aspect floor); the upper bound 2.5
-    // catches obvious "stretched" curvature artifacts.
-    assert!(aspect > 1.3 && aspect < 2.5,
-        "low-altitude top-down aspect = {aspect:.3}; expected a wide \
-         rectangle whose visible aspect tracks the slab dims — \
-         curvature artifacts at k≈0 would skew this",
+    // The slab is thin (z-extent ≈ 7% of the embedding cell) and
+    // the visible silhouette is small but non-zero.
+    assert!(frac > 0.005, "expected some slab pixels, got frac={frac:.4}");
+    assert!(frac < 0.5,
+        "expected mostly-sky frame with the slab visible below the horizon, \
+         got frac={frac:.4}",
     );
+
+    let bbox = solid_bounding_box(&img).expect("non-empty silhouette");
+    let (x0, y0, x1, y1) = bbox;
+    eprintln!("slab_low_altitude bbox = ({x0},{y0})-({x1},{y1})");
+
+    // The silhouette top edge of a flat patch is a (near-)horizontal
+    // line — its best-fit straight-line residual is near zero. A
+    // circular planet horizon viewed from low altitude would give
+    // a non-trivially larger residual under the same scale.
+    let resid = top_edge_curvature_residual(&img)
+        .expect("expect a top edge for a non-empty silhouette");
+    eprintln!("slab_low_altitude top_edge_curvature_residual = {resid:.5}");
+    // Threshold 0.05 (= 5% of frame height) is generous; the
+    // synthetic-flat test in `visual_image_analysis.rs` measures
+    // ~1e-3, and a true sphere of similar bbox at low altitude
+    // would give a much larger residual.
+    assert!(resid < 0.05,
+        "slab top edge looks curved (resid={resid:.5}); expected a flat band — \
+         this test guards against accidentally enabling Phase 3 curvature in Phase 1",
+    );
+
+    // Sanity: the silhouette must have a defined TOP edge (not
+    // touching y=0); a slab-from-above usually rests at the bottom
+    // of the frame so y1 is allowed to reach `height-1`.
+    assert!(y0 > 0,
+        "silhouette top edge touches frame top (y0={y0}); the slab \
+         should be below the camera, not filling the upper half",
+    );
+
+    let rows = solid_pixels_per_row(&img);
+    let max_row = *rows.iter().max().unwrap_or(&0);
+    eprintln!("slab_low_altitude max_row_count = {max_row}");
+    assert!(max_row > 0, "no solid pixels in any row");
+    let _ = (x0, x1, y1);
 }
 
 /// Phase 2: a ray cast east along the slab's wrapped axis from
@@ -280,17 +296,12 @@ fn ray_east_along_wrap_axis_sees_slab_via_wrap() {
     let _ = frac_z;
 }
 
-/// Phase 2 / Phase 3: a top-down screenshot at LOW altitude (k ≈ 0)
-/// must NOT show a missing column at the X-wrap seam. Without proper
-/// wrap dispatch the seam can show as a thin vertical sky-stripe
-/// between the slab's two ends.
-///
-/// Phase 3: at HIGH altitude, the bent ray makes the slab look like
-/// a curved spherical patch — only the directly-below portion is
-/// visible (the rest is curved past the horizon). The Phase-2 "every
-/// row solid all the way across" invariant only holds at LOW altitude
-/// where curvature is bit-identical to flat. We use `--wrapped-cam-y
-/// 0.10` to anchor the test below the curvature-engaged regime.
+/// Phase 2: a top-down screenshot at the slab must NOT show a missing
+/// column at the X-wrap seam (the easternmost / westernmost slab
+/// column). Without proper wrap dispatch the seam can show as a thin
+/// vertical sky-stripe between the slab's two ends. Use
+/// `solid_pixels_per_row` as a coarse proxy — every row that crosses
+/// the slab footprint should report a non-zero solid count.
 #[test]
 fn slab_xwrap_seam_is_continuous() {
     use image_analysis::solid_bounding_box;
@@ -298,15 +309,14 @@ fn slab_xwrap_seam_is_continuous() {
     let png = dir.join("slab_xwrap_seam.png");
     let _ = std::fs::remove_file(&png);
     let png_str = png.to_str().expect("utf8 path");
-    // Top-down (pitch ≈ -π/2) at low altitude. Default spawn yaw is
-    // whatever the bootstrap chose; we override to a steady value so
-    // the slab is axis-aligned in the frame.
+    // Top-down (pitch ≈ -π/2). Default spawn yaw is whatever the
+    // bootstrap chose; we override to a steady value so the slab is
+    // axis-aligned in the frame.
     let args = [
         "--render-harness",
         "--disable-overlay",
         "--disable-highlight",
         "--wrapped-planet",
-        "--wrapped-cam-y", "0.10",  // low altitude → k ≈ 0
         "--spawn-pitch", "-1.5707",
         "--spawn-yaw", "0.0",
         "--harness-width", "320",
@@ -347,146 +357,6 @@ fn slab_xwrap_seam_is_continuous() {
         "found a row with only {min_in_band} solid pixels inside the slab band \
          (bbox width {bbox_width}, expected >= {lower}); this looks like a \
          missing X-wrap seam column",
-    );
-}
-
-/// Phase 3: altitude-sweep. Capture the slab from a sequence of
-/// camera altitudes and verify that the visible slab area shrinks
-/// monotonically as the camera ascends. This is the single best
-/// proxy for "the slab looks more curved/sphere-like at higher
-/// altitudes": the bent ray at altitude makes the far portions of
-/// the slab dip below the horizon, so less of the slab is hit.
-///
-/// Saves screenshots at each altitude for the coordinator's review.
-#[test]
-fn slab_altitude_sweep_curves_progressively() {
-    let dir = tmp_dir();
-    // cam_y values in WrappedPlane cell coords. slab_top in marcher
-    // units = 0.222 (= 2/27 · 3). slab_top in cell coords ≈ 0.074.
-    // Δ = altitude above slab_top in MARCHER units. Cell-coord cam_y
-    // = (0.222 + Δ) / 3, clamped to (0.001, 0.999) by the spawn fn.
-    // R ≈ 0.4775 marcher units → altitude_in_R = Δ / 0.4775.
-    let cases = [
-        ("0p05", 0.05_f32),  // Δ=0.05R altitude → k ≈ 0.05 (flat)
-        ("0p5",  0.5_f32),   // Δ=1.05R altitude → k ≈ 0.52
-        ("2p0",  2.0_f32),   // Δ=4.19R altitude → k ≈ 0.89
-        ("5p0",  5.0_f32),   // Δ=10.5R altitude → k ≈ 0.97 (saturated)
-    ];
-
-    let mut prev_solid_frac: Option<f32> = None;
-    // slab_top in marcher units = dims_y · 3/3^slab_depth = 2·(1/9) = 0.222.
-    let slab_top_marcher = 2.0_f32 / 9.0;
-
-    for (label, delta_marcher) in cases.iter() {
-        // cam_y in WrappedPlane cell `[0, 1)` coords:
-        //   cam_y_marcher = slab_top_marcher + delta_marcher
-        //   cam_y_cell    = cam_y_marcher / 3
-        // Spawn fn clamps to [0.001, 0.999) so saturated high-altitude
-        // cases collapse to the same view at the top of the cell.
-        let cam_y_cell = ((slab_top_marcher + delta_marcher) / 3.0).clamp(0.001, 0.999);
-        let png = dir.join(format!("altitude_sweep_{label}.png"));
-        let _ = std::fs::remove_file(&png);
-        let png_str = png.to_str().expect("utf8 path");
-        let cam_y_str = format!("{cam_y_cell}");
-        let args = [
-            "--render-harness",
-            "--disable-overlay",
-            "--disable-highlight",
-            "--wrapped-planet",
-            "--wrapped-cam-y", cam_y_str.as_str(),
-            "--spawn-pitch", "-1.5707",  // top-down
-            "--spawn-yaw", "0.0",
-            "--harness-width", "320",
-            "--harness-height", "240",
-            "--exit-after-frames", "30",
-            "--timeout-secs", "10",
-            "--suppress-startup-logs",
-            "--screenshot", png_str,
-        ];
-        let Some(_) = run_or_skip(&args) else { return };
-        assert!(png.exists(), "screenshot missing: {}", png.display());
-        let img = load_png(&png);
-        let frac = solid_fraction(&img);
-        eprintln!(
-            "altitude_sweep label={label} delta={delta_marcher} cam_y_cell={cam_y_cell:.4} solid_frac={frac:.4}",
-        );
-
-        // Monotonic check: each ascent step should decrease (or hold
-        // ≈ flat for the very-low case where k ≈ 0). Allow small
-        // jitter for sampling/anti-alias drift.
-        //
-        // Skip the monotonic check at the saturated cam_y (≈ 0.999):
-        // the spawn function clamps any Δ that would push past the
-        // cell boundary, so multiple Δ values collapse to the same
-        // physical position. In that regime the bent-ray + wrap
-        // interaction can produce slightly different sampled solid
-        // counts (TAA / anti-alias jitter) without indicating a
-        // real non-monotonic visual.
-        let cam_y_saturated = cam_y_cell >= 0.99;
-        if let Some(prev) = prev_solid_frac {
-            if !cam_y_saturated {
-                assert!(
-                    frac <= prev + 0.02,
-                    "altitude_sweep non-monotonic at label={label}: \
-                     frac={frac:.4} > prev={prev:.4} + 0.02; the bent ray \
-                     should cover LESS slab as altitude rises (more sphere-like)",
-                );
-            }
-        }
-        prev_solid_frac = Some(frac);
-    }
-}
-
-/// Phase 3: edge-on horizon. From a high-altitude camera looking
-/// horizontally at the slab, the silhouette top edge should NOT be
-/// flat. Under curvature, the slab curves downward at the limb so
-/// the top edge has measurable curvature residual; a flat slab would
-/// give a near-zero residual.
-#[test]
-fn slab_edge_on_horizon_silhouette_is_curved() {
-    let dir = tmp_dir();
-    let png = dir.join("edge_on_horizon.png");
-    let _ = std::fs::remove_file(&png);
-    let png_str = png.to_str().expect("utf8 path");
-    let args = [
-        "--render-harness",
-        "--disable-overlay",
-        "--disable-highlight",
-        "--wrapped-planet",
-        // High altitude (cam_y ≈ 0.7 in cell coords ≈ 4.4R), pitch
-        // ≈ 0 (horizontal), yaw aligned with the wrap axis so the
-        // ray sees the slab stretched wide ahead.
-        "--wrapped-cam-y", "0.5",
-        "--spawn-pitch", "0.0",  // horizontal
-        "--spawn-yaw", "1.5707",  // along +x wrap axis
-        "--harness-width", "320",
-        "--harness-height", "240",
-        "--exit-after-frames", "30",
-        "--timeout-secs", "10",
-        "--suppress-startup-logs",
-        "--screenshot", png_str,
-    ];
-    let Some(_) = run_or_skip(&args) else { return };
-    assert!(png.exists(), "screenshot missing: {}", png.display());
-    let img = load_png(&png);
-    let frac = solid_fraction(&img);
-    eprintln!("edge_on_horizon solid_fraction = {frac:.4}");
-    if frac < 0.005 {
-        // The silhouette is too small to extract a meaningful top-
-        // edge curve — bail with a soft skip rather than fail. The
-        // test's goal is to catch a regression where curvature
-        // VANISHES; a tiny silhouette already proves curvature is
-        // active (clipping the far portion of the slab past horizon).
-        eprintln!("edge_on_horizon: silhouette too small for curve fit, skipping resid check");
-        return;
-    }
-    let resid = top_edge_curvature_residual(&img)
-        .expect("expect a top edge for non-empty silhouette");
-    eprintln!("edge_on_horizon top_edge_curvature_residual = {resid:.5}");
-    assert!(resid > 0.005,
-        "edge-on slab silhouette top edge looks flat (resid={resid:.5}); \
-         expected curvature > 0.005 — Phase 3 bend should make the slab \
-         curve downward at the limb",
     );
 }
 

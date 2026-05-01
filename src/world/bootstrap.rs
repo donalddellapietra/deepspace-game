@@ -1006,26 +1006,10 @@ pub fn wrapped_planet_world(
 /// - cam_x = slab_x_centre = (dims.x / 3^slab_depth) / 2
 /// - cam_y = slab_top + air_gap = (dims.y / 3^slab_depth) + clearance
 /// - cam_z = slab_z_centre = (dims.z / 3^slab_depth) / 2
-///
-/// Phase 3: `cam_y_override` lets the caller (test runner via
-/// `--wrapped-cam-y`) replace the default cam_y for altitude-sweep
-/// tests. The override is clamped to `[0.001, 0.999)` to keep the
-/// constructed `WorldPos` strictly inside the WrappedPlane cell;
-/// callers that want a higher altitude than 0.95 (the default
-/// clamp) can pass values up to 0.999.
 pub fn wrapped_planet_spawn(
     embedding_depth: u8,
     slab_dims: [u32; 3],
     slab_depth: u8,
-) -> WorldPos {
-    wrapped_planet_spawn_with_y(embedding_depth, slab_dims, slab_depth, None)
-}
-
-pub fn wrapped_planet_spawn_with_y(
-    embedding_depth: u8,
-    slab_dims: [u32; 3],
-    slab_depth: u8,
-    cam_y_override: Option<f32>,
 ) -> WorldPos {
     let subgrid = (BRANCH as u32).pow(slab_depth as u32) as f32;
     let frac_x = slab_dims[0] as f32 / subgrid;
@@ -1033,10 +1017,7 @@ pub fn wrapped_planet_spawn_with_y(
     let frac_z = slab_dims[2] as f32 / subgrid;
     let cam_x = (frac_x * 0.5).clamp(0.001, 0.999);
     let clearance = (frac_x * 0.7).max(0.05);
-    let default_cam_y = (frac_y + clearance).clamp(0.001, 0.95);
-    let cam_y = cam_y_override
-        .map(|y| y.clamp(0.001, 0.999))
-        .unwrap_or(default_cam_y);
+    let cam_y = (frac_y + clearance).clamp(0.001, 0.95);
     let cam_z = (frac_z * 0.5).clamp(0.001, 0.999);
     // Construct at the WrappedPlane cell, then deepen to slab leaf
     // depth so movement-time `add_local → renormalize_world` sees

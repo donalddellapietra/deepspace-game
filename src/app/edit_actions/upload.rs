@@ -296,34 +296,6 @@ impl App {
             match self.active_frame.kind {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
-                    // Phase 3: derive per-frame curvature from camera
-                    // altitude above the slab surface in slab-root local
-                    // (marcher) units.
-                    //
-                    //   leaf_cell_marcher = 3.0 / 3^slab_depth
-                    //   C (circumference) = dims_x * leaf_cell_marcher  // = 3.0 with the wrap invariant
-                    //   R = C / (2π)
-                    //   slab_surface_y  = dims_y * leaf_cell_marcher
-                    //   altitude        = max(0, (cam_y - slab_surface_y) / R)
-                    //   k               = 1 − 1/(1 + altitude^1.5)
-                    //
-                    // Shader uses the EXACT great-circle drop
-                    //   drop(s, k, R) = R · (1 − cos(s · k / R))
-                    // which is periodic in `s`, so multi-revolution
-                    // rays close back to drop=0 every full loop around
-                    // the planet. At low altitude k ≈ 0 → drop ≈ 0 →
-                    // flat march, bit-identical to Phase 2.
-                    let subgrid = (crate::world::tree::BRANCH as u32)
-                        .pow(slab_depth as u32) as f32;
-                    let leaf_cell_marcher = 3.0_f32 / subgrid;
-                    let circumference = dims[0] as f32 * leaf_cell_marcher;
-                    let r = circumference / std::f32::consts::TAU;
-                    let r_inv = if r > 1e-6 { 1.0 / r } else { 0.0 };
-                    let slab_surface_y = dims[1] as f32 * leaf_cell_marcher;
-                    let cam_y = cam_gpu.pos[1];
-                    let altitude = ((cam_y - slab_surface_y) / r).max(0.0);
-                    let k = 1.0 - 1.0 / (1.0 + altitude.powf(1.5));
-                    renderer.set_curvature(k, r_inv, slab_surface_y);
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
             }

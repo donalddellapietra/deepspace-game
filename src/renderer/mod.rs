@@ -74,9 +74,9 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Render-time curvature parameters: `(k, R_inv, slab_surface_y,
-    /// _spare)`. Mirrors `Uniforms.curvature` in the WGSL bindings.
-    pub curvature: [f32; 4],
+    /// Padding slot retained so the CPU-side `GpuUniforms` matches
+    /// the WGSL `Uniforms` block byte-for-byte. Unused.
+    pub _pad_radii: [f32; 4],
     /// `WrappedPlane` slab dimensions: `(dims_x, dims_y, dims_z,
     /// slab_depth)`. Populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`; the shader's X-wrap branch reads
@@ -143,11 +143,6 @@ pub struct Renderer {
     /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
     /// shader's X-wrap branch reads the X and W lanes.
     pub(super) slab_dims: [u32; 4],
-    /// `(k, R_inv, slab_surface_y, _spare)` curvature uniform for
-    /// the active `WrappedPlane` render frame. Zero-filled when
-    /// `root_kind == ROOT_KIND_CARTESIAN`. App calls
-    /// `set_curvature(k, R_inv, slab_surface_y)` per frame.
-    pub(super) curvature: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -284,28 +279,19 @@ pub(super) fn create_depth_texture(
 
 impl Renderer {
     /// Set the frame-root NodeKind to Cartesian. Clears
-    /// `slab_dims` and `curvature` so the X-wrap and bent-Y branches
-    /// in the shader can't fire from a stale upload.
+    /// `slab_dims` so the X-wrap branch in the shader can't fire
+    /// from a stale upload.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.slab_dims = [0; 4];
-        self.curvature = [0.0; 4];
         self.write_uniforms();
-    }
-
-    /// Set the per-frame curvature parameters for the active
-    /// `WrappedPlane` render frame. Caller must follow this with
-    /// `set_root_kind_wrapped_plane(...)` (or another uniform
-    /// write) so the new value reaches the GPU. Does NOT call
-    /// `write_uniforms` — caller batches with other per-frame
-    /// uniform updates.
-    pub fn set_curvature(&mut self, k: f32, r_inv: f32, slab_surface_y: f32) {
-        self.curvature = [k, r_inv, slab_surface_y, 0.0];
     }
 
     /// Set the frame-root NodeKind to `WrappedPlane`, carrying the
     /// slab's `(dims_x, dims_y, dims_z, slab_depth)` for the
-    /// shader's wrap branch.
+    /// shader's wrap branch. The shader uses `dims_x` and
+    /// `slab_depth` to compute the wrap shift in slab-root local
+    /// units; `dims_y` / `dims_z` are reserved for Phase 3.
     pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_WRAPPED_PLANE;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
@@ -449,17 +435,10 @@ impl Renderer {
     pub fn march_dims_public(&self) -> (u32, u32) { self.march_dims() }
 
     pub(super) fn current_frame_signature(&self) -> FrameSignature {
-        // Bucket curvature_k by 0.05 — k drift within a bucket is
-        // small enough that TAA's neighborhood clamp absorbs the
-        // ray-path divergence; bucket transitions invalidate history
-        // to prevent smear at altitude changes.
-        let k = self.curvature[0].clamp(0.0, 1.0);
-        let curvature_k_bucket = (k * 20.0).floor() as u32;
         FrameSignature {
             root_index: self.root_index,
             root_kind: self.root_kind,
             ribbon_count: self.ribbon_count,
-            curvature_k_bucket,
         }
     }
 }
