@@ -9,7 +9,7 @@
 
 mod cartesian;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary, REPRESENTATIVE_EMPTY};
 
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
@@ -273,6 +273,31 @@ pub fn cpu_raycast_sphere_uv(
                     frac_z = (frac_z * 3.0) - sz as f32;
                 }
             }
+        }
+
+        // Empty-rep skip — mirrors `cpu_raycast_uv_body::descend`'s
+        // `representative_block == REPRESENTATIVE_EMPTY` check (and
+        // Cartesian's `march_cartesian` empty-rep fast path). Without
+        // this, the path can land on a uniform-empty Node (e.g. an
+        // air pocket the user dug earlier, or an unmaterialized empty
+        // sub-region) — `break_block` then "modifies" already-empty
+        // content, the pack output is unchanged, the render shows no
+        // change, and the user sees the break log fire with no visual
+        // effect. Skip and continue to the next radial layer so the
+        // ray finds genuine solid material to break.
+        let &(parent_id, last_slot) = path.last().unwrap();
+        let final_is_empty = match library
+            .get(parent_id)
+            .map(|n| n.children[last_slot])
+        {
+            Some(Child::Empty) | Some(Child::EntityRef(_)) | None => true,
+            Some(Child::Block(_)) => false,
+            Some(Child::Node(c)) => library
+                .get(c)
+                .map_or(true, |n| n.representative_block == REPRESENTATIVE_EMPTY),
+        };
+        if final_is_empty {
+            continue;
         }
 
         return Some(HitInfo {
