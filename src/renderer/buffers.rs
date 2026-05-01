@@ -82,6 +82,7 @@ impl Renderer {
                 &self.aabbs_buffer,
                 &self.mask_view,
                 &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
             self.coarse_bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
@@ -91,6 +92,7 @@ impl Renderer {
                 &self.aabbs_buffer,
                 &self.dummy_mask_view,
                 &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
             self.last_bind_group_rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -143,6 +145,7 @@ impl Renderer {
                 &self.aabbs_buffer,
                 &self.mask_view,
                 &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
             self.coarse_bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
@@ -152,6 +155,7 @@ impl Renderer {
                 &self.aabbs_buffer,
                 &self.dummy_mask_view,
                 &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
             self.last_bind_group_rebuild_ms += rebuild_start.elapsed().as_secs_f64() * 1000.0;
         }
@@ -195,6 +199,7 @@ impl Renderer {
                 &self.aabbs_buffer,
                 &self.mask_view,
                 &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
             self.coarse_bind_group = make_bind_group(
                 &self.device,
@@ -210,6 +215,7 @@ impl Renderer {
                 &self.aabbs_buffer,
                 &self.dummy_mask_view,
                 &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
         } else {
             self.queue
@@ -256,6 +262,7 @@ impl Renderer {
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.aabbs_buffer, &self.mask_view, &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
             self.coarse_bind_group = make_bind_group(
                 &self.device, &self.bind_group_layout,
@@ -263,6 +270,7 @@ impl Renderer {
                 &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
                 &self.shader_stats_buffer, &self.node_offsets_buffer,
                 &self.aabbs_buffer, &self.dummy_mask_view, &self.entity_buffer,
+                &self.walker_probe_buffer,
             );
         }
         self.write_uniforms();
@@ -306,6 +314,8 @@ impl Renderer {
             slab_dims: self.slab_dims,
             _pad_face_bounds: [0.0; 4],
             _pad_face_pop_pos: [0.0; 4],
+            debug_mode: self.debug_mode,
+            probe_pixel: self.probe_pixel,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -396,6 +406,7 @@ pub(super) fn make_bind_group(
     aabbs: &wgpu::Buffer,
     mask_view: &wgpu::TextureView,
     entities: &wgpu::Buffer,
+    walker_probe: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ray_march"),
@@ -412,6 +423,7 @@ pub(super) fn make_bind_group(
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(mask_view) },
             wgpu::BindGroupEntry { binding: 9, resource: aabbs.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 10, resource: entities.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: walker_probe.as_entire_binding() },
         ],
     })
 }

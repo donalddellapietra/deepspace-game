@@ -270,6 +270,8 @@ impl Renderer {
             slab_dims: [0; 4],
             _pad_face_bounds: [0.0; 4],
             _pad_face_pop_pos: [0.0; 4],
+            debug_mode: [0; 4],
+            probe_pixel: [0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -306,6 +308,21 @@ impl Renderer {
         });
         let shader_stats_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shader_stats_readback"),
+            size: 64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        // Walker probe SSBO (binding 11) — 16 u32s = 64 bytes.
+        let walker_probe_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("walker_probe"),
+            size: 64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let walker_probe_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("walker_probe_readback"),
             size: 64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -408,6 +425,16 @@ impl Renderer {
                         has_dynamic_offset: false, min_binding_size: None,
                     }, count: None,
                 },
+                // Walker probe (binding 11) — 16 u32s, one fragment
+                // pixel writes per frame; CPU reads back via
+                // `walker_probe_readback`. Phase 0c diagnostic.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
             ],
         });
 
@@ -431,6 +458,7 @@ impl Renderer {
             &aabbs_buffer,
             &mask_view,
             &entity_buffer,
+            &walker_probe_buffer,
         );
         let coarse_bind_group = make_bind_group(
             &device, &bind_group_layout,
@@ -440,6 +468,7 @@ impl Renderer {
             &aabbs_buffer,
             &dummy_mask_view,
             &entity_buffer,
+            &walker_probe_buffer,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -681,6 +710,10 @@ impl Renderer {
             last_bind_group_rebuild_ms: 0.0,
             shader_stats_buffer,
             shader_stats_readback,
+            walker_probe_buffer,
+            walker_probe_readback,
+            probe_pixel: [0; 4],
+            debug_mode: [0; 4],
             shader_stats_enabled,
             live_frame_counter: 0,
             live_sample_every_frames,

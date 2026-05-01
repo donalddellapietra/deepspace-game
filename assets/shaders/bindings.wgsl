@@ -68,6 +68,18 @@ struct Uniforms {
     slab_dims: vec4<u32>,
     _pad_face_bounds: vec4<f32>,
     _pad_face_pop_pos: vec4<f32>,
+    /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
+    /// replace the shaded colour with per-pixel diagnostic colors. See
+    /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future
+    /// per-mode tuning. Modes 7 & 8 are reserved placeholders for the
+    /// wrapped-planet phases (planet-frame indicator + curvature-offset
+    /// magnitude); they paint a sentinel until Phase 2 / Phase 3 wires
+    /// the underlying state.
+    debug_mode: vec4<u32>,
+    /// `xy` = screen-space pixel to probe walker state for;
+    /// `z` = non-zero means probing is active (0 disables all
+    /// writes to `walker_probe`). `w` reserved.
+    probe_pixel: vec4<u32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
@@ -190,6 +202,49 @@ struct EntityGpu {
 }
 @group(0) @binding(10) var<storage, read> entities: array<EntityGpu>;
 
+/// Per-pixel walker state probe. A tiny 16-u32 buffer that
+/// `march_cartesian` writes into ONLY for the pixel matching
+/// `uniforms.probe_pixel.xy`. Non-atomic stores are safe because
+/// only one fragment invocation passes the pixel-match gate. Used
+/// for in-situ debugging of walker behavior — the CPU reads back
+/// the values after render and prints them.
+///
+/// Slot semantics (see `WalkerProbeFrame` in
+/// `src/renderer/draw.rs` for the CPU-side decode order):
+///
+///   [ 0] hit_flag         — 1 = wrote a hit, 0 = no write
+///   [ 1] ray_steps        — DDA iteration count at hit
+///   [ 2] final_depth      — terminal walker depth
+///   [ 3] terminal_cell    — packed (x|y<<2|z<<4) of the terminal cell
+///   [ 4] cur_node_origin_x_bits  (bitcast<u32>(f32))
+///   [ 5] cur_node_origin_y_bits
+///   [ 6] cur_node_origin_z_bits
+///   [ 7] cur_cell_size_bits      (bitcast<u32>(f32))
+///   [ 8] hit_t_bits              (bitcast<u32>(f32))
+///   [ 9] hit_face                — 0=+X,1=-X,2=+Y,3=-Y,4=+Z,5=-Z (or 7=unknown)
+///   [10] content_flag            — 1 = block hit, 0 = empty/sky
+///   [11] curvature_offset_bits   — Phase 3: bitcast<u32>(Δy at hit)
+///   [12..16] reserved for future per-phase fields.
+struct WalkerProbe {
+    hit_flag: u32,
+    ray_steps: u32,
+    final_depth: u32,
+    terminal_cell: u32,
+    cur_node_origin_x_bits: u32,
+    cur_node_origin_y_bits: u32,
+    cur_node_origin_z_bits: u32,
+    cur_cell_size_bits: u32,
+    hit_t_bits: u32,
+    hit_face: u32,
+    content_flag: u32,
+    curvature_offset_bits: u32,
+    _reserved12: u32,
+    _reserved13: u32,
+    _reserved14: u32,
+    _reserved15: u32,
+}
+@group(0) @binding(11) var<storage, read_write> walker_probe: WalkerProbe;
+
 /// Coarse beam-prepass mask. The fine fragment shader samples a 5-tap
 /// neighborhood at each pixel's tile: if every tap reads 0.0, the
 /// pixel is definitively sky and we return the sky color without
@@ -220,6 +275,12 @@ var<private> ray_loads_tree: u32 = 0u;
 var<private> ray_loads_offsets: u32 = 0u;
 var<private> ray_loads_kinds: u32 = 0u;
 var<private> ray_loads_ribbon: u32 = 0u;
+/// Current pixel coordinate. `fs_main` / `fs_main_taa` / `fs_main_depth`
+/// stamp this from `@builtin(position).xy` before dispatching the
+/// per-pixel march, so `march_cartesian`'s probe gate (and the
+/// `march_debug.wgsl` paint modes) can read it without threading the
+/// builtin through every call site.
+var<private> current_pixel: vec2<u32> = vec2<u32>(0u, 0u);
 
 /// Pipeline-override constant: when false, fs_main skips all
 /// atomic writes to shader_stats and DDA loops skip the `ray_steps`

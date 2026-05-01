@@ -7,6 +7,7 @@
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
 #include "march.wgsl"
+#include "march_debug.wgsl"
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -54,6 +55,15 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir = jittered_ray_dir(uv);
     let result = march(camera.pos, ray_dir);
+
+    // Debug paint dispatch (mode 1..=8): bypass lighting / bevel /
+    // gamma; preserve t in alpha so TAAU history stays correct. See
+    // `march_debug.wgsl`. Returns immediately on debug mode.
+    let dbg_mode = debug_mode_active();
+    if dbg_mode != 0u {
+        let dbg_color = debug_paint(dbg_mode, result, ray_dir);
+        return vec4<f32>(dbg_color, result.t);
+    }
 
     var color: vec3<f32>;
     if result.hit {
@@ -143,6 +153,9 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Stamp `current_pixel` for the walker-probe gate. Cheap; reads
+    // the fragment-pos builtin which is free.
+    current_pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
     // Beam-prepass cull. The coarse pass (fs_coarse_mask) marks
     // tiles that might hit content (1.0) vs definitely sky (0.0).
     // Sample a 5-tap neighborhood (center + 4 cardinal) so tiles
@@ -244,6 +257,7 @@ struct DepthFragOut {
 
 @fragment
 fn fs_main_depth(in: VertexOutput) -> DepthFragOut {
+    current_pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
     let ray_dir = jittered_ray_dir(in.uv);
     let shaded = shade_pixel(in.uv);
     let t = shaded.a;
@@ -272,6 +286,7 @@ struct TaaFragOut {
 
 @fragment
 fn fs_main_taa(in: VertexOutput) -> TaaFragOut {
+    current_pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
     let shaded = shade_pixel(in.uv);
     var out: TaaFragOut;
     out.color = vec4<f32>(shaded.rgb, 1.0);

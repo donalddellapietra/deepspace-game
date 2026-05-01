@@ -13,7 +13,7 @@ pub mod heightmap;
 mod init;
 mod taa;
 
-pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
+pub use draw::{OffscreenRenderTiming, ShaderStatsFrame, WalkerProbeFrame};
 pub use entity_raster::{compute_view_proj, EntityRasterState, InstanceData};
 pub use taa::{FrameSignature, TaaState};
 
@@ -86,6 +86,16 @@ pub struct GpuUniforms {
     pub slab_dims: [u32; 4],
     pub _pad_face_bounds: [f32; 4],
     pub _pad_face_pop_pos: [f32; 4],
+    /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
+    /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
+    /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
+    /// reserved placeholders for the wrapped-planet phases (Phase 2 /
+    /// Phase 3 wire the underlying state).
+    pub debug_mode: [u32; 4],
+    /// `xy` = screen-space pixel to probe walker state for;
+    /// `z` = non-zero means probing is active (0 disables all writes
+    /// to `walker_probe`). `w` reserved.
+    pub probe_pixel: [u32; 4],
 }
 
 pub struct Renderer {
@@ -207,6 +217,20 @@ pub struct Renderer {
     /// via `copy_buffer_to_buffer` at the end of the render pass,
     /// mapped after `poll(Wait)` so the harness can read it back.
     pub(super) shader_stats_readback: wgpu::Buffer,
+    /// Per-pixel walker-state probe SSBO (binding 11). 64 bytes / 16
+    /// u32s. Cleared each frame; `march_cartesian` writes the matching
+    /// pixel's state if `uniforms.probe_pixel.z != 0` and the probe
+    /// pixel matches `current_pixel`. Read back via
+    /// `walker_probe_readback` after render.
+    pub(super) walker_probe_buffer: wgpu::Buffer,
+    pub(super) walker_probe_readback: wgpu::Buffer,
+    /// Mirror of `uniforms.probe_pixel`. `xy` = pixel coords;
+    /// `z` = active flag; `w` reserved. Set by
+    /// `set_walker_probe_pixel`.
+    pub(super) probe_pixel: [u32; 4],
+    /// Mirror of `uniforms.debug_mode`. `.x` = mode (0..=8); `.yzw`
+    /// reserved. Set by `set_debug_mode`.
+    pub(super) debug_mode: [u32; 4],
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
@@ -354,6 +378,7 @@ impl Renderer {
             &self.aabbs_buffer,
             &self.mask_view,
             &self.entity_buffer,
+            &self.walker_probe_buffer,
         );
         // coarse_bind_group uses the dummy mask view which doesn't
         // resize, so it stays valid across resizes.
@@ -440,5 +465,25 @@ impl Renderer {
             root_kind: self.root_kind,
             ribbon_count: self.ribbon_count,
         }
+    }
+
+    /// Enable or disable the walker-state probe for one pixel. When
+    /// `active` is true, `march_cartesian` writes a 16-u32 record into
+    /// `walker_probe` ONLY for the matching pixel each frame; the
+    /// caller then calls `read_walker_probe` to get the values.
+    /// `active=false` zeros the gate; the buffer is still cleared each
+    /// frame so a later read returns `hit_flag=0`.
+    pub fn set_walker_probe_pixel(&mut self, x: u32, y: u32, active: bool) {
+        self.probe_pixel = [x, y, if active { 1 } else { 0 }, 0];
+        self.write_uniforms();
+    }
+
+    /// Set the visual debug paint mode (see `march_debug.wgsl`).
+    /// 0 = off (normal render). 1..=8 paint per-pixel diagnostics.
+    /// Modes 7 / 8 are placeholders for the wrapped-planet phases —
+    /// they return the unwired sentinel until Phase 2 / Phase 3 land.
+    pub fn set_debug_mode(&mut self, mode: u32) {
+        self.debug_mode = [mode, 0, 0, 0];
+        self.write_uniforms();
     }
 }

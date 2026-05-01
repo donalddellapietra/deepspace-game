@@ -68,6 +68,57 @@ fn path_mask_conservative(entry_cell: vec3<i32>, step: vec3<i32>) -> u32 {
 // On hit, returned `HitResult.t / cell_min / cell_size` are in
 // entity-local units; the caller scales back to world via the
 // entity's bbox size.
+
+/// Map an axis-aligned face normal (single ±1 component) to a face id
+/// matching the cube-face convention used by the CPU debug printer:
+/// 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z, 7=unknown / non-axis.
+fn normal_to_face(n: vec3<f32>) -> u32 {
+    if n.x >  0.5 { return 0u; }
+    if n.x < -0.5 { return 1u; }
+    if n.y >  0.5 { return 2u; }
+    if n.y < -0.5 { return 3u; }
+    if n.z >  0.5 { return 4u; }
+    if n.z < -0.5 { return 5u; }
+    return 7u;
+}
+
+/// Walker-probe writer. Called from `march_cartesian`'s hit / miss
+/// return points. Gated on `uniforms.probe_pixel.z != 0u` AND the
+/// current pixel matching `uniforms.probe_pixel.xy`. Non-atomic
+/// stores are safe because at most one fragment invocation in the
+/// grid passes both gates.
+fn write_walker_probe(
+    hit_flag: u32,
+    steps: u32,
+    final_depth: u32,
+    cell: vec3<i32>,
+    cur_node_origin: vec3<f32>,
+    cur_cell_size: f32,
+    hit_t: f32,
+    normal: vec3<f32>,
+    content_flag: u32,
+    curvature_offset: f32,
+) {
+    if uniforms.probe_pixel.z == 0u { return; }
+    if current_pixel.x != uniforms.probe_pixel.x { return; }
+    if current_pixel.y != uniforms.probe_pixel.y { return; }
+    walker_probe.hit_flag = hit_flag;
+    walker_probe.ray_steps = steps;
+    walker_probe.final_depth = final_depth;
+    let cx = u32(clamp(cell.x + 1, 0, 7)) & 7u;
+    let cy = u32(clamp(cell.y + 1, 0, 7)) & 7u;
+    let cz = u32(clamp(cell.z + 1, 0, 7)) & 7u;
+    walker_probe.terminal_cell = cx | (cy << 2u) | (cz << 4u);
+    walker_probe.cur_node_origin_x_bits = bitcast<u32>(cur_node_origin.x);
+    walker_probe.cur_node_origin_y_bits = bitcast<u32>(cur_node_origin.y);
+    walker_probe.cur_node_origin_z_bits = bitcast<u32>(cur_node_origin.z);
+    walker_probe.cur_cell_size_bits = bitcast<u32>(cur_cell_size);
+    walker_probe.hit_t_bits = bitcast<u32>(hit_t);
+    walker_probe.hit_face = normal_to_face(normal);
+    walker_probe.content_flag = content_flag;
+    walker_probe.curvature_offset_bits = bitcast<u32>(curvature_offset);
+}
+
 fn march_entity_subtree(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
 ) -> HitResult {
@@ -542,6 +593,14 @@ fn march_cartesian(
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
+            // Walker probe (tag==1 hit). 0.0 curvature offset until
+            // Phase 3 introduces it; the slot's reserved so the CPU-
+            // side decode shape is stable across phases.
+            write_walker_probe(
+                1u, iterations, depth, cell,
+                cur_node_origin, cur_cell_size,
+                result.t, normal, 1u, 0.0,
+            );
             return result;
         } else if ENABLE_ENTITIES && tag == 3u {
             // tag=3 — EntityRef. Guarded by the compile-time
