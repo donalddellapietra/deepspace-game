@@ -864,4 +864,124 @@ mod tests {
             );
         }
     }
+
+    /// DIAGNOSIS — sphere-mercator-1-1: documents the data-layer
+    /// asymmetry that makes deep-zoom breaks invisible on the sphere.
+    ///
+    /// What the user sees: at default zoom a break makes a hole; at
+    /// "more than 1 layer below the top" (i.e. anchor depth > slab
+    /// natural depth) the break records in the tree but renders as
+    /// solid grass.
+    ///
+    /// What this test checks: walk the tree to the *slab cell* — the
+    /// granularity at which the GPU shader's `sample_slab_cell` reads.
+    /// At max_depth=slab_natural the slab cell becomes Empty/None.
+    /// At max_depth>slab_natural the slab cell stays as a non-uniform
+    /// Node whose `representative_block` is unchanged (still the
+    /// original block type, because 1/27 cells empty leaves the
+    /// majority unchanged), so `sample_slab_cell` returns the SAME
+    /// block_type it returned before the edit — render is identical.
+    ///
+    /// Cartesian doesn't have this problem: `march_cartesian` walks
+    /// `tag=2` Nodes recursively (gated by `LOD_PIXEL_THRESHOLD`), so
+    /// sub-cell holes inside a non-uniform anchor are visible at any
+    /// zoom where the sub-cell is bigger than a pixel.
+    #[test]
+    fn diagnosis_sphere_deep_break_invisible_at_slab_granularity() {
+        use crate::world::bootstrap::wrapped_planet_world;
+        use crate::world::edit::break_block;
+        use crate::world::tree::{slot_index, Child, REPRESENTATIVE_EMPTY, UNIFORM_MIXED};
+
+        // cell_subtree_depth=3 so anchor cells have a real 3-level
+        // sub-tree the deep-break can carve into. Slab natural depth =
+        // embedding(2) + slab(3) = 5.
+        let case = |max_depth: u32| {
+            let mut world = wrapped_planet_world(2, [27, 2, 14], 3, 3);
+            let frame_path = vec![13u8, 13u8];
+            let cam_local = [3.0, 1.5, 1.5];
+            let ray_dir = [-1.0, 0.0, 0.0];
+            let hit = cpu_raycast_sphere_uv(
+                &world.library, world.root, &frame_path,
+                cam_local, ray_dir,
+                [27, 2, 14], 3,
+                1.26,
+                max_depth,
+            ).expect("ray hits +X equator");
+            let path_len = hit.path.len();
+            let slab_path: Vec<usize> =
+                hit.path.iter().take(5).map(|&(_, s)| s).collect();
+            assert!(break_block(&mut world, &hit), "break should succeed");
+
+            // Walk to the slab cell at its natural depth (5 levels)
+            // and inspect what the GPU shader would read there.
+            // sample_slab_cell on the GPU returns block_type from the
+            // packed tag at slab_depth - 1; that tag is `tag=1` (Block,
+            // for uniform anchors after pack-time uniform-flatten), or
+            // `tag=2` with `representative_block` (for non-uniform).
+            let mut node = world.root;
+            for &slot in &slab_path[..4] {
+                match world.library.get(node).unwrap().children[slot] {
+                    Child::Node(c) => node = c,
+                    other => panic!("expected Node mid-slab, got {other:?}"),
+                }
+            }
+            let last_child =
+                world.library.get(node).unwrap().children[slab_path[4]];
+            let observed = match last_child {
+                Child::Empty => "EMPTY".to_string(),
+                Child::Block(bt) => format!("Block(bt={bt})"),
+                Child::EntityRef(_) => "EntityRef".to_string(),
+                Child::Node(nid) => {
+                    let n = world.library.get(nid).unwrap();
+                    if n.uniform_type != UNIFORM_MIXED {
+                        format!("Uniform-Node(uniform_type={})", n.uniform_type)
+                    } else if n.representative_block == REPRESENTATIVE_EMPTY {
+                        "Mixed-Node-but-rep-empty".to_string()
+                    } else {
+                        format!("Mixed-Node(rep_block={})", n.representative_block)
+                    }
+                }
+            };
+            (path_len, observed)
+        };
+
+        let (len5, slab5) = case(5);
+        let (len6, slab6) = case(6);
+        let (len7, slab7) = case(7);
+        let (len8, slab8) = case(8);
+
+        // Edit-depth=5 reaches slab natural granularity. The slab cell
+        // itself is replaced with Empty: the GPU shader's
+        // sample_slab_cell would return REPRESENTATIVE_EMPTY (0xFFFE),
+        // and the cell renders as a hole. CORRECT.
+        assert_eq!(len5, 5, "edit at slab natural takes 5-step path");
+        assert_eq!(slab5, "EMPTY",
+            "edit-depth=5 (slab natural) makes the slab cell Empty -> shader sees REPRESENTATIVE_EMPTY -> visible hole");
+
+        // Edit-depth=6 reaches 1 sub-cell below the slab cell. The
+        // slab cell becomes a non-uniform Node, but its
+        // representative_block is still GRASS (1 of 27 sub-cells empty
+        // leaves majority untouched). The GPU shader's
+        // sample_slab_cell returns this representative -> renders SAME
+        // as before edit. INVISIBLE. **This is the bug.**
+        assert_eq!(len6, 6, "edit-depth=6 takes 6-step path (1 sub-cell level)");
+        assert!(slab6.starts_with("Mixed-Node"),
+            "edit-depth=6 leaves slab cell as Mixed-Node (was {slab6})");
+        assert!(slab6.contains("rep_block=2") || slab6.contains("rep_block=1"),
+            "representative is still grass/dirt/stone (not REPRESENTATIVE_EMPTY) — got {slab6}");
+
+        // Same pattern at edit-depth=7 and 8: each break is 1/27^k of
+        // the slab cell, representative stays the dominant terrain.
+        assert_eq!(len7, 7);
+        assert!(slab7.starts_with("Mixed-Node"));
+        assert_eq!(len8, 8);
+        assert!(slab8.starts_with("Mixed-Node"));
+
+        eprintln!(
+            "DIAGNOSIS — slab cell observation at depth 5 (what shader's sample_slab_cell sees):\n  edit_depth=5 -> {slab5}\n  edit_depth=6 -> {slab6}\n  edit_depth=7 -> {slab7}\n  edit_depth=8 -> {slab8}",
+        );
+
+        // Shut up unused warnings if assertions ever loosen.
+        let _ = slot_index(0, 0, 0);
+    }
 }

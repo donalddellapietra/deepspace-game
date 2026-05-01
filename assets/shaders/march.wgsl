@@ -996,31 +996,107 @@ fn march_cartesian(
     return result;
 }
 
+// Hardware ceiling for the sphere anchor descent stack. Sized
+// independently from `MAX_STACK_DEPTH` (the Cartesian frame stack,
+// which is tuned at 8 for register pressure on Apple Silicon and
+// works because Cartesian's frame-aware system pops between
+// frames + LOD_PIXEL_THRESHOLD prunes descent). Sphere mode has
+// neither — descent into a non-uniform anchor is one continuous
+// stack — so this needs to cover any reasonable
+// `cell_subtree_depth` (default 20) the user might edit into.
+//
+// Set to 24 to leave headroom above the 20-level default. Above
+// this the descent splats representative (same shape as Cartesian's
+// `at_max`). When edits exceed this, raise this constant; sphere
+// mode is opt-in (--planet-render-sphere) so the extra register
+// pressure only applies when sphere render is active.
+const SPHERE_DESCENT_DEPTH: u32 = 24u;
+
+// Result of a slab-cell tree walk. `tag` mirrors pack-format:
+//   0 = empty / no child at this slot
+//   1 = uniform-flatten Block (`block_type` is the leaf material)
+//   2 = non-uniform Node (`block_type` is the representative_block;
+//       `child_idx` is the BFS index of the anchor's subtree, ready
+//       for sub-cell DDA descent).
+struct SlabSample {
+    block_type: u32,
+    tag: u32,
+    child_idx: u32,
+};
+
 // Phase 3 REVISED Step A.1 — sample the slab tree at (cx, cy, cz).
-// Returns the block_type (palette index) of the cell at that
-// integer leaf-level coord, or 0xFFFE (REPRESENTATIVE_EMPTY) if the
-// cell is empty / the path doesn't exist in the packed tree.
 //
 // Walks `slab_depth` levels of 27-children Cartesian descent. At
 // each level: integer-divide the cell coords by `3^(remaining_levels)`
 // to get the slot index, look up the slab tree's child entry there.
-// On tag=1 (Block leaf) → return its block_type. On tag=2 (Node) at
-// the LAST level → return the entry's representative block_type
-// (works because each slab cell after the anchor-block fix is a
-// uniform-block subtree, so its representative IS the surface
-// material). On tag=2 mid-walk → descend one level. On tag=0 (no
-// child at this slot) → empty.
-struct SlabSample {
-    block_type: u32,    // 0xFFFEu = empty
-    nu_child_idx: u32,  // non-zero when terminal cell is a non-uniform
-                        // Node (tag=2) — caller can descend further;
-                        // zero when terminal is leaf / uniform-flatten.
-};
+// At tag=1 (uniform-flatten Block leaf) → return that material.
+// At tag=2 (non-uniform Node) at the LAST level → return its
+// representative_block AND child_idx so the caller can decide whether
+// to LOD-splat or descend into the subtree.
+// On tag=2 mid-walk → descend one level. tag=0 / unknown → empty.
+fn sample_slab_cell(
+    slab_root_idx: u32,
+    slab_depth: u32,
+    cx: i32, cy: i32, cz: i32,
+) -> SlabSample {
+    var out: SlabSample;
+    out.block_type = 0xFFFEu;
+    out.tag = 0u;
+    out.child_idx = 0u;
+    var idx = slab_root_idx;
+    var cells_per_slot: i32 = 1;
+    for (var k: u32 = 1u; k < slab_depth; k = k + 1u) {
+        cells_per_slot = cells_per_slot * 3;
+    }
+    for (var level: u32 = 0u; level < slab_depth; level = level + 1u) {
+        let sx = (cx / cells_per_slot) % 3;
+        let sy = (cy / cells_per_slot) % 3;
+        let sz = (cz / cells_per_slot) % 3;
+        let slot = u32(sx + sy * 3 + sz * 9);
 
-// Closest-face UV bevel for a (lon, lat, r) cell. Returns a finished
-// HitResult so the same renderer path is shared between the outer
-// slab-granularity DDA and the inner sub-cell DDA — the only thing
-// that changes between the two is the cell-boundary inputs.
+        let header_off = node_offsets[idx];
+        let occ = tree[header_off];
+        let bit = 1u << slot;
+        if (occ & bit) == 0u { return out; }
+        let first_child = tree[header_off + 1u];
+        let rank = countOneBits(occ & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
+        let block_type = (packed >> 8u) & 0xFFFFu;
+
+        if tag == 1u {
+            out.block_type = block_type;
+            out.tag = 1u;
+            return out;
+        }
+        if level == slab_depth - 1u {
+            out.block_type = block_type;
+            out.tag = tag;
+            if tag == 2u {
+                out.child_idx = tree[child_base + 1u];
+            }
+            return out;
+        }
+        if tag == 2u {
+            idx = tree[child_base + 1u];
+        } else {
+            return out;
+        }
+        cells_per_slot = cells_per_slot / 3;
+    }
+    return out;
+}
+
+// Closest-face UV bevel for a (lon, lat, r) cell. Same recipe as the
+// existing slab-cell hit code, extracted as a helper so the slab DDA
+// and the sub-cell anchor DDA share one source of truth.
+//
+// `r, lat_p, lon_p` are the ray's spherical coords at hit. The cell's
+// six faces are at the supplied lo/hi bounds; closest-face is chosen
+// by world-space arc length (lon arcs scale by r·cos(lat), lat arcs
+// by r, r-shells in radial units). The other two axes' in-cell
+// fractional positions form the 2D UV used to bevel the face edge.
 fn make_sphere_hit(
     pos: vec3<f32>, n_step: vec3<f32>, t_param: f32, inv_norm: f32,
     block_type: u32,
@@ -1074,36 +1150,159 @@ fn make_sphere_hit(
     result.normal = n_step;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
-    // Neutralize main.wgsl's cube_face_bevel (see sphere_uv_in_cell).
+    // Neutralize main.wgsl::cube_face_bevel — see slab DDA hit comment.
     result.cell_min = pos - vec3<f32>(0.5);
     result.cell_size = 1.0;
     return result;
 }
 
-fn sample_slab_cell(
-    slab_root_idx: u32,
-    slab_depth: u32,
-    cx: i32, cy: i32, cz: i32,
-) -> SlabSample {
-    var out: SlabSample;
-    out.block_type = 0xFFFEu;
-    out.nu_child_idx = 0u;
-    var idx = slab_root_idx;
-    // Initialize cells_per_slot to 3^(slab_depth - 1).
-    var cells_per_slot: i32 = 1;
-    for (var k: u32 = 1u; k < slab_depth; k = k + 1u) {
-        cells_per_slot = cells_per_slot * 3;
-    }
-    for (var level: u32 = 0u; level < slab_depth; level = level + 1u) {
-        let sx = (cx / cells_per_slot) % 3;
-        let sy = (cy / cells_per_slot) % 3;
-        let sz = (cz / cells_per_slot) % 3;
-        let slot = u32(sx + sy * 3 + sz * 9);
+// Stack-based DDA inside an anchor block at sub-cell granularity.
+// Mirrors `march_cartesian` but in (lon, lat, r) space using the
+// sphere-cell boundary primitives (ray_meridian_t, ray_parallel_t,
+// ray_sphere_after).
+//
+// Recipe — tree-structure descent (no camera-distance LOD):
+// * 27-children descent — each level divides (lon, lat, r) cell sizes
+//   by 3.
+// * tag=1 → hit the leaf Block at this sub-cell.
+// * tag=2 + non-empty representative → push child frame, continue
+//   DDA at finer cells. (Pack format auto-flattens uniform Cartesian
+//   subtrees to tag=1, so descent only enters genuinely non-uniform
+//   subtrees — i.e. the path the user actually edited.)
+// * tag=2 + empty representative → skip whole cell.
+// * empty slot / unknown → advance ray to the cell's nearest face.
+// * stack at MAX_STACK_DEPTH → splat representative (hardware ceiling).
+//
+// On exit (ray leaves the slab cell or stack underflows), returns
+// hit=false so the caller's main slab DDA can continue past this
+// slab cell.
+fn sphere_descend_anchor(
+    anchor_idx: u32,
+    ray_origin: vec3<f32>, ray_dir: vec3<f32>,
+    oc: vec3<f32>, cs_center: vec3<f32>, inv_norm: f32,
+    t_in: f32, t_exit: f32,
+    slab_lon_lo: f32, slab_lon_step: f32,
+    slab_lat_lo: f32, slab_lat_step: f32,
+    slab_r_lo:   f32, slab_r_step:   f32,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
 
-        let header_off = node_offsets[idx];
+    var s_node_idx: array<u32, SPHERE_DESCENT_DEPTH>;
+    var s_cell: array<u32, SPHERE_DESCENT_DEPTH>;
+    var depth: u32 = 0u;
+    s_node_idx[0] = anchor_idx;
+
+    // Frame 0 = anchor block. Each axis is 1/3 of the slab cell.
+    var cur_lon_org = slab_lon_lo;
+    var cur_lat_org = slab_lat_lo;
+    var cur_r_org   = slab_r_lo;
+    var cur_lon_step = slab_lon_step / 3.0;
+    var cur_lat_step = slab_lat_step / 3.0;
+    var cur_r_step   = slab_r_step   / 3.0;
+
+    var t = t_in;
+
+    // Initial sub-cell from the ray's t.
+    {
+        let pos0 = ray_origin + ray_dir * t;
+        let off0 = pos0 - cs_center;
+        let r0 = max(length(off0), 1e-9);
+        let n0 = off0 / r0;
+        let lat0 = asin(clamp(n0.y, -1.0, 1.0));
+        let lon0 = atan2(n0.z, n0.x);
+        let cx0 = clamp(i32(floor((lon0 - cur_lon_org) / cur_lon_step)), 0, 2);
+        let cy0 = clamp(i32(floor((r0   - cur_r_org)   / cur_r_step)),   0, 2);
+        let cz0 = clamp(i32(floor((lat0 - cur_lat_org) / cur_lat_step)), 0, 2);
+        s_cell[0] = pack_cell(vec3<i32>(cx0, cy0, cz0));
+    }
+
+    var iters: u32 = 0u;
+    loop {
+        if iters > 256u { break; }
+        iters = iters + 1u;
+        if t > t_exit { break; }
+
+        let cell = unpack_cell(s_cell[depth]);
+        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
+            // OOB: pop one frame, or exit if at the anchor's outer face.
+            if depth == 0u { break; }
+            depth = depth - 1u;
+            cur_lon_step = cur_lon_step * 3.0;
+            cur_lat_step = cur_lat_step * 3.0;
+            cur_r_step   = cur_r_step   * 3.0;
+            let popped = unpack_cell(s_cell[depth]);
+            cur_lon_org = cur_lon_org - f32(popped.x) * cur_lon_step;
+            cur_r_org   = cur_r_org   - f32(popped.y) * cur_r_step;
+            cur_lat_org = cur_lat_org - f32(popped.z) * cur_lat_step;
+            // After the pop, recompute which cell we're in at the
+            // parent frame using the ray's current t. This may match
+            // `popped` (we exited an axis only), or its neighbour
+            // (the axis stepped over a parent boundary already).
+            let pos_p = ray_origin + ray_dir * t;
+            let off_p = pos_p - cs_center;
+            let r_p = max(length(off_p), 1e-9);
+            let n_p = off_p / r_p;
+            let lat_p = asin(clamp(n_p.y, -1.0, 1.0));
+            let lon_p = atan2(n_p.z, n_p.x);
+            let cx_p = i32(floor((lon_p - cur_lon_org) / cur_lon_step));
+            let cy_p = i32(floor((r_p   - cur_r_org)   / cur_r_step));
+            let cz_p = i32(floor((lat_p - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_p, cy_p, cz_p));
+            continue;
+        }
+
+        // Cell bounds for boundary crossings + occupancy lookup.
+        let lon_lo = cur_lon_org + f32(cell.x) * cur_lon_step;
+        let lon_hi = lon_lo + cur_lon_step;
+        let r_lo   = cur_r_org   + f32(cell.y) * cur_r_step;
+        let r_hi   = r_lo + cur_r_step;
+        let lat_lo = cur_lat_org + f32(cell.z) * cur_lat_step;
+        let lat_hi = lat_lo + cur_lat_step;
+
+        let slot = u32(cell.x + cell.y * 3 + cell.z * 9);
+        let header_off = node_offsets[s_node_idx[depth]];
         let occ = tree[header_off];
         let bit = 1u << slot;
-        if (occ & bit) == 0u { return out; }
+
+        // t_next: smallest cell-face crossing > t. Used by every
+        // "advance past this cell" branch below.
+        var t_next = t_exit + 1.0;
+        let t_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
+        if t_lon_lo > 0.0 && t_lon_lo < t_next { t_next = t_lon_lo; }
+        let t_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
+        if t_lon_hi > 0.0 && t_lon_hi < t_next { t_next = t_lon_hi; }
+        let t_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
+        if t_lat_lo > 0.0 && t_lat_lo < t_next { t_next = t_lat_lo; }
+        let t_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
+        if t_lat_hi > 0.0 && t_lat_hi < t_next { t_next = t_lat_hi; }
+        let t_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
+        if t_r_lo > 0.0 && t_r_lo < t_next { t_next = t_r_lo; }
+        let t_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
+        if t_r_hi > 0.0 && t_r_hi < t_next { t_next = t_r_hi; }
+
+        if (occ & bit) == 0u {
+            // Empty slot. Advance to the next cell within this frame.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            if t > t_exit { break; }
+            let pos_a = ray_origin + ray_dir * t;
+            let off_a = pos_a - cs_center;
+            let r_a = max(length(off_a), 1e-9);
+            let n_a = off_a / r_a;
+            let lat_a = asin(clamp(n_a.y, -1.0, 1.0));
+            let lon_a = atan2(n_a.z, n_a.x);
+            let cx_a = i32(floor((lon_a - cur_lon_org) / cur_lon_step));
+            let cy_a = i32(floor((r_a   - cur_r_org)   / cur_r_step));
+            let cz_a = i32(floor((lat_a - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_a, cy_a, cz_a));
+            continue;
+        }
+
         let first_child = tree[header_off + 1u];
         let rank = countOneBits(occ & (bit - 1u));
         let child_base = first_child + rank * 2u;
@@ -1112,29 +1311,104 @@ fn sample_slab_cell(
         let block_type = (packed >> 8u) & 0xFFFFu;
 
         if tag == 1u {
-            out.block_type = block_type;
-            return out;
+            // Block leaf. Hit at this sub-cell.
+            let pos_h = ray_origin + ray_dir * t;
+            let off_h = pos_h - cs_center;
+            let r_h = max(length(off_h), 1e-9);
+            let n_h = off_h / r_h;
+            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
+            let lon_h = atan2(n_h.z, n_h.x);
+            return make_sphere_hit(
+                pos_h, n_h, t, inv_norm, block_type,
+                r_h, lat_h, lon_h,
+                lon_lo, lon_hi, lat_lo, lat_hi, r_lo, r_hi,
+                cur_lon_step, cur_lat_step, cur_r_step,
+            );
         }
-        // Last walked level: this child is a Node anchor block; its
-        // packed block_type is the uniform subtree's representative.
-        // Expose nu_child_idx so the caller can run an inner DDA
-        // inside this slab cell's subtree (= LOD-driven descent for
-        // non-uniform anchors, e.g. ones the player has dug into).
-        if level == slab_depth - 1u {
-            out.block_type = block_type;
-            if tag == 2u {
-                out.nu_child_idx = tree[child_base + 1u];
-            }
-            return out;
+
+        if tag != 2u {
+            // EntityRef etc. — treat as empty for sphere subtree DDA
+            // (no entities-inside-anchor for now). Advance.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            if t > t_exit { break; }
+            let pos_e = ray_origin + ray_dir * t;
+            let off_e = pos_e - cs_center;
+            let r_e = max(length(off_e), 1e-9);
+            let n_e = off_e / r_e;
+            let lat_e = asin(clamp(n_e.y, -1.0, 1.0));
+            let lon_e = atan2(n_e.z, n_e.x);
+            let cx_e = i32(floor((lon_e - cur_lon_org) / cur_lon_step));
+            let cy_e = i32(floor((r_e   - cur_r_org)   / cur_r_step));
+            let cz_e = i32(floor((lat_e - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_e, cy_e, cz_e));
+            continue;
         }
-        if tag == 2u {
-            idx = tree[child_base + 1u];
-        } else {
-            return out;
+
+        // tag == 2u: non-uniform Node. LOD-gate descent.
+        if block_type == 0xFFFEu {
+            // Subtree empty per `representative_block` — skip whole cell.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            if t > t_exit { break; }
+            let pos_r = ray_origin + ray_dir * t;
+            let off_r = pos_r - cs_center;
+            let r_r = max(length(off_r), 1e-9);
+            let n_r = off_r / r_r;
+            let lat_r = asin(clamp(n_r.y, -1.0, 1.0));
+            let lon_r = atan2(n_r.z, n_r.x);
+            let cx_r = i32(floor((lon_r - cur_lon_org) / cur_lon_step));
+            let cy_r = i32(floor((r_r   - cur_r_org)   / cur_r_step));
+            let cz_r = i32(floor((lat_r - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_r, cy_r, cz_r));
+            continue;
         }
-        cells_per_slot = cells_per_slot / 3;
+
+        // Stack ceiling = hardware limit. No camera-distance LOD here:
+        // sphere mode locks the render frame at WrappedPlane, so the
+        // Cartesian "lod_pixels < threshold" check would collapse deep
+        // edits to the representative_block — exactly the bug we're
+        // fixing. Tree structure (uniform-flatten = tag=1, terminate)
+        // alone drives descent.
+        let at_max = depth + 1u >= SPHERE_DESCENT_DEPTH;
+        if at_max {
+            let pos_h = ray_origin + ray_dir * t;
+            let off_h = pos_h - cs_center;
+            let r_h = max(length(off_h), 1e-9);
+            let n_h = off_h / r_h;
+            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
+            let lon_h = atan2(n_h.z, n_h.x);
+            return make_sphere_hit(
+                pos_h, n_h, t, inv_norm, block_type,
+                r_h, lat_h, lon_h,
+                lon_lo, lon_hi, lat_lo, lat_hi, r_lo, r_hi,
+                cur_lon_step, cur_lat_step, cur_r_step,
+            );
+        }
+
+        // Push child frame.
+        let child_idx = tree[child_base + 1u];
+        depth = depth + 1u;
+        s_node_idx[depth] = child_idx;
+        cur_lon_org = lon_lo;
+        cur_lat_org = lat_lo;
+        cur_r_org   = r_lo;
+        cur_lon_step = cur_lon_step / 3.0;
+        cur_lat_step = cur_lat_step / 3.0;
+        cur_r_step   = cur_r_step   / 3.0;
+
+        // Pick the entry sub-cell from the ray's current t.
+        let pos_c = ray_origin + ray_dir * t;
+        let off_c = pos_c - cs_center;
+        let r_c = max(length(off_c), 1e-9);
+        let n_c = off_c / r_c;
+        let lat_c = asin(clamp(n_c.y, -1.0, 1.0));
+        let lon_c = atan2(n_c.z, n_c.x);
+        let cx_c = clamp(i32(floor((lon_c - cur_lon_org) / cur_lon_step)), 0, 2);
+        let cy_c = clamp(i32(floor((r_c   - cur_r_org)   / cur_r_step)),   0, 2);
+        let cz_c = clamp(i32(floor((lat_c - cur_lat_org) / cur_lat_step)), 0, 2);
+        s_cell[depth] = pack_cell(vec3<i32>(cx_c, cy_c, cz_c));
     }
-    return out;
+
+    return result;
 }
 
 // Phase 3 REVISED — Step A.0+A.1: UV-sphere render of the
@@ -1194,109 +1468,43 @@ fn sphere_uv_in_cell(
     let hit_pos = ray_origin + ray_dir * t_enter;
     let n = (hit_pos - cs_center) / r_sphere;
 
-    // A.3 — Full cell-by-cell DDA in spherical (lat, lon, r) cell
-    // coords. Same architecture as 2-2-3-2's `sphere_in_cell` shell
-    // loop: at each iteration, sample the cell at the current ray
-    // position; if empty, compute t to ALL 6 cell-boundary surfaces
-    // (2 meridians, 2 parallels, 2 spheres) and step to the smallest
-    // crossing. Result: each cell has visible volume — pit walls
-    // when dug, layered cake at the limb, no per-pixel jitter.
+    // A.3 — Full cell-by-cell DDA in spherical (lon, lat, r) cell
+    // coords at slab granularity. At each step, sample the cell; if
+    // empty, compute t to ALL 6 cell-boundary surfaces (2 meridians,
+    // 2 parallels, 2 spheres) and step to the smallest crossing.
     //
     // Slab Y maps to radial: cy = dims_y - 1 at r_outer, cy = 0 at
     // r_inner. Slab X (longitude) wraps the full 2π; cells span
     // lon ∈ [-π, π]. Slab Z (latitude) is bounded to ±lat_max
-    // (poles banned outside this band). Renderer never names
-    // materials — sample whatever's at (cell_x, cy, cell_z).
-    // The DDA always steps at the natural slab granularity. The
-    // pack format already auto-flattens uniform Cartesian subtrees
-    // into `tag=1` Block entries with the subtree's block type, so
-    // a uniform anchor cell renders as that single block at any
-    // zoom — same render at every resolution. Non-uniform anchors
-    // render as their `representative_block` (most-common subtree
-    // type), which is the LOD approximation. `uniforms.max_depth`
-    // controls EDIT depth, not RENDER depth — Cartesian works the
-    // same way: `march_cartesian` uses `MAX_STACK_DEPTH` as a
-    // hardware ceiling and `LOD_PIXEL_THRESHOLD` for descent gating,
-    // never the user's anchor depth.
-    let dims_x_root = i32(uniforms.slab_dims.x);
-    let dims_y_root = i32(uniforms.slab_dims.y);
-    let dims_z_root = i32(uniforms.slab_dims.z);
+    // (poles banned outside this band).
+    //
+    // On a non-empty slab cell we mirror march_cartesian's recipe:
+    //  * tag=1 (uniform-flatten Block) → render Block at slab scale.
+    //  * tag=2 (non-uniform Node) → LOD-gate. If sub-cells project
+    //    above LOD_PIXEL_THRESHOLD, dispatch sphere_descend_anchor to
+    //    walk the anchor's subtree at finer (lon, lat, r) granularity.
+    //    Otherwise splat the representative_block at slab scale.
+    let dims_x = i32(uniforms.slab_dims.x);
+    let dims_y = i32(uniforms.slab_dims.y);
+    let dims_z = i32(uniforms.slab_dims.z);
     let slab_depth = uniforms.slab_dims.w;
     let pi = 3.14159265;
     let shell_thickness = r_sphere * 0.25;
     let r_outer = r_sphere;
     let r_inner = r_sphere - shell_thickness;
     let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
-    let lon_step_root = 2.0 * pi / f32(dims_x_root);
-    let lat_step_root = 2.0 * lat_max / f32(dims_z_root);
-    let r_step_root = shell_thickness / f32(dims_y_root);
+    let lon_step = 2.0 * pi / f32(dims_x);
+    let lat_step = 2.0 * lat_max / f32(dims_z);
+    let r_step = shell_thickness / f32(dims_y);
 
-    // Stack-based DDA mirroring `march_cartesian`. Each stack level
-    // operates at its own (lon, lat, r) cell scale:
-    //   - Level 0: outer slab DDA. Cell sample walks `slab_depth`
-    //     levels of the slab tree (`sample_slab_cell`). Cell grid is
-    //     dims × dims × dims.
-    //   - Level d>=1: inner DDA inside a non-uniform cell of level
-    //     d-1. Cell grid is 3×3×3 sub-cells. Cell sample is one
-    //     tree-step from the parent's anchor node.
-    //
-    // On a non-uniform-Node hit (`tag=2`, `nu_child_idx != 0`), we
-    // PUSH a new stack frame: depth++, set up the child node + the
-    // parent cell's (lon, lat, r) range as the new origin / step,
-    // and t_exit = ray-t at parent cell exit. On t > s_t_exit[depth],
-    // we POP back to the parent.
-    //
-    // This is the LOD-driven descent the user asked for: render
-    // adapts to TREE STRUCTURE — uniform anchors render as one
-    // flattened block (1 step at the outer DDA); non-uniform anchors
-    // descend until each sub-cell is uniform / empty / depth-bounded.
-    // Same render at every zoom (descent depth is a function of the
-    // tree, not `uniforms.max_depth`).
-    const SPHERE_STACK_MAX: u32 = 6u;
-    var s_node:    array<u32, 6>;
-    var s_lon0:    array<f32, 6>;  // origin for cell grid at this level
-    var s_lat0:    array<f32, 6>;
-    var s_r0:      array<f32, 6>;
-    var s_dlon:    array<f32, 6>;  // cell width
-    var s_dlat:    array<f32, 6>;
-    var s_dr:      array<f32, 6>;
-    var s_dimx:    array<i32, 6>;  // cell counts at this level
-    var s_dimy:    array<i32, 6>;
-    var s_dimz:    array<i32, 6>;
-    var s_t_exit:  array<f32, 6>;  // pop back to parent when t > this
-
-    s_node[0]   = body_idx;
-    s_lon0[0]   = -pi;
-    s_lat0[0]   = -lat_max;
-    s_r0[0]     = r_inner;
-    s_dlon[0]   = lon_step_root;
-    s_dlat[0]   = lat_step_root;
-    s_dr[0]     = r_step_root;
-    s_dimx[0]   = dims_x_root;
-    s_dimy[0]   = dims_y_root;
-    s_dimz[0]   = dims_z_root;
-    s_t_exit[0] = t_exit;
-
-    var depth: u32 = 0u;
     var t = max(t_enter, 0.0) + 1e-5;
     var iters: u32 = 0u;
     loop {
-        if iters > 1024u { break; }
+        if t > t_exit { break; }
+        if iters > 256u { break; }
         iters = iters + 1u;
 
-        // Pop check: ray past parent cell exit.
-        if t > s_t_exit[depth] {
-            if depth == 0u { break; }
-            // Pop. New depth's t is just past the popped level's exit
-            // — the parent DDA will recompute its current cell from
-            // ray pos and resume.
-            let popped_exit = s_t_exit[depth];
-            depth = depth - 1u;
-            t = popped_exit + max(s_dr[depth] * 1e-4, 1e-6);
-            continue;
-        }
-
-        // Sample at current t.
+        // Current cell (cell_x, cell_y, cell_z) at the ray's t.
         let pos = ray_origin + ray_dir * t;
         let off = pos - cs_center;
         let r = length(off);
@@ -1306,94 +1514,93 @@ fn sphere_uv_in_cell(
         if abs(lat_p) > lat_max { break; }
         let lon_p = atan2(n_step.z, n_step.x);
 
-        // Cell coords at this level (parent-grid integer).
-        let cell_x = clamp(i32(floor((lon_p - s_lon0[depth]) / s_dlon[depth])), 0, s_dimx[depth] - 1);
-        let cell_y = clamp(i32(floor((r     - s_r0[depth])   / s_dr[depth])),   0, s_dimy[depth] - 1);
-        let cell_z = clamp(i32(floor((lat_p - s_lat0[depth]) / s_dlat[depth])), 0, s_dimz[depth] - 1);
+        let u_p = (lon_p + pi) / (2.0 * pi);
+        let v_p = (lat_p + lat_max) / (2.0 * lat_max);
+        let r_frac = (r - r_inner) / shell_thickness;
+        let cell_x = clamp(i32(floor(u_p * f32(dims_x))), 0, dims_x - 1);
+        let cell_z = clamp(i32(floor(v_p * f32(dims_z))), 0, dims_z - 1);
+        let cell_y = clamp(i32(floor(r_frac * f32(dims_y))), 0, dims_y - 1);
 
-        // Cell bounds at this level.
-        let lon_lo_c = s_lon0[depth] + f32(cell_x) * s_dlon[depth];
-        let lon_hi_c = lon_lo_c + s_dlon[depth];
-        let lat_lo_c = s_lat0[depth] + f32(cell_z) * s_dlat[depth];
-        let lat_hi_c = lat_lo_c + s_dlat[depth];
-        let r_lo_c   = s_r0[depth]   + f32(cell_y) * s_dr[depth];
-        let r_hi_c   = r_lo_c + s_dr[depth];
+        // Slab cell bounds in (lon, lat, r).
+        let lon_lo = -pi + f32(cell_x) * lon_step;
+        let lon_hi = lon_lo + lon_step;
+        let lat_lo = -lat_max + f32(cell_z) * lat_step;
+        let lat_hi = lat_lo + lat_step;
+        let r_lo = r_inner + f32(cell_y) * r_step;
+        let r_hi = r_lo + r_step;
 
-        // Sample tree at this level.
-        var bt: u32 = 0xFFFEu;
-        var nu_child: u32 = 0u;
-        if depth == 0u {
-            let sample = sample_slab_cell(s_node[0], slab_depth, cell_x, cell_y, cell_z);
-            bt = sample.block_type;
-            nu_child = sample.nu_child_idx;
-        } else {
-            // Single tree step from parent anchor node.
-            let slot = u32(cell_x + cell_y * 3 + cell_z * 9);
-            let header_off = node_offsets[s_node[depth]];
-            let occ = tree[header_off];
-            let bit = 1u << slot;
-            if (occ & bit) != 0u {
-                let first_child = tree[header_off + 1u];
-                let rank = countOneBits(occ & (bit - 1u));
-                let child_base = first_child + rank * 2u;
-                let packed = tree[child_base];
-                let tag = packed & 0xFFu;
-                bt = (packed >> 8u) & 0xFFFFu;
-                if tag == 2u && bt != 0xFFFEu {
-                    nu_child = tree[child_base + 1u];
-                }
-            }
-        }
-
-        // t to nearest cell-boundary at this level.
-        var t_cell_exit = s_t_exit[depth] + 1.0;
-        let t_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo_c, t);
-        if t_lon_lo > 0.0 && t_lon_lo < t_cell_exit { t_cell_exit = t_lon_lo; }
-        let t_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi_c, t);
-        if t_lon_hi > 0.0 && t_lon_hi < t_cell_exit { t_cell_exit = t_lon_hi; }
-        let t_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo_c, t);
-        if t_lat_lo > 0.0 && t_lat_lo < t_cell_exit { t_cell_exit = t_lat_lo; }
-        let t_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi_c, t);
-        if t_lat_hi > 0.0 && t_lat_hi < t_cell_exit { t_cell_exit = t_lat_hi; }
-        let t_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo_c, t);
-        if t_r_lo > 0.0 && t_r_lo < t_cell_exit { t_cell_exit = t_r_lo; }
-        let t_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi_c, t);
-        if t_r_hi > 0.0 && t_r_hi < t_cell_exit { t_cell_exit = t_r_hi; }
-
-        if bt != 0xFFFEu {
-            if nu_child == 0u || depth + 1u >= SPHERE_STACK_MAX {
-                // tag=1 (uniform-flattened or leaf), OR non-uniform
-                // but we've hit the stack ceiling → render
-                // representative at this depth's bevel scale.
-                return make_sphere_hit(
-                    pos, n_step, t, inv_norm, bt,
-                    r, lat_p, lon_p,
-                    lon_lo_c, lon_hi_c, lat_lo_c, lat_hi_c, r_lo_c, r_hi_c,
-                    s_dlon[depth], s_dlat[depth], s_dr[depth],
+        let sample = sample_slab_cell(body_idx, slab_depth, cell_x, cell_y, cell_z);
+        if sample.block_type != 0xFFFEu {
+            // tag=2 (non-uniform anchor) ⇒ recursive descent into the
+            // anchor's subtree. NO camera-distance LOD gate: in sphere
+            // mode the render frame is locked at WrappedPlane (the
+            // camera doesn't deepen its frame as anchor_depth grows
+            // the way Cartesian does), so a "cell_size/ray_dist <
+            // threshold" check would collapse deep edits to the
+            // representative — exactly the bug we're fixing. Descend
+            // until tag=1 (uniform-flatten Block leaf) or stack max.
+            // Tree structure ALONE drives descent — same principle as
+            // Cartesian (the LOD gate there only works because frame
+            // shifting keeps cells at "normal voxel size" relative to
+            // the camera).
+            if sample.tag == 2u {
+                let sub = sphere_descend_anchor(
+                    sample.child_idx,
+                    ray_origin, ray_dir,
+                    oc, cs_center, inv_norm,
+                    t, t_exit,
+                    lon_lo, lon_step, lat_lo, lat_step, r_lo, r_step,
                 );
+                if sub.hit { return sub; }
+                // Anchor descent exited without a hit — every sub-cell
+                // along the ray's chord was empty. Advance past the
+                // slab cell.
+                var t_n = t_exit + 1.0;
+                let tn_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
+                if tn_lon_lo > 0.0 && tn_lon_lo < t_n { t_n = tn_lon_lo; }
+                let tn_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
+                if tn_lon_hi > 0.0 && tn_lon_hi < t_n { t_n = tn_lon_hi; }
+                let tn_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
+                if tn_lat_lo > 0.0 && tn_lat_lo < t_n { t_n = tn_lat_lo; }
+                let tn_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
+                if tn_lat_hi > 0.0 && tn_lat_hi < t_n { t_n = tn_lat_hi; }
+                let tn_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
+                if tn_r_lo > 0.0 && tn_r_lo < t_n { t_n = tn_r_lo; }
+                let tn_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
+                if tn_r_hi > 0.0 && tn_r_hi < t_n { t_n = tn_r_hi; }
+                if t_n >= t_exit { break; }
+                t = t_n + max(r_step * 1e-4, 1e-6);
+                continue;
             }
-            // Push: descend into the non-uniform child's subtree.
-            let nd = depth + 1u;
-            s_node[nd]   = nu_child;
-            s_lon0[nd]   = lon_lo_c;
-            s_lat0[nd]   = lat_lo_c;
-            s_r0[nd]     = r_lo_c;
-            s_dlon[nd]   = s_dlon[depth] / 3.0;
-            s_dlat[nd]   = s_dlat[depth] / 3.0;
-            s_dr[nd]     = s_dr[depth]   / 3.0;
-            s_dimx[nd]   = 3;
-            s_dimy[nd]   = 3;
-            s_dimz[nd]   = 3;
-            s_t_exit[nd] = t_cell_exit;
-            depth = nd;
-            // Stay at current t — re-enter loop to sample the
-            // CHILD's cell containing the same hit point.
-            continue;
+            // tag=1 (uniform-flatten): the entire anchor subtree is
+            // one Block — render at slab cell scale, no descent
+            // needed (uniform Cartesian subtrees pack-flatten so the
+            // shader sees one Block at any zoom).
+            return make_sphere_hit(
+                pos, n_step, t, inv_norm, sample.block_type,
+                r, lat_p, lon_p,
+                lon_lo, lon_hi, lat_lo, lat_hi, r_lo, r_hi,
+                lon_step, lat_step, r_step,
+            );
         }
 
-        // Empty cell — advance DDA at this level. If past parent
-        // exit, the next iteration's pop check handles it.
-        t = t_cell_exit + max(s_dr[depth] * 1e-4, 1e-6);
+        // Empty cell — advance to the nearest cell-face crossing.
+        var t_next = t_exit + 1.0;
+        let t_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
+        if t_lon_lo > 0.0 && t_lon_lo < t_next { t_next = t_lon_lo; }
+        let t_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
+        if t_lon_hi > 0.0 && t_lon_hi < t_next { t_next = t_lon_hi; }
+        let t_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
+        if t_lat_lo > 0.0 && t_lat_lo < t_next { t_next = t_lat_lo; }
+        let t_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
+        if t_lat_hi > 0.0 && t_lat_hi < t_next { t_next = t_lat_hi; }
+        let t_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
+        if t_r_lo > 0.0 && t_r_lo < t_next { t_next = t_r_lo; }
+        let t_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
+        if t_r_hi > 0.0 && t_r_hi < t_next { t_next = t_r_hi; }
+
+        if t_next >= t_exit { break; }
+        t = t_next + max(r_step * 1e-4, 1e-6);
     }
 
     return result;
