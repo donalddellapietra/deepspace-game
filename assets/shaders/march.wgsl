@@ -389,6 +389,18 @@ fn march_cartesian(
     // amortizes to ~free. Saves ~60 B of per-thread state.
     var cur_side_dist: vec3<f32>;
 
+    // Phase 3 Step 3.0 — per-depth Y-bend stack. `s_y_drop[d]` is the
+    // parabolic-drop value applied at descent into depth d:
+    //   drop = ct_at_descent² · uniforms.curvature.x
+    // Used at side_dist init / OOB pop so the DDA's Y crossings stay
+    // consistent with the bent `local_entry.y` selection at descent.
+    // 0.0 at depth 0 (root has no descent-time bend); set on every
+    // deeper descend; read on pop. Within a single cell the DDA walks
+    // straight (linear approximation) — fine for small cells; the
+    // bend re-applies whenever we re-descend.
+    var s_y_drop: array<f32, MAX_STACK_DEPTH>;
+    s_y_drop[0] = 0.0;
+
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
 
@@ -528,11 +540,16 @@ fn march_cartesian(
             let parent_cell = unpack_cell(s_cell[depth]);
             cur_node_origin = cur_node_origin - vec3<f32>(parent_cell) * cur_cell_size;
             let lc_pop = vec3<f32>(parent_cell);
+            // Y-axis side_dist references the parent's stored bend
+            // (popped depth = `depth` after the decrement above).
+            // Drop is 0.0 at depth 0, so popping to root recovers the
+            // un-bent crossings byte-for-byte.
+            let bent_entry_y_p = entry_pos.y - s_y_drop[depth];
             cur_side_dist = vec3<f32>(
                 select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
                        (cur_node_origin.x + (lc_pop.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                select((cur_node_origin.y + lc_pop.y * cur_cell_size - entry_pos.y) * inv_dir.y,
-                       (cur_node_origin.y + (lc_pop.y + 1.0) * cur_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                select((cur_node_origin.y + lc_pop.y * cur_cell_size - bent_entry_y_p) * inv_dir.y,
+                       (cur_node_origin.y + (lc_pop.y + 1.0) * cur_cell_size - bent_entry_y_p) * inv_dir.y, ray_dir.y >= 0.0),
                 select((cur_node_origin.z + lc_pop.z * cur_cell_size - entry_pos.z) * inv_dir.z,
                        (cur_node_origin.z + (lc_pop.z + 1.0) * cur_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
             );
@@ -602,7 +619,8 @@ fn march_cartesian(
             // reference at known camera positions, Step 3.0 applies
             // the bend — until then, the marcher is bit-identical
             // to the flat path.
-            let curvature_offset = result.t * result.t * uniforms.curvature.x;
+            let horiz_dir_sq_h = ray_dir.x * ray_dir.x + ray_dir.z * ray_dir.z;
+            let curvature_offset = result.t * result.t * horiz_dir_sq_h * uniforms.curvature.x;
             write_walker_probe(
                 1u, iterations, depth, cell,
                 cur_node_origin, cur_cell_size,
@@ -853,7 +871,32 @@ fn march_cartesian(
                 );
                 let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
-                let local_entry = (child_entry - child_origin) / child_cell_size;
+                // Phase 3 Step 3.0 — parabolic Y-bend. The drop is
+                // proportional to HORIZONTAL distance squared, not
+                // total ray distance — a vertical ray (looking
+                // straight down) has zero horizontal travel and
+                // therefore zero bend, which is the correct
+                // geometry for "ray over planet center → no
+                // curvature offset". A horizontal ray at altitude
+                // gets the full bend.
+                //
+                //   horiz_dist(t) = t · sqrt(ray_dir.x² + ray_dir.z²)
+                //   drop          = horiz_dist² · A
+                //                 = t² · (ray_dir.x² + ray_dir.z²) · A
+                //
+                // Recorded in `s_y_drop[depth+1]` so the side_dist
+                // init below references a bent-Y entry_pos. Cell
+                // selection and Y-plane crossings stay consistent at
+                // this depth. On pop, we recompute side_dist using
+                // the parent's stored drop.
+                let horiz_dir_sq = ray_dir.x * ray_dir.x + ray_dir.z * ray_dir.z;
+                let curvature_drop = ct_start * ct_start * horiz_dir_sq * uniforms.curvature.x;
+                let bent_child_entry_y = child_entry.y - curvature_drop;
+                let local_entry = vec3<f32>(
+                    (child_entry.x - child_origin.x) / child_cell_size,
+                    (bent_child_entry_y - child_origin.y) / child_cell_size,
+                    (child_entry.z - child_origin.z) / child_cell_size,
+                );
 
                 // Instrumentation: count of descents the path-mask
                 // cull would catch if enabled. An earlier experiment
@@ -879,6 +922,7 @@ fn march_cartesian(
 
                 depth += 1u;
                 s_node_idx[depth] = child_idx;
+                s_y_drop[depth] = curvature_drop;
                 cur_node_origin = child_origin;
                 cur_cell_size = child_cell_size;
                 // Load the new current-depth header into scalar
@@ -909,11 +953,17 @@ fn march_cartesian(
                 // byte-exact and shifts descent values by -t_start
                 // (typically <0.001 when the camera is inside the
                 // root box, negligible for the LOD-pixel check).
+                // Y-axis side_dist references the BENT entry-y for
+                // this depth (= entry_pos.y - s_y_drop[depth]). This
+                // keeps Y crossings consistent with the bent
+                // local_entry.y above. X / Z use the un-bent
+                // entry_pos because the bend is Y-only.
+                let bent_entry_y_d = entry_pos.y - s_y_drop[depth];
                 cur_side_dist = vec3<f32>(
                     select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
                            (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                    select((child_origin.y + lc.y * child_cell_size - entry_pos.y) * inv_dir.y,
-                           (child_origin.y + (lc.y + 1.0) * child_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                    select((child_origin.y + lc.y * child_cell_size - bent_entry_y_d) * inv_dir.y,
+                           (child_origin.y + (lc.y + 1.0) * child_cell_size - bent_entry_y_d) * inv_dir.y, ray_dir.y >= 0.0),
                     select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
                            (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
                 );
