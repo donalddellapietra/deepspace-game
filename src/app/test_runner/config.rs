@@ -184,6 +184,13 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
+                "--wrapped-planet" => {
+                    cfg.world_preset = WorldPreset::WrappedPlanet {
+                        embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
+                        slab_dims: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
+                        slab_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
+                    };
+                }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
                 "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
                 "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }
@@ -474,6 +481,9 @@ FRACTAL PRESETS (default plain-layers = 8):
 VISIBILITY TEST PRESETS:
   --stars-world               Planet cube + distant stars at varying ribbon
                               depths; validates precision across deep pops
+  --wrapped-planet            Phase-1 wrapped-Cartesian planet: hardcoded
+                              20x10x2 grass/dirt/stone slab embedded at
+                              depth 22, no wrap or curvature yet
 
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):

@@ -65,6 +65,10 @@ struct Uniforms {
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
+/// WrappedPlane root kind. Phase 1: shader treats it identically to
+/// Cartesian (the marcher does not branch on root_kind). Phase 2 will
+/// hook X-wrap on this kind; Phase 3 will hook curvature.
+const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -83,10 +87,14 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0 = Cartesian (only kind in this codebase)
-    _pad0: u32,
-    _pad1: f32,
-    _pad2: f32,
+    kind: u32,        // 0 = Cartesian, 1 = WrappedPlane
+    /// Slab dims (cells/axis) for WrappedPlane; zero for Cartesian.
+    /// Phase 2 reads these to compute X-wrap modulus; Phase 3 reads
+    /// dims_x to derive the implied planet radius. Phase 1: carried
+    /// but unused.
+    dims_x: u32,
+    dims_y: u32,
+    dims_z: u32,
 }
 
 /// Per-frame shader-side counters. Reset to zero each frame by the

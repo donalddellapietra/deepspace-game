@@ -59,23 +59,32 @@ impl GpuChild {
 }
 
 /// Per-packed-node metadata: indexed by BFS position — the same
-/// `node_index` used in `GpuChild::node_index`. Only Cartesian
-/// nodes exist in this codebase; the type is retained as a 16-byte
-/// padded slot so existing GPU buffer layouts and bind groups stay
-/// untouched.
+/// `node_index` used in `GpuChild::node_index`. 16 bytes total.
+///
+/// `kind`: 0 = Cartesian, 1 = WrappedPlane.
+/// `dims_x/y/z`: slab dims (cells per axis) for `WrappedPlane`;
+/// unused (zeroed) for `Cartesian`. The shader will read these in
+/// Phase 2 to drive X-wrap and in Phase 3 to derive the planet
+/// radius. In Phase 1 they're carried but unused.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
     pub kind: u32,
-    pub _pad0: u32,
-    pub _pad1: f32,
-    pub _pad2: f32,
+    pub dims_x: u32,
+    pub dims_y: u32,
+    pub dims_z: u32,
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, _pad0: 0, _pad1: 0.0, _pad2: 0.0 },
+            NodeKind::Cartesian => Self { kind: 0, dims_x: 0, dims_y: 0, dims_z: 0 },
+            NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
+                kind: 1,
+                dims_x: dims[0],
+                dims_y: dims[1],
+                dims_z: dims[2],
+            },
         }
     }
 }
@@ -154,5 +163,20 @@ mod tests {
     fn from_node_kind_cartesian() {
         let k = GpuNodeKind::from_node_kind(NodeKind::Cartesian);
         assert_eq!(k.kind, 0);
+        assert_eq!(k.dims_x, 0);
+        assert_eq!(k.dims_y, 0);
+        assert_eq!(k.dims_z, 0);
+    }
+
+    #[test]
+    fn from_node_kind_wrapped_plane_carries_dims() {
+        let k = GpuNodeKind::from_node_kind(NodeKind::WrappedPlane {
+            dims: [20, 10, 2],
+            slab_depth: 3,
+        });
+        assert_eq!(k.kind, 1);
+        assert_eq!(k.dims_x, 20);
+        assert_eq!(k.dims_y, 10);
+        assert_eq!(k.dims_z, 2);
     }
 }

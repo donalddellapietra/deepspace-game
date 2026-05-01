@@ -58,7 +58,7 @@
 use std::collections::HashMap;
 
 use crate::world::tree::{
-    Child, NodeId, NodeKind, NodeLibrary, UNIFORM_EMPTY, UNIFORM_MIXED,
+    Child, NodeId, NodeLibrary, UNIFORM_EMPTY, UNIFORM_MIXED,
 };
 
 use super::types::{GpuChild, GpuNodeKind};
@@ -206,17 +206,17 @@ impl CachedTree {
                 entity_idx,
             )),
             Child::Node(child_id) => {
-                let (is_cart, uniform_type, representative) = {
+                let (allows_flatten, uniform_type, representative) = {
                     let node = library.get(child_id)?;
                     (
-                        matches!(node.kind, NodeKind::Cartesian),
+                        node.kind.allows_uniform_flatten(),
                         node.uniform_type,
                         node.representative_block,
                     )
                 };
-                if is_cart && uniform_type == UNIFORM_EMPTY {
+                if allows_flatten && uniform_type == UNIFORM_EMPTY {
                     None
-                } else if is_cart && uniform_type != UNIFORM_MIXED {
+                } else if allows_flatten && uniform_type != UNIFORM_MIXED {
                     Some(GpuChild::new(1, uniform_type, 0, 0))
                 } else {
                     let child_bfs = self.emit_or_lookup(library, child_id);
@@ -307,7 +307,7 @@ pub(crate) fn content_aabb(occupancy: u32) -> u16 {
 mod tests {
     use super::*;
     use crate::world::bootstrap::{menger_world, plain_test_world, plain_world};
-    use crate::world::tree::{empty_children, uniform_children, Child, NodeKind, NodeLibrary, CENTER_SLOT};
+    use crate::world::tree::{empty_children, uniform_children, Child, NodeLibrary, CENTER_SLOT};
 
     /// Read the child at (bfs_idx, slot) from a packed tree. Returns
     /// a synthesized `tag=0` GpuChild when the slot is empty.

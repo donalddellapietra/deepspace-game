@@ -82,6 +82,24 @@ pub fn uniform_children(child: Child) -> Children {
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
+    /// Wrapped-Cartesian planet root. The node's descendants form a
+    /// flat Cartesian subtree spanning a `dims.x × dims.y × dims.z`
+    /// grid of leaf cells at `slab_depth` levels below this node.
+    /// Cells outside that footprint within the embedding 27³ volume
+    /// are `Child::Empty` (sparse occupancy = absent).
+    ///
+    /// Phase 1: this is purely a metadata tag — the renderer treats
+    /// it identically to Cartesian. Phases 2 and 3 will hook X-wrap
+    /// and curvature to nodes carrying this kind.
+    WrappedPlane {
+        /// Slab extent in cells along (x, y, z) at `slab_depth`
+        /// levels below this node.
+        dims: [u32; 3],
+        /// Depth descended below this NodeKind to reach the leaf
+        /// cells. The slab subgrid has `3^slab_depth` cells per axis;
+        /// `dims` must satisfy `dims[i] <= 3^slab_depth`.
+        slab_depth: u8,
+    },
 }
 
 impl Default for NodeKind {
@@ -97,7 +115,25 @@ impl Hash for NodeKind {
         std::mem::discriminant(self).hash(state);
         match self {
             NodeKind::Cartesian => {}
+            NodeKind::WrappedPlane { dims, slab_depth } => {
+                dims.hash(state);
+                slab_depth.hash(state);
+            }
         }
+    }
+}
+
+impl NodeKind {
+    /// Whether the GPU packer is allowed to flatten a uniform
+    /// subtree of this kind into a single Block at its parent's
+    /// slot. Cartesian nodes flatten freely (the standard
+    /// content-addressed shrink); kinds that carry metadata the
+    /// shader needs to dispatch on (WrappedPlane: dims, slab_depth)
+    /// must NOT flatten — otherwise the metadata vanishes the moment
+    /// the subtree happens to be uniformly empty / uniformly air.
+    #[inline]
+    pub fn allows_uniform_flatten(self) -> bool {
+        matches!(self, NodeKind::Cartesian)
     }
 }
 
