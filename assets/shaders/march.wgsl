@@ -1161,17 +1161,71 @@ fn sphere_uv_in_cell(
 
         let block_type = sample_slab_cell(body_idx, slab_depth, cell_x, cell_y, cell_z);
         if block_type != 0xFFFEu {
-            // Hit. Parity-checkerboard tint over (cell_x + cell_y +
-            // cell_z) so adjacent cells are visibly distinguishable
-            // (== voxel aesthetic). A.4+ may replace with proper
-            // bevel shading.
-            let tint = select(0.85, 1.0, ((cell_x + cell_z + cell_y) & 1) == 0);
+            // A.3 — Bevel shading. Hit cell has 6 faces in (lon, lat, r);
+            // pick the GEOMETRICALLY closest one (smallest world-space
+            // arc-length to its boundary), then use the other two
+            // axes' in-cell coords as the 2D bevel UV. This picks the
+            // right face whether the ray entered through it OR is now
+            // grazing along it — no entry-face tracking needed. Matches
+            // sphere-uv-1's `uv_hit_face` + `uv_cell_bevel` pattern.
+            let lon_lo_c = -pi + f32(cell_x) * lon_step;
+            let lon_hi_c = lon_lo_c + lon_step;
+            let lat_lo_c = -lat_max + f32(cell_z) * lat_step;
+            let lat_hi_c = lat_lo_c + lat_step;
+            let r_lo_c = r_inner + f32(cell_y) * r_step;
+            let r_hi_c = r_lo_c + r_step;
+            let cos_lat = max(cos(lat_p), 1e-3);
+            let arc_lon_lo = r * cos_lat * abs(lon_p - lon_lo_c);
+            let arc_lon_hi = r * cos_lat * abs(lon_p - lon_hi_c);
+            let arc_lat_lo = r * abs(lat_p - lat_lo_c);
+            let arc_lat_hi = r * abs(lat_p - lat_hi_c);
+            let arc_r_lo  = abs(r - r_lo_c);
+            let arc_r_hi  = abs(r - r_hi_c);
+            // axis: 0=lon, 1=lat, 2=r
+            var best = arc_lon_lo;
+            var axis: u32 = 0u;
+            if arc_lon_hi < best { best = arc_lon_hi; axis = 0u; }
+            if arc_lat_lo < best { best = arc_lat_lo; axis = 1u; }
+            if arc_lat_hi < best { best = arc_lat_hi; axis = 1u; }
+            if arc_r_lo  < best { best = arc_r_lo;  axis = 2u; }
+            if arc_r_hi  < best { best = arc_r_hi;  axis = 2u; }
+
+            let lon_in_cell = clamp((lon_p - lon_lo_c) / lon_step, 0.0, 1.0);
+            let lat_in_cell = clamp((lat_p - lat_lo_c) / lat_step, 0.0, 1.0);
+            let r_in_cell   = clamp((r     - r_lo_c)   / r_step,   0.0, 1.0);
+            var u_in_face: f32;
+            var v_in_face: f32;
+            if axis == 0u {        // lon face: bevel uses (lat, r)
+                u_in_face = lat_in_cell;
+                v_in_face = r_in_cell;
+            } else if axis == 1u { // lat face: bevel uses (lon, r)
+                u_in_face = lon_in_cell;
+                v_in_face = r_in_cell;
+            } else {               // r face: bevel uses (lon, lat)
+                u_in_face = lon_in_cell;
+                v_in_face = lat_in_cell;
+            }
+            let face_edge = min(
+                min(u_in_face, 1.0 - u_in_face),
+                min(v_in_face, 1.0 - v_in_face),
+            );
+            // Same band/strength as cube_face_bevel, applied as a
+            // multiplicative factor in the (0.7, 1.0) range so the UV
+            // body's bevel intensity matches Cartesian voxels.
+            let shape = smoothstep(0.02, 0.14, face_edge);
+            let bevel_strength = 0.7 + 0.3 * shape;
+
             result.hit = true;
             result.t = t * inv_norm;
-            result.color = palette[block_type].rgb * tint;
+            result.color = palette[block_type].rgb * bevel_strength;
             result.normal = n_step;
-            result.cell_min = pos;
-            result.cell_size = body_size / 27.0;
+            // Neutralize `main.wgsl::shade_pixel`'s `cube_face_bevel`:
+            // it would pick a cube face from `result.normal` and
+            // double-darken through the wrong axes (the cell is curved
+            // in lat/lon/r, not axis-aligned). Anchor cell_min/size so
+            // local = (0.5, 0.5, 0.5) → edge=0.5 → smoothstep → 1.0.
+            result.cell_min = pos - vec3<f32>(0.5);
+            result.cell_size = 1.0;
             return result;
         }
 
