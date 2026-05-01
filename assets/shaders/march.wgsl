@@ -1109,14 +1109,19 @@ fn sphere_uv_in_cell(
     let hit_pos = ray_origin + ray_dir * t_enter;
     let n = (hit_pos - cs_center) / r_sphere;
 
-    // A.2 — Shell march. The slab's Y axis maps to the sphere's
-    // radial depth: cell_y = dims_y - 1 (slab top) at radius r_outer,
-    // cell_y = 0 (slab bottom) at radius r_inner. Shell thickness is
-    // a fraction of r_sphere — picked here as 1/4 R; later tunable.
-    // The renderer does NOT know which cells are which material —
-    // it samples whatever's at (cell_x, cell_y, cell_z) and returns
-    // the first solid cell. A dug-out top row reveals the row
-    // beneath it automatically.
+    // A.3 — Full cell-by-cell DDA in spherical (lat, lon, r) cell
+    // coords. Same architecture as 2-2-3-2's `sphere_in_cell` shell
+    // loop: at each iteration, sample the cell at the current ray
+    // position; if empty, compute t to ALL 6 cell-boundary surfaces
+    // (2 meridians, 2 parallels, 2 spheres) and step to the smallest
+    // crossing. Result: each cell has visible volume — pit walls
+    // when dug, layered cake at the limb, no per-pixel jitter.
+    //
+    // Slab Y maps to radial: cy = dims_y - 1 at r_outer, cy = 0 at
+    // r_inner. Slab X (longitude) wraps the full 2π; cells span
+    // lon ∈ [-π, π]. Slab Z (latitude) is bounded to ±lat_max
+    // (poles banned outside this band). Renderer never names
+    // materials — sample whatever's at (cell_x, cy, cell_z).
     let dims_x = i32(uniforms.slab_dims.x);
     let dims_y = i32(uniforms.slab_dims.y);
     let dims_z = i32(uniforms.slab_dims.z);
@@ -1126,66 +1131,79 @@ fn sphere_uv_in_cell(
     let r_outer = r_sphere;
     let r_inner = r_sphere - shell_thickness;
     let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
+    let lon_step = 2.0 * pi / f32(dims_x);
+    let lat_step = 2.0 * lat_max / f32(dims_z);
+    let r_step = shell_thickness / f32(dims_y);
 
-    // Step size: 4 samples per radial cell layer (so a layer of
-    // shell_thickness / dims_y is sampled 4 times along the ray's
-    // chord through it). Conservative; A.3 / future work can use
-    // analytical (lat, lon, r) DDA for fewer steps per pixel.
-    let dt_radial = shell_thickness / max(f32(dims_y) * 4.0, 1.0);
-    var t = t_enter;
-    var steps: u32 = 0u;
+    var t = max(t_enter, 0.0) + 1e-5;
+    var iters: u32 = 0u;
     loop {
         if t > t_exit { break; }
-        if steps > 1024u { break; }
-        steps = steps + 1u;
+        if iters > 256u { break; }
+        iters = iters + 1u;
 
+        // Current cell (cell_x, cell_y, cell_z) at the ray's t.
         let pos = ray_origin + ray_dir * t;
         let off = pos - cs_center;
         let r = length(off);
-
-        // Outside the populated shell — no solid here. If we've
-        // crossed BELOW the inner radius the ray has exited the
-        // planet's interior; bail (sky beyond / through the planet).
-        if r < r_inner { break; }
-        // Above r_outer means we haven't entered the shell yet (or
-        // are exiting on the back side). Step forward.
-        if r > r_outer + 1e-4 {
-            t = t + dt_radial;
-            continue;
-        }
-
+        if r < r_inner || r > r_outer + 1e-3 { break; }
         let n_step = off / r;
-        let lat = asin(clamp(n_step.y, -1.0, 1.0));
-        if abs(lat) > lat_max {
-            t = t + dt_radial;
-            continue; // banned pole — keep stepping; might re-enter
-        }
-        let lon = atan2(n_step.z, n_step.x);
-        let u = (lon + pi) / (2.0 * pi);
-        let v = (lat + lat_max) / (2.0 * lat_max);
-        let cell_x = clamp(i32(floor(u * f32(dims_x))), 0, dims_x - 1);
-        let cell_z = clamp(i32(floor(v * f32(dims_z))), 0, dims_z - 1);
-        // Radial cell index: r_outer → dims_y - 1 (top, GRASS),
-        // r_inner → 0 (bottom, STONE) — but we never name the
-        // materials. Just walk Y as data.
+        let lat_p = asin(clamp(n_step.y, -1.0, 1.0));
+        if abs(lat_p) > lat_max { break; }
+        let lon_p = atan2(n_step.z, n_step.x);
+
+        let u_p = (lon_p + pi) / (2.0 * pi);
+        let v_p = (lat_p + lat_max) / (2.0 * lat_max);
         let r_frac = (r - r_inner) / shell_thickness;
+        let cell_x = clamp(i32(floor(u_p * f32(dims_x))), 0, dims_x - 1);
+        let cell_z = clamp(i32(floor(v_p * f32(dims_z))), 0, dims_z - 1);
         let cell_y = clamp(i32(floor(r_frac * f32(dims_y))), 0, dims_y - 1);
 
         let block_type = sample_slab_cell(body_idx, slab_depth, cell_x, cell_y, cell_z);
         if block_type != 0xFFFEu {
-            // Hit. Plain palette color — the parity-checkerboard tint
-            // from A.1 (verification aid) is removed now that the
-            // cell-lookup math is confirmed correct via tests. A.3
-            // will introduce real bevels for cell-edge visualization.
+            // Hit. Parity-checkerboard tint over (cell_x + cell_y +
+            // cell_z) so adjacent cells are visibly distinguishable
+            // (== voxel aesthetic). A.4+ may replace with proper
+            // bevel shading.
+            let tint = select(0.85, 1.0, ((cell_x + cell_z + cell_y) & 1) == 0);
             result.hit = true;
             result.t = t * inv_norm;
-            result.color = palette[block_type].rgb;
+            result.color = palette[block_type].rgb * tint;
             result.normal = n_step;
             result.cell_min = pos;
             result.cell_size = body_size / 27.0;
             return result;
         }
-        t = t + dt_radial;
+
+        // Empty cell — advance to the nearest boundary crossing.
+        // Each cell has 6 candidate boundaries (2 per axis); we
+        // compute t for all 6 and pick the smallest > t.
+        let lon_lo = -pi + f32(cell_x) * lon_step;
+        let lon_hi = lon_lo + lon_step;
+        let lat_lo = -lat_max + f32(cell_z) * lat_step;
+        let lat_hi = lat_lo + lat_step;
+        let r_lo = r_inner + f32(cell_y) * r_step;
+        let r_hi = r_lo + r_step;
+
+        var t_next = t_exit + 1.0;
+        let t_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
+        if t_lon_lo > 0.0 && t_lon_lo < t_next { t_next = t_lon_lo; }
+        let t_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
+        if t_lon_hi > 0.0 && t_lon_hi < t_next { t_next = t_lon_hi; }
+        let t_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
+        if t_lat_lo > 0.0 && t_lat_lo < t_next { t_next = t_lat_lo; }
+        let t_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
+        if t_lat_hi > 0.0 && t_lat_hi < t_next { t_next = t_lat_hi; }
+        let t_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
+        if t_r_lo > 0.0 && t_r_lo < t_next { t_next = t_r_lo; }
+        let t_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
+        if t_r_hi > 0.0 && t_r_hi < t_next { t_next = t_r_hi; }
+
+        if t_next >= t_exit { break; }
+        // Step past the boundary by a tiny epsilon — proportional
+        // to the cell's radial size so the new sample lands well
+        // inside the next cell.
+        t = t_next + max(r_step * 1e-4, 1e-6);
     }
 
     return result;

@@ -116,21 +116,20 @@ pub fn cpu_raycast_sphere_uv(
         (hit[1] - cs_center[1]) / r_sphere,
         (hit[2] - cs_center[2]) / r_sphere,
     ];
-    // Walk the chord from t_enter to t_exit, sampling cells at each
-    // radial step. Mirrors the GPU shader's A.2 shell march: the slab
-    // Y axis maps to radial depth, with cell_y = dims.y - 1 at
-    // r = r_outer (sphere surface) and cell_y = 0 at r = r_inner.
-    // First non-empty cell wins. The renderer / raycast does NOT name
-    // materials — it just walks Y as data, so a dug-out top cell
-    // reveals the cell beneath automatically.
+    // A.2 (rev) — Analytical per-layer sampling. Mirrors the GPU
+    // shader's revised approach: for each radial cell layer cy ∈
+    // [dims_y - 1 .. 0], compute the EXACT t at the layer's midpoint
+    // radius (= solve quadratic for ray-vs-sphere-of-radius-r_mid),
+    // sample (lat, lon) ONCE at that t, look up the cell. First
+    // solid layer wins. dims_y iterations per ray instead of fixed-
+    // step march. Eliminates per-pixel radial drift artifacts.
     let pi = std::f32::consts::PI;
     let shell_thickness = r_sphere * 0.25;
-    let r_outer = r_sphere;
+    let _r_outer = r_sphere;
     let r_inner = r_sphere - shell_thickness;
-    let dt_radial = shell_thickness / (dims[1] as f32 * 4.0).max(1.0);
+    let oc_dot_oc = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2];
 
-    // Walk frame_path from world_root to the slab root once
-    // (independent of the chord march below).
+    // Walk frame_path from world_root to the slab root once.
     let mut frame_chain: Vec<(NodeId, usize)> = Vec::with_capacity(frame_path.len());
     let mut cur = world_root;
     for &slot in frame_path.iter() {
@@ -143,45 +142,45 @@ pub fn cpu_raycast_sphere_uv(
     }
     let slab_root = cur;
 
-    let mut t = t_enter;
-    let mut steps: u32 = 0;
-    while t <= t_exit && steps < 1024 {
-        steps += 1;
-        let pos = [
-            cam_local[0] + dir[0] * t,
-            cam_local[1] + dir[1] * t,
-            cam_local[2] + dir[2] * t,
-        ];
-        let off = [
-            pos[0] - cs_center[0],
-            pos[1] - cs_center[1],
-            pos[2] - cs_center[2],
-        ];
-        let r = (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt();
-        if r < r_inner {
-            break; // tunnelled through into the empty interior
+    for cy in (0..dims[1] as i32).rev() {
+        // Sample at layer cy's TOP boundary radius (where the ray
+        // first enters the layer from outside) — same fix as the
+        // GPU shader: sampling at the midpoint dropped grazing
+        // chords that touched the layer but never reached the
+        // midpoint.
+        let r_mid = r_inner + (cy as f32 + 1.0) / dims[1] as f32 * shell_thickness;
+        let cr = oc_dot_oc - r_mid * r_mid;
+        let disc_l = b * b - cr;
+        if disc_l < 0.0 {
+            continue; // ray doesn't reach this radius
         }
-        if r > r_outer + 1e-4 {
-            t += dt_radial;
+        let sq_l = disc_l.sqrt();
+        let t_layer = -b - sq_l;
+        if t_layer < 0.0 || t_layer > t_exit {
             continue;
         }
-        let n = [off[0] / r, off[1] / r, off[2] / r];
-        let lat_step = n[1].clamp(-1.0, 1.0).asin();
-        if lat_step.abs() > lat_max {
-            t += dt_radial;
-            continue; // banned latitude band — keep stepping
-        }
-        let lon_step = n[2].atan2(n[0]);
-        let u = (lon_step + pi) / (2.0 * pi);
-        let v = (lat_step + lat_max) / (2.0 * lat_max);
-        let cell_x = ((u * dims[0] as f32).floor() as i32).clamp(0, dims[0] as i32 - 1);
-        let cell_z = ((v * dims[2] as f32).floor() as i32).clamp(0, dims[2] as i32 - 1);
-        let r_frac = (r - r_inner) / shell_thickness;
-        let cell_y = ((r_frac * dims[1] as f32).floor() as i32).clamp(0, dims[1] as i32 - 1);
 
-        // Walk slab tree down to (cell_x, cell_y, cell_z) — same as
-        // the shader's `sample_slab_cell` but returns the path for
-        // HitInfo (or None on empty cell).
+        let pos_l = [
+            cam_local[0] + dir[0] * t_layer,
+            cam_local[1] + dir[1] * t_layer,
+            cam_local[2] + dir[2] * t_layer,
+        ];
+        let n_l = [
+            (pos_l[0] - cs_center[0]) / r_mid,
+            (pos_l[1] - cs_center[1]) / r_mid,
+            (pos_l[2] - cs_center[2]) / r_mid,
+        ];
+        let lat_l = n_l[1].clamp(-1.0, 1.0).asin();
+        if lat_l.abs() > lat_max {
+            continue;
+        }
+        let lon_l = n_l[2].atan2(n_l[0]);
+        let u_l = (lon_l + pi) / (2.0 * pi);
+        let v_l = (lat_l + lat_max) / (2.0 * lat_max);
+        let cell_x = ((u_l * dims[0] as f32).floor() as i32).clamp(0, dims[0] as i32 - 1);
+        let cell_z = ((v_l * dims[2] as f32).floor() as i32).clamp(0, dims[2] as i32 - 1);
+
+        // Walk slab tree down to (cell_x, cy, cell_z).
         let mut path = frame_chain.clone();
         let mut idx = slab_root;
         let mut cells_per_slot: i32 = 1;
@@ -191,7 +190,7 @@ pub fn cpu_raycast_sphere_uv(
         let mut cell_is_empty = false;
         for level in 0..slab_depth {
             let sx = (cell_x / cells_per_slot).rem_euclid(3);
-            let sy = (cell_y / cells_per_slot).rem_euclid(3);
+            let sy = (cy / cells_per_slot).rem_euclid(3);
             let sz = (cell_z / cells_per_slot).rem_euclid(3);
             let slot = slot_index(sx as usize, sy as usize, sz as usize);
             path.push((idx, slot));
@@ -207,7 +206,7 @@ pub fn cpu_raycast_sphere_uv(
                     cell_is_empty = true;
                     break;
                 }
-                Child::Block(_) => break, // hit a leaf block at this level
+                Child::Block(_) => break,
                 Child::Node(child) => {
                     if level + 1 < slab_depth {
                         idx = child;
@@ -217,17 +216,13 @@ pub fn cpu_raycast_sphere_uv(
             cells_per_slot /= 3;
         }
         if !cell_is_empty {
-            // Hit returned: face = +Y (top face — sphere surface
-            // points outward; A.4+ may compute a face from the
-            // sphere normal direction once placement is wired).
             return Some(HitInfo {
                 path,
                 face: 2,
-                t: t * inv_norm,
+                t: t_layer * inv_norm,
                 place_path: None,
             });
         }
-        t += dt_radial;
     }
 
     None
