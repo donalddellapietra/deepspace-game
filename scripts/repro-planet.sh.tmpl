@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# TEMPLATE — not yet runnable. Phase 1 prerequisite: the
+# `--planet-world` CLI flag must exist (Phase 1 adds it).
+#
+# Once Phase 1 lands, copy this to `repro-planet.sh`, replace the
+# `PLACEHOLDER_*` spawn coordinates with real planet-surface coords
+# (see `docs/sphere-mercator/plan.md` §4 for the surface depth = 7),
+# and `chmod +x`.
+#
+# Pattern ported from `sphere-attempt-2-2-3-2/scripts/repro-sphere-d10-bug.sh`:
+#   - Build with `cargo build` (skippable via `SKIP_BUILD=1`)
+#   - Run the headless harness with `--render-harness --disable-overlay`
+#     and `--interaction-radius 10000` so the cursor raycast can reach
+#     the surface from a distance the default 6-cell cap would block
+#   - Output PNGs go to `tmp/<basename>_m${m}.png` in the WORKTREE,
+#     NOT system /tmp (per `feedback_tmp_in_worktree`)
+#   - `--exit-after-frames` and `--timeout-secs` for finite, kill-
+#     switched runs
+#   - The `--script` flag carries the place / wait / screenshot pattern
+#
+# Usage (after Phase 1 wires `--planet-world`):
+#   scripts/repro-planet.sh            # cycles debug modes 0..8
+#   scripts/repro-planet.sh 4          # single mode
+#   SKIP_BUILD=1 scripts/repro-planet.sh   # skip cargo build
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [[ -z "${SKIP_BUILD:-}" ]]; then
+    cargo build >&2
+fi
+
+BIN="./target/debug/deepspace-game"
+mkdir -p tmp
+
+MODES=("$@")
+if [[ ${#MODES[@]} -eq 0 ]]; then
+    MODES=(0 1 2 3 4 5 6 7 8)
+fi
+
+# Phase 1 prerequisite: the `--planet-world` flag must exist before
+# this script can run. Until then, the WORLD_FLAG below is left as a
+# placeholder; running this template AS-IS will fall back to plain-
+# world rendering (which is fine for sanity-checking the harness).
+WORLD_FLAG="--plain-world"
+# Once Phase 1 lands, change to:
+# WORLD_FLAG="--planet-world"
+
+# Spawn coordinates — Phase 1 fills these in once the planet's surface
+# layout is known. Pre-Phase-1 placeholders point at a generic
+# centred-camera spawn so the script template parses cleanly.
+SPAWN_XYZ_X="1.5"
+SPAWN_XYZ_Y="2.0"
+SPAWN_XYZ_Z="1.5"
+SPAWN_DEPTH="8"      # = planet anchor (3) + internal (4) + 1 sub-cell
+SPAWN_PITCH="-0.5"   # gentle look-down, per the d=10 sphere repro
+
+for m in "${MODES[@]}"; do
+    echo "=== mode $m ==="
+    timeout 20 "$BIN" \
+        $WORLD_FLAG \
+        --spawn-xyz "$SPAWN_XYZ_X" "$SPAWN_XYZ_Y" "$SPAWN_XYZ_Z" \
+        --spawn-depth "$SPAWN_DEPTH" \
+        --spawn-pitch "$SPAWN_PITCH" \
+        --interaction-radius 10000 \
+        --debug-mode "$m" \
+        --screenshot "tmp/planet_init_m${m}.png" \
+        --script "wait:10,place,wait:30,screenshot:tmp/planet_m${m}.png" \
+        --exit-after-frames 80 \
+        --timeout-secs 18 \
+        --harness-width 600 \
+        --harness-height 400 \
+        --disable-overlay 2>&1 \
+        | grep -E "HARNESS_EDIT|render_harness_shader|probe_gpu" \
+        | head -3
+done
+
+echo ""
+echo "Outputs:"
+ls -la tmp/planet_m*.png 2>/dev/null || echo "  (no screenshots saved)"

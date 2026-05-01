@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# TEMPLATE — not yet runnable. Phase 5 prerequisite: a way to spawn
+# the camera at a chosen altitude above the planet surface (the
+# Phase-5 `--spawn-altitude-cells N` flag, or a script command that
+# fly-to-surface'es then nudges by N cells of the current anchor
+# depth's cell size).
+#
+# Once Phase 5 wires the altitude flag, copy this to
+# `repro-planet-altitude-sweep.sh`, replace `PLACEHOLDER_*`, and
+# `chmod +x`.
+#
+# Pattern ported from
+# `sphere-attempt-2-2-3-2/scripts/repro-sphere-d10-elevation.sh`.
+# This is Phase 5's tuning loop: spawn the camera at a range of
+# altitudes (cells above the surface), screenshot each, then run
+# `tests/planet_silhouette.rs`'s curvature analyzer over the set to
+# verify d²y/dx² is monotonic in altitude (no horizon pop).
+#
+# Output PNGs go to `tmp/altitude_<cells>_m${m}.png` in the
+# WORKTREE, NOT system /tmp.
+#
+# Usage (after Phase 5 wires altitude spawn):
+#   scripts/repro-planet-altitude-sweep.sh           # default cells
+#   scripts/repro-planet-altitude-sweep.sh 50        # cells=50, all modes
+#   scripts/repro-planet-altitude-sweep.sh 50 4      # cells=50, mode 4
+#
+# Per `feedback_5s_timeout_on_visual_test_runs`, the inner `timeout`
+# wrapper bounds each invocation so a perf regression doesn't stall
+# the loop.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [[ -z "${SKIP_BUILD:-}" ]]; then
+    cargo build >&2
+fi
+
+BIN="./target/debug/deepspace-game"
+mkdir -p tmp
+
+CELLS="${1:-30}"
+MODES=()
+PITCH="-0.5"
+
+if [[ $# -ge 2 ]]; then
+    MODES=("$2")
+fi
+if [[ $# -ge 3 ]]; then
+    PITCH="$3"
+fi
+
+if [[ ${#MODES[@]} -eq 0 ]]; then
+    MODES=(0 1 2 3 4 5 6 7 8)
+fi
+
+# Phase 5 prerequisite: the planet world preset and the
+# `--spawn-altitude-cells` flag must both exist. Until then the
+# placeholders fall back to plain-world rendering at a fixed spawn
+# so the template at least parses + runs.
+WORLD_FLAG="--plain-world"
+ALTITUDE_FLAG=""  # Phase 5 will set: --spawn-altitude-cells "$CELLS"
+# Once Phase 5 lands:
+# WORLD_FLAG="--planet-world"
+# ALTITUDE_FLAG="--spawn-altitude-cells $CELLS"
+
+CAM_ARGS=(
+    $WORLD_FLAG
+    --spawn-depth 8
+    $ALTITUDE_FLAG
+    --spawn-pitch "$PITCH"
+    --interaction-radius 10000
+    --harness-width 600
+    --harness-height 400
+    --disable-overlay
+    --timeout-secs 18
+)
+
+for m in "${MODES[@]}"; do
+    echo "=== altitude=$CELLS pitch=$PITCH mode=$m ==="
+    timeout 20 "$BIN" "${CAM_ARGS[@]}" \
+        --debug-mode "$m" \
+        --screenshot "tmp/altitude_${CELLS}_m${m}.png" \
+        --script "wait:10,place,wait:30,screenshot:tmp/altitude_${CELLS}_m${m}_placed.png" \
+        --exit-after-frames 80 2>&1 \
+        | grep -E "above_y|HARNESS_EDIT|probe_gpu" \
+        | head -3 \
+        || true
+done
+
+echo ""
+echo "Outputs: tmp/altitude_${CELLS}_m*.png"
+echo "Next: feed these into tests/planet_silhouette.rs's curvature analyzer"
+echo "to verify d^2y/dx^2 is monotonic across the altitude sweep."
