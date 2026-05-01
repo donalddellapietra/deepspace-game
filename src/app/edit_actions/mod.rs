@@ -79,10 +79,43 @@ impl App {
                 (hit, frame_path)
             }
             ActiveFrameKind::UvSphereBody { .. } => {
-                // CPU raycast into a UV body isn't implemented yet;
-                // editing-by-cursor is gated off until commit 3 lands
-                // the UV DDA. Return no hit.
-                (None, self.active_frame.render_path)
+                // Render frame IS the body — dispatch the UV DDA
+                // directly. The frame_path identifies the body's
+                // node; the raycast walks the body subtree in
+                // (φ, θ, r) space and returns a HitInfo whose path
+                // is rooted at the body. We splice the world-root
+                // → body slot prefix back on so break_block sees
+                // an absolute path.
+                let frame_path = self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame(&frame_path);
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let body_node_id = self.active_frame.node_id;
+                let hit = raycast::cpu_raycast_uv_body(
+                    &self.world.library,
+                    body_node_id,
+                    cam_local,
+                    ray_dir,
+                    crate::world::tree::MAX_DEPTH as u32,
+                );
+                let hit = hit.map(|mut h| {
+                    let mut prefix: Vec<(crate::world::tree::NodeId, usize)> =
+                        Vec::with_capacity(frame_path.depth() as usize + h.path.len());
+                    let mut cur = self.world.root;
+                    for &slot in frame_path.as_slice() {
+                        prefix.push((cur, slot as usize));
+                        if let Some(node) = self.world.library.get(cur) {
+                            if let crate::world::tree::Child::Node(child_id) =
+                                node.children[slot as usize]
+                            {
+                                cur = child_id;
+                            }
+                        }
+                    }
+                    prefix.append(&mut h.path);
+                    h.path = prefix;
+                    h
+                });
+                (hit, frame_path)
             }
         };
         // Enforce the interaction radius gate: drop hits beyond

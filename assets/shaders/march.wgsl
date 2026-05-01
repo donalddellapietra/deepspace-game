@@ -737,6 +737,37 @@ fn march_cartesian(
                 }
 
                 if ENABLE_STATS { ray_steps_node_descend = ray_steps_node_descend + 1u; }
+
+                // UV-sphere mid-descent dispatch. When the child is
+                // tagged `NODE_KIND_UV_SPHERE_BODY`, transform the
+                // ray into the child's [0, 3)³ local frame and hand
+                // it to `march_uv_sphere`. On UV hit, return; on UV
+                // miss, continue the parent's Cartesian DDA past
+                // this child slot.
+                let kind_id = node_kinds[child_idx].kind;
+                if kind_id == NODE_KIND_UV_SPHERE_BODY {
+                    let inv_size = 1.0 / child_cell_size;
+                    let uv_ray_origin = (ray_origin - child_origin) * inv_size;
+                    let uv_ray_dir = ray_dir * inv_size;
+                    let uv_result = march_uv_sphere(child_idx, uv_ray_origin, uv_ray_dir);
+                    if uv_result.hit {
+                        result.hit = true;
+                        result.t = uv_result.t;
+                        result.color = uv_result.color;
+                        result.normal = uv_result.normal;
+                        result.cell_min = child_origin
+                            + uv_result.cell_min * (child_cell_size / 3.0);
+                        result.cell_size = uv_result.cell_size * (child_cell_size / 3.0);
+                        return result;
+                    }
+                    // UV miss → step the parent DDA past this child.
+                    let m_uv_miss = min_axis_mask(cur_side_dist);
+                    s_cell[depth] = pack_cell(cell + vec3<i32>(m_uv_miss) * step);
+                    cur_side_dist += m_uv_miss * delta_dist * cur_cell_size;
+                    normal = -vec3<f32>(step) * m_uv_miss;
+                    continue;
+                }
+
                 // Use the NODE box for the DDA entry trim, not the
                 // content AABB. The AABB is correct for the CULL test
                 // above (rays missing the AABB skip the descent
@@ -843,12 +874,12 @@ fn march_cartesian(
 // coords, so the inner DDA is unchanged — only the ray is
 // rescaled and the buffer node_idx swapped.
 fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
-    // UV-sphere dispatch: when the render frame is a UvSphereBody
-    // node, hand the ray to `march_uv_sphere`. The shader doesn't
-    // ribbon-pop out of a UV body in this MVP — the camera lives
-    // inside the body and the body fills the [0, 3)³ frame.
+    // UV-sphere dispatch (camera-inside-body case): when the render
+    // frame IS the body, hand the ray straight to `march_uv_sphere`.
+    // The camera-outside-body case is handled by mid-descent
+    // dispatch from inside `march_cartesian`.
     if uniforms.root_kind == ROOT_KIND_UV_SPHERE_BODY {
-        return march_uv_sphere(world_ray_origin, world_ray_dir);
+        return march_uv_sphere(uniforms.root_index, world_ray_origin, world_ray_dir);
     }
 
     var ray_origin = world_ray_origin;

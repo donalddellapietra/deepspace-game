@@ -1,8 +1,8 @@
 //! Cartesian stack-based DDA. CPU mirror of the shader's
 //! `march_cartesian`. Walks the unified tree in XYZ slot order.
 
-use super::HitInfo;
-use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
+use super::{uvsphere as uv_raycast, HitInfo};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH};
 
 /// Stack frame for iterative DDA traversal.
 pub(super) struct Frame {
@@ -129,6 +129,63 @@ pub(super) fn cpu_raycast_inner(
                 if child_node.representative_block
                     == crate::world::tree::REPRESENTATIVE_EMPTY
                 {
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
+
+                // UV-sphere body dispatch (camera-outside-body
+                // case). When the child is a UvSphereBody node,
+                // transform the ray into the child's [0, 3)³ frame
+                // and hand off to the UV DDA. On hit, splice the
+                // current cartesian path prefix in front of the
+                // UV-DDA's body-rooted path. On miss, advance the
+                // parent DDA past this slot just like any other
+                // failed descent.
+                if matches!(child_node.kind, NodeKind::UvSphereBody { .. }) {
+                    let parent_origin = stack[depth].node_origin;
+                    let parent_cell_size = stack[depth].cell_size;
+                    let child_origin = [
+                        parent_origin[0] + cell[0] as f32 * parent_cell_size,
+                        parent_origin[1] + cell[1] as f32 * parent_cell_size,
+                        parent_origin[2] + cell[2] as f32 * parent_cell_size,
+                    ];
+                    // The child cell occupies [child_origin,
+                    // child_origin + parent_cell_size). In the
+                    // child's own `[0, 3)³` frame the cell is divided
+                    // into 3 sub-cells of size `parent_cell_size /
+                    // 3`. Mapping parent → child coords scales by
+                    // `3 / parent_cell_size`.
+                    let inv_size = 3.0 / parent_cell_size;
+                    let uv_origin = [
+                        (ray_origin[0] - child_origin[0]) * inv_size,
+                        (ray_origin[1] - child_origin[1]) * inv_size,
+                        (ray_origin[2] - child_origin[2]) * inv_size,
+                    ];
+                    let uv_dir = [
+                        ray_dir[0] * inv_size,
+                        ray_dir[1] * inv_size,
+                        ray_dir[2] * inv_size,
+                    ];
+                    if let Some(uv_hit) = uv_raycast::cpu_raycast_uv_body(
+                        library,
+                        child_id,
+                        uv_origin,
+                        uv_dir,
+                        MAX_DEPTH as u32,
+                    ) {
+                        // The UV DDA's path starts with `(child_id,
+                        // ...)`. The parent's `path[depth]` already
+                        // points at `(parent_id, slot_into_child)`,
+                        // so concatenating gives the full chain.
+                        let mut full_path = path[..=depth].to_vec();
+                        full_path.extend(uv_hit.path);
+                        return Some(HitInfo {
+                            path: full_path,
+                            face: uv_hit.face,
+                            t: uv_hit.t,
+                            place_path: uv_hit.place_path,
+                        });
+                    }
                     advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
                     continue;
                 }

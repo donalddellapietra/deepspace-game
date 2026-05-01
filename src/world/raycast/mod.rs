@@ -8,8 +8,11 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
+mod uvsphere;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
+pub use uvsphere::cpu_raycast_uv_body;
+
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
@@ -335,6 +338,47 @@ mod tests {
             assert_ne!(world.root, old_root,
                 "root unchanged after break at anchor_depth={anchor_depth}");
         }
+    }
+
+    /// End-to-end: camera at world-root depth, looking toward a
+    /// body that lives at slot 13 of the world root. The cartesian
+    /// raycast walks down to the body and dispatches the UV DDA;
+    /// the returned HitInfo's path is breakable.
+    #[test]
+    fn cpu_raycast_in_frame_dispatches_into_uv_sphere_body() {
+        use crate::world::bootstrap::{bootstrap_world, WorldPreset};
+        use crate::world::edit::break_block;
+
+        let boot = bootstrap_world(WorldPreset::UvSphere, None);
+        let mut world = boot.world;
+
+        // Spawn from `bootstrap_uv_sphere_world` is at world-frame
+        // [1.5, 1.5, 0.4] looking +Z. Cam_local for an empty
+        // frame_path is the same.
+        let cam_local = [1.5, 1.5, 0.4];
+        let ray_dir = [0.0, 0.0, 1.0];
+
+        let hit = cpu_raycast_in_frame(
+            &world.library,
+            world.root,
+            &[],
+            cam_local,
+            ray_dir,
+            crate::world::tree::MAX_DEPTH as u32,
+            crate::world::tree::MAX_DEPTH as u32,
+        )
+        .expect("ray must hit the UV-sphere body");
+
+        // The hit path begins at the world root.
+        assert_eq!(hit.path[0].0, world.root);
+        // And eventually descends into a body slot — the second
+        // entry's parent should be the body root.
+        assert!(hit.path.len() >= 2);
+
+        let old_root = world.root;
+        let changed = break_block(&mut world, &hit);
+        assert!(changed, "break_block must succeed against the UV-DDA hit");
+        assert_ne!(world.root, old_root);
     }
 
     #[test]

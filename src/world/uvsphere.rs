@@ -312,10 +312,18 @@ pub fn demo_uv_sphere() -> UvSphereSetup {
         inner_r,
         outer_r,
         theta_cap,
-        depth: 28,
+        // Chunky voxels for visualization. depth=4 → 3⁴ = 81 cells
+        // per parameter axis at the leaves; from the demo spawn
+        // distance each cell projects to roughly 5–10 px so the UV
+        // bevels are clearly visible. Bump this to grow detail when
+        // the LOD termination lands.
+        depth: 4,
         sdf: Planet {
             center: [0.5, 0.5, 0.5],
             radius: 0.15,
+            // Smooth ball — no noise. The voxel-cell bevels alone
+            // give the surface its texture; noise stacked on top
+            // makes the silhouette uneven and harder to read.
             noise_scale: 0.0,
             noise_freq: 1.0,
             noise_seed: 0,

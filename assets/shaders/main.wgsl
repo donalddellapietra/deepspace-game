@@ -5,8 +5,8 @@
 
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
-#include "march.wgsl"
 #include "uvsphere.wgsl"
+#include "march.wgsl"
 #include "march_debug.wgsl"
 
 struct VertexOutput {
