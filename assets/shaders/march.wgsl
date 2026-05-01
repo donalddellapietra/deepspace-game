@@ -1376,6 +1376,11 @@ fn sphere_descend_anchor(
         if tag == 1u {
             // Block leaf. Hit at this sub-cell. Use precision-stable
             // in_cell for bevel.
+            //
+            // Axis-convention swizzle: descent tracks frame_in_frac as
+            // (lon, r, lat) to match the slab-tree slot layout
+            // (cell.y = r, cell.z = lat). make_sphere_hit takes
+            // (lon, lat, r). Swapping y↔z aligns the bevel.
             let pos_h = ray_origin + ray_dir * t;
             let off_h = pos_h - cs_center;
             let r_h = max(length(off_h), 1e-9);
@@ -1384,7 +1389,7 @@ fn sphere_descend_anchor(
             return make_sphere_hit(
                 pos_h, n_h, t, inv_norm, block_type,
                 r_h, lat_h,
-                in_cell,
+                vec3<f32>(in_cell.x, in_cell.z, in_cell.y),
                 cur_lon_step, cur_lat_step, cur_r_step,
             );
         }
@@ -1455,6 +1460,7 @@ fn sphere_descend_anchor(
         // alone drives descent.
         let at_max = depth + 1u >= SPHERE_DESCENT_DEPTH;
         if at_max {
+            // Same axis-convention swizzle as the tag=1 hit above.
             let pos_h = ray_origin + ray_dir * t;
             let off_h = pos_h - cs_center;
             let r_h = max(length(off_h), 1e-9);
@@ -1463,7 +1469,7 @@ fn sphere_descend_anchor(
             return make_sphere_hit(
                 pos_h, n_h, t, inv_norm, block_type,
                 r_h, lat_h,
-                in_cell,
+                vec3<f32>(in_cell.x, in_cell.z, in_cell.y),
                 cur_lon_step, cur_lat_step, cur_r_step,
             );
         }
