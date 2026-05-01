@@ -593,13 +593,20 @@ fn march_cartesian(
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
-            // Walker probe (tag==1 hit). 0.0 curvature offset until
-            // Phase 3 introduces it; the slot's reserved so the CPU-
-            // side decode shape is stable across phases.
+            // Walker probe (tag==1 hit). Curvature offset is the
+            // parabolic-drop value the bend math WOULD apply at this
+            // hit's t — `result.t² · A`. Computed but NOT yet applied
+            // to the cell selection (Step 3.0 pre-bend phase: we use
+            // the probe to verify the math before changing what the
+            // marcher does). Once the probe values match the CPU
+            // reference at known camera positions, Step 3.0 applies
+            // the bend — until then, the marcher is bit-identical
+            // to the flat path.
+            let curvature_offset = result.t * result.t * uniforms.curvature.x;
             write_walker_probe(
                 1u, iterations, depth, cell,
                 cur_node_origin, cur_cell_size,
-                result.t, normal, 1u, 0.0,
+                result.t, normal, 1u, curvature_offset,
             );
             return result;
         } else if ENABLE_ENTITIES && tag == 3u {
@@ -846,18 +853,7 @@ fn march_cartesian(
                 );
                 let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
-                // Phase 3 Step 3.0 — per-descent parabolic bend.
-                // Subtract `A * dist²` from the y component of the
-                // child entry, where dist is the (frame-local) ray
-                // parameter at this descent. Cells selected reflect
-                // the bent path; side_dist init below still uses the
-                // un-bent entry_pos (linear approximation between
-                // descents — small for deep trees, refines as descent
-                // depth grows). `A = 0` (the default) zeroes the drop
-                // and the marcher is bit-identical to the flat path.
-                let curvature_drop = ct_start * ct_start * uniforms.curvature.x;
-                let bent_child_entry = child_entry - vec3<f32>(0.0, curvature_drop, 0.0);
-                let local_entry = (bent_child_entry - child_origin) / child_cell_size;
+                let local_entry = (child_entry - child_origin) / child_cell_size;
 
                 // Instrumentation: count of descents the path-mask
                 // cull would catch if enabled. An earlier experiment
