@@ -52,11 +52,16 @@ impl App {
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            ActiveFrameKind::Cartesian => {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                 // Raycast from the render frame — f32 can only represent
                 // positions a few levels deeper than the frame root.
                 // The pop loop handles finding hits at coarser depths
-                // via slot-arithmetic frame transitions.
+                // via slot-arithmetic frame transitions. The CPU
+                // raycast is wrap-unaware (doesn't follow X-wrap into
+                // the slab from outside); for editing inside a
+                // WrappedPlane slab the cursor can still hit content
+                // because the camera is inside the slab cell and
+                // raycasting stays inside the [0, 3)^3 frame.
                 let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);

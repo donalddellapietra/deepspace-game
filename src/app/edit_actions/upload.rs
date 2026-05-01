@@ -295,6 +295,9 @@ impl App {
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
+                ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                    renderer.set_root_kind_wrapped_plane(dims, slab_depth);
+                }
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

@@ -74,11 +74,16 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Padding slots retained so the CPU-side `GpuUniforms` matches
-    /// the WGSL `Uniforms` block byte-for-byte. The shader doesn't
-    /// read them in the wrapped-Cartesian architecture.
+    /// Padding slot retained so the CPU-side `GpuUniforms` matches
+    /// the WGSL `Uniforms` block byte-for-byte. Unused.
     pub _pad_radii: [f32; 4],
-    pub _pad_face_meta: [u32; 4],
+    /// `WrappedPlane` slab dimensions: `(dims_x, dims_y, dims_z,
+    /// slab_depth)`. Populated when `root_kind ==
+    /// ROOT_KIND_WRAPPED_PLANE`; the shader's X-wrap branch reads
+    /// `slab_dims.x` and `slab_dims.w`. Zero-filled on Cartesian
+    /// root frames. Mirrors `Uniforms.slab_dims` in
+    /// `assets/shaders/bindings.wgsl`.
+    pub slab_dims: [u32; 4],
     pub _pad_face_bounds: [f32; 4],
     pub _pad_face_pop_pos: [f32; 4],
 }
@@ -133,6 +138,11 @@ pub struct Renderer {
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
+    /// `(dims_x, dims_y, dims_z, slab_depth)` for the active
+    /// `WrappedPlane` render frame. Zero-filled when `root_kind ==
+    /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
+    /// shader's X-wrap branch reads the X and W lanes.
+    pub(super) slab_dims: [u32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -268,10 +278,23 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian (the only kind in
-    /// the wrapped-Cartesian architecture).
+    /// Set the frame-root NodeKind to Cartesian. Clears
+    /// `slab_dims` so the X-wrap branch in the shader can't fire
+    /// from a stale upload.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
+        self.slab_dims = [0; 4];
+        self.write_uniforms();
+    }
+
+    /// Set the frame-root NodeKind to `WrappedPlane`, carrying the
+    /// slab's `(dims_x, dims_y, dims_z, slab_depth)` for the
+    /// shader's wrap branch. The shader uses `dims_x` and
+    /// `slab_depth` to compute the wrap shift in slab-root local
+    /// units; `dims_y` / `dims_z` are reserved for Phase 3.
+    pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
+        self.root_kind = ROOT_KIND_WRAPPED_PLANE;
+        self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
         self.write_uniforms();
     }
 

@@ -756,15 +756,18 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
 
 /// Default slab dims (cells along x, y, z) for `--wrapped-planet`.
 ///
-/// Picked from the high-level plan: 20 wide × 10 tall × 2 thick.
-/// At `slab_depth = 3` the subgrid is 27³ which comfortably houses
-/// 20×10×2; at `slab_depth = 2` the subgrid is only 9³, so 20×10
-/// would not fit (see `wrapped_planet_world` slab_depth notes).
-pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [20, 10, 2];
+/// Phase 2 X-wrap correctness requires `dims[0] == 3^slab_depth` —
+/// the slab must fully fill the WrappedPlane node along the wrap axis
+/// so the shader's `depth==0 && OOB-on-X` trigger lands on the slab
+/// footprint edge. With `slab_depth = 3` that's `dims[0] = 27`. Y
+/// and Z stay small (10 thick × 2 deep) — they exit the slab via the
+/// normal ribbon-pop path, no fill constraint there.
+pub const DEFAULT_WRAPPED_PLANET_SLAB_DIMS: [u32; 3] = [27, 10, 2];
 /// Default depth descended below the `WrappedPlane` node to reach
-/// leaf cells. With `dims = [20, 10, 2]` the smallest valid
-/// `slab_depth` is 3 (27³ subgrid). Higher values work but waste
-/// cells; lower values fail the `dims_fit_in_slab` check.
+/// leaf cells. `slab_depth = 3` ⇒ subgrid is 27³, which matches
+/// `dims[0]`. Higher values widen the WrappedPlane so the slab no
+/// longer fully fills X, breaking the wrap geometry; lower values
+/// shrink the subgrid below `dims[0]`.
 pub const DEFAULT_WRAPPED_PLANET_SLAB_DEPTH: u8 = 3;
 /// Default tree depth at which the `WrappedPlane` node is installed.
 /// `embedding_depth = 22` puts the slab inside a vanishingly small
