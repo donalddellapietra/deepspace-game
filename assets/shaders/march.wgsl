@@ -996,6 +996,22 @@ fn march_cartesian(
     return result;
 }
 
+// Hardware ceiling for the sphere anchor descent stack. Sized
+// independently from `MAX_STACK_DEPTH` (the Cartesian frame stack,
+// which is tuned at 8 for register pressure on Apple Silicon and
+// works because Cartesian's frame-aware system pops between
+// frames + LOD_PIXEL_THRESHOLD prunes descent). Sphere mode has
+// neither — descent into a non-uniform anchor is one continuous
+// stack — so this needs to cover any reasonable
+// `cell_subtree_depth` (default 20) the user might edit into.
+//
+// Set to 24 to leave headroom above the 20-level default. Above
+// this the descent splats representative (same shape as Cartesian's
+// `at_max`). When edits exceed this, raise this constant; sphere
+// mode is opt-in (--planet-render-sphere) so the extra register
+// pressure only applies when sphere render is active.
+const SPHERE_DESCENT_DEPTH: u32 = 24u;
+
 // Result of a slab-cell tree walk. `tag` mirrors pack-format:
 //   0 = empty / no child at this slot
 //   1 = uniform-flatten Block (`block_type` is the leaf material)
@@ -1177,8 +1193,8 @@ fn sphere_descend_anchor(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
-    var s_node_idx: array<u32, MAX_STACK_DEPTH>;
-    var s_cell: array<u32, MAX_STACK_DEPTH>;
+    var s_node_idx: array<u32, SPHERE_DESCENT_DEPTH>;
+    var s_cell: array<u32, SPHERE_DESCENT_DEPTH>;
     var depth: u32 = 0u;
     s_node_idx[0] = anchor_idx;
 
@@ -1352,7 +1368,7 @@ fn sphere_descend_anchor(
         // edits to the representative_block — exactly the bug we're
         // fixing. Tree structure (uniform-flatten = tag=1, terminate)
         // alone drives descent.
-        let at_max = depth + 1u >= MAX_STACK_DEPTH;
+        let at_max = depth + 1u >= SPHERE_DESCENT_DEPTH;
         if at_max {
             let pos_h = ray_origin + ray_dir * t;
             let off_h = pos_h - cs_center;
