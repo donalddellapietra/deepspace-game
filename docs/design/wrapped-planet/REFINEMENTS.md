@@ -4,36 +4,69 @@ This doc supersedes specific sections of `IMPLEMENTATION_PLAN.md` where my criti
 
 The original plan is otherwise solid — strong architectural anchors, correct dispatch decisions, AABB cull reuse for banning, correct claim that curvature composes across ribbon pops because `ray_dir` is preserved at camera-frame magnitude.
 
-## Issue 1 — Phase 1 dimensions: use 3^N-aligned numbers, not 20×10×2
+## Issue 1 — Phase 1 dimensions: 18×9×3 (2:1 Mercator-correct, 3^N-aligned)
 
 **Override Phase 1.2's dimension choice.**
 
-The plan settles on `width=20, height=10, depth=2` with `active_subdepth=2`, which gives an active region of `[0, 2.22) × [0, 1.11) × [0, 0.22)` in planet-frame units. This means the active edge cuts through the middle of cells at every march-DDA depth. That is the single hardest case to validate.
+The plan settles on `width=20, height=10, depth=2` with `active_subdepth=2`, which gives an active region of `[0, 2.22) × [0, 1.11) × [0, 0.22)` in planet-frame units. The active edge cuts through the middle of cells at every march-DDA depth — the hardest case to validate.
 
-For Phase 1 we MUST validate the architecture against the simplest case first. **Use dimensions that are powers of 3**:
+For Phase 1 we MUST validate the architecture against the simplest aligned case AND keep the Mercator-correct 2:1 aspect ratio (longitude spans 360°, latitude spans 180°; 2:1 grid → roughly square cells at the equator when wrapped onto the sphere).
 
-- **Phase 1 (slab):** `width=27, height=9, depth=3` with `active_subdepth=2`.
-  - X axis: 27 active cells = full `[0, 3)` planet frame at march-depth 0. The wrap fires at the planet-frame OOB boundary, exactly where `march.wgsl:386` already detects.
-  - Y axis: 9 active cells = `[0, 1)` of the planet frame = exactly cell `y=0` at march-depth 0. Cells `y=1, 2` at march-depth 0 are entirely polar (banned).
-  - Z axis: 3 active cells = `[0, 1/3)` of the planet frame = exactly cell `z=0` at march-depth 1, sub-cell `z=0` at march-depth 0. Aligned at depth 1.
+**Use `width=18, height=9, depth=3` with `active_subdepth=2`.**
 
-- **Phase 4 (curvature):** keep 27×9×3 — the curvature math doesn't care about dimensions.
+- **X axis (longitude):** 18 active cells = `[0, 18/9) = [0, 2)` planet-frame extent. At march-depth 0, cells `x=0, 1` are active; cell `x=2` is entirely banned. The wrap fires at the active edge (`cell.x >= 2 || cell.x < 0`), NOT at the frame edge.
+- **Y axis (latitude):** 9 active cells = `[0, 1)` planet-frame extent. At march-depth 0, cell `y=0` is fully active; cells `y=1, 2` are entirely polar (banned, no children, no descent).
+- **Z axis (depth):** 3 active cells = `[0, 1/3)` planet-frame extent. At march-depth 0, cell `z=0` is partially active (the first 1/3); rest banned. At march-depth 1 inside cell `z=0`, cells `z=0` is active, cells `z=1, 2` banned. Clean alignment at march-depth 1.
 
-- **Later, when 20×10×2 is needed for art:** add a follow-up phase to handle partial-cell active regions. Out of scope for Phase 1–5.
+This is the **maximum-X 2:1 layout that fits in one planet-root frame** at active_subdepth=2 (caps at 27 active cells per axis). Larger 2:1 worlds require active_subdepth=3 (max 81 X cells but 9× finer per cell), or a follow-up architecture step for cross-sibling wrap.
 
-**Why the user said "20×10×2":** that was illustrative ("something like 20×10×2"). The 2:1 aspect ratio matters; the exact integer doesn't. 27:9 is 3:1 — close enough for orbit visuals, since the user explicitly said they don't care about latitude travel distance. We can relax to non-3^N dims after the architecture is validated.
+**Why this is preferred over 27×9 (3:1):** 27×9 is 3:1, so cells render 1.5× wider than tall at the equator on a sphere — visibly oblong from orbit. 18×9 is 2:1, square cells at the equator.
 
-## Issue 2 — Phase 2.1 wrap dispatch depth is wrong
+**Why this is preferred over 20×10×2:** 20 doesn't divide cleanly by 9, so the active edge cuts through the middle of cells. The wrap dispatch and the AABB cull both need partial-cell handling — invasive for Phase 1.
 
-**Override Phase 2.1's `depth == 0u` gate.**
+**Z is tunable:** Z=3, 6, or 9 are all aligned. Start at Z=3 for Phase 1 — each Z cell recurses 27³ subcells so absolute dig depth is huge regardless. Bump if Phase 5 needs a thicker crust.
 
-The plan gates the wrap on `depth == 0u` of the inner `march_cartesian`. With Issue-1 dimensions (27×9×3, active_subdepth=2), the active region is exactly `[0, 3)` along X — i.e., the planet-frame boundary IS the active boundary. So the wrap correctly fires at march-depth 0, when `cell.x ∈ {-1, 3}`.
+## Issue 2 — Phase 2.1 wrap dispatch: gate on march-depth 0 + active_width_d0 boundary
 
-But: the wrap depth is **dimension-dependent**, not a fixed `depth == 0u`. In general, the wrap fires at `march_depth == active_subdepth - log_3(width / 3)`, i.e., the depth at which `cell.x ∈ [0, 3)` covers exactly the active width.
+**Override Phase 2.1's wrap-at-frame-edge formulation.**
 
-For Phase 2 with 27×9×3 + active_subdepth=2: active width = 27 cells at depth 2, which is `27/9 = 3` cells at depth 0. So march-depth 0 it is. The plan's `depth == 0u` is correct **only because we picked aligned dimensions in Issue 1**. Document it but don't generalize until later phases need it.
+With 18×9×3 + active_subdepth=2 (Issue 1), the active X-region spans 2 of the 3 cells at march-depth 0. The wrap fires when the DDA tries to advance from `cell.x = 1 → 2` (or `0 → -1`) — at the active edge, NOT the frame edge.
 
-The simpler restatement: **the wrap fires when march-DDA cell-coords exit the planet-frame `[0, 3)` boundary, AND we are inside a `WrappedPlanet` root frame.** No new uniform for `planet_w_cells_at_d0` is needed in Phase 2 — the X-OOB check at `march.wgsl:386` already catches `cell.x ∈ {-1, 3}`. Replace it with a wrap when in WrappedPlanet, pop otherwise.
+Required uniform addition (`assets/shaders/bindings.wgsl` Uniforms struct):
+
+```wgsl
+/// At march-depth 0 inside a WrappedPlanet frame, X cells with
+/// index >= active_width_d0 (or < 0) wrap modularly. For 18×9×3
+/// with active_subdepth=2, active_width_d0 = 2.
+active_width_d0: u32,
+```
+
+Wrap dispatch logic at `assets/shaders/march.wgsl:386` (replacing the OOB X-axis check inside WrappedPlanet):
+
+```wgsl
+let in_planet_frame = (depth == 0u) && (uniforms.root_kind == ROOT_KIND_WRAPPED_PLANET);
+let active_w = i32(uniforms.active_width_d0);  // 2 for 18-cell planet
+
+if in_planet_frame && (cell.x < 0 || cell.x >= active_w) {
+    let new_x = ((cell.x % active_w) + active_w) % active_w;
+    // ... rewrite s_cell, cur_side_dist, entry_pos exactly as plan describes
+    s_cell[depth] = pack_cell(vec3<i32>(new_x, cell.y, cell.z));
+    let dx = new_x - cell.x;  // signed wrap delta in cells
+    entry_pos.x = entry_pos.x - f32(-dx) * cur_cell_size;
+    // recompute cur_side_dist.x for the wrapped cell
+    let lc_wrap = vec3<f32>(f32(new_x), f32(cell.y), f32(cell.z));
+    cur_side_dist.x = select(
+        (cur_node_origin.x + lc_wrap.x * cur_cell_size - entry_pos.x) * inv_dir.x,
+        (cur_node_origin.x + (lc_wrap.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x,
+        ray_dir.x >= 0.0,
+    );
+    continue;
+}
+```
+
+The wrap depth IS `depth == 0u` for our aligned dimensions, but the boundary is `active_w` (uniform-supplied), not `3`. This is a small generalization of the original plan: the gate stays simple, the boundary is parameterized.
+
+For Y/Z OOB at march-depth 0: keep the standard pop logic. The polar treatment in Phase 3 catches Y-banned rays before they pop; Z-banned rays are handled by empty-cell DDA advance through the banned region.
 
 ## Issue 3 — Phase 4.2 bend units are wrong
 
@@ -89,16 +122,29 @@ The plan says lighting is "wrap-implicit because rays already wrap" — correct 
 
 ## Issue 6 — Phase 1.3 acceptance test gap
 
-The plan's `ray_through_banned_cell_misses` test (line 521) tests Y-banned (above-planet) rays. Add a sibling test for Z-banned rays (with 27×9×3 dims, the active region is only the first 1/3 of cell `z=0` at march-depth 0):
+The plan's `ray_through_banned_cell_misses` test (line 521) tests Y-banned (above-planet) rays. Add sibling tests for X-banned (cell.x=2 at march-depth 0) and Z-banned (z>=1/3 of planet frame) rays:
 
 ```rust
 #[test]
+fn ray_through_x_banned_cell_misses() {
+    // 18-cell-wide planet: at march-depth 0 inside the planet,
+    // cell.x = 0, 1 are active; cell.x = 2 is banned. Cast a ray
+    // that lands entirely in cell.x = 2 of the planet root.
+    let mut lib = NodeLibrary::default();
+    let (planet, _) = insert_wrapped_planet(&mut lib, 18, 9, 3, 2);
+    // ... wrap planet in 22 layers, anchor camera in cell.x=2
+    let ray_origin = [2.5, 0.5, 0.1];  // planet-frame x=2.5 is in cell.x=2
+    let ray_dir    = [0.0, 0.0, 1.0];
+    let hit = cpu_raycast(&lib, root, ray_origin, ray_dir, 4);
+    assert!(hit.is_none(), "rays inside the banned X column should miss");
+}
+
+#[test]
 fn ray_through_z_banned_cell_misses() {
     let mut lib = NodeLibrary::default();
-    let (planet, _) = insert_wrapped_planet(&mut lib, 27, 9, 3, 2);
-    // ...
-    // cell z>=3 in active-cell coords = z>=1/3 in planet frame
-    let ray_origin = [1.5, 0.5, 2.5];  // planet z=2.5, well outside [0, 1/3)
+    let (planet, _) = insert_wrapped_planet(&mut lib, 18, 9, 3, 2);
+    // active Z range is [0, 1/3) of planet frame; z=0.5 is banned.
+    let ray_origin = [1.0, 0.5, 0.5];
     let ray_dir    = [0.001, 0.0, 1.0];
     let hit = cpu_raycast(&lib, root, ray_origin, ray_dir, 4);
     assert!(hit.is_none());
@@ -119,12 +165,12 @@ This is a 100-line cleanup PR before architectural work starts.
 
 | Original plan section | Issue | Override |
 |---|---|---|
-| Phase 1.2 dims `20×10×2` | Active edge mid-cell — hardest case | Use `27×9×3` for Phase 1; defer 20×10×2 |
-| Phase 2.1 wrap gate `depth==0u` | Coincidentally correct under Issue 1 | Document, don't generalize |
+| Phase 1.2 dims `20×10×2` | Active edge mid-cell + 3:1 fallback breaks Mercator | Use **`18×9×3`** for Phase 1 — 2:1 + 3^N-aligned |
+| Phase 2.1 wrap gate | Active edge ≠ frame edge under 18-cell X | Gate on `depth==0u` + parameterize bound by `active_width_d0=2` uniform |
 | Phase 4.2 bend units `ct_start` | Camera-frame, breaks at orbit | Multiply by `planet_frame_scale` |
 | Phase 1.1 GpuNodeKind reuse | Fragile bitcast, wrong field names | Rename to `geom_a/b/c` first |
 | Phase 5.1 lighting | Implicit but undocumented | Add forward-compat shader comment |
-| Phase 1.3 acceptance | Only tests Y-banned | Add Z-banned test |
+| Phase 1.3 acceptance | Only tests Y-banned | Add X-banned and Z-banned tests |
 | Sequencing | Plan jumps straight to 1.1 | Insert Phase 0.5 cleanup |
 
 All other sections of the plan stand as written.
