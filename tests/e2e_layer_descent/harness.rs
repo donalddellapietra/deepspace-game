@@ -275,6 +275,46 @@ pub fn sky_dominance_top_half(path: impl AsRef<std::path::Path>) -> f32 {
     if total == 0 { 0.0 } else { sky as f32 / total as f32 }
 }
 
+/// Fraction of pixels in the FULL frame at `path` that are NOT
+/// sky-blue. Mirror of [`sky_dominance_top_half`] but (a) computed
+/// over the entire image, not just the top half, and (b) returns the
+/// "ground" fraction rather than the "sky" fraction. Useful when the
+/// camera is angled down at terrain and the silhouette occupies an
+/// arbitrary portion of the frame: pure sky gives `0.0`, pure ground
+/// gives `1.0`. Compares planet silhouette area across configs.
+pub fn planet_fraction(path: impl AsRef<std::path::Path>) -> f32 {
+    let file = std::fs::File::open(path.as_ref())
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.as_ref().display()));
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().expect("read png header");
+    let info = reader.info().clone();
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => panic!("unsupported png color type {other:?}"),
+    };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buf).expect("decode png frame");
+    let data = &buf[..frame.buffer_size()];
+
+    let total = width * height;
+    let mut planet = 0usize;
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * channels;
+            let r = data[i];
+            let g = data[i + 1];
+            let b = data[i + 2];
+            let is_sky = b > r && b > g;
+            if !is_sky {
+                planet += 1;
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { planet as f32 / total as f32 }
+}
+
 fn parse_probe(rest: &str) -> Option<HarnessProbe> {
     let kv = parse_kv(rest);
     Some(HarnessProbe {
