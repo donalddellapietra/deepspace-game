@@ -78,6 +78,12 @@ impl App {
                 }
                 (hit, frame_path)
             }
+            ActiveFrameKind::UvSphereBody { .. } => {
+                // CPU raycast into a UV body isn't implemented yet;
+                // editing-by-cursor is gated off until commit 3 lands
+                // the UV DDA. Return no hit.
+                (None, self.active_frame.render_path)
+            }
         };
         // Enforce the interaction radius gate: drop hits beyond
         // `interaction_radius_cells × anchor_cell_size`. Same

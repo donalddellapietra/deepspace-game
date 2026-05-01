@@ -843,6 +843,14 @@ fn march_cartesian(
 // coords, so the inner DDA is unchanged — only the ray is
 // rescaled and the buffer node_idx swapped.
 fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
+    // UV-sphere dispatch: when the render frame is a UvSphereBody
+    // node, hand the ray to `march_uv_sphere`. The shader doesn't
+    // ribbon-pop out of a UV body in this MVP — the camera lives
+    // inside the body and the body fills the [0, 3)³ frame.
+    if uniforms.root_kind == ROOT_KIND_UV_SPHERE_BODY {
+        return march_uv_sphere(world_ray_origin, world_ray_dir);
+    }
+
     var ray_origin = world_ray_origin;
     var ray_dir = world_ray_dir;
     var current_idx = uniforms.root_index;

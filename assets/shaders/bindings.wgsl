@@ -76,6 +76,7 @@ struct Uniforms {
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
+const ROOT_KIND_UV_SPHERE_BODY: u32 = 1u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:

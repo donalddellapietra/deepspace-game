@@ -10,11 +10,20 @@
 //! unit testing.
 
 use crate::world::anchor::Path;
-use crate::world::tree::{Child, NodeId, NodeLibrary};
+use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
     Cartesian,
+    /// Render frame is rooted at a `NodeKind::UvSphereBody` node.
+    /// The shader dispatches the UV-sphere DDA at depth==0; body
+    /// params are read shader-side from
+    /// `node_kinds[uniforms.root_index]`.
+    UvSphereBody {
+        inner_r: f32,
+        outer_r: f32,
+        theta_cap: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,7 +50,9 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 /// Resolve the active frame.
 ///
 /// Descends from `world_root` along `camera_anchor` for at most
-/// `desired_depth` slot steps.
+/// `desired_depth` slot steps. Stops at any sphere-aware NodeKind
+/// — the shader dispatches the matching DDA at the body root, so
+/// the render frame must be the body node, not a sub-cell.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -52,13 +63,28 @@ pub fn compute_render_frame(
     target.truncate(desired_depth);
     let mut node_id = world_root;
     let mut reached = Path::root();
+    let mut kind = match library.get(world_root).map(|n| n.kind) {
+        Some(NodeKind::UvSphereBody { inner_r, outer_r, theta_cap }) => {
+            ActiveFrameKind::UvSphereBody { inner_r, outer_r, theta_cap }
+        }
+        _ => ActiveFrameKind::Cartesian,
+    };
     for k in 0..target.depth() as usize {
+        if matches!(kind, ActiveFrameKind::UvSphereBody { .. }) {
+            break;
+        }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
+                if let Some(child_node) = library.get(child_id) {
+                    if let NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } = child_node.kind {
+                        kind = ActiveFrameKind::UvSphereBody { inner_r, outer_r, theta_cap };
+                        break;
+                    }
+                }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
@@ -67,7 +93,7 @@ pub fn compute_render_frame(
         render_path: reached,
         logical_path: reached,
         node_id,
-        kind: ActiveFrameKind::Cartesian,
+        kind,
     }
 }
 

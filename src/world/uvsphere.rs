@@ -298,8 +298,15 @@ pub struct UvSphereSetup {
 }
 
 pub fn demo_uv_sphere() -> UvSphereSetup {
-    let inner_r = 0.12_f32;
-    let outer_r = 0.45_f32;
+    // Smaller-than-cell body so the camera (which lives inside the
+    // body cell at the [0, 3)³ render frame) can still frame the
+    // whole planet without it filling the entire view. With
+    // outer_r=0.20 in body-local units → 0.60 in render frame, and
+    // camera at body-local [0.5, 0.5, 0.04] = render-frame
+    // [1.5, 1.5, 0.12], the body subtends ≈ 26° from the camera —
+    // comfortably inside the default ~70° vertical FOV.
+    let inner_r = 0.05_f32;
+    let outer_r = 0.20_f32;
     let theta_cap = 80.0_f32.to_radians(); // ~6:1 worst aspect at the cap
     UvSphereSetup {
         inner_r,
@@ -308,7 +315,7 @@ pub fn demo_uv_sphere() -> UvSphereSetup {
         depth: 28,
         sdf: Planet {
             center: [0.5, 0.5, 0.5],
-            radius: 0.30,
+            radius: 0.15,
             noise_scale: 0.0,
             noise_freq: 1.0,
             noise_seed: 0,

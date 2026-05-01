@@ -43,10 +43,10 @@ pub enum EntityRenderMode {
 pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `ROOT_KIND_*`
-/// constants in `bindings.wgsl`. Currently only Cartesian; the
-/// field stays so the uniform layout has room for the UV-sphere
-/// dispatch when it lands.
+/// constants in `bindings.wgsl`. Selects which DDA primitive the
+/// shader dispatches for the active render frame.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
+pub const ROOT_KIND_UV_SPHERE_BODY: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -297,6 +297,16 @@ impl Renderer {
     /// Set the frame-root NodeKind to Cartesian.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
+        self.write_uniforms();
+    }
+
+    /// Set the frame-root NodeKind to UV-sphere body. Body params
+    /// (inner_r, outer_r, theta_cap) are read shader-side from
+    /// `node_kinds[uniforms.root_index]` so no separate uniform is
+    /// needed — `GpuNodeKind::from_node_kind` already encodes them
+    /// into `param_a/b/c`.
+    pub fn set_root_kind_uv_sphere_body(&mut self) {
+        self.root_kind = ROOT_KIND_UV_SPHERE_BODY;
         self.write_uniforms();
     }
 

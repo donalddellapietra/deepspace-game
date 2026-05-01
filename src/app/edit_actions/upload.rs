@@ -295,6 +295,9 @@ impl App {
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
+                ActiveFrameKind::UvSphereBody { .. } => {
+                    renderer.set_root_kind_uv_sphere_body();
+                }
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

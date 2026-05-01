@@ -775,21 +775,24 @@ fn bootstrap_uv_sphere_world() -> WorldBootstrap {
 
     let world = WorldState { root, library };
 
-    // Spawn camera offset along +Z from the body so the planet fills
-    // a comfortable fraction of the view. Body center is at the
-    // root's centre slot ⇒ world position [1.5, 1.5, 1.5]; camera at
-    // [1.5, 1.5, 0.4] looks +Z toward the body.
-    let spawn_pos = WorldPos::new(
-        Path::root(),
-        [1.5, 1.5, 0.4],
-    );
-    let _ = body_path; // body_path retained on WorldBootstrap.planet_path below
+    // Spawn camera INSIDE the body cell, just outside the outer
+    // shell, looking toward the body center. Body cell occupies
+    // world [1, 2)³; body center is at world [1.5, 1.5, 1.5];
+    // outer_r = 0.45 in body-local units. Camera at
+    // body-local [0.5, 0.5, 0.04] = world [1.5, 1.5, 1.04] is
+    // 0.46 from center → just outside the outer shell. Anchor at
+    // depth 1 = the body node so the active render frame IS the
+    // body and the shader dispatches the UV-sphere DDA.
+    let body_slot = body_path.slot(0);
+    let mut spawn_anchor = Path::root();
+    spawn_anchor.push(body_slot);
+    let spawn_pos = WorldPos::new(spawn_anchor, [0.5, 0.5, 0.04]);
 
     WorldBootstrap {
         world,
         planet_path: Some(body_path),
         default_spawn_pos: spawn_pos,
-        default_spawn_yaw: 0.0,
+        default_spawn_yaw: std::f32::consts::PI, // look toward +Z (body center)
         default_spawn_pitch: 0.0,
         plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),
