@@ -59,42 +59,23 @@ struct Uniforms {
     /// Padding slot retained so the WGSL `Uniforms` block matches
     /// the CPU-side `GpuUniforms` byte-for-byte. Unused.
     _pad_radii: vec4<f32>,
-    /// `WrappedPlane` slab dimensions, populated when `root_kind ==
-    /// ROOT_KIND_WRAPPED_PLANE`. `(dims_x, dims_y, dims_z, slab_depth)`.
-    /// Phase 2 reads `dims_x` + `slab_depth` (the `.x` and `.w` lanes)
-    /// in the X-wrap branch of `march_cartesian` to compute the
-    /// wrap shift; `.y` / `.z` are unused until Phase 3. Zero on
-    /// Cartesian-root frames.
-    slab_dims: vec4<u32>,
+    /// Reserved 16 bytes — was slab_dims for the wrapped-plane path.
+    _pad_slab: vec4<u32>,
     _pad_face_bounds: vec4<f32>,
     _pad_face_pop_pos: vec4<f32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
-    /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future
-    /// per-mode tuning. Modes 7 & 8 are reserved placeholders for the
-    /// wrapped-planet phases (planet-frame indicator + curvature-offset
-    /// magnitude); they paint a sentinel until Phase 2 / Phase 3 wires
-    /// the underlying state.
+    /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved.
     debug_mode: vec4<u32>,
     /// `xy` = screen-space pixel to probe walker state for;
     /// `z` = non-zero means probing is active (0 disables all
     /// writes to `walker_probe`). `w` reserved.
     probe_pixel: vec4<u32>,
-    /// Render-time curvature parameters. Phase 3 Step 3.0 ships
-    /// the simplest form: `.x = A`, the per-step parabolic-drop
-    /// coefficient. The shader applies `child_entry.y -= A * dist²`
-    /// at each descent. `A = 0` (default) disables curvature
-    /// entirely, leaving the marcher bit-identical to the flat path.
-    /// `.yzw` reserved for k(altitude) ramp + R_inv + slab_surface_y
-    /// once Step 3.4 wires those.
-    curvature: vec4<f32>,
+    /// Reserved 16 bytes — was the render-time curvature uniform.
+    _pad_curvature: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
-/// WrappedPlane root kind. Phase 1: shader treats it identically to
-/// Cartesian (the marcher does not branch on root_kind). Phase 2 will
-/// hook X-wrap on this kind; Phase 3 will hook curvature.
-const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -113,11 +94,10 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0 = Cartesian, 1 = WrappedPlane
-    /// Slab dims (cells/axis) for WrappedPlane; zero for Cartesian.
-    /// Phase 2 reads these to compute X-wrap modulus; Phase 3 reads
-    /// dims_x to derive the implied planet radius. Phase 1: carried
-    /// but unused.
+    kind: u32,        // 0 = Cartesian
+    /// Reserved per-node metadata (zero for Cartesian). Held so the
+    /// CPU-side `GpuNodeKind` layout stays byte-stable while UV-sphere
+    /// metadata is wired in.
     dims_x: u32,
     dims_y: u32,
     dims_z: u32,
@@ -231,8 +211,7 @@ struct EntityGpu {
 ///   [ 8] hit_t_bits              (bitcast<u32>(f32))
 ///   [ 9] hit_face                — 0=+X,1=-X,2=+Y,3=-Y,4=+Z,5=-Z (or 7=unknown)
 ///   [10] content_flag            — 1 = block hit, 0 = empty/sky
-///   [11] curvature_offset_bits   — Phase 3: bitcast<u32>(Δy at hit)
-///   [12..16] reserved for future per-phase fields.
+///   [11..16] reserved for future per-phase fields.
 struct WalkerProbe {
     hit_flag: u32,
     ray_steps: u32,
@@ -245,7 +224,7 @@ struct WalkerProbe {
     hit_t_bits: u32,
     hit_face: u32,
     content_flag: u32,
-    curvature_offset_bits: u32,
+    _reserved11: u32,
     _reserved12: u32,
     _reserved13: u32,
     _reserved14: u32,

@@ -61,11 +61,9 @@ impl GpuChild {
 /// Per-packed-node metadata: indexed by BFS position — the same
 /// `node_index` used in `GpuChild::node_index`. 16 bytes total.
 ///
-/// `kind`: 0 = Cartesian, 1 = WrappedPlane.
-/// `dims_x/y/z`: slab dims (cells per axis) for `WrappedPlane`;
-/// unused (zeroed) for `Cartesian`. The shader will read these in
-/// Phase 2 to drive X-wrap and in Phase 3 to derive the planet
-/// radius. In Phase 1 they're carried but unused.
+/// `kind`: 0 = Cartesian.
+/// `dims_x/y/z`: reserved per-node metadata (zeroed for Cartesian);
+/// kept so the layout has room for UV-sphere body parameters.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -79,12 +77,6 @@ impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
             NodeKind::Cartesian => Self { kind: 0, dims_x: 0, dims_y: 0, dims_z: 0 },
-            NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
-                kind: 1,
-                dims_x: dims[0],
-                dims_y: dims[1],
-                dims_z: dims[2],
-            },
         }
     }
 }
@@ -168,15 +160,4 @@ mod tests {
         assert_eq!(k.dims_z, 0);
     }
 
-    #[test]
-    fn from_node_kind_wrapped_plane_carries_dims() {
-        let k = GpuNodeKind::from_node_kind(NodeKind::WrappedPlane {
-            dims: [20, 10, 2],
-            slab_depth: 3,
-        });
-        assert_eq!(k.kind, 1);
-        assert_eq!(k.dims_x, 20);
-        assert_eq!(k.dims_y, 10);
-        assert_eq!(k.dims_z, 2);
-    }
 }

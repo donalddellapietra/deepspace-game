@@ -282,14 +282,6 @@ impl App {
         eprintln!("startup_perf {source}: renderer_created ms={:.2}", renderer_elapsed.as_secs_f64() * 1000.0);
 
         renderer.update_palette(&self.palette.to_gpu_palette());
-        // Phase 3 Step 3.0: apply CLI curvature debug knob, if any.
-        // `--curvature A` sets a constant per-step parabolic-drop
-        // coefficient — the simplest form of the bend. Used to
-        // validate the math on `--plain-world` before the k(altitude)
-        // ramp lands in Step 3.4.
-        if let Some(a) = self.startup_curvature_a {
-            renderer.set_curvature_a(a);
-        }
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
             eprintln!(
@@ -375,18 +367,12 @@ impl App {
         if self.overlay_active() {
             self.poll_ui_commands();
             let camera_local = match self.active_frame.kind {
-                crate::app::ActiveFrameKind::Cartesian
-                | crate::app::ActiveFrameKind::WrappedPlane { .. } => {
+                crate::app::ActiveFrameKind::Cartesian => {
                     self.camera.position.in_frame(&self.active_frame.render_path)
                 }
             };
             // Keep the UI's zoom_level in sync with the live anchor
-            // depth. `edit_actions::zoom` updates it on explicit zoom
-            // input, but startup spawns + bootstrap defaults (e.g. the
-            // wrapped-planet which spawns at embedding_depth + slab_depth
-            // automatically) need this fallback or the on-screen "Layer
-            // N" indicator stays stuck at 0 until the player presses
-            // a zoom key.
+            // depth.
             self.ui.zoom_level = self.zoom_level();
             self.ui.push_to_overlay(&self.palette);
             crate::overlay::push_state(&crate::bridge::GameStateUpdate::DebugOverlay(

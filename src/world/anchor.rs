@@ -14,7 +14,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH};
+use crate::world::tree::{slot_coords, slot_index, NodeId, NodeLibrary, MAX_DEPTH};
 
 /// Local frame convention: every node's children span
 /// `[0, WORLD_SIZE)³` because there are 3 children per axis.
@@ -127,93 +127,22 @@ impl Path {
         }
     }
 
-    /// Kind-aware neighbor step. Walks `self` from `world_root` to
-    /// determine the parent NodeKind at each level. On overflow:
-    /// - `NodeKind::Cartesian` parent: bubble up exactly like
-    ///   `step_neighbor_cartesian`.
-    /// - `NodeKind::WrappedPlane { dims, slab_depth }` parent AND the
-    ///   overflow axis is the wrap axis (X = axis 0): wrap the slot's
-    ///   X coord in place (set to 0 on east overflow, 2 on west) so
-    ///   the path stays inside the WrappedPlane subtree. Y / Z still
-    ///   bubble — those axes exit the slab via the normal ribbon-pop
-    ///   path, not the wrap.
-    ///
-    /// Returns `true` iff a wrap fired during this step (caller can
-    /// surface a `Transition::WrappedPlaneWrap`).
-    ///
-    /// **Wrap correctness invariant:** the wrap formula assumes the
-    /// slab fully fills the WrappedPlane node along the wrap axis,
-    /// i.e., `dims[0] == 3^slab_depth`. With dims_x < 3^slab_depth
-    /// the wrap would land mid-slab, which is geometrically wrong;
-    /// callers / worldgen MUST size the slab to fully fill the wrap
-    /// axis.
+    /// Kind-aware neighbor step. Currently equivalent to
+    /// `step_neighbor_cartesian` (no sphere-aware nodes yet); kept as
+    /// the API surface for callers that already pass library/root so
+    /// UV-sphere wrap can be hooked in later without churning sites.
+    /// Returns `true` iff an in-place wrap fired (always `false` while
+    /// every node is Cartesian).
     pub fn step_neighbor_in_world(
         &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
+        _library: &NodeLibrary,
+        _world_root: NodeId,
         axis: usize,
         direction: i32,
     ) -> bool {
-        debug_assert!(axis < 3);
-        debug_assert!(direction == 1 || direction == -1);
-        if self.depth == 0 {
-            return false;
-        }
-        let d = self.depth as usize - 1;
-        let slot = self.slots[d] as usize;
-        let (x, y, z) = slot_coords(slot);
-        let mut coords = [x, y, z];
-        let v = coords[axis] as i32 + direction;
-        if (0..3).contains(&v) {
-            coords[axis] = v as usize;
-            self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
-            return false;
-        }
-        // Overflow on slot[d]. The node containing slot[d] sits at
-        // tree depth `d` — walk from world_root through slots[0..d]
-        // to find it. If that node is a WrappedPlane and the axis
-        // matches its wrap axis, wrap in place instead of bubbling.
-        if axis == 0 {
-            if let Some(parent_kind) = node_kind_at_depth(library, world_root, &self.slots[..d]) {
-                if matches!(parent_kind, NodeKind::WrappedPlane { .. }) {
-                    let wrapped = if direction < 0 { 2 } else { 0 };
-                    coords[axis] = wrapped;
-                    self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
-                    return true;
-                }
-            }
-        }
-        // Bubble up: pop, step parent, push the wrapped slot.
-        self.depth -= 1;
-        let wrapped_inner = self.step_neighbor_in_world(library, world_root, axis, direction);
-        let wrapped = if direction < 0 { 2 } else { 0 };
-        coords[axis] = wrapped;
-        let new_slot = slot_index(coords[0], coords[1], coords[2]) as u8;
-        self.slots[self.depth as usize] = new_slot;
-        self.depth += 1;
-        wrapped_inner
+        self.step_neighbor_cartesian(axis, direction);
+        false
     }
-}
-
-/// Walk the tree from `world_root` along `slots`, returning the
-/// `NodeKind` of the node reached (i.e., the node at tree depth
-/// `slots.len()`). Returns `None` if the walk hits a non-Node child
-/// before consuming all slots, or if a node id is missing from the
-/// library.
-fn node_kind_at_depth(
-    library: &NodeLibrary,
-    world_root: NodeId,
-    slots: &[u8],
-) -> Option<NodeKind> {
-    let mut cur = world_root;
-    for &s in slots {
-        let node = library.get(cur)?;
-        match node.children[s as usize] {
-            Child::Node(child) => cur = child,
-            _ => return None,
-        }
-    }
-    library.get(cur).map(|n| n.kind)
 }
 
 impl Default for Path {
@@ -257,12 +186,6 @@ impl std::fmt::Debug for Path {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     None,
-    /// A motion step crossed the wrap axis of a `WrappedPlane`
-    /// ancestor and the path was wrapped (modulo `dims[axis]`)
-    /// rather than bubbled out of the slab subtree. `axis` is the
-    /// world axis that wrapped (0 = x). Phase 2 only wraps on
-    /// axis 0; Y / Z always bubble.
-    WrappedPlaneWrap { axis: u8 },
 }
 
 // ------------------------------------------------------------ WorldPos
@@ -324,9 +247,7 @@ impl WorldPos {
     /// Restore `offset[i] ∈ [0, 1)` by stepping the anchor along
     /// each axis as needed. Cartesian interpretation only — used at
     /// construction (where no library/world_root is available) and
-    /// as a fallback for kind-agnostic callers. Runtime motion
-    /// (`add_local`) uses `renormalize_world` so wrap fires on
-    /// WrappedPlane subtrees.
+    /// as a fallback for kind-agnostic callers.
     fn renormalize_cartesian(&mut self) {
         for axis in 0..3 {
             // Pull overflow in steps so f32 non-finite inputs don't
@@ -354,48 +275,21 @@ impl WorldPos {
         }
     }
 
-    /// Kind-aware renormalize. Walks the anchor through the world
-    /// tree so that overflow on the wrap axis inside a
-    /// `WrappedPlane` subtree wraps in place instead of bubbling.
-    /// Returns the strongest transition observed during the renorm
-    /// (any wrap event collapses to a single `WrappedPlaneWrap`;
-    /// no-wrap steps return `Transition::None`).
+    /// Kind-aware renormalize. Currently delegates to
+    /// `renormalize_cartesian` (every node is Cartesian); kept as the
+    /// API surface so UV-sphere wrap can hook in later without
+    /// churning sites.
     fn renormalize_world(
         &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
+        _library: &NodeLibrary,
+        _world_root: NodeId,
     ) -> Transition {
-        let mut transition = Transition::None;
-        for axis in 0..3 {
-            let mut guard: i32 = 0;
-            while self.offset[axis] >= 1.0 && guard < 1 << 20 {
-                self.offset[axis] -= 1.0;
-                if self.anchor.step_neighbor_in_world(library, world_root, axis, 1) {
-                    transition = Transition::WrappedPlaneWrap { axis: axis as u8 };
-                }
-                guard += 1;
-            }
-            while self.offset[axis] < 0.0 && guard < 1 << 20 {
-                self.offset[axis] += 1.0;
-                if self.anchor.step_neighbor_in_world(library, world_root, axis, -1) {
-                    transition = Transition::WrappedPlaneWrap { axis: axis as u8 };
-                }
-                guard += 1;
-            }
-            if self.offset[axis] >= 1.0 {
-                self.offset[axis] = 1.0 - f32::EPSILON;
-            }
-            if self.offset[axis] < 0.0 {
-                self.offset[axis] = 0.0;
-            }
-        }
-        transition
+        self.renormalize_cartesian();
+        Transition::None
     }
 
     /// Advance by a local delta (in units of the current cell).
-    /// Restores the `[0, 1)` invariant via `renormalize_world` so
-    /// motion across a `WrappedPlane` boundary wraps modulo the
-    /// slab dims rather than bubbling out of the slab subtree.
+    /// Restores the `[0, 1)` invariant via `renormalize_world`.
     pub fn add_local(
         &mut self,
         delta: [f32; 3],

@@ -10,16 +10,11 @@
 //! unit testing.
 
 use crate::world::anchor::Path;
-use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{Child, NodeId, NodeLibrary};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
     Cartesian,
-    /// The render frame is rooted at a `NodeKind::WrappedPlane`
-    /// node. The shader runs the X-wrap branch of `march_cartesian`
-    /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
-    /// `Uniforms.slab_dims`.
-    WrappedPlane { dims: [u32; 3], slab_depth: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,10 +41,7 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 /// Resolve the active frame.
 ///
 /// Descends from `world_root` along `camera_anchor` for at most
-/// `desired_depth` slot steps. Stops early at a `WrappedPlane`
-/// node — the wrap branch in the shader fires at depth==0 of the
-/// marcher's local frame, so the render frame must be the slab
-/// root, not a sub-cell of it.
+/// `desired_depth` slot steps.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -60,30 +52,13 @@ pub fn compute_render_frame(
     target.truncate(desired_depth);
     let mut node_id = world_root;
     let mut reached = Path::root();
-    let mut kind = match library.get(world_root).map(|n| n.kind) {
-        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
-            ActiveFrameKind::WrappedPlane { dims, slab_depth }
-        }
-        _ => ActiveFrameKind::Cartesian,
-    };
     for k in 0..target.depth() as usize {
-        // If we've already landed on a WrappedPlane node, stop —
-        // the slab root IS the render frame.
-        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
-            break;
-        }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
-                if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
-                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                        break;
-                    }
-                }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
@@ -92,7 +67,7 @@ pub fn compute_render_frame(
         render_path: reached,
         logical_path: reached,
         node_id,
-        kind,
+        kind: ActiveFrameKind::Cartesian,
     }
 }
 
@@ -193,71 +168,5 @@ mod tests {
         let p = frame_from_slots(&slots);
         assert_eq!(p.depth(), slots.len() as u8);
         assert_eq!(p.as_slice(), &slots);
-    }
-
-    /// When the descent reaches a `WrappedPlane` node, the render
-    /// frame must STOP there (kind = WrappedPlane) instead of
-    /// descending into the slab subtree. The shader's wrap branch
-    /// fires at marcher-local depth==0 — which means the render
-    /// frame must be the slab root, not a sub-cell.
-    #[test]
-    fn render_frame_kind_is_wrapped_plane_when_descent_lands_on_one() {
-        use crate::world::tree::{empty_children, slot_index, NodeKind};
-        let mut lib = NodeLibrary::default();
-        // Build a small WrappedPlane subtree (slab depth 1, dims
-        // [3, 1, 1] — fills X axis only).
-        let mut wp_children = empty_children();
-        wp_children[slot_index(0, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
-        wp_children[slot_index(1, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
-        wp_children[slot_index(2, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
-        let wp = lib.insert_with_kind(
-            wp_children,
-            NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
-        );
-        // Embed: root has WP at slot 13, everything else empty.
-        let mut root_children = empty_children();
-        root_children[slot_index(1, 1, 1)] = Child::Node(wp);
-        let root = lib.insert(root_children);
-        lib.ref_inc(root);
-
-        // Camera anchor sits at the WP node (depth 1) or deeper.
-        let mut anchor = Path::root();
-        anchor.push(slot_index(1, 1, 1) as u8); // depth 1 → WP node
-        anchor.push(slot_index(2, 0, 0) as u8); // depth 2 → inside WP
-        let frame = compute_render_frame(&lib, root, &anchor, 5);
-        // Render frame stops at the WP node (depth 1), not at the
-        // sub-cell at depth 2.
-        assert_eq!(frame.render_path.depth(), 1);
-        match frame.kind {
-            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
-                assert_eq!(dims, [3, 1, 1]);
-                assert_eq!(slab_depth, 1);
-            }
-            other => panic!("expected WrappedPlane kind, got {other:?}"),
-        }
-    }
-
-    /// Camera anchor that doesn't enter the WrappedPlane subtree
-    /// must produce a plain Cartesian render frame — wrap can't
-    /// fire from outside the slab.
-    #[test]
-    fn render_frame_kind_is_cartesian_when_descent_misses_wrapped_plane() {
-        use crate::world::tree::{empty_children, slot_index, NodeKind};
-        let mut lib = NodeLibrary::default();
-        let wp_children = empty_children();
-        let wp = lib.insert_with_kind(
-            wp_children,
-            NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
-        );
-        let mut root_children = empty_children();
-        root_children[slot_index(1, 1, 1)] = Child::Node(wp);
-        let root = lib.insert(root_children);
-        lib.ref_inc(root);
-
-        // Camera in slot 0 of root — the WP is in slot 13 (centre).
-        let mut anchor = Path::root();
-        anchor.push(0);
-        let frame = compute_render_frame(&lib, root, &anchor, 3);
-        assert!(matches!(frame.kind, ActiveFrameKind::Cartesian));
     }
 }

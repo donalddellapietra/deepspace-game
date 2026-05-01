@@ -311,12 +311,12 @@ impl Renderer {
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             _pad_radii: [0.0; 4],
-            slab_dims: self.slab_dims,
+            _pad_slab: [0; 4],
             _pad_face_bounds: [0.0; 4],
             _pad_face_pop_pos: [0.0; 4],
             debug_mode: self.debug_mode,
             probe_pixel: self.probe_pixel,
-            curvature: self.curvature,
+            _pad_curvature: [0.0; 4],
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

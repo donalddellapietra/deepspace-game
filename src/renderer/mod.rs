@@ -43,13 +43,10 @@ pub enum EntityRenderMode {
 pub const MAX_RIBBON_LEN: usize = 64;
 
 /// `root_kind` discriminant — must mirror the WGSL `ROOT_KIND_*`
-/// constants in `bindings.wgsl`. Phase 1: WrappedPlane renders
-/// identically to Cartesian (the marcher does not yet branch on
-/// root_kind); the constant exists so the uniform / shader layouts
-/// stay in lockstep with the CPU side once Phase 2 / 3 add wrap and
-/// curvature dispatch.
+/// constants in `bindings.wgsl`. Currently only Cartesian; the
+/// field stays so the uniform layout has room for the UV-sphere
+/// dispatch when it lands.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
-pub const ROOT_KIND_WRAPPED_PLANE: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -77,31 +74,25 @@ pub struct GpuUniforms {
     /// Padding slot retained so the CPU-side `GpuUniforms` matches
     /// the WGSL `Uniforms` block byte-for-byte. Unused.
     pub _pad_radii: [f32; 4],
-    /// `WrappedPlane` slab dimensions: `(dims_x, dims_y, dims_z,
-    /// slab_depth)`. Populated when `root_kind ==
-    /// ROOT_KIND_WRAPPED_PLANE`; the shader's X-wrap branch reads
-    /// `slab_dims.x` and `slab_dims.w`. Zero-filled on Cartesian
-    /// root frames. Mirrors `Uniforms.slab_dims` in
-    /// `assets/shaders/bindings.wgsl`.
-    pub slab_dims: [u32; 4],
+    /// Reserved 16 bytes — was `slab_dims` for the wrapped-plane
+    /// path. Kept zero-filled so the Uniforms layout stays
+    /// byte-stable while UV sphere ports its own metadata into a
+    /// successor field.
+    pub _pad_slab: [u32; 4],
     pub _pad_face_bounds: [f32; 4],
     pub _pad_face_pop_pos: [f32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
-    /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
-    /// reserved placeholders for the wrapped-planet phases (Phase 2 /
-    /// Phase 3 wire the underlying state).
+    /// `.x`; `.yzw` reserved for per-mode tuning.
     pub debug_mode: [u32; 4],
     /// `xy` = screen-space pixel to probe walker state for;
     /// `z` = non-zero means probing is active (0 disables all writes
     /// to `walker_probe`). `w` reserved.
     pub probe_pixel: [u32; 4],
-    /// Phase 3 Step 3.0 curvature: `.x = A` is the per-step
-    /// parabolic-drop coefficient (`drop = A · dist²` applied to
-    /// `child_entry.y` at each descent). 0 = disabled; the marcher
-    /// stays bit-identical to the flat path. `.yzw` reserved for
-    /// k(altitude) ramp / R_inv / slab_surface_y in later steps.
-    pub curvature: [f32; 4],
+    /// Reserved 16 bytes — was `curvature` for the wrapped-plane
+    /// shader bend. Kept zero-filled so the Uniforms layout stays
+    /// byte-stable.
+    pub _pad_curvature: [f32; 4],
 }
 
 pub struct Renderer {
@@ -154,11 +145,6 @@ pub struct Renderer {
     pub(super) highlight_min: [f32; 4],
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
-    /// `(dims_x, dims_y, dims_z, slab_depth)` for the active
-    /// `WrappedPlane` render frame. Zero-filled when `root_kind ==
-    /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
-    /// shader's X-wrap branch reads the X and W lanes.
-    pub(super) slab_dims: [u32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -237,11 +223,6 @@ pub struct Renderer {
     /// Mirror of `uniforms.debug_mode`. `.x` = mode (0..=8); `.yzw`
     /// reserved. Set by `set_debug_mode`.
     pub(super) debug_mode: [u32; 4],
-    /// Mirror of `uniforms.curvature`. `.x = A` is the per-step
-    /// parabolic-drop coefficient applied at every descent in
-    /// `march_cartesian`. 0 = disabled (flat path). Set by
-    /// `set_curvature_a` from a CLI debug flag in Step 3.0.
-    pub(super) curvature: [f32; 4],
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
@@ -313,23 +294,9 @@ pub(super) fn create_depth_texture(
 }
 
 impl Renderer {
-    /// Set the frame-root NodeKind to Cartesian. Clears
-    /// `slab_dims` so the X-wrap branch in the shader can't fire
-    /// from a stale upload.
+    /// Set the frame-root NodeKind to Cartesian.
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
-        self.slab_dims = [0; 4];
-        self.write_uniforms();
-    }
-
-    /// Set the frame-root NodeKind to `WrappedPlane`, carrying the
-    /// slab's `(dims_x, dims_y, dims_z, slab_depth)` for the
-    /// shader's wrap branch. The shader uses `dims_x` and
-    /// `slab_depth` to compute the wrap shift in slab-root local
-    /// units; `dims_y` / `dims_z` are reserved for Phase 3.
-    pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
-        self.root_kind = ROOT_KIND_WRAPPED_PLANE;
-        self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
         self.write_uniforms();
     }
 
@@ -491,21 +458,8 @@ impl Renderer {
 
     /// Set the visual debug paint mode (see `march_debug.wgsl`).
     /// 0 = off (normal render). 1..=8 paint per-pixel diagnostics.
-    /// Modes 7 / 8 are placeholders for the wrapped-planet phases —
-    /// they return the unwired sentinel until Phase 2 / Phase 3 land.
     pub fn set_debug_mode(&mut self, mode: u32) {
         self.debug_mode = [mode, 0, 0, 0];
-        self.write_uniforms();
-    }
-
-    /// Phase 3 Step 3.0: set the constant curvature coefficient `A`
-    /// for the per-step parabolic-drop bend `child_entry.y -= A·dist²`
-    /// applied at every descent in `march_cartesian`. `A = 0` (the
-    /// default) keeps the marcher bit-identical to the flat path.
-    /// Wired via the `--curvature A` CLI debug flag; later Phase 3
-    /// steps will compute `A` per-frame from camera altitude.
-    pub fn set_curvature_a(&mut self, a: f32) {
-        self.curvature = [a, 0.0, 0.0, 0.0];
         self.write_uniforms();
     }
 }

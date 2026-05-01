@@ -267,12 +267,12 @@ impl Renderer {
             highlight_min: [0.0; 4],
             highlight_max: [0.0; 4],
             _pad_radii: [0.0; 4],
-            slab_dims: [0; 4],
+            _pad_slab: [0; 4],
             _pad_face_bounds: [0.0; 4],
             _pad_face_pop_pos: [0.0; 4],
             debug_mode: [0; 4],
             probe_pixel: [0; 4],
-            curvature: [0.0; 4],
+            _pad_curvature: [0.0; 4],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -694,7 +694,6 @@ impl Renderer {
             max_depth: MAX_DEPTH as u32, highlight_active: 0,
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
-            slab_dims: [0; 4],
             ribbon_count: 0,
             offscreen_texture: None,
             mask_texture,
@@ -715,7 +714,6 @@ impl Renderer {
             walker_probe_readback,
             probe_pixel: [0; 4],
             debug_mode: [0; 4],
-            curvature: [0.0; 4],
             shader_stats_enabled,
             live_frame_counter: 0,
             live_sample_every_frames,

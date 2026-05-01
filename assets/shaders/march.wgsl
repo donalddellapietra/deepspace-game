@@ -97,7 +97,6 @@ fn write_walker_probe(
     hit_t: f32,
     normal: vec3<f32>,
     content_flag: u32,
-    curvature_offset: f32,
 ) {
     if uniforms.probe_pixel.z == 0u { return; }
     if current_pixel.x != uniforms.probe_pixel.x { return; }
@@ -116,7 +115,7 @@ fn write_walker_probe(
     walker_probe.hit_t_bits = bitcast<u32>(hit_t);
     walker_probe.hit_face = normal_to_face(normal);
     walker_probe.content_flag = content_flag;
-    walker_probe.curvature_offset_bits = bitcast<u32>(curvature_offset);
+    walker_probe._reserved11 = 0u;
 }
 
 fn march_entity_subtree(
@@ -318,13 +317,6 @@ fn march_entity_subtree(
 // frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
 // Returns hit on cell terminal; on miss (ray exits the frame),
 // returns hit=false so the caller can pop to the ancestor ribbon.
-//
-// X-wrap branch (Phase 2): when `uniforms.root_kind ==
-// ROOT_KIND_WRAPPED_PLANE` and the ray exits the root cell
-// purely on the X axis at depth==0, the marcher translates
-// `ray_origin.x` by ±wrap_shift (in slab-root local units) and
-// re-enters the same root from the opposite face instead of
-// returning a miss. Y / Z OOB and depth>0 OOB still ribbon-pop.
 fn march_cartesian(
     root_node_idx: u32, ray_origin_in: vec3<f32>, ray_dir: vec3<f32>,
     depth_limit: u32, skip_slot: u32,
@@ -448,80 +440,6 @@ fn march_cartesian(
         let cell = unpack_cell(s_cell[depth]);
 
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
-            // Phase 2 X-wrap: at depth==0 inside a WrappedPlane root
-            // frame, an X-only OOB wraps the ray instead of returning
-            // miss. Y / Z OOB and depth>0 OOB take the existing
-            // ribbon-pop / break path. The wrap shift is in slab-root
-            // local units (`[0, 3)` frame), so f32 magnitudes stay
-            // bounded — same precision discipline as the descent /
-            // ribbon-pop math.
-            //
-            // Gating: depth==0 AND root_kind==WRAPPED_PLANE AND only
-            // the X axis is OOB. Y or Z OOB simultaneously means the
-            // ray crossed a corner of the slab and should pop normally
-            // (the slab's Y / Z faces are not wrapped). When the
-            // camera is OUTSIDE a slab the render frame is Cartesian
-            // (root_kind != WRAPPED_PLANE), so this branch can't fire
-            // in that case — wrap stays scoped to inside-slab views.
-            let x_oob = cell.x < 0 || cell.x > 2;
-            let yz_in = cell.y >= 0 && cell.y <= 2
-                     && cell.z >= 0 && cell.z <= 2;
-            if depth == 0u
-                && uniforms.root_kind == ROOT_KIND_WRAPPED_PLANE
-                && x_oob && yz_in
-            {
-                // Slab-root local cell size at the slab leaf level:
-                // the WrappedPlane node spans `[0, 3)` and contains
-                // `3^slab_depth` cells per axis. The wrap shift is
-                // `dims_x * cell_size_at_slab_depth`. With Phase 2's
-                // invariant `dims_x == 3^slab_depth`, this evaluates
-                // to exactly 3.0 — i.e., the full WrappedPlane node
-                // width. East OOB → shift west; west OOB → shift east.
-                let dims_x = uniforms.slab_dims.x;
-                let slab_depth_u = uniforms.slab_dims.w;
-                let cell_size_slab = 3.0 / pow(3.0, f32(slab_depth_u));
-                let wrap_shift = f32(dims_x) * cell_size_slab;
-                let east_oob = cell.x > 2;
-                let sign = select(1.0, -1.0, east_oob);
-                ray_origin.x = ray_origin.x + sign * wrap_shift;
-
-                // Re-enter the SAME root node from the opposite face.
-                // cur_node_origin / cur_cell_size / s_node_idx[0] /
-                // cur_occupancy / cur_first_child all stay unchanged
-                // — only the entry point changes.
-                let new_root_hit = ray_box(
-                    ray_origin, inv_dir,
-                    vec3<f32>(0.0), vec3<f32>(3.0),
-                );
-                if new_root_hit.t_enter >= new_root_hit.t_exit
-                    || new_root_hit.t_exit < 0.0
-                {
-                    // Geometrically impossible after a valid wrap
-                    // (the new origin is off-axis but ray_dir.x is
-                    // unchanged, so the slab box is still hit). Bail
-                    // defensively if it ever happens.
-                    break;
-                }
-                let new_t_start = max(new_root_hit.t_enter, 0.0) + 0.001;
-                entry_pos = ray_origin + ray_dir * new_t_start;
-                let new_root_cell = vec3<i32>(
-                    clamp(i32(floor(entry_pos.x)), 0, 2),
-                    clamp(i32(floor(entry_pos.y)), 0, 2),
-                    clamp(i32(floor(entry_pos.z)), 0, 2),
-                );
-                s_cell[0] = pack_cell(new_root_cell);
-                let cf_w = vec3<f32>(new_root_cell);
-                cur_side_dist = vec3<f32>(
-                    select((cf_w.x - entry_pos.x) * inv_dir.x,
-                           (cf_w.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                    select((cf_w.y - entry_pos.y) * inv_dir.y,
-                           (cf_w.y + 1.0 - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-                    select((cf_w.z - entry_pos.z) * inv_dir.z,
-                           (cf_w.z + 1.0 - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
-                );
-                if ENABLE_STATS { ray_steps_oob = ray_steps_oob + 1u; }
-                continue;
-            }
             if depth == 0u { break; }
             depth -= 1u;
             cur_cell_size = cur_cell_size * 3.0;
@@ -593,13 +511,11 @@ fn march_cartesian(
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
-            // Walker probe (tag==1 hit). 0.0 curvature offset until
-            // Phase 3 introduces it; the slot's reserved so the CPU-
-            // side decode shape is stable across phases.
+            // Walker probe (tag==1 hit).
             write_walker_probe(
                 1u, iterations, depth, cell,
                 cur_node_origin, cur_cell_size,
-                result.t, normal, 1u, 0.0,
+                result.t, normal, 1u,
             );
             return result;
         } else if ENABLE_ENTITIES && tag == 3u {
@@ -846,18 +762,7 @@ fn march_cartesian(
                 );
                 let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
-                // Phase 3 Step 3.0 — per-descent parabolic bend.
-                // Subtract `A * dist²` from the y component of the
-                // child entry, where dist is the (frame-local) ray
-                // parameter at this descent. Cells selected reflect
-                // the bent path; side_dist init below still uses the
-                // un-bent entry_pos (linear approximation between
-                // descents — small for deep trees, refines as descent
-                // depth grows). `A = 0` (the default) zeroes the drop
-                // and the marcher is bit-identical to the flat path.
-                let curvature_drop = ct_start * ct_start * uniforms.curvature.x;
-                let bent_child_entry = child_entry - vec3<f32>(0.0, curvature_drop, 0.0);
-                let local_entry = (bent_child_entry - child_origin) / child_cell_size;
+                let local_entry = (child_entry - child_origin) / child_cell_size;
 
                 // Instrumentation: count of descents the path-mask
                 // cull would catch if enabled. An earlier experiment

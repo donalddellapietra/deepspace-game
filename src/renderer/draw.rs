@@ -40,8 +40,9 @@ pub struct WalkerProbeFrame {
     pub hit_t: f32,
     pub hit_face: u32,
     pub content_flag: u32,
-    /// Phase 3 reserved: bitcast<u32>(Δy at hit). Zero until wired.
-    pub curvature_offset: f32,
+    /// Reserved 4 bytes — was Phase 3 curvature_offset placeholder.
+    /// Held as f32 so the SSBO layout's 4-byte slot is preserved.
+    pub _reserved_44: f32,
 }
 
 /// Decoded `shader_stats` buffer for one frame. `avg_steps` is
@@ -751,7 +752,7 @@ impl Renderer {
             hit_t:           f32::from_bits(read_u32(32)),
             hit_face:        read_u32(36),
             content_flag:    read_u32(40),
-            curvature_offset: f32::from_bits(read_u32(44)),
+            _reserved_44:    f32::from_bits(read_u32(44)),
         };
         drop(data);
         self.walker_probe_readback.unmap();

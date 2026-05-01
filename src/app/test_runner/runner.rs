@@ -202,12 +202,6 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
     ));
     let mut renderer = renderer;
     renderer.update_palette(&app.palette.to_gpu_palette());
-    // Phase 3 Step 3.0: apply --curvature debug flag (test-harness
-    // path bypasses App::finish_init, so wire the same setter here).
-    if let Some(a) = cfg.curvature_a {
-        eprintln!("render_harness: curvature A={a:.4}");
-        renderer.set_curvature_a(a);
-    }
     renderer.resize(app.harness_width, app.harness_height);
     eprintln!(
         "render_harness: resize width={} height={}",

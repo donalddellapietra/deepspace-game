@@ -1,8 +1,7 @@
 // Ray march shader for base-3 recursive voxel tree.
 //
-// One unified Cartesian tree walker. Sphere-related dispatch and
-// shaders have been removed in favor of the wrapped-Cartesian
-// architecture (see `docs/design/wrapped-cartesian-planet-plan.md`).
+// One unified Cartesian tree walker. UV-sphere dispatch will be
+// added on top as a separate primitive (see sphere-uv-1 work).
 
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
