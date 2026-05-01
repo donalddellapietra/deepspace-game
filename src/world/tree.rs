@@ -82,6 +82,21 @@ pub fn uniform_children(child: Child) -> Children {
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
+    /// UV-sphere body root. The 27 children are interpreted as
+    /// `(φ-tier, θ-tier, r-tier)` cells in spherical-coordinate
+    /// parameter space. Body bounds: `φ ∈ [0, 2π)` (wraps),
+    /// `θ ∈ [-θ_cap, +θ_cap]`, `r ∈ [inner_r, outer_r]`. Descendants
+    /// stay `Cartesian` — slot semantics are reinterpreted by the UV
+    /// DDA primitive while inside the body subtree, but the storage
+    /// is identical.
+    ///
+    /// Radii are in the body cell's local `[0, 1)` frame; theta_cap
+    /// in radians.
+    UvSphereBody {
+        inner_r: f32,
+        outer_r: f32,
+        theta_cap: f32,
+    },
 }
 
 impl Default for NodeKind {
@@ -97,6 +112,11 @@ impl Hash for NodeKind {
         std::mem::discriminant(self).hash(state);
         match self {
             NodeKind::Cartesian => {}
+            NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } => {
+                inner_r.to_bits().hash(state);
+                outer_r.to_bits().hash(state);
+                theta_cap.to_bits().hash(state);
+            }
         }
     }
 }
@@ -104,7 +124,8 @@ impl Hash for NodeKind {
 impl NodeKind {
     /// Whether the GPU packer is allowed to flatten a uniform
     /// subtree of this kind into a single Block at its parent's
-    /// slot.
+    /// slot. Only Cartesian flattens; sphere-aware kinds carry
+    /// metadata the renderer needs to dispatch on.
     #[inline]
     pub fn allows_uniform_flatten(self) -> bool {
         matches!(self, NodeKind::Cartesian)

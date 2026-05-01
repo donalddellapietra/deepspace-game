@@ -77,6 +77,12 @@ pub enum WorldPreset {
     /// that the ray-march preserves precision across deep pops —
     /// stars at ancestor-depth 1 through N−1 must all render.
     Stars,
+    /// UV-sphere planet: a `NodeKind::UvSphereBody` node carrying
+    /// `(inner_r, outer_r, theta_cap)` installed at the world root's
+    /// center slot. Voxels are right-angled in spherical coords;
+    /// poles outside `|θ| < θ_cap` are not voxelized (cap impostor /
+    /// sky for now).
+    UvSphere,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
@@ -107,7 +113,8 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
         | WorldPreset::Stars
-        | WorldPreset::Scene { .. } => None,
+        | WorldPreset::Scene { .. }
+        | WorldPreset::UvSphere => None,
     }
 }
 
@@ -177,6 +184,7 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
             plain_layers.unwrap_or(40),
         ),
+        WorldPreset::UvSphere => bootstrap_uv_sphere_world(),
     }
 }
 
@@ -748,6 +756,42 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
         default_spawn_yaw: 0.0,
         default_spawn_pitch: -0.45,
         plain_layers,
+        color_registry: crate::world::palette::ColorRegistry::new(),
+    }
+}
+
+/// UV-sphere planet bootstrap. Empty Cartesian world with a single
+/// `NodeKind::UvSphereBody` installed at the world root's center
+/// slot. Camera spawns offset from the body so the whole planet is
+/// visible from outside.
+fn bootstrap_uv_sphere_world() -> WorldBootstrap {
+    use crate::world::uvsphere::{demo_uv_sphere, install_at_root_center};
+
+    let setup = demo_uv_sphere();
+    let mut library = NodeLibrary::default();
+    let empty_root = library.insert(empty_children());
+    let (root, body_path) = install_at_root_center(&mut library, empty_root, &setup);
+    library.ref_inc(root);
+
+    let world = WorldState { root, library };
+
+    // Spawn camera offset along +Z from the body so the planet fills
+    // a comfortable fraction of the view. Body center is at the
+    // root's centre slot ⇒ world position [1.5, 1.5, 1.5]; camera at
+    // [1.5, 1.5, 0.4] looks +Z toward the body.
+    let spawn_pos = WorldPos::new(
+        Path::root(),
+        [1.5, 1.5, 0.4],
+    );
+    let _ = body_path; // body_path retained on WorldBootstrap.planet_path below
+
+    WorldBootstrap {
+        world,
+        planet_path: Some(body_path),
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: 0.0,
+        default_spawn_pitch: 0.0,
+        plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }

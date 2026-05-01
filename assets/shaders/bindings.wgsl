@@ -93,15 +93,23 @@ struct RibbonEntry {
 const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
+/// Per-packed-node metadata, indexed by BFS position. Mirrors the
+/// CPU-side `GpuNodeKind` byte-for-byte.
+///
+/// `kind`: 0 = Cartesian, 1 = UvSphereBody.
+/// `param_a/b/c`: per-kind float metadata in u32-bitcast form.
+/// - `UvSphereBody`: `(inner_r, outer_r, theta_cap)` in body-local
+///   `[0, 1)` frame; theta_cap in radians.
+/// - `Cartesian`: zero.
 struct NodeKindGpu {
-    kind: u32,        // 0 = Cartesian
-    /// Reserved per-node metadata (zero for Cartesian). Held so the
-    /// CPU-side `GpuNodeKind` layout stays byte-stable while UV-sphere
-    /// metadata is wired in.
-    dims_x: u32,
-    dims_y: u32,
-    dims_z: u32,
+    kind: u32,
+    param_a: u32,
+    param_b: u32,
+    param_c: u32,
 }
+
+const NODE_KIND_CARTESIAN: u32 = 0u;
+const NODE_KIND_UV_SPHERE_BODY: u32 = 1u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated

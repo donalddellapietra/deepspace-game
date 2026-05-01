@@ -193,6 +193,7 @@ impl TestConfig {
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
                 "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
+                "--uv-sphere" => { cfg.world_preset = WorldPreset::UvSphere; }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,
@@ -474,6 +475,8 @@ FRACTAL PRESETS (default plain-layers = 8):
 VISIBILITY TEST PRESETS:
   --stars-world               Planet cube + distant stars at varying ribbon
                               depths; validates precision across deep pops
+  --uv-sphere                 UV-sphere planet (capped poles, right-angled
+                              voxels in spherical coords).
 
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):

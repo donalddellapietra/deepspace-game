@@ -61,22 +61,38 @@ impl GpuChild {
 /// Per-packed-node metadata: indexed by BFS position — the same
 /// `node_index` used in `GpuChild::node_index`. 16 bytes total.
 ///
-/// `kind`: 0 = Cartesian.
-/// `dims_x/y/z`: reserved per-node metadata (zeroed for Cartesian);
-/// kept so the layout has room for UV-sphere body parameters.
+/// `kind`: 0 = Cartesian, 1 = UvSphereBody.
+/// `param_a/b/c`: per-kind float metadata in u32-bitcast form.
+/// - `UvSphereBody`: `(inner_r, outer_r, theta_cap)` in body-local
+///   `[0, 1)` frame (theta_cap in radians).
+/// - `Cartesian`: zero.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
     pub kind: u32,
-    pub dims_x: u32,
-    pub dims_y: u32,
-    pub dims_z: u32,
+    pub param_a: u32,
+    pub param_b: u32,
+    pub param_c: u32,
 }
+
+pub const GPU_NODE_KIND_CARTESIAN: u32 = 0;
+pub const GPU_NODE_KIND_UV_SPHERE_BODY: u32 = 1;
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, dims_x: 0, dims_y: 0, dims_z: 0 },
+            NodeKind::Cartesian => Self {
+                kind: GPU_NODE_KIND_CARTESIAN,
+                param_a: 0,
+                param_b: 0,
+                param_c: 0,
+            },
+            NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } => Self {
+                kind: GPU_NODE_KIND_UV_SPHERE_BODY,
+                param_a: inner_r.to_bits(),
+                param_b: outer_r.to_bits(),
+                param_c: theta_cap.to_bits(),
+            },
         }
     }
 }
@@ -154,10 +170,22 @@ mod tests {
     #[test]
     fn from_node_kind_cartesian() {
         let k = GpuNodeKind::from_node_kind(NodeKind::Cartesian);
-        assert_eq!(k.kind, 0);
-        assert_eq!(k.dims_x, 0);
-        assert_eq!(k.dims_y, 0);
-        assert_eq!(k.dims_z, 0);
+        assert_eq!(k.kind, GPU_NODE_KIND_CARTESIAN);
+        assert_eq!(k.param_a, 0);
+        assert_eq!(k.param_b, 0);
+        assert_eq!(k.param_c, 0);
     }
 
+    #[test]
+    fn from_node_kind_uv_sphere_body_packs_params() {
+        let k = GpuNodeKind::from_node_kind(NodeKind::UvSphereBody {
+            inner_r: 0.12,
+            outer_r: 0.45,
+            theta_cap: 1.4,
+        });
+        assert_eq!(k.kind, GPU_NODE_KIND_UV_SPHERE_BODY);
+        assert_eq!(f32::from_bits(k.param_a), 0.12);
+        assert_eq!(f32::from_bits(k.param_b), 0.45);
+        assert_eq!(f32::from_bits(k.param_c), 1.4);
+    }
 }

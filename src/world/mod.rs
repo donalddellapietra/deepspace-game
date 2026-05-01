@@ -13,4 +13,5 @@ pub mod sdf;
 pub mod stars;
 pub mod state;
 pub mod tree;
+pub mod uvsphere;
 pub mod worldgen;
