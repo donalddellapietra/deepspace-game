@@ -1321,48 +1321,39 @@ fn sphere_descend_anchor(
         if t_r_hi > 0.0 && t_r_hi < t_next { t_next = t_r_hi; }
 
         if (occ & bit) == 0u {
-            // Empty slot. Advance to the next cell within this frame.
-            // Track the ray's new lon/lat/r DIFFERENTIALLY: use the
-            // analytic rates of (lon, r, lat) wrt t at the current
-            // ray position. delta_t * rate stays precise (rate is
-            // O(1), delta_t is small but well-conditioned). Adding
-            // (rate * delta_t) / cur_step to frame_in_frac preserves
-            // its precision even at deep depth.
-            let delta_t = t_next + max(cur_r_step * 1e-4, 1e-6) - t;
-            let pos_now = ray_origin + ray_dir * t;
-            let q = pos_now - cs_center;
-            let r_now = max(length(q), 1e-9);
-            let r2_xz = q.x * q.x + q.z * q.z;
-            // d(lon)/dt = (Q.x*D.z - Q.z*D.x) / (Q.x² + Q.z²)
-            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / max(r2_xz, 1e-12);
-            // d(r)/dt = (Q · D) / r
-            let rate_r = dot(q, ray_dir) / r_now;
-            // d(lat)/dt = derived from d(arg)/dt where arg = q.y/r:
-            //   d(arg)/dt = D.y / r - q.y * (q·D) / r³
-            //   d(lat)/dt = d(arg)/dt / sqrt(1 - arg²)
-            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
-            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
-            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
-
-            t = t + delta_t;
-            // Update frame_in_frac via differential rate. Each axis's
-            // step in frac space = delta_t * (axis rate) / cur_axis_step.
-            frame_in_frac = frame_in_frac + vec3<f32>(
-                rate_lon * delta_t / (3.0 * cur_lon_step),
-                rate_r   * delta_t / (3.0 * cur_r_step),
-                rate_lat * delta_t / (3.0 * cur_lat_step),
-            );
-            // Note: division by 3 because frame_in_frac spans [0, 1]
-            // over 3 cells. delta in frac = delta_in_cell / 3 where
-            // delta_in_cell = (rate * dt) / cell_step.
-
+            // Empty slot. Advance past the cell.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
             if t > t_exit { break; }
+            // Cell index: absolute recompute. This is the same precision
+            // class as the original (pre-precision-fix) DDA — robust
+            // enough at shallow depths to avoid skipping cells. Linear-
+            // approximation differential updates accumulated visible
+            // error here ("see-through cubes" symptom); absolute is
+            // simpler and correct.
+            let pos_a = ray_origin + ray_dir * t;
+            let off_a = pos_a - cs_center;
+            let r_a = max(length(off_a), 1e-9);
+            let n_a = off_a / r_a;
+            let lat_a = asin(clamp(n_a.y, -1.0, 1.0));
+            let lon_a = atan2(n_a.z, n_a.x);
             let cell_a = vec3<i32>(
-                i32(floor(frame_in_frac.x * 3.0)),
-                i32(floor(frame_in_frac.y * 3.0)),
-                i32(floor(frame_in_frac.z * 3.0)),
+                i32(floor((lon_a - cur_lon_org) / cur_lon_step)),
+                i32(floor((r_a   - cur_r_org)   / cur_r_step)),
+                i32(floor((lat_a - cur_lat_org) / cur_lat_step)),
             );
             s_cell[depth] = pack_cell(cell_a);
+            // Re-sync frame_in_frac so its cell-index agrees with what
+            // we just packed. At shallow depths this matches the
+            // absolute math; at deep depths frame_in_frac is precision-
+            // limited the same way absolute math is, but the value is
+            // still well-defined. Bevel at hit-after-push remains
+            // precise because the push branch updates frame_in_frac via
+            // the multiply-by-3 trick directly.
+            frame_in_frac = vec3<f32>(
+                (lon_a - cur_lon_org) / (3.0 * cur_lon_step),
+                (r_a   - cur_r_org)   / (3.0 * cur_r_step),
+                (lat_a - cur_lat_org) / (3.0 * cur_lat_step),
+            );
             continue;
         }
 
@@ -1396,59 +1387,52 @@ fn sphere_descend_anchor(
 
         if tag != 2u {
             // EntityRef etc. — treat as empty for sphere subtree DDA
-            // (no entities-inside-anchor for now). Advance.
-            let delta_t = t_next + max(cur_r_step * 1e-4, 1e-6) - t;
-            let pos_now = ray_origin + ray_dir * t;
-            let q = pos_now - cs_center;
-            let r_now = max(length(q), 1e-9);
-            let r2_xz = q.x * q.x + q.z * q.z;
-            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / max(r2_xz, 1e-12);
-            let rate_r = dot(q, ray_dir) / r_now;
-            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
-            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
-            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
-            t = t + delta_t;
-            frame_in_frac = frame_in_frac + vec3<f32>(
-                rate_lon * delta_t / (3.0 * cur_lon_step),
-                rate_r   * delta_t / (3.0 * cur_r_step),
-                rate_lat * delta_t / (3.0 * cur_lat_step),
-            );
+            // (no entities-inside-anchor for now). Advance — same
+            // shape as the empty-slot branch above.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
             if t > t_exit { break; }
+            let pos_e = ray_origin + ray_dir * t;
+            let off_e = pos_e - cs_center;
+            let r_e = max(length(off_e), 1e-9);
+            let n_e = off_e / r_e;
+            let lat_e = asin(clamp(n_e.y, -1.0, 1.0));
+            let lon_e = atan2(n_e.z, n_e.x);
             let cell_e = vec3<i32>(
-                i32(floor(frame_in_frac.x * 3.0)),
-                i32(floor(frame_in_frac.y * 3.0)),
-                i32(floor(frame_in_frac.z * 3.0)),
+                i32(floor((lon_e - cur_lon_org) / cur_lon_step)),
+                i32(floor((r_e   - cur_r_org)   / cur_r_step)),
+                i32(floor((lat_e - cur_lat_org) / cur_lat_step)),
             );
             s_cell[depth] = pack_cell(cell_e);
+            frame_in_frac = vec3<f32>(
+                (lon_e - cur_lon_org) / (3.0 * cur_lon_step),
+                (r_e   - cur_r_org)   / (3.0 * cur_r_step),
+                (lat_e - cur_lat_org) / (3.0 * cur_lat_step),
+            );
             continue;
         }
 
         // tag == 2u: non-uniform Node.
         if block_type == 0xFFFEu {
             // Subtree empty per `representative_block` — skip whole cell.
-            let delta_t = t_next + max(cur_r_step * 1e-4, 1e-6) - t;
-            let pos_now = ray_origin + ray_dir * t;
-            let q = pos_now - cs_center;
-            let r_now = max(length(q), 1e-9);
-            let r2_xz = q.x * q.x + q.z * q.z;
-            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / max(r2_xz, 1e-12);
-            let rate_r = dot(q, ray_dir) / r_now;
-            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
-            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
-            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
-            t = t + delta_t;
-            frame_in_frac = frame_in_frac + vec3<f32>(
-                rate_lon * delta_t / (3.0 * cur_lon_step),
-                rate_r   * delta_t / (3.0 * cur_r_step),
-                rate_lat * delta_t / (3.0 * cur_lat_step),
-            );
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
             if t > t_exit { break; }
+            let pos_r = ray_origin + ray_dir * t;
+            let off_r = pos_r - cs_center;
+            let r_rad = max(length(off_r), 1e-9);
+            let n_r = off_r / r_rad;
+            let lat_r = asin(clamp(n_r.y, -1.0, 1.0));
+            let lon_r = atan2(n_r.z, n_r.x);
             let cell_r = vec3<i32>(
-                i32(floor(frame_in_frac.x * 3.0)),
-                i32(floor(frame_in_frac.y * 3.0)),
-                i32(floor(frame_in_frac.z * 3.0)),
+                i32(floor((lon_r - cur_lon_org) / cur_lon_step)),
+                i32(floor((r_rad - cur_r_org)   / cur_r_step)),
+                i32(floor((lat_r - cur_lat_org) / cur_lat_step)),
             );
             s_cell[depth] = pack_cell(cell_r);
+            frame_in_frac = vec3<f32>(
+                (lon_r - cur_lon_org) / (3.0 * cur_lon_step),
+                (r_rad - cur_r_org)   / (3.0 * cur_r_step),
+                (lat_r - cur_lat_org) / (3.0 * cur_lat_step),
+            );
             continue;
         }
 
