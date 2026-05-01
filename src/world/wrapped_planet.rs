@@ -210,6 +210,7 @@ fn block_for_active_cell(cy: usize, height: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::raycast::cpu_raycast;
     use crate::world::tree::REPRESENTATIVE_EMPTY;
 
     #[test]
@@ -262,5 +263,59 @@ mod tests {
         let mut lib = NodeLibrary::default();
         let _ = build_phase1_planet(&mut lib);
         assert_eq!(lib.len(), 5, "planet library size = {}", lib.len());
+    }
+
+    // Phase 1.3 banned-cell acceptance: rays that traverse only
+    // banned (out-of-active-region) coords must miss. With 18x9x3 at
+    // active_subdepth=2 the active region in planet-frame coords is
+    // [0, 2.0) x [0, 1.0) x [0, 0.333). Banned regions are filled
+    // with `Child::Empty`, so the existing empty-cell DDA advance
+    // already produces a no-hit. These tests pin that contract so a
+    // future "optimize the planet by partially flattening banned
+    // regions into the planet root's NodeKind" change cannot
+    // accidentally revive content there.
+
+    #[test]
+    fn ray_through_x_banned_column_misses() {
+        // Planet-frame X active region is [0, 2.0); cell.x=2 of the
+        // planet root is entirely banned. Ray sits at x=2.5 going +Z
+        // through banned region.
+        let mut lib = NodeLibrary::default();
+        let planet = build_phase1_planet(&mut lib);
+        let hit = cpu_raycast(&lib, planet, [2.5, 0.5, 0.1], [0.0, 0.0, 1.0], 4);
+        assert!(hit.is_none(), "ray entirely within X-banned column should miss");
+    }
+
+    #[test]
+    fn ray_through_y_banned_row_misses() {
+        // Planet-frame Y active region is [0, 1.0); cells at
+        // planet-frame y>=1 are banned (the polar bands).
+        let mut lib = NodeLibrary::default();
+        let planet = build_phase1_planet(&mut lib);
+        let hit = cpu_raycast(&lib, planet, [1.0, 1.5, 0.1], [0.001, 0.0, 1.0], 4);
+        assert!(hit.is_none(), "ray entirely within Y-banned row should miss");
+    }
+
+    #[test]
+    fn ray_through_z_banned_region_misses() {
+        // Planet-frame Z active region is [0, 0.333); z=1.5 is well
+        // inside cell.z=1, banned. Ray sweeps +X across the planet
+        // staying in z=1.5.
+        let mut lib = NodeLibrary::default();
+        let planet = build_phase1_planet(&mut lib);
+        let hit = cpu_raycast(&lib, planet, [0.0, 0.5, 1.5], [1.0, 0.0, 0.0], 4);
+        assert!(hit.is_none(), "ray entirely within Z-banned region should miss");
+    }
+
+    #[test]
+    fn ray_into_active_region_hits() {
+        // Sanity: a downward ray from above the active region hits
+        // the grass top. Active y top is at planet-frame y=1.0
+        // (active y=8 occupies [8/9, 9/9)). Camera at y=1.5 looking
+        // straight down lands on grass at y=1.0.
+        let mut lib = NodeLibrary::default();
+        let planet = build_phase1_planet(&mut lib);
+        let hit = cpu_raycast(&lib, planet, [1.0, 1.5, 0.1], [0.0, -1.0, 0.0], 4);
+        assert!(hit.is_some(), "downward ray over active region should hit grass");
     }
 }
