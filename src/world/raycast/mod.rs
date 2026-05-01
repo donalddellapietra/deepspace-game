@@ -42,6 +42,148 @@ pub fn cpu_raycast(
     cartesian::cpu_raycast_inner(library, root, ray_origin, ray_dir, max_depth)
 }
 
+/// Phase 3 REVISED A.4 — UV-sphere raycast for the WrappedPlane
+/// frame when sphere-render mode is active. CPU mirror of the
+/// shader's `sphere_uv_in_cell`.
+///
+/// `cam_local` and `ray_dir` are in the slab-root frame's local
+/// `[0, 3)³` coords. The function ray-intersects the implied
+/// sphere (centered at frame center, R = body_size / (2π)),
+/// computes (lat, lon) from the surface normal, bans poles past
+/// `lat_max`, maps to slab `(cell_x, cell_z)` (with `cell_y` at
+/// the GRASS row = `dims.y - 1`), and walks the slab tree to
+/// retrieve the cell's NodeId path.
+///
+/// `frame_path` is the world-root → slab-root path; it's prepended
+/// to the returned HitInfo's path so callers (place / break) get a
+/// fully-qualified world-tree path matching the existing flat
+/// raycast's output shape.
+pub fn cpu_raycast_sphere_uv(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    frame_path: &[u8],
+    cam_local: [f32; 3],
+    ray_dir: [f32; 3],
+    dims: [u32; 3],
+    slab_depth: u8,
+    lat_max: f32,
+) -> Option<HitInfo> {
+    // Sphere center / radius in the slab-root frame's [0, 3)³ space.
+    let cs_center = [1.5_f32, 1.5, 1.5];
+    let body_size = 3.0_f32;
+    let r_sphere = body_size / (2.0 * std::f32::consts::PI);
+
+    // Normalize ray_dir for sphere intersect; remember the inverse so
+    // the returned `t` matches the un-normalised parameter the caller
+    // expects (`cam_local + ray_dir * t` lands on the hit point).
+    let dir_len = (ray_dir[0] * ray_dir[0]
+        + ray_dir[1] * ray_dir[1]
+        + ray_dir[2] * ray_dir[2])
+        .sqrt()
+        .max(1e-6);
+    let inv_norm = 1.0 / dir_len;
+    let dir = [
+        ray_dir[0] * inv_norm,
+        ray_dir[1] * inv_norm,
+        ray_dir[2] * inv_norm,
+    ];
+
+    let oc = [
+        cam_local[0] - cs_center[0],
+        cam_local[1] - cs_center[1],
+        cam_local[2] - cs_center[2],
+    ];
+    let b = oc[0] * dir[0] + oc[1] * dir[1] + oc[2] * dir[2];
+    let c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - r_sphere * r_sphere;
+    let disc = b * b - c;
+    if disc <= 0.0 {
+        return None;
+    }
+    let sq = disc.sqrt();
+    let t_enter = (-b - sq).max(0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 {
+        return None;
+    }
+
+    let hit = [
+        cam_local[0] + dir[0] * t_enter,
+        cam_local[1] + dir[1] * t_enter,
+        cam_local[2] + dir[2] * t_enter,
+    ];
+    let n = [
+        (hit[0] - cs_center[0]) / r_sphere,
+        (hit[1] - cs_center[1]) / r_sphere,
+        (hit[2] - cs_center[2]) / r_sphere,
+    ];
+    let lat = n[1].clamp(-1.0, 1.0).asin();
+    if lat.abs() > lat_max {
+        return None; // banned pole — pixel reads as sky
+    }
+    let lon = n[2].atan2(n[0]);
+
+    // (lon, lat) → slab cell coords. Floor + clamp.
+    let pi = std::f32::consts::PI;
+    let u = (lon + pi) / (2.0 * pi); // [0, 1)
+    let v = (lat + lat_max) / (2.0 * lat_max); // [0, 1]
+    let cell_x = ((u * dims[0] as f32).floor() as i32).clamp(0, dims[0] as i32 - 1);
+    let cell_z = ((v * dims[2] as f32).floor() as i32).clamp(0, dims[2] as i32 - 1);
+    let cell_y = dims[1] as i32 - 1; // GRASS row (top of populated band)
+
+    // Walk frame_path from world_root to the slab root, accumulating
+    // the (NodeId, slot) pairs the HitInfo expects.
+    let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(frame_path.len() + slab_depth as usize);
+    let mut cur = world_root;
+    for &slot in frame_path.iter() {
+        let node = library.get(cur)?;
+        path.push((cur, slot as usize));
+        match node.children[slot as usize] {
+            Child::Node(child) => cur = child,
+            _ => return None, // frame_path doesn't lead to a node
+        }
+    }
+    let slab_root = cur;
+
+    // Walk the slab tree from slab_root down `slab_depth` levels to
+    // reach (cell_x, cell_y, cell_z).
+    let mut idx = slab_root;
+    let mut cells_per_slot: i32 = 1;
+    for _ in 1..slab_depth {
+        cells_per_slot *= 3;
+    }
+    for level in 0..slab_depth {
+        let sx = (cell_x / cells_per_slot).rem_euclid(3);
+        let sy = (cell_y / cells_per_slot).rem_euclid(3);
+        let sz = (cell_z / cells_per_slot).rem_euclid(3);
+        let slot = slot_index(sx as usize, sy as usize, sz as usize);
+        path.push((idx, slot));
+        let node = library.get(idx)?;
+        match node.children[slot] {
+            Child::Block(_) => break,
+            Child::Node(child) => {
+                if level + 1 < slab_depth {
+                    idx = child;
+                }
+            }
+            _ => return None, // empty cell — caller treats as miss
+        }
+        cells_per_slot /= 3;
+    }
+
+    // Hit returned: face = +Y (top face — the GRASS surface is up).
+    // place_path: insert above the GRASS row (at cell_y + 1) — since
+    // dims.y = 2 and we're already at the top, "above" means we'd
+    // need to extend the slab. Leave None for now; A.4+ can wire
+    // proper placement once the architecture for "above-slab cells"
+    // is decided.
+    Some(HitInfo {
+        path,
+        face: 2,
+        t: t_enter * inv_norm,
+        place_path: None,
+    })
+}
+
 /// Frame-aware raycast. Mirrors the renderer's ribbon-pop
 /// architecture so the CPU hit depth matches what the shader
 /// renders (LOD-bounded, not budget-bounded): cell-precision is
@@ -375,5 +517,84 @@ mod tests {
             assert!(hit.is_some(),
                 "zoom-in raycast missed at depth={target_depth}");
         }
+    }
+
+    // Phase 3 REVISED A.4 — verify the sphere CPU raycast lands the
+    // hit on the cell predicted by the (lon, lat) → (cell_x, cell_z)
+    // math. Three cardinal directions:
+    // - Ray east of sphere going west (-X) → hits the +X equator
+    //   point. Normal = (1,0,0). lon = atan2(0, 1) = 0. cell_x in
+    //   the middle (= ~13 for dims_x=27). cell_z in the middle.
+    // - Ray north of sphere going down (+Y, lat = π/2) → BANNED by
+    //   pole filter, returns None.
+    // - Ray going at +Z direction towards sphere → hits +Z normal.
+    //   lon = atan2(1, 0) = π/2. cell_x = ~20.
+    #[test]
+    fn cpu_raycast_sphere_uv_east_equator_hits_middle_cell() {
+        use crate::world::bootstrap::wrapped_planet_world;
+        use crate::world::tree::slot_index;
+
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        let mut frame_path = vec![];
+        for _ in 0..2 {
+            frame_path.push(slot_index(1, 1, 1) as u8);
+        }
+        // Camera way east of sphere center (1.5, 1.5, 1.5), looking
+        // -X. Ray hits the +X equator point at world-frame
+        // (1.5 + R, 1.5, 1.5).
+        let cam_local = [3.0, 1.5, 1.5];
+        let ray_dir = [-1.0, 0.0, 0.0];
+        let hit = cpu_raycast_sphere_uv(
+            &world.library, world.root, &frame_path,
+            cam_local, ray_dir,
+            [27, 2, 14], 3,
+            1.26,
+        ).expect("ray to +X equator must hit");
+        // Expected: lon = 0, lat = 0 → u = 0.5, v = 0.5 →
+        // cell_x = floor(0.5 * 27) = 13, cell_z = floor(0.5 * 14) = 7,
+        // cell_y = dims_y - 1 = 1 (GRASS row).
+        // The path's leaf-level (NodeId, slot) encodes the cell —
+        // leaf-level slot for (cell_x % 3, cell_y % 3, cell_z % 3) =
+        // (13 % 3, 1, 7 % 3) = (1, 1, 1) = slot 13.
+        let leaf_slot = hit.path.last().expect("hit path non-empty").1;
+        assert_eq!(leaf_slot, slot_index(1, 1, 1),
+            "expected leaf slot (1,1,1) for cell (13, 1, 7), got slot {leaf_slot}");
+        assert_eq!(hit.face, 2, "sphere hit reports +Y face");
+    }
+
+    #[test]
+    fn cpu_raycast_sphere_uv_pole_is_banned() {
+        use crate::world::bootstrap::wrapped_planet_world;
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        let frame_path = vec![13u8, 13u8];
+        // Ray straight DOWN toward sphere from above — hits +Y
+        // normal (lat = π/2 ≈ 1.57 > lat_max 1.26) → banned pole.
+        let cam_local = [1.5, 3.0, 1.5];
+        let ray_dir = [0.0, -1.0, 0.0];
+        let hit = cpu_raycast_sphere_uv(
+            &world.library, world.root, &frame_path,
+            cam_local, ray_dir,
+            [27, 2, 14], 3,
+            1.26,
+        );
+        assert!(hit.is_none(), "north-pole ray must be banned");
+    }
+
+    #[test]
+    fn cpu_raycast_sphere_uv_misses_when_ray_misses_sphere() {
+        use crate::world::bootstrap::wrapped_planet_world;
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        let frame_path = vec![13u8, 13u8];
+        // Ray going +Y from above, way off to the side — never
+        // intersects the sphere.
+        let cam_local = [3.0, 3.0, 3.0];
+        let ray_dir = [0.0, 1.0, 0.0];
+        let hit = cpu_raycast_sphere_uv(
+            &world.library, world.root, &frame_path,
+            cam_local, ray_dir,
+            [27, 2, 14], 3,
+            1.26,
+        );
+        assert!(hit.is_none(), "ray missing the sphere returns None");
     }
 }
