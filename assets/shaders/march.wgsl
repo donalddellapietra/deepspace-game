@@ -263,6 +263,155 @@ fn march_entity_subtree(
     return result;
 }
 
+// ---- Phase 3: bent-Y DDA helpers --------------------------------
+// Curvature is applied as the EXACT great-circle drop on the y
+// component of the ray's sample position:
+//
+//   theta(t) = t · ray_metric · k / R     (dimensionless angle)
+//   drop(t)  = R · (1 − cos(theta))
+//   y(t)     = entry_y + ray_dir.y · t − drop(t)
+//
+// `t` is the t-parameter along ray_origin + ray_dir·t. ray_dir is
+// not necessarily unit (it depends on FOV/UV), so we scale by
+// `ray_metric = length(ray_dir)` to get arc-length s = t·ray_metric.
+//
+// Properties:
+//   - k = 0           → drop ≡ 0          → bit-identical to flat march.
+//   - k > 0, periodic  → drop returns to 0 every theta = 2π. A
+//                        horizontal ray wrapping around the slab
+//                        returns to the starting y after a full
+//                        revolution. The bent path is continuous
+//                        across X-wrap as long as `cur_t_global`
+//                        is preserved across the wrap.
+//   - small theta     → R(1−cos(theta)) ≈ R·theta²/2 = k·s²/(2R),
+//                        the parabolic Taylor expansion. Low-altitude
+//                        visuals match the local quadratic prior.
+//   - past tangent (theta > π/2) for a near-horizontal ray
+//                     → ray is "behind" the planet; render sky.
+//                       (Not applied to non-horizontal rays — those
+//                       have y(t) monotonic before hitting the slab.)
+//
+// X and Z are unaffected (curvature is symmetric about the implied
+// planet's vertical axis; "down" maps onto local −Y).
+
+// Closed-form `y(t) − boundary_y` along the bent ray.
+fn bent_y_residual(
+    t: f32, boundary_y: f32, entry_y: f32, ray_dir_y: f32,
+    k: f32, r_planet: f32, r_inv: f32, ray_metric: f32,
+) -> f32 {
+    let theta = t * ray_metric * k * r_inv;
+    let drop = r_planet * (1.0 - cos(theta));
+    return (entry_y + ray_dir_y * t - drop) - boundary_y;
+}
+
+// Smallest t > cur_t for which the bent ray's y(t) equals
+// `boundary_y`. Returns `1e20` when no crossing exists in the
+// forward search window `[cur_t, cur_t + dt_max]`.
+//
+// Bracket scheme:
+// - Search width `dt_max = min(πR/(k·ray_metric), C·cur_cell_size /
+//   speed_lo)`. The half-period bound prevents the bisection from
+//   spanning multiple zeros (y oscillates with that period); the
+//   cell-bound prevents skipping past the actual crossing when
+//   cells are finer than the half-period.
+// - Sample-step scan: 16 evenly-spaced f-evals; the first sign
+//   change of f brackets the unique-in-this-window crossing.
+// - Bisect 22 iters → f32 sub-cell precision (~1 ULP at cur_cell_size
+//   = 3e-2; deeper cells still get ~3e-9 precision).
+//
+// k = 0 fast path: closed-form linear crossing, bit-identical to the
+// pre-Phase-3 marcher.
+fn bent_y_t_for_boundary(
+    cur_t: f32, boundary_y: f32, entry_y: f32, ray_dir_y: f32,
+    k: f32, r_planet: f32, r_inv: f32, ray_metric: f32, cur_cell_size: f32,
+) -> f32 {
+    if k < 1e-9 || r_inv < 1e-9 {
+        // Linear ray. Crossing exists iff ray_dir_y ≠ 0 and t > cur_t.
+        if abs(ray_dir_y) < 1e-8 {
+            return 1e20;
+        }
+        let t = (boundary_y - entry_y) / ray_dir_y;
+        return select(1e20, t, t > cur_t + 1e-7);
+    }
+
+    // Bracket width: tight enough to avoid spanning multiple
+    // crossings of the same boundary (they're separated by
+    // ~2πR/(k·ray_metric) = the cosine period). Capped at the
+    // half-period so within the bracket y(t) has at most one apex.
+    //
+    // Lower bound: cell-traverse time. Worst-case y velocity at
+    // apex is 0; we use |ray_dir_y| + k·ray_metric (the speed bound
+    // from the cosine derivative) as a safe upper bound on the
+    // y-velocity magnitude away from apex. Time to traverse a cell:
+    // cur_cell_size / speed. Multiply by 6 for slack so we don't
+    // miss a crossing right past the cell.
+    let speed_hi = abs(ray_dir_y) + k * ray_metric;
+    let dt_cell = 6.0 * cur_cell_size / max(speed_hi, 1e-3);
+    let dt_period_half = 3.14159265 * r_planet / max(k * ray_metric, 1e-6);
+    let dt_max = min(dt_cell, dt_period_half);
+
+    let SAMPLES: i32 = 16;
+    let dt = max(dt_max / f32(SAMPLES), 1e-7);
+    var t_lo = cur_t + 1e-7;
+    var f_lo = bent_y_residual(t_lo, boundary_y, entry_y, ray_dir_y, k, r_planet, r_inv, ray_metric);
+    var t_hi = t_lo;
+    var f_hi = f_lo;
+    var found: bool = false;
+    for (var i: i32 = 1; i <= SAMPLES; i = i + 1) {
+        t_hi = cur_t + 1e-7 + f32(i) * dt;
+        f_hi = bent_y_residual(t_hi, boundary_y, entry_y, ray_dir_y, k, r_planet, r_inv, ray_metric);
+        if (f_lo * f_hi) <= 0.0 {
+            found = true;
+            break;
+        }
+        t_lo = t_hi;
+        f_lo = f_hi;
+    }
+    if !found {
+        return 1e20;
+    }
+
+    // Bisect [t_lo, t_hi] to convergence.
+    for (var j: i32 = 0; j < 22; j = j + 1) {
+        let t_mid = 0.5 * (t_lo + t_hi);
+        let f_mid = bent_y_residual(t_mid, boundary_y, entry_y, ray_dir_y, k, r_planet, r_inv, ray_metric);
+        if (f_lo * f_mid) <= 0.0 {
+            t_hi = t_mid;
+            f_hi = f_mid;
+        } else {
+            t_lo = t_mid;
+            f_lo = f_mid;
+        }
+    }
+    return 0.5 * (t_lo + t_hi);
+}
+
+// Smallest t > cur_t at which the bent ray exits the current
+// y-cell, bounded by `cell_y_lo` and `cell_y_hi`.
+// At apex (dy/dt = 0) the ray turns around; the helper picks
+// whichever boundary the ray reaches first.
+fn bent_y_next_crossing(
+    cur_t: f32, cell_y_lo: f32, cell_y_hi: f32,
+    entry_y: f32, ray_dir_y: f32,
+    k: f32, r_planet: f32, r_inv: f32, ray_metric: f32, cur_cell_size: f32,
+) -> f32 {
+    let t_lo = bent_y_t_for_boundary(
+        cur_t, cell_y_lo, entry_y, ray_dir_y, k, r_planet, r_inv, ray_metric, cur_cell_size,
+    );
+    let t_hi = bent_y_t_for_boundary(
+        cur_t, cell_y_hi, entry_y, ray_dir_y, k, r_planet, r_inv, ray_metric, cur_cell_size,
+    );
+    return min(t_lo, t_hi);
+}
+
+// True when the bent ray has gone past tangent (theta > π/2). Only
+// meaningful for nearly-horizontal rays — non-horizontal rays
+// have y(t) dominated by the linear `ray_dir_y · t` term and don't
+// have a meaningful "behind the planet" condition under Y-only bend.
+fn past_horizon(t: f32, k: f32, r_inv: f32, ray_metric: f32) -> bool {
+    return t * ray_metric * k * r_inv > 1.5707963;
+}
+
 // Cartesian DDA in a single frame rooted at `root_node_idx`. The
 // frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
 // Returns hit on cell terminal; on miss (ray exits the frame),
@@ -370,6 +519,40 @@ fn march_cartesian(
     // as the reference point, so wrap must update both).
     var entry_pos: vec3<f32> = ray_origin + ray_dir * t_start;
 
+    // Phase 3: bent-Y DDA state.
+    //
+    // We maintain TWO t-parameters:
+    //  - `cur_t_local`: t-from-current-entry_pos. Used for
+    //    cur_side_dist comparisons; X/Z DDA stays linear-incremental
+    //    in this frame (Phase-2 byte-identical).
+    //  - `cur_t_global = cur_t_local + t_segment_offset`: cumulative
+    //    arc-length parameter from the FIRST root entry, INVARIANT
+    //    under X-wrap re-entries. The bent-y formula uses this so
+    //    multi-revolution rays close back to drop=0 every period
+    //    (great-circle continuity).
+    //
+    // On X-wrap: ray_origin shifts by ±wrap_shift in X. ray_dir
+    // unchanged. The geometric ray didn't move (in X), so cur_t_global
+    // PERSISTS — we add the pre-wrap cur_t_local into t_segment_offset
+    // and reset cur_t_local to 0 for the new entry_pos. This is the
+    // single biggest behavioral change from the reverted parabolic
+    // attempt: the cosine drop's continuity is what makes wrap +
+    // curvature look connected (no "spiral" / detached arcs).
+    //
+    // `entry_y_init` is captured ONCE at the FIRST root entry and
+    // NEVER refreshed. The X-wrap doesn't change ray's y, but
+    // entry_pos.y can drift via new_t_start (different box-entry t
+    // after the X shift); entry_y_init keeps the bent formula's
+    // reference fixed so the y trajectory is continuous across wraps.
+    //
+    let k_local = uniforms.curvature[0];
+    let r_inv_local = uniforms.curvature[1];
+    let r_planet_local = select(0.0, 1.0 / r_inv_local, r_inv_local > 1e-9);
+    let curvature_on = k_local > 1e-9 && r_inv_local > 1e-9;
+    let entry_y_init: f32 = entry_pos.y;
+    var cur_t_local: f32 = 0.0;
+    var t_segment_offset: f32 = 0.0;
+
     let root_cell = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
         clamp(i32(floor(entry_pos.y)), 0, 2),
@@ -395,6 +578,38 @@ fn march_cartesian(
         if ENABLE_STATS { ray_steps = ray_steps + 1u; }
 
         let cell = unpack_cell(s_cell[depth]);
+
+        // Phase 3: bent-Y DDA recompute. When curvature is on and
+        // we're inside the cell range, override cur_side_dist.y with
+        // the bent-ray's next y-crossing (X and Z stay linear-
+        // incremental). The helper takes GLOBAL t (cumulative
+        // across wraps) and returns global t; we convert back to
+        // local frame via `t_segment_offset`.
+        //
+        // Horizon cutoff: only fire for nearly-horizontal rays
+        // (|ray_dir.y| < 0.2 ≈ 11° from horizontal). Steep / vertical
+        // rays don't have a meaningful "behind the planet" condition
+        // under Y-only bend — they hit the slab via DDA or exit on
+        // Y-OOB normally. Applying a hard horizon cutoff to vertical
+        // rays would prematurely sky'd them while they're still
+        // legitimately descending toward the slab.
+        if curvature_on && cell.y >= 0 && cell.y <= 2 {
+            let cur_t_global = cur_t_local + t_segment_offset;
+            if abs(ray_dir.y) < 0.2
+                && past_horizon(cur_t_global, k_local, r_inv_local, ray_metric)
+            {
+                result.hit = false;
+                return result;
+            }
+            let cell_y_lo = cur_node_origin.y + f32(cell.y) * cur_cell_size;
+            let cell_y_hi = cell_y_lo + cur_cell_size;
+            let t_next_global = bent_y_next_crossing(
+                cur_t_global, cell_y_lo, cell_y_hi,
+                entry_y_init, ray_dir.y,
+                k_local, r_planet_local, r_inv_local, ray_metric, cur_cell_size,
+            );
+            cur_side_dist.y = t_next_global - t_segment_offset;
+        }
 
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             // Phase 2 X-wrap: at depth==0 inside a WrappedPlane root
@@ -452,6 +667,15 @@ fn march_cartesian(
                     break;
                 }
                 let new_t_start = max(new_root_hit.t_enter, 0.0) + 0.001;
+                // Phase 3: cur_t_global PERSISTS across the wrap so
+                // the cosine drop stays continuous (multi-revolution
+                // rays close back to drop=0 every period). Local
+                // parameterization rebases: pre-wrap cur_t_local is
+                // the t at which the ray exited the slab x-face; we
+                // add it to t_segment_offset and reset cur_t_local
+                // to 0 in the new entry_pos frame.
+                t_segment_offset = t_segment_offset + cur_t_local;
+                cur_t_local = 0.0;
                 entry_pos = ray_origin + ray_dir * new_t_start;
                 let new_root_cell = vec3<i32>(
                     clamp(i32(floor(entry_pos.x)), 0, 2),
@@ -472,6 +696,10 @@ fn march_cartesian(
                 continue;
             }
             if depth == 0u { break; }
+            // Phase 3: capture cur_t_local BEFORE the cur_side_dist
+            // recompute below — same parameterization (t-from-
+            // entry_pos), so cur_t_local survives the pop unchanged.
+            cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
             depth -= 1u;
             cur_cell_size = cur_cell_size * 3.0;
             let parent_cell = unpack_cell(s_cell[depth]);
@@ -500,6 +728,7 @@ fn march_cartesian(
 
             let m_oob = min_axis_mask(cur_side_dist);
             s_cell[depth] = pack_cell(parent_cell + vec3<i32>(m_oob) * step);
+            cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
             cur_side_dist += m_oob * delta_dist * cur_cell_size;
             normal = -vec3<f32>(step) * m_oob;
             continue;
@@ -515,6 +744,7 @@ fn march_cartesian(
             if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
             let m_empty = min_axis_mask(cur_side_dist);
             s_cell[depth] = pack_cell(cell + vec3<i32>(m_empty) * step);
+            cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
             cur_side_dist += m_empty * delta_dist * cur_cell_size;
             normal = -vec3<f32>(step) * m_empty;
             continue;
@@ -564,6 +794,7 @@ fn march_cartesian(
             if ebb.t_enter >= ebb.t_exit || ebb.t_exit < 0.0 {
                 let m_bb = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_bb) * step);
+                cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
                 cur_side_dist += m_bb * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_bb;
                 continue;
@@ -592,6 +823,7 @@ fn march_cartesian(
                 }
                 let m_lod_e = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_lod_e) * step);
+                cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
                 cur_side_dist += m_lod_e * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_lod_e;
                 continue;
@@ -617,6 +849,7 @@ fn march_cartesian(
             }
             let m_ent_miss = min_axis_mask(cur_side_dist);
             s_cell[depth] = pack_cell(cell + vec3<i32>(m_ent_miss) * step);
+            cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
             cur_side_dist += m_ent_miss * delta_dist * cur_cell_size;
             normal = -vec3<f32>(step) * m_ent_miss;
             continue;
@@ -637,6 +870,7 @@ fn march_cartesian(
             if depth == 0u && cell_slot == skip_slot {
                 let m_skip = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_skip) * step);
+                cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
                 cur_side_dist += m_skip * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_skip;
                 continue;
@@ -662,6 +896,7 @@ fn march_cartesian(
                 if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
                 let m_rep = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_rep) * step);
+                cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
                 cur_side_dist += m_rep * delta_dist * cur_cell_size;
                 normal = -vec3<f32>(step) * m_rep;
                 continue;
@@ -691,6 +926,7 @@ fn march_cartesian(
                 if bt == 0xFFFEu {
                     let m_lodt = min_axis_mask(cur_side_dist);
                     s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
+                    cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
                     cur_side_dist += m_lodt * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_lodt;
                 } else {
@@ -755,6 +991,7 @@ fn march_cartesian(
                 if aabb_hit.t_exit <= aabb_hit.t_enter || aabb_hit.t_exit < 0.0 {
                     let m_aabb = min_axis_mask(cur_side_dist);
                     s_cell[depth] = pack_cell(cell + vec3<i32>(m_aabb) * step);
+                    cur_t_local = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
                     cur_side_dist += m_aabb * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_aabb;
                     if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
@@ -851,6 +1088,21 @@ fn march_cartesian(
                     select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
                            (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
                 );
+                // Phase 3 note: do NOT overwrite cur_t_local with the
+                // linear `ct_start`. With curvature on, the BENT ray
+                // entered this cell at a different t than the linear
+                // ray would (the cosine drop pulls y down faster), so
+                // `ct_start − t_seg_start` is the LINEAR entry t,
+                // not the BENT entry t. cur_t_local was already set
+                // to the correct bent t at the preceding step site
+                // (`min(cur_side_dist)` pre-increment, with
+                // cur_side_dist.y already replaced by the bent
+                // recompute). It survives descent unchanged because
+                // cur_side_dist after the descent recompute is in
+                // the same t-from-entry_pos parameterization. An
+                // earlier draft did overwrite cur_t_local here and
+                // produced visible "stripe" artifacts at descent
+                // boundaries.
             }
         }
     }

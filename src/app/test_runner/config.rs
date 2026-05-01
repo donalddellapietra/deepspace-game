@@ -26,6 +26,14 @@ pub struct TestConfig {
     pub spawn_yaw: Option<f32>,
     /// Camera pitch at spawn (radians). Default -1.2 (steep down).
     pub spawn_pitch: Option<f32>,
+    /// Phase 3: override the wrapped-planet spawn's `cam_y` (in
+    /// WrappedPlane cell `[0, 1)` coords). The default
+    /// `wrapped_planet_spawn` clamps cam_y to `[0.001, 0.95]` for
+    /// the in-cell air-gap heuristic; altitude-sweep tests need
+    /// values past that range. Only consumed when the active world
+    /// preset is `WrappedPlanet`. Per-axis override of the spawn-
+    /// position computation, NOT a world-XYZ replacement.
+    pub wrapped_cam_y: Option<f32>,
     pub screenshot: Option<String>,
     pub exit_after_frames: Option<u32>,
     /// Wall-clock kill switch in seconds. Defaults to 5.0 so a
@@ -267,6 +275,9 @@ impl TestConfig {
                 }
                 "--spawn-yaw" => { cfg.spawn_yaw = args.next().and_then(|v| v.parse().ok()); }
                 "--spawn-pitch" => { cfg.spawn_pitch = args.next().and_then(|v| v.parse().ok()); }
+                "--wrapped-cam-y" => {
+                    cfg.wrapped_cam_y = args.next().and_then(|v| v.parse().ok());
+                }
                 "--screenshot" => { cfg.screenshot = args.next(); }
                 "--exit-after-frames" => {
                     cfg.exit_after_frames = args.next().and_then(|v| v.parse().ok());
@@ -374,6 +385,7 @@ impl TestConfig {
             || self.spawn_xyz.is_some()
             || self.spawn_yaw.is_some()
             || self.spawn_pitch.is_some()
+            || self.wrapped_cam_y.is_some()
             || self.min_fps.is_some()
             || self.min_cadence_fps.is_some()
             || self.run_for_secs.is_some()

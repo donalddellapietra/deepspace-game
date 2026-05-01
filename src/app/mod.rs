@@ -329,7 +329,19 @@ impl App {
         // `unwrap_or(...)` default applies when the user didn't
         // pass --plain-layers. Fractals default to 8 (where Block
         // leaves are pixel-visible); plain/vox world default to 40.
-        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), test_cfg.plain_layers);
+        let mut bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), test_cfg.plain_layers);
+        // Phase 3: `--wrapped-cam-y` override for the wrapped-planet
+        // preset (altitude-sweep tests). Replaces only the y component
+        // of the default spawn; x/z stay at the slab centre so the
+        // ray-march sees the same "directly above the slab" framing.
+        if let (
+            crate::world::bootstrap::WorldPreset::WrappedPlanet { embedding_depth, slab_dims, slab_depth },
+            Some(cam_y),
+        ) = (test_cfg.world_preset.clone(), test_cfg.wrapped_cam_y) {
+            bootstrap.default_spawn_pos = bootstrap::wrapped_planet_spawn_with_y(
+                embedding_depth, slab_dims, slab_depth, Some(cam_y),
+            );
+        }
         let mut world = bootstrap.world;
         let bootstrap_color_registry = bootstrap.color_registry;
         let tree_depth = world.tree_depth();

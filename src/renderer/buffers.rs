@@ -302,7 +302,7 @@ impl Renderer {
             _pad_entity: [0; 3],
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
-            _pad_radii: [0.0; 4],
+            curvature: self.curvature,
             slab_dims: self.slab_dims,
             _pad_face_bounds: [0.0; 4],
             _pad_face_pop_pos: [0.0; 4],
