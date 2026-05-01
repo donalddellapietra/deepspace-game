@@ -1252,18 +1252,18 @@ fn sphere_uv_in_cell(
     // descend until each sub-cell is uniform / empty / depth-bounded.
     // Same render at every zoom (descent depth is a function of the
     // tree, not `uniforms.max_depth`).
-    const SPHERE_STACK_MAX: u32 = 6u;
-    var s_node:    array<u32, 6>;
-    var s_lon0:    array<f32, 6>;  // origin for cell grid at this level
-    var s_lat0:    array<f32, 6>;
-    var s_r0:      array<f32, 6>;
-    var s_dlon:    array<f32, 6>;  // cell width
-    var s_dlat:    array<f32, 6>;
-    var s_dr:      array<f32, 6>;
-    var s_dimx:    array<i32, 6>;  // cell counts at this level
-    var s_dimy:    array<i32, 6>;
-    var s_dimz:    array<i32, 6>;
-    var s_t_exit:  array<f32, 6>;  // pop back to parent when t > this
+    const SPHERE_STACK_MAX: u32 = 16u;
+    var s_node:    array<u32, 16>;
+    var s_lon0:    array<f32, 16>;  // origin for cell grid at this level
+    var s_lat0:    array<f32, 16>;
+    var s_r0:      array<f32, 16>;
+    var s_dlon:    array<f32, 16>;  // cell width
+    var s_dlat:    array<f32, 16>;
+    var s_dr:      array<f32, 16>;
+    var s_dimx:    array<i32, 16>;  // cell counts at this level
+    var s_dimy:    array<i32, 16>;
+    var s_dimz:    array<i32, 16>;
+    var s_t_exit:  array<f32, 16>;  // pop back to parent when t > this
 
     s_node[0]   = body_idx;
     s_lon0[0]   = -pi;
