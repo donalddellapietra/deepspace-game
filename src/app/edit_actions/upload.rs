@@ -295,6 +295,9 @@ impl App {
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
+                ActiveFrameKind::UvSphereBody { .. } => {
+                    renderer.set_root_kind_uv_sphere_body();
+                }
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }

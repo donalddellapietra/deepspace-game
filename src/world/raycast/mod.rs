@@ -8,8 +8,27 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
+mod uvsphere;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
+
+pub(super) const MAX_UV_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
+
+#[derive(Debug, Clone, Copy)]
+pub struct UvSphereHitCell {
+    pub phi_lo: f32,
+    pub theta_lo: f32,
+    pub r_lo: f32,
+    pub size: f32,
+    pub inner_r: f32,
+    pub outer_r: f32,
+    pub theta_cap: f32,
+    pub body_path_len: usize,
+    pub ratio_phi: i64,
+    pub ratio_theta: i64,
+    pub ratio_r: i64,
+    pub ratio_depth: u8,
+}
 
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
@@ -26,6 +45,9 @@ pub struct HitInfo {
     /// hits leave this `None` — `place_child` derives the adjacent cell
     /// via `face`.
     pub place_path: Option<Vec<(NodeId, usize)>>,
+    /// Exact UV-sphere terminal cell metadata when the hit came from
+    /// a `UvSphereBody`.
+    pub uv_sphere_cell: Option<UvSphereHitCell>,
 }
 
 /// Cast a ray through the tree, stopping at `max_depth` levels from
@@ -39,7 +61,14 @@ pub fn cpu_raycast(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
-    cartesian::cpu_raycast_inner(library, root, ray_origin, ray_dir, max_depth)
+    cartesian::cpu_raycast_with_uv_depth(
+        library,
+        root,
+        ray_origin,
+        ray_dir,
+        max_depth,
+        MAX_UV_DEPTH,
+    )
 }
 
 /// Frame-aware raycast. Mirrors the renderer's ribbon-pop
@@ -55,7 +84,7 @@ pub fn cpu_raycast_in_frame(
     cam_local: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
-    _max_face_depth: u32,
+    max_face_depth: u32,
 ) -> Option<HitInfo> {
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
     let effective_depth = chain.len() - 1;
@@ -69,10 +98,32 @@ pub fn cpu_raycast_in_frame(
     loop {
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
+        let frame_kind = library.get(frame_root_id).map(|n| n.kind);
 
-        let hit_opt = cartesian::cpu_raycast_inner(
-            library, frame_root_id, ray_origin, ray_dir, inner_max,
-        );
+        let hit_opt = if let Some(NodeKind::UvSphereBody { inner_r, outer_r, theta_cap }) = frame_kind {
+            uvsphere::uv_raycast(
+                library,
+                frame_root_id,
+                [0.0; 3],
+                3.0,
+                inner_r,
+                outer_r,
+                theta_cap,
+                ray_origin,
+                ray_dir,
+                &[],
+                max_face_depth,
+            )
+        } else {
+            cartesian::cpu_raycast_with_uv_depth(
+                library,
+                frame_root_id,
+                ray_origin,
+                ray_dir,
+                inner_max,
+                max_face_depth,
+            )
+        };
 
         if let Some(mut hit) = hit_opt {
             prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);

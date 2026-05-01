@@ -61,29 +61,40 @@ impl GpuChild {
 /// Per-packed-node metadata: indexed by BFS position — the same
 /// `node_index` used in `GpuChild::node_index`. 16 bytes total.
 ///
-/// `kind`: 0 = Cartesian, 1 = WrappedPlane.
-/// `dims_x/y/z`: slab dims (cells per axis) for `WrappedPlane`;
-/// unused (zeroed) for `Cartesian`. The shader will read these in
-/// Phase 2 to drive X-wrap and in Phase 3 to derive the planet
-/// radius. In Phase 1 they're carried but unused.
+/// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = UvSphereBody.
+/// `meta_u`: kind-specific packed u32. For `UvSphereBody` this is
+/// `theta_cap.to_bits()`. For other kinds it is currently unused.
+/// `meta0/meta1`: kind-specific f32 payload. For `UvSphereBody`
+/// these are `(inner_r, outer_r)`. For other kinds they are zero.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
     pub kind: u32,
-    pub dims_x: u32,
-    pub dims_y: u32,
-    pub dims_z: u32,
+    pub meta_u: u32,
+    pub meta0: f32,
+    pub meta1: f32,
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
         match k {
-            NodeKind::Cartesian => Self { kind: 0, dims_x: 0, dims_y: 0, dims_z: 0 },
-            NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
+            NodeKind::Cartesian => Self {
+                kind: 0,
+                meta_u: 0,
+                meta0: 0.0,
+                meta1: 0.0,
+            },
+            NodeKind::WrappedPlane { .. } => Self {
                 kind: 1,
-                dims_x: dims[0],
-                dims_y: dims[1],
-                dims_z: dims[2],
+                meta_u: 0,
+                meta0: 0.0,
+                meta1: 0.0,
+            },
+            NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } => Self {
+                kind: 2,
+                meta_u: theta_cap.to_bits(),
+                meta0: inner_r,
+                meta1: outer_r,
             },
         }
     }
@@ -163,20 +174,33 @@ mod tests {
     fn from_node_kind_cartesian() {
         let k = GpuNodeKind::from_node_kind(NodeKind::Cartesian);
         assert_eq!(k.kind, 0);
-        assert_eq!(k.dims_x, 0);
-        assert_eq!(k.dims_y, 0);
-        assert_eq!(k.dims_z, 0);
+        assert_eq!(k.meta_u, 0);
+        assert_eq!(k.meta0, 0.0);
+        assert_eq!(k.meta1, 0.0);
     }
 
     #[test]
-    fn from_node_kind_wrapped_plane_carries_dims() {
+    fn from_node_kind_uv_sphere_carries_radii_and_cap() {
+        let k = GpuNodeKind::from_node_kind(NodeKind::UvSphereBody {
+            inner_r: 0.0,
+            outer_r: 0.45,
+            theta_cap: 0.125,
+        });
+        assert_eq!(k.kind, 2);
+        assert_eq!(f32::from_bits(k.meta_u), 0.125);
+        assert_eq!(k.meta0, 0.0);
+        assert_eq!(k.meta1, 0.45);
+    }
+
+    #[test]
+    fn from_node_kind_wrapped_plane_uses_zero_payload() {
         let k = GpuNodeKind::from_node_kind(NodeKind::WrappedPlane {
             dims: [20, 10, 2],
             slab_depth: 3,
         });
         assert_eq!(k.kind, 1);
-        assert_eq!(k.dims_x, 20);
-        assert_eq!(k.dims_y, 10);
-        assert_eq!(k.dims_z, 2);
+        assert_eq!(k.meta_u, 0);
+        assert_eq!(k.meta0, 0.0);
+        assert_eq!(k.meta1, 0.0);
     }
 }

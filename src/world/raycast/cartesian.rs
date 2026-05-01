@@ -1,8 +1,10 @@
 //! Cartesian stack-based DDA. CPU mirror of the shader's
-//! `march_cartesian`. Walks the unified tree in XYZ slot order.
+//! `march_cartesian`. Walks the unified tree in XYZ slot order and
+//! dispatches into the UV-sphere marcher on `UvSphereBody` children.
 
+use super::uvsphere;
 use super::HitInfo;
-use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Stack frame for iterative DDA traversal.
 pub(super) struct Frame {
@@ -16,12 +18,13 @@ pub(super) struct Frame {
 /// Stack-based Cartesian DDA over the unified tree. `max_depth`
 /// caps how deep the walker descends; the deepest cell at that
 /// depth is the hit granularity.
-pub(super) fn cpu_raycast_inner(
+pub(super) fn cpu_raycast_with_uv_depth(
     library: &NodeLibrary,
     root: NodeId,
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
+    max_uv_depth: u32,
 ) -> Option<HitInfo> {
     let inv_dir = [
         if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
@@ -116,10 +119,38 @@ pub(super) fn cpu_raycast_inner(
                     face: normal_face,
                     t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
                     place_path: None,
+                    uv_sphere_cell: None,
                 });
             }
             Child::Node(child_id) => {
                 let child_node = library.get(child_id)?;
+
+                if let NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } = child_node.kind {
+                    let parent_origin = stack[depth].node_origin;
+                    let parent_cell_size = stack[depth].cell_size;
+                    let body_origin = [
+                        parent_origin[0] + cell[0] as f32 * parent_cell_size,
+                        parent_origin[1] + cell[1] as f32 * parent_cell_size,
+                        parent_origin[2] + cell[2] as f32 * parent_cell_size,
+                    ];
+                    if let Some(hit) = uvsphere::uv_raycast(
+                        library,
+                        child_id,
+                        body_origin,
+                        parent_cell_size,
+                        inner_r,
+                        outer_r,
+                        theta_cap,
+                        ray_origin,
+                        ray_dir,
+                        &path[..=depth],
+                        max_uv_depth,
+                    ) {
+                        return Some(hit);
+                    }
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
 
                 // Short-circuit fully-empty subtrees at any depth.
                 // Without this, the DDA descends into uniform-air
@@ -139,6 +170,7 @@ pub(super) fn cpu_raycast_inner(
                         face: normal_face,
                         t: cell_entry_t(&stack[depth], &ray_origin, &inv_dir),
                         place_path: None,
+                        uv_sphere_cell: None,
                     });
                 }
 
@@ -190,6 +222,23 @@ pub(super) fn cpu_raycast_inner(
     }
 
     None
+}
+
+pub(super) fn cpu_raycast_inner(
+    library: &NodeLibrary,
+    root: NodeId,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    max_depth: u32,
+) -> Option<HitInfo> {
+    cpu_raycast_with_uv_depth(
+        library,
+        root,
+        ray_origin,
+        ray_dir,
+        max_depth,
+        crate::world::tree::MAX_DEPTH as u32,
+    )
 }
 
 pub(super) fn advance_dda(

@@ -18,6 +18,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("ray_prim.wgsl",  include_str!("../assets/shaders/ray_prim.wgsl")),
     ("march.wgsl",     include_str!("../assets/shaders/march.wgsl")),
     ("march_debug.wgsl", include_str!("../assets/shaders/march_debug.wgsl")),
+    ("uv_sphere.wgsl", include_str!("../assets/shaders/uv_sphere.wgsl")),
     ("main.wgsl",      include_str!("../assets/shaders/main.wgsl")),
     ("taa_resolve.wgsl", include_str!("../assets/shaders/taa_resolve.wgsl")),
     ("heightmap_gen.wgsl", include_str!("../assets/shaders/heightmap_gen.wgsl")),

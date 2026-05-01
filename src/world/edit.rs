@@ -29,6 +29,7 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
             face: hit.face,
             t: hit.t,
             place_path: None,
+            uv_sphere_cell: None,
         };
         return propagate_edit(world, &place_hit, new_child);
     }
@@ -193,7 +194,7 @@ fn place_child_at_path(
                 current_id = child_id;
             }
             child if is_last && is_placeable(&world.library, child) => {
-                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
+                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None, uv_sphere_cell: None };
                 return propagate_edit(world, &place_hit, new_child);
             }
             child if !is_last && is_placeable(&world.library, child) => {
@@ -201,7 +202,7 @@ fn place_child_at_path(
                 let chain_id = build_placement_chain_from_slots(
                     world, remaining_slots, new_child,
                 );
-                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None };
+                let place_hit = HitInfo { path, face: 0, t: 0.0, place_path: None, uv_sphere_cell: None };
                 return propagate_edit(world, &place_hit, Child::Node(chain_id));
             }
             _ => {
@@ -380,7 +381,7 @@ mod tests {
         let mut world = plain_test_world();
         let hit = HitInfo {
             path: vec![(world.root, slot_index(1, 2, 1))],
-            face: 2, t: 1.0, place_path: None,
+            face: 2, t: 1.0, place_path: None, uv_sphere_cell: None,
         };
         assert!(!place_block(&mut world, &hit, block::BRICK));
     }
@@ -422,6 +423,7 @@ mod tests {
             face: 0,
             t: 1.0,
             place_path: None,
+            uv_sphere_cell: None,
         };
 
         let result = place_block(&mut world, &hit, block::STONE);

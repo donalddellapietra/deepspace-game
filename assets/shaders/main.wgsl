@@ -6,6 +6,7 @@
 
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
+#include "uv_sphere.wgsl"
 #include "march.wgsl"
 #include "march_debug.wgsl"
 

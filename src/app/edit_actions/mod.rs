@@ -52,7 +52,9 @@ impl App {
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+            ActiveFrameKind::Cartesian
+            | ActiveFrameKind::WrappedPlane { .. }
+            | ActiveFrameKind::UvSphereBody { .. } => {
                 // Raycast from the render frame — f32 can only represent
                 // positions a few levels deeper than the frame root.
                 // The pop loop handles finding hits at coarser depths
@@ -188,7 +190,9 @@ impl App {
                 slot
             ));
             match child_kind {
-                Some(NodeKind::Cartesian) | Some(NodeKind::WrappedPlane { .. }) => {
+                Some(NodeKind::Cartesian)
+                | Some(NodeKind::WrappedPlane { .. })
+                | Some(NodeKind::UvSphereBody { .. }) => {
                     node_id = child_id;
                 }
                 None => break,

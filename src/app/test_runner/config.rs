@@ -190,6 +190,7 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
+                "--uv-sphere" => { cfg.world_preset = WorldPreset::UvSpherePlanet; }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,

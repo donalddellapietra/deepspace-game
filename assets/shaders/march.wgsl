@@ -701,6 +701,34 @@ fn march_cartesian(
                 continue;
             }
 
+            let child_kind = node_kinds[child_idx].kind;
+            if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
+            if child_kind == ROOT_KIND_UV_SPHERE_BODY {
+                let body_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                let body_size = cur_cell_size;
+                let inner_r = node_kinds[child_idx].meta0;
+                let outer_r = node_kinds[child_idx].meta1;
+                let theta_cap = bitcast<f32>(node_kinds[child_idx].meta_u);
+                if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 3u; }
+                let uv_hit = uv_sphere_in_cell(
+                    child_idx,
+                    body_origin,
+                    body_size,
+                    inner_r,
+                    outer_r,
+                    theta_cap,
+                    ray_origin,
+                    ray_dir,
+                    MAX_STACK_DEPTH,
+                );
+                if uv_hit.hit { return uv_hit; }
+                let m_uv_miss = min_axis_mask(cur_side_dist);
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_uv_miss) * step);
+                cur_side_dist += m_uv_miss * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_uv_miss;
+                continue;
+            }
+
             // Empty-representative fast path: when the packed
             // child's representative_block is 255, the subtree has
             // no non-empty content (either uniform-empty deeper in
@@ -959,9 +987,25 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
         // visual LOD gate — rays stop descending when cells fall
         // below the pixel floor.
-        var r: HitResult = march_cartesian(
-            current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot,
-        );
+        var r: HitResult;
+        if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_UV_SPHERE_BODY {
+            let root_meta = node_kinds[current_idx];
+            r = uv_sphere_in_cell(
+                current_idx,
+                vec3<f32>(0.0),
+                3.0,
+                root_meta.meta0,
+                root_meta.meta1,
+                bitcast<f32>(root_meta.meta_u),
+                ray_origin,
+                ray_dir,
+                MAX_STACK_DEPTH,
+            );
+        } else {
+            r = march_cartesian(
+                current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot,
+            );
+        }
         if r.hit {
             r.frame_level = ribbon_level;
             r.frame_scale = cur_scale;

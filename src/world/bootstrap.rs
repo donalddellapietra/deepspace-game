@@ -17,6 +17,9 @@ use std::collections::HashMap;
 pub enum WorldPreset {
     #[default]
     PlainTest,
+    /// Real UV-sphere planet: one continuous `(phi, theta, r)` shell
+    /// rooted at a `NodeKind::UvSphereBody` node.
+    UvSpherePlanet,
     /// Menger sponge — canonical ternary fractal. Each non-empty
     /// cell subdivides into 20 non-empty + 7 empty children (the 7
     /// are the cube centroid + 6 face centroids). 74% occupancy
@@ -127,6 +130,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
         | WorldPreset::Stars
+        | WorldPreset::UvSpherePlanet
         | WorldPreset::Scene { .. } => None,
         // The wrapped planet has a flat slab top at fixed local-y,
         // but its world-y depends on embedding_depth and slot path
@@ -156,6 +160,7 @@ pub struct WorldBootstrap {
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
     match preset {
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
+        WorldPreset::UvSpherePlanet => bootstrap_uv_sphere_world(),
         WorldPreset::Menger => crate::world::fractals::menger::bootstrap_menger_world(
             plain_layers.unwrap_or(8),
         ),
@@ -1119,6 +1124,41 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
     }
 }
 
+fn bootstrap_uv_sphere_world() -> WorldBootstrap {
+    use crate::world::uvsphere;
+    let mut world = crate::world::worldgen::generate_world();
+    let setup = uvsphere::demo_planet();
+    let (new_root, planet_path) = uvsphere::install_at_root_center(
+        &mut world.library,
+        world.root,
+        &setup,
+    );
+    world.swap_root(new_root);
+    let tree_depth = world.tree_depth();
+    eprintln!(
+        "UV sphere world: planet_path={:?}, library_entries={}, depth={}",
+        planet_path.as_slice(),
+        world.library.len(),
+        tree_depth,
+    );
+    let body_top_y = 1.5 + setup.outer_r;
+    let spawn_pos = WorldPos::from_frame_local(
+        &Path::root(),
+        [1.5, (body_top_y + 0.02).min(1.999), 1.5],
+        2,
+    )
+    .deepened_to(16);
+    WorldBootstrap {
+        world,
+        planet_path: Some(planet_path),
+        default_spawn_pos: spawn_pos,
+        default_spawn_yaw: 0.0,
+        default_spawn_pitch: -1.2,
+        plain_layers: 0,
+        color_registry: crate::world::palette::ColorRegistry::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,5 +1215,18 @@ mod tests {
         // anchor subtree underneath. Total tree depth grows by 5.
         let world = wrapped_planet_world(8, [27, 10, 2], 3, 5);
         assert_eq!(world.tree_depth(), 8 + 3 + 5);
+    }
+
+    #[test]
+    fn uv_sphere_bootstrap_installs_body_at_root_center() {
+        let boot = bootstrap_uv_sphere_world();
+        let root = boot.world.library.get(boot.world.root).expect("root exists");
+        let body_slot = slot_index(1, 1, 1);
+        let Child::Node(body_id) = root.children[body_slot] else {
+            panic!("expected uv sphere body at root center");
+        };
+        let body = boot.world.library.get(body_id).expect("body exists");
+        assert!(matches!(body.kind, NodeKind::UvSphereBody { .. }));
+        assert_eq!(boot.planet_path.as_ref().map(Path::as_slice), Some(&[body_slot as u8][..]));
     }
 }

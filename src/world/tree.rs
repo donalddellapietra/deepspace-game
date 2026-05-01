@@ -82,6 +82,19 @@ pub fn uniform_children(child: Child) -> Children {
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
+    /// Root of a UV-sphere body. The node's 27 children are
+    /// interpreted in `(phi, theta, r)` slots that recursively tile
+    /// one continuous spherical shell; deeper descendants stay
+    /// Cartesian and inherit that interpretation through the walk.
+    ///
+    /// `inner_r` / `outer_r` live in the body cell's local `[0, 1)`
+    /// frame. `theta_cap` is the polar cap angle in radians removed
+    /// from both poles. `0.0` means full 0..π coverage.
+    UvSphereBody {
+        inner_r: f32,
+        outer_r: f32,
+        theta_cap: f32,
+    },
     /// Wrapped-Cartesian planet root. The node's descendants form a
     /// flat Cartesian subtree spanning a `dims.x × dims.y × dims.z`
     /// grid of leaf cells at `slab_depth` levels below this node.
@@ -115,6 +128,11 @@ impl Hash for NodeKind {
         std::mem::discriminant(self).hash(state);
         match self {
             NodeKind::Cartesian => {}
+            NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } => {
+                inner_r.to_bits().hash(state);
+                outer_r.to_bits().hash(state);
+                theta_cap.to_bits().hash(state);
+            }
             NodeKind::WrappedPlane { dims, slab_depth } => {
                 dims.hash(state);
                 slab_depth.hash(state);
