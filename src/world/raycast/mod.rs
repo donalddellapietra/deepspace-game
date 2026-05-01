@@ -67,6 +67,7 @@ pub fn cpu_raycast_sphere_uv(
     dims: [u32; 3],
     slab_depth: u8,
     lat_max: f32,
+    max_depth: u32,
 ) -> Option<HitInfo> {
     // Sphere center / radius in the slab-root frame's [0, 3)³ space.
     let cs_center = [1.5_f32, 1.5, 1.5];
@@ -188,6 +189,10 @@ pub fn cpu_raycast_sphere_uv(
             cells_per_slot *= 3;
         }
         let mut cell_is_empty = false;
+        // Track the deepest Node (= anchor block) reached so we can
+        // continue descending into its subtree if the user's edit
+        // depth is deeper than slab_depth.
+        let mut sub_idx: Option<NodeId> = None;
         for level in 0..slab_depth {
             let sx = (cell_x / cells_per_slot).rem_euclid(3);
             let sy = (cy / cells_per_slot).rem_euclid(3);
@@ -210,19 +215,72 @@ pub fn cpu_raycast_sphere_uv(
                 Child::Node(child) => {
                     if level + 1 < slab_depth {
                         idx = child;
+                    } else {
+                        // Last slab level — child is an anchor block.
+                        sub_idx = Some(child);
                     }
                 }
             }
             cells_per_slot /= 3;
         }
-        if !cell_is_empty {
-            return Some(HitInfo {
-                path,
-                face: 2,
-                t: t_layer * inv_norm,
-                place_path: None,
-            });
+        if cell_is_empty {
+            continue;
         }
+
+        // Sub-slab descent: when the slab cell is an anchor Node and
+        // the user's edit depth (max_depth) goes beyond the slab,
+        // continue picking sub-cells using the ray's fractional
+        // (lon, lat, r) coords WITHIN the slab cell. Each level
+        // multiplies the resolution by 3, so the break path lands at
+        // the right sub-cell for the camera's anchor depth — same
+        // behavior as Cartesian where deeper anchors break smaller
+        // cells, and as 2-2-3-2's `walk_face_subtree(max_depth)`.
+        if let Some(mut node_idx) = sub_idx {
+            let absolute_slab_depth = frame_path.len() as u32 + slab_depth as u32;
+            let extra_levels = max_depth.saturating_sub(absolute_slab_depth);
+            if extra_levels > 0 {
+                // Fractional coords within the hit slab cell. The
+                // sample was taken at the layer's TOP boundary (r at
+                // the cell's outer face), so r_in_cell ≈ 1.0 — bias
+                // it slightly inside so floor-pick lands on the
+                // outermost r-slot (sy = 2), which is the cell at
+                // the surface the user sees.
+                let lon_fine = u_l * dims[0] as f32;
+                let lat_fine = v_l * dims[2] as f32;
+                let mut frac_x = (lon_fine - cell_x as f32).clamp(0.0, 0.99999);
+                let mut frac_z = (lat_fine - cell_z as f32).clamp(0.0, 0.99999);
+                let mut frac_y = 0.99999_f32;
+                for _ in 0..extra_levels {
+                    let sx = (frac_x * 3.0).floor() as usize;
+                    let sy = (frac_y * 3.0).floor() as usize;
+                    let sz = (frac_z * 3.0).floor() as usize;
+                    let slot = slot_index(sx, sy, sz);
+                    path.push((node_idx, slot));
+                    let node = match library.get(node_idx) {
+                        Some(n) => n,
+                        None => break,
+                    };
+                    match node.children[slot] {
+                        Child::Node(c) => node_idx = c,
+                        // Sub-cell terminates: leaf Block, Empty (a
+                        // hole someone dug earlier), or EntityRef.
+                        // Path now points at this sub-cell — that's
+                        // what the caller should break/place.
+                        _ => break,
+                    }
+                    frac_x = (frac_x * 3.0) - sx as f32;
+                    frac_y = (frac_y * 3.0) - sy as f32;
+                    frac_z = (frac_z * 3.0) - sz as f32;
+                }
+            }
+        }
+
+        return Some(HitInfo {
+            path,
+            face: 2,
+            t: t_layer * inv_norm,
+            place_path: None,
+        });
     }
 
     None
@@ -593,6 +651,7 @@ mod tests {
             cam_local, ray_dir,
             [27, 2, 14], 3,
             1.26,
+            5,
         ).expect("ray to +X equator must hit");
         // Expected: lon = 0, lat = 0 → u = 0.5, v = 0.5 →
         // cell_x = floor(0.5 * 27) = 13, cell_z = floor(0.5 * 14) = 7,
@@ -620,6 +679,7 @@ mod tests {
             cam_local, ray_dir,
             [27, 2, 14], 3,
             1.26,
+            5,
         );
         assert!(hit.is_none(), "north-pole ray must be banned");
     }
@@ -737,6 +797,7 @@ mod tests {
             cam_local, ray_dir,
             [27, 2, 14], 3,
             1.26,
+            5,
         ).expect("dug-through ray must hit stone underneath");
         let leaf_slot = hit.path.last().unwrap().1;
         // Expect cell_y = 0 → leaf slot has sy = 0 → slot_index(1, 0, 1) = 10.
@@ -758,7 +819,49 @@ mod tests {
             cam_local, ray_dir,
             [27, 2, 14], 3,
             1.26,
+            5,
         );
         assert!(hit.is_none(), "ray missing the sphere returns None");
+    }
+
+    #[test]
+    fn cpu_raycast_sphere_uv_descends_into_anchor_subtree_with_extra_depth() {
+        use crate::world::bootstrap::wrapped_planet_world;
+        // cell_subtree_depth=3 → each anchor block has 3 more levels
+        // of uniform Cartesian subtree. Same +X equator setup as
+        // east_equator_hits_middle_cell.
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 3);
+        let frame_path = vec![13u8, 13u8];
+        let cam_local = [3.0, 1.5, 1.5];
+        let ray_dir = [-1.0, 0.0, 0.0];
+        // Slab natural depth = 2 (frame) + 3 (slab) = 5. Extra=3 →
+        // path should be 8 entries long, descending 3 sub-cell levels
+        // into the anchor block's uniform subtree.
+        let hit_shallow = cpu_raycast_sphere_uv(
+            &world.library, world.root, &frame_path,
+            cam_local, ray_dir,
+            [27, 2, 14], 3,
+            1.26,
+            5,
+        ).expect("shallow hit");
+        let hit_deep = cpu_raycast_sphere_uv(
+            &world.library, world.root, &frame_path,
+            cam_local, ray_dir,
+            [27, 2, 14], 3,
+            1.26,
+            8,
+        ).expect("deep hit");
+        assert_eq!(hit_shallow.path.len(), 5,
+            "shallow path = frame(2) + slab(3) = 5, got {}", hit_shallow.path.len());
+        assert_eq!(hit_deep.path.len(), 8,
+            "deep path = frame(2) + slab(3) + extra(3) = 8, got {}", hit_deep.path.len());
+        // Deep path's first 5 entries should match the shallow path's
+        // (same slab cell hit, just descending further into its subtree).
+        for i in 0..5 {
+            assert_eq!(
+                hit_shallow.path[i].1, hit_deep.path[i].1,
+                "slab path slot mismatch at level {i}",
+            );
+        }
     }
 }

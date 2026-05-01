@@ -75,6 +75,7 @@ impl App {
                     dims,
                     slab_depth,
                     1.26,
+                    self.edit_depth(),
                 );
                 (hit, frame_path)
             }

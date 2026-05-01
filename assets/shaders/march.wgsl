@@ -1122,10 +1122,22 @@ fn sphere_uv_in_cell(
     // lon ∈ [-π, π]. Slab Z (latitude) is bounded to ±lat_max
     // (poles banned outside this band). Renderer never names
     // materials — sample whatever's at (cell_x, cy, cell_z).
-    let dims_x = i32(uniforms.slab_dims.x);
-    let dims_y = i32(uniforms.slab_dims.y);
-    let dims_z = i32(uniforms.slab_dims.z);
-    let slab_depth = uniforms.slab_dims.w;
+    // Slab natural dims/depth describe the cell anchor positions in
+    // the slab subtree. To make breaks/places visible at sub-cell
+    // precision (camera anchor depth > slab depth), scale dims and
+    // walker depth by 3^extra so the DDA steps at the same finer
+    // cells where the editor places sub-cell holes/blocks. extra =
+    // max(0, uniforms.max_depth − natural_slab_depth).
+    let nat_slab_depth = uniforms.slab_dims.w;
+    let eff_slab_depth = max(nat_slab_depth, uniforms.max_depth);
+    var depth_mul: i32 = 1;
+    for (var k: u32 = nat_slab_depth; k < eff_slab_depth; k = k + 1u) {
+        depth_mul = depth_mul * 3;
+    }
+    let dims_x = i32(uniforms.slab_dims.x) * depth_mul;
+    let dims_y = i32(uniforms.slab_dims.y) * depth_mul;
+    let dims_z = i32(uniforms.slab_dims.z) * depth_mul;
+    let slab_depth = eff_slab_depth;
     let pi = 3.14159265;
     let shell_thickness = r_sphere * 0.25;
     let r_outer = r_sphere;
@@ -1137,9 +1149,14 @@ fn sphere_uv_in_cell(
 
     var t = max(t_enter, 0.0) + 1e-5;
     var iters: u32 = 0u;
+    // Iter cap scales with eff_slab_depth: each zoom level multiplies
+    // dims by 3, and the worst-case cell traversal scales with the
+    // largest dim. 256 covers natural slab; bump generously so 2-3
+    // extra zoom levels also fit without short-circuiting.
+    let iter_cap: u32 = 256u * u32(depth_mul) * u32(depth_mul);
     loop {
         if t > t_exit { break; }
-        if iters > 256u { break; }
+        if iters > iter_cap { break; }
         iters = iters + 1u;
 
         // Current cell (cell_x, cell_y, cell_z) at the ray's t.
