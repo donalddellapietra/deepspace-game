@@ -530,7 +530,22 @@ fn march_cartesian(
                 cur_t_global, entry_y_init, ray_dir.y,
                 k_local, r_planet_local, r_inv_local, ray_metric,
             );
-            cell.y = i32(floor((bent_y - cur_node_origin.y) / cur_cell_size));
+            // Boundary-aware floor: when cur_t_local lands exactly on
+            // a y-cell crossing (the previous iteration's
+            // bent_y_next_crossing return), bent_y == boundary
+            // EXACTLY. Plain `floor((boundary − origin)/cell_size)`
+            // returns the UPPER cell index — i.e., the cell we just
+            // LEFT, not the one we entered. Bias by 1e-4 cell units
+            // in the direction of bent dy/dt so the floor lands on
+            // the correct (incoming) cell. dy/dt = ray_dir.y −
+            // sin(theta)·ray_metric·k accounts for both the linear
+            // ray slope and the local cosine derivative; using its
+            // sign handles apex (where ray_dir.y > 0 but bent ray
+            // is descending) correctly.
+            let theta = cur_t_global * ray_metric * k_local * r_inv_local;
+            let bent_dy_dt = ray_dir.y - sin(theta) * ray_metric * k_local;
+            let bias = select(-1.0, 1.0, bent_dy_dt > 0.0) * 1e-4;
+            cell.y = i32(floor((bent_y - cur_node_origin.y) / cur_cell_size + bias));
             s_cell[depth] = pack_cell(cell);
             if cell.y >= 0 && cell.y <= 2 {
                 let cell_y_lo = cur_node_origin.y + f32(cell.y) * cur_cell_size;
