@@ -283,17 +283,22 @@ fn ray_east_along_wrap_axis_sees_slab_via_wrap() {
     // exits the 2-cell-thin slab quickly into empty embedding —
     // that's the no-wrap baseline (frac_z ≈ 0). The +x view firing
     // its wrap branch is what makes frac_x distinctly positive.
+    // The +x view sees more slab than the +z view by a meaningful
+    // margin. This is robust to Phase 3 curvature: at high altitudes
+    // the bent ray drops fast and clips the wrapped tail (so absolute
+    // frac_x falls), but the asymmetry between wrap-axis and
+    // non-wrap-axis remains — the wrap branch still opens a path
+    // along +x that doesn't exist along +z.
     assert!(
-        frac_x > 0.005,
-        "expected slab visible in +x (wrap-axis) view, got frac_x={frac_x:.4}; \
-         either the wrap branch isn't firing or the ray re-entry mis-aligns \
-         off the slab",
+        frac_x > frac_z + 0.002,
+        "expected wrap-axis (+x) to see more slab than non-wrap-axis (+z) \
+         by ≥ 0.002, got frac_x={frac_x:.4} frac_z={frac_z:.4}",
     );
-    // Document the asymmetry: wrap creates content in +x where +z
-    // sees none. Sanity print only — no assert (the geometry of
-    // a 27×10×2 slab at this camera height is genuinely lopsided
-    // along the wrap axis vs. the thin axis).
-    let _ = frac_z;
+    assert!(
+        frac_x > 0.001,
+        "expected slab visible in +x view at all (wrap branch firing or \
+         direct sight under curvature), got frac_x={frac_x:.4}",
+    );
 }
 
 /// Phase 2: a top-down screenshot at the slab must NOT show a missing
