@@ -84,53 +84,21 @@ pub fn compute_render_frame(
         _ => ActiveFrameKind::Cartesian,
     };
     let mut tb_center = [0.0f32; 3];
-    let mut tb_rotation: Option<[[f32; 3]; 3]> = None;
-    let mut tb_scale: f32 = 1.0;
-    let mut tb_depth: usize = 0;
 
-    for k in 0..target.depth() as usize {
+    // Phase 1: descend using the unrotated anchor until we hit a TB
+    // or WrappedPlane (or run out of path/nodes).
+    let mut k = 0usize;
+    while k < target.depth() as usize {
         if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
-        let slot = if let Some(rot) = tb_rotation {
-            // Past a TB: pick the slot from the ROTATED camera
-            // position instead of the unrotated anchor. Compute
-            // cam position in this node's [0,3)³, apply R^T + scale,
-            // and use that to choose the cell.
-            if let Some(pos) = cam_pos {
-                let cam_in_node = pos.in_frame(&reached);
-                let centered = [
-                    cam_in_node[0] - 1.5,
-                    cam_in_node[1] - 1.5,
-                    cam_in_node[2] - 1.5,
-                ];
-                let s = tb_scale;
-                let rotated = [
-                    (rot[0][0]*centered[0] + rot[0][1]*centered[1] + rot[0][2]*centered[2]) / s,
-                    (rot[1][0]*centered[0] + rot[1][1]*centered[1] + rot[1][2]*centered[2]) / s,
-                    (rot[2][0]*centered[0] + rot[2][1]*centered[1] + rot[2][2]*centered[2]) / s,
-                ];
-                let rotated_pos = [
-                    rotated[0] + 1.5,
-                    rotated[1] + 1.5,
-                    rotated[2] + 1.5,
-                ];
-                let cx = (rotated_pos[0].floor() as i32).clamp(0, 2) as usize;
-                let cy = (rotated_pos[1].floor() as i32).clamp(0, 2) as usize;
-                let cz = (rotated_pos[2].floor() as i32).clamp(0, 2) as usize;
-                crate::world::tree::slot_index(cx, cy, cz)
-            } else {
-                target.slot(k) as usize
-            }
-        } else {
-            target.slot(k) as usize
-        };
-
+        let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
+                k += 1;
                 if let Some(child_node) = library.get(child_id) {
                     match child_node.kind {
                         NodeKind::WrappedPlane { dims, slab_depth } => {
@@ -138,24 +106,64 @@ pub fn compute_render_frame(
                             break;
                         }
                         NodeKind::TangentBlock { rotation } => {
-                            tb_rotation = Some(rotation);
-                            tb_scale = inscribed_cube_scale(&rotation);
-                            tb_depth = k + 1;
+                            // Phase 2: compute the R^T-rotated+scaled
+                            // camera position in TB-local [0,3)³, then
+                            // descend using Cartesian floor arithmetic
+                            // on the rotated position.
+                            let tb_scale = inscribed_cube_scale(&rotation);
                             tb_center = [1.5, 1.5, 1.5];
+                            if let Some(pos) = cam_pos {
+                                let cam_tb = pos.in_frame(&reached);
+                                let centered = [
+                                    cam_tb[0] - 1.5,
+                                    cam_tb[1] - 1.5,
+                                    cam_tb[2] - 1.5,
+                                ];
+                                let mut rotated_pos = [
+                                    1.5 + (rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2]) / tb_scale,
+                                    1.5 + (rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2]) / tb_scale,
+                                    1.5 + (rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2]) / tb_scale,
+                                ];
+                                while k < target.depth() as usize {
+                                    let Some(n) = library.get(node_id) else { break };
+                                    let cx = (rotated_pos[0].floor() as i32).clamp(0, 2) as usize;
+                                    let cy = (rotated_pos[1].floor() as i32).clamp(0, 2) as usize;
+                                    let cz = (rotated_pos[2].floor() as i32).clamp(0, 2) as usize;
+                                    let rs = crate::world::tree::slot_index(cx, cy, cz);
+                                    match n.children[rs] {
+                                        Child::Node(cid) => {
+                                            reached.push(rs as u8);
+                                            node_id = cid;
+                                            if let Some(cn) = library.get(cid) {
+                                                if matches!(cn.kind, NodeKind::WrappedPlane { .. }) {
+                                                    if let NodeKind::WrappedPlane { dims, slab_depth } = cn.kind {
+                                                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                            // Update tb_center for this descent level
+                                            tb_center = [
+                                                (tb_center[0] - cx as f32) * 3.0,
+                                                (tb_center[1] - cy as f32) * 3.0,
+                                                (tb_center[2] - cz as f32) * 3.0,
+                                            ];
+                                            // Rescale rotated_pos into child's [0,3)³
+                                            rotated_pos = [
+                                                (rotated_pos[0] - cx as f32) * 3.0,
+                                                (rotated_pos[1] - cy as f32) * 3.0,
+                                                (rotated_pos[2] - cz as f32) * 3.0,
+                                            ];
+                                            k += 1;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                            break;
                         }
                         _ => {}
                     }
-                }
-                // Track TB center as we descend past the TB into
-                // Cartesian children. The center shifts with each
-                // level: center_child = (center_parent - slot_origin) * 3
-                if tb_rotation.is_some() && k >= tb_depth {
-                    let (sx, sy, sz) = crate::world::tree::slot_coords(slot);
-                    tb_center = [
-                        (tb_center[0] - sx as f32) * 3.0,
-                        (tb_center[1] - sy as f32) * 3.0,
-                        (tb_center[2] - sz as f32) * 3.0,
-                    ];
                 }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
