@@ -73,7 +73,7 @@ pub fn compute_render_frame(
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
         }
-        Some(NodeKind::TangentBlock) => ActiveFrameKind::TangentBlock,
+        Some(NodeKind::TangentBlock { .. }) => ActiveFrameKind::TangentBlock,
         _ => ActiveFrameKind::Cartesian,
     };
     for k in 0..target.depth() as usize {
@@ -94,7 +94,7 @@ pub fn compute_render_frame(
                             kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
                             break;
                         }
-                        NodeKind::TangentBlock => {
+                        NodeKind::TangentBlock { .. } => {
                             kind = ActiveFrameKind::TangentBlock;
                             break;
                         }

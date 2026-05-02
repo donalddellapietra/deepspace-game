@@ -73,8 +73,21 @@ pub fn cpu_raycast_in_frame(
         let frame_root_id = chain[current_frame_depth];
         let inner_max = total_max_depth.saturating_sub(current_frame_depth as u32);
 
+        // INSIDE-the-cube case: when the active render frame IS a
+        // TangentBlock, the camera ray is in axis-aligned cube-frame
+        // coords (in_frame doesn't apply rotation). Transform it into
+        // the cube's local rotated frame so the inner DDA hits the
+        // same cells the shader's inside dispatch hits. CPU + GPU
+        // dispatches converge — cursor matches visual.
+        let (start_origin, start_dir) = match library.get(frame_root_id).map(|n| n.kind) {
+            Some(crate::world::tree::NodeKind::TangentBlock { rotation }) => {
+                cartesian::rotate_camera_into_tangent_frame(rotation, ray_origin, ray_dir)
+            }
+            _ => (ray_origin, ray_dir),
+        };
+
         let hit_opt = cartesian::cpu_raycast_inner(
-            library, frame_root_id, ray_origin, ray_dir, inner_max,
+            library, frame_root_id, start_origin, start_dir, inner_max,
         );
 
         if let Some(mut hit) = hit_opt {

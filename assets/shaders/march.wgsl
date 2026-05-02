@@ -2029,26 +2029,30 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 uniforms.planet_render.y,
             );
         } else if cur_kind == NODE_KIND_TANGENT_BLOCK {
-            // The render frame is INSIDE a rotated cube. Without this
-            // branch, the camera ray would march the cube's interior
-            // axis-aligned, causing a 45° "snap" the moment the camera
-            // crosses into the cube (the outside-the-cube dispatch in
-            // march_cartesian no longer fires once the frame root IS
-            // the cube). Rotate the camera ray INTO the cube's local
-            // frame around the frame centre (1.5, 1.5, 1.5) so the
-            // axis-aligned interior content renders rotated.
+            // The render frame IS the cube — camera flew inside.
+            // Without this branch, the camera ray would march the
+            // cube's interior axis-aligned, causing the 45° snap as
+            // the outside-the-cube dispatch (in march_cartesian) no
+            // longer fires once the frame root is the cube itself.
             //
-            // Hardcoded θ = 30° around Y, matching the dispatch in
-            // march_cartesian's TangentBlock branch. Production would
-            // pull per-cell rotation from the node payload.
-            let theta_in: f32 = 0.5236; // 30°
-            let cs_in = cos(theta_in);
-            let sn_in = sin(theta_in);
-            let east_in   = vec3<f32>(cs_in, 0.0, sn_in);
-            let normal_in = vec3<f32>(0.0,   1.0, 0.0);
-            let north_in  = vec3<f32>(-sn_in, 0.0, cs_in);
+            // Read the cube's quaternion from node_kinds — same data
+            // the outside dispatch reads. This makes the boundary
+            // mathematically continuous: just outside, ray descends
+            // into cube via outside dispatch with rotation R; just
+            // inside, ray is rotated by the same R around the frame
+            // centre. The two effective rays converge at the boundary
+            // → no snap (when implementation is correct).
+            let q = node_kinds[current_idx].rotation;
+            let xx = q.x * q.x; let yy = q.y * q.y; let zz = q.z * q.z;
+            let xy = q.x * q.y; let xz = q.x * q.z; let yz = q.y * q.z;
+            let wx = q.w * q.x; let wy = q.w * q.y; let wz = q.w * q.z;
+            let east_in   = vec3<f32>(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz),     2.0 * (xz - wy));
+            let normal_in = vec3<f32>(2.0 * (xy - wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx));
+            let north_in  = vec3<f32>(2.0 * (xz + wy),       2.0 * (yz - wx),     1.0 - 2.0 * (xx + yy));
+
             let frame_centre = vec3<f32>(1.5);
             let d_centre = ray_origin - frame_centre;
+            // dot with rows = R⁻¹ applied (R = [east, normal, north] columns).
             let local_origin = vec3<f32>(
                 dot(east_in,   d_centre),
                 dot(normal_in, d_centre),
@@ -2063,14 +2067,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 current_idx, local_origin, local_dir, MAX_STACK_DEPTH, skip_slot,
             );
             if r.hit {
-                // Rotate the hit normal back to world. Bevel was
-                // computed inside march_cartesian against axis-aligned
-                // cell_min/size in the rotated frame — leave it alone;
-                // the resulting per-face shading still looks correct
-                // because the eye sees those rotated faces lit by the
-                // un-rotated sun direction (which becomes the rotated
-                // sun in local frame, which is what the bevel captures
-                // — slight asymmetry but no snap).
+                // Rotate the hit normal back to world via R (columns).
                 let n_local = r.normal;
                 r.normal = east_in * n_local.x + normal_in * n_local.y + north_in * n_local.z;
             }

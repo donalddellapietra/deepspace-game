@@ -533,7 +533,11 @@ impl App {
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                 NodeKind::WrappedPlane { dims, slab_depth }
             }
-            ActiveFrameKind::TangentBlock => NodeKind::TangentBlock,
+            // The dispatch reads rotation from node_kinds, so the kind
+            // here is just for shape — identity quaternion is fine.
+            ActiveFrameKind::TangentBlock => NodeKind::TangentBlock {
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
         }
     }
 
