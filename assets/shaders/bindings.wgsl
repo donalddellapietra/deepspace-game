@@ -121,15 +121,21 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0 = Cartesian, 1 = WrappedPlane
-    /// Slab dims (cells/axis) for WrappedPlane; zero for Cartesian.
-    /// Phase 2 reads these to compute X-wrap modulus; Phase 3 reads
-    /// dims_x to derive the implied planet radius. Phase 1: carried
-    /// but unused.
+    kind: u32,        // 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock
+    /// Slab dims (cells/axis) for WrappedPlane; zero for Cartesian and
+    /// TangentBlock. Phase 2 reads these to compute X-wrap modulus;
+    /// Phase 3 reads dims_x to derive the implied planet radius.
+    /// `TangentBlock` carries no fields — its TBN is computed by the
+    /// sphere descender from its current `(lon, lat, r)` cell bounds
+    /// at the moment the ray enters the node.
     dims_x: u32,
     dims_y: u32,
     dims_z: u32,
 }
+
+const NODE_KIND_CARTESIAN: u32 = 0u;
+const NODE_KIND_WRAPPED_PLANE: u32 = 1u;
+const NODE_KIND_TANGENT_BLOCK: u32 = 2u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated

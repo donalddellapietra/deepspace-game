@@ -100,6 +100,23 @@ pub enum NodeKind {
         /// `dims` must satisfy `dims[i] <= 3^slab_depth`.
         slab_depth: u8,
     },
+    /// Tangent-plane Cartesian subtree on a sphere. The 27 children
+    /// are interpreted as a normal 27³ Cartesian subgrid in a LOCAL
+    /// rotated frame whose +Y axis is the outward sphere normal at
+    /// the cell's center, +X is the eastward (longitude) tangent,
+    /// +Z is the northward (latitude) tangent.
+    ///
+    /// Carries no fields: the TBN is computed by the descender from
+    /// its current cell bounds (lon/lat/r) at the moment it enters
+    /// this node — no stored f32 state, no dedup loss. Two tangent
+    /// blocks on opposite sides of a planet with identical Cartesian
+    /// content still dedup; the rotation is applied per-ray from
+    /// descent context.
+    ///
+    /// Used by the wrapped-planet bootstrap to escape sphere-DDA
+    /// (which loses precision at deep zoom) into the precision-stable
+    /// Cartesian descent path.
+    TangentBlock,
 }
 
 impl Default for NodeKind {
@@ -119,6 +136,7 @@ impl Hash for NodeKind {
                 dims.hash(state);
                 slab_depth.hash(state);
             }
+            NodeKind::TangentBlock => {}
         }
     }
 }
@@ -128,7 +146,7 @@ impl NodeKind {
     /// subtree of this kind into a single Block at its parent's
     /// slot. Cartesian nodes flatten freely (the standard
     /// content-addressed shrink); kinds that carry metadata the
-    /// shader needs to dispatch on (WrappedPlane: dims, slab_depth)
+    /// shader needs to dispatch on (WrappedPlane, TangentBlock)
     /// must NOT flatten — otherwise the metadata vanishes the moment
     /// the subtree happens to be uniformly empty / uniformly air.
     #[inline]
@@ -463,6 +481,21 @@ mod tests {
         assert!(lib.get(id).is_some());
         lib.ref_dec(id);
         assert!(lib.get(id).is_none());
+    }
+
+    #[test]
+    fn tangent_block_kind_blocks_flatten_and_dedups() {
+        let mut lib = NodeLibrary::default();
+        let stone = uniform_children(Child::Block(block::STONE));
+        let cart = lib.insert_with_kind(stone, NodeKind::Cartesian);
+        let tan1 = lib.insert_with_kind(stone, NodeKind::TangentBlock);
+        let tan2 = lib.insert_with_kind(stone, NodeKind::TangentBlock);
+        // Different kinds are distinct nodes even with identical children.
+        assert_ne!(cart, tan1);
+        // Identical kind + children dedup.
+        assert_eq!(tan1, tan2);
+        // TangentBlock is not allowed to flatten.
+        assert!(!NodeKind::TangentBlock.allows_uniform_flatten());
     }
 
     #[test]

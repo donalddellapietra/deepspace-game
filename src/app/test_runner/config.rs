@@ -200,7 +200,24 @@ impl TestConfig {
                         slab_dims: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
                         slab_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
                         cell_subtree_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
+                        tangent_planes: false,
                     };
+                }
+                // Switch the slab cell anchors from `Cartesian` to
+                // `TangentBlock`. The shader then transforms each
+                // ray into the cell's local tangent frame and runs
+                // the precision-stable Cartesian DDA below — so
+                // 40+ deeper layers don't lose precision the way
+                // sphere-DDA descent does. MUST come AFTER
+                // `--wrapped-planet`.
+                "--wrapped-planet-tangent" => {
+                    if let WorldPreset::WrappedPlanet {
+                        ref mut tangent_planes,
+                        ..
+                    } = cfg.world_preset
+                    {
+                        *tangent_planes = true;
+                    }
                 }
                 // Override the wrapped-planet's total tree depth.
                 // `--planet-layers N` sets total = N. We adjust
@@ -545,6 +562,13 @@ VISIBILITY TEST PRESETS:
                               (embedding 37 + slab 3). Stress-tests the
                               wrap math at deep precision. Must come
                               after `--wrapped-planet`.
+  --wrapped-planet-tangent    (After --wrapped-planet) Slab cell anchors
+                              become NodeKind::TangentBlock. The shader
+                              transforms each ray into the cell's local
+                              tangent-cube frame and dispatches the
+                              precision-stable Cartesian DDA below — so
+                              40+ deeper layers retain precision the way
+                              sphere-DDA descent cannot.
 
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):

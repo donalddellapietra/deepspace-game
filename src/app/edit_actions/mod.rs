@@ -215,7 +215,9 @@ impl App {
                 slot
             ));
             match child_kind {
-                Some(NodeKind::Cartesian) | Some(NodeKind::WrappedPlane { .. }) => {
+                Some(NodeKind::Cartesian)
+                | Some(NodeKind::WrappedPlane { .. })
+                | Some(NodeKind::TangentBlock) => {
                     node_id = child_id;
                 }
                 None => break,

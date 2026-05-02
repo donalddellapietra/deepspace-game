@@ -10,6 +10,7 @@ pub mod raycast;
 pub mod scene;
 pub mod scenes;
 pub mod sdf;
+pub mod sphere;
 pub mod stars;
 pub mod state;
 pub mod tree;

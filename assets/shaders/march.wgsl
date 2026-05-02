@@ -1168,6 +1168,7 @@ fn sphere_descend_anchor(
     slab_lon_lo: f32, slab_lon_step: f32,
     slab_lat_lo: f32, slab_lat_step: f32,
     slab_r_lo:   f32, slab_r_step:   f32,
+    r_sphere: f32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -1176,6 +1177,71 @@ fn sphere_descend_anchor(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+
+    // TangentBlock dispatch: when the slab cell anchor is itself a
+    // TangentBlock, transform the world ray into the cell's local
+    // tangent-cube frame and hand off to the precision-stable
+    // Cartesian DDA. Sphere descent NEVER traverses below this
+    // point — every voxel beneath the slab cell sees pure Cartesian.
+    if anchor_idx < arrayLength(&node_kinds) && node_kinds[anchor_idx].kind == NODE_KIND_TANGENT_BLOCK {
+        // Tangent point: cell center on the sphere.
+        let lat_c = slab_lat_lo + slab_lat_step * 0.5;
+        let lon_c = slab_lon_lo + slab_lon_step * 0.5;
+        let r_c   = slab_r_lo   + slab_r_step   * 0.5;
+
+        let sl = sin(lat_c);
+        let cl = cos(lat_c);
+        let so = sin(lon_c);
+        let co = cos(lon_c);
+        // Sphere-surface basis at (lat_c, lon_c). Right-handed:
+        // east × normal == north.
+        let normal_w = vec3<f32>(cl * co, sl, cl * so);
+        let east_w   = vec3<f32>(-so,    0.0, co);
+        let north_w  = vec3<f32>(-sl * co, cl, -sl * so);
+
+        // Cube origin = cell center; cube side = the cell's largest
+        // arc / radial extent, so the cube fully contains the cell.
+        let cube_origin = cs_center + r_c * normal_w;
+        let east_arc  = r_sphere * abs(cl) * slab_lon_step;
+        let north_arc = r_sphere * slab_lat_step;
+        let cube_side = max(max(east_arc, north_arc), slab_r_step);
+        let scale = 3.0 / cube_side;
+
+        // World → local cube frame: translate to cube origin, rotate
+        // by R^T (rows are basis vectors), scale into [0, 3).
+        let d_origin = ray_origin - cube_origin;
+        let local_origin = vec3<f32>(
+            dot(east_w,   d_origin) * scale + 1.5,
+            dot(normal_w, d_origin) * scale + 1.5,
+            dot(north_w,  d_origin) * scale + 1.5,
+        );
+        let local_dir = vec3<f32>(
+            dot(east_w,   ray_dir) * scale,
+            dot(normal_w, ray_dir) * scale,
+            dot(north_w,  ray_dir) * scale,
+        );
+
+        let sub = march_cartesian(anchor_idx, local_origin, local_dir, MAX_STACK_DEPTH, 0xFFFFFFFFu);
+        if !sub.hit { return result; }
+
+        // local_t == world_t (the dir scale is absorbed in the
+        // parameterisation). Rotate normal back to world; neutralise
+        // cell_min/cell_size so main.wgsl's cube-face bevel reads
+        // the centre of a unit cube — the local cube is rotated, so
+        // the world-space cell-min/size doesn't have a clean axis-
+        // aligned interpretation here.
+        var out: HitResult;
+        out.hit = true;
+        out.t = sub.t * inv_norm;
+        out.color = sub.color;
+        out.normal = east_w * sub.normal.x + normal_w * sub.normal.y + north_w * sub.normal.z;
+        out.frame_level = 0u;
+        out.frame_scale = 1.0;
+        let hit_world = ray_origin + ray_dir * sub.t;
+        out.cell_min = hit_world - vec3<f32>(0.5);
+        out.cell_size = 1.0;
+        return out;
+    }
 
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
     var s_cell: array<u32, MAX_STACK_DEPTH>;
@@ -1534,6 +1600,7 @@ fn sphere_uv_in_cell(
                     oc, cs_center, inv_norm,
                     t, t_exit,
                     lon_lo, lon_step, lat_lo, lat_step, r_lo, r_step,
+                    r_sphere,
                 );
                 if sub.hit { return sub; }
                 // Anchor descent exited without a hit — every sub-cell

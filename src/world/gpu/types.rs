@@ -61,11 +61,13 @@ impl GpuChild {
 /// Per-packed-node metadata: indexed by BFS position — the same
 /// `node_index` used in `GpuChild::node_index`. 16 bytes total.
 ///
-/// `kind`: 0 = Cartesian, 1 = WrappedPlane.
+/// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock.
 /// `dims_x/y/z`: slab dims (cells per axis) for `WrappedPlane`;
-/// unused (zeroed) for `Cartesian`. The shader will read these in
-/// Phase 2 to drive X-wrap and in Phase 3 to derive the planet
-/// radius. In Phase 1 they're carried but unused.
+/// unused (zeroed) for `Cartesian` and `TangentBlock`. The shader
+/// reads these in Phase 2 to drive X-wrap and in Phase 3 to derive
+/// the planet radius. `TangentBlock` carries no fields — its TBN
+/// is computed by the descender from current `(lon, lat, r)` cell
+/// bounds at the moment the ray enters the node.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -85,6 +87,7 @@ impl GpuNodeKind {
                 dims_y: dims[1],
                 dims_z: dims[2],
             },
+            NodeKind::TangentBlock => Self { kind: 2, dims_x: 0, dims_y: 0, dims_z: 0 },
         }
     }
 }
@@ -178,5 +181,14 @@ mod tests {
         assert_eq!(k.dims_x, 20);
         assert_eq!(k.dims_y, 10);
         assert_eq!(k.dims_z, 2);
+    }
+
+    #[test]
+    fn from_node_kind_tangent_block() {
+        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock);
+        assert_eq!(k.kind, 2);
+        assert_eq!(k.dims_x, 0);
+        assert_eq!(k.dims_y, 0);
+        assert_eq!(k.dims_z, 0);
     }
 }

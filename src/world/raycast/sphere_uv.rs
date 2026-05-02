@@ -267,7 +267,7 @@ mod tests {
         use crate::world::bootstrap::wrapped_planet_world;
         use crate::world::tree::slot_index;
 
-        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0, false);
         let mut frame_path = vec![];
         for _ in 0..2 {
             frame_path.push(slot_index(1, 1, 1) as u8);
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn cpu_raycast_sphere_uv_pole_is_banned() {
         use crate::world::bootstrap::wrapped_planet_world;
-        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0, false);
         let frame_path = vec![13u8, 13u8];
         // Ray straight DOWN toward sphere from above — hits +Y
         // normal (lat = π/2 ≈ 1.57 > lat_max 1.26) → banned pole.
@@ -331,7 +331,7 @@ mod tests {
         // building a custom WrappedPlane subtree in which the GRASS
         // cell at that position is Child::Empty. Below it (cell_y=0
         // at the same x, z) STONE is intact.
-        let mut world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        let mut world = wrapped_planet_world(2, [27, 2, 14], 3, 0, false);
         // Walk world tree to the slab root: 2 embedding levels of
         // slot (1, 1, 1).
         let mut node_id = world.root;
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn cpu_raycast_sphere_uv_misses_when_ray_misses_sphere() {
         use crate::world::bootstrap::wrapped_planet_world;
-        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0);
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 0, false);
         let frame_path = vec![13u8, 13u8];
         // Ray going +Y from above, way off to the side — never
         // intersects the sphere.
@@ -461,7 +461,7 @@ mod tests {
         // cell_subtree_depth=3 → each anchor block has 3 more levels
         // of uniform Cartesian subtree. Same +X equator setup as
         // east_equator_hits_middle_cell.
-        let world = wrapped_planet_world(2, [27, 2, 14], 3, 3);
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 3, false);
         let frame_path = vec![13u8, 13u8];
         let cam_local = [3.0, 1.5, 1.5];
         let ray_dir = [-1.0, 0.0, 0.0];
@@ -527,7 +527,7 @@ mod tests {
         // sub-tree the deep-break can carve into. Slab natural depth =
         // embedding(2) + slab(3) = 5.
         let case = |max_depth: u32| {
-            let mut world = wrapped_planet_world(2, [27, 2, 14], 3, 3);
+            let mut world = wrapped_planet_world(2, [27, 2, 14], 3, 3, false);
             let frame_path = vec![13u8, 13u8];
             let cam_local = [3.0, 1.5, 1.5];
             let ray_dir = [-1.0, 0.0, 0.0];
