@@ -883,14 +883,17 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     }
     if uniforms.root_kind == ROOT_KIND_UV_SUB_CELL {
         // Sub-cell dispatch: `uniforms.root_index` is the sub-cell's
-        // node BFS idx; the body's params come through dedicated
-        // uniforms (`uv_body_params`) since the cell node itself
-        // isn't a `UvSphereBody`. The ray is in body-frame
-        // `[0, 3)³` cartesian — `gpu_camera_for_frame` writes the
-        // camera using the body's `cartesian_path()` for sub-cell
-        // frames, matching the body-root convention.
+        // node BFS idx for the descent, `uv_subcell_body_idx.x` is
+        // the enclosing body's BFS idx for the on-frame-exit fall-
+        // back to `march_uv_sphere`. Body params come through
+        // `uv_body_params` since the sub-cell node isn't a
+        // `UvSphereBody`. The ray is in body-frame `[0, 3)³`
+        // cartesian — `gpu_camera_for_frame` writes the camera using
+        // the body's `cartesian_path()` for sub-cell frames, matching
+        // the body-root convention.
         return march_uv_subcell(
             uniforms.root_index,
+            uniforms.uv_subcell_body_idx.x,
             uniforms.uv_body_params.x,
             uniforms.uv_body_params.y,
             uniforms.uv_body_params.z,

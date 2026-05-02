@@ -299,6 +299,7 @@ impl App {
                     renderer.set_root_kind_uv_sphere_body();
                 }
                 ActiveFrameKind::UvSubCell {
+                    body_node_id,
                     body_inner_r, body_outer_r, body_theta_cap,
                     phi_min, theta_min, r_min,
                     dphi, dth, dr,
@@ -307,17 +308,42 @@ impl App {
                     // Body params are stored in body-LOCAL `[0, 1)³`
                     // units (same as the `node_kinds[body]` packing);
                     // the shader's body_size = 3 convention scales
-                    // them by the body-frame size. Match here. The
-                    // shader reads body params from `uv_body_params`
-                    // uniforms — no need to thread the body's BFS
-                    // index through; the renderer's `root_index` is
-                    // already the sub-cell node, not the body.
+                    // them by the body-frame size. Match here.
+                    //
+                    // The shader's sub-cell marcher needs the BODY's
+                    // BFS index too: when a ray exits the sub-cell's
+                    // `(φ, θ, r)` range it falls back to the body-root
+                    // marcher (otherwise the rest of the body reads as
+                    // sky — the literal cut-in-half artifact). Pack
+                    // the body into the cache so its BFS is valid for
+                    // the shader.
                     let body_size = crate::world::anchor::WORLD_SIZE;
+                    let body_bfs = self
+                        .cached_tree
+                        .as_mut()
+                        .expect("cached_tree populated")
+                        .ensure_root(&self.world.library, body_node_id);
+                    // ensure_root may have appended new nodes to the
+                    // pack — re-upload the tail so the GPU sees them.
+                    let cache = self
+                        .cached_tree
+                        .as_ref()
+                        .expect("cached_tree populated");
+                    renderer.update_tree(
+                        &cache.tree,
+                        &cache.node_kinds,
+                        &cache.node_offsets,
+                        &cache.aabbs,
+                        cache.root_bfs_idx,
+                    );
+                    // `set_frame_root` was set above to the SUB-CELL's
+                    // BFS — restore it after `update_tree` clobbers it.
+                    renderer.set_frame_root(scene_frame_bfs);
                     renderer.set_root_kind_uv_sub_cell(
                         body_inner_r * body_size,
                         body_outer_r * body_size,
                         body_theta_cap,
-                        0,
+                        body_bfs,
                         phi_min,
                         theta_min,
                         r_min * body_size,

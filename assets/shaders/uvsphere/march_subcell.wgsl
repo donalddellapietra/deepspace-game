@@ -32,14 +32,18 @@
 //
 // Termination:
 // - Ray exits the body's outer shell (sky).
-// - Ray exits the frame's `(φ, θ, r)` range (sky — ribbon-pop into
-//   sibling sub-cells is a future iteration).
+// - Ray exits the frame's `(φ, θ, r)` range — the marcher falls
+//   back to `march_uv_sphere(body_node_idx, ...)` so the rest of
+//   the body still renders. Without the fallback, a ray going
+//   anywhere outside the camera's UV sub-cell reads as sky and the
+//   sphere appears cut in half.
 // - Hit a Block leaf — return hit.
 // - Inner-core hit — return as stone.
 // - Iteration cap.
 
 fn march_uv_subcell(
     frame_node_idx: u32,
+    body_node_idx: u32,
     body_inner_r: f32, body_outer_r: f32, body_theta_cap: f32,
     phi_min: f32, theta_min: f32, r_min: f32,
     frame_dphi: f32, frame_dth: f32, frame_dr: f32,
@@ -116,11 +120,18 @@ fn march_uv_subcell(
         let un_theta_frame = cam_un_theta + d_un_frame.y * t;
         let un_r_frame = cam_un_r + d_un_frame.z * t;
 
-        // Frame-exit check — sky for now (ribbon-pop is a follow-up).
+        // Frame-exit: fall back to the body-root marcher so the rest
+        // of the body still renders. The fall-back redoes ray-vs-body-
+        // shell entry from the original ray, which is correct even
+        // when the ray has already advanced inside the sub-cell — any
+        // hit inside the sub-cell would have returned earlier in this
+        // loop. Slight redundant work for sub-cell rays whose first
+        // descent lands outside the frame; cleaner than threading a
+        // `t_resume` through the body-root marcher.
         if un_phi_frame < -1e-6 || un_phi_frame > 1.0 + 1e-6
             || un_theta_frame < -1e-6 || un_theta_frame > 1.0 + 1e-6
             || un_r_frame < -1e-6 || un_r_frame > 1.0 + 1e-6 {
-            break;
+            return march_uv_sphere(body_node_idx, ray_origin, ray_dir);
         }
 
         // Descend within frame, capped.
