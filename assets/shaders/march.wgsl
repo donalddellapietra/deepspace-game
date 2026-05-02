@@ -1412,7 +1412,7 @@ fn sphere_descend_anchor(
             if step_y > 0 { frame_in_frac.y = f32(new_cell.y)     / 3.0; }
             if step_z < 0 { frame_in_frac.z = f32(new_cell.z + 1) / 3.0; }
             if step_z > 0 { frame_in_frac.z = f32(new_cell.z)     / 3.0; }
-            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            t = t_next + max(cur_r_step * 1e-2, abs(t_next) * 2e-7);
             if t > t_exit { break; }
             continue;
         }
@@ -1480,7 +1480,7 @@ fn sphere_descend_anchor(
             if step_y > 0 { frame_in_frac.y = f32(new_cell.y)     / 3.0; }
             if step_z < 0 { frame_in_frac.z = f32(new_cell.z + 1) / 3.0; }
             if step_z > 0 { frame_in_frac.z = f32(new_cell.z)     / 3.0; }
-            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            t = t_next + max(cur_r_step * 1e-2, abs(t_next) * 2e-7);
             if t > t_exit { break; }
             continue;
         }
@@ -1522,7 +1522,7 @@ fn sphere_descend_anchor(
             if step_y > 0 { frame_in_frac.y = f32(new_cell.y)     / 3.0; }
             if step_z < 0 { frame_in_frac.z = f32(new_cell.z + 1) / 3.0; }
             if step_z > 0 { frame_in_frac.z = f32(new_cell.z)     / 3.0; }
-            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            t = t_next + max(cur_r_step * 1e-2, abs(t_next) * 2e-7);
             if t > t_exit { break; }
             continue;
         }
