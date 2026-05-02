@@ -16,22 +16,22 @@ use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 
-/// Hard cap on UV-tier descent depth inside a `UvSphereBody`. Past
-/// this depth the frame's `dphi = 2π / 3^N` falls below f32 ULPs of
-/// body-frame `phi`, and `(phi_w − phi_min) / dphi` becomes a
-/// catastrophic cancellation — every sub-pixel of camera motion
-/// resolves to a different UV tier, producing the bevel "swarm"
-/// the user sees at close zoom.
+/// Hard cap on UV-tier descent depth inside a `UvSphereBody`.
 ///
-/// At depth 8, `dphi ≈ 9.6e-4` rad — well above the ~1e-7 absolute
-/// ULP of `phi_w`. Initial cell-local `un_phi` precision is ~1e-4
-/// of frame, leaving a healthy budget for a handful of in-shader
-/// `*3 mod 1` descents before precision degrades visibly. Past
-/// this cap the renderer simply stops at depth 8 and lets the
-/// shader's per-iteration descent cover finer detail; a deeper-
-/// rendering future variant needs cell-local coord propagation
-/// (no body-frame absolute `phi_w`), not a deeper frame.
-const MAX_UV_FRAME_DEPTH: u8 = 8;
+/// Currently `0`: the body-root marcher (`march_uv_sphere`) now uses
+/// a stack-based DDA that propagates `un_*` cell-locally between
+/// iterations — error stays at `1` cell-local ULP regardless of
+/// descent depth. The sub-cell architecture's only job was hiding
+/// the precision cliff of the previous per-iteration recompute;
+/// with that fixed, sub-cell rendering is redundant and would
+/// re-introduce coverage gaps (a frame at body-tree depth K only
+/// covers `1 / 3^K` of the body's `(φ, θ, r)` range).
+///
+/// The `ActiveFrameKind::UvSubCell` variant and shader-side
+/// `march_uv_subcell` stay in the codebase as dormant scaffolding
+/// for any future LOD scheme that wants frame-local precision plus
+/// a ribbon-pop mechanism.
+const MAX_UV_FRAME_DEPTH: u8 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
@@ -492,74 +492,9 @@ mod tests {
         assert_eq!(p.as_slice(), &slots);
     }
 
-    // --------- UV sub-cell descent ---------
-
-    fn uv_body_with_uniform_children(depth_inside: u8) -> (NodeLibrary, NodeId) {
-        // Build a UV body whose children are a uniform Cartesian-style
-        // chain `depth_inside` deep, so descent never stalls on a
-        // Block/Empty leaf and we exercise the sub-cell metadata
-        // accumulation.
-        let mut lib = NodeLibrary::default();
-        let leaf = lib.insert(empty_children());
-        let mut node = leaf;
-        for _ in 1..depth_inside {
-            node = lib.insert(uniform_children(Child::Node(node)));
-        }
-        let body = lib.insert_with_kind(
-            uniform_children(Child::Node(node)),
-            NodeKind::UvSphereBody {
-                inner_r: 0.15,
-                outer_r: 0.60,
-                theta_cap: std::f32::consts::FRAC_PI_2 * 0.9,
-            },
-        );
-        lib.ref_inc(body);
-        (lib, body)
-    }
-
-    #[test]
-    fn render_frame_enters_uv_sub_cell_after_body() {
-        let (lib, body) = uv_body_with_uniform_children(3);
-        // Anchor with one slot inside the body. Body is the world
-        // root in this test. Pick a slot that puts the camera
-        // off-axis so the spherical (r, θ, φ) projection is non-
-        // degenerate (r > 0).
-        let mut anchor = Path::root();
-        anchor.push(22); // (x=1, y=1, z=2) — east of centre on z axis
-        let frame = compute_render_frame(&lib, body, &anchor, 1);
-        assert_eq!(frame.render_path.depth(), 1, "descent stepped into the body");
-        match frame.kind {
-            ActiveFrameKind::UvSubCell { dphi, dth, dr, body_inner_r, body_outer_r, .. } => {
-                assert!((dphi - TWO_PI / 3.0).abs() < 1e-5);
-                assert!((dth - 2.0 * 0.9 * std::f32::consts::FRAC_PI_2 / 3.0).abs() < 1e-4);
-                assert!((dr - (0.60 - 0.15) / 3.0).abs() < 1e-5);
-                assert!((body_inner_r - 0.15).abs() < 1e-6);
-                assert!((body_outer_r - 0.60).abs() < 1e-6);
-            }
-            other => panic!("expected UvSubCell, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn render_frame_uv_sub_cell_metadata_shrinks_per_descent() {
-        let (lib, body) = uv_body_with_uniform_children(5);
-        let mut anchor = Path::root();
-        // Cartesian-deepen anchor a few steps inside the body so the
-        // body-frame position is well-defined.
-        for _ in 0..4 { anchor.push(22); }
-        let frame3 = compute_render_frame(&lib, body, &anchor, 3);
-        assert_eq!(frame3.render_path.depth(), 3);
-        let frame4 = compute_render_frame(&lib, body, &anchor, 4);
-        assert_eq!(frame4.render_path.depth(), 4);
-        let dphi3 = match frame3.kind {
-            ActiveFrameKind::UvSubCell { dphi, .. } => dphi,
-            _ => panic!(),
-        };
-        let dphi4 = match frame4.kind {
-            ActiveFrameKind::UvSubCell { dphi, .. } => dphi,
-            _ => panic!(),
-        };
-        assert!((dphi4 * 3.0 - dphi3).abs() < 1e-6,
-            "dphi must shrink by 1/3 per descent: dphi3={} dphi4={}", dphi3, dphi4);
-    }
+    // UV sub-cell descent is dormant (`MAX_UV_FRAME_DEPTH = 0`) —
+    // the body-root marcher's stack-based DDA covers all zoom depths
+    // with cell-local precision, so the sub-cell variant has no
+    // active rendering path. Tests for it land if/when ribbon-pop
+    // scaffolding wakes the variant back up.
 }
