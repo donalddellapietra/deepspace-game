@@ -1,4 +1,4 @@
-// Ray march shader for base-3 recursive voxel tree.
+// Ray march shader for base-2 recursive voxel tree.
 //
 // One unified Cartesian tree walker. Sphere-related dispatch and
 // shaders have been removed in favor of the wrapped-Cartesian

@@ -57,7 +57,7 @@ impl EntityMesh {
 pub fn unit_cube_mesh() -> EntityMesh {
     let mut vertices: Vec<MeshVertex> = Vec::with_capacity(24);
     let mut indices: Vec<u32> = Vec::with_capacity(36);
-    let s = 3.0;
+    let s = 2.0;
     // Six faces: +X, -X, +Y, -Y, +Z, -Z.
     let faces: [([[f32; 3]; 4], [f32; 3]); 6] = [
         ([[s, 0.0, 0.0], [s, s, 0.0], [s, s, s], [s, 0.0, s]],     [1.0, 0.0, 0.0]),
@@ -93,7 +93,7 @@ pub fn extract(
 ) -> Option<EntityMesh> {
     let node = library.get(root)?;
     let max_depth = node.depth as usize;
-    let res = 3usize.pow(max_depth as u32);
+    let res = 2usize.pow(max_depth as u32);
     let mut grid = vec![0u16; res * res * res];
     fill_dense(library, root, &mut grid, res, 0, 0, 0, res);
     if grid.iter().all(|&c| c == 0) {
@@ -102,7 +102,7 @@ pub fn extract(
 
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    let cell_size = 3.0 / res as f32;
+    let cell_size = 2.0 / res as f32;
 
     // Greedy mesher runs once per face direction (6 total). The
     // mask is a 2D rectangle of (blocktype+facing) tags; a zero tag
@@ -289,8 +289,8 @@ fn fill_dense(
     cell_res: usize,
 ) {
     let Some(node) = library.get(node_id) else { return };
-    let child_res = cell_res / 3;
-    for slot in 0..27 {
+    let child_res = cell_res / 2;
+    for slot in 0..8 {
         let (sx, sy, sz) = slot_coords(slot);
         let cx = ox + sx * child_res;
         let cy = oy + sy * child_res;
@@ -344,7 +344,7 @@ mod tests {
     fn single_solid_block_emits_6_faces() {
         let mut lib = NodeLibrary::default();
         let mut children = empty_children();
-        children[13] = Child::Block(1);
+        children[7] = Child::Block(1);
         let root = lib.insert(children);
         let mut palette: Vec<[f32; 4]> = vec![[0.0; 4]; 256];
         palette[0] = [1.0, 0.0, 0.0, 1.0];

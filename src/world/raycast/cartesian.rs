@@ -35,7 +35,7 @@ pub(super) fn cpu_raycast_inner(
     ];
     let delta_dist = [inv_dir[0].abs(), inv_dir[1].abs(), inv_dir[2].abs()];
 
-    let (t_enter, t_exit) = ray_aabb(ray_origin, inv_dir, [0.0; 3], [3.0; 3]);
+    let (t_enter, t_exit) = ray_aabb(ray_origin, inv_dir, [0.0; 3], [2.0; 3]);
     if t_enter >= t_exit || t_exit < 0.0 {
         return None;
     }
@@ -48,9 +48,9 @@ pub(super) fn cpu_raycast_inner(
     ];
 
     let initial_cell = [
-        (entry_pos[0].floor() as i32).clamp(0, 2),
-        (entry_pos[1].floor() as i32).clamp(0, 2),
-        (entry_pos[2].floor() as i32).clamp(0, 2),
+        (entry_pos[0].floor() as i32).clamp(0, 1),
+        (entry_pos[1].floor() as i32).clamp(0, 1),
+        (entry_pos[2].floor() as i32).clamp(0, 1),
     ];
     let cell_f = [initial_cell[0] as f32, initial_cell[1] as f32, initial_cell[2] as f32];
 
@@ -78,7 +78,7 @@ pub(super) fn cpu_raycast_inner(
         let depth = stack.len() - 1;
         let cell = stack[depth].cell;
 
-        if cell[0] < 0 || cell[0] > 2 || cell[1] < 0 || cell[1] > 2 || cell[2] < 0 || cell[2] > 2 {
+        if cell[0] < 0 || cell[0] > 1 || cell[1] < 0 || cell[1] > 1 || cell[2] < 0 || cell[2] > 1 {
             stack.pop();
             if path.len() > depth {
                 path.truncate(depth);
@@ -123,7 +123,7 @@ pub(super) fn cpu_raycast_inner(
 
                 // Short-circuit fully-empty subtrees at any depth.
                 // Without this, the DDA descends into uniform-air
-                // nodes recursively, visiting O(3^depth) leaf cells
+                // nodes recursively, visiting O(2^depth) leaf cells
                 // before escaping — easily exceeding the iteration
                 // budget for deep carved cavities.
                 if child_node.representative_block
@@ -149,7 +149,7 @@ pub(super) fn cpu_raycast_inner(
                     parent_origin[1] + cell[1] as f32 * parent_cell_size,
                     parent_origin[2] + cell[2] as f32 * parent_cell_size,
                 ];
-                let child_cell_size = parent_cell_size / 3.0;
+                let child_cell_size = parent_cell_size / 2.0;
 
                 // TangentBlock dispatch — frame-local rotation around
                 // (1.5, 1.5, 1.5). Mirrors the shader's march_cartesian.
@@ -158,7 +158,7 @@ pub(super) fn cpu_raycast_inner(
                     // Scale: the slot extent (size parent_cell_size in
                     // parent frame) maps to the child's [0, 3)³ local
                     // frame, so scale = 3 / parent_cell_size.
-                    let scale = 3.0 / parent_cell_size;
+                    let scale = 2.0 / parent_cell_size;
                     let lp_origin = [
                         (ray_origin[0] - child_origin[0]) * scale,
                         (ray_origin[1] - child_origin[1]) * scale,
@@ -170,16 +170,16 @@ pub(super) fn cpu_raycast_inner(
                         ray_dir[2] * scale,
                     ];
                     // R^T applied: result.i = sum_j rotation[i][j] * v.j
-                    let centered = [lp_origin[0] - 1.5, lp_origin[1] - 1.5, lp_origin[2] - 1.5];
+                    let centered = [lp_origin[0] - 1.0, lp_origin[1] - 1.0, lp_origin[2] - 1.0];
                     let rotated_origin = [
                         rotation[0][0] * centered[0] + rotation[0][1] * centered[1] + rotation[0][2] * centered[2],
                         rotation[1][0] * centered[0] + rotation[1][1] * centered[1] + rotation[1][2] * centered[2],
                         rotation[2][0] * centered[0] + rotation[2][1] * centered[1] + rotation[2][2] * centered[2],
                     ];
                     let local_origin = [
-                        rotated_origin[0] + 1.5,
-                        rotated_origin[1] + 1.5,
-                        rotated_origin[2] + 1.5,
+                        rotated_origin[0] + 1.0,
+                        rotated_origin[1] + 1.0,
+                        rotated_origin[2] + 1.0,
                     ];
                     let local_dir = [
                         rotation[0][0] * lp_dir[0] + rotation[0][1] * lp_dir[1] + rotation[0][2] * lp_dir[2],
@@ -221,9 +221,9 @@ pub(super) fn cpu_raycast_inner(
                     (child_entry[2] - child_origin[2]) / child_cell_size,
                 ];
                 let child_cell = [
-                    (local_entry[0].floor() as i32).clamp(0, 2),
-                    (local_entry[1].floor() as i32).clamp(0, 2),
-                    (local_entry[2].floor() as i32).clamp(0, 2),
+                    (local_entry[0].floor() as i32).clamp(0, 1),
+                    (local_entry[1].floor() as i32).clamp(0, 1),
+                    (local_entry[2].floor() as i32).clamp(0, 1),
                 ];
                 let lc = [child_cell[0] as f32, child_cell[1] as f32, child_cell[2] as f32];
 

@@ -93,19 +93,19 @@ fn analyze_per_axis_df(tree: &[u32], node_offsets: &[u32]) {
 
     for &off in node_offsets {
         let occ = tree[off as usize];
-        for slot in 0..27u32 {
+        for slot in 0..8u32 {
             if (occ >> slot) & 1 != 0 {
                 continue;
             }
-            let (cx, cy, cz) = (slot as i32 % 3, (slot as i32 / 3) % 3, slot as i32 / 9);
+            let (cx, cy, cz) = (slot as i32 % 2, (slot as i32 / 2) % 2, slot as i32 / 4);
             for (a, &(dx, dy, dz)) in dirs.iter().enumerate() {
                 let (mut x, mut y, mut z) = (cx, cy, cz);
                 let mut len = 0u32;
                 loop {
-                    if x < 0 || x > 2 || y < 0 || y > 2 || z < 0 || z > 2 {
+                    if x < 0 || x > 1 || y < 0 || y > 1 || z < 0 || z > 1 {
                         break;
                     }
-                    let s = (x as u32) + 3 * (y as u32) + 9 * (z as u32);
+                    let s = (x as u32) + 2 * (y as u32) + 4 * (z as u32);
                     if (occ >> s) & 1 != 0 {
                         break;
                     }
@@ -155,7 +155,7 @@ fn analyze_per_axis_df(tree: &[u32], node_offsets: &[u32]) {
             100.0 * (max_axis - 1.0) / max_axis,
         );
         println!("    fewer empty steps vs no-DF baseline. Storing 6 axes × 2 bits per slot");
-        println!("    (27 × 12 = 324 bits/node) lets every ray use its dominant-axis value.");
+        println!("    (8 × 12 = 96 bits/node) lets every ray use its dominant-axis value.");
     } else {
         println!(
             "  → Per-axis max only {max_axis:.2} — even axis-aligned rays gain little. Not worth storing."
@@ -163,7 +163,7 @@ fn analyze_per_axis_df(tree: &[u32], node_offsets: &[u32]) {
     }
 }
 
-/// For every packed node, enumerate all 27×8 = 216
+/// For every packed node, enumerate all 8×8 = 64
 /// (entry_cell, step_octant) configurations. For each, compute the
 /// conservative path-mask (tensor product of per-axis 3-bit masks)
 /// and test whether `occupancy & path_mask == 0`. Report the
@@ -176,13 +176,13 @@ fn analyze_path_mask_cull(tree: &[u32], node_offsets: &[u32]) {
     let mut total_descents_sim: u64 = 0;
     let mut culled: u64 = 0;
     // Cull rate by node popcount bucket.
-    let mut culled_by_popcount = [0u64; 28];
-    let mut total_by_popcount = [0u64; 28];
+    let mut culled_by_popcount = [0u64; 9];
+    let mut total_by_popcount = [0u64; 9];
 
-    // Precompute the 216 reachable masks (entry_cell × octant → 27-bit).
-    let mut reachable: [[u32; 8]; 27] = [[0; 8]; 27];
-    for ec in 0..27u32 {
-        let (ex, ey, ez) = (ec % 3, (ec / 3) % 3, ec / 9);
+    // Precompute the 216 reachable masks (entry_cell × octant → 8-bit).
+    let mut reachable: [[u32; 8]; 8] = [[0; 8]; 8];
+    for ec in 0..8u32 {
+        let (ex, ey, ez) = (ec % 2, (ec / 2) % 2, ec / 4);
         for oct in 0..8u32 {
             let sx = if oct & 1 == 0 { 1i32 } else { -1 };
             let sy = if oct & 2 == 0 { 1i32 } else { -1 };
@@ -192,21 +192,21 @@ fn analyze_path_mask_cull(tree: &[u32], node_offsets: &[u32]) {
             let xm = axis_mask(ex as i32, sx);
             let ym = axis_mask(ey as i32, sy);
             let zm = axis_mask(ez as i32, sz);
-            // Tensor product into 27-bit mask.
+            // Tensor product into 8-bit mask.
             let mut mask = 0u32;
-            for x in 0..3u32 {
+            for x in 0..2u32 {
                 if (xm >> x) & 1 == 0 {
                     continue;
                 }
-                for y in 0..3u32 {
+                for y in 0..2u32 {
                     if (ym >> y) & 1 == 0 {
                         continue;
                     }
-                    for z in 0..3u32 {
+                    for z in 0..2u32 {
                         if (zm >> z) & 1 == 0 {
                             continue;
                         }
-                        mask |= 1u32 << (x + 3 * y + 9 * z);
+                        mask |= 1u32 << (x + 2 * y + 4 * z);
                     }
                 }
             }
@@ -217,7 +217,7 @@ fn analyze_path_mask_cull(tree: &[u32], node_offsets: &[u32]) {
     for &off in node_offsets {
         let occ = tree[off as usize];
         let pop = occ.count_ones() as usize;
-        for ec in 0..27u32 {
+        for ec in 0..8u32 {
             for oct in 0..8u32 {
                 let mask = reachable[ec as usize][oct as usize];
                 total_descents_sim += 1;
@@ -241,7 +241,7 @@ fn analyze_path_mask_cull(tree: &[u32], node_offsets: &[u32]) {
     println!("  Culled:               {culled} ({cull_rate:.1}%)");
     println!();
     println!("  Cull rate by node popcount (how occupancy density affects cull):");
-    for pc in 0..=27 {
+    for pc in 0..=8 {
         if total_by_popcount[pc] == 0 {
             continue;
         }
@@ -278,7 +278,7 @@ fn axis_mask(entry: i32, step: i32) -> u32 {
     // direction, as a 3-bit mask on bits {0, 1, 2}.
     let mut m = 0u32;
     let mut x = entry;
-    while (0..3).contains(&x) {
+    while (0..2).contains(&x) {
         m |= 1 << x;
         x += step;
     }
@@ -301,19 +301,19 @@ fn analyze_combined_projection(tree: &[u32], node_offsets: &[u32]) {
     ];
     for &off in node_offsets {
         let occ = tree[off as usize];
-        for slot in 0..27u32 {
+        for slot in 0..8u32 {
             if (occ >> slot) & 1 != 0 {
                 continue;
             }
-            let (cx, cy, cz) = (slot as i32 % 3, (slot as i32 / 3) % 3, slot as i32 / 9);
+            let (cx, cy, cz) = (slot as i32 % 2, (slot as i32 / 2) % 2, slot as i32 / 4);
             for (a, &(dx, dy, dz)) in dirs.iter().enumerate() {
                 let (mut x, mut y, mut z) = (cx, cy, cz);
                 let mut len = 0u32;
                 loop {
-                    if x < 0 || x > 2 || y < 0 || y > 2 || z < 0 || z > 2 {
+                    if x < 0 || x > 1 || y < 0 || y > 1 || z < 0 || z > 1 {
                         break;
                     }
-                    let s = (x as u32) + 3 * (y as u32) + 9 * (z as u32);
+                    let s = (x as u32) + 2 * (y as u32) + 4 * (z as u32);
                     if (occ >> s) & 1 != 0 {
                         break;
                     }
@@ -334,9 +334,9 @@ fn analyze_combined_projection(tree: &[u32], node_offsets: &[u32]) {
     // Path-mask cull rate (average over all node configurations).
     let mut total = 0u64;
     let mut culled = 0u64;
-    let mut reachable: [[u32; 8]; 27] = [[0; 8]; 27];
-    for ec in 0..27u32 {
-        let (ex, ey, ez) = (ec % 3, (ec / 3) % 3, ec / 9);
+    let mut reachable: [[u32; 8]; 8] = [[0; 8]; 8];
+    for ec in 0..8u32 {
+        let (ex, ey, ez) = (ec % 2, (ec / 2) % 2, ec / 4);
         for oct in 0..8u32 {
             let sx = if oct & 1 == 0 { 1 } else { -1 };
             let sy = if oct & 2 == 0 { 1 } else { -1 };
@@ -347,19 +347,19 @@ fn analyze_combined_projection(tree: &[u32], node_offsets: &[u32]) {
                 axis_mask(ez as i32, sz),
             );
             let mut mask = 0u32;
-            for x in 0..3u32 {
+            for x in 0..2u32 {
                 if (xm >> x) & 1 == 0 {
                     continue;
                 }
-                for y in 0..3u32 {
+                for y in 0..2u32 {
                     if (ym >> y) & 1 == 0 {
                         continue;
                     }
-                    for z in 0..3u32 {
+                    for z in 0..2u32 {
                         if (zm >> z) & 1 == 0 {
                             continue;
                         }
-                        mask |= 1u32 << (x + 3 * y + 9 * z);
+                        mask |= 1u32 << (x + 2 * y + 4 * z);
                     }
                 }
             }
@@ -368,7 +368,7 @@ fn analyze_combined_projection(tree: &[u32], node_offsets: &[u32]) {
     }
     for &off in node_offsets {
         let occ = tree[off as usize];
-        for ec in 0..27u32 {
+        for ec in 0..8u32 {
             for oct in 0..8u32 {
                 total += 1;
                 if (occ & reachable[ec as usize][oct as usize]) == 0 {

@@ -3,17 +3,17 @@
 //! # Structure
 //!
 //! A stepped Sierpinski tetrahedron in a more "architectural" form:
-//! at every level we keep 4 corners of the y=0 base and the centre of
-//! the y=2 top:
+//! at every level we keep 4 corners of the y=0 base and one apex
+//! corner at y=1:
 //!
 //! ```text
-//!   base (y=0):  (0,0,0)  (2,0,0)  (0,0,2)  (2,0,2)
-//!   apex (y=2):  (1,2,1)
+//!   base (y=0):  (0,0,0)  (1,0,0)  (0,0,1)  (1,0,1)
+//!   apex (y=1):  (0,1,0)
 //! ```
 //!
 //! Recursing yields a ziggurat-like self-similar pyramid — the apex
 //! of every sub-pyramid has its own 4 corners + apex at the next
-//! level. 5 / 27 cells filled per level → quite sparse.
+//! level. 5/8 cells filled per level.
 //!
 //! # Source
 //!
@@ -38,20 +38,20 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
-/// 4 base corners at y=0, 1 apex at y=2 centre. `(x, y, z)` slots.
+/// 4 base corners at y=0, 1 apex at y=1. `(x, y, z)` slots.
 const PYRAMID: [(u8, u8, u8); 5] = [
     (0, 0, 0),
-    (2, 0, 0),
-    (0, 0, 2),
-    (2, 0, 2),
-    (1, 2, 1),
+    (1, 0, 0),
+    (0, 0, 1),
+    (1, 0, 1),
+    (0, 1, 0),
 ];
 
 fn sierpinski_pyramid_world(depth: u8, base: u16, apex: u16) -> WorldState {
     let slots: Vec<Slot> = PYRAMID
         .iter()
         .map(|&(x, y, z)| {
-            let block = if y == 2 { apex } else { base };
+            let block = if y == 1 { apex } else { base };
             (x, y, z, block)
         })
         .collect();
@@ -71,12 +71,11 @@ pub(crate) fn bootstrap_sierpinski_pyramid_world(depth: u8) -> WorldBootstrap {
 
     let world = sierpinski_pyramid_world(depth, base, apex);
 
-    // Far-diagonal pose (see `scripts/test-fractals.sh`): body-diagonal
-    // vantage shows the pyramid stack (base corners + apex) recursed
-    // at every level in a single frame.
+    // Far-diagonal pose: body-diagonal vantage shows the pyramid
+    // stack (base corners + apex) recursed at every level.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.8, 2.8, 2.8],
+        [1.8, 1.8, 1.8],
         2,
     )
     .deepened_to(8);

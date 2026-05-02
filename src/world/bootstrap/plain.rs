@@ -64,11 +64,9 @@ pub fn plain_test_world() -> WorldState {
     for z in 0..BRANCH {
         for x in 0..BRANCH {
             let slot_bottom = slot_index(x, 0, z);
-            let slot_mid = slot_index(x, 1, z);
-            let slot_top = slot_index(x, 2, z);
+            let slot_top = slot_index(x, 1, z);
             grass_surface_children[slot_bottom] = Child::Node(dirt_l1);
-            grass_surface_children[slot_mid] = Child::Node(grass_l1);
-            grass_surface_children[slot_top] = Child::Node(air_l1);
+            grass_surface_children[slot_top] = Child::Node(grass_l1);
         }
     }
     let grass_surface_l2 = library.insert(grass_surface_children);
@@ -84,15 +82,11 @@ pub fn plain_test_world() -> WorldState {
         }
     }
     features_children[slot_index(1, 0, 1)] = Child::Node(wood_l1);
-    features_children[slot_index(1, 1, 1)] = Child::Node(wood_l1);
-    features_children[slot_index(1, 2, 1)] = Child::Node(leaf_l1);
+    features_children[slot_index(1, 1, 1)] = Child::Node(leaf_l1);
     features_children[slot_index(0, 0, 0)] = Child::Node(brick_l1);
     features_children[slot_index(0, 0, 1)] = Child::Node(brick_l1);
-    features_children[slot_index(0, 0, 2)] = Child::Node(brick_l1);
     features_children[slot_index(0, 1, 0)] = Child::Node(brick_l1);
     features_children[slot_index(0, 1, 1)] = Child::Node(brick_l1);
-    features_children[slot_index(0, 1, 2)] = Child::Node(brick_l1);
-    features_children[slot_index(2, 0, 0)] = Child::Node(sand_l1);
     let features_l2 = library.insert(features_children);
 
     let mut root_children = empty_children();
@@ -103,11 +97,10 @@ pub fn plain_test_world() -> WorldState {
             } else {
                 Child::Node(checker_ground_l2)
             };
-            root_children[slot_index(x, 1, z)] = Child::Node(grass_surface_l2);
-            root_children[slot_index(x, 2, z)] = if x == 1 && z == 1 {
+            root_children[slot_index(x, 1, z)] = if x == 1 && z == 1 {
                 Child::Node(features_l2)
             } else {
-                Child::Node(air_l2)
+                Child::Node(grass_surface_l2)
             };
         }
     }

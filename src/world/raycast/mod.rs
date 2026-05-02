@@ -5,7 +5,7 @@
 //! the cell the crosshair targets is the same cell the shader is
 //! shading. Edits operate at a layer-dependent depth: the zoom level
 //! controls how deep the raycast descends, so the same code breaks a
-//! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
+//! single block at fine zoom or an entire 2×2×2 node at coarse zoom.
 
 mod cartesian;
 mod wrapped_planet;
@@ -34,7 +34,7 @@ pub struct HitInfo {
 /// Cast a ray through the tree, stopping at `max_depth` levels from
 /// root. `max_depth` controls the interaction layer: at depth 3 in a
 /// 3-level tree the ray targets individual blocks; at depth 2 it
-/// targets 3×3×3 node groups.
+/// targets 2×2×2 node groups.
 pub fn cpu_raycast(
     library: &NodeLibrary,
     root: NodeId,
@@ -48,7 +48,7 @@ pub fn cpu_raycast(
 /// Frame-aware raycast. Mirrors the renderer's ribbon-pop
 /// architecture so the CPU hit depth matches what the shader
 /// renders (LOD-bounded, not budget-bounded): cell-precision is
-/// bounded by the frame depth (camera in `[0, 3)` regardless of
+/// bounded by the frame depth (camera in `[0, 2)` regardless of
 /// absolute path), and the ray pops upward into ancestor frames
 /// when it exits the current frame's bubble.
 pub fn cpu_raycast_in_frame(
@@ -103,9 +103,9 @@ pub fn cpu_raycast_in_frame(
             if let Some(node) = library.get(child_id) {
                 if let NodeKind::TangentBlock { rotation: r } = node.kind {
                     let scaled = [
-                        ray_origin[0] / 3.0,
-                        ray_origin[1] / 3.0,
-                        ray_origin[2] / 3.0,
+                        ray_origin[0] / 2.0,
+                        ray_origin[1] / 2.0,
+                        ray_origin[2] / 2.0,
                     ];
                     let centered = [scaled[0] - 0.5, scaled[1] - 0.5, scaled[2] - 0.5];
                     ray_origin = [
@@ -115,19 +115,19 @@ pub fn cpu_raycast_in_frame(
                     ];
                     let rd = ray_dir;
                     ray_dir = [
-                        (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
-                        (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,
-                        (r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2]) / 3.0,
+                        (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 2.0,
+                        (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 2.0,
+                        (r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2]) / 2.0,
                     ];
                 }
             }
         } else {
             ray_origin = [
-                slot_off[0] + ray_origin[0] / 3.0,
-                slot_off[1] + ray_origin[1] / 3.0,
-                slot_off[2] + ray_origin[2] / 3.0,
+                slot_off[0] + ray_origin[0] / 2.0,
+                slot_off[1] + ray_origin[1] / 2.0,
+                slot_off[2] + ray_origin[2] / 2.0,
             ];
-            ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
+            ray_dir = [ray_dir[0] / 2.0, ray_dir[1] / 2.0, ray_dir[2] / 2.0];
         }
         current_frame_depth -= 1;
     }
@@ -143,9 +143,9 @@ pub fn is_solid_at(
     pos: [f32; 3],
     max_depth: u32,
 ) -> bool {
-    if pos[0] < 0.0 || pos[0] >= 3.0
-        || pos[1] < 0.0 || pos[1] >= 3.0
-        || pos[2] < 0.0 || pos[2] >= 3.0
+    if pos[0] < 0.0 || pos[0] >= 2.0
+        || pos[1] < 0.0 || pos[1] >= 2.0
+        || pos[2] < 0.0 || pos[2] >= 2.0
     {
         return false;
     }
@@ -164,7 +164,7 @@ pub fn is_solid_at(
         let cy = ((pos[1] - node_origin[1]) / cell_size).floor() as i32;
         let cz = ((pos[2] - node_origin[2]) / cell_size).floor() as i32;
 
-        if cx < 0 || cx > 2 || cy < 0 || cy > 2 || cz < 0 || cz > 2 {
+        if cx < 0 || cx > 1 || cy < 0 || cy > 1 || cz < 0 || cz > 1 {
             return false;
         }
 
@@ -181,7 +181,7 @@ pub fn is_solid_at(
                     node_origin[1] + cy as f32 * cell_size,
                     node_origin[2] + cz as f32 * cell_size,
                 ];
-                cell_size /= 3.0;
+                cell_size /= 2.0;
                 node_id = child_id;
             }
         }

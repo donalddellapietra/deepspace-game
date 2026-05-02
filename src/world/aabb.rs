@@ -16,7 +16,7 @@ pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [
     let mut cell_size_common = WORLD_SIZE;
     for depth in common..cell_path.depth() as usize {
         let (sx, sy, sz) = slot_coords(cell_path.slot(depth) as usize);
-        let child_size = cell_size_common / 3.0;
+        let child_size = cell_size_common / 2.0;
         cell_min_common[0] += sx as f32 * child_size;
         cell_min_common[1] += sy as f32 * child_size;
         cell_min_common[2] += sz as f32 * child_size;
@@ -27,7 +27,7 @@ pub fn hit_aabb_in_frame_local(hit: &HitInfo, frame_path: &Path) -> ([f32; 3], [
     let mut frame_size_common = WORLD_SIZE;
     for depth in common..frame_path.depth() as usize {
         let (sx, sy, sz) = slot_coords(frame_path.slot(depth) as usize);
-        let child_size = frame_size_common / 3.0;
+        let child_size = frame_size_common / 2.0;
         frame_min_common[0] += sx as f32 * child_size;
         frame_min_common[1] += sy as f32 * child_size;
         frame_min_common[2] += sz as f32 * child_size;
@@ -56,10 +56,10 @@ pub fn hit_aabb(_library: &NodeLibrary, hit: &HitInfo) -> ([f32; 3], [f32; 3]) {
             origin[1] + y as f32 * cell_size,
             origin[2] + z as f32 * cell_size,
         ];
-        cell_size /= 3.0;
+        cell_size /= 2.0;
     }
     // Undo the last division — the last path entry IS the hit cell.
-    cell_size *= 3.0;
+    cell_size *= 2.0;
     (origin, [origin[0] + cell_size, origin[1] + cell_size, origin[2] + cell_size])
 }
 

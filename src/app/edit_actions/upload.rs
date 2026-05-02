@@ -16,7 +16,7 @@ use crate::world::tree::NodeId;
 /// Heuristic: should the renderer run the beam-prepass (P1) for this
 /// frame? Returns true iff:
 ///   1. The root (= frame-root) node's occupancy popcount is ≤ 10.
-///      Dense roots (Menger at 20/27, plain worlds filling every slot)
+///      Dense roots (Menger at 7/8, plain worlds filling every slot)
 ///      have near-100% hit_fraction in the fine pass, so coarse-cull
 ///      savings are zero and its cost is pure overhead.
 ///   2. The camera's current root cell is OCCUPIED. This distinguishes
@@ -44,10 +44,10 @@ fn compute_beam_enable(
     // nearby content and hit fast (Jerusalem corner, Cantor default
     // corner spawn) → fine pass is already fast enough that the
     // coarse pass's own cost swamps any savings.
-    let cx = camera_pos[0].floor().clamp(0.0, 2.0) as u32;
-    let cy = camera_pos[1].floor().clamp(0.0, 2.0) as u32;
-    let cz = camera_pos[2].floor().clamp(0.0, 2.0) as u32;
-    let slot = cx + cy * 3 + cz * 9;
+    let cx = camera_pos[0].floor().clamp(0.0, 1.0) as u32;
+    let cy = camera_pos[1].floor().clamp(0.0, 1.0) as u32;
+    let cz = camera_pos[2].floor().clamp(0.0, 1.0) as u32;
+    let slot = cx + cy * 2 + cz * 4;
     (occupancy >> slot) & 1 != 0
 }
 
@@ -324,7 +324,7 @@ impl App {
                     .unwrap_or(0xFFFEu32);
                 let anchor_depth = e.pos.anchor.depth() as i32;
                 let depth_delta = (anchor_depth - frame_depth).max(0);
-                let size = frame_world_size / 3.0_f32.powi(depth_delta);
+                let size = frame_world_size / 2.0_f32.powi(depth_delta);
                 let bbox_min = e.pos.in_frame(&effective_path);
                 let bbox_max = [
                     bbox_min[0] + size, bbox_min[1] + size, bbox_min[2] + size,
@@ -371,7 +371,7 @@ impl App {
             for e in &self.entities.entities {
                 let anchor_depth = e.pos.anchor.depth() as i32;
                 let depth_delta = (anchor_depth - frame_depth).max(0);
-                let size = frame_world_size / 3.0_f32.powi(depth_delta);
+                let size = frame_world_size / 2.0_f32.powi(depth_delta);
                 let translate = e.pos.in_frame(&effective_path);
                 let half = size * 0.5;
                 let dx = translate[0] + half - cam[0];

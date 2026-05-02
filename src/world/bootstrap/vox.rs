@@ -95,7 +95,7 @@ pub fn bootstrap_vox_model_world(
     );
 
     // Wrap in outer air layers up to target total_depth. Each wrap
-    // places the current subtree at the center slot of a 27-child
+    // places the current subtree at the center slot of an 8-child
     // node whose other 26 slots are Empty.
     //
     // When `vox_copies > 1`, the FINAL wrap layer fills multiple slots
@@ -137,14 +137,14 @@ pub fn bootstrap_vox_model_world(
     // Geometry: the model is wrapped at `CENTER_SLOT=(1,1,1)` of each
     // outer layer, so it lives in cell (1,1,1)^(wraps) of the root.
     // That cell's world extent is `[wrap_origin, wrap_origin+wrap_size]^3`
-    // with `wrap_size = 3 * (1/3)^wraps` and `wrap_origin = 1.5 - wrap_size/2`.
+    // with `wrap_size = 2 * (1/2)^wraps` and `wrap_origin = 1.0 - wrap_size/2`.
     // Inside that cell, the model's voxel grid fills
-    // `[0, size_axis/padded]` of the cell, where `padded = 3^silhouette_depth`
+    // `[0, size_axis/padded]` of the cell, where `padded = 2^silhouette_depth`
     // (silhouette-only; interior_depth adds layers *inside* each voxel but
     // doesn't change the voxel grid's extent inside the wrap cell).
     let padded = BRANCH.pow(silhouette_depth as u32) as f32;
-    let wrap_size = 3.0 * (1.0 / BRANCH as f32).powi(wraps as i32);
-    let wrap_origin = 1.5 - wrap_size / 2.0;
+    let wrap_size = 2.0 * (1.0 / BRANCH as f32).powi(wraps as i32);
+    let wrap_origin = 1.0 - wrap_size / 2.0;
     let extent_x = wrap_size * (size_x as f32 / padded);
     let extent_y = wrap_size * (size_y as f32 / padded);
     let extent_z = wrap_size * (size_z as f32 / padded);

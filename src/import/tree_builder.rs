@@ -1,16 +1,16 @@
-//! Convert a flat voxel grid into a base-3 recursive tree.
+//! Convert a flat voxel grid into a base-2 recursive tree.
 //!
-//! The algorithm pads the model to the next power of 3, then
-//! recursively subdivides into 3x3x3 groups bottom-up. Content-
+//! The algorithm pads the model to the next power of 2, then
+//! recursively subdivides into 2x2x2 groups bottom-up. Content-
 //! addressed dedup in `NodeLibrary` collapses identical subtrees
 //! automatically.
 
 use crate::world::tree::*;
 use super::{SparseVoxelModel, VoxelModel};
 
-/// Build a base-3 tree from a voxel model. Returns the root `NodeId`.
+/// Build a base-2 tree from a voxel model. Returns the root `NodeId`.
 ///
-/// The model is padded to the next power-of-3 cube. Out-of-bounds
+/// The model is padded to the next power-of-2 cube. Out-of-bounds
 /// voxels are treated as empty. Uniform subtrees (all one block type
 /// or all empty) are collapsed — they don't create intermediate nodes.
 pub fn build_tree(model: &VoxelModel, library: &mut NodeLibrary) -> NodeId {
@@ -30,7 +30,7 @@ pub fn build_tree_with_interior(
     interior_depth: u8,
 ) -> NodeId {
     let max_dim = model.size_x.max(model.size_y).max(model.size_z).max(1);
-    let padded = next_power_of_3(max_dim);
+    let padded = next_power_of_2(max_dim);
 
     let root_child = build_node(model, library, 0, 0, 0, padded / BRANCH, interior_depth);
     match root_child {
@@ -60,7 +60,7 @@ fn build_node(
         return Child::Empty;
     }
 
-    // Build 27 children.
+    // Build 8 children.
     let mut children = empty_children();
 
     if cell_size == 1 {
@@ -79,7 +79,7 @@ fn build_node(
             }
         }
     } else {
-        // Recurse into 3x3x3 sub-cells.
+        // Recurse into 2x2x2 sub-cells.
         let sub_size = cell_size / BRANCH;
         for z in 0..BRANCH {
             for y in 0..BRANCH {
@@ -97,7 +97,7 @@ fn build_node(
         }
     }
 
-    // Collapse: if all 27 children are the same, return that directly.
+    // Collapse: if all 8 children are the same, return that directly.
     let first = children[0];
     if children.iter().all(|&c| c == first) {
         return first;
@@ -135,20 +135,20 @@ fn leaf_child(
     }
 }
 
-/// Smallest power of 3 >= n.
-fn next_power_of_3(n: usize) -> usize {
+/// Smallest power of 2 >= n.
+fn next_power_of_2(n: usize) -> usize {
     let mut p = 1;
     while p < n {
-        p *= 3;
+        p *= 2;
     }
     p
 }
 
 // -------------------------------------------------------- sparse path
 
-/// Build a base-3 tree from a `SparseVoxelModel`, visiting only the
+/// Build a base-2 tree from a `SparseVoxelModel`, visiting only the
 /// N non-empty voxels instead of iterating the full
-/// `next_power_of_3(max_dim)^3` padded cube.
+/// `next_power_of_2(max_dim)^3` padded cube.
 ///
 /// For a Sponza-sized scene (~5 M voxels in a 729³ = 388 M padded
 /// cube), this is ~77× less work than [`build_tree`], with identical
@@ -164,7 +164,7 @@ pub fn build_tree_sparse(
     library: &mut NodeLibrary,
 ) -> NodeId {
     let max_dim = (model.size_x.max(model.size_y).max(model.size_z)).max(1) as usize;
-    let padded = next_power_of_3(max_dim);
+    let padded = next_power_of_2(max_dim);
 
     let indices: Vec<usize> = (0..model.voxels.len()).collect();
     let root_child = build_sparse_rec(
@@ -199,7 +199,7 @@ fn build_sparse_rec(
     }
     let sub = cell_size / BRANCH;
 
-    // Bucket indices into 27 slots.
+    // Bucket indices into 8 slots.
     let mut buckets: [Vec<usize>; CHILDREN_PER_NODE] =
         std::array::from_fn(|_| Vec::new());
     for &i in indices {
@@ -242,16 +242,16 @@ mod tests {
     use super::*;
     use crate::world::palette::block;
 
-    /// A 3x3x3 model of uniform stone produces a single node.
+    /// A 2x2x2 model of uniform stone produces a single node.
     #[test]
-    fn uniform_3x3x3() {
+    fn uniform_2x2x2() {
         let model = VoxelModel {
-            size_x: 3, size_y: 3, size_z: 3,
-            data: vec![block::STONE; 27],
+            size_x: 2, size_y: 2, size_z: 2,
+            data: vec![block::STONE; 8],
         };
         let mut lib = NodeLibrary::default();
         let root = build_tree(&model, &mut lib);
-        // Uniform → collapsed to one node with 27 Block children.
+        // Uniform → collapsed to one node with 8 Block children.
         assert_eq!(lib.len(), 1);
         let node = lib.get(root).unwrap();
         assert!(node.children.iter().all(|c| *c == Child::Block(block::STONE)));
@@ -263,8 +263,8 @@ mod tests {
         // EMPTY_CELL is the sentinel — plain `0` would now mean
         // palette 0 (Stone), not empty.
         let model = VoxelModel {
-            size_x: 3, size_y: 3, size_z: 3,
-            data: vec![crate::import::EMPTY_CELL; 27],
+            size_x: 2, size_y: 2, size_z: 2,
+            data: vec![crate::import::EMPTY_CELL; 8],
         };
         let mut lib = NodeLibrary::default();
         let root = build_tree(&model, &mut lib);
@@ -273,12 +273,12 @@ mod tests {
         assert!(node.children.iter().all(|c| c.is_empty()));
     }
 
-    /// A 4x4x4 model is padded to 9x9x9 (next power of 3).
+    /// A 3x3x3 model is padded to 4x4x4 (next power of 2).
     #[test]
     fn padding() {
-        let mut data = vec![crate::import::EMPTY_CELL; 4 * 4 * 4];
+        let mut data = vec![crate::import::EMPTY_CELL; 3 * 3 * 3];
         data[0] = block::STONE; // one non-empty voxel
-        let model = VoxelModel { size_x: 4, size_y: 4, size_z: 4, data };
+        let model = VoxelModel { size_x: 3, size_y: 3, size_z: 3, data };
         let mut lib = NodeLibrary::default();
         let _root = build_tree(&model, &mut lib);
         // Should have created some nodes (not everything collapsed).
@@ -288,32 +288,32 @@ mod tests {
     /// Content-addressed dedup: a model with repeated patterns shares nodes.
     #[test]
     fn dedup() {
-        // 9x9x9 model: two 3x3x3 quadrants of stone, rest empty.
-        let mut data = vec![crate::import::EMPTY_CELL; 9 * 9 * 9];
-        // Fill (0,0,0)-(2,2,2) with stone.
-        for z in 0..3 { for y in 0..3 { for x in 0..3 {
-            data[(z * 9 + y) * 9 + x] = block::STONE;
+        // 4x4x4 model: two 2x2x2 quadrants of stone, rest empty.
+        let mut data = vec![crate::import::EMPTY_CELL; 4 * 4 * 4];
+        // Fill (0,0,0)-(1,1,1) with stone.
+        for z in 0..2 { for y in 0..2 { for x in 0..2 {
+            data[(z * 4 + y) * 4 + x] = block::STONE;
         }}}
-        // Fill (3,0,0)-(5,2,2) with stone (identical subtree).
-        for z in 0..3 { for y in 0..3 { for x in 3..6 {
-            data[(z * 9 + y) * 9 + x] = block::STONE;
+        // Fill (2,0,0)-(3,1,1) with stone (identical subtree).
+        for z in 0..2 { for y in 0..2 { for x in 2..4 {
+            data[(z * 4 + y) * 4 + x] = block::STONE;
         }}}
 
-        let model = VoxelModel { size_x: 9, size_y: 9, size_z: 9, data };
+        let model = VoxelModel { size_x: 4, size_y: 4, size_z: 4, data };
         let mut lib = NodeLibrary::default();
         let _root = build_tree(&model, &mut lib);
-        // The two stone 3x3x3 cubes should share a NodeId via dedup.
+        // The two stone 2x2x2 cubes should share a NodeId via dedup.
         // Total unique nodes should be small.
         assert!(lib.len() <= 5, "expected dedup, got {} nodes", lib.len());
     }
 
     /// Round-trip: build tree, then walk it to verify voxels match.
     #[test]
-    fn round_trip_3x3x3() {
-        let mut data = vec![crate::import::EMPTY_CELL; 27];
+    fn round_trip_2x2x2() {
+        let mut data = vec![crate::import::EMPTY_CELL; 8];
         data[0] = block::STONE;
-        data[13] = block::GRASS; // center: (1,1,1)
-        let model = VoxelModel { size_x: 3, size_y: 3, size_z: 3, data };
+        data[slot_index(1, 1, 1)] = block::GRASS; // center: (1,1,1)
+        let model = VoxelModel { size_x: 2, size_y: 2, size_z: 2, data };
         let mut lib = NodeLibrary::default();
         let root = build_tree(&model, &mut lib);
 
@@ -321,6 +321,5 @@ mod tests {
         let node = lib.get(root).unwrap();
         assert_eq!(node.children[slot_index(0, 0, 0)], Child::Block(block::STONE));
         assert_eq!(node.children[slot_index(1, 1, 1)], Child::Block(block::GRASS));
-        assert_eq!(node.children[slot_index(2, 2, 2)], Child::Empty);
     }
 }

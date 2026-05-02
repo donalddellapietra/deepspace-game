@@ -50,9 +50,9 @@ use crate::world::tree::{
 ///
 /// Sparse representation: most slots are `None` because entities
 /// cluster in a small part of the world. The children are stored in
-/// a flat `[Option<Box<...>>; 27]` for simple indexing.
+/// a flat `[Option<Box<...>>; 8]` for simple indexing.
 struct TrieNode {
-    slot_children: [Option<Box<TrieNode>>; 27],
+    slot_children: [Option<Box<TrieNode>>; 8],
     /// `Some(entity_idx)` when an entity's anchor bottoms out at
     /// this node — the parent's slot that points here becomes
     /// `Child::EntityRef(entity_idx)` in the scene tree. Multiple
@@ -137,7 +137,7 @@ fn build_scene_node(
         Some(node) => (node.children, node.kind),
         None => (empty_children(), NodeKind::Cartesian),
     };
-    for s in 0..27 {
+    for s in 0..8 {
         let Some(sub) = trie.slot_children[s].as_deref() else { continue };
         // Terrain-side child currently occupying this slot. If it's
         // a Node, pass it down so the scene child inherits the

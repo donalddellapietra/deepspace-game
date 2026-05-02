@@ -3,13 +3,13 @@
 //! Packs a world (jerusalem, menger, ...) at a given plain_layers
 //! and emits distance-field distributions at two granularities:
 //!
-//! **Single-node (3×3×3)**: DF measured within one packed node's
+//! **Single-node (2×2×2)**: DF measured within one packed node's
 //! occupancy mask. Treats both tag=1 leaves and tag=2 child-Node
 //! slots as "occupied" — i.e. any slot the shader would descend
 //! into. Tells us the safe skip a ray gets within ONE inner DDA
 //! frame.
 //!
-//! **Multi-layer (3^(N+1))**: DF measured after expanding each
+//! **Multi-layer (2^(N+1))**: DF measured after expanding each
 //! tag=2 child's own occupancy into the grid, recursively, N
 //! levels deep. This matches what a ray actually experiences:
 //! descending into a tag=2 cell reveals that its own interior
@@ -21,7 +21,7 @@
 //!
 //! If multi-layer DF grows meaningfully compared to single-layer,
 //! it means the shader could store a pre-expanded occupancy grid
-//! per node (larger than 27 bits) and skip across runs that the
+//! per node (larger than 8 bits) and skip across runs that the
 //! current single-node view misses.
 //!
 //! Usage:
@@ -79,23 +79,23 @@ fn main() {
         tree.len() * 4 / (1024 * 1024),
     );
 
-    // Chebyshev DF histogram: index is DF value (0..=2), over all
+    // Chebyshev DF histogram: index is DF value (0..=1), over all
     // (node, empty_cell) pairs.
-    let mut cheb_hist = [0u64; 3];
+    let mut cheb_hist = [0u64; 2];
     // Per-axis run histogram: [axis][run_len-1]. axis ordering:
-    // 0=+x, 1=-x, 2=+y, 3=-y, 4=+z, 5=-z. run_len ∈ {1,2,3}.
-    let mut axis_hist = [[0u64; 3]; 6];
+    // 0=+x, 1=-x, 2=+y, 3=-y, 4=+z, 5=-z. run_len ∈ {1,2}.
+    let mut axis_hist = [[0u64; 2]; 6];
     // Min-over-used-axes DF: the realistic skip bound for a ray with
     // non-axial direction. For each empty cell, pick a ray octant
     // (+x+y+z worst case = +dir for every axis); the skip is
     // min(run_+x, run_+y, run_+z). Do this for all 8 octants per
     // cell and histogram the minimum.
-    let mut octant_hist = [0u64; 3];
+    let mut octant_hist = [0u64; 2];
 
     let mut total_empty = 0u64;
     let mut total_occupied = 0u64;
     // Popcount histogram to see how sparse typical nodes are.
-    let mut popcount_hist = [0u64; 28];
+    let mut popcount_hist = [0u64; 9];
 
     for bfs in 0..node_count {
         let header = node_offsets[bfs] as usize;
@@ -104,28 +104,28 @@ fn main() {
         popcount_hist[pop] += 1;
         total_occupied += pop as u64;
 
-        for slot in 0..27u32 {
+        for slot in 0..8u32 {
             if (occ >> slot) & 1 != 0 {
                 continue;
             }
             total_empty += 1;
             let (cx, cy, cz) = (
-                (slot % 3) as i32,
-                ((slot / 3) % 3) as i32,
-                (slot / 9) as i32,
+                (slot % 2) as i32,
+                ((slot / 2) % 2) as i32,
+                (slot / 4) as i32,
             );
 
             // Chebyshev DF: min over occupied cells of max(|dx|,|dy|,|dz|).
-            // Max possible in 3×3×3 is 2 (diagonal corner to corner).
-            let mut cheb: u32 = 2;
-            for s in 0..27u32 {
+            // Max possible in 2×2×2 is 1 (diagonal corner to corner).
+            let mut cheb: u32 = 1;
+            for s in 0..8u32 {
                 if (occ >> s) & 1 == 0 {
                     continue;
                 }
                 let (ox, oy, oz) = (
-                    (s % 3) as i32,
-                    ((s / 3) % 3) as i32,
-                    (s / 9) as i32,
+                    (s % 2) as i32,
+                    ((s / 2) % 2) as i32,
+                    (s / 4) as i32,
                 );
                 let d = (cx - ox).abs().max((cy - oy).abs()).max((cz - oz).abs()) as u32;
                 if d < cheb {
@@ -149,10 +149,10 @@ fn main() {
                 let mut z = cz;
                 let mut len = 0u32;
                 loop {
-                    if x < 0 || x > 2 || y < 0 || y > 2 || z < 0 || z > 2 {
+                    if x < 0 || x > 1 || y < 0 || y > 1 || z < 0 || z > 1 {
                         break;
                     }
-                    let s = (x as u32) + 3 * (y as u32) + 9 * (z as u32);
+                    let s = (x as u32) + 2 * (y as u32) + 4 * (z as u32);
                     if (occ >> s) & 1 != 0 {
                         break;
                     }
@@ -162,9 +162,9 @@ fn main() {
                     z += dz;
                 }
                 run_len[a] = len;
-                // len ∈ {1, 2, 3} (at least 1 because this cell is
+                // len ∈ {1, 2} (at least 1 because this cell is
                 // empty). Clamp for the histogram index.
-                let idx = (len.saturating_sub(1).min(2)) as usize;
+                let idx = (len.saturating_sub(1).min(1)) as usize;
                 axis_hist[a][idx] += 1;
             }
 
@@ -173,7 +173,7 @@ fn main() {
             // axes and take the minimum. Histogram the WORST octant
             // — that's the safe skip for diagonal rays from this
             // cell.
-            let mut worst_oct: u32 = 3;
+            let mut worst_oct: u32 = 2;
             for oct in 0..8u32 {
                 let sx = if oct & 1 != 0 { 0 } else { 1 };
                 let sy = if oct & 2 != 0 { 2 } else { 3 };
@@ -183,7 +183,7 @@ fn main() {
                     worst_oct = o;
                 }
             }
-            let idx = worst_oct.saturating_sub(1).min(2) as usize;
+            let idx = worst_oct.saturating_sub(1).min(1) as usize;
             octant_hist[idx] += 1;
         }
     }
@@ -199,7 +199,7 @@ fn main() {
 
     println!();
     println!("Popcount histogram (cells-occupied per node):");
-    for pc in 0..=27 {
+    for pc in 0..=8 {
         if popcount_hist[pc] == 0 {
             continue;
         }
@@ -209,14 +209,14 @@ fn main() {
 
     println!();
     println!("Within-node Chebyshev DF distribution (over {total_empty} empty cells):");
-    for df in 0..=2u32 {
+    for df in 0..=1u32 {
         let pct = 100.0 * cheb_hist[df as usize] as f64 / total_empty as f64;
         println!(
             "  DF={df}: {:>10} cells ({:>5.1}%)",
             cheb_hist[df as usize], pct,
         );
     }
-    let cheb_mean = (cheb_hist[0] * 0 + cheb_hist[1] * 1 + cheb_hist[2] * 2) as f64
+    let cheb_mean = (cheb_hist[0] * 0 + cheb_hist[1] * 1) as f64
         / total_empty as f64;
     println!("  mean Chebyshev DF: {cheb_mean:.3}");
 
@@ -226,21 +226,19 @@ fn main() {
     for a in 0..6 {
         let r1 = axis_hist[a][0];
         let r2 = axis_hist[a][1];
-        let r3 = axis_hist[a][2];
-        let total = r1 + r2 + r3;
-        let mean = (r1 + r2 * 2 + r3 * 3) as f64 / total as f64;
+        let total = r1 + r2;
+        let mean = (r1 + r2 * 2) as f64 / total as f64;
         println!(
-            "  {}: run=1:{:>8} ({:>4.1}%)   run=2:{:>8} ({:>4.1}%)   run=3:{:>8} ({:>4.1}%)   mean={mean:.2}",
+            "  {}: run=1:{:>8} ({:>4.1}%)   run=2:{:>8} ({:>4.1}%)   mean={mean:.2}",
             axis_names[a],
             r1, 100.0 * r1 as f64 / total as f64,
             r2, 100.0 * r2 as f64 / total as f64,
-            r3, 100.0 * r3 as f64 / total as f64,
         );
     }
 
     println!();
     println!("Worst-octant DF distribution (safe diagonal-ray skip, {total_empty} empty cells):");
-    for df in 0..=2u32 {
+    for df in 0..=1u32 {
         let pct = 100.0 * octant_hist[df as usize] as f64 / total_empty as f64;
         println!(
             "  min_skip={}: {:>10} cells ({:>5.1}%)",
@@ -249,7 +247,7 @@ fn main() {
             pct,
         );
     }
-    let oct_mean = (octant_hist[0] * 1 + octant_hist[1] * 2 + octant_hist[2] * 3) as f64
+    let oct_mean = (octant_hist[0] * 1 + octant_hist[1] * 2) as f64
         / total_empty as f64;
     println!("  mean diagonal-safe skip: {oct_mean:.3} cells");
 
@@ -272,8 +270,8 @@ fn main() {
         );
     }
     let axis_max_mean = (0..6)
-        .map(|a| (axis_hist[a][0] + axis_hist[a][1] * 2 + axis_hist[a][2] * 3) as f64
-            / (axis_hist[a][0] + axis_hist[a][1] + axis_hist[a][2]) as f64)
+        .map(|a| (axis_hist[a][0] + axis_hist[a][1] * 2) as f64
+            / (axis_hist[a][0] + axis_hist[a][1]) as f64)
         .fold(0.0_f64, f64::max);
     println!(
         "  Max per-axis run mean: {axis_max_mean:.2}. Axis-aligned rays through empty\n  \
@@ -284,7 +282,7 @@ fn main() {
     // ---------------------------------------------------------------
     // Multi-layer expansion analysis.
     //
-    // Build a dense boolean grid of size 3^(expand+1), populated by
+    // Build a dense boolean grid of size 2^(expand+1), populated by
     // recursively expanding each tag=2 child's occupancy mask into
     // its sub-region. This matches what a ray experiences: a tag=2
     // slot at the current level is mostly empty inside (most cells
@@ -304,7 +302,7 @@ fn main() {
     println!();
     println!("=== Multi-layer expansion: {expand} levels (root node) ===");
 
-    let grid_size: usize = 3usize.pow(expand + 1);
+    let grid_size: usize = 2usize.pow(expand + 1);
     let total_cells = grid_size.pow(3);
     eprintln!(
         "Expanding root into {grid_size}×{grid_size}×{grid_size} = {total_cells} cells..."
@@ -431,7 +429,7 @@ fn main() {
     let mut df_hist_outer = vec![0u64; (max_df as usize) + 2];
     let mut df_hist_inner = vec![0u64; (max_df as usize) + 2];
     let df_hist_len = df_hist.len();
-    let anchor_stride = 3usize.pow(expand); // size of one anchor slot in grid cells
+    let anchor_stride = 2usize.pow(expand); // size of one anchor slot in grid cells
     let root_header_off = node_offsets[root_bfs_idx as usize] as usize;
     let root_occ = tree[root_header_off];
     for (i, &b) in grid.iter().enumerate() {
@@ -444,7 +442,7 @@ fn main() {
         let ax = x / anchor_stride;
         let ay = y / anchor_stride;
         let az = z / anchor_stride;
-        let anchor_slot = ax + 3 * ay + 9 * az;
+        let anchor_slot = ax + 2 * ay + 4 * az;
         let anchor_is_tag2 = (root_occ >> anchor_slot) & 1 != 0;
 
         let d = df_grid[i];
@@ -498,7 +496,7 @@ fn main() {
         let df_mean = df_sum as f64 / df_n.max(1) as f64;
         println!(
             "  mean DF: {df_mean:.2} sub-cells = {:.3} parent-cells = {:.3} world units",
-            df_mean / 3.0_f64.powi(expand as i32),
+            df_mean / 2.0_f64.powi(expand as i32),
             df_mean / grid_size as f64,
         );
         df_mean
@@ -512,7 +510,7 @@ fn main() {
 
     println!();
     println!(
-        "By anchor-slot type (at sub-cell size 1/{grid_size}; anchor = top-level 3×3×3):"
+        "By anchor-slot type (at sub-cell size 1/{grid_size}; anchor = top-level 2×2×2):"
     );
     let df_outer_mean = report_hist(
         "  OUTER (cells in tag=0 anchor slots — rays reach these without descending)",
@@ -528,9 +526,9 @@ fn main() {
     // traversing empty space at anchor depth would skip past. The
     // INNER class is only relevant if the shader also operates at
     // finer resolution inside tag=2 cells.
-    let outer_in_parent = df_outer_mean / 3.0_f64.powi(expand as i32);
-    let inner_in_parent = df_inner_mean / 3.0_f64.powi(expand as i32);
-    let overall_in_parent = df_mean / 3.0_f64.powi(expand as i32);
+    let outer_in_parent = df_outer_mean / 2.0_f64.powi(expand as i32);
+    let inner_in_parent = df_inner_mean / 2.0_f64.powi(expand as i32);
+    let overall_in_parent = df_mean / 2.0_f64.powi(expand as i32);
     let _ = overall_in_parent;
     println!();
     println!("=== COMPARISON (parent-cell units) ===");
@@ -541,7 +539,7 @@ fn main() {
     if outer_in_parent > cheb_mean * 1.5 {
         println!(
             "  OUTER rays: multi-layer DF is {:.1}× single-layer. A ray in an\n  \
-             empty anchor slot could skip further per iteration than the 3×3×3\n  \
+             empty anchor slot could skip further per iteration than the 2×2×2\n  \
              view suggests. Worth considering a per-node finer DF grid.",
             outer_in_parent / cheb_mean,
         );
@@ -560,11 +558,11 @@ fn main() {
 /// substitution to perform. At level 0, the current node's tag=2
 /// children are collapsed into their slot being "occupied" (any
 /// subtree with content); at level >0, we descend into the child's
-/// own 3×3×3 occupancy and keep going.
+/// own 2×2×2 occupancy and keep going.
 ///
 /// This is what the shader's DDA would see if it operated on a
-/// 3^(levels+1) × 3^(levels+1) × 3^(levels+1) pre-expanded grid
-/// rooted at one node, instead of stepping through 3×3×3 + descent
+/// 2^(levels+1) × 2^(levels+1) × 2^(levels+1) pre-expanded grid
+/// rooted at one node, instead of stepping through 2×2×2 + descent
 /// at every level separately.
 fn expand_into_grid(
     tree: &[u32],
@@ -580,15 +578,15 @@ fn expand_into_grid(
     let first_child = tree[header_off + 1] as usize;
 
     // Sub-cell size in the grid: how many grid cells per slot at
-    // this level. At top-level recursion in a 3^(N+1) grid with
-    // levels=N, each slot is 3^N cells wide.
-    let sub_stride = 3usize.pow(levels);
+    // this level. At top-level recursion in a 2^(N+1) grid with
+    // levels=N, each slot is 2^N cells wide.
+    let sub_stride = 2usize.pow(levels);
 
-    for slot in 0..27u32 {
+    for slot in 0..8u32 {
         let (sx, sy, sz) = (
-            (slot % 3) as usize,
-            ((slot / 3) % 3) as usize,
-            (slot / 9) as usize,
+            (slot % 2) as usize,
+            ((slot / 2) % 2) as usize,
+            (slot / 4) as usize,
         );
         let cell_origin = (
             origin.0 + sx * sub_stride,

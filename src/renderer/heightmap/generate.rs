@@ -126,10 +126,10 @@ impl HeightmapGen {
     }
 
     /// Record a full-heightmap dispatch into `encoder`. Workgroup
-    /// count per axis is ceil(side / 9). Every base-3 size in the
-    /// shipped range [27, 2187] is an exact multiple of 9, so the
-    /// ceiling is only nontrivial for small (< 27) sides used in
-    /// tests — in which case the excess threads bail via the
+    /// count per axis is ceil(side / 8). Every base-2 size in the
+    /// shipped range [2, 128] is an exact multiple of 8 (except 2
+    /// and 4), so the ceiling is only nontrivial for very small
+    /// sides — in which case the excess threads bail via the
     /// `u >= side` check at the top of `cs_main`.
     pub fn record(
         &self,

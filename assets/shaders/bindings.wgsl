@@ -37,7 +37,7 @@ struct Uniforms {
     /// the CPU-side `GpuUniforms`; only Cartesian is dispatched.
     root_kind: u32,
     /// Number of ancestor ribbon entries available. When the ray
-    /// exits the frame's [0, 3)³ bubble at depth 0, the shader
+    /// exits the frame's [0, 2)³ bubble at depth 0, the shader
     /// pops upward, walking ribbon[0]..ribbon[ribbon_count-1].
     /// 0 = no ancestors (frame is at world root).
     ribbon_count: u32,
@@ -106,7 +106,7 @@ const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
-/// - low 5 bits: slot (0..27) of the child we're popping FROM
+/// - low 5 bits: slot (0..8) of the child we're popping FROM
 /// - bit 31: `siblings_all_empty` — when set, every other slot of
 ///   `node_idx` has tag=0 (Empty). The shader uses this to fast-
 ///   exit the whole shell with a single ray–box intersection,
@@ -129,7 +129,7 @@ struct NodeKindGpu {
     /// 3×3 rotation matrix (column-major) for TangentBlock. Each
     /// column is `vec4<f32>` (w = 0 padding for std140 alignment).
     /// Identity for Cartesian / WrappedPlane (unread there).
-    /// Applied at descent: `local = R^T·(child_local - 1.5) + 1.5`.
+    /// Applied at descent: `local = R^T·(child_local - 1.0) + 1.0`.
     rot_col0: vec4<f32>,
     rot_col1: vec4<f32>,
     rot_col2: vec4<f32>,
@@ -184,7 +184,7 @@ struct ShaderStats {
 /// `2 + 2*popcount(occupancy)` contiguous u32s:
 ///
 /// ```
-/// tree[base + 0] = occupancy mask (27 bits)
+/// tree[base + 0] = occupancy mask (8 bits)
 /// tree[base + 1] = first_child_offset (absolute u32 index into tree[])
 /// tree[first_child_offset + rank*2]     = packed (tag|block_type|pad)
 /// tree[first_child_offset + rank*2 + 1] = child.node_index (BFS idx,

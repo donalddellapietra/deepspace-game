@@ -4,7 +4,7 @@
 //! The "render frame" is the GPU's view of the world. The shader
 //! starts ray marching at a frame root, with the camera expressed
 //! in that frame's coordinates. All frames are linear Cartesian
-//! `[0, 3)³`.
+//! `[0, 2)³`.
 //!
 //! All functions here are **pure** — no `App` state — for direct
 //! unit testing.
@@ -157,7 +157,7 @@ mod tests {
     fn render_frame_root_when_desired_depth_zero() {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
-        for _ in 0..3 { anchor.push(13); }
+        for _ in 0..3 { anchor.push(7); }
         let frame = compute_render_frame(&lib, root, &anchor, 0);
         assert_eq!(frame.render_path.depth(), 0);
         assert_eq!(frame.node_id, root);
@@ -167,7 +167,7 @@ mod tests {
     fn render_frame_descends_through_cartesian() {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
-        for _ in 0..4 { anchor.push(13); }
+        for _ in 0..4 { anchor.push(7); }
         let frame = compute_render_frame(&lib, root, &anchor, 3);
         assert_eq!(frame.render_path.depth(), 3);
     }
@@ -176,7 +176,7 @@ mod tests {
     fn render_frame_truncates_when_camera_anchor_shallow() {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
-        anchor.push(13);
+        anchor.push(7);
         let frame = compute_render_frame(&lib, root, &anchor, 5);
         assert!(frame.render_path.depth() <= 1);
     }
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn frame_from_slots_builds_exact_prefix() {
-        let slots = [13u8, 16u8, 4u8];
+        let slots = [7u8, 5u8, 4u8];
         let p = frame_from_slots(&slots);
         assert_eq!(p.depth(), slots.len() as u8);
         assert_eq!(p.as_slice(), &slots);
@@ -223,7 +223,7 @@ mod tests {
             wp_children,
             NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
         );
-        // Embed: root has WP at slot 13, everything else empty.
+        // Embed: root has WP at slot 7, everything else empty.
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(wp);
         let root = lib.insert(root_children);
@@ -263,7 +263,7 @@ mod tests {
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        // Camera in slot 0 of root — the WP is in slot 13 (centre).
+        // Camera in slot 0 of root — the WP is in slot 7 (centre).
         let mut anchor = Path::root();
         anchor.push(0);
         let frame = compute_render_frame(&lib, root, &anchor, 3);

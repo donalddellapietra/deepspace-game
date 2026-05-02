@@ -58,21 +58,21 @@ impl TangentFrame {
         let dx = world_pos[0] - self.origin[0];
         let dy = world_pos[1] - self.origin[1];
         let dz = world_pos[2] - self.origin[2];
-        let scale = 3.0 / cube_side;
+        let scale = 2.0 / cube_side;
         [
-            (self.east[0] * dx + self.east[1] * dy + self.east[2] * dz) * scale + 1.5,
-            (self.normal[0] * dx + self.normal[1] * dy + self.normal[2] * dz) * scale + 1.5,
-            (self.north[0] * dx + self.north[1] * dy + self.north[2] * dz) * scale + 1.5,
+            (self.east[0] * dx + self.east[1] * dy + self.east[2] * dz) * scale + 1.0,
+            (self.normal[0] * dx + self.normal[1] * dy + self.normal[2] * dz) * scale + 1.0,
+            (self.north[0] * dx + self.north[1] * dy + self.north[2] * dz) * scale + 1.0,
         ]
     }
 
     /// Transform a world-space direction into the cube's local
-    /// frame. Direction is scaled by `3.0 / cube_side` so an
+    /// frame. Direction is scaled by `2.0 / cube_side` so an
     /// `(origin_local, dir_local)` pair has the same `t`
     /// parameterization as the world ray it came from.
     #[inline]
     pub fn world_dir_to_local(&self, world_dir: [f32; 3], cube_side: f32) -> [f32; 3] {
-        let scale = 3.0 / cube_side;
+        let scale = 2.0 / cube_side;
         [
             (self.east[0] * world_dir[0] + self.east[1] * world_dir[1] + self.east[2] * world_dir[2]) * scale,
             (self.normal[0] * world_dir[0] + self.normal[1] * world_dir[1] + self.normal[2] * world_dir[2]) * scale,
@@ -152,7 +152,7 @@ mod tests {
     /// and the normal points outward from the sphere center.
     #[test]
     fn frame_is_orthonormal_and_outward() {
-        let cs_center = [1.5, 1.5, 1.5];
+        let cs_center = [1.0, 1.0, 1.0];
         let r = 3.0 / (2.0 * std::f32::consts::PI);
         let pi = std::f32::consts::PI;
         // Equator + mid-latitude bands, full longitude sweep.
@@ -182,7 +182,7 @@ mod tests {
     /// Mapping `world → local → world` recovers the input.
     #[test]
     fn world_to_local_round_trip() {
-        let cs_center = [1.5, 1.5, 1.5];
+        let cs_center = [1.0, 1.0, 1.0];
         let r = 3.0 / (2.0 * std::f32::consts::PI);
         let f = TangentFrame::at(cs_center, r, 0.3, -0.7);
         let cube_side = 0.05;
@@ -193,18 +193,18 @@ mod tests {
             f.origin[2] + 0.4 * f.east[2] + 0.1 * f.normal[2] - 0.2 * f.north[2],
         ];
         let local = f.world_to_local(p_world, cube_side);
-        // local should be 1.5 + (offset_in_local_units * 3 / cube_side).
+        // local should be 1.0 + (offset_in_local_units * 3 / cube_side).
         // Offsets above are in world-space units along the basis vectors.
-        let scale = 3.0 / cube_side;
-        assert_close(local[0], 1.5 + 0.4 * scale, 1e-3, "x");
-        assert_close(local[1], 1.5 + 0.1 * scale, 1e-3, "y");
-        assert_close(local[2], 1.5 - 0.2 * scale, 1e-3, "z");
+        let scale = 2.0 / cube_side;
+        assert_close(local[0], 1.0 + 0.4 * scale, 1e-3, "x");
+        assert_close(local[1], 1.0 + 0.1 * scale, 1e-3, "y");
+        assert_close(local[2], 1.0 - 0.2 * scale, 1e-3, "z");
 
-        // Reverse: world = origin + R * (local - 1.5) * (cube/3)
-        let inv_scale = cube_side / 3.0;
-        let lx = (local[0] - 1.5) * inv_scale;
-        let ly = (local[1] - 1.5) * inv_scale;
-        let lz = (local[2] - 1.5) * inv_scale;
+        // Reverse: world = origin + R * (local - 1.0) * (cube/3)
+        let inv_scale = cube_side / 2.0;
+        let lx = (local[0] - 1.0) * inv_scale;
+        let ly = (local[1] - 1.0) * inv_scale;
+        let lz = (local[2] - 1.0) * inv_scale;
         let recovered = [
             f.origin[0] + f.east[0] * lx + f.normal[0] * ly + f.north[0] * lz,
             f.origin[1] + f.east[1] * lx + f.normal[1] * ly + f.north[1] * lz,
@@ -218,7 +218,7 @@ mod tests {
     /// local-mapped image of `world_origin + world_dir * t`.
     #[test]
     fn ray_parameterization_preserved() {
-        let cs_center = [1.5, 1.5, 1.5];
+        let cs_center = [1.0, 1.0, 1.0];
         let r = 3.0 / (2.0 * std::f32::consts::PI);
         let f = TangentFrame::at(cs_center, r, -0.1, 1.2);
         let cube_side = 0.07;
@@ -248,7 +248,7 @@ mod tests {
     /// Local-frame normal returns to the basis vector it represents.
     #[test]
     fn local_normal_unmaps_to_world() {
-        let cs_center = [1.5, 1.5, 1.5];
+        let cs_center = [1.0, 1.0, 1.0];
         let r = 3.0 / (2.0 * std::f32::consts::PI);
         let f = TangentFrame::at(cs_center, r, 0.5, -1.0);
         assert_close_v(f.local_normal_to_world([1.0, 0.0, 0.0]), f.east, 1e-5, "+X");

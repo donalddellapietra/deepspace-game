@@ -1,4 +1,4 @@
-//! Sierpinski tetrahedron — trinary-adapted.
+//! Sierpinski tetrahedron — binary octree adaptation.
 //!
 //! # Source
 //!
@@ -16,25 +16,22 @@
 //! (0,1,1), then `FoldScale(2)` re-scales — binary self-similarity
 //! placing 4 sub-tetrahedra at the cube's tetrahedral corners.
 //!
-//! # Trinary adaptation
+//! # Binary adaptation
 //!
-//! We can't do `FoldScale(2)` on a scale-3 tree. Instead we pick the
-//! 4 slots that form a regular tetrahedron inside the 3×3×3 node:
+//! In a base-2 octree the 4 tetrahedral corners map directly to:
 //!
 //! ```text
-//!   (0, 0, 0)  (2, 2, 0)  (2, 0, 2)  (0, 2, 2)
+//!   (0, 0, 0)  (1, 1, 0)  (1, 0, 1)  (0, 1, 1)
 //! ```
 //!
-//! (any 4 corners where an even number of coordinates equal 2). Each
-//! recurses into another sub-tetrahedron. Result: a Sierpinski gasket
-//! whose silhouette matches the binary original but whose scaffold is
-//! sparser per level (only 4/27 cells vs 4/8) — zoom feels airier.
+//! Each pair differs in exactly 2 coordinates — a regular tetrahedron
+//! inscribed in the unit cube. 4/8 = 50% occupancy per level.
 //!
 //! # Coloring
 //!
 //! PySpace uses a solid cream `(0.8, 0.8, 0.5)`. We keep that as the
 //! primary body colour and add a second accent (a warmer gold) at the
-//! "apex" vertex `(0, 2, 2)` so one corner pops at every zoom level —
+//! "apex" vertex `(0, 1, 1)` so one corner pops at every zoom level —
 //! like the orbit-trap highlight on mausoleum-family fractals.
 
 use crate::world::anchor::{Path, WorldPos};
@@ -44,21 +41,21 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
-/// Tetrahedral-corner pattern in the 3×3×3 subdivision. Four cells
-/// chosen so every pair is diagonally opposite along two axes.
+/// Tetrahedral-corner pattern in the 2×2×2 subdivision. Four cells
+/// chosen so every pair differs in exactly two coordinates.
 const TET_CORNERS: [(u8, u8, u8); 4] = [
     (0, 0, 0),
-    (2, 2, 0),
-    (2, 0, 2),
-    (0, 2, 2),
+    (1, 1, 0),
+    (1, 0, 1),
+    (0, 1, 1),
 ];
 
 fn sierpinski_tet_world(depth: u8, body: u16, apex: u16) -> WorldState {
-    // Apex = (0, 2, 2). All others body.
+    // Apex = (0, 1, 1). All others body.
     let slots: Vec<Slot> = TET_CORNERS
         .iter()
         .map(|&(x, y, z)| {
-            let block = if (x, y, z) == (0, 2, 2) { apex } else { body };
+            let block = if (x, y, z) == (0, 1, 1) { apex } else { body };
             (x, y, z, block)
         })
         .collect();
@@ -72,19 +69,19 @@ pub(crate) fn bootstrap_sierpinski_tet_world(depth: u8) -> WorldBootstrap {
     let depth = depth.min(MAX_DEPTH as u8);
 
     let mut registry = ColorRegistry::new();
-    // PySpace's tet colour: (0.8, 0.8, 0.5) → cream.
+    // PySpace's tet colour: (0.8, 0.8, 0.5) -> cream.
     let body = registry.register(204, 204, 128, 255).unwrap();
     // Warm gold accent for the apex vertex.
     let apex = registry.register(230, 170, 60, 255).unwrap();
 
     let world = sierpinski_tet_world(depth, body, apex);
 
-    // Far-diagonal pose (see `scripts/test-fractals.sh`): body-diagonal
-    // vantage point reveals the tetrahedron's four corners as four
-    // distinct clusters arranged around the centre of frame.
+    // Far-diagonal pose: body-diagonal vantage point reveals the
+    // tetrahedron's four corners as four distinct clusters arranged
+    // around the centre of frame.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.8, 2.8, 2.8],
+        [1.8, 1.8, 1.8],
         2,
     )
     .deepened_to(8);

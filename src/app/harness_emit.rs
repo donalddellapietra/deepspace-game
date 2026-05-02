@@ -162,7 +162,7 @@ impl App {
         // for this nudge — we just need to land above the surface.
         let hit_y = root_cam[1] + ray_dir[1] * hit.t;
         let anchor_depth = self.anchor_depth() as u8;
-        let cell = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
+        let cell = 1.0_f32 / 2.0_f32.powi(anchor_depth as i32);
         let above_y = hit_y + 2.0 * cell;
         let new_pos = [root_cam[0], above_y.min(3.0 - cell), root_cam[2]];
         self.camera.position = WorldPos::from_frame_local(&Path::root(), new_pos, anchor_depth);

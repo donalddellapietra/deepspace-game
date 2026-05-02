@@ -21,16 +21,16 @@
 struct ClampUniforms {
     /// How many entries in the instance buffer are live.
     entity_count: u32,
-    /// `3^delta` — matches the allocated heightmap texture side.
+    /// `2^delta` — matches the allocated heightmap texture side.
     heightmap_side: u32,
     /// Sentinel: values < this are treated as "no ground", see
     /// `heightmap_gen.wgsl::GROUND_NONE`.
     no_ground_threshold: f32,
-    /// Frame XZ origin in world coords (for future non-[0, 3)
+    /// Frame XZ origin in world coords (for future non-[0, 2)
     /// frames; currently always 0).
     frame_xz_origin_x: f32,
     frame_xz_origin_z: f32,
-    /// Frame XZ extent in world coords (currently WORLD_SIZE = 3).
+    /// Frame XZ extent in world coords (currently WORLD_SIZE = 2).
     frame_xz_size: f32,
     _pad0: u32,
     _pad1: u32,

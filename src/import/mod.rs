@@ -1,6 +1,6 @@
 //! Voxel model import pipeline.
 //!
-//! Converts external voxel formats (`.vox`) into the base-3 tree.
+//! Converts external voxel formats (`.vox`) into the base-2 tree.
 //! The pipeline: parse → color map → tree build → NodeId ready to place.
 
 pub mod vox;

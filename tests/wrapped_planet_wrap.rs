@@ -57,7 +57,7 @@ fn pos_at_slab_cell(
     // (x, y, z) coordinate is the ternary digit of (slab_x, slab_y,
     // slab_z) at position (slab_depth - 1 - k).
     for k in 0..slab_depth {
-        let pow = 3u32.pow((slab_depth - 1 - k) as u32);
+        let pow = 2u32.pow((slab_depth - 1 - k) as u32);
         let cx = (slab_x / pow) % 3;
         let cy = (slab_y / pow) % 3;
         let cz = (slab_z / pow) % 3;
@@ -72,10 +72,10 @@ fn step_neighbor_in_world_wraps_east_to_west() {
     let mut pos = pos_at_slab_cell(&slab_root, dims[0] - 1, 1, 1, slab_depth);
     let anchor_before = pos.anchor.as_slice().to_vec();
     let dir = 1; // east
-    let wrapped = pos
+    let (ok, wrapped) = pos
         .anchor
         .step_neighbor_in_world(&world.library, world.root, 0, dir);
-    assert!(wrapped, "stepping east off slab east edge should wrap");
+    assert!(ok && wrapped, "stepping east off slab east edge should wrap");
     let after = pos_at_slab_cell(&slab_root, 0, 1, 1, slab_depth);
     assert_eq!(
         pos.anchor.as_slice(),
@@ -90,10 +90,10 @@ fn step_neighbor_in_world_wraps_west_to_east() {
     let (world, slab_root, dims, slab_depth) = canonical_world();
     let mut pos = pos_at_slab_cell(&slab_root, 0, 1, 1, slab_depth);
     let dir = -1; // west
-    let wrapped = pos
+    let (ok, wrapped) = pos
         .anchor
         .step_neighbor_in_world(&world.library, world.root, 0, dir);
-    assert!(wrapped, "stepping west off slab west edge should wrap");
+    assert!(ok && wrapped, "stepping west off slab west edge should wrap");
     let after = pos_at_slab_cell(&slab_root, dims[0] - 1, 1, 1, slab_depth);
     assert_eq!(
         pos.anchor.as_slice(),

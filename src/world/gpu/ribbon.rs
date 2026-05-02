@@ -1,5 +1,5 @@
 //! Ancestor ribbon: the chain that lets the shader pop upward
-//! when a ray exits the render frame's `[0, 3)³` bubble.
+//! when a ray exits the render frame's `[0, 2)³` bubble.
 //!
 //! The ribbon is computed AFTER the tree pack: it walks the
 //! interleaved GPU buffer along the frame path, recording
@@ -15,7 +15,7 @@
 //! parent_dir = frame_dir / 3.0
 //! ```
 //!
-//! This brings the ray into the parent's `[0, 3)³` frame coords and
+//! This brings the ray into the parent's `[0, 2)³` frame coords and
 //! the DDA continues at the parent's BFS index (looked up via
 //! `node_offsets[]` to find the parent's header in `tree[]`).
 
@@ -29,7 +29,7 @@ use bytemuck::{Pod, Zeroable};
 /// shader maps this to a `tree[]` u32-offset via `node_offsets[]`.
 ///
 /// `slot_bits` packs two things into a u32:
-/// - Low 5 bits: slot (0..27) in the ancestor that contained the
+/// - Low 5 bits: slot (0..8) in the ancestor that contained the
 ///   level the ray is popping FROM.
 /// - Bit 31: `siblings_all_empty` flag. When set, every child slot
 ///   of the ancestor OTHER than `slot` is empty. The shader uses
@@ -48,7 +48,7 @@ pub struct GpuRibbonEntry {
 
 /// Bit mask for the `siblings_all_empty` flag in `slot_bits`.
 pub const SIBLINGS_ALL_EMPTY_BIT: u32 = 1 << 31;
-/// Bit mask isolating the slot index (0..27) in `slot_bits`.
+/// Bit mask isolating the slot index (0..8) in `slot_bits`.
 pub const SLOT_MASK: u32 = 0x1F;
 
 impl GpuRibbonEntry {
@@ -233,18 +233,18 @@ mod tests {
     fn single_step() {
         let (tree, offsets) = two_node_tree(13);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, 0, &[13]);
+            build_ribbon(&tree, &offsets, 0, &[7]);
         assert_eq!(frame_root_idx, 1);
         assert_eq!(ribbon.len(), 1);
         assert_eq!(ribbon[0].node_idx, 0);
-        assert_eq!(ribbon[0].slot(), 13);
+        assert_eq!(ribbon[0].slot(), 7);
         // Root has occupancy with exactly one bit set → flag set.
         assert!(ribbon[0].siblings_all_empty());
     }
 
     #[test]
     fn stops_at_non_node_child() {
-        // Path requests slot 13 → Node, then slot 5 → empty at child.
+        // Path requests slot 7 → Node, then slot 5 → empty at child.
         // Walker stops at frame=1.
         let (tree, offsets) = two_node_tree(13);
         let RibbonResult { frame_root_idx, ribbon, .. } =
@@ -317,11 +317,11 @@ mod tests {
         let world = pocket_world();
         let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
         let RibbonResult { frame_root_idx, ribbon, .. } =
-            build_ribbon(&tree, &offsets, root_idx, &[13]);
+            build_ribbon(&tree, &offsets, root_idx, &[7]);
         assert_ne!(frame_root_idx, root_idx, "interior packed at a different BFS idx");
         assert_eq!(ribbon.len(), 1);
         assert_eq!(ribbon[0].node_idx, root_idx, "first pop is the world root");
-        assert_eq!(ribbon[0].slot(), 13);
+        assert_eq!(ribbon[0].slot(), 7);
     }
 
     #[test]

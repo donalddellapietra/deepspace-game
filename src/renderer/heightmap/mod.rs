@@ -5,8 +5,8 @@
 //!
 //! - A compute shader (`heightmap_gen.wgsl`) walks the voxel tree
 //!   and writes the top-of-ground Y into a 2D R32F texture.
-//!   One texel per collision cell (base-3 aligned to the tree).
-//! - Resolution = `3^(collision_depth - frame_depth)` per axis,
+//!   One texel per collision cell (base-2 aligned to the tree).
+//! - Resolution = `2^(collision_depth - frame_depth)` per axis,
 //!   where `collision_depth = entity_anchor_depth + 1` (one layer
 //!   finer than the entity's own anchor).
 //!
@@ -77,7 +77,7 @@ impl HeightmapUniforms {
         y_origin: f32,
         y_size: f32,
     ) -> Self {
-        let side = 3u32.pow(delta);
+        let side = 2u32.pow(delta);
         Self {
             frame_root_bfs,
             frame_depth,
@@ -110,7 +110,7 @@ impl HeightmapTexture {
     /// a valid-but-trivial configuration so a dispatch before any
     /// `write_uniforms` call is still well-defined.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, delta: u32) -> Self {
-        let side = 3u32.pow(delta);
+        let side = 2u32.pow(delta);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("heightmap"),
             size: wgpu::Extent3d {
@@ -136,7 +136,7 @@ impl HeightmapTexture {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let default_uniforms = HeightmapUniforms::new(0, 0, delta, 0.0, 3.0);
+        let default_uniforms = HeightmapUniforms::new(0, 0, delta, 0.0, 2.0);
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("heightmap_uniforms"),
             contents: bytemuck::bytes_of(&default_uniforms),
@@ -157,5 +157,5 @@ impl HeightmapTexture {
 }
 
 /// Block size of the gen compute shader's workgroup. Matches the
-/// `@workgroup_size(9, 9, 1)` in `heightmap_gen.wgsl`.
-pub const GEN_WORKGROUP_SIDE: u32 = 9;
+/// `@workgroup_size(8, 8, 1)` in `heightmap_gen.wgsl`.
+pub const GEN_WORKGROUP_SIDE: u32 = 8;

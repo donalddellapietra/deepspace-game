@@ -48,8 +48,8 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
     let ny = y as i32 + dy;
     let nz = z as i32 + dz;
 
-    // In-node: neighbor is within the same 3x3x3 node.
-    if (0..=2).contains(&nx) && (0..=2).contains(&ny) && (0..=2).contains(&nz) {
+    // In-node: neighbor is within the same 2x2x2 node.
+    if (0..=1).contains(&nx) && (0..=1).contains(&ny) && (0..=1).contains(&nz) {
         let adj_slot = slot_index(nx as usize, ny as usize, nz as usize);
         let parent_id = hit.path.last().unwrap().0;
 
@@ -359,7 +359,7 @@ mod tests {
         let cell_size = aabb_max[0] - aabb_min[0];
 
         let target_center_y = (aabb_min[1] + aabb_max[1]) * 0.5 + cell_size;
-        if target_center_y < 3.0 {
+        if target_center_y < 2.0 {
             let old_root = world.root;
             let placed = place_block(&mut world, &hit, block::BRICK);
             assert!(placed, "Should place into empty subtree");
@@ -379,7 +379,7 @@ mod tests {
     fn placement_outside_world_returns_false() {
         let mut world = plain_test_world();
         let hit = HitInfo {
-            path: vec![(world.root, slot_index(1, 2, 1))],
+            path: vec![(world.root, slot_index(1, 1, 1))],
             face: 2, t: 1.0, place_path: None,
         };
         assert!(!place_block(&mut world, &hit, block::BRICK));
@@ -407,7 +407,7 @@ mod tests {
             let slot = if level == 0 {
                 slot_index(0, 1, 1)
             } else {
-                slot_index(2, 1, 1)
+                slot_index(1, 1, 1)
             };
             path.push((current, slot));
             if let Some(node) = world.library.get(current) {
@@ -442,7 +442,7 @@ mod tests {
             assert_eq!(
                 verify_path.as_slice()[d],
                 slot_index(0, 1, 1) as u8,
-                "depth {} must wrap x=2 to x=0", d + 1,
+                "depth {} must wrap x=1 to x=0", d + 1,
             );
         }
 

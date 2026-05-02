@@ -1,24 +1,27 @@
-//! Menger sponge — canonical ternary fractal, native to our scale-3 tree.
+//! Menger sponge analogue — 7/8 "hollow cube" fractal for the base-2 octree.
 //!
 //! # Structure
 //!
-//! Of the 27 sub-cells in a 3×3×3 node, the 7 where ≥2 coords equal the
-//! center (= 6 face centers + 1 body center) are removed; the remaining
-//! 20 recurse into sub-sponges. This is the exact Menger definition.
+//! The classic Menger sponge is inherently ternary (20/27 cells kept).
+//! In a base-2 octree there is no center row to remove. The closest
+//! analogue is a "hollow cube" pattern: fill 7 of 8 slots, leaving
+//! one corner empty. We omit (0,0,0) and keep the remaining 7 slots.
+//! 7/8 = 87.5% occupancy per level.
 //!
-//! The 20 kept cells split into two **structural roles**:
+//! The 7 kept cells split into two **structural roles**:
 //!
-//! - **8 cube corners** (all coords ∈ {0, 2}) — the vertex scaffold.
-//! - **12 edge midpoints** (exactly one coord = 1) — the spanning ribs.
+//! - **3 face-adjacent** slots (exactly 1 coord differs from the
+//!   removed corner): (1,0,0), (0,1,0), (0,0,1).
+//! - **4 distant** slots (2+ coords differ from the removed corner):
+//!   (1,1,0), (1,0,1), (0,1,1), (1,1,1).
 //!
 //! # Coloring
 //!
 //! PySpace's `menger` scene uses `color=(.2, .5, 1.0)` — a cool blue —
 //! and `mausoleum` (a Menger embellishment) uses orbit-trap ochre. We
-//! blend the two: corners get the PySpace menger blue, edges get a
-//! warmer structural bronze, so the scaffold-vs-rib split is visible
-//! at every zoom level. This is how we reproduce the orbit-trap
-//! "different folds, different hues" look in a discrete voxel tree.
+//! blend the two: face-adjacent slots get the PySpace menger blue,
+//! distant slots get a warmer structural bronze, so the role split is
+//! visible at every zoom level.
 
 use crate::world::anchor::{Path, WorldPos};
 use crate::world::bootstrap::WorldBootstrap;
@@ -27,15 +30,14 @@ use crate::world::palette::{block, ColorRegistry};
 use crate::world::state::WorldState;
 use crate::world::tree::{empty_children, slot_index, Child, NodeLibrary, BRANCH, MAX_DEPTH};
 
-/// Kept-cell predicate for the Menger sponge. Excludes cells where
-/// ≥2 coords are the center (1).
+/// Kept-cell predicate for the base-2 Menger analogue. Keeps all
+/// slots except (0,0,0).
 #[inline]
 fn is_menger_kept(x: usize, y: usize, z: usize) -> bool {
-    let count = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-    count < 2
+    !(x == 0 && y == 0 && z == 0)
 }
 
-/// Uniform-block Menger sponge (backward-compat helper). All 20
+/// Uniform-block Menger sponge (backward-compat helper). All 7
 /// kept cells become `Child::Block(STONE)` at the deepest level.
 ///
 /// Existing callers (e.g. `gpu/pack.rs` baseline tests) rely on
@@ -71,16 +73,17 @@ pub fn menger_world(depth: u8) -> WorldState {
     WorldState { root: current, library: lib }
 }
 
-/// Two-colour Menger: 8 corner cells painted with `corner_block`, 12
-/// edge-midpoint cells with `edge_block`. See module docs for why.
+/// Two-colour Menger: 3 face-adjacent cells painted with `edge_block`,
+/// 4 distant cells with `corner_block`. See module docs for why.
 fn menger_world_two_tone(depth: u8, corner_block: u16, edge_block: u16) -> WorldState {
-    let mut slots: Vec<Slot> = Vec::with_capacity(20);
-    for z in 0u8..3 {
-        for y in 0u8..3 {
-            for x in 0u8..3 {
+    let mut slots: Vec<Slot> = Vec::with_capacity(7);
+    for z in 0u8..2 {
+        for y in 0u8..2 {
+            for x in 0u8..2 {
                 if !is_menger_kept(x as usize, y as usize, z as usize) { continue; }
-                let center_axes = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-                let block_id = if center_axes == 0 { corner_block } else { edge_block };
+                // Face-adjacent to (0,0,0): exactly one coord is 1
+                let nonzero = (x as u8) + (y as u8) + (z as u8);
+                let block_id = if nonzero == 1 { edge_block } else { corner_block };
                 slots.push((x, y, z, block_id));
             }
         }
@@ -95,22 +98,19 @@ pub(crate) fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
     let depth = depth.min(MAX_DEPTH as u8);
 
     // Palette inspired by PySpace's `menger` (cool blue, .2 .5 1.0) +
-    // `mausoleum` orbit-trap bronze (.70 .55 .25): corners get the
-    // structural bronze, the connecting edges get the blue. At every
-    // zoom level you see the same corner-rib weave.
+    // `mausoleum` orbit-trap bronze (.70 .55 .25): distant slots get the
+    // structural bronze, the face-adjacent slots get the blue.
     let mut registry = ColorRegistry::new();
     let corner = registry.register(178, 140, 64, 255).unwrap();   // bronze (.70 .55 .25)
     let edge = registry.register(51, 128, 255, 255).unwrap();     // PySpace menger blue (.20 .50 1.0)
 
     let world = menger_world_two_tone(depth, corner, edge);
 
-    // Far-diagonal pose (see `scripts/test-fractals.sh`): (+X,+Y,+Z)
-    // corner of the root cell looking back along the body diagonal.
-    // Reveals the sponge's 3D structure with both corner and edge
-    // tones clearly readable.
+    // Far-diagonal pose: (+X,+Y,+Z) corner of the root cell looking
+    // back along the body diagonal.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.8, 2.8, 2.8],
+        [1.8, 1.8, 1.8],
         2,
     )
     .deepened_to(8);
@@ -137,14 +137,14 @@ mod tests {
 
     #[test]
     fn menger_world_dedups_to_one_node_per_level() {
-        // All 20 filled cells at each level share one child → O(depth).
+        // All 7 filled cells at each level share one child -> O(depth).
         let w = menger_world(6);
         assert_eq!(w.library.len(), 6);
     }
 
     #[test]
     fn two_tone_has_same_topology() {
-        // Corner/edge split uses different blocks but SAME kept-cell
+        // Role split uses different blocks but SAME kept-cell
         // set, so tree_depth and library size match uniform Menger.
         let a = menger_world(6);
         let b = menger_world_two_tone(6, 11, 12);

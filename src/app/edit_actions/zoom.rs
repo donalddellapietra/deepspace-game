@@ -37,7 +37,7 @@ impl App {
         let local_cap = if pixels <= FRAME_VISUAL_MIN_PIXELS {
             1
         } else {
-            let extra = (pixels / FRAME_VISUAL_MIN_PIXELS).ln() / 3.0_f32.ln();
+            let extra = (pixels / FRAME_VISUAL_MIN_PIXELS).ln() / 2.0_f32.ln();
             extra.floor().max(1.0) as u32
         };
         local_target
@@ -64,7 +64,7 @@ impl App {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => (
                 self.camera.position.in_frame(&frame.render_path),
-                [1.5, 1.5, 1.5],
+                [1.0, 1.0, 1.0],
                 crate::world::anchor::WORLD_SIZE,
             ),
         };

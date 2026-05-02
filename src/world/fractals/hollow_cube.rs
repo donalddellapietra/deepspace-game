@@ -1,34 +1,26 @@
-//! Hollow cube — 18-cell cube shell (edges + faces, no corners or body).
+//! Hollow cube — 7/8 slots (all except one corner).
 //!
 //! # Structure
 //!
-//! The 18 cells that have at least one coord = 1 **and** at least
-//! one coord ∈ {0, 2}:
+//! In the base-3 tree, the hollow cube kept the 18-cell shell (edges +
+//! faces, no corners or body centre). In a base-2 octree there is no
+//! shell/interior distinction (all 8 slots are corners).
 //!
-//! - 12 edge-midpoints (exactly one coord = 1)
-//! - 6 face-centres (exactly two coords = 1)
-//!
-//! Excluded: 8 cube corners (all coords ∈ {0, 2}) and 1 body centre
-//! (all coords = 1). Each level produces a lace-like shell whose
-//! sub-cells are also hollow cubes — recurses into an increasingly
-//! intricate architectural surface.
-//!
-//! # Source
-//!
-//! No direct PySpace scene. It's a natural complement to Menger
-//! (which keeps corners + edges) and Jerusalem cross (body + faces):
-//! hollow cube keeps edges + faces, giving the third and final
-//! structural partition of the 3×3×3 by "count of centre
-//! coordinates" role.
+//! We use the same 7/8 pattern as the Menger analogue: all slots
+//! except (0,0,0). This gives a cube with one missing corner at every
+//! recursion level — each sub-cube also has its (0,0,0) corner
+//! removed, producing an increasingly intricate lace-like structure.
+//! 7/8 = 87.5% occupancy per level.
 //!
 //! # Coloring
 //!
-//! Two structural roles, steel-architectural palette: faces get a
-//! cooler brushed-metal tone, edges get a warmer polished-brass
-//! tone. The 12:6 edge:face ratio means far-LOD averaging tilts
-//! toward the edge colour (66% brass, 33% steel → warm industrial
-//! average). Consistent with PySpace's `mausoleum` aesthetic but
-//! sharper — no ochre, steel + brass instead.
+//! Two structural roles, steel-architectural palette:
+//! - 3 face-adjacent slots (1 coord nonzero): polished brass
+//! - 4 distant slots (2+ coords nonzero): brushed steel
+//!
+//! The 3:4 face-adjacent:distant ratio means far-LOD averaging tilts
+//! toward the distant colour (57% steel, 43% brass -> cool industrial
+//! average).
 
 use crate::world::anchor::{Path, WorldPos};
 use crate::world::bootstrap::WorldBootstrap;
@@ -38,21 +30,22 @@ use crate::world::state::WorldState;
 use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
 fn hollow_cube_world(depth: u8, face: u16, edge: u16) -> WorldState {
-    let mut slots: Vec<Slot> = Vec::with_capacity(18);
-    for z in 0u8..3 {
-        for y in 0u8..3 {
-            for x in 0u8..3 {
-                let center_axes = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-                // 1 = edge-midpoint, 2 = face-centre. Skip 0 (corner) and 3 (body).
-                match center_axes {
+    let mut slots: Vec<Slot> = Vec::with_capacity(7);
+    for z in 0u8..2 {
+        for y in 0u8..2 {
+            for x in 0u8..2 {
+                if x == 0 && y == 0 && z == 0 { continue; } // omit origin corner
+                let nonzero = (x as u8) + (y as u8) + (z as u8);
+                // 1 nonzero coord = face-adjacent (edge colour = brass)
+                // 2+ nonzero coords = distant (face colour = steel)
+                match nonzero {
                     1 => slots.push((x, y, z, edge)),
-                    2 => slots.push((x, y, z, face)),
-                    _ => {}
+                    _ => slots.push((x, y, z, face)),
                 }
             }
         }
     }
-    debug_assert_eq!(slots.len(), 18, "hollow cube must have 18 slots");
+    debug_assert_eq!(slots.len(), 7, "hollow cube must have 7 slots");
     let mut lib = NodeLibrary::default();
     let root = self_similar_fractal(&mut lib, depth, &slots);
     lib.ref_inc(root);
@@ -70,7 +63,7 @@ pub(crate) fn bootstrap_hollow_cube_world(depth: u8) -> WorldBootstrap {
 
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.8, 2.8, 2.8],
+        [1.8, 1.8, 1.8],
         2,
     )
     .deepened_to(8);
@@ -102,9 +95,9 @@ mod tests {
     }
 
     #[test]
-    fn exactly_18_slots() {
+    fn exactly_7_slots() {
         let w = hollow_cube_world(1, 11, 12);
-        // At depth 1 we have one root node with 18 Block children.
+        // At depth 1 we have one root node with 7 Block children.
         assert_eq!(w.library.len(), 1);
     }
 }

@@ -1,4 +1,4 @@
-//! Symbolic path through the 27-ary tree, plus the kind-aware
+//! Symbolic path through the 8-ary tree (octree), plus the kind-aware
 //! neighbor-stepping primitive that wraps the slot when the parent
 //! is a `WrappedPlane`.
 
@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH};
 
-/// Symbolic path through the 27-ary tree. Exact at any depth; no
+/// Symbolic path through the 8-ary tree. Exact at any depth; no
 /// f32 precision loss.
 #[derive(Clone, Copy)]
 pub struct Path {
@@ -40,7 +40,7 @@ impl Path {
     }
 
     pub fn push(&mut self, slot: u8) {
-        debug_assert!((slot as usize) < 27, "slot must be < 27");
+        debug_assert!((slot as usize) < 8, "slot must be < 8");
         debug_assert!((self.depth as usize) < MAX_DEPTH, "path overflow");
         self.slots[self.depth as usize] = slot;
         self.depth += 1;
@@ -93,7 +93,7 @@ impl Path {
         let (x, y, z) = slot_coords(slot);
         let mut coords = [x, y, z];
         let v = coords[axis] as i32 + direction;
-        if (0..3).contains(&v) {
+        if (0..2).contains(&v) {
             coords[axis] = v as usize;
             self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
             return true;
@@ -103,7 +103,7 @@ impl Path {
             self.depth += 1;
             return false;
         }
-        let wrapped = if direction < 0 { 2 } else { 0 };
+        let wrapped = if direction < 0 { 1 } else { 0 };
         coords[axis] = wrapped;
         let new_slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.slots[self.depth as usize] = new_slot;
@@ -111,26 +111,7 @@ impl Path {
         true
     }
 
-    /// Kind-aware neighbor step. Walks `self` from `world_root` to
-    /// determine the parent NodeKind at each level. On overflow:
-    /// - `NodeKind::Cartesian` parent: bubble up exactly like
-    ///   `step_neighbor_cartesian`.
-    /// - `NodeKind::WrappedPlane { dims, slab_depth }` parent AND the
-    ///   overflow axis is the wrap axis (X = axis 0): wrap the slot's
-    ///   X coord in place (set to 0 on east overflow, 2 on west) so
-    ///   the path stays inside the WrappedPlane subtree. Y / Z still
-    ///   bubble — those axes exit the slab via the normal ribbon-pop
-    ///   path, not the wrap.
-    ///
-    /// Returns `true` iff a wrap fired during this step (caller can
-    /// surface a `Transition::WrappedPlaneWrap`).
-    ///
-    /// **Wrap correctness invariant:** the wrap formula assumes the
-    /// slab fully fills the WrappedPlane node along the wrap axis,
-    /// i.e., `dims[0] == 3^slab_depth`. With dims_x < 3^slab_depth
-    /// the wrap would land mid-slab, which is geometrically wrong;
-    /// callers / worldgen MUST size the slab to fully fill the wrap
-    /// axis.
+    /// Kind-aware neighbor step.
     /// Returns `(stepped_ok, wrap_occurred)`. When `stepped_ok` is
     /// false the path is unchanged (world boundary hit).
     pub fn step_neighbor_in_world(
@@ -143,7 +124,6 @@ impl Path {
         self.step_neighbor_in_world_inner(library, world_root, axis, direction)
     }
 
-    /// Returns `(step_succeeded, wrap_occurred)`.
     fn step_neighbor_in_world_inner(
         &mut self,
         library: &NodeLibrary,
@@ -161,7 +141,7 @@ impl Path {
         let (x, y, z) = slot_coords(slot);
         let mut coords = [x, y, z];
         let v = coords[axis] as i32 + direction;
-        if (0..3).contains(&v) {
+        if (0..2).contains(&v) {
             coords[axis] = v as usize;
             self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
             return (true, false);
@@ -169,7 +149,7 @@ impl Path {
         if axis == 0 {
             if let Some(parent_kind) = node_kind_at_depth(library, world_root, &self.slots[..d]) {
                 if matches!(parent_kind, NodeKind::WrappedPlane { .. }) {
-                    let wrapped = if direction < 0 { 2 } else { 0 };
+                    let wrapped = if direction < 0 { 1 } else { 0 };
                     coords[axis] = wrapped;
                     self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
                     return (true, true);
@@ -182,7 +162,7 @@ impl Path {
             self.depth += 1;
             return (false, false);
         }
-        let wrapped = if direction < 0 { 2 } else { 0 };
+        let wrapped = if direction < 0 { 1 } else { 0 };
         coords[axis] = wrapped;
         let new_slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.slots[self.depth as usize] = new_slot;
@@ -192,10 +172,7 @@ impl Path {
 }
 
 /// Walk the tree from `world_root` along `slots`, returning the
-/// `NodeKind` of the node reached (i.e., the node at tree depth
-/// `slots.len()`). Returns `None` if the walk hits a non-Node child
-/// before consuming all slots, or if a node id is missing from the
-/// library.
+/// `NodeKind` of the node reached.
 fn node_kind_at_depth(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -245,16 +222,9 @@ impl std::fmt::Debug for Path {
 }
 
 /// Event fired when a coordinate primitive crosses a meaningful
-/// boundary. Game-level handlers react (camera up rotation, UI,
-/// etc.); the coordinate math itself is already complete by the
-/// time a transition is reported.
+/// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     None,
-    /// A motion step crossed the wrap axis of a `WrappedPlane`
-    /// ancestor and the path was wrapped (modulo `dims[axis]`)
-    /// rather than bubbled out of the slab subtree. `axis` is the
-    /// world axis that wrapped (0 = x). Phase 2 only wraps on
-    /// axis 0; Y / Z always bubble.
     WrappedPlaneWrap { axis: u8 },
 }

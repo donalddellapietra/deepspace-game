@@ -104,7 +104,7 @@ impl GpuNodeKind {
 }
 
 /// Camera uniforms in shader-frame coords. `pos`/`forward`/etc. are
-/// in the current render frame's local `[0, 3)³` space.
+/// in the current render frame's local `[0, 2)³` space.
 ///
 /// The `jitter_x_px` / `jitter_y_px` slots carry a sub-pixel offset
 /// applied to the NDC coordinates in the ray-march fragment shader.
@@ -132,13 +132,13 @@ pub struct GpuCamera {
 }
 
 /// One entity instance on the GPU: a bounding cube in the current
-/// render frame's [0, 3)³ local coords plus a BFS idx into the
+/// render frame's [0, 2)³ local coords plus a BFS idx into the
 /// shared `tree[]` buffer for the entity's voxel subtree.
 ///
 /// The shader ray-marches against `bbox_min`/`bbox_max`; on AABB
 /// hit it either splats `representative_block` (sub-pixel entity,
 /// skips the whole subtree descent) or transforms the ray into
-/// the subtree's local [0, 3)³ space and calls `march_cartesian`
+/// the subtree's local [0, 2)³ space and calls `march_cartesian`
 /// with a depth budget sized to the entity's on-screen pixel
 /// count. `representative_block` is stored as u32 to keep the
 /// GPU struct 16-byte aligned even though the CPU-side value is

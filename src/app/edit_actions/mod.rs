@@ -54,7 +54,7 @@ impl App {
         let anchor_depth = self.camera.position.anchor.depth();
         let k = anchor_depth.saturating_sub(frame_depth) as i32;
         let k_capped = k.min(MAX_INTERACTION_K_BELOW_FRAME);
-        let anchor_cell_size_in_frame = 3.0_f32.powi(1 - k_capped);
+        let anchor_cell_size_in_frame = 2.0_f32.powi(1 - k_capped);
         self.interaction_radius_cells as f32 * anchor_cell_size_in_frame
     }
 
@@ -98,9 +98,9 @@ impl App {
                 if let Some(frame_node) = self.world.library.get(self.active_frame.node_id) {
                     if let crate::world::tree::NodeKind::TangentBlock { rotation } = frame_node.kind {
                         let centered = [
-                            cam_local[0] - 1.5,
-                            cam_local[1] - 1.5,
-                            cam_local[2] - 1.5,
+                            cam_local[0] - 1.0,
+                            cam_local[1] - 1.0,
+                            cam_local[2] - 1.0,
                         ];
                         cam_local = [
                             1.5 + rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2],

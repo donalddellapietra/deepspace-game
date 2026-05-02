@@ -1,4 +1,4 @@
-//! Mausoleum — Menger sponge with authentic PySpace orbit-trap ochre.
+//! Mausoleum — Menger analogue with authentic PySpace orbit-trap ochre.
 //!
 //! # Source
 //!
@@ -10,16 +10,17 @@
 //!     obj.add(FoldBox(0.34))
 //!     obj.add(FoldMenger())
 //!     obj.add(FoldScaleTranslate(3.28, (-5.27, -0.34, 0.0)))
-//!     obj.add(FoldRotateX(π/2))
+//!     obj.add(FoldRotateX(pi/2))
 //!     obj.add(OrbitMax((0.42, 0.38, 0.19)))
 //! obj.add(Box(2.0, color='orbit'))
 //! ```
 //!
-//! Structurally it's a `FoldMenger` + scale (≈3.28) + rotation stack:
-//! close enough to a pure Menger sponge that the trinary-native 20/27
-//! mapping is the best available voxel adaptation. The `π/2`
-//! `FoldRotateX` re-indexes axes without breaking the base-3 lattice;
-//! the `FoldBox(0.34)` is a continuous clip we can't reproduce.
+//! # Structure
+//!
+//! Same 7/8 hollow-cube geometry as the base-2 Menger analogue: all
+//! slots except (0,0,0) are filled. The structural roles are:
+//! - 3 face-adjacent slots (highlight)
+//! - 4 distant slots (rod)
 //!
 //! # Coloring — the authentic orbit trap
 //!
@@ -28,13 +29,12 @@
 //! scaled by `(0.42, 0.38, 0.19)`, clamped to `[0, 1]` in the shader.
 //! Because the R/G/B scales are biased warm (0.42 > 0.38 >> 0.19),
 //! the output is **warm ochre gradient**: R saturates fastest, G
-//! close behind, B stays damped → gold → dark-amber.
+//! close behind, B stays damped -> gold -> dark-amber.
 //!
 //! In a voxel tree we can't compute a live orbit, but we can sample
 //! two representative points on the curve and paint the two
-//! structural roles of the Menger sponge (corners vs. edge-midpoints)
-//! with them. The result is a static Menger whose palette evokes
-//! the mausoleum's orbit-trap aesthetic at every zoom level.
+//! structural roles with them. The result is a static fractal whose
+//! palette evokes the mausoleum's orbit-trap aesthetic at every zoom.
 //!
 //! Color choices below are the *direct* RGB you get from
 //! `(0.42, 0.38, 0.19) * orbit` at orbit magnitudes 1.0 (deep rod)
@@ -47,16 +47,17 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
-/// 8 corners get highlight, 12 edge-midpoints get rod. Same geometry
-/// as `menger::menger_world` but with role-coloring swapped in.
+/// 7/8 slots: all except (0,0,0). Face-adjacent slots get highlight,
+/// distant slots get rod. Same geometry as `menger` but with
+/// role-coloring swapped in.
 fn mausoleum_world(depth: u8, corner_highlight: u16, edge_rod: u16) -> WorldState {
-    let mut slots: Vec<Slot> = Vec::with_capacity(20);
-    for z in 0u8..3 {
-        for y in 0u8..3 {
-            for x in 0u8..3 {
-                let center_axes = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-                if center_axes >= 2 { continue; } // Menger kept-set
-                let block = if center_axes == 0 { corner_highlight } else { edge_rod };
+    let mut slots: Vec<Slot> = Vec::with_capacity(7);
+    for z in 0u8..2 {
+        for y in 0u8..2 {
+            for x in 0u8..2 {
+                if x == 0 && y == 0 && z == 0 { continue; } // omit (0,0,0)
+                let nonzero = (x as u8) + (y as u8) + (z as u8);
+                let block = if nonzero == 1 { corner_highlight } else { edge_rod };
                 slots.push((x, y, z, block));
             }
         }
@@ -70,10 +71,10 @@ fn mausoleum_world(depth: u8, corner_highlight: u16, edge_rod: u16) -> WorldStat
 pub(crate) fn bootstrap_mausoleum_world(depth: u8) -> WorldBootstrap {
     let depth = depth.min(MAX_DEPTH as u8);
 
-    // Authentic orbit-trap RGB. `OrbitMax((0.42, 0.38, 0.19))` × 1.0
-    // → (107, 97, 48) dark ochre "rod"; × 2.0 (clamped to 1.0 for R/G)
-    // → (214, 194, 97) → we choose the mid-orbit sample at magnitude
-    // ≈1.75 → (178, 161, 81) "highlight" which matches the typical
+    // Authentic orbit-trap RGB. `OrbitMax((0.42, 0.38, 0.19))` x 1.0
+    // -> (107, 97, 48) dark ochre "rod"; x 2.0 (clamped to 1.0 for R/G)
+    // -> (214, 194, 97) -> we choose the mid-orbit sample at magnitude
+    // ~1.75 -> (178, 161, 81) "highlight" which matches the typical
     // bright-side appearance of the original render.
     let mut registry = ColorRegistry::new();
     let corner_highlight = registry.register(178, 161, 81, 255).unwrap();
@@ -83,7 +84,7 @@ pub(crate) fn bootstrap_mausoleum_world(depth: u8) -> WorldBootstrap {
 
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.8, 2.8, 2.8],
+        [1.8, 1.8, 1.8],
         2,
     )
     .deepened_to(8);
@@ -110,7 +111,7 @@ mod tests {
 
     #[test]
     fn mausoleum_dedup() {
-        // Same kept-set as Menger → same O(depth) topology.
+        // Same kept-set as Menger analogue -> same O(depth) topology.
         let w = mausoleum_world(6, 11, 12);
         assert_eq!(w.library.len(), 6);
     }

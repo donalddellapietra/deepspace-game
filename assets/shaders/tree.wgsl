@@ -6,7 +6,7 @@
 //
 // Storage layout (see bindings.wgsl for the full spec):
 //
-// - `tree[header_off + 0]` = occupancy bitmask (low 27 bits).
+// - `tree[header_off + 0]` = occupancy bitmask (low 8 bits).
 // - `tree[header_off + 1]` = first_child_offset in tree[] u32 units.
 // - `tree[first_child + rank*2 + 0]` = packed tag|block_type|pad.
 // - `tree[first_child + rank*2 + 1]` = BFS node_index (if tag==2).
@@ -58,5 +58,5 @@ fn child_tag(packed: u32) -> u32 { return packed & 0xFFu; }
 fn child_block_type(packed: u32) -> u32 { return (packed >> 8u) & 0xFFFFu; }
 
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
-    return u32(z * 9 + y * 3 + x);
+    return u32(z * 4 + y * 2 + x);
 }

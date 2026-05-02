@@ -20,10 +20,10 @@ fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: v
     );
 }
 
-fn pow3_u(exp: u32) -> f32 {
+fn pow2_u(exp: u32) -> f32 {
     var scale = 1.0;
     for (var i: u32 = 0u; i < exp; i = i + 1u) {
-        scale = scale * 3.0;
+        scale = scale * 2.0;
     }
     return scale;
 }

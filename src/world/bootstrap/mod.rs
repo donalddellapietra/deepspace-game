@@ -42,7 +42,7 @@ pub enum WorldPreset {
     Menger,
     /// Sierpinski tetrahedron — 4 tetrahedral corners per level
     /// (trinary adaptation of PySpace's `FoldSierpinski + FoldScale(2)`).
-    /// Very sparse: 4/27 cells filled.
+    /// Very sparse: 4/8 cells filled.
     SierpinskiTet,
     /// Cantor dust in 3D — 8 corner cells per level (all coords ∈
     /// {0, 2}). The canonical ternary set extended to three dimensions.

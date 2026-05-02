@@ -44,7 +44,7 @@ mod tests {
         let depth = w.tree_depth();
         assert_eq!(depth as usize, TARGET_DEPTH);
         // Every point in the world box should read as empty.
-        for &p in &[[0.5, 0.5, 0.5], [1.5, 1.5, 1.5], [2.5, 2.5, 2.5]] {
+        for &p in &[[0.5, 0.5, 0.5], [1.0, 1.0, 1.0], [1.5, 1.5, 1.5]] {
             assert!(!raycast::is_solid_at(&w.library, w.root, p, depth),
                 "expected empty at {:?}", p);
         }

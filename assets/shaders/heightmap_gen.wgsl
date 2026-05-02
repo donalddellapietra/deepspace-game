@@ -1,14 +1,14 @@
 // GPU heightmap generation.
 //
-// Per texel (u, v) in a 3^d × 3^d grid, walks the voxel tree rooted
+// Per texel (u, v) in a 2^d × 2^d grid, walks the voxel tree rooted
 // at `uniforms.frame_root_bfs` and writes the world-Y of the top of
 // the highest solid collision cell into the heightmap texture.
 //
 // Collision depth = frame_depth + d. Every texel is EXACTLY one
-// collision cell projected to the XZ plane (base-3 alignment), so
+// collision cell projected to the XZ plane (base-2 alignment), so
 // there's no fractional mapping between texel coords and cell coords.
 //
-// Workgroup shape 9×9 (81 threads): divides every base-3 heightmap
+// Workgroup shape 9×9 (81 threads): divides every base-2 heightmap
 // size (27, 81, 243, 729, 2187) with no idle threads. Well under
 // the 1024-threads/workgroup limit on Apple silicon.
 //
@@ -18,7 +18,7 @@
 //   If it's a Block or we've reached collision_depth, return its
 //   top-Y. Otherwise descend into it and repeat one level deeper.
 //
-// This is an O(d) tree walk per texel — total work is 3^(2d) × d
+// This is an O(d) tree walk per texel — total work is 2^(2d) × d
 // DDA-like steps. For d=5 (243² = 59k texels) that's ~300k tree
 // reads.
 
@@ -28,7 +28,7 @@ struct HeightmapUniforms {
     /// Depth of the frame root in the world tree. Documentation
     /// only — the compute doesn't consume it.
     frame_depth: u32,
-    /// Heightmap resolution = 3^delta per axis.
+    /// Heightmap resolution = 2^delta per axis.
     side: u32,
     /// Recursion depth = collision_depth - frame_depth.
     delta: u32,
@@ -85,7 +85,7 @@ fn child_tag(packed: u32) -> u32 { return packed & 0xFFu; }
 fn child_block_type(packed: u32) -> u32 { return (packed >> 8u) & 0xFFu; }
 
 fn slot_from_xyz(x: u32, y: u32, z: u32) -> u32 {
-    return z * 9u + y * 3u + x;
+    return z * 4u + y * 2u + x;
 }
 
 /// Empty-subtree sentinel. A Node whose `representative_block`
@@ -124,7 +124,7 @@ fn find_column_top(u: u32, v: u32) -> f32 {
     node_stack[0] = hm_uniforms.frame_root_bfs;
     y_origin_stack[0] = hm_uniforms.y_origin;
     cell_size_stack[0] = hm_uniforms.y_size;
-    next_y_stack[0] = 2;
+    next_y_stack[0] = 1;
     sp = 1;
 
     // Bounded loop — every iteration either descends (sp+1) or
@@ -149,10 +149,10 @@ fn find_column_top(u: u32, v: u32) -> f32 {
         let digit_idx: u32 = hm_uniforms.delta - depth - 1u;
         var divisor: u32 = 1u;
         for (var k: u32 = 0u; k < digit_idx; k = k + 1u) {
-            divisor = divisor * 3u;
+            divisor = divisor * 2u;
         }
-        let x_slot: u32 = (u / divisor) % 3u;
-        let z_slot: u32 = (v / divisor) % 3u;
+        let x_slot: u32 = (u / divisor) % 2u;
+        let z_slot: u32 = (v / divisor) % 2u;
 
         let slot = slot_from_xyz(x_slot, u32(y_slot), z_slot);
         let packed = child_packed(node_stack[top], slot);
@@ -164,7 +164,7 @@ fn find_column_top(u: u32, v: u32) -> f32 {
             continue;
         }
 
-        let child_size = cell_size_stack[top] / 3.0;
+        let child_size = cell_size_stack[top] / 2.0;
         let child_y_origin = y_origin_stack[top] + f32(y_slot) * child_size;
         let child_top_y = child_y_origin + child_size;
 
@@ -192,7 +192,7 @@ fn find_column_top(u: u32, v: u32) -> f32 {
             node_stack[sp] = child_node;
             y_origin_stack[sp] = child_y_origin;
             cell_size_stack[sp] = child_size;
-            next_y_stack[sp] = 2;
+            next_y_stack[sp] = 1;
             sp = sp + 1;
             continue;
         }
@@ -201,7 +201,7 @@ fn find_column_top(u: u32, v: u32) -> f32 {
     return GROUND_NONE;
 }
 
-@compute @workgroup_size(9, 9, 1)
+@compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let u = gid.x;
     let v = gid.y;

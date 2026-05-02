@@ -23,7 +23,7 @@ fn unpack_cell(p: u32) -> vec3<i32> {
     );
 }
 
-// Conservative 27-bit "path mask" — the tensor product of per-axis
+// Conservative 8-bit "path mask" — the tensor product of per-axis
 // 3-bit masks of cells reachable from `entry_cell` moving in `step`
 // direction. Over-approximates the actual ray path (any axis-wise
 // reachable cell triple, not only the specific 3D path the ray
@@ -33,16 +33,16 @@ fn unpack_cell(p: u32) -> vec3<i32> {
 // traversal.
 fn path_mask_conservative(entry_cell: vec3<i32>, step: vec3<i32>) -> u32 {
     let ec = vec3<u32>(
-        u32(clamp(entry_cell.x, 0, 2)),
-        u32(clamp(entry_cell.y, 0, 2)),
-        u32(clamp(entry_cell.z, 0, 2)),
+        u32(clamp(entry_cell.x, 0, 1)),
+        u32(clamp(entry_cell.y, 0, 1)),
+        u32(clamp(entry_cell.z, 0, 1)),
     );
     // Per-axis 3-bit mask. step > 0: bits [ec..2]; step < 0: bits
     // [0..ec]. step is always ±1 in march_cartesian (non-zero).
     let mx: u32 = select((1u << (ec.x + 1u)) - 1u, (7u << ec.x) & 7u, step.x > 0);
     let my: u32 = select((1u << (ec.y + 1u)) - 1u, (7u << ec.y) & 7u, step.y > 0);
     let mz: u32 = select((1u << (ec.z + 1u)) - 1u, (7u << ec.z) & 7u, step.z > 0);
-    // Smear each 3-bit axis mask into its 27-bit "axis active"
+    // Smear each 3-bit axis mask into its 8-bit "axis active"
     // pattern. x repeats stride-3 (bits 0,3,6,...); y expands to a
     // 9-bit xy-plane then repeats stride-9; z gates whole 9-bit
     // planes. Closed-form — no loops, no lookups.
@@ -61,7 +61,7 @@ fn path_mask_conservative(entry_cell: vec3<i32>, step: vec3<i32>) -> u32 {
 // subtree — no sphere/face/ribbon dispatch, no AABB side-buffer,
 // no beam-prepass coupling. Called from `march_cartesian`'s tag==3
 // branch after the ray has been transformed into the entity's
-// `[0, 3)³` local frame. WGSL's no-recursion rule forces this to
+// `[0, 2)³` local frame. WGSL's no-recursion rule forces this to
 // be a separate function rather than a re-entrant call to
 // `march_cartesian`.
 //
@@ -156,16 +156,16 @@ fn march_entity_subtree(
     var cur_occupancy: u32 = tree[root_header_off];
     var cur_first_child: u32 = tree[root_header_off + 1u];
 
-    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(2.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
     }
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
     let entry_cell = vec3<i32>(
-        clamp(i32(floor(entry_pos.x)), 0, 2),
-        clamp(i32(floor(entry_pos.y)), 0, 2),
-        clamp(i32(floor(entry_pos.z)), 0, 2),
+        clamp(i32(floor(entry_pos.x)), 0, 1),
+        clamp(i32(floor(entry_pos.y)), 0, 1),
+        clamp(i32(floor(entry_pos.z)), 0, 1),
     );
     s_cell[0] = pack_cell(entry_cell);
     let cell_f = vec3<f32>(entry_cell);
@@ -184,10 +184,10 @@ fn march_entity_subtree(
         if iterations >= max_iterations { break; }
         iterations += 1u;
         let cell = unpack_cell(s_cell[depth]);
-        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
+        if cell.x < 0 || cell.x > 1 || cell.y < 0 || cell.y > 1 || cell.z < 0 || cell.z > 1 {
             if depth == 0u { break; }
             depth -= 1u;
-            cur_cell_size = cur_cell_size * 3.0;
+            cur_cell_size = cur_cell_size * 2.0;
             let popped = unpack_cell(s_cell[depth]);
             cur_node_origin = cur_node_origin - vec3<f32>(popped) * cur_cell_size;
             let lc_pop = vec3<f32>(popped);
@@ -257,7 +257,7 @@ fn march_entity_subtree(
         }
 
         let at_max = depth + 1u >= MAX_STACK_DEPTH;
-        let child_cell_size = cur_cell_size / 3.0;
+        let child_cell_size = cur_cell_size / 2.0;
         let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
         let ray_dist = max(min_side * ray_metric, 0.001);
         let lod_pixels = child_cell_size / ray_dist
@@ -295,9 +295,9 @@ fn march_entity_subtree(
             cur_occupancy = tree[child_header_off];
             cur_first_child = tree[child_header_off + 1u];
             let child_cell_i = vec3<i32>(
-                clamp(i32(floor(local_entry.x)), 0, 2),
-                clamp(i32(floor(local_entry.y)), 0, 2),
-                clamp(i32(floor(local_entry.z)), 0, 2),
+                clamp(i32(floor(local_entry.x)), 0, 1),
+                clamp(i32(floor(local_entry.y)), 0, 1),
+                clamp(i32(floor(local_entry.z)), 0, 1),
             );
             s_cell[depth] = pack_cell(child_cell_i);
             let lc = vec3<f32>(child_cell_i);
@@ -315,7 +315,7 @@ fn march_entity_subtree(
 }
 
 // Cartesian DDA in a single frame rooted at `root_node_idx`. The
-// frame's cell spans `[0, 3)³` in `ray_origin/ray_dir` coords.
+// frame's cell spans `[0, 2)³` in `ray_origin/ray_dir` coords.
 // Returns hit on cell terminal; on miss (ray exits the frame),
 // returns hit=false so the caller can pop to the ancestor ribbon.
 //
@@ -362,7 +362,7 @@ fn march_cartesian(
     // pre-pack vec3<i32>×8). See pack_cell / unpack_cell above.
     var s_cell: array<u32, MAX_STACK_DEPTH>;
 
-    // Current-depth cell size. Pure function of `depth` (1/3^depth), so
+    // Current-depth cell size. Pure function of `depth` (1/2^depth), so
     // a scalar mutated on push (÷3) / pop (×3) is exactly equivalent
     // to a per-depth array. Saves ~20 B of per-thread state.
     var cur_cell_size: f32 = 1.0;
@@ -422,7 +422,7 @@ fn march_cartesian(
         ray_loads_tree = ray_loads_tree + 2u;
     }
 
-    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(2.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
     }
@@ -434,9 +434,9 @@ fn march_cartesian(
     var entry_pos: vec3<f32> = ray_origin + ray_dir * t_start;
 
     let root_cell = vec3<i32>(
-        clamp(i32(floor(entry_pos.x)), 0, 2),
-        clamp(i32(floor(entry_pos.y)), 0, 2),
-        clamp(i32(floor(entry_pos.z)), 0, 2),
+        clamp(i32(floor(entry_pos.x)), 0, 1),
+        clamp(i32(floor(entry_pos.y)), 0, 1),
+        clamp(i32(floor(entry_pos.z)), 0, 1),
     );
     s_cell[0] = pack_cell(root_cell);
     let cell_f = vec3<f32>(root_cell);
@@ -459,12 +459,12 @@ fn march_cartesian(
 
         let cell = unpack_cell(s_cell[depth]);
 
-        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
+        if cell.x < 0 || cell.x > 1 || cell.y < 0 || cell.y > 1 || cell.z < 0 || cell.z > 1 {
             // Phase 2 X-wrap: at depth==0 inside a WrappedPlane root
             // frame, an X-only OOB wraps the ray instead of returning
             // miss. Y / Z OOB and depth>0 OOB take the existing
             // ribbon-pop / break path. The wrap shift is in slab-root
-            // local units (`[0, 3)` frame), so f32 magnitudes stay
+            // local units (`[0, 2)` frame), so f32 magnitudes stay
             // bounded — same precision discipline as the descent /
             // ribbon-pop math.
             //
@@ -475,7 +475,7 @@ fn march_cartesian(
             // camera is OUTSIDE a slab the render frame is Cartesian
             // (root_kind != WRAPPED_PLANE), so this branch can't fire
             // in that case — wrap stays scoped to inside-slab views.
-            let x_oob = cell.x < 0 || cell.x > 2;
+            let x_oob = cell.x < 0 || cell.x > 1;
             let yz_in = cell.y >= 0 && cell.y <= 2
                      && cell.z >= 0 && cell.z <= 2;
             if depth == 0u
@@ -483,17 +483,17 @@ fn march_cartesian(
                 && x_oob && yz_in
             {
                 // Slab-root local cell size at the slab leaf level:
-                // the WrappedPlane node spans `[0, 3)` and contains
-                // `3^slab_depth` cells per axis. The wrap shift is
+                // the WrappedPlane node spans `[0, 2)` and contains
+                // `2^slab_depth` cells per axis. The wrap shift is
                 // `dims_x * cell_size_at_slab_depth`. With Phase 2's
-                // invariant `dims_x == 3^slab_depth`, this evaluates
+                // invariant `dims_x == 2^slab_depth`, this evaluates
                 // to exactly 3.0 — i.e., the full WrappedPlane node
                 // width. East OOB → shift west; west OOB → shift east.
                 let dims_x = uniforms.slab_dims.x;
                 let slab_depth_u = uniforms.slab_dims.w;
-                let cell_size_slab = 3.0 / pow(3.0, f32(slab_depth_u));
+                let cell_size_slab = 2.0 / pow(2.0, f32(slab_depth_u));
                 let wrap_shift = f32(dims_x) * cell_size_slab;
-                let east_oob = cell.x > 2;
+                let east_oob = cell.x > 1;
                 let sign = select(1.0, -1.0, east_oob);
                 ray_origin.x = ray_origin.x + sign * wrap_shift;
 
@@ -503,7 +503,7 @@ fn march_cartesian(
                 // — only the entry point changes.
                 let new_root_hit = ray_box(
                     ray_origin, inv_dir,
-                    vec3<f32>(0.0), vec3<f32>(3.0),
+                    vec3<f32>(0.0), vec3<f32>(2.0),
                 );
                 if new_root_hit.t_enter >= new_root_hit.t_exit
                     || new_root_hit.t_exit < 0.0
@@ -517,9 +517,9 @@ fn march_cartesian(
                 let new_t_start = max(new_root_hit.t_enter, 0.0) + 0.001;
                 entry_pos = ray_origin + ray_dir * new_t_start;
                 let new_root_cell = vec3<i32>(
-                    clamp(i32(floor(entry_pos.x)), 0, 2),
-                    clamp(i32(floor(entry_pos.y)), 0, 2),
-                    clamp(i32(floor(entry_pos.z)), 0, 2),
+                    clamp(i32(floor(entry_pos.x)), 0, 1),
+                    clamp(i32(floor(entry_pos.y)), 0, 1),
+                    clamp(i32(floor(entry_pos.z)), 0, 1),
                 );
                 s_cell[0] = pack_cell(new_root_cell);
                 let cf_w = vec3<f32>(new_root_cell);
@@ -536,7 +536,7 @@ fn march_cartesian(
             }
             if depth == 0u { break; }
             depth -= 1u;
-            cur_cell_size = cur_cell_size * 3.0;
+            cur_cell_size = cur_cell_size * 2.0;
             let parent_cell = unpack_cell(s_cell[depth]);
             cur_node_origin = cur_node_origin - vec3<f32>(parent_cell) * cur_cell_size;
             let lc_pop = vec3<f32>(parent_cell);
@@ -681,15 +681,15 @@ fn march_cartesian(
                 continue;
             }
 
-            // Transform ray into the entity subtree's [0, 3)³
+            // Transform ray into the entity subtree's [0, 2)³
             // local frame and descend. WGSL's no-recursion rule
             // forces a separate `march_entity_subtree` walker.
-            let scale3 = vec3<f32>(3.0) / bbox_size;
+            let scale3 = vec3<f32>(2.0) / bbox_size;
             let local_origin = (ray_origin - entity.bbox_min) * scale3;
             let local_dir = ray_dir * scale3;
             let sub = march_entity_subtree(entity.subtree_bfs, local_origin, local_dir);
             if sub.hit {
-                let size_over_3 = bbox_size * (1.0 / 3.0);
+                let size_over_3 = bbox_size * (1.0 / 2.0);
                 result.hit = true;
                 // Entity is cubic, scale3.x == y == z; pick any axis.
                 result.t = sub.t / scale3.x;
@@ -717,7 +717,7 @@ fn march_cartesian(
             // same packed node. Checked BEFORE the kind lookup so a
             // ribbon-pop landing on a sphere-body slot doesn't
             // re-dispatch the sphere DDA we already traversed.
-            let cell_slot = u32(cell.x) + u32(cell.y) * 3u + u32(cell.z) * 9u;
+            let cell_slot = u32(cell.x) + u32(cell.y) * 2u + u32(cell.z) * 4u;
             if depth == 0u && cell_slot == skip_slot {
                 let m_skip = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_skip) * step);
@@ -752,16 +752,16 @@ fn march_cartesian(
             }
 
             // TangentBlock dispatch — frame-local rotation around the
-            // cube's geometric centre (1.5, 1.5, 1.5). NO world-space
+            // cube's geometric centre (1.0, 1.0, 1.0). NO world-space
             // coordinates: the ray is re-expressed in the child's
-            // [0, 3)³ via (ray_origin - child_origin) / cur_cell_size,
+            // [0, 2)³ via (ray_origin - child_origin) / cur_cell_size,
             // then rotated by the stored R^T around the cube centre.
             // On hit, normal is rotated back via R · local_normal.
             if node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
                 let child_origin_tb = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
                 // Scale maps the slot's parent extent (size cur_cell_size)
-                // into the child's [0, 3)³ local frame: 3 / cur_cell_size.
-                let scale = 3.0 / cur_cell_size;
+                // into the child's [0, 2)³ local frame: 3 / cur_cell_size.
+                let scale = 2.0 / cur_cell_size;
                 let local_pre_origin = (ray_origin - child_origin_tb) * scale;
                 let local_pre_dir = ray_dir * scale;
                 // Stored rotation R has columns rc0/rc1/rc2.
@@ -769,13 +769,13 @@ fn march_cartesian(
                 let rc0 = node_kinds[child_idx].rot_col0.xyz;
                 let rc1 = node_kinds[child_idx].rot_col1.xyz;
                 let rc2 = node_kinds[child_idx].rot_col2.xyz;
-                let centered = local_pre_origin - vec3<f32>(1.5);
+                let centered = local_pre_origin - vec3<f32>(1.0);
                 let rotated = vec3<f32>(
                     dot(rc0, centered),
                     dot(rc1, centered),
                     dot(rc2, centered),
                 );
-                let local_origin = rotated + vec3<f32>(1.5);
+                let local_origin = rotated + vec3<f32>(1.0);
                 let local_dir = vec3<f32>(
                     dot(rc0, local_pre_dir),
                     dot(rc1, local_pre_dir),
@@ -820,7 +820,7 @@ fn march_cartesian(
             // depth_limit = MAX_STACK_DEPTH — LOD controls the
             // effective depth, not an artificial per-shell budget.
             let at_max = depth + 1u > depth_limit || depth + 1u >= MAX_STACK_DEPTH;
-            let child_cell_size = cur_cell_size / 3.0;
+            let child_cell_size = cur_cell_size / 2.0;
             let cell_world_size = child_cell_size;
             let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
             let ray_dist = max(min_side * ray_metric, 0.001);
@@ -877,7 +877,7 @@ fn march_cartesian(
                 //
                 // aabb_bits == 0 is a degenerate case (empty subtree
                 // edge cases during pack); treat it as the full
-                // [0, 3)^3 so behavior matches the pre-AABB code.
+                // [0, 2)^3 so behavior matches the pre-AABB code.
                 let aabb_bits = aabbs[child_idx] & 0xFFFu;
                 let has_aabb = aabb_bits != 0u;
                 let amin = select(
@@ -890,7 +890,7 @@ fn march_cartesian(
                     has_aabb,
                 );
                 let amax = select(
-                    vec3<f32>(3.0),
+                    vec3<f32>(2.0),
                     vec3<f32>(
                         f32(((aabb_bits >> 6u) & 3u) + 1u),
                         f32(((aabb_bits >> 8u) & 3u) + 1u),
@@ -932,7 +932,7 @@ fn march_cartesian(
                 let node_hit = ray_box(
                     ray_origin, inv_dir,
                     child_origin,
-                    child_origin + vec3<f32>(3.0) * child_cell_size,
+                    child_origin + vec3<f32>(2.0) * child_cell_size,
                 );
                 let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
                 let child_entry = ray_origin + ray_dir * ct_start;
@@ -968,7 +968,7 @@ fn march_cartesian(
                 // OOB pop fires (slab Y is bounded, no Y-wrap) and
                 // the ray escapes to sky.
                 //
-                // R for the slab: with dims_x = 3^slab_depth (the
+                // R for the slab: with dims_x = 2^slab_depth (the
                 // fully-fills-X invariant), slab X extent in frame
                 // units = 3.0, so R_frame = 3.0 / (2π) ≈ 0.477.
                 // Hardcoded for now; if curvature is meaningful only
@@ -1025,9 +1025,9 @@ fn march_cartesian(
                     ray_loads_tree = ray_loads_tree + 2u;
                 }
                 let new_cell = vec3<i32>(
-                    clamp(i32(floor(local_entry.x)), 0, 2),
-                    clamp(i32(floor(local_entry.y)), 0, 2),
-                    clamp(i32(floor(local_entry.z)), 0, 2),
+                    clamp(i32(floor(local_entry.x)), 0, 1),
+                    clamp(i32(floor(local_entry.y)), 0, 1),
+                    clamp(i32(floor(local_entry.z)), 0, 1),
                 );
                 s_cell[depth] = pack_cell(new_cell);
                 let lc = vec3<f32>(new_cell);
@@ -1075,8 +1075,8 @@ struct SlabSample {
 
 // Phase 3 REVISED Step A.1 — sample the slab tree at (cx, cy, cz).
 //
-// Walks `slab_depth` levels of 27-children Cartesian descent. At
-// each level: integer-divide the cell coords by `3^(remaining_levels)`
+// Walks `slab_depth` levels of 8-children Cartesian descent. At
+// each level: integer-divide the cell coords by `2^(remaining_levels)`
 // to get the slot index, look up the slab tree's child entry there.
 // At tag=1 (uniform-flatten Block leaf) → return that material.
 // At tag=2 (non-uniform Node) at the LAST level → return its
@@ -1095,13 +1095,13 @@ fn sample_slab_cell(
     var idx = slab_root_idx;
     var cells_per_slot: i32 = 1;
     for (var k: u32 = 1u; k < slab_depth; k = k + 1u) {
-        cells_per_slot = cells_per_slot * 3;
+        cells_per_slot = cells_per_slot * 2;
     }
     for (var level: u32 = 0u; level < slab_depth; level = level + 1u) {
-        let sx = (cx / cells_per_slot) % 3;
-        let sy = (cy / cells_per_slot) % 3;
-        let sz = (cz / cells_per_slot) % 3;
-        let slot = u32(sx + sy * 3 + sz * 9);
+        let sx = (cx / cells_per_slot) % 2;
+        let sy = (cy / cells_per_slot) % 2;
+        let sz = (cz / cells_per_slot) % 2;
+        let slot = u32(sx + sy * 2 + sz * 4);
 
         let header_off = node_offsets[idx];
         let occ = tree[header_off];
@@ -1132,13 +1132,13 @@ fn sample_slab_cell(
         } else {
             return out;
         }
-        cells_per_slot = cells_per_slot / 3;
+        cells_per_slot = cells_per_slot / 2;
     }
     return out;
 }
 
 // Tangent-cube DDA. Used by `march_wrapped_planet` after the ray has
-// been transformed into a slab cell's local `[0, 3)³` frame.
+// been transformed into a slab cell's local `[0, 2)³` frame.
 //
 // Mirrors `march_cartesian`'s core stack-based DDA but with a
 // deeper stack to accommodate `cell_subtree_depth` without LOD-
@@ -1190,7 +1190,7 @@ fn march_in_tangent_cube(
     var cur_occupancy: u32 = tree[root_header_off];
     var cur_first_child: u32 = tree[root_header_off + 1u];
 
-    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(2.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
     }
@@ -1198,9 +1198,9 @@ fn march_in_tangent_cube(
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
     let root_cell = vec3<i32>(
-        clamp(i32(floor(entry_pos.x)), 0, 2),
-        clamp(i32(floor(entry_pos.y)), 0, 2),
-        clamp(i32(floor(entry_pos.z)), 0, 2),
+        clamp(i32(floor(entry_pos.x)), 0, 1),
+        clamp(i32(floor(entry_pos.y)), 0, 1),
+        clamp(i32(floor(entry_pos.z)), 0, 1),
     );
     s_cell[0] = pack_cell(root_cell);
     let cell_f = vec3<f32>(root_cell);
@@ -1220,10 +1220,10 @@ fn march_in_tangent_cube(
 
         let cell = unpack_cell(s_cell[depth]);
 
-        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
+        if cell.x < 0 || cell.x > 1 || cell.y < 0 || cell.y > 1 || cell.z < 0 || cell.z > 1 {
             if depth == 0u { break; }
             depth = depth - 1u;
-            cur_cell_size = cur_cell_size * 3.0;
+            cur_cell_size = cur_cell_size * 2.0;
             let parent_cell = unpack_cell(s_cell[depth]);
             cur_node_origin = cur_node_origin - vec3<f32>(parent_cell) * cur_cell_size;
             let lc_pop = vec3<f32>(parent_cell);
@@ -1247,7 +1247,7 @@ fn march_in_tangent_cube(
             continue;
         }
 
-        let slot = u32(cell.x + cell.y * 3 + cell.z * 9);
+        let slot = u32(cell.x + cell.y * 2 + cell.z * 4);
         let slot_bit = 1u << slot;
         if (cur_occupancy & slot_bit) == 0u {
             let m_empty = min_axis_mask(cur_side_dist);
@@ -1318,11 +1318,11 @@ fn march_in_tangent_cube(
         // Descend into the Node child. Use NODE box (not the AABB)
         // for entry trim — same reasoning as march_cartesian.
         let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-        let child_cell_size = cur_cell_size / 3.0;
+        let child_cell_size = cur_cell_size / 2.0;
         let node_hit = ray_box(
             ray_origin, inv_dir,
             child_origin,
-            child_origin + vec3<f32>(3.0) * child_cell_size,
+            child_origin + vec3<f32>(2.0) * child_cell_size,
         );
         let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
         let child_entry = ray_origin + ray_dir * ct_start;
@@ -1341,9 +1341,9 @@ fn march_in_tangent_cube(
         cur_first_child = tree[child_header_off + 1u];
 
         let new_cell = vec3<i32>(
-            clamp(i32(floor(local_entry.x)), 0, 2),
-            clamp(i32(floor(local_entry.y)), 0, 2),
-            clamp(i32(floor(local_entry.z)), 0, 2),
+            clamp(i32(floor(local_entry.x)), 0, 1),
+            clamp(i32(floor(local_entry.y)), 0, 1),
+            clamp(i32(floor(local_entry.z)), 0, 1),
         );
         s_cell[depth] = pack_cell(new_cell);
         let lc = vec3<f32>(new_cell);
@@ -1491,12 +1491,12 @@ fn march_wrapped_planet(
             cs_center, r_sphere, lat_max,
             lon_step, lat_step, r_step, r_inner,
         );
-        let scale = 3.0 / cube.side;
+        let scale = 2.0 / cube.side;
         let d_origin = ray_origin - cube.origin_w;
         let local_origin = vec3<f32>(
-            dot(cube.east_w, d_origin) * scale + 1.5,
-            dot(cube.normal_w, d_origin) * scale + 1.5,
-            dot(cube.north_w, d_origin) * scale + 1.5,
+            dot(cube.east_w, d_origin) * scale + 1.0,
+            dot(cube.normal_w, d_origin) * scale + 1.0,
+            dot(cube.north_w, d_origin) * scale + 1.0,
         );
         let local_dir = vec3<f32>(
             dot(cube.east_w, ray_dir) * scale,
@@ -1536,16 +1536,16 @@ fn march_wrapped_planet(
                 select(1e10, 1.0 / local_dir.y, abs(local_dir.y) > 1e-8),
                 select(1e10, 1.0 / local_dir.z, abs(local_dir.z) > 1e-8),
             );
-            let cube_box = ray_box(local_origin, inv_local, vec3<f32>(0.0), vec3<f32>(3.0));
+            let cube_box = ray_box(local_origin, inv_local, vec3<f32>(0.0), vec3<f32>(2.0));
             if cube_box.t_enter < cube_box.t_exit && cube_box.t_exit > 0.0 {
                 let t_local = max(cube_box.t_enter, 0.0);
                 let entry_local = local_origin + local_dir * t_local;
                 let dx_lo = abs(entry_local.x - 0.0);
-                let dx_hi = abs(entry_local.x - 3.0);
+                let dx_hi = abs(entry_local.x - 2.0);
                 let dy_lo = abs(entry_local.y - 0.0);
-                let dy_hi = abs(entry_local.y - 3.0);
+                let dy_hi = abs(entry_local.y - 2.0);
                 let dz_lo = abs(entry_local.z - 0.0);
-                let dz_hi = abs(entry_local.z - 3.0);
+                let dz_hi = abs(entry_local.z - 2.0);
                 var best = dx_lo;
                 var local_normal = vec3<f32>(-1.0, 0.0, 0.0);
                 if dx_hi < best { best = dx_hi; local_normal = vec3<f32>(1.0, 0.0, 0.0); }
@@ -1553,7 +1553,7 @@ fn march_wrapped_planet(
                 if dy_hi < best { best = dy_hi; local_normal = vec3<f32>(0.0, 1.0, 0.0); }
                 if dz_lo < best { best = dz_lo; local_normal = vec3<f32>(0.0, 0.0, -1.0); }
                 if dz_hi < best { best = dz_hi; local_normal = vec3<f32>(0.0, 0.0, 1.0); }
-                let local_in_cell = clamp(entry_local / 3.0, vec3<f32>(0.0), vec3<f32>(1.0));
+                let local_in_cell = clamp(entry_local / 2.0, vec3<f32>(0.0), vec3<f32>(1.0));
                 let local_bevel = cube_face_bevel(local_in_cell, local_normal);
                 var out: HitResult;
                 out.hit = true;
@@ -1582,7 +1582,7 @@ fn march_wrapped_planet(
 //
 // Each pop transforms the ray into the parent's frame coords:
 // `parent_pos = slot_xyz + frame_pos / 3`, `parent_dir = frame_dir / 3`.
-// The parent's frame cell still spans `[0, 3)³` in its own
+// The parent's frame cell still spans `[0, 2)³` in its own
 // coords, so the inner DDA is unchanged — only the ray is
 // rescaled and the buffer node_idx swapped.
 fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
@@ -1596,7 +1596,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     // the TB's unrotated local frame, but the shader needs to see
     // content from the SAME rotated perspective as rays entering
     // from outside (which apply R^T at the TB boundary). Apply R^T
-    // to ray_origin (centered at [1.5,1.5,1.5]) so the Cartesian
+    // to ray_origin (centered at [1.0,1.0,1.0]) so the Cartesian
     // DDA traces through the TB in the rotated view. ray_dir is
     // already R^T-rotated by the CPU's frame_path_rotation basis.
     // On ribbon pop, R reverses this (my ribbon TB fix).
@@ -1605,8 +1605,8 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         let rc0 = node_kinds[current_idx].rot_col0.xyz;
         let rc1 = node_kinds[current_idx].rot_col1.xyz;
         let rc2 = node_kinds[current_idx].rot_col2.xyz;
-        let centered = ray_origin - vec3<f32>(1.5);
-        ray_origin = vec3<f32>(1.5) + vec3<f32>(
+        let centered = ray_origin - vec3<f32>(1.0);
+        ray_origin = vec3<f32>(1.0) + vec3<f32>(
             dot(rc0, centered),
             dot(rc1, centered),
             dot(rc2, centered),
@@ -1633,7 +1633,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         let cur_kind = node_kinds[current_idx].kind;
         if cur_kind == 1u {
             r = march_wrapped_planet(
-                current_idx, vec3<f32>(0.0), 3.0,
+                current_idx, vec3<f32>(0.0), 2.0,
                 ray_origin, ray_dir,
                 uniforms.planet_render.y,
             );
@@ -1653,7 +1653,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             // magnitude across pops, so each frame's inner DDA computes
             // a local t, bounded O(1)). Convert to camera-frame t for
             // the caller and for cell_min/cell_size anchoring.
-            //   t_camera = t_frame / cur_scale   (cur_scale = 1/3^N)
+            //   t_camera = t_frame / cur_scale   (cur_scale = 1/2^N)
             if cur_scale < 1.0 {
                 let hit_popped = ray_origin + ray_dir * r.t;
                 let cell_local = clamp(
@@ -1685,9 +1685,9 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         let entry = ribbon[ribbon_level];
         if ENABLE_STATS { ray_loads_ribbon = ray_loads_ribbon + 1u; }
         let s = entry.slot_bits & RIBBON_SLOT_MASK;
-        let sx = i32(s % 3u);
-        let sy = i32((s / 3u) % 3u);
-        let sz = i32(s / 9u);
+        let sx = i32(s % 2u);
+        let sy = i32((s / 2u) % 2u);
+        let sz = i32(s / 4u);
         let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
         skip_slot = s;
         // Ray pop: rescale origin into parent's [0,3)³.
@@ -1698,15 +1698,15 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             let rc0 = node_kinds[entry.child_bfs].rot_col0.xyz;
             let rc1 = node_kinds[entry.child_bfs].rot_col1.xyz;
             let rc2 = node_kinds[entry.child_bfs].rot_col2.xyz;
-            let scaled = ray_origin / 3.0;
+            let scaled = ray_origin / 2.0;
             let centered = scaled - vec3<f32>(0.5);
             ray_origin = slot_off + vec3<f32>(0.5)
                        + rc0 * centered.x + rc1 * centered.y + rc2 * centered.z;
             ray_dir = rc0 * ray_dir.x + rc1 * ray_dir.y + rc2 * ray_dir.z;
         } else {
-            ray_origin = slot_off + ray_origin / 3.0;
+            ray_origin = slot_off + ray_origin / 2.0;
         }
-        cur_scale = cur_scale * (1.0 / 3.0);
+        cur_scale = cur_scale * (1.0 / 2.0);
         current_idx = entry.node_idx;
         ribbon_level = ribbon_level + 1u;
 
@@ -1723,7 +1723,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             );
             let shell_hit = ray_box(
                 ray_origin, inv_dir_shell,
-                vec3<f32>(0.0), vec3<f32>(3.0),
+                vec3<f32>(0.0), vec3<f32>(2.0),
             );
             if shell_hit.t_exit > 0.0 {
                 // Advance past the shell boundary so the

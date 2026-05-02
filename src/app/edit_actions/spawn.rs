@@ -58,7 +58,7 @@ impl App {
     /// (1000) — the original behavior of N/M before the soldier
     /// model took over those keys. Useful for raster-perf stress
     /// tests where we want a single-color subtree (greedy meshing
-    /// merges every face of a 27-voxel stone cube into 6 quads, so
+    /// merges every face of an 8-voxel stone cube into 6 quads, so
     /// 10k cubes are much cheaper to render than 10k soldiers).
     pub(in crate::app) fn spawn_test_cubes(&mut self, n: u32) {
         if n == 0 {
@@ -218,9 +218,9 @@ impl App {
     /// the library's content-addressing would dedup anyway, but a
     /// cached handle avoids re-walking the build every call.
     fn get_or_build_stone_cube_subtree(&mut self) -> NodeId {
-        // Depth-3 uniform subtree of stone: 27³ leaf voxels, ~4
-        // unique NodeIds total thanks to dedup. The root's 27
-        // children share one NodeId; that one's 27 children share
+        // Depth-3 uniform subtree of stone: 8³ leaf voxels, ~4
+        // unique NodeIds total thanks to dedup. The root's 8
+        // children share one NodeId; that one's 8 children share
         // one more; leaves are Child::Block(STONE).
         let subtree = self.world.library.build_uniform_subtree(block::STONE, 3);
         match subtree {

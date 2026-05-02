@@ -1,7 +1,7 @@
-//! Self-similar voxel fractals adapted for a base-3 recursive tree.
+//! Self-similar voxel fractals adapted for a base-2 recursive octree.
 //!
-//! Each fractal here is expressed as "which of the 27 sub-cells of a
-//! 3×3×3 node are filled at every level of recursion, and with what
+//! Each fractal here is expressed as "which of the 8 sub-cells of a
+//! 2×2×2 node are filled at every level of recursion, and with what
 //! block". Since the tree is content-addressed (see `super::tree`),
 //! every level dedups to a single library node — a depth-`d` fractal
 //! is O(d) storage, no matter how wide its silhouette becomes.
@@ -25,21 +25,20 @@
 //! functions and match the aesthetic of PySpace's original scenes
 //! (cream Sierpinski, cool-blue Menger, prismatic dust, ...).
 //!
-//! # Trinary adaptation of PySpace's fractal zoo
+//! # Binary adaptation of PySpace's fractal zoo
 //!
 //! PySpace targets a ray-marched SDF renderer with `FoldScale(2)`
-//! (binary self-similarity). Our tree subdivides at scale 3 — some
-//! fractals are natural fits (Menger is *defined* on a ternary
-//! subdivision), others need recasting into "pick a subset of 27
-//! cells per level":
+//! (binary self-similarity). Our tree subdivides at scale 2 — some
+//! fractals are natural fits, others need recasting into "pick a
+//! subset of 8 cells per level":
 //!
-//! | PySpace fractal          | Trinary adaptation                  |
-//! |--------------------------|-------------------------------------|
-//! | `menger` / `mausoleum`   | [`menger`] — 20/27 cells (native)   |
-//! | `sierpinski_tetrahedron` | [`sierpinski_tet`] — 4 cube corners |
-//! | —                        | [`cantor_dust`] — 8 cube corners    |
-//! | (inverse of Menger)      | [`jerusalem_cross`] — 7 axis cells  |
-//! | Sierpinski pyramid       | [`sierpinski_pyramid`] — 5 cells    |
+//! | PySpace fractal          | Binary adaptation                     |
+//! |--------------------------|---------------------------------------|
+//! | `menger` / `mausoleum`   | [`menger`] — 7/8 cells (hollow cube) |
+//! | `sierpinski_tetrahedron` | [`sierpinski_tet`] — 4 cube corners   |
+//! | —                        | [`cantor_dust`] — 4 tetrahedral corners|
+//! | (inverse of Menger)      | [`jerusalem_cross`] — 3 L-shape cells |
+//! | Sierpinski pyramid       | [`sierpinski_pyramid`] — 5 cells      |
 //!
 //! SDF-only PySpace scenes (mandelbox, tree_planet, snow_stadium,
 //! butterweed_hills) are not ported — they depend on a continuous
@@ -57,9 +56,9 @@ pub mod sierpinski_tet;
 
 use super::tree::{empty_children, slot_index, Child, NodeId, NodeLibrary};
 
-/// One filled sub-cell in a fractal's 3×3×3 pattern.
+/// One filled sub-cell in a fractal's 2×2×2 pattern.
 ///
-/// `(x, y, z)` are the slot coordinates in `0..3`. `block` is the
+/// `(x, y, z)` are the slot coordinates in `0..2`. `block` is the
 /// palette index written at the deepest level; at all higher levels
 /// the slot holds `Child::Node(<next level>)` so colored cells only
 /// appear at the leaves (which is what makes the fractal "look" like
@@ -79,7 +78,7 @@ pub(super) fn self_similar_fractal(
 ) -> NodeId {
     assert!(depth >= 1, "fractal depth must be >= 1");
     for &(x, y, z, _) in slots {
-        debug_assert!(x < 3 && y < 3 && z < 3, "slot out of range: ({x},{y},{z})");
+        debug_assert!(x < 2 && y < 2 && z < 2, "slot out of range: ({x},{y},{z})");
     }
 
     // Deepest level: each slot is a Block leaf coloured by its role.

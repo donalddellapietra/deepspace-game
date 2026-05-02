@@ -19,10 +19,10 @@ pub use path::{Path, Transition};
 pub use world_pos::WorldPos;
 
 /// Local frame convention: every node's children span
-/// `[0, WORLD_SIZE)³` because there are 3 children per axis.
+/// `[0, WORLD_SIZE)³` because there are 2 children per axis.
 /// This is a frame-local coordinate constant, not an absolute
 /// world-scale measurement. See `docs/no-absolute-coordinates.md`.
-pub const WORLD_SIZE: f32 = 3.0;
+pub const WORLD_SIZE: f32 = 2.0;
 
 #[cfg(test)]
 mod tests;

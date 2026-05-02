@@ -8,7 +8,7 @@
 //! `2 + 2*popcount(occupancy)` contiguous u32s:
 //!
 //! ```text
-//! tree[base + 0]                     = occupancy mask (27 bits)
+//! tree[base + 0]                     = occupancy mask (8 bits)
 //! tree[base + 1]                     = first_child_offset (= base + 2)
 //! tree[first_child_offset + rank*2]     = packed (tag|block_type|pad)
 //! tree[first_child_offset + rank*2 + 1] = child BFS idx (when tag == 2)
@@ -151,8 +151,8 @@ impl CachedTree {
         // Resolve every slot. Child::Node that's uniform-flat doesn't
         // recurse; Child::Node that's non-uniform gets packed here
         // (so its BFS idx is known when we push this node's slab).
-        let mut slab: [Option<GpuChild>; 27] = [None; 27];
-        for s in 0..27 {
+        let mut slab: [Option<GpuChild>; 8] = [None; 8];
+        for s in 0..8 {
             slab[s] = self.build_child_entry(library, children[s]);
         }
 
@@ -259,7 +259,7 @@ pub(crate) fn pack_child_first(c: GpuChild) -> u32 {
         | ((c.flags as u32) << 24)
 }
 
-/// Tight axis-aligned bounding box of the occupied slots in a 3×3×3
+/// Tight axis-aligned bounding box of the occupied slots in a 2×2×2
 /// node, packed into 12 bits. Shader uses it to cull descent before
 /// committing to a child's DDA.
 ///
@@ -279,19 +279,19 @@ pub(crate) fn content_aabb(occupancy: u32) -> u16 {
     if occupancy == 0 {
         return 0;
     }
-    let mut min_x = 3u32;
+    let mut min_x = 2u32;
     let mut max_x = 0u32;
-    let mut min_y = 3u32;
+    let mut min_y = 2u32;
     let mut max_y = 0u32;
-    let mut min_z = 3u32;
+    let mut min_z = 2u32;
     let mut max_z = 0u32;
-    for slot in 0..27u32 {
+    for slot in 0..8u32 {
         if (occupancy >> slot) & 1 == 0 {
             continue;
         }
-        let x = slot % 3;
-        let y = (slot / 3) % 3;
-        let z = slot / 9;
+        let x = slot % 2;
+        let y = (slot / 2) % 2;
+        let z = slot / 4;
         if x < min_x { min_x = x; }
         if x > max_x { max_x = x; }
         if y < min_y { min_y = y; }
@@ -380,7 +380,7 @@ mod tests {
             crate::world::palette::block::STONE,
         )));
         let mut root_children = empty_children();
-        root_children[13] = Child::Node(stone_leaf);
+        root_children[7] = Child::Node(stone_leaf);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 

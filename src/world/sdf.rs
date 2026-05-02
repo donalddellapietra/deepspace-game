@@ -191,7 +191,7 @@ mod tests {
 
     fn test_planet() -> Planet {
         Planet {
-            center: [1.5, 1.5, 1.5],
+            center: [1.0, 1.0, 1.0],
             radius: 0.4,
             noise_scale: 0.05,
             noise_freq: 50.0,

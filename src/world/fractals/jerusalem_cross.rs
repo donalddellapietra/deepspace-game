@@ -1,36 +1,33 @@
-//! Jerusalem cross — the complement of Menger.
+//! Jerusalem cross — L-shape fractal, sparse complement of the Menger analogue.
 //!
 //! # Structure
 //!
-//! Where Menger removes the 7 "interior" cells (6 face centres + 1
-//! body centre), this fractal keeps *only those 7*. Each level is a
-//! 3-axis plus sign embedded in a 3×3×3 cube: three orthogonal rods
-//! passing through the central cell.
+//! In the base-3 tree, the Jerusalem cross kept the 7 "interior"
+//! cells (6 face centres + 1 body centre) — the complement of Menger.
+//! In a base-2 octree there are no face centres or body centre, so a
+//! literal port is impossible.
+//!
+//! Instead we use an L-shaped pattern of 3 slots:
 //!
 //! ```text
-//!   (1,1,0) ──┐   ┌── (1,1,2)
-//!             │   │
-//!   (0,1,1) ──●── (2,1,1)         ● = (1,1,1) body centre
-//!             │   │
-//!   (1,0,1) ──┘   └── (1,2,1)
+//!   (0,0,0)  (1,0,0)  (0,1,0)
 //! ```
 //!
-//! Zooming in reveals smaller crosses joined at every rod end — a
-//! delicate axial scaffold, the exact opposite of Menger's corner-rib
-//! weave.
+//! This forms an L in the XY plane at z=0. 3/8 = 37.5% occupancy.
+//! Recursing produces a delicate angular scaffold — each L-arm
+//! branches into smaller Ls at every zoom level.
 //!
 //! # Source
 //!
-//! PySpace doesn't have a direct analog, but this is in spirit the
-//! "inverse Menger" you can construct from `FoldAbs` + `FoldPlane`
-//! with inverted half-spaces. Our trinary subdivision makes it
-//! essentially free to express.
+//! PySpace doesn't have a direct analog, but this is in spirit a
+//! sparse structural fractal. The L-shape provides interesting
+//! asymmetric self-similarity.
 //!
 //! # Coloring
 //!
-//! Architectural two-tone: the body centre gets a warm gold
-//! "nucleus", the 6 rod cells get a darker ochre. At every zoom the
-//! scaffold reads as connected lattice → core → connected lattice,
+//! Architectural two-tone: the corner (0,0,0) gets a warm gold
+//! "nucleus", the 2 arm cells get a darker ochre. At every zoom the
+//! scaffold reads as connected lattice -> core -> connected lattice,
 //! evoking PySpace's `mausoleum` orbit-trap palette
 //! `(0.42, 0.38, 0.19)`.
 
@@ -41,22 +38,18 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeLibrary, MAX_DEPTH};
 
-/// Cross cells: body centre + 6 face centres.
-const CROSS: [(u8, u8, u8); 7] = [
-    (1, 1, 1),   // body centre
-    (0, 1, 1),   // -X face
-    (2, 1, 1),   // +X face
-    (1, 0, 1),   // -Y face
-    (1, 2, 1),   // +Y face
-    (1, 1, 0),   // -Z face
-    (1, 1, 2),   // +Z face
+/// L-shape cells: origin corner + two arms along X and Y.
+const L_SHAPE: [(u8, u8, u8); 3] = [
+    (0, 0, 0),   // corner (nucleus)
+    (1, 0, 0),   // +X arm
+    (0, 1, 0),   // +Y arm
 ];
 
 fn jerusalem_cross_world(depth: u8, nucleus: u16, rod: u16) -> WorldState {
-    let slots: Vec<Slot> = CROSS
+    let slots: Vec<Slot> = L_SHAPE
         .iter()
         .map(|&(x, y, z)| {
-            let block = if (x, y, z) == (1, 1, 1) { nucleus } else { rod };
+            let block = if (x, y, z) == (0, 0, 0) { nucleus } else { rod };
             (x, y, z, block)
         })
         .collect();
@@ -71,22 +64,20 @@ pub(crate) fn bootstrap_jerusalem_cross_world(depth: u8) -> WorldBootstrap {
 
     let mut registry = ColorRegistry::new();
     // Mausoleum orbit-trap palette, authentic PySpace RGB:
-    //   `OrbitMax((0.42, 0.38, 0.19))` × 1.0 → (107, 97, 48) rod
-    //                                    × 1.75 → (178, 161, 81) highlight
+    //   `OrbitMax((0.42, 0.38, 0.19))` x 1.0 -> (107, 97, 48) rod
+    //                                    x 1.75 -> (178, 161, 81) highlight
     // Nucleus uses the highlight tone so the single-cell core pops
-    // against the 6-rod scaffold at every recursion level.
+    // against the 2-rod scaffold at every recursion level.
     let nucleus = registry.register(178, 161, 81, 255).unwrap();
     let rod = registry.register(107, 97, 48, 255).unwrap();
 
     let world = jerusalem_cross_world(depth, nucleus, rod);
 
-    // Far-diagonal pose (see `scripts/test-fractals.sh`): from the
-    // (+X,+Y,+Z) corner looking back along the body diagonal. The
-    // three orthogonal rods converge toward the camera, giving the
-    // cross its signature ornate filigree silhouette.
+    // Far-diagonal pose: from the (+X,+Y,+Z) corner looking back
+    // along the body diagonal.
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [2.8, 2.8, 2.8],
+        [1.8, 1.8, 1.8],
         2,
     )
     .deepened_to(8);

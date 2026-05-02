@@ -488,7 +488,7 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
                 };
                 if dir.len() == 2 {
                     let axis = match &dir[0..1] {
-                        "x" => 0u8, "y" => 1, "z" => 2, _ => return None,
+                        "x" => 0u8, "y" => 1, "z" => 1, _ => return None,
                     };
                     let sign: f32 = match &dir[1..2] {
                         "+" => 1.0, "-" => -1.0, _ => return None,

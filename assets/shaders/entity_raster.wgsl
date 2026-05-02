@@ -41,9 +41,9 @@ fn vs_main(in: VertexIn) -> VertexOut {
     // entity's anchor cell (which has side length `scale` in frame
     // coords). Then translate to the entity's bbox_min.
     let world = vec3<f32>(
-        in.i_translate.x + in.position.x * (in.i_scale / 3.0),
-        in.i_translate.y + in.position.y * (in.i_scale / 3.0),
-        in.i_translate.z + in.position.z * (in.i_scale / 3.0),
+        in.i_translate.x + in.position.x * (in.i_scale / 2.0),
+        in.i_translate.y + in.position.y * (in.i_scale / 2.0),
+        in.i_translate.z + in.position.z * (in.i_scale / 2.0),
     );
     var out: VertexOut;
     out.clip_position = u.view_proj * vec4<f32>(world, 1.0);

@@ -10,7 +10,7 @@
 //! ```text
 //! root (Cartesian, depth 30)
 //!   slot 12 (0,1,1) -> Cartesian uniform-stone subtree    (depth 29)  axis-aligned A
-//!   slot 13 (1,1,1) -> TangentBlock { rot_y(π/4) }        (depth 29)  rotated
+//!   slot 7 (1,1,1) -> TangentBlock { rot_y(π/4) }        (depth 29)  rotated
 //!                        wraps a 28-deep uniform-stone Cartesian subtree
 //!   slot 14 (2,1,1) -> Cartesian uniform-stone subtree    (depth 29)  axis-aligned B
 //! ```
@@ -44,7 +44,7 @@ use crate::world::tree::{
 /// visually distinctive: from above the cube reads as a diamond.
 const ROTATION_ANGLE_RAD: f32 = std::f32::consts::FRAC_PI_4;
 
-/// Depth of each per-cube subtree (slots 12/13/14 of the root). The
+/// Depth of each per-cube subtree (slots 5/7/6 of the root). The
 /// total tree depth is `CUBE_SUBTREE_DEPTH + 1` (root + each
 /// subtree). For the precision-pressure test, 29 puts the deepest
 /// stone leaves at root tree depth 30.
@@ -106,11 +106,10 @@ pub fn rotated_cube_test_world() -> WorldState {
         &mut library, block::STONE, CUBE_SUBTREE_DEPTH,
     );
 
-    // Root: Cartesian, populated only at slots 12/13/14 (the row).
+    // Root: Cartesian, populated only at slots 5/7/6 (the row).
     let mut root_children = empty_children();
     root_children[slot_index(0, 1, 1)] = cube_a;
     root_children[slot_index(1, 1, 1)] = cube_centre;
-    root_children[slot_index(2, 1, 1)] = cube_b;
     let root = library.insert_with_kind(root_children, NodeKind::Cartesian);
     library.ref_inc(root);
 
@@ -124,10 +123,10 @@ pub fn rotated_cube_test_world() -> WorldState {
 }
 
 /// Camera spawn: one cell directly above the row, looking down.
-/// Anchor depth 1 (slot 16 = (1, 2, 1) of root); offset (0.5, 0.5,
-/// 0.5) puts world position at (1.5, 2.5, 1.5) in root frame coords.
+/// Anchor depth 1 (slot 7 = (1, 1, 1) of root); offset (0.5, 0.5,
+/// 0.5) puts world position at (1.0, 1.0, 1.0) in root frame coords.
 pub fn rotated_cube_test_spawn() -> WorldPos {
-    WorldPos::uniform_column(slot_index(1, 2, 1) as u8, 1, [0.5, 0.5, 0.5])
+    WorldPos::uniform_column(slot_index(1, 1, 1) as u8, 1, [0.5, 0.5, 0.5])
 }
 
 pub(super) fn bootstrap_rotated_cube_test_world() -> WorldBootstrap {

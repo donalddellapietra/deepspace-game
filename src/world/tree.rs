@@ -1,6 +1,6 @@
-//! Content-addressed base-3 recursive tree.
+//! Content-addressed base-2 recursive tree (octree).
 //!
-//! Every node has exactly 27 children (3x3x3). Each child is either
+//! Every node has exactly 8 children (2x2x2). Each child is either
 //! Empty, a Block type, or a reference to another node. Nodes store
 //! nothing else — no voxel grid, no mesh, no metadata.
 //!
@@ -11,13 +11,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 // ------------------------------------------------------------- constants
 
-pub const BRANCH: usize = 3;
-pub const CHILDREN_PER_NODE: usize = 27; // 3³
+pub const BRANCH: usize = 2;
+pub const CHILDREN_PER_NODE: usize = 8; // 2³
 pub const MAX_DEPTH: usize = 63;
 
 // --------------------------------------------------------------- child
 
-/// One child slot in a node's 3x3x3 grid.
+/// One child slot in a node's 2x2x2 grid.
 ///
 /// `Block(u16)` holds a palette index. Builtin block indices live in
 /// `palette::block` (0..=9); imported model colors occupy 10..=65_534.
@@ -72,7 +72,7 @@ pub fn uniform_children(child: Child) -> Children {
     [child; CHILDREN_PER_NODE]
 }
 
-/// Semantic kind of a node. Determines how the 27 children's
+/// Semantic kind of a node. Determines how the 8 children's
 /// positions are interpreted and how the coordinate primitives
 /// dispatch when the anchor is at this depth.
 ///
@@ -87,9 +87,9 @@ pub enum NodeKind {
         dims: [u32; 3],
         slab_depth: u8,
     },
-    /// A Cartesian subtree whose local `[0, 3)³` frame is rotated
+    /// A Cartesian subtree whose local `[0, 2)³` frame is rotated
     /// relative to its parent's slot frame. The rotation is applied
-    /// at descent around the cube's geometric center `(1.5, 1.5, 1.5)`
+    /// at descent around the cube's geometric center `(1.0, 1.0, 1.0)`
     /// — purely frame-local, NO world-space coordinates anywhere.
     ///
     /// `rotation` is column-major: `rotation[col][row]`. It maps
@@ -177,19 +177,11 @@ impl Hash for NodeKind {
 }
 
 impl NodeKind {
-    /// Whether the GPU packer is allowed to flatten a uniform
-    /// subtree of this kind into a single Block at its parent's
-    /// slot. Cartesian nodes flatten freely (the standard
-    /// content-addressed shrink); kinds that carry metadata the
-    /// shader needs to dispatch on (WrappedPlane, TangentBlock)
-    /// must NOT flatten — otherwise the metadata vanishes the moment
-    /// the subtree happens to be uniformly empty / uniformly air.
     #[inline]
     pub fn allows_uniform_flatten(self) -> bool {
         matches!(self, NodeKind::Cartesian)
     }
 
-    /// True iff this kind is `TangentBlock`, regardless of rotation.
     #[inline]
     pub fn is_tangent_block(self) -> bool {
         matches!(self, NodeKind::TangentBlock { .. })
@@ -200,26 +192,8 @@ pub struct Node {
     pub children: Children,
     pub kind: NodeKind,
     pub ref_count: u32,
-    /// Presence-preserving representative block type for this subtree.
-    /// The most common NON-EMPTY block type among all terminals in the
-    /// subtree. Used by the renderer at LOD cutoff — when a cell is too
-    /// small to descend into, it renders as this color.
-    /// `REPRESENTATIVE_EMPTY` = all empty (no solid content).
-    ///
-    /// Presence-preserving means: if ANY child is non-empty, the
-    /// representative is non-empty. A tree trunk (1 voxel of wood in
-    /// 26 air voxels) gets representative = Wood, not Air. Thin
-    /// features survive cascaded LOD across arbitrary depth.
     pub representative_block: u16,
-    /// If the entire subtree is one type: 0..=`MAX_BLOCK_TYPE` = that
-    /// BlockType, `UNIFORM_EMPTY` = all empty, `UNIFORM_MIXED` = not
-    /// uniform. Uniform nodes can be flattened to a single Block
-    /// during GPU packing.
     pub uniform_type: u16,
-    /// Depth of this subtree: 1 for a leaf node (children are all
-    /// Block/Empty), 1 + max(child.depth) for nodes with Child::Node
-    /// children. Cached at insert time so `WorldState::tree_depth()`
-    /// is O(1) instead of a full DFS on every edit.
     pub depth: u32,
 }
 
@@ -235,18 +209,19 @@ pub const REPRESENTATIVE_EMPTY: u16 = UNIFORM_EMPTY;
 
 // ---------------------------------------------------------- slot encoding
 
-/// Row-major index into a 3x3x3 grid: x varies fastest, then y, then z.
+/// Row-major index into a 2x2x2 grid: x varies fastest, then y, then z.
 #[inline]
 pub const fn slot_index(x: usize, y: usize, z: usize) -> usize {
-    z * 9 + y * 3 + x
+    z * 4 + y * 2 + x
 }
 
 #[inline]
 pub const fn slot_coords(slot: usize) -> (usize, usize, usize) {
-    (slot % 3, (slot / 3) % 3, slot / 9)
+    (slot % 2, (slot / 2) % 2, slot / 4)
 }
 
-/// The center child: (1, 1, 1) = slot 13.
+/// Conventional "center" child in a 2×2×2 grid. A true center doesn't
+/// exist; we pick (1, 1, 1) = slot 7 as the canonical placement slot.
 pub const CENTER_SLOT: usize = slot_index(1, 1, 1);
 
 // ------------------------------------------------------------- library
@@ -268,15 +243,10 @@ impl Default for NodeLibrary {
 }
 
 impl NodeLibrary {
-    /// Insert a Cartesian node. Shorthand for `insert_with_kind`
-    /// with `NodeKind::Cartesian`.
     pub fn insert(&mut self, children: Children) -> NodeId {
         self.insert_with_kind(children, NodeKind::Cartesian)
     }
 
-    /// Insert a node with an explicit `NodeKind`. If an existing
-    /// node has identical children AND kind, return its id
-    /// (content-addressed dedup).
     pub fn insert_with_kind(&mut self, children: Children, kind: NodeKind) -> NodeId {
         let h = hash_node_content(&children, &kind);
         if let Some(candidates) = self.by_hash.get(&h) {
@@ -297,15 +267,6 @@ impl NodeLibrary {
                 _ => None,
             })
             .collect();
-        // Compute representative block (presence-preserving):
-        // Most common NON-EMPTY block type among children. Empty children
-        // are ignored so that thin features (a single wood voxel in air)
-        // survive cascaded LOD. For Node children, inherit their
-        // representative_block recursively.
-        // Sparse tally: with u16 palette indices we can't preallocate
-        // a `[u32; 65536]` on the stack. A `HashMap` keyed by block id
-        // handles both narrow (builtins-only) and wide (scene-palette)
-        // tally cases cleanly, at the cost of a bit of alloc per node.
         let mut counts: std::collections::HashMap<u16, u32> =
             std::collections::HashMap::new();
         for c in &children {
@@ -331,7 +292,6 @@ impl NodeLibrary {
             .max_by_key(|(_, count)| *count)
             .map(|(bt, _)| *bt)
             .unwrap_or(REPRESENTATIVE_EMPTY);
-        // Compute uniform_type: is the entire subtree one block type?
         let uniform_type = {
             let mut first: Option<u16> = None;
             let mut uniform = true;
@@ -344,9 +304,6 @@ impl NodeLibrary {
                         .get(nid)
                         .map(|n| n.uniform_type)
                         .unwrap_or(UNIFORM_MIXED),
-                    // EntityRef children force MIXED so pack.rs never
-                    // tries to uniform-flatten a scene ancestor into
-                    // a single Block.
                     Child::EntityRef(_) => UNIFORM_MIXED,
                 };
                 if ct == UNIFORM_MIXED {
@@ -368,9 +325,6 @@ impl NodeLibrary {
                 UNIFORM_MIXED
             }
         };
-        // Cache depth: 1 for leaves (all children are Block/Empty),
-        // 1 + max(child.depth) when any child is Child::Node. O(1)
-        // per insert thanks to child caching.
         let mut max_child_depth = 0u32;
         for c in &children {
             if let Child::Node(nid) = c {
@@ -398,22 +352,8 @@ impl NodeLibrary {
         self.nodes.len()
     }
 
-    /// Build a uniform subtree of `depth` levels filled with `block_type`.
     /// depth=0 returns `Child::Block(block_type)`.
-    /// depth=1 returns a node whose 27 children are all `Block(block_type)`.
-    /// depth=N returns a node of uniform nodes, N levels deep.
-    /// Content-addressed dedup means this creates at most N unique nodes.
-    /// Override an existing node's `representative_block`. Used by
-    /// the scene overlay to make ephemeral ancestors inherit the
-    /// terrain's representative at their position — otherwise the
-    /// ephemeral chain's rep would be dominated by a single
-    /// `Child::EntityRef` sentinel and the shader's LOD-terminal
-    /// splat would show entity-sentinel instead of terrain color.
-    ///
-    /// ## Safety
-    ///
-    /// The node's `uniform_type` is NOT recomputed; callers must
-    /// ensure the override is consistent with that cached field.
+    /// depth=1 returns a node whose 8 children are all `Block(block_type)`.
     pub fn set_representative(&mut self, id: NodeId, rep: u16) {
         if let Some(node) = self.nodes.get_mut(&id) {
             node.representative_block = rep;
@@ -533,14 +473,10 @@ mod tests {
             stone, NodeKind::TangentBlock { rotation: IDENTITY_ROTATION });
         let tan2 = lib.insert_with_kind(
             stone, NodeKind::TangentBlock { rotation: IDENTITY_ROTATION });
-        // Different kinds are distinct nodes even with identical children.
         assert_ne!(cart, tan1);
-        // Identical kind + children dedup (same rotation).
         assert_eq!(tan1, tan2);
-        // TangentBlock is not allowed to flatten.
         let tb_id = NodeKind::TangentBlock { rotation: IDENTITY_ROTATION };
         assert!(!tb_id.allows_uniform_flatten());
-        // Bit-distinct rotations DO NOT dedup.
         let tan_rot = lib.insert_with_kind(
             stone, NodeKind::TangentBlock { rotation: rotation_y(0.5) });
         assert_ne!(tan1, tan_rot);

@@ -20,7 +20,7 @@ use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
 /// raycast's output shape.
 ///
 /// `cam_local` and `ray_dir` are in the slab-root frame's local
-/// `[0, 3)³` coords.
+/// `[0, 2)³` coords.
 pub fn cpu_raycast_wrapped_planet(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -32,8 +32,8 @@ pub fn cpu_raycast_wrapped_planet(
     lat_max: f32,
     max_depth: u32,
 ) -> Option<HitInfo> {
-    let cs_center = [1.5_f32, 1.5, 1.5];
-    let body_size = 3.0_f32;
+    let cs_center = [1.0_f32, 1.5, 1.5];
+    let body_size = 2.0_f32;
     let r_sphere = body_size / (2.0 * std::f32::consts::PI);
 
     let dir_len = (ray_dir[0] * ray_dir[0]
@@ -124,15 +124,15 @@ pub fn cpu_raycast_wrapped_planet(
         let mut idx = slab_root;
         let mut cells_per_slot: i32 = 1;
         for _ in 1..slab_depth {
-            cells_per_slot *= 3;
+            cells_per_slot *= 2;
         }
         let mut anchor: Option<NodeId> = None;
         let mut cell_terminated_uniform: Option<u16> = None;
         let mut empty_at_layer = false;
         for level in 0..slab_depth {
-            let sx = (cell_x / cells_per_slot).rem_euclid(3);
-            let sy = (cy / cells_per_slot).rem_euclid(3);
-            let sz = (cell_z / cells_per_slot).rem_euclid(3);
+            let sx = (cell_x / cells_per_slot).rem_euclid(2);
+            let sy = (cy / cells_per_slot).rem_euclid(2);
+            let sz = (cell_z / cells_per_slot).rem_euclid(2);
             let slot = slot_index(sx as usize, sy as usize, sz as usize);
             path.push((idx, slot));
             let node = match library.get(idx) {
@@ -159,7 +159,7 @@ pub fn cpu_raycast_wrapped_planet(
                     }
                 }
             }
-            cells_per_slot /= 3;
+            cells_per_slot /= 2;
         }
         if empty_at_layer {
             continue;
@@ -182,16 +182,16 @@ pub fn cpu_raycast_wrapped_planet(
         let east_arc = r_sphere * cl.abs() * lon_step;
         let north_arc = r_sphere * lat_step;
         let cube_side = east_arc.max(north_arc).max(r_step);
-        let scale = 3.0 / cube_side;
+        let scale = 2.0 / cube_side;
         let d_origin = [
             cam_local[0] - cube_origin[0],
             cam_local[1] - cube_origin[1],
             cam_local[2] - cube_origin[2],
         ];
         let local_origin = [
-            (east_w[0] * d_origin[0] + east_w[1] * d_origin[1] + east_w[2] * d_origin[2]) * scale + 1.5,
-            (normal_w[0] * d_origin[0] + normal_w[1] * d_origin[1] + normal_w[2] * d_origin[2]) * scale + 1.5,
-            (north_w[0] * d_origin[0] + north_w[1] * d_origin[1] + north_w[2] * d_origin[2]) * scale + 1.5,
+            (east_w[0] * d_origin[0] + east_w[1] * d_origin[1] + east_w[2] * d_origin[2]) * scale + 1.0,
+            (normal_w[0] * d_origin[0] + normal_w[1] * d_origin[1] + normal_w[2] * d_origin[2]) * scale + 1.0,
+            (north_w[0] * d_origin[0] + north_w[1] * d_origin[1] + north_w[2] * d_origin[2]) * scale + 1.0,
         ];
         let local_dir = [
             (east_w[0] * dir[0] + east_w[1] * dir[1] + east_w[2] * dir[2]) * scale,
@@ -308,7 +308,7 @@ mod tests {
     fn miss_when_ray_misses_sphere() {
         let world = wrapped_planet_world(2, [27, 2, 14], 3, 1);
         let frame_path = vec![13u8, 13u8];
-        let cam_local = [3.0, 3.0, 3.0];
+        let cam_local = [2.0, 2.0, 2.0];
         let ray_dir = [0.0, 1.0, 0.0];
         let hit = cpu_raycast_wrapped_planet(
             &world.library, world.root, &frame_path,
