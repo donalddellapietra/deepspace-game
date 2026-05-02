@@ -284,13 +284,6 @@ pub struct App {
     /// Phase 3 REVISED Step A.0: enable UV-sphere render of the
     /// WrappedPlane frame. `Some(1)` from `--planet-render-sphere`.
     pub(super) startup_planet_render_sphere: Option<u32>,
-    /// Rotation matrix to apply at descent into any
-    /// `NodeKind::TangentBlock` child. Set at App::with_test_config
-    /// based on the world preset (identity for everything except
-    /// `RotatedTest`, which installs a non-axis-aligned orthonormal
-    /// rotation so the test is meaningful). Forwarded to the
-    /// renderer once it's online.
-    pub(super) startup_tangent_rotation: [[f32; 3]; 3],
     /// Captured args we need in `finish_init`, populated by
     /// `start_init` before the renderer comes online.
     pub(super) pending_init: Option<PendingInit>,
@@ -328,36 +321,6 @@ impl App {
         let shader_stats_enabled = test_cfg.shader_stats;
         let startup_curvature_a = test_cfg.curvature_a;
         let startup_planet_render_sphere = test_cfg.planet_render_sphere;
-        // Test-world rotation: a non-axis-aligned orthonormal matrix
-        // for `RotatedTest` so the test exercises arbitrary rotation
-        // (not a 45° / axis-aligned special case). Identity for every
-        // other preset — TangentBlock encounters in sphere mode
-        // currently dispatch through the legacy sphere descent path,
-        // which doesn't read these uniforms (yet).
-        let startup_tangent_rotation = match &test_cfg.world_preset {
-            crate::world::bootstrap::WorldPreset::RotatedTest => {
-                // 30° around Y composed with 15° around Z. Both
-                // angles are arbitrary irrationals chosen so the
-                // resulting matrix has no axis-aligned columns and
-                // the rotated cube's faces aren't parallel to any
-                // world plane.
-                let (sy, cy) = (30.0_f32).to_radians().sin_cos();
-                let (sz, cz) = (15.0_f32).to_radians().sin_cos();
-                // Ry(30) =  [ cy, 0, sy ; 0, 1, 0 ; -sy, 0, cy ]
-                // Rz(15) =  [ cz, -sz, 0 ; sz, cz, 0 ; 0, 0, 1 ]
-                // R = Rz · Ry:
-                [
-                    [ cz * cy,        -sz,  cz * sy        ],
-                    [ sz * cy,         cz,  sz * sy        ],
-                    [ -sy,            0.0,  cy             ],
-                ]
-            }
-            _ => [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-        };
         // Nyquist floor: sub-pixel rejection only. This is the
         // sole visual LOD gate; the stack depth (MAX_STACK_DEPTH
         // in the shader) is the hard ceiling.
@@ -521,7 +484,6 @@ impl App {
             pending_init: None,
             startup_curvature_a,
             startup_planet_render_sphere,
-            startup_tangent_rotation,
         };
         if let Some(ref path) = spawn_entity_path {
             let count = spawn_entity_count.max(1);

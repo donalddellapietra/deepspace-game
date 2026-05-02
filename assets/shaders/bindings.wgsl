@@ -96,16 +96,6 @@ struct Uniforms {
     /// (lat_max for poles is `.y`; later: shell inner_radius for
     /// radial-depth marching).
     planet_render: vec4<f32>,
-    /// Orthonormal rotation applied when `march_cartesian` descends
-    /// into a `NodeKind::TangentBlock` child. Rows are the rotated
-    /// frame's local-axes-in-parent-frame: `.xyz` is the basis row,
-    /// `.w` is std140 padding. Reconstruct as
-    /// `mat3x3(row0.xyz, row1.xyz, row2.xyz)` (row-major); the
-    /// inverse for ray transform is the transpose. Default identity
-    /// = no rotation, marcher byte-identical to the unrotated path.
-    tangent_rotation_row0: vec4<f32>,
-    tangent_rotation_row1: vec4<f32>,
-    tangent_rotation_row2: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
