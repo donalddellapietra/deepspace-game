@@ -118,6 +118,29 @@ fn write_walker_probe(
     walker_probe._reserved11 = 0u;
 }
 
+// Position-tracking cartesian DDA, precision-stable at deep depth.
+//
+// State: every level operates in its own [0, 3]³ local frame, where
+// cells are 1 unit. The ray's CURRENT position in this frame is held
+// in `cur_pos` and updated incrementally on each cell crossing — we
+// never reconstruct the position via `origin + dir * t` (that'd
+// subtract two ~3^N values to land in [0, 3], catastrophic at deep
+// depth). `cur_dir` scales by 3 per push, by 1/3 per pop. Per-step
+// position deltas are O(1):
+//
+//   side_dist = (next_face - cur_pos) * cur_inv_dir
+//   min_t     = min(side_dist)
+//   cur_pos  += min_t * cur_dir            // O(1) magnitude
+//   cur_pos[crossed] = next_face[crossed]  // snap exactly
+//   cur_pos[crossed] += step * face_eps    // nudge into next cell
+//
+// Cell selection is precision-exact (`floor(cur_pos)`) at every depth.
+//
+// `cur_t_world` accumulates `min_t` for `result.t` and the LOD ray-
+// distance estimate. Past depth ~17 the per-cell `min_t` falls below
+// ULP of the running `cur_t_world` so its precision degrades — but
+// `cur_pos` and the cells visited stay correct, so what's drawn is
+// what's there.
 fn march_entity_subtree(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
 ) -> HitResult {
@@ -129,185 +152,171 @@ fn march_entity_subtree(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
-    let inv_dir = vec3<f32>(
-        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
-        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
-        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
-    );
-    let ray_metric = max(length(ray_dir), 1e-6);
+    // Direction sign and "next face" offset — invariant under push/pop.
     let step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
         select(-1, 1, ray_dir.y >= 0.0),
         select(-1, 1, ray_dir.z >= 0.0),
     );
-    let delta_dist = abs(inv_dir);
+    let next_face_offset = vec3<f32>(
+        select(0.0, 1.0, ray_dir.x >= 0.0),
+        select(0.0, 1.0, ray_dir.y >= 0.0),
+        select(0.0, 1.0, ray_dir.z >= 0.0),
+    );
+
+    // Per-frame ray state.
+    var cur_pos: vec3<f32> = ray_origin;
+    var cur_dir: vec3<f32> = ray_dir;
+    var cur_inv_dir: vec3<f32> = vec3<f32>(
+        select(1e10, 1.0 / cur_dir.x, abs(cur_dir.x) > 1e-8),
+        select(1e10, 1.0 / cur_dir.y, abs(cur_dir.y) > 1e-8),
+        select(1e10, 1.0 / cur_dir.z, abs(cur_dir.z) > 1e-8),
+    );
+    var cur_cell_size_root: f32 = 1.0;
+    var cur_t_world: f32 = 0.0;
+    var normal: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
 
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
     var s_cell: array<u32, MAX_STACK_DEPTH>;
-    var cur_cell_size: f32 = 1.0;
-    var cur_node_origin: vec3<f32> = vec3<f32>(0.0);
-    var cur_side_dist: vec3<f32>;
-    var normal = vec3<f32>(0.0, 1.0, 0.0);
-    var depth: u32 = 0u;
     s_node_idx[0] = root_node_idx;
+    var depth: u32 = 0u;
 
     let root_header_off = node_offsets[root_node_idx];
     var cur_occupancy: u32 = tree[root_header_off];
     var cur_first_child: u32 = tree[root_header_off + 1u];
 
-    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    // Initial ray-box test → advance cur_pos to the entry point.
+    let root_hit = ray_box(cur_pos, cur_inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
     }
-    let t_start = max(root_hit.t_enter, 0.0) + 0.001;
-    let entry_pos = ray_origin + ray_dir * t_start;
-    let entry_cell = vec3<i32>(
-        clamp(i32(floor(entry_pos.x)), 0, 2),
-        clamp(i32(floor(entry_pos.y)), 0, 2),
-        clamp(i32(floor(entry_pos.z)), 0, 2),
-    );
-    s_cell[0] = pack_cell(entry_cell);
-    let cell_f = vec3<f32>(entry_cell);
-    cur_side_dist = vec3<f32>(
-        select((cell_f.x - entry_pos.x) * inv_dir.x,
-               (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-        select((cell_f.y - entry_pos.y) * inv_dir.y,
-               (cell_f.y + 1.0 - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-        select((cell_f.z - entry_pos.z) * inv_dir.z,
-               (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
-    );
+    let face_eps = 1e-5;
+    cur_t_world = max(root_hit.t_enter, 0.0) + 0.001;
+    cur_pos = cur_pos + cur_dir * cur_t_world;
 
-    var iterations = 0u;
-    let max_iterations = 2048u;
+    var iterations: u32 = 0u;
     loop {
-        if iterations >= max_iterations { break; }
+        if iterations >= 2048u { break; }
         iterations += 1u;
-        let cell = unpack_cell(s_cell[depth]);
+
+        let cell = vec3<i32>(
+            i32(floor(cur_pos.x)),
+            i32(floor(cur_pos.y)),
+            i32(floor(cur_pos.z)),
+        );
+
+        // Out-of-bounds: ray exited the current frame's [0, 3]³.
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
             depth -= 1u;
-            cur_cell_size = cur_cell_size * 3.0;
             let popped = unpack_cell(s_cell[depth]);
-            cur_node_origin = cur_node_origin - vec3<f32>(popped) * cur_cell_size;
-            let lc_pop = vec3<f32>(popped);
-            cur_side_dist = vec3<f32>(
-                select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
-                       (cur_node_origin.x + (lc_pop.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                select((cur_node_origin.y + lc_pop.y * cur_cell_size - entry_pos.y) * inv_dir.y,
-                       (cur_node_origin.y + (lc_pop.y + 1.0) * cur_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-                select((cur_node_origin.z + lc_pop.z * cur_cell_size - entry_pos.z) * inv_dir.z,
-                       (cur_node_origin.z + (lc_pop.z + 1.0) * cur_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
-            );
+            // Pop: child's frame → parent's frame. Linear, O(1).
+            cur_pos = cur_pos / 3.0 + vec3<f32>(popped);
+            cur_dir = cur_dir / 3.0;
+            cur_inv_dir = cur_inv_dir * 3.0;
+            cur_cell_size_root = cur_cell_size_root * 3.0;
             let parent_header_off = node_offsets[s_node_idx[depth]];
             cur_occupancy = tree[parent_header_off];
             cur_first_child = tree[parent_header_off + 1u];
-            let m_oob = min_axis_mask(cur_side_dist);
-            let advanced = popped + vec3<i32>(m_oob) * step;
-            s_cell[depth] = pack_cell(advanced);
-            cur_side_dist += m_oob * delta_dist * cur_cell_size;
-            normal = -vec3<f32>(step) * m_oob;
             continue;
         }
+
+        s_cell[depth] = pack_cell(cell);
 
         let slot = slot_from_xyz(cell.x, cell.y, cell.z);
         let slot_bit = 1u << slot;
-        if ((cur_occupancy & slot_bit) == 0u) {
-            let m_empty = min_axis_mask(cur_side_dist);
-            s_cell[depth] = pack_cell(cell + vec3<i32>(m_empty) * step);
-            cur_side_dist += m_empty * delta_dist * cur_cell_size;
-            normal = -vec3<f32>(step) * m_empty;
-            continue;
-        }
-        let rank = countOneBits(cur_occupancy & (slot_bit - 1u));
-        let child_base = cur_first_child + rank * 2u;
-        let packed = tree[child_base];
-        let tag = packed & 0xFFu;
+        var should_step = (cur_occupancy & slot_bit) == 0u;
+        var should_push = false;
+        var hit_now = false;
+        var hit_block_type: u32 = 0u;
+        var child_idx: u32 = 0u;
 
-        if tag == 1u {
-            let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-            let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
-            let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+        if !should_step {
+            let rank = countOneBits(cur_occupancy & (slot_bit - 1u));
+            let child_base = cur_first_child + rank * 2u;
+            let packed = tree[child_base];
+            let tag = packed & 0xFFu;
+
+            if tag == 1u {
+                hit_now = true;
+                hit_block_type = (packed >> 8u) & 0xFFFFu;
+            } else if tag == 2u {
+                child_idx = tree[child_base + 1u];
+                let child_bt = (packed >> 8u) & 0xFFFFu;
+                if child_bt == 0xFFFEu {
+                    should_step = true;
+                } else {
+                    let at_max = depth + 1u >= MAX_STACK_DEPTH;
+                    let child_cell_size_root = cur_cell_size_root / 3.0;
+                    let ray_dist = max(cur_t_world * max(length(ray_dir), 1e-6), 0.001);
+                    let lod_pixels = child_cell_size_root / ray_dist
+                        * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+                    let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
+                    if at_max || at_lod {
+                        hit_now = true;
+                        hit_block_type = child_bt;
+                    } else {
+                        should_push = true;
+                    }
+                }
+            } else {
+                should_step = true;
+            }
+        }
+
+        if hit_now {
             result.hit = true;
-            result.t = max(cell_box_h.t_enter, 0.0);
-            result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
+            result.t = cur_t_world;
+            result.color = palette[hit_block_type].rgb;
             result.normal = normal;
-            result.cell_min = cell_min_h;
-            result.cell_size = cur_cell_size;
+            result.cell_min = ray_origin + ray_dir * cur_t_world - vec3<f32>(0.5) * cur_cell_size_root;
+            result.cell_size = cur_cell_size_root;
             return result;
         }
-        // tag == 2u: Cartesian Node descent. tag==3 (EntityRef) is
-        // treated as miss inside entity subtrees — no entities-
-        // inside-entities for now.
-        if tag != 2u {
-            let m_skip = min_axis_mask(cur_side_dist);
-            s_cell[depth] = pack_cell(cell + vec3<i32>(m_skip) * step);
-            cur_side_dist += m_skip * delta_dist * cur_cell_size;
-            normal = -vec3<f32>(step) * m_skip;
-            continue;
-        }
-        let child_idx = tree[child_base + 1u];
-        let child_bt = (packed >> 8u) & 0xFFFFu;
-        if child_bt == 0xFFFEu {  // REPRESENTATIVE_EMPTY (matches gpu::pack u16 sentinel)
-            let m_rep = min_axis_mask(cur_side_dist);
-            s_cell[depth] = pack_cell(cell + vec3<i32>(m_rep) * step);
-            cur_side_dist += m_rep * delta_dist * cur_cell_size;
-            normal = -vec3<f32>(step) * m_rep;
-            continue;
-        }
 
-        let at_max = depth + 1u >= MAX_STACK_DEPTH;
-        let child_cell_size = cur_cell_size / 3.0;
-        let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
-        let ray_dist = max(min_side * ray_metric, 0.001);
-        let lod_pixels = child_cell_size / ray_dist
-            * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
-        let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
-        if at_max || at_lod {
-            let bt = child_bt;
-            if bt == 0xFFFEu || bt == 0xFFFDu {  // REPRESENTATIVE_EMPTY / ENTITY_REPRESENTATIVE
-                let m_lodt = min_axis_mask(cur_side_dist);
-                s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
-                cur_side_dist += m_lodt * delta_dist * cur_cell_size;
-                normal = -vec3<f32>(step) * m_lodt;
-            } else {
-                let cell_min_l = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-                let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
-                let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
-                result.hit = true;
-                result.t = max(cell_box_l.t_enter, 0.0);
-                result.color = palette[bt].rgb;
-                result.normal = normal;
-                result.cell_min = cell_min_l;
-                result.cell_size = cur_cell_size;
-                return result;
-            }
-        } else {
-            let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-            let ct_start = max(root_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
-            let child_entry = ray_origin + ray_dir * ct_start;
-            let local_entry = (child_entry - child_origin) / child_cell_size;
+        if should_push {
+            // Push: parent's frame → child's frame. cell is integer
+            // in [0, 2], so `cur_pos - cell` is exact and `* 3` is
+            // exact in f32; cur_pos lands in [0, 3]³ precisely.
+            cur_pos = (cur_pos - vec3<f32>(cell)) * 3.0;
+            cur_dir = cur_dir * 3.0;
+            cur_inv_dir = cur_inv_dir / 3.0;
+            cur_cell_size_root = cur_cell_size_root / 3.0;
             depth += 1u;
             s_node_idx[depth] = child_idx;
-            cur_node_origin = child_origin;
-            cur_cell_size = child_cell_size;
             let child_header_off = node_offsets[child_idx];
             cur_occupancy = tree[child_header_off];
             cur_first_child = tree[child_header_off + 1u];
-            let child_cell_i = vec3<i32>(
-                clamp(i32(floor(local_entry.x)), 0, 2),
-                clamp(i32(floor(local_entry.y)), 0, 2),
-                clamp(i32(floor(local_entry.z)), 0, 2),
-            );
-            s_cell[depth] = pack_cell(child_cell_i);
-            let lc = vec3<f32>(child_cell_i);
-            cur_side_dist = vec3<f32>(
-                select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
-                       (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                select((child_origin.y + lc.y * child_cell_size - entry_pos.y) * inv_dir.y,
-                       (child_origin.y + (lc.y + 1.0) * child_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-                select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
-                       (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
-            );
+            continue;
+        }
+
+        // Step DDA: advance to the next axis face in the current cell.
+        let cell_f = vec3<f32>(cell);
+        let next_face = cell_f + next_face_offset;
+        let side_dist = (next_face - cur_pos) * cur_inv_dir;
+        var min_t = side_dist.x;
+        var min_axis: u32 = 0u;
+        if side_dist.y < min_t { min_t = side_dist.y; min_axis = 1u; }
+        if side_dist.z < min_t { min_t = side_dist.z; min_axis = 2u; }
+
+        // Advance position by min_t along the ray. delta_pos has
+        // O(1) magnitude — exactly 1 on the crossed axis, ratios of
+        // dirs on the other axes — so cur_pos stays well-conditioned.
+        cur_pos = cur_pos + min_t * cur_dir;
+        cur_t_world = cur_t_world + min_t;
+
+        // Snap the crossed axis to the face value (kills f32 drift
+        // around the boundary) and nudge into the next cell so the
+        // next iteration's `floor(cur_pos)` lands cleanly there.
+        if min_axis == 0u {
+            cur_pos.x = next_face.x + f32(step.x) * face_eps;
+            normal = vec3<f32>(-f32(step.x), 0.0, 0.0);
+        } else if min_axis == 1u {
+            cur_pos.y = next_face.y + f32(step.y) * face_eps;
+            normal = vec3<f32>(0.0, -f32(step.y), 0.0);
+        } else {
+            cur_pos.z = next_face.z + f32(step.z) * face_eps;
+            normal = vec3<f32>(0.0, 0.0, -f32(step.z));
         }
     }
     return result;
