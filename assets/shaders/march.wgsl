@@ -128,9 +128,20 @@ fn write_walker_probe(
 // In this rewrite, every level's DDA runs at `cell_size = 1` in its
 // own local [0, 3]³ frame. Ray dir scales by 3 at each push (`*= 3`),
 // by 1/3 at each pop. Positions stay in O(1) magnitude at all depths
-// — no precision degradation. Hit-time `t` is in the CURRENT frame's
-// local units; we track `cur_scale = 3^-depth` and convert back to
-// the input ray's frame on return.
+// — no precision degradation.
+//
+// Critical invariant: the ray's t parameter is identical in every
+// frame. If `cur_origin = (root_origin - cell_chain) * 3^N` and
+// `cur_dir = root_dir * 3^N`, then for any t the local position
+// satisfies `cur_origin + cur_dir * t = (root_pos(t) - cell_chain)
+// * 3^N` — same t indexes the same world point in every frame. So
+// hit-time `t` is returned UNSCALED; only positions need the
+// per-frame transform on push/pop.
+//
+// `cur_cell_size_root = 3^-depth` is tracked separately so
+// `result.cell_size` and the LOD pixel test report values in the
+// input ray's frame (matching what callers like
+// `uv_dispatch_cartesian_tangent` and the world ribbon-pop expect).
 fn march_entity_subtree(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
 ) -> HitResult {
@@ -162,13 +173,9 @@ fn march_entity_subtree(
         select(1e10, 1.0 / cur_dir.z, abs(cur_dir.z) > 1e-8),
     );
     var cur_delta_dist: vec3<f32> = abs(cur_inv_dir);
-    // Conversion factor from local-frame `t` back to the input
-    // (root) frame's `t`. At depth N this is 3^-N. Updated on
-    // push (×1/3) and pop (×3).
-    var cur_scale: f32 = 1.0;
-    // Cell-size IN THE ROOT FRAME at the current depth. For
-    // returning `result.cell_size` and computing `cell_min` to the
-    // caller in root coords. Updated alongside `cur_scale`.
+    // Cell-size IN THE ROOT FRAME at the current depth (3^-depth).
+    // For `result.cell_size` and the LOD pixel-size test in the
+    // caller's frame.
     var cur_cell_size_root: f32 = 1.0;
 
     var cur_side_dist: vec3<f32>;
@@ -223,7 +230,6 @@ fn march_entity_subtree(
             cur_dir = cur_dir / 3.0;
             cur_inv_dir = cur_inv_dir * 3.0;
             cur_delta_dist = cur_delta_dist * 3.0;
-            cur_scale = cur_scale * 3.0;
             cur_cell_size_root = cur_cell_size_root * 3.0;
             // Recompute side_dist for parent frame at the cell we
             // popped INTO (= cell we descended FROM in the parent).
@@ -272,20 +278,16 @@ fn march_entity_subtree(
 
         if tag == 1u {
             // Block leaf hit. Compute hit-cell box in CURRENT local
-            // frame, then convert t and cell_min back to ROOT frame.
+            // frame; ray-box gives the t at which the ray entered
+            // this cell. Local-t equals input-frame t (invariant),
+            // so return as-is.
             let cell_min_local = vec3<f32>(cell);
             let cell_max_local = cell_min_local + vec3<f32>(1.0);
             let cell_box = ray_box(cur_origin, cur_inv_dir, cell_min_local, cell_max_local);
-            let t_local = max(cell_box.t_enter, 0.0);
             result.hit = true;
-            // Convert local t → root t (input ray's t).
-            result.t = t_local * cur_scale;
+            result.t = max(cell_box.t_enter, 0.0);
             result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
             result.normal = normal;
-            // Reconstruct cell_min in root coords by sampling the
-            // hit position with the ROOT ray (which the caller may
-            // pass back). For our caller (uv_dispatch_cartesian_tangent)
-            // cell_min is informational — set to a reasonable approx.
             result.cell_min = ray_origin + ray_dir * result.t - vec3<f32>(0.5) * cur_cell_size_root;
             result.cell_size = cur_cell_size_root;
             return result;
@@ -312,11 +314,11 @@ fn march_entity_subtree(
         let at_max = depth + 1u >= MAX_STACK_DEPTH;
         let child_cell_size_root = cur_cell_size_root / 3.0;
         // LOD: terminate descent when child cells would be sub-pixel
-        // ON SCREEN. Compute ray distance to current cell entry in
-        // ROOT frame using `cur_scale`.
+        // on screen. `min_side` is the local-frame t to the next
+        // axis face (= world-t since they're invariant); times the
+        // input ray dir's length gives world-distance.
         let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
-        let min_side_root = min_side * cur_scale * max(length(ray_dir), 1e-6);
-        let ray_dist = max(min_side_root, 0.001);
+        let ray_dist = max(min_side * max(length(ray_dir), 1e-6), 0.001);
         let lod_pixels = child_cell_size_root / ray_dist
             * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
         let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
@@ -331,9 +333,8 @@ fn march_entity_subtree(
                 let cell_min_local = vec3<f32>(cell);
                 let cell_max_local = cell_min_local + vec3<f32>(1.0);
                 let cell_box = ray_box(cur_origin, cur_inv_dir, cell_min_local, cell_max_local);
-                let t_local = max(cell_box.t_enter, 0.0);
                 result.hit = true;
-                result.t = t_local * cur_scale;
+                result.t = max(cell_box.t_enter, 0.0);
                 result.color = palette[bt].rgb;
                 result.normal = normal;
                 result.cell_min = ray_origin + ray_dir * result.t - vec3<f32>(0.5) * cur_cell_size_root;
@@ -348,7 +349,6 @@ fn march_entity_subtree(
             cur_dir = cur_dir * 3.0;
             cur_inv_dir = cur_inv_dir / 3.0;
             cur_delta_dist = cur_delta_dist / 3.0;
-            cur_scale = cur_scale / 3.0;
             cur_cell_size_root = child_cell_size_root;
             depth += 1u;
             s_node_idx[depth] = child_idx;
