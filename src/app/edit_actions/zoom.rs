@@ -30,7 +30,7 @@ impl App {
         if let Some(depth) = self.forced_visual_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        let local_target = self.edit_depth()
+        let local_target = (self.edit_depth() + 2)
             .saturating_sub(self.active_frame.render_path.depth() as u32)
             .max(1);
         let pixels = self.frame_projected_pixels(&self.active_frame);
