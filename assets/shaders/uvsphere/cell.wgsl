@@ -111,7 +111,17 @@ fn uv_next_boundary(
 // absolute `(phi_lo, phi_hi, theta_lo, theta_hi, r_lo, r_hi)` plus
 // `found_block` and the leaf's `dphi/dth/dr` for face/bevel.
 //
-// Mirrors `descend` at `src/world/raycast/uvsphere.rs:167-287`.
+// Delta-tracked: holds `delta_X = X_w − X_lo` directly through the
+// loop instead of accumulating `X_lo` and recomputing the
+// difference each level. The straightforward
+// `(phi_w − phi_lo) / dphi` form fails at depth 12+ because
+// `phi_lo` accumulates `K · ULP(2π)` rounding (~`1e-6` by `K=12`),
+// and `dphi = 2π/3^K ≈ 1.2e-5` is the same scale — tier picking
+// goes ~50% wrong, breaks land in random cells. Holding `delta`
+// keeps the arithmetic in O(`dphi`) magnitude all the way down,
+// so tier-picking precision stays at sub-ULP at every depth. See
+// `src/world/raycast/uvsphere.rs::descend` for the matching CPU
+// implementation.
 fn uv_descend_cell(
     start_node_idx: u32,
     start_phi_lo: f32, start_phi_hi: f32,
@@ -125,47 +135,49 @@ fn uv_descend_cell(
     d.block_type = 0u;
 
     var node_idx = start_node_idx;
-    var phi_lo = start_phi_lo;
-    var phi_hi = start_phi_hi;
-    var theta_lo = start_theta_lo;
-    var theta_hi = start_theta_hi;
-    var r_lo = start_r_lo;
-    var r_hi = start_r_hi;
+    var delta_phi   = phi_w   - start_phi_lo;
+    var delta_theta = theta_w - start_theta_lo;
+    var delta_r     = r_w     - start_r_lo;
+    var dphi    = start_phi_hi   - start_phi_lo;
+    var dth     = start_theta_hi - start_theta_lo;
+    var dr_axis = start_r_hi     - start_r_lo;
     var depth: u32 = 0u;
 
     loop {
         if depth >= max_descent { break; }
 
-        let dphi = (phi_hi - phi_lo) / 3.0;
-        let dth  = (theta_hi - theta_lo) / 3.0;
-        let dr   = (r_hi - r_lo) / 3.0;
+        // Step down: child cell is `1/3` of parent on every axis.
+        dphi    = dphi    / 3.0;
+        dth     = dth     / 3.0;
+        dr_axis = dr_axis / 3.0;
 
-        // Pick tier in absolute coords (no `un *= 3` chain).
-        let pt = u32(clamp(floor((phi_w   - phi_lo)   / max(dphi, 1e-30)), 0.0, 2.0));
-        let tt = u32(clamp(floor((theta_w - theta_lo) / max(dth,  1e-30)), 0.0, 2.0));
-        let rt = u32(clamp(floor((r_w     - r_lo)     / max(dr,   1e-30)), 0.0, 2.0));
+        let pt = u32(clamp(floor(delta_phi   / max(dphi,    1e-30)), 0.0, 2.0));
+        let tt = u32(clamp(floor(delta_theta / max(dth,     1e-30)), 0.0, 2.0));
+        let rt = u32(clamp(floor(delta_r     / max(dr_axis, 1e-30)), 0.0, 2.0));
         let slot = pt + tt * 3u + rt * 9u;
 
-        // Refine bounds to the (pt, tt, rt) cell — exact in f32.
-        let new_phi_lo   = phi_lo   + f32(pt) * dphi;
-        let new_phi_hi   = new_phi_lo   + dphi;
-        let new_theta_lo = theta_lo + f32(tt) * dth;
-        let new_theta_hi = new_theta_lo + dth;
-        let new_r_lo     = r_lo     + f32(rt) * dr;
-        let new_r_hi     = new_r_lo     + dr;
+        // Refine deltas — subtraction of similar-magnitude values
+        // keeps result-magnitude precision; never falls off the
+        // tier-picking precision cliff.
+        delta_phi   = delta_phi   - f32(pt) * dphi;
+        delta_theta = delta_theta - f32(tt) * dth;
+        delta_r     = delta_r     - f32(rt) * dr_axis;
 
         let header_off = node_offsets[node_idx];
         let occupancy = tree[header_off];
         if (occupancy & (1u << slot)) == 0u {
+            // Empty slot — return the resolved cell. Recover absolute
+            // bounds via `phi_lo = phi_w − delta_phi` etc; ULP is
+            // bounded by `phi_w`'s, not `K · ULP(phi_lo)`.
             d.dphi = dphi;
             d.dth = dth;
-            d.dr = dr;
-            d.phi_lo = new_phi_lo;
-            d.phi_hi = new_phi_hi;
-            d.theta_lo = new_theta_lo;
-            d.theta_hi = new_theta_hi;
-            d.r_lo = new_r_lo;
-            d.r_hi = new_r_hi;
+            d.dr = dr_axis;
+            d.phi_lo   = phi_w   - delta_phi;
+            d.phi_hi   = d.phi_lo   + dphi;
+            d.theta_lo = theta_w - delta_theta;
+            d.theta_hi = d.theta_lo + dth;
+            d.r_lo     = r_w     - delta_r;
+            d.r_hi     = d.r_lo     + dr_axis;
             d.depth = depth + 1u;
             return d;
         }
@@ -177,13 +189,6 @@ fn uv_descend_cell(
         let packed = tree[child_off];
         let tag = packed & 0xFFu;
 
-        // Commit the descent.
-        phi_lo = new_phi_lo;
-        phi_hi = new_phi_hi;
-        theta_lo = new_theta_lo;
-        theta_hi = new_theta_hi;
-        r_lo = new_r_lo;
-        r_hi = new_r_hi;
         depth = depth + 1u;
 
         if tag == 1u {
@@ -191,13 +196,13 @@ fn uv_descend_cell(
             d.block_type = (packed >> 8u) & 0xFFFFu;
             d.dphi = dphi;
             d.dth = dth;
-            d.dr = dr;
-            d.phi_lo = phi_lo;
-            d.phi_hi = phi_hi;
-            d.theta_lo = theta_lo;
-            d.theta_hi = theta_hi;
-            d.r_lo = r_lo;
-            d.r_hi = r_hi;
+            d.dr = dr_axis;
+            d.phi_lo   = phi_w   - delta_phi;
+            d.phi_hi   = d.phi_lo   + dphi;
+            d.theta_lo = theta_w - delta_theta;
+            d.theta_hi = d.theta_lo + dth;
+            d.r_lo     = r_w     - delta_r;
+            d.r_hi     = d.r_lo     + dr_axis;
             d.depth = depth;
             return d;
         }
@@ -208,27 +213,27 @@ fn uv_descend_cell(
         // EntityRef / Empty leaf — treat as empty at this resolved cell.
         d.dphi = dphi;
         d.dth = dth;
-        d.dr = dr;
-        d.phi_lo = phi_lo;
-        d.phi_hi = phi_hi;
-        d.theta_lo = theta_lo;
-        d.theta_hi = theta_hi;
-        d.r_lo = r_lo;
-        d.r_hi = r_hi;
+        d.dr = dr_axis;
+        d.phi_lo   = phi_w   - delta_phi;
+        d.phi_hi   = d.phi_lo   + dphi;
+        d.theta_lo = theta_w - delta_theta;
+        d.theta_hi = d.theta_lo + dth;
+        d.r_lo     = r_w     - delta_r;
+        d.r_hi     = d.r_lo     + dr_axis;
         d.depth = depth;
         return d;
     }
 
     // Hit `max_descent`. Return the deepest committed cell.
-    d.dphi = (phi_hi - phi_lo) / 3.0;
-    d.dth = (theta_hi - theta_lo) / 3.0;
-    d.dr = (r_hi - r_lo) / 3.0;
-    d.phi_lo = phi_lo;
-    d.phi_hi = phi_hi;
-    d.theta_lo = theta_lo;
-    d.theta_hi = theta_hi;
-    d.r_lo = r_lo;
-    d.r_hi = r_hi;
+    d.dphi = dphi / 3.0;
+    d.dth = dth / 3.0;
+    d.dr = dr_axis / 3.0;
+    d.phi_lo   = phi_w   - delta_phi;
+    d.phi_hi   = d.phi_lo   + dphi;
+    d.theta_lo = theta_w - delta_theta;
+    d.theta_hi = d.theta_lo + dth;
+    d.r_lo     = r_w     - delta_r;
+    d.r_hi     = d.r_lo     + dr_axis;
     d.depth = depth;
     return d;
 }

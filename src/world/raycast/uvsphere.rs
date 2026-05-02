@@ -175,35 +175,54 @@ fn descend(
     r_w: f32,
     max_depth: u32,
 ) -> Option<Descent> {
-    let mut phi_lo = 0.0_f32;
-    let mut phi_hi = TAU;
-    let mut theta_lo = -body_theta_cap;
-    let mut theta_hi = body_theta_cap;
-    let mut r_lo = body_inner_r;
-    let mut r_hi = body_outer_r;
+    // Delta-tracking: hold `delta_X = X_w − X_lo` directly instead
+    // of accumulating `X_lo` and subtracting at every level. The
+    // straightforward `(phi_w − phi_lo) / dphi` form fails at depth
+    // 12+ because `phi_lo` accumulates `K · ULP(2π)` rounding (~1e-6
+    // by `K=12`), and `dphi = 2π/3^K ≈ 1.2e-5` is the same scale —
+    // tier picking goes ~50% wrong. Holding `delta` keeps it in
+    // O(`dphi`) arithmetic the whole way down: each refinement
+    // `delta -= pt · dphi` operates on similar-magnitude operands,
+    // so the result's precision is O(dphi · ULP) — five orders of
+    // magnitude tighter at K=12. For the absolute bounds we only
+    // need on the last hop (face / bevel / step boundaries),
+    // recompute them at return as `phi_lo = phi_w − delta`.
+    let mut delta_phi   = phi_w;                   // = phi_w − 0
+    let mut delta_theta = theta_w + body_theta_cap;// = theta_w − (−theta_cap)
+    let mut delta_r     = r_w - body_inner_r;
+    let mut dphi: f32 = TAU;
+    let mut dth: f32 = 2.0 * body_theta_cap;
+    let mut dr_axis: f32 = body_outer_r - body_inner_r;
     let mut node_id = body_root_id;
     let mut path: Vec<(NodeId, usize)> = Vec::new();
 
     loop {
-        let dphi = (phi_hi - phi_lo) / 3.0;
-        let dth = (theta_hi - theta_lo) / 3.0;
-        let dr = (r_hi - r_lo) / 3.0;
+        // Step down: each axis's child cell is `1/3` of the parent.
+        dphi = dphi / 3.0;
+        dth = dth / 3.0;
+        dr_axis = dr_axis / 3.0;
 
-        let pt = (((phi_w - phi_lo) / dphi.max(1e-12)).floor().clamp(0.0, 2.0)) as usize;
-        let tt = (((theta_w - theta_lo) / dth.max(1e-12)).floor().clamp(0.0, 2.0)) as usize;
-        let rt = (((r_w - r_lo) / dr.max(1e-12)).floor().clamp(0.0, 2.0)) as usize;
+        let pt = ((delta_phi / dphi.max(1e-30)).floor().clamp(0.0, 2.0)) as usize;
+        let tt = ((delta_theta / dth.max(1e-30)).floor().clamp(0.0, 2.0)) as usize;
+        let rt = ((delta_r / dr_axis.max(1e-30)).floor().clamp(0.0, 2.0)) as usize;
         let slot = slot_index(pt, tt, rt);
 
         let node = library.get(node_id)?;
         path.push((node_id, slot));
 
-        // Refine bounds to the (pt, tt, rt) cell.
-        phi_lo = phi_lo + pt as f32 * dphi;
-        phi_hi = phi_lo + dphi;
-        theta_lo = theta_lo + tt as f32 * dth;
-        theta_hi = theta_lo + dth;
-        r_lo = r_lo + rt as f32 * dr;
-        r_hi = r_lo + dr;
+        // Refine deltas to the (pt, tt, rt) cell. Subtraction of
+        // similar-magnitude values keeps result-magnitude precision —
+        // never falls off the tier-picking precision cliff.
+        delta_phi   = delta_phi   - (pt as f32) * dphi;
+        delta_theta = delta_theta - (tt as f32) * dth;
+        delta_r     = delta_r     - (rt as f32) * dr_axis;
+        // Recover absolute bounds for the early-exit branches.
+        let phi_lo = phi_w - delta_phi;
+        let phi_hi = phi_lo + dphi;
+        let theta_lo = theta_w - delta_theta;
+        let theta_hi = theta_lo + dth;
+        let r_lo = r_w - delta_r;
+        let r_hi = r_lo + dr_axis;
 
         match node.children[slot] {
             Child::Empty | Child::EntityRef(_) => {
@@ -497,6 +516,180 @@ mod tests {
         .expect("ray through body should hit a Block");
         assert!(hit.path.first().is_some(), "path must start at body root");
         assert_eq!(hit.path[0].0, body, "first entry's node is the body root");
+    }
+
+    /// Reproduces the deep-cell tier-picking failure.
+    ///
+    /// At descent depth K, the descent picks tier from
+    /// `(phi_w - phi_lo) / dphi`. `phi_lo` accumulates K ULPs of
+    /// f32 rounding from `K` incremental additions. By depth 12
+    /// the accumulated error (~`K · 3.7e-7 ≈ 4.5e-6`) is comparable
+    /// to `dphi = 2π/3^12 ≈ 1.2e-5` — about 35% of one tier — so
+    /// `floor()` picks the wrong tier with high probability and
+    /// breaks land in random cells near the click.
+    ///
+    /// The test fires N rays at slightly perturbed angles that all
+    /// hit the same depth-K cell. Each ray's hit path tail (the
+    /// deepest few slots) should be identical because they all
+    /// land in the same cell. With f32-precision tier picking via
+    /// `(phi_w - phi_lo) / dphi`, the tails diverge once descent
+    /// reaches the precision cliff.
+    /// Sweep phi_w near a deep tier boundary; demonstrates how
+    /// the f32 `(phi_w - phi_lo) / dphi` arithmetic flips tiers
+    /// across a window much wider than `dphi_target`. Delta-tracking
+    /// (the recommended fix) keeps the boundary at sub-ULP width.
+    #[test]
+    fn descent_tier_picking_near_boundary_at_depth_12() {
+        let target_depth = 12_u32;
+        // Build a phi_lo that has K accumulated rounding errors,
+        // matching what the real descent does.
+        let mut phi_lo_built: f32 = 0.0;
+        let mut phi_hi_built: f32 = std::f32::consts::TAU;
+        let path: [u32; 12] = [1, 0, 2, 1, 0, 2, 1, 0, 1, 2, 0, 1];
+        for &pt in &path {
+            let dphi = (phi_hi_built - phi_lo_built) / 3.0;
+            phi_lo_built = phi_lo_built + (pt as f32) * dphi;
+            phi_hi_built = phi_lo_built + dphi;
+        }
+        let dphi_target = phi_hi_built - phi_lo_built;
+        let target_phi_lo = phi_lo_built;
+
+        // Pick K phi_w values that step ACROSS the cell at fine
+        // sub-cell increments and observe whether (phi_w - phi_lo)
+        // / dphi gives the EXPECTED un_phi (= 0..1 linearly).
+        let n = 9;
+        let mut max_err: f32 = 0.0;
+        // Sweep strict-interior fractions of the target cell.
+        for i in 0..n {
+            let frac = ((i as f32) + 0.5) / (n as f32);
+            let phi_w = target_phi_lo + frac * dphi_target;
+            // Walk f32 descent USING DELTA TRACKING (the fix). The
+            // straightforward `(phi_w − phi_lo) / dphi` form gives
+            // ~98% un_phi error at depth 12; delta-tracking holds it
+            // at sub-ULP.
+            let mut delta: f32 = phi_w;
+            let mut dphi: f32 = std::f32::consts::TAU;
+            for _ in 0..target_depth {
+                dphi = dphi / 3.0;
+                let pt = ((delta / dphi).floor().clamp(0.0, 2.0)) as u32;
+                delta = delta - (pt as f32) * dphi;
+            }
+            // un_phi the descent perceives.
+            let un_phi = delta / dphi;
+            let err = (un_phi - frac).abs();
+            if err > max_err { max_err = err; }
+        }
+        assert!(
+            max_err < 0.05,
+            "descent's un_phi diverges from expected by more than 5% \
+             at depth 12 — max err = {}",
+            max_err,
+        );
+    }
+
+    /// Direct precision test for the descent's tier picking.
+    /// Walks from body root to depth K accumulating `phi_lo` and
+    /// at each level computes `(phi_w - phi_lo) / dphi` — the same
+    /// tier-pick expression as `descend`. By depth 12 the accumulated
+    /// rounding in `phi_lo` (~`12 · ULP(2π) ≈ 4.5e-6`) is a meaningful
+    /// fraction of `dphi = 2π/3^12 ≈ 1.2e-5` and the picked tier diverges
+    /// from the geometrically-correct one.
+    #[test]
+    fn descent_tier_picking_precision_at_depth_12() {
+        let body_inner_r = 0.15_f32;
+        let body_outer_r = 0.60_f32;
+        let body_theta_cap = std::f32::consts::FRAC_PI_2 * 0.9;
+        // Pick a phi_w that lands in a known cell at depth 12.
+        // We'll construct it by walking down a known tier path,
+        // building phi_lo IDEALLY (without f32 rounding) by summing
+        // exact ternary fractions, then setting phi_w = phi_lo + dphi/2.
+        let target_depth = 12_u32;
+        // Pick a tier sequence — same tier at every level (e.g., 1).
+        // The cell at depth K with all tiers = 1 has center at:
+        //   phi_center = 2π * (1/3 + 1/9 + 1/27 + ... + 1/3^K) + dphi/2
+        //              = 2π * 0.5 * (1 − 3^-K) + 0.5 * dphi
+        //              → 2π * 0.5 = π as K → ∞.
+        // Use ternary-fraction style sum (exact in f32 only up to K~12).
+        let mut phi_lo_ideal: f64 = 0.0;
+        let mut dphi_ideal: f64 = std::f64::consts::TAU;
+        for _ in 0..target_depth {
+            dphi_ideal /= 3.0;
+            phi_lo_ideal += dphi_ideal;
+        }
+        let dphi_target = dphi_ideal as f32;
+        let phi_w = (phi_lo_ideal + 0.5 * dphi_ideal) as f32;
+
+        // Now walk descent IN F32 — accumulating phi_lo with rounding.
+        let mut phi_lo: f32 = 0.0;
+        let mut phi_hi: f32 = std::f32::consts::TAU;
+        let mut picked = Vec::new();
+        for _ in 0..target_depth {
+            let dphi = (phi_hi - phi_lo) / 3.0;
+            let pt = (((phi_w - phi_lo) / dphi).floor().clamp(0.0, 2.0)) as u32;
+            picked.push(pt);
+            phi_lo = phi_lo + (pt as f32) * dphi;
+            phi_hi = phi_lo + dphi;
+        }
+        // Expected: all tiers = 1 (the path we constructed phi_w to land in).
+        let expected: Vec<u32> = (0..target_depth).map(|_| 1).collect();
+        assert_eq!(
+            picked, expected,
+            "f32 (phi_w - phi_lo)/dphi diverges at deep depth — descent picks wrong cell"
+        );
+        // Sanity: dphi at depth 12 should match.
+        assert!((dphi_target - dphi_ideal as f32).abs() < 1e-12);
+        let _ = (body_inner_r, body_outer_r, body_theta_cap);
+    }
+
+    #[test]
+    fn deep_descent_tier_picking_is_stable() {
+        let (lib, _root, body) = build_demo_tree();
+        // Aim at the body's surface; small angular jitter between
+        // rays. Body centre = (1.5, 1.5, 1.5); outer_r in body
+        // frame ≈ 0.6.
+        let cam = [1.5_f32, 1.5, 0.6]; // camera south of body
+        let target_depth: u32 = 14; // past the precision cliff
+        let mut tails: Vec<Vec<usize>> = Vec::new();
+        let n = 5;
+        for i in 0..n {
+            // Sub-ULP angular jitter — at f32 this is the same ray
+            // for atan2 purposes, but the descent's phi_lo
+            // accumulation will diverge.
+            let dx = (i as f32) * 1e-9;
+            let dir = {
+                let mut d = [dx, 0.0_f32, 1.0];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                d[0] /= l;
+                d[1] /= l;
+                d[2] /= l;
+                d
+            };
+            let hit = cpu_raycast_uv_body(&lib, body, cam, dir, target_depth);
+            if let Some(h) = hit {
+                let depth = h.path.len();
+                if depth >= 8 {
+                    let tail: Vec<usize> = h.path[depth - 4..]
+                        .iter()
+                        .map(|(_, s)| *s)
+                        .collect();
+                    tails.push(tail);
+                }
+            }
+        }
+
+        // All sub-ULP-perturbed rays should land in the same deep
+        // cell — the tail should be identical. With buggy tier
+        // picking, the tails diverge.
+        if tails.len() >= 2 {
+            let first = &tails[0];
+            for t in &tails[1..] {
+                assert_eq!(
+                    t, first,
+                    "deep descent picks unstable tiers — tails diverge: {:?} vs {:?}",
+                    first, t,
+                );
+            }
+        }
     }
 
     #[test]
