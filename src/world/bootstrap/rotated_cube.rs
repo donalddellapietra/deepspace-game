@@ -35,18 +35,32 @@ use crate::world::tree::{
     empty_children, slot_index, uniform_children, Child, NodeKind, NodeLibrary, MAX_DEPTH,
 };
 
-/// Default total tree depth for the rotated-cube preset. Deep enough
-/// to exercise the precision-stable render-frame path the user
-/// requires — the cubes live at this depth with a 28-level centered
-/// descent chain above them.
+/// Default total tree depth for the rotated-cube preset.
 pub const DEFAULT_ROTATED_CUBE_DEPTH: u8 = 30;
+/// Default depth of uniform recursive subtree INSIDE each cube. This
+/// is what makes the world meaningfully "N layers" — without this,
+/// the cubes are 1-cell uniform leaves and zooming in reveals
+/// nothing. Mirrors `wrapped_planet`'s `cell_subtree_depth = 20`.
+pub const DEFAULT_ROTATED_CUBE_SUBTREE_DEPTH: u8 = 20;
 
 pub fn rotated_cube_world() -> WorldState {
-    rotated_cube_world_at_depth(DEFAULT_ROTATED_CUBE_DEPTH)
+    rotated_cube_world_at_depth(
+        DEFAULT_ROTATED_CUBE_DEPTH,
+        DEFAULT_ROTATED_CUBE_SUBTREE_DEPTH,
+    )
 }
 
-pub fn rotated_cube_world_at_depth(total_depth: u8) -> WorldState {
-    assert!(total_depth >= 2, "total_depth must be >= 2");
+pub fn rotated_cube_world_at_depth(
+    total_depth: u8,
+    cube_subtree_depth: u8,
+) -> WorldState {
+    assert!(total_depth >= 4, "total_depth must be >= 4");
+    assert!(cube_subtree_depth >= 1, "cube_subtree_depth must be >= 1");
+    assert!(
+        cube_subtree_depth + 2 <= total_depth,
+        "cube_subtree_depth ({}) + 2 must fit in total_depth ({})",
+        cube_subtree_depth, total_depth,
+    );
     assert!(
         (total_depth as usize) <= MAX_DEPTH,
         "total_depth {} exceeds MAX_DEPTH {}",
@@ -56,38 +70,55 @@ pub fn rotated_cube_world_at_depth(total_depth: u8) -> WorldState {
 
     let mut library = NodeLibrary::default();
 
-    // The rotated cube: TangentBlock whose 27 children are uniform
-    // grass. Cannot uniform-flatten, so the node stays explicit; the
-    // shader keys on `NodeKind::TangentBlock` to dispatch the
-    // per-cell rotation transform.
+    // Helper: build a uniform recursive subtree of `depth` Cartesian
+    // levels, all 27 children = the inner (eventually `Block`).
+    // Content-addressed dedup keeps the chain to O(depth) library
+    // entries no matter how many cells it covers. Mirrors
+    // `wrapped_planet::build_uniform_anchor`.
+    fn uniform_anchor(library: &mut NodeLibrary, block_id: u16, depth: u8) -> Child {
+        if depth == 0 {
+            return Child::Block(block_id);
+        }
+        let inner = uniform_anchor(library, block_id, depth - 1);
+        Child::Node(library.insert(uniform_children(inner)))
+    }
+
+    // Rotated cube: TangentBlock whose 27 children are deep uniform
+    // grass anchors. The TangentBlock node itself is at the cube
+    // root level; INSIDE it, `cube_subtree_depth - 1` more levels of
+    // uniform grass form the recursive content. Total levels at and
+    // below the TangentBlock = `cube_subtree_depth`.
+    let grass_inner = uniform_anchor(&mut library, block::GRASS, cube_subtree_depth - 1);
     let rotated_cube = library.insert_with_kind(
-        uniform_children(Child::Block(block::GRASS)),
+        uniform_children(grass_inner),
         NodeKind::TangentBlock,
     );
 
-    // The axis-aligned reference: regular Cartesian node, uniform
-    // stone, same shape. Renders through the unmodified Cartesian
-    // DDA path. A side-by-side comparison is mandatory — a yaw
-    // rotation keeps vertical edges vertical, so a lone rotated cube
-    // can look identical to an axis-aligned one head-on.
-    let reference_cube = library.insert(uniform_children(Child::Block(block::STONE)));
+    // Reference cube: regular Cartesian, same depth + structure but
+    // uniform stone. Renders through the unmodified Cartesian DDA so
+    // any visual difference between the two cubes attributes solely
+    // to the rotation transform.
+    let stone_inner = uniform_anchor(&mut library, block::STONE, cube_subtree_depth - 1);
+    let reference_cube = library.insert(uniform_children(stone_inner));
 
     // Container holds the two cubes in adjacent slots:
     //   slot 12 (cell 0,1,1) = rotated grass cube (LEFT)
     //   slot 14 (cell 2,1,1) = reference stone cube (RIGHT)
     //   slot 22 (cell 1,1,2) = empty — camera anchor lives here
-    // Other slots are empty, giving each cube an isolated silhouette.
     let mut container_children = empty_children();
     container_children[slot_index(0, 1, 1)] = Child::Node(rotated_cube);
     container_children[slot_index(2, 1, 1)] = Child::Node(reference_cube);
     let mut current = library.insert(container_children);
 
-    // Centered descent chain above the container. Each wrap is a
-    // Cartesian node whose only non-empty slot is slot 13 (centre).
-    // After (total_depth - 2) wraps, the container sits at tree depth
-    // (total_depth - 2); cubes at (total_depth - 1); block leaves at
-    // total_depth. Pure integer arithmetic, no f32 anywhere.
-    for _ in 0..(total_depth - 2) {
+    // Centered descent chain above the container. Chain length is
+    // `total_depth - 1 - cube_subtree_depth` so that:
+    //   block leaves          @ depth `total_depth`
+    //   cube node             @ depth `total_depth - cube_subtree_depth`
+    //   container             @ depth `chain_len`
+    //   camera anchor cell    @ depth `chain_len + 1` (slot 22 of last
+    //                          chain wrapper — sibling of container)
+    let chain_len = total_depth - 1 - cube_subtree_depth;
+    for _ in 0..chain_len {
         let mut wrapper = empty_children();
         wrapper[slot_index(1, 1, 1)] = Child::Node(current);
         current = library.insert(wrapper);
@@ -96,43 +127,44 @@ pub fn rotated_cube_world_at_depth(total_depth: u8) -> WorldState {
     library.ref_inc(current);
     let world = WorldState { root: current, library };
     eprintln!(
-        "Rotated cube world: depth={}, library_entries={} \
-         (rotated grass @ slot12, reference stone @ slot14, container @ depth {})",
+        "Rotated cube world: depth={}, library_entries={}, \
+         cube_subtree_depth={}, container @ depth {}",
         world.tree_depth(),
         world.library.len(),
-        total_depth - 2,
+        cube_subtree_depth,
+        chain_len,
     );
     world
 }
 
 pub(crate) fn bootstrap_rotated_cube_world() -> WorldBootstrap {
-    bootstrap_rotated_cube_world_at_depth(DEFAULT_ROTATED_CUBE_DEPTH)
+    bootstrap_rotated_cube_world_at_depth(
+        DEFAULT_ROTATED_CUBE_DEPTH,
+        DEFAULT_ROTATED_CUBE_SUBTREE_DEPTH,
+    )
 }
 
-pub(crate) fn bootstrap_rotated_cube_world_at_depth(total_depth: u8) -> WorldBootstrap {
-    let world = rotated_cube_world_at_depth(total_depth);
+pub(crate) fn bootstrap_rotated_cube_world_at_depth(
+    total_depth: u8,
+    cube_subtree_depth: u8,
+) -> WorldBootstrap {
+    let world = rotated_cube_world_at_depth(total_depth, cube_subtree_depth);
 
-    // Camera anchor: precision-stable construction via integer Path
-    // pushes — no absolute world XYZ at any step. The chain descends
-    // (total_depth - 3) levels of slot 13, then a final slot 22 push
-    // (cell 1,1,2 = +Z neighbour of the next chain step). That places
-    // the camera as a SIBLING of the container at depth `total_depth -
-    // 2` rather than inside it — far enough back that both cubes fit
-    // in the frame instead of filling it.
+    // Camera anchor: pure integer Path::push arithmetic; no absolute
+    // world XYZ. The centered chain descends (chain_len - 1) levels
+    // of slot 13, then a final slot 22 push placing the camera as a
+    // SIBLING of the container at depth `chain_len` (cell 1,1,2 of
+    // the same parent that holds the container at slot 13).
     //
-    // Geometry in the wrapper's [0, 3) local frame at depth
-    // `total_depth - 3`:
-    //   slot 13 = container at local [1, 2)³ (cubes are inside)
+    // Geometry in that parent's [0, 3) local frame:
+    //   slot 13 = container at local [1, 2)³  (rotated + reference)
     //   slot 22 = camera cell at local [1, 2)×[1, 2)×[2, 3)
-    //   camera offset (0.5, 0.5, 0.5) → wrapper-local (1.5, 1.5, 2.5)
-    //   cubes inside container project to wrapper-local
-    //     [1, 4/3) × [4/3, 5/3) × [4/3, 5/3)   (rotated grass)
-    //     [5/3, 2) × [4/3, 5/3) × [4/3, 5/3)   (reference stone)
-    //   ≈ 18° angular offset from forward — comfortable framing.
+    //   camera offset (0.5, 0.5, 0.5) → frame-local (1.5, 1.5, 2.5)
+    //   cubes project to ≈ 18° angular offset from forward (-Z).
+    let chain_len = total_depth - 1 - cube_subtree_depth;
     let mut anchor = Path::root();
-    let chain_len = total_depth - 3;
-    for _ in 0..chain_len {
-        anchor.push(slot_index(1, 1, 1) as u8); // centre slot 13
+    for _ in 0..(chain_len - 1) {
+        anchor.push(slot_index(1, 1, 1) as u8);
     }
     anchor.push(slot_index(1, 1, 2) as u8); // slot 22 = +Z neighbour
     let spawn_pos = WorldPos::new(anchor, [0.5, 0.5, 0.5]);
