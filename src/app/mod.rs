@@ -638,24 +638,101 @@ impl App {
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::normalize(fwd_world);
-        let right_local = crate::world::sdf::normalize(right_world);
-        let up_local = crate::world::sdf::normalize(up_world);
+
+        // Cumulative rotation of the render frame relative to world.
+        // Walk the camera's anchor path; each TangentBlock crossed
+        // contributes its quaternion. Identity if the path is pure
+        // Cartesian — the OUTSIDE case, no behavior change.
+        let frame_rotation = self.accumulated_render_rotation();
+        let inv_rot = quat_inverse(frame_rotation);
+        // Rotate basis INTO the render frame's local coords. Inside a
+        // rotated cube this means rays cast in cube-local direction,
+        // so the cube's axis-aligned interior cells render rotated
+        // relative to the player's world view.
+        let fwd_local = quat_rotate(inv_rot, crate::world::sdf::normalize(fwd_world));
+        let right_local = quat_rotate(inv_rot, crate::world::sdf::normalize(right_world));
+        let up_local = quat_rotate(inv_rot, crate::world::sdf::normalize(up_world));
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
-                fwd_world,
-                fwd_local,
-                right_local,
-                up_local,
+                "gpu_camera basis world_fwd={:?} local_fwd={:?} frame_rot={:?}",
+                fwd_world, fwd_local, frame_rotation,
             );
         }
-        self.camera.gpu_camera_with_basis(
+        let mut gpu = self.camera.gpu_camera_with_basis(
             cam_local,
             fwd_local,
             right_local,
             up_local,
             1.2,
-        )
+        );
+        gpu.frame_rotation = frame_rotation;
+        gpu
     }
+
+    /// Walk the camera's anchor path from world root, accumulating
+    /// the product of every `TangentBlock` quaternion encountered.
+    /// Identity when the path passes through no TangentBlocks. Used
+    /// by `gpu_camera_for_frame` to pre-rotate the camera basis and
+    /// by `frame_aware_raycast` to rotate the cursor ray direction —
+    /// CPU and GPU stay in sync.
+    pub(in crate::app) fn accumulated_render_rotation(&self) -> [f32; 4] {
+        let mut cum = [0.0_f32, 0.0, 0.0, 1.0];
+        let mut node_id = self.world.root;
+        if let Some(node) = self.world.library.get(node_id) {
+            if let NodeKind::TangentBlock { rotation } = node.kind {
+                cum = quat_mul(cum, rotation);
+            }
+        }
+        for slot in self.camera.position.anchor.as_slice() {
+            let Some(node) = self.world.library.get(node_id) else { break };
+            match node.children[*slot as usize] {
+                crate::world::tree::Child::Node(child_id) => {
+                    node_id = child_id;
+                    if let Some(child_node) = self.world.library.get(child_id) {
+                        if let NodeKind::TangentBlock { rotation } = child_node.kind {
+                            cum = quat_mul(cum, rotation);
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        cum
+    }
+}
+
+/// Hamilton product of two unit quaternions. `quat_mul(a, b)` represents
+/// "first b, then a" when applied to a vector.
+pub(crate) fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let (ax, ay, az, aw) = (a[0], a[1], a[2], a[3]);
+    let (bx, by, bz, bw) = (b[0], b[1], b[2], b[3]);
+    [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
+}
+
+/// Inverse (= conjugate) of a unit quaternion.
+pub(crate) fn quat_inverse(q: [f32; 4]) -> [f32; 4] {
+    [-q[0], -q[1], -q[2], q[3]]
+}
+
+/// Rotate a 3-vector by a unit quaternion via
+/// `v + 2·qv × (qv × v + qw·v)`.
+pub(crate) fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let qv = [q[0], q[1], q[2]];
+    let w = q[3];
+    let t1 = [
+        qv[1] * v[2] - qv[2] * v[1] + w * v[0],
+        qv[2] * v[0] - qv[0] * v[2] + w * v[1],
+        qv[0] * v[1] - qv[1] * v[0] + w * v[2],
+    ];
+    let t2 = [
+        qv[1] * t1[2] - qv[2] * t1[1],
+        qv[2] * t1[0] - qv[0] * t1[2],
+        qv[0] * t1[1] - qv[1] * t1[0],
+    ];
+    [v[0] + 2.0 * t2[0], v[1] + 2.0 * t2[1], v[2] + 2.0 * t2[2]]
 }

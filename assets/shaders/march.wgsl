@@ -2028,52 +2028,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 ray_origin, ray_dir,
                 uniforms.planet_render.y,
             );
-        } else if cur_kind == NODE_KIND_TANGENT_BLOCK {
-            // The render frame IS the cube — camera flew inside.
-            // Without this branch, the camera ray would march the
-            // cube's interior axis-aligned, causing the 45° snap as
-            // the outside-the-cube dispatch (in march_cartesian) no
-            // longer fires once the frame root is the cube itself.
-            //
-            // Use `march_in_tangent_cube` (TANGENT_STACK_DEPTH = 24),
-            // NOT `march_cartesian` (MAX_STACK_DEPTH = 8). The cube
-            // interior is up to 20+ levels deep; with the smaller
-            // stack the deep cells LOD-splat to the representative
-            // block, masking edits — break/place CPU goes through
-            // but the shader can't show the result. Same reason the
-            // outside dispatch in march_cartesian uses the deep
-            // walker.
-            //
-            // Read the cube's quaternion from node_kinds — same data
-            // the outside dispatch reads. Both inside and outside
-            // share one rotation source.
-            let q = node_kinds[current_idx].rotation;
-            let xx = q.x * q.x; let yy = q.y * q.y; let zz = q.z * q.z;
-            let xy = q.x * q.y; let xz = q.x * q.z; let yz = q.y * q.z;
-            let wx = q.w * q.x; let wy = q.w * q.y; let wz = q.w * q.z;
-            let east_in   = vec3<f32>(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz),     2.0 * (xz - wy));
-            let normal_in = vec3<f32>(2.0 * (xy - wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx));
-            let north_in  = vec3<f32>(2.0 * (xz + wy),       2.0 * (yz - wx),     1.0 - 2.0 * (xx + yy));
-
-            let frame_centre = vec3<f32>(1.5);
-            let d_centre = ray_origin - frame_centre;
-            // dot with rows = R⁻¹ applied (R = [east, normal, north] columns).
-            let local_origin = vec3<f32>(
-                dot(east_in,   d_centre),
-                dot(normal_in, d_centre),
-                dot(north_in,  d_centre),
-            ) + frame_centre;
-            let local_dir = vec3<f32>(
-                dot(east_in,   ray_dir),
-                dot(normal_in, ray_dir),
-                dot(north_in,  ray_dir),
-            );
-            r = march_in_tangent_cube(current_idx, local_origin, local_dir);
-            if r.hit {
-                // Rotate the hit normal back to world via R (columns).
-                let n_local = r.normal;
-                r.normal = east_in * n_local.x + normal_in * n_local.y + north_in * n_local.z;
-            }
         } else {
             // Cartesian frame: no depth cap beyond the hardware stack
             // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole

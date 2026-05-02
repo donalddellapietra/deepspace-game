@@ -23,10 +23,16 @@ pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 1.0;
 impl App {
     pub(super) fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
         // In Cartesian frames, all levels share the same axes — the
-        // direction is identical in every frame.  The DDA only cares
-        // about the *direction*, not the magnitude.  The old code
-        // scaled by 3^depth which overflows f32 past depth ~20.
-        crate::world::sdf::normalize(self.camera.forward())
+        // direction is identical in every frame. Pre-rotate by the
+        // inverse of the cumulative TangentBlock rotation along the
+        // camera anchor path so the ray cast inside a rotated cube
+        // travels in cube-local direction — same transform applied
+        // to the GPU camera basis. CPU cursor and shader visual stay
+        // in sync. Identity rotation outside any TangentBlock, so
+        // standard Cartesian frames are unaffected.
+        let world_dir = crate::world::sdf::normalize(self.camera.forward());
+        let inv_rot = crate::app::quat_inverse(self.accumulated_render_rotation());
+        crate::app::quat_rotate(inv_rot, world_dir)
     }
 
     /// Interaction distance cap in the given frame's local units.

@@ -137,6 +137,16 @@ pub struct GpuCamera {
     /// When the raster pass is disabled, the matrix is still
     /// uploaded (trivial cost) but nothing reads it.
     pub view_proj: [[f32; 4]; 4],
+    /// Cumulative rotation of the render frame relative to world, as
+    /// a unit quaternion `(x, y, z, w)`. Identity `(0, 0, 0, 1)` when
+    /// the camera anchor's path crosses no `TangentBlock`s; equal to
+    /// the cumulative product of TangentBlock rotations along the
+    /// path otherwise. The shader applies this to hit normals so
+    /// world-frame lighting works regardless of where the camera is.
+    /// Camera basis (forward/right/up) is pre-rotated by R⁻¹ on the
+    /// CPU so rays inside a rotated cube travel in cube-local
+    /// directions.
+    pub frame_rotation: [f32; 4],
 }
 
 /// One entity instance on the GPU: a bounding cube in the current

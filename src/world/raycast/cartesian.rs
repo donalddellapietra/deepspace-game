@@ -36,42 +36,15 @@ fn apply_inv_basis(v: [f32; 3], basis: ([f32; 3], [f32; 3], [f32; 3])) -> [f32; 
     [dot3(east, v), dot3(normal, v), dot3(north, v)]
 }
 
-/// Public entry: transform `(ray_origin, ray_dir)` into the cube's
-/// local rotated frame using the cube's quaternion. The frame is
-/// `[0, 3)³` with rotation around its centre `(1.5, 1.5, 1.5)`.
-/// Used by `cpu_raycast_in_frame` when the active render frame IS a
-/// TangentBlock — so the camera ray is in cube-local coords before
-/// the inner DDA runs.
-pub fn rotate_camera_into_tangent_frame(
-    rotation: [f32; 4],
-    ray_origin: [f32; 3],
-    ray_dir: [f32; 3],
-) -> ([f32; 3], [f32; 3]) {
-    let basis = quat_to_basis(rotation);
-    let centre = [1.5_f32, 1.5, 1.5];
-    let d = [ray_origin[0] - centre[0], ray_origin[1] - centre[1], ray_origin[2] - centre[2]];
-    let local_d = apply_inv_basis(d, basis);
-    let local_origin = [local_d[0] + centre[0], local_d[1] + centre[1], local_d[2] + centre[2]];
-    let local_dir = apply_inv_basis(ray_dir, basis);
-    (local_origin, local_dir)
-}
-
-/// Rotate a hit normal returned from `cpu_raycast_inner` (in the
-/// cube's local frame, axis-aligned face direction) back to world
-/// frame using R (basis as COLUMNS). Inverse of
-/// `rotate_camera_into_tangent_frame`.
-#[allow(dead_code)]
-pub fn rotate_normal_out_of_tangent_frame(
-    rotation: [f32; 4],
-    local_normal: [f32; 3],
-) -> [f32; 3] {
-    let (east, normal, north) = quat_to_basis(rotation);
-    [
-        east[0] * local_normal[0] + normal[0] * local_normal[1] + north[0] * local_normal[2],
-        east[1] * local_normal[0] + normal[1] * local_normal[1] + north[1] * local_normal[2],
-        east[2] * local_normal[0] + normal[2] * local_normal[1] + north[2] * local_normal[2],
-    ]
-}
+// (Earlier prototypes had `rotate_camera_into_tangent_frame` /
+// `rotate_normal_out_of_tangent_frame` helpers for an inside-the-cube
+// shader/CPU dispatch keyed on the render frame BEING a TangentBlock.
+// That dispatch was removed when the render frame was allowed to
+// descend through TangentBlocks like Cartesian — the cumulative
+// rotation lives on `GpuCamera.frame_rotation` / the App
+// `accumulated_render_rotation` instead, applied to camera basis on
+// CPU and to hit normals in the shader. The helpers came back as
+// dead code; deleted.)
 
 /// Stack frame for iterative DDA traversal.
 pub(super) struct Frame {

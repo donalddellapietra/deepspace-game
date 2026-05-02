@@ -73,13 +73,24 @@ pub fn compute_render_frame(
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
         }
+        // TangentBlock at root: tag the frame so call sites know we're
+        // inside a rotated cube, but DON'T stop descent — the render
+        // frame must follow the camera anchor for f32 precision to
+        // hold at deep zoom inside the cube. The cube's rotation is
+        // applied via the cumulative-rotation pipeline (camera basis
+        // pre-rotated on CPU, hit normal lifted back to world in the
+        // shader); no shader root-dispatch needed.
         Some(NodeKind::TangentBlock { .. }) => ActiveFrameKind::TangentBlock,
         _ => ActiveFrameKind::Cartesian,
     };
     for k in 0..target.depth() as usize {
-        // Stop at any non-Cartesian frame kind — the shader needs to
-        // dispatch on the kind, so the render frame must BE that node.
-        if !matches!(kind, ActiveFrameKind::Cartesian) {
+        // Stop only at WrappedPlane (the X-wrap shader branch needs
+        // the slab to BE the frame). Cartesian and TangentBlock both
+        // descend further so the render frame can follow the camera
+        // anchor — TangentBlock interior is just a Cartesian subtree
+        // in the cube's local frame; the rotation is bookkeeping the
+        // pipeline carries separately, not a shader dispatch boundary.
+        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
@@ -95,8 +106,12 @@ pub fn compute_render_frame(
                             break;
                         }
                         NodeKind::TangentBlock { .. } => {
+                            // Mark that the frame chain has crossed
+                            // into a rotated cube — caller uses this
+                            // to apply the cumulative rotation. Keep
+                            // descending so deep cells inside the
+                            // cube get a precise local render frame.
                             kind = ActiveFrameKind::TangentBlock;
-                            break;
                         }
                         NodeKind::Cartesian => {}
                     }

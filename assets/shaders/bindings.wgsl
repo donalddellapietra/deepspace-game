@@ -19,6 +19,13 @@ struct Camera {
     /// from `view_proj * world_hit` so a subsequent raster pass can
     /// z-test against the ray-march output. Ignored by `fs_main`.
     view_proj: mat4x4<f32>,
+    /// Cumulative rotation (unit quaternion x,y,z,w) of the render
+    /// frame relative to world. Identity outside any TangentBlock;
+    /// equal to the cumulative product of TangentBlock rotations
+    /// along the camera anchor path otherwise. shade_pixel applies
+    /// this to hit normals so world-frame lighting works on either
+    /// side of a cube boundary.
+    frame_rotation: vec4<f32>,
 }
 
 // Palette lives in a read-only storage buffer of dynamic length
