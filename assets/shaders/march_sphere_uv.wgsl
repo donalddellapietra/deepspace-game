@@ -137,12 +137,20 @@ fn sphere_uv_in_cell(
             // shifting keeps cells at "normal voxel size" relative to
             // the camera).
             if sample.tag == 2u {
+                // Cartesian-local DDA inside the anchor (Option A).
+                // Slab cell center in (lon, lat, r) coords; the
+                // descent builds an orthonormal local frame there and
+                // walks the anchor in [0, 3)³ Cartesian — coords stay
+                // O(1) at any descent depth, no f32 floor.
+                let cell_lon_center = lon_lo + 0.5 * lon_step;
+                let cell_lat_center = lat_lo + 0.5 * lat_step;
+                let cell_r_center   = r_lo   + 0.5 * r_step;
                 let sub = sphere_descend_anchor(
                     sample.child_idx,
                     ray_origin, ray_dir,
-                    oc, cs_center, inv_norm,
-                    t, t_exit,
-                    lon_lo, lon_step, lat_lo, lat_step, r_lo, r_step,
+                    cs_center, inv_norm,
+                    cell_lon_center, cell_lat_center, cell_r_center,
+                    lon_step, lat_step, r_step,
                 );
                 if sub.hit { return sub; }
                 // Anchor descent exited without a hit — every sub-cell
