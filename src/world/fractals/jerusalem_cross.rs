@@ -98,6 +98,7 @@ pub(crate) fn bootstrap_jerusalem_cross_world(depth: u8) -> WorldBootstrap {
         default_spawn_pitch: -0.615,
         plain_layers: depth,
         color_registry: registry,
+        proto_subtree_root: None,
     }
 }
 

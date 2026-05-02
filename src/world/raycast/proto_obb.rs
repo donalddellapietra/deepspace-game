@@ -18,6 +18,24 @@ pub struct ObbHit {
     pub side: u32, // 0 = `-h` face, 1 = `+h` face
 }
 
+/// Body-frame UV bounds of the prototype's hardcoded target cell.
+/// Mirrors `PROTO_TARGET_*` constants in
+/// `assets/shaders/uvsphere/proto_block.wgsl`. Used by the CPU-side
+/// raycast intercept (`cpu_raycast_uv_body`) so cursor breaks land on
+/// the same volume the shader paints — without depending on the
+/// edit-depth budget being deep enough to walk all the way to body
+/// path `[14, 21, 23]`.
+pub const PROTO_PHI_LO: f32 = 4.654;
+pub const PROTO_PHI_HI: f32 = 4.887;
+pub const PROTO_THETA_LO: f32 = -0.052;
+pub const PROTO_THETA_HI: f32 = 0.052;
+pub const PROTO_R_LO: f32 = 0.4333;
+pub const PROTO_R_HI: f32 = 0.45;
+
+/// Slot path from a `UvSphereBody` root down to the prototype's
+/// target cell (= body-tree depth 3, top of the grass shell).
+pub const PROTO_BODY_PATH: [usize; 3] = [14, 21, 23];
+
 /// World-frame OBB derived from a UV cell's spherical bounds.
 #[derive(Clone, Copy, Debug)]
 pub struct CellObb {

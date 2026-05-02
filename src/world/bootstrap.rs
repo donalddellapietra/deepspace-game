@@ -134,6 +134,13 @@ pub struct WorldBootstrap {
     /// imported-model colors (from `.vox`/`.vxs`) survive into the
     /// render path. Always contains the builtins as a prefix.
     pub color_registry: crate::world::palette::ColorRegistry,
+    /// Side-loaded Cartesian subtree for the UV-sphere prototype's
+    /// "cartesian voxel block in place of one UV cell" demo. When
+    /// `Some`, the upload path packs this node alongside `world.root`
+    /// (via `CachedTree::ensure_root`) and forwards its BFS idx to the
+    /// shader so `proto_obb_render` can dispatch a real cartesian
+    /// `march_entity_subtree` on it. `None` for non-UV worlds.
+    pub proto_subtree_root: Option<crate::world::tree::NodeId>,
 }
 
 pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBootstrap {
@@ -379,6 +386,7 @@ pub(crate) fn bootstrap_vox_model_world(
         default_spawn_pitch: pitch,
         plain_layers: total_depth,
         color_registry: registry,
+        proto_subtree_root: None,
     }
 }
 
@@ -757,6 +765,7 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
         default_spawn_pitch: -0.45,
         plain_layers,
         color_registry: crate::world::palette::ColorRegistry::new(),
+        proto_subtree_root: None,
     }
 }
 
@@ -764,6 +773,44 @@ fn bootstrap_plain_test_world(plain_layers: u8) -> WorldBootstrap {
 /// `NodeKind::UvSphereBody` installed at the world root's center
 /// slot. Camera spawns offset from the body so the whole planet is
 /// visible from outside.
+/// Walks a path of slot indices in a node tree top-down, cloning
+/// every visited node with the leaf slot replaced by `new_child`.
+/// Returns the new root NodeId. Leaves the rest of the library
+/// unchanged — only the cloned nodes along the path differ from the
+/// originals, so other paths sharing the original Nodes still work.
+///
+/// `path` must be non-empty. Intermediate slots must be `Child::Node`.
+fn replace_at_uv_path(
+    library: &mut NodeLibrary,
+    root: NodeId,
+    path: &[usize],
+    new_child: Child,
+) -> NodeId {
+    assert!(!path.is_empty(), "replace_at_uv_path: empty path");
+    let (mut new_children, kind) = {
+        let node = library.get(root).expect("replace_at_uv_path: root must exist");
+        (node.children, node.kind)
+    };
+    let slot = path[0];
+    let new_slot_value = if path.len() == 1 {
+        new_child
+    } else {
+        let child_id = match new_children[slot] {
+            Child::Node(id) => id,
+            other => panic!(
+                "replace_at_uv_path: expected Node at slot {} (depth {}), got {:?}",
+                slot,
+                path.len(),
+                other,
+            ),
+        };
+        let new_child_id = replace_at_uv_path(library, child_id, &path[1..], new_child);
+        Child::Node(new_child_id)
+    };
+    new_children[slot] = new_slot_value;
+    library.insert_with_kind(new_children, kind)
+}
+
 fn bootstrap_uv_sphere_world() -> WorldBootstrap {
     use crate::world::uvsphere::{demo_uv_sphere, install_at_root_center};
 
@@ -772,6 +819,73 @@ fn bootstrap_uv_sphere_world() -> WorldBootstrap {
     let empty_root = library.insert(empty_children());
     let (root, body_path) = install_at_root_center(&mut library, empty_root, &setup);
     library.ref_inc(root);
+
+    // Prototype subtree: a Cartesian chain of N layers ending in
+    // `Child::Block(WATER)` leaves. Stands in for the body's
+    // depth-3 cell at path `[14, 21, 23]`. Used in two roles:
+    //   1. Side-loaded into the GPU pack so the WGSL OBB intercept
+    //      can dispatch `march_entity_subtree` and render the cell
+    //      as a real cartesian voxel grid (visible 3×3×3 substructure).
+    //   2. Spliced into the body tree at the same path so the CPU
+    //      raycast finds it via UV descent — `break_block` can then
+    //      target the cell (or sub-cell) and edit the world.
+    //
+    // Depth pick: body has `setup.depth = 20` total layers; the OBB
+    // sits at body-tree depth 3, so 17 more layers of cartesian
+    // subdivision lands the proto's leaves at the same world-cell
+    // size as the body's grass leaves.
+    //
+    // Uniformity caveat: with all 27 children pointing to a uniform
+    // WATER subtree, `pack_tree` flattens this to tag=1 Block(WATER)
+    // entries (Cartesian's `allows_uniform_flatten`). On the GPU
+    // that still gives 27 tag=1 children at the root level, so
+    // `march_entity_subtree` DDAs through a real 3×3×3 grid of WATER
+    // cells with bevels. Deeper structure becomes visible automatically
+    // as the user digs (which produces non-uniform Nodes that survive
+    // packing).
+    let proto_depth: u32 = (setup.depth.saturating_sub(3)).max(1) as u32;
+    let mut proto_node = library.insert(uniform_children(Child::Block(block::WATER)));
+    library.ref_inc(proto_node);
+    for _ in 1..proto_depth {
+        let parent = library.insert(uniform_children(Child::Node(proto_node)));
+        library.ref_inc(parent);
+        library.ref_dec(proto_node);
+        proto_node = parent;
+    }
+    let proto_subtree_root_id = proto_node;
+
+    // Splice the proto subtree into the body tree at body-path
+    // [14, 21, 23] (depth-3 cell on the grass shell, matching the
+    // OBB's hardcoded position in `proto_block.wgsl`). Walks the
+    // body tree top-down, cloning each node along the path with the
+    // child slot replaced — leaves the rest of the library
+    // (including all paths sharing those slots) untouched, so
+    // breaks elsewhere on the body still work normally.
+    //
+    // The world root must be re-inserted with its slot-13 child
+    // pointing at the spliced body. `body_path` (returned from
+    // `install_at_root_center`) is unchanged — still `[13]`.
+    let (mut new_world_children, world_root_kind) = {
+        let node = library.get(root).expect("world root must exist");
+        (node.children, node.kind)
+    };
+    let body_id = match new_world_children[slot_index(1, 1, 1)] {
+        Child::Node(id) => id,
+        _ => panic!("world root slot 13 must be the body Node"),
+    };
+    let new_body_id = replace_at_uv_path(
+        &mut library,
+        body_id,
+        &[14, 21, 23],
+        Child::Node(proto_subtree_root_id),
+    );
+    new_world_children[slot_index(1, 1, 1)] = Child::Node(new_body_id);
+    let new_root = library.insert_with_kind(new_world_children, world_root_kind);
+    library.ref_inc(new_root);
+    library.ref_dec(root);
+    let root = new_root;
+
+    let proto_subtree_root = Some(proto_subtree_root_id);
 
     let world = WorldState { root, library };
 
@@ -804,6 +918,7 @@ fn bootstrap_uv_sphere_world() -> WorldBootstrap {
         default_spawn_pitch: 0.0,
         plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),
+        proto_subtree_root,
     }
 }
 

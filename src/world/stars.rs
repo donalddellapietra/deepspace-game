@@ -208,6 +208,7 @@ pub fn bootstrap_stars_world(total_depth: u8) -> WorldBootstrap {
         // the caller passes `--spawn-depth`.
         plain_layers: 0,
         color_registry: registry,
+        proto_subtree_root: None,
     }
 }
 

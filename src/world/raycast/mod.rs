@@ -8,7 +8,7 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
-mod proto_obb;
+pub mod proto_obb;
 mod uvsphere;
 
 pub use uvsphere::cpu_raycast_uv_body;

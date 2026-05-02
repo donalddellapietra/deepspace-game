@@ -145,6 +145,12 @@ pub struct Renderer {
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
     pub(super) ribbon_count: u32,
+    /// BFS idx of the side-loaded UV-sphere prototype Cartesian
+    /// subtree (or 0 when no subtree is registered). Forwarded to
+    /// the shader via `_pad_uv_b[0]` so `proto_obb_render` can
+    /// dispatch `march_entity_subtree(proto_subtree_bfs, …)` in
+    /// the OBB-local frame.
+    pub(super) proto_subtree_bfs: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
     /// instance-buffer dispatch count for the raster entity pass.
@@ -307,6 +313,17 @@ impl Renderer {
     pub fn set_root_kind_uv_sphere_body(&mut self) {
         self.root_kind = ROOT_KIND_UV_SPHERE_BODY;
         self.write_uniforms();
+    }
+
+    /// Register the BFS idx of the UV-sphere prototype subtree's
+    /// root node. The shader reads it from `_pad_uv_b[0]` and uses
+    /// it as the `march_entity_subtree` root inside `proto_obb_render`.
+    /// Pass 0 to disable the prototype dispatch.
+    pub fn set_proto_subtree_bfs(&mut self, bfs: u32) {
+        if self.proto_subtree_bfs != bfs {
+            self.proto_subtree_bfs = bfs;
+            self.write_uniforms();
+        }
     }
 
 

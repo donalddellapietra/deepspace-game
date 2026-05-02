@@ -40,9 +40,6 @@ const PROTO_TARGET_HALF_DPHI:  f32 = 0.1164;       // (4.887 − 4.654)/2
 const PROTO_TARGET_HALF_DTH:   f32 = 0.052;        // (0.052 − (−0.052))/2
 const PROTO_TARGET_HALF_DR:    f32 = 0.0083;       // (0.45 − 0.4333)/2
 
-// Bright magenta — unmistakable against the body's green/brown.
-const PROTO_TARGET_COLOR: vec3<f32> = vec3<f32>(1.0, 0.0, 1.0);
-
 // Ray-vs-OBB intersection (slab method projected onto the OBB
 // axes). Returns the closer of `(t_enter, axis, side)` on hit, or
 // `t = 1e30` on miss.
@@ -135,22 +132,52 @@ fn proto_ray_vs_obb(
     return out;
 }
 
-// Render the prototype OBB at hit time. The OBB axes are
-// `(φ̂, θ̂, r̂)` at the target's centre — same basis the slab test
-// used. Bevel is in OBB-local `(u, v) ∈ [-1, 1]` of the two axes
-// orthogonal to the entered face.
+// Render the prototype OBB as a real Cartesian subtree.
+//
+// The OBB stands in for one UV-sphere cell at body-tree depth 3
+// (path `[14, 21, 23]`, top of the grass band). Instead of UV
+// rendering, the cell's volume hosts a Cartesian Node whose BFS
+// idx is forwarded by the CPU side via `uniforms._pad_uv_b.x`.
+//
+// Pipeline:
+//   1. `proto_ray_vs_obb` (caller in `march_root.wgsl`) determines
+//      the ray hits the OBB volume and gives `bd.t` (entry t).
+//   2. We transform `(ray_origin, ray_dir)` from world-frame into
+//      the OBB's local `(φ̂, θ̂, r̂)` cell-grid frame, where the
+//      OBB occupies `[0, 3]³`.
+//   3. We hand off to `march_entity_subtree`, which runs the
+//      world's standard cartesian DDA on the proto subtree —
+//      complete with descent, LOD termination, and palette block
+//      colours (WATER pulls the `(0.20, 0.40, 0.80)` blue from the
+//      builtin palette).
+//   4. On hit, we transform the face normal from OBB-local back
+//      into world frame and return.
+//   5. On miss (every ray-traversed sub-cell empty), `result.hit`
+//      stays false; `march_root.wgsl` falls through to the UV march.
+//
+// Why this isn't a procedural fill: the user wants the OBB to BE a
+// cartesian voxel block — same machinery, same break path — so the
+// cells inside it can be dug like any other voxel.
 fn proto_obb_render(
     ray_origin: vec3<f32>, ray_dir: vec3<f32>,
     body_center: vec3<f32>,
     bd: UvBoundaryHit,
 ) -> HitResult {
     var result: HitResult;
-    result.hit = true;
-    result.t = bd.t;
+    result.hit = false;
+    result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
     result.cell_size = 1.0;
+    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+    result.color = vec3<f32>(0.0);
+    result.cell_min = vec3<f32>(0.0);
 
+    // No proto subtree registered — fall through to UV march.
+    let proto_root_bfs = uniforms._pad_uv_b.x;
+    if proto_root_bfs == 0u { return result; }
+
+    // OBB basis (matches `proto_ray_vs_obb`).
     let cos_p = cos(PROTO_TARGET_PHI);
     let sin_p = sin(PROTO_TARGET_PHI);
     let cos_t = cos(PROTO_TARGET_THETA);
@@ -163,32 +190,57 @@ fn proto_obb_render(
     let h_th  = PROTO_TARGET_HALF_DTH  * PROTO_TARGET_R;
     let h_r   = PROTO_TARGET_HALF_DR;
 
-    var n: vec3<f32>;
-    if bd.axis == 0u {
-        n = select(-phi_hat, phi_hat, bd.side == 1u);
-    } else if bd.axis == 1u {
-        n = select(-theta_hat, theta_hat, bd.side == 1u);
-    } else {
-        n = select(-r_hat, r_hat, bd.side == 1u);
+    // Transform ray into OBB-local cell-grid coords. Each axis is
+    // scaled so the OBB's full extent maps to [0, 3] (one slab per
+    // sub-cell). Linear transform → world-ray `t` is identical to
+    // OBB-local `t`; only positions and directions are rescaled.
+    let to_origin = ray_origin - center;
+    let proj_origin = vec3<f32>(
+        dot(to_origin, phi_hat),
+        dot(to_origin, theta_hat),
+        dot(to_origin, r_hat),
+    );
+    let proj_dir = vec3<f32>(
+        dot(ray_dir, phi_hat),
+        dot(ray_dir, theta_hat),
+        dot(ray_dir, r_hat),
+    );
+    let extents = vec3<f32>(
+        max(h_phi, 1e-12),
+        max(h_th,  1e-12),
+        max(h_r,   1e-12),
+    );
+    let local_origin = proj_origin / extents * 1.5 + vec3<f32>(1.5);
+    let local_dir = proj_dir / extents * 1.5;
+
+    // Hand the ray to the world's standard cartesian DDA. The
+    // proto subtree's BFS idx came from the CPU side via
+    // `_pad_uv_b[0]`. `march_entity_subtree` walks the subtree's
+    // [0, 3]³ cells and returns a hit with palette colour pulled
+    // from the actual block_type stored in the leaf — for a uniform
+    // WATER fill that's `(0.20, 0.40, 0.80)`.
+    let sub = march_entity_subtree(proto_root_bfs, local_origin, local_dir);
+    if !sub.hit {
+        return result;
     }
-    result.normal = normalize(n);
 
-    let pos = ray_origin + ray_dir * bd.t;
-    let p = pos - center;
-    let u = clamp(dot(p, phi_hat)   / max(h_phi, 1e-12), -1.0, 1.0);
-    let v = clamp(dot(p, theta_hat) / max(h_th,  1e-12), -1.0, 1.0);
-    let w = clamp(dot(p, r_hat)     / max(h_r,   1e-12), -1.0, 1.0);
-    let un_u = u * 0.5 + 0.5;
-    let un_v = v * 0.5 + 0.5;
-    let un_w = w * 0.5 + 0.5;
-    var a: f32; var b: f32;
-    if bd.axis == 0u { a = un_v; b = un_w; }
-    else if bd.axis == 1u { a = un_u; b = un_w; }
-    else { a = un_u; b = un_v; }
-    let edge = min(min(a, 1.0 - a), min(b, 1.0 - b));
-    let bevel = smoothstep(0.02, 0.14, edge);
+    // The cartesian DDA returns its normal in the OBB's
+    // local axis basis (`+x` = `+φ̂`, `+y` = `+θ̂`, `+z` = `+r̂`).
+    // Rotate it back into world frame.
+    let world_normal = normalize(
+        sub.normal.x * phi_hat +
+        sub.normal.y * theta_hat +
+        sub.normal.z * r_hat
+    );
 
-    result.color = PROTO_TARGET_COLOR * (0.7 + 0.3 * bevel);
-    result.cell_min = pos - vec3<f32>(0.5);
+    // `t` is identical between the world ray and the OBB-local ray
+    // because the transform is linear (positions and dirs scaled
+    // together; t-units are the same parameter).
+    result.hit = true;
+    result.t = sub.t;
+    result.normal = world_normal;
+    result.color = sub.color;
+    result.cell_min = ray_origin + ray_dir * sub.t - vec3<f32>(0.5);
+    result.cell_size = sub.cell_size;
     return result;
 }

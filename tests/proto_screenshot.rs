@@ -85,14 +85,20 @@ fn run_harness(png_path: &str) -> (u32, u32, Vec<u8>) {
     (info.width, info.height, rgb)
 }
 
-fn count_magenta(rgb: &[u8]) -> usize {
-    // Magenta = high R, low G, high B. The prototype paints
-    // `(1.0, 0.0, 1.0) * (0.7 + 0.3 * bevel)` which gives R, B in
-    // [178, 255] and G ≤ 76 (the bevel only attenuates, never adds
-    // green). Tolerate gamma + sRGB tonemapping by using loose
-    // thresholds.
+fn count_water_blue(rgb: &[u8]) -> usize {
+    // Water (palette block 6) = `(0.20, 0.40, 0.80)`. After bevel
+    // (0.7..1.0) and sRGB encode that gamma-corrects roughly 1.4×,
+    // we expect R ≲ 130, G ∈ [120, 200], B ∈ [180, 230]. The body's
+    // sky band has high values across all channels (R≈160, G≈200,
+    // B≈240); the green grass has G > R, B not dominant. Demand
+    // B > R+30 AND B > G+10 to discriminate water from sky/grass.
     rgb.chunks_exact(3)
-        .filter(|c| c[0] > 150 && c[1] < 100 && c[2] > 150 && (c[0] as i16 - c[2] as i16).abs() < 80)
+        .filter(|c| {
+            let r = c[0] as i16;
+            let g = c[1] as i16;
+            let b = c[2] as i16;
+            b > 150 && b > r + 30 && b > g + 10 && r < 180
+        })
         .count()
 }
 
@@ -101,29 +107,26 @@ fn count_magenta(rgb: &[u8]) -> usize {
 fn proto_obb_visible_in_screenshot() {
     let (w, h, rgb) = run_harness("tmp/proto_obb_default.png");
     let total = (w as usize) * (h as usize);
-    let magenta = count_magenta(&rgb);
+    let blue = count_water_blue(&rgb);
 
     println!("screenshot {}x{} ({} pixels)", w, h, total);
     println!(
-        "magenta = {} ({:.4}%)",
-        magenta,
-        100.0 * magenta as f32 / total as f32
+        "water_blue = {} ({:.4}%)",
+        blue,
+        100.0 * blue as f32 / total as f32
     );
 
-    // OBB at distance ~0.6 m, half-extent ~0.05 m. Angular size
-    // ~2·atan(0.05/0.6) ≈ 9.5°. At 1280×720 with FOV 1.2 rad, one
-    // degree ≈ 19 px → ~180×180 px footprint = ~32 000 magenta px.
-    // Threshold is conservative (50 px) to allow tonemap losses or
-    // partial occlusion by the body shell.
+    // OBB at distance ~0.6 m, half-extent ~0.05 m → ~180×180 px on
+    // a 1280×720 frame with FOV 1.2 rad. Threshold conservative.
     assert!(
-        magenta > 50,
-        "no magenta cube visible — expected >50 px, got {}. \
-         Either the OBB is being placed outside the camera's FOV, \
-         the t-comparison vs UV march is wrong, or the WGSL doesn't \
-         match the CPU port at `src/world/raycast/proto_obb.rs`. \
+        blue > 50,
+        "no water (blue) OBB visible — expected >50 px, got {}. \
+         Likely causes: OBB is outside camera FOV, the WATER subtree \
+         BFS isn't reaching the shader, or `march_entity_subtree` \
+         isn't returning hits in OBB-local. \
          Screenshot saved to tmp/proto_obb_default.png — inspect \
          to debug.",
-        magenta
+        blue
     );
 }
 

@@ -33,6 +33,18 @@ pub fn cpu_raycast_uv_body(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
+    // Prototype OBB intercept: if the ray hits the hardcoded
+    // cartesian-voxel cell at body path [14, 21, 23], return a
+    // breakable hit at that path. The intercept fires regardless of
+    // `max_depth` because the OBB occupies a fixed depth-3 cell —
+    // walking the descent there would otherwise need
+    // `max_depth >= 4`, breaking pickup at default zoom.
+    if let Some(intercept) =
+        try_proto_obb_intercept(library, body_root_id, ray_origin, ray_dir, max_depth)
+    {
+        return Some(intercept);
+    }
+
     let body = library.get(body_root_id)?;
     let (inner_r_local, outer_r_local, theta_cap) = match body.kind {
         NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } => (inner_r, outer_r, theta_cap),
@@ -473,6 +485,145 @@ fn length3(a: [f32; 3]) -> f32 {
     dot3(a, a).sqrt()
 }
 
+/// CPU-side OBB intercept for the UV-sphere prototype's cartesian-
+/// voxel cell. Mirrors the `proto_ray_vs_obb` / `proto_obb_render`
+/// short-circuit in `proto_block.wgsl`.
+///
+/// Two-stage hit resolution:
+///   1. Slab test against the OBB volume. Miss → `None`,
+///      caller proceeds with normal UV descent.
+///   2. Walk the body tree along `PROTO_BODY_PATH` to confirm the
+///      proto subtree is still spliced in (and to fold the body
+///      prefix into the returned path).
+///   3. If `max_depth` budget allows, transform the ray into the
+///      OBB's local `[0, 3]³` frame and descend the proto's
+///      Cartesian subtree via `cpu_raycast_inner`. Append the
+///      resulting path so `break_block` lands on the FINEST
+///      sub-cell the budget reaches — not the whole-OBB cell.
+///
+/// `break_block` walks the returned path, replacing the leaf slot
+/// with `Empty`. The upload step's "is the body cell still the
+/// proto?" check then disables the shader intercept once the
+/// proto's root cell is fully removed.
+fn try_proto_obb_intercept(
+    library: &NodeLibrary,
+    body_root_id: NodeId,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    max_depth: u32,
+) -> Option<HitInfo> {
+    use crate::world::raycast::proto_obb::{
+        cell_obb, ray_vs_obb, PROTO_BODY_PATH, PROTO_PHI_HI, PROTO_PHI_LO, PROTO_R_HI, PROTO_R_LO,
+        PROTO_THETA_HI, PROTO_THETA_LO,
+    };
+
+    // Slab test first — if the ray misses the OBB volume, fall
+    // through to the normal UV descent (cheap return).
+    let obb = cell_obb(
+        [1.5, 1.5, 1.5],
+        PROTO_PHI_LO, PROTO_PHI_HI,
+        PROTO_THETA_LO, PROTO_THETA_HI,
+        PROTO_R_LO, PROTO_R_HI,
+    );
+    let hit = ray_vs_obb(ray_origin, ray_dir, &obb)?;
+
+    // Walk the body tree along the path. Skip intercept if the
+    // bootstrap splice isn't in place (or a previous break removed
+    // the proto cell entirely).
+    let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(PROTO_BODY_PATH.len());
+    let mut cur = body_root_id;
+    let mut proto_root: Option<NodeId> = None;
+    for (i, &slot) in PROTO_BODY_PATH.iter().enumerate() {
+        let node = library.get(cur)?;
+        path.push((cur, slot));
+        match node.children[slot] {
+            Child::Node(child_id) => {
+                cur = child_id;
+                if i + 1 == PROTO_BODY_PATH.len() {
+                    proto_root = Some(child_id);
+                }
+            }
+            Child::Block(_) if i + 1 == PROTO_BODY_PATH.len() => break,
+            _ => return None,
+        }
+    }
+
+    // OBB → world face index. Approximate (OBB axes are tangent-
+    // frame, not world-aligned), but matches what `closest_face_axis`
+    // does for ordinary UV cells.
+    let face_obb = match (hit.axis, hit.side) {
+        (0, 0) => 1, // -φ̂
+        (0, 1) => 0, // +φ̂
+        (1, 0) => 3, // -θ̂
+        (1, 1) => 2, // +θ̂
+        (2, 0) => 5, // -r̂
+        _ => 4,      // +r̂
+    };
+
+    // Descend into the proto's Cartesian subtree at sub-cell
+    // granularity, when the edit-depth budget allows. Without this,
+    // every click destroys the whole OBB at once regardless of zoom.
+    if let Some(proto_id) = proto_root {
+        let used = path.len() as u32;
+        let remaining = max_depth.saturating_sub(used);
+        if remaining > 0 {
+            // Transform ray into OBB-local [0, 3]³ frame (matches
+            // `proto_obb_render` in `proto_block.wgsl`).
+            let to_origin = [
+                ray_origin[0] - obb.center[0],
+                ray_origin[1] - obb.center[1],
+                ray_origin[2] - obb.center[2],
+            ];
+            let dot3v = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            let proj_origin = [
+                dot3v(to_origin, obb.phi_hat),
+                dot3v(to_origin, obb.theta_hat),
+                dot3v(to_origin, obb.r_hat),
+            ];
+            let proj_dir = [
+                dot3v(ray_dir, obb.phi_hat),
+                dot3v(ray_dir, obb.theta_hat),
+                dot3v(ray_dir, obb.r_hat),
+            ];
+            let extents = [
+                obb.half_phi.max(1e-12),
+                obb.half_th.max(1e-12),
+                obb.half_r.max(1e-12),
+            ];
+            let local_origin = [
+                proj_origin[0] / extents[0] * 1.5 + 1.5,
+                proj_origin[1] / extents[1] * 1.5 + 1.5,
+                proj_origin[2] / extents[2] * 1.5 + 1.5,
+            ];
+            let local_dir = [
+                proj_dir[0] / extents[0] * 1.5,
+                proj_dir[1] / extents[1] * 1.5,
+                proj_dir[2] / extents[2] * 1.5,
+            ];
+            if let Some(sub_hit) = super::cartesian::cpu_raycast_inner(
+                library, proto_id, local_origin, local_dir, remaining,
+            ) {
+                path.extend(sub_hit.path);
+                return Some(HitInfo {
+                    path,
+                    face: sub_hit.face,
+                    t: hit.t, // linear transform → world t == OBB-local t
+                    place_path: None,
+                });
+            }
+        }
+    }
+
+    // Either no proto subtree (Block leaf), or budget = 0, or the
+    // sub-DDA missed. Fall back to the whole-OBB cell.
+    Some(HitInfo {
+        path,
+        face: face_obb,
+        t: hit.t,
+        place_path: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,5 +874,119 @@ mod tests {
         let changed = break_block(&mut world, &full_hit);
         assert!(changed, "break_block must succeed against a UV-DDA hit");
         assert_ne!(world.root, old_root, "world root changes after a break");
+    }
+
+    /// Builds a UV-sphere world with the prototype subtree spliced
+    /// into body path `[14, 21, 23]` — same setup as
+    /// `bootstrap_uv_sphere_world`. Returns `(lib, body_root_id,
+    /// proto_root_id)` so tests can target the OBB cell specifically.
+    fn build_demo_tree_with_proto() -> (NodeLibrary, NodeId, NodeId) {
+        use crate::world::palette::block;
+        use crate::world::tree::{slot_index, uniform_children};
+        let setup = demo_uv_sphere();
+        let mut lib = NodeLibrary::default();
+        let world_root = lib.insert(empty_children());
+        let (root, body_path) = install_at_root_center(&mut lib, world_root, &setup);
+        lib.ref_inc(root);
+
+        // Build a 4-layer uniform-WATER chain for the proto subtree.
+        // Deep enough that the descent test below has room to walk.
+        let proto_depth: u32 = 4;
+        let mut proto = lib.insert(uniform_children(Child::Block(block::WATER)));
+        lib.ref_inc(proto);
+        for _ in 1..proto_depth {
+            let parent = lib.insert(uniform_children(Child::Node(proto)));
+            lib.ref_inc(parent);
+            lib.ref_dec(proto);
+            proto = parent;
+        }
+
+        let body_slot = body_path.slot(0) as usize;
+        let body_id = match lib.get(root).unwrap().children[body_slot] {
+            Child::Node(id) => id,
+            _ => panic!("body must be a Node"),
+        };
+        // Mirror `replace_at_uv_path` from `bootstrap.rs` so the test
+        // exercises the same splice the running game gets.
+        fn splice(
+            lib: &mut NodeLibrary,
+            root: NodeId,
+            path: &[usize],
+            new_child: Child,
+        ) -> NodeId {
+            let (mut new_children, kind) = {
+                let n = lib.get(root).unwrap();
+                (n.children, n.kind)
+            };
+            let slot = path[0];
+            let new_slot = if path.len() == 1 {
+                new_child
+            } else {
+                let child_id = match new_children[slot] {
+                    Child::Node(id) => id,
+                    _ => panic!("intermediate path must be Node"),
+                };
+                Child::Node(splice(lib, child_id, &path[1..], new_child))
+            };
+            new_children[slot] = new_slot;
+            lib.insert_with_kind(new_children, kind)
+        }
+        let new_body = splice(&mut lib, body_id, &[14, 21, 23], Child::Node(proto));
+        let mut new_world_children = lib.get(root).unwrap().children;
+        new_world_children[slot_index(1, 1, 1)] = Child::Node(new_body);
+        let new_root = lib.insert_with_kind(new_world_children, lib.get(root).unwrap().kind);
+        lib.ref_inc(new_root);
+        lib.ref_dec(root);
+
+        (lib, new_body, proto)
+    }
+
+    /// Click on the OBB at low edit_depth: path terminates at the
+    /// body's depth-3 cell (3 entries). break_block would remove
+    /// the whole OBB.
+    #[test]
+    fn obb_intercept_low_budget_targets_whole_cell() {
+        let (lib, body, _proto) = build_demo_tree_with_proto();
+        // Camera south of body, looking +z. Body-local frame: cam at
+        // (1.5, 1.5, -1.5), dir (0, 0, 3) — but we test in body-frame
+        // [0,3]³ directly: camera at z=-1.5, dir +z.
+        let hit = cpu_raycast_uv_body(
+            &lib,
+            body,
+            [1.5, 1.5, -1.5],
+            [0.0, 0.0, 3.0],
+            3, // budget exactly = body path length to OBB cell
+        )
+        .expect("ray must hit the OBB");
+        assert_eq!(
+            hit.path.len(),
+            3,
+            "low budget → whole-OBB hit, got path {:?}",
+            hit.path,
+        );
+        assert_eq!(hit.path[2].1, 23, "terminal slot must be 23 (the OBB cell)");
+    }
+
+    /// Click on the OBB at high edit_depth: path descends INTO the
+    /// proto subtree. Each extra level of budget = one more
+    /// path entry = a 27× finer break.
+    #[test]
+    fn obb_intercept_high_budget_descends_into_subtree() {
+        let (lib, body, _proto) = build_demo_tree_with_proto();
+        let hit = cpu_raycast_uv_body(
+            &lib,
+            body,
+            [1.5, 1.5, -1.5],
+            [0.0, 0.0, 3.0],
+            6, // 3 (body) + 3 (proto descent)
+        )
+        .expect("ray must hit the OBB");
+        assert!(
+            hit.path.len() > 3,
+            "high budget → must descend INTO proto subtree, got path len {}: {:?}",
+            hit.path.len(),
+            hit.path,
+        );
+        assert_eq!(hit.path[2].1, 23, "still passes through the OBB cell at depth 3");
     }
 }

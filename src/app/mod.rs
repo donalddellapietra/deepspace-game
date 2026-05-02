@@ -147,6 +147,13 @@ pub struct App {
     /// spawn-position derivation and for camera-local sphere focus
     /// (`edit_actions::zoom::camera_local_sphere_focus_path`).
     pub(super) planet_path: Option<Path>,
+    /// Side-loaded Cartesian Node containing the prototype OBB's
+    /// content (uniform WATER, depth = body.depth − 3). Kept alive
+    /// across edits via `library.ref_inc` in the bootstrap; the
+    /// upload path packs it via `CachedTree::ensure_root` and
+    /// forwards the resulting BFS idx to the shader. `None` outside
+    /// UV-sphere worlds.
+    pub(super) proto_subtree_root: Option<crate::world::tree::NodeId>,
     /// The actual frame the renderer is using right now. This may
     /// be shallower than `render_frame()` when GPU packing flattened
     /// a slot on the intended path and `build_ribbon` had to stop
@@ -433,6 +440,7 @@ impl App {
             fps_smooth: 0.0,
             startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
             planet_path: bootstrap.planet_path,
+            proto_subtree_root: bootstrap.proto_subtree_root,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
             last_lod_upload_key: None,
