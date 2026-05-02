@@ -85,13 +85,7 @@ impl App {
                 if self.startup_planet_render_sphere == Some(1) =>
             {
                 let frame_path = self.active_frame.render_path;
-                // Same shallowing trick as the renderer: at deep
-                // anchor the long in_frame walk introduces ULP-scale
-                // jitter on cam_local; the CPU raycast then targets
-                // a different cell each frame for the same screen
-                // pixel. Shallow to slab-cell depth so the walk is
-                // bounded and consistent with the rendered cam.
-                let cam_local = self.camera.position.shallowed_to(5).in_frame(&frame_path);
+                let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 // lat_max kept in sync with the shader-side default
                 // (1.26 rad ≈ 72°). When this becomes a CLI / runtime
