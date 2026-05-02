@@ -16,6 +16,23 @@ use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 
+/// Hard cap on UV-tier descent depth inside a `UvSphereBody`. Past
+/// this depth the frame's `dphi = 2π / 3^N` falls below f32 ULPs of
+/// body-frame `phi`, and `(phi_w − phi_min) / dphi` becomes a
+/// catastrophic cancellation — every sub-pixel of camera motion
+/// resolves to a different UV tier, producing the bevel "swarm"
+/// the user sees at close zoom.
+///
+/// At depth 8, `dphi ≈ 9.6e-4` rad — well above the ~1e-7 absolute
+/// ULP of `phi_w`. Initial cell-local `un_phi` precision is ~1e-4
+/// of frame, leaving a healthy budget for a handful of in-shader
+/// `*3 mod 1` descents before precision degrades visibly. Past
+/// this cap the renderer simply stops at depth 8 and lets the
+/// shader's per-iteration descent cover finer detail; a deeper-
+/// rendering future variant needs cell-local coord propagation
+/// (no body-frame absolute `phi_w`), not a deeper frame.
+const MAX_UV_FRAME_DEPTH: u8 = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
     Cartesian,
@@ -196,10 +213,17 @@ pub fn compute_render_frame(
                 }
             }
             ActiveFrameKind::UvSphereBody { inner_r, outer_r, theta_cap } => {
+                // Stop UV descent at MAX_UV_FRAME_DEPTH to keep
+                // frame_dphi above f32 ULPs of body-frame phi —
+                // see the constant's docstring for why.
+                let body_d = body_path_depth.unwrap_or(reached.depth());
+                let uv_descent_so_far = reached.depth().saturating_sub(body_d);
+                if uv_descent_so_far >= MAX_UV_FRAME_DEPTH {
+                    break;
+                }
                 // Descend into the body. UV ranges span the whole
                 // body at this point; pick the tier the camera lies
                 // in based on its body-frame spherical coords.
-                let body_d = body_path_depth.unwrap_or(reached.depth());
                 let body_pos = body_frame_pos_from_anchor(camera_anchor, body_d as usize);
                 let phi_min0 = 0.0;
                 let theta_min0 = -theta_cap;
@@ -246,6 +270,11 @@ pub fn compute_render_frame(
                 body_inner_r, body_outer_r, body_theta_cap,
                 phi_min, theta_min, r_min, dphi, dth, dr,
             } => {
+                // Stop UV descent at MAX_UV_FRAME_DEPTH (see const).
+                let uv_descent_so_far = reached.depth().saturating_sub(bd);
+                if uv_descent_so_far >= MAX_UV_FRAME_DEPTH {
+                    break;
+                }
                 let body_d = body_path_depth.unwrap_or(reached.depth());
                 let body_pos = body_frame_pos_from_anchor(camera_anchor, body_d as usize);
                 let Some(slot) = uv_slot_geometric(
