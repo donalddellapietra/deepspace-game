@@ -25,6 +25,23 @@ impl App {
             self.push_crosshair(false, false);
             return;
         }
+        // Sphere-render mode (UV-sphere or tangent cubes) — the
+        // CPU raycast hit position diverges from the GPU's, so the
+        // highlight box would draw in the wrong place. Skip the
+        // highlight; break/place still work because they use the
+        // raycast for the SLAB CELL path, not for screen-space
+        // cursor matching, and the slab-cell-level path is right
+        // even when the sub-cell fraction is off.
+        if self.startup_planet_render_sphere == Some(1) {
+            self.last_highlight_raycast_ms = 0.0;
+            self.last_highlight_set_ms = 0.0;
+            self.cached_highlight = None;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_highlight(None);
+            }
+            self.push_crosshair(self.cursor_locked, false);
+            return;
+        }
         if !self.cursor_locked {
             self.last_highlight_raycast_ms = 0.0;
             self.last_highlight_set_ms = 0.0;

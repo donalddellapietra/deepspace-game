@@ -2,7 +2,7 @@
 //! shader's `sphere_uv_in_cell`.
 
 use super::HitInfo;
-use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Phase 3 REVISED A.4 — UV-sphere raycast for the WrappedPlane
 /// frame when sphere-render mode is active. CPU mirror of the
@@ -189,15 +189,89 @@ pub fn cpu_raycast_sphere_uv(
             continue;
         }
 
-        // Sub-slab descent: when the slab cell is an anchor Node and
-        // the user's edit depth (max_depth) goes beyond the slab,
-        // continue picking sub-cells using the ray's fractional
-        // (lon, lat, r) coords WITHIN the slab cell. Each level
-        // multiplies the resolution by 3, so the break path lands at
-        // the right sub-cell for the camera's anchor depth — same
-        // behavior as Cartesian where deeper anchors break smaller
-        // cells, and as 2-2-3-2's `walk_face_subtree(max_depth)`.
+        // Sub-slab descent. Two cases:
+        //
+        //  * TangentBlock anchor — the cell IS a rotated Cartesian
+        //    cube. Transform the ray into the cube's local `[0, 3)³`
+        //    frame and dispatch the regular CPU Cartesian raycast,
+        //    same recipe the GPU shader's TangentBlock branch uses
+        //    (`sphere_descend_anchor` -> `march_cartesian`). The
+        //    returned path is appended verbatim — its first entry
+        //    is `(tangent_block_node, slot_in_cube)`, so the chain
+        //    `... → slab_cell_slot → (tangent_block, slot) → ...`
+        //    stays consistent for `propagate_edit`.
+        //
+        //  * Cartesian anchor (legacy) — descend by fractional
+        //    (lon, lat, r) inside the slab cell. The sub-cells are
+        //    interpreted as a (lon, lat, r) sub-grid, NOT a cube.
         if let Some(mut node_idx) = sub_idx {
+            let is_tangent = library
+                .get(node_idx)
+                .map(|n| matches!(n.kind, NodeKind::TangentBlock))
+                .unwrap_or(false);
+
+            if is_tangent {
+                let lat_step = 2.0 * lat_max / dims[2] as f32;
+                let lon_step = 2.0 * pi / dims[0] as f32;
+                let r_step = shell_thickness / dims[1] as f32;
+                let lat_c = -lat_max + (cell_z as f32 + 0.5) * lat_step;
+                let lon_c = -pi + (cell_x as f32 + 0.5) * lon_step;
+                let r_c = r_inner + (cy as f32 + 0.5) * r_step;
+                let (sl, cl) = lat_c.sin_cos();
+                let (so, co) = lon_c.sin_cos();
+                let normal_w = [cl * co, sl, cl * so];
+                let east_w = [-so, 0.0, co];
+                let north_w = [-sl * co, cl, -sl * so];
+                let cube_origin = [
+                    cs_center[0] + r_c * normal_w[0],
+                    cs_center[1] + r_c * normal_w[1],
+                    cs_center[2] + r_c * normal_w[2],
+                ];
+                let east_arc = r_sphere * cl.abs() * lon_step;
+                let north_arc = r_sphere * lat_step;
+                let cube_side = east_arc.max(north_arc).max(r_step);
+                let scale = 3.0 / cube_side;
+                let d_origin = [
+                    cam_local[0] - cube_origin[0],
+                    cam_local[1] - cube_origin[1],
+                    cam_local[2] - cube_origin[2],
+                ];
+                let local_origin = [
+                    (east_w[0] * d_origin[0] + east_w[1] * d_origin[1] + east_w[2] * d_origin[2]) * scale + 1.5,
+                    (normal_w[0] * d_origin[0] + normal_w[1] * d_origin[1] + normal_w[2] * d_origin[2]) * scale + 1.5,
+                    (north_w[0] * d_origin[0] + north_w[1] * d_origin[1] + north_w[2] * d_origin[2]) * scale + 1.5,
+                ];
+                let local_dir = [
+                    (east_w[0] * dir[0] + east_w[1] * dir[1] + east_w[2] * dir[2]) * scale,
+                    (normal_w[0] * dir[0] + normal_w[1] * dir[1] + normal_w[2] * dir[2]) * scale,
+                    (north_w[0] * dir[0] + north_w[1] * dir[1] + north_w[2] * dir[2]) * scale,
+                ];
+                let absolute_slab_depth = frame_path.len() as u32 + slab_depth as u32;
+                let cube_max_depth = max_depth.saturating_sub(absolute_slab_depth).max(1);
+                if let Some(sub_hit) = super::cpu_raycast(
+                    library, node_idx, local_origin, local_dir, cube_max_depth,
+                ) {
+                    for &(parent, slot) in &sub_hit.path {
+                        path.push((parent, slot));
+                    }
+                    // local_t == WrappedPlane-normalised t (the dir
+                    // scale is absorbed in the parameterisation), so
+                    // multiply by inv_norm to convert to caller t.
+                    return Some(HitInfo {
+                        path,
+                        face: sub_hit.face,
+                        t: sub_hit.t * inv_norm,
+                        place_path: None,
+                    });
+                }
+                // Ray didn't hit anything inside the cube (entered
+                // sub-pixel angularly off-cube, or DDA exited via an
+                // empty face). Fall through to the next radial
+                // layer — the cube's outer-shell sibling cells may
+                // still cover this ray.
+                continue;
+            }
+
             let absolute_slab_depth = frame_path.len() as u32 + slab_depth as u32;
             let extra_levels = max_depth.saturating_sub(absolute_slab_depth);
             if extra_levels > 0 {
