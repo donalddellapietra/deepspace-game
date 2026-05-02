@@ -23,7 +23,7 @@
 
 use std::f32::consts::PI;
 
-use crate::world::anchor::Path;
+use crate::world::anchor::{Path, WorldPos};
 use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Shell thickness as a fraction of the sphere radius. Mirrors the
@@ -185,6 +185,104 @@ pub fn subframe_range(
     })
 }
 
+/// Camera position + basis projected into a sphere sub-frame's
+/// local rotated+translated coordinate system. The sub-frame's
+/// origin is at the sub-frame center (= sphere body center
+/// translated by `r_c · radial`), with axes:
+///   * +x = lon-tangent at sub-frame center
+///   * +y = lat-tangent at sub-frame center
+///   * +z = radial direction at sub-frame center
+///
+/// All three basis vectors are unit-length in the WP's local frame
+/// (= unit-length in world up to the WP's scale factor — frames are
+/// pure scale+translation, no rotation, so direction vectors are
+/// preserved). Camera position magnitude is bounded by
+/// `camera_distance_to_sub_frame_center` rather than by the sphere
+/// body's WP-local extent — small for cameras anchored INSIDE the
+/// sub-frame, which is the case the precision discipline exists to
+/// solve.
+pub struct SphereSubFrameLocal {
+    pub origin: [f32; 3],
+    pub forward: [f32; 3],
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+    /// Sub-frame center radial distance from the sphere body center.
+    /// Useful for the shader to compute the sphere's position in
+    /// sub-frame coords (= `(0, 0, -r_c)`).
+    pub r_c: f32,
+}
+
+/// Project a camera (position + basis) into a sphere sub-frame's
+/// local coords.
+///
+/// `wp_path` is the path from the world root to the `WrappedPlane`
+/// node — typically `range.wp_path_depth` slots from the active
+/// frame's `render_path`. `range` is the sub-frame's geometry.
+/// `body_size` is the WP's local frame size (3.0 in the standard
+/// architecture).
+pub fn camera_in_sphere_subframe(
+    cam_pos: &WorldPos,
+    cam_forward: [f32; 3],
+    cam_right: [f32; 3],
+    cam_up: [f32; 3],
+    wp_path: &Path,
+    range: &SphereSubFrameRange,
+    body_size: f32,
+) -> SphereSubFrameLocal {
+    let lon_c = range.lon_center();
+    let lat_c = range.lat_center();
+    let r_c = range.r_center();
+    let cl = lat_c.cos();
+    let sl = lat_c.sin();
+    let co = lon_c.cos();
+    let so = lon_c.sin();
+    let radial = [cl * co, sl, cl * so];
+    let lon_tan = [-so, 0.0, co];
+    let lat_tan = [-sl * co, cl, -sl * so];
+
+    // Sub-frame center in WP-local coords.
+    let half = body_size * 0.5;
+    let sub_center_wp = [
+        half + r_c * radial[0],
+        half + r_c * radial[1],
+        half + r_c * radial[2],
+    ];
+
+    // Camera in WP local.
+    let cam_wp = cam_pos.in_frame(wp_path);
+    let cam_offset = [
+        cam_wp[0] - sub_center_wp[0],
+        cam_wp[1] - sub_center_wp[1],
+        cam_wp[2] - sub_center_wp[2],
+    ];
+
+    let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    SphereSubFrameLocal {
+        origin: [
+            dot3(cam_offset, lon_tan),
+            dot3(cam_offset, lat_tan),
+            dot3(cam_offset, radial),
+        ],
+        forward: [
+            dot3(cam_forward, lon_tan),
+            dot3(cam_forward, lat_tan),
+            dot3(cam_forward, radial),
+        ],
+        right: [
+            dot3(cam_right, lon_tan),
+            dot3(cam_right, lat_tan),
+            dot3(cam_right, radial),
+        ],
+        up: [
+            dot3(cam_up, lon_tan),
+            dot3(cam_up, lat_tan),
+            dot3(cam_up, radial),
+        ],
+        r_c,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +412,124 @@ mod tests {
 
     fn lib_ref(world: &crate::world::state::WorldState) -> &NodeLibrary {
         &world.library
+    }
+
+    // -------------------- camera_in_sphere_subframe --------------------
+
+    /// Camera at the sub-frame center → origin = (0, 0, 0).
+    /// Layer-agnostic precision relies on this: the sub-frame center
+    /// is the origin of the local rotated+translated frame.
+    #[test]
+    fn camera_at_subframe_center_projects_to_origin() {
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 3);
+        let mut wp_path = Path::root();
+        wp_path.push(slot_index(1, 1, 1) as u8);
+        wp_path.push(slot_index(1, 1, 1) as u8);
+        // Sub-frame at WP center cell (1, 1, 1) → range center is
+        // sphere center direction at (lat=0, lon=0, r=middle).
+        let mut anchor = wp_path;
+        anchor.push(slot_index(1, 1, 1) as u8);
+        let range = subframe_range(&lib_ref(&world), world.root, &anchor, BODY_SIZE, LAT_MAX)
+            .unwrap();
+        // Camera position: sub-frame center in WP local.
+        let lon_c = range.lon_center();
+        let lat_c = range.lat_center();
+        let r_c = range.r_center();
+        let radial = [
+            lat_c.cos() * lon_c.cos(),
+            lat_c.sin(),
+            lat_c.cos() * lon_c.sin(),
+        ];
+        let half = BODY_SIZE * 0.5;
+        let center_wp = [
+            half + r_c * radial[0],
+            half + r_c * radial[1],
+            half + r_c * radial[2],
+        ];
+        let cam_pos = WorldPos::from_frame_local(&wp_path, center_wp, wp_path.depth());
+        let local = camera_in_sphere_subframe(
+            &cam_pos,
+            [0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+            &wp_path, &range, BODY_SIZE,
+        );
+        assert!(local.origin[0].abs() < 1e-3, "origin.x ≈ 0, got {}", local.origin[0]);
+        assert!(local.origin[1].abs() < 1e-3, "origin.y ≈ 0, got {}", local.origin[1]);
+        assert!(local.origin[2].abs() < 1e-3, "origin.z ≈ 0, got {}", local.origin[2]);
+    }
+
+    /// Camera offset from sub-frame center along the lon-tangent
+    /// direction in WP-local → projects to a pure +x in sub-frame
+    /// local (other axes ≈ 0).
+    #[test]
+    fn camera_offset_along_lon_tangent_projects_to_x_axis() {
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 3);
+        let mut wp_path = Path::root();
+        wp_path.push(slot_index(1, 1, 1) as u8);
+        wp_path.push(slot_index(1, 1, 1) as u8);
+        // Use middle sub-cell (lat = 0, lon ≈ 0) so the basis lines
+        // up nicely with WP-local axes.
+        let mut anchor = wp_path;
+        anchor.push(slot_index(1, 1, 1) as u8);
+        let range = subframe_range(&lib_ref(&world), world.root, &anchor, BODY_SIZE, LAT_MAX)
+            .unwrap();
+        let lon_c = range.lon_center();
+        let lat_c = range.lat_center();
+        let r_c = range.r_center();
+        let radial = [
+            lat_c.cos() * lon_c.cos(),
+            lat_c.sin(),
+            lat_c.cos() * lon_c.sin(),
+        ];
+        let lon_tan = [-lon_c.sin(), 0.0, lon_c.cos()];
+        let half = BODY_SIZE * 0.5;
+        let center_wp = [
+            half + r_c * radial[0],
+            half + r_c * radial[1],
+            half + r_c * radial[2],
+        ];
+        // Camera offset by 0.01 (small) in the lon-tangent direction.
+        let offset = 0.01_f32;
+        let cam_wp = [
+            center_wp[0] + offset * lon_tan[0],
+            center_wp[1] + offset * lon_tan[1],
+            center_wp[2] + offset * lon_tan[2],
+        ];
+        let cam_pos = WorldPos::from_frame_local(&wp_path, cam_wp, wp_path.depth());
+        let local = camera_in_sphere_subframe(
+            &cam_pos,
+            [0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+            &wp_path, &range, BODY_SIZE,
+        );
+        assert!((local.origin[0] - offset).abs() < 1e-4,
+                "x ≈ offset, got {}", local.origin[0]);
+        assert!(local.origin[1].abs() < 1e-4,
+                "y ≈ 0, got {}", local.origin[1]);
+        assert!(local.origin[2].abs() < 1e-4,
+                "z ≈ 0, got {}", local.origin[2]);
+    }
+
+    /// Camera basis is preserved as unit-length under projection
+    /// (the basis vectors are pure rotations of world-axis-aligned
+    /// inputs).
+    #[test]
+    fn camera_basis_remains_unit_length() {
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 3);
+        let mut wp_path = Path::root();
+        wp_path.push(slot_index(1, 1, 1) as u8);
+        wp_path.push(slot_index(1, 1, 1) as u8);
+        let mut anchor = wp_path;
+        anchor.push(slot_index(0, 1, 1) as u8); // off-center sub-frame
+        let range = subframe_range(&lib_ref(&world), world.root, &anchor, BODY_SIZE, LAT_MAX)
+            .unwrap();
+        let cam_pos = WorldPos::from_frame_local(&wp_path, [1.5, 1.5, 1.5], wp_path.depth());
+        let local = camera_in_sphere_subframe(
+            &cam_pos,
+            [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0],
+            &wp_path, &range, BODY_SIZE,
+        );
+        let mag = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        assert!((mag(local.forward) - 1.0).abs() < 1e-4);
+        assert!((mag(local.right) - 1.0).abs() < 1e-4);
+        assert!((mag(local.up) - 1.0).abs() < 1e-4);
     }
 }
