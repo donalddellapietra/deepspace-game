@@ -118,6 +118,19 @@ fn write_walker_probe(
     walker_probe._reserved11 = 0u;
 }
 
+// Precision-stable cartesian DDA in nested local frames.
+//
+// Why nested local frames: with absolute coords in [0, 3]³, cells at
+// depth N have size 3^-N. Past N≈14 the cell size hits the f32 ULP
+// wall — `ray_origin + ray_dir * t` can no longer resolve sub-cell
+// positions, the DDA picks wrong children, the visual smears.
+//
+// In this rewrite, every level's DDA runs at `cell_size = 1` in its
+// own local [0, 3]³ frame. Ray dir scales by 3 at each push (`*= 3`),
+// by 1/3 at each pop. Positions stay in O(1) magnitude at all depths
+// — no precision degradation. Hit-time `t` is in the CURRENT frame's
+// local units; we track `cur_scale = 3^-depth` and convert back to
+// the input ray's frame on return.
 fn march_entity_subtree(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
 ) -> HitResult {
@@ -129,23 +142,35 @@ fn march_entity_subtree(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
-    let inv_dir = vec3<f32>(
-        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
-        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
-        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
-    );
-    let ray_metric = max(length(ray_dir), 1e-6);
     let step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
         select(-1, 1, ray_dir.y >= 0.0),
         select(-1, 1, ray_dir.z >= 0.0),
     );
-    let delta_dist = abs(inv_dir);
 
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
     var s_cell: array<u32, MAX_STACK_DEPTH>;
-    var cur_cell_size: f32 = 1.0;
-    var cur_node_origin: vec3<f32> = vec3<f32>(0.0);
+
+    // Per-level local ray. At depth 0 these match the input ray.
+    // Push: origin = (origin - cell_offset) * 3; dir *= 3.
+    // Pop:  origin = origin / 3 + parent_cell_offset; dir /= 3.
+    var cur_origin: vec3<f32> = ray_origin;
+    var cur_dir: vec3<f32> = ray_dir;
+    var cur_inv_dir: vec3<f32> = vec3<f32>(
+        select(1e10, 1.0 / cur_dir.x, abs(cur_dir.x) > 1e-8),
+        select(1e10, 1.0 / cur_dir.y, abs(cur_dir.y) > 1e-8),
+        select(1e10, 1.0 / cur_dir.z, abs(cur_dir.z) > 1e-8),
+    );
+    var cur_delta_dist: vec3<f32> = abs(cur_inv_dir);
+    // Conversion factor from local-frame `t` back to the input
+    // (root) frame's `t`. At depth N this is 3^-N. Updated on
+    // push (×1/3) and pop (×3).
+    var cur_scale: f32 = 1.0;
+    // Cell-size IN THE ROOT FRAME at the current depth. For
+    // returning `result.cell_size` and computing `cell_min` to the
+    // caller in root coords. Updated alongside `cur_scale`.
+    var cur_cell_size_root: f32 = 1.0;
+
     var cur_side_dist: vec3<f32>;
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
@@ -155,12 +180,12 @@ fn march_entity_subtree(
     var cur_occupancy: u32 = tree[root_header_off];
     var cur_first_child: u32 = tree[root_header_off + 1u];
 
-    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    let root_hit = ray_box(cur_origin, cur_inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
     }
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
-    let entry_pos = ray_origin + ray_dir * t_start;
+    let entry_pos = cur_origin + cur_dir * t_start;
     let entry_cell = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
         clamp(i32(floor(entry_pos.y)), 0, 2),
@@ -169,13 +194,16 @@ fn march_entity_subtree(
     s_cell[0] = pack_cell(entry_cell);
     let cell_f = vec3<f32>(entry_cell);
     cur_side_dist = vec3<f32>(
-        select((cell_f.x - entry_pos.x) * inv_dir.x,
-               (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-        select((cell_f.y - entry_pos.y) * inv_dir.y,
-               (cell_f.y + 1.0 - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-        select((cell_f.z - entry_pos.z) * inv_dir.z,
-               (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+        select((cell_f.x - entry_pos.x) * cur_inv_dir.x,
+               (cell_f.x + 1.0 - entry_pos.x) * cur_inv_dir.x, cur_dir.x >= 0.0),
+        select((cell_f.y - entry_pos.y) * cur_inv_dir.y,
+               (cell_f.y + 1.0 - entry_pos.y) * cur_inv_dir.y, cur_dir.y >= 0.0),
+        select((cell_f.z - entry_pos.z) * cur_inv_dir.z,
+               (cell_f.z + 1.0 - entry_pos.z) * cur_inv_dir.z, cur_dir.z >= 0.0),
     );
+    // `cur_side_dist[axis]` is "extra t-from-entry to next axis face"
+    // in the CURRENT level's local frame. Per cell crossing it grows
+    // by `cur_delta_dist[axis]`.
 
     var iterations = 0u;
     let max_iterations = 2048u;
@@ -185,26 +213,45 @@ fn march_entity_subtree(
         let cell = unpack_cell(s_cell[depth]);
         if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
+            // POP: from child to parent. Inverse of push transform.
             depth -= 1u;
-            cur_cell_size = cur_cell_size * 3.0;
-            let popped = unpack_cell(s_cell[depth]);
-            cur_node_origin = cur_node_origin - vec3<f32>(popped) * cur_cell_size;
-            let lc_pop = vec3<f32>(popped);
+            let popped_cell = unpack_cell(s_cell[depth]);
+            let popped_f = vec3<f32>(popped_cell);
+            // Ray transform: child_origin → parent_origin. Inverse
+            // of push.
+            cur_origin = cur_origin / 3.0 + popped_f;
+            cur_dir = cur_dir / 3.0;
+            cur_inv_dir = cur_inv_dir * 3.0;
+            cur_delta_dist = cur_delta_dist * 3.0;
+            cur_scale = cur_scale * 3.0;
+            cur_cell_size_root = cur_cell_size_root * 3.0;
+            // Recompute side_dist for parent frame at the cell we
+            // popped INTO (= cell we descended FROM in the parent).
+            let entry_pos_p = cur_origin + cur_dir * 0.0; // ray-origin position is the reference
+            // Side_dist[axis] = t-from-entry to next face along axis,
+            // in the PARENT's local frame. We're at popped_cell in
+            // parent. Using ray-origin (t=0) as reference is fine
+            // because side_dist is recomputed each iteration as the
+            // DDA only uses min(cur_side_dist) for stepping.
+            //
+            // Actually we need side_dist relative to the ray's
+            // current position. Since the ray is at the boundary
+            // (it just exited child at this t), recompute:
             cur_side_dist = vec3<f32>(
-                select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
-                       (cur_node_origin.x + (lc_pop.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                select((cur_node_origin.y + lc_pop.y * cur_cell_size - entry_pos.y) * inv_dir.y,
-                       (cur_node_origin.y + (lc_pop.y + 1.0) * cur_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-                select((cur_node_origin.z + lc_pop.z * cur_cell_size - entry_pos.z) * inv_dir.z,
-                       (cur_node_origin.z + (lc_pop.z + 1.0) * cur_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+                select((popped_f.x - entry_pos_p.x) * cur_inv_dir.x,
+                       (popped_f.x + 1.0 - entry_pos_p.x) * cur_inv_dir.x, cur_dir.x >= 0.0),
+                select((popped_f.y - entry_pos_p.y) * cur_inv_dir.y,
+                       (popped_f.y + 1.0 - entry_pos_p.y) * cur_inv_dir.y, cur_dir.y >= 0.0),
+                select((popped_f.z - entry_pos_p.z) * cur_inv_dir.z,
+                       (popped_f.z + 1.0 - entry_pos_p.z) * cur_inv_dir.z, cur_dir.z >= 0.0),
             );
             let parent_header_off = node_offsets[s_node_idx[depth]];
             cur_occupancy = tree[parent_header_off];
             cur_first_child = tree[parent_header_off + 1u];
             let m_oob = min_axis_mask(cur_side_dist);
-            let advanced = popped + vec3<i32>(m_oob) * step;
+            let advanced = popped_cell + vec3<i32>(m_oob) * step;
             s_cell[depth] = pack_cell(advanced);
-            cur_side_dist += m_oob * delta_dist * cur_cell_size;
+            cur_side_dist += m_oob * cur_delta_dist;
             normal = -vec3<f32>(step) * m_oob;
             continue;
         }
@@ -214,7 +261,7 @@ fn march_entity_subtree(
         if ((cur_occupancy & slot_bit) == 0u) {
             let m_empty = min_axis_mask(cur_side_dist);
             s_cell[depth] = pack_cell(cell + vec3<i32>(m_empty) * step);
-            cur_side_dist += m_empty * delta_dist * cur_cell_size;
+            cur_side_dist += m_empty * cur_delta_dist;
             normal = -vec3<f32>(step) * m_empty;
             continue;
         }
@@ -224,89 +271,108 @@ fn march_entity_subtree(
         let tag = packed & 0xFFu;
 
         if tag == 1u {
-            let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-            let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
-            let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+            // Block leaf hit. Compute hit-cell box in CURRENT local
+            // frame, then convert t and cell_min back to ROOT frame.
+            let cell_min_local = vec3<f32>(cell);
+            let cell_max_local = cell_min_local + vec3<f32>(1.0);
+            let cell_box = ray_box(cur_origin, cur_inv_dir, cell_min_local, cell_max_local);
+            let t_local = max(cell_box.t_enter, 0.0);
             result.hit = true;
-            result.t = max(cell_box_h.t_enter, 0.0);
+            // Convert local t → root t (input ray's t).
+            result.t = t_local * cur_scale;
             result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
             result.normal = normal;
-            result.cell_min = cell_min_h;
-            result.cell_size = cur_cell_size;
+            // Reconstruct cell_min in root coords by sampling the
+            // hit position with the ROOT ray (which the caller may
+            // pass back). For our caller (uv_dispatch_cartesian_tangent)
+            // cell_min is informational — set to a reasonable approx.
+            result.cell_min = ray_origin + ray_dir * result.t - vec3<f32>(0.5) * cur_cell_size_root;
+            result.cell_size = cur_cell_size_root;
             return result;
         }
         // tag == 2u: Cartesian Node descent. tag==3 (EntityRef) is
-        // treated as miss inside entity subtrees — no entities-
-        // inside-entities for now.
+        // not supported inside entity subtrees.
         if tag != 2u {
             let m_skip = min_axis_mask(cur_side_dist);
             s_cell[depth] = pack_cell(cell + vec3<i32>(m_skip) * step);
-            cur_side_dist += m_skip * delta_dist * cur_cell_size;
+            cur_side_dist += m_skip * cur_delta_dist;
             normal = -vec3<f32>(step) * m_skip;
             continue;
         }
         let child_idx = tree[child_base + 1u];
         let child_bt = (packed >> 8u) & 0xFFFFu;
-        if child_bt == 0xFFFEu {  // REPRESENTATIVE_EMPTY (matches gpu::pack u16 sentinel)
+        if child_bt == 0xFFFEu {  // REPRESENTATIVE_EMPTY
             let m_rep = min_axis_mask(cur_side_dist);
             s_cell[depth] = pack_cell(cell + vec3<i32>(m_rep) * step);
-            cur_side_dist += m_rep * delta_dist * cur_cell_size;
+            cur_side_dist += m_rep * cur_delta_dist;
             normal = -vec3<f32>(step) * m_rep;
             continue;
         }
 
         let at_max = depth + 1u >= MAX_STACK_DEPTH;
-        let child_cell_size = cur_cell_size / 3.0;
+        let child_cell_size_root = cur_cell_size_root / 3.0;
+        // LOD: terminate descent when child cells would be sub-pixel
+        // ON SCREEN. Compute ray distance to current cell entry in
+        // ROOT frame using `cur_scale`.
         let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
-        let ray_dist = max(min_side * ray_metric, 0.001);
-        let lod_pixels = child_cell_size / ray_dist
+        let min_side_root = min_side * cur_scale * max(length(ray_dir), 1e-6);
+        let ray_dist = max(min_side_root, 0.001);
+        let lod_pixels = child_cell_size_root / ray_dist
             * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
         let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
         if at_max || at_lod {
             let bt = child_bt;
-            if bt == 0xFFFEu || bt == 0xFFFDu {  // REPRESENTATIVE_EMPTY / ENTITY_REPRESENTATIVE
+            if bt == 0xFFFEu || bt == 0xFFFDu {
                 let m_lodt = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_lodt) * step);
-                cur_side_dist += m_lodt * delta_dist * cur_cell_size;
+                cur_side_dist += m_lodt * cur_delta_dist;
                 normal = -vec3<f32>(step) * m_lodt;
             } else {
-                let cell_min_l = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-                let cell_max_l = cell_min_l + vec3<f32>(cur_cell_size);
-                let cell_box_l = ray_box(ray_origin, inv_dir, cell_min_l, cell_max_l);
+                let cell_min_local = vec3<f32>(cell);
+                let cell_max_local = cell_min_local + vec3<f32>(1.0);
+                let cell_box = ray_box(cur_origin, cur_inv_dir, cell_min_local, cell_max_local);
+                let t_local = max(cell_box.t_enter, 0.0);
                 result.hit = true;
-                result.t = max(cell_box_l.t_enter, 0.0);
+                result.t = t_local * cur_scale;
                 result.color = palette[bt].rgb;
                 result.normal = normal;
-                result.cell_min = cell_min_l;
-                result.cell_size = cur_cell_size;
+                result.cell_min = ray_origin + ray_dir * result.t - vec3<f32>(0.5) * cur_cell_size_root;
+                result.cell_size = cur_cell_size_root;
                 return result;
             }
         } else {
-            let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-            let ct_start = max(root_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
-            let child_entry = ray_origin + ray_dir * ct_start;
-            let local_entry = (child_entry - child_origin) / child_cell_size;
+            // PUSH: descend into child cell. Transform ray into
+            // child's [0, 3]³ local frame.
+            let cell_f_push = vec3<f32>(cell);
+            cur_origin = (cur_origin - cell_f_push) * 3.0;
+            cur_dir = cur_dir * 3.0;
+            cur_inv_dir = cur_inv_dir / 3.0;
+            cur_delta_dist = cur_delta_dist / 3.0;
+            cur_scale = cur_scale / 3.0;
+            cur_cell_size_root = child_cell_size_root;
             depth += 1u;
             s_node_idx[depth] = child_idx;
-            cur_node_origin = child_origin;
-            cur_cell_size = child_cell_size;
             let child_header_off = node_offsets[child_idx];
             cur_occupancy = tree[child_header_off];
             cur_first_child = tree[child_header_off + 1u];
+            // Re-derive entry cell + side_dist in CHILD's local frame.
+            let entry_pos_c = cur_origin + cur_dir * (max(root_hit.t_enter, 0.0) + 0.0001);
+            // Note: clamp on entry_pos_c — at boundary, floor() may
+            // step out by 1 ULP. Clamp to [0, 2].
             let child_cell_i = vec3<i32>(
-                clamp(i32(floor(local_entry.x)), 0, 2),
-                clamp(i32(floor(local_entry.y)), 0, 2),
-                clamp(i32(floor(local_entry.z)), 0, 2),
+                clamp(i32(floor(entry_pos_c.x)), 0, 2),
+                clamp(i32(floor(entry_pos_c.y)), 0, 2),
+                clamp(i32(floor(entry_pos_c.z)), 0, 2),
             );
             s_cell[depth] = pack_cell(child_cell_i);
             let lc = vec3<f32>(child_cell_i);
             cur_side_dist = vec3<f32>(
-                select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
-                       (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                select((child_origin.y + lc.y * child_cell_size - entry_pos.y) * inv_dir.y,
-                       (child_origin.y + (lc.y + 1.0) * child_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-                select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
-                       (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+                select((lc.x - entry_pos_c.x) * cur_inv_dir.x,
+                       (lc.x + 1.0 - entry_pos_c.x) * cur_inv_dir.x, cur_dir.x >= 0.0),
+                select((lc.y - entry_pos_c.y) * cur_inv_dir.y,
+                       (lc.y + 1.0 - entry_pos_c.y) * cur_inv_dir.y, cur_dir.y >= 0.0),
+                select((lc.z - entry_pos_c.z) * cur_inv_dir.z,
+                       (lc.z + 1.0 - entry_pos_c.z) * cur_inv_dir.z, cur_dir.z >= 0.0),
             );
         }
     }
