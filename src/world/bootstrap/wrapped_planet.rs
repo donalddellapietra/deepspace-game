@@ -81,10 +81,6 @@ pub fn wrapped_planet_world(
 ) -> WorldState {
     assert!(embedding_depth > 0, "embedding_depth must be >= 1");
     assert!(slab_depth > 0, "slab_depth must be >= 1");
-    assert!(
-        cell_subtree_depth >= 1,
-        "wrapped_planet requires cell_subtree_depth >= 1 (TangentBlock wraps the per-cell chain)",
-    );
     let total_depth = (embedding_depth as usize)
         .saturating_add(slab_depth as usize)
         .saturating_add(cell_subtree_depth as usize);
@@ -117,13 +113,10 @@ pub fn wrapped_planet_world(
     // are `Child::Node(...)`, not `Child::Block(...)`, so the
     // recursive subdivision goes all the way down.
     //
-    // The OUTERMOST node of each cell's chain (= the slab cell
-    // anchor) is `NodeKind::TangentBlock`. The shader detects this
-    // kind, transforms the ray into the cell's local tangent cube
-    // frame, and dispatches `march_in_tangent_cube` from there — so
-    // every voxel below the slab cell sees the precision-stable
-    // Cartesian path. The chain BELOW the TangentBlock is regular
-    // Cartesian and uniform-flattens away in the GPU pack.
+    // Each slab cell is a plain Cartesian anchor subtree —
+    // `cell_subtree_depth` levels of uniform material. The sphere
+    // DDA handles per-cell tangent-plane rotation at render time
+    // via basis math, so no TangentBlock NodeKind is needed.
     fn build_uniform_anchor(library: &mut NodeLibrary, block: u16, depth: u8) -> Child {
         if depth == 0 {
             return Child::Block(block);
@@ -131,16 +124,9 @@ pub fn wrapped_planet_world(
         let inner = build_uniform_anchor(library, block, depth - 1);
         Child::Node(library.insert(uniform_children(inner)))
     }
-    let make_anchor = |library: &mut NodeLibrary, block: u16| -> Child {
-        let inner = build_uniform_anchor(library, block, cell_subtree_depth - 1);
-        Child::Node(library.insert_with_kind(
-            uniform_children(inner),
-            NodeKind::TangentBlock { rotation: crate::world::tree::IDENTITY_ROTATION },
-        ))
-    };
-    let stone_anchor = make_anchor(&mut library, block::STONE);
-    let dirt_anchor  = make_anchor(&mut library, block::DIRT);
-    let grass_anchor = make_anchor(&mut library, block::GRASS);
+    let stone_anchor = build_uniform_anchor(&mut library, block::STONE, cell_subtree_depth);
+    let dirt_anchor  = build_uniform_anchor(&mut library, block::DIRT,  cell_subtree_depth);
+    let grass_anchor = build_uniform_anchor(&mut library, block::GRASS, cell_subtree_depth);
 
     // Build the slab subtree as a flat `subgrid^3` Cartesian volume,
     // sparsely populated to the slab_dims footprint. The simplest
