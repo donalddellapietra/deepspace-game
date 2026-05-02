@@ -83,6 +83,7 @@ export interface DebugOverlayState {
   renderPathCsv: string;
   tbOnAnchorPath: boolean;
   anchorCumulativeYawDeg: number;
+  copySeq: number;
 }
 
 // Union of all state updates pushed from Rust

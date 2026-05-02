@@ -458,6 +458,7 @@ impl App {
                     render_path_csv,
                     tb_on_anchor_path,
                     anchor_cumulative_yaw_deg,
+                    copy_seq: self.debug_copy_seq,
                 },
             ));
         }

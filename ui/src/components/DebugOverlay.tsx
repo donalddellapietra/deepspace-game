@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDebugOverlay } from "../hooks/useGameState";
 import type { DebugOverlayState } from "../types";
 import "./DebugOverlay.css";
@@ -24,9 +24,8 @@ function fmtDist(v: number): string {
 }
 
 /// Format the debug-overlay state as a multi-line string suitable
-/// for pasting into a bug report. Same content the on-screen overlay
-/// shows (sans the "DEBUG" header). Available even when the overlay
-/// is hidden.
+/// for pasting into a bug report. Same content the on-screen
+/// overlay shows. Available even when the overlay is hidden.
 function formatDebug(s: DebugOverlayState): string {
   const [rx, ry, rz] = s.cameraRootXyz;
   const [lx, ly, lz] = s.cameraLocal;
@@ -73,10 +72,9 @@ async function copyToClipboard(text: string): Promise<boolean> {
       return true;
     }
   } catch {
-    // fall through to legacy path
+    // fall through
   }
-  // Fallback for environments that don't expose the modern clipboard
-  // API (older webviews, insecure contexts).
+  // Fallback for environments without the modern clipboard API.
   try {
     const ta = document.createElement("textarea");
     ta.value = text;
@@ -96,46 +94,33 @@ async function copyToClipboard(text: string): Promise<boolean> {
 export function DebugOverlay() {
   const s = useDebugOverlay();
   const [flash, setFlash] = useState<"copied" | "failed" | null>(null);
+  const lastCopySeq = useRef<number>(0);
 
-  // `Ctrl/Cmd+Shift+C` copies the current debug-overlay state to the
-  // clipboard regardless of whether the overlay is visible. The
-  // shortcut is namespaced behind Shift so it doesn't collide with
-  // browser/OS native copy. See the formatDebug() output above for
-  // exactly what gets copied.
+  // Watch the Rust-side `copySeq` counter. It increments each time
+  // the user presses `[` while the overlay is visible (handled in
+  // `src/app/input_handlers.rs`). The actual clipboard write has
+  // to happen in JS (clipboard API is web-only) so we receive the
+  // signal here, format the state, and copy.
   useEffect(() => {
-    function handler(e: KeyboardEvent) {
-      const isMod = e.ctrlKey || e.metaKey;
-      const isCopy =
-        isMod && e.shiftKey && (e.key === "C" || e.key === "c");
-      if (!isCopy) return;
-      e.preventDefault();
-      e.stopPropagation();
-      copyToClipboard(formatDebug(s)).then((ok) => {
-        setFlash(ok ? "copied" : "failed");
-        window.setTimeout(() => setFlash(null), 1500);
-      });
+    // Initialize the ref to whatever we first see, so we don't
+    // copy on first render just because seq jumped from 0 → N
+    // after a hot reload.
+    if (lastCopySeq.current === 0 && s.copySeq !== 0) {
+      lastCopySeq.current = s.copySeq;
+      return;
     }
-    window.addEventListener("keydown", handler, { capture: true });
-    return () =>
-      window.removeEventListener("keydown", handler, { capture: true });
+    if (s.copySeq === lastCopySeq.current) return;
+    lastCopySeq.current = s.copySeq;
+    copyToClipboard(formatDebug(s)).then((ok) => {
+      setFlash(ok ? "copied" : "failed");
+      window.setTimeout(() => setFlash(null), 1500);
+    });
   }, [s]);
 
-  // Even when the overlay isn't visible, render a small "Copied!" /
-  // "Copy failed" toast so the user has feedback that the shortcut
-  // fired. Position it identically to the overlay so the corner of
-  // the screen flashes.
-  if (!s.visible && flash === null) return null;
-
-  if (!s.visible && flash !== null) {
-    return (
-      <div className="debug-overlay">
-        {flash === "copied" ? "✓ debug copied" : "✗ copy failed"}
-      </div>
-    );
-  }
+  if (!s.visible) return null;
 
   const lines = [
-    "DEBUG  [ ]=toggle  ⌘⇧C / ^⇧C=copy",
+    "DEBUG  ]=toggle  [=copy",
     formatDebug(s),
   ];
 
@@ -143,7 +128,7 @@ export function DebugOverlay() {
     <div className="debug-overlay">
       {flash === "copied" && <div>✓ copied to clipboard</div>}
       {flash === "failed" && <div>✗ copy failed (clipboard blocked)</div>}
-      {flash !== null && <div>{" "}</div>}
+      {flash !== null && <div>{" "}</div>}
       {lines.join("\n")}
     </div>
   );

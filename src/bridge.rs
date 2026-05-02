@@ -134,6 +134,14 @@ pub struct DebugOverlayStateJs {
     /// Cumulative Y rotation along the anchor path, in degrees.
     /// (Approximation: only Y-axis rotations show meaningfully.)
     pub anchor_cumulative_yaw_deg: f32,
+    /// Monotonic counter incremented each time the user presses `[`
+    /// while the debug overlay is visible. The UI watches for
+    /// changes and copies the formatted overlay text to the
+    /// clipboard. Plumbed this way (Rust → counter → UI) because the
+    /// webview forwards keystrokes to Rust first; a vanilla JS
+    /// keydown listener wouldn't fire while the canvas is pointer-
+    /// locked.
+    pub copy_seq: u64,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]

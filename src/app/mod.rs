@@ -141,6 +141,11 @@ pub struct App {
     pub(super) save_mode: bool,
     pub(super) ui: GameUiState,
     pub(super) debug_overlay_visible: bool,
+    /// Monotonic counter incremented each time the user requests a
+    /// debug-overlay-state copy via `[`. Forwarded to the UI which
+    /// watches for changes and writes the formatted overlay text to
+    /// the clipboard.
+    pub(super) debug_copy_seq: u64,
     pub(super) fps_smooth: f64,
     pub(super) startup_profile_frames: u32,
     /// The actual frame the renderer is using right now. This may
@@ -433,6 +438,7 @@ impl App {
             save_mode: false,
             ui: GameUiState::new(),
             debug_overlay_visible: false,
+            debug_copy_seq: 0,
             fps_smooth: 0.0,
             startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
             active_frame,

@@ -87,6 +87,7 @@ const debugOverlayStore = createStore<DebugOverlayState>({
   renderPathCsv: "",
   tbOnAnchorPath: false,
   anchorCumulativeYawDeg: 0,
+  copySeq: 0,
 });
 
 // Default `visible: true` so the crosshair is present from the very
