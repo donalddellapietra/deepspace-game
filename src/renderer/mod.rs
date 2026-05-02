@@ -111,6 +111,14 @@ pub struct GpuUniforms {
     pub node_lat_lon: [f32; 4],
     /// Node range radial. `(r_lo, r_hi, _, _)`.
     pub node_r: [f32; 4],
+    /// Hybrid prototype: enabled flag in `.x` (0 = disabled, 1 =
+    /// enabled). Mirrors `Uniforms.proto_target_cell` in bindings.wgsl.
+    pub proto_target_cell: [u32; 4],
+    /// Hybrid prototype: target cell angular range in radians.
+    /// `(lat_lo, lat_hi, lon_lo, lon_hi)`.
+    pub proto_target_lat_lon: [f32; 4],
+    /// Hybrid prototype: target cell radial range. `(r_lo, r_hi, _, _)`.
+    pub proto_target_r: [f32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
     /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
@@ -197,6 +205,9 @@ pub struct Renderer {
     pub(super) subframe_wp_dims: [u32; 4],
     pub(super) node_lat_lon: [f32; 4],
     pub(super) node_r: [f32; 4],
+    pub(super) proto_target_cell: [u32; 4],
+    pub(super) proto_target_lat_lon: [f32; 4],
+    pub(super) proto_target_r: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -409,6 +420,23 @@ impl Renderer {
         self.subframe_wp_dims = [wp_dims[0], wp_dims[1], wp_dims[2], wp_slab_depth as u32];
         self.node_lat_lon = [node_lat_lo, node_lat_hi, node_lon_lo, node_lon_hi];
         self.node_r = [node_r_lo, node_r_hi, 0.0, 0.0];
+        self.write_uniforms();
+    }
+
+    /// Hybrid prototype: identify a single cell on the planet by its
+    /// (lat, lon, r) range. The shader paints any sphere hit whose
+    /// `(lat_p, lon_p, r_h)` lands inside that range as the prototype
+    /// cell. Pass `enabled = false` to disable.
+    pub fn set_proto_target_cell(
+        &mut self,
+        enabled: bool,
+        lat_lo: f32, lat_hi: f32,
+        lon_lo: f32, lon_hi: f32,
+        r_lo: f32, r_hi: f32,
+    ) {
+        self.proto_target_cell = [if enabled { 1 } else { 0 }, 0, 0, 0];
+        self.proto_target_lat_lon = [lat_lo, lat_hi, lon_lo, lon_hi];
+        self.proto_target_r = [r_lo, r_hi, 0.0, 0.0];
         self.write_uniforms();
     }
 

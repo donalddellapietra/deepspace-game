@@ -427,6 +427,119 @@ fn sphere_descend_anchor(
 // the dispatch path wires correctly when the active frame is a
 // SphereSubFrame. Step 7 will replace this with the full DDA in
 // sub-frame local coords using the sphere boundary primitives
+// Hybrid prototype helper: render ONE slab cell as a flat
+// tangent-plane cube on the sphere surface instead of as a curved
+// sphere segment. Returns a hit at the cube face nearest the
+// camera, with the cube's flat face normal (+u, -u, +v, -v, +w, -w
+// where u=lon-tan, v=lat-tan, w=-radial). On miss returns hit=false.
+//
+// The cube's basis is built at the cell's center (lat_c, lon_c).
+// Top face is at the sphere surface (r = r_hi), extending DOWN by
+// r_step in the radial-inward direction. Tangent extents at the
+// surface are `lon_step * r_hi * cos(lat_c)` and `lat_step * r_hi`
+// — the linearization that makes the cube approximately match the
+// curved sphere segment at the cell's center.
+fn render_cell_as_tangent_cube(
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    inv_norm: f32,
+    cs_center: vec3<f32>,
+    block_type: u32,
+    lat_lo: f32, lat_hi: f32,
+    lon_lo: f32, lon_hi: f32,
+    r_lo: f32, r_hi: f32,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    let lat_c = (lat_lo + lat_hi) * 0.5;
+    let lon_c = (lon_lo + lon_hi) * 0.5;
+    let lon_step = lon_hi - lon_lo;
+    let lat_step = lat_hi - lat_lo;
+    let r_step   = r_hi - r_lo;
+    let cl = cos(lat_c); let sl = sin(lat_c);
+    let co = cos(lon_c); let so = sin(lon_c);
+    // Cube basis in WP-local. u = lon-tangent, v = lat-tangent,
+    // w = -radial (inward). Right-handed.
+    let radial = vec3<f32>(cl * co, sl, cl * so);
+    let u_axis = vec3<f32>(-so, 0.0, co);
+    let v_axis = vec3<f32>(-sl * co, cl, -sl * so);
+    let w_axis = -radial;
+
+    // Cube center: half-depth below the surface along radial.
+    let r_mid = (r_lo + r_hi) * 0.5;
+    let center = cs_center + r_mid * radial;
+    // Half-extents in tangent meters (at surface r_hi).
+    let half_u = lon_step * r_hi * cl * 0.5;
+    let half_v = lat_step * r_hi * 0.5;
+    let half_w = r_step * 0.5;
+
+    // Transform ray into cube-local axes.
+    let to_origin = ray_origin - center;
+    let pos_l = vec3<f32>(
+        dot(to_origin, u_axis),
+        dot(to_origin, v_axis),
+        dot(to_origin, w_axis),
+    );
+    let dir_l = vec3<f32>(
+        dot(ray_dir, u_axis),
+        dot(ray_dir, v_axis),
+        dot(ray_dir, w_axis),
+    );
+
+    // Ray-AABB on [-half, +half] in cube-local.
+    let half_v3 = vec3<f32>(half_u, half_v, half_w);
+    let inv_dir = vec3<f32>(
+        select(1e10, 1.0/dir_l.x, abs(dir_l.x) > 1e-8),
+        select(1e10, 1.0/dir_l.y, abs(dir_l.y) > 1e-8),
+        select(1e10, 1.0/dir_l.z, abs(dir_l.z) > 1e-8),
+    );
+    let t1 = (-half_v3 - pos_l) * inv_dir;
+    let t2 = ( half_v3 - pos_l) * inv_dir;
+    let t_min = min(t1, t2);
+    let t_max = max(t1, t2);
+    let t_enter = max(max(t_min.x, t_min.y), t_min.z);
+    let t_exit  = min(min(t_max.x, t_max.y), t_max.z);
+    if t_enter > t_exit || t_exit <= 0.0 { return result; }
+    let t_hit = max(t_enter, 0.0);
+
+    // Pick the face that produced t_enter. Normal in cube-local.
+    var n_local = vec3<f32>(0.0);
+    if t_enter == t_min.x {
+        n_local.x = select(1.0, -1.0, dir_l.x > 0.0);
+    } else if t_enter == t_min.y {
+        n_local.y = select(1.0, -1.0, dir_l.y > 0.0);
+    } else {
+        n_local.z = select(1.0, -1.0, dir_l.z > 0.0);
+    }
+    // World-space face normal (= column of basis matrix).
+    let n_world = u_axis * n_local.x + v_axis * n_local.y + w_axis * n_local.z;
+
+    // Flat face shading: brightness from N·L with a fixed light
+    // direction (above + slightly behind). Bevel/voxel-grid detail
+    // would come from a real Cartesian DDA on the cell's subtree
+    // — v1 work; v0 just shows the cube exists at the right place.
+    let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.4));
+    let n_dot_l = max(dot(n_world, light_dir), 0.0);
+    let shade = 0.4 + 0.6 * n_dot_l;
+    // v0: tint red so the prototype cube stands out unmistakably
+    // against the surrounding green sphere cells.
+    let base_color = vec3<f32>(1.0, 0.0, 0.0);
+
+    result.hit = true;
+    result.t = t_hit * inv_norm;
+    result.normal = n_world;
+    result.color = base_color * shade;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+    return result;
+}
+
 fn sphere_uv_in_cell(
     body_idx: u32,
     body_origin: vec3<f32>,
@@ -571,6 +684,35 @@ fn sphere_uv_in_cell(
                 if t_n >= t_exit { break; }
                 t = t_n + max(r_step * 1e-4, 1e-6);
                 continue;
+            }
+            // Hybrid prototype: when this slab cell matches the proto
+            // target, render it as an axis-aligned tangent-plane CUBE
+            // (real flat box on the sphere surface) instead of a
+            // curved sphere segment. The cube's basis is (lon-tan,
+            // lat-tan, -radial) at the cell's center; extents are
+            // derived from the cell's (lon, lat, r) ranges scaled to
+            // tangent meters at the surface. Block colored by the
+            // sample's block_type with cube-face flat shading — no
+            // curvature in the cell's appearance.
+            let proto_enabled = uniforms.proto_target_cell.x != 0u;
+            let is_proto = proto_enabled
+                && lat_lo >= uniforms.proto_target_lat_lon.x - 1e-5
+                && lat_hi <= uniforms.proto_target_lat_lon.y + 1e-5
+                && lon_lo >= uniforms.proto_target_lat_lon.z - 1e-5
+                && lon_hi <= uniforms.proto_target_lat_lon.w + 1e-5
+                && r_lo   >= uniforms.proto_target_r.x       - 1e-5
+                && r_hi   <= uniforms.proto_target_r.y       + 1e-5;
+            if is_proto {
+                let proto_hit = render_cell_as_tangent_cube(
+                    ray_origin, ray_dir, inv_norm,
+                    cs_center, sample.block_type,
+                    lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
+                );
+                if proto_hit.hit { return proto_hit; }
+                // Box miss — fall through to normal sphere hit
+                // (the box doesn't cover the entire spherical cell
+                // segment near the edges, so grazing rays still need
+                // the curved geometry).
             }
             // tag=1 (uniform-flatten): the entire anchor subtree is
             // one Block — render at slab cell scale, no descent

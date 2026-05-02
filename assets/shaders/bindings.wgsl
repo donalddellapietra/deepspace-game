@@ -85,6 +85,16 @@ struct Uniforms {
     node_lat_lon: vec4<f32>,
     /// Node range radial. `(r_lo, r_hi, _, _)`.
     node_r: vec4<f32>,
+    /// Hybrid prototype: target cell's enabled flag in `.x` (0 =
+    /// disabled, 1 = enabled). `.yzw` reserved.
+    proto_target_cell: vec4<u32>,
+    /// Hybrid prototype: target cell angular range in radians.
+    /// `(lat_lo, lat_hi, lon_lo, lon_hi)`. The shader matches a hit
+    /// against this range — if the hit's (lat, lon) sit inside,
+    /// recolor as the prototype cell.
+    proto_target_lat_lon: vec4<f32>,
+    /// Hybrid prototype: target cell radial range. `(r_lo, r_hi, _, _)`.
+    proto_target_r: vec4<f32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
     /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future

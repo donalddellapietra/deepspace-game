@@ -335,6 +335,45 @@ impl App {
                     );
                 }
             }
+            // Hybrid prototype v0: identify ONE specific cell on the
+            // planet (by its (lat, lon, r) range) and tell the shader
+            // to paint it red on hit. v1 will replace the recolor
+            // with a Cartesian DDA on the cell's subtree.
+            //
+            // Path = [13, 13, 1, 19, 13]. For default planet preset
+            // (embedding=2, slab_dims=[27,2,14], slab_depth=3): WP at
+            // depth 2 (slots [13,13]); the next 3 slots [1,19,13]
+            // navigate to slab grid cell (13, 1, 7) — top of dirt
+            // column = grass. Identifying by range (not NodeId) so
+            // it works whether or not the GPU pack uniform-flattened
+            // the slab cell's subtree to a Block.
+            // Target cell = slab grid (gx=7, gy=1, gz=11) — top of
+            // dirt column (= grass) in the bottom-center of the
+            // visible patch from the default camera. lon ≈ -π/2
+            // (the -Z side of the sphere, which the camera at
+            // z=0.78 < sphere_z=1.5 sees first); lat ≈ 0.8 (the
+            // top arc of the visible cap).
+            let dims = [27u32, 2u32, 14u32];
+            let (gx, gy, gz) = (7u32, 1u32, 11u32);
+            let pi = std::f32::consts::PI;
+            let r_sphere = crate::world::anchor::WORLD_SIZE / (2.0 * pi);
+            let shell = r_sphere
+                * crate::world::sphere_geom::SHELL_THICKNESS_FRAC;
+            let r_inner = r_sphere - shell;
+            let lat_max = crate::world::sphere_geom::DEFAULT_SPHERE_LAT_MAX;
+            let lon_step = 2.0 * pi / dims[0] as f32;
+            let lat_step = 2.0 * lat_max / dims[2] as f32;
+            let r_step = shell / dims[1] as f32;
+            let lon_lo = -pi + gx as f32 * lon_step;
+            let lon_hi = lon_lo + lon_step;
+            let lat_lo = -lat_max + gz as f32 * lat_step;
+            let lat_hi = lat_lo + lat_step;
+            let r_lo = r_inner + gy as f32 * r_step;
+            let r_hi = r_lo + r_step;
+            renderer.set_proto_target_cell(
+                true,
+                lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
+            );
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;
