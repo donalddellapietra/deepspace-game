@@ -751,72 +751,14 @@ fn march_cartesian(
                 continue;
             }
 
-            // TangentBlock dispatch — frame-local rotation around the
-            // cube's geometric centre (1.5, 1.5, 1.5). NO world-space
-            // coordinates: the ray is re-expressed in the child's
-            // [0, 3)³ via (ray_origin - child_origin) / cur_cell_size,
-            // then rotated by the stored R^T around the cube centre.
-            // On hit, normal is rotated back via R · local_normal.
-            if node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
-                let child_origin_tb = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-                // Scale maps the slot's parent extent (size cur_cell_size)
-                // into the child's [0, 3)³ local frame: 3 / cur_cell_size.
-                let scale = 3.0 / cur_cell_size;
-                let local_pre_origin = (ray_origin - child_origin_tb) * scale;
-                let local_pre_dir = ray_dir * scale;
-                // Stored rotation R has columns rc0/rc1/rc2.
-                // (R^T · v).i = dot(rc_i, v).
-                let rc0 = node_kinds[child_idx].rot_col0.xyz;
-                let rc1 = node_kinds[child_idx].rot_col1.xyz;
-                let rc2 = node_kinds[child_idx].rot_col2.xyz;
-                // Direction-only R^T: position stays unrotated so
-                // the DDA traverses the tree in its native slot
-                // layout. The rotated direction gives the visual
-                // rotation effect. This matches the inside-frame
-                // view (R^T basis + unrotated position) so the
-                // boundary transition is continuous.
-                let local_origin = local_pre_origin;
-                let local_dir = vec3<f32>(
-                    dot(rc0, local_pre_dir),
-                    dot(rc1, local_pre_dir),
-                    dot(rc2, local_pre_dir),
-                );
-                let sub = march_in_tangent_cube(child_idx, local_origin, local_dir);
-                if sub.hit {
-                    let local_hit = local_origin + local_dir * sub.t;
-                    let local_in_cell = clamp(
-                        (local_hit - sub.cell_min) / sub.cell_size,
-                        vec3<f32>(0.0), vec3<f32>(1.0),
-                    );
-                    let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
-                    var out: HitResult;
-                    out.hit = true;
-                    // The scale factor applies to both origin and dir,
-                    // so the parameter t is preserved across the
-                    // transform — sub.t is the world ray parameter.
-                    out.t = sub.t;
-                    out.color = sub.color * (0.7 + 0.3 * local_bevel);
-                    // Rotate normal back to outer frame: world = R · local.
-                    // (R · v) = rc0·v.x + rc1·v.y + rc2·v.z.
-                    out.normal = rc0 * sub.normal.x
-                               + rc1 * sub.normal.y
-                               + rc2 * sub.normal.z;
-                    out.frame_level = 0u;
-                    out.frame_scale = 1.0;
-                    let hit_world = ray_origin + ray_dir * sub.t;
-                    out.cell_min = hit_world - vec3<f32>(0.5);
-                    out.cell_size = 1.0;
-                    return out;
-                }
-                // Cube missed — advance DDA past this slot.
-                let m_tb = min_axis_mask(cur_side_dist);
-                s_cell[depth] = pack_cell(cell + vec3<i32>(m_tb) * step);
-                cur_side_dist += m_tb * delta_dist * cur_cell_size;
-                normal = -vec3<f32>(step) * m_tb;
-                continue;
-            }
+            // TangentBlock: treat as a normal Cartesian Node for
+            // descent. The ray direction is already R^T-rotated by
+            // the CPU basis (frame_path_rotation), so the DDA traces
+            // rotated paths through the TB's unrotated slot layout.
+            // No separate march_in_tangent_cube call — the standard
+            // stack-push descent handles the TB's children directly.
 
-            // Cartesian Node: depth/LOD check, then descend.
+            // Cartesian / TangentBlock Node: depth/LOD check, then descend.
             // depth_limit = MAX_STACK_DEPTH — LOD controls the
             // effective depth, not an artificial per-shell budget.
             let at_max = depth + 1u > depth_limit || depth + 1u >= MAX_STACK_DEPTH;
