@@ -159,6 +159,7 @@ fn make_sphere_hit(
     return result;
 }
 
+
 // Stack-based DDA inside an anchor block at sub-cell granularity.
 // Mirrors `march_cartesian` but in (lon, lat, r) space using the
 // sphere-cell boundary primitives (ray_meridian_t, ray_parallel_t,
@@ -196,279 +197,219 @@ fn sphere_descend_anchor(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
-    // SHIFTED-FRAME (tangent-plane Cartesian) DDA. Mirror of how
-    // Cartesian's ribbon-pop architecture keeps every frame's math in
-    // bounded `[0, 3)³` coords: at the slab→anchor boundary we project
-    // the ray into a tangent-plane Cartesian frame anchored at the
-    // slab cell center. Inside that frame, sub-cell DDA uses
-    // axis-aligned plane intersections (= `(boundary − pos.axis) /
-    // dir.axis`). All boundary maths operate on values bounded by the
-    // current cell's extent, so f32 ULP scales WITH the cell — same
-    // ratio at every depth. Layer-agnostic precision.
-    //
-    // Per-iter `s_pos` is the ray pos at the CURRENT t in this
-    // depth's shifted frame. It's updated incrementally (`s_pos +=
-    // shifted_dir * dt`) — never recomputed from the camera-distance
-    // ray origin, which would force absolute-ULP precision (~1e-7 ·
-    // camera_dist) into a sub-cell-sized result and blow up at depth.
-    //
-    // On PUSH, we translate `s_pos` by the child cell center offset
-    // in the parent frame — both bounded by parent extent → bounded
-    // ULP. On POP, we add the offset back. Stack depth bound =
-    // `MAX_STACK_DEPTH` (Cartesian's hardware ceiling, 8 — same
-    // register-file budget).
-    //
-    // Tangent-plane vs sphere geometry: across one slab cell (~13°)
-    // the deviation is ~2.6 % at the cell edge, falling 9× per sub-
-    // level. Visually invisible inside the anchor (sub-cell scale
-    // ≤ 0.3 % deviation).
-
-    // ---- Build orthonormal tangent basis at slab cell center.
-    let lat_c0 = slab_lat_lo + slab_lat_step * 0.5;
-    let lon_c0 = slab_lon_lo + slab_lon_step * 0.5;
-    let r_c0   = slab_r_lo   + slab_r_step   * 0.5;
-    let cl = cos(lat_c0); let sl = sin(lat_c0);
-    let co = cos(lon_c0); let so = sin(lon_c0);
-    let radial  = vec3<f32>( cl * co, sl,  cl * so);
-    let lon_tan = vec3<f32>(-so,      0.0, co);
-    let lat_tan = vec3<f32>(-sl * co, cl, -sl * so);
-
-    // Anchor (= slab cell) extents in tangent-plane world units.
-    let anchor_ext_x = r_c0 * cl * slab_lon_step;
-    let anchor_ext_y = r_c0 * slab_lat_step;
-    let anchor_ext_z = slab_r_step;
-
-    // Tangent-frame ray direction (constant across all descent levels
-    // in tangent-plane approximation).
-    let dir_x = dot(ray_dir, lon_tan);
-    let dir_y = dot(ray_dir, lat_tan);
-    let dir_z = dot(ray_dir, radial);
-
-    // Tangent-frame ray pos at t_in. Compute world pos at t_in first
-    // (cancellation of camera-distance into slab-cell-distance pos),
-    // then project onto basis. ULP at result ~ 1e-7 (slab-cell
-    // magnitude) — fine for sub-cell picks down to depth ~13.
-    let anchor_center_world = cs_center + r_c0 * radial;
-    let world_pos_in = ray_origin + ray_dir * t_in;
-    let world_off_in = world_pos_in - anchor_center_world;
-    var px = dot(world_off_in, lon_tan);
-    var py = dot(world_off_in, lat_tan);
-    var pz = dot(world_off_in, radial);
-
-    // Stack: (parent_node, current_cell_in_parent, shifted_pos at
-    // current t).
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
-    var s_cell:     array<u32, MAX_STACK_DEPTH>;
-    var s_pos_x:    array<f32, MAX_STACK_DEPTH>;
-    var s_pos_y:    array<f32, MAX_STACK_DEPTH>;
-    var s_pos_z:    array<f32, MAX_STACK_DEPTH>;
-
+    var s_cell: array<u32, MAX_STACK_DEPTH>;
+    var depth: u32 = 0u;
     s_node_idx[0] = anchor_idx;
 
-    // Sub-cell extents at depth 0 (anchor's children grid: 1/3 of
-    // anchor extent per axis).
-    var sub_ext_x = anchor_ext_x / 3.0;
-    var sub_ext_y = anchor_ext_y / 3.0;
-    var sub_ext_z = anchor_ext_z / 3.0;
+    // Frame 0 = anchor block. Each axis is 1/3 of the slab cell.
+    var cur_lon_org = slab_lon_lo;
+    var cur_lat_org = slab_lat_lo;
+    var cur_r_org   = slab_r_lo;
+    var cur_lon_step = slab_lon_step / 3.0;
+    var cur_lat_step = slab_lat_step / 3.0;
+    var cur_r_step   = slab_r_step   / 3.0;
 
-    // Initial cell at depth 0: which of the 27 children contains
-    // s_pos. Cell coord convention: cell.x = lon (x-axis), cell.y =
-    // r (z-axis = radial), cell.z = lat (y-axis = lat-tangent).
-    let init_cx = clamp(i32(floor(px / sub_ext_x + 1.5)), 0, 2);
-    let init_cy = clamp(i32(floor(pz / sub_ext_z + 1.5)), 0, 2);
-    let init_cz = clamp(i32(floor(py / sub_ext_y + 1.5)), 0, 2);
-    s_cell[0]  = pack_cell(vec3<i32>(init_cx, init_cy, init_cz));
-    s_pos_x[0] = px;
-    s_pos_y[0] = py;
-    s_pos_z[0] = pz;
-
-    var depth: u32 = 0u;
     var t = t_in;
-    let pop_eps = max(anchor_ext_z * 1e-9, 1e-12);
+
+    // Initial sub-cell from the ray's t.
+    {
+        let pos0 = ray_origin + ray_dir * t;
+        let off0 = pos0 - cs_center;
+        let r0 = max(length(off0), 1e-9);
+        let n0 = off0 / r0;
+        let lat0 = asin(clamp(n0.y, -1.0, 1.0));
+        let lon0 = atan2(n0.z, n0.x);
+        let cx0 = clamp(i32(floor((lon0 - cur_lon_org) / cur_lon_step)), 0, 2);
+        let cy0 = clamp(i32(floor((r0   - cur_r_org)   / cur_r_step)),   0, 2);
+        let cz0 = clamp(i32(floor((lat0 - cur_lat_org) / cur_lat_step)), 0, 2);
+        s_cell[0] = pack_cell(vec3<i32>(cx0, cy0, cz0));
+    }
 
     var iters: u32 = 0u;
     loop {
-        if iters > 1024u { break; }
+        if iters > 256u { break; }
         iters = iters + 1u;
         if t > t_exit { break; }
 
         let cell = unpack_cell(s_cell[depth]);
-        // Cell bounds in shifted frame at parent center. Sub-cell at
-        // (cx, cy, cz) spans
-        //   x: [(cx − 1.5)·sub_ext_x, (cx − 0.5)·sub_ext_x]
-        //   y: [(cz − 1.5)·sub_ext_y, (cz − 0.5)·sub_ext_y]   (lat)
-        //   z: [(cy − 1.5)·sub_ext_z, (cy − 0.5)·sub_ext_z]   (radial)
-        let x_lo = (f32(cell.x) - 1.5) * sub_ext_x;
-        let x_hi = x_lo + sub_ext_x;
-        let y_lo = (f32(cell.z) - 1.5) * sub_ext_y;
-        let y_hi = y_lo + sub_ext_y;
-        let z_lo = (f32(cell.y) - 1.5) * sub_ext_z;
-        let z_hi = z_lo + sub_ext_z;
+        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
+            // OOB: pop one frame, or exit if at the anchor's outer face.
+            if depth == 0u { break; }
+            depth = depth - 1u;
+            cur_lon_step = cur_lon_step * 3.0;
+            cur_lat_step = cur_lat_step * 3.0;
+            cur_r_step   = cur_r_step   * 3.0;
+            let popped = unpack_cell(s_cell[depth]);
+            cur_lon_org = cur_lon_org - f32(popped.x) * cur_lon_step;
+            cur_r_org   = cur_r_org   - f32(popped.y) * cur_r_step;
+            cur_lat_org = cur_lat_org - f32(popped.z) * cur_lat_step;
+            // After the pop, recompute which cell we're in at the
+            // parent frame using the ray's current t. This may match
+            // `popped` (we exited an axis only), or its neighbour
+            // (the axis stepped over a parent boundary already).
+            let pos_p = ray_origin + ray_dir * t;
+            let off_p = pos_p - cs_center;
+            let r_p = max(length(off_p), 1e-9);
+            let n_p = off_p / r_p;
+            let lat_p = asin(clamp(n_p.y, -1.0, 1.0));
+            let lon_p = atan2(n_p.z, n_p.x);
+            let cx_p = i32(floor((lon_p - cur_lon_org) / cur_lon_step));
+            let cy_p = i32(floor((r_p   - cur_r_org)   / cur_r_step));
+            let cz_p = i32(floor((lat_p - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_p, cy_p, cz_p));
+            continue;
+        }
 
-        // Sample tree at this cell.
+        // Cell bounds for boundary crossings + occupancy lookup.
+        let lon_lo = cur_lon_org + f32(cell.x) * cur_lon_step;
+        let lon_hi = lon_lo + cur_lon_step;
+        let r_lo   = cur_r_org   + f32(cell.y) * cur_r_step;
+        let r_hi   = r_lo + cur_r_step;
+        let lat_lo = cur_lat_org + f32(cell.z) * cur_lat_step;
+        let lat_hi = lat_lo + cur_lat_step;
+
         let slot = u32(cell.x + cell.y * 3 + cell.z * 9);
         let header_off = node_offsets[s_node_idx[depth]];
         let occ = tree[header_off];
         let bit = 1u << slot;
-        var bt: u32 = 0xFFFEu;
-        var nu_child: u32 = 0u;
-        if (occ & bit) != 0u {
-            let first_child = tree[header_off + 1u];
-            let rank = countOneBits(occ & (bit - 1u));
-            let child_base = first_child + rank * 2u;
-            let packed = tree[child_base];
-            let tag = packed & 0xFFu;
-            bt = (packed >> 8u) & 0xFFFFu;
-            if tag == 2u && bt != 0xFFFEu {
-                nu_child = tree[child_base + 1u];
-            }
-        }
 
-        // dt to next axis-aligned plane crossing in shifted frame.
-        // (boundary − s_pos.axis) / dir.axis. If dir.axis ≈ 0, that
-        // axis can't be crossed — skip.
-        var dt_next: f32 = t_exit - t + 1.0;
-        var winning: u32 = 6u;
-        if abs(dir_x) > 1e-12 {
-            let dt_lo = (x_lo - px) / dir_x;
-            if dt_lo > 0.0 && dt_lo < dt_next { dt_next = dt_lo; winning = 0u; }
-            let dt_hi = (x_hi - px) / dir_x;
-            if dt_hi > 0.0 && dt_hi < dt_next { dt_next = dt_hi; winning = 1u; }
-        }
-        if abs(dir_y) > 1e-12 {
-            let dt_lo = (y_lo - py) / dir_y;
-            if dt_lo > 0.0 && dt_lo < dt_next { dt_next = dt_lo; winning = 2u; }
-            let dt_hi = (y_hi - py) / dir_y;
-            if dt_hi > 0.0 && dt_hi < dt_next { dt_next = dt_hi; winning = 3u; }
-        }
-        if abs(dir_z) > 1e-12 {
-            let dt_lo = (z_lo - pz) / dir_z;
-            if dt_lo > 0.0 && dt_lo < dt_next { dt_next = dt_lo; winning = 4u; }
-            let dt_hi = (z_hi - pz) / dir_z;
-            if dt_hi > 0.0 && dt_hi < dt_next { dt_next = dt_hi; winning = 5u; }
-        }
+        // t_next: smallest cell-face crossing > t. Used by every
+        // "advance past this cell" branch below.
+        var t_next = t_exit + 1.0;
+        let t_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
+        if t_lon_lo > 0.0 && t_lon_lo < t_next { t_next = t_lon_lo; }
+        let t_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
+        if t_lon_hi > 0.0 && t_lon_hi < t_next { t_next = t_lon_hi; }
+        let t_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
+        if t_lat_lo > 0.0 && t_lat_lo < t_next { t_next = t_lat_lo; }
+        let t_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
+        if t_lat_hi > 0.0 && t_lat_hi < t_next { t_next = t_lat_hi; }
+        let t_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
+        if t_r_lo > 0.0 && t_r_lo < t_next { t_next = t_r_lo; }
+        let t_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
+        if t_r_hi > 0.0 && t_r_hi < t_next { t_next = t_r_hi; }
 
-        // Branch on cell content.
-        if bt != 0xFFFEu {
-            if nu_child == 0u || depth + 1u >= MAX_STACK_DEPTH {
-                // Hit. Compute world hit pos via ray's parametric
-                // form (precision OK — t against world ray_origin).
-                // Bevel uses approximate spherical bounds derived
-                // from tangent-frame extents (good to ~0.3% per
-                // sub-level).
-                let pos_h = ray_origin + ray_dir * t;
-                let off_h = pos_h - cs_center;
-                let r_h = max(length(off_h), 1e-9);
-                let n_h = off_h / r_h;
-                let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
-                let lon_h = atan2(n_h.z, n_h.x);
-                let r_inv = 1.0 / r_c0;
-                let lon_step_local = sub_ext_x / (r_c0 * cl);
-                let lat_step_local = sub_ext_y * r_inv;
-                let r_step_local   = sub_ext_z;
-                let lon_lo_world = lon_c0 + x_lo / (r_c0 * cl);
-                let lon_hi_world = lon_lo_world + lon_step_local;
-                let lat_lo_world = lat_c0 + y_lo * r_inv;
-                let lat_hi_world = lat_lo_world + lat_step_local;
-                let r_lo_world   = r_c0 + z_lo;
-                let r_hi_world   = r_lo_world + r_step_local;
-                return make_sphere_hit(
-                    pos_h, n_h, t, inv_norm, bt,
-                    r_h, lat_h, lon_h,
-                    lon_lo_world, lon_hi_world,
-                    lat_lo_world, lat_hi_world,
-                    r_lo_world,   r_hi_world,
-                    lon_step_local, lat_step_local, r_step_local,
-                );
-            }
-
-            // Push: child cell center in PARENT frame.
-            let child_off_x = (f32(cell.x) - 1.0) * sub_ext_x;
-            let child_off_y = (f32(cell.z) - 1.0) * sub_ext_y;
-            let child_off_z = (f32(cell.y) - 1.0) * sub_ext_z;
-
-            let nd = depth + 1u;
-            s_node_idx[nd] = nu_child;
-            // Translate ray pos into child shifted frame.
-            px = px - child_off_x;
-            py = py - child_off_y;
-            pz = pz - child_off_z;
-            s_pos_x[nd] = px;
-            s_pos_y[nd] = py;
-            s_pos_z[nd] = pz;
-
-            // Sub-extents at child level.
-            sub_ext_x = sub_ext_x / 3.0;
-            sub_ext_y = sub_ext_y / 3.0;
-            sub_ext_z = sub_ext_z / 3.0;
-
-            // Initial sub-cell at child level (1-of-3 pick on
-            // bounded shifted pos — precision-stable).
-            let cx2 = clamp(i32(floor(px / sub_ext_x + 1.5)), 0, 2);
-            let cy2 = clamp(i32(floor(pz / sub_ext_z + 1.5)), 0, 2);
-            let cz2 = clamp(i32(floor(py / sub_ext_y + 1.5)), 0, 2);
-            s_cell[nd] = pack_cell(vec3<i32>(cx2, cy2, cz2));
-            depth = nd;
+        if (occ & bit) == 0u {
+            // Empty slot. Advance to the next cell within this frame.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            if t > t_exit { break; }
+            let pos_a = ray_origin + ray_dir * t;
+            let off_a = pos_a - cs_center;
+            let r_a = max(length(off_a), 1e-9);
+            let n_a = off_a / r_a;
+            let lat_a = asin(clamp(n_a.y, -1.0, 1.0));
+            let lon_a = atan2(n_a.z, n_a.x);
+            let cx_a = i32(floor((lon_a - cur_lon_org) / cur_lon_step));
+            let cy_a = i32(floor((r_a   - cur_r_org)   / cur_r_step));
+            let cz_a = i32(floor((lat_a - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_a, cy_a, cz_a));
             continue;
         }
 
-        // Empty (or rep-empty / EntityRef) — advance.
-        if winning == 6u { break; }  // tangent ray, no crossing
-        var dcell_x: i32 = 0;
-        var dcell_y: i32 = 0;
-        var dcell_z: i32 = 0;
-        switch winning {
-            case 0u: { dcell_x = -1; }
-            case 1u: { dcell_x =  1; }
-            case 2u: { dcell_z = -1; }
-            case 3u: { dcell_z =  1; }
-            case 4u: { dcell_y = -1; }
-            case 5u: { dcell_y =  1; }
-            default: {}
+        let first_child = tree[header_off + 1u];
+        let rank = countOneBits(occ & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
+        let block_type = (packed >> 8u) & 0xFFFFu;
+
+        if tag == 1u {
+            // Block leaf. Hit at this sub-cell.
+            let pos_h = ray_origin + ray_dir * t;
+            let off_h = pos_h - cs_center;
+            let r_h = max(length(off_h), 1e-9);
+            let n_h = off_h / r_h;
+            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
+            let lon_h = atan2(n_h.z, n_h.x);
+            return make_sphere_hit(
+                pos_h, n_h, t, inv_norm, block_type,
+                r_h, lat_h, lon_h,
+                lon_lo, lon_hi, lat_lo, lat_hi, r_lo, r_hi,
+                cur_lon_step, cur_lat_step, cur_r_step,
+            );
         }
 
-        // Advance shifted pos by dt_next (small, bounded by cell
-        // extent). t advances by the same dt.
-        px = px + dir_x * dt_next;
-        py = py + dir_y * dt_next;
-        pz = pz + dir_z * dt_next;
-        t  = t  + dt_next + pop_eps;
-
-        var nx = cell.x + dcell_x;
-        var ny = cell.y + dcell_y;
-        var nz = cell.z + dcell_z;
-        // Cascading pop on OOB. Each pop translates shifted pos
-        // BACK by the popped cell's center offset (= reverse of the
-        // push translation), then re-applies the increment to the
-        // parent's cell.
-        loop {
-            if nx >= 0 && nx <= 2 && ny >= 0 && ny <= 2 && nz >= 0 && nz <= 2 {
-                s_cell[depth]  = pack_cell(vec3<i32>(nx, ny, nz));
-                s_pos_x[depth] = px;
-                s_pos_y[depth] = py;
-                s_pos_z[depth] = pz;
-                break;
-            }
-            if depth == 0u {
-                // Anchor's outer face — let the slab DDA continue.
-                return result;
-            }
-            // Pop. Recover parent shifted pos by ADDING the popped
-            // cell's offset (= reverse of the push subtract).
-            let popped = unpack_cell(s_cell[depth]);
-            px = px + (f32(popped.x) - 1.0) * sub_ext_x;
-            py = py + (f32(popped.z) - 1.0) * sub_ext_y;
-            pz = pz + (f32(popped.y) - 1.0) * sub_ext_z;
-            sub_ext_x = sub_ext_x * 3.0;
-            sub_ext_y = sub_ext_y * 3.0;
-            sub_ext_z = sub_ext_z * 3.0;
-            depth = depth - 1u;
-            // Apply the increment to parent's cell coord.
-            let pcell = unpack_cell(s_cell[depth]);
-            nx = pcell.x + dcell_x;
-            ny = pcell.y + dcell_y;
-            nz = pcell.z + dcell_z;
+        if tag != 2u {
+            // EntityRef etc. — treat as empty for sphere subtree DDA
+            // (no entities-inside-anchor for now). Advance.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            if t > t_exit { break; }
+            let pos_e = ray_origin + ray_dir * t;
+            let off_e = pos_e - cs_center;
+            let r_e = max(length(off_e), 1e-9);
+            let n_e = off_e / r_e;
+            let lat_e = asin(clamp(n_e.y, -1.0, 1.0));
+            let lon_e = atan2(n_e.z, n_e.x);
+            let cx_e = i32(floor((lon_e - cur_lon_org) / cur_lon_step));
+            let cy_e = i32(floor((r_e   - cur_r_org)   / cur_r_step));
+            let cz_e = i32(floor((lat_e - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_e, cy_e, cz_e));
+            continue;
         }
+
+        // tag == 2u: non-uniform Node. LOD-gate descent.
+        if block_type == 0xFFFEu {
+            // Subtree empty per `representative_block` — skip whole cell.
+            t = t_next + max(cur_r_step * 1e-4, 1e-6);
+            if t > t_exit { break; }
+            let pos_r = ray_origin + ray_dir * t;
+            let off_r = pos_r - cs_center;
+            let r_r = max(length(off_r), 1e-9);
+            let n_r = off_r / r_r;
+            let lat_r = asin(clamp(n_r.y, -1.0, 1.0));
+            let lon_r = atan2(n_r.z, n_r.x);
+            let cx_r = i32(floor((lon_r - cur_lon_org) / cur_lon_step));
+            let cy_r = i32(floor((r_r   - cur_r_org)   / cur_r_step));
+            let cz_r = i32(floor((lat_r - cur_lat_org) / cur_lat_step));
+            s_cell[depth] = pack_cell(vec3<i32>(cx_r, cy_r, cz_r));
+            continue;
+        }
+
+        // Stack ceiling = hardware limit. No camera-distance LOD here:
+        // sphere mode locks the render frame at WrappedPlane, so the
+        // Cartesian "lod_pixels < threshold" check would collapse deep
+        // edits to the representative_block — exactly the bug we're
+        // fixing. Tree structure (uniform-flatten = tag=1, terminate)
+        // alone drives descent.
+        let at_max = depth + 1u >= MAX_STACK_DEPTH;
+        if at_max {
+            let pos_h = ray_origin + ray_dir * t;
+            let off_h = pos_h - cs_center;
+            let r_h = max(length(off_h), 1e-9);
+            let n_h = off_h / r_h;
+            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
+            let lon_h = atan2(n_h.z, n_h.x);
+            return make_sphere_hit(
+                pos_h, n_h, t, inv_norm, block_type,
+                r_h, lat_h, lon_h,
+                lon_lo, lon_hi, lat_lo, lat_hi, r_lo, r_hi,
+                cur_lon_step, cur_lat_step, cur_r_step,
+            );
+        }
+
+        // Push child frame.
+        let child_idx = tree[child_base + 1u];
+        depth = depth + 1u;
+        s_node_idx[depth] = child_idx;
+        cur_lon_org = lon_lo;
+        cur_lat_org = lat_lo;
+        cur_r_org   = r_lo;
+        cur_lon_step = cur_lon_step / 3.0;
+        cur_lat_step = cur_lat_step / 3.0;
+        cur_r_step   = cur_r_step   / 3.0;
+
+        // Pick the entry sub-cell from the ray's current t.
+        let pos_c = ray_origin + ray_dir * t;
+        let off_c = pos_c - cs_center;
+        let r_c = max(length(off_c), 1e-9);
+        let n_c = off_c / r_c;
+        let lat_c = asin(clamp(n_c.y, -1.0, 1.0));
+        let lon_c = atan2(n_c.z, n_c.x);
+        let cx_c = clamp(i32(floor((lon_c - cur_lon_org) / cur_lon_step)), 0, 2);
+        let cy_c = clamp(i32(floor((r_c   - cur_r_org)   / cur_r_step)),   0, 2);
+        let cz_c = clamp(i32(floor((lat_c - cur_lat_org) / cur_lat_step)), 0, 2);
+        s_cell[depth] = pack_cell(vec3<i32>(cx_c, cy_c, cz_c));
     }
 
     return result;
