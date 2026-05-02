@@ -55,11 +55,23 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir_world = jittered_ray_dir(uv);
     let ray_origin = camera.pos;
-    let ray_dir = ray_dir_world;
-    // `march()` dispatches on the active frame's NodeKind, including
-    // TangentBlock — it applies Mᵀ to ray_dir internally and calls
-    // the deeper walker. Same for fs_coarse_mask + fs_main_depth.
-    let result = march(ray_origin, ray_dir);
+    // `march()` dispatches on the active frame's NodeKind. For
+    // TangentBlock active frames it applies Mᵀ to ray_dir internally
+    // and walks in rotated frame; result.t / result.cell_min /
+    // result.normal come back in rotated-local coords. For the
+    // post-walk math (hit_pos for bevel + highlight + sky) we need
+    // ray_dir in the SAME frame as result.cell_min — so apply Mᵀ
+    // here too when in TB frame, matching what march() did.
+    var ray_dir = ray_dir_world;
+    if uniforms.root_kind == ROOT_KIND_TANGENT_BLOCK {
+        let c0 = uniforms.tangent_rotation_col0.xyz;
+        let c1 = uniforms.tangent_rotation_col1.xyz;
+        let c2 = uniforms.tangent_rotation_col2.xyz;
+        ray_dir = vec3<f32>(
+            dot(c0, ray_dir), dot(c1, ray_dir), dot(c2, ray_dir),
+        );
+    }
+    let result = march(ray_origin, ray_dir_world);
 
     // Debug paint dispatch (mode 1..=8): bypass lighting / bevel /
     // gamma; preserve t in alpha so TAAU history stays correct. See
@@ -72,16 +84,31 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
 
     var color: vec3<f32>;
     if result.hit {
-        let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
+        // Sun direction is in world axes; rotate to walker frame for
+        // a physically-consistent dot with result.normal (which is in
+        // the walker's frame — rotated for TB, world for cartesian).
+        var sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
+        if uniforms.root_kind == ROOT_KIND_TANGENT_BLOCK {
+            let c0 = uniforms.tangent_rotation_col0.xyz;
+            let c1 = uniforms.tangent_rotation_col1.xyz;
+            let c2 = uniforms.tangent_rotation_col2.xyz;
+            sun_dir = normalize(vec3<f32>(
+                dot(c0, sun_dir), dot(c1, sun_dir), dot(c2, sun_dir),
+            ));
+        }
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
+        // hit_pos uses the ROTATED ray_dir so it lives in the same
+        // frame as result.cell_min (= walker's local frame).
         let hit_pos = ray_origin + ray_dir * result.t;
         let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
         let bevel = cube_face_bevel(local, result.normal);
         let lit = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
         color = pow(lit, vec3<f32>(1.0 / 2.2));
     } else {
-        let sky_t = ray_dir.y * 0.5 + 0.5;
+        // Sky gradient uses WORLD ray dir so sky stays oriented to
+        // world up regardless of which frame the active frame is in.
+        let sky_t = ray_dir_world.y * 0.5 + 0.5;
         color = mix(vec3<f32>(0.7, 0.8, 0.95), vec3<f32>(0.3, 0.5, 0.85), sky_t);
     }
 
