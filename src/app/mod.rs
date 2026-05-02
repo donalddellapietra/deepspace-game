@@ -613,7 +613,15 @@ impl App {
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+                // Rotation-aware: when the anchor path crosses a
+                // TangentBlock, every slot offset past it (and the
+                // final offset) must be rotated by the cumulative
+                // chain rotation. Plain `in_frame` walks Cartesian
+                // and gets the wrong world position for cameras
+                // inside a rotated subtree.
+                self.camera.position.in_frame_rot(
+                    &self.world.library, self.world.root, &frame.render_path,
+                )
             }
         };
         if self.startup_profile_frames < 4 {

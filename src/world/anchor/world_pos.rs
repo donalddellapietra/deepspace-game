@@ -4,7 +4,9 @@
 
 use super::path::{Path, Transition};
 use super::WORLD_SIZE;
-use crate::world::tree::{slot_coords, slot_index, NodeId, NodeLibrary, MAX_DEPTH};
+use crate::world::tree::{
+    slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, IDENTITY_ROTATION, MAX_DEPTH,
+};
 
 /// `(anchor, offset)` position with the offset held in `[0, 1)³`
 /// by invariant.
@@ -272,6 +274,150 @@ impl WorldPos {
         ]
     }
 
+    /// Rotation-aware variant of [`in_frame`]. When the anchor path
+    /// crosses a `NodeKind::TangentBlock` whose stored rotation is
+    /// non-identity, every slot offset *past that node* and the final
+    /// `offset` are rotated by the cumulative chain rotation around
+    /// each enclosing cube's geometric centre. Frame-local throughout
+    /// — never world-absolute. For all-Cartesian paths, the result is
+    /// bit-identical to [`in_frame`].
+    ///
+    /// `library` and `world_root` are needed because the rotation
+    /// data lives on `Node` records keyed by `NodeId`. Currently
+    /// assumes the `frame` path is Cartesian (i.e. no rotated
+    /// ancestors above the camera's anchor) — the renderer guarantees
+    /// this for shallow worlds. If a rotated frame becomes possible,
+    /// extend with frame-side rotation accumulation.
+    pub fn in_frame_rot(
+        &self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        frame: &Path,
+    ) -> [f32; 3] {
+        let c = self.anchor.common_prefix_len(frame) as usize;
+
+        // Walk from world root to the common ancestor, tracking the
+        // cumulative rotation experienced going from root → common.
+        // (Frames assumed Cartesian; this is identity in the typical
+        // case but preserved for future when frame can be rotated.)
+        let mut node = world_root;
+        let mut common_rot = IDENTITY_ROTATION;
+        for k in 0..c {
+            let n = match library.get(node) {
+                Some(n) => n,
+                None => return self.in_frame(frame),
+            };
+            match n.children[self.anchor.slot(k) as usize] {
+                Child::Node(child) => {
+                    if let Some(child_node) = library.get(child) {
+                        if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                            common_rot = matmul3x3(&common_rot, &r);
+                        }
+                    }
+                    node = child;
+                }
+                _ => return self.in_frame(frame),
+            }
+        }
+        let common_node = node;
+
+        // Walk from common ancestor down the anchor's tail,
+        // accumulating both the cube *centre* in common-ancestor
+        // local coords and the cumulative rotation. At each step we
+        // rotate the slot's centred-local offset by the cumulative
+        // rotation before adding to the centre.
+        let mut cur_centre = [WORLD_SIZE * 0.5; 3];
+        let mut cur_size = WORLD_SIZE;
+        // `cur_rot` rotates current node's local frame into common
+        // ancestor's local frame.
+        let mut cur_rot = IDENTITY_ROTATION;
+        // For the segment of the path before the common ancestor the
+        // chain went root→common; we don't apply that to the centred
+        // walk below (we're starting *from* the common ancestor).
+        // `common_rot` is captured for future extensions but unused
+        // when the frame is Cartesian (the typical case).
+        let _ = common_rot;
+        let mut have_node = true;
+        let mut node = common_node;
+        for k in c..(self.anchor.depth() as usize) {
+            let slot = self.anchor.slot(k);
+            let (sx, sy, sz) = slot_coords(slot as usize);
+            let child_size = cur_size / 3.0;
+            // Slot's centre offset relative to the current node's
+            // centre, in current node's LOCAL frame:
+            let centred_local = [
+                (sx as f32 - 1.0) * child_size,
+                (sy as f32 - 1.0) * child_size,
+                (sz as f32 - 1.0) * child_size,
+            ];
+            // Rotate into common ancestor's frame and add to centre.
+            let centred_common = mat3_mul_vec3(&cur_rot, &centred_local);
+            cur_centre = [
+                cur_centre[0] + centred_common[0],
+                cur_centre[1] + centred_common[1],
+                cur_centre[2] + centred_common[2],
+            ];
+
+            // Update rotation if descending into a TangentBlock.
+            // `have_node` tracks whether the path is still inside the
+            // tree; once it falls off (Block / Empty / EntityRef)
+            // further iterations only contribute slot-position offsets
+            // (rotation chain doesn't extend below the tree's nodes).
+            if have_node {
+                let n = library.get(node).unwrap();
+                match n.children[slot as usize] {
+                    Child::Node(child_id) => {
+                        if let Some(child_node) = library.get(child_id) {
+                            if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                                cur_rot = matmul3x3(&cur_rot, &r);
+                            }
+                            node = child_id;
+                        } else {
+                            have_node = false;
+                        }
+                    }
+                    _ => have_node = false,
+                }
+            }
+            cur_size = child_size;
+        }
+
+        // Apply the offset, also rotated by the cumulative chain
+        // around the anchor cell's centre.
+        let centred_offset_local = [
+            (self.offset[0] - 0.5) * cur_size,
+            (self.offset[1] - 0.5) * cur_size,
+            (self.offset[2] - 0.5) * cur_size,
+        ];
+        let centred_offset_common = mat3_mul_vec3(&cur_rot, &centred_offset_local);
+        let pos_common = [
+            cur_centre[0] + centred_offset_common[0],
+            cur_centre[1] + centred_offset_common[1],
+            cur_centre[2] + centred_offset_common[2],
+        ];
+
+        // Walk frame's tail from common ancestor to find frame's
+        // origin + size in common ancestor coords. Frame is assumed
+        // Cartesian here; if it becomes rotated, extend.
+        let mut frame_origin = [0.0f32; 3];
+        let mut frame_size = WORLD_SIZE;
+        for k in c..(frame.depth() as usize) {
+            let (sx, sy, sz) = slot_coords(frame.slot(k) as usize);
+            let child = frame_size / 3.0;
+            frame_origin[0] += sx as f32 * child;
+            frame_origin[1] += sy as f32 * child;
+            frame_origin[2] += sz as f32 * child;
+            frame_size = child;
+        }
+
+        let scale = WORLD_SIZE / frame_size;
+        [
+            (pos_common[0] - frame_origin[0]) * scale,
+            (pos_common[1] - frame_origin[1]) * scale,
+            (pos_common[2] - frame_origin[2]) * scale,
+        ]
+    }
+
     /// Build a `WorldPos` at `anchor_depth` whose frame-local
     /// coordinate under `frame` equals `xyz`. Inverse of
     /// `in_frame`. Used when scroll-zoom reconstructs the camera
@@ -319,4 +465,31 @@ impl WorldPos {
         debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
         Transition::None
     }
+}
+
+/// 3×3 matrix multiply, both column-major (`r[col][row]`).
+fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for c in 0..3 {
+        for r in 0..3 {
+            let mut s = 0.0f32;
+            for k in 0..3 {
+                // (a · b)[r, c] = sum_k a[r, k] · b[k, c]
+                // a[r, k] = a[k][r];  b[k, c] = b[c][k]
+                s += a[k][r] * b[c][k];
+            }
+            out[c][r] = s;
+        }
+    }
+    out
+}
+
+/// Apply a column-major 3×3 matrix to a 3-vector: `(m · v).i =
+/// sum_j m[j][i] · v.j`.
+fn mat3_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2],
+        m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2],
+        m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2],
+    ]
 }
