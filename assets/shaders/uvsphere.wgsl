@@ -13,4 +13,5 @@
 #include "bindings.wgsl"
 #include "uvsphere/types.wgsl"
 #include "uvsphere/cell.wgsl"
+#include "uvsphere/proto_block.wgsl"
 #include "uvsphere/march_root.wgsl"

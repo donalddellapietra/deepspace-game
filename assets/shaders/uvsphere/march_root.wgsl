@@ -39,6 +39,11 @@ fn march_uv_sphere(
     let outer_r = outer_r_local * body_size;
     let inner_r = inner_r_local * body_size;
 
+    // PROTOTYPE: fire ray vs the cartesian-block target. If it hits,
+    // record `proto.t` so the UV march can be overridden when its
+    // hit lies behind the OBB. Final pick happens at end-of-march.
+    let proto = proto_ray_vs_obb(ray_origin, ray_dir, center);
+
     let oc = ray_origin - center;
 
     let outer_t = uv_ray_sphere(oc, ray_dir, outer_r);
@@ -121,6 +126,16 @@ fn march_uv_sphere(
         t = bd.t + max(step * 1e-4, 1e-5);
         last_axis = bd.axis;
         last_side = bd.side;
+    }
+
+    // PROTOTYPE: if the cartesian-block target was hit, prefer it
+    // when it sits closer than the UV march's hit. The OBB
+    // overrides the UV cell pixel-for-pixel where it occludes;
+    // outside the box the UV rendering is unchanged.
+    if proto.t < 1e20 {
+        if !result.hit || proto.t < result.t {
+            return proto_obb_render(ray_origin, ray_dir, center, proto);
+        }
     }
     return result;
 }
