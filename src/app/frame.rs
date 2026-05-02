@@ -67,8 +67,11 @@ pub fn compute_render_frame(
         _ => ActiveFrameKind::Cartesian,
     };
     for k in 0..target.depth() as usize {
-        // If we've already landed on a WrappedPlane node, stop —
-        // the slab root IS the render frame.
+        // If we've already landed on a WrappedPlane or TangentBlock
+        // node, stop — the node IS the render frame. The shader
+        // handles wrap/rotation internally: WrappedPlane fires the
+        // X-wrap branch at depth==0, TangentBlock applies R^T to
+        // position/direction at frame entry.
         if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
@@ -79,9 +82,15 @@ pub fn compute_render_frame(
                 reached.push(slot as u8);
                 node_id = child_id;
                 if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
-                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                        break;
+                    match child_node.kind {
+                        NodeKind::WrappedPlane { dims, slab_depth } => {
+                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                            break;
+                        }
+                        NodeKind::TangentBlock { .. } => {
+                            break;
+                        }
+                        _ => {}
                     }
                 }
             }

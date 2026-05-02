@@ -328,15 +328,12 @@ impl WorldPos {
         // rotation before adding to the centre.
         let mut cur_centre = [WORLD_SIZE * 0.5; 3];
         let mut cur_size = WORLD_SIZE;
-        // The shader applies R^T when entering a TangentBlock, so
-        // when the frame IS a TB (common_rot = R), the tail walk
-        // must start with R^T so the GPU camera position matches
-        // the shader's rotated-local convention. At the cell center
-        // R^T is identity (rotation around center preserves center),
-        // but at the edges the rotated position differs — without
-        // this, the camera jumps by ~1 cell when crossing the TB
-        // boundary away from center.
-        let mut cur_rot = mat3_transpose(&common_rot);
+        // `cur_rot` starts as identity: the tail walk produces the
+        // position in the common ancestor's unrotated local frame.
+        // TangentBlock rotation from `common_rot` is handled by the
+        // shader (R^T at frame entry for TB frame roots), not here.
+        let mut cur_rot = IDENTITY_ROTATION;
+        let _ = common_rot;
         let mut have_node = true;
         let mut node = common_node;
         for k in c..(self.anchor.depth() as usize) {
@@ -482,14 +479,6 @@ fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
         }
     }
     out
-}
-
-fn mat3_transpose(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    [
-        [m[0][0], m[1][0], m[2][0]],
-        [m[0][1], m[1][1], m[2][1]],
-        [m[0][2], m[1][2], m[2][2]],
-    ]
 }
 
 /// Apply a column-major 3×3 matrix to a 3-vector: `(m · v).i =
