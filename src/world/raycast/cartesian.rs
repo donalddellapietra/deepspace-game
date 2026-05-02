@@ -131,23 +131,35 @@ pub(super) fn cpu_raycast_inner(
                 let parent_cell_size = parent.cell_size;
                 let parent_ray_origin = parent.ray_origin;
                 let parent_ray_dir = parent.ray_dir;
-                let parent_inv_dir = parent.inv_dir;
                 let child_origin = [
                     parent_origin[0] + cell[0] as f32 * parent_cell_size,
                     parent_origin[1] + cell[1] as f32 * parent_cell_size,
                     parent_origin[2] + cell[2] as f32 * parent_cell_size,
                 ];
-                let child_cell_size = parent_cell_size / 3.0;
 
                 // Per-descent rotation: read the child's NodeKind. For
-                // `Rotated45Y`, transform the parent's ray into the
-                // rotated child's local frame. Cartesian (and any
-                // other non-rotated kind) takes the cheap path —
-                // copy the parent ray and `node_origin = child_origin`.
+                // `Rotated45Y`, T transforms the parent's ray relative
+                // to the cell center AND the rotated frame is rescaled
+                // back to `[0, 3)³` local coords (`cur_cell_size` resets
+                // to 1.0 instead of `parent_cell_size / 3`). Without
+                // the rescale, the rotated child's `node_origin` (= 0)
+                // and `cell_size` (= parent / 3) live at scale ~parent_
+                // cell_size while `ray_origin` lives at the render-frame
+                // scale; their `(node_origin − ray_origin)` subtraction
+                // loses precision proportional to `1 / parent_cell_size`,
+                // and visible artifacts appear by walker depth 5–6 inside
+                // the rotated subtree. Rescaling makes every rotated
+                // frame restart with the same `[0, 3)³` precision profile
+                // as the render-frame root.
+                //
+                // Cartesian (and any other non-rotated kind) takes the
+                // cheap path: parent ray, `cur_cell_size = parent / 3`,
+                // `node_origin = child_origin`.
                 let (
                     child_ray_origin,
                     child_ray_dir,
                     child_node_origin,
+                    child_cell_size,
                 ) = if matches!(child_node.kind, NodeKind::Rotated45Y) {
                     let cell_center = [
                         child_origin[0] + parent_cell_size * 0.5,
@@ -165,33 +177,34 @@ pub(super) fn cpu_raycast_inner(
                         parent_ray_dir[1],
                         parent_ray_dir[0] + parent_ray_dir[2],
                     ];
+                    let frame_scale = 3.0 / parent_cell_size;
                     let new_origin = [
-                        pc_t[0] + parent_cell_size * 0.5,
-                        pc_t[1] + parent_cell_size * 0.5,
-                        pc_t[2] + parent_cell_size * 0.5,
+                        (pc_t[0] + parent_cell_size * 0.5) * frame_scale,
+                        (pc_t[1] + parent_cell_size * 0.5) * frame_scale,
+                        (pc_t[2] + parent_cell_size * 0.5) * frame_scale,
                     ];
-                    (new_origin, dc_t, [0.0f32; 3])
+                    let new_dir = [
+                        dc_t[0] * frame_scale,
+                        dc_t[1] * frame_scale,
+                        dc_t[2] * frame_scale,
+                    ];
+                    (new_origin, new_dir, [0.0f32; 3], 1.0)
                 } else {
-                    (parent_ray_origin, parent_ray_dir, child_origin)
+                    (parent_ray_origin, parent_ray_dir, child_origin, parent_cell_size / 3.0)
                 };
 
-                // Find the entry cell within the child node using the
-                // child's frame ray (rotated for Rotated45Y, identical
-                // to parent for cartesian).
-                let child_inv = if matches!(child_node.kind, NodeKind::Rotated45Y) {
-                    [
-                        if child_ray_dir[0].abs() > 1e-8 { 1.0 / child_ray_dir[0] } else { 1e10 },
-                        if child_ray_dir[1].abs() > 1e-8 { 1.0 / child_ray_dir[1] } else { 1e10 },
-                        if child_ray_dir[2].abs() > 1e-8 { 1.0 / child_ray_dir[2] } else { 1e10 },
-                    ]
-                } else {
-                    parent_inv_dir
-                };
+                // Derived ray state for the new frame.
+                let child_inv = [
+                    if child_ray_dir[0].abs() > 1e-8 { 1.0 / child_ray_dir[0] } else { 1e10 },
+                    if child_ray_dir[1].abs() > 1e-8 { 1.0 / child_ray_dir[1] } else { 1e10 },
+                    if child_ray_dir[2].abs() > 1e-8 { 1.0 / child_ray_dir[2] } else { 1e10 },
+                ];
+                // Find the entry cell within the new frame.
                 let child_box_min = child_node_origin;
                 let child_box_max = [
-                    child_box_min[0] + parent_cell_size,
-                    child_box_min[1] + parent_cell_size,
-                    child_box_min[2] + parent_cell_size,
+                    child_box_min[0] + 3.0 * child_cell_size,
+                    child_box_min[1] + 3.0 * child_cell_size,
+                    child_box_min[2] + 3.0 * child_cell_size,
                 ];
                 let (ct_enter, _) = ray_aabb(
                     child_ray_origin, child_inv, child_box_min, child_box_max,

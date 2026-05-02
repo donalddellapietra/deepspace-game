@@ -1014,6 +1014,21 @@ fn march_cartesian(
                 let child_kind = node_kinds[child_idx].kind;
                 if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
                 if child_kind == NODE_KIND_ROTATED_45Y {
+                    // Rotated descent: T transforms the ray relative
+                    // to the cell center, then we RESCALE the rotated
+                    // frame back to `[0, 3)³` local coords. Without
+                    // the rescale, the rotated child's `cur_node_origin`
+                    // stays at scale ~`parent_cell_size` while
+                    // `ray_origin` lives at scale ~3 (render-frame
+                    // magnitudes); their `(node_origin − ray_origin)`
+                    // subtraction loses precision proportional to
+                    // `1 / parent_cell_size`, and visible artifacts
+                    // appear by walker depth 5–6 inside the rotated
+                    // subtree. Rescaling makes every rotated frame
+                    // start with the same `[0, 3)³` precision profile
+                    // as the render-frame root — the cartesian DDA
+                    // below this boundary runs without any mixed-scale
+                    // arithmetic.
                     let parent_cell_size_local = cur_cell_size * 3.0;
                     let cell_center = child_origin + vec3<f32>(parent_cell_size_local * 0.5);
                     let pc = ray_origin - cell_center;
@@ -1021,8 +1036,9 @@ fn march_cartesian(
                     let dc_t = vec3<f32>(
                         ray_dir.x - ray_dir.z, ray_dir.y, ray_dir.x + ray_dir.z,
                     );
-                    ray_origin = pc_t + vec3<f32>(parent_cell_size_local * 0.5);
-                    ray_dir = dc_t;
+                    let frame_scale = 3.0 / parent_cell_size_local;
+                    ray_origin = (pc_t + vec3<f32>(parent_cell_size_local * 0.5)) * frame_scale;
+                    ray_dir = dc_t * frame_scale;
                     inv_dir = vec3<f32>(
                         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
                         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
@@ -1036,16 +1052,9 @@ fn march_cartesian(
                     );
                     delta_dist = abs(inv_dir);
                     cur_node_origin = vec3<f32>(0.0);
-                    // Re-anchor entry_pos onto the rotated ray and the
-                    // rotated child's box `[0, parent_cell_size]³`. The
-                    // descent-time side_dist init below uses the new
-                    // entry_pos as the reference point, exactly mirroring
-                    // the X-wrap and root paths.
-                    let r_box = ray_box(
-                        ray_origin, inv_dir,
-                        vec3<f32>(0.0), vec3<f32>(parent_cell_size_local),
-                    );
-                    let r_t_start = max(r_box.t_enter, 0.0) + 0.001 * cur_cell_size;
+                    cur_cell_size = 1.0;
+                    let r_box = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+                    let r_t_start = max(r_box.t_enter, 0.0) + 0.001;
                     entry_pos = ray_origin + ray_dir * r_t_start;
                 }
                 // Save post-transform state so the OOB pop restores
