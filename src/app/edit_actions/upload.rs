@@ -298,26 +298,6 @@ impl App {
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
-                ActiveFrameKind::SphereSubFrame(range) => {
-                    let node_range = crate::world::sphere_geom::subframe_range(
-                        &self.world.library,
-                        self.world.root,
-                        &self.active_frame.render_path,
-                        crate::world::anchor::WORLD_SIZE,
-                        crate::world::sphere_geom::DEFAULT_SPHERE_LAT_MAX,
-                    )
-                    .unwrap_or(range);
-                    renderer.set_root_kind_sphere_subframe(
-                        range.lat_lo, range.lat_hi,
-                        range.lon_lo, range.lon_hi,
-                        range.r_lo, range.r_hi,
-                        range.r_center(),
-                        node_range.lat_lo, node_range.lat_hi,
-                        node_range.lon_lo, node_range.lon_hi,
-                        node_range.r_lo, node_range.r_hi,
-                        range.wp_dims, range.wp_slab_depth,
-                    );
-                }
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

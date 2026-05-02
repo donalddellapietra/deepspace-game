@@ -190,55 +190,6 @@ pub fn subframe_range(
     })
 }
 
-/// Compute the sphere sub-frame range from a path, given the WP
-/// metadata directly (no library walk needed). Used by
-/// `compute_render_frame` which already located the WP during its
-/// descent.
-pub fn subframe_range_from_path(
-    path: &Path,
-    dims: [u32; 3],
-    slab_depth: u8,
-    wp_path_depth: u8,
-) -> SphereSubFrameRange {
-    let body_size = crate::world::anchor::WORLD_SIZE;
-    let r_sphere = body_size / (2.0 * PI);
-    let shell_thickness = r_sphere * SHELL_THICKNESS_FRAC;
-    let r_outer = r_sphere;
-    let r_inner = r_sphere - shell_thickness;
-
-    let mut lat_lo = -DEFAULT_SPHERE_LAT_MAX;
-    let mut lat_hi = DEFAULT_SPHERE_LAT_MAX;
-    let mut lon_lo = -PI;
-    let mut lon_hi = PI;
-    let mut r_lo = r_inner;
-    let mut r_hi = r_outer;
-
-    for &slot in &path.as_slice()[wp_path_depth as usize..] {
-        let (sx, sy, sz) = slot_coords(slot as usize);
-        let half_lon = (lon_hi - lon_lo) / 2.0;
-        let half_lat = (lat_hi - lat_lo) / 2.0;
-        let half_r = (r_hi - r_lo) / 2.0;
-        lon_lo = lon_lo + sx as f32 * half_lon;
-        lon_hi = lon_lo + half_lon;
-        lat_lo = lat_lo + sz as f32 * half_lat;
-        lat_hi = lat_lo + half_lat;
-        r_lo = r_lo + sy as f32 * half_r;
-        r_hi = r_lo + half_r;
-    }
-
-    SphereSubFrameRange {
-        lat_lo,
-        lat_hi,
-        lon_lo,
-        lon_hi,
-        r_lo,
-        r_hi,
-        wp_dims: dims,
-        wp_slab_depth: slab_depth,
-        wp_path_depth,
-    }
-}
-
 /// Camera position + basis projected into a sphere sub-frame's
 /// local rotated+translated coordinate system. The sub-frame's
 /// origin is at the sub-frame center (= sphere body center

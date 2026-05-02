@@ -184,11 +184,6 @@ pub struct Renderer {
     /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
     /// shader's X-wrap branch reads the X and W lanes.
     pub(super) slab_dims: [u32; 4],
-    pub(super) subframe_lat_lon: [f32; 4],
-    pub(super) subframe_r: [f32; 4],
-    pub(super) subframe_wp_dims: [u32; 4],
-    pub(super) node_lat_lon: [f32; 4],
-    pub(super) node_r: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -362,28 +357,6 @@ impl Renderer {
     pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_WRAPPED_PLANE;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
-        self.write_uniforms();
-    }
-
-    pub fn set_root_kind_sphere_subframe(
-        &mut self,
-        sub_lat_lo: f32, sub_lat_hi: f32,
-        sub_lon_lo: f32, sub_lon_hi: f32,
-        sub_r_lo: f32, sub_r_hi: f32,
-        sub_r_c: f32,
-        node_lat_lo: f32, node_lat_hi: f32,
-        node_lon_lo: f32, node_lon_hi: f32,
-        node_r_lo: f32, node_r_hi: f32,
-        wp_dims: [u32; 3],
-        wp_slab_depth: u8,
-    ) {
-        self.root_kind = ROOT_KIND_SPHERE_SUBFRAME;
-        self.slab_dims = [wp_dims[0], wp_dims[1], wp_dims[2], wp_slab_depth as u32];
-        self.subframe_lat_lon = [sub_lat_lo, sub_lat_hi, sub_lon_lo, sub_lon_hi];
-        self.subframe_r = [sub_r_lo, sub_r_hi, sub_r_c, 0.0];
-        self.subframe_wp_dims = [wp_dims[0], wp_dims[1], wp_dims[2], wp_slab_depth as u32];
-        self.node_lat_lon = [node_lat_lo, node_lat_hi, node_lon_lo, node_lon_hi];
-        self.node_r = [node_r_lo, node_r_hi, 0.0, 0.0];
         self.write_uniforms();
     }
 

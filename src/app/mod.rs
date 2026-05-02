@@ -534,9 +534,6 @@ impl App {
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                 NodeKind::WrappedPlane { dims, slab_depth }
             }
-            ActiveFrameKind::SphereSubFrame(range) => {
-                NodeKind::WrappedPlane { dims: range.wp_dims, slab_depth: range.wp_slab_depth }
-            }
         }
     }
 
@@ -621,7 +618,7 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } | ActiveFrameKind::SphereSubFrame(_) => {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                 // Rotation-aware: when the anchor path crosses a
                 // TangentBlock, every slot offset past it (and the
                 // final offset) must be rotated by the cumulative
