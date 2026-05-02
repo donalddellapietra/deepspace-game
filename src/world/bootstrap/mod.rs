@@ -8,6 +8,7 @@ use super::anchor::{Path, WorldPos};
 use super::state::WorldState;
 
 mod plain;
+mod rotated_test;
 mod vox;
 mod wrapped_planet;
 
@@ -91,6 +92,12 @@ pub enum WorldPreset {
     /// that the ray-march preserves precision across deep pops —
     /// stars at ancestor-depth 1 through N−1 must all render.
     Stars,
+    /// Single rotated cartesian block embedded in a flat 3×3×3 root.
+    /// Tree depth 30, with a self-similar 3-color patterned interior
+    /// inside a `NodeKind::TangentBlock`. Used to validate that
+    /// rotation handling preserves precision past the f32 absolute-
+    /// coords wall — depths 18+ can't be cheated with abs coords.
+    RotatedTest,
     /// Wrapped-Cartesian planet (Phase 1: hardcoded slab).
     /// A `NodeKind::WrappedPlane` node is installed at
     /// `embedding_depth` levels below root, with a flat slab subtree
@@ -149,6 +156,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         // but its world-y depends on embedding_depth and slot path
         // — entities don't auto-rest on it in Phase 1.
         WorldPreset::WrappedPlanet { .. } => None,
+        WorldPreset::RotatedTest => None,
     }
 }
 
@@ -233,5 +241,6 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             cell_subtree_depth,
             tangent_planes,
         ),
+        WorldPreset::RotatedTest => rotated_test::bootstrap_rotated_test_world(),
     }
 }

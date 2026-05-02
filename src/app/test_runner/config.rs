@@ -256,6 +256,7 @@ impl TestConfig {
                 "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
                 "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
                 "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
+                "--rotated-test-world" => { cfg.world_preset = WorldPreset::RotatedTest; }
                 "--sponza-world" => {
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,
