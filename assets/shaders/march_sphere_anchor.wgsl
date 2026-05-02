@@ -1,52 +1,55 @@
 #include "bindings.wgsl"
 #include "ray_prim.wgsl"
 #include "march_helpers.wgsl"
-#include "march_sphere_hit.wgsl"
 
-// Hardware ceiling for the sphere anchor descent stack. Sized
-// independently from `MAX_STACK_DEPTH` (the Cartesian frame stack,
-// which is tuned at 8 for register pressure on Apple Silicon and
-// works because Cartesian's frame-aware system pops between
-// frames + LOD_PIXEL_THRESHOLD prunes descent). Sphere mode has
-// neither — descent into a non-uniform anchor is one continuous
-// stack — so this needs to cover any reasonable
-// `cell_subtree_depth` (default 20) the user might edit into.
-//
-// Set to 24 to leave headroom above the 20-level default. Above
-// this the descent splats representative (same shape as Cartesian's
-// `at_max`). When edits exceed this, raise this constant; sphere
-// mode is opt-in (--planet-render-sphere) so the extra register
-// pressure only applies when sphere render is active.
+// Per-frame stack ceiling. Past this we splat representative_block.
+// 24 covers the default cell_subtree_depth=20 with headroom; sphere
+// mode is opt-in (--planet-render-sphere) so the stack arrays only
+// cost when sphere render is active.
 const SPHERE_DESCENT_DEPTH: u32 = 24u;
 
-// Stack-based DDA inside an anchor block at sub-cell granularity.
-// Mirrors `march_cartesian` but in (lon, lat, r) space using the
-// sphere-cell boundary primitives (ray_meridian_t, ray_parallel_t,
-// ray_sphere_after).
+// ─────────────────────────────────────────────────────────────────────
+// Cartesian-local DDA with frame-aware re-zero on push.
 //
-// Recipe — tree-structure descent (no camera-distance LOD):
-// * 27-children descent — each level divides (lon, lat, r) cell sizes
-//   by 3.
-// * tag=1 → hit the leaf Block at this sub-cell.
-// * tag=2 + non-empty representative → push child frame, continue
-//   DDA at finer cells. (Pack format auto-flattens uniform Cartesian
-//   subtrees to tag=1, so descent only enters genuinely non-uniform
-//   subtrees — i.e. the path the user actually edited.)
-// * tag=2 + empty representative → skip whole cell.
-// * empty slot / unknown → advance ray to the cell's nearest face.
-// * stack at MAX_STACK_DEPTH → splat representative (hardware ceiling).
+// At slab-cell entry, an orthonormal frame is built at the slab
+// cell's center (e_lon, e_r, e_lat tangents to the sphere). The ray
+// is transformed into that frame so the slab cell occupies `[0, 3)³`.
 //
-// On exit (ray leaves the slab cell or stack underflows), returns
-// hit=false so the caller's main slab DDA can continue past this
-// slab cell.
+// On EACH push, we DON'T let `cur_node_origin` drift away from zero.
+// Instead we re-zero: the cell we're descending into becomes the new
+// `[0, 3)³` frame. The ray transforms accordingly:
+//
+//   new_O = (old_O - cell) * 3
+//   new_D =  old_D       * 3
+//
+// (D-scaled, t-preserved.) After re-zero, `cur_node_origin = vec3(0)`
+// and `cur_cell_size = 1` always — the DDA's standard machinery sees
+// O(1) coordinates at every depth, not 1/3^N values that would crush
+// against the f32 ULP floor.
+//
+// The cell index path (s_cell stack) makes pop reversible:
+//
+//   on pop: old_O = new_O / 3 + popped_cell
+//           old_D = new_D / 3
+//
+// Sphere curvature within an anchor sub-cell of width ε on a planet
+// of radius r introduces only `O(ε²/r)` deviation from the local-flat
+// approximation — for ε ≤ slab_step ≈ 0.04 and r ≈ 0.5 that's at most
+// 1.6e-3 of cell extent at the slab cell, much smaller in sub-cells.
+// The descent is thus geometrically safe while keeping coords O(1).
+//
+// Bevel is computed in local coords from the hit's in-cell fractions
+// and the entry-face normal; the local axis-aligned normal is rotated
+// back to the world basis (e_lon, e_r, e_lat) for shading.
+// ─────────────────────────────────────────────────────────────────────
+
 fn sphere_descend_anchor(
     anchor_idx: u32,
     ray_origin: vec3<f32>, ray_dir: vec3<f32>,
-    oc: vec3<f32>, cs_center: vec3<f32>, inv_norm: f32,
-    t_in: f32, t_exit: f32,
-    slab_lon_lo: f32, slab_lon_step: f32,
-    slab_lat_lo: f32, slab_lat_step: f32,
-    slab_r_lo:   f32, slab_r_step:   f32,
+    cs_center: vec3<f32>, inv_norm: f32,
+    cell_lon_center: f32, cell_lat_center: f32, cell_r_center: f32,
+    cell_lon_step: f32, cell_lat_step: f32, cell_r_step: f32,
+    t_in: f32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -56,380 +59,302 @@ fn sphere_descend_anchor(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
+    // ── Slab cell's orthonormal world frame ──────────────────────────
+    let cos_lat = cos(cell_lat_center);
+    let sin_lat = sin(cell_lat_center);
+    let cos_lon = cos(cell_lon_center);
+    let sin_lon = sin(cell_lon_center);
+    let e_r   = vec3<f32>(cos_lat * cos_lon, sin_lat,        cos_lat * sin_lon);
+    let e_lon = vec3<f32>(-sin_lon,           0.0,            cos_lon);
+    let e_lat = vec3<f32>(-sin_lat * cos_lon, cos_lat,       -sin_lat * sin_lon);
+    // Slab-axis convention (matches slab tree slot layout
+    // dims=[lon, r, lat]): local x → e_lon, y → e_r, z → e_lat.
+    let ext_x = cell_r_center * cos_lat * cell_lon_step;
+    let ext_y = cell_r_step;
+    let ext_z = cell_r_center * cell_lat_step;
+    let scale_x = 3.0 / max(ext_x, 1e-30);
+    let scale_y = 3.0 / max(ext_y, 1e-30);
+    let scale_z = 3.0 / max(ext_z, 1e-30);
+    // Slab cell corner (where local = 0,0,0) in world.
+    let cell_corner = cs_center + cell_r_center * e_r
+        - 0.5 * ext_x * e_lon
+        - 0.5 * ext_y * e_r
+        - 0.5 * ext_z * e_lat;
+
+    // Transform ray into slab cell's local frame. Slab cell = [0,3)³.
+    let dv = ray_origin - cell_corner;
+    var cur_O = vec3<f32>(
+        dot(dv,      e_lon) * scale_x,
+        dot(dv,      e_r)   * scale_y,
+        dot(dv,      e_lat) * scale_z,
+    );
+    var cur_D = vec3<f32>(
+        dot(ray_dir, e_lon) * scale_x,
+        dot(ray_dir, e_r)   * scale_y,
+        dot(ray_dir, e_lat) * scale_z,
+    );
+
+    // ── DDA setup. cur_node_origin = 0, cur_cell_size = 1 (always).
+    // After every push we re-zero, so these scalars are constants and
+    // we never accumulate ULP drift.
+    var cur_inv_dir = vec3<f32>(
+        select(1e30, 1.0 / cur_D.x, abs(cur_D.x) > 1e-12),
+        select(1e30, 1.0 / cur_D.y, abs(cur_D.y) > 1e-12),
+        select(1e30, 1.0 / cur_D.z, abs(cur_D.z) > 1e-12),
+    );
+    var cur_step = vec3<i32>(
+        select(-1, 1, cur_D.x >= 0.0),
+        select(-1, 1, cur_D.y >= 0.0),
+        select(-1, 1, cur_D.z >= 0.0),
+    );
+    var cur_delta_dist = abs(cur_inv_dir);
+
+    // Initial cell at slab entry (t = t_in is the slab DDA's current
+    // t; ray is geometrically inside the curved slab cell at this t).
+    var t = t_in;
+    var entry_pos = cur_O + cur_D * t;
+    var cur_cell = vec3<i32>(
+        clamp(i32(floor(entry_pos.x)), 0, 2),
+        clamp(i32(floor(entry_pos.y)), 0, 2),
+        clamp(i32(floor(entry_pos.z)), 0, 2),
+    );
+
+    // Side-dist: per-axis t at which the ray will next cross a face
+    // of the current cell. With cur_cell_size = 1 always (re-zero),
+    // delta_dist increment per cell is just `cur_delta_dist`.
+    var cf = vec3<f32>(cur_cell);
+    var cur_side_dist = vec3<f32>(
+        select((cf.x       - cur_O.x) * cur_inv_dir.x,
+               (cf.x + 1.0 - cur_O.x) * cur_inv_dir.x, cur_D.x >= 0.0),
+        select((cf.y       - cur_O.y) * cur_inv_dir.y,
+               (cf.y + 1.0 - cur_O.y) * cur_inv_dir.y, cur_D.y >= 0.0),
+        select((cf.z       - cur_O.z) * cur_inv_dir.z,
+               (cf.z + 1.0 - cur_O.z) * cur_inv_dir.z, cur_D.z >= 0.0),
+    );
+
+    // Entry normal: which face of slab [0, 3)³ did the ray cross?
+    // Compute via per-axis ray-slab math; max of per-axis entry-t
+    // identifies the face. (This is needed for the bevel UV when the
+    // very first cell already has a tag=1 hit — no advance step has
+    // run, so the "default" `normal` would otherwise be zero.)
+    let t1_slab = (vec3<f32>(0.0) - cur_O) * cur_inv_dir;
+    let t2_slab = (vec3<f32>(3.0) - cur_O) * cur_inv_dir;
+    let t_lo_slab = min(t1_slab, t2_slab);
+    let entry_t_slab = max(t_lo_slab.x, max(t_lo_slab.y, t_lo_slab.z));
+    var normal: vec3<f32>;
+    if t_lo_slab.x >= entry_t_slab - 1e-9 {
+        normal = vec3<f32>(-f32(cur_step.x), 0.0, 0.0);
+    } else if t_lo_slab.y >= entry_t_slab - 1e-9 {
+        normal = vec3<f32>(0.0, -f32(cur_step.y), 0.0);
+    } else {
+        normal = vec3<f32>(0.0, 0.0, -f32(cur_step.z));
+    }
+
+    // ── Stack: node IDs and cell-index paths (for pop). Cell indices
+    // are stored at the moment of push so pop can un-re-zero exactly.
     var s_node_idx: array<u32, SPHERE_DESCENT_DEPTH>;
-    var s_cell: array<u32, SPHERE_DESCENT_DEPTH>;
+    var s_cell:     array<u32, SPHERE_DESCENT_DEPTH>;
     var depth: u32 = 0u;
     s_node_idx[0] = anchor_idx;
 
-    // ── State tracked through descent (Approach A) ───────────────────
-    //
-    // `cur_*_center` is the absolute (lon, lat, r) coord of the CURRENT
-    // CELL's center. Maintained per-cell via integer-multiple updates:
-    //   on push:    center += (new_cell_idx - 1) * new_step
-    //   on pop:     center -= (popped_idx - 1) * old_step ; then *=3
-    //   on advance: center += step_dir * cur_step (one of 6 faces)
-    // Every update is an exact-step shift — never an absolute add of a
-    // tiny fraction to a large base, so it doesn't accumulate ULP drift
-    // the way `cur_*_org += cell.x * step` did.
-    //
-    // Cell bounds are derived as `center ± half_step`: half_step is
-    // exact (step is divided by 3 each push, bit-exact in f32) and the
-    // ± is symmetric, so the meridian/parallel/sphere primitives see
-    // face positions without the cumulative drift the old `cur_*_org`
-    // pattern produced.
-    //
-    // `frame_in_frac` is the ray's [0,1]³ position inside the CURRENT
-    // FRAME's 3×3×3 grid. On push it's `parent_frac * 3 - cell_idx`
-    // (bit-exact); on pop `(popped + child_frac) / 3`. At in-frame
-    // advance we use FACE-CROSSING DETECTION (which `t_xxx == t_next`)
-    // to step the cell index by ±1 along that axis — pure integer
-    // math, immune to f32 cell-width-vs-coord-magnitude issues that
-    // plagued `floor((lon_p - cur_lon_org) / step)`. The ray's
-    // crossed-axis position at the new t is exactly the face's
-    // boundary, so the crossed component of `frame_in_frac` snaps
-    // to a precise integer-aligned fraction; non-crossed components
-    // are left at their pre-advance value (the ray's other axes
-    // didn't move enough within one cell to matter for bevel).
-    // ─────────────────────────────────────────────────────────────────
-
-    var cur_lon_step = slab_lon_step / 3.0;
-    var cur_lat_step = slab_lat_step / 3.0;
-    var cur_r_step   = slab_r_step   / 3.0;
-
-    var t = t_in;
-
-    // Initial cell + frame_in_frac at depth 0. Slab cell is large
-    // (~0.077 rad in lon) so absolute math here has plenty of f32
-    // precision (~5 decimal digits in the [0, 1] result).
-    let pos0 = ray_origin + ray_dir * t;
-    let off0 = pos0 - cs_center;
-    let r0 = max(length(off0), 1e-9);
-    let n0 = off0 / r0;
-    let lat0 = asin(clamp(n0.y, -1.0, 1.0));
-    let lon0 = atan2(n0.z, n0.x);
-    var frame_in_frac = vec3<f32>(
-        (lon0 - slab_lon_lo) / slab_lon_step,
-        (r0   - slab_r_lo)   / slab_r_step,
-        (lat0 - slab_lat_lo) / slab_lat_step,
-    );
-    let cell0 = clamp(vec3<i32>(
-        i32(floor(frame_in_frac.x * 3.0)),
-        i32(floor(frame_in_frac.y * 3.0)),
-        i32(floor(frame_in_frac.z * 3.0)),
-    ), vec3<i32>(0), vec3<i32>(2));
-    s_cell[0] = pack_cell(cell0);
-
-    // Cell center: absolute, but only updated via exact integer-step
-    // shifts after this initial computation. No drift accumulation.
-    var cur_lon_center = slab_lon_lo + (f32(cell0.x) + 0.5) * cur_lon_step;
-    var cur_r_center   = slab_r_lo   + (f32(cell0.y) + 0.5) * cur_r_step;
-    var cur_lat_center = slab_lat_lo + (f32(cell0.z) + 0.5) * cur_lat_step;
+    let root_header_off = node_offsets[anchor_idx];
+    var cur_occupancy: u32 = tree[root_header_off];
+    var cur_first_child: u32 = tree[root_header_off + 1u];
 
     var iters: u32 = 0u;
-    loop {
-        if iters > 256u { break; }
-        iters = iters + 1u;
-        if t > t_exit { break; }
+    let max_iters: u32 = 4096u;
+    var did_hit: bool = false;
+    var hit_t: f32 = 0.0;
+    var hit_block: u32 = 0u;
+    var hit_in_cell: vec3<f32> = vec3<f32>(0.5);
 
-        let cell = unpack_cell(s_cell[depth]);
-        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
-            // OOB at depth d: ray exited depth-d's frame. The exit axis
-            // tells us which face of the parent's cell (depth d-1) we
-            // crossed; we pop and advance the parent's cell by ±1 on
-            // that axis.
+    loop {
+        if iters >= max_iters { break; }
+        iters = iters + 1u;
+
+        // OOB → pop one frame, undo the re-zero on the ray.
+        if cur_cell.x < 0 || cur_cell.x > 2 || cur_cell.y < 0 || cur_cell.y > 2 || cur_cell.z < 0 || cur_cell.z > 2 {
             if depth == 0u { break; }
-            let oob_x = select(0, select(1, -1, cell.x < 0), cell.x < 0 || cell.x > 2);
-            let oob_y = select(0, select(1, -1, cell.y < 0), cell.y < 0 || cell.y > 2);
-            let oob_z = select(0, select(1, -1, cell.z < 0), cell.z < 0 || cell.z > 2);
-            let old_step_lon = cur_lon_step;
-            let old_step_lat = cur_lat_step;
-            let old_step_r   = cur_r_step;
+            // Pop. Reverse the push transform:
+            //   old_O = new_O / 3 + popped_cell
+            //   old_D = new_D / 3
             depth = depth - 1u;
-            cur_lon_step = old_step_lon * 3.0;
-            cur_lat_step = old_step_lat * 3.0;
-            cur_r_step   = old_step_r   * 3.0;
             let popped = unpack_cell(s_cell[depth]);
-            // popped is the cell at parent depth d that contained the
-            // (d+1) frame we just exited.
-            //
-            // Pre-pop, cur_*_center is the (d+1) cell's center, which
-            // = (d+1)_frame_center + (cell - 1) * old_step. (`cell`
-            // can be OOB, so its center is conceptually outside the
-            // frame.) (d+1)_frame_center IS the popped cell's center at
-            // depth d, so:
-            //   parent_neighbor_center = (d+1)_frame_center + oob * d_step
-            //                          = cur_*_center - (cell - 1) * old_step
-            //                            + oob * d_step
-            //
-            // Note: uses `cell` (the (d+1) cell index, possibly OOB),
-            // NOT `popped` (the parent cell index).
-            cur_lon_center = cur_lon_center
-                - (f32(cell.x) - 1.0) * old_step_lon
-                + f32(oob_x) * cur_lon_step;
-            cur_r_center = cur_r_center
-                - (f32(cell.y) - 1.0) * old_step_r
-                + f32(oob_y) * cur_r_step;
-            cur_lat_center = cur_lat_center
-                - (f32(cell.z) - 1.0) * old_step_lat
-                + f32(oob_z) * cur_lat_step;
-            // Advance parent's cell index by the OOB direction.
-            let new_cell_p = vec3<i32>(
-                popped.x + oob_x,
-                popped.y + oob_y,
-                popped.z + oob_z,
+            cur_O = cur_O * (1.0 / 3.0) + vec3<f32>(popped);
+            cur_D = cur_D * (1.0 / 3.0);
+            cur_inv_dir = cur_inv_dir * 3.0;
+            cur_delta_dist = cur_delta_dist * 3.0;
+
+            // Determine which face we crossed (in OLD-frame coords) and
+            // advance the parent's cell on that axis.
+            var step_xyz = vec3<i32>(0);
+            if cur_cell.x < 0 { step_xyz.x = -1; }
+            if cur_cell.x > 2 { step_xyz.x = 1; }
+            if cur_cell.y < 0 { step_xyz.y = -1; }
+            if cur_cell.y > 2 { step_xyz.y = 1; }
+            if cur_cell.z < 0 { step_xyz.z = -1; }
+            if cur_cell.z > 2 { step_xyz.z = 1; }
+            cur_cell = popped + step_xyz;
+
+            // Restore parent's occupancy.
+            let parent_header_off = node_offsets[s_node_idx[depth]];
+            cur_occupancy = tree[parent_header_off];
+            cur_first_child = tree[parent_header_off + 1u];
+
+            // Recompute side_dist for the new (parent-frame) cell.
+            let pcf = vec3<f32>(cur_cell);
+            cur_side_dist = vec3<f32>(
+                select((pcf.x       - cur_O.x) * cur_inv_dir.x,
+                       (pcf.x + 1.0 - cur_O.x) * cur_inv_dir.x, cur_D.x >= 0.0),
+                select((pcf.y       - cur_O.y) * cur_inv_dir.y,
+                       (pcf.y + 1.0 - cur_O.y) * cur_inv_dir.y, cur_D.y >= 0.0),
+                select((pcf.z       - cur_O.z) * cur_inv_dir.z,
+                       (pcf.z + 1.0 - cur_O.z) * cur_inv_dir.z, cur_D.z >= 0.0),
             );
-            s_cell[depth] = pack_cell(new_cell_p);
-            // frame_in_frac on pop: `(popped + child_frac) / 3`. Then
-            // on the advanced axis(es), snap to precise face fraction.
-            frame_in_frac = (vec3<f32>(popped) + frame_in_frac) / 3.0;
-            if oob_x < 0 { frame_in_frac.x = f32(new_cell_p.x + 1) / 3.0; }
-            if oob_x > 0 { frame_in_frac.x = f32(new_cell_p.x) / 3.0; }
-            if oob_y < 0 { frame_in_frac.y = f32(new_cell_p.y + 1) / 3.0; }
-            if oob_y > 0 { frame_in_frac.y = f32(new_cell_p.y) / 3.0; }
-            if oob_z < 0 { frame_in_frac.z = f32(new_cell_p.z + 1) / 3.0; }
-            if oob_z > 0 { frame_in_frac.z = f32(new_cell_p.z) / 3.0; }
+            normal = -vec3<f32>(step_xyz);
             continue;
         }
 
-        let cell_f = vec3<f32>(cell);
-        // Precision-stable in-cell fraction. Used for bevel.
-        let in_cell = clamp(frame_in_frac * 3.0 - cell_f, vec3<f32>(0.0), vec3<f32>(1.0));
-
-        // Cell bounds via center ± half_step. No accumulating drift.
-        let half_lon = cur_lon_step * 0.5;
-        let half_lat = cur_lat_step * 0.5;
-        let half_r   = cur_r_step * 0.5;
-        let lon_lo = cur_lon_center - half_lon;
-        let lon_hi = cur_lon_center + half_lon;
-        let r_lo   = cur_r_center   - half_r;
-        let r_hi   = cur_r_center   + half_r;
-        let lat_lo = cur_lat_center - half_lat;
-        let lat_hi = cur_lat_center + half_lat;
-
-        let slot = u32(cell.x + cell.y * 3 + cell.z * 9);
-        let header_off = node_offsets[s_node_idx[depth]];
-        let occ = tree[header_off];
+        let slot = u32(cur_cell.x + cur_cell.y * 3 + cur_cell.z * 9);
         let bit = 1u << slot;
 
-        // t to all 6 cell faces. t_next = smallest > current t.
-        var t_next = t_exit + 1.0;
-        let t_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
-        if t_lon_lo > 0.0 && t_lon_lo < t_next { t_next = t_lon_lo; }
-        let t_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
-        if t_lon_hi > 0.0 && t_lon_hi < t_next { t_next = t_lon_hi; }
-        let t_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
-        if t_lat_lo > 0.0 && t_lat_lo < t_next { t_next = t_lat_lo; }
-        let t_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
-        if t_lat_hi > 0.0 && t_lat_hi < t_next { t_next = t_lat_hi; }
-        let t_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
-        if t_r_lo > 0.0 && t_r_lo < t_next { t_next = t_r_lo; }
-        let t_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
-        if t_r_hi > 0.0 && t_r_hi < t_next { t_next = t_r_hi; }
-
-        // Helper: advance cell + center + frame_in_frac via face-
-        // crossing detection. Used by every "skip this cell" branch.
-        // Inlined as a closure-like block since WGSL has no closures.
-        // (Each branch repeats the same 30 lines with a `continue`.)
-
-        if (occ & bit) == 0u {
-            // Empty slot. Step cell index ±1 on the crossed axis
-            // (precision-stable integer math).
-            var step_x: i32 = 0;
-            var step_y: i32 = 0;
-            var step_z: i32 = 0;
-            if t_next == t_lon_lo { step_x = -1; }
-            else if t_next == t_lon_hi { step_x = 1; }
-            else if t_next == t_r_lo { step_y = -1; }
-            else if t_next == t_r_hi { step_y = 1; }
-            else if t_next == t_lat_lo { step_z = -1; }
-            else if t_next == t_lat_hi { step_z = 1; }
-            let new_cell = vec3<i32>(cell.x + step_x, cell.y + step_y, cell.z + step_z);
-            s_cell[depth] = pack_cell(new_cell);
-            cur_lon_center = cur_lon_center + f32(step_x) * cur_lon_step;
-            cur_r_center   = cur_r_center   + f32(step_y) * cur_r_step;
-            cur_lat_center = cur_lat_center + f32(step_z) * cur_lat_step;
-            // For non-crossed axes the ray's position changes continuously
-            // over delta_t; update frame_in_frac differentially via the
-            // analytic d{lon,r,lat}/dt rates at the current ray point.
-            // This is precise (rates are O(1), delta_t is small but
-            // well-conditioned). Crossed axis snaps below.
-            let delta_t = t_next - t;
-            let pos_now = ray_origin + ray_dir * t;
-            let q = pos_now - cs_center;
-            let r_now = max(length(q), 1e-9);
-            let r2_xz = max(q.x * q.x + q.z * q.z, 1e-12);
-            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / r2_xz;
-            let rate_r = dot(q, ray_dir) / r_now;
-            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
-            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
-            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
-            if step_x == 0 { frame_in_frac.x = frame_in_frac.x + rate_lon * delta_t / (3.0 * cur_lon_step); }
-            if step_y == 0 { frame_in_frac.y = frame_in_frac.y + rate_r   * delta_t / (3.0 * cur_r_step); }
-            if step_z == 0 { frame_in_frac.z = frame_in_frac.z + rate_lat * delta_t / (3.0 * cur_lat_step); }
-            // Snap crossed axis frame_in_frac to the new cell's near face.
-            if step_x < 0 { frame_in_frac.x = f32(new_cell.x + 1) / 3.0; }
-            if step_x > 0 { frame_in_frac.x = f32(new_cell.x)     / 3.0; }
-            if step_y < 0 { frame_in_frac.y = f32(new_cell.y + 1) / 3.0; }
-            if step_y > 0 { frame_in_frac.y = f32(new_cell.y)     / 3.0; }
-            if step_z < 0 { frame_in_frac.z = f32(new_cell.z + 1) / 3.0; }
-            if step_z > 0 { frame_in_frac.z = f32(new_cell.z)     / 3.0; }
-            t = t_next + max(cur_r_step * 1e-2, abs(t_next) * 2e-7);
-            if t > t_exit { break; }
+        if (cur_occupancy & bit) == 0u {
+            // Empty slot — DDA-step along smallest side_dist.
+            let m = min_axis_mask(cur_side_dist);
+            cur_cell = cur_cell + vec3<i32>(m) * cur_step;
+            cur_side_dist = cur_side_dist + m * cur_delta_dist;
+            normal = -vec3<f32>(cur_step) * m;
             continue;
         }
 
-        let first_child = tree[header_off + 1u];
-        let rank = countOneBits(occ & (bit - 1u));
-        let child_base = first_child + rank * 2u;
+        let rank = countOneBits(cur_occupancy & (bit - 1u));
+        let child_base = cur_first_child + rank * 2u;
         let packed = tree[child_base];
         let tag = packed & 0xFFu;
         let block_type = (packed >> 8u) & 0xFFFFu;
 
         if tag == 1u {
-            // Block leaf. Hit at this sub-cell.
-            //
-            // Axis-convention swizzle: descent's frame_in_frac is in
-            // (lon, r, lat) order to match the slab-tree slot layout
-            // (cell.y = r, cell.z = lat). make_sphere_hit takes
-            // (lon, lat, r) — swap y↔z.
-            let pos_h = ray_origin + ray_dir * t;
-            let off_h = pos_h - cs_center;
-            let r_h = max(length(off_h), 1e-9);
-            let n_h = off_h / r_h;
-            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
-            return make_sphere_hit(
-                pos_h, n_h, t, inv_norm, block_type,
-                r_h, lat_h,
-                vec3<f32>(in_cell.x, in_cell.z, in_cell.y),
-                cur_lon_step, cur_lat_step, cur_r_step,
-            );
+            // Block leaf — hit in current cell.
+            let cell_min_l = vec3<f32>(cur_cell);
+            let cell_max_l = cell_min_l + vec3<f32>(1.0);
+            let bx = ray_box(cur_O, cur_inv_dir, cell_min_l, cell_max_l);
+            hit_t = max(bx.t_enter, 0.0);
+            let pos_at_hit = cur_O + cur_D * hit_t;
+            hit_in_cell = clamp(pos_at_hit - cell_min_l, vec3<f32>(0.0), vec3<f32>(1.0));
+            hit_block = block_type;
+            did_hit = true;
+            break;
         }
-
         if tag != 2u {
-            // EntityRef etc. — treat as empty for sphere subtree DDA.
-            // Same advance shape as the empty-slot branch.
-            var step_x: i32 = 0;
-            var step_y: i32 = 0;
-            var step_z: i32 = 0;
-            if t_next == t_lon_lo { step_x = -1; }
-            else if t_next == t_lon_hi { step_x = 1; }
-            else if t_next == t_r_lo { step_y = -1; }
-            else if t_next == t_r_hi { step_y = 1; }
-            else if t_next == t_lat_lo { step_z = -1; }
-            else if t_next == t_lat_hi { step_z = 1; }
-            let new_cell = vec3<i32>(cell.x + step_x, cell.y + step_y, cell.z + step_z);
-            s_cell[depth] = pack_cell(new_cell);
-            cur_lon_center = cur_lon_center + f32(step_x) * cur_lon_step;
-            cur_r_center   = cur_r_center   + f32(step_y) * cur_r_step;
-            cur_lat_center = cur_lat_center + f32(step_z) * cur_lat_step;
-            let delta_t = t_next - t;
-            let pos_now = ray_origin + ray_dir * t;
-            let q = pos_now - cs_center;
-            let r_now = max(length(q), 1e-9);
-            let r2_xz = max(q.x * q.x + q.z * q.z, 1e-12);
-            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / r2_xz;
-            let rate_r = dot(q, ray_dir) / r_now;
-            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
-            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
-            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
-            if step_x == 0 { frame_in_frac.x = frame_in_frac.x + rate_lon * delta_t / (3.0 * cur_lon_step); }
-            if step_y == 0 { frame_in_frac.y = frame_in_frac.y + rate_r   * delta_t / (3.0 * cur_r_step); }
-            if step_z == 0 { frame_in_frac.z = frame_in_frac.z + rate_lat * delta_t / (3.0 * cur_lat_step); }
-            if step_x < 0 { frame_in_frac.x = f32(new_cell.x + 1) / 3.0; }
-            if step_x > 0 { frame_in_frac.x = f32(new_cell.x)     / 3.0; }
-            if step_y < 0 { frame_in_frac.y = f32(new_cell.y + 1) / 3.0; }
-            if step_y > 0 { frame_in_frac.y = f32(new_cell.y)     / 3.0; }
-            if step_z < 0 { frame_in_frac.z = f32(new_cell.z + 1) / 3.0; }
-            if step_z > 0 { frame_in_frac.z = f32(new_cell.z)     / 3.0; }
-            t = t_next + max(cur_r_step * 1e-2, abs(t_next) * 2e-7);
-            if t > t_exit { break; }
+            // Entity / unknown — advance.
+            let m = min_axis_mask(cur_side_dist);
+            cur_cell = cur_cell + vec3<i32>(m) * cur_step;
+            cur_side_dist = cur_side_dist + m * cur_delta_dist;
+            normal = -vec3<f32>(cur_step) * m;
             continue;
         }
-
-        // tag == 2u: non-uniform Node.
+        // tag == 2u — non-uniform Node.
         if block_type == 0xFFFEu {
-            // Subtree empty per `representative_block` — skip whole
-            // cell. Same advance shape.
-            var step_x: i32 = 0;
-            var step_y: i32 = 0;
-            var step_z: i32 = 0;
-            if t_next == t_lon_lo { step_x = -1; }
-            else if t_next == t_lon_hi { step_x = 1; }
-            else if t_next == t_r_lo { step_y = -1; }
-            else if t_next == t_r_hi { step_y = 1; }
-            else if t_next == t_lat_lo { step_z = -1; }
-            else if t_next == t_lat_hi { step_z = 1; }
-            let new_cell = vec3<i32>(cell.x + step_x, cell.y + step_y, cell.z + step_z);
-            s_cell[depth] = pack_cell(new_cell);
-            cur_lon_center = cur_lon_center + f32(step_x) * cur_lon_step;
-            cur_r_center   = cur_r_center   + f32(step_y) * cur_r_step;
-            cur_lat_center = cur_lat_center + f32(step_z) * cur_lat_step;
-            let delta_t = t_next - t;
-            let pos_now = ray_origin + ray_dir * t;
-            let q = pos_now - cs_center;
-            let r_now = max(length(q), 1e-9);
-            let r2_xz = max(q.x * q.x + q.z * q.z, 1e-12);
-            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / r2_xz;
-            let rate_r = dot(q, ray_dir) / r_now;
-            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
-            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
-            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
-            if step_x == 0 { frame_in_frac.x = frame_in_frac.x + rate_lon * delta_t / (3.0 * cur_lon_step); }
-            if step_y == 0 { frame_in_frac.y = frame_in_frac.y + rate_r   * delta_t / (3.0 * cur_r_step); }
-            if step_z == 0 { frame_in_frac.z = frame_in_frac.z + rate_lat * delta_t / (3.0 * cur_lat_step); }
-            if step_x < 0 { frame_in_frac.x = f32(new_cell.x + 1) / 3.0; }
-            if step_x > 0 { frame_in_frac.x = f32(new_cell.x)     / 3.0; }
-            if step_y < 0 { frame_in_frac.y = f32(new_cell.y + 1) / 3.0; }
-            if step_y > 0 { frame_in_frac.y = f32(new_cell.y)     / 3.0; }
-            if step_z < 0 { frame_in_frac.z = f32(new_cell.z + 1) / 3.0; }
-            if step_z > 0 { frame_in_frac.z = f32(new_cell.z)     / 3.0; }
-            t = t_next + max(cur_r_step * 1e-2, abs(t_next) * 2e-7);
-            if t > t_exit { break; }
+            // Subtree empty — skip cell.
+            let m = min_axis_mask(cur_side_dist);
+            cur_cell = cur_cell + vec3<i32>(m) * cur_step;
+            cur_side_dist = cur_side_dist + m * cur_delta_dist;
+            normal = -vec3<f32>(cur_step) * m;
             continue;
         }
-
-        // Stack ceiling — same as Cartesian's MAX_STACK_DEPTH gate.
-        let at_max = depth + 1u >= SPHERE_DESCENT_DEPTH;
-        if at_max {
-            let pos_h = ray_origin + ray_dir * t;
-            let off_h = pos_h - cs_center;
-            let r_h = max(length(off_h), 1e-9);
-            let n_h = off_h / r_h;
-            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
-            return make_sphere_hit(
-                pos_h, n_h, t, inv_norm, block_type,
-                r_h, lat_h,
-                vec3<f32>(in_cell.x, in_cell.z, in_cell.y),
-                cur_lon_step, cur_lat_step, cur_r_step,
-            );
+        let child_idx = tree[child_base + 1u];
+        if depth + 1u >= SPHERE_DESCENT_DEPTH {
+            // Stack ceiling — splat representative.
+            let cell_min_l = vec3<f32>(cur_cell);
+            let cell_max_l = cell_min_l + vec3<f32>(1.0);
+            let bx = ray_box(cur_O, cur_inv_dir, cell_min_l, cell_max_l);
+            hit_t = max(bx.t_enter, 0.0);
+            let pos_at_hit = cur_O + cur_D * hit_t;
+            hit_in_cell = clamp(pos_at_hit - cell_min_l, vec3<f32>(0.0), vec3<f32>(1.0));
+            hit_block = block_type;
+            did_hit = true;
+            break;
         }
 
-        // Push child frame.
-        let child_idx = tree[child_base + 1u];
+        // ── Push with re-zero ──
+        // Save the cell we descended into, transform ray so the cell
+        // becomes the new [0, 3)³ frame.
+        s_cell[depth] = pack_cell(cur_cell);
+        let cell_f = vec3<f32>(cur_cell);
+        cur_O = (cur_O - cell_f) * 3.0;
+        cur_D = cur_D * 3.0;
+        cur_inv_dir = cur_inv_dir * (1.0 / 3.0);
+        cur_delta_dist = cur_delta_dist * (1.0 / 3.0);
+
         depth = depth + 1u;
         s_node_idx[depth] = child_idx;
-        cur_lon_step = cur_lon_step / 3.0;
-        cur_lat_step = cur_lat_step / 3.0;
-        cur_r_step   = cur_r_step   / 3.0;
+        let child_header_off = node_offsets[child_idx];
+        cur_occupancy = tree[child_header_off];
+        cur_first_child = tree[child_header_off + 1u];
 
-        // Precision-stable: child's in-frame frac = parent's in_cell.
-        frame_in_frac = in_cell;
-
-        // Pick entry sub-cell at depth d+1 from the (now-precise) frac.
-        let cell_c = clamp(vec3<i32>(
-            i32(floor(frame_in_frac.x * 3.0)),
-            i32(floor(frame_in_frac.y * 3.0)),
-            i32(floor(frame_in_frac.z * 3.0)),
-        ), vec3<i32>(0), vec3<i32>(2));
-        s_cell[depth] = pack_cell(cell_c);
-
-        // New cell center: parent (the cell we just pushed into) was
-        // at cur_*_center. Shift to new sub-cell:
-        //   new_center = parent_center + (cell_c - 1) * new_step
-        cur_lon_center = cur_lon_center + (f32(cell_c.x) - 1.0) * cur_lon_step;
-        cur_r_center   = cur_r_center   + (f32(cell_c.y) - 1.0) * cur_r_step;
-        cur_lat_center = cur_lat_center + (f32(cell_c.z) - 1.0) * cur_lat_step;
+        // Compute new sub-cell at depth+1 from the ray's current pos
+        // (= same world position; in new frame coords).
+        let new_pos = cur_O + cur_D * t;
+        cur_cell = vec3<i32>(
+            clamp(i32(floor(new_pos.x)), 0, 2),
+            clamp(i32(floor(new_pos.y)), 0, 2),
+            clamp(i32(floor(new_pos.z)), 0, 2),
+        );
+        let ncf = vec3<f32>(cur_cell);
+        cur_side_dist = vec3<f32>(
+            select((ncf.x       - cur_O.x) * cur_inv_dir.x,
+                   (ncf.x + 1.0 - cur_O.x) * cur_inv_dir.x, cur_D.x >= 0.0),
+            select((ncf.y       - cur_O.y) * cur_inv_dir.y,
+                   (ncf.y + 1.0 - cur_O.y) * cur_inv_dir.y, cur_D.y >= 0.0),
+            select((ncf.z       - cur_O.z) * cur_inv_dir.z,
+                   (ncf.z + 1.0 - cur_O.z) * cur_inv_dir.z, cur_D.z >= 0.0),
+        );
+        // normal is preserved across push: child's entry face is the
+        // same axis as parent's (ray didn't change direction at push).
     }
 
-    return result;
+    if !did_hit { return result; }
+
+    // ── Bevel from local in-cell fractions ───────────────────────────
+    var u: f32;
+    var v: f32;
+    if abs(normal.x) > 0.5 {
+        u = hit_in_cell.y;
+        v = hit_in_cell.z;
+    } else if abs(normal.y) > 0.5 {
+        u = hit_in_cell.x;
+        v = hit_in_cell.z;
+    } else {
+        u = hit_in_cell.x;
+        v = hit_in_cell.y;
+    }
+    let face_edge = min(min(u, 1.0 - u), min(v, 1.0 - v));
+    let shape = smoothstep(0.02, 0.14, face_edge);
+    let bevel_strength = 0.7 + 0.3 * shape;
+
+    // Local axis-aligned normal → world basis (e_lon = local x,
+    // e_r = local y, e_lat = local z, per slab-axis convention above).
+    let n_world = normal.x * e_lon + normal.y * e_r + normal.z * e_lat;
+
+    // ── Camera-frame t ───────────────────────────────────────────────
+    // The ray entered descent at t_in (slab DDA's current t). Inside
+    // the descent, t was preserved across pushes (D was scaled, but
+    // pos(t) = O + D·t holds at every depth with the same t value).
+    // So hit_t (the local t at which we hit the cell) IS the world t
+    // at hit, in the same parameterisation as `ray_dir` input.
+    // inv_norm scales to camera-frame normalised t for the result.
+    let world_hit = ray_origin + ray_dir * hit_t;
+
+    var out: HitResult;
+    out.hit = true;
+    out.t = hit_t * inv_norm;
+    out.color = palette[hit_block].rgb * bevel_strength;
+    out.normal = n_world;
+    out.frame_level = 0u;
+    out.frame_scale = 1.0;
+    // Neutralise main.wgsl::shade_pixel's cube_face_bevel — we already
+    // applied the bevel using local axis-aligned coords above.
+    out.cell_min = world_hit - vec3<f32>(0.5);
+    out.cell_size = 1.0;
+    return out;
 }
