@@ -12,4 +12,7 @@
   line-height: 1.5;
   color: var(--text-primary);
   white-space: pre;
+  max-width: 50vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

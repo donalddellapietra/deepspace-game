@@ -8,15 +8,6 @@ function pad(label: string, value: string, width = 44): string {
   return label + " ".repeat(gap) + value;
 }
 
-function truncPath(csv: string, maxSlots = 8): string {
-  if (!csv) return "[]";
-  const parts = csv.split(",");
-  if (parts.length <= maxSlots) return "[" + csv + "]";
-  const head = parts.slice(0, 4).join(",");
-  const tail = parts.slice(-3).join(",");
-  return "[" + head + ",.." + parts.length + ".." + tail + "]";
-}
-
 function fmtCell(v: number): string {
   if (!Number.isFinite(v)) return "—";
   const abs = Math.abs(v);
@@ -63,9 +54,9 @@ function formatDebug(s: DebugOverlayState): string {
     "",
     "── frame ──",
     pad("active kind", s.activeFrameKind),
-    pad("render path", truncPath(s.renderPathCsv)),
-    pad("intended path", truncPath(s.intendedRenderPathCsv || "")),
-    pad("anchor path", truncPath(s.anchorSlotsCsv)),
+    "render   [" + s.renderPathCsv + "]",
+    "intended [" + (s.intendedRenderPathCsv || "") + "]",
+    "anchor   [" + s.anchorSlotsCsv + "]",
     "",
     "── rotation ──",
     pad("TB on anchor path", s.tbOnAnchorPath ? "yes" : "no"),
