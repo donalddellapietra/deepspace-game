@@ -2028,6 +2028,52 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 ray_origin, ray_dir,
                 uniforms.planet_render.y,
             );
+        } else if cur_kind == NODE_KIND_TANGENT_BLOCK {
+            // The render frame is INSIDE a rotated cube. Without this
+            // branch, the camera ray would march the cube's interior
+            // axis-aligned, causing a 45° "snap" the moment the camera
+            // crosses into the cube (the outside-the-cube dispatch in
+            // march_cartesian no longer fires once the frame root IS
+            // the cube). Rotate the camera ray INTO the cube's local
+            // frame around the frame centre (1.5, 1.5, 1.5) so the
+            // axis-aligned interior content renders rotated.
+            //
+            // Hardcoded θ = 30° around Y, matching the dispatch in
+            // march_cartesian's TangentBlock branch. Production would
+            // pull per-cell rotation from the node payload.
+            let theta_in: f32 = 0.5236; // 30°
+            let cs_in = cos(theta_in);
+            let sn_in = sin(theta_in);
+            let east_in   = vec3<f32>(cs_in, 0.0, sn_in);
+            let normal_in = vec3<f32>(0.0,   1.0, 0.0);
+            let north_in  = vec3<f32>(-sn_in, 0.0, cs_in);
+            let frame_centre = vec3<f32>(1.5);
+            let d_centre = ray_origin - frame_centre;
+            let local_origin = vec3<f32>(
+                dot(east_in,   d_centre),
+                dot(normal_in, d_centre),
+                dot(north_in,  d_centre),
+            ) + frame_centre;
+            let local_dir = vec3<f32>(
+                dot(east_in,   ray_dir),
+                dot(normal_in, ray_dir),
+                dot(north_in,  ray_dir),
+            );
+            r = march_cartesian(
+                current_idx, local_origin, local_dir, MAX_STACK_DEPTH, skip_slot,
+            );
+            if r.hit {
+                // Rotate the hit normal back to world. Bevel was
+                // computed inside march_cartesian against axis-aligned
+                // cell_min/size in the rotated frame — leave it alone;
+                // the resulting per-face shading still looks correct
+                // because the eye sees those rotated faces lit by the
+                // un-rotated sun direction (which becomes the rotated
+                // sun in local frame, which is what the bevel captures
+                // — slight asymmetry but no snap).
+                let n_local = r.normal;
+                r.normal = east_in * n_local.x + normal_in * n_local.y + north_in * n_local.z;
+            }
         } else {
             // Cartesian frame: no depth cap beyond the hardware stack
             // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole

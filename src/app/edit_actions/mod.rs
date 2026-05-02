@@ -93,7 +93,9 @@ impl App {
                 );
                 (hit, frame_path)
             }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+            ActiveFrameKind::Cartesian
+            | ActiveFrameKind::WrappedPlane { .. }
+            | ActiveFrameKind::TangentBlock => {
                 // Raycast from the render frame — f32 can only represent
                 // positions a few levels deeper than the frame root.
                 // The pop loop handles finding hits at coarser depths
