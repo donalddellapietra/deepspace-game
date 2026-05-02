@@ -26,7 +26,7 @@
 //! at any zoom the leaf frontier exposes the 3-color signature for
 //! visual rotation verification. Library size is `O(depth)`.
 
-use crate::world::anchor::{Path, WorldPos};
+use crate::world::anchor::WorldPos;
 use crate::world::bootstrap::WorldBootstrap;
 use crate::world::palette::{block, ColorRegistry};
 use crate::world::state::WorldState;
@@ -128,25 +128,20 @@ pub(crate) fn bootstrap_rotated_test_world() -> WorldBootstrap {
     let world = WorldState { root, library };
     let tree_depth = world.tree_depth() as u8;
 
-    // Spawn at the WORLD CENTER inside the embedding chain, then
-    // deepen to a moderate anchor depth. The center sits in slot
-    // (1,1,1) at every embedding level, so the anchor descends
-    // through real Cartesian nodes naturally — the active frame
-    // reaches the scene neighborhood and the walker has its full
-    // stack budget for fine detail.
-    //
-    // Y offset 2.0 puts the camera above the scene's middle row
-    // (y=1 of the scene's 3×3×3) so the rotated cube + flanking
-    // stones are framed against air. Z offset 2.5 places the
-    // camera just outside the scene cube on the +Z side, looking
-    // back through it.
-    let center = 1.5f32;
-    let spawn_pos = WorldPos::from_frame_local(
-        &Path::root(),
-        [center, center + 0.5, center + 1.0],
-        ROTATED_TEST_EMBEDDING_DEPTH as u8 + 2,
-    )
-    .deepened_to(ROTATED_TEST_EMBEDDING_DEPTH as u8 + 6);
+    // Spawn at the embedding chain's bottom — anchor walks slot 13
+    // exactly `ROTATED_TEST_EMBEDDING_DEPTH` times via
+    // `uniform_column`, sidestepping the f32 mantissa drift that
+    // breaks `from_frame_local + deepened_to` past depth ~15. The
+    // offset places the camera in the scene-frame at (1.5, 2.4, 2.85):
+    //   - x = 1.5: centered on the rotated cube's column
+    //   - y = 2.4: above the middle row (y=1) where the structure
+    //     sits, in air → camera is OUTSIDE the rotated cell
+    //   - z = 2.85: south of the cube, looking back northward
+    let spawn_pos = WorldPos::uniform_column(
+        slot_index(1, 1, 1) as u8,
+        ROTATED_TEST_EMBEDDING_DEPTH as u8,
+        [1.5, 2.4, 2.85],
+    );
 
     WorldBootstrap {
         world,
