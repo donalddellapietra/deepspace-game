@@ -427,10 +427,12 @@ impl App {
         let desired_depth = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
-        logical_path.truncate(desired_depth);
+        let mut camera_pos_for_frame = position.deepened_to(RENDER_ANCHOR_DEPTH);
+        camera_pos_for_frame.anchor.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
-            &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
+            &world.library, world.root,
+            &camera_pos_for_frame, &startup_tangent_rotation_cols,
+            RENDER_FRAME_CONTEXT,
         );
         eprintln!(
             "startup_perf initial_frame kind={:?} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
@@ -555,11 +557,12 @@ impl App {
         let desired_depth = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
-        logical_path.truncate(desired_depth);
+        let mut camera_pos_for_frame = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH);
+        camera_pos_for_frame.anchor.truncate(desired_depth);
         frame::with_render_margin(
             &self.world.library, self.world.root,
-            &logical_path, RENDER_FRAME_CONTEXT,
+            &camera_pos_for_frame, &self.startup_tangent_rotation_cols,
+            RENDER_FRAME_CONTEXT,
         )
     }
 

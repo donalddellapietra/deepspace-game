@@ -241,11 +241,10 @@ impl App {
             );
         }
 
-        let effective_render = frame::compute_render_frame(
+        let effective_render = frame::frame_for_path(
             &self.world.library,
             self.world.root,
             &effective_path,
-            effective_path.depth(),
         );
         self.active_frame = ActiveFrame {
             render_path: effective_render.render_path,

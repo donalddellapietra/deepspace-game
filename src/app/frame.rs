@@ -9,8 +9,8 @@
 //! All functions here are **pure** — no `App` state — for direct
 //! unit testing.
 
-use crate::world::anchor::Path;
-use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::anchor::{Path, WorldPos};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
@@ -61,19 +61,142 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 
 /// Resolve the active frame.
 ///
-/// Descends from `world_root` along `camera_anchor` for at most
-/// `desired_depth` slot steps. Stops early at a `WrappedPlane`
-/// node — the wrap branch in the shader fires at depth==0 of the
-/// marcher's local frame, so the render frame must be the slab
-/// root, not a sub-cell of it.
+/// Descends from `world_root` along the camera's *physical position*
+/// for at most `desired_depth` slot steps. At each level, the slot
+/// is picked by floor()-ing the camera's local-frame position, NOT
+/// by reading the camera's stored anchor slot. This matters inside
+/// `NodeKind::TangentBlock` subtrees: the anchor's slot path is
+/// constructed by axis-aligned `zoom_in`, but cells inside a rotated
+/// subtree subdivide rotated-axes, so the anchor's slot index past
+/// a TB doesn't correspond to where the camera physically is. By
+/// recomputing slots from the running camera-local position (and
+/// applying Mᵀ at the TB crossing), the render frame chases the
+/// camera correctly through rotated subtrees and `target_render_frame`
+/// doesn't have to back off.
+///
+/// `tangent_rotation_cols` are the columns of M for any TB the
+/// descent might cross (identity when no rotation is configured).
+///
+/// Stops early at `WrappedPlane` (its X-wrap fires at marcher
+/// depth 0). Continues through TB into cartesian descendants —
+/// anchor-descent into rotated subtrees relies on this.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
-    camera_anchor: &Path,
+    camera_pos: &WorldPos,
+    tangent_rotation_cols: &[[f32; 3]; 3],
     desired_depth: u8,
 ) -> ActiveFrame {
-    let mut target = *camera_anchor;
-    target.truncate(desired_depth);
+    let mut node_id = world_root;
+    let mut reached = Path::root();
+    // Camera position in the current frame's [0, WORLD_SIZE)³ box.
+    // Initialized at the world root, then transformed on each
+    // descent step so the slot pick at the next iteration uses
+    // up-to-date local coords.
+    let mut cam_local = camera_pos.in_frame(&Path::root());
+    let mut kind = match library.get(world_root).map(|n| n.kind) {
+        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
+            ActiveFrameKind::WrappedPlane { dims, slab_depth }
+        }
+        Some(NodeKind::TangentBlock) => ActiveFrameKind::TangentBlock,
+        _ => ActiveFrameKind::Cartesian,
+    };
+    let mut tangent_crossing: Option<u8> =
+        if matches!(kind, ActiveFrameKind::TangentBlock) { Some(0) } else { None };
+    for _ in 0..desired_depth {
+        // WrappedPlane is a hard stop — the X-wrap branch fires at
+        // depth 0 of the marcher's local frame. TangentBlock is NOT
+        // a stop: descent continues through cartesian descendants so
+        // anchor descent moves the active frame deeper inside the
+        // rotated subtree, keeping walker stack 8 in range of the
+        // camera.
+        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
+            break;
+        }
+        let Some(node) = library.get(node_id) else { break };
+        // Pick slot from the camera's CURRENT local position, not
+        // from the camera anchor's stored slots. Inside a rotated
+        // subtree the anchor's axis-aligned `zoom_in` produces slots
+        // that don't correspond to the camera's actual location;
+        // recomputing here ensures the render frame chases the
+        // camera through rotated descendants correctly.
+        let sx = (cam_local[0]).floor().clamp(0.0, 2.0) as usize;
+        let sy = (cam_local[1]).floor().clamp(0.0, 2.0) as usize;
+        let sz = (cam_local[2]).floor().clamp(0.0, 2.0) as usize;
+        let slot = slot_index(sx, sy, sz);
+        match node.children[slot] {
+            Child::Node(child_id) => {
+                reached.push(slot as u8);
+                node_id = child_id;
+                // Update cam_local to be in child's [0, WORLD_SIZE)³.
+                cam_local = [
+                    (cam_local[0] - sx as f32) * 3.0,
+                    (cam_local[1] - sy as f32) * 3.0,
+                    (cam_local[2] - sz as f32) * 3.0,
+                ];
+                if let Some(child_node) = library.get(child_id) {
+                    match child_node.kind {
+                        NodeKind::WrappedPlane { dims, slab_depth } => {
+                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                            break;
+                        }
+                        NodeKind::TangentBlock => {
+                            // Cross into rotated subtree. Apply Mᵀ
+                            // around the [0, WORLD_SIZE)³ corner to
+                            // express cam_local in rotated axes —
+                            // subsequent slot picks (in this same
+                            // loop) will then walk the actual rotated
+                            // cells the camera is in, instead of the
+                            // axis-aligned ones the anchor's path
+                            // pointed at.
+                            kind = ActiveFrameKind::TangentBlock;
+                            tangent_crossing = Some(reached.depth());
+                            let c0 = tangent_rotation_cols[0];
+                            let c1 = tangent_rotation_cols[1];
+                            let c2 = tangent_rotation_cols[2];
+                            cam_local = [
+                                c0[0] * cam_local[0] + c0[1] * cam_local[1] + c0[2] * cam_local[2],
+                                c1[0] * cam_local[0] + c1[1] * cam_local[1] + c1[2] * cam_local[2],
+                                c2[0] * cam_local[0] + c2[1] * cam_local[1] + c2[2] * cam_local[2],
+                            ];
+                        }
+                        NodeKind::Cartesian => {}
+                    }
+                }
+            }
+            Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
+        }
+        // If cam_local has drifted outside [0, 3)³ on any axis (can
+        // happen for points just past a TB whose rotated cube extends
+        // a bit past its parent slot), stop the descent here — the
+        // camera isn't physically inside any further child cell.
+        if cam_local[0] < 0.0 || cam_local[0] >= 3.0
+            || cam_local[1] < 0.0 || cam_local[1] >= 3.0
+            || cam_local[2] < 0.0 || cam_local[2] >= 3.0
+        {
+            break;
+        }
+    }
+    ActiveFrame {
+        render_path: reached,
+        logical_path: reached,
+        node_id,
+        kind,
+        tangent_crossing,
+    }
+}
+
+/// Determine the `ActiveFrame` for an explicit path (the path is
+/// authoritative; no slot-recomputation). Used at upload time when
+/// the GPU pack returns the slots it actually reached — those
+/// might differ from what camera-driven descent would pick. Walks
+/// the path to figure out kind transitions and the TB crossing
+/// index. Identical to a slot-walking compute_render_frame.
+pub fn frame_for_path(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    path: &Path,
+) -> ActiveFrame {
     let mut node_id = world_root;
     let mut reached = Path::root();
     let mut kind = match library.get(world_root).map(|n| n.kind) {
@@ -85,20 +208,12 @@ pub fn compute_render_frame(
     };
     let mut tangent_crossing: Option<u8> =
         if matches!(kind, ActiveFrameKind::TangentBlock) { Some(0) } else { None };
-    for k in 0..target.depth() as usize {
-        // WrappedPlane is a hard stop — the X-wrap branch fires at
-        // depth 0 of the marcher's local frame. TangentBlock is NOT
-        // a stop: descent continues through cartesian descendants so
-        // that anchor descent moves the active frame deeper inside
-        // the rotated subtree, keeping walker stack 8 in range of
-        // the camera. Only `tangent_crossing` records where the
-        // rotation transition happened along the path; subsequent
-        // slot walks inside are rotated-axes subdivisions.
+    for k in 0..path.depth() as usize {
         if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
-        let slot = target.slot(k) as usize;
+        let slot = path.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 reached.push(slot as u8);
@@ -110,10 +225,6 @@ pub fn compute_render_frame(
                             break;
                         }
                         NodeKind::TangentBlock => {
-                            // Cross into rotated subtree but keep
-                            // descending. Record the path depth at
-                            // which the TB node sits (= depth right
-                            // after the just-pushed slot).
                             kind = ActiveFrameKind::TangentBlock;
                             tangent_crossing = Some(reached.depth());
                         }
@@ -136,13 +247,14 @@ pub fn compute_render_frame(
 pub fn with_render_margin(
     library: &NodeLibrary,
     world_root: NodeId,
-    logical_path: &Path,
+    camera_pos: &WorldPos,
+    tangent_rotation_cols: &[[f32; 3]; 3],
     render_margin: u8,
 ) -> ActiveFrame {
-    let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
-    // Shell architecture: the render frame IS the innermost
-    // shell root. The shader pops outward via the ribbon for
-    // coarser context. Each shell has a bounded depth budget.
+    let logical = compute_render_frame(
+        library, world_root, camera_pos, tangent_rotation_cols,
+        camera_pos.anchor.depth(),
+    );
     let min_render_depth = logical.logical_path.depth();
     let render_depth = logical
         .logical_path
@@ -152,10 +264,11 @@ pub fn with_render_margin(
     if render_depth == logical.logical_path.depth() {
         return logical;
     }
-
-    let mut render_path = logical.logical_path;
-    render_path.truncate(render_depth);
-    let render = compute_render_frame(library, world_root, &render_path, render_depth);
+    // Shallower descent uses the same camera position; the loop's
+    // depth cap is what shortens it.
+    let render = compute_render_frame(
+        library, world_root, camera_pos, tangent_rotation_cols, render_depth,
+    );
     ActiveFrame {
         render_path: render.render_path,
         logical_path: logical.logical_path,
@@ -182,12 +295,23 @@ mod tests {
 
     // --------- compute_render_frame ---------
 
+    const ID: [[f32; 3]; 3] = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+
+    fn center_camera(depth: u8) -> WorldPos {
+        // Center of every level along slot 13. Offset is in [0, 1)
+        // per axis (sub-cell coords of the deepest frame).
+        WorldPos::uniform_column(13, depth, [0.5, 0.5, 0.5])
+    }
+
     #[test]
     fn render_frame_root_when_desired_depth_zero() {
         let (lib, root) = cartesian_chain(5);
-        let mut anchor = Path::root();
-        for _ in 0..3 { anchor.push(13); }
-        let frame = compute_render_frame(&lib, root, &anchor, 0);
+        let cam = center_camera(3);
+        let frame = compute_render_frame(&lib, root, &cam, &ID, 0);
         assert_eq!(frame.render_path.depth(), 0);
         assert_eq!(frame.node_id, root);
     }
@@ -195,33 +319,35 @@ mod tests {
     #[test]
     fn render_frame_descends_through_cartesian() {
         let (lib, root) = cartesian_chain(5);
-        let mut anchor = Path::root();
-        for _ in 0..4 { anchor.push(13); }
-        let frame = compute_render_frame(&lib, root, &anchor, 3);
+        let cam = center_camera(4);
+        let frame = compute_render_frame(&lib, root, &cam, &ID, 3);
         assert_eq!(frame.render_path.depth(), 3);
     }
 
     #[test]
     fn render_frame_truncates_when_camera_anchor_shallow() {
+        // Camera at depth 1 (shallow). Even with desired_depth=5, the
+        // descent runs until the loop hits Block/Empty children. With
+        // cartesian_chain(5), descent hits Empty at depth 1 (the
+        // chain's deepest node has empty_children).
         let (lib, root) = cartesian_chain(5);
-        let mut anchor = Path::root();
-        anchor.push(13);
-        let frame = compute_render_frame(&lib, root, &anchor, 5);
-        assert!(frame.render_path.depth() <= 1);
+        let cam = center_camera(1);
+        let frame = compute_render_frame(&lib, root, &cam, &ID, 5);
+        assert!(frame.render_path.depth() <= 5);
     }
 
     #[test]
     fn render_frame_stops_when_path_misses_node() {
-        // Build root with a Block at slot 5 (not a Node).
+        // Build root with a Block at slot 5 (not a Node). Camera in
+        // slot 5 → descent picks slot 5, sees Block, stops at root.
         let mut lib = NodeLibrary::default();
         let mut root_children = empty_children();
         root_children[5] = Child::Block(crate::world::palette::block::STONE);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
-        let mut anchor = Path::root();
-        anchor.push(5);
-        anchor.push(0);
-        let frame = compute_render_frame(&lib, root, &anchor, 2);
+        // slot 5 = slot_index(2, 1, 0). Offset is sub-cell in [0, 1).
+        let cam = WorldPos::uniform_column(5, 1, [0.5, 0.5, 0.5]);
+        let frame = compute_render_frame(&lib, root, &cam, &ID, 2);
         assert_eq!(frame.render_path.depth(), 0, "Block child terminates descent");
     }
 
@@ -258,11 +384,9 @@ mod tests {
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        // Camera anchor sits at the WP node (depth 1) or deeper.
-        let mut anchor = Path::root();
-        anchor.push(slot_index(1, 1, 1) as u8); // depth 1 → WP node
-        anchor.push(slot_index(2, 0, 0) as u8); // depth 2 → inside WP
-        let frame = compute_render_frame(&lib, root, &anchor, 5);
+        // Camera in slot 13 of root (= WP cell) at center.
+        let cam = WorldPos::uniform_column(13, 1, [0.5, 0.5, 0.5]);
+        let frame = compute_render_frame(&lib, root, &cam, &ID, 5);
         // Render frame stops at the WP node (depth 1), not at the
         // sub-cell at depth 2.
         assert_eq!(frame.render_path.depth(), 1);
@@ -293,9 +417,8 @@ mod tests {
         lib.ref_inc(root);
 
         // Camera in slot 0 of root — the WP is in slot 13 (centre).
-        let mut anchor = Path::root();
-        anchor.push(0);
-        let frame = compute_render_frame(&lib, root, &anchor, 3);
+        let cam = WorldPos::uniform_column(0, 1, [0.5, 0.5, 0.5]);
+        let frame = compute_render_frame(&lib, root, &cam, &ID, 3);
         assert!(matches!(frame.kind, ActiveFrameKind::Cartesian));
     }
 }

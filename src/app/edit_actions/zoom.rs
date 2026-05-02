@@ -89,13 +89,17 @@ impl App {
                 || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
         {
             let logical_path = frame.logical_path;
-            let mut shallower = frame.render_path;
-            shallower.truncate(frame.render_path.depth().saturating_sub(1));
+            let target_depth = frame.render_path.depth().saturating_sub(1);
+            // Re-resolve the frame at one shallower depth using the
+            // same camera position. compute_render_frame's internal
+            // slot picking handles the path correctly through any
+            // TangentBlock crossings.
             let render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
-                &shallower,
-                shallower.depth(),
+                &self.camera.position,
+                &self.startup_tangent_rotation_cols,
+                target_depth,
             );
             frame = ActiveFrame {
                 render_path: render.render_path,
