@@ -11,7 +11,7 @@ use crate::bridge::{CrosshairStateJs, GameStateUpdate};
 use crate::overlay;
 use crate::world::aabb;
 
-use crate::app::{App, HighlightCacheKey};
+use crate::app::{ActiveFrameKind, App, HighlightCacheKey};
 
 impl App {
     pub(in crate::app) fn update_highlight(&mut self) {
@@ -25,14 +25,11 @@ impl App {
             self.push_crosshair(false, false);
             return;
         }
-        // Sphere-render mode (UV-sphere or tangent cubes) — the
-        // CPU raycast hit position diverges from the GPU's, so the
-        // highlight box would draw in the wrong place. Skip the
-        // highlight; break/place still work because they use the
-        // raycast for the SLAB CELL path, not for screen-space
-        // cursor matching, and the slab-cell-level path is right
-        // even when the sub-cell fraction is off.
-        if self.startup_planet_render_sphere == Some(1) {
+        // WrappedPlane frame: blocks are rotated tangent cubes, so the
+        // axis-aligned `hit_aabb_in_frame_local` would draw at the
+        // wrong place. Skip highlight; break/place still target the
+        // correct slab cell because the raycast returns a path.
+        if matches!(self.active_frame.kind, ActiveFrameKind::WrappedPlane { .. }) {
             self.last_highlight_raycast_ms = 0.0;
             self.last_highlight_set_ms = 0.0;
             self.cached_highlight = None;

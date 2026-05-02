@@ -84,16 +84,13 @@ pub fn wrapped_planet_world(
     slab_dims: [u32; 3],
     slab_depth: u8,
     cell_subtree_depth: u8,
-    tangent_planes: bool,
 ) -> WorldState {
     assert!(embedding_depth > 0, "embedding_depth must be >= 1");
     assert!(slab_depth > 0, "slab_depth must be >= 1");
-    if tangent_planes {
-        assert!(
-            cell_subtree_depth >= 1,
-            "tangent_planes requires cell_subtree_depth >= 1 (the TangentBlock wraps the chain)",
-        );
-    }
+    assert!(
+        cell_subtree_depth >= 1,
+        "wrapped_planet requires cell_subtree_depth >= 1 (TangentBlock wraps the per-cell chain)",
+    );
     let total_depth = (embedding_depth as usize)
         .saturating_add(slab_depth as usize)
         .saturating_add(cell_subtree_depth as usize);
@@ -126,15 +123,13 @@ pub fn wrapped_planet_world(
     // are `Child::Node(...)`, not `Child::Block(...)`, so the
     // recursive subdivision goes all the way down.
     //
-    // When `tangent_planes` is set, the OUTERMOST node of each
-    // chain (= the slab cell anchor) is `NodeKind::TangentBlock`.
-    // The shader detects this kind on entry into sphere descent,
-    // transforms the ray into the cell's local tangent cube
-    // frame, and dispatches `march_cartesian` from there — so
+    // The OUTERMOST node of each cell's chain (= the slab cell
+    // anchor) is `NodeKind::TangentBlock`. The shader detects this
+    // kind, transforms the ray into the cell's local tangent cube
+    // frame, and dispatches `march_in_tangent_cube` from there — so
     // every voxel below the slab cell sees the precision-stable
-    // Cartesian path instead of (lon, lat, r) sphere descent.
-    // The chain BELOW the TangentBlock is regular Cartesian and
-    // uniform-flattens away in the GPU pack.
+    // Cartesian path. The chain BELOW the TangentBlock is regular
+    // Cartesian and uniform-flattens away in the GPU pack.
     fn build_uniform_anchor(library: &mut NodeLibrary, block: u16, depth: u8) -> Child {
         if depth == 0 {
             return Child::Block(block);
@@ -143,12 +138,8 @@ pub fn wrapped_planet_world(
         Child::Node(library.insert(uniform_children(inner)))
     }
     let make_anchor = |library: &mut NodeLibrary, block: u16| -> Child {
-        if tangent_planes {
-            let inner = build_uniform_anchor(library, block, cell_subtree_depth - 1);
-            Child::Node(library.insert_with_kind(uniform_children(inner), NodeKind::TangentBlock))
-        } else {
-            build_uniform_anchor(library, block, cell_subtree_depth)
-        }
+        let inner = build_uniform_anchor(library, block, cell_subtree_depth - 1);
+        Child::Node(library.insert_with_kind(uniform_children(inner), NodeKind::TangentBlock))
     };
     let stone_anchor = make_anchor(&mut library, block::STONE);
     let dirt_anchor  = make_anchor(&mut library, block::DIRT);
@@ -338,10 +329,9 @@ pub(super) fn bootstrap_wrapped_planet_world(
     slab_dims: [u32; 3],
     slab_depth: u8,
     cell_subtree_depth: u8,
-    tangent_planes: bool,
 ) -> WorldBootstrap {
     let world = wrapped_planet_world(
-        embedding_depth, slab_dims, slab_depth, cell_subtree_depth, tangent_planes,
+        embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
     );
     // Camera spawns AT the slab cell anchor depth (just above the
     // GRASS surface). The cell's subtree below — `cell_subtree_depth`
@@ -378,9 +368,7 @@ mod tests {
         let embedding_depth: u8 = 8;
         let slab_dims = [27u32, 10, 2];
         let slab_depth: u8 = 3;
-        let world = wrapped_planet_world(embedding_depth, slab_dims, slab_depth, 0, false);
-        // Walk down centre slot (13 = (1,1,1)) for `embedding_depth`
-        // levels.
+        let world = wrapped_planet_world(embedding_depth, slab_dims, slab_depth, 1);
         let mut node_id = world.root;
         for _ in 0..embedding_depth {
             let node = world.library.get(node_id).expect("node exists");
@@ -390,8 +378,6 @@ mod tests {
                 other => panic!("expected Child::Node at embedding centre, got {:?}", other),
             }
         }
-        // The node at depth `embedding_depth` is the slab root —
-        // must be `WrappedPlane` with the right dims.
         let slab_root = world.library.get(node_id).expect("slab root exists");
         match slab_root.kind {
             NodeKind::WrappedPlane { dims, slab_depth: sd } => {
@@ -402,36 +388,28 @@ mod tests {
         }
     }
 
-    /// The total tree depth must equal
-    /// `embedding_depth + slab_depth + cell_subtree_depth`. The slab
-    /// cell anchors live `slab_depth` below the slab root, and each
-    /// cell's recursive subtree adds `cell_subtree_depth` more.
+    /// Total tree depth = embedding_depth + slab_depth + cell_subtree_depth.
     #[test]
     fn wrapped_planet_total_tree_depth() {
-        // cell_subtree_depth=0 → cells are bottom-most Block leaves.
-        let world = wrapped_planet_world(8, [27, 10, 2], 3, 0, false);
-        assert_eq!(world.tree_depth(), 8 + 3);
-        // cell_subtree_depth=5 → each cell has a 5-deep uniform
-        // anchor subtree underneath. Total tree depth grows by 5.
-        let world = wrapped_planet_world(8, [27, 10, 2], 3, 5, false);
+        let world = wrapped_planet_world(8, [27, 10, 2], 3, 1);
+        assert_eq!(world.tree_depth(), 8 + 3 + 1);
+        let world = wrapped_planet_world(8, [27, 10, 2], 3, 5);
         assert_eq!(world.tree_depth(), 8 + 3 + 5);
     }
 
-    /// With `tangent_planes` enabled, walking down to a populated
-    /// slab cell anchor must land on a `NodeKind::TangentBlock` (and
-    /// the same path with the flag off lands on `Cartesian`). Tree
-    /// depth is unchanged because `TangentBlock` replaces the
-    /// OUTERMOST Cartesian of the per-cell uniform chain in place.
+    /// Every populated slab cell anchor must be `NodeKind::TangentBlock`
+    /// — the slab is rendered as a sphere of rotated tangent cubes, so
+    /// each cell carries the kind metadata that drives the per-cell
+    /// rotation in `march_wrapped_planet`.
     #[test]
-    fn tangent_planes_replace_slab_anchor_kind() {
+    fn slab_anchor_is_tangent_block() {
         let embedding_depth: u8 = 2;
         let slab_dims = [27u32, 2, 14];
         let slab_depth: u8 = 3;
         let cell_subtree_depth: u8 = 5;
 
         // Path to a populated slab cell: embedding centres (1,1,1),
-        // then slab-depth steps into x=1, y=0 (slab Y bottom = stone
-        // row), z=1.
+        // then slab-depth steps into x=1, y=0 (stone row), z=1.
         let mut populated_path = Vec::new();
         for _ in 0..embedding_depth {
             populated_path.push(slot_index(1, 1, 1));
@@ -451,15 +429,9 @@ mod tests {
             w.library.get(node_id).map(|n| n.kind)
         };
 
-        let off = wrapped_planet_world(
-            embedding_depth, slab_dims, slab_depth, cell_subtree_depth, false,
+        let world = wrapped_planet_world(
+            embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
         );
-        assert_eq!(walk(&off, &populated_path), Some(NodeKind::Cartesian));
-
-        let on = wrapped_planet_world(
-            embedding_depth, slab_dims, slab_depth, cell_subtree_depth, true,
-        );
-        assert_eq!(walk(&on, &populated_path), Some(NodeKind::TangentBlock));
-        assert_eq!(on.tree_depth(), off.tree_depth());
+        assert_eq!(walk(&world, &populated_path), Some(NodeKind::TangentBlock));
     }
 }

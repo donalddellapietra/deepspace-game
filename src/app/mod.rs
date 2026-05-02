@@ -281,9 +281,6 @@ pub struct App {
     /// on the renderer once it's ready (renderer is created
     /// asynchronously after App::new). Read from `--curvature A`.
     pub(super) startup_curvature_a: Option<f32>,
-    /// Phase 3 REVISED Step A.0: enable UV-sphere render of the
-    /// WrappedPlane frame. `Some(1)` from `--planet-render-sphere`.
-    pub(super) startup_planet_render_sphere: Option<u32>,
     /// Captured args we need in `finish_init`, populated by
     /// `start_init` before the renderer comes online.
     pub(super) pending_init: Option<PendingInit>,
@@ -320,7 +317,6 @@ impl App {
         let forced_edit_depth = test_cfg.force_edit_depth;
         let shader_stats_enabled = test_cfg.shader_stats;
         let startup_curvature_a = test_cfg.curvature_a;
-        let startup_planet_render_sphere = test_cfg.planet_render_sphere;
         // Nyquist floor: sub-pixel rejection only. This is the
         // sole visual LOD gate; the stack depth (MAX_STACK_DEPTH
         // in the shader) is the hard ceiling.
@@ -483,7 +479,6 @@ impl App {
             renderer_init_started: false,
             pending_init: None,
             startup_curvature_a,
-            startup_planet_render_sphere,
         };
         if let Some(ref path) = spawn_entity_path {
             let count = spawn_entity_count.max(1);

@@ -110,14 +110,6 @@ pub enum WorldPreset {
         /// is itself a recursive subdivision). Total tree depth =
         /// `embedding_depth + slab_depth + cell_subtree_depth`.
         cell_subtree_depth: u8,
-        /// When `true`, the slab cell anchors are
-        /// `NodeKind::TangentBlock` instead of plain Cartesian. The
-        /// shader detects this kind on entry into sphere descent and
-        /// transforms the ray into the cell's local tangent cube
-        /// frame, dispatching the precision-stable `march_cartesian`
-        /// for everything below. Hybrid: sphere DDA still owns the
-        /// layers above the slab cell anchor depth.
-        tangent_planes: bool,
     },
 }
 
@@ -225,13 +217,11 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             slab_dims,
             slab_depth,
             cell_subtree_depth,
-            tangent_planes,
         } => wrapped_planet::bootstrap_wrapped_planet_world(
             embedding_depth,
             slab_dims,
             slab_depth,
             cell_subtree_depth,
-            tangent_planes,
         ),
     }
 }

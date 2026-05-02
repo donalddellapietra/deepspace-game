@@ -66,21 +66,15 @@ impl App {
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            // Phase 3 REVISED A.4: when the active frame is a
-            // WrappedPlane AND sphere-render mode is on, dispatch
-            // to the CPU sphere raycast so click-targeting matches
-            // the GPU sphere visual. Otherwise fall through to the
-            // flat Cartesian DDA below — same code path as before.
-            ActiveFrameKind::WrappedPlane { dims, slab_depth }
-                if self.startup_planet_render_sphere == Some(1) =>
-            {
+            // WrappedPlane frame: dispatch the rotated-tangent-cube CPU
+            // raycast so click-targeting matches the GPU visual.
+            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                 let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 // lat_max kept in sync with the shader-side default
-                // (1.26 rad ≈ 72°). When this becomes a CLI / runtime
-                // knob the value will move into App state.
-                let hit = raycast::cpu_raycast_sphere_uv(
+                // (1.26 rad ≈ 72°).
+                let hit = raycast::cpu_raycast_wrapped_planet(
                     &self.world.library,
                     self.world.root,
                     frame_path.as_slice(),
@@ -93,7 +87,7 @@ impl App {
                 );
                 (hit, frame_path)
             }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+            ActiveFrameKind::Cartesian => {
                 // Raycast from the render frame — f32 can only represent
                 // positions a few levels deeper than the frame root.
                 // The pop loop handles finding hits at coarser depths

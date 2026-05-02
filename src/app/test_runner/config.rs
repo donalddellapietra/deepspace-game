@@ -22,10 +22,6 @@ pub struct TestConfig {
     /// validating the curvature math on `--plain-world` before
     /// wiring k(altitude) on the wrapped planet.
     pub curvature_a: Option<f32>,
-    /// Phase 3 REVISED Step A.0 — set the WrappedPlane render mode.
-    /// `Some(1)` enables UV-sphere render of the slab (instead of
-    /// the flat slab DDA). Polar ban defaults to `lat_max ≈ 72°`.
-    pub planet_render_sphere: Option<u32>,
     /// Explicit camera world-XYZ at spawn. Positions the camera
     /// at a specific point regardless of zoom level — since the
     /// in-game zoom function is broken, this is the way to put
@@ -200,24 +196,7 @@ impl TestConfig {
                         slab_dims: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
                         slab_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
                         cell_subtree_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
-                        tangent_planes: false,
                     };
-                }
-                // Switch the slab cell anchors from `Cartesian` to
-                // `TangentBlock`. The shader then transforms each
-                // ray into the cell's local tangent frame and runs
-                // the precision-stable Cartesian DDA below — so
-                // 40+ deeper layers don't lose precision the way
-                // sphere-DDA descent does. MUST come AFTER
-                // `--wrapped-planet`.
-                "--wrapped-planet-tangent" => {
-                    if let WorldPreset::WrappedPlanet {
-                        ref mut tangent_planes,
-                        ..
-                    } = cfg.world_preset
-                    {
-                        *tangent_planes = true;
-                    }
                 }
                 // Override the wrapped-planet's total tree depth.
                 // `--planet-layers N` sets total = N. We adjust
@@ -319,14 +298,6 @@ impl TestConfig {
                 // see ground curve down past the horizon.
                 "--curvature" => {
                     cfg.curvature_a = args.next().and_then(|v| v.parse().ok());
-                }
-                // Phase 3 REVISED Step A.0: render WrappedPlane as a
-                // sphere instead of as the flat slab DDA. With this
-                // flag set, ray-sphere intersect replaces march_cartesian
-                // for any frame whose root NodeKind is WrappedPlane.
-                // Without it, behaviour is unchanged (flat slab + wrap).
-                "--planet-render-sphere" => {
-                    cfg.planet_render_sphere = Some(1);
                 }
                 "--spawn-xyz" => {
                     let x: Option<f32> = args.next().and_then(|v| v.parse().ok());
