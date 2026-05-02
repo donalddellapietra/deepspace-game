@@ -645,7 +645,22 @@ impl App {
         let (fwd_world, right_world, up_world) = self.camera.basis();
         match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                let cam_local = self.camera.position.in_frame(&frame.render_path);
+                // Sphere mode: shallow the camera's anchor for the
+                // in_frame computation. The actual camera state
+                // keeps its deep anchor (set by zoom for edit
+                // precision), but the rendering uses a shallowed
+                // copy so `in_frame`'s walk is bounded — at deep
+                // anchor the long walk's per-frame slot bubbles
+                // produce a visible jerk in cam_local. Cap = WP
+                // depth + a few levels of headroom (slab cells).
+                let render_pos = if matches!(frame.kind, ActiveFrameKind::WrappedPlane { .. })
+                    && self.startup_planet_render_sphere == Some(1)
+                {
+                    self.camera.position.shallowed_to(5)
+                } else {
+                    self.camera.position
+                };
+                let cam_local = render_pos.in_frame(&frame.render_path);
                 if self.startup_profile_frames < 4 {
                     eprintln!(
                         "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",

@@ -472,6 +472,25 @@ impl WorldPos {
         self
     }
 
+    /// Inverse of `deepened_to`: pop slots off the anchor until the
+    /// depth equals `target_depth` (or stops when already shallower).
+    /// Each pop folds the popped slot's xyz back into the offset:
+    /// `new_offset = (slot_xyz + offset) / 3`. The result represents
+    /// the same physical position with a shallower anchor — useful
+    /// when the camera's deep anchor (set by zoom for edit precision)
+    /// makes downstream f32 walks lose precision; rendering can use
+    /// a shallowed copy without affecting actual camera state.
+    pub fn shallowed_to(mut self, target_depth: u8) -> Self {
+        while self.anchor.depth() > target_depth {
+            let popped = self.anchor.pop().expect("depth > 0");
+            let (sx, sy, sz) = slot_coords(popped as usize);
+            self.offset[0] = (sx as f32 + self.offset[0]) / 3.0;
+            self.offset[1] = (sy as f32 + self.offset[1]) / 3.0;
+            self.offset[2] = (sz as f32 + self.offset[2]) / 3.0;
+        }
+        self
+    }
+
     /// Position expressed in `frame`'s local coordinate system,
     /// where the frame's cell spans `[0, WORLD_SIZE)³`.
     ///
