@@ -79,15 +79,14 @@ impl Path {
 
     /// Step one cell along `axis` (0=x, 1=y, 2=z) by `direction` ±1
     /// in the Cartesian interpretation. Bubbles up through parent
-    /// cells on overflow.
-    ///
-    /// At the root, stepping is a no-op (the world does not extend
-    /// above the root cell in v1).
-    pub fn step_neighbor_cartesian(&mut self, axis: usize, direction: i32) {
+    /// cells on overflow. Returns `true` if the step succeeded,
+    /// `false` if the camera hit the world boundary (root can't
+    /// step further) — in that case the path is unchanged.
+    pub fn step_neighbor_cartesian(&mut self, axis: usize, direction: i32) -> bool {
         debug_assert!(axis < 3);
         debug_assert!(direction == 1 || direction == -1);
         if self.depth == 0 {
-            return;
+            return false;
         }
         let d = self.depth as usize - 1;
         let slot = self.slots[d] as usize;
@@ -97,16 +96,19 @@ impl Path {
         if (0..3).contains(&v) {
             coords[axis] = v as usize;
             self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
-        } else {
-            // Bubble up: pop, step parent, push the wrapped slot.
-            self.depth -= 1;
-            self.step_neighbor_cartesian(axis, direction);
-            let wrapped = if direction < 0 { 2 } else { 0 };
-            coords[axis] = wrapped;
-            let new_slot = slot_index(coords[0], coords[1], coords[2]) as u8;
-            self.slots[self.depth as usize] = new_slot;
-            self.depth += 1;
+            return true;
         }
+        self.depth -= 1;
+        if !self.step_neighbor_cartesian(axis, direction) {
+            self.depth += 1;
+            return false;
+        }
+        let wrapped = if direction < 0 { 2 } else { 0 };
+        coords[axis] = wrapped;
+        let new_slot = slot_index(coords[0], coords[1], coords[2]) as u8;
+        self.slots[self.depth as usize] = new_slot;
+        self.depth += 1;
+        true
     }
 
     /// Kind-aware neighbor step. Walks `self` from `world_root` to
@@ -129,17 +131,30 @@ impl Path {
     /// the wrap would land mid-slab, which is geometrically wrong;
     /// callers / worldgen MUST size the slab to fully fill the wrap
     /// axis.
+    /// Returns `(stepped_ok, wrap_occurred)`. When `stepped_ok` is
+    /// false the path is unchanged (world boundary hit).
     pub fn step_neighbor_in_world(
         &mut self,
         library: &NodeLibrary,
         world_root: NodeId,
         axis: usize,
         direction: i32,
-    ) -> bool {
+    ) -> (bool, bool) {
+        self.step_neighbor_in_world_inner(library, world_root, axis, direction)
+    }
+
+    /// Returns `(step_succeeded, wrap_occurred)`.
+    fn step_neighbor_in_world_inner(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        axis: usize,
+        direction: i32,
+    ) -> (bool, bool) {
         debug_assert!(axis < 3);
         debug_assert!(direction == 1 || direction == -1);
         if self.depth == 0 {
-            return false;
+            return (false, false);
         }
         let d = self.depth as usize - 1;
         let slot = self.slots[d] as usize;
@@ -149,31 +164,30 @@ impl Path {
         if (0..3).contains(&v) {
             coords[axis] = v as usize;
             self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
-            return false;
+            return (true, false);
         }
-        // Overflow on slot[d]. The node containing slot[d] sits at
-        // tree depth `d` — walk from world_root through slots[0..d]
-        // to find it. If that node is a WrappedPlane and the axis
-        // matches its wrap axis, wrap in place instead of bubbling.
         if axis == 0 {
             if let Some(parent_kind) = node_kind_at_depth(library, world_root, &self.slots[..d]) {
                 if matches!(parent_kind, NodeKind::WrappedPlane { .. }) {
                     let wrapped = if direction < 0 { 2 } else { 0 };
                     coords[axis] = wrapped;
                     self.slots[d] = slot_index(coords[0], coords[1], coords[2]) as u8;
-                    return true;
+                    return (true, true);
                 }
             }
         }
-        // Bubble up: pop, step parent, push the wrapped slot.
         self.depth -= 1;
-        let wrapped_inner = self.step_neighbor_in_world(library, world_root, axis, direction);
+        let (ok, wrapped_inner) = self.step_neighbor_in_world_inner(library, world_root, axis, direction);
+        if !ok {
+            self.depth += 1;
+            return (false, false);
+        }
         let wrapped = if direction < 0 { 2 } else { 0 };
         coords[axis] = wrapped;
         let new_slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.slots[self.depth as usize] = new_slot;
         self.depth += 1;
-        wrapped_inner
+        (true, wrapped_inner)
     }
 }
 

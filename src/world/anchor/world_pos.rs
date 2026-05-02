@@ -70,22 +70,23 @@ impl WorldPos {
     /// WrappedPlane subtrees.
     fn renormalize_cartesian(&mut self) {
         for axis in 0..3 {
-            // Pull overflow in steps so f32 non-finite inputs don't
-            // loop forever — callers are expected to pass finite
-            // deltas, but we guard anyway.
             let mut guard: i32 = 0;
             while self.offset[axis] >= 1.0 && guard < 1 << 20 {
                 self.offset[axis] -= 1.0;
-                self.anchor.step_neighbor_cartesian(axis, 1);
+                if !self.anchor.step_neighbor_cartesian(axis, 1) {
+                    self.offset[axis] = 1.0 - f32::EPSILON;
+                    break;
+                }
                 guard += 1;
             }
             while self.offset[axis] < 0.0 && guard < 1 << 20 {
                 self.offset[axis] += 1.0;
-                self.anchor.step_neighbor_cartesian(axis, -1);
+                if !self.anchor.step_neighbor_cartesian(axis, -1) {
+                    self.offset[axis] = 0.0;
+                    break;
+                }
                 guard += 1;
             }
-            // Floating-point drift can leave the value at exactly
-            // 1.0 after subtraction; clamp back into [0, 1).
             if self.offset[axis] >= 1.0 {
                 self.offset[axis] = 1.0 - f32::EPSILON;
             }
@@ -111,14 +112,24 @@ impl WorldPos {
             let mut guard: i32 = 0;
             while self.offset[axis] >= 1.0 && guard < 1 << 20 {
                 self.offset[axis] -= 1.0;
-                if self.anchor.step_neighbor_in_world(library, world_root, axis, 1) {
+                let (ok, wrapped) = self.anchor.step_neighbor_in_world(library, world_root, axis, 1);
+                if !ok {
+                    self.offset[axis] = 1.0 - f32::EPSILON;
+                    break;
+                }
+                if wrapped {
                     transition = Transition::WrappedPlaneWrap { axis: axis as u8 };
                 }
                 guard += 1;
             }
             while self.offset[axis] < 0.0 && guard < 1 << 20 {
                 self.offset[axis] += 1.0;
-                if self.anchor.step_neighbor_in_world(library, world_root, axis, -1) {
+                let (ok, wrapped) = self.anchor.step_neighbor_in_world(library, world_root, axis, -1);
+                if !ok {
+                    self.offset[axis] = 0.0;
+                    break;
+                }
+                if wrapped {
                     transition = Transition::WrappedPlaneWrap { axis: axis as u8 };
                 }
                 guard += 1;
