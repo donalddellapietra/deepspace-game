@@ -142,6 +142,133 @@ fn ray_parallel_t(oc: vec3<f32>, dir: vec3<f32>, lat_b: f32, after: f32) -> f32 
     return -1.0;
 }
 
+// Sphere sub-frame boundary helpers — same `(meridian, parallel,
+// sphere)` cell faces as the body-rooted DDA, but expressed in
+// sub-frame LOCAL rotated+translated coords. Caller ensures the
+// ray (`oc`, `dir`) is already in sub-frame local.
+//
+// Frame conventions (caller-side):
+//   * Sphere center at `(0, 0, -r_c)` in sub-frame local.
+//   * +x axis = lon-tangent at sub-frame center.
+//   * +y axis = lat-tangent at sub-frame center.
+//   * +z axis = radial (out from sphere center).
+//   * `lat_c`, `lon_c` = sub-frame center's absolute (lat, lon)
+//     on the planet sphere.
+//
+// All boundaries refer to ABSOLUTE (lat, lon, r) values on the
+// planet — same partition as CPU `cpu_raycast_sphere_uv`. The
+// helpers project the absolute geometry into sub-frame local on
+// the fly using `lat_c`, `lon_c`, `r_c` as the basis context.
+
+// Meridian (constant absolute lon = lon_b) plane in sub-frame local.
+// In world: normal = (-sin(lon_b), 0, cos(lon_b)), passes through
+// the sphere's Y axis. Project the normal into sub-frame basis;
+// the plane still passes through the sphere center
+// `(0, 0, -r_c)`.
+fn ray_meridian_subframe_t(
+    oc: vec3<f32>, dir: vec3<f32>,
+    lon_b: f32, lat_c: f32, lon_c: f32,
+    r_c: f32, after: f32,
+) -> f32 {
+    let cl = cos(lat_c); let sl = sin(lat_c);
+    let dlon = lon_b - lon_c;
+    let cd = cos(dlon); let sd = sin(dlon);
+    // Meridian normal in sub-frame local coords (derived in design
+    // doc; cd at lon_b == lon_c gives (1, 0, 0) = +x = lon-tangent).
+    let n = vec3<f32>(cd, sl * sd, -cl * sd);
+    let denom = dot(dir, n);
+    if abs(denom) < 1e-12 { return -1.0; }
+    // Plane passes through sphere center (0, 0, -r_c).
+    let t = -dot(oc - vec3<f32>(0.0, 0.0, -r_c), n) / denom;
+    if t > after { return t; }
+    return -1.0;
+}
+
+// Parallel (constant absolute lat = lat_b) cone in sub-frame local.
+// World cone: y² = (x² + z²) · tan²(lat_b), apex at sphere center.
+// In sub-frame local with the sphere center at `(0, 0, -r_c)`:
+// V = ray_pos - sphere_center = (V.x, V.y, V.z + r_c). Then
+// (cl·V.y + sl·V.z)² = sin²(lat_b) · |V|² gives the cone.
+//
+// Two halves; we pick the half on the same side as `lat_b`
+// (positive lat_b → world Y > 0 → A := cl·V.y + sl·V.z > 0).
+fn ray_parallel_subframe_t(
+    oc: vec3<f32>, dir: vec3<f32>,
+    lat_b: f32, lat_c: f32, r_c: f32, after: f32,
+) -> f32 {
+    let cl = cos(lat_c); let sl = sin(lat_c);
+    let oc_z_shift = oc.z + r_c;
+    let A_const = cl * oc.y + sl * oc_z_shift;
+    let A_lin = cl * dir.y + sl * dir.z;
+    if abs(lat_b) < 1e-9 {
+        // Equator: A(t) = 0 plane.
+        if abs(A_lin) < 1e-12 { return -1.0; }
+        let t = -A_const / A_lin;
+        if t > after { return t; }
+        return -1.0;
+    }
+    let s = sin(lat_b);
+    let s2 = s * s;
+    // |V(t)|² = C0 + 2·C1·t + C2·t²
+    let C0 = oc.x * oc.x + oc.y * oc.y + oc_z_shift * oc_z_shift;
+    let C1 = oc.x * dir.x + oc.y * dir.y + oc_z_shift * dir.z;
+    let C2 = dot(dir, dir);
+    let aa = A_lin * A_lin - s2 * C2;
+    let bb = 2.0 * (A_const * A_lin - s2 * C1);
+    let cc = A_const * A_const - s2 * C0;
+    if abs(aa) < 1e-12 {
+        if abs(bb) < 1e-12 { return -1.0; }
+        let t = -cc / bb;
+        if t > after {
+            let a_val = A_const + A_lin * t;
+            if (a_val > 0.0) == (lat_b > 0.0) { return t; }
+        }
+        return -1.0;
+    }
+    let disc = bb * bb - 4.0 * aa * cc;
+    if disc < 0.0 { return -1.0; }
+    let sq = sqrt(disc);
+    let t0 = (-bb - sq) / (2.0 * aa);
+    let t1 = (-bb + sq) / (2.0 * aa);
+    let t_lo = min(t0, t1);
+    let t_hi = max(t0, t1);
+    let want_pos = lat_b > 0.0;
+    if t_lo > after {
+        let a_val = A_const + A_lin * t_lo;
+        if (a_val > 0.0) == want_pos { return t_lo; }
+    }
+    if t_hi > after {
+        let a_val = A_const + A_lin * t_hi;
+        if (a_val > 0.0) == want_pos { return t_hi; }
+    }
+    return -1.0;
+}
+
+// Constant-radius sphere (= absolute r = r_b) in sub-frame local.
+// Sphere center at `(0, 0, -r_c)`. Standard ray-sphere intersect
+// against this center.
+fn ray_radius_subframe_t(
+    oc: vec3<f32>, dir: vec3<f32>,
+    r_b: f32, r_c: f32, after: f32,
+) -> f32 {
+    let oc_to_c = oc - vec3<f32>(0.0, 0.0, -r_c);
+    let b = dot(oc_to_c, dir);
+    let c = dot(oc_to_c, oc_to_c) - r_b * r_b;
+    let disc = b * b - c;
+    if disc < 0.0 { return -1.0; }
+    let sq = sqrt(disc);
+    let s = select(-1.0, 1.0, b >= 0.0);
+    let q = -b - s * sq;
+    if abs(q) < 1e-30 { return -1.0; }
+    let t0 = q;
+    let t1 = c / q;
+    let t_lo = min(t0, t1);
+    let t_hi = max(t0, t1);
+    if t_lo > after { return t_lo; }
+    if t_hi > after { return t_hi; }
+    return -1.0;
+}
+
 // Branchless argmin mask for the DDA min-side_dist selection.
 // Returns a (0/1) vec3 where exactly one component is 1: the axis whose
 // `side_dist` is smallest. Tie-break priority matches the original
