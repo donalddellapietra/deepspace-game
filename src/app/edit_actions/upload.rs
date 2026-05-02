@@ -298,6 +298,11 @@ impl App {
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
+                // TangentBlock root: shader's `march()` keys directly
+                // on `node_kinds[current_idx].kind`, so no special
+                // root_kind uniform is needed. Use Cartesian setter to
+                // clear any stale `slab_dims` from a prior frame.
+                ActiveFrameKind::TangentBlock => renderer.set_root_kind_cartesian(),
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
