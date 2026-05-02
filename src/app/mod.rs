@@ -642,41 +642,56 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian
-            | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::SphereSubFrame(_) => {
-                self.camera.position.in_frame(&frame.render_path)
-            }
-        };
-        if self.startup_profile_frames < 4 {
-            eprintln!(
-                "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",
-                frame.kind,
-                frame.render_path.as_slice(),
-                frame.logical_path.as_slice(),
-                cam_local,
-            );
-        }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::normalize(fwd_world);
-        let right_local = crate::world::sdf::normalize(right_world);
-        let up_local = crate::world::sdf::normalize(up_world);
-        if self.startup_profile_frames < 4 {
-            eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
-                fwd_world,
-                fwd_local,
-                right_local,
-                up_local,
-            );
+        match frame.kind {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+                let cam_local = self.camera.position.in_frame(&frame.render_path);
+                if self.startup_profile_frames < 4 {
+                    eprintln!(
+                        "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",
+                        frame.kind, frame.render_path.as_slice(),
+                        frame.logical_path.as_slice(), cam_local,
+                    );
+                    eprintln!(
+                        "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
+                        fwd_world, fwd_world, right_world, up_world,
+                    );
+                }
+                self.camera.gpu_camera_with_basis(
+                    cam_local,
+                    crate::world::sdf::normalize(fwd_world),
+                    crate::world::sdf::normalize(right_world),
+                    crate::world::sdf::normalize(up_world),
+                    1.2,
+                )
+            }
+            ActiveFrameKind::SphereSubFrame(range) => {
+                // Step 6: project camera into sub-frame local coords
+                // (origin near 0, basis rotated to (lon-tan, lat-tan,
+                // radial)). Sphere math in the shader operates on
+                // bounded magnitudes — layer-agnostic precision.
+                let mut wp_path = frame.render_path;
+                wp_path.truncate(range.wp_path_depth);
+                let local = crate::world::sphere_geom::camera_in_sphere_subframe(
+                    &self.camera.position,
+                    fwd_world, right_world, up_world,
+                    &wp_path, &range,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                if self.startup_profile_frames < 4 {
+                    eprintln!(
+                        "gpu_camera_sphere_subframe range={:?} cam_local={:?} fwd={:?}",
+                        range, local.origin, local.forward,
+                    );
+                }
+                self.camera.gpu_camera_with_basis(
+                    local.origin,
+                    crate::world::sdf::normalize(local.forward),
+                    crate::world::sdf::normalize(local.right),
+                    crate::world::sdf::normalize(local.up),
+                    1.2,
+                )
+            }
         }
-        self.camera.gpu_camera_with_basis(
-            cam_local,
-            fwd_local,
-            right_local,
-            up_local,
-            1.2,
-        )
     }
 }

@@ -1455,6 +1455,64 @@ fn sphere_descend_anchor(
     return result;
 }
 
+// Step 6 (sphere sub-frame architecture): sphere DDA scoped to a
+// sub-frame inside the WrappedPlane. The ray is already in
+// sub-frame local rotated+translated coords (= origin near 0,
+// basis aligned to the sub-frame's lon-tangent / lat-tangent /
+// radial axes). Sphere center in this frame is at (0, 0, -r_c)
+// where `r_c = uniforms.subframe_r.z`. Sphere radius = `body_size
+// / (2π)`, body_size = 3 (= the WP's local frame size).
+//
+// Currently a STUB: returns a fixed magenta hit so we can verify
+// the dispatch path wires correctly when the active frame is a
+// SphereSubFrame. Step 7 will replace this with the full DDA in
+// sub-frame local coords using the sphere boundary primitives
+// translated for the new sphere center.
+fn sphere_uv_in_subframe(
+    sub_node_idx: u32,
+    ray_origin: vec3<f32>, ray_dir_in: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    let ray_dir = normalize(ray_dir_in);
+    let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
+
+    // Sphere center in sub-frame local coords: along -z by r_c.
+    let r_c = uniforms.subframe_r.z;
+    let cs_center = vec3<f32>(0.0, 0.0, -r_c);
+    // Sphere radius: body_size / (2π) where body_size = 3 (WP local frame size).
+    let r_sphere = 3.0 / (2.0 * 3.14159265);
+
+    let oc = ray_origin - cs_center;
+    let b = dot(oc, ray_dir);
+    let c = dot(oc, oc) - r_sphere * r_sphere;
+    let disc = b * b - c;
+    if disc <= 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_enter = max(-b - sq, 0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return result; }
+
+    // Stub: paint hit magenta so we can VISUALLY confirm the dispatch
+    // path fires. Step 7 replaces this with the full sub-frame DDA.
+    let pos = ray_origin + ray_dir * t_enter;
+    let off = pos - cs_center;
+    let n_step = off / max(length(off), 1e-9);
+    result.hit = true;
+    result.t = t_enter * inv_norm;
+    result.color = vec3<f32>(1.0, 0.0, 1.0);
+    result.normal = n_step;
+    result.cell_min = pos - vec3<f32>(0.5);
+    result.cell_size = 1.0;
+    return result;
+}
+
 // Phase 3 REVISED — Step A.0+A.1: UV-sphere render of the
 // WrappedPlane frame. Replaces the flat slab DDA when
 // `uniforms.planet_render.x == 1.0`. The slab data is unchanged;
@@ -1686,7 +1744,19 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         // `GpuNodeKind::WrappedPlane` (`from_node_kind`).
         var r: HitResult;
         let cur_kind = node_kinds[current_idx].kind;
-        if cur_kind == 1u && uniforms.planet_render.x > 0.5 {
+        // Step 6: sphere sub-frame dispatch fires BEFORE the body-
+        // root sphere dispatch. uniforms.root_kind is set by the
+        // renderer when the active frame is a SphereSubFrame; the
+        // ray here is already in sub-frame local rotated+translated
+        // coords (camera was projected via
+        // `world::sphere_geom::camera_in_sphere_subframe`).
+        if uniforms.root_kind == ROOT_KIND_SPHERE_SUBFRAME
+            && uniforms.planet_render.x > 0.5
+        {
+            r = sphere_uv_in_subframe(
+                current_idx, ray_origin, ray_dir,
+            );
+        } else if cur_kind == 1u && uniforms.planet_render.x > 0.5 {
             r = sphere_uv_in_cell(
                 current_idx, vec3<f32>(0.0), 3.0,
                 ray_origin, ray_dir,

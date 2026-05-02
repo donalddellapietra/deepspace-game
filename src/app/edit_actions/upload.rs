@@ -298,12 +298,17 @@ impl App {
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
-                // Step 2 stub: SphereSubFrame uploads its embedded WP
-                // metadata so the shader still sees a WrappedPlane
-                // root. Step 5+ will add a dedicated sphere sub-frame
-                // upload path with the (lat, lon, r) range uniforms.
+                // Step 6: upload sub-frame range + WP metadata so
+                // the shader can dispatch the sphere sub-frame DDA
+                // in local rotated+translated coords.
                 ActiveFrameKind::SphereSubFrame(range) => {
-                    renderer.set_root_kind_wrapped_plane(range.wp_dims, range.wp_slab_depth);
+                    renderer.set_root_kind_sphere_subframe(
+                        range.lat_lo, range.lat_hi,
+                        range.lon_lo, range.lon_hi,
+                        range.r_lo, range.r_hi,
+                        range.r_center(),
+                        range.wp_dims, range.wp_slab_depth,
+                    );
                 }
             }
         }
