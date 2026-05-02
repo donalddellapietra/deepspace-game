@@ -47,43 +47,76 @@ impl App {
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
-        let cam_local = match frame.kind {
+        match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+                let cam_local = self.camera.position.in_frame(&frame.render_path);
+                cam_local.iter().all(|v| v.is_finite())
+                    && cam_local.iter().all(|&v| {
+                        (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
+                            ..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
+                            .contains(&v)
+                    })
             }
-            // Step 2 stub: SphereSubFrame falls back to Cartesian frame
-            // local for camera-fits purposes. Step 3+ will use the
-            // sphere-aware projection.
-            ActiveFrameKind::SphereSubFrame(_) => {
-                self.camera.position.in_frame(&frame.render_path)
+            ActiveFrameKind::SphereSubFrame(range) => {
+                // Camera fits if its position in sub-frame local
+                // coords is within MAX_FOCUSED_FRAME_CAMERA_EXTENT
+                // (in tangent units) of the sub-frame center. Same
+                // budget as Cartesian — bounded by a multiple of the
+                // frame extent.
+                let mut wp_path = frame.render_path;
+                wp_path.truncate(range.wp_path_depth);
+                let (fwd, right, up) = self.camera.basis();
+                let local = crate::world::sphere_geom::camera_in_sphere_subframe(
+                    &self.camera.position,
+                    fwd, right, up,
+                    &wp_path,
+                    &range,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                let max_axis = range
+                    .lon_extent()
+                    .max(range.lat_extent())
+                    .max(range.r_extent());
+                let bound = MAX_FOCUSED_FRAME_CAMERA_EXTENT * max_axis.max(1e-9);
+                local.origin.iter().all(|v| v.is_finite())
+                    && local.origin.iter().all(|&v| v.abs() <= bound)
             }
-        };
-        cam_local.iter().all(|v| v.is_finite())
-            && cam_local.iter().all(|&v| {
-                (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
-                    ..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
-                    .contains(&v)
-            })
+        }
     }
 
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
-        let (cam_local, frame_center_local, frame_span) = match frame.kind {
-            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => (
-                self.camera.position.in_frame(&frame.render_path),
-                [1.5, 1.5, 1.5],
-                crate::world::anchor::WORLD_SIZE,
-            ),
-            // Step 2 stub: same Cartesian-frame projection.
-            ActiveFrameKind::SphereSubFrame(_) => (
-                self.camera.position.in_frame(&frame.render_path),
-                [1.5, 1.5, 1.5],
-                crate::world::anchor::WORLD_SIZE,
-            ),
-        };
-        let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
-        let dist = crate::world::sdf::length(to_center).max(0.05);
-        let half_fov_recip = 720.0f32 / (2.0f32 * (1.2f32 * 0.5f32).tan());
-        frame_span / dist * half_fov_recip
+        match frame.kind {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+                let cam_local = self.camera.position.in_frame(&frame.render_path);
+                let to_center = crate::world::sdf::sub([1.5, 1.5, 1.5], cam_local);
+                let dist = crate::world::sdf::length(to_center).max(0.05);
+                let half_fov_recip = 720.0f32 / (2.0f32 * (1.2f32 * 0.5f32).tan());
+                crate::world::anchor::WORLD_SIZE / dist * half_fov_recip
+            }
+            ActiveFrameKind::SphereSubFrame(range) => {
+                // Sub-frame's "characteristic span" = max of its three
+                // tangent-axis extents. Distance = camera origin
+                // magnitude in sub-frame local coords (origin at
+                // sub-frame center).
+                let mut wp_path = frame.render_path;
+                wp_path.truncate(range.wp_path_depth);
+                let (fwd, right, up) = self.camera.basis();
+                let local = crate::world::sphere_geom::camera_in_sphere_subframe(
+                    &self.camera.position,
+                    fwd, right, up,
+                    &wp_path,
+                    &range,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                let dist = crate::world::sdf::length(local.origin).max(0.05);
+                let span = range
+                    .lon_extent()
+                    .max(range.lat_extent())
+                    .max(range.r_extent());
+                let half_fov_recip = 720.0f32 / (2.0f32 * (1.2f32 * 0.5f32).tan());
+                span / dist * half_fov_recip
+            }
+        }
     }
 
     pub(in crate::app) fn target_render_frame(&self) -> ActiveFrame {
