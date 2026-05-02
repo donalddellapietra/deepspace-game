@@ -97,15 +97,16 @@ impl App {
                 // The CPU raycast must match.
                 if let Some(frame_node) = self.world.library.get(self.active_frame.node_id) {
                     if let crate::world::tree::NodeKind::TangentBlock { rotation } = frame_node.kind {
+                        let tb_scale = crate::world::raycast::inscribed_cube_scale(&rotation);
                         let centered = [
                             cam_local[0] - 1.5,
                             cam_local[1] - 1.5,
                             cam_local[2] - 1.5,
                         ];
                         cam_local = [
-                            1.5 + rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2],
-                            1.5 + rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2],
-                            1.5 + rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2],
+                            1.5 + (rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2]) / tb_scale,
+                            1.5 + (rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2]) / tb_scale,
+                            1.5 + (rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2]) / tb_scale,
                         ];
                     }
                 }

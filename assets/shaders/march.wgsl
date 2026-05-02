@@ -769,18 +769,19 @@ fn march_cartesian(
                 let rc0 = node_kinds[child_idx].rot_col0.xyz;
                 let rc1 = node_kinds[child_idx].rot_col1.xyz;
                 let rc2 = node_kinds[child_idx].rot_col2.xyz;
+                let tb_scale = node_kinds[child_idx].rot_col0.w;
                 let centered = local_pre_origin - vec3<f32>(1.5);
                 let rotated = vec3<f32>(
                     dot(rc0, centered),
                     dot(rc1, centered),
                     dot(rc2, centered),
                 );
-                let local_origin = rotated + vec3<f32>(1.5);
+                let local_origin = rotated / tb_scale + vec3<f32>(1.5);
                 let local_dir = vec3<f32>(
                     dot(rc0, local_pre_dir),
                     dot(rc1, local_pre_dir),
                     dot(rc2, local_pre_dir),
-                );
+                ) / tb_scale;
                 let sub = march_in_tangent_cube(child_idx, local_origin, local_dir);
                 if sub.hit {
                     let local_hit = local_origin + local_dir * sub.t;
@@ -1605,12 +1606,13 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         let rc0 = node_kinds[current_idx].rot_col0.xyz;
         let rc1 = node_kinds[current_idx].rot_col1.xyz;
         let rc2 = node_kinds[current_idx].rot_col2.xyz;
+        let tb_scale = node_kinds[current_idx].rot_col0.w;
         let centered = ray_origin - vec3<f32>(1.5);
         ray_origin = vec3<f32>(1.5) + vec3<f32>(
             dot(rc0, centered),
             dot(rc1, centered),
             dot(rc2, centered),
-        );
+        ) / tb_scale;
     }
 
     // skip_slot: after a ribbon pop, the slot index (in the parent)
@@ -1698,11 +1700,12 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             let rc0 = node_kinds[entry.child_bfs].rot_col0.xyz;
             let rc1 = node_kinds[entry.child_bfs].rot_col1.xyz;
             let rc2 = node_kinds[entry.child_bfs].rot_col2.xyz;
-            let scaled = ray_origin / 3.0;
-            let centered = scaled - vec3<f32>(0.5);
-            ray_origin = slot_off + vec3<f32>(0.5)
-                       + rc0 * centered.x + rc1 * centered.y + rc2 * centered.z;
-            ray_dir = rc0 * ray_dir.x + rc1 * ray_dir.y + rc2 * ray_dir.z;
+            let tb_scale = node_kinds[entry.child_bfs].rot_col0.w;
+            let centered = (ray_origin - vec3<f32>(1.5)) * tb_scale;
+            let rotated = rc0 * centered.x + rc1 * centered.y + rc2 * centered.z;
+            ray_origin = slot_off + vec3<f32>(0.5) + rotated / 3.0;
+            let rd = ray_dir * tb_scale;
+            ray_dir = rc0 * rd.x + rc1 * rd.y + rc2 * rd.z;
         } else {
             ray_origin = slot_off + ray_origin / 3.0;
         }

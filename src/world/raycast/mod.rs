@@ -12,7 +12,16 @@ mod wrapped_planet;
 
 pub use wrapped_planet::cpu_raycast_wrapped_planet;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
+
+pub(crate) fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
+    let mut max_extent = 0.0f32;
+    for i in 0..3 {
+        let extent = r[0][i].abs() + r[1][i].abs() + r[2][i].abs();
+        max_extent = max_extent.max(extent);
+    }
+    if max_extent < 1e-6 { 1.0 } else { (1.0 / max_extent).min(1.0) }
+}
 
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
@@ -102,18 +111,27 @@ pub fn cpu_raycast_in_frame(
         if child_is_tb {
             if let Some(node) = library.get(child_id) {
                 if let NodeKind::TangentBlock { rotation: r } = node.kind {
-                    let scaled = [
-                        ray_origin[0] / 3.0,
-                        ray_origin[1] / 3.0,
-                        ray_origin[2] / 3.0,
+                    let tb_scale = inscribed_cube_scale(&r);
+                    let centered = [
+                        (ray_origin[0] - 1.5) * tb_scale,
+                        (ray_origin[1] - 1.5) * tb_scale,
+                        (ray_origin[2] - 1.5) * tb_scale,
                     ];
-                    let centered = [scaled[0] - 0.5, scaled[1] - 0.5, scaled[2] - 0.5];
+                    let rotated = [
+                        r[0][0]*centered[0] + r[1][0]*centered[1] + r[2][0]*centered[2],
+                        r[0][1]*centered[0] + r[1][1]*centered[1] + r[2][1]*centered[2],
+                        r[0][2]*centered[0] + r[1][2]*centered[1] + r[2][2]*centered[2],
+                    ];
                     ray_origin = [
-                        slot_off[0] + 0.5 + r[0][0]*centered[0] + r[1][0]*centered[1] + r[2][0]*centered[2],
-                        slot_off[1] + 0.5 + r[0][1]*centered[0] + r[1][1]*centered[1] + r[2][1]*centered[2],
-                        slot_off[2] + 0.5 + r[0][2]*centered[0] + r[1][2]*centered[1] + r[2][2]*centered[2],
+                        slot_off[0] + 0.5 + rotated[0] / 3.0,
+                        slot_off[1] + 0.5 + rotated[1] / 3.0,
+                        slot_off[2] + 0.5 + rotated[2] / 3.0,
                     ];
-                    let rd = ray_dir;
+                    let rd = [
+                        ray_dir[0] * tb_scale,
+                        ray_dir[1] * tb_scale,
+                        ray_dir[2] * tb_scale,
+                    ];
                     ray_dir = [
                         (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
                         (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,

@@ -169,7 +169,7 @@ pub(super) fn cpu_raycast_inner(
                         ray_dir[1] * scale,
                         ray_dir[2] * scale,
                     ];
-                    // R^T applied: result.i = sum_j rotation[i][j] * v.j
+                    let tb_scale = super::inscribed_cube_scale(&rotation);
                     let centered = [lp_origin[0] - 1.5, lp_origin[1] - 1.5, lp_origin[2] - 1.5];
                     let rotated_origin = [
                         rotation[0][0] * centered[0] + rotation[0][1] * centered[1] + rotation[0][2] * centered[2],
@@ -177,14 +177,19 @@ pub(super) fn cpu_raycast_inner(
                         rotation[2][0] * centered[0] + rotation[2][1] * centered[1] + rotation[2][2] * centered[2],
                     ];
                     let local_origin = [
-                        rotated_origin[0] + 1.5,
-                        rotated_origin[1] + 1.5,
-                        rotated_origin[2] + 1.5,
+                        rotated_origin[0] / tb_scale + 1.5,
+                        rotated_origin[1] / tb_scale + 1.5,
+                        rotated_origin[2] / tb_scale + 1.5,
                     ];
-                    let local_dir = [
+                    let rotated_dir = [
                         rotation[0][0] * lp_dir[0] + rotation[0][1] * lp_dir[1] + rotation[0][2] * lp_dir[2],
                         rotation[1][0] * lp_dir[0] + rotation[1][1] * lp_dir[1] + rotation[1][2] * lp_dir[2],
                         rotation[2][0] * lp_dir[0] + rotation[2][1] * lp_dir[1] + rotation[2][2] * lp_dir[2],
+                    ];
+                    let local_dir = [
+                        rotated_dir[0] / tb_scale,
+                        rotated_dir[1] / tb_scale,
+                        rotated_dir[2] / tb_scale,
                     ];
                     let sub_max_depth = max_depth.saturating_sub(depth as u32 + 1);
                     if let Some(sub_hit) = cpu_raycast_inner(
