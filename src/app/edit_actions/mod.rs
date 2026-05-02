@@ -73,9 +73,7 @@ impl App {
                 let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
-                // lat_max kept in sync with the shader-side default
-                // (1.26 rad ≈ 72°).
-                let hit = raycast::cpu_raycast_wrapped_planet(
+                let hit = raycast::cpu_raycast_sphere_uv(
                     &self.world.library,
                     self.world.root,
                     frame_path.as_slice(),
