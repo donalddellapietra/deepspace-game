@@ -194,6 +194,7 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
+                "--rotated-cube" => { cfg.world_preset = WorldPreset::RotatedCube; }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
@@ -550,6 +551,9 @@ FRACTAL PRESETS (default plain-layers = 8):
   --hollow-cube-world         18 edges + faces (no corners/body), brass + steel
 
 VISIBILITY TEST PRESETS:
+  --rotated-cube              Single rotated grass cube (TangentBlock at
+                              slot 13). Smallest end-to-end proof of
+                              Cartesian-DDA → TangentBlock dispatch.
   --stars-world               Planet cube + distant stars at varying ribbon
                               depths; validates precision across deep pops
   --wrapped-planet            Wrapped-Cartesian planet: 27x2x14

@@ -8,6 +8,7 @@ use super::anchor::{Path, WorldPos};
 use super::state::WorldState;
 
 mod plain;
+mod rotated_cube;
 mod vox;
 mod wrapped_planet;
 
@@ -15,6 +16,7 @@ pub use plain::{
     carve_air_pocket, plain_surface_spawn, plain_test_world, plain_world,
     DEFAULT_PLAIN_LAYERS,
 };
+pub use rotated_cube::rotated_cube_world;
 pub use vox::bootstrap_vox_model_world;
 pub use wrapped_planet::{
     wrapped_planet_spawn, wrapped_planet_world, DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
@@ -91,6 +93,14 @@ pub enum WorldPreset {
     /// that the ray-march preserves precision across deep pops —
     /// stars at ancestor-depth 1 through N−1 must all render.
     Stars,
+    /// Single rotated cube — Cartesian root with one
+    /// `NodeKind::TangentBlock` cell at slot 13. The shader's
+    /// `march_cartesian` recognises the kind on descent and
+    /// transforms the ray into the cube's local frame, applying a
+    /// per-cell rotation. This is the smallest end-to-end proof of
+    /// the "Cartesian-DDA dispatches to TangentBlock" path that
+    /// scales up to a sphere of rotated tiles.
+    RotatedCube,
     /// Wrapped-Cartesian planet (Phase 1: hardcoded slab).
     /// A `NodeKind::WrappedPlane` node is installed at
     /// `embedding_depth` levels below root, with a flat slab subtree
@@ -144,7 +154,8 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::EdgeScaffold
         | WorldPreset::HollowCube
         | WorldPreset::Stars
-        | WorldPreset::Scene { .. } => None,
+        | WorldPreset::Scene { .. }
+        | WorldPreset::RotatedCube => None,
         // The wrapped planet has a flat slab top at fixed local-y,
         // but its world-y depends on embedding_depth and slot path
         // — entities don't auto-rest on it in Phase 1.
@@ -220,6 +231,7 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::Stars => {
             crate::world::stars::bootstrap_stars_world(plain_layers.unwrap_or(40))
         }
+        WorldPreset::RotatedCube => rotated_cube::bootstrap_rotated_cube_world(),
         WorldPreset::WrappedPlanet {
             embedding_depth,
             slab_dims,

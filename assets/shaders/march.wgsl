@@ -751,6 +751,78 @@ fn march_cartesian(
                 continue;
             }
 
+            // TangentBlock dispatch from Cartesian DDA. The child node is a
+            // rotated cube whose interior is regular Cartesian content. The
+            // ray is transformed into the cube's local [0, 3) frame, then the
+            // dedicated tangent walker descends inside; the returned normal
+            // is rotated back to world. Precision-stable: rotation is computed
+            // at descent time from bounded inputs (cube origin in current
+            // frame, cube size = current cell size — both in [0, 3)) and the
+            // cube's interior descent is local Cartesian. The rotation never
+            // propagates through descent.
+            //
+            // Prototype rotation: hardcoded 30° around world-Y. Production
+            // would derive per-cell from the cube's intended angular
+            // position (e.g., UV-sphere tangent at the cube's lon/lat).
+            if child_idx < arrayLength(&node_kinds)
+                && node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
+                let cube_origin_w =
+                    cur_node_origin + (vec3<f32>(cell) + vec3<f32>(0.5)) * cur_cell_size;
+                let cube_side = cur_cell_size;
+                let scale = 3.0 / cube_side;
+
+                let theta: f32 = 0.5236; // 30°
+                let cs = cos(theta);
+                let sn = sin(theta);
+                let east_w   = vec3<f32>(cs, 0.0, sn);
+                let normal_w = vec3<f32>(0.0, 1.0, 0.0);
+                let north_w  = vec3<f32>(-sn, 0.0, cs);
+
+                let d_origin = ray_origin - cube_origin_w;
+                let local_origin = vec3<f32>(
+                    dot(east_w,   d_origin) * scale + 1.5,
+                    dot(normal_w, d_origin) * scale + 1.5,
+                    dot(north_w,  d_origin) * scale + 1.5,
+                );
+                let local_dir = vec3<f32>(
+                    dot(east_w,   ray_dir) * scale,
+                    dot(normal_w, ray_dir) * scale,
+                    dot(north_w,  ray_dir) * scale,
+                );
+
+                let sub = march_in_tangent_cube(child_idx, local_origin, local_dir);
+                if sub.hit {
+                    // Bevel in local frame; rotate normal back to world. The
+                    // dir scale (3 / cube_side) absorbs into the t
+                    // parameterisation, so local_t == world_t.
+                    let local_hit = local_origin + local_dir * sub.t;
+                    let local_in_cell = clamp(
+                        (local_hit - sub.cell_min) / sub.cell_size,
+                        vec3<f32>(0.0), vec3<f32>(1.0),
+                    );
+                    let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
+                    var out: HitResult;
+                    out.hit = true;
+                    out.t = sub.t;
+                    out.color = sub.color * (0.7 + 0.3 * local_bevel);
+                    out.normal = east_w * sub.normal.x
+                               + normal_w * sub.normal.y
+                               + north_w * sub.normal.z;
+                    out.frame_level = 0u;
+                    out.frame_scale = 1.0;
+                    let hit_world = ray_origin + ray_dir * sub.t;
+                    out.cell_min = hit_world - vec3<f32>(0.5);
+                    out.cell_size = 1.0;
+                    return out;
+                }
+                // Miss: advance the parent DDA past this cell.
+                let m_tan = min_axis_mask(cur_side_dist);
+                s_cell[depth] = pack_cell(cell + vec3<i32>(m_tan) * step);
+                cur_side_dist += m_tan * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_tan;
+                continue;
+            }
+
             // Cartesian Node: depth/LOD check, then descend.
             // depth_limit = MAX_STACK_DEPTH — LOD controls the
             // effective depth, not an artificial per-shell budget.
