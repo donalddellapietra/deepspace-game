@@ -16,10 +16,13 @@ use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 pub enum ActiveFrameKind {
     Cartesian,
     /// The render frame is rooted at a `NodeKind::WrappedPlane`
-    /// node. The shader runs the X-wrap branch of `march_cartesian`
-    /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
-    /// `Uniforms.slab_dims`.
+    /// node. The shader runs the sphere DDA from the WP root.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
+    /// The render frame is a Cartesian node INSIDE a WrappedPlane
+    /// subtree. The shader dispatches `sphere_uv_in_subframe` using
+    /// sub-frame local coords for precision-stable sphere rendering
+    /// at arbitrary depth.
+    SphereSubFrame(crate::world::sphere_geom::SphereSubFrameRange),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,15 +69,8 @@ pub fn compute_render_frame(
         }
         _ => ActiveFrameKind::Cartesian,
     };
+    let mut wp_dims: Option<([u32; 3], u8, u8)> = None; // (dims, slab_depth, wp_path_depth)
     for k in 0..target.depth() as usize {
-        // If we've already landed on a WrappedPlane or TangentBlock
-        // node, stop — the node IS the render frame. The shader
-        // handles wrap/rotation internally: WrappedPlane fires the
-        // X-wrap branch at depth==0, TangentBlock applies R^T to
-        // position/direction at frame entry.
-        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
-            break;
-        }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
@@ -85,12 +81,26 @@ pub fn compute_render_frame(
                     match child_node.kind {
                         NodeKind::WrappedPlane { dims, slab_depth } => {
                             kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                            break;
+                            wp_dims = Some((dims, slab_depth, reached.depth()));
+                            // Don't break — keep descending into the
+                            // slab's Cartesian children. With base-2,
+                            // the in_frame walk is exact so deepening
+                            // the render frame is safe.
                         }
                         NodeKind::TangentBlock { .. } => {
                             break;
                         }
-                        _ => {}
+                        _ => {
+                            // If we're inside a WP subtree and still
+                            // descending, switch to SphereSubFrame.
+                            if let Some((dims, sd, wp_depth)) = wp_dims {
+                                kind = ActiveFrameKind::SphereSubFrame(
+                                    crate::world::sphere_geom::subframe_range_from_path(
+                                        &reached, dims, sd, wp_depth,
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
             }

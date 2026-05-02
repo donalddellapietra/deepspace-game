@@ -69,7 +69,10 @@ impl App {
         let (hit, cap_frame_path) = match self.active_frame.kind {
             // WrappedPlane frame: dispatch the rotated-tangent-cube CPU
             // raycast so click-targeting matches the GPU visual.
-            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+            ActiveFrameKind::WrappedPlane { dims, slab_depth }
+            | ActiveFrameKind::SphereSubFrame(
+                crate::world::sphere_geom::SphereSubFrameRange { wp_dims: dims, wp_slab_depth: slab_depth, .. }
+            ) => {
                 let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
