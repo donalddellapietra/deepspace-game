@@ -77,6 +77,7 @@ pub struct GpuNodeKind {
 
 pub const GPU_NODE_KIND_CARTESIAN: u32 = 0;
 pub const GPU_NODE_KIND_UV_SPHERE_BODY: u32 = 1;
+pub const GPU_NODE_KIND_CARTESIAN_TANGENT: u32 = 2;
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
@@ -92,6 +93,12 @@ impl GpuNodeKind {
                 param_a: inner_r.to_bits(),
                 param_b: outer_r.to_bits(),
                 param_c: theta_cap.to_bits(),
+            },
+            NodeKind::CartesianTangent => Self {
+                kind: GPU_NODE_KIND_CARTESIAN_TANGENT,
+                param_a: 0,
+                param_b: 0,
+                param_c: 0,
             },
         }
     }

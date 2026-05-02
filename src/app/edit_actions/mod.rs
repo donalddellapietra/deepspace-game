@@ -227,7 +227,9 @@ impl App {
                 slot
             ));
             match child_kind {
-                Some(NodeKind::Cartesian) | Some(NodeKind::UvSphereBody { .. }) => {
+                Some(NodeKind::Cartesian)
+                | Some(NodeKind::UvSphereBody { .. })
+                | Some(NodeKind::CartesianTangent) => {
                     node_id = child_id;
                 }
                 None => break,

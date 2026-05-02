@@ -133,6 +133,7 @@ fn uv_descend_cell(
     var d: UvDescend;
     d.found_block = false;
     d.block_type = 0u;
+    d.tangent_node_idx = 0u;
 
     var node_idx = start_node_idx;
     var delta_phi   = phi_w   - start_phi_lo;
@@ -200,7 +201,27 @@ fn uv_descend_cell(
             return d;
         }
         if tag == 2u {
-            node_idx = tree[child_off + 1u];
+            let child_idx = tree[child_off + 1u];
+            // CartesianTangent dispatch: stop the UV descent here
+            // and signal the caller to run a cartesian DDA in the
+            // tangent frame of THIS cell. The cell's bounds (φ/θ/r)
+            // give the OBB transform; `tangent_node_idx` points at
+            // the cartesian subtree's root.
+            if node_kinds[child_idx].kind == NODE_KIND_CARTESIAN_TANGENT {
+                d.tangent_node_idx = child_idx;
+                d.dphi = dphi;
+                d.dth = dth;
+                d.dr = dr_axis;
+                d.phi_lo   = phi_w   - delta_phi;
+                d.phi_hi   = d.phi_lo   + dphi;
+                d.theta_lo = theta_w - delta_theta;
+                d.theta_hi = d.theta_lo + dth;
+                d.r_lo     = r_w     - delta_r;
+                d.r_hi     = d.r_lo     + dr_axis;
+                d.depth = depth;
+                return d;
+            }
+            node_idx = child_idx;
             continue;
         }
         // EntityRef / Empty leaf — treat as empty.

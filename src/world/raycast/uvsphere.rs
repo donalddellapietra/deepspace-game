@@ -33,18 +33,6 @@ pub fn cpu_raycast_uv_body(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
-    // Prototype OBB intercept: if the ray hits the hardcoded
-    // cartesian-voxel cell at body path [14, 21, 23], return a
-    // breakable hit at that path. The intercept fires regardless of
-    // `max_depth` because the OBB occupies a fixed depth-3 cell —
-    // walking the descent there would otherwise need
-    // `max_depth >= 4`, breaking pickup at default zoom.
-    if let Some(intercept) =
-        try_proto_obb_intercept(library, body_root_id, ray_origin, ray_dir, max_depth)
-    {
-        return Some(intercept);
-    }
-
     let body = library.get(body_root_id)?;
     let (inner_r_local, outer_r_local, theta_cap) = match body.kind {
         NodeKind::UvSphereBody { inner_r, outer_r, theta_cap } => (inner_r, outer_r, theta_cap),
@@ -136,6 +124,74 @@ pub fn cpu_raycast_uv_body(
             });
         }
 
+        // CartesianTangent dispatch: descent stopped at a cartesian-
+        // content child Node. Two outcomes:
+        //
+        //   - Budget remaining: build the tangent-frame OBB from the
+        //     cell bounds, transform the ray, and run the world's
+        //     standard cartesian DDA on the subtree. On hit, splice
+        //     the sub-DDA's path onto the body prefix.
+        //
+        //   - Budget exhausted (= max_depth reached on the body side):
+        //     can't descend further, treat the whole tangent cell as
+        //     a single breakable unit. Mirrors how the ordinary
+        //     descent caps at non-empty Node children.
+        //
+        // On sub-DDA miss WITH budget remaining (= the subtree's
+        // genuinely empty along this ray), step past the cell and
+        // continue the UV march so the body content behind it can
+        // render.
+        if let Some(tangent_root) = descent.tangent_root {
+            let remaining = max_depth.saturating_sub(descent.path.len() as u32);
+            if remaining == 0 {
+                let face = closest_face_axis(
+                    phi_w, theta_w, r_w,
+                    descent.phi_lo, descent.phi_hi,
+                    descent.theta_lo, descent.theta_hi,
+                    descent.r_lo, descent.r_hi,
+                );
+                return Some(HitInfo {
+                    path: descent.path,
+                    face,
+                    t,
+                    place_path: None,
+                });
+            }
+            if let Some(sub_hit) = dispatch_tangent_cartesian(
+                library,
+                tangent_root,
+                ray_origin,
+                ray_dir,
+                descent.phi_lo,
+                descent.phi_hi,
+                descent.theta_lo,
+                descent.theta_hi,
+                descent.r_lo,
+                descent.r_hi,
+                remaining,
+            ) {
+                let mut full_path = descent.path;
+                full_path.extend(sub_hit.path);
+                return Some(HitInfo {
+                    path: full_path,
+                    face: sub_hit.face,
+                    t: sub_hit.t,
+                    place_path: None,
+                });
+            }
+            // Sub-DDA missed — step past the cell.
+            let bd = next_boundary(
+                oc, ray_dir, t,
+                descent.phi_lo, descent.phi_hi,
+                descent.theta_lo, descent.theta_hi,
+                descent.r_lo, descent.r_hi,
+            );
+            if bd.t > 1e20 { return None; }
+            let step = bd.t - t;
+            t = bd.t + (step * 1e-4).max(1e-5);
+            continue;
+        }
+
         // Empty cell at descent.bounds; step the ray to the smallest
         // t exceeding `t` at any of the 6 cell boundaries.
         let bd = next_boundary(
@@ -174,6 +230,11 @@ struct Descent {
     theta_hi: f32,
     r_lo: f32,
     r_hi: f32,
+    /// Set when the descent stopped at a `CartesianTangent` Node.
+    /// The caller must run a cartesian DDA on the subtree in the
+    /// cell's tangent frame and append the sub-DDA's path to
+    /// `path`. `None` for ordinary UV terminals.
+    tangent_root: Option<NodeId>,
 }
 
 fn descend(
@@ -248,6 +309,7 @@ fn descend(
                     theta_hi,
                     r_lo,
                     r_hi,
+                    tangent_root: None,
                 });
             }
             Child::Block(_) => {
@@ -264,9 +326,29 @@ fn descend(
                     theta_hi,
                     r_lo,
                     r_hi,
+                    tangent_root: None,
                 });
             }
             Child::Node(child_id) => {
+                // CartesianTangent: stop UV descent here and ask the
+                // caller to run a cartesian DDA in the cell's tangent
+                // frame. The cell bounds give the OBB transform.
+                let child_kind = library.get(child_id).map(|n| n.kind);
+                if matches!(child_kind, Some(NodeKind::CartesianTangent)) {
+                    return Some(Descent {
+                        found_block: false,
+                        path,
+                        face: 0,
+                        phi_lo,
+                        phi_hi,
+                        theta_lo,
+                        theta_hi,
+                        r_lo,
+                        r_hi,
+                        tangent_root: Some(child_id),
+                    });
+                }
+
                 // Edit-depth cap: if descending further would exceed
                 // `max_depth` (= maximum path length the caller wants),
                 // terminate now and treat this Node as the breakable
@@ -293,6 +375,7 @@ fn descend(
                             theta_hi,
                             r_lo,
                             r_hi,
+                            tangent_root: None,
                         });
                     }
                     let face = closest_face_axis(
@@ -308,6 +391,7 @@ fn descend(
                         theta_hi,
                         r_lo,
                         r_hi,
+                        tangent_root: None,
                     });
                 }
                 node_id = child_id;
@@ -485,143 +569,72 @@ fn length3(a: [f32; 3]) -> f32 {
     dot3(a, a).sqrt()
 }
 
-/// CPU-side OBB intercept for the UV-sphere prototype's cartesian-
-/// voxel cell. Mirrors the `proto_ray_vs_obb` / `proto_obb_render`
-/// short-circuit in `proto_block.wgsl`.
+/// Cartesian-tangent dispatch: when the UV descent stops at a
+/// `CartesianTangent` child, this builds the OBB from the cell's
+/// UV bounds, transforms the ray into the OBB-local `[0, 3]³`
+/// frame, and runs the world's standard cartesian DDA via
+/// `cpu_raycast_inner`. Returns a `HitInfo` whose path is rooted
+/// at `tangent_root` (caller appends it to the body-side prefix).
 ///
-/// Two-stage hit resolution:
-///   1. Slab test against the OBB volume. Miss → `None`,
-///      caller proceeds with normal UV descent.
-///   2. Walk the body tree along `PROTO_BODY_PATH` to confirm the
-///      proto subtree is still spliced in (and to fold the body
-///      prefix into the returned path).
-///   3. If `max_depth` budget allows, transform the ray into the
-///      OBB's local `[0, 3]³` frame and descend the proto's
-///      Cartesian subtree via `cpu_raycast_inner`. Append the
-///      resulting path so `break_block` lands on the FINEST
-///      sub-cell the budget reaches — not the whole-OBB cell.
-///
-/// `break_block` walks the returned path, replacing the leaf slot
-/// with `Empty`. The upload step's "is the body cell still the
-/// proto?" check then disables the shader intercept once the
-/// proto's root cell is fully removed.
-fn try_proto_obb_intercept(
+/// `max_depth` is the path-length budget remaining for the sub-DDA
+/// (caller subtracts the body-prefix length already consumed).
+/// Returns `None` on miss, or when the budget is zero (caller falls
+/// back to a whole-cell hit at the body level).
+fn dispatch_tangent_cartesian(
     library: &NodeLibrary,
-    body_root_id: NodeId,
+    tangent_root: NodeId,
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
-    max_depth: u32,
+    phi_lo: f32, phi_hi: f32,
+    theta_lo: f32, theta_hi: f32,
+    r_lo: f32, r_hi: f32,
+    remaining_budget: u32,
 ) -> Option<HitInfo> {
-    use crate::world::raycast::proto_obb::{
-        cell_obb, ray_vs_obb, PROTO_BODY_PATH, PROTO_PHI_HI, PROTO_PHI_LO, PROTO_R_HI, PROTO_R_LO,
-        PROTO_THETA_HI, PROTO_THETA_LO,
-    };
-
-    // Slab test first — if the ray misses the OBB volume, fall
-    // through to the normal UV descent (cheap return).
-    let obb = cell_obb(
+    if remaining_budget == 0 {
+        return None;
+    }
+    let obb = crate::world::raycast::proto_obb::cell_obb(
         [1.5, 1.5, 1.5],
-        PROTO_PHI_LO, PROTO_PHI_HI,
-        PROTO_THETA_LO, PROTO_THETA_HI,
-        PROTO_R_LO, PROTO_R_HI,
+        phi_lo, phi_hi,
+        theta_lo, theta_hi,
+        r_lo, r_hi,
     );
-    let hit = ray_vs_obb(ray_origin, ray_dir, &obb)?;
-
-    // Walk the body tree along the path. Skip intercept if the
-    // bootstrap splice isn't in place (or a previous break removed
-    // the proto cell entirely).
-    let mut path: Vec<(NodeId, usize)> = Vec::with_capacity(PROTO_BODY_PATH.len());
-    let mut cur = body_root_id;
-    let mut proto_root: Option<NodeId> = None;
-    for (i, &slot) in PROTO_BODY_PATH.iter().enumerate() {
-        let node = library.get(cur)?;
-        path.push((cur, slot));
-        match node.children[slot] {
-            Child::Node(child_id) => {
-                cur = child_id;
-                if i + 1 == PROTO_BODY_PATH.len() {
-                    proto_root = Some(child_id);
-                }
-            }
-            Child::Block(_) if i + 1 == PROTO_BODY_PATH.len() => break,
-            _ => return None,
-        }
-    }
-
-    // OBB → world face index. Approximate (OBB axes are tangent-
-    // frame, not world-aligned), but matches what `closest_face_axis`
-    // does for ordinary UV cells.
-    let face_obb = match (hit.axis, hit.side) {
-        (0, 0) => 1, // -φ̂
-        (0, 1) => 0, // +φ̂
-        (1, 0) => 3, // -θ̂
-        (1, 1) => 2, // +θ̂
-        (2, 0) => 5, // -r̂
-        _ => 4,      // +r̂
-    };
-
-    // Descend into the proto's Cartesian subtree at sub-cell
-    // granularity, when the edit-depth budget allows. Without this,
-    // every click destroys the whole OBB at once regardless of zoom.
-    if let Some(proto_id) = proto_root {
-        let used = path.len() as u32;
-        let remaining = max_depth.saturating_sub(used);
-        if remaining > 0 {
-            // Transform ray into OBB-local [0, 3]³ frame (matches
-            // `proto_obb_render` in `proto_block.wgsl`).
-            let to_origin = [
-                ray_origin[0] - obb.center[0],
-                ray_origin[1] - obb.center[1],
-                ray_origin[2] - obb.center[2],
-            ];
-            let dot3v = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-            let proj_origin = [
-                dot3v(to_origin, obb.phi_hat),
-                dot3v(to_origin, obb.theta_hat),
-                dot3v(to_origin, obb.r_hat),
-            ];
-            let proj_dir = [
-                dot3v(ray_dir, obb.phi_hat),
-                dot3v(ray_dir, obb.theta_hat),
-                dot3v(ray_dir, obb.r_hat),
-            ];
-            let extents = [
-                obb.half_phi.max(1e-12),
-                obb.half_th.max(1e-12),
-                obb.half_r.max(1e-12),
-            ];
-            let local_origin = [
-                proj_origin[0] / extents[0] * 1.5 + 1.5,
-                proj_origin[1] / extents[1] * 1.5 + 1.5,
-                proj_origin[2] / extents[2] * 1.5 + 1.5,
-            ];
-            let local_dir = [
-                proj_dir[0] / extents[0] * 1.5,
-                proj_dir[1] / extents[1] * 1.5,
-                proj_dir[2] / extents[2] * 1.5,
-            ];
-            if let Some(sub_hit) = super::cartesian::cpu_raycast_inner(
-                library, proto_id, local_origin, local_dir, remaining,
-            ) {
-                path.extend(sub_hit.path);
-                return Some(HitInfo {
-                    path,
-                    face: sub_hit.face,
-                    t: hit.t, // linear transform → world t == OBB-local t
-                    place_path: None,
-                });
-            }
-        }
-    }
-
-    // Either no proto subtree (Block leaf), or budget = 0, or the
-    // sub-DDA missed. Fall back to the whole-OBB cell.
-    Some(HitInfo {
-        path,
-        face: face_obb,
-        t: hit.t,
-        place_path: None,
-    })
+    // Transform ray into OBB-local [0, 3]³ frame. Linear transform →
+    // world-ray t equals OBB-local ray t.
+    let to_origin = [
+        ray_origin[0] - obb.center[0],
+        ray_origin[1] - obb.center[1],
+        ray_origin[2] - obb.center[2],
+    ];
+    let dot3v = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let proj_origin = [
+        dot3v(to_origin, obb.phi_hat),
+        dot3v(to_origin, obb.theta_hat),
+        dot3v(to_origin, obb.r_hat),
+    ];
+    let proj_dir = [
+        dot3v(ray_dir, obb.phi_hat),
+        dot3v(ray_dir, obb.theta_hat),
+        dot3v(ray_dir, obb.r_hat),
+    ];
+    let extents = [
+        obb.half_phi.max(1e-12),
+        obb.half_th.max(1e-12),
+        obb.half_r.max(1e-12),
+    ];
+    let local_origin = [
+        proj_origin[0] / extents[0] * 1.5 + 1.5,
+        proj_origin[1] / extents[1] * 1.5 + 1.5,
+        proj_origin[2] / extents[2] * 1.5 + 1.5,
+    ];
+    let local_dir = [
+        proj_dir[0] / extents[0] * 1.5,
+        proj_dir[1] / extents[1] * 1.5,
+        proj_dir[2] / extents[2] * 1.5,
+    ];
+    super::cartesian::cpu_raycast_inner(
+        library, tangent_root, local_origin, local_dir, remaining_budget,
+    )
 }
 
 #[cfg(test)]
@@ -882,24 +895,32 @@ mod tests {
     /// proto_root_id)` so tests can target the OBB cell specifically.
     fn build_demo_tree_with_proto() -> (NodeLibrary, NodeId, NodeId) {
         use crate::world::palette::block;
-        use crate::world::tree::{slot_index, uniform_children};
+        use crate::world::tree::{slot_index, uniform_children, NodeKind};
         let setup = demo_uv_sphere();
         let mut lib = NodeLibrary::default();
         let world_root = lib.insert(empty_children());
         let (root, body_path) = install_at_root_center(&mut lib, world_root, &setup);
         lib.ref_inc(root);
 
-        // Build a 4-layer uniform-WATER chain for the proto subtree.
-        // Deep enough that the descent test below has room to walk.
+        // Build a 4-layer uniform-WATER chain capped with a
+        // `CartesianTangent` root — same shape as
+        // `bootstrap_uv_sphere_world` produces for the real game.
         let proto_depth: u32 = 4;
         let mut proto = lib.insert(uniform_children(Child::Block(block::WATER)));
         lib.ref_inc(proto);
-        for _ in 1..proto_depth {
+        for _ in 1..proto_depth.saturating_sub(1) {
             let parent = lib.insert(uniform_children(Child::Node(proto)));
             lib.ref_inc(parent);
             lib.ref_dec(proto);
             proto = parent;
         }
+        let proto_capped = lib.insert_with_kind(
+            uniform_children(Child::Node(proto)),
+            NodeKind::CartesianTangent,
+        );
+        lib.ref_inc(proto_capped);
+        lib.ref_dec(proto);
+        let proto = proto_capped;
 
         let body_slot = body_path.slot(0) as usize;
         let body_id = match lib.get(root).unwrap().children[body_slot] {

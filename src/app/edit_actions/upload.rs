@@ -11,46 +11,7 @@ use crate::app::frame;
 use crate::renderer::{compute_view_proj, EntityRenderMode, InstanceData};
 use crate::world::gpu::{self, GpuEntity};
 use crate::world::scene::{self, EntityPath};
-use crate::world::state::WorldState;
-use crate::world::tree::{slot_index, Child, NodeId};
-
-/// Walks the body tree at the prototype's OBB path
-/// (`PROTO_BODY_PATH`) and returns true iff every intermediate slot
-/// is still a `Child::Node` AND the terminal slot is non-Empty.
-/// Drives the shader-side OBB intercept gate: once a break makes the
-/// terminal slot Empty (or removes an intermediate Node), the next
-/// upload disables `proto_subtree_bfs` and the OBB visual disappears.
-fn proto_subtree_present_in_world(world: &WorldState) -> bool {
-    let mut cur_id = world.root;
-    // World root → body slot.
-    let body_slot = slot_index(1, 1, 1);
-    let body_id = match world.library.get(cur_id).map(|n| n.children[body_slot]) {
-        Some(Child::Node(id)) => id,
-        _ => return false,
-    };
-    cur_id = body_id;
-    let path = crate::world::raycast::proto_obb::PROTO_BODY_PATH;
-    for (i, &slot) in path.iter().enumerate() {
-        let node = match world.library.get(cur_id) {
-            Some(n) => n,
-            None => return false,
-        };
-        match node.children[slot] {
-            Child::Node(id) => {
-                if i + 1 == path.len() {
-                    return true;
-                }
-                cur_id = id;
-            }
-            // Terminal slot may be a Block leaf — still a valid
-            // breakable cell (the shader intercept renders the
-            // cartesian voxel grid regardless).
-            Child::Block(_) if i + 1 == path.len() => return true,
-            _ => return false,
-        }
-    }
-    true
-}
+use crate::world::tree::NodeId;
 
 /// Heuristic: should the renderer run the beam-prepass (P1) for this
 /// frame? Returns true iff:
@@ -229,27 +190,7 @@ impl App {
         let cache = self.cached_tree.as_mut().expect("cached_tree present");
         let _scene_root_bfs = cache.ensure_root(&self.world.library, scene_root);
 
-        // Side-load the UV-sphere prototype subtree (if present).
-        // Packed into the same GPU `tree[]` buffer as `world.root`
-        // via `ensure_root` (content-addressed: re-uploads cost
-        // O(0) when the subtree is unchanged). The shader uses
-        // the resulting BFS idx in `proto_obb_render` to dispatch
-        // a real cartesian DDA inside the OBB.
-        //
-        // Gating: if the body tree no longer references the proto
-        // subtree at the OBB's path (= the user broke the cell),
-        // pass 0 so the shader's intercept becomes a no-op. Without
-        // this, the OBB would stay visible after breaks because the
-        // side-load is independent of `world.root`.
-        let proto_bfs = match self.proto_subtree_root {
-            Some(nid) if proto_subtree_present_in_world(&self.world) => {
-                cache.ensure_root(&self.world.library, nid)
-            }
-            _ => 0,
-        };
-
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_proto_subtree_bfs(proto_bfs);
             renderer.update_tree(
                 &cache.tree,
                 &cache.node_kinds,

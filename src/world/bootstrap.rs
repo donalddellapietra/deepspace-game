@@ -820,38 +820,44 @@ fn bootstrap_uv_sphere_world() -> WorldBootstrap {
     let (root, body_path) = install_at_root_center(&mut library, empty_root, &setup);
     library.ref_inc(root);
 
-    // Prototype subtree: a Cartesian chain of N layers ending in
-    // `Child::Block(WATER)` leaves. Stands in for the body's
-    // depth-3 cell at path `[14, 21, 23]`. Used in two roles:
-    //   1. Side-loaded into the GPU pack so the WGSL OBB intercept
-    //      can dispatch `march_entity_subtree` and render the cell
-    //      as a real cartesian voxel grid (visible 3×3×3 substructure).
-    //   2. Spliced into the body tree at the same path so the CPU
-    //      raycast finds it via UV descent — `break_block` can then
-    //      target the cell (or sub-cell) and edit the world.
+    // Prototype subtree: a uniform-WATER Cartesian chain of N layers
+    // capped with a `CartesianTangent` ROOT. The CartesianTangent
+    // kind tells the renderer (and CPU raycast) to dispatch a
+    // cartesian DDA in the enclosing UV cell's tangent frame — i.e.,
+    // the body's UV march encounters this node while descending and
+    // hands off to `march_entity_subtree`. No hardcoded OBB
+    // constants, no fake overlay; the rendered geometry IS the
+    // subtree.
     //
-    // Depth pick: body has `setup.depth = 20` total layers; the OBB
-    // sits at body-tree depth 3, so 17 more layers of cartesian
-    // subdivision lands the proto's leaves at the same world-cell
-    // size as the body's grass leaves.
+    // Depth pick: body has `setup.depth = 20` layers; the proto
+    // sits at body-tree depth 3 (path [14, 21, 23]), so ~17 more
+    // layers of cartesian subdivision matches the body's leaf scale.
     //
-    // Uniformity caveat: with all 27 children pointing to a uniform
-    // WATER subtree, `pack_tree` flattens this to tag=1 Block(WATER)
-    // entries (Cartesian's `allows_uniform_flatten`). On the GPU
-    // that still gives 27 tag=1 children at the root level, so
-    // `march_entity_subtree` DDAs through a real 3×3×3 grid of WATER
-    // cells with bevels. Deeper structure becomes visible automatically
-    // as the user digs (which produces non-uniform Nodes that survive
-    // packing).
+    // Why CartesianTangent on the root specifically: descendants of
+    // the proto are plain Cartesian — they live in world cell-grid
+    // coords (relative to the OBB-local frame their parent sets up).
+    // Only the root needs the tangent-dispatch marker; everything
+    // below it is already in cartesian space.
     let proto_depth: u32 = (setup.depth.saturating_sub(3)).max(1) as u32;
     let mut proto_node = library.insert(uniform_children(Child::Block(block::WATER)));
     library.ref_inc(proto_node);
-    for _ in 1..proto_depth {
+    for _ in 1..proto_depth.saturating_sub(1).max(0) {
         let parent = library.insert(uniform_children(Child::Node(proto_node)));
         library.ref_inc(parent);
         library.ref_dec(proto_node);
         proto_node = parent;
     }
+    // Cap with a CartesianTangent root so the body's UV descent
+    // dispatches into `march_entity_subtree` when it encounters this
+    // node (instead of treating slots as UV tiers). Disables
+    // uniform-flatten so the structure survives packing.
+    let proto_root_with_kind = library.insert_with_kind(
+        uniform_children(Child::Node(proto_node)),
+        NodeKind::CartesianTangent,
+    );
+    library.ref_inc(proto_root_with_kind);
+    library.ref_dec(proto_node);
+    let proto_node = proto_root_with_kind;
     let proto_subtree_root_id = proto_node;
 
     // Splice the proto subtree into the body tree at body-path

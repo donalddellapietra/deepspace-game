@@ -113,6 +113,7 @@ struct NodeKindGpu {
 
 const NODE_KIND_CARTESIAN: u32 = 0u;
 const NODE_KIND_UV_SPHERE_BODY: u32 = 1u;
+const NODE_KIND_CARTESIAN_TANGENT: u32 = 2u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated

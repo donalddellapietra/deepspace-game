@@ -695,7 +695,6 @@ impl Renderer {
             highlight_min: [0.0; 4], highlight_max: [0.0; 4],
             root_kind: ROOT_KIND_CARTESIAN,
             ribbon_count: 0,
-            proto_subtree_bfs: 0,
             offscreen_texture: None,
             mask_texture,
             mask_view,

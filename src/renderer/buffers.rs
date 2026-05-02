@@ -311,7 +311,7 @@ impl Renderer {
             highlight_min: self.highlight_min,
             highlight_max: self.highlight_max,
             _pad_uv_a: [0.0; 4],
-            _pad_uv_b: [self.proto_subtree_bfs, 0, 0, 0],
+            _pad_uv_b: [0; 4],
             _pad_uv_c: [0.0; 4],
             _pad_uv_d: [0.0; 4],
             debug_mode: self.debug_mode,

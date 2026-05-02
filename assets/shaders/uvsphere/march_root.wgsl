@@ -39,22 +39,6 @@ fn march_uv_sphere(
     let outer_r = outer_r_local * body_size;
     let inner_r = inner_r_local * body_size;
 
-    // PROTOTYPE: fire ray vs the cartesian-block target. The OBB
-    // REPLACES one specific cell (path [14, 21, 23], outer-r slot
-    // at depth 3, lying on the grass band) with a 3×3×3 cartesian
-    // sub-grid in (φ̂, θ̂, r̂) space. `proto_obb_render` runs a DDA
-    // through the sub-cells; if every cell along the ray is empty
-    // (passes through the OBB volume without solid content), it
-    // returns `result.hit = false` and we fall through to the UV
-    // march so the body content behind the OBB renders normally.
-    let proto = proto_ray_vs_obb(ray_origin, ray_dir, center);
-    if proto.t < 1e20 {
-        let proto_result = proto_obb_render(ray_origin, ray_dir, center, proto);
-        if proto_result.hit {
-            return proto_result;
-        }
-    }
-
     let oc = ray_origin - center;
 
     let outer_t = uv_ray_sphere(oc, ray_dir, outer_r);
@@ -123,6 +107,38 @@ fn march_uv_sphere(
             result.cell_min = pos - vec3<f32>(0.5);
             result.cell_size = 1.0;
             return result;
+        }
+
+        // CartesianTangent dispatch: the descent stopped at a
+        // cartesian-content Node embedded in the body. Build the
+        // OBB from the cell's UV bounds, transform the ray into
+        // OBB-local [0, 3]³, and run a real cartesian DDA.
+        if d.tangent_node_idx != 0u {
+            let sub = uv_dispatch_cartesian_tangent(
+                ray_origin, ray_dir, center,
+                d.tangent_node_idx,
+                d.phi_lo, d.phi_hi,
+                d.theta_lo, d.theta_hi,
+                d.r_lo, d.r_hi,
+            );
+            if sub.hit {
+                return sub;
+            }
+            // Sub-DDA missed (entirely empty subtree along the ray).
+            // Step past the cell and continue the UV march so the
+            // body content behind it can render.
+            let bd = uv_next_boundary(
+                oc, ray_dir, t,
+                d.phi_lo, d.phi_hi,
+                d.theta_lo, d.theta_hi,
+                d.r_lo, d.r_hi,
+            );
+            if bd.t > 1e20 { break; }
+            let step = bd.t - t;
+            t = bd.t + max(step * 1e-4, 1e-5);
+            last_axis = bd.axis;
+            last_side = bd.side;
+            continue;
         }
 
         // Empty cell — step to next cell-face crossing.

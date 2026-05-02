@@ -97,6 +97,22 @@ pub enum NodeKind {
         outer_r: f32,
         theta_cap: f32,
     },
+    /// Cartesian-content cell embedded inside a UV body. The 27
+    /// children are normal cartesian xyz subcells (NOT UV tiers),
+    /// and the renderer must dispatch a cartesian DDA in the
+    /// enclosing UV cell's TANGENT frame `(φ̂, θ̂, r̂)`.
+    ///
+    /// Use case: at deep zoom, a body cell's curvature is sub-pixel
+    /// and the UV math loses precision. Replacing such cells with
+    /// `CartesianTangent` lets the renderer fall back to plain
+    /// cartesian voxels while keeping the body's macroscopic shape.
+    /// This is the building block for the "hybrid" rendering scheme
+    /// described in the design doc.
+    ///
+    /// Uniform-flatten is disabled so the subtree's structure
+    /// survives packing — once a break makes part of it non-uniform,
+    /// the rest of the structure is still there to dig into.
+    CartesianTangent,
 }
 
 impl Default for NodeKind {
@@ -117,6 +133,7 @@ impl Hash for NodeKind {
                 outer_r.to_bits().hash(state);
                 theta_cap.to_bits().hash(state);
             }
+            NodeKind::CartesianTangent => {}
         }
     }
 }
@@ -124,8 +141,8 @@ impl Hash for NodeKind {
 impl NodeKind {
     /// Whether the GPU packer is allowed to flatten a uniform
     /// subtree of this kind into a single Block at its parent's
-    /// slot. Only Cartesian flattens; sphere-aware kinds carry
-    /// metadata the renderer needs to dispatch on.
+    /// slot. Only plain Cartesian flattens; sphere-aware kinds and
+    /// `CartesianTangent` carry semantics the renderer dispatches on.
     #[inline]
     pub fn allows_uniform_flatten(self) -> bool {
         matches!(self, NodeKind::Cartesian)

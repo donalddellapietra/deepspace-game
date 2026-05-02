@@ -86,18 +86,22 @@ fn run_harness(png_path: &str) -> (u32, u32, Vec<u8>) {
 }
 
 fn count_water_blue(rgb: &[u8]) -> usize {
-    // Water (palette block 6) = `(0.20, 0.40, 0.80)`. After bevel
-    // (0.7..1.0) and sRGB encode that gamma-corrects roughly 1.4×,
-    // we expect R ≲ 130, G ∈ [120, 200], B ∈ [180, 230]. The body's
-    // sky band has high values across all channels (R≈160, G≈200,
-    // B≈240); the green grass has G > R, B not dominant. Demand
-    // B > R+30 AND B > G+10 to discriminate water from sky/grass.
+    // Water (palette 6) cells in the rendered frame land at roughly
+    // RGB ≈ (167, 192, 221). Discriminating from sky (~(163, 196, 239))
+    // is tight on R/G/B individually — but `B−R ≈ 54` for water vs
+    // `B−R ≈ 76` for sky, and water's `B−G ≈ 29` vs sky's `B−G ≈ 43`.
+    // Use those gaps. The grass band has B < G, so any `b > g`
+    // already excludes it.
     rgb.chunks_exact(3)
         .filter(|c| {
             let r = c[0] as i16;
             let g = c[1] as i16;
             let b = c[2] as i16;
-            b > 150 && b > r + 30 && b > g + 10 && r < 180
+            let br = b - r;
+            let bg = b - g;
+            b > 200
+                && bg > 20 && bg < 35
+                && br > 40 && br < 65
         })
         .count()
 }
@@ -107,26 +111,59 @@ fn count_water_blue(rgb: &[u8]) -> usize {
 fn proto_obb_visible_in_screenshot() {
     let (w, h, rgb) = run_harness("tmp/proto_obb_default.png");
     let total = (w as usize) * (h as usize);
-    let blue = count_water_blue(&rgb);
+
+    // Sample a 60×40 patch centred on the screen — that's where the
+    // OBB lands at the test's spawn config. Counting matching pixels
+    // in this window discriminates water (the proto subtree's
+    // rendered cell) from the surrounding sky.
+    let cx = w / 2;
+    let cy = h / 2;
+    let x0 = cx.saturating_sub(30);
+    let x1 = (cx + 30).min(w);
+    let y0 = cy.saturating_sub(20);
+    let y1 = (cy + 20).min(h);
+    let mut window_water = 0usize;
+    let mut window_total = 0usize;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y * w + x) as usize) * 3;
+            let r = rgb[i] as i16;
+            let g = rgb[i + 1] as i16;
+            let b = rgb[i + 2] as i16;
+            let br = b - r;
+            let bg = b - g;
+            window_total += 1;
+            if b > 200 && bg > 20 && bg < 35 && br > 40 && br < 65 {
+                window_water += 1;
+            }
+        }
+    }
+    let total_water = count_water_blue(&rgb);
 
     println!("screenshot {}x{} ({} pixels)", w, h, total);
     println!(
-        "water_blue = {} ({:.4}%)",
-        blue,
-        100.0 * blue as f32 / total as f32
+        "centre window {}x{} water = {} / {} ({:.1}%)",
+        x1 - x0,
+        y1 - y0,
+        window_water,
+        window_total,
+        100.0 * window_water as f32 / window_total as f32,
+    );
+    println!(
+        "frame total water = {} ({:.4}%)",
+        total_water,
+        100.0 * total_water as f32 / total as f32,
     );
 
-    // OBB at distance ~0.6 m, half-extent ~0.05 m → ~180×180 px on
-    // a 1280×720 frame with FOV 1.2 rad. Threshold conservative.
+    // The OBB at depth 3 of the body's tree covers roughly a
+    // 30×15 px patch under the crosshair at spawn distance. The
+    // 60×40 window catches the OBB plus surrounding margin; expect
+    // 100+ matching water pixels.
     assert!(
-        blue > 50,
-        "no water (blue) OBB visible — expected >50 px, got {}. \
-         Likely causes: OBB is outside camera FOV, the WATER subtree \
-         BFS isn't reaching the shader, or `march_entity_subtree` \
-         isn't returning hits in OBB-local. \
-         Screenshot saved to tmp/proto_obb_default.png — inspect \
-         to debug.",
-        blue
+        window_water > 100,
+        "OBB not visible in the centre window — water = {} pixels, \
+         expected > 100. Screenshot saved to tmp/proto_obb_default.png.",
+        window_water,
     );
 }
 

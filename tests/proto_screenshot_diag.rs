@@ -83,4 +83,19 @@ fn dump_pixel_histogram() {
     println!("  top-left:         {:?}", sample(10, 10));
     println!("  top-right:        {:?}", sample(info.width - 11, 10));
     println!("  bottom-centre:    {:?}", sample(cx, info.height - 11));
+
+    // Probe a 5×3 grid around the centre to find the OBB's water
+    // pixels (the proto subtree should land directly under the
+    // crosshair).
+    println!("\nCentre grid (rows = y offsets, cols = x offsets):");
+    for dy in [-6_i32, -3, 0, 3, 6] {
+        let y = (cy as i32 + dy).max(0) as u32;
+        let mut row = String::new();
+        for dx in [-12_i32, -6, 0, 6, 12] {
+            let x = (cx as i32 + dx).max(0) as u32;
+            let p = sample(x, y);
+            row.push_str(&format!(" ({},{},{})", p.0, p.1, p.2));
+        }
+        println!("  dy={:+}:{}", dy, row);
+    }
 }

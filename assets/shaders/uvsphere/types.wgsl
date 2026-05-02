@@ -27,6 +27,12 @@ const UV_MAX_ITER: u32 = 256u;
 struct UvDescend {
     found_block: bool,
     block_type: u32,
+    /// BFS idx of a `CartesianTangent` Node the descent stopped at.
+    /// 0 = no tangent dispatch needed. When non-zero, the caller
+    /// must transform the ray into the cell's tangent-frame OBB and
+    /// hand off to `march_entity_subtree(tangent_node_idx, ...)`.
+    /// `found_block` is false when this is set.
+    tangent_node_idx: u32,
     dphi: f32,
     dth: f32,
     dr: f32,
