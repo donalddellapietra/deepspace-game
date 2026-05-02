@@ -31,6 +31,13 @@ pub struct ActiveFrame {
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
+    /// R^T rotation center in frame-local [0,3)³ coords. When the
+    /// frame path crosses a TangentBlock and continues into its
+    /// children, the shader applies full R^T (position+direction)
+    /// around this center at frame entry. [1.5,1.5,1.5] when the
+    /// frame root IS the TB; shifts as the frame descends deeper.
+    /// All zeros when no TB on the frame path.
+    pub tb_center: [f32; 3],
 }
 
 /// Build a `Path` from the slot prefix the GPU ribbon walker
@@ -70,6 +77,8 @@ pub fn compute_render_frame(
         }
         _ => ActiveFrameKind::Cartesian,
     };
+    let mut tb_center = [0.0f32; 3];
+    let mut past_tb = false;
     for k in 0..target.depth() as usize {
         if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
@@ -81,10 +90,25 @@ pub fn compute_render_frame(
                 reached.push(slot as u8);
                 node_id = child_id;
                 if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
-                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                        break;
+                    match child_node.kind {
+                        NodeKind::WrappedPlane { dims, slab_depth } => {
+                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                            break;
+                        }
+                        NodeKind::TangentBlock { .. } => {
+                            tb_center = [1.5, 1.5, 1.5];
+                            past_tb = true;
+                        }
+                        _ => {}
                     }
+                }
+                if past_tb {
+                    let (sx, sy, sz) = crate::world::tree::slot_coords(slot);
+                    tb_center = [
+                        (tb_center[0] - sx as f32) * 3.0,
+                        (tb_center[1] - sy as f32) * 3.0,
+                        (tb_center[2] - sz as f32) * 3.0,
+                    ];
                 }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
@@ -95,6 +119,7 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
+        tb_center,
     }
 }
 
@@ -123,6 +148,7 @@ pub fn with_render_margin(
         logical_path: logical.logical_path,
         node_id: render.node_id,
         kind: render.kind,
+        tb_center: render.tb_center,
     }
 }
 

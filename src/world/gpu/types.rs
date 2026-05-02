@@ -93,14 +93,25 @@ impl GpuNodeKind {
                 kind: 1, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
                 rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
             },
-            NodeKind::TangentBlock { rotation } => Self {
-                kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
-                rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], 0.0],
-                rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
-                rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
+            NodeKind::TangentBlock { rotation } => {
+                let cs = inscribed_cube_scale(&rotation);
+                Self {
+                    kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
+                    rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], cs],
+                    rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
+                    rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
+                }
             },
         }
     }
+}
+
+fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
+    let mut mx = 0.0f32;
+    for i in 0..3 {
+        mx = mx.max(r[0][i].abs() + r[1][i].abs() + r[2][i].abs());
+    }
+    if mx < 1e-6 { 1.0 } else { (1.0 / mx).min(1.0) }
 }
 
 /// Camera uniforms in shader-frame coords. `pos`/`forward`/etc. are
@@ -202,13 +213,14 @@ mod tests {
             rotation: IDENTITY_ROTATION,
         });
         assert_eq!(k.kind, 2);
-        assert_eq!(k.rot_col0, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(k.rot_col0, [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(k.rot_col1, [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(k.rot_col2, [0.0, 0.0, 1.0, 0.0]);
 
         let r = [[0.5, 0.6, 0.7], [0.1, 0.2, 0.3], [0.9, 0.8, 0.4]];
         let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock { rotation: r });
-        assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, 0.0]);
+        let cs = inscribed_cube_scale(&r);
+        assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, cs]);
         assert_eq!(k.rot_col1, [0.1, 0.2, 0.3, 0.0]);
         assert_eq!(k.rot_col2, [0.9, 0.8, 0.4, 0.0]);
     }

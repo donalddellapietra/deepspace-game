@@ -14,6 +14,14 @@ pub use wrapped_planet::cpu_raycast_wrapped_planet;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
+pub(crate) fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
+    let mut mx = 0.0f32;
+    for i in 0..3 {
+        mx = mx.max(r[0][i].abs() + r[1][i].abs() + r[2][i].abs());
+    }
+    if mx < 1e-6 { 1.0 } else { (1.0 / mx).min(1.0) }
+}
+
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
 pub struct HitInfo {
@@ -104,16 +112,27 @@ pub fn cpu_raycast_in_frame(
                 if let NodeKind::TangentBlock { rotation: r } = node.kind {
                     // Direction-only: position pops Cartesian,
                     // direction rotated by R to undo the R^T entry.
-                    ray_origin = [
-                        slot_off[0] + ray_origin[0] / 3.0,
-                        slot_off[1] + ray_origin[1] / 3.0,
-                        slot_off[2] + ray_origin[2] / 3.0,
+                    let s = inscribed_cube_scale(&r);
+                    let c = [
+                        (ray_origin[0]-1.5)*s,
+                        (ray_origin[1]-1.5)*s,
+                        (ray_origin[2]-1.5)*s,
                     ];
-                    let rd = ray_dir;
+                    let rot = [
+                        r[0][0]*c[0]+r[1][0]*c[1]+r[2][0]*c[2],
+                        r[0][1]*c[0]+r[1][1]*c[1]+r[2][1]*c[2],
+                        r[0][2]*c[0]+r[1][2]*c[1]+r[2][2]*c[2],
+                    ];
+                    ray_origin = [
+                        slot_off[0]+(rot[0]+1.5)/3.0,
+                        slot_off[1]+(rot[1]+1.5)/3.0,
+                        slot_off[2]+(rot[2]+1.5)/3.0,
+                    ];
+                    let rd = [ray_dir[0]*s, ray_dir[1]*s, ray_dir[2]*s];
                     ray_dir = [
-                        (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
-                        (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,
-                        (r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2]) / 3.0,
+                        (r[0][0]*rd[0]+r[1][0]*rd[1]+r[2][0]*rd[2])/3.0,
+                        (r[0][1]*rd[0]+r[1][1]*rd[1]+r[2][1]*rd[2])/3.0,
+                        (r[0][2]*rd[0]+r[1][2]*rd[1]+r[2][2]*rd[2])/3.0,
                     ];
                 }
             }
