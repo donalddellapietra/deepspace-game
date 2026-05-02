@@ -9,6 +9,9 @@
 
 mod cartesian;
 
+use crate::world::df64::{
+    df3_add, df3_div3, df3_mul, df3_sub, df3_times3, df_add, df_inv, df_mul, df_sub, Df, Df3,
+};
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
 
 /// Information about a ray hit in the tree.
@@ -307,7 +310,9 @@ fn descend_anchor_cartesian_local(
     max_extra_levels: usize,
     path: &mut Vec<(NodeId, usize)>,
 ) {
-    // Build orthonormal local frame at slab cell center.
+    // Build orthonormal local frame at slab cell center. f32 here is
+    // fine — these are computed once at slab-cell scale and don't
+    // accumulate.
     let cos_lat = cell_lat_center.cos();
     let sin_lat = cell_lat_center.sin();
     let cos_lon = cell_lon_center.cos();
@@ -316,9 +321,6 @@ fn descend_anchor_cartesian_local(
     let e_lon: [f32; 3] = [-sin_lon,           0.0,            cos_lon];
     let e_lat: [f32; 3] = [-sin_lat * cos_lon, cos_lat,       -sin_lat * sin_lon];
 
-    // Slab cell extents in world along the three local axes (slab-axis
-    // convention: local x→e_lon, y→e_r, z→e_lat — matches slot layout
-    // dims = [lon, r, lat]).
     let ext_x = cell_r_center * cos_lat * cell_lon_step;
     let ext_y = cell_r_step;
     let ext_z = cell_r_center * cell_lat_step;
@@ -348,58 +350,66 @@ fn descend_anchor_cartesian_local(
     ];
     let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
-    let mut cur_o: [f32; 3] = [
+    // ── df-precision DDA state. Past depth ~10 with f32-only state,
+    // |cur_d| has scaled by 3^10 ≈ 60000 and |inv_dir| has shrunk to
+    // 1/60000 of original — adjacent side_dist values per cell become
+    // indistinguishable and the descent picks the wrong axis or wrong
+    // cell. df64 (~46-bit mantissa) keeps cell-correctness through
+    // depth 20+.
+    let cur_o_init = [
         dot3(dv, e_lon) * scale_x,
         dot3(dv, e_r)   * scale_y,
         dot3(dv, e_lat) * scale_z,
     ];
-    let mut cur_d: [f32; 3] = [
+    let cur_d_init = [
         dot3(ray_dir, e_lon) * scale_x,
         dot3(ray_dir, e_r)   * scale_y,
         dot3(ray_dir, e_lat) * scale_z,
     ];
+    let mut cur_o = Df3::from_f32_arr(cur_o_init);
+    let mut cur_d = Df3::from_f32_arr(cur_d_init);
 
-    let inv_or_huge = |v: f32| if v.abs() > 1e-12 { 1.0 / v } else { 1e30 };
-    let mut inv_dir = [inv_or_huge(cur_d[0]), inv_or_huge(cur_d[1]), inv_or_huge(cur_d[2])];
+    let inv_safe = |d: Df| -> Df {
+        if d.hi.abs() > 1e-12 { df_inv(d) } else { Df::from_f32(1e30) }
+    };
+    let mut inv_dir = Df3 {
+        x: inv_safe(cur_d.x),
+        y: inv_safe(cur_d.y),
+        z: inv_safe(cur_d.z),
+    };
     let mut step = [
-        if cur_d[0] >= 0.0 { 1i32 } else { -1 },
-        if cur_d[1] >= 0.0 { 1i32 } else { -1 },
-        if cur_d[2] >= 0.0 { 1i32 } else { -1 },
+        if cur_d.x.hi >= 0.0 { 1i32 } else { -1 },
+        if cur_d.y.hi >= 0.0 { 1i32 } else { -1 },
+        if cur_d.z.hi >= 0.0 { 1i32 } else { -1 },
     ];
-    let mut delta_dist = [inv_dir[0].abs(), inv_dir[1].abs(), inv_dir[2].abs()];
+    let mut delta_dist = inv_dir.abs();
 
-    // Initial cell at slab entry (t = t_in is the slab DDA's current
-    // t; ray is geometrically inside the curved slab cell at this t).
-    let entry_pos = [
-        cur_o[0] + cur_d[0] * t_in,
-        cur_o[1] + cur_d[1] * t_in,
-        cur_o[2] + cur_d[2] * t_in,
-    ];
+    // Initial cell at slab entry. t_in is f32 from caller; widen it.
+    let cur_t_init = Df::from_f32(t_in);
+    let entry_pos = df3_add(cur_o, df3_mul(cur_d, Df3 {
+        x: cur_t_init, y: cur_t_init, z: cur_t_init,
+    }));
+    let entry_arr = entry_pos.to_f32_arr();
     let mut cur_cell: [i32; 3] = [
-        (entry_pos[0].floor() as i32).clamp(0, 2),
-        (entry_pos[1].floor() as i32).clamp(0, 2),
-        (entry_pos[2].floor() as i32).clamp(0, 2),
-    ];
-    let mut cur_side_dist: [f32; 3] = [
-        if cur_d[0] >= 0.0 { (cur_cell[0] as f32 + 1.0 - cur_o[0]) * inv_dir[0] }
-        else                 { (cur_cell[0] as f32       - cur_o[0]) * inv_dir[0] },
-        if cur_d[1] >= 0.0 { (cur_cell[1] as f32 + 1.0 - cur_o[1]) * inv_dir[1] }
-        else                 { (cur_cell[1] as f32       - cur_o[1]) * inv_dir[1] },
-        if cur_d[2] >= 0.0 { (cur_cell[2] as f32 + 1.0 - cur_o[2]) * inv_dir[2] }
-        else                 { (cur_cell[2] as f32       - cur_o[2]) * inv_dir[2] },
+        (entry_arr[0].floor() as i32).clamp(0, 2),
+        (entry_arr[1].floor() as i32).clamp(0, 2),
+        (entry_arr[2].floor() as i32).clamp(0, 2),
     ];
 
-    // Stacks: cell index path (for pop's re-zero reversal) and node
-    // ids (parent of `cur_node` at each depth). The node-id stack
-    // mirrors the GPU's `s_node_idx[depth]`. Walking `path.last()` to
-    // recover the parent on pop is wrong — `path` entries are
-    // (parent_node_id, slot), and after `path.pop()` the new last
-    // entry is the GRANDPARENT's edge, not the parent's.
-    //
-    // Cap at SPHERE_DESCENT_DEPTH = 24 to mirror the GPU stack
-    // ceiling exactly. Past that the GPU splats representative; the
-    // CPU also stops at the deepest visible cell so break paths
-    // can't outrun what's rendered.
+    let make_side_dist = |cell: [i32; 3], cur_o: Df3, inv_dir: Df3, cur_d: &Df3| -> Df3 {
+        let mk = |i: usize, c: i32| -> Df {
+            let face = if cur_d.get(i).hi >= 0.0 { c as f32 + 1.0 } else { c as f32 };
+            df_mul(df_sub(Df::from_f32(face), cur_o.get(i)), inv_dir.get(i))
+        };
+        let mut sd = Df3::ZERO;
+        sd.set(0, mk(0, cell[0]));
+        sd.set(1, mk(1, cell[1]));
+        sd.set(2, mk(2, cell[2]));
+        sd
+    };
+
+    let mut cur_side_dist = make_side_dist(cur_cell, cur_o, inv_dir, &cur_d);
+
     let cap = max_extra_levels.min(24);
     let mut s_cell_path: Vec<[i32; 3]> = Vec::with_capacity(cap);
     let mut s_node_path: Vec<NodeId> = Vec::with_capacity(cap);
@@ -407,18 +417,21 @@ fn descend_anchor_cartesian_local(
     let mut depth: usize = 0;
     let mut iters = 0usize;
     let max_iters = 4096usize;
-    // Track the ray's current t (preserved across pushes by the
-    // (O-cell)*3 / D*3 transform). Updated at each DDA advance to the
-    // just-crossed face's t. The push's `new_pos = cur_O + cur_D * t`
-    // needs the CURRENT t, not the slab-entry t — using stale t would
-    // place the post-rezero cell at the slab-entry projected point,
-    // not the cell we're actually descending into.
-    let mut cur_t: f32 = t_in;
+    // Tracks the ray's current t in the input parameterization
+    // (preserved across pushes by the (O-cell)*3 / D*3 transform).
+    // df precision is critical: after each push, t enters
+    // `cur_o + cur_d * t` where both terms are O(3^K) with their
+    // difference O(1) — the catastrophic cancellation only resolves
+    // correctly with df.
+    let mut cur_t: Df = cur_t_init;
 
-    let min_axis = |sd: [f32; 3]| -> usize {
-        if sd[0] <= sd[1] && sd[0] <= sd[2] { 0 }
-        else if sd[1] <= sd[2] { 1 }
-        else { 2 }
+    let min_axis_df = |sd: Df3| -> usize {
+        // sd[0] <= sd[1] && sd[0] <= sd[2] -> 0
+        let xy = !crate::world::df64::df_lt(sd.y, sd.x);
+        let xz = !crate::world::df64::df_lt(sd.z, sd.x);
+        if xy && xz { return 0; }
+        let yz = !crate::world::df64::df_lt(sd.z, sd.y);
+        if yz { 1 } else { 2 }
     };
 
     loop {
@@ -432,24 +445,15 @@ fn descend_anchor_cartesian_local(
         {
             if depth == 0 { break; }
             depth -= 1;
-            // Pop transform reverses the push:
-            //   old_O = new_O / 3 + popped_cell
-            //   old_D = new_D / 3
             let popped = s_cell_path.pop().unwrap();
-            cur_o = [
-                cur_o[0] / 3.0 + popped[0] as f32,
-                cur_o[1] / 3.0 + popped[1] as f32,
-                cur_o[2] / 3.0 + popped[2] as f32,
-            ];
-            cur_d = [cur_d[0] / 3.0, cur_d[1] / 3.0, cur_d[2] / 3.0];
-            inv_dir = [inv_dir[0] * 3.0, inv_dir[1] * 3.0, inv_dir[2] * 3.0];
-            delta_dist = [delta_dist[0] * 3.0, delta_dist[1] * 3.0, delta_dist[2] * 3.0];
-            // Path entry for the popped level was added at push; the
-            // descent didn't terminate inside that subtree, so we
-            // remove the path entry that pointed into it.
+            cur_o = df3_add(
+                df3_div3(cur_o),
+                Df3::from_f32_arr([popped[0] as f32, popped[1] as f32, popped[2] as f32]),
+            );
+            cur_d = df3_div3(cur_d);
+            inv_dir = df3_times3(inv_dir);
+            delta_dist = df3_times3(delta_dist);
             path.pop();
-            // Determine which face we crossed (in CHILD frame coords)
-            // and advance parent's cell on that axis.
             let mut axis_x = 0i32;
             let mut axis_y = 0i32;
             let mut axis_z = 0i32;
@@ -460,18 +464,8 @@ fn descend_anchor_cartesian_local(
             if cur_cell[2] < 0 { axis_z = -1; }
             if cur_cell[2] > 2 { axis_z =  1; }
             cur_cell = [popped[0] + axis_x, popped[1] + axis_y, popped[2] + axis_z];
-            // Restore parent node from the parallel s_node_path stack.
             cur_node = s_node_path.pop().unwrap_or(anchor_idx);
-            // Recompute side_dist for the new (parent-frame) cell.
-            let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
-            cur_side_dist = [
-                if cur_d[0] >= 0.0 { (cf[0] + 1.0 - cur_o[0]) * inv_dir[0] }
-                else                 { (cf[0]       - cur_o[0]) * inv_dir[0] },
-                if cur_d[1] >= 0.0 { (cf[1] + 1.0 - cur_o[1]) * inv_dir[1] }
-                else                 { (cf[1]       - cur_o[1]) * inv_dir[1] },
-                if cur_d[2] >= 0.0 { (cf[2] + 1.0 - cur_o[2]) * inv_dir[2] }
-                else                 { (cf[2]       - cur_o[2]) * inv_dir[2] },
-            ];
+            cur_side_dist = make_side_dist(cur_cell, cur_o, inv_dir, &cur_d);
             continue;
         }
 
@@ -484,69 +478,48 @@ fn descend_anchor_cartesian_local(
 
         match child {
             Child::Empty | Child::EntityRef(_) => {
-                // Empty slot: step DDA along smallest side_dist.
-                let m = min_axis(cur_side_dist);
-                let step_axis = step[m];
-                cur_t = cur_side_dist[m]; // ray's new t = just-crossed face t
-                cur_cell[m] += step_axis;
-                cur_side_dist[m] += delta_dist[m];
+                let m = min_axis_df(cur_side_dist);
+                cur_t = cur_side_dist.get(m); // just-crossed face's t
+                cur_cell[m] += step[m];
+                cur_side_dist.set(m, df_add(cur_side_dist.get(m), delta_dist.get(m)));
                 continue;
             }
             Child::Block(_) => {
-                // Hit a Block leaf — terminate descent here.
                 path.push((cur_node, slot));
                 return;
             }
             Child::Node(child_id) => {
-                // Push or terminate at extra-level limit.
                 path.push((cur_node, slot));
                 if depth + 1 >= cap {
                     return;
                 }
-                // Re-zero local frame onto the cell. Save parent's
-                // node id so pop can restore it without walking the
-                // path (path entries point to parents-by-slot, not
-                // by-node-id directly).
                 s_cell_path.push(cur_cell);
                 s_node_path.push(cur_node);
-                let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
-                cur_o = [
-                    (cur_o[0] - cf[0]) * 3.0,
-                    (cur_o[1] - cf[1]) * 3.0,
-                    (cur_o[2] - cf[2]) * 3.0,
-                ];
-                cur_d = [cur_d[0] * 3.0, cur_d[1] * 3.0, cur_d[2] * 3.0];
-                inv_dir = [inv_dir[0] / 3.0, inv_dir[1] / 3.0, inv_dir[2] / 3.0];
-                delta_dist = [delta_dist[0] / 3.0, delta_dist[1] / 3.0, delta_dist[2] / 3.0];
+                let cf = Df3::from_f32_arr([
+                    cur_cell[0] as f32,
+                    cur_cell[1] as f32,
+                    cur_cell[2] as f32,
+                ]);
+                cur_o = df3_times3(df3_sub(cur_o, cf));
+                cur_d = df3_times3(cur_d);
+                inv_dir = df3_div3(inv_dir);
+                delta_dist = df3_div3(delta_dist);
 
                 depth += 1;
                 cur_node = child_id;
 
-                // Compute new sub-cell at depth+1 from ray's pos in
-                // the new frame. Since the push preserves the world
-                // ray, the position at the same world-t maps to a
-                // local-pos that lies in [0, 3)³.
-                // Use a small offset past the just-crossed face so
-                // numerical error doesn't put us back outside.
-                let new_pos = [
-                    cur_o[0] + cur_d[0] * cur_t,
-                    cur_o[1] + cur_d[1] * cur_t,
-                    cur_o[2] + cur_d[2] * cur_t,
-                ];
+                // new_pos = cur_o + cur_d * cur_t (precision-critical:
+                // cur_o, cur_d are O(3^K); their combination at the
+                // same world-t cancels to O(1) — catastrophic without df.)
+                let t3 = Df3 { x: cur_t, y: cur_t, z: cur_t };
+                let new_pos = df3_add(cur_o, df3_mul(cur_d, t3));
+                let np = new_pos.to_f32_arr();
                 cur_cell = [
-                    (new_pos[0].floor() as i32).clamp(0, 2),
-                    (new_pos[1].floor() as i32).clamp(0, 2),
-                    (new_pos[2].floor() as i32).clamp(0, 2),
+                    (np[0].floor() as i32).clamp(0, 2),
+                    (np[1].floor() as i32).clamp(0, 2),
+                    (np[2].floor() as i32).clamp(0, 2),
                 ];
-                let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
-                cur_side_dist = [
-                    if cur_d[0] >= 0.0 { (cf[0] + 1.0 - cur_o[0]) * inv_dir[0] }
-                    else                 { (cf[0]       - cur_o[0]) * inv_dir[0] },
-                    if cur_d[1] >= 0.0 { (cf[1] + 1.0 - cur_o[1]) * inv_dir[1] }
-                    else                 { (cf[1]       - cur_o[1]) * inv_dir[1] },
-                    if cur_d[2] >= 0.0 { (cf[2] + 1.0 - cur_o[2]) * inv_dir[2] }
-                    else                 { (cf[2]       - cur_o[2]) * inv_dir[2] },
-                ];
+                cur_side_dist = make_side_dist(cur_cell, cur_o, inv_dir, &cur_d);
                 continue;
             }
         }
@@ -1129,6 +1102,54 @@ mod tests {
                 hit_shallow.path[i].1, hit_deep.path[i].1,
                 "slab path slot mismatch at level {i}",
             );
+        }
+    }
+
+    /// df64 descent stays cell-correct at descent depth 20 — the f32
+    /// precision floor that previously broke the descent past depth
+    /// ~10-12. Builds a planet with `cell_subtree_depth=20` and casts
+    /// the same equator ray at progressively deeper edit_depth values.
+    /// At every depth the path must continue descending (length grows
+    /// by 1 per depth bump, slot consistent across depths) — a sign
+    /// that side_dist comparisons are still picking the right axis
+    /// and the post-push cell index is stable.
+    #[test]
+    fn cpu_raycast_sphere_uv_descends_to_depth_20_without_precision_failure() {
+        use crate::world::bootstrap::wrapped_planet_world;
+        let world = wrapped_planet_world(2, [27, 2, 14], 3, 20);
+        let frame_path = vec![13u8, 13u8];
+        let cam_local = [3.0, 1.5, 1.5];
+        let ray_dir = [-1.0, 0.0, 0.0];
+
+        let hit_at = |max_depth: u32| {
+            cpu_raycast_sphere_uv(
+                &world.library, world.root, &frame_path,
+                cam_local, ray_dir,
+                [27, 2, 14], 3,
+                1.26,
+                max_depth,
+            ).expect("ray hits +X equator")
+        };
+
+        // Slab natural = 5. At max_depth=N, descent walks (N - 5) extra
+        // levels into the anchor. Anchor in this test is uniform-tree
+        // (every cell same block) so the descent should walk all the
+        // way down to max_depth or hit the cap (24).
+        for depth in 6..=24 {
+            let hit = hit_at(depth);
+            // Each extra depth level adds one entry to the path.
+            assert_eq!(hit.path.len() as u32, depth,
+                "depth={depth}: got path length {}", hit.path.len());
+        }
+
+        // First 5 entries (slab path) identical across all depths.
+        let base = hit_at(6);
+        for depth in 7..=24 {
+            let h = hit_at(depth);
+            for i in 0..5 {
+                assert_eq!(h.path[i].1, base.path[i].1,
+                    "slab path slot mismatch at level {i} for depth={depth}");
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 pub mod aabb;
 pub mod anchor;
 pub mod bootstrap;
+pub mod df64;
 pub mod edit;
 pub mod entities;
 pub mod fractals;

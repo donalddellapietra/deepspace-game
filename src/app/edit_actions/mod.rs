@@ -51,6 +51,15 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
+        // Sphere-mode hits live in WrappedPlane frame-local units
+        // (the [0, 3]³ root frame); their `t` is a ray distance through
+        // the planet, NOT a multiple of the camera's anchor cell size.
+        // The Cartesian interaction-radius gate (which shrinks ×3^-k
+        // with anchor_depth) collapses to ~nanometers at deep zoom and
+        // rejects every sphere hit. The sphere cast is geometrically
+        // bounded (only the sphere's surface produces hits), so we
+        // skip the gate when sphere mode is on.
+        let mut sphere_mode_active = false;
         let (hit, cap_frame_path) = match self.active_frame.kind {
             // Phase 3 REVISED A.4: when the active frame is a
             // WrappedPlane AND sphere-render mode is on, dispatch
@@ -60,6 +69,7 @@ impl App {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
                 if self.startup_planet_render_sphere == Some(1) =>
             {
+                sphere_mode_active = true;
                 let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
@@ -115,7 +125,13 @@ impl App {
         // `interaction_radius_cells × anchor_cell_size`. Same
         // cubic-shell LOD philosophy as the shader — out of range
         // of your current anchor locality, cursor shows no hit.
+        // Skip in sphere mode: the cast is already bounded by the
+        // sphere's geometry and `h.t` is a frame-local distance, not
+        // a multiple of anchor-cell size.
         let hit = hit.and_then(|h| {
+            if sphere_mode_active {
+                return Some(h);
+            }
             let max_t = self.interaction_range_in_frame(&cap_frame_path);
             if h.t <= max_t {
                 Some(h)

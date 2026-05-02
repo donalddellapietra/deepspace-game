@@ -16,6 +16,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("bindings.wgsl",  include_str!("../assets/shaders/bindings.wgsl")),
     ("tree.wgsl",      include_str!("../assets/shaders/tree.wgsl")),
     ("ray_prim.wgsl",  include_str!("../assets/shaders/ray_prim.wgsl")),
+    ("df64.wgsl",      include_str!("../assets/shaders/df64.wgsl")),
     ("march_helpers.wgsl",       include_str!("../assets/shaders/march_helpers.wgsl")),
     ("march_entity.wgsl",        include_str!("../assets/shaders/march_entity.wgsl")),
     ("march_cartesian.wgsl",     include_str!("../assets/shaders/march_cartesian.wgsl")),
