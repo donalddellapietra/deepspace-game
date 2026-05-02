@@ -768,7 +768,16 @@ fn march_cartesian(
                 && node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
                 let cube_origin_w =
                     cur_node_origin + (vec3<f32>(cell) + vec3<f32>(0.5)) * cur_cell_size;
-                let cube_side = cur_cell_size;
+                // Shrink the rotated cube so its world AABB fits inside
+                // the parent cell. Worst-case axis-aligned bound for an
+                // arbitrarily-oriented cube of side s is s·√3; for the
+                // current Y-only yaw it's s·(|cos θ|+|sin θ|) ≤ s·√2.
+                // Divide by √3 for safety against full 3D rotations
+                // when this scales up. Without this shrink, the parent
+                // DDA's step boundary truncates the rotated cube's
+                // corners — the very "cut off" shape that masquerades
+                // as rotation in head-on screenshots.
+                let cube_side = cur_cell_size * (1.0 / 1.7320508);
                 let scale = 3.0 / cube_side;
 
                 let theta: f32 = 0.5236; // 30°
@@ -1258,7 +1267,6 @@ fn march_in_tangent_cube(
     var cur_cell_size: f32 = 1.0;
     var cur_node_origin: vec3<f32> = vec3<f32>(0.0);
     var cur_side_dist: vec3<f32>;
-    var normal = vec3<f32>(0.0, 1.0, 0.0);
     var depth: u32 = 0u;
     s_node_idx[0] = root_node_idx;
 
@@ -1270,6 +1278,22 @@ fn march_in_tangent_cube(
     if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
         return result;
     }
+
+    // Initial normal = the cube-entry face normal, computed from the
+    // axis that constrained `root_hit.t_enter`. Required so that a
+    // first-cell solid hit (uniform-content cube) reports the correct
+    // entry face — DDA hasn't advanced, so `normal` is still its
+    // initialised value at hit time. The previous default of (0,1,0)
+    // worked only when entering via the +Y face (sphere descent's
+    // radial-outward); Cartesian-DDA dispatch enters from any face.
+    let t1_root = (vec3<f32>(0.0) - ray_origin) * inv_dir;
+    let t2_root = (vec3<f32>(3.0) - ray_origin) * inv_dir;
+    let t_enter_axes = min(t1_root, t2_root);
+    var normal = vec3<f32>(
+        select(0.0, -sign(ray_dir.x), abs(t_enter_axes.x - root_hit.t_enter) < 1e-4),
+        select(0.0, -sign(ray_dir.y), abs(t_enter_axes.y - root_hit.t_enter) < 1e-4),
+        select(0.0, -sign(ray_dir.z), abs(t_enter_axes.z - root_hit.t_enter) < 1e-4),
+    );
 
     let t_start = max(root_hit.t_enter, 0.0) + 0.001;
     let entry_pos = ray_origin + ray_dir * t_start;
