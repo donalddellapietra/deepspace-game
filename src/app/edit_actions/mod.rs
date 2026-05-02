@@ -35,11 +35,25 @@ impl App {
     /// depth minus frame depth (K ≥ 0). `ray_dir_in_frame` is
     /// normalized, so `HitInfo.t` is a frame-local distance and
     /// can be compared directly to this value.
+    ///
+    /// `K` is capped at `MAX_INTERACTION_K_BELOW_FRAME` to prevent
+    /// exponential collapse when the render frame is locked above
+    /// the anchor (sphere/tangent mode: WrappedPlane stays the
+    /// frame even as anchor depth grows). Without the cap, every
+    /// extra anchor level shrinks the interaction range by 1/3 —
+    /// the cursor stops hitting anything within a few levels of
+    /// "zoom" because the player's WORLD position to the cursor
+    /// hit didn't shrink, only the scale we measured it against
+    /// did. In Cartesian mode the frame follows the anchor with a
+    /// render margin of ~3, so `K` is naturally bounded and the
+    /// cap doesn't fire.
     pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
+        const MAX_INTERACTION_K_BELOW_FRAME: i32 = 5;
         let frame_depth = frame_path.depth();
         let anchor_depth = self.camera.position.anchor.depth();
         let k = anchor_depth.saturating_sub(frame_depth) as i32;
-        let anchor_cell_size_in_frame = 3.0_f32.powi(1 - k);
+        let k_capped = k.min(MAX_INTERACTION_K_BELOW_FRAME);
+        let anchor_cell_size_in_frame = 3.0_f32.powi(1 - k_capped);
         self.interaction_radius_cells as f32 * anchor_cell_size_in_frame
     }
 
