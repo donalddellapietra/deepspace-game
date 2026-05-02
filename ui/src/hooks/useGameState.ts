@@ -80,6 +80,13 @@ const debugOverlayStore = createStore<DebugOverlayState>({
   cameraLocal: [0, 0, 0],
   fov: 0,
   nodeCount: 0,
+  cameraRootXyz: [0, 0, 0],
+  anchorCellSizeRoot: 0,
+  anchorSlotsCsv: "",
+  activeFrameKind: "",
+  renderPathCsv: "",
+  tbOnAnchorPath: false,
+  anchorCumulativeYawDeg: 0,
 });
 
 // Default `visible: true` so the crosshair is present from the very

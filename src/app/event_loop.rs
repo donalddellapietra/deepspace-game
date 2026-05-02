@@ -380,16 +380,58 @@ impl App {
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Cartesian
                 | crate::app::ActiveFrameKind::WrappedPlane { .. } => {
-                    self.camera.position.in_frame(&self.active_frame.render_path)
+                    self.camera.position.in_frame_rot(
+                        &self.world.library,
+                        self.world.root,
+                        &self.active_frame.render_path,
+                    )
                 }
             };
+            // Camera position in root-frame world coords (rotation-
+            // aware so the value is correct even when the anchor
+            // crosses a TangentBlock).
+            let camera_root_xyz = self.camera.position.in_frame_rot(
+                &self.world.library,
+                self.world.root,
+                &crate::world::anchor::Path::root(),
+            );
+            let anchor_depth = self.camera.position.anchor.depth();
+            let anchor_cell_size_root =
+                crate::world::anchor::WORLD_SIZE / 3.0_f32.powi(anchor_depth as i32);
+            let anchor_slots_csv = self
+                .camera
+                .position
+                .anchor
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let active_frame_kind = match self.active_frame.kind {
+                crate::app::ActiveFrameKind::Cartesian => "Cartesian".to_string(),
+                crate::app::ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                    format!("WrappedPlane(dims={dims:?}, slab_d={slab_depth})")
+                }
+            };
+            let render_path_csv = self
+                .active_frame
+                .render_path
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let (tb_on_anchor_path, anchor_cumulative_yaw_deg) =
+                tangent_block_chain_summary(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position.anchor,
+                );
             // Keep the UI's zoom_level in sync with the live anchor
             // depth. `edit_actions::zoom` updates it on explicit zoom
-            // input, but startup spawns + bootstrap defaults (e.g. the
-            // wrapped-planet which spawns at embedding_depth + slab_depth
-            // automatically) need this fallback or the on-screen "Layer
-            // N" indicator stays stuck at 0 until the player presses
-            // a zoom key.
+            // input, but startup spawns + bootstrap defaults need
+            // this fallback or the on-screen "Layer N" indicator
+            // stays stuck at 0 until the player presses a zoom key.
             self.ui.zoom_level = self.zoom_level();
             self.ui.push_to_overlay(&self.palette);
             crate::overlay::push_state(&crate::bridge::GameStateUpdate::DebugOverlay(
@@ -405,10 +447,17 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_anchor_depth: self.camera.position.anchor.depth() as u32,
+                    camera_anchor_depth: anchor_depth as u32,
                     camera_local,
                     fov: 1.2,
                     node_count: self.world.library.len(),
+                    camera_root_xyz,
+                    anchor_cell_size_root,
+                    anchor_slots_csv,
+                    active_frame_kind,
+                    render_path_csv,
+                    tb_on_anchor_path,
+                    anchor_cumulative_yaw_deg,
                 },
             ));
         }
@@ -702,4 +751,62 @@ fn wasm_canvas_setup(
         resize_cb.as_ref().unchecked_ref(),
     );
     resize_cb.forget();
+}
+
+/// Walks the camera's anchor path from world root, looking for any
+/// `NodeKind::TangentBlock` and accumulating its rotation. Returns
+/// `(tb_on_path, cumulative_yaw_deg)` where:
+/// - `tb_on_path` is `true` iff at least one TB was descended into.
+/// - `cumulative_yaw_deg` is the cumulative Y-axis rotation in
+///   degrees. For a single 45° TB on the path it's `45.0`. Useful
+///   as a quick "the camera is in a rotated subtree" indicator
+///   even when several TBs nest with non-Y rotations (read as
+///   approximate yaw).
+fn tangent_block_chain_summary(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    anchor: &crate::world::anchor::Path,
+) -> (bool, f32) {
+    use crate::world::tree::{Child, NodeKind};
+    let mut rot: [[f32; 3]; 3] = crate::world::tree::IDENTITY_ROTATION;
+    let mut tb_seen = false;
+    let mut node = world_root;
+    for k in 0..(anchor.depth() as usize) {
+        let n = match library.get(node) {
+            Some(n) => n,
+            None => break,
+        };
+        let slot = anchor.slot(k) as usize;
+        match n.children[slot] {
+            Child::Node(child_id) => {
+                if let Some(child_node) = library.get(child_id) {
+                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                        tb_seen = true;
+                        rot = matmul3x3_local(&rot, &r);
+                    }
+                }
+                node = child_id;
+            }
+            _ => break,
+        }
+    }
+    // Extract approximate yaw from rotation matrix. For a Y-axis
+    // rotation R(θ): R[0][0] = cos(θ), R[2][0] = sin(θ). Take
+    // atan2 of the column-0 X/Z components for column-major.
+    let yaw_rad = rot[0][2].atan2(rot[0][0]);
+    (tb_seen, yaw_rad.to_degrees())
+}
+
+fn matmul3x3_local(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for c in 0..3 {
+        for r in 0..3 {
+            let mut s = 0.0f32;
+            for k in 0..3 {
+                s += a[k][r] * b[c][k];
+            }
+            out[c][r] = s;
+        }
+    }
+    out
 }
