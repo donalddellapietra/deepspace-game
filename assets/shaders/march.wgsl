@@ -1669,16 +1669,22 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         let sz = i32(s / 9u);
         let slot_off = vec3<f32>(f32(sx), f32(sy), f32(sz));
         skip_slot = s;
-        // Ray pop: rescale origin into parent's [0,3)³, keep
-        // ray_dir at camera-frame magnitude. The old scheme
-        // divided ray_dir by 3 on every pop, which kept `t`
-        // invariant across frames but caused ray_dir to
-        // underflow after ~18 pops (3^-18 ≈ 6e-9). With
-        // ray_dir preserved, each frame's DDA runs with O(1)
-        // precision; t inside march_cartesian is frame-local.
-        // Camera-frame t is recovered on hit return as
-        // t_cam = t_frame / cur_scale.
-        ray_origin = slot_off + ray_origin / 3.0;
+        // Ray pop: rescale origin into parent's [0,3)³.
+        // TangentBlock children need rotation R applied on pop
+        // (R maps child-local to parent frame).
+        let child_kind = node_kinds[entry.child_bfs].kind;
+        if child_kind == NODE_KIND_TANGENT_BLOCK {
+            let rc0 = node_kinds[entry.child_bfs].rot_col0.xyz;
+            let rc1 = node_kinds[entry.child_bfs].rot_col1.xyz;
+            let rc2 = node_kinds[entry.child_bfs].rot_col2.xyz;
+            let scaled = ray_origin / 3.0;
+            let centered = scaled - vec3<f32>(0.5);
+            ray_origin = slot_off + vec3<f32>(0.5)
+                       + rc0 * centered.x + rc1 * centered.y + rc2 * centered.z;
+            ray_dir = rc0 * ray_dir.x + rc1 * ray_dir.y + rc2 * ray_dir.z;
+        } else {
+            ray_origin = slot_off + ray_origin / 3.0;
+        }
         cur_scale = cur_scale * (1.0 / 3.0);
         current_idx = entry.node_idx;
         ribbon_level = ribbon_level + 1u;

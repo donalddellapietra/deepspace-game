@@ -115,6 +115,7 @@ const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
 struct RibbonEntry {
     node_idx: u32,
     slot_bits: u32,
+    child_bfs: u32,
 }
 
 const RIBBON_SLOT_MASK: u32 = 0x1Fu;

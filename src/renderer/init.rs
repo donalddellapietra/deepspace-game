@@ -230,7 +230,7 @@ impl Renderer {
         // allocate one stub entry).
         let ribbon_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ribbon"),
-            contents: bytemuck::cast_slice(&[GpuRibbonEntry { node_idx: 0, slot_bits: 0 }]),
+            contents: bytemuck::cast_slice(&[GpuRibbonEntry { node_idx: 0, slot_bits: 0, child_bfs: 0 }]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

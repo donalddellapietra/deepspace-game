@@ -40,6 +40,10 @@ use bytemuck::{Pod, Zeroable};
 pub struct GpuRibbonEntry {
     pub node_idx: u32,
     pub slot_bits: u32,
+    /// BFS index of the child node we're popping FROM. The shader
+    /// reads `node_kinds[child_bfs]` to detect TangentBlock children
+    /// and apply rotation on ribbon pop.
+    pub child_bfs: u32,
 }
 
 /// Bit mask for the `siblings_all_empty` flag in `slot_bits`.
@@ -48,11 +52,12 @@ pub const SIBLINGS_ALL_EMPTY_BIT: u32 = 1 << 31;
 pub const SLOT_MASK: u32 = 0x1F;
 
 impl GpuRibbonEntry {
-    pub fn new(node_idx: u32, slot: u8, siblings_all_empty: bool) -> Self {
+    pub fn new(node_idx: u32, slot: u8, siblings_all_empty: bool, child_bfs: u32) -> Self {
         let flags = if siblings_all_empty { SIBLINGS_ALL_EMPTY_BIT } else { 0 };
         Self {
             node_idx,
             slot_bits: (slot as u32) | flags,
+            child_bfs,
         }
     }
 
@@ -113,10 +118,11 @@ pub fn build_ribbon(
     let mut ribbon = Vec::with_capacity(depth);
     for pop in 0..depth {
         let ancestor_idx = walk[depth - 1 - pop];
+        let child_idx = walk[depth - pop];
         let slot = reached_slots[depth - 1 - pop];
         let siblings_all_empty =
             ancestor_siblings_all_empty(tree, node_offsets, ancestor_idx);
-        ribbon.push(GpuRibbonEntry::new(ancestor_idx, slot, siblings_all_empty));
+        ribbon.push(GpuRibbonEntry::new(ancestor_idx, slot, siblings_all_empty, child_idx));
     }
     RibbonResult { frame_root_idx, ribbon, reached_slots }
 }
@@ -176,7 +182,7 @@ mod tests {
 
     #[test]
     fn gpu_ribbon_entry_size() {
-        assert_eq!(std::mem::size_of::<GpuRibbonEntry>(), 8);
+        assert_eq!(std::mem::size_of::<GpuRibbonEntry>(), 12);
     }
 
     /// Encode a GpuChild's first u32 (tag + block_type_lo + block_type_hi + flags).

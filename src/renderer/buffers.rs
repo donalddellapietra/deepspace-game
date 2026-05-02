@@ -111,7 +111,7 @@ impl Renderer {
         };
         // Always upload at least one entry — empty storage buffers
         // break the bind group.
-        let stub_storage = [GpuRibbonEntry { node_idx: 0, slot_bits: 0 }];
+        let stub_storage = [GpuRibbonEntry { node_idx: 0, slot_bits: 0, child_bfs: 0 }];
         let payload: &[GpuRibbonEntry] = if truncated.is_empty() {
             &stub_storage
         } else {
