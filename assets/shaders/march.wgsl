@@ -327,7 +327,7 @@ fn march_entity_subtree(
 // returning a miss. Y / Z OOB and depth>0 OOB still ribbon-pop.
 fn march_cartesian(
     root_node_idx: u32, ray_origin_in: vec3<f32>, ray_dir: vec3<f32>,
-    depth_limit: u32, skip_slot: u32,
+    depth_limit: u32, skip_slot: u32, use_lod: bool,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -767,7 +767,17 @@ fn march_cartesian(
             // invariant under zoom: the same physical content
             // produces the same lod_pixels regardless of what
             // `anchor_depth` the frame is rooted at.
-            let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
+            //
+            // `use_lod = false` (TangentBlock dispatch from sphere
+            // mode) bypasses this check: the render frame is locked
+            // at WrappedPlane, so cell-size/camera-distance always
+            // reads sub-pixel and the LOD-terminal path would
+            // collapse every edit deeper than ~3 levels into the
+            // node's representative_block — exactly the bug
+            // sphere_descend_anchor exists to avoid. Tree structure
+            // (uniform-flatten = tag=1, terminate) alone drives
+            // descent in that case.
+            let at_lod = use_lod && lod_pixels < LOD_PIXEL_THRESHOLD;
 
             if at_max || at_lod {
                 if ENABLE_STATS { ray_steps_lod_terminal = ray_steps_lod_terminal + 1u; }
@@ -1221,7 +1231,14 @@ fn sphere_descend_anchor(
             dot(north_w,  ray_dir) * scale,
         );
 
-        let sub = march_cartesian(anchor_idx, local_origin, local_dir, MAX_STACK_DEPTH, 0xFFFFFFFFu);
+        // use_lod = false: render frame is locked at WrappedPlane
+        // (camera distance to the cube's leaves is large in
+        // WrappedPlane-local units), so the LOD-pixel check would
+        // collapse every edit deeper than ~3 levels into the
+        // representative_block. Same reason sphere_descend_anchor
+        // disables LOD for sphere descent. Tree structure
+        // (uniform-flatten = tag=1, terminate) drives descent.
+        let sub = march_cartesian(anchor_idx, local_origin, local_dir, MAX_STACK_DEPTH, 0xFFFFFFFFu, false);
         if !sub.hit { return result; }
 
         // Bevel must be computed in the LOCAL cube frame: the world
@@ -1711,7 +1728,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             // visual LOD gate — rays stop descending when cells fall
             // below the pixel floor.
             r = march_cartesian(
-                current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot,
+                current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot, true,
             );
         }
         if r.hit {
