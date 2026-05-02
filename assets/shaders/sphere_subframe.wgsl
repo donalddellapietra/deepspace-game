@@ -41,16 +41,27 @@ fn sphere_uv_in_subframe(
     let ray_dir = normalize(ray_dir_in);
     let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
 
-    // Sub-frame geometry from uniforms.
-    let lat_lo = uniforms.subframe_lat_lon.x;
-    let lat_hi = uniforms.subframe_lat_lon.y;
-    let lon_lo = uniforms.subframe_lat_lon.z;
-    let lon_hi = uniforms.subframe_lat_lon.w;
-    let r_lo   = uniforms.subframe_r.x;
-    let r_hi   = uniforms.subframe_r.y;
+    // Sub-frame basis (camera projection + ray boundary helpers).
+    // Drives the basis (lat_c, lon_c, r_c) used to interpret the
+    // sub-frame local ray. Precision-stable when rays interact with
+    // cells near these center values.
+    let sub_lat_lo = uniforms.subframe_lat_lon.x;
+    let sub_lat_hi = uniforms.subframe_lat_lon.y;
+    let sub_lon_lo = uniforms.subframe_lat_lon.z;
+    let sub_lon_hi = uniforms.subframe_lat_lon.w;
     let r_c    = uniforms.subframe_r.z;
-    let lat_c  = (lat_lo + lat_hi) * 0.5;
-    let lon_c  = (lon_lo + lon_hi) * 0.5;
+    let lat_c  = (sub_lat_lo + sub_lat_hi) * 0.5;
+    let lon_c  = (sub_lon_lo + sub_lon_hi) * 0.5;
+    // Node range — what the dispatched GPU node literally partitions
+    // into 27 children. May be wider than the sub-frame range when
+    // the GPU tree is shallower than the camera's logical depth
+    // (e.g. above the slab — node = WP, sub-frame = a thin patch).
+    let lat_lo = uniforms.node_lat_lon.x;
+    let lat_hi = uniforms.node_lat_lon.y;
+    let lon_lo = uniforms.node_lat_lon.z;
+    let lon_hi = uniforms.node_lat_lon.w;
+    let r_lo   = uniforms.node_r.x;
+    let r_hi   = uniforms.node_r.y;
 
     // Sphere center in sub-frame local coords: along -z by r_c.
     let cs_center = vec3<f32>(0.0, 0.0, -r_c);

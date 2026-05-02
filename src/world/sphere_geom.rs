@@ -30,6 +30,11 @@ use crate::world::tree::{slot_coords, Child, NodeId, NodeKind, NodeLibrary};
 /// shader's `let shell_thickness = r_sphere * 0.25;`.
 pub const SHELL_THICKNESS_FRAC: f32 = 0.25;
 
+/// Default polar-ban latitude (radians) — mirrors `--planet-render-sphere`'s
+/// `planet_render.y` default. Sub-frame range computations use this when
+/// the renderer's runtime value isn't available.
+pub const DEFAULT_SPHERE_LAT_MAX: f32 = 1.26;
+
 /// Sphere sub-frame range in `WrappedPlane`-local sphere coords.
 /// Lat / lon in radians; r in local-frame units (where the
 /// `WrappedPlane`'s own frame is `[0, body_size)³`, body_size = 3.0

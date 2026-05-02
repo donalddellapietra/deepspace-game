@@ -314,6 +314,8 @@ impl Renderer {
             slab_dims: self.slab_dims,
             subframe_r: self.subframe_r,
             subframe_wp_dims: self.subframe_wp_dims,
+            node_lat_lon: self.node_lat_lon,
+            node_r: self.node_r,
             debug_mode: self.debug_mode,
             probe_pixel: self.probe_pixel,
             curvature: self.curvature,

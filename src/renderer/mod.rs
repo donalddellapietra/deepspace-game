@@ -102,6 +102,15 @@ pub struct GpuUniforms {
     /// outer sphere geometry for ribbon-pop continuity. Populated
     /// when sphere sub-frame is active.
     pub subframe_wp_dims: [u32; 4],
+    /// Node range — what the GPU node at `root_index` actually
+    /// partitions into 27 children. `(lat_lo, lat_hi, lon_lo,
+    /// lon_hi)` in radians. Distinct from `subframe_lat_lon`: the
+    /// sub-frame is the camera's deep virtual target, the node range
+    /// is what the dispatched node covers in the GPU tree. They
+    /// match only when the GPU tree extends to the sub-frame's depth.
+    pub node_lat_lon: [f32; 4],
+    /// Node range radial. `(r_lo, r_hi, _, _)`.
+    pub node_r: [f32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
     /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
@@ -186,6 +195,8 @@ pub struct Renderer {
     pub(super) subframe_lat_lon: [f32; 4],
     pub(super) subframe_r: [f32; 4],
     pub(super) subframe_wp_dims: [u32; 4],
+    pub(super) node_lat_lon: [f32; 4],
+    pub(super) node_r: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -352,6 +363,8 @@ impl Renderer {
         self.subframe_lat_lon = [0.0; 4];
         self.subframe_r = [0.0; 4];
         self.subframe_wp_dims = [0; 4];
+        self.node_lat_lon = [0.0; 4];
+        self.node_r = [0.0; 4];
         self.write_uniforms();
     }
 
@@ -366,6 +379,8 @@ impl Renderer {
         self.subframe_lat_lon = [0.0; 4];
         self.subframe_r = [0.0; 4];
         self.subframe_wp_dims = [0; 4];
+        self.node_lat_lon = [0.0; 4];
+        self.node_r = [0.0; 4];
         self.write_uniforms();
     }
 
@@ -375,10 +390,13 @@ impl Renderer {
     /// sub-frame local coords.
     pub fn set_root_kind_sphere_subframe(
         &mut self,
-        lat_lo: f32, lat_hi: f32,
-        lon_lo: f32, lon_hi: f32,
-        r_lo: f32, r_hi: f32,
-        r_c: f32,
+        sub_lat_lo: f32, sub_lat_hi: f32,
+        sub_lon_lo: f32, sub_lon_hi: f32,
+        sub_r_lo: f32, sub_r_hi: f32,
+        sub_r_c: f32,
+        node_lat_lo: f32, node_lat_hi: f32,
+        node_lon_lo: f32, node_lon_hi: f32,
+        node_r_lo: f32, node_r_hi: f32,
         wp_dims: [u32; 3],
         wp_slab_depth: u8,
     ) {
@@ -386,9 +404,11 @@ impl Renderer {
         // Slab dims still uploaded so the shader's WP-relative math
         // (sphere radius from body_size, etc.) has access.
         self.slab_dims = [wp_dims[0], wp_dims[1], wp_dims[2], wp_slab_depth as u32];
-        self.subframe_lat_lon = [lat_lo, lat_hi, lon_lo, lon_hi];
-        self.subframe_r = [r_lo, r_hi, r_c, 0.0];
+        self.subframe_lat_lon = [sub_lat_lo, sub_lat_hi, sub_lon_lo, sub_lon_hi];
+        self.subframe_r = [sub_r_lo, sub_r_hi, sub_r_c, 0.0];
         self.subframe_wp_dims = [wp_dims[0], wp_dims[1], wp_dims[2], wp_slab_depth as u32];
+        self.node_lat_lon = [node_lat_lo, node_lat_hi, node_lon_lo, node_lon_hi];
+        self.node_r = [node_r_lo, node_r_hi, 0.0, 0.0];
         self.write_uniforms();
     }
 

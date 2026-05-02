@@ -73,6 +73,18 @@ struct Uniforms {
     /// wp_dims_y, wp_dims_z, wp_slab_depth)`. Allows ribbon-pop
     /// continuity to know the outer geometry.
     subframe_wp_dims: vec4<u32>,
+    /// Node range — the (lat, lon, r) extent that the GPU node
+    /// pointed to by `root_index` actually covers. Distinct from
+    /// `subframe_lat_lon`: the SUB-FRAME range is the camera's deep
+    /// virtual target (drives basis + camera projection), the NODE
+    /// range is what the dispatched node literally partitions into
+    /// 27 children. They differ when the GPU tree is shallower than
+    /// the camera's logical depth (e.g. above the slab — node = WP =
+    /// full sphere; sub-frame = a thin patch around the camera).
+    /// `(lat_lo, lat_hi, lon_lo, lon_hi)` in radians.
+    node_lat_lon: vec4<f32>,
+    /// Node range radial. `(r_lo, r_hi, _, _)`.
+    node_r: vec4<f32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
     /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future

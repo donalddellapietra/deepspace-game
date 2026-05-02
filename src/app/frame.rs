@@ -10,16 +10,12 @@
 //! unit testing.
 
 use crate::world::anchor::Path;
-use crate::world::sphere_geom::{subframe_range, SphereSubFrameRange};
+use crate::world::sphere_geom::{subframe_range, SphereSubFrameRange, DEFAULT_SPHERE_LAT_MAX};
 use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
 /// Standard body size for `WrappedPlane` nodes — they always
 /// occupy their parent slot's full `[0, 3)³` local frame.
 const WRAPPED_PLANE_BODY_SIZE: f32 = 3.0;
-/// Default polar-ban latitude. Mirrors `--planet-render-sphere`'s
-/// uniform `planet_render.y` default; kept here so frame-resolution
-/// can compute sub-frame range without app-level config.
-const DEFAULT_SPHERE_LAT_MAX: f32 = 1.26;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
