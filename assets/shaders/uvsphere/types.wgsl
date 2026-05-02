@@ -39,18 +39,22 @@ const UV_MAX_ITER: u32 = 256u;
 const UV_SUBCELL_DESCENT: u32 = 4u;
 
 // Outcome of descending from a frame to the deepest cell containing
-// a point in `(φ, θ, r)` parameter-space. `dphi/dth/dr` are the
-// cell-axis sizes at the resolved depth (NOT the frame's). `un_*`
-// are cell-local fractions in `[0, 1)³`.
+// a point in `(φ, θ, r)` parameter-space. Returns ABSOLUTE bounds
+// (so the marcher can step to the next cell boundary in body-frame
+// coords without `3^K` cell-local amplification — see `cell.wgsl`)
+// and the cell-axis sizes at the resolved depth.
 struct UvDescend {
     found_block: bool,
     block_type: u32,
     dphi: f32,
     dth: f32,
     dr: f32,
-    un_phi: f32,
-    un_theta: f32,
-    un_r: f32,
+    phi_lo: f32,
+    phi_hi: f32,
+    theta_lo: f32,
+    theta_hi: f32,
+    r_lo: f32,
+    r_hi: f32,
     depth: u32,
 }
 
