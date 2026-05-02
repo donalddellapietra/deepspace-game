@@ -56,13 +56,20 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// Padding slot retained so the WGSL `Uniforms` block matches
-    /// the CPU-side `GpuUniforms` byte-for-byte. Unused.
-    _pad_radii: vec4<f32>,
-    /// Reserved 16 bytes — was slab_dims for the wrapped-plane path.
-    _pad_slab: vec4<u32>,
-    _pad_face_bounds: vec4<f32>,
-    _pad_face_pop_pos: vec4<f32>,
+    /// `(inner_r, outer_r, theta_cap, _pad)`. UV body params for the
+    /// `ROOT_KIND_UV_SUB_CELL` dispatch — `uniforms.root_index` is
+    /// the sub-cell's BFS idx for that path, so the body's params
+    /// can't be read from `node_kinds[root_index]`.
+    uv_body_params: vec4<f32>,
+    /// `(body_node_idx, _, _, _)`. BFS index of the enclosing body
+    /// node, when rendering a sub-cell.
+    uv_subcell_body_idx: vec4<u32>,
+    /// `(phi_min, theta_min, r_min, _pad)`. Sub-cell origin in the
+    /// body's spherical coords.
+    uv_subcell_origin: vec4<f32>,
+    /// `(dphi, dth, dr, _pad)`. Sub-cell extents in the body's
+    /// spherical coords.
+    uv_subcell_size: vec4<f32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
     /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved.
@@ -77,6 +84,7 @@ struct Uniforms {
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
 const ROOT_KIND_UV_SPHERE_BODY: u32 = 1u;
+const ROOT_KIND_UV_SUB_CELL: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:

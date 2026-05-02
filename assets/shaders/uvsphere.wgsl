@@ -85,28 +85,44 @@ fn uv_descend(
     body_inner_r: f32, body_outer_r: f32, body_theta_cap: f32,
     phi_w: f32, theta_w: f32, r_w: f32,
 ) -> UvDescend {
+    return uv_descend_from_frame(
+        body_node_idx,
+        0.0, -body_theta_cap, body_inner_r,
+        UV_TWO_PI, 2.0 * body_theta_cap, body_outer_r - body_inner_r,
+        phi_w, theta_w, r_w,
+    );
+}
+
+/// Descend from an arbitrary UV frame whose `(φ, θ, r)` range is
+/// `(phi_min, phi_min+frame_dphi) × (theta_min, theta_min+frame_dth) × (r_min, r_min+frame_dr)`.
+/// `frame_node_idx` is the BFS index of the frame's tree node — its
+/// 27 children are addressed by `pt + tt*3 + rt*9` exactly as the
+/// body root's children are. Operates entirely in cell-local
+/// fractions: at each level `un_*` rolls forward via
+/// `un = un·3 − tier`, and `dphi/dth/dr /= 3`. Both stay precise
+/// regardless of how deep the frame itself is.
+fn uv_descend_from_frame(
+    frame_node_idx: u32,
+    phi_min: f32, theta_min: f32, r_min: f32,
+    frame_dphi: f32, frame_dth: f32, frame_dr: f32,
+    phi_w: f32, theta_w: f32, r_w: f32,
+) -> UvDescend {
     var d: UvDescend;
     d.found_block = false;
     d.block_type = 0u;
-    d.dphi = UV_TWO_PI;
-    d.dth = 2.0 * body_theta_cap;
-    d.dr = body_outer_r - body_inner_r;
+    d.dphi = frame_dphi;
+    d.dth = frame_dth;
+    d.dr = frame_dr;
     d.un_phi = 0.0;
     d.un_theta = 0.0;
     d.un_r = 0.0;
     d.depth = 0u;
 
-    var un_phi = clamp(phi_w / UV_TWO_PI, 0.0, 1.0 - 1e-7);
-    var un_theta = clamp(
-        (theta_w + body_theta_cap) / (2.0 * body_theta_cap),
-        0.0, 1.0 - 1e-7,
-    );
-    var un_r = clamp(
-        (r_w - body_inner_r) / (body_outer_r - body_inner_r),
-        0.0, 1.0 - 1e-7,
-    );
+    var un_phi = clamp((phi_w - phi_min) / frame_dphi, 0.0, 1.0 - 1e-7);
+    var un_theta = clamp((theta_w - theta_min) / frame_dth, 0.0, 1.0 - 1e-7);
+    var un_r = clamp((r_w - r_min) / frame_dr, 0.0, 1.0 - 1e-7);
 
-    var node_idx = body_node_idx;
+    var node_idx = frame_node_idx;
     var depth: u32 = 0u;
 
     loop {
@@ -410,6 +426,162 @@ fn march_uv_sphere(body_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>
         }
         // Advance with a small ε to land inside the neighbor cell
         // rather than exactly on the shared boundary.
+        t = t + step.t + max(step.t * 1e-4, 1e-5);
+    }
+
+    return result;
+}
+
+// UV-sub-cell DDA. Same Jacobian-per-cell stepping as
+// `march_uv_sphere`, but the descent starts at a `frame_node_idx`
+// nested inside the body — every iteration's `un_*` lands in the
+// FRAME's `[0, 1]³`, not the body root's, so cell-local resolution
+// stays at f32 ULPs of the frame regardless of how deep the frame
+// itself is.
+//
+// Inputs:
+// - `frame_node_idx`: BFS index of the sub-cell node (its 27 children
+//   are the next UV tiers).
+// - `body_inner_r`, `body_outer_r`, `body_theta_cap`: body params,
+//   in body-frame `[0, 3)³` units (already body_size-scaled).
+// - `phi_min`, `theta_min`, `r_min`: frame origin in body's spherical
+//   coords.
+// - `frame_dphi`, `frame_dth`, `frame_dr`: frame extents in same.
+// - `ray_origin`, `ray_dir`: ray in body-frame `[0, 3)³` cartesian.
+//   The renderer's `gpu_camera_for_frame` writes the camera in this
+//   frame for sub-cell dispatch via `cartesian_path()`.
+//
+// When the ray exits the FRAME's `(φ, θ, r)` range we terminate
+// (no ribbon-pop yet — that's a follow-up). Most rays in
+// inside-the-body gameplay terminate on the surface block well
+// before exiting the frame, so the practical visual is correct;
+// rays threading the body without hitting are a known follow-up.
+fn march_uv_subcell(
+    frame_node_idx: u32,
+    body_inner_r: f32, body_outer_r: f32, body_theta_cap: f32,
+    phi_min: f32, theta_min: f32, r_min: f32,
+    frame_dphi: f32, frame_dth: f32, frame_dr: f32,
+    ray_origin: vec3<f32>, ray_dir: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 3.0;
+    result.color = vec3<f32>(0.0);
+    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+
+    let body_size = 3.0;
+    let center = vec3<f32>(body_size * 0.5);
+    let inner_r = body_inner_r;
+    let outer_r = body_outer_r;
+    let theta_cap = body_theta_cap;
+    let phi_max = phi_min + frame_dphi;
+    let theta_max = theta_min + frame_dth;
+    let r_max = r_min + frame_dr;
+
+    let oc_init = ray_origin - center;
+
+    // Body-shell entry test (same as the body-root marcher). Even
+    // though the frame is a sub-cell, the ray's entry into the
+    // overall body is what bounds the descent's t-range.
+    let outer_t = uv_ray_sphere(oc_init, ray_dir, outer_r);
+    if outer_t.y < 0.0001 || outer_t.x > outer_t.y {
+        return result;
+    }
+    let inside_outer = dot(oc_init, oc_init) <= outer_r * outer_r;
+    var t: f32 = select(max(outer_t.x, 0.0001), 0.0001, inside_outer);
+    let t_exit_outer = outer_t.y;
+
+    var iter: u32 = 0u;
+    loop {
+        if iter >= UV_MAX_ITER { break; }
+        iter += 1u;
+
+        if t > t_exit_outer + 1e-4 { break; }
+
+        let pos = ray_origin + ray_dir * t;
+        let off = pos - center;
+        let r_w = length(off);
+
+        if r_w > outer_r * 1.0001 { break; }
+        if r_w < inner_r * 0.9999 {
+            result.hit = true;
+            result.t = t;
+            result.normal = off / max(r_w, 1e-6);
+            result.color = palette[0u].rgb;
+            result.cell_min = pos - vec3<f32>(0.5);
+            result.cell_size = 1.0;
+            return result;
+        }
+        let theta_w = asin(clamp(off.y / max(r_w, 1e-6), -1.0, 1.0));
+        if abs(theta_w) > theta_cap { break; }
+        var phi_w = atan2(off.z, off.x);
+        if phi_w < 0.0 { phi_w += UV_TWO_PI; }
+
+        // Frame-bound check: if the ray has left the sub-cell's
+        // `(φ, θ, r)` range, we have no descent context here. This
+        // diff terminates; ribbon-pop into the frame's parent (and
+        // sibling sub-cells) is a follow-up.
+        let in_frame =
+            phi_w >= phi_min - 1e-6 && phi_w <= phi_max + 1e-6
+            && theta_w >= theta_min - 1e-6 && theta_w <= theta_max + 1e-6
+            && r_w >= r_min - 1e-6 && r_w <= r_max + 1e-6;
+        if !in_frame {
+            break;
+        }
+
+        let d = uv_descend_from_frame(
+            frame_node_idx,
+            phi_min, theta_min, r_min,
+            frame_dphi, frame_dth, frame_dr,
+            phi_w, theta_w, r_w,
+        );
+
+        if d.found_block {
+            let face = uv_hit_face(
+                off, r_w, theta_w, phi_w,
+                d.un_phi, d.un_theta, d.un_r,
+                d.dphi, d.dth, d.dr,
+            );
+            let bevel = uv_cell_bevel(d.un_phi, d.un_theta, d.un_r, face.axis);
+
+            result.hit = true;
+            result.t = t;
+            result.normal = face.normal;
+            result.color = palette[d.block_type].rgb * (0.7 + 0.3 * bevel);
+            result.cell_min = pos - vec3<f32>(0.5);
+            result.cell_size = 1.0;
+            return result;
+        }
+
+        // EMPTY cell. Step via cell-local Jacobian DDA — same as
+        // `march_uv_sphere`, just the per-cell `dphi/dth/dr` come
+        // from the frame-rooted descent so they're already cell-
+        // local at the sub-cell scale.
+        let cos_t = cos(theta_w);
+        let sin_t_w = sin(theta_w);
+        let cos_p = cos(phi_w);
+        let sin_p = sin(phi_w);
+        let r_hat = vec3<f32>(cos_t * cos_p, sin_t_w, cos_t * sin_p);
+        let theta_hat = vec3<f32>(-sin_t_w * cos_p, cos_t, -sin_t_w * sin_p);
+        let phi_hat = vec3<f32>(-sin_p, 0.0, cos_p);
+        let inv_r = 1.0 / max(r_w, 1e-6);
+        let inv_r_cos = 1.0 / max(r_w * cos_t, 1e-6);
+
+        let d_un_phi = dot(ray_dir, phi_hat) * inv_r_cos / max(d.dphi, 1e-12);
+        let d_un_theta = dot(ray_dir, theta_hat) * inv_r / max(d.dth, 1e-12);
+        let d_un_r = dot(ray_dir, r_hat) / max(d.dr, 1e-12);
+
+        let step = uv_cell_step(
+            d.un_phi, d.un_theta, d.un_r,
+            d_un_phi, d_un_theta, d_un_r,
+        );
+        if step.t > 1e20 {
+            break;
+        }
         t = t + step.t + max(step.t * 1e-4, 1e-5);
     }
 

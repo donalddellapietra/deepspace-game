@@ -881,6 +881,29 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     if uniforms.root_kind == ROOT_KIND_UV_SPHERE_BODY {
         return march_uv_sphere(uniforms.root_index, world_ray_origin, world_ray_dir);
     }
+    if uniforms.root_kind == ROOT_KIND_UV_SUB_CELL {
+        // Sub-cell dispatch: `uniforms.root_index` is the sub-cell's
+        // node BFS idx; the body's params come through dedicated
+        // uniforms (`uv_body_params`) since the cell node itself
+        // isn't a `UvSphereBody`. The ray is in body-frame
+        // `[0, 3)³` cartesian — `gpu_camera_for_frame` writes the
+        // camera using the body's `cartesian_path()` for sub-cell
+        // frames, matching the body-root convention.
+        return march_uv_subcell(
+            uniforms.root_index,
+            uniforms.uv_body_params.x,
+            uniforms.uv_body_params.y,
+            uniforms.uv_body_params.z,
+            uniforms.uv_subcell_origin.x,
+            uniforms.uv_subcell_origin.y,
+            uniforms.uv_subcell_origin.z,
+            uniforms.uv_subcell_size.x,
+            uniforms.uv_subcell_size.y,
+            uniforms.uv_subcell_size.z,
+            world_ray_origin,
+            world_ray_dir,
+        );
+    }
 
     var ray_origin = world_ray_origin;
     var ray_dir = world_ray_dir;
