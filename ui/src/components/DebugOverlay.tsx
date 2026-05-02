@@ -54,9 +54,9 @@ function formatDebug(s: DebugOverlayState): string {
     "",
     "── frame ──",
     pad("active kind", s.activeFrameKind),
-    "render   [" + s.renderPathCsv + "]",
-    "intended [" + (s.intendedRenderPathCsv || "") + "]",
-    "anchor   [" + s.anchorSlotsCsv + "]",
+    "{{PATH:render   [" + s.renderPathCsv + "]}}",
+    "{{PATH:intended [" + (s.intendedRenderPathCsv || "") + "]}}",
+    "{{PATH:anchor   [" + s.anchorSlotsCsv + "]}}",
     "",
     "── rotation ──",
     pad("TB on anchor path", s.tbOnAnchorPath ? "yes" : "no"),
@@ -120,17 +120,21 @@ export function DebugOverlay() {
 
   if (!s.visible) return null;
 
-  const lines = [
-    "DEBUG  ]=toggle  [=copy",
-    formatDebug(s),
-  ];
+  const raw = "DEBUG  ]=toggle  [=copy\n" + formatDebug(s);
+  const parts = raw.split("\n").map((line, i) => {
+    const pathMatch = line.match(/^\{\{PATH:(.+)\}\}$/);
+    if (pathMatch) {
+      return <span key={i} className="path-line">{pathMatch[1]}{"\n"}</span>;
+    }
+    return <span key={i}>{line}{"\n"}</span>;
+  });
 
   return (
     <div className="debug-overlay">
       {flash === "copied" && <div>✓ copied to clipboard</div>}
       {flash === "failed" && <div>✗ copy failed (clipboard blocked)</div>}
       {flash !== null && <div>{" "}</div>}
-      {lines.join("\n")}
+      {parts}
     </div>
   );
 }
