@@ -227,51 +227,44 @@ pub fn cpu_raycast_sphere_uv(
             continue;
         }
 
-        // Sub-slab descent: when the slab cell is an anchor Node and
-        // the user's edit depth (max_depth) goes beyond the slab,
-        // continue picking sub-cells using the ray's fractional
-        // (lon, lat, r) coords WITHIN the slab cell. Each level
-        // multiplies the resolution by 3, so the break path lands at
-        // the right sub-cell for the camera's anchor depth — same
-        // behavior as Cartesian where deeper anchors break smaller
-        // cells, and as 2-2-3-2's `walk_face_subtree(max_depth)`.
-        if let Some(mut node_idx) = sub_idx {
+        // Sub-slab descent — Cartesian-local DDA matching the GPU
+        // shader's `sphere_descend_anchor` exactly. The previous
+        // version walked sub-cells using EQUAL ANGULAR slices of
+        // (lon, lat, r), which diverged from the GPU's CARTESIAN-LOCAL
+        // sub-cell partition at descent depth ≥ 2. The mismatch caused
+        // breaks at depth ≥ 2 to hit slot path A (CPU) while the GPU
+        // rendered slot path B — so a "successful" CPU edit had no
+        // visible effect (the GPU's DDA traversed past the break and
+        // rendered a different sub-cell that wasn't edited).
+        //
+        // Both sides now use the same orthonormal local frame at the
+        // slab cell's center (e_lon, e_r, e_lat tangents) and walk
+        // sub-cells via standard Cartesian DDA in [0, 3)³ with re-zero
+        // per push (`new_O = (old_O - cell) * 3`, `new_D = old_D * 3`).
+        // Coordinates stay O(1) at every depth — same trick as
+        // Cartesian's ribbon-pop, applied in the descent direction.
+        if let Some(anchor_idx) = sub_idx {
             let absolute_slab_depth = frame_path.len() as u32 + slab_depth as u32;
-            let extra_levels = max_depth.saturating_sub(absolute_slab_depth);
+            let extra_levels = max_depth.saturating_sub(absolute_slab_depth) as usize;
             if extra_levels > 0 {
-                // Fractional coords within the hit slab cell. The
-                // sample was taken at the layer's TOP boundary (r at
-                // the cell's outer face), so r_in_cell ≈ 1.0 — bias
-                // it slightly inside so floor-pick lands on the
-                // outermost r-slot (sy = 2), which is the cell at
-                // the surface the user sees.
-                let lon_fine = u_l * dims[0] as f32;
-                let lat_fine = v_l * dims[2] as f32;
-                let mut frac_x = (lon_fine - cell_x as f32).clamp(0.0, 0.99999);
-                let mut frac_z = (lat_fine - cell_z as f32).clamp(0.0, 0.99999);
-                let mut frac_y = 0.99999_f32;
-                for _ in 0..extra_levels {
-                    let sx = (frac_x * 3.0).floor() as usize;
-                    let sy = (frac_y * 3.0).floor() as usize;
-                    let sz = (frac_z * 3.0).floor() as usize;
-                    let slot = slot_index(sx, sy, sz);
-                    path.push((node_idx, slot));
-                    let node = match library.get(node_idx) {
-                        Some(n) => n,
-                        None => break,
-                    };
-                    match node.children[slot] {
-                        Child::Node(c) => node_idx = c,
-                        // Sub-cell terminates: leaf Block, Empty (a
-                        // hole someone dug earlier), or EntityRef.
-                        // Path now points at this sub-cell — that's
-                        // what the caller should break/place.
-                        _ => break,
-                    }
-                    frac_x = (frac_x * 3.0) - sx as f32;
-                    frac_y = (frac_y * 3.0) - sy as f32;
-                    frac_z = (frac_z * 3.0) - sz as f32;
-                }
+                let lon_step = 2.0 * pi / dims[0] as f32;
+                let lat_step = 2.0 * lat_max / dims[2] as f32;
+                let r_step = shell_thickness / dims[1] as f32;
+                let lon_c = -pi + (cell_x as f32 + 0.5) * lon_step;
+                let lat_c = -lat_max + (cell_z as f32 + 0.5) * lat_step;
+                let r_c   = r_inner + (cy as f32 + 0.5) * r_step;
+                descend_anchor_cartesian_local(
+                    library,
+                    anchor_idx,
+                    cam_local,
+                    dir,
+                    cs_center,
+                    lon_c, lat_c, r_c,
+                    lon_step, lat_step, r_step,
+                    t_layer,
+                    extra_levels,
+                    &mut path,
+                );
             }
         }
 
@@ -284,6 +277,263 @@ pub fn cpu_raycast_sphere_uv(
     }
 
     None
+}
+
+/// Cartesian-local DDA inside a sphere-render anchor block. CPU mirror
+/// of the GPU's `sphere_descend_anchor` (assets/shaders/march_sphere_anchor.wgsl).
+///
+/// Both walk an orthonormal frame at the slab cell's center
+/// (e_lon, e_r, e_lat tangents to the sphere), with the slab cell
+/// occupying `[0, 3)³` in local. Each push re-zeros the local frame
+/// onto the descended cell:
+///     new_O = (old_O - cell) * 3
+///     new_D = old_D * 3
+/// so coordinates stay O(1) at every depth. The cell index path
+/// produced is the slot path through the anchor's tree, which becomes
+/// `HitInfo.path` and feeds `propagate_edit` for break/place.
+///
+/// CPU and GPU MUST agree on the slot path or a CPU edit lands at one
+/// cell while the GPU renders a different one. This function is the
+/// CPU side of that contract.
+fn descend_anchor_cartesian_local(
+    library: &NodeLibrary,
+    anchor_idx: NodeId,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    cs_center: [f32; 3],
+    cell_lon_center: f32, cell_lat_center: f32, cell_r_center: f32,
+    cell_lon_step: f32, cell_lat_step: f32, cell_r_step: f32,
+    t_in: f32,
+    max_extra_levels: usize,
+    path: &mut Vec<(NodeId, usize)>,
+) {
+    // Build orthonormal local frame at slab cell center.
+    let cos_lat = cell_lat_center.cos();
+    let sin_lat = cell_lat_center.sin();
+    let cos_lon = cell_lon_center.cos();
+    let sin_lon = cell_lon_center.sin();
+    let e_r:   [f32; 3] = [cos_lat * cos_lon,  sin_lat,        cos_lat * sin_lon];
+    let e_lon: [f32; 3] = [-sin_lon,           0.0,            cos_lon];
+    let e_lat: [f32; 3] = [-sin_lat * cos_lon, cos_lat,       -sin_lat * sin_lon];
+
+    // Slab cell extents in world along the three local axes (slab-axis
+    // convention: local x→e_lon, y→e_r, z→e_lat — matches slot layout
+    // dims = [lon, r, lat]).
+    let ext_x = cell_r_center * cos_lat * cell_lon_step;
+    let ext_y = cell_r_step;
+    let ext_z = cell_r_center * cell_lat_step;
+    let scale_x = 3.0 / ext_x.max(1e-30);
+    let scale_y = 3.0 / ext_y.max(1e-30);
+    let scale_z = 3.0 / ext_z.max(1e-30);
+
+    let cell_corner = [
+        cs_center[0] + cell_r_center * e_r[0]
+            - 0.5 * ext_x * e_lon[0]
+            - 0.5 * ext_y * e_r[0]
+            - 0.5 * ext_z * e_lat[0],
+        cs_center[1] + cell_r_center * e_r[1]
+            - 0.5 * ext_x * e_lon[1]
+            - 0.5 * ext_y * e_r[1]
+            - 0.5 * ext_z * e_lat[1],
+        cs_center[2] + cell_r_center * e_r[2]
+            - 0.5 * ext_x * e_lon[2]
+            - 0.5 * ext_y * e_r[2]
+            - 0.5 * ext_z * e_lat[2],
+    ];
+
+    let dv = [
+        ray_origin[0] - cell_corner[0],
+        ray_origin[1] - cell_corner[1],
+        ray_origin[2] - cell_corner[2],
+    ];
+    let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    let mut cur_o: [f32; 3] = [
+        dot3(dv, e_lon) * scale_x,
+        dot3(dv, e_r)   * scale_y,
+        dot3(dv, e_lat) * scale_z,
+    ];
+    let mut cur_d: [f32; 3] = [
+        dot3(ray_dir, e_lon) * scale_x,
+        dot3(ray_dir, e_r)   * scale_y,
+        dot3(ray_dir, e_lat) * scale_z,
+    ];
+
+    let inv_or_huge = |v: f32| if v.abs() > 1e-12 { 1.0 / v } else { 1e30 };
+    let mut inv_dir = [inv_or_huge(cur_d[0]), inv_or_huge(cur_d[1]), inv_or_huge(cur_d[2])];
+    let mut step = [
+        if cur_d[0] >= 0.0 { 1i32 } else { -1 },
+        if cur_d[1] >= 0.0 { 1i32 } else { -1 },
+        if cur_d[2] >= 0.0 { 1i32 } else { -1 },
+    ];
+    let mut delta_dist = [inv_dir[0].abs(), inv_dir[1].abs(), inv_dir[2].abs()];
+
+    // Initial cell at slab entry (t = t_in is the slab DDA's current
+    // t; ray is geometrically inside the curved slab cell at this t).
+    let entry_pos = [
+        cur_o[0] + cur_d[0] * t_in,
+        cur_o[1] + cur_d[1] * t_in,
+        cur_o[2] + cur_d[2] * t_in,
+    ];
+    let mut cur_cell: [i32; 3] = [
+        (entry_pos[0].floor() as i32).clamp(0, 2),
+        (entry_pos[1].floor() as i32).clamp(0, 2),
+        (entry_pos[2].floor() as i32).clamp(0, 2),
+    ];
+    let mut cur_side_dist: [f32; 3] = [
+        if cur_d[0] >= 0.0 { (cur_cell[0] as f32 + 1.0 - cur_o[0]) * inv_dir[0] }
+        else                 { (cur_cell[0] as f32       - cur_o[0]) * inv_dir[0] },
+        if cur_d[1] >= 0.0 { (cur_cell[1] as f32 + 1.0 - cur_o[1]) * inv_dir[1] }
+        else                 { (cur_cell[1] as f32       - cur_o[1]) * inv_dir[1] },
+        if cur_d[2] >= 0.0 { (cur_cell[2] as f32 + 1.0 - cur_o[2]) * inv_dir[2] }
+        else                 { (cur_cell[2] as f32       - cur_o[2]) * inv_dir[2] },
+    ];
+
+    // Stack of saved cell indices for pop (un-re-zero).
+    let mut s_cell_path: Vec<[i32; 3]> = Vec::with_capacity(max_extra_levels);
+    let mut cur_node = anchor_idx;
+    let mut depth: usize = 0;
+    let mut iters = 0usize;
+    let max_iters = 4096usize;
+
+    let min_axis = |sd: [f32; 3]| -> usize {
+        if sd[0] <= sd[1] && sd[0] <= sd[2] { 0 }
+        else if sd[1] <= sd[2] { 1 }
+        else { 2 }
+    };
+
+    loop {
+        if iters >= max_iters { break; }
+        iters += 1;
+
+        // OOB → pop one frame.
+        if cur_cell[0] < 0 || cur_cell[0] > 2
+            || cur_cell[1] < 0 || cur_cell[1] > 2
+            || cur_cell[2] < 0 || cur_cell[2] > 2
+        {
+            if depth == 0 { break; }
+            depth -= 1;
+            // Pop transform reverses the push:
+            //   old_O = new_O / 3 + popped_cell
+            //   old_D = new_D / 3
+            let popped = s_cell_path.pop().unwrap();
+            cur_o = [
+                cur_o[0] / 3.0 + popped[0] as f32,
+                cur_o[1] / 3.0 + popped[1] as f32,
+                cur_o[2] / 3.0 + popped[2] as f32,
+            ];
+            cur_d = [cur_d[0] / 3.0, cur_d[1] / 3.0, cur_d[2] / 3.0];
+            inv_dir = [inv_dir[0] * 3.0, inv_dir[1] * 3.0, inv_dir[2] * 3.0];
+            delta_dist = [delta_dist[0] * 3.0, delta_dist[1] * 3.0, delta_dist[2] * 3.0];
+            // Path entry for the popped level was added at push; the
+            // descent didn't terminate inside that subtree, so we
+            // remove the path entry that pointed into it.
+            path.pop();
+            // Determine which face we crossed (in CHILD frame coords)
+            // and advance parent's cell on that axis.
+            let mut axis_x = 0i32;
+            let mut axis_y = 0i32;
+            let mut axis_z = 0i32;
+            if cur_cell[0] < 0 { axis_x = -1; }
+            if cur_cell[0] > 2 { axis_x =  1; }
+            if cur_cell[1] < 0 { axis_y = -1; }
+            if cur_cell[1] > 2 { axis_y =  1; }
+            if cur_cell[2] < 0 { axis_z = -1; }
+            if cur_cell[2] > 2 { axis_z =  1; }
+            cur_cell = [popped[0] + axis_x, popped[1] + axis_y, popped[2] + axis_z];
+            // Walk parent node back into scope.
+            cur_node = path.last().map(|(p, _)| {
+                let parent = library.get(*p).unwrap();
+                let slot_at_parent = path.last().unwrap().1;
+                if let Child::Node(n) = parent.children[slot_at_parent] {
+                    n
+                } else { unreachable!("descent stack disagrees with tree") }
+            }).unwrap_or(anchor_idx);
+            // Recompute side_dist for the new (parent-frame) cell.
+            let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
+            cur_side_dist = [
+                if cur_d[0] >= 0.0 { (cf[0] + 1.0 - cur_o[0]) * inv_dir[0] }
+                else                 { (cf[0]       - cur_o[0]) * inv_dir[0] },
+                if cur_d[1] >= 0.0 { (cf[1] + 1.0 - cur_o[1]) * inv_dir[1] }
+                else                 { (cf[1]       - cur_o[1]) * inv_dir[1] },
+                if cur_d[2] >= 0.0 { (cf[2] + 1.0 - cur_o[2]) * inv_dir[2] }
+                else                 { (cf[2]       - cur_o[2]) * inv_dir[2] },
+            ];
+            let _ = step;
+            continue;
+        }
+
+        let slot = slot_index(cur_cell[0] as usize, cur_cell[1] as usize, cur_cell[2] as usize);
+        let node = match library.get(cur_node) {
+            Some(n) => n,
+            None => return,
+        };
+        let child = node.children[slot];
+
+        match child {
+            Child::Empty | Child::EntityRef(_) => {
+                // Empty slot: step DDA along smallest side_dist.
+                let m = min_axis(cur_side_dist);
+                let step_axis = step[m];
+                cur_cell[m] += step_axis;
+                cur_side_dist[m] += delta_dist[m];
+                continue;
+            }
+            Child::Block(_) => {
+                // Hit a Block leaf — terminate descent here.
+                path.push((cur_node, slot));
+                return;
+            }
+            Child::Node(child_id) => {
+                // Push or terminate at extra-level limit.
+                path.push((cur_node, slot));
+                if depth + 1 >= max_extra_levels {
+                    return;
+                }
+                // Re-zero local frame onto the cell.
+                s_cell_path.push(cur_cell);
+                let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
+                cur_o = [
+                    (cur_o[0] - cf[0]) * 3.0,
+                    (cur_o[1] - cf[1]) * 3.0,
+                    (cur_o[2] - cf[2]) * 3.0,
+                ];
+                cur_d = [cur_d[0] * 3.0, cur_d[1] * 3.0, cur_d[2] * 3.0];
+                inv_dir = [inv_dir[0] / 3.0, inv_dir[1] / 3.0, inv_dir[2] / 3.0];
+                delta_dist = [delta_dist[0] / 3.0, delta_dist[1] / 3.0, delta_dist[2] / 3.0];
+
+                depth += 1;
+                cur_node = child_id;
+
+                // Compute new sub-cell at depth+1 from ray's pos in
+                // the new frame. Since the push preserves the world
+                // ray, the position at the same world-t maps to a
+                // local-pos that lies in [0, 3)³.
+                // Use a small offset past the just-crossed face so
+                // numerical error doesn't put us back outside.
+                let new_pos = [
+                    cur_o[0] + cur_d[0] * t_in,
+                    cur_o[1] + cur_d[1] * t_in,
+                    cur_o[2] + cur_d[2] * t_in,
+                ];
+                cur_cell = [
+                    (new_pos[0].floor() as i32).clamp(0, 2),
+                    (new_pos[1].floor() as i32).clamp(0, 2),
+                    (new_pos[2].floor() as i32).clamp(0, 2),
+                ];
+                let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
+                cur_side_dist = [
+                    if cur_d[0] >= 0.0 { (cf[0] + 1.0 - cur_o[0]) * inv_dir[0] }
+                    else                 { (cf[0]       - cur_o[0]) * inv_dir[0] },
+                    if cur_d[1] >= 0.0 { (cf[1] + 1.0 - cur_o[1]) * inv_dir[1] }
+                    else                 { (cf[1]       - cur_o[1]) * inv_dir[1] },
+                    if cur_d[2] >= 0.0 { (cf[2] + 1.0 - cur_o[2]) * inv_dir[2] }
+                    else                 { (cf[2]       - cur_o[2]) * inv_dir[2] },
+                ];
+                continue;
+            }
+        }
+    }
 }
 
 /// Frame-aware raycast. Mirrors the renderer's ribbon-pop
