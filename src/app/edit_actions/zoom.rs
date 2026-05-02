@@ -103,14 +103,12 @@ impl App {
                 self.world.root,
                 &shallower,
                 shallower.depth(),
-                Some(&self.camera.position),
             );
             frame = ActiveFrame {
                 render_path: render.render_path,
                 logical_path,
                 node_id: render.node_id,
                 kind: render.kind,
-                tb_center: render.tb_center,
             };
         }
         if self.startup_profile_frames < 4 {

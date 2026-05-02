@@ -93,31 +93,14 @@ impl GpuNodeKind {
                 kind: 1, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
                 rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
             },
-            NodeKind::TangentBlock { rotation } => {
-                let content_scale = inscribed_cube_scale(&rotation);
-                Self {
-                    kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
-                    rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], content_scale],
-                    rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
-                    rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
-                }
+            NodeKind::TangentBlock { rotation } => Self {
+                kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
+                rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], 0.0],
+                rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
+                rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
             },
         }
     }
-}
-
-/// Largest uniform scale factor s such that a [0,3s)³ cube centered
-/// at [1.5,1.5,1.5], after rotation R, fits entirely within [0,3)³.
-/// For each world axis i, the rotated cube's half-extent along i is
-/// 1.5·s·sum_j(|R[j][i]|). Setting that ≤ 1.5 gives
-/// s ≤ 1 / max_i(sum_j(|R[j][i]|)).
-fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
-    let mut max_extent = 0.0f32;
-    for i in 0..3 {
-        let extent = r[0][i].abs() + r[1][i].abs() + r[2][i].abs();
-        max_extent = max_extent.max(extent);
-    }
-    if max_extent < 1e-6 { 1.0 } else { (1.0 / max_extent).min(1.0) }
 }
 
 /// Camera uniforms in shader-frame coords. `pos`/`forward`/etc. are
@@ -219,14 +202,13 @@ mod tests {
             rotation: IDENTITY_ROTATION,
         });
         assert_eq!(k.kind, 2);
-        assert_eq!(k.rot_col0, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(k.rot_col0, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(k.rot_col1, [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(k.rot_col2, [0.0, 0.0, 1.0, 0.0]);
 
         let r = [[0.5, 0.6, 0.7], [0.1, 0.2, 0.3], [0.9, 0.8, 0.4]];
         let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock { rotation: r });
-        let expected_scale = inscribed_cube_scale(&r);
-        assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, expected_scale]);
+        assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, 0.0]);
         assert_eq!(k.rot_col1, [0.1, 0.2, 0.3, 0.0]);
         assert_eq!(k.rot_col2, [0.9, 0.8, 0.4, 0.0]);
     }

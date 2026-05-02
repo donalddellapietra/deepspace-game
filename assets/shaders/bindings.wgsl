@@ -56,13 +56,7 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// TB frame rotation center in frame-local [0,3)³ coords.
-    /// When the frame path crosses a TangentBlock and descends
-    /// into Cartesian children below, the shader applies R^T
-    /// around this center at frame entry. [1.5,1.5,1.5] when the
-    /// frame root IS the TB; shifts as the frame goes deeper.
-    /// Zero when no TB on the frame path.
-    frame_tb_center: vec4<f32>,
+    _pad_radii: vec4<f32>,
     /// `WrappedPlane` slab dimensions, populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`. `(dims_x, dims_y, dims_z, slab_depth)`.
     /// Phase 2 reads `dims_x` + `slab_depth` (the `.x` and `.w` lanes)

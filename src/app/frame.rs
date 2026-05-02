@@ -31,15 +31,6 @@ pub struct ActiveFrame {
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
-    /// Rotation center for the shader's frame-entry R^T, in the
-    /// frame root's [0,3)³ local coords. When the frame path passes
-    /// through a TangentBlock and continues into Cartesian children
-    /// below it, the shader applies R^T around this center so the
-    /// DDA sees the same rotated view as rays entering from outside.
-    /// `[1.5, 1.5, 1.5]` when the frame root IS the TB; shifts as
-    /// the frame descends deeper. `[0; 3]` (unused) when no TB is
-    /// on the frame path.
-    pub tb_center: [f32; 3],
 }
 
 /// Build a `Path` from the slot prefix the GPU ribbon walker
@@ -60,18 +51,14 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 /// marcher's local frame, so the render frame must be the slab
 /// root, not a sub-cell of it.
 ///
-/// When the descent hits a `TangentBlock`, it computes the camera's
-/// R^T-rotated+scaled position in TB-local and continues descending
-/// using slots derived from the rotated position. This lets the
-/// frame go deeper within the TB (matching the shader's rotated
-/// view) while keeping the render_path consistent with the camera's
-/// actual position after rotation.
+/// TangentBlock nodes are traversed normally (descent continues
+/// into their children). The shader handles the visual rotation
+/// via direction-only R^T in the march_cartesian TB dispatch.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
     camera_anchor: &Path,
     desired_depth: u8,
-    cam_pos: Option<&crate::world::anchor::WorldPos>,
 ) -> ActiveFrame {
     let mut target = *camera_anchor;
     target.truncate(desired_depth);
@@ -83,12 +70,7 @@ pub fn compute_render_frame(
         }
         _ => ActiveFrameKind::Cartesian,
     };
-    let mut tb_center = [0.0f32; 3];
-
-    // Phase 1: descend using the unrotated anchor until we hit a TB
-    // or WrappedPlane (or run out of path/nodes).
-    let mut k = 0usize;
-    while k < target.depth() as usize {
+    for k in 0..target.depth() as usize {
         if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
@@ -98,71 +80,10 @@ pub fn compute_render_frame(
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
-                k += 1;
                 if let Some(child_node) = library.get(child_id) {
-                    match child_node.kind {
-                        NodeKind::WrappedPlane { dims, slab_depth } => {
-                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                            break;
-                        }
-                        NodeKind::TangentBlock { rotation } => {
-                            // Phase 2: compute the R^T-rotated+scaled
-                            // camera position in TB-local [0,3)³, then
-                            // descend using Cartesian floor arithmetic
-                            // on the rotated position.
-                            let tb_scale = inscribed_cube_scale(&rotation);
-                            tb_center = [1.5, 1.5, 1.5];
-                            if let Some(pos) = cam_pos {
-                                let cam_tb = pos.in_frame(&reached);
-                                let centered = [
-                                    cam_tb[0] - 1.5,
-                                    cam_tb[1] - 1.5,
-                                    cam_tb[2] - 1.5,
-                                ];
-                                let mut rotated_pos = [
-                                    1.5 + (rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2]) / tb_scale,
-                                    1.5 + (rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2]) / tb_scale,
-                                    1.5 + (rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2]) / tb_scale,
-                                ];
-                                while k < target.depth() as usize {
-                                    let Some(n) = library.get(node_id) else { break };
-                                    let cx = (rotated_pos[0].floor() as i32).clamp(0, 2) as usize;
-                                    let cy = (rotated_pos[1].floor() as i32).clamp(0, 2) as usize;
-                                    let cz = (rotated_pos[2].floor() as i32).clamp(0, 2) as usize;
-                                    let rs = crate::world::tree::slot_index(cx, cy, cz);
-                                    match n.children[rs] {
-                                        Child::Node(cid) => {
-                                            reached.push(rs as u8);
-                                            node_id = cid;
-                                            if let Some(cn) = library.get(cid) {
-                                                if matches!(cn.kind, NodeKind::WrappedPlane { .. }) {
-                                                    if let NodeKind::WrappedPlane { dims, slab_depth } = cn.kind {
-                                                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                            // Update tb_center for this descent level
-                                            tb_center = [
-                                                (tb_center[0] - cx as f32) * 3.0,
-                                                (tb_center[1] - cy as f32) * 3.0,
-                                                (tb_center[2] - cz as f32) * 3.0,
-                                            ];
-                                            // Rescale rotated_pos into child's [0,3)³
-                                            rotated_pos = [
-                                                (rotated_pos[0] - cx as f32) * 3.0,
-                                                (rotated_pos[1] - cy as f32) * 3.0,
-                                                (rotated_pos[2] - cz as f32) * 3.0,
-                                            ];
-                                            k += 1;
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        _ => {}
+                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
+                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                        break;
                     }
                 }
             }
@@ -174,17 +95,7 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
-        tb_center,
     }
-}
-
-fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
-    let mut max_extent = 0.0f32;
-    for i in 0..3 {
-        let extent = r[0][i].abs() + r[1][i].abs() + r[2][i].abs();
-        max_extent = max_extent.max(extent);
-    }
-    if max_extent < 1e-6 { 1.0 } else { (1.0 / max_extent).min(1.0) }
 }
 
 pub fn with_render_margin(
@@ -192,9 +103,8 @@ pub fn with_render_margin(
     world_root: NodeId,
     logical_path: &Path,
     render_margin: u8,
-    cam_pos: Option<&crate::world::anchor::WorldPos>,
 ) -> ActiveFrame {
-    let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth(), cam_pos);
+    let logical = compute_render_frame(library, world_root, logical_path, logical_path.depth());
     let min_render_depth = logical.logical_path.depth();
     let render_depth = logical
         .logical_path
@@ -207,13 +117,12 @@ pub fn with_render_margin(
 
     let mut render_path = logical.logical_path;
     render_path.truncate(render_depth);
-    let render = compute_render_frame(library, world_root, &render_path, render_depth, cam_pos);
+    let render = compute_render_frame(library, world_root, &render_path, render_depth);
     ActiveFrame {
         render_path: render.render_path,
         logical_path: logical.logical_path,
         node_id: render.node_id,
         kind: render.kind,
-        tb_center: render.tb_center,
     }
 }
 
@@ -232,14 +141,12 @@ mod tests {
         (lib, node)
     }
 
-    // --------- compute_render_frame ---------
-
     #[test]
     fn render_frame_root_when_desired_depth_zero() {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
         for _ in 0..3 { anchor.push(13); }
-        let frame = compute_render_frame(&lib, root, &anchor, 0, None);
+        let frame = compute_render_frame(&lib, root, &anchor, 0);
         assert_eq!(frame.render_path.depth(), 0);
         assert_eq!(frame.node_id, root);
     }
@@ -249,7 +156,7 @@ mod tests {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
         for _ in 0..4 { anchor.push(13); }
-        let frame = compute_render_frame(&lib, root, &anchor, 3, None);
+        let frame = compute_render_frame(&lib, root, &anchor, 3);
         assert_eq!(frame.render_path.depth(), 3);
     }
 
@@ -258,7 +165,7 @@ mod tests {
         let (lib, root) = cartesian_chain(5);
         let mut anchor = Path::root();
         anchor.push(13);
-        let frame = compute_render_frame(&lib, root, &anchor, 5, None);
+        let frame = compute_render_frame(&lib, root, &anchor, 5);
         assert!(frame.render_path.depth() <= 1);
     }
 
@@ -272,7 +179,7 @@ mod tests {
         let mut anchor = Path::root();
         anchor.push(5);
         anchor.push(0);
-        let frame = compute_render_frame(&lib, root, &anchor, 2, None);
+        let frame = compute_render_frame(&lib, root, &anchor, 2);
         assert_eq!(frame.render_path.depth(), 0, "Block child terminates descent");
     }
 
@@ -304,7 +211,7 @@ mod tests {
         let mut anchor = Path::root();
         anchor.push(slot_index(1, 1, 1) as u8);
         anchor.push(slot_index(2, 0, 0) as u8);
-        let frame = compute_render_frame(&lib, root, &anchor, 5, None);
+        let frame = compute_render_frame(&lib, root, &anchor, 5);
         assert_eq!(frame.render_path.depth(), 1);
         match frame.kind {
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
@@ -331,7 +238,7 @@ mod tests {
 
         let mut anchor = Path::root();
         anchor.push(0);
-        let frame = compute_render_frame(&lib, root, &anchor, 3, None);
+        let frame = compute_render_frame(&lib, root, &anchor, 3);
         assert!(matches!(frame.kind, ActiveFrameKind::Cartesian));
     }
 }

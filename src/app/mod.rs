@@ -392,7 +392,6 @@ impl App {
         logical_path.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
-            Some(&position),
         );
         eprintln!(
             "startup_perf initial_frame kind={:?} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
@@ -518,7 +517,6 @@ impl App {
         frame::with_render_margin(
             &self.world.library, self.world.root,
             &logical_path, RENDER_FRAME_CONTEXT,
-            Some(&self.camera.position),
         )
     }
 
