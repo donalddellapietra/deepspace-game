@@ -172,7 +172,23 @@ fn sphere_descend_anchor(
         select((cell_f0.z       - O_l.z) * inv_dir.z,
                (cell_f0.z + 1.0 - O_l.z) * inv_dir.z, D_l.z >= 0.0),
     );
-    var normal = vec3<f32>(0.0);
+    // Entry normal: which face of slab cell [0, 3)³ did the ray enter
+    // through? Computed via ray-box maths on [0, 3)³. The DDA's
+    // advance branches set `normal = -step` on the axis they crossed,
+    // but a HIT on the first iteration (no advance) was leaving
+    // `normal` at zero, which wrecked the bevel face-axis selection.
+    let t1_slab = (vec3<f32>(0.0) - O_l) * inv_dir;
+    let t2_slab = (vec3<f32>(3.0) - O_l) * inv_dir;
+    let t_lo_slab = min(t1_slab, t2_slab);
+    let entry_t_slab = max(t_lo_slab.x, max(t_lo_slab.y, t_lo_slab.z));
+    var normal: vec3<f32>;
+    if t_lo_slab.x >= entry_t_slab - 1e-9 {
+        normal = vec3<f32>(-f32(step.x), 0.0, 0.0);
+    } else if t_lo_slab.y >= entry_t_slab - 1e-9 {
+        normal = vec3<f32>(0.0, -f32(step.y), 0.0);
+    } else {
+        normal = vec3<f32>(0.0, 0.0, -f32(step.z));
+    }
 
     let root_header_off = node_offsets[anchor_idx];
     var cur_occupancy: u32 = tree[root_header_off];
