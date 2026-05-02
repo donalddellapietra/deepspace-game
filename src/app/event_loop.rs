@@ -385,6 +385,47 @@ impl App {
                     self.camera.position.in_frame(&self.active_frame.render_path)
                 }
             };
+            // Camera world position via plain Cartesian `in_frame` —
+            // matches what `add_local` actually moves through. Reporting
+            // a rotation-aware value would diverge from the renderer +
+            // movement system's view of the camera position.
+            let camera_root_xyz = self
+                .camera
+                .position
+                .in_frame(&crate::world::anchor::Path::root());
+            let anchor_depth = self.camera.position.anchor.depth();
+            let anchor_cell_size_root =
+                crate::world::anchor::WORLD_SIZE / 3.0_f32.powi(anchor_depth as i32);
+            let anchor_slots_csv = self
+                .camera
+                .position
+                .anchor
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let active_frame_kind = match self.active_frame.kind {
+                crate::app::ActiveFrameKind::Cartesian => "Cartesian".to_string(),
+                crate::app::ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                    format!("WrappedPlane(dims={dims:?}, slab_d={slab_depth})")
+                }
+                crate::app::ActiveFrameKind::TangentBlock => "TangentBlock".to_string(),
+            };
+            let render_path_csv = self
+                .active_frame
+                .render_path
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let (tb_on_anchor_path, anchor_cumulative_yaw_deg) =
+                tangent_block_chain_summary(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position.anchor,
+                );
             // Keep the UI's zoom_level in sync with the live anchor
             // depth. `edit_actions::zoom` updates it on explicit zoom
             // input, but startup spawns + bootstrap defaults (e.g. the
@@ -407,10 +448,18 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_anchor_depth: self.camera.position.anchor.depth() as u32,
+                    camera_anchor_depth: anchor_depth as u32,
                     camera_local,
                     fov: 1.2,
                     node_count: self.world.library.len(),
+                    camera_root_xyz,
+                    anchor_cell_size_root,
+                    anchor_slots_csv,
+                    active_frame_kind,
+                    render_path_csv,
+                    tb_on_anchor_path,
+                    anchor_cumulative_yaw_deg,
+                    copy_seq: self.debug_copy_seq,
                 },
             ));
         }
@@ -704,4 +753,50 @@ fn wasm_canvas_setup(
         resize_cb.as_ref().unchecked_ref(),
     );
     resize_cb.forget();
+}
+
+/// Walk the camera anchor path and report:
+/// - `tb_on_path`: `true` iff at least one `NodeKind::TangentBlock`
+///   was descended into.
+/// - `cumulative_yaw_deg`: cumulative Y-axis rotation along the
+///   chain, in degrees. For pure-Y rotations this is the actual
+///   yaw; for general rotations it's an approximation derived
+///   from the cumulative quaternion.
+///
+/// Used by the debug overlay to show whether the camera sits inside
+/// a rotated subtree — the on-screen "rotation chain" indicator.
+fn tangent_block_chain_summary(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    anchor: &crate::world::anchor::Path,
+) -> (bool, f32) {
+    use crate::world::tree::{Child, NodeKind};
+    let mut cum: [f32; 4] = [0.0, 0.0, 0.0, 1.0]; // identity quaternion (x, y, z, w)
+    let mut tb_seen = false;
+    let mut node = world_root;
+    for k in 0..(anchor.depth() as usize) {
+        let n = match library.get(node) {
+            Some(n) => n,
+            None => break,
+        };
+        let slot = anchor.slot(k) as usize;
+        match n.children[slot] {
+            Child::Node(child_id) => {
+                if let Some(child_node) = library.get(child_id) {
+                    if let NodeKind::TangentBlock { rotation } = child_node.kind {
+                        tb_seen = true;
+                        cum = crate::app::quat_mul(cum, rotation);
+                    }
+                }
+                node = child_id;
+            }
+            _ => break,
+        }
+    }
+    // Approximate yaw extraction from quaternion. For a pure Y-axis
+    // rotation by θ, q = (0, sin(θ/2), 0, cos(θ/2)) → atan2(qy, qw)
+    // = θ/2, so the full angle is 2·atan2(qy, qw). For mixed-axis
+    // rotations this is a rough indicator only.
+    let yaw_rad = 2.0 * cum[1].atan2(cum[3]);
+    (tb_seen, yaw_rad.to_degrees())
 }

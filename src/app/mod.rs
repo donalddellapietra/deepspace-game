@@ -141,6 +141,12 @@ pub struct App {
     pub(super) save_mode: bool,
     pub(super) ui: GameUiState,
     pub(super) debug_overlay_visible: bool,
+    /// Counter incremented each time the user presses `[` while the
+    /// debug overlay is visible. The UI watches this for changes and
+    /// copies the formatted overlay to the clipboard. Plumbed via
+    /// counter (Rust → JS) because the webview forwards keystrokes
+    /// to Rust before any JS listener fires.
+    pub(super) debug_copy_seq: u64,
     pub(super) fps_smooth: f64,
     pub(super) startup_profile_frames: u32,
     /// The actual frame the renderer is using right now. This may
@@ -437,6 +443,7 @@ impl App {
             save_mode: false,
             ui: GameUiState::new(),
             debug_overlay_visible: false,
+            debug_copy_seq: 0,
             fps_smooth: 0.0,
             startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
             active_frame,

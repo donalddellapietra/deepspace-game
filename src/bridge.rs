@@ -111,6 +111,33 @@ pub struct DebugOverlayStateJs {
     pub camera_local: [f32; 3],
     pub fov: f32,
     pub node_count: usize,
+    /// Camera position in root-frame world coords. Lets the reader
+    /// read "I'm at (x, y, z) in the root cell" directly, without
+    /// knowing the render path.
+    pub camera_root_xyz: [f32; 3],
+    /// `WORLD_SIZE / 3^anchor_depth`. One anchor cell's width in
+    /// root-frame units. `camera_root_xyz[i] / anchor_cell_size_root`
+    /// gives the camera's position in anchor cells from origin.
+    pub anchor_cell_size_root: f32,
+    /// `[s0, s1, ...]` — the camera's anchor slot path. Rendered
+    /// as a short string in the overlay.
+    pub anchor_slots_csv: String,
+    /// `Cartesian` or `WrappedPlane(...)` or `TangentBlock`.
+    pub active_frame_kind: String,
+    /// Render path (usually a prefix of the anchor). Empty when
+    /// rendering from root.
+    pub render_path_csv: String,
+    /// `true` if the camera's anchor path crosses any
+    /// `NodeKind::TangentBlock`. Useful for debugging rotation
+    /// chain handling.
+    pub tb_on_anchor_path: bool,
+    /// Cumulative Y rotation along the anchor path, in degrees.
+    /// (Approximation: only Y-axis rotations show meaningfully.)
+    pub anchor_cumulative_yaw_deg: f32,
+    /// Monotonic counter incremented each time the user presses `[`
+    /// while the debug overlay is visible. The UI watches for changes
+    /// and copies the formatted overlay text to the clipboard.
+    pub copy_seq: u64,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]

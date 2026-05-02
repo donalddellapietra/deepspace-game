@@ -67,6 +67,15 @@ impl App {
             return;
         }
 
+        // `[` while the overlay is visible: bump a counter the UI
+        // watches so it can copy the current overlay state to the
+        // clipboard. Webview forwards keystrokes to Rust before any
+        // JS handler fires, so the trigger has to come from here.
+        if pressed && code == KeyCode::BracketLeft && self.debug_overlay_visible {
+            self.debug_copy_seq = self.debug_copy_seq.wrapping_add(1);
+            return;
+        }
+
         if pressed && code == KeyCode::KeyV && self.cursor_locked {
             self.save_mode = !self.save_mode;
             log::info!("Save mode: {}", self.save_mode);
