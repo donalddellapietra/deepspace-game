@@ -2035,13 +2035,18 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             // the outside-the-cube dispatch (in march_cartesian) no
             // longer fires once the frame root is the cube itself.
             //
+            // Use `march_in_tangent_cube` (TANGENT_STACK_DEPTH = 24),
+            // NOT `march_cartesian` (MAX_STACK_DEPTH = 8). The cube
+            // interior is up to 20+ levels deep; with the smaller
+            // stack the deep cells LOD-splat to the representative
+            // block, masking edits — break/place CPU goes through
+            // but the shader can't show the result. Same reason the
+            // outside dispatch in march_cartesian uses the deep
+            // walker.
+            //
             // Read the cube's quaternion from node_kinds — same data
-            // the outside dispatch reads. This makes the boundary
-            // mathematically continuous: just outside, ray descends
-            // into cube via outside dispatch with rotation R; just
-            // inside, ray is rotated by the same R around the frame
-            // centre. The two effective rays converge at the boundary
-            // → no snap (when implementation is correct).
+            // the outside dispatch reads. Both inside and outside
+            // share one rotation source.
             let q = node_kinds[current_idx].rotation;
             let xx = q.x * q.x; let yy = q.y * q.y; let zz = q.z * q.z;
             let xy = q.x * q.y; let xz = q.x * q.z; let yz = q.y * q.z;
@@ -2063,9 +2068,7 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 dot(normal_in, ray_dir),
                 dot(north_in,  ray_dir),
             );
-            r = march_cartesian(
-                current_idx, local_origin, local_dir, MAX_STACK_DEPTH, skip_slot,
-            );
+            r = march_in_tangent_cube(current_idx, local_origin, local_dir);
             if r.hit {
                 // Rotate the hit normal back to world via R (columns).
                 let n_local = r.normal;
