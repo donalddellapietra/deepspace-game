@@ -464,20 +464,29 @@ fn render_cell_as_tangent_cube(
     let r_step   = r_hi - r_lo;
     let cl = cos(lat_c); let sl = sin(lat_c);
     let co = cos(lon_c); let so = sin(lon_c);
-    // Cube basis in WP-local. u = lon-tangent, v = lat-tangent,
-    // w = -radial (inward). Right-handed.
+    // Cube basis in WP-local — chosen to MATCH the slab subtree's
+    // axis convention so march_cartesian's slot.x/y/z pick the
+    // correct sub-cells. Slab convention: slot.x → lon, slot.y → r
+    // (sy=0 inner, sy=2 outer), slot.z → lat. So:
+    //   cube.x = lon-tangent  → matches slab.x
+    //   cube.y = +radial out  → matches slab.y (cube.y=0 → inner;
+    //                            cube.y=max → outer surface)
+    //   cube.z = lat-tangent  → matches slab.z
+    // Right-handed: cube.x × cube.y = cube.z. Verified:
+    //   lon_tan × radial = lat_tan (computed below).
     let radial = vec3<f32>(cl * co, sl, cl * so);
     let u_axis = vec3<f32>(-so, 0.0, co);
-    let v_axis = vec3<f32>(-sl * co, cl, -sl * so);
-    let w_axis = -radial;
+    let v_axis = radial;
+    let w_axis = vec3<f32>(-sl * co, cl, -sl * so);
 
-    // Cube center: half-depth below the surface along radial.
+    // Cube center: at the cell's mid-radius along the radial.
     let r_mid = (r_lo + r_hi) * 0.5;
     let center = cs_center + r_mid * radial;
-    // Half-extents in tangent meters (at surface r_hi).
+    // Half-extents (cube.x = lon-tangent meters, cube.y = radial
+    // meters, cube.z = lat-tangent meters).
     let half_u = lon_step * r_hi * cl * 0.5;
-    let half_v = lat_step * r_hi * 0.5;
-    let half_w = r_step * 0.5;
+    let half_v = r_step * 0.5;
+    let half_w = lat_step * r_hi * 0.5;
 
     // Transform ray into cube-local axes.
     let to_origin = ray_origin - center;
@@ -568,20 +577,24 @@ fn cartesian_voxels_in_cell(
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
 
-    // Cell's tangent-plane OBB (same basis as render_cell_as_tangent_cube).
+    // Cell's tangent-plane OBB. Basis chosen to MATCH the slab
+    // subtree's axis convention so march_cartesian's slot.x/y/z
+    // pick the correct sub-cells (slab: slot.x → lon, slot.y → r
+    // outward, slot.z → lat). Same basis as
+    // render_cell_as_tangent_cube.
     let lat_c = (lat_lo + lat_hi) * 0.5;
     let lon_c = (lon_lo + lon_hi) * 0.5;
     let cl = cos(lat_c); let sl = sin(lat_c);
     let co = cos(lon_c); let so = sin(lon_c);
     let radial = vec3<f32>(cl * co, sl, cl * so);
     let u_axis = vec3<f32>(-so, 0.0, co);
-    let v_axis = vec3<f32>(-sl * co, cl, -sl * so);
-    let w_axis = -radial;
+    let v_axis = radial;
+    let w_axis = vec3<f32>(-sl * co, cl, -sl * so);
     let center = cs_center + (r_lo + r_hi) * 0.5 * radial;
     let half_v3 = vec3<f32>(
         (lon_hi - lon_lo) * r_hi * cl * 0.5,
-        (lat_hi - lat_lo) * r_hi * 0.5,
         (r_hi   - r_lo)   * 0.5,
+        (lat_hi - lat_lo) * r_hi * 0.5,
     );
 
     // Transform ray to OBB-local (rotated, centered).
