@@ -1,4 +1,6 @@
+import { useEffect, useState } from "react";
 import { useDebugOverlay } from "../hooks/useGameState";
+import type { DebugOverlayState } from "../types";
 import "./DebugOverlay.css";
 
 function pad(label: string, value: string, width = 44): string {
@@ -21,15 +23,16 @@ function fmtDist(v: number): string {
   return v.toExponential(3);
 }
 
-export function DebugOverlay() {
-  const s = useDebugOverlay();
-  if (!s.visible) return null;
-
+/// Format the debug-overlay state as a multi-line string suitable
+/// for pasting into a bug report. Same content the on-screen overlay
+/// shows (sans the "DEBUG" header). Available even when the overlay
+/// is hidden.
+function formatDebug(s: DebugOverlayState): string {
   const [rx, ry, rz] = s.cameraRootXyz;
   const [lx, ly, lz] = s.cameraLocal;
-
-  const lines = [
-    "DEBUG [ ]=toggle",
+  const ts = new Date().toISOString();
+  return [
+    `# debug overlay  ${ts}`,
     pad("fps", s.fps.toFixed(1)),
     pad("frame time", s.frameTimeMs.toFixed(2) + " ms"),
     "",
@@ -60,7 +63,88 @@ export function DebugOverlay() {
     pad("cumulative yaw", s.anchorCumulativeYawDeg.toFixed(3) + "°"),
     "",
     pad("nodes", String(s.nodeCount)),
+  ].join("\n");
+}
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to legacy path
+  }
+  // Fallback for environments that don't expose the modern clipboard
+  // API (older webviews, insecure contexts).
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+export function DebugOverlay() {
+  const s = useDebugOverlay();
+  const [flash, setFlash] = useState<"copied" | "failed" | null>(null);
+
+  // `Ctrl/Cmd+Shift+C` copies the current debug-overlay state to the
+  // clipboard regardless of whether the overlay is visible. The
+  // shortcut is namespaced behind Shift so it doesn't collide with
+  // browser/OS native copy. See the formatDebug() output above for
+  // exactly what gets copied.
+  useEffect(() => {
+    function handler(e: KeyboardEvent) {
+      const isMod = e.ctrlKey || e.metaKey;
+      const isCopy =
+        isMod && e.shiftKey && (e.key === "C" || e.key === "c");
+      if (!isCopy) return;
+      e.preventDefault();
+      e.stopPropagation();
+      copyToClipboard(formatDebug(s)).then((ok) => {
+        setFlash(ok ? "copied" : "failed");
+        window.setTimeout(() => setFlash(null), 1500);
+      });
+    }
+    window.addEventListener("keydown", handler, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", handler, { capture: true });
+  }, [s]);
+
+  // Even when the overlay isn't visible, render a small "Copied!" /
+  // "Copy failed" toast so the user has feedback that the shortcut
+  // fired. Position it identically to the overlay so the corner of
+  // the screen flashes.
+  if (!s.visible && flash === null) return null;
+
+  if (!s.visible && flash !== null) {
+    return (
+      <div className="debug-overlay">
+        {flash === "copied" ? "✓ debug copied" : "✗ copy failed"}
+      </div>
+    );
+  }
+
+  const lines = [
+    "DEBUG  [ ]=toggle  ⌘⇧C / ^⇧C=copy",
+    formatDebug(s),
   ];
 
-  return <div className="debug-overlay">{lines.join("\n")}</div>;
+  return (
+    <div className="debug-overlay">
+      {flash === "copied" && <div>✓ copied to clipboard</div>}
+      {flash === "failed" && <div>✗ copy failed (clipboard blocked)</div>}
+      {flash !== null && <div>{" "}</div>}
+      {lines.join("\n")}
+    </div>
+  );
 }
