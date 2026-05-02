@@ -117,6 +117,11 @@ const ROOT_KIND_CARTESIAN: u32 = 0u;
 /// Cartesian (the marcher does not branch on root_kind). Phase 2 will
 /// hook X-wrap on this kind; Phase 3 will hook curvature.
 const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
+/// TangentBlock root kind. shade_pixel applies Mᵀ
+/// (`tangent_rotation_col*`) to camera.pos + ray_dir before
+/// march_cartesian, so the DDA at the rotated frame's [0, 3)³ runs
+/// on rotated inputs and finds the rotated cells inside.
+const ROOT_KIND_TANGENT_BLOCK: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:

@@ -53,8 +53,31 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 /// non-TAAU path; the gamma-space clamp + blend in the resolve shader
 /// is a small precision hit but not a visible one.
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
-    let ray_dir = jittered_ray_dir(uv);
-    let result = march(camera.pos, ray_dir);
+    let ray_dir_world = jittered_ray_dir(uv);
+    // Frame-property rotation. When the active frame is a
+    // TangentBlock node, the cells inside are rotated relative to
+    // the frame's [0, 3)³ axes — the DDA needs to see camera.pos
+    // and ray_dir in the rotated frame's coords. We apply Mᵀ
+    // (= dot products against the columns) around the cube's
+    // (0, 0, 0) corner; same convention as march_cartesian's
+    // rotation push, so the from-outside path (camera in cartesian
+    // ancestor, push fires at descent) and the from-inside path
+    // (camera anchor inside the rotated subtree, frame is
+    // TangentBlock) produce the same DDA inputs at the boundary.
+    var ray_origin = camera.pos;
+    var ray_dir = ray_dir_world;
+    if uniforms.root_kind == ROOT_KIND_TANGENT_BLOCK {
+        let c0 = uniforms.tangent_rotation_col0.xyz;
+        let c1 = uniforms.tangent_rotation_col1.xyz;
+        let c2 = uniforms.tangent_rotation_col2.xyz;
+        ray_origin = vec3<f32>(
+            dot(c0, ray_origin), dot(c1, ray_origin), dot(c2, ray_origin),
+        );
+        ray_dir = vec3<f32>(
+            dot(c0, ray_dir), dot(c1, ray_dir), dot(c2, ray_dir),
+        );
+    }
+    let result = march(ray_origin, ray_dir);
 
     // Debug paint dispatch (mode 1..=8): bypass lighting / bevel /
     // gamma; preserve t in alpha so TAAU history stays correct. See
@@ -70,7 +93,7 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
         let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
-        let hit_pos = camera.pos + ray_dir * result.t;
+        let hit_pos = ray_origin + ray_dir * result.t;
         let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
         let bevel = cube_face_bevel(local, result.normal);
         let lit = result.color * (ambient + diffuse * 0.7) * (0.7 + 0.3 * bevel);
@@ -85,7 +108,7 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
         let h_max = uniforms.highlight_max.xyz;
         let h_size = h_max - h_min;
         if result.hit {
-            let hit_pos = camera.pos + ray_dir * result.t;
+            let hit_pos = ray_origin + ray_dir * result.t;
             let pad_local = max_component(h_size) * 0.03;
             let inside = all(hit_pos >= (h_min - vec3<f32>(pad_local))) &&
                          all(hit_pos <= (h_max + vec3<f32>(pad_local)));

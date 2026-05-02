@@ -20,6 +20,14 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
+    /// The render frame is rooted at a `NodeKind::TangentBlock` node.
+    /// shade_pixel pre-rotates camera.pos and ray_dir by Mᵀ before
+    /// march_cartesian, so the DDA finds the rotated cells inside.
+    /// The descent stops here (camera anchor can be deeper but the
+    /// render frame doesn't follow into the rotated subtree's
+    /// cartesian descendants — that would require tracking cumulative
+    /// rotation through WorldPos.in_frame, a follow-up).
+    TangentBlock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,12 +72,15 @@ pub fn compute_render_frame(
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
         }
+        Some(NodeKind::TangentBlock) => ActiveFrameKind::TangentBlock,
         _ => ActiveFrameKind::Cartesian,
     };
     for k in 0..target.depth() as usize {
-        // If we've already landed on a WrappedPlane node, stop —
-        // the slab root IS the render frame.
-        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
+        // If we've already landed on a frame-stopping node, stop —
+        // the node IS the render frame. WrappedPlane = wrap branch
+        // fires at depth 0; TangentBlock = shade_pixel pre-rotates
+        // camera + ray, then DDA runs cartesian inside.
+        if !matches!(kind, ActiveFrameKind::Cartesian) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
@@ -79,9 +90,16 @@ pub fn compute_render_frame(
                 reached.push(slot as u8);
                 node_id = child_id;
                 if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
-                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                        break;
+                    match child_node.kind {
+                        NodeKind::WrappedPlane { dims, slab_depth } => {
+                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                            break;
+                        }
+                        NodeKind::TangentBlock => {
+                            kind = ActiveFrameKind::TangentBlock;
+                            break;
+                        }
+                        NodeKind::Cartesian => {}
                     }
                 }
             }

@@ -52,6 +52,7 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// curvature dispatch.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_WRAPPED_PLANE: u32 = 1;
+pub const ROOT_KIND_TANGENT_BLOCK: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -361,6 +362,16 @@ impl Renderer {
     pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_WRAPPED_PLANE;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
+        self.write_uniforms();
+    }
+
+    /// Set the frame-root NodeKind to `TangentBlock`. The shader
+    /// applies Mᵀ rotation (read from `tangent_rotation_col*`) to
+    /// camera.pos and ray_dir before march_cartesian, so the DDA
+    /// finds the rotated cells inside the active frame.
+    pub fn set_root_kind_tangent_block(&mut self) {
+        self.root_kind = ROOT_KIND_TANGENT_BLOCK;
+        self.slab_dims = [0; 4];
         self.write_uniforms();
     }
 

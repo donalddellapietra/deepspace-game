@@ -298,6 +298,9 @@ impl App {
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
+                ActiveFrameKind::TangentBlock => {
+                    renderer.set_root_kind_tangent_block();
+                }
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
