@@ -145,7 +145,20 @@ fn sphere_uv_in_subframe(
 
     var depth: u32 = 0u;
     var iters: u32 = 0u;
-    let pop_eps = max(cur_r_step * 1e-7, 1e-9);
+    // Boundary-advance epsilon. Mirrors `sphere_dda.wgsl`'s proven
+    // value: `cur_r_step * 1e-7` was 3 orders of magnitude below
+    // the f32 ULP at ray t≈1, so `t = t_next + eps` did not
+    // actually advance the ray past the boundary — the next
+    // iteration re-classified the same cell as empty and the loop
+    // bailed on the iter cap, returning sky on patches that should
+    // be filled.
+    let pop_eps = max(cur_r_step * 1e-4, 1e-6);
+    // Pre-compute sub-frame → world basis. Reused on every cascade
+    // pop / empty-cell advance to recover (lat, lon, r) from the
+    // ray's current position; mirrors the same derivation used at
+    // the initial-cell pick (above) and the hit-build (below).
+    let cl_b = cos(lat_c); let sl_b = sin(lat_c);
+    let co_b = cos(lon_c); let so_b = sin(lon_c);
     loop {
         if iters > 1024u { break; }
         iters = iters + 1u;
@@ -241,29 +254,33 @@ fn sphere_uv_in_subframe(
             continue;
         }
 
-        // Empty cell — advance ±1 on winning axis, cascade pop on
-        // OOB (mirror of sphere_descend_anchor's cascading-pop).
+        // Empty cell — advance ray past the winning boundary, then
+        // recompute (lat, lon, r) from the ray's NEW position to
+        // pick the next cell. Cascade up on OOB. Mirrors
+        // `sphere_dda.wgsl::sphere_descend_anchor`'s recipe — the
+        // prior implementation incremented `cell + dx` blindly and
+        // then re-applied `dx` at the parent level on cascade pops,
+        // which overshoots by O(parent_step) and lands the ray in
+        // the wrong sibling cell. That produced diagonal seams
+        // (when wrong-sibling crossings stack on multiple axes) and
+        // wrong-material splats (sub-cell content sampled with the
+        // wrong block_type) at deep zoom.
         if winning == 6u { break; }  // tangent ray
-        var dx: i32 = 0;
-        var dy: i32 = 0;
-        var dz: i32 = 0;
-        switch winning {
-            case 0u: { dx = -1; }
-            case 1u: { dx =  1; }
-            case 2u: { dz = -1; }
-            case 3u: { dz =  1; }
-            case 4u: { dy = -1; }
-            case 5u: { dy =  1; }
-            default: {}
-        }
         t = t_next + pop_eps;
-
-        var nx = cell.x + dx;
-        var ny = cell.y + dy;
-        var nz = cell.z + dz;
+        let pos_a = ray_origin + ray_dir * t;
+        let v_a = pos_a - cs_center;
+        let r_a = max(length(v_a), 1e-9);
+        let vw_x_a = -so_b * v_a.x - sl_b * co_b * v_a.y + cl_b * co_b * v_a.z;
+        let vw_y_a =                 cl_b * v_a.y + sl_b      * v_a.z;
+        let vw_z_a =  co_b * v_a.x - sl_b * so_b * v_a.y + cl_b * so_b * v_a.z;
+        let lat_a = asin(clamp(vw_y_a / r_a, -1.0, 1.0));
+        let lon_a = atan2(vw_z_a, vw_x_a);
         loop {
-            if nx >= 0 && nx <= 2 && ny >= 0 && ny <= 2 && nz >= 0 && nz <= 2 {
-                s_cell[depth] = pack_cell(vec3<i32>(nx, ny, nz));
+            let cx_a = i32(floor((lon_a - s_lon_lo[depth]) / cur_lon_step));
+            let cy_a = i32(floor((r_a   - s_r_lo[depth])   / cur_r_step));
+            let cz_a = i32(floor((lat_a - s_lat_lo[depth]) / cur_lat_step));
+            if cx_a >= 0 && cx_a <= 2 && cy_a >= 0 && cy_a <= 2 && cz_a >= 0 && cz_a <= 2 {
+                s_cell[depth] = pack_cell(vec3<i32>(cx_a, cy_a, cz_a));
                 break;
             }
             if depth == 0u { return result; }
@@ -271,10 +288,6 @@ fn sphere_uv_in_subframe(
             cur_lat_step = cur_lat_step * 3.0;
             cur_lon_step = cur_lon_step * 3.0;
             cur_r_step   = cur_r_step   * 3.0;
-            let pcell = unpack_cell(s_cell[depth]);
-            nx = pcell.x + dx;
-            ny = pcell.y + dy;
-            nz = pcell.z + dz;
         }
     }
 
