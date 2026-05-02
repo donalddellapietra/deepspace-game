@@ -1,22 +1,19 @@
 // `march_uv_sphere`: body-root marcher.
 //
-// Direct port of the CPU walker (`src/world/raycast/uvsphere.rs`)
-// that handles deep-cell rendering correctly.
-//
 // Per-iteration loop:
-// 1. World position at current `t`.
-// 2. World `(φ, θ, r)` from the position.
-// 3. Inner-core / outer-shell / θ-cap exit checks.
-// 4. Tree descent that tracks ABSOLUTE cell bounds — no cell-local
-//    `un *= 3 − tier` chain. The previous shader's chain amplified
-//    a `1` ULP `phi_w` change to `3^K` ULPs of leaf cell, breaking
-//    rendering at depth 10+ once a break had materialized cells
-//    that deep.
-// 5. On Block: face/bevel from absolute bounds, return hit.
-// 6. On Empty: step `t` to the next cell boundary via ray-vs-
-//    sphere/cone/φ-plane intersection (`uv_next_boundary`). All
-//    intersections are in O(1) body-frame world coords; numerically
-//    stable at any descent depth.
+// 1. World position at current `t` → world `(φ, θ, r)`.
+// 2. Inner-core / outer-shell / θ-cap exit checks.
+// 3. Tree descent with delta-tracked tier picking
+//    (`uv_descend_cell` in `cell.wgsl`).
+// 4. On Block: face normal + bevel from the LAST entry axis the
+//    ray crossed to land in this cell — recorded by `uv_next_boundary`
+//    on the previous iteration, or seeded to `+r` (outer-shell entry)
+//    on the first iteration. NEVER auto-picked from arc distance —
+//    that mis-picks near cell edges, producing triangular sub-cell
+//    artifacts in the bevel.
+// 5. On Empty: step to the next cell-face crossing via
+//    `uv_next_boundary`; record the axis for the NEXT iteration's
+//    face/bevel.
 
 fn march_uv_sphere(
     body_node_idx: u32,
@@ -50,6 +47,13 @@ fn march_uv_sphere(
     var t: f32 = select(max(outer_t.x, 0.0001), 0.0001, inside_outer);
     let t_exit_outer = outer_t.y;
 
+    // Entry-axis tracking. Initial: when the ray enters the body
+    // shell from outside, it crosses the outer sphere = +r face.
+    // For inside-body cameras the seed value is unused (the first
+    // iteration finds a Block immediately or steps to a new cell).
+    var last_axis: u32 = 2u;
+    var last_side: u32 = 1u;
+
     var iter: u32 = 0u;
     loop {
         if iter >= UV_MAX_ITER { break; }
@@ -62,10 +66,10 @@ fn march_uv_sphere(
 
         if r_w > outer_r * 1.0001 { break; }
         if r_w < inner_r * 0.9999 {
-            // Inner-core hit.
+            // Inner-core hit — radially-inward face.
             result.hit = true;
             result.t = t;
-            result.normal = off / max(r_w, 1e-6);
+            result.normal = -off / max(r_w, 1e-6);
             result.color = palette[0u].rgb;
             result.cell_min = pos - vec3<f32>(0.5);
             result.cell_size = 1.0;
@@ -86,39 +90,37 @@ fn march_uv_sphere(
         );
 
         if d.found_block {
-            let face = uv_hit_face(
-                off, r_w, theta_w, phi_w,
-                d.phi_lo, d.phi_hi,
-                d.theta_lo, d.theta_hi,
-                d.r_lo, d.r_hi,
+            let normal = uv_face_normal(
+                off, r_w, theta_w, phi_w, last_axis, last_side,
             );
-            let bevel = uv_cell_bevel_abs(
+            let bevel = uv_cell_bevel(
                 phi_w, theta_w, r_w,
                 d.phi_lo, d.phi_hi,
                 d.theta_lo, d.theta_hi,
                 d.r_lo, d.r_hi,
-                face.axis,
+                last_axis,
             );
             result.hit = true;
             result.t = t;
-            result.normal = face.normal;
+            result.normal = normal;
             result.color = palette[d.block_type].rgb * (0.7 + 0.3 * bevel);
             result.cell_min = pos - vec3<f32>(0.5);
             result.cell_size = 1.0;
             return result;
         }
 
-        // Empty cell — step ray to next absolute cell boundary. No
-        // cell-local fraction arithmetic; stable at any depth.
-        let t_next = uv_next_boundary(
+        // Empty cell — step to next cell-face crossing.
+        let bd = uv_next_boundary(
             oc, ray_dir, t,
             d.phi_lo, d.phi_hi,
             d.theta_lo, d.theta_hi,
             d.r_lo, d.r_hi,
         );
-        if t_next > 1e20 { break; }
-        let step = t_next - t;
-        t = t_next + max(step * 1e-4, 1e-5);
+        if bd.t > 1e20 { break; }
+        let step = bd.t - t;
+        t = bd.t + max(step * 1e-4, 1e-5);
+        last_axis = bd.axis;
+        last_side = bd.side;
     }
     return result;
 }

@@ -1,21 +1,18 @@
-// Cell-local primitives shared by the UV-sphere marchers.
+// Cell-local primitives shared by the UV-sphere marcher.
 //
-// Architecture matches the CPU walker (`src/world/raycast/uvsphere.rs`):
+// Architecture mirrors the CPU walker (`src/world/raycast/uvsphere.rs`):
 // - Track ABSOLUTE bounds `(phi_lo, phi_hi, theta_lo, theta_hi,
-//   r_lo, r_hi)` during descent. Each level refines bounds via
-//   `phi_lo += pt * dphi` (exact in f32 since `pt` is integer and
-//   `dphi` is a power-of-1/3 fraction of the body's range).
-// - Step the ray to the next cell boundary via ray-vs-{sphere, cone,
-//   phi-plane} intersection in body-frame cartesian coords. This is
-//   numerically stable at any descent depth — `t` is in O(1) world
-//   units, no `3^K` cell-local-fraction amplification anywhere.
-// - The previous shader's `uv_cell_step` advanced via cell-local
-//   `(1 - un)/d_un` arithmetic, where the descent's
-//   `un *= 3 − tier` chain amplified a `1` ULP `phi_w` change to
-//   `3^K` ULPs of leaf cell — fatal at depth 10+ once a break has
-//   materialized cells that deep.
-
-const UV_BOUNDARY_FRAC: f32 = 1e-4;
+//   r_lo, r_hi)` during descent, but propagated as DELTAS
+//   (`delta_X = X_w − X_lo`) to keep tier-picking precision at
+//   sub-ULP regardless of descent depth.
+// - Step the ray to the next cell boundary via ray-vs-{sphere,
+//   cone, φ-plane} intersection in body-frame cartesian coords;
+//   numerically stable at any descent depth.
+// - The boundary-step result records WHICH face the ray crossed
+//   to enter the next cell. The renderer uses that axis directly
+//   for the hit's face normal + bevel — never the closest-face
+//   arc-distance heuristic, which mis-picks near cell edges and
+//   produces triangular sub-cell artifacts.
 
 fn uv_ray_sphere(oc: vec3<f32>, dir: vec3<f32>, r: f32) -> vec2<f32> {
     let aa = dot(dir, dir);
@@ -29,8 +26,6 @@ fn uv_ray_sphere(oc: vec3<f32>, dir: vec3<f32>, r: f32) -> vec2<f32> {
 }
 
 // Ray vs constant-`θ` cone (apex at body centre, half-angle = `θ`).
-// Returns the two t intersections; sentinel `(1e30, -1e30)` on miss
-// or degenerate (ray along cone axis).
 fn uv_ray_cone(oc: vec3<f32>, dir: vec3<f32>, theta: f32) -> vec2<f32> {
     let s = sin(theta);
     let c = cos(theta);
@@ -55,10 +50,7 @@ fn uv_ray_cone(oc: vec3<f32>, dir: vec3<f32>, theta: f32) -> vec2<f32> {
     return vec2<f32>((-bb - sq) * inv_a, (-bb + sq) * inv_a);
 }
 
-// Ray vs constant-`φ` half-plane (radial out from body axis at
-// azimuth `φ`). Returns the single intersection `t`, or `1e30` on
-// miss / degenerate. The half-plane filter rejects intersections on
-// the antipodal half-plane (where `φ` is exact-but-180°-off).
+// Ray vs constant-`φ` half-plane (radial out from body axis).
 fn uv_ray_phi_plane(oc: vec3<f32>, dir: vec3<f32>, phi: f32) -> f32 {
     let s = sin(phi);
     let c = cos(phi);
@@ -71,57 +63,65 @@ fn uv_ray_phi_plane(oc: vec3<f32>, dir: vec3<f32>, phi: f32) -> f32 {
     return t;
 }
 
-// Advance a ray to the smallest `t > t_min` at which it crosses any
-// of the cell's six bounding surfaces — two `φ`-half-planes, two
-// `θ`-cones, two `r`-spheres. Mirrors `next_boundary` in the CPU
-// walker. All intersections are in O(1) body-frame world coords;
-// no cell-local amplification.
+// Boundary-step result. `t` is world-distance to the closest cell
+// face crossing > `t_min`; `axis` ∈ {0=φ, 1=θ, 2=r} is which face
+// won; `side` is 0 for the cell's `_lo` face, 1 for `_hi`.
+struct UvBoundaryHit {
+    t: f32,
+    axis: u32,
+    side: u32,
+}
+
+// Closest of the cell's six bounding surfaces. Each ray-vs-surface
+// candidate has a known axis+side, so the returned `axis/side`
+// describes WHICH face the ray will cross next — the renderer uses
+// this for the next cell's face-normal lookup, bypassing
+// arc-distance auto-picking that flips axis near cell edges and
+// produces sub-cell triangular artifacts in the bevel.
 fn uv_next_boundary(
     oc: vec3<f32>, dir: vec3<f32>, t_min: f32,
     phi_lo: f32, phi_hi: f32,
     theta_lo: f32, theta_hi: f32,
     r_lo: f32, r_hi: f32,
-) -> f32 {
-    var best: f32 = 1e30;
+) -> UvBoundaryHit {
+    var out: UvBoundaryHit;
+    out.t = 1e30;
+    out.axis = 2u;
+    out.side = 1u;
 
     let t_pl = uv_ray_phi_plane(oc, dir, phi_lo);
-    if t_pl > t_min && t_pl < best { best = t_pl; }
+    if t_pl > t_min && t_pl < out.t { out.t = t_pl; out.axis = 0u; out.side = 0u; }
     let t_ph = uv_ray_phi_plane(oc, dir, phi_hi);
-    if t_ph > t_min && t_ph < best { best = t_ph; }
+    if t_ph > t_min && t_ph < out.t { out.t = t_ph; out.axis = 0u; out.side = 1u; }
 
     let cl = uv_ray_cone(oc, dir, theta_lo);
-    if cl.x > t_min && cl.x < best { best = cl.x; }
-    if cl.y > t_min && cl.y < best { best = cl.y; }
+    if cl.x > t_min && cl.x < out.t { out.t = cl.x; out.axis = 1u; out.side = 0u; }
+    if cl.y > t_min && cl.y < out.t { out.t = cl.y; out.axis = 1u; out.side = 0u; }
     let ch = uv_ray_cone(oc, dir, theta_hi);
-    if ch.x > t_min && ch.x < best { best = ch.x; }
-    if ch.y > t_min && ch.y < best { best = ch.y; }
+    if ch.x > t_min && ch.x < out.t { out.t = ch.x; out.axis = 1u; out.side = 1u; }
+    if ch.y > t_min && ch.y < out.t { out.t = ch.y; out.axis = 1u; out.side = 1u; }
 
     let sl = uv_ray_sphere(oc, dir, r_lo);
-    if sl.x > t_min && sl.x < best { best = sl.x; }
-    if sl.y > t_min && sl.y < best { best = sl.y; }
+    if sl.x > t_min && sl.x < out.t { out.t = sl.x; out.axis = 2u; out.side = 0u; }
+    if sl.y > t_min && sl.y < out.t { out.t = sl.y; out.axis = 2u; out.side = 0u; }
     let sh = uv_ray_sphere(oc, dir, r_hi);
-    if sh.x > t_min && sh.x < best { best = sh.x; }
-    if sh.y > t_min && sh.y < best { best = sh.y; }
+    if sh.x > t_min && sh.x < out.t { out.t = sh.x; out.axis = 2u; out.side = 1u; }
+    if sh.y > t_min && sh.y < out.t { out.t = sh.y; out.axis = 2u; out.side = 1u; }
 
-    return best;
+    return out;
 }
 
-// Walk down the tree from `start_node_idx` using ABSOLUTE world
+// Walk down the tree from `start_node_idx` against world
 // `(phi_w, theta_w, r_w)`. Returns the deepest reached cell as
-// absolute `(phi_lo, phi_hi, theta_lo, theta_hi, r_lo, r_hi)` plus
-// `found_block` and the leaf's `dphi/dth/dr` for face/bevel.
+// absolute bounds + `dphi/dth/dr` and a `found_block` flag.
 //
 // Delta-tracked: holds `delta_X = X_w − X_lo` directly through the
-// loop instead of accumulating `X_lo` and recomputing the
-// difference each level. The straightforward
-// `(phi_w − phi_lo) / dphi` form fails at depth 12+ because
-// `phi_lo` accumulates `K · ULP(2π)` rounding (~`1e-6` by `K=12`),
-// and `dphi = 2π/3^K ≈ 1.2e-5` is the same scale — tier picking
-// goes ~50% wrong, breaks land in random cells. Holding `delta`
-// keeps the arithmetic in O(`dphi`) magnitude all the way down,
-// so tier-picking precision stays at sub-ULP at every depth. See
-// `src/world/raycast/uvsphere.rs::descend` for the matching CPU
-// implementation.
+// loop. The straightforward `(phi_w − phi_lo) / dphi` form fails at
+// depth 12+ because `phi_lo` accumulates `K · ULP(2π)` rounding
+// (~1e-6 by `K=12`), and `dphi = 2π/3^K ≈ 1.2e-5` is the same
+// scale — tier picking goes ~50% wrong, breaks land in random
+// cells. Holding `delta` keeps the arithmetic in O(`dphi`)
+// magnitude all the way down. See `src/world/raycast/uvsphere.rs::descend`.
 fn uv_descend_cell(
     start_node_idx: u32,
     start_phi_lo: f32, start_phi_hi: f32,
@@ -146,7 +146,6 @@ fn uv_descend_cell(
     loop {
         if depth >= max_descent { break; }
 
-        // Step down: child cell is `1/3` of parent on every axis.
         dphi    = dphi    / 3.0;
         dth     = dth     / 3.0;
         dr_axis = dr_axis / 3.0;
@@ -156,9 +155,6 @@ fn uv_descend_cell(
         let rt = u32(clamp(floor(delta_r     / max(dr_axis, 1e-30)), 0.0, 2.0));
         let slot = pt + tt * 3u + rt * 9u;
 
-        // Refine deltas — subtraction of similar-magnitude values
-        // keeps result-magnitude precision; never falls off the
-        // tier-picking precision cliff.
         delta_phi   = delta_phi   - f32(pt) * dphi;
         delta_theta = delta_theta - f32(tt) * dth;
         delta_r     = delta_r     - f32(rt) * dr_axis;
@@ -166,9 +162,6 @@ fn uv_descend_cell(
         let header_off = node_offsets[node_idx];
         let occupancy = tree[header_off];
         if (occupancy & (1u << slot)) == 0u {
-            // Empty slot — return the resolved cell. Recover absolute
-            // bounds via `phi_lo = phi_w − delta_phi` etc; ULP is
-            // bounded by `phi_w`'s, not `K · ULP(phi_lo)`.
             d.dphi = dphi;
             d.dth = dth;
             d.dr = dr_axis;
@@ -210,7 +203,7 @@ fn uv_descend_cell(
             node_idx = tree[child_off + 1u];
             continue;
         }
-        // EntityRef / Empty leaf — treat as empty at this resolved cell.
+        // EntityRef / Empty leaf — treat as empty.
         d.dphi = dphi;
         d.dth = dth;
         d.dr = dr_axis;
@@ -224,7 +217,6 @@ fn uv_descend_cell(
         return d;
     }
 
-    // Hit `max_descent`. Return the deepest committed cell.
     d.dphi = dphi / 3.0;
     d.dth = dth / 3.0;
     d.dr = dr_axis / 3.0;
@@ -238,47 +230,46 @@ fn uv_descend_cell(
     return d;
 }
 
-// Closest cell-face descriptor — uses ABSOLUTE bounds + world
-// `(phi_w, theta_w, r_w)` directly (no un-fractions, no cell-local
-// amplification).
-fn uv_hit_face(
+// Face normal in body-frame world coords, given the axis+side of
+// the face the ray crossed to enter the current cell. The basis
+// `{r̂, θ̂, φ̂}` is evaluated at the world position; for radial
+// faces this is exactly the surface normal, for cone/φ-plane
+// faces it's a tangent-plane normal — same approximation as the
+// previous `uv_hit_face` returned, but without the arc-distance
+// auto-pick that flipped axis near cell edges.
+fn uv_face_normal(
     off: vec3<f32>, r_w: f32, theta_w: f32, phi_w: f32,
-    phi_lo: f32, phi_hi: f32,
-    theta_lo: f32, theta_hi: f32,
-    r_lo: f32, r_hi: f32,
-) -> UvHitFace {
+    axis: u32, side: u32,
+) -> vec3<f32> {
     let cos_t = cos(theta_w);
-    let arc_phi_lo = r_w * cos_t * abs(phi_w - phi_lo);
-    let arc_phi_hi = r_w * cos_t * abs(phi_w - phi_hi);
-    let arc_th_lo  = r_w * abs(theta_w - theta_lo);
-    let arc_th_hi  = r_w * abs(theta_w - theta_hi);
-    let arc_r_lo   = abs(r_w - r_lo);
-    let arc_r_hi   = abs(r_w - r_hi);
-
-    let n_radial = off / max(r_w, 1e-6);
-    let s_t = sin(theta_w);
-    let s_p = sin(phi_w);
-    let c_p = cos(phi_w);
-    let n_theta = vec3<f32>(-s_t * c_p, cos_t, -s_t * s_p);
-    let n_phi = vec3<f32>(-s_p, 0.0, c_p);
-
-    var best = arc_phi_lo;
-    var n = -n_phi;
-    var ax: u32 = 0u;
-    if arc_phi_hi < best { best = arc_phi_hi; n = n_phi; ax = 0u; }
-    if arc_th_lo  < best { best = arc_th_lo;  n = -n_theta; ax = 1u; }
-    if arc_th_hi  < best { best = arc_th_hi;  n = n_theta;  ax = 1u; }
-    if arc_r_lo   < best { best = arc_r_lo;   n = -n_radial; ax = 2u; }
-    if arc_r_hi   < best { best = arc_r_hi;   n = n_radial;  ax = 2u; }
-    var out: UvHitFace;
-    out.normal = normalize(n);
-    out.axis = ax;
-    return out;
+    let sin_t = sin(theta_w);
+    let cos_p = cos(phi_w);
+    let sin_p = sin(phi_w);
+    var n: vec3<f32>;
+    if axis == 0u {
+        // φ-plane normal = ±φ̂.
+        let phi_hat = vec3<f32>(-sin_p, 0.0, cos_p);
+        n = select(-phi_hat, phi_hat, side == 1u);
+    } else if axis == 1u {
+        // θ-cone normal = ±θ̂.
+        let theta_hat = vec3<f32>(-sin_t * cos_p, cos_t, -sin_t * sin_p);
+        n = select(-theta_hat, theta_hat, side == 1u);
+    } else {
+        // r-sphere normal = ±r̂. Use the actual offset for
+        // numerical stability (avoids re-deriving from sin/cos).
+        let r_hat = off / max(r_w, 1e-6);
+        n = select(-r_hat, r_hat, side == 1u);
+    }
+    return normalize(n);
 }
 
 // Soft-edge bevel from absolute bounds. The 2D in-face coord pair
-// perpendicular to the hit-face axis darkens at cell edges.
-fn uv_cell_bevel_abs(
+// is determined by `axis` — the orthogonal pair to the face's
+// out-of-plane direction. With the entry-axis recorded by
+// `uv_next_boundary` (rather than auto-picked), the (u, v) basis
+// is consistent across the cell's visible face — no mid-cell
+// axis flip, no triangular bevel artifact.
+fn uv_cell_bevel(
     phi_w: f32, theta_w: f32, r_w: f32,
     phi_lo: f32, phi_hi: f32,
     theta_lo: f32, theta_hi: f32,
