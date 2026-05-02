@@ -398,20 +398,6 @@ fn fill_for_uv_cell(
 /// coordinates don't affect the band-fill decision, so all 9
 /// (φ-tier, θ-tier) combinations within a given r-tier share the
 /// same subtree. That keeps worldgen O(depth) instead of O(9^depth).
-/// Body-tree depth at which UV-shaped cells transition to
-/// `CartesianTangent` cells. Above this depth (body-depths 1..N-1) the
-/// cells stay UV — visible curvature from outside the sphere comes
-/// from these outer levels. AT this depth (body-depth N), each cell
-/// becomes a `CartesianTangent` Node whose children are plain
-/// cartesian voxels in the cell's tangent frame `(φ̂, θ̂, r̂)`. Below
-/// this depth (body-depths N+1..20) all subdivision is cartesian.
-///
-/// The hybrid lets the macroscopic sphere render as UV (preserving
-/// curvature where it's visible) while deep zoom — where one UV
-/// cell occupies many pixels and the cube-vs-curve difference is
-/// sub-pixel — runs through the precision-stable cartesian DDA.
-pub const CARTESIAN_TANGENT_BODY_DEPTH: u32 = 7;
-
 pub fn insert_uv_sphere_body(
     lib: &mut NodeLibrary,
     inner_r: f32,
@@ -430,10 +416,9 @@ pub fn insert_uv_sphere_body(
     for rt in 0..3 {
         let rn_lo = r_lo_n + drn * rt as f32;
         let rn_hi = rn_lo + drn;
-        // Body root's children are body-depth 1.
         let r_child = build_uv_r_subtree(
             lib, inner_r, outer_r, rn_lo, rn_hi,
-            depth.saturating_sub(1), 1, sdf,
+            depth.saturating_sub(1), sdf,
         );
         for tt in 0..3 {
             for pt in 0..3 {
@@ -466,44 +451,8 @@ fn build_uv_r_subtree(
     inner_r: f32, outer_r: f32,
     rn_lo: f32, rn_hi: f32,
     depth: u32,
-    body_depth: u32,
     sdf: &Planet,
 ) -> Child {
-    // At body-depth `CARTESIAN_TANGENT_BODY_DEPTH` we transition from
-    // UV-march territory to cartesian-tangent dispatch. The Node we
-    // build at this exact depth is marked `CartesianTangent`; that
-    // tells the GPU/CPU UV walkers to stop descending and hand the
-    // cell off to a cartesian DDA in its tangent frame. Above the
-    // boundary (body_depth < N) → plain Cartesian (UV march descends
-    // through them). Below (body_depth > N) → plain Cartesian (the
-    // CartesianTangent ancestor's cartesian DDA already handles
-    // them as pure xyz cells).
-    let kind = if body_depth == CARTESIAN_TANGENT_BODY_DEPTH {
-        NodeKind::CartesianTangent
-    } else {
-        NodeKind::Cartesian
-    };
-    let wrap_uniform_block = |lib: &mut NodeLibrary, b: u16| -> Child {
-        // For uniform-Block fills AT the tangent boundary depth, we
-        // can't use `build_uniform_subtree` directly — that would
-        // return either a `Cartesian` Node or a bare Block. We need
-        // a `CartesianTangent` Node containing a uniform subtree, so
-        // the dispatch fires at this cell.
-        if depth == 0 {
-            return Child::Block(b);
-        }
-        if body_depth == CARTESIAN_TANGENT_BODY_DEPTH {
-            let inner = lib.build_uniform_subtree(b, depth - 1);
-            let mut children = empty_children();
-            for slot in 0..27 {
-                children[slot] = inner;
-            }
-            Child::Node(lib.insert_with_kind(children, NodeKind::CartesianTangent))
-        } else {
-            lib.build_uniform_subtree(b, depth)
-        }
-    };
-
     if let Some(fill) = fill_for_uv_cell(sdf, inner_r, outer_r, rn_lo, rn_hi) {
         return match fill {
             UvFill::Empty => {
@@ -513,7 +462,13 @@ fn build_uv_r_subtree(
                     Child::Node(uniform_empty_chain(lib, depth))
                 }
             }
-            UvFill::Block(b) => wrap_uniform_block(lib, b),
+            UvFill::Block(b) => {
+                if depth == 0 {
+                    Child::Block(b)
+                } else {
+                    lib.build_uniform_subtree(b, depth)
+                }
+            }
         };
     }
 
@@ -538,8 +493,7 @@ fn build_uv_r_subtree(
         let sub_lo = rn_lo + drc * rt as f32;
         let sub_hi = sub_lo + drc;
         let sub = build_uv_r_subtree(
-            lib, inner_r, outer_r, sub_lo, sub_hi,
-            depth - 1, body_depth + 1, sdf,
+            lib, inner_r, outer_r, sub_lo, sub_hi, depth - 1, sdf,
         );
         for tt in 0..3 {
             for pt in 0..3 {
@@ -547,7 +501,7 @@ fn build_uv_r_subtree(
             }
         }
     }
-    Child::Node(lib.insert_with_kind(children, kind))
+    Child::Node(lib.insert(children))
 }
 
 fn uniform_empty_chain(lib: &mut NodeLibrary, depth: u32) -> NodeId {
