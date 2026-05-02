@@ -678,7 +678,7 @@ impl App {
 /// cumulative rotation that takes the FRAME's local frame to the
 /// world root frame. Identity for any path that doesn't cross a
 /// rotated node.
-fn frame_path_rotation(
+pub(super) fn frame_path_rotation(
     library: &crate::world::tree::NodeLibrary,
     world_root: crate::world::tree::NodeId,
     frame_path: &crate::world::anchor::Path,
@@ -720,7 +720,7 @@ fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
     out
 }
 
-fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
+pub(super) fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
     [
         m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],

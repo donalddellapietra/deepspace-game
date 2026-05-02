@@ -21,12 +21,13 @@ pub(super) const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
 pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 1.0;
 
 impl App {
-    pub(super) fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
-        // In Cartesian frames, all levels share the same axes — the
-        // direction is identical in every frame.  The DDA only cares
-        // about the *direction*, not the magnitude.  The old code
-        // scaled by 3^depth which overflows f32 past depth ~20.
-        crate::world::sdf::normalize(self.camera.forward())
+    pub(super) fn ray_dir_in_frame(&self, frame_path: &Path) -> [f32; 3] {
+        let fwd = crate::world::sdf::normalize(self.camera.forward());
+        let frame_rot = super::frame_path_rotation(
+            &self.world.library, self.world.root, frame_path,
+        );
+        let rotated = super::mat3_transpose_mul_vec3(&frame_rot, &fwd);
+        crate::world::sdf::normalize(rotated)
     }
 
     /// Interaction distance cap in the given frame's local units.
@@ -88,18 +89,26 @@ impl App {
                 (hit, frame_path)
             }
             ActiveFrameKind::Cartesian => {
-                // Raycast from the render frame — f32 can only represent
-                // positions a few levels deeper than the frame root.
-                // The pop loop handles finding hits at coarser depths
-                // via slot-arithmetic frame transitions. The CPU
-                // raycast is wrap-unaware (doesn't follow X-wrap into
-                // the slab from outside); for editing inside a
-                // WrappedPlane slab the cursor can still hit content
-                // because the camera is inside the slab cell and
-                // raycasting stays inside the [0, 3)^3 frame.
                 let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
+                let mut cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
+                // When the frame root is a TangentBlock, the shader
+                // applies R^T to the camera position at frame entry.
+                // The CPU raycast must match.
+                if let Some(frame_node) = self.world.library.get(self.active_frame.node_id) {
+                    if let crate::world::tree::NodeKind::TangentBlock { rotation } = frame_node.kind {
+                        let centered = [
+                            cam_local[0] - 1.5,
+                            cam_local[1] - 1.5,
+                            cam_local[2] - 1.5,
+                        ];
+                        cam_local = [
+                            1.5 + rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2],
+                            1.5 + rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2],
+                            1.5 + rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2],
+                        ];
+                    }
+                }
                 let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,
                     self.world.root,

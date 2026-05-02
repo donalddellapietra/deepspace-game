@@ -60,6 +60,8 @@ pub fn cpu_raycast_in_frame(
     max_depth: u32,
     _max_face_depth: u32,
 ) -> Option<HitInfo> {
+    use crate::world::tree::NodeKind;
+
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
     let effective_depth = chain.len() - 1;
     let frame_entries = &frame_entries[..effective_depth];
@@ -82,21 +84,51 @@ pub fn cpu_raycast_in_frame(
             return Some(hit);
         }
 
-        // Miss in current frame — pop one level. Single-level pops
-        // match the shader: skip_slot only covers the immediate
-        // child (which the inner shell fully traversed). Multi-pop
-        // would skip intermediate levels with un-traversed content.
         if current_frame_depth == 0 {
             return None;
         }
+        let child_id = chain[current_frame_depth];
         let last_slot = frame_entries[current_frame_depth - 1].1;
         let (sx, sy, sz) = slot_coords(last_slot);
-        ray_origin = [
-            sx as f32 + ray_origin[0] / 3.0,
-            sy as f32 + ray_origin[1] / 3.0,
-            sz as f32 + ray_origin[2] / 3.0,
-        ];
-        ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
+        let slot_off = [sx as f32, sy as f32, sz as f32];
+
+        // TB-aware pop: if the child we're leaving is a TangentBlock,
+        // apply R (forward rotation) to origin and direction —
+        // mirrors the shader's ribbon pop.
+        let child_is_tb = library
+            .get(child_id)
+            .map(|n| matches!(n.kind, NodeKind::TangentBlock { .. }))
+            .unwrap_or(false);
+        if child_is_tb {
+            if let Some(node) = library.get(child_id) {
+                if let NodeKind::TangentBlock { rotation: r } = node.kind {
+                    let scaled = [
+                        ray_origin[0] / 3.0,
+                        ray_origin[1] / 3.0,
+                        ray_origin[2] / 3.0,
+                    ];
+                    let centered = [scaled[0] - 0.5, scaled[1] - 0.5, scaled[2] - 0.5];
+                    ray_origin = [
+                        slot_off[0] + 0.5 + r[0][0]*centered[0] + r[1][0]*centered[1] + r[2][0]*centered[2],
+                        slot_off[1] + 0.5 + r[0][1]*centered[0] + r[1][1]*centered[1] + r[2][1]*centered[2],
+                        slot_off[2] + 0.5 + r[0][2]*centered[0] + r[1][2]*centered[1] + r[2][2]*centered[2],
+                    ];
+                    let rd = ray_dir;
+                    ray_dir = [
+                        (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
+                        (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,
+                        (r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2]) / 3.0,
+                    ];
+                }
+            }
+        } else {
+            ray_origin = [
+                slot_off[0] + ray_origin[0] / 3.0,
+                slot_off[1] + ray_origin[1] / 3.0,
+                slot_off[2] + ray_origin[2] / 3.0,
+            ];
+            ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
+        }
         current_frame_depth -= 1;
     }
 }
