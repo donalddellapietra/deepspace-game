@@ -1,46 +1,57 @@
 //! Single-rotated-block test world.
 //!
-//! Tree depth 31 (root + TangentBlock + 29-level patterned interior).
-//! The world is a flat 3×3×3 cartesian root; slot (1,1,1) holds a
-//! `NodeKind::TangentBlock` whose 29-level interior is a self-
-//! similar 3-color patterned subtree. Adjacent slots
-//! (0,1,1) / (2,1,1) carry control stone cubes so the rotation is
-//! visually framed against axis-aligned siblings.
+//! Total tree depth ≥ 30. Layout:
 //!
-//! Why 30 levels: depth 12 was the goal, but a 12-deep test world
-//! lets a broken implementation cheat with absolute f32 coords
-//! (3^-12 ≈ 5e-6 still fits in mantissa). At depth 30, 3^-30 ≈ 1e-14
-//! is well past f32 precision — only a frame-local descent that
-//! never touches absolute world coords below the rotation boundary
-//! can render the deep cells correctly.
+//!   root → embedding chain (E levels of slot-13-only cartesian) →
+//!   "scene" 3×3×3 cartesian → slot (1,1,1) is a NodeKind::TangentBlock
+//!   wrapping a self-similar 3-color patterned subtree (K levels deep).
+//!
+//! E + 1 + 1 + K ≥ 30. Defaults: E = 15, K = 14 → tree depth 31.
+//!
+//! Why an embedding chain: camera anchor descent only proceeds while
+//! the path lands on real `Child::Node`s. With the rotated block
+//! directly under root, a camera spawned in any non-(1,1,1) slot
+//! at depth 0 would land on `Empty` immediately and `compute_render_frame`
+//! would stop at depth 0 — capping the walker at MAX_STACK_DEPTH = 8
+//! absolute levels. The embedding chain places real Cartesian nodes
+//! at every level so the anchor descends naturally with zoom and the
+//! active frame reaches the rotated cell's neighborhood.
+//!
+//! Why ≥ 30 levels: at depth 18+, 3^-d falls past f32 absolute-coord
+//! precision. Anything that renders correctly must be using frame-
+//! local descent. A 12-deep test could be cheated with absolute coords.
 //!
 //! Self-similar interior: every level inside the rotated subtree
 //! references the SAME `patterned_node` of one shallower depth, so
-//! at any zoom level the 3-color pattern is visible at the leaf
-//! frontier. Library size is `O(depth)` — ~30 nodes — because
-//! content-addressed dedup collapses identical references.
+//! at any zoom the leaf frontier exposes the 3-color signature for
+//! visual rotation verification. Library size is `O(depth)`.
 
 use crate::world::anchor::{Path, WorldPos};
 use crate::world::bootstrap::WorldBootstrap;
 use crate::world::palette::{block, ColorRegistry};
 use crate::world::state::WorldState;
 use crate::world::tree::{
-    empty_children, slot_index, BRANCH, Child, NodeId, NodeKind, NodeLibrary,
+    empty_children, slot_index, BRANCH, Child, NodeId, NodeKind, NodeLibrary, CENTER_SLOT,
 };
 
-/// Tree depth of the patterned subtree under the TangentBlock node.
-/// Total tree depth = root (1) + TangentBlock (1) +
-/// `ROTATED_INTERIOR_DEPTH` = 31.
-pub const ROTATED_INTERIOR_DEPTH: u32 = 29;
+/// Levels of slot-13-only cartesian above the scene node. Picks
+/// the camera's anchor descent through neutral cells — see module
+/// docs for why this is needed.
+pub const ROTATED_TEST_EMBEDDING_DEPTH: u32 = 15;
+
+/// Levels of patterned cartesian inside the TangentBlock. Total
+/// tree depth = embedding + scene (1) + tangent_block (1) + interior
+/// = ROTATED_TEST_EMBEDDING_DEPTH + 2 + ROTATED_TEST_INTERIOR_DEPTH.
+pub const ROTATED_TEST_INTERIOR_DEPTH: u32 = 14;
 
 /// Build a self-similar 3-color patterned subtree of the given depth.
 ///
 /// At depth 1 the 27 children are `Block` leaves colored by
-/// `(x+y+z) % 3`. At depth K > 1 all 27 children are `Child::Node`
-/// references to the depth-(K-1) patterned subtree. Result: at any
-/// zoom level the rotated cube exposes the same 3-color stripe
-/// signature one level finer — every level has visible non-uniform
-/// content for rotation verification.
+/// `(x+y+z) % 3`. At depth K > 1 all 27 children reference the
+/// depth-(K-1) patterned subtree. Result: at any zoom level the
+/// rotated cube exposes the 3-color stripe signature one level
+/// finer — every level has visible non-uniform content for rotation
+/// verification.
 fn patterned_node(library: &mut NodeLibrary, depth: u32) -> NodeId {
     debug_assert!(depth >= 1);
     if depth == 1 {
@@ -75,15 +86,9 @@ fn patterned_node(library: &mut NodeLibrary, depth: u32) -> NodeId {
 pub(crate) fn bootstrap_rotated_test_world() -> WorldBootstrap {
     let mut library = NodeLibrary::default();
 
-    // Build the rotated subtree's interior (29 levels) as a
-    // self-similar patterned chain, then wrap it in a TangentBlock
-    // node to mark the rotation boundary for the renderer + walker.
-    let interior_root = patterned_node(&mut library, ROTATED_INTERIOR_DEPTH);
-    // The TangentBlock node is structurally a cartesian 3x3x3 with
-    // 27 children pointing at the patterned subtree (so its FIRST
-    // level of cells already shows the 3-color signature). The kind
-    // tag tells the walker to apply a rotation when descending into
-    // this node from any frame.
+    // Patterned interior (K levels deep), wrapped in a TangentBlock
+    // so the renderer recognizes the rotation boundary.
+    let interior_root = patterned_node(&mut library, ROTATED_TEST_INTERIOR_DEPTH);
     let mut tb_children = empty_children();
     for z in 0..BRANCH {
         for y in 0..BRANCH {
@@ -94,37 +99,61 @@ pub(crate) fn bootstrap_rotated_test_world() -> WorldBootstrap {
     }
     let rotated_id = library.insert_with_kind(tb_children, NodeKind::TangentBlock);
 
-    // Root: 3x3x3 cartesian. Stone-cube controls flank the rotated
-    // cell on either side along X so the rotation is visually
-    // grounded against axis-aligned reference geometry.
-    let mut root_children = empty_children();
-    root_children[slot_index(0, 1, 1)] = Child::Block(block::STONE);
-    root_children[slot_index(1, 1, 1)] = Child::Node(rotated_id);
-    root_children[slot_index(2, 1, 1)] = Child::Block(block::STONE);
-    let root = library.insert(root_children);
+    // "Scene" node: 3×3×3 cartesian. Center slot (1,1,1) is the
+    // rotated block; flanking slots (0,1,1) and (2,1,1) are stone
+    // cubes so visual tests have axis-aligned reference geometry.
+    let mut scene_children = empty_children();
+    scene_children[slot_index(0, 1, 1)] = Child::Block(block::STONE);
+    scene_children[slot_index(1, 1, 1)] = Child::Node(rotated_id);
+    scene_children[slot_index(2, 1, 1)] = Child::Block(block::STONE);
+    let scene = library.insert(scene_children);
+
+    // Wrap in `ROTATED_TEST_EMBEDDING_DEPTH` cartesian layers, each
+    // placing the inner subtree at the centre slot (13). Outer slots
+    // are empty so the scene sits in otherwise-empty space — but the
+    // chain itself is real Cartesian nodes, so the camera anchor can
+    // descend through it from any starting position.
+    let mut current = Child::Node(scene);
+    for _ in 0..ROTATED_TEST_EMBEDDING_DEPTH {
+        let mut children = empty_children();
+        children[CENTER_SLOT] = current;
+        current = Child::Node(library.insert(children));
+    }
+    let root = match current {
+        Child::Node(id) => id,
+        _ => unreachable!("embedding wraps Child::Node, can't bottom out as Block/Empty"),
+    };
     library.ref_inc(root);
 
     let world = WorldState { root, library };
+    let tree_depth = world.tree_depth() as u8;
 
-    // Spawn outside the rotated cell, looking down/in from +Y/+Z.
-    // Anchor at depth 4 (shallow) so the active frame at startup
-    // contains the whole world; in-game zoom (edit_depth) descends
-    // the anchor as needed for fine-detail viewing.
+    // Spawn at the WORLD CENTER inside the embedding chain, then
+    // deepen to a moderate anchor depth. The center sits in slot
+    // (1,1,1) at every embedding level, so the anchor descends
+    // through real Cartesian nodes naturally — the active frame
+    // reaches the scene neighborhood and the walker has its full
+    // stack budget for fine detail.
+    //
+    // Y offset 2.0 puts the camera above the scene's middle row
+    // (y=1 of the scene's 3×3×3) so the rotated cube + flanking
+    // stones are framed against air. Z offset 2.5 places the
+    // camera just outside the scene cube on the +Z side, looking
+    // back through it.
+    let center = 1.5f32;
     let spawn_pos = WorldPos::from_frame_local(
         &Path::root(),
-        [1.5, 2.4, 2.85],
-        4,
+        [center, center + 0.5, center + 1.0],
+        ROTATED_TEST_EMBEDDING_DEPTH as u8 + 2,
     )
-    .deepened_to(8);
-
-    let tree_depth = world.tree_depth() as u8;
+    .deepened_to(ROTATED_TEST_EMBEDDING_DEPTH as u8 + 6);
 
     WorldBootstrap {
         world,
         planet_path: None,
         default_spawn_pos: spawn_pos,
         default_spawn_yaw: 0.0,
-        default_spawn_pitch: -0.45,
+        default_spawn_pitch: -0.35,
         plain_layers: tree_depth,
         color_registry: ColorRegistry::new(),
     }
@@ -148,48 +177,76 @@ mod tests {
         );
     }
 
+    /// The embedding chain must be a real `Cartesian` chain that
+    /// `compute_render_frame` can descend through from any starting
+    /// point near the world center. Tests slot 13 at every embedding
+    /// level resolves to the next embedding node (or scene at the
+    /// bottom).
+    #[test]
+    fn embedding_chain_descends_through_center() {
+        let boot = bootstrap_rotated_test_world();
+        let mut node_id = boot.world.root;
+        for level in 0..ROTATED_TEST_EMBEDDING_DEPTH {
+            let node = boot.world.library.get(node_id).expect("embedding node");
+            assert_eq!(node.kind, NodeKind::Cartesian);
+            match node.children[CENTER_SLOT] {
+                Child::Node(child_id) => node_id = child_id,
+                other => panic!("embedding level {} center slot was {:?}", level, other),
+            }
+        }
+        // After unwrapping the chain we should be at the scene node.
+        let scene = boot.world.library.get(node_id).expect("scene");
+        assert_eq!(scene.kind, NodeKind::Cartesian);
+    }
+
     #[test]
     fn rotated_node_has_kind_tangent_block() {
         let boot = bootstrap_rotated_test_world();
-        let root_node = boot.world.library.get(boot.world.root).expect("root");
-        let center_child = root_node.children[slot_index(1, 1, 1)];
-        let rotated_id = match center_child {
+        // Walk down the embedding chain to the scene.
+        let mut node_id = boot.world.root;
+        for _ in 0..ROTATED_TEST_EMBEDDING_DEPTH {
+            node_id = match boot.world.library.get(node_id).unwrap().children[CENTER_SLOT] {
+                Child::Node(id) => id,
+                _ => panic!("embedding broken"),
+            };
+        }
+        // The scene's center slot is the TangentBlock.
+        let scene = boot.world.library.get(node_id).unwrap();
+        let rotated_id = match scene.children[slot_index(1, 1, 1)] {
             Child::Node(id) => id,
             other => panic!("expected center slot to be a Node, got {:?}", other),
         };
-        let rotated = boot
-            .world
-            .library
-            .get(rotated_id)
-            .expect("rotated subtree present");
+        let rotated = boot.world.library.get(rotated_id).unwrap();
         assert_eq!(rotated.kind, NodeKind::TangentBlock);
     }
 
-    /// Self-similarity: every level inside the rotated subtree refers
-    /// to the same patterned_node one level shallower. Library size
-    /// should be `ROTATED_INTERIOR_DEPTH + small overhead`, NOT
-    /// O(3^depth).
+    /// Library size must remain O(depth) — content-addressed dedup
+    /// must collapse identical patterned references and the embedding
+    /// chain's slot-13-only nodes.
     #[test]
     fn library_is_compact() {
         let boot = bootstrap_rotated_test_world();
-        // 29 patterned-node levels + 1 TangentBlock + 1 root ≈ 31
-        // nodes. Allow a modest fudge factor for the dedup machinery.
         let lib_count = boot.world.library.len();
         assert!(
-            lib_count <= 64,
+            lib_count <= 96,
             "library should be O(depth), got {} entries",
             lib_count
         );
     }
 
-    /// Adjacent stone cubes are present so visual tests have axis-
-    /// aligned reference geometry to compare rotation against.
     #[test]
     fn stone_controls_flank_rotated_cell() {
         let boot = bootstrap_rotated_test_world();
-        let root_node = boot.world.library.get(boot.world.root).expect("root");
+        let mut node_id = boot.world.root;
+        for _ in 0..ROTATED_TEST_EMBEDDING_DEPTH {
+            node_id = match boot.world.library.get(node_id).unwrap().children[CENTER_SLOT] {
+                Child::Node(id) => id,
+                _ => panic!("embedding broken"),
+            };
+        }
+        let scene = boot.world.library.get(node_id).unwrap();
         for slot in [slot_index(0, 1, 1), slot_index(2, 1, 1)] {
-            match root_node.children[slot] {
+            match scene.children[slot] {
                 Child::Block(b) => assert_eq!(b, block::STONE),
                 other => panic!("expected stone control at slot {}, got {:?}", slot, other),
             }
