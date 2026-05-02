@@ -47,14 +47,6 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// shader dispatches for the active render frame.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_UV_SPHERE_BODY: u32 = 1;
-/// Render frame is a UV sub-cell at body-tree depth ≥ 1. The
-/// shader's `march_uv_subcell` runs the same Jacobian DDA as the
-/// body-root path, but the cell's `(φ, θ, r)` origin and extents
-/// come from `uv_subcell_origin` / `uv_subcell_size` uniforms (set
-/// by `set_root_kind_uv_sub_cell`), so the cell-local math operates
-/// at f32 ULPs of `[0, 1]` cell fractions regardless of how deep
-/// the frame is — the locality property the cartesian renderer has.
-pub const ROOT_KIND_UV_SUB_CELL: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -79,23 +71,15 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// UV body params, used when `root_kind == ROOT_KIND_UV_SUB_CELL`.
-    /// `(inner_r, outer_r, theta_cap, _pad)` in body-frame `[0, 3)³`
-    /// units (i.e., already scaled by body_size = 3.0). The body-root
-    /// dispatch reads the same values from `node_kinds[root_index]`,
-    /// but a sub-cell frame's `root_index` is the SUB-CELL — not the
-    /// body — so the body params come through here instead.
-    pub uv_body_params: [f32; 4],
-    /// `(body_node_idx, _, _, _)`. BFS index of the enclosing
-    /// `UvSphereBody` node when rendering a sub-cell frame; ignored
-    /// otherwise.
-    pub uv_subcell_body_idx: [u32; 4],
-    /// `(phi_min, theta_min, r_min, _pad)`. UV sub-cell origin in the
-    /// body's spherical coords. Ignored unless `root_kind == ROOT_KIND_UV_SUB_CELL`.
-    pub uv_subcell_origin: [f32; 4],
-    /// `(dphi, dth, dr, _pad)`. UV sub-cell extents in the body's
-    /// spherical coords. Ignored unless `root_kind == ROOT_KIND_UV_SUB_CELL`.
-    pub uv_subcell_size: [f32; 4],
+    /// Reserved 64 bytes — was sub-cell render-frame metadata.
+    /// The body-root marcher reads body params from
+    /// `node_kinds[root_index]`, so no separate uniform path is
+    /// needed. Kept zero-filled so the WGSL `Uniforms` block stays
+    /// byte-stable.
+    pub _pad_uv_a: [f32; 4],
+    pub _pad_uv_b: [u32; 4],
+    pub _pad_uv_c: [f32; 4],
+    pub _pad_uv_d: [f32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
     /// `.x`; `.yzw` reserved for per-mode tuning.
@@ -161,13 +145,6 @@ pub struct Renderer {
     pub(super) highlight_max: [f32; 4],
     pub(super) root_kind: u32,
     pub(super) ribbon_count: u32,
-    /// UV sub-cell metadata. Populated by `set_root_kind_uv_sub_cell`;
-    /// pushed into uniforms via `write_uniforms`. Zero in any non-
-    /// UV-sub-cell frame.
-    pub(super) uv_body_params: [f32; 4],
-    pub(super) uv_subcell_body_idx: [u32; 4],
-    pub(super) uv_subcell_origin: [f32; 4],
-    pub(super) uv_subcell_size: [f32; 4],
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
     /// instance-buffer dispatch count for the raster entity pass.
@@ -332,37 +309,6 @@ impl Renderer {
         self.write_uniforms();
     }
 
-    /// Set the frame-root NodeKind to a UV sub-cell at body-tree depth
-    /// ≥ 1. The shader will dispatch `march_uv_subcell` with
-    /// `(phi_min, theta_min, r_min, dphi, dth, dr)` defining the
-    /// cell's `(φ, θ, r)` range — body params come through
-    /// `uv_body_params` since `uniforms.root_index` is the sub-cell,
-    /// not the body itself.
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_root_kind_uv_sub_cell(
-        &mut self,
-        body_inner_r: f32,
-        body_outer_r: f32,
-        body_theta_cap: f32,
-        body_node_idx: u32,
-        phi_min: f32,
-        theta_min: f32,
-        r_min: f32,
-        dphi: f32,
-        dth: f32,
-        dr: f32,
-    ) {
-        self.root_kind = ROOT_KIND_UV_SUB_CELL;
-        // Body params live in body-frame `[0, 3)³` units, matching the
-        // shader's body_size=3 convention. `inner_r`/`outer_r` here are
-        // already body_size-scaled (the call site multiplies); the
-        // body-root path does the same multiplication shader-side.
-        self.uv_body_params = [body_inner_r, body_outer_r, body_theta_cap, 0.0];
-        self.uv_subcell_body_idx = [body_node_idx, 0, 0, 0];
-        self.uv_subcell_origin = [phi_min, theta_min, r_min, 0.0];
-        self.uv_subcell_size = [dphi, dth, dr, 0.0];
-        self.write_uniforms();
-    }
 
     pub fn set_highlight(&mut self, aabb: Option<([f32; 3], [f32; 3])>) {
         match aabb {

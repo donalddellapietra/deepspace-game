@@ -369,7 +369,7 @@ impl App {
             let camera_local = self
                 .camera
                 .position
-                .in_frame(&self.active_frame.cartesian_path());
+                .in_frame(&self.active_frame.render_path);
             // Keep the UI's zoom_level in sync with the live anchor
             // depth.
             self.ui.zoom_level = self.zoom_level();

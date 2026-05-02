@@ -525,12 +525,6 @@ impl App {
             ActiveFrameKind::UvSphereBody { inner_r, outer_r, theta_cap } => {
                 NodeKind::UvSphereBody { inner_r, outer_r, theta_cap }
             }
-            ActiveFrameKind::UvSubCell { .. } => {
-                // Sub-cells are stored as Cartesian-style 27-children
-                // nodes. The UV semantics live in the frame metadata,
-                // not the node kind.
-                NodeKind::Cartesian
-            }
         }
     }
 
@@ -631,7 +625,7 @@ impl App {
         // shader's UV-sub-cell dispatch will project the body-frame
         // camera onto the sub-cell's `(φ, θ, r)` ranges using the
         // frame metadata (not yet wired in this diff; see follow-up).
-        let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",

@@ -51,7 +51,7 @@ impl App {
         // last frame the WorldPos cartesian machinery understands; the
         // camera is positioned in the body's `[0, 3)³` and the UV
         // sub-cell is a curved sub-region inside it.
-        let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
@@ -61,7 +61,7 @@ impl App {
     }
 
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
-        let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
+        let cam_local = self.camera.position.in_frame(&frame.render_path);
         let frame_center_local = [1.5, 1.5, 1.5];
         let frame_span = crate::world::anchor::WORLD_SIZE;
         let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
@@ -106,7 +106,7 @@ impl App {
             );
         }
         if self.startup_profile_frames < 4 {
-            let cam_local = self.camera.position.in_frame(&frame.cartesian_path());
+            let cam_local = self.camera.position.in_frame(&frame.render_path);
             eprintln!(
                 "target_frame stable render_path={:?} logical_path={:?} kind={:?} cam_local={:?}",
                 frame.render_path.as_slice(),

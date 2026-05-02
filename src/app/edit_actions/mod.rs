@@ -51,10 +51,6 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
-        // For UV sub-cells, dispatch the body-rooted UV walker — the
-        // sub-cell-aware raycast lands in a later diff. Treating the
-        // sub-cell as a body for editing keeps break/place working at
-        // body-cell resolution while the architectural fix is wired in.
         let (hit, cap_frame_path) = match self.active_frame.kind {
             ActiveFrameKind::Cartesian => {
                 // Raycast from the render frame — f32 can only represent
@@ -82,23 +78,20 @@ impl App {
                 }
                 (hit, frame_path)
             }
-            ActiveFrameKind::UvSphereBody { .. } | ActiveFrameKind::UvSubCell { .. } => {
-                // Render frame IS the body (or a UV sub-cell collapsed
-                // back to its enclosing body via `cartesian_path`/
-                // `cartesian_node_id` for edit-side dispatch). The UV
-                // walker takes the camera in body-frame `[0, 3)³`
-                // coords and the body node id; it returns a HitInfo
-                // whose path is rooted at the body — we splice the
-                // world-root → body slot prefix back on so break_block
-                // sees an absolute path.
+            ActiveFrameKind::UvSphereBody { .. } => {
+                // Render frame IS the body. The UV walker takes the
+                // camera in body-frame `[0, 3)³` coords and the body
+                // node id; it returns a HitInfo whose path is rooted
+                // at the body — we splice the world-root → body slot
+                // prefix back on so break_block sees an absolute path.
                 //
                 // edit_depth is total path length budget (anchor
                 // depth = zoom level). Subtract the frame prefix
                 // length so the UV walker only consumes its share.
-                let frame_path = self.active_frame.cartesian_path();
+                let frame_path = self.active_frame.render_path;
                 let cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
-                let body_node_id = self.active_frame.cartesian_node_id();
+                let body_node_id = self.active_frame.node_id;
                 let edit_depth = self.edit_depth();
                 let prefix_len = frame_path.depth() as u32;
                 let uv_budget = edit_depth.saturating_sub(prefix_len).max(1);
