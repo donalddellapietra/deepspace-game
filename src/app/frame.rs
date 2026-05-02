@@ -10,6 +10,7 @@
 //! unit testing.
 
 use crate::world::anchor::Path;
+use crate::world::rotation::{self, Mat3, IDENTITY};
 use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,14 +32,17 @@ pub struct ActiveFrame {
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
-    /// `true` when the frame root is inside (or at) a `Rotated45Y`
-    /// subtree — the camera's anchor path crossed such a node on the
-    /// way down. The renderer / CPU raycast transform the ray by the
-    /// frame's rotation once at the boundary and then run ordinary
-    /// cartesian code in the rotated local frame. Propagates through
-    /// cartesian descendants of a rotated node the same way
-    /// `SphereFrame` carries face bounds through its descendants.
-    pub rotated: bool,
+    /// World-to-frame rotation accumulated as the descent crossed
+    /// `NodeKind::Rotated45Y` boundaries (and any future rotated
+    /// kinds). For Cartesian-only descents this is `IDENTITY`, so
+    /// most frames pay nothing for the matrix machinery.
+    ///
+    /// The renderer applies this matrix to the camera basis vectors
+    /// before they upload, so `ray_dir` arrives in the active frame's
+    /// local coords. The CPU raycast does the same. Walker descents
+    /// below this frame compose further rotations as they encounter
+    /// rotated children.
+    pub rotation: Mat3,
 }
 
 /// Build a `Path` from the slot prefix the GPU ribbon walker
@@ -74,10 +78,10 @@ pub fn compute_render_frame(
         }
         _ => ActiveFrameKind::Cartesian,
     };
-    // Flips true once the descent crosses a Rotated45Y node and stays
-    // true through all cartesian descendants — the rotation applies
-    // to the entire frame below that boundary.
-    let mut rotated = false;
+    // Accumulated world-to-frame rotation. Starts at identity; each
+    // `Rotated45Y` descent multiplies in `T`. Identity rotations are
+    // mathematical no-ops, so Cartesian-only descents stay free.
+    let mut frame_rotation: Mat3 = IDENTITY;
     for k in 0..target.depth() as usize {
         // If we've already landed on a WrappedPlane node, stop —
         // the slab root IS the render frame.
@@ -95,17 +99,15 @@ pub fn compute_render_frame(
                         kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
                         break;
                     }
-                    // Rotated45Y: descent continues like Cartesian, but
-                    // flag the frame so the renderer / raycast apply
-                    // the rotation transform once at the frame
-                    // boundary. Deeper cartesian children inherit the
-                    // flag — rotation accumulates with the frame, not
-                    // re-applied per level.
-                    if matches!(child_node.kind, NodeKind::Rotated45Y) {
-                        rotated = true;
-                    }
-                    // TangentBlock behaves like Cartesian for descent
-                    // — its transform is applied only in the shader.
+                    // Compose the child's rotation into the active
+                    // frame. `rotation_of` returns identity for every
+                    // kind except `Rotated45Y`, so Cartesian descents
+                    // multiply by identity (a no-op the optimizer can
+                    // fold away). One uniform code path handles every
+                    // descent — there is no "rotated" vs "not rotated"
+                    // branch.
+                    let child_rot = rotation::rotation_of(child_node.kind);
+                    frame_rotation = rotation::matmul(child_rot, frame_rotation);
                 }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
@@ -116,7 +118,7 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
-        rotated,
+        rotation: frame_rotation,
     }
 }
 
@@ -148,7 +150,7 @@ pub fn with_render_margin(
         logical_path: logical.logical_path,
         node_id: render.node_id,
         kind: render.kind,
-        rotated: render.rotated,
+        rotation: render.rotation,
     }
 }
 

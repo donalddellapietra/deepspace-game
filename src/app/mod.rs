@@ -393,9 +393,9 @@ impl App {
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
         );
         eprintln!(
-            "startup_perf initial_frame kind={:?} rotated={} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
+            "startup_perf initial_frame kind={:?} rotation_identity={} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
             active_frame.kind,
-            active_frame.rotated,
+            crate::world::rotation::is_identity(active_frame.rotation),
             active_frame.render_path.depth(),
             active_frame.logical_path.depth(),
             desired_depth,
@@ -632,9 +632,19 @@ impl App {
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::normalize(fwd_world);
-        let right_local = crate::world::sdf::normalize(right_world);
-        let up_local = crate::world::sdf::normalize(up_world);
+        // Apply the frame's accumulated world-to-frame rotation to
+        // each basis vector. For Cartesian-only descents this is the
+        // identity matrix and `matvec` is a no-op. For descents that
+        // crossed a `Rotated45Y`, this rotates the basis so the GPU
+        // walker sees `ray_dir` already in frame-local coords — one
+        // uniform code path, regardless of where the camera is.
+        let rot = frame.rotation;
+        let fwd_local =
+            crate::world::sdf::normalize(crate::world::rotation::matvec(rot, fwd_world));
+        let right_local =
+            crate::world::sdf::normalize(crate::world::rotation::matvec(rot, right_world));
+        let up_local =
+            crate::world::sdf::normalize(crate::world::rotation::matvec(rot, up_world));
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",

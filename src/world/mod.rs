@@ -8,6 +8,7 @@ pub mod gpu;
 pub mod palette;
 pub mod raycast;
 pub mod rotated_test;
+pub mod rotation;
 pub mod scene;
 pub mod scenes;
 pub mod sdf;

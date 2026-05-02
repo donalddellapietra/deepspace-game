@@ -252,7 +252,7 @@ impl App {
             logical_path: intended_frame.logical_path,
             node_id: effective_render.node_id,
             kind: effective_render.kind,
-            rotated: effective_render.rotated,
+            rotation: effective_render.rotation,
         };
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(scene_frame_bfs);
@@ -300,10 +300,11 @@ impl App {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
             }
-            // Rotation is orthogonal to the root-kind dispatch —
-            // a cartesian frame can still be "in the rotated frame"
-            // when the anchor descended through a `Rotated45Y`.
-            renderer.set_root_rotated(self.active_frame.rotated);
+            // The active frame's `rotation` matrix is applied to the
+            // camera basis inside `gpu_camera_for_frame` before
+            // upload, so the GPU walker sees `ray_dir` already in
+            // frame-local coords. No separate "rotated frame" uniform
+            // is needed — rotation lives entirely in the camera basis.
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;

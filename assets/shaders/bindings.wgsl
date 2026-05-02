@@ -46,15 +46,12 @@ struct Uniforms {
     /// when zero, there are no EntityRef cells in the tree either,
     /// so the branch is never taken.
     entity_count: u32,
-    /// `1` when the render frame root is inside a `Rotated45Y`
-    /// subtree. `shade_pixel` applies the 45° Y + √2 XZ-stretch
-    /// transform to the ray once before calling `march()` so the
-    /// existing cartesian walker runs unchanged on the transformed
-    /// ray. Lives in the `entity_count` pad slot to preserve layout.
-    root_rotated: u32,
-    // Pad to the next vec4 boundary. WGSL's `vec3<u32>` has 16-byte
-    // alignment that would force 12 bytes of skew-pad before the
-    // next field; scalar pads are 4-byte aligned and match the CPU.
+    // Pad to the next vec4 boundary. Rotation lives entirely in the
+    // camera basis (applied CPU-side in `gpu_camera_for_frame`), so
+    // the shader sees `ray_dir` already in frame-local coords and
+    // doesn't need a per-frame "is rotated?" flag. Scalar pads stay
+    // 4-byte aligned to match the CPU `[u32; 3]` layout.
+    _pad_entities_0: u32,
     _pad_entities_1: u32,
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,

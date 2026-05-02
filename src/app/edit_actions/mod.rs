@@ -22,21 +22,16 @@ pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 1.0;
 
 impl App {
     pub(super) fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
-        // In Cartesian frames, all levels share the same axes — the
-        // direction is identical in every frame.  The DDA only cares
-        // about the *direction*, not the magnitude.  The old code
-        // scaled by 3^depth which overflows f32 past depth ~20.
+        // The DDA only cares about the *direction*, not the magnitude.
+        // (Old code scaled by `3^depth`, which overflows f32 past ~20.)
+        //
+        // Apply the active frame's accumulated world-to-frame rotation
+        // — identity for purely-Cartesian descents (free), `T` for any
+        // chain that crossed a `Rotated45Y`. One uniform path; no
+        // "rotated vs not" branch.
         let fwd = self.camera.forward();
-        if self.active_frame.rotated {
-            // Frame is inside a `Rotated45Y` subtree — apply T once
-            // (45° Y rotation + √2 XZ stretch) to map the world ray
-            // direction into frame-local coords so the existing
-            // cartesian DDA walks the rotated subtree correctly.
-            let t = [fwd[0] - fwd[2], fwd[1], fwd[0] + fwd[2]];
-            crate::world::sdf::normalize(t)
-        } else {
-            crate::world::sdf::normalize(fwd)
-        }
+        let local = crate::world::rotation::matvec(self.active_frame.rotation, fwd);
+        crate::world::sdf::normalize(local)
     }
 
     /// Interaction distance cap in the given frame's local units.
