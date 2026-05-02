@@ -30,15 +30,9 @@ impl App {
         if let Some(depth) = self.forced_visual_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        // Visual depth tracks edit depth so broken cells are always
-        // visible. The shader's LOD_PIXEL_THRESHOLD handles the
-        // "too small to render" case — no need for a pixel-budget
-        // cap on the CPU side.
-        self.edit_depth()
-            .saturating_sub(self.active_frame.render_path.depth() as u32)
-            .max(1)
-            .min(MAX_LOCAL_VISUAL_DEPTH)
-            .min(crate::world::tree::MAX_DEPTH as u32)
+        // No CPU-side depth cap. The shader's LOD_PIXEL_THRESHOLD
+        // (Nyquist) and MAX_STACK_DEPTH are the only limits.
+        (crate::world::tree::MAX_DEPTH as u32).max(1)
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
