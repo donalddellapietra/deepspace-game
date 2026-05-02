@@ -51,6 +51,12 @@ impl App {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                 self.camera.position.in_frame(&frame.render_path)
             }
+            // Step 2 stub: SphereSubFrame falls back to Cartesian frame
+            // local for camera-fits purposes. Step 3+ will use the
+            // sphere-aware projection.
+            ActiveFrameKind::SphereSubFrame(_) => {
+                self.camera.position.in_frame(&frame.render_path)
+            }
         };
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
@@ -63,6 +69,12 @@ impl App {
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => (
+                self.camera.position.in_frame(&frame.render_path),
+                [1.5, 1.5, 1.5],
+                crate::world::anchor::WORLD_SIZE,
+            ),
+            // Step 2 stub: same Cartesian-frame projection.
+            ActiveFrameKind::SphereSubFrame(_) => (
                 self.camera.position.in_frame(&frame.render_path),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
@@ -112,6 +124,9 @@ impl App {
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
                 ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+                    self.camera.position.in_frame(&frame.render_path)
+                }
+                ActiveFrameKind::SphereSubFrame(_) => {
                     self.camera.position.in_frame(&frame.render_path)
                 }
             };

@@ -536,6 +536,14 @@ impl App {
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                 NodeKind::WrappedPlane { dims, slab_depth }
             }
+            // Step 2 stub: SphereSubFrame reports the WP it
+            // descended from, since there's no NodeKind variant for
+            // sphere sub-frames in the storage tree (they're path-
+            // derived, not stored).
+            ActiveFrameKind::SphereSubFrame(range) => NodeKind::WrappedPlane {
+                dims: range.wp_dims,
+                slab_depth: range.wp_slab_depth,
+            },
         }
     }
 
@@ -635,7 +643,9 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+            ActiveFrameKind::Cartesian
+            | ActiveFrameKind::WrappedPlane { .. }
+            | ActiveFrameKind::SphereSubFrame(_) => {
                 self.camera.position.in_frame(&frame.render_path)
             }
         };

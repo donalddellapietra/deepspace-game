@@ -10,7 +10,16 @@
 //! unit testing.
 
 use crate::world::anchor::Path;
+use crate::world::sphere_geom::{subframe_range, SphereSubFrameRange};
 use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
+
+/// Standard body size for `WrappedPlane` nodes — they always
+/// occupy their parent slot's full `[0, 3)³` local frame.
+const WRAPPED_PLANE_BODY_SIZE: f32 = 3.0;
+/// Default polar-ban latitude. Mirrors `--planet-render-sphere`'s
+/// uniform `planet_render.y` default; kept here so frame-resolution
+/// can compute sub-frame range without app-level config.
+const DEFAULT_SPHERE_LAT_MAX: f32 = 1.26;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActiveFrameKind {
@@ -20,6 +29,17 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
+    /// The render frame is rooted at a node INSIDE a `WrappedPlane`
+    /// subtree (= deeper than the WP node itself). Sphere DDA
+    /// operates with a ray reparameterized into this sub-frame's
+    /// local rotated+translated coords; precision scales with the
+    /// sub-frame extent rather than the camera-distance ULP that
+    /// walls a body-rooted DDA at depth ~12.
+    ///
+    /// The sub-frame's (lat, lon, r) range is derived from the
+    /// path under the WP via `sphere_geom::subframe_range`; the
+    /// sub-frame's local axes are built from the range center.
+    SphereSubFrame(SphereSubFrameRange),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,10 +66,21 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 /// Resolve the active frame.
 ///
 /// Descends from `world_root` along `camera_anchor` for at most
-/// `desired_depth` slot steps. Stops early at a `WrappedPlane`
-/// node — the wrap branch in the shader fires at depth==0 of the
-/// marcher's local frame, so the render frame must be the slab
-/// root, not a sub-cell of it.
+/// `desired_depth` slot steps.
+///
+/// Frame-kind transitions during descent:
+///   * Reaches a Cartesian Node mid-descent → `Cartesian` kind,
+///     keep descending.
+///   * Reaches a `WrappedPlane` node and stops there → `WrappedPlane`
+///     kind. (Shader's wrap / sphere dispatch fires at marcher-
+///     local depth==0, so the render frame IS the slab root.)
+///   * Continues PAST a `WrappedPlane` node → `SphereSubFrame` kind
+///     for every deeper level. The sub-frame's `(lat, lon, r)`
+///     range is derived from the slot path under the WP.
+///
+/// The "stop at WP" gate of the previous architecture is now opt-in:
+/// callers that don't want to descend past the WP can pass a
+/// `desired_depth` ≤ the WP's depth.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -60,18 +91,15 @@ pub fn compute_render_frame(
     target.truncate(desired_depth);
     let mut node_id = world_root;
     let mut reached = Path::root();
+    let mut wp_seen = false;
     let mut kind = match library.get(world_root).map(|n| n.kind) {
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
+            wp_seen = true;
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
         }
         _ => ActiveFrameKind::Cartesian,
     };
     for k in 0..target.depth() as usize {
-        // If we've already landed on a WrappedPlane node, stop —
-        // the slab root IS the render frame.
-        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
-            break;
-        }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
@@ -80,8 +108,25 @@ pub fn compute_render_frame(
                 node_id = child_id;
                 if let Some(child_node) = library.get(child_id) {
                     if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
+                        wp_seen = true;
                         kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                        break;
+                        continue;
+                    }
+                }
+                // Inside a WP subtree, every additional step turns
+                // the kind into a SphereSubFrame at the refined
+                // (lat, lon, r) range. We always recompute from the
+                // full reached path because the WP was found at some
+                // earlier step.
+                if wp_seen {
+                    if let Some(range) = subframe_range(
+                        library,
+                        world_root,
+                        &reached,
+                        WRAPPED_PLANE_BODY_SIZE,
+                        DEFAULT_SPHERE_LAT_MAX,
+                    ) {
+                        kind = ActiveFrameKind::SphereSubFrame(range);
                     }
                 }
             }
@@ -235,6 +280,83 @@ mod tests {
             }
             other => panic!("expected WrappedPlane kind, got {other:?}"),
         }
+    }
+
+    /// When `desired_depth` extends BEYOND the WP, descent now
+    /// continues past the WP and reports `SphereSubFrame` for the
+    /// deeper levels (sphere sub-frame architecture, step 2).
+    #[test]
+    fn render_frame_kind_is_sphere_subframe_when_descending_past_wrapped_plane() {
+        use crate::world::tree::{empty_children, slot_index, NodeKind};
+        let mut lib = NodeLibrary::default();
+        let mut wp_children = empty_children();
+        wp_children[slot_index(1, 1, 1)] = Child::Block(crate::world::palette::block::GRASS);
+        let wp = lib.insert_with_kind(
+            wp_children,
+            NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
+        );
+        let mut root_children = empty_children();
+        root_children[slot_index(1, 1, 1)] = Child::Node(wp);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        // Anchor: descend to WP (1 slot), then attempt to go deeper.
+        // The slab's slot (1,1,1) is a Block leaf, so descent still
+        // stops there. But for a path that has a Node at the deeper
+        // slot, the SphereSubFrame kind should appear. Construct
+        // such a tree:
+        let mut nested_inner = empty_children();
+        nested_inner[slot_index(0, 0, 0)] = Child::Block(crate::world::palette::block::STONE);
+        let nested = lib.insert(nested_inner);
+        let mut wp2_children = empty_children();
+        wp2_children[slot_index(1, 1, 1)] = Child::Node(nested);
+        let wp2 = lib.insert_with_kind(
+            wp2_children,
+            NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
+        );
+        let mut root2_children = empty_children();
+        root2_children[slot_index(1, 1, 1)] = Child::Node(wp2);
+        let root2 = lib.insert(root2_children);
+        lib.ref_inc(root2);
+
+        let mut anchor = Path::root();
+        anchor.push(slot_index(1, 1, 1) as u8);
+        anchor.push(slot_index(1, 1, 1) as u8);
+        let frame = compute_render_frame(&lib, root2, &anchor, 5);
+        assert_eq!(frame.render_path.depth(), 2,
+                   "should descend through WP into deeper sphere sub-frame");
+        match frame.kind {
+            ActiveFrameKind::SphereSubFrame(range) => {
+                assert_eq!(range.wp_dims, [3, 1, 1]);
+                assert_eq!(range.wp_slab_depth, 1);
+                assert_eq!(range.wp_path_depth, 1);
+            }
+            other => panic!("expected SphereSubFrame, got {other:?}"),
+        }
+    }
+
+    /// `desired_depth` ≤ the WP's depth still stops at the WP and
+    /// reports `WrappedPlane` kind (= back-compat with the previous
+    /// architecture; the shader's slab-cell DDA + ribbon still fires
+    /// from the WP root in that regime).
+    #[test]
+    fn render_frame_kind_is_wrapped_plane_when_desired_depth_at_wp() {
+        use crate::world::tree::{empty_children, slot_index, NodeKind};
+        let mut lib = NodeLibrary::default();
+        let wp = lib.insert_with_kind(
+            empty_children(),
+            NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
+        );
+        let mut root_children = empty_children();
+        root_children[slot_index(1, 1, 1)] = Child::Node(wp);
+        let root = lib.insert(root_children);
+        lib.ref_inc(root);
+
+        let mut anchor = Path::root();
+        anchor.push(slot_index(1, 1, 1) as u8);
+        let frame = compute_render_frame(&lib, root, &anchor, 1);
+        assert_eq!(frame.render_path.depth(), 1);
+        assert!(matches!(frame.kind, ActiveFrameKind::WrappedPlane { .. }));
     }
 
     /// Camera anchor that doesn't enter the WrappedPlane subtree

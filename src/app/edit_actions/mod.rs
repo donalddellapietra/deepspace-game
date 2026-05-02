@@ -79,7 +79,31 @@ impl App {
                 );
                 (hit, frame_path)
             }
-            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
+            // Step 2 stub: SphereSubFrame uses the same Cartesian-frame
+            // raycast as the WP fallback. Step 3+ adds a sphere-aware
+            // edit raycast scoped to the sub-frame's range.
+            ActiveFrameKind::SphereSubFrame(range)
+                if self.startup_planet_render_sphere == Some(1) =>
+            {
+                let frame_path = self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame(&frame_path);
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let hit = raycast::cpu_raycast_sphere_uv(
+                    &self.world.library,
+                    self.world.root,
+                    frame_path.as_slice(),
+                    cam_local,
+                    ray_dir,
+                    range.wp_dims,
+                    range.wp_slab_depth,
+                    1.26,
+                    self.edit_depth(),
+                );
+                (hit, frame_path)
+            }
+            ActiveFrameKind::Cartesian
+            | ActiveFrameKind::WrappedPlane { .. }
+            | ActiveFrameKind::SphereSubFrame(_) => {
                 // Raycast from the render frame — f32 can only represent
                 // positions a few levels deeper than the frame root.
                 // The pop loop handles finding hits at coarser depths
