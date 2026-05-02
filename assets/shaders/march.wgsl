@@ -1387,6 +1387,24 @@ fn sphere_descend_anchor(
             cur_lon_center = cur_lon_center + f32(step_x) * cur_lon_step;
             cur_r_center   = cur_r_center   + f32(step_y) * cur_r_step;
             cur_lat_center = cur_lat_center + f32(step_z) * cur_lat_step;
+            // For non-crossed axes the ray's position changes continuously
+            // over delta_t; update frame_in_frac differentially via the
+            // analytic d{lon,r,lat}/dt rates at the current ray point.
+            // This is precise (rates are O(1), delta_t is small but
+            // well-conditioned). Crossed axis snaps below.
+            let delta_t = t_next - t;
+            let pos_now = ray_origin + ray_dir * t;
+            let q = pos_now - cs_center;
+            let r_now = max(length(q), 1e-9);
+            let r2_xz = max(q.x * q.x + q.z * q.z, 1e-12);
+            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / r2_xz;
+            let rate_r = dot(q, ray_dir) / r_now;
+            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
+            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
+            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
+            if step_x == 0 { frame_in_frac.x = frame_in_frac.x + rate_lon * delta_t / (3.0 * cur_lon_step); }
+            if step_y == 0 { frame_in_frac.y = frame_in_frac.y + rate_r   * delta_t / (3.0 * cur_r_step); }
+            if step_z == 0 { frame_in_frac.z = frame_in_frac.z + rate_lat * delta_t / (3.0 * cur_lat_step); }
             // Snap crossed axis frame_in_frac to the new cell's near face.
             if step_x < 0 { frame_in_frac.x = f32(new_cell.x + 1) / 3.0; }
             if step_x > 0 { frame_in_frac.x = f32(new_cell.x)     / 3.0; }
@@ -1443,6 +1461,19 @@ fn sphere_descend_anchor(
             cur_lon_center = cur_lon_center + f32(step_x) * cur_lon_step;
             cur_r_center   = cur_r_center   + f32(step_y) * cur_r_step;
             cur_lat_center = cur_lat_center + f32(step_z) * cur_lat_step;
+            let delta_t = t_next - t;
+            let pos_now = ray_origin + ray_dir * t;
+            let q = pos_now - cs_center;
+            let r_now = max(length(q), 1e-9);
+            let r2_xz = max(q.x * q.x + q.z * q.z, 1e-12);
+            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / r2_xz;
+            let rate_r = dot(q, ray_dir) / r_now;
+            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
+            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
+            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
+            if step_x == 0 { frame_in_frac.x = frame_in_frac.x + rate_lon * delta_t / (3.0 * cur_lon_step); }
+            if step_y == 0 { frame_in_frac.y = frame_in_frac.y + rate_r   * delta_t / (3.0 * cur_r_step); }
+            if step_z == 0 { frame_in_frac.z = frame_in_frac.z + rate_lat * delta_t / (3.0 * cur_lat_step); }
             if step_x < 0 { frame_in_frac.x = f32(new_cell.x + 1) / 3.0; }
             if step_x > 0 { frame_in_frac.x = f32(new_cell.x)     / 3.0; }
             if step_y < 0 { frame_in_frac.y = f32(new_cell.y + 1) / 3.0; }
@@ -1472,6 +1503,19 @@ fn sphere_descend_anchor(
             cur_lon_center = cur_lon_center + f32(step_x) * cur_lon_step;
             cur_r_center   = cur_r_center   + f32(step_y) * cur_r_step;
             cur_lat_center = cur_lat_center + f32(step_z) * cur_lat_step;
+            let delta_t = t_next - t;
+            let pos_now = ray_origin + ray_dir * t;
+            let q = pos_now - cs_center;
+            let r_now = max(length(q), 1e-9);
+            let r2_xz = max(q.x * q.x + q.z * q.z, 1e-12);
+            let rate_lon = (q.x * ray_dir.z - q.z * ray_dir.x) / r2_xz;
+            let rate_r = dot(q, ray_dir) / r_now;
+            let arg_lat = clamp(q.y / r_now, -0.99999, 0.99999);
+            let darg_dt = ray_dir.y / r_now - q.y * dot(q, ray_dir) / (r_now * r_now * r_now);
+            let rate_lat = darg_dt / sqrt(max(1.0 - arg_lat * arg_lat, 1e-12));
+            if step_x == 0 { frame_in_frac.x = frame_in_frac.x + rate_lon * delta_t / (3.0 * cur_lon_step); }
+            if step_y == 0 { frame_in_frac.y = frame_in_frac.y + rate_r   * delta_t / (3.0 * cur_r_step); }
+            if step_z == 0 { frame_in_frac.z = frame_in_frac.z + rate_lat * delta_t / (3.0 * cur_lat_step); }
             if step_x < 0 { frame_in_frac.x = f32(new_cell.x + 1) / 3.0; }
             if step_x > 0 { frame_in_frac.x = f32(new_cell.x)     / 3.0; }
             if step_y < 0 { frame_in_frac.y = f32(new_cell.y + 1) / 3.0; }
