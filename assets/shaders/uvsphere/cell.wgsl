@@ -2,7 +2,7 @@
 //
 // - `uv_ray_sphere`: ray-sphere centred at `oc` for body-shell entry.
 // - `uv_descend_cell`: walk the tree from a node + cell-local `un_*`
-//   to the deepest non-empty cell, returning the cell's resolved
+//   to the deepest non-empty cell, returning the resolved cell's
 //   `(dphi, dth, dr)` and the descent's terminal `un_*`.
 // - `uv_cell_step`: cell-local DDA — given the per-axis rates
 //   `d_un_*` (in world-time units) at the cell's depth, return the
@@ -15,8 +15,7 @@
 // converted back to `t` via the cell's per-axis rate. A fixed
 // world-distance ε (e.g. `1e-5`) cannot be reused across depths
 // because cells shrink as `1/3^N` — at depth 12 a `1e-5` ε already
-// overshoots multiple cells, which is the bug that plagued the
-// previous shader.
+// overshoots multiple cells.
 
 const UV_BOUNDARY_FRAC: f32 = 1e-4;
 
@@ -32,16 +31,18 @@ fn uv_ray_sphere(oc: vec3<f32>, dir: vec3<f32>, r: f32) -> vec2<f32> {
 }
 
 // Walk down the tree from `start_node_idx` along the cell-local
-// fractions `un_phi/un_theta/un_r` ∈ `[0, 1]³` (relative to a
+// fractions `(un_phi, un_theta, un_r) ∈ [0, 1]³` (relative to a
 // "starting cell" whose extents are `dphi/dth/dr`). Returns the
-// deepest non-empty cell's `un_*` and `dphi/dth/dr` plus a
-// `found_block` flag for callers.
+// deepest reached cell's REFINED `un_*` and `dphi/dth/dr` plus a
+// `found_block` flag. `max_descent` caps how many levels we descend
+// below the start.
 //
-// `max_descent` caps how many levels we descend below the start. The
-// sub-cell marcher uses `UV_SUBCELL_DESCENT` to stop before
-// `un *= 3 - tier` quantization eats the precision; the body-root
-// marcher passes `UV_MAX_DEPTH` because precision at the root is
-// fresh per iteration.
+// The returned `(un_*, dphi/dth/dr)` always describe the resolved
+// cell (the one the caller treats as a unit during DDA) — never
+// the parent. On empty/leaf the cell is the child at the deepest
+// slot we walked, so we still refine `un *= 3 − tier` and divide
+// `dphi /= 3` once before returning. Skipping that refinement was
+// the bug that caused the cell-skip / cross-section artifacts.
 fn uv_descend_cell(
     start_node_idx: u32,
     dphi: f32, dth: f32, dr: f32,
@@ -51,18 +52,11 @@ fn uv_descend_cell(
     var d: UvDescend;
     d.found_block = false;
     d.block_type = 0u;
-    d.dphi = dphi;
-    d.dth = dth;
-    d.dr = dr;
-    d.un_phi = clamp(un_phi, 0.0, 1.0 - 1e-7);
-    d.un_theta = clamp(un_theta, 0.0, 1.0 - 1e-7);
-    d.un_r = clamp(un_r, 0.0, 1.0 - 1e-7);
-    d.depth = 0u;
 
     var node_idx = start_node_idx;
-    var u_phi = d.un_phi;
-    var u_theta = d.un_theta;
-    var u_r = d.un_r;
+    var u_phi = clamp(un_phi, 0.0, 1.0 - 1e-7);
+    var u_theta = clamp(un_theta, 0.0, 1.0 - 1e-7);
+    var u_r = clamp(un_r, 0.0, 1.0 - 1e-7);
     var c_dphi = dphi;
     var c_dth = dth;
     var c_dr = dr;
@@ -71,23 +65,31 @@ fn uv_descend_cell(
     loop {
         if depth >= max_descent { break; }
 
+        // Pick child slot at this level + decide refined cell sizes.
         let pt = u32(clamp(floor(u_phi * 3.0), 0.0, 2.0));
         let tt = u32(clamp(floor(u_theta * 3.0), 0.0, 2.0));
         let rt = u32(clamp(floor(u_r * 3.0), 0.0, 2.0));
         let slot = pt + tt * 3u + rt * 9u;
+        let child_dphi = c_dphi / 3.0;
+        let child_dth = c_dth / 3.0;
+        let child_dr = c_dr / 3.0;
+        let child_un_phi   = clamp(u_phi   * 3.0 - f32(pt), 0.0, 1.0 - 1e-7);
+        let child_un_theta = clamp(u_theta * 3.0 - f32(tt), 0.0, 1.0 - 1e-7);
+        let child_un_r     = clamp(u_r     * 3.0 - f32(rt), 0.0, 1.0 - 1e-7);
 
         let header_off = node_offsets[node_idx];
         let occupancy = tree[header_off];
         if (occupancy & (1u << slot)) == 0u {
-            // Empty slot — descent stops at the current cell. Return
-            // the cell's pre-descent `un_*` and `dphi/dth/dr`.
-            d.un_phi = u_phi;
-            d.un_theta = u_theta;
-            d.un_r = u_r;
-            d.dphi = c_dphi;
-            d.dth = c_dth;
-            d.dr = c_dr;
-            d.depth = depth;
+            // Empty slot. The child cell at `(pt, tt, rt)` is the
+            // resolved empty cell — refine to its level before
+            // returning so callers' DDA steps at the right scale.
+            d.un_phi = child_un_phi;
+            d.un_theta = child_un_theta;
+            d.un_r = child_un_r;
+            d.dphi = child_dphi;
+            d.dth = child_dth;
+            d.dr = child_dr;
+            d.depth = depth + 1u;
             return d;
         }
 
@@ -98,13 +100,13 @@ fn uv_descend_cell(
         let packed = tree[child_off];
         let tag = packed & 0xFFu;
 
-        // Refine to the child cell.
-        u_phi   = clamp(u_phi   * 3.0 - f32(pt), 0.0, 1.0 - 1e-7);
-        u_theta = clamp(u_theta * 3.0 - f32(tt), 0.0, 1.0 - 1e-7);
-        u_r     = clamp(u_r     * 3.0 - f32(rt), 0.0, 1.0 - 1e-7);
-        c_dphi = c_dphi / 3.0;
-        c_dth = c_dth / 3.0;
-        c_dr = c_dr / 3.0;
+        // Commit the descent into the child cell.
+        u_phi = child_un_phi;
+        u_theta = child_un_theta;
+        u_r = child_un_r;
+        c_dphi = child_dphi;
+        c_dth = child_dth;
+        c_dr = child_dr;
         depth = depth + 1u;
 
         if tag == 1u {
@@ -123,7 +125,7 @@ fn uv_descend_cell(
             node_idx = tree[child_off + 1u];
             continue;
         }
-        // EntityRef / Empty leaf — treat as empty.
+        // EntityRef / Empty leaf — treat as empty at this level.
         d.un_phi = u_phi;
         d.un_theta = u_theta;
         d.un_r = u_r;
@@ -134,6 +136,7 @@ fn uv_descend_cell(
         return d;
     }
 
+    // Fell off `max_descent`. Return the deepest committed cell.
     d.un_phi = u_phi;
     d.un_theta = u_theta;
     d.un_r = u_r;
