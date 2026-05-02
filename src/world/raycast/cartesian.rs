@@ -2,7 +2,7 @@
 //! `march_cartesian`. Walks the unified tree in XYZ slot order.
 
 use super::HitInfo;
-use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Stack frame for iterative DDA traversal.
 pub(super) struct Frame {
@@ -13,27 +13,51 @@ pub(super) struct Frame {
     pub cell_size: f32,
 }
 
+/// Identity rotation columns, for callers that don't apply rotation.
+pub const IDENTITY_ROTATION: [[f32; 3]; 3] = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+];
+
+/// Mᵀ · v via dot products against the columns of M.
+#[inline]
+fn rotation_world_to_local(cols: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [
+        cols[0][0] * v[0] + cols[0][1] * v[1] + cols[0][2] * v[2],
+        cols[1][0] * v[0] + cols[1][1] * v[1] + cols[1][2] * v[2],
+        cols[2][0] * v[0] + cols[2][1] * v[1] + cols[2][2] * v[2],
+    ]
+}
+
 /// Stack-based Cartesian DDA over the unified tree. `max_depth`
 /// caps how deep the walker descends; the deepest cell at that
-/// depth is the hit granularity.
+/// depth is the hit granularity. `tangent_rotation_cols` is M's
+/// columns for the active TangentBlock rotation (identity if no
+/// rotation present in the world).
 pub(super) fn cpu_raycast_inner(
     library: &NodeLibrary,
     root: NodeId,
     ray_origin: [f32; 3],
     ray_dir: [f32; 3],
     max_depth: u32,
+    tangent_rotation_cols: &[[f32; 3]; 3],
 ) -> Option<HitInfo> {
-    let inv_dir = [
+    // Mutable so the rotation push at TangentBlock descent can swap
+    // them in place (and the OOB pop at rot_pushed_depth restores).
+    let mut ray_origin = ray_origin;
+    let mut ray_dir = ray_dir;
+    let mut inv_dir = [
         if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
         if ray_dir[1].abs() > 1e-8 { 1.0 / ray_dir[1] } else { 1e10 },
         if ray_dir[2].abs() > 1e-8 { 1.0 / ray_dir[2] } else { 1e10 },
     ];
-    let step = [
+    let mut step = [
         if ray_dir[0] >= 0.0 { 1i32 } else { -1 },
         if ray_dir[1] >= 0.0 { 1i32 } else { -1 },
         if ray_dir[2] >= 0.0 { 1i32 } else { -1 },
     ];
-    let delta_dist = [inv_dir[0].abs(), inv_dir[1].abs(), inv_dir[2].abs()];
+    let mut delta_dist = [inv_dir[0].abs(), inv_dir[1].abs(), inv_dir[2].abs()];
 
     let (t_enter, t_exit) = ray_aabb(ray_origin, inv_dir, [0.0; 3], [3.0; 3]);
     if t_enter >= t_exit || t_exit < 0.0 {
@@ -65,6 +89,18 @@ pub(super) fn cpu_raycast_inner(
         cell_size: 1.0,
     });
 
+    // TangentBlock rotation push state. Mirror of WGSL march_cartesian.
+    // V1 supports a single rotation in the descent stack — nested
+    // rotated subtrees beyond the first descend without applying
+    // further rotation.
+    let mut rot_active = false;
+    let mut rot_pushed_at_depth: usize = 0;
+    let mut saved_ray_origin = [0.0f32; 3];
+    let mut saved_ray_dir = [0.0f32; 3];
+    let mut saved_inv_dir = [0.0f32; 3];
+    let mut saved_step = [0i32; 3];
+    let mut saved_delta_dist = [0.0f32; 3];
+
     let mut normal_face: u32 = 2;
     let mut iterations = 0u32;
     let max_iterations = (max_depth.max(1) * 4096).max(8192);
@@ -79,6 +115,26 @@ pub(super) fn cpu_raycast_inner(
         let cell = stack[depth].cell;
 
         if cell[0] < 0 || cell[0] > 2 || cell[1] < 0 || cell[1] > 2 || cell[2] < 0 || cell[2] > 2 {
+            // Rotation pop: when popping back to rot_pushed_at_depth,
+            // restore parent-frame ray vars before stepping the parent
+            // DDA. The standard `stack.pop() + advance_dda` would step
+            // using the rotated ray vars — wrong frame.
+            if rot_active && depth == rot_pushed_at_depth + 1 {
+                stack.pop();
+                if path.len() > depth {
+                    path.truncate(depth);
+                }
+                if stack.is_empty() { break; }
+                ray_origin = saved_ray_origin;
+                ray_dir = saved_ray_dir;
+                inv_dir = saved_inv_dir;
+                step = saved_step;
+                delta_dist = saved_delta_dist;
+                rot_active = false;
+                let d = stack.len() - 1;
+                advance_dda(&mut stack[d], &step, &delta_dist, &mut normal_face);
+                continue;
+            }
             stack.pop();
             if path.len() > depth {
                 path.truncate(depth);
@@ -150,6 +206,81 @@ pub(super) fn cpu_raycast_inner(
                     parent_origin[2] + cell[2] as f32 * parent_cell_size,
                 ];
                 let child_cell_size = parent_cell_size / 3.0;
+
+                // TangentBlock rotation push (mirror of WGSL): scale +
+                // rotate the ray so the rotated cube becomes [0, 3)³
+                // in scaled-rotated local coords; the inner DDA then
+                // runs byte-identical to a fresh cartesian root. Hit
+                // conversion happens at the leaf-Block branch above.
+                let is_tangent = !rot_active
+                    && child_node.kind == NodeKind::TangentBlock;
+                if is_tangent {
+                    saved_ray_origin = ray_origin;
+                    saved_ray_dir = ray_dir;
+                    saved_inv_dir = inv_dir;
+                    saved_step = step;
+                    saved_delta_dist = delta_dist;
+                    rot_active = true;
+                    rot_pushed_at_depth = depth;
+
+                    let scale = 3.0 / parent_cell_size;
+                    let dx = [
+                        ray_origin[0] - child_origin[0],
+                        ray_origin[1] - child_origin[1],
+                        ray_origin[2] - child_origin[2],
+                    ];
+                    let dx_local = rotation_world_to_local(tangent_rotation_cols, dx);
+                    let dir_local = rotation_world_to_local(tangent_rotation_cols, ray_dir);
+                    ray_origin = [dx_local[0] * scale, dx_local[1] * scale, dx_local[2] * scale];
+                    ray_dir = [dir_local[0] * scale, dir_local[1] * scale, dir_local[2] * scale];
+                    inv_dir = [
+                        if ray_dir[0].abs() > 1e-8 { 1.0 / ray_dir[0] } else { 1e10 },
+                        if ray_dir[1].abs() > 1e-8 { 1.0 / ray_dir[1] } else { 1e10 },
+                        if ray_dir[2].abs() > 1e-8 { 1.0 / ray_dir[2] } else { 1e10 },
+                    ];
+                    step = [
+                        if ray_dir[0] >= 0.0 { 1i32 } else { -1 },
+                        if ray_dir[1] >= 0.0 { 1i32 } else { -1 },
+                        if ray_dir[2] >= 0.0 { 1i32 } else { -1 },
+                    ];
+                    delta_dist = [inv_dir[0].abs(), inv_dir[1].abs(), inv_dir[2].abs()];
+
+                    let (cube_t_enter, cube_t_exit) =
+                        ray_aabb(ray_origin, inv_dir, [0.0; 3], [3.0; 3]);
+                    if cube_t_enter >= cube_t_exit || cube_t_exit < 0.0 {
+                        // Restore + advance parent.
+                        ray_origin = saved_ray_origin;
+                        ray_dir = saved_ray_dir;
+                        inv_dir = saved_inv_dir;
+                        step = saved_step;
+                        delta_dist = saved_delta_dist;
+                        rot_active = false;
+                        advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                        continue;
+                    }
+                    let cube_t_start = cube_t_enter.max(0.0) + 0.001;
+                    let local_entry = [
+                        ray_origin[0] + ray_dir[0] * cube_t_start,
+                        ray_origin[1] + ray_dir[1] * cube_t_start,
+                        ray_origin[2] + ray_dir[2] * cube_t_start,
+                    ];
+                    let nc = [
+                        (local_entry[0].floor() as i32).clamp(0, 2),
+                        (local_entry[1].floor() as i32).clamp(0, 2),
+                        (local_entry[2].floor() as i32).clamp(0, 2),
+                    ];
+                    let lc = [nc[0] as f32, nc[1] as f32, nc[2] as f32];
+                    stack.push(Frame {
+                        node_id: child_id,
+                        cell: nc,
+                        side_dist: compute_initial_side_dist(
+                            &ray_origin, &lc, &inv_dir, &ray_dir, 1.0, &[0.0; 3],
+                        ),
+                        node_origin: [0.0; 3],
+                        cell_size: 1.0,
+                    });
+                    continue;
+                }
 
                 let child_max = [
                     child_origin[0] + parent_cell_size,

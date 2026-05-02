@@ -10,6 +10,7 @@
 mod cartesian;
 mod sphere_uv;
 
+pub use cartesian::IDENTITY_ROTATION;
 pub use sphere_uv::cpu_raycast_sphere_uv;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
@@ -42,7 +43,25 @@ pub fn cpu_raycast(
     ray_dir: [f32; 3],
     max_depth: u32,
 ) -> Option<HitInfo> {
-    cartesian::cpu_raycast_inner(library, root, ray_origin, ray_dir, max_depth)
+    cartesian::cpu_raycast_inner(
+        library, root, ray_origin, ray_dir, max_depth, &IDENTITY_ROTATION,
+    )
+}
+
+/// Variant of `cpu_raycast` that applies the active TangentBlock
+/// rotation when descent crosses a `NodeKind::TangentBlock` node.
+/// Mirrors the GPU shader's `march_cartesian` rotation push.
+pub fn cpu_raycast_with_rotation(
+    library: &NodeLibrary,
+    root: NodeId,
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    max_depth: u32,
+    tangent_rotation_cols: &[[f32; 3]; 3],
+) -> Option<HitInfo> {
+    cartesian::cpu_raycast_inner(
+        library, root, ray_origin, ray_dir, max_depth, tangent_rotation_cols,
+    )
 }
 
 /// Frame-aware raycast. Mirrors the renderer's ribbon-pop
@@ -59,6 +78,7 @@ pub fn cpu_raycast_in_frame(
     ray_dir: [f32; 3],
     max_depth: u32,
     _max_face_depth: u32,
+    tangent_rotation_cols: &[[f32; 3]; 3],
 ) -> Option<HitInfo> {
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
     let effective_depth = chain.len() - 1;
@@ -75,6 +95,7 @@ pub fn cpu_raycast_in_frame(
 
         let hit_opt = cartesian::cpu_raycast_inner(
             library, frame_root_id, ray_origin, ray_dir, inner_max,
+            tangent_rotation_cols,
         );
 
         if let Some(mut hit) = hit_opt {
@@ -264,6 +285,7 @@ mod tests {
         let frame_hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6,
+            &IDENTITY_ROTATION,
         );
         assert!(world_hit.is_some());
         assert!(frame_hit.is_some());
@@ -282,6 +304,7 @@ mod tests {
         let _ = cpu_raycast_in_frame(
             &world.library, world.root,
             &frame_path, cam, dir, 8, 6,
+            &IDENTITY_ROTATION,
         );
     }
 
@@ -291,6 +314,7 @@ mod tests {
         let hit = cpu_raycast_in_frame(
             &world.library, world.root,
             &[], [1.5, 2.5, 1.5], [0.0, -1.0, 0.0], 8, 6,
+            &IDENTITY_ROTATION,
         ).expect("should hit ground");
         assert_eq!(hit.path[0].0, world.root);
     }
@@ -322,6 +346,7 @@ mod tests {
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
                 edit_depth, 6,
+                &IDENTITY_ROTATION,
             );
 
             assert!(hit.is_some(),
@@ -373,6 +398,7 @@ mod tests {
                 &world.library, world.root,
                 frame_path.as_slice(), cam_local, ray_dir,
                 edit_depth, 6,
+                &IDENTITY_ROTATION,
             );
 
             assert!(hit.is_some(),
