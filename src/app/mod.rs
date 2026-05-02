@@ -392,6 +392,7 @@ impl App {
         logical_path.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
+            Some(&position),
         );
         eprintln!(
             "startup_perf initial_frame kind={:?} render_depth={} logical_depth={} desired_depth={} anchor_depth={}",
@@ -509,9 +510,6 @@ impl App {
     /// explicit face-cell window so render/edit share one layer
     /// definition.
     pub(super) fn render_frame(&self) -> ActiveFrame {
-        // Deepen the camera's anchor to `RENDER_ANCHOR_DEPTH` so
-        // the render frame depth is a function of camera position,
-        // not the user's zoom level. See `RENDER_ANCHOR_DEPTH`.
         let desired_depth = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
@@ -520,6 +518,7 @@ impl App {
         frame::with_render_margin(
             &self.world.library, self.world.root,
             &logical_path, RENDER_FRAME_CONTEXT,
+            Some(&self.camera.position),
         )
     }
 

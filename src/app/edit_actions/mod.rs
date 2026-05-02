@@ -92,21 +92,23 @@ impl App {
                 let frame_path = self.active_frame.render_path;
                 let mut cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
-                // When the frame root is a TangentBlock, the shader
-                // applies R^T to the camera position at frame entry.
-                // The CPU raycast must match.
-                if let Some(frame_node) = self.world.library.get(self.active_frame.node_id) {
-                    if let crate::world::tree::NodeKind::TangentBlock { rotation } = frame_node.kind {
+                // When the frame path crosses a TangentBlock, apply
+                // R^T + content scale around tb_center. Matches the
+                // shader's frame-entry rotation.
+                let tbc = self.active_frame.tb_center;
+                let has_tb = tbc[0] != 0.0 || tbc[1] != 0.0 || tbc[2] != 0.0;
+                if has_tb {
+                    if let Some(rotation) = self.find_frame_path_tb_rotation() {
                         let tb_scale = crate::world::raycast::inscribed_cube_scale(&rotation);
                         let centered = [
-                            cam_local[0] - 1.5,
-                            cam_local[1] - 1.5,
-                            cam_local[2] - 1.5,
+                            cam_local[0] - tbc[0],
+                            cam_local[1] - tbc[1],
+                            cam_local[2] - tbc[2],
                         ];
                         cam_local = [
-                            1.5 + (rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2]) / tb_scale,
-                            1.5 + (rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2]) / tb_scale,
-                            1.5 + (rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2]) / tb_scale,
+                            tbc[0] + (rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2]) / tb_scale,
+                            tbc[1] + (rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2]) / tb_scale,
+                            tbc[2] + (rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2]) / tb_scale,
                         ];
                     }
                 }
@@ -242,6 +244,27 @@ impl App {
             }
         }
         out
+    }
+
+    fn find_frame_path_tb_rotation(&self) -> Option<[[f32; 3]; 3]> {
+        use crate::world::tree::{Child, NodeKind};
+        let mut node = self.world.root;
+        for k in 0..self.active_frame.render_path.depth() as usize {
+            let slot = self.active_frame.render_path.slot(k) as usize;
+            let n = self.world.library.get(node)?;
+            match n.children[slot] {
+                Child::Node(child_id) => {
+                    if let Some(child) = self.world.library.get(child_id) {
+                        if let NodeKind::TangentBlock { rotation } = child.kind {
+                            return Some(rotation);
+                        }
+                    }
+                    node = child_id;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn debug_hit_terminal(&self, hit: &raycast::HitInfo) -> String {

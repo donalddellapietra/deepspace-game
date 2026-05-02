@@ -246,12 +246,14 @@ impl App {
             self.world.root,
             &effective_path,
             effective_path.depth(),
+            Some(&self.camera.position),
         );
         self.active_frame = ActiveFrame {
             render_path: effective_render.render_path,
             logical_path: intended_frame.logical_path,
             node_id: effective_render.node_id,
             kind: effective_render.kind,
+            tb_center: effective_render.tb_center,
         };
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(scene_frame_bfs);
@@ -292,6 +294,7 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(effective_visual_depth);
             renderer.set_beam_enabled(beam_enabled);
+            renderer.set_frame_tb_center(self.active_frame.tb_center);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),

@@ -1593,22 +1593,34 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
 
-    // TangentBlock frame root: the camera position and basis are in
-    // the TB's unrotated local frame, but the shader needs to see
-    // content from the SAME rotated perspective as rays entering
-    // from outside (which apply R^T at the TB boundary). Apply R^T
-    // to ray_origin (centered at [1.5,1.5,1.5]) so the Cartesian
-    // DDA traces through the TB in the rotated view. ray_dir is
-    // already R^T-rotated by the CPU's frame_path_rotation basis.
-    // On ribbon pop, R reverses this (my ribbon TB fix).
-    let frame_root_kind = node_kinds[current_idx].kind;
-    if frame_root_kind == NODE_KIND_TANGENT_BLOCK {
-        let rc0 = node_kinds[current_idx].rot_col0.xyz;
-        let rc1 = node_kinds[current_idx].rot_col1.xyz;
-        let rc2 = node_kinds[current_idx].rot_col2.xyz;
-        let tb_scale = node_kinds[current_idx].rot_col0.w;
-        let centered = ray_origin - vec3<f32>(1.5);
-        ray_origin = vec3<f32>(1.5) + vec3<f32>(
+    // Frame-entry R^T: when the frame path crosses a TangentBlock,
+    // apply R^T + content scale to the camera position so the DDA
+    // sees the same rotated view as rays entering from outside.
+    // The rotation center is `uniforms.frame_tb_center` — [1.5,1.5,1.5]
+    // when the frame root IS the TB, shifted when deeper.
+    // Detect TB on path: frame root is TB, OR frame_tb_center is
+    // non-zero (deeper Cartesian child of a TB).
+    let ftbc = uniforms.frame_tb_center.xyz;
+    let has_tb = ftbc.x != 0.0 || ftbc.y != 0.0 || ftbc.z != 0.0;
+    if has_tb {
+        // Find the TB node: walk ribbon in reverse to find the
+        // TangentBlock ancestor. For frame root = TB, use current_idx.
+        var tb_idx = current_idx;
+        if node_kinds[current_idx].kind != NODE_KIND_TANGENT_BLOCK {
+            for (var ri = 0u; ri < uniforms.ribbon_count; ri = ri + 1u) {
+                let re = ribbon[ri];
+                if node_kinds[re.child_bfs].kind == NODE_KIND_TANGENT_BLOCK {
+                    tb_idx = re.child_bfs;
+                    break;
+                }
+            }
+        }
+        let rc0 = node_kinds[tb_idx].rot_col0.xyz;
+        let rc1 = node_kinds[tb_idx].rot_col1.xyz;
+        let rc2 = node_kinds[tb_idx].rot_col2.xyz;
+        let tb_scale = node_kinds[tb_idx].rot_col0.w;
+        let centered = ray_origin - ftbc;
+        ray_origin = ftbc + vec3<f32>(
             dot(rc0, centered),
             dot(rc1, centered),
             dot(rc2, centered),
