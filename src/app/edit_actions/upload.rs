@@ -299,7 +299,6 @@ impl App {
                     renderer.set_root_kind_uv_sphere_body();
                 }
                 ActiveFrameKind::UvSubCell {
-                    body_node_id,
                     body_inner_r, body_outer_r, body_theta_cap,
                     phi_min, theta_min, r_min,
                     dphi, dth, dr,
@@ -308,27 +307,17 @@ impl App {
                     // Body params are stored in body-LOCAL `[0, 1)³`
                     // units (same as the `node_kinds[body]` packing);
                     // the shader's body_size = 3 convention scales
-                    // them by the body-frame size. Match here.
+                    // them by the body-frame size. Match here. The
+                    // shader reads body params from `uv_body_params`
+                    // uniforms — no need to thread the body's BFS
+                    // index through; the renderer's `root_index` is
+                    // already the sub-cell node, not the body.
                     let body_size = crate::world::anchor::WORLD_SIZE;
-                    // The frame node BFS idx is the renderer's
-                    // current `root_index` (set by `update_tree` when
-                    // the sub-cell pack landed). The BODY's BFS idx
-                    // comes from a CPU-side library lookup against
-                    // the active pack — `cached_tree.bfs_index_of`.
-                    let cached = self
-                        .cached_tree
-                        .as_ref()
-                        .expect("cached_tree populated");
-                    let body_bfs = cached
-                        .bfs_by_nid
-                        .get(&body_node_id)
-                        .copied()
-                        .unwrap_or(0);
                     renderer.set_root_kind_uv_sub_cell(
                         body_inner_r * body_size,
                         body_outer_r * body_size,
                         body_theta_cap,
-                        body_bfs,
+                        0,
                         phi_min,
                         theta_min,
                         r_min * body_size,
