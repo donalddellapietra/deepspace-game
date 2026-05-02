@@ -363,11 +363,11 @@ const MAX_FACE_DEPTH: u32 = 63u;
 /// `plain_layers = 40` world still only needs ~7 levels to
 /// reach its effective visible horizon.
 ///
-/// Per-invocation register cost scales linearly. Base-2 octree
-/// needs ~1.58x more levels than base-3 for the same resolution
-/// (2^13 ≈ 3^8). 13 levels gives comparable visual depth to
-/// the original 8-level base-3 tree.
-const MAX_STACK_DEPTH: u32 = 13u;
+/// With base-2, the render frame stays at the WrappedPlane root
+/// (depth 2) and the camera can be at depth 25+. The shader must
+/// descend deep enough to reach edited cells. 24 matches the
+/// proto cube walker's PROTO_STACK_DEPTH.
+const MAX_STACK_DEPTH: u32 = 24u;
 
 struct HitResult {
     hit: bool,
