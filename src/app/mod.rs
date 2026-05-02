@@ -646,23 +646,20 @@ impl App {
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
 
-        // Cumulative rotation of the render frame relative to world.
-        // Walk the camera's anchor path; each TangentBlock crossed
-        // contributes its quaternion. Identity if the path is pure
-        // Cartesian — the OUTSIDE case, no behavior change.
-        let frame_rotation = self.accumulated_render_rotation();
-        let inv_rot = quat_inverse(frame_rotation);
-        // Rotate basis INTO the render frame's local coords. Inside a
-        // rotated cube this means rays cast in cube-local direction,
-        // so the cube's axis-aligned interior cells render rotated
-        // relative to the player's world view.
-        let fwd_local = quat_rotate(inv_rot, crate::world::sdf::normalize(fwd_world));
-        let right_local = quat_rotate(inv_rot, crate::world::sdf::normalize(right_world));
-        let up_local = quat_rotate(inv_rot, crate::world::sdf::normalize(up_world));
+        // Camera basis stays in WORLD frame — the shader's
+        // TangentBlock dispatches (both outside-in-march_cartesian
+        // and inside-in-march) handle the rotation themselves so the
+        // boundary transform is identical on both sides. CPU-side
+        // basis rotation here previously caused a scale-mismatch
+        // jump at the cube boundary because the inside path skipped
+        // the √3 shrink the outside path applies.
+        let fwd_local = crate::world::sdf::normalize(fwd_world);
+        let right_local = crate::world::sdf::normalize(right_world);
+        let up_local = crate::world::sdf::normalize(up_world);
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} frame_rot={:?}",
-                fwd_world, fwd_local, frame_rotation,
+                "gpu_camera basis world_fwd={:?} local_fwd={:?}",
+                fwd_world, fwd_local,
             );
         }
         let mut gpu = self.camera.gpu_camera_with_basis(
@@ -672,7 +669,9 @@ impl App {
             up_local,
             1.2,
         );
-        gpu.frame_rotation = frame_rotation;
+        // frame_rotation stays identity — the dispatches handle their
+        // own rotation. main.wgsl's normal-lift becomes a no-op.
+        gpu.frame_rotation = [0.0, 0.0, 0.0, 1.0];
         gpu
     }
 
