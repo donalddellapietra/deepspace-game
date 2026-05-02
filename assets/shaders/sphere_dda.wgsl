@@ -638,10 +638,13 @@ fn cartesian_voxels_in_cell(
     result.hit = true;
     result.t = cart_hit.t * inv_norm;
     result.normal = n_world;
-    // v0 prototype: paint pure red so we can unambiguously see
-    // when the v1 dispatch fires. Replace with `cart_hit.color`
-    // (real block color) once the dispatch is verified working.
-    result.color = vec3<f32>(1.0, 0.0, 0.0);
+    // Use the actual block color from `march_cartesian` — this is
+    // what makes the cube show the real voxel structure of the
+    // cell's subtree (grass voxels green, holes from breaks
+    // visible as ray-passes-through). Tint slightly blue so the
+    // proto cell is still visually distinct from the surrounding
+    // sphere cells.
+    result.color = cart_hit.color * vec3<f32>(0.7, 0.9, 1.4);
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
     return result;

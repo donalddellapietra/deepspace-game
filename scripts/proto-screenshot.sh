@@ -35,8 +35,9 @@ mkdir -p "$(dirname "$OUT")"
 # --exit-after-frames 3: harness exits cleanly after 3 frames.
 timeout 12 ./target/debug/deepspace-game \
     --wrapped-planet --planet-render-sphere \
-    --spawn-xyz 1.506 1.65 1.464 \
+    --spawn-xyz 1.506 1.575 1.464 \
     --spawn-yaw 0 --spawn-pitch -1.57 \
+    --interaction-radius 12 \
     --render-harness \
     --screenshot "$OUT" \
     --exit-after-frames 3 \
