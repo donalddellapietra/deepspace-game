@@ -118,26 +118,7 @@ fn march_uv_sphere(
         );
         if bd.t > 1e20 { break; }
         let step = bd.t - t;
-        // Boundary nudge: push `t` just past the cell-face crossing
-        // so the next iteration's `(phi, theta, r)` lands inside the
-        // next cell, not on the shared boundary.
-        //
-        // `step * 1e-4` is `0.01 %` of the cell — fine when the cell
-        // is `O(1)` world units, but at deep zoom `step` shrinks
-        // exponentially with descent depth: at body-tree depth 11
-        // the cell arc-width is `≈ 1.8e-5` so `step * 1e-4 ≈ 1.8e-9`,
-        // well below the f32 ULP of `t` and the nudge effectively
-        // doesn't advance the ray. The previous `1e-5` floor papered
-        // over that, but `1e-5` is `56 %` of cell width at depth 11
-        // — every iteration overshoots more than half a cell, the
-        // ray skips entire cells in (φ, θ, r) space, and the rendered
-        // surface gets the ghostly axis-aligned dark-patch encroaching
-        // artifact at close zoom.
-        //
-        // Floor at `t · 1e-6` instead — that's a few ULPs of f32 `t`
-        // at any non-tiny `t`, just enough to clear the boundary
-        // without overshooting.
-        t = bd.t + max(step * 1e-4, t * 1e-6);
+        t = bd.t + max(step * 1e-4, 1e-5);
         last_axis = bd.axis;
         last_side = bd.side;
     }

@@ -141,14 +141,7 @@ pub fn cpu_raycast_uv_body(
             return None;
         }
         let step = bd.t - t;
-        // Boundary nudge floor scales with `t` (≈ a few f32 ULPs)
-        // rather than a fixed `1e-5`. At deep zoom the cell arc-width
-        // shrinks exponentially with descent depth — by depth 11 it
-        // is ~`1.8e-5` and a `1e-5` floor is `56 %` of cell width,
-        // skipping entire cells per iteration. `t * 1e-6` is a few
-        // ULPs at any non-tiny `t`, just enough to clear the
-        // boundary in f32 without overshooting deep cells.
-        t = bd.t + (step * 1e-4).max(t * 1e-6);
+        t = bd.t + (step * 1e-4).max(1e-5);
     }
 
     None
