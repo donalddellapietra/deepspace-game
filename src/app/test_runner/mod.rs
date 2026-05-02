@@ -65,6 +65,7 @@
 
 mod config;
 mod monitor;
+mod perf;
 mod runner;
 
 pub use config::{ScriptCmd, TestConfig};
