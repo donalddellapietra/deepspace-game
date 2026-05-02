@@ -314,7 +314,7 @@ mod tests {
             let mut frame_path = pos.anchor;
             frame_path.truncate(frame_depth);
 
-            let cam_local = pos.in_frame(&frame_path);
+            let cam_local = pos.in_frame(&frame_path, &world.library, world.root);
             let ray_dir = crate::world::sdf::normalize([0.0, -0.434, -0.901]);
             let edit_depth = anchor_depth as u32;
 
@@ -356,7 +356,7 @@ mod tests {
         bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
 
         for target_depth in (initial_depth + 1)..=38u8 {
-            pos.zoom_in();
+            pos.zoom_in(&world.library, world.root);
 
             let anchor_depth = pos.anchor.depth();
             assert_eq!(anchor_depth, target_depth);
@@ -365,7 +365,7 @@ mod tests {
             let mut frame_path = pos.anchor;
             frame_path.truncate(frame_depth);
 
-            let cam_local = pos.in_frame(&frame_path);
+            let cam_local = pos.in_frame(&frame_path, &world.library, world.root);
             let ray_dir = crate::world::sdf::normalize([0.0, -0.434, -0.901]);
             let edit_depth = anchor_depth as u32;
 

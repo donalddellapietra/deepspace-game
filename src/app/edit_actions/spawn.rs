@@ -168,11 +168,17 @@ impl App {
 
         let base_anchor = if let Some(sea_y) = self.entity_surface_y {
             let base_pos = WorldPos::new_unchecked(base, [0.0, 0.0, 0.0]);
-            let base_world = base_pos.in_frame(&crate::world::anchor::Path::root());
+            let base_world = base_pos.in_frame(
+                &crate::world::anchor::Path::root(),
+                &self.world.library,
+                self.world.root,
+            );
             let ground = WorldPos::from_frame_local(
                 &crate::world::anchor::Path::root(),
                 [base_world[0], sea_y, base_world[2]],
                 anchor_depth,
+                &self.world.library,
+                self.world.root,
             );
             ground.anchor
         } else {

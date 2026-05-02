@@ -72,8 +72,10 @@ pub(crate) fn bootstrap_hollow_cube_world(depth: u8) -> WorldBootstrap {
         &Path::root(),
         [2.8, 2.8, 2.8],
         2,
+        &world.library,
+        world.root,
     )
-    .deepened_to(8);
+    .deepened_to(8, &world.library, world.root);
     WorldBootstrap {
         world,
         planet_path: None,

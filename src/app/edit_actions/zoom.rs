@@ -49,7 +49,7 @@ impl App {
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+                self.camera.position.in_frame(&frame.render_path, &self.world.library, self.world.root)
             }
         };
         cam_local.iter().all(|v| v.is_finite())
@@ -63,7 +63,7 @@ impl App {
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => (
-                self.camera.position.in_frame(&frame.render_path),
+                self.camera.position.in_frame(&frame.render_path, &self.world.library, self.world.root),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
             ),
@@ -112,7 +112,7 @@ impl App {
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
                 ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                    self.camera.position.in_frame(&frame.render_path)
+                    self.camera.position.in_frame(&frame.render_path, &self.world.library, self.world.root)
                 }
             };
             eprintln!(

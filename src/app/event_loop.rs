@@ -380,21 +380,20 @@ impl App {
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Cartesian
                 | crate::app::ActiveFrameKind::WrappedPlane { .. } => {
-                    self.camera.position.world_to_frame_rot(
+                    self.camera.position.in_frame(
+                        &self.active_frame.render_path,
                         &self.world.library,
                         self.world.root,
-                        &self.active_frame.render_path,
                     )
                 }
             };
-            // Camera world position via plain Cartesian `in_frame` —
-            // matches what `add_local` actually moves through and
-            // what `world_to_frame_rot` uses as input. Reporting the
-            // rotation-aware value here would make the overlay show
-            // a different "world position" than the renderer +
-            // movement system actually agree on.
-            let camera_root_xyz =
-                self.camera.position.in_frame(&crate::world::anchor::Path::root());
+            // Camera world position via rotation-aware `in_frame` at
+            // root — matches what the renderer / movement system see.
+            let camera_root_xyz = self.camera.position.in_frame(
+                &crate::world::anchor::Path::root(),
+                &self.world.library,
+                self.world.root,
+            );
             let anchor_depth = self.camera.position.anchor.depth();
             let anchor_cell_size_root =
                 crate::world::anchor::WORLD_SIZE / 3.0_f32.powi(anchor_depth as i32);
@@ -592,9 +591,9 @@ impl App {
         let new_depth = (cur + step).clamp(1, max_depth);
         if new_depth == cur { return; }
         if step > 0 {
-            self.camera.position.zoom_in();
+            self.camera.position.zoom_in(&self.world.library, self.world.root);
         } else {
-            self.camera.position.zoom_out();
+            self.camera.position.zoom_out(&self.world.library, self.world.root);
         }
         self.apply_zoom();
     }

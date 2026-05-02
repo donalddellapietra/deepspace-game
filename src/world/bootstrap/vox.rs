@@ -179,7 +179,9 @@ pub fn bootstrap_vox_model_world(
         &Path::root(),
         [cam_x, cam_y, cam_z],
         2,
-    ).deepened_to(3);
+        &world.library,
+        world.root,
+    ).deepened_to(3, &world.library, world.root);
     let yaw = 0.0;
     let pitch = -1.5;   // nearly straight down
 

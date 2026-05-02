@@ -425,7 +425,7 @@ mod tests {
         cache.update_root(&world.library, world.root);
         let entries_before = cache.node_offsets.len();
 
-        let ray_origin = pos.in_frame(&Path::root());
+        let ray_origin = pos.in_frame(&Path::root(), &world.library, world.root);
         let hit = raycast::cpu_raycast(
             &world.library, world.root, ray_origin, [0.0, -0.4, -0.9], spawn_depth as u32,
         ).expect("raycast should hit ground");
@@ -488,7 +488,7 @@ mod tests {
 
             let (tree_before, _, offsets_before, _, _, _) = pack_tree(&world.library, world.root);
 
-            let ray_origin = pos.in_frame(&Path::root());
+            let ray_origin = pos.in_frame(&Path::root(), &world.library, world.root);
             let hit = raycast::cpu_raycast(
                 &world.library, world.root, ray_origin, [0.0, -0.4, -0.9], spawn_depth as u32,
             ).expect(&format!("raycast must hit at depth {spawn_depth}"));

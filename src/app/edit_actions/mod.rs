@@ -70,7 +70,7 @@ impl App {
             // raycast so click-targeting matches the GPU visual.
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                 let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
+                let cam_local = self.camera.position.in_frame(&frame_path, &self.world.library, self.world.root);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 // lat_max kept in sync with the shader-side default
                 // (1.26 rad ≈ 72°).
@@ -98,7 +98,7 @@ impl App {
                 // because the camera is inside the slab cell and
                 // raycasting stays inside the [0, 3)^3 frame.
                 let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
+                let cam_local = self.camera.position.in_frame(&frame_path, &self.world.library, self.world.root);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,

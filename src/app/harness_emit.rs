@@ -143,7 +143,7 @@ impl App {
         use crate::world::anchor::{Path, WorldPos};
         use crate::world::raycast::cpu_raycast;
 
-        let root_cam = self.camera.position.in_frame(&Path::root());
+        let root_cam = self.camera.position.in_frame(&Path::root(), &self.world.library, self.world.root);
         let ray_dir = [0.0f32, -1.0, 0.0];
         // Raycast the full tree depth so deeply-nested content gets
         // resolved. interaction_radius doesn't apply here — this is
@@ -165,7 +165,7 @@ impl App {
         let cell = 1.0_f32 / 3.0_f32.powi(anchor_depth as i32);
         let above_y = hit_y + 2.0 * cell;
         let new_pos = [root_cam[0], above_y.min(3.0 - cell), root_cam[2]];
-        self.camera.position = WorldPos::from_frame_local(&Path::root(), new_pos, anchor_depth);
+        self.camera.position = WorldPos::from_frame_local(&Path::root(), new_pos, anchor_depth, &self.world.library, self.world.root);
         eprintln!(
             "fly_to_surface: t={:.6} hit_y={:.6} new_y={:.6} anchor_depth={}",
             hit.t, hit_y, above_y, anchor_depth,

@@ -305,6 +305,8 @@ pub fn wrapped_planet_spawn(
     embedding_depth: u8,
     slab_dims: [u32; 3],
     slab_depth: u8,
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
 ) -> WorldPos {
     let subgrid = (BRANCH as u32).pow(slab_depth as u32) as f32;
     let frac_x = slab_dims[0] as f32 / subgrid;
@@ -324,7 +326,7 @@ pub fn wrapped_planet_spawn(
         embedding_depth,
         [cam_x, cam_y, cam_z],
     )
-    .deepened_to(embedding_depth + slab_depth)
+    .deepened_to(embedding_depth + slab_depth, library, world_root)
 }
 
 pub(super) fn bootstrap_wrapped_planet_world(
@@ -341,7 +343,9 @@ pub(super) fn bootstrap_wrapped_planet_world(
     // levels of recursive material — is invisible from this anchor;
     // zooming IN by N levels reveals the next N layers of the
     // subtree, all the way down to the leaf Block at total tree depth.
-    let spawn_pos = wrapped_planet_spawn(embedding_depth, slab_dims, slab_depth);
+    let spawn_pos = wrapped_planet_spawn(
+        embedding_depth, slab_dims, slab_depth, &world.library, world.root,
+    );
     WorldBootstrap {
         world,
         planet_path: None,

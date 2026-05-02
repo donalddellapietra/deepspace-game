@@ -351,8 +351,8 @@ impl App {
                 let depth = test_cfg.spawn_depth.unwrap_or(
                     bootstrap.default_spawn_pos.anchor.depth(),
                 );
-                WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12))
-                    .deepened_to(depth)
+                WorldPos::from_frame_local(&Path::root(), xyz, depth.min(12), &world.library, world.root)
+                    .deepened_to(depth, &world.library, world.root)
             }
             None => {
                 if let Some(depth) = test_cfg.spawn_depth {
@@ -365,8 +365,8 @@ impl App {
                         pos
                     } else {
                         let mut pos = bootstrap.default_spawn_pos;
-                        while pos.anchor.depth() > depth { pos.zoom_out(); }
-                        pos = pos.deepened_to(depth);
+                        while pos.anchor.depth() > depth { pos.zoom_out(&world.library, world.root); }
+                        pos = pos.deepened_to(depth, &world.library, world.root);
                         pos
                     }
                 } else {
@@ -388,7 +388,7 @@ impl App {
         let desired_depth = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
+        let mut logical_path = position.deepened_to(RENDER_ANCHOR_DEPTH, &world.library, world.root).anchor;
         logical_path.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
@@ -515,7 +515,7 @@ impl App {
         let desired_depth = RENDER_ANCHOR_DEPTH
             .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
+        let mut logical_path = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH, &self.world.library, self.world.root).anchor;
         logical_path.truncate(desired_depth);
         frame::with_render_margin(
             &self.world.library, self.world.root,
@@ -619,21 +619,13 @@ impl App {
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                // `world_to_frame_rot` keeps `add_local`'s Cartesian
-                // semantics (offset is a Cartesian world delta from
-                // the anchor cell origin) while still mapping the
-                // camera's WORLD position into the rotation-correct
-                // cell of a rotated render frame. Plain `in_frame`
-                // would Cartesian-walk inside the rotated frame and
-                // place the camera in the WRONG TB-local cell —
-                // visible to the user as the camera "transporting
-                // into a neighbouring block" the moment the anchor
-                // path crosses into the TB. `in_frame_rot` interprets
-                // the offset as already-rotated and produces a
-                // different bug (X-Z jump because the rotation gets
-                // applied to a Cartesian offset).
-                self.camera.position.world_to_frame_rot(
-                    &self.world.library, self.world.root, &frame.render_path,
+                // Rotation-aware: walks both anchor and frame through
+                // any TBs on the path so the camera lands at the
+                // rotation-correct cell of a rotated render frame.
+                // For Cartesian-only paths it reduces to the plain
+                // tail-walk (precision-safe via common ancestor).
+                self.camera.position.in_frame(
+                    &frame.render_path, &self.world.library, self.world.root,
                 )
             }
         };

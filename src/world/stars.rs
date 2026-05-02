@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn stars_world_spawn_is_world_center() {
         let b = bootstrap_stars_world(40);
-        let xyz = b.default_spawn_pos.in_frame(&Path::root());
+        let xyz = b.default_spawn_pos.in_frame(&Path::root(), &b.world.library, b.world.root);
         assert!((xyz[0] - 1.5).abs() < 1e-6);
         assert!((xyz[1] - 1.5).abs() < 1e-6);
         assert!((xyz[2] - 1.5).abs() < 1e-6);
