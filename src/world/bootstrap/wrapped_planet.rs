@@ -145,7 +145,17 @@ pub fn wrapped_planet_world(
     let make_anchor = |library: &mut NodeLibrary, block: u16| -> Child {
         if tangent_planes {
             let inner = build_uniform_anchor(library, block, cell_subtree_depth - 1);
-            Child::Node(library.insert_with_kind(uniform_children(inner), NodeKind::TangentBlock))
+            // Identity rotation — wrapped-planet sphere descent
+            // computes the per-cell tangent rotation from descent
+            // context (lat/lon at cell centre) and ignores this
+            // field. Per-cell pre-computed rotations are a future
+            // optimisation; the field is here so the data layout
+            // matches the rotated-cube preset.
+            const IDENTITY_QUAT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+            Child::Node(library.insert_with_kind(
+                uniform_children(inner),
+                NodeKind::TangentBlock { rotation: IDENTITY_QUAT },
+            ))
         } else {
             build_uniform_anchor(library, block, cell_subtree_depth)
         }
@@ -459,7 +469,10 @@ mod tests {
         let on = wrapped_planet_world(
             embedding_depth, slab_dims, slab_depth, cell_subtree_depth, true,
         );
-        assert_eq!(walk(&on, &populated_path), Some(NodeKind::TangentBlock));
+        assert!(matches!(
+            walk(&on, &populated_path),
+            Some(NodeKind::TangentBlock { .. })
+        ));
         assert_eq!(on.tree_depth(), off.tree_depth());
     }
 }

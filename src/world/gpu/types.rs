@@ -59,35 +59,54 @@ impl GpuChild {
 }
 
 /// Per-packed-node metadata: indexed by BFS position — the same
-/// `node_index` used in `GpuChild::node_index`. 16 bytes total.
+/// `node_index` used in `GpuChild::node_index`. 32 bytes total.
 ///
 /// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock.
 /// `dims_x/y/z`: slab dims (cells per axis) for `WrappedPlane`;
-/// unused (zeroed) for `Cartesian` and `TangentBlock`. The shader
-/// reads these in Phase 2 to drive X-wrap and in Phase 3 to derive
-/// the planet radius. `TangentBlock` carries no fields — its TBN
-/// is computed by the descender from current `(lon, lat, r)` cell
-/// bounds at the moment the ray enters the node.
+/// zero for other kinds.
+/// `rotation`: unit quaternion `(x, y, z, w)` for `TangentBlock`.
+/// Identity `(0, 0, 0, 1)` for other kinds. The shader reads it
+/// from this struct on TangentBlock dispatch — single source of
+/// truth for the cube's orientation.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Default)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuNodeKind {
     pub kind: u32,
     pub dims_x: u32,
     pub dims_y: u32,
     pub dims_z: u32,
+    pub rotation: [f32; 4],
+}
+
+impl Default for GpuNodeKind {
+    fn default() -> Self {
+        Self {
+            kind: 0,
+            dims_x: 0,
+            dims_y: 0,
+            dims_z: 0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
+        let identity = [0.0, 0.0, 0.0, 1.0];
         match k {
-            NodeKind::Cartesian => Self { kind: 0, dims_x: 0, dims_y: 0, dims_z: 0 },
+            NodeKind::Cartesian => Self {
+                kind: 0, dims_x: 0, dims_y: 0, dims_z: 0, rotation: identity,
+            },
             NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
                 kind: 1,
                 dims_x: dims[0],
                 dims_y: dims[1],
                 dims_z: dims[2],
+                rotation: identity,
             },
-            NodeKind::TangentBlock => Self { kind: 2, dims_x: 0, dims_y: 0, dims_z: 0 },
+            NodeKind::TangentBlock { rotation } => Self {
+                kind: 2, dims_x: 0, dims_y: 0, dims_z: 0, rotation,
+            },
         }
     }
 }
@@ -159,7 +178,7 @@ mod tests {
 
     #[test]
     fn gpu_node_kind_size() {
-        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 16);
+        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 32);
     }
 
     #[test]
@@ -185,10 +204,12 @@ mod tests {
 
     #[test]
     fn from_node_kind_tangent_block() {
-        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock);
+        let q = [0.0, 0.2588, 0.0, 0.9659]; // 30° around Y
+        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock { rotation: q });
         assert_eq!(k.kind, 2);
         assert_eq!(k.dims_x, 0);
         assert_eq!(k.dims_y, 0);
         assert_eq!(k.dims_z, 0);
+        assert_eq!(k.rotation, q);
     }
 }

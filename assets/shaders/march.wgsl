@@ -761,31 +761,28 @@ fn march_cartesian(
             // cube's interior descent is local Cartesian. The rotation never
             // propagates through descent.
             //
-            // Prototype rotation: hardcoded 30° around world-Y. Production
-            // would derive per-cell from the cube's intended angular
-            // position (e.g., UV-sphere tangent at the cube's lon/lat).
+            // Rotation is read from `node_kinds[child_idx].rotation` —
+            // the unit quaternion stored on the TangentBlock node by
+            // worldgen. Single source of truth: shader, CPU raycast,
+            // and CPU camera-basis accumulator all read this same field.
             if child_idx < arrayLength(&node_kinds)
                 && node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
                 let cube_origin_w =
                     cur_node_origin + (vec3<f32>(cell) + vec3<f32>(0.5)) * cur_cell_size;
                 // Shrink the rotated cube so its world AABB fits inside
                 // the parent cell. Worst-case axis-aligned bound for an
-                // arbitrarily-oriented cube of side s is s·√3; for the
-                // current Y-only yaw it's s·(|cos θ|+|sin θ|) ≤ s·√2.
-                // Divide by √3 for safety against full 3D rotations
-                // when this scales up. Without this shrink, the parent
-                // DDA's step boundary truncates the rotated cube's
-                // corners — the very "cut off" shape that masquerades
-                // as rotation in head-on screenshots.
+                // arbitrarily-oriented cube of side s is s·√3.
                 let cube_side = cur_cell_size * (1.0 / 1.7320508);
                 let scale = 3.0 / cube_side;
 
-                let theta: f32 = 0.5236; // 30°
-                let cs = cos(theta);
-                let sn = sin(theta);
-                let east_w   = vec3<f32>(cs, 0.0, sn);
-                let normal_w = vec3<f32>(0.0, 1.0, 0.0);
-                let north_w  = vec3<f32>(-sn, 0.0, cs);
+                // Quaternion → 3x3 basis (columns are east, normal, north).
+                let q = node_kinds[child_idx].rotation;
+                let xx = q.x * q.x; let yy = q.y * q.y; let zz = q.z * q.z;
+                let xy = q.x * q.y; let xz = q.x * q.z; let yz = q.y * q.z;
+                let wx = q.w * q.x; let wy = q.w * q.y; let wz = q.w * q.z;
+                let east_w   = vec3<f32>(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz),     2.0 * (xz - wy));
+                let normal_w = vec3<f32>(2.0 * (xy - wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx));
+                let north_w  = vec3<f32>(2.0 * (xz + wy),       2.0 * (yz - wx),     1.0 - 2.0 * (xx + yy));
 
                 let d_origin = ray_origin - cube_origin_w;
                 let local_origin = vec3<f32>(

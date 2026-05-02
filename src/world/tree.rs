@@ -78,7 +78,10 @@ pub fn uniform_children(child: Child) -> Children {
 ///
 /// Part of the content-addressed hash: two nodes with identical
 /// children but different kinds do NOT dedup into one.
-#[derive(Copy, Clone, Debug, PartialEq)]
+// Manual `PartialEq` (below) compares the `rotation` quaternion via
+// `to_bits` so f32 NaN doesn't break content-addressed dedup —
+// otherwise two nodes with identical rotations could fail to dedup.
+#[derive(Copy, Clone, Debug)]
 pub enum NodeKind {
     /// Standard Cartesian subdivision. Default for every node.
     Cartesian,
@@ -102,26 +105,54 @@ pub enum NodeKind {
     },
     /// Tangent-plane Cartesian subtree on a sphere. The 27 children
     /// are interpreted as a normal 27³ Cartesian subgrid in a LOCAL
-    /// rotated frame whose +Y axis is the outward sphere normal at
-    /// the cell's center, +X is the eastward (longitude) tangent,
-    /// +Z is the northward (latitude) tangent.
+    /// rotated frame whose orientation is given by `rotation` (a
+    /// unit quaternion `(x, y, z, w)`), applied around the cube's
+    /// centre.
     ///
-    /// Carries no fields: the TBN is computed by the descender from
-    /// its current cell bounds (lon/lat/r) at the moment it enters
-    /// this node — no stored f32 state, no dedup loss. Two tangent
-    /// blocks on opposite sides of a planet with identical Cartesian
-    /// content still dedup; the rotation is applied per-ray from
-    /// descent context.
+    /// Rotation is FIRST-CLASS DATA on the node — both the GPU
+    /// shader and the CPU raycast read it from `node_kinds[idx]`
+    /// when crossing the cube's boundary, and the camera-basis
+    /// rotation accumulator reads it when the camera's anchor path
+    /// passes through this node. ONE source of truth: anywhere the
+    /// cube interacts with a coordinate frame, the same quaternion
+    /// is used.
     ///
-    /// Used by the wrapped-planet bootstrap to escape sphere-DDA
-    /// (which loses precision at deep zoom) into the precision-stable
-    /// Cartesian descent path.
-    TangentBlock,
+    /// Used by both:
+    /// - the rotated-cube prototype (one cube, one explicit
+    ///   rotation), and
+    /// - the wrapped-planet bootstrap (each slab cell anchor is a
+    ///   TangentBlock whose rotation is the tangent frame at the
+    ///   cell's centre on the conceptual sphere). Worldgen
+    ///   pre-computes the rotation per slab cell; sphere-DDA reads
+    ///   it from the node data instead of recomputing per-ray.
+    TangentBlock { rotation: [f32; 4] },
 }
 
 impl Default for NodeKind {
     fn default() -> Self {
         NodeKind::Cartesian
+    }
+}
+
+impl PartialEq for NodeKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (NodeKind::Cartesian, NodeKind::Cartesian) => true,
+            (
+                NodeKind::WrappedPlane { dims: a_dims, slab_depth: a_d },
+                NodeKind::WrappedPlane { dims: b_dims, slab_depth: b_d },
+            ) => a_dims == b_dims && a_d == b_d,
+            (
+                NodeKind::TangentBlock { rotation: a },
+                NodeKind::TangentBlock { rotation: b },
+            ) => {
+                a[0].to_bits() == b[0].to_bits()
+                    && a[1].to_bits() == b[1].to_bits()
+                    && a[2].to_bits() == b[2].to_bits()
+                    && a[3].to_bits() == b[3].to_bits()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -136,7 +167,11 @@ impl Hash for NodeKind {
                 dims.hash(state);
                 slab_depth.hash(state);
             }
-            NodeKind::TangentBlock => {}
+            NodeKind::TangentBlock { rotation } => {
+                for &q in rotation {
+                    q.to_bits().hash(state);
+                }
+            }
         }
     }
 }
@@ -487,15 +522,23 @@ mod tests {
     fn tangent_block_kind_blocks_flatten_and_dedups() {
         let mut lib = NodeLibrary::default();
         let stone = uniform_children(Child::Block(block::STONE));
+        let identity = [0.0, 0.0, 0.0, 1.0];
         let cart = lib.insert_with_kind(stone, NodeKind::Cartesian);
-        let tan1 = lib.insert_with_kind(stone, NodeKind::TangentBlock);
-        let tan2 = lib.insert_with_kind(stone, NodeKind::TangentBlock);
+        let tan1 = lib.insert_with_kind(stone, NodeKind::TangentBlock { rotation: identity });
+        let tan2 = lib.insert_with_kind(stone, NodeKind::TangentBlock { rotation: identity });
+        let tan_other = lib.insert_with_kind(
+            stone,
+            NodeKind::TangentBlock { rotation: [0.0, 0.2588, 0.0, 0.9659] },
+        );
         // Different kinds are distinct nodes even with identical children.
         assert_ne!(cart, tan1);
-        // Identical kind + children dedup.
+        // Identical kind + identical rotation + children dedup.
         assert_eq!(tan1, tan2);
-        // TangentBlock is not allowed to flatten.
-        assert!(!NodeKind::TangentBlock.allows_uniform_flatten());
+        // Different rotations on the same children are distinct nodes —
+        // rotation is part of the node's content-addressed identity.
+        assert_ne!(tan1, tan_other);
+        // TangentBlock is not allowed to flatten regardless of rotation.
+        assert!(!NodeKind::TangentBlock { rotation: identity }.allows_uniform_flatten());
     }
 
     #[test]

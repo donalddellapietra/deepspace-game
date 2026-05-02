@@ -122,15 +122,15 @@ const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
     kind: u32,        // 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock
-    /// Slab dims (cells/axis) for WrappedPlane; zero for Cartesian and
-    /// TangentBlock. Phase 2 reads these to compute X-wrap modulus;
-    /// Phase 3 reads dims_x to derive the implied planet radius.
-    /// `TangentBlock` carries no fields — its TBN is computed by the
-    /// sphere descender from its current `(lon, lat, r)` cell bounds
-    /// at the moment the ray enters the node.
+    /// Slab dims (cells/axis) for WrappedPlane; zero otherwise.
     dims_x: u32,
     dims_y: u32,
     dims_z: u32,
+    /// Unit quaternion (x, y, z, w) — the cube's orientation for
+    /// `TangentBlock`. Identity (0, 0, 0, 1) for other kinds.
+    /// `march_cartesian`'s TangentBlock dispatch reads this directly
+    /// — single source of truth for the rotation.
+    rotation: vec4<f32>,
 }
 
 const NODE_KIND_CARTESIAN: u32 = 0u;

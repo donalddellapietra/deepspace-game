@@ -88,10 +88,17 @@ pub fn rotated_cube_world_at_depth(
     // root level; INSIDE it, `cube_subtree_depth - 1` more levels of
     // uniform grass form the recursive content. Total levels at and
     // below the TangentBlock = `cube_subtree_depth`.
+    //
+    // Rotation = 30° around world-Y, expressed as a unit quaternion
+    // `(x, y, z, w) = (0, sin(15°), 0, cos(15°))`. This is the
+    // SINGLE source of truth for the cube's orientation: the GPU
+    // shader and the CPU raycast both read this quaternion from
+    // `node_kinds[idx].rotation` (no hardcoded angle anywhere).
+    const ROT_Y_30: [f32; 4] = [0.0, 0.258_819_05, 0.0, 0.965_925_8];
     let grass_inner = uniform_anchor(&mut library, block::GRASS, cube_subtree_depth - 1);
     let rotated_cube = library.insert_with_kind(
         uniform_children(grass_inner),
-        NodeKind::TangentBlock,
+        NodeKind::TangentBlock { rotation: ROT_Y_30 },
     );
 
     // Reference cube: regular Cartesian, same depth + structure but

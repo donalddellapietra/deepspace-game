@@ -207,7 +207,7 @@ pub fn cpu_raycast_sphere_uv(
         if let Some(mut node_idx) = sub_idx {
             let is_tangent = library
                 .get(node_idx)
-                .map(|n| matches!(n.kind, NodeKind::TangentBlock))
+                .map(|n| matches!(n.kind, NodeKind::TangentBlock { .. }))
                 .unwrap_or(false);
 
             if is_tangent {
