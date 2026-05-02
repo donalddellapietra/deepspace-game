@@ -221,7 +221,11 @@ fn sphere_descend_anchor(
 
         if (cur_occupancy & bit) == 0u {
             // Empty slot — DDA-step along smallest side_dist.
+            // Update `t` to the just-crossed face's t BEFORE advancing
+            // side_dist; subsequent push needs the ray's current t to
+            // compute the post-rezero cell index correctly.
             let m = min_axis_mask(cur_side_dist);
+            t = dot(cur_side_dist, m);
             cur_cell = cur_cell + vec3<i32>(m) * cur_step;
             cur_side_dist = cur_side_dist + m * cur_delta_dist;
             normal = -vec3<f32>(cur_step) * m;
@@ -254,6 +258,7 @@ fn sphere_descend_anchor(
         if tag != 2u {
             // Entity / unknown — advance.
             let m = min_axis_mask(cur_side_dist);
+            t = dot(cur_side_dist, m);
             cur_cell = cur_cell + vec3<i32>(m) * cur_step;
             cur_side_dist = cur_side_dist + m * cur_delta_dist;
             normal = -vec3<f32>(cur_step) * m;
@@ -263,6 +268,7 @@ fn sphere_descend_anchor(
         if block_type == 0xFFFEu {
             // Subtree empty — skip cell.
             let m = min_axis_mask(cur_side_dist);
+            t = dot(cur_side_dist, m);
             cur_cell = cur_cell + vec3<i32>(m) * cur_step;
             cur_side_dist = cur_side_dist + m * cur_delta_dist;
             normal = -vec3<f32>(cur_step) * m;

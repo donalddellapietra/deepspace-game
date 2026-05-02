@@ -407,6 +407,13 @@ fn descend_anchor_cartesian_local(
     let mut depth: usize = 0;
     let mut iters = 0usize;
     let max_iters = 4096usize;
+    // Track the ray's current t (preserved across pushes by the
+    // (O-cell)*3 / D*3 transform). Updated at each DDA advance to the
+    // just-crossed face's t. The push's `new_pos = cur_O + cur_D * t`
+    // needs the CURRENT t, not the slab-entry t — using stale t would
+    // place the post-rezero cell at the slab-entry projected point,
+    // not the cell we're actually descending into.
+    let mut cur_t: f32 = t_in;
 
     let min_axis = |sd: [f32; 3]| -> usize {
         if sd[0] <= sd[1] && sd[0] <= sd[2] { 0 }
@@ -480,6 +487,7 @@ fn descend_anchor_cartesian_local(
                 // Empty slot: step DDA along smallest side_dist.
                 let m = min_axis(cur_side_dist);
                 let step_axis = step[m];
+                cur_t = cur_side_dist[m]; // ray's new t = just-crossed face t
                 cur_cell[m] += step_axis;
                 cur_side_dist[m] += delta_dist[m];
                 continue;
@@ -521,9 +529,9 @@ fn descend_anchor_cartesian_local(
                 // Use a small offset past the just-crossed face so
                 // numerical error doesn't put us back outside.
                 let new_pos = [
-                    cur_o[0] + cur_d[0] * t_in,
-                    cur_o[1] + cur_d[1] * t_in,
-                    cur_o[2] + cur_d[2] * t_in,
+                    cur_o[0] + cur_d[0] * cur_t,
+                    cur_o[1] + cur_d[1] * cur_t,
+                    cur_o[2] + cur_d[2] * cur_t,
                 ];
                 cur_cell = [
                     (new_pos[0].floor() as i32).clamp(0, 2),
