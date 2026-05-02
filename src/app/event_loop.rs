@@ -421,6 +421,14 @@ impl App {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            let intended_render_path_csv = self
+                .target_render_frame()
+                .render_path
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let (tb_on_anchor_path, anchor_cumulative_yaw_deg) =
                 tangent_block_chain_summary(
                     &self.world.library,
@@ -456,6 +464,7 @@ impl App {
                     anchor_slots_csv,
                     active_frame_kind,
                     render_path_csv,
+                    intended_render_path_csv,
                     tb_on_anchor_path,
                     anchor_cumulative_yaw_deg,
                     copy_seq: self.debug_copy_seq,

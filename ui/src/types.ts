@@ -81,6 +81,7 @@ export interface DebugOverlayState {
   anchorSlotsCsv: string;
   activeFrameKind: string;
   renderPathCsv: string;
+  intendedRenderPathCsv: string;
   tbOnAnchorPath: boolean;
   anchorCumulativeYawDeg: number;
   copySeq: number;

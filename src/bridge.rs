@@ -127,6 +127,7 @@ pub struct DebugOverlayStateJs {
     /// Render path (usually a prefix of the anchor). Empty when
     /// rendering from root.
     pub render_path_csv: String,
+    pub intended_render_path_csv: String,
     /// `true` if the camera's anchor path crosses any
     /// `NodeKind::TangentBlock`. Useful for debugging rotation
     /// chain handling.

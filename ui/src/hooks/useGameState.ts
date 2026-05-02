@@ -85,6 +85,7 @@ const debugOverlayStore = createStore<DebugOverlayState>({
   anchorSlotsCsv: "",
   activeFrameKind: "",
   renderPathCsv: "",
+  intendedRenderPathCsv: "",
   tbOnAnchorPath: false,
   anchorCumulativeYawDeg: 0,
   copySeq: 0,
