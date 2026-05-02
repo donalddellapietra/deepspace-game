@@ -202,20 +202,17 @@ impl App {
 
         // --- Ensure render path is traversible ---
         // The GPU pack may be stale: the camera moved into a region
-        // that was Empty/Block when the pack was built. If the ribbon
-        // can't follow the full intended path, repack the world root
-        // so the pack reflects the current tree at the camera's path.
+        // where path nodes were uniform-flattened or absent. Evict
+        // stale path ancestors from the content-address cache and
+        // re-emit them so the ribbon can descend the full path.
         {
-            let cache = self.cached_tree.as_ref().expect("cached_tree");
-            let probe = gpu::build_ribbon(
-                &cache.tree,
-                &cache.node_offsets,
-                cache.root_bfs_idx,
+            let cache = self.cached_tree.as_mut().expect("cached_tree");
+            let path_fixed = cache.ensure_path_packed(
+                &self.world.library,
+                self.world.root,
                 intended_render_path.as_slice(),
             );
-            if probe.reached_slots.len() < intended_render_path.depth() as usize {
-                let cache = self.cached_tree.as_mut().expect("cached_tree");
-                cache.update_root(&self.world.library, self.world.root);
+            if path_fixed {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.update_tree(
                         &cache.tree,

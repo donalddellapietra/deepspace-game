@@ -185,19 +185,20 @@ impl CachedTree {
         bfs
     }
 
-    /// Ensure every node along `path_slots` is packed as tag=2 (Node)
-    /// in its parent's slab so `build_ribbon` can traverse the full
-    /// path. Uniform-flatten may have collapsed path nodes to tag=1;
-    /// this patches them back to tag=2 with the correct BFS idx.
-    /// Returns true if any slab entry was patched (caller should
-    /// re-upload the tree buffer).
-    pub fn force_path_traversible(
+    /// Ensure every node along `path_slots` is fully traversible in
+    /// the pack. Handles two stale cases:
+    ///   1. Child is tag=1 (uniform-flattened) → patch to tag=2.
+    ///   2. Child has occupancy=0 or tag=0 (absent/empty in pack but
+    ///      Node in tree) → evict the parent from the dedup cache and
+    ///      re-emit it so the child appears in the new slab.
+    /// Returns true if anything was fixed.
+    pub fn ensure_path_packed(
         &mut self,
         library: &NodeLibrary,
         world_root: NodeId,
         path_slots: &[u8],
     ) -> bool {
-        let mut patched = false;
+        let mut fixed = false;
         let mut parent_bfs = self.root_bfs_idx;
         let mut node_id = world_root;
         for &slot in path_slots {
@@ -213,25 +214,47 @@ impl CachedTree {
             let occupancy = self.tree[header_off];
             let bit = 1u32 << slot;
             if occupancy & bit == 0 {
-                break;
-            }
-            let rank = (occupancy & (bit - 1)).count_ones() as usize;
-            let first_child = self.tree[header_off + 1] as usize;
-            let entry_off = first_child + rank * 2;
-            let packed_word = self.tree[entry_off];
-            let tag = packed_word & 0xFF;
-            if tag == 2 {
-                parent_bfs = self.tree[entry_off + 1];
+                // Slot absent in pack — evict parent and re-emit.
+                self.bfs_by_nid.remove(&self.node_ids[parent_bfs as usize]);
+                let new_parent_bfs = self.emit_or_lookup(library, node_id);
+                // Update root_bfs if this is the world root.
+                if node_id == world_root {
+                    self.root_bfs_idx = new_parent_bfs;
+                }
+                parent_bfs = new_parent_bfs;
+                fixed = true;
+                // Re-read the child from the freshly emitted parent.
+                let h = self.node_offsets[parent_bfs as usize] as usize;
+                let occ = self.tree[h];
+                if occ & bit == 0 { break; }
+                let r = (occ & (bit - 1)).count_ones() as usize;
+                let fc = self.tree[h + 1] as usize;
+                let t = self.tree[fc + r * 2] & 0xFF;
+                if t == 2 {
+                    parent_bfs = self.tree[fc + r * 2 + 1];
+                } else {
+                    break;
+                }
             } else {
-                let child_bfs = self.emit_or_lookup(library, child_id);
-                self.tree[entry_off] = (packed_word & !0xFF) | 2;
-                self.tree[entry_off + 1] = child_bfs;
-                parent_bfs = child_bfs;
-                patched = true;
+                let rank = (occupancy & (bit - 1)).count_ones() as usize;
+                let first_child = self.tree[header_off + 1] as usize;
+                let entry_off = first_child + rank * 2;
+                let packed_word = self.tree[entry_off];
+                let tag = packed_word & 0xFF;
+                if tag == 2 {
+                    parent_bfs = self.tree[entry_off + 1];
+                } else {
+                    // Flattened to Block — pack the child and patch.
+                    let child_bfs = self.emit_or_lookup(library, child_id);
+                    self.tree[entry_off] = (packed_word & !0xFF) | 2;
+                    self.tree[entry_off + 1] = child_bfs;
+                    parent_bfs = child_bfs;
+                    fixed = true;
+                }
             }
             node_id = child_id;
         }
-        patched
+        fixed
     }
 
     /// Build the `GpuChild` for one slot of a parent's children slab.
