@@ -6,6 +6,7 @@
 //! descending — there are no parallel buffers for sphere content,
 //! no `cs_*` uniforms, and no absolute-coord shimming.
 
+mod beam_mask;
 mod buffers;
 mod draw;
 pub mod entity_raster;
@@ -388,7 +389,7 @@ impl Renderer {
         // Beam-prepass mask sizes to 1/BEAM_TILE_SIZE of the new
         // swapchain. Recreate both texture and bind group.
         let (mask_texture, mask_view) =
-            self::init::create_mask_texture(&self.device, width, height);
+            self::beam_mask::create_mask_texture(&self.device, width, height);
         self.mask_texture = mask_texture;
         self.mask_view = mask_view;
         self.bind_group = self::buffers::make_bind_group(
