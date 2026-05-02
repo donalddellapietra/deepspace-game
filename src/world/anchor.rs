@@ -490,46 +490,48 @@ impl WorldPos {
     pub fn in_frame(&self, frame: &Path) -> [f32; 3] {
         let c = self.anchor.common_prefix_len(frame) as usize;
 
-        // Walk [c..self.anchor.depth) + offset → position in the
-        // common ancestor's frame (spans [0, WORLD_SIZE)).
-        let mut pos_common = [0.0f32; 3];
-        let mut size = WORLD_SIZE;
+        // f64 accumulators: at deep anchors (depth ≥ ~18 with a
+        // shallow frame like a WrappedPlane at depth 2), the slot
+        // contributions `(size / 3^k)` shrink below f32 ULP at
+        // value ~1.5, so f32 sums miss them and (worse) oscillate
+        // at the rounding boundary as the path moves — visible as
+        // a jitter on the rendered camera position. f64 has enough
+        // mantissa bits to capture the full anchor depth precisely;
+        // the final cast to f32 is a single round, no accumulation
+        // in f32. WORLD_SIZE / 3^18 ≈ 1.7e-9 is below f32 epsilon
+        // ~1e-7 at value 1.5; well above f64's ~3e-16 at the same
+        // magnitude.
+        const WS: f64 = WORLD_SIZE as f64;
+        let mut pos_common = [0.0f64; 3];
+        let mut size: f64 = WS;
         for k in c..(self.anchor.depth() as usize) {
             let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
             let child = size / 3.0;
-            pos_common[0] += sx as f32 * child;
-            pos_common[1] += sy as f32 * child;
-            pos_common[2] += sz as f32 * child;
+            pos_common[0] += sx as f64 * child;
+            pos_common[1] += sy as f64 * child;
+            pos_common[2] += sz as f64 * child;
             size = child;
         }
-        pos_common[0] += self.offset[0] * size;
-        pos_common[1] += self.offset[1] * size;
-        pos_common[2] += self.offset[2] * size;
+        pos_common[0] += self.offset[0] as f64 * size;
+        pos_common[1] += self.offset[1] as f64 * size;
+        pos_common[2] += self.offset[2] as f64 * size;
 
-        // Walk [c..frame.depth) → frame's min corner in the common
-        // ancestor's frame, plus the frame's cell size there.
-        let mut frame_origin = [0.0f32; 3];
-        let mut frame_size = WORLD_SIZE;
+        let mut frame_origin = [0.0f64; 3];
+        let mut frame_size: f64 = WS;
         for k in c..(frame.depth() as usize) {
             let (sx, sy, sz) = slot_coords(frame.slot(k) as usize);
             let child = frame_size / 3.0;
-            frame_origin[0] += sx as f32 * child;
-            frame_origin[1] += sy as f32 * child;
-            frame_origin[2] += sz as f32 * child;
+            frame_origin[0] += sx as f64 * child;
+            frame_origin[1] += sy as f64 * child;
+            frame_origin[2] += sz as f64 * child;
             frame_size = child;
         }
 
-        // Transform common-ancestor coords → frame-local: the
-        // frame's cell is `[frame_origin, frame_origin + frame_size)`
-        // in the common ancestor, and `[0, WORLD_SIZE)` in frame
-        // local. When `c == frame.depth()` (frame is prefix of
-        // anchor) this reduces to the identity, i.e.
-        // `pos_common - 0 * 1 = pos_common` — the precise tail walk.
-        let scale = WORLD_SIZE / frame_size;
+        let scale = WS / frame_size;
         [
-            (pos_common[0] - frame_origin[0]) * scale,
-            (pos_common[1] - frame_origin[1]) * scale,
-            (pos_common[2] - frame_origin[2]) * scale,
+            ((pos_common[0] - frame_origin[0]) * scale) as f32,
+            ((pos_common[1] - frame_origin[1]) * scale) as f32,
+            ((pos_common[2] - frame_origin[2]) * scale) as f32,
         ]
     }
 

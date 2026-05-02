@@ -222,23 +222,23 @@ pub fn cpu_raycast_sphere_uv(
                 // it slightly inside so floor-pick lands on the
                 // outermost r-slot (sy = 2), which is the cell at
                 // the surface the user sees.
-                let lon_fine = u_l * dims[0] as f32;
-                let lat_fine = v_l * dims[2] as f32;
-                let mut frac_x = (lon_fine - cell_x as f32).clamp(0.0, 0.99999);
-                let mut frac_z = (lat_fine - cell_z as f32).clamp(0.0, 0.99999);
-                let mut frac_y = 0.99999_f32;
+                // f64 fractions: at deep edit_depth (extra_levels >
+                // ~10), the iterative `frac = frac * 3 - sx` loses
+                // f32 precision exponentially because each iter
+                // amplifies the prior step's ULP by 3. f64 has
+                // ~52 bits of mantissa vs f32's 23, so at 11+
+                // iterations f64 still has plenty of bits left.
+                let lon_fine = u_l as f64 * dims[0] as f64;
+                let lat_fine = v_l as f64 * dims[2] as f64;
+                let mut frac_x = (lon_fine - cell_x as f64).clamp(0.0, 0.99999);
+                let mut frac_z = (lat_fine - cell_z as f64).clamp(0.0, 0.99999);
+                let mut frac_y = 0.99999_f64;
 
                 // Hybrid prototype: when the slab cell IS the proto
-                // target (hardcoded slab grid (7, 1, 11) — same as
-                // the GPU shader's `render_cell_as_tangent_cube` /
-                // `cartesian_voxels_in_cell` fires for), the cell is
-                // visually rendered as a tangent-plane CUBE on the
-                // sphere. Sub-cell descent must use the CUBE's local
-                // hit position (= ray-OBB intersect in cube basis),
-                // not the curved sphere's (lon, lat, r) — those
-                // differ by O(curvature) for off-center pixels and
-                // make break/place land at a DIFFERENT sub-voxel
-                // than the cube visually shows.
+                // target (hardcoded slab grid (7, 1, 11)), use the
+                // CUBE's local hit position so break/place lands on
+                // the sub-cell visually under the cursor, not the
+                // sub-cell the curved sphere raycast would pick.
                 let is_proto = cell_x == 7 && cy == 1 && cell_z == 11;
                 if is_proto {
                     if let Some((cx_3, cy_3, cz_3)) = cube_local_hit(
@@ -247,12 +247,9 @@ pub fn cpu_raycast_sphere_uv(
                         cell_x, cy, cell_z,
                         dims, shell_thickness, r_inner,
                     ) {
-                        // cx_3 / cy_3 / cz_3 are in cube-local
-                        // [0, 3)³. Convert to [0, 1) fractions for
-                        // the descent loop below.
-                        frac_x = (cx_3 / 3.0).clamp(0.0, 0.99999);
-                        frac_y = (cy_3 / 3.0).clamp(0.0, 0.99999);
-                        frac_z = (cz_3 / 3.0).clamp(0.0, 0.99999);
+                        frac_x = (cx_3 as f64 / 3.0).clamp(0.0, 0.99999);
+                        frac_y = (cy_3 as f64 / 3.0).clamp(0.0, 0.99999);
+                        frac_z = (cz_3 as f64 / 3.0).clamp(0.0, 0.99999);
                     }
                 }
                 for _ in 0..extra_levels {
@@ -273,9 +270,9 @@ pub fn cpu_raycast_sphere_uv(
                         // what the caller should break/place.
                         _ => break,
                     }
-                    frac_x = (frac_x * 3.0) - sx as f32;
-                    frac_y = (frac_y * 3.0) - sy as f32;
-                    frac_z = (frac_z * 3.0) - sz as f32;
+                    frac_x = (frac_x * 3.0) - sx as f64;
+                    frac_y = (frac_y * 3.0) - sy as f64;
+                    frac_z = (frac_z * 3.0) - sz as f64;
                 }
             }
         }
