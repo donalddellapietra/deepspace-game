@@ -34,6 +34,7 @@ timeout 15 ./target/debug/deepspace-game \
     --spawn-yaw 0 --spawn-pitch -1.57 \
     --interaction-radius 12 \
     --force-edit-depth 8 \
+    --disable-highlight \
     --render-harness \
     --script "wait:5,break,wait:3,screenshot:$OUT" \
     --exit-after-frames 45 \

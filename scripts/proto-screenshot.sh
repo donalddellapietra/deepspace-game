@@ -38,6 +38,7 @@ timeout 12 ./target/debug/deepspace-game \
     --spawn-xyz 1.506 1.575 1.464 \
     --spawn-yaw 0 --spawn-pitch -1.57 \
     --interaction-radius 12 \
+    --disable-highlight \
     --render-harness \
     --screenshot "$OUT" \
     --exit-after-frames 3 \

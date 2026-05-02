@@ -227,6 +227,34 @@ pub fn cpu_raycast_sphere_uv(
                 let mut frac_x = (lon_fine - cell_x as f32).clamp(0.0, 0.99999);
                 let mut frac_z = (lat_fine - cell_z as f32).clamp(0.0, 0.99999);
                 let mut frac_y = 0.99999_f32;
+
+                // Hybrid prototype: when the slab cell IS the proto
+                // target (hardcoded slab grid (7, 1, 11) — same as
+                // the GPU shader's `render_cell_as_tangent_cube` /
+                // `cartesian_voxels_in_cell` fires for), the cell is
+                // visually rendered as a tangent-plane CUBE on the
+                // sphere. Sub-cell descent must use the CUBE's local
+                // hit position (= ray-OBB intersect in cube basis),
+                // not the curved sphere's (lon, lat, r) — those
+                // differ by O(curvature) for off-center pixels and
+                // make break/place land at a DIFFERENT sub-voxel
+                // than the cube visually shows.
+                let is_proto = cell_x == 7 && cy == 1 && cell_z == 11;
+                if is_proto {
+                    if let Some((cx_3, cy_3, cz_3)) = cube_local_hit(
+                        cam_local, dir,
+                        cs_center, lat_max,
+                        cell_x, cy, cell_z,
+                        dims, shell_thickness, r_inner,
+                    ) {
+                        // cx_3 / cy_3 / cz_3 are in cube-local
+                        // [0, 3)³. Convert to [0, 1) fractions for
+                        // the descent loop below.
+                        frac_x = (cx_3 / 3.0).clamp(0.0, 0.99999);
+                        frac_y = (cy_3 / 3.0).clamp(0.0, 0.99999);
+                        frac_z = (cz_3 / 3.0).clamp(0.0, 0.99999);
+                    }
+                }
                 for _ in 0..extra_levels {
                     let sx = (frac_x * 3.0).floor() as usize;
                     let sy = (frac_y * 3.0).floor() as usize;
@@ -286,6 +314,120 @@ pub fn cpu_raycast_sphere_uv(
     }
 
     None
+}
+
+/// Hybrid prototype helper: ray-OBB intersect against the slab
+/// cell's tangent-plane CUBE (same basis as the GPU's
+/// `render_cell_as_tangent_cube` / `cartesian_voxels_in_cell`).
+/// Returns the hit position in cube-local [0, 3)³ coords on hit,
+/// or `None` if the ray misses the cube.
+///
+/// CPU mirror of the GPU cube basis:
+///   cube.x = lon-tangent
+///   cube.y = +radial out  (cube.y=0 inner, cube.y=3 outer)
+///   cube.z = lat-tangent
+///
+/// For ray hits, the (cx_3, cy_3, cz_3) returned is the entry
+/// position in cube-local coords. Caller divides by 3 to get
+/// frac coords for the sub-slab descent loop.
+fn cube_local_hit(
+    cam_local: [f32; 3],
+    dir_unit: [f32; 3],
+    cs_center: [f32; 3],
+    lat_max: f32,
+    cell_x: i32, cell_y: i32, cell_z: i32,
+    dims: [u32; 3],
+    shell_thickness: f32,
+    r_inner: f32,
+) -> Option<(f32, f32, f32)> {
+    use std::f32::consts::PI;
+    // Cell's (lat, lon, r) range from grid coords (matches the
+    // GPU's body-rooted DDA mapping).
+    let lon_step = 2.0 * PI / dims[0] as f32;
+    let lat_step = 2.0 * lat_max / dims[2] as f32;
+    let r_step = shell_thickness / dims[1] as f32;
+    let lon_lo = -PI + cell_x as f32 * lon_step;
+    let lon_hi = lon_lo + lon_step;
+    let lat_lo = -lat_max + cell_z as f32 * lat_step;
+    let lat_hi = lat_lo + lat_step;
+    let r_lo = r_inner + cell_y as f32 * r_step;
+    let r_hi = r_lo + r_step;
+
+    let lat_c = (lat_lo + lat_hi) * 0.5;
+    let lon_c = (lon_lo + lon_hi) * 0.5;
+    let cl = lat_c.cos();
+    let sl = lat_c.sin();
+    let co = lon_c.cos();
+    let so = lon_c.sin();
+    // Cube basis (matches GPU shader exactly).
+    let radial = [cl * co, sl, cl * so];
+    let u_axis = [-so, 0.0, co];
+    let v_axis = radial;
+    let w_axis = [-sl * co, cl, -sl * so];
+
+    let r_mid = (r_lo + r_hi) * 0.5;
+    let center = [
+        cs_center[0] + r_mid * radial[0],
+        cs_center[1] + r_mid * radial[1],
+        cs_center[2] + r_mid * radial[2],
+    ];
+    let half_u = (lon_hi - lon_lo) * r_hi * cl * 0.5;
+    let half_v = (r_hi - r_lo) * 0.5;
+    let half_w = (lat_hi - lat_lo) * r_hi * 0.5;
+
+    // Transform ray into cube-local.
+    let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let to_origin = [
+        cam_local[0] - center[0],
+        cam_local[1] - center[1],
+        cam_local[2] - center[2],
+    ];
+    let pos_l = [
+        dot3(to_origin, u_axis),
+        dot3(to_origin, v_axis),
+        dot3(to_origin, w_axis),
+    ];
+    let dir_l = [
+        dot3(dir_unit, u_axis),
+        dot3(dir_unit, v_axis),
+        dot3(dir_unit, w_axis),
+    ];
+
+    // Ray-AABB on [-half, +half] in cube-local.
+    let half = [half_u, half_v, half_w];
+    let inv_dir = [
+        if dir_l[0].abs() > 1e-8 { 1.0 / dir_l[0] } else { 1e10 },
+        if dir_l[1].abs() > 1e-8 { 1.0 / dir_l[1] } else { 1e10 },
+        if dir_l[2].abs() > 1e-8 { 1.0 / dir_l[2] } else { 1e10 },
+    ];
+    let mut t_min = f32::NEG_INFINITY;
+    let mut t_max = f32::INFINITY;
+    for axis in 0..3 {
+        let t1 = (-half[axis] - pos_l[axis]) * inv_dir[axis];
+        let t2 = (half[axis] - pos_l[axis]) * inv_dir[axis];
+        let (lo, hi) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+        t_min = t_min.max(lo);
+        t_max = t_max.min(hi);
+    }
+    if t_min > t_max || t_max <= 0.0 {
+        return None;
+    }
+    let t_hit = t_min.max(0.0);
+
+    // Hit position in cube-local, mapped to [0, 3)³.
+    let hit_l = [
+        pos_l[0] + dir_l[0] * t_hit,
+        pos_l[1] + dir_l[1] * t_hit,
+        pos_l[2] + dir_l[2] * t_hit,
+    ];
+    let cx_3 = (hit_l[0] + half_u) * 3.0 / (2.0 * half_u);
+    let cy_3 = (hit_l[1] + half_v) * 3.0 / (2.0 * half_v);
+    let cz_3 = (hit_l[2] + half_w) * 3.0 / (2.0 * half_w);
+    Some((
+        cx_3.clamp(0.0, 2.99999),
+        cy_3.clamp(0.0, 2.99999),
+        cz_3.clamp(0.0, 2.99999),
+    ))
 }
 
 #[cfg(test)]

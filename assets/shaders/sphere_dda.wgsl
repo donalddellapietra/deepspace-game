@@ -530,9 +530,7 @@ fn render_cell_as_tangent_cube(
     let n_world = u_axis * n_local.x + v_axis * n_local.y + w_axis * n_local.z;
 
     // Flat face shading: brightness from N·L with a fixed light
-    // direction (above + slightly behind). Bevel/voxel-grid detail
-    // would come from a real Cartesian DDA on the cell's subtree
-    // — v1 work; v0 just shows the cube exists at the right place.
+    // direction (above + slightly behind).
     let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.4));
     let n_dot_l = max(dot(n_world, light_dir), 0.0);
     let shade = 0.4 + 0.6 * n_dot_l;
@@ -540,10 +538,29 @@ fn render_cell_as_tangent_cube(
     // against the surrounding green sphere cells.
     let base_color = vec3<f32>(1.0, 0.0, 0.0);
 
+    // Cube-face bevel: darken the band along each face's edges so
+    // we can see WHICH face the ray hit. Project the entry point
+    // onto the cube face (= drop the normal-axis), normalize to
+    // [0, 1] within the face, and darken near min/max.
+    let entry_local = pos_l + dir_l * t_hit;
+    let entry_uvw = (entry_local + half_v3) / (2.0 * half_v3);  // [0, 1] per axis
+    let edge = min(entry_uvw, vec3<f32>(1.0) - entry_uvw);
+    // Pick the two non-normal axes' edge proximity.
+    var face_edge = 1.0;
+    if abs(n_local.x) > 0.5 {
+        face_edge = min(edge.y, edge.z);
+    } else if abs(n_local.y) > 0.5 {
+        face_edge = min(edge.x, edge.z);
+    } else {
+        face_edge = min(edge.x, edge.y);
+    }
+    let bevel = smoothstep(0.02, 0.10, face_edge);
+    let bevel_strength = 0.5 + 0.5 * bevel;
+
     result.hit = true;
     result.t = t_hit * inv_norm;
     result.normal = n_world;
-    result.color = base_color * shade;
+    result.color = base_color * shade * bevel_strength;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
     return result;
@@ -648,16 +665,33 @@ fn cartesian_voxels_in_cell(
                 + v_axis * cart_hit.normal.y
                 + w_axis * cart_hit.normal.z;
 
+    // Per-voxel bevel: darken the band along each sub-cell's face
+    // edges so the cartesian voxel grid is visible inside the
+    // cube. `cart_hit.cell_min` and `cart_hit.cell_size` are in
+    // cell-local [0, 3)³ coords (the frame we passed to
+    // march_cartesian); compute UV inside the hit cell and
+    // smoothstep near the edges.
+    let entry_3 = pos_3 + dir_3 * cart_hit.t;
+    let uvw_in_cell = (entry_3 - cart_hit.cell_min) / cart_hit.cell_size;
+    let edge = min(uvw_in_cell, vec3<f32>(1.0) - uvw_in_cell);
+    var face_edge = 1.0;
+    if abs(cart_hit.normal.x) > 0.5 {
+        face_edge = min(edge.y, edge.z);
+    } else if abs(cart_hit.normal.y) > 0.5 {
+        face_edge = min(edge.x, edge.z);
+    } else {
+        face_edge = min(edge.x, edge.y);
+    }
+    let bevel = smoothstep(0.02, 0.14, face_edge);
+    let bevel_strength = 0.6 + 0.4 * bevel;
+
     result.hit = true;
     result.t = cart_hit.t * inv_norm;
     result.normal = n_world;
-    // Use the actual block color from `march_cartesian` — this is
-    // what makes the cube show the real voxel structure of the
-    // cell's subtree (grass voxels green, holes from breaks
-    // visible as ray-passes-through). Tint slightly blue so the
-    // proto cell is still visually distinct from the surrounding
-    // sphere cells.
-    result.color = cart_hit.color * vec3<f32>(0.7, 0.9, 1.4);
+    // Use the actual block color from `march_cartesian` — shows
+    // the real voxel structure of the cell's subtree. Tint
+    // slightly blue so the proto cell is distinct.
+    result.color = cart_hit.color * vec3<f32>(0.7, 0.9, 1.4) * bevel_strength;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
     return result;
