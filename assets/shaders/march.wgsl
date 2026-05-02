@@ -2028,6 +2028,28 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 ray_origin, ray_dir,
                 uniforms.planet_render.y,
             );
+        } else if cur_kind == NODE_KIND_TANGENT_BLOCK {
+            // Camera is INSIDE a rotated cube — the render frame IS the
+            // TangentBlock. CPU has already rotated the camera basis by
+            // R⁻¹ (so ray_dir is in cube-local axis-aligned direction),
+            // and main.wgsl rotates the returned hit normal back to
+            // world via `frame_rotation = R`. So the shader-side work
+            // here is just: descend into the cube interior with the
+            // ALREADY-ROTATED ray.
+            //
+            // Use `march_in_tangent_cube` (TANGENT_STACK_DEPTH = 24,
+            // NO LOD pixel termination), NOT `march_cartesian`. Why:
+            // the GPU pack uniform-flattens deep uniform regions
+            // (cube_subtree_depth = 20 levels of uniform grass collapses
+            // to a single representative block per slot), so the render
+            // frame's effective depth is the cube root. From there,
+            // `march_cartesian`'s LOD splatting clamps descent to ~6
+            // levels — masking edits at depth 22+ as the
+            // representative_block (= grass), which is why "blocks
+            // don't break apart at deep layers". `march_in_tangent_cube`
+            // skips the LOD gate exactly because of this case (see its
+            // comment).
+            r = march_in_tangent_cube(current_idx, ray_origin, ray_dir);
         } else {
             // Cartesian frame: no depth cap beyond the hardware stack
             // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
