@@ -380,15 +380,8 @@ impl App {
             }
         };
         let anchor_depth = position.anchor.depth();
-        // Render-frame depth is decoupled from the user's anchor
-        // depth (see `RENDER_ANCHOR_DEPTH` docs). We deepen the
-        // camera's `WorldPos` using its f32 offset to a constant
-        // maximum, so zooming only changes `edit_depth`, not what
-        // the camera *sees*.
-        let desired_depth = RENDER_ANCHOR_DEPTH
-            .saturating_sub(RENDER_FRAME_K)
-            .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
+        let mut logical_path = position.anchor;
+        let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
         logical_path.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
@@ -509,10 +502,8 @@ impl App {
     /// explicit face-cell window so render/edit share one layer
     /// definition.
     pub(super) fn render_frame(&self) -> ActiveFrame {
-        let desired_depth = RENDER_ANCHOR_DEPTH
-            .saturating_sub(RENDER_FRAME_K)
-            .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
+        let mut logical_path = self.camera.position.anchor;
+        let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
         logical_path.truncate(desired_depth);
         frame::with_render_margin(
             &self.world.library, self.world.root,
