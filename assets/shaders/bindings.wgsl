@@ -333,7 +333,12 @@ const MAX_FACE_DEPTH: u32 = 63u;
 /// Apple Silicon register-file boundary; larger values spill to
 /// threadgroup memory, adding memory latency to every DDA
 /// iteration. See `docs/testing/perf-lod-diagnosis.md`.
-const MAX_STACK_DEPTH: u32 = 8u;
+///
+/// PROTOTYPE: bumped to 20 so the UV-sphere proto subtree's full
+/// 17-layer cartesian descent lands. Past depth 8 the world cells
+/// are sub-pixel anyway, so the runtime cost lands on rays that
+/// hit the deeply-dug proto cell — uncommon outside the demo.
+const MAX_STACK_DEPTH: u32 = 20u;
 
 struct HitResult {
     hit: bool,
