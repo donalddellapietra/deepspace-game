@@ -99,13 +99,16 @@ pub fn compute_render_frame(
         }
         _ => ActiveFrameKind::Cartesian,
     };
+    let mut last_k: usize = 0;
+    let mut stopped_early = false;
     for k in 0..target.depth() as usize {
-        let Some(node) = library.get(node_id) else { break };
+        let Some(node) = library.get(node_id) else { stopped_early = true; break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
+                last_k = k + 1;
                 if let Some(child_node) = library.get(child_id) {
                     if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
                         wp_seen = true;
@@ -130,7 +133,38 @@ pub fn compute_render_frame(
                     }
                 }
             }
-            Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
+            Child::Block(_) | Child::Empty | Child::EntityRef(_) => {
+                stopped_early = true;
+                break;
+            }
+        }
+    }
+    // Past-leaf SphereSubFrame refinement: when the library descent
+    // stopped inside (or at) a WrappedPlane but the camera anchor
+    // wanted to go deeper, KEEP refining the sub-frame range using
+    // the remaining slots of the target path. The render frame's
+    // `reached` path stays at the deepest reachable Node (= what the
+    // GPU buffer can address), but the SphereSubFrame range tracks
+    // the camera's logical (lat, lon, r) extent so deep-zoom rays
+    // can run on bounded sub-frame coords. Without this, the kind
+    // stays WrappedPlane whenever the camera anchor's f32-deepened
+    // path hits an Empty slot above the slab — the exact case the
+    // sub-frame architecture exists to fix.
+    if wp_seen && stopped_early && last_k < target.depth() as usize {
+        let mut virtual_path = reached;
+        for k in last_k..target.depth() as usize {
+            virtual_path.push(target.slot(k));
+        }
+        if virtual_path.depth() > reached.depth() {
+            if let Some(range) = subframe_range(
+                library,
+                world_root,
+                &virtual_path,
+                WRAPPED_PLANE_BODY_SIZE,
+                DEFAULT_SPHERE_LAT_MAX,
+            ) {
+                kind = ActiveFrameKind::SphereSubFrame(range);
+            }
         }
     }
     ActiveFrame {
@@ -240,17 +274,17 @@ mod tests {
         assert_eq!(p.as_slice(), &slots);
     }
 
-    /// When the descent reaches a `WrappedPlane` node, the render
-    /// frame must STOP there (kind = WrappedPlane) instead of
-    /// descending into the slab subtree. The shader's wrap branch
-    /// fires at marcher-local depth==0 — which means the render
-    /// frame must be the slab root, not a sub-cell.
+    /// When the library descent stops at the WP because the deeper
+    /// slot is a Block leaf, `render_path` stays at the WP — the
+    /// shader still runs its dispatch from the WP node. But the kind
+    /// upgrades to `SphereSubFrame` whenever the camera anchor's
+    /// target path extends past the WP, so the renderer projects the
+    /// camera into sub-frame local coords (precision-stable) instead
+    /// of body-rooted WP-local coords (which wall at depth ~22).
     #[test]
-    fn render_frame_kind_is_wrapped_plane_when_descent_lands_on_one() {
+    fn render_frame_upgrades_to_sphere_subframe_past_wp_leaf() {
         use crate::world::tree::{empty_children, slot_index, NodeKind};
         let mut lib = NodeLibrary::default();
-        // Build a small WrappedPlane subtree (slab depth 1, dims
-        // [3, 1, 1] — fills X axis only).
         let mut wp_children = empty_children();
         wp_children[slot_index(0, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
         wp_children[slot_index(1, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
@@ -259,26 +293,38 @@ mod tests {
             wp_children,
             NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
         );
-        // Embed: root has WP at slot 13, everything else empty.
         let mut root_children = empty_children();
         root_children[slot_index(1, 1, 1)] = Child::Node(wp);
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        // Camera anchor sits at the WP node (depth 1) or deeper.
+        // Camera anchor: WP (depth 1) → Block slot at depth 2 →
+        // virtual deeper slots up to desired_depth=5.
         let mut anchor = Path::root();
         anchor.push(slot_index(1, 1, 1) as u8); // depth 1 → WP node
-        anchor.push(slot_index(2, 0, 0) as u8); // depth 2 → inside WP
+        anchor.push(slot_index(2, 0, 0) as u8); // depth 2 → Block (descent stops)
+        anchor.push(slot_index(1, 1, 1) as u8); // virtual depth 3
+        anchor.push(slot_index(1, 1, 1) as u8); // virtual depth 4
+        anchor.push(slot_index(1, 1, 1) as u8); // virtual depth 5
         let frame = compute_render_frame(&lib, root, &anchor, 5);
-        // Render frame stops at the WP node (depth 1), not at the
-        // sub-cell at depth 2.
+        // Render path stops at the WP (deepest reachable Node).
         assert_eq!(frame.render_path.depth(), 1);
+        // But the kind upgrades to SphereSubFrame because the target
+        // path extends 4 slots past the WP.
         match frame.kind {
-            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
-                assert_eq!(dims, [3, 1, 1]);
-                assert_eq!(slab_depth, 1);
+            ActiveFrameKind::SphereSubFrame(range) => {
+                assert_eq!(range.wp_dims, [3, 1, 1]);
+                assert_eq!(range.wp_slab_depth, 1);
+                assert_eq!(range.wp_path_depth, 1);
+                // 4 slots past WP → sub-frame extents shrink by 3^4.
+                let expected_lon_extent = (2.0 * std::f32::consts::PI) / 3.0_f32.powi(4);
+                assert!(
+                    (range.lon_extent() - expected_lon_extent).abs() < 1e-5,
+                    "lon extent should refine 4 levels past WP, got {}",
+                    range.lon_extent(),
+                );
             }
-            other => panic!("expected WrappedPlane kind, got {other:?}"),
+            other => panic!("expected SphereSubFrame kind, got {other:?}"),
         }
     }
 

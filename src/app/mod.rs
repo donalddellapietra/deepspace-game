@@ -666,10 +666,22 @@ impl App {
                 )
             }
             ActiveFrameKind::SphereSubFrame(range) => {
-                // Step 6: project camera into sub-frame local coords
-                // (origin near 0, basis rotated to (lon-tan, lat-tan,
-                // radial)). Sphere math in the shader operates on
-                // bounded magnitudes — layer-agnostic precision.
+                // Sub-frame dispatch only fires when render_path is
+                // genuinely deeper than the WP — otherwise the
+                // shader runs body-rooted (`sphere_uv_in_cell`),
+                // which expects camera in WP-local coords. Mirror
+                // the routing decision in `upload_tree_lod`.
+                let deeper_than_wp = frame.render_path.depth() > range.wp_path_depth;
+                if !deeper_than_wp {
+                    let cam_local = self.camera.position.in_frame(&frame.render_path);
+                    return self.camera.gpu_camera_with_basis(
+                        cam_local,
+                        crate::world::sdf::normalize(fwd_world),
+                        crate::world::sdf::normalize(right_world),
+                        crate::world::sdf::normalize(up_world),
+                        1.2,
+                    );
+                }
                 let mut wp_path = frame.render_path;
                 wp_path.truncate(range.wp_path_depth);
                 let local = crate::world::sphere_geom::camera_in_sphere_subframe(

@@ -298,17 +298,37 @@ impl App {
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
-                // Step 6: upload sub-frame range + WP metadata so
-                // the shader can dispatch the sphere sub-frame DDA
-                // in local rotated+translated coords.
+                // SphereSubFrame dispatch only fires when the GPU
+                // tree extends PAST the WrappedPlane along the
+                // camera path — i.e. `render_path` is deeper than
+                // the sub-frame's `wp_path_depth`. Without that, the
+                // shader's `sphere_uv_in_subframe` would receive the
+                // WP node as `sub_node_idx` and try to pick cells
+                // against the (narrow) sub-frame range that has no
+                // structural relation to the WP's children grid.
+                //
+                // When the camera is "above" the slab and the GPU
+                // tree stops at the WP, fall back to the body-rooted
+                // sphere DDA (`sphere_uv_in_cell`). The active frame
+                // kind stays SphereSubFrame for camera-projection /
+                // pop-loop purposes (precision-stable bookkeeping),
+                // but the shader runs body-rooted.
                 ActiveFrameKind::SphereSubFrame(range) => {
-                    renderer.set_root_kind_sphere_subframe(
-                        range.lat_lo, range.lat_hi,
-                        range.lon_lo, range.lon_hi,
-                        range.r_lo, range.r_hi,
-                        range.r_center(),
-                        range.wp_dims, range.wp_slab_depth,
-                    );
+                    let deeper_than_wp =
+                        self.active_frame.render_path.depth() > range.wp_path_depth;
+                    if deeper_than_wp {
+                        renderer.set_root_kind_sphere_subframe(
+                            range.lat_lo, range.lat_hi,
+                            range.lon_lo, range.lon_hi,
+                            range.r_lo, range.r_hi,
+                            range.r_center(),
+                            range.wp_dims, range.wp_slab_depth,
+                        );
+                    } else {
+                        renderer.set_root_kind_wrapped_plane(
+                            range.wp_dims, range.wp_slab_depth,
+                        );
+                    }
                 }
             }
         }

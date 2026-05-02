@@ -58,11 +58,15 @@ impl App {
                     })
             }
             ActiveFrameKind::SphereSubFrame(range) => {
-                // Camera fits if its position in sub-frame local
-                // coords is within MAX_FOCUSED_FRAME_CAMERA_EXTENT
-                // (in tangent units) of the sub-frame center. Same
-                // budget as Cartesian — bounded by a multiple of the
-                // frame extent.
+                // Sub-frame is the camera's tangent column above the
+                // sub-frame surface center. "Fits" iff the camera's
+                // tangent offset (sub-frame local x, y) from the
+                // sub-frame center is bounded by a small multiple of
+                // the sub-frame's tangent extent. The radial axis
+                // (sub-frame local z, the altitude direction) is
+                // unbounded — a high-altitude camera looking down at
+                // a tiny sub-frame patch must still "fit" the deep
+                // frame, otherwise sub-frame dispatch never fires.
                 let mut wp_path = frame.render_path;
                 wp_path.truncate(range.wp_path_depth);
                 let (fwd, right, up) = self.camera.basis();
@@ -73,13 +77,14 @@ impl App {
                     &range,
                     crate::world::anchor::WORLD_SIZE,
                 );
-                let max_axis = range
-                    .lon_extent()
-                    .max(range.lat_extent())
-                    .max(range.r_extent());
-                let bound = MAX_FOCUSED_FRAME_CAMERA_EXTENT * max_axis.max(1e-9);
+                let r_sphere = crate::world::anchor::WORLD_SIZE / (2.0 * std::f32::consts::PI);
+                let tangent_x = range.lon_extent() * r_sphere;
+                let tangent_y = range.lat_extent() * r_sphere;
+                let max_tangent = tangent_x.max(tangent_y).max(1e-9);
+                let bound = MAX_FOCUSED_FRAME_CAMERA_EXTENT * max_tangent;
                 local.origin.iter().all(|v| v.is_finite())
-                    && local.origin.iter().all(|&v| v.abs() <= bound)
+                    && local.origin[0].abs() <= bound
+                    && local.origin[1].abs() <= bound
             }
         }
     }
@@ -123,27 +128,56 @@ impl App {
         // Render frame depth is derived from `RENDER_ANCHOR_DEPTH`,
         // not the user's anchor depth — zoom controls interaction
         // layer, not what the camera renders. See `RENDER_ANCHOR_DEPTH`.
-        let frame = self.render_frame();
-        let mut frame = frame;
-        while frame.render_path.depth() > 0
-            && (!self.camera_fits_frame(&frame)
-                || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
-        {
-            let logical_path = frame.logical_path;
-            let mut shallower = frame.render_path;
-            shallower.truncate(frame.render_path.depth().saturating_sub(1));
+        //
+        // Pop strategy: iterate `virtual_depth` (= the desired_depth
+        // passed to `compute_render_frame`) downward until the camera
+        // fits. For SphereSubFrame frames, reducing virtual_depth
+        // shrinks the past-leaf range refinement — the sub-frame
+        // grows toward the WP root until its tangent extent is large
+        // enough to absorb the camera's f32 quantization noise.
+        // Truncating `render_path` (the prior implementation) didn't
+        // affect the virtual refinement and would collapse the kind
+        // straight to Cartesian as soon as render_path dropped below
+        // the WP — rendering the planet as a flat slab.
+        let logical_path = self.camera.position.deepened_to(crate::app::RENDER_ANCHOR_DEPTH).anchor;
+        let mut virtual_depth = crate::app::RENDER_ANCHOR_DEPTH
+            .saturating_sub(crate::app::RENDER_FRAME_K)
+            .min(crate::app::RENDER_FRAME_MAX_DEPTH);
+        let mut frame = loop {
             let render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
-                &shallower,
-                shallower.depth(),
+                &logical_path,
+                virtual_depth,
             );
-            frame = ActiveFrame {
+            let candidate = ActiveFrame {
                 render_path: render.render_path,
                 logical_path,
                 node_id: render.node_id,
                 kind: render.kind,
             };
+            let fits = self.camera_fits_frame(&candidate)
+                && self.frame_projected_pixels(&candidate) >= FRAME_FOCUS_MIN_PIXELS;
+            if fits || virtual_depth == 0 {
+                break candidate;
+            }
+            virtual_depth = virtual_depth.saturating_sub(1);
+        };
+        // Tighten the render frame to the deeper context window
+        // (mirrors `with_render_margin`). Skip when the frame is a
+        // SphereSubFrame — those are already at the camera's logical
+        // depth (`render_path` cannot be deepened past where the
+        // library has Nodes).
+        if !matches!(frame.kind, ActiveFrameKind::SphereSubFrame(_)) {
+            let render = frame::with_render_margin(
+                &self.world.library,
+                self.world.root,
+                &logical_path,
+                crate::app::RENDER_FRAME_CONTEXT,
+            );
+            if render.render_path.depth() <= frame.render_path.depth() {
+                frame = render;
+            }
         }
         if self.startup_profile_frames < 4 {
             eprintln!(
