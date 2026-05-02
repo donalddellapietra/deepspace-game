@@ -137,9 +137,14 @@ pub fn wrapped_planet_world(
         let inner = build_uniform_anchor(library, block, depth - 1);
         Child::Node(library.insert(uniform_children(inner)))
     }
+    // Step 1 placeholder: identity rotation. Step 2 will compute the
+    // sphere-tangent rotation per (cell_x, cell_z) at worldgen.
     let make_anchor = |library: &mut NodeLibrary, block: u16| -> Child {
         let inner = build_uniform_anchor(library, block, cell_subtree_depth - 1);
-        Child::Node(library.insert_with_kind(uniform_children(inner), NodeKind::TangentBlock))
+        Child::Node(library.insert_with_kind(
+            uniform_children(inner),
+            NodeKind::TangentBlock { rotation: crate::world::tree::IDENTITY_ROTATION },
+        ))
     };
     let stone_anchor = make_anchor(&mut library, block::STONE);
     let dirt_anchor  = make_anchor(&mut library, block::DIRT);
@@ -432,6 +437,7 @@ mod tests {
         let world = wrapped_planet_world(
             embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
         );
-        assert_eq!(walk(&world, &populated_path), Some(NodeKind::TangentBlock));
+        let kind = walk(&world, &populated_path).expect("populated cell exists");
+        assert!(kind.is_tangent_block(), "expected TangentBlock kind, got {kind:?}");
     }
 }

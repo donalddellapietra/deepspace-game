@@ -2,7 +2,7 @@
 //! `march_cartesian`. Walks the unified tree in XYZ slot order.
 
 use super::HitInfo;
-use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
+use crate::world::tree::{slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
 /// Stack frame for iterative DDA traversal.
 pub(super) struct Frame {
@@ -150,6 +150,62 @@ pub(super) fn cpu_raycast_inner(
                     parent_origin[2] + cell[2] as f32 * parent_cell_size,
                 ];
                 let child_cell_size = parent_cell_size / 3.0;
+
+                // TangentBlock dispatch — frame-local rotation around
+                // the cube's geometric center (1.5, 1.5, 1.5). Mirrors
+                // the shader's march_cartesian path. NO world-absolute
+                // coordinates: the ray is re-expressed in the child's
+                // [0, 3)³ via (ray - child_origin) / parent_cell_size,
+                // then rotated.
+                if let NodeKind::TangentBlock { rotation } = child_node.kind {
+                    let inv_csize = 1.0 / parent_cell_size;
+                    let local_pre_origin = [
+                        (ray_origin[0] - child_origin[0]) * inv_csize,
+                        (ray_origin[1] - child_origin[1]) * inv_csize,
+                        (ray_origin[2] - child_origin[2]) * inv_csize,
+                    ];
+                    let local_pre_dir = [
+                        ray_dir[0] * inv_csize,
+                        ray_dir[1] * inv_csize,
+                        ray_dir[2] * inv_csize,
+                    ];
+                    let centered = [
+                        local_pre_origin[0] - 1.5,
+                        local_pre_origin[1] - 1.5,
+                        local_pre_origin[2] - 1.5,
+                    ];
+                    // (R^T · v).i = rotation[i][0]*v.0 + rotation[i][1]*v.1 + rotation[i][2]*v.2
+                    let rotated_origin = [
+                        rotation[0][0] * centered[0] + rotation[0][1] * centered[1] + rotation[0][2] * centered[2],
+                        rotation[1][0] * centered[0] + rotation[1][1] * centered[1] + rotation[1][2] * centered[2],
+                        rotation[2][0] * centered[0] + rotation[2][1] * centered[1] + rotation[2][2] * centered[2],
+                    ];
+                    let local_origin = [
+                        rotated_origin[0] + 1.5,
+                        rotated_origin[1] + 1.5,
+                        rotated_origin[2] + 1.5,
+                    ];
+                    let local_dir = [
+                        rotation[0][0] * local_pre_dir[0] + rotation[0][1] * local_pre_dir[1] + rotation[0][2] * local_pre_dir[2],
+                        rotation[1][0] * local_pre_dir[0] + rotation[1][1] * local_pre_dir[1] + rotation[1][2] * local_pre_dir[2],
+                        rotation[2][0] * local_pre_dir[0] + rotation[2][1] * local_pre_dir[1] + rotation[2][2] * local_pre_dir[2],
+                    ];
+                    let sub_max_depth = max_depth.saturating_sub(depth as u32 + 1);
+                    if let Some(sub_hit) = cpu_raycast_inner(
+                        library, child_id, local_origin, local_dir, sub_max_depth,
+                    ) {
+                        let mut combined_path = path[..=depth].to_vec();
+                        combined_path.extend(sub_hit.path);
+                        return Some(HitInfo {
+                            path: combined_path,
+                            face: sub_hit.face,
+                            t: sub_hit.t,
+                            place_path: None,
+                        });
+                    }
+                    advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+                    continue;
+                }
 
                 let child_max = [
                     child_origin[0] + parent_cell_size,

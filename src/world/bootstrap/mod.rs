@@ -8,12 +8,17 @@ use super::anchor::{Path, WorldPos};
 use super::state::WorldState;
 
 mod plain;
+mod rotated_block_test;
 mod vox;
 mod wrapped_planet;
 
 pub use plain::{
     carve_air_pocket, plain_surface_spawn, plain_test_world, plain_world,
     DEFAULT_PLAIN_LAYERS,
+};
+pub use rotated_block_test::{
+    rotated_block_test_spawn, rotated_block_test_world,
+    ROTATED_BLOCK_TEST_SPAWN_ANCHOR_DEPTH, ROTATED_BLOCK_TEST_TREE_DEPTH,
 };
 pub use vox::bootstrap_vox_model_world;
 pub use wrapped_planet::{
@@ -102,15 +107,13 @@ pub enum WorldPreset {
         embedding_depth: u8,
         slab_dims: [u32; 3],
         slab_depth: u8,
-        /// Depth of the recursive subtree under EACH slab cell. The
-        /// slab cells are `Child::Node(uniform_block_subtree)` of
-        /// this depth — NOT `Child::Block(...)` leaf-terminals — so
-        /// they behave as proper anchor blocks per the
-        /// `[Recursive architecture]` rule (every cell at every layer
-        /// is itself a recursive subdivision). Total tree depth =
-        /// `embedding_depth + slab_depth + cell_subtree_depth`.
         cell_subtree_depth: u8,
     },
+    /// Step-1 unit primitive: a single rotated `TangentBlock` at tree
+    /// depth 30, flanked by two axis-aligned `Block` siblings. Tests
+    /// that frame-local rotation dispatch and cartesian descent are
+    /// both correct at maximum-precision-pressure depth.
+    RotatedBlockTest,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -137,10 +140,8 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         | WorldPreset::HollowCube
         | WorldPreset::Stars
         | WorldPreset::Scene { .. } => None,
-        // The wrapped planet has a flat slab top at fixed local-y,
-        // but its world-y depends on embedding_depth and slot path
-        // — entities don't auto-rest on it in Phase 1.
         WorldPreset::WrappedPlanet { .. } => None,
+        WorldPreset::RotatedBlockTest => None,
     }
 }
 
@@ -223,5 +224,8 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             slab_depth,
             cell_subtree_depth,
         ),
+        WorldPreset::RotatedBlockTest => {
+            rotated_block_test::bootstrap_rotated_block_test_world()
+        }
     }
 }

@@ -12,7 +12,7 @@ mod zoom;
 use crate::world::anchor::Path;
 use crate::world::{aabb, raycast};
 
-use super::{ActiveFrameKind, App};
+use super::App;
 
 /// CPU-side ceiling for `visual_depth()`.
 pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
@@ -65,60 +65,31 @@ impl App {
     /// that's actually under the crosshair, instead of being
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
-        let (hit, cap_frame_path) = match self.active_frame.kind {
-            // WrappedPlane frame: dispatch the rotated-tangent-cube CPU
-            // raycast so click-targeting matches the GPU visual.
-            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
-                let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
-                // lat_max kept in sync with the shader-side default
-                // (1.26 rad ≈ 72°).
-                let hit = raycast::cpu_raycast_wrapped_planet(
-                    &self.world.library,
-                    self.world.root,
-                    frame_path.as_slice(),
-                    cam_local,
-                    ray_dir,
-                    dims,
-                    slab_depth,
-                    1.26,
-                    self.edit_depth(),
-                );
-                (hit, frame_path)
-            }
-            ActiveFrameKind::Cartesian => {
-                // Raycast from the render frame — f32 can only represent
-                // positions a few levels deeper than the frame root.
-                // The pop loop handles finding hits at coarser depths
-                // via slot-arithmetic frame transitions. The CPU
-                // raycast is wrap-unaware (doesn't follow X-wrap into
-                // the slab from outside); for editing inside a
-                // WrappedPlane slab the cursor can still hit content
-                // because the camera is inside the slab cell and
-                // raycasting stays inside the [0, 3)^3 frame.
-                let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
-                let hit = raycast::cpu_raycast_in_frame(
-                    &self.world.library,
-                    self.world.root,
-                    frame_path.as_slice(),
-                    cam_local,
-                    ray_dir,
-                    self.edit_depth(),
-                    self.cs_edit_depth(),
-                );
-                if hit.is_none() && self.startup_profile_frames < 16 {
-                    eprintln!(
-                        "frame_raycast_cartesian_miss edit_depth={} render_path={:?}",
-                        self.edit_depth(),
-                        frame_path.as_slice(),
-                    );
-                }
-                (hit, frame_path)
-            }
-        };
+        // Single dispatch: cpu_raycast_in_frame walks the cartesian tree.
+        // TangentBlock dispatch happens INSIDE the inner walker at child
+        // descent (mirrors the shader). WrappedPlane behaves like
+        // Cartesian here — its TangentBlock children carry their own
+        // rotations.
+        let frame_path = self.active_frame.render_path;
+        let cam_local = self.camera.position.in_frame(&frame_path);
+        let ray_dir = self.ray_dir_in_frame(&frame_path);
+        let hit = raycast::cpu_raycast_in_frame(
+            &self.world.library,
+            self.world.root,
+            frame_path.as_slice(),
+            cam_local,
+            ray_dir,
+            self.edit_depth(),
+            self.cs_edit_depth(),
+        );
+        if hit.is_none() && self.startup_profile_frames < 16 {
+            eprintln!(
+                "frame_raycast_miss edit_depth={} render_path={:?}",
+                self.edit_depth(),
+                frame_path.as_slice(),
+            );
+        }
+        let cap_frame_path = frame_path;
         // Enforce the interaction radius gate: drop hits beyond
         // `interaction_radius_cells × anchor_cell_size`. Same
         // cubic-shell LOD philosophy as the shader — out of range
@@ -225,7 +196,7 @@ impl App {
             match child_kind {
                 Some(NodeKind::Cartesian)
                 | Some(NodeKind::WrappedPlane { .. })
-                | Some(NodeKind::TangentBlock) => {
+                | Some(NodeKind::TangentBlock { .. }) => {
                     node_id = child_id;
                 }
                 None => break,
