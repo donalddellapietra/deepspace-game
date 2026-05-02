@@ -95,6 +95,21 @@ struct Uniforms {
     proto_target_lat_lon: vec4<f32>,
     /// Hybrid prototype: target cell radial range. `(r_lo, r_hi, _, _)`.
     proto_target_r: vec4<f32>,
+    /// Hybrid prototype: deeper sub-node BFS idx in `.x` for v1
+    /// frame-deepening (see proto_sub_lat_lon / proto_sub_r). `0` →
+    /// no deeper node, fall back to sample.child_idx (the slab
+    /// cell's subtree root). `.y` is unused. Mirrors the main
+    /// cartesian render's frame-deepening pattern: as the camera
+    /// anchor goes deeper into the subtree, the dispatch root moves
+    /// with it so march_cartesian's MAX_STACK_DEPTH=8 budget always
+    /// has enough room.
+    proto_sub_node: vec4<u32>,
+    /// Hybrid prototype: deeper sub-cube angular range
+    /// `(lat_lo, lat_hi, lon_lo, lon_hi)`. Used as the OBB extents
+    /// for the v1 dispatch when proto_sub_node.x != 0.
+    proto_sub_lat_lon: vec4<f32>,
+    /// Hybrid prototype: deeper sub-cube radial range. `(r_lo, r_hi, _, _)`.
+    proto_sub_r: vec4<f32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
     /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future

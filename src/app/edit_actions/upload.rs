@@ -374,6 +374,91 @@ impl App {
                 true,
                 lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
             );
+
+            // Frame-deepening (mirror of Cartesian's render-frame
+            // pattern): walk the proto cell's subtree along the
+            // camera anchor's path within the cell, find the
+            // deepest reachable Node + its BFS idx + its sub-cube
+            // bounds. The shader's v1 dispatch uses these as the
+            // march_cartesian root + OBB so the 8-level descent
+            // budget always starts deep enough to reach edits at
+            // any anchor depth — same reason the main Cartesian
+            // render works at 25+ tree depths with MAX_STACK_DEPTH=8.
+            //
+            // Path from world root to proto slab cell = [13, 13, 9, 2, 22].
+            let proto_cell_slots: [u8; 5] = [13, 13, 9, 2, 22];
+            let proto_cell_depth = proto_cell_slots.len();
+            let mut sub_node_id: Option<crate::world::tree::NodeId> = None;
+            let mut sub_node = self.world.root;
+            let mut found_cell = true;
+            for &slot in &proto_cell_slots {
+                let Some(n) = self.world.library.get(sub_node) else {
+                    found_cell = false;
+                    break;
+                };
+                match n.children[slot as usize] {
+                    crate::world::tree::Child::Node(c) => {
+                        sub_node = c;
+                        sub_node_id = Some(c);
+                    }
+                    _ => {
+                        found_cell = false;
+                        break;
+                    }
+                }
+            }
+            if !found_cell {
+                renderer.set_proto_sub_node(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            } else {
+                // Walk camera anchor's slots PAST the cell to deepen
+                // the sub-frame. Stop when we leave Node children or
+                // hit an unpacked NodeId.
+                let cam_slots = self.camera.position.anchor.as_slice().to_vec();
+                let mut sub_lat_lo = lat_lo;
+                let mut sub_lat_hi = lat_hi;
+                let mut sub_lon_lo = lon_lo;
+                let mut sub_lon_hi = lon_hi;
+                let mut sub_r_lo = r_lo;
+                let mut sub_r_hi = r_hi;
+                let mut deepest_bfs: u32 = self
+                    .cached_tree
+                    .as_ref()
+                    .and_then(|c| c.bfs_by_nid.get(&sub_node_id.unwrap()).copied())
+                    .unwrap_or(0);
+                if cam_slots.len() > proto_cell_depth {
+                    for &slot in &cam_slots[proto_cell_depth..] {
+                        let Some(n) = self.world.library.get(sub_node) else { break };
+                        match n.children[slot as usize] {
+                            crate::world::tree::Child::Node(c) => {
+                                let bfs = self
+                                    .cached_tree
+                                    .as_ref()
+                                    .and_then(|cache| cache.bfs_by_nid.get(&c).copied());
+                                let Some(b) = bfs else { break };
+                                sub_node = c;
+                                deepest_bfs = b;
+                                let (sx, sy, sz) = crate::world::tree::slot_coords(slot as usize);
+                                let lon_s = (sub_lon_hi - sub_lon_lo) / 3.0;
+                                let lat_s = (sub_lat_hi - sub_lat_lo) / 3.0;
+                                let r_s = (sub_r_hi - sub_r_lo) / 3.0;
+                                sub_lon_lo += sx as f32 * lon_s;
+                                sub_lon_hi = sub_lon_lo + lon_s;
+                                sub_lat_lo += sz as f32 * lat_s;
+                                sub_lat_hi = sub_lat_lo + lat_s;
+                                sub_r_lo += sy as f32 * r_s;
+                                sub_r_hi = sub_r_lo + r_s;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                renderer.set_proto_sub_node(
+                    deepest_bfs,
+                    sub_lat_lo, sub_lat_hi,
+                    sub_lon_lo, sub_lon_hi,
+                    sub_r_lo, sub_r_hi,
+                );
+            }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;
         self.last_ribbon_build_ms = ribbon_elapsed.as_secs_f64() * 1000.0;

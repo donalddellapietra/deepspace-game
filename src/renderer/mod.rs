@@ -119,6 +119,14 @@ pub struct GpuUniforms {
     pub proto_target_lat_lon: [f32; 4],
     /// Hybrid prototype: target cell radial range. `(r_lo, r_hi, _, _)`.
     pub proto_target_r: [f32; 4],
+    /// Hybrid prototype: deeper sub-node BFS idx for v1 frame-
+    /// deepening. `(bfs_idx, _, _, _)`. 0 = no deeper node.
+    pub proto_sub_node: [u32; 4],
+    /// Hybrid prototype: deeper sub-cube angular range.
+    /// `(lat_lo, lat_hi, lon_lo, lon_hi)`.
+    pub proto_sub_lat_lon: [f32; 4],
+    /// Hybrid prototype: deeper sub-cube radial range. `(r_lo, r_hi, _, _)`.
+    pub proto_sub_r: [f32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
     /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
@@ -208,6 +216,9 @@ pub struct Renderer {
     pub(super) proto_target_cell: [u32; 4],
     pub(super) proto_target_lat_lon: [f32; 4],
     pub(super) proto_target_r: [f32; 4],
+    pub(super) proto_sub_node: [u32; 4],
+    pub(super) proto_sub_lat_lon: [f32; 4],
+    pub(super) proto_sub_r: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -437,6 +448,21 @@ impl Renderer {
         self.proto_target_cell = [if enabled { 1 } else { 0 }, 0, 0, 0];
         self.proto_target_lat_lon = [lat_lo, lat_hi, lon_lo, lon_hi];
         self.proto_target_r = [r_lo, r_hi, 0.0, 0.0];
+        self.write_uniforms();
+    }
+
+    /// Hybrid prototype: deeper sub-node info for v1 frame-deepening.
+    /// `bfs_idx = 0` to disable (= use sample.child_idx instead).
+    pub fn set_proto_sub_node(
+        &mut self,
+        bfs_idx: u32,
+        lat_lo: f32, lat_hi: f32,
+        lon_lo: f32, lon_hi: f32,
+        r_lo: f32, r_hi: f32,
+    ) {
+        self.proto_sub_node = [bfs_idx, 0, 0, 0];
+        self.proto_sub_lat_lon = [lat_lo, lat_hi, lon_lo, lon_hi];
+        self.proto_sub_r = [r_lo, r_hi, 0.0, 0.0];
         self.write_uniforms();
     }
 

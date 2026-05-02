@@ -832,17 +832,43 @@ fn sphere_uv_in_cell(
                     && r_lo   >= uniforms.proto_target_r.x       - 1e-5
                     && r_hi   <= uniforms.proto_target_r.y       + 1e-5;
                 if is_proto {
+                    // Frame-deepening for v1 dispatch: when CPU has
+                    // pre-walked the cell's subtree along the camera
+                    // anchor's path and found a deeper Node, use it
+                    // as the march_cartesian root + use the deeper
+                    // sub-cube's bounds as the OBB. This mirrors the
+                    // main Cartesian render's frame-deepening pattern
+                    // — march_cartesian's MAX_STACK_DEPTH=8 budget
+                    // always starts deep enough to reach edits at
+                    // any anchor depth.
+                    var sub_idx = sample.child_idx;
+                    var sub_lat_lo = lat_lo;
+                    var sub_lat_hi = lat_hi;
+                    var sub_lon_lo = lon_lo;
+                    var sub_lon_hi = lon_hi;
+                    var sub_r_lo   = r_lo;
+                    var sub_r_hi   = r_hi;
+                    if uniforms.proto_sub_node.x != 0u {
+                        sub_idx = uniforms.proto_sub_node.x;
+                        sub_lat_lo = uniforms.proto_sub_lat_lon.x;
+                        sub_lat_hi = uniforms.proto_sub_lat_lon.y;
+                        sub_lon_lo = uniforms.proto_sub_lat_lon.z;
+                        sub_lon_hi = uniforms.proto_sub_lat_lon.w;
+                        sub_r_lo   = uniforms.proto_sub_r.x;
+                        sub_r_hi   = uniforms.proto_sub_r.y;
+                    }
                     let proto_hit = cartesian_voxels_in_cell(
-                        sample.child_idx,
+                        sub_idx,
                         ray_origin, ray_dir, inv_norm,
                         cs_center,
-                        lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
+                        sub_lat_lo, sub_lat_hi,
+                        sub_lon_lo, sub_lon_hi,
+                        sub_r_lo,   sub_r_hi,
                     );
                     if proto_hit.hit { return proto_hit; }
-                    // OBB miss / cartesian miss — fall through to
-                    // sphere descent for this cell (handles grazing
-                    // rays at OBB edges where the OBB doesn't quite
-                    // cover the spherical cell segment).
+                    // OBB miss — fall through to sphere descent
+                    // (handles grazing rays at OBB edges where the
+                    // sub-cube doesn't cover the curved segment).
                 }
                 let sub = sphere_descend_anchor(
                     sample.child_idx,
