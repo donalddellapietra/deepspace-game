@@ -970,18 +970,8 @@ fn march_cartesian(
                     saved_delta_dist = delta_dist;
                     saved_node_origin = cur_node_origin;
                     saved_cell_size = cur_cell_size;
-                    // Inscribed-shrink: shrink the rotated cube to
-                    // `s · parent_cell_size` and center it in the
-                    // parent cell, so its world AABB stays inside
-                    // the parent regardless of rotation angle. `s` is
-                    // computed in Renderer::set_tangent_rotation_columns
-                    // as `1 / max_j(Σ_i |M_ji|)`. Without this, rays
-                    // hitting the rotated cube's overhanging corners
-                    // are clipped by the parent cell's AABB cull.
-                    let shrink = uniforms.tangent_rotation_col0.w;
-                    saved_cube_size = cur_cell_size * shrink;
-                    let center_offset = (cur_cell_size - saved_cube_size) * 0.5;
-                    saved_cube_origin = child_origin + vec3<f32>(center_offset);
+                    saved_cube_origin = child_origin;       // world
+                    saved_cube_size = cur_cell_size;         // world
                     rot_active = true;
                     rot_pushed_at_depth = depth;
 
@@ -990,7 +980,10 @@ fn march_cartesian(
                     // the columns). Both ray_origin and ray_dir are
                     // scaled by `scale = 3 / cube_size_world` so the
                     // rotated cube becomes [0, 3)³ in local coords.
-                    // Scaling both keeps the t-parameter invariant.
+                    // Scaling both keeps the t-parameter invariant
+                    // (verified: pos_local(t) = scale·Mᵀ·(pos_world(t)
+                    // − cube_origin) is linear in t with the same
+                    // coefficient on `t`).
                     let c0 = uniforms.tangent_rotation_col0.xyz;
                     let c1 = uniforms.tangent_rotation_col1.xyz;
                     let c2 = uniforms.tangent_rotation_col2.xyz;

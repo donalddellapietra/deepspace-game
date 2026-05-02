@@ -106,12 +106,7 @@ struct Uniforms {
     /// (orthonormal: Mᵀ = M⁻¹). On push, transform the world ray to
     /// rotated coords with Mᵀ; on hit, transform local cell_min /
     /// normal back to world with M. Default identity.
-    ///
-    /// `col0.w` carries the inscribed-shrink factor `s` — the
-    /// rotated cube has world edge `s · parent_cell_size`, centered
-    /// in its parent cell, so it stays fully inside the parent
-    /// regardless of rotation angle. `s = 1.0` for identity / axis-
-    /// aligned rotations. `col1.w` / `col2.w` are std140 padding.
+    /// `.w` lane is std140 padding.
     tangent_rotation_col0: vec4<f32>,
     tangent_rotation_col1: vec4<f32>,
     tangent_rotation_col2: vec4<f32>,
