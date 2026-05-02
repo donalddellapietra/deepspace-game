@@ -1288,20 +1288,28 @@ fn sphere_descend_anchor(
             cur_lat_step = old_step_lat * 3.0;
             cur_r_step   = old_step_r   * 3.0;
             let popped = unpack_cell(s_cell[depth]);
-            // popped is the cell at depth-d's parent that contained
-            // the (depth+1) frame we just exited.
-            // Its center, after popping, is shifted by `(popped - 1) *
-            // old_step` from the (now-current) cur_*_center. Subtract
-            // that to get parent's "popped cell" center, then add the
-            // OOB step at parent step to advance to popped's neighbour.
+            // popped is the cell at parent depth d that contained the
+            // (d+1) frame we just exited.
+            //
+            // Pre-pop, cur_*_center is the (d+1) cell's center, which
+            // = (d+1)_frame_center + (cell - 1) * old_step. (`cell`
+            // can be OOB, so its center is conceptually outside the
+            // frame.) (d+1)_frame_center IS the popped cell's center at
+            // depth d, so:
+            //   parent_neighbor_center = (d+1)_frame_center + oob * d_step
+            //                          = cur_*_center - (cell - 1) * old_step
+            //                            + oob * d_step
+            //
+            // Note: uses `cell` (the (d+1) cell index, possibly OOB),
+            // NOT `popped` (the parent cell index).
             cur_lon_center = cur_lon_center
-                - (f32(popped.x) - 1.0) * old_step_lon
+                - (f32(cell.x) - 1.0) * old_step_lon
                 + f32(oob_x) * cur_lon_step;
             cur_r_center = cur_r_center
-                - (f32(popped.y) - 1.0) * old_step_r
+                - (f32(cell.y) - 1.0) * old_step_r
                 + f32(oob_y) * cur_r_step;
             cur_lat_center = cur_lat_center
-                - (f32(popped.z) - 1.0) * old_step_lat
+                - (f32(cell.z) - 1.0) * old_step_lat
                 + f32(oob_z) * cur_lat_step;
             // Advance parent's cell index by the OOB direction.
             let new_cell_p = vec3<i32>(
