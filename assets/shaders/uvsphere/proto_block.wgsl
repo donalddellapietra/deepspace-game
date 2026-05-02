@@ -1,39 +1,44 @@
-// Prototype: render ONE cartesian voxel embedded in the UV sphere.
+// Prototype: replace ONE specific UV cell with a cartesian voxel.
 //
-// At the target spherical position `(φ_c, θ_c, r_c)`, place an
-// oriented axis-aligned box whose axes are the local `(φ̂, θ̂, r̂)`
-// basis at that position and whose extents match the half-widths
-// of a UV cell at some chosen depth. The marcher tries this OBB
-// every ray; if the ray hits the box closer than (or at all when)
-// the UV march finds something, the OBB renders instead. Pixels
-// outside the box keep the UV-sphere rendering.
+// Target = a real cell in the body's tree at a tier-aligned path.
+// The OBB's centre / basis / extents are derived from the cell's
+// EXACT bounds, so it sits in the same volume the UV cell would
+// occupy — no floating off the surface, no clipping into the
+// sphere. If this looks right, the same primitive generalises:
+// every Block with `d.depth ≥ N` uses its own bounds for centre /
+// basis / extents and replaces its UV rendering pixel-for-pixel.
+
+// --- Target cell selection -------------------------------------
 //
-// This is the smallest version of the hybrid scheme: a single
-// cartesian voxel "in place of" a UV cell. If the placement +
-// orientation + face shading look correct, the same machinery
-// generalises to every cell at depth ≥ N.
+// Path = [14, 21, 5] (depth 3) — slot encoding `pt + tt*3 + rt*9`:
+//   d=1: pt=2 (φ ∈ [4π/3, 2π]), tt=1 (θ ∈ [-θcap/3, θcap/3]),
+//        rt=1 (r ∈ [inner_r + dr/3, inner_r + 2dr/3]).
+//   d=2: pt=0 (φ ∈ [4π/3, 4π/3 + 2π/9]), tt=1, rt=2.
+//   d=3: pt=2, tt=1, rt=0.
 //
-// Body-frame coords: body centre at `(1.5, 1.5, 1.5)`, body radius
-// in `[inner_r, outer_r]` body-frame units.
+// Cell bounds (with body params `inner_r=0.15, outer_r=0.60,
+// θcap=80°≈1.396`):
+//   φ ∈ [4.654, 4.887]      (≈ south face, slightly east of -z)
+//   θ ∈ [-0.155, 0.155]     (equator-centred)
+//   r ∈ [0.40, 0.417]       (mid body-shell, dirt band)
+//
+// Cell centre in body-frame world coords ≈ (1.524, 1.5, 1.093).
+// Default spawn camera sits at (1.5, 1.5, 1.0) looking +z, so the
+// target lands ~14° off forward — well inside the FOV.
+const PROTO_TARGET_PHI:        f32 = 4.7705;       // (4.654 + 4.887)/2
+const PROTO_TARGET_THETA:      f32 = 0.0;
+const PROTO_TARGET_R:          f32 = 0.4083;       // (0.40 + 0.417)/2
 
-// Target — south face of the body (visible from default spawn at
-// `[1.5, 1.5, 1.0]` looking +z), at the outer-shell grass band.
-const PROTO_TARGET_PHI: f32   = 4.712389;   // 3π/2
-const PROTO_TARGET_THETA: f32 = 0.0;        // equator
-const PROTO_TARGET_R: f32     = 0.59;       // outer-shell band
-// Box half-extents in spherical-tangent coords (rad / rad / radial
-// world). At depth 5: dphi ≈ 0.026 rad → half ≈ 0.013. Pick a hair
-// larger so the box visibly straddles the surface.
-const PROTO_TARGET_HALF_DPHI: f32 = 0.025;
-const PROTO_TARGET_HALF_DTH:  f32 = 0.025;
-const PROTO_TARGET_HALF_DR:   f32 = 0.012;
+const PROTO_TARGET_HALF_DPHI:  f32 = 0.1164;       // (4.887 − 4.654)/2
+const PROTO_TARGET_HALF_DTH:   f32 = 0.1551;       // (0.155 − (−0.155))/2
+const PROTO_TARGET_HALF_DR:    f32 = 0.0083;       // (0.417 − 0.40)/2
 
-// Box block colour — palette index 2 = grass on the demo body.
-const PROTO_TARGET_BLOCK_TYPE: u32 = 2u;
+// Bright magenta — unmistakable against the body's green/brown.
+const PROTO_TARGET_COLOR: vec3<f32> = vec3<f32>(1.0, 0.0, 1.0);
 
-// Ray-vs-OBB intersection in body-frame world coords. Returns the
-// closer of (`t_enter`, axis, side) on hit, or `t = 1e30` on miss.
-// Slab method projected onto the OBB's axes.
+// Ray-vs-OBB intersection (slab method projected onto the OBB
+// axes). Returns the closer of `(t_enter, axis, side)` on hit, or
+// `t = 1e30` on miss.
 fn proto_ray_vs_obb(
     ray_origin: vec3<f32>, ray_dir: vec3<f32>,
     body_center: vec3<f32>,
@@ -48,21 +53,21 @@ fn proto_ray_vs_obb(
     let cos_t = cos(PROTO_TARGET_THETA);
     let sin_t = sin(PROTO_TARGET_THETA);
 
-    // Local basis at target.
+    // Local basis at target — matches the cell's tangent + radial frame.
     let r_hat     = vec3<f32>( cos_t * cos_p,  sin_t,  cos_t * sin_p);
     let theta_hat = vec3<f32>(-sin_t * cos_p,  cos_t, -sin_t * sin_p);
     let phi_hat   = vec3<f32>(-sin_p,           0.0,    cos_p);
 
-    // Box centre in body-frame world coords.
     let center = body_center + r_hat * PROTO_TARGET_R;
 
-    // Half-extents in WORLD units along each axis.
-    // Tangential extents are arc lengths: `r · cos θ · Δφ` and `r · Δθ`.
+    // Half-extents in WORLD units. Tangential extents are arc lengths
+    // `r · cos θ · Δφ` and `r · Δθ`; radial extent is just `Δr`.
     let h_phi = PROTO_TARGET_HALF_DPHI * PROTO_TARGET_R * cos_t;
     let h_th  = PROTO_TARGET_HALF_DTH  * PROTO_TARGET_R;
     let h_r   = PROTO_TARGET_HALF_DR;
 
-    // Ray in OBB-local coords (origin shifted, projected onto basis).
+    // Ray in OBB-local: project (origin − centre) onto the basis,
+    // and the ray dir similarly.
     let to_origin = ray_origin - center;
     let q0 = dot(to_origin, phi_hat);
     let q1 = dot(to_origin, theta_hat);
@@ -84,8 +89,7 @@ fn proto_ray_vs_obb(
         var t_a = (-h_phi - q0) * inv_d;
         var t_b = ( h_phi - q0) * inv_d;
         var sa: u32 = 0u;
-        var sb: u32 = 1u;
-        if t_a > t_b { let tmp = t_a; t_a = t_b; t_b = tmp; sa = 1u; sb = 0u; }
+        if t_a > t_b { let tmp = t_a; t_a = t_b; t_b = tmp; sa = 1u; }
         if t_a > t_min { t_min = t_a; enter_axis = 0u; enter_side = sa; }
         if t_b < t_max { t_max = t_b; }
         if t_min > t_max { return out; }
@@ -98,8 +102,7 @@ fn proto_ray_vs_obb(
         var t_a = (-h_th - q1) * inv_d;
         var t_b = ( h_th - q1) * inv_d;
         var sa: u32 = 0u;
-        var sb: u32 = 1u;
-        if t_a > t_b { let tmp = t_a; t_a = t_b; t_b = tmp; sa = 1u; sb = 0u; }
+        if t_a > t_b { let tmp = t_a; t_a = t_b; t_b = tmp; sa = 1u; }
         if t_a > t_min { t_min = t_a; enter_axis = 1u; enter_side = sa; }
         if t_b < t_max { t_max = t_b; }
         if t_min > t_max { return out; }
@@ -112,15 +115,12 @@ fn proto_ray_vs_obb(
         var t_a = (-h_r - q2) * inv_d;
         var t_b = ( h_r - q2) * inv_d;
         var sa: u32 = 0u;
-        var sb: u32 = 1u;
-        if t_a > t_b { let tmp = t_a; t_a = t_b; t_b = tmp; sa = 1u; sb = 0u; }
+        if t_a > t_b { let tmp = t_a; t_a = t_b; t_b = tmp; sa = 1u; }
         if t_a > t_min { t_min = t_a; enter_axis = 2u; enter_side = sa; }
         if t_b < t_max { t_max = t_b; }
         if t_min > t_max { return out; }
     }
 
-    // Camera inside the box (`t_min < 0`): clamp to 0 — the inside
-    // face entered "now" is the camera's containing one.
     if t_max < 0.0001 { return out; }
     out.t = max(t_min, 0.0001);
     out.axis = enter_axis;
@@ -128,9 +128,10 @@ fn proto_ray_vs_obb(
     return out;
 }
 
-// Render the prototype OBB at hit time. Uses the SAME
-// `(r̂, θ̂, φ̂)` basis as the OBB axes. Bevel is in OBB-local
-// `(u, v) ∈ [-1, 1]` of the TWO axes orthogonal to the entry face.
+// Render the prototype OBB at hit time. The OBB axes are
+// `(φ̂, θ̂, r̂)` at the target's centre — same basis the slab test
+// used. Bevel is in OBB-local `(u, v) ∈ [-1, 1]` of the two axes
+// orthogonal to the entered face.
 fn proto_obb_render(
     ray_origin: vec3<f32>, ray_dir: vec3<f32>,
     body_center: vec3<f32>,
@@ -155,7 +156,6 @@ fn proto_obb_render(
     let h_th  = PROTO_TARGET_HALF_DTH  * PROTO_TARGET_R;
     let h_r   = PROTO_TARGET_HALF_DR;
 
-    // Face normal: ±basis along the entered axis.
     var n: vec3<f32>;
     if bd.axis == 0u {
         n = select(-phi_hat, phi_hat, bd.side == 1u);
@@ -166,8 +166,6 @@ fn proto_obb_render(
     }
     result.normal = normalize(n);
 
-    // Bevel from OBB-local (u, v, w). Each component ∈ [-1, 1] for
-    // points inside the box; the entered axis is at ±1.
     let pos = ray_origin + ray_dir * bd.t;
     let p = pos - center;
     let u = clamp(dot(p, phi_hat)   / max(h_phi, 1e-12), -1.0, 1.0);
@@ -183,7 +181,7 @@ fn proto_obb_render(
     let edge = min(min(a, 1.0 - a), min(b, 1.0 - b));
     let bevel = smoothstep(0.02, 0.14, edge);
 
-    result.color = palette[PROTO_TARGET_BLOCK_TYPE].rgb * (0.7 + 0.3 * bevel);
+    result.color = PROTO_TARGET_COLOR * (0.7 + 0.3 * bevel);
     result.cell_min = pos - vec3<f32>(0.5);
     return result;
 }
