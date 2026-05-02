@@ -49,14 +49,7 @@ impl App {
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                // Rotation-aware: when the frame is inside a rotated
-                // subtree (TB on the path), plain `in_frame` walks
-                // Cartesian and reports a wildly off "world position
-                // in frame coords" — making the fits-in-frame check
-                // erroneously truncate the render frame.
-                self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame.render_path,
-                )
+                self.camera.position.in_frame(&frame.render_path)
             }
         };
         cam_local.iter().all(|v| v.is_finite())
@@ -70,14 +63,7 @@ impl App {
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => (
-                // Rotation-aware: same reason as `camera_fits_frame`.
-                // The "frame projected pixels" estimate that drives
-                // render-frame depth selection has to use the camera's
-                // actual position in frame coords, not the Cartesian-
-                // walked one.
-                self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame.render_path,
-                ),
+                self.camera.position.in_frame(&frame.render_path),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
             ),
@@ -126,9 +112,7 @@ impl App {
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
                 ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                    self.camera.position.in_frame_rot(
-                        &self.world.library, self.world.root, &frame.render_path,
-                    )
+                    self.camera.position.in_frame(&frame.render_path)
                 }
             };
             eprintln!(
