@@ -190,13 +190,6 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
-                // Step-1 unit primitive: a single rotated TangentBlock
-                // at depth 30, flanked by two axis-aligned cartesian
-                // Block siblings. Tests the rotated-cartesian rendering
-                // primitive in isolation.
-                "--rotated-block-test" => {
-                    cfg.world_preset = WorldPreset::RotatedBlockTest;
-                }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
