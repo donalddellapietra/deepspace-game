@@ -566,13 +566,234 @@ fn render_cell_as_tangent_cube(
     return result;
 }
 
+// Dedicated walker for the proto cell's tangent-plane Cartesian
+// dispatch. Mirrors `march_cartesian`'s core stack-based DDA but
+// with a deeper stack to accommodate the cell's `cell_subtree_depth`
+// (up to 20 in the wrapped-planet preset) and NO LOD-pixel
+// termination — the camera-distance LOD that march_cartesian uses
+// would collapse deep edits to representative_block (= the cell
+// looks unchanged after a deep break, exactly the bug we're
+// fixing). MAX_STACK_DEPTH stays at 8 globally; this walker only
+// allocates its larger stack when a ray actually enters a proto
+// cell, so most fragments don't pay for it.
+//
+// Simplified vs march_cartesian: no entity dispatch, no X-wrap, no
+// Y-curvature, no walker probe, no LOD termination. Pure tree-
+// structure descent driven by tag=1/tag=2 boundaries.
+const PROTO_STACK_DEPTH: u32 = 24u;
+
+fn march_in_proto_cube(
+    root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    let inv_dir = vec3<f32>(
+        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+    );
+    let step = vec3<i32>(
+        select(-1, 1, ray_dir.x >= 0.0),
+        select(-1, 1, ray_dir.y >= 0.0),
+        select(-1, 1, ray_dir.z >= 0.0),
+    );
+    let delta_dist = abs(inv_dir);
+
+    var s_node_idx: array<u32, PROTO_STACK_DEPTH>;
+    var s_cell: array<u32, PROTO_STACK_DEPTH>;
+    var cur_cell_size: f32 = 1.0;
+    var cur_node_origin: vec3<f32> = vec3<f32>(0.0);
+    var cur_side_dist: vec3<f32>;
+    var normal = vec3<f32>(0.0, 1.0, 0.0);
+    var depth: u32 = 0u;
+    s_node_idx[0] = root_node_idx;
+
+    let root_header_off = node_offsets[root_node_idx];
+    var cur_occupancy: u32 = tree[root_header_off];
+    var cur_first_child: u32 = tree[root_header_off + 1u];
+
+    let root_hit = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+    if root_hit.t_enter >= root_hit.t_exit || root_hit.t_exit < 0.0 {
+        return result;
+    }
+
+    let t_start = max(root_hit.t_enter, 0.0) + 0.001;
+    let entry_pos = ray_origin + ray_dir * t_start;
+    let root_cell = vec3<i32>(
+        clamp(i32(floor(entry_pos.x)), 0, 2),
+        clamp(i32(floor(entry_pos.y)), 0, 2),
+        clamp(i32(floor(entry_pos.z)), 0, 2),
+    );
+    s_cell[0] = pack_cell(root_cell);
+    let cell_f = vec3<f32>(root_cell);
+    cur_side_dist = vec3<f32>(
+        select((cell_f.x - entry_pos.x) * inv_dir.x,
+               (cell_f.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+        select((cell_f.y - entry_pos.y) * inv_dir.y,
+               (cell_f.y + 1.0 - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+        select((cell_f.z - entry_pos.z) * inv_dir.z,
+               (cell_f.z + 1.0 - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+    );
+
+    var iterations: u32 = 0u;
+    loop {
+        if iterations >= 2048u { break; }
+        iterations = iterations + 1u;
+
+        let cell = unpack_cell(s_cell[depth]);
+
+        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
+            if depth == 0u { break; }
+            depth = depth - 1u;
+            cur_cell_size = cur_cell_size * 3.0;
+            let parent_cell = unpack_cell(s_cell[depth]);
+            cur_node_origin = cur_node_origin - vec3<f32>(parent_cell) * cur_cell_size;
+            let lc_pop = vec3<f32>(parent_cell);
+            cur_side_dist = vec3<f32>(
+                select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
+                       (cur_node_origin.x + (lc_pop.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                select((cur_node_origin.y + lc_pop.y * cur_cell_size - entry_pos.y) * inv_dir.y,
+                       (cur_node_origin.y + (lc_pop.y + 1.0) * cur_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                select((cur_node_origin.z + lc_pop.z * cur_cell_size - entry_pos.z) * inv_dir.z,
+                       (cur_node_origin.z + (lc_pop.z + 1.0) * cur_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+            );
+
+            let parent_header_off = node_offsets[s_node_idx[depth]];
+            cur_occupancy = tree[parent_header_off];
+            cur_first_child = tree[parent_header_off + 1u];
+
+            let m_oob = min_axis_mask(cur_side_dist);
+            s_cell[depth] = pack_cell(parent_cell + vec3<i32>(m_oob) * step);
+            cur_side_dist = cur_side_dist + m_oob * delta_dist * cur_cell_size;
+            normal = -vec3<f32>(step) * m_oob;
+            continue;
+        }
+
+        let slot = u32(cell.x + cell.y * 3 + cell.z * 9);
+        let slot_bit = 1u << slot;
+        if (cur_occupancy & slot_bit) == 0u {
+            let m_empty = min_axis_mask(cur_side_dist);
+            s_cell[depth] = pack_cell(cell + vec3<i32>(m_empty) * step);
+            cur_side_dist = cur_side_dist + m_empty * delta_dist * cur_cell_size;
+            normal = -vec3<f32>(step) * m_empty;
+            continue;
+        }
+
+        let rank = countOneBits(cur_occupancy & (slot_bit - 1u));
+        let child_base = cur_first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
+
+        if tag == 1u {
+            let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+            let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
+            let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+            result.hit = true;
+            result.t = max(cell_box_h.t_enter, 0.0);
+            result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
+            result.normal = normal;
+            result.cell_min = cell_min_h;
+            result.cell_size = cur_cell_size;
+            return result;
+        }
+
+        if tag != 2u {
+            // Unknown tag (EntityRef etc.) — treat as empty.
+            let m_other = min_axis_mask(cur_side_dist);
+            s_cell[depth] = pack_cell(cell + vec3<i32>(m_other) * step);
+            cur_side_dist = cur_side_dist + m_other * delta_dist * cur_cell_size;
+            normal = -vec3<f32>(step) * m_other;
+            continue;
+        }
+
+        // tag == 2u: Node child.
+        let child_bt = (packed >> 8u) & 0xFFFFu;
+        if child_bt == 0xFFFEu {
+            let m_rep = min_axis_mask(cur_side_dist);
+            s_cell[depth] = pack_cell(cell + vec3<i32>(m_rep) * step);
+            cur_side_dist = cur_side_dist + m_rep * delta_dist * cur_cell_size;
+            normal = -vec3<f32>(step) * m_rep;
+            continue;
+        }
+
+        let child_idx = tree[child_base + 1u];
+
+        // Stack ceiling — only fires when subtree depth exceeds
+        // PROTO_STACK_DEPTH. Splat representative as a last-resort
+        // terminal so the cell is still visible (just at lower
+        // resolution than the user edited at).
+        let at_max = depth + 1u >= PROTO_STACK_DEPTH;
+        if at_max {
+            let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+            let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
+            let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
+            result.hit = true;
+            result.t = max(cell_box_h.t_enter, 0.0);
+            result.color = palette[child_bt].rgb;
+            result.normal = normal;
+            result.cell_min = cell_min_h;
+            result.cell_size = cur_cell_size;
+            return result;
+        }
+
+        // Descend into the Node child.
+        let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+        let child_cell_size = cur_cell_size / 3.0;
+        let node_hit = ray_box(
+            ray_origin, inv_dir,
+            child_origin,
+            child_origin + vec3<f32>(3.0) * child_cell_size,
+        );
+        let ct_start = max(node_hit.t_enter, 0.0) + 0.0001 * child_cell_size;
+        let child_entry = ray_origin + ray_dir * ct_start;
+        let local_entry = vec3<f32>(
+            (child_entry.x - child_origin.x) / child_cell_size,
+            (child_entry.y - child_origin.y) / child_cell_size,
+            (child_entry.z - child_origin.z) / child_cell_size,
+        );
+
+        depth = depth + 1u;
+        s_node_idx[depth] = child_idx;
+        cur_node_origin = child_origin;
+        cur_cell_size = child_cell_size;
+        let child_header_off = node_offsets[child_idx];
+        cur_occupancy = tree[child_header_off];
+        cur_first_child = tree[child_header_off + 1u];
+
+        let new_cell = vec3<i32>(
+            clamp(i32(floor(local_entry.x)), 0, 2),
+            clamp(i32(floor(local_entry.y)), 0, 2),
+            clamp(i32(floor(local_entry.z)), 0, 2),
+        );
+        s_cell[depth] = pack_cell(new_cell);
+        let lc = vec3<f32>(new_cell);
+        cur_side_dist = vec3<f32>(
+            select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
+                   (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+            select((child_origin.y + lc.y * child_cell_size - entry_pos.y) * inv_dir.y,
+                   (child_origin.y + (lc.y + 1.0) * child_cell_size - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+            select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
+                   (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+        );
+    }
+
+    return result;
+}
+
 // Hybrid prototype v1: render a cell's subtree as a CARTESIAN
 // voxel grid in the cell's tangent-plane local frame. The cell
 // occupies an OBB on the sphere surface (basis = lon-tan, lat-tan,
 // -radial; extents from cell's lat/lon/r ranges). The ray is
-// transformed into cell-local [0, 3)³ coords and `march_cartesian`
-// walks the subtree with bounded magnitudes — no f32 ULP wall no
-// matter how deep the subtree gets.
+// transformed into cell-local [0, 3)³ coords and
+// `march_in_proto_cube` (deeper stack, no LOD) walks the subtree
+// with bounded magnitudes — no f32 ULP wall and no LOD-termination
+// no matter how deep the subtree gets.
 //
 // Returns hit=false on OBB miss OR cartesian-walker miss; the
 // caller falls through to spherical descent in those cases.
@@ -652,10 +873,7 @@ fn cartesian_voxels_in_cell(
     let pos_3 = (pos_l + half_v3) * scale_to_3;
     let dir_3 = dir_l * scale_to_3;
 
-    let cart_hit = march_cartesian(
-        sub_node_idx, pos_3, dir_3,
-        MAX_STACK_DEPTH, 0xFFFFFFFFu,
-    );
+    let cart_hit = march_in_proto_cube(sub_node_idx, pos_3, dir_3);
     if !cart_hit.hit { return result; }
 
     // Convert cell-local axis-aligned hit normal back to world
@@ -832,43 +1050,21 @@ fn sphere_uv_in_cell(
                     && r_lo   >= uniforms.proto_target_r.x       - 1e-5
                     && r_hi   <= uniforms.proto_target_r.y       + 1e-5;
                 if is_proto {
-                    // Frame-deepening for v1 dispatch: when CPU has
-                    // pre-walked the cell's subtree along the camera
-                    // anchor's path and found a deeper Node, use it
-                    // as the march_cartesian root + use the deeper
-                    // sub-cube's bounds as the OBB. This mirrors the
-                    // main Cartesian render's frame-deepening pattern
-                    // — march_cartesian's MAX_STACK_DEPTH=8 budget
-                    // always starts deep enough to reach edits at
-                    // any anchor depth.
-                    var sub_idx = sample.child_idx;
-                    var sub_lat_lo = lat_lo;
-                    var sub_lat_hi = lat_hi;
-                    var sub_lon_lo = lon_lo;
-                    var sub_lon_hi = lon_hi;
-                    var sub_r_lo   = r_lo;
-                    var sub_r_hi   = r_hi;
-                    if uniforms.proto_sub_node.x != 0u {
-                        sub_idx = uniforms.proto_sub_node.x;
-                        sub_lat_lo = uniforms.proto_sub_lat_lon.x;
-                        sub_lat_hi = uniforms.proto_sub_lat_lon.y;
-                        sub_lon_lo = uniforms.proto_sub_lat_lon.z;
-                        sub_lon_hi = uniforms.proto_sub_lat_lon.w;
-                        sub_r_lo   = uniforms.proto_sub_r.x;
-                        sub_r_hi   = uniforms.proto_sub_r.y;
-                    }
+                    // Dispatch the dedicated proto-cube walker on
+                    // the cell's actual subtree (sample.child_idx).
+                    // The walker has a 24-deep stack and skips LOD-
+                    // pixel termination, so deep edits within the
+                    // cell's anchor chain (up to 20 levels) render
+                    // correctly. NO frame-deepening needed — the
+                    // walker handles depth from the subtree root.
                     let proto_hit = cartesian_voxels_in_cell(
-                        sub_idx,
+                        sample.child_idx,
                         ray_origin, ray_dir, inv_norm,
                         cs_center,
-                        sub_lat_lo, sub_lat_hi,
-                        sub_lon_lo, sub_lon_hi,
-                        sub_r_lo,   sub_r_hi,
+                        lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
                     );
                     if proto_hit.hit { return proto_hit; }
-                    // OBB miss — fall through to sphere descent
-                    // (handles grazing rays at OBB edges where the
-                    // sub-cube doesn't cover the curved segment).
+                    // OBB miss — fall through to sphere descent.
                 }
                 let sub = sphere_descend_anchor(
                     sample.child_idx,
