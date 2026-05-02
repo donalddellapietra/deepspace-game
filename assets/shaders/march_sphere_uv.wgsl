@@ -151,6 +151,7 @@ fn sphere_uv_in_cell(
                     cs_center, inv_norm,
                     cell_lon_center, cell_lat_center, cell_r_center,
                     lon_step, lat_step, r_step,
+                    t,
                 );
                 if sub.hit { return sub; }
                 // Anchor descent exited without a hit — every sub-cell

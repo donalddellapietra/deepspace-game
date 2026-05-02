@@ -63,6 +63,7 @@ fn sphere_descend_anchor(
     cs_center: vec3<f32>, inv_norm: f32,
     cell_lon_center: f32, cell_lat_center: f32, cell_r_center: f32,
     cell_lon_step: f32, cell_lat_step: f32, cell_r_step: f32,
+    t_in: f32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -133,19 +134,25 @@ fn sphere_descend_anchor(
     );
     let delta_dist = abs(inv_dir);
 
-    // Slab-cell ray-box clip. If the local ray misses [0, 3)³ it can't
-    // hit anything — bail.
-    let slab_box = ray_box(O_l, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
-    if slab_box.t_enter >= slab_box.t_exit || slab_box.t_exit < 0.0 {
-        return result;
-    }
-    let t_start = max(slab_box.t_enter, 0.0) + 0.001;
+    // No early ray-box bail. The CALLER (slab DDA) already verified
+    // the ray is inside the curved slab cell at t_in by sampling the
+    // sphere geometry; the local-flat box approximation can be
+    // numerically off at the cell boundary by O((slab_step)²/r) and
+    // would falsely reject some valid rays. Start DDA from t_in
+    // directly; if the ray genuinely doesn't traverse any solid
+    // sub-cell, the OOB-pop branch returns no-hit naturally.
+    let t_start = t_in;
     let entry_pos = O_l + D_l * t_start;
     let entry_cell = vec3<i32>(
         clamp(i32(floor(entry_pos.x)), 0, 2),
         clamp(i32(floor(entry_pos.y)), 0, 2),
         clamp(i32(floor(entry_pos.z)), 0, 2),
     );
+    // Used for child-frame ct_start in the push branch — kept around
+    // in case the entry_pos is slightly outside [0, 3) due to
+    // curvature error. The DDA-internal `ct_start` for child frame
+    // entry uses this.
+    let slab_t_floor = max(t_in - 0.001, 0.0);
 
     var s_node_idx: array<u32, SPHERE_DESCENT_DEPTH>;
     var s_cell:     array<u32, SPHERE_DESCENT_DEPTH>;
@@ -273,7 +280,7 @@ fn sphere_descend_anchor(
         }
         let child_cell_size = cur_cell_size / 3.0;
         let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-        let ct_start = max(slab_box.t_enter, 0.0) + 0.0001 * child_cell_size;
+        let ct_start = slab_t_floor + 0.0001 * child_cell_size;
         let child_entry = O_l + D_l * ct_start;
         let local_entry = (child_entry - child_origin) / child_cell_size;
         depth = depth + 1u;
