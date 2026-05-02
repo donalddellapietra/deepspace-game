@@ -89,11 +89,6 @@ pub fn compute_render_frame(
 ) -> ActiveFrame {
     let mut node_id = world_root;
     let mut reached = Path::root();
-    // Camera position in the current frame's [0, WORLD_SIZE)³ box.
-    // Initialized at the world root, then transformed on each
-    // descent step so the slot pick at the next iteration uses
-    // up-to-date local coords.
-    let mut cam_local = camera_pos.in_frame(&Path::root());
     let mut kind = match library.get(world_root).map(|n| n.kind) {
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
@@ -114,6 +109,29 @@ pub fn compute_render_frame(
             break;
         }
         let Some(node) = library.get(node_id) else { break };
+        // Recompute cam_local fresh from the camera's WorldPos at
+        // each iteration. Iteratively scaling cam_local by 3× per
+        // descent step compounds f32 error catastrophically — by
+        // depth 15 a single ulp of starting error has grown to
+        // ~1 cell. `in_frame` / `in_frame_with_rotation` use the
+        // anchor's slot decomposition + offset directly, with f32
+        // precision bounded by the frame's local extent (not by
+        // the cumulative descent depth).
+        let cam_local = match tangent_crossing {
+            Some(crossing) => camera_pos.in_frame_with_rotation(
+                &reached, tangent_rotation_cols, crossing,
+            ),
+            None => camera_pos.in_frame(&reached),
+        };
+        // If camera is outside the current frame's [0, 3)³, descent
+        // can't continue — the camera isn't physically inside any
+        // child of the current node.
+        if cam_local[0] < 0.0 || cam_local[0] >= 3.0
+            || cam_local[1] < 0.0 || cam_local[1] >= 3.0
+            || cam_local[2] < 0.0 || cam_local[2] >= 3.0
+        {
+            break;
+        }
         // Pick slot from the camera's CURRENT local position, not
         // from the camera anchor's stored slots. Inside a rotated
         // subtree the anchor's axis-aligned `zoom_in` produces slots
@@ -128,12 +146,6 @@ pub fn compute_render_frame(
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
-                // Update cam_local to be in child's [0, WORLD_SIZE)³.
-                cam_local = [
-                    (cam_local[0] - sx as f32) * 3.0,
-                    (cam_local[1] - sy as f32) * 3.0,
-                    (cam_local[2] - sz as f32) * 3.0,
-                ];
                 if let Some(child_node) = library.get(child_id) {
                     match child_node.kind {
                         NodeKind::WrappedPlane { dims, slab_depth } => {
@@ -141,40 +153,18 @@ pub fn compute_render_frame(
                             break;
                         }
                         NodeKind::TangentBlock => {
-                            // Cross into rotated subtree. Apply Mᵀ
-                            // around the [0, WORLD_SIZE)³ corner to
-                            // express cam_local in rotated axes —
-                            // subsequent slot picks (in this same
-                            // loop) will then walk the actual rotated
-                            // cells the camera is in, instead of the
-                            // axis-aligned ones the anchor's path
-                            // pointed at.
+                            // Cross into rotated subtree — record
+                            // the crossing index so the next
+                            // iteration's `in_frame_with_rotation`
+                            // applies Mᵀ at the right path index.
                             kind = ActiveFrameKind::TangentBlock;
                             tangent_crossing = Some(reached.depth());
-                            let c0 = tangent_rotation_cols[0];
-                            let c1 = tangent_rotation_cols[1];
-                            let c2 = tangent_rotation_cols[2];
-                            cam_local = [
-                                c0[0] * cam_local[0] + c0[1] * cam_local[1] + c0[2] * cam_local[2],
-                                c1[0] * cam_local[0] + c1[1] * cam_local[1] + c1[2] * cam_local[2],
-                                c2[0] * cam_local[0] + c2[1] * cam_local[1] + c2[2] * cam_local[2],
-                            ];
                         }
                         NodeKind::Cartesian => {}
                     }
                 }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
-        }
-        // If cam_local has drifted outside [0, 3)³ on any axis (can
-        // happen for points just past a TB whose rotated cube extends
-        // a bit past its parent slot), stop the descent here — the
-        // camera isn't physically inside any further child cell.
-        if cam_local[0] < 0.0 || cam_local[0] >= 3.0
-            || cam_local[1] < 0.0 || cam_local[1] >= 3.0
-            || cam_local[2] < 0.0 || cam_local[2] >= 3.0
-        {
-            break;
         }
     }
     ActiveFrame {
