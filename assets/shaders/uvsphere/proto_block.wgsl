@@ -10,28 +10,35 @@
 
 // --- Target cell selection -------------------------------------
 //
-// Path = [14, 21, 5] (depth 3) — slot encoding `pt + tt*3 + rt*9`:
+// Path = [14, 21, 23] (depth 3) — slot encoding `pt + tt*3 + rt*9`:
 //   d=1: pt=2 (φ ∈ [4π/3, 2π]), tt=1 (θ ∈ [-θcap/3, θcap/3]),
 //        rt=1 (r ∈ [inner_r + dr/3, inner_r + 2dr/3]).
 //   d=2: pt=0 (φ ∈ [4π/3, 4π/3 + 2π/9]), tt=1, rt=2.
-//   d=3: pt=2, tt=1, rt=0.
+//   d=3: pt=2, tt=1, rt=2 — outermost r-slot at depth 3.
 //
-// Cell bounds (with body params `inner_r=0.15, outer_r=0.60,
-// θcap=80°≈1.396`):
+// Cell bounds (in body-marcher local frame, where `body_size=3.0`,
+// inner_r=0.15, outer_r=0.60, θcap=80°≈1.396):
 //   φ ∈ [4.654, 4.887]      (≈ south face, slightly east of -z)
-//   θ ∈ [-0.155, 0.155]     (equator-centred)
-//   r ∈ [0.40, 0.417]       (mid body-shell, dirt band)
+//   θ ∈ [-0.052, 0.052]     (equator-centred, depth-3 width)
+//   r ∈ [0.4333, 0.45]      (top of grass band — visible on surface)
 //
-// Cell centre in body-frame world coords ≈ (1.524, 1.5, 1.093).
-// Default spawn camera sits at (1.5, 1.5, 1.0) looking +z, so the
-// target lands ~14° off forward — well inside the FOV.
+// Why this cell and not the original mid-shell `[14, 21, 5]`:
+// the body's grass shell at r ∈ [0.4275, 0.45] sits in FRONT of the
+// dirt band at r ∈ [0.315, 0.4275]. Targeting a dirt cell hides
+// the OBB behind grass. The outermost r-slot (rt=2 at depth 3) lies
+// IN the grass band, on the body's silhouette — the OBB replaces a
+// real grass cell pixel-for-pixel.
+//
+// Cell centre in body-frame world coords ≈ (1.526, 1.5, 1.059).
+// Camera at (1.5, 1.5, 0.5) looking +z (test setup) puts the target
+// ~1° off forward.
 const PROTO_TARGET_PHI:        f32 = 4.7705;       // (4.654 + 4.887)/2
 const PROTO_TARGET_THETA:      f32 = 0.0;
-const PROTO_TARGET_R:          f32 = 0.4083;       // (0.40 + 0.417)/2
+const PROTO_TARGET_R:          f32 = 0.4417;       // (0.4333 + 0.45)/2
 
 const PROTO_TARGET_HALF_DPHI:  f32 = 0.1164;       // (4.887 − 4.654)/2
-const PROTO_TARGET_HALF_DTH:   f32 = 0.1551;       // (0.155 − (−0.155))/2
-const PROTO_TARGET_HALF_DR:    f32 = 0.0083;       // (0.417 − 0.40)/2
+const PROTO_TARGET_HALF_DTH:   f32 = 0.052;        // (0.052 − (−0.052))/2
+const PROTO_TARGET_HALF_DR:    f32 = 0.0083;       // (0.45 − 0.4333)/2
 
 // Bright magenta — unmistakable against the body's green/brown.
 const PROTO_TARGET_COLOR: vec3<f32> = vec3<f32>(1.0, 0.0, 1.0);

@@ -39,10 +39,17 @@ fn march_uv_sphere(
     let outer_r = outer_r_local * body_size;
     let inner_r = inner_r_local * body_size;
 
-    // PROTOTYPE: fire ray vs the cartesian-block target. If it hits,
-    // record `proto.t` so the UV march can be overridden when its
-    // hit lies behind the OBB. Final pick happens at end-of-march.
+    // PROTOTYPE: fire ray vs the cartesian-block target. The OBB
+    // REPLACES one specific cell (path [14, 21, 23], outer-r slot
+    // at depth 3, lying on the grass band). If the ray hits the
+    // OBB, render it directly — short-circuit the UV march. The
+    // body's normal grass cell at this position is REPLACED, not
+    // composited with, so we don't need the t-comparison: any pixel
+    // that hits the OBB is "in" the cartesian-rendered cell.
     let proto = proto_ray_vs_obb(ray_origin, ray_dir, center);
+    if proto.t < 1e20 {
+        return proto_obb_render(ray_origin, ray_dir, center, proto);
+    }
 
     let oc = ray_origin - center;
 
@@ -128,14 +135,5 @@ fn march_uv_sphere(
         last_side = bd.side;
     }
 
-    // PROTOTYPE: if the cartesian-block target was hit, prefer it
-    // when it sits closer than the UV march's hit. The OBB
-    // overrides the UV cell pixel-for-pixel where it occludes;
-    // outside the box the UV rendering is unchanged.
-    if proto.t < 1e20 {
-        if !result.hit || proto.t < result.t {
-            return proto_obb_render(ray_origin, ray_dir, center, proto);
-        }
-    }
     return result;
 }
