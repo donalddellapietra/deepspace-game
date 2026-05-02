@@ -829,10 +829,14 @@ fn march_cartesian(
                 continue;
             }
 
-            // Cartesian Node: depth/LOD check, then descend.
-            // depth_limit = MAX_STACK_DEPTH — LOD controls the
-            // effective depth, not an artificial per-shell budget.
-            let at_max = depth + 1u > depth_limit || depth + 1u >= MAX_STACK_DEPTH;
+            // Cartesian Node: descend until Nyquist (at_lod) terminates.
+            // The depth_limit gate is removed — only the hardware stack
+            // ceiling (MAX_STACK_DEPTH) and the Nyquist pixel test
+            // gate descent. Per user directive: ALL non-Nyquist LOD
+            // gates are removed so deep edits inside uniform-flattened
+            // regions become visible (LOD splatting was masking edits
+            // at depth 22+ as the representative_block).
+            let at_max = depth + 1u >= MAX_STACK_DEPTH;
             let child_cell_size = cur_cell_size / 3.0;
             let cell_world_size = child_cell_size;
             let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
@@ -1234,7 +1238,11 @@ fn make_sphere_hit(
 // Simplified vs `march_cartesian`: no entity dispatch, no X-wrap,
 // no Y-curvature, no walker probe, no LOD termination. Pure tree-
 // structure descent.
-const TANGENT_STACK_DEPTH: u32 = 24u;
+// Bumped to 32 — same as MAX_STACK_DEPTH. Inside the cube the only
+// remaining stopping gate should be the Nyquist (sub-pixel) check,
+// not a hardcoded stack ceiling. Cube interior tree depth depends on
+// `cube_subtree_depth` at worldgen and could exceed 24.
+const TANGENT_STACK_DEPTH: u32 = 32u;
 
 fn march_in_tangent_cube(
     root_node_idx: u32, ray_origin: vec3<f32>, ray_dir: vec3<f32>,

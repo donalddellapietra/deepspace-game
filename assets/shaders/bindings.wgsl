@@ -343,27 +343,16 @@ const MAX_FACE_DEPTH: u32 = 63u;
 
 /// Cartesian DDA stack depth — the hard descent ceiling.
 ///
-/// Sized to the Nyquist-limited descent depth, NOT tree depth.
-/// When a ray ribbon-pops to an ancestor frame, the fresh
-/// `march_cartesian` starts with `depth=0` and must descend
-/// until `cell_size/ray_dist < LOD_PIXEL_THRESHOLD`. The number
-/// of levels that takes is:
-///
-///     ceil(log₃(S_root · H / (2·tan(fov/2) · d_min · τ))) + 1
-///
-/// For 2560×1440 fov≈70° at `d_min ≈ 4.85` world units (the
-/// fractal-presets canonical spawn) this comes out to 7. We
-/// round up to 8 for headroom at closer zooms. Independent of
-/// `tree_depth` — Nyquist prunes before the tree does, so a
-/// `plain_layers = 40` world still only needs ~7 levels to
-/// reach its effective visible horizon.
-///
-/// Per-invocation register cost scales linearly. At 8 the 5
-/// per-fragment DDA stack arrays (~1 KB total) are just at the
-/// Apple Silicon register-file boundary; larger values spill to
-/// threadgroup memory, adding memory latency to every DDA
-/// iteration. See `docs/testing/perf-lod-diagnosis.md`.
-const MAX_STACK_DEPTH: u32 = 8u;
+/// Bumped from 8 to 32 for the rotated-cube prototype: when the
+/// camera is INSIDE a TangentBlock and the GPU pack uniform-flattens
+/// the cube interior, the render frame stays at the cube root. To
+/// reach edits at depth >> 8 inside the cube, the inner DDA needs
+/// stack room to descend further with ONLY the Nyquist gate (LOD
+/// pixel threshold) acting as a stopping rule — no other gates.
+/// Costs ~4× the per-fragment stack array memory; performance
+/// regression on Apple Silicon is acknowledged but the deep-zoom
+/// edit visibility requires it.
+const MAX_STACK_DEPTH: u32 = 32u;
 
 struct HitResult {
     hit: bool,
