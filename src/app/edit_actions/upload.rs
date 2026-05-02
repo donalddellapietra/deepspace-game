@@ -201,24 +201,30 @@ impl App {
         }
 
         // --- Ensure render path is traversible ---
-        // Uniform-flatten may have collapsed path nodes to Block in
-        // the GPU pack. Patch them back to Node so the ribbon can
-        // descend the full intended path without a full repack.
-        let cache = self.cached_tree.as_mut().expect("cached_tree");
-        let path_patched = cache.force_path_traversible(
-            &self.world.library,
-            self.world.root,
-            intended_render_path.as_slice(),
-        );
-        if path_patched {
-            if let Some(renderer) = &mut self.renderer {
-                renderer.update_tree(
-                    &cache.tree,
-                    &cache.node_kinds,
-                    &cache.node_offsets,
-                    &cache.aabbs,
-                    cache.root_bfs_idx,
-                );
+        // The GPU pack may be stale: the camera moved into a region
+        // that was Empty/Block when the pack was built. If the ribbon
+        // can't follow the full intended path, repack the world root
+        // so the pack reflects the current tree at the camera's path.
+        {
+            let cache = self.cached_tree.as_ref().expect("cached_tree");
+            let probe = gpu::build_ribbon(
+                &cache.tree,
+                &cache.node_offsets,
+                cache.root_bfs_idx,
+                intended_render_path.as_slice(),
+            );
+            if probe.reached_slots.len() < intended_render_path.depth() as usize {
+                let cache = self.cached_tree.as_mut().expect("cached_tree");
+                cache.update_root(&self.world.library, self.world.root);
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.update_tree(
+                        &cache.tree,
+                        &cache.node_kinds,
+                        &cache.node_offsets,
+                        &cache.aabbs,
+                        cache.root_bfs_idx,
+                    );
+                }
             }
         }
 
