@@ -167,15 +167,27 @@ pub(crate) fn bootstrap_rotated_cube_world_at_depth(
         anchor.push(slot_index(1, 1, 1) as u8);
     }
     anchor.push(slot_index(1, 1, 2) as u8); // slot 22 = +Z neighbour
-    let spawn_pos = WorldPos::new(anchor, [0.5, 0.5, 0.5]);
+    // Diagonal spawn — three distinct off-centre offsets so the camera
+    // position lies on no slot or face boundary in any axis. Combined
+    // with the yaw / pitch below this guarantees the viewing ray
+    // never coincides with a frame axis, so frame transitions don't
+    // look like the camera rotating into the new frame.
+    let spawn_pos = WorldPos::new(anchor, [0.42, 0.58, 0.71]);
 
     WorldBootstrap {
         world,
         planet_path: None,
         default_spawn_pos: spawn_pos,
-        // yaw=0 is -Z (looking into the screen) per camera.rs basis.
-        default_spawn_yaw: 0.0,
-        default_spawn_pitch: 0.0,
+        // Diagonal yaw + pitch — off-cardinal so the camera's viewing
+        // line is never aligned with any axis of any render frame it
+        // descends into. Frames in this engine are nested and
+        // axis-aligned; a diagonal viewer means there's no frame
+        // transition at which the camera's apparent orientation
+        // discontinuously snaps to a frame axis. Magnitudes kept
+        // small enough that both cubes (at ≈ ±18° from -Z) stay in
+        // frame.
+        default_spawn_yaw: 0.2617994,    // π/12 = 15°
+        default_spawn_pitch: -0.2617994, // -π/12 = -15°
         // `plain_layers = 0` opts out of `--plain-world` surface
         // tracking that would override our spawn anchor.
         plain_layers: 0,
