@@ -1224,16 +1224,22 @@ fn sphere_descend_anchor(
         let sub = march_cartesian(anchor_idx, local_origin, local_dir, MAX_STACK_DEPTH, 0xFFFFFFFFu);
         if !sub.hit { return result; }
 
+        // Bevel must be computed in the LOCAL cube frame: the world
+        // cube is rotated, so main.wgsl's `(hit_world - cell_min) /
+        // cell_size` formula can't recover [0,1] local coords from
+        // axis-aligned cell_min/size. Compute the local-within-cell
+        // here, run the same `cube_face_bevel` Cartesian uses, and
+        // bake it into result.color. Then neutralise cell_min/size
+        // so main.wgsl's secondary bevel multiplier is 1.0.
+        let local_hit = local_origin + local_dir * sub.t;
+        let local_in_cell = clamp((local_hit - sub.cell_min) / sub.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));
+        let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
         // local_t == world_t (the dir scale is absorbed in the
-        // parameterisation). Rotate normal back to world; neutralise
-        // cell_min/cell_size so main.wgsl's cube-face bevel reads
-        // the centre of a unit cube — the local cube is rotated, so
-        // the world-space cell-min/size doesn't have a clean axis-
-        // aligned interpretation here.
+        // parameterisation). Rotate normal back to world for diffuse.
         var out: HitResult;
         out.hit = true;
         out.t = sub.t * inv_norm;
-        out.color = sub.color;
+        out.color = sub.color * (0.7 + 0.3 * local_bevel);
         out.normal = east_w * sub.normal.x + normal_w * sub.normal.y + north_w * sub.normal.z;
         out.frame_level = 0u;
         out.frame_scale = 1.0;
