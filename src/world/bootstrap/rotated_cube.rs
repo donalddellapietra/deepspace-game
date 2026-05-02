@@ -36,12 +36,15 @@ use crate::world::tree::{
 };
 
 /// Default total tree depth for the rotated-cube preset.
-pub const DEFAULT_ROTATED_CUBE_DEPTH: u8 = 30;
-/// Default depth of uniform recursive subtree INSIDE each cube. This
-/// is what makes the world meaningfully "N layers" — without this,
-/// the cubes are 1-cell uniform leaves and zooming in reveals
-/// nothing. Mirrors `wrapped_planet`'s `cell_subtree_depth = 20`.
-pub const DEFAULT_ROTATED_CUBE_SUBTREE_DEPTH: u8 = 20;
+/// 40 layers — pushing past the worst-case f32 precision bound
+/// (~13 levels of descent inside the cube) to test how far the
+/// typical-case math actually holds inside `march_in_tangent_cube`.
+pub const DEFAULT_ROTATED_CUBE_DEPTH: u8 = 40;
+/// Default depth of uniform recursive subtree INSIDE each cube.
+/// Bumped to 30 so the cube has 30 levels of internal structure to
+/// dig through. Both this and the shader's TANGENT_STACK_DEPTH (=32)
+/// must accommodate this depth.
+pub const DEFAULT_ROTATED_CUBE_SUBTREE_DEPTH: u8 = 30;
 
 pub fn rotated_cube_world() -> WorldState {
     rotated_cube_world_at_depth(
