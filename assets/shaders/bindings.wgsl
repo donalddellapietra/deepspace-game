@@ -136,6 +136,7 @@ struct NodeKindGpu {
 const NODE_KIND_CARTESIAN: u32 = 0u;
 const NODE_KIND_WRAPPED_PLANE: u32 = 1u;
 const NODE_KIND_TANGENT_BLOCK: u32 = 2u;
+const NODE_KIND_ROTATED_45Y: u32 = 3u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated
@@ -369,4 +370,12 @@ struct HitResult {
     frame_scale: f32,
     cell_min: vec3<f32>,
     cell_size: f32,
+    /// Hit position in cell-local `[0, 1]³` coords. Computed by the
+    /// walker at hit time using its CURRENT frame state — for hits
+    /// that descended through a `Rotated45Y` boundary, this is in
+    /// the rotated cell's local frame. Caller-side bevel / face
+    /// shading uses this directly, avoiding any reconstruction of a
+    /// world-frame `hit_pos = camera.pos + ray_dir * t` that would
+    /// mix world-frame ray data with the walker's rotated `cell_min`.
+    cell_local: vec3<f32>,
 }

@@ -129,6 +129,7 @@ fn march_entity_subtree(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.cell_local = vec3<f32>(0.5);
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -326,7 +327,7 @@ fn march_entity_subtree(
 // re-enters the same root from the opposite face instead of
 // returning a miss. Y / Z OOB and depth>0 OOB still ribbon-pop.
 fn march_cartesian(
-    root_node_idx: u32, ray_origin_in: vec3<f32>, ray_dir: vec3<f32>,
+    root_node_idx: u32, ray_origin_in: vec3<f32>, ray_dir_in: vec3<f32>,
     depth_limit: u32, skip_slot: u32,
 ) -> HitResult {
     var result: HitResult;
@@ -336,12 +337,16 @@ fn march_cartesian(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.cell_local = vec3<f32>(0.5);
 
-    // Mutable alias of the input ray origin so the X-wrap branch
-    // can translate it. WGSL function parameters are immutable.
+    // Mutable: the X-wrap branch translates `ray_origin`, and a
+    // `Rotated45Y` descent transforms both `ray_origin` and `ray_dir`
+    // into the rotated child's local frame. Each rotated descent
+    // saves the prior ray onto `s_ray_*` so the OOB pop can restore.
     var ray_origin: vec3<f32> = ray_origin_in;
+    var ray_dir: vec3<f32> = ray_dir_in;
 
-    let inv_dir = vec3<f32>(
+    var inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
         select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
@@ -349,15 +354,23 @@ fn march_cartesian(
     // After ribbon pops, ray_dir magnitude shrinks (÷3 per pop).
     // LOD pixel calculations need world-space distances, so scale
     // side_dist by ray_metric to get actual distance.
-    let ray_metric = max(length(ray_dir), 1e-6);
-    let step = vec3<i32>(
+    var ray_metric = max(length(ray_dir), 1e-6);
+    var step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
         select(-1, 1, ray_dir.y >= 0.0),
         select(-1, 1, ray_dir.z >= 0.0),
     );
-    let delta_dist = abs(inv_dir);
+    var delta_dist = abs(inv_dir);
 
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
+    // Saved ray + frame-origin per stack depth. Pushed BEFORE any
+    // rotated-descent transform so the OOB pop can restore the
+    // parent's ray + node origin verbatim — no inverse-T arithmetic
+    // needed, and Cartesian-only descents cost three writes that
+    // round-trip the same vec3.
+    var s_ray_origin: array<vec3<f32>, MAX_STACK_DEPTH>;
+    var s_ray_dir: array<vec3<f32>, MAX_STACK_DEPTH>;
+    var s_node_origin: array<vec3<f32>, MAX_STACK_DEPTH>;
     // Packed per-depth cell coords, 32 B total (vs 96 B for the
     // pre-pack vec3<i32>×8). See pack_cell / unpack_cell above.
     var s_cell: array<u32, MAX_STACK_DEPTH>;
@@ -405,6 +418,9 @@ fn march_cartesian(
     var depth: u32 = 0u;
 
     s_node_idx[0] = root_node_idx;
+    s_ray_origin[0] = ray_origin;
+    s_ray_dir[0] = ray_dir;
+    s_node_origin[0] = vec3<f32>(0.0);
 
     // Interleaved-layout header for the CURRENT depth, cached in
     // scalar registers. Written on entry, refreshed on descend AND
@@ -538,12 +554,34 @@ fn march_cartesian(
             depth -= 1u;
             cur_cell_size = cur_cell_size * 3.0;
             let parent_cell = unpack_cell(s_cell[depth]);
-            cur_node_origin = cur_node_origin - vec3<f32>(parent_cell) * cur_cell_size;
+            // Restore parent-frame ray + node origin from the stack.
+            // For Cartesian descents this is a verbatim round-trip;
+            // for `Rotated45Y` descents the parent's pre-T ray is
+            // recovered exactly — no inverse-T arithmetic needed.
+            ray_origin = s_ray_origin[depth];
+            ray_dir = s_ray_dir[depth];
+            cur_node_origin = s_node_origin[depth];
+            inv_dir = vec3<f32>(
+                select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+                select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+                select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+            );
+            ray_metric = max(length(ray_dir), 1e-6);
+            step = vec3<i32>(
+                select(-1, 1, ray_dir.x >= 0.0),
+                select(-1, 1, ray_dir.y >= 0.0),
+                select(-1, 1, ray_dir.z >= 0.0),
+            );
+            delta_dist = abs(inv_dir);
+            // Re-anchor `entry_pos` onto the restored ray. The DDA
+            // uses it as a reference point for side_dist; placing it
+            // on the [0, 3)³ box entry of the restored frame keeps
+            // initial side_dist values non-negative and consistent
+            // with the descent-time init below.
+            let pop_box = ray_box(ray_origin, inv_dir, vec3<f32>(0.0), vec3<f32>(3.0));
+            let pop_t_start = max(pop_box.t_enter, 0.0) + 0.001;
+            entry_pos = ray_origin + ray_dir * pop_t_start;
             let lc_pop = vec3<f32>(parent_cell);
-            // Y-axis side_dist references the parent's stored bend
-            // (popped depth = `depth` after the decrement above).
-            // Drop is 0.0 at depth 0, so popping to root recovers the
-            // un-bent crossings byte-for-byte.
             let bent_entry_y_p = entry_pos.y - s_y_drop[depth];
             cur_side_dist = vec3<f32>(
                 select((cur_node_origin.x + lc_pop.x * cur_cell_size - entry_pos.x) * inv_dir.x,
@@ -610,6 +648,17 @@ fn march_cartesian(
             result.normal = normal;
             result.cell_min = cell_min_h;
             result.cell_size = cur_cell_size;
+            // `cell_local` in walker's CURRENT frame — for hits that
+            // descended through `Rotated45Y`, this is in the rotated
+            // cell's local coords. Computed here so the caller never
+            // has to know whether the hit happened in a rotated
+            // subtree (would otherwise mix world ray with rotated
+            // cell_min when reconstructing `hit_pos`).
+            let hit_pos_h = ray_origin + ray_dir * result.t;
+            result.cell_local = clamp(
+                (hit_pos_h - cell_min_h) / cur_cell_size,
+                vec3<f32>(0.0), vec3<f32>(1.0),
+            );
             // Walker probe (tag==1 hit). Curvature offset is the
             // parabolic-drop value the bend math WOULD apply at this
             // hit's t — `result.t² · A`. Computed but NOT yet applied
@@ -787,6 +836,11 @@ fn march_cartesian(
                     result.normal = normal;
                     result.cell_min = cell_min_l;
                     result.cell_size = cur_cell_size;
+                    let hit_pos_l = ray_origin + ray_dir * result.t;
+                    result.cell_local = clamp(
+                        (hit_pos_l - cell_min_l) / cur_cell_size,
+                        vec3<f32>(0.0), vec3<f32>(1.0),
+                    );
                     return result;
                 }
             } else {
@@ -947,6 +1001,60 @@ fn march_cartesian(
                 s_y_drop[depth] = curvature_drop;
                 cur_node_origin = child_origin;
                 cur_cell_size = child_cell_size;
+                // Per-descent rotation: read the child's NodeKind and,
+                // if it carries a rotation (currently only `Rotated45Y`),
+                // transform `ray_origin` / `ray_dir` into the rotated
+                // local frame. Cartesian descents skip this entirely —
+                // one branch on data, no shadow code path. After the
+                // transform the rotated child fills `[0, parent_cell_size]³`
+                // axis-aligned in its local frame, so `cur_node_origin`
+                // resets to (0, 0, 0); `cur_cell_size` keeps its
+                // already-divided value because the local-frame metric
+                // matches parent-frame size.
+                let child_kind = node_kinds[child_idx].kind;
+                if ENABLE_STATS { ray_loads_kinds = ray_loads_kinds + 1u; }
+                if child_kind == NODE_KIND_ROTATED_45Y {
+                    let parent_cell_size_local = cur_cell_size * 3.0;
+                    let cell_center = child_origin + vec3<f32>(parent_cell_size_local * 0.5);
+                    let pc = ray_origin - cell_center;
+                    let pc_t = vec3<f32>(pc.x - pc.z, pc.y, pc.x + pc.z);
+                    let dc_t = vec3<f32>(
+                        ray_dir.x - ray_dir.z, ray_dir.y, ray_dir.x + ray_dir.z,
+                    );
+                    ray_origin = pc_t + vec3<f32>(parent_cell_size_local * 0.5);
+                    ray_dir = dc_t;
+                    inv_dir = vec3<f32>(
+                        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+                        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+                        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+                    );
+                    ray_metric = max(length(ray_dir), 1e-6);
+                    step = vec3<i32>(
+                        select(-1, 1, ray_dir.x >= 0.0),
+                        select(-1, 1, ray_dir.y >= 0.0),
+                        select(-1, 1, ray_dir.z >= 0.0),
+                    );
+                    delta_dist = abs(inv_dir);
+                    cur_node_origin = vec3<f32>(0.0);
+                    // Re-anchor entry_pos onto the rotated ray and the
+                    // rotated child's box `[0, parent_cell_size]³`. The
+                    // descent-time side_dist init below uses the new
+                    // entry_pos as the reference point, exactly mirroring
+                    // the X-wrap and root paths.
+                    let r_box = ray_box(
+                        ray_origin, inv_dir,
+                        vec3<f32>(0.0), vec3<f32>(parent_cell_size_local),
+                    );
+                    let r_t_start = max(r_box.t_enter, 0.0) + 0.001 * cur_cell_size;
+                    entry_pos = ray_origin + ray_dir * r_t_start;
+                }
+                // Save post-transform state so the OOB pop restores
+                // exactly the ray that's valid AT this new depth — for
+                // Cartesian descents that's the parent's ray verbatim,
+                // for rotated descents it's the T-transformed ray.
+                s_ray_origin[depth] = ray_origin;
+                s_ray_dir[depth] = ray_dir;
+                s_node_origin[depth] = cur_node_origin;
                 // Load the new current-depth header into scalar
                 // registers so the inner loop never re-reads tree[]
                 // headers. `node_offsets` is the only per-descent
@@ -959,10 +1067,15 @@ fn march_cartesian(
                     ray_loads_offsets = ray_loads_offsets + 1u;
                     ray_loads_tree = ray_loads_tree + 2u;
                 }
+                // Recompute `local_entry` for the (possibly rotated)
+                // ray. For Cartesian descents this is byte-identical
+                // to the descent-block value above; for `Rotated45Y`
+                // it points into the rotated child's local frame.
+                let entry_in_child = (entry_pos - cur_node_origin) / child_cell_size;
                 let new_cell = vec3<i32>(
-                    clamp(i32(floor(local_entry.x)), 0, 2),
-                    clamp(i32(floor(local_entry.y)), 0, 2),
-                    clamp(i32(floor(local_entry.z)), 0, 2),
+                    clamp(i32(floor(entry_in_child.x)), 0, 2),
+                    clamp(i32(floor(entry_in_child.y)), 0, 2),
+                    clamp(i32(floor(entry_in_child.z)), 0, 2),
                 );
                 s_cell[depth] = pack_cell(new_cell);
                 let lc = vec3<f32>(new_cell);
@@ -982,12 +1095,12 @@ fn march_cartesian(
                 // entry_pos because the bend is Y-only.
                 let bent_entry_y_d = entry_pos.y - s_y_drop[depth];
                 cur_side_dist = vec3<f32>(
-                    select((child_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
-                           (child_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-                    select((child_origin.y + lc.y * child_cell_size - bent_entry_y_d) * inv_dir.y,
-                           (child_origin.y + (lc.y + 1.0) * child_cell_size - bent_entry_y_d) * inv_dir.y, ray_dir.y >= 0.0),
-                    select((child_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
-                           (child_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+                    select((cur_node_origin.x + lc.x * child_cell_size - entry_pos.x) * inv_dir.x,
+                           (cur_node_origin.x + (lc.x + 1.0) * child_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                    select((cur_node_origin.y + lc.y * child_cell_size - bent_entry_y_d) * inv_dir.y,
+                           (cur_node_origin.y + (lc.y + 1.0) * child_cell_size - bent_entry_y_d) * inv_dir.y, ray_dir.y >= 0.0),
+                    select((cur_node_origin.z + lc.z * child_cell_size - entry_pos.z) * inv_dir.z,
+                           (cur_node_origin.z + (lc.z + 1.0) * child_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
                 );
             }
         }
@@ -1137,6 +1250,7 @@ fn make_sphere_hit(
     // Neutralize main.wgsl::cube_face_bevel — see slab DDA hit comment.
     result.cell_min = pos - vec3<f32>(0.5);
     result.cell_size = 1.0;
+    result.cell_local = vec3<f32>(0.5);
     return result;
 }
 
@@ -1168,6 +1282,7 @@ fn march_in_tangent_cube(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.cell_local = vec3<f32>(0.5);
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -1401,6 +1516,7 @@ fn sphere_descend_anchor(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.cell_local = vec3<f32>(0.5);
 
     // TangentBlock dispatch: when the slab cell anchor is itself a
     // TangentBlock, transform the world ray into the cell's local
@@ -1728,6 +1844,7 @@ fn sphere_uv_in_cell(
     result.frame_scale = 1.0;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.cell_local = vec3<f32>(0.5);
 
     // Quadratic discriminant assumes unit ray_dir; the marcher
     // passes camera.forward + right·ndc + up·ndc which isn't unit.
@@ -2034,5 +2151,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     result.frame_scale = cur_scale;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
+    result.cell_local = vec3<f32>(0.5);
     return result;
 }
