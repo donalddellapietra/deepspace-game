@@ -135,6 +135,14 @@ impl App {
             .map(|r| r.entity_render_mode() == EntityRenderMode::Raster)
             .unwrap_or(false);
         let intended_render_path = intended_frame.render_path;
+        if self.startup_profile_frames < 8 {
+            eprintln!(
+                "upload_tree_lod intended_render_path={:?} intended_logical={:?} tb_center={:?}",
+                intended_render_path.as_slice(),
+                intended_frame.logical_path.as_slice(),
+                intended_frame.tb_center,
+            );
+        }
         let mut entity_paths: Vec<EntityPath> =
             Vec::with_capacity(self.entities.len());
         if !raster_mode {
@@ -211,6 +219,14 @@ impl App {
         );
         let ribbon_elapsed = ribbon_start.elapsed();
         self.last_ribbon_len = r.ribbon.len() as u32;
+        if self.startup_profile_frames < 8 {
+            eprintln!(
+                "upload_tree_lod ribbon reached_slots={:?} intended={:?} ribbon_len={}",
+                r.reached_slots,
+                intended_render_path.as_slice(),
+                r.ribbon.len(),
+            );
+        }
 
         // --- Frame root: SCENE at terrain's reached depth ---
         // Walk scene_root down the ribbon's reached slot path to
