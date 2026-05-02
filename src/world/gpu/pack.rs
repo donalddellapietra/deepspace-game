@@ -185,6 +185,55 @@ impl CachedTree {
         bfs
     }
 
+    /// Ensure every node along `path_slots` is packed as tag=2 (Node)
+    /// in its parent's slab so `build_ribbon` can traverse the full
+    /// path. Uniform-flatten may have collapsed path nodes to tag=1;
+    /// this patches them back to tag=2 with the correct BFS idx.
+    /// Returns true if any slab entry was patched (caller should
+    /// re-upload the tree buffer).
+    pub fn force_path_traversible(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        path_slots: &[u8],
+    ) -> bool {
+        let mut patched = false;
+        let mut parent_bfs = self.root_bfs_idx;
+        let mut node_id = world_root;
+        for &slot in path_slots {
+            let node = match library.get(node_id) {
+                Some(n) => n,
+                None => break,
+            };
+            let child_id = match node.children[slot as usize] {
+                Child::Node(id) => id,
+                _ => break,
+            };
+            let header_off = self.node_offsets[parent_bfs as usize] as usize;
+            let occupancy = self.tree[header_off];
+            let bit = 1u32 << slot;
+            if occupancy & bit == 0 {
+                break;
+            }
+            let rank = (occupancy & (bit - 1)).count_ones() as usize;
+            let first_child = self.tree[header_off + 1] as usize;
+            let entry_off = first_child + rank * 2;
+            let packed_word = self.tree[entry_off];
+            let tag = packed_word & 0xFF;
+            if tag == 2 {
+                parent_bfs = self.tree[entry_off + 1];
+            } else {
+                let child_bfs = self.emit_or_lookup(library, child_id);
+                self.tree[entry_off] = (packed_word & !0xFF) | 2;
+                self.tree[entry_off + 1] = child_bfs;
+                parent_bfs = child_bfs;
+                patched = true;
+            }
+            node_id = child_id;
+        }
+        patched
+    }
+
     /// Build the `GpuChild` for one slot of a parent's children slab.
     /// Applies content-driven uniform-flatten (Cartesian only) so
     /// uniform subtrees collapse to a single Block. Non-uniform
