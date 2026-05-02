@@ -128,6 +128,24 @@ pub fn compute_render_frame(
                         kind = ActiveFrameKind::SphereSubFrame(range);
                     }
                 }
+                // Hybrid prototype: when the descent enters the proto
+                // target cell's subtree (= [13,13,9,2,22, ...]),
+                // upgrade kind to Cartesian. The renderer then
+                // dispatches march_cartesian on the deep render
+                // frame, and gpu_camera_for_frame computes
+                // camera-in-frame with a SHORT walk (= bounded f32 =
+                // no jitter). Sphere-mode camera ABOVE the planet
+                // doesn't enter this branch — its anchor path goes
+                // through Empty WP children, descent stops at WP.
+                // But once the camera is inside the proto cell's
+                // subtree, the precision-stable Cartesian frame
+                // takes over.
+                let proto_cell_path: [u8; 5] = [13, 13, 9, 2, 22];
+                if reached.depth() as usize >= proto_cell_path.len()
+                    && reached.as_slice()[..proto_cell_path.len()] == proto_cell_path
+                {
+                    kind = ActiveFrameKind::Cartesian;
+                }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => {
                 stopped_early = true;
