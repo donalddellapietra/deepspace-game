@@ -67,25 +67,8 @@ fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
 
     var color: vec3<f32>;
     if result.hit {
-        // Rotate the hit normal from render-frame to world frame.
-        // Identity for OUTSIDE-the-cube views (camera path passes
-        // through no TangentBlock); the cube's quaternion when the
-        // camera is INSIDE. The march_cartesian TangentBlock dispatch
-        // already returns world-frame normals for the OUTSIDE case
-        // (rotated back via the cube basis), so applying identity
-        // here is a no-op for that path. For the INSIDE case, the
-        // normal coming back is in the cube's local frame; this
-        // rotation lifts it to world so the world-frame sun direction
-        // produces the same lighting on either side of the boundary.
-        let q = camera.frame_rotation;
-        let qv = q.xyz;
-        let qw = q.w;
-        let t1 = cross(qv, result.normal) + qw * result.normal;
-        let t2 = cross(qv, t1);
-        let world_normal = result.normal + 2.0 * t2;
-
         let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
-        let diffuse = max(dot(world_normal, sun_dir), 0.0);
+        let diffuse = max(dot(result.normal, sun_dir), 0.0);
         let ambient = 0.3;
         let hit_pos = camera.pos + ray_dir * result.t;
         let local = clamp((hit_pos - result.cell_min) / result.cell_size, vec3<f32>(0.0), vec3<f32>(1.0));

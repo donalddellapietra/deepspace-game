@@ -181,7 +181,6 @@ impl Renderer {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-            frame_rotation: [0.0, 0.0, 0.0, 1.0],
         };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),

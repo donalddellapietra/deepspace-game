@@ -631,120 +631,24 @@ impl App {
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-
-        // Step B: cumulative rotation of the camera's render frame
-        // relative to world. Walk the camera's anchor path; for every
-        // TangentBlock encountered, multiply its rotation in. Stays
-        // identity for camera anchors that never descend through a
-        // TangentBlock — the OUTSIDE case. When the camera flies
-        // INSIDE a rotated cube, the cube's quaternion is picked up
-        // here, and the camera basis below is rotated INTO the
-        // cube's local frame (R⁻¹) so rays cast inside the cube
-        // travel in cube-local directions; the shader then rotates
-        // hit normals back to world via this same quaternion so
-        // lighting is consistent across the boundary — no snap.
-        let frame_rotation = accumulate_tangent_rotation(
-            &self.world.library,
-            self.world.root,
-            &self.camera.position.anchor,
-        );
-        let inv_rot = quat_inverse(frame_rotation);
-        let fwd_local = quat_rotate(inv_rot, crate::world::sdf::normalize(fwd_world));
-        let right_local = quat_rotate(inv_rot, crate::world::sdf::normalize(right_world));
-        let up_local = quat_rotate(inv_rot, crate::world::sdf::normalize(up_world));
+        let fwd_local = crate::world::sdf::normalize(fwd_world);
+        let right_local = crate::world::sdf::normalize(right_world);
+        let up_local = crate::world::sdf::normalize(up_world);
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?} frame_rot={:?}",
+                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
                 fwd_world,
                 fwd_local,
                 right_local,
                 up_local,
-                frame_rotation,
             );
         }
-        let mut gpu = self.camera.gpu_camera_with_basis(
+        self.camera.gpu_camera_with_basis(
             cam_local,
             fwd_local,
             right_local,
             up_local,
             1.2,
-        );
-        gpu.frame_rotation = frame_rotation;
-        gpu
+        )
     }
-}
-
-/// Walk the camera's anchor path from world root, accumulating the
-/// product of every `TangentBlock` rotation encountered. Identity
-/// when the path passes through no TangentBlocks. Quaternion
-/// multiplication is right-to-left in vector application
-/// convention: a vector in the deepest cube's local frame is
-/// transformed back to world by `cum * v`.
-fn accumulate_tangent_rotation(
-    library: &crate::world::tree::NodeLibrary,
-    root: crate::world::tree::NodeId,
-    anchor: &Path,
-) -> [f32; 4] {
-    let mut cum = [0.0_f32, 0.0, 0.0, 1.0];
-    let mut node_id = root;
-    if let Some(node) = library.get(node_id) {
-        if let NodeKind::TangentBlock { rotation } = node.kind {
-            cum = quat_mul(cum, rotation);
-        }
-    }
-    for slot in anchor.as_slice() {
-        let Some(node) = library.get(node_id) else { break };
-        match node.children[*slot as usize] {
-            crate::world::tree::Child::Node(child_id) => {
-                node_id = child_id;
-                if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::TangentBlock { rotation } = child_node.kind {
-                        cum = quat_mul(cum, rotation);
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
-    cum
-}
-
-/// Hamilton product of two unit quaternions. `quat_mul(a, b)`
-/// represents the rotation "first b, then a" when applied to a
-/// vector: `quat_rotate(quat_mul(a, b), v) == quat_rotate(a, quat_rotate(b, v))`.
-fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    let (ax, ay, az, aw) = (a[0], a[1], a[2], a[3]);
-    let (bx, by, bz, bw) = (b[0], b[1], b[2], b[3]);
-    [
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    ]
-}
-
-/// Inverse of a unit quaternion = its conjugate (negate the
-/// vector part). For non-unit quaternions this would also need a
-/// magnitude divide — we always pass unit quaternions here.
-fn quat_inverse(q: [f32; 4]) -> [f32; 4] {
-    [-q[0], -q[1], -q[2], q[3]]
-}
-
-/// Rotate a 3-vector by a unit quaternion. Uses the standard
-/// `v + 2 * cross(qv, cross(qv, v) + w * v)` form — fewer
-/// operations than `q v q⁻¹` and numerically clean for unit q.
-fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
-    let qv = [q[0], q[1], q[2]];
-    let w = q[3];
-    let t1 = [
-        qv[1] * v[2] - qv[2] * v[1] + w * v[0],
-        qv[2] * v[0] - qv[0] * v[2] + w * v[1],
-        qv[0] * v[1] - qv[1] * v[0] + w * v[2],
-    ];
-    let t2 = [
-        qv[1] * t1[2] - qv[2] * t1[1],
-        qv[2] * t1[0] - qv[0] * t1[2],
-        qv[0] * t1[1] - qv[1] * t1[0],
-    ];
-    [v[0] + 2.0 * t2[0], v[1] + 2.0 * t2[1], v[2] + 2.0 * t2[2]]
 }
