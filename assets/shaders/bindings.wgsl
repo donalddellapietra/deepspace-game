@@ -96,6 +96,20 @@ struct Uniforms {
     /// (lat_max for poles is `.y`; later: shell inner_radius for
     /// radial-depth marching).
     planet_render: vec4<f32>,
+    /// Columns of the orthonormal rotation matrix `M` applied at
+    /// `NodeKind::TangentBlock` descent. `M` maps rotated-frame
+    /// vectors back to the parent frame:
+    ///   `M * v_rotated = v_parent`  → use the column-form
+    ///                                  `col0*v.x + col1*v.y + col2*v.z`
+    ///   `Mᵀ * v_parent = v_rotated` → use the dot-product form
+    ///                                  `vec3(dot(col0,v), dot(col1,v), dot(col2,v))`
+    /// (orthonormal: Mᵀ = M⁻¹). On push, transform the world ray to
+    /// rotated coords with Mᵀ; on hit, transform local cell_min /
+    /// normal back to world with M. Default identity.
+    /// `.w` lane is std140 padding.
+    tangent_rotation_col0: vec4<f32>,
+    tangent_rotation_col1: vec4<f32>,
+    tangent_rotation_col2: vec4<f32>,
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;

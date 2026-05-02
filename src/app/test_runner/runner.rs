@@ -213,6 +213,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         eprintln!("render_harness: planet-render sphere mode={mode}");
         renderer.set_planet_render_sphere(mode, 1.26);
     }
+    renderer.set_tangent_rotation_columns(app.startup_tangent_rotation_cols);
     renderer.resize(app.harness_width, app.harness_height);
     eprintln!(
         "render_harness: resize width={} height={}",

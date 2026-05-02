@@ -110,6 +110,20 @@ pub struct GpuUniforms {
     /// `.y = lat_max` (radians) — poles past this latitude return
     /// no-hit (banned). `.zw` reserved.
     pub planet_render: [f32; 4],
+    /// Orthonormal rotation matrix applied at descent into any
+    /// `NodeKind::TangentBlock` child. Stored as **columns** of the
+    /// rotation matrix M, where M maps rotated-frame coords back to
+    /// the parent (world) frame:
+    ///     `M * v_rotated = v_parent`
+    ///     `Mᵀ * v_parent = v_rotated`  (orthonormal: Mᵀ = M⁻¹)
+    /// Column 0 = rotated frame's +X axis expressed in parent coords;
+    /// column 1 = +Y axis; column 2 = +Z axis. The shader uses Mᵀ
+    /// (= dot products against the columns) on push and M (= column-
+    /// scaled sums) on hit. Default identity = no rotation. The
+    /// `.w` lane is std140 padding (unused).
+    pub tangent_rotation_col0: [f32; 4],
+    pub tangent_rotation_col1: [f32; 4],
+    pub tangent_rotation_col2: [f32; 4],
 }
 
 pub struct Renderer {
@@ -253,6 +267,12 @@ pub struct Renderer {
     /// Mirror of `uniforms.planet_render`. `.x` = render mode:
     /// 0 = flat slab DDA, 1 = UV-sphere. `.y` = lat_max (radians).
     pub(super) planet_render: [f32; 4],
+    /// Columns of the rotation matrix applied at TangentBlock descent.
+    /// Identity = no rotation, marcher byte-identical to flat path.
+    /// See the field-level docs on `GpuUniforms` for the convention.
+    pub(super) tangent_rotation_col0: [f32; 4],
+    pub(super) tangent_rotation_col1: [f32; 4],
+    pub(super) tangent_rotation_col2: [f32; 4],
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
@@ -524,6 +544,20 @@ impl Renderer {
     /// frame. `mode = 0` → flat slab DDA (default), `mode = 1` →
     /// sphere intersect + (lon, lat) → cell. `lat_max` is the polar
     /// ban threshold in radians (e.g. 1.26 ≈ 72°).
+    /// Install the rotation applied at descent into any
+    /// `NodeKind::TangentBlock` child. `cols` is column-major: column
+    /// `i` is the rotated frame's +i axis expressed in the parent
+    /// (world) frame. Equivalently, it is column `i` of the rotation
+    /// matrix `M` such that `M * v_rotated = v_parent`. The matrix
+    /// MUST be orthonormal — non-orthonormal matrices break the
+    /// t-parameter invariance the DDA relies on. Pass identity to
+    /// disable.
+    pub fn set_tangent_rotation_columns(&mut self, cols: [[f32; 3]; 3]) {
+        self.tangent_rotation_col0 = [cols[0][0], cols[0][1], cols[0][2], 0.0];
+        self.tangent_rotation_col1 = [cols[1][0], cols[1][1], cols[1][2], 0.0];
+        self.tangent_rotation_col2 = [cols[2][0], cols[2][1], cols[2][2], 0.0];
+    }
+
     pub fn set_planet_render_sphere(&mut self, mode: u32, lat_max_rad: f32) {
         self.planet_render = [mode as f32, lat_max_rad, 0.0, 0.0];
         self.write_uniforms();

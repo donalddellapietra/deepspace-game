@@ -284,6 +284,13 @@ pub struct App {
     /// Phase 3 REVISED Step A.0: enable UV-sphere render of the
     /// WrappedPlane frame. `Some(1)` from `--planet-render-sphere`.
     pub(super) startup_planet_render_sphere: Option<u32>,
+    /// Columns of the rotation matrix to install on the renderer at
+    /// startup (applied at descent into any `NodeKind::TangentBlock`
+    /// child). Identity for everything except `RotatedTest`, which
+    /// installs a non-axis-aligned orthonormal rotation so the test
+    /// exercises arbitrary angles (not a 45° / axis-aligned special
+    /// case).
+    pub(super) startup_tangent_rotation_cols: [[f32; 3]; 3],
     /// Captured args we need in `finish_init`, populated by
     /// `start_init` before the renderer comes online.
     pub(super) pending_init: Option<PendingInit>,
@@ -321,6 +328,39 @@ impl App {
         let shader_stats_enabled = test_cfg.shader_stats;
         let startup_curvature_a = test_cfg.curvature_a;
         let startup_planet_render_sphere = test_cfg.planet_render_sphere;
+        // Test-world rotation: a non-axis-aligned orthonormal matrix
+        // for `RotatedTest` so the test exercises arbitrary rotation
+        // (not a 45° / axis-aligned special case). Identity for
+        // every other preset. Stored as COLUMNS of M, where M maps
+        // rotated-frame vectors back to the parent (world) frame —
+        // so column `i` is the rotated frame's +i axis in world.
+        let startup_tangent_rotation_cols = match &test_cfg.world_preset {
+            crate::world::bootstrap::WorldPreset::RotatedTest => {
+                // M = Rz(15°) · Ry(30°). Both angles arbitrary;
+                // composed so no resulting basis vector is parallel
+                // to any world axis. Columns of M are extracted from
+                // the row-major product:
+                //   row0 = (cz·cy, -sz, cz·sy)
+                //   row1 = (sz·cy,  cz, sz·sy)
+                //   row2 = (  -sy, 0.0,    cy)
+                // → columns (= rotated frame's axes in world):
+                //   col0 = (cz·cy, sz·cy, -sy)   (+X axis)
+                //   col1 = (  -sz,    cz, 0.0)   (+Y axis)
+                //   col2 = (cz·sy, sz·sy,  cy)   (+Z axis)
+                let (sy, cy) = (30.0_f32).to_radians().sin_cos();
+                let (sz, cz) = (15.0_f32).to_radians().sin_cos();
+                [
+                    [ cz * cy,  sz * cy, -sy ],   // col 0 (rotated +X in world)
+                    [ -sz,      cz,      0.0 ],   // col 1 (rotated +Y in world)
+                    [ cz * sy,  sz * sy,  cy ],   // col 2 (rotated +Z in world)
+                ]
+            }
+            _ => [
+                [1.0, 0.0, 0.0],   // identity
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        };
         // Nyquist floor: sub-pixel rejection only. This is the
         // sole visual LOD gate; the stack depth (MAX_STACK_DEPTH
         // in the shader) is the hard ceiling.
@@ -484,6 +524,7 @@ impl App {
             pending_init: None,
             startup_curvature_a,
             startup_planet_render_sphere,
+            startup_tangent_rotation_cols,
         };
         if let Some(ref path) = spawn_entity_path {
             let count = spawn_entity_count.max(1);

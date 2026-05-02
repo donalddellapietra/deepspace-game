@@ -318,6 +318,9 @@ impl Renderer {
             probe_pixel: self.probe_pixel,
             curvature: self.curvature,
             planet_render: self.planet_render,
+            tangent_rotation_col0: self.tangent_rotation_col0,
+            tangent_rotation_col1: self.tangent_rotation_col1,
+            tangent_rotation_col2: self.tangent_rotation_col2,
         };
         self.queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

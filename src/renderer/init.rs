@@ -223,6 +223,9 @@ impl Renderer {
             probe_pixel: [0; 4],
             curvature: [0.0; 4],
             planet_render: [0.0; 4],
+            tangent_rotation_col0: [1.0, 0.0, 0.0, 0.0],
+            tangent_rotation_col1: [0.0, 1.0, 0.0, 0.0],
+            tangent_rotation_col2: [0.0, 0.0, 1.0, 0.0],
         };
 
         // Initial ribbon buffer is empty (just a stub of zero
@@ -667,6 +670,9 @@ impl Renderer {
             debug_mode: [0; 4],
             curvature: [0.0; 4],
             planet_render: [0.0; 4],
+            tangent_rotation_col0: [1.0, 0.0, 0.0, 0.0],
+            tangent_rotation_col1: [0.0, 1.0, 0.0, 0.0],
+            tangent_rotation_col2: [0.0, 0.0, 1.0, 0.0],
             shader_stats_enabled,
             live_frame_counter: 0,
             live_sample_every_frames,
