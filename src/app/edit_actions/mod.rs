@@ -90,8 +90,19 @@ impl App {
             }
             ActiveFrameKind::Cartesian => {
                 let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
+                let mut cam_local = self.camera.position.in_frame(&frame_path);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let tbc = self.active_frame.tb_center;
+                if tbc[0] != 0.0 || tbc[1] != 0.0 || tbc[2] != 0.0 {
+                    if let Some(rot) = self.find_frame_path_tb_rotation() {
+                        let c = [cam_local[0]-tbc[0], cam_local[1]-tbc[1], cam_local[2]-tbc[2]];
+                        cam_local = [
+                            tbc[0] + rot[0][0]*c[0]+rot[0][1]*c[1]+rot[0][2]*c[2],
+                            tbc[1] + rot[1][0]*c[0]+rot[1][1]*c[1]+rot[1][2]*c[2],
+                            tbc[2] + rot[2][0]*c[0]+rot[2][1]*c[1]+rot[2][2]*c[2],
+                        ];
+                    }
+                }
                 let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,
                     self.world.root,
@@ -224,6 +235,27 @@ impl App {
             }
         }
         out
+    }
+
+    fn find_frame_path_tb_rotation(&self) -> Option<[[f32; 3]; 3]> {
+        use crate::world::tree::{Child, NodeKind};
+        let mut node = self.world.root;
+        for k in 0..self.active_frame.render_path.depth() as usize {
+            let slot = self.active_frame.render_path.slot(k) as usize;
+            let n = self.world.library.get(node)?;
+            match n.children[slot] {
+                Child::Node(child_id) => {
+                    if let Some(child) = self.world.library.get(child_id) {
+                        if let NodeKind::TangentBlock { rotation } = child.kind {
+                            return Some(rotation);
+                        }
+                    }
+                    node = child_id;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn debug_hit_terminal(&self, hit: &raycast::HitInfo) -> String {

@@ -76,7 +76,7 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    pub _pad_radii: [f32; 4],
+    pub frame_tb_center: [f32; 4],
     /// `WrappedPlane` slab dimensions: `(dims_x, dims_y, dims_z,
     /// slab_depth)`. Populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`; the shader's X-wrap branch reads
@@ -162,6 +162,7 @@ pub struct Renderer {
     /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
     /// shader's X-wrap branch reads the X and W lanes.
     pub(super) slab_dims: [u32; 4],
+    pub(super) frame_tb_center: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -321,6 +322,10 @@ impl Renderer {
     /// Set the frame-root NodeKind to Cartesian. Clears
     /// `slab_dims` so the X-wrap branch in the shader can't fire
     /// from a stale upload.
+    pub fn set_frame_tb_center(&mut self, c: [f32; 3]) {
+        self.frame_tb_center = [c[0], c[1], c[2], 0.0];
+    }
+
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.slab_dims = [0; 4];

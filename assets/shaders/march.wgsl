@@ -1580,6 +1580,31 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
 
+    // Frame-entry R^T: when the frame path crossed a TangentBlock,
+    // rotate the ray position around frame_tb_center so inside
+    // matches the outside TB dispatch's full R^T.
+    let ftbc = uniforms.frame_tb_center.xyz;
+    if ftbc.x != 0.0 || ftbc.y != 0.0 || ftbc.z != 0.0 {
+        var tb_idx = current_idx;
+        if node_kinds[current_idx].kind != NODE_KIND_TANGENT_BLOCK {
+            for (var ri = 0u; ri < uniforms.ribbon_count; ri = ri + 1u) {
+                if node_kinds[ribbon[ri].child_bfs].kind == NODE_KIND_TANGENT_BLOCK {
+                    tb_idx = ribbon[ri].child_bfs;
+                    break;
+                }
+            }
+        }
+        let rc0 = node_kinds[tb_idx].rot_col0.xyz;
+        let rc1 = node_kinds[tb_idx].rot_col1.xyz;
+        let rc2 = node_kinds[tb_idx].rot_col2.xyz;
+        let centered = ray_origin - ftbc;
+        ray_origin = ftbc + vec3<f32>(
+            dot(rc0, centered),
+            dot(rc1, centered),
+            dot(rc2, centered),
+        );
+    }
+
     // skip_slot: after a ribbon pop, the slot index (in the parent)
     // of the child we just left. march_cartesian skips this slot at
     // depth 0 to avoid re-entering the subtree already traversed by
@@ -1665,10 +1690,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             let rc0 = node_kinds[entry.child_bfs].rot_col0.xyz;
             let rc1 = node_kinds[entry.child_bfs].rot_col1.xyz;
             let rc2 = node_kinds[entry.child_bfs].rot_col2.xyz;
-            // Direction-only: position pops Cartesian (no rotation),
-            // direction rotated by R (forward) to undo the R^T that
-            // was applied on entry.
-            ray_origin = slot_off + ray_origin / 3.0;
+            // Undo full R^T around [1.5,1.5,1.5]. Cartesian pops
+            // below the TB shift the center back here naturally.
+            let centered = ray_origin - vec3<f32>(1.5);
+            let rotated = rc0 * centered.x + rc1 * centered.y + rc2 * centered.z;
+            ray_origin = slot_off + (rotated + vec3<f32>(1.5)) / 3.0;
             ray_dir = rc0 * ray_dir.x + rc1 * ray_dir.y + rc2 * ray_dir.z;
         } else {
             ray_origin = slot_off + ray_origin / 3.0;
