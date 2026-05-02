@@ -540,6 +540,112 @@ fn render_cell_as_tangent_cube(
     return result;
 }
 
+// Hybrid prototype v1: render a cell's subtree as a CARTESIAN
+// voxel grid in the cell's tangent-plane local frame. The cell
+// occupies an OBB on the sphere surface (basis = lon-tan, lat-tan,
+// -radial; extents from cell's lat/lon/r ranges). The ray is
+// transformed into cell-local [0, 3)³ coords and `march_cartesian`
+// walks the subtree with bounded magnitudes — no f32 ULP wall no
+// matter how deep the subtree gets.
+//
+// Returns hit=false on OBB miss OR cartesian-walker miss; the
+// caller falls through to spherical descent in those cases.
+fn cartesian_voxels_in_cell(
+    sub_node_idx: u32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    inv_norm: f32,
+    cs_center: vec3<f32>,
+    lat_lo: f32, lat_hi: f32,
+    lon_lo: f32, lon_hi: f32,
+    r_lo: f32, r_hi: f32,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    // Cell's tangent-plane OBB (same basis as render_cell_as_tangent_cube).
+    let lat_c = (lat_lo + lat_hi) * 0.5;
+    let lon_c = (lon_lo + lon_hi) * 0.5;
+    let cl = cos(lat_c); let sl = sin(lat_c);
+    let co = cos(lon_c); let so = sin(lon_c);
+    let radial = vec3<f32>(cl * co, sl, cl * so);
+    let u_axis = vec3<f32>(-so, 0.0, co);
+    let v_axis = vec3<f32>(-sl * co, cl, -sl * so);
+    let w_axis = -radial;
+    let center = cs_center + (r_lo + r_hi) * 0.5 * radial;
+    let half_v3 = vec3<f32>(
+        (lon_hi - lon_lo) * r_hi * cl * 0.5,
+        (lat_hi - lat_lo) * r_hi * 0.5,
+        (r_hi   - r_lo)   * 0.5,
+    );
+
+    // Transform ray to OBB-local (rotated, centered).
+    let to_origin = ray_origin - center;
+    let pos_l = vec3<f32>(
+        dot(to_origin, u_axis),
+        dot(to_origin, v_axis),
+        dot(to_origin, w_axis),
+    );
+    let dir_l = vec3<f32>(
+        dot(ray_dir, u_axis),
+        dot(ray_dir, v_axis),
+        dot(ray_dir, w_axis),
+    );
+
+    // Ray-AABB on the OBB to verify the ray actually enters the
+    // cell. If not, return miss so the caller can fall through.
+    let inv_dir_l = vec3<f32>(
+        select(1e10, 1.0/dir_l.x, abs(dir_l.x) > 1e-8),
+        select(1e10, 1.0/dir_l.y, abs(dir_l.y) > 1e-8),
+        select(1e10, 1.0/dir_l.z, abs(dir_l.z) > 1e-8),
+    );
+    let t1 = (-half_v3 - pos_l) * inv_dir_l;
+    let t2 = ( half_v3 - pos_l) * inv_dir_l;
+    let t_min = min(t1, t2);
+    let t_max = max(t1, t2);
+    let t_obb_enter = max(max(t_min.x, t_min.y), t_min.z);
+    let t_obb_exit  = min(min(t_max.x, t_max.y), t_max.z);
+    if t_obb_enter > t_obb_exit || t_obb_exit <= 0.0 { return result; }
+
+    // Transform ray to cell-local [0, 3)³ frame. Each cell-local
+    // unit corresponds to `2 * half / 3` world meters along each
+    // OBB axis. Sharing the t parameter with world (P_3(t) =
+    // pos_3 + t * dir_3 corresponds to P_world(t) = O_world +
+    // t * ray_dir): pos_3 = (pos_l + half) * 3 / (2*half), and
+    // dir_3 = dir_l * 3 / (2*half).
+    let scale_to_3 = vec3<f32>(3.0) / (2.0 * half_v3);
+    let pos_3 = (pos_l + half_v3) * scale_to_3;
+    let dir_3 = dir_l * scale_to_3;
+
+    let cart_hit = march_cartesian(
+        sub_node_idx, pos_3, dir_3,
+        MAX_STACK_DEPTH, 0xFFFFFFFFu,
+    );
+    if !cart_hit.hit { return result; }
+
+    // Convert cell-local axis-aligned hit normal back to world
+    // basis: each axis of the cell-local frame maps to one of the
+    // OBB's basis vectors.
+    let n_world = u_axis * cart_hit.normal.x
+                + v_axis * cart_hit.normal.y
+                + w_axis * cart_hit.normal.z;
+
+    result.hit = true;
+    result.t = cart_hit.t * inv_norm;
+    result.normal = n_world;
+    // Tint reddish so the prototype cell stands out from the
+    // surrounding green sphere cells.
+    result.color = cart_hit.color * vec3<f32>(1.5, 0.6, 0.6);
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+    return result;
+}
+
 fn sphere_uv_in_cell(
     body_idx: u32,
     body_origin: vec3<f32>,
@@ -657,6 +763,36 @@ fn sphere_uv_in_cell(
             // shifting keeps cells at "normal voxel size" relative to
             // the camera).
             if sample.tag == 2u {
+                // Hybrid prototype v1: when this cell's subtree is
+                // the proto target AND has been broken (tag=2 = non-
+                // uniform), dispatch a Cartesian DDA on the subtree
+                // in the cell's tangent-plane local [0, 3)³ frame
+                // instead of the spherical descent. The Cartesian
+                // walker has bounded ray-pos magnitudes inside the
+                // OBB so it doesn't trip the f32 ULP wall — this is
+                // the precision claim the hybrid architecture is
+                // built on.
+                let proto_enabled = uniforms.proto_target_cell.x != 0u;
+                let is_proto = proto_enabled
+                    && lat_lo >= uniforms.proto_target_lat_lon.x - 1e-5
+                    && lat_hi <= uniforms.proto_target_lat_lon.y + 1e-5
+                    && lon_lo >= uniforms.proto_target_lat_lon.z - 1e-5
+                    && lon_hi <= uniforms.proto_target_lat_lon.w + 1e-5
+                    && r_lo   >= uniforms.proto_target_r.x       - 1e-5
+                    && r_hi   <= uniforms.proto_target_r.y       + 1e-5;
+                if is_proto {
+                    let proto_hit = cartesian_voxels_in_cell(
+                        sample.child_idx,
+                        ray_origin, ray_dir, inv_norm,
+                        cs_center,
+                        lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
+                    );
+                    if proto_hit.hit { return proto_hit; }
+                    // OBB miss / cartesian miss — fall through to
+                    // sphere descent for this cell (handles grazing
+                    // rays at OBB edges where the OBB doesn't quite
+                    // cover the spherical cell segment).
+                }
                 let sub = sphere_descend_anchor(
                     sample.child_idx,
                     ray_origin, ray_dir,
