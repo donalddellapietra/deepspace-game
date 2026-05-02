@@ -3,3 +3,4 @@
 //! position) match the WGSL marcher's `sphere_uv_in_cell`.
 
 pub mod tangent;
+pub mod uv_lens;
