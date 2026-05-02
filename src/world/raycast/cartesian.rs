@@ -169,17 +169,13 @@ pub(super) fn cpu_raycast_inner(
                         ray_dir[1] * scale,
                         ray_dir[2] * scale,
                     ];
-                    let tb_scale = super::inscribed_cube_scale(&rotation);
-                    let centered = [lp_origin[0] - 1.5, lp_origin[1] - 1.5, lp_origin[2] - 1.5];
-                    let local_origin = [
-                        1.5 + (rotation[0][0]*centered[0] + rotation[0][1]*centered[1] + rotation[0][2]*centered[2]) / tb_scale,
-                        1.5 + (rotation[1][0]*centered[0] + rotation[1][1]*centered[1] + rotation[1][2]*centered[2]) / tb_scale,
-                        1.5 + (rotation[2][0]*centered[0] + rotation[2][1]*centered[1] + rotation[2][2]*centered[2]) / tb_scale,
-                    ];
+                    // Direction-only R^T: position stays unrotated
+                    // (matches the tree's native slot layout).
+                    let local_origin = lp_origin;
                     let local_dir = [
-                        (rotation[0][0]*lp_dir[0] + rotation[0][1]*lp_dir[1] + rotation[0][2]*lp_dir[2]) / tb_scale,
-                        (rotation[1][0]*lp_dir[0] + rotation[1][1]*lp_dir[1] + rotation[1][2]*lp_dir[2]) / tb_scale,
-                        (rotation[2][0]*lp_dir[0] + rotation[2][1]*lp_dir[1] + rotation[2][2]*lp_dir[2]) / tb_scale,
+                        rotation[0][0] * lp_dir[0] + rotation[0][1] * lp_dir[1] + rotation[0][2] * lp_dir[2],
+                        rotation[1][0] * lp_dir[0] + rotation[1][1] * lp_dir[1] + rotation[1][2] * lp_dir[2],
+                        rotation[2][0] * lp_dir[0] + rotation[2][1] * lp_dir[1] + rotation[2][2] * lp_dir[2],
                     ];
                     let sub_max_depth = max_depth.saturating_sub(depth as u32 + 1);
                     if let Some(sub_hit) = cpu_raycast_inner(
