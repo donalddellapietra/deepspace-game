@@ -76,7 +76,17 @@ impl App {
         // layer, not what the camera renders. See `RENDER_ANCHOR_DEPTH`.
         let frame = self.render_frame();
         let mut frame = frame;
+        // Pull back the frame when the camera doesn't fit / the frame
+        // projects below 1 pixel. NEVER pull back past a UvSphereBody:
+        // collapsing to the world-root cartesian frame switches the
+        // shader from `march_uv_sphere` to `march_cartesian`'s 3³
+        // box-walk, and the camera sees the world-root cell as a
+        // cubic room around itself — visually a hard mode-switch
+        // mid-zoom that the user reports as "transition to another
+        // broken view." The body frame is always rendered by the UV
+        // marcher; we keep it that way.
         while frame.render_path.depth() > 0
+            && !matches!(frame.kind, ActiveFrameKind::UvSphereBody { .. })
             && (!self.camera_fits_frame(&frame)
                 || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)
         {
