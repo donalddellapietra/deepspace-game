@@ -76,18 +76,43 @@ pub fn compute_render_frame(
         }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
-        match node.children[slot] {
-            Child::Node(child_id) => {
-                reached.push(slot as u8);
-                node_id = child_id;
-                if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
-                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                        break;
+        let child_id = match node.children[slot] {
+            Child::Node(id) => Some(id),
+            _ => {
+                // Anchor slot has no Node — find any neighboring
+                // Cartesian Node child so the render path can
+                // continue deeper. Skip WrappedPlane/TangentBlock
+                // to avoid entering a special frame type by accident.
+                let mut fallback = None;
+                for s in 0..27 {
+                    if let Child::Node(id) = node.children[s] {
+                        let dominated = library.get(id).map(|n| {
+                            matches!(n.kind, NodeKind::WrappedPlane { .. })
+                        }).unwrap_or(false);
+                        if !dominated {
+                            fallback = Some((s, id));
+                            break;
+                        }
                     }
                 }
+                fallback.map(|(s, id)| {
+                    reached.push(s as u8);
+                    id
+                })
             }
-            Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
+        };
+        let Some(child_id) = child_id else { break };
+        if !matches!(node.children[slot], Child::Node(_)) {
+            // fallback path already pushed to reached above
+        } else {
+            reached.push(slot as u8);
+        }
+        node_id = child_id;
+        if let Some(child_node) = library.get(child_id) {
+            if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
+                kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                break;
+            }
         }
     }
     ActiveFrame {
