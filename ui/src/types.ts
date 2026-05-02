@@ -76,6 +76,14 @@ export interface DebugOverlayState {
   cameraLocal: [number, number, number];
   fov: number;
   nodeCount: number;
+  cameraRootXyz: [number, number, number];
+  anchorCellSizeRoot: number;
+  anchorSlotsCsv: string;
+  activeFrameKind: string;
+  renderPathCsv: string;
+  tbOnAnchorPath: boolean;
+  anchorCumulativeYawDeg: number;
+  copySeq: number;
 }
 
 // Union of all state updates pushed from Rust

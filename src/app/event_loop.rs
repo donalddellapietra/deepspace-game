@@ -379,20 +379,75 @@ impl App {
         // wry IPC + evaluate_script. WASM: JS queues + window.__onGameState.
         if self.overlay_active() {
             self.poll_ui_commands();
-            let camera_local = match self.active_frame.kind {
-                crate::app::ActiveFrameKind::Cartesian
-                | crate::app::ActiveFrameKind::WrappedPlane { .. }
-                | crate::app::ActiveFrameKind::TangentBlock => {
-                    self.camera.position.in_frame(&self.active_frame.render_path)
+            // For TangentBlock active frames, use the rotation-aware
+            // in_frame so cam_local lives in the rotated subtree's
+            // local axes (matches what shade_pixel sees).
+            let camera_local = match (
+                self.active_frame.kind,
+                self.active_frame.tangent_crossing,
+            ) {
+                (crate::app::ActiveFrameKind::TangentBlock, Some(crossing)) => {
+                    self.camera.position.in_frame_with_rotation(
+                        &self.active_frame.render_path,
+                        &self.startup_tangent_rotation_cols,
+                        crossing,
+                    )
                 }
+                _ => self.camera.position.in_frame(&self.active_frame.render_path),
             };
+            // Camera position in root-frame world coords. For paths
+            // crossing a TB, use rotation-aware in_frame so the
+            // value is correct.
+            let camera_root_xyz = match self.active_frame.tangent_crossing {
+                Some(crossing) => self.camera.position.in_frame_with_rotation(
+                    &crate::world::anchor::Path::root(),
+                    &self.startup_tangent_rotation_cols,
+                    crossing,
+                ),
+                None => self
+                    .camera
+                    .position
+                    .in_frame(&crate::world::anchor::Path::root()),
+            };
+            let anchor_depth = self.camera.position.anchor.depth();
+            let anchor_cell_size_root =
+                3.0_f32 / 3.0_f32.powi(anchor_depth as i32);
+            let anchor_slots_csv = self
+                .camera
+                .position
+                .anchor
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let active_frame_kind = match self.active_frame.kind {
+                crate::app::ActiveFrameKind::Cartesian => "Cartesian".to_string(),
+                crate::app::ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                    format!("WrappedPlane(dims={dims:?}, slab_d={slab_depth})")
+                }
+                crate::app::ActiveFrameKind::TangentBlock => "TangentBlock".to_string(),
+            };
+            let render_path_csv = self
+                .active_frame
+                .render_path
+                .as_slice()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let (tb_on_anchor_path, anchor_cumulative_yaw_deg) =
+                tangent_block_chain_summary(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position.anchor,
+                    &self.startup_tangent_rotation_cols,
+                );
             // Keep the UI's zoom_level in sync with the live anchor
             // depth. `edit_actions::zoom` updates it on explicit zoom
-            // input, but startup spawns + bootstrap defaults (e.g. the
-            // wrapped-planet which spawns at embedding_depth + slab_depth
-            // automatically) need this fallback or the on-screen "Layer
-            // N" indicator stays stuck at 0 until the player presses
-            // a zoom key.
+            // input, but startup spawns + bootstrap defaults need
+            // this fallback or the on-screen "Layer N" indicator
+            // stays stuck at 0 until the player presses a zoom key.
             self.ui.zoom_level = self.zoom_level();
             self.ui.push_to_overlay(&self.palette);
             crate::overlay::push_state(&crate::bridge::GameStateUpdate::DebugOverlay(
@@ -408,10 +463,18 @@ impl App {
                     tree_depth: self.tree_depth,
                     edit_depth: self.edit_depth(),
                     visual_depth: self.visual_depth(),
-                    camera_anchor_depth: self.camera.position.anchor.depth() as u32,
+                    camera_anchor_depth: anchor_depth as u32,
                     camera_local,
                     fov: 1.2,
                     node_count: self.world.library.len(),
+                    camera_root_xyz,
+                    anchor_cell_size_root,
+                    anchor_slots_csv,
+                    active_frame_kind,
+                    render_path_csv,
+                    tb_on_anchor_path,
+                    anchor_cumulative_yaw_deg,
+                    copy_seq: self.debug_copy_seq,
                 },
             ));
         }
@@ -705,4 +768,73 @@ fn wasm_canvas_setup(
         resize_cb.as_ref().unchecked_ref(),
     );
     resize_cb.forget();
+}
+
+/// Walks the camera's anchor path from world root, looking for any
+/// `NodeKind::TangentBlock` and accumulating its rotation. Returns
+/// `(tb_on_path, cumulative_yaw_deg)`:
+/// - `tb_on_path`: `true` iff at least one TB was descended through.
+/// - `cumulative_yaw_deg`: cumulative Y-axis rotation in degrees,
+///   extracted from the chained matrix's column-0 X/Z components.
+///   Quick read of "is the camera in a rotated subtree right now."
+///
+/// In this branch every TB shares the same rotation matrix
+/// (`startup_tangent_rotation_cols`); the chain accumulates
+/// `M^n` for n nested crossings, which projects to a yaw read
+/// proportional to n.
+fn tangent_block_chain_summary(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    anchor: &crate::world::anchor::Path,
+    rotation_cols: &[[f32; 3]; 3],
+) -> (bool, f32) {
+    use crate::world::tree::{Child, NodeKind};
+    // Identity matrix as columns.
+    let mut rot: [[f32; 3]; 3] = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+    let mut tb_seen = false;
+    let mut node = world_root;
+    for k in 0..(anchor.depth() as usize) {
+        let n = match library.get(node) {
+            Some(n) => n,
+            None => break,
+        };
+        let slot = anchor.slot(k) as usize;
+        match n.children[slot] {
+            Child::Node(child_id) => {
+                if let Some(child_node) = library.get(child_id) {
+                    if matches!(child_node.kind, NodeKind::TangentBlock) {
+                        tb_seen = true;
+                        rot = matmul3x3_cols(&rot, rotation_cols);
+                    }
+                }
+                node = child_id;
+            }
+            _ => break,
+        }
+    }
+    // Approximate yaw from rotation matrix. With column-major
+    // storage and a Y-axis rotation R(θ): col0 = (cos θ, 0, -sin θ).
+    // atan2(-col0[2], col0[0]) recovers θ.
+    let yaw_rad = (-rot[0][2]).atan2(rot[0][0]);
+    (tb_seen, yaw_rad.to_degrees())
+}
+
+/// Multiply two 3×3 matrices stored as `[col0, col1, col2]`.
+/// Returns `a · b`.
+fn matmul3x3_cols(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for c in 0..3 {
+        for r in 0..3 {
+            let mut s = 0.0f32;
+            for k in 0..3 {
+                s += a[k][r] * b[c][k];
+            }
+            out[c][r] = s;
+        }
+    }
+    out
 }
