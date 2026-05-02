@@ -11,10 +11,11 @@ mod draw;
 pub mod entity_raster;
 pub mod heightmap;
 mod init;
+mod stats;
 mod taa;
 
-pub use draw::{OffscreenRenderTiming, ShaderStatsFrame, WalkerProbeFrame};
 pub use entity_raster::{compute_view_proj, EntityRasterState, InstanceData};
+pub use stats::{OffscreenRenderTiming, ShaderStatsFrame, WalkerProbeFrame};
 pub use taa::{FrameSignature, TaaState};
 
 /// How entities are rendered. Chosen at startup via
