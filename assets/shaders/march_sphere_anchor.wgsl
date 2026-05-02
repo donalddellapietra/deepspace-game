@@ -84,34 +84,40 @@ fn sphere_descend_anchor(
     let e_r   = vec3<f32>(cos_lat * cos_lon, sin_lat,         cos_lat * sin_lon);
     let e_lon = vec3<f32>(-sin_lon,           0.0,             cos_lon);
     let e_lat = vec3<f32>(-sin_lat * cos_lon, cos_lat,        -sin_lat * sin_lon);
-    // Slab cell extents in WORLD units along the three local axes
-    // (anisotropic — lon arc length depends on cos(lat)).
-    let ext_lon = cell_r_center * cos_lat * cell_lon_step;
-    let ext_lat = cell_r_center * cell_lat_step;
-    let ext_r   = cell_r_step;
-    // Local-coord scale: slab cell occupies [0, 3) on each axis.
-    let scale_lon = 3.0 / max(ext_lon, 1e-30);
-    let scale_lat = 3.0 / max(ext_lat, 1e-30);
-    let scale_r   = 3.0 / max(ext_r,   1e-30);
-    // Slab cell's local-origin (where local = [0, 0, 0]) in world.
+    // ── Local axis assignment: must match slab tree slot indexing ──
+    // slab_dims = [lon, r, lat] and slot = sx + sy*3 + sz*9 means the
+    // tree expects local (x, y, z) = (lon, r, lat). The Cartesian DDA
+    // here uses cell.x/y/z to compute slot, so we MUST assign:
+    //   local x → e_lon
+    //   local y → e_r
+    //   local z → e_lat
+    // Otherwise the DDA looks up the WRONG slot in the anchor's tree
+    // and finds random content (this was the bug behind "sometimes
+    // blocks render, sometimes they stay as representative").
+    let ext_x = cell_r_center * cos_lat * cell_lon_step;  // lon arc
+    let ext_y = cell_r_step;                               // r
+    let ext_z = cell_r_center * cell_lat_step;             // lat arc
+    let scale_x = 3.0 / max(ext_x, 1e-30);
+    let scale_y = 3.0 / max(ext_y, 1e-30);
+    let scale_z = 3.0 / max(ext_z, 1e-30);
     let cell_corner = cs_center
         + cell_r_center * e_r
-        - 0.5 * ext_lon * e_lon
-        - 0.5 * ext_lat * e_lat
-        - 0.5 * ext_r   * e_r;
+        - 0.5 * ext_x * e_lon
+        - 0.5 * ext_y * e_r
+        - 0.5 * ext_z * e_lat;
 
     // Transform ray to local. Both origin (positions) and direction
     // (vectors) project onto basis with the same per-axis scale.
     let dv = ray_origin - cell_corner;
     let O_l = vec3<f32>(
-        dot(dv,      e_lon) * scale_lon,
-        dot(dv,      e_lat) * scale_lat,
-        dot(dv,      e_r)   * scale_r,
+        dot(dv,      e_lon) * scale_x,
+        dot(dv,      e_r)   * scale_y,
+        dot(dv,      e_lat) * scale_z,
     );
     let D_l = vec3<f32>(
-        dot(ray_dir, e_lon) * scale_lon,
-        dot(ray_dir, e_lat) * scale_lat,
-        dot(ray_dir, e_r)   * scale_r,
+        dot(ray_dir, e_lon) * scale_x,
+        dot(ray_dir, e_r)   * scale_y,
+        dot(ray_dir, e_lat) * scale_z,
     );
 
     // ── Cartesian DDA in local [0, 3)³ ───────────────────────────────
@@ -324,7 +330,9 @@ fn sphere_descend_anchor(
 
     // Convert local axis-aligned normal back to world via the local
     // basis. e_lon/e_lat/e_r are unit vectors in world Cartesian.
-    let n_world = normal.x * e_lon + normal.y * e_lat + normal.z * e_r;
+    // Axis convention: local x = e_lon, local y = e_r, local z = e_lat
+    // (matches slab tree slot layout — see frame setup above).
+    let n_world = normal.x * e_lon + normal.y * e_r + normal.z * e_lat;
 
     // World-space hit position. The local-t and world-t are linearly
     // related (M * D_world = D_local), so `t_world = hit_local_t` at
