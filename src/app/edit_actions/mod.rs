@@ -35,7 +35,31 @@ impl App {
     /// depth minus frame depth (K ≥ 0). `ray_dir_in_frame` is
     /// normalized, so `HitInfo.t` is a frame-local distance and
     /// can be compared directly to this value.
+    ///
+    /// Sphere-render mode (planet_render_sphere == 1) overrides the
+    /// usual scaling: the camera is rendered ON the curved sphere
+    /// from a fixed body-rooted frame (the WrappedPlane), so its
+    /// physical distance to the cell does NOT shrink as
+    /// `anchor_depth` deepens (zoom in only changes which cell
+    /// gets edited, not the camera's actual position). Using the
+    /// cartesian-style scaled range would make the cap microscopic
+    /// (3^-12 ≈ 1e-6 at anchor depth 15) while the camera-to-cell
+    /// distance stays at WP-local order ~0.5 — every break would
+    /// be rejected. Instead use a fixed cap in frame-local units,
+    /// big enough to cover the entire visible body from any
+    /// reasonable camera position above the planet.
     pub(super) fn interaction_range_in_frame(&self, frame_path: &Path) -> f32 {
+        if self.startup_planet_render_sphere == Some(1)
+            && matches!(
+                self.active_frame.kind,
+                ActiveFrameKind::WrappedPlane { .. } | ActiveFrameKind::SphereSubFrame(_)
+            )
+        {
+            // WP frame is [0, 3)³. A cap of `WORLD_SIZE` (= 3) lets
+            // the ray reach across the entire body from any camera
+            // position inside or just outside the WP cell.
+            return crate::world::anchor::WORLD_SIZE;
+        }
         let frame_depth = frame_path.depth();
         let anchor_depth = self.camera.position.anchor.depth();
         let k = anchor_depth.saturating_sub(frame_depth) as i32;
