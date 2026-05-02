@@ -110,6 +110,16 @@ pub struct GpuUniforms {
     /// `.y = lat_max` (radians) — poles past this latitude return
     /// no-hit (banned). `.zw` reserved.
     pub planet_render: [f32; 4],
+    /// Orthonormal rotation matrix applied at the descent boundary
+    /// into any `NodeKind::TangentBlock` child (rows = basis vectors
+    /// of the rotated child's local axes expressed in the parent
+    /// frame). Stored as 3 vec4 rows (`.xyz` is the row, `.w` pad).
+    /// Default identity (no rotation). The shader's `march_cartesian`
+    /// applies `R^-1 = R^T` to the ray on push and `R` to the hit
+    /// normal on return.
+    pub tangent_rotation_row0: [f32; 4],
+    pub tangent_rotation_row1: [f32; 4],
+    pub tangent_rotation_row2: [f32; 4],
 }
 
 pub struct Renderer {
@@ -253,6 +263,13 @@ pub struct Renderer {
     /// Mirror of `uniforms.planet_render`. `.x` = render mode:
     /// 0 = flat slab DDA, 1 = UV-sphere. `.y` = lat_max (radians).
     pub(super) planet_render: [f32; 4],
+    /// Orthonormal rotation matrix applied at descent into any
+    /// `NodeKind::TangentBlock` child. Rows are the rotated frame's
+    /// local axes expressed in the parent frame; identity = no
+    /// rotation, marcher unchanged. Set via `set_tangent_rotation`.
+    pub(super) tangent_rotation_row0: [f32; 4],
+    pub(super) tangent_rotation_row1: [f32; 4],
+    pub(super) tangent_rotation_row2: [f32; 4],
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
     /// shader's atomic writes are compiled out via the `ENABLE_STATS`
@@ -524,6 +541,20 @@ impl Renderer {
     /// frame. `mode = 0` → flat slab DDA (default), `mode = 1` →
     /// sphere intersect + (lon, lat) → cell. `lat_max` is the polar
     /// ban threshold in radians (e.g. 1.26 ≈ 72°).
+    /// Install the rotation applied at descent into any
+    /// `NodeKind::TangentBlock` child. `rows` is row-major: each
+    /// row is the corresponding rotated-frame axis expressed in
+    /// the parent frame. The matrix MUST be orthonormal — non-
+    /// orthonormal matrices break the t-parameter invariance the
+    /// DDA relies on (lengths inside the rotated subtree drift
+    /// per descent and the cell-boundary side_dist becomes
+    /// inconsistent). Pass identity to disable rotation.
+    pub fn set_tangent_rotation(&mut self, rows: [[f32; 3]; 3]) {
+        self.tangent_rotation_row0 = [rows[0][0], rows[0][1], rows[0][2], 0.0];
+        self.tangent_rotation_row1 = [rows[1][0], rows[1][1], rows[1][2], 0.0];
+        self.tangent_rotation_row2 = [rows[2][0], rows[2][1], rows[2][2], 0.0];
+    }
+
     pub fn set_planet_render_sphere(&mut self, mode: u32, lat_max_rad: f32) {
         self.planet_render = [mode as f32, lat_max_rad, 0.0, 0.0];
         self.write_uniforms();

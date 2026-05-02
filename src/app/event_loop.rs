@@ -294,6 +294,7 @@ impl App {
             // lat_max ≈ 72° = 1.26 rad. Banned past this latitude.
             renderer.set_planet_render_sphere(mode, 1.26);
         }
+        renderer.set_tangent_rotation(self.startup_tangent_rotation);
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
             eprintln!(

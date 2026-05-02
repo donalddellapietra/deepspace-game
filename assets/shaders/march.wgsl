@@ -326,7 +326,7 @@ fn march_entity_subtree(
 // re-enters the same root from the opposite face instead of
 // returning a miss. Y / Z OOB and depth>0 OOB still ribbon-pop.
 fn march_cartesian(
-    root_node_idx: u32, ray_origin_in: vec3<f32>, ray_dir: vec3<f32>,
+    root_node_idx: u32, ray_origin_in: vec3<f32>, ray_dir_in: vec3<f32>,
     depth_limit: u32, skip_slot: u32,
 ) -> HitResult {
     var result: HitResult;
@@ -341,7 +341,13 @@ fn march_cartesian(
     // can translate it. WGSL function parameters are immutable.
     var ray_origin: vec3<f32> = ray_origin_in;
 
-    let inv_dir = vec3<f32>(
+    // ray_dir / inv_dir / step / delta_dist are mutated on the
+    // TangentBlock rotation push (see the descent branch). They
+    // stay constants for non-rotated descents — `var` instead of
+    // `let` lets us swap them in-place on push and restore on pop
+    // without duplicating the DDA loop.
+    var ray_dir: vec3<f32> = ray_dir_in;
+    var inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
         select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
         select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
@@ -350,12 +356,29 @@ fn march_cartesian(
     // LOD pixel calculations need world-space distances, so scale
     // side_dist by ray_metric to get actual distance.
     let ray_metric = max(length(ray_dir), 1e-6);
-    let step = vec3<i32>(
+    var step = vec3<i32>(
         select(-1, 1, ray_dir.x >= 0.0),
         select(-1, 1, ray_dir.y >= 0.0),
         select(-1, 1, ray_dir.z >= 0.0),
     );
-    let delta_dist = abs(inv_dir);
+    var delta_dist = abs(inv_dir);
+
+    // TangentBlock rotation push state. `rot_active` flips true
+    // when descent crosses a `NodeKind::TangentBlock` child; the
+    // ray is transformed into the rotated subtree's local frame
+    // and the saved_* values are restored on pop. Only a SINGLE
+    // rotation is supported in the descent stack for V1 — nested
+    // rotated subtrees beyond the first encounter descend without
+    // applying further rotation.
+    var rot_active: bool = false;
+    var rot_pushed_at_depth: u32 = 0u;
+    var saved_ray_origin: vec3<f32>;
+    var saved_ray_dir: vec3<f32>;
+    var saved_inv_dir: vec3<f32>;
+    var saved_step: vec3<i32>;
+    var saved_delta_dist: vec3<f32>;
+    var saved_node_origin: vec3<f32>;
+    var saved_cell_size: f32;
 
     var s_node_idx: array<u32, MAX_STACK_DEPTH>;
     // Packed per-depth cell coords, 32 B total (vs 96 B for the
@@ -535,6 +558,50 @@ fn march_cartesian(
                 continue;
             }
             if depth == 0u { break; }
+            // TangentBlock rotation pop. When the OOB happens at the
+            // depth right above the rotation push, we're popping out
+            // of the rotated subtree — restore the saved parent-frame
+            // ray vars and the parent's cur_node_origin / cur_cell_size
+            // directly (the standard pop math assumes axis-aligned
+            // ÷3 cell scaling and would corrupt the rotated frame's
+            // local origin).
+            if rot_active && depth == rot_pushed_at_depth + 1u {
+                depth -= 1u;
+                ray_origin = saved_ray_origin;
+                ray_dir = saved_ray_dir;
+                inv_dir = saved_inv_dir;
+                step = saved_step;
+                delta_dist = saved_delta_dist;
+                cur_node_origin = saved_node_origin;
+                cur_cell_size = saved_cell_size;
+                rot_active = false;
+                // Reload parent's occupancy / first_child.
+                let parent_header_off = node_offsets[s_node_idx[depth]];
+                cur_occupancy = tree[parent_header_off];
+                cur_first_child = tree[parent_header_off + 1u];
+                if ENABLE_STATS {
+                    ray_loads_offsets = ray_loads_offsets + 1u;
+                    ray_loads_tree = ray_loads_tree + 2u;
+                    ray_steps_oob = ray_steps_oob + 1u;
+                }
+                // Recompute parent's side_dist from restored entry_pos.
+                let parent_cell = unpack_cell(s_cell[depth]);
+                let lc_pop_r = vec3<f32>(parent_cell);
+                let bent_entry_y_r = entry_pos.y - s_y_drop[depth];
+                cur_side_dist = vec3<f32>(
+                    select((cur_node_origin.x + lc_pop_r.x * cur_cell_size - entry_pos.x) * inv_dir.x,
+                           (cur_node_origin.x + (lc_pop_r.x + 1.0) * cur_cell_size - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                    select((cur_node_origin.y + lc_pop_r.y * cur_cell_size - bent_entry_y_r) * inv_dir.y,
+                           (cur_node_origin.y + (lc_pop_r.y + 1.0) * cur_cell_size - bent_entry_y_r) * inv_dir.y, ray_dir.y >= 0.0),
+                    select((cur_node_origin.z + lc_pop_r.z * cur_cell_size - entry_pos.z) * inv_dir.z,
+                           (cur_node_origin.z + (lc_pop_r.z + 1.0) * cur_cell_size - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+                );
+                let m_oob_r = min_axis_mask(cur_side_dist);
+                s_cell[depth] = pack_cell(parent_cell + vec3<i32>(m_oob_r) * step);
+                cur_side_dist += m_oob_r * delta_dist * cur_cell_size;
+                normal = -vec3<f32>(step) * m_oob_r;
+                continue;
+            }
             depth -= 1u;
             cur_cell_size = cur_cell_size * 3.0;
             let parent_cell = unpack_cell(s_cell[depth]);
@@ -607,8 +674,23 @@ fn march_cartesian(
             result.hit = true;
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
-            result.normal = normal;
-            result.cell_min = cell_min_h;
+            // Inside a rotated subtree, cell_min and normal are in
+            // the rotated frame's local coords. Map back to parent
+            // (= world) so main.wgsl's bevel + lighting see consistent
+            // frame data. cell_size (edge length) is rotation-
+            // invariant; t is preserved by orthonormal rotation.
+            if rot_active {
+                let r0 = uniforms.tangent_rotation_row0.xyz;
+                let r1 = uniforms.tangent_rotation_row1.xyz;
+                let r2 = uniforms.tangent_rotation_row2.xyz;
+                let n_l = normal;
+                result.normal = r0 * n_l.x + r1 * n_l.y + r2 * n_l.z;
+                result.cell_min = saved_node_origin
+                    + r0 * cell_min_h.x + r1 * cell_min_h.y + r2 * cell_min_h.z;
+            } else {
+                result.normal = normal;
+                result.cell_min = cell_min_h;
+            }
             result.cell_size = cur_cell_size;
             // Walker probe (tag==1 hit). Curvature offset is the
             // parabolic-drop value the bend math WOULD apply at this
@@ -784,8 +866,18 @@ fn march_cartesian(
                     result.hit = true;
                     result.t = max(cell_box_l.t_enter, 0.0);
                     result.color = palette[bt].rgb;
-                    result.normal = normal;
-                    result.cell_min = cell_min_l;
+                    if rot_active {
+                        let r0 = uniforms.tangent_rotation_row0.xyz;
+                        let r1 = uniforms.tangent_rotation_row1.xyz;
+                        let r2 = uniforms.tangent_rotation_row2.xyz;
+                        let n_l = normal;
+                        result.normal = r0 * n_l.x + r1 * n_l.y + r2 * n_l.z;
+                        result.cell_min = saved_node_origin
+                            + r0 * cell_min_l.x + r1 * cell_min_l.y + r2 * cell_min_l.z;
+                    } else {
+                        result.normal = normal;
+                        result.cell_min = cell_min_l;
+                    }
                     result.cell_size = cur_cell_size;
                     return result;
                 }
@@ -842,6 +934,109 @@ fn march_cartesian(
                     cur_side_dist += m_aabb * delta_dist * cur_cell_size;
                     normal = -vec3<f32>(step) * m_aabb;
                     if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+                    continue;
+                }
+
+                // TangentBlock rotation push. When the child node is
+                // a `NodeKind::TangentBlock` (and we're not already
+                // inside a rotated subtree — V1 supports only one
+                // rotation in the descent stack), transform the ray
+                // into the rotated frame, recompute entry_pos in
+                // local coords, and continue the SAME DDA loop. The
+                // matching restore happens in the OOB-pop branch when
+                // depth pops back to `rot_pushed_at_depth`.
+                let is_tangent = !rot_active
+                              && child_idx < arrayLength(&node_kinds)
+                              && node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK;
+                if is_tangent {
+                    // Save state for restoration on pop.
+                    saved_ray_origin = ray_origin;
+                    saved_ray_dir = ray_dir;
+                    saved_inv_dir = inv_dir;
+                    saved_step = step;
+                    saved_delta_dist = delta_dist;
+                    saved_node_origin = cur_node_origin;
+                    saved_cell_size = cur_cell_size;
+                    rot_active = true;
+                    rot_pushed_at_depth = depth;
+
+                    // Rows of R = rotated frame's local axes expressed
+                    // in the parent frame. Parent → child transform
+                    // is `child = R * (parent - child_origin_parent)`.
+                    let r0 = uniforms.tangent_rotation_row0.xyz;
+                    let r1 = uniforms.tangent_rotation_row1.xyz;
+                    let r2 = uniforms.tangent_rotation_row2.xyz;
+
+                    let dx = ray_origin - child_origin;
+                    ray_origin = vec3<f32>(dot(r0, dx), dot(r1, dx), dot(r2, dx));
+                    ray_dir = vec3<f32>(
+                        dot(r0, ray_dir), dot(r1, ray_dir), dot(r2, ray_dir),
+                    );
+                    inv_dir = vec3<f32>(
+                        select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
+                        select(1e10, 1.0 / ray_dir.y, abs(ray_dir.y) > 1e-8),
+                        select(1e10, 1.0 / ray_dir.z, abs(ray_dir.z) > 1e-8),
+                    );
+                    step = vec3<i32>(
+                        select(-1, 1, ray_dir.x >= 0.0),
+                        select(-1, 1, ray_dir.y >= 0.0),
+                        select(-1, 1, ray_dir.z >= 0.0),
+                    );
+                    delta_dist = abs(inv_dir);
+
+                    // Recompute entry_pos in child-frame coords.
+                    // Rotated cube spans [0, 3)³ in its own frame.
+                    let cube_hit = ray_box(ray_origin, inv_dir,
+                                           vec3<f32>(0.0), vec3<f32>(3.0));
+                    if cube_hit.t_enter >= cube_hit.t_exit || cube_hit.t_exit < 0.0 {
+                        // Geometrically the AABB cull already guaranteed
+                        // the world AABB is hit; if the rotated cube
+                        // box test still fails it's a precision edge
+                        // case — restore and advance the parent DDA.
+                        ray_origin = saved_ray_origin;
+                        ray_dir = saved_ray_dir;
+                        inv_dir = saved_inv_dir;
+                        step = saved_step;
+                        delta_dist = saved_delta_dist;
+                        rot_active = false;
+                        let m_miss = min_axis_mask(cur_side_dist);
+                        s_cell[depth] = pack_cell(cell + vec3<i32>(m_miss) * step);
+                        cur_side_dist += m_miss * delta_dist * cur_cell_size;
+                        normal = -vec3<f32>(step) * m_miss;
+                        continue;
+                    }
+                    let cube_t_start = max(cube_hit.t_enter, 0.0)
+                        + 0.0001 * child_cell_size;
+                    entry_pos = ray_origin + ray_dir * cube_t_start;
+
+                    depth += 1u;
+                    s_node_idx[depth] = child_idx;
+                    s_y_drop[depth] = 0.0;
+                    cur_node_origin = vec3<f32>(0.0);
+                    cur_cell_size = child_cell_size;
+                    let cho = node_offsets[child_idx];
+                    cur_occupancy = tree[cho];
+                    cur_first_child = tree[cho + 1u];
+                    if ENABLE_STATS {
+                        ray_loads_offsets = ray_loads_offsets + 1u;
+                        ray_loads_tree = ray_loads_tree + 2u;
+                        ray_steps_node_descend = ray_steps_node_descend + 1u;
+                    }
+                    let nc = vec3<i32>(
+                        clamp(i32(floor(entry_pos.x)), 0, 2),
+                        clamp(i32(floor(entry_pos.y)), 0, 2),
+                        clamp(i32(floor(entry_pos.z)), 0, 2),
+                    );
+                    s_cell[depth] = pack_cell(nc);
+                    let lc = vec3<f32>(nc);
+                    cur_side_dist = vec3<f32>(
+                        select((lc.x       - entry_pos.x) * inv_dir.x,
+                               (lc.x + 1.0 - entry_pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                        select((lc.y       - entry_pos.y) * inv_dir.y,
+                               (lc.y + 1.0 - entry_pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                        select((lc.z       - entry_pos.z) * inv_dir.z,
+                               (lc.z + 1.0 - entry_pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+                    );
                     continue;
                 }
 
