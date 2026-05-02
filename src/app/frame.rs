@@ -98,7 +98,8 @@ pub fn compute_render_frame(
     };
     let mut tangent_crossing: Option<u8> =
         if matches!(kind, ActiveFrameKind::TangentBlock) { Some(0) } else { None };
-    for _ in 0..desired_depth {
+    let trace = std::env::var("DSG_FRAME_TRACE").map(|v| v != "0").unwrap_or(false);
+    for iter_k in 0..desired_depth {
         // WrappedPlane is a hard stop — the X-wrap branch fires at
         // depth 0 of the marcher's local frame. TangentBlock is NOT
         // a stop: descent continues through cartesian descendants so
@@ -106,9 +107,17 @@ pub fn compute_render_frame(
         // rotated subtree, keeping walker stack 8 in range of the
         // camera.
         if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
+            if trace {
+                eprintln!("frame_trace iter={} BREAK kind=WrappedPlane reached_depth={}", iter_k, reached.depth());
+            }
             break;
         }
-        let Some(node) = library.get(node_id) else { break };
+        let Some(node) = library.get(node_id) else {
+            if trace {
+                eprintln!("frame_trace iter={} BREAK node_id={} not in library reached_depth={}", iter_k, node_id, reached.depth());
+            }
+            break;
+        };
         // Recompute cam_local fresh from the camera's WorldPos at
         // each iteration. Iteratively scaling cam_local by 3× per
         // descent step compounds f32 error catastrophically — by
@@ -130,6 +139,12 @@ pub fn compute_render_frame(
             || cam_local[1] < 0.0 || cam_local[1] >= 3.0
             || cam_local[2] < 0.0 || cam_local[2] >= 3.0
         {
+            if trace {
+                eprintln!(
+                    "frame_trace iter={} BREAK cam_oob cam=({:.3}, {:.3}, {:.3}) reached_depth={} kind={:?} crossing={:?}",
+                    iter_k, cam_local[0], cam_local[1], cam_local[2], reached.depth(), kind, tangent_crossing,
+                );
+            }
             break;
         }
         // Pick slot from the camera's CURRENT local position, not
@@ -144,6 +159,12 @@ pub fn compute_render_frame(
         let slot = slot_index(sx, sy, sz);
         match node.children[slot] {
             Child::Node(child_id) => {
+                if trace {
+                    eprintln!(
+                        "frame_trace iter={} push slot={} cam=({:.3},{:.3},{:.3}) child_id={} kind={:?}",
+                        iter_k, slot, cam_local[0], cam_local[1], cam_local[2], child_id, kind,
+                    );
+                }
                 reached.push(slot as u8);
                 node_id = child_id;
                 if let Some(child_node) = library.get(child_id) {
@@ -159,13 +180,39 @@ pub fn compute_render_frame(
                             // applies Mᵀ at the right path index.
                             kind = ActiveFrameKind::TangentBlock;
                             tangent_crossing = Some(reached.depth());
+                            if trace {
+                                eprintln!("frame_trace iter={} CROSSED_TB crossing={}", iter_k, reached.depth());
+                            }
                         }
                         NodeKind::Cartesian => {}
                     }
                 }
             }
-            Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
+            Child::Block(b) => {
+                if trace {
+                    eprintln!("frame_trace iter={} BREAK Block({}) at slot={} reached_depth={}", iter_k, b, slot, reached.depth());
+                }
+                break;
+            }
+            Child::Empty => {
+                if trace {
+                    eprintln!("frame_trace iter={} BREAK Empty at slot={} reached_depth={}", iter_k, slot, reached.depth());
+                }
+                break;
+            }
+            Child::EntityRef(_) => {
+                if trace {
+                    eprintln!("frame_trace iter={} BREAK EntityRef at slot={} reached_depth={}", iter_k, slot, reached.depth());
+                }
+                break;
+            }
         }
+    }
+    if trace {
+        eprintln!(
+            "frame_trace EXIT reached_depth={} kind={:?} crossing={:?} desired_depth={}",
+            reached.depth(), kind, tangent_crossing, desired_depth,
+        );
     }
     ActiveFrame {
         render_path: reached,
