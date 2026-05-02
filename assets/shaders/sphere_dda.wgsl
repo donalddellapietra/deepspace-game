@@ -534,8 +534,9 @@ fn render_cell_as_tangent_cube(
     let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.4));
     let n_dot_l = max(dot(n_world, light_dir), 0.0);
     let shade = 0.4 + 0.6 * n_dot_l;
-    // Use the cell's actual block color (from the palette).
-    let base_color = palette[block_type].rgb;
+    // v0: tint red so the prototype cube stands out unmistakably
+    // against the surrounding green sphere cells.
+    let base_color = vec3<f32>(1.0, 0.0, 0.0);
 
     // Cube-face bevel: darken the band along each face's edges so
     // we can see WHICH face the ray hit. Project the entry point
@@ -687,10 +688,10 @@ fn cartesian_voxels_in_cell(
     result.hit = true;
     result.t = cart_hit.t * inv_norm;
     result.normal = n_world;
-    // Use the cell's actual block color — voxel structure of the
-    // cell's subtree visible (grass green, broken cells = sky
-    // through the holes).
-    result.color = cart_hit.color * bevel_strength;
+    // Use the actual block color from `march_cartesian` — shows
+    // the real voxel structure of the cell's subtree. Tint
+    // slightly blue so the proto cell is distinct.
+    result.color = cart_hit.color * vec3<f32>(0.7, 0.9, 1.4) * bevel_strength;
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
     return result;
@@ -813,26 +814,36 @@ fn sphere_uv_in_cell(
             // shifting keeps cells at "normal voxel size" relative to
             // the camera).
             if sample.tag == 2u {
-                // Per-block hybrid: ALWAYS dispatch the Cartesian
-                // DDA on a non-uniform slab cell's subtree, in the
-                // cell's tangent-plane local [0, 3)³ frame. The
-                // Cartesian walker has bounded ray-pos magnitudes
-                // inside the OBB so it doesn't trip the f32 ULP wall
-                // — this is the precision claim of the hybrid
-                // architecture. The previous fallback to
-                // sphere_descend_anchor was hitting MAX_STACK_DEPTH
-                // and returning representative_block at deep edits,
-                // so deep-zoom breaks looked unchanged in the render
-                // even though the world data was modified.
-                let cart_hit = cartesian_voxels_in_cell(
-                    sample.child_idx,
-                    ray_origin, ray_dir, inv_norm,
-                    cs_center,
-                    lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
-                );
-                if cart_hit.hit { return cart_hit; }
-                // OBB miss — fall through to sphere descent for
-                // grazing rays at the OBB's curve-vs-tangent gap.
+                // Hybrid prototype v1: when this cell's subtree is
+                // the proto target AND has been broken (tag=2 = non-
+                // uniform), dispatch a Cartesian DDA on the subtree
+                // in the cell's tangent-plane local [0, 3)³ frame
+                // instead of the spherical descent. The Cartesian
+                // walker has bounded ray-pos magnitudes inside the
+                // OBB so it doesn't trip the f32 ULP wall — this is
+                // the precision claim the hybrid architecture is
+                // built on.
+                let proto_enabled = uniforms.proto_target_cell.x != 0u;
+                let is_proto = proto_enabled
+                    && lat_lo >= uniforms.proto_target_lat_lon.x - 1e-5
+                    && lat_hi <= uniforms.proto_target_lat_lon.y + 1e-5
+                    && lon_lo >= uniforms.proto_target_lat_lon.z - 1e-5
+                    && lon_hi <= uniforms.proto_target_lat_lon.w + 1e-5
+                    && r_lo   >= uniforms.proto_target_r.x       - 1e-5
+                    && r_hi   <= uniforms.proto_target_r.y       + 1e-5;
+                if is_proto {
+                    let proto_hit = cartesian_voxels_in_cell(
+                        sample.child_idx,
+                        ray_origin, ray_dir, inv_norm,
+                        cs_center,
+                        lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
+                    );
+                    if proto_hit.hit { return proto_hit; }
+                    // OBB miss / cartesian miss — fall through to
+                    // sphere descent for this cell (handles grazing
+                    // rays at OBB edges where the OBB doesn't quite
+                    // cover the spherical cell segment).
+                }
                 let sub = sphere_descend_anchor(
                     sample.child_idx,
                     ray_origin, ray_dir,
@@ -861,21 +872,35 @@ fn sphere_uv_in_cell(
                 t = t_n + max(r_step * 1e-4, 1e-6);
                 continue;
             }
-            // Per-block hybrid: ALWAYS render uniform-flatten Block
-            // slab cells (tag=1) as axis-aligned tangent-plane cubes
-            // on the sphere surface. The cube's basis matches the
-            // slab subtree axis convention (cube.x → lon, cube.y →
-            // r, cube.z → lat), so this dispatch and the tag=2
-            // Cartesian dispatch share the same coord system.
-            let cube_hit = render_cell_as_tangent_cube(
-                ray_origin, ray_dir, inv_norm,
-                cs_center, sample.block_type,
-                lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
-            );
-            if cube_hit.hit { return cube_hit; }
-            // OBB miss — fall through to the curved sphere hit
-            // (grazing rays at OBB edges where the curve dips below
-            // the flat top still need spherical geometry).
+            // Hybrid prototype: when this slab cell matches the proto
+            // target, render it as an axis-aligned tangent-plane CUBE
+            // (real flat box on the sphere surface) instead of a
+            // curved sphere segment. The cube's basis is (lon-tan,
+            // lat-tan, -radial) at the cell's center; extents are
+            // derived from the cell's (lon, lat, r) ranges scaled to
+            // tangent meters at the surface. Block colored by the
+            // sample's block_type with cube-face flat shading — no
+            // curvature in the cell's appearance.
+            // Hybrid prototype: when this slab cell matches the proto
+            // target, render it as an axis-aligned tangent-plane CUBE
+            // (real flat box on the sphere surface) instead of a
+            // curved sphere segment.
+            let proto_enabled = uniforms.proto_target_cell.x != 0u;
+            let is_proto = proto_enabled
+                && lat_lo >= uniforms.proto_target_lat_lon.x - 1e-5
+                && lat_hi <= uniforms.proto_target_lat_lon.y + 1e-5
+                && lon_lo >= uniforms.proto_target_lat_lon.z - 1e-5
+                && lon_hi <= uniforms.proto_target_lat_lon.w + 1e-5
+                && r_lo   >= uniforms.proto_target_r.x       - 1e-5
+                && r_hi   <= uniforms.proto_target_r.y       + 1e-5;
+            if is_proto {
+                let proto_hit = render_cell_as_tangent_cube(
+                    ray_origin, ray_dir, inv_norm,
+                    cs_center, sample.block_type,
+                    lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
+                );
+                if proto_hit.hit { return proto_hit; }
+            }
             // tag=1 (uniform-flatten): the entire anchor subtree is
             // one Block — render at slab cell scale, no descent
             // needed (uniform Cartesian subtrees pack-flatten so the
