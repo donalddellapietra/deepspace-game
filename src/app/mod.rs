@@ -353,6 +353,9 @@ impl App {
                     [ cz * cy,  sz * cy, -sy ],   // col 0 (rotated +X in world)
                     [ -sz,      cz,      0.0 ],   // col 1 (rotated +Y in world)
                     [ cz * sy,  sz * sy,  cy ],   // col 2 (rotated +Z in world)
+                    // Note: shrink-to-inscribe factor is computed by
+                    // the renderer below from this matrix; no need to
+                    // hand-tune.
                 ]
             }
             _ => [

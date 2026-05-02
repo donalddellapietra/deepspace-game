@@ -119,8 +119,12 @@ pub struct GpuUniforms {
     /// Column 0 = rotated frame's +X axis expressed in parent coords;
     /// column 1 = +Y axis; column 2 = +Z axis. The shader uses Mᵀ
     /// (= dot products against the columns) on push and M (= column-
-    /// scaled sums) on hit. Default identity = no rotation. The
-    /// `.w` lane is std140 padding (unused).
+    /// scaled sums) on hit. Default identity = no rotation.
+    ///
+    /// `.w` of `col0` carries the inscribed-shrink factor `s` (= 1 /
+    /// max_j(Σ_i |M_ji|)), used to fit the rotated cube inside its
+    /// parent cell without clipping. `.w` of `col1` / `col2` is std140
+    /// padding (unused).
     pub tangent_rotation_col0: [f32; 4],
     pub tangent_rotation_col1: [f32; 4],
     pub tangent_rotation_col2: [f32; 4],
@@ -552,8 +556,28 @@ impl Renderer {
     /// MUST be orthonormal — non-orthonormal matrices break the
     /// t-parameter invariance the DDA relies on. Pass identity to
     /// disable.
+    ///
+    /// Side effect: computes and stores the inscribed-shrink factor
+    /// `s` (= `1 / max_j(Σ_i |M_ji|)`) in `col0.w`. The shader uses
+    /// `s` to inscribe the rotated cube fully inside its parent cell
+    /// regardless of rotation angle, so corners that would otherwise
+    /// extend into neighboring slots stay visible without clipping.
+    /// `s = 1.0` for identity / axis-aligned rotations; `≈ 0.577`
+    /// for the worst-case 3D rotation.
     pub fn set_tangent_rotation_columns(&mut self, cols: [[f32; 3]; 3]) {
-        self.tangent_rotation_col0 = [cols[0][0], cols[0][1], cols[0][2], 0.0];
+        // L1-row-norm of M: max over world axes j of the sum of
+        // absolute column-i components at row j.
+        //   col_i = cols[i] = (M_0i, M_1i, M_2i)
+        //   row_j L1 norm = Σ_i |M_ji| = Σ_i |cols[i][j]|
+        let mut max_row = 0.0_f32;
+        for j in 0..3 {
+            let row_l1 = cols[0][j].abs() + cols[1][j].abs() + cols[2][j].abs();
+            if row_l1 > max_row {
+                max_row = row_l1;
+            }
+        }
+        let shrink = if max_row > 1e-6 { 1.0 / max_row } else { 1.0 };
+        self.tangent_rotation_col0 = [cols[0][0], cols[0][1], cols[0][2], shrink];
         self.tangent_rotation_col1 = [cols[1][0], cols[1][1], cols[1][2], 0.0];
         self.tangent_rotation_col2 = [cols[2][0], cols[2][1], cols[2][2], 0.0];
     }

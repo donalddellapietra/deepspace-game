@@ -223,7 +223,7 @@ impl Renderer {
             probe_pixel: [0; 4],
             curvature: [0.0; 4],
             planet_render: [0.0; 4],
-            tangent_rotation_col0: [1.0, 0.0, 0.0, 0.0],
+            tangent_rotation_col0: [1.0, 0.0, 0.0, 1.0],
             tangent_rotation_col1: [0.0, 1.0, 0.0, 0.0],
             tangent_rotation_col2: [0.0, 0.0, 1.0, 0.0],
         };
@@ -670,7 +670,7 @@ impl Renderer {
             debug_mode: [0; 4],
             curvature: [0.0; 4],
             planet_render: [0.0; 4],
-            tangent_rotation_col0: [1.0, 0.0, 0.0, 0.0],
+            tangent_rotation_col0: [1.0, 0.0, 0.0, 1.0],
             tangent_rotation_col1: [0.0, 1.0, 0.0, 0.0],
             tangent_rotation_col2: [0.0, 0.0, 1.0, 0.0],
             shader_stats_enabled,
