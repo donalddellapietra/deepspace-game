@@ -364,9 +364,7 @@ impl App {
                 .map(|r| r.march_dims_public().1)
                 .unwrap_or(360);
             let focal_px = march_h as f32 / (2.0 * (0.6_f32).tan());
-            let cam = self.camera.position.in_frame_rot(
-                &self.world.library, self.world.root, &effective_path,
-            );
+            let cam = self.camera.position.in_frame(&effective_path);
             let lod_cube_node = crate::renderer::entity_raster::LOD_CUBE_NODE;
             for e in &self.entities.entities {
                 let anchor_depth = e.pos.anchor.depth() as i32;

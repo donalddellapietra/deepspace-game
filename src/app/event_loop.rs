@@ -380,21 +380,13 @@ impl App {
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Cartesian
                 | crate::app::ActiveFrameKind::WrappedPlane { .. } => {
-                    self.camera.position.in_frame_rot(
-                        &self.world.library,
-                        self.world.root,
-                        &self.active_frame.render_path,
-                    )
+                    self.camera.position.in_frame(&self.active_frame.render_path)
                 }
             };
-            // Camera position in root-frame world coords (rotation-
-            // aware so the value is correct even when the anchor
-            // crosses a TangentBlock).
-            let camera_root_xyz = self.camera.position.in_frame_rot(
-                &self.world.library,
-                self.world.root,
-                &crate::world::anchor::Path::root(),
-            );
+            // Camera position in root-frame world coords. Cartesian
+            // walk to match what the renderer + add_local agree on.
+            let camera_root_xyz =
+                self.camera.position.in_frame(&crate::world::anchor::Path::root());
             let anchor_depth = self.camera.position.anchor.depth();
             let anchor_cell_size_root =
                 crate::world::anchor::WORLD_SIZE / 3.0_f32.powi(anchor_depth as i32);
