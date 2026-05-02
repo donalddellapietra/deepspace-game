@@ -54,25 +54,17 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 /// is a small precision hit but not a visible one.
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir_world = jittered_ray_dir(uv);
-    // Frame-property rotation. When the active frame is a
-    // TangentBlock node, the cells inside are rotated relative to
-    // the frame's [0, 3)³ axes — the DDA needs to see camera.pos
-    // and ray_dir in the rotated frame's coords. We apply Mᵀ
-    // (= dot products against the columns) around the cube's
-    // (0, 0, 0) corner; same convention as march_cartesian's
-    // rotation push, so the from-outside path (camera in cartesian
-    // ancestor, push fires at descent) and the from-inside path
-    // (camera anchor inside the rotated subtree, frame is
-    // TangentBlock) produce the same DDA inputs at the boundary.
+    // When the active frame is inside a rotated subtree, camera.pos
+    // is already in rotated-local coords (the CPU side's
+    // `in_frame_with_rotation` applied Mᵀ at the TB crossing during
+    // its slot walk). ray_dir, by contrast, comes from the world
+    // camera basis — apply Mᵀ here to enter the rotated frame.
     var ray_origin = camera.pos;
     var ray_dir = ray_dir_world;
     if uniforms.root_kind == ROOT_KIND_TANGENT_BLOCK {
         let c0 = uniforms.tangent_rotation_col0.xyz;
         let c1 = uniforms.tangent_rotation_col1.xyz;
         let c2 = uniforms.tangent_rotation_col2.xyz;
-        ray_origin = vec3<f32>(
-            dot(c0, ray_origin), dot(c1, ray_origin), dot(c2, ray_origin),
-        );
         ray_dir = vec3<f32>(
             dot(c0, ray_dir), dot(c1, ray_dir), dot(c2, ray_dir),
         );

@@ -252,6 +252,7 @@ impl App {
             logical_path: intended_frame.logical_path,
             node_id: effective_render.node_id,
             kind: effective_render.kind,
+            tangent_crossing: effective_render.tangent_crossing,
         };
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(scene_frame_bfs);

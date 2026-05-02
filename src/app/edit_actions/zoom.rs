@@ -102,6 +102,7 @@ impl App {
                 logical_path,
                 node_id: render.node_id,
                 kind: render.kind,
+                tangent_crossing: render.tangent_crossing,
             };
         }
         if self.startup_profile_frames < 4 {

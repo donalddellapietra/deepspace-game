@@ -106,30 +106,33 @@ impl App {
                 // because the camera is inside the slab cell and
                 // raycasting stays inside the [0, 3)^3 frame.
                 let frame_path = self.active_frame.render_path;
-                let cam_local_axis = self.camera.position.in_frame(&frame_path);
-                let ray_dir_axis = self.ray_dir_in_frame(&frame_path);
-                // Frame-property rotation. When the active frame is
-                // TangentBlock, pre-rotate cam_local and ray_dir by
-                // Mᵀ around the cube's (0, 0, 0) corner — same as
-                // shade_pixel — so the inner DDA finds the rotated
-                // cells. Identity rotation otherwise.
                 let cols = &self.startup_tangent_rotation_cols;
-                let (cam_local, ray_dir) = if matches!(
+                // For TB frames, cam_local must be in rotated-local
+                // (matches the renderer's `in_frame_with_rotation`).
+                // ray_dir comes from world camera basis → apply Mᵀ
+                // here to enter the rotated frame.
+                let cam_local = match (
+                    self.active_frame.kind,
+                    self.active_frame.tangent_crossing,
+                ) {
+                    (ActiveFrameKind::TangentBlock, Some(crossing)) => {
+                        self.camera.position.in_frame_with_rotation(
+                            &frame_path, cols, crossing,
+                        )
+                    }
+                    _ => self.camera.position.in_frame(&frame_path),
+                };
+                let ray_dir_world = self.ray_dir_in_frame(&frame_path);
+                let ray_dir = if matches!(
                     self.active_frame.kind, ActiveFrameKind::TangentBlock,
                 ) {
-                    let cam_rot = [
-                        cols[0][0] * cam_local_axis[0] + cols[0][1] * cam_local_axis[1] + cols[0][2] * cam_local_axis[2],
-                        cols[1][0] * cam_local_axis[0] + cols[1][1] * cam_local_axis[1] + cols[1][2] * cam_local_axis[2],
-                        cols[2][0] * cam_local_axis[0] + cols[2][1] * cam_local_axis[1] + cols[2][2] * cam_local_axis[2],
-                    ];
-                    let dir_rot = [
-                        cols[0][0] * ray_dir_axis[0] + cols[0][1] * ray_dir_axis[1] + cols[0][2] * ray_dir_axis[2],
-                        cols[1][0] * ray_dir_axis[0] + cols[1][1] * ray_dir_axis[1] + cols[1][2] * ray_dir_axis[2],
-                        cols[2][0] * ray_dir_axis[0] + cols[2][1] * ray_dir_axis[1] + cols[2][2] * ray_dir_axis[2],
-                    ];
-                    (cam_rot, dir_rot)
+                    [
+                        cols[0][0] * ray_dir_world[0] + cols[0][1] * ray_dir_world[1] + cols[0][2] * ray_dir_world[2],
+                        cols[1][0] * ray_dir_world[0] + cols[1][1] * ray_dir_world[1] + cols[1][2] * ray_dir_world[2],
+                        cols[2][0] * ray_dir_world[0] + cols[2][1] * ray_dir_world[1] + cols[2][2] * ray_dir_world[2],
+                    ]
                 } else {
-                    (cam_local_axis, ray_dir_axis)
+                    ray_dir_world
                 };
                 let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,

@@ -39,6 +39,14 @@ pub struct ActiveFrame {
     pub logical_path: Path,
     pub node_id: NodeId,
     pub kind: ActiveFrameKind,
+    /// Path depth at which the descent crossed a `NodeKind::TangentBlock`
+    /// (i.e. the path index of the TB node itself). `None` when the
+    /// frame's path doesn't go through any rotated subtree. When set,
+    /// camera-position math must apply Mᵀ (rotation) at this index
+    /// during the slot walk so that frame-local coords inside the
+    /// rotated subtree are interpreted as rotated-axes — see
+    /// `WorldPos::in_frame_with_rotation`.
+    pub tangent_crossing: Option<u8>,
 }
 
 /// Build a `Path` from the slot prefix the GPU ribbon walker
@@ -75,12 +83,18 @@ pub fn compute_render_frame(
         Some(NodeKind::TangentBlock) => ActiveFrameKind::TangentBlock,
         _ => ActiveFrameKind::Cartesian,
     };
+    let mut tangent_crossing: Option<u8> =
+        if matches!(kind, ActiveFrameKind::TangentBlock) { Some(0) } else { None };
     for k in 0..target.depth() as usize {
-        // If we've already landed on a frame-stopping node, stop —
-        // the node IS the render frame. WrappedPlane = wrap branch
-        // fires at depth 0; TangentBlock = shade_pixel pre-rotates
-        // camera + ray, then DDA runs cartesian inside.
-        if !matches!(kind, ActiveFrameKind::Cartesian) {
+        // WrappedPlane is a hard stop — the X-wrap branch fires at
+        // depth 0 of the marcher's local frame. TangentBlock is NOT
+        // a stop: descent continues through cartesian descendants so
+        // that anchor descent moves the active frame deeper inside
+        // the rotated subtree, keeping walker stack 8 in range of
+        // the camera. Only `tangent_crossing` records where the
+        // rotation transition happened along the path; subsequent
+        // slot walks inside are rotated-axes subdivisions.
+        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
@@ -96,8 +110,12 @@ pub fn compute_render_frame(
                             break;
                         }
                         NodeKind::TangentBlock => {
+                            // Cross into rotated subtree but keep
+                            // descending. Record the path depth at
+                            // which the TB node sits (= depth right
+                            // after the just-pushed slot).
                             kind = ActiveFrameKind::TangentBlock;
-                            break;
+                            tangent_crossing = Some(reached.depth());
                         }
                         NodeKind::Cartesian => {}
                     }
@@ -111,6 +129,7 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
+        tangent_crossing,
     }
 }
 
@@ -142,6 +161,7 @@ pub fn with_render_margin(
         logical_path: logical.logical_path,
         node_id: render.node_id,
         kind: render.kind,
+        tangent_crossing: render.tangent_crossing,
     }
 }
 

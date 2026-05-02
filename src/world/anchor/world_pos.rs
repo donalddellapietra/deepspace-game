@@ -272,6 +272,69 @@ impl WorldPos {
         ]
     }
 
+    /// Variant of `in_frame` for paths that cross a `NodeKind::TangentBlock`
+    /// at index `crossing_idx` in `frame`. Inside a rotated subtree,
+    /// child slots subdivide rotated-local axes (not world axes), so
+    /// the standard slot walk produces bogus coords. This method:
+    ///   1. Computes the camera in TB's [0, 3)³ axis-aligned frame
+    ///      via the standard walk up to `crossing_idx`.
+    ///   2. Applies Mᵀ (= dot products against `rotation_cols`) to
+    ///      land in TB's [0, 3)³ rotated-local frame.
+    ///   3. Walks the remaining slots `crossing_idx..frame.depth()`
+    ///      axis-aligned (now correctly interpreted as rotated-axes
+    ///      subdivisions), accumulating frame origin / size.
+    ///   4. Scales into the frame's [0, 3)³ local box.
+    ///
+    /// `crossing_idx == frame.depth()` (frame stops AT the TB node)
+    /// reduces to `Mᵀ · in_frame(&frame)` — the no-descent case the
+    /// shader's pre-rotation already handled.
+    ///
+    /// `rotation_cols` are the columns of M (rotated frame's axes
+    /// in parent coords), matching `GpuUniforms.tangent_rotation_col*`.
+    pub fn in_frame_with_rotation(
+        &self,
+        frame: &Path,
+        rotation_cols: &[[f32; 3]; 3],
+        crossing_idx: u8,
+    ) -> [f32; 3] {
+        // Step 1: cam in TB's [0, 3)³ axis-aligned frame.
+        let mut tb_path = *frame;
+        tb_path.truncate(crossing_idx);
+        let cam_in_tb_axis = self.in_frame(&tb_path);
+        // Step 2: apply Mᵀ (dot products against the columns) to
+        // enter TB's rotated-local frame.
+        let cam_in_tb_rotated = [
+            rotation_cols[0][0] * cam_in_tb_axis[0]
+                + rotation_cols[0][1] * cam_in_tb_axis[1]
+                + rotation_cols[0][2] * cam_in_tb_axis[2],
+            rotation_cols[1][0] * cam_in_tb_axis[0]
+                + rotation_cols[1][1] * cam_in_tb_axis[1]
+                + rotation_cols[1][2] * cam_in_tb_axis[2],
+            rotation_cols[2][0] * cam_in_tb_axis[0]
+                + rotation_cols[2][1] * cam_in_tb_axis[1]
+                + rotation_cols[2][2] * cam_in_tb_axis[2],
+        ];
+        // Step 3: walk slots[crossing_idx..frame.depth] in rotated
+        // [0, 3)³ to find the frame's origin + size relative to TB.
+        let mut origin = [0.0f32; 3];
+        let mut size = WORLD_SIZE;
+        for k in (crossing_idx as usize)..(frame.depth() as usize) {
+            let (sx, sy, sz) = slot_coords(frame.slot(k) as usize);
+            let child = size / 3.0;
+            origin[0] += sx as f32 * child;
+            origin[1] += sy as f32 * child;
+            origin[2] += sz as f32 * child;
+            size = child;
+        }
+        // Step 4: scale into the frame's own [0, 3)³.
+        let scale = WORLD_SIZE / size;
+        [
+            (cam_in_tb_rotated[0] - origin[0]) * scale,
+            (cam_in_tb_rotated[1] - origin[1]) * scale,
+            (cam_in_tb_rotated[2] - origin[2]) * scale,
+        ]
+    }
+
     /// Build a `WorldPos` at `anchor_depth` whose frame-local
     /// coordinate under `frame` equals `xyz`. Inverse of
     /// `in_frame`. Used when scroll-zoom reconstructs the camera

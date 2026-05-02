@@ -658,12 +658,21 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian
-            | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::TangentBlock => {
-                self.camera.position.in_frame(&frame.render_path)
+        // For TangentBlock frames, cam_local lives in the rotated
+        // subtree's local axes. `in_frame_with_rotation` applies Mᵀ
+        // at the path crossing so that walks past the TB are
+        // correctly interpreted as rotated-axes subdivisions —
+        // without it, the standard axis-aligned slot walk produces
+        // bogus coords once the active frame descends into the TB.
+        let cam_local = match (frame.kind, frame.tangent_crossing) {
+            (ActiveFrameKind::TangentBlock, Some(crossing)) => {
+                self.camera.position.in_frame_with_rotation(
+                    &frame.render_path,
+                    &self.startup_tangent_rotation_cols,
+                    crossing,
+                )
             }
+            _ => self.camera.position.in_frame(&frame.render_path),
         };
         if self.startup_profile_frames < 4 {
             eprintln!(
