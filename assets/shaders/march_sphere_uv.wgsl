@@ -101,7 +101,7 @@ fn sphere_uv_in_cell(
         let pos = ray_origin + ray_dir * t;
         let off = pos - cs_center;
         let r = length(off);
-        if r < r_inner || r > r_outer + 1e-3 { break; }
+        if r < r_inner - 1e-3 || r > r_outer + 1e-3 { break; }
         let n_step = off / r;
         let lat_p = asin(clamp(n_step.y, -1.0, 1.0));
         if abs(lat_p) > lat_max { break; }
@@ -137,11 +137,28 @@ fn sphere_uv_in_cell(
             // shifting keeps cells at "normal voxel size" relative to
             // the camera).
             if sample.tag == 2u {
-                // Cartesian-local DDA inside the anchor (Option A).
-                // Slab cell center in (lon, lat, r) coords; the
-                // descent builds an orthonormal local frame there and
-                // walks the anchor in [0, 3)³ Cartesian — coords stay
-                // O(1) at any descent depth, no f32 floor.
+                // Cartesian-local DDA inside the anchor.
+                // Compute the slab cell's curved-boundary exit-t once,
+                // BEFORE the descent — pass it in so the descent can
+                // clamp any hit that's past the curved cell boundary
+                // (the flat-box approximation can let sub-cells stick
+                // out past the curved cell at corners; rejecting those
+                // hits eliminates the "thin sliver" overhangs at slab
+                // boundaries).
+                var t_curved_exit = t_exit + 1.0;
+                let tn_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
+                if tn_lon_lo > 0.0 && tn_lon_lo < t_curved_exit { t_curved_exit = tn_lon_lo; }
+                let tn_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
+                if tn_lon_hi > 0.0 && tn_lon_hi < t_curved_exit { t_curved_exit = tn_lon_hi; }
+                let tn_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
+                if tn_lat_lo > 0.0 && tn_lat_lo < t_curved_exit { t_curved_exit = tn_lat_lo; }
+                let tn_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
+                if tn_lat_hi > 0.0 && tn_lat_hi < t_curved_exit { t_curved_exit = tn_lat_hi; }
+                let tn_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
+                if tn_r_lo > 0.0 && tn_r_lo < t_curved_exit { t_curved_exit = tn_r_lo; }
+                let tn_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
+                if tn_r_hi > 0.0 && tn_r_hi < t_curved_exit { t_curved_exit = tn_r_hi; }
+
                 let cell_lon_center = lon_lo + 0.5 * lon_step;
                 let cell_lat_center = lat_lo + 0.5 * lat_step;
                 let cell_r_center   = r_lo   + 0.5 * r_step;
@@ -152,26 +169,14 @@ fn sphere_uv_in_cell(
                     cell_lon_center, cell_lat_center, cell_r_center,
                     lon_step, lat_step, r_step,
                     t,
+                    t_curved_exit,
                 );
                 if sub.hit { return sub; }
-                // Anchor descent exited without a hit — every sub-cell
-                // along the ray's chord was empty. Advance past the
-                // slab cell.
-                var t_n = t_exit + 1.0;
-                let tn_lon_lo = ray_meridian_t(oc, ray_dir, lon_lo, t);
-                if tn_lon_lo > 0.0 && tn_lon_lo < t_n { t_n = tn_lon_lo; }
-                let tn_lon_hi = ray_meridian_t(oc, ray_dir, lon_hi, t);
-                if tn_lon_hi > 0.0 && tn_lon_hi < t_n { t_n = tn_lon_hi; }
-                let tn_lat_lo = ray_parallel_t(oc, ray_dir, lat_lo, t);
-                if tn_lat_lo > 0.0 && tn_lat_lo < t_n { t_n = tn_lat_lo; }
-                let tn_lat_hi = ray_parallel_t(oc, ray_dir, lat_hi, t);
-                if tn_lat_hi > 0.0 && tn_lat_hi < t_n { t_n = tn_lat_hi; }
-                let tn_r_lo = ray_sphere_after(ray_origin, ray_dir, cs_center, r_lo, t);
-                if tn_r_lo > 0.0 && tn_r_lo < t_n { t_n = tn_r_lo; }
-                let tn_r_hi = ray_sphere_after(ray_origin, ray_dir, cs_center, r_hi, t);
-                if tn_r_hi > 0.0 && tn_r_hi < t_n { t_n = tn_r_hi; }
-                if t_n >= t_exit { break; }
-                t = t_n + max(r_step * 1e-4, 1e-6);
+                // Descent returned no-hit — either the chord found
+                // only empty sub-cells, or the hit was beyond the
+                // curved slab boundary. Advance past the slab cell.
+                if t_curved_exit >= t_exit { break; }
+                t = t_curved_exit + max(r_step * 1e-4, 1e-6);
                 continue;
             }
             // tag=1 (uniform-flatten): the entire anchor subtree is
@@ -180,19 +185,20 @@ fn sphere_uv_in_cell(
             // shader sees one Block at any zoom).
             //
             // Slab cell is large (~0.077 in lon-radians); subtractions
-            // here have plenty of f32 precision. Pass in_cell directly
-            // so make_sphere_hit's bevel uses precision-stable
-            // arc = step * frac math.
+            // here have plenty of f32 precision. Pass `in_cell` in
+            // SLAB-TREE SLOT ORDER (lon, r, lat) — same convention as
+            // the descent — so adjacent cells render with consistent
+            // bevels and don't seam at slab boundaries.
             let in_cell_slab = vec3<f32>(
                 clamp((lon_p - lon_lo) / lon_step, 0.0, 1.0),
-                clamp((lat_p - lat_lo) / lat_step, 0.0, 1.0),
                 clamp((r     - r_lo)   / r_step,   0.0, 1.0),
+                clamp((lat_p - lat_lo) / lat_step, 0.0, 1.0),
             );
             return make_sphere_hit(
                 pos, n_step, t, inv_norm, sample.block_type,
                 r, lat_p,
                 in_cell_slab,
-                lon_step, lat_step, r_step,
+                lon_step, r_step, lat_step,
             );
         }
 

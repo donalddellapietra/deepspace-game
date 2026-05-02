@@ -1,53 +1,51 @@
 #include "bindings.wgsl"
 
-// Closest-face UV bevel for a (lon, lat, r) cell.
+// Closest-face UV bevel for a sphere cell.
 //
-// `in_cell` is the ray-hit position as a fractional offset within the
-// current cell, on each of the 3 axes (lon, lat, r), in [0, 1]^3.
-// Tracking this fraction through descent via the precision-stable
-// multiply-by-3 trick (parent_frac * 3 - cell_idx) is what keeps the
-// bevel sharp at deep depths — using `(lon_p - lon_lo_c)` directly
-// would catastrophic-cancel two near-equal f32s and the bevel
-// fractions degrade to noise once cell width drops below f32's
-// ~1e-7 absolute precision (around descent depth 10).
+// `in_cell` axis convention is **slab-tree slot layout**:
+//   in_cell.x = lon  (slab dims[0])
+//   in_cell.y = r    (slab dims[1])
+//   in_cell.z = lat  (slab dims[2])
+// This matches `slot_index(sx, sy, sz) = sx + sy*3 + sz*9` so
+// caller-side fractions and descent-side fractions agree everywhere.
 //
-// Face-arc weights still need physical sizes: we multiply in_cell by
-// the cell's step in absolute (lon-radians, lat-radians, r-units),
-// scaled by `r * cos(lat)` to get arc length on the sphere. Step
-// scalars retain full f32 relative precision through descent (each
-// push divides by 3, no subtractions of near-equals).
+// Face-arc weights need physical sizes: we multiply `in_cell` by the
+// cell's step in absolute axis units (lon-radians, lat-radians,
+// r-units), scaled by `r * cos(lat)` to get arc length on the sphere.
+// Step scalars retain full f32 relative precision through descent
+// (each push divides by 3, no subtractions of near-equals).
 fn make_sphere_hit(
     pos: vec3<f32>, n_step: vec3<f32>, t_param: f32, inv_norm: f32,
     block_type: u32,
     r: f32, lat_p: f32,
     in_cell: vec3<f32>,
-    lon_step_c: f32, lat_step_c: f32, r_step_c: f32,
+    lon_step_c: f32, r_step_c: f32, lat_step_c: f32,
 ) -> HitResult {
     var result: HitResult;
     let cos_lat = max(cos(lat_p), 1e-3);
     let arc_lon_lo = r * cos_lat * lon_step_c * in_cell.x;
     let arc_lon_hi = r * cos_lat * lon_step_c * (1.0 - in_cell.x);
-    let arc_lat_lo = r * lat_step_c * in_cell.y;
-    let arc_lat_hi = r * lat_step_c * (1.0 - in_cell.y);
-    let arc_r_lo  = r_step_c * in_cell.z;
-    let arc_r_hi  = r_step_c * (1.0 - in_cell.z);
+    let arc_r_lo   = r_step_c * in_cell.y;
+    let arc_r_hi   = r_step_c * (1.0 - in_cell.y);
+    let arc_lat_lo = r * lat_step_c * in_cell.z;
+    let arc_lat_hi = r * lat_step_c * (1.0 - in_cell.z);
     var best = arc_lon_lo;
-    var axis: u32 = 0u;
+    var axis: u32 = 0u;  // 0=lon, 1=r, 2=lat (slab convention)
     if arc_lon_hi < best { best = arc_lon_hi; axis = 0u; }
-    if arc_lat_lo < best { best = arc_lat_lo; axis = 1u; }
-    if arc_lat_hi < best { best = arc_lat_hi; axis = 1u; }
-    if arc_r_lo  < best { best = arc_r_lo;  axis = 2u; }
-    if arc_r_hi  < best { best = arc_r_hi;  axis = 2u; }
+    if arc_r_lo   < best { best = arc_r_lo;   axis = 1u; }
+    if arc_r_hi   < best { best = arc_r_hi;   axis = 1u; }
+    if arc_lat_lo < best { best = arc_lat_lo; axis = 2u; }
+    if arc_lat_hi < best { best = arc_lat_hi; axis = 2u; }
 
     var u_in_face: f32;
     var v_in_face: f32;
-    if axis == 0u {
+    if axis == 0u {        // lon face: bevel uses (r, lat)
         u_in_face = in_cell.y;
         v_in_face = in_cell.z;
-    } else if axis == 1u {
+    } else if axis == 1u { // r face: bevel uses (lon, lat)
         u_in_face = in_cell.x;
         v_in_face = in_cell.z;
-    } else {
+    } else {               // lat face: bevel uses (lon, r)
         u_in_face = in_cell.x;
         v_in_face = in_cell.y;
     }

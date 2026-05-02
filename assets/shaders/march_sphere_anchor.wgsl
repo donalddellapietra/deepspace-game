@@ -50,6 +50,7 @@ fn sphere_descend_anchor(
     cell_lon_center: f32, cell_lat_center: f32, cell_r_center: f32,
     cell_lon_step: f32, cell_lat_step: f32, cell_r_step: f32,
     t_in: f32,
+    t_slab_exit: f32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -239,6 +240,11 @@ fn sphere_descend_anchor(
             let cell_max_l = cell_min_l + vec3<f32>(1.0);
             let bx = ray_box(cur_O, cur_inv_dir, cell_min_l, cell_max_l);
             hit_t = max(bx.t_enter, 0.0);
+            // Clamp against curved slab cell exit. Flat sub-cells can
+            // stick past the curved slab boundary (~0.4% in lon-arc at
+            // off-equator lats); rejecting hits past `t_slab_exit`
+            // prevents thin-sliver overhangs at slab cell edges.
+            if hit_t > t_slab_exit { return result; }
             let pos_at_hit = cur_O + cur_D * hit_t;
             hit_in_cell = clamp(pos_at_hit - cell_min_l, vec3<f32>(0.0), vec3<f32>(1.0));
             hit_block = block_type;
@@ -269,6 +275,7 @@ fn sphere_descend_anchor(
             let cell_max_l = cell_min_l + vec3<f32>(1.0);
             let bx = ray_box(cur_O, cur_inv_dir, cell_min_l, cell_max_l);
             hit_t = max(bx.t_enter, 0.0);
+            if hit_t > t_slab_exit { return result; }
             let pos_at_hit = cur_O + cur_D * hit_t;
             hit_in_cell = clamp(pos_at_hit - cell_min_l, vec3<f32>(0.0), vec3<f32>(1.0));
             hit_block = block_type;
@@ -309,8 +316,24 @@ fn sphere_descend_anchor(
             select((ncf.z       - cur_O.z) * cur_inv_dir.z,
                    (ncf.z + 1.0 - cur_O.z) * cur_inv_dir.z, cur_D.z >= 0.0),
         );
-        // normal is preserved across push: child's entry face is the
-        // same axis as parent's (ray didn't change direction at push).
+
+        // Recompute entry normal in the new frame: which face of the
+        // new [0, 3)³ does the ray cross? Same per-axis ray-box maths
+        // as the initial slab entry. The previous "normal preserved
+        // across push" comment was wrong — for a hit on a freshly
+        // pushed cell with no advance step, the bevel needs the
+        // child's entry face, not the slab's.
+        let t1_new = (vec3<f32>(0.0) - cur_O) * cur_inv_dir;
+        let t2_new = (vec3<f32>(3.0) - cur_O) * cur_inv_dir;
+        let t_lo_new = min(t1_new, t2_new);
+        let entry_t_new = max(t_lo_new.x, max(t_lo_new.y, t_lo_new.z));
+        if t_lo_new.x >= entry_t_new - 1e-9 {
+            normal = vec3<f32>(-f32(cur_step.x), 0.0, 0.0);
+        } else if t_lo_new.y >= entry_t_new - 1e-9 {
+            normal = vec3<f32>(0.0, -f32(cur_step.y), 0.0);
+        } else {
+            normal = vec3<f32>(0.0, 0.0, -f32(cur_step.z));
+        }
     }
 
     if !did_hit { return result; }

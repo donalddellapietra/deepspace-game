@@ -389,8 +389,20 @@ fn descend_anchor_cartesian_local(
         else                 { (cur_cell[2] as f32       - cur_o[2]) * inv_dir[2] },
     ];
 
-    // Stack of saved cell indices for pop (un-re-zero).
-    let mut s_cell_path: Vec<[i32; 3]> = Vec::with_capacity(max_extra_levels);
+    // Stacks: cell index path (for pop's re-zero reversal) and node
+    // ids (parent of `cur_node` at each depth). The node-id stack
+    // mirrors the GPU's `s_node_idx[depth]`. Walking `path.last()` to
+    // recover the parent on pop is wrong — `path` entries are
+    // (parent_node_id, slot), and after `path.pop()` the new last
+    // entry is the GRANDPARENT's edge, not the parent's.
+    //
+    // Cap at SPHERE_DESCENT_DEPTH = 24 to mirror the GPU stack
+    // ceiling exactly. Past that the GPU splats representative; the
+    // CPU also stops at the deepest visible cell so break paths
+    // can't outrun what's rendered.
+    let cap = max_extra_levels.min(24);
+    let mut s_cell_path: Vec<[i32; 3]> = Vec::with_capacity(cap);
+    let mut s_node_path: Vec<NodeId> = Vec::with_capacity(cap);
     let mut cur_node = anchor_idx;
     let mut depth: usize = 0;
     let mut iters = 0usize;
@@ -441,14 +453,8 @@ fn descend_anchor_cartesian_local(
             if cur_cell[2] < 0 { axis_z = -1; }
             if cur_cell[2] > 2 { axis_z =  1; }
             cur_cell = [popped[0] + axis_x, popped[1] + axis_y, popped[2] + axis_z];
-            // Walk parent node back into scope.
-            cur_node = path.last().map(|(p, _)| {
-                let parent = library.get(*p).unwrap();
-                let slot_at_parent = path.last().unwrap().1;
-                if let Child::Node(n) = parent.children[slot_at_parent] {
-                    n
-                } else { unreachable!("descent stack disagrees with tree") }
-            }).unwrap_or(anchor_idx);
+            // Restore parent node from the parallel s_node_path stack.
+            cur_node = s_node_path.pop().unwrap_or(anchor_idx);
             // Recompute side_dist for the new (parent-frame) cell.
             let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
             cur_side_dist = [
@@ -459,7 +465,6 @@ fn descend_anchor_cartesian_local(
                 if cur_d[2] >= 0.0 { (cf[2] + 1.0 - cur_o[2]) * inv_dir[2] }
                 else                 { (cf[2]       - cur_o[2]) * inv_dir[2] },
             ];
-            let _ = step;
             continue;
         }
 
@@ -487,11 +492,15 @@ fn descend_anchor_cartesian_local(
             Child::Node(child_id) => {
                 // Push or terminate at extra-level limit.
                 path.push((cur_node, slot));
-                if depth + 1 >= max_extra_levels {
+                if depth + 1 >= cap {
                     return;
                 }
-                // Re-zero local frame onto the cell.
+                // Re-zero local frame onto the cell. Save parent's
+                // node id so pop can restore it without walking the
+                // path (path entries point to parents-by-slot, not
+                // by-node-id directly).
                 s_cell_path.push(cur_cell);
+                s_node_path.push(cur_node);
                 let cf = [cur_cell[0] as f32, cur_cell[1] as f32, cur_cell[2] as f32];
                 cur_o = [
                     (cur_o[0] - cf[0]) * 3.0,
