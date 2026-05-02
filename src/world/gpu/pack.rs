@@ -153,7 +153,7 @@ impl CachedTree {
         // (so its BFS idx is known when we push this node's slab).
         let mut slab: [Option<GpuChild>; 27] = [None; 27];
         for s in 0..27 {
-            slab[s] = self.build_child_entry(library, children[s], kind);
+            slab[s] = self.build_child_entry(library, children[s]);
         }
 
         // Compute occupancy from the slab.
@@ -189,7 +189,7 @@ impl CachedTree {
     /// Applies content-driven uniform-flatten (Cartesian only) so
     /// uniform subtrees collapse to a single Block. Non-uniform
     /// Child::Node recursively packs its subtree.
-    fn build_child_entry(&mut self, library: &NodeLibrary, child: Child, parent_kind: crate::world::tree::NodeKind) -> Option<GpuChild> {
+    fn build_child_entry(&mut self, library: &NodeLibrary, child: Child) -> Option<GpuChild> {
         match child {
             Child::Empty => None,
             Child::Block(bt) => Some(GpuChild::new(1, bt, 0, 0)),
@@ -209,8 +209,7 @@ impl CachedTree {
                 let (allows_flatten, uniform_type, representative) = {
                     let node = library.get(child_id)?;
                     (
-                        node.kind.allows_uniform_flatten()
-                            && !parent_kind.is_tangent_block(),
+                        node.kind.allows_uniform_flatten(),
                         node.uniform_type,
                         node.representative_block,
                     )

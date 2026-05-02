@@ -135,14 +135,6 @@ impl App {
             .map(|r| r.entity_render_mode() == EntityRenderMode::Raster)
             .unwrap_or(false);
         let intended_render_path = intended_frame.render_path;
-        if self.startup_profile_frames < 8 {
-            eprintln!(
-                "upload_tree_lod intended_render_path={:?} intended_logical={:?} tb_center={:?}",
-                intended_render_path.as_slice(),
-                intended_frame.logical_path.as_slice(),
-                intended_frame.tb_center,
-            );
-        }
         let mut entity_paths: Vec<EntityPath> =
             Vec::with_capacity(self.entities.len());
         if !raster_mode {
@@ -219,14 +211,6 @@ impl App {
         );
         let ribbon_elapsed = ribbon_start.elapsed();
         self.last_ribbon_len = r.ribbon.len() as u32;
-        if self.startup_profile_frames < 8 {
-            eprintln!(
-                "upload_tree_lod ribbon reached_slots={:?} intended={:?} ribbon_len={}",
-                r.reached_slots,
-                intended_render_path.as_slice(),
-                r.ribbon.len(),
-            );
-        }
 
         // --- Frame root: SCENE at terrain's reached depth ---
         // Walk scene_root down the ribbon's reached slot path to
@@ -268,7 +252,6 @@ impl App {
             logical_path: intended_frame.logical_path,
             node_id: effective_render.node_id,
             kind: effective_render.kind,
-            tb_center: effective_render.tb_center,
         };
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(scene_frame_bfs);
@@ -309,7 +292,6 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(effective_visual_depth);
             renderer.set_beam_enabled(beam_enabled);
-            renderer.set_frame_tb_center(self.active_frame.tb_center);
             renderer.update_camera(&cam_gpu);
             match self.active_frame.kind {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),

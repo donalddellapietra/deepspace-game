@@ -102,22 +102,18 @@ pub fn cpu_raycast_in_frame(
         if child_is_tb {
             if let Some(node) = library.get(child_id) {
                 if let NodeKind::TangentBlock { rotation: r } = node.kind {
-                    let c = [ray_origin[0]-1.5, ray_origin[1]-1.5, ray_origin[2]-1.5];
-                    let rot = [
-                        r[0][0]*c[0]+r[1][0]*c[1]+r[2][0]*c[2],
-                        r[0][1]*c[0]+r[1][1]*c[1]+r[2][1]*c[2],
-                        r[0][2]*c[0]+r[1][2]*c[1]+r[2][2]*c[2],
-                    ];
+                    // Direction-only: position pops Cartesian,
+                    // direction rotated by R to undo the R^T entry.
                     ray_origin = [
-                        slot_off[0]+(rot[0]+1.5)/3.0,
-                        slot_off[1]+(rot[1]+1.5)/3.0,
-                        slot_off[2]+(rot[2]+1.5)/3.0,
+                        slot_off[0] + ray_origin[0] / 3.0,
+                        slot_off[1] + ray_origin[1] / 3.0,
+                        slot_off[2] + ray_origin[2] / 3.0,
                     ];
                     let rd = ray_dir;
                     ray_dir = [
-                        (r[0][0]*rd[0]+r[1][0]*rd[1]+r[2][0]*rd[2])/3.0,
-                        (r[0][1]*rd[0]+r[1][1]*rd[1]+r[2][1]*rd[2])/3.0,
-                        (r[0][2]*rd[0]+r[1][2]*rd[1]+r[2][2]*rd[2])/3.0,
+                        (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
+                        (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,
+                        (r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2]) / 3.0,
                     ];
                 }
             }

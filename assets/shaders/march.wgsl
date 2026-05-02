@@ -751,25 +751,31 @@ fn march_cartesian(
                 continue;
             }
 
-            // TangentBlock dispatch — full R^T around the cube's
-            // geometric centre (1.5, 1.5, 1.5). The ray is
-            // re-expressed in the child's [0, 3)³, then both
-            // position and direction are rotated by R^T.
+            // TangentBlock dispatch — frame-local rotation around the
+            // cube's geometric centre (1.5, 1.5, 1.5). NO world-space
+            // coordinates: the ray is re-expressed in the child's
+            // [0, 3)³ via (ray_origin - child_origin) / cur_cell_size,
+            // then rotated by the stored R^T around the cube centre.
+            // On hit, normal is rotated back via R · local_normal.
             if node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
                 let child_origin_tb = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                // Scale maps the slot's parent extent (size cur_cell_size)
+                // into the child's [0, 3)³ local frame: 3 / cur_cell_size.
                 let scale = 3.0 / cur_cell_size;
                 let local_pre_origin = (ray_origin - child_origin_tb) * scale;
                 let local_pre_dir = ray_dir * scale;
+                // Stored rotation R has columns rc0/rc1/rc2.
+                // (R^T · v).i = dot(rc_i, v).
                 let rc0 = node_kinds[child_idx].rot_col0.xyz;
                 let rc1 = node_kinds[child_idx].rot_col1.xyz;
                 let rc2 = node_kinds[child_idx].rot_col2.xyz;
-                let centered = local_pre_origin - vec3<f32>(1.5);
-                let rotated = vec3<f32>(
-                    dot(rc0, centered),
-                    dot(rc1, centered),
-                    dot(rc2, centered),
-                );
-                let local_origin = rotated + vec3<f32>(1.5);
+                // Direction-only R^T: position stays unrotated so
+                // the DDA traverses the tree in its native slot
+                // layout. The rotated direction gives the visual
+                // rotation effect. This matches the inside-frame
+                // view (R^T basis + unrotated position) so the
+                // boundary transition is continuous.
+                let local_origin = local_pre_origin;
                 let local_dir = vec3<f32>(
                     dot(rc0, local_pre_dir),
                     dot(rc1, local_pre_dir),
@@ -785,8 +791,13 @@ fn march_cartesian(
                     let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
                     var out: HitResult;
                     out.hit = true;
+                    // The scale factor applies to both origin and dir,
+                    // so the parameter t is preserved across the
+                    // transform — sub.t is the world ray parameter.
                     out.t = sub.t;
                     out.color = sub.color * (0.7 + 0.3 * local_bevel);
+                    // Rotate normal back to outer frame: world = R · local.
+                    // (R · v) = rc0·v.x + rc1·v.y + rc2·v.z.
                     out.normal = rc0 * sub.normal.x
                                + rc1 * sub.normal.y
                                + rc2 * sub.normal.z;
@@ -797,6 +808,7 @@ fn march_cartesian(
                     out.cell_size = 1.0;
                     return out;
                 }
+                // Cube missed — advance DDA past this slot.
                 let m_tb = min_axis_mask(cur_side_dist);
                 s_cell[depth] = pack_cell(cell + vec3<i32>(m_tb) * step);
                 cur_side_dist += m_tb * delta_dist * cur_cell_size;
@@ -1580,31 +1592,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
 
-    // Frame-entry R^T: when the frame path crossed a TangentBlock,
-    // rotate the ray position around frame_tb_center so inside
-    // matches the outside TB dispatch's full R^T.
-    let ftbc = uniforms.frame_tb_center.xyz;
-    if ftbc.x != 0.0 || ftbc.y != 0.0 || ftbc.z != 0.0 {
-        var tb_idx = current_idx;
-        if node_kinds[current_idx].kind != NODE_KIND_TANGENT_BLOCK {
-            for (var ri = 0u; ri < uniforms.ribbon_count; ri = ri + 1u) {
-                if node_kinds[ribbon[ri].child_bfs].kind == NODE_KIND_TANGENT_BLOCK {
-                    tb_idx = ribbon[ri].child_bfs;
-                    break;
-                }
-            }
-        }
-        let rc0 = node_kinds[tb_idx].rot_col0.xyz;
-        let rc1 = node_kinds[tb_idx].rot_col1.xyz;
-        let rc2 = node_kinds[tb_idx].rot_col2.xyz;
-        let centered = ray_origin - ftbc;
-        ray_origin = ftbc + vec3<f32>(
-            dot(rc0, centered),
-            dot(rc1, centered),
-            dot(rc2, centered),
-        );
-    }
-
     // skip_slot: after a ribbon pop, the slot index (in the parent)
     // of the child we just left. march_cartesian skips this slot at
     // depth 0 to avoid re-entering the subtree already traversed by
@@ -1690,11 +1677,10 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             let rc0 = node_kinds[entry.child_bfs].rot_col0.xyz;
             let rc1 = node_kinds[entry.child_bfs].rot_col1.xyz;
             let rc2 = node_kinds[entry.child_bfs].rot_col2.xyz;
-            // Undo full R^T around [1.5,1.5,1.5]. Cartesian pops
-            // below the TB shift the center back here naturally.
-            let centered = ray_origin - vec3<f32>(1.5);
-            let rotated = rc0 * centered.x + rc1 * centered.y + rc2 * centered.z;
-            ray_origin = slot_off + (rotated + vec3<f32>(1.5)) / 3.0;
+            // Direction-only: position pops Cartesian (no rotation),
+            // direction rotated by R (forward) to undo the R^T that
+            // was applied on entry.
+            ray_origin = slot_off + ray_origin / 3.0;
             ray_dir = rc0 * ray_dir.x + rc1 * ray_dir.y + rc2 * ray_dir.z;
         } else {
             ray_origin = slot_off + ray_origin / 3.0;

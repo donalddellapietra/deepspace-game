@@ -56,7 +56,7 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    frame_tb_center: vec4<f32>,
+    _pad_radii: vec4<f32>,
     /// `WrappedPlane` slab dimensions, populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`. `(dims_x, dims_y, dims_z, slab_depth)`.
     /// Phase 2 reads `dims_x` + `slab_depth` (the `.x` and `.w` lanes)
