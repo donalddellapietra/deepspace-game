@@ -98,6 +98,10 @@ impl Camera {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
+            // Default to identity quaternion. Callers that need a
+            // non-identity render-frame rotation (camera anchored
+            // inside a TangentBlock) overwrite this after construction.
+            frame_rotation: [0.0, 0.0, 0.0, 1.0],
         }
     }
 }
