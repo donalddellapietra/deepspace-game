@@ -640,12 +640,23 @@ impl App {
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        let fwd_local = crate::world::sdf::normalize(fwd_world);
-        let right_local = crate::world::sdf::normalize(right_world);
-        let up_local = crate::world::sdf::normalize(up_world);
+        // Walk the frame path from world root; if any node along the
+        // way is a TangentBlock with non-identity rotation, accumulate
+        // R into `frame_rot`. The frame's local frame is rotated R
+        // relative to world, so to express world-direction vectors in
+        // frame-local we apply R^T.
+        let frame_rot = frame_path_rotation(
+            &self.world.library, self.world.root, &frame.render_path,
+        );
+        let fwd_world_rot = mat3_transpose_mul_vec3(&frame_rot, &fwd_world);
+        let right_world_rot = mat3_transpose_mul_vec3(&frame_rot, &right_world);
+        let up_world_rot = mat3_transpose_mul_vec3(&frame_rot, &up_world);
+        let fwd_local = crate::world::sdf::normalize(fwd_world_rot);
+        let right_local = crate::world::sdf::normalize(right_world_rot);
+        let up_local = crate::world::sdf::normalize(up_world_rot);
         if self.startup_profile_frames < 4 {
             eprintln!(
-                "gpu_camera basis world_fwd={:?} local_fwd={:?} local_right={:?} local_up={:?}",
+                "gpu_camera basis world_fwd={:?} frame_local_fwd={:?} local_right={:?} local_up={:?}",
                 fwd_world,
                 fwd_local,
                 right_local,
@@ -660,4 +671,59 @@ impl App {
             1.2,
         )
     }
+}
+
+/// Walk `frame_path` from `world_root`, multiplying any rotation
+/// from `NodeKind::TangentBlock` along the way. Returns the
+/// cumulative rotation that takes the FRAME's local frame to the
+/// world root frame. Identity for any path that doesn't cross a
+/// rotated node.
+fn frame_path_rotation(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    frame_path: &crate::world::anchor::Path,
+) -> [[f32; 3]; 3] {
+    use crate::world::tree::{Child, NodeKind, IDENTITY_ROTATION};
+    let mut rot = IDENTITY_ROTATION;
+    let mut node = world_root;
+    for k in 0..(frame_path.depth() as usize) {
+        let n = match library.get(node) {
+            Some(n) => n,
+            None => return rot,
+        };
+        match n.children[frame_path.slot(k) as usize] {
+            Child::Node(child_id) => {
+                if let Some(child_node) = library.get(child_id) {
+                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                        rot = matmul3x3(&rot, &r);
+                    }
+                }
+                node = child_id;
+            }
+            _ => return rot,
+        }
+    }
+    rot
+}
+
+fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for c in 0..3 {
+        for r in 0..3 {
+            let mut s = 0.0f32;
+            for k in 0..3 {
+                s += a[k][r] * b[c][k];
+            }
+            out[c][r] = s;
+        }
+    }
+    out
+}
+
+fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
 }
