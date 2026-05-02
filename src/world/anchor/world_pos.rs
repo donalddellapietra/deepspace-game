@@ -418,6 +418,95 @@ impl WorldPos {
         ]
     }
 
+    /// Cartesian world position via plain `in_frame` mapped to a
+    /// (possibly rotated) render frame's `[0, 3)³` local coords.
+    ///
+    /// This is the architecturally consistent camera-position-in-
+    /// frame computation when:
+    /// - `WorldPos.offset` is a Cartesian offset (i.e. `add_local`
+    ///   adds world-frame deltas straight to it without applying
+    ///   `R^T`), and
+    /// - the render frame's local frame is rotated relative to world
+    ///   because some ancestor of the frame is a `TangentBlock`.
+    ///
+    /// Algorithm:
+    /// 1. Compute Cartesian world position via `in_frame(&root)`.
+    /// 2. Walk `frame` from world root tracking the frame's WORLD
+    ///    centre + cumulative rotation. (Rotation is composed at
+    ///    each `TangentBlock` descent.)
+    /// 3. Map world → frame-local: `centred = R^T · (world −
+    ///    frame_centre_world)`, scaled by `WORLD_SIZE / frame_size_world`,
+    ///    then `+ WORLD_SIZE/2`.
+    ///
+    /// For all-Cartesian frame paths the result is bit-identical to
+    /// plain `in_frame`. For paths through a TB the camera lands at
+    /// the rotation-correct TB-local cell — i.e. the same cell the
+    /// shader's TB-descent dispatch would put a ray hitting from
+    /// outside the TB at the same world position. This eliminates
+    /// the "transported into a neighbouring TB cell" jump that the
+    /// shader sees when the same world position is interpreted as
+    /// (Cartesian-walked TB-local) vs (rotation-correct TB-local).
+    pub fn world_to_frame_rot(
+        &self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        frame: &Path,
+    ) -> [f32; 3] {
+        let world = self.in_frame(&Path::root());
+
+        // Walk frame from world root tracking world-space centre +
+        // cumulative rotation.
+        let mut frame_centre_world = [WORLD_SIZE * 0.5; 3];
+        let mut frame_size_world = WORLD_SIZE;
+        let mut frame_rot = IDENTITY_ROTATION;
+        let mut node = world_root;
+        for k in 0..(frame.depth() as usize) {
+            let n = match library.get(node) {
+                Some(n) => n,
+                None => break,
+            };
+            let slot = frame.slot(k);
+            let (sx, sy, sz) = slot_coords(slot as usize);
+            let child_size = frame_size_world / 3.0;
+            let centred_local = [
+                (sx as f32 - 1.0) * child_size,
+                (sy as f32 - 1.0) * child_size,
+                (sz as f32 - 1.0) * child_size,
+            ];
+            let centred_world = mat3_mul_vec3(&frame_rot, &centred_local);
+            frame_centre_world = [
+                frame_centre_world[0] + centred_world[0],
+                frame_centre_world[1] + centred_world[1],
+                frame_centre_world[2] + centred_world[2],
+            ];
+            frame_size_world = child_size;
+            match n.children[slot as usize] {
+                Child::Node(child_id) => {
+                    if let Some(child_node) = library.get(child_id) {
+                        if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                            frame_rot = matmul3x3(&frame_rot, &r);
+                        }
+                    }
+                    node = child_id;
+                }
+                _ => break,
+            }
+        }
+
+        let centred_world = [
+            world[0] - frame_centre_world[0],
+            world[1] - frame_centre_world[1],
+            world[2] - frame_centre_world[2],
+        ];
+        let centred_local = mat3_transpose_mul_vec3(&frame_rot, &centred_world);
+        let scale = WORLD_SIZE / frame_size_world;
+        [
+            centred_local[0] * scale + WORLD_SIZE * 0.5,
+            centred_local[1] * scale + WORLD_SIZE * 0.5,
+            centred_local[2] * scale + WORLD_SIZE * 0.5,
+        ]
+    }
+
     /// Build a `WorldPos` at `anchor_depth` whose frame-local
     /// coordinate under `frame` equals `xyz`. Inverse of
     /// `in_frame`. Used when scroll-zoom reconstructs the camera
@@ -491,5 +580,16 @@ fn mat3_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
         m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2],
         m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2],
         m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+/// Apply the transpose of a column-major 3×3 matrix to a 3-vector:
+/// `(m^T · v).i = sum_j m[i][j] · v.j` (= `dot(m[i], v)` when
+/// `m[i]` is the i'th column).
+fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
     ]
 }

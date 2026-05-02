@@ -619,13 +619,20 @@ impl App {
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                // Rotation-aware: when the anchor path crosses a
-                // TangentBlock, every slot offset past it (and the
-                // final offset) must be rotated by the cumulative
-                // chain rotation. Plain `in_frame` walks Cartesian
-                // and gets the wrong world position for cameras
-                // inside a rotated subtree.
-                self.camera.position.in_frame_rot(
+                // `world_to_frame_rot` keeps `add_local`'s Cartesian
+                // semantics (offset is a Cartesian world delta from
+                // the anchor cell origin) while still mapping the
+                // camera's WORLD position into the rotation-correct
+                // cell of a rotated render frame. Plain `in_frame`
+                // would Cartesian-walk inside the rotated frame and
+                // place the camera in the WRONG TB-local cell —
+                // visible to the user as the camera "transporting
+                // into a neighbouring block" the moment the anchor
+                // path crosses into the TB. `in_frame_rot` interprets
+                // the offset as already-rotated and produces a
+                // different bug (X-Z jump because the rotation gets
+                // applied to a Cartesian offset).
+                self.camera.position.world_to_frame_rot(
                     &self.world.library, self.world.root, &frame.render_path,
                 )
             }
