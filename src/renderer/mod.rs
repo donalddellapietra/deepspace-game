@@ -50,6 +50,11 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// curvature dispatch.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_WRAPPED_PLANE: u32 = 1;
+/// Step 5 of the sphere sub-frame architecture: shader sees a frame
+/// rooted at a Cartesian Node INSIDE a `WrappedPlane` subtree, with
+/// the sub-frame's spherical bounds + WP geometry passed via the
+/// `subframe_*` uniform fields.
+pub const ROOT_KIND_SPHERE_SUBFRAME: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -74,9 +79,11 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Padding slot retained so the CPU-side `GpuUniforms` matches
-    /// the WGSL `Uniforms` block byte-for-byte. Unused.
-    pub _pad_radii: [f32; 4],
+    /// Sphere sub-frame angular range: `(lat_lo, lat_hi, lon_lo,
+    /// lon_hi)` in radians. Populated when `root_kind ==
+    /// ROOT_KIND_SPHERE_SUBFRAME`; zeroed otherwise. Step 5 of the
+    /// sphere sub-frame architecture.
+    pub subframe_lat_lon: [f32; 4],
     /// `WrappedPlane` slab dimensions: `(dims_x, dims_y, dims_z,
     /// slab_depth)`. Populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`; the shader's X-wrap branch reads
@@ -84,8 +91,17 @@ pub struct GpuUniforms {
     /// root frames. Mirrors `Uniforms.slab_dims` in
     /// `assets/shaders/bindings.wgsl`.
     pub slab_dims: [u32; 4],
-    pub _pad_face_bounds: [f32; 4],
-    pub _pad_face_pop_pos: [f32; 4],
+    /// Sphere sub-frame radial range + center: `(r_lo, r_hi, r_c,
+    /// _pad)`. `r_c` = sphere center in sub-frame local z-coord
+    /// (= `-r_c` since sphere center is at distance r_c BELOW the
+    /// sub-frame center along radial). Populated when sphere
+    /// sub-frame is active.
+    pub subframe_r: [f32; 4],
+    /// Sphere sub-frame's WP metadata: `(wp_dims_x, wp_dims_y,
+    /// wp_dims_z, wp_slab_depth)`. Allows the shader to know the
+    /// outer sphere geometry for ribbon-pop continuity. Populated
+    /// when sphere sub-frame is active.
+    pub subframe_wp_dims: [u32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
     /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
@@ -165,6 +181,11 @@ pub struct Renderer {
     /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
     /// shader's X-wrap branch reads the X and W lanes.
     pub(super) slab_dims: [u32; 4],
+    /// Sphere sub-frame state — populated by
+    /// `set_root_kind_sphere_subframe`. Step 5.
+    pub(super) subframe_lat_lon: [f32; 4],
+    pub(super) subframe_r: [f32; 4],
+    pub(super) subframe_wp_dims: [u32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -328,6 +349,9 @@ impl Renderer {
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.slab_dims = [0; 4];
+        self.subframe_lat_lon = [0.0; 4];
+        self.subframe_r = [0.0; 4];
+        self.subframe_wp_dims = [0; 4];
         self.write_uniforms();
     }
 
@@ -339,6 +363,32 @@ impl Renderer {
     pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_WRAPPED_PLANE;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
+        self.subframe_lat_lon = [0.0; 4];
+        self.subframe_r = [0.0; 4];
+        self.subframe_wp_dims = [0; 4];
+        self.write_uniforms();
+    }
+
+    /// Step 5: set the frame to a sphere sub-frame inside a
+    /// `WrappedPlane`. Carries the sub-frame's `(lat, lon, r)` range
+    /// + WP geometry so the shader can dispatch the sphere DDA in
+    /// sub-frame local coords.
+    pub fn set_root_kind_sphere_subframe(
+        &mut self,
+        lat_lo: f32, lat_hi: f32,
+        lon_lo: f32, lon_hi: f32,
+        r_lo: f32, r_hi: f32,
+        r_c: f32,
+        wp_dims: [u32; 3],
+        wp_slab_depth: u8,
+    ) {
+        self.root_kind = ROOT_KIND_SPHERE_SUBFRAME;
+        // Slab dims still uploaded so the shader's WP-relative math
+        // (sphere radius from body_size, etc.) has access.
+        self.slab_dims = [wp_dims[0], wp_dims[1], wp_dims[2], wp_slab_depth as u32];
+        self.subframe_lat_lon = [lat_lo, lat_hi, lon_lo, lon_hi];
+        self.subframe_r = [r_lo, r_hi, r_c, 0.0];
+        self.subframe_wp_dims = [wp_dims[0], wp_dims[1], wp_dims[2], wp_slab_depth as u32];
         self.write_uniforms();
     }
 

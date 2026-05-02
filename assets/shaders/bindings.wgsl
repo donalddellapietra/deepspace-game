@@ -56,18 +56,23 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// Padding slot retained so the WGSL `Uniforms` block matches
-    /// the CPU-side `GpuUniforms` byte-for-byte. Unused.
-    _pad_radii: vec4<f32>,
+    /// Step 5: Sphere sub-frame angular range. `(lat_lo, lat_hi,
+    /// lon_lo, lon_hi)` in radians. Populated when `root_kind ==
+    /// ROOT_KIND_SPHERE_SUBFRAME`; zero otherwise.
+    subframe_lat_lon: vec4<f32>,
     /// `WrappedPlane` slab dimensions, populated when `root_kind ==
-    /// ROOT_KIND_WRAPPED_PLANE`. `(dims_x, dims_y, dims_z, slab_depth)`.
-    /// Phase 2 reads `dims_x` + `slab_depth` (the `.x` and `.w` lanes)
-    /// in the X-wrap branch of `march_cartesian` to compute the
-    /// wrap shift; `.y` / `.z` are unused until Phase 3. Zero on
-    /// Cartesian-root frames.
+    /// ROOT_KIND_WRAPPED_PLANE` OR `ROOT_KIND_SPHERE_SUBFRAME`.
+    /// `(dims_x, dims_y, dims_z, slab_depth)`. The X-wrap branch of
+    /// `march_cartesian` reads `.x` + `.w`; sphere DDAs read all
+    /// four lanes for the WP geometry context.
     slab_dims: vec4<u32>,
-    _pad_face_bounds: vec4<f32>,
-    _pad_face_pop_pos: vec4<f32>,
+    /// Step 5: Sphere sub-frame radial range + center. `(r_lo, r_hi,
+    /// r_c, _pad)`.
+    subframe_r: vec4<f32>,
+    /// Step 5: Sphere sub-frame's WP metadata mirror. `(wp_dims_x,
+    /// wp_dims_y, wp_dims_z, wp_slab_depth)`. Allows ribbon-pop
+    /// continuity to know the outer geometry.
+    subframe_wp_dims: vec4<u32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
     /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future
@@ -103,6 +108,11 @@ const ROOT_KIND_CARTESIAN: u32 = 0u;
 /// Cartesian (the marcher does not branch on root_kind). Phase 2 will
 /// hook X-wrap on this kind; Phase 3 will hook curvature.
 const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
+/// Step 5 of the sphere sub-frame architecture: shader sees a frame
+/// rooted at a Cartesian Node INSIDE a `WrappedPlane` subtree, with
+/// the sub-frame's spherical bounds + WP geometry passed via the
+/// `subframe_*` uniform fields.
+const ROOT_KIND_SPHERE_SUBFRAME: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
