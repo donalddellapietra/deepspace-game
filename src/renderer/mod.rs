@@ -52,6 +52,7 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// curvature dispatch.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_WRAPPED_PLANE: u32 = 1;
+pub const ROOT_KIND_SPHERE_SUBFRAME: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -76,18 +77,37 @@ pub struct GpuUniforms {
     pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
-    /// Padding slot retained so the CPU-side `GpuUniforms` matches
-    /// the WGSL `Uniforms` block byte-for-byte. Unused.
-    pub _pad_radii: [f32; 4],
+    /// Sphere sub-frame angular range: `(lat_lo, lat_hi, lon_lo,
+    /// lon_hi)` in radians. Populated when `root_kind ==
+    /// ROOT_KIND_SPHERE_SUBFRAME`; zeroed otherwise.
+    pub subframe_lat_lon: [f32; 4],
     /// `WrappedPlane` slab dimensions: `(dims_x, dims_y, dims_z,
     /// slab_depth)`. Populated when `root_kind ==
     /// ROOT_KIND_WRAPPED_PLANE`; the shader's X-wrap branch reads
     /// `slab_dims.x` and `slab_dims.w`. Zero-filled on Cartesian
-    /// root frames. Mirrors `Uniforms.slab_dims` in
-    /// `assets/shaders/bindings.wgsl`.
+    /// root frames.
     pub slab_dims: [u32; 4],
-    pub _pad_face_bounds: [f32; 4],
-    pub _pad_face_pop_pos: [f32; 4],
+    /// Sphere sub-frame radial range + center: `(r_lo, r_hi, r_c, _)`.
+    pub subframe_r: [f32; 4],
+    /// Sphere sub-frame WP metadata: `(wp_dims_x, wp_dims_y,
+    /// wp_dims_z, wp_slab_depth)`.
+    pub subframe_wp_dims: [u32; 4],
+    /// Node range: `(lat_lo, lat_hi, lon_lo, lon_hi)` in radians.
+    pub node_lat_lon: [f32; 4],
+    /// Node range radial: `(r_lo, r_hi, _, _)`.
+    pub node_r: [f32; 4],
+    /// Hybrid prototype: enabled flag in `.x`.
+    pub proto_target_cell: [u32; 4],
+    /// Hybrid prototype: target cell angular range.
+    pub proto_target_lat_lon: [f32; 4],
+    /// Hybrid prototype: target cell radial range.
+    pub proto_target_r: [f32; 4],
+    /// Hybrid prototype: deeper sub-node BFS idx.
+    pub proto_sub_node: [u32; 4],
+    /// Hybrid prototype: deeper sub-cube angular range.
+    pub proto_sub_lat_lon: [f32; 4],
+    /// Hybrid prototype: deeper sub-cube radial range.
+    pub proto_sub_r: [f32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
     /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
@@ -520,7 +540,7 @@ impl Renderer {
     /// radians (e.g. 1.26 ≈ 72°). Cells past this latitude return
     /// no-hit so they read as sky.
     pub fn set_planet_lat_max(&mut self, lat_max_rad: f32) {
-        self.planet_render = [0.0, lat_max_rad, 0.0, 0.0];
+        self.planet_render = [1.0, lat_max_rad, 0.0, 0.0];
         self.write_uniforms();
     }
 }

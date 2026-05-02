@@ -56,18 +56,30 @@ struct Uniforms {
     _pad_entities_2: u32,
     highlight_min: vec4<f32>,
     highlight_max: vec4<f32>,
-    /// Padding slot retained so the WGSL `Uniforms` block matches
-    /// the CPU-side `GpuUniforms` byte-for-byte. Unused.
-    _pad_radii: vec4<f32>,
-    /// `WrappedPlane` slab dimensions, populated when `root_kind ==
-    /// ROOT_KIND_WRAPPED_PLANE`. `(dims_x, dims_y, dims_z, slab_depth)`.
-    /// Phase 2 reads `dims_x` + `slab_depth` (the `.x` and `.w` lanes)
-    /// in the X-wrap branch of `march_cartesian` to compute the
-    /// wrap shift; `.y` / `.z` are unused until Phase 3. Zero on
-    /// Cartesian-root frames.
+    /// Sphere sub-frame angular range: `(lat_lo, lat_hi, lon_lo, lon_hi)`.
+    subframe_lat_lon: vec4<f32>,
+    /// WrappedPlane slab dimensions: `(dims_x, dims_y, dims_z, slab_depth)`.
     slab_dims: vec4<u32>,
-    _pad_face_bounds: vec4<f32>,
-    _pad_face_pop_pos: vec4<f32>,
+    /// Sphere sub-frame radial range: `(r_lo, r_hi, r_c, _)`.
+    subframe_r: vec4<f32>,
+    /// Sphere sub-frame WP metadata: `(wp_dims_x, wp_dims_y, wp_dims_z, wp_slab_depth)`.
+    subframe_wp_dims: vec4<u32>,
+    /// Node range: `(lat_lo, lat_hi, lon_lo, lon_hi)`.
+    node_lat_lon: vec4<f32>,
+    /// Node range radial: `(r_lo, r_hi, _, _)`.
+    node_r: vec4<f32>,
+    /// Hybrid prototype: `(enabled, _, _, _)`.
+    proto_target_cell: vec4<u32>,
+    /// Hybrid prototype angular range: `(lat_lo, lat_hi, lon_lo, lon_hi)`.
+    proto_target_lat_lon: vec4<f32>,
+    /// Hybrid prototype radial range: `(r_lo, r_hi, _, _)`.
+    proto_target_r: vec4<f32>,
+    /// Hybrid prototype sub-node: `(bfs_idx, _, _, _)`.
+    proto_sub_node: vec4<u32>,
+    /// Hybrid prototype sub-cube angular range.
+    proto_sub_lat_lon: vec4<f32>,
+    /// Hybrid prototype sub-cube radial range.
+    proto_sub_r: vec4<f32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
     /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future
@@ -99,10 +111,8 @@ struct Uniforms {
 }
 
 const ROOT_KIND_CARTESIAN: u32 = 0u;
-/// WrappedPlane root kind. Phase 1: shader treats it identically to
-/// Cartesian (the marcher does not branch on root_kind). Phase 2 will
-/// hook X-wrap on this kind; Phase 3 will hook curvature.
 const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
+const ROOT_KIND_SPHERE_SUBFRAME: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -353,12 +363,11 @@ const MAX_FACE_DEPTH: u32 = 63u;
 /// `plain_layers = 40` world still only needs ~7 levels to
 /// reach its effective visible horizon.
 ///
-/// Per-invocation register cost scales linearly. At 8 the 5
-/// per-fragment DDA stack arrays (~1 KB total) are just at the
-/// Apple Silicon register-file boundary; larger values spill to
-/// threadgroup memory, adding memory latency to every DDA
-/// iteration. See `docs/testing/perf-lod-diagnosis.md`.
-const MAX_STACK_DEPTH: u32 = 8u;
+/// Per-invocation register cost scales linearly. Base-2 octree
+/// needs ~1.58x more levels than base-3 for the same resolution
+/// (2^13 ≈ 3^8). 13 levels gives comparable visual depth to
+/// the original 8-level base-3 tree.
+const MAX_STACK_DEPTH: u32 = 13u;
 
 struct HitResult {
     hit: bool,

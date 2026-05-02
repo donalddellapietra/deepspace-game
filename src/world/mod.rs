@@ -11,6 +11,7 @@ pub mod scene;
 pub mod scenes;
 pub mod sdf;
 pub mod sphere;
+pub mod sphere_geom;
 pub mod stars;
 pub mod state;
 pub mod tree;

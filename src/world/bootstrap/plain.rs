@@ -253,21 +253,17 @@ pub fn plain_world(layers: u8) -> WorldState {
 /// f64 entirely: we encode the exact ternary digit pattern as path
 /// slots, achieving precision-perfect spawning at any anchor depth.
 pub fn plain_surface_spawn(anchor_depth: u8) -> WorldPos {
-    // y ≈ 0.95 in [0, WORLD_SIZE=3). Ternary expansion:
-    //   depth 1:  digit 0  (root y ∈ [0,1))
-    //   depth 2+: repeating [2, 2, 1, 1]
-    const Y_PATTERN: [usize; 4] = [2, 2, 1, 1];
-
+    // Place camera just below the surface (y ≈ WORLD_SIZE * 0.5).
+    // In base-2, y=0 is ground, y=1 is surface/sky. We descend
+    // into the y=1 half at depth 1 (surface layer), then alternate
+    // y=0 (lower half of that) to stay near the ground plane.
     let mut path = Path::root();
     for d in 0..anchor_depth as usize {
-        let y_row = if d == 0 { 0 } else { Y_PATTERN[(d - 1) % 4] };
-        let slot = slot_index(1, y_row, 1); // x=1, z=1 center
+        let y_row = if d == 0 { 1 } else { 0 };
+        let slot = slot_index(1, y_row, 1);
         path.push(slot as u8);
     }
 
-    // Camera near center of cell. After carve_air_pocket clears
-    // this cell, the camera is in a 1-block air pocket looking at
-    // surrounding dirt/grass blocks.
     WorldPos::new(path, [0.5, 0.5, 0.5])
 }
 
