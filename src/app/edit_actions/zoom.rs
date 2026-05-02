@@ -34,7 +34,18 @@ impl App {
             .saturating_sub(self.active_frame.render_path.depth() as u32)
             .max(1);
         let pixels = self.frame_projected_pixels(&self.active_frame);
-        let local_cap = if pixels <= FRAME_VISUAL_MIN_PIXELS {
+        // The pixel cap limits visual depth based on the frame's
+        // projected size — prevents over-descent when the frame is
+        // far away. Skip it when the camera is inside the frame
+        // (which is always true for the render frame): the shader's
+        // own LOD_PIXEL_THRESHOLD handles per-cell gating, and the
+        // CPU cap is too conservative for inside-frame cameras
+        // (especially TB frames stopped at depth 1).
+        let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
+        let camera_inside = cam_local.iter().all(|&v| v >= 0.0 && v <= 3.0);
+        let local_cap = if camera_inside {
+            MAX_LOCAL_VISUAL_DEPTH
+        } else if pixels <= FRAME_VISUAL_MIN_PIXELS {
             1
         } else {
             let extra = (pixels / FRAME_VISUAL_MIN_PIXELS).ln() / 3.0_f32.ln();
