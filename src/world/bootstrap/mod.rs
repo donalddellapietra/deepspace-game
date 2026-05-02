@@ -8,8 +8,11 @@ use super::anchor::{Path, WorldPos};
 use super::state::WorldState;
 
 mod plain;
+mod rotated_cube_test;
 mod vox;
 mod wrapped_planet;
+
+pub use rotated_cube_test::{rotated_cube_test_spawn, rotated_cube_test_world};
 
 pub use plain::{
     carve_air_pocket, plain_surface_spawn, plain_test_world, plain_world,
@@ -102,15 +105,11 @@ pub enum WorldPreset {
         embedding_depth: u8,
         slab_dims: [u32; 3],
         slab_depth: u8,
-        /// Depth of the recursive subtree under EACH slab cell. The
-        /// slab cells are `Child::Node(uniform_block_subtree)` of
-        /// this depth — NOT `Child::Block(...)` leaf-terminals — so
-        /// they behave as proper anchor blocks per the
-        /// `[Recursive architecture]` rule (every cell at every layer
-        /// is itself a recursive subdivision). Total tree depth =
-        /// `embedding_depth + slab_depth + cell_subtree_depth`.
         cell_subtree_depth: u8,
     },
+    /// Step-1 unit primitive: a single `TangentBlock` at tree depth 3,
+    /// rotated 45° around Y, in an otherwise empty world.
+    RotatedCubeTest,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -141,6 +140,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         // but its world-y depends on embedding_depth and slot path
         // — entities don't auto-rest on it in Phase 1.
         WorldPreset::WrappedPlanet { .. } => None,
+        WorldPreset::RotatedCubeTest => None,
     }
 }
 
@@ -223,5 +223,8 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
             slab_depth,
             cell_subtree_depth,
         ),
+        WorldPreset::RotatedCubeTest => {
+            rotated_cube_test::bootstrap_rotated_cube_test_world()
+        }
     }
 }

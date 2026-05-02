@@ -190,6 +190,12 @@ impl TestConfig {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
+                // Step-1 unit primitive: a single rotated TangentBlock
+                // at tree depth 3 in an otherwise empty world. View
+                // from above, expect a diamond silhouette.
+                "--rotated-cube-test" => {
+                    cfg.world_preset = WorldPreset::RotatedCubeTest;
+                }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,

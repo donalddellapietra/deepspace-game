@@ -58,16 +58,15 @@ impl GpuChild {
     }
 }
 
-/// Per-packed-node metadata: indexed by BFS position — the same
-/// `node_index` used in `GpuChild::node_index`. 16 bytes total.
+/// Per-packed-node metadata: 64 bytes total.
 ///
 /// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock.
-/// `dims_x/y/z`: slab dims (cells per axis) for `WrappedPlane`;
-/// unused (zeroed) for `Cartesian` and `TangentBlock`. The shader
-/// reads these in Phase 2 to drive X-wrap and in Phase 3 to derive
-/// the planet radius. `TangentBlock` carries no fields — its TBN
-/// is computed by the descender from current `(lon, lat, r)` cell
-/// bounds at the moment the ray enters the node.
+/// `dims_x/y/z`: slab dims for `WrappedPlane`; zero otherwise.
+///
+/// `rot_col0/1/2`: 3×3 rotation matrix (column-major) for
+/// `TangentBlock`. Each column is `vec4<f32>` (xyz = column, w = 0)
+/// for std140-style 16-byte vec3 alignment. Identity for the other
+/// kinds (shader doesn't read it for those).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -75,19 +74,31 @@ pub struct GpuNodeKind {
     pub dims_x: u32,
     pub dims_y: u32,
     pub dims_z: u32,
+    pub rot_col0: [f32; 4],
+    pub rot_col1: [f32; 4],
+    pub rot_col2: [f32; 4],
 }
 
 impl GpuNodeKind {
     pub fn from_node_kind(k: NodeKind) -> Self {
+        let id_col0 = [1.0, 0.0, 0.0, 0.0];
+        let id_col1 = [0.0, 1.0, 0.0, 0.0];
+        let id_col2 = [0.0, 0.0, 1.0, 0.0];
         match k {
-            NodeKind::Cartesian => Self { kind: 0, dims_x: 0, dims_y: 0, dims_z: 0 },
-            NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
-                kind: 1,
-                dims_x: dims[0],
-                dims_y: dims[1],
-                dims_z: dims[2],
+            NodeKind::Cartesian => Self {
+                kind: 0, dims_x: 0, dims_y: 0, dims_z: 0,
+                rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
             },
-            NodeKind::TangentBlock => Self { kind: 2, dims_x: 0, dims_y: 0, dims_z: 0 },
+            NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
+                kind: 1, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
+                rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
+            },
+            NodeKind::TangentBlock { rotation } => Self {
+                kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
+                rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], 0.0],
+                rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
+                rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
+            },
         }
     }
 }
@@ -159,7 +170,8 @@ mod tests {
 
     #[test]
     fn gpu_node_kind_size() {
-        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 16);
+        // 4 u32 (16) + 3 vec4 (48) = 64 B.
+        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 64);
     }
 
     #[test]
@@ -184,11 +196,20 @@ mod tests {
     }
 
     #[test]
-    fn from_node_kind_tangent_block() {
-        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock);
+    fn from_node_kind_tangent_block_carries_rotation() {
+        use crate::world::tree::IDENTITY_ROTATION;
+        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock {
+            rotation: IDENTITY_ROTATION,
+        });
         assert_eq!(k.kind, 2);
-        assert_eq!(k.dims_x, 0);
-        assert_eq!(k.dims_y, 0);
-        assert_eq!(k.dims_z, 0);
+        assert_eq!(k.rot_col0, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(k.rot_col1, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(k.rot_col2, [0.0, 0.0, 1.0, 0.0]);
+
+        let r = [[0.5, 0.6, 0.7], [0.1, 0.2, 0.3], [0.9, 0.8, 0.4]];
+        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock { rotation: r });
+        assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, 0.0]);
+        assert_eq!(k.rot_col1, [0.1, 0.2, 0.3, 0.0]);
+        assert_eq!(k.rot_col2, [0.9, 0.8, 0.4, 0.0]);
     }
 }
