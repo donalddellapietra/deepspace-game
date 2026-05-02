@@ -533,7 +533,6 @@ impl App {
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                 NodeKind::WrappedPlane { dims, slab_depth }
             }
-            ActiveFrameKind::TangentBlock => NodeKind::TangentBlock,
         }
     }
 
@@ -618,9 +617,7 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian
-            | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::TangentBlock => {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                 self.camera.position.in_frame(&frame.render_path)
             }
         };

@@ -20,15 +20,6 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
-    /// The render frame is rooted at a `NodeKind::TangentBlock` —
-    /// the camera is INSIDE a rotated cube. The shader's `march()`
-    /// transforms the camera ray into the cube's local rotated
-    /// frame before descending into the (axis-aligned in local
-    /// frame) interior content. Without this branch, the camera
-    /// crossing into the cube would see a 45° "snap" because the
-    /// outside-the-cube TangentBlock dispatch never fires once the
-    /// render frame is the cube itself.
-    TangentBlock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,13 +64,12 @@ pub fn compute_render_frame(
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
         }
-        Some(NodeKind::TangentBlock) => ActiveFrameKind::TangentBlock,
         _ => ActiveFrameKind::Cartesian,
     };
     for k in 0..target.depth() as usize {
-        // Stop at any non-Cartesian frame kind — the shader needs to
-        // dispatch on the kind, so the render frame must BE that node.
-        if !matches!(kind, ActiveFrameKind::Cartesian) {
+        // If we've already landed on a WrappedPlane node, stop —
+        // the slab root IS the render frame.
+        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
@@ -89,16 +79,9 @@ pub fn compute_render_frame(
                 reached.push(slot as u8);
                 node_id = child_id;
                 if let Some(child_node) = library.get(child_id) {
-                    match child_node.kind {
-                        NodeKind::WrappedPlane { dims, slab_depth } => {
-                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                            break;
-                        }
-                        NodeKind::TangentBlock => {
-                            kind = ActiveFrameKind::TangentBlock;
-                            break;
-                        }
-                        NodeKind::Cartesian => {}
+                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
+                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                        break;
                     }
                 }
             }

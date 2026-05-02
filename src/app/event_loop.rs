@@ -380,8 +380,7 @@ impl App {
             self.poll_ui_commands();
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Cartesian
-                | crate::app::ActiveFrameKind::WrappedPlane { .. }
-                | crate::app::ActiveFrameKind::TangentBlock => {
+                | crate::app::ActiveFrameKind::WrappedPlane { .. } => {
                     self.camera.position.in_frame(&self.active_frame.render_path)
                 }
             };
