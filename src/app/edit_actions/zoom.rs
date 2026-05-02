@@ -30,18 +30,13 @@ impl App {
         if let Some(depth) = self.forced_visual_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        let local_target = (self.edit_depth() + 2)
+        // Visual depth tracks edit depth so broken cells are always
+        // visible. The shader's LOD_PIXEL_THRESHOLD handles the
+        // "too small to render" case — no need for a pixel-budget
+        // cap on the CPU side.
+        self.edit_depth()
             .saturating_sub(self.active_frame.render_path.depth() as u32)
-            .max(1);
-        let pixels = self.frame_projected_pixels(&self.active_frame);
-        let local_cap = if pixels <= FRAME_VISUAL_MIN_PIXELS {
-            1
-        } else {
-            let extra = (pixels / FRAME_VISUAL_MIN_PIXELS).ln() / 2.0_f32.ln();
-            extra.floor().max(1.0) as u32
-        };
-        local_target
-            .min(local_cap)
+            .max(1)
             .min(MAX_LOCAL_VISUAL_DEPTH)
             .min(crate::world::tree::MAX_DEPTH as u32)
     }
