@@ -154,10 +154,43 @@ pub fn wrapped_planet_world(
     let dirt_anchor  = make_anchor(&mut library, block::DIRT);
     let grass_anchor = make_anchor(&mut library, block::GRASS);
 
+    // Air subtrees, one per depth from 0 (= a single Cartesian node
+    // with all-Empty children) up to the deepest level any empty
+    // slot in the world tree sits above. Used to fill the empty
+    // regions of the slab subgrid AND the embedding's non-centre
+    // slots so `compute_render_frame` can descend along ANY camera
+    // anchor path — same trick `plain.rs` uses (`air_l1`, `air_l2`,
+    // `air_subtree`). Without this, a camera above the slab has its
+    // anchor path hit `Child::Empty` at WP depth 2, the render frame
+    // pins there, and `WorldPos::in_frame`'s tail walk accumulates
+    // 16+ levels of slot offsets in WP-local — f32 precision
+    // collapses by ~depth 13 inside any tangent cube. With air
+    // subtrees the path always finds Nodes; render frame deepens
+    // alongside the camera anchor; tail walk stays short; precision
+    // stays at full strength (same as plain Cartesian's 40+ layers).
+    //
+    // Content-addressed dedup means we only allocate one entry per
+    // distinct depth regardless of how many empty slots reference
+    // them. `air_subtrees[d]` is a Node whose subtree depth is
+    // exactly `d + 1` (it counts its own level + d wrapping
+    // levels). Use `air_node_of_depth(D)` to get a Node whose
+    // `Node.depth` is exactly `D`, so it dedups cleanly with a
+    // material chain of the same depth at the same slot.
+    let mut air_subtrees: Vec<Child> = Vec::with_capacity(total_depth + 1);
+    air_subtrees.push(Child::Node(library.insert(empty_children())));
+    for _ in 0..total_depth {
+        let inner = *air_subtrees.last().unwrap();
+        air_subtrees.push(Child::Node(library.insert(uniform_children(inner))));
+    }
+    let air_node_of_depth = |depth: usize| -> Child {
+        debug_assert!(depth >= 1, "air_node_of_depth requires depth >= 1");
+        air_subtrees[(depth - 1).min(air_subtrees.len() - 1)]
+    };
+
     // Build the slab subtree as a flat `subgrid^3` Cartesian volume,
     // sparsely populated to the slab_dims footprint. The simplest
     // exact construction is to walk the leaf-cell grid and at each
-    // (x, y, z) pick the per-material anchor (or Empty), then
+    // (x, y, z) pick the per-material anchor (or air leaf), then
     // bottom-up assemble 3×3×3 nodes layer by layer.
     //
     // Leaf-cell selection rule for the slab footprint:
@@ -165,7 +198,17 @@ pub fn wrapped_planet_world(
     //     - bottom row (y == 0): stone_anchor
     //     - middle rows (1..dims.y-1): dirt_anchor
     //     - top row (y == dims.y-1): grass_anchor
-    //   else: Empty
+    //   else: air subtree of the same Node depth as the material
+    //         chain (= `cell_subtree_depth`), so the air sibling
+    //         dedups symmetrically and `tree_depth` is unchanged.
+    //         When `cell_subtree_depth == 0` the slab cells are
+    //         `Child::Block` (no Node), so air falls back to
+    //         `Child::Empty` to preserve symmetry.
+    let leaf_air = if cell_subtree_depth >= 1 {
+        air_node_of_depth(cell_subtree_depth as usize)
+    } else {
+        Child::Empty
+    };
     let leaf_at = |x: u32, y: u32, z: u32| -> Child {
         if x < slab_dims[0] && y < slab_dims[1] && z < slab_dims[2] {
             if y == 0 {
@@ -176,7 +219,7 @@ pub fn wrapped_planet_world(
                 dirt_anchor
             }
         } else {
-            Child::Empty
+            leaf_air
         }
     };
 
@@ -256,11 +299,34 @@ pub fn wrapped_planet_world(
     );
 
     // Embed: wrap in `embedding_depth` Cartesian layers, each
-    // placing the inner subtree at the centre slot (13). Outer slots
-    // are Empty so the slab sits in otherwise empty space.
+    // placing the inner subtree at the centre slot (13). Non-centre
+    // slots get air subtrees extending to leaf depth — same reason
+    // the slab subgrid uses air for outside-footprint cells: render
+    // frame must be able to descend along ANY camera anchor path
+    // for f32 precision to stay short-tail, even when the camera
+    // sits in the otherwise-empty space around the planet.
     let mut current = Child::Node(wrapped_plane_root);
     for _ in 0..(embedding_depth as usize) {
-        let mut children = empty_children();
+        // Sibling air slots match the depth of the wrapped content
+        // exactly so the Node.depth bookkeeping stays consistent
+        // with the legacy (Empty-padded) layout. The wrapped
+        // content's depth is `library.get(current).depth` (which
+        // is well-defined here because `current` is always
+        // `Child::Node(...)` in this loop).
+        let content_id = match current {
+            Child::Node(id) => id,
+            _ => unreachable!("embedding wrap always builds Child::Node"),
+        };
+        let content_depth = library
+            .get(content_id)
+            .map(|n| n.depth as usize)
+            .expect("wrapped node must be in library");
+        let air = if content_depth >= 1 {
+            air_node_of_depth(content_depth)
+        } else {
+            Child::Empty
+        };
+        let mut children = uniform_children(air);
         children[slot_index(1, 1, 1)] = current;
         current = Child::Node(library.insert_with_kind(children, NodeKind::Cartesian));
     }

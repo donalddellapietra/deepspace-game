@@ -46,10 +46,40 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 /// Resolve the active frame.
 ///
 /// Descends from `world_root` along `camera_anchor` for at most
-/// `desired_depth` slot steps. Stops early at a `WrappedPlane`
-/// node — the wrap branch in the shader fires at depth==0 of the
-/// marcher's local frame, so the render frame must be the slab
-/// root, not a sub-cell of it.
+/// `desired_depth` slot steps. The descent walks any Cartesian
+/// or `WrappedPlane` Node it finds; it does NOT stop early at
+/// the `WrappedPlane` boundary the way it used to.
+///
+/// **Why descent must go past WrappedPlane.** Plain Cartesian's
+/// precision discipline is "render frame follows the camera
+/// anchor down with a small render margin". `WorldPos::in_frame`
+/// then walks `[common_prefix..anchor_depth)` slots — short tail,
+/// every contribution bounded by `WORLD_SIZE`, f32 precise. With
+/// a WP-stop the render frame stays pinned at depth ≈ 2 while
+/// the camera anchor goes to 18+, so the tail walk accumulates
+/// ~16 levels of slot offsets in WP-local; deep slots
+/// (`3 / 3^N`) sit below the f32 eps for the running sum and
+/// the camera's WP-local position has ~2e-7 of fixed noise.
+/// At deep anchor that noise is bigger than the cell the cursor
+/// or pixel is supposed to resolve — visible as camera jitter
+/// and "off by some" CPU raycast hits. Letting descent continue
+/// past WP (through the slab subgrid, into a `TangentBlock`,
+/// into the cube's Cartesian interior) keeps the tail walk short
+/// and the camera local at full precision — same trick Cartesian
+/// has always used.
+///
+/// The kind tracked here is the kind of the FINAL node landed on.
+/// `WrappedPlane` only when the descent literally ends at the WP
+/// node (camera anchor at WP depth, or shallower / pointed away).
+/// Once descent goes through WP, kind reverts to whatever the
+/// deeper node carries — typically Cartesian.
+///
+/// **X-wrap caveat.** `march_cartesian`'s X-wrap branch fires at
+/// marcher-local `depth == 0` of a WP frame; with the render
+/// frame past WP it can't fire from the player's POV. That's
+/// acceptable — X-wrap matters when navigating across the slab
+/// (camera at-or-above the surface, render frame stays at WP),
+/// not when zoomed in on a single cube.
 pub fn compute_render_frame(
     library: &NodeLibrary,
     world_root: NodeId,
@@ -60,34 +90,23 @@ pub fn compute_render_frame(
     target.truncate(desired_depth);
     let mut node_id = world_root;
     let mut reached = Path::root();
-    let mut kind = match library.get(world_root).map(|n| n.kind) {
-        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
-            ActiveFrameKind::WrappedPlane { dims, slab_depth }
-        }
-        _ => ActiveFrameKind::Cartesian,
-    };
     for k in 0..target.depth() as usize {
-        // If we've already landed on a WrappedPlane node, stop —
-        // the slab root IS the render frame.
-        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
-            break;
-        }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
-                if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
-                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                        break;
-                    }
-                }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
     }
+    let kind = match library.get(node_id).map(|n| n.kind) {
+        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
+            ActiveFrameKind::WrappedPlane { dims, slab_depth }
+        }
+        _ => ActiveFrameKind::Cartesian,
+    };
     ActiveFrame {
         render_path: reached,
         logical_path: reached,
