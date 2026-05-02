@@ -54,27 +54,12 @@ fn jittered_ray_dir(uv: vec2<f32>) -> vec3<f32> {
 /// is a small precision hit but not a visible one.
 fn shade_pixel(uv: vec2<f32>) -> vec4<f32> {
     let ray_dir_world = jittered_ray_dir(uv);
-    var ray_origin = camera.pos;
-    var ray_dir = ray_dir_world;
-    var result: HitResult;
-    if uniforms.root_kind == ROOT_KIND_TANGENT_BLOCK {
-        // Active frame is inside the rotated subtree. camera.pos is
-        // already in rotated-local coords (the CPU side's
-        // `in_frame_with_rotation` applied Mᵀ at the TB crossing
-        // during its slot walk). Apply Mᵀ to ray_dir, then dispatch
-        // to the dedicated `march_in_tangent_cube` walker (stack 24)
-        // so we can render past `march_cartesian`'s 8-level cap from
-        // a fixed active frame.
-        let c0 = uniforms.tangent_rotation_col0.xyz;
-        let c1 = uniforms.tangent_rotation_col1.xyz;
-        let c2 = uniforms.tangent_rotation_col2.xyz;
-        ray_dir = vec3<f32>(
-            dot(c0, ray_dir), dot(c1, ray_dir), dot(c2, ray_dir),
-        );
-        result = march_in_tangent_cube(uniforms.root_index, ray_origin, ray_dir);
-    } else {
-        result = march(ray_origin, ray_dir);
-    }
+    let ray_origin = camera.pos;
+    let ray_dir = ray_dir_world;
+    // `march()` dispatches on the active frame's NodeKind, including
+    // TangentBlock — it applies Mᵀ to ray_dir internally and calls
+    // the deeper walker. Same for fs_coarse_mask + fs_main_depth.
+    let result = march(ray_origin, ray_dir);
 
     // Debug paint dispatch (mode 1..=8): bypass lighting / bevel /
     // gamma; preserve t in alpha so TAAU history stays correct. See

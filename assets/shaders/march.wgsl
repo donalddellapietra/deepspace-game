@@ -476,9 +476,20 @@ fn march_in_tangent_cube(
 
         let child_idx = tree[child_base + 1u];
 
-        // Stack ceiling — splat representative if we'd overflow stack.
+        // Termination: stack ceiling OR LOD pixel-size cutoff. Without
+        // LOD the walker descends to leaves at every distance, burning
+        // through the iteration cap on far-away rays and returning
+        // sky — far-away cells stop rendering entirely. The LOD calc
+        // matches march_cartesian: cell_world_size / ray_dist projected
+        // through fov gives pixels-per-cell at this view distance.
         let at_max = depth + 1u >= TANGENT_STACK_DEPTH;
-        if at_max {
+        let child_cell_size = cur_cell_size / 3.0;
+        let min_side = min(cur_side_dist.x, min(cur_side_dist.y, cur_side_dist.z));
+        let ray_dist = max(min_side, 0.001);
+        let lod_pixels = child_cell_size / ray_dist
+            * uniforms.screen_height / (2.0 * tan(camera.fov * 0.5));
+        let at_lod = lod_pixels < LOD_PIXEL_THRESHOLD;
+        if at_max || at_lod {
             let cell_min_h = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
             let cell_max_h = cell_min_h + vec3<f32>(cur_cell_size);
             let cell_box_h = ray_box(ray_origin, inv_dir, cell_min_h, cell_max_h);
@@ -492,7 +503,6 @@ fn march_in_tangent_cube(
         }
 
         let child_origin = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
-        let child_cell_size = cur_cell_size / 3.0;
         let node_hit = ray_box(
             ray_origin, inv_dir,
             child_origin,
@@ -1994,6 +2004,22 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 ray_origin, ray_dir,
                 uniforms.planet_render.y,
             );
+        } else if cur_kind == NODE_KIND_TANGENT_BLOCK {
+            // Active frame is a TangentBlock node. The cells inside
+            // are rotated relative to the parent frame, so we use
+            // the dedicated walker (TANGENT_STACK_DEPTH = 24, no
+            // cartesian-stack ceiling). camera.pos is already in
+            // rotated-local from `in_frame_with_rotation`; we apply
+            // Mᵀ to ray_dir here to keep all callers (shade_pixel,
+            // fs_coarse_mask, fs_main_depth) consistent — anything
+            // that calls march() lands on the right walker.
+            let c0 = uniforms.tangent_rotation_col0.xyz;
+            let c1 = uniforms.tangent_rotation_col1.xyz;
+            let c2 = uniforms.tangent_rotation_col2.xyz;
+            let rot_dir = vec3<f32>(
+                dot(c0, ray_dir), dot(c1, ray_dir), dot(c2, ray_dir),
+            );
+            r = march_in_tangent_cube(current_idx, ray_origin, rot_dir);
         } else {
             // Cartesian frame: no depth cap beyond the hardware stack
             // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole

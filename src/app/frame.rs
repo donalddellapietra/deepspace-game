@@ -100,15 +100,16 @@ pub fn compute_render_frame(
         if matches!(kind, ActiveFrameKind::TangentBlock) { Some(0) } else { None };
     let trace = std::env::var("DSG_FRAME_TRACE").map(|v| v != "0").unwrap_or(false);
     for iter_k in 0..desired_depth {
-        // WrappedPlane is a hard stop — the X-wrap branch fires at
-        // depth 0 of the marcher's local frame. TangentBlock is NOT
-        // a stop: descent continues through cartesian descendants so
-        // anchor descent moves the active frame deeper inside the
-        // rotated subtree, keeping walker stack 8 in range of the
-        // camera.
-        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
+        // Both WrappedPlane and TangentBlock are HARD STOPS. The
+        // walker that runs at the active frame (X-wrap shader for
+        // WrappedPlane, march_in_tangent_cube for TangentBlock)
+        // owns the [0, 3)³ box and traverses its full depth in
+        // one shot. Descending past these would force rays exiting
+        // the smaller frame to return sky (no ribbon support in
+        // those walkers), losing far-away content visibility.
+        if !matches!(kind, ActiveFrameKind::Cartesian) {
             if trace {
-                eprintln!("frame_trace iter={} BREAK kind=WrappedPlane reached_depth={}", iter_k, reached.depth());
+                eprintln!("frame_trace iter={} BREAK kind={:?} reached_depth={}", iter_k, kind, reached.depth());
             }
             break;
         }
