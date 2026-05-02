@@ -393,7 +393,7 @@ fn analyze_combined_projection(tree: &[u32], node_offsets: &[u32]) {
     let empty_from_culled_descends = culled_descends * 2.0;
     let empty_final = (empty_after_df - empty_from_culled_descends).max(0.0);
 
-    let after_total = empty_final + descend_after + pop_after;
+    let _after_total = empty_final + descend_after + pop_after;
 
     println!();
     println!("─────────── Combined projection ───────────");

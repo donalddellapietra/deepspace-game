@@ -85,9 +85,6 @@ pub struct EntityRasterState {
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
     batches: Vec<DrawBatch>,
-    /// Dedup staging so we don't repeat work every frame when
-    /// entity set is stable.
-    scratch_bucket: HashMap<NodeId, Vec<InstanceData>>,
 }
 
 impl EntityRasterState {
@@ -247,7 +244,6 @@ impl EntityRasterState {
             instance_buffer,
             instance_capacity: initial_instance_bytes,
             batches: Vec::new(),
-            scratch_bucket: HashMap::new(),
         }
     }
 

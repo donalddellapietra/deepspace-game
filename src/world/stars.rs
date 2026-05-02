@@ -31,7 +31,9 @@
 //! descent test covers — with explicit star occupants instead of an
 //! empty-sky aperture.
 
-use crate::world::anchor::{Path, WorldPos};
+use crate::world::anchor::WorldPos;
+#[cfg(test)]
+use crate::world::anchor::Path;
 use crate::world::bootstrap::WorldBootstrap;
 use crate::world::palette::{block, ColorRegistry};
 use crate::world::state::WorldState;

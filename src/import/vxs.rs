@@ -20,7 +20,7 @@
 //! index LUT maps `.vxs` palette → registry index.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, SeekFrom};
 use std::path::Path;
 
 use crate::world::palette::ColorRegistry;

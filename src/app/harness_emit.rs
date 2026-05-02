@@ -17,7 +17,7 @@
 
 use super::App;
 use super::test_runner::ScriptCmd;
-use crate::world::anchor::{Path, WorldPos};
+use crate::world::anchor::WorldPos;
 use crate::world::raycast::HitInfo;
 use crate::world::tree::slot_index;
 

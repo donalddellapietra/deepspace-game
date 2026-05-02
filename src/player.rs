@@ -1,12 +1,11 @@
 //! Player physics — intentionally empty.
 //!
 //! All motion is debug-only now: WASD teleports one child chunk at
-//! the current anchor depth (see `App::step_chunk`), Space/Shift
-//! move along world Y, and `App::debug_teleport` jumps to an
-//! arbitrary path. Gravity, velocity integration, and flight
-//! thrust are gone — they'll come back later under a different
-//! input mode once the coordinate refactor's behavior is
-//! stabilized.
+//! the current anchor depth, Space/Shift move along world Y, and
+//! `App::debug_teleport` jumps to an arbitrary path. Gravity,
+//! velocity integration, and flight thrust are gone — they'll come
+//! back later under a different input mode once the coordinate
+//! refactor's behavior is stabilized.
 
 use crate::camera::Camera;
 

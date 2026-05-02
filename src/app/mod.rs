@@ -143,10 +143,6 @@ pub struct App {
     pub(super) debug_overlay_visible: bool,
     pub(super) fps_smooth: f64,
     pub(super) startup_profile_frames: u32,
-    /// Path from `world.root` to the planet's body node. Used for
-    /// spawn-position derivation and for camera-local sphere focus
-    /// (`edit_actions::zoom::camera_local_sphere_focus_path`).
-    pub(super) planet_path: Option<Path>,
     /// The actual frame the renderer is using right now. This may
     /// be shallower than `render_frame()` when GPU packing flattened
     /// a slot on the intended path and `build_ribbon` had to stop
@@ -273,11 +269,13 @@ pub struct App {
     /// `Renderer` back via `UserEvent::RendererReady`, and so the
     /// browser-window resize closure can post `UserEvent::Resize`.
     /// Native keeps it for symmetry but doesn't currently send.
+    #[allow(dead_code)] // wasm-only consumer; native build keeps the field for symmetry
     pub(super) proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     /// True after we kicked off the async renderer init (WASM only).
     /// Stops `ensure_started` from re-spawning the future on every
     /// `resumed` / `about_to_wait` callback before the renderer
     /// actually arrives.
+    #[allow(dead_code)] // wasm-only
     pub(super) renderer_init_started: bool,
     /// Phase 3 Step 3.0 debug knob: constant curvature `A` to set
     /// on the renderer once it's ready (renderer is created
@@ -441,7 +439,6 @@ impl App {
             debug_overlay_visible: false,
             fps_smooth: 0.0,
             startup_profile_frames: if test_cfg.suppress_startup_logs { u32::MAX } else { 0 },
-            planet_path: bootstrap.planet_path,
             active_frame,
             test: test_runner::TestRunner::from_config(test_cfg),
             last_lod_upload_key: None,
@@ -597,21 +594,6 @@ impl App {
         { self.overlay_enabled() }
         #[cfg(target_arch = "wasm32")]
         { true }
-    }
-
-    pub(super) fn step_chunk(&mut self, axis: usize, direction: i32) {
-        if self.frozen { return; }
-        // WASD-style one-cell teleport. Use the kind-aware step so an
-        // X-axis step inside a `WrappedPlane` subtree wraps when it
-        // would have left the slab footprint instead of bubbling up
-        // into an empty sibling cell of the embedding chain.
-        self.camera.position.anchor.step_neighbor_in_world(
-            &self.world.library,
-            self.world.root,
-            axis,
-            direction,
-        );
-        self.camera.position.offset = [0.5, 0.5, 0.5];
     }
 
     pub fn debug_teleport(&mut self, slots: &[u8], offset: [f32; 3]) {
