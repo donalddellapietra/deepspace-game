@@ -638,9 +638,10 @@ fn cartesian_voxels_in_cell(
     result.hit = true;
     result.t = cart_hit.t * inv_norm;
     result.normal = n_world;
-    // Tint reddish so the prototype cell stands out from the
-    // surrounding green sphere cells.
-    result.color = cart_hit.color * vec3<f32>(1.5, 0.6, 0.6);
+    // v0 prototype: paint pure red so we can unambiguously see
+    // when the v1 dispatch fires. Replace with `cart_hit.color`
+    // (real block color) once the dispatch is verified working.
+    result.color = vec3<f32>(1.0, 0.0, 0.0);
     result.cell_min = vec3<f32>(0.0);
     result.cell_size = 1.0;
     return result;
@@ -830,6 +831,10 @@ fn sphere_uv_in_cell(
             // tangent meters at the surface. Block colored by the
             // sample's block_type with cube-face flat shading — no
             // curvature in the cell's appearance.
+            // Hybrid prototype: when this slab cell matches the proto
+            // target, render it as an axis-aligned tangent-plane CUBE
+            // (real flat box on the sphere surface) instead of a
+            // curved sphere segment.
             let proto_enabled = uniforms.proto_target_cell.x != 0u;
             let is_proto = proto_enabled
                 && lat_lo >= uniforms.proto_target_lat_lon.x - 1e-5
@@ -845,10 +850,6 @@ fn sphere_uv_in_cell(
                     lat_lo, lat_hi, lon_lo, lon_hi, r_lo, r_hi,
                 );
                 if proto_hit.hit { return proto_hit; }
-                // Box miss — fall through to normal sphere hit
-                // (the box doesn't cover the entire spherical cell
-                // segment near the edges, so grazing rays still need
-                // the curved geometry).
             }
             // tag=1 (uniform-flatten): the entire anchor subtree is
             // one Block — render at slab cell scale, no descent
