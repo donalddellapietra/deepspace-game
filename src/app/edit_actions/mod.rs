@@ -90,7 +90,17 @@ impl App {
             }
             ActiveFrameKind::Cartesian => {
                 let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
+                // Must match the GPU side: `in_frame_rot` applies the
+                // cumulative R^T·/tb_scale chain for any TBs on the
+                // frame path, so `cam_local` lands in the frame's
+                // *storage* coords. Using `in_frame` here would feed
+                // the CPU raycast pure-Cartesian coords inside what
+                // it interprets as a storage frame — cursor would
+                // target the wrong cell when the render frame's path
+                // crosses a TB.
+                let cam_local = self.camera.position.in_frame_rot(
+                    &self.world.library, self.world.root, &frame_path,
+                );
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,
