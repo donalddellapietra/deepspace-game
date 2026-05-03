@@ -73,10 +73,12 @@ use crate::world::tree::{
 };
 
 /// Depth of each per-cube subtree (the centre and the twelve face
-/// children of root). Small by default — this preset is for
-/// rotation-diversity stress on `renormalize_world`, not f32
-/// precision stress.
-const CUBE_SUBTREE_DEPTH: u8 = 6;
+/// children of root). At 30 the deepest stone leaves sit at root
+/// tree depth 31, exercising both rotation diversity (twelve
+/// distinct non-axis-aligned R's) and f32 precision stress on
+/// `renormalize_world` simultaneously — every cell-local descent
+/// through a TB chain composes a tilt with a 1/3³⁰ scale factor.
+const CUBE_SUBTREE_DEPTH: u8 = 30;
 
 /// Build a uniform-block recursive Cartesian subtree of `depth`
 /// levels. Every level dedups against the same library entry.
