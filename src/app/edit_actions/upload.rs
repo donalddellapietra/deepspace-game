@@ -202,17 +202,37 @@ impl App {
 
         // --- Ensure render path is traversible ---
         // The GPU pack may be stale: the camera moved into a region
-        // where path nodes were uniform-flattened or absent. Evict
-        // stale path ancestors from the content-address cache and
-        // re-emit them so the ribbon can descend the full path.
+        // where path nodes were uniform-flattened or absent. Probe
+        // the ribbon; if it can't follow the full intended path,
+        // evict all path ancestors and re-emit from root so the
+        // pack has fresh slabs that include the needed slots.
         {
-            let cache = self.cached_tree.as_mut().expect("cached_tree");
-            let path_fixed = cache.ensure_path_packed(
-                &self.world.library,
-                self.world.root,
+            let cache = self.cached_tree.as_ref().expect("cached_tree");
+            let probe = gpu::build_ribbon(
+                &cache.tree,
+                &cache.node_offsets,
+                cache.root_bfs_idx,
                 intended_render_path.as_slice(),
             );
-            if path_fixed {
+            if probe.reached_slots.len() < intended_render_path.depth() as usize {
+                let cache = self.cached_tree.as_mut().expect("cached_tree");
+                // Evict every node on the path so re-emit gets fresh slabs.
+                let mut nid = self.world.root;
+                cache.bfs_by_nid.remove(&nid);
+                for &slot in intended_render_path.as_slice() {
+                    let node = match self.world.library.get(nid) {
+                        Some(n) => n,
+                        None => break,
+                    };
+                    match node.children[slot as usize] {
+                        crate::world::tree::Child::Node(child) => {
+                            cache.bfs_by_nid.remove(&child);
+                            nid = child;
+                        }
+                        _ => break,
+                    }
+                }
+                cache.update_root(&self.world.library, self.world.root);
                 if let Some(renderer) = &mut self.renderer {
                     renderer.update_tree(
                         &cache.tree,
