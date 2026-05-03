@@ -550,18 +550,32 @@ impl App {
                 // `delta` is in WORLD axes (camera basis is in world
                 // frame). The offset stored in `WorldPos` lives in
                 // the deepest cell's children frame — for paths that
-                // cross a `TangentBlock`, that's `R^T · world`. Apply
-                // the cumulative anchor rotation's transpose so the
-                // step has the same axes as the offset BEFORE adding.
+                // cross a `TangentBlock`, that's `R^T · world` *and*
+                // shrunk by the inscribed-cube scale. Apply the
+                // cumulative anchor rotation's transpose AND divide
+                // by the cumulative scale so the step has the same
+                // axes / magnitude as the offset BEFORE adding.
                 // `renormalize_world` then handles cell-boundary
-                // crossings (including TB rotation pivots) cell-locally.
+                // crossings (including TB rotation+scale pivots)
+                // cell-locally.
                 let step_world = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
                 let anchor_rot = frame_path_rotation(
                     &self.world.library,
                     self.world.root,
                     &self.camera.position.anchor,
                 );
-                let step_local = mat3_transpose_mul_vec3(&anchor_rot, &step_world);
+                let anchor_scale = frame_path_scale(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position.anchor,
+                );
+                let rotated = mat3_transpose_mul_vec3(&anchor_rot, &step_world);
+                let inv_scale = if anchor_scale > 1e-6 { 1.0 / anchor_scale } else { 1.0 };
+                let step_local = [
+                    rotated[0] * inv_scale,
+                    rotated[1] * inv_scale,
+                    rotated[2] * inv_scale,
+                ];
                 self.camera.position.add_local(
                     step_local,
                     &self.world.library,
@@ -730,4 +744,37 @@ pub(super) fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
         m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
     ]
+}
+
+/// Cumulative inscribed-cube scale along `frame_path` — product of
+/// `inscribed_cube_scale(R)` for every TangentBlock encountered on
+/// the descent from `world_root`. Used to convert WSAD step from
+/// world units into the offset's frame, which gets shrunk by this
+/// factor through each TB on the anchor.
+pub(super) fn frame_path_scale(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    frame_path: &crate::world::anchor::Path,
+) -> f32 {
+    use crate::world::tree::{Child, NodeKind};
+    let mut scale: f32 = 1.0;
+    let mut node = world_root;
+    for k in 0..(frame_path.depth() as usize) {
+        let n = match library.get(node) {
+            Some(n) => n,
+            None => return scale,
+        };
+        match n.children[frame_path.slot(k) as usize] {
+            Child::Node(child_id) => {
+                if let Some(child_node) = library.get(child_id) {
+                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                        scale *= crate::world::gpu::inscribed_cube_scale(&r);
+                    }
+                }
+                node = child_id;
+            }
+            _ => return scale,
+        }
+    }
+    scale
 }
