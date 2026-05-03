@@ -221,8 +221,7 @@ impl App {
                         None => break,
                     };
                     match node.children[slot as usize] {
-                        crate::world::tree::Child::Node(child)
-                        | crate::world::tree::Child::PlacedNode { node: child, .. } => {
+                        crate::world::tree::Child::Node(child) => {
                             cache.bfs_by_nid.remove(&child);
                             nid = child;
                         }
@@ -274,8 +273,7 @@ impl App {
         for &slot in r.reached_slots.iter() {
             let Some(node) = self.world.library.get(scene_frame_id) else { break };
             match node.children[slot as usize] {
-                crate::world::tree::Child::Node(id)
-                | crate::world::tree::Child::PlacedNode { node: id, .. } => scene_frame_id = id,
+                crate::world::tree::Child::Node(id) => scene_frame_id = id,
                 _ => break,
             }
         }
@@ -303,14 +301,7 @@ impl App {
             render_path: effective_render.render_path,
             logical_path: intended_frame.logical_path,
             node_id: effective_render.node_id,
-            kind: match intended_frame.kind {
-                ActiveFrameKind::UvRingCell { .. }
-                    if effective_render.render_path == intended_frame.render_path =>
-                {
-                    intended_frame.kind
-                }
-                _ => effective_render.kind,
-            },
+            kind: effective_render.kind,
         };
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(scene_frame_bfs);
@@ -360,7 +351,6 @@ impl App {
                 ActiveFrameKind::UvRing { dims, slab_depth } => {
                     renderer.set_root_kind_uv_ring(dims, slab_depth);
                 }
-                ActiveFrameKind::UvRingCell { .. } => renderer.set_root_kind_cartesian(),
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

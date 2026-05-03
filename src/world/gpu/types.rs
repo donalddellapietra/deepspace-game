@@ -61,8 +61,9 @@ impl GpuChild {
 /// Per-packed-node metadata: 64 bytes total.
 ///
 /// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock,
-/// 3 = UvRing.
-/// `dims_x/y/z`: slab dims for `WrappedPlane` / `UvRing`; zero otherwise.
+///         3 = UvRing.
+/// `dims_x/y/z`: slab dims for `WrappedPlane` / `UvRing`; zero
+/// otherwise.
 ///
 /// `rot_col0/1/2`: 3×3 rotation matrix (column-major) for
 /// `TangentBlock`. Each column is `vec4<f32>` (xyz = column, w = 0)
@@ -94,11 +95,7 @@ impl GpuNodeKind {
                 kind: 1, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
                 rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
             },
-            NodeKind::UvRing { dims, slab_depth: _ } => Self {
-                kind: 3, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
-                rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
-            },
-            NodeKind::TangentBlock { rotation } | NodeKind::TangentPlane { rotation } => {
+            NodeKind::TangentBlock { rotation } => {
                 let content_scale = inscribed_cube_scale(&rotation);
                 Self {
                     kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
@@ -106,6 +103,10 @@ impl GpuNodeKind {
                     rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
                     rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
                 }
+            },
+            NodeKind::UvRing { dims, slab_depth: _ } => Self {
+                kind: 3, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
+                rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
             },
         }
     }
@@ -156,24 +157,12 @@ impl TbBoundary {
         Self { r, tb_scale: inscribed_cube_scale(&r) }
     }
 
-    /// Build from a `NodeKind`; returns `None` for non-geometric-TB
-    /// kinds. This is the movement/frame-normalization boundary.
+    /// Build from a `NodeKind`; returns `None` for non-TB kinds.
     pub fn from_kind(k: crate::world::tree::NodeKind) -> Option<Self> {
         if let crate::world::tree::NodeKind::TangentBlock { rotation } = k {
             Some(Self::new(rotation))
         } else {
             None
-        }
-    }
-
-    /// Build from any kind that should render/raycast through tangent
-    /// dispatch. Unlike `from_kind`, this includes `TangentPlane`,
-    /// whose movement topology remains Cartesian.
-    pub fn from_render_kind(k: crate::world::tree::NodeKind) -> Option<Self> {
-        match k {
-            crate::world::tree::NodeKind::TangentBlock { rotation }
-            | crate::world::tree::NodeKind::TangentPlane { rotation } => Some(Self::new(rotation)),
-            _ => None,
         }
     }
 

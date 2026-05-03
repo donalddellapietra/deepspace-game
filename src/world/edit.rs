@@ -98,7 +98,7 @@ pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u16) -> bo
         if let Some(parent) = world.library.get(parent_id) {
             let mut max_d = 0u32;
             for child in &parent.children {
-                if let Child::Node(nid) | Child::PlacedNode { node: nid, .. } = child {
+                if let Child::Node(nid) = child {
                     let d = depth_of_node(&world.library, *nid);
                     if d > max_d { max_d = d; }
                 }
@@ -128,9 +128,7 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_nod
         descent.push((current_id, slot));
         let Some(node) = world.library.get(current_id) else { return };
         match node.children[slot] {
-            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
-                current_id = child_id;
-            }
+            Child::Node(child_id) => current_id = child_id,
             _ => break,
         }
     }
@@ -142,7 +140,7 @@ pub fn install_subtree(world: &mut WorldState, ancestor_slots: &[usize], new_nod
         let Some(node) = world.library.get(parent_id) else { return };
         let original_kind = node.kind;
         let mut new_children = node.children;
-        new_children[slot] = preserve_placement(node.children[slot], child);
+        new_children[slot] = child;
         child = Child::Node(world.library.insert_with_kind(new_children, original_kind));
     }
 
@@ -191,7 +189,7 @@ fn place_child_at_path(
         let is_last = level == target_depth - 1;
 
         match node.children[slot] {
-            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } if !is_last => {
+            Child::Node(child_id) if !is_last => {
                 current_id = child_id;
             }
             child if is_last && is_placeable(&world.library, child) => {
@@ -258,7 +256,7 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
 
         let mut new_children = children_template;
         if let Some(nid) = replacement {
-            new_children[slot] = preserve_placement(children_template[slot], Child::Node(nid));
+            new_children[slot] = Child::Node(nid);
         } else {
             new_children[slot] = new_child;
         }
@@ -274,15 +272,6 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
     }
 }
 
-fn preserve_placement(original: Child, replacement: Child) -> Child {
-    match (original, replacement) {
-        (Child::PlacedNode { kind, .. }, Child::Node(node)) => {
-            Child::PlacedNode { node, kind }
-        }
-        (_, child) => child,
-    }
-}
-
 /// A cell is placeable if it's Empty or an all-empty Node subtree
 /// (`representative_block == REPRESENTATIVE_EMPTY`). At coarser zoom
 /// levels, air regions are represented as Node subtrees rather than
@@ -291,7 +280,7 @@ fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
     use crate::world::tree::REPRESENTATIVE_EMPTY;
     match child {
         Child::Empty => true,
-        Child::Node(id) | Child::PlacedNode { node: id, .. } => library
+        Child::Node(id) => library
             .get(id)
             .map_or(false, |n| n.representative_block == REPRESENTATIVE_EMPTY),
         Child::Block(_) => false,
@@ -394,47 +383,6 @@ mod tests {
             face: 2, t: 1.0, place_path: None,
         };
         assert!(!place_block(&mut world, &hit, block::BRICK));
-    }
-
-    #[test]
-    fn edit_inside_placed_node_preserves_placement_kind() {
-        let mut library = NodeLibrary::default();
-        let content = library.build_uniform_subtree(block::GRASS, 2);
-        let Child::Node(content_id) = content else {
-            panic!("uniform depth 2 must build a node");
-        };
-        let rotation = crate::world::tree::rotation_y(0.5);
-        let mut root_children = empty_children();
-        let root_slot = slot_index(1, 1, 1);
-        root_children[root_slot] = Child::PlacedNode {
-            node: content_id,
-            kind: NodeKind::TangentBlock { rotation },
-        };
-        let root = library.insert(root_children);
-        library.ref_inc(root);
-        let mut world = WorldState { root, library };
-
-        let leaf_slot = slot_index(1, 1, 1);
-        let leaf_id = match world.library.get(content_id).unwrap().children[leaf_slot] {
-            Child::Node(id) => id,
-            other => panic!("expected inner node, got {other:?}"),
-        };
-        let hit = HitInfo {
-            path: vec![(root, root_slot), (content_id, leaf_slot), (leaf_id, leaf_slot)],
-            face: 2,
-            t: 1.0,
-            place_path: None,
-        };
-
-        assert!(break_block(&mut world, &hit));
-        let root_node = world.library.get(world.root).unwrap();
-        match root_node.children[root_slot] {
-            Child::PlacedNode { node, kind: NodeKind::TangentBlock { rotation: r } } => {
-                assert_ne!(node, content_id, "edited content should get a new dedup id");
-                assert_eq!(r, rotation, "placement rotation must survive edit propagation");
-            }
-            other => panic!("expected placed tangent node after edit, got {other:?}"),
-        }
     }
 
     /// Cross-node placement must work identically at shallow and deep

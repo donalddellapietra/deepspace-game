@@ -80,7 +80,7 @@ pub fn cpu_raycast_wrapped_planet(
         let node = library.get(cur)?;
         frame_chain.push((cur, slot as usize));
         match node.children[slot as usize] {
-            Child::Node(child) | Child::PlacedNode { node: child, .. } => cur = child,
+            Child::Node(child) => cur = child,
             _ => return None,
         }
     }
@@ -151,7 +151,7 @@ pub fn cpu_raycast_wrapped_planet(
                     cell_terminated_uniform = Some(bt);
                     break;
                 }
-                Child::Node(child) | Child::PlacedNode { node: child, .. } => {
+                Child::Node(child) => {
                     if level + 1 < slab_depth {
                         idx = child;
                     } else {

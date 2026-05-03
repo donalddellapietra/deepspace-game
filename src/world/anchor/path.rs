@@ -192,22 +192,14 @@ pub(super) fn node_kind_at_depth(
     slots: &[u8],
 ) -> Option<NodeKind> {
     let mut cur = world_root;
-    let mut kind = library.get(cur).map(|n| n.kind)?;
     for &s in slots {
         let node = library.get(cur)?;
         match node.children[s as usize] {
-            Child::Node(child) => {
-                cur = child;
-                kind = library.get(cur).map(|n| n.kind)?;
-            }
-            Child::PlacedNode { node, kind: placement_kind } => {
-                cur = node;
-                kind = placement_kind;
-            }
+            Child::Node(child) => cur = child,
             _ => return None,
         }
     }
-    Some(kind)
+    library.get(cur).map(|n| n.kind)
 }
 
 impl Default for Path {

@@ -20,8 +20,11 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
+    /// The render frame is rooted at a `NodeKind::UvRing` node.
+    /// The shader dispatches `march_uv_ring` at ribbon level 0;
+    /// the slab's `(dims, slab_depth)` carry the cell count and
+    /// storage depth.
     UvRing { dims: [u32; 3], slab_depth: u8 },
-    UvRingCell { dims: [u32; 3], slab_depth: u8, cell_x: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,11 +51,10 @@ pub fn frame_from_slots(slots: &[u8]) -> Path {
 /// Resolve the active frame.
 ///
 /// Descends from `world_root` along `camera_anchor` for at most
-/// `desired_depth` slot steps. If the reached frame root itself is
-/// a `WrappedPlane`, the shader renders the overview sphere. Once
-/// the requested frame descends below it, rendering returns to
-/// ordinary Cartesian local coordinates; wrapped-planet slab cells
-/// are `TangentPlane` anchors, so deep zoom stays precision-stable.
+/// `desired_depth` slot steps. Stops early at a `WrappedPlane`
+/// node — the wrap branch in the shader fires at depth==0 of the
+/// marcher's local frame, so the render frame must be the slab
+/// root, not a sub-cell of it.
 ///
 /// TangentBlock nodes are traversed normally (descent continues
 /// into their children). The shader handles the visual rotation
@@ -67,15 +69,41 @@ pub fn compute_render_frame(
     target.truncate(desired_depth);
     let mut node_id = world_root;
     let mut reached = Path::root();
-    let mut kind = active_frame_kind_for_node(library, node_id);
+    let mut kind = match library.get(world_root).map(|n| n.kind) {
+        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
+            ActiveFrameKind::WrappedPlane { dims, slab_depth }
+        }
+        Some(NodeKind::UvRing { dims, slab_depth }) => {
+            ActiveFrameKind::UvRing { dims, slab_depth }
+        }
+        _ => ActiveFrameKind::Cartesian,
+    };
     for k in 0..target.depth() as usize {
+        if matches!(
+            kind,
+            ActiveFrameKind::WrappedPlane { .. } | ActiveFrameKind::UvRing { .. },
+        ) {
+            break;
+        }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
-            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+            Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
-                kind = active_frame_kind_for_node(library, node_id);
+                if let Some(child_node) = library.get(child_id) {
+                    match child_node.kind {
+                        NodeKind::WrappedPlane { dims, slab_depth } => {
+                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                            break;
+                        }
+                        NodeKind::UvRing { dims, slab_depth } => {
+                            kind = ActiveFrameKind::UvRing { dims, slab_depth };
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
@@ -85,18 +113,6 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
-    }
-}
-
-fn active_frame_kind_for_node(library: &NodeLibrary, node_id: NodeId) -> ActiveFrameKind {
-    match library.get(node_id).map(|n| n.kind) {
-        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
-            ActiveFrameKind::WrappedPlane { dims, slab_depth }
-        }
-        Some(NodeKind::UvRing { dims, slab_depth }) => {
-            ActiveFrameKind::UvRing { dims, slab_depth }
-        }
-        _ => ActiveFrameKind::Cartesian,
     }
 }
 
@@ -116,9 +132,7 @@ pub fn render_frame_stop_reason(
         };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
-            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
-                node_id = child_id;
-            }
+            Child::Node(child_id) => { node_id = child_id; }
             Child::Block(_) => return format!("Block@{}:s{}", k, slot),
             Child::Empty => return format!("Empty@{}:s{}", k, slot),
             Child::EntityRef(_) => return format!("Entity@{}:s{}", k, slot),
@@ -226,6 +240,8 @@ mod tests {
         let mut lib = NodeLibrary::default();
         let mut wp_children = empty_children();
         wp_children[slot_index(0, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
+        wp_children[slot_index(1, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
+        wp_children[slot_index(2, 0, 0)] = Child::Block(crate::world::palette::block::GRASS);
         let wp = lib.insert_with_kind(
             wp_children,
             NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
@@ -238,7 +254,7 @@ mod tests {
         let mut anchor = Path::root();
         anchor.push(slot_index(1, 1, 1) as u8);
         anchor.push(slot_index(2, 0, 0) as u8);
-        let frame = compute_render_frame(&lib, root, &anchor, 1);
+        let frame = compute_render_frame(&lib, root, &anchor, 5);
         assert_eq!(frame.render_path.depth(), 1);
         match frame.kind {
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
@@ -247,30 +263,6 @@ mod tests {
             }
             other => panic!("expected WrappedPlane kind, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn render_frame_descends_below_wrapped_plane_for_deep_local_frames() {
-        use crate::world::tree::{empty_children, slot_index, NodeKind};
-        let mut lib = NodeLibrary::default();
-        let leaf = lib.insert(empty_children());
-        let mut wp_children = empty_children();
-        wp_children[slot_index(2, 0, 0)] = Child::Node(leaf);
-        let wp = lib.insert_with_kind(
-            wp_children,
-            NodeKind::WrappedPlane { dims: [3, 1, 1], slab_depth: 1 },
-        );
-        let mut root_children = empty_children();
-        root_children[slot_index(1, 1, 1)] = Child::Node(wp);
-        let root = lib.insert(root_children);
-        lib.ref_inc(root);
-
-        let mut anchor = Path::root();
-        anchor.push(slot_index(1, 1, 1) as u8);
-        anchor.push(slot_index(2, 0, 0) as u8);
-        let frame = compute_render_frame(&lib, root, &anchor, 2);
-        assert_eq!(frame.render_path.depth(), 2);
-        assert!(matches!(frame.kind, ActiveFrameKind::Cartesian));
     }
 
     #[test]

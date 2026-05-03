@@ -10,7 +10,7 @@ use super::state::WorldState;
 mod dodecahedron_test;
 mod plain;
 mod rotated_cube_test;
-mod uv_sphere_test;
+mod sphere_ring_test;
 mod vox;
 mod wrapped_planet;
 
@@ -22,7 +22,7 @@ pub use vox::bootstrap_vox_model_world;
 pub use wrapped_planet::{
     wrapped_planet_spawn, wrapped_planet_world, DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
     DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH, DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
-    DEFAULT_WRAPPED_PLANET_SLAB_DIMS, DEFAULT_WRAPPED_PLANET_LAT_MAX,
+    DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
 };
 
 /// Re-export of [`crate::world::fractals::menger::menger_world`] for
@@ -116,9 +116,14 @@ pub enum WorldPreset {
     /// `renormalize_world` against twelve distinct *non*-axis-aligned
     /// rotations.
     DodecahedronTest,
-    /// Dodecahedron-style UV sphere: tangent-plane cells placed as
-    /// real tree geometry on a spherical shell.
-    UvSphereTest,
+    /// Sphere-ring primitive: an unrotated centre cube surrounded by
+    /// eight `TangentBlock` cubes on the y=1 plane perimeter, each
+    /// rotated so its storage `+Y` aligns to the ring radial
+    /// direction. Stresses `TbBoundary` against eight rotations that
+    /// vary continuously around a single axis — a one-parameter
+    /// rotation sweep using only the existing TB primitive (no new
+    /// `NodeKind`, no global-coord shader path).
+    SphereRingTest,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -151,7 +156,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         WorldPreset::WrappedPlanet { .. } => None,
         WorldPreset::RotatedCubeTest => None,
         WorldPreset::DodecahedronTest => None,
-        WorldPreset::UvSphereTest => None,
+        WorldPreset::SphereRingTest => None,
     }
 }
 
@@ -240,8 +245,8 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         WorldPreset::DodecahedronTest => {
             dodecahedron_test::bootstrap_dodecahedron_test_world()
         }
-        WorldPreset::UvSphereTest => {
-            uv_sphere_test::bootstrap_uv_sphere_test_world()
+        WorldPreset::SphereRingTest => {
+            sphere_ring_test::bootstrap_sphere_ring_test_world()
         }
     }
 }

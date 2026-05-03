@@ -34,10 +34,6 @@ pub enum Child {
     Empty,
     Block(u16),
     Node(NodeId),
-    PlacedNode {
-        node: NodeId,
-        kind: NodeKind,
-    },
     EntityRef(u32),
 }
 
@@ -56,23 +52,6 @@ impl Child {
     #[inline]
     pub fn is_solid(self) -> bool {
         !self.is_empty()
-    }
-
-    #[inline]
-    pub fn node_id(self) -> Option<NodeId> {
-        match self {
-            Child::Node(id) => Some(id),
-            Child::PlacedNode { node, .. } => Some(node),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn placement_kind(self) -> Option<NodeKind> {
-        match self {
-            Child::PlacedNode { kind, .. } => Some(kind),
-            _ => None,
-        }
     }
 }
 
@@ -108,13 +87,6 @@ pub enum NodeKind {
         dims: [u32; 3],
         slab_depth: u8,
     },
-    /// Straight UV lattice rendered as a circular ring. The content
-    /// stays Cartesian under the node; render/raycast entry maps the
-    /// X row around a ring instead of a sphere.
-    UvRing {
-        dims: [u32; 3],
-        slab_depth: u8,
-    },
     /// A Cartesian subtree whose local `[0, 3)³` frame is rotated
     /// relative to its parent's slot frame. The rotation is applied
     /// at descent around the cube's geometric center `(1.5, 1.5, 1.5)`
@@ -130,14 +102,23 @@ pub enum NodeKind {
     TangentBlock {
         rotation: [[f32; 3]; 3],
     },
-    /// A Cartesian slab cell that renders/raycasts through a rotated
-    /// tangent frame but keeps ordinary Cartesian movement topology.
+    /// UV-ring topology adapter. Cells are stored in a `[N, 1, 1]`
+    /// slab (slab-style, like `WrappedPlane`) and rendered as `N`
+    /// cubes evenly spaced around a circle inside the node's local
+    /// `[0, 3)³` frame. Cell `x` is rendered at angle
+    /// `θ_x = -π + (x + 0.5) · 2π/N`, oriented so that storage `+X`
+    /// aligns to the ring tangent and storage `+Y` to the radial
+    /// direction.
     ///
-    /// This is used by UV wrapped planets: stepping out of the cell
-    /// should move to the neighboring UV slab slot, while visuals are
-    /// oriented by the latitude/longitude tangent basis.
-    TangentPlane {
-        rotation: [[f32; 3]; 3],
+    /// All ring topology lives strictly within this node's local
+    /// `[0, 3)³` — no global coordinates are ever passed to the
+    /// renderer. The displacement from each cell's storage slot
+    /// (a thin `[3/N, 3, 3]` slab cell) to its on-ring cube is
+    /// applied at march time by the shader / CPU raycast, exactly
+    /// once per ray, in a single cell-local transform.
+    UvRing {
+        dims: [u32; 3],
+        slab_depth: u8,
     },
 }
 
@@ -181,17 +162,13 @@ impl PartialEq for NodeKind {
                 NodeKind::WrappedPlane { dims: b, slab_depth: bd },
             ) => a == b && ad == bd,
             (
-                NodeKind::UvRing { dims: a, slab_depth: ad },
-                NodeKind::UvRing { dims: b, slab_depth: bd },
-            ) => a == b && ad == bd,
-            (
                 NodeKind::TangentBlock { rotation: a },
                 NodeKind::TangentBlock { rotation: b },
             ) => rotation_bits(a) == rotation_bits(b),
             (
-                NodeKind::TangentPlane { rotation: a },
-                NodeKind::TangentPlane { rotation: b },
-            ) => rotation_bits(a) == rotation_bits(b),
+                NodeKind::UvRing { dims: a, slab_depth: ad },
+                NodeKind::UvRing { dims: b, slab_depth: bd },
+            ) => a == b && ad == bd,
             _ => false,
         }
     }
@@ -214,15 +191,12 @@ impl Hash for NodeKind {
                 dims.hash(state);
                 slab_depth.hash(state);
             }
-            NodeKind::UvRing { dims, slab_depth } => {
-                dims.hash(state);
-                slab_depth.hash(state);
-            }
             NodeKind::TangentBlock { rotation } => {
                 rotation_bits(rotation).hash(state);
             }
-            NodeKind::TangentPlane { rotation } => {
-                rotation_bits(rotation).hash(state);
+            NodeKind::UvRing { dims, slab_depth } => {
+                dims.hash(state);
+                slab_depth.hash(state);
             }
         }
     }
@@ -245,20 +219,6 @@ impl NodeKind {
     #[inline]
     pub fn is_tangent_block(self) -> bool {
         matches!(self, NodeKind::TangentBlock { .. })
-    }
-
-    /// True iff this kind is `TangentPlane`, regardless of rotation.
-    #[inline]
-    pub fn is_tangent_plane(self) -> bool {
-        matches!(self, NodeKind::TangentPlane { .. })
-    }
-
-    /// True iff this kind should use tangent-frame render/raycast
-    /// dispatch. `TangentPlane` intentionally does not participate
-    /// in movement normalization; see `TbBoundary::from_kind`.
-    #[inline]
-    pub fn is_tangent_dispatch(self) -> bool {
-        matches!(self, NodeKind::TangentBlock { .. } | NodeKind::TangentPlane { .. })
     }
 }
 
@@ -359,7 +319,7 @@ impl NodeLibrary {
         let child_node_ids: Vec<NodeId> = children
             .iter()
             .filter_map(|c| match c {
-                Child::Node(nid) | Child::PlacedNode { node: nid, .. } => Some(*nid),
+                Child::Node(nid) => Some(*nid),
                 _ => None,
             })
             .collect();
@@ -377,7 +337,7 @@ impl NodeLibrary {
         for c in &children {
             match c {
                 Child::Block(bt) => *counts.entry(*bt).or_insert(0) += 1,
-                Child::Node(nid) | Child::PlacedNode { node: nid, .. } => {
+                Child::Node(nid) => {
                     if let Some(child_node) = self.nodes.get(nid) {
                         if child_node.representative_block != REPRESENTATIVE_EMPTY {
                             *counts
@@ -410,7 +370,6 @@ impl NodeLibrary {
                         .get(nid)
                         .map(|n| n.uniform_type)
                         .unwrap_or(UNIFORM_MIXED),
-                    Child::PlacedNode { .. } => UNIFORM_MIXED,
                     // EntityRef children force MIXED so pack.rs never
                     // tries to uniform-flatten a scene ancestor into
                     // a single Block.
@@ -440,7 +399,7 @@ impl NodeLibrary {
         // per insert thanks to child caching.
         let mut max_child_depth = 0u32;
         for c in &children {
-            if let Child::Node(nid) | Child::PlacedNode { node: nid, .. } = c {
+            if let Child::Node(nid) = c {
                 if let Some(child_node) = self.nodes.get(nid) {
                     if child_node.depth > max_child_depth {
                         max_child_depth = child_node.depth;
@@ -526,7 +485,7 @@ impl NodeLibrary {
             if v.is_empty() { self.by_hash.remove(&h); }
         }
         for child in &node.children {
-            if let Child::Node(nid) | Child::PlacedNode { node: nid, .. } = child {
+            if let Child::Node(nid) = child {
                 self.ref_dec(*nid);
             }
         }

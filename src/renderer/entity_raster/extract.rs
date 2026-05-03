@@ -298,7 +298,7 @@ fn fill_dense(
         match node.children[slot] {
             Child::Empty => {}
             Child::Block(bt) => fill_block(grid, res, cx, cy, cz, child_res, bt),
-            Child::Node(nid) | Child::PlacedNode { node: nid, .. } => {
+            Child::Node(nid) => {
                 if child_res == 0 { continue; }
                 fill_dense(library, nid, grid, res, cx, cy, cz, child_res);
             }

@@ -41,7 +41,7 @@ impl App {
         // own LOD_PIXEL_THRESHOLD handles per-cell gating, and the
         // CPU cap is too conservative for inside-frame cameras
         // (especially TB frames stopped at depth 1).
-        let cam_local = self.camera_local_for_active_frame(&self.active_frame);
+        let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
         let camera_inside = cam_local.iter().all(|&v| v >= 0.0 && v <= 3.0);
         let local_cap = if camera_inside {
             MAX_LOCAL_VISUAL_DEPTH
@@ -61,8 +61,9 @@ impl App {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian
             | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::UvRing { .. }
-            | ActiveFrameKind::UvRingCell { .. } => self.camera_local_for_active_frame(frame),
+            | ActiveFrameKind::UvRing { .. } => {
+                self.camera.position.in_frame(&frame.render_path)
+            }
         };
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
@@ -76,9 +77,8 @@ impl App {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Cartesian
             | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::UvRing { .. }
-            | ActiveFrameKind::UvRingCell { .. } => (
-                self.camera_local_for_active_frame(frame),
+            | ActiveFrameKind::UvRing { .. } => (
+                self.camera.position.in_frame(&frame.render_path),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
             ),
@@ -102,27 +102,6 @@ impl App {
             let logical_path = frame.logical_path;
             let mut shallower = frame.render_path;
             shallower.truncate(frame.render_path.depth().saturating_sub(1));
-            if let ActiveFrameKind::UvRingCell { slab_depth, .. } = frame.kind {
-                if shallower.depth() < slab_depth {
-                    break;
-                }
-                let render = frame::compute_render_frame(
-                    &self.world.library,
-                    self.world.root,
-                    &shallower,
-                    shallower.depth(),
-                );
-                if render.render_path != shallower {
-                    break;
-                }
-                frame = ActiveFrame {
-                    render_path: render.render_path,
-                    logical_path,
-                    node_id: render.node_id,
-                    kind: frame.kind,
-                };
-                continue;
-            }
             let render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
@@ -148,9 +127,10 @@ impl App {
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
                 ActiveFrameKind::Cartesian
-                | ActiveFrameKind::WrappedPlane { .. }
-                | ActiveFrameKind::UvRing { .. }
-                | ActiveFrameKind::UvRingCell { .. } => self.camera_local_for_active_frame(&frame),
+            | ActiveFrameKind::WrappedPlane { .. }
+            | ActiveFrameKind::UvRing { .. } => {
+                    self.camera.position.in_frame(&frame.render_path)
+                }
             };
             eprintln!(
                 "target_frame stable render_path={:?} logical_path={:?} kind={:?} cam_local={:?}",
@@ -164,7 +144,6 @@ impl App {
     }
 
     pub fn apply_zoom(&mut self) {
-        self.ensure_uv_ring_camera_anchor_local();
         self.ui.zoom_level = self.zoom_level();
         let frame = self.target_render_frame();
         self.active_frame = frame;

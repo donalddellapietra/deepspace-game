@@ -339,6 +339,11 @@ impl Renderer {
         self.write_uniforms();
     }
 
+    /// Set the frame-root NodeKind to `UvRing`, carrying the slab's
+    /// `(dims_x, dims_y, dims_z, slab_depth)`. The shader's
+    /// `march_uv_ring` reads `dims.x` (cell count) and `slab_depth`
+    /// to walk the ring's storage children; the cell layout in the
+    /// ring's local `[0, 3)³` is fixed by the kind alone.
     pub fn set_root_kind_uv_ring(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_UV_RING;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
@@ -525,7 +530,7 @@ impl Renderer {
     /// radians (e.g. 1.26 ≈ 72°). Cells past this latitude return
     /// no-hit so they read as sky.
     pub fn set_planet_lat_max(&mut self, lat_max_rad: f32) {
-        self.planet_render = [1.0, lat_max_rad, 0.0, 0.0];
+        self.planet_render = [0.0, lat_max_rad, 0.0, 0.0];
         self.write_uniforms();
     }
 }

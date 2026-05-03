@@ -199,8 +199,8 @@ impl TestConfig {
                 "--dodecahedron-test" => {
                     cfg.world_preset = WorldPreset::DodecahedronTest;
                 }
-                "--uv-sphere-test" => {
-                    cfg.world_preset = WorldPreset::UvSphereTest;
+                "--sphere-ring-test" => {
+                    cfg.world_preset = WorldPreset::SphereRingTest;
                 }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
@@ -540,21 +540,29 @@ VISIBILITY TEST PRESETS:
   --dodecahedron-test         Centre cube + 12 TangentBlocks rotated to
                               the regular-dodecahedron face normals;
                               rotation-diversity stress on renormalize
-  --uv-sphere-test            Dodecahedron-style UV sphere: many
-                              TangentBlock cells placed as real sphere
-                              geometry, not a flat slab reinterpretation
-  --wrapped-planet            UV tangent-plane planet: 27x2x14
+  --sphere-ring-test          Centre cube + 8 TangentBlocks on the y=1
+                              plane perimeter, rotated so storage +Y
+                              aligns to the ring radial direction;
+                              one-axis rotation sweep using only the
+                              existing TB primitive
+  --wrapped-planet            Wrapped-Cartesian planet: 27x2x14
                               grass/dirt/stone slab with X-axis wrap
-                              (longitude). Each occupied cell is a
-                              TangentBlock rotated from its lat/lon
-                              center; no analytical sphere primitive.
-                              Default total tree depth: 25.
+                              (longitude). Default total tree depth: 25
+                              (embedding 22 + slab 3). No curvature yet.
   --planet-layers N           (After --wrapped-planet) Override total
                               tree depth. e.g. `--planet-layers 40`
                               puts slab leaves at world-tree depth 40
                               (embedding 37 + slab 3). Stress-tests the
                               wrap math at deep precision. Must come
                               after `--wrapped-planet`.
+  --wrapped-planet-tangent    (After --wrapped-planet) Slab cell anchors
+                              become NodeKind::TangentBlock. The shader
+                              transforms each ray into the cell's local
+                              tangent-cube frame and dispatches the
+                              precision-stable Cartesian DDA below — so
+                              40+ deeper layers retain precision the way
+                              sphere-DDA descent cannot.
+
 MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
 scripts/fetch-glb-presets.sh to download source GLBs):
   --sponza-world              Crytek Sponza atrium (Khronos glTF Sample Assets)

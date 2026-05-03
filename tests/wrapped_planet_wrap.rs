@@ -72,7 +72,7 @@ fn step_neighbor_in_world_wraps_east_to_west() {
     let mut pos = pos_at_slab_cell(&slab_root, dims[0] - 1, 1, 1, slab_depth);
     let anchor_before = pos.anchor.as_slice().to_vec();
     let dir = 1; // east
-    let (_stepped, wrapped) = pos
+    let wrapped = pos
         .anchor
         .step_neighbor_in_world(&world.library, world.root, 0, dir);
     assert!(wrapped, "stepping east off slab east edge should wrap");
@@ -90,7 +90,7 @@ fn step_neighbor_in_world_wraps_west_to_east() {
     let (world, slab_root, dims, slab_depth) = canonical_world();
     let mut pos = pos_at_slab_cell(&slab_root, 0, 1, 1, slab_depth);
     let dir = -1; // west
-    let (_stepped, wrapped) = pos
+    let wrapped = pos
         .anchor
         .step_neighbor_in_world(&world.library, world.root, 0, dir);
     assert!(wrapped, "stepping west off slab west edge should wrap");

@@ -162,7 +162,7 @@ pub fn is_solid_at(
         match node.children[slot] {
             Child::Empty | Child::EntityRef(_) => return false,
             Child::Block(_) => return true,
-            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+            Child::Node(child_id) => {
                 if depth + 1 >= max_depth {
                     return true;
                 }
@@ -195,8 +195,8 @@ fn build_frame_chain(
     for &slot in frame_path {
         let Some(node) = library.get(current) else { break };
         entries.push((current, slot as usize));
-        match node.children[slot as usize].node_id() {
-            Some(child_id) => {
+        match node.children[slot as usize] {
+            Child::Node(child_id) => {
                 current = child_id;
                 chain.push(current);
             }

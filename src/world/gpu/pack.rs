@@ -58,7 +58,7 @@
 use std::collections::HashMap;
 
 use crate::world::tree::{
-    Child, NodeId, NodeKind, NodeLibrary, UNIFORM_EMPTY, UNIFORM_MIXED,
+    Child, NodeId, NodeLibrary, UNIFORM_EMPTY, UNIFORM_MIXED,
 };
 
 use super::types::{GpuChild, GpuNodeKind};
@@ -94,7 +94,6 @@ pub struct CachedTree {
     pub aabbs: Vec<u32>,
     pub node_ids: Vec<NodeId>,
     pub bfs_by_nid: HashMap<NodeId, u32>,
-    bfs_by_placed: HashMap<(NodeId, NodeKind), u32>,
     pub root_bfs_idx: u32,
 }
 
@@ -107,7 +106,6 @@ impl Default for CachedTree {
             aabbs: Vec::new(),
             node_ids: Vec::new(),
             bfs_by_nid: HashMap::new(),
-            bfs_by_placed: HashMap::new(),
             root_bfs_idx: 0,
         }
     }
@@ -143,36 +141,6 @@ impl CachedTree {
         if let Some(&bfs) = self.bfs_by_nid.get(&nid) {
             return bfs;
         }
-        let bfs = self.emit_node(library, nid);
-        self.bfs_by_nid.insert(nid, bfs);
-        bfs
-    }
-
-    fn emit_or_lookup_placed(
-        &mut self,
-        library: &NodeLibrary,
-        nid: NodeId,
-        placement_kind: NodeKind,
-    ) -> u32 {
-        let key = (nid, placement_kind);
-        if let Some(&bfs) = self.bfs_by_placed.get(&key) {
-            return bfs;
-        }
-        let content_bfs = self.emit_or_lookup(library, nid);
-        let bfs = self.node_offsets.len() as u32;
-        self.node_offsets.push(self.node_offsets[content_bfs as usize]);
-        self.aabbs.push(self.aabbs[content_bfs as usize]);
-        self.node_kinds.push(GpuNodeKind::from_node_kind(placement_kind));
-        self.node_ids.push(nid);
-        self.bfs_by_placed.insert(key, bfs);
-        bfs
-    }
-
-    fn emit_node(
-        &mut self,
-        library: &NodeLibrary,
-        nid: NodeId,
-    ) -> u32 {
         let (children, kind) = {
             let node = library
                 .get(nid)
@@ -213,6 +181,7 @@ impl CachedTree {
         self.aabbs.push(content_aabb(occ) as u32);
         self.node_kinds.push(GpuNodeKind::from_node_kind(kind));
         self.node_ids.push(nid);
+        self.bfs_by_nid.insert(nid, bfs);
         bfs
     }
 
@@ -230,8 +199,9 @@ impl CachedTree {
                 Some(n) => n,
                 None => return false,
             };
-            let Some(child_id) = node.children[slot as usize].node_id() else {
-                return false;
+            let child_id = match node.children[slot as usize] {
+                Child::Node(id) => id,
+                _ => return false,
             };
             let header_off = self.node_offsets[parent_bfs as usize] as usize;
             let occupancy = self.tree[header_off];
@@ -270,8 +240,9 @@ impl CachedTree {
                 Some(n) => n,
                 None => return (i, patches, "lib_miss"),
             };
-            let Some(child_id) = node.children[slot as usize].node_id() else {
-                return (i, patches, "not_node");
+            let child_id = match node.children[slot as usize] {
+                Child::Node(id) => id,
+                _ => return (i, patches, "not_node"),
             };
             let header_off = self.node_offsets[parent_bfs as usize] as usize;
             let occupancy = self.tree[header_off];
@@ -315,12 +286,11 @@ impl CachedTree {
                 0,
                 entity_idx,
             )),
-            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
-                let placement_kind = child.placement_kind();
+            Child::Node(child_id) => {
                 let (allows_flatten, uniform_type, representative) = {
                     let node = library.get(child_id)?;
                     (
-                        placement_kind.unwrap_or(node.kind).allows_uniform_flatten(),
+                        node.kind.allows_uniform_flatten(),
                         node.uniform_type,
                         node.representative_block,
                     )
@@ -329,18 +299,12 @@ impl CachedTree {
                     // Emit as tag=2 (Node) so the ribbon can traverse
                     // through it. Content-addressed dedup means all
                     // uniform-empty Nodes share one BFS entry.
-                    let child_bfs = match placement_kind {
-                        Some(kind) => self.emit_or_lookup_placed(library, child_id, kind),
-                        None => self.emit_or_lookup(library, child_id),
-                    };
+                    let child_bfs = self.emit_or_lookup(library, child_id);
                     Some(GpuChild::new(2, representative, 0, child_bfs))
                 } else if allows_flatten && uniform_type != UNIFORM_MIXED {
                     Some(GpuChild::new(1, uniform_type, 0, 0))
                 } else {
-                    let child_bfs = match placement_kind {
-                        Some(kind) => self.emit_or_lookup_placed(library, child_id, kind),
-                        None => self.emit_or_lookup(library, child_id),
-                    };
+                    let child_bfs = self.emit_or_lookup(library, child_id);
                     // `flags` filled in by the caller when emitting
                     // the parent's slab (carries content AABB bits),
                     // at which point the child's occupancy is known.

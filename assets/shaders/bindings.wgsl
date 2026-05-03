@@ -101,6 +101,9 @@ const ROOT_KIND_CARTESIAN: u32 = 0u;
 /// Cartesian (the marcher does not branch on root_kind). Phase 2 will
 /// hook X-wrap on this kind; Phase 3 will hook curvature.
 const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
+/// UvRing root kind. The marcher dispatches `march_uv_ring` instead
+/// of `march_cartesian` at ribbon level 0. The ring's local frame is
+/// the standard `[0, 3)³` of any node — no global coords leak in.
 const ROOT_KIND_UV_RING: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
@@ -127,7 +130,7 @@ struct NodeKindGpu {
     dims_z: u32,
     /// 3×3 rotation matrix (column-major) for TangentBlock. Each
     /// column is `vec4<f32>` (w = 0 padding for std140 alignment).
-    /// Identity for Cartesian / WrappedPlane (unread there).
+    /// Identity for Cartesian / WrappedPlane / UvRing (unread there).
     /// Applied at descent: `local = R^T·(child_local - 1.5) + 1.5`.
     rot_col0: vec4<f32>,
     rot_col1: vec4<f32>,

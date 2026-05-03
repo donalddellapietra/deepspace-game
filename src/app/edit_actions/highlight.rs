@@ -29,10 +29,7 @@ impl App {
         // axis-aligned `hit_aabb_in_frame_local` would draw at the
         // wrong place. Skip highlight; break/place still target the
         // correct slab cell because the raycast returns a path.
-        if matches!(
-            self.active_frame.kind,
-            ActiveFrameKind::WrappedPlane { .. } | ActiveFrameKind::UvRing { .. }
-        ) {
+        if matches!(self.active_frame.kind, ActiveFrameKind::WrappedPlane { .. }) {
             self.last_highlight_raycast_ms = 0.0;
             self.last_highlight_set_ms = 0.0;
             self.cached_highlight = None;

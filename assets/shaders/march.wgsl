@@ -1619,10 +1619,29 @@ fn march_wrapped_planet(
     return result;
 }
 
+// UV-ring topology adapter.
+//
+// Renders an `[N, 1, 1]` storage slab as `N` cubes evenly spaced
+// around a circle in the ring node's local `[0, 3)³` frame. Cells
+// are stored at storage slot `(cell_x, 0, 0)`; the topology adapter
+// is the only place that knows about ring positioning.
+//
+// The ring is implicitly in `[0, 3)³` — no `body_origin` / `body_size`
+// parameters; every transform stays cell-local. The ring centre is
+// `(1.5, 1.5, 1.5)`, the radius is fixed at `RING_RADIUS`, and each
+// cell is a cube of side `arc · RING_PACKING`. For `dims_x = 27`,
+// `arc ≈ 0.233` and the cell side ≈ `0.221` — comfortably within
+// the ring's `[0, 3)³`.
+//
+// O(N) ray loop. Each iteration:
+//   1. Ring tangent basis at `θ = -π + (cell_x + 0.5)·2π/N`.
+//   2. Lookup cell content via `sample_slab_cell(ring, depth, x, 0, 0)`.
+//   3. Transform the ray into the cell's local `[0, 3)³`
+//      (rotate by tangent / radial / up; scale by `3 / cell_side`).
+//   4. Dispatch `march_in_tangent_cube` on the cell content.
+//   5. Keep the closest hit across all cells.
 fn march_uv_ring(
     ring_idx: u32,
-    body_origin: vec3<f32>,
-    body_size: f32,
     ray_origin: vec3<f32>,
     ray_dir_in: vec3<f32>,
 ) -> HitResult {
@@ -1638,29 +1657,34 @@ fn march_uv_ring(
     let slab_depth = uniforms.slab_dims.w;
     if dims_x <= 0 { return result; }
 
-    let center = body_origin + vec3<f32>(body_size * 0.5);
     let pi = 3.14159265;
-    let angle_step = 2.0 * pi / f32(dims_x);
-    let radius = body_size * 0.38;
-    let side = max((2.0 * pi * radius / f32(dims_x)) * 0.95, body_size / 27.0);
+    let ring_center = vec3<f32>(1.5, 1.5, 1.5);
+    // Ring radius and per-cell packing: chosen so the cells fit
+    // comfortably inside `[0, 3)³` with no overlap, regardless of
+    // `dims_x`. `RING_RADIUS = 1.0` keeps the cell centres at radius
+    // 1.0 from the ring centre — well within the cube. The 0.95
+    // packing factor leaves a small tangential gap between cells so
+    // the cube AABBs don't touch.
+    let ring_radius = 1.0;
+    let arc = (2.0 * pi * ring_radius) / f32(dims_x);
+    let cell_side = arc * 0.95;
+    let scale = 3.0 / cell_side;
 
     var best_t = 1e20;
     var best: HitResult = result;
     for (var cell_x: i32 = 0; cell_x < dims_x; cell_x = cell_x + 1) {
-        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
-        if sample.block_type == 0xFFFEu {
-            continue;
-        }
-
-        let angle = -pi + (f32(cell_x) + 0.5) * angle_step;
-        let sa = sin(angle);
-        let ca = cos(angle);
-        let radial = vec3<f32>(ca, 0.0, sa);
-        let tangent = vec3<f32>(-sa, 0.0, ca);
+        let theta = -pi + (f32(cell_x) + 0.5) * (2.0 * pi / f32(dims_x));
+        let st = sin(theta);
+        let ct = cos(theta);
+        let tangent = vec3<f32>(-st, 0.0, ct);
+        let radial = vec3<f32>(ct, 0.0, st);
         let up = vec3<f32>(0.0, 1.0, 0.0);
-        let cube_origin = center + radial * radius;
-        let scale = 3.0 / side;
-        let d_origin = ray_origin - cube_origin;
+        let cell_center = ring_center + radial * ring_radius;
+
+        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
+        if sample.block_type == 0xFFFEu { continue; }
+
+        let d_origin = ray_origin - cell_center;
         let local_origin = vec3<f32>(
             dot(tangent, d_origin) * scale + 1.5,
             dot(radial, d_origin) * scale + 1.5,
@@ -1740,7 +1764,6 @@ fn march_uv_ring(
             }
         }
     }
-
     return best;
 }
 
@@ -1771,25 +1794,27 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
+        // Frame dispatch on NodeKind. WrappedPlane (kind == 1) always
+        // renders as a sphere of rotated tangent cubes via
+        // `march_wrapped_planet`. UvRing (kind == 3) renders as a
+        // circle of cubes in the node's local `[0, 3)³` via
+        // `march_uv_ring`. All other kinds fall through to the
+        // Cartesian DDA.
         var r: HitResult;
-        if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_UV_RING {
-            r = march_uv_ring(
-                current_idx,
-                vec3<f32>(0.0),
-                3.0,
-                ray_origin,
-                ray_dir,
-            );
-        } else if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_WRAPPED_PLANE {
+        let cur_kind = node_kinds[current_idx].kind;
+        if cur_kind == 1u {
             r = march_wrapped_planet(
-                current_idx,
-                vec3<f32>(0.0),
-                3.0,
-                ray_origin,
-                ray_dir,
-                max(uniforms.planet_render.y, 1.26),
+                current_idx, vec3<f32>(0.0), 3.0,
+                ray_origin, ray_dir,
+                uniforms.planet_render.y,
             );
+        } else if cur_kind == 3u {
+            r = march_uv_ring(current_idx, ray_origin, ray_dir);
         } else {
+            // Cartesian frame: no depth cap beyond the hardware stack
+            // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
+            // visual LOD gate — rays stop descending when cells fall
+            // below the pixel floor.
             r = march_cartesian(
                 current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot,
             );
