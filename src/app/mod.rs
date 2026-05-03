@@ -244,6 +244,7 @@ pub struct App {
     /// Whether `upload_tree_lod` reused a previously packed tree
     /// instead of repacking. When true, pack/ribbon_build are 0.
     pub(super) last_reused_gpu_tree: bool,
+    pub(super) last_path_diag: String,
     pub(super) highlight_epoch: u64,
     pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
     /// Last crosshair reticle state pushed to the overlay. Used by
@@ -464,6 +465,7 @@ impl App {
             last_ribbon_len: 0,
             last_effective_visual_depth: 0,
             last_reused_gpu_tree: false,
+            last_path_diag: String::new(),
             highlight_epoch: 0,
             last_crosshair_sent: None,
             cached_highlight: None,

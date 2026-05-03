@@ -474,6 +474,7 @@ impl App {
                     render_path_csv,
                     intended_render_path_csv,
                     render_stop_reason,
+                    path_diag: self.last_path_diag.clone(),
                     tb_on_anchor_path,
                     anchor_cumulative_yaw_deg,
                     copy_seq: self.debug_copy_seq,

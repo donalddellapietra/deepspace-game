@@ -201,22 +201,18 @@ impl App {
         }
 
         // --- Ensure render path is traversible ---
-        // The GPU pack may be stale: the camera moved into a region
-        // where path nodes were uniform-flattened or absent. Probe
-        // the ribbon; if it can't follow the full intended path,
-        // evict all path ancestors and re-emit from root so the
-        // pack has fresh slabs that include the needed slots.
+        // Walk the intended path in the GPU pack. Two problems:
+        //   1. Slot absent (occ=0): camera moved to a previously-empty
+        //      region → evict path ancestors, re-emit from root.
+        //   2. Slot flattened (tag=1): uniform-flatten collapsed it →
+        //      patch to tag=2 inline.
+        // Both are O(depth). Runs every frame; no-op when pack is fresh.
         {
-            let cache = self.cached_tree.as_ref().expect("cached_tree");
-            let probe = gpu::build_ribbon(
-                &cache.tree,
-                &cache.node_offsets,
-                cache.root_bfs_idx,
-                intended_render_path.as_slice(),
+            let cache = self.cached_tree.as_mut().expect("cached_tree");
+            let needs_reemit = cache.path_has_missing_slots(
+                &self.world.library, self.world.root, intended_render_path.as_slice(),
             );
-            if probe.reached_slots.len() < intended_render_path.depth() as usize {
-                let cache = self.cached_tree.as_mut().expect("cached_tree");
-                // Evict every node on the path so re-emit gets fresh slabs.
+            if needs_reemit {
                 let mut nid = self.world.root;
                 cache.bfs_by_nid.remove(&nid);
                 for &slot in intended_render_path.as_slice() {
@@ -233,15 +229,24 @@ impl App {
                     }
                 }
                 cache.update_root(&self.world.library, self.world.root);
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.update_tree(
-                        &cache.tree,
-                        &cache.node_kinds,
-                        &cache.node_offsets,
-                        &cache.aabbs,
-                        cache.root_bfs_idx,
-                    );
-                }
+            }
+            let (path_walked, path_patches, path_exit) = cache.force_path_tags(
+                &self.world.library, self.world.root, intended_render_path.as_slice(),
+            );
+            self.last_path_diag = format!(
+                "rm={} walked={}/{} patches={} exit={}",
+                if needs_reemit { 1 } else { 0 },
+                path_walked, intended_render_path.depth(),
+                path_patches, path_exit,
+            );
+            if let Some(renderer) = &mut self.renderer {
+                renderer.update_tree(
+                    &cache.tree,
+                    &cache.node_kinds,
+                    &cache.node_offsets,
+                    &cache.aabbs,
+                    cache.root_bfs_idx,
+                );
             }
         }
 

@@ -131,6 +131,7 @@ pub struct DebugOverlayStateJs {
     /// Why compute_render_frame stopped: "ok" if it reached desired
     /// depth, or "Block@D:S" / "Empty@D:S" showing depth and slot.
     pub render_stop_reason: String,
+    pub path_diag: String,
     /// `true` if the camera's anchor path crosses any
     /// `NodeKind::TangentBlock`. Useful for debugging rotation
     /// chain handling.
