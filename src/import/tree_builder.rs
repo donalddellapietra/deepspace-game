@@ -6,7 +6,7 @@
 //! automatically.
 
 use crate::world::tree::*;
-use super::VoxelModel;
+use super::{SparseVoxelModel, VoxelModel};
 
 /// Build a base-3 tree from a voxel model. Returns the root `NodeId`.
 ///
@@ -119,7 +119,7 @@ fn leaf_child(
 ) -> Child {
     if x < model.size_x && y < model.size_y && z < model.size_z {
         let v = model.get(x, y, z);
-        if v == 0 {
+        if v == super::EMPTY_CELL {
             Child::Empty
         } else if interior_depth == 0 {
             Child::Block(v)
@@ -142,6 +142,99 @@ fn next_power_of_3(n: usize) -> usize {
         p *= 3;
     }
     p
+}
+
+// -------------------------------------------------------- sparse path
+
+/// Build a base-3 tree from a `SparseVoxelModel`, visiting only the
+/// N non-empty voxels instead of iterating the full
+/// `next_power_of_3(max_dim)^3` padded cube.
+///
+/// For a Sponza-sized scene (~5 M voxels in a 729³ = 388 M padded
+/// cube), this is ~77× less work than [`build_tree`], with identical
+/// output topology (content-addressed dedup still kicks in).
+///
+/// Algorithm: recursive bucket-descent. At each level, partition the
+/// current index slice into 27 per-slot buckets by `(x, y, z)`, then
+/// recurse into each non-empty bucket. Empty buckets collapse to
+/// `Child::Empty`; uniform 27-tuples collapse further. Work is
+/// `O(N × silhouette_depth)`.
+pub fn build_tree_sparse(
+    model: &SparseVoxelModel,
+    library: &mut NodeLibrary,
+) -> NodeId {
+    let max_dim = (model.size_x.max(model.size_y).max(model.size_z)).max(1) as usize;
+    let padded = next_power_of_3(max_dim);
+
+    let indices: Vec<usize> = (0..model.voxels.len()).collect();
+    let root_child = build_sparse_rec(
+        &model.voxels,
+        &indices,
+        [0, 0, 0],
+        padded,
+        library,
+    );
+    match root_child {
+        Child::Node(id) => id,
+        other => library.insert(uniform_children(other)),
+    }
+}
+
+fn build_sparse_rec(
+    voxels: &[(u32, u32, u32, u16)],
+    indices: &[usize],
+    origin: [usize; 3],
+    cell_size: usize,
+    lib: &mut NodeLibrary,
+) -> Child {
+    if indices.is_empty() {
+        return Child::Empty;
+    }
+    if cell_size == 1 {
+        // The cell IS a single voxel; `indices` must have length 1
+        // if bucketing was exact (duplicates are tolerated — the last
+        // wins, which matches the dense path).
+        let v = voxels[*indices.last().unwrap()];
+        return Child::Block(v.3);
+    }
+    let sub = cell_size / BRANCH;
+
+    // Bucket indices into 27 slots.
+    let mut buckets: [Vec<usize>; CHILDREN_PER_NODE] =
+        std::array::from_fn(|_| Vec::new());
+    for &i in indices {
+        let (x, y, z, _) = voxels[i];
+        let rel_x = (x as usize).saturating_sub(origin[0]) / sub;
+        let rel_y = (y as usize).saturating_sub(origin[1]) / sub;
+        let rel_z = (z as usize).saturating_sub(origin[2]) / sub;
+        // Out-of-range voxels (past padded volume) clamp into the
+        // last slot; they'd be dropped on downsample anyway.
+        let rx = rel_x.min(BRANCH - 1);
+        let ry = rel_y.min(BRANCH - 1);
+        let rz = rel_z.min(BRANCH - 1);
+        buckets[slot_index(rx, ry, rz)].push(i);
+    }
+
+    let mut children = empty_children();
+    for i in 0..CHILDREN_PER_NODE {
+        if buckets[i].is_empty() {
+            continue;
+        }
+        let (sx, sy, sz) = slot_coords(i);
+        let sub_origin = [
+            origin[0] + sx * sub,
+            origin[1] + sy * sub,
+            origin[2] + sz * sub,
+        ];
+        children[i] = build_sparse_rec(voxels, &buckets[i], sub_origin, sub, lib);
+    }
+
+    let first = children[0];
+    if children.iter().all(|&c| c == first) {
+        return first;
+    }
+
+    Child::Node(lib.insert(children))
 }
 
 #[cfg(test)]
@@ -167,9 +260,11 @@ mod tests {
     /// A fully empty model produces a single all-empty node.
     #[test]
     fn empty_model() {
+        // EMPTY_CELL is the sentinel — plain `0` would now mean
+        // palette 0 (Stone), not empty.
         let model = VoxelModel {
             size_x: 3, size_y: 3, size_z: 3,
-            data: vec![0; 27],
+            data: vec![crate::import::EMPTY_CELL; 27],
         };
         let mut lib = NodeLibrary::default();
         let root = build_tree(&model, &mut lib);
@@ -181,7 +276,7 @@ mod tests {
     /// A 4x4x4 model is padded to 9x9x9 (next power of 3).
     #[test]
     fn padding() {
-        let mut data = vec![0u8; 4 * 4 * 4];
+        let mut data = vec![crate::import::EMPTY_CELL; 4 * 4 * 4];
         data[0] = block::STONE; // one non-empty voxel
         let model = VoxelModel { size_x: 4, size_y: 4, size_z: 4, data };
         let mut lib = NodeLibrary::default();
@@ -194,7 +289,7 @@ mod tests {
     #[test]
     fn dedup() {
         // 9x9x9 model: two 3x3x3 quadrants of stone, rest empty.
-        let mut data = vec![0u8; 9 * 9 * 9];
+        let mut data = vec![crate::import::EMPTY_CELL; 9 * 9 * 9];
         // Fill (0,0,0)-(2,2,2) with stone.
         for z in 0..3 { for y in 0..3 { for x in 0..3 {
             data[(z * 9 + y) * 9 + x] = block::STONE;
@@ -215,7 +310,7 @@ mod tests {
     /// Round-trip: build tree, then walk it to verify voxels match.
     #[test]
     fn round_trip_3x3x3() {
-        let mut data = vec![0u8; 27];
+        let mut data = vec![crate::import::EMPTY_CELL; 27];
         data[0] = block::STONE;
         data[13] = block::GRASS; // center: (1,1,1)
         let model = VoxelModel { size_x: 3, size_y: 3, size_z: 3, data };

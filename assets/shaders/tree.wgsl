@@ -52,7 +52,10 @@ fn child_node_index(node_idx: u32, slot: u32) -> u32 {
 }
 
 fn child_tag(packed: u32) -> u32 { return packed & 0xFFu; }
-fn child_block_type(packed: u32) -> u32 { return (packed >> 8u) & 0xFFu; }
+/// Palette index widened from u8 → u16 (bits 8-23). Upper byte
+/// previously held part of the content-AABB (bits 16-27); that
+/// optimization was removed when the palette grew.
+fn child_block_type(packed: u32) -> u32 { return (packed >> 8u) & 0xFFFFu; }
 
 fn slot_from_xyz(x: i32, y: i32, z: i32) -> u32 {
     return u32(z * 9 + y * 3 + x);

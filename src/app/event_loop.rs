@@ -157,7 +157,7 @@ impl App {
         eprintln!("startup_perf {source}: window_prepared ms={:.2}", prepare_elapsed.as_secs_f64() * 1000.0);
 
         let pack_start = web_time::Instant::now();
-        let (tree_packed, node_kinds, node_offsets, _node_ids, root_index) =
+        let (tree_packed, node_kinds, node_offsets, aabbs, _node_ids, root_index) =
             gpu::pack_tree(&self.world.library, self.world.root);
         let pack_elapsed = pack_start.elapsed();
         eprintln!(
@@ -175,9 +175,13 @@ impl App {
         };
         let shader_stats_enabled = self.shader_stats_enabled;
         let lod_pixel_threshold = self.lod_pixel_threshold;
-        let lod_base_depth = self.lod_base_depth;
         let live_sample_every = self.live_sample_every_frames;
         let taa_enabled = self.taa_enabled;
+        // Default: entities enabled on every preset. `--no-entities`
+        // flips the compile-time override so the shader's tag==3
+        // branch DCEs for pure-fractal perf runs.
+        let entities_enabled = !self.disable_entities;
+        let entity_render_mode = self.entity_render_mode;
         let node_count = node_kinds.len();
         let tree_u32_count = tree_packed.len();
 
@@ -199,14 +203,16 @@ impl App {
                 &tree_packed,
                 &node_kinds,
                 &node_offsets,
+                &aabbs,
                 root_index,
                 present_mode,
                 shader_stats_enabled,
                 lod_pixel_threshold,
-                lod_base_depth,
                 live_sample_every,
                 taa_enabled,
-            ));
+                entities_enabled,
+                entity_render_mode,
+));
             self.finish_init(renderer);
         }
 
@@ -221,6 +227,7 @@ impl App {
             let tree_packed = tree_packed.to_vec();
             let node_kinds = node_kinds.to_vec();
             let node_offsets = node_offsets.to_vec();
+            let aabbs = aabbs.to_vec();
             wasm_bindgen_futures::spawn_local(async move {
                 // Re-stamp the canvas backing store right before
                 // surface creation. Winit's request_inner_size on web
@@ -244,13 +251,15 @@ impl App {
                     &tree_packed,
                     &node_kinds,
                     &node_offsets,
+                    &aabbs,
                     root_index,
                     present_mode,
                     shader_stats_enabled,
                     lod_pixel_threshold,
-                    lod_base_depth,
                     live_sample_every,
                     taa_enabled,
+                    entities_enabled,
+                    entity_render_mode,
                 )
                 .await;
                 if proxy.send_event(UserEvent::RendererReady(Box::new(renderer))).is_err() {

@@ -34,14 +34,18 @@ fn convert_model(
 ) -> VoxelModel {
     // Build a LUT mapping .vox palette index → our palette index.
     // Index 0 in .vox is reserved/unused; real colors are 1-255.
-    let mut lut = [0u8; 256];
+    // Source slots with alpha=0 are mapped to `EMPTY_CELL` so
+    // downstream tree-build sees them as air.
+    let mut lut = [super::EMPTY_CELL; 256];
     for (i, c) in vox_palette.iter().enumerate().take(256) {
         if c.a == 0 {
-            lut[i] = 0; // transparent → empty
+            lut[i] = super::EMPTY_CELL;
         } else if let Some(idx) = registry.register(c.r, c.g, c.b, c.a) {
             lut[i] = idx;
         }
-        // If registry is full, lut[i] stays 0 (empty). Acceptable fallback.
+        // If registry is full, lut[i] stays EMPTY_CELL. The voxel
+        // simply doesn't get placed — safer than silently remapping
+        // to palette 0 (which is now Stone, not a sentinel).
     }
 
     // MagicaVoxel coordinate system: (x, z, y) → our (x, y, z).
@@ -50,7 +54,7 @@ fn convert_model(
     let out_y = model.size.z as usize; // their Z → our Y
     let out_z = model.size.y as usize; // their Y → our Z
 
-    let mut data = vec![0u8; out_x * out_y * out_z];
+    let mut data = vec![super::EMPTY_CELL; out_x * out_y * out_z];
 
     for v in &model.voxels {
         let x = v.x as usize;

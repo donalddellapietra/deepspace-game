@@ -10,24 +10,12 @@ pub struct OffscreenRenderTiming {
     pub submit_ms: f64,
     pub wait_ms: f64,
     pub total_ms: f64,
-    /// Ray-march render pass duration as reported by the GPU itself,
-    /// via the `TIMESTAMP_QUERY` scaffolding. `Some(0.0)` is a valid
-    /// result (pass was truly trivial), `None` means the adapter
-    /// does not support timestamp queries. On CPU-bound frames this
-    /// will be much smaller than `wait_ms`; when they're close, the
-    /// frame is genuinely GPU-bound.
-    pub gpu_pass_ms: Option<f64>,
-    /// Staging-buffer map_async + read-back cost for the timestamp
-    /// values themselves. Included in `wait_ms`; broken out so it
-    /// can be subtracted from a GPU-bound interpretation.
-    pub gpu_readback_ms: f64,
     /// Time from `queue.submit` to the `on_submitted_work_done`
-    /// callback firing. Captures *all* GPU work including the
-    /// TBDR tile-resolve phase on Apple Silicon — which
-    /// `gpu_pass_ms` (render-pass-boundary timestamps) can miss.
-    /// When this is close to `wait_ms` and much larger than
-    /// `gpu_pass_ms`, the cost is outside the measured pass:
-    /// typically tile resolve, flush, or driver scheduling.
+    /// callback firing. Authoritative GPU-bound signal on Apple
+    /// Silicon: captures all GPU work including TBDR tile resolve.
+    /// (A prior render-pass-boundary `gpu_pass_ms` timestamp-query
+    /// metric was removed — Metal's per-pass timestamps were
+    /// non-monotonic for fast passes and gave nonsense values.)
     pub submitted_done_ms: Option<f64>,
     /// Shader-side per-ray counters for the frame. Populated by
     /// atomic writes in the fragment shader, read back by copy to
@@ -54,6 +42,25 @@ pub struct ShaderStatsFrame {
     pub sum_steps_empty_div4: u32,
     pub sum_steps_node_descend_div4: u32,
     pub sum_steps_lod_terminal_div4: u32,
+    /// Instrumentation counter: how many descent candidates would
+    /// have been culled by `(child_occupancy & path_mask) == 0u`
+    /// if the test ran BEFORE descending. Upper-bound on savings a
+    /// real path-mask cull could deliver. Does not alter traversal.
+    pub sum_steps_would_cull_div4: u32,
+    /// Per-ray storage-buffer u32-load counters, split by which
+    /// buffer is read. On Apple Silicon these are the dominant
+    /// cost source (dependent chains stall L1); ALU counting on
+    /// the same shader is not representative of real frame time.
+    /// Populated only when ENABLE_STATS is true.
+    pub sum_loads_tree_div4: u32,
+    pub sum_loads_offsets_div4: u32,
+    pub sum_loads_kinds_div4: u32,
+    pub sum_loads_ribbon_div4: u32,
+    /// Steps accumulated over rays that RETURNED a hit. Divided
+    /// by 4 on the GPU side. Use with `hit_count` to compute avg
+    /// steps per hit; `sum_steps_div4 - sum_steps_hits_div4` gives
+    /// the per-miss total.
+    pub sum_steps_hits_div4: u32,
 }
 
 impl ShaderStatsFrame {
@@ -85,6 +92,44 @@ impl ShaderStatsFrame {
         else { (self.sum_steps_lod_terminal_div4 as f64 * 4.0) / self.ray_count as f64 }
     }
 
+    pub fn avg_steps_would_cull(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_steps_would_cull_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+
+    pub fn avg_loads_tree(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_tree_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_offsets(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_offsets_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_kinds(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_kinds_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_ribbon(&self) -> f64 {
+        if self.ray_count == 0 { 0.0 }
+        else { (self.sum_loads_ribbon_div4 as f64 * 4.0) / self.ray_count as f64 }
+    }
+    pub fn avg_loads_total(&self) -> f64 {
+        self.avg_loads_tree() + self.avg_loads_offsets()
+            + self.avg_loads_kinds() + self.avg_loads_ribbon()
+    }
+
+    pub fn avg_steps_per_hit(&self) -> f64 {
+        if self.hit_count == 0 { 0.0 }
+        else { (self.sum_steps_hits_div4 as f64 * 4.0) / self.hit_count as f64 }
+    }
+
+    pub fn avg_steps_per_miss(&self) -> f64 {
+        let miss_count = self.miss_count;
+        if miss_count == 0 { return 0.0; }
+        let miss_sum_div4 = self.sum_steps_div4.saturating_sub(self.sum_steps_hits_div4);
+        (miss_sum_div4 as f64 * 4.0) / miss_count as f64
+    }
+
     pub fn hit_fraction(&self) -> f64 {
         if self.ray_count == 0 {
             0.0
@@ -113,9 +158,6 @@ impl Renderer {
     /// and patches the camera buffer's jitter fields in-place, so
     /// the march pass sees the sub-pixel offset without requiring
     /// the caller to know about TAAU.
-    ///
-    /// `timestamp_writes` are attached to the ray-march pass (the
-    /// dominant work), not the resolve pass.
     fn record_frame_passes(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -128,14 +170,114 @@ impl Renderer {
             self.prepare_taa_frame();
         }
 
-        // Build timestamp writes after the mutable prepare step
-        // returns; they borrow self.timestamp immutably and have to
-        // outlive the render pass.
-        let timestamp_writes = self.timestamp.as_ref().map(|ts| wgpu::RenderPassTimestampWrites {
-            query_set: &ts.query_set,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
-        });
+        // --- Beam-prepass coarse mask ---
+        //
+        // When `beam_enabled`, renders `fs_coarse_mask` at
+        // 1/BEAM_TILE_SIZE per-axis into the R8Unorm `mask_texture`.
+        // Casts 4 rays at tile corners (really 2 opposite corners
+        // after the register-pressure fallback) and ORs the hit
+        // flags so sub-tile features are caught consistently across
+        // frames — the pattern that eliminated the shimmer at
+        // tile boundaries.
+        //
+        // When `beam_enabled` is false (CPU heuristic decided the
+        // coarse pass isn't worth it — e.g., content-dense scenes
+        // like Menger or plain worlds where every tile would mark
+        // as hit anyway), skip the march entirely and just clear
+        // the mask to 1.0. The fine pass's 5-tap check then always
+        // reads 1.0 and falls through to the full march for every
+        // pixel — equivalent to the pre-P1 baseline for that frame.
+        if self.beam_enabled {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("beam_coarse_mask"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.coarse_pipeline);
+            pass.set_bind_group(0, &self.coarse_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        } else {
+            // No fragment work — just a clear pass that fills the
+            // mask with 1.0. R8Unorm encodes 1.0 as 255.
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("beam_mask_clear_to_one"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 1.0, g: 0.0, b: 0.0, a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+
+        // --- Heightmap gen (raster mode, when dirty) ---
+        let current_frame_root = self.root_index;
+        if self.heightmap_frame_root_bfs != current_frame_root {
+            self.heightmap_dirty = true;
+            self.heightmap_frame_root_bfs = current_frame_root;
+        }
+        if let (Some(hgen), Some(htex)) =
+            (self.heightmap_gen.as_ref(), self.heightmap_texture.as_ref())
+        {
+            if self.heightmap_dirty {
+                let u = crate::renderer::heightmap::HeightmapUniforms::new(
+                    current_frame_root,
+                    0,
+                    htex.delta,
+                    0.0,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                htex.write_uniforms(&self.queue, &u);
+                let bg = hgen.make_bind_group(
+                    &self.device,
+                    &self.tree_buffer,
+                    &self.node_offsets_buffer,
+                    htex,
+                );
+                hgen.record(encoder, &bg, htex);
+                self.heightmap_dirty = false;
+            }
+        }
+
+        // --- Entity Y clamp (raster mode, every frame with instances) ---
+        if let (Some(clamp), Some(htex), Some(raster)) = (
+            self.entity_heightmap_clamp.as_ref(),
+            self.heightmap_texture.as_ref(),
+            self.entity_raster.as_ref(),
+        ) {
+            let count = raster.total_instances();
+            if count > 0 {
+                let u = crate::renderer::heightmap::ClampUniforms::new(
+                    count,
+                    htex.side,
+                    crate::world::anchor::WORLD_SIZE,
+                );
+                let uniforms = clamp.make_uniforms_buffer(&self.device, &u);
+                let bg = clamp.make_bind_group(
+                    &self.device,
+                    raster.instance_buffer(),
+                    &uniforms,
+                    htex,
+                );
+                clamp.record(encoder, &bg, count);
+            }
+        }
 
         // --- Ray-march pass ---
         if self.pipeline_taa.is_some() {
@@ -168,10 +310,41 @@ impl Renderer {
                     }),
                 ],
                 depth_stencil_attachment: None,
-                timestamp_writes,
+                timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(pipeline_taa);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        } else if let (Some(p_with_depth), Some(depth_view)) =
+            (self.pipeline_with_depth.as_ref(), self.depth_view.as_ref())
+        {
+            // Raster-entity mode: ray-march writes color + frag_depth;
+            // entity raster pass runs next and z-tests against it.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(march_label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dest_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05, g: 0.05, b: 0.1, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(p_with_depth);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         } else {
@@ -188,12 +361,19 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes,
+                timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        // --- Entity raster pass (raster mode only) ---
+        if let (Some(raster), Some(depth_view)) =
+            (self.entity_raster.as_ref(), self.depth_view.as_ref())
+        {
+            raster.record_pass(encoder, dest_view, depth_view);
         }
 
         // --- Resolve pass (TAA only) ---
@@ -268,10 +448,6 @@ impl Renderer {
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
         self.record_frame_passes(&mut encoder, &view, "ray_march");
-        if let Some(ts) = self.timestamp.as_ref() {
-            encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
-            encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
-        }
         if self.shader_stats_enabled {
             encoder.copy_buffer_to_buffer(
                 &self.shader_stats_buffer, 0,
@@ -311,18 +487,17 @@ impl Renderer {
         // don't want to stall every frame — but during a slowdown we
         // want the data.
         let slow = frame_elapsed.as_secs_f64() * 1000.0 >= 30.0;
-        let (gpu_pass_ms, submitted_done_ms, shader_stats) =
+        let (submitted_done_ms, shader_stats) =
             if self.shader_stats_enabled && slow {
                 let _ = self.device.poll(wgpu::PollType::Wait);
                 let submitted_done_ms = done_slot
                     .lock()
                     .ok()
                     .and_then(|s| s.map(|t| t.duration_since(submit_start).as_secs_f64() * 1000.0));
-                let (gpu_pass_ms, _) = self.read_timestamps();
                 let stats = self.read_shader_stats();
-                (gpu_pass_ms, submitted_done_ms, stats)
+                (submitted_done_ms, stats)
             } else {
-                (None, None, ShaderStatsFrame::default())
+                (None, ShaderStatsFrame::default())
             };
         // Periodic steady-state sample: CPU-side timings only, no
         // device.poll(Wait) stall. Gives us acquire/encode/submit/
@@ -345,13 +520,12 @@ impl Renderer {
         }
         if slow {
             eprintln!(
-                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} gpu_pass_ms={} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={} avg_oob={:.1} avg_empty={:.1} avg_descend={:.1} avg_lod_terminal={:.1}",
+                "renderer_slow acquire_ms={:.2} encode_ms={:.2} submit_ms={:.2} present_ms={:.2} total_ms={:.2} submitted_done_ms={} rays={} hits={} miss={} max_iters={} avg_steps={:.1} max_steps={} avg_oob={:.1} avg_empty={:.1} avg_descend={:.1} avg_lod_terminal={:.1} avg_would_cull={:.2} avg_loads_total={:.1} avg_loads_tree={:.1} avg_loads_offsets={:.1} avg_loads_kinds={:.2} avg_loads_ribbon={:.2}",
                 acquire_elapsed.as_secs_f64() * 1000.0,
                 encode_elapsed.as_secs_f64() * 1000.0,
                 submit_elapsed.as_secs_f64() * 1000.0,
                 present_elapsed.as_secs_f64() * 1000.0,
                 frame_elapsed.as_secs_f64() * 1000.0,
-                gpu_pass_ms.map(|v| format!("{v:.2}")).unwrap_or_else(|| "na".into()),
                 submitted_done_ms.map(|v| format!("{v:.2}")).unwrap_or_else(|| "na".into()),
                 shader_stats.ray_count,
                 shader_stats.hit_count,
@@ -363,6 +537,12 @@ impl Renderer {
                 shader_stats.avg_steps_empty(),
                 shader_stats.avg_steps_descend(),
                 shader_stats.avg_steps_lod_terminal(),
+                shader_stats.avg_steps_would_cull(),
+                shader_stats.avg_loads_total(),
+                shader_stats.avg_loads_tree(),
+                shader_stats.avg_loads_offsets(),
+                shader_stats.avg_loads_kinds(),
+                shader_stats.avg_loads_ribbon(),
             );
         }
         Ok(())
@@ -407,10 +587,6 @@ impl Renderer {
             encoder.clear_buffer(&self.shader_stats_buffer, 0, None);
         }
         self.record_frame_passes(&mut encoder, &view, "offscreen-ray-march");
-        if let Some(ts) = self.timestamp.as_ref() {
-            encoder.resolve_query_set(&ts.query_set, 0..2, &ts.resolve, 0);
-            encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.staging, 0, 16);
-        }
         if self.shader_stats_enabled {
             encoder.copy_buffer_to_buffer(
                 &self.shader_stats_buffer, 0,
@@ -448,7 +624,6 @@ impl Renderer {
             .lock()
             .ok()
             .and_then(|slot| slot.map(|t| t.duration_since(submit_start).as_secs_f64() * 1000.0));
-        let (gpu_pass_ms, gpu_readback_ms) = self.read_timestamps();
         let shader_stats = if self.shader_stats_enabled {
             self.read_shader_stats()
         } else {
@@ -457,23 +632,22 @@ impl Renderer {
         let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         if total_ms >= 10.0 {
             eprintln!(
-                "renderer_offscreen_slow size={}x{} texture_alloc_ms={:.2} view_ms={:.2} encode_ms={:.2} submit_ms={:.2} wait_ms={:.2} gpu_pass_ms={} total_ms={:.2}",
+                "renderer_offscreen_slow size={}x{} texture_alloc_ms={:.2} view_ms={:.2} encode_ms={:.2} submit_ms={:.2} wait_ms={:.2} submitted_done_ms={} total_ms={:.2}",
                 self.config.width, self.config.height,
                 texture_alloc_ms, view_ms, encode_ms, submit_ms, wait_ms,
-                gpu_pass_ms.map(|v| format!("{v:.2}")).unwrap_or_else(|| "na".into()),
+                submitted_done_ms.map(|v| format!("{v:.2}")).unwrap_or_else(|| "na".into()),
                 total_ms,
             );
         }
         OffscreenRenderTiming {
             texture_alloc_ms, view_ms, encode_ms, submit_ms, wait_ms, total_ms,
-            gpu_pass_ms, gpu_readback_ms, submitted_done_ms, shader_stats,
+            submitted_done_ms, shader_stats,
         }
     }
 
-    /// Map `shader_stats_readback`, decode the 6 u32 counters, and
+    /// Map `shader_stats_readback`, decode the counter u32s, and
     /// unmap. Called after the render-pass submit has completed on
-    /// GPU (verified by the earlier `poll(Wait)`), and after the
-    /// timestamp readback has already fired its own poll pass.
+    /// GPU (verified by the earlier `poll(Wait)`).
     fn read_shader_stats(&self) -> ShaderStatsFrame {
         let slice = self.shader_stats_readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -498,64 +672,16 @@ impl Renderer {
             sum_steps_empty_div4: read_u32(28),
             sum_steps_node_descend_div4: read_u32(32),
             sum_steps_lod_terminal_div4: read_u32(36),
+            sum_steps_would_cull_div4: read_u32(40),
+            sum_loads_tree_div4: read_u32(44),
+            sum_loads_offsets_div4: read_u32(48),
+            sum_loads_kinds_div4: read_u32(52),
+            sum_loads_ribbon_div4: read_u32(56),
+            sum_steps_hits_div4: read_u32(60),
         };
         drop(data);
         self.shader_stats_readback.unmap();
         stats
-    }
-
-    /// Map the staging buffer (if present), read back the two
-    /// timestamp tick values, compute the delta in ms using the
-    /// queue's ns-per-tick period. Returns `(pass_ms, readback_ms)`.
-    /// `pass_ms` is `None` if the adapter did not enable the
-    /// timestamp-query feature.
-    fn read_timestamps(&self) -> (Option<f64>, f64) {
-        let ts = match self.timestamp.as_ref() {
-            Some(t) => t,
-            None => return (None, 0.0),
-        };
-        let readback_start = web_time::Instant::now();
-        let slice = ts.staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        // map_async's callback is only driven when the device is
-        // polled; poll(Wait) here is bounded because the submit
-        // that resolved the query set already completed during the
-        // earlier wait in render_offscreen.
-        let _ = self.device.poll(wgpu::PollType::Wait);
-        if rx.recv().is_err() {
-            ts.staging.unmap();
-            let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
-            return (None, readback_ms);
-        }
-        let data = slice.get_mapped_range();
-        let start_tick = u64::from_ne_bytes(data[0..8].try_into().unwrap());
-        let end_tick = u64::from_ne_bytes(data[8..16].try_into().unwrap());
-        drop(data);
-        ts.staging.unmap();
-        // Known wgpu/Metal quirk on Apple Silicon: the per-render-pass
-        // start/end timestamp counters are not guaranteed to be
-        // monotonic for fast passes — we sometimes see end < start by
-        // a few milliseconds. Take the magnitude as a best-effort
-        // estimate; `wait_ms` stays as the authoritative GPU-bound
-        // signal on Metal. On vendors where the counters behave,
-        // `abs` is a no-op vs. the direct subtraction.
-        let delta_ticks = if end_tick >= start_tick {
-            end_tick - start_tick
-        } else {
-            start_tick - end_tick
-        };
-        let ms = (delta_ticks as f64) * (ts.period_ns as f64) / 1_000_000.0;
-        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
-        // Guard against Apple Silicon Metal's timestamp counters
-        // returning nonsense for sub-ms passes (we've seen values
-        // ~13e6 ms, = 3+ hours, from a frame that actually took
-        // milliseconds). Cap at 5 seconds per pass — anything above
-        // that is physically impossible in a render-harness run and
-        // should be treated as "no reliable sample".
-        const MAX_PLAUSIBLE_MS: f64 = 5000.0;
-        let reported = if ms <= MAX_PLAUSIBLE_MS { Some(ms) } else { None };
-        (reported, readback_ms)
     }
 
     /// Render an off-screen frame and write a PNG to `path`. Used

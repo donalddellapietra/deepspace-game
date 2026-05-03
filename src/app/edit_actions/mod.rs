@@ -8,6 +8,7 @@
 
 mod break_place;
 mod highlight;
+mod spawn;
 pub(crate) mod upload;
 mod zoom;
 
@@ -16,10 +17,14 @@ use crate::world::{aabb, raycast};
 
 use super::{ActiveFrameKind, App};
 
-pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = 12;
+/// CPU-side ceiling for `visual_depth()` (feeds the sphere/face
+/// walker's `uniforms.max_depth`). Picked equal to the tree's
+/// absolute max so the sphere path isn't artificially capped —
+/// the Cartesian path doesn't use this any more.
+pub(super) const MAX_LOCAL_VISUAL_DEPTH: u32 = crate::world::tree::MAX_DEPTH as u32;
 pub(super) const MAX_FOCUSED_FRAME_CAMERA_EXTENT: f32 = 8.0;
 pub(super) const FRAME_VISUAL_MIN_PIXELS: f32 = 1.0;
-pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 192.0;
+pub(super) const FRAME_FOCUS_MIN_PIXELS: f32 = 1.0;
 
 impl App {
     pub(super) fn ray_dir_in_frame(&self, _frame_path: &Path) -> [f32; 3] {
@@ -200,6 +205,14 @@ impl App {
                         ));
                         None
                     }
+                    Child::EntityRef(idx) => {
+                        out.push(format!(
+                            "d{} slot={} parent={kind:?} -> EntityRef({idx})",
+                            depth + 1,
+                            slot
+                        ));
+                        None
+                    }
                 });
             let Some(child_id) = next else { break };
             let child_kind = self.world.library.get(child_id).map(|n| n.kind);
@@ -232,6 +245,9 @@ impl App {
         match node.children[slot] {
             Child::Empty => format!("Empty node_id={node_id} slot={slot}"),
             Child::Block(block) => format!("Block({block}) node_id={node_id} slot={slot}"),
+            Child::EntityRef(idx) => {
+                format!("EntityRef({idx}) node_id={node_id} slot={slot}")
+            }
             Child::Node(child_id) => {
                 let desc = self
                     .world

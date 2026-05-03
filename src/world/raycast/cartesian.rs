@@ -109,6 +109,12 @@ pub(super) fn cpu_raycast_with_face_depth(
             Child::Empty => {
                 advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
             }
+            // Entity cells aren't selectable by the cursor raycast —
+            // editing entities goes through a different path that
+            // descends into the entity's own voxel subtree.
+            Child::EntityRef(_) => {
+                advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
+            }
             Child::Block(_) => {
                 return Some(HitInfo {
                     path: path.clone(),
@@ -148,7 +154,9 @@ pub(super) fn cpu_raycast_with_face_depth(
                 // nodes recursively, visiting O(3^depth) leaf cells
                 // before escaping — easily exceeding the iteration
                 // budget for deep carved cavities.
-                if child_node.representative_block == 255 {
+                if child_node.representative_block
+                    == crate::world::tree::REPRESENTATIVE_EMPTY
+                {
                     advance_dda(&mut stack[depth], &step, &delta_dist, &mut normal_face);
                     continue;
                 }

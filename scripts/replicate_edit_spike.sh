@@ -2,10 +2,10 @@
 #
 # Self-sufficient repro for the 40 ms first-frame-post-edit wall-clock
 # spike. Uses `wall_ms` frame-to-frame DELTA, which is the only
-# reliable harness signal for what the user actually feels — the
-# Apple Silicon timestamp counters (`gpu_pass_ms`) coincidentally
-# match the true cost on edit frames but `submitted_done_ms` does
-# NOT (see draw.rs:527 comment re: non-monotonic timestamps).
+# reliable harness signal for what the user actually feels across
+# script-triggered edit frames — the GPU-side `submitted_done_ms`
+# signal is correct but doesn't include the CPU-side edit work that
+# happens before submit.
 #
 # Scenario: 20-layer soldier world, camera landed on soldier via
 # `fly_to_surface`, five alternating break/place edits spaced 5
@@ -29,7 +29,7 @@ BUDGET_MS="${EDIT_SPIKE_BUDGET_MS:-5}"
 
 ./target/debug/deepspace-game --render-harness \
     --vox-model assets/vox/soldier_729.vxs \
-    --plain-layers 20 --vox-interior-depth 13 --lod-base-depth 20 --shader-stats \
+    --plain-layers 20 --vox-interior-depth 13 --shader-stats \
     --spawn-xyz 0.5 1.5 0.12 --spawn-depth 10 --spawn-pitch -1.5 \
     --disable-overlay --harness-width 600 --harness-height 400 \
     --script "wait:10,fly_to_surface,wait:5,break,wait:5,place,wait:5,break,wait:5,place,wait:5,break,wait:5" \
@@ -44,8 +44,8 @@ rows = list(csv.DictReader(open('tmp/perf/edit-spike.csv')))
 rows.sort(key=lambda r: int(r['frame']))
 
 # Compute wall-delta (ms) between consecutive frames. This is the
-# actual per-frame wall-clock cost the user feels; gpu_pass_ms and
-# submitted_done_ms are not reliable on macOS under our setup.
+# actual per-frame wall-clock cost the user feels across both the
+# CPU edit work and the GPU render.
 walls = [(int(r['frame']), float(r['wall_ms'])) for r in rows]
 deltas = {}
 for (f1, w1), (f2, w2) in zip(walls, walls[1:]):
@@ -94,7 +94,7 @@ phase_fields = [
     'tree_write_ms', 'ribbon_write_ms', 'bind_group_rebuild_ms',
     'highlight_ms', 'highlight_raycast_ms', 'highlight_set_ms',
     'render_total_ms', 'render_encode_ms', 'render_submit_ms',
-    'render_wait_ms', 'gpu_pass_ms', 'gpu_readback_ms',
+    'render_wait_ms',
     'submitted_done_ms',
 ]
 by_frame = {int(r['frame']): r for r in rows}

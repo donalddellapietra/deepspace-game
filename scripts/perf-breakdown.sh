@@ -77,8 +77,8 @@ if [ "$SEL" = "grassland" ] || [ "$SEL" = "all" ]; then
   echo "### MATRIX: grassland zoom (plain, retina 2560x1440, --shader-stats) ###"
   # Stationary overlook at various anchor depths. Simulates the
   # user's "overlooking grassland, zoom out to layer 37, slow" case.
-  # Invariant we care about: avg_steps and gpu_pass should stay
-  # roughly flat across zoom levels when distance-based LOD works.
+  # Invariant we care about: avg_steps and submitted_done should
+  # stay roughly flat across zoom levels when distance-based LOD works.
   for d in 3 5 8 12 17; do
     run "grassland_still_d${d}" \
       --harness-width 2560 --harness-height 1440 \

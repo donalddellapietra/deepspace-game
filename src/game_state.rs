@@ -12,7 +12,7 @@ use crate::world::tree::NodeId;
 
 #[derive(Clone, Debug)]
 pub enum HotbarItem {
-    Block(u8),
+    Block(u16),
     Mesh(usize),
 }
 
@@ -103,7 +103,7 @@ impl GameUiState {
     }
 
     /// The palette index of the active hotbar slot, or None for mesh slots.
-    pub fn active_block_type(&self) -> Option<u8> {
+    pub fn active_block_type(&self) -> Option<u16> {
         match &self.slots[self.active_slot] {
             HotbarItem::Block(idx) => Some(*idx),
             HotbarItem::Mesh(_) => None,
@@ -130,7 +130,7 @@ impl GameUiState {
                 self.picker_b = b;
             }
             UiCommand::CreateBlock => {
-                let idx = block::BUILTIN_COUNT + self.custom_blocks.len() as u8;
+                let idx = block::BUILTIN_COUNT + self.custom_blocks.len() as u16;
                 let name = format!("Custom #{}", self.custom_blocks.len() + 1);
                 let color = [self.picker_r, self.picker_g, self.picker_b, 1.0];
                 self.custom_blocks.push(CustomBlock { name, color });
@@ -229,7 +229,7 @@ impl GameUiState {
         }).collect();
 
         let custom_blocks: Vec<BlockInfo> = self.custom_blocks.iter().enumerate().map(|(i, cb)| {
-            BlockInfo { voxel: block::BUILTIN_COUNT + i as u8, name: cb.name.clone(), color: cb.color }
+            BlockInfo { voxel: block::BUILTIN_COUNT + i as u16, name: cb.name.clone(), color: cb.color }
         }).collect();
 
         let inventory = InventoryStateJs {

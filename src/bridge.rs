@@ -25,7 +25,7 @@ pub struct HotbarState {
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct BlockInfo {
-    pub voxel: u8,
+    pub voxel: u16,
     pub name: String,
     pub color: [f32; 4],
 }
@@ -133,7 +133,7 @@ pub enum GameStateUpdate {
 #[serde(tag = "cmd", rename_all = "camelCase")]
 pub enum UiCommand {
     SelectHotbarSlot { slot: usize },
-    AssignBlockToSlot { voxel: u8 },
+    AssignBlockToSlot { voxel: u16 },
     #[serde(rename_all = "camelCase")]
     AssignMeshToSlot { mesh_index: usize },
     SetColorPickerRgb { r: f32, g: f32, b: f32 },

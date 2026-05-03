@@ -24,9 +24,35 @@ pub enum WorldPreset {
     /// per level, no uniform collapse — stresses the packer's
     /// preserved-detail path in a way plain/sphere don't.
     Menger,
-    /// Imported `.vox` model placed inside a plain world. Uses the
-    /// GLB→vox→tree pipeline (see `src/import/` and
-    /// `tools/glb_to_vox.py`). The model is planted at the center
+    /// Sierpinski tetrahedron — 4 tetrahedral corners per level
+    /// (trinary adaptation of PySpace's `FoldSierpinski + FoldScale(2)`).
+    /// Very sparse: 4/27 cells filled.
+    SierpinskiTet,
+    /// Cantor dust in 3D — 8 corner cells per level (all coords ∈
+    /// {0, 2}). The canonical ternary set extended to three dimensions.
+    /// Colored as an 8-hue prismatic orbit trap.
+    CantorDust,
+    /// Jerusalem cross / axial plus — the complement of Menger: 7
+    /// cells (body centre + 6 face centres) per level. A delicate
+    /// self-similar scaffold of orthogonal rods.
+    JerusalemCross,
+    /// Stepped Sierpinski pyramid — 4 base corners + 1 apex per
+    /// level. Ziggurat-like self-similarity with a distinct "up" axis.
+    SierpinskiPyramid,
+    /// Mausoleum — Menger geometry with authentic PySpace orbit-trap
+    /// ochre palette. Structurally equivalent to [`Menger`] but
+    /// painted with `OrbitMax((0.42, 0.38, 0.19))` derived RGB
+    /// instead of the hybrid bronze+blue.
+    Mausoleum,
+    /// Edge scaffold — 12 edge-midpoint rods per level. Neon axial
+    /// palette (cyan/magenta/yellow per orientation).
+    EdgeScaffold,
+    /// Hollow cube — 18-cell architectural shell (12 edges + 6
+    /// faces, no corners or body). Brushed-steel + brass palette.
+    HollowCube,
+    /// Imported `.vox` / `.vxs` model placed inside a plain world.
+    /// Uses the GLB→`.vxs`→tree pipeline (see `src/import/` and
+    /// `tools/scene_voxelize/`). The model is planted at the center
     /// of a plain world of depth `plain_layers` (default 8), so
     /// camera spawn is reasonable out-of-the-box. Stresses the
     /// packer's real-content path: tens of thousands of unique
@@ -42,12 +68,50 @@ pub enum WorldPreset {
         path: std::path::PathBuf,
         interior_depth: u8,
     },
+    /// Canonical high-resolution mesh scene (Sponza, San Miguel,
+    /// Bistro) voxelized offline by `tools/scene_voxelize/`. See
+    /// [`crate::world::scenes`].
+    Scene {
+        id: crate::world::scenes::SceneId,
+    },
+    /// Planet + distant stars at varying ribbon depths. Validates
+    /// that the ray-march preserves precision across deep pops —
+    /// stars at ancestor-depth 1 through N−1 must all render.
+    Stars,
 }
 
 pub const DEFAULT_PLAIN_LAYERS: u8 = 40;
 const PLAIN_SURFACE_Y: f32 = 1.0;
 const PLAIN_GRASS_THICKNESS: f32 = 0.05;
 const PLAIN_DIRT_THICKNESS: f32 = 0.25;
+
+/// World-coordinate Y where entities naturally rest. `Some(y)` for
+/// worlds with a single flat ground plane; `None` for sphere /
+/// fractal presets where "resting height" is position-dependent.
+/// Callers consume this to drop the Y component of entity velocity
+/// so they don't drift off the ground during long sessions.
+pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
+    match preset {
+        WorldPreset::PlainTest => Some(PLAIN_SURFACE_Y),
+        // Imported .vox worlds embed the model in a plain world;
+        // they inherit the same sea level.
+        WorldPreset::VoxModel { .. } => Some(PLAIN_SURFACE_Y),
+        // Every fractal / sphere preset leaves entities to fly
+        // freely — they don't have a single horizontal ground plane
+        // that a constant sea-level Y could track.
+        WorldPreset::DemoSphere
+        | WorldPreset::Menger
+        | WorldPreset::SierpinskiTet
+        | WorldPreset::CantorDust
+        | WorldPreset::JerusalemCross
+        | WorldPreset::SierpinskiPyramid
+        | WorldPreset::Mausoleum
+        | WorldPreset::EdgeScaffold
+        | WorldPreset::HollowCube
+        | WorldPreset::Stars
+        | WorldPreset::Scene { .. } => None,
+    }
+}
 
 pub struct WorldBootstrap {
     pub world: WorldState,
@@ -71,51 +135,58 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
     match preset {
         WorldPreset::DemoSphere => bootstrap_demo_sphere_world(),
         WorldPreset::PlainTest => bootstrap_plain_test_world(plain_layers.unwrap_or(DEFAULT_PLAIN_LAYERS)),
-        WorldPreset::Menger => bootstrap_menger_world(plain_layers.unwrap_or(20)),
+        WorldPreset::Menger => crate::world::fractals::menger::bootstrap_menger_world(
+            plain_layers.unwrap_or(8),
+        ),
+        WorldPreset::SierpinskiTet => {
+            crate::world::fractals::sierpinski_tet::bootstrap_sierpinski_tet_world(
+                plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::CantorDust => {
+            crate::world::fractals::cantor_dust::bootstrap_cantor_dust_world(
+                plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::JerusalemCross => {
+            crate::world::fractals::jerusalem_cross::bootstrap_jerusalem_cross_world(
+                plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::SierpinskiPyramid => {
+            crate::world::fractals::sierpinski_pyramid::bootstrap_sierpinski_pyramid_world(
+                plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::Mausoleum => {
+            crate::world::fractals::mausoleum::bootstrap_mausoleum_world(
+                plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::EdgeScaffold => {
+            crate::world::fractals::edge_scaffold::bootstrap_edge_scaffold_world(
+                plain_layers.unwrap_or(8),
+            )
+        }
+        WorldPreset::HollowCube => {
+            crate::world::fractals::hollow_cube::bootstrap_hollow_cube_world(
+                plain_layers.unwrap_or(8),
+            )
+        }
         WorldPreset::VoxModel { path, interior_depth } => bootstrap_vox_model_world(
             &path, plain_layers.unwrap_or(8), interior_depth,
+        ),
+        WorldPreset::Scene { id } => crate::world::scenes::bootstrap_scene_world(id),
+        WorldPreset::Stars => crate::world::stars::bootstrap_stars_world(
+            plain_layers.unwrap_or(40),
         ),
     }
 }
 
-/// Build a Menger sponge of the given depth. Content-addressed
-/// dedup means storage is O(depth), not O(20^depth) — all 20
-/// non-empty cells at each level point to the same sub-sponge.
-pub fn menger_world(depth: u8) -> WorldState {
-    let mut lib = NodeLibrary::default();
-
-    // Level 1: 27 children, leaves are stone/empty per Menger pattern.
-    let mut children = empty_children();
-    for z in 0..BRANCH {
-        for y in 0..BRANCH {
-            for x in 0..BRANCH {
-                let count = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-                if count >= 2 { continue; }
-                children[slot_index(x, y, z)] = Child::Block(block::STONE);
-            }
-        }
-    }
-    let mut current = lib.insert(children);
-
-    // Levels 2..=depth: each non-empty slot points to the previous
-    // level's node. Dedup compresses this to one node per level.
-    for _ in 1..depth {
-        let mut children = empty_children();
-        for z in 0..BRANCH {
-            for y in 0..BRANCH {
-                for x in 0..BRANCH {
-                    let count = (x == 1) as u8 + (y == 1) as u8 + (z == 1) as u8;
-                    if count >= 2 { continue; }
-                    children[slot_index(x, y, z)] = Child::Node(current);
-                }
-            }
-        }
-        current = lib.insert(children);
-    }
-
-    lib.ref_inc(current);
-    WorldState { root: current, library: lib }
-}
+/// Re-export of [`crate::world::fractals::menger::menger_world`] for
+/// existing call-sites (e.g. `gpu/pack.rs` baseline tests). The full
+/// colored bootstrap lives in [`crate::world::fractals::menger`].
+pub use crate::world::fractals::menger::menger_world;
 
 /// Load a `.vox` file via the import pipeline and embed it as the
 /// child of a tree of `total_depth` levels. The model sits at the
@@ -124,7 +195,7 @@ pub fn menger_world(depth: u8) -> WorldState {
 ///
 /// Panics if the file doesn't exist or doesn't parse — this is a
 /// bootstrap function, not a content runtime path.
-fn bootstrap_vox_model_world(
+pub(crate) fn bootstrap_vox_model_world(
     path: &std::path::Path,
     total_depth: u8,
     interior_depth: u8,
@@ -137,21 +208,63 @@ fn bootstrap_vox_model_world(
     let mut lib = NodeLibrary::default();
     let mut registry = crate::world::palette::ColorRegistry::new();
 
-    let model = import::load(path, &mut registry)
-        .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
-    eprintln!(
-        "vox_world: loaded {:?} ({}x{}x{} = {} voxels, interior_depth={})",
-        path, model.size_x, model.size_y, model.size_z,
-        model.data.iter().filter(|&&v| v != 0).count(),
-        interior_depth,
-    );
+    // Use the sparse path for `.vxs` when `interior_depth == 0` —
+    // iterates only occupied voxels instead of the padded cube. For
+    // Sponza (5 M voxels in a 729³ ≈ 388 M padded cube) this is
+    // ~77× less work at load time.
+    let ext_is_vxs = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("vxs"))
+        .unwrap_or(false);
 
-    let model_root_id = tree_builder::build_tree_with_interior(&model, &mut lib, interior_depth);
+    let (size_x, size_y, size_z, model_root_id) = if ext_is_vxs && interior_depth == 0 {
+        let t = std::time::Instant::now();
+        let sparse = import::vxs::load_sparse(path, &mut registry)
+            .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
+        eprintln!(
+            "vox_world: loaded (sparse) {:?} ({}x{}x{} = {} voxels) in {:.2?}",
+            path,
+            sparse.size_x,
+            sparse.size_y,
+            sparse.size_z,
+            sparse.voxels.len(),
+            t.elapsed(),
+        );
+        let t = std::time::Instant::now();
+        let root = tree_builder::build_tree_sparse(&sparse, &mut lib);
+        eprintln!(
+            "vox_world: sparse tree build in {:.2?} ({} library nodes)",
+            t.elapsed(),
+            lib.len(),
+        );
+        (
+            sparse.size_x as usize,
+            sparse.size_y as usize,
+            sparse.size_z as usize,
+            root,
+        )
+    } else {
+        let model = import::load(path, &mut registry)
+            .unwrap_or_else(|e| panic!("failed to load {:?}: {}", path, e));
+        eprintln!(
+            "vox_world: loaded {:?} ({}x{}x{} = {} voxels, interior_depth={})",
+            path,
+            model.size_x,
+            model.size_y,
+            model.size_z,
+            model.data.iter().filter(|&&v| v != 0).count(),
+            interior_depth,
+        );
+        let root =
+            tree_builder::build_tree_with_interior(&model, &mut lib, interior_depth);
+        (model.size_x, model.size_y, model.size_z, root)
+    };
 
     // Silhouette depth: log3(max_dim). Each voxel then contributes
     // `interior_depth` additional levels (uniform-fill subtree),
     // so the model's full tree footprint is silhouette + interior.
-    let max_dim = model.size_x.max(model.size_y).max(model.size_z).max(1);
+    let max_dim = size_x.max(size_y).max(size_z).max(1);
     let mut dim = 1usize;
     let mut silhouette_depth: u8 = 0;
     while dim < max_dim {
@@ -215,9 +328,9 @@ fn bootstrap_vox_model_world(
     let padded = BRANCH.pow(silhouette_depth as u32) as f32;
     let wrap_size = 3.0 * (1.0 / BRANCH as f32).powi(wraps as i32);
     let wrap_origin = 1.5 - wrap_size / 2.0;
-    let extent_x = wrap_size * (model.size_x as f32 / padded);
-    let extent_y = wrap_size * (model.size_y as f32 / padded);
-    let extent_z = wrap_size * (model.size_z as f32 / padded);
+    let extent_x = wrap_size * (size_x as f32 / padded);
+    let extent_y = wrap_size * (size_y as f32 / padded);
+    let extent_z = wrap_size * (size_z as f32 / padded);
     let center_x = wrap_origin + extent_x / 2.0;
     let center_y = wrap_origin + extent_y / 2.0;
     let center_z = wrap_origin + extent_z / 2.0;
@@ -261,28 +374,6 @@ fn bootstrap_vox_model_world(
         default_spawn_pitch: pitch,
         plain_layers: total_depth,
         color_registry: registry,
-    }
-}
-
-fn bootstrap_menger_world(depth: u8) -> WorldBootstrap {
-    let depth = depth.min(MAX_DEPTH as u8);
-    let world = menger_world(depth);
-    // Spawn outside the sponge looking toward it. Menger sits in
-    // [0, 3)³ at the root; place the camera at (2.5, 2.0, 2.5) so
-    // the sponge fills the lower-left view.
-    let spawn_pos = WorldPos::from_frame_local(
-        &Path::root(),
-        [2.5, 2.0, 2.5],
-        2,
-    ).deepened_to(8);
-    WorldBootstrap {
-        world,
-        planet_path: None,
-        default_spawn_pos: spawn_pos,
-        default_spawn_yaw: -std::f32::consts::FRAC_PI_4,
-        default_spawn_pitch: -0.6,
-        plain_layers: depth,
-        color_registry: crate::world::palette::ColorRegistry::new(),
     }
 }
 
@@ -405,7 +496,7 @@ pub fn plain_world(layers: u8) -> WorldState {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum UniformFill {
         Empty,
-        Block(u8),
+        Block(u16),
     }
 
     fn fill_for_range(y_min: f32, y_max: f32) -> Option<UniformFill> {
@@ -597,17 +688,28 @@ fn air_subtree(lib: &mut NodeLibrary, depth: u8) -> NodeId {
     lib.insert(uniform_children(Child::Node(child)))
 }
 
-/// Carve an air cavity at the camera's anchor position.
+/// Ensure the camera's anchor path is tree-walkable down to
+/// `anchor.depth()`, inserting a fresh empty Node at any slot that
+/// was `Child::Empty` or `Child::Block` along the walk, and carving
+/// an air subtree at the final slot of depth `anchor.depth() - 1`.
 ///
-/// Replaces the cell at `anchor.depth()` with an air-filled Node
-/// subtree (not `Child::Empty`) so the render-frame tree walk can
-/// descend through the carved region. This is critical: if the carved
-/// cell were `Child::Empty`, the walk would stop there and the render
-/// frame would be stuck at a shallow depth — zooming deeper would
-/// show no visual change.
+/// Two guarantees for the renderer:
+/// 1. `compute_render_frame` can walk the anchor path all the way
+///    down — critical for fractals (Menger's body-centre Empties,
+///    Sierpinski's unused corner slots, etc.) where the path would
+///    otherwise stall on a structural Empty at depth 2–3.
+/// 2. The last cell (at `anchor.depth()`) is always air, so plain-
+///    world spawn lands in an air pocket rather than inside a
+///    dirt/grass block.
 ///
-/// The air subtree extends to `total_depth` so the user can zoom to
-/// any depth inside the cavity and still get a deep render frame.
+/// The expand-on-walk is a side effect the renderer *needs*; the
+/// final-cell carve is a side effect plain-worlds *want*. Both
+/// happen together because a single bottom-up rebuild stitches the
+/// new child IDs upward through the whole anchor path.
+///
+/// The air subtree below the final cell extends to `total_depth` so
+/// the user can zoom to any depth inside the cavity and still get a
+/// deep, walkable render frame.
 pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) {
     if anchor.depth() < 2 { return; }
     let slots = anchor.as_slice();
@@ -619,7 +721,25 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
         node_stack.push((node_id, node.kind));
         match node.children[slot as usize] {
             Child::Node(child_id) => node_id = child_id,
-            _ => return,
+            // If the camera's anchor path crosses an Empty or Block
+            // slot before reaching `carve_depth`, install a fresh
+            // empty Node there so the walk can continue. Bottom-up
+            // rebuild below stitches the new Node into the parent's
+            // slot via the replacement chain — the rest of the
+            // parent's siblings stay untouched. This is the fix
+            // for fractals with structural empties (Menger's body-
+            // centres, Sierpinski's 23 unused corners etc.): without
+            // it, `compute_render_frame` stalls at the first empty
+            // and the shader can never render cells small enough
+            // for Nyquist to let a real Block leaf be visible,
+            // which manifests as monochromatic LOD-terminal colour.
+            // EntityRef should never appear in a terrain edit path
+            // — entities only land in ephemeral scene-root nodes —
+            // but if it does, treat it like an empty and install a
+            // fresh air Node so carve can proceed without panicking.
+            Child::Empty | Child::Block(_) | Child::EntityRef(_) => {
+                node_id = world.library.insert(empty_children());
+            }
         }
     }
     let Some(node) = world.library.get(node_id) else { return };

@@ -63,10 +63,17 @@ use crate::world::tree::{
 
 use super::types::{GpuChild, GpuNodeKind};
 
-/// Full pack result tuple: `(tree, node_kinds, node_offsets,
+/// Full pack result tuple: `(tree, node_kinds, node_offsets, aabbs,
 /// node_ids, root_bfs_idx)`. Used by the initial GPU bring-up and
 /// tests; edit-path callers use [`CachedTree`] directly.
-pub type PackedTree = (Vec<u32>, Vec<GpuNodeKind>, Vec<u32>, Vec<NodeId>, u32);
+pub type PackedTree = (
+    Vec<u32>,
+    Vec<GpuNodeKind>,
+    Vec<u32>,
+    Vec<u32>,
+    Vec<NodeId>,
+    u32,
+);
 
 /// The packed GPU tree state. Owned by the app; mutated in place on
 /// every edit. The shader reads `tree` / `node_kinds` / `node_offsets`
@@ -77,6 +84,14 @@ pub struct CachedTree {
     pub tree: Vec<u32>,
     pub node_kinds: Vec<GpuNodeKind>,
     pub node_offsets: Vec<u32>,
+    /// Per-BFS-idx content AABB, 12 bits packed in the low 12 bits of
+    /// each u32 (6 × 2 bits, see [`content_aabb`]). Before the u16
+    /// palette widening this lived in `GpuChild._pad`, stored per
+    /// child entry; now the entry's bits are taken by `block_type_hi`
+    /// so the AABB moved to its own parallel buffer indexed by the
+    /// child's BFS position. Shader reads `aabbs[child_idx]` on
+    /// descent to cull rays that miss the subtree's occupied cells.
+    pub aabbs: Vec<u32>,
     pub node_ids: Vec<NodeId>,
     pub bfs_by_nid: HashMap<NodeId, u32>,
     pub root_bfs_idx: u32,
@@ -88,6 +103,7 @@ impl Default for CachedTree {
             tree: Vec::new(),
             node_kinds: Vec::new(),
             node_offsets: Vec::new(),
+            aabbs: Vec::new(),
             node_ids: Vec::new(),
             bfs_by_nid: HashMap::new(),
             root_bfs_idx: 0,
@@ -105,6 +121,16 @@ impl CachedTree {
     pub fn update_root(&mut self, library: &NodeLibrary, new_root: NodeId) {
         let bfs = self.emit_or_lookup(library, new_root);
         self.root_bfs_idx = bfs;
+    }
+
+    /// Ensure `nid` is packed into this buffer and return its BFS
+    /// idx WITHOUT touching `root_bfs_idx`. Used for auxiliary
+    /// roots (scene overlay, entity subtrees) that live alongside
+    /// `world.root` in the same GPU tree buffer. Content-addressed:
+    /// a previously-packed NodeId returns the cached BFS idx with
+    /// no buffer writes.
+    pub fn ensure_root(&mut self, library: &NodeLibrary, nid: NodeId) -> u32 {
+        self.emit_or_lookup(library, nid)
     }
 
     /// Resolve a NodeId to a BFS idx, packing it (and any missing
@@ -136,25 +162,23 @@ impl CachedTree {
             if e.is_some() { occ |= 1u32 << i; }
         }
 
-        // Emit header + children slab. For tag=2 entries, fill the
-        // content AABB from the just-resolved child's occupancy —
-        // the shader uses this to cull descents before committing.
+        // Emit header + children slab. Content AABB for the parent
+        // is stored in the parallel `aabbs` buffer at this node's
+        // BFS idx (see `CachedTree::aabbs`). The shader reads
+        // `aabbs[child_idx]` on descent rather than extracting it
+        // from the child-entry bits.
         let header_off = self.tree.len() as u32;
         self.tree.push(occ);
         self.tree.push(header_off + 2);
         for entry in slab.iter().flatten() {
-            let mut e = *entry;
-            if e.tag == 2 {
-                let child_header_off = self.node_offsets[e.node_index as usize] as usize;
-                let child_occ = self.tree[child_header_off];
-                e._pad = content_aabb(child_occ);
-            }
+            let e = *entry;
             self.tree.push(pack_child_first(e));
             self.tree.push(e.node_index);
         }
 
         let bfs = self.node_offsets.len() as u32;
         self.node_offsets.push(header_off);
+        self.aabbs.push(content_aabb(occ) as u32);
         self.node_kinds.push(GpuNodeKind::from_node_kind(kind));
         self.node_ids.push(nid);
         self.bfs_by_nid.insert(nid, bfs);
@@ -168,9 +192,19 @@ impl CachedTree {
     fn build_child_entry(&mut self, library: &NodeLibrary, child: Child) -> Option<GpuChild> {
         match child {
             Child::Empty => None,
-            Child::Block(bt) => Some(GpuChild {
-                tag: 1, block_type: bt, _pad: 0, node_index: 0,
-            }),
+            Child::Block(bt) => Some(GpuChild::new(1, bt, 0, 0)),
+            // tag=3: EntityRef cell. `node_index` carries the GPU
+            // entity-buffer index; `block_type` carries the entity-
+            // representative sentinel so the LOD-terminal splat
+            // isn't triggered by an "empty" reading. The shader's
+            // tag==3 branch (`march_cartesian`) transforms the ray
+            // into the per-entity bbox and runs a sub-DDA there.
+            Child::EntityRef(entity_idx) => Some(GpuChild::new(
+                3,
+                crate::world::tree::ENTITY_REPRESENTATIVE,
+                0,
+                entity_idx,
+            )),
             Child::Node(child_id) => {
                 let (is_cart, uniform_type, representative) = {
                     let node = library.get(child_id)?;
@@ -183,23 +217,13 @@ impl CachedTree {
                 if is_cart && uniform_type == UNIFORM_EMPTY {
                     None
                 } else if is_cart && uniform_type != UNIFORM_MIXED {
-                    Some(GpuChild {
-                        tag: 1,
-                        block_type: uniform_type,
-                        _pad: 0,
-                        node_index: 0,
-                    })
+                    Some(GpuChild::new(1, uniform_type, 0, 0))
                 } else {
                     let child_bfs = self.emit_or_lookup(library, child_id);
-                    // _pad (content AABB) filled in by the caller
-                    // when emitting the parent's slab, at which
-                    // point the child's occupancy is known.
-                    Some(GpuChild {
-                        tag: 2,
-                        block_type: representative,
-                        _pad: 0,
-                        node_index: child_bfs,
-                    })
+                    // `flags` filled in by the caller when emitting
+                    // the parent's slab (carries content AABB bits),
+                    // at which point the child's occupancy is known.
+                    Some(GpuChild::new(2, representative, 0, child_bfs))
                 }
             }
         }
@@ -214,14 +238,25 @@ pub fn pack_tree(library: &NodeLibrary, root: NodeId) -> PackedTree {
     let mut cache = CachedTree::new();
     cache.update_root(library, root);
     (
-        cache.tree, cache.node_kinds, cache.node_offsets,
-        cache.node_ids, cache.root_bfs_idx,
+        cache.tree,
+        cache.node_kinds,
+        cache.node_offsets,
+        cache.aabbs,
+        cache.node_ids,
+        cache.root_bfs_idx,
     )
 }
 
-/// Encode a child's first u32: tag | (block_type << 8) | (_pad << 16).
+/// Encode a child's first u32:
+/// `tag | (block_type_lo << 8) | (block_type_hi << 16) | (flags << 24)`.
+/// Little-endian across bytes 0-3 → the shader extracts tag as
+/// `packed & 0xFFu` (unchanged) and block_type as
+/// `(packed >> 8) & 0xFFFFu`.
 pub(crate) fn pack_child_first(c: GpuChild) -> u32 {
-    (c.tag as u32) | ((c.block_type as u32) << 8) | ((c._pad as u32) << 16)
+    (c.tag as u32)
+        | ((c.block_type_lo as u32) << 8)
+        | ((c.block_type_hi as u32) << 16)
+        | ((c.flags as u32) << 24)
 }
 
 /// Tight axis-aligned bounding box of the occupied slots in a 3×3×3
@@ -287,16 +322,23 @@ mod tests {
         let first_child = tree[header_off + 1] as usize;
         let bit = 1u32 << slot;
         if occupancy & bit == 0 {
-            return GpuChild { tag: 0, block_type: 0, _pad: 0, node_index: 0 };
+            return GpuChild::new(0, 0, 0, 0);
         }
         let rank = (occupancy & (bit - 1)).count_ones() as usize;
         let off = first_child + rank * 2;
         let packed = tree[off];
         let tag = (packed & 0xFF) as u8;
-        let block_type = ((packed >> 8) & 0xFF) as u8;
-        let _pad = ((packed >> 16) & 0xFFFF) as u16;
+        let block_type_lo = ((packed >> 8) & 0xFF) as u8;
+        let block_type_hi = ((packed >> 16) & 0xFF) as u8;
+        let flags = ((packed >> 24) & 0xFF) as u8;
         let node_index = tree[off + 1];
-        GpuChild { tag, block_type, _pad, node_index }
+        GpuChild {
+            tag,
+            block_type_lo,
+            block_type_hi,
+            flags,
+            node_index,
+        }
     }
 
     #[test]
@@ -305,7 +347,7 @@ mod tests {
         // root last. Before this refactor root was BFS idx 0; now
         // it's `node_offsets.len() - 1`.
         let world = plain_test_world();
-        let (_, kinds, offsets, _, root_idx) = pack_tree(&world.library, world.root);
+        let (_, kinds, offsets, _, _, root_idx) = pack_tree(&world.library, world.root);
         assert_eq!(root_idx as usize, offsets.len() - 1);
         assert_eq!(kinds.len(), offsets.len());
     }
@@ -327,7 +369,7 @@ mod tests {
     #[test]
     fn pack_includes_body_kind_and_radii() {
         let world = planet_world();
-        let (_, kinds, _, _, _) = pack_tree(&world.library, world.root);
+        let (_, kinds, _, _, _, _) = pack_tree(&world.library, world.root);
         let body = kinds.iter().find(|k| k.kind == 1).expect("body kind in buffer");
         assert!((body.inner_r - 0.12).abs() < 1e-6);
         assert!((body.outer_r - 0.45).abs() < 1e-6);
@@ -336,7 +378,7 @@ mod tests {
     #[test]
     fn pack_flattens_uniform_empty_siblings() {
         let world = planet_world();
-        let (tree, _, offsets, _, root_idx) = pack_tree(&world.library, world.root);
+        let (tree, _, offsets, _, _, root_idx) = pack_tree(&world.library, world.root);
         // Slot 0 of root (uniform-empty Cartesian) should be absent.
         assert_eq!(sparse_child(&tree, &offsets, root_idx, 0).tag, 0);
         // CENTER_SLOT has the sphere body → Node, must stay.
@@ -355,10 +397,10 @@ mod tests {
         let root = lib.insert(root_children);
         lib.ref_inc(root);
 
-        let (tree, kinds, offsets, _, root_idx) = pack_tree(&lib, root);
+        let (tree, kinds, offsets, _, _, root_idx) = pack_tree(&lib, root);
         let entry = sparse_child(&tree, &offsets, root_idx, 13);
         assert_eq!(entry.tag, 1, "uniform-nonempty subtree flattens to Block");
-        assert_eq!(entry.block_type, crate::world::palette::block::STONE);
+        assert_eq!(entry.block_type(), crate::world::palette::block::STONE);
         assert_eq!(kinds.len(), 1, "only root emitted; uniform subtree pruned");
     }
 
@@ -423,7 +465,7 @@ mod tests {
     #[test]
     fn menger_pack_size_regression() {
         let world = menger_world(5);
-        let (tree, _, _, _, _) = pack_tree(&world.library, world.root);
+        let (tree, _, _, _, _, _) = pack_tree(&world.library, world.root);
         let u32s = tree.len();
         eprintln!("menger depth=5 pack size: {} u32s ({} bytes)", u32s, u32s * 4);
         const MENGER_D5_MAX_U32S: usize = 320;
@@ -433,7 +475,7 @@ mod tests {
     #[test]
     fn plain_pack_size_regression() {
         let world = plain_world(5);
-        let (tree, _, _, _, _) = pack_tree(&world.library, world.root);
+        let (tree, _, _, _, _, _) = pack_tree(&world.library, world.root);
         let u32s = tree.len();
         eprintln!("plain layers=5 pack size: {} u32s ({} bytes)", u32s, u32s * 4);
         const PLAIN_L5_MAX_U32S: usize = 1400;
@@ -457,7 +499,7 @@ mod tests {
             let pos = bootstrap::plain_surface_spawn(spawn_depth);
             bootstrap::carve_air_pocket(&mut world, &pos.anchor, 40);
 
-            let (tree_before, _, offsets_before, _, _) = pack_tree(&world.library, world.root);
+            let (tree_before, _, offsets_before, _, _, _) = pack_tree(&world.library, world.root);
 
             let ray_origin = pos.in_frame(&Path::root());
             let hit = raycast::cpu_raycast(
@@ -465,7 +507,7 @@ mod tests {
             ).expect(&format!("raycast must hit at depth {spawn_depth}"));
             assert!(edit::break_block(&mut world, &hit));
 
-            let (tree_after, _, offsets_after, _, _) = pack_tree(&world.library, world.root);
+            let (tree_after, _, offsets_after, _, _, _) = pack_tree(&world.library, world.root);
             assert!(
                 tree_before != tree_after || offsets_before != offsets_after,
                 "packed GPU data unchanged after break at depth {spawn_depth}",

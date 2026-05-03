@@ -134,7 +134,7 @@ fn march_face_root(
                           + (abs(hit_normal.x) + abs(hit_normal.z)) * 0.82;
             let ambient = 0.22;
             let block_shape = sphere_cell_shape(cell_u, cell_v, cell_r);
-            result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
+            result.color = palette[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
             result.normal = hit_normal;
             return result;
         }
@@ -262,7 +262,7 @@ fn sphere_in_cell(
                 case 5u: { hit_normal =  n; }
                 default: { hit_normal =  n; }
             }
-            let cell_color = palette.colors[block_id].rgb;
+            let cell_color = palette[block_id].rgb;
             let sun_dir = normalize(vec3<f32>(0.4, 0.7, 0.3));
             let diffuse = max(dot(hit_normal, sun_dir), 0.0);
             let axis_tint = abs(hit_normal.y) * 1.0
@@ -420,7 +420,7 @@ fn sphere_in_face_window(
                           + (abs(hit_normal.x) + abs(hit_normal.z)) * 0.82;
             let ambient = 0.22;
             let block_shape = sphere_cell_shape(cell_u, cell_v, cell_r);
-            result.color = palette.colors[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
+            result.color = palette[block_id].rgb * (ambient + diffuse * 0.78) * axis_tint * block_shape;
             return result;
         }
 

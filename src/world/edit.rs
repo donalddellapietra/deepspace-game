@@ -96,7 +96,7 @@ pub fn place_child(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> b
 /// Place a block adjacent to the hit face. Builds a uniform subtree
 /// that matches the depth of siblings at the placement site, so the
 /// placed block has full recursive structure like the terrain around it.
-pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u8) -> bool {
+pub fn place_block(world: &mut WorldState, hit: &HitInfo, block_type: u16) -> bool {
     // Figure out how deep siblings are at the placement site.
     let sibling_depth = if let Some(&(parent_id, _)) = hit.path.last() {
         if let Some(parent) = world.library.get(parent_id) {
@@ -290,15 +290,20 @@ fn propagate_edit(world: &mut WorldState, hit: &HitInfo, new_child: Child) -> bo
 }
 
 /// A cell is placeable if it's Empty or an all-empty Node subtree
-/// (representative_block == 255). At coarser zoom levels, air regions
-/// are represented as Node subtrees rather than Child::Empty.
+/// (`representative_block == REPRESENTATIVE_EMPTY`). At coarser zoom
+/// levels, air regions are represented as Node subtrees rather than
+/// Child::Empty.
 fn is_placeable(library: &NodeLibrary, child: Child) -> bool {
+    use crate::world::tree::REPRESENTATIVE_EMPTY;
     match child {
         Child::Empty => true,
         Child::Node(id) => library
             .get(id)
-            .map_or(false, |n| n.representative_block == 255),
+            .map_or(false, |n| n.representative_block == REPRESENTATIVE_EMPTY),
         Child::Block(_) => false,
+        // Entity cells aren't placeable — something is already there
+        // (the entity). Players edit entities via a different path.
+        Child::EntityRef(_) => false,
     }
 }
 

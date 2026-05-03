@@ -11,16 +11,20 @@ use crate::world::tree::NodeKind;
 /// slot `s` at BFS position `b` the pack emits two u32s:
 ///
 /// ```text
-/// tree[header_offset[b] + 2 + rank*2 + 0]  = packed (tag|block_type|pad)
+/// tree[header_offset[b] + 2 + rank*2 + 0]  = packed (tag|block_type_lo|block_type_hi|flags)
 /// tree[header_offset[b] + 2 + rank*2 + 1]  = node_index (tag=2)
 /// ```
 ///
-/// - `tag` (u8): 1 = Block, 2 = Node. (tag=0 never appears.)
-/// - `block_type` (u8): valid when `tag == 1` (LOD-flattened or
-///   leaf block). For `tag == 2` it carries the child's
-///   representative block — a hint the shader uses for the
-///   empty-representative fast path without descending.
-/// - `_pad` (u16): reserved for per-child flags.
+/// - `tag` (u8): 1 = Block, 2 = Node. (tag=0 never appears.) Kept at
+///   byte 0 so the shader's tag extraction is a simple `packed & 0xFFu`
+///   regardless of palette width.
+/// - `block_type_lo` + `block_type_hi` (u16 little-endian across bytes
+///   1-2): palette index. Valid when `tag == 1` (LOD-flattened or
+///   leaf block). For `tag == 2` it carries the child's representative
+///   block — a hint the shader uses for the empty-representative fast
+///   path without descending. Combined u16 gives 65 536 distinct
+///   palette entries.
+/// - `flags` (u8): reserved for per-child flags.
 /// - `node_index` (u32): BFS position of the child node when
 ///   `tag == 2`. Used to index `node_kinds[]` and `node_offsets[]`.
 ///   The header u32-offset in `tree[]` is
@@ -29,9 +33,29 @@ use crate::world::tree::NodeKind;
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
 pub struct GpuChild {
     pub tag: u8,
-    pub block_type: u8,
-    pub _pad: u16,
+    pub block_type_lo: u8,
+    pub block_type_hi: u8,
+    pub flags: u8,
     pub node_index: u32,
+}
+
+impl GpuChild {
+    #[inline]
+    pub fn new(tag: u8, block_type: u16, flags: u8, node_index: u32) -> Self {
+        let [lo, hi] = block_type.to_le_bytes();
+        Self {
+            tag,
+            block_type_lo: lo,
+            block_type_hi: hi,
+            flags,
+            node_index,
+        }
+    }
+
+    #[inline]
+    pub fn block_type(&self) -> u16 {
+        u16::from_le_bytes([self.block_type_lo, self.block_type_hi])
+    }
 }
 
 /// Per-packed-node metadata: which `NodeKind` this node is, plus
@@ -85,24 +109,41 @@ pub struct GpuCamera {
     pub _pad2: f32,
     pub up: [f32; 3],
     pub fov: f32,
+    /// World → clip-space matrix (column-major). The ray-march writes
+    /// this into `@builtin(frag_depth)` via the `fs_main_depth`
+    /// entry point so the entity raster pass can z-test against it.
+    /// When the raster pass is disabled, the matrix is still
+    /// uploaded (trivial cost) but nothing reads it.
+    pub view_proj: [[f32; 4]; 4],
 }
 
-/// Block color palette — up to 256 RGBA colors indexed by block type.
+/// One entity instance on the GPU: a bounding cube in the current
+/// render frame's [0, 3)³ local coords plus a BFS idx into the
+/// shared `tree[]` buffer for the entity's voxel subtree.
+///
+/// The shader ray-marches against `bbox_min`/`bbox_max`; on AABB
+/// hit it either splats `representative_block` (sub-pixel entity,
+/// skips the whole subtree descent) or transforms the ray into
+/// the subtree's local [0, 3)³ space and calls `march_cartesian`
+/// with a depth budget sized to the entity's on-screen pixel
+/// count. `representative_block` is stored as u32 to keep the
+/// GPU struct 16-byte aligned even though the CPU-side value is
+/// a u16 palette index.
+///
+/// 32 bytes total (vec4-aligned for WGSL storage buffer).
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct GpuPalette {
-    pub colors: [[f32; 4]; 256],
+#[derive(Clone, Copy, Pod, Zeroable, Default, Debug)]
+pub struct GpuEntity {
+    pub bbox_min: [f32; 3],
+    pub representative_block: u32,
+    pub bbox_max: [f32; 3],
+    pub subtree_bfs: u32,
 }
 
-impl Default for GpuPalette {
-    fn default() -> Self {
-        let mut colors = [[0.0f32; 4]; 256];
-        for &(idx, _, color) in crate::world::palette::BUILTINS {
-            colors[idx as usize] = color;
-        }
-        Self { colors }
-    }
-}
+// The former fixed-size `GpuPalette` uniform struct has been removed.
+// Palette colors now live in a variable-length read-only storage
+// buffer (see `ColorRegistry::to_gpu_palette` -> `Vec<[f32; 4]>`
+// and `src/renderer/init.rs`'s palette buffer binding).
 
 #[cfg(test)]
 mod tests {

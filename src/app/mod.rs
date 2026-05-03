@@ -15,21 +15,41 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::{NodeKind, MAX_DEPTH};
 
-/// Levels shallower than the camera's anchor at which the render
-/// frame sits. The frame walks down the camera's path until either
-/// (a) it reaches `anchor_depth - RENDER_FRAME_K`, or (b) it would
-/// cross into a non-Cartesian node — whichever happens first. The
-/// non-Cartesian stop is required because the shader's main DDA
-/// only knows how to march through Cartesian children at the frame
-/// root (sphere body / face-cell roots are next-session work).
-///
-/// `RENDER_FRAME_MAX_DEPTH` was the historical pin at root (0) used
-/// to validate the sphere dispatch; with the precision rewrite in
-/// place it's now `MAX_DEPTH` so the walker can descend freely
-/// through Cartesian zones.
+/// `render_margin` passed to `with_render_margin`. For Cartesian
+/// frames `min_render_depth = logical.depth()` so this constant is
+/// dormant — render_path = logical_path regardless of K. It still
+/// controls the spread between logical and render paths on Sphere
+/// and Body frames, where the logical path continues through the
+/// face subtree but the render walker stays at the containing body
+/// cell. The `= 3` value is a historical pin kept for sphere path
+/// stability.
 pub const RENDER_FRAME_K: u8 = 3;
 pub const RENDER_FRAME_MAX_DEPTH: u8 = MAX_DEPTH as u8;
 pub const RENDER_FRAME_CONTEXT: u8 = 4;
+
+/// Depth at which the render frame is rooted, *independent of
+/// the user's zoom level*. The camera's `WorldPos` is deepened to
+/// this path depth via `deepened_to` — using the stored f32 offset
+/// to pick slots at every level beyond the user's anchor — and
+/// that deep path drives `compute_render_frame`.
+///
+/// # Why this exists
+///
+/// Zooming is a UI/interaction concept: it controls `edit_depth`
+/// (where break/place operations resolve), not what the camera
+/// actually sees. Two cameras at the same world position should
+/// render identical pixels regardless of their zoom state. Before
+/// this constant existed, `desired_depth = anchor_depth - K`
+/// leaked zoom directly into render-frame depth — so a fractal
+/// looked like chunky cubes when zoomed out and fine mesh when
+/// zoomed in, even though the camera hadn't moved.
+///
+/// # Bound
+///
+/// Disabled (= MAX_DEPTH) to let the render frame follow the
+/// actual camera anchor. The prior 14 cap was an f32-precision
+/// workaround for the shader's `ray_dir /= 3` per-pop scheme.
+pub const RENDER_ANCHOR_DEPTH: u8 = MAX_DEPTH as u8;
 pub mod cursor;
 pub mod edit_actions;
 pub mod event_loop;
@@ -164,11 +184,10 @@ pub struct App {
     pub(super) shader_stats_enabled: bool,
     /// Nyquist LOD pixel threshold for the Cartesian shader.
     /// Threaded to `Renderer::new` where it's baked into the
-    /// pipeline as a WGSL `override` constant.
+    /// pipeline as a WGSL `override` constant. This is the sole
+    /// visual LOD gate now that the old ribbon-shell descent
+    /// budget has been retired.
     pub(super) lod_pixel_threshold: f32,
-    /// Ribbon-level base detail budget. See bindings.wgsl
-    /// `BASE_DETAIL_DEPTH`.
-    pub(super) lod_base_depth: u32,
     /// When > 0, the live-surface `render()` path emits a
     /// `render_live_sample` line every N frames with CPU-side phase
     /// timings (acquire / encode / submit / present / total). 0
@@ -177,6 +196,27 @@ pub struct App {
     /// Whether TAAU is enabled. Threaded to `Renderer::new` so the
     /// live and harness paths share the same resolve setup.
     pub(super) taa_enabled: bool,
+    /// How entities render — ray-march through tag=3 (default) or
+    /// instanced raster (landed later). Set from CLI
+    /// `--entity-render` and baked into Renderer::new.
+    pub(super) entity_render_mode: crate::renderer::EntityRenderMode,
+    /// Compile-time entity-branch kill switch. When true, the
+    /// ray-march pipeline is built with `ENABLE_ENTITIES=false`
+    /// so Naga DCEs the tag==3 branch + march_entity_subtree.
+    /// Set via `--no-entities`. Default false = entities enabled.
+    pub(super) disable_entities: bool,
+    /// World-coordinate Y where entities naturally rest. `Some` for
+    /// flat worlds (sea level = a specific Y); `None` for sphere/
+    /// fractal worlds where "resting height" is position-dependent.
+    /// Consumed by `EntityStore::tick` to zero out the Y velocity
+    /// component so entities stay on the ground they spawned on.
+    pub(super) entity_surface_y: Option<f32>,
+    /// Cached subtree NodeId for the soldier model loaded from
+    /// `assets/vox/soldier.vox` on first `spawn_test_entities` call.
+    /// `None` until the first press of N or M. Caches the parsed
+    /// model so repeat presses don't re-read the .vox file or
+    /// re-register palette entries.
+    pub(super) cached_soldier_subtree: Option<crate::world::tree::NodeId>,
     /// Block-interaction radius in anchor-cell units. Caps the
     /// cursor raycast distance so break/place only succeed when
     /// the target is within `interaction_radius × anchor_cell_size`
@@ -215,6 +255,15 @@ pub struct App {
     /// fine detail along the edit path visible, even when the camera
     /// is far enough from the surface that LOD would normally collapse it.
     pub(super) last_edit_slots: Option<Path>,
+    /// All live entities. Flat Vec, no ECS — the old npc-instancing
+    /// branch's 40× perf-over-ECS lesson. Visual content shared via
+    /// `NodeLibrary`; position + override state per-entity.
+    pub(super) entities: crate::world::entities::EntityStore,
+    /// Scene root NodeId from the last `upload_tree_lod`. Held via
+    /// `NodeLibrary::ref_inc` so its ephemeral ancestor chain
+    /// survives between frames; released on the next upload when the
+    /// new scene root replaces it.
+    pub(super) active_scene_root: Option<crate::world::tree::NodeId>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -265,15 +314,22 @@ impl App {
         let forced_visual_depth = test_cfg.force_visual_depth;
         let forced_edit_depth = test_cfg.force_edit_depth;
         let shader_stats_enabled = test_cfg.shader_stats;
-        // Nyquist floor: sub-pixel rejection only. Primary LOD gate
-        // is ribbon-level-based (`lod_base_depth`).
+        // Nyquist floor: sub-pixel rejection only. This is the
+        // sole visual LOD gate; the stack depth (MAX_STACK_DEPTH
+        // in the shader) is the hard ceiling.
         let lod_pixel_threshold = test_cfg.lod_pixels.unwrap_or(1.0);
-        let lod_base_depth = test_cfg.lod_base_depth.unwrap_or(4);
         let live_sample_every_frames = test_cfg.live_sample_every_frames.unwrap_or(0);
         let taa_enabled = test_cfg.taa;
+        let entity_render_mode = test_cfg.entity_render_mode;
+        let disable_entities = test_cfg.disable_entities;
+        let entity_surface_y = bootstrap::surface_y_for_preset(&test_cfg.world_preset);
         let interaction_radius_cells = test_cfg.interaction_radius.unwrap_or(6);
         let (harness_width, harness_height) = test_cfg.harness_size();
-        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), Some(test_cfg.plain_layers()));
+        // Pass the raw `Option` through so each preset's
+        // `unwrap_or(...)` default applies when the user didn't
+        // pass --plain-layers. Fractals default to 8 (where Block
+        // leaves are pixel-visible); plain/vox world default to 40.
+        let bootstrap = bootstrap::bootstrap_world(test_cfg.world_preset.clone(), test_cfg.plain_layers);
         let mut world = bootstrap.world;
         let bootstrap_color_registry = bootstrap.color_registry;
         let tree_depth = world.tree_depth();
@@ -316,9 +372,15 @@ impl App {
             }
         };
         let anchor_depth = position.anchor.depth();
-        let desired_depth = (position.anchor.depth().saturating_sub(RENDER_FRAME_K))
+        // Render-frame depth is decoupled from the user's anchor
+        // depth (see `RENDER_ANCHOR_DEPTH` docs). We deepen the
+        // camera's `WorldPos` using its f32 offset to a constant
+        // maximum, so zooming only changes `edit_depth`, not what
+        // the camera *sees*.
+        let desired_depth = RENDER_ANCHOR_DEPTH
+            .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = position.anchor;
+        let mut logical_path = position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
         logical_path.truncate(desired_depth);
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
@@ -339,7 +401,13 @@ impl App {
             spawn_yaw, spawn_pitch,
         );
 
-        Self {
+        // Pull spawn-entity fields out of `test_cfg` before
+        // `from_config` consumes it, so the init-time entity spawn
+        // can run after the struct is fully built.
+        let spawn_entity_path = test_cfg.spawn_entity.clone();
+        let spawn_entity_count = test_cfg.spawn_entity_count;
+
+        let mut app = Self {
             window: None,
             renderer: None,
             camera: Camera {
@@ -380,9 +448,12 @@ impl App {
             harness_height,
             shader_stats_enabled,
             lod_pixel_threshold,
-            lod_base_depth,
             live_sample_every_frames,
             taa_enabled,
+            entity_render_mode,
+            disable_entities,
+            entity_surface_y,
+            cached_soldier_subtree: None,
             interaction_radius_cells,
             last_highlight_raycast_ms: 0.0,
             last_highlight_set_ms: 0.0,
@@ -396,6 +467,8 @@ impl App {
             last_crosshair_sent: None,
             cached_highlight: None,
             last_edit_slots: None,
+            entities: crate::world::entities::EntityStore::new(),
+            active_scene_root: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -403,7 +476,12 @@ impl App {
             proxy,
             renderer_init_started: false,
             pending_init: None,
+        };
+        if let Some(ref path) = spawn_entity_path {
+            let count = spawn_entity_count.max(1);
+            app.spawn_vox_entity_at_init(path, count);
         }
+        app
     }
 
     #[inline]
@@ -422,9 +500,13 @@ impl App {
     /// explicit face-cell window so render/edit share one layer
     /// definition.
     pub(super) fn render_frame(&self) -> ActiveFrame {
-        let desired_depth = (self.anchor_depth().saturating_sub(RENDER_FRAME_K as u32) as u8)
+        // Deepen the camera's anchor to `RENDER_ANCHOR_DEPTH` so
+        // the render frame depth is a function of camera position,
+        // not the user's zoom level. See `RENDER_ANCHOR_DEPTH`.
+        let desired_depth = RENDER_ANCHOR_DEPTH
+            .saturating_sub(RENDER_FRAME_K)
             .min(RENDER_FRAME_MAX_DEPTH);
-        let mut logical_path = self.camera.position.anchor;
+        let mut logical_path = self.camera.position.deepened_to(RENDER_ANCHOR_DEPTH).anchor;
         logical_path.truncate(desired_depth);
         frame::with_render_margin(
             &self.world.library, self.world.root,
@@ -449,6 +531,13 @@ impl App {
 
     pub(super) fn update(&mut self, dt: f32) {
         player::update(&mut self.camera, dt);
+        // Advance entities by velocity * dt. WorldPos renormalizes
+        // so cell-boundary crossings are handled transparently; on
+        // worlds with a defined sea level, `tick` zeroes the Y
+        // velocity so entities don't drift off the ground.
+        if !self.entities.is_empty() {
+            self.entities.tick(&self.world.library, dt, self.entity_surface_y);
+        }
         let cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
         if let Some(renderer) = &mut self.renderer {
             renderer.update_camera(&cam_gpu);

@@ -8,11 +8,34 @@
 
 mod buffers;
 mod draw;
+pub mod entity_raster;
+pub mod heightmap;
 mod init;
 mod taa;
 
 pub use draw::{OffscreenRenderTiming, ShaderStatsFrame};
+pub use entity_raster::{compute_view_proj, EntityRasterState, InstanceData};
 pub use taa::{FrameSignature, TaaState};
+
+/// How entities are rendered. Chosen at startup via
+/// `--entity-render` and baked into the Renderer (pipelines and
+/// buffers are allocated accordingly). Mutating at runtime isn't
+/// supported — a toggle would require rebuilding the ray-march
+/// pipeline and reallocating the depth texture.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum EntityRenderMode {
+    #[default]
+    /// Entities enter the tree as `Child::EntityRef(idx)` and are
+    /// ray-marched through the tag=3 branch of `march_cartesian`.
+    /// Default. Decent perf up to ~1k entities.
+    RayMarch,
+    /// Entities are rendered as instanced triangle meshes in a
+    /// separate raster pass after the ray-march. Scales to 100k+.
+    /// Incompatible with TAA (depth buffer handoff would need
+    /// half-res adaptation). Landed in a later commit; ray-march
+    /// is the only mode active on this branch until then.
+    Raster,
+}
 
 /// Maximum ancestor-ribbon depth supported by the shader. Larger
 /// ribbons get truncated at upload (anything beyond can't pop).
@@ -42,6 +65,11 @@ pub struct GpuUniforms {
     /// Number of ancestor ribbon entries. 0 = frame is at world
     /// root, no pop possible.
     pub ribbon_count: u32,
+    /// Number of live entities in the entity buffer (binding 10).
+    /// Shader's tag=3 dispatch uses it as a validity gate; zero
+    /// means the entity path is inert.
+    pub entity_count: u32,
+    pub _pad_entity: [u32; 3],
     pub highlight_min: [f32; 4],
     pub highlight_max: [f32; 4],
     /// Body radii (used iff `root_kind == 1`). Stored in the body
@@ -69,6 +97,11 @@ pub struct Renderer {
     /// BFS index → tree[] u32-offset of that node's header. Touched
     /// only on descent / ribbon pop (cold path).
     pub(super) node_offsets_buffer: wgpu::Buffer,
+    /// BFS index → packed 12-bit content AABB in the low 12 bits.
+    /// See `gpu::pack::CachedTree::aabbs`. Parallel to
+    /// `node_offsets_buffer`; the ray-march descent uses it to cull
+    /// rays that miss the subtree's occupied region.
+    pub(super) aabbs_buffer: wgpu::Buffer,
     pub(super) node_kinds_buffer: wgpu::Buffer,
     /// Running counts of what's currently uploaded to the GPU
     /// buffers (u32s for tree; element counts for the BFS-indexed
@@ -78,6 +111,7 @@ pub struct Renderer {
     pub(super) uploaded_tree_u32s: u64,
     pub(super) uploaded_kinds_count: u64,
     pub(super) uploaded_offsets_count: u64,
+    pub(super) uploaded_aabbs_count: u64,
     pub(super) camera_buffer: wgpu::Buffer,
     /// CPU-side mirror of the most recent GpuCamera uploaded via
     /// `update_camera()`, with `jitter_x_px` / `jitter_y_px` always
@@ -102,7 +136,46 @@ pub struct Renderer {
     pub(super) root_face_bounds: [f32; 4],
     pub(super) root_face_pop_pos: [f32; 4],
     pub(super) ribbon_count: u32,
+    /// Number of live entities. Drives the uniforms' `entity_count`
+    /// (shader-side gate for the tag=3 dispatch path) and the
+    /// instance-buffer dispatch count for the raster entity pass.
+    pub(super) entity_count: u32,
+    /// Per-entity storage buffer (binding 10). Populated each frame
+    /// by `update_entities` with the live entity list; the ray-march
+    /// shader indexes into it from tag=3 child entries.
+    pub(super) entity_buffer: wgpu::Buffer,
+    pub(super) uploaded_entities_count: u64,
     pub(super) offscreen_texture: Option<wgpu::Texture>,
+    /// Beam-prepass mask: 1/BEAM_TILE_SIZE-per-axis R8Unorm render
+    /// target populated by `coarse_pipeline` at the start of each
+    /// frame. `fs_main` samples this 5 times per pixel and returns
+    /// sky directly when every tap reads 0, skipping the
+    /// register-constrained tree walk for sky tiles.
+    pub(super) mask_texture: wgpu::Texture,
+    pub(super) mask_view: wgpu::TextureView,
+    /// 1×1 dummy `texture_2d<f32>` that replaces `mask_texture` at
+    /// bind slot 8 during the coarse pass — a texture can't be
+    /// simultaneously bound as a render target and a sampled input.
+    /// `fs_coarse_mask` doesn't reference `coarse_mask`, so the
+    /// dummy's contents never matter.
+    pub(super) dummy_mask_view: wgpu::TextureView,
+    /// Coarse-pass render pipeline. Same bind group layout as the
+    /// main pipeline (one layout for both simplifies the code) but
+    /// targets R8Unorm at 1/BEAM_TILE_SIZE resolution and uses the
+    /// `fs_coarse_mask` fragment entry.
+    pub(super) coarse_pipeline: wgpu::RenderPipeline,
+    /// Bind group for the coarse pass. Identical to `bind_group`
+    /// except slot 8 is bound to `dummy_mask_view` instead of
+    /// `mask_view`.
+    pub(super) coarse_bind_group: wgpu::BindGroup,
+    /// When true, the coarse pass runs to populate the mask and
+    /// `fs_main`'s 5-tap check culls sky tiles. When false, the
+    /// mask is cleared to 1.0 (every pixel marches) and the coarse
+    /// pass is skipped. Toggled per-frame by `set_beam_enabled`
+    /// based on a CPU heuristic in the app: sparse root + camera
+    /// inside occupied cell → enable; otherwise skip the coarse
+    /// overhead and let the fine pass march every pixel directly.
+    pub(super) beam_enabled: bool,
     /// Second ray-march pipeline compiled to the TAAU entry point
     /// (`fs_main_taa`) with two color attachments — linear RGBA16F
     /// color and R32F hit-t. `None` when TAAU is disabled; the draw
@@ -111,11 +184,6 @@ pub struct Renderer {
     /// TAAU state: history textures, resolve pipeline, jitter,
     /// previous camera. `None` when TAAU is disabled.
     pub(super) taa: Option<TaaState>,
-    /// Optional GPU timestamp-query scaffolding. Present only when
-    /// the adapter reports `Features::TIMESTAMP_QUERY`. Used by
-    /// `render_offscreen` to measure the ray-march pass on the GPU
-    /// side, not just the CPU-side `device.poll(Wait)` duration.
-    pub(super) timestamp: Option<TimestampScratch>,
     /// Last queue.write_buffer durations (camera/ribbon/tree) in ms.
     /// Populated by the buffer-upload path so the harness can break
     /// "upload" into per-buffer sub-phases.
@@ -124,12 +192,12 @@ pub struct Renderer {
     pub(super) last_tree_write_ms: f64,
     pub(super) last_bind_group_rebuild_ms: f64,
     /// Shader-side atomic counters written by the fragment shader
-    /// each frame (ray_count, hit_count, miss_count, max_iter_count,
-    /// sum_steps_div4, max_steps, + 2 u32 pad). 32 bytes total.
+    /// each frame. Layout matches the `ShaderStats` struct in
+    /// `bindings.wgsl`; 64 bytes total (16 u32 slots).
     pub(super) shader_stats_buffer: wgpu::Buffer,
     /// Mappable COPY_DST shadow of `shader_stats_buffer`. Populated
     /// via `copy_buffer_to_buffer` at the end of the render pass,
-    /// mapped after `poll(Wait)` so the harness can read the 8 u32s.
+    /// mapped after `poll(Wait)` so the harness can read it back.
     pub(super) shader_stats_readback: wgpu::Buffer,
     /// When false, `render_offscreen` skips the stats clear / copy /
     /// map round-trip and returns a zeroed `ShaderStatsFrame`. The
@@ -145,17 +213,60 @@ pub struct Renderer {
     /// frames. CPU-side only — no `device.poll(Wait)` stall. Set via
     /// `--live-sample-every N` CLI flag; 0 (default) disables.
     pub(super) live_sample_every_frames: u32,
+    /// Which entity render path this renderer is wired for. Baked
+    /// at `Renderer::new` time; the raster path allocates the
+    /// depth-aware ray-march pipeline, a depth texture, and an
+    /// `EntityRasterState`.
+    pub(super) entity_render_mode: EntityRenderMode,
+    /// Depth texture used by the raster entity pass. Present iff
+    /// `entity_render_mode == Raster`. The ray-march pass writes
+    /// `@builtin(frag_depth)` via the `fs_main_depth` entry point;
+    /// the raster pass runs second with `depth_compare: Less`.
+    pub(super) depth_texture: Option<wgpu::Texture>,
+    pub(super) depth_view: Option<wgpu::TextureView>,
+    /// Ray-march pipeline compiled with a depth attachment + the
+    /// `fs_main_depth` fragment entry point. Used only when
+    /// `entity_render_mode == Raster`.
+    pub(super) pipeline_with_depth: Option<wgpu::RenderPipeline>,
+    /// Raster pass for entity meshes. Present iff
+    /// `entity_render_mode == Raster`.
+    pub(super) entity_raster: Option<EntityRasterState>,
+
+    // --- Heightmap / entity physics (raster mode only) ---
+    /// GPU heightmap-gen compute pipeline.
+    pub(super) heightmap_gen: Option<heightmap::HeightmapGen>,
+    /// GPU per-entity Y-clamp compute pipeline.
+    pub(super) entity_heightmap_clamp: Option<heightmap::EntityHeightmapClamp>,
+    /// Current heightmap texture + its uniforms. Reallocated when
+    /// `delta` (collision depth relative to frame depth) changes.
+    pub(super) heightmap_texture: Option<heightmap::HeightmapTexture>,
+    /// True whenever the tree / frame root / collision depth
+    /// changed since the last `heightmap_gen` dispatch.
+    pub(super) heightmap_dirty: bool,
+    /// Frame-root BFS index the heightmap was last generated for.
+    pub(super) heightmap_frame_root_bfs: u32,
 }
 
-/// GPU timestamp query resources. `query_set` holds two timestamp
-/// slots (pass start, pass end); `resolve` is the COPY_SRC buffer
-/// that `resolve_query_set` writes ticks into; `staging` is a
-/// MAP_READ buffer used to read the ticks back on the CPU.
-pub struct TimestampScratch {
-    pub query_set: wgpu::QuerySet,
-    pub resolve: wgpu::Buffer,
-    pub staging: wgpu::Buffer,
-    pub period_ns: f32,
+/// Depth attachment format for the raster entity pass.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+pub(super) fn create_depth_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("entity_raster_depth"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 impl Renderer {
@@ -214,6 +325,16 @@ impl Renderer {
         self.write_uniforms();
     }
 
+    /// Per-frame toggle for the beam prepass. Callers compute a
+    /// cheap CPU heuristic (root occupancy popcount, camera's root
+    /// cell) and set this; when false, the renderer skips the
+    /// coarse pass and clears the mask to 1.0 so the fine pass's
+    /// 5-tap check always passes — equivalent to running without
+    /// P1 at all but keeping the shader path constant.
+    pub fn set_beam_enabled(&mut self, enabled: bool) {
+        self.beam_enabled = enabled;
+    }
+
     /// Update the BFS index the shader uses as the frame root. The
     /// root of the full packed tree is always BFS index 0; this lets
     /// the shader start rendering from a deeper node (the current
@@ -229,11 +350,63 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.offscreen_texture = None;
+        // Beam-prepass mask sizes to 1/BEAM_TILE_SIZE of the new
+        // swapchain. Recreate both texture and bind group.
+        let (mask_texture, mask_view) =
+            self::init::create_mask_texture(&self.device, width, height);
+        self.mask_texture = mask_texture;
+        self.mask_view = mask_view;
+        self.bind_group = self::buffers::make_bind_group(
+            &self.device, &self.bind_group_layout,
+            &self.tree_buffer, &self.camera_buffer, &self.palette_buffer,
+            &self.uniforms_buffer, &self.node_kinds_buffer, &self.ribbon_buffer,
+            &self.shader_stats_buffer, &self.node_offsets_buffer,
+            &self.aabbs_buffer,
+            &self.mask_view,
+            &self.entity_buffer,
+        );
+        // coarse_bind_group uses the dummy mask view which doesn't
+        // resize, so it stays valid across resizes.
         if let Some(taa) = self.taa.as_mut() {
             taa.resize(&self.device, width, height);
         }
+        if self.entity_render_mode == EntityRenderMode::Raster {
+            let (tex, view) = create_depth_texture(&self.device, width, height);
+            self.depth_texture = Some(tex);
+            self.depth_view = Some(view);
+        }
         self.write_uniforms();
     }
+
+    pub fn entity_render_mode(&self) -> EntityRenderMode { self.entity_render_mode }
+
+    pub fn entity_raster_mut(&mut self) -> Option<&mut EntityRasterState> {
+        self.entity_raster.as_mut()
+    }
+
+    /// Force a heightmap rebuild on the next frame.
+    pub fn mark_heightmap_dirty(&mut self) {
+        self.heightmap_dirty = true;
+    }
+
+    /// Ensure a heightmap texture of `3^delta` side exists.
+    /// Reallocates if `delta` changed; no-op otherwise.
+    pub fn ensure_heightmap(&mut self, delta: u32) {
+        let cap_delta = delta.min(6);
+        let need_alloc = match self.heightmap_texture.as_ref() {
+            Some(h) => h.delta != cap_delta,
+            None => true,
+        };
+        if need_alloc {
+            self.heightmap_texture = Some(
+                heightmap::HeightmapTexture::new(&self.device, &self.queue, cap_delta),
+            );
+            self.heightmap_dirty = true;
+        }
+    }
+
+    pub fn device(&self) -> &wgpu::Device { &self.device }
+    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
 
     /// Mark the TAAU history as invalid for the next few frames.
     /// Callers must invoke this whenever the render-frame root
@@ -265,6 +438,11 @@ impl Renderer {
             None => (self.config.width, self.config.height),
         }
     }
+
+    /// Public wrapper for `march_dims` — used by the app layer to
+    /// build the view+projection matrix with the right aspect ratio
+    /// (the ray-march pass is half-res under TAAU).
+    pub fn march_dims_public(&self) -> (u32, u32) { self.march_dims() }
 
     pub(super) fn current_frame_signature(&self) -> FrameSignature {
         FrameSignature {

@@ -267,6 +267,11 @@ pub fn insert_spherical_body(
                 let uniform = uniform_children(Child::Block(b));
                 lib.insert_with_kind(uniform, NodeKind::CubedSphereFace { face })
             }
+            // EntityRef can't appear in terrain — sphere worldgen
+            // builds pure terrain. Panic makes a bug here loud.
+            Child::EntityRef(_) => {
+                unreachable!("sphere worldgen should never produce EntityRef")
+            }
         };
         face_root_children[face as usize] = Child::Node(face_root_id);
     }
@@ -460,6 +465,7 @@ mod tests {
             }
             Child::Block(b) => assert_eq!(b, block::STONE),
             Child::Empty => panic!("interior slot is empty"),
+            Child::EntityRef(_) => panic!("interior slot is an entity ref"),
         }
         // The 20 other slots are Empty.
         for slot in 0..27 {

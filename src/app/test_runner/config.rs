@@ -58,16 +58,10 @@ pub struct TestConfig {
     /// diagnostic runs. See `docs/testing/perf-isolation.md`.
     pub shader_stats: bool,
     /// Nyquist floor: pixels below this threshold get LOD-terminal.
-    /// Default 1.0 = standard sub-pixel rejection. This is a
-    /// FLOOR, not the primary LOD gate — the primary gate is
-    /// `lod_base_depth` (ribbon-level cube shells).
+    /// Default 1.0 = standard sub-pixel rejection. This is the
+    /// sole visual LOD gate — the hard ceiling is MAX_STACK_DEPTH
+    /// in the shader, which is driven by register pressure.
     pub lod_pixels: Option<f32>,
-    /// Detail budget inside the anchor cell. Each additional
-    /// ribbon-pop shell gets one less level of detail. Default 4.
-    /// Lower = faster + coarser; higher = slower + crisper distant
-    /// content. Baked into the pipeline as the WGSL `override`
-    /// `BASE_DETAIL_DEPTH`. See `docs/testing/perf-lod-diagnosis.md`.
-    pub lod_base_depth: Option<u32>,
     /// Block-interaction radius, in anchor-cell units. The cursor
     /// raycast (highlight) and break/place only return hits at
     /// distances ≤ `interaction_radius × anchor_cell_size`. Default
@@ -94,6 +88,28 @@ pub struct TestConfig {
     /// See `docs/testing/proposed-perf-speedups.md` and the TAAU
     /// discussion in this session's chat log.
     pub taa: bool,
+    /// How entities are rendered.
+    /// `--entity-render ray-march` (default): entities live in the
+    /// world tree as `Child::EntityRef` cells; the ray-march
+    /// dispatches into their voxel subtrees. Decent to ~1k.
+    /// `--entity-render raster`: instanced mesh raster pass (landed
+    /// in a later commit on this branch). Incompatible with TAA.
+    pub entity_render_mode: crate::renderer::EntityRenderMode,
+    /// Compile-time disable for the shader's tag==3 (entity)
+    /// dispatch. Default false = entities enabled everywhere. Flip
+    /// to true via `--no-entities` to DCE the entity branch from
+    /// the ray-march shader for pure-fractal perf runs that
+    /// wouldn't use entities anyway (~2 ms/frame recovery on
+    /// Jerusalem nucleus 2560x1440).
+    pub disable_entities: bool,
+    /// Load a `.vox` or `.vxs` file as a visual entity and spawn it
+    /// one cell in front of the camera at startup. Used by the
+    /// entity-visibility test suite to place a known-shape entity
+    /// deterministically without scripted interaction.
+    pub spawn_entity: Option<std::path::PathBuf>,
+    /// Number of copies of `spawn_entity` to place. Defaults to 1;
+    /// higher values arrange them in a grid in front of the camera.
+    pub spawn_entity_count: u32,
     pub script: Vec<ScriptCmd>,
 }
 
@@ -149,6 +165,7 @@ impl TestConfig {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--help" | "-h" => { print_help_and_exit(); }
                 "--render-harness" => { cfg.render_harness = true; }
                 "--show-window" => { cfg.show_window = true; }
                 "--disable-overlay" => { cfg.disable_overlay = true; }
@@ -169,6 +186,29 @@ impl TestConfig {
                 "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
                 "--sphere-world" => { cfg.world_preset = WorldPreset::DemoSphere; }
                 "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
+                "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
+                "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }
+                "--jerusalem-cross-world" => { cfg.world_preset = WorldPreset::JerusalemCross; }
+                "--sierpinski-pyramid-world" => { cfg.world_preset = WorldPreset::SierpinskiPyramid; }
+                "--mausoleum-world" => { cfg.world_preset = WorldPreset::Mausoleum; }
+                "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
+                "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
+                "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
+                "--sponza-world" => {
+                    cfg.world_preset = WorldPreset::Scene {
+                        id: crate::world::scenes::SceneId::Sponza,
+                    };
+                }
+                "--san-miguel-world" => {
+                    cfg.world_preset = WorldPreset::Scene {
+                        id: crate::world::scenes::SceneId::SanMiguel,
+                    };
+                }
+                "--bistro-world" => {
+                    cfg.world_preset = WorldPreset::Scene {
+                        id: crate::world::scenes::SceneId::Bistro,
+                    };
+                }
                 "--vox-model" => {
                     if let Some(path_str) = args.next() {
                         // Interior depth may be set before or after this
@@ -265,9 +305,6 @@ impl TestConfig {
                 "--lod-pixels" => {
                     cfg.lod_pixels = args.next().and_then(|v| v.parse().ok());
                 }
-                "--lod-base-depth" => {
-                    cfg.lod_base_depth = args.next().and_then(|v| v.parse().ok());
-                }
                 "--interaction-radius" => {
                     cfg.interaction_radius = args.next().and_then(|v| v.parse().ok());
                 }
@@ -275,6 +312,36 @@ impl TestConfig {
                     cfg.live_sample_every_frames = args.next().and_then(|v| v.parse().ok());
                 }
                 "--taa" => { cfg.taa = true; }
+                "--spawn-entity" => {
+                    if let Some(p) = args.next() {
+                        cfg.spawn_entity = Some(std::path::PathBuf::from(p));
+                        if cfg.spawn_entity_count == 0 {
+                            cfg.spawn_entity_count = 1;
+                        }
+                    }
+                }
+                "--spawn-entity-count" => {
+                    cfg.spawn_entity_count = args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                }
+                "--entity-render" => {
+                    if let Some(v) = args.next() {
+                        cfg.entity_render_mode = match v.as_str() {
+                            "ray-march" | "raymarch" => {
+                                crate::renderer::EntityRenderMode::RayMarch
+                            }
+                            "raster" => crate::renderer::EntityRenderMode::Raster,
+                            other => {
+                                eprintln!(
+                                    "--entity-render: unknown value {other:?} (expected ray-march|raster)",
+                                );
+                                crate::renderer::EntityRenderMode::RayMarch
+                            }
+                        };
+                    }
+                }
+                "--no-entities" => { cfg.disable_entities = true; }
                 _ => {}
             }
         }
@@ -382,4 +449,93 @@ fn parse_script(s: &str) -> Vec<ScriptCmd> {
             None
         })
         .collect()
+}
+
+fn print_help_and_exit() -> ! {
+    println!(r#"deepspace-game — ray-marched voxel engine
+
+USAGE:
+  scripts/dev.sh -- [FLAGS]
+  ./target/debug/deepspace-game [FLAGS]
+
+WORLD PRESETS (pick one; defaults to --plain-world):
+  --plain-world               40-level test world with grass/dirt/stone
+  --sphere-world              Demo cubed-sphere planet
+  --vox-model PATH            Load .vox / .vxs model (e.g. assets/vox/soldier_729.vxs)
+
+FRACTAL PRESETS (default plain-layers = 8):
+  --menger-world              Menger sponge, bronze corners + PySpace blue edges
+  --mausoleum-world           Menger geometry, authentic PySpace orbit-ochre
+  --sierpinski-tet-world      4 tetrahedral corners per level, cream + apex gold
+  --sierpinski-pyramid-world  4 base + 1 apex per level, limestone + gilt
+  --cantor-dust-world         8 cube corners per level, 8-hue prismatic
+  --jerusalem-cross-world     7 axial cells (body + 6 faces), ochre two-tone
+  --edge-scaffold-world       12 edge rods per level, cyan/magenta/yellow
+  --hollow-cube-world         18 edges + faces (no corners/body), brass + steel
+
+VISIBILITY TEST PRESETS:
+  --stars-world               Planet cube + distant stars at varying ribbon
+                              depths; validates precision across deep pops
+
+MESH SCENE PRESETS (voxelized offline via tools/scene_voxelize/; see
+scripts/fetch-glb-presets.sh to download source GLBs):
+  --sponza-world              Crytek Sponza atrium (Khronos glTF Sample Assets)
+  --san-miguel-world          Morgan McGuire's San Miguel courtyard (~10.5M tris)
+  --bistro-world              Amazon Lumberyard Bistro (NVIDIA ORCA, Paris street)
+
+WORLD TUNING:
+  --plain-layers N            Tree depth (default 40 for plain, 8 for fractals)
+  --vox-interior-depth N      Subdivide each imported voxel N levels
+
+SPAWN:
+  --spawn-xyz X Y Z           Override spawn position (root-cell-local, 0..3)
+  --spawn-depth N             Camera anchor depth
+  --spawn-yaw RAD             Yaw (radians)
+  --spawn-pitch RAD           Pitch (radians)
+
+RENDERING:
+  --lod-pixels N              Nyquist floor in screen pixels (default 1.0)
+  --taa                       Enable temporal anti-aliasing (TAAU)
+  --disable-overlay           Hide the wry WebView overlay UI
+  --disable-highlight         Hide the cursor highlight reticle
+
+HEADLESS HARNESS:
+  --render-harness            Run without opening an interactive window
+  --show-window               Open the harness window (for visual verify)
+  --harness-width N           Framebuffer width  (default 1280)
+  --harness-height N          Framebuffer height (default 720)
+  --screenshot PATH           Save a PNG on exit
+  --exit-after-frames N       Quit after N rendered frames
+  --timeout-secs N            Hard-kill wall-clock cap (default 5)
+  --script "cmd1,cmd2,..."    Scripted actions (see scripts/ for examples)
+  --suppress-startup-logs     Silence the startup_perf / spawn log spam
+
+PERF / DEBUG:
+  --shader-stats              Emit per-ray DDA step atomics (adds ~1 ms)
+  --perf-trace PATH           Per-frame CSV timings
+  --perf-trace-warmup N       Skip first N frames in the trace
+  --live-sample-every N       Render-loop phase timings every N frames
+  --force-visual-depth N      Override computed visual_depth
+  --force-edit-depth N        Override computed edit_depth
+  --interaction-radius N      Cursor/break reach in anchor-cells (default 6)
+  --min-fps N                 Assertion floor
+  --fps-warmup-frames N       Exclude from the FPS assertion
+  --min-cadence-fps N         Frame-cadence assertion floor
+  --cadence-warmup-frames N   Exclude from the cadence assertion
+  --run-for-secs N            Minimum wall-clock before exit
+  --max-frame-gap-ms N        Assertion ceiling on per-frame gaps
+  --frame-gap-warmup-frames N
+  --require-webview           Fail if the wry overlay never comes up
+
+HELP:
+  --help, -h                  Show this message
+
+EXAMPLES:
+  scripts/dev.sh -- --menger-world
+  scripts/dev.sh -- --mausoleum-world --plain-layers 10
+  scripts/dev.sh -- --vox-model assets/vox/soldier_729.vxs --plain-layers 8
+  scripts/dev.sh -- --sphere-world --spawn-depth 12
+  scripts/test-fractals.sh                          # screenshot every fractal
+"#);
+    std::process::exit(0);
 }
