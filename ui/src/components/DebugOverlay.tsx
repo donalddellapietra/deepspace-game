@@ -54,9 +54,9 @@ function formatDebug(s: DebugOverlayState): string {
     "",
     "── frame ──",
     pad("active kind", s.activeFrameKind),
-    "{{PATH:render   [" + s.renderPathCsv + "]}}",
-    "{{PATH:intended [" + (s.intendedRenderPathCsv || "") + "]}}",
-    "{{PATH:anchor   [" + s.anchorSlotsCsv + "]}}",
+    "render   [" + s.renderPathCsv + "]",
+    "intended [" + (s.intendedRenderPathCsv || "") + "]",
+    "anchor   [" + s.anchorSlotsCsv + "]",
     "",
     "── rotation ──",
     pad("TB on anchor path", s.tbOnAnchorPath ? "yes" : "no"),
@@ -122,9 +122,9 @@ export function DebugOverlay() {
 
   const raw = "DEBUG  ]=toggle  [=copy\n" + formatDebug(s);
   const parts = raw.split("\n").map((line, i) => {
-    const pathMatch = line.match(/^\{\{PATH:(.+)\}\}$/);
-    if (pathMatch) {
-      return <span key={i} className="path-line">{pathMatch[1]}{"\n"}</span>;
+    const isPath = line.startsWith("render") || line.startsWith("intended") || line.startsWith("anchor");
+    if (isPath) {
+      return <span key={i} className="path-line">{line}{"\n"}</span>;
     }
     return <span key={i}>{line}{"\n"}</span>;
   });
