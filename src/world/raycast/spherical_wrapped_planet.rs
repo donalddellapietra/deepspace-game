@@ -216,7 +216,11 @@ pub fn cpu_raycast_spherical_wrapped_planet(
         ];
 
         // Transform ray into cell-storage frame: subtract cell origin,
-        // scale, apply TbBoundary::enter_*. tb_scale = 1 (already).
+        // scale, then apply R^T about pivot 1.5 with NO inscribed-cube
+        // shrink (mirror of shader: displaced cells store tb_scale=1).
+        // `TbBoundary::from_kind` would apply the shrink, which the
+        // shader DOESN'T do for displaced cells — so we apply the
+        // rotation manually here.
         let scale = 3.0 / aabb_size_render;
         let lp_origin = [
             (cam_local[0] - cell_actual_lower[0]) * scale,
@@ -224,9 +228,18 @@ pub fn cpu_raycast_spherical_wrapped_planet(
             (cam_local[2] - cell_actual_lower[2]) * scale,
         ];
         let lp_dir = [dir[0] * scale, dir[1] * scale, dir[2] * scale];
-        let boundary = super::TbBoundary::new(rotation);
-        let local_origin = boundary.enter_point(lp_origin, 1.5);
-        let local_dir = boundary.enter_dir(lp_dir);
+        // R^T · (lp − 1.5) + 1.5  (column-major: r[col][row]).
+        let centred = [lp_origin[0] - 1.5, lp_origin[1] - 1.5, lp_origin[2] - 1.5];
+        let local_origin = [
+            rotation[0][0] * centred[0] + rotation[0][1] * centred[1] + rotation[0][2] * centred[2] + 1.5,
+            rotation[1][0] * centred[0] + rotation[1][1] * centred[1] + rotation[1][2] * centred[2] + 1.5,
+            rotation[2][0] * centred[0] + rotation[2][1] * centred[1] + rotation[2][2] * centred[2] + 1.5,
+        ];
+        let local_dir = [
+            rotation[0][0] * lp_dir[0] + rotation[0][1] * lp_dir[1] + rotation[0][2] * lp_dir[2],
+            rotation[1][0] * lp_dir[0] + rotation[1][1] * lp_dir[1] + rotation[1][2] * lp_dir[2],
+            rotation[2][0] * lp_dir[0] + rotation[2][1] * lp_dir[1] + rotation[2][2] * lp_dir[2],
+        ];
 
         // Recurse into the cell's content via cpu_raycast.
         let sub_max_depth = max_depth;
