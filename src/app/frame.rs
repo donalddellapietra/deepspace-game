@@ -10,6 +10,7 @@
 //! unit testing.
 
 use crate::world::anchor::Path;
+use crate::world::sphere::SphereRange;
 use crate::world::tree::{Child, NodeId, NodeKind, NodeLibrary};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,6 +21,12 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
+    /// The render frame is a node below a `WrappedPlane`, interpreted
+    /// as a bounded `(lon, r, lat)` UV sphere subframe.
+    SphereSubFrame {
+        wp_path: Path,
+        range: SphereRange,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

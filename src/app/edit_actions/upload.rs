@@ -60,7 +60,15 @@ impl App {
     }
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
-        let intended_frame = self.target_render_frame();
+        let mut intended_frame = self.target_render_frame();
+        if self.startup_planet_uv_sphere {
+            if let Some(sphere_frame) = self
+                .sphere_subframe_for_path(&intended_frame.logical_path)
+                .or_else(|| self.sphere_subframe_for_path(&intended_frame.render_path))
+            {
+                intended_frame = sphere_frame;
+            }
+        }
         let effective_visual_depth = self.visual_depth();
         let upload_key = LodUploadKey::new(self.world.root);
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
@@ -233,11 +241,46 @@ impl App {
             let (path_walked, path_patches, path_exit) = cache.force_path_tags(
                 &self.world.library, self.world.root, intended_render_path.as_slice(),
             );
+            let mut edit_diag = String::from("edit=none");
+            if let Some(edit_path) = self.last_edit_slots {
+                let edit_needs_reemit = cache.path_has_missing_slots(
+                    &self.world.library, self.world.root, edit_path.as_slice(),
+                );
+                if edit_needs_reemit {
+                    let mut nid = self.world.root;
+                    cache.bfs_by_nid.remove(&nid);
+                    for &slot in edit_path.as_slice() {
+                        let node = match self.world.library.get(nid) {
+                            Some(n) => n,
+                            None => break,
+                        };
+                        match node.children[slot as usize] {
+                            crate::world::tree::Child::Node(child) => {
+                                cache.bfs_by_nid.remove(&child);
+                                nid = child;
+                            }
+                            _ => break,
+                        }
+                    }
+                    cache.update_root(&self.world.library, self.world.root);
+                }
+                let (edit_walked, edit_patches, edit_exit) = cache.force_path_tags(
+                    &self.world.library, self.world.root, edit_path.as_slice(),
+                );
+                edit_diag = format!(
+                    "edit_rm={} edit_walked={}/{} edit_patches={} edit_exit={}",
+                    if edit_needs_reemit { 1 } else { 0 },
+                    edit_walked,
+                    edit_path.depth(),
+                    edit_patches,
+                    edit_exit,
+                );
+            }
             self.last_path_diag = format!(
-                "rm={} walked={}/{} patches={} exit={}",
+                "rm={} walked={}/{} patches={} exit={} {}",
                 if needs_reemit { 1 } else { 0 },
                 path_walked, intended_render_path.depth(),
-                path_patches, path_exit,
+                path_patches, path_exit, edit_diag,
             );
             if let Some(renderer) = &mut self.renderer {
                 renderer.update_tree(
@@ -278,7 +321,7 @@ impl App {
             }
         }
         let cache = self.cached_tree.as_mut().expect("cached_tree");
-        let scene_frame_bfs = cache.ensure_root(
+        let mut scene_frame_bfs = cache.ensure_root(
             &self.world.library, scene_frame_id,
         );
         if let Some(renderer) = &mut self.renderer {
@@ -297,15 +340,49 @@ impl App {
             &effective_path,
             effective_path.depth(),
         );
-        self.active_frame = ActiveFrame {
-            render_path: effective_render.render_path,
-            logical_path: intended_frame.logical_path,
-            node_id: effective_render.node_id,
-            kind: effective_render.kind,
+        self.active_frame = if self.startup_planet_uv_sphere {
+            self.sphere_subframe_for_path(&effective_path)
+                .or_else(|| self.sphere_subframe_for_path(&effective_render.render_path))
+                .unwrap_or(ActiveFrame {
+                    render_path: effective_render.render_path,
+                    logical_path: intended_frame.logical_path,
+                    node_id: effective_render.node_id,
+                    kind: effective_render.kind,
+                })
+        } else {
+            ActiveFrame {
+                render_path: effective_render.render_path,
+                logical_path: intended_frame.logical_path,
+                node_id: effective_render.node_id,
+                kind: effective_render.kind,
+            }
         };
         if let Some(renderer) = &mut self.renderer {
+            if let ActiveFrameKind::SphereSubFrame { wp_path, .. } = self.active_frame.kind {
+                let mut sphere_scene_id = scene_root;
+                for &slot in wp_path.as_slice() {
+                    let Some(node) = self.world.library.get(sphere_scene_id) else { break };
+                    match node.children[slot as usize] {
+                        crate::world::tree::Child::Node(id) => sphere_scene_id = id,
+                        _ => break,
+                    }
+                }
+                let cache = self.cached_tree.as_mut().expect("cached_tree");
+                scene_frame_bfs = cache.ensure_root(&self.world.library, sphere_scene_id);
+                renderer.update_tree(
+                    &cache.tree,
+                    &cache.node_kinds,
+                    &cache.node_offsets,
+                    &cache.aabbs,
+                    cache.root_bfs_idx,
+                );
+            }
             renderer.set_frame_root(scene_frame_bfs);
-            renderer.update_ribbon(&r.ribbon);
+            if matches!(self.active_frame.kind, ActiveFrameKind::SphereSubFrame { .. }) {
+                renderer.update_ribbon(&[]);
+            } else {
+                renderer.update_ribbon(&r.ribbon);
+            }
         }
 
         let mut cam_gpu = self.gpu_camera_for_frame(&self.active_frame);
@@ -347,6 +424,9 @@ impl App {
                 ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
+                }
+                ActiveFrameKind::SphereSubFrame { range, .. } => {
+                    renderer.set_root_kind_sphere_subframe(range);
                 }
             }
         }

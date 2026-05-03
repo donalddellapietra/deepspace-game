@@ -293,6 +293,7 @@ impl App {
         // lat_max ≈ 72° = 1.26 rad — pole-band ban for the WrappedPlane
         // rotated-tangent-cube render. No-op for non-WrappedPlane frames.
         renderer.set_planet_lat_max(1.26);
+        renderer.set_planet_uv_sphere_enabled(self.startup_planet_uv_sphere);
         if self.render_harness {
             renderer.resize(self.harness_width, self.harness_height);
             eprintln!(
@@ -386,6 +387,17 @@ impl App {
                         &self.active_frame.render_path,
                     )
                 }
+                crate::app::ActiveFrameKind::SphereSubFrame { wp_path, range } => {
+                    let (fwd, right, up) = self.camera.basis();
+                    crate::world::sphere::camera_in_sphere_subframe(
+                        &self.camera.position,
+                        fwd,
+                        right,
+                        up,
+                        &wp_path,
+                        range,
+                    ).origin
+                }
             };
             // Camera position in root-frame world coords (rotation-
             // aware so the value is correct even when the anchor
@@ -411,6 +423,9 @@ impl App {
                 crate::app::ActiveFrameKind::Cartesian => "Cartesian".to_string(),
                 crate::app::ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     format!("WrappedPlane(dims={dims:?}, slab_d={slab_depth})")
+                }
+                crate::app::ActiveFrameKind::SphereSubFrame { range, .. } => {
+                    format!("SphereSubFrame(dims={:?}, slab_d={})", range.dims, range.slab_depth)
                 }
             };
             let render_path_csv = self
@@ -820,4 +835,3 @@ fn tangent_block_chain_summary(
     let yaw_rad = rot[0][2].atan2(rot[0][0]);
     (tb_seen, yaw_rad.to_degrees())
 }
-

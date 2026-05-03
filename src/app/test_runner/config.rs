@@ -22,6 +22,9 @@ pub struct TestConfig {
     /// validating the curvature math on `--plain-world` before
     /// wiring k(altitude) on the wrapped planet.
     pub curvature_a: Option<f32>,
+    /// Render `WrappedPlane` frames with the UV sphere body marcher
+    /// instead of the default tangent-cube sphere approximation.
+    pub planet_uv_sphere: bool,
     /// Explicit camera world-XYZ at spawn. Positions the camera
     /// at a specific point regardless of zoom level — since the
     /// in-game zoom function is broken, this is the way to put
@@ -168,6 +171,7 @@ pub enum ScriptCmd {
 impl TestConfig {
     pub fn from_args() -> Self {
         let mut cfg = TestConfig::default();
+        let mut world_preset_explicit = false;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -189,23 +193,24 @@ impl TestConfig {
                 "--harness-height" => {
                     cfg.harness_height = args.next().and_then(|v| v.parse().ok());
                 }
-                "--plain-world" => { cfg.world_preset = WorldPreset::PlainTest; }
+                "--plain-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::PlainTest;
+                }
                 // Step-1 unit primitive: a single rotated TangentBlock
                 // at tree depth 3 in an otherwise empty world. View
                 // from above, expect a diamond silhouette.
                 "--rotated-cube-test" => {
+                    world_preset_explicit = true;
                     cfg.world_preset = WorldPreset::RotatedCubeTest;
                 }
                 "--dodecahedron-test" => {
+                    world_preset_explicit = true;
                     cfg.world_preset = WorldPreset::DodecahedronTest;
                 }
                 "--wrapped-planet" => {
-                    cfg.world_preset = WorldPreset::WrappedPlanet {
-                        embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
-                        slab_dims: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
-                        slab_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
-                        cell_subtree_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
-                    };
+                    world_preset_explicit = true;
+                    cfg.world_preset = default_wrapped_planet_preset();
                 }
                 // Override the wrapped-planet's total tree depth.
                 // `--planet-layers N` sets total = N. We adjust
@@ -235,32 +240,63 @@ impl TestConfig {
                         }
                     }
                 }
-                "--menger-world" => { cfg.world_preset = WorldPreset::Menger; }
-                "--sierpinski-tet-world" => { cfg.world_preset = WorldPreset::SierpinskiTet; }
-                "--cantor-dust-world" => { cfg.world_preset = WorldPreset::CantorDust; }
-                "--jerusalem-cross-world" => { cfg.world_preset = WorldPreset::JerusalemCross; }
-                "--sierpinski-pyramid-world" => { cfg.world_preset = WorldPreset::SierpinskiPyramid; }
-                "--mausoleum-world" => { cfg.world_preset = WorldPreset::Mausoleum; }
-                "--edge-scaffold-world" => { cfg.world_preset = WorldPreset::EdgeScaffold; }
-                "--hollow-cube-world" => { cfg.world_preset = WorldPreset::HollowCube; }
-                "--stars-world" => { cfg.world_preset = WorldPreset::Stars; }
+                "--menger-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::Menger;
+                }
+                "--sierpinski-tet-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::SierpinskiTet;
+                }
+                "--cantor-dust-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::CantorDust;
+                }
+                "--jerusalem-cross-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::JerusalemCross;
+                }
+                "--sierpinski-pyramid-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::SierpinskiPyramid;
+                }
+                "--mausoleum-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::Mausoleum;
+                }
+                "--edge-scaffold-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::EdgeScaffold;
+                }
+                "--hollow-cube-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::HollowCube;
+                }
+                "--stars-world" => {
+                    world_preset_explicit = true;
+                    cfg.world_preset = WorldPreset::Stars;
+                }
                 "--sponza-world" => {
+                    world_preset_explicit = true;
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Sponza,
                     };
                 }
                 "--san-miguel-world" => {
+                    world_preset_explicit = true;
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::SanMiguel,
                     };
                 }
                 "--bistro-world" => {
+                    world_preset_explicit = true;
                     cfg.world_preset = WorldPreset::Scene {
                         id: crate::world::scenes::SceneId::Bistro,
                     };
                 }
                 "--vox-model" => {
                     if let Some(path_str) = args.next() {
+                        world_preset_explicit = true;
                         // Interior depth may be set before or after this
                         // flag; capture the existing value if any.
                         let interior_depth = match &cfg.world_preset {
@@ -307,6 +343,12 @@ impl TestConfig {
                 // see ground curve down past the horizon.
                 "--curvature" => {
                     cfg.curvature_a = args.next().and_then(|v| v.parse().ok());
+                }
+                "--planet-uv-sphere" => {
+                    cfg.planet_uv_sphere = true;
+                    if !world_preset_explicit {
+                        cfg.world_preset = default_wrapped_planet_preset();
+                    }
                 }
                 "--spawn-xyz" => {
                     let x: Option<f32> = args.next().and_then(|v| v.parse().ok());
@@ -449,6 +491,15 @@ impl TestConfig {
     }
 }
 
+fn default_wrapped_planet_preset() -> WorldPreset {
+    WorldPreset::WrappedPlanet {
+        embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
+        slab_dims: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
+        slab_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
+        cell_subtree_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
+    }
+}
+
 fn parse_script(s: &str) -> Vec<ScriptCmd> {
     s.split(',')
         .filter_map(|raw| {
@@ -512,7 +563,7 @@ fn print_help_and_exit() -> ! {
     println!(r#"deepspace-game — ray-marched voxel engine
 
 USAGE:
-  scripts/dev.sh -- [FLAGS]
+  scripts/dev.sh [FLAGS]
   ./target/debug/deepspace-game [FLAGS]
 
 WORLD PRESETS (pick one; defaults to --plain-world):
@@ -541,6 +592,9 @@ VISIBILITY TEST PRESETS:
                               grass/dirt/stone slab with X-axis wrap
                               (longitude). Default total tree depth: 25
                               (embedding 22 + slab 3). No curvature yet.
+  --planet-uv-sphere          Render the wrapped planet as a UV sphere.
+                              If no world preset has been selected,
+                              this implies --wrapped-planet.
   --planet-layers N           (After --wrapped-planet) Override total
                               tree depth. e.g. `--planet-layers 40`
                               puts slab leaves at world-tree depth 40

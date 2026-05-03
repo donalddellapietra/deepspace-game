@@ -210,6 +210,7 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
         renderer.set_curvature_a(a);
     }
     renderer.set_planet_lat_max(1.26);
+    renderer.set_planet_uv_sphere_enabled(cfg.planet_uv_sphere);
     renderer.resize(app.harness_width, app.harness_height);
     eprintln!(
         "render_harness: resize width={} height={}",
@@ -367,4 +368,3 @@ pub fn run_render_harness(cfg: TestConfig) -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
-

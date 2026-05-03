@@ -1180,6 +1180,427 @@ fn sample_slab_cell(
     return out;
 }
 
+fn descend_uv_parameter_subtree(
+    root_idx: u32,
+    lon: f32,
+    r: f32,
+    lat: f32,
+    lon_lo_in: f32,
+    lon_hi_in: f32,
+    r_lo_in: f32,
+    r_hi_in: f32,
+    lat_lo_in: f32,
+    lat_hi_in: f32,
+) -> SlabSample {
+    var out: SlabSample;
+    out.block_type = 0xFFFEu;
+    out.tag = 0u;
+    out.child_idx = root_idx;
+
+    var node_idx = root_idx;
+    var lon_lo = lon_lo_in;
+    var lon_hi = lon_hi_in;
+    var r_lo = r_lo_in;
+    var r_hi = r_hi_in;
+    var lat_lo = lat_lo_in;
+    var lat_hi = lat_hi_in;
+    let depth_limit = min(uniforms.max_depth, MAX_STACK_DEPTH);
+
+    for (var depth: u32 = 0u; depth < MAX_STACK_DEPTH; depth = depth + 1u) {
+        let header_off = node_offsets[node_idx];
+        let occ = tree[header_off];
+        if occ == 0u { return out; }
+
+        let lon_step = (lon_hi - lon_lo) / 3.0;
+        let r_step = (r_hi - r_lo) / 3.0;
+        let lat_step = (lat_hi - lat_lo) / 3.0;
+        let sx = clamp(i32(floor((lon - lon_lo) / max(lon_step, 1e-9))), 0, 2);
+        let sy = clamp(i32(floor((r - r_lo) / max(r_step, 1e-9))), 0, 2);
+        let sz = clamp(i32(floor((lat - lat_lo) / max(lat_step, 1e-9))), 0, 2);
+        let slot = u32(sx + sy * 3 + sz * 9);
+        let bit = 1u << slot;
+        if (occ & bit) == 0u { return out; }
+
+        let first_child = tree[header_off + 1u];
+        let rank = countOneBits(occ & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
+        let block_type = (packed >> 8u) & 0xFFFFu;
+        if block_type == 0xFFFEu { return out; }
+
+        out.block_type = block_type;
+        out.tag = tag;
+        if tag == 1u || depth + 1u >= depth_limit || depth + 1u >= MAX_STACK_DEPTH {
+            return out;
+        }
+        if tag != 2u {
+            out.tag = 0u;
+            out.block_type = 0xFFFEu;
+            return out;
+        }
+
+        node_idx = tree[child_base + 1u];
+        out.child_idx = node_idx;
+        lon_lo = lon_lo + f32(sx) * lon_step;
+        lon_hi = lon_lo + lon_step;
+        r_lo = r_lo + f32(sy) * r_step;
+        r_hi = r_lo + r_step;
+        lat_lo = lat_lo + f32(sz) * lat_step;
+        lat_hi = lat_lo + lat_step;
+    }
+
+    return out;
+}
+
+// Body-frame UV sphere renderer for WrappedPlane storage. This keeps
+// the tree's flat storage layout as `(lon, r, lat)` ground truth and
+// selects cells by spherical shell/angle boundaries instead of by
+// Cartesian tangent-cube entry.
+fn march_wrapped_planet_uv_body(
+    body_idx: u32,
+    body_origin: vec3<f32>,
+    body_size: f32,
+    ray_origin: vec3<f32>,
+    ray_dir_in: vec3<f32>,
+    lat_max: f32,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    let ray_dir = normalize(ray_dir_in);
+    let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
+
+    let cs_center = body_origin + vec3<f32>(body_size * 0.5);
+    let r_sphere = body_size / (2.0 * 3.14159265);
+    let oc = ray_origin - cs_center;
+    let b = dot(oc, ray_dir);
+    let oc_len2 = dot(oc, oc);
+    let c = oc_len2 - r_sphere * r_sphere;
+    let disc = b * b - c;
+    if disc <= 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return result; }
+
+    let dims_x = i32(uniforms.slab_dims.x);
+    let dims_y = i32(uniforms.slab_dims.y);
+    let dims_z = i32(uniforms.slab_dims.z);
+    let slab_depth = uniforms.slab_dims.w;
+    if dims_x <= 0 || dims_y <= 0 || dims_z <= 0 || slab_depth == 0u {
+        return result;
+    }
+
+    let pi = 3.14159265;
+    let shell_thickness = r_sphere * 0.25;
+    let r_inner = r_sphere - shell_thickness;
+    let r_step = shell_thickness / f32(dims_y);
+
+    var cy = dims_y - 1;
+    loop {
+        if cy < 0 { break; }
+
+        let r_hi = r_inner + (f32(cy) + 1.0) * r_step;
+        let cr = oc_len2 - r_hi * r_hi;
+        let disc_layer = b * b - cr;
+        if disc_layer < 0.0 {
+            cy = cy - 1;
+            continue;
+        }
+        let t_layer = -b - sqrt(disc_layer);
+        if t_layer < 0.0 || t_layer > t_exit {
+            cy = cy - 1;
+            continue;
+        }
+
+        let pos = ray_origin + ray_dir * t_layer;
+        let n = (pos - cs_center) / r_hi;
+        let lat = asin(clamp(n.y, -1.0, 1.0));
+        if abs(lat) > lat_max {
+            cy = cy - 1;
+            continue;
+        }
+        let lon = atan2(n.z, n.x);
+        let cell_x = clamp(i32(floor(((lon + pi) / (2.0 * pi)) * f32(dims_x))), 0, dims_x - 1);
+        let cell_z = clamp(i32(floor(((lat + lat_max) / (2.0 * lat_max)) * f32(dims_z))), 0, dims_z - 1);
+
+        let sample = sample_slab_cell(body_idx, slab_depth, cell_x, cy, cell_z);
+        if sample.tag == 0u || sample.block_type == 0xFFFEu {
+            cy = cy - 1;
+            continue;
+        }
+
+        result.hit = true;
+        result.t = t_layer * inv_norm;
+        result.color = palette[sample.block_type].rgb;
+        result.normal = normalize(n);
+        // Neutral AABB for main.wgsl's cube bevel/highlight math.
+        // The UV path's hit primitive is curved, not an axis-aligned
+        // cube cell in the current frame.
+        result.cell_min = pos - vec3<f32>(0.5);
+        result.cell_size = 1.0;
+        return result;
+    }
+
+    return result;
+}
+
+fn march_sphere_subframe_uv(
+    root_idx: u32,
+    ray_origin: vec3<f32>,
+    ray_dir_in: vec3<f32>,
+) -> HitResult {
+    var result: HitResult;
+    result.hit = false;
+    result.t = 1e20;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = vec3<f32>(0.0);
+    result.cell_size = 1.0;
+
+    let ray_dir = normalize(ray_dir_in);
+    let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
+
+    let lat_lo_root = uniforms.sphere_lat_lon.x;
+    let lat_hi_root = uniforms.sphere_lat_lon.y;
+    let lon_lo_root = uniforms.sphere_lat_lon.z;
+    let lon_hi_root = uniforms.sphere_lat_lon.w;
+    let r_lo_root = uniforms.sphere_r.x;
+    let r_hi_root = uniforms.sphere_r.y;
+    let r_center = uniforms.sphere_r.z;
+    let lat_center = (lat_lo_root + lat_hi_root) * 0.5;
+    let lon_center = (lon_lo_root + lon_hi_root) * 0.5;
+
+    let cs_center = vec3<f32>(0.0, 0.0, -r_center);
+    let r_sphere = r_hi_root;
+    let oc = ray_origin - cs_center;
+    let b = dot(oc, ray_dir);
+    let c = dot(oc, oc) - r_sphere * r_sphere;
+    let disc = b * b - c;
+    if disc <= 0.0 { return result; }
+    let sq = sqrt(disc);
+    let t_enter = max(-b - sq, 0.0);
+    let t_exit = -b + sq;
+    if t_exit <= 0.0 { return result; }
+
+    let t = t_enter + 1e-6;
+    let pos = ray_origin + ray_dir * t;
+    let v = pos - cs_center;
+    let r = max(length(v), 1e-9);
+    let cl = cos(lat_center);
+    let sl = sin(lat_center);
+    let co = cos(lon_center);
+    let so = sin(lon_center);
+    let vw_x = -so * v.x - sl * co * v.y + cl * co * v.z;
+    let vw_y =                 cl * v.y + sl      * v.z;
+    let vw_z =  co * v.x - sl * so * v.y + cl * so * v.z;
+    let lat = asin(clamp(vw_y / r, -1.0, 1.0));
+    let lon = atan2(vw_z, vw_x);
+    if lat < lat_lo_root - 1e-5 || lat > lat_hi_root + 1e-5 ||
+       lon < lon_lo_root - 1e-5 || lon > lon_hi_root + 1e-5 ||
+       r < r_lo_root - 1e-5 || r > r_hi_root + 1e-5 {
+        return result;
+    }
+
+    if node_kinds[root_idx].kind == NODE_KIND_WRAPPED_PLANE {
+        let dims_x = i32(uniforms.slab_dims.x);
+        let dims_y = i32(uniforms.slab_dims.y);
+        let dims_z = i32(uniforms.slab_dims.z);
+        let slab_depth = uniforms.slab_dims.w;
+        if dims_x <= 0 || dims_y <= 0 || dims_z <= 0 || slab_depth == 0u {
+            return result;
+        }
+        let cell_x = clamp(
+            i32(floor(((lon + 3.14159265) / (2.0 * 3.14159265)) * f32(dims_x))),
+            0,
+            dims_x - 1,
+        );
+        let cell_y = clamp(
+            i32(floor(((r - r_lo_root) / max(r_hi_root - r_lo_root, 1e-6)) * f32(dims_y))),
+            0,
+            dims_y - 1,
+        );
+        let cell_z = clamp(
+            i32(floor(((lat + 1.26) / (2.0 * 1.26)) * f32(dims_z))),
+            0,
+            dims_z - 1,
+        );
+        let sample = sample_slab_cell(root_idx, slab_depth, cell_x, cell_y, cell_z);
+        if sample.tag == 0u || sample.block_type == 0xFFFEu {
+            return result;
+        }
+
+        let lon_step = (2.0 * 3.14159265) / f32(dims_x);
+        let lat_step = (2.0 * 1.26) / f32(dims_z);
+        let r_step = (r_hi_root - r_lo_root) / f32(dims_y);
+        let cell_lat = -1.26 + (f32(cell_z) + 0.5) * lat_step;
+        let cell_lon = -3.14159265 + (f32(cell_x) + 0.5) * lon_step;
+        let cell_r = r_lo_root + (f32(cell_y) + 0.5) * r_step;
+        let cell_sl = sin(cell_lat);
+        let cell_cl = cos(cell_lat);
+        let cell_so = sin(cell_lon);
+        let cell_co = cos(cell_lon);
+        let radial_c = vec3<f32>(cl * co, sl, cl * so);
+        let east_c = vec3<f32>(-so, 0.0, co);
+        let north_c = vec3<f32>(-sl * co, cl, -sl * so);
+        let radial_g = vec3<f32>(cell_cl * cell_co, cell_sl, cell_cl * cell_so);
+        let east_g = vec3<f32>(-cell_so, 0.0, cell_co);
+        let north_g = vec3<f32>(-cell_sl * cell_co, cell_cl, -cell_sl * cell_so);
+        let cube_origin_g = cell_r * radial_g - r_center * radial_c;
+        let cube_origin = vec3<f32>(
+            dot(cube_origin_g, east_c),
+            dot(cube_origin_g, north_c),
+            dot(cube_origin_g, radial_c),
+        );
+        let cube_east = vec3<f32>(
+            dot(east_g, east_c),
+            dot(east_g, north_c),
+            dot(east_g, radial_c),
+        );
+        let cube_normal = vec3<f32>(
+            dot(radial_g, east_c),
+            dot(radial_g, north_c),
+            dot(radial_g, radial_c),
+        );
+        let cube_north = vec3<f32>(
+            dot(north_g, east_c),
+            dot(north_g, north_c),
+            dot(north_g, radial_c),
+        );
+        let east_arc = r_hi_root * abs(cell_cl) * lon_step;
+        let north_arc = r_hi_root * lat_step;
+        let cube_side = max(max(east_arc, north_arc), r_step);
+        let scale = 3.0 / max(cube_side, 1e-6);
+        let d_origin = ray_origin - cube_origin;
+        let local_origin = vec3<f32>(
+            dot(cube_east, d_origin) * scale + 1.5,
+            dot(cube_normal, d_origin) * scale + 1.5,
+            dot(cube_north, d_origin) * scale + 1.5,
+        );
+        let local_dir = vec3<f32>(
+            dot(cube_east, ray_dir) * scale,
+            dot(cube_normal, ray_dir) * scale,
+            dot(cube_north, ray_dir) * scale,
+        );
+
+        if sample.tag == 2u {
+            let sub = march_in_tangent_cube(sample.child_idx, local_origin, local_dir);
+            if !sub.hit {
+                return result;
+            }
+            let local_hit = local_origin + local_dir * sub.t;
+            let local_in_cell = clamp(
+                (local_hit - sub.cell_min) / sub.cell_size,
+                vec3<f32>(0.0), vec3<f32>(1.0),
+            );
+            let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
+            result.hit = true;
+            result.t = sub.t * inv_norm;
+            result.color = sub.color * (0.7 + 0.3 * local_bevel);
+            result.normal = cube_east * sub.normal.x
+                          + cube_normal * sub.normal.y
+                          + cube_north * sub.normal.z;
+            result.cell_min = (ray_origin + ray_dir * sub.t) - vec3<f32>(0.5);
+            result.cell_size = 1.0;
+            return result;
+        }
+        if sample.tag == 1u {
+            let inv_local = vec3<f32>(
+                select(1e10, 1.0 / local_dir.x, abs(local_dir.x) > 1e-8),
+                select(1e10, 1.0 / local_dir.y, abs(local_dir.y) > 1e-8),
+                select(1e10, 1.0 / local_dir.z, abs(local_dir.z) > 1e-8),
+            );
+            let cube_box = ray_box(local_origin, inv_local, vec3<f32>(0.0), vec3<f32>(3.0));
+            if cube_box.t_enter >= cube_box.t_exit || cube_box.t_exit <= 0.0 {
+                return result;
+            }
+            let t_local = max(cube_box.t_enter, 0.0);
+            let entry_local = local_origin + local_dir * t_local;
+            let dx_lo = abs(entry_local.x);
+            let dx_hi = abs(entry_local.x - 3.0);
+            let dy_lo = abs(entry_local.y);
+            let dy_hi = abs(entry_local.y - 3.0);
+            let dz_lo = abs(entry_local.z);
+            let dz_hi = abs(entry_local.z - 3.0);
+            var best = dx_lo;
+            var local_normal = vec3<f32>(-1.0, 0.0, 0.0);
+            if dx_hi < best { best = dx_hi; local_normal = vec3<f32>(1.0, 0.0, 0.0); }
+            if dy_lo < best { best = dy_lo; local_normal = vec3<f32>(0.0, -1.0, 0.0); }
+            if dy_hi < best { best = dy_hi; local_normal = vec3<f32>(0.0, 1.0, 0.0); }
+            if dz_lo < best { best = dz_lo; local_normal = vec3<f32>(0.0, 0.0, -1.0); }
+            if dz_hi < best { local_normal = vec3<f32>(0.0, 0.0, 1.0); }
+            let local_in_cell = clamp(entry_local / 3.0, vec3<f32>(0.0), vec3<f32>(1.0));
+            let local_bevel = cube_face_bevel(local_in_cell, local_normal);
+            result.hit = true;
+            result.t = t_local * inv_norm;
+            result.color = palette[sample.block_type].rgb * (0.7 + 0.3 * local_bevel);
+            result.normal = cube_east * local_normal.x
+                          + cube_normal * local_normal.y
+                          + cube_north * local_normal.z;
+            result.cell_min = (ray_origin + ray_dir * t_local) - vec3<f32>(0.5);
+            result.cell_size = 1.0;
+            return result;
+        }
+        return result;
+    }
+
+    var node_idx = root_idx;
+    var lat_lo = lat_lo_root;
+    var lat_hi = lat_hi_root;
+    var lon_lo = lon_lo_root;
+    var lon_hi = lon_hi_root;
+    var r_lo = r_lo_root;
+    var r_hi = r_hi_root;
+
+    for (var depth: u32 = 0u; depth < MAX_STACK_DEPTH; depth = depth + 1u) {
+        let lon_step = (lon_hi - lon_lo) / 3.0;
+        let lat_step = (lat_hi - lat_lo) / 3.0;
+        let r_step = (r_hi - r_lo) / 3.0;
+        let sx = clamp(i32(floor((lon - lon_lo) / lon_step)), 0, 2);
+        let sy = clamp(i32(floor((r - r_lo) / r_step)), 0, 2);
+        let sz = clamp(i32(floor((lat - lat_lo) / lat_step)), 0, 2);
+        let slot = u32(sx + sy * 3 + sz * 9);
+
+        let header_off = node_offsets[node_idx];
+        let occ = tree[header_off];
+        let bit = 1u << slot;
+        if (occ & bit) == 0u { return result; }
+        let first_child = tree[header_off + 1u];
+        let rank = countOneBits(occ & (bit - 1u));
+        let child_base = first_child + rank * 2u;
+        let packed = tree[child_base];
+        let tag = packed & 0xFFu;
+        let block_type = (packed >> 8u) & 0xFFFFu;
+        if block_type == 0xFFFEu { return result; }
+
+        if tag == 1u || depth + 1u >= MAX_STACK_DEPTH {
+            result.hit = true;
+            result.t = t * inv_norm;
+            result.color = palette[block_type].rgb;
+            result.normal = normalize(v);
+            result.cell_min = pos - vec3<f32>(0.5);
+            result.cell_size = 1.0;
+            return result;
+        }
+        if tag != 2u { return result; }
+
+        node_idx = tree[child_base + 1u];
+        lon_lo = lon_lo + f32(sx) * lon_step;
+        lon_hi = lon_lo + lon_step;
+        r_lo = r_lo + f32(sy) * r_step;
+        r_hi = r_lo + r_step;
+        lat_lo = lat_lo + f32(sz) * lat_step;
+        lat_hi = lat_lo + lat_step;
+    }
+
+    return result;
+}
+
 // Tangent-cube DDA. Used by `march_wrapped_planet` after the ray has
 // been transformed into a slab cell's local `[0, 3)³` frame.
 //
@@ -1646,19 +2067,29 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
-        // Frame dispatch on NodeKind. WrappedPlane (kind == 1) always
-        // renders as a sphere of rotated tangent cubes via
-        // `march_wrapped_planet` — no spherical primitive in the
-        // traversal, just per-cell rotation. All other kinds fall
-        // through to the cartesian DDA.
+        // Frame dispatch on NodeKind. WrappedPlane can render through
+        // either the existing tangent-cube sphere approximation
+        // (`planet_render.x == 0`) or the UV-body path
+        // (`planet_render.x == 1`). All other kinds fall through to
+        // Cartesian DDA.
         var r: HitResult;
         let cur_kind = node_kinds[current_idx].kind;
-        if cur_kind == 1u {
-            r = march_wrapped_planet(
-                current_idx, vec3<f32>(0.0), 3.0,
-                ray_origin, ray_dir,
-                uniforms.planet_render.y,
-            );
+        if uniforms.sphere_r.w >= 1.5 {
+            r = march_sphere_subframe_uv(current_idx, ray_origin, ray_dir);
+        } else if cur_kind == 1u {
+            if uniforms.planet_render.x >= 0.5 {
+                r = march_wrapped_planet_uv_body(
+                    current_idx, vec3<f32>(0.0), 3.0,
+                    ray_origin, ray_dir,
+                    uniforms.planet_render.y,
+                );
+            } else {
+                r = march_wrapped_planet(
+                    current_idx, vec3<f32>(0.0), 3.0,
+                    ray_origin, ray_dir,
+                    uniforms.planet_render.y,
+                );
+            }
         } else {
             // Cartesian frame: no depth cap beyond the hardware stack
             // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole

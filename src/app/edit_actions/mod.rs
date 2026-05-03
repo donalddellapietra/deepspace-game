@@ -75,18 +75,54 @@ impl App {
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 // lat_max kept in sync with the shader-side default
                 // (1.26 rad ≈ 72°).
-                let hit = raycast::cpu_raycast_wrapped_planet(
+                let hit = if self.startup_planet_uv_sphere {
+                    raycast::cpu_raycast_sphere_uv(
+                        &self.world.library,
+                        self.world.root,
+                        frame_path.as_slice(),
+                        cam_local,
+                        ray_dir,
+                        dims,
+                        slab_depth,
+                        1.26,
+                        self.edit_depth(),
+                    )
+                } else {
+                    raycast::cpu_raycast_wrapped_planet(
+                        &self.world.library,
+                        self.world.root,
+                        frame_path.as_slice(),
+                        cam_local,
+                        ray_dir,
+                        dims,
+                        slab_depth,
+                        1.26,
+                        self.edit_depth(),
+                    )
+                };
+                (hit, frame_path)
+            }
+            ActiveFrameKind::SphereSubFrame { wp_path, range } => {
+                let (fwd, right, up) = self.camera.basis();
+                let sub = crate::world::sphere::camera_in_sphere_subframe(
+                    &self.camera.position,
+                    fwd,
+                    right,
+                    up,
+                    &wp_path,
+                    range,
+                );
+                let hit = raycast::cpu_raycast_sphere_uv_subframe(
                     &self.world.library,
                     self.world.root,
-                    frame_path.as_slice(),
-                    cam_local,
-                    ray_dir,
-                    dims,
-                    slab_depth,
+                    wp_path.as_slice(),
+                    range,
+                    sub.origin,
+                    crate::world::sdf::normalize(sub.forward),
                     1.26,
                     self.edit_depth(),
                 );
-                (hit, frame_path)
+                (hit, wp_path)
             }
             ActiveFrameKind::Cartesian => {
                 let frame_path = self.active_frame.render_path;

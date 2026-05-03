@@ -62,6 +62,17 @@ impl App {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                 self.camera.position.in_frame(&frame.render_path)
             }
+            ActiveFrameKind::SphereSubFrame { wp_path, range } => {
+                let (fwd, right, up) = self.camera.basis();
+                crate::world::sphere::camera_in_sphere_subframe(
+                    &self.camera.position,
+                    fwd,
+                    right,
+                    up,
+                    &wp_path,
+                    range,
+                ).origin
+            }
         };
         cam_local.iter().all(|v| v.is_finite())
             && cam_local.iter().all(|&v| {
@@ -78,6 +89,22 @@ impl App {
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
             ),
+            ActiveFrameKind::SphereSubFrame { wp_path, range } => {
+                let (fwd, right, up) = self.camera.basis();
+                let sub = crate::world::sphere::camera_in_sphere_subframe(
+                    &self.camera.position,
+                    fwd,
+                    right,
+                    up,
+                    &wp_path,
+                    range,
+                );
+                (
+                    sub.origin,
+                    [0.0, 0.0, 0.0],
+                    range.lon_extent().max(range.lat_extent()).max(range.r_extent()),
+                )
+            }
         };
         let to_center = crate::world::sdf::sub(frame_center_local, cam_local);
         let dist = crate::world::sdf::length(to_center).max(0.05);
@@ -104,11 +131,20 @@ impl App {
                 &shallower,
                 shallower.depth(),
             );
-            frame = ActiveFrame {
-                render_path: render.render_path,
-                logical_path,
-                node_id: render.node_id,
-                kind: render.kind,
+            frame = if self.startup_planet_uv_sphere {
+                self.sphere_subframe_for_path(&render.render_path).unwrap_or(ActiveFrame {
+                    render_path: render.render_path,
+                    logical_path,
+                    node_id: render.node_id,
+                    kind: render.kind,
+                })
+            } else {
+                ActiveFrame {
+                    render_path: render.render_path,
+                    logical_path,
+                    node_id: render.node_id,
+                    kind: render.kind,
+                }
             };
         }
         if self.startup_profile_frames < 4 {
@@ -124,6 +160,17 @@ impl App {
             let cam_local = match frame.kind {
                 ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                     self.camera.position.in_frame(&frame.render_path)
+                }
+                ActiveFrameKind::SphereSubFrame { wp_path, range } => {
+                    let (fwd, right, up) = self.camera.basis();
+                    crate::world::sphere::camera_in_sphere_subframe(
+                        &self.camera.position,
+                        fwd,
+                        right,
+                        up,
+                        &wp_path,
+                        range,
+                    ).origin
                 }
             };
             eprintln!(
@@ -146,6 +193,16 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_max_depth(vd);
             renderer.update_camera(&cam_gpu);
+            match self.active_frame.kind {
+                ActiveFrameKind::Cartesian => renderer.set_root_kind_cartesian(),
+                ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                    renderer.set_root_kind_wrapped_plane(dims, slab_depth);
+                }
+                ActiveFrameKind::SphereSubFrame { range, .. } => {
+                    renderer.set_root_kind_sphere_subframe(range);
+                    renderer.update_ribbon(&[]);
+                }
+            }
         }
         log::info!(
             "Zoom: {}/{}, edit_depth: {}, visual: {}, anchor_depth: {}, frame_depth: {}",

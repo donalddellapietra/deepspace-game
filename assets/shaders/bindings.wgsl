@@ -64,8 +64,8 @@ struct Uniforms {
     /// wrap shift; `.y` / `.z` are unused until Phase 3. Zero on
     /// Cartesian-root frames.
     slab_dims: vec4<u32>,
-    _pad_face_bounds: vec4<f32>,
-    _pad_face_pop_pos: vec4<f32>,
+    sphere_lat_lon: vec4<f32>,
+    sphere_r: vec4<f32>,
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8
     /// replace the shaded colour with per-pixel diagnostic colors. See
     /// `march_debug.wgsl`. Lives in `.x`; `.yzw` reserved for future

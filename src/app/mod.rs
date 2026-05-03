@@ -287,6 +287,9 @@ pub struct App {
     /// on the renderer once it's ready (renderer is created
     /// asynchronously after App::new). Read from `--curvature A`.
     pub(super) startup_curvature_a: Option<f32>,
+    /// When true, WrappedPlane frames render through the UV sphere
+    /// body marcher instead of the tangent-cube approximation.
+    pub(super) startup_planet_uv_sphere: bool,
     /// Captured args we need in `finish_init`, populated by
     /// `start_init` before the renderer comes online.
     pub(super) pending_init: Option<PendingInit>,
@@ -323,6 +326,7 @@ impl App {
         let forced_edit_depth = test_cfg.force_edit_depth;
         let shader_stats_enabled = test_cfg.shader_stats;
         let startup_curvature_a = test_cfg.curvature_a;
+        let startup_planet_uv_sphere = test_cfg.planet_uv_sphere;
         // Nyquist floor: sub-pixel rejection only. This is the
         // sole visual LOD gate; the stack depth (MAX_STACK_DEPTH
         // in the shader) is the hard ceiling.
@@ -487,6 +491,7 @@ impl App {
             renderer_init_started: false,
             pending_init: None,
             startup_curvature_a,
+            startup_planet_uv_sphere,
         };
         if let Some(ref path) = spawn_entity_path {
             let count = spawn_entity_count.max(1);
@@ -514,6 +519,11 @@ impl App {
         let mut logical_path = self.camera.position.anchor;
         let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
         logical_path.truncate(desired_depth);
+        if self.startup_planet_uv_sphere {
+            if let Some(frame) = self.sphere_subframe_for_path(&logical_path) {
+                return frame;
+            }
+        }
         // The render frame's root must be Cartesian or WrappedPlane —
         // never a TangentBlock. The shader's TB dispatch fires at TB
         // *child* entry, not at the frame root, so a TB-rooted frame
@@ -525,14 +535,43 @@ impl App {
         {
             logical_path.truncate(logical_path.depth() - 1);
         }
-        frame::with_render_margin(
+        let frame = frame::with_render_margin(
             &self.world.library, self.world.root,
             &logical_path, RENDER_FRAME_CONTEXT,
-        )
+        );
+        if self.startup_planet_uv_sphere {
+            self.sphere_subframe_for_path(&frame.render_path).unwrap_or(frame)
+        } else {
+            frame
+        }
     }
 
     fn path_lands_on_tangent_block(&self, path: &Path) -> bool {
         path_lands_on_tangent_block(&self.world.library, self.world.root, path)
+    }
+
+    fn sphere_subframe_for_path(&self, path: &Path) -> Option<ActiveFrame> {
+        let path_range = crate::world::sphere::sphere_range_for_path(
+            &self.world.library,
+            self.world.root,
+            path,
+            crate::world::sphere::DEFAULT_SPHERE_LAT_MAX,
+        )?;
+        let mut wp_path = *path;
+        wp_path.truncate(path_range.wp_path_depth);
+        let range = crate::world::sphere::sphere_range_for_path(
+            &self.world.library,
+            self.world.root,
+            &wp_path,
+            crate::world::sphere::DEFAULT_SPHERE_LAT_MAX,
+        )?;
+        let node_id = node_at_path(&self.world.library, self.world.root, &wp_path)?;
+        Some(ActiveFrame {
+            render_path: wp_path,
+            logical_path: *path,
+            node_id,
+            kind: ActiveFrameKind::SphereSubFrame { wp_path, range },
+        })
     }
 
     pub(super) fn update(&mut self, dt: f32) {
@@ -647,6 +686,24 @@ impl App {
                     &self.world.library, self.world.root, &frame.render_path,
                 )
             }
+            ActiveFrameKind::SphereSubFrame { wp_path, range } => {
+                let (fwd_world, right_world, up_world) = self.camera.basis();
+                let sub = crate::world::sphere::camera_in_sphere_subframe(
+                    &self.camera.position,
+                    fwd_world,
+                    right_world,
+                    up_world,
+                    &wp_path,
+                    range,
+                );
+                return self.camera.gpu_camera_with_basis(
+                    sub.origin,
+                    crate::world::sdf::normalize(sub.forward),
+                    crate::world::sdf::normalize(sub.right),
+                    crate::world::sdf::normalize(sub.up),
+                    1.2,
+                );
+            }
         };
         if self.startup_profile_frames < 4 {
             eprintln!(
@@ -720,6 +777,23 @@ pub(super) fn path_lands_on_tangent_block(
         .unwrap_or(false)
 }
 
+pub(super) fn node_at_path(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    path: &crate::world::anchor::Path,
+) -> Option<crate::world::tree::NodeId> {
+    use crate::world::tree::Child;
+    let mut node = world_root;
+    for k in 0..path.depth() as usize {
+        let parent = library.get(node)?;
+        match parent.children[path.slot(k) as usize] {
+            Child::Node(child_id) => node = child_id,
+            _ => return None,
+        }
+    }
+    Some(node)
+}
+
 /// Walk `frame_path` from `world_root`, accumulating the cumulative
 /// `TangentBlock` rotation **and** inscribed-cube shrink scale.
 /// Returns `(R, scale)` where `R` takes the frame's local axes to
@@ -765,4 +839,3 @@ pub(super) fn frame_path_rotation(
 ) -> [[f32; 3]; 3] {
     frame_path_chain(library, world_root, frame_path).0
 }
-

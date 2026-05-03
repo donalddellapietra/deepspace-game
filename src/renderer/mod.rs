@@ -84,8 +84,12 @@ pub struct GpuUniforms {
     /// root frames. Mirrors `Uniforms.slab_dims` in
     /// `assets/shaders/bindings.wgsl`.
     pub slab_dims: [u32; 4],
-    pub _pad_face_bounds: [f32; 4],
-    pub _pad_face_pop_pos: [f32; 4],
+    /// Sphere UV subframe range: `(lat_lo, lat_hi, lon_lo, lon_hi)`.
+    /// Zero when sphere subframe mode is inactive.
+    pub sphere_lat_lon: [f32; 4],
+    /// Sphere UV subframe radial range: `(r_lo, r_hi, r_center, mode)`.
+    /// `mode = 2` means `planet_render.x` should dispatch subframe.
+    pub sphere_r: [f32; 4],
     /// Visual debug paint mode. 0 = off (normal rendering); 1..=8 are
     /// the diagnostic paint modes in `march_debug.wgsl`. Lives in
     /// `.x`; `.yzw` reserved for per-mode tuning. Modes 7 and 8 are
@@ -162,6 +166,8 @@ pub struct Renderer {
     /// ROOT_KIND_CARTESIAN`. Uploaded as `Uniforms.slab_dims`; the
     /// shader's X-wrap branch reads the X and W lanes.
     pub(super) slab_dims: [u32; 4],
+    pub(super) sphere_lat_lon: [f32; 4],
+    pub(super) sphere_r: [f32; 4],
     pub(super) ribbon_count: u32,
     /// Number of live entities. Drives the uniforms' `entity_count`
     /// (shader-side gate for the tag=3 dispatch path) and the
@@ -324,6 +330,8 @@ impl Renderer {
     pub fn set_root_kind_cartesian(&mut self) {
         self.root_kind = ROOT_KIND_CARTESIAN;
         self.slab_dims = [0; 4];
+        self.sphere_lat_lon = [0.0; 4];
+        self.sphere_r = [0.0; 4];
         self.write_uniforms();
     }
 
@@ -335,6 +343,21 @@ impl Renderer {
     pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_WRAPPED_PLANE;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
+        self.sphere_lat_lon = [0.0; 4];
+        self.sphere_r = [0.0; 4];
+        self.write_uniforms();
+    }
+
+    pub fn set_root_kind_sphere_subframe(&mut self, range: crate::world::sphere::SphereRange) {
+        self.root_kind = ROOT_KIND_WRAPPED_PLANE;
+        self.slab_dims = [
+            range.dims[0],
+            range.dims[1],
+            range.dims[2],
+            range.slab_depth as u32,
+        ];
+        self.sphere_lat_lon = [range.lat_lo, range.lat_hi, range.lon_lo, range.lon_hi];
+        self.sphere_r = [range.r_lo, range.r_hi, range.r_center(), 2.0];
         self.write_uniforms();
     }
 
@@ -518,7 +541,15 @@ impl Renderer {
     /// radians (e.g. 1.26 ≈ 72°). Cells past this latitude return
     /// no-hit so they read as sky.
     pub fn set_planet_lat_max(&mut self, lat_max_rad: f32) {
-        self.planet_render = [0.0, lat_max_rad, 0.0, 0.0];
+        self.planet_render[1] = lat_max_rad;
+        self.write_uniforms();
+    }
+
+    /// Select the WrappedPlane sphere renderer. `false` keeps the
+    /// current tangent-cube sphere path; `true` uses the UV-body
+    /// path that treats storage slots as `(lon, r, lat)` cells.
+    pub fn set_planet_uv_sphere_enabled(&mut self, enabled: bool) {
+        self.planet_render[0] = if enabled { 1.0 } else { 0.0 };
         self.write_uniforms();
     }
 }
