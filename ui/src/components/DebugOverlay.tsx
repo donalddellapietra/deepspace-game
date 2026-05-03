@@ -23,9 +23,8 @@ function fmtDist(v: number): string {
   return v.toExponential(3);
 }
 
-/// Format the debug-overlay state as a multi-line string suitable
-/// for pasting into a bug report. Same content the on-screen
-/// overlay shows. Available even when the overlay is hidden.
+/// Format the debug-overlay state for the on-screen display.
+/// Uses unicode for nicer formatting; not safe for terminal paste.
 function formatDebug(s: DebugOverlayState): string {
   const [rx, ry, rz] = s.cameraRootXyz;
   const [lx, ly, lz] = s.cameraLocal;
@@ -58,12 +57,55 @@ function formatDebug(s: DebugOverlayState): string {
     "intended [" + (s.intendedRenderPathCsv || "") + "]",
     "anchor   [" + s.anchorSlotsCsv + "]",
     "stop     " + (s.renderStopReason || "ok"),
+    "diag     " + (s.pathDiag || "-"),
     "",
     "── rotation ──",
     pad("TB on anchor path", s.tbOnAnchorPath ? "yes" : "no"),
     pad("cumulative yaw", s.anchorCumulativeYawDeg.toFixed(3) + "°"),
     "",
     pad("nodes", String(s.nodeCount)),
+  ].join("\n");
+}
+
+/// Pure ASCII format for clipboard copy. Terminals choke on the
+/// unicode block-drawing chars and trailing whitespace from pad();
+/// this strips all that to a single-space label/value format.
+function formatDebugAscii(s: DebugOverlayState): string {
+  const [rx, ry, rz] = s.cameraRootXyz;
+  const [lx, ly, lz] = s.cameraLocal;
+  const ts = new Date().toISOString();
+  const kv = (k: string, v: string | number) => `${k}: ${v}`;
+  return [
+    `# debug ${ts}`,
+    kv("fps", s.fps.toFixed(1)),
+    kv("frame_ms", s.frameTimeMs.toFixed(2)),
+    "",
+    "[zoom]",
+    kv("zoom_level", s.zoomLevel),
+    kv("tree_depth", s.treeDepth),
+    kv("edit_depth", s.editDepth),
+    kv("visual_depth", s.visualDepth),
+    kv("anchor_depth", s.cameraAnchorDepth),
+    kv("anchor_cell_root", fmtCell(s.anchorCellSizeRoot)),
+    "",
+    "[camera]",
+    kv("root", `${fmtDist(rx)}, ${fmtDist(ry)}, ${fmtDist(rz)}`),
+    kv("local", `${lx.toFixed(6)}, ${ly.toFixed(6)}, ${lz.toFixed(6)}`),
+    kv("fov", s.fov.toFixed(3)),
+    "",
+    "[frame]",
+    kv("active_kind", s.activeFrameKind),
+    kv("render", `[${s.renderPathCsv}]`),
+    kv("intended", `[${s.intendedRenderPathCsv || ""}]`),
+    kv("anchor", `[${s.anchorSlotsCsv}]`),
+    kv("stop", s.renderStopReason || "ok"),
+    kv("diag", s.pathDiag || "-"),
+    "",
+    "[rotation]",
+    kv("tb_on_anchor", s.tbOnAnchorPath ? "yes" : "no"),
+    kv("cumulative_yaw_deg", s.anchorCumulativeYawDeg.toFixed(3)),
+    "",
+    kv("nodes", s.nodeCount),
   ].join("\n");
 }
 
@@ -113,7 +155,7 @@ export function DebugOverlay() {
     }
     if (s.copySeq === lastCopySeq.current) return;
     lastCopySeq.current = s.copySeq;
-    copyToClipboard(formatDebug(s)).then((ok) => {
+    copyToClipboard(formatDebugAscii(s)).then((ok) => {
       setFlash(ok ? "copied" : "failed");
       window.setTimeout(() => setFlash(null), 1500);
     });

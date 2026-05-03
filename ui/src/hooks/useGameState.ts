@@ -87,6 +87,7 @@ const debugOverlayStore = createStore<DebugOverlayState>({
   renderPathCsv: "",
   intendedRenderPathCsv: "",
   renderStopReason: "",
+  pathDiag: "",
   tbOnAnchorPath: false,
   anchorCumulativeYawDeg: 0,
   copySeq: 0,
