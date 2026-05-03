@@ -97,10 +97,19 @@ pub enum NodeKind {
     /// At descent the renderer applies `R^T` to the ray; on hit the
     /// normal is rotated back via `R · local_normal`.
     ///
-    /// Two TangentBlocks with bit-distinct rotations DO NOT dedup;
-    /// bit-identical rotations dedup as usual.
+    /// `cell_offset` is the cell's displacement from its natural slot
+    /// centre, expressed in parent-frame `[0, 3)³` units. For ordinary
+    /// TBs (rotated_cube_test, dodecahedron_test) this is `[0, 0, 0]`
+    /// — the cell sits at its slot. For `SphericalWrappedPlane`
+    /// children, this is `sphere_position − slot_centre`, repositioning
+    /// the cell onto the sphere surface while keeping the parent's
+    /// flat slab as ground-truth storage.
+    ///
+    /// Two TangentBlocks with bit-distinct `(rotation, cell_offset)`
+    /// pairs DO NOT dedup; bit-identical pairs dedup as usual.
     TangentBlock {
         rotation: [[f32; 3]; 3],
+        cell_offset: [f32; 3],
     },
 }
 
@@ -135,6 +144,15 @@ fn rotation_bits(r: &[[f32; 3]; 3]) -> [[u32; 3]; 3] {
     out
 }
 
+/// Bit-pattern of a `[f32; 3]` for dedup hashing — same trick as
+/// `rotation_bits`. Two `cell_offset`s with identical bit patterns
+/// dedup; `0.0` and `-0.0` are treated as distinct (the bit pattern
+/// differs), but no current call site constructs `-0.0`.
+#[inline]
+fn f32_3_bits(v: &[f32; 3]) -> [u32; 3] {
+    [v[0].to_bits(), v[1].to_bits(), v[2].to_bits()]
+}
+
 impl PartialEq for NodeKind {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -144,9 +162,9 @@ impl PartialEq for NodeKind {
                 NodeKind::WrappedPlane { dims: b, slab_depth: bd },
             ) => a == b && ad == bd,
             (
-                NodeKind::TangentBlock { rotation: a },
-                NodeKind::TangentBlock { rotation: b },
-            ) => rotation_bits(a) == rotation_bits(b),
+                NodeKind::TangentBlock { rotation: a, cell_offset: ao },
+                NodeKind::TangentBlock { rotation: b, cell_offset: bo },
+            ) => rotation_bits(a) == rotation_bits(b) && f32_3_bits(ao) == f32_3_bits(bo),
             _ => false,
         }
     }
@@ -169,8 +187,9 @@ impl Hash for NodeKind {
                 dims.hash(state);
                 slab_depth.hash(state);
             }
-            NodeKind::TangentBlock { rotation } => {
+            NodeKind::TangentBlock { rotation, cell_offset } => {
                 rotation_bits(rotation).hash(state);
+                f32_3_bits(cell_offset).hash(state);
             }
         }
     }
@@ -530,19 +549,19 @@ mod tests {
         let stone = uniform_children(Child::Block(block::STONE));
         let cart = lib.insert_with_kind(stone, NodeKind::Cartesian);
         let tan1 = lib.insert_with_kind(
-            stone, NodeKind::TangentBlock { rotation: IDENTITY_ROTATION });
+            stone, NodeKind::TangentBlock { rotation: IDENTITY_ROTATION, cell_offset: [0.0; 3] });
         let tan2 = lib.insert_with_kind(
-            stone, NodeKind::TangentBlock { rotation: IDENTITY_ROTATION });
+            stone, NodeKind::TangentBlock { rotation: IDENTITY_ROTATION, cell_offset: [0.0; 3] });
         // Different kinds are distinct nodes even with identical children.
         assert_ne!(cart, tan1);
         // Identical kind + children dedup (same rotation).
         assert_eq!(tan1, tan2);
         // TangentBlock is not allowed to flatten.
-        let tb_id = NodeKind::TangentBlock { rotation: IDENTITY_ROTATION };
+        let tb_id = NodeKind::TangentBlock { rotation: IDENTITY_ROTATION, cell_offset: [0.0; 3] };
         assert!(!tb_id.allows_uniform_flatten());
         // Bit-distinct rotations DO NOT dedup.
         let tan_rot = lib.insert_with_kind(
-            stone, NodeKind::TangentBlock { rotation: rotation_y(0.5) });
+            stone, NodeKind::TangentBlock { rotation: rotation_y(0.5), cell_offset: [0.0; 3] });
         assert_ne!(tan1, tan_rot);
     }
 

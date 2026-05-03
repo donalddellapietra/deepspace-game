@@ -804,7 +804,7 @@ fn tangent_block_chain_summary(
         match n.children[slot] {
             Child::Node(child_id) => {
                 if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                    if let NodeKind::TangentBlock { rotation: r, .. } = child_node.kind {
                         tb_seen = true;
                         rot = crate::world::mat3::matmul(&rot, &r);
                     }

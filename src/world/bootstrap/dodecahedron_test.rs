@@ -108,7 +108,7 @@ fn build_tangent_block_subtree(
     let inner = build_uniform_cartesian_subtree(library, block_id, depth - 1);
     Child::Node(library.insert_with_kind(
         uniform_children(inner),
-        NodeKind::TangentBlock { rotation },
+        NodeKind::TangentBlock { rotation, cell_offset: [0.0; 3] },
     ))
 }
 

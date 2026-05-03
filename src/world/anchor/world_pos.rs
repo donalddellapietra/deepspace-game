@@ -577,7 +577,7 @@ impl WorldPos {
             match n.children[self.anchor.slot(k) as usize] {
                 Child::Node(child) => {
                     if let Some(child_node) = library.get(child) {
-                        if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                        if let NodeKind::TangentBlock { rotation: r, .. } = child_node.kind {
                             common_rot = crate::world::mat3::matmul(&common_rot, &r);
                         }
                     }

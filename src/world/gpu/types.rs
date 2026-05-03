@@ -58,7 +58,7 @@ impl GpuChild {
     }
 }
 
-/// Per-packed-node metadata: 64 bytes total.
+/// Per-packed-node metadata: 80 bytes total.
 ///
 /// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock.
 /// `dims_x/y/z`: slab dims for `WrappedPlane`; zero otherwise.
@@ -66,7 +66,15 @@ impl GpuChild {
 /// `rot_col0/1/2`: 3×3 rotation matrix (column-major) for
 /// `TangentBlock`. Each column is `vec4<f32>` (xyz = column, w = 0)
 /// for std140-style 16-byte vec3 alignment. Identity for the other
-/// kinds (shader doesn't read it for those).
+/// kinds (shader doesn't read it for those). `rot_col0.w` carries
+/// the inscribed-cube `tb_scale`.
+///
+/// `cell_offset` (xyz, w padding): TB cell's displacement from its
+/// natural slot centre, in parent-frame `[0, 3)³` units. Zero for
+/// ordinary TBs (the cell sits at slot centre); non-zero for
+/// SphericalWrappedPlane children that are repositioned onto the
+/// sphere surface. Subtracted from the slot origin at TB child
+/// dispatch (descent) and added back at ribbon pop (exit).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GpuNodeKind {
@@ -77,6 +85,7 @@ pub struct GpuNodeKind {
     pub rot_col0: [f32; 4],
     pub rot_col1: [f32; 4],
     pub rot_col2: [f32; 4],
+    pub cell_offset: [f32; 4],
 }
 
 impl GpuNodeKind {
@@ -84,22 +93,26 @@ impl GpuNodeKind {
         let id_col0 = [1.0, 0.0, 0.0, 0.0];
         let id_col1 = [0.0, 1.0, 0.0, 0.0];
         let id_col2 = [0.0, 0.0, 1.0, 0.0];
+        let zero_off = [0.0, 0.0, 0.0, 0.0];
         match k {
             NodeKind::Cartesian => Self {
                 kind: 0, dims_x: 0, dims_y: 0, dims_z: 0,
                 rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
+                cell_offset: zero_off,
             },
             NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
                 kind: 1, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
                 rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
+                cell_offset: zero_off,
             },
-            NodeKind::TangentBlock { rotation } => {
+            NodeKind::TangentBlock { rotation, cell_offset } => {
                 let content_scale = inscribed_cube_scale(&rotation);
                 Self {
                     kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
                     rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], content_scale],
                     rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
                     rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
+                    cell_offset: [cell_offset[0], cell_offset[1], cell_offset[2], 0.0],
                 }
             },
         }
@@ -143,18 +156,30 @@ pub(crate) fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
 pub struct TbBoundary {
     pub r: [[f32; 3]; 3],
     pub tb_scale: f32,
+    /// Cell's displacement from its natural slot centre, in
+    /// parent-frame `[0, 3)³` units. Zero for ordinary TBs (the cell
+    /// sits at slot centre); non-zero for SphericalWrappedPlane
+    /// children. Subtracted at descent and added at exit by the
+    /// boundary call site (NOT by `enter_point` / `exit_point` —
+    /// those still operate purely on rotation+scale about pivot).
+    pub cell_offset: [f32; 3],
 }
 
 impl TbBoundary {
     /// Build a `TbBoundary` from a `TangentBlock` rotation matrix.
+    /// `cell_offset` defaults to zero (slot-centred cell).
     pub fn new(r: [[f32; 3]; 3]) -> Self {
-        Self { r, tb_scale: inscribed_cube_scale(&r) }
+        Self { r, tb_scale: inscribed_cube_scale(&r), cell_offset: [0.0; 3] }
     }
 
     /// Build from a `NodeKind`; returns `None` for non-TB kinds.
     pub fn from_kind(k: crate::world::tree::NodeKind) -> Option<Self> {
-        if let crate::world::tree::NodeKind::TangentBlock { rotation } = k {
-            Some(Self::new(rotation))
+        if let crate::world::tree::NodeKind::TangentBlock { rotation, cell_offset } = k {
+            Some(Self {
+                r: rotation,
+                tb_scale: inscribed_cube_scale(&rotation),
+                cell_offset,
+            })
         } else {
             None
         }
@@ -279,8 +304,8 @@ mod tests {
 
     #[test]
     fn gpu_node_kind_size() {
-        // 4 u32 (16) + 3 vec4 (48) = 64 B.
-        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 64);
+        // 4 u32 (16) + 3 vec4 rotation (48) + 1 vec4 cell_offset (16) = 80 B.
+        assert_eq!(std::mem::size_of::<GpuNodeKind>(), 80);
     }
 
     #[test]
@@ -309,6 +334,7 @@ mod tests {
         use crate::world::tree::IDENTITY_ROTATION;
         let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock {
             rotation: IDENTITY_ROTATION,
+            cell_offset: [0.0; 3],
         });
         assert_eq!(k.kind, 2);
         // Identity rotation has inscribed scale 1.0.
@@ -317,10 +343,24 @@ mod tests {
         assert_eq!(k.rot_col2, [0.0, 0.0, 1.0, 0.0]);
 
         let r = [[0.5, 0.6, 0.7], [0.1, 0.2, 0.3], [0.9, 0.8, 0.4]];
-        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock { rotation: r });
+        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock {
+            rotation: r,
+            cell_offset: [0.0; 3],
+        });
         let expected_scale = inscribed_cube_scale(&r);
         assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, expected_scale]);
         assert_eq!(k.rot_col1, [0.1, 0.2, 0.3, 0.0]);
         assert_eq!(k.rot_col2, [0.9, 0.8, 0.4, 0.0]);
+        assert_eq!(k.cell_offset, [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn from_node_kind_tangent_block_carries_cell_offset() {
+        use crate::world::tree::IDENTITY_ROTATION;
+        let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock {
+            rotation: IDENTITY_ROTATION,
+            cell_offset: [0.7, -0.3, 1.4],
+        });
+        assert_eq!(k.cell_offset, [0.7, -0.3, 1.4, 0.0]);
     }
 }

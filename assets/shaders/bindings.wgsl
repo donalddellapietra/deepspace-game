@@ -125,12 +125,19 @@ struct NodeKindGpu {
     dims_y: u32,
     dims_z: u32,
     /// 3×3 rotation matrix (column-major) for TangentBlock. Each
-    /// column is `vec4<f32>` (w = 0 padding for std140 alignment).
+    /// column is `vec4<f32>` (w = 0 padding for std140 alignment;
+    /// `rot_col0.w` carries `tb_scale`, the inscribed-cube shrink).
     /// Identity for Cartesian / WrappedPlane (unread there).
     /// Applied at descent: `local = R^T·(child_local - 1.5) + 1.5`.
     rot_col0: vec4<f32>,
     rot_col1: vec4<f32>,
     rot_col2: vec4<f32>,
+    /// TB cell's displacement from its natural slot centre, in
+    /// parent-frame `[0, 3)³` units. `.xyz` is the offset; `.w` is
+    /// padding (zero). Zero for ordinary TBs (cell at slot centre);
+    /// non-zero for SphericalWrappedPlane children. Subtracted at
+    /// TB child dispatch (descent), added at ribbon pop (exit).
+    cell_offset: vec4<f32>,
 }
 
 const NODE_KIND_CARTESIAN: u32 = 0u;
