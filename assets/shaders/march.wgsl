@@ -1664,11 +1664,17 @@ fn march_spherical_wrapped_plane(
     let ray_dir = normalize(ray_dir_in);
     let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
     let cs_center = body_origin + vec3<f32>(body_size * 0.5);
-    // body_size is the SphericalWP's extent in render frame; WP uses
-    // a [0, 3)³ logical frame, so 1 WP unit = body_size / 3 in render.
     let wp_to_render = body_size / 3.0;
     let r_outer_render = body_radius_wp * wp_to_render;
 
+    var subgrid: f32 = 1.0;
+    for (var k: u32 = 0u; k < slab_depth; k = k + 1u) { subgrid = subgrid * 3.0; }
+    let cell_size_wp = 3.0 / subgrid;
+    let cell_size_render = cell_size_wp * wp_to_render;
+    // Slab thickness along radial: dims_y cells from inner to outer.
+    let r_inner_render = r_outer_render - f32(dims_y) * cell_size_render;
+
+    // Outer sphere intersection.
     let oc = ray_origin - cs_center;
     let b = dot(oc, ray_dir);
     let oc_dot_oc = dot(oc, oc);
@@ -1676,63 +1682,56 @@ fn march_spherical_wrapped_plane(
     let disc_outer = b * b - c;
     if disc_outer <= 0.0 { return result; }
     let sq_outer = sqrt(disc_outer);
-    let t_exit_sphere = -b + sq_outer;
-    if t_exit_sphere <= 0.0 { return result; }
+    let t_far_outer = -b + sq_outer;
+    if t_far_outer <= 0.0 { return result; }
+    let t_near_outer = -b - sq_outer;
+    let t_start = max(t_near_outer, 0.0);
+    let t_end = t_far_outer;
 
-    // Slab cell extent in render frame and cell-size in WP units.
-    var subgrid: f32 = 1.0;
-    for (var k: u32 = 0u; k < slab_depth; k = k + 1u) { subgrid = subgrid * 3.0; }
-    let cell_size_wp = 3.0 / subgrid;
-    let cell_size_render = cell_size_wp * wp_to_render;
-    // Radial shell thickness — n_r cells, each `cell_size_wp` thick
-    // along the radial.
-    let r_step = cell_size_render;
+    // March the ray through the shell, sampling at a fine step. At
+    // each step, find the cell at (lon_idx, lat_idx, r_idx) that
+    // contains the current point, and dispatch into its TB. Skip
+    // repeated samples of the same cell. The step size is set so
+    // the longest path through any single cell is sampled at least
+    // ~3 times — gives DDA-like coverage without the bookkeeping of
+    // a true 3D-spherical DDA.
+    let pi = 3.14159265;
+    let n_steps = 96u;
+    let dt = (t_end - t_start) / f32(n_steps);
+    var last_cx: i32 = -999;
+    var last_cy: i32 = -999;
+    var last_cz: i32 = -999;
 
-    // Walk radial layers from outermost (cy = dims_y - 1) inward,
-    // following the ray's first intersection with each shell.
-    var cy = dims_y - 1;
-    loop {
-        if cy < 0 { break; }
+    for (var i: u32 = 0u; i < n_steps; i = i + 1u) {
+        let t = t_start + (f32(i) + 0.5) * dt;
+        let pos = ray_origin + ray_dir * t;
+        let oc_p = pos - cs_center;
+        let r_p = length(oc_p);
+        if r_p < r_inner_render || r_p > r_outer_render { continue; }
 
-        // r_layer = body_radius - (n_r - 1 - cy) * cell_size — outer
-        // shell at cy = dims_y - 1, inner at cy = 0.
-        let r_layer = r_outer_render - f32(dims_y - 1 - cy) * r_step;
-        if r_layer <= 0.0 { cy = cy - 1; continue; }
-        let cr = oc_dot_oc - r_layer * r_layer;
-        let disc_layer = b * b - cr;
-        if disc_layer < 0.0 { cy = cy - 1; continue; }
-        let sq_layer = sqrt(disc_layer);
-        let t_layer = -b - sq_layer;
-        if t_layer < 0.0 || t_layer > t_exit_sphere {
-            cy = cy - 1; continue;
-        }
-
-        let pos = ray_origin + ray_dir * t_layer;
-        let n = (pos - cs_center) / r_layer;
+        let n = oc_p / r_p;
         let lat = asin(clamp(n.y, -1.0, 1.0));
-        if abs(lat) > lat_max { cy = cy - 1; continue; }
+        if abs(lat) > lat_max { continue; }
         let lon = atan2(n.z, n.x);
-        let pi = 3.14159265;
         let u = (lon + pi) / (2.0 * pi);
         let v = (lat + lat_max) / (2.0 * lat_max);
-        let cell_x = clamp(i32(floor(u * f32(dims_x))), 0, dims_x - 1);
-        let cell_z = clamp(i32(floor(v * f32(dims_z))), 0, dims_z - 1);
+        let cx = clamp(i32(floor(u * f32(dims_x))), 0, dims_x - 1);
+        let cz = clamp(i32(floor(v * f32(dims_z))), 0, dims_z - 1);
+        // r_idx 0 is innermost shell at r_inner; cy = dims_y-1 is
+        // outermost. r_step = cell_size_render.
+        let cy = clamp(
+            i32(floor((r_p - r_inner_render) / cell_size_render)),
+            0, dims_y - 1,
+        );
 
-        let sample = sample_slab_cell(body_idx, slab_depth, cell_x, cy, cell_z);
-        if sample.tag != 2u {
-            cy = cy - 1; continue;
-        }
+        if cx == last_cx && cy == last_cy && cz == last_cz { continue; }
+        last_cx = cx; last_cy = cy; last_cz = cz;
 
-        // Cell's actual lower corner in render frame: natural slot
-        // position + cell_offset displacement (both in WP units,
-        // scaled by wp_to_render).
+        let sample = sample_slab_cell(body_idx, slab_depth, cx, cy, cz);
+        if sample.tag != 2u { continue; }
+
         let cell_kind = node_kinds[sample.child_idx];
-        let cell_natural_lower = vec3<f32>(f32(cell_x), f32(cy), f32(cell_z)) * cell_size_wp;
-        let cell_actual_lower = body_origin
-            + (cell_natural_lower + cell_kind.cell_offset.xyz * cell_size_wp) * 1.0
-            * wp_to_render / wp_to_render;
-        // ^ keep `wp_to_render` factored for clarity; the natural
-        // and offset terms are both already in WP units.
+        let cell_natural_lower = vec3<f32>(f32(cx), f32(cy), f32(cz)) * cell_size_wp;
         let cell_actual_lower_render = body_origin
             + cell_natural_lower * wp_to_render
             + cell_kind.cell_offset.xyz * cell_size_render;
@@ -1755,7 +1754,6 @@ fn march_spherical_wrapped_plane(
             out.hit = true;
             out.t = sub.t * inv_norm;
             out.color = sub.color * (0.7 + 0.3 * local_bevel);
-            // Rotate normal back via R · local.
             let rc0 = node_kinds[sample.child_idx].rot_col0.xyz;
             let rc1 = node_kinds[sample.child_idx].rot_col1.xyz;
             let rc2 = node_kinds[sample.child_idx].rot_col2.xyz;
@@ -1767,7 +1765,6 @@ fn march_spherical_wrapped_plane(
             out.cell_size = 1.0;
             return out;
         }
-        cy = cy - 1;
     }
     return result;
 }
