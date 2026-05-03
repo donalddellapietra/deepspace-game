@@ -546,35 +546,24 @@ impl App {
             let len = crate::world::sdf::length(delta);
             if len > 1e-6 {
                 let speed_cells_per_sec = 4.0;
-                // Convert anchor cell size from `[0,3)` frame units
-                // into world units: world_per_cell = 3 / 3^depth.
-                let anchor_depth = self.camera.position.anchor.depth();
-                let cell_world = 3.0 / 3.0_f32.powi(anchor_depth as i32);
-                let scale = speed_cells_per_sec * cell_world * dt / len;
+                let scale = speed_cells_per_sec * dt / len;
                 let step_world = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
-                // Snap-to-world-position movement. Path-based
-                // step_neighbor inherits source-cell slot indices
-                // when popping up across cells; those indices are
-                // world-frame, but a TB's children are indexed in
-                // storage frame — so crossing into a rotated cube
-                // teleports the apparent world position. Computing
-                // the new world XYZ and re-deriving anchor + offset
-                // via `from_world_xyz` (which applies R^T at every
-                // TB on the descent) keeps world position continuous
-                // through the TB boundary.
-                let cur_world = self.camera.position.in_frame_rot(
+                // The `WorldPos.offset` lives in the deepest anchor
+                // cell's LOCAL frame, which equals world frame outside
+                // any TangentBlock but is rotated by the cumulative
+                // TB chain along the anchor when inside one.
+                // `add_local` adds delta directly to offset — so the
+                // world-frame WASD delta must first be R^T-rotated
+                // into that local frame, otherwise pressing forward
+                // inside a rotated cube drifts the offset off-axis.
+                let anchor_rot = frame_path_rotation(
                     &self.world.library,
                     self.world.root,
-                    &crate::world::anchor::Path::root(),
+                    &self.camera.position.anchor,
                 );
-                let new_world = [
-                    cur_world[0] + step_world[0],
-                    cur_world[1] + step_world[1],
-                    cur_world[2] + step_world[2],
-                ];
-                self.camera.position = crate::world::anchor::WorldPos::from_world_xyz(
-                    new_world,
-                    anchor_depth,
+                let step_local = mat3_transpose_mul_vec3(&anchor_rot, &step_world);
+                self.camera.position.add_local(
+                    step_local,
                     &self.world.library,
                     self.world.root,
                 );

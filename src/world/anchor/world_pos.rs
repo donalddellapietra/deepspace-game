@@ -96,52 +96,185 @@ impl WorldPos {
         }
     }
 
-    /// Kind-aware renormalize. Walks the anchor through the world
-    /// tree so that overflow on the wrap axis inside a
-    /// `WrappedPlane` subtree wraps in place instead of bubbling.
-    /// Returns the strongest transition observed during the renorm
-    /// (any wrap event collapses to a single `WrappedPlaneWrap`;
-    /// no-wrap steps return `Transition::None`).
+    /// Kind-aware renormalize. Cell-local pop + redescend that keeps
+    /// the camera's physical position continuous across cell
+    /// boundaries, including TangentBlock rotation boundaries and
+    /// WrappedPlane wrap boundaries.
+    ///
+    /// Algorithm:
+    /// - Loop: if offset is in `[0, 1)³` and depth meets target, done.
+    /// - WrappedPlane wrap: if the deepest cell's parent is a slab
+    ///   and offset[0] overflows, increment / decrement the deepest
+    ///   slot's X coord (wrapping at slab edges), adjust offset[0],
+    ///   stay at same depth.
+    /// - Pop: drop the deepest slot. If the cell being popped was a
+    ///   `TangentBlock`, apply forward `R` about `(0.5, 0.5, 0.5)`
+    ///   to convert offset from TB-storage frame into the parent's
+    ///   slot frame (Cartesian world). Then `(slot + offset) / 3`
+    ///   to express in the new deepest cell's children frame.
+    /// - Redescend: pick slot via `floor(offset * 3)`. If the picked
+    ///   child is a `TangentBlock`, apply `R^T` about `(0.5, 0.5, 0.5)`
+    ///   to the post-floor offset to convert from parent-frame into
+    ///   TB-storage so subsequent descents (and the offset's frame)
+    ///   are in storage.
+    ///
+    /// Pure cell-local arithmetic — magnitudes stay ≤ 0.5 in the
+    /// rotations regardless of anchor depth, so f32 precision is
+    /// bounded by the cell-fraction not the world position.
     fn renormalize_world(
         &mut self,
         library: &NodeLibrary,
         world_root: NodeId,
     ) -> Transition {
+        let target_depth = self.anchor.depth();
         let mut transition = Transition::None;
-        for axis in 0..3 {
-            let mut guard: i32 = 0;
-            while self.offset[axis] >= 1.0 && guard < 1 << 20 {
-                self.offset[axis] -= 1.0;
-                let (ok, wrapped) = self.anchor.step_neighbor_in_world(library, world_root, axis, 1);
-                if !ok {
-                    self.offset[axis] = 1.0 - f32::EPSILON;
+        let mut guard: u32 = 0;
+        let max_guard: u32 = 1 << 20;
+        loop {
+            guard += 1;
+            if guard > max_guard {
+                debug_assert!(false, "renormalize_world guard exceeded");
+                break;
+            }
+            let in_range = self.offset[0] >= 0.0 && self.offset[0] < 1.0
+                && self.offset[1] >= 0.0 && self.offset[1] < 1.0
+                && self.offset[2] >= 0.0 && self.offset[2] < 1.0;
+            if in_range && self.anchor.depth() >= target_depth {
+                break;
+            }
+            if !in_range {
+                if self.anchor.depth() == 0 {
+                    // Hit root, clamp.
+                    for i in 0..3 {
+                        if self.offset[i] >= 1.0 {
+                            self.offset[i] = 1.0 - f32::EPSILON;
+                        } else if self.offset[i] < 0.0 {
+                            self.offset[i] = 0.0;
+                        }
+                    }
                     break;
                 }
-                if wrapped {
-                    transition = Transition::WrappedPlaneWrap { axis: axis as u8 };
+                // Try WrappedPlane wrap on axis 0 if the deepest
+                // cell's parent is a slab.
+                let depth = self.anchor.depth() as usize;
+                let parent_slots_len = depth - 1;
+                let parent_kind = super::path::node_kind_at_depth(
+                    library,
+                    world_root,
+                    &self.anchor.as_slice()[..parent_slots_len],
+                );
+                if let Some(NodeKind::WrappedPlane { .. }) = parent_kind {
+                    let last_slot = self.anchor.slot(depth - 1) as usize;
+                    let (sx, sy, sz) = slot_coords(last_slot);
+                    if self.offset[0] >= 1.0 {
+                        self.offset[0] -= 1.0;
+                        let new_sx = if sx < 2 { sx + 1 } else { 0 };
+                        if new_sx == 0 {
+                            transition = Transition::WrappedPlaneWrap { axis: 0 };
+                        }
+                        self.anchor.pop();
+                        self.anchor.push(slot_index(new_sx, sy, sz) as u8);
+                        continue;
+                    }
+                    if self.offset[0] < 0.0 {
+                        self.offset[0] += 1.0;
+                        let new_sx = if sx > 0 { sx - 1 } else { 2 };
+                        if new_sx == 2 {
+                            transition = Transition::WrappedPlaneWrap { axis: 0 };
+                        }
+                        self.anchor.pop();
+                        self.anchor.push(slot_index(new_sx, sy, sz) as u8);
+                        continue;
+                    }
+                    // Y or Z overflow: pop normally below.
                 }
-                guard += 1;
-            }
-            while self.offset[axis] < 0.0 && guard < 1 << 20 {
-                self.offset[axis] += 1.0;
-                let (ok, wrapped) = self.anchor.step_neighbor_in_world(library, world_root, axis, -1);
-                if !ok {
-                    self.offset[axis] = 0.0;
-                    break;
-                }
-                if wrapped {
-                    transition = Transition::WrappedPlaneWrap { axis: axis as u8 };
-                }
-                guard += 1;
-            }
-            if self.offset[axis] >= 1.0 {
-                self.offset[axis] = 1.0 - f32::EPSILON;
-            }
-            if self.offset[axis] < 0.0 {
-                self.offset[axis] = 0.0;
+                // Pop one level (TangentBlock-rotation-aware).
+                self.pop_one_level_rot_aware(library, world_root);
+            } else {
+                // In range but depth < target. Redescend one level.
+                self.descend_one_level_rot_aware(library, world_root);
             }
         }
         transition
+    }
+
+    /// Pop the deepest slot. If the cell being popped was a
+    /// `TangentBlock`, apply forward `R` rotation about
+    /// `(0.5, 0.5, 0.5)` to convert the offset from TB-storage frame
+    /// into the parent-of-TB frame BEFORE the standard
+    /// `(slot_offset + offset) / 3` rescaling. World position is
+    /// preserved across the pop.
+    fn pop_one_level_rot_aware(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) {
+        if self.anchor.depth() == 0 {
+            return;
+        }
+        // Kind of the cell currently at the end of the path (the
+        // cell being popped).
+        let popped_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
+        let mut adjusted = self.offset;
+        if let Some(NodeKind::TangentBlock { rotation: r }) = popped_kind {
+            let centred = [adjusted[0] - 0.5, adjusted[1] - 0.5, adjusted[2] - 0.5];
+            let rotated = mat3_mul_vec3(&r, &centred);
+            adjusted[0] = rotated[0] + 0.5;
+            adjusted[1] = rotated[1] + 0.5;
+            adjusted[2] = rotated[2] + 0.5;
+        }
+        let last_slot = self.anchor.pop().unwrap_or(0) as usize;
+        let (sx, sy, sz) = slot_coords(last_slot);
+        self.offset[0] = (sx as f32 + adjusted[0]) / 3.0;
+        self.offset[1] = (sy as f32 + adjusted[1]) / 3.0;
+        self.offset[2] = (sz as f32 + adjusted[2]) / 3.0;
+    }
+
+    /// Descend one level: pick the slot containing the camera and
+    /// push it onto the anchor. If the picked child is a
+    /// `TangentBlock`, apply `R^T` rotation about `(0.5, 0.5, 0.5)`
+    /// to the post-floor offset to convert from parent-frame into
+    /// TB-storage frame. World position is preserved across the
+    /// descend.
+    fn descend_one_level_rot_aware(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) {
+        let storage_pos = [
+            self.offset[0] * 3.0,
+            self.offset[1] * 3.0,
+            self.offset[2] * 3.0,
+        ];
+        let sx = storage_pos[0].floor().clamp(0.0, 2.0) as i32 as usize;
+        let sy = storage_pos[1].floor().clamp(0.0, 2.0) as i32 as usize;
+        let sz = storage_pos[2].floor().clamp(0.0, 2.0) as i32 as usize;
+        let slot = slot_index(sx, sy, sz) as u8;
+        // Push first, then look up the descended-into cell's kind.
+        self.anchor.push(slot);
+        let descend_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
+        let mut new_offset = [
+            (storage_pos[0] - sx as f32).clamp(0.0, 1.0 - f32::EPSILON),
+            (storage_pos[1] - sy as f32).clamp(0.0, 1.0 - f32::EPSILON),
+            (storage_pos[2] - sz as f32).clamp(0.0, 1.0 - f32::EPSILON),
+        ];
+        if let Some(NodeKind::TangentBlock { rotation: r }) = descend_kind {
+            // R^T · (offset - 0.5) + 0.5
+            let centred = [new_offset[0] - 0.5, new_offset[1] - 0.5, new_offset[2] - 0.5];
+            let rotated = [
+                r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
+                r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
+                r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
+            ];
+            new_offset[0] = (rotated[0] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+            new_offset[1] = (rotated[1] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+            new_offset[2] = (rotated[2] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+        }
+        self.offset = new_offset;
     }
 
     /// Advance by a local delta (in units of the current cell).
@@ -184,6 +317,11 @@ impl WorldPos {
     /// World position shift is bounded by `BOUNDARY_EPS * cell_size`
     /// — imperceptible in gameplay but enough to keep the render
     /// path on the carved branch when the camera is right on a wall.
+    ///
+    /// TangentBlock-aware: if the cell being descended INTO is a TB,
+    /// apply `R^T` about `(0.5, 0.5, 0.5)` to the post-floor offset
+    /// to convert from parent-frame into TB-storage frame. World
+    /// position is preserved across the zoom.
     pub fn zoom_in_in_world(
         &mut self,
         library: &NodeLibrary,
@@ -192,7 +330,7 @@ impl WorldPos {
         const BOUNDARY_EPS: f32 = 1e-3;
         // Resolve the parent node by walking the anchor in the tree.
         let parent = node_at_path(library, world_root, &self.anchor);
-        // Naive geometric pick.
+        // Naive geometric pick (in current deepest cell's children frame).
         let mut coords = [0usize; 3];
         let mut new_offset = [0.0f32; 3];
         for i in 0..3 {
@@ -203,7 +341,8 @@ impl WorldPos {
         // Tree-aware tie-break: per axis, if offset is near 0 or 1
         // (we just crossed a boundary) AND the geometric slot leads
         // to Empty/Block while the boundary-neighbor on this axis
-        // is a Node, snap to the neighbor.
+        // is a Node, snap to the neighbor. Cartesian only — the
+        // tie-break operates in the current cell's children frame.
         if let Some(parent_id) = parent {
             for axis in 0..3 {
                 let near_low = new_offset[axis] < BOUNDARY_EPS && coords[axis] > 0;
@@ -227,9 +366,66 @@ impl WorldPos {
                 }
             }
         }
-        self.offset = new_offset;
         let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.anchor.push(slot);
+        // If the cell we just descended INTO is a TangentBlock, the
+        // offset's frame changes from parent-Cartesian to TB-storage.
+        // Apply R^T rotation about (0.5, 0.5, 0.5).
+        let descend_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
+        if let Some(NodeKind::TangentBlock { rotation: r }) = descend_kind {
+            let centred = [new_offset[0] - 0.5, new_offset[1] - 0.5, new_offset[2] - 0.5];
+            let rotated = [
+                r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
+                r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
+                r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
+            ];
+            new_offset[0] = (rotated[0] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+            new_offset[1] = (rotated[1] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+            new_offset[2] = (rotated[2] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+        }
+        self.offset = new_offset;
+        Transition::None
+    }
+
+    /// Pop the deepest slot. World position preserved across the
+    /// pop, including TangentBlock rotation when the cell being
+    /// popped was a TB. Use this at runtime; `zoom_out` is a
+    /// Cartesian fallback for callers without a library.
+    pub fn zoom_out_in_world(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) -> Transition {
+        if self.anchor.depth() == 0 {
+            return Transition::None;
+        }
+        // Kind of the cell at the end of the path (the cell being
+        // popped). If it's a TangentBlock, the offset is in
+        // TB-storage frame and must be rotated by R about (0.5, 0.5, 0.5)
+        // to express in the parent-of-TB Cartesian frame BEFORE the
+        // standard pop rescale.
+        let popped_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
+        let mut adjusted = self.offset;
+        if let Some(NodeKind::TangentBlock { rotation: r }) = popped_kind {
+            let centred = [adjusted[0] - 0.5, adjusted[1] - 0.5, adjusted[2] - 0.5];
+            let rotated = mat3_mul_vec3(&r, &centred);
+            adjusted[0] = rotated[0] + 0.5;
+            adjusted[1] = rotated[1] + 0.5;
+            adjusted[2] = rotated[2] + 0.5;
+        }
+        let last_slot = match self.anchor.pop() {
+            Some(s) => s as usize,
+            None => return Transition::None,
+        };
+        let (sx, sy, sz) = slot_coords(last_slot);
+        self.offset[0] = (sx as f32 + adjusted[0]) / 3.0;
+        self.offset[1] = (sy as f32 + adjusted[1]) / 3.0;
+        self.offset[2] = (sz as f32 + adjusted[2]) / 3.0;
+        debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
         Transition::None
     }
 

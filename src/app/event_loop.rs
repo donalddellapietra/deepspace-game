@@ -615,7 +615,9 @@ impl App {
                 &self.world.library, self.world.root,
             );
         } else {
-            self.camera.position.zoom_out();
+            self.camera.position.zoom_out_in_world(
+                &self.world.library, self.world.root,
+            );
         }
         self.apply_zoom();
     }

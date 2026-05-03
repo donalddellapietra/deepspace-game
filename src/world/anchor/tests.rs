@@ -455,3 +455,85 @@ fn add_local_offset_is_normalized() {
         assert!((0.0..1.0).contains(&v));
     }
 }
+
+/// Crossing into a `TangentBlock` ancestor must preserve world
+/// position. Without the kind-boundary fixup in `renormalize_world`,
+/// `step_neighbor` inherits source-cell slot indices in the wrong
+/// frame and the camera teleports off-axis the moment its anchor
+/// crosses the rotated cube's face.
+#[test]
+fn add_local_preserves_world_pos_across_tangent_block_boundary() {
+    use crate::world::bootstrap::rotated_cube_test_world;
+    let world = rotated_cube_test_world();
+    // Spawn just above the +Y face of the rotated middle cube
+    // (slot 13 of root = world cell [1,2]³).
+    // Anchor depth 3 puts the camera in a depth-3 cell of root,
+    // matching the user's reported repro.
+    let mut pos = WorldPos::from_world_xyz(
+        [1.26083, 2.03101, 1.26498], 3, &world.library, world.root,
+    );
+    let world_before = pos.in_frame_rot(
+        &world.library, world.root, &Path::root(),
+    );
+    // Sanity: the constructor lands at the requested world pos.
+    for i in 0..3 {
+        assert!((world_before[i] - [1.26083, 2.03101, 1.26498][i]).abs() < 1e-4,
+            "from_world_xyz lost precision at axis {}: got {:?} want {:?}",
+            i, world_before, [1.26083, 2.03101, 1.26498]);
+    }
+    // Move just enough to cross the y=2 boundary into the TB.
+    // `add_local` takes delta in deepest-cell offset units (`[0, 1)`
+    // = one cell), so to move world Y by -0.06 at depth 3 (cell
+    // size = 3 / 3^3 = 1/9 world per offset unit) we pass
+    // `dy_offset = -0.06 * 9 = -0.54`.
+    let cell_world = WORLD_SIZE / 3.0_f32.powi(pos.anchor.depth() as i32);
+    let dy_world = -0.06; // crosses y=2 boundary into TB
+    let dy_offset = dy_world / cell_world;
+    pos.add_local([0.0, dy_offset, 0.0], &world.library, world.root);
+    let world_after = pos.in_frame_rot(
+        &world.library, world.root, &Path::root(),
+    );
+    // World Y should drop by ~|dy_world|. X and Z must stay
+    // continuous — the user's reported teleport jumped X by -0.10
+    // and Z by +0.24 at the boundary.
+    let tol = 1e-3;
+    assert!((world_after[0] - world_before[0]).abs() < tol,
+        "X teleported across TB boundary: before {} after {}",
+        world_before[0], world_after[0]);
+    assert!((world_after[2] - world_before[2]).abs() < tol,
+        "Z teleported across TB boundary: before {} after {}",
+        world_before[2], world_after[2]);
+    assert!((world_after[1] - (world_before[1] + dy_world)).abs() < tol,
+        "Y didn't track the requested delta: before {} after {} dy_world {}",
+        world_before[1], world_after[1], dy_world);
+    // Sanity: anchor should now have the TB on its path (slot 13).
+    assert_eq!(pos.anchor.slot(0), 13,
+        "after crossing into the TB, anchor[0] should be 13 (TB slot)");
+}
+
+/// At deep anchors (where each cell is well below f32 epsilon in
+/// world units), `add_local` must remain stable — the precision of
+/// the camera position is bounded by the cell-fraction, not by the
+/// absolute world coordinate. The cell-local pop+redescend in
+/// `renormalize_world` should keep arithmetic magnitudes ≤ 0.5
+/// regardless of depth. World-absolute snap algorithms (e.g. lifting
+/// through `in_frame_rot` to root and re-walking from XYZ) lose all
+/// information about the offset by ~depth 25.
+#[test]
+fn add_local_is_precision_stable_at_deep_anchor() {
+    let l = lib();
+    // Plain Cartesian world (no TB needed for this precision check).
+    let mut pos = WorldPos::uniform_column(13, 28, [0.5, 0.5, 0.5]);
+    // Move by a fraction of the deepest cell. The same offset delta
+    // moves the same fraction of the cell at any depth — that's the
+    // whole point of cell-local arithmetic.
+    let dx = 0.1_f32;
+    let off_before = pos.offset;
+    pos.add_local([dx, 0.0, 0.0], &l, NO_ROOT);
+    let off_after = pos.offset;
+    // No cell-boundary crossing: offset should advance by exactly dx
+    // (within f32 epsilon).
+    assert!((off_after[0] - (off_before[0] + dx)).abs() < 1e-6,
+        "deep-anchor add_local lost precision: before {} after {} dx {}",
+        off_before[0], off_after[0], dx);
+}
