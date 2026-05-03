@@ -33,7 +33,7 @@
 //! direction frame-chain rotation fix protects.
 
 use super::WorldBootstrap;
-use crate::world::anchor::WorldPos;
+use crate::world::anchor::{Path, WorldPos};
 use crate::world::palette::block;
 use crate::world::state::WorldState;
 use crate::world::tree::{
@@ -44,14 +44,22 @@ use crate::world::tree::{
 /// visually distinctive: from above the cube reads as a diamond.
 const ROTATION_ANGLE_RAD: f32 = std::f32::consts::FRAC_PI_4;
 
-/// Depth of each per-cube subtree (slots 12/13/14 of the root). The
-/// total tree depth is `CUBE_SUBTREE_DEPTH + 1` (root + each
-/// subtree). For the precision-pressure test, 29 puts the deepest
-/// stone leaves at root tree depth 30.
+/// Depth of each per-cube subtree (slots 12/13/14 of the inner row
+/// root). The total tree depth is `CUBE_SUBTREE_DEPTH + 1 +
+/// WRAP_LAYERS`. For the precision-pressure test, 29 puts the
+/// deepest stone leaves at tree depth 30 + `WRAP_LAYERS`.
 pub const CUBE_SUBTREE_DEPTH: u8 = 29;
 
+/// Number of plain-Cartesian wrap layers placed ABOVE the cube row.
+/// Each layer is a Cartesian node holding the inner content at its
+/// centre slot (13 = (1,1,1)) and is otherwise empty, so the camera
+/// has empty space to fly around the rotated diamond from a few
+/// layers out.
+pub const WRAP_LAYERS: u8 = 2;
+
 /// Total tree depth produced by this preset.
-pub const ROTATED_CUBE_TEST_TREE_DEPTH: u32 = CUBE_SUBTREE_DEPTH as u32 + 1;
+pub const ROTATED_CUBE_TEST_TREE_DEPTH: u32 =
+    CUBE_SUBTREE_DEPTH as u32 + 1 + WRAP_LAYERS as u32;
 
 /// Build a uniform-block recursive Cartesian subtree of `depth`
 /// levels. Returns a `Child` referencing the root of the subtree
@@ -106,12 +114,23 @@ pub fn rotated_cube_test_world() -> WorldState {
         &mut library, block::STONE, CUBE_SUBTREE_DEPTH,
     );
 
-    // Root: Cartesian, populated only at slots 12/13/14 (the row).
-    let mut root_children = empty_children();
-    root_children[slot_index(0, 1, 1)] = cube_a;
-    root_children[slot_index(1, 1, 1)] = cube_centre;
-    root_children[slot_index(2, 1, 1)] = cube_b;
-    let root = library.insert_with_kind(root_children, NodeKind::Cartesian);
+    // Inner row root: Cartesian, populated only at slots 12/13/14.
+    let mut row_children = empty_children();
+    row_children[slot_index(0, 1, 1)] = cube_a;
+    row_children[slot_index(1, 1, 1)] = cube_centre;
+    row_children[slot_index(2, 1, 1)] = cube_b;
+    let mut current = library.insert_with_kind(row_children, NodeKind::Cartesian);
+
+    // Wrap with `WRAP_LAYERS` Cartesian levels: each puts the inner
+    // content at the centre slot (13) and leaves the surrounding
+    // slots empty so the camera can navigate the empty space
+    // around the cube row from a few layers out.
+    for _ in 0..WRAP_LAYERS {
+        let mut wrap = empty_children();
+        wrap[slot_index(1, 1, 1)] = Child::Node(current);
+        current = library.insert_with_kind(wrap, NodeKind::Cartesian);
+    }
+    let root = current;
     library.ref_inc(root);
 
     let world = WorldState { root, library };
@@ -123,11 +142,17 @@ pub fn rotated_cube_test_world() -> WorldState {
     world
 }
 
-/// Camera spawn: one cell directly above the row, looking down.
-/// Anchor depth 1 (slot 16 = (1, 2, 1) of root); offset (0.5, 0.5,
-/// 0.5) puts world position at (1.5, 2.5, 1.5) in root frame coords.
+/// Camera spawn: directly above the cube row, one cell above the
+/// inner row root. Anchor walks `WRAP_LAYERS` centre slots (13 =
+/// (1,1,1)) to reach the row root, then slot 16 = (1, 2, 1) for
+/// the cell above the row, with offset (0.5, 0.5, 0.5).
 pub fn rotated_cube_test_spawn() -> WorldPos {
-    WorldPos::uniform_column(slot_index(1, 2, 1) as u8, 1, [0.5, 0.5, 0.5])
+    let mut anchor = Path::root();
+    for _ in 0..WRAP_LAYERS {
+        anchor.push(slot_index(1, 1, 1) as u8);
+    }
+    anchor.push(slot_index(1, 2, 1) as u8);
+    WorldPos::new(anchor, [0.5, 0.5, 0.5])
 }
 
 pub(super) fn bootstrap_rotated_cube_test_world() -> WorldBootstrap {
@@ -157,27 +182,41 @@ mod tests {
     #[test]
     fn library_dedups_uniform_subtrees() {
         let world = rotated_cube_test_world();
-        // Depth-29 uniform Cartesian + 1 TB head = 30 library entries.
-        // (Every level of uniform stone dedups across cubes A and B
-        // with the inside of cube_centre.)
+        // Depth-29 uniform Cartesian + 1 TB head + WRAP_LAYERS empty
+        // wrap layers ≈ 30 + WRAP_LAYERS library entries. Allow a
+        // small margin for any incidental dedup interactions.
+        let budget = 32 + WRAP_LAYERS as usize;
         assert!(
-            world.library.len() <= 32,
-            "library should dedup uniform subtrees, got {} entries",
+            world.library.len() <= budget,
+            "library should dedup uniform subtrees, got {} entries (budget {})",
             world.library.len(),
+            budget,
         );
     }
 
     #[test]
     fn root_slots_match_layout() {
         let world = rotated_cube_test_world();
-        let root_node = world.library.get(world.root).expect("root exists");
-        assert_eq!(root_node.kind, NodeKind::Cartesian);
+        // Walk down `WRAP_LAYERS` centre slots from the root to reach
+        // the cube row's container; the layout assertions below all
+        // apply to the row root, not the wrap layers.
+        let mut node_id = world.root;
+        for _ in 0..WRAP_LAYERS {
+            let n = world.library.get(node_id).expect("wrap node");
+            assert_eq!(n.kind, NodeKind::Cartesian);
+            match n.children[slot_index(1, 1, 1)] {
+                Child::Node(id) => node_id = id,
+                other => panic!("expected Node at wrap centre, got {other:?}"),
+            }
+        }
+        let row_node = world.library.get(node_id).expect("row root exists");
+        assert_eq!(row_node.kind, NodeKind::Cartesian);
 
         // Outer slots are uniform-stone Cartesian subtrees (Node, not
         // Block — they're recursive subdivisions, not leaves).
         for slot_xyz in [(0u8, 1u8, 1u8), (2, 1, 1)] {
             let slot = slot_index(slot_xyz.0 as usize, slot_xyz.1 as usize, slot_xyz.2 as usize);
-            let child = root_node.children[slot];
+            let child = row_node.children[slot];
             match child {
                 Child::Node(id) => {
                     let n = world.library.get(id).expect("subtree exists");
@@ -188,7 +227,7 @@ mod tests {
         }
 
         // Centre slot is a TangentBlock subtree.
-        match root_node.children[slot_index(1, 1, 1)] {
+        match row_node.children[slot_index(1, 1, 1)] {
             Child::Node(id) => {
                 let n = world.library.get(id).expect("centre subtree exists");
                 assert!(n.kind.is_tangent_block(), "expected TB, got {:?}", n.kind);

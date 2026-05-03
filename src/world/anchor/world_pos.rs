@@ -236,7 +236,12 @@ impl WorldPos {
                 self.pop_one_level_rot_aware(library, world_root);
             } else {
                 // In range but depth < target. Redescend one level.
-                self.descend_one_level_rot_aware(library, world_root);
+                // Stop descending when the kind-aware descend refuses
+                // (camera in a TB's outer cube but outside the
+                // inscribed diamond — leave it at the parent depth).
+                if !self.descend_one_level_rot_aware(library, world_root) {
+                    break;
+                }
             }
         }
         transition
@@ -279,11 +284,19 @@ impl WorldPos {
     /// is a `TangentBlock`, apply `R^T · /tb_scale` about
     /// `(0.5, 0.5, 0.5)` so subsequent descents see the offset in
     /// TB-storage frame. Pure cell-local arithmetic.
+    ///
+    /// Returns `false` when descent into a TB would leave the offset
+    /// outside `[0, 1)³` in storage — that means the camera sits in
+    /// the TB's outer Cartesian box but outside the inscribed
+    /// (rotated) content region. In that case the anchor is left
+    /// untouched: the camera stays at the parent's depth in the
+    /// empty space surrounding the diamond. Caller (renormalize_world,
+    /// scroll-zoom) should stop descending when this returns false.
     fn descend_one_level_rot_aware(
         &mut self,
         library: &NodeLibrary,
         world_root: NodeId,
-    ) {
+    ) -> bool {
         let storage_pos = [
             self.offset[0] * 3.0,
             self.offset[1] * 3.0,
@@ -293,25 +306,32 @@ impl WorldPos {
         let sy = storage_pos[1].floor().clamp(0.0, 2.0) as i32 as usize;
         let sz = storage_pos[2].floor().clamp(0.0, 2.0) as i32 as usize;
         let slot = slot_index(sx, sy, sz) as u8;
-        self.anchor.push(slot);
-        self.offset = [
-            (storage_pos[0] - sx as f32).clamp(0.0, 1.0 - f32::EPSILON),
-            (storage_pos[1] - sy as f32).clamp(0.0, 1.0 - f32::EPSILON),
-            (storage_pos[2] - sz as f32).clamp(0.0, 1.0 - f32::EPSILON),
+        let candidate = [
+            storage_pos[0] - sx as f32,
+            storage_pos[1] - sy as f32,
+            storage_pos[2] - sz as f32,
         ];
-        // Look up the kind of the cell JUST PUSHED — anchor slice
-        // now ends at this cell.
+        // Peek the kind of the candidate child via push/inspect/pop.
+        self.anchor.push(slot);
         let pushed_kind = super::path::node_kind_at_depth(
             library, world_root, self.anchor.as_slice(),
         );
         if let Some(NodeKind::TangentBlock { rotation: r }) = pushed_kind {
-            let rotated = tb_external_to_storage(self.offset, &r);
-            self.offset = [
-                rotated[0].clamp(0.0, 1.0 - f32::EPSILON),
-                rotated[1].clamp(0.0, 1.0 - f32::EPSILON),
-                rotated[2].clamp(0.0, 1.0 - f32::EPSILON),
-            ];
+            let rotated = tb_external_to_storage(candidate, &r);
+            let in_range = (0.0..1.0).contains(&rotated[0])
+                && (0.0..1.0).contains(&rotated[1])
+                && (0.0..1.0).contains(&rotated[2]);
+            if !in_range {
+                // Outside the inscribed diamond. Roll back the push
+                // so the camera stays at the parent's depth.
+                self.anchor.pop();
+                return false;
+            }
+            self.offset = rotated;
+        } else {
+            self.offset = candidate;
         }
+        true
     }
 
     /// Advance by a local delta (in units of the current cell).
@@ -400,21 +420,28 @@ impl WorldPos {
         }
         let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.anchor.push(slot);
-        self.offset = new_offset;
         // Kind-aware: if the just-pushed cell is a TangentBlock,
         // convert offset from parent's children frame into
-        // TB-storage so the new deepest-cell interior is consistent
-        // with the storage-based slot indexing of the TB's children.
+        // TB-storage. If the storage offset would be outside
+        // `[0, 1)³` the camera is in the TB's outer Cartesian box
+        // but outside the inscribed diamond — refuse to zoom into
+        // the diamond, roll back the push, and leave the camera at
+        // the previous depth.
         let pushed_kind = super::path::node_kind_at_depth(
             library, world_root, self.anchor.as_slice(),
         );
         if let Some(NodeKind::TangentBlock { rotation: r }) = pushed_kind {
-            let rotated = tb_external_to_storage(self.offset, &r);
-            self.offset = [
-                rotated[0].clamp(0.0, 1.0 - f32::EPSILON),
-                rotated[1].clamp(0.0, 1.0 - f32::EPSILON),
-                rotated[2].clamp(0.0, 1.0 - f32::EPSILON),
-            ];
+            let rotated = tb_external_to_storage(new_offset, &r);
+            let in_range = (0.0..1.0).contains(&rotated[0])
+                && (0.0..1.0).contains(&rotated[1])
+                && (0.0..1.0).contains(&rotated[2]);
+            if !in_range {
+                self.anchor.pop();
+                return Transition::None;
+            }
+            self.offset = rotated;
+        } else {
+            self.offset = new_offset;
         }
         Transition::None
     }
