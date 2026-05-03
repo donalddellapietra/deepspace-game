@@ -12,11 +12,12 @@ mod wrapped_planet;
 
 pub use wrapped_planet::cpu_raycast_wrapped_planet;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
 
-/// Re-export so submodules can apply the inscribed-cube shrink at
-/// TB entry / pop, mirroring the shader.
-pub(crate) use crate::world::gpu::inscribed_cube_scale;
+/// Re-export so submodules can apply the unified TangentBlock
+/// rotation+scale boundary transform at TB entry / pop, mirroring
+/// the shader.
+pub(crate) use crate::world::gpu::TbBoundary;
 
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
@@ -64,8 +65,6 @@ pub fn cpu_raycast_in_frame(
     max_depth: u32,
     _max_face_depth: u32,
 ) -> Option<HitInfo> {
-    use crate::world::tree::NodeKind;
-
     let (chain, frame_entries) = build_frame_chain(library, world_root, frame_path);
     let effective_depth = chain.len() - 1;
     let frame_entries = &frame_entries[..effective_depth];
@@ -97,47 +96,19 @@ pub fn cpu_raycast_in_frame(
         let slot_off = [sx as f32, sy as f32, sz as f32];
 
         // TB-aware pop: if the child we're leaving is a TangentBlock,
-        // apply R (forward rotation) to origin and direction —
-        // mirrors the shader's ribbon pop.
-        let child_is_tb = library
-            .get(child_id)
-            .map(|n| matches!(n.kind, NodeKind::TangentBlock { .. }))
-            .unwrap_or(false);
-        if child_is_tb {
-            if let Some(node) = library.get(child_id) {
-                if let NodeKind::TangentBlock { rotation: r } = node.kind {
-                    // Inverse of TB entry: multiply centred origin /
-                    // dir by tb_scale (undo the entry-side division),
-                    // apply R about (1.5, 1.5, 1.5), then /3 +
-                    // slot_off + 0.5 to express in parent's [0, 3)³.
-                    let tb_scale = inscribed_cube_scale(&r);
-                    let centered = [
-                        (ray_origin[0] - 1.5) * tb_scale,
-                        (ray_origin[1] - 1.5) * tb_scale,
-                        (ray_origin[2] - 1.5) * tb_scale,
-                    ];
-                    let rotated = [
-                        r[0][0]*centered[0] + r[1][0]*centered[1] + r[2][0]*centered[2],
-                        r[0][1]*centered[0] + r[1][1]*centered[1] + r[2][1]*centered[2],
-                        r[0][2]*centered[0] + r[1][2]*centered[1] + r[2][2]*centered[2],
-                    ];
-                    ray_origin = [
-                        slot_off[0] + 0.5 + rotated[0] / 3.0,
-                        slot_off[1] + 0.5 + rotated[1] / 3.0,
-                        slot_off[2] + 0.5 + rotated[2] / 3.0,
-                    ];
-                    let rd = [
-                        ray_dir[0] * tb_scale,
-                        ray_dir[1] * tb_scale,
-                        ray_dir[2] * tb_scale,
-                    ];
-                    ray_dir = [
-                        (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
-                        (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,
-                        (r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2]) / 3.0,
-                    ];
-                }
-            }
+        // apply the inverse-of-entry transform (`exit_point` / `exit_dir`
+        // about pivot 1.5) and then translate-and-scale into parent's
+        // `[0, 3)³`. Mirrors the shader's ribbon pop.
+        let child_kind = library.get(child_id).map(|n| n.kind);
+        if let Some(boundary) = child_kind.and_then(TbBoundary::from_kind) {
+            let parent_origin = boundary.exit_point(ray_origin, 1.5);
+            let parent_dir = boundary.exit_dir(ray_dir);
+            ray_origin = [
+                slot_off[0] + 0.5 + (parent_origin[0] - 1.5) / 3.0,
+                slot_off[1] + 0.5 + (parent_origin[1] - 1.5) / 3.0,
+                slot_off[2] + 0.5 + (parent_origin[2] - 1.5) / 3.0,
+            ];
+            ray_dir = [parent_dir[0] / 3.0, parent_dir[1] / 3.0, parent_dir[2] / 3.0];
         } else {
             ray_origin = [
                 slot_off[0] + ray_origin[0] / 3.0,

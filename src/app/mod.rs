@@ -556,12 +556,7 @@ impl App {
                 // `renormalize_world` then handles cell-boundary
                 // crossings (including TB rotation pivots) cell-locally.
                 let step_world = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
-                let anchor_rot = frame_path_rotation(
-                    &self.world.library,
-                    self.world.root,
-                    &self.camera.position.anchor,
-                );
-                let anchor_scale = frame_path_scale(
+                let (anchor_rot, anchor_scale) = frame_path_chain(
                     &self.world.library,
                     self.world.root,
                     &self.camera.position.anchor,
@@ -688,37 +683,50 @@ impl App {
     }
 }
 
-/// Walk `frame_path` from `world_root`, multiplying any rotation
-/// from `NodeKind::TangentBlock` along the way. Returns the
-/// cumulative rotation that takes the FRAME's local frame to the
-/// world root frame. Identity for any path that doesn't cross a
-/// rotated node.
+/// Walk `frame_path` from `world_root`, accumulating the cumulative
+/// `TangentBlock` rotation **and** inscribed-cube shrink scale.
+/// Returns `(R, scale)` where `R` takes the frame's local axes to
+/// the world root frame and `scale = ∏ tb_scale` over every TB on
+/// the path. Identity / 1.0 for any path with no rotated nodes.
+pub(super) fn frame_path_chain(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    frame_path: &crate::world::anchor::Path,
+) -> ([[f32; 3]; 3], f32) {
+    use crate::world::gpu::TbBoundary;
+    use crate::world::tree::{Child, IDENTITY_ROTATION};
+    let mut rot = IDENTITY_ROTATION;
+    let mut scale: f32 = 1.0;
+    let mut node = world_root;
+    for k in 0..(frame_path.depth() as usize) {
+        let n = match library.get(node) {
+            Some(n) => n,
+            None => return (rot, scale),
+        };
+        match n.children[frame_path.slot(k) as usize] {
+            Child::Node(child_id) => {
+                if let Some(child_node) = library.get(child_id) {
+                    if let Some(b) = TbBoundary::from_kind(child_node.kind) {
+                        rot = matmul3x3(&rot, &b.r);
+                        scale *= b.tb_scale;
+                    }
+                }
+                node = child_id;
+            }
+            _ => return (rot, scale),
+        }
+    }
+    (rot, scale)
+}
+
+/// Rotation-only variant of [`frame_path_chain`] — convenience for
+/// callers that don't need the scale.
 pub(super) fn frame_path_rotation(
     library: &crate::world::tree::NodeLibrary,
     world_root: crate::world::tree::NodeId,
     frame_path: &crate::world::anchor::Path,
 ) -> [[f32; 3]; 3] {
-    use crate::world::tree::{Child, NodeKind, IDENTITY_ROTATION};
-    let mut rot = IDENTITY_ROTATION;
-    let mut node = world_root;
-    for k in 0..(frame_path.depth() as usize) {
-        let n = match library.get(node) {
-            Some(n) => n,
-            None => return rot,
-        };
-        match n.children[frame_path.slot(k) as usize] {
-            Child::Node(child_id) => {
-                if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
-                        rot = matmul3x3(&rot, &r);
-                    }
-                }
-                node = child_id;
-            }
-            _ => return rot,
-        }
-    }
-    rot
+    frame_path_chain(library, world_root, frame_path).0
 }
 
 fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
@@ -743,34 +751,3 @@ pub(super) fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 
     ]
 }
 
-/// Cumulative inscribed-cube shrink along a path — product of
-/// `inscribed_cube_scale(R)` over every TangentBlock encountered.
-/// Used to convert a world-frame WSAD step into the offset's
-/// (chain-rotated, chain-shrunk) frame.
-pub(super) fn frame_path_scale(
-    library: &crate::world::tree::NodeLibrary,
-    world_root: crate::world::tree::NodeId,
-    frame_path: &crate::world::anchor::Path,
-) -> f32 {
-    use crate::world::tree::{Child, NodeKind};
-    let mut scale: f32 = 1.0;
-    let mut node = world_root;
-    for k in 0..(frame_path.depth() as usize) {
-        let n = match library.get(node) {
-            Some(n) => n,
-            None => return scale,
-        };
-        match n.children[frame_path.slot(k) as usize] {
-            Child::Node(child_id) => {
-                if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
-                        scale *= crate::world::gpu::inscribed_cube_scale(&r);
-                    }
-                }
-                node = child_id;
-            }
-            _ => return scale,
-        }
-    }
-    scale
-}

@@ -36,5 +36,5 @@ mod types;
 
 pub use pack::{pack_tree, CachedTree};
 pub use ribbon::{build_ribbon, GpuRibbonEntry};
-pub(crate) use types::inscribed_cube_scale;
+pub(crate) use types::TbBoundary;
 pub use types::{GpuCamera, GpuChild, GpuEntity, GpuNodeKind};

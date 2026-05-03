@@ -69,6 +69,56 @@ fn path_mask_conservative(entry_cell: vec3<i32>, step: vec3<i32>) -> u32 {
 // entity-local units; the caller scales back to world via the
 // entity's bbox size.
 
+/// TangentBlock boundary transform — symmetric counterpart to
+/// `TbBoundary` in `world/gpu/types.rs`. The four helpers each read
+/// `(rot_col0.xyz, rot_col1.xyz, rot_col2.xyz, rot_col0.w)` from
+/// the child's `node_kinds[]` entry and apply the unified rule.
+///
+/// Descent (parent → TB-storage frame, pivot 1.5 in `[0, 3)³`):
+///     `p' = R^T · (p − pivot) / tb_scale + pivot`
+///     `d' = R^T · d / tb_scale`
+/// Pop (TB-storage → parent), the inverse:
+///     `p' = R · (p − pivot) · tb_scale + pivot`
+///     `d' = R · d · tb_scale`
+///
+/// `R` is column-major: `rc{0,1,2}` are columns; `R^T·v` is built
+/// via `dot(rcN, v)` (rows of `R^T`), and `R·v` via the column
+/// linear combination `rc0·v.x + rc1·v.y + rc2·v.z`.
+fn tb_enter_point(child_idx: u32, p: vec3<f32>, pivot: f32) -> vec3<f32> {
+    let rc0 = node_kinds[child_idx].rot_col0.xyz;
+    let rc1 = node_kinds[child_idx].rot_col1.xyz;
+    let rc2 = node_kinds[child_idx].rot_col2.xyz;
+    let s = node_kinds[child_idx].rot_col0.w;
+    let c = p - vec3<f32>(pivot);
+    return vec3<f32>(dot(rc0, c), dot(rc1, c), dot(rc2, c)) / s + vec3<f32>(pivot);
+}
+
+fn tb_enter_dir(child_idx: u32, d: vec3<f32>) -> vec3<f32> {
+    let rc0 = node_kinds[child_idx].rot_col0.xyz;
+    let rc1 = node_kinds[child_idx].rot_col1.xyz;
+    let rc2 = node_kinds[child_idx].rot_col2.xyz;
+    let s = node_kinds[child_idx].rot_col0.w;
+    return vec3<f32>(dot(rc0, d), dot(rc1, d), dot(rc2, d)) / s;
+}
+
+fn tb_exit_point(child_idx: u32, p: vec3<f32>, pivot: f32) -> vec3<f32> {
+    let rc0 = node_kinds[child_idx].rot_col0.xyz;
+    let rc1 = node_kinds[child_idx].rot_col1.xyz;
+    let rc2 = node_kinds[child_idx].rot_col2.xyz;
+    let s = node_kinds[child_idx].rot_col0.w;
+    let c = (p - vec3<f32>(pivot)) * s;
+    return rc0 * c.x + rc1 * c.y + rc2 * c.z + vec3<f32>(pivot);
+}
+
+fn tb_exit_dir(child_idx: u32, d: vec3<f32>) -> vec3<f32> {
+    let rc0 = node_kinds[child_idx].rot_col0.xyz;
+    let rc1 = node_kinds[child_idx].rot_col1.xyz;
+    let rc2 = node_kinds[child_idx].rot_col2.xyz;
+    let s = node_kinds[child_idx].rot_col0.w;
+    let v = d * s;
+    return rc0 * v.x + rc1 * v.y + rc2 * v.z;
+}
+
 /// Map an axis-aligned face normal (single ±1 component) to a face id
 /// matching the cube-face convention used by the CPU debug printer:
 /// 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z, 7=unknown / non-axis.
@@ -764,30 +814,12 @@ fn march_cartesian(
                 let scale = 3.0 / cur_cell_size;
                 let local_pre_origin = (ray_origin - child_origin_tb) * scale;
                 let local_pre_dir = ray_dir * scale;
-                // Stored rotation R has columns rc0/rc1/rc2.
-                // tb_scale is the inscribed-cube shrink factor (in
-                // rot_col0.w) so the rotated cube fits inside the
-                // parent slot bounds.
-                let rc0 = node_kinds[child_idx].rot_col0.xyz;
-                let rc1 = node_kinds[child_idx].rot_col1.xyz;
-                let rc2 = node_kinds[child_idx].rot_col2.xyz;
-                let tb_scale = node_kinds[child_idx].rot_col0.w;
-                // Centred R^T about (1.5, 1.5, 1.5), then divide by
-                // tb_scale. Rigid rotation + uniform scale is a
-                // similarity transform → t-preserving, so the inner
-                // DDA's `sub.t` is the world parameter.
-                let centered = local_pre_origin - vec3<f32>(1.5);
-                let rotated = vec3<f32>(
-                    dot(rc0, centered),
-                    dot(rc1, centered),
-                    dot(rc2, centered),
-                );
-                let local_origin = rotated / tb_scale + vec3<f32>(1.5);
-                let local_dir = vec3<f32>(
-                    dot(rc0, local_pre_dir),
-                    dot(rc1, local_pre_dir),
-                    dot(rc2, local_pre_dir),
-                ) / tb_scale;
+                // Centred R^T about (1.5, 1.5, 1.5), divide by tb_scale.
+                // Rigid rotation + uniform scale is a similarity
+                // transform → t-preserving, so the inner DDA's `sub.t`
+                // is the world parameter.
+                let local_origin = tb_enter_point(child_idx, local_pre_origin, 1.5);
+                let local_dir = tb_enter_dir(child_idx, local_pre_dir);
                 let sub = march_in_tangent_cube(child_idx, local_origin, local_dir);
                 if sub.hit {
                     let local_hit = local_origin + local_dir * sub.t;
@@ -804,7 +836,10 @@ fn march_cartesian(
                     out.t = sub.t;
                     out.color = sub.color * (0.7 + 0.3 * local_bevel);
                     // Rotate normal back to outer frame: world = R · local.
-                    // (R · v) = rc0·v.x + rc1·v.y + rc2·v.z.
+                    // No scale — normals stay unit-length under R.
+                    let rc0 = node_kinds[child_idx].rot_col0.xyz;
+                    let rc1 = node_kinds[child_idx].rot_col1.xyz;
+                    let rc2 = node_kinds[child_idx].rot_col2.xyz;
                     out.normal = rc0 * sub.normal.x
                                + rc1 * sub.normal.y
                                + rc2 * sub.normal.z;
@@ -1682,19 +1717,13 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         // (R maps child-local to parent frame).
         let child_kind = node_kinds[entry.child_bfs].kind;
         if child_kind == NODE_KIND_TANGENT_BLOCK {
-            let rc0 = node_kinds[entry.child_bfs].rot_col0.xyz;
-            let rc1 = node_kinds[entry.child_bfs].rot_col1.xyz;
-            let rc2 = node_kinds[entry.child_bfs].rot_col2.xyz;
-            let tb_scale = node_kinds[entry.child_bfs].rot_col0.w;
-            // Inverse of the entry transform: multiply centred origin
-            // and direction by tb_scale (undo the entry-side division),
-            // apply R about (1.5, 1.5, 1.5), then /3 + slot_off + 0.5
-            // to express in the parent's [0, 3)³.
-            let centered = (ray_origin - vec3<f32>(1.5)) * tb_scale;
-            let rotated = rc0 * centered.x + rc1 * centered.y + rc2 * centered.z;
-            ray_origin = slot_off + vec3<f32>(0.5) + rotated / 3.0;
-            let rd = ray_dir * tb_scale;
-            ray_dir = rc0 * rd.x + rc1 * rd.y + rc2 * rd.z;
+            // Inverse of the entry transform (`tb_exit_*` about
+            // pivot 1.5), then translate-and-scale into parent's
+            // `[0, 3)³`.
+            let parent_origin = tb_exit_point(entry.child_bfs, ray_origin, 1.5);
+            let parent_dir = tb_exit_dir(entry.child_bfs, ray_dir);
+            ray_origin = slot_off + vec3<f32>(0.5) + (parent_origin - vec3<f32>(1.5)) / 3.0;
+            ray_dir = parent_dir;
         } else {
             ray_origin = slot_off + ray_origin / 3.0;
         }

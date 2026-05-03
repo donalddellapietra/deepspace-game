@@ -121,6 +121,97 @@ pub(crate) fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
     if max_extent < 1e-6 { 1.0 } else { (1.0 / max_extent).min(1.0) }
 }
 
+/// The single TangentBlock transform applied symmetrically across
+/// shader, CPU raycast, anchor descent, and `in_frame_rot`.
+///
+/// **Descent** (parent → TB-storage frame):
+///     `p' = R^T · (p − pivot) / tb_scale + pivot`
+///     `d' = R^T · d / tb_scale`
+/// **Pop** (TB-storage → parent frame), the inverse of descent:
+///     `p' = R · (p − pivot) · tb_scale + pivot`
+///     `d' = R · d · tb_scale`
+///
+/// `pivot` is `0.5` when working in unit-cell coords (anchor
+/// descent / pop) and `1.5` when working in `[0, 3)³` coords
+/// (shader / CPU raycast).
+///
+/// Rigid rotation + uniform scale → similarity transform → ray
+/// parameter `t` is preserved between the two frames. That's why
+/// the inner DDA's `sub.t` can be used directly as the world
+/// parameter without rescaling.
+#[derive(Clone, Copy, Debug)]
+pub struct TbBoundary {
+    pub r: [[f32; 3]; 3],
+    pub tb_scale: f32,
+}
+
+impl TbBoundary {
+    /// Build a `TbBoundary` from a `TangentBlock` rotation matrix.
+    pub fn new(r: [[f32; 3]; 3]) -> Self {
+        Self { r, tb_scale: inscribed_cube_scale(&r) }
+    }
+
+    /// Build from a `NodeKind`; returns `None` for non-TB kinds.
+    pub fn from_kind(k: crate::world::tree::NodeKind) -> Option<Self> {
+        if let crate::world::tree::NodeKind::TangentBlock { rotation } = k {
+            Some(Self::new(rotation))
+        } else {
+            None
+        }
+    }
+
+    /// Descent: parent → TB-storage frame. `p' = R^T·(p−pivot)/s + pivot`.
+    pub fn enter_point(&self, p: [f32; 3], pivot: f32) -> [f32; 3] {
+        let c = [p[0] - pivot, p[1] - pivot, p[2] - pivot];
+        // R^T · c (column-major r[col][row]).
+        let rotated = [
+            self.r[0][0] * c[0] + self.r[0][1] * c[1] + self.r[0][2] * c[2],
+            self.r[1][0] * c[0] + self.r[1][1] * c[1] + self.r[1][2] * c[2],
+            self.r[2][0] * c[0] + self.r[2][1] * c[1] + self.r[2][2] * c[2],
+        ];
+        [
+            rotated[0] / self.tb_scale + pivot,
+            rotated[1] / self.tb_scale + pivot,
+            rotated[2] / self.tb_scale + pivot,
+        ]
+    }
+
+    /// Descent direction. `d' = R^T·d/s` (no pivot — directions are
+    /// translation-invariant).
+    pub fn enter_dir(&self, d: [f32; 3]) -> [f32; 3] {
+        [
+            (self.r[0][0] * d[0] + self.r[0][1] * d[1] + self.r[0][2] * d[2]) / self.tb_scale,
+            (self.r[1][0] * d[0] + self.r[1][1] * d[1] + self.r[1][2] * d[2]) / self.tb_scale,
+            (self.r[2][0] * d[0] + self.r[2][1] * d[1] + self.r[2][2] * d[2]) / self.tb_scale,
+        ]
+    }
+
+    /// Pop: TB-storage → parent frame. `p' = R·(p−pivot)·s + pivot`.
+    pub fn exit_point(&self, p: [f32; 3], pivot: f32) -> [f32; 3] {
+        let c = [
+            (p[0] - pivot) * self.tb_scale,
+            (p[1] - pivot) * self.tb_scale,
+            (p[2] - pivot) * self.tb_scale,
+        ];
+        // R · c (column-major).
+        [
+            self.r[0][0] * c[0] + self.r[1][0] * c[1] + self.r[2][0] * c[2] + pivot,
+            self.r[0][1] * c[0] + self.r[1][1] * c[1] + self.r[2][1] * c[2] + pivot,
+            self.r[0][2] * c[0] + self.r[1][2] * c[1] + self.r[2][2] * c[2] + pivot,
+        ]
+    }
+
+    /// Pop direction. `d' = R·d·s`.
+    pub fn exit_dir(&self, d: [f32; 3]) -> [f32; 3] {
+        let s = [d[0] * self.tb_scale, d[1] * self.tb_scale, d[2] * self.tb_scale];
+        [
+            self.r[0][0] * s[0] + self.r[1][0] * s[1] + self.r[2][0] * s[2],
+            self.r[0][1] * s[0] + self.r[1][1] * s[1] + self.r[2][1] * s[2],
+            self.r[0][2] * s[0] + self.r[1][2] * s[1] + self.r[2][2] * s[2],
+        ]
+    }
+}
+
 /// Camera uniforms in shader-frame coords. `pos`/`forward`/etc. are
 /// in the current render frame's local `[0, 3)³` space.
 ///
