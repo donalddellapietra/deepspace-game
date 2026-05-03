@@ -1767,6 +1767,32 @@ fn march_spherical_wrapped_plane(
 
         let sub = march_in_tangent_cube(sample.child_idx, local_origin, local_dir);
         if sub.hit {
+            // Sphere-cell mask: cells overlap in render frame (their
+            // rotated cube AABB is wider than the spacing), so the
+            // ray could be hitting content that physically belongs
+            // to a NEIGHBOUR cell. Compute the hit point's spherical
+            // coords and reject the hit if it falls outside this
+            // cell's (lon, lat, r) bin. Without this, breaking an
+            // outer cell would still show grass because adjacent
+            // cells' content extends into the broken cell's region.
+            let hit_world = ray_origin + ray_dir * sub.t;
+            let oc_h = hit_world - cs_center;
+            let r_h = length(oc_h);
+            let n_h = oc_h / r_h;
+            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
+            let lon_h = atan2(n_h.z, n_h.x);
+            let u_h = (lon_h + pi) / (2.0 * pi);
+            let v_h = (lat_h + lat_max) / (2.0 * lat_max);
+            let cx_h = clamp(i32(floor(u_h * f32(dims_x))), 0, dims_x - 1);
+            let cz_h = clamp(i32(floor(v_h * f32(dims_z))), 0, dims_z - 1);
+            let cy_h = clamp(
+                i32(floor((r_h - r_inner_render) / cell_size_render)),
+                0, dims_y - 1,
+            );
+            if cx_h != cx || cy_h != cy || cz_h != cz {
+                continue;
+            }
+
             let local_hit = local_origin + local_dir * sub.t;
             let local_in_cell = clamp(
                 (local_hit - sub.cell_min) / sub.cell_size,
@@ -1783,7 +1809,6 @@ fn march_spherical_wrapped_plane(
             out.normal = rc0 * sub.normal.x + rc1 * sub.normal.y + rc2 * sub.normal.z;
             out.frame_level = 0u;
             out.frame_scale = 1.0;
-            let hit_world = ray_origin + ray_dir * sub.t;
             out.cell_min = hit_world - vec3<f32>(0.5);
             out.cell_size = 1.0;
             return out;

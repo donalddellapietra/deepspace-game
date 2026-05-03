@@ -250,6 +250,39 @@ pub fn cpu_raycast_spherical_wrapped_planet(
             local_dir,
             sub_max_depth,
         ) {
+            // Sphere-cell mask: cells overlap in render frame, so the
+            // hit could be content belonging to a neighbour cell.
+            // Reject if the hit's spherical (cx, cy, cz) doesn't match
+            // the cell we tested. Mirrors the shader.
+            let hit_world = [
+                cam_local[0] + dir[0] * sub_hit.t,
+                cam_local[1] + dir[1] * sub_hit.t,
+                cam_local[2] + dir[2] * sub_hit.t,
+            ];
+            let oc_h = [
+                hit_world[0] - cs_center[0],
+                hit_world[1] - cs_center[1],
+                hit_world[2] - cs_center[2],
+            ];
+            let r_h = (oc_h[0] * oc_h[0] + oc_h[1] * oc_h[1] + oc_h[2] * oc_h[2]).sqrt();
+            if r_h <= 0.0 {
+                continue;
+            }
+            let n_h = [oc_h[0] / r_h, oc_h[1] / r_h, oc_h[2] / r_h];
+            let lat_h = n_h[1].clamp(-1.0, 1.0).asin();
+            let lon_h = n_h[2].atan2(n_h[0]);
+            let u_h = (lon_h + pi) / (2.0 * pi);
+            let v_h = (lat_h + lat_max) / (2.0 * lat_max);
+            let cx_h =
+                ((u_h * dims[0] as f32).floor() as i32).clamp(0, dims[0] as i32 - 1);
+            let cz_h =
+                ((v_h * dims[2] as f32).floor() as i32).clamp(0, dims[2] as i32 - 1);
+            let cy_h = (((r_h - r_inner_render) / cell_size_render).floor() as i32)
+                .clamp(0, dims[1] as i32 - 1);
+            if cx_h != cx || cy_h != cy || cz_h != cz {
+                continue;
+            }
+
             // Build a fully-qualified path from world_root.
             let mut combined_path = path;
             combined_path.extend(sub_hit.path);
