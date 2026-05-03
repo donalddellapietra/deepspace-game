@@ -548,9 +548,27 @@ impl App {
         if desired_depth < slab_depth {
             return None;
         }
-        let cell_x = uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)?;
-        let mut logical_path = self.camera.position.anchor;
-        logical_path.truncate(desired_depth);
+        let valid_cell_x = uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth);
+        let cell_x = valid_cell_x.unwrap_or_else(|| self.nearest_uv_ring_cell_x(dims));
+        let cell_local = self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x);
+        if !uv_ring_cell_local_is_near(cell_local, slab_depth) {
+            return None;
+        }
+        let mut logical_path = if valid_cell_x.is_some() {
+            let mut path = self.camera.position.anchor;
+            path.truncate(desired_depth);
+            path
+        } else {
+            let mut path = uv_ring_cell_path(cell_x, slab_depth);
+            if uv_ring_cell_local_is_inside(cell_local) {
+                append_cartesian_local_path(
+                    &mut path,
+                    cell_local,
+                    desired_depth.saturating_sub(slab_depth),
+                );
+            }
+            path
+        };
         if logical_path.depth() < slab_depth {
             logical_path = uv_ring_cell_path(cell_x, slab_depth);
         }
@@ -613,56 +631,15 @@ impl App {
     }
 
     pub(super) fn ensure_uv_ring_camera_anchor_local(&mut self) {
-        let Some(root) = self.world.library.get(self.world.root) else { return };
-        let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
-            return;
-        };
-        if dims[0] == 0 || dims[1] != 1 || dims[2] != 1 {
-            return;
-        }
-        let desired_depth = self.camera.position.anchor.depth().saturating_sub(RENDER_FRAME_K);
-        if desired_depth < slab_depth {
-            return;
-        }
-        if uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth).is_some() {
-            return;
-        }
-        let cell_x = self.nearest_uv_ring_cell_x(dims);
-        let cell_path = uv_ring_cell_path(cell_x, slab_depth);
-        let root_cam = self.camera.position.in_frame_rot(
-            &self.world.library,
-            self.world.root,
-            &Path::root(),
-        );
-        let cell_local = uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_local(root_cam);
-        if !uv_ring_cell_local_is_inside(cell_local) {
-            return;
-        }
-        let anchor_depth = self.camera.position.anchor.depth().max(slab_depth);
-        self.camera.position = WorldPos::from_frame_local(&cell_path, cell_local, anchor_depth);
+        // UvRing cell entry is a render/edit-frame choice, not a
+        // forced camera-anchor rewrite. Rewriting here clamps outside
+        // points into the tangent cube and traps the camera at the
+        // block boundary. Keep WorldPos stable; `render_frame` chooses
+        // `UvRingCell` when the camera is close enough.
     }
 
     fn exit_uv_ring_cell_if_needed(&mut self, previous_position: WorldPos) {
-        let Some(root) = self.world.library.get(self.world.root) else { return };
-        let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
-            return;
-        };
-        if uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth).is_some() {
-            return;
-        }
-        let Some(previous_cell_x) = uv_ring_cell_x_from_path(&previous_position.anchor, slab_depth)
-        else {
-            return;
-        };
-        let previous_cell_path = uv_ring_cell_path(previous_cell_x, slab_depth);
-        let local = self.camera.position.in_frame_rot(
-            &self.world.library,
-            self.world.root,
-            &previous_cell_path,
-        );
-        let root_xyz = uv_ring_cell_frame(dims, slab_depth, previous_cell_x).point_to_world(local);
-        self.camera.position =
-            WorldPos::from_frame_local(&Path::root(), root_xyz, self.camera.position.anchor.depth());
+        let _ = previous_position;
     }
 
     fn path_lands_on_tangent_block(&self, path: &Path) -> bool {
@@ -813,12 +790,19 @@ impl App {
     pub(super) fn camera_local_for_active_frame(&self, frame: &ActiveFrame) -> [f32; 3] {
         match frame.kind {
             ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
-                let _ = (dims, slab_depth, cell_x);
-                self.camera.position.in_frame_rot(
-                    &self.world.library,
-                    self.world.root,
-                    &frame.render_path,
-                )
+                if uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)
+                    == Some(cell_x)
+                {
+                    self.camera.position.in_frame_rot(
+                        &self.world.library,
+                        self.world.root,
+                        &frame.render_path,
+                    )
+                } else {
+                    let cell_local =
+                        self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x);
+                    cartesian_local_in_path_suffix(cell_local, &frame.render_path, slab_depth)
+                }
             }
             ActiveFrameKind::UvRing { dims, slab_depth } => {
                 if let Some(cell_x) =
@@ -890,6 +874,23 @@ impl App {
             crate::world::sdf::normalize(right),
             crate::world::sdf::normalize(up),
         )
+    }
+}
+
+impl App {
+    fn camera_root_to_uv_ring_cell_local(
+        &self,
+        dims: [u32; 3],
+        slab_depth: u8,
+        cell_x: u32,
+    ) -> [f32; 3] {
+        let _ = slab_depth;
+        let root_cam = self.camera.position.in_frame_rot(
+            &self.world.library,
+            self.world.root,
+            &Path::root(),
+        );
+        uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_local(root_cam)
     }
 }
 
@@ -996,6 +997,45 @@ fn cartesian_dir_in_path_suffix(mut d: [f32; 3], path: &Path, suffix_start: u8) 
     d
 }
 
+fn cartesian_local_in_path_suffix(mut p: [f32; 3], path: &Path, suffix_start: u8) -> [f32; 3] {
+    for k in suffix_start as usize..path.depth() as usize {
+        let (sx, sy, sz) = crate::world::tree::slot_coords(path.slot(k) as usize);
+        p = [
+            (p[0] - sx as f32) * 3.0,
+            (p[1] - sy as f32) * 3.0,
+            (p[2] - sz as f32) * 3.0,
+        ];
+    }
+    p
+}
+
+fn append_cartesian_local_path(path: &mut Path, mut p: [f32; 3], depth: u8) {
+    for _ in 0..depth {
+        if path.depth() as usize >= crate::world::tree::MAX_DEPTH {
+            break;
+        }
+        let sx = ternary_coord(p[0]);
+        let sy = ternary_coord(p[1]);
+        let sz = ternary_coord(p[2]);
+        path.push(crate::world::tree::slot_index(sx, sy, sz) as u8);
+        p = [
+            (p[0] - sx as f32) * 3.0,
+            (p[1] - sy as f32) * 3.0,
+            (p[2] - sz as f32) * 3.0,
+        ];
+    }
+}
+
+fn ternary_coord(v: f32) -> usize {
+    if v < 1.0 {
+        0
+    } else if v < 2.0 {
+        1
+    } else {
+        2
+    }
+}
+
 pub(super) fn uv_ring_cell_x_from_path(path: &Path, slab_depth: u8) -> Option<u32> {
     if path.depth() < slab_depth {
         return None;
@@ -1013,6 +1053,15 @@ pub(super) fn uv_ring_cell_x_from_path(path: &Path, slab_depth: u8) -> Option<u3
 
 fn uv_ring_cell_local_is_inside(p: [f32; 3]) -> bool {
     p.iter().all(|v| v.is_finite()) && p.iter().all(|&v| (0.0..3.0).contains(&v))
+}
+
+fn uv_ring_cell_local_is_near(p: [f32; 3], slab_depth: u8) -> bool {
+    const ENTRY_DEPTH: u8 = 7;
+    let extra_depth = ENTRY_DEPTH.saturating_sub(slab_depth) as i32;
+    let entry_margin = 3.0 / 3.0_f32.powi(extra_depth);
+    p.iter().all(|v| v.is_finite())
+        && p.iter()
+            .all(|&v| (-entry_margin..(3.0 + entry_margin)).contains(&v))
 }
 
 /// True iff walking `path` from `world_root` lands on a node whose
