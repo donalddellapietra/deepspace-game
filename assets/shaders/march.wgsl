@@ -875,28 +875,29 @@ fn march_cartesian(
                 // uses the NODE box (same as pre-AABB code); the
                 // cull still captures ~all the perf win.
                 //
-                // aabb_bits == 0 is a degenerate case (empty subtree
-                // edge cases during pack); treat it as the full
-                // [0, 3)^3 so behavior matches the pre-AABB code.
+                // aabb_bits == 0 means empty subtree (occupancy=0,
+                // see content_aabb in pack.rs). The Node still has a
+                // BFS entry so the ribbon can traverse it, but for
+                // rendering we skip the descent — there's nothing to
+                // hit inside.
                 let aabb_bits = aabbs[child_idx] & 0xFFFu;
-                let has_aabb = aabb_bits != 0u;
-                let amin = select(
-                    vec3<f32>(0.0),
-                    vec3<f32>(
-                        f32(aabb_bits & 3u),
-                        f32((aabb_bits >> 2u) & 3u),
-                        f32((aabb_bits >> 4u) & 3u),
-                    ),
-                    has_aabb,
+                if aabb_bits == 0u {
+                    let m_empty = min_axis_mask(cur_side_dist);
+                    s_cell[depth] = pack_cell(cell + vec3<i32>(m_empty) * step);
+                    cur_side_dist += m_empty * delta_dist * cur_cell_size;
+                    normal = -vec3<f32>(step) * m_empty;
+                    if ENABLE_STATS { ray_steps_empty = ray_steps_empty + 1u; }
+                    continue;
+                }
+                let amin = vec3<f32>(
+                    f32(aabb_bits & 3u),
+                    f32((aabb_bits >> 2u) & 3u),
+                    f32((aabb_bits >> 4u) & 3u),
                 );
-                let amax = select(
-                    vec3<f32>(3.0),
-                    vec3<f32>(
-                        f32(((aabb_bits >> 6u) & 3u) + 1u),
-                        f32(((aabb_bits >> 8u) & 3u) + 1u),
-                        f32(((aabb_bits >> 10u) & 3u) + 1u),
-                    ),
-                    has_aabb,
+                let amax = vec3<f32>(
+                    f32(((aabb_bits >> 6u) & 3u) + 1u),
+                    f32(((aabb_bits >> 8u) & 3u) + 1u),
+                    f32(((aabb_bits >> 10u) & 3u) + 1u),
                 );
                 let aabb_min_world = child_origin + amin * child_cell_size;
                 let aabb_max_world = child_origin + amax * child_cell_size;
