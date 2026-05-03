@@ -87,7 +87,13 @@ pub fn compute_render_frame(
                     }
                 }
             }
-            Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
+            child @ (Child::Block(_) | Child::Empty | Child::EntityRef(_)) => {
+                eprintln!(
+                    "compute_render_frame STOP depth={} slot={} child={:?} reached={:?}",
+                    k, slot, child, reached.as_slice(),
+                );
+                break;
+            }
         }
     }
     ActiveFrame {

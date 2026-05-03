@@ -112,7 +112,9 @@ export function DebugOverlay() {
     }
     if (s.copySeq === lastCopySeq.current) return;
     lastCopySeq.current = s.copySeq;
-    copyToClipboard(formatDebug(s)).then((ok) => {
+    const text = formatDebug(s);
+    console.log("DEBUG_COPY anchor_len=", s.anchorSlotsCsv.length, "full=", text.length);
+    copyToClipboard(text).then((ok) => {
       setFlash(ok ? "copied" : "failed");
       window.setTimeout(() => setFlash(null), 1500);
     });
