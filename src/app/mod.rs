@@ -780,10 +780,7 @@ impl App {
     pub(super) fn camera_local_for_active_frame(&self, frame: &ActiveFrame) -> [f32; 3] {
         match frame.kind {
             ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
-                let cell_local =
-                    self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x);
-                let stick_root_local = uv_ring_cell_local_to_stick_root(dims, cell_x, cell_local);
-                cartesian_local_in_path(stick_root_local, &frame.render_path)
+                self.camera_local_in_uv_ring_render_frame(dims, slab_depth, cell_x, frame)
             }
             ActiveFrameKind::UvRing { dims, slab_depth } => {
                 if let Some(cell_x) =
@@ -860,6 +857,33 @@ impl App {
 }
 
 impl App {
+    fn camera_local_in_uv_ring_render_frame(
+        &self,
+        dims: [u32; 3],
+        slab_depth: u8,
+        cell_x: u32,
+        frame: &ActiveFrame,
+    ) -> [f32; 3] {
+        let cell_frame = uv_ring_cell_frame(dims, slab_depth, cell_x);
+        let center_stick = cartesian_path_center(&frame.render_path);
+        let center_cell_local = uv_ring_stick_root_to_cell_local(dims, cell_x, center_stick);
+        let center_world = cell_frame.point_to_world(center_cell_local);
+        let center_pos = WorldPos::from_frame_local(
+            &Path::root(),
+            center_world,
+            self.camera.position.anchor.depth(),
+        );
+        let delta = self.camera.position.offset_from(&center_pos);
+        let tail_depth = frame.render_path.depth().saturating_sub(slab_depth) as i32;
+        let cell_world_size = cell_frame.side() / 3.0_f32.powi(tail_depth);
+        let to_frame = 3.0 / cell_world_size;
+        [
+            1.5 + crate::world::sdf::dot(cell_frame.tangent, delta) * to_frame,
+            1.5 + crate::world::sdf::dot(cell_frame.radial, delta) * to_frame,
+            1.5 + crate::world::sdf::dot(cell_frame.up, delta) * to_frame,
+        ]
+    }
+
     fn camera_root_to_uv_ring_cell_local(
         &self,
         dims: [u32; 3],
@@ -886,6 +910,10 @@ pub(super) struct UvRingCellFrame {
 }
 
 impl UvRingCellFrame {
+    fn side(self) -> f32 {
+        3.0 / self.scale
+    }
+
     fn point_to_local(self, p: [f32; 3]) -> [f32; 3] {
         let d = crate::world::sdf::sub(p, self.origin);
         [
@@ -972,23 +1000,29 @@ pub(super) fn uv_ring_cell_path(cell_x: u32, slab_depth: u8) -> Path {
     path
 }
 
+fn cartesian_path_center(path: &Path) -> [f32; 3] {
+    let mut origin = [0.0f32; 3];
+    let mut size = crate::world::anchor::WORLD_SIZE;
+    for k in 0..path.depth() as usize {
+        let (sx, sy, sz) = crate::world::tree::slot_coords(path.slot(k) as usize);
+        let child = size / 3.0;
+        origin[0] += sx as f32 * child;
+        origin[1] += sy as f32 * child;
+        origin[2] += sz as f32 * child;
+        size = child;
+    }
+    [
+        origin[0] + size * 0.5,
+        origin[1] + size * 0.5,
+        origin[2] + size * 0.5,
+    ]
+}
+
 fn cartesian_dir_in_path(mut d: [f32; 3], path: &Path) -> [f32; 3] {
     for _ in 0..path.depth() as usize {
         d = [d[0] * 3.0, d[1] * 3.0, d[2] * 3.0];
     }
     d
-}
-
-fn cartesian_local_in_path(mut p: [f32; 3], path: &Path) -> [f32; 3] {
-    for k in 0..path.depth() as usize {
-        let (sx, sy, sz) = crate::world::tree::slot_coords(path.slot(k) as usize);
-        p = [
-            (p[0] - sx as f32) * 3.0,
-            (p[1] - sy as f32) * 3.0,
-            (p[2] - sz as f32) * 3.0,
-        ];
-    }
-    p
 }
 
 fn append_cartesian_local_path(path: &mut Path, mut p: [f32; 3], depth: u8) {
@@ -1018,16 +1052,17 @@ fn ternary_coord(v: f32) -> usize {
     }
 }
 
-fn uv_ring_cell_local_to_stick_root(
+fn uv_ring_stick_root_to_cell_local(
     dims: [u32; 3],
     cell_x: u32,
-    cell_local: [f32; 3],
+    stick_root: [f32; 3],
 ) -> [f32; 3] {
     let cell_size = crate::world::anchor::WORLD_SIZE / dims[0] as f32;
+    let scale = crate::world::anchor::WORLD_SIZE / cell_size;
     [
-        cell_x as f32 * cell_size + cell_local[0] * (cell_size / crate::world::anchor::WORLD_SIZE),
-        cell_local[1] * (cell_size / crate::world::anchor::WORLD_SIZE),
-        cell_local[2] * (cell_size / crate::world::anchor::WORLD_SIZE),
+        (stick_root[0] - cell_x as f32 * cell_size) * scale,
+        stick_root[1] * scale,
+        stick_root[2] * scale,
     ]
 }
 
