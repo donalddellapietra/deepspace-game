@@ -1731,12 +1731,34 @@ fn march_spherical_wrapped_plane(
         if sample.tag != 2u { continue; }
 
         let cell_kind = node_kinds[sample.child_idx];
-        let cell_natural_lower = vec3<f32>(f32(cx), f32(cy), f32(cz)) * cell_size_wp;
-        let cell_actual_lower_render = body_origin
-            + cell_natural_lower * wp_to_render
-            + cell_kind.cell_offset.xyz * cell_size_render;
+        // The cell content is a rotated cube of side `cell_size_render`
+        // in render frame. Its AABB is `cell_size_render / inscribed_scale`
+        // wide — bigger than the storage [0, 3)³ once you account for
+        // rotation. We need our cell-box to MATCH the rotated cube's
+        // AABB so `march_in_tangent_cube`'s storage clip doesn't cut
+        // off the AABB-corners. Compute inscribed_scale from R columns.
+        let r0 = cell_kind.rot_col0.xyz;
+        let r1 = cell_kind.rot_col1.xyz;
+        let r2 = cell_kind.rot_col2.xyz;
+        let extent = vec3<f32>(
+            abs(r0.x) + abs(r1.x) + abs(r2.x),
+            abs(r0.y) + abs(r1.y) + abs(r2.y),
+            abs(r0.z) + abs(r1.z) + abs(r2.z),
+        );
+        let max_extent = max(max(extent.x, extent.y), extent.z);
+        let aabb_factor = max(max_extent, 1.0);
+        let aabb_size_render = cell_size_render * aabb_factor;
 
-        let scale = 3.0 / cell_size_render;
+        // Cell content centre in render = sphere_pos = bootstrap's
+        // `cell_natural_lower * wp_to_render + 0.5 * cell_size_render
+        // + cell_offset * cell_size_render`. The AABB centre matches
+        // (centred at cell content centre).
+        let cell_content_centre = body_origin
+            + (cell_natural_lower + vec3<f32>(0.5 * cell_size_wp)) * wp_to_render
+            + cell_kind.cell_offset.xyz * cell_size_render;
+        let cell_actual_lower_render = cell_content_centre - vec3<f32>(0.5 * aabb_size_render);
+
+        let scale = 3.0 / aabb_size_render;
         let local_pre_origin = (ray_origin - cell_actual_lower_render) * scale;
         let local_pre_dir = ray_dir * scale;
         let local_origin = tb_enter_point(sample.child_idx, local_pre_origin, 1.5);
