@@ -105,9 +105,20 @@ pub fn spherical_wrapped_planet_world(
         let lon_c = -std::f32::consts::PI
             + (lon_idx as f32 + 0.5) / n_lng as f32 * std::f32::consts::TAU;
         let lat_c = -lat_max + (lat_idx as f32 + 0.5) / n_lat as f32 * 2.0 * lat_max;
-        // Radial position: r_idx=0 at body_radius, each successive
-        // shell one cell_size further out.
-        let r_c = body_radius_wp + (r_idx as f32 + 0.5) * cell_size_wp;
+        // Radial position: cells stack INWARD from body_radius.
+        // r_idx=N_r-1 is the OUTERMOST shell (at body_radius − ½·cell_size);
+        // r_idx=0 is the INNERMOST (at body_radius − (N_r−½)·cell_size).
+        // This matches the shader's `r_p` → `cy` inverse mapping
+        // `r_p = r_inner + (cy + 0.5)·cell_size_render`, so the cell
+        // the shader looks for at cy=r_idx is the SAME cell the
+        // bootstrap places at r_idx. (Earlier the formula was
+        // `body_radius + (r_idx + 0.5)·cell_size` — pointing OUTWARD,
+        // which placed cells outside the shader's expected radial
+        // band; cells rendered but at world positions inconsistent
+        // with the ray's spherical intersection, making blocks
+        // appear to drift as the camera moved.)
+        let r_c = body_radius_wp
+            - (n_r as f32 - r_idx as f32 - 0.5) * cell_size_wp;
         let cos_lat = lat_c.cos();
         let sin_lat = lat_c.sin();
         let cos_lon = lon_c.cos();
