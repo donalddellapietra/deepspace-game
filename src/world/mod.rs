@@ -1,6 +1,5 @@
 pub mod aabb;
 pub mod anchor;
-pub mod anchor_extend;
 pub mod bootstrap;
 pub mod edit;
 pub mod entities;
