@@ -196,6 +196,35 @@ impl TestConfig {
                 "--rotated-cube-test" => {
                     cfg.world_preset = WorldPreset::RotatedCubeTest;
                 }
+                // Step-2 multi-TB primitive: unrotated centre cube
+                // with six face-aligned TangentBlocks around it (a
+                // 3D plus / cross). Validates multi-TB navigation
+                // — the camera moves between face cubes only via
+                // the centre, exercising pop+redescend with two
+                // distinct rotations per transition.
+                "--cube-faces-test" => {
+                    cfg.world_preset = WorldPreset::CubeFacesTest;
+                }
+                // Step-3 multi-TB primitive: 12 face-oriented
+                // TangentBlocks at the rhombic-dodecahedron face
+                // directions (= cube edge directions = FCC neighbour
+                // set), plus an unrotated centre. Validates 12
+                // distinct non-axis-aligned rotations at one tree
+                // level; corners poke into adjacent slots since
+                // tb_scale = 1 (visual only, not a math bug).
+                "--rhombic-dodecahedron-test" => {
+                    cfg.world_preset = WorldPreset::RhombicDodecahedronTest;
+                }
+                // Step-4 multi-TB primitive: 12 TangentBlocks at the
+                // *regular* dodecahedron face normals — golden-ratio
+                // directions `(0, ±1, ±φ)` and cyclic permutations.
+                // Same 12 cube-edge slots as `--rhombic-dodecahedron-test`,
+                // but the rotations are non-axis-aligned (~32° tilt
+                // off the slot direction). Stresses `renormalize_world`
+                // against twelve distinct non-axis-aligned rotations.
+                "--dodecahedron-test" => {
+                    cfg.world_preset = WorldPreset::DodecahedronTest;
+                }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
