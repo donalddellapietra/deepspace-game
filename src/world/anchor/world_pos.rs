@@ -4,6 +4,7 @@
 
 use super::path::{Path, Transition};
 use super::WORLD_SIZE;
+use crate::world::gpu::inscribed_cube_scale;
 use crate::world::tree::{
     slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH,
 };
@@ -246,16 +247,72 @@ impl WorldPos {
     /// Restores the `[0, 1)` invariant via `renormalize_world` so
     /// motion across a `WrappedPlane` boundary wraps modulo the
     /// slab dims rather than bubbling out of the slab subtree.
+    ///
+    /// **TB-boundary continuity.** `renormalize_world` is pure
+    /// Cartesian: when a step descends into a `TangentBlock`, it
+    /// picks the deepest slot via `floor(offset * 3)` in Cartesian,
+    /// but the TB's children are stored in the rotated/inscribed
+    /// storage frame. The wrong slot picks a different physical
+    /// region of the TB, so the resulting `(anchor, offset)`
+    /// represents a different world position than the camera was
+    /// continuously moving through — the visible "wild jump" at
+    /// TB-on-anchor crossings.
+    ///
+    /// To preserve world-position continuity: snapshot the pre-move
+    /// `WorldPos` (kept as anchor coords — precision-safe at any
+    /// depth), let the Cartesian renormalize run, and if the anchor
+    /// changed, re-derive `(anchor, offset)` from the intended
+    /// post-move world position via a rotation-aware walk (`R^T ·
+    /// /tb_scale` at every TB on the path). The reconstruction frame
+    /// is the deepest common ancestor of the pre- and post-anchors,
+    /// so f32 precision is bounded by that ancestor's cell size — not
+    /// by absolute world coordinates.
     pub fn add_local(
         &mut self,
         delta: [f32; 3],
         library: &NodeLibrary,
         world_root: NodeId,
     ) -> Transition {
+        let pre = *self;
         for i in 0..3 {
             self.offset[i] += delta[i];
         }
-        self.renormalize_world(library, world_root)
+        let trans = self.renormalize_world(library, world_root);
+
+        if pre.anchor != self.anchor {
+            let target_depth = pre.anchor.depth();
+            let common = pre.anchor.common_prefix_len(&self.anchor);
+            let mut frame_path = pre.anchor;
+            frame_path.truncate(common);
+            // Pre's position in `frame_path`-local Cartesian, in
+            // [0, WORLD_SIZE)³. Rotation-aware: walks bottom-up
+            // applying `R · *tb_scale` at every TB-leaving step, so
+            // pre's world XYZ is correct even when its tail crosses
+            // TB ancestors.
+            let pre_in_frame =
+                pre.in_frame_rot(library, world_root, &frame_path);
+            // `delta` is in units of the *deepest* cell. Express it in
+            // `frame_path`-local units: deepest_cell_size_in_frame =
+            // WORLD_SIZE / 3^(pre_depth − common_depth).
+            let mut delta_scale = WORLD_SIZE;
+            for _ in 0..(pre.anchor.depth() - common) {
+                delta_scale /= 3.0;
+            }
+            let target_in_frame = [
+                pre_in_frame[0] + delta[0] * delta_scale,
+                pre_in_frame[1] + delta[1] * delta_scale,
+                pre_in_frame[2] + delta[2] * delta_scale,
+            ];
+            *self = Self::from_frame_xyz_rot(
+                &frame_path,
+                target_in_frame,
+                target_depth,
+                library,
+                world_root,
+            );
+        }
+
+        trans
     }
 
     /// Push a new slot under the current offset. Offset rescaled so
@@ -469,30 +526,120 @@ impl WorldPos {
         ]
     }
 
-    /// Rotation-aware variant of [`in_frame`]. When the anchor path
-    /// crosses a `NodeKind::TangentBlock` whose stored rotation is
-    /// non-identity, every slot offset *past that node* and the final
-    /// `offset` are rotated by the cumulative chain rotation around
-    /// each enclosing cube's geometric centre. Frame-local throughout
-    /// — never world-absolute. For all-Cartesian paths, the result is
-    /// bit-identical to [`in_frame`].
+    /// Rotation-aware variant of [`in_frame`]. When the camera's
+    /// anchor path crosses a `NodeKind::TangentBlock` between
+    /// `frame.depth()` and `self.anchor.depth()`, the offset's
+    /// effective frame inside that TB is the rotated/inscribed
+    /// storage frame; expressing the camera in the parent's frame
+    /// requires applying `R · *tb_scale` about the TB's centre.
     ///
-    /// Pure Cartesian wrapper preserved for API compatibility. The
-    /// anchor representation is purely Cartesian — TB rotation/scale
-    /// is a shader-side rendering effect (`tb_scale` in `rot_col0.w`
-    /// of `GpuNodeKind`), not a property of the path. So the world
-    /// position derived from `(anchor, offset)` is always the plain
-    /// Cartesian walk.
+    /// Algorithm: bottom-up walk from `self.anchor.depth()` to
+    /// `frame.depth()`, in [0, 1)³ cell-local frame at each level.
+    /// At the step from depth `d+1` to `d`, the cell at depth `d+1`
+    /// is the one being LEFT — if it's a TB, apply `R · *tb_scale`
+    /// about (0.5, 0.5, 0.5) to convert pos from the TB's interior
+    /// (storage) to its external (parent's children) frame. Then
+    /// compose with the slot in the parent's children frame:
+    /// `pos_new = (slot_xyz + pos) / 3`.
     ///
-    /// `library` and `world_root` are accepted for signature
-    /// compatibility with callers from when this was rotation-aware.
+    /// Result is in `frame`'s `[0, WORLD_SIZE)³` interior frame
+    /// (= `frame`'s children frame). For Cartesian-only paths, the
+    /// result is bit-identical to [`in_frame`] (R never fires).
+    ///
+    /// **Precision-safe.** All arithmetic stays in `[0, 1)³`
+    /// fractions plus integer slots — magnitudes never exceed a
+    /// single cell, so f32 precision is bounded by cell-fraction,
+    /// not by absolute world coordinates. The final `× WORLD_SIZE`
+    /// scale-up to `[0, WORLD_SIZE)³` happens once at the end.
+    ///
+    /// Requires `frame` to be a strict prefix of `self.anchor` (the
+    /// usual case for the camera's render frame). Falls back to
+    /// `in_frame` for non-prefix frames; rotation-aware handling for
+    /// divergent paths is currently out of scope (no caller needs it).
     pub fn in_frame_rot(
         &self,
-        _library: &NodeLibrary,
-        _world_root: NodeId,
+        library: &NodeLibrary,
+        world_root: NodeId,
         frame: &Path,
     ) -> [f32; 3] {
-        self.in_frame(frame)
+        let depth = self.anchor.depth() as usize;
+        let frame_depth = frame.depth() as usize;
+        let common = self.anchor.common_prefix_len(frame) as usize;
+        if common < frame_depth {
+            // Diverges from frame — bail out to Cartesian in_frame
+            // (covers the rare "frame is sibling of anchor" case).
+            return self.in_frame(frame);
+        }
+
+        // kinds[k] = NodeKind at tree depth k along self.anchor;
+        // i.e., kinds[0] = world root, kinds[depth] = the deepest cell.
+        let mut kinds: [Option<NodeKind>; MAX_DEPTH + 1] =
+            [None; MAX_DEPTH + 1];
+        let mut node = world_root;
+        kinds[0] = library.get(node).map(|n| n.kind);
+        for k in 0..depth {
+            let n = match library.get(node) {
+                Some(n) => n,
+                None => break,
+            };
+            match n.children[self.anchor.slot(k) as usize] {
+                Child::Node(child) => {
+                    node = child;
+                    kinds[k + 1] = library.get(node).map(|n| n.kind);
+                }
+                _ => break,
+            }
+        }
+
+        // pos lives in cell-at-depth-d's [0, 1)³ interior frame.
+        let mut pos = self.offset;
+        for d in (frame_depth..depth).rev() {
+            // Going up from the cell at depth `d+1` (kinds[d+1]) to
+            // its parent (the cell at depth `d`). If the child cell
+            // is a TB, its interior is storage-frame; convert pos to
+            // the parent's children frame (Cartesian view of TB)
+            // before the slot composition.
+            if let Some(NodeKind::TangentBlock { rotation: r }) =
+                kinds[d + 1]
+            {
+                let s = inscribed_cube_scale(&r);
+                let centered =
+                    [pos[0] - 0.5, pos[1] - 0.5, pos[2] - 0.5];
+                // R · centered (`r` stores R^T per `from_world_xyz`,
+                // so applying R is the transposed multiply).
+                let rotated = [
+                    r[0][0] * centered[0]
+                        + r[1][0] * centered[1]
+                        + r[2][0] * centered[2],
+                    r[0][1] * centered[0]
+                        + r[1][1] * centered[1]
+                        + r[2][1] * centered[2],
+                    r[0][2] * centered[0]
+                        + r[1][2] * centered[1]
+                        + r[2][2] * centered[2],
+                ];
+                pos = [
+                    rotated[0] * s + 0.5,
+                    rotated[1] * s + 0.5,
+                    rotated[2] * s + 0.5,
+                ];
+            }
+            let slot = self.anchor.slot(d) as usize;
+            let (sx, sy, sz) = slot_coords(slot);
+            pos = [
+                (sx as f32 + pos[0]) / 3.0,
+                (sy as f32 + pos[1]) / 3.0,
+                (sz as f32 + pos[2]) / 3.0,
+            ];
+        }
+
+        // pos is in frame's [0, 1)³ interior frame. Scale to
+        // [0, WORLD_SIZE)³ to match the in_frame contract.
+        [
+            pos[0] * WORLD_SIZE,
+            pos[1] * WORLD_SIZE,
+            pos[2] * WORLD_SIZE,
+        ]
     }
 
     /// Build a `WorldPos` at `anchor_depth` whose frame-local
@@ -524,6 +671,133 @@ impl WorldPos {
             ((clamped[0] - origin[0]) / size).clamp(0.0, 1.0 - f32::EPSILON),
             ((clamped[1] - origin[1]) / size).clamp(0.0, 1.0 - f32::EPSILON),
             ((clamped[2] - origin[2]) / size).clamp(0.0, 1.0 - f32::EPSILON),
+        ];
+        Self { anchor, offset }
+    }
+
+    /// Rotation-aware variant of [`from_frame_local`]. Walks
+    /// `frame → anchor_depth` applying `R^T · /tb_scale` about
+    /// `(1.5, 1.5, 1.5)` at every `TangentBlock` along the way, so
+    /// the resulting `(anchor, offset)` correctly represents `xyz`
+    /// in `frame`-local coords even when the descent crosses
+    /// rotated/inscribed subtrees.
+    ///
+    /// Inverse of [`in_frame_rot`]. Used by [`add_local`] to restore
+    /// world-position continuity after a Cartesian renormalize
+    /// crosses a TB boundary: snapshot pre-move position in
+    /// `frame_path`-local Cartesian, then re-derive `(anchor,
+    /// offset)` such that its world-XYZ matches `pre + delta`.
+    ///
+    /// Precondition: `frame.depth() ≤ anchor_depth ≤ MAX_DEPTH`, and
+    /// `xyz ∈ [0, WORLD_SIZE)³` (`frame`-local). Out-of-range `xyz`
+    /// is clamped.
+    pub fn from_frame_xyz_rot(
+        frame: &Path,
+        xyz: [f32; 3],
+        anchor_depth: u8,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) -> Self {
+        debug_assert!(anchor_depth >= frame.depth());
+        let clamped = [
+            xyz[0].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[1].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            xyz[2].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+        ];
+        // Walk world_root → frame.depth() to find the node sitting at
+        // `frame`. From there, descend `anchor_depth - frame.depth()`
+        // levels rotation-aware.
+        let mut node = world_root;
+        let mut have_node = true;
+        for k in 0..(frame.depth() as usize) {
+            if !have_node {
+                break;
+            }
+            let n = match library.get(node) {
+                Some(n) => n,
+                None => {
+                    have_node = false;
+                    break;
+                }
+            };
+            match n.children[frame.slot(k) as usize] {
+                Child::Node(child) => node = child,
+                _ => {
+                    have_node = false;
+                    break;
+                }
+            }
+        }
+
+        let mut anchor = *frame;
+        // `pos` lives in the current node's local `[0, WORLD_SIZE)³`
+        // frame; for descendants of a TB this becomes the storage-
+        // frame local coord after the TB's `R^T · /tb_scale`.
+        let mut pos = clamped;
+
+        for _ in frame.depth()..anchor_depth {
+            if have_node {
+                if let Some(n) = library.get(node) {
+                    if let NodeKind::TangentBlock { rotation: r } =
+                        n.kind
+                    {
+                        let s = inscribed_cube_scale(&r);
+                        let centered = [
+                            pos[0] - 1.5,
+                            pos[1] - 1.5,
+                            pos[2] - 1.5,
+                        ];
+                        // R^T · centered (column-major `r[col][row]`
+                        // applied as `rotated[i] = r[i][j] * v[j]`).
+                        let rotated = [
+                            r[0][0] * centered[0]
+                                + r[0][1] * centered[1]
+                                + r[0][2] * centered[2],
+                            r[1][0] * centered[0]
+                                + r[1][1] * centered[1]
+                                + r[1][2] * centered[2],
+                            r[2][0] * centered[0]
+                                + r[2][1] * centered[1]
+                                + r[2][2] * centered[2],
+                        ];
+                        // Inscribed-cube scale: divide by tb_scale to
+                        // un-shrink the storage frame so children sit
+                        // at integer slot positions in [0, 3)³.
+                        let inv_s = if s > 1e-6 { 1.0 / s } else { 1.0 };
+                        pos = [
+                            rotated[0] * inv_s + 1.5,
+                            rotated[1] * inv_s + 1.5,
+                            rotated[2] * inv_s + 1.5,
+                        ];
+                    }
+                }
+            }
+            let sx = (pos[0].floor() as i32).clamp(0, 2) as usize;
+            let sy = (pos[1].floor() as i32).clamp(0, 2) as usize;
+            let sz = (pos[2].floor() as i32).clamp(0, 2) as usize;
+            let slot = slot_index(sx, sy, sz);
+            anchor.push(slot as u8);
+            pos = [
+                (pos[0] - sx as f32) * 3.0,
+                (pos[1] - sy as f32) * 3.0,
+                (pos[2] - sz as f32) * 3.0,
+            ];
+            if have_node {
+                if let Some(n) = library.get(node) {
+                    match n.children[slot] {
+                        Child::Node(child) => node = child,
+                        _ => have_node = false,
+                    }
+                } else {
+                    have_node = false;
+                }
+            }
+        }
+
+        let offset = [
+            (pos[0] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+            (pos[1] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+            (pos[2] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
         ];
         Self { anchor, offset }
     }
