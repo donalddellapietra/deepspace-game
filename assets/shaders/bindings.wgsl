@@ -101,6 +101,7 @@ const ROOT_KIND_CARTESIAN: u32 = 0u;
 /// Cartesian (the marcher does not branch on root_kind). Phase 2 will
 /// hook X-wrap on this kind; Phase 3 will hook curvature.
 const ROOT_KIND_WRAPPED_PLANE: u32 = 1u;
+const ROOT_KIND_UV_RING: u32 = 2u;
 
 /// One entry in the ancestor ribbon. `node_idx` is the buffer
 /// index of the ancestor's node. `slot_bits` packs:
@@ -120,7 +121,7 @@ const RIBBON_SLOT_MASK: u32 = 0x1Fu;
 const RIBBON_SIBLINGS_ALL_EMPTY: u32 = 0x80000000u;
 
 struct NodeKindGpu {
-    kind: u32,        // 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock
+    kind: u32,        // 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock, 3 = UvRing
     dims_x: u32,
     dims_y: u32,
     dims_z: u32,
@@ -136,6 +137,7 @@ struct NodeKindGpu {
 const NODE_KIND_CARTESIAN: u32 = 0u;
 const NODE_KIND_WRAPPED_PLANE: u32 = 1u;
 const NODE_KIND_TANGENT_BLOCK: u32 = 2u;
+const NODE_KIND_UV_RING: u32 = 3u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated

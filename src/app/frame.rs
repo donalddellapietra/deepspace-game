@@ -20,6 +20,7 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
+    UvRing { dims: [u32; 3], slab_depth: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,6 +91,9 @@ fn active_frame_kind_for_node(library: &NodeLibrary, node_id: NodeId) -> ActiveF
     match library.get(node_id).map(|n| n.kind) {
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
+        }
+        Some(NodeKind::UvRing { dims, slab_depth }) => {
+            ActiveFrameKind::UvRing { dims, slab_depth }
         }
         _ => ActiveFrameKind::Cartesian,
     }

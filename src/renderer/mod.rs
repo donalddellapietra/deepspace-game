@@ -52,6 +52,7 @@ pub const MAX_RIBBON_LEN: usize = 64;
 /// curvature dispatch.
 pub const ROOT_KIND_CARTESIAN: u32 = 0;
 pub const ROOT_KIND_WRAPPED_PLANE: u32 = 1;
+pub const ROOT_KIND_UV_RING: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -334,6 +335,12 @@ impl Renderer {
     /// units; `dims_y` / `dims_z` are reserved for Phase 3.
     pub fn set_root_kind_wrapped_plane(&mut self, dims: [u32; 3], slab_depth: u8) {
         self.root_kind = ROOT_KIND_WRAPPED_PLANE;
+        self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
+        self.write_uniforms();
+    }
+
+    pub fn set_root_kind_uv_ring(&mut self, dims: [u32; 3], slab_depth: u8) {
+        self.root_kind = ROOT_KIND_UV_RING;
         self.slab_dims = [dims[0], dims[1], dims[2], slab_depth as u32];
         self.write_uniforms();
     }

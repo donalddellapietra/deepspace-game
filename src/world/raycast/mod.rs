@@ -8,8 +8,10 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
+mod uv_ring;
 mod wrapped_planet;
 
+pub use uv_ring::cpu_raycast_uv_ring;
 pub use wrapped_planet::cpu_raycast_wrapped_planet;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};

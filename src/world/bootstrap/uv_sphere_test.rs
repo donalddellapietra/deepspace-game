@@ -1,11 +1,11 @@
 //! UV-sphere tangent-cell test world.
 //!
-//! This is the UV analogue of `dodecahedron_test`: many tangent
-//! cells are placed as real Cartesian tree cells on a spherical shell,
-//! and each cell is a placed tangent instance carrying the lat/lon
-//! tangent basis that maps storage +Y to the local radial normal.
-//! The sphere shape therefore comes from actual tree placement, not
-//! from a special WrappedPlane shader reinterpretation.
+//! Diagnostic UV ring world.
+//!
+//! Content is stored as a straight `[27, 1, 1]` UV lattice under a
+//! `UvRing` root. The render path maps that one row into a ring, so
+//! placement and tangent rotation come from the same UV coordinate
+//! instead of rounded Cartesian sphere samples.
 
 use super::WorldBootstrap;
 use crate::world::anchor::WorldPos;
@@ -15,53 +15,30 @@ use crate::world::tree::{
     empty_children, slot_index, uniform_children, Child, NodeKind, NodeLibrary,
 };
 
-const GRID_DEPTH: u8 = 4; // 3^4 = 81 cells per axis.
-const GRID_SIZE: usize = 81;
+const GRID_DEPTH: u8 = super::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH;
+const GRID_SIZE: usize = 27;
 const CELL_SUBTREE_DEPTH: u8 = 20;
-const SPHERE_RADIUS_CELLS: f32 = 36.0;
-const TARGET_CENTER_SPACING: f32 = 0.85;
-const LAT_RINGS: u32 = 107;
-const GLOBAL_LONGITUDES: u32 = 256;
-const LAT_MAX: f32 = 1.26;
+const RING_DIMS: [u32; 3] = [super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 1];
 
 #[inline]
+#[cfg(test)]
 fn normalize(v: [f32; 3]) -> [f32; 3] {
     let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
     [v[0] / m, v[1] / m, v[2] / m]
 }
 
 #[inline]
-fn ring_longitude_cells(lat: f32) -> u32 {
-    let circumference = 2.0 * std::f32::consts::PI * SPHERE_RADIUS_CELLS * lat.cos().abs();
-    (circumference / TARGET_CENTER_SPACING).ceil().max(8.0) as u32
-}
-
-#[inline]
-fn tangent_rotation_for_lat_lon(lat: f32, lon: f32) -> [[f32; 3]; 3] {
+#[cfg(test)]
+fn tangent_rotation_for_ring_cell(cell_x: u32) -> [[f32; 3]; 3] {
+    let lat = 0.0f32;
+    let lon = -std::f32::consts::PI
+        + (cell_x as f32 + 0.5) * (2.0 * std::f32::consts::PI / RING_DIMS[0] as f32);
     let (sl, cl) = lat.sin_cos();
     let (so, co) = lon.sin_cos();
     let east = normalize([-so, 0.0, co]);
     let radial = normalize([cl * co, sl, cl * so]);
     let north = normalize([-sl * co, cl, -sl * so]);
     [east, radial, north]
-}
-
-#[inline]
-fn uv_lat_for_ring(ring: u32) -> f32 {
-    let lat_step = 2.0 * LAT_MAX / LAT_RINGS as f32;
-    -LAT_MAX + (ring as f32 + 0.5) * lat_step
-}
-
-#[inline]
-fn uv_lon_for_lattice_cell(cell_x: u32) -> f32 {
-    let pi = std::f32::consts::PI;
-    -pi + (cell_x as f32 + 0.5) * (2.0 * pi / GLOBAL_LONGITUDES as f32)
-}
-
-#[inline]
-fn longitude_stride_for_ring(lat: f32) -> u32 {
-    let target = ring_longitude_cells(lat).min(GLOBAL_LONGITUDES);
-    GLOBAL_LONGITUDES.div_ceil(target).max(1)
 }
 
 fn build_uniform_cartesian_subtree(
@@ -76,22 +53,12 @@ fn build_uniform_cartesian_subtree(
     Child::Node(library.insert(uniform_children(inner)))
 }
 
-fn build_tangent_cell(content: Child, rotation: [[f32; 3]; 3]) -> Child {
-    let Child::Node(node) = content else {
-        panic!("tangent cell content must be a node");
-    };
-    Child::PlacedNode {
-        node,
-        kind: NodeKind::TangentBlock { rotation },
-    }
-}
-
 #[inline]
 fn grid_index(x: usize, y: usize, z: usize) -> usize {
     (z * GRID_SIZE + y) * GRID_SIZE + x
 }
 
-fn build_grid_tree(library: &mut NodeLibrary, leaves: Vec<Child>) -> Child {
+fn build_grid_tree(library: &mut NodeLibrary, leaves: Vec<Child>, root_kind: NodeKind) -> Child {
     let mut size = GRID_SIZE;
     let mut layer = leaves;
     while size > 1 {
@@ -113,10 +80,11 @@ fn build_grid_tree(library: &mut NodeLibrary, leaves: Vec<Child>) -> Child {
                             }
                         }
                     }
+                    let kind = if next_size == 1 { root_kind } else { NodeKind::Cartesian };
                     next[(z * next_size + y) * next_size + x] = if children.iter().all(|c| c.is_empty()) {
                         Child::Empty
                     } else {
-                        Child::Node(library.insert(children))
+                        Child::Node(library.insert_with_kind(children, kind))
                     };
                 }
             }
@@ -133,38 +101,16 @@ pub(super) fn uv_sphere_test_world() -> WorldState {
     let mut leaves = vec![Child::Empty; GRID_SIZE * GRID_SIZE * GRID_SIZE];
     let tangent_content =
         build_uniform_cartesian_subtree(&mut library, block::GRASS, CELL_SUBTREE_DEPTH);
-    let centre = (GRID_SIZE as f32 - 1.0) * 0.5;
-    let radius = SPHERE_RADIUS_CELLS;
-    let mut occupied = std::collections::HashSet::new();
-
-    for v in 0..LAT_RINGS {
-        let lat = uv_lat_for_ring(v);
-        let stride = longitude_stride_for_ring(lat);
-        let mut u = 0;
-        while u < GLOBAL_LONGITUDES {
-            let cell_x = u;
-            u += stride;
-            let lon = uv_lon_for_lattice_cell(cell_x);
-            let rotation = tangent_rotation_for_lat_lon(lat, lon);
-            let radial = rotation[1];
-            let gx = (centre + radial[0] * radius).round() as i32;
-            let gy = (centre + radial[1] * radius).round() as i32;
-            let gz = (centre + radial[2] * radius).round() as i32;
-            if !(0..GRID_SIZE as i32).contains(&gx)
-                || !(0..GRID_SIZE as i32).contains(&gy)
-                || !(0..GRID_SIZE as i32).contains(&gz)
-            {
-                continue;
-            }
-            let idx = grid_index(gx as usize, gy as usize, gz as usize);
-            if !occupied.insert(idx) {
-                continue;
-            }
-            leaves[idx] = build_tangent_cell(tangent_content, rotation);
-        }
+    for x in 0..RING_DIMS[0] as usize {
+        let idx = grid_index(x, 0, 0);
+        leaves[idx] = tangent_content;
     }
 
-    let root_child = build_grid_tree(&mut library, leaves);
+    let root_child = build_grid_tree(
+        &mut library,
+        leaves,
+        NodeKind::UvRing { dims: RING_DIMS, slab_depth: GRID_DEPTH },
+    );
     let root = match root_child {
         Child::Node(id) => id,
         _ => library.insert(empty_children()),
@@ -172,12 +118,11 @@ pub(super) fn uv_sphere_test_world() -> WorldState {
     library.ref_inc(root);
     let world = WorldState { root, library };
     eprintln!(
-        "uv_sphere_test world: tree_depth={} library_entries={} lat_rings={} global_longitudes={} radius_cells={}",
+        "uv_sphere_test uv-ring world: tree_depth={} library_entries={} ring_dims={:?} slab_depth={}",
         world.tree_depth(),
         world.library.len(),
-        LAT_RINGS,
-        GLOBAL_LONGITUDES,
-        SPHERE_RADIUS_CELLS,
+        RING_DIMS,
+        GRID_DEPTH,
     );
     world
 }
@@ -214,10 +159,8 @@ mod tests {
 
     #[test]
     fn rotations_are_lat_lon_dependent_and_radial() {
-        let lat = uv_lat_for_ring(LAT_RINGS / 2);
-        let stride = longitude_stride_for_ring(lat);
-        let a = tangent_rotation_for_lat_lon(lat, uv_lon_for_lattice_cell(0));
-        let b = tangent_rotation_for_lat_lon(lat, uv_lon_for_lattice_cell(stride));
+        let a = tangent_rotation_for_ring_cell(0);
+        let b = tangent_rotation_for_ring_cell(1);
         assert_ne!(a, b);
         let radial = a[1];
         let len = (radial[0] * radial[0] + radial[1] * radial[1] + radial[2] * radial[2]).sqrt();
@@ -225,71 +168,79 @@ mod tests {
     }
 
     #[test]
-    fn ring_sampling_targets_cell_sized_spacing() {
-        let equator = uv_lat_for_ring(LAT_RINGS / 2);
-        let equator_stride = longitude_stride_for_ring(equator);
-        let equator_count = GLOBAL_LONGITUDES.div_ceil(equator_stride);
-        let equator_spacing =
-            2.0 * std::f32::consts::PI * SPHERE_RADIUS_CELLS * equator.cos().abs()
-                / equator_count as f32;
-        let lat_spacing = 2.0 * LAT_MAX * SPHERE_RADIUS_CELLS / LAT_RINGS as f32;
-        assert!(
-            (0.6..=1.1).contains(&equator_spacing),
-            "equator spacing should be near target cell spacing, got {equator_spacing}",
-        );
-        assert!(
-            (0.6..=1.1).contains(&lat_spacing),
-            "latitude spacing should be near target cell spacing, got {lat_spacing}",
-        );
+    fn ring_lattice_matches_wrapped_plane_row() {
+        assert_eq!(RING_DIMS, [super::super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 1]);
     }
 
     #[test]
-    fn sampled_longitudes_stay_on_global_meridians() {
-        let low_lat = uv_lat_for_ring(0);
-        let mid_lat = uv_lat_for_ring(LAT_RINGS / 2);
-        let low_stride = longitude_stride_for_ring(low_lat);
-        let mid_stride = longitude_stride_for_ring(mid_lat);
-        assert_eq!(low_stride % mid_stride, 0, "sparser rings should use meridian subsets");
+    fn ring_uses_one_fixed_uv_latitude() {
+        for cell in 0..RING_DIMS[0] {
+            let rotation = tangent_rotation_for_ring_cell(cell);
+            let radial = rotation[1];
+            assert!(radial[1].abs() < 1e-6, "radial y drifted at cell {cell}: {}", radial[1]);
+        }
     }
 
     #[test]
-    fn sphere_cells_are_deduped_placed_tangent_blocks() {
+    fn root_is_uv_ring() {
         let world = uv_sphere_test_world();
-        fn count_placed_tangent_blocks(
+        let root = world.library.get(world.root).expect("root exists");
+        match root.kind {
+            NodeKind::UvRing { dims, slab_depth } => {
+                assert_eq!(dims, RING_DIMS);
+                assert_eq!(slab_depth, GRID_DEPTH);
+            }
+            other => panic!("expected UvRing root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ring_row_cells_are_populated_in_uv_lattice() {
+        let world = uv_sphere_test_world();
+        for x in 0..RING_DIMS[0] as usize {
+            let mut node_id = world.root;
+            for level in (0..GRID_DEPTH as u32).rev() {
+                let div = 3usize.pow(level);
+                let sx = (x / div) % 3;
+                let slot = slot_index(sx, 0, 0);
+                let node = world.library.get(node_id).expect("node exists");
+                match node.children[slot] {
+                    Child::Node(child) => node_id = child,
+                    other => panic!("ring x={x} missing at slot {slot}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ring_content_is_deduped_under_wrapped_plane() {
+        let world = uv_sphere_test_world();
+        fn count_nonempty_nodes(
             library: &NodeLibrary,
             child: Child,
             seen: &mut std::collections::HashSet<crate::world::tree::NodeId>,
         ) -> usize {
-            let placed = usize::from(matches!(
-                child,
-                Child::PlacedNode { kind: NodeKind::TangentBlock { .. }, .. }
-            ));
-            let Some(id) = child.node_id() else { return placed };
+            let Some(id) = child.node_id() else { return 0 };
             if !seen.insert(id) {
-                return placed;
+                return 0;
             }
             let Some(node) = library.get(id) else { return 0 };
-            placed + node.children
+            1 + node.children
                 .iter()
                 .copied()
-                .map(|c| count_placed_tangent_blocks(library, c, seen))
+                .map(|c| count_nonempty_nodes(library, c, seen))
                 .sum::<usize>()
         }
 
-        let tangent_blocks = count_placed_tangent_blocks(
+        let nodes = count_nonempty_nodes(
             &world.library,
             Child::Node(world.root),
             &mut std::collections::HashSet::new(),
         );
         assert!(
-            tangent_blocks > 100,
-            "expected many tangent sphere cells, got {tangent_blocks}",
-        );
-        assert!(
-            world.library.len() < tangent_blocks,
-            "content nodes should be deduped below placed rotations: library={} tangent_blocks={}",
+            world.library.len() < RING_DIMS[0] as usize + CELL_SUBTREE_DEPTH as usize + 10,
+            "ring content should stay deduped: library={} reachable_nodes={nodes}",
             world.library.len(),
-            tangent_blocks,
         );
     }
 

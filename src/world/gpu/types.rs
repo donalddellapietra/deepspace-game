@@ -60,8 +60,9 @@ impl GpuChild {
 
 /// Per-packed-node metadata: 64 bytes total.
 ///
-/// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock.
-/// `dims_x/y/z`: slab dims for `WrappedPlane`; zero otherwise.
+/// `kind`: 0 = Cartesian, 1 = WrappedPlane, 2 = TangentBlock,
+/// 3 = UvRing.
+/// `dims_x/y/z`: slab dims for `WrappedPlane` / `UvRing`; zero otherwise.
 ///
 /// `rot_col0/1/2`: 3×3 rotation matrix (column-major) for
 /// `TangentBlock`. Each column is `vec4<f32>` (xyz = column, w = 0)
@@ -91,6 +92,10 @@ impl GpuNodeKind {
             },
             NodeKind::WrappedPlane { dims, slab_depth: _ } => Self {
                 kind: 1, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
+                rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
+            },
+            NodeKind::UvRing { dims, slab_depth: _ } => Self {
+                kind: 3, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
                 rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
             },
             NodeKind::TangentBlock { rotation } | NodeKind::TangentPlane { rotation } => {

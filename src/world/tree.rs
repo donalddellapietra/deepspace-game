@@ -108,6 +108,13 @@ pub enum NodeKind {
         dims: [u32; 3],
         slab_depth: u8,
     },
+    /// Straight UV lattice rendered as a circular ring. The content
+    /// stays Cartesian under the node; render/raycast entry maps the
+    /// X row around a ring instead of a sphere.
+    UvRing {
+        dims: [u32; 3],
+        slab_depth: u8,
+    },
     /// A Cartesian subtree whose local `[0, 3)³` frame is rotated
     /// relative to its parent's slot frame. The rotation is applied
     /// at descent around the cube's geometric center `(1.5, 1.5, 1.5)`
@@ -174,6 +181,10 @@ impl PartialEq for NodeKind {
                 NodeKind::WrappedPlane { dims: b, slab_depth: bd },
             ) => a == b && ad == bd,
             (
+                NodeKind::UvRing { dims: a, slab_depth: ad },
+                NodeKind::UvRing { dims: b, slab_depth: bd },
+            ) => a == b && ad == bd,
+            (
                 NodeKind::TangentBlock { rotation: a },
                 NodeKind::TangentBlock { rotation: b },
             ) => rotation_bits(a) == rotation_bits(b),
@@ -200,6 +211,10 @@ impl Hash for NodeKind {
         match self {
             NodeKind::Cartesian => {}
             NodeKind::WrappedPlane { dims, slab_depth } => {
+                dims.hash(state);
+                slab_depth.hash(state);
+            }
+            NodeKind::UvRing { dims, slab_depth } => {
                 dims.hash(state);
                 slab_depth.hash(state);
             }

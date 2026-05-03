@@ -125,6 +125,24 @@ impl App {
                 }
                 (hit, frame_path)
             }
+            ActiveFrameKind::UvRing { dims, slab_depth } => {
+                let frame_path = self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame_rot(
+                    &self.world.library, self.world.root, &frame_path,
+                );
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let hit = raycast::cpu_raycast_uv_ring(
+                    &self.world.library,
+                    self.world.root,
+                    frame_path.as_slice(),
+                    cam_local,
+                    ray_dir,
+                    dims,
+                    slab_depth,
+                    self.edit_depth(),
+                );
+                (hit, frame_path)
+            }
         };
         // Enforce the interaction radius gate: drop hits beyond
         // `interaction_radius_cells × anchor_cell_size`. Same
@@ -234,6 +252,7 @@ impl App {
             match child_kind {
                 Some(NodeKind::Cartesian)
                 | Some(NodeKind::WrappedPlane { .. })
+                | Some(NodeKind::UvRing { .. })
                 | Some(NodeKind::TangentBlock { .. })
                 | Some(NodeKind::TangentPlane { .. }) => {
                     node_id = child_id;
