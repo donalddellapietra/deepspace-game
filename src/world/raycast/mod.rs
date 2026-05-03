@@ -14,6 +14,11 @@ pub use wrapped_planet::cpu_raycast_wrapped_planet;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
 
+/// Re-export of the inscribed-cube scale used when packing TB nodes
+/// for the GPU. The CPU raycast applies the same shrink at the same
+/// transform points so cursor targeting matches the visual.
+pub(crate) use crate::world::gpu::inscribed_cube_scale;
+
 /// Information about a ray hit in the tree.
 #[derive(Debug, Clone)]
 pub struct HitInfo {
@@ -102,22 +107,32 @@ pub fn cpu_raycast_in_frame(
         if child_is_tb {
             if let Some(node) = library.get(child_id) {
                 if let NodeKind::TangentBlock { rotation: r } = node.kind {
-                    // Centred R: invert the entry-side R^T-around-
-                    // (1.5,1.5,1.5) by rotating the scaled-down origin
-                    // by R about (0.5,0.5,0.5) before translating into
-                    // the parent's [0,3)³. Direction also rotated by R.
-                    let scaled = [
-                        ray_origin[0] / 3.0,
-                        ray_origin[1] / 3.0,
-                        ray_origin[2] / 3.0,
+                    // Inverse of the entry transform: multiply the
+                    // centred origin/direction by tb_scale (undo the
+                    // entry-side division), apply R about
+                    // (1.5, 1.5, 1.5), then /3 + slot_off + 0.5 to
+                    // express in the parent's [0,3)³.
+                    let tb_scale = inscribed_cube_scale(&r);
+                    let centered = [
+                        (ray_origin[0] - 1.5) * tb_scale,
+                        (ray_origin[1] - 1.5) * tb_scale,
+                        (ray_origin[2] - 1.5) * tb_scale,
                     ];
-                    let centered = [scaled[0] - 0.5, scaled[1] - 0.5, scaled[2] - 0.5];
+                    let rotated = [
+                        r[0][0]*centered[0] + r[1][0]*centered[1] + r[2][0]*centered[2],
+                        r[0][1]*centered[0] + r[1][1]*centered[1] + r[2][1]*centered[2],
+                        r[0][2]*centered[0] + r[1][2]*centered[1] + r[2][2]*centered[2],
+                    ];
                     ray_origin = [
-                        slot_off[0] + 0.5 + r[0][0]*centered[0] + r[1][0]*centered[1] + r[2][0]*centered[2],
-                        slot_off[1] + 0.5 + r[0][1]*centered[0] + r[1][1]*centered[1] + r[2][1]*centered[2],
-                        slot_off[2] + 0.5 + r[0][2]*centered[0] + r[1][2]*centered[1] + r[2][2]*centered[2],
+                        slot_off[0] + 0.5 + rotated[0] / 3.0,
+                        slot_off[1] + 0.5 + rotated[1] / 3.0,
+                        slot_off[2] + 0.5 + rotated[2] / 3.0,
                     ];
-                    let rd = ray_dir;
+                    let rd = [
+                        ray_dir[0] * tb_scale,
+                        ray_dir[1] * tb_scale,
+                        ray_dir[2] * tb_scale,
+                    ];
                     ray_dir = [
                         (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
                         (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,
