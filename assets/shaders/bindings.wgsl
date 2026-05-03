@@ -356,7 +356,7 @@ const MAX_FACE_DEPTH: u32 = 63u;
 /// Apple Silicon register-file boundary; larger values spill to
 /// threadgroup memory, adding memory latency to every DDA
 /// iteration. See `docs/testing/perf-lod-diagnosis.md`.
-const MAX_STACK_DEPTH: u32 = 16u;
+const MAX_STACK_DEPTH: u32 = 8u;
 
 struct HitResult {
     hit: bool,
