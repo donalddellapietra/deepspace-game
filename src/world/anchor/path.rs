@@ -196,7 +196,7 @@ impl Path {
 /// `slots.len()`). Returns `None` if the walk hits a non-Node child
 /// before consuming all slots, or if a node id is missing from the
 /// library.
-fn node_kind_at_depth(
+pub(super) fn node_kind_at_depth(
     library: &NodeLibrary,
     world_root: NodeId,
     slots: &[u8],
