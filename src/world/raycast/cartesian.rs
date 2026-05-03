@@ -169,9 +169,23 @@ pub(super) fn cpu_raycast_inner(
                         ray_dir[1] * scale,
                         ray_dir[2] * scale,
                     ];
-                    // Direction-only R^T: position stays unrotated
-                    // (matches the tree's native slot layout).
-                    let local_origin = lp_origin;
+                    // Centred R^T around (1.5, 1.5, 1.5). Mirrors the
+                    // shader's TB entry — rotating origin and direction
+                    // by R^T about the same pivot is t-preserving, so
+                    // the world parameter from the inner DDA matches
+                    // the world ray. Direction-only here makes
+                    // break/place targeting drift with camera position.
+                    let centered = [lp_origin[0] - 1.5, lp_origin[1] - 1.5, lp_origin[2] - 1.5];
+                    let rotated_origin = [
+                        rotation[0][0] * centered[0] + rotation[0][1] * centered[1] + rotation[0][2] * centered[2],
+                        rotation[1][0] * centered[0] + rotation[1][1] * centered[1] + rotation[1][2] * centered[2],
+                        rotation[2][0] * centered[0] + rotation[2][1] * centered[1] + rotation[2][2] * centered[2],
+                    ];
+                    let local_origin = [
+                        rotated_origin[0] + 1.5,
+                        rotated_origin[1] + 1.5,
+                        rotated_origin[2] + 1.5,
+                    ];
                     let local_dir = [
                         rotation[0][0] * lp_dir[0] + rotation[0][1] * lp_dir[1] + rotation[0][2] * lp_dir[2],
                         rotation[1][0] * lp_dir[0] + rotation[1][1] * lp_dir[1] + rotation[1][2] * lp_dir[2],

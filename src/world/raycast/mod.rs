@@ -102,12 +102,20 @@ pub fn cpu_raycast_in_frame(
         if child_is_tb {
             if let Some(node) = library.get(child_id) {
                 if let NodeKind::TangentBlock { rotation: r } = node.kind {
-                    // Direction-only: position pops Cartesian,
-                    // direction rotated by R to undo the R^T entry.
+                    // Centred R: invert the entry-side R^T-around-
+                    // (1.5,1.5,1.5) by rotating the scaled-down origin
+                    // by R about (0.5,0.5,0.5) before translating into
+                    // the parent's [0,3)³. Direction also rotated by R.
+                    let scaled = [
+                        ray_origin[0] / 3.0,
+                        ray_origin[1] / 3.0,
+                        ray_origin[2] / 3.0,
+                    ];
+                    let centered = [scaled[0] - 0.5, scaled[1] - 0.5, scaled[2] - 0.5];
                     ray_origin = [
-                        slot_off[0] + ray_origin[0] / 3.0,
-                        slot_off[1] + ray_origin[1] / 3.0,
-                        slot_off[2] + ray_origin[2] / 3.0,
+                        slot_off[0] + 0.5 + r[0][0]*centered[0] + r[1][0]*centered[1] + r[2][0]*centered[2],
+                        slot_off[1] + 0.5 + r[0][1]*centered[0] + r[1][1]*centered[1] + r[2][1]*centered[2],
+                        slot_off[2] + 0.5 + r[0][2]*centered[0] + r[1][2]*centered[1] + r[2][2]*centered[2],
                     ];
                     let rd = ray_dir;
                     ray_dir = [
