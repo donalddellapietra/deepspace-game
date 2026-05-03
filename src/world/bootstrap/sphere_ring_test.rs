@@ -57,8 +57,7 @@ const CELL_SUBTREE_DEPTH: u8 = 30;
 
 /// Build a uniform-block recursive Cartesian subtree of `depth`
 /// levels. Every level dedups against the same library entry —
-/// all `RING_CELLS` cells share this one Cartesian content chain
-/// underneath their distinct tangent-block heads.
+/// all `RING_CELLS` cells share one content subtree.
 fn build_uniform_cartesian_subtree(
     library: &mut NodeLibrary,
     block_id: u16,
@@ -69,41 +68,6 @@ fn build_uniform_cartesian_subtree(
     }
     let inner = build_uniform_cartesian_subtree(library, block_id, depth - 1);
     Child::Node(library.insert(uniform_children(inner)))
-}
-
-/// Build a `TangentBlock`-headed cell subtree of total depth
-/// `CELL_SUBTREE_DEPTH`. The outermost node carries `rotation` so
-/// the existing TB primitive applies the ring tangent basis at
-/// cube descent — exactly the same pattern as
-/// [`dodecahedron_test::build_tangent_block_subtree`]. The TB head
-/// also prevents the GPU packer from collapsing the uniform-stone
-/// subtree into a single Block (which would make per-cell edits
-/// land on the whole cell instead of individual voxels).
-fn build_tangent_block_cell(
-    library: &mut NodeLibrary,
-    block_id: u16,
-    depth: u8,
-    rotation: [[f32; 3]; 3],
-) -> Child {
-    assert!(depth >= 1, "TangentBlock subtree depth must be >= 1");
-    let inner = build_uniform_cartesian_subtree(library, block_id, depth - 1);
-    Child::Node(library.insert_with_kind(
-        uniform_children(inner),
-        NodeKind::TangentBlock { rotation },
-    ))
-}
-
-/// Ring tangent basis at angle `theta` (radians, CCW around +Y).
-/// Column-major `[tangent | radial | up]`: storage `+X` → tangent,
-/// storage `+Y` → radial, storage `+Z` → up. Same convention as
-/// [`dodecahedron_test::rotation_align_y_to`].
-fn ring_rotation(theta: f32) -> [[f32; 3]; 3] {
-    let (st, ct) = theta.sin_cos();
-    [
-        [-st, 0.0, ct],
-        [ct, 0.0, st],
-        [0.0, 1.0, 0.0],
-    ]
 }
 
 /// Build the `[N, 1, 1]` slab tree by recursive ternary subdivision
@@ -143,22 +107,11 @@ fn build_ring_slab(
 pub(super) fn sphere_ring_test_world() -> WorldState {
     let mut library = NodeLibrary::default();
 
-    // Per-cell TangentBlock heads carrying the ring tangent basis
-    // rotation. The Cartesian content chain underneath dedups across
-    // all cells; only the TB heads themselves are distinct (one
-    // library entry per cell, since each rotation hashes to a
-    // different bit pattern).
-    let two_pi = std::f32::consts::TAU;
-    let pi = std::f32::consts::PI;
-    let leaves: Vec<Child> = (0..RING_CELLS)
-        .map(|cell_x| {
-            let theta = -pi + (cell_x as f32 + 0.5) * (two_pi / RING_CELLS as f32);
-            let rotation = ring_rotation(theta);
-            build_tangent_block_cell(
-                &mut library, block::STONE, CELL_SUBTREE_DEPTH, rotation,
-            )
-        })
-        .collect();
+    // Single deduped content subtree, shared by every ring cell.
+    let cell_content =
+        build_uniform_cartesian_subtree(&mut library, block::STONE, CELL_SUBTREE_DEPTH);
+
+    let leaves: Vec<Child> = (0..RING_CELLS).map(|_| cell_content).collect();
 
     let root_child = build_ring_slab(
         &mut library,
@@ -271,50 +224,25 @@ mod tests {
         }
     }
 
-    /// Each ring cell carries a distinct TangentBlock rotation.
-    /// With `RING_CELLS = 27` distinct rotations, the library
-    /// contains 27 TB head entries; the Cartesian content chain
-    /// underneath dedups across all cells.
+    /// Ring content is shared (deduped) across all cells. With
+    /// `RING_CELLS = 27` cells all pointing at one uniform-stone
+    /// subtree, the library should contain only the slab descent
+    /// nodes plus the one shared content chain — far fewer than 27
+    /// distinct copies.
     #[test]
-    fn ring_cells_are_tangent_blocks_with_distinct_rotations() {
+    fn ring_content_is_deduped() {
         let world = sphere_ring_test_world();
-        // Walk the slab path for each cell_x and confirm the leaf
-        // child is a Node whose kind is TangentBlock.
-        let mut tb_ids = std::collections::HashSet::new();
-        for cell_x in 0..RING_CELLS {
-            let mut node_id = world.root;
-            let mut cells_per_slot: u32 = 1;
-            for _ in 1..RING_SLAB_DEPTH {
-                cells_per_slot *= 3;
-            }
-            for level in 0..RING_SLAB_DEPTH {
-                let sx = ((cell_x / cells_per_slot) % 3) as usize;
-                let slot = slot_index(sx, 0, 0);
-                let node = world.library.get(node_id).expect("node");
-                match node.children[slot] {
-                    Child::Node(child) => {
-                        if level + 1 == RING_SLAB_DEPTH {
-                            let n = world.library.get(child).expect("cell head");
-                            assert!(
-                                n.kind.is_tangent_block(),
-                                "cell {cell_x} head is not a TangentBlock: {:?}",
-                                n.kind,
-                            );
-                            tb_ids.insert(child);
-                        } else {
-                            node_id = child;
-                        }
-                    }
-                    other => panic!("cell {cell_x} missing at slot {slot}: {other:?}"),
-                }
-                cells_per_slot = (cells_per_slot / 3).max(1);
-            }
-        }
-        assert_eq!(
-            tb_ids.len(),
-            RING_CELLS as usize,
-            "expected {RING_CELLS} distinct TB heads, got {}",
-            tb_ids.len(),
+        let total = world.library.len();
+        // Slab descent: 1 root + 3 mid + 9 leaf-parents = 13 nodes.
+        // Content chain: CELL_SUBTREE_DEPTH = 30 nodes.
+        // Plus a small slack for any other library entries created
+        // by `insert_with_kind` deduping under a kind-specific hash.
+        let upper_bound = (RING_SLAB_DEPTH as usize) * 3
+            + (CELL_SUBTREE_DEPTH as usize)
+            + 16;
+        assert!(
+            total < upper_bound,
+            "library should stay deduped: got {total} entries, expected < {upper_bound}",
         );
     }
 }

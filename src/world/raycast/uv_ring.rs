@@ -72,7 +72,9 @@ pub fn cpu_raycast_uv_ring(
     for cell_x in 0..dims[0] as i32 {
         let theta = -pi + (cell_x as f32 + 0.5) * (two_pi / dims[0] as f32);
         let (st, ct) = theta.sin_cos();
+        let tangent = [-st, 0.0, ct];
         let radial = [ct, 0.0, st];
+        let up = [0.0_f32, 1.0, 0.0];
         let cell_center = [
             RING_CENTER[0] + radial[0] * RING_RADIUS,
             RING_CENTER[1],
@@ -83,19 +85,20 @@ pub fn cpu_raycast_uv_ring(
             library, ring_root, &frame_chain, dims[0], slab_depth, cell_x as u32,
         ) else { continue };
 
-        // Translate + scale only — no rotation. The TB head at
-        // the cell's storage tip applies the ring tangent basis
-        // R^T at descent (handled by `cpu_raycast_inner`'s TB
-        // dispatch).
+        let d = [
+            cam_local[0] - cell_center[0],
+            cam_local[1] - cell_center[1],
+            cam_local[2] - cell_center[2],
+        ];
         let local_origin = [
-            (cam_local[0] - cell_center[0]) * scale + 1.5,
-            (cam_local[1] - cell_center[1]) * scale + 1.5,
-            (cam_local[2] - cell_center[2]) * scale + 1.5,
+            (tangent[0] * d[0] + tangent[1] * d[1] + tangent[2] * d[2]) * scale + 1.5,
+            (radial[0] * d[0] + radial[1] * d[1] + radial[2] * d[2]) * scale + 1.5,
+            (up[0] * d[0] + up[1] * d[1] + up[2] * d[2]) * scale + 1.5,
         ];
         let local_dir = [
-            ray_dir[0] * scale,
-            ray_dir[1] * scale,
-            ray_dir[2] * scale,
+            (tangent[0] * ray_dir[0] + tangent[1] * ray_dir[1] + tangent[2] * ray_dir[2]) * scale,
+            (radial[0] * ray_dir[0] + radial[1] * ray_dir[1] + radial[2] * ray_dir[2]) * scale,
+            (up[0] * ray_dir[0] + up[1] * ray_dir[1] + up[2] * ray_dir[2]) * scale,
         ];
 
         let inner_max = max_depth.saturating_sub(cell_path.len() as u32);
