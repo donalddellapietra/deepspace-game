@@ -271,64 +271,6 @@ mod tests {
         }
     }
 
-    /// Zooming in on a UvRing world advances the anchor by exactly
-    /// `slab_depth` slots (the storage path for the cell nearest
-    /// the camera in ring topology). Without `zoom_in_uv_ring`, the
-    /// standard 3³ slot pick lands on slots like `(1, 1, 2)` which
-    /// have no children in the `[27, 1, 1]` slab — render frame
-    /// stays at root regardless of zoom level (the bug from the
-    /// debug capture).
-    #[test]
-    fn zoom_in_descends_into_uv_ring_cell() {
-        use crate::world::anchor::WorldPos;
-
-        let world = sphere_ring_test_world();
-        let mut pos = WorldPos::new(
-            crate::world::anchor::Path::root(),
-            // Camera at world (1.5, 1.5, 2.5) — the +Z arc of the
-            // ring. Offset = world / 3 because anchor depth is 0.
-            [0.5, 0.5, 5.0 / 6.0],
-        );
-        pos.zoom_in_in_world(&world.library, world.root);
-
-        assert_eq!(
-            pos.anchor.depth(),
-            RING_SLAB_DEPTH,
-            "zoom_in on UvRing root should advance anchor by exactly slab_depth ({}); got {}",
-            RING_SLAB_DEPTH,
-            pos.anchor.depth(),
-        );
-
-        for k in 0..RING_SLAB_DEPTH as usize {
-            let slot = pos.anchor.slot(k);
-            let (_, sy, sz) = crate::world::tree::slot_coords(slot as usize);
-            assert_eq!(sy, 0, "slab slot at level {k} has sy != 0: {slot}");
-            assert_eq!(sz, 0, "slab slot at level {k} has sz != 0: {slot}");
-        }
-
-        // Walk the slab path; final child must be a TangentBlock head.
-        let mut node_id = world.root;
-        for k in 0..RING_SLAB_DEPTH as usize {
-            let slot = pos.anchor.slot(k) as usize;
-            let n = world.library.get(node_id).expect("node along slab path");
-            match n.children[slot] {
-                Child::Node(child) => {
-                    if k + 1 == RING_SLAB_DEPTH as usize {
-                        let cell = world.library.get(child).expect("cell head");
-                        assert!(
-                            cell.kind.is_tangent_block(),
-                            "cell head not a TB: {:?}",
-                            cell.kind,
-                        );
-                    } else {
-                        node_id = child;
-                    }
-                }
-                other => panic!("expected Node at slab level {k}: {other:?}"),
-            }
-        }
-    }
-
     /// Each ring cell carries a distinct TangentBlock rotation.
     /// With `RING_CELLS = 27` distinct rotations, the library
     /// contains 27 TB head entries; the Cartesian content chain

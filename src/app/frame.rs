@@ -69,30 +69,41 @@ pub fn compute_render_frame(
     target.truncate(desired_depth);
     let mut node_id = world_root;
     let mut reached = Path::root();
-    let mut kind = active_frame_kind_for(library.get(world_root).map(|n| n.kind));
+    let mut kind = match library.get(world_root).map(|n| n.kind) {
+        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
+            ActiveFrameKind::WrappedPlane { dims, slab_depth }
+        }
+        Some(NodeKind::UvRing { dims, slab_depth }) => {
+            ActiveFrameKind::UvRing { dims, slab_depth }
+        }
+        _ => ActiveFrameKind::Cartesian,
+    };
     for k in 0..target.depth() as usize {
-        // `WrappedPlane` requires the frame root to BE the WP node
-        // (shader dispatches `march_wrapped_planet` at depth 0 of the
-        // frame). Stop descent once the frame lands on a WP node.
-        //
-        // `UvRing` is intentionally NOT a stopper here: when the
-        // anchor descends through the storage slab into a cell's
-        // content, the render frame should follow into the cell so
-        // the shader runs `march_cartesian` on the cell content
-        // directly (with the camera already projected into the cell
-        // by `zoom_in_uv_ring`'s topology entry transform). When the
-        // anchor doesn't descend past a UvRing, the loop simply
-        // doesn't advance and `kind` stays `UvRing`, so the shader
-        // dispatches `march_uv_ring` for the whole-ring view.
-        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) { break; }
-
+        if matches!(
+            kind,
+            ActiveFrameKind::WrappedPlane { .. } | ActiveFrameKind::UvRing { .. },
+        ) {
+            break;
+        }
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
-                kind = active_frame_kind_for(library.get(child_id).map(|n| n.kind));
+                if let Some(child_node) = library.get(child_id) {
+                    match child_node.kind {
+                        NodeKind::WrappedPlane { dims, slab_depth } => {
+                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                            break;
+                        }
+                        NodeKind::UvRing { dims, slab_depth } => {
+                            kind = ActiveFrameKind::UvRing { dims, slab_depth };
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
@@ -102,19 +113,6 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
-    }
-}
-
-#[inline]
-fn active_frame_kind_for(kind: Option<NodeKind>) -> ActiveFrameKind {
-    match kind {
-        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
-            ActiveFrameKind::WrappedPlane { dims, slab_depth }
-        }
-        Some(NodeKind::UvRing { dims, slab_depth }) => {
-            ActiveFrameKind::UvRing { dims, slab_depth }
-        }
-        _ => ActiveFrameKind::Cartesian,
     }
 }
 
