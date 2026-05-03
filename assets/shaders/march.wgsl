@@ -1750,11 +1750,12 @@ fn march_spherical_wrapped_plane(
         let aabb_size_render = cell_size_render * aabb_factor;
 
         // Cell content centre in render = sphere_pos = bootstrap's
-        // `cell_natural_lower * wp_to_render + 0.5 * cell_size_render
+        // `(cell_natural_lower + 0.5 * cell_size_wp) * wp_to_render
         // + cell_offset * cell_size_render`. The AABB centre matches
         // (centred at cell content centre).
+        let cell_natural_lower_wp = vec3<f32>(f32(cx), f32(cy), f32(cz)) * cell_size_wp;
         let cell_content_centre = body_origin
-            + (cell_natural_lower + vec3<f32>(0.5 * cell_size_wp)) * wp_to_render
+            + (cell_natural_lower_wp + vec3<f32>(0.5 * cell_size_wp)) * wp_to_render
             + cell_kind.cell_offset.xyz * cell_size_render;
         let cell_actual_lower_render = cell_content_centre - vec3<f32>(0.5 * aabb_size_render);
 
