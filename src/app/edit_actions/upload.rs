@@ -60,6 +60,13 @@ impl App {
     }
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
+        // Force-extend the world tree along the camera anchor so the
+        // render-frame walker reaches anchor depth via real Nodes
+        // (not bare Empty/Block sparse leaves). Idempotent and
+        // dedup-bounded — see `world::anchor_extend`.
+        let anchor = self.camera.position.anchor;
+        self.world.ensure_anchor_extended(anchor.as_slice());
+
         let intended_frame = self.target_render_frame();
         let effective_visual_depth = self.visual_depth();
         let upload_key = LodUploadKey::new(self.world.root);

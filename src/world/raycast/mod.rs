@@ -70,6 +70,17 @@ pub fn cpu_raycast_in_frame(
     let mut ray_origin = cam_local;
     let mut ray_dir = ray_dir;
     let total_max_depth = max_depth;
+    // `cur_scale` mirrors the GPU shader's `march()` loop
+    // (assets/shaders/march.wgsl:1689). Each ribbon pop scales
+    // `ray_origin` by 1/3 into the parent frame's [0,3)³ but leaves
+    // `ray_dir` at its original magnitude — `cur_scale` carries the
+    // cumulative 1/3^N. The inner DDA's `hit.t` is in frame-local
+    // parametric units; on hit we divide by `cur_scale` to recover
+    // the camera-frame `t`. Keeping `ray_dir` constant avoids the
+    // f32 precision loss that `ray_dir /= 3` accumulates over deep
+    // pops (after 24 pops the old scheme had ray_dir / 3^24 ≈ 3e-12,
+    // breaking DDA at deep render frames).
+    let mut cur_scale: f32 = 1.0;
 
     loop {
         let frame_root_id = chain[current_frame_depth];
@@ -80,6 +91,9 @@ pub fn cpu_raycast_in_frame(
         );
 
         if let Some(mut hit) = hit_opt {
+            if cur_scale < 1.0 {
+                hit.t /= cur_scale;
+            }
             prepend_frame_entries(&mut hit, frame_entries, current_frame_depth);
             return Some(hit);
         }
@@ -93,38 +107,30 @@ pub fn cpu_raycast_in_frame(
         let slot_off = [sx as f32, sy as f32, sz as f32];
 
         // TB-aware pop: if the child we're leaving is a TangentBlock,
-        // apply R (forward rotation) to origin and direction —
-        // mirrors the shader's ribbon pop.
+        // rotate `ray_dir` by R (forward) — mirrors the shader's
+        // ribbon pop in march.wgsl:1684-1685.
         let child_is_tb = library
             .get(child_id)
             .map(|n| matches!(n.kind, NodeKind::TangentBlock { .. }))
             .unwrap_or(false);
+        ray_origin = [
+            slot_off[0] + ray_origin[0] / 3.0,
+            slot_off[1] + ray_origin[1] / 3.0,
+            slot_off[2] + ray_origin[2] / 3.0,
+        ];
         if child_is_tb {
             if let Some(node) = library.get(child_id) {
                 if let NodeKind::TangentBlock { rotation: r } = node.kind {
-                    // Direction-only: position pops Cartesian,
-                    // direction rotated by R to undo the R^T entry.
-                    ray_origin = [
-                        slot_off[0] + ray_origin[0] / 3.0,
-                        slot_off[1] + ray_origin[1] / 3.0,
-                        slot_off[2] + ray_origin[2] / 3.0,
-                    ];
                     let rd = ray_dir;
                     ray_dir = [
-                        (r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2]) / 3.0,
-                        (r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2]) / 3.0,
-                        (r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2]) / 3.0,
+                        r[0][0]*rd[0] + r[1][0]*rd[1] + r[2][0]*rd[2],
+                        r[0][1]*rd[0] + r[1][1]*rd[1] + r[2][1]*rd[2],
+                        r[0][2]*rd[0] + r[1][2]*rd[1] + r[2][2]*rd[2],
                     ];
                 }
             }
-        } else {
-            ray_origin = [
-                slot_off[0] + ray_origin[0] / 3.0,
-                slot_off[1] + ray_origin[1] / 3.0,
-                slot_off[2] + ray_origin[2] / 3.0,
-            ];
-            ray_dir = [ray_dir[0] / 3.0, ray_dir[1] / 3.0, ray_dir[2] / 3.0];
         }
+        cur_scale *= 1.0 / 3.0;
         current_frame_depth -= 1;
     }
 }

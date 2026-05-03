@@ -85,10 +85,61 @@ impl App {
         frame_span / dist * half_fov_recip
     }
 
+    /// Render-frame derivation with hysteresis: keep the current
+    /// `active_frame` as long as it's still valid for the current
+    /// anchor depth, walks through real Nodes, and contains the
+    /// camera in its `[0, 3)³`.
+    ///
+    /// Without hysteresis, the render frame is rebuilt from anchor
+    /// slots every call. Tiny camera moves that flip a slot at any
+    /// intermediate depth then propagate into the render frame's
+    /// path, jumping the shader's coordinate system to a neighboring
+    /// depth-K cell. With LOD aggregation in the pack, that produces
+    /// visible LOD popping (uniform-flat cell vs detailed cell on
+    /// either side of a slot boundary).
+    ///
+    /// Hysteresis pins the frame to a single depth-K cell until the
+    /// camera definitively leaves its `[0, 3)³` — then a single
+    /// frame switch instead of many slot-boundary-driven oscillations.
     pub(in crate::app) fn target_render_frame(&self) -> ActiveFrame {
-        // Render frame depth is derived from `RENDER_ANCHOR_DEPTH`,
-        // not the user's anchor depth — zoom controls interaction
-        // layer, not what the camera renders. See `RENDER_ANCHOR_DEPTH`.
+        let anchor_depth = self.camera.position.anchor.depth();
+        let target_render_depth = anchor_depth
+            .saturating_sub(crate::app::RENDER_FRAME_K);
+        if target_render_depth > 0
+            && self.active_frame.render_path.depth() == target_render_depth
+            && matches!(self.active_frame.kind, ActiveFrameKind::Cartesian)
+        {
+            // Validate the path still walks Nodes (world.root may have
+            // changed via edits since the frame was last set).
+            let validated = frame::compute_render_frame(
+                &self.world.library,
+                self.world.root,
+                &self.active_frame.render_path,
+                target_render_depth,
+            );
+            if validated.render_path.depth() == target_render_depth
+                && validated.render_path.as_slice()
+                    == self.active_frame.render_path.as_slice()
+            {
+                let cam_local = self
+                    .camera
+                    .position
+                    .in_frame(&self.active_frame.render_path);
+                let inside = cam_local
+                    .iter()
+                    .all(|&v| v.is_finite() && (0.0..3.0).contains(&v));
+                if inside {
+                    return self.active_frame;
+                }
+            }
+        }
+        self.target_render_frame_fresh()
+    }
+
+    /// Fresh render-frame derivation from the camera anchor, with no
+    /// hysteresis. Used when the existing active_frame is stale, the
+    /// camera left it, or zoom changed the target depth.
+    pub(in crate::app) fn target_render_frame_fresh(&self) -> ActiveFrame {
         let frame = self.render_frame();
         let mut frame = frame;
         while frame.render_path.depth() > 0
