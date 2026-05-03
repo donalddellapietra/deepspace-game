@@ -221,7 +221,8 @@ impl App {
                         None => break,
                     };
                     match node.children[slot as usize] {
-                        crate::world::tree::Child::Node(child) => {
+                        crate::world::tree::Child::Node(child)
+                        | crate::world::tree::Child::PlacedNode { node: child, .. } => {
                             cache.bfs_by_nid.remove(&child);
                             nid = child;
                         }
@@ -273,7 +274,8 @@ impl App {
         for &slot in r.reached_slots.iter() {
             let Some(node) = self.world.library.get(scene_frame_id) else { break };
             match node.children[slot as usize] {
-                crate::world::tree::Child::Node(id) => scene_frame_id = id,
+                crate::world::tree::Child::Node(id)
+                | crate::world::tree::Child::PlacedNode { node: id, .. } => scene_frame_id = id,
                 _ => break,
             }
         }

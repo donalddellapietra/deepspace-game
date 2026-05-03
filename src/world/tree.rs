@@ -34,6 +34,10 @@ pub enum Child {
     Empty,
     Block(u16),
     Node(NodeId),
+    PlacedNode {
+        node: NodeId,
+        kind: NodeKind,
+    },
     EntityRef(u32),
 }
 
@@ -52,6 +56,23 @@ impl Child {
     #[inline]
     pub fn is_solid(self) -> bool {
         !self.is_empty()
+    }
+
+    #[inline]
+    pub fn node_id(self) -> Option<NodeId> {
+        match self {
+            Child::Node(id) => Some(id),
+            Child::PlacedNode { node, .. } => Some(node),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn placement_kind(self) -> Option<NodeKind> {
+        match self {
+            Child::PlacedNode { kind, .. } => Some(kind),
+            _ => None,
+        }
     }
 }
 
@@ -323,7 +344,7 @@ impl NodeLibrary {
         let child_node_ids: Vec<NodeId> = children
             .iter()
             .filter_map(|c| match c {
-                Child::Node(nid) => Some(*nid),
+                Child::Node(nid) | Child::PlacedNode { node: nid, .. } => Some(*nid),
                 _ => None,
             })
             .collect();
@@ -341,7 +362,7 @@ impl NodeLibrary {
         for c in &children {
             match c {
                 Child::Block(bt) => *counts.entry(*bt).or_insert(0) += 1,
-                Child::Node(nid) => {
+                Child::Node(nid) | Child::PlacedNode { node: nid, .. } => {
                     if let Some(child_node) = self.nodes.get(nid) {
                         if child_node.representative_block != REPRESENTATIVE_EMPTY {
                             *counts
@@ -374,6 +395,7 @@ impl NodeLibrary {
                         .get(nid)
                         .map(|n| n.uniform_type)
                         .unwrap_or(UNIFORM_MIXED),
+                    Child::PlacedNode { .. } => UNIFORM_MIXED,
                     // EntityRef children force MIXED so pack.rs never
                     // tries to uniform-flatten a scene ancestor into
                     // a single Block.
@@ -403,7 +425,7 @@ impl NodeLibrary {
         // per insert thanks to child caching.
         let mut max_child_depth = 0u32;
         for c in &children {
-            if let Child::Node(nid) = c {
+            if let Child::Node(nid) | Child::PlacedNode { node: nid, .. } = c {
                 if let Some(child_node) = self.nodes.get(nid) {
                     if child_node.depth > max_child_depth {
                         max_child_depth = child_node.depth;
@@ -489,7 +511,7 @@ impl NodeLibrary {
             if v.is_empty() { self.by_hash.remove(&h); }
         }
         for child in &node.children {
-            if let Child::Node(nid) = child {
+            if let Child::Node(nid) | Child::PlacedNode { node: nid, .. } = child {
                 self.ref_dec(*nid);
             }
         }

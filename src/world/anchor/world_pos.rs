@@ -575,9 +575,12 @@ impl WorldPos {
                 None => return self.in_frame(frame),
             };
             match n.children[self.anchor.slot(k) as usize] {
-                Child::Node(child) => {
+                Child::Node(child) | Child::PlacedNode { node: child, .. } => {
+                    let edge_kind = n.children[self.anchor.slot(k) as usize].placement_kind();
                     if let Some(child_node) = library.get(child) {
-                        if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                        if let NodeKind::TangentBlock { rotation: r } =
+                            edge_kind.unwrap_or(child_node.kind)
+                        {
                             common_rot = crate::world::mat3::matmul(&common_rot, &r);
                         }
                     }
@@ -622,9 +625,10 @@ impl WorldPos {
             if have_node {
                 let n = library.get(node).unwrap();
                 match n.children[slot as usize] {
-                    Child::Node(child_id) => {
+                    Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+                        let edge_kind = n.children[slot as usize].placement_kind();
                         if let Some(child_node) = library.get(child_id) {
-                            if let Some(b) = TbBoundary::from_kind(child_node.kind) {
+                            if let Some(b) = TbBoundary::from_kind(edge_kind.unwrap_or(child_node.kind)) {
                                 cur_rot = crate::world::mat3::matmul(&cur_rot, &b.r);
                                 cur_scale *= b.tb_scale;
                             }
@@ -731,7 +735,7 @@ fn node_at_path(library: &NodeLibrary, world_root: NodeId, path: &Path) -> Optio
     for k in 0..(path.depth() as usize) {
         let node = library.get(nid)?;
         match node.children[path.slot(k) as usize] {
-            Child::Node(child) => nid = child,
+            Child::Node(child) | Child::PlacedNode { node: child, .. } => nid = child,
             _ => return None,
         }
     }
@@ -753,5 +757,5 @@ fn slot_is_node(
     c[axis] = new as usize;
     let slot = slot_index(c[0], c[1], c[2]);
     let Some(node) = library.get(parent) else { return false; };
-    matches!(node.children[slot], Child::Node(_))
+    matches!(node.children[slot], Child::Node(_) | Child::PlacedNode { .. })
 }

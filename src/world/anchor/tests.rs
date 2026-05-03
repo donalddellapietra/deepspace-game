@@ -1,5 +1,7 @@
 use super::*;
-use crate::world::tree::{slot_index, NodeLibrary};
+use crate::world::tree::{
+    empty_children, rotation_y, slot_index, Child, NodeKind, NodeLibrary,
+};
 
 fn lib() -> NodeLibrary {
     NodeLibrary::default()
@@ -203,6 +205,64 @@ fn zoom_in_then_zoom_out_preserves_position() {
     for i in 0..3 {
         assert!((after[i] - before[i]).abs() < 1e-4,
             "axis {}: {} -> {}", i, before[i], after[i]);
+    }
+}
+
+#[test]
+fn world_zoom_preserves_position_inside_placed_tangent_node() {
+    let mut library = NodeLibrary::default();
+    let content = library.build_uniform_subtree(crate::world::palette::block::GRASS, 3);
+    let Child::Node(content_id) = content else {
+        panic!("uniform depth 3 must build a node");
+    };
+    let rotation = rotation_y(0.5);
+    let placed_slot = slot_index(1, 1, 1);
+    let inner_slot = slot_index(1, 1, 1);
+    let mut root_children = empty_children();
+    root_children[placed_slot] = Child::PlacedNode {
+        node: content_id,
+        kind: NodeKind::TangentBlock { rotation },
+    };
+    let root = library.insert(root_children);
+    library.ref_inc(root);
+
+    let mut anchor = Path::root();
+    anchor.push(placed_slot as u8);
+    anchor.push(inner_slot as u8);
+    let mut pos = WorldPos::new_unchecked(anchor, [0.23, 0.67, 0.41]);
+    let before = pos.in_frame_rot(&library, root, &Path::root());
+
+    pos.zoom_out_in_world(&library, root);
+    let after_one_out = pos.in_frame_rot(&library, root, &Path::root());
+    for i in 0..3 {
+        assert!(
+            (before[i] - after_one_out[i]).abs() < 1e-4,
+            "axis {i}: before={} after_one_out={}",
+            before[i],
+            after_one_out[i],
+        );
+    }
+
+    pos.zoom_out_in_world(&library, root);
+    let after_two_out = pos.in_frame_rot(&library, root, &Path::root());
+    for i in 0..3 {
+        assert!(
+            (before[i] - after_two_out[i]).abs() < 1e-4,
+            "axis {i}: before={} after_two_out={}",
+            before[i],
+            after_two_out[i],
+        );
+    }
+
+    pos.zoom_in_in_world(&library, root);
+    let after_in = pos.in_frame_rot(&library, root, &Path::root());
+    for i in 0..3 {
+        assert!(
+            (before[i] - after_in[i]).abs() < 1e-4,
+            "axis {i}: before={} after_in={}",
+            before[i],
+            after_in[i],
+        );
     }
 }
 

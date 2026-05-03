@@ -802,9 +802,12 @@ fn tangent_block_chain_summary(
         };
         let slot = anchor.slot(k) as usize;
         match n.children[slot] {
-            Child::Node(child_id) => {
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+                let edge_kind = n.children[slot].placement_kind();
                 if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
+                    if let NodeKind::TangentBlock { rotation: r } =
+                        edge_kind.unwrap_or(child_node.kind)
+                    {
                         tb_seen = true;
                         rot = crate::world::mat3::matmul(&rot, &r);
                     }
@@ -820,4 +823,3 @@ fn tangent_block_chain_summary(
     let yaw_rad = rot[0][2].atan2(rot[0][0]);
     (tb_seen, yaw_rad.to_degrees())
 }
-

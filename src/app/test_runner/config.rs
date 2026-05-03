@@ -541,7 +541,7 @@ VISIBILITY TEST PRESETS:
                               the regular-dodecahedron face normals;
                               rotation-diversity stress on renormalize
   --uv-sphere-test            Dodecahedron-style UV sphere: many
-                              TangentPlane cells placed as real sphere
+                              TangentBlock cells placed as real sphere
                               geometry, not a flat slab reinterpretation
   --wrapped-planet            UV tangent-plane planet: 27x2x14
                               grass/dirt/stone slab with X-axis wrap

@@ -196,7 +196,9 @@ impl App {
                 .library
                 .get(node_id)
                 .and_then(|n| match n.children[slot as usize] {
-                    Child::Node(child_id) => Some(child_id),
+                    Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+                        Some(child_id)
+                    }
                     Child::Block(block) => {
                         out.push(format!(
                             "d{} slot={} parent={kind:?} -> Block({block})",
@@ -257,7 +259,7 @@ impl App {
             Child::EntityRef(idx) => {
                 format!("EntityRef({idx}) node_id={node_id} slot={slot}")
             }
-            Child::Node(child_id) => {
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
                 let desc = self
                     .world
                     .library

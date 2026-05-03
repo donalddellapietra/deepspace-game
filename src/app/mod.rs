@@ -711,6 +711,12 @@ pub(super) fn path_lands_on_tangent_block(
         let Some(parent) = library.get(node) else { return false };
         match parent.children[path.slot(k) as usize] {
             Child::Node(child_id) => node = child_id,
+            Child::PlacedNode { node: child_id, kind } => {
+                if k + 1 == path.depth() as usize {
+                    return kind.is_tangent_block();
+                }
+                node = child_id;
+            }
             _ => return false,
         }
     }
@@ -741,9 +747,10 @@ pub(super) fn frame_path_chain(
             None => return (rot, scale),
         };
         match n.children[frame_path.slot(k) as usize] {
-            Child::Node(child_id) => {
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+                let edge_kind = n.children[frame_path.slot(k) as usize].placement_kind();
                 if let Some(child_node) = library.get(child_id) {
-                    if let Some(b) = TbBoundary::from_kind(child_node.kind) {
+                    if let Some(b) = TbBoundary::from_kind(edge_kind.unwrap_or(child_node.kind)) {
                         rot = crate::world::mat3::matmul(&rot, &b.r);
                         scale *= b.tb_scale;
                     }
@@ -772,11 +779,11 @@ pub(super) fn frame_path_rotation(
             None => return rot,
         };
         match n.children[frame_path.slot(k) as usize] {
-            Child::Node(child_id) => {
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+                let edge_kind = n.children[frame_path.slot(k) as usize].placement_kind();
                 if let Some(child_node) = library.get(child_id) {
-                    match child_node.kind {
-                        NodeKind::TangentBlock { rotation }
-                        | NodeKind::TangentPlane { rotation } => {
+                    match edge_kind.unwrap_or(child_node.kind) {
+                        NodeKind::TangentBlock { rotation } => {
                             rot = crate::world::mat3::matmul(&rot, &rotation);
                         }
                         _ => {}

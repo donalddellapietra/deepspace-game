@@ -70,7 +70,7 @@ pub fn compute_render_frame(
         let Some(node) = library.get(node_id) else { break };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
-            Child::Node(child_id) => {
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
                 reached.push(slot as u8);
                 node_id = child_id;
                 kind = active_frame_kind_for_node(library, node_id);
@@ -111,7 +111,9 @@ pub fn render_frame_stop_reason(
         };
         let slot = target.slot(k) as usize;
         match node.children[slot] {
-            Child::Node(child_id) => { node_id = child_id; }
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
+                node_id = child_id;
+            }
             Child::Block(_) => return format!("Block@{}:s{}", k, slot),
             Child::Empty => return format!("Empty@{}:s{}", k, slot),
             Child::EntityRef(_) => return format!("Entity@{}:s{}", k, slot),

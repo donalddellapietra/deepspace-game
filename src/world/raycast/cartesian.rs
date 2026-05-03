@@ -118,8 +118,9 @@ pub(super) fn cpu_raycast_inner(
                     place_path: None,
                 });
             }
-            Child::Node(child_id) => {
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => {
                 let child_node = library.get(child_id)?;
+                let child_kind = child.placement_kind().unwrap_or(child_node.kind);
 
                 // Short-circuit fully-empty subtrees at any depth.
                 // Without this, the DDA descends into uniform-air
@@ -154,7 +155,7 @@ pub(super) fn cpu_raycast_inner(
                 // TangentBlock dispatch — frame-local rotation around
                 // (1.5, 1.5, 1.5). Mirrors the shader's march_cartesian.
                 // NO world-absolute coordinates.
-                if let Some(boundary) = super::TbBoundary::from_render_kind(child_node.kind) {
+                if let Some(boundary) = super::TbBoundary::from_render_kind(child_kind) {
                     let scale = 3.0 / parent_cell_size;
                     let lp_origin = [
                         (ray_origin[0] - child_origin[0]) * scale,

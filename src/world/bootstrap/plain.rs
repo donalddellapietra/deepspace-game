@@ -323,7 +323,7 @@ pub fn carve_air_pocket(world: &mut WorldState, anchor: &Path, total_depth: u8) 
         let Some(node) = world.library.get(node_id) else { return };
         node_stack.push((node_id, node.kind));
         match node.children[slot as usize] {
-            Child::Node(child_id) => node_id = child_id,
+            Child::Node(child_id) | Child::PlacedNode { node: child_id, .. } => node_id = child_id,
             // If the camera's anchor path crosses an Empty or Block
             // slot before reaching `carve_depth`, install a fresh
             // empty Node there so the walk can continue. Bottom-up
