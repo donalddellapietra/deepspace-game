@@ -384,6 +384,13 @@ impl App {
         let mut logical_path = position.anchor;
         let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
         logical_path.truncate(desired_depth);
+        // Render-frame root must not be a TangentBlock — see
+        // `App::render_frame` for the rationale.
+        while logical_path.depth() > 0
+            && path_lands_on_tangent_block(&world.library, world.root, &logical_path)
+        {
+            logical_path.truncate(logical_path.depth() - 1);
+        }
         let active_frame = frame::with_render_margin(
             &world.library, world.root, &logical_path, RENDER_FRAME_CONTEXT,
         );
@@ -507,10 +514,25 @@ impl App {
         let mut logical_path = self.camera.position.anchor;
         let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
         logical_path.truncate(desired_depth);
+        // The render frame's root must be Cartesian or WrappedPlane —
+        // never a TangentBlock. The shader's TB dispatch fires at TB
+        // *child* entry, not at the frame root, so a TB-rooted frame
+        // would be rendered as if it were axis-aligned. Truncate one
+        // level at a time until the path no longer lands on a TB.
+        // (Stops at root, where there's no TB by construction.)
+        while logical_path.depth() > 0
+            && self.path_lands_on_tangent_block(&logical_path)
+        {
+            logical_path.truncate(logical_path.depth() - 1);
+        }
         frame::with_render_margin(
             &self.world.library, self.world.root,
             &logical_path, RENDER_FRAME_CONTEXT,
         )
+    }
+
+    fn path_lands_on_tangent_block(&self, path: &Path) -> bool {
+        path_lands_on_tangent_block(&self.world.library, self.world.root, path)
     }
 
     /// `NodeKind` of the *intended* render-frame root from a tree
@@ -681,6 +703,35 @@ impl App {
             1.2,
         )
     }
+}
+
+/// True iff walking `path` from `world_root` lands on a node whose
+/// kind is `TangentBlock`. Returns false for paths that leave the
+/// tree (Block / Empty / EntityRef terminus) or for the root path
+/// (depth 0). Used by render-frame selection: the render frame's
+/// root must never be a TB, so callers truncate the path until this
+/// returns false.
+pub(super) fn path_lands_on_tangent_block(
+    library: &crate::world::tree::NodeLibrary,
+    world_root: crate::world::tree::NodeId,
+    path: &crate::world::anchor::Path,
+) -> bool {
+    use crate::world::tree::{Child, NodeKind};
+    if path.depth() == 0 {
+        return false;
+    }
+    let mut node = world_root;
+    for k in 0..path.depth() as usize {
+        let Some(parent) = library.get(node) else { return false };
+        match parent.children[path.slot(k) as usize] {
+            Child::Node(child_id) => node = child_id,
+            _ => return false,
+        }
+    }
+    library
+        .get(node)
+        .map(|n| matches!(n.kind, NodeKind::TangentBlock { .. }))
+        .unwrap_or(false)
 }
 
 /// Walk `frame_path` from `world_root`, accumulating the cumulative
