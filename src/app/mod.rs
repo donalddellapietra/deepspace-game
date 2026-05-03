@@ -569,7 +569,7 @@ impl App {
                     self.world.root,
                     &self.camera.position.anchor,
                 );
-                let rotated = mat3_transpose_mul_vec3(&anchor_rot, &step_world);
+                let rotated = crate::world::mat3::transpose_mul_vec3(&anchor_rot, &step_world);
                 let inv_scale = if anchor_scale > 1e-6 { 1.0 / anchor_scale } else { 1.0 };
                 let step_local = [
                     rotated[0] * inv_scale,
@@ -666,9 +666,9 @@ impl App {
         let frame_rot = frame_path_rotation(
             &self.world.library, self.world.root, &frame.render_path,
         );
-        let fwd_world_rot = mat3_transpose_mul_vec3(&frame_rot, &fwd_world);
-        let right_world_rot = mat3_transpose_mul_vec3(&frame_rot, &right_world);
-        let up_world_rot = mat3_transpose_mul_vec3(&frame_rot, &up_world);
+        let fwd_world_rot = crate::world::mat3::transpose_mul_vec3(&frame_rot, &fwd_world);
+        let right_world_rot = crate::world::mat3::transpose_mul_vec3(&frame_rot, &right_world);
+        let up_world_rot = crate::world::mat3::transpose_mul_vec3(&frame_rot, &up_world);
         let fwd_local = crate::world::sdf::normalize(fwd_world_rot);
         let right_local = crate::world::sdf::normalize(right_world_rot);
         let up_local = crate::world::sdf::normalize(up_world_rot);
@@ -744,7 +744,7 @@ pub(super) fn frame_path_chain(
             Child::Node(child_id) => {
                 if let Some(child_node) = library.get(child_id) {
                     if let Some(b) = TbBoundary::from_kind(child_node.kind) {
-                        rot = matmul3x3(&rot, &b.r);
+                        rot = crate::world::mat3::matmul(&rot, &b.r);
                         scale *= b.tb_scale;
                     }
                 }
@@ -764,27 +764,5 @@ pub(super) fn frame_path_rotation(
     frame_path: &crate::world::anchor::Path,
 ) -> [[f32; 3]; 3] {
     frame_path_chain(library, world_root, frame_path).0
-}
-
-fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut out = [[0.0f32; 3]; 3];
-    for c in 0..3 {
-        for r in 0..3 {
-            let mut s = 0.0f32;
-            for k in 0..3 {
-                s += a[k][r] * b[c][k];
-            }
-            out[c][r] = s;
-        }
-    }
-    out
-}
-
-pub(super) fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
 }
 

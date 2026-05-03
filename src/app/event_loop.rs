@@ -806,7 +806,7 @@ fn tangent_block_chain_summary(
                 if let Some(child_node) = library.get(child_id) {
                     if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
                         tb_seen = true;
-                        rot = matmul3x3_local(&rot, &r);
+                        rot = crate::world::mat3::matmul(&rot, &r);
                     }
                 }
                 node = child_id;
@@ -821,16 +821,3 @@ fn tangent_block_chain_summary(
     (tb_seen, yaw_rad.to_degrees())
 }
 
-fn matmul3x3_local(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut out = [[0.0f32; 3]; 3];
-    for c in 0..3 {
-        for r in 0..3 {
-            let mut s = 0.0f32;
-            for k in 0..3 {
-                s += a[k][r] * b[c][k];
-            }
-            out[c][r] = s;
-        }
-    }
-    out
-}

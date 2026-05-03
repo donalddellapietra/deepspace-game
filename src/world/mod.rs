@@ -5,6 +5,7 @@ pub mod edit;
 pub mod entities;
 pub mod fractals;
 pub mod gpu;
+pub mod mat3;
 pub mod palette;
 pub mod raycast;
 pub mod scene;

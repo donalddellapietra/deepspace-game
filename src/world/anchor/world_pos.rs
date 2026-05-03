@@ -578,7 +578,7 @@ impl WorldPos {
                 Child::Node(child) => {
                     if let Some(child_node) = library.get(child) {
                         if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
-                            common_rot = matmul3x3(&common_rot, &r);
+                            common_rot = crate::world::mat3::matmul(&common_rot, &r);
                         }
                     }
                     node = child;
@@ -611,7 +611,7 @@ impl WorldPos {
                 (sz as f32 - 1.0) * child_size,
             ];
             // Rotate, scale by cumulative TB shrink, add to centre.
-            let rotated = mat3_mul_vec3(&cur_rot, &centred_local);
+            let rotated = crate::world::mat3::mul_vec3(&cur_rot, &centred_local);
             cur_centre = [
                 cur_centre[0] + rotated[0] * cur_scale,
                 cur_centre[1] + rotated[1] * cur_scale,
@@ -625,7 +625,7 @@ impl WorldPos {
                     Child::Node(child_id) => {
                         if let Some(child_node) = library.get(child_id) {
                             if let Some(b) = TbBoundary::from_kind(child_node.kind) {
-                                cur_rot = matmul3x3(&cur_rot, &b.r);
+                                cur_rot = crate::world::mat3::matmul(&cur_rot, &b.r);
                                 cur_scale *= b.tb_scale;
                             }
                             node = child_id;
@@ -646,7 +646,7 @@ impl WorldPos {
             (self.offset[1] - 0.5) * cur_size,
             (self.offset[2] - 0.5) * cur_size,
         ];
-        let rotated_offset = mat3_mul_vec3(&cur_rot, &centred_offset_local);
+        let rotated_offset = crate::world::mat3::mul_vec3(&cur_rot, &centred_offset_local);
         let pos_common = [
             cur_centre[0] + rotated_offset[0] * cur_scale,
             cur_centre[1] + rotated_offset[1] * cur_scale,
@@ -722,33 +722,6 @@ impl WorldPos {
         debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
         Transition::None
     }
-}
-
-/// 3×3 matrix multiply, both column-major (`r[col][row]`).
-fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut out = [[0.0f32; 3]; 3];
-    for c in 0..3 {
-        for r in 0..3 {
-            let mut s = 0.0f32;
-            for k in 0..3 {
-                // (a · b)[r, c] = sum_k a[r, k] · b[k, c]
-                // a[r, k] = a[k][r];  b[k, c] = b[c][k]
-                s += a[k][r] * b[c][k];
-            }
-            out[c][r] = s;
-        }
-    }
-    out
-}
-
-/// Apply a column-major 3×3 matrix to a 3-vector: `(m · v).i =
-/// sum_j m[j][i] · v.j`.
-fn mat3_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2],
-        m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2],
-        m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2],
-    ]
 }
 
 /// Walk `library` from `world_root` along `path`'s slots; return the

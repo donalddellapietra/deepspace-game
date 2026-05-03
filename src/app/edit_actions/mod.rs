@@ -26,7 +26,7 @@ impl App {
         let frame_rot = super::frame_path_rotation(
             &self.world.library, self.world.root, frame_path,
         );
-        let rotated = super::mat3_transpose_mul_vec3(&frame_rot, &fwd);
+        let rotated = crate::world::mat3::transpose_mul_vec3(&frame_rot, &fwd);
         crate::world::sdf::normalize(rotated)
     }
 
