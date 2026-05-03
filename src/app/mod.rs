@@ -547,15 +547,23 @@ impl App {
             if len > 1e-6 {
                 let speed_cells_per_sec = 4.0;
                 let scale = speed_cells_per_sec * dt / len;
-                // Pure Cartesian step: `WorldPos.offset` is in the
-                // deepest cell's axis-aligned children frame for any
-                // node kind. TB rotation/scale lives in the shader
-                // (R^T·/tb_scale at TB-cell entry) as a render-only
-                // effect — it does NOT propagate to the offset's frame.
-                // So world step adds directly to offset.
-                let step = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
+                // `delta` is in WORLD axes (camera basis is in world
+                // frame). The offset stored in `WorldPos` lives in
+                // the deepest cell's children frame — for paths that
+                // cross a `TangentBlock`, that's `R^T · world`. Apply
+                // the cumulative anchor rotation's transpose so the
+                // step has the same axes as the offset BEFORE adding.
+                // `renormalize_world` then handles cell-boundary
+                // crossings (including TB rotation pivots) cell-locally.
+                let step_world = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
+                let anchor_rot = frame_path_rotation(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position.anchor,
+                );
+                let step_local = mat3_transpose_mul_vec3(&anchor_rot, &step_world);
                 self.camera.position.add_local(
-                    step,
+                    step_local,
                     &self.world.library,
                     self.world.root,
                 );
