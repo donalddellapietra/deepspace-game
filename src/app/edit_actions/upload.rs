@@ -60,6 +60,15 @@ impl App {
     }
 
     pub(in crate::app) fn upload_tree_lod(&mut self) {
+        // Force-extend the tree along the camera anchor so the
+        // render-frame walker reaches anchor depth. Without this, the
+        // anchor's sub-cell precision past empty/block leaves leaves a
+        // gap (anchor.depth() − render_path.depth()) that exceeds
+        // shader MAX_STACK_DEPTH=8 and the deepest cells are
+        // unrenderable. Idempotent: a no-op once the path's there.
+        let anchor_slots = self.camera.position.anchor;
+        self.world.ensure_anchor_extended(anchor_slots.as_slice());
+
         let intended_frame = self.target_render_frame();
         let effective_visual_depth = self.visual_depth();
         let upload_key = LodUploadKey::new(self.world.root);
