@@ -9,6 +9,36 @@ use crate::world::tree::{
     slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, IDENTITY_ROTATION, MAX_DEPTH,
 };
 
+/// UvRing topology constants — must match `march_uv_ring` in
+/// `assets/shaders/march.wgsl` and `cpu_raycast_uv_ring` in
+/// `src/world/raycast/uv_ring.rs`. Cell layout in the UvRing's
+/// local `[0, 3)³`:
+///   centre  = `(1.5, 1.5, 1.5)`
+///   radius  = 1.0
+///   side    = (2π·radius / N) · packing
+const UV_RING_CENTER: [f32; 3] = [1.5, 1.5, 1.5];
+const UV_RING_RADIUS: f32 = 1.0;
+const UV_RING_PACKING: f32 = 0.95;
+
+/// True when the first `slab_depth` slots of `anchor` form a valid
+/// UvRing slab descent path (every slot has `(sy, sz) == (0, 0)`).
+/// Used by `zoom_in_in_world` to skip UvRing entry when the camera
+/// is already inside a cell — subsequent zoom-ins fall through to
+/// the standard Cartesian DDA path on the cell content.
+fn anchor_traverses_uv_ring_slab(anchor: &Path, slab_depth: u8) -> bool {
+    if anchor.depth() < slab_depth {
+        return false;
+    }
+    for k in 0..slab_depth as usize {
+        let slot = anchor.slot(k);
+        let (_, sy, sz) = slot_coords(slot as usize);
+        if sy != 0 || sz != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// `(anchor, offset)` position with the offset held in `[0, 1)³`
 /// by invariant.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -328,6 +358,24 @@ impl WorldPos {
         library: &NodeLibrary,
         world_root: NodeId,
     ) -> Transition {
+        // UvRing world: the storage slab is `[N, 1, 1]`, so the
+        // standard 3³ geometric slot pick produces non-slab paths
+        // (every cell of the UvRing root with `sy != 0` or
+        // `sz != 0` is empty). Instead, project the camera onto the
+        // ring's topology to find which cell `cell_x` it's nearest,
+        // push the slab descent path for that cell, and apply the
+        // topology entry transform to the offset. After this, the
+        // anchor terminates at the cell's TangentBlock head and
+        // subsequent zoom-ins fall through to the standard
+        // Cartesian DDA path inside the cell content.
+        if let Some(root_node) = library.get(world_root) {
+            if let NodeKind::UvRing { dims, slab_depth } = root_node.kind {
+                if !anchor_traverses_uv_ring_slab(&self.anchor, slab_depth) {
+                    return self.zoom_in_uv_ring(library, world_root, dims, slab_depth);
+                }
+            }
+        }
+
         const BOUNDARY_EPS: f32 = 1e-3;
         // Resolve the parent node by walking the anchor in the tree.
         let parent = node_at_path(library, world_root, &self.anchor);
@@ -389,6 +437,122 @@ impl WorldPos {
             new_offset = b.enter_point(new_offset, 0.5);
         }
         self.offset = new_offset;
+        Transition::None
+    }
+
+    /// UvRing entry: replace the current anchor with the slab
+    /// descent path for the cell nearest to the camera in ring
+    /// topology, and transform the offset into the cell's local
+    /// `[0, 3)³` (cell-axis-aligned, then `R^T` via the cell head's
+    /// `TbBoundary`).
+    ///
+    /// **Why a special case:** the `[N, 1, 1]` storage slab maps
+    /// `cell_x` to slot path `(sx, 0, 0)` per ternary digit, which
+    /// has no relationship to the geometric `(offset · 3 → slot)`
+    /// pick the standard Cartesian zoom uses. Without this entry,
+    /// every zoom-in from a UvRing root pushes a slot like
+    /// `(sx, sy, sz)` with `sy != 0` or `sz != 0`, which is empty
+    /// in a `[N, 1, 1]` slab — the anchor descends into empty
+    /// space, render frame stops at root, and edits target nothing.
+    ///
+    /// The constants `UV_RING_*` MUST match the renderer's shader
+    /// (`march_uv_ring`) and the CPU raycast (`cpu_raycast_uv_ring`)
+    /// — if you change one, change all three.
+    fn zoom_in_uv_ring(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        dims: [u32; 3],
+        slab_depth: u8,
+    ) -> Transition {
+        use std::f32::consts::{PI, TAU};
+
+        if dims[0] == 0 || slab_depth == 0 {
+            return Transition::None;
+        }
+
+        // Snap the anchor back to the UvRing root and re-anchor the
+        // offset there. Necessary when the anchor has previously
+        // descended into empty 3³ slots of the UvRing root (which is
+        // what every standard zoom-in does on a UvRing world before
+        // this branch was added). World position is preserved.
+        let cam_in_root = self.in_frame_rot(library, world_root, &Path::root());
+        self.anchor = Path::root();
+        self.offset = [
+            cam_in_root[0] / WORLD_SIZE,
+            cam_in_root[1] / WORLD_SIZE,
+            cam_in_root[2] / WORLD_SIZE,
+        ];
+
+        // Camera world position in the UvRing's `[0, 3)³` frame.
+        let cam_in_ring = [
+            self.offset[0] * WORLD_SIZE,
+            self.offset[1] * WORLD_SIZE,
+            self.offset[2] * WORLD_SIZE,
+        ];
+
+        // Project the camera onto the ring (XZ plane) and find the
+        // nearest `cell_x`.
+        let dx = cam_in_ring[0] - UV_RING_CENTER[0];
+        let dz = cam_in_ring[2] - UV_RING_CENTER[2];
+        let theta_cam = dz.atan2(dx);
+        let u = (theta_cam + PI) / TAU;
+        let cell_x = ((u * dims[0] as f32).floor() as i32)
+            .rem_euclid(dims[0] as i32) as u32;
+
+        // Push the slab descent path for `cell_x`. The slab is
+        // `[N, 1, 1]`, so each level's slot is `(sx, 0, 0)` for the
+        // appropriate ternary digit of `cell_x`.
+        let mut cells_per_slot: u32 = 1;
+        for _ in 1..slab_depth {
+            cells_per_slot *= 3;
+        }
+        for _ in 0..slab_depth {
+            let sx = (cell_x / cells_per_slot) % 3;
+            let slot = slot_index(sx as usize, 0, 0) as u8;
+            self.anchor.push(slot);
+            cells_per_slot = (cells_per_slot / 3).max(1);
+        }
+
+        // Topology entry transform: ring frame → cell-axis-aligned
+        // `[0, 3)³`. The cell head is a `TangentBlock` carrying the
+        // ring tangent basis rotation; the `TbBoundary` descent
+        // rule below applies `R^T` so the final offset is in the
+        // cell's storage frame.
+        let cell_theta = -PI + (cell_x as f32 + 0.5) * TAU / dims[0] as f32;
+        let (st, ct) = cell_theta.sin_cos();
+        let radial = [ct, 0.0_f32, st];
+        let cell_center = [
+            UV_RING_CENTER[0] + radial[0] * UV_RING_RADIUS,
+            UV_RING_CENTER[1],
+            UV_RING_CENTER[2] + radial[2] * UV_RING_RADIUS,
+        ];
+        let arc = TAU * UV_RING_RADIUS / dims[0] as f32;
+        let cell_side = arc * UV_RING_PACKING;
+        let scale = WORLD_SIZE / cell_side;
+
+        let cell_local = [
+            (cam_in_ring[0] - cell_center[0]) * scale + 1.5,
+            (cam_in_ring[1] - cell_center[1]) * scale + 1.5,
+            (cam_in_ring[2] - cell_center[2]) * scale + 1.5,
+        ];
+        let mut new_offset = [
+            cell_local[0] / WORLD_SIZE,
+            cell_local[1] / WORLD_SIZE,
+            cell_local[2] / WORLD_SIZE,
+        ];
+
+        // Apply the cell head's `R^T` rotation about pivot 0.5
+        // (= 1.5 in storage `[0, 3)³`). Mirrors the standard TB
+        // descent rule at the bottom of the Cartesian path.
+        let descend_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
+        if let Some(b) = descend_kind.and_then(TbBoundary::from_kind) {
+            new_offset = b.enter_point(new_offset, 0.5);
+        }
+        self.offset = new_offset;
+
         Transition::None
     }
 
