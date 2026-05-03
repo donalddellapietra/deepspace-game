@@ -28,8 +28,11 @@ function fmtDist(v: number): string {
 function formatDebug(s: DebugOverlayState): string {
   const [rx, ry, rz] = s.cameraRootXyz;
   const [lx, ly, lz] = s.cameraLocal;
+  const [ox, oy, oz] = s.cameraOffset;
+  const [dwx, dwy, dwz] = s.worldDelta;
+  const [dox, doy, doz] = s.offsetDelta;
   const ts = new Date().toISOString();
-  return [
+  const lines = [
     `# debug overlay  ${ts}`,
     pad("fps", s.fps.toFixed(1)),
     pad("frame time", s.frameTimeMs.toFixed(2) + " ms"),
@@ -49,7 +52,14 @@ function formatDebug(s: DebugOverlayState): string {
     pad("local x", lx.toFixed(6)),
     pad("local y", ly.toFixed(6)),
     pad("local z", lz.toFixed(6)),
+    pad("offset x", ox.toFixed(6)),
+    pad("offset y", oy.toFixed(6)),
+    pad("offset z", oz.toFixed(6)),
     pad("fov", s.fov.toFixed(3)),
+    "",
+    "── per-frame delta ──",
+    pad("Δ world", `${fmtDist(dwx)}, ${fmtDist(dwy)}, ${fmtDist(dwz)}`),
+    pad("Δ offset", `${dox.toFixed(6)}, ${doy.toFixed(6)}, ${doz.toFixed(6)}`),
     "",
     "── frame ──",
     pad("active kind", s.activeFrameKind),
@@ -62,9 +72,30 @@ function formatDebug(s: DebugOverlayState): string {
     "── rotation ──",
     pad("TB on anchor path", s.tbOnAnchorPath ? "yes" : "no"),
     pad("cumulative yaw", s.anchorCumulativeYawDeg.toFixed(3) + "°"),
-    "",
-    pad("nodes", String(s.nodeCount)),
-  ].join("\n");
+  ];
+  if (s.lastTbCrossing) {
+    const c = s.lastTbCrossing;
+    const [bwx, bwy, bwz] = c.beforeWorld;
+    const [box, boy, boz] = c.beforeOffset;
+    const [awx, awy, awz] = c.afterWorld;
+    const [aox, aoy, aoz] = c.afterOffset;
+    lines.push(
+      "",
+      "── last TB boundary crossing ──",
+      pad("before tb_on_anchor", c.beforeTbOnAnchor ? "yes" : "no"),
+      pad("before world", `${fmtDist(bwx)}, ${fmtDist(bwy)}, ${fmtDist(bwz)}`),
+      pad("before offset", `${box.toFixed(6)}, ${boy.toFixed(6)}, ${boz.toFixed(6)}`),
+      "before anchor [" + c.beforeAnchor + "]",
+      pad("after tb_on_anchor", c.afterTbOnAnchor ? "yes" : "no"),
+      pad("after world", `${fmtDist(awx)}, ${fmtDist(awy)}, ${fmtDist(awz)}`),
+      pad("after offset", `${aox.toFixed(6)}, ${aoy.toFixed(6)}, ${aoz.toFixed(6)}`),
+      "after  anchor [" + c.afterAnchor + "]",
+      pad("after yaw", c.afterYawDeg.toFixed(3) + "°"),
+      pad("Δ world (cross)", `${fmtDist(awx - bwx)}, ${fmtDist(awy - bwy)}, ${fmtDist(awz - bwz)}`),
+    );
+  }
+  lines.push("", pad("nodes", String(s.nodeCount)));
+  return lines.join("\n");
 }
 
 /// Pure ASCII format for clipboard copy. Terminals choke on the
@@ -73,9 +104,12 @@ function formatDebug(s: DebugOverlayState): string {
 function formatDebugAscii(s: DebugOverlayState): string {
   const [rx, ry, rz] = s.cameraRootXyz;
   const [lx, ly, lz] = s.cameraLocal;
+  const [ox, oy, oz] = s.cameraOffset;
+  const [dwx, dwy, dwz] = s.worldDelta;
+  const [dox, doy, doz] = s.offsetDelta;
   const ts = new Date().toISOString();
   const kv = (k: string, v: string | number) => `${k}: ${v}`;
-  return [
+  const out: string[] = [
     `# debug ${ts}`,
     kv("fps", s.fps.toFixed(1)),
     kv("frame_ms", s.frameTimeMs.toFixed(2)),
@@ -91,7 +125,12 @@ function formatDebugAscii(s: DebugOverlayState): string {
     "[camera]",
     kv("root", `${fmtDist(rx)}, ${fmtDist(ry)}, ${fmtDist(rz)}`),
     kv("local", `${lx.toFixed(6)}, ${ly.toFixed(6)}, ${lz.toFixed(6)}`),
+    kv("offset", `${ox.toFixed(6)}, ${oy.toFixed(6)}, ${oz.toFixed(6)}`),
     kv("fov", s.fov.toFixed(3)),
+    "",
+    "[delta]",
+    kv("d_world", `${fmtDist(dwx)}, ${fmtDist(dwy)}, ${fmtDist(dwz)}`),
+    kv("d_offset", `${dox.toFixed(6)}, ${doy.toFixed(6)}, ${doz.toFixed(6)}`),
     "",
     "[frame]",
     kv("active_kind", s.activeFrameKind),
@@ -104,9 +143,30 @@ function formatDebugAscii(s: DebugOverlayState): string {
     "[rotation]",
     kv("tb_on_anchor", s.tbOnAnchorPath ? "yes" : "no"),
     kv("cumulative_yaw_deg", s.anchorCumulativeYawDeg.toFixed(3)),
-    "",
-    kv("nodes", s.nodeCount),
-  ].join("\n");
+  ];
+  if (s.lastTbCrossing) {
+    const c = s.lastTbCrossing;
+    const [bwx, bwy, bwz] = c.beforeWorld;
+    const [box, boy, boz] = c.beforeOffset;
+    const [awx, awy, awz] = c.afterWorld;
+    const [aox, aoy, aoz] = c.afterOffset;
+    out.push(
+      "",
+      "[last_tb_crossing]",
+      kv("before_tb_on_anchor", c.beforeTbOnAnchor ? "yes" : "no"),
+      kv("before_world", `${fmtDist(bwx)}, ${fmtDist(bwy)}, ${fmtDist(bwz)}`),
+      kv("before_offset", `${box.toFixed(6)}, ${boy.toFixed(6)}, ${boz.toFixed(6)}`),
+      kv("before_anchor", `[${c.beforeAnchor}]`),
+      kv("after_tb_on_anchor", c.afterTbOnAnchor ? "yes" : "no"),
+      kv("after_world", `${fmtDist(awx)}, ${fmtDist(awy)}, ${fmtDist(awz)}`),
+      kv("after_offset", `${aox.toFixed(6)}, ${aoy.toFixed(6)}, ${aoz.toFixed(6)}`),
+      kv("after_anchor", `[${c.afterAnchor}]`),
+      kv("after_yaw_deg", c.afterYawDeg.toFixed(3)),
+      kv("d_world_cross", `${fmtDist(awx - bwx)}, ${fmtDist(awy - bwy)}, ${fmtDist(awz - bwz)}`),
+    );
+  }
+  out.push("", kv("nodes", s.nodeCount));
+  return out.join("\n");
 }
 
 async function copyToClipboard(text: string): Promise<boolean> {

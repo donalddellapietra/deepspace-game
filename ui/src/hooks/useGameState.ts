@@ -90,6 +90,10 @@ const debugOverlayStore = createStore<DebugOverlayState>({
   pathDiag: "",
   tbOnAnchorPath: false,
   anchorCumulativeYawDeg: 0,
+  cameraOffset: [0, 0, 0],
+  worldDelta: [0, 0, 0],
+  offsetDelta: [0, 0, 0],
+  lastTbCrossing: null,
   copySeq: 0,
 });
 

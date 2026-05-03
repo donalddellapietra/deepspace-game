@@ -126,6 +126,41 @@ impl LodUploadKey {
     }
 }
 
+/// Snapshot of the previous frame's camera state, kept on `App` so
+/// the debug overlay can show per-frame deltas and detect TB
+/// boundary crossings.
+#[derive(Clone, Debug)]
+pub(super) struct PrevDebugFrame {
+    pub world_xyz: [f32; 3],
+    pub offset: [f32; 3],
+    pub anchor_csv: String,
+    pub tb_on_anchor: bool,
+    /// Currently unused but reserved — useful when debugging
+    /// boundary crossings that change anchor depth (e.g. zoom +
+    /// renormalize fighting at a frame edge).
+    #[allow(dead_code)]
+    pub anchor_depth: u8,
+}
+
+/// A pair of `(before, after)` camera-state snapshots captured the
+/// frame the anchor's `tb_on_anchor` flag toggled. Used to surface
+/// boundary-crossing diagnostics in the debug overlay.
+#[derive(Clone, Debug)]
+pub(super) struct TbCrossingSnapshot {
+    pub before_world: [f32; 3],
+    pub before_offset: [f32; 3],
+    pub before_anchor: String,
+    pub before_tb_on_anchor: bool,
+    pub after_world: [f32; 3],
+    pub after_offset: [f32; 3],
+    pub after_anchor: String,
+    pub after_tb_on_anchor: bool,
+    /// The anchor-rotation matrix at the deepest cell, just *after*
+    /// the crossing. Surfaced as a Y-only yaw approximation since
+    /// that's the format the existing rotation row already uses.
+    pub after_yaw_deg: f32,
+}
+
 pub struct App {
     pub(super) window: Option<Arc<Window>>,
     pub(super) renderer: Option<Renderer>,
@@ -245,6 +280,16 @@ pub struct App {
     /// instead of repacking. When true, pack/ribbon_build are 0.
     pub(super) last_reused_gpu_tree: bool,
     pub(super) last_path_diag: String,
+    /// Previous frame's debug state, used to compute per-frame
+    /// deltas (`world_delta`, `offset_delta`) and to detect TB
+    /// boundary crossings (anchor's `tb_on_anchor` flag toggling).
+    pub(super) prev_debug_frame: Option<PrevDebugFrame>,
+    /// Most recent TB-boundary crossing — captured automatically the
+    /// frame the anchor's `tb_on_anchor` flag toggles. Surfaces in
+    /// the debug overlay so the user can copy state immediately
+    /// after observing a visual jerk and the surrounding frames are
+    /// still in the snapshot.
+    pub(super) last_tb_crossing: Option<TbCrossingSnapshot>,
     pub(super) highlight_epoch: u64,
     pub(super) cached_highlight: Option<(HighlightCacheKey, Option<([f32; 3], [f32; 3])>)>,
     /// Last crosshair reticle state pushed to the overlay. Used by
@@ -466,6 +511,8 @@ impl App {
             last_effective_visual_depth: 0,
             last_reused_gpu_tree: false,
             last_path_diag: String::new(),
+            prev_debug_frame: None,
+            last_tb_crossing: None,
             highlight_epoch: 0,
             last_crosshair_sent: None,
             cached_highlight: None,

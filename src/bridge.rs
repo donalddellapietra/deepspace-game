@@ -139,6 +139,23 @@ pub struct DebugOverlayStateJs {
     /// Cumulative Y rotation along the anchor path, in degrees.
     /// (Approximation: only Y-axis rotations show meaningfully.)
     pub anchor_cumulative_yaw_deg: f32,
+    /// Camera offset in `[0, 1)³` of the deepest anchor cell.
+    /// Inside a `TangentBlock` ancestor, this lives in TB-storage
+    /// frame; outside it's world-aligned.
+    pub camera_offset: [f32; 3],
+    /// Per-frame world-position delta. `[0, 0, 0]` on the first
+    /// frame after spawn or whenever `prev_debug_frame` resets.
+    pub world_delta: [f32; 3],
+    /// Per-frame offset delta. Inside a TB the offset is in storage
+    /// frame, so a clean `world_delta` may show a rotated
+    /// `offset_delta`.
+    pub offset_delta: [f32; 3],
+    /// Most recent TB-boundary crossing. Captured automatically on
+    /// the frame `tb_on_anchor_path` toggles (in either direction).
+    /// Persists until the next crossing, so a player who sees a
+    /// jerk can copy the overlay several frames later and the
+    /// before/after pair is still attached.
+    pub last_tb_crossing: Option<TbCrossingJs>,
     /// Monotonic counter incremented each time the user presses `[`
     /// while the debug overlay is visible. The UI watches for
     /// changes and copies the formatted overlay text to the
@@ -147,6 +164,20 @@ pub struct DebugOverlayStateJs {
     /// keydown listener wouldn't fire while the canvas is pointer-
     /// locked.
     pub copy_seq: u64,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TbCrossingJs {
+    pub before_world: [f32; 3],
+    pub before_offset: [f32; 3],
+    pub before_anchor: String,
+    pub before_tb_on_anchor: bool,
+    pub after_world: [f32; 3],
+    pub after_offset: [f32; 3],
+    pub after_anchor: String,
+    pub after_tb_on_anchor: bool,
+    pub after_yaw_deg: f32,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]

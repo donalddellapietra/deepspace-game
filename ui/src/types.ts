@@ -86,7 +86,23 @@ export interface DebugOverlayState {
   pathDiag: string;
   tbOnAnchorPath: boolean;
   anchorCumulativeYawDeg: number;
+  cameraOffset: [number, number, number];
+  worldDelta: [number, number, number];
+  offsetDelta: [number, number, number];
+  lastTbCrossing: TbCrossing | null;
   copySeq: number;
+}
+
+export interface TbCrossing {
+  beforeWorld: [number, number, number];
+  beforeOffset: [number, number, number];
+  beforeAnchor: string;
+  beforeTbOnAnchor: boolean;
+  afterWorld: [number, number, number];
+  afterOffset: [number, number, number];
+  afterAnchor: string;
+  afterTbOnAnchor: boolean;
+  afterYawDeg: number;
 }
 
 // Union of all state updates pushed from Rust

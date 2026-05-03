@@ -443,6 +443,79 @@ impl App {
                     self.world.root,
                     &self.camera.position.anchor,
                 );
+
+            // Per-frame deltas + boundary-crossing capture. Saving
+            // the previous frame's state lets the overlay show how
+            // the camera's offset / world position shifted in a
+            // single tick — the smoking gun for the "jerk on TB
+            // boundary" diagnostic the regular two-snapshot copy
+            // cannot show.
+            let camera_offset = self.camera.position.offset;
+            let cur_anchor_csv = anchor_slots_csv.clone();
+            let cur_anchor_depth = anchor_depth;
+            let (world_delta, offset_delta) =
+                if let Some(prev) = self.prev_debug_frame.as_ref() {
+                    (
+                        [
+                            camera_root_xyz[0] - prev.world_xyz[0],
+                            camera_root_xyz[1] - prev.world_xyz[1],
+                            camera_root_xyz[2] - prev.world_xyz[2],
+                        ],
+                        [
+                            camera_offset[0] - prev.offset[0],
+                            camera_offset[1] - prev.offset[1],
+                            camera_offset[2] - prev.offset[2],
+                        ],
+                    )
+                } else {
+                    ([0.0; 3], [0.0; 3])
+                };
+
+            // If `tb_on_anchor_path` toggled since last frame OR the
+            // anchor at the cluster level (= just-past the buffer
+            // wraps) changed, capture the crossing. The first
+            // condition covers entering/exiting a TB; the second
+            // also catches sliding between two adjacent TB siblings
+            // with the same `tb_on_anchor` flag.
+            if let Some(prev) = self.prev_debug_frame.as_ref() {
+                let toggled = prev.tb_on_anchor != tb_on_anchor_path;
+                let anchor_changed = prev.anchor_csv != cur_anchor_csv;
+                if toggled || (anchor_changed && (tb_on_anchor_path || prev.tb_on_anchor)) {
+                    self.last_tb_crossing = Some(crate::app::TbCrossingSnapshot {
+                        before_world: prev.world_xyz,
+                        before_offset: prev.offset,
+                        before_anchor: prev.anchor_csv.clone(),
+                        before_tb_on_anchor: prev.tb_on_anchor,
+                        after_world: camera_root_xyz,
+                        after_offset: camera_offset,
+                        after_anchor: cur_anchor_csv.clone(),
+                        after_tb_on_anchor: tb_on_anchor_path,
+                        after_yaw_deg: anchor_cumulative_yaw_deg,
+                    });
+                }
+            }
+
+            self.prev_debug_frame = Some(crate::app::PrevDebugFrame {
+                world_xyz: camera_root_xyz,
+                offset: camera_offset,
+                anchor_csv: cur_anchor_csv,
+                tb_on_anchor: tb_on_anchor_path,
+                anchor_depth: cur_anchor_depth,
+            });
+
+            let last_tb_crossing_js = self.last_tb_crossing.as_ref().map(|c| {
+                crate::bridge::TbCrossingJs {
+                    before_world: c.before_world,
+                    before_offset: c.before_offset,
+                    before_anchor: c.before_anchor.clone(),
+                    before_tb_on_anchor: c.before_tb_on_anchor,
+                    after_world: c.after_world,
+                    after_offset: c.after_offset,
+                    after_anchor: c.after_anchor.clone(),
+                    after_tb_on_anchor: c.after_tb_on_anchor,
+                    after_yaw_deg: c.after_yaw_deg,
+                }
+            });
             // Keep the UI's zoom_level in sync with the live anchor
             // depth. `edit_actions::zoom` updates it on explicit zoom
             // input, but startup spawns + bootstrap defaults need
@@ -477,6 +550,10 @@ impl App {
                     path_diag: self.last_path_diag.clone(),
                     tb_on_anchor_path,
                     anchor_cumulative_yaw_deg,
+                    camera_offset,
+                    world_delta,
+                    offset_delta,
+                    last_tb_crossing: last_tb_crossing_js,
                     copy_seq: self.debug_copy_seq,
                 },
             ));
