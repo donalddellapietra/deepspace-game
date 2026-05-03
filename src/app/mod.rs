@@ -547,23 +547,16 @@ impl App {
             if len > 1e-6 {
                 let speed_cells_per_sec = 4.0;
                 let scale = speed_cells_per_sec * dt / len;
-                let step_world = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
-                // The `WorldPos.offset` lives in the deepest anchor
-                // cell's LOCAL frame, which equals world frame outside
-                // any TangentBlock but is rotated by the cumulative
-                // TB chain along the anchor when inside one.
-                // `add_local` adds delta directly to offset — so the
-                // world-frame WASD delta must first be R^T-rotated
-                // into that local frame, otherwise pressing forward
-                // inside a rotated cube drifts the offset off-axis.
-                let anchor_rot = frame_path_rotation(
-                    &self.world.library,
-                    self.world.root,
-                    &self.camera.position.anchor,
-                );
-                let step_local = mat3_transpose_mul_vec3(&anchor_rot, &step_world);
+                // The anchor representation is now pure Cartesian —
+                // `WorldPos.offset` is in the deepest cell's
+                // axis-aligned children frame regardless of whether
+                // any ancestor is a TangentBlock. TB rotation lives
+                // in the renderer (R^T·/tb_scale at TB-cell entry),
+                // not in the path. So world-frame WASD delta adds
+                // directly to offset — no anchor-chain R^T conversion.
+                let step = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
                 self.camera.position.add_local(
-                    step_local,
+                    step,
                     &self.world.library,
                     self.world.root,
                 );

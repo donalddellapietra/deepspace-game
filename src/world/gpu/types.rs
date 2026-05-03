@@ -2,7 +2,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::world::tree::NodeKind;
+use crate::world::tree::{inscribed_cube_scale, NodeKind};
 
 /// One child entry in the interleaved sparse-tree layout. 8 bytes.
 ///
@@ -93,12 +93,19 @@ impl GpuNodeKind {
                 kind: 1, dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
                 rot_col0: id_col0, rot_col1: id_col1, rot_col2: id_col2,
             },
-            NodeKind::TangentBlock { rotation } => Self {
-                kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
-                rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], 0.0],
-                rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
-                rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
-            },
+            NodeKind::TangentBlock { rotation } => {
+                // `tb_scale` lives in `rot_col0.w` (was unused
+                // padding). Renderer divides by it at TB-cell entry
+                // so the rotated content is inscribed inside its
+                // slot rather than poking into neighbours.
+                let tb_scale = inscribed_cube_scale(&rotation);
+                Self {
+                    kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
+                    rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], tb_scale],
+                    rot_col1: [rotation[1][0], rotation[1][1], rotation[1][2], 0.0],
+                    rot_col2: [rotation[2][0], rotation[2][1], rotation[2][2], 0.0],
+                }
+            }
         }
     }
 }
@@ -202,13 +209,16 @@ mod tests {
             rotation: IDENTITY_ROTATION,
         });
         assert_eq!(k.kind, 2);
-        assert_eq!(k.rot_col0, [1.0, 0.0, 0.0, 0.0]);
+        // Identity rotation has inscribed_cube_scale == 1.0 (no
+        // shrink). Stored in `rot_col0.w`.
+        assert_eq!(k.rot_col0, [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(k.rot_col1, [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(k.rot_col2, [0.0, 0.0, 1.0, 0.0]);
 
         let r = [[0.5, 0.6, 0.7], [0.1, 0.2, 0.3], [0.9, 0.8, 0.4]];
         let k = GpuNodeKind::from_node_kind(NodeKind::TangentBlock { rotation: r });
-        assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, 0.0]);
+        let expected_scale = inscribed_cube_scale(&r);
+        assert_eq!(k.rot_col0, [0.5, 0.6, 0.7, expected_scale]);
         assert_eq!(k.rot_col1, [0.1, 0.2, 0.3, 0.0]);
         assert_eq!(k.rot_col2, [0.9, 0.8, 0.4, 0.0]);
     }

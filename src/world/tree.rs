@@ -146,6 +146,28 @@ pub fn rotation_z(radians: f32) -> [[f32; 3]; 3] {
     ]
 }
 
+/// Largest uniform scale `s` such that `R · ([0, 1]³ centred at
+/// 0.5)` shrunk by `s` fits inside the unrotated `[0, 1]³`. Equal to
+/// `1 / max_i Σ_j |R[j][i]|`. For axis-aligned rotations this is
+/// `1.0` (no shrink needed); for a 45° rotation it's `1/√2 ≈ 0.707`;
+/// for the regular-dodecahedron face rotations it's `≈ 0.724`. The
+/// renderer applies `R^T·/s` at TB-cell entry so the rotated cube
+/// renders inscribed inside its slot rather than poking out.
+pub fn inscribed_cube_scale(r: &[[f32; 3]; 3]) -> f32 {
+    let mut max_extent = 0.0_f32;
+    for i in 0..3 {
+        let extent = r[0][i].abs() + r[1][i].abs() + r[2][i].abs();
+        if extent > max_extent {
+            max_extent = extent;
+        }
+    }
+    if max_extent < 1e-6 {
+        1.0
+    } else {
+        (1.0 / max_extent).min(1.0)
+    }
+}
+
 /// Compose two column-major rotations: returns `a · b` such that
 /// `(a · b) · v == a · (b · v)`. Used by world bootstraps that need
 /// a rotation expressed as the composition of axis rotations.
