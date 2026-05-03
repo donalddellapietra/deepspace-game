@@ -347,12 +347,20 @@ impl WorldPos {
         // Resolve the parent node by walking the anchor in the tree.
         let parent = node_at_path(library, world_root, &self.anchor);
         // Naive geometric pick (in current deepest cell's children frame).
+        // For OOB offsets (camera in TB-corner outside inscribed),
+        // use the CLAMPED slot for the subtraction so the new
+        // (slot, offset) pair represents the same world position as
+        // the input (slot + new_offset == old offset · 3 in parent
+        // frame). Don't re-clamp new_offset to [0, 1) — that would
+        // produce a different world position and cause the camera
+        // to "jump" on zoom.
         let mut coords = [0usize; 3];
         let mut new_offset = [0.0f32; 3];
         for i in 0..3 {
-            let s = (self.offset[i] * 3.0).floor();
-            coords[i] = s.clamp(0.0, 2.0) as usize;
-            new_offset[i] = (self.offset[i] * 3.0 - s).clamp(0.0, 1.0 - f32::EPSILON);
+            let s_unclamped = (self.offset[i] * 3.0).floor();
+            let s_clamped = s_unclamped.clamp(0.0, 2.0);
+            coords[i] = s_clamped as usize;
+            new_offset[i] = self.offset[i] * 3.0 - s_clamped;
         }
         // Tree-aware tie-break: per axis, if offset is near 0 or 1
         // (we just crossed a boundary) AND the geometric slot leads
