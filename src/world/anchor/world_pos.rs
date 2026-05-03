@@ -518,6 +518,92 @@ impl WorldPos {
         Self { anchor, offset }
     }
 
+    /// Build a `WorldPos` at `anchor_depth` whose world-frame
+    /// coordinates equal `world_xyz`. Walks the tree from the world
+    /// root, applying `R^T` about each `TangentBlock`'s centre to
+    /// pick the storage-frame slot at every level. Pure function on
+    /// the tree state — no `App`.
+    ///
+    /// This is the rotation-aware inverse of
+    /// `in_frame_rot(library, world_root, &Path::root())`, and is
+    /// the canonical way to set the camera's anchor when its world
+    /// position changes (movement, teleport, edit-driven snap).
+    /// Path-level Cartesian step_neighbor inherits source-cell slot
+    /// indices that are world-frame, but a TB's children are indexed
+    /// in storage frame — so a Cartesian step that pops up across a
+    /// TB ancestor places the camera at the wrong storage cell.
+    /// Re-deriving the anchor from world coordinates avoids that.
+    pub fn from_world_xyz(
+        world_xyz: [f32; 3],
+        anchor_depth: u8,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) -> Self {
+        let clamped = [
+            world_xyz[0].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            world_xyz[1].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+            world_xyz[2].clamp(0.0, WORLD_SIZE - f32::EPSILON),
+        ];
+        let mut anchor = Path::root();
+        // `pos` lives in the current node's local `[0, WORLD_SIZE)³`
+        // frame; for descendants of a TB this is the storage-frame
+        // local coordinate after applying `R^T` about the TB centre
+        // when we reach the TB level.
+        let mut pos = clamped;
+        let mut have_node = true;
+        let mut node = world_root;
+
+        for _ in 0..anchor_depth {
+            // If the current node is a TB, its children are indexed
+            // in storage frame: rotate `pos` by `R^T` about (1.5,
+            // 1.5, 1.5) before flooring to a slot.
+            if have_node {
+                if let Some(n) = library.get(node) {
+                    if let NodeKind::TangentBlock { rotation: r } = n.kind {
+                        let centered = [pos[0] - 1.5, pos[1] - 1.5, pos[2] - 1.5];
+                        // R^T · centered (column-major `r[col][row]`).
+                        let rotated = [
+                            r[0][0] * centered[0] + r[0][1] * centered[1] + r[0][2] * centered[2],
+                            r[1][0] * centered[0] + r[1][1] * centered[1] + r[1][2] * centered[2],
+                            r[2][0] * centered[0] + r[2][1] * centered[1] + r[2][2] * centered[2],
+                        ];
+                        pos = [rotated[0] + 1.5, rotated[1] + 1.5, rotated[2] + 1.5];
+                    }
+                }
+            }
+            let sx = (pos[0].floor() as i32).clamp(0, 2) as usize;
+            let sy = (pos[1].floor() as i32).clamp(0, 2) as usize;
+            let sz = (pos[2].floor() as i32).clamp(0, 2) as usize;
+            let slot = slot_index(sx, sy, sz);
+            anchor.push(slot as u8);
+            // Sub-cell position in child's `[0, WORLD_SIZE)³` frame.
+            pos = [
+                (pos[0] - sx as f32) * 3.0,
+                (pos[1] - sy as f32) * 3.0,
+                (pos[2] - sz as f32) * 3.0,
+            ];
+            // Descend into child node so the next iteration can
+            // detect a TB at the new level.
+            if have_node {
+                if let Some(n) = library.get(node) {
+                    match n.children[slot] {
+                        Child::Node(child) => node = child,
+                        _ => have_node = false,
+                    }
+                } else {
+                    have_node = false;
+                }
+            }
+        }
+
+        let offset = [
+            (pos[0] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+            (pos[1] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+            (pos[2] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
+        ];
+        Self { anchor, offset }
+    }
+
     /// Pop the deepest slot. Offset rescaled so the world position
     /// is unchanged. Clamps at root.
     pub fn zoom_out(&mut self) -> Transition {
