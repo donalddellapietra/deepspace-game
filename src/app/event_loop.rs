@@ -380,12 +380,9 @@ impl App {
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Cartesian
                 | crate::app::ActiveFrameKind::WrappedPlane { .. }
-                | crate::app::ActiveFrameKind::UvRing { .. } => {
-                    self.camera.position.in_frame_rot(
-                        &self.world.library,
-                        self.world.root,
-                        &self.active_frame.render_path,
-                    )
+                | crate::app::ActiveFrameKind::UvRing { .. }
+                | crate::app::ActiveFrameKind::UvRingCell { .. } => {
+                    self.camera_local_for_active_frame(&self.active_frame)
                 }
             };
             // Camera position in root-frame world coords (rotation-
@@ -416,6 +413,9 @@ impl App {
                 crate::app::ActiveFrameKind::UvRing { dims, slab_depth } => {
                     format!("UvRing(dims={dims:?}, slab_d={slab_depth})")
                 }
+                crate::app::ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
+                    format!("UvRingCell(dims={dims:?}, slab_d={slab_depth}, x={cell_x})")
+                }
             };
             let render_path_csv = self
                 .active_frame
@@ -435,12 +435,15 @@ impl App {
                 .join(",");
             let desired_depth = self.camera.position.anchor.depth()
                 .saturating_sub(crate::app::RENDER_FRAME_K);
-            let render_stop_reason = crate::app::frame::render_frame_stop_reason(
-                &self.world.library,
-                self.world.root,
-                &self.camera.position.anchor,
-                desired_depth,
-            );
+            let render_stop_reason = match intended_frame.kind {
+                crate::app::ActiveFrameKind::UvRingCell { .. } => "ok".to_string(),
+                _ => crate::app::frame::render_frame_stop_reason(
+                    &self.world.library,
+                    self.world.root,
+                    &self.camera.position.anchor,
+                    desired_depth,
+                ),
+            };
             let (tb_on_anchor_path, anchor_cumulative_yaw_deg) =
                 tangent_block_chain_summary(
                     &self.world.library,
