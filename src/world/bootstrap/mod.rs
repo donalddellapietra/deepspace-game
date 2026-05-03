@@ -7,6 +7,7 @@
 use super::anchor::{Path, WorldPos};
 use super::state::WorldState;
 
+mod dodecahedron_test;
 mod plain;
 mod rotated_cube_test;
 mod vox;
@@ -108,6 +109,12 @@ pub enum WorldPreset {
     /// Step-1 unit primitive: a single `TangentBlock` at tree depth 3,
     /// rotated 45° around Y, in an otherwise empty world.
     RotatedCubeTest,
+    /// Multi-TB primitive: an unrotated centre cube surrounded by
+    /// twelve `TangentBlock` cubes occupying the cube-edge slots,
+    /// each rotated to a regular dodecahedron face normal. Stresses
+    /// `renormalize_world` against twelve distinct *non*-axis-aligned
+    /// rotations.
+    DodecahedronTest,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -139,6 +146,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         // — entities don't auto-rest on it in Phase 1.
         WorldPreset::WrappedPlanet { .. } => None,
         WorldPreset::RotatedCubeTest => None,
+        WorldPreset::DodecahedronTest => None,
     }
 }
 
@@ -223,6 +231,9 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         ),
         WorldPreset::RotatedCubeTest => {
             rotated_cube_test::bootstrap_rotated_cube_test_world()
+        }
+        WorldPreset::DodecahedronTest => {
+            dodecahedron_test::bootstrap_dodecahedron_test_world()
         }
     }
 }

@@ -196,6 +196,9 @@ impl TestConfig {
                 "--rotated-cube-test" => {
                     cfg.world_preset = WorldPreset::RotatedCubeTest;
                 }
+                "--dodecahedron-test" => {
+                    cfg.world_preset = WorldPreset::DodecahedronTest;
+                }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
@@ -529,6 +532,11 @@ FRACTAL PRESETS (default plain-layers = 8):
 VISIBILITY TEST PRESETS:
   --stars-world               Planet cube + distant stars at varying ribbon
                               depths; validates precision across deep pops
+  --rotated-cube-test         Single 45°-Y rotated TangentBlock; depth-30
+                              precision stress for the unit primitive
+  --dodecahedron-test         Centre cube + 12 TangentBlocks rotated to
+                              the regular-dodecahedron face normals;
+                              rotation-diversity stress on renormalize
   --wrapped-planet            Wrapped-Cartesian planet: 27x2x14
                               grass/dirt/stone slab with X-axis wrap
                               (longitude). Default total tree depth: 25
