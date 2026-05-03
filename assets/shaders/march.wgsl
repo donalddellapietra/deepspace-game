@@ -1629,17 +1629,23 @@ fn march_wrapped_planet(
 // The ring is implicitly in `[0, 3)³` — no `body_origin` / `body_size`
 // parameters; every transform stays cell-local. The ring centre is
 // `(1.5, 1.5, 1.5)`, the radius is fixed at `RING_RADIUS`, and each
-// cell is a cube of side `arc · RING_PACKING`. For `dims_x = 27`,
-// `arc ≈ 0.233` and the cell side ≈ `0.221` — comfortably within
-// the ring's `[0, 3)³`.
+// cell is a cube of side `arc · RING_PACKING`.
+//
+// **Topology adapter does TRANSLATE + SCALE only** — no rotation.
+// Each cell's storage child is a `TangentBlock` whose stored
+// rotation is the ring tangent basis at that cell. The TB primitive
+// applies `R^T` at descent (inside `march_in_tangent_cube`), so the
+// rotation lives in the tree, not in the marcher. Identical to how
+// `dodecahedron_test` rotates each cell via stored TB rotation.
 //
 // O(N) ray loop. Each iteration:
-//   1. Ring tangent basis at `θ = -π + (cell_x + 0.5)·2π/N`.
-//   2. Lookup cell content via `sample_slab_cell(ring, depth, x, 0, 0)`.
-//   3. Transform the ray into the cell's local `[0, 3)³`
-//      (rotate by tangent / radial / up; scale by `3 / cell_side`).
-//   4. Dispatch `march_in_tangent_cube` on the cell content.
-//   5. Keep the closest hit across all cells.
+//   1. Ring radial direction at `θ = -π + (cell_x + 0.5)·2π/N`.
+//   2. Cell centre in ring frame: `ring_centre + radial · RING_RADIUS`.
+//   3. Lookup cell content via `sample_slab_cell(ring, depth, x, 0, 0)`.
+//   4. Transform the ray into the cell's axis-aligned `[0, 3)³`
+//      (translate by `cell_centre`, scale by `3 / cell_side`).
+//   5. Dispatch `march_in_tangent_cube` on the cell content (a TB).
+//   6. Keep the closest hit across all cells.
 fn march_uv_ring(
     ring_idx: u32,
     ray_origin: vec3<f32>,
@@ -1659,12 +1665,6 @@ fn march_uv_ring(
 
     let pi = 3.14159265;
     let ring_center = vec3<f32>(1.5, 1.5, 1.5);
-    // Ring radius and per-cell packing: chosen so the cells fit
-    // comfortably inside `[0, 3)³` with no overlap, regardless of
-    // `dims_x`. `RING_RADIUS = 1.0` keeps the cell centres at radius
-    // 1.0 from the ring centre — well within the cube. The 0.95
-    // packing factor leaves a small tangential gap between cells so
-    // the cube AABBs don't touch.
     let ring_radius = 1.0;
     let arc = (2.0 * pi * ring_radius) / f32(dims_x);
     let cell_side = arc * 0.95;
@@ -1676,25 +1676,17 @@ fn march_uv_ring(
         let theta = -pi + (f32(cell_x) + 0.5) * (2.0 * pi / f32(dims_x));
         let st = sin(theta);
         let ct = cos(theta);
-        let tangent = vec3<f32>(-st, 0.0, ct);
         let radial = vec3<f32>(ct, 0.0, st);
-        let up = vec3<f32>(0.0, 1.0, 0.0);
         let cell_center = ring_center + radial * ring_radius;
 
         let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
         if sample.block_type == 0xFFFEu { continue; }
 
-        let d_origin = ray_origin - cell_center;
-        let local_origin = vec3<f32>(
-            dot(tangent, d_origin) * scale + 1.5,
-            dot(radial, d_origin) * scale + 1.5,
-            dot(up, d_origin) * scale + 1.5,
-        );
-        let local_dir = vec3<f32>(
-            dot(tangent, ray_dir_in) * scale,
-            dot(radial, ray_dir_in) * scale,
-            dot(up, ray_dir_in) * scale,
-        );
+        // Translate + scale only — no rotation. The TB head at
+        // the cell's storage tip applies the ring tangent basis
+        // R^T at descent, mirroring the dodecahedron pattern.
+        let local_origin = (ray_origin - cell_center) * scale + vec3<f32>(1.5);
+        let local_dir = ray_dir_in * scale;
 
         if sample.tag == 2u {
             let sub = march_in_tangent_cube(sample.child_idx, local_origin, local_dir);
@@ -1709,9 +1701,9 @@ fn march_uv_ring(
                 out.hit = true;
                 out.t = sub.t;
                 out.color = sub.color * (0.7 + 0.3 * local_bevel);
-                out.normal = tangent * sub.normal.x
-                           + radial * sub.normal.y
-                           + up * sub.normal.z;
+                // Cell axes are world-aligned in the topology adapter,
+                // so `sub.normal` is already in the ring frame.
+                out.normal = sub.normal;
                 out.frame_level = 0u;
                 out.frame_scale = 1.0;
                 let hit_world = ray_origin + ray_dir_in * sub.t;
@@ -1750,9 +1742,10 @@ fn march_uv_ring(
                     out.hit = true;
                     out.t = t_local;
                     out.color = palette[sample.block_type].rgb * (0.7 + 0.3 * local_bevel);
-                    out.normal = tangent * local_normal.x
-                               + radial * local_normal.y
-                               + up * local_normal.z;
+                    // Cell axes are world-aligned (topology adapter
+                    // does no rotation), so `local_normal` is already
+                    // in the ring frame.
+                    out.normal = local_normal;
                     out.frame_level = 0u;
                     out.frame_scale = 1.0;
                     let hit_world = ray_origin + ray_dir_in * t_local;
