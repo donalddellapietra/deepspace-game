@@ -551,10 +551,10 @@ impl App {
         let valid_cell_x = uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth);
         let cell_x = valid_cell_x.unwrap_or_else(|| self.nearest_uv_ring_cell_x(dims));
         let cell_local = self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x);
-        if !uv_ring_cell_local_is_near(cell_local, slab_depth) {
+        if !uv_ring_cell_local_is_near_ring_slab(cell_local, slab_depth) {
             return None;
         }
-        let mut logical_path = if valid_cell_x.is_some() {
+        let logical_path = if valid_cell_x.is_some() {
             let mut path = self.camera.position.anchor;
             path.truncate(desired_depth);
             path
@@ -569,29 +569,19 @@ impl App {
             }
             path
         };
-        if logical_path.depth() < slab_depth {
-            logical_path = uv_ring_cell_path(cell_x, slab_depth);
-        }
+        let logical_path = if logical_path.depth() < slab_depth {
+            uv_ring_cell_path(cell_x, slab_depth)
+        } else {
+            logical_path
+        };
         let mut render_path = logical_path;
         render_path.truncate(render_path.depth().saturating_sub(RENDER_FRAME_CONTEXT).max(slab_depth));
-        let mut render = frame::compute_render_frame(
+        let render = frame::compute_render_frame(
             &self.world.library,
             self.world.root,
             &render_path,
             render_path.depth(),
         );
-        while render.render_path != render_path && render_path.depth() > slab_depth {
-            render_path.truncate(render_path.depth() - 1);
-            render = frame::compute_render_frame(
-                &self.world.library,
-                self.world.root,
-                &render_path,
-                render_path.depth(),
-            );
-        }
-        if render.render_path != render_path {
-            return None;
-        }
         Some(ActiveFrame {
             render_path,
             logical_path,
@@ -790,19 +780,10 @@ impl App {
     pub(super) fn camera_local_for_active_frame(&self, frame: &ActiveFrame) -> [f32; 3] {
         match frame.kind {
             ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
-                if uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)
-                    == Some(cell_x)
-                {
-                    self.camera.position.in_frame_rot(
-                        &self.world.library,
-                        self.world.root,
-                        &frame.render_path,
-                    )
-                } else {
-                    let cell_local =
-                        self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x);
-                    cartesian_local_in_path_suffix(cell_local, &frame.render_path, slab_depth)
-                }
+                let cell_local =
+                    self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x);
+                let stick_root_local = uv_ring_cell_local_to_stick_root(dims, cell_x, cell_local);
+                cartesian_local_in_path(stick_root_local, &frame.render_path)
             }
             ActiveFrameKind::UvRing { dims, slab_depth } => {
                 if let Some(cell_x) =
@@ -841,7 +822,8 @@ impl App {
             ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
                 let cell_dir = uv_ring_cell_frame(dims, slab_depth, cell_x)
                     .dir_to_local(dir_world);
-                cartesian_dir_in_path_suffix(cell_dir, &frame.render_path, slab_depth)
+                let stick_root_dir = uv_ring_cell_dir_to_stick_root(dims, cell_dir);
+                cartesian_dir_in_path(stick_root_dir, &frame.render_path)
             }
             ActiveFrameKind::UvRing { dims, slab_depth } => {
                 let _ = (dims, slab_depth);
@@ -990,15 +972,15 @@ pub(super) fn uv_ring_cell_path(cell_x: u32, slab_depth: u8) -> Path {
     path
 }
 
-fn cartesian_dir_in_path_suffix(mut d: [f32; 3], path: &Path, suffix_start: u8) -> [f32; 3] {
-    for _ in suffix_start as usize..path.depth() as usize {
+fn cartesian_dir_in_path(mut d: [f32; 3], path: &Path) -> [f32; 3] {
+    for _ in 0..path.depth() as usize {
         d = [d[0] * 3.0, d[1] * 3.0, d[2] * 3.0];
     }
     d
 }
 
-fn cartesian_local_in_path_suffix(mut p: [f32; 3], path: &Path, suffix_start: u8) -> [f32; 3] {
-    for k in suffix_start as usize..path.depth() as usize {
+fn cartesian_local_in_path(mut p: [f32; 3], path: &Path) -> [f32; 3] {
+    for k in 0..path.depth() as usize {
         let (sx, sy, sz) = crate::world::tree::slot_coords(path.slot(k) as usize);
         p = [
             (p[0] - sx as f32) * 3.0,
@@ -1036,6 +1018,25 @@ fn ternary_coord(v: f32) -> usize {
     }
 }
 
+fn uv_ring_cell_local_to_stick_root(
+    dims: [u32; 3],
+    cell_x: u32,
+    cell_local: [f32; 3],
+) -> [f32; 3] {
+    let cell_size = crate::world::anchor::WORLD_SIZE / dims[0] as f32;
+    [
+        cell_x as f32 * cell_size + cell_local[0] * (cell_size / crate::world::anchor::WORLD_SIZE),
+        cell_local[1] * (cell_size / crate::world::anchor::WORLD_SIZE),
+        cell_local[2] * (cell_size / crate::world::anchor::WORLD_SIZE),
+    ]
+}
+
+fn uv_ring_cell_dir_to_stick_root(dims: [u32; 3], cell_dir: [f32; 3]) -> [f32; 3] {
+    let cell_size = crate::world::anchor::WORLD_SIZE / dims[0] as f32;
+    let scale = cell_size / crate::world::anchor::WORLD_SIZE;
+    [cell_dir[0] * scale, cell_dir[1] * scale, cell_dir[2] * scale]
+}
+
 pub(super) fn uv_ring_cell_x_from_path(path: &Path, slab_depth: u8) -> Option<u32> {
     if path.depth() < slab_depth {
         return None;
@@ -1055,13 +1056,14 @@ fn uv_ring_cell_local_is_inside(p: [f32; 3]) -> bool {
     p.iter().all(|v| v.is_finite()) && p.iter().all(|&v| (0.0..3.0).contains(&v))
 }
 
-fn uv_ring_cell_local_is_near(p: [f32; 3], slab_depth: u8) -> bool {
+fn uv_ring_cell_local_is_near_ring_slab(p: [f32; 3], slab_depth: u8) -> bool {
     const ENTRY_DEPTH: u8 = 7;
     let extra_depth = ENTRY_DEPTH.saturating_sub(slab_depth) as i32;
     let entry_margin = 3.0 / 3.0_f32.powi(extra_depth);
     p.iter().all(|v| v.is_finite())
-        && p.iter()
-            .all(|&v| (-entry_margin..(3.0 + entry_margin)).contains(&v))
+        && (-1.5..4.5).contains(&p[0])
+        && (-entry_margin..(3.0 + entry_margin)).contains(&p[1])
+        && (-entry_margin..(3.0 + entry_margin)).contains(&p[2])
 }
 
 /// True iff walking `path` from `world_root` lands on a node whose
