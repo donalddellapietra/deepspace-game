@@ -612,18 +612,101 @@ impl App {
         );
     }
 
+    pub(super) fn position_in_render_frame(&self, frame_path: &Path) -> [f32; 3] {
+        let root = Path::root();
+        let pos = self.camera.position.in_frame(&root);
+        self.point_root_to_render_frame(pos, frame_path)
+    }
+
+    pub(super) fn direction_in_render_frame(
+        &self,
+        dir: [f32; 3],
+        frame_path: &Path,
+    ) -> [f32; 3] {
+        let mut out = dir;
+        let mut node = self.world.root;
+        for k in 0..frame_path.depth() as usize {
+            let Some(parent) = self.world.library.get(node) else { break };
+            let slot = frame_path.slot(k) as usize;
+            out = [out[0] * 3.0, out[1] * 3.0, out[2] * 3.0];
+            match parent.children[slot] {
+                crate::world::tree::Child::Node(child_id) => {
+                    if let Some(child) = self.world.library.get(child_id) {
+                        if let crate::world::tree::NodeKind::TangentBlock { rotation } = child.kind {
+                            let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation);
+                            out = [
+                                (rotation[0][0] * out[0] + rotation[0][1] * out[1] + rotation[0][2] * out[2]) / tb_scale,
+                                (rotation[1][0] * out[0] + rotation[1][1] * out[1] + rotation[1][2] * out[2]) / tb_scale,
+                                (rotation[2][0] * out[0] + rotation[2][1] * out[1] + rotation[2][2] * out[2]) / tb_scale,
+                            ];
+                        }
+                    }
+                    node = child_id;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    pub(super) fn render_frame_crosses_tangent_block(&self, frame_path: &Path) -> bool {
+        let mut node = self.world.root;
+        for k in 0..frame_path.depth() as usize {
+            let Some(parent) = self.world.library.get(node) else { return false };
+            match parent.children[frame_path.slot(k) as usize] {
+                crate::world::tree::Child::Node(child_id) => {
+                    if let Some(child) = self.world.library.get(child_id) {
+                        if matches!(
+                            child.kind,
+                            crate::world::tree::NodeKind::TangentBlock { .. }
+                        ) {
+                            return true;
+                        }
+                    }
+                    node = child_id;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn point_root_to_render_frame(&self, mut pos: [f32; 3], frame_path: &Path) -> [f32; 3] {
+        let mut node = self.world.root;
+        for k in 0..frame_path.depth() as usize {
+            let Some(parent) = self.world.library.get(node) else { break };
+            let slot = frame_path.slot(k) as usize;
+            let (sx, sy, sz) = crate::world::tree::slot_coords(slot);
+            pos = [
+                (pos[0] - sx as f32) * 3.0,
+                (pos[1] - sy as f32) * 3.0,
+                (pos[2] - sz as f32) * 3.0,
+            ];
+            match parent.children[slot] {
+                crate::world::tree::Child::Node(child_id) => {
+                    if let Some(child) = self.world.library.get(child_id) {
+                        if let crate::world::tree::NodeKind::TangentBlock { rotation } = child.kind {
+                            let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation);
+                            let centered = [pos[0] - 1.5, pos[1] - 1.5, pos[2] - 1.5];
+                            pos = [
+                                (rotation[0][0] * centered[0] + rotation[0][1] * centered[1] + rotation[0][2] * centered[2]) / tb_scale + 1.5,
+                                (rotation[1][0] * centered[0] + rotation[1][1] * centered[1] + rotation[1][2] * centered[2]) / tb_scale + 1.5,
+                                (rotation[2][0] * centered[0] + rotation[2][1] * centered[1] + rotation[2][2] * centered[2]) / tb_scale + 1.5,
+                            ];
+                        }
+                    }
+                    node = child_id;
+                }
+                _ => break,
+            }
+        }
+        pos
+    }
+
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                // Rotation-aware: when the anchor path crosses a
-                // TangentBlock, every slot offset past it (and the
-                // final offset) must be rotated by the cumulative
-                // chain rotation. Plain `in_frame` walks Cartesian
-                // and gets the wrong world position for cameras
-                // inside a rotated subtree.
-                self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame.render_path,
-                )
+                self.position_in_render_frame(&frame.render_path)
             }
         };
         if self.startup_profile_frames < 4 {
@@ -636,20 +719,15 @@ impl App {
             );
         }
         let (fwd_world, right_world, up_world) = self.camera.basis();
-        // Walk the frame path from world root; if any node along the
-        // way is a TangentBlock with non-identity rotation, accumulate
-        // R into `frame_rot`. The frame's local frame is rotated R
-        // relative to world, so to express world-direction vectors in
-        // frame-local we apply R^T.
-        let frame_rot = frame_path_rotation(
-            &self.world.library, self.world.root, &frame.render_path,
+        let fwd_local = crate::world::sdf::normalize(
+            self.direction_in_render_frame(fwd_world, &frame.render_path),
         );
-        let fwd_world_rot = mat3_transpose_mul_vec3(&frame_rot, &fwd_world);
-        let right_world_rot = mat3_transpose_mul_vec3(&frame_rot, &right_world);
-        let up_world_rot = mat3_transpose_mul_vec3(&frame_rot, &up_world);
-        let fwd_local = crate::world::sdf::normalize(fwd_world_rot);
-        let right_local = crate::world::sdf::normalize(right_world_rot);
-        let up_local = crate::world::sdf::normalize(up_world_rot);
+        let right_local = crate::world::sdf::normalize(
+            self.direction_in_render_frame(right_world, &frame.render_path),
+        );
+        let up_local = crate::world::sdf::normalize(
+            self.direction_in_render_frame(up_world, &frame.render_path),
+        );
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera basis world_fwd={:?} frame_local_fwd={:?} local_right={:?} local_up={:?}",
@@ -667,59 +745,4 @@ impl App {
             1.2,
         )
     }
-}
-
-/// Walk `frame_path` from `world_root`, multiplying any rotation
-/// from `NodeKind::TangentBlock` along the way. Returns the
-/// cumulative rotation that takes the FRAME's local frame to the
-/// world root frame. Identity for any path that doesn't cross a
-/// rotated node.
-pub(super) fn frame_path_rotation(
-    library: &crate::world::tree::NodeLibrary,
-    world_root: crate::world::tree::NodeId,
-    frame_path: &crate::world::anchor::Path,
-) -> [[f32; 3]; 3] {
-    use crate::world::tree::{Child, NodeKind, IDENTITY_ROTATION};
-    let mut rot = IDENTITY_ROTATION;
-    let mut node = world_root;
-    for k in 0..(frame_path.depth() as usize) {
-        let n = match library.get(node) {
-            Some(n) => n,
-            None => return rot,
-        };
-        match n.children[frame_path.slot(k) as usize] {
-            Child::Node(child_id) => {
-                if let Some(child_node) = library.get(child_id) {
-                    if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
-                        rot = matmul3x3(&rot, &r);
-                    }
-                }
-                node = child_id;
-            }
-            _ => return rot,
-        }
-    }
-    rot
-}
-
-fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut out = [[0.0f32; 3]; 3];
-    for c in 0..3 {
-        for r in 0..3 {
-            let mut s = 0.0f32;
-            for k in 0..3 {
-                s += a[k][r] * b[c][k];
-            }
-            out[c][r] = s;
-        }
-    }
-    out
-}
-
-pub(super) fn mat3_transpose_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
 }

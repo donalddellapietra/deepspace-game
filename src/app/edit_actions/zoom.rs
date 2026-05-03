@@ -41,7 +41,7 @@ impl App {
         // own LOD_PIXEL_THRESHOLD handles per-cell gating, and the
         // CPU cap is too conservative for inside-frame cameras
         // (especially TB frames stopped at depth 1).
-        let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
+        let cam_local = self.position_in_render_frame(&self.active_frame.render_path);
         let camera_inside = cam_local.iter().all(|&v| v >= 0.0 && v <= 3.0);
         let local_cap = if camera_inside {
             MAX_LOCAL_VISUAL_DEPTH
@@ -60,11 +60,16 @@ impl App {
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                self.camera.position.in_frame(&frame.render_path)
+                self.position_in_render_frame(&frame.render_path)
             }
         };
-        cam_local.iter().all(|v| v.is_finite())
-            && cam_local.iter().all(|&v| {
+        if !cam_local.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        if self.render_frame_crosses_tangent_block(&frame.render_path) {
+            return cam_local.iter().all(|&v| (0.0..=WORLD_SIZE).contains(&v));
+        }
+        cam_local.iter().all(|&v| {
                 (-MAX_FOCUSED_FRAME_CAMERA_EXTENT
                     ..=WORLD_SIZE + MAX_FOCUSED_FRAME_CAMERA_EXTENT)
                     .contains(&v)
@@ -74,7 +79,7 @@ impl App {
     pub(in crate::app) fn frame_projected_pixels(&self, frame: &ActiveFrame) -> f32 {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => (
-                self.camera.position.in_frame(&frame.render_path),
+                self.position_in_render_frame(&frame.render_path),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
             ),
@@ -123,7 +128,7 @@ impl App {
         if self.startup_profile_frames < 4 {
             let cam_local = match frame.kind {
                 ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
-                    self.camera.position.in_frame(&frame.render_path)
+                    self.position_in_render_frame(&frame.render_path)
                 }
             };
             eprintln!(

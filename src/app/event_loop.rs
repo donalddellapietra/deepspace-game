@@ -380,11 +380,7 @@ impl App {
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Cartesian
                 | crate::app::ActiveFrameKind::WrappedPlane { .. } => {
-                    self.camera.position.in_frame_rot(
-                        &self.world.library,
-                        self.world.root,
-                        &self.active_frame.render_path,
-                    )
+                    self.position_in_render_frame(&self.active_frame.render_path)
                 }
             };
             // Camera position in root-frame world coords (rotation-

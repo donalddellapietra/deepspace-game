@@ -12,7 +12,7 @@ mod wrapped_planet;
 
 pub use wrapped_planet::cpu_raycast_wrapped_planet;
 
-use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary};
+use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
 
 /// Re-export of the inscribed-cube scale used when packing TB nodes
 /// for the GPU. The CPU raycast applies the same shrink at the same
