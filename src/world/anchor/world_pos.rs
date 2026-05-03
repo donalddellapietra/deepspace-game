@@ -4,9 +4,53 @@
 
 use super::path::{Path, Transition};
 use super::WORLD_SIZE;
+use crate::world::gpu::inscribed_cube_scale;
 use crate::world::tree::{
     slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH,
 };
+
+/// Apply `R · *tb_scale` about `(0.5, 0.5, 0.5)` in `[0, 1)³` —
+/// converts an offset from a `TangentBlock`'s storage (interior)
+/// frame into its parent's children (Cartesian-external) frame.
+/// `r` stores `R^T` per the codebase convention, so applying `R`
+/// is the transposed multiply `r[j][i] * v[j]` summed over `j`.
+#[inline]
+fn tb_storage_to_external(offset: [f32; 3], r: &[[f32; 3]; 3]) -> [f32; 3] {
+    let s = inscribed_cube_scale(r);
+    let c = [offset[0] - 0.5, offset[1] - 0.5, offset[2] - 0.5];
+    let rotated = [
+        r[0][0] * c[0] + r[1][0] * c[1] + r[2][0] * c[2],
+        r[0][1] * c[0] + r[1][1] * c[1] + r[2][1] * c[2],
+        r[0][2] * c[0] + r[1][2] * c[1] + r[2][2] * c[2],
+    ];
+    [
+        rotated[0] * s + 0.5,
+        rotated[1] * s + 0.5,
+        rotated[2] * s + 0.5,
+    ]
+}
+
+/// Apply `R^T · /tb_scale` about `(0.5, 0.5, 0.5)` in `[0, 1)³` —
+/// converts an offset from a `TangentBlock`'s parent's children
+/// frame (Cartesian-external) into the TB's storage (interior)
+/// frame. Inverse of `tb_storage_to_external`. `r` is `R^T`, so
+/// `R^T · v` is the direct multiply `r[i][j] * v[j]` summed over `j`.
+#[inline]
+fn tb_external_to_storage(offset: [f32; 3], r: &[[f32; 3]; 3]) -> [f32; 3] {
+    let s = inscribed_cube_scale(r);
+    let inv_s = if s > 1e-6 { 1.0 / s } else { 1.0 };
+    let c = [offset[0] - 0.5, offset[1] - 0.5, offset[2] - 0.5];
+    let rotated = [
+        r[0][0] * c[0] + r[0][1] * c[1] + r[0][2] * c[2],
+        r[1][0] * c[0] + r[1][1] * c[1] + r[1][2] * c[2],
+        r[2][0] * c[0] + r[2][1] * c[1] + r[2][2] * c[2],
+    ];
+    [
+        rotated[0] * inv_s + 0.5,
+        rotated[1] * inv_s + 0.5,
+        rotated[2] * inv_s + 0.5,
+    ]
+}
 
 /// `(anchor, offset)` position with the offset held in `[0, 1)³`
 /// by invariant.
@@ -198,19 +242,32 @@ impl WorldPos {
         transition
     }
 
-    /// Pop the deepest slot. Pure Cartesian: TB rotation is a
-    /// shader-side rendering effect; the anchor's slot indexing is
-    /// always axis-aligned with the parent's children frame, so a
-    /// pop is `(slot_offset + offset) / 3` regardless of node kind.
+    /// Pop the deepest slot. Kind-aware: if the cell being popped is
+    /// a `TangentBlock`, apply forward `R · *tb_scale` about
+    /// `(0.5, 0.5, 0.5)` to convert offset from TB-storage frame
+    /// into the parent's children (Cartesian-external) frame BEFORE
+    /// the standard `(slot + offset) / 3` rescale. Pure cell-local
+    /// arithmetic — magnitudes stay ≤ 0.5 in the rotation step
+    /// regardless of anchor depth, so f32 precision is bounded by
+    /// the cell-fraction not the world position.
     fn pop_one_level_rot_aware(
         &mut self,
-        _library: &NodeLibrary,
-        _world_root: NodeId,
+        library: &NodeLibrary,
+        world_root: NodeId,
     ) {
         if self.anchor.depth() == 0 {
             return;
         }
+        // Look up the kind of the cell BEING POPPED — i.e., the
+        // current deepest cell, indexed by the full anchor slice
+        // before we pop it.
+        let popped_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
         let last_slot = self.anchor.pop().unwrap_or(0) as usize;
+        if let Some(NodeKind::TangentBlock { rotation: r }) = popped_kind {
+            self.offset = tb_storage_to_external(self.offset, &r);
+        }
         let (sx, sy, sz) = slot_coords(last_slot);
         self.offset[0] = (sx as f32 + self.offset[0]) / 3.0;
         self.offset[1] = (sy as f32 + self.offset[1]) / 3.0;
@@ -218,12 +275,14 @@ impl WorldPos {
     }
 
     /// Descend one level: pick the slot containing the camera and
-    /// push it onto the anchor. Pure Cartesian: see
-    /// `pop_one_level_rot_aware` for rationale.
+    /// push it onto the anchor. Kind-aware: if the just-pushed cell
+    /// is a `TangentBlock`, apply `R^T · /tb_scale` about
+    /// `(0.5, 0.5, 0.5)` so subsequent descents see the offset in
+    /// TB-storage frame. Pure cell-local arithmetic.
     fn descend_one_level_rot_aware(
         &mut self,
-        _library: &NodeLibrary,
-        _world_root: NodeId,
+        library: &NodeLibrary,
+        world_root: NodeId,
     ) {
         let storage_pos = [
             self.offset[0] * 3.0,
@@ -240,6 +299,19 @@ impl WorldPos {
             (storage_pos[1] - sy as f32).clamp(0.0, 1.0 - f32::EPSILON),
             (storage_pos[2] - sz as f32).clamp(0.0, 1.0 - f32::EPSILON),
         ];
+        // Look up the kind of the cell JUST PUSHED — anchor slice
+        // now ends at this cell.
+        let pushed_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
+        if let Some(NodeKind::TangentBlock { rotation: r }) = pushed_kind {
+            let rotated = tb_external_to_storage(self.offset, &r);
+            self.offset = [
+                rotated[0].clamp(0.0, 1.0 - f32::EPSILON),
+                rotated[1].clamp(0.0, 1.0 - f32::EPSILON),
+                rotated[2].clamp(0.0, 1.0 - f32::EPSILON),
+            ];
+        }
     }
 
     /// Advance by a local delta (in units of the current cell).
@@ -328,33 +400,54 @@ impl WorldPos {
         }
         let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.anchor.push(slot);
-        // Pure Cartesian: TB rotation lives in the shader/raycast at
-        // TB-cell entry, not in the anchor representation. Same offset
-        // semantics regardless of whether the descended-into cell is
-        // a TB.
         self.offset = new_offset;
+        // Kind-aware: if the just-pushed cell is a TangentBlock,
+        // convert offset from parent's children frame into
+        // TB-storage so the new deepest-cell interior is consistent
+        // with the storage-based slot indexing of the TB's children.
+        let pushed_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
+        if let Some(NodeKind::TangentBlock { rotation: r }) = pushed_kind {
+            let rotated = tb_external_to_storage(self.offset, &r);
+            self.offset = [
+                rotated[0].clamp(0.0, 1.0 - f32::EPSILON),
+                rotated[1].clamp(0.0, 1.0 - f32::EPSILON),
+                rotated[2].clamp(0.0, 1.0 - f32::EPSILON),
+            ];
+        }
         Transition::None
     }
 
-    /// Pop the deepest slot. Pure Cartesian — see
-    /// `pop_one_level_rot_aware` and `zoom_in_in_world`.
+    /// Pop the deepest slot. Kind-aware: forward `R · *tb_scale`
+    /// about `(0.5, 0.5, 0.5)` if the cell being popped is a
+    /// `TangentBlock` (storage → external), then standard
+    /// `(slot + offset) / 3`. See `pop_one_level_rot_aware`.
     pub fn zoom_out_in_world(
         &mut self,
-        _library: &NodeLibrary,
-        _world_root: NodeId,
+        library: &NodeLibrary,
+        world_root: NodeId,
     ) -> Transition {
         if self.anchor.depth() == 0 {
             return Transition::None;
         }
+        let popped_kind = super::path::node_kind_at_depth(
+            library, world_root, self.anchor.as_slice(),
+        );
         let last_slot = match self.anchor.pop() {
             Some(s) => s as usize,
             None => return Transition::None,
         };
+        if let Some(NodeKind::TangentBlock { rotation: r }) = popped_kind {
+            self.offset = tb_storage_to_external(self.offset, &r);
+        }
         let (sx, sy, sz) = slot_coords(last_slot);
-        self.offset[0] = (sx as f32 + self.offset[0]) / 3.0;
-        self.offset[1] = (sy as f32 + self.offset[1]) / 3.0;
-        self.offset[2] = (sz as f32 + self.offset[2]) / 3.0;
-        debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
+        self.offset[0] = ((sx as f32 + self.offset[0]) / 3.0)
+            .clamp(0.0, 1.0 - f32::EPSILON);
+        self.offset[1] = ((sy as f32 + self.offset[1]) / 3.0)
+            .clamp(0.0, 1.0 - f32::EPSILON);
+        self.offset[2] = ((sz as f32 + self.offset[2]) / 3.0)
+            .clamp(0.0, 1.0 - f32::EPSILON);
         Transition::None
     }
 
@@ -469,30 +562,82 @@ impl WorldPos {
         ]
     }
 
-    /// Rotation-aware variant of [`in_frame`]. When the anchor path
-    /// crosses a `NodeKind::TangentBlock` whose stored rotation is
-    /// non-identity, every slot offset *past that node* and the final
-    /// `offset` are rotated by the cumulative chain rotation around
-    /// each enclosing cube's geometric centre. Frame-local throughout
-    /// — never world-absolute. For all-Cartesian paths, the result is
-    /// bit-identical to [`in_frame`].
+    /// Rotation-aware variant of [`in_frame`]. The anchor's offset
+    /// is in the deepest cell's interior frame — which is
+    /// TB-storage for any descendant of a `TangentBlock` (the offset
+    /// is rotated/inscribed-shrunk relative to absolute Cartesian).
+    /// Bottom-up walk in `[0, 1)³` cell-local: at each step from
+    /// depth `d+1` to `d`, if the cell at depth `d+1` is a TB we're
+    /// LEAVING, apply forward `R · *tb_scale` about
+    /// `(0.5, 0.5, 0.5)` to convert pos from interior (storage) to
+    /// external (parent's children) frame. Then compose with the
+    /// slot in the parent's children frame: `(slot + pos) / 3`.
     ///
-    /// Pure Cartesian wrapper preserved for API compatibility. The
-    /// anchor representation is purely Cartesian — TB rotation/scale
-    /// is a shader-side rendering effect (`tb_scale` in `rot_col0.w`
-    /// of `GpuNodeKind`), not a property of the path. So the world
-    /// position derived from `(anchor, offset)` is always the plain
-    /// Cartesian walk.
+    /// Result is in `frame`'s `[0, WORLD_SIZE)³` interior frame
+    /// (= `frame`'s children frame). Pure cell-local arithmetic —
+    /// magnitudes stay ≤ 1 in `[0, 1)³` until the final scalar
+    /// `× WORLD_SIZE`. For Cartesian-only paths, R never fires and
+    /// the result is bit-identical to [`in_frame`].
     ///
-    /// `library` and `world_root` are accepted for signature
-    /// compatibility with callers from when this was rotation-aware.
+    /// Requires `frame` to be a prefix of `self.anchor`. Falls back
+    /// to `in_frame` for divergent frames.
     pub fn in_frame_rot(
         &self,
-        _library: &NodeLibrary,
-        _world_root: NodeId,
+        library: &NodeLibrary,
+        world_root: NodeId,
         frame: &Path,
     ) -> [f32; 3] {
-        self.in_frame(frame)
+        let depth = self.anchor.depth() as usize;
+        let frame_depth = frame.depth() as usize;
+        let common = self.anchor.common_prefix_len(frame) as usize;
+        if common < frame_depth {
+            return self.in_frame(frame);
+        }
+
+        // kinds[k] = NodeKind at tree depth k along self.anchor.
+        // kinds[0] = world root's kind; kinds[depth] = the deepest
+        // cell's kind.
+        let mut kinds: [Option<NodeKind>; MAX_DEPTH + 1] =
+            [None; MAX_DEPTH + 1];
+        let mut node = world_root;
+        kinds[0] = library.get(node).map(|n| n.kind);
+        for k in 0..depth {
+            let n = match library.get(node) {
+                Some(n) => n,
+                None => break,
+            };
+            match n.children[self.anchor.slot(k) as usize] {
+                Child::Node(child) => {
+                    node = child;
+                    kinds[k + 1] = library.get(node).map(|n| n.kind);
+                }
+                _ => break,
+            }
+        }
+
+        // Walk bottom-up in `[0, 1)³` cell-local frame.
+        let mut pos = self.offset;
+        for d in (frame_depth..depth).rev() {
+            // Going up from cell at depth `d+1` to its parent at
+            // depth `d`. If the child is a TB, leave it: apply
+            // `R · *tb_scale` to convert pos from TB-storage
+            // (child's interior) to child's external (parent's
+            // children frame).
+            if let Some(NodeKind::TangentBlock { rotation: r }) =
+                kinds[d + 1]
+            {
+                pos = tb_storage_to_external(pos, &r);
+            }
+            let slot = self.anchor.slot(d) as usize;
+            let (sx, sy, sz) = slot_coords(slot);
+            pos = [
+                (sx as f32 + pos[0]) / 3.0,
+                (sy as f32 + pos[1]) / 3.0,
+                (sz as f32 + pos[2]) / 3.0,
+            ];
+        }
+
+        [pos[0] * WORLD_SIZE, pos[1] * WORLD_SIZE, pos[2] * WORLD_SIZE]
     }
 
     /// Build a `WorldPos` at `anchor_depth` whose frame-local
