@@ -282,6 +282,11 @@ pub fn spherical_wrapped_planet_spawn(embedding_depth: u8) -> WorldPos {
     // 0.1) → world (1.1, 1.1, 1.1). Then deepen by RENDER_FRAME_K=3
     // levels so the render frame truncates to depth=embedding_depth
     // (= the SphericalWP itself). That fires `march_spherical_wrapped_plane`.
+    // Need anchor depth ≥ embedding_depth + RENDER_FRAME_K (=3) so
+    // the render frame settles at the SphericalWP node, where the
+    // sphere DDA dispatch fires. Deeper is also fine — the
+    // truncate-while-strict-descendant rule keeps render_path at
+    // SphericalWP regardless of how deep the anchor goes.
     WorldPos::uniform_column(slot_index(1, 1, 1) as u8, 1, [0.1, 0.1, 0.1])
         .deepened_to(embedding_depth + 3)
 }
