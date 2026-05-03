@@ -348,15 +348,6 @@ impl App {
                 ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     renderer.set_root_kind_wrapped_plane(dims, slab_depth);
                 }
-                ActiveFrameKind::SphericalWrappedPlane { dims, slab_depth, .. } => {
-                    // Sphere DDA shader path is selected via
-                    // `node_kinds[root_idx].kind == 3`, not via
-                    // `root_kind` uniform. Treat as Cartesian for
-                    // root_kind purposes (no X-wrap branch in
-                    // march_cartesian fires for sphere render frames).
-                    let _ = (dims, slab_depth);
-                    renderer.set_root_kind_cartesian();
-                }
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

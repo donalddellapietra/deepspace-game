@@ -20,15 +20,6 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
-    /// The render frame is rooted at a `NodeKind::SphericalWrappedPlane`
-    /// node. Sphere DDA dispatch fires; CPU raycast uses the matching
-    /// sphere DDA mirror.
-    SphericalWrappedPlane {
-        dims: [u32; 3],
-        slab_depth: u8,
-        body_radius_cells: f32,
-        lat_max: f32,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,15 +68,10 @@ pub fn compute_render_frame(
         Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
             ActiveFrameKind::WrappedPlane { dims, slab_depth }
         }
-        Some(NodeKind::SphericalWrappedPlane {
-            dims, slab_depth, body_radius_cells, lat_max,
-        }) => ActiveFrameKind::SphericalWrappedPlane {
-            dims, slab_depth, body_radius_cells, lat_max,
-        },
         _ => ActiveFrameKind::Cartesian,
     };
     for k in 0..target.depth() as usize {
-        if !matches!(kind, ActiveFrameKind::Cartesian) {
+        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
@@ -95,20 +81,9 @@ pub fn compute_render_frame(
                 reached.push(slot as u8);
                 node_id = child_id;
                 if let Some(child_node) = library.get(child_id) {
-                    match child_node.kind {
-                        NodeKind::WrappedPlane { dims, slab_depth } => {
-                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                            break;
-                        }
-                        NodeKind::SphericalWrappedPlane {
-                            dims, slab_depth, body_radius_cells, lat_max,
-                        } => {
-                            kind = ActiveFrameKind::SphericalWrappedPlane {
-                                dims, slab_depth, body_radius_cells, lat_max,
-                            };
-                            break;
-                        }
-                        _ => {}
+                    if let NodeKind::WrappedPlane { dims, slab_depth } = child_node.kind {
+                        kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
+                        break;
                     }
                 }
             }

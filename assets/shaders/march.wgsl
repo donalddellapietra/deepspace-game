@@ -808,14 +808,7 @@ fn march_cartesian(
             // then rotated by the stored R^T around the cube centre.
             // On hit, normal is rotated back via R · local_normal.
             if node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
-                // Cell origin = natural slot lower corner + per-cell
-                // displacement. `cell_offset` is in parent-frame `[0, 3)³`
-                // units (one slot = 1 unit), so scale to render-frame
-                // by multiplying by `cur_cell_size` alongside `cell`.
-                // Zero for ordinary TBs; non-zero for SphericalWP cells.
-                let cell_off = node_kinds[child_idx].cell_offset.xyz;
-                let child_origin_tb =
-                    cur_node_origin + (vec3<f32>(cell) + cell_off) * cur_cell_size;
+                let child_origin_tb = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
                 // Scale maps the slot's parent extent (size cur_cell_size)
                 // into the child's [0, 3)³ local frame: 3 / cur_cell_size.
                 let scale = 3.0 / cur_cell_size;
@@ -1626,197 +1619,6 @@ fn march_wrapped_planet(
     return result;
 }
 
-// SphericalWrappedPlane (kind == 3) sphere DDA. Same shape as
-// `march_wrapped_planet` but reads:
-//   - sphere parameters (body_radius, lat_max, slab_depth, dims) from
-//     the node's own `NodeKindGpu` entry, not from `uniforms.slab_dims`.
-//   - per-cell rotation R and `cell_offset` from each leaf TB's
-//     `NodeKindGpu`, not from a per-fragment `tangent_cube_frame_for_cell`
-//     computation.
-//
-// This is the "stored-not-computed" version of the UV sphere — every
-// frame reads the same precomputed rotation table that the anchor /
-// CPU raycast / shader all share via `TbBoundary`. No per-fragment
-// `sin`/`cos` on absolute angles → no precision wall at deep zoom.
-fn march_spherical_wrapped_plane(
-    body_idx: u32,
-    body_origin: vec3<f32>,
-    body_size: f32,
-    ray_origin: vec3<f32>,
-    ray_dir_in: vec3<f32>,
-) -> HitResult {
-    var result: HitResult;
-    result.hit = false;
-    result.t = 1e20;
-    result.frame_level = 0u;
-    result.frame_scale = 1.0;
-    result.cell_min = vec3<f32>(0.0);
-    result.cell_size = 1.0;
-
-    let kind = node_kinds[body_idx];
-    let body_radius_wp = kind.rot_col0.x;
-    let lat_max = kind.rot_col0.y;
-    let slab_depth = u32(kind.rot_col0.z);
-    let dims_x = i32(kind.dims_x);
-    let dims_y = i32(kind.dims_y);
-    let dims_z = i32(kind.dims_z);
-
-    let ray_dir = normalize(ray_dir_in);
-    let inv_norm = 1.0 / max(length(ray_dir_in), 1e-6);
-    let cs_center = body_origin + vec3<f32>(body_size * 0.5);
-    let wp_to_render = body_size / 3.0;
-    let r_outer_render = body_radius_wp * wp_to_render;
-
-    var subgrid: f32 = 1.0;
-    for (var k: u32 = 0u; k < slab_depth; k = k + 1u) { subgrid = subgrid * 3.0; }
-    let cell_size_wp = 3.0 / subgrid;
-    let cell_size_render = cell_size_wp * wp_to_render;
-    // Slab thickness along radial: dims_y cells from inner to outer.
-    let r_inner_render = r_outer_render - f32(dims_y) * cell_size_render;
-
-    // Outer sphere intersection.
-    let oc = ray_origin - cs_center;
-    let b = dot(oc, ray_dir);
-    let oc_dot_oc = dot(oc, oc);
-    let c = oc_dot_oc - r_outer_render * r_outer_render;
-    let disc_outer = b * b - c;
-    if disc_outer <= 0.0 { return result; }
-    let sq_outer = sqrt(disc_outer);
-    let t_far_outer = -b + sq_outer;
-    if t_far_outer <= 0.0 { return result; }
-    let t_near_outer = -b - sq_outer;
-    let t_start = max(t_near_outer, 0.0);
-    let t_end = t_far_outer;
-
-    // March the ray through the shell, sampling at a fine step. At
-    // each step, find the cell at (lon_idx, lat_idx, r_idx) that
-    // contains the current point, and dispatch into its TB. Skip
-    // repeated samples of the same cell. The step size is set so
-    // the longest path through any single cell is sampled at least
-    // ~3 times — gives DDA-like coverage without the bookkeeping of
-    // a true 3D-spherical DDA.
-    let pi = 3.14159265;
-    let n_steps = 96u;
-    let dt = (t_end - t_start) / f32(n_steps);
-    var last_cx: i32 = -999;
-    var last_cy: i32 = -999;
-    var last_cz: i32 = -999;
-
-    for (var i: u32 = 0u; i < n_steps; i = i + 1u) {
-        let t = t_start + (f32(i) + 0.5) * dt;
-        let pos = ray_origin + ray_dir * t;
-        let oc_p = pos - cs_center;
-        let r_p = length(oc_p);
-        if r_p < r_inner_render || r_p > r_outer_render { continue; }
-
-        let n = oc_p / r_p;
-        let lat = asin(clamp(n.y, -1.0, 1.0));
-        if abs(lat) > lat_max { continue; }
-        let lon = atan2(n.z, n.x);
-        let u = (lon + pi) / (2.0 * pi);
-        let v = (lat + lat_max) / (2.0 * lat_max);
-        let cx = clamp(i32(floor(u * f32(dims_x))), 0, dims_x - 1);
-        let cz = clamp(i32(floor(v * f32(dims_z))), 0, dims_z - 1);
-        // r_idx 0 is innermost shell at r_inner; cy = dims_y-1 is
-        // outermost. r_step = cell_size_render.
-        let cy = clamp(
-            i32(floor((r_p - r_inner_render) / cell_size_render)),
-            0, dims_y - 1,
-        );
-
-        if cx == last_cx && cy == last_cy && cz == last_cz { continue; }
-        last_cx = cx; last_cy = cy; last_cz = cz;
-
-        let sample = sample_slab_cell(body_idx, slab_depth, cx, cy, cz);
-        if sample.tag != 2u { continue; }
-
-        let cell_kind = node_kinds[sample.child_idx];
-        // The cell content is a rotated cube of side `cell_size_render`
-        // in render frame. Its AABB is `cell_size_render / inscribed_scale`
-        // wide — bigger than the storage [0, 3)³ once you account for
-        // rotation. We need our cell-box to MATCH the rotated cube's
-        // AABB so `march_in_tangent_cube`'s storage clip doesn't cut
-        // off the AABB-corners. Compute inscribed_scale from R columns.
-        let r0 = cell_kind.rot_col0.xyz;
-        let r1 = cell_kind.rot_col1.xyz;
-        let r2 = cell_kind.rot_col2.xyz;
-        let extent = vec3<f32>(
-            abs(r0.x) + abs(r1.x) + abs(r2.x),
-            abs(r0.y) + abs(r1.y) + abs(r2.y),
-            abs(r0.z) + abs(r1.z) + abs(r2.z),
-        );
-        let max_extent = max(max(extent.x, extent.y), extent.z);
-        let aabb_factor = max(max_extent, 1.0);
-        let aabb_size_render = cell_size_render * aabb_factor;
-
-        // Cell content centre in render = sphere_pos = bootstrap's
-        // `(cell_natural_lower + 0.5 * cell_size_wp) * wp_to_render
-        // + cell_offset * cell_size_render`. The AABB centre matches
-        // (centred at cell content centre).
-        let cell_natural_lower_wp = vec3<f32>(f32(cx), f32(cy), f32(cz)) * cell_size_wp;
-        let cell_content_centre = body_origin
-            + (cell_natural_lower_wp + vec3<f32>(0.5 * cell_size_wp)) * wp_to_render
-            + cell_kind.cell_offset.xyz * cell_size_render;
-        let cell_actual_lower_render = cell_content_centre - vec3<f32>(0.5 * aabb_size_render);
-
-        let scale = 3.0 / aabb_size_render;
-        let local_pre_origin = (ray_origin - cell_actual_lower_render) * scale;
-        let local_pre_dir = ray_dir * scale;
-        let local_origin = tb_enter_point(sample.child_idx, local_pre_origin, 1.5);
-        let local_dir = tb_enter_dir(sample.child_idx, local_pre_dir);
-
-        let sub = march_in_tangent_cube(sample.child_idx, local_origin, local_dir);
-        if sub.hit {
-            // Sphere-cell mask: cells overlap in render frame (their
-            // rotated cube AABB is wider than the spacing), so the
-            // ray could be hitting content that physically belongs
-            // to a NEIGHBOUR cell. Compute the hit point's spherical
-            // coords and reject the hit if it falls outside this
-            // cell's (lon, lat, r) bin. Without this, breaking an
-            // outer cell would still show grass because adjacent
-            // cells' content extends into the broken cell's region.
-            let hit_world = ray_origin + ray_dir * sub.t;
-            let oc_h = hit_world - cs_center;
-            let r_h = length(oc_h);
-            let n_h = oc_h / r_h;
-            let lat_h = asin(clamp(n_h.y, -1.0, 1.0));
-            let lon_h = atan2(n_h.z, n_h.x);
-            let u_h = (lon_h + pi) / (2.0 * pi);
-            let v_h = (lat_h + lat_max) / (2.0 * lat_max);
-            let cx_h = clamp(i32(floor(u_h * f32(dims_x))), 0, dims_x - 1);
-            let cz_h = clamp(i32(floor(v_h * f32(dims_z))), 0, dims_z - 1);
-            let cy_h = clamp(
-                i32(floor((r_h - r_inner_render) / cell_size_render)),
-                0, dims_y - 1,
-            );
-            if cx_h != cx || cy_h != cy || cz_h != cz {
-                continue;
-            }
-
-            let local_hit = local_origin + local_dir * sub.t;
-            let local_in_cell = clamp(
-                (local_hit - sub.cell_min) / sub.cell_size,
-                vec3<f32>(0.0), vec3<f32>(1.0),
-            );
-            let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
-            var out: HitResult;
-            out.hit = true;
-            out.t = sub.t * inv_norm;
-            out.color = sub.color * (0.7 + 0.3 * local_bevel);
-            let rc0 = node_kinds[sample.child_idx].rot_col0.xyz;
-            let rc1 = node_kinds[sample.child_idx].rot_col1.xyz;
-            let rc2 = node_kinds[sample.child_idx].rot_col2.xyz;
-            out.normal = rc0 * sub.normal.x + rc1 * sub.normal.y + rc2 * sub.normal.z;
-            out.frame_level = 0u;
-            out.frame_scale = 1.0;
-            out.cell_min = hit_world - vec3<f32>(0.5);
-            out.cell_size = 1.0;
-            return out;
-        }
-    }
-    return result;
-}
-
 // Top-level march. Dispatches the current frame's Cartesian DDA,
 // then on miss pops to the next ancestor in the ribbon and
 // continues. When ribbon is exhausted, returns sky (hit=false).
@@ -1856,11 +1658,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
                 current_idx, vec3<f32>(0.0), 3.0,
                 ray_origin, ray_dir,
                 uniforms.planet_render.y,
-            );
-        } else if cur_kind == NODE_KIND_SPHERICAL_WRAPPED_PLANE {
-            r = march_spherical_wrapped_plane(
-                current_idx, vec3<f32>(0.0), 3.0,
-                ray_origin, ray_dir,
             );
         } else {
             // Cartesian frame: no depth cap beyond the hardware stack
@@ -1922,14 +1719,10 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if child_kind == NODE_KIND_TANGENT_BLOCK {
             // Inverse of the entry transform (`tb_exit_*` about
             // pivot 1.5), then translate-and-scale into parent's
-            // `[0, 3)³`. The cell's centre in parent units is
-            // `slot_off + 0.5 + cell_offset` (zero offset → cell
-            // sits at slot centre; non-zero → SphericalWP).
-            let cell_off = node_kinds[entry.child_bfs].cell_offset.xyz;
+            // `[0, 3)³`.
             let parent_origin = tb_exit_point(entry.child_bfs, ray_origin, 1.5);
             let parent_dir = tb_exit_dir(entry.child_bfs, ray_dir);
-            ray_origin = slot_off + vec3<f32>(0.5) + cell_off
-                + (parent_origin - vec3<f32>(1.5)) / 3.0;
+            ray_origin = slot_off + vec3<f32>(0.5) + (parent_origin - vec3<f32>(1.5)) / 3.0;
             ray_dir = parent_dir;
         } else {
             ray_origin = slot_off + ray_origin / 3.0;

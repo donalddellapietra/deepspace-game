@@ -8,10 +8,8 @@
 //! single block at fine zoom or an entire 3×3×3 node at coarse zoom.
 
 mod cartesian;
-mod spherical_wrapped_planet;
 mod wrapped_planet;
 
-pub use spherical_wrapped_planet::cpu_raycast_spherical_wrapped_planet;
 pub use wrapped_planet::cpu_raycast_wrapped_planet;
 
 use crate::world::tree::{slot_coords, slot_index, Child, NodeId, NodeLibrary};
@@ -103,14 +101,12 @@ pub fn cpu_raycast_in_frame(
         // `[0, 3)³`. Mirrors the shader's ribbon pop.
         let child_kind = library.get(child_id).map(|n| n.kind);
         if let Some(boundary) = child_kind.and_then(TbBoundary::from_kind) {
-            // Cell centre in parent's [0, 3)³ = slot_off + 0.5 + cell_offset
-            // (zero offset → cell at slot centre).
             let parent_origin = boundary.exit_point(ray_origin, 1.5);
             let parent_dir = boundary.exit_dir(ray_dir);
             ray_origin = [
-                slot_off[0] + 0.5 + boundary.cell_offset[0] + (parent_origin[0] - 1.5) / 3.0,
-                slot_off[1] + 0.5 + boundary.cell_offset[1] + (parent_origin[1] - 1.5) / 3.0,
-                slot_off[2] + 0.5 + boundary.cell_offset[2] + (parent_origin[2] - 1.5) / 3.0,
+                slot_off[0] + 0.5 + (parent_origin[0] - 1.5) / 3.0,
+                slot_off[1] + 0.5 + (parent_origin[1] - 1.5) / 3.0,
+                slot_off[2] + 0.5 + (parent_origin[2] - 1.5) / 3.0,
             ];
             ray_dir = [parent_dir[0] / 3.0, parent_dir[1] / 3.0, parent_dir[2] / 3.0];
         } else {

@@ -387,10 +387,7 @@ impl App {
         // Render-frame root must not be a TangentBlock — see
         // `App::render_frame` for the rationale.
         while logical_path.depth() > 0
-            && (path_lands_on_tangent_block(&world.library, world.root, &logical_path)
-                || path_is_strict_descendant_of_spherical_wrapped_plane(
-                    &world.library, world.root, &logical_path,
-                ))
+            && path_lands_on_tangent_block(&world.library, world.root, &logical_path)
         {
             logical_path.truncate(logical_path.depth() - 1);
         }
@@ -517,20 +514,14 @@ impl App {
         let mut logical_path = self.camera.position.anchor;
         let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
         logical_path.truncate(desired_depth);
-        // Render frame must satisfy two constraints:
-        //   1. Its root is not a TangentBlock — the shader's TB dispatch
-        //      fires at TB *child* entry, never at the frame root, so
-        //      a TB-rooted frame would render axis-aligned.
-        //   2. Its root is not a strict descendant of a
-        //      SphericalWrappedPlane — the sphere DDA dispatch fires
-        //      only when SphericalWP is the active frame, never deeper.
-        //      A deeper frame would route through `march_cartesian`,
-        //      which doesn't know how to find sphere-positioned cells.
-        // Truncate one level at a time while either rule is violated.
-        // (Stops at root, where neither applies by construction.)
+        // The render frame's root must be Cartesian or WrappedPlane —
+        // never a TangentBlock. The shader's TB dispatch fires at TB
+        // *child* entry, not at the frame root, so a TB-rooted frame
+        // would be rendered as if it were axis-aligned. Truncate one
+        // level at a time until the path no longer lands on a TB.
+        // (Stops at root, where there's no TB by construction.)
         while logical_path.depth() > 0
-            && (self.path_lands_on_tangent_block(&logical_path)
-                || self.path_is_strict_descendant_of_spherical_wp(&logical_path))
+            && self.path_lands_on_tangent_block(&logical_path)
         {
             logical_path.truncate(logical_path.depth() - 1);
         }
@@ -542,12 +533,6 @@ impl App {
 
     fn path_lands_on_tangent_block(&self, path: &Path) -> bool {
         path_lands_on_tangent_block(&self.world.library, self.world.root, path)
-    }
-
-    fn path_is_strict_descendant_of_spherical_wp(&self, path: &Path) -> bool {
-        path_is_strict_descendant_of_spherical_wrapped_plane(
-            &self.world.library, self.world.root, path,
-        )
     }
 
     pub(super) fn update(&mut self, dt: f32) {
@@ -651,9 +636,7 @@ impl App {
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
         let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian
-            | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::SphericalWrappedPlane { .. } => {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::WrappedPlane { .. } => {
                 // Rotation-aware: when the anchor path crosses a
                 // TangentBlock, every slot offset past it (and the
                 // final offset) must be rotated by the cumulative
@@ -706,45 +689,6 @@ impl App {
             1.2,
         )
     }
-}
-
-/// True iff walking `path` from `world_root` passes THROUGH a
-/// `SphericalWrappedPlane` node before reaching the leaf — i.e., the
-/// leaf is a strict descendant of a SphericalWP. Used by render-frame
-/// selection: the render frame must never descend BELOW a SphericalWP,
-/// because the sphere DDA dispatch fires only when the SphericalWP is
-/// the active frame; any deeper frame would route through plain
-/// `march_cartesian`, which doesn't know how to find sphere-positioned
-/// cells.
-///
-/// Returns false if the path's leaf IS the SphericalWP (that's allowed
-/// — it's the active frame for sphere DDA), or if no SphericalWP is on
-/// the path at all.
-pub(super) fn path_is_strict_descendant_of_spherical_wrapped_plane(
-    library: &crate::world::tree::NodeLibrary,
-    world_root: crate::world::tree::NodeId,
-    path: &crate::world::anchor::Path,
-) -> bool {
-    use crate::world::tree::{Child, NodeKind};
-    if path.depth() == 0 {
-        return false;
-    }
-    let mut node = world_root;
-    for k in 0..(path.depth() as usize) {
-        // Check the CURRENT node (= a strict ancestor of the leaf
-        // since we haven't walked into the leaf yet).
-        if let Some(n) = library.get(node) {
-            if matches!(n.kind, NodeKind::SphericalWrappedPlane { .. }) {
-                return true;
-            }
-        }
-        // Walk to next.
-        match library.get(node).map(|n| n.children[path.slot(k) as usize]) {
-            Some(Child::Node(child_id)) => node = child_id,
-            _ => return false,
-        }
-    }
-    false
 }
 
 /// True iff walking `path` from `world_root` lands on a node whose

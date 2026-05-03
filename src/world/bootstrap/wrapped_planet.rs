@@ -141,10 +141,7 @@ pub fn wrapped_planet_world(
         let inner = build_uniform_anchor(library, block, cell_subtree_depth - 1);
         Child::Node(library.insert_with_kind(
             uniform_children(inner),
-            NodeKind::TangentBlock {
-                rotation: crate::world::tree::IDENTITY_ROTATION,
-                cell_offset: [0.0; 3],
-            },
+            NodeKind::TangentBlock { rotation: crate::world::tree::IDENTITY_ROTATION },
         ))
     };
     let stone_anchor = make_anchor(&mut library, block::STONE);

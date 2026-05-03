@@ -199,9 +199,6 @@ impl TestConfig {
                 "--dodecahedron-test" => {
                     cfg.world_preset = WorldPreset::DodecahedronTest;
                 }
-                "--spherical-wrapped-planet" => {
-                    cfg.world_preset = WorldPreset::SphericalWrappedPlanet;
-                }
                 "--wrapped-planet" => {
                     cfg.world_preset = WorldPreset::WrappedPlanet {
                         embedding_depth: crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH,
@@ -540,10 +537,6 @@ VISIBILITY TEST PRESETS:
   --dodecahedron-test         Centre cube + 12 TangentBlocks rotated to
                               the regular-dodecahedron face normals;
                               rotation-diversity stress on renormalize
-  --spherical-wrapped-planet  Proof-of-concept UV sphere via per-cell
-                              TB rotation+cell_offset on a flat slab.
-                              Renders with dispatch artifacts (no
-                              sphere DDA yet) — for visualisation only.
   --wrapped-planet            Wrapped-Cartesian planet: 27x2x14
                               grass/dirt/stone slab with X-axis wrap
                               (longitude). Default total tree depth: 25
