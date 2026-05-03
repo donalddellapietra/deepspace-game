@@ -513,6 +513,9 @@ impl App {
     pub(super) fn render_frame(&self) -> ActiveFrame {
         let mut logical_path = self.camera.position.anchor;
         let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
+        if let Some(frame) = self.uv_ring_cell_render_frame(desired_depth) {
+            return frame;
+        }
         logical_path.truncate(desired_depth);
         // The render frame's root must be Cartesian or WrappedPlane —
         // never a TangentBlock. The shader's TB dispatch fires at TB
@@ -531,11 +534,97 @@ impl App {
         )
     }
 
+    fn uv_ring_cell_render_frame(&self, desired_depth: u8) -> Option<ActiveFrame> {
+        let root = self.world.library.get(self.world.root)?;
+        let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
+            return None;
+        };
+        if desired_depth < slab_depth || dims[0] == 0 || dims[1] != 1 || dims[2] != 1 {
+            return None;
+        }
+        let cell_x = uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)?;
+        let mut logical_path = self.camera.position.anchor;
+        logical_path.truncate(desired_depth);
+        if logical_path.depth() < slab_depth {
+            logical_path = uv_ring_cell_path(cell_x, slab_depth);
+        }
+        let mut render_path = logical_path;
+        render_path.truncate(render_path.depth().saturating_sub(RENDER_FRAME_CONTEXT).max(slab_depth));
+        let mut render = frame::compute_render_frame(
+            &self.world.library,
+            self.world.root,
+            &render_path,
+            render_path.depth(),
+        );
+        while render.render_path != render_path && render_path.depth() > slab_depth {
+            render_path.truncate(render_path.depth() - 1);
+            render = frame::compute_render_frame(
+                &self.world.library,
+                self.world.root,
+                &render_path,
+                render_path.depth(),
+            );
+        }
+        if render.render_path != render_path {
+            return None;
+        }
+        Some(ActiveFrame {
+            render_path,
+            logical_path,
+            node_id: render.node_id,
+            kind: ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x },
+        })
+    }
+
+    fn nearest_uv_ring_cell_x(&self, dims: [u32; 3]) -> u32 {
+        let root_cam = self.camera.position.in_frame_rot(
+            &self.world.library,
+            self.world.root,
+            &Path::root(),
+        );
+        let dx = root_cam[0] - 1.5;
+        let dz = root_cam[2] - 1.5;
+        let mut u = (dz.atan2(dx) + std::f32::consts::PI)
+            / (2.0 * std::f32::consts::PI);
+        if !u.is_finite() {
+            u = 0.0;
+        }
+        let cell = (u * dims[0] as f32).floor() as i32;
+        cell.rem_euclid(dims[0] as i32) as u32
+    }
+
+    pub(super) fn ensure_uv_ring_camera_anchor_local(&mut self) {
+        let Some(root) = self.world.library.get(self.world.root) else { return };
+        let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
+            return;
+        };
+        if dims[0] == 0 || dims[1] != 1 || dims[2] != 1 {
+            return;
+        }
+        if self.camera.position.anchor.depth() <= slab_depth {
+            return;
+        }
+        if uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth).is_some() {
+            return;
+        }
+        let cell_x = self.nearest_uv_ring_cell_x(dims);
+        let cell_path = uv_ring_cell_path(cell_x, slab_depth);
+        let root_cam = self.camera.position.in_frame_rot(
+            &self.world.library,
+            self.world.root,
+            &Path::root(),
+        );
+        let cell_local = uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_local(root_cam);
+        let anchor_depth = self.camera.position.anchor.depth().max(slab_depth);
+        self.camera.position = WorldPos::from_frame_local(&cell_path, cell_local, anchor_depth);
+    }
+
     fn path_lands_on_tangent_block(&self, path: &Path) -> bool {
         path_lands_on_tangent_block(&self.world.library, self.world.root, path)
     }
 
     pub(super) fn update(&mut self, dt: f32) {
+        self.ensure_uv_ring_camera_anchor_local();
         // Camera-relative continuous flight (Minecraft-creative-style).
         // W/S follow camera forward (with pitch — looking down + W
         // dives), A/D follow camera right, Space/Shift go world ±Y.
@@ -581,9 +670,11 @@ impl App {
                     &self.world.library,
                     self.world.root,
                 );
+                self.ensure_uv_ring_camera_anchor_local();
             }
         }
         player::update(&mut self.camera, dt);
+        self.ensure_uv_ring_camera_anchor_local();
         // Advance entities by velocity * dt. WorldPos renormalizes
         // so cell-boundary crossings are handled transparently; on
         // worlds with a defined sea level, `tick` zeroes the Y
@@ -635,21 +726,7 @@ impl App {
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
-            ActiveFrameKind::Cartesian
-            | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::UvRing { .. } => {
-                // Rotation-aware: when the anchor path crosses a
-                // TangentBlock, every slot offset past it (and the
-                // final offset) must be rotated by the cumulative
-                // chain rotation. Plain `in_frame` walks Cartesian
-                // and gets the wrong world position for cameras
-                // inside a rotated subtree.
-                self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame.render_path,
-                )
-            }
-        };
+        let cam_local = self.camera_local_for_active_frame(frame);
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",
@@ -665,15 +742,8 @@ impl App {
         // R into `frame_rot`. The frame's local frame is rotated R
         // relative to world, so to express world-direction vectors in
         // frame-local we apply R^T.
-        let frame_rot = frame_path_rotation(
-            &self.world.library, self.world.root, &frame.render_path,
-        );
-        let fwd_world_rot = crate::world::mat3::transpose_mul_vec3(&frame_rot, &fwd_world);
-        let right_world_rot = crate::world::mat3::transpose_mul_vec3(&frame_rot, &right_world);
-        let up_world_rot = crate::world::mat3::transpose_mul_vec3(&frame_rot, &up_world);
-        let fwd_local = crate::world::sdf::normalize(fwd_world_rot);
-        let right_local = crate::world::sdf::normalize(right_world_rot);
-        let up_local = crate::world::sdf::normalize(up_world_rot);
+        let (fwd_local, right_local, up_local) =
+            self.camera_basis_for_active_frame(frame, fwd_world, right_world, up_world);
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera basis world_fwd={:?} frame_local_fwd={:?} local_right={:?} local_up={:?}",
@@ -691,6 +761,206 @@ impl App {
             1.2,
         )
     }
+
+    pub(super) fn camera_local_for_active_frame(&self, frame: &ActiveFrame) -> [f32; 3] {
+        match frame.kind {
+            ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
+                let _ = (dims, slab_depth, cell_x);
+                self.camera.position.in_frame_rot(
+                    &self.world.library,
+                    self.world.root,
+                    &frame.render_path,
+                )
+            }
+            ActiveFrameKind::UvRing { dims, slab_depth } => {
+                if let Some(cell_x) =
+                    uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)
+                {
+                    let cell_path = uv_ring_cell_path(cell_x, slab_depth);
+                    let cell_local = self.camera.position.in_frame_rot(
+                        &self.world.library,
+                        self.world.root,
+                        &cell_path,
+                    );
+                    uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_world(cell_local)
+                } else {
+                    self.camera.position.in_frame_rot(
+                        &self.world.library,
+                        self.world.root,
+                        &frame.render_path,
+                    )
+                }
+            }
+            ActiveFrameKind::Cartesian
+            | ActiveFrameKind::WrappedPlane { .. } => self.camera.position.in_frame_rot(
+                &self.world.library,
+                self.world.root,
+                &frame.render_path,
+            ),
+        }
+    }
+
+    pub(super) fn direction_for_active_frame(
+        &self,
+        frame: &ActiveFrame,
+        dir_world: [f32; 3],
+    ) -> [f32; 3] {
+        match frame.kind {
+            ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
+                let cell_dir = uv_ring_cell_frame(dims, slab_depth, cell_x)
+                    .dir_to_local(dir_world);
+                cartesian_dir_in_path_suffix(cell_dir, &frame.render_path, slab_depth)
+            }
+            ActiveFrameKind::UvRing { dims, slab_depth } => {
+                let _ = (dims, slab_depth);
+                dir_world
+            }
+            ActiveFrameKind::Cartesian
+            | ActiveFrameKind::WrappedPlane { .. } => {
+                let frame_rot = frame_path_rotation(
+                    &self.world.library,
+                    self.world.root,
+                    &frame.render_path,
+                );
+                crate::world::mat3::transpose_mul_vec3(&frame_rot, &dir_world)
+            }
+        }
+    }
+
+    fn camera_basis_for_active_frame(
+        &self,
+        frame: &ActiveFrame,
+        fwd_world: [f32; 3],
+        right_world: [f32; 3],
+        up_world: [f32; 3],
+    ) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        let fwd = self.direction_for_active_frame(frame, fwd_world);
+        let right = self.direction_for_active_frame(frame, right_world);
+        let up = self.direction_for_active_frame(frame, up_world);
+        (
+            crate::world::sdf::normalize(fwd),
+            crate::world::sdf::normalize(right),
+            crate::world::sdf::normalize(up),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct UvRingCellFrame {
+    origin: [f32; 3],
+    tangent: [f32; 3],
+    radial: [f32; 3],
+    up: [f32; 3],
+    scale: f32,
+}
+
+impl UvRingCellFrame {
+    fn point_to_local(self, p: [f32; 3]) -> [f32; 3] {
+        let d = crate::world::sdf::sub(p, self.origin);
+        [
+            crate::world::sdf::dot(self.tangent, d) * self.scale + 1.5,
+            crate::world::sdf::dot(self.radial, d) * self.scale + 1.5,
+            crate::world::sdf::dot(self.up, d) * self.scale + 1.5,
+        ]
+    }
+
+    fn dir_to_local(self, d: [f32; 3]) -> [f32; 3] {
+        [
+            crate::world::sdf::dot(self.tangent, d) * self.scale,
+            crate::world::sdf::dot(self.radial, d) * self.scale,
+            crate::world::sdf::dot(self.up, d) * self.scale,
+        ]
+    }
+
+    fn point_to_world(self, p: [f32; 3]) -> [f32; 3] {
+        let q = [
+            (p[0] - 1.5) / self.scale,
+            (p[1] - 1.5) / self.scale,
+            (p[2] - 1.5) / self.scale,
+        ];
+        [
+            self.origin[0]
+                + self.tangent[0] * q[0]
+                + self.radial[0] * q[1]
+                + self.up[0] * q[2],
+            self.origin[1]
+                + self.tangent[1] * q[0]
+                + self.radial[1] * q[1]
+                + self.up[1] * q[2],
+            self.origin[2]
+                + self.tangent[2] * q[0]
+                + self.radial[2] * q[1]
+                + self.up[2] * q[2],
+        ]
+    }
+
+}
+
+pub(super) fn uv_ring_cell_frame(
+    dims: [u32; 3],
+    _slab_depth: u8,
+    cell_x: u32,
+) -> UvRingCellFrame {
+    let body_size = 3.0_f32;
+    let center = [body_size * 0.5; 3];
+    let radius = body_size * 0.38;
+    let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
+    let side = ((2.0 * std::f32::consts::PI * radius / dims[0] as f32) * 0.95)
+        .max(body_size / 27.0);
+    let angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
+    let (sa, ca) = angle.sin_cos();
+    let radial = [ca, 0.0, sa];
+    let tangent = [-sa, 0.0, ca];
+    let up = [0.0, 1.0, 0.0];
+    let origin = [
+        center[0] + radial[0] * radius,
+        center[1],
+        center[2] + radial[2] * radius,
+    ];
+    UvRingCellFrame {
+        origin,
+        tangent,
+        radial,
+        up,
+        scale: 3.0 / side,
+    }
+}
+
+pub(super) fn uv_ring_cell_path(cell_x: u32, slab_depth: u8) -> Path {
+    let mut path = Path::root();
+    let mut cells_per_slot = 1u32;
+    for _ in 1..slab_depth {
+        cells_per_slot *= 3;
+    }
+    for _ in 0..slab_depth {
+        let sx = (cell_x / cells_per_slot) % 3;
+        let slot = crate::world::tree::slot_index(sx as usize, 0, 0) as u8;
+        path.push(slot);
+        cells_per_slot = (cells_per_slot / 3).max(1);
+    }
+    path
+}
+
+fn cartesian_dir_in_path_suffix(mut d: [f32; 3], path: &Path, suffix_start: u8) -> [f32; 3] {
+    for _ in suffix_start as usize..path.depth() as usize {
+        d = [d[0] * 3.0, d[1] * 3.0, d[2] * 3.0];
+    }
+    d
+}
+
+pub(super) fn uv_ring_cell_x_from_path(path: &Path, slab_depth: u8) -> Option<u32> {
+    if path.depth() < slab_depth {
+        return None;
+    }
+    let mut x = 0u32;
+    for k in 0..slab_depth as usize {
+        let (sx, sy, sz) = crate::world::tree::slot_coords(path.slot(k) as usize);
+        if sy != 0 || sz != 0 {
+            return None;
+        }
+        x = x * 3 + sx as u32;
+    }
+    Some(x)
 }
 
 /// True iff walking `path` from `world_root` lands on a node whose
@@ -739,9 +1009,15 @@ pub(super) fn frame_path_chain(
     frame_path: &crate::world::anchor::Path,
 ) -> ([[f32; 3]; 3], f32) {
     use crate::world::gpu::TbBoundary;
-    use crate::world::tree::{Child, IDENTITY_ROTATION};
+    use crate::world::tree::{Child, IDENTITY_ROTATION, NodeKind};
     let mut rot = IDENTITY_ROTATION;
     let mut scale: f32 = 1.0;
+    if let Some(NodeKind::UvRing { dims, slab_depth }) = library.get(world_root).map(|n| n.kind) {
+        if let Some(cell_x) = uv_ring_cell_x_from_path(frame_path, slab_depth) {
+            let f = uv_ring_cell_frame(dims, slab_depth, cell_x);
+            rot = [f.tangent, f.radial, f.up];
+        }
+    }
     let mut node = world_root;
     for k in 0..(frame_path.depth() as usize) {
         let n = match library.get(node) {
@@ -774,6 +1050,12 @@ pub(super) fn frame_path_rotation(
 ) -> [[f32; 3]; 3] {
     use crate::world::tree::{Child, IDENTITY_ROTATION, NodeKind};
     let mut rot = IDENTITY_ROTATION;
+    if let Some(NodeKind::UvRing { dims, slab_depth }) = library.get(world_root).map(|n| n.kind) {
+        if let Some(cell_x) = uv_ring_cell_x_from_path(frame_path, slab_depth) {
+            let f = uv_ring_cell_frame(dims, slab_depth, cell_x);
+            rot = [f.tangent, f.radial, f.up];
+        }
+    }
     let mut node = world_root;
     for k in 0..(frame_path.depth() as usize) {
         let n = match library.get(node) {

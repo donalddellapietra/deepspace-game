@@ -140,7 +140,7 @@ pub(super) fn bootstrap_uv_sphere_test_world() -> WorldBootstrap {
         world: uv_sphere_test_world(),
         planet_path: None,
         default_spawn_pos: uv_sphere_test_spawn(),
-        default_spawn_yaw: std::f32::consts::PI,
+        default_spawn_yaw: 0.0,
         default_spawn_pitch: 0.0,
         plain_layers: 0,
         color_registry: crate::world::palette::ColorRegistry::new(),

@@ -303,7 +303,14 @@ impl App {
             render_path: effective_render.render_path,
             logical_path: intended_frame.logical_path,
             node_id: effective_render.node_id,
-            kind: effective_render.kind,
+            kind: match intended_frame.kind {
+                ActiveFrameKind::UvRingCell { .. }
+                    if effective_render.render_path == intended_frame.render_path =>
+                {
+                    intended_frame.kind
+                }
+                _ => effective_render.kind,
+            },
         };
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(scene_frame_bfs);
@@ -353,6 +360,7 @@ impl App {
                 ActiveFrameKind::UvRing { dims, slab_depth } => {
                     renderer.set_root_kind_uv_ring(dims, slab_depth);
                 }
+                ActiveFrameKind::UvRingCell { .. } => renderer.set_root_kind_cartesian(),
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

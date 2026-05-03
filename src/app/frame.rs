@@ -21,6 +21,7 @@ pub enum ActiveFrameKind {
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
     UvRing { dims: [u32; 3], slab_depth: u8 },
+    UvRingCell { dims: [u32; 3], slab_depth: u8, cell_x: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

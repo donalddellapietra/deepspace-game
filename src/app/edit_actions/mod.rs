@@ -30,6 +30,18 @@ impl App {
         crate::world::sdf::normalize(rotated)
     }
 
+    pub(super) fn ray_dir_in_active_frame(&self) -> [f32; 3] {
+        let fwd = crate::world::sdf::normalize(self.camera.forward());
+        match self.active_frame.kind {
+            ActiveFrameKind::UvRingCell { .. } => {
+                crate::world::sdf::normalize(
+                    self.direction_for_active_frame(&self.active_frame, fwd),
+                )
+            }
+            _ => self.ray_dir_in_frame(&self.active_frame.render_path),
+        }
+    }
+
     /// Interaction distance cap in the given frame's local units.
     /// = `interaction_radius_cells × anchor_cell_size_in_frame`,
     /// where `anchor_cell_size_in_frame = 3 / 3^K` for K = anchor
@@ -67,7 +79,7 @@ impl App {
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            ActiveFrameKind::Cartesian => {
+            ActiveFrameKind::Cartesian | ActiveFrameKind::UvRingCell { .. } => {
                 let frame_path = self.active_frame.render_path;
                 // Rotation-aware projection: when the anchor crosses
                 // a TangentBlock the offset lives in the chain-rotated
@@ -77,10 +89,8 @@ impl App {
                 // on the path — agrees with what `gpu_camera_for_frame`
                 // already does (`in_frame_rot` at line 624 of mod.rs)
                 // so cursor targeting matches what the shader renders.
-                let cam_local = self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame_path,
-                );
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let cam_local = self.camera_local_for_active_frame(&self.active_frame);
+                let ray_dir = self.ray_dir_in_active_frame();
                 let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,
                     self.world.root,
