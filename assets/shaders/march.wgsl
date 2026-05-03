@@ -127,8 +127,7 @@ fn march_entity_subtree(
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
-    result.cell_min = vec3<f32>(0.0);
-    result.cell_size = 1.0;
+    result.local_in_cell = vec3<f32>(0.0);
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -232,8 +231,11 @@ fn march_entity_subtree(
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
             result.normal = normal;
-            result.cell_min = cell_min_h;
-            result.cell_size = cur_cell_size;
+            let hit_local = ray_origin + ray_dir * result.t;
+            result.local_in_cell = clamp(
+                (hit_local - cell_min_h) / cur_cell_size,
+                vec3<f32>(0.0), vec3<f32>(1.0),
+            );
             return result;
         }
         // tag == 2u: Cartesian Node descent. tag==3 (EntityRef) is
@@ -278,8 +280,11 @@ fn march_entity_subtree(
                 result.t = max(cell_box_l.t_enter, 0.0);
                 result.color = palette[bt].rgb;
                 result.normal = normal;
-                result.cell_min = cell_min_l;
-                result.cell_size = cur_cell_size;
+                let hit_local = ray_origin + ray_dir * result.t;
+                result.local_in_cell = clamp(
+                    (hit_local - cell_min_l) / cur_cell_size,
+                    vec3<f32>(0.0), vec3<f32>(1.0),
+                );
                 return result;
             }
         } else {
@@ -334,8 +339,7 @@ fn march_cartesian(
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
-    result.cell_min = vec3<f32>(0.0);
-    result.cell_size = 1.0;
+    result.local_in_cell = vec3<f32>(0.0);
 
     // Local-frame DDA. Each push transforms the ray into the child's
     // [0, 3)³ local frame (origin = (origin - vec3(cell)) * 3, dir *=3).
@@ -592,10 +596,10 @@ fn march_cartesian(
         if ENABLE_STATS { ray_loads_tree = ray_loads_tree + 1u; }
 
         if tag == 1u {
-            // Block hit. Outer-frame cell_min/size: cell occupies
-            // [vec3(cell), vec3(cell)+1] in current local frame, which
-            // maps to [vec3(cell)*cur_scale + cur_outer_origin,
-            // ... + cur_scale] in outer frame.
+            // Block hit. Compute local_in_cell directly from the
+            // local-frame ray + t. NO absolute coords — the cell
+            // occupies [vec3(cell), vec3(cell)+1] in current local
+            // frame regardless of depth.
             let local_cell_min = vec3<f32>(cell);
             let local_cell_max = local_cell_min + vec3<f32>(1.0);
             let cell_box_h = ray_box(ray_origin, inv_dir, local_cell_min, local_cell_max);
@@ -603,16 +607,15 @@ fn march_cartesian(
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
             result.normal = normal;
-            result.cell_min = cur_outer_origin + vec3<f32>(cell) * cur_scale;
-            result.cell_size = cur_scale;
-            // Walker probe (curvature_offset uses outer ray_dir for
-            // bit-identical semantics with the old code).
+            let hit_local = ray_origin + ray_dir * result.t;
+            result.local_in_cell = clamp(hit_local - local_cell_min, vec3<f32>(0.0), vec3<f32>(1.0));
+            // Walker probe (curvature_offset from outer ray_dir).
             let horiz_dir_sq_h = outer_ray_dir.x * outer_ray_dir.x
                 + outer_ray_dir.z * outer_ray_dir.z;
             let curvature_offset = result.t * result.t * horiz_dir_sq_h * uniforms.curvature.x;
             write_walker_probe(
                 1u, iterations, depth, cell,
-                result.cell_min, cur_scale,
+                vec3<f32>(0.0), cur_scale,
                 result.t, normal, 1u, curvature_offset,
             );
             return result;
@@ -650,8 +653,13 @@ fn march_cartesian(
                     result.t = max(ebb.t_enter, 0.0);
                     result.color = palette[rep].rgb;
                     result.normal = -normalize(ray_dir);
-                    result.cell_min = entity.bbox_min;
-                    result.cell_size = bbox_size_outer.x;
+                    // local_in_cell within entity bbox (in current local frame)
+                    let hit_local = ray_origin + ray_dir * result.t;
+                    let bbox_size_local = bbox_max_local - bbox_min_local;
+                    result.local_in_cell = clamp(
+                        (hit_local - bbox_min_local) / max(bbox_size_local, vec3<f32>(1e-8)),
+                        vec3<f32>(0.0), vec3<f32>(1.0),
+                    );
                     return result;
                 }
                 let m_lod_e = min_axis_mask(cur_side_dist);
@@ -675,18 +683,14 @@ fn march_cartesian(
             let ent_dir = ray_dir * scale3_local;
             let sub = march_entity_subtree(entity.subtree_bfs, ent_origin, ent_dir);
             if sub.hit {
-                let size_over_3 = bbox_size_outer * (1.0 / 3.0);
                 result.hit = true;
-                // scale3 has equal components for cubic entity; ent_dir
-                // = ray_dir * scale3.x, so sub.t (entity local t) is
-                // related to outer t by sub.t / scale3_outer.x where
-                // scale3_outer = 3 / bbox_size_outer.
                 let scale3_outer_x = 3.0 / bbox_size_outer.x;
                 result.t = sub.t / scale3_outer_x;
                 result.color = sub.color;
                 result.normal = sub.normal;
-                result.cell_min = entity.bbox_min + sub.cell_min * size_over_3;
-                result.cell_size = sub.cell_size * size_over_3.x;
+                // sub.local_in_cell is already in [0,1]³ within the
+                // sub-march's hit cell — pass through unchanged.
+                result.local_in_cell = sub.local_in_cell;
                 return result;
             }
             let m_ent_miss = min_axis_mask(cur_side_dist);
@@ -737,24 +741,11 @@ fn march_cartesian(
                 );
                 let sub = march_in_tangent_cube(child_idx, local_origin, local_dir);
                 if sub.hit {
-                    let local_hit = local_origin + local_dir * sub.t;
-                    let local_in_cell = clamp(
-                        (local_hit - sub.cell_min) / sub.cell_size,
-                        vec3<f32>(0.0), vec3<f32>(1.0),
-                    );
-                    let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
+                    // sub.local_in_cell is in [0,1]³ within the
+                    // sub-march's hit cell. Bevel uses it directly.
+                    let local_bevel = cube_face_bevel(sub.local_in_cell, sub.normal);
                     var out: HitResult;
                     out.hit = true;
-                    // sub.t is the t in the ENTITY/local-subtree ray
-                    // parameterization. The local_pre_dir = ray_dir * 3,
-                    // so ray_dir * t_outer = local_pre_dir * t_local
-                    // → t_outer = t_local / 3? No: scale was applied to
-                    // BOTH origin and dir of march_in_tangent_cube, so
-                    // t IS preserved across local_pre_origin / local_dir.
-                    // But rotation is applied only to direction (R^T),
-                    // which is orthonormal so doesn't change |dir| —
-                    // t stays preserved. So sub.t is in OUTER ray's
-                    // parameterization. (Same as old code.)
                     out.t = sub.t;
                     out.color = sub.color * (0.7 + 0.3 * local_bevel);
                     out.normal = rc0 * sub.normal.x
@@ -762,10 +753,7 @@ fn march_cartesian(
                                + rc2 * sub.normal.z;
                     out.frame_level = 0u;
                     out.frame_scale = 1.0;
-                    let hit_local = ray_origin + ray_dir * sub.t;
-                    let hit_outer = cur_outer_origin + hit_local * cur_scale;
-                    out.cell_min = hit_outer - vec3<f32>(0.5);
-                    out.cell_size = 1.0;
+                    out.local_in_cell = sub.local_in_cell;
                     return out;
                 }
                 let m_tb = min_axis_mask(cur_side_dist);
@@ -808,8 +796,8 @@ fn march_cartesian(
                     result.t = max(cell_box_l.t_enter, 0.0);
                     result.color = palette[bt].rgb;
                     result.normal = normal;
-                    result.cell_min = cur_outer_origin + vec3<f32>(cell) * cur_scale;
-                    result.cell_size = cur_scale;
+                    let hit_local = ray_origin + ray_dir * result.t;
+                    result.local_in_cell = clamp(hit_local - local_cell_min, vec3<f32>(0.0), vec3<f32>(1.0));
                     return result;
                 }
             } else {
@@ -1087,8 +1075,7 @@ fn march_in_tangent_cube(
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
-    result.cell_min = vec3<f32>(0.0);
-    result.cell_size = 1.0;
+    result.local_in_cell = vec3<f32>(0.0);
 
     let inv_dir = vec3<f32>(
         select(1e10, 1.0 / ray_dir.x, abs(ray_dir.x) > 1e-8),
@@ -1195,8 +1182,11 @@ fn march_in_tangent_cube(
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette[(packed >> 8u) & 0xFFFFu].rgb;
             result.normal = normal;
-            result.cell_min = cell_min_h;
-            result.cell_size = cur_cell_size;
+            let hit_local = ray_origin + ray_dir * result.t;
+            result.local_in_cell = clamp(
+                (hit_local - cell_min_h) / cur_cell_size,
+                vec3<f32>(0.0), vec3<f32>(1.0),
+            );
             return result;
         }
 
@@ -1235,8 +1225,11 @@ fn march_in_tangent_cube(
             result.t = max(cell_box_h.t_enter, 0.0);
             result.color = palette[child_bt].rgb;
             result.normal = normal;
-            result.cell_min = cell_min_h;
-            result.cell_size = cur_cell_size;
+            let hit_local = ray_origin + ray_dir * result.t;
+            result.local_in_cell = clamp(
+                (hit_local - cell_min_h) / cur_cell_size,
+                vec3<f32>(0.0), vec3<f32>(1.0),
+            );
             return result;
         }
 
@@ -1349,8 +1342,7 @@ fn march_wrapped_planet(
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = 1.0;
-    result.cell_min = vec3<f32>(0.0);
-    result.cell_size = 1.0;
+    result.local_in_cell = vec3<f32>(0.0);
 
     // Renormalise the ray for the entry quadratic. `t` returned to
     // the caller is in the original parameterisation, so multiply
@@ -1432,12 +1424,7 @@ fn march_wrapped_planet(
         if sample.tag == 2u {
             let sub = march_in_tangent_cube(sample.child_idx, local_origin, local_dir);
             if sub.hit {
-                let local_hit = local_origin + local_dir * sub.t;
-                let local_in_cell = clamp(
-                    (local_hit - sub.cell_min) / sub.cell_size,
-                    vec3<f32>(0.0), vec3<f32>(1.0),
-                );
-                let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
+                let local_bevel = cube_face_bevel(sub.local_in_cell, sub.normal);
                 var out: HitResult;
                 out.hit = true;
                 out.t = sub.t * inv_norm;
@@ -1447,9 +1434,7 @@ fn march_wrapped_planet(
                            + cube.north_w * sub.normal.z;
                 out.frame_level = 0u;
                 out.frame_scale = 1.0;
-                let hit_world = ray_origin + ray_dir * sub.t;
-                out.cell_min = hit_world - vec3<f32>(0.5);
-                out.cell_size = 1.0;
+                out.local_in_cell = sub.local_in_cell;
                 return out;
             }
         } else if sample.tag == 1u {
@@ -1489,9 +1474,7 @@ fn march_wrapped_planet(
                            + cube.north_w * local_normal.z;
                 out.frame_level = 0u;
                 out.frame_scale = 1.0;
-                let hit_world = ray_origin + ray_dir * t_local;
-                out.cell_min = hit_world - vec3<f32>(0.5);
-                out.cell_size = 1.0;
+                out.local_in_cell = local_in_cell;
                 return out;
             }
         }
@@ -1644,7 +1627,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     result.t = 1e20;
     result.frame_level = 0u;
     result.frame_scale = cur_scale;
-    result.cell_min = vec3<f32>(0.0);
-    result.cell_size = 1.0;
+    result.local_in_cell = vec3<f32>(0.0);
     return result;
 }

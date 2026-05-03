@@ -373,6 +373,9 @@ struct HitResult {
     /// camera frame; >0 = popped that many times into ancestors.
     frame_level: u32,
     frame_scale: f32,
-    cell_min: vec3<f32>,
-    cell_size: f32,
+    /// Hit position normalized within the hit cell, in [0, 1]³.
+    /// Computed inside the marcher using LOCAL-FRAME coords at the
+    /// hit depth — never needs absolute world coords. Used by the
+    /// fragment shader for the cube bevel effect.
+    local_in_cell: vec3<f32>,
 }
