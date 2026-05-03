@@ -230,7 +230,16 @@ impl WorldPos {
             library, world_root, self.anchor.as_slice(),
         );
         let adjusted = match popped_kind.and_then(TbBoundary::from_kind) {
-            Some(b) => b.exit_point(self.offset, 0.5),
+            Some(b) => {
+                // Cell sits at parent slot's natural position + cell_offset
+                // (in parent's [0, 3)³ units; same as our offset frame
+                // before the /3 rescale).
+                let mut p = b.exit_point(self.offset, 0.5);
+                p[0] += b.cell_offset[0];
+                p[1] += b.cell_offset[1];
+                p[2] += b.cell_offset[2];
+                p
+            }
             None => self.offset,
         };
         let last_slot = self.anchor.pop().unwrap_or(0) as usize;
@@ -277,7 +286,13 @@ impl WorldPos {
         ];
         if let Some(b) = descend_kind.and_then(TbBoundary::from_kind) {
             // No clamp — let offset go OOB. Phase 2 of renormalize
-            // accepts this rather than looping.
+            // accepts this rather than looping. Subtract cell_offset
+            // before the rotation+scale: position is relative to
+            // cell's actual lower corner, which is `slot + cell_offset`
+            // in parent units.
+            new_offset[0] -= b.cell_offset[0];
+            new_offset[1] -= b.cell_offset[1];
+            new_offset[2] -= b.cell_offset[2];
             new_offset = b.enter_point(new_offset, 0.5);
         }
         self.offset = new_offset;
@@ -386,6 +401,11 @@ impl WorldPos {
         if let Some(b) = descend_kind.and_then(TbBoundary::from_kind) {
             // No clamp — offset can go OOB if camera is in the
             // parent slot's corner outside the inscribed diamond.
+            // Subtract cell_offset (cell's displacement from natural
+            // slot position) before the rotation+scale.
+            new_offset[0] -= b.cell_offset[0];
+            new_offset[1] -= b.cell_offset[1];
+            new_offset[2] -= b.cell_offset[2];
             new_offset = b.enter_point(new_offset, 0.5);
         }
         self.offset = new_offset;
@@ -413,7 +433,13 @@ impl WorldPos {
             library, world_root, self.anchor.as_slice(),
         );
         let adjusted = match popped_kind.and_then(TbBoundary::from_kind) {
-            Some(b) => b.exit_point(self.offset, 0.5),
+            Some(b) => {
+                let mut p = b.exit_point(self.offset, 0.5);
+                p[0] += b.cell_offset[0];
+                p[1] += b.cell_offset[1];
+                p[2] += b.cell_offset[2];
+                p
+            }
             None => self.offset,
         };
         let last_slot = match self.anchor.pop() {
@@ -605,11 +631,33 @@ impl WorldPos {
             let slot = self.anchor.slot(k);
             let (sx, sy, sz) = slot_coords(slot as usize);
             let child_size = cur_size / 3.0;
-            let centred_local = [
+
+            // Look up the child kind so cell_offset (if it's a TB) can
+            // displace the slot-centre BEFORE the cumulative
+            // rotation+scale is applied. cell_offset is in parent-frame
+            // [0, 3)³ units (one slot = 1 unit), which corresponds to
+            // `child_size` in chain coords.
+            let child_boundary = if have_node {
+                let n = library.get(node).unwrap();
+                if let Child::Node(child_id) = n.children[slot as usize] {
+                    library.get(child_id).and_then(|c| TbBoundary::from_kind(c.kind))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut centred_local = [
                 (sx as f32 - 1.0) * child_size,
                 (sy as f32 - 1.0) * child_size,
                 (sz as f32 - 1.0) * child_size,
             ];
+            if let Some(b) = child_boundary {
+                centred_local[0] += b.cell_offset[0] * child_size;
+                centred_local[1] += b.cell_offset[1] * child_size;
+                centred_local[2] += b.cell_offset[2] * child_size;
+            }
             // Rotate, scale by cumulative TB shrink, add to centre.
             let rotated = crate::world::mat3::mul_vec3(&cur_rot, &centred_local);
             cur_centre = [

@@ -156,10 +156,18 @@ pub(super) fn cpu_raycast_inner(
                 // NO world-absolute coordinates.
                 if let Some(boundary) = super::TbBoundary::from_kind(child_node.kind) {
                     let scale = 3.0 / parent_cell_size;
+                    // Cell origin = slot lower corner + per-cell
+                    // displacement (zero for ordinary TBs). Mirrors
+                    // the shader's TB child dispatch.
+                    let cell_off_world = [
+                        boundary.cell_offset[0] * parent_cell_size,
+                        boundary.cell_offset[1] * parent_cell_size,
+                        boundary.cell_offset[2] * parent_cell_size,
+                    ];
                     let lp_origin = [
-                        (ray_origin[0] - child_origin[0]) * scale,
-                        (ray_origin[1] - child_origin[1]) * scale,
-                        (ray_origin[2] - child_origin[2]) * scale,
+                        (ray_origin[0] - child_origin[0] - cell_off_world[0]) * scale,
+                        (ray_origin[1] - child_origin[1] - cell_off_world[1]) * scale,
+                        (ray_origin[2] - child_origin[2] - cell_off_world[2]) * scale,
                     ];
                     let lp_dir = [
                         ray_dir[0] * scale,

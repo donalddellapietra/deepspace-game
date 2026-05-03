@@ -808,7 +808,14 @@ fn march_cartesian(
             // then rotated by the stored R^T around the cube centre.
             // On hit, normal is rotated back via R · local_normal.
             if node_kinds[child_idx].kind == NODE_KIND_TANGENT_BLOCK {
-                let child_origin_tb = cur_node_origin + vec3<f32>(cell) * cur_cell_size;
+                // Cell origin = natural slot lower corner + per-cell
+                // displacement. `cell_offset` is in parent-frame `[0, 3)³`
+                // units (one slot = 1 unit), so scale to render-frame
+                // by multiplying by `cur_cell_size` alongside `cell`.
+                // Zero for ordinary TBs; non-zero for SphericalWP cells.
+                let cell_off = node_kinds[child_idx].cell_offset.xyz;
+                let child_origin_tb =
+                    cur_node_origin + (vec3<f32>(cell) + cell_off) * cur_cell_size;
                 // Scale maps the slot's parent extent (size cur_cell_size)
                 // into the child's [0, 3)³ local frame: 3 / cur_cell_size.
                 let scale = 3.0 / cur_cell_size;
@@ -1719,10 +1726,14 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if child_kind == NODE_KIND_TANGENT_BLOCK {
             // Inverse of the entry transform (`tb_exit_*` about
             // pivot 1.5), then translate-and-scale into parent's
-            // `[0, 3)³`.
+            // `[0, 3)³`. The cell's centre in parent units is
+            // `slot_off + 0.5 + cell_offset` (zero offset → cell
+            // sits at slot centre; non-zero → SphericalWP).
+            let cell_off = node_kinds[entry.child_bfs].cell_offset.xyz;
             let parent_origin = tb_exit_point(entry.child_bfs, ray_origin, 1.5);
             let parent_dir = tb_exit_dir(entry.child_bfs, ray_dir);
-            ray_origin = slot_off + vec3<f32>(0.5) + (parent_origin - vec3<f32>(1.5)) / 3.0;
+            ray_origin = slot_off + vec3<f32>(0.5) + cell_off
+                + (parent_origin - vec3<f32>(1.5)) / 3.0;
             ray_dir = parent_dir;
         } else {
             ray_origin = slot_off + ray_origin / 3.0;
