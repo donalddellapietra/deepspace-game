@@ -1599,28 +1599,6 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
     var ribbon_level: u32 = 0u;
     var cur_scale: f32 = 1.0;
 
-    // TangentBlock frame root: the camera position arrives in the
-    // TB's UNROTATED local frame (CPU `in_frame_rot` only handles
-    // rotations strictly below the frame). The shader needs to see
-    // content from the same R^T-rotated perspective as rays
-    // entering from outside (which apply R^T-around-(1.5,1.5,1.5)
-    // at the TB boundary). Apply the same centred R^T to ray_origin
-    // here so inside/outside views stay continuous. ray_dir is
-    // already R^T-rotated by the CPU's frame_path_rotation basis.
-    // On ribbon pop above this frame, the centred R inverts it.
-    let frame_root_kind = node_kinds[current_idx].kind;
-    if frame_root_kind == NODE_KIND_TANGENT_BLOCK {
-        let rc0 = node_kinds[current_idx].rot_col0.xyz;
-        let rc1 = node_kinds[current_idx].rot_col1.xyz;
-        let rc2 = node_kinds[current_idx].rot_col2.xyz;
-        let centered = ray_origin - vec3<f32>(1.5);
-        ray_origin = vec3<f32>(1.5) + vec3<f32>(
-            dot(rc0, centered),
-            dot(rc1, centered),
-            dot(rc2, centered),
-        );
-    }
-
     // skip_slot: after a ribbon pop, the slot index (in the parent)
     // of the child we just left. march_cartesian skips this slot at
     // depth 0 to avoid re-entering the subtree already traversed by
