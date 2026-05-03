@@ -47,9 +47,9 @@ pub struct GpuRibbonEntry {
 }
 
 /// Bit mask for the `siblings_all_empty` flag in `slot_bits`.
-pub const SIBLINGS_ALL_EMPTY_BIT: u32 = 1 << 31;
+const SIBLINGS_ALL_EMPTY_BIT: u32 = 1 << 31;
 /// Bit mask isolating the slot index (0..27) in `slot_bits`.
-pub const SLOT_MASK: u32 = 0x1F;
+const SLOT_MASK: u32 = 0x1F;
 
 impl GpuRibbonEntry {
     pub fn new(node_idx: u32, slot: u8, siblings_all_empty: bool, child_bfs: u32) -> Self {

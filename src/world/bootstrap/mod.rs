@@ -12,8 +12,6 @@ mod rotated_cube_test;
 mod vox;
 mod wrapped_planet;
 
-pub use rotated_cube_test::{rotated_cube_test_spawn, rotated_cube_test_world};
-
 pub use plain::{
     carve_air_pocket, plain_surface_spawn, plain_test_world, plain_world,
     DEFAULT_PLAIN_LAYERS,

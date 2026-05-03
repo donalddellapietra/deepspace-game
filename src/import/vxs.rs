@@ -20,7 +20,7 @@
 //! index LUT maps `.vxs` palette → registry index.
 
 use std::fs::File;
-use std::io::{Read, SeekFrom};
+use std::io::Read;
 use std::path::Path;
 
 use crate::world::palette::ColorRegistry;
@@ -165,6 +165,3 @@ fn read_u32(f: &mut File) -> Result<u32, String> {
     Ok(u32::from_le_bytes(b))
 }
 
-// Suppress unused-import warnings when this module is tested in isolation.
-#[allow(dead_code)]
-fn _seek_unused(_f: &mut File) { let _ = SeekFrom::Start(0); }

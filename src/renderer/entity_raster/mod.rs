@@ -72,7 +72,6 @@ pub struct DrawBatch {
 
 pub struct EntityRasterState {
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
     uniforms_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// NodeId → GpuMesh. Entries never evict during a run; edits
@@ -237,7 +236,6 @@ impl EntityRasterState {
 
         Self {
             pipeline,
-            bind_group_layout,
             uniforms_buffer,
             bind_group,
             mesh_cache,
@@ -426,10 +424,6 @@ impl EntityRasterState {
     /// `wgpu::Buffer` is a shared-handle type.
     pub fn instance_buffer(&self) -> &wgpu::Buffer { &self.instance_buffer }
 
-    #[allow(dead_code)]
-    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.bind_group_layout
-    }
 }
 
 /// Column-major 4x4 identity.

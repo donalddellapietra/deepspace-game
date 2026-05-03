@@ -48,10 +48,7 @@ const ROTATION_ANGLE_RAD: f32 = std::f32::consts::FRAC_PI_4;
 /// total tree depth is `CUBE_SUBTREE_DEPTH + 1` (root + each
 /// subtree). For the precision-pressure test, 29 puts the deepest
 /// stone leaves at root tree depth 30.
-pub const CUBE_SUBTREE_DEPTH: u8 = 29;
-
-/// Total tree depth produced by this preset.
-pub const ROTATED_CUBE_TEST_TREE_DEPTH: u32 = CUBE_SUBTREE_DEPTH as u32 + 1;
+const CUBE_SUBTREE_DEPTH: u8 = 29;
 
 /// Build a uniform-block recursive Cartesian subtree of `depth`
 /// levels. Returns a `Child` referencing the root of the subtree
@@ -90,7 +87,7 @@ fn build_tangent_block_subtree(
     ))
 }
 
-pub fn rotated_cube_test_world() -> WorldState {
+pub(super) fn rotated_cube_test_world() -> WorldState {
     let mut library = NodeLibrary::default();
 
     // Three sibling subtrees forming a horizontal row at root y=1, z=1.
@@ -126,7 +123,7 @@ pub fn rotated_cube_test_world() -> WorldState {
 /// Camera spawn: one cell directly above the row, looking down.
 /// Anchor depth 1 (slot 16 = (1, 2, 1) of root); offset (0.5, 0.5,
 /// 0.5) puts world position at (1.5, 2.5, 1.5) in root frame coords.
-pub fn rotated_cube_test_spawn() -> WorldPos {
+pub(super) fn rotated_cube_test_spawn() -> WorldPos {
     WorldPos::uniform_column(slot_index(1, 2, 1) as u8, 1, [0.5, 0.5, 0.5])
 }
 
@@ -151,7 +148,7 @@ mod tests {
     #[test]
     fn tree_has_expected_depth() {
         let world = rotated_cube_test_world();
-        assert_eq!(world.tree_depth(), ROTATED_CUBE_TEST_TREE_DEPTH);
+        assert_eq!(world.tree_depth(), CUBE_SUBTREE_DEPTH as u32 + 1);
     }
 
     #[test]

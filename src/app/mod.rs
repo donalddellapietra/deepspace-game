@@ -13,7 +13,7 @@ use crate::world::anchor::{Path, WorldPos, WORLD_SIZE};
 use crate::world::bootstrap;
 use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
-use crate::world::tree::{NodeKind, MAX_DEPTH};
+use crate::world::tree::MAX_DEPTH;
 
 /// `render_margin` passed to `with_render_margin`. For Cartesian
 /// frames `min_render_depth = logical.depth()` so this constant is
@@ -533,20 +533,6 @@ impl App {
 
     fn path_lands_on_tangent_block(&self, path: &Path) -> bool {
         path_lands_on_tangent_block(&self.world.library, self.world.root, path)
-    }
-
-    /// `NodeKind` of the *intended* render-frame root from a tree
-    /// walk (no buffer-truncation awareness). `upload_tree_lod`
-    /// uses the effective frame instead — the one build_ribbon
-    /// could actually reach. Kept for tests / debugging.
-    #[allow(dead_code)]
-    pub(super) fn render_frame_kind(&self) -> NodeKind {
-        match self.render_frame().kind {
-            ActiveFrameKind::Cartesian => NodeKind::Cartesian,
-            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
-                NodeKind::WrappedPlane { dims, slab_depth }
-            }
-        }
     }
 
     pub(super) fn update(&mut self, dt: f32) {

@@ -133,18 +133,8 @@ impl Path {
     /// axis.
     /// Returns `(stepped_ok, wrap_occurred)`. When `stepped_ok` is
     /// false the path is unchanged (world boundary hit).
-    pub fn step_neighbor_in_world(
-        &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
-        axis: usize,
-        direction: i32,
-    ) -> (bool, bool) {
-        self.step_neighbor_in_world_inner(library, world_root, axis, direction)
-    }
-
     /// Returns `(step_succeeded, wrap_occurred)`.
-    fn step_neighbor_in_world_inner(
+    pub fn step_neighbor_in_world(
         &mut self,
         library: &NodeLibrary,
         world_root: NodeId,
@@ -177,7 +167,7 @@ impl Path {
             }
         }
         self.depth -= 1;
-        let (ok, wrapped_inner) = self.step_neighbor_in_world_inner(library, world_root, axis, direction);
+        let (ok, wrapped_inner) = self.step_neighbor_in_world(library, world_root, axis, direction);
         if !ok {
             self.depth += 1;
             return (false, false);
