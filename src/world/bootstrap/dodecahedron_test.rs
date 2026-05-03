@@ -430,4 +430,54 @@ mod tests {
         }
     }
 
+    /// Cross-territorial routing: a world point that lies in slot 16
+    /// (face-adjacent Empty in this preset) but inside the +Y+Z TB's
+    /// rotated storage cube must be anchored *through the TB*, not
+    /// through the Empty territorial slot. This is the architectural
+    /// invariant that `pick_owning_child` enforces — a TB's storage
+    /// extent reaches across slot boundaries, and the renormaliser
+    /// picks the TB that geometrically claims the point.
+    ///
+    /// Without the cross-territorial fix, `from_world_xyz` would
+    /// floor-pick slot 16 (an empty corner of the dodec figure),
+    /// `in_frame_rot` would recover a wrong world Y / Z, and the
+    /// camera would render through empty space at a position that's
+    /// actually inside a TB cube.
+    #[test]
+    fn cross_territorial_world_point_routes_through_owning_tb() {
+        use crate::world::anchor::Path;
+        let world = dodecahedron_test_world();
+        // World point (1.5, 2.7, 1.9): inside slot 16 = (1, 2, 1)
+        // territorial extent [1,2]×[2,3]×[1,2], but inside the +Y+Z
+        // TB at slot 25's R(storage_cube) — the rotated storage face
+        // pokes back into z=1 territory along the lower edge of the
+        // tilted cube.
+        let xyz = [1.5, 2.7, 1.9];
+        let pos = WorldPos::from_world_xyz(
+            xyz, 3, &world.library, world.root,
+        );
+        // Anchor must descend through slot 25 (the owning TB), not
+        // through slot 16 (the territorial Empty face-adjacent slot).
+        assert_eq!(
+            pos.anchor.slot(0),
+            slot_index(1, 2, 2) as u8,
+            "expected slot 25 (+Y+Z TB) at depth 0; anchor was {:?}",
+            pos.anchor.as_slice(),
+        );
+        // The round-trip back through `in_frame_rot` must recover
+        // the input world coordinates — proves that the routing
+        // and the `R^T` ↔ `R` pair compose to identity even when
+        // the slot is reached cross-territorially.
+        let recovered = pos.in_frame_rot(
+            &world.library, world.root, &Path::root(),
+        );
+        for i in 0..3 {
+            assert!(
+                (recovered[i] - xyz[i]).abs() < 1e-3,
+                "cross-territorial round-trip drift on axis {i}: \
+                 input {:?} recovered {:?} (anchor {:?}, offset {:?})",
+                xyz, recovered, pos.anchor.as_slice(), pos.offset,
+            );
+        }
+    }
 }

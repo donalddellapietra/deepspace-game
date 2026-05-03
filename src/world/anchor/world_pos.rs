@@ -233,48 +233,29 @@ impl WorldPos {
     }
 
     /// Descend one level: pick the slot containing the camera and
-    /// push it onto the anchor. If the picked child is a
-    /// `TangentBlock`, apply `R^T` rotation about `(0.5, 0.5, 0.5)`
-    /// to the post-floor offset to convert from parent-frame into
-    /// TB-storage frame. World position is preserved across the
-    /// descend.
+    /// push it onto the anchor. World position preserved across the
+    /// descend. When the parent has `TangentBlock` children whose
+    /// rotated storage cubes overlap into neighbouring slots, the
+    /// owning child is chosen by `pick_owning_child`: any TB whose
+    /// `R(storage_cube) + slot_origin` contains the world point
+    /// claims it, even when the world point lies in a *different*
+    /// slot's territorial extent. Falls back to floor-based slot
+    /// selection (current cell-tiling behaviour) when no TB sibling
+    /// claims the world point.
     fn descend_one_level_rot_aware(
         &mut self,
         library: &NodeLibrary,
         world_root: NodeId,
     ) {
-        let storage_pos = [
+        let pos = [
             self.offset[0] * 3.0,
             self.offset[1] * 3.0,
             self.offset[2] * 3.0,
         ];
-        let sx = storage_pos[0].floor().clamp(0.0, 2.0) as i32 as usize;
-        let sy = storage_pos[1].floor().clamp(0.0, 2.0) as i32 as usize;
-        let sz = storage_pos[2].floor().clamp(0.0, 2.0) as i32 as usize;
-        let slot = slot_index(sx, sy, sz) as u8;
-        // Push first, then look up the descended-into cell's kind.
+        let parent_id = node_at_path(library, world_root, &self.anchor);
+        let (slot, child_offset) = pick_owning_child(pos, parent_id, library);
         self.anchor.push(slot);
-        let descend_kind = super::path::node_kind_at_depth(
-            library, world_root, self.anchor.as_slice(),
-        );
-        let mut new_offset = [
-            (storage_pos[0] - sx as f32).clamp(0.0, 1.0 - f32::EPSILON),
-            (storage_pos[1] - sy as f32).clamp(0.0, 1.0 - f32::EPSILON),
-            (storage_pos[2] - sz as f32).clamp(0.0, 1.0 - f32::EPSILON),
-        ];
-        if let Some(NodeKind::TangentBlock { rotation: r }) = descend_kind {
-            // R^T · (offset - 0.5) + 0.5
-            let centred = [new_offset[0] - 0.5, new_offset[1] - 0.5, new_offset[2] - 0.5];
-            let rotated = [
-                r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
-                r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
-                r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
-            ];
-            new_offset[0] = (rotated[0] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[1] = (rotated[1] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[2] = (rotated[2] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-        }
-        self.offset = new_offset;
+        self.offset = child_offset;
     }
 
     /// Advance by a local delta (in units of the current cell).
@@ -425,8 +406,12 @@ impl WorldPos {
         self.offset[0] = (sx as f32 + adjusted[0]) / 3.0;
         self.offset[1] = (sy as f32 + adjusted[1]) / 3.0;
         self.offset[2] = (sz as f32 + adjusted[2]) / 3.0;
-        debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
-        Transition::None
+        // For non-axis-aligned `TangentBlock` rotations, R(storage_cube)
+        // can extend past its slot boundary; in that case the popped
+        // offset lands outside `[0, 1)³` and the caller (or the next
+        // `renormalize_world`) re-routes through the correct sibling.
+        // Restore the strict invariant via a kind-aware renormalize.
+        self.renormalize_world(library, world_root)
     }
 
     /// Vector from `other` to `self`, computed
@@ -741,48 +726,37 @@ impl WorldPos {
             world_xyz[2].clamp(0.0, WORLD_SIZE - f32::EPSILON),
         ];
         let mut anchor = Path::root();
-        // `pos` lives in the current node's local `[0, WORLD_SIZE)³`
-        // frame; for descendants of a TB this is the storage-frame
-        // local coordinate after applying `R^T` about the TB centre
-        // when we reach the TB level.
+        // `pos` lives in the *current node's* children-grid frame —
+        // `[0, 3)³` where each integer cell is one child. Inside a
+        // `TangentBlock` parent this is the storage-frame children
+        // grid. Routing at each level goes through
+        // `pick_owning_child`, which checks every TB child's
+        // rotated storage cube and routes the world point to the
+        // claiming TB even when it sits in a different slot's
+        // territorial extent.
         let mut pos = clamped;
         let mut have_node = true;
         let mut node = world_root;
+        // Default offset (when `anchor_depth == 0`): root-frame
+        // `clamped / WORLD_SIZE`. Overwritten by the loop body.
+        let mut child_offset = [
+            (clamped[0] / WORLD_SIZE).clamp(0.0, 1.0 - f32::EPSILON),
+            (clamped[1] / WORLD_SIZE).clamp(0.0, 1.0 - f32::EPSILON),
+            (clamped[2] / WORLD_SIZE).clamp(0.0, 1.0 - f32::EPSILON),
+        ];
 
         for _ in 0..anchor_depth {
-            // If the current node is a TB, its children are indexed
-            // in storage frame: rotate `pos` by `R^T` about (1.5,
-            // 1.5, 1.5) before flooring to a slot.
-            if have_node {
-                if let Some(n) = library.get(node) {
-                    if let NodeKind::TangentBlock { rotation: r } = n.kind {
-                        let centered = [pos[0] - 1.5, pos[1] - 1.5, pos[2] - 1.5];
-                        // R^T · centered (column-major `r[col][row]`).
-                        let rotated = [
-                            r[0][0] * centered[0] + r[0][1] * centered[1] + r[0][2] * centered[2],
-                            r[1][0] * centered[0] + r[1][1] * centered[1] + r[1][2] * centered[2],
-                            r[2][0] * centered[0] + r[2][1] * centered[1] + r[2][2] * centered[2],
-                        ];
-                        pos = [rotated[0] + 1.5, rotated[1] + 1.5, rotated[2] + 1.5];
-                    }
-                }
-            }
-            let sx = (pos[0].floor() as i32).clamp(0, 2) as usize;
-            let sy = (pos[1].floor() as i32).clamp(0, 2) as usize;
-            let sz = (pos[2].floor() as i32).clamp(0, 2) as usize;
-            let slot = slot_index(sx, sy, sz);
-            anchor.push(slot as u8);
-            // Sub-cell position in child's `[0, WORLD_SIZE)³` frame.
-            pos = [
-                (pos[0] - sx as f32) * 3.0,
-                (pos[1] - sy as f32) * 3.0,
-                (pos[2] - sz as f32) * 3.0,
-            ];
+            let parent_id = if have_node { Some(node) } else { None };
+            let (slot, off) = pick_owning_child(pos, parent_id, library);
+            anchor.push(slot);
+            child_offset = off;
+            // Scale into the next iteration's children-grid frame.
+            pos = [off[0] * 3.0, off[1] * 3.0, off[2] * 3.0];
             // Descend into child node so the next iteration can
-            // detect a TB at the new level.
+            // see *its* children (and detect TB grandchildren).
             if have_node {
                 if let Some(n) = library.get(node) {
-                    match n.children[slot] {
+                    match n.children[slot as usize] {
                         Child::Node(child) => node = child,
                         _ => have_node = false,
                     }
@@ -792,12 +766,10 @@ impl WorldPos {
             }
         }
 
-        let offset = [
-            (pos[0] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
-            (pos[1] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
-            (pos[2] / 3.0).clamp(0.0, 1.0 - f32::EPSILON),
-        ];
-        Self { anchor, offset }
+        Self {
+            anchor,
+            offset: child_offset,
+        }
     }
 
     /// Pop the deepest slot. Offset rescaled so the world position
@@ -855,6 +827,172 @@ fn node_at_path(library: &NodeLibrary, world_root: NodeId, path: &Path) -> Optio
         }
     }
     Some(nid)
+}
+
+/// Tolerance for "world point lies inside a TB's R(storage_cube)".
+/// Tighter than `BOUNDARY_EPS` because the test is on storage-frame
+/// coords post-rotation: any f32 noise from the rotation matmul
+/// should be ≪ 1e-4 for unit-magnitude rotations.
+const TB_CLAIM_EPS: f32 = 1e-4;
+
+/// Pick the child of `parent_id` that owns world coords `pos`,
+/// expressed in the parent's local children-grid frame `[0, 3)³`.
+/// Returns `(slot_idx, offset_in_child_local_frame)` where the
+/// returned offset is in the child's `[0, 1)³` (storage frame for
+/// `TangentBlock` children, otherwise parent-local).
+///
+/// Picks a `TangentBlock` sibling whenever its rotated storage cube
+/// `R · [0,1]³ + slot_centre` contains the world point, even when
+/// that point lies in a *different* slot's territorial extent. This
+/// is the routing rule that lets non-axis-aligned TBs poke out of
+/// their host slot without losing world points to neighbouring
+/// Empty/Cartesian content.
+///
+/// When multiple TB siblings claim the same world point (their
+/// storage cubes overlap), pick the one whose storage offset is most
+/// central — minimises the `‖offset − 0.5‖∞` per the Chebyshev
+/// metric. Falls back to floor-based slot selection (parent-frame
+/// `floor(pos)`) when no TB claims; the floor-pick child can be a
+/// non-TB (Cartesian / Empty / Block) or a TB whose storage cube
+/// merely *touches* the world point at a face — in either case the
+/// returned offset is the standard parent-local `[0, 1)³`.
+fn pick_owning_child(
+    pos: [f32; 3],
+    parent_id: Option<NodeId>,
+    library: &NodeLibrary,
+) -> (u8, [f32; 3]) {
+    if let Some(pid) = parent_id {
+        if let Some(parent) = library.get(pid) {
+            // Phase 1: any TB sibling whose R(storage_cube) contains
+            // the world point.
+            let mut best: Option<([f32; 3], u8, f32)> = None;
+            for slot_idx in 0..27usize {
+                let Child::Node(child_id) = parent.children[slot_idx] else { continue };
+                let Some(child) = library.get(child_id) else { continue };
+                let NodeKind::TangentBlock { rotation: r } = child.kind else { continue };
+                let (sx, sy, sz) = slot_coords(slot_idx);
+                let parent_relative = [
+                    pos[0] - sx as f32,
+                    pos[1] - sy as f32,
+                    pos[2] - sz as f32,
+                ];
+                // R^T · (parent_relative − 0.5) + 0.5 — the inverse
+                // of the storage→parent rotation about the slot
+                // centre.
+                let centred = [
+                    parent_relative[0] - 0.5,
+                    parent_relative[1] - 0.5,
+                    parent_relative[2] - 0.5,
+                ];
+                let rotated = [
+                    r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
+                    r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
+                    r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
+                ];
+                let storage = [
+                    rotated[0] + 0.5,
+                    rotated[1] + 0.5,
+                    rotated[2] + 0.5,
+                ];
+                let inside = storage[0] >= -TB_CLAIM_EPS
+                    && storage[0] < 1.0 + TB_CLAIM_EPS
+                    && storage[1] >= -TB_CLAIM_EPS
+                    && storage[1] < 1.0 + TB_CLAIM_EPS
+                    && storage[2] >= -TB_CLAIM_EPS
+                    && storage[2] < 1.0 + TB_CLAIM_EPS;
+                if !inside {
+                    continue;
+                }
+                let centrality = [
+                    (storage[0] - 0.5).abs(),
+                    (storage[1] - 0.5).abs(),
+                    (storage[2] - 0.5).abs(),
+                ]
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max);
+                let take = match best {
+                    None => true,
+                    Some((_, _, prev)) => centrality < prev,
+                };
+                if take {
+                    best = Some((storage, slot_idx as u8, centrality));
+                }
+            }
+            if let Some((storage, slot, _)) = best {
+                let clamped = [
+                    storage[0].clamp(0.0, 1.0 - f32::EPSILON),
+                    storage[1].clamp(0.0, 1.0 - f32::EPSILON),
+                    storage[2].clamp(0.0, 1.0 - f32::EPSILON),
+                ];
+                return (slot, clamped);
+            }
+        }
+    }
+    // Phase 2: floor-based fallback (covers non-TB descendants, and
+    // the case of a TB sibling whose storage cube doesn't reach the
+    // world point — descend into whatever slot owns the point
+    // territorially). The post-floor offset is in parent-local
+    // `[0, 1)³`; if the floor-pick child happens to be a TB, the
+    // caller's outer routing (`renormalize_world` outer loop with
+    // `descend_one_level_rot_aware`'s next iteration) will re-test
+    // that descent — but only after first having declined to claim
+    // here, so we know the storage cube doesn't strictly contain
+    // the point. The floor-pick still descends into the slot for
+    // continuity; the storage-frame offset we'd compute would be
+    // outside `[0, 1)³` and clamped, putting the camera against the
+    // TB's storage face. Acceptable: the camera is on the boundary
+    // between the TB's content and the empty gap inside the slot.
+    let sx = pos[0].floor().clamp(0.0, 2.0) as i32 as usize;
+    let sy = pos[1].floor().clamp(0.0, 2.0) as i32 as usize;
+    let sz = pos[2].floor().clamp(0.0, 2.0) as i32 as usize;
+    let slot = slot_index(sx, sy, sz) as u8;
+    // If the floor-pick child IS a TangentBlock, apply R^T about
+    // its slot centre to convert parent-frame offset → storage
+    // frame, clamping into `[0, 1)`. (This preserves the historical
+    // behaviour at the slot's interior, where storage and parent
+    // frames agree on the cube's owner — just not on the rotation.)
+    let parent_relative = [
+        (pos[0] - sx as f32),
+        (pos[1] - sy as f32),
+        (pos[2] - sz as f32),
+    ];
+    if let Some(pid) = parent_id {
+        if let Some(parent) = library.get(pid) {
+            if let Child::Node(child_id) = parent.children[slot as usize] {
+                if let Some(child) = library.get(child_id) {
+                    if let NodeKind::TangentBlock { rotation: r } = child.kind {
+                        let centred = [
+                            parent_relative[0] - 0.5,
+                            parent_relative[1] - 0.5,
+                            parent_relative[2] - 0.5,
+                        ];
+                        let rotated = [
+                            r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
+                            r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
+                            r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
+                        ];
+                        return (
+                            slot,
+                            [
+                                (rotated[0] + 0.5).clamp(0.0, 1.0 - f32::EPSILON),
+                                (rotated[1] + 0.5).clamp(0.0, 1.0 - f32::EPSILON),
+                                (rotated[2] + 0.5).clamp(0.0, 1.0 - f32::EPSILON),
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    (
+        slot,
+        [
+            parent_relative[0].clamp(0.0, 1.0 - f32::EPSILON),
+            parent_relative[1].clamp(0.0, 1.0 - f32::EPSILON),
+            parent_relative[2].clamp(0.0, 1.0 - f32::EPSILON),
+        ],
+    )
 }
 
 /// Is `parent`'s child at `coords + axis_delta` a Node?
