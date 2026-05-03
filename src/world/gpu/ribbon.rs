@@ -325,16 +325,14 @@ mod tests {
     }
 
     #[test]
-    fn reached_slots_truncated_when_pack_flattens_sibling() {
+    fn reached_slots_descend_through_uniform_empty_node() {
+        // Uniform-empty Nodes are now packed as tag=2 so the ribbon
+        // can traverse through them. This keeps the render frame
+        // close to the camera's anchor in carved regions.
         let world = pocket_world();
         let (tree, _kinds, offsets, _, _node_ids, root_idx) = pack_tree(&world.library, world.root);
-        // Slot 16 is uniform-empty Cartesian → absent from pack.
-        // Descent into [16, 13] stops at depth 0.
-        let r = build_ribbon(&tree, &offsets, root_idx, &[16, 13]);
-        assert_eq!(r.frame_root_idx, root_idx, "stayed at world root");
-        assert!(r.ribbon.is_empty());
-        assert!(r.reached_slots.is_empty(),
-            "no slot reachable past flattened sibling");
+        let r = build_ribbon(&tree, &offsets, root_idx, &[16]);
+        assert_eq!(r.reached_slots, vec![16], "descended into uniform-empty Node");
     }
 
     #[test]

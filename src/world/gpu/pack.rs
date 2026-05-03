@@ -185,6 +185,87 @@ impl CachedTree {
         bfs
     }
 
+    /// Check if any slot on the path has occupancy bit = 0 (absent).
+    pub fn path_has_missing_slots(
+        &self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        path_slots: &[u8],
+    ) -> bool {
+        let mut parent_bfs = self.root_bfs_idx;
+        let mut node_id = world_root;
+        for &slot in path_slots {
+            let node = match library.get(node_id) {
+                Some(n) => n,
+                None => return false,
+            };
+            let child_id = match node.children[slot as usize] {
+                Child::Node(id) => id,
+                _ => return false,
+            };
+            let header_off = self.node_offsets[parent_bfs as usize] as usize;
+            let occupancy = self.tree[header_off];
+            let bit = 1u32 << slot;
+            if occupancy & bit == 0 {
+                return true;
+            }
+            let rank = (occupancy & (bit - 1)).count_ones() as usize;
+            let first_child = self.tree[header_off + 1] as usize;
+            let entry_off = first_child + rank * 2;
+            let tag = self.tree[entry_off] & 0xFF;
+            if tag == 2 {
+                parent_bfs = self.tree[entry_off + 1];
+            } else {
+                return false;
+            }
+            node_id = child_id;
+        }
+        false
+    }
+
+    /// Patch any tag=1 (uniform-flattened) entries on the path to
+    /// tag=2 (Node). Assumes slots are present (occ bit set).
+    /// Returns (depth_walked, patches_made, exit_reason).
+    pub fn force_path_tags(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+        path_slots: &[u8],
+    ) -> (usize, usize, &'static str) {
+        let mut parent_bfs = self.root_bfs_idx;
+        let mut node_id = world_root;
+        let mut patches = 0usize;
+        for (i, &slot) in path_slots.iter().enumerate() {
+            let node = match library.get(node_id) {
+                Some(n) => n,
+                None => return (i, patches, "lib_miss"),
+            };
+            let child_id = match node.children[slot as usize] {
+                Child::Node(id) => id,
+                _ => return (i, patches, "not_node"),
+            };
+            let header_off = self.node_offsets[parent_bfs as usize] as usize;
+            let occupancy = self.tree[header_off];
+            let bit = 1u32 << slot;
+            if occupancy & bit == 0 { return (i, patches, "occ0"); }
+            let rank = (occupancy & (bit - 1)).count_ones() as usize;
+            let first_child = self.tree[header_off + 1] as usize;
+            let entry_off = first_child + rank * 2;
+            let tag = self.tree[entry_off] & 0xFF;
+            if tag == 2 {
+                parent_bfs = self.tree[entry_off + 1];
+            } else {
+                let child_bfs = self.emit_or_lookup(library, child_id);
+                self.tree[entry_off] = (self.tree[entry_off] & !0xFF) | 2;
+                self.tree[entry_off + 1] = child_bfs;
+                parent_bfs = child_bfs;
+                patches += 1;
+            }
+            node_id = child_id;
+        }
+        (path_slots.len(), patches, "done")
+    }
+
     /// Build the `GpuChild` for one slot of a parent's children slab.
     /// Applies content-driven uniform-flatten (Cartesian only) so
     /// uniform subtrees collapse to a single Block. Non-uniform
@@ -215,7 +296,11 @@ impl CachedTree {
                     )
                 };
                 if allows_flatten && uniform_type == UNIFORM_EMPTY {
-                    None
+                    // Emit as tag=2 (Node) so the ribbon can traverse
+                    // through it. Content-addressed dedup means all
+                    // uniform-empty Nodes share one BFS entry.
+                    let child_bfs = self.emit_or_lookup(library, child_id);
+                    Some(GpuChild::new(2, representative, 0, child_bfs))
                 } else if allows_flatten && uniform_type != UNIFORM_MIXED {
                     Some(GpuChild::new(1, uniform_type, 0, 0))
                 } else {
@@ -353,11 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn pack_flattens_uniform_empty_siblings() {
+    fn pack_keeps_uniform_empty_node_traversible() {
+        // Uniform-empty Nodes used to vanish from the slab, but the
+        // ribbon needs to traverse them so the render path can stay
+        // close to the camera's anchor when the camera is in
+        // recently-emptied (carved) regions.
         let mut lib = NodeLibrary::default();
         let leaf_air = lib.insert(empty_children());
         let mut root_children = uniform_children(Child::Node(leaf_air));
-        // Place a non-uniform child at CENTER so it doesn't flatten away.
         let mut interior = empty_children();
         interior[0] = Child::Block(crate::world::palette::block::STONE);
         let interior_id = lib.insert(interior);
@@ -366,9 +454,9 @@ mod tests {
         lib.ref_inc(root);
 
         let (tree, _, offsets, _, _, root_idx) = pack_tree(&lib, root);
-        // Slot 0 of root (uniform-empty Cartesian) should be absent.
-        assert_eq!(sparse_child(&tree, &offsets, root_idx, 0).tag, 0);
-        // CENTER_SLOT has a non-uniform Node, must stay.
+        // Slot 0 (uniform-empty Cartesian Node) is now tag=2 so the
+        // ribbon can descend through it.
+        assert_eq!(sparse_child(&tree, &offsets, root_idx, 0).tag, 2);
         let center = sparse_child(&tree, &offsets, root_idx, CENTER_SLOT as u8);
         assert_eq!(center.tag, 2);
     }
