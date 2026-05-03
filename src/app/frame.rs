@@ -87,13 +87,7 @@ pub fn compute_render_frame(
                     }
                 }
             }
-            child @ (Child::Block(_) | Child::Empty | Child::EntityRef(_)) => {
-                eprintln!(
-                    "compute_render_frame STOP depth={} slot={} child={:?} reached={:?}",
-                    k, slot, child, reached.as_slice(),
-                );
-                break;
-            }
+            Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
     }
     ActiveFrame {
@@ -102,6 +96,31 @@ pub fn compute_render_frame(
         node_id,
         kind,
     }
+}
+
+/// Diagnostic: why did compute_render_frame stop before desired_depth?
+pub fn render_frame_stop_reason(
+    library: &NodeLibrary,
+    world_root: NodeId,
+    camera_anchor: &Path,
+    desired_depth: u8,
+) -> String {
+    let mut target = *camera_anchor;
+    target.truncate(desired_depth);
+    let mut node_id = world_root;
+    for k in 0..target.depth() as usize {
+        let Some(node) = library.get(node_id) else {
+            return format!("NoNode@{}", k);
+        };
+        let slot = target.slot(k) as usize;
+        match node.children[slot] {
+            Child::Node(child_id) => { node_id = child_id; }
+            Child::Block(_) => return format!("Block@{}:s{}", k, slot),
+            Child::Empty => return format!("Empty@{}:s{}", k, slot),
+            Child::EntityRef(_) => return format!("Entity@{}:s{}", k, slot),
+        }
+    }
+    "ok".to_string()
 }
 
 pub fn with_render_margin(

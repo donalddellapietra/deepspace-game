@@ -421,14 +421,22 @@ impl App {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            let intended_render_path_csv = self
-                .target_render_frame()
+            let intended_frame = self.target_render_frame();
+            let intended_render_path_csv = intended_frame
                 .render_path
                 .as_slice()
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            let desired_depth = self.camera.position.anchor.depth()
+                .saturating_sub(crate::app::RENDER_FRAME_K);
+            let render_stop_reason = crate::app::frame::render_frame_stop_reason(
+                &self.world.library,
+                self.world.root,
+                &self.camera.position.anchor,
+                desired_depth,
+            );
             let (tb_on_anchor_path, anchor_cumulative_yaw_deg) =
                 tangent_block_chain_summary(
                     &self.world.library,
@@ -465,6 +473,7 @@ impl App {
                     active_frame_kind,
                     render_path_csv,
                     intended_render_path_csv,
+                    render_stop_reason,
                     tb_on_anchor_path,
                     anchor_cumulative_yaw_deg,
                     copy_seq: self.debug_copy_seq,

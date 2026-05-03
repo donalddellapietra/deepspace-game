@@ -57,6 +57,7 @@ function formatDebug(s: DebugOverlayState): string {
     "render   [" + s.renderPathCsv + "]",
     "intended [" + (s.intendedRenderPathCsv || "") + "]",
     "anchor   [" + s.anchorSlotsCsv + "]",
+    pad("stop reason", s.renderStopReason || "ok"),
     "",
     "── rotation ──",
     pad("TB on anchor path", s.tbOnAnchorPath ? "yes" : "no"),
@@ -112,9 +113,7 @@ export function DebugOverlay() {
     }
     if (s.copySeq === lastCopySeq.current) return;
     lastCopySeq.current = s.copySeq;
-    const text = formatDebug(s);
-    console.log("DEBUG_COPY anchor_len=", s.anchorSlotsCsv.length, "full=", text.length);
-    copyToClipboard(text).then((ok) => {
+    copyToClipboard(formatDebug(s)).then((ok) => {
       setFlash(ok ? "copied" : "failed");
       window.setTimeout(() => setFlash(null), 1500);
     });
