@@ -612,27 +612,59 @@ impl App {
     }
 
     pub(super) fn position_in_render_frame(&self, frame_path: &Path) -> [f32; 3] {
-        let pos = self.camera_root_position_f64();
-        self.point_root_to_render_frame_f64(pos, frame_path)
+        if !self.render_frame_descends_inside_tangent_block(frame_path) {
+            return self.camera.position.in_frame(frame_path);
+        }
+        let Some((effective_path, effective_offset)) = self.effective_camera_path() else {
+            return self.camera.position.in_frame(frame_path);
+        };
+        if !Self::path_is_prefix(frame_path, &effective_path) {
+            return [0.0, 0.0, 0.0];
+        }
+        let pos = Self::position_from_effective_tail(
+            &effective_path,
+            effective_offset,
+            frame_path.depth(),
+        );
+        [pos[0] as f32, pos[1] as f32, pos[2] as f32]
     }
 
     fn camera_render_path(&self, desired_depth: u8) -> Path {
-        let mut pos = self.camera_root_position_f64();
-        let mut node = self.world.root;
+        let Some((mut path, _offset)) = self.effective_camera_path() else {
+            return Path::root();
+        };
+        path.truncate(desired_depth);
+        while self.path_lands_on_tangent_block(&path) {
+            path.truncate(path.depth().saturating_sub(1));
+        }
+        path
+    }
+
+    fn effective_camera_path(&self) -> Option<(Path, [f64; 3])> {
+        if self.camera.position.anchor.depth() == 0 {
+            return Some((
+                Path::root(),
+                [
+                    self.camera.position.offset[0] as f64,
+                    self.camera.position.offset[1] as f64,
+                    self.camera.position.offset[2] as f64,
+                ],
+            ));
+        }
+
         let mut path = Path::root();
-        for _ in 0..desired_depth {
-            let Some(parent) = self.world.library.get(node) else { break };
-            if !pos.iter().all(|v| v.is_finite()) {
-                break;
+        let (mut node, mut pos) = self.enter_first_camera_cell(&mut path)?;
+
+        while path.depth() < self.camera.position.anchor.depth() {
+            if !pos.iter().all(|v| v.is_finite()) { break; }
+            if let Some(parent) = node.and_then(|id| self.world.library.get(id)) {
+                pos = self.apply_render_node_transform(pos, parent.kind);
             }
 
             let x = pos[0].floor().clamp(0.0, 2.0) as usize;
             let y = pos[1].floor().clamp(0.0, 2.0) as usize;
             let z = pos[2].floor().clamp(0.0, 2.0) as usize;
             let slot = x + y * 3 + z * 9;
-            let crate::world::tree::Child::Node(child_id) = parent.children[slot] else {
-                break;
-            };
 
             path.push(slot as u8);
             let (sx, sy, sz) = crate::world::tree::slot_coords(slot);
@@ -641,50 +673,155 @@ impl App {
                 (pos[1] - sy as f64) * 3.0,
                 (pos[2] - sz as f64) * 3.0,
             ];
-            if let Some(child) = self.world.library.get(child_id) {
-                if let crate::world::tree::NodeKind::TangentBlock { rotation } = child.kind {
-                    let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation) as f64;
-                    let centered = [pos[0] - 1.5, pos[1] - 1.5, pos[2] - 1.5];
-                    pos = [
-                        (rotation[0][0] as f64 * centered[0]
-                            + rotation[0][1] as f64 * centered[1]
-                            + rotation[0][2] as f64 * centered[2])
-                            / tb_scale
-                            + 1.5,
-                        (rotation[1][0] as f64 * centered[0]
-                            + rotation[1][1] as f64 * centered[1]
-                            + rotation[1][2] as f64 * centered[2])
-                            / tb_scale
-                            + 1.5,
-                        (rotation[2][0] as f64 * centered[0]
-                            + rotation[2][1] as f64 * centered[1]
-                            + rotation[2][2] as f64 * centered[2])
-                            / tb_scale
-                            + 1.5,
-                    ];
+            if let Some(parent) = node.and_then(|id| self.world.library.get(id)) {
+                match parent.children[slot] {
+                    crate::world::tree::Child::Node(child_id) => {
+                        node = Some(child_id);
+                    }
+                    _ => node = None,
                 }
             }
-            node = child_id;
         }
-        path
+
+        Some((
+            path,
+            [
+                pos[0] / WORLD_SIZE as f64,
+                pos[1] / WORLD_SIZE as f64,
+                pos[2] / WORLD_SIZE as f64,
+            ],
+        ))
     }
 
-    fn camera_root_position_f64(&self) -> [f64; 3] {
-        let mut pos = [0.0f64; 3];
-        let mut size = WORLD_SIZE as f64;
-        for k in 0..self.camera.position.anchor.depth() as usize {
+    fn path_is_prefix(prefix: &Path, path: &Path) -> bool {
+        if prefix.depth() > path.depth() {
+            return false;
+        }
+        for k in 0..prefix.depth() as usize {
+            if prefix.slot(k) != path.slot(k) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn path_lands_on_tangent_block(&self, path: &Path) -> bool {
+        if path.depth() == 0 {
+            return false;
+        }
+        let mut node = self.world.root;
+        for k in 0..path.depth() as usize {
+            let Some(parent) = self.world.library.get(node) else { return false };
+            match parent.children[path.slot(k) as usize] {
+                crate::world::tree::Child::Node(child_id) => node = child_id,
+                _ => return false,
+            }
+        }
+        self.world
+            .library
+            .get(node)
+            .map(|n| matches!(n.kind, crate::world::tree::NodeKind::TangentBlock { .. }))
+            .unwrap_or(false)
+    }
+
+    fn position_from_effective_tail(
+        path: &Path,
+        offset: [f64; 3],
+        frame_depth: u8,
+    ) -> [f64; 3] {
+        let mut pos = offset;
+        for k in (frame_depth as usize..path.depth() as usize).rev() {
+            let (sx, sy, sz) = crate::world::tree::slot_coords(path.slot(k) as usize);
+            pos = [sx as f64 + pos[0], sy as f64 + pos[1], sz as f64 + pos[2]];
+            if k > frame_depth as usize {
+                pos = [pos[0] / 3.0, pos[1] / 3.0, pos[2] / 3.0];
+            }
+        }
+        pos
+    }
+
+    fn enter_first_camera_cell(&self, path: &mut Path) -> Option<(Option<crate::world::tree::NodeId>, [f64; 3])> {
+        if self.camera.position.anchor.depth() == 0 {
+            return None;
+        }
+        self.enter_render_cell(self.camera.position.anchor.slot(0), path)
+    }
+
+    fn enter_render_cell(
+        &self,
+        slot: u8,
+        path: &mut Path,
+    ) -> Option<(Option<crate::world::tree::NodeId>, [f64; 3])> {
+        let root = self.world.library.get(self.world.root)?;
+        path.push(slot);
+        let pos = self.camera_position_in_anchor_prefix(path)?;
+        let child_id = match root.children[slot as usize] {
+            crate::world::tree::Child::Node(child_id) => Some(child_id),
+            _ => None,
+        };
+        Some((child_id, pos))
+    }
+
+    fn camera_position_in_anchor_prefix(&self, frame: &Path) -> Option<[f64; 3]> {
+        if frame.depth() > self.camera.position.anchor.depth() {
+            return None;
+        }
+        for k in 0..frame.depth() as usize {
+            if frame.slot(k) != self.camera.position.anchor.slot(k) {
+                return None;
+            }
+        }
+        if frame.depth() == self.camera.position.anchor.depth() {
+            return Some([
+                self.camera.position.offset[0] as f64 * WORLD_SIZE as f64,
+                self.camera.position.offset[1] as f64 * WORLD_SIZE as f64,
+                self.camera.position.offset[2] as f64 * WORLD_SIZE as f64,
+            ]);
+        }
+
+        let mut pos = [
+            self.camera.position.offset[0] as f64,
+            self.camera.position.offset[1] as f64,
+            self.camera.position.offset[2] as f64,
+        ];
+        for k in (frame.depth() as usize..self.camera.position.anchor.depth() as usize).rev() {
             let (sx, sy, sz) = crate::world::tree::slot_coords(
                 self.camera.position.anchor.slot(k) as usize,
             );
-            let child = size / 3.0;
-            pos[0] += sx as f64 * child;
-            pos[1] += sy as f64 * child;
-            pos[2] += sz as f64 * child;
-            size = child;
+            pos = [sx as f64 + pos[0], sy as f64 + pos[1], sz as f64 + pos[2]];
+            if k > frame.depth() as usize {
+                pos = [pos[0] / 3.0, pos[1] / 3.0, pos[2] / 3.0];
+            }
         }
-        pos[0] += self.camera.position.offset[0] as f64 * size;
-        pos[1] += self.camera.position.offset[1] as f64 * size;
-        pos[2] += self.camera.position.offset[2] as f64 * size;
+        Some(pos)
+    }
+
+    fn apply_render_node_transform(
+        &self,
+        mut pos: [f64; 3],
+        kind: crate::world::tree::NodeKind,
+    ) -> [f64; 3] {
+        if let crate::world::tree::NodeKind::TangentBlock { rotation } = kind {
+            let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation) as f64;
+            let centered = [pos[0] - 1.5, pos[1] - 1.5, pos[2] - 1.5];
+            pos = [
+                (rotation[0][0] as f64 * centered[0]
+                    + rotation[0][1] as f64 * centered[1]
+                    + rotation[0][2] as f64 * centered[2])
+                    / tb_scale
+                    + 1.5,
+                (rotation[1][0] as f64 * centered[0]
+                    + rotation[1][1] as f64 * centered[1]
+                    + rotation[1][2] as f64 * centered[2])
+                    / tb_scale
+                    + 1.5,
+                (rotation[2][0] as f64 * centered[0]
+                    + rotation[2][1] as f64 * centered[1]
+                    + rotation[2][2] as f64 * centered[2])
+                    / tb_scale
+                    + 1.5,
+            ];
+        }
         pos
     }
 
@@ -697,20 +834,18 @@ impl App {
         let mut node = self.world.root;
         for k in 0..frame_path.depth() as usize {
             let Some(parent) = self.world.library.get(node) else { break };
+            if let crate::world::tree::NodeKind::TangentBlock { rotation } = parent.kind {
+                let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation);
+                out = [
+                    (rotation[0][0] * out[0] + rotation[0][1] * out[1] + rotation[0][2] * out[2]) / tb_scale,
+                    (rotation[1][0] * out[0] + rotation[1][1] * out[1] + rotation[1][2] * out[2]) / tb_scale,
+                    (rotation[2][0] * out[0] + rotation[2][1] * out[1] + rotation[2][2] * out[2]) / tb_scale,
+                ];
+            }
             let slot = frame_path.slot(k) as usize;
             out = [out[0] * 3.0, out[1] * 3.0, out[2] * 3.0];
             match parent.children[slot] {
                 crate::world::tree::Child::Node(child_id) => {
-                    if let Some(child) = self.world.library.get(child_id) {
-                        if let crate::world::tree::NodeKind::TangentBlock { rotation } = child.kind {
-                            let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation);
-                            out = [
-                                (rotation[0][0] * out[0] + rotation[0][1] * out[1] + rotation[0][2] * out[2]) / tb_scale,
-                                (rotation[1][0] * out[0] + rotation[1][1] * out[1] + rotation[1][2] * out[2]) / tb_scale,
-                                (rotation[2][0] * out[0] + rotation[2][1] * out[1] + rotation[2][2] * out[2]) / tb_scale,
-                            ];
-                        }
-                    }
                     node = child_id;
                 }
                 _ => break,
@@ -741,80 +876,22 @@ impl App {
         false
     }
 
-    fn point_root_to_render_frame(&self, mut pos: [f32; 3], frame_path: &Path) -> [f32; 3] {
+    pub(super) fn render_frame_descends_inside_tangent_block(&self, frame_path: &Path) -> bool {
         let mut node = self.world.root;
         for k in 0..frame_path.depth() as usize {
-            let Some(parent) = self.world.library.get(node) else { break };
-            let slot = frame_path.slot(k) as usize;
-            let (sx, sy, sz) = crate::world::tree::slot_coords(slot);
-            pos = [
-                (pos[0] - sx as f32) * 3.0,
-                (pos[1] - sy as f32) * 3.0,
-                (pos[2] - sz as f32) * 3.0,
-            ];
-            match parent.children[slot] {
-                crate::world::tree::Child::Node(child_id) => {
-                    if let Some(child) = self.world.library.get(child_id) {
-                        if let crate::world::tree::NodeKind::TangentBlock { rotation } = child.kind {
-                            let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation);
-                            let centered = [pos[0] - 1.5, pos[1] - 1.5, pos[2] - 1.5];
-                            pos = [
-                                (rotation[0][0] * centered[0] + rotation[0][1] * centered[1] + rotation[0][2] * centered[2]) / tb_scale + 1.5,
-                                (rotation[1][0] * centered[0] + rotation[1][1] * centered[1] + rotation[1][2] * centered[2]) / tb_scale + 1.5,
-                                (rotation[2][0] * centered[0] + rotation[2][1] * centered[1] + rotation[2][2] * centered[2]) / tb_scale + 1.5,
-                            ];
-                        }
-                    }
-                    node = child_id;
-                }
-                _ => break,
+            let Some(parent) = self.world.library.get(node) else { return false };
+            if matches!(
+                parent.kind,
+                crate::world::tree::NodeKind::TangentBlock { .. }
+            ) {
+                return true;
+            }
+            match parent.children[frame_path.slot(k) as usize] {
+                crate::world::tree::Child::Node(child_id) => node = child_id,
+                _ => return false,
             }
         }
-        pos
-    }
-
-    fn point_root_to_render_frame_f64(&self, mut pos: [f64; 3], frame_path: &Path) -> [f32; 3] {
-        let mut node = self.world.root;
-        for k in 0..frame_path.depth() as usize {
-            let Some(parent) = self.world.library.get(node) else { break };
-            let slot = frame_path.slot(k) as usize;
-            let (sx, sy, sz) = crate::world::tree::slot_coords(slot);
-            pos = [
-                (pos[0] - sx as f64) * 3.0,
-                (pos[1] - sy as f64) * 3.0,
-                (pos[2] - sz as f64) * 3.0,
-            ];
-            match parent.children[slot] {
-                crate::world::tree::Child::Node(child_id) => {
-                    if let Some(child) = self.world.library.get(child_id) {
-                        if let crate::world::tree::NodeKind::TangentBlock { rotation } = child.kind {
-                            let tb_scale = crate::world::gpu::inscribed_cube_scale(&rotation) as f64;
-                            let centered = [pos[0] - 1.5, pos[1] - 1.5, pos[2] - 1.5];
-                            pos = [
-                                (rotation[0][0] as f64 * centered[0]
-                                    + rotation[0][1] as f64 * centered[1]
-                                    + rotation[0][2] as f64 * centered[2])
-                                    / tb_scale
-                                    + 1.5,
-                                (rotation[1][0] as f64 * centered[0]
-                                    + rotation[1][1] as f64 * centered[1]
-                                    + rotation[1][2] as f64 * centered[2])
-                                    / tb_scale
-                                    + 1.5,
-                                (rotation[2][0] as f64 * centered[0]
-                                    + rotation[2][1] as f64 * centered[1]
-                                    + rotation[2][2] as f64 * centered[2])
-                                    / tb_scale
-                                    + 1.5,
-                            ];
-                        }
-                    }
-                    node = child_id;
-                }
-                _ => break,
-            }
-        }
-        [pos[0] as f32, pos[1] as f32, pos[2] as f32]
+        false
     }
 
     pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {

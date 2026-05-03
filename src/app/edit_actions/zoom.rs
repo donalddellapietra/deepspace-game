@@ -103,6 +103,9 @@ impl App {
             let logical_path = frame.logical_path;
             let mut shallower = frame.render_path;
             shallower.truncate(frame.render_path.depth().saturating_sub(1));
+            while self.path_lands_on_tangent_block(&shallower) {
+                shallower.truncate(shallower.depth().saturating_sub(1));
+            }
             let render = frame::compute_render_frame(
                 &self.world.library,
                 self.world.root,
