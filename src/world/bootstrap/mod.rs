@@ -10,6 +10,7 @@ use super::state::WorldState;
 mod dodecahedron_test;
 mod plain;
 mod rotated_cube_test;
+mod spherical_wrapped_planet;
 mod vox;
 mod wrapped_planet;
 
@@ -115,6 +116,14 @@ pub enum WorldPreset {
     /// `renormalize_world` against twelve distinct *non*-axis-aligned
     /// rotations.
     DodecahedronTest,
+    /// UV-sphere proof-of-concept. Same `WrappedPlane` slab as
+    /// `WrappedPlanet` but each cell carries a per-cell
+    /// `TangentBlock { rotation, cell_offset }` repositioning the
+    /// cell onto a sphere surface. Renders incorrectly (slot DDA
+    /// vs. sphere-positioned cells); included to visualise what the
+    /// `cell_offset` plumbing produces before the sphere DDA dispatch
+    /// is built.
+    SphericalWrappedPlanet,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -147,6 +156,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         WorldPreset::WrappedPlanet { .. } => None,
         WorldPreset::RotatedCubeTest => None,
         WorldPreset::DodecahedronTest => None,
+        WorldPreset::SphericalWrappedPlanet => None,
     }
 }
 
@@ -234,6 +244,14 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         }
         WorldPreset::DodecahedronTest => {
             dodecahedron_test::bootstrap_dodecahedron_test_world()
+        }
+        WorldPreset::SphericalWrappedPlanet => {
+            spherical_wrapped_planet::bootstrap_spherical_wrapped_planet_world(
+                spherical_wrapped_planet::DEFAULT_SPHERICAL_EMBEDDING_DEPTH,
+                spherical_wrapped_planet::DEFAULT_SPHERICAL_SLAB_DIMS,
+                spherical_wrapped_planet::DEFAULT_SPHERICAL_SLAB_DEPTH,
+                spherical_wrapped_planet::DEFAULT_SPHERICAL_CELL_SUBTREE_DEPTH,
+            )
         }
     }
 }
