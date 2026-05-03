@@ -1539,18 +1539,11 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
             // r.t is FRAME-LOCAL t (ray_dir is kept at camera-frame
             // magnitude across pops, so each frame's inner DDA computes
             // a local t, bounded O(1)). Convert to camera-frame t for
-            // the caller and for cell_min/cell_size anchoring.
+            // the caller's hit_pos = camera.pos + ray_dir * r.t math.
             //   t_camera = t_frame / cur_scale   (cur_scale = 1/3^N)
+            // local_in_cell is already in [0,1]³, no conversion needed.
             if cur_scale < 1.0 {
-                let hit_popped = ray_origin + ray_dir * r.t;
-                let cell_local = clamp(
-                    (hit_popped - r.cell_min) / r.cell_size,
-                    vec3<f32>(0.0), vec3<f32>(1.0),
-                );
                 r.t = r.t / cur_scale;
-                let hit_camera = world_ray_origin + world_ray_dir * r.t;
-                r.cell_size = r.cell_size / cur_scale;
-                r.cell_min = hit_camera - cell_local * r.cell_size;
             }
             return r;
         }
