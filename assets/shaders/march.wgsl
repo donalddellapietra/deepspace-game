@@ -1646,24 +1646,17 @@ fn march(world_ray_origin: vec3<f32>, world_ray_dir: vec3<f32>) -> HitResult {
         if hops > 80u { break; }
         hops = hops + 1u;
 
-        // Frame dispatch on NodeKind. WrappedPlane (kind == 1) always
-        // renders as a sphere of rotated tangent cubes via
-        // `march_wrapped_planet` — no spherical primitive in the
-        // traversal, just per-cell rotation. All other kinds fall
-        // through to the cartesian DDA.
         var r: HitResult;
-        let cur_kind = node_kinds[current_idx].kind;
-        if cur_kind == 1u {
+        if ribbon_level == 0u && uniforms.root_kind == ROOT_KIND_WRAPPED_PLANE {
             r = march_wrapped_planet(
-                current_idx, vec3<f32>(0.0), 3.0,
-                ray_origin, ray_dir,
-                uniforms.planet_render.y,
+                current_idx,
+                vec3<f32>(0.0),
+                3.0,
+                ray_origin,
+                ray_dir,
+                max(uniforms.planet_render.y, 1.26),
             );
         } else {
-            // Cartesian frame: no depth cap beyond the hardware stack
-            // ceiling. `LOD_PIXEL_THRESHOLD` (Nyquist) is the sole
-            // visual LOD gate — rays stop descending when cells fall
-            // below the pixel floor.
             r = march_cartesian(
                 current_idx, ray_origin, ray_dir, MAX_STACK_DEPTH, skip_slot,
             );

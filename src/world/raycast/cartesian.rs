@@ -154,7 +154,7 @@ pub(super) fn cpu_raycast_inner(
                 // TangentBlock dispatch — frame-local rotation around
                 // (1.5, 1.5, 1.5). Mirrors the shader's march_cartesian.
                 // NO world-absolute coordinates.
-                if let Some(boundary) = super::TbBoundary::from_kind(child_node.kind) {
+                if let Some(boundary) = super::TbBoundary::from_render_kind(child_node.kind) {
                     let scale = 3.0 / parent_cell_size;
                     let lp_origin = [
                         (ray_origin[0] - child_origin[0]) * scale,

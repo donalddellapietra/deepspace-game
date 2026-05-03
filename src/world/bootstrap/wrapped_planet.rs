@@ -1,4 +1,9 @@
-//! `WrappedPlane` planet bootstrap (Phase 1: hardcoded slab).
+//! `WrappedPlane` planet bootstrap.
+//!
+//! The `WrappedPlane` node is wrap metadata. The occupied slab cells
+//! below it are `TangentPlane` anchors whose rotations come from
+//! their UV latitude/longitude centers, so rendering/editing stays
+//! on the precision-stable Cartesian path.
 
 use super::WorldBootstrap;
 use crate::world::anchor::WorldPos;
@@ -52,6 +57,25 @@ pub const DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH: u8 = 2;
 /// (= `EMBEDDING + SLAB`) each with a 20-deep subtree, summing to a
 /// 25-layer tree by default.
 pub const DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH: u8 = 20;
+/// Latitude clamp used by the UV tangent-plane planet. Avoids the
+/// degenerate east-vector behavior at the poles while covering the
+/// visible low/mid latitude band.
+pub const DEFAULT_WRAPPED_PLANET_LAT_MAX: f32 = 1.26;
+
+#[inline]
+fn tangent_rotation_for_uv_cell(cell_x: u32, cell_z: u32, dims: [u32; 3]) -> [[f32; 3]; 3] {
+    let pi = std::f32::consts::PI;
+    let lon_step = 2.0 * pi / dims[0] as f32;
+    let lat_step = 2.0 * DEFAULT_WRAPPED_PLANET_LAT_MAX / dims[2] as f32;
+    let lon = -pi + (cell_x as f32 + 0.5) * lon_step;
+    let lat = -DEFAULT_WRAPPED_PLANET_LAT_MAX + (cell_z as f32 + 0.5) * lat_step;
+    let (sl, cl) = lat.sin_cos();
+    let (so, co) = lon.sin_cos();
+    let east = [-so, 0.0, co];
+    let radial = [cl * co, sl, cl * so];
+    let north = [-sl * co, cl, -sl * so];
+    [east, radial, north]
+}
 
 /// Build a `NodeKind::WrappedPlane`-rooted slab embedded in an
 /// otherwise empty world.
@@ -77,8 +101,10 @@ pub const DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH: u8 = 20;
 /// y=1 (top), dirt rows below it; we keep the y=0 row (the lowest)
 /// as stone for a recognisable cross-section.
 ///
-/// **Phase 1** does not enable wrap or curvature — the resulting
-/// rectangle just renders as a small flat patch of terrain.
+/// The slab is not rendered by a spherical primitive. Each occupied
+/// cell is a flat tangent-plane cube, rotated according to its UV
+/// position and then handled by the normal Cartesian/tangent-dispatch
+/// renderer and raycaster.
 pub fn wrapped_planet_world(
     embedding_depth: u8,
     slab_dims: [u32; 3],
@@ -89,7 +115,7 @@ pub fn wrapped_planet_world(
     assert!(slab_depth > 0, "slab_depth must be >= 1");
     assert!(
         cell_subtree_depth >= 1,
-        "wrapped_planet requires cell_subtree_depth >= 1 (TangentBlock wraps the per-cell chain)",
+        "wrapped_planet requires cell_subtree_depth >= 1 (TangentPlane wraps the per-cell chain)",
     );
     let total_depth = (embedding_depth as usize)
         .saturating_add(slab_depth as usize)
@@ -124,29 +150,35 @@ pub fn wrapped_planet_world(
     // recursive subdivision goes all the way down.
     //
     // The OUTERMOST node of each cell's chain (= the slab cell
-    // anchor) is `NodeKind::TangentBlock`. The shader detects this
+    // anchor) is `NodeKind::TangentPlane`. The shader detects this
     // kind, transforms the ray into the cell's local tangent cube
     // frame, and dispatches `march_in_tangent_cube` from there — so
     // every voxel below the slab cell sees the precision-stable
-    // Cartesian path. The chain BELOW the TangentBlock is regular
+    // Cartesian path. The chain BELOW the TangentPlane is regular
     // Cartesian and uniform-flattens away in the GPU pack.
-    fn build_uniform_anchor(library: &mut NodeLibrary, block: u16, depth: u8) -> Child {
+    fn build_uniform_anchor(library: &mut NodeLibrary, terminal: Child, depth: u8) -> Child {
         if depth == 0 {
-            return Child::Block(block);
+            return terminal;
         }
-        let inner = build_uniform_anchor(library, block, depth - 1);
+        let inner = build_uniform_anchor(library, terminal, depth - 1);
         Child::Node(library.insert(uniform_children(inner)))
     }
-    let make_anchor = |library: &mut NodeLibrary, block: u16| -> Child {
-        let inner = build_uniform_anchor(library, block, cell_subtree_depth - 1);
+    let empty_inner = build_uniform_anchor(&mut library, Child::Empty, cell_subtree_depth - 1);
+    let stone_inner = build_uniform_anchor(
+        &mut library, Child::Block(block::STONE), cell_subtree_depth - 1,
+    );
+    let dirt_inner = build_uniform_anchor(
+        &mut library, Child::Block(block::DIRT), cell_subtree_depth - 1,
+    );
+    let grass_inner = build_uniform_anchor(
+        &mut library, Child::Block(block::GRASS), cell_subtree_depth - 1,
+    );
+    let make_anchor = |library: &mut NodeLibrary, inner: Child, rotation: [[f32; 3]; 3]| -> Child {
         Child::Node(library.insert_with_kind(
             uniform_children(inner),
-            NodeKind::TangentBlock { rotation: crate::world::tree::IDENTITY_ROTATION },
+            NodeKind::TangentPlane { rotation },
         ))
     };
-    let stone_anchor = make_anchor(&mut library, block::STONE);
-    let dirt_anchor  = make_anchor(&mut library, block::DIRT);
-    let grass_anchor = make_anchor(&mut library, block::GRASS);
 
     // Build the slab subtree as a flat `subgrid^3` Cartesian volume,
     // sparsely populated to the slab_dims footprint. The simplest
@@ -155,19 +187,29 @@ pub fn wrapped_planet_world(
     // bottom-up assemble 3×3×3 nodes layer by layer.
     //
     // Leaf-cell selection rule for the slab footprint:
-    //   x ∈ [0, dims.x)  AND  y ∈ [0, dims.y)  AND  z ∈ [0, dims.z)
+    //   x ∈ [0, dims.x)  AND  z ∈ [0, dims.z)
     //     - bottom row (y == 0): stone_anchor
-    //     - middle rows (1..dims.y-1): dirt_anchor
-    //     - top row (y == dims.y-1): grass_anchor
+    //     - middle material rows (1..dims.y-1): dirt_anchor
+    //     - top material row (y == dims.y-1): grass_anchor
+    //     - rows above material slab: empty TangentPlane anchors
+    //
+    // Empty anchors above the material slab are intentional. The
+    // camera spawns in air above the surface; preserving a
+    // TangentPlane node there lets high-depth render frames follow
+    // the camera into local tangent coordinates instead of staying
+    // pinned to the coarse WrappedPlane frame.
     //   else: Empty
-    let leaf_at = |x: u32, y: u32, z: u32| -> Child {
-        if x < slab_dims[0] && y < slab_dims[1] && z < slab_dims[2] {
+    let leaf_at = |library: &mut NodeLibrary, x: u32, y: u32, z: u32| -> Child {
+        if x < slab_dims[0] && z < slab_dims[2] {
+            let rotation = tangent_rotation_for_uv_cell(x, z, slab_dims);
             if y == 0 {
-                stone_anchor
+                make_anchor(library, stone_inner, rotation)
             } else if y + 1 == slab_dims[1] {
-                grass_anchor
+                make_anchor(library, grass_inner, rotation)
+            } else if y < slab_dims[1] {
+                make_anchor(library, dirt_inner, rotation)
             } else {
-                dirt_anchor
+                make_anchor(library, empty_inner, rotation)
             }
         } else {
             Child::Empty
@@ -179,7 +221,11 @@ pub fn wrapped_planet_world(
     let mut layer: Vec<Vec<Vec<Child>>> = (0..n0)
         .map(|z| {
             (0..n0)
-                .map(|y| (0..n0).map(|x| leaf_at(x as u32, y as u32, z as u32)).collect())
+                .map(|y| {
+                    (0..n0)
+                        .map(|x| leaf_at(&mut library, x as u32, y as u32, z as u32))
+                        .collect()
+                })
                 .collect()
         })
         .collect();
@@ -400,12 +446,11 @@ mod tests {
         assert_eq!(world.tree_depth(), 8 + 3 + 5);
     }
 
-    /// Every populated slab cell anchor must be `NodeKind::TangentBlock`
-    /// — the slab is rendered as a sphere of rotated tangent cubes, so
-    /// each cell carries the kind metadata that drives the per-cell
-    /// rotation in `march_wrapped_planet`.
+    /// Every populated slab cell anchor must be `NodeKind::TangentPlane`
+    /// — WrappedPlane is only wrap metadata; the visual UV-sphere
+    /// effect comes from per-cell tangent-plane rotations.
     #[test]
-    fn slab_anchor_is_tangent_block() {
+    fn slab_anchor_is_tangent_plane() {
         let embedding_depth: u8 = 2;
         let slab_dims = [27u32, 2, 14];
         let slab_depth: u8 = 3;
@@ -436,6 +481,45 @@ mod tests {
             embedding_depth, slab_dims, slab_depth, cell_subtree_depth,
         );
         let kind = walk(&world, &populated_path).expect("populated cell exists");
-        assert!(kind.is_tangent_block(), "expected TangentBlock, got {kind:?}");
+        assert!(kind.is_tangent_plane(), "expected TangentPlane, got {kind:?}");
+    }
+
+    #[test]
+    fn uv_cells_get_lat_lon_tangent_rotations() {
+        let dims = [27, 2, 14];
+        let equatorish = tangent_rotation_for_uv_cell(13, 6, dims);
+        let eastern = tangent_rotation_for_uv_cell(14, 6, dims);
+        assert_ne!(equatorish, eastern, "longitude should change tangent rotation");
+
+        let pi = std::f32::consts::PI;
+        let lon_step = 2.0 * pi / dims[0] as f32;
+        let lat_step = 2.0 * DEFAULT_WRAPPED_PLANET_LAT_MAX / dims[2] as f32;
+        let lon = -pi + (13.5 * lon_step);
+        let lat = -DEFAULT_WRAPPED_PLANET_LAT_MAX + (6.5 * lat_step);
+        let (sl, cl) = lat.sin_cos();
+        let (so, co) = lon.sin_cos();
+        let expected_radial = [cl * co, sl, cl * so];
+        for i in 0..3 {
+            assert!(
+                (equatorish[1][i] - expected_radial[i]).abs() < 1e-5,
+                "local +Y should map to radial axis {i}: got {:?}, want {:?}",
+                equatorish[1],
+                expected_radial,
+            );
+        }
+
+        let cross = [
+            equatorish[0][1] * equatorish[1][2] - equatorish[0][2] * equatorish[1][1],
+            equatorish[0][2] * equatorish[1][0] - equatorish[0][0] * equatorish[1][2],
+            equatorish[0][0] * equatorish[1][1] - equatorish[0][1] * equatorish[1][0],
+        ];
+        for i in 0..3 {
+            assert!(
+                (cross[i] - equatorish[2][i]).abs() < 1e-5,
+                "basis must be right-handed on axis {i}: got {:?}, want {:?}",
+                cross,
+                equatorish[2],
+            );
+        }
     }
 }

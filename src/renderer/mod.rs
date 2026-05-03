@@ -518,7 +518,7 @@ impl Renderer {
     /// radians (e.g. 1.26 ≈ 72°). Cells past this latitude return
     /// no-hit so they read as sky.
     pub fn set_planet_lat_max(&mut self, lat_max_rad: f32) {
-        self.planet_render = [0.0, lat_max_rad, 0.0, 0.0];
+        self.planet_render = [1.0, lat_max_rad, 0.0, 0.0];
         self.write_uniforms();
     }
 }

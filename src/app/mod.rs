@@ -702,7 +702,7 @@ pub(super) fn path_lands_on_tangent_block(
     world_root: crate::world::tree::NodeId,
     path: &crate::world::anchor::Path,
 ) -> bool {
-    use crate::world::tree::{Child, NodeKind};
+    use crate::world::tree::Child;
     if path.depth() == 0 {
         return false;
     }
@@ -716,7 +716,7 @@ pub(super) fn path_lands_on_tangent_block(
     }
     library
         .get(node)
-        .map(|n| matches!(n.kind, NodeKind::TangentBlock { .. }))
+        .map(|n| n.kind.is_tangent_block())
         .unwrap_or(false)
 }
 
@@ -763,6 +763,29 @@ pub(super) fn frame_path_rotation(
     world_root: crate::world::tree::NodeId,
     frame_path: &crate::world::anchor::Path,
 ) -> [[f32; 3]; 3] {
-    frame_path_chain(library, world_root, frame_path).0
+    use crate::world::tree::{Child, IDENTITY_ROTATION, NodeKind};
+    let mut rot = IDENTITY_ROTATION;
+    let mut node = world_root;
+    for k in 0..(frame_path.depth() as usize) {
+        let n = match library.get(node) {
+            Some(n) => n,
+            None => return rot,
+        };
+        match n.children[frame_path.slot(k) as usize] {
+            Child::Node(child_id) => {
+                if let Some(child_node) = library.get(child_id) {
+                    match child_node.kind {
+                        NodeKind::TangentBlock { rotation }
+                        | NodeKind::TangentPlane { rotation } => {
+                            rot = crate::world::mat3::matmul(&rot, &rotation);
+                        }
+                        _ => {}
+                    }
+                }
+                node = child_id;
+            }
+            _ => return rot,
+        }
+    }
+    rot
 }
-

@@ -102,6 +102,15 @@ pub enum NodeKind {
     TangentBlock {
         rotation: [[f32; 3]; 3],
     },
+    /// A Cartesian slab cell that renders/raycasts through a rotated
+    /// tangent frame but keeps ordinary Cartesian movement topology.
+    ///
+    /// This is used by UV wrapped planets: stepping out of the cell
+    /// should move to the neighboring UV slab slot, while visuals are
+    /// oriented by the latitude/longitude tangent basis.
+    TangentPlane {
+        rotation: [[f32; 3]; 3],
+    },
 }
 
 /// Identity rotation (column-major). A `TangentBlock` carrying this
@@ -147,6 +156,10 @@ impl PartialEq for NodeKind {
                 NodeKind::TangentBlock { rotation: a },
                 NodeKind::TangentBlock { rotation: b },
             ) => rotation_bits(a) == rotation_bits(b),
+            (
+                NodeKind::TangentPlane { rotation: a },
+                NodeKind::TangentPlane { rotation: b },
+            ) => rotation_bits(a) == rotation_bits(b),
             _ => false,
         }
     }
@@ -172,6 +185,9 @@ impl Hash for NodeKind {
             NodeKind::TangentBlock { rotation } => {
                 rotation_bits(rotation).hash(state);
             }
+            NodeKind::TangentPlane { rotation } => {
+                rotation_bits(rotation).hash(state);
+            }
         }
     }
 }
@@ -193,6 +209,20 @@ impl NodeKind {
     #[inline]
     pub fn is_tangent_block(self) -> bool {
         matches!(self, NodeKind::TangentBlock { .. })
+    }
+
+    /// True iff this kind is `TangentPlane`, regardless of rotation.
+    #[inline]
+    pub fn is_tangent_plane(self) -> bool {
+        matches!(self, NodeKind::TangentPlane { .. })
+    }
+
+    /// True iff this kind should use tangent-frame render/raycast
+    /// dispatch. `TangentPlane` intentionally does not participate
+    /// in movement normalization; see `TbBoundary::from_kind`.
+    #[inline]
+    pub fn is_tangent_dispatch(self) -> bool {
+        matches!(self, NodeKind::TangentBlock { .. } | NodeKind::TangentPlane { .. })
     }
 }
 

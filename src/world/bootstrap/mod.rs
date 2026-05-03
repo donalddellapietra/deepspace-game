@@ -10,6 +10,7 @@ use super::state::WorldState;
 mod dodecahedron_test;
 mod plain;
 mod rotated_cube_test;
+mod uv_sphere_test;
 mod vox;
 mod wrapped_planet;
 
@@ -21,7 +22,7 @@ pub use vox::bootstrap_vox_model_world;
 pub use wrapped_planet::{
     wrapped_planet_spawn, wrapped_planet_world, DEFAULT_WRAPPED_PLANET_CELL_SUBTREE_DEPTH,
     DEFAULT_WRAPPED_PLANET_EMBEDDING_DEPTH, DEFAULT_WRAPPED_PLANET_SLAB_DEPTH,
-    DEFAULT_WRAPPED_PLANET_SLAB_DIMS,
+    DEFAULT_WRAPPED_PLANET_SLAB_DIMS, DEFAULT_WRAPPED_PLANET_LAT_MAX,
 };
 
 /// Re-export of [`crate::world::fractals::menger::menger_world`] for
@@ -115,6 +116,9 @@ pub enum WorldPreset {
     /// `renormalize_world` against twelve distinct *non*-axis-aligned
     /// rotations.
     DodecahedronTest,
+    /// Dodecahedron-style UV sphere: tangent-plane cells placed as
+    /// real tree geometry on a spherical shell.
+    UvSphereTest,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -147,6 +151,7 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         WorldPreset::WrappedPlanet { .. } => None,
         WorldPreset::RotatedCubeTest => None,
         WorldPreset::DodecahedronTest => None,
+        WorldPreset::UvSphereTest => None,
     }
 }
 
@@ -234,6 +239,9 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         }
         WorldPreset::DodecahedronTest => {
             dodecahedron_test::bootstrap_dodecahedron_test_world()
+        }
+        WorldPreset::UvSphereTest => {
+            uv_sphere_test::bootstrap_uv_sphere_test_world()
         }
     }
 }

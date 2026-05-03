@@ -67,27 +67,6 @@ impl App {
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
         let (hit, cap_frame_path) = match self.active_frame.kind {
-            // WrappedPlane frame: dispatch the rotated-tangent-cube CPU
-            // raycast so click-targeting matches the GPU visual.
-            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
-                let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame(&frame_path);
-                let ray_dir = self.ray_dir_in_frame(&frame_path);
-                // lat_max kept in sync with the shader-side default
-                // (1.26 rad ≈ 72°).
-                let hit = raycast::cpu_raycast_wrapped_planet(
-                    &self.world.library,
-                    self.world.root,
-                    frame_path.as_slice(),
-                    cam_local,
-                    ray_dir,
-                    dims,
-                    slab_depth,
-                    1.26,
-                    self.edit_depth(),
-                );
-                (hit, frame_path)
-            }
             ActiveFrameKind::Cartesian => {
                 let frame_path = self.active_frame.render_path;
                 // Rotation-aware projection: when the anchor crosses
@@ -114,6 +93,32 @@ impl App {
                 if hit.is_none() && self.startup_profile_frames < 16 {
                     eprintln!(
                         "frame_raycast_cartesian_miss edit_depth={} render_path={:?}",
+                        self.edit_depth(),
+                        frame_path.as_slice(),
+                    );
+                }
+                (hit, frame_path)
+            }
+            ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
+                let frame_path = self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame_rot(
+                    &self.world.library, self.world.root, &frame_path,
+                );
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let hit = raycast::cpu_raycast_wrapped_planet(
+                    &self.world.library,
+                    self.world.root,
+                    frame_path.as_slice(),
+                    cam_local,
+                    ray_dir,
+                    dims,
+                    slab_depth,
+                    crate::world::bootstrap::DEFAULT_WRAPPED_PLANET_LAT_MAX,
+                    self.edit_depth(),
+                );
+                if hit.is_none() && self.startup_profile_frames < 16 {
+                    eprintln!(
+                        "frame_raycast_wrapped_planet_miss edit_depth={} render_path={:?}",
                         self.edit_depth(),
                         frame_path.as_slice(),
                     );
@@ -227,7 +232,8 @@ impl App {
             match child_kind {
                 Some(NodeKind::Cartesian)
                 | Some(NodeKind::WrappedPlane { .. })
-                | Some(NodeKind::TangentBlock { .. }) => {
+                | Some(NodeKind::TangentBlock { .. })
+                | Some(NodeKind::TangentPlane { .. }) => {
                     node_id = child_id;
                 }
                 None => break,
