@@ -69,39 +69,18 @@ impl App {
         let anchor = self.camera.position.anchor;
         self.world.ensure_anchor_extended(anchor.as_slice());
 
-        // Build the camera-aware view tree by pruning `world.root`.
-        // Far cells collapse to Block splats (representative color);
-        // near cells keep full structure. Same Nyquist gate the
-        // shader's `at_lod` would compute, just done once on CPU
-        // and baked into the rendered tree. Replaces pack-level
-        // content-aware uniform-flatten — adjacent cells now LOD
-        // identically based on distance, not on whether their
-        // content happens to be uniform. Dedup means most far cells
-        // share NodeIds across frames.
-        let camera_world = self.camera.position.in_frame(&Path::root());
-        let (_, view_h) = self
-            .renderer
-            .as_ref()
-            .map(|r| r.march_dims_public())
-            .unwrap_or((self.harness_width.max(1), self.harness_height.max(1)));
-        let focal = view_h as f32 / (2.0 * (1.2_f32 * 0.5).tan());
-        let view_tree_root = view_tree::build_view_tree(
-            &mut self.world.library,
-            self.world.root,
-            camera_world,
-            focal,
-            self.lod_pixel_threshold,
-        );
-        // Hold a ref so the view tree survives the rest of this
-        // upload; release the previous frame's view tree.
-        self.world.library.ref_inc(view_tree_root);
-        if let Some(prev) = self.active_view_tree_root.replace(view_tree_root) {
-            self.world.library.ref_dec(prev);
-        }
+        // View-tree integration disabled while the per-frame
+        // walker is optimized — naive recursion over 100k+ nodes
+        // is unacceptable. See `world::view_tree`. Reinstated
+        // once the walker has uniform-flatten short-circuit and
+        // depth bounding.
+        let view_tree_root = self.world.root;
+        let _ = &view_tree_root;
+        let _ = view_tree::build_view_tree;
 
         let intended_frame = self.target_render_frame();
         let effective_visual_depth = self.visual_depth();
-        let upload_key = LodUploadKey::new(view_tree_root);
+        let upload_key = LodUploadKey::new(self.world.root);
         let reused_gpu_tree = self.last_lod_upload_key == Some(upload_key);
         self.last_effective_visual_depth = effective_visual_depth;
         self.last_reused_gpu_tree = reused_gpu_tree;
@@ -140,7 +119,7 @@ impl App {
             let pack_start = web_time::Instant::now();
             let cache = self.cached_tree.as_mut().expect("cache inserted above");
             let len_before = cache.tree.len();
-            cache.update_root(&self.world.library, view_tree_root);
+            cache.update_root(&self.world.library, self.world.root);
             pack_elapsed = pack_start.elapsed();
             let appended_u32s = cache.tree.len().saturating_sub(len_before);
             self.last_packed_node_count = cache.node_offsets.len() as u32;
@@ -218,7 +197,7 @@ impl App {
         }
         let scene_result = scene::build_scene_root(
             &mut self.world.library,
-            view_tree_root,
+            self.world.root,
             &entity_paths,
         );
         let scene_root = scene_result.node_id;
