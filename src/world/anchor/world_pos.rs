@@ -5,7 +5,7 @@
 use super::path::{Path, Transition};
 use super::WORLD_SIZE;
 use crate::world::tree::{
-    slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, IDENTITY_ROTATION, MAX_DEPTH,
+    slot_coords, slot_index, Child, NodeId, NodeKind, NodeLibrary, MAX_DEPTH,
 };
 
 /// `(anchor, offset)` position with the offset held in `[0, 1)³`
@@ -198,48 +198,32 @@ impl WorldPos {
         transition
     }
 
-    /// Pop the deepest slot. If the cell being popped was a
-    /// `TangentBlock`, apply forward `R` rotation about
-    /// `(0.5, 0.5, 0.5)` to convert the offset from TB-storage frame
-    /// into the parent-of-TB frame BEFORE the standard
-    /// `(slot_offset + offset) / 3` rescaling.
+    /// Pop the deepest slot. Pure Cartesian: TB rotation is a
+    /// shader-side rendering effect; the anchor's slot indexing is
+    /// always axis-aligned with the parent's children frame, so a
+    /// pop is `(slot_offset + offset) / 3` regardless of node kind.
     fn pop_one_level_rot_aware(
         &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
+        _library: &NodeLibrary,
+        _world_root: NodeId,
     ) {
         if self.anchor.depth() == 0 {
             return;
         }
-        // Kind of the cell currently at the end of the path (the
-        // cell being popped).
-        let popped_kind = super::path::node_kind_at_depth(
-            library, world_root, self.anchor.as_slice(),
-        );
-        let mut adjusted = self.offset;
-        if let Some(NodeKind::TangentBlock { rotation: r }) = popped_kind {
-            let centred = [adjusted[0] - 0.5, adjusted[1] - 0.5, adjusted[2] - 0.5];
-            let rotated = mat3_mul_vec3(&r, &centred);
-            adjusted[0] = rotated[0] + 0.5;
-            adjusted[1] = rotated[1] + 0.5;
-            adjusted[2] = rotated[2] + 0.5;
-        }
         let last_slot = self.anchor.pop().unwrap_or(0) as usize;
         let (sx, sy, sz) = slot_coords(last_slot);
-        self.offset[0] = (sx as f32 + adjusted[0]) / 3.0;
-        self.offset[1] = (sy as f32 + adjusted[1]) / 3.0;
-        self.offset[2] = (sz as f32 + adjusted[2]) / 3.0;
+        self.offset[0] = (sx as f32 + self.offset[0]) / 3.0;
+        self.offset[1] = (sy as f32 + self.offset[1]) / 3.0;
+        self.offset[2] = (sz as f32 + self.offset[2]) / 3.0;
     }
 
     /// Descend one level: pick the slot containing the camera and
-    /// push it onto the anchor. If the picked child is a
-    /// `TangentBlock`, apply `R^T` rotation about `(0.5, 0.5, 0.5)`
-    /// to the post-floor offset to convert from parent-frame into
-    /// TB-storage frame.
+    /// push it onto the anchor. Pure Cartesian: see
+    /// `pop_one_level_rot_aware` for rationale.
     fn descend_one_level_rot_aware(
         &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
+        _library: &NodeLibrary,
+        _world_root: NodeId,
     ) {
         let storage_pos = [
             self.offset[0] * 3.0,
@@ -250,29 +234,12 @@ impl WorldPos {
         let sy = storage_pos[1].floor().clamp(0.0, 2.0) as i32 as usize;
         let sz = storage_pos[2].floor().clamp(0.0, 2.0) as i32 as usize;
         let slot = slot_index(sx, sy, sz) as u8;
-        // Push first, then look up the descended-into cell's kind.
         self.anchor.push(slot);
-        let descend_kind = super::path::node_kind_at_depth(
-            library, world_root, self.anchor.as_slice(),
-        );
-        let mut new_offset = [
+        self.offset = [
             (storage_pos[0] - sx as f32).clamp(0.0, 1.0 - f32::EPSILON),
             (storage_pos[1] - sy as f32).clamp(0.0, 1.0 - f32::EPSILON),
             (storage_pos[2] - sz as f32).clamp(0.0, 1.0 - f32::EPSILON),
         ];
-        if let Some(NodeKind::TangentBlock { rotation: r }) = descend_kind {
-            // R^T · (offset - 0.5) + 0.5
-            let centred = [new_offset[0] - 0.5, new_offset[1] - 0.5, new_offset[2] - 0.5];
-            let rotated = [
-                r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
-                r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
-                r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
-            ];
-            new_offset[0] = (rotated[0] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[1] = (rotated[1] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[2] = (rotated[2] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-        }
-        self.offset = new_offset;
     }
 
     /// Advance by a local delta (in units of the current cell).
@@ -361,63 +328,32 @@ impl WorldPos {
         }
         let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
         self.anchor.push(slot);
-        // If the cell we just descended INTO is a TangentBlock, the
-        // offset's frame changes from parent-Cartesian to TB-storage.
-        // Apply R^T rotation about (0.5, 0.5, 0.5).
-        let descend_kind = super::path::node_kind_at_depth(
-            library, world_root, self.anchor.as_slice(),
-        );
-        if let Some(NodeKind::TangentBlock { rotation: r }) = descend_kind {
-            let centred = [new_offset[0] - 0.5, new_offset[1] - 0.5, new_offset[2] - 0.5];
-            let rotated = [
-                r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
-                r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
-                r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
-            ];
-            new_offset[0] = (rotated[0] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[1] = (rotated[1] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[2] = (rotated[2] + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-        }
+        // Pure Cartesian: TB rotation lives in the shader/raycast at
+        // TB-cell entry, not in the anchor representation. Same offset
+        // semantics regardless of whether the descended-into cell is
+        // a TB.
         self.offset = new_offset;
         Transition::None
     }
 
-    /// Pop the deepest slot. World position preserved across the
-    /// pop, including TangentBlock rotation when the cell being
-    /// popped was a TB. Use this at runtime; `zoom_out` is a
-    /// Cartesian fallback for callers without a library.
+    /// Pop the deepest slot. Pure Cartesian — see
+    /// `pop_one_level_rot_aware` and `zoom_in_in_world`.
     pub fn zoom_out_in_world(
         &mut self,
-        library: &NodeLibrary,
-        world_root: NodeId,
+        _library: &NodeLibrary,
+        _world_root: NodeId,
     ) -> Transition {
         if self.anchor.depth() == 0 {
             return Transition::None;
-        }
-        // Kind of the cell at the end of the path (the cell being
-        // popped). If it's a TangentBlock, the offset is in
-        // TB-storage frame and must be rotated by R about (0.5, 0.5, 0.5)
-        // to express in the parent-of-TB Cartesian frame BEFORE the
-        // standard pop rescale.
-        let popped_kind = super::path::node_kind_at_depth(
-            library, world_root, self.anchor.as_slice(),
-        );
-        let mut adjusted = self.offset;
-        if let Some(NodeKind::TangentBlock { rotation: r }) = popped_kind {
-            let centred = [adjusted[0] - 0.5, adjusted[1] - 0.5, adjusted[2] - 0.5];
-            let rotated = mat3_mul_vec3(&r, &centred);
-            adjusted[0] = rotated[0] + 0.5;
-            adjusted[1] = rotated[1] + 0.5;
-            adjusted[2] = rotated[2] + 0.5;
         }
         let last_slot = match self.anchor.pop() {
             Some(s) => s as usize,
             None => return Transition::None,
         };
         let (sx, sy, sz) = slot_coords(last_slot);
-        self.offset[0] = (sx as f32 + adjusted[0]) / 3.0;
-        self.offset[1] = (sy as f32 + adjusted[1]) / 3.0;
-        self.offset[2] = (sz as f32 + adjusted[2]) / 3.0;
+        self.offset[0] = (sx as f32 + self.offset[0]) / 3.0;
+        self.offset[1] = (sy as f32 + self.offset[1]) / 3.0;
+        self.offset[2] = (sz as f32 + self.offset[2]) / 3.0;
         debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
         Transition::None
     }
@@ -541,137 +477,22 @@ impl WorldPos {
     /// — never world-absolute. For all-Cartesian paths, the result is
     /// bit-identical to [`in_frame`].
     ///
-    /// `library` and `world_root` are needed because the rotation
-    /// data lives on `Node` records keyed by `NodeId`. Currently
-    /// assumes the `frame` path is Cartesian (i.e. no rotated
-    /// ancestors above the camera's anchor) — the renderer guarantees
-    /// this for shallow worlds. If a rotated frame becomes possible,
-    /// extend with frame-side rotation accumulation.
+    /// Pure Cartesian wrapper preserved for API compatibility. The
+    /// anchor representation is purely Cartesian — TB rotation/scale
+    /// is a shader-side rendering effect (`tb_scale` in `rot_col0.w`
+    /// of `GpuNodeKind`), not a property of the path. So the world
+    /// position derived from `(anchor, offset)` is always the plain
+    /// Cartesian walk.
+    ///
+    /// `library` and `world_root` are accepted for signature
+    /// compatibility with callers from when this was rotation-aware.
     pub fn in_frame_rot(
         &self,
-        library: &NodeLibrary,
-        world_root: NodeId,
+        _library: &NodeLibrary,
+        _world_root: NodeId,
         frame: &Path,
     ) -> [f32; 3] {
-        let c = self.anchor.common_prefix_len(frame) as usize;
-
-        // Walk from world root to the common ancestor, tracking the
-        // cumulative rotation experienced going from root → common.
-        // (Frames assumed Cartesian; this is identity in the typical
-        // case but preserved for future when frame can be rotated.)
-        let mut node = world_root;
-        let mut common_rot = IDENTITY_ROTATION;
-        for k in 0..c {
-            let n = match library.get(node) {
-                Some(n) => n,
-                None => return self.in_frame(frame),
-            };
-            match n.children[self.anchor.slot(k) as usize] {
-                Child::Node(child) => {
-                    if let Some(child_node) = library.get(child) {
-                        if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
-                            common_rot = matmul3x3(&common_rot, &r);
-                        }
-                    }
-                    node = child;
-                }
-                _ => return self.in_frame(frame),
-            }
-        }
-        let common_node = node;
-
-        // Walk from common ancestor down the anchor's tail,
-        // accumulating both the cube *centre* in common-ancestor
-        // local coords and the cumulative rotation. At each step we
-        // rotate the slot's centred-local offset by the cumulative
-        // rotation before adding to the centre.
-        let mut cur_centre = [WORLD_SIZE * 0.5; 3];
-        let mut cur_size = WORLD_SIZE;
-        // `cur_rot` starts as identity: the tail walk produces the
-        // position in the common ancestor's unrotated local frame.
-        // TangentBlock rotation from `common_rot` is handled by the
-        // shader (R^T at frame entry for TB frame roots), not here.
-        let mut cur_rot = IDENTITY_ROTATION;
-        let _ = common_rot;
-        let mut have_node = true;
-        let mut node = common_node;
-        for k in c..(self.anchor.depth() as usize) {
-            let slot = self.anchor.slot(k);
-            let (sx, sy, sz) = slot_coords(slot as usize);
-            let child_size = cur_size / 3.0;
-            // Slot's centre offset relative to the current node's
-            // centre, in current node's LOCAL frame:
-            let centred_local = [
-                (sx as f32 - 1.0) * child_size,
-                (sy as f32 - 1.0) * child_size,
-                (sz as f32 - 1.0) * child_size,
-            ];
-            // Rotate into common ancestor's frame and add to centre.
-            let centred_common = mat3_mul_vec3(&cur_rot, &centred_local);
-            cur_centre = [
-                cur_centre[0] + centred_common[0],
-                cur_centre[1] + centred_common[1],
-                cur_centre[2] + centred_common[2],
-            ];
-
-            // Update rotation if descending into a TangentBlock.
-            // `have_node` tracks whether the path is still inside the
-            // tree; once it falls off (Block / Empty / EntityRef)
-            // further iterations only contribute slot-position offsets
-            // (rotation chain doesn't extend below the tree's nodes).
-            if have_node {
-                let n = library.get(node).unwrap();
-                match n.children[slot as usize] {
-                    Child::Node(child_id) => {
-                        if let Some(child_node) = library.get(child_id) {
-                            if let NodeKind::TangentBlock { rotation: r } = child_node.kind {
-                                cur_rot = matmul3x3(&cur_rot, &r);
-                            }
-                            node = child_id;
-                        } else {
-                            have_node = false;
-                        }
-                    }
-                    _ => have_node = false,
-                }
-            }
-            cur_size = child_size;
-        }
-
-        // Apply the offset, also rotated by the cumulative chain
-        // around the anchor cell's centre.
-        let centred_offset_local = [
-            (self.offset[0] - 0.5) * cur_size,
-            (self.offset[1] - 0.5) * cur_size,
-            (self.offset[2] - 0.5) * cur_size,
-        ];
-        let centred_offset_common = mat3_mul_vec3(&cur_rot, &centred_offset_local);
-        let pos_common = [
-            cur_centre[0] + centred_offset_common[0],
-            cur_centre[1] + centred_offset_common[1],
-            cur_centre[2] + centred_offset_common[2],
-        ];
-
-        // Walk frame's tail from common ancestor to find frame's
-        // origin + size in common ancestor coords. Frame is assumed
-        // Cartesian here; if it becomes rotated, extend.
-        let mut frame_origin = [0.0f32; 3];
-        let mut frame_size = WORLD_SIZE;
-        for k in c..(frame.depth() as usize) {
-            let (sx, sy, sz) = slot_coords(frame.slot(k) as usize);
-            let child = frame_size / 3.0;
-            frame_origin[0] += sx as f32 * child;
-            frame_origin[1] += sy as f32 * child;
-            frame_origin[2] += sz as f32 * child;
-            frame_size = child;
-        }
-
-        let scale = WORLD_SIZE / frame_size;
-        [
-            (pos_common[0] - frame_origin[0]) * scale,
-            (pos_common[1] - frame_origin[1]) * scale,
-            (pos_common[2] - frame_origin[2]) * scale,
-        ]
+        self.in_frame(frame)
     }
 
     /// Build a `WorldPos` at `anchor_depth` whose frame-local
@@ -807,33 +628,6 @@ impl WorldPos {
         debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
         Transition::None
     }
-}
-
-/// 3×3 matrix multiply, both column-major (`r[col][row]`).
-fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut out = [[0.0f32; 3]; 3];
-    for c in 0..3 {
-        for r in 0..3 {
-            let mut s = 0.0f32;
-            for k in 0..3 {
-                // (a · b)[r, c] = sum_k a[r, k] · b[k, c]
-                // a[r, k] = a[k][r];  b[k, c] = b[c][k]
-                s += a[k][r] * b[c][k];
-            }
-            out[c][r] = s;
-        }
-    }
-    out
-}
-
-/// Apply a column-major 3×3 matrix to a 3-vector: `(m · v).i =
-/// sum_j m[j][i] · v.j`.
-fn mat3_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2],
-        m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2],
-        m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2],
-    ]
 }
 
 /// Walk `library` from `world_root` along `path`'s slots; return the
