@@ -1662,17 +1662,70 @@ fn march_uv_ring(
     let dims_x = i32(uniforms.slab_dims.x);
     let slab_depth = uniforms.slab_dims.w;
     if dims_x <= 0 { return result; }
+    // Bitmask cap: see candidate-cell loop below.
+    if dims_x > 32 { return result; }
 
     let pi = 3.14159265;
     let ring_center = vec3<f32>(1.5, 1.5, 1.5);
     let ring_radius = 1.0;
     let arc = (2.0 * pi * ring_radius) / f32(dims_x);
     let cell_side = arc * 0.95;
+    let half_side = cell_side * 0.5;
     let scale = 3.0 / cell_side;
+
+    let inv_dir = vec3<f32>(
+        select(1e10, 1.0 / ray_dir_in.x, abs(ray_dir_in.x) > 1e-8),
+        select(1e10, 1.0 / ray_dir_in.y, abs(ray_dir_in.y) > 1e-8),
+        select(1e10, 1.0 / ray_dir_in.z, abs(ray_dir_in.z) > 1e-8),
+    );
+
+    // Outer AABB rejection — skip rays that miss the ring entirely.
+    // The ring lives in a Y-thin slab of half-extent
+    // `(ring_radius + half_side, half_side, ring_radius + half_side)`
+    // centred at `(1.5, 1.5, 1.5)`. Every cell sits inside this
+    // AABB, so any ray missing it cannot hit a cell.
+    let aabb_pad = ring_radius + half_side;
+    let aabb_min = vec3<f32>(1.5 - aabb_pad, 1.5 - half_side, 1.5 - aabb_pad);
+    let aabb_max = vec3<f32>(1.5 + aabb_pad, 1.5 + half_side, 1.5 + aabb_pad);
+    let outer = ray_box(ray_origin, inv_dir, aabb_min, aabb_max);
+    if outer.t_enter >= outer.t_exit || outer.t_exit < 0.0 {
+        return result;
+    }
+
+    // Sampled candidate-cell mask. Sample the ray inside the ring
+    // AABB at fixed `t` values; for each sample compute the ring
+    // angle of the sample's XZ projection, mark that cell + its
+    // two neighbours in a 32-bit mask. The per-cell loop below
+    // tests only marked cells. Per-ray cost is now O(samples +
+    // hits), independent of `dims_x` — typical hit count is 1–3
+    // even at `dims_x = 27`. Without this mask, the previous
+    // unconditional 0..N loop dispatched `march_in_tangent_cube`
+    // 27× per ray and bottlenecked the marcher to ~27 fps; with
+    // the mask, it matches `march_cartesian`'s "DDA visits 1–3
+    // cells per ray" cost profile.
+    let t_lo = max(outer.t_enter, 0.0);
+    let t_hi = outer.t_exit;
+    var cell_mask: u32 = 0u;
+    let samples: i32 = 8;
+    for (var s: i32 = 0; s <= samples; s = s + 1) {
+        let t = mix(t_lo, t_hi, f32(s) / f32(samples));
+        let p = ray_origin + ray_dir_in * t;
+        let theta_p = atan2(p.z - 1.5, p.x - 1.5);
+        let u_p = (theta_p + pi) / (2.0 * pi);
+        let cell_raw = i32(floor(u_p * f32(dims_x)));
+        let cell_c = ((cell_raw % dims_x) + dims_x) % dims_x;
+        let cell_p = (cell_c + dims_x - 1) % dims_x;
+        let cell_n = (cell_c + 1) % dims_x;
+        cell_mask = cell_mask
+            | (1u << u32(cell_c))
+            | (1u << u32(cell_p))
+            | (1u << u32(cell_n));
+    }
 
     var best_t = 1e20;
     var best: HitResult = result;
     for (var cell_x: i32 = 0; cell_x < dims_x; cell_x = cell_x + 1) {
+        if (cell_mask & (1u << u32(cell_x))) == 0u { continue; }
         let theta = -pi + (f32(cell_x) + 0.5) * (2.0 * pi / f32(dims_x));
         let st = sin(theta);
         let ct = cos(theta);

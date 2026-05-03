@@ -15,6 +15,7 @@
 //! These constants must stay in lockstep with the shader's
 //! `march_uv_ring`; if you change one, change both.
 
+use super::cartesian::ray_aabb;
 use super::HitInfo;
 use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
 
@@ -64,13 +65,67 @@ pub fn cpu_raycast_uv_ring(
     let two_pi = 2.0 * pi;
     let arc = (two_pi * RING_RADIUS) / dims[0] as f32;
     let cell_side = arc * RING_PACKING;
+    let half_side = cell_side * 0.5;
     let scale = 3.0 / cell_side;
+
+    if dims[0] > 32 {
+        return None;
+    }
+
+    // Outer AABB rejection: the ring lives inside a Y-thin slab of
+    // half-extent `(RING_RADIUS + half_side, half_side, RING_RADIUS
+    // + half_side)` centred at `RING_CENTER`. Mirrors the shader's
+    // `march_uv_ring` AABB cull.
+    let aabb_pad = RING_RADIUS + half_side;
+    let aabb_min = [
+        RING_CENTER[0] - aabb_pad,
+        RING_CENTER[1] - half_side,
+        RING_CENTER[2] - aabb_pad,
+    ];
+    let aabb_max = [
+        RING_CENTER[0] + aabb_pad,
+        RING_CENTER[1] + half_side,
+        RING_CENTER[2] + aabb_pad,
+    ];
+    let (t_enter, t_exit) = ray_aabb(cam_local, ray_dir, aabb_min, aabb_max);
+    if t_enter >= t_exit || t_exit < 0.0 {
+        return None;
+    }
+
+    // Sampled candidate-cell mask. See the shader's `march_uv_ring`
+    // for the full rationale: per-ray cost becomes O(samples + hits)
+    // instead of O(N).
+    let t_lo = t_enter.max(0.0);
+    let t_hi = t_exit;
+    let dims_x = dims[0] as i32;
+    let mut cell_mask: u32 = 0;
+    let samples: i32 = 8;
+    for s in 0..=samples {
+        let t = t_lo + (t_hi - t_lo) * (s as f32 / samples as f32);
+        let p = [
+            cam_local[0] + ray_dir[0] * t,
+            cam_local[1] + ray_dir[1] * t,
+            cam_local[2] + ray_dir[2] * t,
+        ];
+        let theta_p = (p[2] - RING_CENTER[2]).atan2(p[0] - RING_CENTER[0]);
+        let u_p = (theta_p + pi) / two_pi;
+        let cell_raw = (u_p * dims_x as f32).floor() as i32;
+        let cell_c = cell_raw.rem_euclid(dims_x);
+        let cell_p = (cell_c + dims_x - 1) % dims_x;
+        let cell_n = (cell_c + 1) % dims_x;
+        cell_mask |= 1u32 << cell_c;
+        cell_mask |= 1u32 << cell_p;
+        cell_mask |= 1u32 << cell_n;
+    }
 
     let mut best: Option<HitInfo> = None;
     let mut best_t = f32::INFINITY;
 
-    for cell_x in 0..dims[0] as i32 {
-        let theta = -pi + (cell_x as f32 + 0.5) * (two_pi / dims[0] as f32);
+    for cell_x in 0..dims_x {
+        if (cell_mask & (1u32 << cell_x)) == 0 {
+            continue;
+        }
+        let theta = -pi + (cell_x as f32 + 0.5) * (two_pi / dims_x as f32);
         let (st, ct) = theta.sin_cos();
         let radial = [ct, 0.0, st];
         let cell_center = [
