@@ -30,13 +30,31 @@ impl App {
         if let Some(depth) = self.forced_visual_depth {
             return depth.max(1).min(crate::world::tree::MAX_DEPTH as u32);
         }
-        // With multi-ray frame selection, render_path can be
-        // anywhere in the tree; the old `edit_depth - render_depth`
-        // formula gave wildly varying small budgets that caused LOD
-        // pop in side / popped frames. Just use the full shader
-        // stack budget — per-ray LOD_PIXEL_THRESHOLD handles nyquist
-        // termination correctly.
-        crate::world::tree::MAX_DEPTH as u32 // shader caps at MAX_STACK_DEPTH
+        let local_target = self.edit_depth()
+            .saturating_sub(self.active_frame.render_path.depth() as u32)
+            .max(1);
+        let pixels = self.frame_projected_pixels(&self.active_frame);
+        // The pixel cap limits visual depth based on the frame's
+        // projected size — prevents over-descent when the frame is
+        // far away. Skip it when the camera is inside the frame
+        // (which is always true for the render frame): the shader's
+        // own LOD_PIXEL_THRESHOLD handles per-cell gating, and the
+        // CPU cap is too conservative for inside-frame cameras
+        // (especially TB frames stopped at depth 1).
+        let cam_local = self.camera.position.in_frame(&self.active_frame.render_path);
+        let camera_inside = cam_local.iter().all(|&v| v >= 0.0 && v <= 3.0);
+        let local_cap = if camera_inside {
+            MAX_LOCAL_VISUAL_DEPTH
+        } else if pixels <= FRAME_VISUAL_MIN_PIXELS {
+            1
+        } else {
+            let extra = (pixels / FRAME_VISUAL_MIN_PIXELS).ln() / 3.0_f32.ln();
+            extra.floor().max(1.0) as u32
+        };
+        local_target
+            .min(local_cap)
+            .min(MAX_LOCAL_VISUAL_DEPTH)
+            .min(crate::world::tree::MAX_DEPTH as u32)
     }
 
     fn camera_fits_frame(&self, frame: &ActiveFrame) -> bool {

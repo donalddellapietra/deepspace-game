@@ -504,73 +504,13 @@ impl App {
     /// explicit face-cell window so render/edit share one layer
     /// definition.
     pub(super) fn render_frame(&self) -> ActiveFrame {
-        // Try multi-ray content sampling first: the deepest common
-        // tree path containing all visible-content hits is the ideal
-        // frame root — it sits ON the carved structure regardless of
-        // where the camera anchor's slot rounding lands. Falls back
-        // to camera-anchor-based selection if no rays hit (sky).
-        let logical_path = self
-            .nearest_visible_content_path()
-            .unwrap_or_else(|| {
-                let mut p = self.camera.position.anchor;
-                let desired_depth = p.depth().saturating_sub(RENDER_FRAME_K);
-                p.truncate(desired_depth);
-                p
-            });
+        let mut logical_path = self.camera.position.anchor;
+        let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
+        logical_path.truncate(desired_depth);
         frame::with_render_margin(
             &self.world.library, self.world.root,
             &logical_path, RENDER_FRAME_CONTEXT,
         )
-    }
-
-    /// Cast an N×N grid of rays across the camera's FOV, find the
-    /// deepest tree path that's a common ancestor of all hit paths.
-    /// Returns None if no rays hit content.
-    pub(super) fn nearest_visible_content_path(&self) -> Option<crate::world::anchor::Path> {
-        use crate::world::anchor::Path;
-        use crate::world::raycast::cpu_raycast;
-        const N: usize = 16;
-        const RAY_MAX_DEPTH: u32 = 16;
-        let cam_root = self.camera.position.in_frame(&Path::root());
-        let (fwd, right, up) = self.camera.basis();
-        let aspect = self.harness_width as f32 / self.harness_height as f32;
-        let half_fov_tan = (1.2_f32 * 0.5).tan();
-        let mut common: Option<Path> = None;
-        for iy in 0..N {
-            for ix in 0..N {
-                let nx = ((ix as f32 + 0.5) / N as f32) * 2.0 - 1.0;
-                let ny = ((iy as f32 + 0.5) / N as f32) * 2.0 - 1.0;
-                let dx = nx * aspect * half_fov_tan;
-                let dy = -ny * half_fov_tan;
-                let mut dir = [
-                    fwd[0] + right[0] * dx + up[0] * dy,
-                    fwd[1] + right[1] * dx + up[1] * dy,
-                    fwd[2] + right[2] * dx + up[2] * dy,
-                ];
-                let len = (dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]).sqrt();
-                if len < 1e-6 { continue; }
-                dir[0] /= len; dir[1] /= len; dir[2] /= len;
-                let hit = cpu_raycast(
-                    &self.world.library, self.world.root,
-                    cam_root, dir, RAY_MAX_DEPTH,
-                );
-                let Some(hit) = hit else { continue };
-                let mut hit_path = Path::root();
-                for &(_, slot) in &hit.path {
-                    hit_path.push(slot as u8);
-                }
-                common = Some(match common {
-                    None => hit_path,
-                    Some(c) => {
-                        let n = c.common_prefix_len(&hit_path);
-                        let mut p = c;
-                        p.truncate(n);
-                        p
-                    }
-                });
-            }
-        }
-        common
     }
 
     /// `NodeKind` of the *intended* render-frame root from a tree
