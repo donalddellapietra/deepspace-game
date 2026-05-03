@@ -106,7 +106,22 @@ impl GpuNodeKind {
                 cell_offset: zero_off,
             },
             NodeKind::TangentBlock { rotation, cell_offset } => {
-                let content_scale = inscribed_cube_scale(&rotation);
+                // Inscribed-cube shrink exists so a rotated cube fits
+                // inside its axis-aligned slot. SphericalWP cells —
+                // identified by non-zero `cell_offset` — are NOT
+                // axis-aligned-constrained: they're at sphere
+                // positions, repositioned out of their natural slot,
+                // and tile the sphere via their rotation. The shrink
+                // would just leave gaps between adjacent rotated
+                // tangent cubes. Skip it for displaced cells.
+                let displaced = cell_offset[0] != 0.0
+                    || cell_offset[1] != 0.0
+                    || cell_offset[2] != 0.0;
+                let content_scale = if displaced {
+                    1.0
+                } else {
+                    inscribed_cube_scale(&rotation)
+                };
                 Self {
                     kind: 2, dims_x: 0, dims_y: 0, dims_z: 0,
                     rot_col0: [rotation[0][0], rotation[0][1], rotation[0][2], content_scale],
