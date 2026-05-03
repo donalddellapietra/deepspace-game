@@ -124,6 +124,47 @@ pub fn rotation_y(radians: f32) -> [[f32; 3]; 3] {
     ]
 }
 
+/// Rotation about the +X axis by `radians`, column-major.
+/// `R · v` rotates `v` counter-clockwise looking down +X.
+pub fn rotation_x(radians: f32) -> [[f32; 3]; 3] {
+    let (s, c) = radians.sin_cos();
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, c, s],
+        [0.0, -s, c],
+    ]
+}
+
+/// Rotation about the +Z axis by `radians`, column-major.
+/// `R · v` rotates `v` counter-clockwise looking down +Z.
+pub fn rotation_z(radians: f32) -> [[f32; 3]; 3] {
+    let (s, c) = radians.sin_cos();
+    [
+        [c, s, 0.0],
+        [-s, c, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+}
+
+/// Compose two column-major rotations: returns `a · b` such that
+/// `(a · b) · v == a · (b · v)`. Used by world bootstraps that need
+/// a rotation expressed as the composition of axis rotations.
+pub fn matmul3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for c in 0..3 {
+        for r in 0..3 {
+            let mut s = 0.0f32;
+            for k in 0..3 {
+                // (a · b)[r, c] = sum_k a[r, k] · b[k, c]
+                // a[r, k] = a[k][r];  b[k, c] = b[c][k]
+                s += a[k][r] * b[c][k];
+            }
+            out[c][r] = s;
+        }
+    }
+    out
+}
+
 #[inline]
 fn rotation_bits(r: &[[f32; 3]; 3]) -> [[u32; 3]; 3] {
     let mut out = [[0u32; 3]; 3];

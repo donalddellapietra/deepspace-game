@@ -456,6 +456,31 @@ fn add_local_offset_is_normalized() {
     }
 }
 
+/// Hitting the world boundary clamps the position but must NOT
+/// collapse the anchor to depth 0. The renormalize loop has to
+/// redescend after the clamp so the camera ends up in the boundary
+/// cell at the original target depth, not floating at empty-root.
+#[test]
+fn add_local_at_world_boundary_preserves_anchor_depth() {
+    let l = lib();
+    let mut anchor = Path::root();
+    anchor.push(crate::world::tree::slot_index(1, 2, 1) as u8);
+    anchor.push(crate::world::tree::slot_index(1, 2, 1) as u8);
+    let mut pos = WorldPos::new(anchor, [0.5, 0.5, 0.5]);
+    let target_depth = pos.anchor.depth();
+    // Push offset[1] way past 1.0 — equivalent to the camera trying
+    // to leave the world via the +Y face. The renormalize must
+    // clamp at the world boundary AND re-walk back down to the
+    // boundary cell at target_depth.
+    pos.add_local([0.0, 5.0, 0.0], &l, NO_ROOT);
+    assert_eq!(pos.anchor.depth(), target_depth,
+        "world-boundary clamp collapsed anchor: {:?}", pos.anchor.as_slice());
+    for &v in &pos.offset {
+        assert!((0.0..1.0).contains(&v),
+            "offset out of range after boundary clamp: {:?}", pos.offset);
+    }
+}
+
 /// Crossing into a `TangentBlock` ancestor must preserve world
 /// position. Without the kind-boundary fixup in `renormalize_world`,
 /// `step_neighbor` inherits source-cell slot indices in the wrong

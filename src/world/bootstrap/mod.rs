@@ -7,11 +7,17 @@
 use super::anchor::{Path, WorldPos};
 use super::state::WorldState;
 
+mod cube_faces_test;
 mod plain;
+mod rhombic_dodecahedron_test;
 mod rotated_cube_test;
 mod vox;
 mod wrapped_planet;
 
+pub use cube_faces_test::{cube_faces_test_spawn, cube_faces_test_world};
+pub use rhombic_dodecahedron_test::{
+    rhombic_dodecahedron_test_spawn, rhombic_dodecahedron_test_world,
+};
 pub use rotated_cube_test::{rotated_cube_test_spawn, rotated_cube_test_world};
 
 pub use plain::{
@@ -110,6 +116,21 @@ pub enum WorldPreset {
     /// Step-1 unit primitive: a single `TangentBlock` at tree depth 3,
     /// rotated 45° around Y, in an otherwise empty world.
     RotatedCubeTest,
+    /// Step-2 multi-TB primitive: an unrotated centre cube surrounded
+    /// by six face-aligned `TangentBlock` cubes (a 3D plus / cross).
+    /// Each face TB carries the rotation that maps its storage +Y to
+    /// the world outward direction of that face. Validates the
+    /// rotation-aware `renormalize_world` against the case of multiple
+    /// distinct TB rotations at the same tree level.
+    CubeFacesTest,
+    /// Step-3 multi-TB primitive: 12 `TangentBlock` cubes at the 12
+    /// edge-adjacent positions of root, each oriented toward its
+    /// world edge direction (the rhombic-dodecahedron face-normals,
+    /// = the FCC nearest-neighbour set, = the 3D analog of the
+    /// hexagon). Plus an unrotated centre cube. Each rotation is a
+    /// 45°-style rotation; without `tb_scale` the corners poke into
+    /// adjacent slots — visual artifact only, not a math bug.
+    RhombicDodecahedronTest,
 }
 
 /// World-coordinate Y where entities naturally rest. `Some(y)` for
@@ -141,6 +162,8 @@ pub fn surface_y_for_preset(preset: &WorldPreset) -> Option<f32> {
         // — entities don't auto-rest on it in Phase 1.
         WorldPreset::WrappedPlanet { .. } => None,
         WorldPreset::RotatedCubeTest => None,
+        WorldPreset::CubeFacesTest => None,
+        WorldPreset::RhombicDodecahedronTest => None,
     }
 }
 
@@ -225,6 +248,12 @@ pub fn bootstrap_world(preset: WorldPreset, plain_layers: Option<u8>) -> WorldBo
         ),
         WorldPreset::RotatedCubeTest => {
             rotated_cube_test::bootstrap_rotated_cube_test_world()
+        }
+        WorldPreset::CubeFacesTest => {
+            cube_faces_test::bootstrap_cube_faces_test_world()
+        }
+        WorldPreset::RhombicDodecahedronTest => {
+            rhombic_dodecahedron_test::bootstrap_rhombic_dodecahedron_test_world()
         }
     }
 }

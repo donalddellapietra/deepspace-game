@@ -144,7 +144,12 @@ impl WorldPos {
             }
             if !in_range {
                 if self.anchor.depth() == 0 {
-                    // Hit root, clamp.
+                    // Hit world root, clamp the offset to the world
+                    // bounds. The next loop iteration sees an in-range
+                    // offset at depth 0 and redescends back to
+                    // `target_depth`, so the camera ends up in the
+                    // boundary cell rather than at empty root with
+                    // an empty anchor.
                     for i in 0..3 {
                         if self.offset[i] >= 1.0 {
                             self.offset[i] = 1.0 - f32::EPSILON;
@@ -152,7 +157,7 @@ impl WorldPos {
                             self.offset[i] = 0.0;
                         }
                     }
-                    break;
+                    continue;
                 }
                 // Try WrappedPlane wrap on axis 0 if the deepest
                 // cell's parent is a slab.
