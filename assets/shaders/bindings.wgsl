@@ -356,13 +356,7 @@ const MAX_FACE_DEPTH: u32 = 63u;
 /// Apple Silicon register-file boundary; larger values spill to
 /// threadgroup memory, adding memory latency to every DDA
 /// iteration. See `docs/testing/perf-lod-diagnosis.md`.
-/// Was 8 (Nyquist-bound). After the 2025 sphere-mercator rewrite of
-/// `march_cartesian` to a per-push local-frame DDA, the stack is no
-/// longer precision-bounded — `cur_cell_size` is always 1.0 inside
-/// the function, so `cur_side_dist += delta_dist` accumulates with
-/// O(1) magnitude regardless of depth. Bumped to 16 to cover the
-/// Layer-12+ camera positions without LOD-clipping deep edits.
-const MAX_STACK_DEPTH: u32 = 16u;
+const MAX_STACK_DEPTH: u32 = 8u;
 
 struct HitResult {
     hit: bool,
@@ -373,9 +367,6 @@ struct HitResult {
     /// camera frame; >0 = popped that many times into ancestors.
     frame_level: u32,
     frame_scale: f32,
-    /// Hit position normalized within the hit cell, in [0, 1]³.
-    /// Computed inside the marcher using LOCAL-FRAME coords at the
-    /// hit depth — never needs absolute world coords. Used by the
-    /// fragment shader for the cube bevel effect.
-    local_in_cell: vec3<f32>,
+    cell_min: vec3<f32>,
+    cell_size: f32,
 }
