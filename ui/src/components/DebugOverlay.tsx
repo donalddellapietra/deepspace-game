@@ -57,7 +57,7 @@ function formatDebug(s: DebugOverlayState): string {
     "render   [" + s.renderPathCsv + "]",
     "intended [" + (s.intendedRenderPathCsv || "") + "]",
     "anchor   [" + s.anchorSlotsCsv + "]",
-    pad("stop reason", s.renderStopReason || "ok"),
+    "stop     " + (s.renderStopReason || "ok"),
     "",
     "── rotation ──",
     pad("TB on anchor path", s.tbOnAnchorPath ? "yes" : "no"),
