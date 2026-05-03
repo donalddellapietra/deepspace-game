@@ -250,8 +250,16 @@ impl WorldPos {
                 // Pop one level (TangentBlock-rotation-aware).
                 self.pop_one_level_rot_aware(library, world_root);
             } else {
-                // In range but depth < target. Redescend one level.
-                self.descend_one_level_rot_aware(library, world_root);
+                // In range but depth < target. Try to redescend.
+                // Kind-aware descend refuses when the current
+                // offset is OOB — that happens when the camera sits
+                // in a TB cell's empty surround (cart-equivalent in
+                // range, but storage offset out of [0, 1)³). There's
+                // no meaningful child to descend into; settle at
+                // the parent's depth.
+                if !self.descend_one_level_rot_aware(library, world_root) {
+                    break;
+                }
             }
         }
         transition
@@ -295,19 +303,36 @@ impl WorldPos {
     /// `(0.5, 0.5, 0.5)` so subsequent descents see the offset in
     /// TB-storage frame.
     ///
-    /// The transformed storage offset is allowed to land OUTSIDE
-    /// `[0, 1)³` — this represents the camera being inside the TB
-    /// cell's outer Cartesian box but outside the inscribed
-    /// (rotated) content region (the empty space surrounding the
-    /// diamond). `renormalize_world`'s in-range check uses the
-    /// Cartesian-equivalent at TB depths so it pops only when the
-    /// camera actually leaves the cell's outer cube — not when it
-    /// merely steps outside the inscribed content.
+    /// **Refusal contract.** If `self.offset` is itself outside
+    /// `[0, 1)³`, return `false` without modifying state. The only
+    /// way that condition arises in practice is when the current
+    /// cell is a TangentBlock and the camera is in the empty
+    /// surround between the inscribed diamond and the outer cube —
+    /// there is no meaningful child slot to descend into (the
+    /// inscribed diamond fills the whole `[0, 3)³` storage children
+    /// frame; positions outside it map to clamped slots whose
+    /// child-frame candidate offset is itself OOB, causing
+    /// renormalize to ping-pong infinitely between depths). The
+    /// caller (`renormalize_world`) breaks the descent loop so the
+    /// anchor settles at the TB cell's depth.
+    ///
+    /// The transformed offset for a successfully-descended TB child
+    /// is still allowed to land outside `[0, 1)³` — that's the
+    /// "entering the TB from above" case where the parent's
+    /// children frame puts the camera in the diamond's empty
+    /// surround. Renormalize's Cartesian-equivalent in-range check
+    /// keeps that valid.
     fn descend_one_level_rot_aware(
         &mut self,
         library: &NodeLibrary,
         world_root: NodeId,
-    ) {
+    ) -> bool {
+        if !(0.0..1.0).contains(&self.offset[0])
+            || !(0.0..1.0).contains(&self.offset[1])
+            || !(0.0..1.0).contains(&self.offset[2])
+        {
+            return false;
+        }
         let storage_pos = [
             self.offset[0] * 3.0,
             self.offset[1] * 3.0,
@@ -331,6 +356,7 @@ impl WorldPos {
         } else {
             self.offset = candidate;
         }
+        true
     }
 
     /// Advance by a local delta (in units of the current cell).
@@ -379,6 +405,18 @@ impl WorldPos {
         world_root: NodeId,
     ) -> Transition {
         const BOUNDARY_EPS: f32 = 1e-3;
+        // Refuse to zoom in when the offset is OOB — see the
+        // `descend_one_level_rot_aware` refusal contract: the only
+        // way that arises is at a TB cell where the camera is in
+        // the empty surround between the inscribed diamond and the
+        // outer cube. There is no meaningful child slot to descend
+        // into; pushing one would create an invalid OOB candidate.
+        if !(0.0..1.0).contains(&self.offset[0])
+            || !(0.0..1.0).contains(&self.offset[1])
+            || !(0.0..1.0).contains(&self.offset[2])
+        {
+            return Transition::None;
+        }
         // Resolve the parent node by walking the anchor in the tree.
         let parent = node_at_path(library, world_root, &self.anchor);
         // Naive geometric pick (in current deepest cell's children frame).
