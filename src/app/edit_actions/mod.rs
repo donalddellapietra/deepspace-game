@@ -227,7 +227,8 @@ impl App {
             match child_kind {
                 Some(NodeKind::Cartesian)
                 | Some(NodeKind::WrappedPlane { .. })
-                | Some(NodeKind::TangentBlock { .. }) => {
+                | Some(NodeKind::TangentBlock { .. })
+                | Some(NodeKind::SphericalWrappedPlane { .. }) => {
                     node_id = child_id;
                 }
                 None => break,

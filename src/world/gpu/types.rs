@@ -115,6 +115,22 @@ impl GpuNodeKind {
                     cell_offset: [cell_offset[0], cell_offset[1], cell_offset[2], 0.0],
                 }
             },
+            NodeKind::SphericalWrappedPlane {
+                dims, slab_depth, body_radius_cells, lat_max,
+            } => {
+                // kind=3. Slab dims in dims_x/y/z. Sphere params in
+                // rot_col0 (.x=body_radius, .y=lat_max, .z=slab_depth
+                // as f32; .w unused). Other rot_cols / cell_offset
+                // unused (zeroed).
+                Self {
+                    kind: 3,
+                    dims_x: dims[0], dims_y: dims[1], dims_z: dims[2],
+                    rot_col0: [body_radius_cells, lat_max, slab_depth as f32, 0.0],
+                    rot_col1: id_col1,
+                    rot_col2: id_col2,
+                    cell_offset: zero_off,
+                }
+            },
         }
     }
 }

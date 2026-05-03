@@ -111,6 +111,21 @@ pub enum NodeKind {
         rotation: [[f32; 3]; 3],
         cell_offset: [f32; 3],
     },
+    /// UV-sphere root: same flat-slab storage as `WrappedPlane` (X
+    /// wraps) but rendered via a sphere DDA that walks the ray
+    /// against concentric shells + lat/lon bands. Each leaf cell is
+    /// a `TangentBlock` whose rotation is the local tangent basis at
+    /// `(lon_c, lat_c)` and whose `cell_offset` repositions the cell
+    /// onto the sphere surface in the SphericalWP's `[0, 3)³` frame.
+    ///
+    /// `body_radius_cells` and `lat_max` are stored as f32; dedup
+    /// hashes their bit pattern.
+    SphericalWrappedPlane {
+        dims: [u32; 3],
+        slab_depth: u8,
+        body_radius_cells: f32,
+        lat_max: f32,
+    },
 }
 
 /// Identity rotation (column-major). A `TangentBlock` carrying this
@@ -165,6 +180,17 @@ impl PartialEq for NodeKind {
                 NodeKind::TangentBlock { rotation: a, cell_offset: ao },
                 NodeKind::TangentBlock { rotation: b, cell_offset: bo },
             ) => rotation_bits(a) == rotation_bits(b) && f32_3_bits(ao) == f32_3_bits(bo),
+            (
+                NodeKind::SphericalWrappedPlane {
+                    dims: ad, slab_depth: ash, body_radius_cells: ar, lat_max: al,
+                },
+                NodeKind::SphericalWrappedPlane {
+                    dims: bd, slab_depth: bsh, body_radius_cells: br, lat_max: bl,
+                },
+            ) => ad == bd
+                && ash == bsh
+                && ar.to_bits() == br.to_bits()
+                && al.to_bits() == bl.to_bits(),
             _ => false,
         }
     }
@@ -190,6 +216,14 @@ impl Hash for NodeKind {
             NodeKind::TangentBlock { rotation, cell_offset } => {
                 rotation_bits(rotation).hash(state);
                 f32_3_bits(cell_offset).hash(state);
+            }
+            NodeKind::SphericalWrappedPlane {
+                dims, slab_depth, body_radius_cells, lat_max,
+            } => {
+                dims.hash(state);
+                slab_depth.hash(state);
+                body_radius_cells.to_bits().hash(state);
+                lat_max.to_bits().hash(state);
             }
         }
     }

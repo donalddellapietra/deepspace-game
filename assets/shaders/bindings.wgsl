@@ -143,6 +143,11 @@ struct NodeKindGpu {
 const NODE_KIND_CARTESIAN: u32 = 0u;
 const NODE_KIND_WRAPPED_PLANE: u32 = 1u;
 const NODE_KIND_TANGENT_BLOCK: u32 = 2u;
+/// UV-sphere root: rendered via sphere DDA (ray-vs-sphere + lon/lat
+/// band walk + per-cell TB dispatch). Slab dims in dims_x/y/z;
+/// `rot_col0.x = body_radius_cells`, `.y = lat_max`,
+/// `.z = slab_depth`.
+const NODE_KIND_SPHERICAL_WRAPPED_PLANE: u32 = 3u;
 
 /// Per-frame shader-side counters. Reset to zero each frame by the
 /// renderer via `encoder.clear_buffer`, then atomically accumulated

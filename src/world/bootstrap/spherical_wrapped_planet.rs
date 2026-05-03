@@ -98,7 +98,12 @@ pub fn spherical_wrapped_planet_world(
                      lat_idx: u32,
                      material: u16|
      -> Child {
-        let lon_c = (lon_idx as f32 + 0.5) / n_lng as f32 * std::f32::consts::TAU;
+        // Lon convention matches the shader: cell 0 is at lon=-π
+        // (=−X axis) and cell N_lng-1 is at lon=+π−ε. The shader's
+        // `u = (lon + π) / (2π)` inverts to `lon = -π + u · 2π`,
+        // which gives cell-centre `lon_c = -π + (lon_idx + 0.5) · (2π/N_lng)`.
+        let lon_c = -std::f32::consts::PI
+            + (lon_idx as f32 + 0.5) / n_lng as f32 * std::f32::consts::TAU;
         let lat_c = -lat_max + (lat_idx as f32 + 0.5) / n_lat as f32 * 2.0 * lat_max;
         // Radial position: r_idx=0 at body_radius, each successive
         // shell one cell_size further out.
@@ -216,7 +221,12 @@ pub fn spherical_wrapped_planet_world(
     }
     let wrapped_plane_root = library.insert_with_kind(
         slab_children,
-        NodeKind::WrappedPlane { dims: slab_dims, slab_depth },
+        NodeKind::SphericalWrappedPlane {
+            dims: slab_dims,
+            slab_depth,
+            body_radius_cells: body_radius_wp,
+            lat_max,
+        },
     );
 
     // Embed in `embedding_depth` Cartesian layers, slot 13 each level.
@@ -252,18 +262,28 @@ fn rotation_x_local(radians: f32) -> [[f32; 3]; 3] {
     ]
 }
 
-/// Spawn outside the slab embedding, looking back at the sphere
-/// centre at (1.5, 1.5, 1.5) in world root coords.
+/// Spawn INSIDE the slab embedding's box but outside the sphere
+/// itself, looking diagonally at the sphere centre.
 ///
-/// With `embedding_depth=2` the slab fills root's `[1,2]×[1,2]×[1,2]`
-/// box. Spawn at world ≈ `(0.4, 0.4, 0.4)` (slot 0 of root, near its
-/// centre) so the camera has a clear diagonal sight line into the
-/// slab box. Yaw/pitch face toward `(1.5, 1.5, 1.5)`.
-pub fn spherical_wrapped_planet_spawn(_embedding_depth: u8) -> WorldPos {
-    // World position ≈ (0.85, 0.85, 0.85). Anchor at slot 0 of root
-    // (= (0, 0, 0) corner), offset (0.85, 0.85, 0.85) — close to the
-    // slab box (1, 2)³ so the sphere fills more of the view.
-    WorldPos::uniform_column(slot_index(0, 0, 0) as u8, 1, [0.85, 0.85, 0.85])
+/// **Why slot 13 (centre) rather than slot 0 (corner)**: zoom_in_in_world
+/// descends the anchor through slot floor(offset * 3) at each level.
+/// If we spawn in slot 0, every zoom step descends the corner chain
+/// — the render frame zooms toward the (0, 0, 0) corner of the
+/// world, AWAY from the sphere at (1.5, 1.5, 1.5). Cells "disappear"
+/// because the render frame's box no longer contains them.
+///
+/// Spawning in slot 13 (=embedding cell, which contains the
+/// WrappedPlane) keeps the anchor descent chain pointed at the
+/// sphere. From (1.1, 1.1, 1.1) the camera is inside slot 13 (=
+/// world `(1, 2)³`) but outside the sphere (= world ≈
+/// `(1.34, 1.66)³` for embedding_depth=1).
+pub fn spherical_wrapped_planet_spawn(embedding_depth: u8) -> WorldPos {
+    // Anchor at slot 13 (= SphericalWP node) with offset (0.1, 0.1,
+    // 0.1) → world (1.1, 1.1, 1.1). Then deepen by RENDER_FRAME_K=3
+    // levels so the render frame truncates to depth=embedding_depth
+    // (= the SphericalWP itself). That fires `march_spherical_wrapped_plane`.
+    WorldPos::uniform_column(slot_index(1, 1, 1) as u8, 1, [0.1, 0.1, 0.1])
+        .deepened_to(embedding_depth + 3)
 }
 
 pub(super) fn bootstrap_spherical_wrapped_planet_world(
