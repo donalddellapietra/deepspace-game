@@ -129,73 +129,87 @@ impl WorldPos {
     ) -> Transition {
         let target_depth = self.anchor.depth();
         let mut transition = Transition::None;
-        let mut guard: u32 = 0;
-        let max_guard: u32 = 1 << 20;
+
+        // Phase 1: pop until offset is in [0, 1)³, or until we hit
+        // root. Bounded by anchor.depth iterations. WrappedPlane
+        // wraps fire here.
+        let mut phase1_guard: u32 = 0;
         loop {
-            guard += 1;
-            if guard > max_guard {
-                debug_assert!(false, "renormalize_world guard exceeded");
+            phase1_guard += 1;
+            if phase1_guard > 1024 {
+                debug_assert!(false, "renormalize_world phase 1 guard");
                 break;
             }
             let in_range = self.offset[0] >= 0.0 && self.offset[0] < 1.0
                 && self.offset[1] >= 0.0 && self.offset[1] < 1.0
                 && self.offset[2] >= 0.0 && self.offset[2] < 1.0;
-            if in_range && self.anchor.depth() >= target_depth {
+            if in_range || self.anchor.depth() == 0 {
                 break;
             }
-            if !in_range {
-                if self.anchor.depth() == 0 {
-                    // Hit root, clamp.
-                    for i in 0..3 {
-                        if self.offset[i] >= 1.0 {
-                            self.offset[i] = 1.0 - f32::EPSILON;
-                        } else if self.offset[i] < 0.0 {
-                            self.offset[i] = 0.0;
-                        }
+            // Try WrappedPlane wrap on axis 0 if the deepest cell's
+            // parent is a slab.
+            let depth = self.anchor.depth() as usize;
+            let parent_slots_len = depth - 1;
+            let parent_kind = super::path::node_kind_at_depth(
+                library,
+                world_root,
+                &self.anchor.as_slice()[..parent_slots_len],
+            );
+            if let Some(NodeKind::WrappedPlane { .. }) = parent_kind {
+                let last_slot = self.anchor.slot(depth - 1) as usize;
+                let (sx, sy, sz) = slot_coords(last_slot);
+                if self.offset[0] >= 1.0 {
+                    self.offset[0] -= 1.0;
+                    let new_sx = if sx < 2 { sx + 1 } else { 0 };
+                    if new_sx == 0 {
+                        transition = Transition::WrappedPlaneWrap { axis: 0 };
                     }
-                    break;
+                    self.anchor.pop();
+                    self.anchor.push(slot_index(new_sx, sy, sz) as u8);
+                    continue;
                 }
-                // Try WrappedPlane wrap on axis 0 if the deepest
-                // cell's parent is a slab.
-                let depth = self.anchor.depth() as usize;
-                let parent_slots_len = depth - 1;
-                let parent_kind = super::path::node_kind_at_depth(
-                    library,
-                    world_root,
-                    &self.anchor.as_slice()[..parent_slots_len],
-                );
-                if let Some(NodeKind::WrappedPlane { .. }) = parent_kind {
-                    let last_slot = self.anchor.slot(depth - 1) as usize;
-                    let (sx, sy, sz) = slot_coords(last_slot);
-                    if self.offset[0] >= 1.0 {
-                        self.offset[0] -= 1.0;
-                        let new_sx = if sx < 2 { sx + 1 } else { 0 };
-                        if new_sx == 0 {
-                            transition = Transition::WrappedPlaneWrap { axis: 0 };
-                        }
-                        self.anchor.pop();
-                        self.anchor.push(slot_index(new_sx, sy, sz) as u8);
-                        continue;
+                if self.offset[0] < 0.0 {
+                    self.offset[0] += 1.0;
+                    let new_sx = if sx > 0 { sx - 1 } else { 2 };
+                    if new_sx == 2 {
+                        transition = Transition::WrappedPlaneWrap { axis: 0 };
                     }
-                    if self.offset[0] < 0.0 {
-                        self.offset[0] += 1.0;
-                        let new_sx = if sx > 0 { sx - 1 } else { 2 };
-                        if new_sx == 2 {
-                            transition = Transition::WrappedPlaneWrap { axis: 0 };
-                        }
-                        self.anchor.pop();
-                        self.anchor.push(slot_index(new_sx, sy, sz) as u8);
-                        continue;
-                    }
-                    // Y or Z overflow: pop normally below.
+                    self.anchor.pop();
+                    self.anchor.push(slot_index(new_sx, sy, sz) as u8);
+                    continue;
                 }
-                // Pop one level (TangentBlock-rotation-aware).
-                self.pop_one_level_rot_aware(library, world_root);
-            } else {
-                // In range but depth < target. Redescend one level.
-                self.descend_one_level_rot_aware(library, world_root);
+            }
+            // Pop one level (TangentBlock-rotation-aware).
+            self.pop_one_level_rot_aware(library, world_root);
+        }
+
+        // If at root with offset still OOB, clamp the rare case.
+        if self.anchor.depth() == 0 {
+            for i in 0..3 {
+                if self.offset[i] >= 1.0 {
+                    self.offset[i] = 1.0 - f32::EPSILON;
+                } else if self.offset[i] < 0.0 {
+                    self.offset[i] = 0.0;
+                }
             }
         }
+
+        // Phase 2: descend back to target_depth. Each descent into
+        // a TB applies R^T·/tb_scale and may push the offset
+        // OUTSIDE [0, 1)³ — that's accepted ("the world is bigger
+        // than the inscribed diamond"); the camera at parent-slot-
+        // corner positions has a representable anchor at TB depth
+        // with an out-of-range offset rather than getting clamped
+        // to the inscribed boundary. Downstream `in_frame_rot` and
+        // shader cam.pos handling work for OOB offset via the
+        // mathematical formulas; the shader's ribbon-pop mechanism
+        // takes the rendering up to a containing ancestor frame
+        // when the OOB cam.pos doesn't hit anything inside the
+        // current frame's [0, 3)³.
+        while self.anchor.depth() < target_depth {
+            self.descend_one_level_rot_aware(library, world_root);
+        }
+
         transition
     }
 
@@ -236,11 +250,14 @@ impl WorldPos {
     /// push it onto the anchor. If the picked child is a
     /// `TangentBlock`, apply `R^T / tb_scale` about `(0.5, 0.5, 0.5)`
     /// to the post-floor offset to convert from parent-frame into
-    /// TB-storage frame. Clamps OOB results — refusing would drop
-    /// anchor depth and cause "layer-31 sky" flicker. The clamp
-    /// produces a small world snap (≤ 0.5 · cell_size) only when
-    /// the camera physically sits in the parent slot's corner
-    /// outside the inscribed content.
+    /// TB-storage frame. **NO clamping** — the offset is allowed to
+    /// fall outside `[0, 1)³` for camera positions in the parent
+    /// slot's corner that lies outside the inscribed cube. This
+    /// makes the TB cell's "logical" extent the full parent slot
+    /// rather than just the inscribed diamond, so the camera can
+    /// always be represented at TB depth without being trapped or
+    /// snapped. Downstream `in_frame_rot` returns the correct world
+    /// position for OOB offsets via the same formulas.
     fn descend_one_level_rot_aware(
         &mut self,
         library: &NodeLibrary,
@@ -260,22 +277,23 @@ impl WorldPos {
             library, world_root, self.anchor.as_slice(),
         );
         let mut new_offset = [
-            (storage_pos[0] - sx as f32).clamp(0.0, 1.0 - f32::EPSILON),
-            (storage_pos[1] - sy as f32).clamp(0.0, 1.0 - f32::EPSILON),
-            (storage_pos[2] - sz as f32).clamp(0.0, 1.0 - f32::EPSILON),
+            storage_pos[0] - sx as f32,
+            storage_pos[1] - sy as f32,
+            storage_pos[2] - sz as f32,
         ];
         if let Some(NodeKind::TangentBlock { rotation: r }) = descend_kind {
             let tb_scale = inscribed_cube_scale(&r);
             let centred = [new_offset[0] - 0.5, new_offset[1] - 0.5, new_offset[2] - 0.5];
-            // R^T · centred (column-major r[col][row]).
             let rotated = [
                 r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
                 r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
                 r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
             ];
-            new_offset[0] = (rotated[0] / tb_scale + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[1] = (rotated[1] / tb_scale + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[2] = (rotated[2] / tb_scale + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+            // No clamp — let offset go OOB. Phase 2 of renormalize
+            // accepts this rather than looping.
+            new_offset[0] = rotated[0] / tb_scale + 0.5;
+            new_offset[1] = rotated[1] / tb_scale + 0.5;
+            new_offset[2] = rotated[2] / tb_scale + 0.5;
         }
         self.offset = new_offset;
     }
@@ -380,9 +398,11 @@ impl WorldPos {
                 r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
                 r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
             ];
-            new_offset[0] = (rotated[0] / tb_scale + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[1] = (rotated[1] / tb_scale + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
-            new_offset[2] = (rotated[2] / tb_scale + 0.5).clamp(0.0, 1.0 - f32::EPSILON);
+            // No clamp — offset can go OOB if camera is in the
+            // parent slot's corner outside the inscribed diamond.
+            new_offset[0] = rotated[0] / tb_scale + 0.5;
+            new_offset[1] = rotated[1] / tb_scale + 0.5;
+            new_offset[2] = rotated[2] / tb_scale + 0.5;
         }
         self.offset = new_offset;
         Transition::None
@@ -425,7 +445,9 @@ impl WorldPos {
         self.offset[0] = (sx as f32 + adjusted[0]) / 3.0;
         self.offset[1] = (sy as f32 + adjusted[1]) / 3.0;
         self.offset[2] = (sz as f32 + adjusted[2]) / 3.0;
-        debug_assert!(self.offset.iter().all(|&x| (0.0..1.0).contains(&x)));
+        // No `[0, 1)³` invariant on offset — TB descendants may have
+        // OOB offsets representing camera positions in the parent
+        // slot's corner outside the inscribed diamond.
         Transition::None
     }
 
