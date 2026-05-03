@@ -523,44 +523,151 @@ impl WorldPos {
         world_root: NodeId,
         frame: &Path,
     ) -> [f32; 3] {
-        // Step 1: camera world Cartesian position, via the plain
-        // Cartesian walk of `(anchor, offset)` from root. No
-        // rotation accumulation here — anchor descent is pure
-        // Cartesian (TB rotation is a render-time effect, not part
-        // of the path).
-        let mut p = [0.0_f32; 3];
-        let mut size = WORLD_SIZE;
-        for k in 0..(self.anchor.depth() as usize) {
-            let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
-            let child = size / 3.0;
-            p[0] += sx as f32 * child;
-            p[1] += sy as f32 * child;
-            p[2] += sz as f32 * child;
-            size = child;
-        }
-        p[0] += self.offset[0] * size;
-        p[1] += self.offset[1] * size;
-        p[2] += self.offset[2] * size;
+        // PRECISION RULE (see `feedback_no_global_coords.md`):
+        // every intermediate value in this function must be bounded
+        // by a node's local `[0, WORLD_SIZE)³` — never accumulate
+        // position by adding `slot * (1/3)^k` from world root, since
+        // f32 epsilon (~1e-7) at world magnitudes (~3) drops any
+        // term smaller than that, and the loss compounds when
+        // scaled into a deep frame's `[0, 3)³`.
+        //
+        // The strategy is the standard common-prefix optimisation
+        // (which keeps `p` in the common ancestor's `[0, 3)³`),
+        // *plus* a per-TB local rotation step that walks `p` UP to
+        // each prefix-TB's child frame, applies `R^T · / tb_scale`
+        // about the child frame's centre `(1.5, 1.5, 1.5)`, and
+        // walks back DOWN to the common ancestor. The UP/DOWN walks
+        // are pure Cartesian un-descent / descent — both stay in
+        // local `[0, 3)³` magnitudes at every step. No quantity in
+        // this function ever has magnitude `O(3^k)` for any `k > 1`.
 
-        // Step 2: walk the *full* frame path from root. At each
-        // step where the descended-into child is a TangentBlock
-        // with rotation `R`, apply `R^T · / inscribed_cube_scale(R)`
-        // about that slot's centre (in current accumulated coords).
-        // The walk *cannot* short-circuit on a common prefix with
-        // the anchor — TB rotations on the prefix still have to be
-        // inverted, because the anchor representation never applied
-        // them in the first place. (That was the bug at layer 27 of
-        // rotated_cube_test: frame `[13]` shares its only step with
-        // the anchor's `[13]` prefix, so a tail-only walk left the
-        // rotation unapplied and the camera fed the shader in
-        // pure-Cartesian coords inside a TB-storage frame — visible
-        // as an abrupt camera teleport when the render frame depth
-        // changed across the TB ancestor.)
-        let mut node = world_root;
-        let mut have_node = true;
+        let c = self.anchor.common_prefix_len(frame) as usize;
+
+        // ----------- step 1: anchor tail walk in common's frame -----
+        // Walk anchor's tail past `c` to land at the camera in the
+        // common ancestor's `[0, WORLD_SIZE)³` Cartesian frame.
+        // Bounded magnitudes throughout.
+        let mut p = [0.0_f32; 3];
+        {
+            let mut size = WORLD_SIZE;
+            for k in c..(self.anchor.depth() as usize) {
+                let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
+                let child = size / 3.0;
+                p[0] += sx as f32 * child;
+                p[1] += sy as f32 * child;
+                p[2] += sz as f32 * child;
+                size = child;
+            }
+            p[0] += self.offset[0] * size;
+            p[1] += self.offset[1] * size;
+            p[2] += self.offset[2] * size;
+        }
+        // `p` is camera in common ancestor's Cartesian frame.
+
+        // ----------- step 2: prefix-TB rotations applied locally ---
+        // For each TB descent at depth `d` in `path[0..c)`:
+        //   - Walk `p` UP from common (depth `c`) to depth `d+1`,
+        //     pure Cartesian un-descent (`p = p/3 + slot_at_(k+1)`).
+        //     Each step bounded by `[0, 3)³`.
+        //   - Apply `R^T · / inscribed_cube_scale(R)` about
+        //     `(1.5, 1.5, 1.5)` of `(d+1)`'s frame — the TB's child
+        //     frame, where the rotation pivot is exactly at that
+        //     fixed point. Bounded.
+        //   - Walk `p` DOWN from `d+1` back to common (depth `c`),
+        //     pure Cartesian descent (`p = (p − slot_at_(k+1)) * 3`).
+        //     Bounded.
+        // After all prefix TBs are processed in order from shallowest
+        // to deepest, `p` is the camera in the common ancestor's
+        // *storage* frame.
+        let prefix_slice = self.anchor.as_slice();
+        let mut walk_node = world_root;
+        let mut walk_ok = true;
+        for d in 0..c {
+            // `walk_node` is the node at depth `d`. The child at
+            // `prefix_slice[d]` is the node at depth `d+1` — this is
+            // where we test for a TangentBlock.
+            let slot_d = prefix_slice[d] as usize;
+            if !walk_ok {
+                break;
+            }
+            let parent = match library.get(walk_node) {
+                Some(n) => n,
+                None => {
+                    walk_ok = false;
+                    break;
+                }
+            };
+            let (child_id, tb_rot) = match parent.children[slot_d] {
+                Child::Node(child_id) => match library.get(child_id) {
+                    Some(child_node) => match child_node.kind {
+                        NodeKind::TangentBlock { rotation: r } => (child_id, Some(r)),
+                        _ => (child_id, None),
+                    },
+                    None => {
+                        walk_ok = false;
+                        break;
+                    }
+                },
+                _ => {
+                    walk_ok = false;
+                    break;
+                }
+            };
+
+            if let Some(r) = tb_rot {
+                // Walk UP from common (depth c) to (d+1) in `p`.
+                let mut q = p;
+                for k in (d + 1..c).rev() {
+                    let (sx, sy, sz) = slot_coords(prefix_slice[k] as usize);
+                    q = [
+                        q[0] / 3.0 + sx as f32,
+                        q[1] / 3.0 + sy as f32,
+                        q[2] / 3.0 + sz as f32,
+                    ];
+                }
+                // Apply R^T · / tb_scale about (1.5, 1.5, 1.5) of
+                // (d+1)'s child frame.
+                let s = inscribed_cube_scale(&r);
+                let centred = [q[0] - 1.5, q[1] - 1.5, q[2] - 1.5];
+                let rotated = [
+                    r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
+                    r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
+                    r[2][0] * centred[0] + r[2][1] * centred[1] + r[2][2] * centred[2],
+                ];
+                q = [
+                    rotated[0] / s + 1.5,
+                    rotated[1] / s + 1.5,
+                    rotated[2] / s + 1.5,
+                ];
+                // Walk DOWN from (d+1) to common.
+                for k in (d + 1)..c {
+                    let (sx, sy, sz) = slot_coords(prefix_slice[k] as usize);
+                    q = [
+                        (q[0] - sx as f32) * 3.0,
+                        (q[1] - sy as f32) * 3.0,
+                        (q[2] - sz as f32) * 3.0,
+                    ];
+                }
+                p = q;
+            }
+            walk_node = child_id;
+        }
+        // `p` is camera in common ancestor's STORAGE frame.
+
+        // ----------- step 3: frame's tail past common -----------
+        // For frame paths that extend below the common prefix
+        // (frame.depth() > c — atypical for camera-tracking frames
+        // but possible in general), walk the tail in the running
+        // accumulated frame coords. At each TB descent apply
+        // `R^T · / s` about the slot's centre in *current* frame
+        // coords (which always lands within `[0, 3)³` since the
+        // slot's centre is just `(sx, sy, sz) + 0.5` in the
+        // current children grid).
         let mut frame_origin = [0.0_f32; 3];
         let mut frame_size = WORLD_SIZE;
-        for k in 0..(frame.depth() as usize) {
+        let mut node = walk_node;
+        let mut have_node = walk_ok;
+        for k in c..(frame.depth() as usize) {
             let slot = frame.slot(k);
             let (sx, sy, sz) = slot_coords(slot as usize);
             let child_size = frame_size / 3.0;
@@ -605,7 +712,6 @@ impl WorldPos {
                     p[1] - slot_centre[1],
                     p[2] - slot_centre[2],
                 ];
-                // R^T · centred (column-major `r[col][row]`).
                 let rotated = [
                     r[0][0] * centred[0] + r[0][1] * centred[1] + r[0][2] * centred[2],
                     r[1][0] * centred[0] + r[1][1] * centred[1] + r[1][2] * centred[2],
