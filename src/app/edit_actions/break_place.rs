@@ -4,10 +4,37 @@
 use crate::game_state::HotbarItem;
 use crate::world::anchor::Path;
 use crate::world::edit;
+use crate::world::raycast::HitInfo;
 
 use crate::app::App;
 
 impl App {
+    /// After a successful edit, align the camera's anchor slot path
+    /// to the dig path so the render frame stays close to the carved
+    /// structure. Without this, the camera anchor can drift one slot
+    /// over between edits (offset-arithmetic at cell boundaries),
+    /// causing compute_render_frame to stop short in the empty
+    /// neighbor cell while the carving is in the dug branch.
+    ///
+    /// Preserves the camera's anchor depth (= zoom level) and offset
+    /// within the deepest cell. The camera's WORLD position shifts
+    /// by at most one cell at the divergence depth — small enough to
+    /// be unnoticeable in gameplay.
+    fn snap_anchor_to_dig_path(&mut self, hit: &HitInfo) {
+        let cam_depth = self.camera.position.anchor.depth();
+        let mut new_anchor = Path::root();
+        for &(_, slot) in hit.path.iter().take(cam_depth as usize) {
+            new_anchor.push(slot as u8);
+        }
+        // If hit.path is shallower than camera anchor, pad with the
+        // camera's existing slots (rare — hits are usually deeper).
+        for d in (new_anchor.depth() as usize)..(cam_depth as usize) {
+            new_anchor.push(self.camera.position.anchor.slot(d));
+        }
+        self.camera.position.anchor = new_anchor;
+    }
+
+
     pub(in crate::app) fn do_break(&mut self) {
         let hit = self.frame_aware_raycast();
         let Some(hit) = hit else {
@@ -60,6 +87,7 @@ impl App {
         eprintln!("do_break: changed={changed}");
         self.harness_emit_edit("broke", &hit, changed);
         if changed {
+            self.snap_anchor_to_dig_path(&hit);
             self.upload_tree();
         }
     }
@@ -90,6 +118,7 @@ impl App {
                 eprintln!("do_place: block_type={} changed={changed}", block_type);
                 self.harness_emit_edit("placed", &hit, changed);
                 if changed {
+                    self.snap_anchor_to_dig_path(&hit);
                     self.upload_tree();
                 }
             }
@@ -103,6 +132,7 @@ impl App {
                 eprintln!("do_place: mesh_idx={} node_id={} changed={changed}", idx, node_id);
                 self.harness_emit_edit("placed", &hit, changed);
                 if changed {
+                    self.snap_anchor_to_dig_path(&hit);
                     self.upload_tree();
                 }
             }
