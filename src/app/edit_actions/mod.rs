@@ -67,6 +67,28 @@ impl App {
     /// pinned to the f32-precision wall of world XYZ.
     pub(in crate::app) fn frame_aware_raycast(&self) -> Option<raycast::HitInfo> {
         let (hit, cap_frame_path) = match self.active_frame.kind {
+            ActiveFrameKind::SphericalWrappedPlane {
+                dims, slab_depth, body_radius_cells, lat_max,
+            } => {
+                let frame_path = self.active_frame.render_path;
+                let cam_local = self.camera.position.in_frame_rot(
+                    &self.world.library, self.world.root, &frame_path,
+                );
+                let ray_dir = self.ray_dir_in_frame(&frame_path);
+                let hit = raycast::cpu_raycast_spherical_wrapped_planet(
+                    &self.world.library,
+                    self.world.root,
+                    frame_path.as_slice(),
+                    cam_local,
+                    ray_dir,
+                    dims,
+                    slab_depth,
+                    body_radius_cells,
+                    lat_max,
+                    self.edit_depth(),
+                );
+                (hit, frame_path)
+            }
             // WrappedPlane frame: dispatch the rotated-tangent-cube CPU
             // raycast so click-targeting matches the GPU visual.
             ActiveFrameKind::WrappedPlane { dims, slab_depth } => {

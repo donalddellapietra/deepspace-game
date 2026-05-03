@@ -379,7 +379,8 @@ impl App {
             self.poll_ui_commands();
             let camera_local = match self.active_frame.kind {
                 crate::app::ActiveFrameKind::Cartesian
-                | crate::app::ActiveFrameKind::WrappedPlane { .. } => {
+                | crate::app::ActiveFrameKind::WrappedPlane { .. }
+                | crate::app::ActiveFrameKind::SphericalWrappedPlane { .. } => {
                     self.camera.position.in_frame_rot(
                         &self.world.library,
                         self.world.root,
@@ -412,6 +413,11 @@ impl App {
                 crate::app::ActiveFrameKind::WrappedPlane { dims, slab_depth } => {
                     format!("WrappedPlane(dims={dims:?}, slab_d={slab_depth})")
                 }
+                crate::app::ActiveFrameKind::SphericalWrappedPlane {
+                    dims, slab_depth, body_radius_cells, lat_max,
+                } => format!(
+                    "SphericalWrappedPlane(dims={dims:?}, slab_d={slab_depth}, r={body_radius_cells:.3}, lat_max={lat_max:.3})"
+                ),
             };
             let render_path_csv = self
                 .active_frame
