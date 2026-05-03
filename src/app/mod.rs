@@ -266,6 +266,11 @@ pub struct App {
     /// survives between frames; released on the next upload when the
     /// new scene root replaces it.
     pub(super) active_scene_root: Option<crate::world::tree::NodeId>,
+    /// View-tree root NodeId from the last `upload_tree_lod`. Held
+    /// via `NodeLibrary::ref_inc` so the ephemeral pruned tree
+    /// survives between frames; released on the next upload when
+    /// the new view tree replaces it.
+    pub(super) active_view_tree_root: Option<crate::world::tree::NodeId>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) webview: Option<wry::WebView>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -472,6 +477,7 @@ impl App {
             last_edit_slots: None,
             entities: crate::world::entities::EntityStore::new(),
             active_scene_root: None,
+            active_view_tree_root: None,
             #[cfg(not(target_arch = "wasm32"))]
             webview: None,
             #[cfg(not(target_arch = "wasm32"))]

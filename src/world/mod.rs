@@ -15,4 +15,5 @@ pub mod sphere;
 pub mod stars;
 pub mod state;
 pub mod tree;
+pub mod view_tree;
 pub mod worldgen;
