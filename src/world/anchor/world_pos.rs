@@ -174,6 +174,65 @@ impl WorldPos {
         Transition::None
     }
 
+    /// Tree-aware zoom: like `zoom_in`, but when the offset lies
+    /// near a cell boundary AND the geometric pick lands on
+    /// Empty/Block while a neighboring cell has a Node, pick the
+    /// neighbor. This biases tie-breaks at boundaries toward slots
+    /// with carved structure so the anchor follows the tree's
+    /// content rather than drifting into adjacent empty space.
+    ///
+    /// World position shift is bounded by `BOUNDARY_EPS * cell_size`
+    /// — imperceptible in gameplay but enough to keep the render
+    /// path on the carved branch when the camera is right on a wall.
+    pub fn zoom_in_in_world(
+        &mut self,
+        library: &NodeLibrary,
+        world_root: NodeId,
+    ) -> Transition {
+        const BOUNDARY_EPS: f32 = 1e-3;
+        // Resolve the parent node by walking the anchor in the tree.
+        let parent = node_at_path(library, world_root, &self.anchor);
+        // Naive geometric pick.
+        let mut coords = [0usize; 3];
+        let mut new_offset = [0.0f32; 3];
+        for i in 0..3 {
+            let s = (self.offset[i] * 3.0).floor();
+            coords[i] = s.clamp(0.0, 2.0) as usize;
+            new_offset[i] = (self.offset[i] * 3.0 - s).clamp(0.0, 1.0 - f32::EPSILON);
+        }
+        // Tree-aware tie-break: per axis, if offset is near 0 or 1
+        // (we just crossed a boundary) AND the geometric slot leads
+        // to Empty/Block while the boundary-neighbor on this axis
+        // is a Node, snap to the neighbor.
+        if let Some(parent_id) = parent {
+            for axis in 0..3 {
+                let near_low = new_offset[axis] < BOUNDARY_EPS && coords[axis] > 0;
+                let near_high = new_offset[axis] > 1.0 - BOUNDARY_EPS && coords[axis] < 2;
+                if !near_low && !near_high { continue; }
+                let cur_is_node = slot_is_node(library, parent_id, coords, axis, 0);
+                if cur_is_node { continue; }
+                // Only consider a snap if current pick is Empty/Block.
+                let alt_dir = if near_low { -1i32 } else { 1 };
+                let alt_is_node = slot_is_node(library, parent_id, coords, axis, alt_dir);
+                if alt_is_node {
+                    // Snap: move to neighbor. Offset on this axis
+                    // wraps to the other end of [0, 1).
+                    let new_coord = (coords[axis] as i32 + alt_dir) as usize;
+                    coords[axis] = new_coord;
+                    new_offset[axis] = if alt_dir < 0 {
+                        1.0 - f32::EPSILON
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+        self.offset = new_offset;
+        let slot = slot_index(coords[0], coords[1], coords[2]) as u8;
+        self.anchor.push(slot);
+        Transition::None
+    }
+
     /// Vector from `other` to `self`, computed
     /// without ever materializing either position at world scale.
     ///
@@ -500,4 +559,36 @@ fn mat3_mul_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
         m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2],
         m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2],
     ]
+}
+
+/// Walk `library` from `world_root` along `path`'s slots; return the
+/// final NodeId reached (or None if the path leaves the tree).
+fn node_at_path(library: &NodeLibrary, world_root: NodeId, path: &Path) -> Option<NodeId> {
+    let mut nid = world_root;
+    for k in 0..(path.depth() as usize) {
+        let node = library.get(nid)?;
+        match node.children[path.slot(k) as usize] {
+            Child::Node(child) => nid = child,
+            _ => return None,
+        }
+    }
+    Some(nid)
+}
+
+/// Is `parent`'s child at `coords + axis_delta` a Node?
+/// `delta` is along `axis` only (or 0 for "current").
+fn slot_is_node(
+    library: &NodeLibrary,
+    parent: NodeId,
+    coords: [usize; 3],
+    axis: usize,
+    delta: i32,
+) -> bool {
+    let mut c = coords;
+    let new = c[axis] as i32 + delta;
+    if new < 0 || new > 2 { return false; }
+    c[axis] = new as usize;
+    let slot = slot_index(c[0], c[1], c[2]);
+    let Some(node) = library.get(parent) else { return false; };
+    matches!(node.children[slot], Child::Node(_))
 }

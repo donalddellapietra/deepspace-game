@@ -611,7 +611,9 @@ impl App {
         let new_depth = (cur + step).clamp(1, max_depth);
         if new_depth == cur { return; }
         if step > 0 {
-            self.camera.position.zoom_in();
+            self.camera.position.zoom_in_in_world(
+                &self.world.library, self.world.root,
+            );
         } else {
             self.camera.position.zoom_out();
         }
