@@ -523,17 +523,14 @@ impl WorldPos {
         world_root: NodeId,
         frame: &Path,
     ) -> [f32; 3] {
-        let c = self.anchor.common_prefix_len(frame) as usize;
-
-        // Step 1: camera position in the common ancestor's
-        // [0, WORLD_SIZE)³ frame, via pure Cartesian walk of the
-        // anchor's tail past the common prefix + the in-cell offset.
-        // Pure Cartesian because the anchor representation is itself
-        // pure Cartesian (TB rotation lives in the renderer, not the
-        // path).
+        // Step 1: camera world Cartesian position, via the plain
+        // Cartesian walk of `(anchor, offset)` from root. No
+        // rotation accumulation here — anchor descent is pure
+        // Cartesian (TB rotation is a render-time effect, not part
+        // of the path).
         let mut p = [0.0_f32; 3];
         let mut size = WORLD_SIZE;
-        for k in c..(self.anchor.depth() as usize) {
+        for k in 0..(self.anchor.depth() as usize) {
             let (sx, sy, sz) = slot_coords(self.anchor.slot(k) as usize);
             let child = size / 3.0;
             p[0] += sx as f32 * child;
@@ -545,31 +542,25 @@ impl WorldPos {
         p[1] += self.offset[1] * size;
         p[2] += self.offset[2] * size;
 
-        // Walk `world_root → common_ancestor` in the library so we
-        // can look up child kinds when we descend through the frame's
-        // tail. Bail out to the pure-Cartesian projection if the path
-        // leaves the tree early — there's no rotation to apply
-        // outside the tree.
+        // Step 2: walk the *full* frame path from root. At each
+        // step where the descended-into child is a TangentBlock
+        // with rotation `R`, apply `R^T · / inscribed_cube_scale(R)`
+        // about that slot's centre (in current accumulated coords).
+        // The walk *cannot* short-circuit on a common prefix with
+        // the anchor — TB rotations on the prefix still have to be
+        // inverted, because the anchor representation never applied
+        // them in the first place. (That was the bug at layer 27 of
+        // rotated_cube_test: frame `[13]` shares its only step with
+        // the anchor's `[13]` prefix, so a tail-only walk left the
+        // rotation unapplied and the camera fed the shader in
+        // pure-Cartesian coords inside a TB-storage frame — visible
+        // as an abrupt camera teleport when the render frame depth
+        // changed across the TB ancestor.)
         let mut node = world_root;
         let mut have_node = true;
-        for k in 0..c {
-            let n = match library.get(node) {
-                Some(n) => n,
-                None => return self.in_frame(frame),
-            };
-            match n.children[self.anchor.slot(k) as usize] {
-                Child::Node(child_id) => node = child_id,
-                _ => return self.in_frame(frame),
-            }
-        }
-
-        // Step 2/3: walk the frame's tail, accumulating frame_origin
-        // and frame_size in the common ancestor's coords. At each TB
-        // descent, apply `R^T · / s` to `p` about the slot's centre
-        // (computed in the current accumulated coords).
         let mut frame_origin = [0.0_f32; 3];
         let mut frame_size = WORLD_SIZE;
-        for k in c..(frame.depth() as usize) {
+        for k in 0..(frame.depth() as usize) {
             let slot = frame.slot(k);
             let (sx, sy, sz) = slot_coords(slot as usize);
             let child_size = frame_size / 3.0;
@@ -584,8 +575,6 @@ impl WorldPos {
                 slot_origin[2] + child_size * 0.5,
             ];
 
-            // Look up the child kind at this slot of the current
-            // node, and advance `node` in lockstep with the walk.
             let mut descend_into_tb: Option<[[f32; 3]; 3]> = None;
             if have_node {
                 if let Some(n) = library.get(node) {
